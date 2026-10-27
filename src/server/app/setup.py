@@ -42,6 +42,7 @@ from starlette.middleware.gzip import GZipMiddleware
 
 from ptc_agent.core.sandbox.livefs_runtime.protocol import PREFIX as LIVEFS_PREFIX
 from ptc_agent.core.sandbox.platform_secrets import PlatformSecretError
+from ptc_agent.core.sandbox.providers.ssh_errors import SSHConnectError
 from ptc_agent.core.sandbox.runtime import SandboxGoneError, SandboxTransientError
 from src.server.preview_proxy import install_preview_proxy
 from src.config.logging_config import configure_logging
@@ -57,9 +58,10 @@ from src.server.utils.api import find_malformed_route_ids  # TEMP (malformed-id-
 from src.server.services.preview_base import (
     PreviewProxyConfigurationError,
     check_preview_proxy_config,
+    preview_proxy_requirements,
 )
 from src.server.utils.error_sanitization import (
-    sandbox_unreachable_detail,
+    sandbox_failure_http,
     single_line,
 )
 
@@ -130,6 +132,9 @@ _REDIS_BACKGROUND_SINGLETONS: tuple[tuple[str, str], ...] = (
     # Keeps running sandboxes' market-data tokens fresh between turns; a
     # claim on each computer's row in Postgres dedups it across workers.
     ("DataTokenSweeper", "src.server.services.data_token_sweep"),
+    # Takes tunnels no computer uses off their machines; a claim on each
+    # tunnel's row in Postgres dedups it across workers.
+    ("TunnelSweeper", "src.server.services.ssh_tunnel_sweep"),
 )
 
 
@@ -334,7 +339,7 @@ async def lifespan(app: FastAPI):
         from src.config.env import PUBLIC_APP_URL, SERVER_BASE_URL
 
         check_preview_proxy_config(
-            requires_proxy=not agent_config.sandbox.e2b.public_traffic,
+            proxy_required_by=preview_proxy_requirements(agent_config.sandbox),
             app_urls=(SERVER_BASE_URL, PUBLIC_APP_URL, *get_allowed_origins()),
         )
 
@@ -405,6 +410,15 @@ async def lifespan(app: FastAPI):
         )
         await workspace_manager.start_cleanup_task()
         logger.info("Workspace Manager initialized")
+
+        # An ssh computer logs in with its owner's key, which the provider
+        # reads through this loader; any worker may start one. A machine that
+        # connects out is reached through the gateway the second loader names.
+        from src.server.services.ssh_computers import install_client_key_loader
+        from src.server.services.ssh_tunnels import install_gateway_loader
+
+        install_client_key_loader()
+        install_gateway_loader()
 
         # Platform-secret migration sweep: converges running sandboxes left
         # behind the fleet generation (always-on sandboxes never re-init, so
@@ -1260,14 +1274,15 @@ install_preview_proxy(app)
 # ============================================================================
 
 
-async def _sandbox_unreachable_handler(request: Request, exc: Exception) -> JSONResponse:
-    """Map an unreachable sandbox to 503 once, for every route.
+async def _sandbox_failure_handler(request: Request, exc: Exception) -> JSONResponse:
+    """Answer a sandbox failure once, for every route, as the computer routes do.
 
-    The detail wording is a wire contract, not a message: the file panel
-    categorizes the error by matching this string, so it must stay identical
-    across producers rather than being re-spelled per route. It is built by
-    ``sandbox_unreachable_detail`` because the raw exception carries provider
-    URLs and SDK response bodies that must not leave the server.
+    ``sandbox_failure_http`` decides, so one failure gets one status whichever
+    route met it: 422 with the owner's own sentence when their SSH machine
+    answered and refused, which a retry cannot fix, and 503 otherwise. The 503
+    detail is a wire contract, not a message: the file panel categorizes the
+    error by matching it, and it never quotes the raw exception, which carries
+    provider URLs and SDK response bodies that must not leave the server.
     """
     # The exception is the live carrier: it quotes provider response bodies, so
     # it can hold a newline and a forged entry. Starlette's path is already
@@ -1275,14 +1290,14 @@ async def _sandbox_unreachable_handler(request: Request, exc: Exception) -> JSON
     logger.warning(
         f"Sandbox unreachable for {single_line(request.url.path)}: {single_line(str(exc))}"
     )
-    return JSONResponse(
-        status_code=503,
-        content={"detail": sandbox_unreachable_detail(exc)},
-    )
+    answer = sandbox_failure_http(exc)
+    return JSONResponse(status_code=answer.status_code, content={"detail": answer.detail})
 
 
-app.add_exception_handler(SandboxGoneError, _sandbox_unreachable_handler)
-app.add_exception_handler(SandboxTransientError, _sandbox_unreachable_handler)
+app.add_exception_handler(SandboxGoneError, _sandbox_failure_handler)
+app.add_exception_handler(SandboxTransientError, _sandbox_failure_handler)
+# A refusal a caller let through unwrapped, which would otherwise answer 500.
+app.add_exception_handler(SSHConnectError, _sandbox_failure_handler)
 
 
 # ============================================================================
@@ -1293,6 +1308,7 @@ from src.server.app.threads import router as threads_router
 from src.server.app.sessions import router as sessions_router
 from src.server.app.utilities import health_router
 from src.server.app.computers import router as computers_router
+from src.server.app.computers_ssh import router as computers_ssh_router
 from src.server.app.workspaces import router as workspaces_router
 from src.server.app.workspace_files import router as workspace_files_router
 from src.server.app.workspace_files import wsfiles_router
@@ -1362,6 +1378,9 @@ else:
 app.include_router(threads_router)  # /api/v1/threads/* - Thread CRUD, messages, control
 app.include_router(sessions_router)  # /api/v1/sessions - Active session stats
 app.include_router(workspaces_router)  # /api/v1/workspaces/* - Workspace CRUD
+app.include_router(
+    computers_ssh_router
+)  # /api/v1/computers/ssh/* - Adding an SSH machine, ahead of /{computer_id}
 app.include_router(
     computers_router
 )  # /api/v1/computers/* - Computer lifecycle (the workspace routes alias these)

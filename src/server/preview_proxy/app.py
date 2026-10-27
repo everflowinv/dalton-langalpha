@@ -27,9 +27,11 @@ from src.server.services.preview_base import PreviewBase
 from src.server.services.preview_capabilities import (
     Capability,
     PreviewProxyUnavailable,
+    Upstream,
     resolve_host,
     until_revoked,
 )
+from src.server.services.preview_upstreams import upstream_for
 
 logger = logging.getLogger(__name__)
 
@@ -241,15 +243,7 @@ class PreviewProxy:
                 await send({"type": "websocket.close", "code": _SOCKETS_FULL})
                 return
             try:
-                await relay_websocket(
-                    scope,
-                    receive,
-                    send,
-                    capability,
-                    capability_origin=capability_origin,
-                    target=target.decode("latin-1"),
-                    activity=self.activity,
-                )
+                await self._dial(scope, receive, send, capability, capability_origin, target)
             finally:
                 self._sockets.release(capability.sandbox_id)
             return
@@ -262,13 +256,11 @@ class PreviewProxy:
             await _page(send, 503)
             return
         try:
-            await self._forward(
-                scope, receive, send, capability, capability_origin, target
-            )
+            await self._dial(scope, receive, send, capability, capability_origin, target)
         finally:
             self._requests.release(capability.sandbox_id)
 
-    async def _forward(
+    async def _dial(
         self,
         scope: dict[str, Any],
         receive: Any,
@@ -277,12 +269,53 @@ class PreviewProxy:
         capability_origin: str,
         target: bytes,
     ) -> None:
+        """Open the capability's port from this worker, then relay to it."""
+        websocket = scope["type"] == "websocket"
+        try:
+            upstream = await upstream_for(capability)
+            status = 502
+        except PreviewProxyUnavailable as e:
+            logger.warning("Preview proxy could not open an upstream: %s", e)
+            upstream, status = None, 503
+        if upstream is None:
+            if websocket:
+                # Before the accept, a close answers the handshake with a 403.
+                await send({"type": "websocket.close", "code": 1011})
+            else:
+                await _page(send, status)
+            return
+        if websocket:
+            await relay_websocket(
+                scope,
+                receive,
+                send,
+                capability,
+                upstream=upstream,
+                capability_origin=capability_origin,
+                target=target.decode("latin-1"),
+                activity=self.activity,
+            )
+        else:
+            await self._forward(
+                scope, receive, send, capability, upstream, capability_origin, target
+            )
+
+    async def _forward(
+        self,
+        scope: dict[str, Any],
+        receive: Any,
+        send: Any,
+        capability: Capability,
+        upstream: Upstream,
+        capability_origin: str,
+        target: bytes,
+    ) -> None:
         method = scope["method"]
         headers = request_headers(
             scope.get("headers", []),
             capability_origin=capability_origin,
-            upstream_origin=capability.upstream,
-            inject=capability.headers,
+            upstream_origin=upstream.origin,
+            inject=upstream.headers,
         )
         declared = _header(scope, b"content-length")
         if declared is not None and declared.isdigit() and int(declared) > _MAX_BODY_BYTES:
@@ -308,7 +341,7 @@ class PreviewProxy:
         client = self._http_client()
         request = client.build_request(
             method,
-            httpx.URL(capability.upstream).copy_with(raw_path=target),
+            httpx.URL(upstream.origin).copy_with(raw_path=target),
             headers=[(k.encode("latin-1"), v.encode("latin-1")) for k, v in headers],
             content=body() if has_body else None,
         )
@@ -348,10 +381,10 @@ class PreviewProxy:
                     "status": response.status_code,
                     "headers": response_headers(
                         response.headers.raw,
-                        upstream_origin=capability.upstream,
+                        upstream_origin=upstream.origin,
                         capability_origin=capability_origin,
                         frame_ancestors=self._frame_ancestors,
-                        withheld=capability.headers.values(),
+                        withheld=upstream.headers.values(),
                     ),
                 }
             )

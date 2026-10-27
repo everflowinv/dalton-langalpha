@@ -442,7 +442,17 @@ async def _exec_text_write_once(
             payload,
             _INLINE_TEXT_MARKER,
             'count=$(wc -c < "$tmp")',
-            'mv -fT -- "$tmp" "$target"',
+            # BSD mv (a macOS machine) has no -T. As -T does, refuse a
+            # directory, and replace a link to one rather than move into it.
+            'if [ "$(uname -s)" = Darwin ]; then',
+            '  if [ -d "$target" ]; then',
+            '    [ -L "$target" ] || { echo "mv: $target: Is a directory" >&2; exit 1; }',
+            '    rm -f -- "$target"',
+            "  fi",
+            '  mv -f -- "$tmp" "$target"',
+            "else",
+            '  mv -fT -- "$tmp" "$target"',
+            "fi",
             "trap - EXIT HUP INT TERM",
             "printf '%s\\n' \"$count\"",
         ]

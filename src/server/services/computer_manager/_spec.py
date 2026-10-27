@@ -17,6 +17,7 @@ from typing import Any, AsyncIterator, Dict, Mapping, Optional
 
 from fastapi import HTTPException
 
+from ptc_agent.core.sandbox.providers import provider_class
 from ptc_agent.core.sandbox.runtime import SandboxGoneError
 from ptc_agent.core.session import Session, SessionManager
 
@@ -45,6 +46,7 @@ from src.server.services.computer_errors import (
     DiskTooSmallError,
     MachineBusyError,
     SpecChangeLostError,
+    SpecNotChangeable,
 )
 from src.server.services.computer_manager._types import ComputerBinding
 from src.server.services.persistence.transfer import PULL_MAX_INFLIGHT_BYTES
@@ -89,6 +91,14 @@ def _spec_refusal(
     ``claim_id`` is the re-check's own claim, whose record says whether it
     took over a dead change.
     """
+    if not provider_class(computer["kind"]).recreatable:
+        # A tier change is a rebuild, and this machine is never rebuilt.
+        if tier == (computer.get("resource_tier") or "standard"):
+            return True
+        raise SpecNotChangeable(
+            "This computer runs on a machine you manage, so its size is set "
+            "on that machine rather than here."
+        )
     if tier not in tiers:
         raise ValueError(f"Unknown resource tier: {tier}")
     record = computer.get("spec_change") or {}
@@ -795,6 +805,10 @@ class ComputerSpecMixin:
                 or computer.get("provider_ref") != sandbox_id
             ):
                 return False
+            if not provider_class(computer["kind"]).recreatable:
+                # Its provider takes no platform credential, and its machine
+                # is never the server's to rebuild or empty.
+                return False
             if not await get_live_workspace_ids_for_computer(computer_id):
                 return await self._drop_empty_machine_sandbox(computer, sandbox_id)
             await self._replace_running_sandbox(
@@ -856,6 +870,10 @@ class ComputerSpecMixin:
         """
         from src.server.services.preview_capabilities import revoke
 
+        if binding is not None and not binding.provider.recreatable:
+            # Every caller builds a replacement after this, which a machine its
+            # owner brought never gets; their own checks keep it from here.
+            raise RuntimeError("This computer's machine is never replaced")
         # First, so no proxied preview outlives the sandbox it opens.
         await revoke(sandbox_id)
         provider = self._provider_for(binding)

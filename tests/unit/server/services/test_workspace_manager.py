@@ -25,6 +25,7 @@ from ptc_agent.core.sandbox.runtime import (
 from src.server.database.workspace_folders import WorkspaceFolderMoving
 from src.server.models.computer import ComputerStatus
 from src.server.services.computer_errors import SpecChangeLostError
+from src.server.services.computer_manager._types import ComputerBinding
 
 # Imported for its side effect: this module binds ``platform_secrets_active`` by
 # value at import time, and the hot-resync tests below patch that name on its
@@ -815,6 +816,36 @@ class TestStopWorkspace:
             manager._settle_machine_stop.assert_awaited_once_with(_STUB_COMPUTER_ID, state)
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("kind", "files_backup"), [("daytona", True), ("ssh", False)], ids=["on", "off"]
+    )
+    async def test_the_stop_backup_follows_the_machines_switch(self, kind, files_backup):
+        """Off is the owner's choice to keep the last backup as it is; the stop
+        itself runs in full either way."""
+        manager = WorkspaceManager(_make_config())
+        manager._backup_machine_files_to_db = AsyncMock(return_value=1)
+        manager._owner_machine_state = AsyncMock(return_value=RuntimeState.RUNNING)
+        manager.refresh_computer_disk = AsyncMock()
+        manager._machine_has_active_tasks = AsyncMock(return_value=False)
+        manager._retain_machine_stop_claim = AsyncMock(return_value=True)
+        manager._settle_machine_stop = AsyncMock()
+        manager._stop_result = AsyncMock(return_value={"status": "stopped"})
+        session = _make_mock_session()
+        manager._machine(_STUB_COMPUTER_ID).session = session
+
+        await manager._finish_claimed_stop(
+            _binding("ws-1", kind=kind, files_backup=files_backup),
+            workspace_id="ws-1",
+            durable_sandbox_id="sandbox-abc",
+        )
+
+        assert manager._backup_machine_files_to_db.await_count == (1 if files_backup else 0)
+        session.stop.assert_awaited_once()
+        manager._settle_machine_stop.assert_awaited_once_with(
+            _STUB_COMPUTER_ID, ComputerStatus.STOPPED
+        )
+
+    @pytest.mark.asyncio
     async def test_stop_a_machine_that_is_gone_raises(self):
         """The machine is the lifecycle authority, so its absence is the error
         a stop reports; the project row is only the handle that asked."""
@@ -1025,7 +1056,7 @@ class TestBackupFilesStrict:
         wm = WorkspaceManager(_make_config())
         session = _make_mock_session()
         session.sandbox.working_dir = "/persisted/root"
-        binding = SimpleNamespace(
+        binding = ComputerBinding(
             workspace_id="workspace", computer_id=_STUB_COMPUTER_ID,
             root_dir="/persisted/root", kind="daytona", provider_config={},
         )
@@ -1045,7 +1076,7 @@ class TestBackupFilesStrict:
         wm = WorkspaceManager(_make_config())
         session = _make_mock_session()
         session.sandbox.working_dir = "/old/root"
-        binding = SimpleNamespace(
+        binding = ComputerBinding(
             workspace_id="workspace",
             computer_id=_STUB_COMPUTER_ID,
             root_dir="/new/root",
@@ -1079,7 +1110,7 @@ class TestBackupFilesStrict:
         wm = WorkspaceManager(_make_config())
         session = _make_mock_session()
         session.sandbox.working_dir = "/old/root"
-        binding = SimpleNamespace(
+        binding = ComputerBinding(
             workspace_id="workspace",
             computer_id=_STUB_COMPUTER_ID,
             root_dir="/new/root",
@@ -1116,7 +1147,7 @@ class TestBackupFilesStrict:
         wm = WorkspaceManager(_make_config())
         session = _make_mock_session()
         session.sandbox.working_dir = "/old/root"
-        binding = SimpleNamespace(
+        binding = ComputerBinding(
             workspace_id="workspace",
             computer_id=_STUB_COMPUTER_ID,
             root_dir="/new/root",
@@ -1155,7 +1186,7 @@ class TestBackupFilesStrict:
         wm = WorkspaceManager(_make_config())
         session = _make_mock_session()
         session.sandbox.working_dir = "/old/root"
-        binding = SimpleNamespace(
+        binding = ComputerBinding(
             workspace_id="workspace",
             computer_id=_STUB_COMPUTER_ID,
             root_dir="/new/root",
@@ -1432,7 +1463,7 @@ class TestBackupFilesStrict:
             events.append("read")
             return "Macro"
 
-        async def sync(_workspace_id, _sandbox, *, layout):
+        async def sync(_workspace_id, _sandbox, *, layout, routine):
             events.append(f"sync {layout.root}/{layout.dir_name}")
             return SyncResult(synced=1)
 
@@ -1610,7 +1641,9 @@ class TestDeleteWorkspace:
             result = await wm.delete_workspace(ws_id)
 
         assert result is True
-        mock_db_delete.assert_awaited_once_with(ws_id)
+        mock_db_delete.assert_awaited_once_with(
+            ws_id, bound_to=_STUB_COMPUTER_ID, keep_folder=False
+        )
         wm._remove_workspace_folder.assert_awaited_once()
         wm._teardown_machine.assert_not_awaited()
         # The session belongs to the computer and outlives the project; only the
@@ -1736,6 +1769,37 @@ class TestDeleteOnASharedMachine:
         "src.server.services.workspace_manager.db_delete_workspace",
         new_callable=AsyncMock,
     )
+    @patch(f"{_RETIREMENT}.get_computer", new_callable=AsyncMock)
+    @cm_patch("db_get_workspace", new_callable=AsyncMock)
+    async def test_a_machine_with_backups_off_is_not_backed_up_before_a_delete(
+        self, mock_db_get, mock_get_computer, mock_db_delete
+    ):
+        """The last sync before a delete is a routine backup like any other,
+        which its owner turned off; the delete itself goes ahead."""
+        computer = _make_computer(
+            computer_id=_STUB_COMPUTER_ID, kind="ssh", files_backup=False
+        )
+        ws_id = str(uuid.uuid4())
+        mock_db_get.return_value = _make_workspace(
+            workspace_id=ws_id, computer_id=_STUB_COMPUTER_ID, dir_name="alpha-1a2b"
+        )
+        mock_get_computer.return_value = computer
+
+        wm = self._manager()
+        with _patch_resolve(computer), _patch_live_ids("sibling-ws"):
+            assert await wm.delete_workspace(ws_id) is True
+
+        wm.backup_project_files.assert_not_awaited()
+        mock_db_delete.assert_awaited_once_with(
+            ws_id, bound_to=_STUB_COMPUTER_ID, keep_folder=True
+        )
+        wm._remove_workspace_folder.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @patch(
+        "src.server.services.workspace_manager.db_delete_workspace",
+        new_callable=AsyncMock,
+    )
     @patch(f"{_RETIREMENT}.update_computer_status", new_callable=AsyncMock)
     @patch(f"{_RETIREMENT}.get_computer", new_callable=AsyncMock)
     @cm_patch("db_get_workspace", new_callable=AsyncMock)
@@ -1848,6 +1912,91 @@ class TestDeleteOnASharedMachine:
             {"expected": "running"},
             {"expected": "stopping"},
         ]
+
+
+class TestDeleteKeepsTheFolderOnTheOwnersMachine:
+    """A folder on a machine its owner brought may hold work kept nowhere else,
+    so a delete leaves it unless the owner asked for it to go."""
+
+    def setup_method(self):
+        WorkspaceManager.reset_instance()
+        self._retirement_marker = patch(
+            f"{_RETIREMENT}.mark_computer_retirement_pending",
+            AsyncMock(return_value=True),
+        )
+        self._retirement_marker.start()
+        self._retirement_clear = patch(
+            f"{_RETIREMENT}.clear_computer_retirement_pending",
+            AsyncMock(return_value=True),
+        )
+        self._retirement_clear.start()
+
+    def teardown_method(self):
+        self._retirement_clear.stop()
+        self._retirement_marker.stop()
+        WorkspaceManager.reset_instance()
+
+    async def _delete(self, kind, **kwargs):
+        computer = _make_computer(computer_id=_STUB_COMPUTER_ID, kind=kind)
+        ws_id = str(uuid.uuid4())
+        wm = WorkspaceManager(_make_config())
+        wm._teardown_machine = AsyncMock()
+        wm._remove_workspace_folder = AsyncMock()
+        wm.backup_project_files = AsyncMock()
+        wm._machine_decision_lock = _decision_lock(True)
+        with (
+            patch(
+                f"{_WORKSPACE_MANAGER}.db_delete_workspace", new_callable=AsyncMock
+            ) as db_delete,
+            cm_patch(
+                "db_get_workspace",
+                AsyncMock(
+                    return_value=_make_workspace(
+                        workspace_id=ws_id,
+                        computer_id=_STUB_COMPUTER_ID,
+                        dir_name="alpha",
+                    )
+                ),
+            ),
+            patch(f"{_RETIREMENT}.get_computer", AsyncMock(return_value=computer)),
+            _patch_resolve(computer),
+            _patch_live_ids("sibling-ws"),
+        ):
+            assert await wm.delete_workspace(ws_id, **kwargs) is True
+        return ws_id, db_delete, wm._remove_workspace_folder
+
+    @pytest.mark.asyncio
+    async def test_a_delete_leaves_the_folder_by_default(self):
+        """The default is what an agent's tool and any API caller without the
+        flag get, so it is the one that must not lose files."""
+        ws_id, db_delete, remove = await self._delete("ssh")
+
+        db_delete.assert_awaited_once_with(
+            ws_id, bound_to=_STUB_COMPUTER_ID, keep_folder=True
+        )
+        remove.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_the_owner_asking_deletes_the_folder(self):
+        ws_id, db_delete, remove = await self._delete("ssh", delete_files=True)
+
+        db_delete.assert_awaited_once_with(
+            ws_id, bound_to=_STUB_COMPUTER_ID, keep_folder=False
+        )
+        remove.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("kind", ["daytona", "e2b", "docker"])
+    @pytest.mark.parametrize("delete_files", [False, True])
+    async def test_a_hosted_machine_deletes_the_folder_either_way(
+        self, kind, delete_files
+    ):
+        ws_id, db_delete, remove = await self._delete(kind, delete_files=delete_files)
+
+        db_delete.assert_awaited_once_with(
+            ws_id, bound_to=_STUB_COMPUTER_ID, keep_folder=False
+        )
+        remove.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------
@@ -4921,6 +5070,41 @@ class TestEntitledAlwaysOn:
             assert await manager._entitled_always_on(binding, "user-1") is False
         mock_set_ao.assert_awaited_once_with(_STUB_COMPUTER_ID, False)
 
+    @pytest.mark.asyncio
+    async def test_unmetered_kind_keeps_flag_without_probe(self):
+        """A user's own machine keeps always-on whatever the plan says."""
+        manager = self._make_manager()
+        binding = _binding("ws-1", is_always_on=True, kind="ssh")
+
+        with (
+            patch(self._LOST, new_callable=AsyncMock, return_value=True) as mock_lost,
+            patch(self._SET_AO, new_callable=AsyncMock) as mock_set_ao,
+        ):
+            assert await manager._entitled_always_on(binding, "user-1") is True
+        mock_lost.assert_not_awaited()
+        mock_set_ao.assert_not_awaited()
+
+
+class TestReconcileAlwaysOnUnmetered:
+    @pytest.mark.asyncio
+    async def test_unmetered_exempt_unprobed_metered_reclaimed(self):
+        manager = WorkspaceManager(_make_config())
+        ssh = _make_computer(computer_id="c-ssh", kind="ssh", is_always_on=True)
+        cloud = _make_computer(computer_id="c-cloud", is_always_on=True)
+        lost = "src.server.dependencies.usage_limits.always_on_entitlement_lost"
+
+        with (
+            patch(lost, new_callable=AsyncMock, return_value=True) as mock_lost,
+            patch.object(
+                manager, "set_computer_always_on", new_callable=AsyncMock, return_value={}
+            ) as disable,
+        ):
+            exempt = await manager._reconcile_always_on_entitlements([ssh, cloud])
+
+        assert exempt == {"c-ssh"}
+        mock_lost.assert_awaited_once_with("user-1")
+        disable.assert_awaited_once_with("c-cloud", False)
+
 
 class TestSetComputerAlwaysOn:
     def setup_method(self):
@@ -5053,6 +5237,36 @@ class TestSetComputerAlwaysOn:
             "capacity-exit",
             "observed-exit",
         ]
+
+    @pytest.mark.asyncio
+    async def test_an_owners_machine_goes_always_on_outside_the_plan_cap(self):
+        """Its owner runs and pays for it, so no always-on slot counts it, and
+        the user-wide capacity lock is not held for its toggle."""
+        manager = WorkspaceManager.get_instance(config=_make_config())
+        manager._machine_decision_lock = _decision_lock(True)
+        computer = _make_computer(
+            computer_id=_STUB_COMPUTER_ID, kind="ssh", status="stopped"
+        )
+        capacity = MagicMock(side_effect=AssertionError("capacity lock taken"))
+        gate = AsyncMock()
+        persist = AsyncMock()
+        with (
+            patch(f"{_ENTITLEMENTS}.get_computer", AsyncMock(return_value=computer)),
+            patch(f"{_ENTITLEMENTS}.computer_capacity_lock", capacity),
+            patch(
+                "src.server.dependencies.usage_limits.platform_gating_active",
+                return_value=True,
+            ),
+            patch("src.server.dependencies.usage_limits.assert_always_on_allowed", gate),
+            patch(f"{_ENTITLEMENTS}.db_set_computer_always_on", persist),
+        ):
+            await manager.set_computer_always_on(
+                _STUB_COMPUTER_ID, True, user_id="user-1"
+            )
+
+        persist.assert_awaited_once_with(_STUB_COMPUTER_ID, True)
+        gate.assert_not_awaited()
+        capacity.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -6949,8 +7163,9 @@ class TestRestoreGuard:
             events.append("read")
             return "Macro"
 
-        async def maybe_restore(_workspace_id, _sandbox, *, layout):
+        async def maybe_restore(_workspace_id, _sandbox, *, layout, ask_first=False):
             events.append(f"restore {layout.dir_name}")
+            return True
 
         with (
             patch(f"{_LAYOUT}.workspace_folder_in_use", hold),
@@ -7028,6 +7243,35 @@ class TestRestoreGuard:
             assert not await manager._maybe_restore_files(
                 _binding("ws-1", dir_name="Research"), sandbox
             )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("kind", "restored", "asked", "brought_up"),
+        [
+            ("daytona", True, False, True),
+            ("ssh", False, True, False),
+            ("ssh", True, True, True),
+        ],
+        ids=["hosted", "owner-offered", "owner-owed"],
+    )
+    async def test_a_folder_waiting_on_its_owner_is_attached_but_not_brought_up(
+        self, kind, restored, asked, brought_up
+    ):
+        """Attached, turns keep their skills and tools while the owner decides.
+        The bring-up waits, since its deferred pass would lay backed-up files
+        into the folder too."""
+        manager = WorkspaceManager(_make_config())
+        maybe_restore = AsyncMock(return_value=restored)
+        with (
+            patch(f"{_PROVISIONING}.FilePersistenceService.maybe_restore", maybe_restore),
+            patch.object(manager, "_queue_bring_up") as bring_up,
+        ):
+            assert await manager._maybe_restore_files(
+                _binding("ws-1", kind=kind), MagicMock()
+            ) is True
+
+        assert maybe_restore.await_args.kwargs["ask_first"] is asked
+        assert bring_up.called is brought_up
 
     @pytest.mark.asyncio
     @patch(f"{_LIFECYCLE}.update_workspace_status", new_callable=AsyncMock)
@@ -7163,6 +7407,93 @@ class TestRestoreGuard:
             )
 
         assert order == ["bind", "reconcile"]
+
+
+class TestFilesRestoreChoice:
+    """The owner's answer to a restore offer: lay the backup, or keep the folder."""
+
+    @staticmethod
+    def _manager(session):
+        manager = WorkspaceManager(_make_config())
+        manager.get_session_for_workspace = AsyncMock(return_value=session)
+        manager._ensure_project_attached = AsyncMock()
+        # The settle records a new arrival of the files, read back after it.
+        manager.resolve_binding = AsyncMock(
+            side_effect=[
+                ComputerBinding(
+                    workspace_id="ws-1", computer_id="comp-1", kind="ssh",
+                    dir_name="test-ab12", root_dir="/home/u/langalpha",
+                    files_epoch=epoch,
+                )
+                for epoch in ("before", "after")
+            ]
+        )
+        return manager
+
+    @staticmethod
+    def _offer(standing=True, settled=True):
+        return (
+            patch(
+                f"{_WORKSPACE_MANAGER}.files_restore_offered",
+                AsyncMock(return_value=standing),
+            ),
+            patch(
+                f"{_WORKSPACE_MANAGER}.FilePersistenceService.settle_restore_offer",
+                AsyncMock(return_value=settled),
+            ),
+        )
+
+    @pytest.mark.asyncio
+    async def test_with_no_offer_standing_the_machine_is_not_reached(self):
+        """The folder came back or another tab chose: nothing waits on this one."""
+        manager = self._manager(_make_mock_session())
+        offered, settle = self._offer(standing=False)
+        with offered, settle as settled:
+            assert not await manager.settle_files_restore_offer(
+                "ws-1", user_id="user-1", restore=True
+            )
+
+        manager.get_session_for_workspace.assert_not_awaited()
+        settled.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("restore", [True, False], ids=["restore", "keep"])
+    async def test_the_choice_settles_on_the_held_folder_then_attaches_anew(self, restore):
+        """The folder is the one read under the hold, and the attach that follows
+        is for the arrival the settle recorded: the one the offer stood on
+        matches the record made while it stood and would skip the restore owed,
+        or the bring-up held back."""
+        session = _make_mock_session()
+        manager = self._manager(session)
+        events = []
+        manager._ensure_project_attached.side_effect = (
+            lambda *_a, **_k: events.append("attach")
+        )
+        offered, settle = self._offer()
+        with offered, settle as settled:
+            settled.side_effect = lambda *_a, **_k: events.append("settle") or True
+            assert await manager.settle_files_restore_offer(
+                "ws-1", user_id="user-1", restore=restore
+            )
+
+        assert settled.await_args.args == ("ws-1", session.sandbox)
+        assert settled.await_args.kwargs["layout"].dir_name == "test-ab12"
+        assert settled.await_args.kwargs["restore"] is restore
+        assert events == ["settle", "attach"]
+        binding, attached = manager._ensure_project_attached.await_args.args
+        assert (binding.files_epoch, attached) == ("after", session)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("restore", [True, False], ids=["restore", "keep"])
+    async def test_a_choice_another_tab_settled_first_is_not_attached_again(self, restore):
+        manager = self._manager(_make_mock_session())
+        offered, settle = self._offer(settled=False)
+        with offered, settle:
+            assert not await manager.settle_files_restore_offer(
+                "ws-1", user_id="user-1", restore=restore
+            )
+
+        manager._ensure_project_attached.assert_not_awaited()
 
 
 class TestGeneratedContentGoesToTheHeldFolder:
@@ -7375,8 +7706,9 @@ class TestGeneratedContentGoesToTheHeldFolder:
             events.append("read")
             return "Macro"
 
-        async def restore(_workspace_id, _sandbox, *, layout):
+        async def restore(_workspace_id, _sandbox, *, layout, ask_first=False):
             events.append(f"restore {layout.dir_name}")
+            return True
 
         return hold, read, restore
 

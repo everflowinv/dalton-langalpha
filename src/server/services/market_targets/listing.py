@@ -13,10 +13,16 @@ from typing import Any, Mapping, NamedTuple, Optional, Tuple
 from market_protocol import AssetClass, InstrumentRef, to_legacy_api
 
 from src.data_client.ginlix_data.data_source import index_ticker
-from src.server.models.automation import MarketType, bare_alert_listing, is_pair_symbol
+from src.server.models.automation import (
+    MarketType,
+    bare_alert_listing,
+    is_pair_symbol,
+    is_unsuffixed_code,
+)
 from src.server.services.price_monitor import watched_listing, watched_market
 from src.tools.market_data.display import resolve_ref
 from src.tools.wakeups.wording import (
+    LISTING_NO_SUFFIX,
     LISTING_PAIR,
     LISTING_UNKNOWN_SUFFIX,
     LISTING_UNREADABLE as UNREADABLE,
@@ -74,6 +80,8 @@ def target_listing(symbol: str) -> Tuple[Optional[TargetListing], Optional[str]]
     price monitor cannot watch it."""
     if is_pair_symbol(symbol):
         return None, LISTING_PAIR
+    if is_unsuffixed_code(symbol):
+        return None, LISTING_NO_SUFFIX
     if symbol.startswith("^"):
         key, market = index_ticker(symbol).removeprefix("I:"), MarketType.INDEX
     else:

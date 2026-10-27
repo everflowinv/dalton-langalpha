@@ -338,11 +338,14 @@ async def execute_task_report_back(job: dict) -> None:
     busy-wait cap, re-parks the job as deferred instead of dropping — the
     thread's next dead-turn finalize releases it.
     """
+    from src.server.database.runs import lifecycle as tl_db
     from src.server.database.runs import outbox as outbox_db
     from src.server.services.report_back.notify_turn import (
         await_run_terminal,
         park_while_thread_busy,
         post_notification_turn,
+        release_if_a_turn_ended,
+        run_marker,
     )
     from src.server.services.report_back.handoff import wake
     from src.server.services.hook_outbox import LEASE_SECONDS, MAX_ATTEMPTS
@@ -418,6 +421,11 @@ async def execute_task_report_back(job: dict) -> None:
                 await publish_cleared_wake(thread_id)
             return
 
+        # Read before the look: a turn whose finalize runs while this job is
+        # claimed releases nothing for it, and this is how a capped wait
+        # below tells that one ended meanwhile.
+        at_claim = run_marker(await tl_db.get_latest_attempt(thread_id))
+
         # A live turn takes the report in as a steer before its next model
         # call (``report_back.steer``; jobs are born at the run's CAS,
         # usually mid-turn), or fetches the result itself.
@@ -456,8 +464,17 @@ async def execute_task_report_back(job: dict) -> None:
             return  # reclaimed: the live owner resumes; no teardown
         if outcome == "cap":
             # Busy thread (long user turn, backlog). Not a failure: park
-            # until the next dead-turn finalize re-releases the job.
-            await _repark()
+            # until the next dead-turn finalize re-releases the job, or now
+            # if a turn ended while this claim held it. Only on an ending: a
+            # thread that refused every POST while idle (no credit) would
+            # otherwise spin the job through its attempts to dead.
+            if await _repark() == "pending" and await release_if_a_turn_ended(
+                thread_id, at_claim
+            ):
+                logger.info(
+                    f"[TASK_REPORT_BACK] A turn on thread {thread_id} ended "
+                    f"during the claim; released {subject} for one more look"
+                )
             return
         if outcome in ("deleted", "drop"):
             return  # thread gone or terminal rejection: ack, nothing owed

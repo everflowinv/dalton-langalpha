@@ -31,6 +31,10 @@ export interface ToolActivityItem extends ActivityIdentity {
   isFailed?: boolean;
   _recentlyCompleted?: boolean;
   _annotationStep?: boolean;
+  /** The computer's root, which the row's title, pill and icon read its
+   *  paths under. Stamped by the projection that built the row, so every
+   *  reader of the row agrees with the filter that kept it. */
+  root?: string | null;
 }
 
 export type ActivityItem = ReasoningActivityItem | ToolActivityItem;

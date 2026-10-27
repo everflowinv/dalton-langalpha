@@ -55,6 +55,8 @@ export interface FileViewerProps {
   // no reference to land, no editor and no workspace to link into.
   focus?: FileViewerFocus;
   onPageCount?: (pages: number) => void;
+  /** An HTML file's markup rather than its page, switched from the panel header. */
+  htmlSource?: boolean;
 
   isEditing?: boolean;
   editContent?: string | null;
@@ -187,9 +189,9 @@ export function FileViewer(props: FileViewerProps): React.ReactElement {
             servePrefix={props.servePrefix}
             anchor={focus.htmlAnchor}
             anchorSeq={focus.seq}
-            onTriggerDownload={props.onDownloadInFallback}
             // DALTON-HOOK(team-sharing): forward teamReadOnly to HtmlViewer
             teamReadOnly={props.teamReadOnly}
+            source={props.htmlSource}
           />
         </DocumentErrorBoundary>
       </Suspense>

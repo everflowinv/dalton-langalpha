@@ -236,7 +236,7 @@ def history(monkeypatch):
         if thread_id is None or short_id not in (None, thread_id[:8]):
             return []
         listed = [
-            ListedFile(thread_id, thread_id[:8], path, sha256, size)
+            ListedFile(thread_id, thread_id[:8], path, sha256, size, USER)
             for path, (sha256, size) in sorted(list_transcript(workspace_id, thread_id[:8]).items())
         ]
         return listed[:limit]

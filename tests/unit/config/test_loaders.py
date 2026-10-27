@@ -178,7 +178,6 @@ class TestLoadFromDictOptionalSections:
         data = _full_config_dict(skills={
             "enabled": False,
             "user_skills_dir": "/custom/skills",
-            "sandbox_skills_base": "/sandbox/skills",
         })
         config = load_from_dict(data)
         assert config.skills.enabled is False

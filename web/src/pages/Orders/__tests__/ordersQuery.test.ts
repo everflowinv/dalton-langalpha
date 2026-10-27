@@ -33,6 +33,7 @@ describe('ordersQueryParams', () => {
     // Unknown is open: the server still reconciles it, so a surface keeps polling.
     expect(ordersQueryParams({ status: 'open' }).status).toContain('unknown');
     expect(ordersQueryParams({ status: 'failed' }).status).toEqual(['failed']);
+    expect(ordersQueryParams({ status: 'handed_off' }).status).toEqual(['handed_off']);
   });
 
   it('drops an unset facet rather than sending it empty', () => {

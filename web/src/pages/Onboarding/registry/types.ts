@@ -21,7 +21,7 @@ export interface AnnouncementDef {
 
 /**
  * Illustration scene rendered in the intro modal's visual panel. Implemented
- * in `engine/introVisuals.tsx` — the Record there is typed against this union,
+ * in `engine/introScenes/index.ts` — the Record there is typed against this union,
  * so adding an id without a scene is a compile error.
  */
 export type IntroVisualId =
@@ -29,21 +29,37 @@ export type IntroVisualId =
   | 'workspaceGrid'
   | 'chiefOfStaffAnswer'
   | 'ptcSandbox'
+  | 'shareThread'
   | 'createWorkspace'
   | 'filePanel'
+  | 'chartPanel'
   | 'memory'
   | 'memo'
   | 'dashboardGrid'
   | 'dashboardCustomize'
-  | 'dashboardAttach';
+  | 'dashboardAttach'
+  | 'marketAsk'
+  | 'marketDraw'
+  | 'automationTrigger'
+  | 'automationAsk'
+  | 'automationFeed'
+  | 'automationDelivery';
 
-/** One stage of a page intro. Copy is i18n keys under `onboarding.intros.*`. */
+/**
+ * One stage of a page intro. Its copy is `<intro id>.<step id>.title` and
+ * `.body` in the `intros` namespace (locales/intros/), which loads with the
+ * first intro rather than on every page.
+ */
 export interface PageIntroStepDef {
-  /** Stable id — React key + i18n path segment. */
+  /** Stable id — React key + the copy's key segment. */
   id: string;
-  titleKey: string;
-  bodyKey: string;
   visual: IntroVisualId;
+  /**
+   * Only on the hosted platform, where the step's feature exists (chat app
+   * delivery, say); a self-hosted build skips it. Never on a first step, which
+   * `PageIntroDef.steps` rejects.
+   */
+  platformOnly?: boolean;
 }
 
 /**
@@ -56,18 +72,25 @@ export interface PageIntroDef {
   id: string;
   /** Which pages this intro belongs to. */
   matchRoute: (pathname: string) => boolean;
-  /** At least one step — the modal indexes steps[0], so empty would crash. */
-  steps: [PageIntroStepDef, ...PageIntroStepDef[]];
+  /**
+   * At least one step — the modal indexes steps[0], so empty would crash. The
+   * first shows on every deployment, so dropping platform-only steps never
+   * empties an intro.
+   */
+  steps: [PageIntroStepDef & { platformOnly?: false }, ...PageIntroStepDef[]];
 }
 
-/** A task on the getting-started checklist card. Copy is i18n keys. */
+/** A task on the getting-started list in the sidebar. Copy is i18n keys. */
 export interface GettingStartedTaskDef {
   id: string;
   titleKey: string;
   descKey: string;
   /** Where clicking the task navigates (router path, or a full URL when external). */
   to: string;
-  /** Cross-app destination: opens in a new tab and is stamped done on click. */
+  /**
+   * Cross-app destination, stamped done on click: a new tab in the browser,
+   * this window in the desktop app.
+   */
   external?: boolean;
   /** Only offered on the hosted platform (e.g. channel integrations). */
   platformOnly?: boolean;

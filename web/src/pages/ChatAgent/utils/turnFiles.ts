@@ -137,8 +137,8 @@ function placeRef(
     return { path: sibling.path, workspaceId: sibling.workspaceId, notes: isAgentNotesPath(parseAgentPath(sibling.path)) };
   }
   return {
-    path: workspaceScopedPath(parts, folders?.dirName, folders?.previousDirNames),
-    notes: isAgentNotesPath(parts, folders?.dirName, folders?.previousDirNames),
+    path: workspaceScopedPath(parts, folders?.dirName, folders?.previousDirNames, folders?.otherRoots),
+    notes: isAgentNotesPath(parts, folders?.dirName, folders?.previousDirNames, folders?.otherRoots),
   };
 }
 
@@ -164,15 +164,15 @@ function filesInMessage(message: TurnMessage, folders?: ComputerFolders | null):
     // would mark a real chart as already drawn and suppress the card its Write
     // earned. The scan is a read, but it is the same prose/code split every
     // rewrite in this pipeline goes through.
-    mapOutsideCode(text ? normalizeFileRefs(text) : '', (prose) => {
+    mapOutsideCode(text ? normalizeFileRefs(text, folders?.rootDir, folders?.otherRoots) : '', (prose) => {
       const collect = (raw: string, embeds: boolean) => {
         const dest = raw.replace(/^<|>$/g, '');
-        if (!isFilePath(dest)) return;
+        if (!isFilePath(dest, folders)) return;
         // `#L12` and `:42` are link syntax, so they come off before the path
         // rules run: those drop a fragment, and would take the location with it.
         const { path: href, location } = splitFileLocation(dest);
         const wsRef = parseWsPath(href);
-        const { path, workspaceId, notes } = placeRef(parseAgentHref(href), folders);
+        const { path, workspaceId, notes } = placeRef(parseAgentHref(href, folders?.rootDir), folders);
         if (!openablePath(path) || notes) return;
         const file: TurnFile = { path, workspaceId: wsRef?.workspaceId ?? workspaceId, location: location ?? undefined };
         if (embeds || isImagePath(path)) {
@@ -191,7 +191,7 @@ function filesInMessage(message: TurnMessage, folders?: ComputerFolders | null):
     });
   }
 
-  for (const { parts, call } of writeCalls(message)) {
+  for (const { parts, call } of writeCalls(message, folders?.rootDir)) {
     const { path, workspaceId, notes } = placeRef(parts, folders);
     if (!openablePath(path) || notes) continue;
     // Only an Edit says what changed. A Write carries the new file alone, and
@@ -253,7 +253,8 @@ export function collectTurnFiles(
 // the transcript, and the entry built without them hides the wrong `agent.md`.
 // They are compared by value, so the same names from another copy of the
 // record still hit. The siblings' folders join them, for the same reason: the
-// list of every workspace lands after the transcript too.
+// list of every workspace lands after the transcript too, and so do the
+// computers' roots, which the absolute paths are read against.
 const turnCache = new WeakMap<object, {
   members: readonly TurnMessage[];
   folders: string;
@@ -263,8 +264,11 @@ const turnCache = new WeakMap<object, {
 function cachedTurnFiles(members: readonly TurnMessage[], folders: ComputerFolders | null): TurnFile[] {
   const key = members[members.length - 1] as object | undefined;
   if (!key) return [];
-  // A folder name holds no `/`, so joined on it the names read back unambiguously.
+  // A folder name holds no `/`, so joined on it the names read back
+  // unambiguously; a root holds no control character.
   const names = [
+    folders?.rootDir ?? '',
+    (folders?.otherRoots ?? []).join('\u0001'),
     [folders?.dirName ?? '', ...(folders?.previousDirNames ?? [])].join('/'),
     ...(folders?.siblings ?? []).map((s) => [s.workspaceId, s.dirName, ...(s.previousDirNames ?? [])].join('/')),
   ].join('\u0000');

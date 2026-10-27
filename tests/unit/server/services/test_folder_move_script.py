@@ -1443,6 +1443,83 @@ async def test_a_settle_sends_the_script_every_field_it_reads(root, monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_a_folder_its_owner_kept_is_set_aside_only_for_its_names_new_owner(
+    root, monkeypatch
+):
+    """Deleted on the owner's machine without asking for the files to go, a
+    folder stays where it is, and goes under leftovers, whole, only when a new
+    workspace takes its name. No pass deletes it, even where a rename fails."""
+    from contextlib import asynccontextmanager
+    from unittest.mock import AsyncMock
+
+    from src.server.database.workspace_folders import (
+        FOLDER_LAYOUT_VERSION, FolderRow, plan_folder_moves,
+    )
+    from src.server.services.computer_manager import _folders
+
+    rows = [
+        FolderRow("K", "Research", "Research", True, kept=True),
+        FolderRow("L", "Old", "Old", True, kept=True),
+        FolderRow("A", "Research", "Research-1a2b", False),
+    ]
+
+    @asynccontextmanager
+    async def lock(_computer_id):
+        yield object()
+
+    sent = []
+    real_run = _folders._run_folder_script
+
+    async def run(*args, **kwargs):
+        sent.append(kwargs)
+        return await real_run(*args, **kwargs)
+
+    record = AsyncMock(return_value={"A"})
+    monkeypatch.setattr(_folders, "read_folder_rows", AsyncMock(return_value=(FOLDER_LAYOUT_VERSION, rows)))
+    monkeypatch.setattr(_folders, "busy_workspace_ids", AsyncMock(return_value=set()))
+    monkeypatch.setattr(_folders, "workspace_folders_lock", lock)
+    monkeypatch.setattr(_folders, "stage_folder_moves", AsyncMock(return_value=plan_folder_moves(rows)))
+    monkeypatch.setattr(_folders, "record_folder_landings", record)
+    monkeypatch.setattr(_folders, "_run_folder_script", run)
+    _hard_to_copy(root, "Research", "kept")
+    want = _tree(root / "Research")
+    _folder(root, "Old", "also kept")
+    _folder(root, "Research-1a2b", "A")
+
+    assert await _folders.FolderSettleMixin._settle_folders(
+        None, "c", _SubprocessRuntime(), root=str(root)
+    )
+    [payload] = sent
+    assert [(t["id"], t["stuck"]) for t in payload["tombstones"]] == [("K", "copy")]
+    assert record.await_args.kwargs == {
+        "moves": {"A": "Research"}, "tombstones": {"K": f"{LEFTOVERS}/K"},
+    }
+    assert _owner(root, "Research") == "A"
+    assert _tree(root / LEFTOVERS / "K") == want
+    assert _owner(root, "Old") == "also kept"
+
+
+def test_on_a_restored_disk_a_kept_folder_is_copied_aside_not_deleted(root):
+    """A failed rename deletes an ordinary deleted workspace's folder where it
+    is; one its owner kept is copied under leftovers instead."""
+    _hard_to_copy(root, "Research", "kept")
+    want = _tree(root / "Research")
+    _folder(root, "Research-1a2b", "A")
+    report = _run(
+        root,
+        before=prefix(archive(root)),
+        tombstones=[{"id": "K", "dir": "Research", "stuck": "copy"}],
+        moves=[{"id": "A", "source": "Research-1a2b", "target": "Research"}],
+        copying=["A"],
+    )
+    assert report["errors"] == []
+    assert report["tombstones"] == {"K": f"{LEFTOVERS}/K"}
+    assert "K" not in report.get("deleted", [])
+    assert _tree(root / LEFTOVERS / "K") == want
+    assert _owner(root, "Research") == "A"
+
+
+@pytest.mark.asyncio
 async def test_a_settle_whose_script_never_started_puts_its_rows_back(root, monkeypatch):
     """Staged rows are refused by every acquisition until they land; when the
     plan never reached the disk, nothing moved, so the row can go back now."""

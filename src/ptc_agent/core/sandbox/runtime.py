@@ -134,16 +134,20 @@ class ExecResult:
 class PreviewInfo:
     """Preview URL info for a service running in the sandbox.
 
-    ``browser_ready`` False means ``url`` only answers a request carrying
-    ``auth_headers``, which a browser cannot add, so the server hands a browser
-    a proxied URL instead and never this one. The headers stay out of the repr
-    because they are a live credential for the sandbox's ports.
+    ``browser_ready`` False means a browser cannot use ``url`` itself, so the
+    server hands it a proxied URL instead and never this one: ``url`` answers
+    only a request carrying ``auth_headers``, which a browser cannot add, or,
+    when ``process_local``, only this process, through a forward its
+    connection to the machine holds for as long as that connection lives. The
+    headers stay out of the repr because they are a live credential for the
+    sandbox's ports.
     """
 
     url: str
     token: str | None
     auth_headers: dict[str, str] = field(default_factory=dict, repr=False)
     browser_ready: bool = True
+    process_local: bool = False
 
 
 @dataclass
@@ -262,6 +266,13 @@ class SandboxRuntime(ABC):
         """Set/unset sandbox-level env vars; providers without support raise."""
         raise NotImplementedError(
             f"{type(self).__name__} does not support sandbox env updates"
+        )
+
+    async def replace_env(self, env: dict[str, str]) -> bool:
+        """Make *env* the sandbox's whole env, for a provider whose
+        ``converges_env`` is set (others raise); True when it changed."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support replacing the sandbox env"
         )
 
     async def update_secrets(self, secrets: dict[str, str]) -> None:
@@ -481,6 +492,25 @@ class SandboxProvider(ABC):
     # Whether a sandbox that once held plaintext can be scrubbed in place: its
     # env rewritten, and every process purged by a stop.
     scrubs_platform_secrets: ClassVar[bool] = False
+    # False where the machine is not the server's to replace: a lost one waits
+    # for its owner to bring it back, and is never rebuilt from a backup.
+    recreatable: ClassVar[bool] = True
+    # False where the owner brings and pays for the machine, so no plan cap
+    # (computers, always-on) counts it.
+    metered: ClassVar[bool] = True
+    # True where the machine outlives every create, so a change to the env
+    # this deployment gives a new computer reaches it only by being written
+    # again at each open (``SandboxRuntime.replace_env``).
+    converges_env: ClassVar[bool] = False
+    # Whether the file mount may run on the machine. It needs root and
+    # /dev/fuse, which a machine the server does not own need not grant.
+    mounts_livefs: ClassVar[bool] = True
+    # The layout version a sandbox whose manifest has no stamp was made at, so
+    # a failed first manifest write cannot replay older layout moves.
+    first_layout_version: ClassVar[int] = 1
+    # What a new computer is called until its owner names it. A user reads the
+    # name before anything else about the machine, so it says where it runs.
+    default_computer_name: ClassVar[str] = "Cloud computer"
 
     @classmethod
     def platform_secret_name(cls, name: str) -> str:
@@ -492,6 +522,25 @@ class SandboxProvider(ABC):
         """Whether a sandbox built from *settings* measures its own disk, rather
         than its host's."""
         return True
+
+    @classmethod
+    def trusted_host(cls, sandbox: Any) -> bool:
+        """Whether what the deployment holds may reach this kind's machines,
+        under the *sandbox* section.
+
+        False where the machine belongs to the person who added it and the
+        deployment has not vouched for it: no host-resolved MCP env, no
+        platform Secret, no bot credential. The data token goes there either
+        way: it is minted for that one computer and that user, lasts an hour,
+        and ends at stop.
+        """
+        return True
+
+    @property
+    def channel(self) -> str | None:
+        """How calls reach this provider's machines, for traces and metrics,
+        where the kind alone does not say; None where it does."""
+        return None
 
     async def reconcile_platform_secrets(
         self, secrets: "Sequence[ResolvedPlatformSecret]"

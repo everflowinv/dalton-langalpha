@@ -192,6 +192,7 @@ class PTCAgent:
         workspace: WorkspaceLayout | None = None,
         legacy_layout: bool = False,
         files_mounted: bool = False,
+        history_files: bool = False,
         chart_annotation_enabled: bool = True,
         role: AgentRole = "analyst",
         channels_enabled: bool = False,
@@ -204,7 +205,9 @@ class PTCAgent:
         lives in one workspace, so a thread still reuses its own prefix.
         ``channels_enabled`` adds the chat-app section; it follows the
         deployment's messaging service and the turn having a user, neither of
-        which moves between a thread's turns.
+        which moves between a thread's turns. ``history_files`` says the file
+        tools read past threads with no mount, which follows the computer's
+        kind, so it does not move between them either.
         """
         loader = get_loader()
         return loader.get_system_prompt(
@@ -228,6 +231,7 @@ class PTCAgent:
             scratchpad_enabled=scratchpad_enabled,
             direct_tool_summary=direct_tool_summary,
             files_mounted=files_mounted,
+            history_files=history_files,
             chart_annotation_enabled=chart_annotation_enabled,
             role=role,
             channels_enabled=channels_enabled,
@@ -371,6 +375,10 @@ class PTCAgent:
             thread_id=thread_id,
             timezone=turn_context.tool_timezone if turn_context else None,
         )
+        # Past threads the file tools read in process, on a machine no file
+        # mount ever serves; where one may, its links show them instead.
+        history = None if sandbox.mounts_livefs else sandbox.history
+        history_routes = history.routes(backend) if history is not None else []
         filesystem_backend, baseline_store_sources = build_filesystem_backend(
             backend=backend,
             gates=gates,
@@ -379,6 +387,7 @@ class PTCAgent:
             workspace_id=workspace_id_for_memory,
             layout=workspace_layout,
             call=call_context,
+            history_routes=history_routes,
         )
 
         # The folders only the file tools reach, which Bash and code refuse.
@@ -536,14 +545,18 @@ class PTCAgent:
         # Shared placement gives subagents provenance coverage too. The leak
         # detector's redactor scrubs secrets from snippets the content-only scan
         # never sees (provenance fingerprints the raw result/artifact).
-        shared_middleware.append(ProvenanceMiddleware(redactor=leak_detection.redact))
+        shared_middleware.append(
+            ProvenanceMiddleware(
+                redactor=leak_detection.redact, sandbox_root=sandbox.working_dir
+            )
+        )
         if todo_tools:
             shared_middleware.append(TodoWriteMiddleware())
 
+        # The computer's own skills folder: the sync delivers to it under the
+        # live root, which a root the deployment default does not name moves.
         skill_sources = (
-            [f"{self.config.skills.sandbox_skills_base}/"]
-            if self.config.skills.enabled
-            else []
+            [f"{sandbox.layout.skills}/"] if self.config.skills.enabled else []
         )
 
         known_skills: dict[str, Any] = {}
@@ -588,9 +601,7 @@ class PTCAgent:
             backend=backend,
             sources=skill_sources,
             known_skills=known_skills,
-            skill_dirs=[
-                d for d, _ in self.config.skills.local_skill_dirs_with_sandbox()
-            ],
+            skill_dirs=self.config.skills.local_skill_dirs(),
             disabled_skills=self.config.disabled_skills,
         )
         skill_loader_middleware = skills_middleware(
@@ -756,7 +767,12 @@ class PTCAgent:
         # Read once: the baseline freezes this value per epoch, and the
         # prompt is sent with the frozen one (FrozenPromptMiddleware).
         files_mounted = sandbox.livefs is not None
-        system_prompt = render_prompt(files_mounted=files_mounted)
+        # By the machine's kind, not by whether its past threads loaded, so
+        # the prompt cannot flip between a thread's turns.
+        history_files = not sandbox.mounts_livefs
+        system_prompt = render_prompt(
+            files_mounted=files_mounted, history_files=history_files
+        )
 
         logger.debug(
             "Creating agent with custom middleware stack",
@@ -1017,7 +1033,9 @@ class PTCAgent:
                 # below appends to.
                 FrozenPromptMiddleware(
                     files_mounted=files_mounted,
-                    render=lambda mounted: render_prompt(files_mounted=mounted),
+                    render=lambda mounted: render_prompt(
+                        files_mounted=mounted, history_files=history_files
+                    ),
                 ),
                 # Outside every tool wrapper below, so a call refused in the
                 # last minutes of the turn reaches none of them: not the Task

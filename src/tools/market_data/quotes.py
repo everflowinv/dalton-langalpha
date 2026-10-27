@@ -23,9 +23,10 @@ from src.data_client.freshness import is_live
 from src.data_client.ginlix_data.directory import fill_quote_names
 from src.data_client.market_data_provider import snapshot_key
 from src.data_client.ginlix_data.pagination import paginate_cursor
+from src.observability import stamp_tool_provider
 from market_protocol import AssetClass, display_spelling
 
-from ._shared import _get_user_id
+from ._shared import _get_user_id, _mark_failure, _mark_no_data
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +59,7 @@ async def fetch_options_chain(
         ref, underlying = resolve_listing(underlying)
         cur = _symbol_currency(ref)
         if provider.intel is None:
+            _mark_failure("not_configured")
             return (
                 "Options chain data is not available"
                 " (no MarketIntelSource configured).",
@@ -151,6 +153,7 @@ async def fetch_options_chain(
 
     except Exception as e:
         logger.error(f"Error fetching options chain for {underlying}: {e}")
+        _mark_failure(e)
         timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         err = (
             f"## Options Chain: {underlying}\n"
@@ -164,6 +167,19 @@ async def fetch_options_chain(
 
 
 
+def _movers_error(message: str) -> Tuple[str, Dict[str, Any]]:
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    err = (
+        f"## Market Movers\n"
+        f"**Retrieved:** {timestamp}\n"
+        f"**Status:** Error\n\nError: {message}"
+    )
+    return err, {
+        "type": "market_movers", "results": [],
+        "error": message,
+    }
+
+
 async def fetch_market_movers(
     direction: str = "gainers",
     config: Optional[RunnableConfig] = None,
@@ -173,10 +189,17 @@ async def fetch_market_movers(
     Returns:
         Tuple of (markdown content, artifact dict)
     """
+    # The agent's mistake, so refused here unmarked: the data API would answer
+    # it with a 422 that alarms as our failure and shows the model its URL.
+    if direction not in ("gainers", "losers"):
+        return _movers_error(
+            f"direction must be 'gainers' or 'losers', got {direction!r}"
+        )
     try:
         provider = await get_financial_data_provider()
         user_id = _get_user_id(config)
         if provider.intel is None:
+            _mark_failure("not_configured")
             return (
                 "Market movers data is not available"
                 " (no MarketIntelSource configured).",
@@ -217,16 +240,8 @@ async def fetch_market_movers(
 
     except Exception as e:
         logger.error(f"Error fetching market movers ({direction}): {e}")
-        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-        err = (
-            f"## Market Movers\n"
-            f"**Retrieved:** {timestamp}\n"
-            f"**Status:** Error\n\nError: {e}"
-        )
-        return err, {
-            "type": "market_movers", "results": [],
-            "error": str(e),
-        }
+        _mark_failure(e)
+        return _movers_error(str(e))
 
 
 async def fetch_quote(
@@ -301,6 +316,7 @@ async def fetch_quote(
         # The card names each row as the REST routes do; a daily row has none.
         await fill_quote_names(snaps)
         if not snaps:
+            _mark_no_data()
             return f"No quote data available for {', '.join(syms)}.", empty
         # Stamp each row with what it actually is: the declared tier, the
         # measured freshness, and a venue-local clock at the PRINT time when the
@@ -331,6 +347,11 @@ async def fetch_quote(
                 snap["currency"] = ref.price_currency
             all_realtime = all_realtime and is_live(snap["freshness"])
         content = format_quote_block(snaps, at=retrieved_at)
+        # A batch can be split across the chain: one stable name for the set.
+        sources = {snap.get("source") for snap in snaps}
+        stamp_tool_provider(
+            ",".join(sorted(s for s in sources if isinstance(s, str) and s)) or None
+        )
         # Diff on the RESOLVED spelling the provider actually saw (an alias like
         # "SPX" is requested as "GSPC"), but report under the caller's input
         # label, matched as the provider chain matches its rows.
@@ -353,4 +374,5 @@ async def fetch_quote(
         }
     except Exception as e:
         logger.error(f"Error fetching quotes for {syms}: {e}")
+        _mark_failure(e)
         return f"Error fetching quotes: {e}", empty

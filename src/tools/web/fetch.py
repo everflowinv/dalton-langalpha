@@ -23,7 +23,8 @@ from src.llms import LLM, format_llm_content, make_api_call, maybe_disable_strea
 from src.tools.web.inhouse.sitemap import get_sitemap_summary
 from src.tools.decorators import log_io
 from src.tools.web.router import FetchRouter
-from src.observability import stamp_run
+from src.observability import stamp_run, stamp_tool_provider
+from src.tools.web.providers._shared import empty_content_error, mark_web_outcome
 from src.tools.web.types import (
     FetchAttempt,
     FetchRequest,
@@ -284,7 +285,6 @@ async def _extract_with_llm(
             llm=llm,
             system_prompt=EXTRACTION_SYSTEM_PROMPT,
             user_prompt=user_prompt,
-            disable_tracing=True,
         ),
         timeout=EXTRACTION_TIMEOUT,
     )
@@ -368,6 +368,12 @@ async def web_fetch(
             if result.error is not None:
                 kind = result.error.type.value
                 artifact["error"] = kind
+                # A failed URL's error came from the last provider to try it;
+                # the response names a provider only when one succeeded.
+                mark_web_outcome(
+                    result.error,
+                    response.attempts[-1].provider if response.attempts else None,
+                )
                 return _with_sitemap_suggestions(
                     f"[{kind}] Failed to fetch {url}: {result.error.message}",
                     await _sitemap(),
@@ -384,6 +390,7 @@ async def web_fetch(
             markdown = result.markdown
             if not markdown or len(markdown.strip()) < 50:
                 artifact["error"] = "empty"
+                mark_web_outcome(empty_content_error())
                 sitemap_summary = await _sitemap()
                 if sitemap_summary:
                     return _with_sitemap_suggestions(
@@ -407,6 +414,7 @@ async def web_fetch(
         logger.error(f"Failed to process {url}. Error: {repr(e)}")
         short_error = str(e).split('\n')[0][:100]
         artifact["error"] = "exception"
+        mark_web_outcome(e)
         return f"Failed to process {url}: {short_error}", artifact
 
 
@@ -430,6 +438,7 @@ async def _web_fetch_tool_impl(
         fetch_source=artifact.get("source"),
         fetch_error=artifact.get("error"),
     )
+    stamp_tool_provider(provider)
     return content, artifact
 
 

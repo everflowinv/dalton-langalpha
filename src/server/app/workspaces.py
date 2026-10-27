@@ -56,6 +56,7 @@ from src.server.database.workspace import (
     batch_update_sort_order,
 )
 from src.server.models.workspace import (
+    FilesRestoreChoice,
     WorkspaceActionResponse,
     WorkspaceAlwaysOnRequest,
     WorkspaceCreate,
@@ -74,8 +75,9 @@ from src.server.services.computer_errors import (
     ComputerNotFoundError,
     ComputerPreparingError,
 )
+from ptc_agent.core.sandbox.providers.ssh_errors import connect_failure
 from ptc_agent.core.sandbox.runtime import SandboxGoneError, SandboxTransientError
-from src.server.utils.error_sanitization import sandbox_unreachable_detail
+from src.server.utils.error_sanitization import sandbox_failure_http
 from src.server.models.workspace_refresh import WorkspaceRefreshResponse
 from src.server.services.turn_runtime import ensure_home
 from src.server.services.workspace_manager import WorkspaceManager
@@ -116,12 +118,15 @@ async def _workspace_action_errors(action: str, workspace_id: str):
         yield
     except HTTPException:
         raise
-    except (SandboxGoneError, SandboxTransientError):
+    except (SandboxGoneError, SandboxTransientError) as e:
         # Before the RuntimeError arm, which these subclass. An unreachable
         # sandbox is not a bad request: letting it fall through answered 400
         # with the provider's raw text, which both loses the 503 the file panel
         # keys on and ships request URLs and SDK bodies to the client. Re-raise
-        # for the app-level handler that owns the wording and the sanitizing.
+        # for the app-level handler that owns the wording and the sanitizing,
+        # except an owner's SSH machine, which answers as its computer's start.
+        if connect_failure(e) is not None:
+            raise sandbox_failure_http(e) from None
         raise
     except (WorkspaceNameTaken, WorkspaceNameInvalid) as e:
         # Before the ValueError arm: an unusable name is not a missing workspace.
@@ -133,6 +138,8 @@ async def _workspace_action_errors(action: str, workspace_id: str):
         logger.warning(f"Refused to {action}: {e}")
         raise HTTPException(status_code=400, detail=e.user_message) from None
     except RuntimeError as e:
+        if connect_failure(e) is not None:
+            raise sandbox_failure_http(e) from None
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.exception(f"Error {action} workspace {workspace_id}: {e}")
@@ -164,6 +171,8 @@ def _workspace_to_response(workspace: dict) -> WorkspaceResponse:
         computer_id=str(computer_id) if computer_id else None,
         dir_name=workspace.get("dir_name"),
         previous_dir_names=list(workspace.get("previous_dir_names") or ()),
+        root_dir=workspace.get("computer_root_dir") or None,
+        previous_root_dirs=list(workspace.get("previous_root_dirs") or ()),
         status=workspace["status"],
         is_home=is_home_row(workspace),
         created_at=workspace["created_at"],
@@ -176,6 +185,8 @@ def _workspace_to_response(workspace: dict) -> WorkspaceResponse:
         resource_tier=workspace.get("resource_tier", "standard"),
         is_always_on=workspace.get("is_always_on", False),
         files_restore_incomplete=bool(workspace.get("files_restore_incomplete")),
+        files_restore_offered_at=workspace.get("files_restore_offered_at"),
+        files_backed_up_at=workspace.get("files_backed_up_at"),
     )
 
 
@@ -820,11 +831,46 @@ async def move_workspace(
     Copying a folder outlasts a request, so the refusals a client can act on
     are answered here as a 409 ``{code, message}`` and the outcome is read
     back from ``GET /{workspace_id}/move``. Home moves only by making its
-    computer primary.
+    computer primary. ``from_backup`` is for a machine its owner brought that
+    is gone, typically offered after a move failed ``source_unavailable``.
     """
     workspace = await db_get_workspace(workspace_id)
     require_workspace_owner(workspace, user_id=x_user_id)
-    return await accept_workspace_move(x_user_id, workspace_id, request.computer_id)
+    return await accept_workspace_move(
+        x_user_id,
+        workspace_id,
+        request.computer_id,
+        from_backup=request.from_backup,
+    )
+
+
+@router.post("/{workspace_id}/files/restore-choice", response_model=WorkspaceResponse)
+async def choose_files_restore(
+    workspace_id: str,
+    request: FilesRestoreChoice,
+    x_user_id: CurrentUserId,
+):
+    """Restore the folder gone from its owner's machine, or keep it as it is.
+
+    Answers once the files are back or the folder is taken as it is, which
+    brings the machine up, and a 409 when no restore waits on a choice: the
+    folder came back, or another tab chose.
+    """
+    workspace = await db_get_workspace(workspace_id)
+    require_workspace_owner(workspace, user_id=x_user_id)
+    try:
+        settled = await WorkspaceManager.get_instance().settle_files_restore_offer(
+            workspace_id, user_id=x_user_id, restore=request.restore
+        )
+    except Exception as e:
+        logger.warning(f"Restore choice for workspace {workspace_id} failed: {e}")
+        raise sandbox_failure_http(e) from None
+    if not settled:
+        raise HTTPException(
+            status_code=409,
+            detail="No restore is waiting on a choice for this workspace.",
+        )
+    return _workspace_to_response(await db_get_workspace(workspace_id) or workspace)
 
 
 @router.get("/{workspace_id}/move", response_model=Optional[WorkspaceMoveOut])
@@ -881,10 +927,10 @@ async def refresh_workspace(
         # rather than spelling a fourth variant of this 503 here.
         raise
     except Exception as e:
-        # Everything else still answers 503, but never with the raw text: this
-        # is the same call _acquire_sandbox makes, and its exceptions quote
-        # provider URLs and sandbox ids.
-        raise HTTPException(status_code=503, detail=sandbox_unreachable_detail(e))
+        # Everything else answers as _acquire_sandbox does, never with the raw
+        # text: this is the same call, and its exceptions quote provider URLs
+        # and sandbox ids.
+        raise sandbox_failure_http(e) from None
 
     sandbox = getattr(session, "sandbox", None)
     if sandbox is None:
@@ -927,16 +973,28 @@ async def refresh_workspace(
 
 
 @router.delete("/{workspace_id}", status_code=204)
-async def delete_workspace(workspace_id: str, x_user_id: CurrentUserId):
+async def delete_workspace(
+    workspace_id: str,
+    x_user_id: CurrentUserId,
+    delete_files: bool = Query(
+        False,
+        description=(
+            "Also delete the workspace's folder from a machine the user brought. "
+            "Without it that folder stays; on every other computer it is always deleted."
+        ),
+    ),
+):
     """
     Delete a workspace and its project data.
 
-    This permanently deletes the workspace and its folder. The computer and
-    sibling workspaces remain available.
+    This deletes the workspace and its folder, except on a machine the user
+    brought, where the folder stays unless ``delete_files`` is set. The
+    computer and sibling workspaces remain available.
 
     Args:
         workspace_id: Workspace UUID
         x_user_id: Authenticated user ID
+        delete_files: Also delete the folder from the user's own machine
     """
     try:
         workspace = await db_get_workspace(workspace_id)
@@ -954,7 +1012,7 @@ async def delete_workspace(workspace_id: str, x_user_id: CurrentUserId):
             )
 
         manager = WorkspaceManager.get_instance()
-        await manager.delete_workspace(workspace_id)
+        await manager.delete_workspace(workspace_id, delete_files=delete_files)
 
         # Invalidate existence cache
         from src.server.database.conversation import ws_exists_key

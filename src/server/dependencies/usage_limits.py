@@ -867,9 +867,9 @@ async def assert_provider_allowed(
 ) -> None:
     """Gate creating a computer on ``kind`` (scope 403). The default kind is never gated.
 
-    Scope only, with no count quota: the computer cap already meters machines
-    whatever they run on. No-op in OSS mode, fail-open when the platform is
-    unreachable.
+    Scope only, with no count quota: the computer cap already meters every
+    machine the deployment provides, and none its owner brings (``metered``).
+    No-op in OSS mode, fail-open when the platform is unreachable.
     """
     if kind == default_kind:
         return

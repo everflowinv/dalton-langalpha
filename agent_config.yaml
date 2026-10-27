@@ -28,7 +28,8 @@ sandbox:
   provider: "daytona"
   # Other providers a user may pick when creating a computer; `provider` stays
   # the default. Each needs its credentials, and a computer keeps its provider.
-  # offered_providers: ["e2b"]
+  # "ssh" is offered only this way: it lets users add their own Linux or macOS machine.
+  # offered_providers: ["e2b", "ssh"]
 
   # Daytona cloud sandbox configuration
   daytona:
@@ -55,6 +56,45 @@ sandbox:
     # A computer keeps the value it was created with, so turning this back on
     # still needs the proxy until the computers created while it was off are gone.
     public_traffic: true
+
+  # A machine the user brings, reached over SSH (offer it with
+  # offered_providers). Each user gets one client key, which they authorize on
+  # their machine; the host, login and pinned host key are set per computer
+  # when the user adds it, never here. Needs BYOK_ENCRYPTION_KEY, which keeps
+  # the client keys encrypted at rest, and PREVIEW_PROXY_BASE_URL, since a
+  # preview of a port on the machine is served through the preview proxy.
+  # The agent runs as the login user in a folder of its own, ~/langalpha unless
+  # the user picks another (filesystem.working_directory applies to hosted
+  # computers only), with a Python runtime it installs under ~/.langalpha on
+  # the first start. Nothing this deployment holds (MCP server keys, platform
+  # secrets) is sent to the machine, only the computer's own data token, so a
+  # built-in server that needs a vendor key works there when it is served over
+  # HTTP with `auth: data_token`, and not over stdio. Removing the computer
+  # takes those credentials off the machine; the folder stays the owner's.
+  ssh:
+    auto_stop_interval: 3600 # seconds idle before the computer's processes are stopped; the machine keeps running
+    allow_private_addresses: false # true lets users add machines at private, loopback or link-local addresses
+    # true sends SSH machines what any computer gets from this server: the
+    # built-in data servers' keys (FMP_API_KEY and the rest) and the GitHub
+    # bot token. Each machine's owner can read them, so turn it on only where
+    # every user may hold them, such as a deployment you alone use. Machines
+    # added earlier pick the change up at their next start. A deployment with
+    # a platform_secrets catalog refuses to boot with it on.
+    trusted_host: false
+    # SSH connections per user per hour to addresses the user names (a probe,
+    # a pairing, a create); starting a computer is not counted. 0 is no limit.
+    dials_per_hour: 60
+    # Addresses this server's SSH connections come from, as the machines see
+    # them (IPs or CIDR). Set, each machine's key line admits logins only from
+    # these and from the machine itself (its tunnel), and every start brings
+    # the line up to date. Empty admits any address. List a new address
+    # beside the old one until the machines have started once from it.
+    login_from: []
+    connect_timeout: 10 # seconds
+    keepalive_interval: 15 # seconds between keepalives on the pooled connection
+    keepalive_count_max: 3 # unanswered keepalives before the connection is dropped
+    bootstrap_timeout: 1800 # seconds the first start may spend installing the runtime
+    max_computers_per_user: 20 # SSH computers one user may have; 0 for no limit
 
   # Platform-secret catalog: Daytona and E2B providers (ignored under
   # docker/memory). Each entry delivers a backend-owned API key into sandboxes

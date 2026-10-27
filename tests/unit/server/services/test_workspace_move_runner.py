@@ -21,7 +21,7 @@ from src.server.services.computer_manager import ComputerManager
 from src.server.services.computer_errors import ComputerBusyError
 from src.server.services.computer_manager._move import _PUT_BACK_GIVE_UP_S, _folder_held
 from src.server.services.persistence.transfer import SYNC_MARKER_NAME
-from src.server.services.workspace_move import move_from_row
+from src.server.services.workspace_move import MoveNoRoom, move_error, move_from_row
 from tests.unit.restored_overlay import archive, python3_on_path
 
 _MOVE = "src.server.services.computer_manager._move"
@@ -390,7 +390,8 @@ async def test_a_folder_with_no_room_for_its_copy_is_deleted_after_its_backup(
         patch(f"{_MOVE}.advance_workspace_move", advance),
     ):
         staged = await _manager()._set_folder_aside(
-            _staged(), _LocalShell(), str(root), back_up, asyncio.Event()
+            _staged(), _LocalShell(), str(root), back_up, asyncio.Event(),
+            owner_machine=False,
         )
 
     assert staged == {"phase": "staged", "leftovers_path": None}
@@ -399,3 +400,135 @@ async def test_a_folder_with_no_room_for_its_copy_is_deleted_after_its_backup(
     advance.assert_awaited_once_with(MOVE_ID, "runner-1", "staged", leftovers_path=None)
     assert not folder.exists()
     assert not (root / AWAY).exists()
+
+
+@pytest.mark.asyncio
+async def test_a_folder_with_no_room_on_its_owners_machine_stays_and_fails_the_move(
+    tmp_path, monkeypatch
+):
+    """The same disk on a machine its owner brought: the backup lacks .git and
+    dependencies that may exist nowhere else, so the folder is never cut down
+    to it. It stays whole under its name, with its sync marker, nothing of the
+    copy is left, and the move fails with its own sentence."""
+    root = tmp_path / "root"
+    folder = root / "Research"
+    (folder / ".git").mkdir(parents=True)
+    (folder / ".git" / "HEAD").write_text("ref")
+    (folder / SYNC_MARKER_NAME).write_text("synced")
+    python3_on_path(monkeypatch, tmp_path / "bin", archive(root), full=True)
+    back_up = AsyncMock(return_value=True)
+    flag = AsyncMock()
+
+    @asynccontextmanager
+    async def held(computer_id, workspace_id):
+        yield object()
+
+    with (
+        patch(f"{_MOVE}._folder_held", held),
+        patch(f"{_MOVE}.get_workspace_dir_name", AsyncMock(return_value="Research")),
+        patch(f"{_MOVE}.stage_workspace_move", AsyncMock(return_value=_staged())),
+        patch(f"{_MOVE}.flag_rollback_restore", flag),
+        pytest.raises(MoveNoRoom) as raised,
+    ):
+        await _manager()._set_folder_aside(
+            _staged(), _LocalShell(), str(root), back_up, asyncio.Event(),
+            owner_machine=True,
+        )
+
+    back_up.assert_not_awaited()
+    flag.assert_not_awaited()
+    assert (folder / ".git" / "HEAD").read_text() == "ref"
+    assert (folder / SYNC_MARKER_NAME).exists()
+    assert not (root / AWAY).exists()
+    assert not any((root / "_internal" / "leftovers").glob("*.copying"))
+    assert move_error(raised.value)["code"] == "no_room"
+
+
+# --- a move from the backup, off a machine its owner brought ----------------
+
+
+@pytest.fixture
+def from_backup(folder_hold):
+    """A move that lays the workspace on its target from the backup alone."""
+    folder_hold.holds = [True]
+    manager = _manager()
+
+    @asynccontextmanager
+    async def heartbeat(move_id, runner_id, source_id):
+        yield asyncio.Event()
+
+    @asynccontextmanager
+    async def decision_lock(computer_id):
+        yield True
+
+    manager._move_heartbeat = heartbeat
+    manager._machine_decision_lock = decision_lock
+    manager._wake_move_source = AsyncMock()
+    manager.backup_project_files = AsyncMock()
+    manager._back_up_and_set_aside = AsyncMock()
+    manager._commit_move = AsyncMock(return_value={"move_id": MOVE_ID, "phase": "committed"})
+    manager._finish_committed_move = AsyncMock()
+    manager._abort_move = AsyncMock()
+    staged = _staged(leftovers_path=None, from_backup=True)
+    with (
+        patch(f"{_MOVE}.advance_workspace_move", AsyncMock(return_value={"phase": "backing_up"})),
+        patch(f"{_MOVE}.get_workspace_dir_name", AsyncMock(return_value="Research")) as folder,
+        patch(f"{_MOVE}.stage_workspace_move", AsyncMock(return_value=staged)) as stage,
+    ):
+        yield SimpleNamespace(manager=manager, folder=folder, stage=stage, staged=staged)
+
+
+@pytest.mark.asyncio
+async def test_a_move_from_the_backup_never_reaches_the_machine_it_leaves(from_backup):
+    """That machine is unreachable, which is why its owner moves from the
+    backup: no wake, no backup of it, and its folder stays where it is, so a
+    rollback has nothing to put back."""
+    manager = from_backup.manager
+    await manager._run_move(_staged(phase="preparing", from_backup=True))
+
+    manager._wake_move_source.assert_not_awaited()
+    manager.backup_project_files.assert_not_awaited()
+    manager._back_up_and_set_aside.assert_not_awaited()
+    from_backup.stage.assert_awaited_once_with(
+        MOVE_ID, "runner-1", source_folder="Research", leftovers_path=None
+    )
+    manager._commit_move.assert_awaited_once_with(from_backup.staged)
+    manager._finish_committed_move.assert_awaited_once_with(
+        {"move_id": MOVE_ID, "phase": "committed"}
+    )
+    manager._abort_move.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("folder", [None, f"_internal/moving/{MOVE_ID}"], ids=["none", "staged"])
+async def test_a_move_from_the_backup_waits_for_a_folder_mid_move(from_backup, folder):
+    """The staged row records the folder the workspace left by name, which a
+    folder not at its name cannot give."""
+    from_backup.folder.return_value = folder
+
+    with pytest.raises(ComputerBusyError, match="mid-move"):
+        await from_backup.manager._stage_from_backup(_staged(phase="preparing", from_backup=True))
+
+    from_backup.stage.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("left", [False, True], ids=["moved", "left-behind"])
+async def test_a_machine_left_behind_is_not_dialled_to_drop_its_grants(left):
+    """It went unreachable, so the dial would only wait out its timeout; the
+    database already denies the grants it held."""
+    manager = _manager()
+    manager._refresh_source_grants = AsyncMock()
+    target = {**_computer(), "computer_id": "target-1"}
+    with (
+        patch(f"{_MOVE}.get_computer", AsyncMock(side_effect=[target, _computer()])),
+        patch(f"{_MOVE}.publish_workspace_binding_change", AsyncMock()),
+        patch("src.server.services.preview_capabilities.revoke", AsyncMock()),
+        patch(f"{_MOVE}.finish_workspace_move", AsyncMock()) as finish,
+    ):
+        await manager._finish_committed_move(
+            _staged(phase="committed", target_computer_id="target-1", from_backup=left)
+        )
+
+    assert manager._refresh_source_grants.await_count == (0 if left else 1)
+    finish.assert_awaited_once_with(MOVE_ID, "runner-1", "done")

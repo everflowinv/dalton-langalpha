@@ -692,7 +692,7 @@ async def test_a_backup_keeps_its_folder_until_the_scan_ends(seed_user, test_db_
     await workspaces.update_workspace(a, name="Final")
     scans = []
 
-    async def scan(_workspace_id, _sandbox, *, layout, conn=None):
+    async def scan(_workspace_id, _sandbox, *, layout, routine=False, conn=None):
         async with workspace_folders_lock(computer_id) as conn:
             plan = await stage_folder_moves(conn, computer_id, ignore_busy=True)
         scans.append((layout.dir_name, [m.workspace_id for m in plan.moves]))
@@ -797,7 +797,7 @@ async def test_an_asset_sync_keeps_its_folder_until_the_overlay_is_written(seed_
         syncs.append((kwargs["project"].dir_name, [m.workspace_id for m in plan.moves]))
         return SimpleNamespace(layout_version=FOLDER_LAYOUT_VERSION)
 
-    sandbox = SimpleNamespace(sync_sandbox_assets=sync, vault_secrets={})
+    sandbox = SimpleNamespace(sync_sandbox_assets=sync, vault_secrets={}, mounts_livefs=True)
     with (
         patch(_SKILL_PARAMS, AsyncMock(return_value={})),
         patch.object(manager, "_vault_snapshot", AsyncMock(return_value=(None, {}, ""))),
@@ -879,6 +879,7 @@ async def test_concurrent_cold_attach_fits_the_pool(
             runtime=None,
             sandbox_id=f"sb-{workspace_id}",
             vault_secrets={},
+            mounts_livefs=True,
             _ensure_workspace_dirs=ensure_dirs,
             # A restore marker is there, so the check only reconciles the flag.
             adownload_file_bytes=AsyncMock(return_value=b"restored"),
@@ -950,6 +951,8 @@ async def test_concurrent_cold_restores_fit_the_pool(
             runtime=None,
             sandbox_id=None,
             vault_secrets={},
+            mounts_livefs=True,
+            recreatable=True,
             _ensure_workspace_dirs=AsyncMock(),
             # No restore marker: the sandbox was recreated empty.
             adownload_file_bytes=AsyncMock(return_value=None),

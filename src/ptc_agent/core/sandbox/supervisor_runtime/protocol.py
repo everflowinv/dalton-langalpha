@@ -32,6 +32,9 @@ PACKAGE_NAME = "supervisor"
 OP_CALL = "call"
 OP_HEALTH = "health"
 OP_SHUTDOWN = "shutdown"
+#: Stop taking calls, let acknowledged ones finish, then exit, as a superseded
+#: daemon does.
+OP_RETIRE = "retire"
 
 # -- frame types ------------------------------------------------------------
 #: Non-terminal: the daemon accepted the call and is about to dispatch it.
@@ -113,7 +116,7 @@ def call_request(
 
 
 def simple_request(request_id: int, op: str) -> dict[str, Any]:
-    """A ``health`` or ``shutdown`` request."""
+    """A ``health``, ``shutdown`` or ``retire`` request."""
     return {"v": VERSION, "id": request_id, "op": op}
 
 

@@ -50,8 +50,10 @@ from ptc_agent.core.paths import (
     LEGACY_ROOT_TOOLS_DIR,
     MEMO_USER_DIR,
     MEMORY_USER_DIR,
+    SANDBOX_ROOTS,
     SandboxLayout,
     WorkspaceLayout,
+    computer_roots,
     strip_previous_dir_name,
 )
 
@@ -90,12 +92,6 @@ _INFRA_PREFIXES = (
 # external data. agent.md is the per-workspace notebook auto-injected into every
 # turn, so the agent reading it back is not a tracked data access.
 _INFRA_FILES = ("agent.md",)
-
-# Sandbox-root prefixes the agent emits on absolute paths (e.g.
-# /home/workspace/.agents/...). Stripped before the infra/memo/memory prefix
-# checks so classification works for both absolute and relative path forms —
-# without this the agent's absolute paths bypass every prefix check.
-_SANDBOX_ROOT_PREFIXES = ("home/workspace/", "home/daytona/")
 
 # Market tools whose identifier is a single symbol-bearing arg.
 _MARKET_SYMBOL_ARGS = ("symbol", "underlying")
@@ -168,7 +164,7 @@ def _new_id() -> str:
     return str(uuid.uuid4())
 
 
-def _normalize_sandbox_path(path: str) -> str:
+def _normalize_sandbox_path(path: str, root: str | None = None) -> str:
     """Fold a path to its workspace-relative form for the prefix checks.
 
     Strips the sandbox root, then the turn's own workspace folder: the agent's
@@ -177,12 +173,24 @@ def _normalize_sandbox_path(path: str) -> str:
     read as ``/home/workspace/<ws>/.agents/tools/docs/...`` misses every infra
     prefix and is recorded as a data source. An absolute path under a folder
     the workspace was renamed out of names the same file, so it strips too.
+    ``root`` is the computer's own, which need not be one of the stock roots.
     """
-    p = (path or "").lstrip("/").removeprefix("./")
+    raw = path or ""
+    p = raw.lstrip("/").removeprefix("./")
     rooted = False
-    for prefix in _SANDBOX_ROOT_PREFIXES:
-        if p.startswith(prefix):
-            p = p[len(prefix):]
+    # The root the agent's absolute paths start with (e.g.
+    # /home/workspace/.agents/...) goes before the infra/memo/memory prefix
+    # checks, which would otherwise miss every absolute path.
+    for candidate in computer_roots(root):
+        bare = candidate.strip("/")
+        if candidate in SANDBOX_ROOTS:
+            hit, rest = p.startswith(f"{bare}/"), p[len(bare) + 1:]
+        else:
+            # The computer's own root needs its leading slash: a one-segment
+            # root (`/work`) must not swallow the relative `work/tools/x.py`.
+            hit, rest = raw.startswith(f"/{bare}/"), raw[len(bare) + 2:]
+        if hit:
+            p = rest
             rooted = True
             break
     project = current_project()
@@ -196,9 +204,9 @@ def _normalize_sandbox_path(path: str) -> str:
     return p
 
 
-def _classify_file_source_type(path: str) -> str:
+def _classify_file_source_type(path: str, root: str | None = None) -> str:
     """Map a read path to memo_read / memory_read / file_read by prefix."""
-    normalized = _normalize_sandbox_path(path)
+    normalized = _normalize_sandbox_path(path, root)
     if normalized.startswith(_MEMO_PREFIX):
         return "memo_read"
     if any(normalized.startswith(prefix) for prefix in _MEMORY_PREFIXES):
@@ -206,14 +214,14 @@ def _classify_file_source_type(path: str) -> str:
     return "file_read"
 
 
-def _is_agent_infra_path(path: str) -> bool:
+def _is_agent_infra_path(path: str, root: str | None = None) -> bool:
     """True for agent scaffolding (skills/tools/mcp/system/notebook) — not data.
 
     Dir prefixes match at a path-segment boundary so ``tools/x`` and the bare dir
     ``tools`` hit but a sibling like ``tools_analysis/x`` does not; the
     ``_INFRA_FILES`` notebook files (e.g. agent.md) match exactly.
     """
-    normalized = _normalize_sandbox_path(path).rstrip("/")
+    normalized = _normalize_sandbox_path(path, root).rstrip("/")
     if normalized in _INFRA_FILES:
         return True
     return any(
@@ -309,14 +317,19 @@ class ProvenanceMiddleware(AgentMiddleware):
     secret values from every snippet before it is emitted/persisted — provenance
     fingerprints the raw result/artifact, which the leak middleware's
     content-only scan never touches.
+
+    ``sandbox_root`` is the computer's root, which the agent's absolute paths
+    start with; without it only the stock roots are recognised.
     """
 
     def __init__(
         self,
         redactor: Callable[[str | None], str | None] | None = None,
+        sandbox_root: str | None = None,
     ) -> None:
         super().__init__()
         self._redactor = redactor
+        self._sandbox_root = sandbox_root
         # Background body-store writes in flight (strong refs so they aren't GC'd
         # mid-flush), owned by this instance and drained best-effort at agent end.
         # Bounded concurrency + exception consumption live in body_store.
@@ -719,13 +732,13 @@ class ProvenanceMiddleware(AgentMiddleware):
         path = args.get("file_path") or args.get("path")
         if not path:
             return
-        if _is_agent_infra_path(path):
+        if _is_agent_infra_path(path, self._sandbox_root):
             return
         content = getattr(result, "content", result)
         sha256, size, snippet = fingerprint_result(content)
         yield ProvenanceSource(
             record_id=_new_id(),
-            source_type=_classify_file_source_type(path),
+            source_type=_classify_file_source_type(path, self._sandbox_root),
             identifier=path,
             timestamp=_now_iso(),
             tool_call_id=request.tool_call.get("id"),

@@ -351,7 +351,7 @@ async def check_user_mcp_server(
     assert sandbox.runtime is not None
     work_dir = sandbox._work_dir
     layout = SandboxLayout(work_dir)
-    stem = f"{SandboxLayout.INTERNAL_DIR}/.mcp_check_{uuid.uuid4().hex}"
+    stem = f"{SandboxLayout.MCP_CHECK_PREFIX}{uuid.uuid4().hex}"
     vault_rel = f"{stem}.vault.json"
     client_path = layout.join(f"{stem}.py")
     vault_path = layout.join(vault_rel)
@@ -443,7 +443,9 @@ async def _remove_check_files(sandbox: "PTCSandbox", paths: tuple[str, ...]) -> 
         logger.warning("MCP command check cleanup failed", error=str(e))
 
 
-async def _start_internal_mcp_servers(sandbox: "PTCSandbox") -> bool | None:
+async def _start_internal_mcp_servers(
+    sandbox: "PTCSandbox", *, replace: bool = False
+) -> bool | None:
     """Start the computer's MCP supervisor, if it is not already listening.
 
     One daemon per computer owns every sandbox-side MCP server process, so a
@@ -459,6 +461,10 @@ async def _start_internal_mcp_servers(sandbox: "PTCSandbox") -> bool | None:
     Answers whether the file mount answered at its path (None: the exec
     failed). A reconnect runs this exec anyway, and a mount gone with a boot
     or a dead daemon meets no command that would say so.
+
+    ``replace`` first retires a running daemon, for a computer whose env
+    changed under it: the daemon and its servers keep the env they started
+    with.
     """
     assert sandbox.runtime is not None
     work_dir = sandbox._work_dir
@@ -467,13 +473,19 @@ async def _start_internal_mcp_servers(sandbox: "PTCSandbox") -> bool | None:
     log_path = f"{work_dir}/{supervisor_protocol.LOG_REL_PATH}"
     src_root = layout.internal_src
     quoted_socket = shlex.quote(socket_path)
+    # A machine that never mounts has no mount to lose, so it is not asked.
+    probe = sandbox.mounts_livefs
+    pythonpath = f"PYTHONPATH={shlex.quote(src_root)}"
+    daemon = f"python3 -m {supervisor_protocol.PACKAGE_NAME} {shlex.quote(work_dir)}"
+    to_log = f">> {shlex.quote(log_path)} 2>&1"
     command = (
-        f"{livefs_mount.PROBE} ; "
-        f"mkdir -p {shlex.quote(posixpath.dirname(socket_path))} && "
+        (f"{livefs_mount.PROBE} ; " if probe else "")
+        + f"mkdir -p {shlex.quote(posixpath.dirname(socket_path))} && "
         f"cd {shlex.quote(src_root)} && "
-        f"{{ PYTHONPATH={shlex.quote(src_root)} "
-        f"nohup python3 -m {supervisor_protocol.PACKAGE_NAME} "
-        f"{shlex.quote(work_dir)} >> {shlex.quote(log_path)} 2>&1 < /dev/null & }} ; "
+        # A daemon that would not retire leaves this start the loser of the
+        # lock, which is no worse than not replacing it.
+        + (f"{{ {pythonpath} {daemon} --retire {to_log} || true ; }} && " if replace else "")
+        + f"{{ {pythonpath} nohup {daemon} {to_log} < /dev/null & }} ; "
         # Poll rather than sleep a fixed amount: a warm start binds in
         # milliseconds and only a genuinely failing one pays the full wait.
         f"for _ in $(seq 30); do [ -S {quoted_socket} ] && break; sleep 0.1; done; "
@@ -491,7 +503,9 @@ async def _start_internal_mcp_servers(sandbox: "PTCSandbox") -> bool | None:
     except Exception as e:  # noqa: BLE001 - the client's fallback covers this
         logger.warning("MCP supervisor start failed", error=str(e))
         return None
-    mount_answers = livefs_mount.answered(getattr(result, "stdout", None))
+    mount_answers = (
+        livefs_mount.answered(getattr(result, "stdout", None)) if probe else None
+    )
     exit_code = getattr(result, "exit_code", 0)
     if exit_code:
         logger.warning(

@@ -667,6 +667,24 @@ async def set_files_scan_mark(
             await cur.execute(sql, (Json(mark), workspace_id))
 
 
+async def mark_files_backed_up(workspace_id: str, *, conn) -> None:
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "UPDATE workspaces SET files_backed_up_at = NOW() WHERE workspace_id = %s",
+            (workspace_id,),
+        )
+
+
+async def workspace_has_backup(workspace_id: str, *, conn=None) -> bool:
+    async with get_db_connection(conn) as owned, owned.cursor() as cur:
+        await cur.execute(
+            "SELECT EXISTS (SELECT 1 FROM workspace_files WHERE workspace_id = %s)",
+            (workspace_id,),
+        )
+        row = await cur.fetchone()
+    return bool(row and row[0])
+
+
 async def get_scan_marks_for_computer(computer_id: str) -> List[Dict[str, Any]]:
     """Every live project on the machine with its folder and scan mark.
 

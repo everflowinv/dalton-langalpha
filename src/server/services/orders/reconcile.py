@@ -41,11 +41,12 @@ from src.server.database.mcp_oauth import SERVABLE, get_connection
 from src.server.database.order_reconciliation import (
     Observation,
     active_grant_for_connection,
-    cancelled_by_own_attempt,
     claimed_vendor_order_ids,
     fail_undispatched_attempts,
     lapse_unspent_approvals,
     list_stale_attempts,
+    mark_unlisted,
+    own_cancel,
     reconcile_group_lock,
     reconcile_pass_lock,
     record_observation,
@@ -84,6 +85,10 @@ RECONCILE_SANDBOX_ID = "reconcile"
 MAX_LISTING_PAGES = 20
 
 STOP_GRACE = 30.0
+
+# How far either side of the interval a worker's pass may land, so sibling
+# workers' advisory-lock probes don't fall in lockstep every cycle.
+PASS_JITTER = 0.2
 
 # How far a vendor's clock may run behind ours. ``executed_at`` is stamped
 # before the call leaves, so this attempt's own order can predate it only by
@@ -310,12 +315,11 @@ class OrderReconciler:
     async def _loop(self) -> None:
         while not self._stop_event.is_set():
             interval = float(self._settings().interval_seconds)
-            # Jitter desynchronizes sibling workers so their advisory-lock
-            # probes don't land in lockstep every cycle.
             try:
                 await asyncio.wait_for(
                     self._stop_event.wait(),
-                    timeout=interval * (0.8 + 0.4 * random.random()),
+                    timeout=interval
+                    * (1 - PASS_JITTER + 2 * PASS_JITTER * random.random()),
                 )
                 return
             except TimeoutError:
@@ -374,6 +378,21 @@ class OrderReconciler:
             rows = await list_stale_attempts(
                 submitting_grace_seconds=config.submitting_grace_seconds,
                 open_after_seconds=config.open_after_seconds,
+                # Less however early a pass may come: held to the full interval,
+                # a pass landing early skipped every row the one before it took,
+                # and a lone worker read each row only every other pass. Never
+                # by more than the jitter's share of the window itself, though:
+                # a loop interval five times the window took the gate to zero,
+                # and a sibling could then re-read a row seconds after another
+                # took it, putting the two lists a hand-off waits for that close.
+                resweep_after_seconds=(
+                    float(config.open_after_seconds)
+                    - PASS_JITTER
+                    * min(
+                        float(config.interval_seconds),
+                        float(config.open_after_seconds),
+                    )
+                ),
                 limit=config.batch_limit,
             )
             report = PassReport(
@@ -648,6 +667,8 @@ class OrderReconciler:
         )
         if observation.status is None:
             report.unresolved += 1
+            if observation.unlisted:
+                await mark_unlisted(attempt_id, current)
             logger.log(
                 logging.WARNING if observation.ambiguous else logging.INFO,
                 "[OrderReconcile] attempt %s: %s; left %s",
@@ -663,8 +684,8 @@ class OrderReconciler:
             claimed.add(observation.vendor_order_id)
         if observation.status == current:
             # The read named the state the row was already in: the fill grew or
-            # the instrument got a name, and ``updated_at`` moved so the next
-            # pass does not immediately re-read a row that has not changed.
+            # the instrument got a name. That enriches the row without moving
+            # it, so it is not counted or logged as a move.
             return
         report.moved += 1
         logger.info(
@@ -759,6 +780,8 @@ class OrderReconciler:
                 row, current,
                 had_identity=bool(wanted) or key is not None,
                 complete=listing.complete,
+                adapter=adapter,
+                grace_seconds=float(config.submitting_grace_seconds),
             )
         outcome = found.outcome
         if outcome.status is AttemptStatus.UNKNOWN:
@@ -791,6 +814,8 @@ class OrderReconciler:
         *,
         had_identity: bool,
         complete: bool,
+        adapter: OrderAdapter,
+        grace_seconds: float,
     ) -> Observation:
         """A call the vendor has no order for, once the grace window has passed.
 
@@ -798,30 +823,71 @@ class OrderReconciler:
         state the row is in: a brokerage that answers a cancel by dropping the
         row, IBKR's deleted instruction being the case that forced this, would
         otherwise leave the placement re-read forever with the cancel that
-        ended it one column away. Past that, only a call whose answer never
-        came back ends here, ``submitting`` or ``unknown`` with no order id,
-        and only when we had something to look it up by and the vendor listed
-        everything it has: an attempt we could not identify, or one missing
-        from a list the vendor cut short, is unresolved, not lost, and saying
-        otherwise would report an order as failed that may be sitting in the
-        book under a name we could not recognize or on a page we did not read.
+        ended it one column away. An order whose vendor lists only what is
+        still pending is settled next, in the state its adapter names, once
+        two complete lists a poll interval apart stop carrying it: IBKR drops a
+        staged instruction when a person sends or deletes it in its own client
+        or when it expires, says nothing about which, and the row was re-read
+        forever on that silence. The first such list only stamps the row, since
+        the end is final and one short answer would otherwise end every staged
+        instruction at once. One our own cancel is still answering for waits a
+        pass instead, since the end written now could not give way to the
+        cancel landing next.
+        Past that, only a call whose answer never came back ends here,
+        ``submitting`` or ``unknown`` with no order id, and only when we had
+        something to look it up by and the vendor listed everything it has: an
+        attempt we could not identify, or one missing from a list the vendor
+        cut short, is unresolved, not lost, and saying otherwise would report
+        an order as failed that may be sitting in the book under a name we
+        could not recognize or on a page we did not read.
         """
         vendor_order_id = row.get("vendor_order_id")
         if vendor_order_id and current in OPEN_STATUSES:
-            cancel = await cancelled_by_own_attempt(
+            ended = adapter.absent_status(row.get("action"))
+            cancel = await own_cancel(
                 row["user_id"],
                 row.get("vendor") or "",
                 str(vendor_order_id),
                 account_ref=row.get("account_ref"),
                 exclude_attempt_id=row["attempt_id"],
+                awaiting_within=grace_seconds if ended is not None else None,
             )
-            if cancel is not None:
+            if cancel is not None and cancel["status"] == AttemptStatus.CANCELLED:
                 return Observation(
                     status=AttemptStatus.CANCELLED,
                     reason=(
                         f"vendor order {vendor_order_id}, cancelled by attempt "
                         f"{cancel['attempt_id']}"
                     ),
+                )
+            if ended is not None:
+                if not complete:
+                    return Observation(
+                        reason="not in the pages read, and the vendor has more"
+                    )
+                if cancel is not None:
+                    return Observation(
+                        reason="gone from the list while our cancel of it awaits "
+                        "its answer"
+                    )
+                if row.get("unlisted_at") is None:
+                    return Observation(
+                        reason="gone from the vendor's list; ended if the next "
+                        "read agrees",
+                        unlisted=True,
+                    )
+                return Observation(
+                    status=ended,
+                    reason=(
+                        "left the vendor's instruction list: sent, deleted or "
+                        "expired there, and the vendor does not say which"
+                    ),
+                    # Absence again, as ``not_found`` below is: anything that
+                    # moved the row since it was read knows more than a list
+                    # that no longer names it, so the write holds to that row,
+                    # and to the stamp it was read with.
+                    from_absence=True,
+                    unlisted_at=row["unlisted_at"],
                 )
         unanswered = current is AttemptStatus.SUBMITTING or (
             current is AttemptStatus.UNKNOWN and not vendor_order_id

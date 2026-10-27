@@ -779,6 +779,7 @@ class AutomationExecutor:
                 user_id=user_id,
                 route=firing.route,
                 is_byok=has_byok,
+                from_server=True,
                 steerable=False,
                 # Stamped on the run at START, so its finalize settles this
                 # firing whichever worker is left to drain the job, and

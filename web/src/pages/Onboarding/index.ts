@@ -4,3 +4,4 @@
 // flow is the shell's own lazy route (pages/Onboarding/welcome/Welcome).
 export { OnboardingProvider, useOnboarding } from './OnboardingProvider';
 export { OnboardingHostGate } from './OnboardingHostGate';
+export { GettingStartedGate } from './GettingStartedGate';

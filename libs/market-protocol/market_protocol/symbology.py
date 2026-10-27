@@ -377,13 +377,17 @@ def _seed_registry() -> dict[str, dict]:
 # Parsing helpers
 # ---------------------------------------------------------------------------
 
+class InvalidSymbol(ValueError):
+    """A symbol no instrument could be spelled as: the caller's input, not a source failing."""
+
+
 def parse_instrument_key(key: str) -> tuple[str, str]:
-    """Split ``symbol.MIC`` into ``(symbol, mic_segment)``. Raises ValueError."""
+    """Split ``symbol.MIC`` into ``(symbol, mic_segment)``. Raises InvalidSymbol."""
     if "." not in key:
-        raise ValueError(f"Not an instrument key (no MIC segment): {key!r}")
+        raise InvalidSymbol(f"Not an instrument key (no MIC segment): {key!r}")
     symbol, segment = key.rsplit(".", 1)
     if not symbol or not segment:
-        raise ValueError(f"Malformed instrument key: {key!r}")
+        raise InvalidSymbol(f"Malformed instrument key: {key!r}")
     return symbol, segment
 
 
@@ -405,7 +409,7 @@ _URL_METACHARS = frozenset("/\\?#%,")
 
 
 def _checked(symbol: object) -> str:
-    """*symbol* cleaned, or ValueError when no instrument could be spelled that way.
+    """*symbol* cleaned, or InvalidSymbol when no instrument could be spelled that way.
 
     Checked after the fold, which turns a full-width ``．．／`` into ``../``.
     A denylist rather than an allowlist: real spellings carry ``^ . - = & :``
@@ -413,17 +417,17 @@ def _checked(symbol: object) -> str:
     pasted symbol often brings a newline along.
     """
     if not isinstance(symbol, str):
-        raise ValueError(f"Symbol must be a string, not {type(symbol).__name__}")
+        raise InvalidSymbol(f"Symbol must be a string, not {type(symbol).__name__}")
     s = _clean(symbol)
     if not s:
-        raise ValueError("Empty symbol")
+        raise InvalidSymbol("Empty symbol")
     if len(s) > _MAX_SYMBOL_LEN:
-        raise ValueError(f"Symbol longer than {_MAX_SYMBOL_LEN} characters")
+        raise InvalidSymbol(f"Symbol longer than {_MAX_SYMBOL_LEN} characters")
     for ch in s:
         # Categories C* and Z*: controls, format characters such as a
         # zero-width space, and every separator.
         if ch in _URL_METACHARS or ch.isspace() or unicodedata.category(ch)[0] in "CZ":
-            raise ValueError(f"Symbol {s!r} contains {ch!r}")
+            raise InvalidSymbol(f"Symbol {s!r} contains {ch!r}")
     return s
 
 
@@ -433,7 +437,7 @@ def _require_stem(symbol: str) -> None:
     ``.HK`` and ``AAPL.`` are typos, and ``..`` as a URL path segment climbs a level.
     """
     if not any(ch.isalnum() for ch in symbol) or "" in symbol.split("."):
-        raise ValueError(f"Empty symbol: {symbol!r}")
+        raise InvalidSymbol(f"Empty symbol: {symbol!r}")
 
 
 def _spell(symbol: str, mic: str, *, vendor: bool = False) -> str:
@@ -448,7 +452,7 @@ def _key(symbol: str, segment: str) -> str:
     """``symbol.SEGMENT``, refused when it would be too long to parse back."""
     key = f"{symbol}.{segment}"
     if len(key) > _MAX_SYMBOL_LEN:
-        raise ValueError(f"Symbol {symbol!r} is too long for a key on {segment}")
+        raise InvalidSymbol(f"Symbol {symbol!r} is too long for a key on {segment}")
     return key
 
 
@@ -483,7 +487,7 @@ _PAIR_CLASSES = (AssetClass.CRYPTO, AssetClass.FX)
 
 def _refuse_pair_hint(listing: str, asset_class: AssetClass | None) -> None:
     if asset_class in _PAIR_CLASSES:
-        raise ValueError(
+        raise InvalidSymbol(
             f"{listing!r} is a venue listing, not a pair: the {asset_class} hint does not apply"
         )
 
@@ -667,7 +671,7 @@ def from_instrument_key(key: str) -> InstrumentRef:
     """
     s = _checked(key)
     if not _is_canonical_key(s):
-        raise ValueError(f"Not an instrument key on a known venue: {s!r}")
+        raise InvalidSymbol(f"Not an instrument key on a known venue: {s!r}")
     return to_canonical(s)
 
 

@@ -8,6 +8,7 @@ from langchain_core.tools import BaseTool, tool
 from ptc_agent.agent.backends.sandbox import SandboxBackend
 from ptc_agent.agent.limits import pending_read
 from ptc_agent.core.sandbox import livefs_mount
+from src.observability import TOOL_CHANNEL, TOOL_PROVIDER, mark_tool_failed
 
 logger = structlog.get_logger(__name__)
 
@@ -56,6 +57,7 @@ def create_bash_output_tool(
                 try:
                     stopped = await backend.astop_background_command(command_id)
                 except Exception as e:
+                    mark_tool_failed(e)
                     logger.warning(
                         "Failed to stop background command",
                         command_id=command_id,
@@ -110,8 +112,14 @@ def create_bash_output_tool(
             return "\n".join(parts), artifact
 
         except Exception as e:
+            mark_tool_failed(e)
             error_msg = f"Failed to get background command output: {e!s}"
             logger.error(error_msg, command_id=command_id, exc_info=True)
             return f"ERROR: {error_msg}", {"mcp_trace": []}
 
+    # Every run, as for Bash, so an error rate reads per provider.
+    BashOutput.metadata = {
+        TOOL_PROVIDER: backend.provider,
+        TOOL_CHANNEL: backend.channel,
+    }
     return BashOutput

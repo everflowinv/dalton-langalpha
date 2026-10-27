@@ -584,9 +584,6 @@ def test_multiple_carriers_each_get_their_own_entry():
     assert payload["messages"][4]["content"] == [{"type": "text", "text": "second envelope"}]
 
 
-# DALTON-HOOK(upstream-backport-596): upstream 86ce2f02c, placement rule for mid-turn system entries.
-
-
 def test_a_carrier_no_assistant_turn_follows_rides_as_a_reminder():
     """Anthropic refuses a system entry with a user turn after it, which is
     where a turn stopped before the model answered leaves its carrier."""

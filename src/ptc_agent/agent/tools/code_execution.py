@@ -8,12 +8,14 @@ from langchain_core.tools import BaseTool, tool
 from ptc_agent.agent.backends.sandbox import SandboxBackend
 from ptc_agent.agent.tools.code_admission import code_run_slot, max_execution_time_of
 from ptc_agent.agent.tools.mount_guard import run_guarded
+from ptc_agent.agent.tools.utils import mark_sandbox_failed
 from ptc_agent.core.paths import (
     MEMO_USER_DIR,
     MEMORY_USER_DIR,
     WorkspaceLayout,
 )
 from ptc_agent.core.sandbox import livefs_mount
+from src.observability import TOOL_CHANNEL, TOOL_PROVIDER, mark_tool_failed
 
 logger = structlog.get_logger(__name__)
 
@@ -101,9 +103,6 @@ def create_execute_code_tool(
         Returns:
             SUCCESS with stdout, or ERROR with stderr.
         """
-        if not backend:
-            return "ERROR: Sandbox not initialized", {"mcp_trace": []}
-
         return await run_guarded(
             backend,
             code,
@@ -153,6 +152,8 @@ def create_execute_code_tool(
                     stdout_length=len(result.stdout),
                 )
                 return response, artifact
+            if result.failure:
+                mark_sandbox_failed(result.failure)
             # Format error response
             # Python tracebacks often go to stdout in some environments
             # Show stderr if available, otherwise show stdout
@@ -168,6 +169,12 @@ def create_execute_code_tool(
 
         except Exception as e:
             logger.error("Code execution exception", error=str(e), exc_info=True)
+            mark_tool_failed(e)
             return f"ERROR: {e!s}", {"mcp_trace": []}
 
+    # Every run, not only a failed one, so an error rate reads per provider.
+    execute_code.metadata = {
+        TOOL_PROVIDER: backend.provider,
+        TOOL_CHANNEL: backend.channel,
+    }
     return execute_code

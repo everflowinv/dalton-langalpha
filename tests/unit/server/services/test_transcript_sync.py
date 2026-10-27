@@ -859,7 +859,7 @@ async def test_a_deleted_threads_dirs_leave_a_running_machine(monkeypatch):
         assert sandbox_id == "sb-1"
         yield runtime
 
-    manager = SimpleNamespace(_computer_runtime=computer_runtime)
+    manager = SimpleNamespace(computer_runtime=computer_runtime)
     monkeypatch.setattr(
         _bringup,
         "get_computer_for_workspace",

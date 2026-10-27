@@ -25,6 +25,7 @@ vi.mock('@/components/ui/use-toast', () => ({ toast: vi.fn() }));
 vi.mock('../../utils/api', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../utils/api')>()),
   getComputers: vi.fn(),
+  getWorkspace: vi.fn(),
   getWorkspaceMove: vi.fn(),
   moveWorkspace: vi.fn(),
   cancelWorkspaceMove: vi.fn(),
@@ -32,7 +33,7 @@ vi.mock('../../utils/api', async (importOriginal) => ({
 }));
 
 import { toast } from '@/components/ui/use-toast';
-import { getComputers, getWorkspaceMove, makeComputerPrimary, moveWorkspace } from '../../utils/api';
+import { getComputers, getWorkspace, getWorkspaceMove, makeComputerPrimary, moveWorkspace } from '../../utils/api';
 import { useComputerActions } from '../../hooks/useComputerActions';
 import {
   WORKSPACE_MOVE_POLL_MS,
@@ -49,6 +50,7 @@ const mockGetComputers = getComputers as Mock;
 const mockGetMove = getWorkspaceMove as Mock;
 const mockMoveWorkspace = moveWorkspace as Mock;
 const mockMakePrimary = makeComputerPrimary as Mock;
+const mockGetWorkspace = getWorkspace as Mock;
 
 const ALPHA = '5319ad0e-7835-4ca6-9541-b7c2961a7bf6';
 const BETA = '3b788b47-352e-4cfb-94f0-920b599ea227';
@@ -71,6 +73,7 @@ function computer(computer_id: string, name: string, is_primary: boolean): Compu
     root_dir: '/home/workspace',
     provider_ref: `sbx-${name.toLowerCase()}`,
     spec_change: null,
+    ssh: null,
   };
 }
 
@@ -278,6 +281,49 @@ describe('MoveWorkspaceDialog', () => {
 
     expect(mockToast).not.toHaveBeenCalled();
     expect(getWatchedMove(WS)).toBeUndefined();
+  });
+
+  it('offers a restore from the backup when the machine the user brought does not answer', async () => {
+    // Alpha is the user's own machine; it fails to start, so the copy cannot begin.
+    mockGetComputers.mockResolvedValue({
+      ...MACHINES,
+      computers: [{ ...computer(ALPHA, 'Alpha', true), kind: 'ssh', status: 'error' }, computer(BETA, 'Beta', false)],
+    });
+    mockGetWorkspace.mockResolvedValue({
+      workspace_id: WS, name: 'Research', status: 'stopped', computer_id: ALPHA,
+      files_backed_up_at: new Date(Date.now() - 3 * 86_400_000).toISOString(),
+    });
+    const { queryClient } = renderWithProviders(<DialogAndOutcomes />, { queryClient: client() });
+    const submit = await screen.findByRole('button', { name: i18n.t('workspace.move.submit') });
+    await waitFor(() => expect(submit).toBeEnabled());
+    fireEvent.click(submit);
+    await waitFor(() => expect(mockMoveWorkspace).toHaveBeenCalledWith(WS, BETA));
+
+    const reason = "The computer this workspace is on couldn't start, so its files couldn't be copied. Try again once it is running.";
+    server[WS] = move('failed', { error: { code: 'source_unavailable', message: reason } });
+    await act(async () => {
+      await queryClient.invalidateQueries({ queryKey: queryKeys.workspaceMoves.workspace(WS) });
+    });
+
+    const offer = await screen.findByText(/Alpha didn't answer, so the files couldn't be copied from it/);
+    await waitFor(() => expect(offer).toHaveTextContent(/restore this workspace on Beta from its backup taken 3\s?d(ays)? ago\.$/));
+    // The offer says what failed, in place of the server's sentence.
+    expect(screen.queryByText(reason)).not.toBeInTheDocument();
+
+    mockMoveWorkspace.mockImplementation(async () => {
+      server[WS] = move('preparing', { move_id: '4d1c9e7a-2b5f-4a8e-9c3d-6f0b1e2a7d58', from_backup: true });
+      return server[WS];
+    });
+    fireEvent.click(screen.getByRole('button', { name: i18n.t('workspace.move.fromBackup.button') }));
+    expect(screen.getByText("Files changed since that backup aren't included. The folder on Alpha is kept, moved to _internal/leftovers once it answers again.")).toBeInTheDocument();
+    expect(mockMoveWorkspace).toHaveBeenCalledTimes(1);
+
+    const confirm = screen
+      .getAllByRole('button', { name: i18n.t('workspace.move.fromBackup.button') })
+      .at(-1)!;
+    fireEvent.click(confirm);
+    await waitFor(() => expect(mockMoveWorkspace).toHaveBeenCalledWith(WS, BETA, { fromBackup: true }));
+    expect(await screen.findByText(i18n.t('workspace.move.fromBackup.restoring'))).toBeInTheDocument();
   });
 });
 

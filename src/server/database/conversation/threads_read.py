@@ -805,7 +805,10 @@ async def get_thread_by_share_token(share_token: str) -> Optional[Dict[str, Any]
     """
     Get a shared thread by its public share token.
 
-    Returns thread info + workspace_id + workspace name only if is_shared = TRUE.
+    Returns thread info + workspace_id + workspace name only if is_shared = TRUE,
+    with the workspace's folder and the root of the computer it is on, which
+    the agent's absolute paths are spelled with, and the roots of the
+    computers it moved off, which an older turn's paths are spelled with.
     """
     try:
         async with pool.get_db_connection() as conn:
@@ -824,9 +827,13 @@ async def get_thread_by_share_token(share_token: str) -> Optional[Dict[str, Any]
                         t.shared_at,
                         t.created_at,
                         t.updated_at,
-                        w.name AS workspace_name
+                        w.name AS workspace_name,
+                        w.dir_name,
+                        w.previous_root_dirs,
+                        c.root_dir
                     FROM conversation_threads t
                     JOIN workspaces w ON w.workspace_id = t.workspace_id
+                    LEFT JOIN computers c ON c.computer_id = w.computer_id
                     WHERE t.share_token = %s AND t.is_shared = TRUE
                 """,
                     (share_token,),

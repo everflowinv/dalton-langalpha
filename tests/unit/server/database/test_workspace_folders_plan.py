@@ -209,6 +209,37 @@ def test_top_level_tombstones_are_cleared_first_and_leftovers_are_not():
     assert moves(plan) == {C: ("Research-1a2b", "Research")}
 
 
+def test_a_folder_its_owner_kept_stays_until_its_name_is_wanted():
+    """Kept on the owner's machine, it is theirs: no pass touches it, nor runs
+    for it, while no live row targets its name."""
+    kept = replace(row(A, "Research", "Research", deleted=True), kept=True)
+    plan = plan_folder_moves([kept, row(B, "Macro", "Macro")])
+    assert not plan
+    assert plan.deferred == (A,)
+
+
+def test_a_kept_folder_left_past_the_cap_holds_its_name():
+    """Landing on one the pass leaves would push it aside unrecorded."""
+    n = TOMBSTONES_PER_PASS + 5
+    rows = [
+        replace(row(f"{i:08d}-0000-4000-8000-00000000000d", f"N{i}", f"N{i}", deleted=True), kept=True)
+        for i in range(n)
+    ]
+    rows += [row(f"{i:08d}-0000-4000-8000-00000000000a", f"N{i}", f"N{i}-{i:04x}") for i in range(n)]
+    plan = plan_folder_moves(rows)
+    assert len(plan.tombstones) == TOMBSTONES_PER_PASS
+    assert {m.target for m in plan.moves} == {t.dir_name for t in plan.tombstones}
+
+
+def test_a_kept_folder_whose_name_a_new_workspace_wants_is_set_aside():
+    """The new workspace lands on the name; the kept folder goes under
+    leftovers, where the settle records it and nothing removes it."""
+    kept = replace(row(A, "Research", "Research", deleted=True), kept=True)
+    plan = plan_folder_moves([kept, row(B, "Research", "Research-1a2b")])
+    assert [t.workspace_id for t in plan.tombstones] == [A]
+    assert moves(plan) == {B: ("Research-1a2b", "Research")}
+
+
 def test_a_tombstone_does_not_hold_a_live_row_back():
     """It is cleared before any move lands, in the same pass."""
     rows = [row(A, "Research", "Research", deleted=True), row(B, "Research", "Research-1a2b")]

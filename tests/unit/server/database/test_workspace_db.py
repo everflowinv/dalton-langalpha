@@ -508,6 +508,60 @@ async def test_delete_workspace_soft(ws_mock_db, mock_cursor):
     assert "folder_cleanup_pending" in sql
 
 
+def _delete_update(mock_cursor):
+    return next(
+        call.args for call in mock_cursor.execute.call_args_list
+        if "UPDATE workspaces" in call.args[0]
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("keep", [False, True])
+async def test_a_delete_marks_the_folder_kept_or_queued_never_both(
+    ws_mock_db, mock_cursor, keep
+):
+    """The reaper removes what is queued and the settle keeps what is kept, so
+    a row carrying both from an earlier delete would be decided twice."""
+    from src.server.database.workspace import delete_workspace
+
+    mock_cursor.fetchone.return_value = {
+        "workspace_id": "ws-1", "user_id": "user-1", "computer_id": "comp-a",
+        "busy": False, "moving": False,
+    }
+
+    assert await delete_workspace("ws-1", bound_to="comp-a", keep_folder=keep)
+
+    sql, params = _delete_update(mock_cursor)
+    assert params["keep"] is keep
+    kept_branch, queued_branch = sql.split("WHEN %(keep)s")[1].split("ELSE")[:2]
+    assert "#- '{folder_cleanup_pending}'" in kept_branch
+    assert "'{folder_kept}'" in kept_branch
+    assert "#- '{folder_kept}'" in queued_branch
+    assert "'{folder_cleanup_pending}'" in queued_branch
+
+
+@pytest.mark.asyncio
+async def test_a_delete_is_refused_once_the_workspace_moved_elsewhere(
+    ws_mock_db, mock_cursor
+):
+    """Whether the folder stays was decided for the computer the caller saw;
+    on another one the same choice could delete files its owner kept."""
+    from src.server.database.workspace import WorkspaceBusyError, delete_workspace
+
+    mock_cursor.fetchone.return_value = {
+        "workspace_id": "ws-1", "user_id": "user-1", "computer_id": "comp-b",
+        "busy": False, "moving": False,
+    }
+
+    with pytest.raises(WorkspaceBusyError):
+        await delete_workspace("ws-1", bound_to="comp-a", keep_folder=True)
+
+    assert not any(
+        "UPDATE workspaces" in call.args[0]
+        for call in mock_cursor.execute.call_args_list
+    )
+
+
 @pytest.mark.asyncio
 async def test_delete_workspace_never_removes_the_row(ws_mock_db, mock_cursor):
     """A removed row takes the layout owner's identity with it, and migration

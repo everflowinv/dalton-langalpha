@@ -5,8 +5,9 @@ import { getCompletedRowTitle } from '../toolDisplayConfig';
 import type { MessageRecord } from './types';
 
 /** Screen-reader announcer for tool-call completions (carved out of ChatView,
- * 5.9c). Returns the string for ChatView's polite aria-live region. */
-export function useToolCallAnnouncer(messages: readonly MessageRecord[]): string {
+ * 5.9c). Returns the string for ChatView's polite aria-live region. `root` is
+ * the computer's, which a path-aware title reads its paths under. */
+export function useToolCallAnnouncer(messages: readonly MessageRecord[], root?: string | null): string {
   const { t } = useTranslation();
 
   // --- Aria-live announcement for screen readers ---
@@ -71,14 +72,14 @@ export function useToolCallAnnouncer(messages: readonly MessageRecord[]): string
         const toolName = (proc.toolName as string) || '';
         const toolCall = proc.toolCall as { args?: Record<string, unknown> } | undefined;
         const artifact = (proc.toolCallResult as { artifact?: unknown } | undefined)?.artifact;
-        const baseTitle = getCompletedRowTitle(toolName, toolCall, t, artifact);
+        const baseTitle = getCompletedRowTitle(toolName, toolCall, t, { artifact, root });
         announcementQueueRef.current.push({ label: baseTitle, failed: isFailed });
         enqueued++;
       }
     }
 
     if (enqueued > 0) pumpAnnouncements();
-  }, [messages, t, pumpAnnouncements]);
+  }, [messages, t, root, pumpAnnouncements]);
 
   // Clear announcement timer + queue on unmount.
   useEffect(() => {

@@ -22,6 +22,7 @@ from ptc_agent.agent.middleware.background_subagent.registry import (
 )
 from ptc_agent.agent.middleware.background_subagent.spawn import (
     NamespaceUnfenced,
+    RunLedgerUnavailable,
     TaskRunRefused,
 )
 from ptc_agent.agent.middleware.background_subagent.tools import (
@@ -227,7 +228,7 @@ class BackgroundSubagentMiddleware(AgentMiddleware):
                 exc_info=True,
             )
             await self._release_task_ns(task.task_id)
-            raise TaskRunRefused("its run could not be recorded. Try again") from e
+            raise RunLedgerUnavailable("its run could not be recorded. Try again") from e
 
     async def _abort_admitted_run(self, task: BackgroundTask, exc: Exception) -> None:
         """Post-INSERT setup failure: settle the just-born row as error

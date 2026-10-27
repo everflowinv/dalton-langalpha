@@ -16,17 +16,18 @@ from .utils import finite_or_none
 from src.data_client import get_financial_data_provider, get_market_data_provider
 from src.data_client.freshness import measure_daily
 from src.data_client.instrument_clock import clock_for
-from src.data_client.market_data_provider import snapshot_key
+from src.data_client.market_data_provider import MarketNotCovered, snapshot_key
 from src.data_client.normalize import change_from
 from market_protocol import (
     CARET_INDEX_REGIONS,
     AssetClass,
+    InvalidSymbol,
     is_family_index,
     to_canonical,
     to_legacy_api,
 )
 
-from ._shared import _get_user_id, _normalize_market_bars
+from ._shared import _get_user_id, _mark_failure, _mark_no_data, _normalize_market_bars
 from .prices import _calculate_price_statistics
 
 logger = logging.getLogger(__name__)
@@ -418,10 +419,10 @@ async def _fetch_index_day_snapshot(
             freshness = (
                 measure_daily(symbol, raw, is_index=True, source=source) if open_ended(symbol) else None
             )
-            return symbol, _normalize_market_bars(raw, symbol), source, freshness
+            return symbol, _normalize_market_bars(raw, symbol), source, freshness, None
         except Exception as e:
             logger.warning(f"Error fetching data for index {symbol}: {e}")
-            return symbol, None, None, None
+            return symbol, None, None, None, e
 
     results = await asyncio.gather(*[fetch_single(sym) for sym in basket])
 
@@ -429,7 +430,7 @@ async def _fetch_index_day_snapshot(
     rows: List[str] = []
     missing: List[str] = []
     snapshot_date: Optional[str] = None
-    for symbol, bars, source, freshness in results:
+    for symbol, bars, source, freshness, _ in results:
         bars = list(bars or [])
         row_tier = None
         forming = None
@@ -481,6 +482,18 @@ async def _fetch_index_day_snapshot(
         rows.append(_format_index_day_row(symbol, latest))
 
     if not artifact_indices:
+        # Each index's error is caught so the rest of the basket still shows,
+        # which leaves none to mark the run when every one of them failed. The
+        # worst marks it: a source failing, then an uncovered market, then a
+        # malformed symbol.
+        errors = [e for *_, e in results if e is not None]
+        if errors:
+            _mark_failure(min(
+                errors,
+                key=lambda e: (isinstance(e, InvalidSymbol), isinstance(e, MarketNotCovered)),
+            ))
+        else:
+            _mark_no_data()
         return (
             "No index data available for the requested date.",
             {"type": "market_indices", "indices": {}},
@@ -607,6 +620,7 @@ async def fetch_market_overview(
         return "\n\n".join(parts), artifact
     except Exception as e:
         logger.error(f"Error building market overview for region {region}: {e}")
+        _mark_failure(e)
         return (
             f"## Market Overview — {region.upper()}\n"
             f"**Status:** Error\n\n"

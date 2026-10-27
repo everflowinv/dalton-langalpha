@@ -46,10 +46,10 @@ from deepagents.backends.protocol import (
 )
 
 from ptc_agent.agent.backends.results import EditTextResult
-from ptc_agent.core.paths import resolve_agent_path
+from ptc_agent.core.paths import on_file_mount, resolve_agent_path
 from ptc_agent.core.sandbox import ExecutionResult, PTCSandbox
 from ptc_agent.core.sandbox.grep_render import GrepLine
-from ptc_agent.core.sandbox.livefs_mount import MountHandle
+from ptc_agent.core.sandbox.livefs_mount import MountHandle, TranscriptReach
 from ptc_agent.core.sandbox.runtime import PreviewInfo
 
 logger = structlog.get_logger(__name__)
@@ -105,6 +105,12 @@ class SandboxBackend(SandboxBackendProtocol):
     def livefs(self) -> MountHandle | None:
         """The file mount serving the sandbox, or None while none does."""
         return self.sandbox.livefs
+
+    @property
+    def transcripts(self) -> TranscriptReach | None:
+        """Where this agent's transcripts reach its tools, or None while
+        nothing serves them."""
+        return self.sandbox.transcripts
 
     async def settled_livefs(
         self, workspace_id: str | None = None
@@ -541,6 +547,26 @@ class SandboxBackend(SandboxBackendProtocol):
     def sandbox_id(self) -> str | None:
         """Return the raw sandbox ID attribute (may be None if not yet initialized)."""
         return self.sandbox.sandbox_id
+
+    @property
+    def provider(self) -> str:
+        """The kind of sandbox this is (daytona, e2b, docker), fixed for its life."""
+        return self.sandbox.config.sandbox.provider
+
+    @property
+    def channel(self) -> str:
+        """How a call reaches the machine, as tool traces name it."""
+        return self.sandbox.channel
+
+    def channel_for(self, path: str) -> str:
+        """The channel a file call on ``path`` takes: ``fuse`` where the file
+        mount serves it, whose daemon answers from the server, else the
+        machine's own."""
+        if self.livefs is not None and on_file_mount(
+            self.normalize_path(path), self.sandbox.workspace()
+        ):
+            return "fuse"
+        return self.channel
 
     @property
     def skills_manifest(self) -> dict[str, Any] | None:

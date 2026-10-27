@@ -357,8 +357,15 @@ def _fetch_single_snapshot(sym: str) -> dict[str, Any] | None:
             "regular_only": True,
         }
         return enrich_yfinance_snapshot_extended_hours(snap, sym, ticker)  # DALTON-HOOK(extended-hours-quotes)
-    except Exception:
-        logger.warning("yfinance.snapshot.failed | symbol=%s", sym, exc_info=True)
+    except Exception as exc:
+        # fast_info raises this exact KeyError when the chart request came back
+        # empty: Yahoo has no such symbol, or yfinance swallowed the request's
+        # own failure. Either can be an outage, so it stays a warning, without
+        # a traceback that only ever shows yfinance's frames.
+        if isinstance(exc, KeyError) and exc.args == ("currentTradingPeriod",):
+            logger.warning("yfinance.snapshot.no_chart | symbol=%s", sym)
+        else:
+            logger.warning("yfinance.snapshot.failed | symbol=%s", sym, exc_info=True)
         return None
 
 

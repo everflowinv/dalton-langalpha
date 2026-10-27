@@ -342,6 +342,15 @@ def is_pair_symbol(symbol: str) -> bool:
     return any(s == base + quote for base in _CRYPTO_BASES for quote in _PAIR_QUOTES)
 
 
+def is_unsuffixed_code(symbol: str) -> bool:
+    """A bare number: an Asian exchange's code without its suffix (.SH, .HK, .T ...).
+
+    No US ticker is all digits, yet a bare spelling reads as a US listing, so
+    600519 would be saved watching a New York stock that never quotes.
+    """
+    return symbol.isascii() and symbol.isdigit()
+
+
 # Each field's name and cycle: a step up to the cycle is a steady interval
 # (*/60 minutes is hourly); a longer one matches once per cycle.
 _CRON_FIELDS = (("minute", 60), ("hour", 24), ("day-of-month", 31), ("month", 12), ("day-of-week", 7))
@@ -421,6 +430,12 @@ class _ScheduleFields(BaseModel):
                 raise ValueError(
                     f"Invalid price trigger config: '{config.symbol}' is a crypto, currency or futures "
                     "symbol; price alerts cannot watch those"
+                )
+            if is_unsuffixed_code(config.symbol):
+                raise ValueError(
+                    f"Invalid price trigger config: '{config.symbol}' is a bare number, which names no "
+                    "market; add its exchange suffix, as in 600519.SH, 830799.BJ, 0700.HK, 7203.T, "
+                    "005930.KS or 2330.TW"
                 )
             v = {**v, "symbol": config.symbol}
         return v

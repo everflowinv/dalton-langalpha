@@ -97,6 +97,16 @@ export const queryKeys = {
     storage: (computerId: string) => [...queryKeys.computers.all, 'storage', computerId],
     // What a new machine can run on, per user: the plan decides `allowed`.
     providers: () => [...queryKeys.computers.all, 'providers'],
+    sshKey: () => [...queryKeys.computers.all, 'ssh-key'],
+  },
+  // A pairing is minted by a POST and then polled; the mint is cached so a
+  // render never mints twice, and each token's status keys apart from it.
+  // Not under `computers`: it is no machine yet, and refreshing the machines
+  // must never mint a new command under the one the user is running.
+  sshPairings: {
+    all:    ['ssh-pairings'],
+    mint:   () => [...queryKeys.sshPairings.all, 'mint'],
+    status: (token: string) => [...queryKeys.sshPairings.all, 'status', token],
   },
   threads: {
     all:         ['threads'],
@@ -129,6 +139,9 @@ export const queryKeys = {
   },
   workspaceFiles: {
     all:  ['workspaceFiles'],
+    // Every listing and body of one workspace, for a change that rewrites
+    // its whole folder (a restore from its backup).
+    workspace: (wsId: string) => [...queryKeys.workspaceFiles.all, wsId],
     byWs: (wsId: string, opts?: Record<string, unknown>) => [...queryKeys.workspaceFiles.all, wsId, opts],
     // One file's bytes. `mode` rides in the key because the same path answers
     // in a different shape per reader — paginated text, full source, an

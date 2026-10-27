@@ -89,9 +89,6 @@ export function useMessageActionBundles(src: MessageActionSources): {
     src.onRegenerate(id, src.chatInputRef.current?.getModelOptions?.()));
   const stableRetry = useStableHandler(() => src.onRetry(src.chatInputRef.current?.getModelOptions?.()));
   const editDrafts = src.editDrafts;
-  const stableReportWithAgent = useStableHandler((instruction: string) => {
-    src.onSendMessage(`/self-improve ${instruction}`);
-  });
   // Feedback handlers close over the stored ratings, so their raw identity
   // churns on every load/submit; wrap them or a single thumbs click would
   // re-render the whole transcript through the context value.
@@ -145,7 +142,6 @@ export function useMessageActionBundles(src: MessageActionSources): {
           editDrafts,
           onThumbUp: stableThumbUp,
           onThumbDown: stableThumbDown,
-          onReportWithAgent: stableReportWithAgent,
           onWidgetSendPrompt: stableSendMessage,
         }
   ), [
@@ -156,7 +152,7 @@ export function useMessageActionBundles(src: MessageActionSources): {
     stableApprovePTCAgent, stableRejectPTCAgent, stableApproveSecretaryAction,
     stableRejectSecretaryAction, stableResumeCreditPause, stableApproveToolCall, stableRejectToolCall,
     stableEditMessage, stableRegenerate, stableRetry, editDrafts,
-    stableThumbUp, stableThumbDown, stableReportWithAgent, stableSendMessage,
+    stableThumbUp, stableThumbDown, stableSendMessage,
   ]);
 
   // The subagent transcript is a DIFFERENT surface: its cards belong to a task,

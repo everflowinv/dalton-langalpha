@@ -22,12 +22,18 @@ ONLY = (SandboxLayout.CHANNELS_DIR,)
 class _Untouchable:
     """A sandbox backend that fails the test on any use."""
 
+    provider = "docker"  # read once, when the tool is built
+    channel = "docker"
+
     def __getattr__(self, name: str):
         raise AssertionError(f"the sandbox was touched: {name}")
 
 
 class _Mounted:
     """A sandbox the file mount serves, recording what ran."""
+
+    provider = "docker"
+    channel = "docker"
 
     def __init__(self) -> None:
         self.ran: list[str] = []

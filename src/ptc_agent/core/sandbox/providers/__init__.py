@@ -9,16 +9,18 @@ from ptc_agent.config.core import (
     DockerConfig,
     E2BConfig,
     PlatformSecretDefinition,
+    SSHConfig,
 )
 from ptc_agent.core.sandbox.runtime import SandboxProvider
 
-ProviderConfig = DaytonaConfig | DockerConfig | E2BConfig
+ProviderConfig = DaytonaConfig | DockerConfig | E2BConfig | SSHConfig
 
 # Imported on first use: each provider module loads its vendor's SDK.
 _PROVIDERS: dict[str, str] = {
     "daytona": "ptc_agent.core.sandbox.providers.daytona:DaytonaProvider",
     "docker": "ptc_agent.core.sandbox.providers.docker:DockerProvider",
     "e2b": "ptc_agent.core.sandbox.providers.e2b:E2BProvider",
+    "ssh": "ptc_agent.core.sandbox.providers.ssh:SSHProvider",
 }
 
 PROVIDER_KINDS = tuple(_PROVIDERS)
@@ -44,6 +46,18 @@ def provider_runs_remote(kind: str | None) -> bool:
         return provider_class(kind).runs_remote  # type: ignore[arg-type]
     except ValueError:
         return False
+
+
+def may_be_primary(kind: str) -> bool:
+    """Whether a computer of ``kind`` may be the user's primary. Home lives on
+    the primary, which is never removed, so only a machine the deployment can
+    build again may hold it: one the user brought could be wiped or gone for
+    good with Home on it.
+
+    Raises:
+        ValueError: If ``kind`` names no known provider.
+    """
+    return provider_class(kind).recreatable
 
 
 def build_provider(

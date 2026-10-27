@@ -20,6 +20,7 @@ import AccountMenu from './AccountMenu';
 import { useChatRoute } from './useChatRoute';
 import { useSidebarAgents } from '@/pages/ChatAgent/components/sidebarAgentsBridge';
 import { useWorkspaceLabel } from '@/hooks/useWorkspaceLabel';
+import { GettingStartedGate } from '@/pages/Onboarding';
 import { SIDEBAR_DEFAULT_WIDTH, clampSidebarWidth } from './sidebarWidth';
 // DALTON-HOOK(team-sharing): collapsible Team workspaces section
 import { TeamWorkspacesSection } from '@/pages/ChatAgent/components/dalton/TeamSharing';
@@ -265,6 +266,7 @@ function AppSidebar({ collapsed, onToggleCollapse, width, onWidthChange }: AppSi
           </TooltipProvider>
         </nav>
         <div className="sidebar-bottom">
+          <GettingStartedGate variant="rail" onExpand={onToggleCollapse} />
           <AccountMenu />
         </div>
         </React.Fragment>
@@ -361,6 +363,8 @@ function AppSidebar({ collapsed, onToggleCollapse, width, onWidthChange }: AppSi
         {/* DALTON-HOOK(team-sharing): Team workspaces section below My Workspaces */}
         {isDaltonAuth && <TeamWorkspacesSection currentWorkspaceId={currentWorkspaceId} />}
       </div>
+
+      <GettingStartedGate variant="row" />
 
       <div className="sidebar-panel-bottom">
         <AccountMenu variant="row" />

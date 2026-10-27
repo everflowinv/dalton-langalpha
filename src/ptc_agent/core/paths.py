@@ -20,6 +20,18 @@ LEGACY_SANDBOX_ROOTS: tuple[str, ...] = ("/home/daytona",)
 
 SANDBOX_ROOTS: tuple[str, ...] = (DEFAULT_SANDBOX_ROOT, *LEGACY_SANDBOX_ROOTS)
 
+
+def computer_roots(own: str | None) -> tuple[str, ...]:
+    """A computer's own root, then the stock roots, longest first and deduped.
+
+    Path folds (provenance, link qualifying) must agree on one list: the own
+    root leads so it wins where it is a shorter prefix of a stock root.
+    """
+    own = (own or "").rstrip("/")
+    stock = sorted(SANDBOX_ROOTS, key=len, reverse=True)
+    return tuple(dict.fromkeys([own, *stock] if own else stock))
+
+
 # Reused sandboxes retain root-level tools until migration; name-based filters
 # must recognize it alongside _internal.
 LEGACY_ROOT_TOOLS_DIR: str = "tools"
@@ -108,6 +120,8 @@ class SandboxLayout:
     MCP_TOKENS_FILE: ClassVar[str] = "_internal/.mcp_tokens.json"
     EGRESS_RELAY_FILE: ClassVar[str] = "_internal/.egress_relay.json"
     VAULT_SECRETS_FILE: ClassVar[str] = "_internal/.vault_secrets.json"
+    # An MCP check's files, which hold a copy of the server's vault secrets.
+    MCP_CHECK_PREFIX: ClassVar[str] = "_internal/.mcp_check_"
 
     #: Relative names the uploaded sandbox client reads back out of the
     #: emitted block. Only these are emitted: the emission rides
@@ -244,6 +258,12 @@ class SandboxLayout:
     @property
     def vault_secrets(self) -> str:
         return self.join(self.VAULT_SECRETS_FILE)
+
+    @property
+    def credential_files(self) -> tuple[str, ...]:
+        """The files the server writes credentials to for the computer's
+        processes; an MCP check's copies match ``MCP_CHECK_PREFIX``."""
+        return (self.mcp_tokens, self.egress_relay, self.vault_secrets)
 
     @property
     def setup_dirs(self) -> tuple[str, ...]:
@@ -447,8 +467,8 @@ BACKUP_EXCLUDE_DIRS: frozenset[str] = frozenset({
 })
 
 # Where the file mount links the user's server-held files in, workspace-
-# relative (every workspace folder holds all of them, as the root does). The
-# server is their only copy: a backup never reads them and a restore never
+# relative (every workspace folder holds all of them). The server is their
+# only copy: a backup never reads them and a restore never
 # writes them, including rows an older manifest recorded before they were
 # mounted.
 MOUNTED_AGENT_SUBDIRS: tuple[str, ...] = (
@@ -457,6 +477,40 @@ MOUNTED_AGENT_SUBDIRS: tuple[str, ...] = (
     WorkspaceLayout.MEMORY_DIR,
     WorkspaceLayout.TRANSCRIPTS_DIR,
 )
+
+# The computer's index of past threads, which the file mount links in at the
+# root alone and writes as it is read.
+THREAD_INDEX: str = f"{SandboxLayout.AGENTS_DIR}/threads.jsonl"
+
+# What the file mount links in at the computer root, besides the thread index;
+# the per-workspace subtrees join them only where an unsplit workspace owns
+# the root.
+ROOT_MOUNTED_AGENT_SUBDIRS: tuple[str, ...] = (
+    SandboxLayout.USER_DIR,
+    SandboxLayout.WORKFLOWS_DIR,
+)
+
+
+def _under_any(relative: str, linked: tuple[str, ...]) -> bool:
+    return any(relative == d or relative.startswith(f"{d}/") for d in linked)
+
+
+def on_file_mount(path: str, workspace: WorkspaceLayout) -> bool:
+    """Whether ``path``, absolute in the sandbox, is one the file mount serves
+    while it runs, for a turn in ``workspace``: under one of its links at the
+    computer root or in a workspace folder."""
+    relative = posixpath.relpath(path, workspace.root)
+    if relative == ".." or relative.startswith("../"):
+        return False
+    if relative == THREAD_INDEX:
+        return True
+    at_root = (
+        MOUNTED_AGENT_SUBDIRS if not workspace.dir_name else ROOT_MOUNTED_AGENT_SUBDIRS
+    )
+    return _under_any(relative, at_root) or _under_any(
+        relative.partition("/")[2], MOUNTED_AGENT_SUBDIRS
+    )
+
 
 # Exclude ephemeral agent data from backup. Both tiers appear because the
 # names are matched workspace-relative and the two tiers can share a folder.

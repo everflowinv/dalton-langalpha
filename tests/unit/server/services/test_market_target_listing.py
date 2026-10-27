@@ -48,6 +48,13 @@ def test_unknown_suffix_is_refused():
     assert "never be checked" in refusal
 
 
+@pytest.mark.parametrize("symbol", ["123456", "0700", "7203"])
+def test_a_bare_number_is_refused(symbol):
+    listing, refusal = target_listing(symbol)
+    assert listing is None
+    assert "add its exchange suffix" in refusal
+
+
 def test_watch_spelling_of_stored_rows():
     assert watch_spelling("SPX", MarketType.INDEX) == "^GSPC"
     assert watch_spelling("HSI", MarketType.INDEX) == "^HSI"

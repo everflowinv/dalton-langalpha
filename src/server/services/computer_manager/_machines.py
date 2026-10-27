@@ -11,7 +11,11 @@ from datetime import datetime
 from typing import Any, Dict, Optional
 from uuid import uuid4
 
-from ptc_agent.core.sandbox.providers import PROVIDER_KINDS, provider_class
+from ptc_agent.core.sandbox.providers import (
+    PROVIDER_KINDS,
+    may_be_primary,
+    provider_class,
+)
 from ptc_agent.core.sandbox.runtime import SandboxGoneError, SandboxTransientError
 from ptc_agent.core.session import Session, SessionManager
 
@@ -66,18 +70,18 @@ logger = logging.getLogger(__name__)
 _HOME_BIND_ATTEMPTS = 3
 
 def default_computer_name(kind: str) -> str:
-    """A user reads the name before anything else about the machine, so it says
-    where the machine runs: a remote cloud, or their own."""
-    return "Cloud computer" if provider_class(kind).runs_remote else "Local computer"
+    return provider_class(kind).default_computer_name
 
 
-def next_default_computer_name(kind: str, taken: Iterable[Optional[str]]) -> str:
-    """The kind's default name, numbered past the names in ``taken``.
+def next_default_computer_name(
+    kind: str, taken: Iterable[Optional[str]], *, base: Optional[str] = None
+) -> str:
+    """The kind's default name, or ``base``, numbered past the names in ``taken``.
 
     Two kinds share "Cloud computer", so a user's second machine would
     otherwise read the same as their first in every picker.
     """
-    base = default_computer_name(kind)
+    base = base or default_computer_name(kind)
     used = {name.casefold() for name in taken if name}
     if base.casefold() not in used:
         return base
@@ -125,6 +129,10 @@ class MachineLifecycleMixin:
         resource_tier: Optional[str] = None,
         is_primary: bool = False,
         prepare: bool = False,
+        provider_config: Optional[Dict[str, Any]] = None,
+        root_dir: Optional[str] = None,
+        default_name: Optional[str] = None,
+        files_backup: bool = True,
     ) -> Dict[str, Any]:
         """Stopped and unprovisioned unless ``prepare``, so billing begins only on start.
 
@@ -134,7 +142,10 @@ class MachineLifecycleMixin:
         A machine keeps its provider for life, so ``kind`` (the deployment's
         when None) is checked before the row exists. Without a
         ``resource_tier`` it is created at "standard", which a provider that
-        lacks it resolves to its default size.
+        lacks it resolves to its default size. ``provider_config`` holds the
+        machine's own settings over the kind's (an ssh computer's target), and
+        is validated here so a bad one never reaches a row; ``default_name``
+        is what an unnamed machine is called before numbering.
 
         Raises:
             ProviderNotOffered: ``kind`` is not one a new computer may run on.
@@ -143,23 +154,26 @@ class MachineLifecycleMixin:
         kind = kind or self.config.sandbox.provider
         if kind not in self.config.sandbox.creatable_providers():
             raise ProviderNotOffered("Provider not offered")
-        if (
-            resource_tier is not None
-            and resource_tier not in self._provider_settings(kind, None).resource_tiers
-        ):
-            raise UnknownResourceTier("Unknown resource tier")
+        if resource_tier is not None or provider_config:
+            settings = self._provider_settings(kind, provider_config)
+            if resource_tier is not None and resource_tier not in settings.resource_tiers:
+                raise UnknownResourceTier("Unknown resource tier")
         if not name:
             name = next_default_computer_name(
-                kind, (c.get("name") for c in await get_computers_for_user(user_id))
+                kind,
+                (c.get("name") for c in await get_computers_for_user(user_id)),
+                base=default_name,
             )
         return await create_computer(
             user_id,
             kind=kind,
             name=name,
-            is_primary=is_primary,
+            is_primary=is_primary and may_be_primary(kind),
             status=ComputerStatus.CREATING if prepare else ComputerStatus.STOPPED,
             resource_tier=resource_tier or "standard",
-            root_dir=self.config.filesystem.working_directory,
+            root_dir=root_dir or self.config.filesystem.working_directory,
+            provider_config=provider_config,
+            files_backup=files_backup,
         )
 
     async def ensure_primary_computer(
@@ -347,7 +361,7 @@ class MachineLifecycleMixin:
                 platform_secret_version=int(
                     workspace.get("platform_secret_version") or 0
                 ),
-                is_primary=True,
+                is_primary=may_be_primary(kind),
                 root_dir=root_dir,
                 computer_id=candidate_id,
                 origin_workspace_id=workspace_id if adopt_ref else None,
@@ -565,13 +579,11 @@ class MachineLifecycleMixin:
         if sandbox is None:
             return
         skill_dirs = (
-            self.config.skills.local_skill_dirs_with_sandbox()
+            self.config.skills.local_skill_dirs()
             if self.config.skills.enabled
             else None
         )
-        user_skill_params = await sandbox_skill_sync_params(
-            user_id, self.config.skills.sandbox_skills_base
-        )
+        user_skill_params = await sandbox_skill_sync_params(user_id)
         result = await sandbox.sync_sandbox_assets(
             skill_dirs=skill_dirs,
             reusing_sandbox=reusing_sandbox,
@@ -605,7 +617,9 @@ class MachineLifecycleMixin:
         core_config = self._core_config_for(binding)
         previous_ref = binding.provider_ref
         reconnected = previous_ref is not None
-        tier_lapsed = reconnected and (computer.get("resource_tier") or tier) != tier
+        tier_lapsed = (
+            reconnected and (computer.get("resource_tier") or tier) != tier
+        )
 
         def _handle() -> Session:
             return SessionManager.get_session(
@@ -862,6 +876,8 @@ class MachineLifecycleMixin:
         computer = await get_computer(computer_id)
         if computer is None:
             return None
+        if not provider_class(computer["kind"]).metered:
+            return await try_claim_computer_for_start(computer_id, from_status=from_status)
         async with computer_capacity_lock(computer["user_id"]) as conn:
             current = await get_computer(computer_id, conn=conn)
             if current is None or current["status"] != from_status:

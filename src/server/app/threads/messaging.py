@@ -625,6 +625,7 @@ async def _handle_send_message(
         is_byok=is_byok,
         config=config,
         dispatched=is_dispatch,
+        from_server=is_internal,
         named_model=named_model,
         # A report-back summary owes its pair's watch clear, so its finalize
         # must see the pair.

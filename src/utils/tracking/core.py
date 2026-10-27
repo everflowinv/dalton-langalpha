@@ -2,7 +2,7 @@
 
 import copy
 import logging
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple, TypedDict
 
 logger = logging.getLogger(__name__)
 
@@ -98,8 +98,194 @@ def empty_usage_payload() -> Dict[str, Any]:
     }
 
 
+class CallRecord(TypedDict):
+    """One model call as metered and not yet priced (``build_call_record``)."""
+
+    # The billing key. The vendor's echo is kept apart and never priced.
+    model_name: str
+    served_model: Optional[str]
+    # The client's own stamp, which outranks a lookup by name.
+    pricing_model_id: Optional[str]
+    pricing_provider: Optional[str]
+    # Flattened by extract_token_usage: input, output, cached, cache write tokens.
+    usage: Dict[str, Any]
+    billing_type: str
+    started_at: Optional[str]
+    timestamp: str
+    run_id: str
+    parent_run_id: Optional[str]
+
+
+class PricedCall(NamedTuple):
+    card: Optional[Dict[str, Any]]
+    window: Optional[str]
+    straddled: bool
+    cost: float
+    breakdown: Dict[str, Any]
+    # Whether the manifest had a card at all: a seat-priced card is found and
+    # still bills as None, which a caller has to tell apart from "unknown".
+    listed: bool
+
+
+_ResolutionKey = Tuple[str, str, Optional[str], Optional[str]]
+
+
+class PricingResolver:
+    """Resolve and price a model once per key, not once per call.
+
+    A turn carries hundreds of records across a handful of models, and both
+    lookups walk the manifest and log on a miss. Memoizing turns the miss
+    into one warning per model per turn instead of one per call. The stamped
+    pair is part of the key because a fallback can swap the route mid-turn,
+    so two records can share a display name and still bill differently.
+    """
+
+    def __init__(self) -> None:
+        self._resolved: Dict[_ResolutionKey, Tuple[Optional[Dict[str, Any]], bool]] = {}
+
+    def card_for(self, record: CallRecord) -> Tuple[Optional[Dict[str, Any]], bool]:
+        """The billable card for the record's call, and whether one was listed."""
+        from src.llms.pricing_utils import find_model_pricing, resolve_pricing_identity
+
+        model_name = record["model_name"]
+        billing_type = record.get("billing_type", "platform")
+        stamped_id = record.get("pricing_model_id")
+        stamped_provider = record.get("pricing_provider")
+        cache_key = (model_name, billing_type, stamped_id, stamped_provider)
+        if cache_key in self._resolved:
+            return self._resolved[cache_key]
+
+        if stamped_id:
+            # The client that issued the call is the authority on what it routed
+            # to, so its own stamp outranks a lookup by name. For a built-in the
+            # two agree — provider is already reassigned to system_provider on the
+            # platform route — but a user-defined model may deliberately shadow a
+            # built-in name to send it through a variant's key, and resolving that
+            # name against the manifest would price the model it replaced.
+            provider, pricing_id = stamped_provider, stamped_id
+        else:
+            # No stamp: a consumer-supplied client. Fall back to the manifest key
+            # the record carries — system_provider for platform billing, base
+            # provider for BYOK/OAuth.
+            provider, pricing_id = resolve_pricing_identity(
+                model_name, billing_type=billing_type
+            )
+
+        pricing = find_model_pricing(pricing_id, provider=provider)
+        listed = pricing is not None
+
+        if pricing is None:
+            # A miss on a platform call is a money event, not a reporting gap: the
+            # tokens still aggregate but contribute nothing to platform_cost, which
+            # is the figure the turn is billed on. find_model_pricing already warns
+            # on the lookup itself; this line adds the context that makes it actionable.
+            # !r on both names: an unstamped record carries the vendor's string,
+            # which can hold newlines and forge log records downstream. pricing_id
+            # needs the same treatment as model_name rather than less — on a
+            # manifest miss the resolver hands back the name it was given, so this
+            # is that same untrusted string a second time.
+            miss = (
+                f"No pricing found for model: {model_name[:_LOGGED_NAME_MAX_LEN]!r} "
+                f"(pricing id: {pricing_id[:_LOGGED_NAME_MAX_LEN]!r}, provider: {provider!r}), "
+                "recording tokens with zero cost"
+            )
+            if billing_type == "platform":
+                logger.warning(miss)
+            else:
+                logger.debug(miss)
+        elif pricing.get("pricing_type") == "subscription":
+            # Seat-priced plans meter tokens but bill nothing per token.
+            logger.debug(f"Subscription pricing for {model_name!r}, recording tokens with zero cost")
+            pricing = None
+
+        self._resolved[cache_key] = (pricing, listed)
+        return self._resolved[cache_key]
+
+
+def price_call(record: CallRecord, resolve: Optional[PricingResolver] = None) -> PricedCall:
+    """One per-call record priced, picking the rate window first.
+
+    The batch pass prices every record through here, so a caller pricing one
+    call cannot disagree with the bill. ``resolve`` carries a memo across
+    calls for a caller that prices them one at a time.
+    """
+    from src.llms.pricing_utils import (
+        calculate_total_cost,
+        has_schedule,
+        parse_stamp,
+        resolve_schedule,
+        schedule_anchor,
+    )
+
+    pricing, listed = (resolve or PricingResolver()).card_for(record)
+    usage = record["usage"]
+
+    # Extract token counts from this specific call
+    input_tokens = usage.get('input_tokens', 0)
+    output_tokens = usage.get('output_tokens', 0)
+
+    # Extract cached tokens and cache creation tokens
+    # Uses flattened structure from extract_token_usage()
+    cached_tokens = usage.get('cached_tokens', 0)
+    cache_5m_tokens = usage.get('cache_5m_tokens', 0)
+    cache_1h_tokens = usage.get('cache_1h_tokens', 0)
+
+    # A model on peak hour pricing resolves per record, after the memoized
+    # lookup: the card depends on when this call ran, which the batch cannot
+    # share. Anchored on whichever end of the call the manifest names.
+    window = None
+    straddled = False
+    card = pricing
+    if has_schedule(pricing):
+        anchor = schedule_anchor(pricing)
+        billed_on = "started_at" if anchor == "request" else "timestamp"
+        other_end = "timestamp" if anchor == "request" else "started_at"
+        anchor_at = parse_stamp(record.get(billed_on))
+        other_at = parse_stamp(record.get(other_end))
+
+        # Records written before the start stamp existed carry only one end.
+        # The other end is a real observation of the same call, so it places
+        # the call far better than the no-stamp default of charging peak.
+        card, window = resolve_schedule(pricing, anchor_at or other_at)
+
+        # A streamed call can open in one window and close in another, and
+        # the whole call bills at one rate either way — the windows differ by
+        # 2x, so the unbilled end is the error. Recorded rather than acted on:
+        # no vendor says which end it charges, so the size of the disagreement
+        # has to be measurable before anyone can argue about it. Compares the
+        # two ends only, so a call crossing out of a window and back reads as
+        # unstraddled; that needs a call longer than the trough between two
+        # peak blocks, which is hours. Both ends have to be real: claiming a
+        # straddle off one stamp and one default would inflate the very count
+        # this exists to size, and every pre-branch record has one end.
+        if anchor_at is not None and other_at is not None:
+            straddled = resolve_schedule(pricing, other_at)[1] != window
+
+    # Cost is 0 when pricing is unavailable or seat-priced, but token counts
+    # are still aggregated so usage is never lost.
+    if card:
+        # Calculate cost for THIS CALL ONLY (accurate tiered pricing)
+        cost_result = calculate_total_cost(
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cached_tokens=cached_tokens,
+            cache_5m_tokens=cache_5m_tokens,
+            cache_1h_tokens=cache_1h_tokens,
+            pricing=card
+        )
+        return PricedCall(
+            card,
+            window,
+            straddled,
+            cost_result['total_cost'],
+            cost_result.get('breakdown', {}),
+            listed,
+        )
+    return PricedCall(card, window, straddled, 0.0, {}, listed)
+
+
 def calculate_cost_from_per_call_records(
-    per_call_records: List[Dict[str, Any]]
+    per_call_records: List[CallRecord], resolve: Optional[PricingResolver] = None
 ) -> Dict[str, Any]:
     """
     Calculate accurate cost from per-call token usage records.
@@ -118,17 +304,9 @@ def calculate_cost_from_per_call_records(
         Correct (per-call): Two 30k calls → Each in Tier 1 → Accurate pricing
 
     Args:
-        per_call_records: List of per-call token records from PerCallTokenTracker
-                         Each record contains:
-                         - model_name: str (the billing key)
-                         - served_model: Optional[str] (vendor echo, never priced)
-                         - pricing_model_id / pricing_provider: Optional[str],
-                           used only when model_name is off-manifest
-                         - usage: UsageMetadata dict
-                         - billing_type: str ("platform" / "byok" / "oauth")
-                         - timestamp: str (ISO format)
-                         - run_id: str
-                         - parent_run_id: Optional[str]
+        per_call_records: The records PerCallTokenTracker collected.
+        resolve: The memo of earlier passes over the same turn, for the
+            mid-run spend gate. The bill resolves afresh.
 
     Returns:
         The shape below is persisted verbatim into the ``token_usage`` JSON
@@ -186,16 +364,6 @@ def calculate_cost_from_per_call_records(
             ]
         }
     """
-    from src.llms.pricing_utils import (
-        calculate_total_cost,
-        find_model_pricing,
-        has_schedule,
-        parse_stamp,
-        resolve_pricing_identity,
-        resolve_schedule,
-        schedule_anchor,
-    )
-
     if not per_call_records:
         return empty_usage_payload()
 
@@ -210,71 +378,7 @@ def calculate_cost_from_per_call_records(
     }
     per_call_costs = []
     by_model: Dict[str, Dict[str, Any]] = {}
-    Resolution = Tuple[Optional[str], str, Optional[Dict[str, Any]]]
-    resolved: Dict[Tuple[str, str, Optional[str], Optional[str]], Resolution] = {}
-
-    def _resolve(
-        model_name: str,
-        billing_type: str,
-        stamped_id: Optional[str],
-        stamped_provider: Optional[str],
-    ) -> Resolution:
-        """Resolve and price a model once per batch, not once per call.
-
-        A turn carries hundreds of records across a handful of models, and both
-        lookups walk the manifest and log on a miss. Memoizing turns the miss
-        into one warning per model per turn instead of one per call. The stamped
-        pair is part of the key because a fallback can swap the route mid-turn,
-        so two records can share a display name and still bill differently.
-        """
-        cache_key = (model_name, billing_type, stamped_id, stamped_provider)
-        if cache_key in resolved:
-            return resolved[cache_key]
-
-        if stamped_id:
-            # The client that issued the call is the authority on what it routed
-            # to, so its own stamp outranks a lookup by name. For a built-in the
-            # two agree — provider is already reassigned to system_provider on the
-            # platform route — but a user-defined model may deliberately shadow a
-            # built-in name to send it through a variant's key, and resolving that
-            # name against the manifest would price the model it replaced.
-            provider, pricing_id = stamped_provider, stamped_id
-        else:
-            # No stamp: a consumer-supplied client. Fall back to the manifest key
-            # the record carries — system_provider for platform billing, base
-            # provider for BYOK/OAuth.
-            provider, pricing_id = resolve_pricing_identity(
-                model_name, billing_type=billing_type
-            )
-
-        pricing = find_model_pricing(pricing_id, provider=provider)
-
-        if pricing is None:
-            # A miss on a platform call is a money event, not a reporting gap: the
-            # tokens still aggregate but contribute nothing to platform_cost, which
-            # is the figure the turn is billed on. find_model_pricing already warns
-            # on the lookup itself; this line adds the context that makes it actionable.
-            # !r on both names: an unstamped record carries the vendor's string,
-            # which can hold newlines and forge log records downstream. pricing_id
-            # needs the same treatment as model_name rather than less — on a
-            # manifest miss the resolver hands back the name it was given, so this
-            # is that same untrusted string a second time.
-            miss = (
-                f"No pricing found for model: {model_name[:_LOGGED_NAME_MAX_LEN]!r} "
-                f"(pricing id: {pricing_id[:_LOGGED_NAME_MAX_LEN]!r}, provider: {provider!r}), "
-                "recording tokens with zero cost"
-            )
-            if billing_type == "platform":
-                logger.warning(miss)
-            else:
-                logger.debug(miss)
-        elif pricing.get("pricing_type") == "subscription":
-            # Seat-priced plans meter tokens but bill nothing per token.
-            logger.debug(f"Subscription pricing for {model_name!r}, recording tokens with zero cost")
-            pricing = None
-
-        resolved[cache_key] = (provider, pricing_id, pricing)
-        return resolved[cache_key]
+    resolve = resolve or PricingResolver()
 
     # A stamped client names its own key; an unstamped one leaves the vendor echo as
     # the key. Counted so the marker describes the dict actually built rather than
@@ -292,76 +396,13 @@ def calculate_cost_from_per_call_records(
         usage = record["usage"]
 
         billing_type = record.get("billing_type", "platform")
-        stamped_id = record.get("pricing_model_id")
-        if stamped_id:
+        if record.get("pricing_model_id"):
             stamped_records += 1
-        # Only the priced card is needed here; the resolver logs the identity it
-        # used on a miss, which is the one place the other two matter.
-        _, _, pricing = _resolve(
-            model_name,
-            billing_type,
-            stamped_id,
-            record.get("pricing_provider"),
-        )
+        card, window, straddled, call_cost, call_breakdown, _ = price_call(record, resolve)
 
-        # Extract token counts from this specific call
         input_tokens = usage.get('input_tokens', 0)
         output_tokens = usage.get('output_tokens', 0)
-
-        # Extract cached tokens and cache creation tokens
-        # Uses flattened structure from extract_token_usage()
         cached_tokens = usage.get('cached_tokens', 0)
-        cache_5m_tokens = usage.get('cache_5m_tokens', 0)
-        cache_1h_tokens = usage.get('cache_1h_tokens', 0)
-
-        # A model on peak hour pricing resolves per record, after the memoized
-        # lookup: the card depends on when this call ran, which the batch cannot
-        # share. Anchored on whichever end of the call the manifest names.
-        window = None
-        straddled = False
-        card = pricing
-        if has_schedule(pricing):
-            anchor = schedule_anchor(pricing)
-            billed_on = "started_at" if anchor == "request" else "timestamp"
-            other_end = "timestamp" if anchor == "request" else "started_at"
-            anchor_at = parse_stamp(record.get(billed_on))
-            other_at = parse_stamp(record.get(other_end))
-
-            # Records written before the start stamp existed carry only one end.
-            # The other end is a real observation of the same call, so it places
-            # the call far better than the no-stamp default of charging peak.
-            card, window = resolve_schedule(pricing, anchor_at or other_at)
-
-            # A streamed call can open in one window and close in another, and
-            # the whole call bills at one rate either way — the windows differ by
-            # 2x, so the unbilled end is the error. Recorded rather than acted on:
-            # no vendor says which end it charges, so the size of the disagreement
-            # has to be measurable before anyone can argue about it. Compares the
-            # two ends only, so a call crossing out of a window and back reads as
-            # unstraddled; that needs a call longer than the trough between two
-            # peak blocks, which is hours. Both ends have to be real: claiming a
-            # straddle off one stamp and one default would inflate the very count
-            # this exists to size, and every pre-branch record has one end.
-            if anchor_at is not None and other_at is not None:
-                straddled = resolve_schedule(pricing, other_at)[1] != window
-
-        # Cost is 0 when pricing is unavailable or seat-priced, but token counts
-        # are still aggregated so usage is never lost.
-        if card:
-            # Calculate cost for THIS CALL ONLY (accurate tiered pricing)
-            cost_result = calculate_total_cost(
-                input_tokens=input_tokens,
-                output_tokens=output_tokens,
-                cached_tokens=cached_tokens,
-                cache_5m_tokens=cache_5m_tokens,
-                cache_1h_tokens=cache_1h_tokens,
-                pricing=card
-            )
-            call_cost = cost_result['total_cost']
-            call_breakdown = cost_result.get('breakdown', {})
-        else:
-            call_cost = 0.0
-            call_breakdown = {}
 
         # Store per-call cost record
         call_cost_record = {
@@ -452,5 +493,9 @@ def calculate_cost_from_per_call_records(
 
 # Public API
 __all__ = [
+    'CallRecord',
+    'PricedCall',
+    'PricingResolver',
     'calculate_cost_from_per_call_records',
+    'price_call',
 ]

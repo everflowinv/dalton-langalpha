@@ -432,7 +432,6 @@ def skills_delivery_signature(
 
 async def sandbox_skill_sync_params(
     user_id: str | None,
-    sandbox_skills_base: str,
     workspace_id: str | None = None,
 ) -> dict[str, Any]:
     """Per-user kwargs for ``sync_sandbox_assets`` (``user_skill_dir`` +
@@ -448,5 +447,5 @@ async def sandbox_skill_sync_params(
     if bundle.account_disabled_builtins:
         params["disabled_skills"] = bundle.account_disabled_builtins
     if bundle.dir:
-        params["user_skill_dir"] = (bundle.dir, sandbox_skills_base)
+        params["user_skill_dir"] = bundle.dir
     return params

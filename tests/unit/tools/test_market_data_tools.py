@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 import pytz
+from market_protocol import InvalidSymbol
 
 from src.tools.market_data._shared import _normalize_market_bars
 from src.tools.market_data.company import _quote_heading, fetch_company_overview
@@ -442,6 +443,88 @@ class TestFetchDailyPrices:
 
         # Should call with date range (limit logic converts to date range)
         provider.get_daily_with_source.assert_called_once()
+
+
+class _RecordingClient:
+    """Stands in for the LangSmith client: records the runs it would update."""
+
+    def __init__(self) -> None:
+        self.updated: list[dict] = []
+
+    def create_run(self, **kwargs) -> None:
+        return None
+
+    def update_run(self, **kwargs) -> None:
+        self.updated.append(kwargs)
+
+    def flush(self) -> None:
+        return None
+
+
+class TestDailyPricesOutcome:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("symbol", "markets", "raised", "outcome", "error_class", "text"),
+        [
+            pytest.param(
+                "0700.HK", {"us"}, RuntimeError("upstream 503"),
+                "unavailable", "MarketNotCovered",
+                "No data source configured for market of 0700.HK",
+                id="market-not-covered",
+            ),
+            pytest.param(
+                "AAPL", {"all"}, InvalidSymbol("Symbol 'A B' contains ' '"),
+                "ok", None, "Symbol 'A B' contains ' '",
+                id="invalid-symbol",
+            ),
+            pytest.param(
+                "AAPL", {"all"}, RuntimeError("upstream 503"),
+                "error", "RuntimeError", "upstream 503",
+                id="source-failed",
+            ),
+            pytest.param(
+                "AAPL", {"all"}, None,
+                "unavailable", "no_data", "No price data available",
+                id="no-bars",
+            ),
+        ],
+    )
+    async def test_only_a_source_failing_is_an_error(
+        self, symbol, markets, raised, outcome, error_class, text
+    ):
+        """A market no source covers, a symbol nothing is spelled as, or a
+        range the symbol has no bars for is the agent's ask, not a source
+        failing, so it stays out of the tool's error rate; its text is
+        unchanged."""
+        from src.data_client.market_data_provider import (
+            MarketDataProvider,
+            ProviderEntry,
+        )
+        from src.observability.langsmith_tracer import NonRetainingTracer
+        from src.tools.market_data.tool import get_daily_prices
+
+        source = AsyncMock()
+        source.get_daily = AsyncMock(side_effect=raised, return_value=[])
+        provider = MarketDataProvider([ProviderEntry("ginlix", source, markets)])
+        client = _RecordingClient()
+
+        with patch(f"{_PRICES_MOD}.get_market_data_provider", return_value=provider):
+            msg = await get_daily_prices.ainvoke(
+                {
+                    "type": "tool_call",
+                    "name": "get_daily_prices",
+                    "args": {"symbol": symbol},
+                    "id": "tc-1",
+                },
+                {"callbacks": [NonRetainingTracer(project_name="proj", client=client)]},
+            )
+
+        assert text in msg.content
+        (update,) = [u for u in client.updated if u["run_type"] == "tool"]
+        metadata = update["extra"]["metadata"]
+        assert metadata["tool_outcome"] == outcome
+        assert metadata.get("error_class") == error_class
+        assert (update["error"] is not None) == (outcome == "error")
 
 
 class TestChartSeriesProvenance:
@@ -1353,6 +1436,73 @@ class TestFetchMarketOverview:
         assert content.startswith("[Live: ^GSPC 6,120.50")
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("markets", "raised", "indices", "outcome", "error_class"),
+        [
+            pytest.param(
+                {"us"}, RuntimeError("upstream 503"), None,
+                "unavailable", "MarketNotCovered", id="market-not-covered",
+            ),
+            pytest.param(
+                {"all"}, RuntimeError("upstream 503"), None,
+                "error", "RuntimeError", id="source-failed",
+            ),
+            pytest.param(
+                {"all"}, InvalidSymbol("Symbol 'A B' contains ' '"), None,
+                "ok", None, id="invalid-symbol",
+            ),
+            pytest.param(
+                {"us"}, InvalidSymbol("Symbol 'A B' contains ' '"), ["A B", "^N225"],
+                "unavailable", "MarketNotCovered", id="malformed-then-uncovered",
+            ),
+            pytest.param(
+                {"all"}, None, None,
+                "unavailable", "no_data", id="no-bars",
+            ),
+        ],
+    )
+    async def test_no_index_coming_back_marks_why(
+        self, markets, raised, indices, outcome, error_class
+    ):
+        """Each index's error is caught to keep the rest of the basket, so with
+        none back the snapshot itself marks the run, by the same rule a single
+        symbol's fetch does, with the worst of its errors."""
+        from src.data_client.market_data_provider import (
+            MarketDataProvider,
+            ProviderEntry,
+        )
+        from src.observability.langsmith_tracer import NonRetainingTracer
+        from src.tools.market_data.tool import get_market_overview
+
+        source = AsyncMock()
+        source.get_daily = AsyncMock(side_effect=raised, return_value=[])
+        provider = MarketDataProvider([ProviderEntry("ginlix", source, markets)])
+        client = _RecordingClient()
+
+        with patch(f"{_MKT_MOD}.get_market_data_provider", return_value=provider):
+            msg = await get_market_overview.ainvoke(
+                {
+                    "type": "tool_call",
+                    "name": "get_market_overview",
+                    # A past day, so no live snapshot stands in for the bars.
+                    "args": {
+                        "region": "jp",
+                        "date": "2025-02-14",
+                        **({"indices": indices} if indices else {}),
+                    },
+                    "id": "tc-1",
+                },
+                {"callbacks": [NonRetainingTracer(project_name="proj", client=client)]},
+            )
+
+        assert "No index data available" in msg.content
+        (update,) = [u for u in client.updated if u["run_type"] == "tool"]
+        metadata = update["extra"]["metadata"]
+        assert metadata["tool_outcome"] == outcome
+        assert metadata.get("error_class") == error_class
+        assert (update["error"] is not None) == (outcome == "error")
+
+    @pytest.mark.asyncio
     async def test_historical_date_skips_live_stamp(self):
         provider = _no_snapshot_provider()
         with patch(f"{_MKT_MOD}._fetch_index_day_snapshot",
@@ -1864,6 +2014,37 @@ class TestFetchMarketMovers:
 
         assert "not available" in content
 
+    @pytest.mark.asyncio
+    async def test_an_unknown_direction_is_refused_unmarked(self):
+        """The data API 422s any other direction; asking it would read as our
+        failure, so the tool refuses first and the run stays ok."""
+        from src.observability.langsmith_tracer import NonRetainingTracer
+        from src.tools.market_data.tool import get_market_movers
+
+        intel = _make_fake_intel_source()
+        provider = _make_fake_financial_provider(intel=intel)
+        client = _RecordingClient()
+
+        with patch(f"{_QUOTES_MOD}.get_financial_data_provider", return_value=provider):
+            msg = await get_market_movers.ainvoke(
+                {
+                    "type": "tool_call",
+                    "name": "get_market_movers",
+                    "args": {"direction": "sideways"},
+                    "id": "tc-1",
+                },
+                {"callbacks": [NonRetainingTracer(project_name="proj", client=client)]},
+            )
+
+        assert "direction must be 'gainers' or 'losers', got 'sideways'" in msg.content
+        assert msg.artifact["error"] == (
+            "direction must be 'gainers' or 'losers', got 'sideways'"
+        )
+        intel.get_movers.assert_not_called()
+        (update,) = [u for u in client.updated if u["run_type"] == "tool"]
+        assert update["extra"]["metadata"]["tool_outcome"] == "ok"
+        assert update["error"] is None
+
 
 # ---------------------------------------------------------------------------
 # CMDP display fixes: per-instrument Market header, unitless index levels,
@@ -2309,6 +2490,28 @@ class TestFetchQuote:
         assert not any("After-Hours Price" in ln for ln in closed_odd_lot)
 
     @pytest.mark.asyncio
+    async def test_no_row_for_any_symbol_is_unavailable(self):
+        """Nothing quoted for any symbol named is the instrument having
+        nothing, not a source failing, so the run is not errored."""
+        from src.observability.langsmith_tracer import NonRetainingTracer
+        from src.tools.market_data.tool import get_quote
+
+        provider = _make_fake_snapshot_provider([])
+        client = _RecordingClient()
+        with patch(f"{_QUOTES_MOD}.get_market_data_provider", return_value=provider), \
+                patch(f"{_DAILY_MOD}.daily_fallback_snapshot", new=AsyncMock(return_value=None)):
+            msg = await get_quote.ainvoke(
+                {"type": "tool_call", "name": "get_quote", "args": {"symbols": ["ZZZQ"]}, "id": "tc-1"},
+                {"callbacks": [NonRetainingTracer(project_name="proj", client=client)]},
+            )
+
+        assert "No quote data available for ZZZQ" in msg.content
+        (update,) = [u for u in client.updated if u["run_type"] == "tool"]
+        metadata = update["extra"]["metadata"]
+        assert (metadata["tool_outcome"], metadata["error_class"]) == ("unavailable", "no_data")
+        assert update["error"] is None
+
+    @pytest.mark.asyncio
     async def test_a_missing_listing_stays_missing_while_its_venue_trades(self):
         # During a session a last close would pass a quote outage off as live.
         snaps = [{"symbol": "600519.SH", "price": 1255.79, "change_percent": -0.22,
@@ -2681,3 +2884,45 @@ class TestIndexOverviewOutage:
 
         with self._down(), pytest.raises(RuntimeError, match="upstream 503"):
             await fetch_company_overview_data("^GSPC")
+
+
+_YEAR_OF_BARS = [{"date": "2026-01-02", "open": 1.0, "high": 2.0, "low": 0.5, "close": 1.5}]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("symbol", "bars"),
+    [("FAKE", []), ("^GSPC", []), ("^GSPC", _YEAR_OF_BARS)],
+    ids=["company", "index", "index-year-range-only"],
+)
+async def test_an_overview_with_nothing_behind_it_is_unavailable(symbol, bars):
+    """A company with no profile, or an index with no level (a year range
+    alone included), is the instrument having nothing, not a source failing,
+    so the run is not errored."""
+    from src.observability.langsmith_tracer import NonRetainingTracer
+    from src.tools.market_data.tool import get_company_overview
+
+    market = MagicMock()
+    market.get_snapshots = AsyncMock(return_value=[])
+    market.get_daily_with_source = AsyncMock(return_value=(bars, "ginlix-data", None))
+    provider = _make_fake_financial_provider(
+        financial=_make_fake_financial_source(profile_data=[])
+    )
+    client = _RecordingClient()
+    with (
+        patch(f"{_COMPANY_MOD}.get_financial_data_provider", return_value=provider),
+        patch(f"{_COMPANY_MOD}._fmp_request", return_value=[]),
+        patch(
+            "src.tools.market_data.index_overview.get_market_data_provider",
+            AsyncMock(return_value=market),
+        ),
+    ):
+        await get_company_overview.ainvoke(
+            {"type": "tool_call", "name": "get_company_overview", "args": {"symbol": symbol}, "id": "tc-1"},
+            {"callbacks": [NonRetainingTracer(project_name="proj", client=client)]},
+        )
+
+    (update,) = [u for u in client.updated if u["run_type"] == "tool"]
+    metadata = update["extra"]["metadata"]
+    assert (metadata["tool_outcome"], metadata["error_class"]) == ("unavailable", "no_data")
+    assert update["error"] is None

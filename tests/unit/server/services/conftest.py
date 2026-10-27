@@ -58,6 +58,17 @@ def _no_workspace_moving():
 
 
 @pytest.fixture(autouse=True)
+def _no_backup_stamp():
+    """Every backup stamps the time once it completes: a row write these
+    pool-less tests cannot make."""
+    with patch(
+        "src.server.services.persistence.backup.mark_files_backed_up",
+        AsyncMock(),
+    ):
+        yield
+
+
+@pytest.fixture(autouse=True)
 def _folder_allocation_is_free():
     """An adoption picks its folder under a transaction-scoped advisory lock
     these pool-less tests cannot take; the reads and the bind under it are patched."""

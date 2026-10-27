@@ -108,7 +108,8 @@ class WorkspaceEntitlementsMixin:
         """
         from src.server.dependencies.usage_limits import always_on_entitlement_lost
 
-        if not binding.is_always_on or not user_id:
+        # An unmetered machine is the user's own: no plan grants or limits it.
+        if not binding.is_always_on or not user_id or not binding.provider.metered:
             return binding.is_always_on
         if not await always_on_entitlement_lost(user_id):
             return True
@@ -256,7 +257,11 @@ class WorkspaceEntitlementsMixin:
                     platform_gating_active,
                 )
 
-                if enabled and platform_gating_active():
+                if (
+                    enabled
+                    and platform_gating_active()
+                    and provider_class(computer["kind"]).metered
+                ):
                     await stack.enter_async_context(computer_capacity_lock(owner_id))
                     computer = await get_computer(computer_id)
                     if not computer:
@@ -394,7 +399,16 @@ class WorkspaceEntitlementsMixin:
 
         exempt: set[str] = set()
 
-        always_on_rows = [c for c in running_computers if c.get("is_always_on")]
+        always_on_rows = []
+        for c in running_computers:
+            if not c.get("is_always_on"):
+                continue
+            # An unmetered machine is the user's own, so no plan can lapse it
+            # and there is nothing to probe.
+            if not provider_class(c["kind"]).metered:
+                exempt.add(str(c["computer_id"]))
+                continue
+            always_on_rows.append(c)
         # One platform validate per distinct owner, bounded-concurrent so a
         # large always-on fleet doesn't serialize the reaper cycle on RTTs.
         semaphore = asyncio.Semaphore(5)

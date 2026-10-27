@@ -17,6 +17,8 @@ import { Button } from '@/components/ui/button';
 import { Loader } from '@/components/ui/loader';
 import { ModalShell } from '@/components/ui/ModalShell';
 import { useLocale } from '@/hooks/useLocale';
+import { useNow } from '@/hooks/useNow';
+import { useWorkspace } from '@/hooks/useWorkspace';
 import { AnimatePresence } from '@/lib/framer';
 import type { Computer, WorkspaceMove, WorkspaceMoveError } from '@/types/api';
 
@@ -34,6 +36,8 @@ import {
   useWorkspaceMove,
   watchMove,
 } from '../hooks/useWorkspaceMove';
+import { backupAge } from './backupAge';
+import { backupRestoreOffer, type MoveAttempt } from './moveFromBackup';
 import { RadioCardGroup, type RadioCardOption } from './radioCardGroup';
 import { effectiveTier } from './specChangeUi';
 import { specErrorFiles } from './specErrors';
@@ -110,13 +114,43 @@ function MovePanel({ workspace, onClose }: { workspace: MoveWorkspaceTarget; onC
 
   const busy = moveRequest.isPending || cancelRequest.isPending;
   // The refusal of the last request outranks the failure it was retrying.
+  const refusal = moveRequest.error ? moveRefusal(moveRequest.error) : null;
   const formError: WorkspaceMoveError | null = moveRequest.isPending
     ? null
     : moveRequest.error
-      ? { code: 'request', message: requestErrorMessage(moveRequest.error, t) }
+      ? refusal ?? { code: 'request', message: requestErrorMessage(moveRequest.error, t) }
       : ended?.phase === 'failed'
         ? ended.error ?? { code: 'unknown', message: t('workspace.move.failed', "Couldn't move this workspace. Try again.") }
         : null;
+  // The last try, for the offer of a restore from the backup: this dialog's
+  // request, the move it followed, or else a move that failed before it opened.
+  const failedMove = active || moveRequest.isPending ? null : ended ?? (move?.phase === 'failed' ? move : null);
+  const attempt: MoveAttempt | null = moveRequest.isPending
+    ? null
+    : moveRequest.error
+      ? {
+        code: refusal?.code ?? null,
+        sourceId: currentId,
+        targetId: moveRequest.variables?.computerId ?? null,
+        fromBackup: !!moveRequest.variables?.fromBackup,
+      }
+      : failedMove && {
+        code: failedMove.error?.code ?? null,
+        sourceId: failedMove.source_computer_id,
+        targetId: failedMove.target_computer_id,
+        fromBackup: !!failedMove.from_backup,
+        earlier: failedMove !== ended,
+      };
+  const restoreOffer = backupRestoreOffer(attempt, computers, currentId);
+  // The restore the user is confirming, held until its request settles so the
+  // confirmation stays up while it is sent.
+  const [restoreTargetId, setRestoreTargetId] = useState<string | null>(null);
+  const restoring = restoreTargetId ?? restoreOffer?.targetId ?? null;
+  // Read only to say how old the backup is, so only while a restore is offered.
+  const { data: workspaceRow } = useWorkspace(restoring ? workspaceId : null);
+  const now = useNow(60_000, !!restoring);
+  const backedUpAt = workspaceRow?.files_backed_up_at;
+  const backupTime = backupAge(backedUpAt, locale, now);
   const cancelError = cancelRequest.error
     ? moveRefusal(cancelRequest.error)?.message
       ?? apiErrorReason(cancelRequest.error)
@@ -141,11 +175,38 @@ function MovePanel({ workspace, onClose }: { workspace: MoveWorkspaceTarget; onC
     cancelRequest.mutate({ workspaceId });
   };
 
-  const view = moveLoading ? 'loading' : active ? 'progress' : ended?.phase === 'done' ? 'done' : 'form';
+  const restoreFromBackup = () => {
+    if (!restoreTargetId || busy) return;
+    cancelRequest.reset();
+    moveRequest.mutate(
+      { workspaceId, computerId: restoreTargetId, name, fromBackup: true },
+      // Accepted, the move's progress takes over; refused, the form says why.
+      { onSettled: () => setRestoreTargetId(null) },
+    );
+  };
+
+  const view = moveLoading
+    ? 'loading'
+    : active
+      ? 'progress'
+      : ended?.phase === 'done'
+        ? 'done'
+        : restoreTargetId
+          ? 'confirmRestore'
+          : 'form';
 
   const footer = (
     <div className="flex items-center justify-end gap-2">
-      {view === 'form' ? (
+      {view === 'confirmRestore' ? (
+        <>
+          <Button type="button" variant="ghost" onClick={() => setRestoreTargetId(null)} disabled={busy}>
+            {t('common.back', 'Back')}
+          </Button>
+          <Button type="button" onClick={restoreFromBackup} disabled={busy} aria-busy={moveRequest.isPending}>
+            {t('workspace.move.fromBackup.button', 'Restore from backup')}
+          </Button>
+        </>
+      ) : view === 'form' ? (
         <>
           <Button type="button" variant="ghost" onClick={close} disabled={busy}>
             {t('common.cancel')}
@@ -221,6 +282,28 @@ function MovePanel({ workspace, onClose }: { workspace: MoveWorkspaceTarget; onC
           {t('workspace.move.done', 'Moved to {{computer}}', { computer: nameOf(ended.target_computer_id) })}
         </div>
       )}
+      {view === 'confirmRestore' && restoreTargetId && (
+        <div className="flex flex-col gap-2 text-sm" style={{ color: 'var(--color-text-primary)' }}>
+          <p>
+            {backupTime
+              ? t('workspace.move.fromBackup.confirm', {
+                target: nameOf(restoreTargetId),
+                time: backupTime,
+                defaultValue: 'Restore this workspace on {{target}} from its backup taken {{time}}?',
+              })
+              : t('workspace.move.fromBackup.confirmUndated', {
+                target: nameOf(restoreTargetId),
+                defaultValue: 'Restore this workspace on {{target}} from its backup?',
+              })}
+          </p>
+          <p className="text-xs" style={{ color: 'var(--color-text-secondary)' }}>
+            {t('workspace.move.fromBackup.caveats', {
+              computer: nameOf(currentId),
+              defaultValue: "Files changed since that backup aren't included. The folder on {{computer}} is kept, moved to _internal/leftovers once it answers again.",
+            })}
+          </p>
+        </div>
+      )}
       {view === 'form' && (
         <>
           <RadioCardGroup
@@ -230,13 +313,54 @@ function MovePanel({ workspace, onClose }: { workspace: MoveWorkspaceTarget; onC
             label={t('computer.computerLabel', 'Computer')}
           />
           <p className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
-            {t('workspace.move.notCopied', {
-              source: nameOf(currentId),
-              defaultValue:
-                "Installed dependencies, caches and .git history aren't copied. They stay on {{source}} for 7 days, then are removed.",
-            })}
+            {/* Leftovers on a machine the user brought are never removed. */}
+            {computers.find((c) => c.computer_id === currentId)?.kind === 'ssh'
+              ? t('workspace.move.notCopiedKept', {
+                  source: nameOf(currentId),
+                  defaultValue:
+                    "Installed dependencies, caches and .git history aren't copied. They stay on {{source}}, in _internal/leftovers, and aren't removed.",
+                })
+              : t('workspace.move.notCopied', {
+                  source: nameOf(currentId),
+                  defaultValue:
+                    "Installed dependencies, caches and .git history aren't copied. They stay on {{source}} for 7 days, then are removed.",
+                })}
           </p>
-          {formError && (
+          {restoreOffer ? (
+            // Says what failed itself, so it stands in for the failure's sentence.
+            <div
+              role="alert"
+              className="flex flex-col items-start gap-2 rounded-md px-3 py-2.5 text-sm"
+              style={{ backgroundColor: 'var(--color-bg-card)', color: 'var(--color-text-primary)' }}
+            >
+              <p>
+                {backupTime
+                  ? t('workspace.move.fromBackup.offer', {
+                    computer: nameOf(restoreOffer.sourceId),
+                    target: nameOf(restoreOffer.targetId),
+                    time: backupTime,
+                    defaultValue:
+                      "{{computer}} didn't answer, so the files couldn't be copied from it. If it's gone for good, you can restore this workspace on {{target}} from its backup taken {{time}}.",
+                  })
+                  : t('workspace.move.fromBackup.offerUndated', {
+                    computer: nameOf(restoreOffer.sourceId),
+                    target: nameOf(restoreOffer.targetId),
+                    defaultValue:
+                      "{{computer}} didn't answer, so the files couldn't be copied from it. If it's gone for good, you can restore this workspace on {{target}} from its backup.",
+                  })}
+              </p>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                className="h-7 px-2.5 text-xs"
+                onClick={() => setRestoreTargetId(restoreOffer.targetId)}
+                disabled={busy}
+              >
+                {t('workspace.move.fromBackup.button', 'Restore from backup')}
+              </Button>
+            </div>
+          ) : formError && (
             <div
               role="alert"
               className="rounded-md px-3 py-2 text-sm"
@@ -272,9 +396,10 @@ function computerOption(t: Translate, computer: Computer): RadioCardOption<strin
 
 /** Copying runs until the folder is set aside; past that the move is finishing on its own. */
 function moveProgressLabel(t: Translate, move: WorkspaceMove): string {
-  return isMoveCancellable(move)
-    ? t('workspace.move.copying', 'Copying files…')
-    : t('workspace.move.finishing', 'Finishing up…');
+  if (!isMoveCancellable(move)) return t('workspace.move.finishing', 'Finishing up…');
+  return move.from_backup
+    ? t('workspace.move.fromBackup.restoring', 'Restoring files from backup…')
+    : t('workspace.move.copying', 'Copying files…');
 }
 
 /** A refused or failed request, in the server's words when it gave some. */

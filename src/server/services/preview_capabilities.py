@@ -16,6 +16,11 @@ sandbox is recreated, the only way to rotate it. What a capability bounds is
 the browser's reach: one port, until it lapses or is revoked. Revocation is a
 per-sandbox generation counter, so revoking needs no index of what was minted,
 and a lost counter fails closed.
+
+A provider URL marked process-local is a forward only the minting process
+holds, so its record names no upstream: the worker serving a request opens
+its own (``preview_upstreams``). A stored origin is dialed as it is by
+whichever worker serves it, so one on loopback is refused at mint.
 """
 
 from __future__ import annotations
@@ -31,6 +36,7 @@ from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlsplit
 
+from ptc_agent.core.sandbox.preview_probe import is_loopback_url
 from ptc_agent.core.sandbox.runtime import PreviewInfo
 from src.server.services.preview_base import PreviewBase, preview_base
 from src.utils.cache.redis_cache import get_cache_client
@@ -42,9 +48,10 @@ __all__ = [
     "Capability",
     "PreviewProxyNotConfigured",
     "PreviewProxyUnavailable",
+    "Upstream",
     "is_current",
     "mint",
-    "probe_target",
+    "preview_origin",
     "publish",
     "resolve",
     "resolve_host",
@@ -52,7 +59,13 @@ __all__ = [
     "until_revoked",
 ]
 
+# A record that names its upstream stays a 2, the shape a reader that knows
+# only 2 still serves: during a cutover both colors share Redis, and after a
+# rollback the older one reads what this one minted. Only a null upstream,
+# which that reader would dial as "None", is a 3 it refuses.
 _RECORD_VERSION = 2
+_NULL_UPSTREAM_VERSION = 3
+_READABLE_VERSIONS = (_RECORD_VERSION, _NULL_UPSTREAM_VERSION)
 # Outlives every record minted against it: refreshed on each mint and revoke
 # to past the longest lifetime the preview route lets a caller ask for.
 _GENERATION_TTL_S = 86_400 + 3600
@@ -72,43 +85,57 @@ class PreviewProxyUnavailable(Exception):
 
 
 @dataclass(frozen=True)
+class Upstream:
+    """Where a worker dials a capability's port, and the headers it needs."""
+
+    origin: str
+    headers: Mapping[str, str] = field(default_factory=dict, repr=False)
+
+
+@dataclass(frozen=True)
 class Capability:
-    """What one capability opens: one port of one sandbox, until it lapses."""
+    """What one capability opens: one port of one sandbox, until it lapses.
+
+    ``upstream`` is None for a port only the process that opened its forward
+    can dial; the serving worker resolves it for itself from the sandbox, port
+    and workspace.
+    """
 
     sandbox_id: str
     port: int
-    upstream: str
+    upstream: Upstream | None
     workspace_id: str
     generation: int
     expires_at: int
-    headers: Mapping[str, str] = field(default_factory=dict, repr=False)
 
     def to_record(self) -> dict[str, Any]:
+        upstream = self.upstream
         return {
-            "v": _RECORD_VERSION,
+            "v": _NULL_UPSTREAM_VERSION if upstream is None else _RECORD_VERSION,
             "sandbox_id": self.sandbox_id,
             "port": self.port,
-            "upstream": self.upstream,
+            "upstream": None if upstream is None else upstream.origin,
             "workspace_id": self.workspace_id,
             "generation": self.generation,
             "expires_at": self.expires_at,
-            "headers": dict(self.headers),
+            "headers": {} if upstream is None else dict(upstream.headers),
         }
 
     @classmethod
     def from_record(cls, record: Any) -> Capability | None:
         """The capability a stored record holds; None for any other shape."""
-        if not isinstance(record, dict) or record.get("v") != _RECORD_VERSION:
+        if not isinstance(record, dict) or record.get("v") not in _READABLE_VERSIONS:
             return None
         try:
+            origin = record["upstream"]
+            headers = {str(k): str(v) for k, v in (record["headers"] or {}).items()}
             return cls(
                 sandbox_id=str(record["sandbox_id"]),
                 port=int(record["port"]),
-                upstream=str(record["upstream"]),
+                upstream=None if origin is None else Upstream(str(origin), headers),
                 workspace_id=str(record["workspace_id"]),
                 generation=int(record["generation"]),
                 expires_at=int(record["expires_at"]),
-                headers={str(k): str(v) for k, v in (record["headers"] or {}).items()},
             )
         except (AttributeError, KeyError, TypeError, ValueError):
             return None
@@ -136,7 +163,7 @@ def _redis() -> Any:
     return cache.client
 
 
-def _origin(url: str) -> str:
+def preview_origin(url: str) -> str:
     parts = urlsplit(url)
     if parts.scheme not in ("http", "https") or not parts.netloc:
         raise ValueError(f"not an origin a preview can be served from: {url!r}")
@@ -157,6 +184,15 @@ async def mint(
     Fails closed: a record that could not be written raises rather than hand
     out a URL that would answer 404.
     """
+    origin = preview_origin(info.url)
+    if info.process_local:
+        # Another worker holds no listener on that port, or one forwarding to
+        # another machine, so the record keeps only what re-resolves it there.
+        upstream = None
+    elif is_loopback_url(origin):
+        raise ValueError(f"a preview on loopback that is not process-local: {origin}")
+    else:
+        upstream = Upstream(origin, dict(info.auth_headers))
     client = _redis()
     key = _generation_key(sandbox_id)
     try:
@@ -175,11 +211,10 @@ async def mint(
     capability = Capability(
         sandbox_id=sandbox_id,
         port=int(port),
-        upstream=_origin(info.url),
+        upstream=upstream,
         workspace_id=workspace_id,
         generation=generation,
         expires_at=int(time.time()) + expires_in,
-        headers=dict(info.auth_headers),
     )
     if not await get_cache_client().set(
         _record_key(token), capability.to_record(), ttl=expires_in
@@ -297,25 +332,3 @@ async def publish(
         expires_in=expires_in,
         base=base,
     )
-
-
-async def probe_target(url: str) -> tuple[str, dict[str, str]] | None:
-    """Where the server checks a URL it handed a browser, and with which headers.
-
-    A capability URL is checked at its sandbox, never through the server's
-    own preview host. None means the capability no longer opens anything.
-    """
-    base = preview_base()
-    parts = urlsplit(url)
-    if base is None or not base.claims(parts.netloc):
-        return url, {}
-    try:
-        capability = await resolve_host(parts.netloc, base=base)
-    except PreviewProxyUnavailable:
-        return None
-    if capability is None:
-        return None
-    target = capability.upstream + (parts.path or "/")
-    if parts.query:
-        target = f"{target}?{parts.query}"
-    return target, dict(capability.headers)

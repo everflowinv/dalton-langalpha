@@ -512,7 +512,7 @@ class TestResearch:
         with patch("src.server.app.setup.agent_config", MagicMock()), \
              patch("src.server.services.llm.config.resolve_llm_config", AsyncMock(return_value=resolved)), \
              patch("ptc_agent.agent.insight_graph.build_insight_graph", return_value=Graph()):
-            assert await _research("prompt", user_id="user-1") == "brief"
+            assert await _research("prompt", user_id="user-1", insight_type="personalized") == "brief"
 
         assert seen == {"model": "user-fetch-model", "client": client}
         assert fetch.fetch_model_override.get() is None

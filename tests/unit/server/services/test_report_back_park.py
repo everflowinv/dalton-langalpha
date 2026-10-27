@@ -75,6 +75,17 @@ async def test_a_finalize_between_the_read_and_the_park_is_caught():
 
 
 @pytest.mark.asyncio
+async def test_the_re_read_waits_out_a_finalize_in_flight():
+    """A finalize whose release pass ran before the park still reads live
+    to a plain read until it commits, which strands the job; the re-read
+    waits on the row that finalize holds."""
+    with _env(["in_progress", "completed"]) as (latest, _, release, _):
+        assert await _park() is True
+    assert latest.await_args_list[1].kwargs == {"wait_for_finalize": True}
+    release.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_an_alert_held_at_the_ceiling_is_released_by_the_re_read_too():
     """A market-target alert parked at the attempts ceiling is held rather
     than dead, still parked for the finalize release the re-read stands in
@@ -140,6 +151,8 @@ async def test_a_turn_ended_since_the_claim_releases_the_thread(since, now):
         latest.side_effect = None
         latest.return_value = now
         assert await release_if_a_turn_ended("t-1", run_marker(since)) is True
+    # Behind a finalize in flight, which a plain read would take for live.
+    assert latest.await_args.kwargs == {"wait_for_finalize": True}
     release.assert_awaited_once()
     assert release.await_args.args[1] == "t-1"
     drainer.nudge.assert_called_once()

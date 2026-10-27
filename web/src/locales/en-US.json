@@ -11,6 +11,7 @@
       "offlineMessage": "You are offline. Data may be out of date until your connection returns."
     },
     "copy": "Copy",
+    "copied": "Copied",
     "submit": "Submit",
     "save": "Save",
     "saving": "Saving...",
@@ -1370,6 +1371,7 @@
       "title": "Move workspace",
       "intro": "Move {{name}} to another of your computers. Its files, threads and settings go with it.",
       "notCopied": "Installed dependencies, caches and .git history aren't copied. They stay on {{source}} for 7 days, then are removed.",
+      "notCopiedKept": "Installed dependencies, caches and .git history aren't copied. They stay on {{source}}, in _internal/leftovers, and aren't removed.",
       "submit": "Move",
       "copying": "Copying files…",
       "finishing": "Finishing up…",
@@ -1378,7 +1380,30 @@
       "cancelFailed": "Couldn't cancel the move. Try again.",
       "done": "Moved to {{computer}}",
       "failedTitle": "Couldn't move {{name}}",
-      "failed": "Couldn't move this workspace. Try again."
+      "failed": "Couldn't move this workspace. Try again.",
+      "fromBackup": {
+        "offer": "{{computer}} didn't answer, so the files couldn't be copied from it. If it's gone for good, you can restore this workspace on {{target}} from its backup taken {{time}}.",
+        "offerUndated": "{{computer}} didn't answer, so the files couldn't be copied from it. If it's gone for good, you can restore this workspace on {{target}} from its backup.",
+        "button": "Restore from backup",
+        "confirm": "Restore this workspace on {{target}} from its backup taken {{time}}?",
+        "confirmUndated": "Restore this workspace on {{target}} from its backup?",
+        "caveats": "Files changed since that backup aren't included. The folder on {{computer}} is kept, moved to _internal/leftovers once it answers again.",
+        "restoring": "Restoring files from backup…"
+      }
+    },
+    "restoreOffer": {
+      "missing": "This workspace's folder is missing on {{computer}}.",
+      "missingUnnamed": "This workspace's folder is missing.",
+      "prompt": "Restore it from the backup taken {{time}}?",
+      "promptUndated": "Restore it from its backup?",
+      "restore": "Restore files",
+      "keepEmpty": "Keep it empty",
+      "restoring": "Restoring files…",
+      "keeping": "Keeping the folder empty…",
+      "keepEmptyTitle": "Keep the folder empty?",
+      "keepEmptyBody": "The backup then follows the folder as it is now, so the files in it can't be restored afterwards.",
+      "keepEmptyConfirm": "Keep it empty",
+      "failed": "Couldn't restore the files"
     },
     "notOnPlan": "Not available on your plan. Upgrade to unlock.",
     "tierLimitReached": "You've reached your {{tier}} workspace limit.",
@@ -1392,6 +1417,11 @@
     "failedLoadWorkspaces": "Failed to load workspaces. Please refresh the page.",
     "invalidWorkspace": "Invalid workspace. Please try again.",
     "failedDeleteWorkspace": "Failed to delete workspace. Please try again.",
+    "deleteOwnMachine": {
+      "cannotUndo": "The workspace and its threads are deleted, and this can't be undone.",
+      "filesStay": "Its files are in {{folder}} on {{computer}}, and they stay there.",
+      "alsoDeleteFiles": "Also delete {{folder}} from this machine"
+    },
     "loadingWorkspaces": "Loading workspaces...",
     "backToThreads": "Back to threads",
     "updated": "Updated {{time}}",
@@ -1439,11 +1469,15 @@
       "label": "Provider",
       "daytonaDesc": "Stopping keeps your files. Running programs end.",
       "e2bDesc": "Stopping keeps memory and running programs, so it picks up where it left off.",
-      "dockerDesc": "Runs on this machine."
+      "dockerDesc": "Runs on this machine.",
+      "sshDesc": "Any Linux server or Mac you can SSH into. Stopping ends only the agent's programs.",
+      "sshLabel": "Your machine (SSH)"
     },
     "newComputer": "New computer",
     "create": "Create computer",
     "creating": "Creating...",
+    "add": "Add computer",
+    "adding": "Adding...",
     "start": "Start",
     "stop": "Stop",
     "primaryBadge": "Primary",
@@ -1479,8 +1513,15 @@
     "remove": "Remove",
     "removeTitle": "Remove {{name}}?",
     "removeBody": "Its sandbox and everything on its disk are deleted. This can't be undone.",
+    "removeBodyOwnMachine": "We stop using this machine and remove what we set up there for it. Your files in {{folder}} stay.",
     "removeConfirm": "Remove computer",
     "removing": "Removing...",
+    "removeKey": "Remove our key from ~/.ssh/authorized_keys",
+    "keyRemoved": "We also removed our key from ~/.ssh/authorized_keys.",
+    "keyKept": "Our key stays in ~/.ssh/authorized_keys, since {{computer}} still logs in with it.",
+    "keySkipped": "We could not safely remove our key, so it still lets us log in there.",
+    "keyUnreached": "We could not reach the machine, so our key is still there.",
+    "keyRemoveYourself": "To remove it yourself, delete the line ending in {{comment}} from ~/.ssh/authorized_keys. Its fingerprint is {{fingerprint}}.",
     "removed": "{{name}} removed",
     "removeFailed": "Couldn't remove this computer. Try again.",
     "removeBlocked": {
@@ -1497,6 +1538,13 @@
     },
     "manageComputer": "Manage {{name}}",
     "alwaysOn": "Always-on",
+    "filesBackup": {
+      "label": "Back up files",
+      "offTitle": "Stop backing up files?",
+      "offBody": "The last backup of each workspace on {{name}} is kept but stops updating. A folder lost on this machine could then only be restored as it was then.",
+      "offConfirm": "Stop backing up",
+      "failed": "Couldn't change file backup"
+    },
     "prepare": {
       "sandbox": "Creating the sandbox",
       "tools": "Installing tools",
@@ -1582,6 +1630,70 @@
       "refresh": "Refresh status",
       "archive": "Archive",
       "sandboxId": "Sandbox ID:"
+    },
+    "ssh": {
+      "filesBackup": "Back up workspace files",
+      "filesBackupHint": "Keeps a copy of each workspace's files on the server, so a lost folder can be restored. Version control and dependency folders are left out.",
+      "previewLabel": "Preview",
+      "previewNotice": "Connecting your own machine is new, so use it with care. The agent can do anything the account you connect can do, so connect an account made for it rather than your own.",
+      "pairIntro": "Run this on the machine you are adding (Linux or macOS), as the user the agent should work as:",
+      "pairIntroLocal": "Run this in a terminal on the computer running LangAlpha, as the user the agent should work as. To add another machine, set it up by hand.",
+      "pairLoading": "Getting your command...",
+      "viewScript": "View script",
+      "waiting": "Waiting for your machine...",
+      "checking": "{{username}}@{{hostname}} checked in. Connecting...",
+      "tunneling": "Connecting {{hostname}} through a tunnel. It could not be reached from the internet, so it is connecting out instead. This takes a few seconds.",
+      "readyTunnel": "{{hostname}}, through a tunnel",
+      "tunnelBadge": "tunnel",
+      "tunnelOffline": "tunnel offline",
+      "pairFailedNext": "Fix it and run the command again, or enter the address yourself:",
+      "pairRerun": "Fix it and run the command again.",
+      "pairOtherUser": "The command ran as {{username}}. To use another login, run it as that user.",
+      "limitReached_one": "You can have only {{count}} SSH computer. Remove it to add another.",
+      "limitReached_other": "You can have up to {{count}} SSH computers. Remove one to add another.",
+      "pairUnavailable": "The one-line command is not available on this server, so set it up by hand.",
+      "manualLink": "Set it up by hand instead",
+      "pairingLink": "Use the one-line command instead",
+      "addressLabel": "Host or SSH command",
+      "addressHint": "Add :2222 for another port.",
+      "addressNoUser": "Include the user, like ubuntu@203.0.113.10.",
+      "addressInvalid": "Enter an address like ubuntu@203.0.113.10.",
+      "portInvalid": "Enter a port from 1 to 65535.",
+      "connect": "Connect",
+      "connecting": "Connecting...",
+      "keyStep": "Our key isn't on {{username}}@{{host}} yet. Run this there as {{username}}, then Connect again:",
+      "keyLoading": "Getting your key...",
+      "keyUnavailable": "This server cannot store SSH keys, so it cannot connect to your machine.",
+      "keyFailed": "Could not get your key. Close this dialog and try again.",
+      "commandLabel": "command",
+      "publicKeyLabel": "public key",
+      "copyLabel": "Copy {{what}}",
+      "keyManual": "Or add the public key yourself",
+      "differentMachine": "Use a different machine",
+      "diskFree": "{{free}} free",
+      "sudoRoot": "Connecting as root.",
+      "sudoYes": "sudo available",
+      "sudoNo": "sudo is not available. Some tools may not install.",
+      "folder": "Folder",
+      "folderHint": "Where workspaces are kept on your machine.",
+      "folderShown": "Workspaces go in {{folder}}.",
+      "changeFolder": "Change",
+      "hostKey": "Host key {{fingerprint}}",
+      "error": {
+        "authFailed": "The machine did not accept our key for {{username}}.",
+        "authFailedRoot": "The machine did not accept our key for root, most likely because it does not allow root logins. Run the command as the user the agent should work as, or allow root logins by key (PermitRootLogin prohibit-password).",
+        "unreachable": "We could not reach {{address}}. It must accept SSH from the internet.",
+        "unreachableMachine": "We could not reach your machine over SSH. It must accept SSH from the internet.",
+        "unreachableMac": "We could not reach your Mac over SSH. Turn on Remote Login in System Settings, General, Sharing, then run the command again.",
+        "timeout": "The connection timed out. Check that SSH is running and its port is open.",
+        "hostKeyMismatch": "Something other than your machine answered at that address.",
+        "privateAddress": "The machine is on a private network, which we cannot reach. Use an address that is reachable from the internet.",
+        "unsupported": "This machine is not supported.",
+        "expired": "This command expired. Run the new one.",
+        "rateLimited_one": "This account has tried too many SSH connections in the last hour. Try again in {{count}} minute.",
+        "rateLimited_other": "This account has tried too many SSH connections in the last hour. Try again in {{count}} minutes.",
+        "generic": "Could not connect. Try again."
+      }
     }
   },
   "thread": {
@@ -2051,8 +2163,7 @@
       "sector-overviewDesc": "Industry landscape report: market size, competitive dynamics, company profiles, valuation context",
       "competitive-analysisDesc": "Competitive landscape analysis: positioning, scorecards, moat assessment, market share trends",
       "initiating-coverageDesc": "Full equity research initiation: company research, financial model, valuation, charts, 30-50 page report",
-      "chart-annotationDesc": "Annotate a price chart: price lines, trendlines, zones, and event markers, live on MarketView or as a chart card in chat",
-      "report-issueDesc": "Report issues and propose fixes to improve agent capabilities"
+      "chart-annotationDesc": "Annotate a price chart: price lines, trendlines, zones, and event markers, live on MarketView or as a chart card in chat"
     },
     "compactedNotification": "Context compacted · {{from}} messages → summary",
     "taskErrorNotification": "Subagent run failed",
@@ -2286,13 +2397,13 @@
     "metaPages_one": "1 page",
     "metaPages_other": "{{count}} pages",
     "newTab": "New tab",
+    "back": "Back",
+    "forward": "Forward",
     "noFilesYet": "No files yet",
     "noTypeMatches": "No {{type}} files",
     "openFile": "Open a file",
-    "openFileHint": "Pick one from the tree on the right.",
-    "openFileHintUpload": "Pick one from the tree on the right, or drop a file here to upload it.",
-    "showFileTree": "Show file tree",
-    "dropToUploadHint": "Or drop a file here to upload it.",
+    "files": "Files",
+    "dropToUploadHint": "Drop a file here to upload it.",
     "openFiles": "Open tabs",
     "runningApps": "Running apps",
     "reloadApp": "Reload app",
@@ -2300,7 +2411,6 @@
     "previewFrameTitle": "App on port {{port}}",
     "openInBrowser": "Open in browser",
     "chartTab": "Chart",
-    "openChart": "Open a chart",
     "addChartToContext": "Add chart to context",
     "openInMarketView": "Open in MarketView",
     "chartContextHint": "The user is looking at the live {{symbol}} chart ({{timeframe}} candles) in the workspace panel.",
@@ -2319,11 +2429,14 @@
     "systemDirs": "System",
     "systemDirsHint": "Show system directories (.agents/, .system/, tools/, …)",
     "toggleTree": "Toggle file tree",
+    "expandPanel": "Expand panel",
+    "collapsePanel": "Show chat",
     "uploadFile": "Upload file",
     "uploadingNth": "Uploading {{current}} / {{total}}: {{name}} — {{percent}}%",
     "uploadFailedSummary_one": "1 file failed to upload: {{details}}",
     "uploadFailedSummary_other": "{{count}} files failed to upload: {{details}}",
     "backupFiles": "Backup files to database",
+    "backupOff": "File backup is off for this computer.",
     "backupSummary_one": "Backed up 1 file",
     "backupSummary_other": "Backed up {{count}} files",
     "backupUnchanged": ", {{count}} unchanged",
@@ -2368,8 +2481,8 @@
     "exitFullscreen": "Exit fullscreen",
     "downloadAsHtml": "Download as HTML",
     "moreActions": "More actions",
-    "htmlPreview": "Preview",
-    "htmlSource": "Source",
+    "viewSource": "View source",
+    "viewPreview": "View page",
     "htmlPreviewFailed": "Couldn't load the preview.",
     "pdfPrintHint": "Press Cmd/Ctrl-P to save the page as a PDF.",
     "pdfGenerating": "Generating PDF…",
@@ -3235,6 +3348,9 @@
         "partiallyFilled": "Partially filled",
         "filled": "Filled",
         "cancelled": "Cancelled",
+        "handedOff": "Left the brokerage's instruction list, so it was sent, deleted or expired there. The brokerage does not say which; the account's orders show what was sent.",
+        "handedOffStaged": "Left {{vendor}}'s instruction list, so it was sent, deleted or expired in {{vendor}}. {{vendor}} does not say which; the account's orders show what was sent.",
+        "handedOffStagedUnnamed": "Left the brokerage's instruction list, so it was sent, deleted or expired there. The brokerage does not say which; the account's orders show what was sent.",
         "rejectedByVendor": "Rejected by the brokerage",
         "failed": "Failed before the brokerage answered",
         "unknown": "Outcome unknown"
@@ -3252,6 +3368,7 @@
         "partiallyFilled": "Partial fill",
         "filled": "Filled",
         "cancelled": "Cancelled",
+        "handedOff": "Handed off",
         "rejectedByVendor": "Broker rejected",
         "failed": "Failed",
         "unknown": "Unknown"
@@ -3728,77 +3845,37 @@
     "next": "Continue",
     "done": "Start exploring",
     "step": "Step {{n}}",
-    "intros": {
-      "chat": {
-        "steps": {
-          "workspace": {
-            "title": "Meet workspaces"
-          }
-        }
-      },
-      "thread": {
-        "steps": {
-          "filePanel": {
-            "title": "Every artifact lands in the file panel",
-            "body": "Word docs, Excel models, PDFs, charts — whatever the agent produces is saved to the workspace. Open the folder icon up top to browse, preview, and download."
-          },
-          "memory": {
-            "title": "The agent remembers how you work",
-            "body": "The agent keeps long-term memory across threads: your preferences, conventions, and conclusions worth reusing. Say \"remember this\" and it persists."
-          },
-          "memo": {
-            "title": "Ground it with your memos",
-            "body": "Upload PDFs, notes, or spreadsheets as memos. The agent reads them on demand — your private research becomes part of its context."
-          }
-        }
-      },
-      "dashboard": {
-        "steps": {
-          "overview": {
-            "title": "Your market homepage",
-            "body": "Watchlist, portfolio, news, and live charts in one place — a real-time overview that's ready before you ask anything."
-          },
-          "customize": {
-            "title": "Make it yours",
-            "body": "Switch to Custom mode to add, remove, resize, and rearrange widgets. Build the exact monitor you want to wake up to."
-          },
-          "attach": {
-            "title": "Clip any widget into chat",
-            "body": "See something worth digging into? Hit the paperclip on a row to attach it to chat as context — the agent picks up exactly what you're looking at."
-          }
-        }
-      }
-    },
     "gettingStarted": {
       "title": "Get started",
       "dismiss": "Hide guide",
+      "progress": "{{done}} of {{total}} done",
       "tasks": {
         "dashboard": {
           "title": "Explore the dashboard",
-          "desc": "Watchlist, portfolio, news, and live widgets in one place."
+          "desc": "Watchlist, portfolio, and news on one live page."
         },
         "market": {
           "title": "Check live markets",
-          "desc": "Real-time charts with streaming market data."
+          "desc": "Streaming charts for any symbol."
         },
         "profile": {
           "title": "Set up your investing profile",
           "desc": "Risk, markets, style, and how the agent works with you."
         },
         "createWorkspace": {
-          "title": "Create your first workspace"
+          "title": "Create a workspace"
         },
         "firstChat": {
           "title": "Run your first analysis",
-          "desc": "Open a chat and ask about any ticker, sector, or filing."
+          "desc": "Ask about any ticker, sector, or filing."
         },
         "models": {
-          "title": "Visit the model configuration",
-          "desc": "Choose default models and connect providers in Settings."
+          "title": "Choose your models",
+          "desc": "Pick default models and connect providers."
         },
         "integrations": {
-          "title": "Use {{brand}} on other platforms",
-          "desc": "Reach the agent from Slack, email, and more via platform integrations."
+          "title": "Connect a chat app",
+          "desc": "Talk to {{brand}} from Slack, Telegram, iMessage, and more."
         }
       }
     },
@@ -4579,6 +4656,7 @@
       "open": "Open at the broker",
       "filled": "Filled",
       "cancelled": "Cancelled",
+      "handedOff": "Handed off",
       "rejected": "Rejected",
       "failed": "Failed"
     }
@@ -5905,32 +5983,11 @@
       "setupFailed": "Couldn't open the workspace. Please try again."
     },
     "tour": {
-      "modes": {
-        "title": "Two ways to work",
-        "body": "Pick a workspace and its Analyst does the work there, with that workspace's files. Pick All workspaces and your Chief of Staff takes it: it answers quick questions itself and hands deep work to the right Analyst. The next steps show each one."
-      },
-      "chiefOfStaff": {
-        "title": "All workspaces: your Chief of Staff",
-        "body": "Just say what you need. Your Chief of Staff answers quick questions, creates and manages workspaces, hands deep work to each workspace's Analyst and reports back, and manages your automations. Its conversations are collected in the All workspaces card, and its own files live in a folder called Home."
-      },
-      "analyst": {
-        "title": "A workspace: its Analyst does the work",
-        "body": "Each workspace has its own Analyst. Every thread in the workspace shares the same files, data and prior work, so research compounds. It processes large datasets, coordinates teams of subagents, and produces any deliverable: Excel models, Word docs, PDFs, dashboards."
-      },
-      "workspace": {
-        "body": "Every workspace is a project desk: the conversations about one task live there together, sharing the same files, data and results, separate from other workspaces. All your workspaces and Home live on one computer, which starts as soon as you start typing."
-      },
-      "create": {
-        "title": "Give real tasks their own workspace",
-        "body": "If it involves data work or ends in a deliverable, give it a workspace: hit \"New workspace\" and name it after the task, or ask your Chief of Staff to set one up."
-      },
-      "createWorkspaceTask": "Spin up a dedicated workspace; its Analyst gets a full sandbox for real research."
+      "createWorkspaceTask": "A desk for one project, with its own Analyst and files."
     },
     "intro": {
-      "chiefOfStaffRun": "chief of staff",
       "handoff": "handed to an analyst",
-      "taskHandoff": "task handed to an analyst",
-      "footer": "two ways to work"
+      "taskHandoff": "task handed to an analyst"
     }
   },
   "dalton": {

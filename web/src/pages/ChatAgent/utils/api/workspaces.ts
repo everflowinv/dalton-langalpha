@@ -21,6 +21,10 @@ const WORKSPACE_MUTATION_TIMEOUT_MS = 120000;
 
 const WORKSPACE_QUERY_TIMEOUT_MS = 15000;
 
+// A restore copies a whole workspace back onto a machine over SSH, which can
+// outlast any other workspace call.
+const FILES_RESTORE_TIMEOUT_MS = 600000;
+
 export async function getWorkspaces(limit: number = 20, offset: number = 0, sortBy: string = 'custom', includeHome: boolean = false): Promise<WorkspacesResponse> {
   const { data } = await api.get<WorkspacesResponse>('/api/v1/workspaces', {
     params: { limit, offset, sort_by: sortBy, ...(includeHome ? { include_home: true } : {}) },
@@ -40,11 +44,16 @@ export async function createWorkspace(
   return data;
 }
 
-export async function deleteWorkspace(workspaceId: string) {
+/**
+ * `deleteFiles` also deletes the folder from a machine the user brought, where
+ * the server otherwise leaves it. Every other computer's folder goes regardless.
+ */
+export async function deleteWorkspace(workspaceId: string, { deleteFiles = false }: { deleteFiles?: boolean } = {}) {
   if (!workspaceId) throw new Error('Workspace ID is required');
   const id = String(workspaceId).trim();
   if (!id) throw new Error('Workspace ID cannot be empty');
-  await api.delete(`/api/v1/workspaces/${id}`);
+  const url = `/api/v1/workspaces/${id}`;
+  await (deleteFiles ? api.delete(url, { params: { delete_files: true } }) : api.delete(url));
 }
 
 export async function getWorkspace(workspaceId: string): Promise<Workspace> {
@@ -103,12 +112,21 @@ export async function duplicateWorkspace(workspaceId: string) {
  * outcome are read back with `getWorkspaceMove`. A refusal is a 409 (a 404
  * when the workspace is gone) carrying a `WorkspaceMoveError`; see
  * `moveRefusal`. Home is refused here: it moves only with the primary.
+ *
+ * `fromBackup` restores the workspace onto the target from its backup instead
+ * of copying it off its computer, which is never contacted: the way off a
+ * machine the user brought that is gone for good. Refused with `no_backup`
+ * when there is no backup to restore from.
  */
-export async function moveWorkspace(workspaceId: string, computerId: string): Promise<WorkspaceMove> {
+export async function moveWorkspace(
+  workspaceId: string,
+  computerId: string,
+  options: { fromBackup?: boolean } = {},
+): Promise<WorkspaceMove> {
   if (!workspaceId) throw new Error('Workspace ID is required');
   const { data } = await api.post<WorkspaceMove>(
     `/api/v1/workspaces/${workspaceId}/move`,
-    { computer_id: computerId },
+    { computer_id: computerId, ...(options.fromBackup ? { from_backup: true } : {}) },
     { timeout: WORKSPACE_MUTATION_TIMEOUT_MS },
   );
   return data;
@@ -148,6 +166,24 @@ export function moveRefusal(err: unknown): WorkspaceMoveError | null {
   return detail && typeof detail.code === 'string' && typeof detail.message === 'string' && detail.message
     ? (detail as unknown as WorkspaceMoveError)
     : null;
+}
+
+/**
+ * Answer a restore offer (`files_restore_offered_at`): copy the backup back
+ * into the folder, or keep the folder empty and let the backup follow it as it
+ * is now. Restoring brings the machine up and copies every file back, so the
+ * bound is the long one. Answers the workspace with the offer cleared; a 409
+ * means no offer stands (already answered), and a machine that cannot be
+ * reached is a 503 in the sandbox-failure shape.
+ */
+export async function chooseFilesRestore(workspaceId: string, restore: boolean): Promise<Workspace> {
+  if (!workspaceId) throw new Error('Workspace ID is required');
+  const { data } = await api.post<Workspace>(
+    `/api/v1/workspaces/${workspaceId}/files/restore-choice`,
+    { restore },
+    { timeout: FILES_RESTORE_TIMEOUT_MS },
+  );
+  return data;
 }
 
 /**

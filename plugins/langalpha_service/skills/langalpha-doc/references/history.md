@@ -1,6 +1,6 @@
 # Conversation History
 
-Every conversation on this computer is saved as a transcript, so when the user points back at earlier work, another conversation or something said before, look it up instead of guessing or asking. The server keeps them and the computer's file mount shows them as files; if `.agents/transcripts` does not exist, this computer is not showing them, so ask the user instead.
+Every conversation on this computer is saved as a transcript, so when the user points back at earlier work, another conversation or something said before, look it up instead of guessing or asking. The server keeps them and the computer's file mount shows them as files. A computer without the mount, such as a machine the user brings over SSH, shows them to Read, Grep and Glob only: Bash and code find no `.agents/transcripts` there and the `jq` and `rg` commands below have no file to open, so do the same with Grep and Read. If Read cannot open `../.agents/threads.jsonl`, this computer is not showing them, so ask the user instead.
 
 ## Where it lives
 
@@ -47,8 +47,9 @@ Grep skips `.agents/` (`.agents/memory/` aside) and Glob skips the history folde
 - This workspace: `Grep(pattern, path=".agents/transcripts")`, files first, then content.
 - A sibling workspace: pass its transcript folder from the index as `path`.
 - Every workspace at once:
-  `jq -r '.transcript // empty' ../.agents/threads.jsonl | xargs -r rg -l 'pattern'`
-- One line can be a whole pasted document or a large tool result. Grep content mode cuts long lines to windows around the matches, while Read returns whole lines, so Read only small turn files. `jq` pulls single events: `jq -c 'select(.type=="user") | .text[:300]' turn-0003.jsonl`.
+  `jq -r '.transcript // empty' ../.agents/threads.jsonl | xargs -r rg -l 'pattern'`. Without the mount, Grep each transcript folder the index lists.
+- One line can be a whole pasted document or a large tool result. Grep content mode cuts long lines to windows around the matches, and Read of a turn or run file cuts each field over 1,000 characters, naming the `offset` that shows its line whole with `limit=1`. Where Bash sees the files, `jq` pulls single events: `jq -c 'select(.type=="user") | .text[:300]' turn-0003.jsonl`.
+- A tool result or a pasted document is one JSON string, its lines joined by `\n`, so `^` and `$` match only at the ends of the whole event: search for the text itself.
 - Count across threads with Grep `output_mode="count"` or `rg -c`.
 - Each file is fetched from the server when first read, so a search over every thread is slower than one over workspace files. Narrow to likely threads with the index first.
 
@@ -62,7 +63,7 @@ Until compaction you do not need this thread's transcript: the whole conversatio
 
 When the context grows past a threshold, older messages are replaced by a `[Context Summary]` message and only the last few messages stay verbatim. The summary names the transcript folder that still holds everything before it; when an exact figure, path or the user's own wording matters, Grep that folder rather than trust the summary. Only the user can compact on demand.
 
-When a turn starts more than 90 minutes after your last reply, older tool calls are also trimmed, then and never in the middle of a turn, and never in the newest messages. A string over 2,000 characters passed to Write, Edit or ExecuteCode is cut to a pointer naming the transcript file of its turn and the call's `call_id`, with the `jq` command that prints the full arguments. Older Read results of files under `.agents/threads/`, `.agents/transcripts/`, `.agents/large_tool_results/`, `.agents/scratchpad/` and `.agents/tmp/` are cleared, as is a Read superseded by a later Read of the same file and range, so write down what you need from those files in your own reply when you read them.
+When a turn starts more than 90 minutes after your last reply, older tool calls are also trimmed, then and never in the middle of a turn, and never in the newest messages. A string over 2,000 characters passed to Write, Edit or ExecuteCode is cut to a pointer naming the transcript file of its turn and the call's `call_id`, with how to print the full arguments. Older Read results of files under `.agents/threads/`, `.agents/transcripts/`, `.agents/large_tool_results/`, `.agents/scratchpad/` and `.agents/tmp/` are cleared, as is a Read superseded by a later Read of the same file and range, so write down what you need from those files in your own reply when you read them.
 
 ## Tool results saved to a file
 

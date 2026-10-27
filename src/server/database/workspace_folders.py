@@ -172,6 +172,8 @@ class FolderRow:
     # A target the last pass had no disk to copy this row's folder to, while
     # its backoff lasts: each acquisition would copy and fail the same way.
     blocked: Optional[str] = None
+    # A deleted workspace whose folder its owner kept on their machine.
+    kept: bool = False
 
     @property
     def folder_label(self) -> Optional[str]:
@@ -267,8 +269,15 @@ def plan_folder_moves(rows: Iterable[FolderRow], busy: set[str] = frozenset()) -
     # remembers its landing.
     staged_dead = [r for r in rows if r.deleted and r.staged]
     top_dead = [r for r in rows if r.deleted and is_top_level(r.dir_name)]
+    # A kept folder stays where its owner left it, until a live row needs the
+    # name; then it goes aside under leftovers, as the owner's still.
     clearable = sorted(
-        (r for r in top_dead if r.workspace_id not in busy),
+        (
+            r
+            for r in top_dead
+            if r.workspace_id not in busy
+            and (not r.kept or fold(r.dir_name) in seen_targets)
+        ),
         key=lambda r: fold(r.dir_name) not in seen_targets,
     )
     room = max(TOMBSTONES_PER_PASS - len(staged_dead), 0)
@@ -347,6 +356,7 @@ def _row(record: Mapping[str, Any]) -> FolderRow:
         landings=recorded_landings(record.get("landings")) if staged else (),
         home=is_home_row(record),
         blocked=record.get("move_blocked"),
+        kept=bool(record.get("folder_kept")),
     )
 
 
@@ -370,10 +380,14 @@ _MOVE_BLOCKED = """
     END AS move_blocked
 """
 
+_FOLDER_KEPT = """
+    COALESCE(w.config, '{}'::jsonb) @> '{"folder_kept": true}' AS folder_kept
+"""
+
 _ROWS_SQL = f"""
     SELECT w.workspace_id, w.name, w.dir_name, w.status = 'deleted' AS deleted,
            w.previous_dir_names, w.config->'folder_landings' AS landings,
-           w.user_id, w.status, {_MOVE_BLOCKED}
+           w.user_id, w.status, {_MOVE_BLOCKED}, {_FOLDER_KEPT}
     FROM workspaces w
     WHERE w.computer_id = %s AND {_HOLDS_FOLDER}
     ORDER BY w.created_at, w.workspace_id
@@ -406,7 +420,7 @@ async def read_folder_rows(computer_id: str) -> tuple[Optional[int], list[Folder
             SELECT c.layout_version, w.workspace_id, w.name, w.dir_name,
                    w.status = 'deleted' AS deleted, w.previous_dir_names,
                    w.config->'folder_landings' AS landings,
-                   w.user_id, w.status, {_MOVE_BLOCKED}
+                   w.user_id, w.status, {_MOVE_BLOCKED}, {_FOLDER_KEPT}
             FROM computers c
             LEFT JOIN workspaces w
               ON w.computer_id = c.computer_id AND {_HOLDS_FOLDER}
@@ -771,14 +785,19 @@ async def record_folder_landings(
                     (workspace_id, computer_id),
                 )
             else:
+                # A kept folder is set aside for its owner, never queued for removal.
                 await cur.execute(
                     """
                     UPDATE workspaces
                     SET dir_name = %s,
-                        config = jsonb_set(
-                            COALESCE(config, '{}'::jsonb) #- '{folder_landings}',
-                            '{folder_cleanup_pending}', 'true'
-                        )
+                        config = CASE
+                            WHEN COALESCE(config, '{}'::jsonb) @> '{"folder_kept": true}'
+                            THEN config #- '{folder_landings}'
+                            ELSE jsonb_set(
+                                COALESCE(config, '{}'::jsonb) #- '{folder_landings}',
+                                '{folder_cleanup_pending}', 'true'
+                            )
+                        END
                     WHERE workspace_id = %s AND computer_id = %s AND status = 'deleted'
                     """,
                     (folder, workspace_id, computer_id),

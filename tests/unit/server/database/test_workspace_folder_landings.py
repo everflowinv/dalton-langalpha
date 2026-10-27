@@ -114,6 +114,21 @@ async def test_a_row_that_leaves_staging_drops_its_planned_landings():
 
 
 @pytest.mark.asyncio
+async def test_a_kept_folder_set_aside_is_never_queued_for_removal():
+    """Only a delete that asked for the folder to go queues it; one its owner
+    kept is recorded under leftovers and forgotten there."""
+    cur = _Cursor()
+    await record_folder_landings(
+        _Conn(cur), "computer", moves={}, tombstones={D: leftovers_path(D)}
+    )
+    [(sql, params)] = cur.updates()
+    assert params == (leftovers_path(D), D, "computer")
+    kept, queued = sql.split("""WHEN COALESCE(config, '{}'::jsonb) @> '{"folder_kept": true}'""")[1].split("ELSE")
+    assert "folder_cleanup_pending" not in kept
+    assert "'{folder_cleanup_pending}', 'true'" in queued
+
+
+@pytest.mark.asyncio
 async def test_a_folder_taken_stops_being_any_staged_siblings_landing():
     """The folder now holds this workspace's content, which the sibling's
     move script would take back as its own on a journal entry naming it.
@@ -148,7 +163,7 @@ async def test_a_new_folder_is_never_one_a_staged_row_may_have_landed_on():
 @pytest.mark.asyncio
 async def test_a_config_replace_keeps_the_rows_server_owned_keys():
     """The client writes ``config`` whole; the settle's list, its block on a
-    rename and the sandbox stamp are not its to set."""
+    rename, a delete's folder markers and the sandbox stamp are not its to set."""
     from src.server.database.workspace import update_workspace
 
     cur = _Cursor()
@@ -162,6 +177,8 @@ async def test_a_config_replace_keeps_the_rows_server_owned_keys():
     owned = [
         "folder_landings",
         "folder_move_blocked",
+        "folder_cleanup_pending",
+        "folder_kept",
         "sandbox_config_hash",
         "sandbox_provider",
         "sandbox_working_dir",

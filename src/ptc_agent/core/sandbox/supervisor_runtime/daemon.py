@@ -332,6 +332,12 @@ class Supervisor:
             conn.send(p.result_frame(request_id, {"stopping": True}))
             self._stop.set()
             return
+        if op == p.OP_RETIRE:
+            with self._drain_lock:
+                self._draining.set()
+            conn.send(p.result_frame(request_id, {"retiring": True}))
+            self._start_drain_waiter()
+            return
         if op != p.OP_CALL:
             conn.send(
                 p.error_frame(request_id, p.ERR_BAD_REQUEST, f"unknown op {op!r}")
@@ -963,8 +969,54 @@ def _stderr_log(message: str) -> None:
     print(f"[mcp-supervisor] {message}", file=sys.stderr, flush=True)  # noqa: T201
 
 
+def retire(socket_path: str, lock_path: str) -> int:
+    """Ask the computer's daemon to stand down, and return once it has.
+
+    For a computer whose env changed: the daemon and every server it holds
+    started with the old one, and a stdio server's env is fixed at spawn.
+    Waits for the lock rather than the socket, so the start that follows
+    takes it instead of exiting as the loser.
+    """
+    import fcntl
+
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(5.0)
+    try:
+        try:
+            sock.connect(socket_path)
+        except OSError:
+            return 0  # no daemon listening
+        sock.sendall(p.encode(p.simple_request(0, p.OP_RETIRE)))
+        with sock.makefile("rb") as reply:
+            frame = p.decode(reply.readline())
+    except (OSError, ValueError) as exc:
+        _stderr_log(f"retire request failed: {exc}")
+        return 1
+    finally:
+        sock.close()
+    if frame.get("type") != p.TYPE_RESULT:
+        # A daemon from before the op; it keeps serving.
+        _stderr_log(f"supervisor refused to retire: {frame.get('message')}")
+        return 1
+    lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    deadline = time.monotonic() + DEFAULT_DRAIN_TIMEOUT_S + 10.0
+    try:
+        while True:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return 0
+            except OSError:
+                if time.monotonic() >= deadline:
+                    _stderr_log("the retiring supervisor did not exit in time")
+                    return 1
+                time.sleep(0.1)
+    finally:
+        os.close(lock_fd)
+
+
 def main(argv: list[str] | None = None) -> int:
-    """Run the daemon for the computer rooted at ``argv[0]``.
+    """Run the daemon for the computer rooted at ``argv[0]``, or with
+    ``--retire`` stand the running one down (:func:`retire`).
 
     Single instance per computer: the exclusive lock is taken before the bind,
     so two executions racing to start one produce exactly one daemon and the
@@ -973,13 +1025,17 @@ def main(argv: list[str] | None = None) -> int:
     import fcntl
 
     argv = list(sys.argv[1:] if argv is None else argv)
+    retiring = "--retire" in argv
+    argv = [arg for arg in argv if arg != "--retire"]
     root = argv[0] if argv else os.environ.get("MCP_SUPERVISOR_ROOT", "")
     if not root:
-        _stderr_log("usage: python -m supervisor <computer_root>")
+        _stderr_log("usage: python -m supervisor <computer_root> [--retire]")
         return 2
     socket_path = os.path.join(root, p.SOCKET_REL_PATH)
     os.makedirs(os.path.dirname(socket_path), exist_ok=True)
     lock_path = socket_path + ".lock"
+    if retiring:
+        return retire(socket_path, lock_path)
     lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
     try:
         fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)

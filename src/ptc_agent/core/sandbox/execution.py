@@ -29,6 +29,7 @@ from ptc_agent.core.sandbox.retry import RetryPolicy
 from ..paths import SandboxLayout, WorkspaceLayout
 
 from ptc_agent.core.sandbox._shared import (
+    SANDBOX_TIMEOUT,
     TURN_CWD_ENV,
     ChartData,
     ExecutionResult,
@@ -48,6 +49,10 @@ _SYSTEM_CODE = SandboxLayout.SYSTEM_CODE_DIR
 #: client checks on every call (``_require_enabled``; that file ships into the
 #: sandbox and cannot import this). Exported only for such a subagent.
 _ALLOWED_SERVERS_ENV = "PTC_ALLOWED_SERVERS"
+
+
+def _failure_class(is_timeout: bool, error: BaseException) -> str:
+    return SANDBOX_TIMEOUT if is_timeout else type(error).__name__
 
 
 def _allowed_servers_value(servers: frozenset[str]) -> str:
@@ -429,6 +434,7 @@ async def execute(
             code_hash=code_hash,
             charts=[],
             mcp_trace=crash_mcp_trace,
+            failure=_failure_class(is_timeout, e),
         )
     finally:
         _exec_span.end()
@@ -703,6 +709,7 @@ async def execute_bash_command(
             "bash_id": locals().get("bash_id"),
             "command_hash": None,
             "mcp_trace": recovered_trace,
+            "failure": _failure_class(is_timeout, e),
         }
     finally:
         # asyncio.CancelledError (BaseException) skips the except above, so a

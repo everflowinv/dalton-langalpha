@@ -107,6 +107,7 @@ def steps():
             live[workspace_id] = moved.pop(workspace_id)
         if workspace_id in short:
             return {"restored": 0, "errors": 1, "skipped": 0, "done": False}
+        getattr(sandbox, "marked", set()).add(layout.join(_bringup.DEFERRED_MARKER))
         return {"restored": 0, "errors": 0, "skipped": 0, "done": True}
 
     async def sync(workspace_id):
@@ -160,7 +161,19 @@ class _Redis:
 
 @pytest.fixture
 def sandbox():
-    return SimpleNamespace(runtime=object(), sandbox_id="sandbox-1", working_dir=ROOT)
+    """``marked`` holds the deferred markers a finished pass wrote."""
+    marked: set[str] = set()
+
+    async def adownload_file_bytes(path):
+        return b"done" if path in marked else None
+
+    return SimpleNamespace(
+        runtime=object(),
+        sandbox_id="sandbox-1",
+        working_dir=ROOT,
+        marked=marked,
+        adownload_file_bytes=adownload_file_bytes,
+    )
 
 
 def _schedule(manager, sandbox, workspace_id: str, *, urgent: bool) -> None:
@@ -415,7 +428,8 @@ async def test_a_finished_pass_is_skipped_until_its_threads_or_sandbox_change(
 ):
     """Only a thread's delete or archive leaves a dir to prune, and the marker
     ends the restore, so a reconnect or a second worker finding the same
-    sandbox and threads skips the probe and the restore; the sync still runs."""
+    sandbox and threads skips the probe and the restore; the sync still runs.
+    A folder laid again on the same machine lost the marker, and is not."""
     redis = _Redis()
     with patch.object(_bringup.cache, "client", lambda: redis):
         _schedule(manager, sandbox, "A", urgent=False)
@@ -426,21 +440,26 @@ async def test_a_finished_pass_is_skipped_until_its_threads_or_sandbox_change(
         await _drain(manager)
         assert steps.order[3:] == ["sync:A"]
 
-        # Archived: the thread stays, its scratchpad has to go.
-        steps.live["A"] = ThreadPrefixes(all=frozenset({"live-A"}), open=frozenset())
+        sandbox.marked.clear()
         _schedule(manager, sandbox, "A", urgent=False)
         await _drain(manager)
         assert steps.order[4:] == ["inventory:A", "restore:A", "sync:A"]
 
-        steps.live["A"] = ThreadPrefixes(all=frozenset(), open=frozenset())
+        # Archived: the thread stays, its scratchpad has to go.
+        steps.live["A"] = ThreadPrefixes(all=frozenset({"live-A"}), open=frozenset())
         _schedule(manager, sandbox, "A", urgent=False)
         await _drain(manager)
         assert steps.order[7:] == ["inventory:A", "restore:A", "sync:A"]
 
+        steps.live["A"] = ThreadPrefixes(all=frozenset(), open=frozenset())
+        _schedule(manager, sandbox, "A", urgent=False)
+        await _drain(manager)
+        assert steps.order[10:] == ["inventory:A", "restore:A", "sync:A"]
+
         replacement = SimpleNamespace(runtime=object(), sandbox_id="sandbox-2")
         _schedule(manager, replacement, "A", urgent=False)
         await _drain(manager)
-        assert steps.order[10:] == ["inventory:A", "restore:A", "sync:A"]
+        assert steps.order[13:] == ["inventory:A", "restore:A", "sync:A"]
 
 
 async def test_one_exec_lists_the_thread_dirs_and_probes_the_deferred_dir(tmp_path):

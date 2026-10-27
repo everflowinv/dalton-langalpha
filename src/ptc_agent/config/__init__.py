@@ -42,6 +42,7 @@ from ptc_agent.config.core import (
     MCPServerConfig,
     SandboxConfig,
     SecurityConfig,
+    SSHConfig,
 )
 
 # File-based loading
@@ -83,6 +84,7 @@ __all__ = [
     "MCPConfig",
     "MCPServerConfig",
     "SandboxConfig",
+    "SSHConfig",
     "SecurityConfig",
     "CompactionConfig",
     # Utilities

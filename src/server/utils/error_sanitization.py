@@ -2,7 +2,10 @@
 
 import re
 
+from fastapi import HTTPException
 from pydantic import ValidationError
+
+from ptc_agent.core.sandbox.providers.ssh_errors import connect_failure
 
 
 # httpx includes request URLs in some exception messages. Strip basic-auth
@@ -73,8 +76,32 @@ def sandbox_unreachable_detail(exc: BaseException) -> str:
     the message is a protocol read rather than the message matching this module
     otherwise avoids: the sandbox layer stamps that word deliberately as the
     carrier for the in-flight case, and it is the one distinction the file panel
-    renders differently.
+    renders differently. An SSH computer's connect failure is the exception:
+    the machine is its owner's, so the detail says it is theirs that is not
+    answering, in the provider's words naming it, rather than suggest the
+    service is down. A tunnel that is down is told in its own words, which say
+    whose side it is down on.
     """
+    failure = connect_failure(exc)
+    if failure is not None:
+        owner = failure.for_owner
+        lead = "" if owner == str(failure) else "your machine is not answering. "
+        return f"{SANDBOX_UNREACHABLE_PREFIX}{lead}{owner}"
     if "starting" in str(exc).lower():
         return f"{SANDBOX_UNREACHABLE_PREFIX}the sandbox is still starting"
     return f"{SANDBOX_UNREACHABLE_PREFIX}please retry in a moment"
+
+
+def sandbox_failure_http(exc: BaseException) -> HTTPException:
+    """422 when an owner's SSH machine answered and refused, 503 otherwise.
+
+    A refusal (a key it does not take, a different host key, an address or a
+    platform this server does not serve, a root folder the login user cannot
+    have) is the owner's to fix, and the provider's sentence says how; a
+    machine that did not answer may on retry. One function for every route
+    that starts a machine, so a computer and a workspace on it answer alike.
+    """
+    failure = connect_failure(exc)
+    if failure is not None and failure.answered:
+        return HTTPException(status_code=422, detail=str(failure))
+    return HTTPException(status_code=503, detail=sandbox_unreachable_detail(exc))

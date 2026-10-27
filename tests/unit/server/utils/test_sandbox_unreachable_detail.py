@@ -9,6 +9,7 @@ only the second constraint silently downgrades every "starting" card to
 """
 
 import asyncio
+import json
 
 import pytest
 
@@ -157,7 +158,7 @@ def test_the_handler_logs_one_line_for_a_multiline_provider_body(monkeypatch):
         url = type("U", (), {"path": "/api/v1/workspaces/ws-1/files"})()
 
     response = asyncio.run(
-        setup._sandbox_unreachable_handler(_Request(), SandboxTransientError(forged))
+        setup._sandbox_failure_handler(_Request(), SandboxTransientError(forged))
     )
 
     assert response.status_code == 503
@@ -165,3 +166,58 @@ def test_the_handler_logs_one_line_for_a_multiline_provider_body(monkeypatch):
     assert "\n" not in captured[0] and "\r" not in captured[0]
     # Escaped, not dropped: the diagnostic has to survive for the operator.
     assert "sandbox verified clean" in captured[0]
+
+
+def test_an_owners_ssh_machine_is_named_as_theirs_not_ours():
+    """An SSH computer's machine is its owner's, so the detail names it in the
+    provider's words and says it is theirs that is not answering. The prefix
+    stays, so the panel renders the same card."""
+    from ptc_agent.core.sandbox.providers.ssh_errors import SSHConnectError
+    from ptc_agent.core.sandbox.runtime import SandboxHostUnavailableError
+
+    silent = SSHConnectError(
+        "unreachable", "Could not reach 203.0.113.9 on port 22: the connection was refused."
+    )
+    try:
+        raise SandboxHostUnavailableError("a" * 32, "host unavailable") from silent
+    except SandboxHostUnavailableError as e:
+        wrapped = e
+    detail = sandbox_unreachable_detail(wrapped)
+    assert detail.startswith(SANDBOX_UNREACHABLE_PREFIX + "your machine is not answering.")
+    assert "203.0.113.9 on port 22" in detail
+
+    refused = SSHConnectError(
+        "auth_failed", "dev@203.0.113.9 did not accept our key."
+    )
+    assert sandbox_unreachable_detail(refused) == (
+        SANDBOX_UNREACHABLE_PREFIX + "dev@203.0.113.9 did not accept our key."
+    )
+
+
+@pytest.mark.parametrize(
+    "code, status",
+    [("auth_failed", 422), ("host_key_mismatch", 422), ("unreachable", 503)],
+)
+def test_the_app_handler_answers_a_refusal_as_the_computer_routes_do(code, status):
+    """A refusal reaches a file or thread route wrapped, as a reconnect wraps
+    it; answered 503 there, the client retried what only its owner can fix."""
+    from ptc_agent.core.sandbox.providers.ssh_errors import SSHConnectError
+    from src.server.app import setup
+    from src.server.utils.error_sanitization import sandbox_failure_http
+
+    failure = SSHConnectError(code, "The sentence for dev@203.0.113.9.")
+    try:
+        raise SandboxTransientError("Could not reach sandbox sbx-9f3c: refused") from failure
+    except SandboxTransientError as e:
+        wrapped = e
+
+    class _Request:
+        url = type("U", (), {"path": "/api/v1/workspaces/ws-1/files"})()
+
+    for raised in (wrapped, failure):
+        response = asyncio.run(setup._sandbox_failure_handler(_Request(), raised))
+        expected = sandbox_failure_http(raised)
+        assert response.status_code == expected.status_code == status
+        assert json.loads(response.body) == {"detail": expected.detail}
+        assert "sbx-9f3c" not in response.body.decode()
+    assert setup.app.exception_handlers[SSHConnectError] is setup._sandbox_failure_handler

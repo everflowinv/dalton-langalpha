@@ -34,9 +34,9 @@ from ptc_agent.core.sandbox.runtime import (
     ExecResult,
     RuntimeState,
     SandboxGoneError,
-    SandboxProvider,
     SandboxRuntime,
 )
+from tests.unit.core.sandbox.fake_provider import fake_provider
 
 
 def _make_config(**overrides) -> CoreConfig:
@@ -71,7 +71,7 @@ def mock_runtime():
 
 @pytest.fixture
 def mock_provider(mock_runtime):
-    provider = AsyncMock(spec=SandboxProvider)
+    provider = fake_provider()
     provider.create = AsyncMock(return_value=mock_runtime)
     provider.get = AsyncMock(return_value=mock_runtime)
     provider.close = AsyncMock()
@@ -283,7 +283,7 @@ class TestPTCSandboxDelegation:
         with (
             patch("asyncio.sleep", new=AsyncMock(side_effect=sleep)),
             patch(
-                "ptc_agent.core.sandbox.ptc_sandbox.time.monotonic",
+                "ptc_agent.core.sandbox.reconnect.time.monotonic",
                 side_effect=lambda: clock[0],
             ),
         ):

@@ -21,7 +21,8 @@ import httpx
 from ptc_agent.core.sandbox.preview_probe import head_preview
 from ptc_agent.core.sandbox.runtime import PreviewInfo
 from src.server.database.workspace import get_preview_command
-from src.server.services.preview_capabilities import probe_target, publish
+from src.server.services.preview_capabilities import publish
+from src.server.services.preview_upstreams import probe_target
 from src.utils.cache.redis_cache import get_cache_client
 
 _SIGNED_URL_TTL = 3000  # 50 min (signed URLs expire in 1h)

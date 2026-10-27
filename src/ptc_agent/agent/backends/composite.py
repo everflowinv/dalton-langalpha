@@ -9,7 +9,8 @@ from typing import Any, Callable, Collection, Protocol, Sequence, TypeVar
 
 import structlog
 
-from ptc_agent.agent.backends.results import EditTextResult, WriteTextResult
+from ptc_agent.agent.backends.langgraph_store import UnsupportedPattern
+from ptc_agent.agent.backends.results import EditTextResult, GrepAnswer, WriteTextResult
 from ptc_agent.agent.backends.sandbox import SandboxBackend
 from ptc_agent.agent.backends.search_match import DiskGlob, RgRefused, RgWalk
 from ptc_agent.core.paths import (
@@ -30,6 +31,10 @@ _T = TypeVar("_T")
 # thousands of alternatives over a thousand files would hold the loop for
 # a third of a second.
 _INLINE_FILTER_CHARS = 1024
+
+# The channel of a file call a route answers in process, never reaching the
+# machine.
+IN_PROCESS_CHANNEL = "server"
 
 # The computer's server-held folders, which the file mount links in at the
 # root and in every folder. The sandbox glob goes through such a link only by
@@ -57,7 +62,24 @@ class FilesystemRoute(Protocol):
     relative to its root, for a route that knows them without a read. A
     search at or above such a route skips it when its pattern can match none
     of them, and Grep reads only the ones it can match, each by
-    ``agrep_rich`` at that file's path, which has to search that file alone."""
+    ``agrep_rich`` at that file's path, which has to search that file alone.
+
+    ``refuses_writes`` (False when absent) marks a route no write reaches,
+    which a path may enter through ``..``.
+
+    ``searched_only_inside`` (False when absent) marks a route Grep searches
+    only when its path is at or inside the route's root, never from above:
+    where the file mount serves such files they sit behind a link, which rg
+    follows only when it is the path it was given.
+
+    ``takes_walk`` (False when absent) marks a route whose ``agrep_rich``
+    takes ``searches``, the walk's verdict on a file of its own by path, and
+    honors ``head_limit``, counting only entries the walk keeps: a route that
+    fetches each file it searches then fetches no file the walk skips and
+    stops once the page has enough. Any route's answer may carry ``notes``
+    (a ``GrepAnswer``), which the composite passes on, and a route whose
+    search refuses the pattern raises ``UnsupportedPattern``, which the
+    composite answers with a note naming what it did not search."""
 
     @property
     def root_prefix(self) -> str: ...
@@ -101,12 +123,46 @@ def _spelled_below(route: FilesystemRoute, rel: str, path: str) -> str:
     return posixpath.join(rel, path[len(route.root_prefix) :])
 
 
+def _finds_from(walk: RgWalk, base: str, path: str) -> bool:
+    """Whether a walk of ``base``, the path a Grep was given inside a route,
+    searches the route's file ``path``."""
+    inside = path.startswith(base + "/")
+    return walk.finds(base, path[len(base) + 1 :] if inside else "")
+
+
+def _finds_below(
+    walk: RgWalk, start: str, route: FilesystemRoute, rel: str, path: str
+) -> bool:
+    """Whether a walk from ``start``, where the route's root is ``rel``,
+    searches the route's file ``path``."""
+    return walk.finds(start, _spelled_below(route, rel, path))
+
+
 def _page(entries: list[Any], offset: int, head_limit: int | None) -> list[Any]:
     """The slice of ``entries`` a Grep's ``offset`` and ``head_limit`` ask for."""
     start = max(0, offset)
     if head_limit is not None:
         return entries[start : start + head_limit]
     return entries[start:]
+
+
+def _walked(
+    route: FilesystemRoute, searches: Callable[[str], bool], head_limit: int | None
+) -> dict[str, Any]:
+    """What a route that ``takes_walk`` is told of the walk: which of its
+    files it searches, and how many entries the page needs at most."""
+    if getattr(route, "takes_walk", False):
+        return {"searches": searches, "head_limit": head_limit}
+    return {"head_limit": None}
+
+
+def _answer(entries: list[Any], answers: Sequence[Any]) -> list[Any]:
+    """``entries`` with the notes the routes' ``answers`` carry, if any, each
+    once: a route read at each of its files may say the same of all of them."""
+    notes = list(
+        dict.fromkeys(note for answer in answers for note in getattr(answer, "notes", ()))
+    )
+    return GrepAnswer(entries, notes) if notes else entries
 
 
 async def _matched(match: Callable[[], _T], glob: str | None) -> _T:
@@ -140,6 +196,8 @@ class CompositeFilesystemBackend:
         which the collapse the sandbox normalizer now does would otherwise
         hide, and the collapsed target catches one walking back in, which
         would route to the sandbox FS and shadow the store's copy for good.
+        A route that refuses every write has no copy to shadow, so a path may
+        walk into it: the prompts name the thread index as ``../.agents/``.
         """
         segments = path.split("/")
         if ".." not in segments:
@@ -151,7 +209,8 @@ class CompositeFilesystemBackend:
             if head and self._route_for(self._sandbox.normalize_path(head)):
                 return True
         collapsed = posixpath.normpath(self._sandbox.normalize_path(path))
-        return self._route_for(collapsed) is not None
+        target = self._route_for(collapsed)
+        return target is not None and not getattr(target, "refuses_writes", False)
 
     def normalize_path(self, path: str) -> str:
         # `..` on a mounted path could normalize into the sandbox FS and
@@ -199,6 +258,13 @@ class CompositeFilesystemBackend:
     def route_for(self, path: str) -> FilesystemRoute | None:
         """The mounted route that owns ``path``, or None where the sandbox does."""
         return self._route_for(self.normalize_path(path))
+
+    def channel_for(self, path: str) -> str:
+        """The channel a file call on ``path`` takes: ``server`` where a route
+        owns it and answers in process, else the sandbox's."""
+        if self.route_for(path) is not None:
+            return IN_PROCESS_CHANNEL
+        return self._sandbox.channel_for(path)
 
     def _route_for(self, normalized_path: str) -> FilesystemRoute | None:
         for route in self._routes:
@@ -258,7 +324,7 @@ class CompositeFilesystemBackend:
     ) -> list[tuple[FilesystemRoute, str, str]]:
         """``below`` with where rg starts the walk to each route, and the
         route's root spelled from there: ``base``, except for a Grep from the
-        turn's folder.
+        turn's folder. A route searched only from inside is left out.
 
         That one also searches the folder's own routes, the ones it spells
         outside the computer tier, as though ``path`` named them beside the
@@ -267,6 +333,11 @@ class CompositeFilesystemBackend:
         only a dot-name below that is skipped. The user tier is the
         computer's, not the folder's, so its walk starts at the folder."""
         start = base.rstrip("/")
+        below = [
+            (route, rel)
+            for route, rel in below
+            if not getattr(route, "searched_only_inside", False)
+        ]
         if self._spelling(start) != "":
             return [(route, rel, start) for route, rel in below]
         return [
@@ -471,6 +542,16 @@ class CompositeFilesystemBackend:
         found.extend(self._glob_found(reached, listings, wanted))
         return list(dict.fromkeys(found))
 
+    async def _route_grep(
+        self, route: FilesystemRoute, searched: str, pattern: str, **kwargs: Any
+    ) -> Any:
+        """``route``'s answer to a Grep of ``searched``. One that refuses the
+        pattern searched nothing, which no matches would hide, so it says so."""
+        try:
+            return await route.agrep_rich(pattern, **kwargs)
+        except UnsupportedPattern as refused:
+            return GrepAnswer((), [refused.note(self._sandbox.virtualize_path(searched))])
+
     async def agrep_rich(
         self,
         pattern: str,
@@ -538,9 +619,15 @@ class CompositeFilesystemBackend:
                 )
             else:
                 wheres = [normalized]
+            searches = functools.partial(_finds_from, walk, base)
+            # Nothing else comes before the route's entries here, so the page
+            # needs no more of them than its own end.
+            wanted = None if head_limit is None else max(0, offset) + head_limit
             results = await asyncio.gather(
                 *(
-                    route.agrep_rich(
+                    self._route_grep(
+                        route,
+                        base,
                         pattern,
                         path=where,
                         output_mode=output_mode,
@@ -550,8 +637,8 @@ class CompositeFilesystemBackend:
                         lines_before=lines_before,
                         lines_context=lines_context,
                         multiline=multiline,
-                        head_limit=None,
                         offset=0,
+                        **_walked(route, searches, wanted),
                     )
                     for where in wheres
                 )
@@ -560,7 +647,7 @@ class CompositeFilesystemBackend:
                 if not isinstance(found, list):
                     return found
 
-            def kept(walk: RgWalk) -> list[Any]:
+            def kept() -> list[Any]:
                 # Every line of a file meets the walk as the file does, so
                 # each file is asked about once.
                 verdicts: dict[str | None, bool] = {None: True}
@@ -569,16 +656,13 @@ class CompositeFilesystemBackend:
                     for entry in found:
                         hit = _grep_entry_path(entry, output_mode)
                         if hit not in verdicts:
-                            inside = hit.startswith(base + "/")
-                            verdicts[hit] = walk.finds(
-                                base, hit[len(base) + 1 :] if inside else ""
-                            )
+                            verdicts[hit] = searches(hit)
                         if verdicts[hit]:
                             kept.append(entry)
                 return kept
 
-            found = await _matched(functools.partial(kept, walk), glob)
-            return _page(found, offset, head_limit)
+            found = await _matched(kept, glob)
+            return _answer(_page(found, offset, head_limit), results)
 
         # Gather all hits first, then apply one global offset/head_limit slice:
         # per-backend pagination would produce the wrong slice at the root.
@@ -592,24 +676,35 @@ class CompositeFilesystemBackend:
             ]
 
         searched: list[tuple[FilesystemRoute, str, str, str]] = []
+        told: list[dict[str, Any]] = []
         if walk is not None:
             starts = self._grep_starts(normalized, self._routes_below(normalized))
             searched = await _matched(functools.partial(reads, starts, walk), glob)
+            # No limit: which of a route's entries survive rg's own is only
+            # known once both have answered.
+            told = [
+                _walked(
+                    route, functools.partial(_finds_below, walk, start, route, rel), None
+                )
+                for route, rel, start, _ in searched
+            ]
         sandbox_result, *route_results = await asyncio.gather(
             self._sandbox.agrep_rich(
                 pattern, path=normalized, head_limit=None, offset=0, **sandbox_kwargs
             ),
             *(
-                route.agrep_rich(
+                self._route_grep(
+                    route,
+                    route.root_prefix.rstrip("/"),
                     pattern,
                     path=where,
                     output_mode=output_mode,
                     case_insensitive=case_insensitive,
                     show_line_numbers=show_line_numbers,
-                    head_limit=None,
                     offset=0,
+                    **walked,
                 )
-                for route, _, _, where in searched
+                for (route, _, _, where), walked in zip(searched, told)
             ),
         )
 
@@ -634,8 +729,8 @@ class CompositeFilesystemBackend:
                     if hit is None:
                         continue
                     if hit not in verdicts:
-                        verdicts[hit] = hit not in rg_files and walk.finds(
-                            start, _spelled_below(route, rel, hit)
+                        verdicts[hit] = hit not in rg_files and _finds_below(
+                            walk, start, route, rel, hit
                         )
                     if verdicts[hit]:
                         added.append(entry)
@@ -643,4 +738,4 @@ class CompositeFilesystemBackend:
 
         if walk is not None and searched:
             combined.extend(await _matched(functools.partial(added, walk), glob))
-        return _page(combined, offset, head_limit)
+        return _answer(_page(combined, offset, head_limit), route_results)

@@ -23,6 +23,7 @@ const FORKS_FILES = [
   'src/pages/Setup/__tests__/SetupWizard.return.test.tsx',
   'src/pages/Setup/steps/__tests__/connectReturn.test.tsx',
   'src/components/__tests__/HostedSignInGate.test.tsx',
+  'src/pages/Onboarding/__tests__/GettingStarted.desktop.test.tsx',
   'src/pages/Login/__tests__/AuthConfirm.hostedSignIn.test.tsx',
   // Replaces `window` itself to install the desktop bridge.
   'src/lib/__tests__/desktop.test.ts',

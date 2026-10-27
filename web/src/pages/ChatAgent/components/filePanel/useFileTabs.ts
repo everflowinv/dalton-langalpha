@@ -60,6 +60,23 @@ type TabBody =
 
 export type FileTab = { id: string } & TabBody;
 
+/**
+ * What a tab showed before something took its place, and what it showed
+ * after the reader stepped back from it: a browser tab's history, kept per
+ * tab. Only an open that lands in an existing tab adds a step (the on-loan
+ * tab as the tree is browsed, the empty tab a file fills, a chart moved to
+ * another ticker); switching tabs is not one.
+ */
+interface TabHistory {
+  back: TabBody[];
+  forward: TabBody[];
+}
+
+export type HistoryDirection = 'back' | 'forward';
+
+/** Past this a tab forgets its oldest steps; nobody clicks back fifty times. */
+const MAX_HISTORY = 50;
+
 /** The kinds that live only as long as the transcript, or the watch, they point into. */
 const EPHEMERAL_KINDS = ['tool', 'sources', 'status'] as const satisfies readonly FileTab['kind'][];
 type EphemeralKind = (typeof EPHEMERAL_KINDS)[number];
@@ -94,6 +111,8 @@ interface TabsState {
    * thread's tabs would be written over the incoming thread's saved strip.
    */
   key: string | null;
+  /** Kept for the life of the mount, never stored: a reload is a fresh start. */
+  history?: Readonly<Record<string, TabHistory>>;
 }
 
 /** A strip before it is tied to a key. */
@@ -308,6 +327,90 @@ function replaceIn(state: TabsState, id: string, body: TabBody): TabsState {
   return { ...state, tabs: state.tabs.map((t) => (t.id !== id ? t : { ...body, id })), activeId: id };
 }
 
+function bodyOf({ id: _id, ...body }: FileTab): TabBody {
+  return body;
+}
+
+/** Whether two bodies are the same thing to show, the rule that keeps one tab per file, port, symbol or call. */
+function sameView(a: TabBody, b: TabBody): boolean {
+  switch (a.kind) {
+    case 'empty': return false;
+    case 'file': return b.kind === 'file' && b.path === a.path;
+    case 'preview': return b.kind === 'preview' && b.port === a.port;
+    case 'chart': return b.kind === 'chart' && b.symbol === a.symbol;
+    case 'tool': return b.kind === 'tool' && b.toolCallId === a.toolCallId;
+    case 'sources': return b.kind === 'sources' && b.messageId === a.messageId;
+    default: return b.kind === a.kind;
+  }
+}
+
+/** Remake a tab as something else, with the step it left kept to come back to. */
+function navigateIn(state: TabsState, id: string, body: TabBody): TabsState {
+  const tab = state.tabs.find((t) => t.id === id);
+  const next = replaceIn(state, id, body);
+  if (!tab || sameView(tab, body)) return next;
+  const back = [...(state.history?.[id]?.back ?? []), bodyOf(tab)].slice(-MAX_HISTORY);
+  return { ...next, history: { ...state.history, [id]: { back, forward: [] } } };
+}
+
+/** A step onto `b` from `a` would change nothing on screen; two empty tabs look alike. */
+function sameStep(a: TabBody, b: TabBody): boolean {
+  return a.kind === 'empty' ? b.kind === 'empty' : sameView(a, b);
+}
+
+/** Drops a step that shows what the one before it shows, which a step onto it would not change. */
+function collapseRepeats(steps: TabBody[]): TabBody[] {
+  return steps.filter((step, at) => at === 0 || !sameStep(step, steps[at - 1]));
+}
+
+/** Drops the steps that name a deleted file, so Back never lands on a read error. */
+function forgetPathsIn(state: TabsState, paths: ReadonlySet<string>): TabsState {
+  if (!state.history) return state;
+  const keep = (body: TabBody) => body.kind !== 'file' || !paths.has(body.path);
+  const history = Object.fromEntries(Object.entries(state.history).map(
+    ([id, h]) => [id, { back: collapseRepeats(h.back.filter(keep)), forward: collapseRepeats(h.forward.filter(keep)) }],
+  ));
+  return { ...state, history };
+}
+
+/**
+ * The nearest step a tab can take in `dir`. A step another tab now shows is
+ * passed over, since going there would put the same file in two tabs, and so
+ * is one onto what the tab already shows (left behind when a deleted file's
+ * step between two visits goes), since it would only remount it.
+ */
+function historyStep(state: TabsState, id: string, dir: HistoryDirection): number {
+  const steps = state.history?.[id]?.[dir] ?? [];
+  const tab = state.tabs.find((t) => t.id === id);
+  for (let at = steps.length - 1; at >= 0; at--) {
+    if (tab && sameStep(tab, steps[at])) continue;
+    if (!state.tabs.some((t) => t.id !== id && sameView(t, steps[at]))) return at;
+  }
+  return -1;
+}
+
+/**
+ * Take the step. The tab comes back under a new id, so what the panel keeps
+ * per tab (an editor's draft, a location to replay) starts over with what it
+ * now shows, as it does for a tab opened fresh. Steps passed over are dropped.
+ */
+function stepIn(state: TabsState, id: string, dir: HistoryDirection): TabsState {
+  const tab = state.tabs.find((t) => t.id === id);
+  const at = historyStep(state, id, dir);
+  if (!tab || at < 0) return state;
+  const { [id]: history, ...rest } = state.history!;
+  const steps = history[dir];
+  const ahead = steps.slice(0, at);
+  const behind = [...history[dir === 'back' ? 'forward' : 'back'], bodyOf(tab)].slice(-MAX_HISTORY);
+  const fresh = newId();
+  return {
+    ...state,
+    tabs: state.tabs.map((t) => (t.id === id ? { ...steps[at], id: fresh } : t)),
+    activeId: state.activeId === id ? fresh : state.activeId,
+    history: { ...rest, [fresh]: dir === 'back' ? { back: ahead, forward: behind } : { back: behind, forward: ahead } },
+  };
+}
+
 function patchIn(state: TabsState, id: string, fn: (tab: FileTab) => FileTab): TabsState {
   return { ...state, tabs: state.tabs.map((t) => (t.id === id ? fn(t) : t)) };
 }
@@ -332,7 +435,7 @@ function place(
   const onLoan = (t: FileTab) => loan && isOnLoan(t) && t.kind === body.kind;
   const active = state.tabs.find((t) => t.id === state.activeId);
   const slot = active && (active.kind === 'empty' || onLoan(active)) ? active : state.tabs.find(onLoan);
-  if (slot) return replaceIn(state, slot.id, body);
+  if (slot) return navigateIn(state, slot.id, body);
 
   const fresh: FileTab = { id: newId(), ...body };
   const at = state.tabs.findIndex((t) => t.id === state.activeId);
@@ -352,7 +455,8 @@ function closeIn(state: TabsState, id: string): TabsState {
   const tabs = state.tabs.filter((t) => t.id !== id);
   if (!tabs.length) return { ...blankStrip(), key: state.key };
   const activeId = id === state.activeId ? (tabs[at] ?? tabs[at - 1]).id : state.activeId;
-  return { ...state, tabs, activeId };
+  const { [id]: _closed, ...history } = state.history ?? {};
+  return { ...state, tabs, activeId, history };
 }
 
 /**
@@ -558,9 +662,17 @@ export function useFileTabs(
           const { workspaceId: _dropped, ...rest } = t;
           return { ...rest, timeframe: tab.timeframe, ...(tab.workspaceId && { workspaceId: tab.workspaceId }) };
         });
-        return { ...folded, activeId: other.id };
+        // So is its history: Back from the tab it folded into returns to the
+        // ticker the reader moved away from, as it would have without the fold.
+        // The surviving tab's own steps stay on either side of that journey,
+        // since its current ticker is where both left off. Where the two
+        // journeys meet they can repeat a step (both began on an empty tab).
+        const kept = prev.history?.[other.id];
+        const back = collapseRepeats([...(kept?.back ?? []), ...(prev.history?.[id]?.back ?? []), bodyOf(tab)]).slice(-MAX_HISTORY);
+        return { ...folded, activeId: other.id, history: { ...folded.history, [other.id]: { back, forward: kept?.forward ?? [] } } };
       }
-      return patchIn(prev, id, (t) => (t.kind === 'chart' ? { ...t, symbol: ticker } : t));
+      const { id: _id, ...chart } = tab;
+      return navigateIn(prev, id, { ...chart, symbol: ticker });
     });
   }, [workspaceId, persist]);
 
@@ -591,6 +703,23 @@ export function useFileTabs(
   }, [patchTab]);
 
   const closeTab = useCallback((id: string) => setState((prev) => closeIn(prev, id)), []);
+
+  /** What a step from this tab would show, or null where it has none to take. */
+  const historyTarget = useCallback((id: string, dir: HistoryDirection): TabBody | null => {
+    const at = historyStep(state, id, dir);
+    return at < 0 ? null : state.history![id][dir][at];
+  }, [state]);
+
+  const forgetPaths = useCallback((paths: readonly string[]) => {
+    setState((prev) => forgetPathsIn(prev, new Set(paths)));
+  }, []);
+
+  const stepHistory = useCallback((id: string, dir: HistoryDirection) => {
+    // A step to another ticker is as much the reader's pick as a retarget is.
+    const target = historyTarget(id, dir);
+    if (persist && target?.kind === 'chart') rememberChartSymbol(workspaceId, target.symbol);
+    setState((prev) => stepIn(prev, id, dir));
+  }, [historyTarget, workspaceId, persist]);
 
   /** Drop a tab's location: the focus chip's dismiss, which must survive a tab switch. */
   const clearLocation = useCallback((id: string) => {
@@ -628,10 +757,13 @@ export function useFileTabs(
     openSources,
     patchTab,
     clearLocation,
+    historyTarget,
+    stepHistory,
+    forgetPaths,
   }), [
     state.tabs, activeTab, openPaths,
     activate, openFile, pinTab, closeTab, closeOut, newTab, showListing, openSettings, openMemory, openMemo, openStatus,
-    openPreview, openChart, retargetChart, openTool, openSources, patchTab, clearLocation,
+    openPreview, openChart, retargetChart, openTool, openSources, patchTab, clearLocation, historyTarget, stepHistory, forgetPaths,
   ]);
 }
 

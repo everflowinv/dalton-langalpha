@@ -2,11 +2,42 @@
 
 from __future__ import annotations
 
+import ipaddress
+import socket
 from collections.abc import Mapping
+from urllib.parse import urlsplit
 
 import httpx
 
 _MAX_HOPS = 5
+
+
+def is_loopback_url(url: str) -> bool:
+    """Whether *url* names this host's loopback.
+
+    A preview link's stored upstream is dialed by whichever worker serves the
+    request, so one on loopback is refused unless the preview is
+    process-local: another worker holds nothing on that port, or a forward to
+    another machine. An unspecified address counts, since dialing one reaches
+    this host, and so do the shorthand IPv4 forms the resolver accepts
+    (``127.1``).
+    """
+    try:
+        host = (urlsplit(url).hostname or "").rstrip(".")
+    except ValueError:
+        return False
+    if host == "localhost" or host.endswith(".localhost"):
+        return True
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        try:
+            address = ipaddress.IPv4Address(socket.inet_aton(host))
+        except OSError:
+            return False
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
+        address = address.ipv4_mapped
+    return address.is_loopback or address.is_unspecified
 
 
 async def head_preview(

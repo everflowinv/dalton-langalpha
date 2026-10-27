@@ -13,7 +13,7 @@ from websockets.asyncio.server import serve
 
 from src.server.preview_proxy.activity import PreviewActivity
 from src.server.preview_proxy.ws import relay_websocket
-from src.server.services.preview_capabilities import Capability
+from src.server.services.preview_capabilities import Capability, Upstream
 
 
 @pytest.mark.asyncio
@@ -41,11 +41,10 @@ async def test_a_redirect_on_the_upgrade_closes_and_reaches_no_other_host():
             capability = Capability(
                 sandbox_id="sbx-1",
                 port=8080,
-                upstream=f"http://127.0.0.1:{port}",
+                upstream=None,
                 workspace_id="ws-1",
                 generation=1,
                 expires_at=int(time.time()) + 600,
-                headers={"e2b-traffic-access-token": "tok-1"},
             )
             sent: list[dict] = []
             # The browser connects, then leaves, so a relay that did open
@@ -65,6 +64,9 @@ async def test_a_redirect_on_the_upgrade_closes_and_reaches_no_other_host():
                 receive,
                 send,
                 capability,
+                upstream=Upstream(
+                    f"http://127.0.0.1:{port}", {"e2b-traffic-access-token": "tok-1"}
+                ),
                 capability_origin="http://8080-x.preview.localhost",
                 target="/",
                 activity=PreviewActivity(),

@@ -245,6 +245,60 @@ class TestBuildGraphConfig:
         ):
             assert llm_owned not in metadata
 
+    @pytest.mark.parametrize(
+        ("origin", "expected"),
+        [
+            (None, {"origin": "user"}),
+            (
+                {"type": "automation", "id": "auto-1", "name": "Morning brief"},
+                {"origin": "automation", "automation_id": "auto-1"},
+            ),
+            ({"type": "agent", "id": "t-0", "agent": "chief_of_staff"}, {"origin": "agent"}),
+            ({"type": "system"}, {"origin": "system"}),
+        ],
+    )
+    def test_root_run_says_what_drove_the_turn(self, origin, expected):
+        from src.server.models.chat import ThreadOrigin
+
+        request = MagicMock(
+            locale=None,
+            checkpoint_id=None,
+            platform=None,
+            origin=ThreadOrigin(**origin) if origin else None,
+            query_type=None,
+        )
+        metadata = self._build(request=request, from_server=True)["metadata"]
+        assert {k: v for k, v in metadata.items() if k != "k"} == expected
+
+    @pytest.mark.parametrize(
+        "origin",
+        [{"type": "automation", "id": "auto-1"}, {"type": "agent", "agent": "chief_of_staff"}],
+    )
+    def test_an_origin_a_client_names_is_not_believed(self, origin):
+        """Any client may send one; only the server's own labels the trace."""
+        from src.server.models.chat import ThreadOrigin
+
+        request = MagicMock(
+            locale=None,
+            checkpoint_id=None,
+            platform=None,
+            origin=ThreadOrigin(**origin),
+            query_type=None,
+        )
+        metadata = self._build(request=request)["metadata"]
+        assert {k: v for k, v in metadata.items() if k != "k"} == {"origin": "user"}
+
+    @pytest.mark.parametrize("query_type", ["system", "market_target", "wakeup"])
+    def test_a_turn_the_server_posted_is_not_the_users(self, query_type):
+        request = MagicMock(
+            locale=None, checkpoint_id=None, platform=None, origin=None, query_type=query_type
+        )
+        metadata = self._build(request=request)["metadata"]
+        assert {k: v for k, v in metadata.items() if k != "k"} == {
+            "origin": "system",
+            "query_type": query_type,
+        }
+
     def test_timezone_in_configurable(self):
         config = self._build(timezone_str="UTC")
         assert config["configurable"]["timezone"] == "UTC"

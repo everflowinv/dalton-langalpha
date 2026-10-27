@@ -70,6 +70,19 @@ describe('categorizeFileError', () => {
     });
   });
 
+  it('carries the server\'s sentence on a 422 that has one', () => {
+    const err = makeApiError(422, 'The machine did not accept our key for dev.');
+    expect(categorizeFileError(err)).toEqual({
+      category: 'unknown',
+      detail: 'The machine did not accept our key for dev.',
+      message: 'The machine did not accept our key for dev.',
+    });
+    expect(categorizeFileError({ response: { status: 422, data: { detail: [{ msg: 'x' }] } } })).toEqual({
+      category: 'unknown',
+      detail: '',
+    });
+  });
+
   it('returns access_denied for 403', () => {
     const err = makeApiError(403, 'Access denied: /etc is not in allowed directories');
     expect(categorizeFileError(err)).toEqual({

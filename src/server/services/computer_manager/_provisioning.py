@@ -70,6 +70,11 @@ logger = logging.getLogger(__name__)
 # Sibling folders one restore pass fills at once: a recreated sandbox is one
 # small machine, already busy with the turn that recreated it.
 _SIBLING_RESTORES_AT_ONCE = 3
+# How long removing a computer waits on a machine its owner brought. The
+# session path retries an unanswering machine for minutes, and nothing is
+# billed while it waits, so the removal stops waiting first.
+_OWNER_MACHINE_CLEANUP_S = 30
+
 # An attach record this worker never made, which no files_epoch equals.
 _UNSEEN = object()
 
@@ -100,6 +105,32 @@ class ProvisioningMixin:
             machine.last_sync_at = None
         self._cancel_mcp_discovery(computer_id)
 
+        if binding.provider.recreatable:
+            await self._delete_machine_sandbox(binding, session, attached_sandbox_id)
+            return
+        # A machine the server cannot recreate is its owner's: it bills
+        # nothing here, and one that no longer answers or takes the key must
+        # not keep a computer they asked to remove. Its folder stays theirs.
+        try:
+            async with asyncio.timeout(_OWNER_MACHINE_CLEANUP_S):
+                await self._delete_machine_sandbox(
+                    binding, session, attached_sandbox_id
+                )
+        except Exception as e:
+            logger.warning(
+                f"Removed computer {computer_id} without cleaning up its "
+                f"machine: {e!r}",
+                extra={"computer_id": computer_id, "sandbox_id": durable_sandbox_id},
+            )
+
+    async def _delete_machine_sandbox(
+        self,
+        binding: ComputerBinding,
+        session: Any,
+        attached_sandbox_id: Optional[str],
+    ) -> None:
+        computer_id = binding.computer_id
+        durable_sandbox_id = binding.provider_ref
         if session is not None and attached_sandbox_id != durable_sandbox_id:
             # Cleanup would delete a stale handle's sandbox, which this machine does not own.
             await self._retire_session(
@@ -109,6 +140,15 @@ class ProvisioningMixin:
             )
         else:
             self._drop_session(computer_id)
+            cached = SessionManager.get_cached_session(computer_id)
+            if (
+                cached is not None
+                and durable_sandbox_id
+                and self._session_sandbox_id(cached) == durable_sandbox_id
+            ):
+                # A reconnect that failed during an outage would otherwise
+                # keep it, and the removal would leave it running.
+                cached.sandbox.release_for_removal()
             try:
                 await SessionManager.cleanup_session(computer_id)
             except Exception as e:
@@ -200,7 +240,7 @@ class ProvisioningMixin:
         workspace_id = binding.workspace_id
 
         skill_dirs = (
-            self.config.skills.local_skill_dirs_with_sandbox()
+            self.config.skills.local_skill_dirs()
             if self.config.skills.enabled
             else None
         )
@@ -209,9 +249,7 @@ class ProvisioningMixin:
 
         async def _sync_assets() -> Any:
             user_skill_params = await sandbox_skill_sync_params(
-                user_id,
-                self.config.skills.sandbox_skills_base,
-                workspace_id=workspace_id,
+                user_id, workspace_id=workspace_id
             )
             vault_owner, vault_secrets, vault_fingerprint = await self._vault_snapshot(
                 workspace_id, user_id
@@ -588,6 +626,14 @@ class ProvisioningMixin:
         project shadow that lags a resize would rebuild at the old size.
         ``outage_since`` is the host outage that authorized replacing the old
         sandbox, if one did; the bind holds only while that outage runs."""
+        if binding.provider_ref and not binding.provider.recreatable:
+            # Every path that replaces a sandbox checks this first; all of
+            # them end here, so a new one that forgets cannot replace a
+            # computer on its owner's machine.
+            raise RuntimeError(
+                f"Computer {binding.computer_id} is on a machine the server "
+                "cannot replace"
+            )
         workspace_id = binding.workspace_id
         workspace = await db_get_workspace(workspace_id)
         # Warm-path recovery may lack user_id. Use the NOT NULL row owner or
@@ -683,6 +729,7 @@ class ProvisioningMixin:
         session: Session | None = None,
         layout: WorkspaceLayout | None = None,
         held_folder: str | None = None,
+        routine: bool = False,
     ) -> bool:
         """Always fence backups: sync_to_db overwrites the durable file copy.
 
@@ -699,7 +746,8 @@ class ProvisioningMixin:
         The machine is resolved here for a caller that holds only the project
         (the post-turn mirror), because the session and the fence are the
         machine's: requiring it of every caller made that one fail on its
-        signature and stop mirroring turns at all."""
+        signature and stop mirroring turns at all. ``routine`` is a backup the
+        computer's switch governs (``sync_to_db``)."""
         binding = None
         if computer_id is None:
             binding = await self.resolve_binding(workspace_id)
@@ -771,6 +819,7 @@ class ProvisioningMixin:
                     layout=await self._project_layout(
                         workspace_id, computer_id, dir_name=dir_name or "", root=root
                     ),
+                    routine=routine,
                 )
         except WorkspaceFolderMoving as e:
             message = f"Folder of workspace {workspace_id} is moving; not backed up this pass"
@@ -785,6 +834,13 @@ class ProvisioningMixin:
                     f"sandbox teardown: {e}"
                 ) from e
             logger.warning(f"File backup failed for {workspace_id}: {e}")
+            return False
+
+        if result.backups_off:
+            logger.info(
+                f"Workspace {workspace_id} not backed up: its computer's "
+                f"backups were turned off during the pass"
+            )
             return False
 
         # ``sync_to_db`` is per-file best-effort: it reports failures instead
@@ -807,10 +863,11 @@ class ProvisioningMixin:
             logger.warning(message)
             return False
 
-        if result.root_missing:
+        if result.root_missing or result.held:
             logger.info(
-                f"Workspace {workspace_id} has no folder on this sandbox; "
-                f"its mirror is already the record"
+                f"Workspace {workspace_id} has no folder on this sandbox, or "
+                f"one waiting on its owner to restore it; its mirror is already "
+                f"the record"
             )
             return True
 
@@ -936,11 +993,16 @@ class ProvisioningMixin:
 
         The folder is read again under the folder hold, as a backup's is: a
         restore into a folder a settle moved meanwhile recreates the old one and
-        marks itself complete there, and a backup of the new one then prunes."""
+        marks itself complete there, and a backup of the new one then prunes.
+        On a machine the server cannot rebuild, a folder gone from it waits on
+        its owner (``maybe_restore``'s ``ask_first``). It is attached as it is
+        meanwhile, so turns keep their skills and tools, and only the bring-up
+        waits, whose deferred pass would lay files too. A restore they ask for
+        attaches again (``settle_files_restore_offer``)."""
         workspace_id = binding.workspace_id
         try:
             async with self._held_workspace_folder(workspace_id) as dir_name:
-                await FilePersistenceService.maybe_restore(
+                restored = await FilePersistenceService.maybe_restore(
                     workspace_id,
                     sandbox,
                     layout=await self._project_layout(
@@ -949,6 +1011,7 @@ class ProvisioningMixin:
                         dir_name=dir_name or "",
                         root=binding.root_dir,
                     ),
+                    ask_first=not binding.provider.recreatable,
                 )
         except WorkspaceFolderMoving:
             # The next acquisition restores once it lands.
@@ -958,9 +1021,10 @@ class ProvisioningMixin:
         except Exception as e:
             logger.warning(f"File restore check failed for {workspace_id}: {e}")
             return False
-        self._queue_bring_up(
-            binding.computer_id, workspace_id, sandbox, binding.root_dir, urgent=urgent
-        )
+        if restored:
+            self._queue_bring_up(
+                binding.computer_id, workspace_id, sandbox, binding.root_dir, urgent=urgent
+            )
         return True
 
     async def _ensure_workspace_dirs(
@@ -1286,6 +1350,15 @@ class ProvisioningMixin:
         expected_wd = binding.root_dir or self.config.filesystem.working_directory
         if actual_wd == expected_wd:
             # Another recreation may already have corrected the directory.
+            await self._write_sandbox_stamp(binding)
+            return None
+        if not binding.provider.recreatable:
+            # The machine is its owner's, so a settings change is no reason to
+            # replace it; the stamp records what it runs on now.
+            logger.warning(
+                f"Computer {binding.computer_id} works in {actual_wd!r}, not "
+                f"{expected_wd!r}; its machine is never replaced to match"
+            )
             await self._write_sandbox_stamp(binding)
             return None
 

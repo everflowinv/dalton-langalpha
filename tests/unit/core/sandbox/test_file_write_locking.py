@@ -521,4 +521,4 @@ async def test_the_write_script_creates_the_parent_and_refuses_a_directory_targe
     mkdir = next(i for i, line in enumerate(lines) if line.startswith("mkdir -p"))
     mktemp = next(i for i, line in enumerate(lines) if line.startswith("tmp=$(mktemp"))
     assert mkdir < mktemp
-    assert 'mv -fT -- "$tmp" "$target"' in lines
+    assert 'mv -fT -- "$tmp" "$target"' in [line.strip() for line in lines]

@@ -69,6 +69,7 @@ _WS_COLUMNS: tuple[str, ...] = (
     "computer_id",
     "dir_name",
     "previous_dir_names",
+    "previous_root_dirs",
     "layout_origin",
     "status",
     "created_at",
@@ -83,6 +84,8 @@ _WS_COLUMNS: tuple[str, ...] = (
     "is_always_on",
     "platform_secret_version",
     "mcp_config_version",
+    "files_restore_offered_at",
+    "files_backed_up_at",
 )
 
 # The restore flag is read as a boolean, never as its column: the timestamp is
@@ -567,9 +570,16 @@ async def get_live_workspace_ids_for_computer(
 # What a row's sandbox was last verified under, for the next start to compare.
 SANDBOX_STAMP_KEYS = ("sandbox_config_hash", "sandbox_provider", "sandbox_working_dir")
 # Written by the server alone: a forged stamp would skip the migration a start
-# owes, and folder landings and a move's backoff are the folder settle's
-# record. A client's config carries none of them in.
-SERVER_OWNED_CONFIG_KEYS = ("folder_landings", "folder_move_blocked", *SANDBOX_STAMP_KEYS)
+# owes, folder landings and a move's backoff are the folder settle's record,
+# and a delete's markers decide whether a folder on its owner's machine is
+# removed. A client's config carries none of them in.
+SERVER_OWNED_CONFIG_KEYS = (
+    "folder_landings",
+    "folder_move_blocked",
+    "folder_cleanup_pending",
+    "folder_kept",
+    *SANDBOX_STAMP_KEYS,
+)
 
 
 async def stamp_computer_sandbox_config(computer_id: str, stamp: Dict[str, Any]) -> None:
@@ -670,18 +680,33 @@ async def get_live_workspace_folders_for_computer(
 
 
 async def get_workspace_dir_names_for_computer(
-    computer_id: str, *, conn=None
+    computer_id: str, *, conn=None, left_by_moves: bool = True
 ) -> tuple[str, ...]:
     """Every folder a row on this computer holds, tombstones included.
 
     A stopped machine may still hold a deleted workspace's folder. A row staged
     mid-move also holds the folder it left, the one its name lands on and every
     one a pass planned for it: until the move is recorded its content may be in
-    any, and a deleted one's clearing takes whatever it finds there.
+    any, and a deleted one's clearing takes whatever it finds there. So does a
+    move from the backup that left its folder in place, until the sweep sets it
+    aside: its sync marker would vouch for a stale copy to whatever took it.
+    ``left_by_moves=False`` leaves those out, for the sweep asking whether a
+    workspace holds the name now.
     """
+    left = (
+        """
+            UNION ALL
+            SELECT source_folder, NULL, NULL FROM workspace_moves
+            WHERE source_computer_id = %(computer)s
+              AND from_backup AND leftovers_removed_at IS NULL
+              AND phase IN ('committed', 'done')
+        """
+        if left_by_moves
+        else ""
+    )
     async with _ws_cursor(conn) as cur:
         await cur.execute(
-            """
+            f"""
             SELECT dir_name AS folder, NULL AS landing, NULL::jsonb AS landings
             FROM workspaces
             WHERE computer_id = %(computer)s AND dir_name IS NOT NULL
@@ -689,6 +714,7 @@ async def get_workspace_dir_names_for_computer(
             SELECT previous_dir_names[1], name, config->'folder_landings' FROM workspaces
             WHERE computer_id = %(computer)s
               AND dir_name = %(moving)s || workspace_id::text
+            {left}
             """,
             {"computer": computer_id, "moving": f"{MOVING_DIR}/"},
         )
@@ -879,6 +905,8 @@ async def duplicate_workspace_on_computer(
 
     A visible empty project can attach before the copy and record an empty
     restore as complete, permanently skipping the files that arrive later.
+    The copy's restore is owed from the start: on a machine its owner
+    brought, a folder missing its files is otherwise theirs to decline.
     """
     from src.server.database.workspace_file import copy_workspace_files
 
@@ -892,6 +920,9 @@ async def duplicate_workspace_on_computer(
             if workspace is not None:
                 await copy_workspace_files(
                     source_id, str(workspace["workspace_id"]), conn=conn,
+                )
+                await set_files_restore_incomplete(
+                    str(workspace["workspace_id"]), True, conn=conn
                 )
             return workspace
 
@@ -1067,9 +1098,15 @@ async def get_workspaces_for_user(
             count_result = await cur.fetchone()
             total = count_result["total"] if count_result else 0
 
+            # The root rides on each row as on the detail read, so a page that
+            # seeds a workspace from its list reads its paths without waiting on
+            # the computers. A subquery, since a join would make the bare
+            # columns the ordering names ambiguous.
             await cur.execute(
                 f"""
-                SELECT {_WS_COLS}
+                SELECT {_WS_COLS},
+                       (SELECT c.root_dir FROM computers c
+                        WHERE c.computer_id = workspaces.computer_id) AS computer_root_dir
                 FROM workspaces
                 WHERE user_id = %(user_id)s {status_filter} {home_filter}
                 ORDER BY {order_clause}, workspace_id DESC
@@ -1374,6 +1411,81 @@ async def files_restore_incomplete(workspace_id: str, *, conn=None) -> bool:
     return bool(row and row["files_restore_incomplete_at"] is not None)
 
 
+async def computer_backs_up_files(workspace_id: str, *, conn=None) -> bool:
+    """Whether the switch of the computer holding the workspace leaves routine backups on.
+
+    Read by each routine backup under the workspace's sync lock, so turning
+    backups off stops every one that had not started when the switch landed,
+    not only the passes planned after it."""
+    async with _ws_cursor(conn) as cur:
+        await cur.execute(
+            "SELECT c.files_backup FROM workspaces w "
+            "JOIN computers c ON c.computer_id = w.computer_id "
+            "WHERE w.workspace_id = %s",
+            (workspace_id,),
+        )
+        row = await cur.fetchone()
+    return row is None or row["files_backup"] is not False
+
+
+async def offer_files_restore(workspace_id: str, *, conn=None) -> bool:
+    """Record that the folder is gone and restoring it waits on the owner.
+
+    False when a restore is owed instead: one a move, a rollback or the owner
+    already asked for is not theirs to decline, so an offer never stands
+    beside the flag."""
+    async with _ws_cursor(conn) as cur:
+        await cur.execute(
+            """
+            UPDATE workspaces
+            SET files_restore_offered_at = COALESCE(files_restore_offered_at, NOW())
+            WHERE workspace_id = %s AND status <> 'deleted'
+              AND files_restore_incomplete_at IS NULL
+            """,
+            (workspace_id,),
+        )
+        return cur.rowcount > 0
+
+
+async def files_restore_offered(workspace_id: str, *, conn=None) -> bool:
+    """Propagate read failures, as the flag's reader does: a backup that read
+    no offer would mirror the emptied folder over the files it stands for."""
+    async with _ws_cursor(conn) as cur:
+        await cur.execute(
+            "SELECT files_restore_offered_at FROM workspaces WHERE workspace_id = %s",
+            (workspace_id,),
+        )
+        row = await cur.fetchone()
+    return bool(row and row["files_restore_offered_at"] is not None)
+
+
+async def settle_files_restore_offer(
+    workspace_id: str, *, restore: bool, conn=None
+) -> bool:
+    """End a standing offer, owing its restore or dropping it; False if none stood.
+
+    Owing the restore takes the offer's place in one write, so the backup is
+    held by one or the other throughout. Either way the files arrive anew, as
+    a move's do: every worker that attached the folder while the offer stood
+    attaches it again, which lays the restore owed wherever the next open
+    lands, or queues the bring-up the offer held back."""
+    owe = (
+        ", files_restore_incomplete_at = COALESCE(files_restore_incomplete_at, NOW())"
+        if restore
+        else ""
+    )
+    async with _ws_cursor(conn) as cur:
+        await cur.execute(
+            f"""
+            UPDATE workspaces
+            SET files_restore_offered_at = NULL, files_epoch = gen_random_uuid(){owe}
+            WHERE workspace_id = %s AND files_restore_offered_at IS NOT NULL
+            """,
+            (workspace_id,),
+        )
+        return cur.rowcount > 0
+
+
 async def workspace_owner(workspace_id: str, conn=None) -> str:
     """A missing owner must raise or storage keys could place bytes in an unowned namespace."""
     async with _ws_cursor(conn) as cur:
@@ -1486,6 +1598,9 @@ async def lock_run_workspace(conn, thread_id: str) -> None:
 async def delete_workspace(
     workspace_id: str,
     conn=None,
+    *,
+    bound_to: Optional[str] = None,
+    keep_folder: bool = False,
 ) -> bool:
     """Project deletion must leave the shared computer alone.
 
@@ -1493,6 +1608,11 @@ async def delete_workspace(
     then the binding remains, and FENCE_NOT_DELETED prevents reuse after tombstoning.
     The tombstone is the only deletion: a row removed outright takes the layout
     owner's identity with it, and ON DELETE SET NULL leaves the folder unowned.
+
+    ``keep_folder`` leaves the folder where it is: the tombstone holds its name
+    with ``folder_kept`` and nothing queues its removal. That choice depends on
+    the computer, so ``bound_to`` names the one it was made for, and a row a
+    move has bound elsewhere since is refused rather than decided wrongly.
     """
     from src.server.database.egress_grants import (
         lock_user_egress_state,
@@ -1512,9 +1632,12 @@ async def delete_workspace(
                 # Same lock order as grant sync: owner first, workspace second.
                 await lock_user_egress_state(cur, owner["user_id"])
                 await cur.execute(
-                    "SELECT workspace_id FROM workspaces WHERE workspace_id = %s FOR UPDATE",
+                    "SELECT workspace_id, computer_id FROM workspaces WHERE workspace_id = %s FOR UPDATE",
                     (workspace_id,),
                 )
+                locked = await cur.fetchone()
+                if bound_to is not None and str((locked or {}).get("computer_id")) != str(bound_to):
+                    raise WorkspaceBusyError(MOVING_DELETE_REFUSAL)
                 if await workspace_has_live_runs(cur, workspace_id):
                     raise WorkspaceBusyError(
                         "This workspace has active work. Stop it or wait for it to finish before deleting."
@@ -1523,24 +1646,34 @@ async def delete_workspace(
                 # would have cleared a folder it found missing.
                 if await workspace_is_moving(workspace_id, conn=owned):
                     raise WorkspaceBusyError(MOVING_DELETE_REFUSAL)
+                # Exactly one of the two markers, whatever the row carried in.
                 await cur.execute(
                     """
                     UPDATE workspaces
                     SET status = 'deleted',
                         config = CASE
-                            WHEN computer_id IS NOT NULL AND dir_name IS NOT NULL
+                            WHEN computer_id IS NULL OR dir_name IS NULL THEN config
+                            WHEN %(keep)s
                             THEN jsonb_set(
-                                COALESCE(config, '{}'::jsonb),
+                                COALESCE(config, '{}'::jsonb) #- '{folder_cleanup_pending}',
+                                '{folder_kept}',
+                                'true'::jsonb
+                            )
+                            ELSE jsonb_set(
+                                COALESCE(config, '{}'::jsonb) #- '{folder_kept}',
                                 '{folder_cleanup_pending}',
                                 'true'::jsonb
                             )
-                            ELSE config
                         END,
-                        updated_at = %s
-                    WHERE workspace_id = %s AND status <> 'deleted'
+                        updated_at = %(now)s
+                    WHERE workspace_id = %(id)s AND status <> 'deleted'
                     RETURNING workspace_id, computer_id
                     """,
-                    (datetime.now(timezone.utc), workspace_id),
+                    {
+                        "keep": keep_folder,
+                        "now": datetime.now(timezone.utc),
+                        "id": workspace_id,
+                    },
                 )
                 result = await cur.fetchone()
                 if result:
@@ -1594,6 +1727,31 @@ async def get_pending_workspace_folder_cleanups(
             LIMIT %s
             """,
             params,
+        )
+        return [dict(row) for row in await cur.fetchall()]
+
+
+async def get_folder_cleanups_owed_by(
+    computer_id: str, *, conn=None
+) -> List[Dict[str, Any]]:
+    """The deleted projects whose folder one computer still owes, whatever its status.
+
+    The reaper reads running computers only. A machine its owner brought
+    outlives the computer, whose removal is the last time the server reaches it.
+    """
+    async with _ws_cursor(conn) as cur:
+        await cur.execute(
+            """
+            SELECT workspace_id, dir_name
+            FROM workspaces
+            WHERE computer_id = %s
+              AND status = 'deleted'
+              AND dir_name IS NOT NULL
+              AND COALESCE(config, '{}'::jsonb)
+                    @> '{"folder_cleanup_pending": true}'::jsonb
+            ORDER BY updated_at ASC, workspace_id
+            """,
+            (computer_id,),
         )
         return [dict(row) for row in await cur.fetchall()]
 

@@ -1,8 +1,9 @@
 """What the mount serves of past threads: each workspace's transcripts and
 the computer's thread index. Both are renders of server state, so both are
-read-only, and neither is a filesystem route the file tools use: those reach
-them through the sandbox paths the mount links in, so a search over hundreds
-of megabytes runs in the sandbox rather than on the server.
+read-only. Where the mount serves, the file tools reach them through the
+sandbox paths it links in, so a search over hundreds of megabytes runs in the
+sandbox rather than on the server; a machine it never serves gets them as
+filesystem routes instead (``history_files``).
 
 Each is a ``MountRoute`` of its own, listing a directory from the stored
 digests rather than every file's content. The transcripts list as a tree, so
@@ -17,6 +18,7 @@ import json
 import logging
 from collections import Counter, OrderedDict
 from collections.abc import Awaitable, Callable
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from typing import Any
 
@@ -157,6 +159,21 @@ class _VerifiedBytes:
 
 _verified = _VerifiedBytes(_READ_CACHE_BYTES)
 
+# Threads of their own for transcript downloads, which a search makes many of
+# at once: on the default pool they would hold every other thread call in
+# the worker, the event loop's DNS lookups included, behind storage. Its size
+# is how many any number of searches fetch at once.
+_DOWNLOADS = ThreadPoolExecutor(max_workers=8, thread_name_prefix="transcript-fetch")
+
+
+async def blob_bytes(user_id: str, sha256: str) -> bytes:
+    """A transcript file's blob, for a caller holding the row that names it."""
+    from src.server.database.workspace_file_blobs import fetch_blob
+
+    return await _verified.get(
+        (user_id, sha256), lambda: fetch_blob(user_id, sha256, executor=_DOWNLOADS)
+    )
+
 
 async def read_file_with_digest(
     workspace_id: str, short_id: str, path: str
@@ -166,18 +183,13 @@ async def read_file_with_digest(
     no such file. The digest names these exact bytes, so a caller needs no
     hash of its own."""
     from src.server.database.thread_transcripts import load_transcript_file
-    from src.server.database.workspace_file_blobs import fetch_blob
 
     row = await load_transcript_file(workspace_id, short_id, path)
     if row is None:
         return None
     if row.content is not None:
         return row.content, row.sha256
-    user_id, sha256 = row.user_id, row.sha256
-    data = await _verified.get(
-        (user_id, sha256), lambda: fetch_blob(user_id, sha256)
-    )
-    return data, sha256
+    return await blob_bytes(row.user_id, row.sha256), row.sha256
 
 
 class TranscriptRoute(_ReadOnly):
@@ -251,14 +263,18 @@ class TranscriptRoute(_ReadOnly):
             directories[parent][filename]["content"] = data.decode()
         return {parent: _sorted(entries) for parent, entries in directories.items()}
 
-    async def read(self, path: str) -> tuple[str, str] | None:
+    async def read_bytes(self, path: str) -> tuple[bytes, str] | None:
+        """The file at ``path`` undecoded, with its sha256."""
         relative = self._relative(path)
         if not relative:
             return None
         short_id, _, inner = relative.partition("/")
         if not inner or not THREAD_DIR_NAME.match(short_id):
             return None
-        found = await read_file_with_digest(self._workspace_id, short_id, inner)
+        return await read_file_with_digest(self._workspace_id, short_id, inner)
+
+    async def read(self, path: str) -> tuple[str, str] | None:
+        found = await self.read_bytes(path)
         if found is None:
             return None
         data, sha256 = found

@@ -24,6 +24,7 @@ import shutil
 import socket
 import ssl
 import stat
+import subprocess
 import sys
 import tempfile
 import threading
@@ -329,7 +330,18 @@ def _boot_id() -> str | None:
         with open("/proc/sys/kernel/random/boot_id") as f:
             return f.read().strip() or None
     except OSError:
+        pass
+    # macOS has no /proc; without an id every sweep would rescan everything.
+    try:
+        found = subprocess.run(
+            ["sysctl", "-n", "kern.bootsessionuuid"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
         return None
+    return found.stdout.strip() or None
 
 
 def _clock_offset_ns() -> int:

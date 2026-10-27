@@ -28,8 +28,11 @@ from ptc_agent.agent.tools.context_file_policy import (
     fill_note,
     over_cap_refusal,
 )
+from ptc_agent.agent.tools.utils import mark_sandbox_raised, stamp_sandbox_served
 from ptc_agent.core.paths import MEMO_USER_DIR, logged_path
 from ptc_agent.agent.backends.db_json_route import UserDataValidationError
+from ptc_agent.agent.transcript.reading import READ_CHARS as TRANSCRIPT_READ_CHARS
+from ptc_agent.agent.transcript.reading import cut_window, is_segment
 from src.observability.private_errors import failure
 
 logger = structlog.get_logger(__name__)
@@ -158,6 +161,7 @@ def create_filesystem_tools(
             start_offset = offset or 0
             max_lines = limit or DEFAULT_READ_LINES
 
+            stamp_sandbox_served(backend, normalized_path)
             content = await backend.aread_range(normalized_path, start_offset, max_lines)
 
             if content is None:
@@ -182,9 +186,16 @@ def create_filesystem_tools(
             lines = content.splitlines()
             if not lines and start_offset > 0:
                 return f"[{file_path} has no lines from offset {start_offset}; it is shorter than that.]"
+            # A transcript is read an event at a time: a window cuts each long
+            # field and stops sooner, and a single line comes whole.
+            segment = is_segment(normalized_path)
+            cap = MAX_READ_CHARS
+            if segment and max_lines > 1:
+                lines = await cut_window(lines, start_offset)
+                cap = TRANSCRIPT_READ_CHARS
             formatted = format_cat_n(lines, start_line_number=start_offset + 1)
 
-            if len(formatted) > MAX_READ_CHARS:
+            if len(formatted) > cap:
                 # Reserve room for the truncation marker. The single-line
                 # overflow path embeds ``file_path`` three times (narrative +
                 # head -c + sed -n), so the budget has to cover ~200 chars of
@@ -192,7 +203,7 @@ def create_filesystem_tools(
                 # which is past the POSIX 255-char limit for any realistic
                 # filesystem.
                 marker_budget = 1200
-                content_budget = max(MAX_READ_CHARS - marker_budget, 0)
+                content_budget = max(cap - marker_budget, 0)
 
                 # Clip to the last newline boundary inside the budget so we
                 # report a line range the agent actually saw end-to-end. If
@@ -225,16 +236,26 @@ def create_filesystem_tools(
                     # huge first line and overstate the agent's slice target.
                     line_size = len(lines[0]) if lines else 0
                     slice_budget = MAX_READ_CHARS // 20  # ~8 KB chunks
-                    marker = (
-                        f"{READ_CLIPPED_NOTE}: line {start_offset + 1} of '{file_path}' "
-                        f"is ~{line_size} characters, exceeds the {MAX_READ_CHARS}-character "
-                        f"context budget. Read won't help here (it's line-based). Use bash to "
-                        f"slice the file, e.g. `head -c {slice_budget} '{file_path}'` or "
-                        f"`sed -n '{start_offset + 1}p' '{file_path}' | head -c {slice_budget}`.]"
-                    )
+                    if segment:
+                        # Bash may not reach the file: the file tools can serve
+                        # a transcript where no file mount shows it.
+                        marker = (
+                            f"{READ_CLIPPED_NOTE}: line {start_offset + 1} of '{file_path}' "
+                            f"is ~{line_size} characters, exceeds the {cap}-character "
+                            "context budget. Grep a phrase from it, with this file as "
+                            "`path`, to see the part you need.]"
+                        )
+                    else:
+                        marker = (
+                            f"{READ_CLIPPED_NOTE}: line {start_offset + 1} of '{file_path}' "
+                            f"is ~{line_size} characters, exceeds the {MAX_READ_CHARS}-character "
+                            f"context budget. Read won't help here (it's line-based). Use bash to "
+                            f"slice the file, e.g. `head -c {slice_budget} '{file_path}'` or "
+                            f"`sed -n '{start_offset + 1}p' '{file_path}' | head -c {slice_budget}`.]"
+                        )
                 else:
                     marker = (
-                        f"{READ_CLIPPED_NOTE} at {MAX_READ_CHARS} characters to protect the context window. "
+                        f"{READ_CLIPPED_NOTE} at {cap} characters to protect the context window. "
                         f"You saw lines {start_offset + 1}..{next_line}. "
                         f"Call Read(file_path='{file_path}', offset={next_line}, limit={max_lines}) "
                         "to continue, or pass a smaller limit to keep each chunk shorter.]"
@@ -252,6 +273,7 @@ def create_filesystem_tools(
             return formatted
 
         except Exception as e:
+            mark_sandbox_raised(e)
             error_msg = f"Failed to read file: {e!s}"
             fields, trace = failure(e)
             logger.error("Failed to read file", file_path=logged_path(file_path), exc_info=trace, **fields)
@@ -292,6 +314,7 @@ def create_filesystem_tools(
                     )
                     return refusal
 
+            stamp_sandbox_served(backend, normalized_path)
             try:
                 result = await backend.awrite_text(normalized_path, content)
             except ReadOnlyStoreError as exc:
@@ -341,6 +364,7 @@ def create_filesystem_tools(
             return f"{message}\n\n{note}" if note else message
 
         except Exception as e:
+            mark_sandbox_raised(e)
             error_msg = f"Failed to write file: {e!s}"
             fields, trace = failure(e)
             logger.error("Failed to write file", file_path=logged_path(file_path), exc_info=trace, **fields)
@@ -373,6 +397,7 @@ def create_filesystem_tools(
                 logger.error("Access denied: path outside the allowed directories", file_path=logged_path(file_path))
                 return f"ERROR: {error_msg}"
 
+            stamp_sandbox_served(backend, normalized_path)
             result = await backend.aedit_text(normalized_path, old_string, new_string, replace_all=replace_all)
             if not result.get("success", False):
                 error_msg = result.get("error", "Edit operation failed")
@@ -404,6 +429,7 @@ def create_filesystem_tools(
             return message
 
         except Exception as e:
+            mark_sandbox_raised(e)
             error_msg = f"Failed to edit file: {e!s}"
             fields, trace = failure(e)
             logger.error("Failed to edit file", file_path=logged_path(file_path), exc_info=trace, **fields)

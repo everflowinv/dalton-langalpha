@@ -59,7 +59,7 @@ dependencies = [
     "pypdf>=4.0.0",
     "youtube-transcript-api>=1.0.0",
     "playwright",
-    "fastapi>=0.110.0",
+    "fastapi>=0.113.0",
     "anyio>=4.0.0",
     "uvicorn>=0.27.1",
     # The preview proxy subclasses the asyncio client to refuse redirects.
@@ -123,6 +123,13 @@ dependencies = [
     # just as jsonschema's transitive.
     "referencing>=0.30",
     "e2b>=2.53.1,<3",
+    # SSH computers. 2.24.1 is the floor because the far end is a machine its
+    # owner controls: it bounds packet lengths and stops a server writing
+    # outside the paths an SFTP client asked for.
+    "asyncssh>=2.24.1,<3",
+    # Past threads are searched on the server with the agent's own pattern;
+    # RE2 matches in linear time, so no pattern can hold a worker's loop.
+    "google-re2>=1.1.20251105",
 ]
 
 [tool.uv.sources]
@@ -210,6 +217,7 @@ markers = [
     "provider_docker: tests requiring Docker daemon",
     "provider_daytona: tests requiring Daytona API key",
     "provider_e2b: tests requiring E2B API key",
+    "provider_ssh: tests requiring an SSH machine (see tests/integration/sandbox/ssh_target)",
     "regression: locks live market-data API behavior against a running server + live providers — opt-in",
 ]
 addopts = "-m 'not integration and not slow and not regression'"

@@ -155,6 +155,22 @@ class WorkspaceResponse(BaseModel):
             "under one of them still means this workspace's folder"
         ),
     )
+    root_dir: Optional[str] = Field(
+        None,
+        description=(
+            "The root of the computer this workspace is on, where its folder "
+            "sits and where the agent's absolute paths start; given on the "
+            "detail and the list, null on the answer to a change"
+        ),
+    )
+    previous_root_dirs: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Roots of the computers this workspace moved off, newest first; "
+            "a path under one of them through its folder still means this "
+            "workspace's folder"
+        ),
+    )
     status: str = Field(
         description=(
             "Workspace status: creating, starting, running, stopping, stopped, "
@@ -198,8 +214,28 @@ class WorkspaceResponse(BaseModel):
             "records may be absent from its folder"
         ),
     )
+    files_restore_offered_at: Optional[datetime] = Field(
+        None,
+        description=(
+            "When the folder was found gone from its owner's machine while a "
+            "backup holds it. Set, the restore waits on the owner's choice "
+            "(POST files/restore-choice) and no backup of it runs"
+        ),
+    )
+    files_backed_up_at: Optional[datetime] = Field(
+        None, description="When the last complete backup of the folder ran"
+    )
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class FilesRestoreChoice(BaseModel):
+    restore: bool = Field(
+        description=(
+            "True lays the backup back into the folder; False keeps the folder "
+            "as it is, and the backup then follows it"
+        )
+    )
 
 
 class WorkspaceReorderItem(BaseModel):

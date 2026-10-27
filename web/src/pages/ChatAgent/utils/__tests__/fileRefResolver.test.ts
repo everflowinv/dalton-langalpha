@@ -118,7 +118,14 @@ describe('collectRecentWritePaths', () => {
       { toolCallProcesses: { a: call('Write', '/home/workspace/Research/results/a.md', 1) } },
       { toolCallProcesses: { b: call('Edit', '/home/workspace/research-ab12/results/b.md', 1) } },
     ];
-    expect(collectRecentWritePaths(messages, 'Research', ['research-ab12'])).toEqual(['results/b.md', 'results/a.md']);
+    expect(collectRecentWritePaths(messages, { dirName: 'Research', previousDirNames: ['research-ab12'] })).toEqual(['results/b.md', 'results/a.md']);
+  });
+
+  it('reads a write under the computer\'s own root as it reads the stock root', () => {
+    const messages: TurnMessage[] = [
+      { toolCallProcesses: { a: call('Write', '/home/someone/langalpha/Research/results/a.md', 1) } },
+    ];
+    expect(collectRecentWritePaths(messages, { dirName: 'Research', rootDir: '/home/someone/langalpha' })).toEqual(['results/a.md']);
   });
 });
 

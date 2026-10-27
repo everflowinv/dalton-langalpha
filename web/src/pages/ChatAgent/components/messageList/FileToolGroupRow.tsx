@@ -30,8 +30,9 @@ interface FileToolGroupRowProps {
 export const FileToolGroupRow = memo(function FileToolGroupRow({ items, onOpenFile, onToolCallClick, isStreaming = false }: FileToolGroupRowProps): React.ReactElement {
   const { t } = useTranslation();
   const [expanded, setExpanded] = useState(false);
+  const { root } = items[0];
   const toolName = items[0].toolName || 'Read';
-  const IconComponent = getToolIcon(toolName, items[0].toolCall?.args);
+  const IconComponent = getToolIcon(toolName, items[0].toolCall?.args, root);
   const isFailed = items.some((item) => item.isFailed === true || item._liveState === 'failed');
   const single = items.length === 1;
   const item = items[0];
@@ -43,7 +44,7 @@ export const FileToolGroupRow = memo(function FileToolGroupRow({ items, onOpenFi
     if (p && !paths.includes(p)) paths.push(p);
   }
   const verbKey = toolName === 'Edit' ? 'edit' : toolName === 'Write' ? 'write' : 'read';
-  const title = single ? getCompletedRowTitle(toolName, item.toolCall, t) : paths.length > 1
+  const title = single ? getCompletedRowTitle(toolName, item.toolCall, t, { root }) : paths.length > 1
     ? t(`toolArtifact.fileGroup.${verbKey}`, { count: paths.length })
     : t(`toolArtifact.fileGroup.${verbKey}One`);
   const repeat = !single && paths.length <= 1
@@ -54,13 +55,13 @@ export const FileToolGroupRow = memo(function FileToolGroupRow({ items, onOpenFi
     ? items.map((item) => ({ item, path: filePathOf(item), ...editStrings(item) })).filter((d) => d.oldStr || d.newStr)
     : [];
   const hasDiff = diffs.length > 0;
-  const category = categorizeTool(toolName, item.toolCall);
+  const category = categorizeTool(toolName, item.toolCall, root);
   const tab = category === 'memoryRead' || category === 'memoryWrite' ? 'memory'
     : category === 'memo' || category === 'memoWrite' ? 'memo' : 'files';
   const openLabel = t('toolArtifact.a11y.openInTab', { tab: t(`filePanel.tabs.${tab}`) });
   const singlePath = filePathOf(item);
-  const singleLabel = getCompletedSummary(toolName, item.toolCall, t)
-    || (singlePath && classifyAgentPath(singlePath).kind === 'file' ? singlePath.split('/').pop() : null);
+  const singleLabel = getCompletedSummary(toolName, item.toolCall, t, root)
+    || (singlePath && classifyAgentPath(singlePath, root).kind === 'file' ? singlePath.split('/').pop() : null);
   const openPath = (path: string) => {
     if (onOpenFile) onOpenFile(path);
     else {

@@ -1,13 +1,14 @@
 """Core configuration classes for Open PTC Agent infrastructure.
 
 This module defines pure data classes for core configuration:
-- Sandbox settings (Daytona, Docker, E2B)
+- Sandbox settings (Daytona, Docker, E2B, SSH)
 - MCP server configurations
 - Filesystem access settings
 - Security settings
 - Logging settings
 """
 
+import ipaddress
 import logging
 import os
 import re
@@ -379,17 +380,6 @@ class FilesystemConfig(BaseModel):
             self.__pydantic_fields_set__.discard("denied_directories")
 
 
-def default_sandbox_skills_base(working_directory: str) -> str:
-    """Where skills land in a sandbox rooted at ``working_directory``.
-
-    Lives here rather than in the skills config so the two call sites that
-    derive it (the YAML loader and ``AgentConfig.create``) share one answer.
-    """
-    from ptc_agent.core.paths import SandboxLayout
-
-    return SandboxLayout(working_directory).skills
-
-
 class DockerConfig(ResourceTieredConfig):
     """Docker sandbox provider configuration.
 
@@ -442,6 +432,120 @@ class DockerConfig(ResourceTieredConfig):
     network_mode: str = "bridge"
     preview_proxy_ports: str = "13000-13009"
     preview_base_url: str | None = None
+
+
+def _single_tier() -> dict[str, ResourceTier]:
+    return {"standard": ResourceTier(cpu=1, memory=1, disk=1)}
+
+
+class SSHConfig(ResourceTieredConfig):
+    """A machine the user brings, reached over SSH.
+
+    The deployment's section holds only the tunables; the target (host, user,
+    pinned host key, whose client key) is each computer's own
+    ``provider_config``, set by the server when the computer is added, never
+    by the YAML. The machine's size is its own, so the kind has one tier and
+    the tier is never shown.
+    """
+
+    host: str = ""
+    port: int = Field(default=22, ge=1, le=65535)
+    username: str = ""
+    # The machine's public host key as an OpenSSH line ("ssh-ed25519 AAAA..."),
+    # pinned when the computer is added. A connection presenting any other key
+    # is refused.
+    host_key: str = ""
+    # The user whose client key authenticates, which only the server sets.
+    key_owner: str = ""
+    # The tunnel of a machine that connects out to the deployment's gateway,
+    # which only the server sets. With one, ``host`` is the machine's name and
+    # ``port`` its sshd's port on the machine itself; nothing dials either.
+    tunnel: str = ""
+    # The machine never stops on idle, so the server's idle reaper stops a
+    # quiet one by this interval. Stopping only ends this computer's own
+    # processes there; the machine keeps running.
+    auto_stop_interval: int = Field(default=3600, ge=60)
+    # The server dials each machine itself, so by default it connects only to
+    # public addresses: a user's machine is never a way into the network the
+    # server sits on. A deployment whose users' machines are on its own LAN or
+    # VPN turns this on.
+    allow_private_addresses: bool = False
+    # Dials per user per hour to addresses the user names (a probe, a pairing
+    # report, a create), counted by host and port tried. Starting a computer
+    # that exists is not counted. 0 is no limit.
+    dials_per_hour: int = Field(default=60, ge=0)
+    # The machine belongs to whoever added it, so by default nothing this
+    # deployment holds reaches it (``SandboxProvider.trusted_host``). A
+    # deployment whose every user may hold its keys, one person self-hosting
+    # most often, turns this on, and its machines get the env any computer
+    # does, the built-in servers' keys included. Each machine's env follows
+    # this at its next open, so turning it off takes those keys off.
+    trusted_host: bool = False
+    # The addresses this deployment's SSH connections reach machines from, as
+    # the machines see them (IPs or CIDR networks). Named, the key's line on
+    # every machine admits logins only from these and from the machine itself,
+    # so a copy of the key is no use elsewhere. Empty, it admits any address,
+    # since where a self-hosted server's connections come from is not known.
+    login_from: list[str] = Field(default_factory=list)
+    connect_timeout: int = Field(default=10, ge=1)
+    keepalive_interval: int = Field(default=15, ge=1)
+    keepalive_count_max: int = Field(default=3, ge=1)
+    # The first start installs the Python runtime, which downloads about a
+    # gigabyte of packages on the machine's own network.
+    bootstrap_timeout: int = Field(default=1800, ge=60)
+    # SSH computers one user may have, 0 for no limit. The plan's computer
+    # cap leaves them out, the machines being their owners', but each still
+    # holds a connection, a tunnel and its sweeps on this server.
+    max_computers_per_user: int = Field(default=20, ge=0)
+    resource_tiers: dict[str, ResourceTier] = Field(
+        default_factory=_single_tier, validate_default=True
+    )
+
+    # Each computer's own, in its ``provider_config``.
+    TARGET_FIELDS: ClassVar[tuple[str, ...]] = (
+        "host",
+        "port",
+        "username",
+        "host_key",
+        "key_owner",
+        "tunnel",
+    )
+
+    @field_validator("login_from")
+    @classmethod
+    def _login_sources(cls, entries: list[str]) -> list[str]:
+        # As sshd's from= reads them. A host name is refused: sshd matches one
+        # only where it resolves clients by name, which it does not by default.
+        sources = []
+        for entry in entries:
+            try:
+                network = ipaddress.ip_network(str(entry).strip(), strict=False)
+            except ValueError:
+                raise ValueError(
+                    f"sandbox.ssh.login_from: {entry!r} is not an IP address or network"
+                ) from None
+            sources.append(
+                str(network.network_address)
+                if network.num_addresses == 1
+                else str(network)
+            )
+        return list(dict.fromkeys(sources))
+
+    @classmethod
+    def from_section(cls, data: Mapping[str, Any] | None = None) -> Self:
+        """The deployment's section, which may not name any computer's target.
+
+        A computer's ``provider_config`` is laid over these settings, so a
+        target set here would reach every computer that lacks the key, and a
+        tunnel would route them all through one machine without a word.
+        """
+        named = [key for key in cls.TARGET_FIELDS if key in (data or {})]
+        if named:
+            raise ValueError(
+                f"sandbox.ssh cannot set {', '.join(named)}: each computer has "
+                "its own, which the server sets when the computer is added"
+            )
+        return cls(**(data or {}))
 
 
 class PlatformSecretDefinition(BaseModel):
@@ -508,10 +612,13 @@ class SandboxConfig(BaseModel):
     # Kinds a new computer may be created on besides ``provider``, which stays
     # the default. Only this list offers a kind: holding its credentials does
     # not, since one environment often carries keys for several providers.
-    offered_providers: tuple[Literal["daytona", "docker", "e2b"], ...] = ()
+    # ``ssh`` is only ever offered: a computer on it needs a machine its owner
+    # names, so it cannot be the default.
+    offered_providers: tuple[Literal["daytona", "docker", "e2b", "ssh"], ...] = ()
     daytona: DaytonaConfig = Field(default_factory=DaytonaConfig)
     e2b: E2BConfig = Field(default_factory=E2BConfig)
     docker: DockerConfig = Field(default_factory=DockerConfig)
+    ssh: SSHConfig = Field(default_factory=SSHConfig)
     platform_secrets: tuple[PlatformSecretDefinition, ...] = ()
 
     def creatable_providers(self) -> tuple[str, ...]:
@@ -524,7 +631,7 @@ class SandboxConfig(BaseModel):
 
     def settings_for(
         self, kind: str
-    ) -> DaytonaConfig | DockerConfig | E2BConfig:
+    ) -> DaytonaConfig | DockerConfig | E2BConfig | SSHConfig:
         """The settings computers of ``kind`` are built from.
 
         Each kind's settings sit under a field of the kind's own name, so a

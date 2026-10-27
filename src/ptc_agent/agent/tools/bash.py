@@ -7,12 +7,14 @@ from langchain_core.tools import BaseTool, tool
 
 from ptc_agent.agent.backends.sandbox import SandboxBackend
 from ptc_agent.agent.tools.mount_guard import run_guarded
+from ptc_agent.agent.tools.utils import mark_sandbox_failed
 from ptc_agent.core.paths import (
     MEMO_USER_DIR,
     MEMORY_USER_DIR,
     WorkspaceLayout,
 )
 from ptc_agent.core.sandbox import livefs_mount
+from src.observability import TOOL_CHANNEL, TOOL_PROVIDER, mark_tool_failed
 
 logger = structlog.get_logger(__name__)
 
@@ -189,6 +191,8 @@ def create_execute_bash_tool(
                 )
                 return "Command completed successfully", artifact
 
+            if result.get("failure"):
+                mark_sandbox_failed(result["failure"])
             # Command failed — Daytona returns combined stdout+stderr in "stdout"
             stdout = result.get("stdout", "")
             stderr = result.get("stderr", "")
@@ -215,6 +219,12 @@ def create_execute_bash_tool(
                 error=str(e),
                 exc_info=True,
             )
+            mark_tool_failed(e)
             return f"ERROR: {error_msg}", {"mcp_trace": []}
 
+    # Every run, not only a failed one, so an error rate reads per provider.
+    Bash.metadata = {
+        TOOL_PROVIDER: backend.provider,
+        TOOL_CHANNEL: backend.channel,
+    }
     return Bash

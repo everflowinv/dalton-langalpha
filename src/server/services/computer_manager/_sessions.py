@@ -62,6 +62,7 @@ class SessionCacheMixin:
             files_epoch=(
                 str(computer["files_epoch"]) if computer.get("files_epoch") else None
             ),
+            files_backup=computer.get("files_backup", True) is not False,
         )
 
     async def resolve_binding(

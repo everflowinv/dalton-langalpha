@@ -265,6 +265,8 @@ def require_platform_secret_capable(
     A provider that cannot hold Secrets resolves each catalog credential from
     the host's environment into ordinary sandbox env. Self-hosted, that is the
     documented fall-through; hosted, those credentials are the platform's.
+    A machine the deployment does not trust is exempt: it is never given a
+    host-resolved value at all, so it has nothing to hold.
 
     Raises:
         PlatformSecretConfigurationError: In hosted mode with a catalog, for
@@ -275,6 +277,9 @@ def require_platform_secret_capable(
     if _resolved_host_mode(host_mode) != "platform":
         return
     for kind in kinds:
+        cls = _provider_class(kind)
+        if cls is not None and not cls.trusted_host(config.sandbox):
+            continue
         if not provider_kind_supports_platform_secrets(kind):
             raise PlatformSecretConfigurationError(
                 f"{kind} cannot hold platform Secrets"

@@ -103,7 +103,10 @@ class ProviderMixin:
         base = self.config.to_core_config().sandbox.settings_for(kind)
         if not overrides:
             return base
-        unknown = sorted(set(overrides) - set(type(base).model_fields))
+        # A kind that names its computers' own fields (an ssh target) keeps
+        # the rest, its trust switch included, the deployment's alone.
+        settable = getattr(type(base), "TARGET_FIELDS", None) or type(base).model_fields
+        unknown = sorted(set(overrides) - set(settable))
         if unknown:
             raise ValueError(
                 f"provider_config for kind {kind!r} names unknown settings: "
@@ -311,7 +314,7 @@ class ProviderMixin:
             return row, None
 
     @asynccontextmanager
-    async def _computer_runtime(
+    async def computer_runtime(
         self, computer: Dict[str, Any], sandbox_id: str
     ) -> AsyncIterator[SandboxRuntime]:
         """This worker's session runtime when it holds that sandbox, else a detached one."""
@@ -327,7 +330,7 @@ class ProviderMixin:
     async def _measure_disk(
         self, computer: Dict[str, Any], sandbox_id: str, breakdown: bool
     ) -> tuple[Dict[str, Any], Dict[str, int]]:
-        async with self._computer_runtime(computer, sandbox_id) as runtime:
+        async with self.computer_runtime(computer, sandbox_id) as runtime:
             return await self._read_and_record_disk(
                 computer, runtime, breakdown, sandbox_id=sandbox_id
             )

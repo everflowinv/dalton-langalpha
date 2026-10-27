@@ -206,3 +206,29 @@ async def test_a_starved_order_tool_takes_the_whole_server_with_it(monkeypatch, 
     assert binding.tools == []
     assert "order tools over budget" in caplog.text
     assert "trading_order_place" in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("vendor", "provider"),
+    [
+        pytest.param("moomoo", "moomoo", id="brokerage-vendor"),
+        pytest.param(None, "custom_mcp", id="user-added-server-label-withheld"),
+    ],
+)
+async def test_a_bound_tool_names_its_provider_never_the_users_label(
+    monkeypatch, vendor, provider
+):
+    """Every trace run of the tool carries its metadata, and the monitoring
+    digest posts the provider to a shared channel."""
+    monkeypatch.setattr(direct_tools, "EGRESS_RELAY_SECRET", "s")
+    binding = await direct_tools.prepare_direct_mcp_tools(
+        user_id="u",
+        workspace_id="w",
+        sandbox_id="sb",
+        grants={"My Private Desk": "grant-1"},
+        by_server={"My Private Desk": _entry(_read("quote"), vendor=vendor)},
+    )
+
+    [tool] = binding.tools
+    assert tool.metadata["tool_provider"] == provider

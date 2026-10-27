@@ -13,6 +13,8 @@ export interface ContentInput {
   isSubagentView?: boolean;
   /** See `buildRenderBlocks`; the current time when omitted. */
   now?: number;
+  /** The computer's own root, read as a sandbox root by the path checks. */
+  root?: string | null;
 }
 
 type FoldRole = 'retain' | 'text' | 'process';
@@ -167,6 +169,7 @@ interface CacheEntry {
   tools: unknown;
   pending: unknown;
   streaming: boolean;
+  root: string | null | undefined;
   projection: ContentProjection;
 }
 
@@ -181,9 +184,10 @@ const latestById = new Map<string, ContentProjection>();
 const LATEST_MAX = 32;
 registerAuthReset(() => latestById.clear());
 
-export function projectMessageContent(message: MessageRecord, isSubagentView = false): ContentProjection {
+export function projectMessageContent(message: MessageRecord, isSubagentView = false, root?: string | null): ContentProjection {
   const hit = cache.get(message);
   if (hit && hit.subagent === isSubagentView
+    && hit.root === root
     && hit.segments === message.contentSegments
     && hit.reasoning === message.reasoningProcesses
     && hit.tools === message.toolCallProcesses
@@ -201,6 +205,7 @@ export function projectMessageContent(message: MessageRecord, isSubagentView = f
     pendingToolCallChunks: (message.pendingToolCallChunks ?? EMPTY_OBJ) as ContentInput['pendingToolCallChunks'],
     isStreaming: message.isStreaming === true,
     isSubagentView,
+    root,
   }, prev);
   if (id) {
     latestById.delete(id);
@@ -214,6 +219,7 @@ export function projectMessageContent(message: MessageRecord, isSubagentView = f
     tools: message.toolCallProcesses,
     pending: message.pendingToolCallChunks,
     streaming: message.isStreaming === true,
+    root,
     projection,
   });
   return projection;
@@ -238,21 +244,22 @@ export function projectMessageContent(message: MessageRecord, isSubagentView = f
  * its content projection / provenanceRecords / error / stopped / isStreaming.
  * A future assistant field that renders OUTSIDE those (e.g. assistant-side
  * attachments) must be added to this guard or its bubbles will be hidden.
- * `isSubagentView` only keys the projection cache the bubble itself reads.
+ * `isSubagentView` and `root` only key the projection cache the bubble itself
+ * reads, so they must be the ones the bubble passes or each render rebuilds it.
  */
-export function isOrphanAssistantMessage(message: MessageRecord, isSubagentView = false): boolean {
+export function isOrphanAssistantMessage(message: MessageRecord, isSubagentView = false, root?: string | null): boolean {
   if (message.role !== 'assistant') return false;
   if (message.isStreaming) return false;
   const provenance = message.provenanceRecords as Record<string, unknown> | undefined;
   if (provenance && Object.keys(provenance).length > 0) return false;
   if (message.error || message.stopped) return false;
-  const projection = projectMessageContent(message, isSubagentView);
+  const projection = projectMessageContent(message, isSubagentView, root);
   return projection.textCount === 0 && projection.blocks.every((block) => block.type === 'text');
 }
 
 /** Drop bubbles the list must not paint (see `isOrphanAssistantMessage`). */
-export function visibleProjection(projected: ProjectedMessage[], isSubagentView = false): ProjectedMessage[] {
-  return projected.filter((p) => !isOrphanAssistantMessage(p.message, isSubagentView));
+export function visibleProjection(projected: ProjectedMessage[], isSubagentView = false, root?: string | null): ProjectedMessage[] {
+  return projected.filter((p) => !isOrphanAssistantMessage(p.message, isSubagentView, root));
 }
 
 /**

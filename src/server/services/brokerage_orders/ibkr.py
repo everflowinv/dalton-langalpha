@@ -14,9 +14,13 @@ And the vendor puts a rejection on the error channel, so a tool error here is
 the vendor's word rather than the transport's, and is classified as one.
 
 An instruction is written into the real account but is not an order until a
-human releases it in IBKR's own client, so no status here maps past
-``submitted``: there is nothing for this stack to watch working or fill, and a
-released instruction turns into a live order this list no longer carries.
+human releases it in IBKR's own client, so no listed row maps past
+``submitted``: there is nothing for this stack to watch working or fill. A
+released instruction turns into a live order under a new id, with no link back,
+and leaves the list; so does one deleted there or expired, and the list does not
+say which. Leaving it is therefore the one end this file names,
+``handed_off``, which reconciliation writes once a complete list stops carrying
+an instruction.
 """
 
 from __future__ import annotations
@@ -368,6 +372,17 @@ class IbkrOrderAdapter(OrderAdapter):
             # that way would report an open attempt as gone.
             raise StatusReadError(text or "no instruction list")
         return [_listed(row) for row in rows]
+
+    def absent_status(self, action: str | None) -> AttemptStatus | None:
+        """``handed_off`` for a staged instruction the list no longer carries.
+
+        It leaves when a person sends it or deletes it in IBKR's own client, or
+        when it expires seven days after it was made, and the order a send
+        makes has a new id that names no instruction. Only a person there can
+        trade it, so IBKR's record is the outcome and the ledger stops at the
+        hand-off. A delete was never listed, so it has no absence to read.
+        """
+        return AttemptStatus.HANDED_OFF if action == OrderAction.STAGE else None
 
     def match_key(self, order: BrokerOrder | None) -> str | None:
         """A create's fingerprint, comparable with a listed instruction.

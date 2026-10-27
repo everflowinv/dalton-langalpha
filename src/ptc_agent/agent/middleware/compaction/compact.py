@@ -67,6 +67,7 @@ from ptc_agent.config.agent import CredentialSource
 from ptc_agent.agent.transcript.pointer import (
     TranscriptTurns,
     aexport_transcript,
+    shell_reads_transcripts,
     summary_span,
     transcript_target,
 )
@@ -319,6 +320,7 @@ async def compact_messages(
         state,
         max_length=config.compaction.truncate_args_max_length,
         transcript=transcript,
+        shell=shell_reads_transcripts(backend),
     )
     if len(view) <= keep_messages:
         raise ValueError(

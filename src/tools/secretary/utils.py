@@ -1,15 +1,17 @@
 """Utility functions for secretary tools."""
 
+import functools
 import json
 import logging
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone as dt_timezone
-from typing import Any
+from typing import Any, NamedTuple
+from urllib.parse import quote, unquote
 from zoneinfo import ZoneInfo
 
-from ptc_agent.core.paths import SANDBOX_ROOTS
+from ptc_agent.core.paths import computer_roots
 
 logger = logging.getLogger(__name__)
 
@@ -125,12 +127,65 @@ _SEP_RE = re.compile(r"/|%2[fF]")
 # :line, :start-end, :line:col. The `#fragment` and `?query` forms are read by
 # `_split_location`.
 _LINE_LOCATION_RE = re.compile(r":\d+(?:-\d+|:\d+)?$")
-# The computer root in every spelling, current and legacy, with or without a
-# `file://` scheme.
-_SANDBOX_ROOT_RE = re.compile(
-    "^(?:file://)?(?:" + "|".join(re.escape(r) for r in SANDBOX_ROOTS) + ")/",
-    re.IGNORECASE,
-)
+
+
+@functools.lru_cache(maxsize=64)
+def _roots_re(roots: tuple[str, ...]) -> re.Pattern[str]:
+    """Any of ``roots`` in every spelling, with or without a `file://` scheme.
+
+    A link is tested before it is decoded, so a root with characters that
+    travel percent-encoded matches in that spelling too, the one the client's
+    ``ownRootPatterns`` reads (``encodeURIComponent`` per segment).
+    """
+    spellings = dict.fromkeys(
+        spelling
+        for r in roots
+        for spelling in (r, "/".join(quote(s, safe="!*'()") for s in r.split("/")))
+    )
+    alternation = "|".join(re.escape(s) for s in spellings)
+    return re.compile(f"^(?:file://)?(?:{alternation})/", re.IGNORECASE)
+
+
+class _Placement(NamedTuple):
+    """Where a workspace's files are: its computer's root, None when it is on
+    none, and its folder there; and where they were: the roots of the
+    computers it moved off and the names its folder had."""
+
+    root: str | None = None
+    previous_roots: Sequence[str] = ()
+    folder: str | None = None
+    previous_folders: Sequence[str] = ()
+
+
+def _without_root(path: str, where: _Placement) -> str:
+    """``path`` without the computer root it is spelled under, current or legacy.
+
+    The current root is the workspace's own computer's: a computer whose user
+    cannot create the stock root keeps its workspaces under another one, and
+    its analyst spells that out in an absolute link like any other. A turn
+    from before a move spells its links under a root the workspace left,
+    where only a path through its folder, by any name it had, is its own; the
+    folder goes with that root, and the rest of the root held its siblings.
+    A path through the current folder reads as the current one first, and
+    without it, as the server's file routes and the client read it.
+    """
+    here = _roots_re(computer_roots(where.root)).match(path)
+    rest = path[here.end() :] if here else None
+    if rest is not None and where.folder:
+        first, _, inside = rest.partition("/")
+        if unquote(first) == where.folder:
+            return inside
+    names = {n.casefold() for n in (where.folder, *where.previous_folders) if n}
+    left = {r.rstrip("/") for r in where.previous_roots} - {""}
+    for root in sorted(left, key=len, reverse=True):
+        there = _roots_re((root,)).match(path)
+        if there:
+            first, _, inside = path[there.end() :].partition("/")
+            if unquote(first).casefold() in names:
+                return inside
+    return path if rest is None else rest
+
+
 _BARE_DOMAIN_RE = re.compile(r"^www\.", re.IGNORECASE)
 _FILE_NAME_RE = re.compile(r"\.(?:" + _FILE_EXTS + r")$", re.IGNORECASE)
 # A colon introduces a scheme only before the first slash, which is the rule
@@ -169,7 +224,14 @@ def _split_location(path: str) -> tuple[str, str]:
     return (path[: line.start()], line.group(0) + tail) if line else (path, tail)
 
 
-def _qualify_file_paths(text: str, workspace_id: str) -> str:
+def _qualify_file_paths(
+    text: str,
+    workspace_id: str,
+    root: str | None = None,
+    previous_roots: Sequence[str] = (),
+    folder: str | None = None,
+    previous_folders: Sequence[str] = (),
+) -> str:
     """Rewrite workspace file links to __wsref__/{workspace_id}/path.
 
     Transforms:
@@ -185,6 +247,7 @@ def _qualify_file_paths(text: str, workspace_id: str) -> str:
     """
     if not workspace_id or not text:
         return text
+    where = _Placement(root, previous_roots, folder, previous_folders)
 
     def _rewrite(m: re.Match) -> str:
         prefix, dest, suffix = m.group(1), m.group(2), m.group(3)
@@ -194,7 +257,7 @@ def _qualify_file_paths(text: str, workspace_id: str) -> str:
         # mints a reference that resolver then refuses.
         path = (dest[1:-1] if bracketed else dest).strip().replace("\\", "/")
         path, tail = _split_location(path)
-        path = _SANDBOX_ROOT_RE.sub("", path)
+        path = _without_root(path, where)
         while path.startswith("./"):
             path = path[2:]
         if (
@@ -297,6 +360,20 @@ def _join_recent_turns(turn_texts: list[str]) -> str:
     return body
 
 
+async def _placement(workspace_id: str) -> _Placement:
+    if not workspace_id:
+        return _Placement()
+    from src.server.database.computer import get_computer_for_workspace
+
+    computer = await get_computer_for_workspace(workspace_id) or {}
+    return _Placement(
+        computer.get("root_dir"),
+        tuple(computer.get("previous_root_dirs") or ()),
+        computer.get("dir_name"),
+        tuple(computer.get("previous_dir_names") or ()),
+    )
+
+
 async def extract_text_from_thread(
     thread_id: str, turns: int = 1, timezone: str = "UTC"
 ) -> dict[str, Any]:
@@ -332,6 +409,7 @@ async def extract_text_from_thread(
 
     workspace_id = str(thread.get("workspace_id", ""))
     zone = user_zone(timezone)
+    where = await _placement(workspace_id)
 
     # The ledger routes live-vs-settled (v4 2.4): an in_progress row means
     # the turn is still streaming into Redis on SOME worker; anything else
@@ -355,14 +433,18 @@ async def extract_text_from_thread(
             thread_id, str(active_run["conversation_response_id"])
         )
         text = _truncate_single(
-            _run_block(active_run, _qualify_file_paths(text, workspace_id), zone)
+            _run_block(
+                active_run,
+                _qualify_file_paths(text, workspace_id, *where),
+                zone,
+            )
         )
     else:
         runs = await _runs_to_read(thread_id, turns)
         text = _join_recent_turns([
             _run_block(
                 run,
-                _qualify_file_paths(run["main_text"], workspace_id),
+                _qualify_file_paths(run["main_text"], workspace_id, *where),
                 zone,
             )
             for run in runs

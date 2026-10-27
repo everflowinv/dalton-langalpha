@@ -284,6 +284,8 @@ class TestExecuteCodeTool:
 
         class _Backend:
             livefs = None
+            provider = "docker"
+            channel = "docker"
             sandbox = SimpleNamespace(
                 config=SimpleNamespace(
                     security=SimpleNamespace(max_execution_time=300)
@@ -314,6 +316,8 @@ class TestExecuteCodeTool:
 
         class _Backend:
             livefs = None
+            provider = "docker"
+            channel = "docker"
             sandbox = None
 
             async def settled_livefs(self, workspace_id=None):

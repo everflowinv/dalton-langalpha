@@ -12,6 +12,10 @@ back in place and ``LEFTOVERS_KEEP_DAYS`` have passed, because the mirror
 leaves out dependency and version-control folders. A folder a rename cannot
 move (a Daytona sandbox restored from its archive) is copied aside instead, or,
 with no disk for the copy, deleted where it is, and the backup is all it keeps.
+On a machine its owner brought, the folder is theirs: what is set aside stays
+for good, and one with no room for its copy stays where it is and fails the
+move. Such a machine that is gone can be left behind: a move ``from_backup``
+never reaches it, and the target gets the last backup alone.
 """
 
 import asyncio
@@ -25,6 +29,7 @@ from typing import Any, AsyncIterator, Awaitable, Callable, Dict, Literal, Mappi
 from psycopg.errors import DeadlockDetected, SerializationFailure
 
 from ptc_agent.core.paths import workspace_root
+from ptc_agent.core.sandbox.providers import provider_class
 
 from src.server.database.computer import (
     DEFAULT_ROOT_DIR,
@@ -40,16 +45,20 @@ from src.server.database.workspace_folders import (
     workspace_folders_lock,
 )
 from src.server.database.workspace_move import (
+    LEFT_FOLDER_RETRY_S,
     advance_workspace_move,
+    claim_folders_left_in_place,
     commit_workspace_move,
     fail_stale_early_moves,
     finish_workspace_move,
     flag_rollback_restore,
     get_workspace_move,
     heartbeat_workspace_move,
+    left_folder_taken,
     list_moves_with_leftovers,
     mark_leftovers_removed,
     mark_move_restored,
+    set_left_folder_aside,
     stage_workspace_move,
     take_over_stale_moves,
 )
@@ -58,6 +67,7 @@ from src.server.services.computer_errors import ComputerBusyError
 from src.server.services.computer_manager._folders import _run_folder_script
 from src.server.services.persistence.transfer import SYNC_MARKER_NAME
 from src.server.services.workspace_move import (
+    MoveNoRoom,
     MoveSourceUnavailable,
     move_error,
     move_error_detail,
@@ -85,6 +95,10 @@ _FOLDER_HOLD_RETRY_S = 0.5
 # each resuming where the last stopped: a few minutes, for a large folder.
 _SET_ASIDE_PASSES = 8
 _NO_ROOM = object()
+# The most one try at a folder a move from the backup left may take, its dial
+# and passes included, leaving room for a cancelled pass to be outlasted. Under
+# the claim's retry, so no other worker claims the row while this one is at it.
+_LEFT_FOLDER_TRY_S = LEFT_FOLDER_RETRY_S * 2 // 3
 
 
 @asynccontextmanager
@@ -225,13 +239,22 @@ class WorkspaceMoveMixin:
         move_id = str(move["move_id"])
         runner = str(move["runner_id"])
         source = str(move["source_computer_id"])
+        from_backup = bool(move.get("from_backup"))
         async with self._move_heartbeat(move_id, runner, source) as lost:
             try:
-                session = await self._wake_move_source(source, str(move["user_id"]))
+                session = (
+                    None
+                    if from_backup
+                    else await self._wake_move_source(source, str(move["user_id"]))
+                )
                 async with self._machine_decision_lock(source) as acquired:
                     if not acquired:
                         raise ComputerBusyError("the source computer is busy")
-                    staged = await self._back_up_and_set_aside(move, session, lost)
+                    staged = (
+                        await self._stage_from_backup(move)
+                        if from_backup
+                        else await self._back_up_and_set_aside(move, session, lost)
+                    )
                     committed = await self._commit_move(staged) if staged else None
             except BaseException as exc:
                 await asyncio.shield(self._abort_move(move_id, runner, exc))
@@ -278,7 +301,29 @@ class WorkspaceMoveMixin:
             computer.get("root_dir") or DEFAULT_ROOT_DIR,
             back_up,
             lost,
+            owner_machine=not provider_class(computer["kind"]).recreatable,
         )
+
+    async def _stage_from_backup(
+        self, move: Mapping[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        """The staged row for a move that leaves its computer as it is; None if not ours.
+
+        Nothing is set aside, so a rollback has nothing to put back, and the
+        folder stays on the old machine under its name, its owner's.
+        """
+        move_id = str(move["move_id"])
+        runner = str(move["runner_id"])
+        workspace_id = str(move["workspace_id"])
+        if await advance_workspace_move(move_id, runner, "backing_up") is None:
+            return None
+        async with _folder_held(str(move["source_computer_id"]), workspace_id) as conn:
+            folder = await get_workspace_dir_name(workspace_id, conn=conn)
+            if not folder or not is_top_level(folder):
+                raise ComputerBusyError(f"the folder is mid-move ({folder!r})")
+            return await stage_workspace_move(
+                move_id, runner, source_folder=folder, leftovers_path=None
+            )
 
     async def _set_folder_aside(
         self,
@@ -287,6 +332,8 @@ class WorkspaceMoveMixin:
         root: str,
         back_up: Callable[..., Awaitable[bool]],
         lost: asyncio.Event,
+        *,
+        owner_machine: bool,
     ) -> Optional[Dict[str, Any]]:
         """Move the folder under ``_internal/leftovers`` on the source.
 
@@ -311,6 +358,14 @@ class WorkspaceMoveMixin:
             if staged is None:
                 return None
             moved = await _clear_move_folder(runtime, root, tombstone, folder, "copy")
+            if moved is _NO_ROOM and owner_machine:
+                # The backup lacks what may exist nowhere else (.git,
+                # dependencies), so on its owner's machine the folder stays
+                # whole under its name, and the rollback finds it there.
+                raise MoveNoRoom(
+                    f"no room on computer {move['source_computer_id']} "
+                    f"to copy {folder!r} aside"
+                )
             if moved is _NO_ROOM:
                 # The backup is all that is kept of it now, so it is taken
                 # again here: a file change that began before this hold may
@@ -476,7 +531,9 @@ class WorkspaceMoveMixin:
                 logger.warning("Could not publish the move of %s: %s", workspace_id, e)
         source = await get_computer(str(row["source_computer_id"]))
         if source is not None:
-            await self._refresh_source_grants(source, str(row["user_id"]))
+            if not row.get("from_backup"):
+                # A machine left behind is not dialled: it went unreachable.
+                await self._refresh_source_grants(source, str(row["user_id"]))
             from src.server.services.preview_capabilities import revoke
 
             # Revocation is per sandbox, so a sibling's preview mints a fresh
@@ -539,12 +596,103 @@ class WorkspaceMoveMixin:
         except Exception:
             logger.exception("Workspace move sweep failed")
 
+    async def set_aside_left_folders(self) -> None:
+        """Set aside the folders moves from the backup left, while any is due.
+
+        Run apart from the cleanup loop: each dials its owner's machine, which
+        may be dark or slow, and idle reaping must not wait on that. Every
+        worker runs this; the claim hands each row to one of them at a time.
+        """
+        while not self._shutdown:
+            try:
+                rows = await claim_folders_left_in_place()
+            except Exception:
+                logger.exception("Could not claim the folders moves left in place")
+                return
+            if not rows:
+                return
+            for row in rows:
+                try:
+                    await asyncio.wait_for(
+                        self._set_left_folder_aside(row), _LEFT_FOLDER_TRY_S
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "Could not set aside the folder move %s left: %r", row["move_id"], e
+                    )
+
+    async def _set_left_folder_aside(self, row: Mapping[str, Any]) -> None:
+        """Move a folder a move from the backup left under its name to the
+        move's leftovers, once its computer runs again.
+
+        Its sync marker would vouch for a stale copy to anything bound to the
+        name, so the move holds the name until then. Kept, as any move's
+        leftovers are on the owner's machine, since the backup lacks its .git
+        and dependencies.
+        """
+        move_id = str(row["move_id"])
+        folder = row.get("source_folder")
+        if row["source_gone"] or not folder or not is_top_level(folder):
+            await set_left_folder_aside(move_id, None)
+            return
+        source = str(row["source_computer_id"])
+        computer = await get_computer(source)
+        provider_ref = _running_ref(computer)
+        if provider_ref is None:
+            return
+        root = computer.get("root_dir") or DEFAULT_ROOT_DIR
+        # Not waited for, as a settle holding it would only be in the way.
+        async with self._detached_runtime(
+            provider_ref, binding=self._binding_from_computer("", computer)
+        ) as runtime, workspace_folders_lock(source, wait_s=0) as conn:
+            if conn is None:
+                return
+            if await left_folder_taken(conn, source, folder):
+                moved = None
+            else:
+                moved = await _clear_move_folder(
+                    runtime, root, f"move-{move_id}", folder, "copy"
+                )
+        if moved is _NO_ROOM:
+            logger.warning(
+                "No room on computer %s to set aside %r, left by move %s; its name stays held",
+                source, folder, move_id,
+            )
+            return
+        await set_left_folder_aside(move_id, moved)
+        if moved is None:
+            logger.info(
+                "Released %r on computer %s, held for move %s: nothing of it is there",
+                folder, source, move_id,
+            )
+        else:
+            logger.info(
+                "Set aside %r on computer %s, left by move %s, at %s",
+                folder, source, move_id, moved,
+            )
+
     async def _reap_move_leftovers(self, row: Mapping[str, Any]) -> None:
         """Act on a folder a move left, as the listing decided.
 
         Only on a computer already running: none is started for this.
         """
         move_id = str(row["move_id"])
+        kind = row.get("source_kind")
+        if kind and not provider_class(kind).recreatable:
+            # The owner's machine, where what the mirror left out (.git,
+            # dependencies, large files) exists nowhere else; their computer's
+            # removal leaves it there too.
+            await mark_leftovers_removed(move_id)
+            logger.info(
+                "Kept %s on computer %s, its owner's machine, where move %s left it",
+                workspace_root(
+                    row.get("source_root_dir") or DEFAULT_ROOT_DIR,
+                    row["leftovers_path"],
+                ),
+                row["source_computer_id"],
+                move_id,
+            )
+            return
         if row["action"] == "source_gone":
             # Deleted with its sandbox, and the folder with it.
             await mark_leftovers_removed(move_id)

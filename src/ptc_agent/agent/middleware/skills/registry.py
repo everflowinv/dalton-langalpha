@@ -370,12 +370,6 @@ SKILL_REGISTRY: dict[str, SkillDefinition] = {
         command="competitive-analysis",
         requires=("research-conventions",),
     ),
-    "self-improve": SkillDefinition(
-        name="self-improve",
-        description="Report issues and propose fixes to improve your own capabilities when you encounter errors or limitations",
-        skill_md_path="skills/self-improve/SKILL.md",
-        command="report-issue",
-    ),
     "inline-widget": SkillDefinition(
         name="inline-widget",
         description="Inline HTML widgets: charts, dashboards, data tables rendered directly in the chat via ShowWidget",

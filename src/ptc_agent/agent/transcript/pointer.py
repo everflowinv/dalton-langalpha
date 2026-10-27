@@ -4,8 +4,9 @@ A summary alone reads as all that survived, so it names the transcript
 directory, the turns it covers, each turn's file beside the request that
 opened it, and how to search them, and the transcript is saved from the
 messages in hand before the summary is written. Only a sandbox
-the file mount serves has a transcript to point at, and only a save that
-landed, in a workspace folder whose links are in, is pointed at.
+the file mount serves, or one whose host serves past threads to the file tools
+(``HistoryFiles``), has a transcript to point at, and only a save that landed,
+where the tools can reach it, is pointed at.
 """
 
 from __future__ import annotations
@@ -14,7 +15,7 @@ import asyncio
 import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from langchain_core.messages import AnyMessage
 
@@ -25,7 +26,7 @@ from ptc_agent.agent.transcript.store import TranscriptTarget, segment_file
 
 if TYPE_CHECKING:
     from ptc_agent.agent.backends.sandbox import SandboxBackend
-    from ptc_agent.core.sandbox.livefs_mount import MountHandle
+    from ptc_agent.core.sandbox.livefs_mount import HistoryFiles, MountHandle, TranscriptReach
 
 logger = logging.getLogger(__name__)
 
@@ -119,14 +120,21 @@ class SummarySpan:
     gap: tuple[int, int] | None = None
 
 
-def _mount(backend: SandboxBackend | None) -> MountHandle | None:
-    return backend.livefs if backend is not None else None
+def _reach(backend: SandboxBackend | None) -> TranscriptReach | None:
+    return backend.transcripts if backend is not None else None
+
+
+def shell_reads_transcripts(backend: SandboxBackend | None) -> bool:
+    """Whether Bash and code see the transcript files: only where the mount
+    links them in, since the routes without it serve the file tools alone."""
+    reach = _reach(backend)
+    return reach is not None and reach.shell
 
 
 def transcript_target(
     backend: SandboxBackend | None, thread_id: str | None, checkpoint_ns: str = ""
 ) -> TranscriptTarget | None:
-    if not thread_id or _mount(backend) is None:
+    if not thread_id or _reach(backend) is None:
         return None
     return TranscriptTarget.for_agent(str(thread_id), checkpoint_ns)
 
@@ -142,7 +150,8 @@ async def aexport_transcript(
 ) -> TranscriptTarget | None:
     """Bring the transcript up to date within ``budget`` seconds (at most
     ``_EXPORT_TIMEOUT``); the one a summary may point at, or None unless the
-    save landed and the mount serves ``workspace_id``'s folder. Never raises.
+    save landed and the mount serves ``workspace_id``'s folder, or the host's
+    routes serve that folder's transcripts to the file tools. Never raises.
     ``window`` is what was trimmed from the head of ``messages``, whose
     files the store keeps.
 
@@ -152,17 +161,34 @@ async def aexport_transcript(
     folder's links and, unlike Bash, do not wait for links still going in, so
     a pointer is only as good as those links.
     """
-    mount = _mount(backend)
-    if backend is None or mount is None or transcript is None:
+    reach = _reach(backend)
+    if backend is None or reach is None or transcript is None:
+        return None
+    history = None if reach.shell else cast("HistoryFiles", reach.home)
+    if history is not None and not history.serves(workspace_id):
+        # Its routes were built without this folder, as when the computer's
+        # folders could not be read, so nothing would serve the directory.
+        logger.warning(
+            "[Compaction] transcript %s not pointed at: no route serves workspace %s",
+            transcript.directory,
+            workspace_id,
+        )
         return None
 
     async def save_and_settle() -> tuple[bool, MountHandle | None]:
         # A task group, not gather: when one fails, the other is cancelled
-        # rather than left saving past the timeout.
+        # rather than left saving past the timeout. The file tools read the
+        # routes' rows themselves, so only the mount has links to wait for.
         async with asyncio.TaskGroup() as group:
-            saved = group.create_task(mount.save_transcript(transcript, messages, window=window))
-            settled = group.create_task(backend.settled_livefs(workspace_id))
-        return saved.result(), settled.result()
+            saved = group.create_task(
+                reach.home.save_transcript(transcript, messages, window=window)
+            )
+            settled = (
+                group.create_task(backend.settled_livefs(workspace_id))
+                if reach.shell
+                else None
+            )
+        return saved.result(), settled.result() if settled is not None else None
 
     try:
         saved, settled = await asyncio.wait_for(
@@ -176,7 +202,7 @@ async def aexport_transcript(
     if not saved:
         logger.warning("[Compaction] transcript save for %s did not land", transcript.directory)
         return None
-    if settled is None:
+    if reach.shell and settled is None:
         logger.warning(
             "[Compaction] transcript %s saved, but workspace %s has no file mount links",
             transcript.directory,

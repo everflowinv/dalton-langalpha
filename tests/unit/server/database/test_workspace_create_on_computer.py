@@ -415,3 +415,53 @@ class TestAdoptingTheMachinesSandbox:
         db.fetchall = AsyncMock(return_value=[])
         await W.adopt_computer_sandbox_into_workspaces(COMPUTER_ID)
         assert "w.status NOT IN ('deleted', 'unbound')" in _sql(db)
+
+
+class TestDuplicateOwesItsRestore:
+    @pytest.mark.asyncio
+    async def test_the_copy_owes_its_files_in_the_transaction_that_publishes_it(
+        self, db
+    ):
+        """On a machine its owner brought, a folder without its files is
+        otherwise offered to the owner, who never removed anything from it."""
+        events = []
+        created = {"workspace_id": "ws-copy"}
+        with (
+            patch.object(
+                W,
+                "create_workspace_on_computer",
+                AsyncMock(side_effect=lambda *_a, **_k: events.append("create") or created),
+            ),
+            patch(
+                "src.server.database.workspace_file.copy_workspace_files",
+                AsyncMock(side_effect=lambda *_a, **_k: events.append("copy")),
+            ),
+            patch.object(
+                W,
+                "set_files_restore_incomplete",
+                AsyncMock(side_effect=lambda *_a, **_k: events.append("owed") or True),
+            ) as owed,
+        ):
+            assert await W.duplicate_workspace_on_computer(
+                "ws-source", "user-1", "Copy", COMPUTER_ID
+            ) is created
+
+        assert events == ["create", "copy", "owed"]
+        assert owed.await_args.args == ("ws-copy", True)
+        assert owed.await_args.kwargs["conn"] is not None
+
+
+class TestRestoreOfferSettle:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("restore", [True, False], ids=["restore", "keep"])
+    async def test_either_answer_is_a_new_arrival_of_the_files(self, db, restore):
+        """Every worker that attached the folder while the offer stood attaches
+        it again, laying the restore owed or queuing the bring-up held back,
+        rather than only the worker that took the answer."""
+        db.rowcount = 1
+        assert await W.settle_files_restore_offer("ws-1", restore=restore)
+
+        sql = _sql(db)
+        assert "files_epoch = gen_random_uuid()" in sql
+        assert ("files_restore_incomplete_at" in sql) is restore
+        assert "files_restore_offered_at IS NOT NULL" in sql

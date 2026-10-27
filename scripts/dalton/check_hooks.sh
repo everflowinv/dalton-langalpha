@@ -101,7 +101,6 @@ ALLOWED_HOOKS=(
   "fallback-reason-log"
   "sandbox-pip-system"
   "subagent-workspace-root"
-  "upstream-backport-596"
   "workspace-sharing-settings"
   "composer-drafts"
   "feishu-docs"

@@ -25,7 +25,6 @@ from src.server.database.workspace_move import (
     MoveRefused,
     advance_workspace_move,
     cancel_workspace_move,
-    claim_workspace_move,
     commit_workspace_move,
     finish_workspace_move,
     get_latest_workspace_move,
@@ -34,9 +33,10 @@ from src.server.database.workspace_move import (
     list_moves_with_leftovers,
     mark_leftovers_removed,
     mark_move_restored,
-    set_primary_computer,
     stage_workspace_move,
 )
+# The service layer's, which carry the providers' rule for the primary.
+from src.server.services.workspace_move import claim_workspace_move, set_primary_computer
 from src.server.database.workspace_folders import WorkspaceFolderMoving, workspace_folder_in_use
 from src.server.database.workspace_names import HOME_FOLDER
 
@@ -46,10 +46,12 @@ _WAITING = 1
 _DUE = LEFTOVERS_KEEP_DAYS + 1
 
 
-async def _computer(user_id, name, *, primary=False, status="running", built=True) -> str:
+async def _computer(
+    user_id, name, *, primary=False, status="running", built=True, kind="docker"
+) -> str:
     row = await create_computer(
         user_id,
-        kind="docker",
+        kind=kind,
         name=name,
         is_primary=primary,
         status=status,
@@ -364,6 +366,25 @@ async def test_make_primary_refuses_a_computer_that_is_gone_broken_or_building(
         with pytest.raises(MoveRefused) as refused:
             await set_primary_computer(user_id, target)
         assert refused.value.code == "target_unavailable"
+
+
+async def test_a_machine_its_owner_brought_never_becomes_primary(seed_user):
+    user_id = seed_user["user_id"]
+    primary, _ = await _machines(user_id)
+    owned = await _computer(user_id, "Owned", kind="ssh")
+    home = await _home_on(user_id, primary)
+
+    with pytest.raises(MoveRefused) as refused:
+        await set_primary_computer(user_id, owned)
+    assert refused.value.code == "not_primary"
+    await _refused(
+        "not_primary",
+        user_id=user_id,
+        workspace_id=home,
+        target_computer_id=owned,
+        make_primary=True,
+    )
+    assert await _is_primary(primary)
 
 
 # ---------------------------------------------------------------------------

@@ -6,6 +6,7 @@ import { Pin, Pencil, Copy, FolderOutput, Trash2 } from 'lucide-react';
 import { DropdownMenuItem, DropdownMenuSeparator } from '@/components/ui/dropdown-menu';
 import { toast } from '@/components/ui/use-toast';
 import { queryKeys } from '@/lib/queryKeys';
+import type { Computer } from '@/types/api';
 import { deleteWorkspace, duplicateWorkspace } from '../utils/api';
 import { entitlementErrorMessage } from '../utils/entitlementErrors';
 import { workspaceNameErrorMessage } from '../utils/workspaceName';
@@ -15,11 +16,12 @@ import { forgetSharedWorkspaceThreads } from '@/lib/navThreadsStore';
 import { removeStoredThreadId } from '../hooks/utils/threadStorage';
 import { useComputers } from '../hooks/useComputers';
 import { liveComputers, takesWorkspaces } from '../utils/computerStatus';
+import { providerKeepsFilesOnRemove } from './providerUi';
 import { clearAllMarketThreadsForWorkspace } from '../../MarketView/utils/threadPersistence';
 import { forgetNavPanelExpansion } from './navExpansionStore';
 import { lazyWithMotion } from '@/lib/lazyWithMotion';
 import { scrollMemory } from '@/lib/scrollMemory';
-import DeleteConfirmModal from './DeleteConfirmModal';
+import DeleteConfirmModal, { type OwnMachineFolder } from './DeleteConfirmModal';
 import DuplicateWorkspaceDialog from './DuplicateWorkspaceDialog';
 import { WorkspaceMoveOutcomes } from './WorkspaceMoveOutcomes';
 
@@ -36,6 +38,7 @@ export interface MenuWorkspace {
   is_pinned?: boolean;
   is_home?: boolean;
   computer_id?: string | null;
+  dir_name?: string | null;
   [key: string]: unknown;
 }
 
@@ -109,6 +112,18 @@ export function WorkspaceMenuItems<W extends MenuWorkspace>({
   );
 }
 
+/** Where a workspace's files are on a machine the user brought; null on every other computer. */
+function ownMachineFolder(
+  workspace: MenuWorkspace | null,
+  computers: readonly Computer[] | undefined,
+): OwnMachineFolder | null {
+  const computer = workspace?.computer_id
+    ? computers?.find((c) => c.computer_id === workspace.computer_id)
+    : undefined;
+  if (!computer || !workspace?.dir_name || !providerKeepsFilesOnRemove(computer.kind)) return null;
+  return { folder: `${computer.root_dir.replace(/\/+$/, '')}/${workspace.dir_name}`, computer: computer.name };
+}
+
 export interface WorkspaceActions {
   openDuplicate: (workspace: MenuWorkspace) => void;
   openMove: (workspace: MenuWorkspace) => void;
@@ -152,6 +167,14 @@ export function useWorkspaceActions({
   const [deleteTarget, setDeleteTarget] = useState<MenuWorkspace | null>(null);
   const [deleteBusy, setDeleteBusy] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [deleteFiles, setDeleteFiles] = useState(false);
+  // The list is usually cached already; the dialog only reads it. Until it
+  // answers, the dialog waits: it would word a machine the user brought as a
+  // hosted one, whose folder goes, and send the delete that keeps it. A list
+  // that fails to load gets the general warning.
+  const computerList = useComputers({ enabled: !!deleteTarget?.computer_id });
+  const deleteOwnMachine = ownMachineFolder(deleteTarget, computerList.data?.computers);
+  const deleteWaiting = !!deleteTarget?.computer_id && computerList.isPending;
 
   const handleDuplicateConfirm = async () => {
     if (!duplicateTarget || duplicateBusy) return;
@@ -181,7 +204,8 @@ export function useWorkspaceActions({
     setDeleteBusy(true);
     setDeleteError(null);
     try {
-      await deleteWorkspace(wsId);
+      // Only a choice the dialog offered: elsewhere the server deletes the folder anyway.
+      await deleteWorkspace(wsId, { deleteFiles: !!deleteOwnMachine && deleteFiles });
       // Same cleanup set as the gallery's delete: stored thread pointers
       // (chat + market), remembered tree expansion, frozen nav orders, and the
       // shared thread lists — so nothing re-expands or 404s a dead workspace.
@@ -227,12 +251,15 @@ export function useWorkspaceActions({
           each one is handed out once however many are mounted. */}
       <WorkspaceMoveOutcomes />
       <DeleteConfirmModal
-        isOpen={!!deleteTarget}
+        isOpen={!!deleteTarget && !deleteWaiting}
         workspaceName={deleteTarget?.name || ''}
         onConfirm={() => void handleConfirmDelete()}
         onCancel={() => { setDeleteTarget(null); setDeleteError(null); }}
         isDeleting={deleteBusy}
         error={deleteError}
+        ownMachine={deleteOwnMachine}
+        deleteFiles={deleteFiles}
+        onDeleteFilesChange={setDeleteFiles}
       />
     </>
   );
@@ -242,7 +269,7 @@ export function useWorkspaceActions({
   const actions = useMemo<Omit<WorkspaceActions, 'dialogs'>>(() => ({
     openDuplicate: setDuplicateTarget,
     openMove: setMoveTarget,
-    openDelete: (ws) => { setDeleteTarget(ws); setDeleteError(null); },
+    openDelete: (ws) => { setDeleteTarget(ws); setDeleteError(null); setDeleteFiles(false); },
   }), []);
 
   return { ...actions, dialogs };

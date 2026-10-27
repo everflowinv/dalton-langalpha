@@ -1190,7 +1190,7 @@ class TestDockerRuntimeSessions:
         cmd = call_args[1].get("cmd", call_args[0][0] if call_args[0] else None)
         cmd_str = cmd[-1] if isinstance(cmd, list) else str(cmd)
         assert "base64" in cmd_str
-        assert "nohup setsid" in cmd_str
+        assert "L=setsid" in cmd_str and "nohup $L bash" in cmd_str
 
     @pytest.mark.asyncio
     async def test_session_command_logs_finished(self, runtime):
@@ -1319,10 +1319,11 @@ class TestDockerRuntimeSessions:
             await runtime.session_command_logs("../evil", "abc12345")
 
 
-def _stat_line(pid: int, start: int) -> str:
-    """A /proc/<pid>/stat line whose start time (field 22) is ``start``,
-    behind a command name with the spaces and parens one may hold."""
-    return f"{pid} (a) b (c) S {' '.join(['0'] * 18)} {start} 0 0\n"
+def _stat_line(pid: int, start: int, pgrp: int = 0) -> str:
+    """A /proc/<pid>/stat line whose start time (field 22) is ``start`` and
+    group (field 5) ``pgrp``, behind a command name with the spaces and parens
+    one may hold."""
+    return f"{pid} (a) b (c) S 0 {pgrp} {' '.join(['0'] * 16)} {start} 0 0\n"
 
 
 class TestDockerSessionsAcrossRestartsAndPidReuse:
@@ -1351,6 +1352,14 @@ class TestDockerSessionsAcrossRestartsAndPidReuse:
             (proc / str(pid)).mkdir(exist_ok=True)
             (proc / str(pid) / "stat").write_text(_stat_line(pid, start))
 
+        def add_member(pgrp: int, environ: bytes) -> None:
+            """A process in group ``pgrp`` with ``environ``, under a pid no
+            test records."""
+            member = proc / "424242"
+            member.mkdir()
+            (member / "stat").write_text(_stat_line(424242, 400, pgrp=pgrp))
+            (member / "environ").write_bytes(environ)
+
         def record(run: int, pid: int, start: int) -> None:
             """A command whose wrapper wrote no exit code."""
             session = sessions / f"run-{run}" / self.SID
@@ -1363,7 +1372,12 @@ class TestDockerSessionsAcrossRestartsAndPidReuse:
         runtime.exec = local_exec
         victim = subprocess.Popen(["sleep", "30"], start_new_session=True)
         yield SimpleNamespace(
-            runtime=runtime, sessions=sessions, set_start=set_start, record=record, victim=victim
+            runtime=runtime,
+            sessions=sessions,
+            set_start=set_start,
+            add_member=add_member,
+            record=record,
+            victim=victim,
         )
         victim.kill()
         victim.wait()
@@ -1421,14 +1435,34 @@ class TestDockerSessionsAcrossRestartsAndPidReuse:
 
     @pytest.mark.asyncio
     async def test_a_finished_commands_leftovers_go_with_its_session(self, machine):
-        """With the wrapper gone and its pid not reused, a group by that id
-        holds what the command left running."""
+        """With the wrapper gone, a group by its id whose member carries the
+        command's mark holds what the command left running."""
         runtime, victim = machine.runtime, machine.victim
         machine.set_start(1, 200)
         machine.record(200, victim.pid, 300)
+        machine.add_member(
+            victim.pid, f"PATH=/bin\0LANGALPHA_EXEC={victim.pid}-300\0".encode()
+        )
 
         await runtime.delete_session(self.SID)
         assert victim.wait(timeout=5) is not None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("mark", ["", "LANGALPHA_EXEC={pid}-299\0"])
+    async def test_a_group_that_took_a_finished_commands_id_is_not_signalled(
+        self, machine, mark
+    ):
+        """Once the command's group emptied, its id could go to someone else's:
+        a group by that id carrying no mark, or another command's, is not its."""
+        runtime, victim = machine.runtime, machine.victim
+        machine.set_start(1, 200)
+        machine.record(200, victim.pid, 300)
+        machine.add_member(
+            victim.pid, f"PATH=/bin\0{mark.format(pid=victim.pid)}".encode()
+        )
+
+        await runtime.delete_session(self.SID)
+        assert victim.poll() is None
 
 
 # ---------------------------------------------------------------------------

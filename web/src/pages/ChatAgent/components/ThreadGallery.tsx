@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import { ArrowLeft, Folder, FileText, Archive } from 'lucide-react';
 import { Loader } from '@/components/ui/loader';
+import { cn } from '@/lib/utils';
 import { useIsMobile } from '@/hooks/useIsMobile';
 import { useWorkspaceLabel } from '@/hooks/useWorkspaceLabel';
 import { HomeRowIcon } from '@/hooks/useHomeWorkspace';
@@ -172,6 +173,11 @@ function ThreadGallery({ workspaceId, onBack, onThreadSelect }: ThreadGalleryPro
   const [showFilePanel, setShowFilePanel] = useState(false);
   const [showSandboxPanel, setShowSandboxPanel] = useState(false);
   const [filePanelWidth, setFilePanelWidth] = useState(850);
+  // Expanded, the panel lies over the whole gallery, as it does over a chat.
+  // Closing the panel ends it, so the next open starts beside the cards.
+  const [panelExpanded, setPanelExpanded] = useState(false);
+  if (panelExpanded && (!showFilePanel || isMobile)) setPanelExpanded(false);
+  const handleTogglePanelExpanded = useCallback(() => setPanelExpanded((v) => !v), []);
   // Show system files in FilePanel (.agents/, code/, tools/, etc.)
   const [showSystemFiles, setShowSystemFiles] = useState(
     () => localStorage.getItem('filePanel.showSystemFiles') === 'true'
@@ -716,8 +722,9 @@ function ThreadGallery({ workspaceId, onBack, onThreadSelect }: ThreadGalleryPro
         backgroundColor: 'var(--color-bg-page)',
       }}
     >
-      {/* Main Content Area */}
-      <div className="flex-1 flex flex-col overflow-hidden">
+      {/* Main Content Area. Inert and isolated under an expanded panel, as
+          the chat is in ChatView. */}
+      <div className={cn('flex-1 flex flex-col overflow-hidden', panelExpanded && 'isolate')} inert={panelExpanded}>
         {/* Back Button - Fixed at top left. Doubles as this route's drag region
             in the desktop shell: it is the top bar the content column already
             has, so it costs no layout, and the back button wins its own clicks
@@ -971,17 +978,25 @@ function ThreadGallery({ workspaceId, onBack, onThreadSelect }: ThreadGalleryPro
             className={isMobile ? 'flex overflow-hidden' : 'flex shrink-0 overflow-hidden'}
             style={isMobile ? { position: 'absolute', inset: 0, zIndex: 30 } : undefined}
           >
-            {!isMobile && (
+            {!isMobile && !panelExpanded && (
               <div
                 className="w-[4px] bg-transparent hover:bg-foreground/20 cursor-col-resize shrink-0 transition-colors"
                 onMouseDown={handleDividerMouseDown}
               />
             )}
-            <div className="shrink-0" style={{ width: isMobile ? '100%' : filePanelWidth }}>
+            {/* Expanded, the panel lies over the gallery while the wrapper
+                keeps its width in the row, so the panel stays the same
+                element and a running app's iframe does not reload. */}
+            <div
+              className={panelExpanded ? 'absolute inset-0 z-10' : 'shrink-0'}
+              style={panelExpanded ? undefined : { width: isMobile ? '100%' : filePanelWidth }}
+            >
               <WorkspaceProvider workspaceId={shownWorkspaceId} downloadFile={null} folders={panelFolders}>
               <FilePanel
                 workspaceId={shownWorkspaceId ?? workspaceId}
                 onClose={() => setShowFilePanel(false)}
+                expanded={panelExpanded}
+                onToggleExpanded={isMobile ? null : handleTogglePanelExpanded}
                 onLeaveGuardChange={handleFilesLeaveGuardChange}
                 target={panelTarget}
                 onTargetHandled={handleTargetHandled}

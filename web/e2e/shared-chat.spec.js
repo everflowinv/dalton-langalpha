@@ -212,4 +212,30 @@ test.describe('SharedChat page', () => {
     // Verify file name appears in the panel
     await expect(page.getByText('analysis.py')).toBeVisible({ timeout: 10000 });
   });
+
+  // The shared view, unlike the owner's chat, stays mounted across the mobile
+  // breakpoint, so the expansion has to end there itself.
+  test('an expanded file panel opens beside the chat again after the window passes through mobile width', async ({ page }) => {
+    await page.setViewportSize({ width: 1280, height: 720 });
+    await setupStandardScenarios({ ...sharedMetadata, permissions: { allow_files: true, allow_download: true } });
+    await configureSSE({
+      method: 'GET',
+      path: `/api/v1/public/shared/${TOKEN}/files`,
+      json: { path: '.', files: ['analysis.py'], source: 'workspace' },
+      status: 200,
+    });
+
+    await page.goto(`/s/${TOKEN}`);
+    await expect(page.locator('h1')).toHaveText('Research', { timeout: 10000 });
+    await page.locator('button[title="Workspace Files"]').click();
+    await page.getByRole('button', { name: 'Expand panel' }).click();
+    await expect(page.getByRole('button', { name: 'Show chat' })).toBeVisible();
+
+    await page.setViewportSize({ width: 600, height: 720 });
+    await expect(page.getByRole('button', { name: 'Show chat' })).toHaveCount(0);
+    await page.setViewportSize({ width: 1280, height: 720 });
+
+    await expect(page.getByRole('button', { name: 'Expand panel' })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Show chat' })).toHaveCount(0);
+  });
 });

@@ -20,6 +20,7 @@ import { cn } from '@/lib/utils';
 import { createValueStore } from '@/lib/valueStore';
 import type { Computer, ComputerDiskLevel } from '@/types/api';
 
+import { providerManagesSpec } from './providerUi';
 import { openComputerSpec, openComputersPanel } from '../hooks/computerPanelStore';
 import { diskLevelRank, isDiskAlertLevel, nextTier } from './computerDiskUi';
 import { activeSpecChange, effectiveTier, SpecChangeProgress } from './specChangeUi';
@@ -148,7 +149,7 @@ export function DiskWarning({ computer, className }: DiskWarningProps) {
   // offering it again would only earn a 409. The top tier has nothing bigger.
   const changeSpec = specChange ? (
     <SpecChangeProgress change={specChange} className="text-xs" />
-  ) : nextTier(effectiveTier(computer)) ? (
+  ) : providerManagesSpec(computer.kind) && nextTier(effectiveTier(computer)) ? (
     <Button size="sm" className={ACTION_CLASS} onClick={() => openComputerSpec(computer.computer_id)}>
       {t('workspace.changeSpec', 'Change spec')}
     </Button>

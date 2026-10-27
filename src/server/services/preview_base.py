@@ -11,9 +11,13 @@ import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 from functools import lru_cache
+from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 
 from tld import get_fld
+
+if TYPE_CHECKING:
+    from ptc_agent.config.core import SandboxConfig
 
 __all__ = [
     "PreviewBase",
@@ -21,6 +25,7 @@ __all__ = [
     "check_preview_proxy_config",
     "parse_preview_base",
     "preview_base",
+    "preview_proxy_requirements",
 ]
 
 # ``<port>-<token>``, the token as a capability is minted: 32 lowercase base32
@@ -183,28 +188,47 @@ def preview_base() -> PreviewBase | None:
     return _parsed(env.PREVIEW_PROXY_BASE_URL)
 
 
+def preview_proxy_requirements(sandbox: SandboxConfig) -> tuple[str, ...]:
+    """The settings under which previews must go through the proxy, as config names them.
+
+    A private E2B computer's ports answer only with a traffic header the
+    proxy adds. An SSH machine's ports are forwarded over the server's own
+    connection, so no browser can reach them without it. These read the
+    settings, not the fleet: a private E2B computer stays private after
+    ``public_traffic`` turns true, and an SSH computer outlives ``ssh``
+    leaving ``offered_providers``.
+    """
+    reasons = []
+    if not sandbox.e2b.public_traffic:
+        reasons.append("sandbox.e2b.public_traffic is false")
+    if "ssh" in sandbox.offered_providers:
+        reasons.append("sandbox.offered_providers includes ssh")
+    return tuple(reasons)
+
+
 def check_preview_proxy_config(
-    *, requires_proxy: bool, app_urls: Iterable[str]
+    *, proxy_required_by: Iterable[str], app_urls: Iterable[str]
 ) -> None:
     """Refuse a deployment whose previews could not be served, or not safely.
 
-    *requires_proxy* says private E2B computers are configured, which without
-    a base would mint nothing a browser could open. That holds whatever the
-    default provider is, since a computer bound to E2B is built from the E2B
-    settings on any deployment. It reads the setting, not the fleet: a computer
-    created while it was false stays private after it turns true. A base that
-    contains the app's own host would claim every request to the app as a
-    preview. A base on the app's site would let preview code read cookies the
-    app scopes to its domain and set ones the app then receives, so the base
-    must be a registrable domain of its own; only local names, which share
-    no cookies a deployment cares about, are exempt.
+    *proxy_required_by* names the settings, from
+    :func:`preview_proxy_requirements`, under which a preview link without a
+    base would be one no browser could open; any of them makes the base
+    required, whatever the default provider is, since a computer is built
+    from its own kind's settings on any deployment. A base that contains the
+    app's own host would claim every request to the app as a preview. A base
+    on the app's site would let preview code read cookies the app scopes to
+    its domain and set ones the app then receives, so the base must be a
+    registrable domain of its own; only local names, which share no cookies a
+    deployment cares about, are exempt.
     """
     base = preview_base()
     if base is None:
-        if requires_proxy:
+        reasons = tuple(proxy_required_by)
+        if reasons:
             raise PreviewProxyConfigurationError(
-                "sandbox.e2b.public_traffic is false, so previews must go "
-                "through the preview proxy; set PREVIEW_PROXY_BASE_URL"
+                f"{' and '.join(reasons)}, so previews must go through the "
+                "preview proxy; set PREVIEW_PROXY_BASE_URL"
             )
         return
     for url in app_urls:

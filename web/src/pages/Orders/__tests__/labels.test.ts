@@ -70,8 +70,8 @@ describe('order label keys', () => {
     });
   }
 
-  it('covers all fourteen attempt statuses', () => {
-    expect(Object.keys(ORDER_STATUS_KEY)).toHaveLength(14);
+  it('covers all fifteen attempt statuses', () => {
+    expect(Object.keys(ORDER_STATUS_KEY)).toHaveLength(15);
   });
 
   // Three of the five are durations vendors added after the ledger shipped,
@@ -111,6 +111,16 @@ describe('what a staged order is called', () => {
     }
   });
 
+  it('names the broker a handed-off instruction left, or drops it', () => {
+    expect(orderStatusLabel('handed_off', 'staged', 'Interactive Brokers')).toEqual({
+      key: 'toolArtifact.directTool.orderStatus.handedOffStaged',
+      params: { vendor: 'Interactive Brokers' },
+    });
+    expect(orderStatusLabel('handed_off', 'staged', null)).toEqual({
+      key: 'toolArtifact.directTool.orderStatus.handedOffStagedUnnamed',
+    });
+  });
+
   it('shortens to "Staged" on a row, and only there', () => {
     expect(orderStatusShortLabel('submitted', 'staged')).toBe(
       'toolArtifact.directTool.orderStatusShort.submittedStaged',
@@ -130,7 +140,7 @@ describe('what a staged order is called', () => {
 
   it('leaves every other staged state on the word it had', () => {
     for (const status of ORDER_STATUSES) {
-      if (status === 'submitted') continue;
+      if (status === 'submitted' || status === 'handed_off') continue;
       expect(orderStatusLabel(status, 'staged', 'Interactive Brokers')).toEqual({
         key: ORDER_STATUS_KEY[status],
       });

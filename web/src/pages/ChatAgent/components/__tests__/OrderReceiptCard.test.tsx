@@ -133,6 +133,7 @@ const STATUSES: OrderStatus[] = [
   'filled',
   'cancelled',
   'rejected_by_vendor',
+  'handed_off',
   'failed',
   'unknown',
 ];
@@ -659,6 +660,15 @@ describe('what a staged order says it is waiting on', () => {
     );
     expect(screen.getByTestId('order-status-submitted')).not.toHaveTextContent(
       'Staged',
+    );
+  });
+
+  it('says a handed-off instruction left the broker, not that it was sent', () => {
+    shipped.brokerages = [{ name: 'ibkr', label: 'Interactive Brokers' }];
+    renderWithProviders(<OrderReceiptCard artifact={stagedArtifact('handed_off')} />);
+
+    expect(screen.getByTestId('order-status-handed_off')).toHaveTextContent(
+      'toolArtifact.directTool.orderStatus.handedOffStaged',
     );
   });
 

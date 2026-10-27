@@ -52,6 +52,11 @@ class AttemptStatus(StrEnum):
     PARTIALLY_FILLED = "partially_filled"
     FILLED = "filled"
     CANCELLED = "cancelled"
+    # A staged instruction the vendor stopped listing: a person sent it, deleted
+    # it or let it expire in the vendor's own client, which does not say which.
+    # Only a person there can trade one, so that is where its outcome is
+    # recorded and where the ledger's part ends.
+    HANDED_OFF = "handed_off"
     REJECTED_BY_VENDOR = "rejected_by_vendor"
     FAILED = "failed"
     UNKNOWN = "unknown"
@@ -78,6 +83,7 @@ TERMINAL_STATUSES: tuple[AttemptStatus, ...] = (
     AttemptStatus.REFUSED,
     AttemptStatus.FILLED,
     AttemptStatus.CANCELLED,
+    AttemptStatus.HANDED_OFF,
     AttemptStatus.REJECTED_BY_VENDOR,
     AttemptStatus.FAILED,
 )

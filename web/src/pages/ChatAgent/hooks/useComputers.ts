@@ -8,19 +8,23 @@
  */
 import { useCallback, useEffect, useMemo, useSyncExternalStore } from 'react';
 
-import { QueryClient, useQuery, useQueryClient } from '@tanstack/react-query';
+import { QueryClient, queryOptions, useQuery, useQueryClient } from '@tanstack/react-query';
 
 import { registerAuthReset } from '@/lib/authResets';
 import { queryKeys } from '@/lib/queryKeys';
-import type { Computer, ComputerStorage, ComputersResponse } from '@/types/api';
+import type { Computer, ComputerStorage, ComputersResponse, SshPairingStatus } from '@/types/api';
 
 import {
+  createSshPairing,
   getComputerProviders,
   getComputerStorage,
   getComputers,
+  getSshKey,
+  getSshPairing,
   streamComputerEvents,
   streamWorkspaceEvents,
 } from '../utils/api';
+import { apiErrorStatus } from '../utils/api/errors';
 import {
   cachedWorkspaceLists,
   patchComputerStatusInCaches,
@@ -72,15 +76,45 @@ function cachedComputerStatus(queryClient: QueryClient, computerId: string): str
  * status frame names its outcome, so the list re-reads itself while any row
  * has one in progress. Observers share the timer: every fetch resets them all.
  */
-export function useComputers(options: { enabled?: boolean } = {}) {
-  return useQuery({
+function computersList() {
+  return queryOptions({
     queryKey: queryKeys.computers.lists(),
     queryFn: getComputers,
-    enabled: options.enabled ?? true,
     staleTime: 30_000,
     refetchInterval: (query) =>
       query.state.data?.computers.some((c) => activeSpecChange(c)) ? SPEC_CHANGE_POLL_MS : false,
   });
+}
+
+export function useComputers(options: { enabled?: boolean } = {}) {
+  return useQuery({ ...computersList(), enabled: options.enabled ?? true });
+}
+
+/**
+ * The root a computer keeps its workspace folders under, off the shared list.
+ * Selected, so a refetch that only moved a status leaves its readers alone.
+ */
+export function useComputerRootDir(computerId: string | null | undefined): string | undefined {
+  const { data } = useQuery({
+    ...computersList(),
+    enabled: !!computerId,
+    select: (list) => list.computers.find((c) => c.computer_id === computerId)?.root_dir,
+  });
+  return data;
+}
+
+/**
+ * Every computer's root, off the shared list. A workspace moves between
+ * computers with its folder, so an older turn's absolute path can start at a
+ * root it has since left. Selected like the one above.
+ */
+export function useComputerRootDirs(options: { enabled: boolean }): readonly string[] | undefined {
+  const { data } = useQuery({
+    ...computersList(),
+    enabled: options.enabled,
+    select: (list) => list.computers.map((c) => c.root_dir),
+  });
+  return data;
 }
 
 /**
@@ -425,4 +459,74 @@ function useUnboundTransitionalWorkspaceKey(): string {
   }, [queryClient]);
 
   return useSyncExternalStore(subscribe, getKey);
+}
+
+/** The key to authorize on the user's machine; fetched once the user connects by hand. */
+export function useSshKey(options: { enabled: boolean }) {
+  return useQuery({
+    queryKey: queryKeys.computers.sshKey(),
+    queryFn: () => getSshKey(),
+    enabled: options.enabled,
+    staleTime: Infinity,
+    retry: false,
+  });
+}
+
+/** How often a pairing is re-read while the machine has not been reached. */
+export const SSH_PAIRING_POLL_MS = 2000;
+
+/**
+ * The pairing the open form shows, minted once and kept while it is mounted.
+ *
+ * A query rather than a mutation so a re-render, or a remount in development,
+ * reuses the one in flight instead of minting another. Never refetched on its
+ * own: a new command replaces the one the user may already have pasted, so
+ * only an expiry or "use a different machine" asks for one. Dropped on unmount,
+ * so the next opening starts a fresh pairing.
+ */
+export function useSshPairingMint(options: { enabled: boolean }) {
+  return useQuery({
+    queryKey: queryKeys.sshPairings.mint(),
+    queryFn: () => createSshPairing(),
+    enabled: options.enabled,
+    staleTime: Infinity,
+    gcTime: 0,
+    retry: false,
+    refetchOnWindowFocus: false,
+    refetchOnReconnect: false,
+  });
+}
+
+/**
+ * Still worth asking about: the machine may check in, or check in again after
+ * a fix. A machine reached but unable to host a computer is ready too, and the
+ * same command run again once its owner fixes it moves the pairing on.
+ */
+export function sshPairingPending(status: SshPairingStatus | undefined): boolean {
+  return !status || status.status !== 'ready' || !status.probe?.supported;
+}
+
+/**
+ * A pairing's status, re-read every couple of seconds until it is ready.
+ * `paused` holds the polling while a connect of our own is in flight, whose
+ * answer is written straight into this entry; a poll that crossed it would
+ * put the older state back. A 404 stops it: the pairing is gone, and the
+ * caller mints another.
+ */
+export function useSshPairingStatus(token: string | null, options: { enabled: boolean; paused: boolean }) {
+  return useQuery({
+    queryKey: queryKeys.sshPairings.status(token ?? ''),
+    queryFn: () => getSshPairing(token as string),
+    enabled: options.enabled && !!token,
+    // A ready pairing is settled: read again on a refocus after its 15
+    // minutes, it would answer 404 and take the summary away from the user.
+    staleTime: (query) => (sshPairingPending(query.state.data) ? 0 : Infinity),
+    gcTime: 0,
+    retry: false,
+    refetchInterval: (query) => {
+      if (options.paused) return false;
+      if (query.state.status === 'error' && apiErrorStatus(query.state.error) === 404) return false;
+      return sshPairingPending(query.state.data) ? SSH_PAIRING_POLL_MS : false;
+    },
+  });
 }

@@ -838,9 +838,10 @@ class FolderSettleMixin:
                             "source": t.source,
                             "staged": t.staged,
                             "landings": list(t.landings),
-                            # Nothing of a deleted workspace is kept, so a
-                            # folder a rename cannot move is deleted where it is.
-                            "stuck": "delete",
+                            # A folder a rename cannot move is deleted where
+                            # it is, unless its owner kept it: that one is
+                            # copied aside, or stays put with no room to.
+                            "stuck": "copy" if t.kept else "delete",
                         }
                         for t in plan.tombstones
                     ],

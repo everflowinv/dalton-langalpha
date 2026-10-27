@@ -1142,7 +1142,10 @@ async def computer_has_active_run(computer_id: str) -> bool:
 
 
 async def get_latest_attempt(
-    thread_id: str, *, before_turn: Optional[int] = None
+    thread_id: str,
+    *,
+    before_turn: Optional[int] = None,
+    wait_for_finalize: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """The thread's most recent attempt row — /retry's validation target.
 
@@ -1153,12 +1156,17 @@ async def get_latest_attempt(
     ``before_turn`` narrows the search to attempts of earlier turns: a fork
     from turn N discards N and everything after it, so its predecessor is the
     latest attempt that will survive, not the latest attempt there is.
+
+    ``wait_for_finalize`` reads the row ``FOR SHARE``, which waits out a
+    finalize in flight: its terminal CAS holds the row until it commits, so
+    a run whose finalize has already run its release pass never reads live.
     """
     clauses = ["conversation_thread_id = %s"]
     params: list[Any] = [thread_id]
     if before_turn is not None:
         clauses.append("turn_index < %s")
         params.append(before_turn)
+    lock = "FOR SHARE" if wait_for_finalize else ""
     async with pool.get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
@@ -1167,6 +1175,7 @@ async def get_latest_attempt(
                 WHERE {" AND ".join(clauses)}
                 ORDER BY run_seq DESC
                 LIMIT 1
+                {lock}
                 """,
                 tuple(params),
             )

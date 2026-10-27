@@ -35,6 +35,7 @@ import {
   createComputer,
   deleteComputer,
   getComputers,
+  setComputerFilesBackup,
   startComputer,
   stopComputer,
   streamComputerEvents,
@@ -137,6 +138,18 @@ describe('createComputer', () => {
     expect(mockPost.mock.calls[0][1]).toEqual({ resource_tier: 'standard' });
   });
 
+  it('carries the backup choice for a machine the user brings, off included', async () => {
+    mockPost.mockResolvedValueOnce({ data: {} });
+    const ssh = {
+      host: '198.51.100.7', port: 22, username: 'me',
+      host_key: 'ssh-ed25519 AAAAC3Nz', root_dir: '/home/me/langalpha',
+    };
+    await createComputer({ name: 'devbox', kind: 'ssh', ssh, files_backup: false });
+    expect(mockPost.mock.calls[0][1]).toEqual({
+      name: 'devbox', resource_tier: 'standard', kind: 'ssh', ssh, files_backup: false,
+    });
+  });
+
   it('lets a 429 through with the interceptor-attached quota body intact', async () => {
     const denial = Object.assign(new Error('Request failed'), {
       status: 429,
@@ -153,6 +166,24 @@ describe('createComputer', () => {
       status: 429,
       rateLimitInfo: { message: 'You have reached the 3 workspace limit on the Starter plan.' },
     });
+  });
+});
+
+describe('setComputerFilesBackup', () => {
+  it('posts the switch to the computer route and answers the updated row', async () => {
+    mockPost.mockResolvedValueOnce({ data: { computer_id: 'c1', kind: 'ssh', files_backup: false } });
+    const row = await setComputerFilesBackup('c1', false);
+    expect(mockPost).toHaveBeenCalledWith(
+      '/api/v1/computers/c1/files-backup',
+      { enabled: false },
+      expect.objectContaining({ timeout: expect.any(Number) }),
+    );
+    expect(row.files_backup).toBe(false);
+  });
+
+  it('refuses an empty id rather than posting to a route with a hole in it', async () => {
+    await expect(setComputerFilesBackup('', true)).rejects.toThrow('Computer ID is required');
+    expect(mockPost).not.toHaveBeenCalled();
   });
 });
 
@@ -182,14 +213,16 @@ describe('start/stop', () => {
 });
 
 describe('deleteComputer', () => {
-  it('deletes the computer route, which answers 204 with no body', async () => {
-    mockDelete.mockResolvedValueOnce({ data: '', status: 204, headers: {} });
-    await expect(deleteComputer('c1')).resolves.toBeUndefined();
+  it.each([true, false])('deletes the computer route with remove_key=%s and returns what happened to the key', async (removeKey) => {
+    const body = { key: { outcome: 'removed', used_by: null, fingerprint: 'SHA256:abc/def+', comment: 'langalpha' } };
+    mockDelete.mockResolvedValueOnce({ data: body, status: 200, headers: {} });
+    await expect(deleteComputer('c1', { removeKey })).resolves.toEqual(body);
     expect(mockDelete.mock.calls[0][0]).toBe('/api/v1/computers/c1');
+    expect(mockDelete.mock.calls[0][1]).toMatchObject({ params: { remove_key: removeKey } });
   });
 
   it('refuses an empty id rather than deleting a route with a hole in it', async () => {
-    await expect(deleteComputer('')).rejects.toThrow('Computer ID is required');
+    await expect(deleteComputer('', { removeKey: true })).rejects.toThrow('Computer ID is required');
     expect(mockDelete).not.toHaveBeenCalled();
   });
 });

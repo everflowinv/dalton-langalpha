@@ -35,17 +35,18 @@ export function dirname(path: string): string {
 /**
  * Candidate paths for a link found inside an open file, most likely first. A
  * relative link reads against the file's own directory, but agents just as
- * often write it from the workspace root, so both are offered.
+ * often write it from the workspace root, so both are offered. `root` is the
+ * computer's own root (`ComputerFolders.rootDir`).
  */
-export function linkCandidates(href: string, fromFile: string | null): string[] {
-  const { path: direct, absolute, workspaceId } = parseAgentPath(href);
+export function linkCandidates(href: string, fromFile: string | null, root?: string | null): string[] {
+  const { path: direct, absolute, workspaceId } = parseAgentPath(href, root);
   // A `__wsref__` destination names its own workspace, so the file the reader
   // has open says nothing about where it lives; joining would have produced
   // `work/__wsref__/<id>/…`, a path no workspace holds.
   if (!fromFile || absolute || workspaceId) return [direct];
-  const dir = dirname(normalizeAgentPath(fromFile));
+  const dir = dirname(normalizeAgentPath(fromFile, root));
   if (!dir || dir === '/') return [direct];
-  const joined = normalizeAgentPath(`${dir}/${href}`);
+  const joined = normalizeAgentPath(`${dir}/${href}`, root);
   return joined === direct ? [direct] : [joined, direct];
 }
 
@@ -64,13 +65,14 @@ export function folderLinkTarget(
   folders: ComputerFolders | null | undefined,
 ): { path: string; workspaceId?: string } | null {
   if (!folders) return null;
-  const parts = parseAgentPath(href);
+  const root = folders.rootDir;
+  const parts = parseAgentPath(href, root);
   // A candidate is a canonical string, which has lost the sandbox root.
-  const readings = parts.absolute ? [parts] : linkCandidates(href, fromFile).map((c) => parseAgentPath(c));
+  const readings = parts.absolute ? [parts] : linkCandidates(href, fromFile, root).map((c) => parseAgentPath(c, root));
   for (const reading of readings) {
     const sibling = siblingWorkspacePath(reading, folders);
     if (sibling) return sibling;
-    const own = workspaceScopedPath(reading, folders.dirName, folders.previousDirNames);
+    const own = workspaceScopedPath(reading, folders.dirName, folders.previousDirNames, folders.otherRoots);
     if (own !== reading.path) return { path: own || './' };
   }
   return null;
@@ -162,7 +164,7 @@ export interface WriteCall {
   call: ToolCallLike;
 }
 
-export function writeCalls(message: TurnMessage): WriteCall[] {
+export function writeCalls(message: TurnMessage, root?: string | null): WriteCall[] {
   const out: WriteCall[] = [];
   const calls = Object.entries(message.toolCallProcesses ?? {})
     // A call still in flight when the turn stopped names a file nothing said
@@ -175,11 +177,18 @@ export function writeCalls(message: TurnMessage): WriteCall[] {
     const args = call.toolCall?.args;
     const named = args?.file_path ?? args?.filePath ?? args?.path ?? args?.filename;
     if (typeof named !== 'string' || !named) continue;
-    const parts = parseAgentPath(named);
+    const parts = parseAgentPath(named, root);
     if (parts.path) out.push({ id, parts, call });
   }
   return out;
 }
+
+/**
+ * What places a write in the workspace: its own folders, and the computer root
+ * an absolute path starts with, or one it was written under before a move. A
+ * sibling's folders do not, so a refreshed sibling list leaves the logs alone.
+ */
+export type WriteScope = Pick<ComputerFolders, 'dirName' | 'previousDirNames' | 'rootDir' | 'otherRoots'>;
 
 /** One Write or Edit the agent made, as the changed-file dot sees it. */
 export interface WriteEvent {
@@ -194,16 +203,12 @@ export interface WriteEvent {
  * file changed needs the write itself, since a rewrite of the newest file
  * leaves that list byte-identical.
  */
-export function collectWriteLog(
-  messages: readonly TurnMessage[],
-  workspaceDirName?: string | null,
-  previousDirNames?: readonly string[] | null,
-): WriteEvent[] {
+export function collectWriteLog(messages: readonly TurnMessage[], scope?: WriteScope | null): WriteEvent[] {
   const out: WriteEvent[] = [];
   for (let i = messages.length - 1; i >= 0 && out.length < RECENT_WRITE_LIMIT; i--) {
-    const calls = writeCalls(messages[i] ?? {});
+    const calls = writeCalls(messages[i] ?? {}, scope?.rootDir);
     for (let j = calls.length - 1; j >= 0 && out.length < RECENT_WRITE_LIMIT; j--) {
-      out.push({ id: calls[j].id, path: workspaceScopedPath(calls[j].parts, workspaceDirName, previousDirNames) });
+      out.push({ id: calls[j].id, path: workspaceScopedPath(calls[j].parts, scope?.dirName, scope?.previousDirNames, scope?.otherRoots) });
     }
   }
   return out;
@@ -221,17 +226,13 @@ export function collectWriteLog(
 export const RECENT_WRITE_LIMIT = 200;
 
 /** Paths the agent wrote or edited in this thread, newest first. */
-export function collectRecentWritePaths(
-  messages: readonly TurnMessage[],
-  workspaceDirName?: string | null,
-  previousDirNames?: readonly string[] | null,
-): string[] {
+export function collectRecentWritePaths(messages: readonly TurnMessage[], scope?: WriteScope | null): string[] {
   const out: string[] = [];
   const seen = new Set<string>();
   for (let i = messages.length - 1; i >= 0 && out.length < RECENT_WRITE_LIMIT; i--) {
-    const calls = writeCalls(messages[i] ?? {});
+    const calls = writeCalls(messages[i] ?? {}, scope?.rootDir);
     for (let j = calls.length - 1; j >= 0 && out.length < RECENT_WRITE_LIMIT; j--) {
-      const path = workspaceScopedPath(calls[j].parts, workspaceDirName, previousDirNames);
+      const path = workspaceScopedPath(calls[j].parts, scope?.dirName, scope?.previousDirNames, scope?.otherRoots);
       if (seen.has(path)) continue;
       seen.add(path);
       out.push(path);

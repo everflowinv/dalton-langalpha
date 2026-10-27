@@ -15,7 +15,8 @@ from __future__ import annotations
 
 import logging
 import uuid
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from collections.abc import Callable
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 from psycopg.errors import UniqueViolation
 from psycopg.rows import dict_row
@@ -75,8 +76,12 @@ _NOT_LAPSED = f"NOT (phase = ANY(%(early)s) AND {move_stale()})"
 
 #: How long a moved workspace's old folder is kept on its old computer once
 #: the workspace's files are back in place. The mirror skips dependency and
-#: version-control folders, and this is the only copy of those.
+#: version-control folders, and this is the only copy of those. On a machine
+#: its owner brought, the folder is theirs and is never removed.
 LEFTOVERS_KEEP_DAYS = 7
+#: How long a folder a move from the backup left waits after a try before the
+#: sweep claims it again.
+LEFT_FOLDER_RETRY_S = 15 * 60
 
 
 class MoveRefused(Exception):
@@ -100,6 +105,9 @@ async def claim_workspace_move(
     workspace_id: str,
     target_computer_id: str,
     make_primary: bool = False,
+    from_backup: bool = False,
+    may_be_primary: Callable[[str], bool],
+    may_be_left: Callable[[str], bool] = lambda kind: False,
 ) -> Dict[str, Any]:
     """Record a move, or raise ``MoveRefused`` with why it cannot start.
 
@@ -107,7 +115,10 @@ async def claim_workspace_move(
     SHARE until its run row commits, so a turn either started first and this
     sees it, or meets the move row this inserts. A run elsewhere on the source
     refuses it too, since sibling workspaces use each other's folders; staging
-    checks that again, as the authority.
+    checks that again, as the authority. ``may_be_primary`` answers for the
+    target's kind, which is the providers' rule, not the rows'; so does
+    ``may_be_left`` for the source's, which a move ``from_backup`` never
+    reaches: a machine the server rebuilds is never left behind for its backup.
     """
     workspace_id = normalize_uuid(workspace_id)
     if workspace_id is None:
@@ -122,6 +133,7 @@ async def claim_workspace_move(
         "workspace_id": workspace_id,
         "target": target,
         "make_primary": make_primary,
+        "from_backup": from_backup,
         "early": _EARLY,
         "active": _ACTIVE,
     }
@@ -143,7 +155,7 @@ async def claim_workspace_move(
             )
             await cur.execute(
                 f"""
-                SELECT computer_id FROM computers
+                SELECT computer_id, kind FROM computers
                 WHERE computer_id = %(target)s AND user_id = %(user_id)s
                   AND {_TAKES_A_WORKSPACE}
                 FOR SHARE
@@ -176,6 +188,10 @@ async def claim_workspace_move(
                 raise MoveRefused("same_computer")
             if computer is None:
                 raise MoveRefused("target_unavailable")
+            if make_primary and not may_be_primary(computer["kind"]):
+                raise MoveRefused("not_primary")
+            if from_backup:
+                await _check_left_for_backup(cur, workspace, may_be_left)
             if await workspace_has_live_runs(cur, workspace_id):
                 raise MoveRefused("turn_active")
             if await computer_run_in_progress(cur, str(workspace["computer_id"])):
@@ -184,12 +200,12 @@ async def claim_workspace_move(
                 f"""
                 INSERT INTO workspace_moves (
                     move_id, user_id, workspace_id, source_computer_id,
-                    target_computer_id, make_primary, phase, runner_id,
-                    source_folder
+                    target_computer_id, make_primary, from_backup, phase,
+                    runner_id, source_folder
                 ) VALUES (
                     %(move_id)s, %(user_id)s, %(workspace_id)s, %(source)s,
-                    %(target)s, %(make_primary)s, 'preparing', %(runner_id)s,
-                    %(source_folder)s
+                    %(target)s, %(make_primary)s, %(from_backup)s, 'preparing',
+                    %(runner_id)s, %(source_folder)s
                 )
                 RETURNING *, {_stale_projection()}
                 """,
@@ -202,6 +218,29 @@ async def claim_workspace_move(
             return dict(await cur.fetchone())
     except UniqueViolation:
         raise MoveRefused("move_in_progress") from None
+
+
+async def _check_left_for_backup(
+    cur, workspace: Mapping[str, Any], may_be_left: Callable[[str], bool]
+) -> None:
+    """Refuse a move from the backup off a machine that may not be left, or with none.
+
+    Any file row will do. A workspace never backed up has none, and laid
+    from nothing it would read as moved while its files stayed behind.
+    """
+    await cur.execute(
+        "SELECT kind FROM computers WHERE computer_id = %s",
+        (workspace["computer_id"],),
+    )
+    source = await cur.fetchone()
+    if source is None or not may_be_left(source["kind"]):
+        raise MoveRefused("not_movable")
+    await cur.execute(
+        "SELECT EXISTS (SELECT 1 FROM workspace_files WHERE workspace_id = %s) AS held",
+        (workspace["workspace_id"],),
+    )
+    if not (await cur.fetchone())["held"]:
+        raise MoveRefused("no_backup")
 
 
 async def heartbeat_workspace_move(move_id: str, runner_id: str) -> bool:
@@ -249,7 +288,7 @@ async def advance_workspace_move(
 
 
 async def stage_workspace_move(
-    move_id: str, runner_id: str, *, source_folder: str, leftovers_path: str
+    move_id: str, runner_id: str, *, source_folder: str, leftovers_path: Optional[str]
 ) -> Optional[Dict[str, Any]]:
     """Record the folder as about to leave its name; None once the move is not this runner's.
 
@@ -427,6 +466,28 @@ def carried_previous(
     return kept[:PREVIOUS_DIR_NAMES_MAX]
 
 
+#: How many roots a workspace keeps of the computers it left. Each is a read a
+#: path fold tries, and a workspace that outlives this many moves has turns
+#: old enough that their links were never going to open anyway.
+PREVIOUS_ROOT_DIRS_MAX = 16
+
+
+def carried_roots(
+    left: Optional[str], landed: Optional[str], previous: Optional[Sequence[str]]
+) -> List[str]:
+    """The computer roots an old path in the workspace's threads may start with.
+
+    The live computer list stops naming a root once its computer is removed,
+    so the workspace keeps its own. The root left leads, as the folder left
+    does; one the target shares adds nothing, since its paths read the same.
+    """
+    kept = [root for root in previous or () if root]
+    left = (left or "").rstrip("/")
+    if left and left != (landed or "").rstrip("/"):
+        kept = [left, *(root for root in kept if root != left)]
+    return kept[:PREVIOUS_ROOT_DIRS_MAX]
+
+
 async def _flip_primary(cur, user_id: str, computer_id: str) -> None:
     """Make ``computer_id`` the user's primary; the old one is cleared first.
 
@@ -478,7 +539,7 @@ async def commit_workspace_move(move_id: str, runner_id: str) -> Optional[Dict[s
         # the workspace; held for update when the flip will write them.
         await cur.execute(
             f"""
-            SELECT computer_id, provider_ref, layout_version,
+            SELECT computer_id, provider_ref, layout_version, root_dir,
                    ({_TAKES_A_WORKSPACE}) AS takes_a_workspace
             FROM computers
             WHERE computer_id = %(target)s
@@ -493,10 +554,17 @@ async def commit_workspace_move(move_id: str, runner_id: str) -> Optional[Dict[s
         )
         # Owner first, workspace second, as every grant writer orders them.
         await lock_user_egress_state(cur, user_id)
+        # The source's root is read, not locked: a computer's root is fixed
+        # when it is made, and computer rows are locked ahead of this one.
         await cur.execute(
             """
-            SELECT workspace_id, user_id, name, computer_id, previous_dir_names, status
-            FROM workspaces WHERE workspace_id = %s FOR UPDATE
+            SELECT w.workspace_id, w.user_id, w.name, w.computer_id,
+                   w.previous_dir_names, w.previous_root_dirs, w.status,
+                   c.root_dir AS source_root_dir
+            FROM workspaces w
+            LEFT JOIN computers c ON c.computer_id = w.computer_id
+            WHERE w.workspace_id = %s
+            FOR UPDATE OF w
             """,
             (workspace_id,),
         )
@@ -531,7 +599,9 @@ async def commit_workspace_move(move_id: str, runner_id: str) -> Optional[Dict[s
             """
             UPDATE workspaces w
             SET previous_dir_names = %(carried)s::text[],
+                previous_root_dirs = %(roots)s::text[],
                 files_restore_incomplete_at = COALESCE(w.files_restore_incomplete_at, NOW()),
+                files_restore_offered_at = NULL,
                 files_epoch = %(move_id)s,
                 config = (COALESCE(w.config, '{}'::jsonb) - %(stamp_keys)s::text[])
                     || COALESCE((
@@ -553,6 +623,11 @@ async def commit_workspace_move(move_id: str, runner_id: str) -> Optional[Dict[s
                     workspace["previous_dir_names"],
                     bound["dir_name"],
                     held,
+                ),
+                "roots": carried_roots(
+                    workspace["source_root_dir"],
+                    computer["root_dir"],
+                    workspace["previous_root_dirs"],
                 ),
                 "move_id": move_id,
                 "stamp_keys": list(SANDBOX_STAMP_KEYS),
@@ -594,6 +669,7 @@ async def flag_rollback_restore(move_id: str, workspace_id: str) -> None:
             """
             UPDATE workspaces
             SET files_restore_incomplete_at = COALESCE(files_restore_incomplete_at, NOW()),
+                files_restore_offered_at = NULL,
                 files_epoch = %s
             WHERE workspace_id = %s
             """,
@@ -601,12 +677,15 @@ async def flag_rollback_restore(move_id: str, workspace_id: str) -> None:
         )
 
 
-async def set_primary_computer(user_id: str, computer_id: str) -> bool:
+async def set_primary_computer(
+    user_id: str, computer_id: str, *, may_be_primary: Callable[[str], bool]
+) -> bool:
     """Flip the primary without moving Home; False when Home must move with it.
 
     The old primary is held before Home, as Home's first bind holds it: that
     bind takes only a computer still primary, so it either landed first and
     this refuses, or waits and then binds Home to the new primary.
+    ``may_be_primary`` is as for ``claim_workspace_move``.
     """
     computer_id = normalize_uuid(computer_id)
     if computer_id is None:
@@ -616,7 +695,7 @@ async def set_primary_computer(user_id: str, computer_id: str) -> bool:
     ) as cur:
         await cur.execute(
             f"""
-            SELECT computer_id,
+            SELECT computer_id, kind,
                    ({_TAKES_A_WORKSPACE}) AS takes_workspaces
             FROM computers
             WHERE user_id = %(user_id)s AND (computer_id = %(target)s OR is_primary)
@@ -627,11 +706,13 @@ async def set_primary_computer(user_id: str, computer_id: str) -> bool:
         )
         # As a claim to move onto it reads: Home and new workspaces would land
         # on a computer that cannot start or is still building its first sandbox.
-        if not any(
-            str(r["computer_id"]) == computer_id and r["takes_workspaces"]
-            for r in await cur.fetchall()
-        ):
+        target = next(
+            (r for r in await cur.fetchall() if str(r["computer_id"]) == computer_id), None
+        )
+        if target is None or not target["takes_workspaces"]:
             raise MoveRefused("target_unavailable")
+        if not may_be_primary(target["kind"]):
+            raise MoveRefused("not_primary")
         await cur.execute(
             "SELECT computer_id FROM workspaces WHERE workspace_id = %s FOR UPDATE",
             (get_home_workspace_id(user_id),),
@@ -696,13 +777,16 @@ async def list_moves_with_leftovers(limit: int = 50) -> List[Dict[str, Any]]:
     computer is running and the workspace is deleted or restored long enough
     ago. ``restored``: the workspace's files are back in place, which starts
     the wait. A folder waiting out its days or on a stopped computer is not
-    listed, so those can never crowd out one that is due.
+    listed, so those can never crowd out one that is due. The source's kind
+    and root ride along, since whether the folder may ever be removed is the
+    providers' rule, not the rows'.
     """
     async with get_db_connection() as conn, conn.cursor(row_factory=dict_row) as cur:
         await cur.execute(
             """
             SELECT * FROM (
                 SELECT m.move_id, m.source_computer_id, m.leftovers_path, m.finished_at,
+                    c.kind AS source_kind, c.root_dir AS source_root_dir,
                     CASE
                         WHEN c.computer_id IS NULL OR c.status = 'deleted'
                             THEN 'source_gone'
@@ -729,6 +813,79 @@ async def list_moves_with_leftovers(limit: int = 50) -> List[Dict[str, Any]]:
         return [dict(row) for row in await cur.fetchall()]
 
 
+async def claim_folders_left_in_place(limit: int = 1) -> List[Dict[str, Any]]:
+    """Claim folders moves from the backup left, on a computer running again or gone.
+
+    Each holds its name there (``get_workspace_dir_names_for_computer``) until
+    ``set_left_folder_aside`` records it moved aside, or its computer went.
+    Setting one aside dials its owner's machine, which may not answer, so the
+    claim stamps the row and it is due again only ``LEFT_FOLDER_RETRY_S``
+    later: one worker tries it per window, and a row that never clears goes
+    behind those untried. One at a time by default, so the window starts when
+    the row's try does.
+    """
+    async with get_db_connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(
+            """
+            UPDATE workspace_moves claimed
+            SET left_folder_tried_at = NOW()
+            FROM (
+                SELECT m.move_id,
+                    (c.computer_id IS NULL OR c.status = 'deleted') AS source_gone
+                FROM workspace_moves m
+                LEFT JOIN computers c ON c.computer_id = m.source_computer_id
+                WHERE m.from_backup AND m.leftovers_removed_at IS NULL
+                  AND m.phase = 'done'
+                  AND (
+                      c.computer_id IS NULL OR c.status = 'deleted'
+                      OR (c.status = 'running' AND c.host_unavailable_since IS NULL)
+                  )
+                  AND (
+                      m.left_folder_tried_at IS NULL
+                      OR m.left_folder_tried_at < NOW() - make_interval(secs => %(retry_s)s)
+                  )
+                ORDER BY m.left_folder_tried_at NULLS FIRST, m.finished_at
+                LIMIT %(limit)s
+                FOR UPDATE OF m SKIP LOCKED
+            ) due
+            WHERE claimed.move_id = due.move_id
+            RETURNING claimed.move_id, claimed.source_computer_id, claimed.source_folder,
+                due.source_gone
+            """,
+            {"retry_s": LEFT_FOLDER_RETRY_S, "limit": limit},
+        )
+        return [dict(row) for row in await cur.fetchall()]
+
+
+async def left_folder_taken(conn, computer_id: str, folder: str) -> bool:
+    """Whether a workspace holds the name now: a rename's landing sets what it
+    finds there aside on its way in, so the folder there is that workspace's.
+
+    By any name a row holds there, a staged row's landings included, and by
+    any spelling folding alike, as folder allocation compares them: the
+    owner's disk may not tell case apart.
+    """
+    folded = folder.casefold()
+    held = await get_workspace_dir_names_for_computer(
+        computer_id, conn=conn, left_by_moves=False
+    )
+    return any(name.casefold() == folded for name in held)
+
+
+async def set_left_folder_aside(move_id: str, leftovers_path: Optional[str]) -> None:
+    """Release a folder a move from the backup left: kept at ``leftovers_path``
+    on its owner's machine, or None once nothing of it is left."""
+    async with get_db_connection() as conn, conn.cursor() as cur:
+        await cur.execute(
+            """
+            UPDATE workspace_moves
+            SET leftovers_path = %s, leftovers_removed_at = NOW()
+            WHERE move_id = %s AND leftovers_removed_at IS NULL
+            """,
+            (leftovers_path, move_id),
+        )
+
+
 async def mark_move_restored(move_id: str) -> None:
     async with get_db_connection() as conn, conn.cursor() as cur:
         await cur.execute(
@@ -738,6 +895,8 @@ async def mark_move_restored(move_id: str) -> None:
 
 
 async def mark_leftovers_removed(move_id: str) -> None:
+    """The sweep is done with a move's folder: removed, gone with its computer,
+    or kept on its owner's machine, where ``leftovers_path`` still finds it."""
     async with get_db_connection() as conn, conn.cursor() as cur:
         await cur.execute(
             "UPDATE workspace_moves SET leftovers_removed_at = NOW() WHERE move_id = %s",

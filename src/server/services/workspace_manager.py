@@ -33,6 +33,7 @@ from src.server.database.workspace import (
     complete_workspace_folder_cleanup,
     create_workspace_on_computer,
     delete_workspace as db_delete_workspace,
+    files_restore_offered,
     get_pending_workspace_folder_cleanups,
     workspace_is_moving,
 )
@@ -48,6 +49,7 @@ from src.server.services.computer_errors import (
     ComputerPreparingError,
 )
 from src.server.services.computer_manager import ComputerManager
+from src.server.services.persistence.file import FilePersistenceService
 
 logger = logging.getLogger(__name__)
 
@@ -283,6 +285,42 @@ class WorkspaceManager(ComputerManager):
             return None
         return await self.get_session_for_workspace(workspace_id, user_id=user_id)
 
+    async def settle_files_restore_offer(
+        self, workspace_id: str, *, user_id: str, restore: bool
+    ) -> bool:
+        """Restore the folder an offer stands for, or keep it as it is; False if none stands.
+
+        Either way on the machine: a restore lays the files there, and keeping
+        the folder writes the markers that say it is current before the offer
+        ends. Settling makes the files a new arrival, so every worker attaches
+        the folder again: this one now, which lays the restore now owed or
+        queues the bring-up the offer held back, and any other at its next
+        open, which lays a restore cut short here.
+        """
+        if not await files_restore_offered(workspace_id):
+            return False
+        session = await self.get_session_for_workspace(workspace_id, user_id=user_id)
+        async with workspace_folder_in_use(workspace_id):
+            binding = await self.resolve_binding(workspace_id)
+            async with self._held_workspace_folder(workspace_id) as dir_name:
+                settled = await FilePersistenceService.settle_restore_offer(
+                    workspace_id,
+                    session.sandbox,
+                    layout=await self._project_layout(
+                        workspace_id,
+                        binding.computer_id,
+                        dir_name=dir_name or "",
+                        root=binding.root_dir,
+                    ),
+                    restore=restore,
+                )
+            if not settled:
+                return False
+            # Read again, for the arrival the settle recorded.
+            binding = await self.resolve_binding(workspace_id)
+            await self._ensure_project_attached(binding, session, user_id=user_id)
+            return True
+
     async def archive_workspace(self, workspace_id: str) -> Dict[str, Any]:
         """Archive a stopped machine (moves its sandbox to object storage)."""
         binding = await self.resolve_binding(workspace_id)
@@ -293,6 +331,8 @@ class WorkspaceManager(ComputerManager):
     async def delete_workspace(
         self,
         workspace_id: str,
+        *,
+        delete_files: bool = False,
     ) -> bool:
         """
         Delete a workspace: the project only, never its machine by itself.
@@ -303,14 +343,26 @@ class WorkspaceManager(ComputerManager):
         live project left on it, and not the user's primary, which instant
         create hands the next project.
 
+        On a machine its owner brought, the folder holds their files, which
+        may be a clone or work kept nowhere else: it stays where it is unless
+        ``delete_files`` says the owner asked for it to go. Every other
+        caller, an agent's tool included, leaves it.
+
         Args:
             workspace_id: Workspace UUID
+            delete_files: The owner asked for the folder on their machine to go too.
 
         Returns:
             True if deleted successfully
         """
         binding = await self.resolve_binding(workspace_id)
         computer_id = binding.computer_id
+        try:
+            owners_machine = not binding.provider.recreatable
+        except ValueError:
+            # A kind this build cannot reach, where nothing is removed anyway.
+            owners_machine = True
+        keep_folder = owners_machine and not delete_files
         async with self._observed_lock(computer_id, "workspace.delete"):
             workspace = await self.workspace_row(workspace_id)
             if not workspace:
@@ -330,20 +382,25 @@ class WorkspaceManager(ComputerManager):
 
             try:
                 # The project's last mirror sync, before anything on the
-                # machine's disk moves. Best effort, as every other backup.
-                await self.backup_project_files(
-                    workspace_id,
-                    computer_id=computer_id,
-                    expected_sandbox_id=binding.provider_ref,
-                )
+                # machine's disk moves. Best effort, as every other backup,
+                # and none where the machine's owner turned backups off.
+                if binding.files_backup:
+                    await self.backup_project_files(
+                        workspace_id,
+                        computer_id=computer_id,
+                        expected_sandbox_id=binding.provider_ref,
+                        routine=True,
+                    )
 
                 # Soft delete in DB. Before the emptiness decision, so two
                 # deletes racing a machine's last two projects cannot both read
                 # the other as a live sibling and both leave it running.
-                await db_delete_workspace(workspace_id)
+                await db_delete_workspace(
+                    workspace_id, bound_to=computer_id, keep_folder=keep_folder
+                )
 
                 retired = await self._retire_machine_if_empty(
-                    computer_id, workspace_id, workspace
+                    computer_id, workspace_id, workspace, keep_folder=keep_folder
                 )
 
                 logger.info(f"Workspace {workspace_id} deleted successfully")
@@ -624,7 +681,11 @@ class WorkspaceManager(ComputerManager):
         return reverted
 
     async def start_cleanup_task(self) -> None:
-        """Start background cleanup task."""
+        """Start the background cleanup task, and the left-folder sweep beside it.
+
+        The sweep dials owners' machines, any of which may be dark or slow, so
+        it runs in a loop of its own rather than ahead of idle reaping.
+        """
         if self._cleanup_task is not None:
             return
 
@@ -648,7 +709,19 @@ class WorkspaceManager(ComputerManager):
                 except Exception as e:
                     logger.error(f"Error in workspace cleanup loop: {e}")
 
+        async def left_folders_loop():
+            while not self._shutdown:
+                try:
+                    await asyncio.sleep(self.cleanup_interval)
+                    if not self._shutdown:
+                        await self.set_aside_left_folders()
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    logger.error(f"Error in left-folder sweep loop: {e}")
+
         self._cleanup_task = asyncio.create_task(cleanup_loop())
+        self._left_folders_task = asyncio.create_task(left_folders_loop())
         logger.info("Workspace cleanup task started")
 
 

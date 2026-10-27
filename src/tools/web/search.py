@@ -4,6 +4,7 @@ from typing import Optional
 
 from src.config.tool_settings import get_search_api
 from src.dalton.web_search_spec import register_openclaw_search_builder  # DALTON-HOOK(web-search-openclaw)
+from src.observability import TOOL_PROVIDER
 from src.tools.decorators import create_logged_tool
 from src.tools.web.manifest import (
     CAPABILITY_SEARCH,
@@ -94,5 +95,9 @@ def get_web_search_tool(
         tool_fn,
         name="WebSearch",
         tracking_name=cap.tracking_key(depth_spec),
-        run_metadata={"search_engine": engine, "search_depth": depth_spec.name},
+        run_metadata={
+            "search_engine": engine,
+            "search_depth": depth_spec.name,
+            TOOL_PROVIDER: engine,
+        },
     )

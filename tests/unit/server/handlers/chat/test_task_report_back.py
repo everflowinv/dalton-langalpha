@@ -157,12 +157,13 @@ def _arb_env(
     is the attempt row the task's ``parent_run_id`` names."""
     # A plain string is the status alone; a dict is the whole attempt row, for
     # the arms that read more of it than its status.
-    latest = AsyncMock(
-        side_effect=[
-            s if isinstance(s, dict) else ({"status": s} if s else None)
-            for s in latest_statuses
-        ]
-    )
+    rows = [
+        s if isinstance(s, dict) else ({"status": s} if s else None)
+        for s in latest_statuses
+    ]
+    # An owed report reads its claim marker before the park's reads; the
+    # first row stands for that read too.
+    latest = AsyncMock(side_effect=rows[:1] + rows)
     patches = (
         patch(
             "src.server.database.runs.subagent_runs.get_task_run",

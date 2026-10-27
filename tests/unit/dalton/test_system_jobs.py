@@ -1890,7 +1890,20 @@ def test_plugins_config_and_sandbox_env_exclude_bridge_admin_token(
     assert admin_secret in (by_name["leak_url_srv"].url or "")
     assert any(admin_secret in str(a) for a in by_name["leak_args_srv"].args)
 
+    class _TrustedProvider:
+        # B3's builder gates the deployment env on provider trust; the stub
+        # host is trusted so the token paths under test run.
+        @staticmethod
+        def trusted_host(config):
+            return True
+
     sandbox_stub = create_autospec(PTCSandbox, instance=True)
+    sandbox_stub.provider = _TrustedProvider()
+    # The real builder delegates to _deployment_env_vars off the instance;
+    # on the autospec stub that dispatch would hit a mock, so delegate back.
+    sandbox_stub._deployment_env_vars.side_effect = (
+        lambda bindings: PTCSandbox._deployment_env_vars(sandbox_stub, bindings)
+    )
     # Upstream's env-var build now consults self.config for platform-secret
     # withholding; a Docker provider never withholds, which keeps this test on
     # the plain Dalton (oss) path.
@@ -1974,7 +1987,20 @@ def test_sandbox_env_vars_never_resolve_admin_token_placeholders(
             },
         ),
     ]
+    class _TrustedProvider:
+        # B3's builder gates the deployment env on provider trust; the stub
+        # host is trusted so the token paths under test run.
+        @staticmethod
+        def trusted_host(config):
+            return True
+
     sandbox_stub = create_autospec(PTCSandbox, instance=True)
+    sandbox_stub.provider = _TrustedProvider()
+    # The real builder delegates to _deployment_env_vars off the instance;
+    # on the autospec stub that dispatch would hit a mock, so delegate back.
+    sandbox_stub._deployment_env_vars.side_effect = (
+        lambda bindings: PTCSandbox._deployment_env_vars(sandbox_stub, bindings)
+    )
     sandbox_stub.config = SimpleNamespace(sandbox=SimpleNamespace(provider="docker"))
     sandbox_stub._token_file_path = "/home/workspace/.ginlix_token"
     sandbox_stub._builtin_servers.return_value = servers
@@ -2068,10 +2094,23 @@ def test_sandbox_env_and_mcp_config_exclude_internal_service_token(
     by_name = {s.name: s for s in loaded_servers}
     assert by_name["leak_env_srv"].env["RENAMED_INTERNAL"] == internal_secret
 
+    class _TrustedProvider:
+        # B3's builder gates the deployment env on provider trust; the stub
+        # host is trusted so the token paths under test run.
+        @staticmethod
+        def trusted_host(config):
+            return True
+
     sandbox_stub = create_autospec(PTCSandbox, instance=True)
+    sandbox_stub.provider = _TrustedProvider()
     sandbox_stub.config = SimpleNamespace(sandbox=SimpleNamespace(provider="docker"))
     sandbox_stub._token_file_path = "/home/workspace/.ginlix_token"
     sandbox_stub._builtin_servers.return_value = loaded_servers
+    # The real builder delegates to _deployment_env_vars off the instance;
+    # on the autospec stub that dispatch would hit a mock, so delegate back.
+    sandbox_stub._deployment_env_vars.side_effect = (
+        lambda bindings: PTCSandbox._deployment_env_vars(sandbox_stub, bindings)
+    )
 
     env_vars = PTCSandbox._build_sandbox_env_vars(sandbox_stub, {})
     gen = ToolFunctionGenerator()

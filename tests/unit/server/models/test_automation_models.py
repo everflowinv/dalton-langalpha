@@ -188,6 +188,22 @@ class TestTriggerRules:
         stored = _create("price", trigger_config=config).trigger_config
         assert stored == {**config, "symbol": "600519.SH"}
 
+    @pytest.mark.parametrize("symbol", ["123456", "0700", "7203"])
+    def test_a_bare_number_is_refused_on_create_and_update(self, symbol):
+        """Read as a US ticker it would never quote; the suffix names its market."""
+        config = {"symbol": symbol, "conditions": [{"type": "price_below", "value": 140.0}]}
+        refusal = f"'{symbol}' is a bare number, which names no market; add its exchange suffix"
+        with pytest.raises(ValidationError, match=refusal):
+            _create("price", trigger_config=config)
+        with pytest.raises(ValidationError, match=refusal):
+            AutomationUpdate.model_validate(
+                {"trigger_config": config}, context={"trigger_type": "price"}
+            )
+
+    def test_a_suffixed_code_is_kept(self):
+        config = {"symbol": "830799.BJ", "conditions": [{"type": "price_below", "value": 140.0}]}
+        assert _create("price", trigger_config=config).trigger_config == config
+
 
 # ---------------------------------------------------------------------------
 # Zone and run time: what every surface refuses, and the agent's own guards

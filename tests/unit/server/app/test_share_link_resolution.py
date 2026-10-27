@@ -312,6 +312,10 @@ async def test_metadata_thread_token_answers_the_thread():
         "workspace_id": WS_ID,
         "share_permissions": {"allow_files": True},
         "title": "T",
+        "root_dir": "/home/dev/langalpha",
+        # A turn from before a move spells its paths under the root it left.
+        "previous_root_dirs": ["/home/old/langalpha"],
+        "dir_name": "NVDA",
     }
     with (
         patch(_ACCESS_LINK, AsyncMock()) as link,
@@ -324,7 +328,32 @@ async def test_metadata_thread_token_answers_the_thread():
     assert body["kind"] == "thread"
     assert body["thread_id"] == "thread-fake-1"
     assert body["permissions"] == {"allow_files": True, "allow_download": False}
+    assert body["root_dir"] == "/home/dev/langalpha"
+    assert body["previous_root_dirs"] == ["/home/old/langalpha"]
+    assert body["dir_name"] == "NVDA"
+    assert "previous_dir_names" not in body
     link.assert_not_awaited()
+
+
+async def test_metadata_without_files_leaves_out_the_roots_a_move_left():
+    """They only open files, and the thread may never spell them."""
+    thread = {
+        "conversation_thread_id": "thread-fake-1",
+        "workspace_id": WS_ID,
+        "share_permissions": {"allow_files": False},
+        "root_dir": "/home/dev/langalpha",
+        "previous_root_dirs": ["/home/old/langalpha"],
+        "dir_name": "NVDA",
+    }
+    with (
+        patch(_ACCESS_LINK, AsyncMock()),
+        patch(_PUBLIC_THREAD, AsyncMock(return_value=thread)),
+    ):
+        async with _client() as client:
+            resp = await client.get("/api/v1/public/shared/share_abc123")
+    body = resp.json()
+    assert body["previous_root_dirs"] == []
+    assert body["root_dir"] == "/home/dev/langalpha"
 
 
 async def test_metadata_shared_file_is_public_to_anyone():

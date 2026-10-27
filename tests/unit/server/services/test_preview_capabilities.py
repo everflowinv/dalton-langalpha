@@ -14,10 +14,12 @@ import pytest
 from ptc_agent.core.sandbox.runtime import PreviewInfo
 from src.config import env
 from src.server.services import preview_capabilities as caps
+from src.server.services import preview_upstreams
 from src.server.services.preview_base import preview_base
 from src.server.services.preview_capabilities import (
     PreviewProxyNotConfigured,
     PreviewProxyUnavailable,
+    Upstream,
 )
 
 _TOKEN = "abcdefghijklmnopqrstuvwxyz234567"
@@ -141,8 +143,7 @@ class TestLifecycle:
         assert capability.sandbox_id == "sbx-1"
         assert capability.port == 8080
         assert capability.workspace_id == "ws-1"
-        assert capability.upstream == "https://8080-sbx-1.e2b.app"
-        assert dict(capability.headers) == _HEADERS
+        assert capability.upstream == Upstream("https://8080-sbx-1.e2b.app", _HEADERS)
         assert "tok-1" not in repr(capability)
 
     @pytest.mark.asyncio
@@ -250,7 +251,7 @@ class TestPublish:
     async def test_a_capability_is_probed_at_its_sandbox_with_its_header(self, cache):
         url = await _mint()
 
-        target = await caps.probe_target(url.rstrip("/") + "/app/page?x=1")
+        target = await preview_upstreams.probe_target(url.rstrip("/") + "/app/page?x=1")
 
         assert target == ("https://8080-sbx-1.e2b.app/app/page?x=1", _HEADERS)
 
@@ -259,10 +260,91 @@ class TestPublish:
         url = await _mint()
         await caps.revoke("sbx-1")
 
-        assert await caps.probe_target(url) is None
+        assert await preview_upstreams.probe_target(url) is None
 
     @pytest.mark.asyncio
     async def test_any_other_url_is_probed_as_it_is(self, cache):
         url = "https://3000-sbx.example.org/?tkn=x"
 
-        assert await caps.probe_target(url) == (url, {})
+        assert await preview_upstreams.probe_target(url) == (url, {})
+
+
+class TestProcessLocal:
+    """A process-local URL is a forward only the minting process holds."""
+
+    @pytest.mark.asyncio
+    async def test_a_process_local_url_is_stored_as_no_upstream(self, cache):
+        info = PreviewInfo(
+            url="http://127.0.0.1:41234",
+            token=None,
+            auth_headers={"x-forward": "f-1"},
+            browser_ready=False,
+            process_local=True,
+        )
+
+        url = await caps.publish(
+            info, sandbox_id="ssh-1", port=8080, workspace_id="ws-1", expires_in=600
+        )
+
+        record = next(
+            json.loads(v) for k, v in cache.client.kv.items()
+            if not k.startswith("preview:cap:gen:")
+        )
+        assert record["upstream"] is None
+        assert record["headers"] == {}
+        # Not a 2, which an older reader would take and dial as "None".
+        assert record["v"] == 3
+        assert "41234" not in json.dumps(record)
+        capability = await caps.resolve(_token(url))
+        assert capability is not None
+        assert capability.upstream is None
+        assert (capability.sandbox_id, capability.port, capability.workspace_id) == (
+            "ssh-1",
+            8080,
+            "ws-1",
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "http://127.0.0.1:41000",
+            "http://localhost:41000",
+            "http://[::1]:41000",
+            "http://0.0.0.0:41000",
+            "http://127.1:41000",
+            "http://[::ffff:127.0.0.1]:41000",
+        ],
+    )
+    async def test_a_loopback_url_that_is_not_process_local_is_never_stored(
+        self, cache, url
+    ):
+        # Whichever worker serves a stored origin dials it, which on loopback
+        # is that worker's own host.
+        with pytest.raises(ValueError):
+            await caps.publish(
+                _private(url), sandbox_id="sbx-1", port=8080, workspace_id="ws-1",
+                expires_in=600,
+            )
+        assert cache.client.kv == {}
+
+    @pytest.mark.asyncio
+    async def test_a_record_that_names_its_upstream_is_one_an_older_reader_takes(
+        self, cache
+    ):
+        # During a cutover the draining color reads what this one mints, and a
+        # reader that knows only version 2 takes exactly this shape.
+        url = await _mint()
+        key = next(k for k in cache.client.kv if not k.startswith("preview:cap:gen:"))
+        record = json.loads(cache.client.kv[key])
+
+        assert record["v"] == 2
+        assert set(record) == {
+            "v", "sandbox_id", "port", "upstream", "workspace_id", "generation",
+            "expires_at", "headers",
+        }
+        assert record["upstream"] == "https://8080-sbx-1.e2b.app"
+        assert record["headers"] == _HEADERS
+        capability = await caps.resolve(_token(url))
+        assert capability is not None
+        assert capability.upstream == Upstream("https://8080-sbx-1.e2b.app", _HEADERS)

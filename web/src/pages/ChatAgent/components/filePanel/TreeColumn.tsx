@@ -1,10 +1,11 @@
 import React, { useRef } from 'react';
 import {
-  ArrowUpDown, BookMarked, CheckSquare, HardDrive, LayoutDashboard, RefreshCw, ScrollText, Search, Settings, Trash2, Upload, X,
+  ArrowUpDown, BookMarked, CandlestickChart, CheckSquare, HardDrive, LayoutDashboard, RefreshCw, ScrollText, Search, Settings, Trash2, Upload, X,
 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { motion } from '@/lib/framer';
 import { DURATION, EASE_OUT } from '@/lib/motion';
+import { cn } from '@/lib/utils';
 import { Loader } from '@/components/ui/loader';
 import type { MemoEntry } from '../../utils/api';
 import type { ContextMenuData, ContextPayload } from './types';
@@ -51,6 +52,8 @@ export interface TreeColumnProps {
   /** The reader's memory and memo stores, pinned above the listing; null where the reader has none here. */
   onOpenMemory: (() => void) | null;
   onOpenMemo: (() => void) | null;
+  /** A live chart, pinned with the stores; null where charts have no place (a share). */
+  onOpenChart: (() => void) | null;
 
   readOnly: boolean;
   uploadDisabled: boolean;
@@ -62,6 +65,8 @@ export interface TreeColumnProps {
 
   /** Under a narrow panel the column floats over the viewer instead of beside it. */
   overlay: boolean;
+  /** On the empty tab the listing is the tab, so it takes the whole body; it wins over `overlay`. */
+  full: boolean;
   onDismissOverlay: () => void;
 }
 
@@ -88,15 +93,22 @@ export function TreeColumn(props: TreeColumnProps): React.ReactElement {
 
   // Docked, the column folds on its width so the viewer reflows with it;
   // floating, it slides in from the edge it hangs off. Exits are shorter.
+  // Full, it arrives with its tab as any tab's body does, and a file opened
+  // from it narrows it to the column on the same width the fold uses.
   const enter = { duration: DURATION.fold, ease: EASE_OUT };
   const exit = { duration: DURATION.exit, ease: EASE_OUT };
-  const columnMotion = props.overlay
+  const overlay = props.overlay && !props.full;
+  const columnMotion = overlay
     ? { initial: { x: '100%' }, animate: { x: 0, transition: enter }, exit: { x: '100%', transition: exit } }
-    : { initial: { width: 0 }, animate: { width: TREE_WIDTH, transition: enter }, exit: { width: 0, transition: exit } };
+    : {
+      initial: props.full ? false as const : { width: 0 },
+      animate: { width: props.full ? '100%' : TREE_WIDTH, transition: enter },
+      exit: { width: 0, transition: exit },
+    };
 
   return (
     <>
-      {props.overlay && (
+      {overlay && (
         <motion.div
           className="file-panel-tree-scrim"
           onClick={props.onDismissOverlay}
@@ -107,7 +119,7 @@ export function TreeColumn(props: TreeColumnProps): React.ReactElement {
         />
       )}
       <motion.aside
-        className={`file-panel-tree${props.overlay ? ' is-overlay' : ''}`}
+        className={cn('file-panel-tree', overlay && 'is-overlay', props.full && 'is-full')}
         aria-label={t('chat.workspaceFiles')}
         {...columnMotion}
       >
@@ -162,9 +174,11 @@ export function TreeColumn(props: TreeColumnProps): React.ReactElement {
                   >
                     <Upload className="h-4 w-4" />
                   </button>
-                  <button onClick={backup.handleBackup} className="file-panel-icon-btn" title={t('filePanel.backupFiles')} disabled={backup.backingUp}>
-                    <HardDrive className={`h-4 w-4 ${backup.backingUp ? 'animate-pulse' : ''}`} />
-                  </button>
+                  {backup.canBackUp && (
+                    <button onClick={backup.handleBackup} className="file-panel-icon-btn" title={t('filePanel.backupFiles')} disabled={backup.backingUp}>
+                      <HardDrive className={`h-4 w-4 ${backup.backingUp ? 'animate-pulse' : ''}`} />
+                    </button>
+                  )}
                   <button onClick={props.onRefreshFiles} className="file-panel-icon-btn" title={t('filePanel.refresh')}>
                     {props.filesLoading ? <Loader size={16} className="text-current" /> : <RefreshCw className="h-4 w-4" />}
                   </button>
@@ -284,6 +298,13 @@ export function TreeColumn(props: TreeColumnProps): React.ReactElement {
           </p>
         )}
 
+        {/* In place of the back-up-now button, which the tree no longer offers. */}
+        {!props.readOnly && !selection.selectMode && backup.backupOff && (
+          <p className="px-2 pb-1.5 text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
+            {t('filePanel.backupOff', 'File backup is off for this computer.')}
+          </p>
+        )}
+
         {props.scopeDir != null && (
           <div className="file-panel-tree-scope">
             <span className="truncate">{props.scopeDir ? `${props.scopeDir}/` : '/'}</span>
@@ -310,10 +331,10 @@ export function TreeColumn(props: TreeColumnProps): React.ReactElement {
           </div>
         )}
 
-        {/* The stores are pinned above the listing, and outside the tree for
-            the same reason the running apps are: they are not files, and a
-            `role="tree"` cannot hold rows that are not treeitems. */}
-        {(props.onOpenMemory || props.onOpenMemo) && (
+        {/* The stores and the chart are pinned above the listing, and outside
+            the tree for the same reason the running apps are: they are not
+            files, and a `role="tree"` cannot hold rows that are not treeitems. */}
+        {(props.onOpenMemory || props.onOpenMemo || props.onOpenChart) && (
           <div className="file-panel-store-group">
             {props.onOpenMemory && (
               <button type="button" className="file-panel-item file-panel-store-row" onClick={props.onOpenMemory}>
@@ -328,6 +349,14 @@ export function TreeColumn(props: TreeColumnProps): React.ReactElement {
                 <ScrollText className="h-3.5 w-3.5 shrink-0" style={{ color: 'var(--color-text-tertiary)' }} />
                 <span className="flex-1 min-w-0 truncate text-xs" style={{ color: 'var(--color-text-primary)' }}>
                   {t('filePanel.tabs.memo')}
+                </span>
+              </button>
+            )}
+            {props.onOpenChart && (
+              <button type="button" className="file-panel-item file-panel-store-row" onClick={props.onOpenChart}>
+                <CandlestickChart className="h-3.5 w-3.5 shrink-0" style={{ color: 'var(--color-text-tertiary)' }} />
+                <span className="flex-1 min-w-0 truncate text-xs" style={{ color: 'var(--color-text-primary)' }}>
+                  {t('filePanel.chartTab')}
                 </span>
               </button>
             )}

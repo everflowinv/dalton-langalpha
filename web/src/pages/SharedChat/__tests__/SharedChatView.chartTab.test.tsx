@@ -158,10 +158,12 @@ describe('SharedChatView chart cards', () => {
     expect(panelProps!.filesLoading).toBe(false);
     expect(getSharedFiles).toHaveBeenCalledTimes(1);
 
-    const toggle = screen.getByTitle('Workspace Files');
-    fireEvent.click(toggle);
+    // The open panel covers the header's toggle and closes by its own copy of it.
+    expect(screen.queryByTitle('Workspace Files')).toBeNull();
+    expect(panelProps!.panelToggle).toBe(true);
+    act(() => (panelProps!.onClose as () => void)());
     await waitFor(() => expect(document.querySelector('[data-testid="file-panel"]')).toBeNull());
-    fireEvent.click(toggle);
+    fireEvent.click(screen.getByTitle('Workspace Files'));
     await waitFor(() => expect(document.querySelector('[data-testid="file-panel"]')).not.toBeNull());
     expect(panelProps!.files).toEqual(['report.md']);
     expect(getSharedFiles).toHaveBeenCalledTimes(1);

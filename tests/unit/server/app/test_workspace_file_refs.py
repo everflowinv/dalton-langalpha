@@ -21,6 +21,7 @@ from src.server.app.workspace_files._containment import contained_relative_path
 from src.server.app.workspace_files._shared import (
     _normalize_requested_path,
     previous_dir_names_of,
+    previous_roots_of,
 )
 from src.server.app.workspace_files.crud import resolve_workspace_file
 from src.server.app.workspace_files.file_refs import (
@@ -231,6 +232,38 @@ class TestPreviousFolderSpellings:
         assert previous_dir_names_of(row) == ("Old Name",)
         assert previous_dir_names_of({"dir_name": "New Name"}) == ()
         assert previous_dir_names_of(None) == ()
+
+
+class TestPreviousRootSpellings:
+    """A turn from before a move spells the folder under the computer it left,
+    by whatever name the folder had then."""
+
+    @pytest.mark.parametrize(
+        "requested",
+        [
+            "/srv/old/Old Name/reports/q3.md",
+            "/srv/old/New Name/reports/q3.md",
+            "file:///srv/old/Old%20Name/reports/q3.md",
+        ],
+    )
+    def test_the_folder_under_a_root_left_behind_is_this_folder(self, requested):
+        folded = clean_path(
+            requested, RENAMED_WORK_DIR, PREVIOUS, previous_roots=("/srv/old",)
+        )
+        assert folded == "reports/q3.md"
+
+    def test_another_folder_under_a_root_left_behind_is_refused(self):
+        # A sibling's folder on the computer the workspace left.
+        requested = "/srv/old/Beta/secret.md"
+        assert clean_path(requested, RENAMED_WORK_DIR, PREVIOUS, previous_roots=("/srv/old",)) is None
+        assert clean_path("/srv/old/Old Name/../Beta/x.md", RENAMED_WORK_DIR, PREVIOUS, previous_roots=("/srv/old",)) is None
+
+    def test_the_more_specific_root_reads_first(self):
+        # In a folder named `old`, `/srv` would leave the former folder in front.
+        roots = previous_roots_of({"previous_root_dirs": ["/srv", "/srv/old/", ""]})
+        assert roots == ("/srv/old", "/srv")
+        folded = clean_path("/srv/old/Older/q3.md", f"{WORK_DIR}/old", ("Older",), previous_roots=roots)
+        assert folded == "q3.md"
 
 
 class TestResolve:
@@ -455,6 +488,39 @@ async def test_a_shared_thread_resolves_against_the_listing_it_browses():
         "status": "resolved", "path": "archive/report.md", "match": "recent_write",
         "matches": ["archive/report.md", "results/report.md"], "source": "database",
     }
+
+
+@pytest.mark.asyncio
+async def test_a_shared_thread_resolves_a_link_from_before_a_move():
+    """The share sends no former names, so the fold under a root left behind is the server's."""
+    target = SimpleNamespace(
+        workspace={
+            "workspace_id": "ws-1", "status": "stopped", "dir_name": "New Name",
+            "previous_dir_names": ["Old Name"], "previous_root_dirs": ["/srv/old"],
+        },
+        workspace_id="ws-1",
+        work_dir=RENAMED_WORK_DIR,
+    )
+    with (
+        patch(f"{SHARE}.resolve_shared_files", new_callable=AsyncMock, return_value=target),
+        patch(f"{SHARE}._visible_listing", new_callable=AsyncMock, return_value=(["results/report.md"], "database")),
+    ):
+        result = await resolve_shared_file("tok", _body("/srv/old/Old Name/results/report.md"))
+    assert result["status"] == "resolved"
+    assert result["path"] == "results/report.md"
+
+    # A write that turn made picks between namesakes, spelled as it was then.
+    listing = ["results/report.md", "archive/report.md"]
+    with (
+        patch(f"{SHARE}.resolve_shared_files", new_callable=AsyncMock, return_value=target),
+        patch(f"{SHARE}._visible_listing", new_callable=AsyncMock, return_value=(listing, "database")),
+    ):
+        result = await resolve_shared_file(
+            "tok", _body("report.md", writes=["/srv/old/Old Name/archive/report.md"])
+        )
+    assert (result["status"], result["path"], result["match"]) == (
+        "resolved", "archive/report.md", "recent_write",
+    )
 
 
 @pytest.mark.asyncio

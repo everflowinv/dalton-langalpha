@@ -32,7 +32,7 @@ from ptc_agent.config.core import (
 from ptc_agent.core.paths import SandboxLayout
 from ptc_agent.core.project_context import ProjectContext
 from ptc_agent.core.sandbox.providers._image_recipe import builtin_mcp_packages
-from ptc_agent.core.sandbox.runtime import ExecResult, SandboxProvider, SandboxRuntime
+from ptc_agent.core.sandbox.runtime import ExecResult, SandboxRuntime
 from ptc_agent.core.sandbox.tool_overlay import (
     _SCRIPT,
     ToolOverlayError,
@@ -41,6 +41,7 @@ from ptc_agent.core.sandbox.tool_overlay import (
     overlay_claim_missing,
 )
 from ptc_agent.core.sandbox.vault_helper import VAULT_MODULE_SOURCE
+from tests.unit.core.sandbox.fake_provider import fake_provider
 
 
 def _make_config(servers=None) -> CoreConfig:
@@ -70,7 +71,10 @@ def _connector(name, **kw):
 def _make_sandbox(config):
     from ptc_agent.core.sandbox.ptc_sandbox import PTCSandbox
 
-    with patch("ptc_agent.core.sandbox.ptc_sandbox.create_provider"):
+    with patch(
+        "ptc_agent.core.sandbox.ptc_sandbox.create_provider",
+        return_value=fake_provider(),
+    ):
         sandbox = PTCSandbox(config=config)
     return sandbox
 
@@ -1234,8 +1238,7 @@ def discovery_sandbox():
     runtime.working_dir = "/home/workspace"
     runtime.exec = AsyncMock(return_value=ExecResult("", "", 0))
     runtime.upload_file = AsyncMock()
-    provider = AsyncMock(spec=SandboxProvider)
-    provider.is_transient_error = MagicMock(return_value=False)
+    provider = fake_provider()
     with patch(
         "ptc_agent.core.sandbox.ptc_sandbox.create_provider", return_value=provider
     ):

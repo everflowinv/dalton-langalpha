@@ -22,15 +22,18 @@ MoveRefusalCode = Literal[
     "not_movable",
     "same_computer",
     "target_unavailable",
+    "not_primary",
     "turn_active",
     "move_in_progress",
     "not_cancellable",
+    "no_backup",
 ]
 
 MoveErrorCode = Literal[
     "source_unavailable",
     "backup_incomplete",
     "busy",
+    "no_room",
     "target_unavailable",
     "not_found",
     "not_movable",
@@ -41,6 +44,14 @@ MoveErrorCode = Literal[
 
 class WorkspaceMoveRequest(BaseModel):
     computer_id: str = Field(description="The computer to move the workspace to")
+    from_backup: bool = Field(
+        False,
+        description=(
+            "Lay the workspace on the target from its last backup without "
+            "reaching the computer it is on, for a machine its owner brought "
+            "that is gone. The folder there is left as it is"
+        ),
+    )
 
 
 class WorkspaceMoveError(BaseModel):
@@ -60,6 +71,7 @@ class WorkspaceMoveOut(BaseModel):
     source_computer_id: str
     target_computer_id: str
     make_primary: bool
+    from_backup: bool = False
     phase: MovePhase
     error: Optional[WorkspaceMoveError] = None
     created_at: datetime

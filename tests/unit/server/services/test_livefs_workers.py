@@ -181,6 +181,8 @@ class _Box:
 class _Sandbox:
     """One worker's object for the shared sandbox."""
 
+    mounts_livefs = True
+
     def __init__(self, box: _Box, *, lost: bool = False) -> None:
         self.sandbox_id = SANDBOX
         self.layout = LAYOUT
@@ -733,6 +735,8 @@ async def test_a_reconnect_to_a_running_sandbox_reads_the_mount_off_its_one_exec
     mount; the supervisor start every reconnect runs says, at no exec more."""
 
     class _Provider:
+        converges_env = False
+
         async def get(self, sandbox_id, **kwargs):
             return _Running()
 
@@ -774,7 +778,10 @@ async def test_the_supervisor_start_asks_whether_the_mount_answers(stdout, answe
         return await func(*args)
 
     sandbox = SimpleNamespace(
-        runtime=SimpleNamespace(exec=exec_), _runtime_call=runtime_call, _work_dir=ROOT
+        runtime=SimpleNamespace(exec=exec_),
+        _runtime_call=runtime_call,
+        _work_dir=ROOT,
+        mounts_livefs=True,
     )
 
     assert await mcp_setup._start_internal_mcp_servers(sandbox) is answered

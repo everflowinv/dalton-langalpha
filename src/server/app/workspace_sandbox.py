@@ -40,7 +40,7 @@ from src.server.app.workspace_files._shared import (
     work_dir_for,
 )
 from src.server.services.workspace_layout import WorkspaceLayoutUnavailable
-from src.server.utils.error_sanitization import sandbox_unreachable_detail
+from src.server.utils.error_sanitization import sandbox_failure_http
 from src.server.services.workspace_manager import WorkspaceManager
 from ptc_agent.core.paths import DEFAULT_SANDBOX_ROOT, WorkspaceLayout
 from ptc_agent.core.sandbox import PTCSandbox
@@ -159,7 +159,7 @@ async def _get_sandbox(workspace_id: str, user_id: str) -> Any:
     except Exception as e:
         # The raw text quotes provider URLs and sandbox ids; it stays in the log.
         logger.warning(f"Sandbox for workspace {workspace_id} not ready: {e}")
-        raise HTTPException(status_code=503, detail=sandbox_unreachable_detail(e)) from None
+        raise sandbox_failure_http(e) from None
 
     sandbox = getattr(session, "sandbox", None)
     if sandbox is None:
@@ -713,7 +713,7 @@ async def check_preview_health(
         session = await manager.get_session_if_running(workspace_id, user_id=x_user_id)
     except Exception as e:
         logger.warning(f"Preview health could not reach workspace {workspace_id}: {e}")
-        raise HTTPException(status_code=503, detail=sandbox_unreachable_detail(e)) from None
+        raise sandbox_failure_http(e) from None
     sandbox = getattr(session, "sandbox", None)
     if sandbox is None or sandbox.runtime is None:
         raise stopped

@@ -6,11 +6,14 @@ are read and written here. ``provider_ref`` is the vendor's id for the machine
 and is only ever handed to the owner.
 """
 
+import ipaddress
+import posixpath
+import re
 from datetime import datetime
 from enum import StrEnum
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from src.server.services.persistence.sync_result import UnsavedReason
 
@@ -40,7 +43,124 @@ class ComputerStatus(StrEnum):
 CLAIMABLE_FOR_START = (ComputerStatus.STOPPED, ComputerStatus.CREATING)
 
 
-ComputerKind = Literal["daytona", "docker", "e2b"]
+ComputerKind = Literal["daytona", "docker", "e2b", "ssh"]
+
+
+_HOSTNAME = re.compile(
+    r"^(?=.{1,253}$)[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*\.?$"
+)
+# A login name as useradd accepts it, or as SSSD gives a directory account,
+# ``name@domain``, which is what ``id -un`` reports on such a machine. Either
+# way it cannot be read as an ssh option or a second argument.
+_USERNAME = re.compile(
+    r"^(?=.{1,128}$)[A-Za-z_][A-Za-z0-9_.-]*(?:@[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?)?$"
+)
+# A tunnel's id, as ``ssh_tunnels`` mints it.
+_TUNNEL_ID = r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+# "<type> <base64 blob> [comment]", the form ssh-keyscan and known_hosts use.
+_HOST_KEY = re.compile(
+    r"^((?:ssh|ecdsa|sk)-[A-Za-z0-9@.-]+) ([A-Za-z0-9+/]+={0,2})(?: .*)?$"
+)
+
+
+def is_login_name(value: str) -> bool:
+    """Whether *value* is an account name SSH may be told to log in as."""
+    return _USERNAME.fullmatch(value) is not None
+
+
+class ComputerSSHAddress(BaseModel):
+    """Where a machine answers SSH."""
+
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    host: str = Field(
+        min_length=1,
+        max_length=255,
+        description="Hostname or IP address, without a scheme, user or port",
+    )
+    port: int = Field(22, ge=1, le=65535, description="SSH port")
+
+    @field_validator("host")
+    @classmethod
+    def _check_host(cls, value: str) -> str:
+        bare = value[1:-1] if value.startswith("[") and value.endswith("]") else value
+        try:
+            return str(ipaddress.ip_address(bare))
+        except ValueError:
+            pass
+        if not _HOSTNAME.match(bare):
+            raise ValueError(
+                "Enter a hostname or IP address only, without a scheme, user or port"
+            )
+        return bare.rstrip(".").lower()
+
+
+class ComputerSSHTarget(ComputerSSHAddress):
+    """A machine to reach over SSH: an address and the account to log in as."""
+
+    username: str = Field(min_length=1, max_length=128, description="Login name")
+
+    @field_validator("username")
+    @classmethod
+    def _check_username(cls, value: str) -> str:
+        if not is_login_name(value):
+            raise ValueError("Enter the login name of an account on the machine")
+        return value
+
+
+class ComputerSSHSpec(ComputerSSHTarget):
+    """The SSH machine a new computer runs on, as the probe confirmed it."""
+
+    host_key: str = Field(
+        min_length=1,
+        max_length=16384,
+        description=(
+            "The machine's public host key as an OpenSSH line, the one the "
+            "probe returned and the user confirmed. Any other key is refused."
+        ),
+    )
+    root_dir: Optional[str] = Field(
+        None,
+        max_length=1024,
+        description=(
+            "Absolute folder the computer works in on the machine; when "
+            "absent, ~/langalpha in the login's home, or the next free "
+            "~/langalpha-N when another of the caller's computers uses it"
+        ),
+    )
+    tunnel_id: Optional[str] = Field(
+        None,
+        pattern=_TUNNEL_ID,
+        description=(
+            "The caller's tunnel the pairing reached the machine through. The "
+            "machine is then reached through the gateway: host is only its "
+            "name, and port its SSH port on the machine itself"
+        ),
+    )
+
+    @field_validator("host_key")
+    @classmethod
+    def _check_host_key(cls, value: str) -> str:
+        match = _HOST_KEY.match(value)
+        if match is None:
+            raise ValueError("host_key is not an OpenSSH public key line")
+        # The comment carries nothing the pin needs.
+        return f"{match.group(1)} {match.group(2)}"
+
+    @field_validator("root_dir")
+    @classmethod
+    def _check_root_dir(cls, value: Optional[str]) -> Optional[str]:
+        if value is None or value == "":
+            return None
+        if not value.startswith("/") or any(ord(c) < 32 for c in value):
+            raise ValueError("root_dir must be an absolute path")
+        # normpath keeps a leading "//", which would make one folder two to
+        # the check that keeps computers out of each other's folders.
+        normal = posixpath.normpath("/" + value.lstrip("/"))
+        if normal == "/" or ".." in normal.split("/"):
+            raise ValueError("root_dir must be a folder below /")
+        return normal
 
 
 class ComputerCreate(BaseModel):
@@ -62,6 +182,222 @@ class ComputerCreate(BaseModel):
             "Sandbox provider the computer runs on, for good; the deployment "
             "default when absent. Must be one GET /computers/providers lists."
         ),
+    )
+    ssh: Optional[ComputerSSHSpec] = Field(
+        None,
+        description="The machine to use; required with kind ssh, refused otherwise",
+    )
+    files_backup: bool = Field(
+        True,
+        description=(
+            "Whether routine backups of its workspaces' files run. Only a "
+            "machine the server never rebuilds (kind ssh) may be created "
+            "without them"
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _ssh_only_with_its_kind(self) -> "ComputerCreate":
+        if self.kind == "ssh" and self.ssh is None:
+            raise ValueError("kind ssh needs ssh: host, port, username and host_key")
+        if self.kind != "ssh" and self.ssh is not None:
+            raise ValueError("ssh is only accepted with kind ssh")
+        if self.ssh is not None:
+            # The machine's size is its own, so the one tier is the only one.
+            self.resource_tier = "standard"
+        return self
+
+
+class ComputerSSHKeyResponse(BaseModel):
+    """The caller's SSH client key, which every machine they add must trust."""
+
+    public_key: str = Field(description="OpenSSH public key line")
+    fingerprint: str = Field(description="SHA256 fingerprint of the public key")
+    authorized_keys_command: str = Field(
+        description=(
+            "A shell command that adds the key to the login account's "
+            "authorized_keys, run once on the machine"
+        )
+    )
+
+
+class ComputerSSHProbeResponse(BaseModel):
+    """What a probe found on the machine, for the user to confirm before adding it."""
+
+    host_key: str = Field(
+        description="The machine's host key as an OpenSSH line, pinned on create"
+    )
+    fingerprint: str = Field(description="SHA256 fingerprint of the host key")
+    os: str
+    arch: str
+    distro: str
+    home: str
+    shell: str
+    is_root: bool
+    has_sudo: bool = Field(
+        description="Whether the account may sudo without a password"
+    )
+    disk_free_bytes: Optional[int] = None
+    supported: bool = Field(description="Whether a computer can run on the machine")
+    problems: List[str] = Field(
+        default_factory=list,
+        description="Why it cannot, or what will not work, one sentence each",
+    )
+    hostname: str = Field("", description="The machine's own name for itself")
+    suggested_root_dir: str = Field(
+        description=(
+            "The folder a computer created without root_dir would work in: "
+            "~/langalpha in the login's home, or the next free ~/langalpha-N "
+            "when another of the caller's computers already uses it"
+        ),
+    )
+
+
+class ComputerSSHPairingResponse(BaseModel):
+    """A pairing: the command that adds a machine by being run on it."""
+
+    token: str = Field(
+        description="Names the pairing in the routes below; also in the command"
+    )
+    command: str = Field(
+        description="One line to run on the machine as the account the agent will use"
+    )
+    script_url: str = Field(
+        description="The script the command runs, for reading first"
+    )
+    expires_at: datetime
+    local_only: bool = Field(
+        False,
+        description=(
+            "The command reaches this server only from the machine running it, "
+            "so it can add that machine and no other"
+        ),
+    )
+
+
+class ComputerSSHPairingMachine(BaseModel):
+    """What the machine said about itself when the command ran."""
+
+    username: str
+    hostname: str
+    os: str = Field("", description="uname -s: Linux or Darwin")
+    addresses: List[str] = Field(
+        description="Where it may be reached, the one it reported from first"
+    )
+
+
+class ComputerSSHPairingTarget(BaseModel):
+    """The address and account that logged in."""
+
+    host: str
+    port: int
+    username: str
+    tunnel_id: Optional[str] = Field(
+        None,
+        description=(
+            "Set when the machine was reached through its tunnel; a create "
+            "passes it on, and host is then only the machine's name"
+        ),
+    )
+
+
+class ComputerSSHPairingError(BaseModel):
+    code: str = Field(
+        description=(
+            "unreachable, timeout, auth_failed, host_key_mismatch (something "
+            "else answered there), private_address, not_connected (the "
+            "machine's tunnel did not come up), gateway_unreachable (the "
+            "tunnel gateway did not answer), no_host_key (the machine named "
+            "no SSH host keys, so it was not dialed) or script_failed (the "
+            "command stopped on the machine; the message is what it printed)"
+        )
+    )
+    message: str = Field(description="A sentence the client may show as is")
+
+
+class ComputerSSHPairingStatus(BaseModel):
+    """Where a pairing stands, for the dialog that polls it."""
+
+    status: Literal["waiting", "checking", "tunneling", "ready", "failed"] = Field(
+        description=(
+            "waiting for the command to run; checking while the server dials "
+            "the machine; tunneling while the machine, which could not be "
+            "dialed, sets up a tunnel and is reached through it; ready with "
+            "target and probe; failed with error"
+        )
+    )
+    expires_at: datetime
+    machine: Optional[ComputerSSHPairingMachine] = None
+    target: Optional[ComputerSSHPairingTarget] = None
+    probe: Optional[ComputerSSHProbeResponse] = Field(
+        None, description="As POST /ssh/probe answers, for the machine that logged in"
+    )
+    error: Optional[ComputerSSHPairingError] = None
+
+
+# A form field the pairing script posts is cut to this, so what a pairing
+# keeps of one stays small. The route caps the whole body before parsing it.
+_MAX_FORM_FIELD = 16384
+
+
+class _ScriptForm(BaseModel):
+    """A form the pairing script posts, every field text and none refused.
+
+    The script prints the answer's body, so a field of the wrong shape or
+    length is cut to text here and judged where it is read: a JSON 422 would
+    reach the machine's terminal as noise.
+    """
+
+    @field_validator("*", mode="before")
+    @classmethod
+    def _as_text(cls, value: Any) -> str:
+        return str(value)[:_MAX_FORM_FIELD]
+
+
+class ComputerSSHPairingReport(_ScriptForm):
+    """What the script reports of the machine it runs on, all of it unchecked."""
+
+    user: str = ""
+    os: str = ""
+    hostname: str = ""
+    host_keys: str = ""
+    ports: str = ""
+    addresses: str = ""
+    can_tunnel: str = ""
+    tunnel_id: str = ""
+    # The run of the command that sent this, a report or a stop.
+    run: str = ""
+    # Sent with only the run beside it, and set even when empty: the script
+    # stopping, and why.
+    failed: Optional[str] = None
+
+
+class ComputerSSHTunnelRequest(_ScriptForm):
+    """The script's ask for a tunnel: the public half of the key it made."""
+
+    public_key: str = ""
+    hostname: str = ""
+
+
+class ComputerSSHInfo(BaseModel):
+    """Where an ssh computer's machine is, as its owner entered it."""
+
+    host: str
+    port: int
+    username: str
+    fingerprint: Optional[str] = Field(
+        None, description="SHA256 fingerprint of the pinned host key"
+    )
+    tunnel: bool = Field(
+        False,
+        description=(
+            "The machine connects out through a tunnel rather than being "
+            "dialed; host is then only its name"
+        ),
+    )
+    tunnel_connected: Optional[bool] = Field(
+        None,
+        description="Whether the tunnel is up now; null when there is none or it is not known",
     )
 
 
@@ -100,6 +436,17 @@ class ComputerAlwaysOnRequest(BaseModel):
     """Request model for toggling a computer's always-on flag."""
 
     enabled: bool = Field(description="Whether to keep the computer always-on")
+
+
+class ComputerFilesBackupRequest(BaseModel):
+    """Request model for a machine owner's file backup switch."""
+
+    enabled: bool = Field(
+        description=(
+            "Whether routine backups of its workspaces' files run; off keeps "
+            "the last backup as it is"
+        )
+    )
 
 
 class ComputerRenameRequest(BaseModel):
@@ -220,7 +567,7 @@ class ComputerResponse(BaseModel):
 
     computer_id: str = Field(description="Unique computer identifier")
     user_id: str = Field(description="Owner user ID")
-    kind: str = Field(description="Execution backend: daytona, docker, e2b")
+    kind: str = Field(description="Execution backend: daytona, docker, e2b, ssh")
     name: str = Field(description="User-facing computer name")
     status: str = Field(
         description=(
@@ -235,6 +582,13 @@ class ComputerResponse(BaseModel):
     is_always_on: bool = Field(
         False,
         description="Whether auto-stop is disabled (always-on computer)",
+    )
+    files_backup: bool = Field(
+        True,
+        description=(
+            "Whether routine backups of its workspaces' files run; off only on "
+            "a machine its owner brought"
+        ),
     )
     is_primary: bool = Field(
         False,
@@ -283,6 +637,9 @@ class ComputerResponse(BaseModel):
     spec_change: Optional[ComputerSpecChange] = Field(
         None,
         description="The last spec change and its outcome; null when none was requested",
+    )
+    ssh: Optional[ComputerSSHInfo] = Field(
+        None, description="The machine an ssh computer runs on; null for other kinds"
     )
 
     model_config = ConfigDict(from_attributes=True)
@@ -334,6 +691,42 @@ class ComputerActionResponse(BaseModel):
     computer_id: str = Field(description="Computer identifier")
     status: str = Field(description="New computer status")
     message: str = Field(description="Action result message")
+
+
+KeyRemovalOutcome = Literal["removed", "kept", "skipped", "unreached"]
+
+
+class ComputerKeyRemoval(BaseModel):
+    """What became of the client key's line on a removed ssh computer's machine."""
+
+    outcome: KeyRemovalOutcome = Field(
+        description=(
+            "removed: taken out of ~/.ssh/authorized_keys. kept: another of the "
+            "user's computers logs in with it through the same file, as the same "
+            "user on the machine or from a host that shares the home. "
+            "skipped: the file was not one to change safely (a link, another "
+            "owner's, missing, a line for the key its owner changed, or the key "
+            "authorized from another file). unreached: the machine did not answer"
+        )
+    )
+    used_by: Optional[str] = Field(
+        None, description="On kept, the name of the computer that still logs in with it"
+    )
+    fingerprint: Optional[str] = Field(
+        None, description="SHA256 fingerprint of the key, for removing it by hand"
+    )
+    comment: Optional[str] = Field(
+        None, description="The comment that ends the key's line"
+    )
+
+
+class ComputerRemoveResponse(BaseModel):
+    """What a removal left behind that its owner may want to know about."""
+
+    key: Optional[ComputerKeyRemoval] = Field(
+        None,
+        description="Null for a computer on any kind but ssh, and when the key was kept on request",
+    )
 
 
 class ComputerSessionResponse(BaseModel):

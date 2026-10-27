@@ -213,6 +213,18 @@ class TestCreateSandboxConfigNewFormat:
         cfg = create_sandbox_config(config_data)
         assert cfg.provider == "daytona"
 
+    def test_an_ssh_section_naming_a_computers_target_is_refused(self):
+        """Each computer's settings lie over the section, so a tunnel set
+        there would route every computer that lacks one through it."""
+        config_data = {
+            "sandbox": {"provider": "docker", "ssh": {"tunnel": "t", "port": 2222}}
+        }
+        with pytest.raises(ValueError, match="sandbox.ssh cannot set port, tunnel"):
+            create_sandbox_config(config_data)
+
+        tunables = {"sandbox": {"provider": "docker", "ssh": {"connect_timeout": 5}}}
+        assert create_sandbox_config(tunables).ssh.connect_timeout == 5
+
 
 # ---------------------------------------------------------------------------
 # create_sandbox_config — backward compat "daytona:" key

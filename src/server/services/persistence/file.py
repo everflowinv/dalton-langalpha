@@ -77,6 +77,7 @@ class FilePersistenceService:
     prior_from_meta = staticmethod(backup.prior_from_meta)
     restore_to_sandbox = staticmethod(restore.restore_to_sandbox)
     maybe_restore = staticmethod(restore.maybe_restore)
+    settle_restore_offer = staticmethod(restore.settle_restore_offer)
     restore_deferred = staticmethod(restore.restore_deferred)
     get_file_tree = staticmethod(get_file_tree)
     get_file_content = staticmethod(get_file_content)

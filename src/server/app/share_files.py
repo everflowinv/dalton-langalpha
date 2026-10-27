@@ -41,6 +41,7 @@ from src.server.app.workspace_files._shared import (
     _to_client_path,
     folder_unmoved,
     previous_dir_names_of,
+    previous_roots_of,
 )
 from src.server.app.workspace_files.file_refs import (
     ResolveFileRefRequest,
@@ -280,13 +281,17 @@ async def resolve_shared_file(share_token: str, body: ResolveFileRefRequest):
         return {"status": "unavailable", "reason": HOME_NOT_ON_COMPUTER_REASON, "matches": []}
 
     previous_dirs = previous_dir_names_of(target.workspace)
-    candidates = clean_candidates(body.candidates, target.work_dir, previous_dirs)
+    previous_roots = previous_roots_of(target.workspace)
+    candidates = clean_candidates(
+        body.candidates, target.work_dir, previous_dirs, previous_roots=previous_roots
+    )
     if not candidates:
         raise HTTPException(status_code=400, detail="A file reference is required")
     recent_writes = [
         p
         for p in (
-            clean_path(w, target.work_dir, previous_dirs) for w in body.recent_writes
+            clean_path(w, target.work_dir, previous_dirs, previous_roots=previous_roots)
+            for w in body.recent_writes
         )
         if p
     ]

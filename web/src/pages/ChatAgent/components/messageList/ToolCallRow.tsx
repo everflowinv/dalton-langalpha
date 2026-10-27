@@ -27,7 +27,7 @@ const RUNNING_VERB_KEY: Record<string, string> = { Read: 'read', Edit: 'edit', W
 function runningLine(item: ToolActivityItem, t: (key: string) => string): { verb: string; pill: string | null } {
   const verbKey = RUNNING_VERB_KEY[item.toolName || ''];
   const filePath = verbKey ? filePathOf(item) : null;
-  if (verbKey && filePath && classifyAgentPath(filePath).kind === 'file') {
+  if (verbKey && filePath && classifyAgentPath(filePath, item.root).kind === 'file') {
     return { verb: t(`toolArtifact.running.${verbKey}`), pill: completedToolSummary(item, t) || filePath.split('/').pop() || null };
   }
   return { verb: liveToolLabel(item, t), pill: null };
@@ -90,7 +90,7 @@ export const ToolCallRow = memo(function ToolCallRow({ item, onClick, running = 
   const failedLabel = t('toolArtifact.a11y.toolCallFailed');
 
   // Decide the destination tab label for the pill tooltip.
-  const cat = categorizeTool(toolName, item.toolCall);
+  const cat = categorizeTool(toolName, item.toolCall, item.root);
   const isMemory = cat === 'memoryRead' || cat === 'memoryWrite';
   const tabLabel = isMemory
     ? t('filePanel.tabs.memory')

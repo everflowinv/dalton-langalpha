@@ -25,7 +25,6 @@ from ptc_agent.config.core import (
     SandboxConfig,
     SecurityConfig,
     create_default_security_config,
-    default_sandbox_skills_base,
     detect_provider_kind,
     validate_sandbox_api_keys,
 )
@@ -125,10 +124,9 @@ class SkillsConfig(BaseModel):
     enabled: bool = True
     #: See ``DEFAULT_USER_SKILLS_DIR``.
     user_skills_dir: str = DEFAULT_USER_SKILLS_DIR
-    sandbox_skills_base: str = "/home/workspace/.agents/skills"  # Where skills live in sandbox
 
-    def local_skill_dirs_with_sandbox(self) -> list[tuple[str, str]]:
-        """Return ordered (local_dir, sandbox_dir) sources.
+    def local_skill_dirs(self) -> list[str]:
+        """Return the ordered host-side skill sources.
 
         Precedence is last-wins (later sources override earlier ones).
         Order: bundled skills < user skills.
@@ -138,12 +136,10 @@ class SkillsConfig(BaseModel):
         operator's from their home — so a server started from anywhere finds
         the same skills, which a directory relative to ``cwd`` could not
         promise once the shipped skills moved into the bundles that declare
-        them.
+        them. Where they land is the sandbox's to say: the folder sits under
+        each computer's own root, which no deployment-wide setting knows.
         """
-        return [
-            (str(d), self.sandbox_skills_base)
-            for d in host_skill_dirs(self.user_skills_dir)
-        ]
+        return [str(d) for d in host_skill_dirs(self.user_skills_dir)]
 
 
 class SubagentConfig(BaseModel):
@@ -545,14 +541,9 @@ class AgentConfig(BaseModel):
             enable_path_validation=kwargs.pop("enable_path_validation", True),
         )
 
-        # Create Skills config (derive sandbox_skills_base from filesystem working_directory)
         skills_config = SkillsConfig(
             enabled=kwargs.pop("skills_enabled", True),
             user_skills_dir=kwargs.pop("user_skills_dir", "~/.ptc-agent/skills"),
-            sandbox_skills_base=kwargs.pop(
-                "sandbox_skills_base",
-                default_sandbox_skills_base(filesystem_config.working_directory),
-            ),
         )
 
         # Wrap in SandboxConfig with resolved provider

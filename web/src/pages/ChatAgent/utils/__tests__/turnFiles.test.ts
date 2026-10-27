@@ -239,6 +239,24 @@ describe('collectTurnFiles', () => {
     expect(files).toEqual([{ path: 'report.md' }, { path: 'report.md', workspaceId: 'ws-nvda' }]);
   });
 
+  it('reads paths under the computer\'s own root as it reads the stock root', () => {
+    // A computer whose user cannot create the stock root keeps its folders
+    // under one of its own, and the reply's absolute links start there.
+    const root = '/home/someone/langalpha';
+    const files = collectTurnFiles(
+      [assistant(
+        `See [the report](file://${root}/Home/weekly/report.md), [my notes](${root}/Home/agent.md) and [theirs](${root}/NVDA/report.md).`,
+        { a: write(0, `${root}/Home/data/prices.csv`) },
+      )],
+      { ...own('Home', [], [{ workspaceId: 'ws-nvda', dirName: 'NVDA' }]), rootDir: root },
+    );
+    expect(files).toEqual([
+      { path: 'weekly/report.md' },
+      { path: 'report.md', workspaceId: 'ws-nvda' },
+      { path: 'data/prices.csv' },
+    ]);
+  });
+
   it('leaves out system paths, section links and folders', () => {
     const files = collectTurnFiles([
       assistant('[skills](.agents/skills/report/SKILL.md), [a section](#findings), [a folder](results/), [a route](/settings)'),

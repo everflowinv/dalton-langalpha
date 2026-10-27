@@ -9,6 +9,7 @@ import { useTranslation } from 'react-i18next';
 import ToolCallDetailView, { type ToolCallProcessRecord, type SubagentInfo } from './ToolCallDetailView';
 import { taskCardStatusKind } from './taskStatusUi';
 import { isToolCallFailed } from './filePanel/toolCallFailure';
+import { useWorkspaceFolders } from '../contexts/WorkspaceContext';
 
 interface DetailPanelProps {
   toolCallProcess: ToolCallProcessRecord | null;
@@ -24,6 +25,7 @@ interface DetailPanelProps {
 function DetailPanel({ toolCallProcess, onOpenFile, onOpenSubagentTask }: DetailPanelProps): React.ReactElement | null {
   const { t } = useTranslation();
   const isMobile = useIsMobile();
+  const root = useWorkspaceFolders()?.rootDir;
 
   if (!toolCallProcess) return null;
 
@@ -33,7 +35,7 @@ function DetailPanel({ toolCallProcess, onOpenFile, onOpenSubagentTask }: Detail
   const artifact = toolCallProcess.toolCallResult?.artifact;
   const displayName = isTask
     ? t('toolArtifact.subagentTask')
-    : getDisplayName(toolName, t, toolArgs, artifact);
+    : getDisplayName(toolName, t, toolArgs, { artifact, root });
   const subagentType = isTask ? ((toolCallProcess.toolCall?.args?.subagent_type as string) || 'general-purpose') : '';
   // Status only — a Task's reply exists from the moment it is dispatched, so
   // `content` marked every running task "completed" and contradicted the

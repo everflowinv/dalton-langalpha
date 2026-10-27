@@ -18,30 +18,9 @@
   font-weight: 500;
   color: var(--color-text-secondary);
 }
-.file-panel-empty-tab-btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  margin-top: 4px;
-  padding: 6px 12px;
-  border-radius: var(--radius);
-  border: 1px solid var(--color-border-default);
-  background: var(--color-bg-card);
-  color: var(--color-text-primary);
-  font-size: 0.8125rem;
-  font-weight: 500;
-  cursor: pointer;
-}
-.file-panel-empty-tab-btn:hover { background: var(--color-bg-card-hover); }
 .file-panel-empty-tab-hint {
   max-width: min(22rem, 100%);
   font-size: 0.75rem;
   line-height: 1.5;
   color: var(--color-text-tertiary);
-}
-.file-panel-empty-tab-actions {
-  display: flex;
-  flex-wrap: wrap;
-  justify-content: center;
-  gap: 8px;
 }

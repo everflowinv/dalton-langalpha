@@ -203,6 +203,97 @@ async def test_backup_scans_the_folder_read_under_the_folder_hold():
 
 
 @pytest.mark.asyncio
+async def test_a_backup_that_found_the_folder_gone_answers_as_a_standing_offer():
+    """The pass offered the restore instead of mirroring the emptied folder, so
+    nothing was saved; a 200 with nothing synced would read as a backup made."""
+    from fastapi import HTTPException
+
+    from src.server.app.workspace_files.crud import backup_workspace_files
+    from src.server.services.persistence.sync_result import SyncResult
+
+    from contextlib import nullcontext
+
+    row = {**_workspace("ws-1", "user-1", status="running"), "computer_root_dir": "/home/u"}
+    with (
+        patch("src.server.app.workspace_files.crud.db_get_workspace", AsyncMock(return_value=row)),
+        patch(
+            "src.server.app.workspace_files.crud.get_computer",
+            AsyncMock(return_value={"computer_id": "comp-1", "files_backup": True}),
+        ),
+        patch(
+            "src.server.app.workspace_files._shared.workspace_folder_in_use",
+            lambda _workspace_id: nullcontext(),
+        ),
+        patch(
+            "src.server.app.workspace_files._shared._acquire_sandbox",
+            AsyncMock(return_value=(object(), {**row, "dir_name": "Research"})),
+        ),
+        patch(
+            "src.server.app.workspace_files._shared.db_get_workspace",
+            AsyncMock(return_value={**row, "dir_name": "Research"}),
+        ),
+        patch(
+            "src.server.app.workspace_files.crud.FilePersistenceService.sync_to_db",
+            AsyncMock(return_value=SyncResult(held=True)),
+        ),
+        pytest.raises(HTTPException) as refused,
+    ):
+        await backup_workspace_files(workspace_id="ws-1", x_user_id="user-1")
+
+    assert refused.value.status_code == 409
+    assert "Restore it from the backup" in refused.value.detail
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("offered_at", "files_backup", "detail"),
+    [
+        (
+            "2026-10-01T00:00:00Z",
+            True,
+            "This workspace's folder is missing on its computer. Restore it "
+            "from the backup or keep it as it is first.",
+        ),
+        (None, False, "File backup is off for this computer."),
+    ],
+    ids=["restore-offered", "backups-off"],
+)
+async def test_a_backup_asked_for_by_hand_is_refused_before_the_machine_is_reached(
+    offered_at, files_backup, detail
+):
+    """A pass over a folder that is gone prunes the backup the owner may yet
+    restore, and one on a machine with backups off replaces the backup its
+    owner chose to keep. Refused before the acquire, which would start the
+    machine for nothing."""
+    from fastapi import HTTPException
+
+    from src.server.app.workspace_files.crud import backup_workspace_files
+
+    row = {
+        **_workspace("ws-1", "user-1", status="running"),
+        "computer_id": "comp-1",
+        "files_restore_offered_at": offered_at,
+    }
+    acquire = AsyncMock()
+    sync = AsyncMock()
+    with (
+        patch("src.server.app.workspace_files._shared.db_get_workspace", AsyncMock(return_value=row)),
+        patch(
+            "src.server.app.workspace_files.crud.get_computer",
+            AsyncMock(return_value={"computer_id": "comp-1", "files_backup": files_backup}),
+        ),
+        patch("src.server.app.workspace_files._shared._acquire_sandbox", acquire),
+        patch("src.server.app.workspace_files.crud.FilePersistenceService.sync_to_db", sync),
+        pytest.raises(HTTPException) as refused,
+    ):
+        await backup_workspace_files(workspace_id="ws-1", x_user_id="user-1")
+
+    assert (refused.value.status_code, refused.value.detail) == (409, detail)
+    acquire.assert_not_awaited()
+    sync.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("moving", ["hold_times_out", "row_staged"])
 async def test_backup_status_falls_back_when_the_folder_is_moving(moving):
     """A folder a settle is moving cannot be scanned yet, and the status is
@@ -253,4 +344,6 @@ async def test_backup_status_falls_back_when_the_folder_is_moving(moving):
         "untracked": [],
         "total_backed_up_size": 7,
         "files_restore_incomplete": False,
+        "files_backup": True,
+        "files_restore_offered_at": None,
     }

@@ -57,6 +57,11 @@ COPY mcp_servers/ mcp_servers/
 COPY plugins/ plugins/
 COPY workflows/ workflows/
 
+# The commit this image was built from, stamped on every LangSmith run so a
+# regression can be pinned to a deploy. Last, so a new SHA rebuilds only this.
+ARG LANGALPHA_BUILD_SHA=
+ENV LANGALPHA_BUILD_SHA=${LANGALPHA_BUILD_SHA}
+
 EXPOSE 8000
 
 # tini reaps orphaned browser subprocesses. `-s` registers as child

@@ -20,6 +20,7 @@ from src.server.services.computer_manager import _thread_dirs
 from src.server.services.livefs import cache
 from src.server.services.persistence import restore
 from src.server.services.persistence.file import FilePersistenceService
+from src.server.services.persistence.transfer import DEFERRED_MARKER
 from src.server.services.workspace_layout import held_workspace_layout
 
 if TYPE_CHECKING:
@@ -215,7 +216,21 @@ class BringUp:
             live = await _thread_prefixes(workspace_id)
         except Exception:  # noqa: BLE001 - the pass reads them again and reports
             return False
-        return stamp == _stamp(self.sandbox_id, live)
+        if stamp != _stamp(self.sandbox_id, live):
+            return False
+        # A machine keeps its id when only the folder goes (its owner's own, or
+        # a folder lost on a sandbox never rebuilt), so the stamp outlives the
+        # files: a folder laid again since lacks the marker the pass writes.
+        try:
+            async with held_workspace_layout(workspace_id, self.root) as layout:
+                if layout is None:
+                    return False
+                marker = await self.sandbox.adownload_file_bytes(
+                    layout.join(DEFERRED_MARKER)
+                )
+        except Exception:  # noqa: BLE001 - the pass looks again and reports
+            return False
+        return marker is not None
 
     async def _restore(self, workspace_id: str, step: _Step) -> None:
         done = False
@@ -377,7 +392,7 @@ class BringUpMixin:
             if not sandbox_id:
                 return
             async with (
-                self._computer_runtime(computer, str(sandbox_id)) as runtime,
+                self.computer_runtime(computer, str(sandbox_id)) as runtime,
                 held_workspace_layout(
                     workspace_id, computer.get("root_dir") or DEFAULT_ROOT_DIR
                 ) as layout,

@@ -4,6 +4,7 @@ import structlog
 from langchain_core.tools import BaseTool, tool
 
 from ptc_agent.agent.backends import FilesystemBackend
+from ptc_agent.agent.tools.utils import mark_sandbox_raised, stamp_sandbox_served
 from ptc_agent.core.paths import logged_path
 from ptc_agent.core.sandbox.glob_runtime import TooManyPatterns, expand_braces
 from src.observability.private_errors import failure
@@ -68,6 +69,7 @@ def create_glob_tool(backend: FilesystemBackend) -> BaseTool:
             except TooManyPatterns as e:
                 return f"ERROR: {e}"
 
+            stamp_sandbox_served(backend, normalized_path)
             matches = await backend.aglob_paths(pattern, normalized_path)
 
             if not matches:
@@ -99,6 +101,7 @@ def create_glob_tool(backend: FilesystemBackend) -> BaseTool:
             return result.rstrip()
 
         except Exception as e:
+            mark_sandbox_raised(e)
             error_msg = f"Failed to glob files: {e!s}"
             fields, trace = failure(e)
             logger.error("Failed to glob files", path=logged_path(search_path), exc_info=trace, **fields)

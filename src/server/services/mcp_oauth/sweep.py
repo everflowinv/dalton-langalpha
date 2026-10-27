@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 SWEEP_INTERVAL_S = 300.0
 SWEEP_BATCH_LIMIT = 20
 # Refresh anything expiring inside this window (comfortably wider than the
-# hot path's 10-minute margin so the sweeper usually gets there first).
+# hot path's margin, at most 10 minutes, so the sweeper usually gets there first).
 DUE_MARGIN_SECONDS = 900
 STOP_GRACE = 30.0
 

@@ -18,6 +18,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import posixpath
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
@@ -34,14 +35,14 @@ from ptc_agent.agent.transcript import (
     load_manifest,
 )
 from ptc_agent.agent.transcript.render import SCHEMA_VERSION
-from ptc_agent.core.paths import WorkspaceLayout
+from ptc_agent.core.paths import THREAD_INDEX, WorkspaceLayout
 
 if TYPE_CHECKING:
     from src.server.database.thread_transcripts import TaskRun
 
 logger = logging.getLogger(__name__)
 
-INDEX = "threads.jsonl"
+INDEX = posixpath.basename(THREAD_INDEX)
 
 # Files up to this size keep their bytes in the row even with object storage:
 # most turns fit, and a row costs a turn end no upload and a read no fetch.

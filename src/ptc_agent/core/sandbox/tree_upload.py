@@ -105,7 +105,9 @@ async def upload_tree(
     quoted = shlex.quote(remote)
     steps = [
         f"[ -f {quoted} ] || exit {_ARCHIVE_GONE}",
-        f"trap 'rm -f {quoted}' EXIT",
+        # Quoted whole: under a root with a space the path is in single
+        # quotes of its own, which would end a pair around it.
+        f"trap {shlex.quote(f'rm -f {quoted}')} EXIT",
         f"tar -xzf {quoted} -C / --no-same-owner",
     ]
     result = await sandbox._runtime_call(

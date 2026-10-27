@@ -222,14 +222,17 @@ class ListedFile:
     path: str
     sha256: str
     byte_len: int
+    #: The blob's namespace.
+    user_id: str
 
 
 async def list_transcript_tree(
-    workspace_id: str, short_id: str | None, limit: int
+    workspace_id: str, short_id: str | None, limit: int, *, newest_first: bool = False
 ) -> list[ListedFile]:
     """The first ``limit`` files of the workspace's transcript directories,
     or of the one ``short_id`` names, in directory order, each directory
-    naming its thread as ``_THREAD_BY_SHORT_ID`` picks it."""
+    naming its thread as ``_THREAD_BY_SHORT_ID`` picks it. ``newest_first``
+    takes the directories by when their thread last changed instead."""
     if short_id is None:
         bounds = ("00000000-0000-0000-0000-000000000000", "ffffffff-ffff-ffff-ffff-ffffffffffff")
     else:
@@ -242,7 +245,8 @@ async def list_transcript_tree(
                 """
                 WITH thread AS (
                     SELECT (array_agg(t.conversation_thread_id))[1] AS id,
-                        left(t.conversation_thread_id::text, 8) AS short_id
+                        left(t.conversation_thread_id::text, 8) AS short_id,
+                        max(t.updated_at) AS updated_at
                     FROM conversation_threads t
                     WHERE t.workspace_id = %s
                       AND t.conversation_thread_id BETWEEN %s::uuid AND %s::uuid
@@ -253,18 +257,18 @@ async def list_transcript_tree(
                     GROUP BY 2
                     HAVING count(*) = 1
                 )
-                SELECT thread.id, thread.short_id, f.path, f.sha256, f.byte_len
+                SELECT thread.id, thread.short_id, f.path, f.sha256, f.byte_len, f.user_id
                 FROM thread_transcript_files f
                 JOIN thread ON f.conversation_thread_id = thread.id
-                ORDER BY 2, 3
+                ORDER BY CASE WHEN %s THEN thread.updated_at END DESC NULLS LAST, 2, 3
                 LIMIT %s
                 """,
-                (workspace_id, *bounds, limit),
+                (workspace_id, *bounds, newest_first, limit),
             )
             rows = await cur.fetchall()
     return [
-        ListedFile(str(thread_id), short, path, sha256, int(byte_len))
-        for thread_id, short, path, sha256, byte_len in rows
+        ListedFile(str(thread_id), short, path, sha256, int(byte_len), user_id)
+        for thread_id, short, path, sha256, byte_len, user_id in rows
     ]
 
 

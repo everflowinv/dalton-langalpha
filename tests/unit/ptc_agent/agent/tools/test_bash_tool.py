@@ -23,6 +23,8 @@ def _make_backend(result: dict) -> Any:
     backend.aexecute_bash = AsyncMock(return_value=result)
     backend.livefs = None
     backend.settled_livefs = AsyncMock(return_value=None)
+    backend.provider = "docker"
+    backend.channel = "docker"
     return backend
 
 
@@ -119,3 +121,52 @@ class TestBashTimeout:
         call["args"]["timeout"] = timeout
         await tool.ainvoke(call)
         assert backend.aexecute_bash.await_args.kwargs["timeout"] == seconds
+
+
+class TestBashSandboxOutcome:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("execute", "outcome", "error_class"),
+        [
+            pytest.param(
+                AsyncMock(return_value={"success": False, "stdout": "boom", "exit_code": 1}),
+                "ok",
+                None,
+                id="nonzero-exit-is-the-agents",
+            ),
+            pytest.param(
+                AsyncMock(
+                    return_value={
+                        "success": False,
+                        "stdout": "",
+                        "exit_code": -1,
+                        "failure": "timeout",
+                    }
+                ),
+                "unavailable",
+                "timeout",
+                id="timeout",
+            ),
+            pytest.param(
+                AsyncMock(side_effect=ConnectionError("sandbox gone")),
+                "error",
+                "ConnectionError",
+                id="dead-sandbox",
+            ),
+        ],
+    )
+    async def test_only_the_sandbox_failing_marks_the_run(
+        self, traced_tool, execute, outcome, error_class
+    ):
+        """Every run names its provider, so an error rate reads per provider."""
+        backend = _make_backend({})
+        backend.aexecute_bash = execute
+
+        msg, metadata = await traced_tool(
+            create_execute_bash_tool(backend), _tool_call("python run.py")
+        )
+
+        assert msg.content.startswith("ERROR")
+        assert metadata["tool_outcome"] == outcome
+        assert metadata.get("error_class") == error_class
+        assert metadata["tool_provider"] == "docker"

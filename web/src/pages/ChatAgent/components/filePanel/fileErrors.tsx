@@ -18,6 +18,8 @@ export type FileErrorCategory =
 export interface FileError {
   category: FileErrorCategory;
   detail?: string;
+  /** The server's own sentence, shown in place of the category's hint. */
+  message?: string;
 }
 
 const ERROR_I18N_KEY: Record<FileErrorCategory, string> = {
@@ -62,6 +64,11 @@ export function categorizeFileError(err: unknown, wsStatus?: string): FileError 
       return { category: 'unknown', detail };
     case 403:
       return { category: 'access_denied', detail };
+    case 422:
+      // An owner's SSH machine that answered and refused, as when our key was
+      // taken off it: the server's sentence says what to fix there. A
+      // validation refusal carries a list instead, and keeps the generic hint.
+      return detail ? { category: 'unknown', detail, message: detail } : { category: 'unknown', detail };
     default:
       return { category: 'unknown', detail };
   }
@@ -96,7 +103,7 @@ export function FileErrorDisplay({ error, onRetry, onDownload, downloadState = '
         {t(`filePanel.error.${key}`)}
       </p>
       <p className="text-xs text-center max-w-xs" style={{ color: 'var(--color-text-tertiary)' }}>
-        {t(hintKey)}
+        {error.message ?? t(hintKey)}
       </p>
       <div className="flex gap-2 mt-1">
         {showRetry && onRetry && (

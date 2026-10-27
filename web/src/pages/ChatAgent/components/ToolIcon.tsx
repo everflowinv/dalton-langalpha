@@ -2,6 +2,7 @@ import React from 'react';
 import { getToolIcon } from './toolDisplayConfig';
 import { directToolIdentity } from '../utils/directTools';
 import { DirectToolRowMark } from './mcp/DirectToolMark';
+import { useWorkspaceFolders } from '../contexts/WorkspaceContext';
 
 /**
  * The icon for a tool call: a direct MCP tool wears its vendor's mark,
@@ -21,8 +22,9 @@ export function ToolIcon({ toolName, args, artifact, className, style }: {
   className?: string;
   style?: React.CSSProperties;
 }): React.ReactElement {
+  const root = useWorkspaceFolders()?.rootDir;
   const direct = directToolIdentity(toolName, artifact);
   if (direct) return <DirectToolRowMark server={direct.server} className={className} style={style} />;
-  const IconComponent = getToolIcon(toolName, args);
+  const IconComponent = getToolIcon(toolName, args, root);
   return <IconComponent className={className} style={style} />;
 }

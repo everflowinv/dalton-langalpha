@@ -163,6 +163,7 @@ class _HungBackend(_Backend):
     """A sandbox that stopped answering mid-listing."""
 
     livefs = None
+    transcripts = None
 
     def __init__(self):
         super().__init__([])

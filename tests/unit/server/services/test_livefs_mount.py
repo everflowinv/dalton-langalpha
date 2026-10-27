@@ -60,6 +60,8 @@ def _in(minutes: float) -> datetime:
 class _Sandbox:
     """What a daemon command touches, answering each in turn."""
 
+    mounts_livefs = True
+
     def __init__(self, *answers: dict, sandbox_id: str = "sb-test-1") -> None:
         self.sandbox_id = sandbox_id
         self.layout = LAYOUT

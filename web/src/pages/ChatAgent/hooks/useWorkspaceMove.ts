@@ -184,8 +184,13 @@ export function useShowMove(workspaceId: string): void {
 export function useMoveWorkspace() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: ({ workspaceId, computerId }: { workspaceId: string; computerId: string; name: string }) =>
-      moveWorkspace(workspaceId, computerId),
+    mutationFn: ({ workspaceId, computerId, fromBackup }: {
+      workspaceId: string;
+      computerId: string;
+      name: string;
+      /** Restore onto the target from the backup, without the source. */
+      fromBackup?: boolean;
+    }) => (fromBackup ? moveWorkspace(workspaceId, computerId, { fromBackup }) : moveWorkspace(workspaceId, computerId)),
     onSuccess: async (move, { name }) => {
       await seedWorkspaceMove(queryClient, move);
       watchMove(move, name);

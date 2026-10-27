@@ -192,6 +192,10 @@ PRICE_ALREADY_MET = {
 LISTING_PAIR = "a crypto, currency or futures symbol; the price monitor cannot watch those"
 LISTING_UNREADABLE = "the price monitor cannot read this symbol"
 LISTING_UNKNOWN_SUFFIX = "an exchange suffix the price monitor does not know, so it would never be checked"
+LISTING_NO_SUFFIX = (
+    "a bare number names no market; add its exchange suffix, as in 600519.SH, 830799.BJ, "
+    "0700.HK, 7203.T, 005930.KS or 2330.TW"
+)
 
 
 def render_wake_block(lines: Sequence[str], *, started_turn: bool) -> str:

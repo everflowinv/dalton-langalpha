@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { AnimatePresence, motion, useReducedMotion, type Variants } from '@/lib/framer';
 import {
@@ -9,29 +9,39 @@ import {
   DialogDescription,
 } from '@/components/ui/dialog';
 import { cn } from '@/lib/utils';
-import { INTRO_VISUALS, INTRO_VISUAL_ANCHOR } from './introVisuals';
+import { SceneStage } from './introScenes/SceneStage';
+import { useIntro } from './loadIntro';
 import type { PageIntroDef } from '../registry';
 import './pageIntro.css';
 
 /**
- * One-time contextual intro for the page the user just landed on. Large
- * half-screen two-panel layout: stepped copy + navigation on the left, a
- * blueprint-style product mockup on the right. Seen-state is per-intro —
- * any close path (final CTA, X, Esc) at any step marks the intro seen.
+ * One-time contextual intro for the page the user just landed on. Two
+ * panels: stepped copy + navigation in the narrower one, a blueprint-style
+ * product mockup in the wider one. Seen-state is per-intro — any close path
+ * (final CTA, X, Esc) at any step marks the intro seen. `onAbandon` reports
+ * an intro that could not show, which stays unseen.
  */
 export function PageIntroModal({
   intro,
   onClose,
+  onAbandon,
 }: {
   intro: PageIntroDef;
   onClose: () => void;
+  onAbandon: () => void;
 }) {
   const { t } = useTranslation();
   const reduceMotion = useReducedMotion();
+  // Suspends until this intro's copy and scenes are in, so the modal opens
+  // whole and the copy below is already there.
+  const scenes = useIntro(intro);
+  const { t: tCopy } = useTranslation('intros');
   const [stepIdx, setStepIdx] = useState(0);
   // +1 forward / -1 back — drives which side the copy slides from. Updated on
   // every navigation (dots can jump non-adjacent steps in either direction).
   const [dir, setDir] = useState(1);
+  // Opening focus goes to the primary button, so Enter walks the tour.
+  const primaryRef = useRef<HTMLButtonElement>(null);
   const goTo = (i: number) => {
     setDir(i > stepIdx ? 1 : -1);
     setStepIdx(Math.min(Math.max(i, 0), intro.steps.length - 1));
@@ -51,15 +61,25 @@ export function PageIntroModal({
       transition: { duration: reduceMotion ? 0 : 0.15, ease: 'easeIn' },
     }),
   };
-  const step = intro.steps[Math.min(stepIdx, intro.steps.length - 1)];
+  const shown = Math.min(stepIdx, intro.steps.length - 1);
+  const step = intro.steps[shown];
   const isLast = stepIdx >= intro.steps.length - 1;
-  const Visual = INTRO_VISUALS[step.visual];
-  const anchor = INTRO_VISUAL_ANCHOR[step.visual];
+
+  // The copy did not load, as when a deploy retired its chunk. Show nothing
+  // rather than raw keys, and hand the screen back: the intro stays unseen
+  // and opens after the reload the stale-build notice offers.
+  const abandoned = scenes === null;
+  useEffect(() => {
+    if (abandoned) onAbandon();
+  }, [abandoned, onAbandon]);
+  if (abandoned) return null;
+
+  const scene = scenes[shown];
   // When every step's mockup anchors right (e.g. the thread intro), the
   // visual takes the LEFT half: the anchored hot region then sits beside the
   // copy and the wireframe bleeds off the modal's outer edge. Per-intro, not
   // per-step, so the panel never jumps sides mid-intro.
-  const visualFirst = intro.steps.every((s) => INTRO_VISUAL_ANCHOR[s.visual] === 'right');
+  const visualFirst = scenes.every((s) => s?.anchor === 'right');
 
   return (
     <Dialog
@@ -71,10 +91,20 @@ export function PageIntroModal({
       <DialogContent
         variant="centered"
         className="intro-dialog w-[min(94vw,980px)] max-w-none gap-0 overflow-hidden p-0"
+        onOpenAutoFocus={(e) => {
+          e.preventDefault();
+          primaryRef.current?.focus();
+        }}
       >
-        <div className="grid sm:min-h-[min(580px,76vh)] sm:grid-cols-2" key={intro.id}>
+        <div
+          className={cn(
+            'grid sm:min-h-[min(500px,72vh)]',
+            visualFirst ? 'sm:grid-cols-[7fr_5fr]' : 'sm:grid-cols-[5fr_7fr]'
+          )}
+          key={intro.id}
+        >
           {/* Copy + step navigation */}
-          <div className={cn('flex flex-col gap-4 p-6 sm:p-10', visualFirst && 'sm:order-2')}>
+          <div className={cn('flex flex-col gap-4 p-6 sm:p-9', visualFirst && 'sm:order-2')}>
             <span
               className="w-fit rounded-full px-2.5 py-0.5 text-xs font-medium"
               style={{
@@ -98,22 +128,22 @@ export function PageIntroModal({
               >
                 <DialogHeader className="space-y-3 text-left">
                   <DialogTitle
-                    className="text-2xl font-semibold leading-tight sm:text-3xl"
+                    className="text-2xl font-semibold leading-tight sm:text-[1.75rem]"
                     style={{ color: 'var(--color-text-primary)' }}
                   >
-                    {t(step.titleKey)}
+                    {tCopy(`${intro.id}.${step.id}.title`)}
                   </DialogTitle>
                   <DialogDescription
                     className="text-sm leading-relaxed sm:text-[0.9375rem]"
                     style={{ color: 'var(--color-text-secondary)' }}
                   >
-                    {t(step.bodyKey)}
+                    {tCopy(`${intro.id}.${step.id}.body`)}
                   </DialogDescription>
                 </DialogHeader>
               </motion.div>
             </AnimatePresence>
 
-            <div className="mt-auto flex flex-col gap-4 pt-6">
+            <div className="mt-auto flex items-center gap-3 pt-6">
               <div className="flex items-center gap-1.5">
                 {intro.steps.map((s, i) => (
                   <button
@@ -134,32 +164,24 @@ export function PageIntroModal({
                     }}
                   />
                 ))}
-                <span
-                  className="ml-auto font-mono text-xs tabular-nums"
-                  style={{ color: 'var(--color-text-tertiary)' }}
-                >
-                  {stepIdx + 1} / {intro.steps.length}
-                </span>
               </div>
 
-              <div className="flex gap-3">
+              <div className="ml-auto flex gap-2">
                 {stepIdx > 0 && (
                   <button
                     type="button"
                     onClick={() => goTo(stepIdx - 1)}
-                    className="rounded-lg border px-4 py-2.5 text-sm font-medium transition-colors hover:bg-(--color-bg-subtle) focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
-                    style={{
-                      borderColor: 'var(--color-border-default)',
-                      color: 'var(--color-text-secondary)',
-                    }}
+                    className="rounded-lg px-3.5 py-2 text-sm font-medium transition-colors hover:bg-(--color-bg-subtle) focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
+                    style={{ color: 'var(--color-text-secondary)' }}
                   >
                     {t('onboarding.back', 'Back')}
                   </button>
                 )}
                 <button
+                  ref={primaryRef}
                   type="button"
                   onClick={() => (isLast ? onClose() : goTo(stepIdx + 1))}
-                  className="flex-1 rounded-lg px-4 py-2.5 text-sm font-semibold transition-opacity hover:opacity-90 focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+                  className="rounded-lg px-5 py-2 text-sm font-semibold transition-opacity hover:opacity-90 focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
                   style={{
                     background: 'var(--color-accent-primary)',
                     color: 'var(--color-text-on-accent)',
@@ -174,13 +196,10 @@ export function PageIntroModal({
           </div>
 
           {/* Blueprint mockup panel — hidden on small screens where the copy
-              needs the room. The mockup keeps its 400px design size and is
-              scaled up on a static wrapper (intro-rv animates `transform`,
-              so the scale cannot live on an animated element), bleeding off
-              the panel's clipped edge opposite its anchor. Keyed by step:
-              the outgoing scene crossfades out, then the incoming one fades
-              in and its CSS stagger replays. The motion wrapper only animates
-              opacity, so the scale transform stays on the static inner div. */}
+              needs the room. Keyed by step: the outgoing scene crossfades
+              out, then the incoming one fades in and its script starts from
+              the top. The motion wrapper only animates opacity, so the
+              stage's scale transform is left alone. */}
           <div
             className={cn('intro-visual hidden items-center sm:flex', visualFirst && 'sm:order-1')}
             aria-hidden
@@ -200,21 +219,7 @@ export function PageIntroModal({
                   transition: { duration: reduceMotion ? 0 : 0.15, ease: 'easeIn' },
                 }}
               >
-                <div
-                  className={cn(
-                    'w-[400px] shrink-0',
-                    anchor === 'left' && 'ml-8',
-                    anchor === 'right' && 'ml-auto mr-8',
-                    anchor === 'center' && 'mx-auto'
-                  )}
-                  style={{
-                    transform: 'scale(1.45)',
-                    transformOrigin:
-                      anchor === 'center' ? 'center center' : `${anchor} center`,
-                  }}
-                >
-                  <Visual />
-                </div>
+                {scene && <SceneStage scene={scene} />}
               </motion.div>
             </AnimatePresence>
           </div>

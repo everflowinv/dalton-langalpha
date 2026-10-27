@@ -304,7 +304,7 @@ function AuthenticatedShell() {
   }, []);
   // Published on the document root, not on .app-layout: custom properties only
   // inherit downward, and every fixed overlay that has to dodge the sidebar
-  // (the getting-started card, the dashboard's floating chat and edit toolbar)
+  // (the dashboard's floating chat and edit toolbar)
   // is viewport-anchored — some of them portalled clean out of the layout
   // subtree. Off the root they'd read the collapsed default from tokens.css and
   // sit under the sidebar. 0 on mobile, where no sidebar renders at all.

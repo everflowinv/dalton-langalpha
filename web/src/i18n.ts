@@ -20,19 +20,34 @@ i18n.on('languageChanged', (lng) => {
 // half of it in a language the visitor never sees. The active one still does
 // not wait for the entry: scripts/locale-preload.ts has index.html start
 // fetching it alongside.
-const CATALOGS: Record<Locale, () => Promise<{ default: ResourceKey }>> = {
+type Catalog = () => Promise<{ default: ResourceKey }>;
+
+const CATALOGS: Record<Locale, Catalog> = {
   'en-US': () => import('./locales/en-US.json'),
   'zh-CN': () => import('./locales/zh-CN.json'),
+};
+
+// The page intros' copy is a namespace of its own, so only someone opening an
+// intro downloads it: useTranslation('intros') fetches it on first use.
+const NAMESPACES: Record<string, Record<Locale, Catalog>> = {
+  translation: CATALOGS,
+  intros: {
+    'en-US': () => import('./locales/intros/en-US.json'),
+    'zh-CN': () => import('./locales/intros/zh-CN.json'),
+  },
 };
 
 const catalogBackend: BackendModule = {
   type: 'backend',
   init() {},
-  read(lng, _ns, callback) {
+  read(lng, ns, callback) {
+    const catalogs = NAMESPACES[ns];
     // `false` tells i18next not to retry. The usual cause is a build asset the
     // server no longer has, and only a reload fixes that.
-    if (!isSupported(lng)) return callback(new Error(`no catalog for ${lng}`), false);
-    CATALOGS[lng]().then(
+    if (!catalogs || !isSupported(lng)) {
+      return callback(new Error(`no ${ns} catalog for ${lng}`), false);
+    }
+    catalogs[lng]().then(
       (m) => callback(null, m.default),
       (err: unknown) => callback(err instanceof Error ? err : String(err), false),
     );

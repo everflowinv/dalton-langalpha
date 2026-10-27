@@ -11,6 +11,7 @@
       "offlineMessage": "网络已断开。恢复连接前，数据可能不是最新的。"
     },
     "copy": "复制",
+    "copied": "已复制",
     "submit": "提交",
     "save": "保存",
     "saving": "保存中...",
@@ -1368,6 +1369,7 @@
       "title": "迁移工作区",
       "intro": "将 {{name}} 迁移到你的另一台计算机上，文件、对话和设置都会一起迁移过去。",
       "notCopied": "已安装的依赖、缓存和 .git 历史不会复制，它们会在 {{source}} 上保留 7 天，之后删除。",
+      "notCopiedKept": "已安装的依赖、缓存和 .git 历史不会复制，它们会保留在 {{source}} 的 _internal/leftovers 中，不会被删除。",
       "submit": "迁移",
       "copying": "正在复制文件…",
       "finishing": "即将完成…",
@@ -1376,7 +1378,30 @@
       "cancelFailed": "无法取消迁移，请重试。",
       "done": "已迁移到 {{computer}}",
       "failedTitle": "无法迁移 {{name}}",
-      "failed": "无法迁移此工作区，请重试。"
+      "failed": "无法迁移此工作区，请重试。",
+      "fromBackup": {
+        "offer": "{{computer}} 没有响应，无法从它复制文件。如果它已无法恢复，你可以用{{time}}的备份在 {{target}} 上恢复此工作区。",
+        "offerUndated": "{{computer}} 没有响应，无法从它复制文件。如果它已无法恢复，你可以用备份在 {{target}} 上恢复此工作区。",
+        "button": "从备份恢复",
+        "confirm": "要用{{time}}的备份在 {{target}} 上恢复此工作区吗？",
+        "confirmUndated": "要用备份在 {{target}} 上恢复此工作区吗？",
+        "caveats": "该备份之后更改的文件不会包含在内。{{computer}} 上的文件夹会保留，在它恢复响应后移到 _internal/leftovers 中。",
+        "restoring": "正在从备份恢复文件…"
+      }
+    },
+    "restoreOffer": {
+      "missing": "{{computer}} 上找不到此工作区的文件夹。",
+      "missingUnnamed": "找不到此工作区的文件夹。",
+      "prompt": "要从{{time}}的备份恢复吗？",
+      "promptUndated": "要从备份恢复吗？",
+      "restore": "恢复文件",
+      "keepEmpty": "保持为空",
+      "restoring": "正在恢复文件…",
+      "keeping": "正在保留空文件夹…",
+      "keepEmptyTitle": "保持文件夹为空？",
+      "keepEmptyBody": "之后备份会以文件夹的当前状态为准，其中原有的文件将无法再恢复。",
+      "keepEmptyConfirm": "保持为空",
+      "failed": "无法恢复文件"
     },
     "notOnPlan": "您的套餐不支持此功能，请升级后使用。",
     "tierLimitReached": "您的 {{tier}} 工作区数量已达上限。",
@@ -1390,6 +1415,11 @@
     "failedLoadWorkspaces": "加载工作区失败，请刷新页面。",
     "invalidWorkspace": "无效工作区，请重试。",
     "failedDeleteWorkspace": "删除工作区失败，请重试。",
+    "deleteOwnMachine": {
+      "cannotUndo": "工作区及其对话将被删除，此操作无法撤销。",
+      "filesStay": "它的文件位于 {{computer}} 上的 {{folder}} 中，会保留在那里。",
+      "alsoDeleteFiles": "同时从这台机器上删除 {{folder}}"
+    },
     "loadingWorkspaces": "加载工作区中...",
     "backToThreads": "返回对话列表",
     "updated": "更新于 {{time}}",
@@ -1437,11 +1467,15 @@
       "label": "提供商",
       "daytonaDesc": "停止后保留文件，正在运行的程序会结束。",
       "e2bDesc": "停止后保留内存和正在运行的程序，恢复后从中断处继续。",
-      "dockerDesc": "在本机运行。"
+      "dockerDesc": "在本机运行。",
+      "sshDesc": "任何可通过 SSH 登录的 Linux 服务器或 Mac。停止只会结束 Agent 的程序。",
+      "sshLabel": "你的机器 (SSH)"
     },
     "newComputer": "新建计算机",
     "create": "创建计算机",
     "creating": "创建中...",
+    "add": "添加计算机",
+    "adding": "添加中...",
     "start": "启动",
     "stop": "停止",
     "primaryBadge": "默认",
@@ -1477,8 +1511,15 @@
     "remove": "移除",
     "removeTitle": "移除 {{name}}？",
     "removeBody": "它的沙箱和磁盘上的所有内容都会被删除，此操作无法撤销。",
+    "removeBodyOwnMachine": "我们将停止使用这台机器，并移除在上面为它设置的内容。{{folder}} 中的文件会保留。",
     "removeConfirm": "移除计算机",
     "removing": "移除中...",
+    "removeKey": "从 ~/.ssh/authorized_keys 中移除我们的密钥",
+    "keyRemoved": "我们的密钥也已从 ~/.ssh/authorized_keys 中移除。",
+    "keyKept": "我们的密钥仍保留在 ~/.ssh/authorized_keys 中，因为 {{computer}} 还在用它登录。",
+    "keySkipped": "我们无法安全地移除密钥，它仍可用于登录这台机器。",
+    "keyUnreached": "我们无法连接这台机器，密钥仍留在上面。",
+    "keyRemoveYourself": "如需自行移除，请在 ~/.ssh/authorized_keys 中删除以 {{comment}} 结尾的那一行，其指纹为 {{fingerprint}}。",
     "removed": "已移除 {{name}}",
     "removeFailed": "无法移除这台计算机，请重试。",
     "removeBlocked": {
@@ -1495,6 +1536,13 @@
     },
     "manageComputer": "管理 {{name}}",
     "alwaysOn": "常驻",
+    "filesBackup": {
+      "label": "备份文件",
+      "offTitle": "停止备份文件？",
+      "offBody": "{{name}} 上每个工作区的最后一次备份会保留，但不再更新。之后如果这台机器上的文件夹丢失，只能恢复到当时的状态。",
+      "offConfirm": "停止备份",
+      "failed": "无法更改文件备份设置"
+    },
     "prepare": {
       "sandbox": "正在创建沙箱",
       "tools": "正在安装工具",
@@ -1580,6 +1628,69 @@
       "refresh": "刷新状态",
       "archive": "归档",
       "sandboxId": "沙箱 ID："
+    },
+    "ssh": {
+      "filesBackup": "备份工作区文件",
+      "filesBackupHint": "在服务器上保留每个工作区文件的副本，文件夹丢失时可以恢复。版本控制和依赖文件夹不会备份。",
+      "previewLabel": "预览",
+      "previewNotice": "连接自己的机器是一项新功能，请谨慎使用。Agent 可以执行所连接账户能做的任何操作，建议为它单独创建一个账户，而不是使用你自己的账户。",
+      "pairIntro": "请在要添加的机器（Linux 或 macOS）上，以 Agent 要使用的用户身份运行这条命令：",
+      "pairIntroLocal": "请在运行 LangAlpha 的这台电脑的终端里，以 Agent 要使用的用户身份运行这条命令。要添加其他机器，请手动设置。",
+      "pairLoading": "正在获取命令...",
+      "viewScript": "查看脚本",
+      "waiting": "正在等待你的机器...",
+      "checking": "{{username}}@{{hostname}} 已报到，正在连接...",
+      "tunneling": "正在通过隧道连接 {{hostname}}。无法从互联网访问这台机器，所以改为由它主动连出。这需要几秒钟。",
+      "readyTunnel": "{{hostname}}，通过隧道",
+      "tunnelBadge": "隧道",
+      "tunnelOffline": "隧道已离线",
+      "pairFailedNext": "修复后重新运行命令，或自行输入地址：",
+      "pairRerun": "修复后重新运行命令。",
+      "pairOtherUser": "命令是以 {{username}} 身份运行的。如需换一个登录用户，请以该用户身份运行命令。",
+      "limitReached_one": "最多可以添加 {{count}} 台 SSH 计算机。请先移除一台，再添加新的。",
+      "limitReached_other": "最多可以添加 {{count}} 台 SSH 计算机。请先移除一台，再添加新的。",
+      "pairUnavailable": "此服务器不支持一行命令，请手动设置。",
+      "manualLink": "改为手动设置",
+      "pairingLink": "改用一行命令",
+      "addressLabel": "主机或 SSH 命令",
+      "addressHint": "如需其他端口，在末尾加上 :2222。",
+      "addressNoUser": "请带上用户名，例如 ubuntu@203.0.113.10。",
+      "addressInvalid": "请输入类似 ubuntu@203.0.113.10 的地址。",
+      "portInvalid": "请输入 1 到 65535 之间的端口。",
+      "connect": "连接",
+      "connecting": "正在连接...",
+      "keyStep": "我们的密钥还没有添加到 {{username}}@{{host}}。请在那台机器上以 {{username}} 身份运行以下命令，然后再次连接：",
+      "keyLoading": "正在获取密钥...",
+      "keyUnavailable": "此服务器无法保存 SSH 密钥，因此无法连接你的机器。",
+      "keyFailed": "无法获取密钥。请关闭此对话框后重试。",
+      "commandLabel": "命令",
+      "publicKeyLabel": "公钥",
+      "copyLabel": "复制{{what}}",
+      "keyManual": "或自行添加公钥",
+      "differentMachine": "换一台机器",
+      "diskFree": "可用 {{free}}",
+      "sudoRoot": "以 root 身份连接。",
+      "sudoYes": "可使用 sudo",
+      "sudoNo": "无法使用 sudo，部分工具可能无法安装。",
+      "folder": "文件夹",
+      "folderHint": "工作区在你机器上的存放位置。",
+      "folderShown": "工作区存放在 {{folder}}。",
+      "changeFolder": "更改",
+      "hostKey": "主机密钥 {{fingerprint}}",
+      "error": {
+        "authFailed": "这台机器没有接受我们为 {{username}} 提供的密钥。",
+        "authFailedRoot": "这台机器没有接受我们为 root 提供的密钥，很可能是因为它不允许 root 登录。请以 Agent 应使用的用户身份运行命令，或允许 root 使用密钥登录（PermitRootLogin prohibit-password）。",
+        "unreachable": "无法连接 {{address}}。该机器必须允许来自互联网的 SSH 连接。",
+        "unreachableMachine": "无法通过 SSH 连接你的机器。它必须允许来自互联网的 SSH 连接。",
+        "unreachableMac": "无法通过 SSH 连接你的 Mac。请在“系统设置 > 通用 > 共享”中打开“远程登录”，然后重新运行命令。",
+        "timeout": "连接超时。请检查 SSH 是否在运行，以及端口是否开放。",
+        "hostKeyMismatch": "在该地址响应的不是你的机器。",
+        "privateAddress": "这台机器位于私有网络，我们无法访问。请使用可从互联网访问的地址。",
+        "unsupported": "不支持此机器。",
+        "expired": "这条命令已过期，请运行新的命令。",
+        "rateLimited_other": "这个账号在过去一小时内尝试的 SSH 连接过多。请在 {{count}} 分钟后重试。",
+        "generic": "无法连接，请重试。"
+      }
     }
   },
   "thread": {
@@ -2047,8 +2158,7 @@
       "sector-overviewDesc": "行业全景报告：市场规模、竞争格局、公司概览、估值背景",
       "competitive-analysisDesc": "竞争格局分析：市场定位、评分卡、护城河评估、份额趋势",
       "initiating-coverageDesc": "全面研究启动：公司研究、财务模型、估值、图表、30-50 页报告",
-      "chart-annotationDesc": "标注价格图表：价格线、趋势线、区间和事件标记，实时显示在 MarketView，或作为聊天中的图表卡片",
-      "report-issueDesc": "报告问题并提出改进建议以提升 Agent 能力"
+      "chart-annotationDesc": "标注价格图表：价格线、趋势线、区间和事件标记，实时显示在 MarketView，或作为聊天中的图表卡片"
     },
     "compactedNotification": "上下文已压缩 · {{from}} 条消息 → 摘要",
     "taskErrorNotification": "子任务运行失败",
@@ -2279,13 +2389,13 @@
     "metaLines": "{{count}} 行",
     "metaPages": "{{count}} 页",
     "newTab": "新建标签页",
+    "back": "后退",
+    "forward": "前进",
     "noFilesYet": "暂无文件",
     "noTypeMatches": "没有 {{type}} 文件",
     "openFile": "打开文件",
-    "openFileHint": "从右侧的文件树中选择一个文件。",
-    "openFileHintUpload": "从右侧的文件树中选择一个文件，或将文件拖放到此处上传。",
-    "showFileTree": "显示文件树",
-    "dropToUploadHint": "或将文件拖放到此处上传。",
+    "files": "文件",
+    "dropToUploadHint": "将文件拖放到此处上传。",
     "openFiles": "已打开的标签页",
     "runningApps": "运行中的应用",
     "reloadApp": "重新加载应用",
@@ -2293,7 +2403,6 @@
     "previewFrameTitle": "端口 {{port}} 上的应用",
     "openInBrowser": "在浏览器中打开",
     "chartTab": "图表",
-    "openChart": "打开图表",
     "addChartToContext": "将图表添加到上下文",
     "openInMarketView": "在行情中心打开",
     "chartContextHint": "用户正在工作区面板中查看 {{symbol}} 的实时图表（{{timeframe}} K 线）。",
@@ -2312,10 +2421,13 @@
     "systemDirs": "系统",
     "systemDirsHint": "显示系统目录（.agents/、.system/、tools/ 等）",
     "toggleTree": "显示/隐藏文件树",
+    "expandPanel": "展开面板",
+    "collapsePanel": "显示对话",
     "uploadFile": "上传文件",
     "uploadingNth": "正在上传 第 {{current}} / 共 {{total}} 个：{{name}} — {{percent}}%",
     "uploadFailedSummary": "{{count}} 个文件上传失败：{{details}}",
     "backupFiles": "备份文件到数据库",
+    "backupOff": "此计算机已关闭文件备份。",
     "backupSummary": "已备份 {{count}} 个文件",
     "backupUnchanged": "，{{count}} 个未变更",
     "backupNotSaved": "{{count}} 个未保存",
@@ -2357,8 +2469,8 @@
     "exitFullscreen": "退出全屏",
     "downloadAsHtml": "下载为 HTML",
     "moreActions": "更多操作",
-    "htmlPreview": "预览",
-    "htmlSource": "源代码",
+    "viewSource": "查看源代码",
+    "viewPreview": "查看页面",
     "htmlPreviewFailed": "无法加载预览。",
     "pdfPrintHint": "按 Cmd/Ctrl-P 将页面保存为 PDF。",
     "pdfGenerating": "正在生成 PDF…",
@@ -3200,6 +3312,9 @@
         "partiallyFilled": "部分成交",
         "filled": "全部成交",
         "cancelled": "已撤单",
+        "handedOff": "已从券商的指令列表中移除，即已在券商处提交、删除或过期。券商不会告知是哪一种，可在账户订单中查看已提交的内容。",
+        "handedOffStaged": "已从 {{vendor}} 的指令列表中移除，即已在 {{vendor}} 提交、删除或过期。{{vendor}} 不会告知是哪一种，可在账户订单中查看已提交的内容。",
+        "handedOffStagedUnnamed": "已从券商的指令列表中移除，即已在券商处提交、删除或过期。券商不会告知是哪一种，可在账户订单中查看已提交的内容。",
         "rejectedByVendor": "券商拒绝了这笔订单",
         "failed": "未送达券商即失败",
         "unknown": "结果未知"
@@ -3217,6 +3332,7 @@
         "partiallyFilled": "部分成交",
         "filled": "已成交",
         "cancelled": "已撤单",
+        "handedOff": "已移交",
         "rejectedByVendor": "券商拒绝",
         "failed": "失败",
         "unknown": "未知"
@@ -3691,77 +3807,37 @@
     "next": "继续",
     "done": "开始探索",
     "step": "第 {{n}} 步",
-    "intros": {
-      "chat": {
-        "steps": {
-          "workspace": {
-            "title": "认识工作区"
-          }
-        }
-      },
-      "thread": {
-        "steps": {
-          "filePanel": {
-            "title": "文件统一保存在文件面板",
-            "body": "Word 文档、Excel 模型、PDF、图表等 Agent 生成的文件都会保存在工作区中。点击顶部的文件夹图标，即可浏览、预览和下载。"
-          },
-          "memory": {
-            "title": "Agent 会记住你的偏好",
-            "body": "Agent 具备跨对话的长期记忆，可以保存你的偏好、惯例和值得复用的结论。对它说“记住这个”，相关内容便会长期保留。"
-          },
-          "memo": {
-            "title": "上传备忘录，补充分析资料",
-            "body": "可以将 PDF、笔记或表格上传为备忘录。Agent 会在需要时读取，把你的私有资料纳入分析上下文。"
-          }
-        }
-      },
-      "dashboard": {
-        "steps": {
-          "overview": {
-            "title": "行情总览",
-            "body": "自选股、投资组合、新闻与实时图表集中呈现，打开页面即可掌握市场概况。"
-          },
-          "customize": {
-            "title": "自定义布局",
-            "body": "切换到自定义模式后，可以添加、删除、调整和排列小组件，搭建符合自己需求的监控面板。"
-          },
-          "attach": {
-            "title": "将组件内容附加到对话",
-            "body": "看到值得深入分析的内容时，点击该行的回形针图标，即可将其作为上下文附加到对话，Agent 会基于这一内容继续分析。"
-          }
-        }
-      }
-    },
     "gettingStarted": {
       "title": "快速上手",
       "dismiss": "隐藏引导",
+      "progress": "已完成 {{done}}/{{total}}",
       "tasks": {
         "dashboard": {
           "title": "探索仪表盘",
-          "desc": "自选股、组合、新闻与实时组件一站集齐。"
+          "desc": "自选股、组合与新闻，在一个页面实时更新。"
         },
         "market": {
           "title": "查看实时行情",
-          "desc": "实时数据流驱动的行情图表。"
+          "desc": "任意标的的实时行情图表。"
         },
         "profile": {
           "title": "设置投资画像",
           "desc": "风险、市场、风格，以及 Agent 怎么配合你。"
         },
         "createWorkspace": {
-          "title": "创建第一个工作区"
+          "title": "创建工作区"
         },
         "firstChat": {
           "title": "开始第一次分析",
-          "desc": "打开对话，询问任意股票、行业或财报。"
+          "desc": "询问任意股票、行业或财报。"
         },
         "models": {
-          "title": "查看模型配置",
-          "desc": "在设置的模型页选择默认模型并连接服务商。"
+          "title": "选择模型",
+          "desc": "设置默认模型，连接模型服务商。"
         },
         "integrations": {
-          "title": "在其他平台使用 {{brand}}",
-          "desc": "通过平台集成，在 Slack、邮件等平台使用 {{brand}}。"
+          "title": "连接聊天应用",
+          "desc": "在 Slack、飞书、Telegram 等应用里和 {{brand}} 对话。"
         }
       }
     },
@@ -4526,6 +4602,7 @@
       "open": "进行中",
       "filled": "已成交",
       "cancelled": "已撤单",
+      "handedOff": "已移交",
       "rejected": "已拒绝",
       "failed": "失败"
     }
@@ -5797,32 +5874,11 @@
       "setupFailed": "无法打开工作区，请重试。"
     },
     "tour": {
-      "modes": {
-        "title": "两种工作方式",
-        "body": "选择一个工作区，由该工作区的分析师在其中完成工作，使用该工作区的文件。选择所有工作区，则由 Chief of Staff Agent 接手：快速问题它亲自回答，深度任务交给合适的分析师。接下来分别介绍两者。"
-      },
-      "chiefOfStaff": {
-        "title": "所有工作区：你的 Chief of Staff Agent",
-        "body": "你只管提出需求。Chief of Staff Agent 会回答快速问题、创建和管理工作区、把深度任务交给各工作区的分析师并汇报结果，还会管理你的自动化。它的所有对话归入“所有工作区”卡片，它自己的文件存放在名为 Home 的文件夹中。"
-      },
-      "analyst": {
-        "title": "工作区：由分析师完成工作",
-        "body": "每个工作区都有一位专属分析师。同一工作区内的所有对话共享文件、数据与已有成果，分析可以持续积累。它能处理大规模数据，并行调度多个子 Agent，还能生成各类交付物：Excel 模型、Word 文档、PDF、仪表盘。"
-      },
-      "workspace": {
-        "body": "每一个工作区都是一个项目空间：围绕同一任务的对话都集中在这里，共享文件、数据和成果，与其他工作区相互独立。你的所有工作区和 Home 都位于同一台电脑上，你一开始输入它就会启动。"
-      },
-      "create": {
-        "title": "为正式任务创建专属工作区",
-        "body": "涉及数据处理或需要产出交付物的任务，建议为其创建工作区：点击“新建工作区”并按任务命名，或让 Chief of Staff Agent 替你创建。"
-      },
-      "createWorkspaceTask": "新建一个专属工作区，其分析师将在完整沙箱中执行正式分析任务。"
+      "createWorkspaceTask": "为一个项目单独开辟空间，配有专属分析师和文件。"
     },
     "intro": {
-      "chiefOfStaffRun": "CoS Agent",
       "handoff": "已交给分析师",
-      "taskHandoff": "任务已交给分析师",
-      "footer": "两种工作方式"
+      "taskHandoff": "任务已交给分析师"
     }
   },
   "dalton": {

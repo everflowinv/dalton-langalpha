@@ -17,7 +17,11 @@ from websockets.exceptions import ConnectionClosed, WebSocketException
 
 from src.server.preview_proxy.activity import PreviewActivity
 from src.server.preview_proxy.headers import request_headers
-from src.server.services.preview_capabilities import Capability, until_revoked
+from src.server.services.preview_capabilities import (
+    Capability,
+    Upstream,
+    until_revoked,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +61,7 @@ async def relay_websocket(
     send: Any,
     capability: Capability,
     *,
+    upstream: Upstream,
     capability_origin: str,
     target: str,
     activity: PreviewActivity,
@@ -64,15 +69,14 @@ async def relay_websocket(
     message = await receive()
     if message["type"] != "websocket.connect":
         return
-    upstream_origin = capability.upstream
-    url = "ws" + upstream_origin[len("http") :] + target
+    url = "ws" + upstream.origin[len("http") :] + target
     # Origin and User-Agent ride along as the browser sent them, Origin
     # rebased, so the library adds neither.
     headers = request_headers(
         scope.get("headers", []),
         capability_origin=capability_origin,
-        upstream_origin=upstream_origin,
-        inject=capability.headers,
+        upstream_origin=upstream.origin,
+        inject=upstream.headers,
         websocket=True,
     )
     try:

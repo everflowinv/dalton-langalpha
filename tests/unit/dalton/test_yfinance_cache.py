@@ -18,8 +18,11 @@ def _touch_all_three_caches(tag: str) -> dict[str, str]:
     assert tz.lookup(f"SYM_{tag}") == "America/New_York"
 
     cookie = yf_cache.get_cookie_cache()
-    cookie.store(f"strat_{tag}", {"tag": tag})
-    assert cookie.lookup(f"strat_{tag}")["cookie"] == {"tag": tag}
+    # A cookie shaped as yfinance's own: the A3 guard (upstream 982b0a5cd)
+    # reads one without the A3 path as a miss and deletes it, so the fork
+    # test's sentinel has to be a valid entry.
+    cookie.store(f"strat_{tag}", {"cache_key": {"/": {"A3": f"a3-{tag}"}}})
+    assert cookie.lookup(f"strat_{tag}")["cookie"]["cache_key"]["/"]["A3"] == f"a3-{tag}"
 
     isin = yf_cache.get_isin_cache()
     isin.store(f"ISIN_{tag}", f"SYM_{tag}")

@@ -16,7 +16,7 @@ import pytest
 from src.server.preview_proxy import app as proxy_app
 from src.server.preview_proxy.app import PreviewProxy
 from src.server.services.preview_base import PreviewBase
-from src.server.services.preview_capabilities import Capability
+from src.server.services.preview_capabilities import Capability, Upstream
 
 SANDBOX = "isbx0123456789abcdef"
 HOST = "8080-" + "a" * 32 + ".preview.example.com"
@@ -27,11 +27,12 @@ def proxy(monkeypatch):
     capability = Capability(
         sandbox_id=SANDBOX,
         port=8080,
-        upstream=f"https://8080-{SANDBOX}.e2b.app",
+        upstream=Upstream(
+            f"https://8080-{SANDBOX}.e2b.app", {"e2b-traffic-access-token": "tok-1"}
+        ),
         workspace_id="ws-1",
         generation=1,
         expires_at=int(time.time()) + 600,
-        headers={"e2b-traffic-access-token": "tok-1"},
     )
 
     async def resolve_host(host, *, base):

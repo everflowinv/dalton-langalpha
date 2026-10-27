@@ -50,6 +50,12 @@ class SyncResult:
     #: The project's folder is absent from this sandbox, so the pass mirrored
     #: nothing and pruned nothing; the manifest stands as the record.
     root_missing: bool = False
+    #: The folder's restore waits on its owner's choice, so the pass read
+    #: nothing; the manifest stands as the record, as the files to restore.
+    held: bool = False
+    #: A routine pass found its computer's backups turned off, so it read
+    #: nothing; the last backup stays as it was.
+    backups_off: bool = False
     #: The pass pruned and refreshed stamps; one that withheld both leaves
     #: work a later pass has to repeat.
     pruned: bool = False

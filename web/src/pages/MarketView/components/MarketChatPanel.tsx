@@ -22,6 +22,7 @@ import { ChartSurfaceContext, type ChartSurface } from '../../ChatAgent/contexts
 import { WorkspaceProvider } from '../../ChatAgent/contexts/WorkspaceContext';
 import { computerFolders } from '../../ChatAgent/utils/agentPaths';
 import { useChatMessages } from '../../ChatAgent/hooks/useChatMessages';
+import { useComputerRootDir } from '../../ChatAgent/hooks/useComputers';
 import { useThreadModel } from '../../ChatAgent/hooks/useThreadModel';
 import { useThreadSubagents } from '../../ChatAgent/hooks/useThreadSubagents';
 import { useThreadTuning } from '../../ChatAgent/hooks/useThreadTuning';
@@ -156,7 +157,9 @@ function MarketChatScope(props: MarketChatPanelProps): React.ReactElement {
   // does Home's cached row, which can predate the turn that gave Home its folder.
   const { data: activeWorkspace } = useWorkspace(activeWorkspaceId);
   // No sibling list: this page opens no files, so a sibling's has nowhere to go.
-  const folders = useMemo(() => computerFolders(activeWorkspace, null), [activeWorkspace]);
+  // The computer's root is kept: the reply's absolute paths start with it.
+  const rootDir = useComputerRootDir(activeWorkspace?.computer_id);
+  const folders = useMemo(() => computerFolders(activeWorkspace, null, rootDir), [activeWorkspace, rootDir]);
 
   // Initial thread resolution. URL `?thread=` wins, then localStorage keyed by
   // (workspace, symbol), then a new chat. This state determines which thread
@@ -717,9 +720,6 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
   }, [returnedEdit, clearReturnedEdit]);
   const stableThumbUp = useStableHandler(handleThumbUp);
   const stableThumbDown = useStableHandler(handleThumbDown);
-  const stableReportWithAgent = useStableHandler((instruction: string) => {
-    handleSendMessage(`/self-improve ${instruction}`, null, null, {});
-  });
   const stableWidgetSendPrompt = useStableHandler((text: string) => {
     handleSendMessage(text, null, null, {});
   });
@@ -746,7 +746,6 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
     editDrafts,
     onThumbUp: stableThumbUp,
     onThumbDown: stableThumbDown,
-    onReportWithAgent: stableReportWithAgent,
     onWidgetSendPrompt: stableWidgetSendPrompt,
   }), [
     stableOpenSubagentTask, stableToolCallDetail,
@@ -755,7 +754,7 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
     stableApprovePTCAgent, stableRejectPTCAgent, stableApproveSecretaryAction,
     stableRejectSecretaryAction, stableResumeCreditPause, stableApproveToolCall, stableRejectToolCall,
     stableEditMessage, stableRegenerate, stableRetry, editDrafts,
-    stableThumbUp, stableThumbDown, stableReportWithAgent, stableWidgetSendPrompt,
+    stableThumbUp, stableThumbDown, stableWidgetSendPrompt,
   ]);
 
   // In All workspaces, carry the source thread/workspace into a PTC-agent

@@ -810,6 +810,28 @@ async def turn_start_checkpoint_id(
     return await turn_base_checkpoint_id(checkpointer, thread_id)
 
 
+def _origin_metadata(request: ChatRequest, *, from_server: bool) -> dict[str, str]:
+    """Who sent the turn, so a trace can be split by what drove it.
+
+    Read per request rather than off the thread: an automation's thread takes
+    turns from a person too, and only the request says which this one is. A
+    turn the server posts itself (a report-back or a wake) carries no origin
+    either, so its query type, which no client can set, keeps it from reading
+    as the user's. Any client may name an origin, so only the server's own is
+    believed: a person's turn labelled an automation's would drop out of the
+    user traffic and pin its failures on an automation.
+    """
+    if request.query_type in NOTIFICATION_QUERY_TYPES:
+        return {"origin": "system", "query_type": request.query_type}
+    origin = request.origin
+    if origin is None or not from_server:
+        return {"origin": "user"}
+    fields = {"origin": origin.type}
+    if origin.type == "automation" and origin.id:
+        fields["automation_id"] = origin.id
+    return fields
+
+
 def build_graph_config(
     thread_id: str,
     user_id: str,
@@ -825,6 +847,7 @@ def build_graph_config(
     turn_index: int | None = None,
     surface: str | None = None,
     base_checkpoint_id: str | None = None,
+    from_server: bool = False,
 ) -> dict:
     """Build the LangGraph ``config`` dict for a PTC turn.
 
@@ -838,7 +861,8 @@ def build_graph_config(
     ``configurable`` as ``run_id`` and ``platform``, which is where a tool
     reads which run and which conversation it is acting in.
     ``base_checkpoint_id`` is where a turn that names no checkpoint starts
-    (``turn_start_checkpoint_id``).
+    (``turn_start_checkpoint_id``). ``from_server`` says the server sent the
+    request, so the trace believes the origin it names.
     """
     langsmith_tags = get_langsmith_tags(locale=request.locale)
     langsmith_metadata = get_langsmith_metadata(
@@ -855,6 +879,7 @@ def build_graph_config(
         langsmith_metadata["run_id"] = run_id
     if turn_index is not None:
         langsmith_metadata["turn_index"] = turn_index
+    langsmith_metadata.update(_origin_metadata(request, from_server=from_server))
 
     configurable: dict = {
         "thread_id": thread_id,

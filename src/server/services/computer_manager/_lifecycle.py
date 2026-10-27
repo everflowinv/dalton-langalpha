@@ -12,7 +12,12 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
 from ptc_agent.core.sandbox.migration import LayoutMigrationError
-from ptc_agent.core.sandbox.runtime import SandboxGoneError, SandboxTransientError
+from ptc_agent.core.sandbox.providers.ssh_errors import connect_failure
+from ptc_agent.core.sandbox.runtime import (
+    RuntimeState,
+    SandboxGoneError,
+    SandboxTransientError,
+)
 from ptc_agent.core.session import Session
 
 from src.server.services.runs.executor import LocalRunExecutor
@@ -58,6 +63,10 @@ from src.server.services.workspace_status_pubsub import (
 
 
 logger = logging.getLogger(__name__)
+
+# How long a stop waits for an owner's machine to say how it is: one connect
+# with its timeout, then one short command.
+_OWNER_MACHINE_PROBE_S = 20
 
 
 class _MachineLeftRunning(Exception):
@@ -486,25 +495,86 @@ class SessionLifecycleMixin:
             )
             return await get_computer(computer_id)
 
-    async def _reconcile_provider_stop(self, binding: ComputerBinding) -> None:
-        """Keep a failed stop retryable without guessing whether the provider stopped."""
+    async def _owner_machine_state(
+        self, binding: ComputerBinding
+    ) -> RuntimeState | None:
+        """The state a machine its owner brought reports; None when it does not
+        answer or refuses the connection.
+
+        Such a machine is often away for longer than a stop should wait (a
+        laptop asleep, a VPS powered down), and the stop cannot reach what
+        still runs there anyway. The next start finds the machine as it was
+        left and carries on from there, so the stop settles without it.
+        """
+        provider = self._provider_for(binding)
+        try:
+            async with asyncio.timeout(_OWNER_MACHINE_PROBE_S):
+                runtime = await provider.get(binding.provider_ref)
+                return await runtime.get_state()
+        except TimeoutError:
+            return None
+        except Exception as e:
+            # A connection lost mid-read is as unanswered as one never made.
+            if provider.is_host_unavailable(e) or provider.is_transient_error(e):
+                return None
+            # A refused login (the key line removed, a reinstall that changed
+            # the host key) reaches the machine no better. Left 'stopping', the
+            # row would refuse the start that shows the owner why, and the
+            # remove that is their way out.
+            refused = connect_failure(e)
+            if refused is not None:
+                logger.warning(
+                    "Computer %s's machine refused the stop (%s): %s",
+                    binding.computer_id,
+                    refused.code,
+                    refused,
+                )
+                return None
+            raise
+        finally:
+            await provider.close()
+
+    async def _settle_unanswered_stop(self, computer_id: str) -> None:
+        logger.warning(
+            f"Computer {computer_id} is on its owner's machine, which the stop "
+            "could not reach; settling its stop without it"
+        )
+        session = self._cached_session(computer_id)
+        if session is not None:
+            await self._retire_session(
+                computer_id, session, reason="the stop could not reach its machine"
+            )
+        await self._settle_machine_stop(computer_id, ComputerStatus.STOPPED)
+
+    async def _reconcile_provider_stop(self, binding: ComputerBinding) -> bool:
+        """Keep a failed stop retryable without guessing whether the provider stopped.
+
+        True when the machine is its owner's and could not be reached, which
+        settles the stop rather than leaving it to be retried.
+        """
         computer_id = binding.computer_id
         sandbox_id = binding.provider_ref
         if not sandbox_id:
             # Nothing to probe: the stop had no sandbox to take down, so the
             # row is settled to 'stopped' and a start rebuilds from scratch.
             await self._settle_machine_stop(computer_id, ComputerStatus.STOPPED)
-            return
-        try:
-            async with self._detached_runtime(sandbox_id, binding=binding) as runtime:
-                actual_state = await runtime.get_state()
-        except SandboxGoneError as e:
-            logger.warning(
-                f"Sandbox {sandbox_id} is gone for computer {computer_id} during "
-                f"stopping-state recovery ({e}); settling the row to 'stopped'"
-            )
-            await self._settle_machine_stop(computer_id, ComputerStatus.STOPPED)
-            return
+            return False
+        if not binding.provider.recreatable:
+            actual_state = await self._owner_machine_state(binding)
+            if actual_state is None:
+                await self._settle_unanswered_stop(computer_id)
+                return True
+        else:
+            try:
+                async with self._detached_runtime(sandbox_id, binding=binding) as runtime:
+                    actual_state = await runtime.get_state()
+            except SandboxGoneError as e:
+                logger.warning(
+                    f"Sandbox {sandbox_id} is gone for computer {computer_id} during "
+                    f"stopping-state recovery ({e}); settling the row to 'stopped'"
+                )
+                await self._settle_machine_stop(computer_id, ComputerStatus.STOPPED)
+                return False
 
         state = actual_state.value
         logger.warning(
@@ -529,6 +599,7 @@ class SessionLifecycleMixin:
                 f"Workspace {binding.workspace_id} sandbox is in transient "
                 f"state {state!r}. Please wait and try again."
             )
+        return False
 
     async def _await_in_flight_start(
         self,
@@ -1048,7 +1119,22 @@ class SessionLifecycleMixin:
             workspace = {**workspace, "sandbox_id": sandbox_id}
 
         # A computer CAS can win while its shadow fails and the loser deletes its
-        # sandbox. Conflicting refs require recreation, not a guessed reconnect.
+        # sandbox. Conflicting refs require recreation, not a guessed reconnect,
+        # except on a machine that is never replaced: there the computer's ref
+        # is the machine, and the workspace's copy is only behind.
+        if (
+            binding.provider_ref is not None
+            and binding.provider_ref != sandbox_id
+            and not binding.provider.recreatable
+        ):
+            logger.warning(
+                f"Computer/workspace binding is split for {workspace_id} "
+                f"(computer={binding.provider_ref}, workspace={sandbox_id}); "
+                "reconnecting to the computer's machine",
+                extra={"workspace_id": workspace_id},
+            )
+            sandbox_id = binding.provider_ref
+            workspace = {**workspace, "sandbox_id": sandbox_id}
         if binding.provider_ref is not None and binding.provider_ref != sandbox_id:
             logger.warning(
                 f"Computer/workspace binding is split for {workspace_id} "
@@ -1552,18 +1638,31 @@ class SessionLifecycleMixin:
     ) -> Dict[str, Any]:
         computer_id = binding.computer_id
         try:
-            backup_started = time.monotonic()
-            folder_count = await self._backup_machine_files_to_db(
-                computer_id,
-                workspace_id=workspace_id,
-                expected_sandbox_id=durable_sandbox_id,
-            )
-            logger.info(
-                "Computer %s stop backup mirrored %d folder(s) in %.0fms",
-                computer_id,
-                int(folder_count or 0),
-                (time.monotonic() - backup_started) * 1000,
-            )
+            # Before the backup, which would wait out its timeout on every
+            # folder of a machine that is not there.
+            if (
+                durable_sandbox_id
+                and not binding.provider.recreatable
+                and await self._owner_machine_state(binding) is None
+            ):
+                await self._settle_unanswered_stop(computer_id)
+                return await self._stop_result(computer_id, workspace_id)
+
+            # A machine its owner chose not to back up keeps its last backup.
+            if binding.files_backup:
+                backup_started = time.monotonic()
+                folder_count = await self._backup_machine_files_to_db(
+                    computer_id,
+                    workspace_id=workspace_id,
+                    expected_sandbox_id=durable_sandbox_id,
+                    routine=True,
+                )
+                logger.info(
+                    "Computer %s stop backup mirrored %d folder(s) in %.0fms",
+                    computer_id,
+                    int(folder_count or 0),
+                    (time.monotonic() - backup_started) * 1000,
+                )
 
             # The last chance to read the disk before it is unreachable, so the
             # stopped machine still shows how full it is.
@@ -1624,7 +1723,8 @@ class SessionLifecycleMixin:
         except Exception as e:
             logger.error(f"Error stopping computer {computer_id}: {e}")
             try:
-                await self._reconcile_provider_stop(binding)
+                if await self._reconcile_provider_stop(binding):
+                    return await self._stop_result(computer_id, workspace_id)
             except Exception:
                 # Leave the durable stopping claim for the existing recovery
                 # path once this owner releases its heartbeat.

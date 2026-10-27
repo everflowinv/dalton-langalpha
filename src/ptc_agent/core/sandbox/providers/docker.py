@@ -634,6 +634,7 @@ class DockerProvider(SandboxProvider):
 
     label = "Docker"
     runs_remote = False
+    default_computer_name = "Local computer"
 
     @classmethod
     def reports_own_disk(cls, settings: Any) -> bool:

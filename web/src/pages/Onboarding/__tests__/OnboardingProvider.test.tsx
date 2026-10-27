@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen, fireEvent } from '@testing-library/react';
+import { render, screen, fireEvent, act, waitFor } from '@testing-library/react';
 import { MemoryRouter, useLocation, useNavigate } from 'react-router';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { emptyOnboardingPrefs } from '../onboardingPrefsSchema';
@@ -57,7 +57,17 @@ vi.mock('@/hooks/useWorkspaces', () => ({
   useWorkspaces: (opts?: { enabled?: boolean }) => useWorkspacesSpy(opts),
 }));
 
+// The onboarding chunk, behind which the intros' scenes and copy load: the
+// factory runs only if the host gate imports it.
+const hostChunkLoaded = vi.hoisted(() => vi.fn());
+vi.mock('../OnboardingHost', () => {
+  hostChunkLoaded();
+  return { OnboardingHost: () => null };
+});
+
 import { OnboardingProvider, useOnboarding } from '../OnboardingProvider';
+import { OnboardingHostGate } from '../OnboardingHostGate';
+import { PAGE_INTROS } from '../registry';
 
 function Harness() {
   const {
@@ -65,6 +75,7 @@ function Harness() {
     activeIntro,
     gettingStarted,
     dismissPageIntro,
+    abandonPageIntro,
     acknowledgeWhatsNew,
     replayGuides: replay,
     resetOnboarding,
@@ -73,10 +84,12 @@ function Harness() {
     <div>
       <span data-testid="phase">{phase}</span>
       <span data-testid="intro">{activeIntro?.id ?? 'none'}</span>
+      <span data-testid="introSteps">{activeIntro?.steps.map((s) => s.id).join(',')}</span>
       <span data-testid="card">{gettingStarted.visible ? 'visible' : 'hidden'}</span>
       <span data-testid="done">{gettingStarted.doneCount}</span>
       <span data-testid="taskIds">{gettingStarted.tasks.map((t) => t.def.id).join(',')}</span>
       <button onClick={dismissPageIntro}>dismiss</button>
+      <button onClick={abandonPageIntro}>abandon</button>
       <button onClick={acknowledgeWhatsNew}>ack</button>
       <button onClick={replay}>replay</button>
       <button onClick={resetOnboarding}>reset</button>
@@ -88,8 +101,12 @@ function Harness() {
 
 function NavButtons() {
   const navigate = useNavigate();
+  const { pathname } = useLocation();
   return (
     <>
+      <button onClick={() => navigate('/chat/t/__default__')}>go-new-chat</button>
+      {/* What the chat does once it has read its route state. */}
+      <button onClick={() => navigate(pathname, { replace: true, state: {} })}>clear-state</button>
       <button onClick={() => navigate('/chat/t/resolved-guid', { replace: true })}>
         go-resolved
       </button>
@@ -105,13 +122,17 @@ function LocationProbe() {
   return <span data-testid="location">{pathname + search}</span>;
 }
 
-function renderAt(route: string) {
+/** The welcome flow's hand-off into the chat it opens. */
+const WELCOME_HANDOFF = { pathname: '/chat/t/__default__', state: { handoff: true } };
+
+function renderAt(route: string | { pathname: string; state: unknown }, { withHost = false } = {}) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={client}>
       <MemoryRouter initialEntries={[route]}>
         <OnboardingProvider>
           <Harness />
+          {withHost && <OnboardingHostGate />}
         </OnboardingProvider>
       </MemoryRouter>
     </QueryClientProvider>
@@ -133,6 +154,7 @@ describe('OnboardingProvider', () => {
     mockIsMobile = false;
     vi.clearAllMocks();
     localStorage.clear();
+    sessionStorage.clear();
   });
 
   it('opens the chat intro for a fresh user on /chat and stamps first-run once', () => {
@@ -152,6 +174,19 @@ describe('OnboardingProvider', () => {
     renderAt('/dashboard');
     expect(phase()).toBe('pageIntro');
     expect(intro()).toBe('dashboard');
+  });
+
+  it('drops platform-only intro steps from a self-hosted build', () => {
+    renderAt('/automations');
+    expect(intro()).toBe('automations');
+    // Delivery goes to chat apps, which link through the hosted platform.
+    expect(screen.getByTestId('introSteps').textContent).toBe('trigger,ask,feed');
+  });
+
+  it('drops the Chief of Staff step, which answers from iMessage, from a self-hosted build', () => {
+    renderAt('/chat');
+    expect(intro()).toBe('chat');
+    expect(screen.getByTestId('introSteps').textContent).toBe('modes,ptc,workspace,create');
   });
 
   it('shows nothing on pages with no matching intro', () => {
@@ -245,6 +280,66 @@ describe('OnboardingProvider', () => {
     expect(intro()).toBe('thread');
   });
 
+  it('keeps the getting-started list out of the welcome flow conversation', () => {
+    mockPrefs = { ...emptyOnboardingPrefs(), pageIntrosSeen: { chat: 1 } };
+    renderAt(WELCOME_HANDOFF);
+    expect(card()).toBe('hidden');
+    // The chat clears its route state as it sends, and the rename on the first
+    // message drops it too: the hand-off is carried across both.
+    fireEvent.click(screen.getByText('clear-state'));
+    expect(card()).toBe('hidden');
+    fireEvent.click(screen.getByText('go-resolved'));
+    expect(card()).toBe('hidden');
+    // Back on any other page, the list returns.
+    fireEvent.click(screen.getByText('go-dashboard'));
+    expect(card()).toBe('visible');
+  });
+
+  it('keeps the getting-started list on every other new chat', () => {
+    mockPrefs = { ...emptyOnboardingPrefs(), pageIntrosSeen: { chat: 1 } };
+    renderAt('/chat/t/__default__');
+    expect(card()).toBe('visible');
+    fireEvent.click(screen.getByText('go-resolved'));
+    expect(card()).toBe('visible');
+    // Its first turn still holds the intros off.
+    expect(phase()).toBe('idle');
+  });
+
+  it('shows the getting-started list on a new chat started after the welcome flow', () => {
+    mockPrefs = { ...emptyOnboardingPrefs(), pageIntrosSeen: { chat: 1 } };
+    renderAt(WELCOME_HANDOFF);
+    fireEvent.click(screen.getByText('go-resolved'));
+    expect(card()).toBe('hidden');
+    fireEvent.click(screen.getByText('go-new-chat'));
+    expect(card()).toBe('visible');
+    fireEvent.click(screen.getByText('go-thread')); // the new chat's rename
+    expect(card()).toBe('visible');
+    expect(phase()).toBe('idle');
+  });
+
+  it('still knows the welcome flow conversation after a reload', () => {
+    mockPrefs = { ...emptyOnboardingPrefs(), pageIntrosSeen: { chat: 1 } };
+    const first = renderAt(WELCOME_HANDOFF);
+    fireEvent.click(screen.getByText('go-resolved'));
+    first.unmount();
+
+    // A fresh provider on the renamed thread, as a reload mounts it.
+    renderAt('/chat/t/resolved-guid');
+    expect(phase()).toBe('idle');
+    expect(card()).toBe('hidden');
+  });
+
+  it("still knows another new chat's first turn after a reload, and shows the list there", () => {
+    mockPrefs = { ...emptyOnboardingPrefs(), pageIntrosSeen: { chat: 1 } };
+    const first = renderAt('/chat/t/__default__');
+    fireEvent.click(screen.getByText('go-resolved'));
+    first.unmount();
+
+    renderAt('/chat/t/resolved-guid');
+    expect(phase()).toBe('idle');
+    expect(card()).toBe('visible');
+  });
+
   it('an open intro closes unseen when navigation leaves its page, and re-offers later', () => {
     renderAt('/chat');
     expect(intro()).toBe('chat');
@@ -256,6 +351,30 @@ describe('OnboardingProvider', () => {
     // Returning to /chat re-offers the unfinished chat intro.
     fireEvent.click(screen.getByText('go-gallery'));
     expect(intro()).toBe('chat');
+  });
+
+  it('abandonPageIntro closes the intro unseen, for this session only', () => {
+    const first = renderAt('/chat');
+    expect(intro()).toBe('chat');
+    fireEvent.click(screen.getByText('abandon'));
+    expect(markPageIntroSeen).not.toHaveBeenCalled();
+    expect(phase()).toBe('idle');
+    // A later render does not reopen it.
+    fireEvent.click(screen.getByText('go-gallery'));
+    expect(intro()).toBe('none');
+    first.unmount();
+
+    // A reload offers it again.
+    renderAt('/chat');
+    expect(intro()).toBe('chat');
+  });
+
+  it("abandonPageIntro hands the screen to What's-New", () => {
+    mockPrefs = { ...emptyOnboardingPrefs(), firstRunAt: 1, lastSeenReleaseVersion: '2026.1' };
+    renderAt('/chat');
+    expect(intro()).toBe('chat');
+    fireEvent.click(screen.getByText('abandon'));
+    expect(phase()).toBe('whatsNew');
   });
 
   it("resets a stranded What's-New phase when another tab acknowledges it", () => {
@@ -537,5 +656,29 @@ describe('OnboardingProvider', () => {
     renderAt('/chat');
     expect(phase()).toBe('idle');
     expect(card()).toBe('hidden');
+  });
+
+  it('downloads no intro code for a user who has seen every intro, on any page', async () => {
+    mockPrefs = {
+      ...emptyOnboardingPrefs(),
+      firstRunAt: 1,
+      lastSeenReleaseVersion: '9999.1',
+      pageIntrosSeen: Object.fromEntries(PAGE_INTROS.map((i) => [i.id, 1])),
+    };
+    const routes = ['/chat', '/chat/t/a-thread', '/dashboard', '/market', '/automations'];
+    // One route per intro, so an intro added later is covered or fails here.
+    expect(PAGE_INTROS.filter((i) => !routes.some((r) => i.matchRoute(r)))).toEqual([]);
+    for (const route of routes) {
+      const { unmount } = renderAt(route, { withHost: true });
+      await act(async () => {});
+      expect(phase()).toBe('idle');
+      unmount();
+    }
+    expect(hostChunkLoaded).not.toHaveBeenCalled();
+
+    // The same page with its intro unseen does load it, so the spy can tell.
+    mockPrefs = { ...mockPrefs, pageIntrosSeen: {} };
+    renderAt('/market', { withHost: true });
+    await waitFor(() => expect(hostChunkLoaded).toHaveBeenCalled());
   });
 });

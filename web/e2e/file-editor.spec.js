@@ -63,7 +63,6 @@ async function openEditor(page) {
   await page.goto(`/chat/t/${TH}`);
   await page.waitForSelector('textarea', { timeout: 10000 });
   await page.locator('button[title="Workspace Files"]').click();
-  await page.getByRole('button', { name: 'Show file tree' }).click();
   // Dispatched rather than clicked: on a cold load the tree column's entry
   // animation can stall with the row still off screen, and the tree is not
   // what this spec is about.
@@ -206,5 +205,29 @@ test.describe('file editor', () => {
     await ask.getByRole('button', { name: 'Discard' }).click();
     await expect(page.locator('.file-panel-crumb')).toHaveCount(0);
     expect(native).toEqual([]);
+  });
+
+  test('a keyboard close held by the discard question still hands focus to the header toggle', async ({ page }) => {
+    await serveMonacoLocally(page);
+    await mockFile(page);
+    await openEditor(page);
+
+    const lines = page.locator('.monaco-editor .view-lines');
+    await lines.waitFor({ timeout: 30000 });
+    await lines.click();
+    await page.keyboard.press('ControlOrMeta+End');
+    await page.keyboard.type('x');
+
+    await page.locator('[data-panel-toggle="panel"]').focus();
+    await page.keyboard.press('Enter');
+    const ask = page.getByRole('dialog', { name: 'Discard changes' });
+    await expect(ask).toBeVisible();
+    // Longer than the hand-off waits for a toggle to render, so a hand-off
+    // started by the press rather than the close would have given up.
+    await page.waitForTimeout(2500);
+    await ask.getByRole('button', { name: 'Discard' }).focus();
+    await page.keyboard.press('Enter');
+
+    await expect(page.locator('[data-panel-toggle="header"]')).toBeFocused();
   });
 });

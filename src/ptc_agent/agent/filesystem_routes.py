@@ -14,6 +14,7 @@ the namespace behind it -- which is what holds the bytes -- never changes.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from collections.abc import Sequence
 from typing import Any
 
 from ptc_agent.agent.backends import (
@@ -162,6 +163,7 @@ def build_filesystem_backend(
     workspace_id: str | None,
     layout: WorkspaceLayout | None = None,
     call: CallContext | None = None,
+    history_routes: Sequence[Any] = (),
 ) -> tuple[Any, BaselineSources | None]:
     """Mount the store-backed routes over the sandbox filesystem.
 
@@ -174,7 +176,8 @@ def build_filesystem_backend(
     mount hangs off. Omitted, the workspace owns the computer root.
     ``call`` is who the files are written for, which a new automation
     defaults to: this workspace, this conversation for ``thread: "current"``,
-    and this clock, else the user's own.
+    and this clock, else the user's own. ``history_routes`` are past threads
+    the host serves where no file mount shows them (``HistoryFiles``).
     """
     if not (
         gates.memory
@@ -182,6 +185,7 @@ def build_filesystem_backend(
         or gates.user_data
         or gates.workflow
         or gates.channels
+        or history_routes
     ):
         return backend, None
 
@@ -206,7 +210,7 @@ def build_filesystem_backend(
     # across requests, memory will cross-pollinate between users. Resolve
     # identity at call time (e.g. via `langgraph.runtime.get_runtime()`)
     # before introducing reuse.
-    routes: list[Any] = []
+    routes: list[Any] = list(history_routes)
     user_namespace_factory: NamespaceFactory | None = None
     workspace_namespace_factory: NamespaceFactory | None = None
     memo_namespace_factory: NamespaceFactory | None = None

@@ -119,6 +119,7 @@ def create_sandbox_config(config_data: dict[str, Any]) -> SandboxConfig:
         DockerConfig,
         E2BConfig,
         SandboxConfig,
+        SSHConfig,
         detect_provider_kind,
     )
 
@@ -139,6 +140,7 @@ def create_sandbox_config(config_data: dict[str, Any]) -> SandboxConfig:
             if "docker" in sandbox_data
             else DockerConfig()
         )
+        ssh_cfg = SSHConfig.from_section(sandbox_data.get("ssh"))
         platform_secrets = sandbox_data.get("platform_secrets") or []
         offered_providers = sandbox_data.get("offered_providers") or []
     elif "daytona" in config_data:
@@ -148,6 +150,7 @@ def create_sandbox_config(config_data: dict[str, Any]) -> SandboxConfig:
         daytona_cfg = DaytonaConfig.from_section(config_data["daytona"] or {})
         e2b_cfg = E2BConfig.from_section(None)
         docker_cfg = DockerConfig()
+        ssh_cfg = SSHConfig()
         platform_secrets = []
         offered_providers = []
     else:
@@ -171,6 +174,7 @@ def create_sandbox_config(config_data: dict[str, Any]) -> SandboxConfig:
         daytona=daytona_cfg,
         e2b=e2b_cfg,
         docker=docker_cfg,
+        ssh=ssh_cfg,
         platform_secrets=platform_secrets,
     )
 

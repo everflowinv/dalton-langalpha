@@ -49,8 +49,11 @@ at a bucket that has none, before enabling this in a hosted deployment.
 from __future__ import annotations
 
 import asyncio
+import contextvars
+import functools
 import hashlib
 import logging
+from concurrent.futures import Executor
 
 from src.server.database.blob_keys import (
     BLOB_CONTENT_TYPE,
@@ -247,15 +250,8 @@ async def register_blobs(user_id: str, entries: list[tuple[str, int]]) -> None:
             )
 
 
-async def fetch_blob(user_id: str, sha256: str) -> bytes:
-    """Read a blob's bytes back, verifying they still hash to their key.
-
-    The digest check is free relative to the download and turns silent
-    corruption (or a mis-keyed object) into a loud error rather than a file
-    that restores wrong.
-    """
-    key = blob_key(user_id, sha256)
-    data = await asyncio.to_thread(_storage_get_bytes, key)
+def _verified_get(key: str, sha256: str) -> bytes:
+    data = _storage_get_bytes(key)
     # `is None` deliberately: sha256(b"") is a valid blob and b"" is falsy.
     if data is None:
         msg = f"Blob {key} could not be read from object storage"
@@ -265,6 +261,22 @@ async def fetch_blob(user_id: str, sha256: str) -> bytes:
         msg = f"Blob {key} content hash mismatch (got {actual})"
         raise BlobFetchError(msg)
     return data
+
+
+async def fetch_blob(
+    user_id: str, sha256: str, *, executor: Executor | None = None
+) -> bytes:
+    """Read a blob's bytes back, verifying they still hash to their key.
+
+    The digest check is free relative to the download and turns silent
+    corruption (or a mis-keyed object) into a loud error rather than a file
+    that restores wrong. It runs in the download's thread, since hashing
+    megabytes would hold the event loop. ``executor`` (the default pool when
+    None) lets a caller that fetches many at once keep them off that pool.
+    """
+    key = blob_key(user_id, sha256)
+    run = functools.partial(contextvars.copy_context().run, _verified_get, key, sha256)
+    return await asyncio.get_running_loop().run_in_executor(executor, run)
 
 
 async def fetch_blob_range(

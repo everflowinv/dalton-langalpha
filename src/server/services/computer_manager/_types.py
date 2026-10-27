@@ -11,6 +11,8 @@ from typing import TYPE_CHECKING, Any, Dict, Mapping, Optional, Set, Tuple
 
 from ptc_agent.core.mcp_composite import builtin_registry_of
 from ptc_agent.core.mcp_registry import get_global_registry
+from ptc_agent.core.sandbox.providers import provider_class
+from ptc_agent.core.sandbox.runtime import SandboxProvider
 from ptc_agent.core.session import Session
 from src.server.services.livefs.tracker import MountTracker
 
@@ -69,8 +71,10 @@ class ComputerBinding:
     acquisition resolves the binding it hands out. None on a workspace binding
     means only that this read did not answer for the folder, so the layout
     resolves it from the row; a caller that builds a workspace binding out of a
-    machine row has to supply it. files_epoch names the move that last brought
-    the project's files to this machine, None if none has."""
+    machine row has to supply it. files_epoch names the last arrival of the
+    project's files on this machine, a move or a settled restore offer, None if
+    none has come. files_backup is the machine's switch for routine backups,
+    off only where its owner chose."""
 
     workspace_id: str
     computer_id: str
@@ -82,11 +86,18 @@ class ComputerBinding:
     is_always_on: bool = False
     provider_config: Optional[Dict[str, Any]] = None
     files_epoch: Optional[str] = None
+    files_backup: bool = True
 
     @property
     def provider_identity(self) -> Tuple[str, str]:
         """Row-level provider overrides distinguish backends of the same kind."""
         return (self.kind, json.dumps(self.provider_config or {}, sort_keys=True))
+
+    @property
+    def provider(self) -> type[SandboxProvider]:
+        """The machine's provider class, for the facts its kind fixes; an
+        unknown kind raises, since nothing can reach such a machine."""
+        return provider_class(self.kind)
 
 
 @dataclass(frozen=True)

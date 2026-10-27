@@ -119,6 +119,11 @@ def _refusal(price: dict) -> str:
             "- ZZZZ.ZZ below 5: an exchange suffix the price monitor does not know,"
             " so it would never be checked.",
         ),
+        (
+            {"symbol": "123456", "below": 140},
+            "- 123456 below 140: a bare number names no market; add its exchange suffix,"
+            " as in 600519.SH, 830799.BJ, 0700.HK, 7203.T, 005930.KS or 2330.TW.",
+        ),
     ],
 )
 def test_each_ported_price_refusal_reads_as_drafted(price, refusal):

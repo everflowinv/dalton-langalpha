@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { Dispatch, SetStateAction } from 'react';
 import { useLocation, useNavigate } from 'react-router';
 import { appendPathSuffix, getPreviewUrl } from '../../utils/api';
@@ -103,6 +103,15 @@ export function useRightPanel({
   // (closed). 'detail' and 'preview' are the mobile sheets; the desktop column
   // shows a tool result or a running app as a tab of the file view.
   const [rightPanelType, setRightPanelType] = useState<'file' | 'detail' | 'preview' | null>(null);
+
+  // Expanded, the file panel lies over the whole view, for what wants the
+  // width: a spreadsheet, a deck, a long report. Closing the panel ends it, so
+  // a file opened from the chat later opens beside the chat. Mobile shows the
+  // panel over the chat already and offers no toggle.
+  const [expanded, setExpanded] = useState(false);
+  if (expanded && rightPanelType !== 'file') setExpanded(false);
+  const panelExpanded = expanded && !isMobile;
+  const handleTogglePanelExpanded = useCallback(() => setExpanded((v) => !v), []);
 
   const [rightPanelWidth, setRightPanelWidth] = useState(750);
   // What the file panel has in front, reported by the panel as it changes. A
@@ -355,9 +364,15 @@ export function useRightPanel({
   // siblings does not remake the log.
   const dirName = folders?.dirName;
   const previousDirNames = folders?.previousDirNames;
+  const rootDir = folders?.rootDir;
+  const otherRoots = folders?.otherRoots;
+  const writeScope = useMemo(
+    () => ({ dirName, previousDirNames, rootDir, otherRoots }),
+    [dirName, previousDirNames, rootDir, otherRoots],
+  );
   const collectWrites = useCallback(
-    (msgs: readonly TranscriptMessage[]) => collectWriteLog(msgs, dirName, previousDirNames),
-    [dirName, previousDirNames],
+    (msgs: readonly TranscriptMessage[]) => collectWriteLog(msgs, writeScope),
+    [writeScope],
   );
   const transcript = useTranscriptReader(messages, subagentTranscripts, collectWrites);
 
@@ -370,7 +385,7 @@ export function useRightPanel({
   // needs this thread's Write/Edit paths when it resolves a reference, and a
   // memo over `messages` would rebuild on every streamed chunk.
   const getRecentWritePaths = useStableHandler(
-    () => collectRecentWritePaths(messages, dirName, previousDirNames),
+    () => collectRecentWritePaths(messages, writeScope),
   );
 
   // One-shot ?file= deep link: opens the file panel targeting that file. Gated
@@ -734,6 +749,8 @@ export function useRightPanel({
     rightPanelType,
     setRightPanelType,
     rightPanelWidth,
+    panelExpanded,
+    handleTogglePanelExpanded,
     previewData,
     panelWrapperRef,
     isDragging,

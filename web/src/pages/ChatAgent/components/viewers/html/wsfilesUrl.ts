@@ -5,11 +5,12 @@ import { workspaceRelativePath } from '../../../utils/agentPaths';
 // Built off the same base as the API client (api/client.ts).
 const API_BASE = (import.meta.env.VITE_API_BASE_URL ?? '').replace(/\/+$/, '');
 
-function encodePathSegments(filePath: string): string {
+function encodePathSegments(filePath: string, root?: string | null): string {
   // A served path is read the same way every other reference is: a sandbox
-  // root (`/home/workspace/x`, `file:///home/daytona/x`) names the workspace
-  // and comes off, rather than riding into the URL as two literal segments.
-  return workspaceRelativePath(filePath)
+  // root (`/home/workspace/x`, `file:///home/daytona/x`, or the computer's
+  // own) names the workspace and comes off, rather than riding into the URL
+  // as literal segments.
+  return workspaceRelativePath(filePath, root)
     .split('/')
     .map(encodeURIComponent)
     .join('/');
@@ -17,6 +18,8 @@ function encodePathSegments(filePath: string): string {
 
 export interface ServeUrlOptions {
   injectTheme?: boolean;
+  /** The computer's root, which an absolute path may start with. */
+  root?: string | null;
 }
 
 /** The ?format=pdf query string, with the optional render knobs appended. */
@@ -41,9 +44,9 @@ export function pdfQuery(scale?: number, pageNumbers?: boolean, branding?: boole
 export function buildServeUrl(
   prefix: string,
   filePath: string,
-  { injectTheme = false }: ServeUrlOptions = {},
+  { injectTheme = false, root }: ServeUrlOptions = {},
 ): string {
   const base = /^https?:\/\//i.test(prefix) ? prefix : `${API_BASE}${prefix}`;
-  const url = `${base.replace(/\/+$/, '')}/${encodePathSegments(filePath)}`;
+  const url = `${base.replace(/\/+$/, '')}/${encodePathSegments(filePath, root)}`;
   return injectTheme ? `${url}?inject=theme` : url;
 }

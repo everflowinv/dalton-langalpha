@@ -4,11 +4,10 @@ import { ChevronDown } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { INLINE_ARTIFACT_MAP, isInlineArtifactReady, openCardTarget } from './charts/InlineArtifactCards';
 import { PILL_ROW_CLASS, isPillArtifactType } from './charts/pillArtifacts';
-import { isUserDataReadmePath } from '../utils/agentPaths';
 import { announceAnchoredToggle } from '../utils/anchoredToggle';
 import { summarizeCompletedItems } from './messageList/activitySummary';
 import { type ActivityItem, type PreparingToolCallData, isRunning } from './messageList/activityTypes';
-import { filePathOf, groupFileToolRuns } from './messageList/groupFileToolRuns';
+import { groupFileToolRuns } from './messageList/groupFileToolRuns';
 import { FileToolGroupRow } from './messageList/FileToolGroupRow';
 import { ReasoningRow } from './messageList/ReasoningRow';
 import { ToolCallRow, PreparingTimelineRow } from './messageList/ToolCallRow';
@@ -47,17 +46,15 @@ const ActivityBlock = memo(function ActivityBlock({
   const { timeline, charts } = useMemo(() => {
     const timeline: ActivityItem[] = [];
     const charts: ActivityItem[] = [];
+    // A user-data README read never arrives here: the projection that built
+    // these items drops it, under the root it stamped on them.
     for (const item of items) {
-      if (item.type === 'tool_call') {
-        const path = filePathOf(item);
-        if (item.toolName === 'Read' && path && isUserDataReadmePath(path)) continue;
-        if (item._liveState === 'completed' && !item._annotationStep
-          && isInlineArtifactReady(item.toolName, item.toolCallResult?.artifact)) {
-          charts.push(item);
-          continue;
-        }
+      if (item.type === 'tool_call' && item._liveState === 'completed' && !item._annotationStep
+        && isInlineArtifactReady(item.toolName, item.toolCallResult?.artifact)) {
+        charts.push(item);
+      } else {
+        timeline.push(item);
       }
-      timeline.push(item);
     }
     return { timeline, charts };
   }, [items]);

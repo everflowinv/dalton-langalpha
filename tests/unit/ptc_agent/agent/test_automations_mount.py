@@ -121,6 +121,8 @@ class _Untouchable:
     """A sandbox backend without the file mount that fails the test on any other use."""
 
     livefs = None
+    provider = "docker"  # read once, when the tool is built
+    channel = "docker"
 
     async def settled_livefs(self, workspace_id=None):
         return None
@@ -174,6 +176,9 @@ class _Mount:
 
 class _Mounted:
     """A sandbox backend whose sandbox the file mount serves."""
+
+    provider = "docker"
+    channel = "docker"
 
     def __init__(self) -> None:
         self.mount = _Mount()

@@ -72,7 +72,6 @@ export interface MessageActions {
    *  continuation rates the turn it continues. MessageList supplies the index. */
   onThumbUp?: (turnIndex: number) => Promise<FeedbackResult | null>;
   onThumbDown?: (turnIndex: number, issueCategories: string[], comment: string | null, consentHumanReview: boolean) => Promise<FeedbackResult | null>;
-  onReportWithAgent?: (instruction: string) => void;
   onWidgetSendPrompt?: (text: string) => void;
 }
 

@@ -19,6 +19,7 @@ from ptc_agent.agent.middleware.compaction.summary_request import (
     _COMPACTION_USER_NUDGE,
     build_summary_request as _build_summary_request,
 )
+from ptc_agent.core.sandbox.livefs_mount import TranscriptReach
 from src.llms import maybe_disable_streaming
 
 
@@ -374,7 +375,11 @@ async def test_compact_messages_summarizes_the_offload_view(monkeypatch):
 
     monkeypatch.setattr(compact_module, "aoffload_base64_content", _recording_offload)
     mount = SimpleNamespace(save_transcript=AsyncMock(return_value=True))
-    backend = SimpleNamespace(livefs=mount, settled_livefs=AsyncMock(return_value=mount))
+    backend = SimpleNamespace(
+        livefs=mount,
+        transcripts=TranscriptReach(mount, shell=True),
+        settled_livefs=AsyncMock(return_value=mount),
+    )
     messages = [
         HumanMessage(content="go", id="h1"),
         AIMessage(

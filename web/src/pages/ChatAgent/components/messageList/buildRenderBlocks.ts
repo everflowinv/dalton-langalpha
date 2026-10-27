@@ -140,7 +140,13 @@ export function groupSegments(segments: ContentSegmentRecord[]): ContentSegmentR
     return groups;
 }
 
-function toolActivity(proc: ToolCallProcessRecord, id: string, state: LiveState, extra: Partial<ToolActivityItem> = {}): ToolActivityItem {
+function toolActivity(
+  proc: ToolCallProcessRecord,
+  id: string,
+  state: LiveState,
+  root: string | null | undefined,
+  extra: Partial<ToolActivityItem> = {},
+): ToolActivityItem {
   return {
     ...proc,
     type: 'tool_call', id, toolCallId: id,
@@ -150,6 +156,7 @@ function toolActivity(proc: ToolCallProcessRecord, id: string, state: LiveState,
     isComplete: proc.isComplete === true,
     isFailed: proc.isFailed === true,
     _liveState: state,
+    root,
     ...extra,
   };
 }
@@ -166,6 +173,7 @@ export function buildRenderBlocks(
     isSubagentView,
     preparing,
     now = Date.now(),
+    root,
   }: {
     reasoningProcesses: Record<string, Record<string, unknown>>;
     toolCallProcesses: Record<string, ToolCallProcessRecord>;
@@ -179,6 +187,8 @@ export function buildRenderBlocks(
     /** The clock live exposure is measured against. A component passes its
      *  own, so a timer that advances it is visibly an input of the build. */
     now?: number;
+    /** The computer's own root, so a README read under it is still hidden. */
+    root?: string | null;
   },
 ): { blocks: RenderBlock[]; nextExpiry: number | null; pinnedLive: boolean; pinnedSettledAt: number | null } {
     // A hidden secretary call the user approved in advance has no proposal
@@ -208,7 +218,7 @@ export function buildRenderBlocks(
             return card !== null;
           }
           const path = args?.file_path || args?.filePath || args?.path || args?.filename;
-          if (toolName === 'Read' && typeof path === 'string' && isUserDataReadmePath(path)) return false;
+          if (toolName === 'Read' && typeof path === 'string' && isUserDataReadmePath(path, root)) return false;
           return true;
         }
         return false;
@@ -333,7 +343,7 @@ export function buildRenderBlocks(
           }
 
           if ((proc.isInProgress as boolean) && (isAlwaysLive || (isStreaming && age < MAX_IN_PROGRESS_MS))) {
-            pendingItems.push(toolActivity(proc, seg.toolCallId!, 'active'));
+            pendingItems.push(toolActivity(proc, seg.toolCallId!, 'active', root));
             if (isAlwaysLive) pinnedLive = true;
             if (!isAlwaysLive) {
               const expiry = createdAt! + MAX_IN_PROGRESS_MS;
@@ -351,7 +361,7 @@ export function buildRenderBlocks(
               // draw: render as an ordinary completed row (its content shows in
               // the pinned card above). `_annotationStep` stops ActivityBlock
               // (see its partition guard) from re-promoting it into a card.
-              pendingItems.push(toolActivity(proc, seg.toolCallId!, 'completed', { _annotationStep: true }));
+              pendingItems.push(toolActivity(proc, seg.toolCallId!, 'completed', root, { _annotationStep: true }));
             } else if (isChartAnnotation && plan) {
               // The anchor (first) draw: pin the card here but feed it the
               // freshest cumulative artifact so it grows in place. Key is the
@@ -375,13 +385,13 @@ export function buildRenderBlocks(
               });
             }
           } else if (!streamEnded && age < MIN_LIVE_EXPOSURE_MS && !INLINE_ARTIFACT_TOOLS.has(proc.toolName as string)) {
-            pendingItems.push(toolActivity(proc, seg.toolCallId!, proc.isFailed ? 'failed' : 'completing', { _recentlyCompleted: true }));
+            pendingItems.push(toolActivity(proc, seg.toolCallId!, proc.isFailed ? 'failed' : 'completing', root, { _recentlyCompleted: true }));
             const expiry = createdAt! + MIN_LIVE_EXPOSURE_MS;
             if (computedNextExpiry === null || expiry < computedNextExpiry) {
               computedNextExpiry = expiry;
             }
           } else {
-            pendingItems.push(toolActivity(proc, seg.toolCallId!, 'completed'));
+            pendingItems.push(toolActivity(proc, seg.toolCallId!, 'completed', root));
           }
         } else if (seg.type === 'subagent_task') {
           flushActivity();

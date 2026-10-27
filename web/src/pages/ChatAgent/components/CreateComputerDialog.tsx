@@ -6,7 +6,7 @@
  * from a blank form. The provider and the tier are locked by plan the same
  * way, and either lock brings up the same way out as the spec dialog.
  */
-import { useId, useState, type FormEvent } from 'react';
+import { useEffect, useId, useRef, useState, type FormEvent } from 'react';
 import { useTranslation } from 'react-i18next';
 
 import { Button } from '@/components/ui/button';
@@ -16,13 +16,13 @@ import type { ComputerCreate, ResourceTier } from '@/types/api';
 
 import { useComputerProviders } from '../hooks/useComputers';
 import { useTierQuota } from '../hooks/useTierQuota';
+import { COMPUTER_NAME_MAX } from './computerName';
+import { SshSetup } from './sshSetup';
+import { useSshSetup } from './sshSetupState';
 import { PlanUpgradeHint } from './planUpgradeHint';
-import { defaultProviderKind, isProviderLocked, providerOptions } from './providerUi';
+import { defaultProviderKind, isProviderLocked, providerManagesSpec, providerOptions } from './providerUi';
 import { RadioCardGroup } from './radioCardGroup';
 import { TIER_ORDER, TierRadioGroup, isTierBlocked, tierCapacity } from './tierUi';
-
-/** The server's column width for a computer's name. */
-export const COMPUTER_NAME_MAX = 255;
 
 interface CreateComputerDialogProps {
   onClose: () => void;
@@ -41,6 +41,13 @@ function CreateComputerDialog({ onClose, onSubmit, busy, error }: CreateComputer
   const [name, setName] = useState('');
   const [pickedKind, setPickedKind] = useState<string | null>(null);
   const [pickedTier, setPickedTier] = useState<ResourceTier>('standard');
+  const errorRef = useRef<HTMLParagraphElement>(null);
+
+  // The SSH summary makes the form taller than the dialog, so a refusal would
+  // land below the fold with nothing visible changing.
+  useEffect(() => {
+    if (error && !busy) errorRef.current?.scrollIntoView?.({ block: 'nearest' });
+  }, [error, busy]);
 
   const { data: providerData } = useComputerProviders({ enabled: true });
   const { data: quota } = useTierQuota({ enabled: true });
@@ -56,8 +63,13 @@ function CreateComputerDialog({ onClose, onSubmit, busy, error }: CreateComputer
   const kind = picked && !isProviderLocked(picked) ? picked.kind : defaultProviderKind(providers);
   const tier: ResourceTier = isTierBlocked(tierCapacity(quota, pickedTier)) ? 'standard' : pickedTier;
 
+  const isSsh = kind === 'ssh';
+  const ssh = useSshSetup(isSsh);
+  // A machine the user brings is sized by them, so its tier is never a pick.
+  const managesSpec = kind === null || providerManagesSpec(kind);
+
   const providerLocked = choosesProvider && providers.some(isProviderLocked);
-  const tierLocked = TIER_ORDER.some((id) => isTierBlocked(tierCapacity(quota, id)));
+  const tierLocked = managesSpec && TIER_ORDER.some((id) => isTierBlocked(tierCapacity(quota, id)));
   const upgradeLead = providerLocked && tierLocked
     ? t('computer.planLimitedBoth', "Need a provider or spec your plan doesn't include?")
     : providerLocked
@@ -65,18 +77,24 @@ function CreateComputerDialog({ onClose, onSubmit, busy, error }: CreateComputer
       : tierLocked
         ? t('computer.spec.planLimited', 'Need a bigger spec than your plan includes?')
         : null;
+  // The body the form would send, or null while it cannot send one. An SSH
+  // machine's comes from its setup and always names its kind, since the
+  // server takes a target only with it.
+  const trimmedName = name.trim();
+  const fields: ComputerCreate | null = isSsh
+    ? ssh.create && { ...ssh.create, resource_tier: 'standard', kind }
+    : {
+      ...(trimmedName ? { name: trimmedName } : {}),
+      resource_tier: tier,
+      ...(choosesProvider && kind ? { kind } : {}),
+    };
   // Every provider on offer locked leaves nothing to create on.
-  const blocked = choosesProvider && kind === null;
+  const blocked = (choosesProvider && kind === null) || !fields;
 
   const submit = (e: FormEvent) => {
     e.preventDefault();
     if (busy || blocked) return;
-    const trimmed = name.trim();
-    onSubmit({
-      ...(trimmed ? { name: trimmed } : {}),
-      resource_tier: tier,
-      ...(choosesProvider && kind ? { kind } : {}),
-    });
+    onSubmit(fields);
   };
 
   const footer = (
@@ -85,7 +103,9 @@ function CreateComputerDialog({ onClose, onSubmit, busy, error }: CreateComputer
         {t('common.cancel')}
       </Button>
       <Button type="submit" form={formId} disabled={busy || blocked} aria-busy={busy}>
-        {busy ? t('computer.creating', 'Creating...') : t('computer.create', 'Create computer')}
+        {isSsh
+          ? (busy ? t('computer.adding', 'Adding...') : t('computer.add', 'Add computer'))
+          : (busy ? t('computer.creating', 'Creating...') : t('computer.create', 'Create computer'))}
       </Button>
     </div>
   );
@@ -106,28 +126,33 @@ function CreateComputerDialog({ onClose, onSubmit, busy, error }: CreateComputer
       footer={footer}
     >
       <form id={formId} onSubmit={submit} className="flex flex-col gap-4">
-        <div className="flex flex-col gap-1.5">
-          <label htmlFor={nameId} className="text-xs font-medium" style={{ color: 'var(--color-text-secondary)' }}>
-            {t('computer.nameLabel', 'Name')}{' '}
-            <span className="font-normal" style={{ color: 'var(--color-text-tertiary)' }}>{t('common.optional')}</span>
-          </label>
-          <Input
-            id={nameId}
-            value={name}
-            maxLength={COMPUTER_NAME_MAX}
-            onChange={(e) => setName(e.target.value)}
-            disabled={busy}
-            style={{
-              backgroundColor: 'var(--color-bg-input)',
-              borderColor: 'var(--color-border-muted)',
-              color: 'var(--color-text-primary)',
-            }}
-          />
-        </div>
+        {!isSsh && (
+          <div className="flex flex-col gap-1.5">
+            <label htmlFor={nameId} className="text-xs font-medium" style={{ color: 'var(--color-text-secondary)' }}>
+              {t('computer.nameLabel', 'Name')}{' '}
+              <span className="font-normal" style={{ color: 'var(--color-text-tertiary)' }}>{t('common.optional')}</span>
+            </label>
+            <Input
+              id={nameId}
+              value={name}
+              maxLength={COMPUTER_NAME_MAX}
+              onChange={(e) => setName(e.target.value)}
+              disabled={busy}
+              style={{
+                backgroundColor: 'var(--color-bg-input)',
+                borderColor: 'var(--color-border-muted)',
+                color: 'var(--color-text-primary)',
+              }}
+            />
+          </div>
+        )}
 
         {choosesProvider && (
           <RadioCardGroup
-            options={providerOptions(t, providers)}
+            options={providerOptions(t, providers).map((o) =>
+              // Beside the title, where a lock note would sit; a lock note wins.
+              o.value === 'ssh' && !o.note ? { ...o, note: t('computer.ssh.previewLabel', 'Preview') } : o,
+            )}
             value={kind}
             onChange={setPickedKind}
             label={t('computer.provider.label', 'Provider')}
@@ -136,17 +161,21 @@ function CreateComputerDialog({ onClose, onSubmit, busy, error }: CreateComputer
           />
         )}
 
-        <TierRadioGroup
-          value={tier}
-          onChange={setPickedTier}
-          label={t('computer.tierLabel', 'Computer spec')}
-          quota={quota}
-        />
+        {isSsh ? (
+          <SshSetup state={ssh} busy={busy} nameMaxLength={COMPUTER_NAME_MAX} />
+        ) : (
+          <TierRadioGroup
+            value={tier}
+            onChange={setPickedTier}
+            label={t('computer.tierLabel', 'Computer spec')}
+            quota={quota}
+          />
+        )}
 
         {upgradeLead && <PlanUpgradeHint lead={upgradeLead} testId="create-computer-plan-cta" />}
 
         {error && !busy && (
-          <p className="text-sm" role="alert" style={{ color: 'var(--color-icon-danger)' }}>
+          <p ref={errorRef} className="text-sm" role="alert" style={{ color: 'var(--color-icon-danger)' }}>
             {error}
           </p>
         )}

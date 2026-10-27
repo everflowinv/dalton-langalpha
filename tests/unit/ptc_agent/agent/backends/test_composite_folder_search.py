@@ -38,6 +38,7 @@ from langgraph.store.memory import InMemoryStore
 
 from ptc_agent.agent.backends import workflow_namespace
 from ptc_agent.agent.backends.automations import AutomationsBackend
+from ptc_agent.agent.backends.results import GrepAnswer
 from ptc_agent.agent.backends.sandbox import SandboxBackend
 from ptc_agent.agent.backends.search_match import (
     GLOB_EXCLUDED_DIRS,
@@ -2048,3 +2049,124 @@ class TestGrepFilterMatchesRgOnDisk:
                 differences[path] = (sorted(found - expected), sorted(expected - found))
 
         assert differences == {}
+
+
+class TestARouteSearchedOnlyInside:
+    """A route marked ``searched_only_inside`` is searched when ``path`` is
+    at or inside its root and from nowhere above, as rg follows the mount's
+    link to such files only when it is given that link."""
+
+    ROOT_PREFIX = f"{FOLDER}/.agents/history/"
+    HIT = f"{ROOT_PREFIX}abcd1234/turn-0001.jsonl"
+
+    @pytest.fixture
+    def history(self, files):
+        route = SimpleNamespace(
+            root_prefix=self.ROOT_PREFIX,
+            refuses_writes=True,
+            searched_only_inside=True,
+            agrep_rich=AsyncMock(return_value=[self.HIT]),
+        )
+        files._routes.insert(0, route)
+        return route
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("path", "glob"),
+        [(".", None), (FOLDER, None), (".agents", None), (ROOT, "**/.agents/**")],
+    )
+    async def test_a_grep_from_above_does_not_search_it(self, files, history, path, glob):
+        await _grep(files, "ZEPH", path, glob=glob)
+
+        history.agrep_rich.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("path", [".agents/history", ".agents/history/abcd1234"])
+    async def test_a_path_inside_it_searches_it(self, files, history, path):
+        found = await _grep(files, "ZEPH", path)
+
+        history.agrep_rich.assert_awaited()
+        assert found == [self.HIT]
+
+
+class TestARouteThatTakesTheWalk:
+    """A route that ``takes_walk`` is told the page's end and the walk's
+    verdict on its files, so it fetches no more than the page needs, and the
+    notes it answers with reach the Grep's output."""
+
+    ROOT_PREFIX = f"{FOLDER}/.agents/history/"
+    HIT = f"{ROOT_PREFIX}abcd1234/turn-0001.jsonl"
+
+    @pytest.fixture
+    def history(self, files):
+        route = SimpleNamespace(
+            root_prefix=self.ROOT_PREFIX,
+            refuses_writes=True,
+            searched_only_inside=True,
+            takes_walk=True,
+            agrep_rich=AsyncMock(return_value=GrepAnswer([self.HIT], ["[stopped short]"])),
+        )
+        files._routes.insert(0, route)
+        return route
+
+    @pytest.mark.asyncio
+    async def test_it_is_told_the_pages_end_and_the_filters_verdict(self, files, history):
+        await _grep(files, "ZEPH", ".agents/history", glob="turn-*", head_limit=2, offset=3)
+
+        told = history.agrep_rich.await_args.kwargs
+        assert told["head_limit"] == 5
+        assert told["searches"](self.HIT)
+        assert not told["searches"](f"{self.ROOT_PREFIX}abcd1234/manifest.json")
+
+    @pytest.mark.asyncio
+    async def test_its_notes_follow_the_matches(self, files, history):
+        printed = await create_grep_tool(files).ainvoke(
+            {"pattern": "ZEPH", "path": ".agents/history"}
+        )
+
+        assert printed.endswith("abcd1234/turn-0001.jsonl\n\n[stopped short]")
+
+
+class TestARouteThatRefusesThePattern:
+    """A route searches with RE2, which refuses some syntax rg runs, such as
+    ``(?x)``. Its files went unsearched, which no matches would hide, so the
+    Grep says so once for each route, at the path it prints, and rg's own
+    matches stand."""
+
+    REFUSED = (
+        "[Grep did not search {path}: its files are searched with RE2, which "
+        "refuses this pattern (invalid perl operator: (?x). Grep that path "
+        "again without that syntax to search them.]"
+    )
+
+    @pytest.mark.asyncio
+    async def test_a_grep_inside_it_says_it_did_not_search_it(self, files):
+        # The profile is read at each of its files, and is named once.
+        printed = await create_grep_tool(files).ainvoke(
+            {"pattern": "(?x) ZEPH", "path": ".agents/user/profile"}
+        )
+
+        assert printed == (
+            "No matches found for pattern '(?x) ZEPH' in '.agents/user/profile'\n\n"
+            + self.REFUSED.format(path="/.agents/user/profile")
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_grep_from_above_keeps_rgs_matches_and_names_each_route(
+        self, files, sandbox
+    ):
+        on_disk = f"{ROOT}/.agents/user/notes.md"
+        sandbox.agrep_rich.return_value = [on_disk]
+        below = [
+            route.root_prefix.rstrip("/")
+            for route in files._routes
+            if route.root_prefix.startswith(f"{ROOT}/.agents/user/")
+        ]
+
+        found = await _grep(files, "(?x) ZEPH", ".agents/user")
+
+        assert found == [on_disk]
+        assert len(below) > 1
+        assert sorted(found.notes) == sorted(
+            self.REFUSED.format(path=path[len(ROOT) :]) for path in below
+        )

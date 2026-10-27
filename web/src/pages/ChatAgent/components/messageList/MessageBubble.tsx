@@ -19,11 +19,13 @@ import type { AttachmentData, WidgetChipShape } from './attachments';
 import { MessageContentSegments } from './MessageContentSegments';
 import { OverflowCollapse } from './OverflowCollapse';
 import { useMessageActions } from './MessageActionsContext';
+import { useWorkspaceFolders } from '../../contexts/WorkspaceContext';
 import { OpenThoughtContext, openThoughtLength, useArrivalQuiet, useOpenThoughts } from './useArrivalQuiet';
 import { useStableHandler } from '@/hooks/useStableHandler';
 import { useEditDraft, useEditDraftStore } from '../../hooks/utils/editDrafts';
 import { isSteeringUserMessage } from './messagePredicates';
 import { UserBubble } from './UserBubble';
+import { MessageTime } from './MessageTime';
 import { assistantText } from './messageText';
 import { TurnFileCards } from './TurnFileCards';
 import type { TurnFile } from '../../utils/turnFiles';
@@ -64,6 +66,8 @@ interface MessageBubbleProps {
   isTurnLive?: boolean;
   /** Files this whole turn wrote or pointed at, rendered as cards on the tail. */
   turnFiles?: TurnFile[];
+  /** When the turn ended, on its tail once it has; the time its reply shows. */
+  completedAt?: number;
   /** This turn's stored rating, or null. */
   feedback?: FeedbackResult | null;
   isLoading?: boolean;
@@ -83,10 +87,11 @@ interface MessageBubbleProps {
  * MessageActionsContext (one identity-stable object per host), so a streamed
  * chunk never re-renders settled bubbles through a handler identity.
  */
-export const MessageBubble = memo(function MessageBubble({ message, contentProjection, turnIndex, isTurnTail, canRegenerate = true, isLatestReply = true, isTurnLive, turnFiles, feedback, isLoading, fold = 'unfolded', isSubagentView, readOnly, allowFiles, isMobile, dispatcherContext }: MessageBubbleProps): React.ReactElement | null {
-  const { onOpenFile, onDownloadFile, onRevealFiles, onOpenSources, onEditMessage, editDrafts, onRegenerate, onRetry, onThumbUp, onThumbDown, onReportWithAgent } = useMessageActions();
+export const MessageBubble = memo(function MessageBubble({ message, contentProjection, turnIndex, isTurnTail, canRegenerate = true, isLatestReply = true, isTurnLive, turnFiles, completedAt, feedback, isLoading, fold = 'unfolded', isSubagentView, readOnly, allowFiles, isMobile, dispatcherContext }: MessageBubbleProps): React.ReactElement | null {
+  const { onOpenFile, onDownloadFile, onRevealFiles, onOpenSources, onEditMessage, editDrafts, onRegenerate, onRetry, onThumbUp, onThumbDown } = useMessageActions();
   const { t } = useTranslation();
-  const projection = contentProjection ?? projectMessageContent(message, isSubagentView);
+  const root = useWorkspaceFolders()?.rootDir;
+  const projection = contentProjection ?? projectMessageContent(message, isSubagentView, root);
   const isUser = (message.role as string) === 'user';
   const isAssistant = (message.role as string) === 'assistant';
   const isPendingDelivery = isUser && ((message.isPending as boolean) || (message.steering as boolean) || (message.queued as boolean));
@@ -204,6 +209,12 @@ export const MessageBubble = memo(function MessageBubble({ message, contentProje
   const failure = hasError ? message.structuredError as StructuredError | undefined : undefined;
   const hasBody = !(projection.textCount === 0 && projection.blocks.every((block) => block.type === 'text'));
   const isSteering = isSteeringUserMessage(message);
+  // A message shows when it was sent and a reply when its turn ended. A
+  // steering bubble shows none: replayed, its time is not history time.
+  // It sits on the row's inner side, so the buttons keep their place at the
+  // edge whatever its length: before a user's buttons, after a reply's.
+  const shownAt = isUser ? (isSteering ? undefined : message.timestamp) : completedAt;
+  const shownTime = <MessageTime value={shownAt} />;
   const resizeTextarea = () => {
     const el = editTextareaRef.current;
     if (!el) return;
@@ -301,6 +312,7 @@ export const MessageBubble = memo(function MessageBubble({ message, contentProje
       isUser ? 'justify-end mt-0.5' : 'justify-start'
     }`}
   >
+    {isUser && shownTime}
     {/* User message actions. Steering bubbles get no edit pencil:
         they're injected mid-turn and have no turn checkpoint of their
         own, so an edit fork would target the NEXT turn and leave the
@@ -376,6 +388,7 @@ export const MessageBubble = memo(function MessageBubble({ message, contentProje
         <RotateCcw className="h-3.5 w-3.5" style={{ color: 'var(--color-text-tertiary)' }} />
       </button>
     )}
+    {!isUser && shownTime}
   </div>
   ) : null;
 
@@ -700,10 +713,6 @@ export const MessageBubble = memo(function MessageBubble({ message, contentProje
             isOpen={showThumbDownModal}
             onSubmit={handleThumbDownSubmit}
             onCancel={() => setShowThumbDownModal(false)}
-            onReportWithAgent={onReportWithAgent ? (instruction: string) => {
-              setShowThumbDownModal(false);
-              onReportWithAgent(instruction);
-            } : undefined}
           />
         )}
       </div>

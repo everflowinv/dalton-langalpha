@@ -2,9 +2,7 @@
 
 import asyncio
 import shlex
-import time
 from collections.abc import AsyncIterator, Callable, Iterable, Mapping
-from datetime import datetime
 from pathlib import Path
 from types import TracebackType
 from typing import Any
@@ -24,16 +22,13 @@ from ptc_agent.core.sandbox.platform_secrets import (
 )
 from ptc_agent.core.sandbox.providers import create_provider
 from ptc_agent.core.sandbox.providers._image_recipe import builtin_mcp_packages
-from ptc_agent.core.sandbox.livefs_mount import MountHandle
+from ptc_agent.core.sandbox.livefs_mount import HistoryFiles, MountHandle, TranscriptReach
 from ptc_agent.core.sandbox.retry import RetryPolicy, async_retry_with_backoff
 from ptc_agent.core.sandbox.runtime import (
     HostUnavailablePolicy,
     PreviewInfo,
     RuntimeState,
-    SandboxFailureKind,
     SandboxGoneError,
-    SandboxHostLostError,
-    SandboxHostUnavailableError,
     SandboxRuntime,
     SandboxTransientError,
 )
@@ -59,6 +54,7 @@ from ptc_agent.core.sandbox import execution as _execution
 from ptc_agent.core.sandbox import files as _files
 from ptc_agent.core.sandbox import path_resolution as _paths
 from ptc_agent.core.sandbox import mcp_setup as _mcp_setup
+from ptc_agent.core.sandbox import reconnect as _reconnect
 from ptc_agent.core.sandbox import tool_overlay as _tool_overlay
 from ptc_agent.core.sandbox import sessions as _sessions
 
@@ -94,6 +90,9 @@ class PTCSandbox:
         # Set by the host while the file mount serves this sandbox; None
         # means the store-backed paths are not on its filesystem.
         self.livefs: MountHandle | None = None
+        # Set by the host on a machine the mount never serves, whose past
+        # threads the file tools then read in process.
+        self.history: HistoryFiles | None = None
         # A reconnect found the mount gone: it booted the sandbox, or nothing
         # answered at the mount's path. The host records that before it next
         # reads what was recorded of the mount, which still says it serves.
@@ -103,7 +102,11 @@ class PTCSandbox:
         # after sandbox creation/reconnect.
         self._work_dir: str = config.filesystem.working_directory
 
-        self._reconnect_lock = asyncio.Lock()
+        # The reconnect in flight, which every caller arriving meanwhile awaits
+        # rather than repeating it: against a host that does not answer, each
+        # one queued behind it would pay its own connect timeout in turn.
+        self._reconnect_task: asyncio.Task[None] | None = None
+        self._reconnects_running = 0
         self._tool_refresh_lock = asyncio.Lock()
         self._download_semaphore = asyncio.Semaphore(4)
 
@@ -125,7 +128,8 @@ class PTCSandbox:
         self._init_error: Exception | None = None
         # Every failed open evicts its session through cleanup, so cleanup keeps
         # a sandbox no reconnect has completed on: an errored one may hold the
-        # only copy of files its backup lacks.
+        # only copy of files its backup lacks. A later call that reaches the
+        # sandbox outside a reconnect clears it, as does a removal.
         self._reconnect_incomplete = False
         # Set once a rebuild elsewhere is authorized: the host may come back,
         # and with it files the backup lacks, so cleanup never deletes this one.
@@ -179,6 +183,32 @@ class PTCSandbox:
         return SandboxLayout(self._work_dir).for_workspace(
             ctx.dir_name if ctx is not None else None
         )
+
+    @property
+    def channel(self) -> str:
+        """How a call reaches this computer's machine, as tool traces name it:
+        the provider's kind, unless the provider tells its ways in apart."""
+        return self.provider.channel or self.config.sandbox.provider
+
+    @property
+    def mounts_livefs(self) -> bool:
+        """Whether this computer's provider can serve the file mount at all."""
+        return type(self.provider).mounts_livefs
+
+    @property
+    def recreatable(self) -> bool:
+        """Whether the server rebuilds this computer, and so lays its files
+        unasked; on one its owner brought, a missing folder is theirs to restore."""
+        return type(self.provider).recreatable
+
+    @property
+    def transcripts(self) -> TranscriptReach | None:
+        """Where this agent's transcripts reach its tools, by the provider's
+        kind: the mount wherever one may serve, the in-process routes on a
+        machine none ever does. None while that one is not there."""
+        if self.mounts_livefs:
+            return None if self.livefs is None else TranscriptReach(self.livefs, shell=True)
+        return None if self.history is None else TranscriptReach(self.history, shell=False)
 
     @property
     def _unified_manifest_path(self) -> str:
@@ -337,8 +367,48 @@ class PTCSandbox:
     ) -> dict[str, str]:
         """Build environment variables to inject at sandbox creation time.
 
-        Resolves MCP server env vars (${VAR} placeholders from host) and
-        GitHub bot credentials so they're available to all sandbox processes.
+        The deployment's own (``_deployment_env_vars``) go only to a machine
+        it trusts. One it does not (``trusted_host`` False) gets none: whoever
+        owns it can read every process's environment, and config load has
+        already replaced each placeholder with the host's value, so no server
+        env is sent at all.
+        """
+        env_vars: dict[str, str] = {
+            # Paths baked into the sandbox image, repeated here so a sandbox born
+            # on a snapshot built before one of them was added still gets it.
+            **SANDBOX_IMAGE_ENV,
+            # Tell the in-sandbox ginlix-data client the exact path the host
+            # uploads the token file to. It must not key off $HOME: Daytona
+            # runs as root ($HOME=/root) while the working dir is /home/workspace.
+            "GINLIX_TOKEN_FILE": self._token_file_path,
+        }
+        if type(self.provider).trusted_host(self.config.sandbox):
+            env_vars.update(self._deployment_env_vars(platform_secret_bindings))
+        # DALTON-HOOK(bridge-admin-token): the final scrub — by value, whatever
+        # key carried it — over the merged env and the servers it came from.
+        from src.dalton.settings import sanitize_sandbox_env_vars
+
+        return sanitize_sandbox_env_vars(env_vars, self._builtin_servers())
+
+    async def converge_env(self) -> bool:
+        """Bring a machine that outlives every create to the env a new one gets;
+        True when that changed it.
+
+        Only where the provider asks (``converges_env``): the env is written at
+        create, so a change since (a key added, the trust switch turned on or
+        off) reaches such a machine at its next open or never.
+        """
+        if self.runtime is None or not type(self.provider).converges_env:
+            return False
+        return await self.runtime.replace_env(
+            self._build_sandbox_env_vars(build_platform_secret_bindings(self.config))
+        )
+
+    def _deployment_env_vars(
+        self, platform_secret_bindings: dict[str, str]
+    ) -> dict[str, str]:
+        """Resolve MCP server env vars (${VAR} placeholders from host) so
+        they're available to all sandbox processes.
         Vars named in ``platform_secret_bindings`` are excluded: the provider
         delivers those as managed Secrets.
 
@@ -360,16 +430,7 @@ class PTCSandbox:
         )
         withheld: set[str] = set()
         withheld_from: set[str] = set()
-
-        env_vars: dict[str, str] = {
-            # Paths baked into the sandbox image, repeated here so a sandbox born
-            # on a snapshot built before one of them was added still gets it.
-            **SANDBOX_IMAGE_ENV,
-            # Tell the in-sandbox ginlix-data client the exact path the host
-            # uploads the token file to. It must not key off $HOME — Daytona
-            # runs as root ($HOME=/root) while the working dir is /home/workspace.
-            "GINLIX_TOKEN_FILE": self._token_file_path,
-        }
+        env_vars: dict[str, str] = {}
 
         # MCP server env vars (resolve ${VAR} placeholders from host).
         # Built-ins ONLY: a user server's env must never be injected into the
@@ -428,24 +489,7 @@ class PTCSandbox:
                 servers=sorted(withheld_from),
             )
 
-        # GitHub bot env vars
-        from src.config.settings import get_nested_config
-
-        if get_nested_config("github.enabled", False):
-            token_env = get_nested_config("github.token_env", "GITHUB_BOT_TOKEN")
-            token = os.getenv(token_env)
-            if token:
-                env_vars["GITHUB_TOKEN"] = token
-                bot_name = get_nested_config("github.bot_name", "langalpha-bot")
-                bot_email = get_nested_config("github.bot_email", "bot@ginlix.ai")
-                env_vars["GIT_AUTHOR_NAME"] = bot_name
-                env_vars["GIT_AUTHOR_EMAIL"] = bot_email
-                env_vars["GIT_COMMITTER_NAME"] = bot_name
-                env_vars["GIT_COMMITTER_EMAIL"] = bot_email
-
-        from src.dalton.settings import sanitize_sandbox_env_vars  # DALTON-HOOK(bridge-admin-token)
-
-        return sanitize_sandbox_env_vars(env_vars, builtin_servers)
+        return env_vars
 
     async def setup_sandbox_workspace(
         self,
@@ -660,264 +704,25 @@ class PTCSandbox:
         Raises:
             SandboxGoneError: If sandbox cannot be found or is in an unrecoverable state
         """
-        logger.debug("Reconnecting to stopped sandbox", sandbox_id=sandbox_id)
+        await _reconnect.reconnect(self, sandbox_id, on_state_observed)
 
-        _t0 = time.time()
-        _rc_phases: dict[str, float] = {}
+    async def _cancel_background_tasks(self) -> None:
+        """Cancel an in-flight lazy init or shared reconnect, and wait for each.
 
-        def _mark_rc(name: str) -> None:
-            nonlocal _t0
-            now = time.time()
-            _rc_phases[name] = (now - _t0) * 1000
-            _t0 = now
-
-        self._reconnect_incomplete = True
-
-        # Clear stale state — sessions and preview links don't survive stop/start
-        self._preview_sessions.clear()
-        self._preview_link_cache.clear()
-
-        # Get the existing sandbox via provider
-        try:
-            self.runtime = await self._runtime_call(
-                self.provider.get,
-                sandbox_id,
-                retry_policy=RetryPolicy.SAFE,
-                allow_reconnect=False,
-            )
-        except SandboxTransientError:
-            # A transport blip is NOT a missing sandbox. Converting every failure
-            # here into SandboxGoneError made a network hiccup trigger recovery —
-            # which creates a replacement sandbox and abandons the real one, and
-            # several workers can do it at once.
-            raise
-        except Exception as e:
-            # Only a positively identified absence may authorize Gone. The caller
-            # answers Gone by building a replacement and abandoning this sandbox,
-            # so an undecidable failure must not reach it: UNKNOWN is where a
-            # rotated or under-privileged provider key (401/403) lands, and there
-            # the sandbox is fine and the credential is not. Treating that as
-            # absence recreates a live sandbox on every request and leaks the
-            # original each time.
-            if self.provider.classify_error(e) is SandboxFailureKind.SANDBOX_GONE:
-                raise SandboxGoneError(sandbox_id, f"not found: {e}") from e
-            raise SandboxTransientError(
-                f"Could not reach sandbox {sandbox_id}: {e}"
-            ) from e
-        _mark_rc("provider_get")
-
-        assert self.runtime is not None
-        await self.provider.prepare_reconnect(self.runtime, tier=self.resource_tier)
-        self.sandbox_id = sandbox_id
-
-        # Check sandbox state before attempting to start
-        state = await self.runtime.get_state()
-        state_value = state.value
-        _mark_rc("get_state")
-
-        if on_state_observed is not None:
+        A reconnect is shielded from the callers that gave up on it, so this
+        is the one thing that stops it; left to finish after a stop, it would
+        start the machine again behind a computer recorded as stopped.
+        """
+        for task in (self._init_task, self._reconnect_task):
+            if task is None or task.done() or task is asyncio.current_task():
+                continue
+            task.cancel()
             try:
-                # An archive in progress ends in a restore from archived, so it
-                # gets the same slow-restore notice.
-                on_state_observed(
-                    "archived" if state_value == "archiving" else state_value
-                )
-            except Exception:
-                logger.debug(
-                    "on_state_observed callback raised; ignoring",
-                    sandbox_id=sandbox_id,
-                )
-
-        if state_value != "running":
-            self.livefs_lost = True
-            self.livefs = None
-        if state_value == "running":
-            logger.debug(
-                "Sandbox already started, skipping start", sandbox_id=sandbox_id
-            )
-        elif state_value == "stopped":
-            logger.debug(
-                "Starting stopped sandbox", sandbox_id=sandbox_id, state=state_value
-            )
-            await self._start_runtime(sandbox_id, self.runtime.start, timeout=60)
-            _mark_rc("start")
-        elif state_value == "starting":
-            # Sandbox is already transitioning — wait for it to reach 'running'.
-            logger.debug(
-                "Sandbox is starting, waiting for ready",
-                sandbox_id=sandbox_id,
-            )
-            for _ in range(40):  # Max ~20 seconds
-                await asyncio.sleep(0.5)
-                self.runtime = await self._runtime_call(
-                    self.provider.get,
-                    sandbox_id,
-                    retry_policy=RetryPolicy.SAFE,
-                    allow_reconnect=False,
-                )
-                state = await self.runtime.get_state()
-                state_value = state.value
-                if state_value == "running":
-                    break
-            if state_value != "running":
-                # Transient, not gone: the state was just read back, which is
-                # positive evidence the sandbox exists. ``SandboxGoneError`` is
-                # the authorization to replace, and its handlers in
-                # ``workspace_manager`` call ``_clear_session`` first, which
-                # deletes the runtime — so calling a slow boot "gone" destroys a
-                # live sandbox and restores it from a DB backup. The word
-                # "starting" is load-bearing: it is what renders the retry card.
-                raise SandboxTransientError(
-                    f"Sandbox {sandbox_id} is still starting "
-                    f"(state '{state_value}' after ~20s)"
-                )
-            _mark_rc("wait_starting")
-        elif state_value == "stopping":
-            # Wait for sandbox to finish stopping, then start it.
-            logger.info(
-                "Sandbox is stopping, waiting before start",
-                sandbox_id=sandbox_id,
-            )
-            for _ in range(20):  # Max ~10 seconds
-                await asyncio.sleep(0.5)
-                self.runtime = await self._runtime_call(
-                    self.provider.get,
-                    sandbox_id,
-                    retry_policy=RetryPolicy.SAFE,
-                    allow_reconnect=False,
-                )
-                state = await self.runtime.get_state()
-                state_value = state.value
-                if state_value == "stopped":
-                    break
-            if state_value == "stopped":
-                logger.info(
-                    "Sandbox finished stopping, starting it",
-                    sandbox_id=sandbox_id,
-                )
-                await self._start_runtime(sandbox_id, self.runtime.start, timeout=60)
-            else:
-                # Same reasoning as the 'starting' wait above: still mid-stop is
-                # a sandbox that exists, so this is a retry, not a replacement.
-                raise SandboxTransientError(
-                    f"Sandbox {sandbox_id} has not finished stopping "
-                    f"(state '{state_value}' after ~10s)"
-                )
-            _mark_rc("wait_stopping")
-        elif state_value == "archived":
-            # Always restore. Daytona's ``recoverable`` flag describes an
-            # errored sandbox and reads False on every healthy one, so gating
-            # on it called each auto-archived sandbox gone: the recover path
-            # rebuilt it from the DB backup, dropping whatever only the archive
-            # held, and orphaned the archive. A restore that truly fails is
-            # classified like any start, Gone only on a positive absence.
-            logger.info(
-                "Starting archived sandbox (restore may take longer)",
-                sandbox_id=sandbox_id,
-            )
-            await self._start_runtime(sandbox_id, self.runtime.start, timeout=300)
-            _mark_rc("start_archived")
-        elif state_value == "archiving":
-            # Never started mid-archive: a start that lands once Daytona has
-            # removed the container errors the sandbox beyond recovery, which
-            # reads as gone and rebuilds it from the backup. Wait for the
-            # archive to land, then restore it like any archived sandbox.
-            logger.info(
-                "Sandbox is being archived, waiting before restore",
-                sandbox_id=sandbox_id,
-            )
-            # A deadline, not a poll count: each poll is also a provider read,
-            # and the restore after it has its own 300s budget.
-            deadline = time.monotonic() + 45
-            while time.monotonic() < deadline:
-                await asyncio.sleep(0.5)
-                self.runtime = await self._runtime_call(
-                    self.provider.get,
-                    sandbox_id,
-                    retry_policy=RetryPolicy.SAFE,
-                    allow_reconnect=False,
-                )
-                state = await self.runtime.get_state()
-                state_value = state.value
-                if state_value != "archiving":
-                    break
-            # A cancelled archive ends stopped, which starts like any other,
-            # or running, when something else already started it.
-            if state_value not in ("archived", "stopped", "running"):
-                # Still archiving is a sandbox that exists, so a retry, not a
-                # replacement; any other state is the next open's to handle.
-                logger.warning(
-                    "Sandbox did not finish archiving",
-                    sandbox_id=sandbox_id,
-                    state=state_value,
-                )
-                raise SandboxTransientError(
-                    f"Sandbox {sandbox_id} is being archived "
-                    f"(state '{state_value}' after ~45s); try again in a few minutes"
-                )
-            if state_value != "running":
-                await self._start_runtime(
-                    sandbox_id, self.runtime.start, timeout=300
-                )
-            _mark_rc("start_archiving")
-        elif state_value == "error":
-            # Restarting an errored sandbox the provider will not recover fails
-            # the same way on every open, so the runtime answers Gone and the
-            # caller rebuilds from the backup. A recovery can restore from the
-            # provider's own backup, so it gets the archive restore's budget.
-            logger.warning(
-                "Sandbox in error state, attempting recovery",
-                sandbox_id=sandbox_id,
-            )
-            await self._start_runtime(
-                sandbox_id, self.runtime.recover_from_error, timeout=300
-            )
-            _mark_rc("start_error_recovery")
-        else:
-            raise SandboxGoneError(
-                sandbox_id,
-                f"unrecoverable state: {state_value}",
-            )
-        await self._confirm_host_back(sandbox_id)
-
-        # Fetch the actual working dir from the sandbox. The config default
-        # may differ from the real dir (e.g. /home/workspace vs /home/daytona)
-        # when the sandbox was created under a previous config.
-        self._work_dir = await self.runtime.fetch_working_dir()
-        _mark_rc("fetch_workdir")
-
-        total = sum(_rc_phases.values())
-        phases = " ".join(f"{k}={v:.0f}ms" for k, v in _rc_phases.items())
-        logger.info(
-            f"[RECONNECT] sandbox_id={sandbox_id} state={state_value} "
-            f"total={total:.0f}ms ({phases})"
-        )
-
-        # SKIP: _setup_workspace() - directories already exist
-        # SKIP: _upload_mcp_server_files() - files already uploaded
-        # SKIP: _install_tool_modules() - tool modules already installed
-
-        # Initialize MCP server sessions (needed for tool execution)
-        self.mcp_server_sessions: dict[str, Any] = {}
-        if await self._start_internal_mcp_servers() is False:
-            self.livefs_lost = True
-            self.livefs = None
-        self._reconnect_incomplete = False
-
-        logger.debug(
-            "Sandbox started from stopped state",
-            sandbox_id=self.sandbox_id,
-        )
-
-    async def _cancel_init_task(self) -> None:
-        """Cancel any in-flight lazy init task and wait for it to finish."""
-        if self._init_task is not None and not self._init_task.done():
-            self._init_task.cancel()
-            try:
-                await self._init_task
+                await task
             except (asyncio.CancelledError, Exception):
                 pass
         self._init_task = None
+        self._reconnect_task = None
 
     async def stop_sandbox(self) -> None:
         """Stop the sandbox without deleting it.
@@ -925,7 +730,7 @@ class PTCSandbox:
         Used for session persistence - stops the sandbox so it can be
         restarted quickly on the next session, rather than deleting it.
         """
-        await self._cancel_init_task()
+        await self._cancel_background_tasks()
 
         if not self.runtime:
             return
@@ -1035,7 +840,7 @@ class PTCSandbox:
         repo_root = config_dir or Path.cwd()
         local_src_dir = (repo_root / "src").resolve()
 
-        files = _internal_package_files(local_src_dir)
+        files = _internal_package_files(local_src_dir, livefs=self.mounts_livefs)
         if not files:
             logger.warning(
                 "Skipping internal package upload - local src/__init__.py not found",
@@ -1110,114 +915,15 @@ class PTCSandbox:
             stderr_msg = f"Sandbox execution error: {error_detail}"
         return is_timeout, error_detail, stderr_msg
 
-    async def _start_runtime(
-        self, sandbox_id: str, start: Callable[..., Any], *, timeout: int
-    ) -> None:
-        """Start the sandbox, telling a recovering host apart from other failures.
-
-        Such a host refuses every start until it is back, so the policy decides
-        between waiting for it (transient) and rebuilding elsewhere (gone). The
-        policy failing is no answer, and waiting is the default.
-        """
-        try:
-            # Only reconnect calls this, and a reconnect from inside it would
-            # wait on the lock its own caller holds.
-            await self._runtime_call(
-                start,
-                timeout=timeout,
-                retry_policy=RetryPolicy.SAFE,
-                allow_reconnect=False,
-            )
-        except SandboxGoneError:
-            raise
-        except Exception as e:
-            if not self.provider.is_host_unavailable(e):
-                raise
-            outage_since = None
-            if self.host_unavailable_policy is not None:
-                try:
-                    outage_since = await self.host_unavailable_policy.rebuild_now(
-                        sandbox_id
-                    )
-                except Exception:
-                    logger.warning(
-                        "Host-unavailable policy failed; waiting for the host",
-                        sandbox_id=sandbox_id,
-                        exc_info=True,
-                    )
-            if isinstance(outage_since, datetime):
-                self._kept_for_salvage = True
-                raise SandboxHostLostError(
-                    sandbox_id,
-                    f"host unavailable: {e}",
-                    outage_since=outage_since,
-                ) from e
-            raise SandboxHostUnavailableError(sandbox_id, str(e)) from e
-
-    async def _confirm_host_back(self, sandbox_id: str) -> None:
-        """End the outage clock the moment the sandbox is up, before anything runs on it.
-
-        Later setup can fail and leave the sandbox up anyway, and a clock left
-        running cuts the next outage short. A rebuild authorized meanwhile may
-        already have replaced the sandbox; then it is no longer the machine's
-        and must be neither used nor deleted, and is stopped so it does not
-        run unowned. Still the machine's, it is deleted with the machine again,
-        even after this handle once gave it up. Without the answer neither is
-        known, so the reconnect fails and is retried.
-        """
-        if self.host_unavailable_policy is None:
-            return
-        try:
-            current = await self.host_unavailable_policy.reconnected(sandbox_id)
-        except Exception as e:
-            raise SandboxTransientError(
-                f"Could not record that the host of sandbox {sandbox_id} is back"
-            ) from e
-        if current is False:
-            self._kept_for_salvage = True
-            try:
-                # Nothing else stops it: no row names it any more.
-                await self._runtime_call(
-                    self.runtime.stop,
-                    retry_policy=RetryPolicy.SAFE,
-                    allow_reconnect=False,
-                )
-            except Exception:
-                logger.warning(
-                    "Could not stop a sandbox a rebuild replaced",
-                    sandbox_id=sandbox_id,
-                    exc_info=True,
-                )
-            raise SandboxGoneError(
-                sandbox_id, "replaced by a rebuild while its host was unavailable"
-            )
-        if current is True:
-            self._kept_for_salvage = False
-
     async def _ensure_sandbox_connected(self) -> None:
-        if self.sandbox_id is None:
-            raise SandboxTransientError(
-                "Sandbox disconnected and no sandbox_id is available"
-            )
+        await _reconnect.ensure_connected(self)
 
-        # Serialize concurrent reconnect attempts. asyncio.Lock is held
-        # across internal awaits, so a second caller that acquires the lock
-        # runs after the first's reconnect has fully resolved (success or
-        # exception propagated). No explicit coalescing primitive needed.
-        async with self._reconnect_lock:
-            # Always recreate the provider. This callback only fires after
-            # a transient error, so the existing client may be dead or stale.
-            try:
-                await self.provider.close()
-            except Exception:
-                pass
-            self.provider = create_provider(self.config)
-            try:
-                await self.reconnect(self.sandbox_id)
-            except SandboxGoneError as e:
-                self._lost = e
-                raise
-            self._lost = None
+    async def _reset_provider(self) -> None:
+        try:
+            await self.provider.close()
+        except Exception:
+            pass
+        self.provider = create_provider(self.config)
 
     async def _runtime_call(
         self,
@@ -1231,7 +937,7 @@ class PTCSandbox:
         **kwargs: Any,
     ) -> Any:
         on_transient = self._ensure_sandbox_connected if allow_reconnect else None
-        return await async_retry_with_backoff(
+        result = await async_retry_with_backoff(
             func,
             *args,
             retry_policy=retry_policy,
@@ -1243,6 +949,8 @@ class PTCSandbox:
             total_timeout=total_timeout,
             **kwargs,
         )
+        _reconnect.call_served(self)
+        return result
 
     def _make_rebinder(
         self, entry_runtime: SandboxRuntime | None
@@ -1297,9 +1005,18 @@ class PTCSandbox:
         return sandbox.id if hasattr(sandbox, "id") else str(id(sandbox))
 
 
+    def release_for_removal(self) -> None:
+        """Let cleanup delete the sandbox though no reconnect completed on it.
+
+        That keep is for evicting a failed open, whose sandbox may hold files
+        its backup lacks, and a computer is removed only once no workspace is
+        left on it. A sandbox kept for salvage stays kept.
+        """
+        self._reconnect_incomplete = False
+
     async def cleanup(self) -> None:
         """Clean up and destroy the sandbox."""
-        await self._cancel_init_task()
+        await self._cancel_background_tasks()
 
         logger.info("Cleaning up sandbox", sandbox_id=self.sandbox_id)
 
@@ -1411,8 +1128,8 @@ class PTCSandbox:
     async def sync_sandbox_assets(
         self,
         *,
-        skill_dirs: list[tuple[str, str]] | None = None,
-        user_skill_dir: tuple[str, str] | None = None,
+        skill_dirs: list[str] | None = None,
+        user_skill_dir: str | None = None,
         disabled_skills: frozenset[str] = frozenset(),
         reusing_sandbox: bool = False,
         force_refresh: bool = False,
@@ -1443,31 +1160,25 @@ class PTCSandbox:
     ) -> None:
         return await _assets._prune_disabled_tool_modules(self, project=project)
 
-    async def _download_skills_lock(
-        self, sandbox_skills_base: str
-    ) -> dict[str, Any] | None:
-        return await _assets._download_skills_lock(self, sandbox_skills_base)
+    async def _download_skills_lock(self) -> dict[str, Any] | None:
+        return await _assets._download_skills_lock(self)
 
     def _build_complete_skills_cache(
-        self,
-        skills_mod: dict[str, Any],
-        merged_lock: dict[str, Any],
-        sandbox_skills_base: str,
+        self, skills_mod: dict[str, Any], merged_lock: dict[str, Any]
     ) -> None:
-        return _assets._build_complete_skills_cache(self, skills_mod, merged_lock, sandbox_skills_base)
+        return _assets._build_complete_skills_cache(self, skills_mod, merged_lock)
 
     async def _prune_remote_skills(
         self,
-        sandbox_base: str,
         local_skill_names: set[str],
         *,
         existing_lock: dict[str, Any] | None = None,
     ) -> None:
-        return await _assets._prune_remote_skills(self, sandbox_base, local_skill_names, existing_lock=existing_lock)
+        return await _assets._prune_remote_skills(self, local_skill_names, existing_lock=existing_lock)
 
     async def _upload_skills(
         self,
-        local_skills_dirs: list[tuple[str, str]],
+        local_skills_dirs: list[str],
         *,
         manifest: dict[str, Any] | None = None,
         existing_lock: dict[str, Any] | None = None,
@@ -1517,8 +1228,8 @@ class PTCSandbox:
             self, server, vault, budget_s=budget_s, deadline=deadline
         )
 
-    async def _start_internal_mcp_servers(self) -> bool | None:
-        return await _mcp_setup._start_internal_mcp_servers(self)
+    async def _start_internal_mcp_servers(self, *, replace: bool = False) -> bool | None:
+        return await _mcp_setup._start_internal_mcp_servers(self, replace=replace)
 
     def _detect_missing_imports(self, stderr: str) -> list[str]:
         return _mcp_setup._detect_missing_imports(self, stderr)

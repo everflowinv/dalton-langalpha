@@ -1,10 +1,11 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { Link } from 'react-router';
 import { BRAND_NAME } from '@/config/brand'; // DALTON-HOOK(brand-name)
-import { ArrowLeft, FolderOpen } from 'lucide-react';
+import { ArrowLeft, FolderOpen, PanelRight } from 'lucide-react';
 import { motion, type PanInfo } from '@/lib/framer';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { Loader } from '@/components/ui/loader';
+import { cn } from '@/lib/utils';
 import MessageList from '../ChatAgent/components/MessageList';
 import {
   MessageActionsProvider,
@@ -14,6 +15,7 @@ import {
 import FilePanel, { type PanelTarget } from '../ChatAgent/components/FilePanel';
 import { dirTarget, fileTarget, stampTarget, type ChartTabSpec } from '../ChatAgent/components/filePanel/types';
 import type { FileTab } from '../ChatAgent/components/filePanel/useFileTabs';
+import { handOffToggleFocus } from '../ChatAgent/components/filePanel/panelToggleFocus';
 import { CHART_SURFACE_MIN_WIDTH } from '@/pages/MarketView/components/chartSurfaceLayout';
 import { WorkspaceProvider } from '../ChatAgent/contexts/WorkspaceContext';
 import { useAuth } from '../../contexts/AuthContext';
@@ -45,7 +47,7 @@ import ShareUnavailable from './ShareUnavailable';
 import type { TextSegment } from '@/types/chat';
 import { isTaskAgentId } from '../ChatAgent/utils/agentId';
 import type { FileLocation } from '../ChatAgent/utils/fileLocation';
-import { computeAgentArtifactRouting } from '../ChatAgent/utils/agentPaths';
+import { computeAgentArtifactRouting, computerFolders, type ComputerFolders } from '../ChatAgent/utils/agentPaths';
 import { collectRecentWritePaths, downloadTarget, type TurnMessage } from '../ChatAgent/utils/fileRefResolver';
 import { useStableHandler } from '@/hooks/useStableHandler';
 import { DispatchStatusProvider } from '../ChatAgent/hooks/usePTCDispatchStatus';
@@ -93,6 +95,13 @@ export default function SharedChatView({ shareToken, metadata }: SharedChatViewP
   const [rightPanelWidth, setRightPanelWidth] = useState(750);
   // What the panel has in front: a chart holds the divider at its floor.
   const [panelTabKind, setPanelTabKind] = useState<FileTab['kind'] | null>(null);
+  // Expanded, the panel lies over the whole view, as it does in the owner's.
+  // Closing the panel ends it, so the next open starts beside the chat, and
+  // so does the mobile layout, which offers no toggle.
+  const [expanded, setExpanded] = useState(false);
+  if (expanded && (!showFilePanel || isMobile)) setExpanded(false);
+  const panelExpanded = expanded && !isMobile;
+  const handleTogglePanelExpanded = useCallback(() => setExpanded((v) => !v), []);
   const panelMinWidth = panelTabKind === 'chart' ? CHART_SURFACE_MIN_WIDTH : PANEL_MIN_WIDTH;
   const panelMaxRatio = panelTabKind === 'chart' ? CHART_MAX_RATIO : PANEL_MAX_RATIO;
   useEffect(() => {
@@ -414,16 +423,27 @@ export default function SharedChatView({ shareToken, metadata }: SharedChatViewP
 
   const imageDownloader = useCallback((path: string) => servedObjectUrl(servePrefix, path), [servePrefix]);
 
+  // The workspace's folder, so its absolute paths read as workspace paths here
+  // as they do in the owner's view, a turn from before a move included. Its
+  // siblings are not the viewer's, nor are the owner's other computers.
+  const { root_dir: rootDir, dir_name: dirName, previous_root_dirs: previousRootDirs } = metadata;
+  const folders = useMemo<ComputerFolders | null>(
+    () => (rootDir || dirName
+      ? computerFolders({ workspace_id: '', root_dir: rootDir, dir_name: dirName, previous_root_dirs: previousRootDirs }, null)
+      : null),
+    [rootDir, dirName, previousRootDirs],
+  );
+
   // Open file from chat (tool call artifacts, file mention cards)
   const handleOpenFile = useCallback((filePath: string, _workspaceId?: string, location?: FileLocation, opts?: { pin?: boolean }) => {
     if (!canBrowseFiles) return;
     setShowFilePanel(true);
-    const dir = computeAgentArtifactRouting(filePath).targetDirectory;
+    const dir = computeAgentArtifactRouting(filePath, undefined, folders).targetDirectory;
     // The panel reads a request off the counter rather than off a changed
     // string, so the same folder clicked twice arrives twice here too.
     const seq = ++filePanelTargetSeq.current;
     setFilePanelTarget(dir == null ? fileTarget(filePath, { location, pin: opts?.pin }, seq) : dirTarget(dir, seq));
-  }, [canBrowseFiles]);
+  }, [canBrowseFiles, folders]);
 
   // A chart card opens the symbol as a chart tab here, prices only. The card
   // names the owner's workspace, whose drawings and events the share does not
@@ -451,7 +471,7 @@ export default function SharedChatView({ shareToken, metadata }: SharedChatViewP
   // This thread's writes break ties between namesakes, the same tiebreak the
   // owner view passes. Identity-stable, so the actions memo below does not
   // rebuild on every replayed message.
-  const getRecentWritePaths = useStableHandler(() => collectRecentWritePaths(messages as TurnMessage[]));
+  const getRecentWritePaths = useStableHandler(() => collectRecentWritePaths(messages as TurnMessage[], folders));
 
   // Read-only adapter for the transcript's action surface. The shared view has
   // no turn to edit/regenerate/rate and no interrupt to approve. Subagent-task
@@ -540,22 +560,29 @@ export default function SharedChatView({ shareToken, metadata }: SharedChatViewP
 
   // One panel for both layouts; only its container differs by viewport.
   const filePanel = (
-    <FilePanel
-      readOnly
-      canDownload={canDownload}
-      workspaceId=""
-      apiAdapter={fileApiAdapter}
-      // No files to browse means no tree.
-      singleFileMode={!canBrowseFiles}
-      onActiveTabKindChange={setPanelTabKind}
-      onClose={() => setShowFilePanel(false)}
-      files={files}
-      filesLoading={filesLoading}
-      target={filePanelTarget}
-      onTargetHandled={handleTargetHandled}
-      onOpenFile={handleOpenFile}
-      getRecentWritePaths={getRecentWritePaths}
-    />
+    <WorkspaceProvider workspaceId={null} downloadFile={null} folders={folders}>
+      <FilePanel
+        readOnly
+        canDownload={canDownload}
+        workspaceId=""
+        apiAdapter={fileApiAdapter}
+        // No files to browse means no tree.
+        singleFileMode={!canBrowseFiles}
+        onActiveTabKindChange={setPanelTabKind}
+        expanded={panelExpanded}
+        onToggleExpanded={isMobile ? null : handleTogglePanelExpanded}
+        onClose={() => setShowFilePanel(false)}
+        // A panel the header did not open (a file link, with nothing to
+        // browse) has no toggle to stand in for, so it keeps its close.
+        panelToggle={canBrowseFiles}
+        files={files}
+        filesLoading={filesLoading}
+        target={filePanelTarget}
+        onTargetHandled={handleTargetHandled}
+        onOpenFile={handleOpenFile}
+        getRecentWritePaths={getRecentWritePaths}
+      />
+    </WorkspaceProvider>
   );
 
   // The metadata resolved, so a failure here is the replay's, not the link's.
@@ -568,8 +595,9 @@ export default function SharedChatView({ shareToken, metadata }: SharedChatViewP
       className="relative flex h-screen w-full overflow-hidden"
       style={{ backgroundColor: 'var(--color-bg-page)' }}
     >
-      {/* Left Side: Topbar + Chat Window — identical structure to ChatView */}
-      <div className="flex flex-col flex-1 min-w-0">
+      {/* Left Side: Topbar + Chat Window — identical structure to ChatView,
+          inert and isolated under an expanded panel as there. */}
+      <div className={cn('flex flex-col flex-1 min-w-0', panelExpanded && 'isolate')} inert={panelExpanded}>
         {/* Top bar — matches ChatView's top bar exactly */}
         <div className="flex items-center justify-between px-4 py-2 border-b min-w-0 shrink-0" style={{ borderColor: 'var(--color-border-muted)' }}>
           <div className="flex items-center gap-4 min-w-0 shrink">
@@ -594,16 +622,19 @@ export default function SharedChatView({ shareToken, metadata }: SharedChatViewP
           </div>
 
           <div className="flex items-center gap-2">
-            {canBrowseFiles && (
+            {/* Covered by the open panel on desktop, whose corner carries it. */}
+            {canBrowseFiles && (isMobile || !showFilePanel) && (
               <button
-                onClick={handleToggleFilePanel}
-                className="p-2 rounded-md transition-colors"
-                style={{ color: 'var(--color-text-primary)', backgroundColor: showFilePanel ? 'var(--color-border-muted)' : undefined }}
+                type="button"
+                data-panel-toggle="header"
+                onClick={(event) => { handleToggleFilePanel(); if (!isMobile) handOffToggleFocus(event, 'panel'); }}
+                aria-pressed={showFilePanel}
+                className={cn('transition-colors hover:bg-(--color-border-muted)', isMobile ? 'p-2 rounded-md' : 'p-1.5 -mr-2 rounded-[4px]')}
+                style={{ color: 'var(--color-text-primary)' }}
                 title="Workspace Files"
-                onMouseEnter={(e) => { if (!showFilePanel) e.currentTarget.style.backgroundColor = 'var(--color-border-muted)'; }}
-                onMouseLeave={(e) => { if (!showFilePanel) e.currentTarget.style.backgroundColor = ''; }}
+                aria-label="Workspace Files"
               >
-                <FolderOpen className="h-5 w-5" />
+                <PanelRight className={isMobile ? 'h-5 w-5' : 'h-4 w-4'} />
               </button>
             )}
           </div>
@@ -629,7 +660,7 @@ export default function SharedChatView({ shareToken, metadata }: SharedChatViewP
                         <span className="ml-2 text-sm" style={{ color: 'var(--color-text-tertiary)' }}>Loading conversation...</span>
                       </div>
                     ) : (
-                      <WorkspaceProvider workspaceId={null} downloadFile={imageDownloader}>
+                      <WorkspaceProvider workspaceId={null} downloadFile={imageDownloader} folders={folders}>
                       <MessageActionsProvider actions={readOnlyActions}>
                       <DispatchStatusProvider>
                         <MessageList
@@ -717,8 +748,11 @@ export default function SharedChatView({ shareToken, metadata }: SharedChatViewP
         </motion.div>
       ) : (
         <>
-          <div className="chat-split-divider" onMouseDown={handleDividerMouseDown} />
-          <div className="shrink-0" style={{ width: rightPanelWidth }}>
+          {!panelExpanded && <div className="chat-split-divider" onMouseDown={handleDividerMouseDown} />}
+          <div
+            className={panelExpanded ? 'absolute inset-0 z-10' : 'shrink-0'}
+            style={panelExpanded ? undefined : { width: rightPanelWidth }}
+          >
             {filePanel}
           </div>
         </>

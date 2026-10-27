@@ -9,6 +9,14 @@ Available providers:
     daytona  -- real Daytona sandbox (requires DAYTONA_API_KEY)
     e2b      -- real E2B sandbox (requires E2B_API_KEY)
     docker   -- Docker containers (requires Docker daemon + langalpha-sandbox image)
+    ssh      -- a Linux machine over SSH (requires SSH_TEST_HOST, SSH_TEST_USER and
+                SSH_TEST_KEY_FILE; SSH_TEST_PORT and SSH_TEST_HOST_KEY optional).
+                SSH_TEST_TUNNEL reaches it through a tunnel gateway instead, with
+                SSH_TEST_GATEWAY (host:port), SSH_TEST_GATEWAY_HOST_KEY and
+                SSH_TEST_GATEWAY_KEY_FILE (the dialer's private key); SSH_TEST_HOST
+                is then only the machine's name and SSH_TEST_PORT its sshd's port.
+                ssh_target/Dockerfile builds one. Runtime contract tests only:
+                sandbox.provider cannot select ssh, so PTCSandbox tests skip it.
 
 Usage:
     # Default: in-memory (fast, no infra)
@@ -81,6 +89,8 @@ def _can_run_provider(name: str) -> bool:
         return bool(os.environ.get("E2B_API_KEY"))
     if name == "docker":
         return shutil.which("docker") is not None
+    if name == "ssh":
+        return bool(os.environ.get("SSH_TEST_HOST"))
     return False
 
 
@@ -250,8 +260,84 @@ async def _make_provider(
         )
         yield provider
         await provider.close()
+    elif name == "ssh":
+        yield await _make_ssh_provider()
     else:
         yield MemoryProvider(base_dir=sandbox_base_dir or "/tmp/sandbox-test")
+
+
+async def _make_ssh_provider():
+    """An SSH provider for the machine the SSH_TEST_* env names.
+
+    Without SSH_TEST_HOST_KEY the machine's key is read on first contact and
+    pinned for the run, as adding a computer does.
+    """
+    from ptc_agent.config.core import SSHConfig
+    from ptc_agent.core.sandbox.providers import ssh
+
+    key_file = os.environ.get("SSH_TEST_KEY_FILE", "")
+    if not key_file:
+        pytest.skip("SSH_TEST_KEY_FILE not set")
+    with open(os.path.expanduser(key_file)) as f:
+        private_key = f.read()
+    host = os.environ["SSH_TEST_HOST"]
+    port = int(os.environ.get("SSH_TEST_PORT", "22"))
+    username = os.environ.get("SSH_TEST_USER", "dev")
+    host_key = os.environ.get("SSH_TEST_HOST_KEY", "")
+    tunnel = os.environ.get("SSH_TEST_TUNNEL", "")
+    if tunnel:
+        gw_host, _, gw_port = os.environ["SSH_TEST_GATEWAY"].rpartition(":")
+        with open(os.path.expanduser(os.environ["SSH_TEST_GATEWAY_KEY_FILE"])) as f:
+            dialer_key = f.read()
+        access = ssh.GatewayAccess(
+            host=gw_host.strip("[]"),
+            port=int(gw_port),
+            host_key=os.environ["SSH_TEST_GATEWAY_HOST_KEY"],
+            dialer_key=dialer_key,
+        )
+
+        async def load_gateway() -> ssh.GatewayAccess:
+            return access
+
+        ssh.set_gateway_loader(load_gateway)
+    if not host_key:
+        probe = await ssh.probe_ssh_target(
+            host=host,
+            port=port,
+            username=username,
+            private_key=private_key,
+            allow_private_addresses=True,
+            tunnel=tunnel or None,
+        )
+        host_key = probe.host_key
+
+    async def load_key(owner: str) -> str:
+        return private_key
+
+    ssh.set_client_key_loader(load_key)
+
+    class OneRootEach(ssh.SSHProvider):
+        """Each computer in a folder of its own under the base, as the server
+        gives each its own root: a root another computer holds is refused."""
+
+        def _runtime(self, sandbox_id: str) -> ssh.SSHRuntime:
+            runtime = super()._runtime(sandbox_id)
+            runtime._working_dir = f"{self._working_dir}/{sandbox_id}"
+            return runtime
+
+    return OneRootEach(
+        SSHConfig(
+            host=host,
+            port=port,
+            username=username,
+            host_key=host_key,
+            key_owner="integration-test",
+            # The test machine is usually a local container.
+            allow_private_addresses=True,
+            tunnel=tunnel,
+        ),
+        working_dir=os.environ.get("SSH_SANDBOX_WORK_DIR", "/home/workspace"),
+    )
 
 
 @pytest_asyncio.fixture
@@ -345,6 +431,9 @@ def _build_core_config(provider_name: str, base_dir: str) -> CoreConfig:
             provider="e2b",
             e2b_config=E2BConfig(api_key=api_key),
         )
+
+    elif provider_name == "ssh":
+        pytest.skip("sandbox.provider cannot select ssh; runtime contract tests only")
 
     # memory provider -- use temp dir as working directory
     return _make_core_config(

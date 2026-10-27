@@ -2,7 +2,7 @@
 
 import hashlib
 import re
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -24,8 +24,10 @@ from ptc_agent.core.sandbox.platform_secrets import (
     build_platform_secret_bindings,
     platform_secrets_active,
     platform_secrets_required,
+    require_platform_secret_capable,
     resolve_platform_secrets,
 )
+from tests.unit.core.sandbox.fake_provider import fake_provider
 
 
 _FMP_DEFINITION = PlatformSecretDefinition(
@@ -442,7 +444,7 @@ def test_hosted_daytona_env_excludes_plaintext_and_mounts_secret(monkeypatch):
     monkeypatch.setenv("FMP_API_KEY", "real-fmp-value")
     with patch(
         "ptc_agent.core.sandbox.ptc_sandbox.create_provider",
-        return_value=MagicMock(),
+        return_value=fake_provider(),
     ):
         sandbox = PTCSandbox(_config())
 
@@ -479,7 +481,7 @@ def _hosted_sandbox(monkeypatch, config: CoreConfig):
     monkeypatch.setattr("src.config.env.HOST_MODE", "platform")
     with patch(
         "ptc_agent.core.sandbox.ptc_sandbox.create_provider",
-        return_value=MagicMock(),
+        return_value=fake_provider(),
     ):
         return PTCSandbox(config)
 
@@ -560,7 +562,7 @@ def test_ungated_modes_keep_current_plaintext_behavior(
     monkeypatch.setenv("FMP_API_KEY", "real-fmp-value")
     with patch(
         "ptc_agent.core.sandbox.ptc_sandbox.create_provider",
-        return_value=MagicMock(),
+        return_value=fake_provider("docker" if provider == "memory" else provider),
     ):
         sandbox = PTCSandbox(
             _config(provider=provider, namespace="", platform_secrets=platform_secrets)
@@ -571,6 +573,47 @@ def test_ungated_modes_keep_current_plaintext_behavior(
 
     assert bindings == {}
     assert env_vars["FMP_API_KEY"] == "real-fmp-value"
+
+
+@pytest.mark.parametrize("trusted", [False, True])
+def test_an_ssh_machine_gets_server_env_only_when_the_deployment_trusts_it(
+    monkeypatch, trusted
+):
+    # Config load replaces ${FMP_API_KEY} with the host's value, so the server
+    # env arrives here as a literal no placeholder check can tell from a constant.
+    from ptc_agent.core.sandbox.providers.ssh import SSHProvider
+    from ptc_agent.core.sandbox.ptc_sandbox import PTCSandbox
+
+    monkeypatch.setattr("src.config.env.HOST_MODE", "oss")
+    config = _config(namespace="", platform_secrets=())
+    config.sandbox.ssh.trusted_host = trusted
+    config.mcp.servers[0].env = {"FMP_API_KEY": "real-fmp-value"}
+    with patch(
+        "ptc_agent.core.sandbox.ptc_sandbox.create_provider",
+        return_value=SSHProvider.__new__(SSHProvider),
+    ):
+        sandbox = PTCSandbox(config)
+
+    env_vars = sandbox._build_sandbox_env_vars({})
+
+    assert ("real-fmp-value" in env_vars.values()) is trusted
+    assert (env_vars.get("FMP_API_KEY") == "real-fmp-value") is trusted
+
+
+@pytest.mark.parametrize("trusted", [False, True])
+def test_a_hosted_catalog_refuses_ssh_machines_only_once_they_are_trusted(trusted):
+    # Untrusted, a machine is sent nothing and has nothing to hold; trusted,
+    # it would get the catalog's credentials as plaintext.
+    config = _config()
+    config.sandbox.ssh.trusted_host = trusted
+
+    if trusted:
+        with pytest.raises(
+            PlatformSecretConfigurationError, match="ssh cannot hold platform Secrets"
+        ):
+            require_platform_secret_capable(config, ("ssh",), host_mode="platform")
+    else:
+        require_platform_secret_capable(config, ("ssh",), host_mode="platform")
 
 
 @pytest.mark.parametrize("provider", ["docker", "memory"])

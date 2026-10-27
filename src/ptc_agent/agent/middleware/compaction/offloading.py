@@ -42,7 +42,13 @@ def tool_call_ids(messages: list[AnyMessage]) -> set[str]:
     }
 
 
-def arg_offload_marker(path: str, call_id: str) -> str:
+def arg_offload_marker(path: str, call_id: str, *, shell: bool = True) -> str:
+    if not shell:
+        return (
+            f"... [argument cut here. Its full call is in {path}: Grep that file for "
+            f'{call_id} (output_mode="content"), then Read the tool_call line it names '
+            f"with offset set to its line number minus 1 and limit=1]"
+        )
     return (
         f"... [argument cut here. Its full call is in {path}; read it with "
         f"jq -c 'select(.call_id==\"{call_id}\" and .type==\"tool_call\") "
@@ -115,6 +121,7 @@ def offload_view(
     *,
     max_length: int,
     transcript: TranscriptTarget | None,
+    shell: bool = True,
 ) -> list[AnyMessage]:
     """What the model is sent of ``messages``: the view after ``state``'s
     last summary, with every offload ``state`` recorded applied.
@@ -122,9 +129,10 @@ def offload_view(
     An offload is a view over the checkpoint, not a rewrite of it: the id sets
     are the record, and every call cuts them again, so a call cut once stays
     cut and the prompt cache holds. A cut argument points at its call in the
-    file of its turn in ``transcript``. Where no mount serves one
-    (``transcript`` is None) arguments stay whole until one does, since a
-    pointer there would name a file nothing can read.
+    file of its turn in ``transcript``. Where nothing serves one
+    (``transcript`` is None) arguments stay whole until something does, since
+    a pointer there would name a file nothing can read. ``shell`` says whether
+    Bash sees that file, which decides how the pointer says to read it.
     """
     effective = get_effective_messages(messages, state.get("_summarization_event"))
     arg_ids, read_ids = recorded_offloads(state)
@@ -133,7 +141,7 @@ def offload_view(
         if arg_ids and transcript is not None
         else None
     )
-    return apply_recorded_offloads(effective, arg_ids, read_ids, max_length, turns)
+    return apply_recorded_offloads(effective, arg_ids, read_ids, max_length, turns, shell=shell)
 
 
 def apply_recorded_offloads(
@@ -142,6 +150,8 @@ def apply_recorded_offloads(
     read_ids: set[str],
     max_length: int,
     turns: TranscriptTurns | None,
+    *,
+    shell: bool = True,
 ) -> list[AnyMessage]:
     """Cut every recorded offload in ``messages``, an argument only where
     ``turns`` names the file that keeps it. Each id is checked against its
@@ -162,7 +172,8 @@ def apply_recorded_offloads(
                 if tc["name"] == "Read" and tc["id"] in read_ids:
                     read_paths[tc["id"]] = tc.get("args", {}).get("file_path", "")
                 if path and tc["id"] in arg_ids and tc["name"] in TRUNCATABLE_TOOLS:
-                    new_tc = truncate_tool_call(tc, max_length, arg_offload_marker(path, tc["id"]))
+                    marker = arg_offload_marker(path, tc["id"], shell=shell)
+                    new_tc = truncate_tool_call(tc, max_length, marker)
                     msg_changed = msg_changed or new_tc is not tc
                     calls.append(new_tc)
                 else:

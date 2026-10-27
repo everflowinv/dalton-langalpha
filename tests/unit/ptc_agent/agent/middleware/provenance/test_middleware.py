@@ -470,6 +470,38 @@ def test_a_renamed_out_folder_skips_infra_like_the_current_one(
     assert _is_agent_infra_path(path) is infra
 
 
+@pytest.mark.parametrize(
+    "path,source_type,infra",
+    [
+        ("/home/someone/langalpha/New Name/.agents/memory/memory.md", "memory_read", False),
+        ("/home/someone/langalpha/Old Name/.agents/user/memo/x.md", "memo_read", False),
+        ("/home/someone/langalpha/New Name/.agents/skills/x/SKILL.md", "file_read", True),
+        ("/home/someone/langalpha/New Name/results/x.csv", "file_read", False),
+    ],
+)
+def test_a_computer_root_of_its_own_strips_like_the_stock_one(
+    renamed_project, path, source_type, infra
+):
+    """A computer whose user cannot create the stock root keeps its workspaces
+    under another, and the agent's absolute paths start with that one."""
+    from ptc_agent.agent.middleware.provenance.middleware import (
+        _classify_file_source_type,
+        _is_agent_infra_path,
+    )
+
+    root = "/home/someone/langalpha"
+    assert _classify_file_source_type(path, root) == source_type
+    assert _is_agent_infra_path(path, root) is infra
+
+
+def test_a_one_segment_root_does_not_swallow_a_relative_path(renamed_project):
+    from ptc_agent.agent.middleware.provenance.middleware import _is_agent_infra_path
+
+    assert _is_agent_infra_path("/work/.agents/skills/x/SKILL.md", "/work") is True
+    # Relative, so it names a folder called `work` inside the workspace.
+    assert _is_agent_infra_path("work/.agents/skills/x/SKILL.md", "/work") is False
+
+
 @pytest.mark.asyncio
 async def test_glob_not_tracked(middleware):
     """Glob is directory enumeration, not a data access — emits no provenance."""

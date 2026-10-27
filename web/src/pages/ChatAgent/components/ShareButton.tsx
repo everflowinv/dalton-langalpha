@@ -3,8 +3,10 @@ import { Share2, Copy, Check, Link2, Lock, FileText } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
 import { toast } from '@/components/ui/use-toast';
+import { cn } from '@/lib/utils';
 import { shortMonthDay } from '@/lib/format';
 import { useCopyShareLink } from '@/hooks/useCopyShareLink';
+import { useIsMobile } from '@/hooks/useIsMobile';
 import { useLocale } from '@/hooks/useLocale';
 import { useSharedLinks, useShareLinkMutations } from '@/hooks/useShareLink';
 import { getThreadShareStatus, updateThreadSharing } from '../utils/api';
@@ -100,6 +102,7 @@ function SharedInWorkspace({ workspaceId }: { workspaceId: string }) {
  */
 export default function ShareButton({ threadId, initialIsShared = false, workspaceId = null }: ShareButtonProps) {
   const { t } = useTranslation();
+  const isMobile = useIsMobile();
   const [open, setOpen] = useState(false);
   const [loading, setLoading] = useState(false);
   const [shareState, setShareState] = useState<ThreadShareStatus | null>(null);
@@ -176,9 +179,11 @@ export default function ShareButton({ threadId, initialIsShared = false, workspa
   return (
     <Popover open={open} onOpenChange={setOpen}>
       <PopoverTrigger asChild>
+        {/* Sized as the files toggle beside it is: the panel's own button
+            size on desktop, a touch target on mobile. */}
         <button
           type="button"
-          className="p-2 rounded-md transition-colors"
+          className={cn('transition-colors', isMobile ? 'p-2 rounded-md' : 'p-1.5 rounded-[4px]')}
           style={{
             color: isShared ? 'var(--color-accent-primary)' : 'var(--color-text-primary)',
             backgroundColor: open ? 'var(--color-border-muted)' : undefined,
@@ -187,7 +192,7 @@ export default function ShareButton({ threadId, initialIsShared = false, workspa
           onMouseEnter={(e) => { if (!open) e.currentTarget.style.backgroundColor = 'var(--color-border-muted)'; }}
           onMouseLeave={(e) => { if (!open) e.currentTarget.style.backgroundColor = ''; }}
         >
-          <Share2 className="h-5 w-5" />
+          <Share2 className={isMobile ? 'h-5 w-5' : 'h-4 w-4'} />
         </button>
       </PopoverTrigger>
 

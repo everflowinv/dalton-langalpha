@@ -6,6 +6,8 @@ import logging
 from contextlib import asynccontextmanager
 from typing import Any, Dict, Optional
 
+from ptc_agent.core.sandbox.providers import provider_class
+
 from src.server.database.computer import (
     clear_computer_retirement_pending,
     defer_computer_retirement,
@@ -43,9 +45,24 @@ def _retirement_pending(computer: Dict[str, Any]) -> bool:
     return bool((computer.get("config") or {}).get("retire_when_empty"))
 
 
+def _owners_machine(computer: Dict[str, Any]) -> bool:
+    """A machine the deployment cannot make again leaves only at its owner's request.
+
+    Retiring an empty computer stops paying for a hosted machine. A machine the
+    user brings costs nothing here, and retiring it would drop its pinned host
+    key, so its owner would have to add it again for their next workspace.
+    """
+    return not provider_class(computer["kind"]).recreatable
+
+
 class RetirementMixin:
     async def _retire_machine_if_empty(
-        self, computer_id: str, workspace_id: str, workspace: Dict[str, Any]
+        self,
+        computer_id: str,
+        workspace_id: str,
+        workspace: Dict[str, Any],
+        *,
+        keep_folder: bool = False,
     ) -> bool:
         """Check emptiness under the machine advisory key after project tombstoning.
 
@@ -65,12 +82,15 @@ class RetirementMixin:
                     computer = await get_computer(computer_id)
                 if computer is None or outcome not in (
                     Retirement.PRIMARY,
+                    Retirement.OWNERS_MACHINE,
                     Retirement.HAS_WORKSPACES,
                     Retirement.DEFERRED,
                 ):
                     return outcome is Retirement.RETIRED
-                # The shared machine survives; remove only the departing project's folder.
-                await self._remove_workspace_folder(workspace_id, workspace, computer)
+                # The shared machine survives; remove only the departing
+                # project's folder, and none its owner kept on their machine.
+                if not keep_folder:
+                    await self._remove_workspace_folder(workspace_id, workspace, computer)
                 return False
         except Exception as e:
             # The project is already unlinked; do not fail its completed delete.
@@ -162,6 +182,8 @@ class RetirementMixin:
                 return
             if owner_request:
                 kept = await self._removal_refusal(computer_id, computer)
+            elif _owners_machine(computer):
+                kept = Retirement.OWNERS_MACHINE
             else:
                 kept = await self._why_machine_is_kept(computer_id, computer)
             if kept is not None:

@@ -197,6 +197,7 @@ async def astream_ptc_workflow(
     is_byok: bool = False,
     config=None,
     dispatched: bool = False,
+    from_server: bool = False,
     steerable: bool = True,
     run_metadata: dict | None = None,
     extra_configurable: dict | None = None,
@@ -216,6 +217,8 @@ async def astream_ptc_workflow(
     stamp on the run row, which the run's finalize hooks read.
     ``extra_configurable`` joins the graph config's ``configurable``, where
     the turn's tools read it.
+    ``from_server`` says the server sent the request (its service token, or an
+    automation firing in process), so the trace believes the origin it names.
 
     ``named_model`` is the model a client named for this thread, kept on it
     once the turn is admitted; automations never pass one. ``route`` comes
@@ -755,10 +758,7 @@ async def astream_ptc_workflow(
         else:
             skill_contexts = None
         skill_dirs = (
-            [
-                local_dir
-                for local_dir, _ in config.skills.local_skill_dirs_with_sandbox()
-            ]
+            config.skills.local_skill_dirs()
             + ([config.user_skill_dir] if config.user_skill_dir else [])
             if skill_contexts
             else None
@@ -862,6 +862,7 @@ async def astream_ptc_workflow(
             surface=turn_surface(request, prior_thread),
             extra_configurable=extra_configurable,
             base_checkpoint_id=base_checkpoint_id,
+            from_server=from_server,
         )
         # Propagate run_id to LangGraph via the top-level config key; it
         # lands on ExecutionInfo.run_id and CheckpointMetadata.run_id so

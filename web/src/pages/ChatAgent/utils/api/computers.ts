@@ -11,9 +11,15 @@ import type {
   ComputerActionResponse,
   ComputerCreate,
   ComputerProvidersResponse,
+  ComputerRemoveResponse,
   ComputerStorage,
   ComputersResponse,
   MakePrimaryResponse,
+  SshKeyResponse,
+  SshPairing,
+  SshPairingStatus,
+  SshProbeResult,
+  SshTarget,
   ResourceTier,
   UnsavedFile,
 } from '@/types/api';
@@ -58,6 +64,8 @@ export async function createComputer(body: ComputerCreate = {}): Promise<Compute
       ...(body.name ? { name: body.name } : {}),
       resource_tier: body.resource_tier ?? 'standard',
       ...(body.kind ? { kind: body.kind } : {}),
+      ...(body.ssh ? { ssh: body.ssh } : {}),
+      ...(body.files_backup !== undefined ? { files_backup: body.files_backup } : {}),
     },
     { timeout: COMPUTER_MUTATION_TIMEOUT_MS },
   );
@@ -136,14 +144,23 @@ export async function setComputerSpec(computerId: string, tier: ResourceTier): P
 
 /**
  * Remove a computer: its sandbox and everything on its disk go with it. The
- * server answers 204 and keeps a tombstone, which the list no longer returns.
- * It refuses with a 409 whose `detail.code` says why: `primary`,
- * `has_workspaces`, or `busy` (moving between states, being prepared,
- * changing spec, or held by another action).
+ * server keeps a tombstone, which the list no longer returns, and answers what
+ * became of our key line on an SSH computer's machine (`key`, null for other
+ * kinds and when `removeKey` was false). `removeKey` is sent explicitly, so the
+ * choice the user saw is the one that is made. It refuses with a 409 whose
+ * `detail.code` says why: `primary`, `has_workspaces`, or `busy` (moving
+ * between states, being prepared, changing spec, or held by another action).
  */
-export async function deleteComputer(computerId: string): Promise<void> {
+export async function deleteComputer(
+  computerId: string,
+  { removeKey }: { removeKey: boolean },
+): Promise<ComputerRemoveResponse> {
   if (!computerId) throw new Error('Computer ID is required');
-  await api.delete(`/api/v1/computers/${computerId}`, { timeout: COMPUTER_MUTATION_TIMEOUT_MS });
+  const { data } = await api.delete<ComputerRemoveResponse>(`/api/v1/computers/${computerId}`, {
+    params: { remove_key: removeKey },
+    timeout: COMPUTER_MUTATION_TIMEOUT_MS,
+  });
+  return data;
 }
 
 /**
@@ -166,6 +183,21 @@ export async function setComputerAlwaysOn(computerId: string, enabled: boolean):
   if (!computerId) throw new Error('Computer ID is required');
   const { data } = await api.post<Computer>(
     `/api/v1/computers/${computerId}/always-on`,
+    { enabled },
+    { timeout: COMPUTER_MUTATION_TIMEOUT_MS },
+  );
+  return data;
+}
+
+/**
+ * Turn the file backup of a machine the user brings on or off. Off keeps each
+ * workspace's last backup but stops updating it. The server refuses a hosted
+ * machine, which always backs up, with a 409 whose `detail` is its sentence.
+ */
+export async function setComputerFilesBackup(computerId: string, enabled: boolean): Promise<Computer> {
+  if (!computerId) throw new Error('Computer ID is required');
+  const { data } = await api.post<Computer>(
+    `/api/v1/computers/${computerId}/files-backup`,
     { enabled },
     { timeout: COMPUTER_MUTATION_TIMEOUT_MS },
   );
@@ -204,4 +236,51 @@ export async function streamComputerEvents(
 ): Promise<void> {
   if (!computerId) return;
   await streamStatusEvents(`/api/v1/computers/${computerId}/events`, onFrame, signal);
+}
+
+/** The key a user authorizes on their own machine. Minted on the first call. */
+export async function getSshKey(): Promise<SshKeyResponse> {
+  const { data } = await api.get<SshKeyResponse>('/api/v1/computers/ssh/key');
+  return data;
+}
+
+// The server bounds its own dial; this only keeps a hung request from lingering.
+const SSH_PROBE_TIMEOUT_MS = 60000;
+
+/** Connect to the machine once and report what is on it, without creating anything. */
+export async function probeSsh(target: SshTarget): Promise<SshProbeResult> {
+  const { data } = await api.post<SshProbeResult>('/api/v1/computers/ssh/probe', target, {
+    timeout: SSH_PROBE_TIMEOUT_MS,
+  });
+  return data;
+}
+
+/** Start pairing a machine: the one-line command the user runs on it. */
+export async function createSshPairing(): Promise<SshPairing> {
+  const { data } = await api.post<SshPairing>('/api/v1/computers/ssh/pairings');
+  return data;
+}
+
+/** Where a pairing stands. A 404 means it expired, or never was this user's. */
+export async function getSshPairing(token: string): Promise<SshPairingStatus> {
+  const { data } = await api.get<SshPairingStatus>(
+    `/api/v1/computers/ssh/pairings/${encodeURIComponent(token)}`,
+  );
+  return data;
+}
+
+/**
+ * Try an address the user gave for a machine that checked in but could not be
+ * reached on its own. The login and host keys are the ones the machine reported.
+ */
+export async function connectSshPairing(
+  token: string,
+  address: Pick<SshTarget, 'host' | 'port'>,
+): Promise<SshPairingStatus> {
+  const { data } = await api.post<SshPairingStatus>(
+    `/api/v1/computers/ssh/pairings/${encodeURIComponent(token)}/connect`,
+    address,
+    { timeout: SSH_PROBE_TIMEOUT_MS },
+  );
+  return data;
 }

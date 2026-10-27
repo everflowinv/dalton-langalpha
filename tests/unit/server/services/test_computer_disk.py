@@ -32,7 +32,10 @@ def test_level_is_set_by_free_bytes(free, level):
 
 
 def test_parse_df_reads_the_numbers_line():
-    out = "     1B-blocks      Used      Avail\n3221225472 96800768 3124424704\n"
+    out = (
+        "Filesystem     1024-blocks  Used Available Capacity Mounted on\n"
+        "overlay           3145728 94532   3051196       4% /\n"
+    )
     reading = parse_df(out)
     assert (reading.total_bytes, reading.used_bytes, reading.free_bytes) == (
         3221225472,
@@ -44,23 +47,21 @@ def test_parse_df_reads_the_numbers_line():
 
 def test_parse_du_keeps_direct_children_only():
     out = (
-        "830000000\t/home/workspace/research-a1b2/\n"
+        "810548\t/home/workspace/research-a1b2/\n"
         "12\t/home/workspace/notes-c3d4/\n"
         "garbage line\n"
     )
     assert parse_du(out, "/home/workspace") == {
-        "research-a1b2": 830000000,
-        "notes-c3d4": 12,
+        "research-a1b2": 810548 * 1024,
+        "notes-c3d4": 12 * 1024,
     }
 
 
 def test_breakdown_measures_allocated_blocks_like_df():
     """The folders must reconcile with df's used: apparent size (``du -b``)
-    lets a sparse file exceed it and clamp 'other' to zero. ``-B`` swallows
-    the rest of its cluster as the size (``-sB1x`` fails as "1x", silently,
-    since the du's stderr is dropped), so it stands alone."""
+    lets a sparse file exceed it and clamp 'other' to zero."""
     command, _ = disk_command("/home/workspace", breakdown=True)
-    assert "du -sx -B1 " in command
+    assert "du -skx " in command
     assert "--apparent-size" not in command and "du -sb" not in command
 
 
@@ -252,7 +253,8 @@ async def test_a_recent_breakdown_is_served_again_without_an_exec():
     runtime.exec = AsyncMock(
         return_value=MagicMock(
             stdout=(
-                "Size Used Avail\n1000 400 600\n---du---\n"
+                "Filesystem 1024-blocks Used Available Capacity Mounted on\n"
+                "overlay 1000 400 600 40% /\n---du---\n"
                 "300\t/home/workspace/alpha/\n100\t/home/workspace/beta/\n"
             )
         )
@@ -265,7 +267,7 @@ async def test_a_recent_breakdown_is_served_again_without_an_exec():
         _, sizes = await manager._read_and_record_disk(
             _running(), runtime, True, sandbox_id="sb-1"
         )
-        assert sizes == {"alpha": 300, "beta": 100}
+        assert sizes == {"alpha": 300 * 1024, "beta": 100 * 1024}
 
         manager._measure_disk = AsyncMock()
         row, again = await manager.refresh_computer_disk(
@@ -292,7 +294,7 @@ async def test_a_recent_breakdown_is_served_again_without_an_exec():
 
 @pytest.mark.parametrize(
     ("now_ref", "sizes"),
-    [("sb-2", None), ("sb-1", {"alpha": 300})],
+    [("sb-2", None), ("sb-1", {"alpha": 300 * 1024})],
 )
 @pytest.mark.asyncio
 async def test_a_lost_write_answers_the_row_as_it_now_stands(now_ref, sizes):
@@ -306,7 +308,10 @@ async def test_a_lost_write_answers_the_row_as_it_now_stands(now_ref, sizes):
     runtime = MagicMock()
     runtime.exec = AsyncMock(
         return_value=MagicMock(
-            stdout="Size Used Avail\n1000 400 600\n---du---\n300\t/home/workspace/alpha/\n"
+            stdout=(
+                "Filesystem 1024-blocks Used Available Capacity Mounted on\n"
+                "overlay 1000 400 600 40% /\n---du---\n300\t/home/workspace/alpha/\n"
+            )
         )
     )
     current = _running(provider_ref=now_ref, disk_sandbox_ref=now_ref)

@@ -54,7 +54,7 @@ const FOLDED_MAX = 3;
 export function classifyToolCall(item: ActivityItem): ToolCategory | 'reasoning' {
   return item.type === 'reasoning'
     ? 'reasoning'
-    : categorizeTool(item.toolName || '', item.toolCall);
+    : categorizeTool(item.toolName || '', item.toolCall, item.root);
 }
 
 /** Per-category counts for a run, in the order the header reads them. */
@@ -166,15 +166,15 @@ export function summarizeCompletedItems(
 
 /** Present tense, for a call that is still running: "Reading memory about …". */
 export function liveToolLabel(item: ToolActivityItem, t: TFn): string {
-  return getActiveLabel(item.toolName || '', item.toolCall, t);
+  return getActiveLabel(item.toolName || '', item.toolCall, t, item.root);
 }
 
 /** Past tense, for a settled row: "Read memory", "Activated skill". */
 export function completedToolTitle(item: ToolActivityItem, t: TFn): string {
-  return getCompletedRowTitle(item.toolName || '', item.toolCall, t, item.toolCallResult?.artifact);
+  return getCompletedRowTitle(item.toolName || '', item.toolCall, t, { artifact: item.toolCallResult?.artifact, root: item.root });
 }
 
 /** The object a settled row names, rendered as its pill; null when there is none. */
 export function completedToolSummary(item: ToolActivityItem, t: TFn): string | null {
-  return getCompletedSummary(item.toolName || '', item.toolCall, t);
+  return getCompletedSummary(item.toolName || '', item.toolCall, t, item.root);
 }

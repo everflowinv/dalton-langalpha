@@ -13,6 +13,7 @@ the states it names are asserted here rather than taken from a caller.
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from decimal import Decimal
 from unittest.mock import AsyncMock, patch
 
@@ -108,8 +109,10 @@ async def test_the_settling_write_binds_the_fill_and_the_instrument_twice(cursor
     # Terminal, so the same statement dates the attempt, and the guard is the
     # set the write derived rather than one a caller chose.
     assert params[11] is True
-    assert params[12] == ATTEMPT
-    assert set(params[13]) == {
+    # The vendor named the order, so a listing that once lacked it is cleared.
+    assert params[12] is False
+    assert params[13] == ATTEMPT
+    assert set(params[14]) == {
         "submitting", "unknown", "submitted", "pending_confirm",
         "working", "partially_filled",
     }
@@ -138,8 +141,9 @@ async def test_a_read_naming_the_same_state_only_enriches_and_never_completes(cu
     # Not terminal, so nothing dates the attempt, and the guard is the state
     # the pass read: the row may only be enriched where it still stands.
     assert params[11] is False
-    assert params[12] == ATTEMPT
-    assert params[13] == ["partially_filled"]
+    assert params[12] is False
+    assert params[13] == ATTEMPT
+    assert params[14] == ["partially_filled"]
 
 
 @pytest.mark.asyncio
@@ -177,8 +181,33 @@ async def test_an_absence_may_only_settle_the_row_it_was_read_from(cursor):
     params = _json_params(cursor)
     # One state, the observed one. Without the narrowing this arrives as the
     # whole of ``forward_from(failed)``, which carries submitted and working.
-    assert params[13] == ["submitting"]
+    assert params[14] == ["submitting"]
     assert "WHERE attempt_id = %s AND status = ANY(%s)" in cursor.sql
+    # And it keeps the stamp dating the first listing that lacked the order.
+    assert params[12] is True
+    assert "unlisted_at = CASE WHEN %s THEN unlisted_at END" in cursor.sql
+
+
+@pytest.mark.asyncio
+async def test_an_end_on_two_lists_holds_to_the_stamp_it_was_read_with(cursor):
+    """A sibling that listed the order since the select cleared the stamp.
+
+    The status cannot show that, since the row is still ``submitted``, so the
+    write names the stamp too and lands nowhere once it has gone.
+    """
+    stamp = datetime(2026, 10, 21, 12, 0, 0, 123456, tzinfo=UTC)
+    await record_observation(
+        ATTEMPT,
+        AttemptStatus.SUBMITTED,
+        Observation(
+            status=AttemptStatus.HANDED_OFF, from_absence=True, unlisted_at=stamp
+        ),
+    )
+
+    params = _json_params(cursor)
+    assert "AND (%s::timestamptz IS NULL OR unlisted_at = %s)" in cursor.sql
+    assert params[14] == ["submitted"]
+    assert params[15] == params[16] == stamp
 
 
 @pytest.mark.asyncio
@@ -190,7 +219,9 @@ async def test_a_vendors_own_answer_still_overtakes_every_open_state(cursor):
 
     # A row that moved to working while the read was in flight is still settled
     # by it, because the vendor said so rather than failed to mention it.
-    assert "working" in _json_params(cursor)[13]
+    assert "working" in _json_params(cursor)[14]
+    # And no stamp to hold it to.
+    assert _json_params(cursor)[15] is None
 
 
 @pytest.mark.parametrize("cursor", ["order_attempts"], indirect=True)

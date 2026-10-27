@@ -20,16 +20,20 @@ from unittest.mock import patch
 import pytest
 
 from src.server.database.order_reconciliation import forward_from
+from src.server.services.brokerage_capabilities import OrderAction
 from src.server.services.brokerage_orders import (
     AttemptStatus,
     EquityRef,
+    IbkrOrderAdapter,
     ListingIncomplete,
     MatchKey,
     Money,
+    OrderAdapter,
     OrderOutcome,
     StatusQuery,
     StatusReadError,
     VendorOrder,
+    adapter_for,
 )
 from src.server.services.brokerage_orders.models import TERMINAL_STATUSES
 from src.server.services.egress.execution_token import DEFAULT_TTL_SECONDS
@@ -127,12 +131,22 @@ class FakeLedger:
     """The ledger rows, with the real write's guard and nothing else."""
 
     def __init__(
-        self, rows, cancels=None, lapsed=None, abandoned=None, undispatched=None
+        self,
+        rows,
+        cancels=None,
+        lapsed=None,
+        abandoned=None,
+        undispatched=None,
+        awaiting=None,
     ):
         self.rows = {row["attempt_id"]: dict(row) for row in rows}
         self.recorded: list[str] = []
         # A confirmed cancel of the user's own, keyed by the order it ended.
         self.cancels = dict(cancels or {})
+        # The orders a cancel of the user's own names while its answer is out.
+        self.awaiting = set(awaiting or ())
+        # Whether each cancel read asked after one still awaiting its answer.
+        self.cancel_reads: list[bool] = []
         # What the two lapse statements refuse this pass; the SQL decides which.
         self.lapsed = list(lapsed or ())
         self.abandoned = list(abandoned or ())
@@ -141,7 +155,8 @@ class FakeLedger:
         self.lapse_calls = 0
         self.sweeps: list[str] = []
 
-    async def list_stale_attempts(self, **_kwargs):
+    async def list_stale_attempts(self, **kwargs):
+        self.sweep_args = kwargs
         return [dict(row) for row in self.rows.values()]
 
     async def refuse_abandoned_proposals(self, **_kwargs):
@@ -184,6 +199,11 @@ class FakeLedger:
         )
         if AttemptStatus(row["status"]) not in allowed:
             return None
+        if (
+            observation.unlisted_at is not None
+            and row.get("unlisted_at") != observation.unlisted_at
+        ):
+            return None
         self.recorded.append(attempt_id)
         row["status"] = str(status)
         # COALESCE, as every column but the failure does it: a silent answer
@@ -193,6 +213,8 @@ class FakeLedger:
         row["route"] = row["route"] or (observation.route or {})
         row["failure"] = observation.failure
         row["completed"] = status in TERMINAL_STATUSES
+        if not observation.from_absence:
+            row["unlisted_at"] = None
         _learn(
             row,
             observation.filled_qty,
@@ -202,17 +224,34 @@ class FakeLedger:
         )
         return dict(row)
 
-    async def cancelled_by_own_attempt(
-        self, _user, _vendor, vendor_order_id, *, account_ref, exclude_attempt_id
+    async def own_cancel(
+        self,
+        _user,
+        _vendor,
+        vendor_order_id,
+        *,
+        account_ref,
+        exclude_attempt_id,
+        awaiting_within=None,
     ):
+        self.cancel_reads.append(awaiting_within is not None)
         cancel = self.cancels.get(vendor_order_id)
         if (
-            cancel is None
-            or cancel["attempt_id"] == exclude_attempt_id
-            or cancel["account_ref"] != account_ref
+            cancel is not None
+            and cancel["attempt_id"] != exclude_attempt_id
+            and cancel["account_ref"] == account_ref
         ):
-            return None
-        return dict(cancel)
+            return {**cancel, "status": "cancelled"}
+        if awaiting_within is not None and vendor_order_id in self.awaiting:
+            return {"attempt_id": "d-out", "status": "submitting"}
+        return None
+
+    async def mark_unlisted(self, attempt_id, current):
+        row = self.rows[attempt_id]
+        if row["status"] != str(current) or row.get("unlisted_at") is not None:
+            return False
+        row["unlisted_at"] = EXECUTED_AT
+        return True
 
 
 class StubAdapter:
@@ -247,6 +286,10 @@ class StubAdapter:
 
     def match_key(self, order):
         return self.key
+
+    # The contract's own default: a vendor whose list keeps an order after it
+    # ends, so absence from it settles nothing.
+    absent_status = OrderAdapter.absent_status
 
 
 class StallingAdapter(StubAdapter):
@@ -309,6 +352,7 @@ def _patches(
     *,
     held=True,
     group_held=True,
+    vendor="moomoo",
 ):
     """Everything outside the engine: the ledger, the vendor, and the relay."""
     connection = SimpleNamespace(
@@ -326,12 +370,11 @@ def _patches(
         patch(f"{_MOD}.claimed_vendor_order_ids", ledger.claimed_vendor_order_ids),
         patch(f"{_MOD}.unanswered_attempts", ledger.unanswered_attempts),
         patch(f"{_MOD}.record_observation", ledger.record_observation),
-        patch(
-            f"{_MOD}.cancelled_by_own_attempt", ledger.cancelled_by_own_attempt
-        ),
+        patch(f"{_MOD}.own_cancel", ledger.own_cancel),
+        patch(f"{_MOD}.mark_unlisted", ledger.mark_unlisted),
         patch(f"{_MOD}.SERVABLE", frozenset({"active"})),
         patch(f"{_MOD}.get_connection", _async(connection)),
-        patch(f"{_MOD}.vendor_for_url", lambda _url: "moomoo"),
+        patch(f"{_MOD}.vendor_for_url", lambda _url: vendor),
         patch(f"{_MOD}.adapter_for", lambda _vendor: adapter),
         patch(
             f"{_MOD}.active_grant_for_connection",
@@ -353,9 +396,20 @@ def _async(value):
     return _call
 
 
-async def _run(ledger, adapter, client, *, held=True, group_held=True, config=None):
+async def _run(
+    ledger,
+    adapter,
+    client,
+    *,
+    held=True,
+    group_held=True,
+    config=None,
+    vendor="moomoo",
+):
     reconciler = OrderReconciler(config=config or _config())
-    patches = _patches(ledger, adapter, client, held=held, group_held=group_held)
+    patches = _patches(
+        ledger, adapter, client, held=held, group_held=group_held, vendor=vendor
+    )
     for p in patches:
         p.start()
     try:
@@ -365,6 +419,33 @@ async def _run(ledger, adapter, client, *, held=True, group_held=True, config=No
             p.stop()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("interval", "open_after", "resweep"), [(60, 60, 48.0), (60, 300, 288.0), (600, 60, 48.0)]
+)
+async def test_a_pass_that_lands_early_still_reads_the_rows_the_last_one_took(
+    interval, open_after, resweep
+):
+    """The gate is the interval less the jitter, so an early pass is not a skip.
+
+    Held to the full interval, a lone worker whose pass came a few seconds
+    early found every row the pass before took still held off, and read each
+    row only every other pass. The jitter taken off is never more than its
+    share of the window, so a long loop interval cannot take the gate to zero
+    and let two workers read one row seconds apart.
+    """
+    ledger = FakeLedger([])
+    await _run(
+        ledger,
+        StubAdapter([]),
+        FakeClient(),
+        config=_config(interval_seconds=interval, open_after_seconds=open_after),
+    )
+
+    assert ledger.sweep_args["open_after_seconds"] == open_after
+    assert ledger.sweep_args["resweep_after_seconds"] == resweep
+
+
 # --------------------------------------------------------------- forward only
 
 
@@ -372,6 +453,7 @@ def test_forward_from_never_overtakes_a_terminal_row():
     for terminal in (
         AttemptStatus.FILLED,
         AttemptStatus.CANCELLED,
+        AttemptStatus.HANDED_OFF,
         AttemptStatus.FAILED,
         AttemptStatus.REJECTED_BY_VENDOR,
         AttemptStatus.REJECTED_BY_USER,
@@ -1261,3 +1343,250 @@ async def test_a_cancel_in_another_account_does_not_settle_this_order():
 
     assert report.moved == 0
     assert ledger.rows["a1"]["status"] == "submitted"
+
+
+# ------------------------------------------- a staged instruction that left the list
+
+# Invented ids in IBKR's shapes: a decimal-string instruction id, and a list
+# answer whose rows carry no status word.
+STAGED_ID = "9000001"
+OTHER_STAGED_ID = "9000002"
+
+
+def _staged_row(
+    attempt_id: str,
+    status: AttemptStatus,
+    vendor_order_id: str | None = STAGED_ID,
+):
+    """An IBKR create, as the ledger holds it once IBKR answered with an id."""
+    return {
+        **_row(attempt_id, status, vendor_order_id),
+        "server": "ibkr",
+        "vendor": "ibkr",
+        "tool": "create_order_instruction",
+        "action": "stage",
+        "mode": "staged",
+        "account_ref": "",
+        "order_json": {"vendor": "ibkr", "account_ref": "", "mode": "staged"},
+    }
+
+
+def _instructions(*ids: str) -> FakeClient:
+    """``get_order_instructions`` answering with these and nothing else."""
+    rows = [
+        {
+            "id": instruction_id,
+            "contract_id_ex": "1234567",
+            "side": "BUY",
+            "quantity": 1.0,
+            "order_type": "LIMIT",
+            "limit_price": 1.0,
+            "tif": "DAY",
+            "symbol": "AAPL",
+        }
+        for instruction_id in ids
+    ]
+    return FakeClient(json.dumps({"instructions": rows}))
+
+
+def _delete_row(attempt_id: str, instruction_id: str) -> dict:
+    """A delete of this user's that IBKR answered with its empty body."""
+    return {
+        **_cancel_row(attempt_id, instruction_id, account_ref=""),
+        "tool": "delete_order_instruction",
+        "action": "unstage",
+    }
+
+
+class StalledIbkr(IbkrOrderAdapter):
+    """IBKR answering one page and claiming more it will not name."""
+
+    def next_page(self, query, body):
+        raise ListingIncomplete("more instructions, no next page")
+
+
+@pytest.mark.asyncio
+async def test_a_staged_instruction_gone_from_two_complete_lists_is_handed_off(caplog):
+    """Sent, deleted or expired in IBKR's own client: the list says none of these.
+
+    The row used to stay ``submitted`` and be read again every pass, waiting on
+    an answer IBKR never gives. The first list to lack it only stamps it, since
+    the end is final; the next read, a poll interval on, settles it.
+    """
+    ledger = FakeLedger([_staged_row("a1", AttemptStatus.SUBMITTED)])
+    first = await _run(
+        ledger, IbkrOrderAdapter(), _instructions(OTHER_STAGED_ID), vendor="ibkr"
+    )
+
+    assert first.moved == 0
+    assert first.unresolved == 1
+    assert ledger.rows["a1"]["status"] == "submitted"
+    assert ledger.rows["a1"]["unlisted_at"] is not None
+
+    with caplog.at_level(logging.INFO):
+        report = await _run(
+            ledger, IbkrOrderAdapter(), _instructions(OTHER_STAGED_ID), vendor="ibkr"
+        )
+
+    assert report.moved == 1
+    assert ledger.rows["a1"]["status"] == "handed_off"
+    assert ledger.rows["a1"]["completed"] is True
+    assert ledger.rows["a1"]["failure"] is None
+    assert "sent, deleted or expired there" in caplog.text
+
+
+class _SiblingListsItFirst(FakeClient):
+    """A sibling worker reads the account between this pass's select and list.
+
+    Its read named the instruction, which cleared the stamp on the row, while
+    this pass still holds the row as it selected it.
+    """
+
+    def __init__(self, ledger, attempt_id, payload):
+        super().__init__(payload)
+        self._ledger = ledger
+        self._attempt_id = attempt_id
+
+    async def call_tool(self, name, args):
+        self._ledger.rows[self._attempt_id]["unlisted_at"] = None
+        return await super().call_tool(name, args)
+
+
+@pytest.mark.asyncio
+async def test_a_stamp_a_sibling_cleared_after_the_select_ends_nothing():
+    """The end holds to the stamp the sweep read, not to the status alone.
+
+    A pass can wait for a group slot past the resweep gate, long enough for a
+    sibling to select the row, list the instruction and clear the stamp. The
+    row is still ``submitted``, so only the stamp says this pass's one empty
+    list came after a sighting.
+    """
+    ledger = FakeLedger([_staged_row("a1", AttemptStatus.SUBMITTED)])
+    await _run(ledger, IbkrOrderAdapter(), _instructions(), vendor="ibkr")
+    assert ledger.rows["a1"]["unlisted_at"] is not None
+
+    sibling = _SiblingListsItFirst(ledger, "a1", _instructions().payload)
+    report = await _run(ledger, IbkrOrderAdapter(), sibling, vendor="ibkr")
+
+    assert report.moved == 0
+    assert report.unresolved == 1
+    assert not report.errors
+    assert ledger.rows["a1"]["status"] == "submitted"
+
+
+@pytest.mark.asyncio
+async def test_one_empty_answer_between_two_that_list_it_ends_nothing():
+    """An answer that drops a live instruction once is not the instruction going.
+
+    A list read again that names it clears the stamp, so the next empty answer
+    starts the count over rather than finishing it.
+    """
+    ledger = FakeLedger([_staged_row("a1", AttemptStatus.SUBMITTED)])
+    await _run(ledger, IbkrOrderAdapter(), _instructions(), vendor="ibkr")
+    assert ledger.rows["a1"]["unlisted_at"] is not None
+
+    await _run(ledger, IbkrOrderAdapter(), _instructions(STAGED_ID), vendor="ibkr")
+    assert ledger.rows["a1"]["unlisted_at"] is None
+
+    report = await _run(ledger, IbkrOrderAdapter(), _instructions(), vendor="ibkr")
+    assert report.moved == 0
+    assert ledger.rows["a1"]["status"] == "submitted"
+    assert ledger.rows["a1"]["unlisted_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_a_staged_instruction_still_listed_stays_submitted():
+    ledger = FakeLedger([_staged_row("a1", AttemptStatus.SUBMITTED)])
+    report = await _run(
+        ledger, IbkrOrderAdapter(), _instructions(STAGED_ID), vendor="ibkr"
+    )
+
+    assert report.moved == 0
+    assert ledger.rows["a1"]["status"] == "submitted"
+
+
+@pytest.mark.asyncio
+async def test_a_staged_instruction_missing_from_a_list_cut_short_stays_open():
+    ledger = FakeLedger([_staged_row("a1", AttemptStatus.SUBMITTED)])
+    report = await _run(ledger, StalledIbkr(), _instructions(), vendor="ibkr")
+
+    assert report.moved == 0
+    assert report.unresolved == 1
+    assert ledger.rows["a1"]["status"] == "submitted"
+    # Nor does it count toward ending it: the rest of the list was never read.
+    assert ledger.rows["a1"].get("unlisted_at") is None
+
+
+@pytest.mark.asyncio
+async def test_a_failed_list_read_hands_nothing_off():
+    ledger = FakeLedger([_staged_row("a1", AttemptStatus.SUBMITTED)])
+    client = FakeClient(json.dumps({"code": 401, "message": "token expired"}))
+    report = await _run(ledger, IbkrOrderAdapter(), client, vendor="ibkr")
+
+    assert report.moved == 0
+    assert report.errors["ibkr"] == 1
+    assert ledger.rows["a1"]["status"] == "submitted"
+    assert ledger.rows["a1"].get("unlisted_at") is None
+
+
+@pytest.mark.asyncio
+async def test_our_own_delete_settles_the_instruction_cancelled_not_handed_off():
+    ledger = FakeLedger(
+        [_staged_row("a1", AttemptStatus.SUBMITTED)],
+        cancels={STAGED_ID: _delete_row("d1", STAGED_ID)},
+    )
+    report = await _run(ledger, IbkrOrderAdapter(), _instructions(), vendor="ibkr")
+
+    assert report.moved == 1
+    assert ledger.rows["a1"]["status"] == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_an_instruction_our_delete_is_still_answering_for_waits_a_pass():
+    """IBKR drops the row before our delete's answer lands, and an end is final.
+
+    Handed off in that gap, the instruction could never become the
+    ``cancelled`` the delete makes it a moment later.
+    """
+    ledger = FakeLedger(
+        [_staged_row("a1", AttemptStatus.SUBMITTED)], awaiting={STAGED_ID}
+    )
+    report = await _run(ledger, IbkrOrderAdapter(), _instructions(), vendor="ibkr")
+
+    assert report.moved == 0
+    assert report.unresolved == 1
+    assert ledger.rows["a1"]["status"] == "submitted"
+    # Asked in the same read as the confirmed cancel, so one answered between
+    # two reads cannot slip past both.
+    assert ledger.cancel_reads == [True]
+    assert ledger.rows["a1"].get("unlisted_at") is None
+
+    ledger.awaiting.clear()
+    ledger.cancels[STAGED_ID] = _delete_row("d1", STAGED_ID)
+    await _run(ledger, IbkrOrderAdapter(), _instructions(), vendor="ibkr")
+
+    assert ledger.rows["a1"]["status"] == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_a_vendor_that_keeps_ended_orders_listed_leaves_a_missing_one_open():
+    """The default: absence from a list that keeps its history is unexplained."""
+    row = {**_row("a1", AttemptStatus.SUBMITTED, "V1"), "action": "stage"}
+    ledger = FakeLedger([row])
+    report = await _run(ledger, StubAdapter([]), FakeClient())
+
+    assert report.moved == 0
+    assert report.unresolved == 1
+    assert ledger.rows["a1"]["status"] == "submitted"
+    assert ledger.rows["a1"].get("unlisted_at") is None
+    # Only a confirmed cancel can settle it, so none still out is asked after.
+    assert ledger.cancel_reads == [False]
+
+
+@pytest.mark.parametrize("vendor", ["moomoo", "robinhood"])
+@pytest.mark.parametrize("action", list(OrderAction))
+def test_only_an_ibkr_staged_instruction_ends_by_leaving_the_list(vendor, action):
+    assert adapter_for(vendor).absent_status(action) is None
+    assert adapter_for(vendor).absent_status(str(action)) is None
+    expected = AttemptStatus.HANDED_OFF if action is OrderAction.STAGE else None
+    assert adapter_for("ibkr").absent_status(str(action)) is expected

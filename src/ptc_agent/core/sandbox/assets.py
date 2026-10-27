@@ -122,7 +122,10 @@ async def _read_vault_digest(sandbox: "PTCSandbox") -> str | None:
     path = shlex.quote(sandbox.layout.vault_secrets)
     result = await sandbox._runtime_call(
         sandbox.runtime.exec,
-        f"if [ -e {path} ]; then sha256sum {path}; else echo absent; fi",
+        f"if [ ! -e {path} ]; then echo absent; "
+        f"elif command -v sha256sum >/dev/null 2>&1; then sha256sum {path}; "
+        # A macOS machine may have only shasum, which prints the same line.
+        f"else shasum -a 256 {path}; fi",
         retry_policy=RetryPolicy.SAFE,
     )
     words = (result.stdout or "").split() if result.exit_code == 0 else []
@@ -438,7 +441,10 @@ async def _compute_sandbox_manifest(
     repo_root = config_dir or Path.cwd()
     src_dir = (repo_root / "src").resolve()
     internal_files = {
-        str(rel): _sha256_file(local) for local, rel in _internal_package_files(src_dir)
+        str(rel): _sha256_file(local)
+        for local, rel in _internal_package_files(
+            src_dir, livefs=sandbox.mounts_livefs
+        )
     }
     if internal_files:
         # The vault helper ships in the same upload but is generated rather
@@ -719,8 +725,8 @@ async def _prune_mcp_server_files(sandbox: "PTCSandbox", expected: set[str]) -> 
 async def sync_sandbox_assets(
     sandbox: "PTCSandbox",
     *,
-    skill_dirs: list[tuple[str, str]] | None = None,
-    user_skill_dir: tuple[str, str] | None = None,
+    skill_dirs: list[str] | None = None,
+    user_skill_dir: str | None = None,
     disabled_skills: frozenset[str] = frozenset(),
     reusing_sandbox: bool = False,
     force_refresh: bool = False,
@@ -739,11 +745,14 @@ async def sync_sandbox_assets(
     modules, and skills in one manifest file.
 
     Args:
-        skill_dirs: Ordered list of (local_path, sandbox_path) for skills.
-        user_skill_dir: (host cache view, sandbox base) for the user's
-            server-managed skill tier. A separate param, not another
-            ``skill_dirs`` entry, because the manifest computation must
-            know which root is managed to stamp the right lock ownership.
+        skill_dirs: Ordered host directories to deliver skills from. They
+            all land in the sandbox's own skills folder, read off its live
+            root like every other path here, so a computer whose root is not
+            the deployment default still gets them where its agent looks.
+        user_skill_dir: Host cache view of the user's server-managed skill
+            tier. A separate param, not another ``skill_dirs`` entry, because
+            the manifest computation must know which root is managed to
+            stamp the right lock ownership.
         disabled_skills: Builtin skill names this user disabled — excluded
             from the local set, so the prune removes them from the sandbox.
             One an enabled skill declares in ``requires`` is kept: the
@@ -780,7 +789,7 @@ async def sync_sandbox_assets(
 
     # Fold the managed user tier into the source list (last, so it can never
     # be overridden); which root is managed travels separately.
-    managed_root = user_skill_dir[0] if user_skill_dir else None
+    managed_root = user_skill_dir
     if user_skill_dir:
         skill_dirs = list(skill_dirs or []) + [user_skill_dir]
 
@@ -813,7 +822,7 @@ async def sync_sandbox_assets(
         # _prune_disabled_tool_modules → sandbox rm (disjoint from manifest paths)
         # _compute_sandbox_manifest → local CPU/disk only
         # _read_unified_manifest → sandbox HTTP GET
-        skill_roots = [d for d, _ in skill_dirs] if skill_dirs else None
+        skill_roots = list(skill_dirs) if skill_dirs else None
 
         (
             _,
@@ -847,8 +856,13 @@ async def sync_sandbox_assets(
         )
         _mark_sync("manifest")
 
-        # 2b. Run layout migrations if needed (zero cost when current)
-        remote_layout = (remote_manifest or {}).get("layout_version", 1)
+        # 2b. Run layout migrations if needed (zero cost when current). A
+        # missing stamp reads as the oldest layout the provider ever made, not
+        # v1, so a failed first manifest write cannot replay old moves.
+        first_layout = type(sandbox.provider).first_layout_version
+        remote_layout = max(
+            (remote_manifest or {}).get("layout_version", 1), first_layout
+        )
         layout_version = await run_layout_migrations(
             sandbox.runtime,
             sandbox._work_dir,
@@ -893,11 +907,10 @@ async def sync_sandbox_assets(
                 if skill_dirs:
                     # Cold process / reconnect: one lock read folds the
                     # agent-installed entries in without a filesystem re-scan.
-                    sandbox_base = skill_dirs[-1][1].rstrip("/")
-                    existing_lock = await sandbox._download_skills_lock(sandbox_base)
+                    existing_lock = await sandbox._download_skills_lock()
                     if existing_lock:
                         sandbox._build_complete_skills_cache(
-                            skills_mod, {"skills": existing_lock}, sandbox_base
+                            skills_mod, {"skills": existing_lock}
                         )
                 if sandbox._skills_manifest is None:
                     sandbox._skills_manifest = skills_mod
@@ -926,16 +939,15 @@ async def sync_sandbox_assets(
         async def _do_skills_upload() -> None:
             """Skills sub-chain: collect → prune → upload (internally sequential)."""
             local_skill_names = await _collect_local_skill_names(
-                [d for d, _ in skill_dirs],
+                list(skill_dirs or []),
                 disabled=disabled_skills,
             )
-            sandbox_base = skill_dirs[-1][1].rstrip("/")  # type: ignore[index]
 
             # Download existing lock file once (shared by prune + upload)
-            existing_lock = await sandbox._download_skills_lock(sandbox_base)
+            existing_lock = await sandbox._download_skills_lock()
 
             await sandbox._prune_remote_skills(
-                sandbox_base, local_skill_names, existing_lock=existing_lock
+                local_skill_names, existing_lock=existing_lock
             )
             skills_mod = local_manifest["modules"].get("skills", {})
             if skills_mod.get("files"):
@@ -948,9 +960,7 @@ async def sync_sandbox_assets(
                 skill_collisions.update(collisions)
                 # Build complete skills cache from merged lock data
                 if merged_lock:
-                    sandbox._build_complete_skills_cache(
-                        skills_mod, merged_lock, sandbox_base
-                    )
+                    sandbox._build_complete_skills_cache(skills_mod, merged_lock)
 
         # Group 1: independent uploads in parallel
         parallel_uploads: list[tuple[str, Any]] = []
@@ -1164,16 +1174,14 @@ async def _collect_local_skill_names(
     return await asyncio.to_thread(build)
 
 
-async def _download_skills_lock(
-    sandbox: "PTCSandbox", sandbox_skills_base: str
-) -> dict[str, Any] | None:
+async def _download_skills_lock(sandbox: "PTCSandbox") -> dict[str, Any] | None:
     """Download and parse the existing skills-lock.json from sandbox.
 
     Returns parsed skill entries dict, or None if missing/corrupt.
     """
     from ptc_agent.agent.middleware.skills.lock import LOCK_FILENAME, parse_skills_lock
 
-    lock_path = f"{sandbox_skills_base}/{LOCK_FILENAME}"
+    lock_path = f"{sandbox.layout.skills}/{LOCK_FILENAME}"
     assert sandbox.runtime is not None
     try:
         raw = await sandbox._runtime_call(
@@ -1193,7 +1201,6 @@ def _build_complete_skills_cache(
     sandbox: "PTCSandbox",
     skills_mod: dict[str, Any],
     merged_lock: dict[str, Any],
-    sandbox_skills_base: str,
 ) -> None:
     """Merge user-installed skills from lock file into the skills manifest cache.
 
@@ -1204,10 +1211,11 @@ def _build_complete_skills_cache(
 
     all_skills = dict(skills_mod.get("skills", {}))
 
+    skills_base = sandbox.layout.skills
     lock_skills = merged_lock.get("skills", {})
     for name, entry in lock_skills.items():
         if entry.get("owner") == "user" and name not in all_skills:
-            skill_path = f"{sandbox_skills_base}/{name}/SKILL.md"
+            skill_path = f"{skills_base}/{name}/SKILL.md"
             meta = lock_entry_to_skill_metadata(entry, skill_path)
             all_skills[name] = dict(meta)
 
@@ -1216,7 +1224,6 @@ def _build_complete_skills_cache(
 
 async def _prune_remote_skills(
     sandbox: "PTCSandbox",
-    sandbox_base: str,
     local_skill_names: set[str],
     *,
     existing_lock: dict[str, Any] | None = None,
@@ -1234,7 +1241,8 @@ async def _prune_remote_skills(
         return
     assert sandbox.runtime is not None
     runtime = sandbox.runtime
-    entries = await sandbox.als_directory(sandbox_base)
+    skills_base = sandbox.layout.skills
+    entries = await sandbox.als_directory(skills_base)
     if not entries:
         return
 
@@ -1280,13 +1288,13 @@ async def _prune_remote_skills(
     logger.info(
         "Pruned stale platform skills from sandbox",
         removed=len(paths_to_remove),
-        sandbox_root=sandbox_base,
+        sandbox_root=skills_base,
     )
 
 
 async def _upload_skills(
     sandbox: "PTCSandbox",
-    local_skills_dirs: list[tuple[str, str]],
+    local_skills_dirs: list[str],
     *,
     manifest: dict[str, Any] | None = None,
     existing_lock: dict[str, Any] | None = None,
@@ -1301,8 +1309,8 @@ async def _upload_skills(
       exec that swaps each staged dir into place and merges the lock.
 
     Args:
-        local_skills_dirs: List of (local_path, sandbox_path) tuples.
-            Example: [("~/.ptc-agent/skills", "{working_directory}/skills")]
+        local_skills_dirs: Host directories, in precedence order. Every one
+            lands in the sandbox's skills folder.
         manifest: Pre-computed skills manifest. If None, computed from local_skills_dirs.
         existing_lock: Previously downloaded lock entries, or None for fresh sandbox.
 
@@ -1321,8 +1329,9 @@ async def _upload_skills(
     runtime = sandbox.runtime
 
     if manifest is None:
-        local_roots = [local_dir for local_dir, _ in local_skills_dirs]
-        manifest = await sandbox._compute_skills_module(local_roots, disabled=disabled)
+        manifest = await sandbox._compute_skills_module(
+            list(local_skills_dirs), disabled=disabled
+        )
 
     if not manifest.get("files"):
         logger.debug("No skills found; skipping upload")
@@ -1358,7 +1367,7 @@ async def _upload_skills(
         ]
 
     def _plan_all() -> None:
-        for local_dir, _ in local_skills_dirs:
+        for local_dir in local_skills_dirs:
             local_path = Path(local_dir).expanduser()
             if not local_path.exists():
                 continue
@@ -1384,7 +1393,7 @@ async def _upload_skills(
     await asyncio.to_thread(_plan_all)
     # Every source lands in the one shared folder; planning above already
     # collapsed a name to a single source on that assumption.
-    sandbox_base = local_skills_dirs[-1][1].rstrip("/")
+    sandbox_base = sandbox.layout.skills
 
     # Never write over content this path does not own: a planned skill whose
     # name an agent-installed or reconciler-linked skill already occupies is

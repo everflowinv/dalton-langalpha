@@ -89,6 +89,41 @@ class MountHandle(Protocol):
         whether it landed."""
 
 
+class HistoryFiles(Protocol):
+    """Past threads for the file tools on a machine the mount never serves.
+
+    The tools read them in process, through routes the host builds over the
+    rows, which Bash and code do not reach. The host implements it, since the
+    rows are its own.
+    """
+
+    def routes(self, sandbox: Any) -> list[Any]:
+        """Read-only filesystem routes over ``sandbox``'s paths: each
+        workspace folder's transcripts and the computer's thread index."""
+
+    def serves(self, workspace_id: str | None) -> bool:
+        """Whether the routes include ``workspace_id``'s transcripts, which
+        a pointer at one of its threads needs."""
+
+    async def save_transcript(
+        self, target: TranscriptTarget, messages: Sequence[AnyMessage], *, window: Window
+    ) -> bool:
+        """As ``MountHandle.save_transcript``, for the routes to serve."""
+
+
+@dataclass(frozen=True)
+class TranscriptReach:
+    """Where an agent's transcripts are saved for its tools to read.
+
+    ``shell`` says Bash and code see them too, which only the mount gives:
+    its links put them in the workspace folder, so a pointer at them is only
+    as good as those links. The in-process routes serve the file tools alone.
+    """
+
+    home: MountHandle | HistoryFiles
+    shell: bool
+
+
 async def through_mount(
     mount: MountHandle | None,
     context: CallContext | None,

@@ -9,15 +9,18 @@ from __future__ import annotations
 
 import pytest
 
+from ptc_agent.config.core import E2BConfig, SandboxConfig
 from src.config import env
 from src.server.services.preview_base import (
     PreviewBase,
     PreviewProxyConfigurationError,
     check_preview_proxy_config,
     parse_preview_base,
+    preview_proxy_requirements,
 )
 
 _TOKEN = "abcdefghijklmnopqrstuvwxyz234567"
+_PRIVATE_E2B = ("sandbox.e2b.public_traffic is false",)
 
 
 class TestBase:
@@ -97,23 +100,37 @@ class TestBase:
 
 
 class TestBootCheck:
-    def test_private_e2b_without_a_base_refuses_to_boot(self, monkeypatch):
+    @pytest.mark.parametrize(
+        ("sandbox", "named"),
+        [
+            (SandboxConfig(e2b=E2BConfig(public_traffic=False)), "e2b.public_traffic"),
+            (SandboxConfig(offered_providers=("ssh",)), "includes ssh"),
+        ],
+    )
+    def test_a_proxied_provider_without_a_base_refuses_to_boot(
+        self, monkeypatch, sandbox, named
+    ):
+        """An SSH preview is never browser-ready, the same as a private E2B one."""
         monkeypatch.setattr(env, "PREVIEW_PROXY_BASE_URL", "")
 
-        with pytest.raises(PreviewProxyConfigurationError):
-            check_preview_proxy_config(requires_proxy=True, app_urls=())
+        with pytest.raises(PreviewProxyConfigurationError, match=named):
+            check_preview_proxy_config(
+                proxy_required_by=preview_proxy_requirements(sandbox), app_urls=()
+            )
 
     def test_public_e2b_needs_no_base(self, monkeypatch):
         monkeypatch.setattr(env, "PREVIEW_PROXY_BASE_URL", "")
 
-        check_preview_proxy_config(requires_proxy=False, app_urls=())
+        check_preview_proxy_config(
+            proxy_required_by=preview_proxy_requirements(SandboxConfig()), app_urls=()
+        )
 
     def test_a_base_that_holds_the_app_host_refuses_to_boot(self, monkeypatch):
         monkeypatch.setattr(env, "PREVIEW_PROXY_BASE_URL", "https://example.com")
 
         with pytest.raises(PreviewProxyConfigurationError):
             check_preview_proxy_config(
-                requires_proxy=True,
+                proxy_required_by=_PRIVATE_E2B,
                 app_urls=("https://app.example.com",),
             )
 
@@ -130,13 +147,13 @@ class TestBootCheck:
         monkeypatch.setattr(env, "PREVIEW_PROXY_BASE_URL", base)
 
         with pytest.raises(PreviewProxyConfigurationError, match="same site"):
-            check_preview_proxy_config(requires_proxy=True, app_urls=("*", app))
+            check_preview_proxy_config(proxy_required_by=_PRIVATE_E2B, app_urls=("*", app))
 
     def test_a_base_on_a_site_of_its_own_boots(self, monkeypatch):
         monkeypatch.setattr(env, "PREVIEW_PROXY_BASE_URL", "https://preview.example.net")
 
         check_preview_proxy_config(
-            requires_proxy=True,
+            proxy_required_by=_PRIVATE_E2B,
             app_urls=("https://app.example.com", "http://localhost:8000", "*"),
         )
 
@@ -144,6 +161,6 @@ class TestBootCheck:
         monkeypatch.setattr(env, "PREVIEW_PROXY_BASE_URL", "http://preview.localhost:8000")
 
         check_preview_proxy_config(
-            requires_proxy=True,
+            proxy_required_by=_PRIVATE_E2B,
             app_urls=("http://localhost:8000", "http://app.localhost:5173"),
         )

@@ -28,6 +28,7 @@ from ptc_agent.core.project_context import ProjectContext
 from ptc_agent.core.sandbox.assets import publish_vault_secrets, sync_sandbox_assets
 from ptc_agent.core.sandbox.migration import CURRENT_LAYOUT_VERSION
 from ptc_agent.core.sandbox.runtime import ExecResult, SandboxRuntime
+from tests.unit.core.sandbox.fake_provider import fake_provider
 
 WORK_DIR = "/home/workspace"
 DIR_NAME = "acme-ab12"
@@ -45,7 +46,10 @@ def _make_sandbox():
         logging=LoggingConfig(),
         filesystem=FilesystemConfig(),
     )
-    with patch("ptc_agent.core.sandbox.ptc_sandbox.create_provider"):
+    with patch(
+        "ptc_agent.core.sandbox.ptc_sandbox.create_provider",
+        return_value=fake_provider(),
+    ):
         sandbox = PTCSandbox(config=config)
     sandbox._work_dir = WORK_DIR
     sandbox.mcp_registry = None
@@ -190,10 +194,42 @@ class TestTheMigrationStampsItself:
             await sandbox.sync_sandbox_assets(
                 reusing_sandbox=True,
                 project=PROJECT,
-                skill_dirs=[("/local/skills", f"{WORK_DIR}/.agents/skills")],
+                skill_dirs=["/local/skills"],
             )
 
         sandbox._build_complete_skills_cache.assert_called_once()
+
+
+class TestAMissingStampOnAMachineBornLater:
+    """A missing manifest reads as v1, whose steps delete and move folders by
+    name. On a machine the owner keeps their own files on, that would take
+    them, so a provider whose machines were never laid out that way floors
+    the stamp at the first layout it made."""
+
+    @pytest.mark.asyncio
+    async def test_ssh_starts_from_its_first_layout(self):
+        from ptc_agent.core.sandbox.providers.ssh import SSHProvider
+
+        sandbox = _make_sandbox()
+        sandbox.provider = object.__new__(SSHProvider)
+        sandbox._read_unified_manifest = AsyncMock(return_value=None)
+        migrate = AsyncMock(side_effect=lambda _rt, _wd, version, **_kw: version)
+
+        with patch("ptc_agent.core.sandbox.assets.run_layout_migrations", migrate):
+            await sandbox.sync_sandbox_assets(reusing_sandbox=True, project=PROJECT)
+
+        assert migrate.await_args.args[2] == SSHProvider.first_layout_version
+
+    @pytest.mark.asyncio
+    async def test_other_providers_still_start_from_v1(self):
+        sandbox = _make_sandbox()
+        sandbox._read_unified_manifest = AsyncMock(return_value=None)
+        migrate = AsyncMock(return_value=CURRENT_LAYOUT_VERSION)
+
+        with patch("ptc_agent.core.sandbox.assets.run_layout_migrations", migrate):
+            await sandbox.sync_sandbox_assets(reusing_sandbox=True, project=PROJECT)
+
+        assert migrate.await_args.args[2] == 1
 
 
 VAULT_FILE = f"{WORK_DIR}/_internal/.vault_secrets.json"

@@ -18,6 +18,8 @@ interface FileFocus {
   location: FileLocation;
   /** Bumped on every visit so a repeat click scrolls and plays the highlight again. */
   seq: number;
+  /** A tab come back to the front putting the reader back where they were, not a new ask. */
+  replay?: boolean;
 }
 
 export interface FocusChipState {
@@ -168,10 +170,11 @@ export function useFileFocus({
   const [landing, setLanding] = useState<{ seq: number; title?: string; found: boolean; near?: boolean } | null>(null);
   const seqRef = useRef(0);
 
-  const focusAt = useCallback((path: string, location: FileLocation | null | undefined) => {
-    setFocus(location ? { path, location, seq: ++seqRef.current } : null);
+  const focusAt = useCallback((path: string, location: FileLocation | null | undefined, replay = false) => {
+    setFocus(location ? { path, location, seq: ++seqRef.current, ...(replay && { replay }) } : null);
   }, []);
-  const jump = useCallback(() => setFocus((f) => f && { ...f, seq: ++seqRef.current }), []);
+  // A jump is the reader asking again, so it is never a replay.
+  const jump = useCallback(() => setFocus((f) => f && { path: f.path, location: f.location, seq: ++seqRef.current }), []);
   const dismiss = useCallback(() => setFocus(null), []);
 
   useEffect(() => {
@@ -280,5 +283,6 @@ export function useFileFocus({
       : loc?.line && !loc.lineEnd ? `L${loc.line}`
       : null,
     seq: activeSeq,
+    replayed: !!active?.replay,
   };
 }

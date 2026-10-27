@@ -34,6 +34,7 @@ from langchain_core.tools import BaseTool
 from ptc_agent.agent.middleware.direct_mcp import METADATA_KEY
 from ptc_agent.agent.middleware.order_governance import execution_token
 from src.config.env import EGRESS_RELAY_LOOPBACK_URL, EGRESS_RELAY_SECRET
+from src.observability.langsmith_run import TOOL_PROVIDER
 from src.server.database.mcp_oauth import SERVABLE, ConnectionStatus, get_connection
 from src.server.services.brokerage_capabilities import (
     denied_tools,
@@ -613,6 +614,10 @@ async def prepare_direct_mcp_tools(
                     "sandboxed": direct.sandboxed,
                     "approval": direct.resolved.approval,
                 },
+                # What its trace runs are filed under. A server the user added
+                # is named by the user, and the digest posts to a shared
+                # channel, so it is filed as a kind rather than by that label.
+                TOOL_PROVIDER: entry.vendor or "custom_mcp",
             }
             binding.tools.append(lc_tool)
             bound += 1

@@ -43,6 +43,7 @@ export type OrderStatusGroup =
   | 'open'
   | 'filled'
   | 'cancelled'
+  | 'handed_off'
   | 'rejected'
   | 'failed';
 
@@ -51,6 +52,7 @@ export const ORDER_STATUS_GROUPS: readonly OrderStatusGroup[] = [
   'open',
   'filled',
   'cancelled',
+  'handed_off',
   'rejected',
   'failed',
 ] as const;
@@ -70,6 +72,7 @@ export const ORDER_STATUS_GROUP_STATUSES: Record<OrderStatusGroup, readonly Orde
   ],
   filled: ['filled'],
   cancelled: ['cancelled'],
+  handed_off: ['handed_off'],
   rejected: ['rejected_by_user', 'refused', 'rejected_by_vendor'],
   failed: ['failed'],
 };

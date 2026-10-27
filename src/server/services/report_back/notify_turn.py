@@ -74,11 +74,14 @@ async def park_while_thread_busy(
 
     The re-read closes the race where that finalize landed between the
     status read and the park (its release pass saw no deferred row yet),
-    releasing the job itself. ``parks_at_ceiling`` is for a type the defer
-    still parks at the attempts ceiling (an alert: a price target's or a
-    wakeup's notice, held for the thread's next turn), so the re-read covers
-    it there too; a steer settled
-    there instead is not parked, and has nothing to release.
+    releasing the job itself. It waits out a finalize still in flight: one
+    whose release pass ran before the park reads live to a plain read until
+    it commits, and the job would then wait on a turn already over, holding
+    up every later notification on its chain. ``parks_at_ceiling`` is for a
+    type the defer still parks at the attempts ceiling (an alert: a price
+    target's or a wakeup's notice, held for the thread's next turn), so the
+    re-read covers it there too; a steer settled there instead is not
+    parked, and has nothing to release.
     """
     from src.server.database.runs import lifecycle as tl_db
     from src.server.database.runs import outbox as outbox_db
@@ -95,7 +98,7 @@ async def park_while_thread_busy(
         f"{thread_id} is {latest.get('status')} (status={parked})"
     )
     if parked == "pending" or (parked == "exhausted" and parks_at_ceiling):
-        latest = await tl_db.get_latest_attempt(thread_id)
+        latest = await tl_db.get_latest_attempt(thread_id, wait_for_finalize=True)
         if not latest or latest.get("status") not in _BUSY_STATUSES:
             await release_parked_notifications(thread_id)
     return True
@@ -137,7 +140,8 @@ async def release_if_a_turn_ended(thread_id: str, since: tuple[str, str] | None)
     """
     from src.server.database.runs import lifecycle as tl_db
 
-    latest = await tl_db.get_latest_attempt(thread_id)
+    # Behind a finalize in flight, as the park's re-read is.
+    latest = await tl_db.get_latest_attempt(thread_id, wait_for_finalize=True)
     if not latest or latest.get("status") in _BUSY_STATUSES:
         return False
     if run_marker(latest) == since:

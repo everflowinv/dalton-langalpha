@@ -188,6 +188,16 @@ describe('ChatAgent API utilities', () => {
       await deleteWorkspace('  ws-123  ');
       expect(mockDelete).toHaveBeenCalledWith('/api/v1/workspaces/ws-123');
     });
+
+    it('asks for the folder to go only when told to', async () => {
+      mockDelete.mockResolvedValue({});
+
+      await deleteWorkspace('ws-123', { deleteFiles: true });
+      expect(mockDelete).toHaveBeenLastCalledWith('/api/v1/workspaces/ws-123', { params: { delete_files: true } });
+
+      await deleteWorkspace('ws-123', { deleteFiles: false });
+      expect(mockDelete).toHaveBeenLastCalledWith('/api/v1/workspaces/ws-123');
+    });
   });
 
   describe('getWorkspace', () => {

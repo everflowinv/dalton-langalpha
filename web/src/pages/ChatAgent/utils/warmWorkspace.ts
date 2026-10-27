@@ -38,9 +38,20 @@ export function cachedWorkspaceLists(queryClient: QueryClient): Workspace[] {
   return rows;
 }
 
-/** `row` with `status` written in, and the computer when the writer names one. */
+/**
+ * `row` with `status` written in, and the computer when the writer names one.
+ * The root the row was read with is its computer's, so a writer that names
+ * another computer clears it, and the computer list's stands in until the row
+ * is read again.
+ */
 function withStatus<T extends Workspace>(row: T, status: string, computerId?: string): T {
-  return { ...row, status, ...(computerId ? { computer_id: computerId } : {}) };
+  const moved = !!computerId && computerId !== row.computer_id;
+  return {
+    ...row,
+    status,
+    ...(computerId ? { computer_id: computerId } : {}),
+    ...(moved && row.root_dir ? { root_dir: null } : {}),
+  };
 }
 
 /**

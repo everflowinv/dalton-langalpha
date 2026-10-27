@@ -7,6 +7,7 @@ import {
   CheckCircle2,
   CircleDot,
   Clock,
+  CornerUpRight,
   HelpCircle,
   MinusCircle,
   Send,
@@ -61,6 +62,7 @@ const STATUS_META: Record<OrderStatus, StatusMeta> = {
   filled: { tone: 'profit', icon: CheckCircle2 },
   cancelled: { tone: 'muted', icon: MinusCircle },
   rejected_by_vendor: { tone: 'loss', icon: AlertCircle },
+  handed_off: { tone: 'muted', icon: CornerUpRight },
   failed: { tone: 'loss', icon: AlertCircle },
   unknown: { tone: 'muted', icon: HelpCircle },
 };

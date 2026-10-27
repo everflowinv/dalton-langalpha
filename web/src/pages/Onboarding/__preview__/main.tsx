@@ -1,5 +1,5 @@
 /* eslint-disable react-refresh/only-export-components -- entry file, not a module */
-import { StrictMode, useEffect, useState } from 'react';
+import { StrictMode, Suspense, useEffect, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import i18n, { initI18n } from '@/i18n';
 import { switchLocale } from '@/lib/locale';
@@ -7,16 +7,25 @@ import '@/index.css';
 import { ANNOUNCEMENTS, PAGE_INTROS } from '@/pages/Onboarding/registry';
 import { PageIntroModal } from '@/pages/Onboarding/engine/PageIntroModal';
 import { WhatsNewModal } from '@/pages/Onboarding/engine/WhatsNewModal';
+import { INTRO_VISUALS, loadIntroScenes } from '@/pages/Onboarding/engine/introScenes';
+import { GuidePreview } from './guide';
+import { ScenePreview } from './scenes';
 
 /**
- * Dev-only harness rendering the REAL PageIntroModal and WhatsNewModal for
- * design iteration. Open /intro-preview.html on the dev server. Not bundled
+ * Dev-only harness rendering the REAL PageIntroModal, WhatsNewModal and the
+ * sidebar's getting-started entry for design iteration. Open /intro-preview.html on the dev server. Not bundled
  * in production (vite builds index.html only) and not mounted anywhere in
  * the app.
  *
  * Note: the dialogs are modal, so clicking the toolbar counts as an
  * outside-click and re-mounts the modal at step 1 — which conveniently
  * replays the entrance animations after every control change.
+ *
+ * URL parameters, for screenshots without clicking: `theme`, `locale` and
+ * `surface` (intro, whatsNew, guide; `rail` for the guide's rail) set the
+ * starting toggles; `scene=<visual id>` shows that one scene alone, live,
+ * or with `frames=0,800,1600` (or `frames=8` for that many evenly spaced) as
+ * a contact sheet of frozen frames.
  */
 
 // Synthetic newer release (copy reused from the real entry) so the modal's
@@ -29,6 +38,14 @@ const SECOND_RELEASE = ANNOUNCEMENTS.map((a) => ({
 
 const THEMES = ['light', 'dark'] as const;
 const LOCALES = ['en-US', 'zh-CN'] as const;
+
+const params = new URLSearchParams(window.location.search);
+const initialTheme = THEMES.find((t) => t === params.get('theme')) ?? 'light';
+const initialLocale = LOCALES.find((l) => l === params.get('locale')) ?? 'en-US';
+const SURFACES = ['intro', 'whatsNew', 'guide'] as const;
+const initialSurface = SURFACES.find((v) => v === params.get('surface')) ?? 'intro';
+const sceneParam = params.get('scene');
+const scene = INTRO_VISUALS.find((v) => v === sceneParam) ?? null;
 
 function Btn({
   on,
@@ -46,6 +63,7 @@ function Btn({
       style={{
         font: 'inherit',
         fontSize: '0.75rem',
+        whiteSpace: 'nowrap',
         cursor: 'pointer',
         padding: '5px 12px',
         borderRadius: 999,
@@ -60,11 +78,14 @@ function Btn({
 }
 
 function Preview() {
-  const [surface, setSurface] = useState<'intro' | 'whatsNew'>('intro');
+  const [surface, setSurface] = useState<(typeof SURFACES)[number]>(initialSurface);
+  const [guideVariant, setGuideVariant] = useState<'row' | 'rail'>(
+    params.has('rail') ? 'rail' : 'row'
+  );
   const [twoReleases, setTwoReleases] = useState(false);
   const [introId, setIntroId] = useState(PAGE_INTROS[0].id);
-  const [theme, setTheme] = useState<(typeof THEMES)[number]>('light');
-  const [locale, setLocale] = useState<(typeof LOCALES)[number]>('en-US');
+  const [theme, setTheme] = useState<(typeof THEMES)[number]>(initialTheme);
+  const [locale, setLocale] = useState<(typeof LOCALES)[number]>(initialLocale);
   const [run, setRun] = useState(0); // bump = remount modal at step 1
 
   useEffect(() => {
@@ -76,6 +97,8 @@ function Preview() {
   }, [locale]);
 
   const intro = PAGE_INTROS.find((i) => i.id === introId) ?? PAGE_INTROS[0];
+
+  if (scene) return <ScenePreview key={locale} visual={scene} frames={params.get('frames')} />;
 
   return (
     <>
@@ -120,6 +143,17 @@ function Preview() {
             +2nd release
           </Btn>
         )}
+        <Btn on={surface === 'guide'} onClick={() => setSurface('guide')}>
+          guide
+        </Btn>
+        {surface === 'guide' && (
+          <Btn
+            on={guideVariant === 'rail'}
+            onClick={() => setGuideVariant((v) => (v === 'row' ? 'rail' : 'row'))}
+          >
+            rail
+          </Btn>
+        )}
         <span style={{ width: 1, height: 18, background: 'var(--color-border-default)' }} />
         {THEMES.map((t) => (
           <Btn key={t} on={t === theme} onClick={() => setTheme(t)}>
@@ -133,12 +167,19 @@ function Preview() {
           </Btn>
         ))}
       </div>
-      {surface === 'intro' ? (
-        <PageIntroModal
-          key={`${intro.id}-${locale}-${run}`}
-          intro={intro}
-          onClose={() => setRun((n) => n + 1)}
-        />
+      {surface === 'guide' ? (
+        <GuidePreview key={`${guideVariant}-${locale}-${run}`} variant={guideVariant} done={2} />
+      ) : surface === 'intro' ? (
+        // The modal still suspends for a tick on each intro and language: the
+        // loads below are done, but `use` meets each promise for the first time.
+        <Suspense fallback={null}>
+          <PageIntroModal
+            key={`${intro.id}-${locale}-${run}`}
+            intro={intro}
+            onClose={() => setRun((n) => n + 1)}
+            onAbandon={() => console.warn(`[preview] no ${locale} copy for the ${intro.id} intro`)}
+          />
+        </Suspense>
       ) : (
         <WhatsNewModal
           key={`wn-${locale}-${twoReleases}-${run}`}
@@ -150,7 +191,11 @@ function Preview() {
   );
 }
 
-void initI18n().then(() =>
+// Every scene and the intro copy up front, so nothing here waits on a download.
+void Promise.all([
+  initI18n().then(() => i18n.loadNamespaces('intros')),
+  loadIntroScenes(INTRO_VISUALS),
+]).then(() =>
   createRoot(document.getElementById('root')!).render(
     <StrictMode>
       <Preview />

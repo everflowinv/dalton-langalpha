@@ -89,16 +89,6 @@ class LeakDetectionMiddleware(AgentMiddleware):
                 if len(value) >= 8:
                     secrets[f"{server.name}:{key}"] = value
 
-        # Also check for GITHUB_TOKEN (injected separately by _build_sandbox_env_vars).
-        # Use get_nested_config to match sandbox.py's resolution logic.
-        from src.config.settings import get_nested_config
-
-        if get_nested_config("github.enabled", False):
-            token_env = get_nested_config("github.token_env", "GITHUB_BOT_TOKEN")
-            gh_token = os.environ.get(token_env)
-            if gh_token and len(gh_token) >= 8:
-                secrets["GITHUB_TOKEN"] = gh_token
-
         # Merge the owner's vault secrets (user-provided API keys, one vault
         # for all of their workspaces). Same >=8 threshold as MCP secrets to
         # avoid false-positive redaction.

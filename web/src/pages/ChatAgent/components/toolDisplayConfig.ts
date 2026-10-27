@@ -122,21 +122,30 @@ const FILE_READ_TOOLS = new Set(['Read']);
 const FILE_PATH_TOOLS = new Set([...FILE_WRITE_TOOLS, ...FILE_READ_TOOLS]);
 
 /** Classifies the file_path arg for Read/Write/Edit. Returns null for all other tools. */
-function classifyFromArgs(toolName: string, args: ToolCallArgs | undefined): AgentPathInfo | null {
+function classifyFromArgs(toolName: string, args: ToolCallArgs | undefined, root?: string | null): AgentPathInfo | null {
   if (!args) return null;
   if (!FILE_PATH_TOOLS.has(toolName)) return null;
   const fp = (args.file_path || args.filePath) as string | undefined;
   if (!fp) return null;
-  return classifyAgentPath(fp);
+  return classifyAgentPath(fp, root);
+}
+
+/**
+ * What a title reads beyond the call's own args: the result's artifact, which
+ * carries a direct tool's vendor names, and the computer root its paths start with.
+ */
+export interface ToolTitleContext {
+  artifact?: unknown;
+  root?: string | null;
 }
 
 export function getDisplayName(
   rawToolName: string,
   t?: TFn,
   args?: ToolCallArgs,
-  artifact?: unknown,
+  { artifact, root }: ToolTitleContext = {},
 ): string {
-  const info = classifyFromArgs(rawToolName, args);
+  const info = classifyFromArgs(rawToolName, args, root);
   if (info) {
     if (info.kind === 'skill') {
       return t ? t('toolArtifact.tool.skill') : 'Skill';
@@ -174,8 +183,8 @@ export function isTaskTool(toolName: string | undefined): boolean {
   return toolName === 'Task' || toolName === 'task';
 }
 
-export function getToolIcon(rawToolName: string, args?: ToolCallArgs): LucideIcon {
-  const info = classifyFromArgs(rawToolName, args);
+export function getToolIcon(rawToolName: string, args?: ToolCallArgs, root?: string | null): LucideIcon {
+  const info = classifyFromArgs(rawToolName, args, root);
   if (info) {
     if (info.kind === 'skill') return Sparkles;
     if (info.kind === 'memory') return BookMarked;
@@ -193,13 +202,13 @@ export function getToolIcon(rawToolName: string, args?: ToolCallArgs): LucideIco
   return TOOL_DISPLAY_CONFIG[rawToolName]?.icon || Wrench;
 }
 
-export function getInProgressText(rawToolName: string, toolCall: ToolCall | undefined, t?: TFn): string {
+export function getInProgressText(rawToolName: string, toolCall: ToolCall | undefined, t?: TFn, root?: string | null): string {
   const args = toolCall?.args;
   const tr = t ? (key: string, opts?: Record<string, unknown>) => t(`toolArtifact.inProgress.${key}`, opts) : null;
 
   // Path-aware variants for store-backed paths. These short-circuit the
   // generic Read/Write/Edit branches below.
-  const info = classifyFromArgs(rawToolName, args);
+  const info = classifyFromArgs(rawToolName, args, root);
   if (info) {
     if (info.kind === 'skill' && rawToolName === 'Read') {
       return info.name
@@ -412,12 +421,12 @@ export function getInProgressText(rawToolName: string, toolCall: ToolCall | unde
  * doesn't need localization today, but the param keeps call sites symmetric
  * and reserves space for future translated variants.
  */
-export function getCompletedSummary(toolName: string, toolCall: ToolCall | undefined, _t?: TFn): string | null {
+export function getCompletedSummary(toolName: string, toolCall: ToolCall | undefined, _t?: TFn, root?: string | null): string | null {
   const args = toolCall?.args;
   if (!args) return null;
   // Path-aware summaries: emit just the meaningful object (skill name, topic,
   // memo slug). The verb is carried by getDisplayName / row label.
-  const info = classifyFromArgs(toolName, args);
+  const info = classifyFromArgs(toolName, args, root);
   if (info) {
     if (info.kind === 'skill') return info.name || null;
     if (info.kind === 'memory') {
@@ -474,15 +483,15 @@ export function getCompletedSummary(toolName: string, toolCall: ToolCall | undef
  * noun; for generic tools we fall back to the historic
  * `${displayName} ${progressText}` concat.
  */
-export function getActiveLabel(toolName: string, toolCall: ToolCall | undefined, t?: TFn): string {
+export function getActiveLabel(toolName: string, toolCall: ToolCall | undefined, t?: TFn, root?: string | null): string {
   const args = toolCall?.args;
-  const info = classifyFromArgs(toolName, args);
+  const info = classifyFromArgs(toolName, args, root);
   if (info && info.kind !== 'file') {
     // getInProgressText already produces the full phrase for path-aware paths.
-    return getInProgressText(toolName, toolCall, t);
+    return getInProgressText(toolName, toolCall, t, root);
   }
-  const dn = getDisplayName(toolName, t, args);
-  const pt = getInProgressText(toolName, toolCall, t);
+  const dn = getDisplayName(toolName, t, args, { root });
+  const pt = getInProgressText(toolName, toolCall, t, root);
   return pt ? `${dn} ${pt}` : dn;
 }
 
@@ -499,10 +508,10 @@ export function getCompletedRowTitle(
   toolName: string,
   toolCall: ToolCall | undefined,
   t?: TFn,
-  artifact?: unknown,
+  context: ToolTitleContext = {},
 ): string {
   const args = toolCall?.args;
-  const info = classifyFromArgs(toolName, args);
+  const info = classifyFromArgs(toolName, args, context.root);
   if (info) {
     if (info.kind === 'skill' && toolName === 'Read') {
       return t ? t('toolArtifact.completed.activatedSkill') : 'Activated skill';
@@ -542,7 +551,7 @@ export function getCompletedRowTitle(
       return t ? t(`toolArtifact.completed.updated_${entity}`) : `Updated ${entity}`;
     }
   }
-  return getDisplayName(toolName, t, args, artifact);
+  return getDisplayName(toolName, t, args, context);
 }
 
 /**
@@ -572,9 +581,9 @@ export type ToolCategory =
   | 'fileEdit'    // Write/Edit/Save on a non-store path
   | 'generic';    // anything else (TaskOutput, MCP tools without artifacts, ...)
 
-export function categorizeTool(toolName: string, toolCall: ToolCall | undefined): ToolCategory {
+export function categorizeTool(toolName: string, toolCall: ToolCall | undefined, root?: string | null): ToolCategory {
   const args = toolCall?.args;
-  const info = classifyFromArgs(toolName, args);
+  const info = classifyFromArgs(toolName, args, root);
   if (info) {
     if (info.kind === 'skill') return 'skill';
     if (info.kind === 'memory') {

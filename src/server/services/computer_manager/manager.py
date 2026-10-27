@@ -100,6 +100,7 @@ class ComputerManager(
         self._mcp_discovery_tasks: set[asyncio.Task] = set()
 
         self._cleanup_task: Optional[asyncio.Task] = None
+        self._left_folders_task: Optional[asyncio.Task] = None
         self._shutdown = False
 
         logger.info(
@@ -138,13 +139,15 @@ class ComputerManager(
 
         self._shutdown = True
 
-        if self._cleanup_task:
-            self._cleanup_task.cancel()
+        loops = [t for t in (self._cleanup_task, self._left_folders_task) if t]
+        for task in loops:
+            task.cancel()
+        for task in loops:
             try:
-                await self._cleanup_task
+                await task
             except asyncio.CancelledError:
                 pass
-            self._cleanup_task = None
+        self._cleanup_task = self._left_folders_task = None
 
         for task in list(self._mcp_discovery_tasks):
             task.cancel()

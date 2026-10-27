@@ -46,6 +46,7 @@ from ptc_agent.agent.middleware.compaction.types import OffloadSettings
 from ptc_agent.agent.middleware.compaction.window import window_cut
 from ptc_agent.agent.middleware.subagent_switch import subagents_window_carry
 from ptc_agent.agent.transcript import Window
+from ptc_agent.core.sandbox.livefs_mount import TranscriptReach
 from scripts.ops import thin_message_snapshots as thinning
 from scripts.ops._delta_loads import Mode
 from tests.unit.middleware.compaction import window_harness as h
@@ -149,7 +150,10 @@ def _backend() -> Any:
         return mount
 
     return SimpleNamespace(
-        livefs=mount, settled_livefs=settled_livefs, normalize_path=lambda path: path
+        livefs=mount,
+        transcripts=TranscriptReach(home=mount, shell=True),
+        settled_livefs=settled_livefs,
+        normalize_path=lambda path: path,
     )
 
 

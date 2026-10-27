@@ -2017,6 +2017,26 @@ class TestSsrfPosture:
         finally:
             await close_relay_client()
 
+    @pytest.mark.asyncio
+    async def test_a_connection_the_vendor_closed_while_idle_is_never_reused(self):
+        # The long expiry above outlives some vendors' own idle timeout, and
+        # httpcore notices a server-side close on an idle connection only over
+        # HTTP/1.1. Over HTTP/2 the next call went out on the dead connection
+        # and failed in a millisecond, which is what IBKR's edge did to roughly
+        # one relayed call in twelve.
+        from src.server.services.egress.relay import close_relay_client, get_relay_client
+
+        client = get_relay_client()
+        try:
+            pool = client._transport._pool
+            assert pool._http1 is True
+            assert pool._http2 is False
+            # One connection per call in flight, so a keep-alive cap below the
+            # limit closes, rather than keeps, each one past it as it idles.
+            assert pool._max_keepalive_connections == pool._max_connections
+        finally:
+            await close_relay_client()
+
 
 # ---------------------------------------------------------------------------
 # Header-authenticated grants: the second kind, whose credential is the

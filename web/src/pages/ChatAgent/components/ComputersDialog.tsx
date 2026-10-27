@@ -11,7 +11,7 @@
  * its place rather than piling on top: while one is open this panel steps
  * back, and the page stays dimmed exactly as much as with this panel alone.
  */
-import { useEffect, useId, useRef, useState } from 'react';
+import { Fragment, Suspense, useEffect, useId, useRef, useState, type ReactNode } from 'react';
 import { useTranslation } from 'react-i18next';
 import { AnimatePresence } from '@/lib/framer';
 import { ChevronDown, Cpu, Pencil, Play, Plus, Square, Star, Trash2 } from 'lucide-react';
@@ -24,8 +24,9 @@ import { ToggleSwitch } from '@/components/ui/switch';
 import { useHomeWorkspaceId } from '@/hooks/useHomeWorkspace';
 import { useLocale } from '@/hooks/useLocale';
 import { formatBytes } from '@/lib/format';
+import { lazyWithMotion } from '@/lib/lazyWithMotion';
 import { cn } from '@/lib/utils';
-import type { Computer, ComputerCreate } from '@/types/api';
+import type { Computer, ComputerCreate, ComputerSsh } from '@/types/api';
 
 import { useComputerProviders, useComputerStorage, useComputers } from '../hooks/useComputers';
 import { openComputerSpec } from '../hooks/computerPanelStore';
@@ -37,15 +38,30 @@ import { isComputerPreparing, isComputerStatusTransitional, prepareStepLabel, ta
 import { tierLabel } from './tierUi';
 import { DiskBar, diskLevelColor, diskUsageLabel } from './computerDiskUi';
 import { activeSpecChange, effectiveTier, specChangeLabel, SpecChangeProgress } from './specChangeUi';
-import CreateComputerDialog, { COMPUTER_NAME_MAX } from './CreateComputerDialog';
+import { COMPUTER_NAME_MAX } from './computerName';
+import FilesBackupOffDialog from './FilesBackupOffDialog';
 import RemoveComputerDialog from './RemoveComputerDialog';
 import MakePrimaryDialog, { MakePrimaryButton } from './MakePrimaryDialog';
-import { providerLabel, rowsShowProvider } from './providerUi';
+import {
+  providerCanBePrimary,
+  providerHoldsOurKey,
+  providerKeepsFilesOnRemove,
+  providerLabel,
+  providerManagesSpec,
+  rowsShowProvider,
+} from './providerUi';
+import { formatSshReached } from './sshTarget';
 import { apiErrorObject, apiErrorReason, apiErrorStatus } from '../utils/api';
 import { denialMessage } from '../utils/denialMessage';
 import { entitlementErrorMessage } from '../utils/entitlementErrors';
+import { sshLimitMessage } from '../utils/sshLimit';
 
 type Translate = ReturnType<typeof useTranslation>['t'];
+
+// Off the chat page's first load, since it carries the SSH setup. Preloadable,
+// so the panel fetches it as it opens and New computer renders at once rather
+// than suspending on its first open.
+const CreateComputerDialog = lazyWithMotion(() => import('./CreateComputerDialog'));
 
 interface ComputersDialogProps {
   open: boolean;
@@ -73,6 +89,7 @@ function ComputersDialog({
   const [createdId, setCreatedId] = useState<string | null>(null);
   const [removeTargetId, setRemoveTargetId] = useState<string | null>(null);
   const [primaryTargetId, setPrimaryTargetId] = useState<string | null>(null);
+  const [backupOffTargetId, setBackupOffTargetId] = useState<string | null>(null);
 
   const { data, isLoading } = useComputers({ enabled: open });
   const computers = data?.computers ?? [];
@@ -80,9 +97,10 @@ function ComputersDialog({
   // this dialog) closes its confirmation rather than leaving a stale copy.
   const removeTarget = removeTargetId ? computers.find((c) => c.computer_id === removeTargetId) ?? null : null;
   const primaryTarget = primaryTargetId ? computers.find((c) => c.computer_id === primaryTargetId) ?? null : null;
+  const backupOffTarget = backupOffTargetId ? computers.find((c) => c.computer_id === backupOffTargetId) ?? null : null;
   const { data: providerData } = useComputerProviders({ enabled: open });
   const showProvider = rowsShowProvider(providerData?.providers, computers);
-  const { power, renameComputerTo, turnOffAlwaysOn, create, remove, makePrimary } = useComputerActions();
+  const { power, renameComputerTo, turnOffAlwaysOn, setFilesBackup, create, remove, makePrimary } = useComputerActions();
   // Home moves with the primary, so a make-primary that has to move it runs
   // as Home's move: read here so it shows on its row, after a reopen too.
   const homeId = useHomeWorkspaceId() ?? makePrimary.data?.move?.workspace_id;
@@ -91,10 +109,15 @@ function ComputersDialog({
   // A refused start relays the quota service's own sentence (denialMessage).
   const error = power.error ? denialMessage(power.error, t) : null;
   const createError = create.error
-    ? entitlementErrorMessage(create.error, t, create.variables?.resource_tier)
+    ? (sshLimitMessage(create.error, t) ?? entitlementErrorMessage(create.error, t, create.variables?.resource_tier))
     : null;
   const removeError = remove.error ? removeErrorMessage(remove.error, t) : null;
   const focusId = createdId ?? focusComputerId;
+
+  // A failed preload is not kept: opening the dialog imports it again.
+  useEffect(() => {
+    if (open) void CreateComputerDialog.preload().catch(() => {});
+  }, [open]);
 
   const closeAndReset = () => {
     power.reset();
@@ -105,6 +128,7 @@ function ComputersDialog({
     setCreatedId(null);
     setRemoveTargetId(null);
     setPrimaryTargetId(null);
+    setBackupOffTargetId(null);
     onOpenChange(false);
   };
 
@@ -127,12 +151,24 @@ function ComputersDialog({
     setRemoveTargetId(computerId);
   };
 
-  const confirmRemove = () => {
+  const confirmRemove = (removeKey: boolean) => {
     if (!removeTarget || remove.isPending) return;
     remove.mutate(
-      { computerId: removeTarget.computer_id, name: removeTarget.name },
+      { computerId: removeTarget.computer_id, name: removeTarget.name, removeKey },
       { onSuccess: () => setRemoveTargetId(null) },
     );
+  };
+
+  // On is safe to take at once; off asks first, since a folder lost after it
+  // could only come back as it was then.
+  const changeFilesBackup = (computerId: string, enabled: boolean) => {
+    if (enabled) setFilesBackup.mutate({ computerId, enabled });
+    else setBackupOffTargetId(computerId);
+  };
+
+  const confirmFilesBackupOff = () => {
+    if (backupOffTarget) setFilesBackup.mutate({ computerId: backupOffTarget.computer_id, enabled: false });
+    setBackupOffTargetId(null);
   };
 
   const confirmMakePrimary = () => {
@@ -154,7 +190,7 @@ function ComputersDialog({
             onClose={closeAndReset}
             width="standard"
             density="form"
-            covered={covered || createOpen || !!removeTarget || !!primaryTarget}
+            covered={covered || createOpen || !!removeTarget || !!primaryTarget || !!backupOffTarget}
             footer={
               <Button variant="ghost" size="sm" className="gap-1.5" onClick={openCreate}>
                 <Plus className="h-3.5 w-3.5" />
@@ -191,6 +227,8 @@ function ComputersDialog({
                     onTurnOffAlwaysOn={() => {
                       if (!turnOffAlwaysOn.isPending) turnOffAlwaysOn.mutate({ computerId: computer.computer_id });
                     }}
+                    filesBackupBusy={setFilesBackup.isPending && setFilesBackup.variables?.computerId === computer.computer_id}
+                    onFilesBackupChange={(enabled) => changeFilesBackup(computer.computer_id, enabled)}
                     onRemove={() => openRemove(computer.computer_id)}
                     movingHome={homeMoving?.target_computer_id === computer.computer_id}
                     // One move at a time per user, and Home's is the one this
@@ -215,22 +253,35 @@ function ComputersDialog({
       </AnimatePresence>
       <AnimatePresence>
         {open && createOpen && (
-          <CreateComputerDialog
-            onClose={() => { if (!create.isPending) setCreateOpen(false); }}
-            onSubmit={submitCreate}
-            busy={create.isPending}
-            error={createError}
-          />
+          <Suspense fallback={null}>
+            <CreateComputerDialog
+              onClose={() => { if (!create.isPending) setCreateOpen(false); }}
+              onSubmit={submitCreate}
+              busy={create.isPending}
+              error={createError}
+            />
+          </Suspense>
         )}
       </AnimatePresence>
       <AnimatePresence>
         {open && removeTarget && (
           <RemoveComputerDialog
             name={removeTarget.name}
+            filesKeptIn={providerKeepsFilesOnRemove(removeTarget.kind) ? removeTarget.root_dir : null}
+            holdsOurKey={providerHoldsOurKey(removeTarget.kind)}
             onClose={() => { if (!remove.isPending) setRemoveTargetId(null); }}
             onConfirm={confirmRemove}
             busy={remove.isPending}
             error={removeError}
+          />
+        )}
+      </AnimatePresence>
+      <AnimatePresence>
+        {open && backupOffTarget && (
+          <FilesBackupOffDialog
+            name={backupOffTarget.name}
+            onClose={() => setBackupOffTargetId(null)}
+            onConfirm={confirmFilesBackupOff}
           />
         )}
       </AnimatePresence>
@@ -262,6 +313,9 @@ interface ComputerRowProps {
   onRename: (name: string) => void;
   onChangeSpec: () => void;
   onTurnOffAlwaysOn: () => void;
+  /** The file backup switch is being changed. */
+  filesBackupBusy: boolean;
+  onFilesBackupChange: (enabled: boolean) => void;
   onRemove: () => void;
   /** Home is moving here because this computer is being made primary. */
   movingHome: boolean;
@@ -280,6 +334,8 @@ function ComputerRow({
   onRename,
   onChangeSpec,
   onTurnOffAlwaysOn,
+  filesBackupBusy,
+  onFilesBackupChange,
   onRemove,
   movingHome,
   makePrimaryHeld,
@@ -296,9 +352,10 @@ function ComputerRow({
   const isTransitional = isComputerStatusTransitional(computer.status);
   const preparing = isComputerPreparing(computer);
   const prepareStage = usePrepareStage(computer.computer_id);
-  const tier = effectiveTier(computer);
   const disk = computer.disk ?? null;
   const specChange = activeSpecChange(computer);
+  const managesSpec = providerManagesSpec(computer.kind);
+  const facts = rowFacts(t, computer, showProvider, managesSpec);
   // The primary is kept, so it offers no Remove at all. Every other computer
   // offers it, held while the server would refuse, with the reason under it.
   const removeHeld = computer.is_primary ? null : removeBlock(computer, busy);
@@ -336,20 +393,12 @@ function ComputerRow({
               preparing={preparing}
               detail={preparing ? prepareStepLabel(t, prepareStage) : null}
             />
-            {showProvider && (
-              <>
+            {facts.map(({ key, node }) => (
+              <Fragment key={key}>
                 <span aria-hidden="true">·</span>
-                <span>{providerLabel(computer.kind)}</span>
-              </>
-            )}
-            <span aria-hidden="true">·</span>
-            <span>{tierLabel(t, tier)}</span>
-            {typeof computer.workspace_count === 'number' && (
-              <>
-                <span aria-hidden="true">·</span>
-                <span>{t('computer.workspaceCount', { count: computer.workspace_count })}</span>
-              </>
-            )}
+                {node}
+              </Fragment>
+            ))}
           </div>
           {preparing && (
             <p id={prepareHintId} className="text-xs mt-1" style={{ color: 'var(--color-text-tertiary)' }}>
@@ -405,7 +454,7 @@ function ComputerRow({
       <div className="flex flex-col gap-0.5">
         <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1">
           {/* Always-on is no longer offered, so the switch is only there to turn it off. */}
-          {computer.is_always_on && (
+          {managesSpec && computer.is_always_on && (
             <label className="flex items-center gap-2 text-sm" style={{ color: 'var(--color-text-secondary)' }}>
               <ToggleSwitch
                 checked
@@ -418,9 +467,21 @@ function ComputerRow({
               <span>{t('computer.alwaysOn', 'Always-on')}</span>
             </label>
           )}
+          {/* Only a machine the user brings offers the choice: a hosted one always backs up. */}
+          {computer.kind === 'ssh' && (
+            <label className="flex items-center gap-2 text-sm" style={{ color: 'var(--color-text-secondary)' }}>
+              <ToggleSwitch
+                checked={computer.files_backup !== false}
+                onChange={() => onFilesBackupChange(computer.files_backup === false)}
+                disabled={filesBackupBusy || computer.status === 'deleted'}
+                ariaLabel={t('computer.filesBackup.label', 'Back up files')}
+              />
+              <span>{t('computer.filesBackup.label', 'Back up files')}</span>
+            </label>
+          )}
           {/* Wraps under the switch on a phone, still at the row's end. */}
           <div className="ml-auto flex flex-wrap items-center justify-end gap-1">
-            {specChange ? (
+            {!managesSpec ? null : specChange ? (
               // Opens the same dialog, which shows the change's progress, not a picker.
               <button
                 type="button"
@@ -436,7 +497,7 @@ function ComputerRow({
                 {t('workspace.changeSpec', 'Change spec')}
               </Button>
             )}
-            {!computer.is_primary && (
+            {!computer.is_primary && providerCanBePrimary(computer.kind) && (
               <MakePrimaryButton
                 movingHome={movingHome}
                 disabled={makePrimaryHeld || !!specChange || !takesWorkspaces(computer)}
@@ -467,6 +528,41 @@ function ComputerRow({
       </div>
     </div>
   );
+}
+
+interface RowFact {
+  key: string;
+  node: ReactNode;
+}
+
+/**
+ * What a row says after its status, each fact set off by a dot. A machine the
+ * deployment sizes is told apart by its tier; one the user brings has none,
+ * and is told apart by where it is reached instead.
+ */
+function rowFacts(t: Translate, computer: Computer, showProvider: boolean, managesSpec: boolean): RowFact[] {
+  const facts: RowFact[] = [];
+  if (showProvider) facts.push({ key: 'provider', node: <span>{providerLabel(computer.kind, t)}</span> });
+  if (managesSpec) facts.push({ key: 'tier', node: <span>{tierLabel(t, effectiveTier(computer))}</span> });
+  else if (computer.ssh) facts.push(...sshFacts(t, computer.ssh));
+  if (typeof computer.workspace_count === 'number') {
+    facts.push({ key: 'workspaces', node: <span>{t('computer.workspaceCount', { count: computer.workspace_count })}</span> });
+  }
+  return facts;
+}
+
+function sshFacts(t: Translate, ssh: ComputerSsh): RowFact[] {
+  const address = formatSshReached(ssh, ssh.tunnel);
+  const facts: RowFact[] = [
+    { key: 'address', node: <span className="min-w-0 truncate font-mono" title={address}>{address}</span> },
+  ];
+  if (ssh.tunnel) {
+    facts.push({ key: 'tunnel', node: <span>{t('computer.ssh.tunnelBadge', 'tunnel')}</span> });
+    if (ssh.tunnel_connected === false) {
+      facts.push({ key: 'offline', node: <span>{t('computer.ssh.tunnelOffline', 'tunnel offline')}</span> });
+    }
+  }
+  return facts;
 }
 
 /**

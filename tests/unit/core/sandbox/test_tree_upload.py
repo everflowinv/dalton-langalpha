@@ -118,6 +118,17 @@ class TestTheUpload:
         assert os.listdir(tmp_path / "_internal") == []
 
     @pytest.mark.asyncio
+    async def test_a_root_with_a_space_unpacks_and_cleans_up(self, tmp_path):
+        """A computer the user brings works in a folder they may have named."""
+        root = tmp_path / "my data"
+        sandbox = _sandbox(root)
+
+        await upload_tree(sandbox, [(b"x", f"{root}/s/a/SKILL.md")])
+
+        assert (root / "s" / "a" / "SKILL.md").read_text() == "x"
+        assert os.listdir(root / "_internal") == []
+
+    @pytest.mark.asyncio
     async def test_a_failed_unpack_raises(self, tmp_path):
         sandbox = _sandbox(tmp_path)
 

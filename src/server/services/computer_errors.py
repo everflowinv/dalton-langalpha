@@ -25,6 +25,7 @@ class Retirement(StrEnum):
     RETIRED = "retired"
     GONE = "gone"
     PRIMARY = "primary"
+    OWNERS_MACHINE = "owners_machine"
     HAS_WORKSPACES = "has_workspaces"
     BUSY = "busy"
     DEFERRED = "deferred"
@@ -48,6 +49,10 @@ class ComputerBusyError(RuntimeError):
 
 class DiskTooSmallError(RuntimeError):
     """The machine's backed-up files would not fit the smaller disk a downgrade asks for."""
+
+
+class SpecNotChangeable(RuntimeError):
+    """The machine's size is its owner's to set, so no tier change applies to it."""
 
 
 class SpecChangeLostError(RuntimeError):

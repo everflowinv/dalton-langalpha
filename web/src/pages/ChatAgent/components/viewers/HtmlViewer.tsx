@@ -1,17 +1,14 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 import { AlertCircle } from 'lucide-react';
-import { useTheme } from '@/contexts/ThemeContext';
 import { Button } from '@/components/ui/button';
 import { Loader } from '@/components/ui/loader';
-import SyntaxHighlighter, { oneDark, oneLight } from '../SyntaxHighlighter';
+import { useTheme } from '@/contexts/ThemeContext';
+import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
+import { oneDark, oneLight } from 'react-syntax-highlighter/dist/esm/styles/prism';
 import { useHtmlSandbox } from './html/useHtmlSandbox';
-import { useHtmlActions } from './html/useHtmlActions';
 import { useServedHtml } from './html/useServedHtml';
 import { SERVED_HTML_SANDBOX } from './html/sandbox';
-import HtmlActionBar from './html/HtmlActionBar';
-import HtmlFullscreenModal from './html/HtmlFullscreenModal';
-import './HtmlViewer.css';
 
 interface HtmlViewerProps {
   /** Full source (read unlimited so Source isn't truncated). */
@@ -20,10 +17,8 @@ interface HtmlViewerProps {
   workspaceId: string;
   /** Path within the workspace, e.g. "results/report.html". */
   filePath: string;
-  /** Download the server's original bytes for this file. */
-  /** Omitted where the viewer may not save the bytes, which drops the save
-   *  affordances in the fullscreen toolbar along with it. */
-  onTriggerDownload?: () => void;
+  /** The markup rather than the rendered page; the switch is in the panel header. */
+  source?: boolean;
   /** The serve prefix a share's page was handed. Omitted, the owner's grant
    *  serves the file. */
   servePrefix?: string;
@@ -42,7 +37,7 @@ export default function HtmlViewer({
   fileName,
   workspaceId,
   filePath,
-  onTriggerDownload,
+  source = false,
   servePrefix,
   anchor = null,
   anchorSeq = null,
@@ -50,21 +45,7 @@ export default function HtmlViewer({
 }: HtmlViewerProps) {
   const { t } = useTranslation();
   const { theme } = useTheme();
-  const [mode, setMode] = useState<'preview' | 'source'>('preview');
-  const [fullscreen, setFullscreen] = useState(false);
-
-  // An anchored open asks for a place in the rendered document, and Source
-  // cannot show one: the tab survives both the file and the anchor changing, so
-  // a reference clicked while reading markup left the reader on the same markup
-  // with nothing to tell them the click had landed. The request is the seq, not
-  // the anchor's text, so asking for one section twice is two requests, while
-  // switching to Source with a request still in effect is left alone.
   const request = anchor ? `${anchorSeq ?? ''}\u0000${anchor}` : null;
-  const [handled, setHandled] = useState(request);
-  if (request !== handled) {
-    setHandled(request);
-    if (request) setMode('preview');
-  }
   const iframeRef = useRef<HTMLIFrameElement>(null);
 
   const { pushTheme, scrollToAnchor } = useHtmlSandbox({ iframeRef, autoHeight: false });
@@ -76,18 +57,10 @@ export default function HtmlViewer({
     if (anchor) scrollToAnchor(anchor);
   }, [request, anchor, scrollToAnchor]);
 
-  // DALTON-HOOK(team-sharing): skip owner-only grant in colleague mirror mode and use mirror srcDoc preview
+  // DALTON-HOOK(team-sharing): skip owner-only grant in colleague mirror mode; the mirror srcDoc below serves the page
   const isReadOnlyMirror = teamReadOnly && !servePrefix;
   const served = useServedHtml(workspaceId, filePath, servePrefix, { teamReadOnly });
   const servedUrl = served.themedUrl;
-
-  const actions = useHtmlActions({
-    mode: 'file',
-    filePath,
-    triggerDownload: onTriggerDownload && (() => Promise.resolve(onTriggerDownload())),
-    servedUrl: served.plainUrl,
-    openUrl: served.openUrl,
-  });
 
   const isLight = theme === 'light';
 
@@ -142,30 +115,7 @@ export default function HtmlViewer({
 
   return (
     <div className="html-viewer">
-      <div className="html-viewer-toolbar">
-        <div className="html-viewer-tabs">
-          <button
-            className={`html-viewer-tab ${mode === 'preview' ? 'active' : ''}`}
-            onClick={() => setMode('preview')}
-          >
-            {t('filePanel.htmlPreview')}
-          </button>
-          <button
-            className={`html-viewer-tab ${mode === 'source' ? 'active' : ''}`}
-            onClick={() => setMode('source')}
-          >
-            {t('filePanel.htmlSource')}
-          </button>
-        </div>
-        {/* Download/Save-as-PDF and the share link live in the file panel header. */}
-        {/* DALTON-HOOK(team-sharing): a teammate's HTML previews from the mirror in a sandboxed iframe */}
-        <HtmlActionBar
-          onFullscreen={() => setFullscreen(true)}
-          fullscreenDisabled={!servedUrl && !isReadOnlyMirror}
-          onOpenInNewTab={actions.openInNewTab}
-        />
-      </div>
-      {mode === 'preview' ? renderPreview() : (
+      {source ? (
         <div className="html-viewer-source">
           <SyntaxHighlighter
             language="markup"
@@ -177,30 +127,7 @@ export default function HtmlViewer({
             {content}
           </SyntaxHighlighter>
         </div>
-      )}
-      {fullscreen && (servedUrl || isReadOnlyMirror) && (
-        servedUrl ? (
-          <HtmlFullscreenModal
-            variant="file"
-            open={fullscreen}
-            onOpenChange={setFullscreen}
-            title={fileName}
-            servedUrl={servedUrl}
-            actions={actions}
-            canDownload={!!onTriggerDownload}
-          />
-        ) : (
-          <HtmlFullscreenModal
-            variant="widget"
-            open={fullscreen}
-            onOpenChange={setFullscreen}
-            title={fileName}
-            srcDoc={content}
-            actions={actions}
-            canDownload={!!onTriggerDownload}
-          />
-        )
-      )}
+      ) : renderPreview()}
     </div>
   );
 }

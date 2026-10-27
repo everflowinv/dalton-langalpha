@@ -53,6 +53,7 @@ from ptc_agent.agent.middleware.subagent_switch import (
 )
 from ptc_agent.agent.transcript import TranscriptTarget, Window, build_directory, load_manifest
 from ptc_agent.agent.transcript.render import split_runs
+from ptc_agent.core.sandbox.livefs_mount import TranscriptReach
 
 THREAD = "abcd1234-5678-4000-8000-00000000c0de"
 WORKSPACE = "/home/workspace"
@@ -187,6 +188,7 @@ def _backend(store: TranscriptStore) -> Any:
 
     return SimpleNamespace(
         livefs=store,
+        transcripts=TranscriptReach(store, shell=True),
         settled_livefs=settled_livefs,
         aglob=aglob,
         normalize_path=lambda path: path,

@@ -19,7 +19,7 @@ from ptc_agent.agent.tools.bash_output import create_bash_output_tool
 
 
 def _make_backend(*, status: dict | None = None, stopped: bool = True) -> Any:
-    backend = SimpleNamespace(livefs=None)
+    backend = SimpleNamespace(livefs=None, provider="docker", channel="docker")
     backend.aget_background_command_status = AsyncMock(return_value=status or {})
     backend.astop_background_command = AsyncMock(return_value=stopped)
     return backend
@@ -118,3 +118,51 @@ class TestBashOutputMcpTraceArtifact:
         msg = await tool.ainvoke(_tool_call("cmd-1"))
         assert msg.artifact == {"mcp_trace": []}
         assert msg.content.startswith("ERROR")
+
+
+class TestBashOutputSandboxOutcome:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("action", "status", "stop", "outcome", "error_class"),
+        [
+            pytest.param(
+                "status",
+                AsyncMock(return_value={"is_running": False, "exit_code": 1, "stdout": ""}),
+                None,
+                "ok",
+                None,
+                id="nonzero-exit-is-the-agents",
+            ),
+            pytest.param(
+                "status",
+                AsyncMock(side_effect=ConnectionError("sandbox gone")),
+                None,
+                "error",
+                "ConnectionError",
+                id="status-read-failed",
+            ),
+            pytest.param(
+                "stop",
+                None,
+                AsyncMock(side_effect=ConnectionError("sandbox gone")),
+                "error",
+                "ConnectionError",
+                id="stop-failed",
+            ),
+        ],
+    )
+    async def test_only_the_sandbox_failing_marks_the_run(
+        self, traced_tool, action, status, stop, outcome, error_class
+    ):
+        """Every run names its provider, as Bash's do."""
+        backend = _make_backend()
+        backend.aget_background_command_status = status or backend.aget_background_command_status
+        backend.astop_background_command = stop or backend.astop_background_command
+
+        _, metadata = await traced_tool(
+            create_bash_output_tool(backend), _tool_call("cmd-1", action=action)
+        )
+
+        assert metadata["tool_outcome"] == outcome
+        assert metadata.get("error_class") == error_class
+        assert metadata["tool_provider"] == "docker"

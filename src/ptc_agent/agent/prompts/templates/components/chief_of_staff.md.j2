@@ -54,8 +54,8 @@ When the user asks about earlier work, a result, a file, or what a workspace fou
 {% if scratchpad_enabled | default(false) %}
 - `../<folder>/{{ workspace_paths.scratchpad }}/` holds that workspace's temporary files and the checkpoint notes of its threads: the analyst's working record, deleted when a thread is archived. Answer from `agent.md`, the files it points to and `agent_output`, and never link a file there.
 {% endif %}
-{% if files_mounted | default(false) %}
-- `../.agents/threads.jsonl` lists every conversation on this computer, each workspace's included, with its transcript; search them for what was said or decided.
+{% if files_mounted | default(false) or history_files | default(false) %}
+- `../.agents/threads.jsonl` lists every conversation on this computer, each workspace's included, with its transcript; search them for what was said or decided.{% if history_files | default(false) and not files_mounted | default(false) %} On this computer only Read, Grep and Glob reach them: Bash and code find no such files.{% endif %}
 {% endif %}
 - `manage_threads(action="list")` finds a thread, and `agent_output` returns what its agent wrote.
 - A workspace shown without a folder is on another computer, out of reach of your file tools and links: read its threads with `agent_output`, and hand what they do not answer to its analyst.

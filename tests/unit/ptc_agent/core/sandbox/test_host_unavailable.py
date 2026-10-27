@@ -28,6 +28,7 @@ from ptc_agent.config.core import (
 )
 from ptc_agent.core.sandbox.providers.daytona import DaytonaProvider
 from ptc_agent.core.sandbox.ptc_sandbox import PTCSandbox
+from ptc_agent.core.sandbox.retry import RetryPolicy
 from ptc_agent.core.sandbox.runtime import (
     HostUnavailablePolicy,
     RuntimeState,
@@ -360,3 +361,46 @@ async def test_a_transient_start_inside_a_reconnect_retries_the_start():
 
     assert runtime.start.await_count == 2
     assert sandbox.is_ready() is True
+
+
+@pytest.mark.asyncio
+async def test_a_sandbox_serving_again_after_its_outage_is_deleted_with_it():
+    """A host back from an outage answers the next call on a new connection,
+    with no reconnect to complete; kept, the removal left it running."""
+    failure = await _sdk_start_error(HOST_RECOVERING)
+    sandbox, runtime = _sandbox(failure)
+    with pytest.raises(SandboxHostUnavailableError):
+        await sandbox.reconnect(SANDBOX)
+
+    await sandbox._runtime_call(
+        AsyncMock(return_value="ok"), retry_policy=RetryPolicy.SAFE
+    )
+    await sandbox.cleanup()
+
+    runtime.delete.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_a_removal_deletes_a_sandbox_no_reconnect_completed_on():
+    failure = await _sdk_start_error(HOST_RECOVERING)
+    sandbox, runtime = _sandbox(failure)
+    with pytest.raises(SandboxHostUnavailableError):
+        await sandbox.reconnect(SANDBOX)
+
+    sandbox.release_for_removal()
+    await sandbox.cleanup()
+
+    runtime.delete.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_a_removal_still_keeps_a_sandbox_left_for_salvage():
+    failure = await _sdk_start_error(HOST_RECOVERING)
+    sandbox, runtime = _sandbox(failure, _policy(rebuild=True))
+    with pytest.raises(SandboxHostLostError):
+        await sandbox.reconnect(SANDBOX)
+
+    sandbox.release_for_removal()
+    await sandbox.cleanup()
+
+    runtime.delete.assert_not_awaited()

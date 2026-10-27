@@ -38,6 +38,23 @@ READ_TOO_LARGE = 5
 # provider's file download instead.
 EXEC_READ_MAX_BYTES = 64 * 1024 * 1024
 
+# ``realpath -m`` for a machine without it whose ``readlink -f`` needs every
+# component to exist (macOS), where a path not yet written would read as
+# unresolvable: links are followed wherever they lead, even dangling, as -m
+# does; the directory that exists is resolved by the OS (the external pwd,
+# which spells it as the disk does, so a case-insensitive disk cannot pass a
+# deny list in other case); the missing rest is appended. A link loop fails.
+_RESOLVE_SH = (
+    "__la_rp() { p=$1; tail=; n=0; case $p in /*) ;; *) return 1 ;; esac; "
+    "while :; do "
+    'if [ -L "$p" ]; then n=$((n + 1)); [ "$n" -le 40 ] || return 1; '
+    'l=$(readlink -- "$p") || return 1; case $l in /*) p=$l ;; *) p=${p%/*}/$l ;; esac; '
+    'elif [ -d "$p" ]; then d=$(cd -P -- "$p" && env pwd -P) || return 1; '
+    'r=${d%/}$tail; printf %s "${r:-/}"; return 0; '
+    "else s=${p##*/}; case $s in .|..) return 1 ;; '') p=${p%/} ;; "
+    "*) tail=/$s$tail; p=${p%/*}; [ -n \"$p\" ] || p=/ ;; esac; fi; done; }; "
+)
+
 
 class FileTooLargeToServe(Exception):
     """The file is contained but too large to read through an exec.
@@ -149,6 +166,7 @@ def _root_lines(roots: Sequence[str]) -> tuple[list[str], list[str]]:
             f"{var}in={shlex.quote(root)}; "
             f'{var}=$(realpath -m -- "${var}in" 2>/dev/null) '
             f'|| {var}=$(readlink -f -- "${var}in" 2>/dev/null) '
+            f'|| {var}=$(__la_rp "${var}in") '
             f"|| exit {PROBE_UNRESOLVABLE}; "
             f'[ -n "${var}" ] || exit {PROBE_UNRESOLVABLE}; '
         )
@@ -157,7 +175,7 @@ def _root_lines(roots: Sequence[str]) -> tuple[list[str], list[str]]:
 
 
 def probe_command(target: str, *, roots: Sequence[str]) -> str:
-    """realpath -m distinguishes a missing leaf from a symlink escape; readlink -f covers other images.
+    """realpath -m distinguishes a missing leaf from a symlink escape; readlink -f covers other images, __la_rp macOS.
 
     Repeat containment in the shell so it refuses escaped paths regardless of caller behavior.
     """
@@ -166,10 +184,12 @@ def probe_command(target: str, *, roots: Sequence[str]) -> str:
         return f"exit {PROBE_ESCAPED}"
     return "".join(
         [
+            _RESOLVE_SH,
             *setup,
             f"t={shlex.quote(target)}; ",
             'tt=$(realpath -m -- "$t" 2>/dev/null) ',
-            f'|| tt=$(readlink -f -- "$t" 2>/dev/null) || exit {PROBE_UNRESOLVABLE}; ',
+            f'|| tt=$(readlink -f -- "$t" 2>/dev/null) || tt=$(__la_rp "$t") '
+            f"|| exit {PROBE_UNRESOLVABLE}; ",
             f'[ -n "$tt" ] || exit {PROBE_UNRESOLVABLE}; ',
             f'case "$tt" in {"|".join(patterns)}) printf %s "$tt" ;; ',
             f"*) exit {PROBE_ESCAPED} ;; esac",
@@ -190,7 +210,8 @@ def contained_read_command(
         denied_setup.append(
             f"{var}in={shlex.quote(root)}; "
             f'{var}=$(realpath -m -- "${var}in" 2>/dev/null) '
-            f'|| {var}=$(readlink -f -- "${var}in" 2>/dev/null) || true; '
+            f'|| {var}=$(readlink -f -- "${var}in" 2>/dev/null) '
+            f'|| {var}=$(__la_rp "${var}in") || true; '
         )
         denied_patterns.extend([f'"${var}"', f'"${var}"/*'])
     denied_check = (
@@ -201,11 +222,13 @@ def contained_read_command(
     )
     return "".join(
         [
+            _RESOLVE_SH,
             *setup,
             *denied_setup,
             f"t={shlex.quote(target)}; ",
             'tt=$(realpath -m -- "$t" 2>/dev/null) ',
-            f'|| tt=$(readlink -f -- "$t" 2>/dev/null) || exit {READ_CONTAINMENT}; ',
+            f'|| tt=$(readlink -f -- "$t" 2>/dev/null) || tt=$(__la_rp "$t") '
+            f"|| exit {READ_CONTAINMENT}; ",
             f'[ -n "$tt" ] || exit {READ_CONTAINMENT}; ',
             f'case "$tt" in {"|".join(patterns)}) ;; ',
             f"*) exit {READ_CONTAINMENT} ;; esac; ",
@@ -292,12 +315,13 @@ def batch_probe_command(
     quoted = " ".join(shlex.quote(target) for target in targets)
     return "".join(
         [
+            _RESOLVE_SH,
             *setup,
             f"m={shlex.quote(mark)}; ",
             f"set -- {quoted}; ",
             'for t in "$@"; do ',
             'tt=$(realpath -m -- "$t" 2>/dev/null) ',
-            '|| tt=$(readlink -f -- "$t" 2>/dev/null) ',
+            '|| tt=$(readlink -f -- "$t" 2>/dev/null) || tt=$(__la_rp "$t") ',
             "|| { printf 'n%s' \"$m\"; continue; }; ",
             '[ -n "$tt" ] || { printf \'n%s\' "$m"; continue; }; ',
             f'case "$tt" in {"|".join(patterns)}) ',

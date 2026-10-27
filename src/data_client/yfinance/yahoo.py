@@ -14,6 +14,55 @@ import yfinance as yf
 from market_protocol import vendor_spelling
 
 
+class _CookieCacheWithA3:
+    """yfinance's cookie cache, less an entry without the ``A3`` cookie.
+
+    yfinance reads the cached cookie's ``A3`` without checking it is there, so
+    one saved without it fails every request in every later process with
+    ``KeyError: 'A3'``. Such an entry reads as a miss and is deleted. The cache
+    stays: yfinance refetches the cookie on every request without it. The
+    sandbox servers carry the same guard in ``mcp_servers/_yf_common.py``,
+    since this package is mirrored into sandboxes where that one may not import.
+    """
+
+    checks_a3 = True
+
+    def __init__(self, inner):
+        self._inner = inner
+
+    def lookup(self, strategy):
+        entry = self._inner.lookup(strategy)
+        try:
+            next(iter(entry["cookie"].values()))["/"]["A3"]
+        except (TypeError, KeyError, StopIteration, AttributeError):
+            if entry is not None:
+                self._inner.store(strategy, None)  # a None store deletes the row
+            return None
+        return entry
+
+    def store(self, strategy, cookie):
+        self._inner.store(strategy, cookie)
+
+    # DALTON-HOOK(yfinance-cache): everything else the cache exposes (its
+    # ``db`` handle among it — the per-process cache the proxy layer swaps in
+    # reads it) passes through untouched.
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+def _guard_cookie_cache() -> None:
+    try:
+        from yfinance import cache
+        current = cache.get_cookie_cache()
+        if not getattr(current, "checks_a3", False):
+            cache._CookieCacheManager._Cookie_cache = _CookieCacheWithA3(current)
+    except (ImportError, AttributeError):
+        pass  # a release that moved the cache; the load it guards moved with it
+
+
+_guard_cookie_cache()
+
+
 def yahoo_symbol(symbol: str, *, is_index: bool = False) -> str:
     """Yahoo's spelling of *symbol*; a bare index gets its caret (``^GSPC``).
 

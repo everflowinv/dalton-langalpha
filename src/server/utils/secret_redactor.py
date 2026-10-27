@@ -30,7 +30,6 @@ class SecretRedactor:
     """Resolves secret values from MCP config and provides redaction methods."""
 
     def __init__(self) -> None:
-        from src.config.settings import get_nested_config
         from src.config.tool_settings import _get_agent_config_dict
 
         secrets: dict[str, str] = {}
@@ -50,13 +49,6 @@ class SecretRedactor:
                         secrets[key] = resolved
                 elif isinstance(value, str) and len(value) >= 8:
                     secrets[key] = value
-
-        # GITHUB_TOKEN — injected separately by _build_sandbox_env_vars
-        if get_nested_config("github.enabled", False):
-            token_env = get_nested_config("github.token_env", "GITHUB_BOT_TOKEN")
-            gh_token = os.environ.get(token_env)
-            if gh_token and len(gh_token) >= 8:
-                secrets["GITHUB_TOKEN"] = gh_token
 
         # Sort by value length descending so longer matches replace first
         self._secrets = sorted(secrets.items(), key=lambda kv: len(kv[1]), reverse=True)

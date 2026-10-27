@@ -149,6 +149,22 @@ describe('useWorkspaceFiles', () => {
     expect(result.current.error).toBe('Failed to load files');
   });
 
+  it("returns the server's sentence when the machine refused", async () => {
+    // An owner's SSH machine that answered and refused is a 422 whose detail
+    // says what to fix; a generic line would hide it.
+    const error: Error & { response?: { status?: number; data?: { detail?: unknown } } } =
+      new Error('Unprocessable');
+    error.response = { status: 422, data: { detail: 'dev@203.0.113.9 did not accept our key.' } };
+    mockListFiles.mockRejectedValue(error);
+
+    const queryClient = createFastRetryClient();
+    const { result } = renderHookWithProviders(() => useWorkspaceFiles('ws-1'), { queryClient });
+
+    await waitFor(() => expect(result.current.error).not.toBeNull());
+    expect(result.current.error).toBe('dev@203.0.113.9 did not accept our key.');
+    expect(mockListFiles).toHaveBeenCalledTimes(1);
+  });
+
   it('returns sandbox unavailable for 503', async () => {
     // The hook retries 503 errors up to 3 times with delays of 1s+2s+3s = 6s
     // wall clock. Use fake timers and step through them so the test runs in

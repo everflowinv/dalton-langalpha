@@ -205,8 +205,10 @@ async def get_computer_for_workspace(
     binding needs the folder as often as it needs the machine, and a second
     query for it is a second answer that can disagree with this one, and so
     does ``files_epoch``, which says which arrival of the files a worker's
-    record of the folder is for. None is normal for an unbound Home and
-    backfill shared-sandbox tie-break losers.
+    record of the folder is for, and ``previous_root_dirs`` and
+    ``previous_dir_names``, which a fold of the workspace's older paths reads
+    beside the machine's own root and folder. None is normal for an unbound
+    Home and backfill shared-sandbox tie-break losers.
     """
     workspace_id = normalize_uuid(workspace_id)
     if workspace_id is None:
@@ -215,7 +217,8 @@ async def get_computer_for_workspace(
     async with _computer_cursor(conn) as cur:
         await cur.execute(
             f"""
-            SELECT {computer_cols("c")}, w.dir_name, w.files_epoch
+            SELECT {computer_cols("c")}, w.dir_name, w.files_epoch, w.previous_root_dirs,
+                w.previous_dir_names
             FROM computers c
             JOIN workspaces w ON w.computer_id = c.computer_id
             WHERE w.workspace_id = %s AND c.{FENCE_NOT_DELETED}
@@ -295,6 +298,22 @@ async def get_computers_for_user(
             (user_id,),
         )
         return [dict(r) for r in await cur.fetchall()]
+
+
+async def count_live_computers_of_kind(
+    user_id: str, kind: str, *, conn=None
+) -> int:
+    async with _computer_cursor(conn) as cur:
+        await cur.execute(
+            f"""
+            SELECT count(*) AS computers
+            FROM computers
+            WHERE user_id = %s AND kind = %s AND {FENCE_NOT_DELETED}
+            """,
+            (user_id, kind),
+        )
+        row = await cur.fetchone()
+        return int(row["computers"]) if row else 0
 
 
 async def get_computer_names_and_home(
@@ -477,6 +496,7 @@ async def create_computer(
     is_always_on: bool = False,
     platform_secret_version: int = 0,
     origin_workspace_id: Optional[str] = None,
+    files_backup: bool = True,
     conn=None,
 ) -> Dict[str, Any]:
     """A lost primary-index race retries as non-primary because another primary now exists.
@@ -494,7 +514,7 @@ async def create_computer(
                     computer_id, user_id, kind, name, is_primary, status,
                     resource_tier, root_dir, provider_config, config,
                     provider_ref, is_always_on, platform_secret_version,
-                    origin_workspace_id
+                    origin_workspace_id, files_backup
                 )
                 VALUES (
                     COALESCE(%s::uuid, gen_random_uuid()), %s, %s, %s,
@@ -503,7 +523,7 @@ async def create_computer(
                         WHERE user_id = %s AND is_primary AND {FENCE_NOT_DELETED}
                     ),
                     %s, %s, %s, %s, %s,
-                    %s, %s, %s, %s::uuid
+                    %s, %s, %s, %s::uuid, %s
                 )
                 RETURNING {_COMPUTER_COLS}
                 """,
@@ -523,6 +543,7 @@ async def create_computer(
                     is_always_on,
                     platform_secret_version,
                     origin_workspace_id,
+                    files_backup,
                 ),
             )
             return dict(await cur.fetchone())
@@ -834,6 +855,23 @@ async def set_computer_always_on(
     conn=None,
 ) -> Optional[Dict[str, Any]]:
     return await _set_computer_scalar(computer_id, "is_always_on", enabled, conn=conn)
+
+
+async def set_computer_files_backup(
+    computer_id: str, enabled: bool, *, conn=None
+) -> Optional[Dict[str, Any]]:
+    """No workspace shadow, unlike the scalars below: no platform count reads it."""
+    async with _computer_cursor(conn) as cur:
+        await cur.execute(
+            f"""
+            UPDATE computers SET files_backup = %s, updated_at = NOW()
+            WHERE computer_id = %s AND {FENCE_NOT_DELETED}
+            RETURNING {_COMPUTER_COLS}
+            """,
+            (enabled, normalize_uuid(computer_id)),
+        )
+        row = await cur.fetchone()
+    return dict(row) if row else None
 
 
 async def _set_computer_scalar(

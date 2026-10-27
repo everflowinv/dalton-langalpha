@@ -29,6 +29,9 @@ interface PanelNoticesProps {
   backupResult: BackupResult | null;
   onDismissBackupResult: () => void;
   editing: boolean;
+  /** The offer to restore a folder found missing, first: until it is
+   *  answered the listing below is of an empty folder. */
+  restoreOffer?: React.ReactNode;
 }
 
 /**
@@ -42,10 +45,12 @@ interface PanelNoticesProps {
  */
 export function PanelNotices({
   uploadProgress, error, onDismissError, filesError = null, filesRestoreIncomplete = false, onRefreshFiles, busy, backupResult, onDismissBackupResult, editing,
+  restoreOffer = null,
 }: PanelNoticesProps): React.ReactElement {
   const { t } = useTranslation();
   return (
     <>
+      {restoreOffer}
       {uploadProgress !== null && (
         <div className="file-panel-upload-progress">
           <div className="file-panel-upload-progress-bar" style={{ width: `${uploadProgress}%` }} />

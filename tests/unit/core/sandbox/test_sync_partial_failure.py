@@ -26,6 +26,7 @@ from ptc_agent.core.project_context import ProjectContext
 from ptc_agent.core.sandbox import assets
 from ptc_agent.core.sandbox.migration import CURRENT_LAYOUT_VERSION
 from ptc_agent.core.sandbox.runtime import SandboxRuntime
+from tests.unit.core.sandbox.fake_provider import fake_provider
 
 WORK_DIR = "/home/workspace"
 PROJECT = ProjectContext("ws-1", "acme-ab12")
@@ -42,7 +43,10 @@ def _make_sandbox(order: list[str]):
         logging=LoggingConfig(),
         filesystem=FilesystemConfig(),
     )
-    with patch("ptc_agent.core.sandbox.ptc_sandbox.create_provider"):
+    with patch(
+        "ptc_agent.core.sandbox.ptc_sandbox.create_provider",
+        return_value=fake_provider(),
+    ):
         sandbox = PTCSandbox(config=config)
     sandbox._work_dir = WORK_DIR
     sandbox.mcp_registry = MagicMock()
@@ -76,7 +80,7 @@ def _skill_dirs(tmp_path):
     skill = tmp_path / "skills" / "charting"
     skill.mkdir(parents=True)
     (skill / "SKILL.md").write_text("---\nname: charting\n---\nDraw.\n")
-    return [(str(tmp_path / "skills"), f"{WORK_DIR}/.agents/skills")]
+    return [str(tmp_path / "skills")]
 
 
 async def _sync(sandbox, tmp_path):

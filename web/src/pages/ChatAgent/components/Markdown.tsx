@@ -790,6 +790,8 @@ interface MarkdownProps {
 function Markdown({ content, variant = 'panel', className = '', style, onOpenFile, onAnchorLink, codeTheme, streaming = false }: MarkdownProps): React.ReactElement {
   const config = VARIANTS[variant];
   const folders = useWorkspaceFolders();
+  const rootDir = folders?.rootDir;
+  const otherRoots = folders?.otherRoots;
   // Every pass below rewrites prose before the markdown parser sees it, so each
   // one has to say how much of the string it may touch. Inside code, markdown
   // stops interpreting escapes and raw HTML — a rewrite that lands there is
@@ -797,7 +799,7 @@ function Markdown({ content, variant = 'panel', className = '', style, onOpenFil
   const processed = useMemo(() => {
     // Whole-string by design: front matter is anchored at the start, and
     // normalizeFileRefs deliberately unwraps backticks around file refs.
-    const base = normalizeFileRefs(stripFrontMatter(content));
+    const base = normalizeFileRefs(stripFrontMatter(content), rootDir, otherRoots);
     // Table repair is line-structural, so it reads whole lines and has to stay
     // out of the code spans that own one — fenced, or inline across a break.
     const tables = mapOutsideMultilineCode(base, fixMarkdownTables);
@@ -808,7 +810,7 @@ function Markdown({ content, variant = 'panel', className = '', style, onOpenFil
     // Line-structural again, and after the delimiter pass so `\[x\]` arrives
     // already spelled `$$x$$`.
     return mapOutsideMultilineCode(prose, blockOneLineDisplayMath);
-  }, [content]);
+  }, [content, rootDir, otherRoots]);
 
   const blocks = useMemo(() => splitMarkdownBlocks(processed), [processed]);
 
@@ -877,7 +879,7 @@ function Markdown({ content, variant = 'panel', className = '', style, onOpenFil
           >{children}</a>
         );
       }
-      if (isFilePath(href)) {
+      if (isFilePath(href, folders)) {
         // Image file linked as [name](path.png) -- render as embedded image.
         // The destination goes over raw: WorkspaceImage reads it the same way
         // this link does, and normalizing here would decode it twice.
@@ -894,7 +896,7 @@ function Markdown({ content, variant = 'panel', className = '', style, onOpenFil
           // and stripping the root alone would leave the folder as a
           // subdirectory. A relative one keeps its climb, which the handler
           // reads against the file it was written in.
-          const rooted = parseAgentPath(path).absolute;
+          const rooted = parseAgentPath(path, folders?.rootDir).absolute;
           return (
             <a
               className="underline hover:opacity-80 transition-opacity cursor-pointer"

@@ -56,6 +56,9 @@ async def get_preview_link(
 
         Results are cached per-port since the standard URL doesn't change
         while the sandbox is running. Cache is cleared on sandbox restart.
+        A loopback link is the exception: it is a forward this process holds
+        on its connection to the machine, which a reconnect moves to another
+        port, so only the runtime can say where it is now.
         ``wake=False`` is for probes: one attempt and no reconnect, because
         the reconnect that rescues a stopped sandbox would start it.
         """
@@ -71,7 +74,8 @@ async def get_preview_link(
         allow_reconnect=wake,
         retries=5 if wake else 1,
     )
-    sandbox._preview_link_cache[port] = result
+    if not result.process_local:
+        sandbox._preview_link_cache[port] = result
     return result
 
 

@@ -24,6 +24,7 @@ import { normalizeSubagentText } from './normalizeSubagentText';
 import StructuredResultBlock from './StructuredResultBlock';
 import { parseStructuredResult } from '../../utils/structuredResult';
 import { useMessageActions } from './MessageActionsContext';
+import { useWorkspaceFolders } from '../../contexts/WorkspaceContext';
 import { FoldPanel } from './FoldPanel';
 import { projectContent, blockIsProcess, blockVisible, streamingTextBlockIndex, type ContentProjection } from './contentProjection';
 import { EMPTY_OBJ } from './types';
@@ -171,11 +172,12 @@ export const MessageContentSegments = memo(function MessageContentSegments({ seg
   // next row is due. It is state rather than a `Date.now()` inside the build:
   // a cached computation only reruns for inputs it can see.
   const [now, setNow] = useState(Date.now);
+  const root = useWorkspaceFolders()?.rootDir;
 
   const projection = useMemo(() => {
     if (contentProjection && (contentProjection.nextExpiry === null || contentProjection.nextExpiry > now)) return contentProjection;
-    return projectContent({ segments, reasoningProcesses, toolCallProcesses, isStreaming, isSubagentView, pendingToolCallChunks, now }, contentProjection);
-  }, [contentProjection, segments, reasoningProcesses, toolCallProcesses, isStreaming, isSubagentView, pendingToolCallChunks, now]);
+    return projectContent({ segments, reasoningProcesses, toolCallProcesses, isStreaming, isSubagentView, pendingToolCallChunks, now, root }, contentProjection);
+  }, [contentProjection, segments, reasoningProcesses, toolCallProcesses, isStreaming, isSubagentView, pendingToolCallChunks, now, root]);
   const { blocks: renderBlocks, preparingToolCall, nextExpiry } = projection;
 
   useEffect(() => {

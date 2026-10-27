@@ -69,7 +69,11 @@ from ptc_agent.agent.middleware.compaction.window import (
 )
 from ptc_agent.agent.transcript import TranscriptTarget, Window
 from ptc_agent.agent.transcript.identity import DIGEST_VERSION
-from ptc_agent.agent.transcript.pointer import aexport_transcript, transcript_target
+from ptc_agent.agent.transcript.pointer import (
+    aexport_transcript,
+    shell_reads_transcripts,
+    transcript_target,
+)
 
 if TYPE_CHECKING:
     from ptc_agent.agent.backends.sandbox import SandboxBackend
@@ -180,6 +184,7 @@ class CompactionMiddleware(AgentMiddleware):
             request.state,
             max_length=self._offload.max_length,
             transcript=transcript,
+            shell=shell_reads_transcripts(self._backend),
         )
 
         tokens = self._context_tokens(request, view)
@@ -419,7 +424,7 @@ class CompactionMiddleware(AgentMiddleware):
         return main
 
     def _transcript_target(self) -> TranscriptTarget | None:
-        """This agent's transcript, or None where no mount serves one."""
+        """This agent's transcript, or None where nothing serves one."""
         try:
             configurable = get_config().get("configurable", {})
         except RuntimeError:

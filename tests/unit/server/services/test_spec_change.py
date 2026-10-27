@@ -366,7 +366,13 @@ class TestSameTierShortcut:
 
         tiers = {"standard": object(), "max": object()}
         return _spec_refusal(
-            {"resource_tier": "max", "status": "stopped", "provider_ref": "sb-1", **row},
+            {
+                "kind": "daytona",
+                "resource_tier": "max",
+                "status": "stopped",
+                "provider_ref": "sb-1",
+                **row,
+            },
             "max",
             tiers,
         )
