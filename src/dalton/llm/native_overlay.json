@@ -923,6 +923,22 @@
           "context_window": 1000000,
           "max_output": 128000
         }
+      ],
+      "openrouter": [
+        {
+          "id": "openai/gpt-oss-120b",
+          "name": "GPT-OSS 120B (OpenRouter)",
+          "is_reasoning": true,
+          "description": "OpenAI GPT-OSS 120B via OpenRouter",
+          "pricing": {
+            "input": 0.15,
+            "output": 0.6,
+            "cached_input": 0.075,
+            "unit": "per_1m_tokens"
+          },
+          "context_window": 131072,
+          "max_output": 32768
+        }
       ]
     }
   },

@@ -199,8 +199,72 @@ class TestInsertProvenanceRecords:
         assert len(json_binds) == 1, "args should be a JSONB bind"
         assert "\\u0000" not in json_binds[0].dumps(json_binds[0].obj)
 
+    # DALTON-HOOK(provenance-full-archive): 2500 records written in 3 batches of 1000/1000/500.
+    @pytest.mark.asyncio
+    async def test_batches_2500_records_into_three_inserts(
+        self, mock_connection, mock_cursor
+    ):
+        records = [
+            _record(identifier=f"https://example.test/{i}", result_sha256=f"sha-{i}")
+            for i in range(2500)
+        ]
+        n = await insert_provenance_records(
+            mock_connection,
+            conversation_response_id=RESPONSE_ID,
+            conversation_thread_id=THREAD_ID,
+            turn_index=0,
+            lanes=(MAIN_PROVENANCE_LANE,),
+            records=records,
+        )
+        assert n == 2500
+
+        insert_calls = [
+            c
+            for c in mock_cursor.execute.call_args_list
+            if "INSERT INTO provenance_records" in c.args[0]
+        ]
+        assert len(insert_calls) == 3
+        batch_row_counts = [c.args[0].count("(%s") for c in insert_calls]
+        assert batch_row_counts == [1000, 1000, 500]
+        assert [len(c.args[1]) for c in insert_calls] == [
+            1000 * NCOLS,
+            1000 * NCOLS,
+            500 * NCOLS,
+        ]
+
 
 class TestSyncProvenanceForResponse:
+    # DALTON-HOOK(provenance-full-archive): returns deduplicated count across batched inserts.
+    @pytest.mark.asyncio
+    async def test_returns_deduplicated_count_across_batches(
+        self, mock_connection, mock_cursor
+    ):
+        unique_events = [
+            {
+                "event": "provenance",
+                "source_type": "web_search",
+                "identifier": f"https://example.test/{i}",
+                "result_sha256": f"sha-{i}",
+                "tool_call_id": "call-1",
+            }
+            for i in range(2500)
+        ]
+        duplicate_events = unique_events[:391]
+        n = await sync_provenance_for_response(
+            mock_connection,
+            conversation_response_id=RESPONSE_ID,
+            conversation_thread_id=THREAD_ID,
+            turn_index=0,
+            provenance=unique_events + duplicate_events,
+            lanes=(MAIN_PROVENANCE_LANE,),
+        )
+        assert n == 2500
+        insert_calls = [
+            c
+            for c in mock_cursor.execute.call_args_list
+            if "INSERT INTO provenance_records" in c.args[0]
+        ]
+        assert len(insert_calls) == 3
     @pytest.mark.asyncio
     async def test_returns_inserted_count(self, mock_connection, mock_cursor):
         events = [

@@ -119,6 +119,7 @@ class TestExtendedHoursPassThrough:
             assert mock_ticker.history.call_args.kwargs == {
                 "period": "1d",
                 "interval": "5m",
+                "auto_adjust": True,
                 "prepost": True,
             }
 
@@ -129,6 +130,7 @@ class TestExtendedHoursPassThrough:
             assert mock_ticker.history.call_args.kwargs == {
                 "period": "1d",
                 "interval": "5m",
+                "auto_adjust": True,
                 "prepost": True,
             }
 

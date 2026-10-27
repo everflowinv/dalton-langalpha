@@ -12,6 +12,16 @@ from src.server.database.conversation import _sql
 logger = logging.getLogger(__name__)
 
 
+# DALTON-HOOK(provenance-full-archive): return the actual written count from
+# provenance sync helpers while keeping replace_lane_provenance truthy whenever
+# the target response row exists (even when 0 records are written).
+class _SyncedProvenanceCount(int):
+    """Written provenance count that evaluates truthy when the response row existed."""
+
+    def __bool__(self) -> bool:
+        return True
+
+
 def _has_provenance(events: Optional[Any]) -> bool:
     """True if any SSE event is a provenance entry."""
     if not events:
@@ -29,7 +39,7 @@ async def _sync_provenance_for_response(
     strict: bool = False,
     appended_only: bool = True,
     lanes: Collection[str],
-) -> None:
+) -> int:  # DALTON-HOOK(provenance-full-archive)
     """(Re)derive provenance_records from ``provenance`` events on the
     caller's connection.
 
@@ -44,11 +54,11 @@ async def _sync_provenance_for_response(
     # extract + delete-then-insert is skipped. A write that strips rows can take
     # the last entry away, and its records must go with it.
     if appended_only and not _has_provenance(provenance):
-        return
+        return 0  # DALTON-HOOK(provenance-full-archive)
 
     from src.server.database.provenance import sync_provenance_for_response
 
-    await sync_provenance_for_response(
+    return await sync_provenance_for_response(  # DALTON-HOOK(provenance-full-archive)
         conn,
         conversation_response_id=conversation_response_id,
         conversation_thread_id=conversation_thread_id,
@@ -63,14 +73,14 @@ async def replace_lane_provenance(
     conversation_response_id: str,
     events: List[Dict[str, Any]],
     lanes: Collection[str],
-) -> bool:
+) -> int | bool:  # DALTON-HOOK(provenance-full-archive)
     """Rewrite ``lanes``' provenance on a response from ``events``.
 
     ``events`` hold each lane's whole record, so a lane they name no
     provenance for loses its rows; other lanes keep theirs. Raises on a
     failed write, so the caller can retry it; returns False when the row is
-    missing.
-    """
+    missing, or the actual written count (as a truthy int) when synced.
+    """  # DALTON-HOOK(provenance-full-archive)
     async with pool.get_db_connection() as conn:
         async with conn.transaction():
             async with conn.cursor(row_factory=dict_row) as cur:
@@ -86,7 +96,7 @@ async def replace_lane_provenance(
                     f"response_id={conversation_response_id}"
                 )
                 return False
-            await _sync_provenance_for_response(
+            written = await _sync_provenance_for_response(  # DALTON-HOOK(provenance-full-archive)
                 conn,
                 conversation_response_id=conversation_response_id,
                 conversation_thread_id=str(row["conversation_thread_id"]),
@@ -96,7 +106,7 @@ async def replace_lane_provenance(
                 appended_only=False,
                 lanes=lanes,
             )
-            return True
+            return _SyncedProvenanceCount(written)  # DALTON-HOOK(provenance-full-archive)
 
 
 async def get_recent_responses_for_thread(

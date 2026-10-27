@@ -144,3 +144,30 @@ async def test_events_outside_a_task_lane_write_nothing():
 
     assert ok is True
     write.assert_not_awaited()
+
+
+# DALTON-HOOK(provenance-full-archive): log actual deduplicated written count and dedup stats.
+@pytest.mark.asyncio
+async def test_persist_logs_actual_written_and_deduped_count(caplog):
+    import logging
+    from unittest.mock import create_autospec
+
+    dup1 = _source("task:k1", "tc-a", "https://a.test")
+    dup2 = _source("task:k1", "tc-a", "https://a.test")
+    unique = _source("task:k1", "tc-a", "https://b.test")
+    events = [dup1, dup2, unique, _chunk("task:k1")]
+    write_spy = create_autospec(subagent_archive.replace_lane_provenance, return_value=2)
+
+    with caplog.at_level(logging.INFO, logger="src.server.services.runs.subagent_archive"):
+        ok, write, _ = await _persist(
+            events,
+            {"k1": _saved("tc-a")},
+            write=write_spy,
+        )
+
+    assert ok is True
+    assert write.await_count == 1
+    assert any(
+        "Recorded 2 provenance entries (deduped=1)" in rec.message
+        for rec in caplog.records
+    )

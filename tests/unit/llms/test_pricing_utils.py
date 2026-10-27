@@ -323,3 +323,102 @@ class TestCalculateTotalCost:
         result = calculate_total_cost(pricing=pricing)
         assert result["total_cost"] == 0.0
         assert result["breakdown"] == {}
+
+    # DALTON-HOOK(llm-overlay): subscription providers log DEBUG without WARNING and return billing="subscription";
+    # missing pay-per-token models log WARNING once per (model, provider) and return pricing_missing=True;
+    # openrouter openai/gpt-oss-120b resolves and prices accurately.
+    def test_subscription_providers_do_not_warn_and_return_subscription_billing(self, caplog):
+        import logging
+
+        from src.llms.pricing_utils import find_model_pricing
+
+        sub_cases = [
+            ("gemini-4-argon-low", "antigravity-oauth"),
+            ("gemini-3.8-flash-medium", "antigravity-oauth"),
+            ("claude-opus-5-5-high", "antigravity-oauth"),
+            ("gpt-oss-120b-medium", "antigravity-oauth"),
+            ("muse-wonder-1.0", "muse-oauth"),
+            ("muse-wonder-full-1.0", "muse-oauth"),
+            ("muse-spark-1.3", "muse-oauth"),
+            ("grok-4.7-build-fast", "xai-oauth"),
+        ]
+        with caplog.at_level(logging.DEBUG, logger="src.llms.pricing_utils"):
+            for model_name, provider in sub_cases:
+                card = find_model_pricing(model_name, provider=provider)
+                assert card is not None
+                assert card.get("billing") == "subscription"
+                assert card.get("total_cost") == 0.0
+
+                cost_res = calculate_total_cost(
+                    input_tokens=100_000,
+                    output_tokens=20_000,
+                    model_name=model_name,
+                    provider=provider,
+                )
+                assert cost_res["total_cost"] == 0.0
+                assert cost_res["billing"] == "subscription"
+                assert "pricing_missing" not in cost_res
+
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert warnings == []
+
+    def test_missing_cash_model_warns_once_per_model_provider_and_sets_pricing_missing(
+        self, caplog
+    ):
+        import logging
+
+        from src.llms.pricing_utils import _WARNED_MISSING_PRICING, find_model_pricing
+
+        _WARNED_MISSING_PRICING.discard(("unpriced-cash-model-xyz", "openrouter"))
+        with caplog.at_level(logging.WARNING, logger="src.llms.pricing_utils"):
+            res1 = calculate_total_cost(
+                input_tokens=5000,
+                output_tokens=1000,
+                model_name="unpriced-cash-model-xyz",
+                provider="openrouter",
+            )
+            res2 = calculate_total_cost(
+                input_tokens=5000,
+                output_tokens=1000,
+                model_name="unpriced-cash-model-xyz",
+                provider="openrouter",
+            )
+            assert find_model_pricing("unpriced-cash-model-xyz", provider="openrouter") is None
+
+        assert res1["total_cost"] == 0.0
+        assert isinstance(res1["total_cost"], float)
+        assert res1["pricing_missing"] is True
+        assert res2["pricing_missing"] is True
+
+        matching_warnings = [
+            r
+            for r in caplog.records
+            if r.levelno == logging.WARNING and "unpriced-cash-model-xyz" in r.message
+        ]
+        assert len(matching_warnings) == 1
+
+    def test_openrouter_gpt_oss_120b_pricing_and_cost(self, caplog):
+        import logging
+
+        from src.llms.pricing_utils import find_model_pricing
+
+        with caplog.at_level(logging.WARNING, logger="src.llms.pricing_utils"):
+            pricing = find_model_pricing("openai/gpt-oss-120b", provider="openrouter")
+            assert pricing is not None
+            assert pricing["input"] == pytest.approx(0.15)
+            assert pricing["output"] == pytest.approx(0.60)
+            assert pricing["cached_input"] == pytest.approx(0.075)
+
+            res = calculate_total_cost(
+                input_tokens=1_000_000,
+                output_tokens=500_000,
+                cached_tokens=200_000,
+                pricing=pricing,
+            )
+        # Regular input: 800k * $0.15/M = $0.12
+        # Cached input:  200k * $0.075/M = $0.015
+        # Output:        500k * $0.60/M = $0.30
+        # Total:         $0.435
+        assert res["total_cost"] == pytest.approx(0.435)
+        assert "pricing_missing" not in res
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
