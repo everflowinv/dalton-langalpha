@@ -70,6 +70,13 @@ async def attach_request_files(
     supported, unsupported, file_only = filter_multimodal_by_capability(
         multimodal_contexts, modalities
     )
+    # DALTON-HOOK(attachment-native-cap): an image or PDF above what a provider
+    # takes inline rides the sandbox path instead; inlined, it stays in the
+    # thread's history and fails every later turn on the request size.
+    from src.dalton.attachments import split_oversized
+
+    supported, oversized = split_oversized(supported)
+    file_only = file_only + oversized
 
     # 3. Inject supported as native content blocks (merged into user message)
     if supported:

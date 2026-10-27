@@ -1593,6 +1593,7 @@
     "goToLangAlpha": "前往 {{brand}}"
   },
   "chat": {
+    "attachmentTooLarge": "{{name}} 超过 {{max}} MB，没有添加。更大的文件请从文件面板上传。",
     "backToWorkflow": "返回工作流",
     "backToMain": "返回主对话",
     "reconnecting": "重新连接中…",

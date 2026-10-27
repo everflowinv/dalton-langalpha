@@ -1,4 +1,6 @@
 import { useCallback, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import { useToast } from './use-toast';
 import type { FileAttachment } from './chat-input.types';
 import { MAX_FILES, MAX_FILE_SIZE } from './chat-input.helpers';
 
@@ -7,6 +9,8 @@ import { MAX_FILES, MAX_FILE_SIZE } from './chat-input.helpers';
 export function useFileAttachments() {
   const [attachedFiles, setAttachedFiles] = useState<FileAttachment[]>([]);
   const [isDragging, setIsDragging] = useState(false);
+  const { t } = useTranslation();
+  const { toast } = useToast();
 
   const handleFiles = useCallback((newFilesList: FileList | File[]) => {
     const currentCount = attachedFiles.length;
@@ -15,7 +19,14 @@ export function useFileAttachments() {
     const validFiles = [];
     for (const file of fileArray) {
       if (currentCount + validFiles.length >= MAX_FILES) break;
-      if (file.size > MAX_FILE_SIZE) continue;
+      if (file.size > MAX_FILE_SIZE) {
+        // DALTON-HOOK(attachment-native-cap): say so instead of dropping it silently
+        toast({
+          title: t('chat.attachmentTooLarge', { name: file.name, max: MAX_FILE_SIZE / (1024 * 1024) }),
+          variant: 'destructive',
+        });
+        continue;
+      }
       validFiles.push(file);
     }
 
@@ -49,7 +60,7 @@ export function useFileAttachments() {
       };
       reader.readAsDataURL(f.file);
     });
-  }, [attachedFiles.length]);
+  }, [attachedFiles.length, t, toast]);
 
   const removeFile = useCallback((id: string) => {
     setAttachedFiles((prev) => {

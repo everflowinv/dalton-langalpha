@@ -95,7 +95,7 @@ ALLOWED_HOOKS=(
   "dalton-notify"
   "glob-brace-expansion"
   "user-coverage"
-  "multi-file-upload"
+  "multi-file-upload" "attachment-native-cap"
   "invite-signup"
   "wiki-ingest"
   "handoff-keep-on-resumable"
