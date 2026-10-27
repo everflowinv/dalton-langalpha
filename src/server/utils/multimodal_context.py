@@ -37,8 +37,13 @@ def data_url_decoded_size(data_url: str) -> int:
     payload, so a file exactly at a limit stated in decoded bytes reads at
     it, not a hair over.
     """
-    payload = data_url.split(",", 1)[1] if "," in data_url else ""
-    return len(payload) // 4 * 3 - (len(payload) - len(payload.rstrip("=")))
+    header, sep, payload = data_url.partition(",")
+    pad = len(payload) - len(payload.rstrip("="))
+    if not sep or ";base64" not in header or pad > 2:
+        # Not canonical base64: the raw length never undercounts, so a
+        # malformed payload cannot slip under a size cap.
+        return len(payload)
+    return max(0, len(payload) // 4 * 3 - pad)
 
 
 def parse_multimodal_contexts(

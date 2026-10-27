@@ -1850,7 +1850,7 @@ async def test_delete_workspace_success(client, query, delete_files):
         # table before deleting; this workspace holds none.
         patch(
             "src.dalton.database.publications.has_published_reports",
-            new_callable=AsyncMock,
+            autospec=True,
             return_value=False,
         ),
     ):
@@ -1883,7 +1883,7 @@ async def test_delete_workspace_with_published_reports_is_refused(client):
         patch("src.server.app.workspaces.WorkspaceManager") as MockWM,
         patch(
             "src.dalton.database.publications.has_published_reports",
-            new_callable=AsyncMock,
+            autospec=True,
             return_value=True,
         ),
     ):

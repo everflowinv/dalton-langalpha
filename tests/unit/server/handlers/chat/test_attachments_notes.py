@@ -225,3 +225,19 @@ async def test_a_plain_saved_file_keeps_the_short_python_note(monkeypatch):
     )
     assert "Use Python to process it." in content
     assert "PIL" not in content
+
+
+def test_decoded_size_never_undercounts_malformed_payloads():
+    """Over-padded or non-base64 payloads report their raw length, so a file
+    just past the ceiling cannot read as under it."""
+    from src.server.utils.multimodal_context import data_url_decoded_size
+
+    raw = b"x" * (INLINE_UNSAVED_PDF_MAX_BYTES + 1)
+    over_padded = (
+        "data:application/pdf;base64," + base64.b64encode(raw).decode() + "===="
+    )
+    assert base64.b64decode(over_padded.split(",", 1)[1]) == raw
+    assert data_url_decoded_size(over_padded) > INLINE_UNSAVED_PDF_MAX_BYTES
+    assert data_url_decoded_size("data:application/pdf,ABCD") == 4
+    assert data_url_decoded_size("data:application/pdf;base64,=") == 0
+    assert data_url_decoded_size("no-comma") == 0
