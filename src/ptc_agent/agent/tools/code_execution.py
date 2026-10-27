@@ -6,16 +6,25 @@ import structlog
 from langchain_core.tools import BaseTool, tool
 
 from ptc_agent.agent.backends.sandbox import SandboxBackend
-from ptc_agent.agent.tools.code_admission import code_run_slot, max_execution_time_of
+from ptc_agent.agent.tools.code_admission import (
+    code_run_slot,
+    max_execution_time_of,
+    resource_tiers_of,
+)
 from ptc_agent.agent.tools.mount_guard import run_guarded
-from ptc_agent.agent.tools.utils import mark_sandbox_failed
+from ptc_agent.agent.tools.utils import mark_sandbox_failed, note_sandbox_exit, resource_tier_of
 from ptc_agent.core.paths import (
     MEMO_USER_DIR,
     MEMORY_USER_DIR,
     WorkspaceLayout,
 )
 from ptc_agent.core.sandbox import livefs_mount
-from src.observability import TOOL_CHANNEL, TOOL_PROVIDER, mark_tool_failed
+from src.observability import (
+    TOOL_CHANNEL,
+    TOOL_PROVIDER,
+    mark_tool_failed,
+    stamp_resource_tier,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -66,9 +75,10 @@ def create_execute_code_tool(
         backend: SandboxBackend wrapping the sandbox
         mcp_registry: MCPRegistry instance with available MCP tools
         thread_id: Short thread ID (first 8 chars) for thread-scoped code storage
-        session: The machine's session, read at call time for its ``computer_id``
-            and ``resource_tier`` to size per-computer admission. Omitted by
-            callers with no notion of a computer, which skips admission.
+        session: The machine's session, read at call time for its ``computer_id``,
+            ``resource_tier`` and provider config to size per-computer
+            admission. Omitted by callers with no notion of a computer, which
+            skips admission.
         call_context: Who the code runs for, which a save through the file
             mount reads its defaults from
         file_tools_only: Directories under the sandbox root only the file
@@ -117,6 +127,9 @@ def create_execute_code_tool(
         )
 
     async def _run(code: str, call_id: str | None) -> tuple[str, dict[str, Any]]:
+        # Every run, not only a failed one, and read here for the same reason
+        # as the admission tier below.
+        stamp_resource_tier(resource_tier_of(session, backend))
         try:
             logger.info("Executing code in sandbox", code_length=len(code), thread_id=thread_id)
 
@@ -127,6 +140,7 @@ def create_execute_code_tool(
             async with code_run_slot(
                 getattr(session, "computer_id", None),
                 tier=getattr(session, "resource_tier", None),
+                resource_tiers=resource_tiers_of(session),
                 max_execution_time=max_execution_time_of(backend),
             ):
                 result = await backend.aexecute_code(
@@ -154,6 +168,7 @@ def create_execute_code_tool(
                 return response, artifact
             if result.failure:
                 mark_sandbox_failed(result.failure)
+            await note_sandbox_exit(backend, result.exit_code, result.failure)
             # Format error response
             # Python tracebacks often go to stdout in some environments
             # Show stderr if available, otherwise show stdout

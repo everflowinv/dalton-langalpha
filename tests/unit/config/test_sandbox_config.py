@@ -350,6 +350,58 @@ class TestE2BConfig:
             cfg.validate_api_keys()
 
 
+class TestResourceTierSpecs:
+    """The sizes each provider offers, and the ceiling each one holds them to."""
+
+    def test_daytona_offers_three_sizes(self):
+        tiers = DaytonaConfig().resource_tiers
+        assert {n: (t.cpu, t.memory, t.disk) for n, t in tiers.items()} == {
+            "standard": (1, 2, 5),
+            "performance": (2, 4, 10),
+            "max": (2, 8, 10),
+        }
+
+    def test_e2b_offers_the_same_three_and_extra_large(self):
+        tiers = E2BConfig().resource_tiers
+        assert {n: (t.cpu, t.memory, t.disk) for n, t in tiers.items()} == {
+            "standard": (1, 2, 5),
+            "performance": (2, 4, 10),
+            "max": (2, 8, 10),
+            "xlarge": (4, 8, 20),
+        }
+
+    def test_a_shared_name_is_one_size_on_every_provider(self):
+        """The tier is persisted on the row, so a name means one size."""
+        daytona, e2b = DaytonaConfig().resource_tiers, E2BConfig().resource_tiers
+        for name, tier in daytona.items():
+            assert e2b[name] == tier
+
+    def test_docker_keeps_the_shared_sizes(self):
+        assert set(DockerConfig().resource_tiers) == {"standard", "performance", "max"}
+
+    def test_daytona_refuses_extra_large(self):
+        """Above Daytona's 4 vCPU / 8 GiB / 10 GiB per sandbox."""
+        with pytest.raises(ValueError, match=r"xlarge.*disk=20 \(max 10\)"):
+            DaytonaConfig(
+                resource_tiers={
+                    "standard": {"cpu": 1, "memory": 2, "disk": 5},
+                    "xlarge": {"cpu": 4, "memory": 8, "disk": 20},
+                }
+            )
+
+    def test_e2b_refuses_a_tier_above_its_own_ceiling(self):
+        with pytest.raises(ValueError, match=r"memory=16 \(max 8\)"):
+            E2BConfig(
+                resource_tiers={"standard": {"cpu": 8, "memory": 16, "disk": 20}}
+            )
+
+    def test_docker_has_no_ceiling(self):
+        cfg = DockerConfig(
+            resource_tiers={"standard": {"cpu": 16, "memory": 64, "disk": 200}}
+        )
+        assert cfg.resource_tiers["standard"].cpu == 16
+
+
 class TestPlatformSecretCatalogValidation:
     """SandboxConfig rejects a catalog that would silently mis-bind."""
 

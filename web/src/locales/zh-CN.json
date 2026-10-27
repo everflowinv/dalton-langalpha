@@ -449,8 +449,13 @@
       "deep": "深度"
     },
     "compactionProfile": "压缩预设",
-    "compactionProfileDesc": "用于控制压缩触发与保留的预设组合。保持系统默认时，每个模型会自动匹配与其上下文窗口相称的预设。",
+    "compactionProfileDesc": "用于控制压缩触发与保留的预设组合。保持系统默认时，每个模型使用各自的预设：Claude 和 GPT 为 500k，其他模型按其上下文窗口匹配。",
     "compactionProfileUseDefault": "使用系统默认",
+    "nativeCompaction": "服务商压缩",
+    "nativeCompactionOn": "开启",
+    "nativeCompactionOff": "关闭",
+    "nativeCompactionAnthropicDesc": "压缩时由 Claude 自己总结对话，因此它在保留下来的轮次里仍能保留自己的推理过程。这份摘要可以直接阅读，切换到其他模型后，新模型读取的也是它。",
+    "nativeCompactionOpenAIDesc": "OpenAI 会把对话压缩成一份加密摘要，只有 OpenAI 的模型能读取，无论通过 API 还是 ChatGPT 登录。压缩卡片显示的是对话的简要记录，而不是摘要。若把这个对话切换到其他服务商的模型，它拿到的是这份记录而不是摘要，会丢失早先工具结果中的细节。",
     "compactionProfilePreset": "{{tokens}}k tokens · 保留 {{keep}} 条",
     "compactionProfiles": {
       "aggressive": {
@@ -463,11 +468,27 @@
       },
       "extended": {
         "label": "扩展",
-        "description": "保留更多上下文。适合 400k–1M 上下文模型。"
+        "description": "保留更多上下文。适合 400k 上下文模型。"
+      },
+      "economy": {
+        "label": "经济",
+        "description": "控制在 272k 以内，超过后 OpenAI 会按长上下文价格计费整个请求。"
       },
       "relaxed": {
         "label": "宽松",
-        "description": "最大化上下文。适合 1M 上下文模型。"
+        "description": "在 1M 上下文模型上留出更多空间再压缩。"
+      },
+      "spacious": {
+        "label": "充裕",
+        "description": "适合在 1M 上下文模型上进行长时间会话。"
+      },
+      "expansive": {
+        "label": "广阔",
+        "description": "用到 1M 窗口的一半才压缩。线程越长，每次调用成本越高。"
+      },
+      "maximal": {
+        "label": "最大",
+        "description": "占用 1M 窗口的大部分。每次调用成本最高；仅适合 1M 上下文模型。"
       }
     },
     "modelTuning": {
@@ -1349,14 +1370,15 @@
     "alwaysOnFailed": "无法更改常驻设置",
     "tierBadgeTitle": "{{tier}} 沙箱规格",
     "tier": {
-      "standard": "标准",
-      "performance": "高性能",
-      "max": "旗舰"
+      "standard": "小型",
+      "performance": "中型",
+      "max": "大型",
+      "xlarge": "超大型"
     },
-    "tierSpec": {
-      "standard": "1 vCPU · 1 GB 内存 · 3 GB 磁盘",
-      "performance": "2 vCPU · 4 GB 内存 · 5 GB 磁盘",
-      "max": "4 vCPU · 8 GB 内存 · 10 GB 磁盘"
+    "tierFact": {
+      "cpu": "{{count}} vCPU",
+      "memory": "{{count}} GB 内存",
+      "disk": "{{count}} GB 磁盘"
     },
     "specUpdated": "计算机规格已更新",
     "duplicate": "复制",
@@ -1458,6 +1480,10 @@
     "createDesc": "一台独立的计算机，有自己的文件。放在上面的工作区会随它一起启动和停止。",
     "planLimitedProvider": "需要当前套餐不包含的提供商？",
     "planLimitedBoth": "需要当前套餐不包含的提供商或规格？",
+    "capReached": "你的计算机数量已达套餐上限。请先移除一台，再添加新的。",
+    "capPlanLimited": "需要比当前套餐更多的计算机？",
+    "tierElsewhere": "{{tier}}可在 {{provider}} 上使用。",
+    "switchProvider": "切换到 {{provider}}",
     "computerLabel": "计算机",
     "computerHint": "同一台计算机上的工作区共用它的磁盘，并会一起启动和停止。",
     "primaryOption": "{{name}}（默认）",
@@ -1469,7 +1495,8 @@
       "e2bDesc": "停止后保留内存和正在运行的程序，恢复后从中断处继续。",
       "dockerDesc": "在本机运行。",
       "sshDesc": "任何可通过 SSH 登录的 Linux 服务器或 Mac。停止只会结束 Agent 的程序。",
-      "sshLabel": "你的机器 (SSH)"
+      "sshLabel": "你的机器 (SSH)",
+      "capReached": "已达上限"
     },
     "newComputer": "新建计算机",
     "create": "创建计算机",
@@ -1691,6 +1718,37 @@
         "rateLimited_other": "这个账号在过去一小时内尝试的 SSH 连接过多。请在 {{count}} 分钟后重试。",
         "generic": "无法连接，请重试。"
       }
+    },
+    "remoteControl": {
+      "cardTitle": "这台 Mac",
+      "cardDesc": "让 Agent 直接在这台 Mac 上工作，关闭 LangAlpha 后也不会中断。",
+      "alreadyAdded": "已添加",
+      "title": "远程控制这台 Mac",
+      "intro": "LangAlpha 的 Agent 将以 {{account}} 的身份在这台 Mac 上工作，拥有这个账户的全部权限。",
+      "meansLabel": "这意味着",
+      "meansAccess": "它可以运行任何命令，在任何文件夹中读取或修改 {{account}} 有权访问的任何文件。它的工作会放在你选择的文件夹里，但这台 Mac 上没有任何机制把它限制在那里。",
+      "meansBackground": "关闭 LangAlpha 后它仍会继续工作。远程控制在后台运行，每次登录都会自动启动，直到你将它关闭。",
+      "meansCredentials": "它可以读取命令行工具为 {{account}} 保存的内容，例如 Git 和云服务的登录信息，也能访问你的家庭或办公网络。",
+      "meansAccount": "任何登录你的 LangAlpha 账号的人都可以指挥它。",
+      "stopLabel": "如何停止",
+      "stop": "你可以随时在 LangAlpha 菜单中暂停它，也可以在“系统设置 > 通用 > 登录项”中关闭。在 LangAlpha 中移除这台计算机会关闭远程控制，并从这台 Mac 上删除它的密钥。",
+      "folderPrompts": "macOS 可能会询问是否允许 LangAlpha 访问“文稿”“桌面”等文件夹。你可以拒绝：Agent 自己的文件夹不需要这项权限。",
+      "previewNotice": "远程控制仍处于预览阶段，我们正在加入更多安全保护。在此之前，Agent 拥有与你相同的访问权限，因此请只在可以接受这一点的 Mac 上开启。",
+      "acknowledge": "我了解 LangAlpha 的 Agent 能以 {{account}} 的身份在这台 Mac 上运行命令、修改文件。",
+      "turnOn": "开启远程控制",
+      "turningOn": "正在开启远程控制…",
+      "connecting": "正在连接这台 Mac…",
+      "needsApproval": "需要你在 macOS 中确认。请在“系统设置 > 通用 > 登录项”中允许 LangAlpha 在后台运行，然后点击“继续”。",
+      "continue": "继续",
+      "tryAgain": "重试",
+      "failed": "无法开启远程控制，请重试。",
+      "insecure": "远程控制要求服务器地址以 https 开头，这台 Mac 才能信任收到的配对信息。",
+      "thisMacBadge": "这台 Mac",
+      "provider": "远程控制",
+      "asAccount": "以 {{account}} 身份",
+      "notConnected": "未连接",
+      "paused": "远程控制已暂停，可在 LangAlpha 菜单中恢复。",
+      "removeTurnsOff": "这台 Mac 上的远程控制也会随之关闭。"
     }
   },
   "thread": {
@@ -1915,10 +1973,15 @@
       "automationNamed": "自动化 · {{name}}",
       "viaChannel": "来自 {{platform}}",
       "fromMainAgent": "来自主 Agent",
-      "reportFrom": "来自 {{name}} 的汇报",
-      "reportFromAnalyst": "来自分析师的汇报",
-      "taskFinished": "{{id}} 已完成",
-      "taskFailed": "{{id}} 已失败"
+      "steered": "引导消息",
+      "steeredHint": "由正在进行的运行读取",
+      "analyst": "{{name}} 的分析师",
+      "analystUnnamed": "分析师",
+      "reportedBack": "已汇报",
+      "couldntFinish": "未能完成",
+      "stopped": "已被停止",
+      "taskFinished": "已完成",
+      "taskFailed": "已失败"
     },
     "taskCard": {
       "statusRunning": "运行中",
@@ -1939,15 +2002,26 @@
       "title": "额度已用尽"
     },
     "subagentCard": {
-      "titleFallback": "子 Agent 任务",
-      "viewDetails": "查看任务详情",
-      "openUpdated": "点击查看已更新的子 Agent",
-      "openResumed": "点击查看已恢复的子 Agent",
-      "openRunning": "点击查看运行中的子 Agent",
-      "openDetails": "点击查看子 Agent 详情",
-      "toolUnit_one": "次工具调用",
-      "toolUnit_other": "次工具调用",
-      "tokenUnit": "tokens"
+      "titleFallback": "子 Agent 任务"
+    },
+    "subagentRun": {
+      "starting": "正在启动",
+      "couldntStart": "未能启动",
+      "subagentsOff": "此对话已关闭子 Agent",
+      "openLabel": "打开子 Agent：{{title}}",
+      "count_one": "{{count}} 个子 Agent",
+      "count_other": "{{count}} 个子 Agent",
+      "tally": {
+        "working": "{{count}} 运行中",
+        "done": "{{count}} 已完成",
+        "failed": "{{count}} 失败",
+        "stopped": "{{count}} 已停止",
+        "updated": "{{count}} 已更新",
+        "resumed": "{{count}} 已恢复"
+      },
+      "finishedIn": "已完成，用时 {{duration}}",
+      "finished": "已完成",
+      "model": "模型：{{model}}"
     },
     "subagentBar": {
       "completedWithTools_one": "已完成（{{count}} 次工具调用）",
@@ -1992,25 +2066,38 @@
       "noProgress": "本次运行没有记录到进度。"
     },
     "ptcCard": {
-      "awaitingApproval": "等待批准",
-      "researchDeclined": "已拒绝研究",
+      "handOffTo": "交给<ws> {{name}} 的</ws>分析师",
+      "handOffToAnalyst": "交给分析师",
+      "waitingForYou": "等待你确认",
+      "briefMore": "阅读完整任务说明",
+      "briefLess": "收起",
       "reportBack": "完成后汇报摘要",
-      "approve": "批准",
+      "handOff": "交办",
       "decline": "拒绝",
+      "declined": "已拒绝交办",
       "statusWorking": "工作中",
       "statusStarting": "正在启动…",
       "statusNeedsInput": "需要输入",
       "statusCompleted": "已完成",
       "statusFailed": "已失败",
       "statusStopped": "已停止",
-      "hintProvisioning": "正在配置沙箱…",
-      "hintWorking": "正在后台运行",
-      "hintFailed": "运行未完成便已停止",
-      "hintNotStarted": "运行未能启动",
-      "hintStopped": "运行已停止",
-      "ctaOpenThread": "打开对话",
-      "ctaAnswerContinue": "回答并继续",
-      "ctaViewThread": "查看对话",
+      "needsAnswer": "等待你回答",
+      "answer": "回答",
+      "open": "打开",
+      "seeReport": "查看汇报",
+      "finished": "已完成",
+      "finishedAfter": "已完成，用时 {{duration}}",
+      "couldntFinish": "未能完成",
+      "stopped": "已停止",
+      "stoppedAfter": "已停止，用时 {{duration}}",
+      "couldntStart": "未能启动",
+      "groupTitle_other": "已交给 {{count}} 位分析师",
+      "summaryWorking": "{{count}} 位工作中",
+      "summaryNeedsAnswer_other": "{{count}} 位等待你回答",
+      "summaryFinished": "{{count}} 位已完成",
+      "summaryCouldntFinish": "{{count}} 位未能完成",
+      "summaryStopped": "{{count}} 位已停止",
+      "summaryCouldntStart": "{{count}} 位未能启动",
       "alwaysApprove": "始终允许",
       "alwaysApproveHint": "这次及以后交给分析师的任务都不再询问，可在设置中关闭。"
     },

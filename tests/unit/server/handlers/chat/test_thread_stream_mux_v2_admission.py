@@ -135,3 +135,29 @@ async def test_open_turn_failures_read_as_unserved():
     cache.client.expire = AsyncMock()
     attach_pipeline(cache.client)
     assert await _store_pending(cache, "t-1", "run-1", "task:abc") is False
+
+
+class TestRowTruthCloseCarriesFinish:
+    """A task channel closed from row truth names when the ledger settled the
+    run (``finished``, epoch ms), as the ``run_end`` it never got would have,
+    so a live card ends its run there rather than whenever the close reached
+    the browser."""
+
+    SETTLED = datetime.datetime(2026, 7, 1, 0, 3, tzinfo=datetime.timezone.utc)
+
+    @pytest.mark.asyncio
+    async def test_row_truth_close_takes_finalized_at(self):
+        from src.server.handlers.chat.thread_stream_mux_v2 import _run_row_close
+
+        with _patched(
+            row={"status": "error", "started_at": STARTED, "finalized_at": self.SETTLED}
+        ):
+            close = await _run_row_close("r1", "task:t1")
+        assert close == {"outcome": "error", "finished": self.SETTLED.timestamp() * 1000}
+
+    @pytest.mark.asyncio
+    async def test_open_row_does_not_close(self):
+        from src.server.handlers.chat.thread_stream_mux_v2 import _run_row_close
+
+        with _patched(row={"status": "in_progress", "started_at": STARTED}):
+            assert await _run_row_close("r1", "task:t1") is None

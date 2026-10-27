@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useSta
 import { AT_BOTTOM_PX, NEAR_BOTTOM_PX, createSettleWindow, isNearBottom, type SettleWindow } from '../../utils/scrollHelpers';
 import { INTENT_EVENTS, createStreamFollow, type StreamFollowControls } from './streamFollow';
 import { anchorTop, findMessageElement, resolveScrollContent, resolveScrollViewport, type AnchorPart } from '../../utils/scrollDom';
+import { prefersReducedMotion } from '@/lib/reducedMotion';
 import { scrollMemory } from '@/lib/scrollMemory';
 import { ANCHORED_TOGGLE_EVENT } from '../../utils/anchoredToggle';
 import { useLatestRef } from '@/hooks/useLatestRef';
@@ -411,6 +412,24 @@ export function useChatScroll({
       armSettleTimers();
     },
     [getScrollContainer, withProgrammaticScroll, armSettleTimers, setPillState, messagesLenRef],
+  );
+
+  // A link to a message further on (a hand-off's report): under the viewport
+  // top as the minimap's jump lands it, then focus there, so the next Tab
+  // reaches what it holds. Only this transcript's own messages count: the
+  // threads kept mounted behind it are hidden, and a message loaded from
+  // history is named by its place there, so another can share its name.
+  const revealMessage = useCallback(
+    (id: string): boolean => {
+      const c = getScrollContainer(scrollAreaRef);
+      const el = c && findMessageElement(c, id);
+      if (!c || !el) return false;
+      const drawn = c.querySelectorAll('[data-message-id]');
+      pinToMessage(id, prefersReducedMotion() ? 'auto' : 'smooth', drawn[drawn.length - 1] === el);
+      el.focus({ preventScroll: true });
+      return true;
+    },
+    [getScrollContainer, pinToMessage],
   );
 
   // For a turn that finished under 'reply_start': the first line of the reply
@@ -870,6 +889,7 @@ export function useChatScroll({
     follow,
     pinToMessage,
     revealFiles,
+    revealMessage,
     holdPlace,
     pinTargetRef,
     saveScrollPosition,

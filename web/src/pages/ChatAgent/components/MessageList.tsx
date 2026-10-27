@@ -1,6 +1,7 @@
 import React from 'react';
 import { motion } from '@/lib/framer';
 import { useIsMobile } from '@/hooks/useIsMobile';
+import { useStableArray } from '@/hooks/useStableArray';
 import { NotificationDivider } from './messageList/NotificationDivider';
 import { WakeupRow } from './messageList/WakeupRow';
 import { QuietChecksRow } from './messageList/QuietChecksRow';
@@ -9,13 +10,14 @@ import { TurnFold } from './messageList/TurnFold';
 import { projectMessageContent, visibleProjection } from './messageList/contentProjection';
 import { useMessageActions } from './messageList/MessageActionsContext';
 import { isReportRow, opensTurn } from './messageList/messagePredicates';
-import { UserBubble } from './messageList/UserBubble';
+import { ReportRow, type ReportProvenance } from './messageList/ReportRow';
+import { HandoffPlacesContext, placeHandoffs, samePlaces } from './analystHandoff/reportLinks';
 import {
   computeTurnTails, hasTurn, hiddenOpenerTurns, liveTurns, messageTimeMs, projectTurns,
 } from './messageList/turnProjection';
 import { planQuietChecks } from './messageList/quietChecks';
 import { useLiveMessages, type LiveMessages } from '../session/stream/liveMessages';
-import type { ChatMessage, MessageProvenance, WakeupArrival } from '@/types/chat';
+import type { ChatMessage, WakeupArrival } from '@/types/chat';
 import { turnFilesByTurn } from '../utils/turnFiles';
 import { useWorkspaceFolders } from '../contexts/WorkspaceContext';
 import type { FeedbackResult, FoldState, MessageRecord } from './messageList/types';
@@ -95,6 +97,12 @@ function MessageList({ messages, isLoading, isLoadingHistory, isSubagentView, re
     const last = visible.findLast(({ message }) => message.role !== 'notification')?.message;
     return last?.role === 'assistant' ? last.id : undefined;
   }, [visible]);
+  // Each hand-off on screen with the report that answers it, so its slip can
+  // link down to that report rather than away to the thread. Kept while it
+  // says the same: the list rebuilds on every streamed frame, and a new map
+  // each time would redraw every slip with it.
+  const placeEntries = useStableArray(React.useMemo(() => placeHandoffs(visible), [visible]), samePlaces);
+  const places = React.useMemo(() => new Map(placeEntries), [placeEntries]);
 
   // The deliverables strip reads the RAW projection: a turn's files are named
   // across its whole span, including a bubble the list never paints.
@@ -271,11 +279,11 @@ function MessageList({ messages, isLoading, isLoadingHistory, isSubagentView, re
   }
 
   // The host renders DispatchStatusProvider above the list, so every
-  // PTCAgentCard in it shares one batched dispatch-liveness query and timer.
+  // hand-off in it shares one batched dispatch-liveness query and timer.
   // Here it re-rendered, and re-ran its query hook, on every streamed frame.
   // sibling-space-y, not space-y: NotificationDivider's own my-1 would
   // otherwise replace the gap below it.
-  return (
+  const list = (
     <div className={`font-content ${isMobile ? 'sibling-space-y-4' : 'sibling-space-y-6'}`}>
       {items.map((item) => {
         if (item.kind === 'quiet') {
@@ -290,20 +298,16 @@ function MessageList({ messages, isLoading, isLoadingHistory, isSubagentView, re
             : <NotificationDivider key={message.id as string} message={message} />;
         }
         if (isReportRow(message)) {
+          const prev = visible[i - 1]?.message;
           return (
-            <div
+            <ReportRow
               key={message.id as string}
-              data-message-id={message.id as string}
-              data-message-role="user"
-              className="flex justify-end"
-            >
-              <UserBubble
-                provenance={message.provenance as MessageProvenance}
-                readOnly={readOnly}
-                dispatcherContext={dispatcherContext}
-                className="max-w-[80%]"
-              />
-            </div>
+              id={message.id as string}
+              provenance={message.provenance as ReportProvenance}
+              together={!!prev && isReportRow(prev)}
+              readOnly={readOnly}
+              dispatcherContext={dispatcherContext}
+            />
           );
         }
         // A bubble only ever folds when its turn shows the row that unfolds it:
@@ -373,6 +377,7 @@ function MessageList({ messages, isLoading, isLoadingHistory, isSubagentView, re
       })}
     </div>
   );
+  return <HandoffPlacesContext value={places}>{list}</HandoffPlacesContext>;
 }
 
 /**

@@ -7,7 +7,7 @@
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { Mock } from 'vitest';
-import { fireEvent, screen, within } from '@testing-library/react';
+import { act, fireEvent, screen, waitFor, within } from '@testing-library/react';
 
 import { renderWithProviders } from '@/test/utils';
 import type { Workspace } from '@/types/api';
@@ -51,6 +51,7 @@ vi.mock('../../utils/api', () => ({
   reorderWorkspaces: vi.fn(),
   renameWorkspace: vi.fn(),
   getComputers: vi.fn(),
+  getComputerProviders: vi.fn(async () => ({ providers: [] })),
   streamComputerEvents: vi.fn(async () => {}),
   streamWorkspaceEvents: vi.fn(async () => {}),
   createComputer: vi.fn(),
@@ -76,7 +77,7 @@ vi.mock('../../hooks/workspaceRowActions', () => ({ pinWorkspaceRow: vi.fn() }))
 vi.mock('../../hooks/useNavigationData', () => ({ isEffectivelyPinned: () => false }));
 vi.mock('../../hooks/utils/chatSessionRestore', () => ({ clearChatSession: vi.fn() }));
 
-import { getComputers } from '../../utils/api';
+import { getComputerProviders, getComputers } from '../../utils/api';
 import { useWorkspaces } from '@/hooks/useWorkspaces';
 import WorkspaceGallery from '../WorkspaceGallery';
 
@@ -204,5 +205,45 @@ describe('WorkspaceCard, machine line', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Dismiss' }));
 
     expect(screen.queryByTestId('disk-warning')).not.toBeInTheDocument();
+  });
+
+  it.each([
+    ['daytona', false],
+    ['e2b', true],
+  ])('offers a bigger size to a full Large machine on %s only where one runs', async (kind, offered) => {
+    const disk: Record<string, number> = { standard: 5, performance: 10, max: 10, xlarge: 20 };
+    const spec = (tier: string) => ({ tier, cpu: 2, memory_gib: 8, disk_gib: disk[tier] });
+    (getComputerProviders as Mock).mockResolvedValue({
+      providers: [
+        { kind: 'daytona', is_default: true, allowed: null, tiers: ['standard', 'performance', 'max'].map(spec) },
+        { kind: 'e2b', is_default: false, allowed: true, tiers: ['standard', 'performance', 'max', 'xlarge'].map(spec) },
+      ],
+    });
+    const [machine] = computerList('running').computers;
+    mockGetComputers.mockResolvedValue({
+      computers: [{
+        ...machine,
+        kind,
+        resource_tier: 'max',
+        disk: {
+          used_bytes: 9_000_000_000,
+          total_bytes: 10_000_000_000,
+          free_bytes: 1_000_000_000,
+          measured_at: '2026-09-16T02:23:43.210835Z',
+          level: 'warning',
+        },
+      }],
+      total: 1,
+    });
+    renderWithProviders(<WorkspaceGallery onWorkspaceSelect={vi.fn()} />);
+
+    const warning = await screen.findByTestId('disk-warning');
+    await waitFor(() => expect(getComputerProviders).toHaveBeenCalled());
+    if (offered) expect(await within(warning).findByRole('button', { name: 'Change spec' })).toBeInTheDocument();
+    else {
+      // Let the list land before reading its absence.
+      await act(async () => {});
+      expect(within(warning).queryByRole('button', { name: 'Change spec' })).not.toBeInTheDocument();
+    }
   });
 });

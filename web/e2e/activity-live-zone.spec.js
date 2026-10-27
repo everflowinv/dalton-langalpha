@@ -167,7 +167,7 @@ test.describe('activity live zone', () => {
       await page.locator('textarea').fill('Review the evidence');
       await page.getByRole('button', { name: 'Send message', exact: true }).click();
       await expect(page.getByText('Review underway.', { exact: true })).toBeVisible();
-      await page.getByRole('button', { name: /general-purpose.*Review the evidence/ }).click();
+      await page.getByRole('button', { name: 'Open subagent: Review the evidence', exact: true }).click();
       const thought = page.getByRole('button', { name: 'Inspecting evidence', exact: true });
       await expect(thought).toHaveAttribute('aria-expanded', String(turnDisplay === 'verbose'));
       const body = page.getByText('The subagent is comparing source documents.', { exact: true });

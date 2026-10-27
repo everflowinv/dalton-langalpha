@@ -7,8 +7,10 @@ how long the main agent thought over each message it committed
 and the URL each sandbox image its saved text still named at its end was
 captured to (``images``). A subagent run's
 ``subagent_runs`` row holds the URL each sandbox image it referenced was
-captured to (``images``) and the steering it handed back unread
-(``steering_returned``). A row settled before the column existed has none:
+captured to (``images``), the steering it handed back unread
+(``steering_returned``), and the model it ran when that was not its
+launcher's (``model``), which projection does not read: the task card is
+stamped with it at read time, with the run's times. A row settled before the column existed has none:
 what its archived stream kept is in its legacy facts (``legacy``), and a turn
 settled before its row held its images keeps them in an ``image_capture`` ui
 record on its checkpoint.
@@ -24,6 +26,7 @@ from dataclasses import dataclass, field
 from typing import Any, Required, TypedDict
 
 from ptc_agent.agent.middleware.image_capture import IMAGE_MD_RE
+from ptc_agent.config.agent import SubagentModel
 from src.server.services.history.replay.lanes import MAIN_LANE, agent_lane
 from src.server.services.history.slices import SpanDelta
 
@@ -57,6 +60,8 @@ class SubagentRunFacts(TypedDict, total=False):
     # Sandbox image path -> the URL it was captured to.
     images: dict[str, str]
     steering_returned: list[ReturnedSteering]
+    # Written at admission.
+    model: SubagentModel
 
 
 @dataclass

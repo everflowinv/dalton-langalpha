@@ -2,10 +2,11 @@
 
 const http = require('node:http')
 const { randomUUID } = require('node:crypto')
-const { shell } = require('electron')
+const { ipcMain, shell } = require('electron')
 const origins = require('./origins')
 const { navigate } = require('./navigate')
 const { forDisplay } = require('./redact')
+const { senderWindow } = require('./sender')
 
 // ---------------------------------------------------------------------------
 // System-browser OAuth (RFC 8252), intercepted in the shell.
@@ -717,7 +718,37 @@ function cancelMcp(win, flowId) {
   return true
 }
 
+function registerIpc() {
+  // The one auth-shaped thing the page may ask for, and it hands back a local
+  // URL rather than anything secret. Our own sign-in stays intercepted and
+  // unreachable from here; this is for a connector whose authorization server
+  // refuses a hosted callback, where the page has to name the loopback URI when
+  // it asks its backend to mint the flow. `beginMcp` re-checks the asking
+  // window itself, so a message from anywhere unexpected is refused there.
+  ipcMain.handle('shell:mcp-oauth-begin', (event, returnUrl) => {
+    const win = senderWindow(event)
+    return win ? beginMcp(returnUrl, win) : null
+  })
+
+  // The second half of the handshake: the flow's `state` exists only after the
+  // backend has minted it, and until the shell has been told it, the armed flow
+  // accepts no callback. `bindMcp` re-checks the window and the flow id.
+  ipcMain.handle('shell:mcp-oauth-bind', (event, flowId, state) => {
+    const win = senderWindow(event)
+    return win ? bindMcp(win, flowId, state) : false
+  })
+
+  // The other half of that handshake: the page armed before it knew whether
+  // its backend would mint a flow at all, so it needs a way to say it did not.
+  // Named by flow id, so a start that failed cannot stand down a later connect
+  // that is still running.
+  ipcMain.handle('shell:mcp-oauth-cancel', (event, flowId) => {
+    const win = senderWindow(event)
+    return win ? cancelMcp(win, flowId) : false
+  })
+}
+
 module.exports = {
   isAuthorizeUrl, begin, beginMcp, bindMcp, cancelMcp, startCallbackServer, stopCallbackServer,
-  isProviderNavigation, MCP_CALLBACK_PATH,
+  isProviderNavigation, registerIpc, MCP_CALLBACK_PATH,
 }

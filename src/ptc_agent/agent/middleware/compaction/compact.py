@@ -10,11 +10,12 @@ idle pass does.
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 from langchain_core.messages import AnyMessage
 
@@ -23,6 +24,7 @@ from langchain.chat_models import BaseChatModel
 from src.config.settings import get_compaction_timeout
 from src.llms import LLM, create_llm
 from src.llms.model_spec import summary_reasoning_effort
+from src.llms.provider_compaction import readable_text
 
 from ptc_agent.agent.state import ensure_message_ids
 from ptc_agent.agent.middleware.compaction.types import (
@@ -35,6 +37,8 @@ from ptc_agent.agent.middleware.compaction.summary_request import (
     build_summary_request,
 )
 from ptc_agent.agent.middleware.compaction.summarize import (
+    FIRST_SHARE,
+    PROVIDER_LEAD,
     Progress,
     Summary,
     awrite_summary,
@@ -82,6 +86,20 @@ logger = logging.getLogger(__name__)
 #: that crossed it, however large its last tool result, usually reaches it
 #: whole.
 _SUMMARY_HEADROOM = 50_000
+
+
+class NativeAnswer(NamedTuple):
+    """What a provider's own compaction answered with (see
+    ``src.llms.provider_compaction.native_answer``), and the route that
+    wrote it."""
+
+    answer: dict[str, Any]
+    origin: str | None
+
+
+#: The agent's provider summarizing the messages it is given itself, raising
+#: when it writes no summary.
+Native = Callable[[list[AnyMessage]], Awaitable[NativeAnswer]]
 
 
 @dataclass(frozen=True)
@@ -165,11 +183,13 @@ class Summarizer:
         notes_dir: str | None = None,
         window: Window,
         progress: Progress | None = None,
+        native: Native | None = None,
     ) -> Compaction:
         """Summarize ``view`` before ``cutoff``, ``messages`` being the
-        agent's checkpoint list (what ``window`` trimmed of it aside), from
-        this model, then the next one (see ``_next``), then the server (see
-        ``summarize``).
+        agent's checkpoint list (what ``window`` trimmed of it aside), by
+        ``native`` when given (the agent's provider compacting the messages
+        itself), else from this model, then the next one (see ``_next``),
+        then the server (see ``summarize``).
 
         The transcript is saved first: the summary cites its turn files and
         ends pointing at it only if that save lands and ``workspace_id``'s
@@ -201,20 +221,28 @@ class Summarizer:
         # the listing never holds the compaction past it, and it is dropped
         # with a summary that fails.
         listing = asyncio.create_task(anotes_pointer(backend, notes_dir, remaining))
+        server = functools.partial(
+            server_summary,
+            to_summarize,
+            preserved,
+            raw_messages=messages,
+            turns=turns,
+            window=window,
+        )
         try:
-            summary = await awrite_summary(
+            # The provider gets the summary model's share, leaving the
+            # summarizer a real call when it writes none.
+            summary = await _native_summary(
+                native, to_summarize, server, remaining * FIRST_SHARE
+            )
+            remaining = budget - (time.monotonic() - started)
+            summary = summary or await awrite_summary(
                 model=self.model,
                 fallback=self._next(fallback),
                 prepare=preparer(
                     to_summarize, limit=self.limit, counter=self.counter, render=render
                 ),
-                server=lambda: server_summary(
-                    to_summarize,
-                    preserved,
-                    raw_messages=messages,
-                    turns=turns,
-                    window=window,
-                ),
+                server=server,
                 budget=remaining,
                 progress=progress,
             )
@@ -243,6 +271,34 @@ class Summarizer:
         if self.fallback is not None and not is_other_model(agent_model, self.fallback):
             return self.fallback
         return agent_model
+
+
+async def _native_summary(
+    native: Native | None,
+    to_summarize: list[AnyMessage],
+    server: Callable[..., Summary],
+    budget: float,
+) -> Summary | None:
+    """``native``'s summary within ``budget``, or None for the summarizer to
+    write one: only a cancellation escapes, as in ``awrite_summary``. An
+    answer only its provider can read takes ``server``'s digest as its text."""
+    if native is None:
+        return None
+    try:
+        async with asyncio.timeout(budget):
+            written = await native(to_summarize)
+    except Exception as e:
+        logger.warning("[Compaction] provider compaction failed (%s: %s)", type(e).__name__, e)
+        return None
+    text = readable_text(written.answer)
+    if text is not None:
+        covered = to_summarize
+    else:
+        digest = server(lead=PROVIDER_LEAD)
+        text, covered = digest.text, digest.covered
+    return Summary(
+        text, "provider", covered, native=written.answer, origin=written.origin
+    )
 
 
 def build_summary_event(
@@ -279,6 +335,8 @@ def build_summary_event(
         skills=compacted_skills(to_summarize, preserved, user_skills),
         source=summary.source,
         notes=notes,
+        native=summary.native,
+        origin=summary.origin,
     )
     return build_compaction_event(
         raw_messages=raw_messages,

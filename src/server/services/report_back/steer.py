@@ -556,12 +556,7 @@ async def _analyst_offer(job: dict, thread_id: str) -> SteeredReport | None:
         owed.origin.pop(pointer.AWAITING_RESUME_FIELD, None)
     # DALTON-HOOK(handoff-keep-on-resumable): pass resumable interruption flag to steered message
     content, report_source = await report_message(
-        owed.ptc_thread_id,
-        owed.origin,
-        owed.final_status,
-        steered=True,
-        run_id=analyst_run_id,
-        resumable=resumable,
+        owed, steered=True, resumable=resumable
     )
     return SteeredReport(
         job_id=job_id,

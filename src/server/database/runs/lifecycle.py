@@ -146,10 +146,11 @@ class NewestCheckpoint:
 # The row a finalize hands back: the terminal status plus what the post-CAS
 # effects read (outbox jobs, the transcript export). Never the archived event
 # stream an older row holds: it runs to tens of MB, and decoding it holds the
-# event loop.
+# event loop. The start and the settle the CAS stamps time the run for the
+# report it owes.
 _FINALIZE_ROW_COLUMNS = """
     conversation_response_id, conversation_thread_id, turn_index, run_seq,
-    status, interrupt_reason, metadata
+    status, interrupt_reason, metadata, created_at, usage_settled_at
 """
 
 
@@ -1268,6 +1269,23 @@ async def heal_stale_thread_projections() -> int:
             return cur.rowcount
 
 
+# What a liveness read says of a run, and the joins that keep its reads (a
+# thread's latest run here, a run by id in ``handoff_liveness``) to runs the
+# caller owns.
+_LIVENESS_RUN_COLUMNS = """
+    cr.conversation_response_id, cr.conversation_thread_id,
+    cr.status, cr.cancel_requested_at,
+    -- What run_completed_at reads to say when it settled.
+    cr.created_at, cr.usage_settled_at, cr.execution_time
+"""
+_OWNED_RUNS_FROM = """
+    FROM conversation_responses cr
+    JOIN conversation_threads ct
+        ON ct.conversation_thread_id = cr.conversation_thread_id
+    JOIN workspaces w ON w.workspace_id = ct.workspace_id
+"""
+
+
 async def get_latest_attempts_for_threads(
     thread_ids: List[str], user_id: str
 ) -> Dict[str, Dict[str, Any]]:
@@ -1284,12 +1302,10 @@ async def get_latest_attempts_for_threads(
     async with pool.get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
-                """
+                f"""
                 SELECT DISTINCT ON (cr.conversation_thread_id)
-                    cr.conversation_thread_id, cr.conversation_response_id,
-                    cr.status, cr.cancel_requested_at,
+                    {_LIVENESS_RUN_COLUMNS},
                     cr.interrupt_reason, cr.run_seq,
-                    cr.created_at AS run_started_at,
                     -- A run settled before usage_settled_at existed falls
                     -- back to its start plus measured duration, as replay's
                     -- run_completed_at does.
@@ -1302,10 +1318,7 @@ async def get_latest_attempts_for_threads(
                     ) AS last_activity_at,
                     NULLIF(ct.title, '') AS title,
                     w.name AS workspace_name
-                FROM conversation_responses cr
-                JOIN conversation_threads ct
-                    ON ct.conversation_thread_id = cr.conversation_thread_id
-                JOIN workspaces w ON w.workspace_id = ct.workspace_id
+                {_OWNED_RUNS_FROM}
                 WHERE cr.conversation_thread_id = ANY(%s)
                   AND w.user_id = %s
                 ORDER BY cr.conversation_thread_id, cr.run_seq DESC
@@ -1314,6 +1327,53 @@ async def get_latest_attempts_for_threads(
             )
             rows = await cur.fetchall()
             return {str(r["conversation_thread_id"]): dict(r) for r in rows}
+
+
+# How far back a report's run is followed. A chain longer than this names its
+# newest legs only, which leaves the hand-off without its report link, not the
+# report undelivered.
+_CONTINUED_RUNS_LIMIT = 50
+
+
+async def get_continued_runs(thread_id: str, run_id: str) -> List[str]:
+    """``run_id`` and the runs it continued on ``thread_id``, oldest first.
+
+    A run that ends interrupted waits on the user and reports nothing; the
+    next attempt on the thread, a resume or a message past the interrupt,
+    carries its work on and reports for it, as ``carried_pair`` has it carry
+    a summary's pair. So a report on the last leg answers every leg back to
+    the first one that did not follow an interrupt, which is the run a
+    hand-off named. Empty when ``run_id`` is not a run of ``thread_id``.
+    """
+    thread, run = normalize_uuid(thread_id), normalize_uuid(run_id)
+    if thread is None or run is None:
+        return []
+    async with pool.get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                SELECT conversation_response_id, status
+                FROM conversation_responses
+                WHERE conversation_thread_id = %s
+                  AND run_seq <= (
+                      SELECT run_seq FROM conversation_responses
+                      WHERE conversation_response_id = %s
+                        AND conversation_thread_id = %s
+                  )
+                ORDER BY run_seq DESC
+                LIMIT %s
+                """,
+                (thread, run, thread, _CONTINUED_RUNS_LIMIT),
+            )
+            rows = await cur.fetchall()
+    # The first row is the run itself; each earlier one joins while it ended
+    # interrupted.
+    chain = [str(r["conversation_response_id"]) for r in rows[:1]]
+    for row in rows[1:]:
+        if row["status"] != "interrupted":
+            break
+        chain.append(str(row["conversation_response_id"]))
+    return chain[::-1]
 
 
 async def get_run_statuses(run_ids: List[str]) -> Dict[str, str]:

@@ -28,6 +28,7 @@ from langchain_core.messages import ToolMessage
 from ptc_agent.agent.middleware.background_subagent.task import WORKFLOW_SUBAGENT_TYPE
 from ptc_agent.agent.transcript.classify import is_run_boundary_message
 from src.config.settings import get_redis_ttl_workflow_events
+from src.server.contracts.run_times import epoch_ms
 from src.server.database.conversation import turn_slices as slices_db
 from src.server.database.pool import DATABASE_UNAVAILABLE
 from src.server.database.runs import subagent_runs as sr_db
@@ -427,7 +428,7 @@ class RunLane:
             run_id = str(r["task_run_id"])
             status[run_id] = str(r["status"])
             if r.get("started_at") is not None:
-                started[run_id] = r["started_at"].timestamp() * 1000.0
+                started[run_id] = epoch_ms(r["started_at"])
             error = r.get("failure")
             if isinstance(error, dict) and error.get("error"):
                 failure[run_id] = str(error["error"])

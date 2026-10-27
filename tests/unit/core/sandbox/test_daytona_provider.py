@@ -11,6 +11,7 @@ Covers:
 - DaytonaProvider.is_transient_error() classifies errors correctly
 """
 
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -535,7 +536,7 @@ class TestDaytonaProvider:
         from ptc_agent.core.sandbox.providers.daytona import DaytonaProvider
 
         provider = DaytonaProvider.__new__(DaytonaProvider)
-        provider._config = DaytonaConfig(api_key="test-key")  # standard 1/1/3
+        provider._config = DaytonaConfig(api_key="test-key")  # standard 1/2/5
         provider._working_dir = "/home/workspace"
         provider._client = mock_daytona_client
 
@@ -546,8 +547,8 @@ class TestDaytonaProvider:
         kwargs = mock_ensure.call_args.kwargs
         assert kwargs["tier"] == "standard"
         assert kwargs["resources"].cpu == 1
-        assert kwargs["resources"].memory == 1
-        assert kwargs["resources"].disk == 3
+        assert kwargs["resources"].memory == 2
+        assert kwargs["resources"].disk == 5
 
     @patch("ptc_agent.core.sandbox.providers.daytona.AsyncDaytona")
     @pytest.mark.asyncio
@@ -678,3 +679,186 @@ class TestDaytonaProvider:
         assert provider.is_transient_error(
             Exception("RemoteDisconnected: peer closed")
         )
+
+
+# ---------------------------------------------------------------------------
+# DaytonaProvider.metrics_since
+# ---------------------------------------------------------------------------
+
+_T0 = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
+
+
+def _bucket(ts: datetime, **fields) -> SimpleNamespace:
+    """An SDK ``SandboxMetrics``: what Daytona did not report is 0."""
+    values = {
+        "cpu_count": 2,
+        "cpu_used_pct": 12.5,
+        "disk_total": 10 * 2**30,
+        "disk_used": 2**30,
+        "mem_total": 4 * 2**30,
+        "mem_used": 2**29,
+        "mem_cache": 2**28,
+    }
+    return SimpleNamespace(timestamp=ts, **{**values, **fields})
+
+
+def _metrics_provider(buckets):
+    from ptc_agent.core.sandbox.providers.daytona import DaytonaProvider
+
+    provider = DaytonaProvider.__new__(DaytonaProvider)
+    sdk_sandbox = MagicMock()
+    sdk_sandbox.get_metrics = AsyncMock(return_value=buckets)
+    sdk_sandbox.start = AsyncMock()
+    provider._client = MagicMock()
+    provider._client.get = AsyncMock(return_value=sdk_sandbox)
+    return provider, sdk_sandbox
+
+
+class TestDaytonaMetricsSince:
+    def test_reports_metrics(self):
+        from ptc_agent.core.sandbox.providers.daytona import DaytonaProvider
+
+        assert DaytonaProvider.reports_metrics is True
+
+    @pytest.mark.asyncio
+    async def test_maps_fields_and_reads_without_starting(self):
+        provider, sdk_sandbox = _metrics_provider([_bucket(_T0 + timedelta(minutes=1))])
+        until = _T0 + timedelta(hours=1)
+
+        [sample] = await provider.metrics_since("sbx", _T0, until=until)
+
+        provider._client.get.assert_awaited_once_with("sbx")
+        sdk_sandbox.start.assert_not_awaited()
+        sdk_sandbox.get_metrics.assert_awaited_once_with(_T0, until)
+        assert sample.timestamp == _T0 + timedelta(minutes=1)
+        assert sample.cpu_used_pct == 12.5
+        assert sample.cpu_count == 2
+        assert sample.mem_used_bytes == 2**29
+        assert sample.mem_cache_bytes == 2**28
+        assert sample.mem_total_bytes == 4 * 2**30
+        assert sample.disk_used_bytes == 2**30
+        assert sample.disk_total_bytes == 10 * 2**30
+
+    @pytest.mark.asyncio
+    async def test_without_until_the_window_ends_now(self):
+        provider, sdk_sandbox = _metrics_provider([])
+
+        await provider.metrics_since("sbx", _T0)
+
+        end = sdk_sandbox.get_metrics.await_args.args[1]
+        assert end.tzinfo is not None
+        assert abs(datetime.now(UTC) - end) < timedelta(seconds=5)
+
+    @pytest.mark.asyncio
+    async def test_unreported_sizes_are_none_and_idle_cpu_is_a_reading(self):
+        provider, _ = _metrics_provider(
+            [
+                _bucket(
+                    _T0 + timedelta(minutes=1),
+                    cpu_count=0,
+                    cpu_used_pct=0.0,
+                    disk_total=0,
+                    disk_used=0,
+                    mem_total=0,
+                )
+            ]
+        )
+
+        [sample] = await provider.metrics_since("sbx", _T0)
+
+        assert sample.cpu_used_pct == 0.0
+        assert sample.cpu_count is None
+        assert sample.mem_total_bytes is None
+        assert sample.disk_total_bytes is None
+        assert sample.disk_used_bytes is None
+
+    @pytest.mark.asyncio
+    async def test_window_is_strict_after_since_and_up_to_until(self):
+        until = _T0 + timedelta(minutes=10)
+        provider, _ = _metrics_provider(
+            [
+                _bucket(_T0),
+                _bucket(_T0 + timedelta(minutes=5)),
+                _bucket(until),
+                _bucket(until + timedelta(seconds=1)),
+            ]
+        )
+
+        samples = await provider.metrics_since("sbx", _T0, until=until)
+
+        assert [s.timestamp for s in samples] == [_T0 + timedelta(minutes=5), until]
+
+    @pytest.mark.asyncio
+    async def test_samples_are_oldest_first_and_utc(self):
+        naive = datetime(2026, 1, 1, 12, 5)
+        provider, _ = _metrics_provider(
+            [
+                _bucket(_T0 + timedelta(minutes=9)),
+                _bucket(naive),
+                _bucket(_T0 + timedelta(minutes=7)),
+            ]
+        )
+
+        samples = await provider.metrics_since("sbx", _T0)
+
+        assert [s.timestamp for s in samples] == [
+            _T0 + timedelta(minutes=5),
+            _T0 + timedelta(minutes=7),
+            _T0 + timedelta(minutes=9),
+        ]
+        assert all(s.timestamp.utcoffset() == timedelta(0) for s in samples)
+
+    @pytest.mark.asyncio
+    async def test_sdk_errors_propagate(self):
+        provider, sdk_sandbox = _metrics_provider([])
+        sdk_sandbox.get_metrics.side_effect = RuntimeError("telemetry down")
+
+        with pytest.raises(RuntimeError, match="telemetry down"):
+            await provider.metrics_since("sbx", _T0)
+
+        provider._client.get.side_effect = RuntimeError("lookup failed")
+        with pytest.raises(RuntimeError, match="lookup failed"):
+            await provider.metrics_since("sbx", _T0)
+
+    @pytest.mark.asyncio
+    async def test_a_429_on_the_cause_is_a_rate_limited_error(self):
+        from daytona import DaytonaError
+
+        from ptc_agent.core.sandbox.runtime import SandboxRateLimitedError
+
+        provider, sdk_sandbox = _metrics_provider([])
+        cause = RuntimeError("too many requests")
+        cause.status = 429  # type: ignore[attr-defined]
+        error = DaytonaError("Failed to get sandbox metrics\nrate limited")
+        error.__cause__ = cause
+        sdk_sandbox.get_metrics.side_effect = error
+
+        with pytest.raises(SandboxRateLimitedError, match="Failed to get sandbox metrics"):
+            await provider.metrics_since("sbx", _T0)
+
+    @pytest.mark.asyncio
+    async def test_any_other_status_propagates_unchanged(self):
+        from daytona import DaytonaError
+
+        from ptc_agent.core.sandbox.runtime import SandboxRateLimitedError
+
+        provider, sdk_sandbox = _metrics_provider([])
+        error = DaytonaError("not found", status_code=404)
+        sdk_sandbox.get_metrics.side_effect = error
+
+        with pytest.raises(DaytonaError) as raised:
+            await provider.metrics_since("sbx", _T0)
+
+        assert raised.value is error
+        assert not isinstance(raised.value, SandboxRateLimitedError)
+
+    @pytest.mark.asyncio
+    async def test_memory_in_use_is_not_adjusted_by_the_cache(self):
+        provider, _ = _metrics_provider(
+            [_bucket(_T0 + timedelta(minutes=1), mem_used=2**29, mem_cache=2**28)]
+        )
+
+        [sample] = await provider.metrics_since("sbx", _T0)
+
+        assert sample.mem_used_bytes == 2**29
+        assert sample.mem_cache_bytes == 2**28

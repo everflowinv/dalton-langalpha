@@ -69,3 +69,44 @@ async def test_projection_healer_uses_the_same_latest_definition(
     sql = _executed_sql(mock_cursor)
     assert "ORDER BY cr.run_seq DESC" in sql
     assert "turn_index" not in sql
+
+
+# A report names the runs it continued by walking back over the thread's
+# attempts in the same order, so an attempt before the reported run is the
+# one before it by run_seq.
+_THREAD = str(uuid.uuid4())
+_LEGS = [str(uuid.uuid4()) for _ in range(4)]  # oldest first; the last reports
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("statuses", "chain"),
+    [
+        (["completed", "interrupted", "interrupted", "completed"], _LEGS[1:]),
+        (["interrupted", "completed", "interrupted", "completed"], _LEGS[2:]),
+        (None, []),
+    ],
+    ids=["interrupted-chain", "broken-by-a-completed-run", "missing-run"],
+)
+async def test_a_reported_run_names_the_interrupted_runs_it_continued(
+    mock_db_connection, mock_cursor, statuses, chain
+):
+    """Oldest first, back to the first attempt that did not follow an
+    interrupt. A run that is not on the thread reads no rows."""
+    mock_cursor.fetchall.return_value = (
+        []
+        if statuses is None
+        else [
+            {"conversation_response_id": uuid.UUID(run), "status": status}
+            for run, status in zip(reversed(_LEGS), reversed(statuses))
+        ]
+    )
+
+    got = await tl_db.get_continued_runs(_THREAD, _LEGS[-1].upper())
+
+    assert got == chain
+    sql = _executed_sql(mock_cursor)
+    assert "ORDER BY run_seq DESC" in sql
+    assert "LIMIT %s" in sql
+    assert "turn_index" not in sql
+    assert mock_cursor.execute.call_args.args[1][:3] == (_THREAD, _LEGS[-1], _THREAD)

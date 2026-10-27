@@ -8,6 +8,7 @@
     "speed": 3,
     "intelligence": 3,
     "context": 1050000,
+    "compaction_profile": "expansive",
     "input_modalities": [
       "text",
       "image",
@@ -43,6 +44,7 @@
     "speed": 2,
     "intelligence": 5,
     "context": 1050000,
+    "compaction_profile": "expansive",
     "input_modalities": [
       "text",
       "image",
@@ -77,6 +79,7 @@
     "speed": 3,
     "intelligence": 5,
     "context": 1050000,
+    "compaction_profile": "expansive",
     "input_modalities": [
       "text",
       "image",
@@ -110,6 +113,7 @@
     "speed": 5,
     "intelligence": 3,
     "context": 1050000,
+    "compaction_profile": "expansive",
     "input_modalities": [
       "text",
       "image",
@@ -145,6 +149,7 @@
     "speed": 3,
     "intelligence": 5,
     "context": 1000000,
+    "compaction_profile": "expansive",
     "input_modalities": [
       "text",
       "image",
@@ -157,6 +162,9 @@
         "display": "summarized"
       }
     },
+    "additional_betas": [
+      "compact-2026-09-04"
+    ],
     "reasoning": {
       "efforts": [
         "low",
@@ -178,6 +186,7 @@
     "speed": 3,
     "intelligence": 5,
     "context": 1000000,
+    "compaction_profile": "expansive",
     "input_modalities": [
       "text",
       "image",
@@ -194,7 +203,8 @@
       }
     },
     "additional_betas": [
-      "thinking-binding-controls-2026-08-01"
+      "thinking-binding-controls-2026-08-01",
+      "compact-2026-09-04"
     ],
     "reasoning": {
       "efforts": [
@@ -217,6 +227,7 @@
     "speed": 4,
     "intelligence": 5,
     "context": 1000000,
+    "compaction_profile": "expansive",
     "input_modalities": [
       "text",
       "image",
@@ -233,7 +244,8 @@
       }
     },
     "additional_betas": [
-      "thinking-binding-controls-2026-08-01"
+      "thinking-binding-controls-2026-08-01",
+      "compact-2026-09-04"
     ],
     "reasoning": {
       "efforts": [
@@ -255,6 +267,7 @@
     "speed": 5,
     "intelligence": 3,
     "context": 1000000,
+    "compaction_profile": "expansive",
     "input_modalities": [
       "text",
       "image",
@@ -271,7 +284,8 @@
       }
     },
     "additional_betas": [
-      "thinking-binding-controls-2026-08-01"
+      "thinking-binding-controls-2026-08-01",
+      "compact-2026-09-04"
     ],
     "reasoning": {
       "efforts": [
@@ -1042,6 +1056,7 @@
     "speed": 3,
     "intelligence": 3,
     "context": 1050000,
+    "compaction_profile": "expansive",
     "input_modalities": [
       "text",
       "image",
@@ -1078,6 +1093,7 @@
     "speed": 2,
     "intelligence": 5,
     "context": 1050000,
+    "compaction_profile": "expansive",
     "input_modalities": [
       "text",
       "image",
@@ -1113,6 +1129,7 @@
     "speed": 3,
     "intelligence": 5,
     "context": 1050000,
+    "compaction_profile": "expansive",
     "input_modalities": [
       "text",
       "image",
@@ -1147,6 +1164,7 @@
     "speed": 5,
     "intelligence": 3,
     "context": 1050000,
+    "compaction_profile": "expansive",
     "input_modalities": [
       "text",
       "image",
@@ -1183,6 +1201,7 @@
     "speed": 3,
     "intelligence": 5,
     "context": 1000000,
+    "compaction_profile": "expansive",
     "input_modalities": [
       "text",
       "image",
@@ -1195,6 +1214,9 @@
         "display": "summarized"
       }
     },
+    "additional_betas": [
+      "compact-2026-09-04"
+    ],
     "reasoning": {
       "efforts": [
         "low",
@@ -1216,6 +1238,7 @@
     "speed": 3,
     "intelligence": 5,
     "context": 1000000,
+    "compaction_profile": "expansive",
     "input_modalities": [
       "text",
       "image",
@@ -1232,7 +1255,8 @@
       }
     },
     "additional_betas": [
-      "thinking-binding-controls-2026-08-01"
+      "thinking-binding-controls-2026-08-01",
+      "compact-2026-09-04"
     ],
     "reasoning": {
       "efforts": [
@@ -1255,6 +1279,7 @@
     "speed": 4,
     "intelligence": 5,
     "context": 1000000,
+    "compaction_profile": "expansive",
     "input_modalities": [
       "text",
       "image",
@@ -1271,7 +1296,8 @@
       }
     },
     "additional_betas": [
-      "thinking-binding-controls-2026-08-01"
+      "thinking-binding-controls-2026-08-01",
+      "compact-2026-09-04"
     ],
     "reasoning": {
       "efforts": [
@@ -1293,6 +1319,7 @@
     "speed": 5,
     "intelligence": 3,
     "context": 1000000,
+    "compaction_profile": "expansive",
     "input_modalities": [
       "text",
       "image",
@@ -1309,7 +1336,8 @@
       }
     },
     "additional_betas": [
-      "thinking-binding-controls-2026-08-01"
+      "thinking-binding-controls-2026-08-01",
+      "compact-2026-09-04"
     ],
     "reasoning": {
       "efforts": [

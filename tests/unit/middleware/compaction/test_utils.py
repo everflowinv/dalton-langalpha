@@ -22,6 +22,7 @@ from ptc_agent.agent.middleware.compaction.utils import (
     find_group_safe_cutoff,
     get_effective_messages,
     partition_at_cutoff,
+    provider_cutoff,
     strip_orphan_tool_messages,
 )
 
@@ -315,6 +316,87 @@ class TestFindGroupSafeCutoff:
         messages = self._batch()
         assert find_group_safe_cutoff(messages, 0) == 0
         assert find_group_safe_cutoff(messages, len(messages)) == len(messages)
+
+
+class TestProviderCutoff:
+    """Where a provider's own compaction may cut: the latest point at or
+    before the cutoff where the kept part opens on an assistant turn right
+    after a user-side message, never inside a tool-call group, and with at
+    least two messages summarized."""
+
+    def test_the_latest_assistant_turn_after_a_request(self):
+        messages = [
+            HumanMessage(content="q0", id="0"),
+            AIMessage(content="a1", id="1"),
+            HumanMessage(content="q2", id="2"),
+            AIMessage(content="a3", id="3"),
+            HumanMessage(content="q4", id="4"),
+            AIMessage(content="a5", id="5"),
+        ]
+        assert provider_cutoff(messages, 4) == 3
+        assert provider_cutoff(messages, 5) == 5
+
+    def test_an_assistant_turn_after_a_tool_result(self):
+        messages = [
+            HumanMessage(content="q0", id="0"),
+            AIMessage(content="", id="1", tool_calls=[_call("tc2"), _call("tc3")]),
+            ToolMessage(content="r2", id="2", tool_call_id="tc2"),
+            ToolMessage(content="r3", id="3", tool_call_id="tc3"),
+            AIMessage(content="a4", id="4"),
+            HumanMessage(content="q5", id="5"),
+            AIMessage(content="a6", id="6"),
+        ]
+        assert provider_cutoff(messages, 5) == 4
+
+    def test_an_assistant_turn_after_another_is_not_a_cut(self):
+        messages = [
+            HumanMessage(content="q0", id="0"),
+            AIMessage(content="a1", id="1"),
+            AIMessage(content="a2", id="2"),
+            AIMessage(content="a3", id="3"),
+        ]
+        assert provider_cutoff(messages, 3) == 0
+
+    def test_never_splits_a_tool_call_group(self):
+        """A5 follows a result, but cutting there strands T5, whose call A3
+        would be summarized."""
+        messages = [
+            HumanMessage(content="q0", id="0"),
+            AIMessage(content="a1", id="1"),
+            HumanMessage(content="q2", id="2"),
+            AIMessage(content="", id="3", tool_calls=[_call("tc4"), _call("tc5")]),
+            ToolMessage(content="r4", id="4", tool_call_id="tc4"),
+            AIMessage(content="", id="5", tool_calls=[_call("tc6")]),
+            ToolMessage(content="r5", id="t5", tool_call_id="tc5"),
+            ToolMessage(content="r6", id="t6", tool_call_id="tc6"),
+            AIMessage(content="a8", id="8"),
+        ]
+        assert find_group_safe_cutoff(messages, 5) != 5
+        assert provider_cutoff(messages, 6) == 3
+
+    def test_a_cutoff_past_the_end_keeps_the_last_message(self):
+        messages = [
+            HumanMessage(content="q0", id="0"),
+            AIMessage(content="a1", id="1"),
+            HumanMessage(content="q2", id="2"),
+            AIMessage(content="a3", id="3"),
+        ]
+        assert provider_cutoff(messages, 10) == 3
+
+    def test_at_least_two_messages_are_summarized(self):
+        messages = [
+            HumanMessage(content="q0", id="0"),
+            AIMessage(content="a1", id="1"),
+            HumanMessage(content="q2", id="2"),
+            AIMessage(content="a3", id="3"),
+        ]
+        assert provider_cutoff(messages, 1) == 0
+        assert provider_cutoff(messages, 2) == 0
+        assert provider_cutoff(messages[:3], 2) == 0
+
+    def test_no_cut_in_an_empty_or_short_view(self):
+        assert provider_cutoff([], 0) == 0
+        assert provider_cutoff([HumanMessage(content="q0", id="0")], 1) == 0
 
 
 class TestStripOrphanToolMessages:

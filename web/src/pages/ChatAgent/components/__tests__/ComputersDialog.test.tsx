@@ -211,8 +211,8 @@ describe('ComputersDialog', () => {
     expect(screen.getByText('Running')).toBeInTheDocument();
     expect(screen.getByText('Stopped')).toBeInTheDocument();
 
-    expect(screen.getByText('Standard')).toBeInTheDocument();
-    expect(screen.getByText('Performance')).toBeInTheDocument();
+    expect(screen.getByText('Small')).toBeInTheDocument();
+    expect(screen.getByText('Medium')).toBeInTheDocument();
 
     // Only the primary is badged.
     expect(screen.getAllByText('Primary')).toHaveLength(1);
@@ -331,7 +331,7 @@ describe('ComputersDialog', () => {
     expect(await screen.findByRole('radiogroup', { name: 'Provider' })).toBeInTheDocument();
     expect(radio('Daytona')).toBeChecked();
     await user.click(radio('E2B'));
-    await user.click(radio('Performance'));
+    await user.click(radio('Medium'));
     await user.type(screen.getByLabelText(/^Name/), 'Research box');
     await user.click(screen.getByRole('button', { name: 'Create computer' }));
 
@@ -467,6 +467,78 @@ describe('ComputersDialog', () => {
   });
 });
 
+describe('ComputersDialog: at the computer cap', () => {
+  const AT_CAP = { performance: null, max: null, always_on: null, computers: { used: 2, limit: 2 } };
+  const WITH_SSH: ComputerProviderOption[] = [...DAYTONA_AND_E2B, { kind: 'ssh', is_default: false, allowed: true }];
+
+  it('holds New computer and says why when no provider is left open', async () => {
+    mockProviders.mockResolvedValue({ providers: DAYTONA_AND_E2B });
+    mockQuota.mockResolvedValue(AT_CAP);
+    open();
+
+    const button = await screen.findByRole('button', { name: 'New computer' });
+    await waitFor(() => expect(button).toBeDisabled());
+    expect(button).toHaveAccessibleDescription(
+      'You have as many computers as your plan allows. Remove one to add another.',
+    );
+    expect(screen.getByTestId('computers-cap-plan-cta')).toHaveTextContent(
+      'Need more computers than your plan includes? Upgrade plan',
+    );
+  });
+
+  it.each([
+    ['the plan lacks SSH', [...DAYTONA_AND_E2B, { kind: 'ssh', is_default: false, allowed: false }]],
+    ['the deployment offers no SSH', DAYTONA_ONLY],
+  ])('holds it too when %s', async (_case, providers) => {
+    mockProviders.mockResolvedValue({ providers });
+    mockQuota.mockResolvedValue(AT_CAP);
+    open();
+    await waitFor(() => expect(screen.getByRole('button', { name: 'New computer' })).toBeDisabled());
+  });
+
+  it("opens onto the user's own machine when SSH is open", async () => {
+    const user = userEvent.setup();
+    mockProviders.mockResolvedValue({ providers: WITH_SSH });
+    mockQuota.mockResolvedValue(AT_CAP);
+    open();
+    // Both have landed once the rows name a provider.
+    await screen.findAllByText('Daytona');
+    await waitFor(() => expect(mockQuota).toHaveBeenCalled());
+
+    const button = screen.getByRole('button', { name: 'New computer' });
+    expect(button).toBeEnabled();
+    expect(screen.queryByTestId('computers-cap-plan-cta')).not.toBeInTheDocument();
+    await user.click(button);
+    await screen.findByRole('dialog', { name: 'New computer' });
+    expect(radio('Daytona')).toBeDisabled();
+    expect(radio('Your machine \\(SSH\\)')).toBeChecked();
+  });
+
+  it.each([
+    ['unknown', { performance: null, max: null, always_on: null, computers: null }],
+    ['unlimited', { performance: null, max: null, always_on: null, computers: { used: 9, limit: -1 } }],
+    ['from an older server', { performance: null, max: null, always_on: null }],
+  ])('never holds it when the cap is %s', async (_case, quota) => {
+    mockProviders.mockResolvedValue({ providers: DAYTONA_AND_E2B });
+    mockQuota.mockResolvedValue(quota);
+    const { queryClient } = open();
+    await waitFor(() => expect(queryClient.getQueryData(queryKeys.workspaces.quota())).toBeDefined());
+    expect(screen.getByRole('button', { name: 'New computer' })).toBeEnabled();
+  });
+
+  it('re-reads the count once a computer is created', async () => {
+    const user = userEvent.setup();
+    mockQuota.mockResolvedValue({ performance: null, max: null, always_on: null, computers: { used: 1, limit: 2 } });
+    mockCreate.mockResolvedValue({ ...CREATED, kind: 'daytona', resource_tier: 'standard' });
+    await openCreateForm(user);
+    await waitFor(() => expect(mockQuota).toHaveBeenCalled());
+    const reads = mockQuota.mock.calls.length;
+
+    await user.click(screen.getByRole('button', { name: 'Create computer' }));
+    await waitFor(() => expect(mockQuota.mock.calls.length).toBeGreaterThan(reads));
+  });
+});
+
 describe('ComputersDialog: removing a computer', () => {
   it('offers Remove on every computer but the primary', async () => {
     open();
@@ -496,7 +568,7 @@ describe('ComputersDialog: removing a computer', () => {
     // Its owner sizes it, so the tier its row holds is no spec of theirs.
     mockGetComputers.mockResolvedValue(withSecond({ kind: 'ssh', ssh: null }));
     open();
-    expect(await secondRow()).not.toHaveTextContent('Performance');
+    expect(await secondRow()).not.toHaveTextContent('Medium');
   });
 
   it.each([
@@ -559,7 +631,7 @@ describe('ComputersDialog: removing a computer', () => {
     expect(within(confirm).queryByRole('checkbox')).not.toBeInTheDocument();
     await user.click(within(confirm).getByRole('button', { name: 'Remove computer' }));
 
-    expect(mockDelete).toHaveBeenCalledWith(SECOND_ID, { removeKey: true });
+    expect(mockDelete).toHaveBeenCalledWith(SECOND_ID, { removeKey: false });
     await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Remove Second machine?' })).not.toBeInTheDocument());
     expect(screen.getAllByTestId('computer-row')).toHaveLength(1);
     expect(screen.queryByText('Second machine')).not.toBeInTheDocument();

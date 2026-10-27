@@ -24,7 +24,7 @@ from ptc_agent.core.sandbox.runtime import (
 )
 from src.server.database.workspace_folders import WorkspaceFolderMoving
 from src.server.models.computer import ComputerStatus
-from src.server.services.computer_errors import SpecChangeLostError
+from src.server.services.computer_errors import SpecChangeLostError, UnknownResourceTier
 from src.server.services.computer_manager._types import ComputerBinding
 
 # Imported for its side effect: this module binds ``platform_secrets_active`` by
@@ -1212,6 +1212,44 @@ class TestBackupFilesStrict:
         wm._recover_sandbox.assert_awaited_once()
         mock_status.assert_not_awaited()
 
+    @pytest.mark.asyncio
+    @cm_patch("try_claim_computer_for_start", AsyncMock(return_value=True))
+    @cm_patch("SessionManager")
+    @patch(f"{_PROVISIONING}.update_computer_status", new_callable=AsyncMock)
+    async def test_migration_reads_usage_before_its_cleanup_deletes_the_sandbox(
+        self, mock_status, mock_sessions
+    ):
+        wm = WorkspaceManager(_make_config())
+        session = _make_mock_session()
+        session.sandbox.working_dir = "/old/root"
+        binding = ComputerBinding(
+            workspace_id="workspace",
+            computer_id=_STUB_COMPUTER_ID,
+            root_dir="/new/root",
+            kind="daytona",
+            provider_config={},
+        )
+        order: list[str] = []
+        wm._machine_has_active_tasks = AsyncMock(return_value=False)
+        wm._backup_machine_files_to_db = AsyncMock()
+        wm._recover_sandbox = AsyncMock(return_value=_make_mock_session())
+        wm._write_sandbox_stamp = AsyncMock()
+        wm._fold_usage_before_delete = AsyncMock(side_effect=lambda _c: order.append("read"))
+        wm._end_replaced_usage_run = AsyncMock(
+            side_effect=lambda _c, sandbox_id: order.append(f"end {sandbox_id}")
+        )
+        mock_sessions.cleanup_session = AsyncMock(
+            side_effect=lambda _c: order.append("delete")
+        )
+
+        await wm._maybe_migrate_sandbox(
+            binding, "user-1", session,
+            {"config": {"sandbox_config_hash": "old"}, "sandbox_id": "sandbox-abc"},
+            expected_hash="new",
+        )
+
+        assert order == ["read", "delete", "end sandbox-abc"]
+
     @staticmethod
     def _backup(wm, workspace_id, **kwargs):
         """The mirror is per project, but the session it reads is the machine's."""
@@ -2059,7 +2097,7 @@ class TestCleanupIdle:
 
         assert count == 1
         mock_stop.assert_awaited_once_with(
-            computer_id, unchanged_since=row["updated_at"]
+            computer_id, unchanged_since=row["updated_at"], reason="idle"
         )
         mock_computers.assert_awaited_once_with("running", limit=1000, offset=0)
 
@@ -2102,7 +2140,7 @@ class TestCleanupIdle:
             call("running", limit=1000, offset=1000),
         ]
         stop.assert_awaited_once_with(
-            str(eligible["computer_id"]), unchanged_since=eligible["updated_at"]
+            str(eligible["computer_id"]), unchanged_since=eligible["updated_at"], reason="idle"
         )
 
     @pytest.mark.asyncio
@@ -2134,7 +2172,7 @@ class TestCleanupIdle:
             assert await wm.cleanup_idle_workspaces() == 1
 
         mock_stop.assert_awaited_once_with(
-            short["computer_id"], unchanged_since=short["updated_at"]
+            short["computer_id"], unchanged_since=short["updated_at"], reason="idle"
         )
 
     @pytest.mark.asyncio
@@ -2180,7 +2218,7 @@ class TestCleanupIdle:
 
         assert count == stopped
         assert mock_stop.await_args_list == [
-            call(computer_id, unchanged_since=row["updated_at"])
+            call(computer_id, unchanged_since=row["updated_at"], reason="idle")
         ] * stopped
 
     @pytest.mark.asyncio
@@ -2286,7 +2324,7 @@ class TestCleanupIdle:
 
         mock_disable.assert_awaited_once_with(computer_id, False)
         mock_stop.assert_awaited_once_with(
-            computer_id, unchanged_since=disabled["updated_at"]
+            computer_id, unchanged_since=disabled["updated_at"], reason="idle"
         )
         assert count == 1
 
@@ -5336,6 +5374,35 @@ class TestMaybeReclaimLazyTier:
 
     @pytest.mark.asyncio
     @patch(f"{_ENTITLEMENTS}.get_computer")
+    async def test_lapsed_tier_reads_usage_before_the_delete_and_ends_the_run(
+        self, mock_get_computer
+    ):
+        manager = self._make_manager()
+        mock_get_computer.return_value = self._elevated()
+        session = _make_mock_session()
+        manager._machine(_STUB_COMPUTER_ID).session = session
+        order: list[str] = []
+        manager._entitled_tier = AsyncMock(return_value="standard")
+        manager._fold_usage_before_delete = AsyncMock(
+            side_effect=lambda _c: order.append("read")
+        )
+        manager._destroy_sandbox = AsyncMock(
+            side_effect=lambda *_a, **_k: order.append("delete")
+        )
+        manager._end_replaced_usage_run = AsyncMock(
+            side_effect=lambda _c, sandbox_id: order.append(f"end {sandbox_id}")
+        )
+        manager._clear_session = AsyncMock()
+        manager._recover_sandbox = AsyncMock(return_value=_make_mock_session())
+
+        await manager._maybe_reclaim_lazy_tier(
+            _binding(str(uuid.uuid4()), self._elevated()), "user-1", session
+        )
+
+        assert order == ["read", "delete", "end sandbox-1"]
+
+    @pytest.mark.asyncio
+    @patch(f"{_ENTITLEMENTS}.get_computer")
     async def test_still_entitled_returns_none(self, mock_get_computer):
         """Still entitled → None (proceed on the existing sandbox), no teardown."""
         manager = self._make_manager()
@@ -5841,10 +5908,23 @@ class TestSetWorkspaceSpec:
         """Tier validation uses the durable computer provider configuration."""
         mock_get_computer.return_value = self._computer()
         manager = self._make_manager()
-        with pytest.raises(ValueError, match="Unknown resource tier"):
+        with pytest.raises(UnknownResourceTier, match="does not offer the 'titanium' spec"):
             await manager.set_workspace_spec("ws-1", "titanium")
         # Refused by the precheck, before anything is claimed.
         assert mock_get_computer.await_count == 1
+        self.claim.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @patch(f"{_SPEC}.get_computer", new_callable=AsyncMock)
+    async def test_extra_large_is_refused_on_a_daytona_computer(self, mock_get_computer):
+        """Daytona's own tiers stop at Large, whatever E2B offers."""
+        from ptc_agent.config.core import DaytonaConfig
+
+        mock_get_computer.return_value = self._computer(kind="daytona")
+        manager = self._make_manager()
+        manager.config.sandbox.daytona.resource_tiers = DaytonaConfig().resource_tiers
+        with pytest.raises(UnknownResourceTier, match="'xlarge'"):
+            await manager.set_computer_spec(_STUB_COMPUTER["computer_id"], "xlarge")
         self.claim.assert_not_awaited()
 
     @pytest.mark.asyncio

@@ -6,6 +6,7 @@ import asyncio
 import re
 import time
 from collections.abc import Callable, Sequence
+from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 import httpx
@@ -36,6 +37,7 @@ from ptc_agent.core.sandbox.providers._image_recipe import (
     image_identity,
     image_steps,
 )
+from ptc_agent.core.sandbox.providers._metrics import normalize_samples
 from ptc_agent.core.sandbox.providers._tiers import resolve_tier
 from ptc_agent.core.sandbox.providers.e2b_runtime import E2BRuntime, _window
 from ptc_agent.core.sandbox.providers.e2b_secrets import (
@@ -45,8 +47,10 @@ from ptc_agent.core.sandbox.providers.e2b_secrets import (
     secret_marker,
 )
 from ptc_agent.core.sandbox.runtime import (
+    MetricSample,
     SandboxFailureKind,
     SandboxProvider,
+    SandboxRateLimitedError,
     SandboxTransientError,
 )
 
@@ -106,6 +110,7 @@ class E2BProvider(SandboxProvider):
     # E2B fixes a sandbox's env at create, and its stop is a pause that keeps
     # every process, so only a replacement sandbox would be clean.
     scrubs_platform_secrets = False
+    reports_metrics = True
 
     @classmethod
     def platform_secret_name(cls, name: str) -> str:
@@ -250,6 +255,28 @@ class E2BProvider(SandboxProvider):
             secret_routes=self._secret_routes,
             public_traffic=self._config.public_traffic,
         )
+
+    async def metrics_since(
+        self,
+        sandbox_id: str,
+        since: datetime,
+        *,
+        until: datetime | None = None,
+    ) -> list[MetricSample]:
+        # The class-level variant is a plain API read; the instance one would
+        # connect, which resumes a paused sandbox. The API takes whole seconds
+        # and floors ``start``, so the sample at ``since`` comes back again and
+        # ``normalize_samples`` drops it. Its ``mem_used`` leaves the page
+        # cache out (it tracks MemTotal - MemAvailable, measured 2026-10-23).
+        try:
+            raw = await self._client.AsyncSandbox.get_metrics(
+                sandbox_id, start=since, end=until
+            )
+        except SandboxException as e:
+            if isinstance(e, RateLimitException) or e.status_code == 429:
+                raise SandboxRateLimitedError(str(e)) from e
+            raise
+        return normalize_samples(raw, since, until, used_excludes_cache=True)
 
     async def close(self) -> None:
         # The SDK pools its connections per process and has nothing to close.

@@ -19,6 +19,7 @@ import {
   type SubagentDataLike,
   type SubagentHistoryLike,
 } from '../../session/subagents/resolveSubagentTelemetry';
+import { taskRunFromWire } from '../../session/subagents/taskRuns';
 import {
   resolveWorkflowRun as resolveWorkflowRunPure,
   type WorkflowRunState,
@@ -48,6 +49,8 @@ export function useSubagentTabs({
   updateSubagentCard,
   sendSubagentInstruction,
   getSubagentHistory,
+  getTaskRuns,
+  putTaskRun,
   resolveSubagentIdToAgentId,
   hydrateTaskTranscript,
   saveScrollPosition,
@@ -66,6 +69,8 @@ export function useSubagentTabs({
   updateSubagentCard: CardStateAPI['updateSubagentCard'];
   sendSubagentInstruction: ChatMessagesAPI['sendSubagentInstruction'];
   getSubagentHistory: ChatMessagesAPI['getSubagentHistory'];
+  getTaskRuns: ChatMessagesAPI['getTaskRuns'];
+  putTaskRun: ChatMessagesAPI['putTaskRun'];
   resolveSubagentIdToAgentId: ChatMessagesAPI['resolveSubagentIdToAgentId'];
   hydrateTaskTranscript: ChatMessagesAPI['hydrateTaskTranscript'];
   saveScrollPosition: () => void;
@@ -185,8 +190,10 @@ export function useSubagentTabs({
     const card = cards[`subagent-${resolveSubagentIdToAgentId(subagentId)}`];
     const sd = card?.subagentData as SubagentDataLike | undefined;
     const history = getSubagentHistory?.(subagentId) as SubagentHistoryLike | undefined;
-    return resolveSubagentTelemetryPure(sd, history);
-  }, [cards, resolveSubagentIdToAgentId, getSubagentHistory]);
+    // The segment's id is the Task call it stands for, which names the run
+    // its row draws when the task was resumed.
+    return resolveSubagentTelemetryPure(sd, history, getTaskRuns?.(subagentId) ?? [], subagentId);
+  }, [cards, resolveSubagentIdToAgentId, getSubagentHistory, getTaskRuns]);
 
   // Same closure shape for workflow-run progress: the inline WorkflowRunCard
   // subscribes at the leaf and reads the live card's reduced state, falling
@@ -356,6 +363,8 @@ export function useSubagentTabs({
       const s = normalizeWireStatus(res?.status);
       if (!isTerminalStatus(s)) return;
       const existing = cards[`subagent-${agentId}`]?.subagentData;
+      // The task's latest run, which the stream may never have opened here.
+      if (res.run_id) putTaskRun?.(res.run_id, { taskId: agentId, ...taskRunFromWire(res) });
       updateSubagentCard(agentId, {
         agentId,
         taskId: agentId,
@@ -372,7 +381,7 @@ export function useSubagentTabs({
       // Best-effort: a failed hydration leaves the card as-is (a full thread
       // reload still corrects it via replay stamping).
     }
-  }, [threadId, getSubagentHistory, cards, updateSubagentCard]);
+  }, [threadId, getSubagentHistory, cards, updateSubagentCard, putTaskRun]);
 
   // Lazy transcript hydration for tasks replay never projects as lanes
   // (workflow children have no Task-tool launch artifact in the main

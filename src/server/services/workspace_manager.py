@@ -510,7 +510,9 @@ class WorkspaceManager(ComputerManager):
 
             try:
                 await self._stop_machine(
-                    computer_id, unchanged_since=computer.get("updated_at")
+                    computer_id,
+                    unchanged_since=computer.get("updated_at"),
+                    reason="idle",
                 )
                 stopped_count += 1
                 if machine is not None:
@@ -681,10 +683,11 @@ class WorkspaceManager(ComputerManager):
         return reverted
 
     async def start_cleanup_task(self) -> None:
-        """Start the background cleanup task, and the left-folder sweep beside it.
+        """Start the background cleanup task, and the left-folder and usage sweeps beside it.
 
-        The sweep dials owners' machines, any of which may be dark or slow, so
-        it runs in a loop of its own rather than ahead of idle reaping.
+        Both sweeps dial machines or providers, any of which may be dark or
+        slow, so each runs in a loop of its own rather than ahead of idle
+        reaping.
         """
         if self._cleanup_task is not None:
             return
@@ -720,8 +723,22 @@ class WorkspaceManager(ComputerManager):
                 except Exception as e:
                     logger.error(f"Error in left-folder sweep loop: {e}")
 
+        async def usage_loop():
+            # First at once, so a deploy opens runs for the computers already
+            # running rather than a cycle later.
+            while not self._shutdown:
+                try:
+                    await self.sweep_usage()
+                    await asyncio.sleep(self.cleanup_interval)
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    logger.error(f"Error in usage sweep loop: {e}")
+                    await asyncio.sleep(self.cleanup_interval)
+
         self._cleanup_task = asyncio.create_task(cleanup_loop())
         self._left_folders_task = asyncio.create_task(left_folders_loop())
+        self._usage_task = asyncio.create_task(usage_loop())
         logger.info("Workspace cleanup task started")
 
 

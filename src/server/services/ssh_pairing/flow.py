@@ -116,7 +116,8 @@ async def report(
     tunnels is reached through it alone. A tunnel this pairing just handed
     out is waited for; an older one is tried once, and when it is not
     connected the script sets it up again. A machine nothing reached answers
-    202 when it may connect out instead. A ``failed`` field, sent alone, is
+    202 when it may connect out instead, as a ``tunnel_only`` one, which has
+    no SSH server to dial, always does. A ``failed`` field, sent alone, is
     the script saying it stopped, and why.
 
     Raises:
@@ -144,7 +145,10 @@ async def report(
     machine = binding.held(machine)
     if not machine.host_keys:
         return await _unpinned(pairing, machine)
-    tunnel_id = machine.tunnel_id if tunnels_enabled() else None
+    tunnels = tunnels_enabled()
+    if machine.tunnel_only and not tunnels:
+        return await _refuse(pairing, 422, _NO_TUNNEL)
+    tunnel_id = machine.tunnel_id if tunnels else None
     if tunnel_id:
         # Paired again now, so no take-off claimed before this one runs.
         renewed = await renew_tunnel(pairing.user_id, tunnel_id)

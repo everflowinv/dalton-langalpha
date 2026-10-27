@@ -3,9 +3,9 @@
 Replaces the stock langchain ``ModelRetryMiddleware`` + ``ModelFallbackMiddleware``
 pair so that:
 
-- non-retryable errors (bad request / auth / unknown model) skip straight to
-  the next fallback model instead of burning retries on a call that cannot
-  succeed,
+- non-retryable errors (bad request / auth / unknown model, or a crash in
+  parsing the response) skip straight to the next fallback model instead of
+  burning retries on a call that cannot succeed,
 - every retry and fallback switch is emitted as a custom stream event
   (``model_retry`` / ``model_fallback``) for the client to render, and
 - on total exhaustion the PRIMARY model's exception is re-raised with the full
@@ -35,6 +35,7 @@ from src.llms.error_classification import (
     is_retryable_error,
     is_stalled_stream,
 )
+from src.llms.provider_compaction import is_compaction_request
 from src.llms.reasoning_payload import strip_all_reasoning
 
 if TYPE_CHECKING:
@@ -319,7 +320,13 @@ class ModelResilienceMiddleware(AgentMiddleware):
         raise primary.exc
 
     def _candidates(self, request: ModelRequest) -> list[tuple[str, Any | None]]:
-        return [(self._primary_display_name(request), None), *self.fallbacks]
+        primary = (self._primary_display_name(request), None)
+        # A compaction request asks the primary's provider for its own
+        # summary; another model would answer it as a turn, and the caller
+        # has a summarizer of its own to fall back to.
+        if is_compaction_request(request.model_settings):
+            return [primary]
+        return [primary, *self.fallbacks]
 
     def _classify(self, exc: Exception) -> tuple[int | None, bool]:
         status = extract_status_code(exc)

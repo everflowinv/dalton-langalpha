@@ -22,7 +22,7 @@ import { useLocale } from '@/hooks/useLocale';
 import type { SshTarget } from '@/types/api';
 
 import { apiErrorStatus } from '../utils/api/errors';
-import { failureText, type SshFailure, type SshSetupState } from './sshSetupState';
+import { failureText, type SshFailure, type SshReadyStep, type SshSetupState } from './sshSetupState';
 import { formatSshReached, type SshReady } from './sshTarget';
 
 const SSH_ADDRESS_PLACEHOLDER = 'ubuntu@203.0.113.10';
@@ -95,7 +95,7 @@ function LinkButton({
 }
 
 /** A spinning glyph and a line, the app's way of saying work is in progress. */
-function Working({ children }: { children: ReactNode }) {
+export function Working({ children }: { children: ReactNode }) {
   return (
     <span className="flex items-center gap-2">
       <span aria-hidden="true" className="inline-flex shrink-0">
@@ -363,13 +363,13 @@ function ManualView({ state, busy }: { state: SshSetupState; busy: boolean }) {
   );
 }
 
-function ReadySummary({
-  state,
+export function ReadySummary({
+  step,
   ready,
   busy,
   nameMaxLength,
 }: {
-  state: SshSetupState;
+  step: SshReadyStep;
   ready: SshReady;
   busy: boolean;
   nameMaxLength: number;
@@ -380,12 +380,15 @@ function ReadySummary({
   const folderId = useId();
   const backupHintId = useId();
   const { target, probe } = ready;
-  const tunneled = !!target.tunnel_id;
-  const reached = tunneled
-    ? t('computer.ssh.readyTunnel', '{{hostname}}, through a tunnel', { hostname: formatSshReached(target, true) })
-    : formatSshReached(target, false);
-  const startOver = (
-    <LinkButton onClick={state.startOver} disabled={busy} className="ml-auto shrink-0 self-auto">
+  // A helper is reached through its tunnel by construction and logs in as the
+  // account it works as, so it is named the way its row will name it.
+  const reached = probe.helper
+    ? t('computer.remoteControl.asAccount', 'as {{account}}', { account: target.username })
+    : target.tunnel_id
+      ? t('computer.ssh.readyTunnel', '{{hostname}}, through a tunnel', { hostname: formatSshReached(target, true) })
+      : formatSshReached(target, false);
+  const startOver = step.startOver && (
+    <LinkButton onClick={step.startOver} disabled={busy} className="ml-auto shrink-0 self-auto">
       {t('computer.ssh.differentMachine', 'Use a different machine')}
     </LinkButton>
   );
@@ -416,7 +419,7 @@ function ReadySummary({
     : probe.has_sudo
       ? null
       : t('computer.ssh.sudoNo', 'sudo is not available. Some tools may not install.');
-  const shownFolder = state.folder.trim() || probe.suggested_root_dir;
+  const shownFolder = step.folder.trim() || probe.suggested_root_dir;
 
   return (
     <div
@@ -440,9 +443,9 @@ function ReadySummary({
         <label htmlFor={nameId} style={labelStyle}>{t('computer.nameLabel', 'Name')}</label>
         <Input
           id={nameId}
-          value={state.name}
+          value={step.name}
           maxLength={nameMaxLength}
-          onChange={(e) => state.setName(e.target.value)}
+          onChange={(e) => step.setName(e.target.value)}
           disabled={busy}
           autoComplete="off"
           spellCheck={false}
@@ -450,13 +453,13 @@ function ReadySummary({
         />
       </div>
 
-      {state.folderOpen ? (
+      {step.folderOpen ? (
         <div className="flex flex-col gap-1">
           <label htmlFor={folderId} style={labelStyle}>{t('computer.ssh.folder', 'Folder')}</label>
           <Input
             id={folderId}
-            value={state.folder}
-            onChange={(e) => state.setFolder(e.target.value)}
+            value={step.folder}
+            onChange={(e) => step.setFolder(e.target.value)}
             disabled={busy}
             autoComplete="off"
             spellCheck={false}
@@ -474,7 +477,7 @@ function ReadySummary({
           <span className="min-w-0 break-all">
             {t('computer.ssh.folderShown', 'Workspaces go in {{folder}}.', { folder: shownFolder })}
           </span>
-          <LinkButton onClick={state.openFolder} disabled={busy} className="self-auto">
+          <LinkButton onClick={step.openFolder} disabled={busy} className="self-auto">
             {t('computer.ssh.changeFolder', 'Change')}
           </LinkButton>
         </div>
@@ -482,8 +485,8 @@ function ReadySummary({
 
       <div className="flex flex-col gap-1">
         <CheckboxChoice
-          checked={state.filesBackup}
-          onCheckedChange={state.setFilesBackup}
+          checked={step.filesBackup}
+          onCheckedChange={step.setFilesBackup}
           disabled={busy}
           aria-describedby={backupHintId}
           className="items-center gap-2 rounded-md text-xs"
@@ -508,34 +511,37 @@ function ReadySummary({
 }
 
 /** Same callout as the experiments trade-off: tinted, never an error. */
-function PreviewNotice() {
+export function PreviewNotice({ children, className, testId }: { children: ReactNode; className?: string; testId?: string }) {
   const { t } = useTranslation();
   return (
     <div
-      className="mb-3 flex items-start gap-2 rounded-md px-3 py-2 text-xs leading-relaxed"
+      className={cn('flex items-start gap-2 rounded-md px-3 py-2 text-xs leading-relaxed', className)}
       style={{ backgroundColor: 'var(--color-warning-soft)' }}
-      data-testid="ssh-preview-notice"
+      data-testid={testId}
     >
       <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" style={{ color: 'var(--color-warning)' }} aria-hidden="true" />
       <p style={labelStyle}>
         <span className="font-medium" style={{ color: 'var(--color-warning)' }}>
           {t('computer.ssh.previewLabel', 'Preview')}
         </span>{' '}
-        {t(
-          'computer.ssh.previewNotice',
-          'Connecting your own machine is new, so use it with care. The agent can do anything the account you connect can do, so connect an account made for it rather than your own.',
-        )}
+        {children}
       </p>
     </div>
   );
 }
 
 export function SshSetup({ state, busy, nameMaxLength }: { state: SshSetupState; busy: boolean; nameMaxLength: number }) {
+  const { t } = useTranslation();
   return (
     <div data-testid="ssh-setup">
-      <PreviewNotice />
+      <PreviewNotice className="mb-3" testId="ssh-preview-notice">
+        {t(
+          'computer.ssh.previewNotice',
+          'Connecting your own machine is new, so use it with care. The agent can do anything the account you connect can do, so connect an account made for it rather than your own.',
+        )}
+      </PreviewNotice>
       {state.ready ? (
-        <ReadySummary state={state} ready={state.ready} busy={busy} nameMaxLength={nameMaxLength} />
+        <ReadySummary step={state.readyStep} ready={state.ready} busy={busy} nameMaxLength={nameMaxLength} />
       ) : state.view === 'pairing' ? (
         <PairingView state={state} busy={busy} focusTarget={state.setEntry} />
       ) : (

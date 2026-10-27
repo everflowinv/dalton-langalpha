@@ -1,18 +1,19 @@
 import type { ComponentType, CSSProperties, ReactNode } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
-  ArrowRight,
   ArrowUpRight,
   Check,
   CheckCircle2,
   ChevronDown,
   ChevronRight,
+  Folder,
   FolderPlus,
   Bot,
   PanelRight,
   Paperclip,
   type LucideProps,
 } from 'lucide-react';
+import { LangAlphaMark } from '@/components/brand/LangAlphaMark';
 import { useLocale } from '@/hooks/useLocale';
 import { compactNumber } from '@/lib/format';
 import { cn } from '@/lib/utils';
@@ -26,7 +27,7 @@ import { Appear, Loader, rv } from './kit';
 
 /* The chat intro's own transcript parts, shared by its scenes and the share
    scene that opens on one of its threads: the workspace line, the hand-off
-   card, a workflow run, the caption on a message from another agent, a
+   row, a workflow run, the caption on a message from another agent, a
    chart in the reply, and the files a turn produced. The parts every
    transcript draws (header, column, prose, tool rows) are in
    transcriptParts.tsx. Each is a small copy of the component the app draws
@@ -79,104 +80,76 @@ export function WorkspaceLine({ name, at, done }: { name: string; at: number; do
   );
 }
 
-/** A hand-off to an Analyst under way (`PTCAgentCard`, its mission panel):
-    the workspace in small mono caps and the run's status, the thread's
-    title with the brief under it, then a rule over what the run is doing
-    and the way into its thread. Starting until `started`, working until
-    `finished`, then completed. */
-export function HandoffCard({
+/** A hand-off to an Analyst once it is handed off (`HandoffSlip`): our
+    mark on a round avatar, the task, and under it how the run stands, then
+    the workspace it runs in. No card: it sits in the reply as the turn's
+    other rows do, at their left edge, keeping the app's padding above and
+    under its two lines. At the scenes' scale the chat column is a narrow one, so
+    the line takes the app's narrow form, without the Analyst's name or how
+    long the run took. Starting until `started`, working until `finished`,
+    then finished, where the spinner going away is the done state. */
+export function HandoffSlip({
   workspace,
   title,
-  brief,
   at,
   started,
   finished,
 }: {
   workspace: string;
   title: string;
-  brief: string;
   at: number;
   started: number;
   finished: number;
 }) {
   const { t } = useTranslation();
   const now = useSceneTime();
-  const live = now < finished;
-  const [label, hint] =
+  const [glyph, label] =
     now < started
-      ? ['chat.ptcCard.statusStarting', 'chat.ptcCard.hintProvisioning']
-      : live
-        ? ['chat.ptcCard.statusWorking', 'chat.ptcCard.hintWorking']
-        : ['chat.ptcCard.statusCompleted', null];
+      ? [
+          <span
+            key="pending"
+            className="block h-[4.5px] w-[4.5px] rounded-full border"
+            style={{ borderColor: 'var(--color-text-tertiary)' }}
+          />,
+          'chat.ptcCard.statusStarting',
+        ]
+      : now < finished
+        ? [
+            <Loader key="live" color="var(--color-accent-primary)" className="text-[7px]" />,
+            'chat.ptcCard.statusWorking',
+          ]
+        : [null, 'chat.ptcCard.finished'];
   return (
-    <Appear at={at}>
-      <div
-        className="flex flex-col rounded-md border px-2 pb-1.5 pt-1.5"
-        style={{
-          ...toolCard,
-          borderColor: live ? 'var(--color-border-default)' : 'var(--color-border-muted)',
-        }}
+    <Appear at={at} className="grid grid-cols-[16px_minmax(0,1fr)] items-center gap-x-[7px] py-[3px]">
+      <span
+        className="flex h-4 w-4 items-center justify-center rounded-full border"
+        style={{ borderColor: 'var(--color-border-default)', color: 'var(--color-text-primary)' }}
       >
-        <div className="flex items-center gap-1">
-          <span
-            className={cn(
-              'truncate font-mono text-[6px] font-medium uppercase',
-              'leading-none tracking-[0.08em]'
-            )}
-            style={{ color: 'var(--color-text-quaternary)' }}
-          >
-            {workspace}
-          </span>
-          <span
-            className={cn(
-              'ml-auto flex shrink-0 items-center gap-0.5',
-              'text-[7px] font-medium leading-none'
-            )}
-            style={{ color: 'var(--color-text-tertiary)' }}
-          >
-            {live ? (
-              <Loader color="var(--color-accent-primary)" className="text-[7px]" />
-            ) : (
-              <Check
-                className="intro-pop h-2 w-2"
-                strokeWidth={2.5}
-                style={{ ...rv(0), color: 'var(--color-success)' }}
-              />
-            )}
-            {t(label)}
-          </span>
-        </div>
+        <LangAlphaMark className="h-[8.5px] w-[8.5px]" />
+      </span>
+      <span className="min-w-0">
         <span
-          className="mt-1.5 truncate text-[8px] font-medium leading-none"
+          className="block truncate text-[8px] font-medium leading-[1.3]"
           style={{ color: 'var(--color-text-primary)' }}
         >
           {title}
         </span>
         <span
-          className="mt-1 truncate text-[7px] leading-none"
-          style={{ color: 'var(--color-text-tertiary)' }}
-        >
-          {brief}
-        </span>
-        <div
-          className="mt-1.5 flex items-center justify-between gap-1 border-t pt-1"
-          style={{ borderColor: 'var(--color-border-muted)' }}
+          className="mt-[2px] flex min-w-0 items-center gap-[3.5px] text-[7px] leading-[1.3]"
+          style={{ color: 'var(--color-text-secondary)' }}
         >
           <span
-            className="truncate text-[6px] leading-none"
-            style={{ color: 'var(--color-text-quaternary)' }}
-          >
-            {hint && t(hint)}
-          </span>
-          <span
-            className="flex shrink-0 items-center gap-0.5 text-[7px] font-medium leading-none"
+            className="flex shrink-0 items-center gap-[2px] whitespace-nowrap"
             style={{ color: 'var(--color-text-tertiary)' }}
           >
-            {t('chat.ptcCard.ctaOpenThread')}
-            <ArrowRight className="h-2 w-2" />
+            {glyph}
+            {t(label)}
           </span>
-        </div>
-      </div>
+          <span style={{ color: 'var(--color-text-tertiary)' }}>·</span>
+          <Folder className="h-[7px] w-[7px] shrink-0" />
+          <span className="truncate">{workspace}</span>
+        </span>
+      </span>
     </Appear>
   );
 }

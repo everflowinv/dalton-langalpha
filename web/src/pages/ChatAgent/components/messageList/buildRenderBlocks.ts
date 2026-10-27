@@ -6,6 +6,7 @@ import { MIN_LIVE_EXPOSURE_MS } from './liveZoneTiming';
 import { inChunkOrder } from '../../session/stream/textChunks';
 import { preapprovedCardOf, type PreapprovedCard } from '../../utils/preapprovedCards';
 import { isPlanTool, readPastPlan, type PastPlanOutcome } from './pastPlan';
+import type { PTCAgentProposalState } from '@/types/chat';
 import type { ContentSegmentRecord, ToolCallProcessRecord } from './types';
 import type { ActivityItem, ToolActivityItem, LiveState, ToolCallData, ToolCallResultData } from './activityTypes';
 
@@ -61,7 +62,7 @@ export interface PTCAgentRenderBlock {
   segment: ContentSegmentRecord;
   /** Set for a hand-off made without asking; otherwise the card is the
    *  proposal under `segment.proposalId`. */
-  proposal?: Record<string, unknown>;
+  proposal?: PTCAgentProposalState;
 }
 export interface SecretaryActionRenderBlock {
   type: 'delete_workspace' | 'stop_workspace' | 'delete_thread';
@@ -305,8 +306,9 @@ export function buildRenderBlocks(
           const card = preapproved.get(seg.toolCallId!);
           if (card) {
             flushActivity();
-            const key = `${card.type === 'ptc_agent' ? 'ptc-agent' : 'workspace'}-${seg.toolCallId}`;
-            blocks.push({ type: card.type, key, segment: seg, proposal: card.proposal });
+            blocks.push(card.type === 'ptc_agent'
+              ? { type: 'ptc_agent', key: `ptc-agent-${seg.toolCallId}`, segment: seg, proposal: card.proposal }
+              : { type: 'create_workspace', key: `workspace-${seg.toolCallId}`, segment: seg, proposal: card.proposal });
             continue;
           }
 

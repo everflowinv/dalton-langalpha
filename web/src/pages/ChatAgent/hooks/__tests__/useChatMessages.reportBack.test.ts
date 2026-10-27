@@ -1303,7 +1303,7 @@ describe('useChatMessages: report-back watch (PTC → report-back)', () => {
     // Approve: the watch opens NOW, and nothing attaches (no run exists yet —
     // approval is what dispatches).
     await act(async () => {
-      result.current.handleApprovePTCAgent({ tool_call_id: 'tc-1' }, undefined, 'prop-1', 'int-1');
+      result.current.handleApprovePTCAgent({ status: 'pending', question: '', tool_call_id: 'tc-1' }, undefined, 'prop-1', 'int-1');
       await new Promise((r) => setTimeout(r, 0));
     });
     expect(mockWatch).toHaveBeenCalledTimes(1);
@@ -1321,7 +1321,7 @@ describe('useChatMessages: report-back watch (PTC → report-back)', () => {
     await settleMountEffect();
 
     await act(async () => {
-      result.current.handleApprovePTCAgent({ tool_call_id: 'tc-1' }, { report_back: false }, 'prop-1', 'int-1');
+      result.current.handleApprovePTCAgent({ status: 'pending', question: '', tool_call_id: 'tc-1' }, { report_back: false }, 'prop-1', 'int-1');
       await new Promise((r) => setTimeout(r, 0));
     });
     expect(mockWatch).not.toHaveBeenCalled();

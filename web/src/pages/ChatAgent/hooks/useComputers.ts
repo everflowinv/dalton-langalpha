@@ -91,6 +91,19 @@ export function useComputers(options: { enabled?: boolean } = {}) {
 }
 
 /**
+ * The server's list, for a decision made outside render, such as whether a
+ * machine is still in use. Never the cached one: that can predate the removal
+ * the decision is about, made on another device. Rejects rather than answering
+ * with nothing, so a failed read never passes for an empty list.
+ */
+export function fetchComputerList(queryClient: QueryClient): Promise<ComputersResponse> {
+  return queryClient.fetchQuery({ ...computersList(), staleTime: 0 });
+}
+
+/** Names the create, so a decision that needs a new row on the list can wait for it to land. */
+export const CREATE_COMPUTER_MUTATION_KEY = ['computers', 'create'] as const;
+
+/**
  * The root a computer keeps its workspace folders under, off the shared list.
  * Selected, so a refetch that only moved a status leaves its readers alone.
  */

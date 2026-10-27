@@ -5,9 +5,10 @@
  * fill the same disk, and the moment it fills, saving a file or running code
  * fails in whichever workspace happens to be active. The warning therefore
  * shows wherever the user works (the gallery and every chat on that machine).
- * Its call to action is the spec change. Whether the plan allows a bigger tier
- * is the dialog's to say, so the banner never guesses at it. At `critical` the
- * storage breakdown also lets the user delete by hand.
+ * Its call to action is the spec change, offered only where a size with more
+ * disk is one the plan allows: a dialog whose every bigger size is disabled is
+ * a dead end, so a plan that lacks them gets the way to a bigger plan instead.
+ * At `critical` the storage breakdown also lets the user delete by hand.
  */
 import { useEffect, useSyncExternalStore } from 'react';
 import { useTranslation } from 'react-i18next';
@@ -22,8 +23,12 @@ import type { Computer, ComputerDiskLevel } from '@/types/api';
 
 import { providerManagesSpec } from './providerUi';
 import { openComputerSpec, openComputersPanel } from '../hooks/computerPanelStore';
-import { diskLevelRank, isDiskAlertLevel, nextTier } from './computerDiskUi';
+import { useComputerProviders } from '../hooks/useComputers';
+import { useTierQuota } from '../hooks/useTierQuota';
+import { diskLevelRank, diskUpgradeTier, isDiskAlertLevel, largerDiskTiers } from './computerDiskUi';
+import { PlanUpgradeHint } from './planUpgradeHint';
 import { activeSpecChange, effectiveTier, SpecChangeProgress } from './specChangeUi';
+import { needsBiggerPlan, offeredTiers } from './tierUi';
 
 // --- Dismissal, per computer for the browser session --------------------------
 
@@ -123,12 +128,24 @@ export function DiskWarning({ computer, className }: DiskWarningProps) {
   const visible = useDiskWarningVisible(computer);
   const disk = computer.disk;
   const level = disk?.level;
+  // Whether there is a size with more disk depends on what the provider runs
+  // (Medium and Large share one, and only E2B runs Extra Large), and whether
+  // it can be picked on what the plan allows.
+  const { data: providerData } = useComputerProviders({ enabled: visible && isDiskAlertLevel(level) });
+  const { data: quota } = useTierQuota({ enabled: visible && isDiskAlertLevel(level) });
 
   if (!visible || !disk || !isDiskAlertLevel(level)) return null;
 
   const critical = level === 'critical';
   const tint = critical ? 'var(--color-loss-soft)' : 'var(--color-warning-soft)';
   const specChange = activeSpecChange(computer);
+  const tier = effectiveTier(computer);
+  const provider = providerData?.providers.find((p) => p.kind === computer.kind);
+  const offer = offeredTiers(provider, tier);
+  const managesSpec = providerManagesSpec(computer.kind);
+  const canGrow = managesSpec && diskUpgradeTier(tier, offer, quota) !== null;
+  const planLimited =
+    managesSpec && !canGrow && largerDiskTiers(tier, offer).some((id) => needsBiggerPlan(quota, id));
 
   const title = critical
     ? t('computer.disk.criticalTitle', '{{name}} is almost out of disk space', { name: computer.name })
@@ -146,10 +163,11 @@ export function DiskWarning({ computer, className }: DiskWarningProps) {
       );
 
   // A change already running replaces the call to action with its progress:
-  // offering it again would only earn a 409. The top tier has nothing bigger.
+  // offering it again would only earn a 409. With no size of more disk that
+  // the provider runs and the plan allows, there is no spec change to offer.
   const changeSpec = specChange ? (
     <SpecChangeProgress change={specChange} className="text-xs" />
-  ) : providerManagesSpec(computer.kind) && nextTier(effectiveTier(computer)) ? (
+  ) : canGrow ? (
     <Button size="sm" className={ACTION_CLASS} onClick={() => openComputerSpec(computer.computer_id)}>
       {t('workspace.changeSpec', 'Change spec')}
     </Button>
@@ -193,6 +211,13 @@ export function DiskWarning({ computer, className }: DiskWarningProps) {
           <p className="text-xs mt-0.5" style={{ color: 'var(--color-text-secondary)' }}>
             {body}
           </p>
+          {!specChange && planLimited && (
+            <PlanUpgradeHint
+              lead={t('computer.spec.planLimited', 'Need a bigger spec than your plan includes?')}
+              testId="disk-plan-cta"
+              className="mt-1"
+            />
+          )}
         </div>
         {(changeSpec || breakdown) && (
           <div className="flex shrink-0 flex-wrap items-center gap-1.5">

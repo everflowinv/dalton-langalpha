@@ -60,7 +60,7 @@ const probe = (over: Partial<SshProbeResult> = {}): SshProbeResult => ({
   host_key: 'ssh-ed25519 AAAAC3Nz', fingerprint: 'SHA256:abc123', os: 'linux', arch: 'x86_64',
   distro: 'Ubuntu 24.04', home: '/home/me', shell: '/bin/bash', is_root: false, has_sudo: true,
   disk_free_bytes: null, supported: true, problems: [], suggested_root_dir: '/home/me/langalpha',
-  hostname: 'devbox', ...over,
+  hostname: 'devbox', helper: false, ...over,
 });
 
 const MACHINE = { username: 'me', hostname: 'devbox', os: 'Linux', addresses: ['198.51.100.7', '10.0.0.4'] };
@@ -82,7 +82,7 @@ function apiError(code: number, detail: unknown) {
 }
 
 function open(onSubmit = vi.fn()) {
-  renderWithProviders(<CreateComputerDialog onClose={() => {}} onSubmit={onSubmit} busy={false} error={null} />);
+  renderWithProviders(<CreateComputerDialog computers={[]} onClose={() => {}} onSubmit={onSubmit} busy={false} error={null} />);
   return onSubmit;
 }
 

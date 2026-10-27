@@ -6,12 +6,13 @@
  * locale, the time and the zone.
  */
 import type { TFunction } from 'i18next';
+import { epochMs } from '@/lib/elapsed';
 import { clockTime, formatList } from '@/lib/format';
 import { formatDateTimeShort } from '../../../Automations/utils/time';
 import type { WakeupArrival } from '@/types/chat';
 import type { WakeNotice } from '@/types/wakeups';
 import {
-  conditionLabel, epochMs, orderOutcomeLabel, priceFormat, sameDay, triggerText, zonedClock,
+  conditionLabel, orderOutcomeLabel, priceFormat, sameDay, triggerText, zonedClock,
 } from '../wakeupLabels';
 import type { QuietCheck } from './quietChecks';
 

@@ -94,6 +94,30 @@ def _window(minutes: int | None, *, default_s: int, max_s: int) -> int:
     return max(60, min(seconds, max_s))
 
 
+# envd reports a process a signal ended as exit -1, naming the signal the way
+# Go does ("signal: killed"). A shell reports 128 + its number, which is what
+# the other providers return, so an OOM kill reads 137 on every one of them.
+# Linux numbers, the sandbox's, not this host's (SIGBUS is 10 on macOS).
+_SIGNAL_NUMBERS = {
+    "hangup": 1,
+    "interrupt": 2,
+    "aborted": 6,
+    "bus error": 7,
+    "killed": 9,
+    "segmentation fault": 11,
+    "terminated": 15,
+}
+
+
+def _exit_status(exit_code: int, error: str | None) -> int:
+    """The shell's exit status for an envd result."""
+    if exit_code != -1 or not error or not error.startswith("signal: "):
+        return exit_code
+    name = error.removeprefix("signal: ").removesuffix(" (core dumped)")
+    number = _SIGNAL_NUMBERS.get(name)
+    return exit_code if number is None else 128 + number
+
+
 class E2BRuntime(ExecSessionRuntime):
     """Runtime over one E2B sandbox, attached lazily and never resumed implicitly.
 
@@ -315,6 +339,7 @@ class E2BRuntime(ExecSessionRuntime):
             )
         except CommandExitException as exc:
             # A nonzero exit is a result here, not an error.
+            exc.exit_code = _exit_status(exc.exit_code, exc.error)
             return exc
 
     async def code_run(

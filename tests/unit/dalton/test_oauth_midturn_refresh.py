@@ -22,10 +22,13 @@ class _FakeModel:
 
 
 class _FakeRequest:
+    # DALTON-HOOK(oauth-dispatch): B4's resilience chain reads model_settings
+    # (compaction-request detection); a plain send carries none.
     def __init__(self, model, messages=None, state=None):
         self.model = model
         self.messages = messages if messages is not None else []
         self.state = state if state is not None else {"messages": []}
+        self.model_settings = {}
 
     def override(self, *, model=None, messages=None):
         return _FakeRequest(

@@ -9,7 +9,7 @@ import type {
   ProvenanceSourceType,
 } from './sse';
 import type { ErrorLinkSpec, StructuredError } from '@/utils/rateLimitError';
-import type { DispatchingAgent } from './api';
+import type { DispatchingAgent, ReportOutcome } from './api';
 
 // --- Content Segments (discriminated union) ---
 
@@ -85,6 +85,9 @@ export interface SubagentTaskRecord {
   /** The reply itself was a failure, so nothing ran. Kept apart from `status`,
    *  which a started task's own settle can also set to `error`. */
   launchFailed?: boolean;
+  /** Why a launch was refused, when the reply names a reason the user can be
+   *  told in their own words (`result` is written for the model). */
+  launchRefusal?: 'subagents_off';
 }
 
 export interface NotificationSegment {
@@ -381,17 +384,31 @@ export interface QuestionProposalState {
   interruptId?: string;
 }
 
+/** A `delegate_to_analyst` hand-off, as the approval request carried it or,
+ *  made without asking, as its result did (`utils/preapprovedCards.ts`). */
 export interface PTCAgentProposalState {
   proposalId?: string;
-  status: string;
+  status: 'pending' | 'approved' | 'rejected';
   workspace_id?: string;
   workspace_name?: string;
   thread_id?: string;
-  question?: string;
+  question: string;
   interruptId?: string;
+  /** The call that made the hand-off, which names it in the transcript. */
   tool_call_id?: string;
   report_back?: boolean;
+  /** Approved, but the dispatch failed (`utils/dispatchResult.ts`). */
   dispatch_failed?: boolean;
+  /** With `dispatch_failed`: the failure left it unknown whether the run
+   *  started, so the thread named may yet run it. */
+  dispatch_unknown?: boolean;
+  /** The hand-off's own run, as the dispatch's result named it. Absent on
+   *  older proposals and when the dispatch's reply was lost. */
+  run_id?: string;
+  /** A hand-off steered into a run already going: its steer, which names the
+   *  run that took it in, since `run_id` can end before reading it. Absent on
+   *  older proposals and on a hand-off that started its own run. */
+  steer_id?: string;
 }
 
 export interface SecretaryActionProposalState {
@@ -441,8 +458,23 @@ export type MessageProvenance =
   | { kind: 'main_agent' }
   /** The two report-backs. Each is drawn as its label alone: the turn's own
    *  message is written for the model. */
-  | { kind: 'analyst_report'; threadId: string; workspaceId: string | null; workspaceName: string | null }
-  | { kind: 'task_report'; taskId: string; displayId: string; description: string | null; failed: boolean };
+  | {
+      kind: 'analyst_report'; threadId: string; workspaceId: string | null; workspaceName: string | null;
+      /** How the reported run ended; absent on older reports. */
+      outcome?: ReportOutcome;
+      /** The run reported on and the interrupted runs it continued, one of
+       *  which its hand-off names; absent on older reports. */
+      runIds?: string[];
+      /** The hand-off steers those runs took in: empty when they took none,
+       *  absent when unknown (a report from before the list, or one the
+       *  server could not read it for), which cannot say. */
+      steerIds?: string[];
+    }
+  | {
+      kind: 'task_report'; taskId: string; displayId: string; description: string | null; failed: boolean;
+      /** The subagent's role; absent on older reports. */
+      subagentType?: string;
+    };
 
 export type UserMessage = {
   id: string;

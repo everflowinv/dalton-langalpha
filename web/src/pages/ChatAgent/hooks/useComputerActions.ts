@@ -28,10 +28,12 @@ import {
 } from '../utils/api';
 import { apiErrorReason } from '../utils/api/errors';
 import { entitlementErrorMessage } from '../utils/entitlementErrors';
+import { releaseRemoteControl } from './useRemoteControl';
 import { tierLabel } from '../components/tierUi';
 import { closeComputerSpec } from './computerPanelStore';
 import {
   addComputerRow,
+  CREATE_COMPUTER_MUTATION_KEY,
   invalidateMachine,
   invalidateMachineStorage,
   patchComputerRow,
@@ -117,12 +119,15 @@ export function useComputerActions() {
       // and put the row back without its change, which also stops the poll.
       await queryClient.cancelQueries({ queryKey: queryKeys.computers.lists() });
       patchComputerRow(queryClient, computerId, row);
-      if (row.spec_change?.state !== 'in_progress') {
-        // Already at that tier: nothing was scheduled.
-        toast({ title: t('workspace.specUpdated', 'Computer spec updated'), description: tierLabel(t, tier) });
-        invalidateMachine(queryClient);
-        closeComputerSpec();
+      if (row.spec_change?.state === 'in_progress') {
+        // The accepted change already holds a slot of the tier it is going to.
+        void queryClient.invalidateQueries({ queryKey: queryKeys.workspaces.quota() });
+        return;
       }
+      // Already at that tier: nothing was scheduled.
+      toast({ title: t('workspace.specUpdated', 'Computer spec updated'), description: tierLabel(t, tier) });
+      invalidateMachine(queryClient);
+      closeComputerSpec();
     },
     onError: () => invalidateMachine(queryClient),
   });
@@ -191,7 +196,10 @@ export function useComputerActions() {
   // The new row goes on the list straight away so the dialog can scroll to it;
   // the refetch then brings the server's count and status. A refusal can mean
   // the plan or the offered providers moved under the form, so both re-read.
+  // Keyed, so turning remote control off can wait for a create in flight to
+  // put its row on the list.
   const create = useMutation({
+    mutationKey: CREATE_COMPUTER_MUTATION_KEY,
     mutationFn: (body: ComputerCreate) => createComputer(body),
     onSuccess: (row) => {
       addComputerRow(queryClient, row);
@@ -205,14 +213,18 @@ export function useComputerActions() {
 
   // The row leaves every list at once, so nothing goes on offering a machine
   // that is gone; the refetch then confirms it with the server's list. The
-  // name rides in the variables because the row is gone by the time it is read.
+  // name rides in the variables because the row is gone by the time it is read,
+  // and so does the host key of an SSH computer: when it was this Mac, remote
+  // control turns off with it here, where a dialog closing mid-removal cannot
+  // drop it.
   const remove = useMutation({
-    mutationFn: ({ computerId, removeKey }: { computerId: string; name: string; removeKey: boolean }) =>
+    mutationFn: ({ computerId, removeKey }: { computerId: string; name: string; removeKey: boolean; fingerprint?: string | null }) =>
       deleteComputer(computerId, { removeKey }),
-    onSuccess: (res, { computerId, name }) => {
+    onSuccess: (res, { computerId, name, fingerprint }) => {
       removeComputerRow(queryClient, computerId);
       queryClient.removeQueries({ queryKey: queryKeys.computers.storage(computerId) });
       invalidateMachine(queryClient);
+      if (fingerprint) void releaseRemoteControl(queryClient, { onlyFor: fingerprint });
       // A key left behind is the user's to remove and the fingerprint is
       // something to copy, so those stay until closed. Still the plain
       // variant: the removal itself succeeded.

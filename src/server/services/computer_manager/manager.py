@@ -26,6 +26,7 @@ from src.server.services.computer_manager._provisioning import ProvisioningMixin
 from src.server.services.computer_manager._retirement import RetirementMixin
 from src.server.services.computer_manager._sessions import SessionCacheMixin
 from src.server.services.computer_manager._spec import ComputerSpecMixin
+from src.server.services.computer_manager._usage import UsageMixin
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +46,7 @@ class ComputerManager(
     ComputerSpecMixin,
     WorkspaceMoveMixin,
     WorkspaceEntitlementsMixin,
+    UsageMixin,
 ):
     _instance: Optional["ComputerManager"] = None
 
@@ -101,6 +103,7 @@ class ComputerManager(
 
         self._cleanup_task: Optional[asyncio.Task] = None
         self._left_folders_task: Optional[asyncio.Task] = None
+        self._usage_task: Optional[asyncio.Task] = None
         self._shutdown = False
 
         logger.info(
@@ -139,7 +142,11 @@ class ComputerManager(
 
         self._shutdown = True
 
-        loops = [t for t in (self._cleanup_task, self._left_folders_task) if t]
+        loops = [
+            t
+            for t in (self._cleanup_task, self._left_folders_task, self._usage_task)
+            if t
+        ]
         for task in loops:
             task.cancel()
         for task in loops:
@@ -147,7 +154,7 @@ class ComputerManager(
                 await task
             except asyncio.CancelledError:
                 pass
-        self._cleanup_task = self._left_folders_task = None
+        self._cleanup_task = self._left_folders_task = self._usage_task = None
 
         for task in list(self._mcp_discovery_tasks):
             task.cancel()

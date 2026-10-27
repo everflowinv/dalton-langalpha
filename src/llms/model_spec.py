@@ -156,10 +156,10 @@ def _checked_surface(name: str, reasoning: dict | None) -> dict:
 #: What a custom entry inherits from a built-in whose name it takes. Routing --
 #: model_id, provider, parameters -- is the entry's whole reason to exist and
 #: never inherits. These say what the model honors, and a shadow is the same
-#: model reached through the user's own key. ``context`` is here because it is
-#: the only compaction declaration the manifest actually makes:
-#: ``compaction_profile_for`` reads the named profile first and the window's
-#: band second, and every manifest row answers by window. ``reasoning`` is
+#: model reached through the user's own key. ``compaction_profile_for`` reads
+#: the named profile first and the window's band second, so both travel:
+#: Claude and GPT rows name a later profile than their window's band.
+#: ``reasoning`` is
 #: handled separately by :func:`with_inherited_declarations`, because it is the
 #: one declaration that is really two.
 SHADOW_INHERITED = (

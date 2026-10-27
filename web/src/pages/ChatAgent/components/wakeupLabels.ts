@@ -9,6 +9,7 @@
 import type { TFunction } from 'i18next';
 import { createDateFormatter, createFormatter, relativeTime } from '@/lib/format';
 import { currentTimezoneName, deviceTimezone } from '@/lib/deviceTimezone';
+import { epochMs } from '@/lib/elapsed';
 import { cronToHuman } from '../../Automations/utils/cron';
 import { formatDateTimeShort, formatUpcoming } from '../../Automations/utils/time';
 import type { Wakeup, WakeupKind, WakeupOrder, WakeupPrice, WakeupState } from '@/types/wakeups';
@@ -19,12 +20,6 @@ const levelFormat = createFormatter({ maximumFractionDigits: 4 });
 export const priceFormat = createFormatter({ minimumFractionDigits: 2, maximumFractionDigits: 4 });
 const moveFormat = createFormatter({ style: 'percent', signDisplay: 'always', maximumFractionDigits: 2 });
 const qtyFormat = createFormatter({ maximumFractionDigits: 6 });
-
-export function epochMs(iso: string | null | undefined): number | null {
-  if (!iso) return null;
-  const ms = Date.parse(iso);
-  return Number.isFinite(ms) ? ms : null;
-}
 
 const currencyFormats = new Map<string, (n: number, locale: string) => string>();
 /** A price in the order's own currency, plain when none is named or the code

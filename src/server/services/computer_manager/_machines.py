@@ -466,7 +466,11 @@ class MachineLifecycleMixin:
                     )
 
     async def _claim_machine_for_stop(
-        self, computer_id: str, *, unchanged_since: datetime | None = None
+        self,
+        computer_id: str,
+        *,
+        unchanged_since: datetime | None = None,
+        reason: str | None = None,
     ) -> Optional[Dict[str, Any]]:
         """Whoever wins running -> stopping owns the teardown; losing is not an error.
 
@@ -494,6 +498,7 @@ class MachineLifecycleMixin:
             ComputerStatus.STOPPING,
             expected=ComputerStatus.RUNNING,
             updated_before=unchanged_since,
+            run_end_reason=reason,
         )
         if claimed is None:
             logger.info(
@@ -656,7 +661,9 @@ class MachineLifecycleMixin:
                     f"Computer {computer_id} lost its tier entitlement; "
                     f"replacing sandbox {previous_ref} at tier {tier!r}"
                 )
+                await self._fold_usage_before_delete(computer_id)
                 await self._destroy_sandbox(previous_ref, binding=binding)
+                await self._end_replaced_usage_run(computer_id, previous_ref)
                 reconnected = False
             if reconnected:
                 try:

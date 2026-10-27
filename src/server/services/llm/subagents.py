@@ -18,9 +18,10 @@ from ptc_agent.agent.subagents.merge import (
     merge_subagents,
     narrow_to_request,
     plan_gated,
+    turn_roster,
 )
 from ptc_agent.agent.roles import AgentRole
-from ptc_agent.config.agent import SubagentsConfig
+from ptc_agent.config.agent import SubagentModel, SubagentsConfig
 from src.llms.preferences import resolve_tuning
 
 from . import logger, user_models
@@ -300,3 +301,46 @@ def demote_clientless(
         changed = True
     if changed:
         config.subagents.resolved = replace(resolved, definitions=definitions)
+
+
+def subagent_models(
+    config: Any, model_pref: dict, turn_model: str, *, role: AgentRole = "analyst",
+) -> dict[str, SubagentModel]:
+    """Each subagent that runs a model other than the turn's, by name.
+
+    Read off the client the compiler will hand the subagent, not off its pin:
+    a pinned role with no key of its own runs a copy of the main client, and
+    an effort with no pin runs the turn's model at that effort. Two catalog
+    names for one API model (a model and its subscription twin) count as the
+    same, since the user picked that model either way.
+    """
+    main_id = _api_model_id(model_pref, turn_model)
+    models: dict[str, SubagentModel] = {}
+    for defn in turn_roster(config.subagents).for_role(role):
+        client = config.subsidiary_llm_clients.get(f"subagent:{defn.name}")
+        runs = (
+            (getattr(client, "metadata", None) or {}).get("manifest_model")
+            if client is not None
+            else defn.model
+        )
+        if not runs or _api_model_id(model_pref, runs) == main_id:
+            continue
+        provider = _serving_provider(model_pref, runs)
+        if provider:
+            models[defn.name] = {"id": runs, "provider": provider}
+    return models
+
+
+def _api_model_id(model_pref: dict, name: str) -> str:
+    entry = user_models.model_entry(model_pref, name) or {}
+    return entry.get("model_id") or name
+
+
+def _serving_provider(model_pref: dict, name: str) -> str | None:
+    """The catalog provider serving ``name``. A user's own provider is a
+    variant of a catalog one, which is the one with a mark to show."""
+    provider = (user_models.model_entry(model_pref, name) or {}).get("provider")
+    for custom in model_pref.get("custom_providers") or []:
+        if custom.get("name") == provider:
+            return custom.get("parent_provider") or provider
+    return provider

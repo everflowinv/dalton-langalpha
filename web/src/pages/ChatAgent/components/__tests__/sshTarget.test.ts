@@ -109,7 +109,7 @@ describe('formatSshAddress', () => {
 const probe = (over: Partial<SshProbeResult> = {}): SshProbeResult => ({
   host_key: 'ssh-ed25519 AAAA', fingerprint: 'SHA256:x', os: 'linux', arch: 'x86_64', distro: 'Ubuntu',
   home: '/home/me', shell: '/bin/bash', is_root: false, has_sudo: true, disk_free_bytes: null,
-  supported: true, problems: [], suggested_root_dir: '/home/me/langalpha', hostname: 'box', ...over,
+  supported: true, problems: [], suggested_root_dir: '/home/me/langalpha', hostname: 'box', helper: false, ...over,
 });
 const ready = (over: Partial<SshProbeResult> = {}): SshReady => ({
   target: { host: 'box.example.com', port: 22, username: 'me' },

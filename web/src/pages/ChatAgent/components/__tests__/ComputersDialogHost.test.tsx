@@ -24,6 +24,7 @@ vi.mock('@/components/ui/use-toast', () => ({ toast: vi.fn() }));
 vi.mock('../../utils/api', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../utils/api')>()),
   getComputers: vi.fn(),
+  getComputerProviders: vi.fn(async () => ({ providers: [] })),
   getComputerStorage: vi.fn(),
   setComputerSpec: vi.fn(),
   getWorkspaceQuota: vi.fn(async () => ({ performance: null, max: null, always_on: null })),
@@ -32,7 +33,7 @@ vi.mock('../../utils/api', async (importOriginal) => ({
 }));
 
 import { toast } from '@/components/ui/use-toast';
-import { getComputers, setComputerSpec } from '../../utils/api';
+import { getComputerProviders, getComputers, setComputerSpec } from '../../utils/api';
 import {
   closeComputerSpec,
   closeComputersPanel,
@@ -125,7 +126,7 @@ describe('ComputersDialogHost, spec-change outcomes', () => {
 
     await waitFor(() =>
       expect(mockToast).toHaveBeenCalledWith(
-        expect.objectContaining({ description: 'Alpha Research now runs at Performance.' }),
+        expect.objectContaining({ description: 'Alpha Research now runs at Medium.' }),
       ),
     );
     expect(mockToast).toHaveBeenCalledTimes(1);
@@ -152,7 +153,7 @@ describe('ComputersDialogHost, spec-change outcomes', () => {
 
     await waitFor(() =>
       expect(mockToast).toHaveBeenCalledWith(
-        expect.objectContaining({ description: 'Alpha Research now runs at Performance.' }),
+        expect.objectContaining({ description: 'Alpha Research now runs at Medium.' }),
       ),
     );
     expect(mockToast).toHaveBeenCalledTimes(1);
@@ -199,7 +200,7 @@ describe('ComputersDialogHost, spec-change outcomes', () => {
     const { queryClient } = renderWithProviders(<ComputersDialogHost />);
     act(() => openComputerSpec(ID));
 
-    expect(await screen.findByTestId('spec-change-progress')).toHaveTextContent('Upgrading to Performance…');
+    expect(await screen.findByTestId('spec-change-progress')).toHaveTextContent('Upgrading to Medium…');
 
     await refetchReturning(
       queryClient,
@@ -224,7 +225,7 @@ describe('ComputersDialogHost, spec-change outcomes', () => {
 
     await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
     expect(mockToast).toHaveBeenCalledWith(
-      expect.objectContaining({ description: 'Alpha Research now runs at Performance.' }),
+      expect.objectContaining({ description: 'Alpha Research now runs at Medium.' }),
     );
   });
 
@@ -234,11 +235,52 @@ describe('ComputersDialogHost, spec-change outcomes', () => {
     await mount();
     act(() => openComputerSpec(ID));
 
-    await userEvent.click(await screen.findByRole('radio', { name: /^Performance/ }));
+    await userEvent.click(await screen.findByRole('radio', { name: /^Medium/ }));
     await userEvent.click(screen.getByRole('button', { name: 'Back up and change spec' }));
 
     await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
-    expect(mockToast).toHaveBeenCalledWith(expect.objectContaining({ description: 'Performance' }));
+    expect(mockToast).toHaveBeenCalledWith(expect.objectContaining({ description: 'Medium' }));
+  });
+});
+
+describe("ComputersDialogHost, the computer's sizes", () => {
+  it("offers the sizes the computer's provider runs", async () => {
+    (getComputerProviders as Mock).mockResolvedValue({
+      providers: [
+        {
+          kind: 'e2b',
+          is_default: true,
+          allowed: true,
+          tiers: [
+            { tier: 'standard', cpu: 1, memory_gib: 2, disk_gib: 5 },
+            { tier: 'performance', cpu: 2, memory_gib: 4, disk_gib: 10 },
+            { tier: 'max', cpu: 2, memory_gib: 8, disk_gib: 10 },
+            { tier: 'xlarge', cpu: 4, memory_gib: 8, disk_gib: 20 },
+          ],
+        },
+      ],
+    });
+    mockGetComputers.mockResolvedValue(list({ ...machine(null), kind: 'e2b' }));
+    await mount();
+    act(() => openComputerSpec(ID));
+
+    expect(await screen.findByRole('radio', { name: /^Extra Large/ })).toHaveAccessibleDescription(
+      /^4 vCPU\s*·\s*8 GB RAM\s*·\s*20 GB disk$/,
+    );
+  });
+
+  it('re-reads the tier counts once a change is accepted', async () => {
+    mockGetComputers.mockResolvedValue(list(machine(null)));
+    (setComputerSpec as Mock).mockResolvedValue(machine(change()));
+    const { queryClient } = await mount();
+    queryClient.setQueryDefaults(queryKeys.workspaces.quota(), { gcTime: Infinity });
+    queryClient.setQueryData(queryKeys.workspaces.quota(), { performance: null, max: null, always_on: null });
+    act(() => openComputerSpec(ID));
+
+    await userEvent.click(await screen.findByRole('radio', { name: /^Medium/ }));
+    await userEvent.click(screen.getByRole('button', { name: 'Back up and change spec' }));
+
+    await waitFor(() => expect(queryClient.getQueryState(queryKeys.workspaces.quota())?.isInvalidated).toBe(true));
   });
 });
 

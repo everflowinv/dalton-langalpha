@@ -87,7 +87,9 @@ export function deriveTaskSegment(
       resumeTargetId,
       description,
       prompt,
-      type: subagentType,
+      // A follow-up rarely names the role; its task has one already, so an
+      // unnamed one is left blank rather than called general-purpose.
+      type: (args.subagent_type as string) || '',
       action,
       status: 'running',
     },
@@ -116,14 +118,15 @@ export function applyLaunchReply(
   record: SubagentTaskRecord,
   result: { content?: unknown; artifact?: unknown; status?: unknown },
 ): SubagentTaskRecord {
-  const stopped =
-    (result.artifact as { launch?: unknown } | null | undefined)?.launch === 'cancelled';
+  const launch = (result.artifact as { launch?: unknown } | null | undefined)?.launch;
+  const stopped = launch === 'cancelled';
   const status = stopped ? 'cancelled' : isToolResultFailure(result) ? 'error' : undefined;
   return {
     ...record,
     ...(typeof result.content === 'string' ? { result: result.content } : {}),
     ...(status ? { status } : {}),
     ...(status === 'error' ? { launchFailed: true } : {}),
+    ...(status === 'error' && launch === 'subagents_off' ? { launchRefusal: launch } : {}),
   };
 }
 

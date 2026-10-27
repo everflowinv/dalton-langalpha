@@ -113,6 +113,8 @@ class ExecutionResult:
     # or the class of what the call raised. A nonzero exit leaves it None, so a
     # tool can count the sandbox's faults apart from the agent's.
     failure: str | None = None
+    # The code's exit status; None where the run never produced one.
+    exit_code: int | None = None
 
 
 @dataclass

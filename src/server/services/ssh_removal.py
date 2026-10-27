@@ -39,7 +39,7 @@ from src.server.database.workspace_folders import (
 from src.server.models.computer import ComputerKeyRemoval, KeyRemovalOutcome
 from src.server.services.ssh_computers import (
     computer_sharing_login,
-    other_ssh_computers,
+    key_line_logins,
     tunnel_of,
 )
 from src.server.services.ssh_tunnel_sweep import Ahead, release_tunnel
@@ -96,8 +96,13 @@ async def leave_machine(
 
     ``computer`` is the row as it was before the removal; ``settings`` the
     deployment's, which its ``provider_config`` is laid over as for any of its
-    calls, so the connection found is the one its delete used.
+    calls, so the connection found is the one its delete used. A machine
+    LangAlpha's helper answers for has no line of ours in ``~/.ssh`` to take,
+    so ``remove_key`` is not asked of it: its key goes with the helper's folder.
     """
+    remove_key = remove_key and not (computer.get("provider_config") or {}).get(
+        "helper"
+    )
     try:
         config = SSHConfig.model_validate(
             {**settings.model_dump(), **(computer.get("provider_config") or {})}
@@ -215,7 +220,7 @@ async def _key_line(
     # another host can log in through the line too; only its folder there says so.
     homes = {
         str(c["provider_ref"]): c.get("name")
-        for c in other_ssh_computers(computers, computer)
+        for c in key_line_logins(computers, computer)
         if c.get("provider_ref")
     }
     try:

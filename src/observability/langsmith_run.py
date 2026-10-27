@@ -81,6 +81,8 @@ TOOL_PROVIDER = "tool_provider"
 # say: a file the mount serves or a store route answers never reaches the
 # machine, and an SSH machine may be dialled direct or through the tunnel.
 TOOL_CHANNEL = "tool_channel"
+# The computer's size, which a sandbox call's latency and failures read against.
+RESOURCE_TIER = "resource_tier"
 ERROR_CLASS = "error_class"
 
 
@@ -106,6 +108,11 @@ def stamp_tool_provider(provider: Optional[str]) -> None:
 def stamp_tool_channel(channel: Optional[str]) -> None:
     """Name the path the enclosing tool call took (``TOOL_CHANNEL``)."""
     _stamp_tool_run({TOOL_CHANNEL: channel})
+
+
+def stamp_resource_tier(tier: Optional[str]) -> None:
+    """Name the size of the machine the enclosing tool call ran on (``RESOURCE_TIER``)."""
+    _stamp_tool_run({RESOURCE_TIER: tier})
 
 
 def _class_of(error: BaseException | str) -> str:

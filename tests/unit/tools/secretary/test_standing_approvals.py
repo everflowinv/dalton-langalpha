@@ -12,6 +12,7 @@ import json
 from typing import Annotated
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import aiohttp
 import pytest
 from langchain.agents import create_agent
 from langchain.tools import InjectedState
@@ -340,6 +341,158 @@ async def test_a_handoff_approved_in_advance_names_its_workspace(monkeypatch):
     assert payload["preapproved"] is True
     assert payload["workspace_name"] == "Research"
     assert payload["report_back"] is True
+
+
+_WORKSPACE = "22222222-2222-2222-2222-222222222222"
+_PTC_THREAD = "11111111-1111-1111-1111-111111111111"
+
+
+def _fill_thread_cap(cache: FakeCache) -> None:
+    from src.server.services.report_back.handoff import keys, reserve
+
+    members = {f"p{i}" for i in range(reserve.MAX_DISPATCH_PER_THREAD)}
+    cache.client.sets[keys.watch_key("home-1")] = members
+    # Live origins, or the over-cap retry reaps them as orphans.
+    for member in members:
+        cache.kv[keys.ptc_origin_key(member)] = {
+            "home_thread_id": "home-1",
+            "report_back": True,
+        }
+
+
+async def _handoff_that_fails(
+    monkeypatch, *, session, approved_in_advance=True, thread_id=None, cache=None
+) -> dict:
+    monkeypatch.setenv("INTERNAL_SERVICE_TOKEN", "test-internal-service-token")
+    cache = cache or FakeCache()
+    monkeypatch.setattr("src.utils.cache.redis_cache.get_cache_client", lambda: cache)
+    target = {"thread_id": thread_id} if thread_id else {"workspace_id": _WORKSPACE}
+    asks = (
+        _NEVER_ASK if approved_in_advance else MagicMock(return_value=(True, {}))
+    )
+    with patch("src.tools.secretary.dispatch.hitl_confirm", asks), patch(
+        "src.server.database.workspace.get_workspace",
+        AsyncMock(return_value={"user_id": USER_ID, "name": "Research"}),
+    ), patch(
+        "src.server.database.conversation.threads_read.get_thread_owner_id",
+        AsyncMock(return_value=USER_ID),
+    ), patch(
+        "src.server.database.conversation.threads_read.get_thread_by_id",
+        AsyncMock(return_value={"workspace_id": _WORKSPACE}),
+    ), patch(
+        "src.server.database.runs.lifecycle.get_latest_attempt",
+        AsyncMock(return_value=None),
+    ), patch(
+        "src.tools.secretary.dispatch._DISPATCH_CONFIRM_GRACE_S", 0.0
+    ), patch("aiohttp.ClientSession", return_value=session):
+        result = await delegate_to_analyst.ainvoke(
+            {
+                "name": "delegate_to_analyst",
+                "args": {
+                    "question": "analyze this",
+                    **target,
+                    "state": (
+                        {"preapproved_calls": ["call-1"]} if approved_in_advance else {}
+                    ),
+                },
+                "id": "call-1",
+                "type": "tool_call",
+            },
+            config={"configurable": {"user_id": USER_ID, "thread_id": "home-1"}},
+        )
+    return _payload(result)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("session", "error"),
+    [
+        (FakeSession(FakeResp(status=402)), "dispatch_failed"),
+        (FakeSession(post_exc=aiohttp.InvalidURL("x")), "dispatch_failed"),
+    ],
+    ids=["refused", "never-sent"],
+)
+async def test_a_handoff_approved_in_advance_that_fails_says_where_it_was_going(
+    monkeypatch, session, error
+):
+    """No card asked for it, so the failure carries what the card would show.
+    A new thread's id names nothing until its run starts, so it stays out."""
+    payload = await _handoff_that_fails(monkeypatch, session=session)
+
+    assert payload == {
+        "success": False,
+        "error": error,
+        "preapproved": True,
+        "workspace_id": _WORKSPACE,
+        "workspace_name": "Research",
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_handoff_approved_in_advance_over_the_cap_says_where_it_was_going(
+    monkeypatch,
+):
+    cache = FakeCache()
+    _fill_thread_cap(cache)
+    payload = await _handoff_that_fails(
+        monkeypatch,
+        session=MagicMock(side_effect=AssertionError("dispatch must not run")),
+        cache=cache,
+    )
+
+    assert "too many concurrent analyses" in payload["error"]
+    assert payload["preapproved"] is True
+    assert payload["workspace_name"] == "Research"
+    assert "thread_id" not in payload
+
+
+@pytest.mark.asyncio
+async def test_a_continuation_approved_in_advance_that_fails_names_its_thread(
+    monkeypatch,
+):
+    from src.tools.secretary.dispatch import _THREAD_BUSY
+
+    payload = await _handoff_that_fails(
+        monkeypatch,
+        session=FakeSession(FakeResp(status=409)),
+        thread_id=_PTC_THREAD,
+    )
+
+    assert payload == {
+        "success": False,
+        "error": _THREAD_BUSY,
+        "preapproved": True,
+        "workspace_id": _WORKSPACE,
+        "workspace_name": "Research",
+        "thread_id": _PTC_THREAD,
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_handoff_approved_in_advance_with_an_unknown_outcome_is_marked(
+    monkeypatch,
+):
+    payload = await _handoff_that_fails(
+        monkeypatch, session=FakeSession(post_exc=TimeoutError())
+    )
+
+    assert payload["outcome"] == "unknown_retained"
+    assert payload["preapproved"] is True
+    assert payload["workspace_name"] == "Research"
+    # The minted thread, where the run may have started.
+    assert payload["thread_id"]
+
+
+@pytest.mark.asyncio
+async def test_a_handoff_approved_on_its_card_fails_as_before(monkeypatch):
+    """Its card already shows where it was going."""
+    payload = await _handoff_that_fails(
+        monkeypatch,
+        session=FakeSession(FakeResp(status=402)),
+        approved_in_advance=False,
+    )
+
+    assert payload == {"success": False, "error": "dispatch_failed"}
 
 
 def test_a_declined_hand_off_keeps_the_work_unrouted_and_the_users_reason():

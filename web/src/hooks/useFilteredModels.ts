@@ -1,6 +1,7 @@
 import type { ProviderModelsData } from '@/components/model/types';
 import type { ConfiguredProvider } from './useConfiguredProviders';
 import type { PlatformModelsResponse } from '@/types/platform';
+import type { NativeCompactionKind } from './useAllModels';
 import { getModelAccess } from './usePlatformModels';
 
 /**
@@ -32,6 +33,9 @@ export interface ModelMetadataEntry {
   /** Compaction preset the model resolves to on its own — its declaration, else
    * the band its context window falls in. Absent = the deployment default. */
   compaction_profile?: string;
+  /** Whose compaction the model takes, on by default. Absent or null = its
+   * provider cannot compact for it. */
+  native_compaction?: NativeCompactionKind | null;
 }
 
 /** Key for the (group, name) pair in customPairs — '::' can't collide with any provider or model name. */
@@ -335,7 +339,13 @@ export function buildVisibleModels(
     // typed, while the built-in's display_name names the manifest's model,
     // which this entry may not route to.
     const ladder = declaredLadder(cm);
-    const { display_name: _shadowedLabel, ...declared } = metadata[cm.name];
+    // Provider compaction does not carry over either: it rides on the
+    // manifest's own request settings, which a custom entry never inherits.
+    const {
+      display_name: _shadowedLabel,
+      native_compaction: _shadowedNative,
+      ...declared
+    } = metadata[cm.name];
     metadata[cm.name] = {
       ...declared,
       ...('efforts' in ladder ? { reasoning_efforts: ladder.efforts } : {}),

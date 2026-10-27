@@ -1,8 +1,8 @@
 """Routes for adding a machine its owner brings, reached over SSH.
 
-The key, the probe and the pairing the dialog walks through, and the three
-public routes the pairing's script calls from the machine, whose token is the
-credential. The create itself is ``POST /api/v1/computers``.
+The key, the probe and the pairing the dialog walks through, and the public
+routes the pairing's script, or LangAlpha's helper, calls from the machine,
+whose token is the credential. The create itself is ``POST /api/v1/computers``.
 """
 
 from __future__ import annotations
@@ -276,6 +276,22 @@ async def ssh_pairing_script(token: str):
     except SSHUnavailable as e:
         script = _shell_message(str(e))
     return PlainTextResponse(script, headers={"Cache-Control": "no-store"})
+
+
+@router.get("/pairings/{token}/key", response_class=PlainTextResponse)
+@_plain_text_errors
+async def ssh_pairing_key(token: str):
+    """The line the script authorizes, for a machine that pairs without running it.
+
+    Public: the token is the credential. LangAlpha's helper reads it here and
+    keeps it in its own folder. 404 once expired.
+    """
+    settings = await _ssh_settings(None)
+    with _ssh_errors():
+        line = await ssh_pairing.pairing_key(token, settings)
+    if line is None:
+        raise HTTPException(status_code=404, detail=ssh_pairing.EXPIRED)
+    return PlainTextResponse(f"{line}\n", headers={"Cache-Control": "no-store"})
 
 
 @router.post("/pairings/{token}/report", response_class=PlainTextResponse)

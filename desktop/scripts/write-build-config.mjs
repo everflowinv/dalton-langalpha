@@ -30,7 +30,13 @@ if (!EDITIONS.includes(edition)) {
 const config = { edition }
 
 if (edition === 'saas') {
-  const required = { appOrigin: 'DESKTOP_APP_ORIGIN', platformOrigin: 'DESKTOP_PLATFORM_ORIGIN' }
+  // `pairingOrigin` is the deployment's API server, the one place a hosted
+  // build lets remote control pair this Mac with (src/remoteControl.js).
+  const required = {
+    appOrigin: 'DESKTOP_APP_ORIGIN',
+    platformOrigin: 'DESKTOP_PLATFORM_ORIGIN',
+    pairingOrigin: 'DESKTOP_PAIRING_ORIGIN',
+  }
   let missing = false
   for (const [key, envName] of Object.entries(required)) {
     const value = process.env[envName]
@@ -136,6 +142,7 @@ const shown = [
   `edition=${edition}`,
   config.appOrigin && `app=${config.appOrigin}`,
   config.platformOrigin && `platform=${config.platformOrigin}`,
+  config.pairingOrigin && `pairing=${config.pairingOrigin}`,
   `updates=${updateMode}`,
 ].filter(Boolean)
 console.log(`[config] ${shown.join(' ')}`)

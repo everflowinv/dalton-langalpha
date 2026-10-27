@@ -302,3 +302,28 @@ def test_a_listing_fingerprints_a_key_as_the_provider_does():
     for line in (_KEY, f"{_KEY} root@box", minted):
         assert host_key_fingerprint(line) == ssh.public_key_fingerprint(line)
     assert host_key_fingerprint("ssh-ed25519 not*base64") is None
+
+
+@pytest.mark.parametrize(("stored", "helper"), [(True, True), (None, False)])
+def test_a_listing_says_whether_the_helper_answers_for_the_machine(stored, helper):
+    """A computer added before the helper existed has no such key."""
+    from src.server.services.ssh_computers import ssh_info
+
+    computer = _ssh("/home/ubuntu/langalpha")
+    if stored is not None:
+        computer["provider_config"]["helper"] = stored
+
+    assert ssh_info(computer).helper is helper
+
+
+@pytest.mark.parametrize(("os", "stored"), [("Darwin", "Darwin"), ("", None)])
+def test_a_new_computer_keeps_its_system_only_when_the_probe_named_one(os, stored):
+    """The deployment may not set it, so a system left out stays unknown."""
+    from src.server.services.ssh_computers import provider_config_for
+
+    config = provider_config_for(
+        "user-1", host="203.0.113.10", port=22, username="dev", host_key=_KEY, os=os
+    )
+
+    assert config.get("os") == stored
+    assert ("os" in config) is bool(stored)

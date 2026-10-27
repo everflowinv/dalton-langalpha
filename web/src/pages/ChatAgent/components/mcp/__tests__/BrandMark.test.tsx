@@ -52,11 +52,27 @@ describe('BrandMark', () => {
     expect(container.querySelector('img')?.getAttribute('src')).toBe('/icon/new');
   });
 
-  it('beds a transparent glyph on white so it survives a dark surface', () => {
+  it('turns a black mark light on the dark theme and leaves it on the light one', () => {
     const { container } = render(
-      <BrandMark name="ollama" art={{ src: '/ollama.png', padded: true }} />,
+      <BrandMark name="ollama" art={{ src: '/ollama.svg', ink: true }} />,
     );
-    expect(container.querySelector('img')?.className).toContain('bg-white');
+    const cls = container.querySelector('img')?.className ?? '';
+    expect(cls).toContain('invert');
+    expect(cls).toContain('[[data-theme=light]_&]:filter-none');
+  });
+
+  it('never rounds a bare glyph, whatever rounding the caller asks for the stand-in', () => {
+    const { container } = render(
+      <BrandMark name="kimi" art={{ src: '/kimi.svg', bare: true }} className="rounded-full" />,
+    );
+    const cls = container.querySelector('img')?.className ?? '';
+    expect(cls).toContain('rounded-none');
+    expect(cls).not.toContain('rounded-full');
+  });
+
+  it('leaves a mark in its own colors alone', () => {
+    const { container } = render(<BrandMark name="gemini" art={{ src: '/gemini.svg' }} />);
+    expect(container.querySelector('img')?.className).not.toContain('invert');
   });
 
   it('is decorative in both states, so the row keeps its own accessible name', () => {

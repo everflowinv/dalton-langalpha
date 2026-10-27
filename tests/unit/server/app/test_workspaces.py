@@ -466,12 +466,14 @@ async def test_list_workspaces_invalid_sort_by(client):
 _ALL_SCOPES = [
     "workspace:spec:performance",
     "workspace:spec:max",
+    "workspace:spec:xlarge",
     "workspace:always_on",
 ]
 
 
 def _quota_platform(scopes, capacity):
     """Patch the platform reads behind /quota: the scope list and the count quotas."""
+    counts = AsyncMock(side_effect=lambda _uid, quota: capacity[quota])
     return (
         patch(
             "src.server.dependencies.usage_limits.platform_gating_active",
@@ -481,56 +483,61 @@ def _quota_platform(scopes, capacity):
             "src.server.dependencies.usage_limits._get_user_scopes",
             new=AsyncMock(return_value=scopes),
         ),
-        patch(
-            "src.server.dependencies.usage_limits.get_capacity_status",
-            new=AsyncMock(side_effect=lambda _uid, quota: capacity[quota]),
-        ),
+        patch("src.server.dependencies.usage_limits.get_capacity_status", new=counts),
+        patch("src.server.app.workspaces.get_capacity_status", new=counts),
     )
 
 
 _CAPACITY = {
     "spec_performance": {"used": 1, "limit": 3},
     "spec_max": {"used": 0, "limit": 2},
+    "spec_xlarge": {"used": 1, "limit": 1},
     "always_on": {"used": 2, "limit": -1},
+    "computer_count": {"used": 2, "limit": 2},
 }
 
 
 @pytest.mark.asyncio
 async def test_get_workspace_quota_platform(client):
     """Platform mode surfaces per-tier {used, limit}; /quota is not shadowed by /{id}."""
-    gating, scopes, capacity = _quota_platform(_ALL_SCOPES, _CAPACITY)
-    with gating, scopes, capacity:
+    gating, scopes, capacity, counts = _quota_platform(_ALL_SCOPES, _CAPACITY)
+    with gating, scopes, capacity, counts:
         resp = await client.get("/api/v1/workspaces/quota")
 
     assert resp.status_code == 200
     assert resp.json() == {
         "performance": {"used": 1, "limit": 3},
         "max": {"used": 0, "limit": 2},
+        "xlarge": {"used": 1, "limit": 1},
         "always_on": {"used": 2, "limit": -1},
+        "computers": {"used": 2, "limit": 2},
     }
 
 
 @pytest.mark.asyncio
 async def test_get_workspace_quota_missing_scope_reads_not_on_plan(client):
     """A count limit the plan's scopes do not grant must not advertise an upgrade the gate refuses."""
-    gating, scopes, capacity = _quota_platform(
+    gating, scopes, capacity, counts = _quota_platform(
         ["workspace:spec:performance"], _CAPACITY
     )
-    with gating, scopes, capacity:
+    with gating, scopes, capacity, counts:
         resp = await client.get("/api/v1/workspaces/quota")
 
     assert resp.json() == {
         "performance": {"used": 1, "limit": 3},
         "max": {"used": 0, "limit": 0},
+        "xlarge": {"used": 0, "limit": 0},
         "always_on": {"used": 0, "limit": 0},
+        # Held computers need no scope, so a plan's scopes never zero them.
+        "computers": {"used": 2, "limit": 2},
     }
 
 
 @pytest.mark.asyncio
 async def test_get_workspace_quota_unknown_scopes_fail_open(client):
     """No scope list from the platform is unknown, not denial: the counts pass through."""
-    gating, scopes, capacity = _quota_platform(None, _CAPACITY)
-    with gating, scopes, capacity:
+    gating, scopes, capacity, counts = _quota_platform(None, _CAPACITY)
+    with gating, scopes, capacity, counts:
         resp = await client.get("/api/v1/workspaces/quota")
 
     assert resp.json()["max"] == {"used": 0, "limit": 2}
@@ -546,7 +553,13 @@ async def test_get_workspace_quota_oss_all_null(client):
         resp = await client.get("/api/v1/workspaces/quota")
 
     assert resp.status_code == 200
-    assert resp.json() == {"performance": None, "max": None, "always_on": None}
+    assert resp.json() == {
+        "performance": None,
+        "max": None,
+        "xlarge": None,
+        "always_on": None,
+        "computers": None,
+    }
 
 
 # ---------------------------------------------------------------------------

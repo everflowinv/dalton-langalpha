@@ -21,16 +21,18 @@ class _FakeModel:
 class _FakeRequest:
     """Duck-typed stand-in for langchain's ModelRequest."""
 
-    def __init__(self, model, messages=None, state=None):
+    def __init__(self, model, messages=None, state=None, model_settings=None):
         self.model = model
         self.messages = messages if messages is not None else []
         self.state = state if state is not None else {"messages": []}
+        self.model_settings = model_settings if model_settings is not None else {}
 
     def override(self, *, model=None, messages=None):
         return _FakeRequest(
             model if model is not None else self.model,
             messages if messages is not None else self.messages,
             self.state,
+            self.model_settings,
         )
 
 
@@ -167,6 +169,64 @@ class TestRetryBehavior:
         assert fallbacks[0]["from_is_primary"] is True
         assert fallbacks[0]["attempts_on_from"] == 1
         assert fallbacks[0]["status_code"] == 404
+
+
+class TestProgrammingErrors:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            AttributeError("'dict' object has no attribute 'model_dump'"),
+            TypeError("'NoneType' object is not iterable"),
+            KeyError("choices"),
+        ],
+    )
+    async def test_a_parsing_crash_goes_straight_to_the_fallback(self, exc, events):
+        client = _FakeModel("primary-model")
+        fallback_client = _FakeModel("fallback-a")
+        mw = _make_middleware(client, fallbacks=[("fallback-a", fallback_client)])
+        calls = []
+
+        async def handler(req):
+            calls.append(req.model)
+            if req.model is client:
+                raise exc
+            return "ok-from-fallback"
+
+        result = await mw.awrap_model_call(_FakeRequest(client), handler)
+        assert result == "ok-from-fallback"
+        assert calls == [client, fallback_client]
+        assert _fallback_props(events)[0]["attempts_on_from"] == 1
+
+    @pytest.mark.asyncio
+    async def test_a_crash_with_no_fallback_surfaces_after_one_attempt(self, events):
+        client = _FakeModel("primary-model")
+        mw = _make_middleware(client)
+        calls = []
+
+        async def handler(req):
+            calls.append(req)
+            raise KeyError("choices")
+
+        with pytest.raises(KeyError):
+            await mw.awrap_model_call(_FakeRequest(client), handler)
+        assert len(calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_connection_error_keeps_its_retries(self, events):
+        import httpx
+
+        client = _FakeModel("primary-model")
+        mw = _make_middleware(client, max_retries=2)
+        calls = []
+
+        async def handler(req):
+            calls.append(req)
+            raise httpx.ConnectError("refused")
+
+        with pytest.raises(httpx.ConnectError):
+            await mw.awrap_model_call(_FakeRequest(client), handler)
+        assert len(calls) == 3
 
 
 class TestStalledStream:
@@ -394,6 +454,43 @@ class TestRobustness:
         assert mw._calculate_delay(0) == 1.0
         assert mw._calculate_delay(1) == 2.0
         assert mw._calculate_delay(2) == 3.0  # capped at max_delay
+
+
+class TestCompactionRequest:
+    """A compaction request asks the primary's provider for its own summary:
+    another model would answer it as a turn, and compaction has a summarizer
+    of its own to fall back to."""
+
+    _SETTINGS = {"extra_body": {"compaction": {"type": "summarize"}}}
+
+    @pytest.mark.asyncio
+    async def test_only_the_primary_is_tried(self, events):
+        client = _FakeModel("primary-model")
+        fallback_client = _FakeModel("fallback-a")
+        mw = _make_middleware(client, fallbacks=[("fallback-a", fallback_client)])
+        exc = _status_error("Error code: 404 - model not found", status=404)
+        calls = []
+
+        async def handler(req):
+            calls.append(req.model)
+            raise exc
+
+        with pytest.raises(Exception) as exc_info:
+            await mw.awrap_model_call(_FakeRequest(client, model_settings=self._SETTINGS), handler)
+
+        assert exc_info.value is exc
+        assert calls == [client]
+        assert _fallback_props(events) == []
+
+    def test_candidates(self):
+        client = _FakeModel("primary-model")
+        mw = _make_middleware(client, fallbacks=[("fallback-a", _FakeModel("fallback-a"))])
+
+        compaction = mw._candidates(_FakeRequest(client, model_settings=self._SETTINGS))
+        turn = mw._candidates(_FakeRequest(client, model_settings={"extra_body": {"x": 1}}))
+
+        assert [name for name, _ in compaction] == ["primary-model"]
+        assert [name for name, _ in turn] == ["primary-model", "fallback-a"]
 
 
 class TestBuildFallbackPairs:

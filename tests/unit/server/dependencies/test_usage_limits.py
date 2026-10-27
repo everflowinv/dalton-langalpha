@@ -1056,6 +1056,19 @@ class TestExtractCapacityAliases:
     def test_absent_counts_stay_none(self):
         assert self._extract()({"allowed": True}) == (None, None)
 
+    def test_null_names_fall_through_to_the_counted_ones(self):
+        """The platform sends every quota field, the unused ones as null; a
+        computer quota carries its counts under the workspace names only."""
+        assert self._extract()(
+            {
+                "allowed": True,
+                "capacity_used": None,
+                "capacity_limit": None,
+                "active_workspaces": 1,
+                "workspace_limit": 2,
+            }
+        ) == (1, 2)
+
 
 # ===================================================================
 # always_on_entitlement_lost — the idle-cleanup reconciler's check.
@@ -1269,6 +1282,70 @@ class TestEnforceCapacity:
 # ===================================================================
 
 
+class TestEnforceComputerCount:
+    """The create-only cap on computers held, stopped ones included."""
+
+    @pytest.mark.asyncio
+    async def test_asks_the_held_count_and_relays_a_full_cap(self):
+        from fastapi import HTTPException
+
+        quota_response = {
+            "quota": {
+                "allowed": False,
+                "limit_type": "workspace_limit",
+                "message": "Limit reached",
+                "active_workspaces": 2,
+                "workspace_limit": 2,
+            }
+        }
+        validate = AsyncMock(return_value=quota_response)
+        with (
+            patch(f"{MODULE}.HOST_MODE", "platform"),
+            patch(f"{MODULE}.AUTH_SERVICE_URL", "http://localhost:8003"),
+            patch(f"{MODULE}._call_validate_for_user", validate),
+        ):
+            from src.server.dependencies.usage_limits import enforce_computer_count
+
+            with pytest.raises(HTTPException) as exc:
+                await enforce_computer_count("user-1")
+
+        validate.assert_awaited_once_with("user-1", check_quota="computer_count")
+        assert exc.value.status_code == 429
+        assert exc.value.detail["current"] == 2
+        assert exc.value.detail["limit"] == 2
+
+    @pytest.mark.asyncio
+    async def test_fails_open_on_a_platform_that_predates_it(self):
+        """An older platform answers 422, which reads as no result: the create
+        falls back on the running-computer limit it also asks."""
+        with (
+            patch(f"{MODULE}.HOST_MODE", "platform"),
+            patch(f"{MODULE}.AUTH_SERVICE_URL", "http://localhost:8003"),
+            patch(
+                f"{MODULE}._call_validate_for_user",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+        ):
+            from src.server.dependencies.usage_limits import enforce_computer_count
+
+            assert await enforce_computer_count("user-1") is None
+
+    @pytest.mark.asyncio
+    async def test_running_limit_still_asks_the_running_count(self):
+        validate = AsyncMock(return_value={"quota": {"allowed": True}})
+        with (
+            patch(f"{MODULE}.HOST_MODE", "platform"),
+            patch(f"{MODULE}.AUTH_SERVICE_URL", "http://localhost:8003"),
+            patch(f"{MODULE}._call_validate_for_user", validate),
+        ):
+            from src.server.dependencies.usage_limits import enforce_computer_limit
+
+            assert await enforce_computer_limit("user-1") == "user-1"
+
+        validate.assert_awaited_once_with("user-1", check_quota="workspace")
+
+
 class TestAssertSpecAllowed:
     @pytest.mark.asyncio
     async def test_standard_is_noop(self):
@@ -1341,8 +1418,9 @@ class TestAssertSpecAllowed:
             mock_cap.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_downgrade_skips_count(self):
-        """max → performance is a downgrade: scope checked, no new slot counted."""
+    async def test_a_step_down_into_a_metered_tier_counts(self):
+        """max → performance takes a performance slot, which the plan caps on
+        its own: uncounted, a user could free their top slot and fill it again."""
         with (
             patch(f"{MODULE}.HOST_MODE", "platform"),
             patch(f"{MODULE}.AUTH_SERVICE_URL", "http://localhost:8003"),
@@ -1356,7 +1434,7 @@ class TestAssertSpecAllowed:
             from src.server.dependencies.usage_limits import assert_spec_allowed
 
             await assert_spec_allowed("user-1", "performance", current_tier="max")
-            mock_cap.assert_not_awaited()
+            mock_cap.assert_awaited_once_with("user-1", "spec_performance")
 
     @pytest.mark.asyncio
     async def test_max_checks_max_scope_and_count(self):
@@ -1374,6 +1452,80 @@ class TestAssertSpecAllowed:
             from src.server.dependencies.usage_limits import assert_spec_allowed
 
             await assert_spec_allowed("user-1", "max", current_tier="standard")
+            mock_cap.assert_awaited_once_with("user-1", "spec_max")
+
+    @pytest.mark.asyncio
+    async def test_xlarge_without_its_scope_raises_403(self):
+        """Every other spec scope held is no grant of Extra Large: an absent
+        entry would leave the tier ungated."""
+        with (
+            patch(f"{MODULE}.HOST_MODE", "platform"),
+            patch(f"{MODULE}.AUTH_SERVICE_URL", "http://localhost:8003"),
+            patch(
+                f"{MODULE}._get_user_scopes",
+                new_callable=AsyncMock,
+                return_value=["workspace:spec:performance", "workspace:spec:max"],
+            ),
+            patch(f"{MODULE}.enforce_capacity", new_callable=AsyncMock) as mock_cap,
+        ):
+            from src.server.dependencies.usage_limits import assert_spec_allowed
+
+            with pytest.raises(HTTPException) as exc:
+                await assert_spec_allowed("user-1", "xlarge", current_tier="max")
+
+            assert exc.value.status_code == 403
+            mock_cap.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_xlarge_at_its_count_raises_429(self):
+        """Large to Extra Large is an upgrade, so the platform's count decides."""
+        with (
+            patch(f"{MODULE}.HOST_MODE", "platform"),
+            patch(f"{MODULE}.AUTH_SERVICE_URL", "http://localhost:8003"),
+            patch(
+                f"{MODULE}._get_user_scopes",
+                new_callable=AsyncMock,
+                return_value=["workspace:spec:xlarge"],
+            ),
+            patch(
+                f"{MODULE}._call_validate_for_user",
+                new_callable=AsyncMock,
+                return_value={
+                    "quota": {
+                        "allowed": False,
+                        "limit_type": "xlarge_limit",
+                        "message": "Extra Large limit reached",
+                        "capacity_used": 1,
+                        "capacity_limit": 1,
+                    }
+                },
+            ) as validate,
+        ):
+            from src.server.dependencies.usage_limits import assert_spec_allowed
+
+            with pytest.raises(HTTPException) as exc:
+                await assert_spec_allowed("user-1", "xlarge", current_tier="max")
+
+        validate.assert_awaited_once_with("user-1", check_quota="spec_xlarge")
+        assert exc.value.status_code == 429
+        assert exc.value.detail["type"] == "xlarge_limit"
+        assert (exc.value.detail["current"], exc.value.detail["limit"]) == (1, 1)
+
+    @pytest.mark.asyncio
+    async def test_a_step_down_from_xlarge_counts_the_target_tier(self):
+        with (
+            patch(f"{MODULE}.HOST_MODE", "platform"),
+            patch(f"{MODULE}.AUTH_SERVICE_URL", "http://localhost:8003"),
+            patch(
+                f"{MODULE}._get_user_scopes",
+                new_callable=AsyncMock,
+                return_value=["workspace:spec:max"],
+            ),
+            patch(f"{MODULE}.enforce_capacity", new_callable=AsyncMock) as mock_cap,
+        ):
+            from src.server.dependencies.usage_limits import assert_spec_allowed
+
+            await assert_spec_allowed("user-1", "max", current_tier="xlarge")
             mock_cap.assert_awaited_once_with("user-1", "spec_max")
 
     @pytest.mark.asyncio
@@ -1917,6 +2069,21 @@ class TestSpecEntitlementLost:
             from src.server.dependencies.usage_limits import spec_entitlement_lost
 
             assert await spec_entitlement_lost("user-1", "performance") is False
+
+    @pytest.mark.asyncio
+    async def test_xlarge_is_reclaimed_when_its_scope_is_gone(self):
+        with (
+            patch(f"{MODULE}.HOST_MODE", "platform"),
+            patch(f"{MODULE}.AUTH_SERVICE_URL", "http://localhost:8003"),
+            patch(
+                f"{MODULE}._call_validate_for_user",
+                new_callable=AsyncMock,
+                return_value={"scopes": ["workspace:spec:max"]},
+            ),
+        ):
+            from src.server.dependencies.usage_limits import spec_entitlement_lost
+
+            assert await spec_entitlement_lost("user-1", "xlarge") is True
 
     @pytest.mark.asyncio
     async def test_standard_and_unknown_tiers_never_reclaimed(self):

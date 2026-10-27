@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Any
 
+from src.server.contracts.run_times import run_completed_at
 from src.server.contracts.status import TERMINAL_STATUSES
 from src.server.contracts.turn_kinds import NOTIFICATION_QUERY_TYPES
 from src.server.database.provenance import provenance_row_to_event
@@ -58,33 +59,6 @@ def _user_message_item(
     if completed_at is not None:
         payload["run_completed_at"] = completed_at
     return {"event": "user_message", "data": payload}
-
-
-def run_completed_at(response: dict[str, Any] | None) -> str | None:
-    """When the turn's run settled, paired with the query timestamp to show how
-    long the turn took.
-
-    ``usage_settled_at`` is the terminal CAS's own ``NOW()`` — the settle
-    instant itself. Rows written before that column existed fall back to the
-    run's start plus its measured duration, and a row that knows neither
-    returns None so the client shows no duration rather than a wrong one.
-
-    Public: the shared replay in ``server/app/public.py`` hand-builds its own
-    ``user_message`` payload and needs the same answer. Two copies of the
-    fallback chain would drift the moment one of them learned a new column.
-    """
-    if response is None or response.get("status") not in TERMINAL_STATUSES:
-        return None
-    settled = response.get("usage_settled_at")
-    if settled is not None:
-        return settled.isoformat() if hasattr(settled, "isoformat") else str(settled)
-    created_at = response.get("created_at")
-    execution_time = response.get("execution_time")
-    if not hasattr(created_at, "isoformat") or not isinstance(
-        execution_time, (int, float)
-    ):
-        return None
-    return (created_at + timedelta(seconds=float(execution_time))).isoformat()
 
 
 def _interrupt_item(thread_id: str, interrupt: dict[str, Any]) -> dict[str, Any]:

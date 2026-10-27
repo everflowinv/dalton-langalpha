@@ -482,6 +482,45 @@ def _validate_custom_models(custom_models: list, custom_providers: list | None =
             )
 
 
+async def _refuse_custom_model_endpoints(custom_models: list, stored: list | None = None) -> None:
+    """Refuse, in platform mode, a custom model whose parameters point its
+    client somewhere the server must not dial, or route it another way.
+
+    Only an entry that is new, or whose routing differs from the ``stored``
+    entry of its name, is checked. A save carries the whole list, so one entry
+    saved before the policy, or whose host has stopped resolving, would
+    otherwise block every later change. Such an entry is still refused, or
+    held, where its client is built.
+    """
+    from src.server.services.llm import egress
+
+    if not egress.enforced():
+        return
+    saved = {
+        cm.get("name"): egress.routing_params(cm.get("parameters"))
+        for cm in stored or []
+        if isinstance(cm, dict)
+    }
+    to_check: list[tuple[int, str]] = []
+    for idx, cm in enumerate(custom_models):
+        params = cm.get("parameters")
+        if cm.get("name") in saved and saved[cm.get("name")] == egress.routing_params(params):
+            continue
+        for key in (*egress.connection_params(params), *egress.vertex_params(params)):
+            raise HTTPException(
+                status_code=400,
+                detail=f"custom_models[{idx}]: parameters.{key} cannot be set. Remove it.",
+            )
+        to_check.extend((idx, url) for url in egress.parameter_urls(params))
+    reasons = await egress.save_refusals(url for _, url in to_check)
+    for idx, url in to_check:
+        if reasons[url]:
+            raise HTTPException(
+                status_code=400,
+                detail=f"custom_models[{idx}]: the base URL in parameters cannot be used: {reasons[url]}",
+            )
+
+
 def _validate_custom_providers(custom_providers: list) -> None:
     """Validate custom_providers list before persisting."""
     if not isinstance(custom_providers, list):
@@ -737,6 +776,11 @@ async def update_preferences(
             _validate_custom_models(
                 effective.get("custom_models") or [],
                 effective.get("custom_providers") or [],
+            )
+
+        if model_pref.get("custom_models"):
+            await _refuse_custom_model_endpoints(
+                model_pref["custom_models"], stored_model_pref.get("custom_models")
             )
 
         _validate_model_tuning(model_pref, effective)

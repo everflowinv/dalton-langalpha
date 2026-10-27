@@ -411,7 +411,62 @@ async def test_analyst_offer_steers_an_owed_report():
         "This notice is from the system, not the user. Keep writing to the user in the language of their request.\n"
         "</system>"
     )
-    assert offer.shown["report_source"] == {"kind": "analyst", "thread_id": "ptc-1"}
+    assert offer.shown["report_source"] == {
+        "kind": "analyst",
+        "thread_id": "ptc-1",
+        "outcome": "completed",
+    }
+
+
+@pytest.mark.asyncio
+async def test_analyst_offer_labels_the_run_it_reports():
+    """A steered report labels its row as its own turn would: how the
+    reported run ended, the runs it continued, and the hand-offs they took
+    in as steers."""
+    job = _analyst_job(
+        run_id="run-1",
+        payload={
+            "ptc_thread_id": "ptc-1",
+            "final_status": "error",
+        },
+    )
+    with (
+        patch(_CACHE, return_value=_analyst_cache(_origin())),
+        # DALTON-HOOK(handoff-keep-on-resumable): the resumable verdict reads
+        # the run row; this error is an ordinary one, not a worker-lost.
+        patch(
+            "src.server.services.report_back.handoff.executor."
+            "is_resumable_analyst_failure",
+            new=AsyncMock(return_value=False),
+        ),
+        patch(
+            "src.server.database.runs.lifecycle.get_latest_attempt",
+            new=AsyncMock(return_value={"conversation_response_id": "run-1"}),
+        ),
+        patch(
+            "src.server.database.runs.lifecycle.get_continued_runs",
+            new=AsyncMock(return_value=["run-0", "run-1"]),
+        ),
+        patch(
+            f"{_OUTBOX}.list_taken_hand_offs",
+            # Taken in by one of the runs the report names, on its thread.
+            new=AsyncMock(
+                side_effect=lambda thread, runs: (
+                    ["steer-1"] if (thread, runs) == ("ptc-1", ["run-0", "run-1"])
+                    else []
+                )
+            ),
+        ),
+    ):
+        offer = await steer._analyst_offer(job, "t-1")
+
+    assert offer.shown["report_source"] == {
+        "kind": "analyst",
+        "thread_id": "ptc-1",
+        "outcome": "error",
+        "run_ids": ["run-0", "run-1"],
+        "steer_ids": ["steer-1"],
+    }
 
 
 @pytest.mark.asyncio
@@ -506,15 +561,16 @@ async def test_analyst_offer_carries_where_the_work_was_asked_for_inline():
 async def test_analyst_report_message_includes_language_notice():
     from src.server.services.report_back.handoff import executor
 
+    owed = executor.OwedAnalystReport(
+        origin={"ptc_workspace_id": "ws-googl"},
+        dispatcher_thread_id="home-1",
+        ptc_thread_id="ptc-99",
+        final_status="completed",
+    )
     with patch.object(
         executor, "_workspace_name", autospec=True, return_value="GOOGL"
     ):
-        msg, source = await executor.report_message(
-            "ptc-99",
-            {"ptc_workspace_id": "ws-googl"},
-            "completed",
-            steered=False,
-        )
+        msg, source = await executor.report_message(owed, steered=False)
     assert msg == (
         "<system>\n"
         'The analysis you dispatched (thread ptc-99 in the "GOOGL" workspace) has completed.\n'

@@ -1,5 +1,6 @@
 import { keepPreviousData, useQuery } from '@tanstack/react-query';
 import { useStableArray } from '@/hooks/useStableArray';
+import { epochMs } from '@/lib/elapsed';
 import { queryKeys } from '@/lib/queryKeys';
 import { useThreadRunStates } from '@/lib/threadLifecycle/store';
 import {
@@ -7,7 +8,7 @@ import {
   mapLivenessStatus,
   type PTCDispatchStatus,
 } from '../../hooks/usePTCDispatchStatus';
-import { getDispatchLiveness, type DispatchLiveness } from '../../utils/api';
+import { getHandoffLiveness, type DispatchLiveness } from '../../utils/api';
 import { staysOnRoster, type AnalystCandidate } from './delegatedWork';
 
 export interface RosterAnalyst {
@@ -22,11 +23,6 @@ export interface RosterAnalyst {
   startedAt?: number;
   /** Working, or still owing this thread its report while not waiting on the user. */
   running: boolean;
-}
-
-function parseMs(iso: string | null | undefined): number | null {
-  const ms = iso ? Date.parse(iso) : NaN;
-  return Number.isFinite(ms) ? ms : null;
 }
 
 function sameIds(a: string[], b: string[]): boolean {
@@ -60,7 +56,10 @@ export function useAnalystRoster(
   const { status: pushed, revision } = useThreadRunStates(ids);
   const { data, isPlaceholderData } = useQuery({
     queryKey: queryKeys.threads.dispatchActivity(ids, revision),
-    queryFn: () => getDispatchLiveness(ids),
+    // The shape the hand-off cards cache under the same key prefix, which
+    // `patchThreadTitle` rewrites in place; only the rows are read here.
+    queryFn: () => getHandoffLiveness({ threads: ids, runs: [], steers: [] }),
+    select: (read) => read.liveness,
     enabled: ids.length > 0,
     placeholderData: keepPreviousData,
     staleTime: 30_000,
@@ -83,7 +82,7 @@ export function useAnalystRoster(
     const settling = !running && isPlaceholderData && (read === 'running' || read === 'needs_input');
     // Owed with nothing read: a hand-off whose run has not registered yet.
     const status = notStarted ? 'failed' : reported ?? (c.owed ? 'starting' : null);
-    const lastActivityMs = Math.max(parseMs(live?.last_activity_at) ?? -Infinity, c.seenMs ?? -Infinity);
+    const lastActivityMs = Math.max(epochMs(live?.last_activity_at) ?? -Infinity, c.seenMs ?? -Infinity);
     const known = Number.isFinite(lastActivityMs) ? lastActivityMs : null;
     if (!settling && !staysOnRoster(running || waiting, known, turnStarts)) continue;
     rows.push({
@@ -92,7 +91,7 @@ export function useAnalystRoster(
       workspaceName: live?.workspace_name ?? c.workspaceName,
       title: live?.title ?? c.title,
       status,
-      startedAt: parseMs(live?.run_started_at) ?? undefined,
+      startedAt: read === 'running' ? epochMs(live?.run_started_at) ?? undefined : undefined,
       running,
       lastActivityMs: known,
     });

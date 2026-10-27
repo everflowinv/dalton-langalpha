@@ -47,6 +47,7 @@ from src.server.services.computer_errors import (
     MachineBusyError,
     SpecChangeLostError,
     SpecNotChangeable,
+    UnknownResourceTier,
 )
 from src.server.services.computer_manager._types import ComputerBinding
 from src.server.services.persistence.transfer import PULL_MAX_INFLIGHT_BYTES
@@ -100,7 +101,10 @@ def _spec_refusal(
             "on that machine rather than here."
         )
     if tier not in tiers:
-        raise ValueError(f"Unknown resource tier: {tier}")
+        # Each provider offers its own sizes, so one may lack a tier another has.
+        raise UnknownResourceTier(
+            f"This computer's provider does not offer the {tier!r} spec"
+        )
     record = computer.get("spec_change") or {}
     took_over = (
         claim_id is not None
@@ -303,7 +307,8 @@ class ComputerSpecMixin:
         backed-up files won't fit the smaller disk is refused before teardown.
 
         Raises:
-            ValueError: Computer not found or ``tier`` is unknown.
+            ValueError: Computer not found.
+            UnknownResourceTier: The computer's provider has no ``tier``.
             ComputerBusyError: Another spec change or operation holds the machine.
             DiskTooSmallError: Downgrade refused, files exceed the target disk.
             MachineBusyError: A turn is running on the machine.
@@ -631,7 +636,10 @@ class ComputerSpecMixin:
                 await session.stop()
             if not gone:
                 await self._assert_spec_claim_owned(computer_id, claim_id)
+                # Daytona's metric history goes with the sandbox.
+                await self._fold_usage_before_delete(computer_id)
                 await self._destroy_sandbox(sandbox_id, binding=binding)
+                await self._end_replaced_usage_run(computer_id, sandbox_id)
             # The ref still names this sandbox, so its reading would pass for
             # the machine's at the new tier until the next start measures.
             await clear_computer_disk(computer_id, sandbox_id=sandbox_id)
@@ -765,6 +773,9 @@ class ComputerSpecMixin:
             # the row stopped and the next start rebuilds (claim -> restart ->
             # SandboxGone -> recover). 'error' would be terminal.
             claim.release_to = ComputerStatus.STOPPED
+            # Before the session's cleanup below, which deletes the sandbox and
+            # Daytona's metric history with it.
+            await self._fold_usage_before_delete(computer_id)
             # Force-evict the SessionManager entry: cleanup_session skips its
             # own pop when session.cleanup() raised, so the recover below must
             # not return the stale broken session.
@@ -775,6 +786,9 @@ class ComputerSpecMixin:
             # once the old one is confirmed gone, so the two never run, and
             # bill, side by side.
             await self._destroy_sandbox(locked_sandbox_id, binding=binding)
+            # The new sandbox binds only after its restore, none of which is
+            # the old one's.
+            await self._end_replaced_usage_run(computer_id, locked_sandbox_id)
             # A recover that fails leaves the ref on the destroyed sandbox.
             await clear_computer_disk(computer_id, sandbox_id=locked_sandbox_id)
             await self._recover_sandbox(
@@ -842,6 +856,8 @@ class ComputerSpecMixin:
                 computer_id
             ) or await self._machine_has_active_tasks(computer_id):
                 return False
+            # Before the session's cleanup, which deletes the sandbox.
+            await self._fold_usage_before_delete(computer_id)
             self._cancel_mcp_discovery(computer_id)
             await self._clear_session(computer_id)
             SessionManager.remove_session(computer_id)

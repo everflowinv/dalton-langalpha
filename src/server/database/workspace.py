@@ -1009,7 +1009,9 @@ async def get_workspace_naming(workspace_id: str) -> Optional[Dict[str, Any]]:
 
     The live computer the workspace is on comes with the count of its user's
     live computers, which decides whether that computer is named at all, so
-    both answer from the snapshot the name does.
+    both answer from the snapshot the name does. Its kind and provider config
+    say whether it is a machine of the user's own, named or not, and its
+    folder where LangAlpha's part of that machine is.
     """
     workspace_id = normalize_uuid(workspace_id)
     if workspace_id is None:
@@ -1019,6 +1021,7 @@ async def get_workspace_naming(workspace_id: str) -> Optional[Dict[str, Any]]:
         await cur.execute(
             f"""
             SELECT w.name, w.description, c.name AS computer_name,
+                   c.kind AS computer_kind, c.provider_config, c.root_dir,
                    (SELECT count(*) FROM computers o
                     WHERE o.user_id = w.user_id AND o.{FENCE_NOT_DELETED}) AS computers
             FROM workspaces w
@@ -1302,6 +1305,14 @@ async def update_workspace_status(
             await publish_status_change(
                 workspace_id, status, computer_id=result.get("computer_id")
             )
+            if _mirrors_to_computer(status) and result.get("computer_id"):
+                from src.server.services.computer_usage.transitions import (
+                    note_computer_status,
+                )
+
+                # The ledger guards on the computer's own status, so a mirror
+                # that never reached the machine changes no run.
+                await note_computer_status(result, status, conn=conn)
             return dict(result)
         return None
 

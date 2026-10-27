@@ -69,6 +69,8 @@ describe('live: a hand-off approved on its card', () => {
 
     expect(card()).toMatchObject({ status: 'approved', dispatch_failed: true });
     expect(card().thread_id).toBeUndefined();
+    // A refusal is definite: nothing on any thread is this hand-off's run.
+    expect(card()).not.toHaveProperty('dispatch_unknown');
     expect(backfill.size).toBe(0);
   });
 
@@ -84,7 +86,7 @@ describe('live: a hand-off approved on its card', () => {
     });
 
     expect(card()).toMatchObject({
-      status: 'approved', dispatch_failed: true, thread_id: 'analyst-1', workspace_id: 'ws-1',
+      status: 'approved', dispatch_failed: true, dispatch_unknown: true, thread_id: 'analyst-1', workspace_id: 'ws-1',
     });
   });
 
@@ -100,9 +102,18 @@ describe('live: a hand-off approved on its card', () => {
   it('gives a dispatch that started its thread and no failure', () => {
     const { result, card } = setup();
 
-    result({ success: true, status: 'dispatched', thread_id: 'analyst-1', workspace_id: 'ws-1' });
+    result({ success: true, status: 'dispatched', thread_id: 'analyst-1', workspace_id: 'ws-1', run_id: 'run-1' });
 
-    expect(card()).toMatchObject({ status: 'approved', thread_id: 'analyst-1', workspace_id: 'ws-1' });
+    // The run it started, which the card reads once it is over, whatever the thread runs next.
+    expect(card()).toMatchObject({ status: 'approved', thread_id: 'analyst-1', workspace_id: 'ws-1', run_id: 'run-1' });
     expect(card().dispatch_failed).toBeUndefined();
+  });
+
+  it('writes whether a report-back is wired, which the switch only asked for', () => {
+    const { result, card } = setup();
+
+    result({ success: true, status: 'dispatched', thread_id: 'analyst-1', workspace_id: 'ws-1', report_back: false });
+
+    expect(card()).toMatchObject({ status: 'approved', report_back: false });
   });
 });

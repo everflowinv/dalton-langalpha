@@ -322,11 +322,12 @@ async def get_computer_names_and_home(
     conn=None,
 ) -> List[Dict[str, Any]]:
     """The user's live computers by id and name, each flagged when the user's
-    Home is on it: the names and the Home binding from one snapshot."""
+    Home is on it: the names and the Home binding from one snapshot. The kind
+    and provider config say which is a machine of the user's own."""
     async with _computer_cursor(conn) as cur:
         await cur.execute(
             f"""
-            SELECT c.computer_id, c.name,
+            SELECT c.computer_id, c.name, c.kind, c.provider_config,
                    c.computer_id IS NOT DISTINCT FROM (
                        SELECT h.computer_id FROM workspaces h
                        WHERE h.workspace_id = %(home_id)s AND h.{FENCE_NOT_DELETED}
@@ -573,6 +574,9 @@ async def create_computer(
         f"Created computer {row['computer_id']} (kind={kind}, "
         f"primary={row['is_primary']}) for user {user_id}"
     )
+    if row.get("status") == "running":
+        # Only an adopted sandbox is born running.
+        await _note_usage(row, "running", conn=conn)
     return row
 
 
@@ -585,6 +589,7 @@ async def update_computer_status(
     updated_before=None,
     expected_provider_ref: Optional[str] = None,
     require_provider_ref: bool = False,
+    run_end_reason: Optional[str] = None,
     conn=None,
 ) -> Optional[Dict[str, Any]]:
     """Only try_bind_computer_provider_ref may change the durable machine binding.
@@ -593,6 +598,8 @@ async def update_computer_status(
     project or attach a machine-less workspace. A tombstone also surrenders the
     primary flag: every probe fences on the tombstone, so a deleted row holding
     it would wedge ensure_primary_computer against the partial unique index.
+    run_end_reason is why the machine's usage run is ending, for a cause the
+    status does not say (an idle stop).
     """
     if status not in COMPUTER_STATUSES:
         raise ValueError(f"Not a computer status: {status!r}")
@@ -648,6 +655,7 @@ async def update_computer_status(
     if row is None:
         return None
     await _publish_shadowed(row, status)
+    await _note_usage(row, status, conn=conn, reason=run_end_reason)
     return dict(row)
 
 
@@ -703,6 +711,7 @@ async def try_claim_computer_for_start(
         return None
     logger.debug(f"Claimed computer {computer_id} for start (was {from_status})")
     await _publish_shadowed(row, "starting")
+    await _note_usage(row, "starting", conn=conn)
     return dict(row)
 
 
@@ -743,6 +752,7 @@ async def try_bind_computer_provider_ref(
     if row is None:
         return None
     await _publish_shadowed(row, "running")
+    await _note_usage(row, "running")
     return dict(row)
 
 
@@ -1222,6 +1232,20 @@ async def stamp_computer_mcp_config_version(
     stamped = int(row["mcp_config_version"] or 0)
     logger.info(f"Computer {computer_id} MCP config version stamped: {stamped}")
     return stamped
+
+
+async def _note_usage(
+    row: Dict[str, Any], status: str, *, conn=None, reason: Optional[str] = None
+) -> None:
+    """Open or close the machine's usage run for a status it was written to.
+
+    After the publish: nothing a waiter does on waking reads the ledger, and
+    a caller cancelled during the hook has still told the other workers.
+    Never raises (``note_computer_status``).
+    """
+    from src.server.services.computer_usage.transitions import note_computer_status
+
+    await note_computer_status(row, status, conn=conn, reason=reason)
 
 
 async def _publish_shadowed(row: Dict[str, Any], status: str) -> None:

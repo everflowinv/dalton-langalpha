@@ -593,6 +593,7 @@ export function useChatMessages(
   // publish applies the queued chunks first, like any write that is not one.
   const {
     store: subagentHistory, entries: subagentHistoryEntries, resolveSubagentIdToAgentId, getSubagentHistory, hydrateTaskTranscript,
+    getTaskRuns, putTaskRun,
   } = useSubagentHistory(liveMessages.flush, { t, threadId, subagentStateRefsRef });
   // An instruction the user sends a running subagent, bound to the
   // transcripts its stream writes.
@@ -3647,6 +3648,8 @@ export function useChatMessages(
     feedbackByTurn,
     resolveSubagentIdToAgentId,
     getSubagentHistory,
+    getTaskRuns,
+    putTaskRun,
     subagentHistoryEntries,
     hydrateTaskTranscript,
     sendSubagentInstruction,

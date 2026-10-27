@@ -1,7 +1,7 @@
 /**
  * The caption above a message nobody typed in this view, naming who sent it:
  * an agent's hand-off, an automation, a channel, a subagent's main agent. A
- * report-back is drawn as this caption alone, in place of its hidden message.
+ * report-back is drawn instead as a line of its own (`ReportRow`).
  *
  * Where the sender has a place in the app the caption links there. Read-only
  * views draw it without the link, as they draw a card's.
@@ -9,16 +9,15 @@
 import React from 'react';
 import { useNavigate } from 'react-router';
 import { useTranslation } from 'react-i18next';
-import { ArrowUpRight, Bot, CircleCheck, CircleX, Clock, CornerDownRight, Inbox, MessageCircle, type LucideIcon } from 'lucide-react';
+import { ArrowUpRight, Bot, Clock, CornerDownRight, Merge, MessageCircle, type LucideIcon } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import type { MessageProvenance } from '@/types/chat';
 import { useRouteLeaveGuard } from '../../contexts/RouteLeaveGuardContext';
-import { useOpenDispatchedThread, type DispatcherContext } from '../../hooks/useOpenDispatchedThread';
 import { Favicon } from '../Favicon';
 import { messagingAppDomain, messagingAppName } from '../messaging/messageDelivery';
 import { useMessageActions } from './MessageActionsContext';
 
-const CAPTION = 'inline-flex max-w-full min-w-0 items-center gap-1.5 text-xs leading-4 text-(--color-text-tertiary)';
+export const CAPTION = 'inline-flex max-w-full min-w-0 items-center gap-1.5 text-xs leading-4 text-(--color-text-tertiary)';
 // The padding gives the hover fill room, and the negative margins and the shift
 // take it back so a linked caption sits exactly where a plain one does: its
 // text on the bubble's edge, its line no taller. The shift is a translate, not
@@ -33,20 +32,16 @@ const LINKED = cn(
 interface MessageProvenanceProps {
   provenance: MessageProvenance;
   readOnly?: boolean;
-  /** The thread this transcript belongs to when it hands work out, which an
-   *  Analyst's thread opened from here links back to (as its hand-off card does). */
-  dispatcherContext?: DispatcherContext | null;
   className?: string;
 }
 
-export function MessageProvenanceLabel({ provenance, readOnly, dispatcherContext, className }: MessageProvenanceProps): React.ReactElement | null {
+export function MessageProvenanceLabel({ provenance, readOnly, className }: MessageProvenanceProps): React.ReactElement | null {
   const { t } = useTranslation();
   const navigate = useNavigate();
   const guardLeave = useRouteLeaveGuard();
-  const openDispatchedThread = useOpenDispatchedThread(dispatcherContext);
-  const { onOpenDispatcher, onOpenSubagentTask } = useMessageActions();
+  const { onOpenDispatcher } = useMessageActions();
 
-  let Icon: LucideIcon;
+  let Icon: LucideIcon | null = null;
   let logo: React.ReactNode = null;
   let label: React.ReactNode;
   let title: string | undefined;
@@ -86,33 +81,18 @@ export function MessageProvenanceLabel({ provenance, readOnly, dispatcherContext
       Icon = CornerDownRight;
       label = t('chat.provenance.fromMainAgent');
       break;
-    case 'analyst_report': {
-      Icon = Inbox;
-      label = provenance.workspaceName
-        ? t('chat.provenance.reportFrom', { name: provenance.workspaceName })
-        : t('chat.provenance.reportFromAnalyst');
-      const { threadId, workspaceId } = provenance;
-      if (threadId) open = () => openDispatchedThread(threadId, workspaceId);
-      break;
-    }
-    case 'task_report': {
-      Icon = provenance.failed ? CircleX : CircleCheck;
-      label = t(provenance.failed ? 'chat.provenance.taskFailed' : 'chat.provenance.taskFinished', { id: provenance.displayId });
-      // The display id alone says little; the task's own words say which.
-      title = provenance.description ?? undefined;
-      const { taskId, description } = provenance;
-      if (taskId && onOpenSubagentTask) {
-        open = () => onOpenSubagentTask({ subagentId: `task:${taskId}`, ...(description ? { description } : {}) });
-      }
-      break;
-    }
+    case 'analyst_report':
+    case 'task_report':
+      // The list draws a report as a line of its own (`ReportRow`), never as
+      // a caption over a bubble.
+      return null;
   }
   // A long name truncates; the whole caption is a hover away.
   title ??= typeof label === 'string' ? label : undefined;
 
   const content = (
     <>
-      {logo ?? <Icon aria-hidden="true" className="h-3 w-3 shrink-0" />}
+      {logo ?? (Icon && <Icon aria-hidden="true" className="h-3 w-3 shrink-0" />)}
       <span className="min-w-0 truncate">{label}</span>
     </>
   );
@@ -128,6 +108,21 @@ export function MessageProvenanceLabel({ provenance, readOnly, dispatcherContext
   return (
     <span className={cn(CAPTION, className)} title={title}>
       {content}
+    </span>
+  );
+}
+
+/**
+ * The mark on a message a turn already running took in, rather than one that
+ * opened a turn: whoever sent it, the user here, an agent or a channel. In the
+ * ink and size of the line it sits on.
+ */
+export function SteeredMark({ className }: { className?: string }): React.ReactElement {
+  const { t } = useTranslation();
+  return (
+    <span className={cn('inline-flex shrink-0 items-center gap-1.5', className)} title={t('chat.provenance.steeredHint')}>
+      <Merge aria-hidden="true" className="h-3 w-3 shrink-0" />
+      {t('chat.provenance.steered')}
     </span>
   );
 }

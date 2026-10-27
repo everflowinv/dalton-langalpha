@@ -93,7 +93,7 @@ class WorkspaceUpdate(BaseModel):
 class WorkspaceSpecRequest(BaseModel):
     """Request model for changing a workspace's sandbox spec tier."""
 
-    tier: Literal["standard", "performance", "max"] = Field(
+    tier: Literal["standard", "performance", "max", "xlarge"] = Field(
         description="Target sandbox spec preset",
     )
 
@@ -120,7 +120,15 @@ class WorkspaceQuotaResponse(BaseModel):
 
     performance: Optional[WorkspaceCapacity] = None
     max: Optional[WorkspaceCapacity] = None
+    xlarge: Optional[WorkspaceCapacity] = None
     always_on: Optional[WorkspaceCapacity] = None
+    computers: Optional[WorkspaceCapacity] = Field(
+        None,
+        description=(
+            "Computers the user holds against the plan's cap, stopped ones "
+            "included; a machine its owner brings is never counted"
+        ),
+    )
 
 
 class WorkspaceResponse(BaseModel):
@@ -201,7 +209,10 @@ class WorkspaceResponse(BaseModel):
     sort_order: int = Field(0, description="Manual sort order within pin group")
     resource_tier: str = Field(
         "standard",
-        description="Sandbox spec preset: standard, performance, max",
+        description=(
+            "Sandbox spec preset: standard (Small), performance (Medium), "
+            "max (Large), xlarge (Extra Large)"
+        ),
     )
     is_always_on: bool = Field(
         False,

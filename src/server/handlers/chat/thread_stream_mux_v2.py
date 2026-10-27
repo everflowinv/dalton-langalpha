@@ -33,6 +33,7 @@ from typing import AsyncGenerator, Optional
 
 from fastapi import HTTPException
 
+from src.server.contracts.run_times import epoch_ms
 from src.server.services.thread_control_stream import control_stream_key
 from src.utils.cache.redis_cache import get_cache_client, is_pool_exhaustion
 from src.utils.cache import stream_pool
@@ -305,18 +306,23 @@ def _row_outcome(row: Optional[dict]) -> Optional[str]:
 
 
 def _row_started_ms(row: Optional[dict]) -> Optional[float]:
-    """Run start as epoch ms — the client orders outcome votes by this."""
-    ts = row.get("started_at") if row else None
-    try:
-        return ts.timestamp() * 1000.0 if ts is not None else None
-    except (AttributeError, ValueError, OSError):
+    """Run start as epoch ms; the client orders outcome votes by this."""
+    return epoch_ms(row.get("started_at")) if row else None
+
+
+async def _run_row_close(run_id: str, lane: str) -> Optional[dict]:
+    """``chan_close`` extras from a terminal row, or None while open/unknown:
+    the crash-window backstop for streams whose writer died between CAS
+    and run_end. A task run's row also says when it settled (``finished``),
+    which its ``run_end`` would have carried."""
+    row = await _run_row(run_id, lane)
+    outcome = _row_outcome(row)
+    if outcome is None:
         return None
-
-
-async def _run_row_outcome(run_id: str, lane: str) -> Optional[str]:
-    """Terminal row status, or None while open/unknown — the crash-window
-    backstop for streams whose writer died between CAS and run_end."""
-    return _row_outcome(await _run_row(run_id, lane))
+    finished = epoch_ms(row.get("finalized_at"))
+    if finished is None:
+        return {"outcome": outcome}
+    return {"outcome": outcome, "finished": finished}
 
 
 async def _admission_meta(
@@ -679,12 +685,10 @@ async def stream_thread_mux_v2(
         except Exception:
             continue
         if not head:
-            outcome = await _run_row_outcome(chan.run_id, chan.lane)
-            if outcome is not None:
+            close = await _run_row_close(chan.run_id, chan.lane)
+            if close is not None:
                 chan.closed = True
-                attach_frames.append(
-                    _chan_close_frame(chan, "terminal", outcome=outcome)
-                )
+                attach_frames.append(_chan_close_frame(chan, "terminal", **close))
             continue
         if _entry_after(head[0][0], chan.cursor.decode()):
             chan.closed = True
@@ -767,9 +771,9 @@ async def stream_thread_mux_v2(
             except Exception:
                 return True  # transient probe failure — the pump reads onward
             if not head:
-                outcome = await _run_row_outcome(run_id, lane)
-                if outcome is not None:
-                    await _close(chan, "terminal", outcome=outcome)
+                close = await _run_row_close(run_id, lane)
+                if close is not None:
+                    await _close(chan, "terminal", **close)
                 return True
             if _entry_after(head[0][0], cursor):
                 await out_q.put(
@@ -932,9 +936,9 @@ async def stream_thread_mux_v2(
                 if now - chan.last_probe_at < _PROBE_MIN_INTERVAL_S:
                     continue
                 chan.last_probe_at = now
-                outcome = await _run_row_outcome(chan.run_id, chan.lane)
-                if outcome is not None:
-                    await _close(chan, "terminal", outcome=outcome)
+                close = await _run_row_close(chan.run_id, chan.lane)
+                if close is not None:
+                    await _close(chan, "terminal", **close)
 
             if time.monotonic() - last_scan >= _RESCAN_INTERVAL_S:
                 last_scan = time.monotonic()

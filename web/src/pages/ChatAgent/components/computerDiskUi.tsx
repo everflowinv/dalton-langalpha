@@ -9,9 +9,9 @@ import { useTranslation } from 'react-i18next';
 import { useLocale } from '@/hooks/useLocale';
 import { formatBytes } from '@/lib/format';
 import { cn } from '@/lib/utils';
-import type { ComputerDisk, ComputerDiskLevel, ResourceTier } from '@/types/api';
+import type { ComputerDisk, ComputerDiskLevel, ResourceTier, WorkspaceQuota } from '@/types/api';
 
-import { TIER_ORDER } from './tierUi';
+import { isTierBlocked, tierCapacity, type TierOffer } from './tierUi';
 
 type Translate = ReturnType<typeof useTranslation>['t'];
 
@@ -46,10 +46,32 @@ export function diskLevelColor(level: ComputerDiskLevel | null | undefined): str
   }
 }
 
-/** The tier one step up, or null on the top tier. */
-export function nextTier(tier: ResourceTier): ResourceTier | null {
-  const index = TIER_ORDER.indexOf(tier);
-  return index >= 0 && index < TIER_ORDER.length - 1 ? TIER_ORDER[index + 1] : null;
+/**
+ * The offered sizes with more disk than `tier`, smallest first. Medium and
+ * Large share a disk, so the next size up is not always one. Without the
+ * provider's specs (an older server) the next size up stands in.
+ */
+export function largerDiskTiers(tier: ResourceTier, offer: TierOffer): ResourceTier[] {
+  const diskOf = (id: ResourceTier) => offer.specs.find((s) => s.tier === id)?.disk_gib;
+  const current = diskOf(tier);
+  if (current === undefined) {
+    const index = offer.tiers.indexOf(tier);
+    return index >= 0 && index < offer.tiers.length - 1 ? [offer.tiers[index + 1]] : [];
+  }
+  return offer.tiers.filter((id) => (diskOf(id) ?? 0) > current);
+}
+
+/**
+ * The size a low disk points to: the smallest with more disk that the plan
+ * allows, so a Pro plan on Small is sent to Large past the Medium it lacks.
+ * Null when the provider runs none or the plan allows none.
+ */
+export function diskUpgradeTier(
+  tier: ResourceTier,
+  offer: TierOffer,
+  quota: WorkspaceQuota | null | undefined,
+): ResourceTier | null {
+  return largerDiskTiers(tier, offer).find((id) => !isTierBlocked(tierCapacity(quota, id))) ?? null;
 }
 
 export function diskUsageLabel(t: Translate, disk: ComputerDisk, locale: string): string {

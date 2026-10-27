@@ -146,10 +146,11 @@ export async function setComputerSpec(computerId: string, tier: ResourceTier): P
  * Remove a computer: its sandbox and everything on its disk go with it. The
  * server keeps a tombstone, which the list no longer returns, and answers what
  * became of our key line on an SSH computer's machine (`key`, null for other
- * kinds and when `removeKey` was false). `removeKey` is sent explicitly, so the
- * choice the user saw is the one that is made. It refuses with a 409 whose
- * `detail.code` says why: `primary`, `has_workspaces`, or `busy` (moving
- * between states, being prepared, changing spec, or held by another action).
+ * kinds, for one a helper answers, and when `removeKey` was false).
+ * `removeKey` is sent explicitly, so the choice the user saw is the one that
+ * is made. It refuses with a 409 whose `detail.code` says why: `primary`,
+ * `has_workspaces`, or `busy` (moving between states, being prepared,
+ * changing spec, or held by another action).
  */
 export async function deleteComputer(
   computerId: string,

@@ -1,5 +1,6 @@
 """Shared utilities for agent tools."""
 
+import asyncio
 import functools
 from collections.abc import Awaitable, Callable
 from typing import Any, TypeVar
@@ -19,6 +20,48 @@ from src.observability import (
 logger = structlog.get_logger(__name__)
 
 T = TypeVar("T")
+
+# 137 is any SIGKILL (128+9), not only the kernel OOM killer's, so the count
+# it feeds is an upper bound on OOM kills.
+OOM_KILL_EXIT_CODE = 137
+_OOM_RECORD_TIMEOUT_S = 2
+
+
+def resource_tier_of(session: Any, backend: Any) -> str | None:
+    """The tier of the machine a call runs on, read at call time.
+
+    The session is preferred because a long turn's session can be rebound after
+    the tool is built; the sandbox's own tier covers a caller with no session.
+    """
+    tier = getattr(session, "resource_tier", None)
+    if tier is None:
+        tier = getattr(getattr(backend, "sandbox", None), "resource_tier", None)
+    return tier
+
+
+async def note_sandbox_exit(backend: Any, exit_code: int | None, failure: str | None) -> None:
+    """Count an exit-137 run against the computer's open usage run: a
+    foreground one by its own call, a background one by the BashOutput read
+    that sees it finish.
+
+    Never raises or waits long: usage accounting must not break or slow the
+    tool. A call that failed in the sandbox (a timeout kills the process too)
+    is not the code being OOM-killed, so it is skipped.
+    """
+    if exit_code != OOM_KILL_EXIT_CODE or failure:
+        return
+    try:
+        sandbox_id = backend.sandbox_id
+        if sandbox_id is None:
+            return
+        # Lazy: the CLI has no server database.
+        from src.server.database.computer_runs import record_oom_kill
+
+        await asyncio.wait_for(
+            record_oom_kill(backend.provider, sandbox_id), timeout=_OOM_RECORD_TIMEOUT_S
+        )
+    except Exception as e:  # a call never fails for its accounting
+        logger.debug("oom kill record failed: %s", e)
 
 
 def mark_sandbox_failed(failure: str) -> None:

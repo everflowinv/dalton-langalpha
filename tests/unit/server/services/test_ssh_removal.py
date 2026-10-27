@@ -208,6 +208,23 @@ async def test_a_computer_on_another_host_sharing_the_home_keeps_it(machine):
 
 
 @pytest.mark.asyncio
+async def test_this_mac_on_the_same_login_does_not_keep_it(machine):
+    """The helper checks the key itself, so it never logs in through the line,
+    by its host key or through the home they share."""
+    machine["link"] = link = _Link(_said("removed\n"))
+    mac = _computer("c-2", name="This Mac", host_key="ssh-ed25519 B", tunnel="t-2")
+    mac["provider_config"]["helper"] = True
+    same_key = _computer("c-3", name="Also This Mac")
+    same_key["provider_config"]["helper"] = True
+    machine["others"] = [mac, same_key]
+
+    left = await _leave(_computer())
+
+    assert left.key.outcome == "removed"
+    assert link.scripts == [home_shared_script([]) + remove_script(_PUBLIC_KEY)]
+
+
+@pytest.mark.asyncio
 async def test_a_machine_the_delete_could_not_reach_is_not_dialed(machine):
     left = await _leave(_computer())
 
@@ -323,6 +340,18 @@ async def test_a_key_kept_on_request_is_not_touched(machine):
     assert left.key is None
     assert link.scripts == [ssh_tunnel_sweep._uninstall_sh("t-1")]
     assert left.tunnel_released is True
+
+
+@pytest.mark.asyncio
+async def test_a_machine_the_helper_answers_for_is_not_asked_for_the_key(machine):
+    machine["link"] = link = _Link(_said(""))
+    computer = _computer(tunnel="t-1")
+    computer["provider_config"]["helper"] = True
+
+    left = await _leave(computer, remove_key=True)
+
+    assert left.key is None
+    assert link.scripts == [ssh_tunnel_sweep._uninstall_sh("t-1")]
 
 
 @pytest.mark.asyncio

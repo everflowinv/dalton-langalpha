@@ -5,7 +5,7 @@
  * Parallel dispatches pause as separate interrupts, and nothing orders them
  * after the tool calls: the cards can replay in one order and the dispatch
  * results in the other. Each card has to take the result of its own call, or
- * its "Open thread" button and status follow the other analyst.
+ * its slip opens the other analyst's thread and shows that one's status.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { AssistantMessage, ChatMessage } from '@/types/chat';

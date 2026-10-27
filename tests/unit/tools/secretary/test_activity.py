@@ -187,6 +187,49 @@ def test_with_two_computers_every_workspace_names_its_computer():
     )
 
 
+def test_a_computer_of_the_users_own_says_so_only_where_it_is_named():
+    """With one computer, Home's own block says whose it is."""
+    mac = {
+        "computer_id": "computer-mac",
+        "name": "Studio Mac",
+        "is_home": False,
+        "kind": "ssh",
+        "provider_config": {"helper": True, "os": "Darwin"},
+    }
+    hosted = {
+        "computer_id": HOME_COMPUTER,
+        "name": "Cloud computer",
+        "is_home": True,
+        "kind": "daytona",
+        "provider_config": {},
+    }
+    on_mac = {**WORKSPACES[0], "workspace_id": "ws-mac", "computer_id": "computer-mac"}
+
+    two = _render(
+        workspaces=[WORKSPACES[0], on_mac],
+        workspace_total=2,
+        placement=ComputerPlacement.from_rows([hosted, mac]),
+    ).splitlines()
+    assert two[1] == (
+        '- Semis: Chip makers (last active 2026-10-05, computer "Cloud computer", '
+        "folder `semis`, workspace_id `ws-semis`)"
+    )
+    assert two[2] == (
+        '- Semis: Chip makers (last active 2026-10-05, computer "Studio Mac", '
+        "the user's own Mac, workspace_id `ws-mac`)"
+    )
+
+    one = _render(
+        workspaces=[on_mac],
+        workspace_total=1,
+        placement=ComputerPlacement.from_rows([{**mac, "is_home": True}]),
+    ).splitlines()
+    assert one[1] == (
+        "- Semis: Chip makers (last active 2026-10-05, folder `semis`, "
+        "workspace_id `ws-mac`)"
+    )
+
+
 def test_every_thread_carries_its_place_status_and_id():
     lines = _full().splitlines()
     assert (

@@ -114,17 +114,28 @@ async def _read_workspace_naming(
     except Exception as e:
         logger.warning(f"Failed to read the name of workspace {workspace_id}: {e}")
         return None
-    from src.tools.secretary.utils import computer_label
+    from src.tools.secretary.utils import computer_label, computer_machine
 
     computer = computer_label(row.get("computer_name"), row.get("computers") or 0) or ""
+    # Whose machine it is matters with one computer too: it is where the work runs.
+    machine = computer_machine(row.get("computer_kind"), row.get("provider_config"))
+    root = (row.get("root_dir") or "") if machine else ""
     if role == "chief_of_staff":
         from src.server.database.workspace_names import HOME_FOLDER
 
-        return Workspace(name=HOME_FOLDER, description=_HOME_DESCRIPTION, computer=computer)
+        return Workspace(
+            name=HOME_FOLDER,
+            description=_HOME_DESCRIPTION,
+            computer=computer,
+            machine=machine,
+            root=root,
+        )
     return Workspace(
         name=(row.get("name") or "").strip(),
         description=(row.get("description") or "").strip(),
         computer=computer,
+        machine=machine,
+        root=root,
     )
 
 

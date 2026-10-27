@@ -80,6 +80,8 @@ class ReportedMachine(BaseModel):
     # Whether the script could connect the machine out, and the tunnel an
     # earlier run left there, by its own account: checked before any use.
     can_tunnel: bool = False
+    # No SSH server answers on the machine, so no address is worth a dial.
+    tunnel_only: bool = False
     tunnel_id: Optional[str] = None
     # The run of the command that reported it; empty from a script that does
     # not name its run.

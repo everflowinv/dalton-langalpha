@@ -233,6 +233,7 @@ async def test_create_serializes_the_tier_check_with_the_insert(
         )
     )
     gate = AsyncMock(side_effect=lambda *_args, **_kwargs: events.append(("gate", USER)))
+    held = AsyncMock(side_effect=lambda *_args, **_kwargs: events.append(("held", USER)))
     limit = AsyncMock(
         side_effect=lambda *_args, **_kwargs: events.append(("limit", USER))
     )
@@ -243,6 +244,7 @@ async def test_create_serializes_the_tier_check_with_the_insert(
     with (
         patch("src.server.app.computers._computer_manager", return_value=manager),
         patch("src.server.app.computers.assert_spec_allowed", gate),
+        patch("src.server.app.computers.enforce_computer_count", held),
         patch("src.server.app.computers.enforce_computer_limit", limit),
         patch("src.server.app.computers._schedule_claimed_start", schedule),
         patch("src.server.app.computers.platform_gating_active", return_value=True),
@@ -255,8 +257,11 @@ async def test_create_serializes_the_tier_check_with_the_insert(
     assert response.status_code == 201
     # The new row holds a running slot from its insert, so the limit is read
     # under the same lock; the start claims that slot after the lock is gone.
+    # The held count goes first, so a user at the cap is not sent to step
+    # down a size only to be refused for the cap.
     assert events == [
         ("lock", USER),
+        ("held", USER),
         ("gate", USER),
         ("limit", USER),
         ("insert", USER),
@@ -288,6 +293,34 @@ async def test_a_capped_user_is_refused_before_the_row_is_written(
 
     assert resp.status_code == 429
     assert resp.json()["detail"]["message"] == "Limit reached"
+    manager.create_computer_for_user.assert_not_awaited()
+    prepares.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_user_holding_their_cap_is_refused_before_the_row_is_written(
+    client, entitled, prepares
+):
+    """A stopped computer still counts toward the plan's cap, so stopping one
+    does not make room for another."""
+    from fastapi import HTTPException
+
+    manager = MagicMock()
+    manager.create_computer_for_user = AsyncMock()
+    held = AsyncMock(
+        side_effect=HTTPException(
+            status_code=429, detail={"message": "Limit reached", "remaining": 0}
+        )
+    )
+    with (
+        patch("src.server.app.computers._computer_manager", return_value=manager),
+        patch("src.server.app.computers.enforce_computer_count", held),
+        patch("src.server.app.computers.enforce_computer_limit", AsyncMock()),
+    ):
+        resp = await client.post("/api/v1/computers", json={})
+
+    assert resp.status_code == 429
+    held.assert_awaited_once()
     manager.create_computer_for_user.assert_not_awaited()
     prepares.assert_not_awaited()
 
@@ -419,9 +452,9 @@ async def test_providers_lists_only_the_default_when_nothing_is_offered(client):
         resp = await client.get("/api/v1/computers/providers")
 
     assert resp.status_code == 200
-    assert resp.json() == {
-        "providers": [{"kind": "daytona", "is_default": True, "allowed": True}]
-    }
+    assert resp.json()["providers"] == [
+        {"kind": "daytona", "is_default": True, "allowed": True, "tiers": ANY}
+    ]
     # Not read as a computer id by GET /{computer_id}.
     get_computer.assert_not_called()
 
@@ -439,7 +472,9 @@ async def test_providers_lists_the_default_first_with_what_the_caller_may_pick(
         resp = await client.get("/api/v1/computers/providers")
 
     assert resp.status_code == 200
-    assert resp.json()["providers"] == [
+    assert [
+        {k: v for k, v in p.items() if k != "tiers"} for p in resp.json()["providers"]
+    ] == [
         {"kind": "e2b", "is_default": True, "allowed": True},
         {"kind": "daytona", "is_default": False, "allowed": False},
         {"kind": "docker", "is_default": False, "allowed": None},
@@ -460,7 +495,87 @@ async def test_providers_reads_an_ungated_offer_as_unknown_in_oss_mode(
         "kind": "e2b",
         "is_default": False,
         "allowed": None,
+        "tiers": ANY,
     }
+
+
+@pytest.mark.asyncio
+async def test_providers_list_each_ones_sizes_from_its_config(client, sandbox_config):
+    """The pickers render specs from here, so Extra Large shows only on E2B."""
+    sandbox_config.offered_providers = ("e2b", "ssh")
+    resp = await client.get("/api/v1/computers/providers")
+
+    tiers = {p["kind"]: p["tiers"] for p in resp.json()["providers"]}
+    assert tiers["daytona"] == [
+        {"tier": "standard", "cpu": 1, "memory_gib": 2, "disk_gib": 5},
+        {"tier": "performance", "cpu": 2, "memory_gib": 4, "disk_gib": 10},
+        {"tier": "max", "cpu": 2, "memory_gib": 8, "disk_gib": 10},
+    ]
+    assert tiers["e2b"][-1] == {
+        "tier": "xlarge", "cpu": 4, "memory_gib": 8, "disk_gib": 20
+    }
+    assert [t["tier"] for t in tiers["e2b"]] == [
+        "standard", "performance", "max", "xlarge"
+    ]
+    # Its owner sizes the machine.
+    assert tiers["ssh"] == []
+
+
+@pytest.mark.asyncio
+async def test_extra_large_on_daytona_is_refused_before_the_plan_gate(client):
+    """A plan without xlarge would otherwise be offered an upgrade for a size
+    Daytona never builds."""
+    manager = MagicMock()
+    manager.create_computer_for_user = AsyncMock()
+    spec_gate = AsyncMock()
+    with (
+        patch("src.server.app.computers._computer_manager", return_value=manager),
+        patch("src.server.app.computers.assert_spec_allowed", spec_gate),
+    ):
+        resp = await client.post(
+            "/api/v1/computers", json={"kind": "daytona", "resource_tier": "xlarge"}
+        )
+
+    assert resp.status_code == 400
+    assert "does not offer the 'xlarge' spec" in resp.json()["detail"]
+    spec_gate.assert_not_awaited()
+    manager.create_computer_for_user.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_extra_large_on_e2b_is_gated_then_created(
+    client, sandbox_config, entitled, prepares, sample_computer_dict
+):
+    sandbox_config.offered_providers = ("e2b",)
+    manager = MagicMock()
+    manager.create_computer_for_user = AsyncMock(
+        return_value=sample_computer_dict(
+            computer_id=COMPUTER_ID, kind="e2b", resource_tier="xlarge"
+        )
+    )
+    with (
+        patch("src.server.app.computers._computer_manager", return_value=manager),
+        patch("src.server.app.computers.assert_provider_allowed", AsyncMock()),
+        patch("src.server.app.computers.enforce_computer_count", AsyncMock()),
+        patch("src.server.app.computers.enforce_computer_limit", AsyncMock()),
+    ):
+        resp = await client.post(
+            "/api/v1/computers", json={"kind": "e2b", "resource_tier": "xlarge"}
+        )
+
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["resource_tier"] == "xlarge"
+    entitled.assert_awaited_once_with(USER, "xlarge")
+    assert manager.create_computer_for_user.await_args.kwargs["resource_tier"] == "xlarge"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enabled", [True, False])
+async def test_providers_say_whether_an_ssh_machine_may_connect_out(client, enabled):
+    with patch("src.server.app.computers.tunnels_enabled", return_value=enabled):
+        resp = await client.get("/api/v1/computers/providers")
+
+    assert resp.json()["tunnels"] is enabled
 
 
 _HOST_KEY = (
@@ -603,6 +718,38 @@ async def test_an_ssh_create_without_a_folder_works_in_langalpha_in_the_home(
     assert probe.await_args.kwargs["root_dir"] == "/home/dev/langalpha"
     kwargs = manager.create_computer_for_user.await_args.kwargs
     assert kwargs["root_dir"] == "/home/dev/langalpha"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("helper", "os"), [(True, "Darwin"), (False, "Linux")])
+async def test_an_ssh_computer_keeps_the_helper_and_system_its_probe_found(
+    client, computer, entitled, sandbox_config, prepares, helper, os
+):
+    """Only the probe can say so: the request never carries them."""
+    import contextlib
+
+    @contextlib.asynccontextmanager
+    async def _lock(user_id):
+        yield
+
+    sandbox_config.offered_providers = ("ssh",)
+    manager = _creating_manager({**computer, "kind": "ssh"})
+    body = {**_SSH_CREATE, "ssh": {**_SSH_CREATE["ssh"], "helper": not helper}}
+    with (
+        patch("src.server.app.computers._computer_manager", return_value=manager),
+        patch(f"{_SSH}.has_client_key", AsyncMock(return_value=True)),
+        patch(f"{_SSH}.client_key", AsyncMock(return_value="private key")),
+        patch(f"{_SSH}.probe", AsyncMock(return_value=_found(helper=helper, os=os))),
+        patch(f"{_SSH}.get_computers_for_user", AsyncMock(return_value=[])),
+        patch("src.server.app.computers.computer_capacity_lock", _lock),
+        patch("src.server.app.computers.enforce_computer_limit", AsyncMock()),
+    ):
+        resp = await client.post("/api/v1/computers", json=body)
+
+    assert resp.status_code == 201, resp.text
+    kwargs = manager.create_computer_for_user.await_args.kwargs
+    assert kwargs["provider_config"]["helper"] is helper
+    assert kwargs["provider_config"]["os"] == os
 
 
 @pytest.mark.asyncio
@@ -1860,6 +2007,36 @@ def _assert_refusal(resp, code):
     assert detail["code"] == code
     assert isinstance(detail["message"], str) and detail["message"]
     assert detail["files"] == []
+
+
+@pytest.mark.asyncio
+async def test_set_spec_to_a_size_the_provider_lacks_is_a_400_before_the_gate(
+    client, computer, mock_computer_manager
+):
+    """Extra Large on a Daytona computer: refused as a bad request, never
+    offered as an upgrade."""
+    mock_computer_manager.precheck_computer_spec = AsyncMock(
+        side_effect=UnknownResourceTier(
+            "This computer's provider does not offer the 'xlarge' spec"
+        )
+    )
+    mock_computer_manager.claim_computer_spec = AsyncMock()
+    gate = AsyncMock()
+    get_row, get_manager = _spec_client_patches(computer, mock_computer_manager)
+    with (
+        get_row,
+        get_manager,
+        patch("src.server.app.computers.platform_gating_active", return_value=True),
+        patch("src.server.app.computers.assert_spec_allowed", gate),
+    ):
+        resp = await client.post(
+            f"/api/v1/computers/{COMPUTER_ID}/spec", json={"tier": "xlarge"}
+        )
+
+    assert resp.status_code == 400
+    assert "xlarge" in resp.json()["detail"]
+    gate.assert_not_awaited()
+    mock_computer_manager.claim_computer_spec.assert_not_awaited()
 
 
 @pytest.mark.asyncio

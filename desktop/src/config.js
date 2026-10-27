@@ -134,13 +134,18 @@ function normalizeUrl(value) {
  * leaves the OS to pick one, so a hosted magic link can open a build pointed at
  * localhost, which cannot redeem it.
  *
+ * The helper label is the third: the launchd label of the remote-control agent
+ * this edition's bundle carries, and the stem of its plist. launchd keeps one job
+ * per label, so two editions sharing it would be one job to macOS, and turning
+ * remote control off in one would turn off the other's.
+ *
  * These are asserted against electron-builder.yml and scripts/build.mjs in the
  * tests: every consumer only reads its own half, so a rename on one side is
  * silent everywhere else.
  */
 const IDENTITY = {
-  saas: { appName: 'LangAlpha', scheme: 'langalpha' },
-  oss: { appName: 'LangAlpha OSS', scheme: 'langalpha-oss' },
+  saas: { appName: 'LangAlpha', scheme: 'langalpha', helperLabel: 'ai.langalpha.desktop.helper' },
+  oss: { appName: 'LangAlpha OSS', scheme: 'langalpha-oss', helperLabel: 'ai.langalpha.desktop.oss.helper' },
 }
 
 module.exports = Object.freeze({
@@ -150,10 +155,17 @@ module.exports = Object.freeze({
   appName: IDENTITY[merged.edition].appName,
   /** The custom scheme this edition registers, without the `://`. */
   scheme: IDENTITY[merged.edition].scheme,
+  /** The remote-control agent's launchd label; its plist is `<label>.plist`. */
+  helperLabel: IDENTITY[merged.edition].helperLabel,
   /** Where the langalpha SPA lives. In the OSS edition the stored server URL wins. */
   appOrigin: normalizeOrigin(merged.appOrigin),
   /** The account console. Null in the OSS edition, which ships without one. */
   platformOrigin: normalizeOrigin(merged.platformOrigin),
+  /**
+   * The one server a SaaS build pairs this Mac with, its deployment's API host.
+   * Null in the OSS edition, which pairs with whatever server the user runs.
+   */
+  pairingOrigin: normalizeOrigin(merged.pairingOrigin),
   /**
    * Where a SaaS first run enters the platform. Sign-in rather than onboarding:
    * the platform's post-auth funnel is what decides whether this account still

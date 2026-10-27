@@ -253,7 +253,7 @@ class TestCleanupIdleWorkspacesGuard:
 
         assert stopped == 1
         mock_stop.assert_called_once_with(
-            "comp-idle", unchanged_since=machine["updated_at"]
+            "comp-idle", unchanged_since=machine["updated_at"], reason="idle"
         )
 
 

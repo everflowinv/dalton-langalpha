@@ -104,13 +104,14 @@ def success_command(
     )
 
 
-def error_command(error: str, tool_call_id: str) -> Command:
-    """Return a Command with a JSON error response."""
+def error_command(error: str, tool_call_id: str, **fields: Any) -> Command:
+    """Return a Command with a JSON error response, plus any ``fields`` that
+    say what the failed action was."""
     return Command(
         update={
             "messages": [
                 ToolMessage(
-                    content=json.dumps({"success": False, "error": error}),
+                    content=json.dumps({"success": False, "error": error, **fields}),
                     tool_call_id=tool_call_id,
                 ),
             ],

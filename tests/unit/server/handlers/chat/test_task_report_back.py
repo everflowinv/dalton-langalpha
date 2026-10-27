@@ -50,7 +50,12 @@ class TestTaskReport:
             "task_id": "abc123",
             "display_id": "Task-abc123",
             "failed": True,
+            "subagent_type": "research",
         }
+
+    def test_the_row_gets_the_role(self):
+        report = task_report(_payload(final_status="completed"))
+        assert report.subagent_type == "research"
 
 
 class TestBuildNotificationMessage:
@@ -369,6 +374,7 @@ async def test_dispatch_posts_the_report_as_its_own_turn():
         "display_id": "Task-abc123",
         "description": "look things up",
         "failed": False,
+        "subagent_type": "research",
     }
 
 

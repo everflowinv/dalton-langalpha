@@ -1586,6 +1586,7 @@ class SessionLifecycleMixin:
         *,
         workspace_id: str | None = None,
         unchanged_since: datetime | None = None,
+        reason: str | None = None,
     ) -> Dict[str, Any]:
         """Stop the machine, which takes every project on it down with it.
 
@@ -1594,7 +1595,7 @@ class SessionLifecycleMixin:
         only names the project that asked, for the mirror and the logs.
         unchanged_since is the idle sweep's read of the row: a machine opened
         after that read has been stamped, and is no longer the idle one the
-        sweep judged."""
+        sweep judged. reason is why, for the usage run the stop ends."""
         async with self._observed_lock(computer_id, "computer.stop"):
             # Stopping one project removes every sibling's sandbox; gate across
             # the machine.
@@ -1610,7 +1611,7 @@ class SessionLifecycleMixin:
             # where the claim answers "nothing to stop", so the idle reaper hit
             # its 3-strike backoff on a machine that needed no work.
             claimed = await self._claim_machine_for_stop(
-                computer_id, unchanged_since=unchanged_since
+                computer_id, unchanged_since=unchanged_since, reason=reason
             )
             if claimed is None:
                 return await self._stop_result(computer_id, workspace_id)

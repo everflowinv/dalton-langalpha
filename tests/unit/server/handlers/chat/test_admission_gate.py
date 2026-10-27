@@ -426,6 +426,75 @@ class TestKeyedSendSteersOnce:
         assert dup.value.steered is steered
 
 
+class TestHandOffSteer:
+    """A Chief of Staff hand-off that meets a running turn hands the dispatch
+    primer the run it went into and its steer's row, which names the run
+    that takes it in if that one ends first."""
+
+    @pytest.fixture(autouse=True)
+    def ledger(self):
+        with (
+            patch(_ADMIT, new_callable=AsyncMock, create=True) as admit,
+            patch(_GET_JOB, new_callable=AsyncMock, return_value=None, create=True),
+            patch(_FIND_KEY, new_callable=AsyncMock, return_value=None),
+            patch(_GET_RUN, new_callable=AsyncMock, return_value=_LIVE_RUN),
+        ):
+            admit.return_value = _accepted()
+            yield SimpleNamespace(admit=admit)
+
+    @staticmethod
+    async def _hand_off():
+        from src.server.handlers.chat.admission_gate import AgentSteer, wait_or_steer
+
+        agent = AgentSteer(
+            sender="chief_of_staff",
+            origin={"type": "agent", "agent": "chief_of_staff", "id": "cos-1"},
+            idempotency_key="steer:dispatch:g-1",
+            origin_stamp=None,
+        )
+        return await wait_or_steer(
+            _admitting("running"), "t-1", "size the market", "u-1", agent=agent
+        )
+
+    @staticmethod
+    def _copy_of(payload):
+        """Another copy of the hand-off admitted its key first."""
+        return {
+            "state": "duplicate",
+            "job": {"id": "job-1", "run_id": "run-live", "payload": payload},
+        }
+
+    @pytest.mark.parametrize(
+        "copy",
+        [None, {"steered_run_id": "run-live"}, {}],
+        ids=["accepted", "copy-held-by-the-run", "copy-parked"],
+    )
+    @pytest.mark.asyncio
+    async def test_a_hand_off_into_a_running_turn_names_the_run_and_the_steer(
+        self, ledger, copy
+    ):
+        from src.server.handlers.chat.request_prep import HandOffSteered
+
+        if copy is not None:
+            ledger.admit.return_value = self._copy_of(copy)
+
+        assert await self._hand_off() == (False, HandOffSteered("run-live", "job-1"))
+
+    @pytest.mark.asyncio
+    async def test_a_copy_whose_steer_became_its_own_turn_names_that_turn(
+        self, ledger
+    ):
+        from src.server.database.runs.lifecycle import DuplicateRequestError
+
+        ledger.admit.return_value = self._copy_of({"dispatched_run_id": "run-live"})
+
+        with pytest.raises(DuplicateRequestError) as dup:
+            await self._hand_off()
+
+        assert dup.value.existing_run is _LIVE_RUN
+        assert dup.value.steered is False
+
+
 # ---------------------------------------------------------------------------
 # admission_conflict_detail (single 409 wording source)
 # ---------------------------------------------------------------------------

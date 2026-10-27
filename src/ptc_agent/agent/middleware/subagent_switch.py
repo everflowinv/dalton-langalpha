@@ -150,9 +150,12 @@ class SubagentSwitchMiddleware(AgentMiddleware):
             return await handler(request)
         # The shape of the launch tools' own refusals: nothing started, so the
         # error status is the only signal the client's launch card settles on.
+        # The content is written for the model; the artifact lets the card say
+        # why to the user in their own words instead.
         return ToolMessage(
             content=SUBAGENTS_REFUSAL,
             tool_call_id=request.tool_call.get("id"),
             name=name,
             status="error",
+            artifact={"launch": "subagents_off"},
         )

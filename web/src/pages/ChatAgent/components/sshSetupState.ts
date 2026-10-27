@@ -24,6 +24,7 @@ import {
 } from '../utils/api/errors';
 import {
   formatSshHostPort,
+  pairingReady,
   parseSshAddress,
   sshCreateBody,
   sshDefaultName,
@@ -115,6 +116,67 @@ function machineAddress(machine: SshPairingMachine | null): string {
   return `${machine.username}@${machine.addresses[0] ?? ''}`;
 }
 
+/** What the ready step shows and sets; `startOver` is offered only where another machine can be picked. */
+export interface SshReadyStep {
+  name: string;
+  setName: (name: string) => void;
+  folder: string;
+  setFolder: (folder: string) => void;
+  folderOpen: boolean;
+  openFolder: () => void;
+  filesBackup: boolean;
+  setFilesBackup: (on: boolean) => void;
+  startOver?: () => void;
+}
+
+/**
+ * The machine's name, folder and backup choice on the ready step, and the
+ * create body they make: shared by every way a machine comes in, so each
+ * names and files it the same way.
+ */
+export function useSshReadyFields(ready: SshReady | null) {
+  // The name and folder the user typed, or null while they show our prefill,
+  // so a later probe can replace a prefill but never what was typed.
+  const [typedName, setTypedName] = useState<string | null>(null);
+  const [typedFolder, setTypedFolder] = useState<string | null>(null);
+  const [folderOpen, setFolderOpen] = useState(false);
+  // On unless the user says otherwise: a folder lost on their machine can then
+  // be restored.
+  const [filesBackup, setFilesBackup] = useState(true);
+
+  const name = typedName ?? (ready ? sshDefaultName(ready) : '');
+  const folder = typedFolder ?? ready?.probe.suggested_root_dir ?? '';
+  // The machine's part of the create body, or null until a supported one is
+  // in. It is named in its summary, prefilled from its hostname.
+  const body = sshCreateBody(ready, folder);
+  const trimmedName = name.trim();
+  const create = body
+    ? { ...(trimmedName ? { name: trimmedName } : {}), ssh: body, files_backup: filesBackup }
+    : null;
+
+  const step: SshReadyStep = {
+    name,
+    setName: setTypedName,
+    folder,
+    setFolder: setTypedFolder,
+    folderOpen,
+    openFolder: () => setFolderOpen(true),
+    filesBackup,
+    setFilesBackup,
+  };
+
+  return {
+    create,
+    step,
+    /** Back to the prefill, for another machine. */
+    reset: () => {
+      setTypedName(null);
+      setTypedFolder(null);
+      setFolderOpen(false);
+    },
+  };
+}
+
 export function useSshSetup(active: boolean) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
@@ -126,15 +188,6 @@ export function useSshSetup(active: boolean) {
   const setEntry = (el: HTMLElement | null) => {
     entryRef.current = el;
   };
-
-  // The name and folder the user typed, or null while they show our prefill,
-  // so a later probe can replace a prefill but never what was typed.
-  const [typedName, setTypedName] = useState<string | null>(null);
-  const [typedFolder, setTypedFolder] = useState<string | null>(null);
-  const [folderOpen, setFolderOpen] = useState(false);
-  // On unless the user says otherwise: a folder lost on their machine can then
-  // be restored.
-  const [filesBackup, setFilesBackup] = useState(true);
 
   // --- Pairing ---
   const mint = useSshPairingMint({ enabled: active && mode === 'pairing' });
@@ -167,18 +220,8 @@ export function useSshSetup(active: boolean) {
   // form so the key step has it the moment it opens.
   const key = useSshKey({ enabled: active && view === 'manual' });
 
-  const ready: SshReady | null = view === 'pairing'
-    ? (pairing?.status === 'ready' && pairing.target && pairing.probe ? { target: pairing.target, probe: pairing.probe } : null)
-    : probed;
-  const name = typedName ?? (ready ? sshDefaultName(ready) : '');
-  const folder = typedFolder ?? ready?.probe.suggested_root_dir ?? '';
-  // The machine's part of the create body, or null until a supported one is
-  // in. It is named in its summary, prefilled from its hostname.
-  const body = sshCreateBody(ready, folder);
-  const trimmedName = name.trim();
-  const create = body
-    ? { ...(trimmedName ? { name: trimmedName } : {}), ssh: body, files_backup: filesBackup }
-    : null;
+  const ready = view === 'pairing' ? pairingReady(pairing) : probed;
+  const fields = useSshReadyFields(ready);
 
   const remint = () => {
     void mint.refetch({ cancelRefetch: false });
@@ -197,9 +240,7 @@ export function useSshSetup(active: boolean) {
 
   const startOver = () => {
     flushSync(() => {
-      setTypedName(null);
-      setTypedFolder(null);
-      setFolderOpen(false);
+      fields.reset();
       if (view === 'pairing') {
         setDismissedToken(token);
         setPairAddress(null);
@@ -296,17 +337,9 @@ export function useSshSetup(active: boolean) {
     view,
     setEntry,
     switchTo,
-    startOver,
     ready,
-    create,
-    name,
-    setName: setTypedName,
-    folder,
-    setFolder: setTypedFolder,
-    folderOpen,
-    openFolder: () => setFolderOpen(true),
-    filesBackup,
-    setFilesBackup,
+    readyStep: { ...fields.step, startOver },
+    create: fields.create,
     pairing: {
       unavailable: mint.isError,
       // Why the one-line command was refused, when the reason is the cap.

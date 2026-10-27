@@ -25,7 +25,12 @@ from langchain_core.tracers.langchain import LangChainTracer
 from langsmith.run_helpers import tracing_context
 from langsmith.run_trees import RunTree
 
-from src.observability import mark_tool_failed, mark_tool_unavailable
+from src.observability import (
+    RESOURCE_TIER,
+    mark_tool_failed,
+    mark_tool_unavailable,
+    stamp_resource_tier,
+)
 from src.observability.langsmith_run import build_sha
 from src.observability.langsmith_tracer import NonRetainingTracer, with_run_tracer
 from src.utils.tracking.core import calculate_cost_from_per_call_records
@@ -503,3 +508,18 @@ def test_a_huge_failed_output_yields_a_bounded_error():
 
     assert update["error"].startswith("provider_error: xxx")
     assert len(update["error"]) <= 300
+
+
+def test_a_tool_stamps_its_resource_tier():
+    def sized() -> str:
+        """probe"""
+        stamp_resource_tier("standard")
+        return "ok"
+
+    update = _tool_update(sized)
+
+    assert update["extra"]["metadata"][RESOURCE_TIER] == "standard"
+
+
+def test_stamping_a_tier_outside_a_tool_run_is_a_no_op():
+    stamp_resource_tier("standard")

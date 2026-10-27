@@ -1,4 +1,5 @@
 import { registerAuthReset } from '@/lib/authResets';
+import { clip, flattenMarkdown } from '@/lib/plainLine';
 import type { Attachment } from '@/types/sse';
 import type { MessageRecord } from './messageList/types';
 import { assistantText } from './messageList/messageText';
@@ -25,24 +26,6 @@ const RAW_SLACK = 4;
 // so a thread's history is flattened once, not once per token.
 const flatCache = new WeakMap<object, string>();
 
-function flatten(markdown: string): string {
-  return markdown
-    .replace(/!\[[^\]]*\]\([^)]*\)/g, '')
-    .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')
-    .replace(/^\s{0,3}(#{1,6}\s+|>\s?|[-*+]\s+|\d+\.\s+)/gm, '')
-    // Only a matched pair is formatting. Research prose is full of literal
-    // `*`, `_` and `~` (BRK_B, A * B, ~5%), and stripping them by character
-    // rewrites the sentence the preview exists to quote.
-    .replace(/\*\*([^*]+)\*\*/g, '$1')
-    .replace(/__([^_]+)__/g, '$1')
-    .replace(/~~([^~]+)~~/g, '$1')
-    .replace(/`([^`]+)`/g, '$1')
-    .replace(/(^|[\s(])([*_])(?=\S)([^*_]*?[^\s*_])\2(?=[\s).,;:!?]|$)/g, '$1$3')
-    .replace(/\|/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-
 // The last flattening, keyed by its input. A streaming reply is a new object
 // on every chunk, so the per-message cache below cannot hold it; but the
 // preview reads only its head, which stops changing once it is longer than
@@ -59,14 +42,10 @@ registerAuthReset(() => {
 export function plainText(markdown: unknown): string {
   if (typeof markdown !== 'string') return '';
   if (markdown === lastMarkdown) return lastPlain;
-  const prose = flatten(markdown.replace(/```[\s\S]*?(```|$)/g, ' '));
-  lastPlain = prose || flatten(markdown.replace(/```[^\n]*/g, ' '));
+  const prose = flattenMarkdown(markdown.replace(/```[\s\S]*?(```|$)/g, ' '));
+  lastPlain = prose || flattenMarkdown(markdown.replace(/```[^\n]*/g, ' '));
   lastMarkdown = markdown;
   return lastPlain;
-}
-
-export function clip(text: string, max: number): string {
-  return text.length > max ? text.slice(0, max).trimEnd() + '…' : text;
 }
 
 // `raw` is a producer, not a string: a settled message must cost nothing on a

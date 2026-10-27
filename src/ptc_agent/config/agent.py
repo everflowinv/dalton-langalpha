@@ -9,7 +9,7 @@ Use src.config.loaders for file-based loading.
 import os
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, TypedDict
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -31,6 +31,14 @@ from ptc_agent.config.core import (
 
 if TYPE_CHECKING:
     from langchain_core.language_models import BaseChatModel
+
+
+class SubagentModel(TypedDict):
+    """The model a subagent runs when it is not its launcher's: the catalog
+    name and the provider serving it."""
+
+    id: str
+    provider: str
 
 
 class CredentialSource(StrEnum):
@@ -72,20 +80,32 @@ class CompactionConfig(BaseModel):
     #: window. Reported, never read: the knobs are the behavior.
     profile: str | None = None
 
+    #: Whether a model whose provider can compact the conversation itself does
+    #: (see ``src.llms.provider_compaction``): the user's ``native_compaction``
+    #: setting, set per turn by ``apply_compaction``. The ``provider_compaction``
+    #: feature gates it when the middleware is built.
+    native: bool = True
+
 
 # Named presets that bundle the two user-facing compaction knobs
 # (token_threshold, keep_messages). Applied at request time in
-# ``resolve_llm_config`` when the user selects a profile.
+# ``resolve_llm_config`` when the user selects a profile, and listed here in
+# ascending order, which the settings pages draw them in.
 #
-# Thresholds are chosen to leave healthy headroom under common model context
-# windows: 100k (<=200k models), 130k (200k models), 200k (400k/1M models),
-# 300k (1M models). The kept tail scales with the threshold so that relaxed
-# profiles also keep more recent history.
+# Thresholds leave headroom under common context windows: 100k-130k for 200k
+# models, 200k for 400k models, 300k-750k for 1M models. ``economy`` stops
+# short of 272k, past which OpenAI bills a whole request at long-context
+# rates. The kept tail scales with the threshold so that later profiles also
+# keep more recent history.
 COMPACTION_PROFILES: dict[str, dict[str, int]] = {
     "aggressive": {"token_threshold": 100000, "keep_messages": 5},
     "moderate": {"token_threshold": 130000, "keep_messages": 8},
     "extended": {"token_threshold": 200000, "keep_messages": 10},
+    "economy": {"token_threshold": 250000, "keep_messages": 12},
     "relaxed": {"token_threshold": 300000, "keep_messages": 15},
+    "spacious": {"token_threshold": 400000, "keep_messages": 18},
+    "expansive": {"token_threshold": 500000, "keep_messages": 20},
+    "maximal": {"token_threshold": 750000, "keep_messages": 25},
 }
 
 
@@ -344,6 +364,12 @@ class AgentConfig(BaseModel):
     # Written alongside the clients above, because a role without a client of
     # its own still runs a model: by name, or by inheriting the main one.
     role_prompt_guidance: dict[str, str] = Field(default_factory=dict, exclude=True)
+    # Each subagent whose clients above run a model other than the turn's.
+    # Admission records it on the run, because nothing downstream of the
+    # build can still tell which model a run used.
+    subagent_models: dict[str, SubagentModel] = Field(
+        default_factory=dict, exclude=True
+    )
     # None permits standalone name resolution; [] means resolution rejected all candidates.
     fallback_llm_clients: list[Any] | None = Field(default=None, exclude=True)
     # Display names aligned index-for-index with ``fallback_llm_clients``

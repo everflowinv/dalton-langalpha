@@ -456,17 +456,39 @@ async def enforce_computer_limit(
     the platform already counts computers behind those names, and the strings
     rename on their own release once both sides speak the new one.
     """
-    if not platform_gating_active():
-        return user_id
+    await _enforce_computer_quota(user_id, "workspace")
+    return user_id
 
-    result = await _call_validate_for_user(user_id, check_quota="workspace")
+
+# Every managed computer a user holds, stopped ones included.
+COMPUTER_COUNT_QUOTA = "computer_count"
+
+
+async def enforce_computer_count(user_id: str) -> None:
+    """Enforce how many computers the plan lets a user hold. No-op in OSS mode.
+
+    The platform's ``computer_count`` counts stopped computers too, so a user at
+    the cap can't create another by stopping one. Ask it on a create only: on a
+    start it would count the computer being started and refuse a user exactly
+    at their cap. A platform that predates the value answers 422 and this fails
+    open, so a create still asks :func:`enforce_computer_limit` as well.
+    """
+    await _enforce_computer_quota(user_id, COMPUTER_COUNT_QUOTA)
+
+
+async def _enforce_computer_quota(user_id: str, check_quota: str) -> None:
+    """Raise the platform's 429 when ``check_quota``'s computer count is full."""
+    if not platform_gating_active():
+        return
+
+    result = await _call_validate_for_user(user_id, check_quota=check_quota)
 
     if result is None:
-        return user_id  # Fail-open
+        return  # Fail-open
 
     quota = result.get("quota")
     if not quota:
-        return user_id
+        return
 
     if not quota.get("allowed", True):
         # Forward platform's `message` and `limit_type` verbatim; no copy authored here.
@@ -484,8 +506,6 @@ async def enforce_computer_limit(
                 "X-RateLimit-Remaining": "0",
             },
         )
-
-    return user_id
 
 
 # ---------------------------------------------------------------------------
@@ -676,14 +696,18 @@ async def require_workspace_scope(user_id: str, scope: str) -> None:
 
 
 def _first(quota: dict, *names: str) -> int | None:
-    """Read the first of ``names`` the quota object carries, by presence.
+    """Read the first of ``names`` the quota object carries a count for.
 
-    Presence decides, not the value: a name the platform sends as null stops
-    the search and yields None rather than falling through to the next one.
+    The platform serializes every field of its quota object, so a name it has
+    no count for arrives as null: a computer quota sends ``capacity_used`` and
+    ``capacity_limit`` as null beside ``active_workspaces`` and
+    ``workspace_limit``. A null falls through to the next name, or the
+    computer counts would never be read.
     """
     for name in names:
-        if name in quota:
-            return quota[name]
+        value = quota.get(name)
+        if value is not None:
+            return value
     return None
 
 
@@ -712,7 +736,7 @@ async def enforce_capacity(user_id: str, check_quota: str) -> None:
     """Raise 429 when the platform reports the named count quota is exhausted.
 
     Generalizes ``enforce_computer_limit`` over ``check_quota`` (``always_on``,
-    ``spec_performance``, ``spec_max``). No-op in OSS mode and fail-open when the
+    ``spec_performance``, ``spec_max``, ``spec_xlarge``). No-op in OSS mode and fail-open when the
     platform is unreachable or omits the quota object.
     """
     if not platform_gating_active():
@@ -810,6 +834,7 @@ ALWAYS_ON_QUOTA = "always_on"
 _SPEC_ENTITLEMENTS: dict[str, tuple[str, str]] = {
     "performance": ("workspace:spec:performance", "spec_performance"),
     "max": ("workspace:spec:max", "spec_max"),
+    "xlarge": ("workspace:spec:xlarge", "spec_xlarge"),
 }
 
 # key -> (scope, count-quota name) for every entitlement the quota route shows.
@@ -818,9 +843,6 @@ DISPLAYED_ENTITLEMENTS: dict[str, tuple[str, str]] = {
     "always_on": (ALWAYS_ON_SCOPE, ALWAYS_ON_QUOTA),
 }
 
-# Ordering for upgrade-vs-downgrade decisions. Unknown tiers rank lowest so a
-# move from one is treated as an upgrade (counted).
-_TIER_RANK: dict[str, int] = {"standard": 0, "performance": 1, "max": 2}
 
 
 async def _assert_hybrid_gate(
@@ -835,21 +857,19 @@ async def _assert_hybrid_gate(
 async def assert_spec_allowed(
     user_id: str, tier: str, *, current_tier: Optional[str] = None
 ) -> None:
-    """Gate an upgrade to ``tier`` (scope 403 + count 429). Standard is never gated.
+    """Gate a move to ``tier`` (scope 403 + count 429). Standard is never gated.
 
-    The count quota is skipped when ``current_tier == tier`` (no new slot) and on
-    downgrades — a user must always be able to step down-tier, even if that
-    briefly reads over the target tier's count (the freed higher slot
-    compensates, and new allocations stay gated). No-op in OSS mode.
+    The count quota is skipped only when ``current_tier == tier`` (no new slot).
+    A step down into another metered tier counts too: a plan caps each tier on
+    its own, so an uncounted step down would let a user free their top-tier
+    slot, fill it again, and hold two elevated computers. Standard stays the
+    step down that is always open. No-op in OSS mode.
     """
     entitlement = _SPEC_ENTITLEMENTS.get(tier)
     if entitlement is None:
         return  # standard / unknown tiers are ungated
     scope, check_quota = entitlement
-    # Same-tier and downward moves never count; equal ranks make the former a
-    # non-upgrade automatically.
-    is_upgrade = _TIER_RANK.get(tier, -1) > _TIER_RANK.get(current_tier or "", -1)
-    await _assert_hybrid_gate(user_id, scope, check_quota, count=is_upgrade)
+    await _assert_hybrid_gate(user_id, scope, check_quota, count=tier != current_tier)
 
 
 async def assert_always_on_allowed(user_id: str) -> None:

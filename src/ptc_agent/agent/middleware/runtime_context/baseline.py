@@ -57,6 +57,7 @@ from ptc_agent.agent.middleware.runtime_context.epoch import (
     Workspace,
     advance_epoch,
     compaction_fingerprint,
+    machine_lines,
 )
 from ptc_agent.agent.middleware.runtime_context.harness_blocks import (
     HARNESS_BLOCKS,
@@ -756,6 +757,7 @@ def _workspace_block(workspace: Workspace, role: AgentRole = "analyst") -> str:
         lines.append(f"Computer: {escape(computer, quote=False)}")
         if role != "chief_of_staff":
             lines.append(OTHER_COMPUTERS)
+    lines.extend(machine_lines(workspace, role))
     body = "\n".join(lines)
     return f"<workspace>\n{body}\n</workspace>"
 

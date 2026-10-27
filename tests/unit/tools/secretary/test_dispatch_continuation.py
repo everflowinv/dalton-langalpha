@@ -142,6 +142,40 @@ async def test_the_dispatched_thread_names_the_agent_that_sent_it():
     }
 
 
+async def _continue_into(body: dict):
+    """The ToolMessage a continuation gets when the endpoint answers ``body``."""
+    with patch(
+        "src.server.database.conversation.threads_read.get_thread_owner_id",
+        AsyncMock(return_value=USER_ID),
+    ), patch(
+        "src.server.database.conversation.threads_read.get_thread_by_id",
+        AsyncMock(return_value={"workspace_id": WORKSPACE_ID}),
+    ), patch(
+        "src.tools.secretary.dispatch.hitl_confirm", return_value=(True, {})
+    ), patch("aiohttp.ClientSession", return_value=_FakeSession(_FakeResp(body=body))):
+        result = await delegate_to_analyst.ainvoke(
+            _tool_call({"question": "follow up", "thread_id": PTC_THREAD_ID}),
+            config=_config(),
+        )
+    return result.update["messages"][0]
+
+
+@pytest.mark.asyncio
+async def test_a_steered_hand_off_carries_its_steer_only_in_the_artifact():
+    """The view follows the steer to the run that takes it in; the model's
+    result is the same with the steer as without it."""
+    steered = {"status": "steered", "run_id": "run-live", "thread_id": PTC_THREAD_ID}
+
+    with_steer = await _continue_into({**steered, "steer_id": "job-1"})
+    without = await _continue_into(steered)
+
+    assert with_steer.artifact == {"steer_id": "job-1"}
+    assert with_steer.content == without.content
+    assert "job-1" not in with_steer.content
+    assert without.artifact is None
+    assert json.loads(with_steer.content)["status"] == "steered"
+
+
 @pytest.mark.asyncio
 async def test_continuation_owner_mismatch_returns_thread_not_found():
     """A thread owned by someone else is rejected before dispatch."""

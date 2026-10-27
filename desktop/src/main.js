@@ -18,6 +18,7 @@ const { probe } = require('./probe')
 const { navigate } = require('./navigate')
 const { forDisplay } = require('./redact')
 const { buildMenu, syncNavMenu } = require('./menu')
+const { createRemoteControl, registerIpc: registerRemoteControlIpc } = require('./remoteControl')
 
 // Before anything can ask where userData lives.
 //
@@ -47,6 +48,8 @@ let deferredLink = null
 // and a second launch moves focus again before the link it carries is
 // delivered.
 let lastSentOutWindow = null
+
+const remoteControl = createRemoteControl({ onMenuChange: installMenu })
 
 const SETUP_DIR = path.join(__dirname, '..', 'setup')
 
@@ -776,66 +779,8 @@ function openLaunchWindows() {
 function registerIpc() {
   ipcMain.handle('shell:open-external', openExternallyFrom)
 
-  // The one auth-shaped thing the page may ask for, and it hands back a local
-  // URL rather than anything secret. Our own sign-in stays intercepted and
-  // unreachable from here; this is for a connector whose authorization server
-  // refuses a hosted callback, where the page has to name the loopback URI when
-  // it asks its backend to mint the flow. `oauth.beginMcp` re-checks the asking
-  // window itself, so a message from anywhere unexpected is refused there.
-  ipcMain.handle('shell:mcp-oauth-begin', (event, returnUrl) => {
-    const win = BrowserWindow.fromWebContents(event.sender)
-    return win ? oauth.beginMcp(returnUrl, win) : null
-  })
-
-  // The second half of the handshake: the flow's `state` exists only after the
-  // backend has minted it, and until the shell has been told it, the armed flow
-  // accepts no callback. `oauth.bindMcp` re-checks the window and the flow id.
-  ipcMain.handle('shell:mcp-oauth-bind', (event, flowId, state) => {
-    const win = BrowserWindow.fromWebContents(event.sender)
-    return win ? oauth.bindMcp(win, flowId, state) : false
-  })
-
-  // The other half of that handshake: the page armed before it knew whether
-  // its backend would mint a flow at all, so it needs a way to say it did not.
-  // Named by flow id, so a start that failed cannot stand down a later connect
-  // that is still running.
-  ipcMain.handle('shell:mcp-oauth-cancel', (event, flowId) => {
-    const win = BrowserWindow.fromWebContents(event.sender)
-    return win ? oauth.cancelMcp(win, flowId) : false
-  })
-
-  // Theme has to come from the page: the shell cannot read a CSS variable, and
-  // the user's choice lives in the renderer's localStorage, not the OS setting.
-  ipcMain.on('shell:set-theme', (event, value) => {
-    // Answered rather than dropped: the ack exists so a renderer can tell a
-    // shell that understands this message from one that does not, and returning
-    // undefined for a value this shell simply rejected says the wrong thing.
-    if (!theme.isTheme(value)) {
-      event.returnValue = false
-      return
-    }
-    // Painted before the store is consulted, because the guard below is about
-    // the disk write and this is an in-memory native call. A window is created
-    // with whatever colour the store held then, so a sibling window moving the
-    // store between this one's creation and its first report would leave this
-    // one wearing the old theme with the guard suppressing the correction.
-    //
-    // Only the window that reported it. The app and the console are separate
-    // deploys resolving their own preference, so painting both from one message
-    // gives the other window a frame in a theme its page is not using, which is
-    // the mismatched resize band this exists to prevent.
-    const reporting = BrowserWindow.fromWebContents(event.sender)
-    if (reporting && !reporting.isDestroyed()) reporting.setBackgroundColor(theme.backgroundFor(value))
-    // Unchanged is the common case, not the rare one: every page load reports
-    // the theme it resolved, nearly always the stored one, and this is
-    // sendSync, so the renderer blocks on it. Writing anyway put a synchronous
-    // mkdir and a synchronous file write on the main event loop of every load,
-    // which is the whole app — menus, both windows — waiting on a disk for a
-    // value that already had that value.
-    if (store.get('theme') !== value) store.set('theme', value)
-    // Acknowledged only so a renderer can tell an old shell from a new one.
-    event.returnValue = true
-  })
+  oauth.registerIpc()
+  theme.registerIpc()
 
   outage.registerIpc({ onRetry: (win, url) => navigate(win, url) })
 
@@ -865,6 +810,44 @@ function registerIpc() {
   ipcMain.handle('server:current', () => store.get('serverUrl'))
 
   pdf.registerIpc()
+
+  registerRemoteControlIpc(remoteControl)
+}
+
+// ---------------------------------------------------------------------------
+// Application menu
+// ---------------------------------------------------------------------------
+
+function installMenu() {
+  Menu.setApplicationMenu(buildMenu({
+    isSaas: config.isSaas,
+    onChangeServer: showServerPicker,
+    onOpenAccount: () => {
+      const platform = origins.platformOrigin()
+      if (!platform) return
+      // The menu item and the app's own "Usage & Plan" link are the same
+      // journey and must not land in different windows.
+      if (policy.platformFitsMainWindow()) showInMainWindow(platform)
+      else openPlatformWindow(platform)
+    },
+    onCheckForUpdates: (win) => updater.checkManually(win || focusedOrMain()),
+    onReload: reloadWindow,
+    onBack: (win) => {
+      const history = win.webContents.navigationHistory
+      if (history.canGoBack()) history.goBack()
+    },
+    onForward: (win) => {
+      const history = win.webContents.navigationHistory
+      if (history.canGoForward()) history.goForward()
+    },
+    onHome: (win) => goHome(win, { isMainWindow: win === mainWindow }),
+    onOpenInBrowser: openCurrentInBrowser,
+    remoteControl: remoteControl.menuView(),
+    onPauseRemoteControl: remoteControl.pause,
+    onResumeRemoteControl: remoteControl.resume,
+  }))
+  // A rebuilt menu starts with Back and Forward disabled.
+  syncNavMenu(BrowserWindow.getFocusedWindow())
 }
 
 // ---------------------------------------------------------------------------
@@ -897,30 +880,8 @@ if (!app.requestSingleInstanceLock()) {
     await oauth.startCallbackServer()
     registerIpc()
 
-    Menu.setApplicationMenu(buildMenu({
-      isSaas: config.isSaas,
-      onChangeServer: showServerPicker,
-      onOpenAccount: () => {
-        const platform = origins.platformOrigin()
-        if (!platform) return
-        // The menu item and the app's own "Usage & Plan" link are the same
-        // journey and must not land in different windows.
-        if (policy.platformFitsMainWindow()) showInMainWindow(platform)
-        else openPlatformWindow(platform)
-      },
-      onCheckForUpdates: (win) => updater.checkManually(win || focusedOrMain()),
-      onReload: reloadWindow,
-      onBack: (win) => {
-        const history = win.webContents.navigationHistory
-        if (history.canGoBack()) history.goBack()
-      },
-      onForward: (win) => {
-        const history = win.webContents.navigationHistory
-        if (history.canGoForward()) history.goForward()
-      },
-      onHome: (win) => goHome(win, { isMainWindow: win === mainWindow }),
-      onOpenInBrowser: openCurrentInBrowser,
-    }))
+    installMenu()
+    remoteControl.watch()
 
     openLaunchWindows()
     updater.init(() => mainWindow)
@@ -941,6 +902,7 @@ app.on('window-all-closed', () => {
 app.on('before-quit', () => {
   oauth.stopCallbackServer()
   updater.stop()
+  remoteControl.unwatch()
 })
 
 // A remote-URL shell loads code it did not build; a stray permission prompt from

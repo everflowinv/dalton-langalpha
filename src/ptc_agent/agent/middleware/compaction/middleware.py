@@ -24,14 +24,18 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import functools
 import logging
 import time
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any
 
 from langchain_core.exceptions import ContextOverflowError
-from langchain_core.messages import AIMessage, AnyMessage
+from langchain_core.messages import AIMessage, AnyMessage, HumanMessage
+from langchain_core.runnables.config import var_child_runnable_config
 from langgraph.config import get_config, get_stream_writer
+from langgraph.constants import TAG_NOSTREAM
 from langgraph.types import Command
 from typing_extensions import override
 
@@ -42,15 +46,28 @@ from langchain.agents.middleware.types import (
     ModelResponse,
 )
 
+from src.llms.provider_compaction import (
+    compaction_settings,
+    kept_user_texts,
+    native_answer,
+    native_kind,
+)
 from src.llms.token_counter import extract_token_usage
 
 from ptc_agent.agent.state import ensure_message_ids
 from ptc_agent.agent.middleware.compaction.types import CompactionState, OffloadSettings
-from ptc_agent.agent.middleware.compaction.compact import Compaction, Summarizer
+from ptc_agent.agent.middleware.compaction.compact import (
+    Compaction,
+    Native,
+    NativeAnswer,
+    Summarizer,
+)
+from ptc_agent.agent.middleware.compaction.summary_request import NATIVE_SUMMARY_PROMPT
 from ptc_agent.agent.middleware.compaction.utils import (
     find_group_safe_cutoff,
     get_effective_messages,
     measured_tokens,
+    provider_cutoff,
     stamp_compaction_summary,
     stamp_context_threshold,
 )
@@ -67,7 +84,9 @@ from ptc_agent.agent.middleware.compaction.window import (
     trim,
     window_cut,
 )
+from ptc_agent.agent.middleware.reasoning_compat import ORIGIN_KEY
 from ptc_agent.agent.transcript import TranscriptTarget, Window
+from ptc_agent.agent.transcript.classify import human_kind, is_summary_message
 from ptc_agent.agent.transcript.identity import DIGEST_VERSION
 from ptc_agent.agent.transcript.pointer import (
     aexport_transcript,
@@ -85,6 +104,36 @@ logger = logging.getLogger(__name__)
 # boundaries, which takes tens of milliseconds; past this the trim waits for
 # the next pass rather than hold the turn.
 _COVERAGE_TIMEOUT_S = 5.0
+
+
+@contextmanager
+def _unstreamed() -> Iterator[None]:
+    """Tag the model calls made inside ``nostream``. The model node calls the
+    model with the config it finds here, so the tag reaches the call, and the
+    callbacks that bill and trace it still see it."""
+    ambient = var_child_runnable_config.get() or {}
+    token = var_child_runnable_config.set(
+        {**ambient, "tags": [*(ambient.get("tags") or ()), TAG_NOSTREAM]}
+    )
+    try:
+        yield
+    finally:
+        var_child_runnable_config.reset(token)
+
+
+def _user_texts(messages: Sequence[AnyMessage]) -> list[str]:
+    """What the user wrote in ``messages``, oldest first, with what an
+    earlier OpenAI summary among them kept: the messages Codex keeps beside
+    its item, none of the rows the runtime stamps."""
+    texts: list[str] = []
+    for message in messages:
+        if not isinstance(message, HumanMessage):
+            continue
+        if is_summary_message(message):
+            texts.extend(kept_user_texts(message))
+        elif human_kind(message) in ("plain", "steering"):
+            texts.append(message.text)
+    return texts
 
 
 def _summary_fields(compaction: Compaction) -> dict[str, Any]:
@@ -116,6 +165,7 @@ class CompactionMiddleware(AgentMiddleware):
         offload: OffloadSettings = OffloadSettings(),
         backend: SandboxBackend | None = None,
         workspace_id: str | None = None,
+        native: bool = True,
     ) -> None:
         """
         Args:
@@ -129,6 +179,8 @@ class CompactionMiddleware(AgentMiddleware):
                 sandbox, which has neither.
             workspace_id: The workspace the turn runs in, whose folder must
                 reach the transcript before anything points at it.
+            native: Whether a provider that can compact the conversation
+                itself does.
         """
         super().__init__()
         self._summarizer = summarizer
@@ -137,6 +189,7 @@ class CompactionMiddleware(AgentMiddleware):
         self._offload = offload
         self._backend = backend
         self._workspace_id = workspace_id
+        self._native = native
         # The notes folder this agent's summaries name; see with_scratchpad_notes.
         self._notes_dir: str | None = None
         # The main agent's window; see with_window.
@@ -151,7 +204,12 @@ class CompactionMiddleware(AgentMiddleware):
         backend: SandboxBackend | None = None,
         workspace_id: str | None = None,
     ) -> CompactionMiddleware | None:
-        """The middleware ``config.compaction`` describes, or None when it is off."""
+        """The middleware ``config.compaction`` describes, or None when it is off.
+
+        The ``provider_compaction`` feature is read here rather than with the
+        user's settings, so a build that resolves no user, a system insight,
+        still honors an operator who turned it off.
+        """
         settings = config.compaction
         if not settings.enabled:
             return None
@@ -162,6 +220,7 @@ class CompactionMiddleware(AgentMiddleware):
             offload=OffloadSettings.from_config(settings),
             backend=backend,
             workspace_id=workspace_id,
+            native=settings.native and config.feature_enabled("provider_compaction"),
         )
 
     # =========================================================================
@@ -207,7 +266,14 @@ class CompactionMiddleware(AgentMiddleware):
             # Too few messages to summarize.
             return self._answered(await handler(request.override(messages=view)))
 
-        compaction = await self._compact(request, view, cutoff, transcript)
+        native: Native | None = None
+        kind = native_kind(request.model) if self._native else None
+        # Claude reads its block only where the kept turns can follow it.
+        cut = provider_cutoff(view, cutoff) if kind == "anthropic" else cutoff
+        if kind is not None and cut > 0:
+            cutoff = cut
+            native = functools.partial(self._provider_summary, request, handler)
+        compaction = await self._compact(request, view, cutoff, transcript, native)
         response = await handler(request.override(messages=compaction.messages))
         self._stamp_summary(response, compaction)
         return self._answered(response, compaction.update(request.state))
@@ -226,9 +292,10 @@ class CompactionMiddleware(AgentMiddleware):
         view: list[AnyMessage],
         cutoff: int,
         transcript: TranscriptTarget | None,
+        native: Native | None = None,
     ) -> Compaction:
-        """Summarize ``view`` before ``cutoff``, this agent's model being
-        the fallback (see ``Summarizer.compact``).
+        """Summarize ``view`` before ``cutoff``, by ``native`` when given,
+        this agent's model being the fallback (see ``Summarizer.compact``).
 
         Start is outside the try, so a start that fails opened no window. A
         cancellation still emits error before it propagates: otherwise the
@@ -251,12 +318,44 @@ class CompactionMiddleware(AgentMiddleware):
                 progress=lambda tokens: self._emit_context_signal(
                     "summary_progress", "progress", summary_tokens=tokens
                 ),
+                native=native,
             )
         except BaseException as e:
             self._emit_context_signal("summarize", "error", error=str(e))
             raise
         self._emit_context_signal("summarize", "complete", **_summary_fields(compaction))
         return compaction
+
+    @staticmethod
+    async def _provider_summary(
+        request: ModelRequest,
+        handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
+        to_summarize: list[AnyMessage],
+    ) -> NativeAnswer:
+        """The agent's provider compacting ``to_summarize`` itself, with the
+        summary prompt in place of its own where it takes one (Claude).
+
+        Sent through ``handler`` so the request is the conversation's own:
+        the same system prompt, tools and thinking, which its cache and the
+        thinking in the kept turns are checked against. It stays out of the
+        turn's message stream, where its reply would read as the answer.
+        OpenAI's goes after the user's own messages it summarized.
+        """
+        settings = compaction_settings(
+            request.model, request.model_settings, NATIVE_SUMMARY_PROMPT
+        )
+        with _unstreamed():
+            response = await handler(
+                request.override(messages=to_summarize, model_settings=settings)
+            )
+        message = next(
+            (m for m in reversed(response.result or ()) if isinstance(m, AIMessage)), None
+        )
+        answer = native_answer(message, _user_texts(to_summarize))
+        if message is None or answer is None:
+            stop = (message.response_metadata or {}).get("stop_reason") if message else None
+            raise ValueError(f"no compaction (stop reason {stop})")
+        return NativeAnswer(answer, (message.response_metadata or {}).get(ORIGIN_KEY))
 
     @staticmethod
     def _stamp_summary(response: ModelResponse, compaction: Compaction) -> None:

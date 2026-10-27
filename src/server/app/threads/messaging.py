@@ -27,6 +27,8 @@ from src.server.database.conversation import (
     lookup_thread_by_external_id,
     get_replay_thread_data,
 )
+from src.server.contracts.run_times import run_completed_at
+from src.server.contracts.status import to_public
 from src.server.contracts.turn_kinds import ANNOUNCED_KEYS
 from src.server.database.pool import DATABASE_UNAVAILABLE
 from src.server.services.report_back.handoff.keys import ORIGIN_THREAD_META
@@ -688,7 +690,7 @@ async def _prime_dispatch(
     from src.server.database.runs.lifecycle import DuplicateRequestError
     from src.server.handlers.chat.request_prep import (
         DISPATCH_STARTED_MARKER,
-        DISPATCH_STEERED_MARKER,
+        HandOffSteered,
     )
     from src.server.services.report_back.handoff import pointer, reserve
 
@@ -707,7 +709,9 @@ async def _prime_dispatch(
     # a report-back summary carries its pair's generation for the claim above.
     gated_gen = request.origin_dispatch_gen if not rb_ptc else None
 
-    async def steered(target_run_id: str) -> JSONResponse:
+    async def steered(
+        target_run_id: str, steer_id: str | None = None
+    ) -> JSONResponse:
         # The hand-off went into a running turn as a steer: this request's
         # run never starts, so its pre-START stamp goes. The generation stays
         # admitted on the ledger, where the steer stamped the running run.
@@ -718,12 +722,17 @@ async def _prime_dispatch(
             f"[PTC_DISPATCH] Hand-off steered into running run {target_run_id} "
             f"on thread {thread_id}"
         )
-        return JSONResponse({
+        body = {
             "status": "steered",
             "thread_id": thread_id,
             "run_id": target_run_id,
             "workspace_id": workspace_id,
-        })
+        }
+        if steer_id:
+            # A run that ends before reading the steer leaves it to a later
+            # run, which only the steer's row names.
+            body["steer_id"] = steer_id
+        return JSONResponse(body)
 
     async with pointer.claim(
         rb_cache, thread_id, rb_ptc, run_id,
@@ -837,9 +846,9 @@ async def _prime_dispatch(
                 status_code=503,
                 detail=f"Dispatch could not start durably: {e}",
             )
-        if isinstance(first, str) and first.startswith(DISPATCH_STEERED_MARKER):
+        if isinstance(first, HandOffSteered):
             await gen.aclose()
-            return await steered(first[len(DISPATCH_STEERED_MARKER):])
+            return await steered(first.run_id, first.steer_id)
         if first != DISPATCH_STARTED_MARKER:
             await gen.aclose()
             await scope.release_slot()
@@ -1224,19 +1233,58 @@ async def get_thread_status(
     return status
 
 
-# Upper bound on ids per liveness request — one MGET stays cheap. Ids past the
-# cap are dropped for that request and stay unresolved on the client (there is
-# no per-card fallback); >100 concurrently-unresolved cards would need the
-# frontend to chunk requests.
+# Upper bound on ids of each kind (threads, runs, steers) per liveness request,
+# so one request stays one bounded query per kind. Ids past the cap are dropped
+# for that request; the client sends at most this many of each kind per request
+# and splits larger sets across requests.
 _MAX_LIVENESS_IDS = 100
+
+
+def _run_view(row: dict) -> dict:
+    """A run's public status and times, the same for a thread's latest run
+    and for a run read by id. The finish is null while the run is live; a
+    client tells a live run by the status, not by these times."""
+    return {
+        "status": to_public(
+            row["status"], cancel_requested_at=row.get("cancel_requested_at")
+        ),
+        "run_started_at": row["created_at"],
+        "run_finished_at": run_completed_at(row),
+    }
+
+
+def _liveness_ids(raw: str, kind: str, user_id: str) -> list[str]:
+    """A comma-separated id list, deduped in order and capped."""
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for part in raw.split(","):
+        item = part.strip()
+        if item and item not in seen:
+            seen.add(item)
+            deduped.append(item)
+    if len(deduped) > _MAX_LIVENESS_IDS:
+        logger.warning(
+            f"[LIVENESS] {len(deduped)} {kind} requested by {user_id}; capping at "
+            f"{_MAX_LIVENESS_IDS} (remainder unresolved this request)"
+        )
+        deduped = deduped[:_MAX_LIVENESS_IDS]
+    return deduped
 
 
 @router.get("/dispatches/liveness")
 async def get_dispatches_liveness(
     x_user_id: CurrentUserId,
     ids: str = Query(
-        ...,
+        "",
         description="Comma-separated thread ids to read liveness for (one MGET).",
+    ),
+    runs: str = Query(
+        "",
+        description="Comma-separated run ids to read on their own, beside the threads.",
+    ),
+    steers: str = Query(
+        "",
+        description="Comma-separated steer ids to resolve to the run that took each.",
     ),
 ):
     """Batched, client-keyed dispatch liveness — N cards in one round-trip.
@@ -1248,45 +1296,55 @@ async def get_dispatches_liveness(
     crosscheck is obsolete — the recovery scanner converges orphaned
     in_progress rows. Threads with no attempt row yet (a dispatch still
     pre-START) are silently omitted so the card keeps polling as 'starting'.
+
+    ``runs`` reads named runs the same way: a hand-off is one run, and once
+    it is over the thread's latest attempt describes whatever the thread did
+    since. Unowned or unknown runs are omitted.
+
+    ``steers`` follows a hand-off steered into a running turn to the run
+    that took it in, which is a later run when that turn ended before
+    reading it. Each says ``taken``, with that run's id, whose view joins
+    ``runs`` if it was not asked for; ``queued`` until a run takes it; or
+    ``dropped`` if it settled with none. A steer the running turn holds for
+    its next model call is taken, and goes back to queued if that turn ends
+    without reading it. A steer is known only while its outbox row lives,
+    which is purged 7 days after it settles (``RETENTION_SECONDS``); after
+    that it is omitted, as unowned and unknown ones are, and the client
+    falls back to the run it was steered into. A reported hand-off keeps its
+    link through its report's ``steer_ids``.
     """
-    seen: set[str] = set()
-    deduped: list[str] = []
-    for raw in ids.split(","):
-        tid = raw.strip()
-        if tid and tid not in seen:
-            seen.add(tid)
-            deduped.append(tid)
+    thread_ids = _liveness_ids(ids, "ids", x_user_id)
+    run_ids = _liveness_ids(runs, "runs", x_user_id)
+    steer_ids = _liveness_ids(steers, "steers", x_user_id)
 
-    if len(deduped) > _MAX_LIVENESS_IDS:
-        logger.warning(
-            f"[LIVENESS] {len(deduped)} ids requested by {x_user_id}; capping at "
-            f"{_MAX_LIVENESS_IDS} (remainder unresolved this request)"
-        )
-        deduped = deduped[:_MAX_LIVENESS_IDS]
+    if not thread_ids and not run_ids and not steer_ids:
+        return {"liveness": [], "runs": [], "steers": []}
 
-    if not deduped:
-        return {"liveness": []}
-
+    from src.server.database.runs import handoff_liveness
     from src.server.database.runs import lifecycle as tl_db
-    from src.server.contracts.status import to_public
 
-    rows = await tl_db.get_latest_attempts_for_threads(deduped, x_user_id)
+    async def _read(fetch, wanted: list[str]) -> dict:
+        return await fetch(wanted, x_user_id) if wanted else {}
+
+    # Independent reads, each on its own pooled connection.
+    rows, run_rows, steer_rows = await asyncio.gather(
+        _read(tl_db.get_latest_attempts_for_threads, thread_ids),
+        _read(handoff_liveness.get_owned_runs, run_ids),
+        _read(handoff_liveness.get_owned_steers, steer_ids),
+    )
 
     liveness = []
     for tid, row in rows.items():
-        status = to_public(
-            row["status"], cancel_requested_at=row.get("cancel_requested_at")
-        )
-        live = status in ("running", "stopping")
+        # The thread's latest run, live or settled: a card opened mid-run
+        # times it from its start, and a settled one says how long it took.
+        view = _run_view(row)
+        live = view["status"] in ("running", "stopping")
         liveness.append(
             {
                 "thread_id": tid,
-                "status": status,
+                **view,
                 "run_id": str(row["conversation_response_id"]) if live else None,
                 "can_reconnect": live,
-                # A card opened mid-run times the run from here, not from
-                # when the card mounted.
-                "run_started_at": row["run_started_at"] if live else None,
                 # When the thread's latest turn started or settled, whoever
                 # sent it: how long the thread has been quiet.
                 "last_activity_at": row["last_activity_at"],
@@ -1298,7 +1356,32 @@ async def get_dispatches_liveness(
             }
         )
 
-    return {"liveness": liveness}
+    # A taken steer's run is read in the same query, so a view following the
+    # steer finds that run here without asking for it again.
+    runs_by_id = dict(run_rows)
+    for steer in steer_rows.values():
+        if steer["run"] is not None:
+            runs_by_id.setdefault(steer["run_id"], steer["run"])
+    pinned = [
+        {
+            "run_id": rid,
+            "thread_id": str(row["conversation_thread_id"]),
+            **_run_view(row),
+        }
+        for rid, row in runs_by_id.items()
+    ]
+
+    resolved = [
+        {
+            "steer_id": sid,
+            "thread_id": steer["thread_id"],
+            "state": steer["state"],
+            "run_id": steer["run_id"],
+        }
+        for sid, steer in steer_rows.items()
+    ]
+
+    return {"liveness": liveness, "runs": pinned, "steers": resolved}
 
 
 @router.post("/{thread_id}/cancel", status_code=200)

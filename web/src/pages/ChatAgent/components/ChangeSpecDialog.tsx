@@ -5,9 +5,18 @@ import { Button } from '@/components/ui/button';
 import { Loader } from '@/components/ui/loader';
 import { ModalShell } from '@/components/ui/ModalShell';
 import { useLocale } from '@/hooks/useLocale';
-import type { Computer, ResourceTier, WorkspaceQuota } from '@/types/api';
-import { TIER_ORDER, TierRadioGroup, isTierBlocked, normalizeTier, tierCapacity, tierLabel } from './tierUi';
-import { DiskBar, diskUsageLabel, isDiskAlertLevel, nextTier } from './computerDiskUi';
+import type { Computer, ComputerProviderOption, ResourceTier, WorkspaceQuota } from '@/types/api';
+import {
+  TierRadioGroup,
+  isTierBlocked,
+  needsBiggerPlan,
+  normalizeTier,
+  offeredTiers,
+  tierCapacity,
+  tierLabel,
+  type TierOffer,
+} from './tierUi';
+import { DiskBar, diskUpgradeTier, diskUsageLabel, isDiskAlertLevel } from './computerDiskUi';
 import { specErrorFiles, type SpecError } from './specErrors';
 import { activeSpecChange, effectiveTier, specChangeLabel } from './specChangeUi';
 import { PlanUpgradeHint } from './planUpgradeHint';
@@ -22,6 +31,11 @@ interface ChangeSpecDialogProps {
   busy: boolean;
   /** Per-tier count quotas (platform mode only); null/undefined hides the capacity hint. */
   quota?: WorkspaceQuota | null;
+  /**
+   * The computer's provider as offered now, which decides the sizes shown.
+   * Unknown, or a provider no longer offered, shows the base ladder.
+   */
+  provider?: ComputerProviderOption | null;
   /** The last refusal, shown inline so a list of files can be read and acted on. */
   error?: SpecError | null;
   /** Opened over the Computers dialog, which steps back and keeps the page dimmed. */
@@ -48,6 +62,7 @@ function ChangeSpecPanel({
   onSubmit,
   busy,
   quota,
+  provider,
   error,
   stacked = false,
 }: Omit<ChangeSpecDialogProps, 'target'> & { target: SpecTarget }) {
@@ -55,23 +70,26 @@ function ChangeSpecPanel({
   const locale = useLocale();
   const titleId = useId();
   const currentTier = effectiveTier(target);
-  // Derived rather than seeded: the quota lands after the dialog opens and
-  // can refetch while it is open, and the row behind `target` is replaced on
-  // every list refetch. A pick holds while the plan allows it (the current
-  // tier always does); otherwise the seed stands.
+  const offer = offeredTiers(provider, currentTier);
+  // Derived rather than seeded: the quota and the provider's sizes land after
+  // the dialog opens and can refetch while it is open, and the row behind
+  // `target` is replaced on every list refetch. A pick holds while the
+  // provider offers it and the plan allows it (the current tier always does);
+  // otherwise the seed stands.
   const [picked, setPicked] = useState<ResourceTier | null>(null);
   const tier =
-    picked && (picked === currentTier || !isTierBlocked(tierCapacity(quota, picked)))
+    picked && offer.tiers.includes(picked) && (picked === currentTier || !isTierBlocked(tierCapacity(quota, picked)))
       ? picked
-      : seedTier(target, quota);
+      : seedTier(currentTier, target, offer, quota);
   const isRunning = target.status === 'running';
   const errorFiles = specErrorFiles(error?.files, t, locale);
   const change = activeSpecChange(target);
   // A bigger tier the plan keeps closed can't be picked here, so the dialog
-  // points to where that is decided instead of leaving a dead end.
+  // points to where that is decided instead of leaving a dead end. Only where
+  // a bigger plan opens it: a plan at the top size is not told to upgrade.
   const planLimited =
     !change &&
-    TIER_ORDER.slice(TIER_ORDER.indexOf(currentTier) + 1).some((id) => isTierBlocked(tierCapacity(quota, id)));
+    offer.tiers.slice(offer.tiers.indexOf(currentTier) + 1).some((id) => needsBiggerPlan(quota, id));
   // The row is the only witness to where the change is. It reads 'starting'
   // from before the backup until the new sandbox is up, so that one phase
   // covers both; 'running' is the moment before the machine is claimed.
@@ -158,6 +176,7 @@ function ChangeSpecPanel({
         </div>
       ) : (
         <TierRadioGroup
+          offer={offer}
           value={tier}
           onChange={setPicked}
           label={t('computer.tierLabel', 'Computer spec')}
@@ -186,10 +205,13 @@ function ChangeSpecPanel({
   );
 }
 
-function seedTier(target: SpecTarget, quota: WorkspaceQuota | null | undefined): ResourceTier {
-  const current = effectiveTier(target);
-  const up = isDiskAlertLevel(target.disk?.level) ? nextTier(current) : null;
-  return up && !isTierBlocked(tierCapacity(quota, up)) ? up : current;
+function seedTier(
+  current: ResourceTier,
+  target: SpecTarget,
+  offer: TierOffer,
+  quota: WorkspaceQuota | null | undefined,
+): ResourceTier {
+  return (isDiskAlertLevel(target.disk?.level) && diskUpgradeTier(current, offer, quota)) || current;
 }
 
 export default ChangeSpecDialog;

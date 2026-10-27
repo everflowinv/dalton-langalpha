@@ -42,6 +42,7 @@ from src.server.database.workspace_move import MoveRefused
 from src.server.dependencies.usage_limits import (
     assert_provider_allowed,
     assert_spec_allowed,
+    enforce_computer_count,
     enforce_computer_limit,
     get_provider_allowances,
     platform_gating_active,
@@ -55,6 +56,7 @@ from src.server.models.computer import (
     ComputerListResponse,
     ComputerProviderOption,
     ComputerProvidersResponse,
+    ComputerTierSpec,
     ComputerRemoveResponse,
     ComputerRenameRequest,
     ComputerResponse,
@@ -95,6 +97,7 @@ from src.server.services.ssh_computers import (
 from src.server.services.ssh_dial_budget import SSHDialBudgetExceeded
 from src.server.services.ssh_removal import leave_machine
 from src.server.services.ssh_tunnel_sweep import release_tunnel
+from src.server.services.ssh_tunnels import tunnels_enabled
 from src.server.services.workspace_move import (
     claim_workspace_move,
     move_error_detail,
@@ -402,6 +405,12 @@ async def create_computer(
             # The manager refuses it too, but an ssh create dials the machine
             # it names first, which only a kind on offer may cause.
             raise ProviderNotOffered("Provider not offered")
+        if request.resource_tier not in sandbox.settings_for(kind).resource_tiers:
+            # Ahead of the plan gate, which would offer an upgrade for a size
+            # this provider never builds (xlarge on Daytona).
+            raise UnknownResourceTier(
+                f"This provider does not offer the {request.resource_tier!r} spec"
+            )
         await assert_provider_allowed(x_user_id, kind, default_kind=sandbox.provider)
         plan: Optional[SSHCreatePlan] = None
         if request.ssh is not None:
@@ -419,6 +428,9 @@ async def create_computer(
                 with _ssh_create_refusals():
                     await plan.recheck(x_user_id)
             if provider_class(kind).metered:
+                # The cap first: a user at it who asked for a size their plan
+                # refuses would step down only to be refused again.
+                await enforce_computer_count(x_user_id)
                 await assert_spec_allowed(x_user_id, request.resource_tier)
                 await enforce_computer_limit(x_user_id)
             computer = await _computer_manager().create_computer_for_user(
@@ -513,11 +525,33 @@ async def list_computer_providers(x_user_id: CurrentUserId):
     return ComputerProvidersResponse(
         providers=[
             ComputerProviderOption(
-                kind=kind, is_default=kind == sandbox.provider, allowed=allowed[kind]
+                kind=kind,
+                is_default=kind == sandbox.provider,
+                allowed=allowed[kind],
+                tiers=_tier_specs(sandbox, kind),
             )
             for kind in kinds
-        ]
+        ],
+        tunnels=tunnels_enabled(),
     )
+
+
+def _tier_specs(sandbox: Any, kind: str) -> list[ComputerTierSpec]:
+    """The sizes ``kind`` offers, from the settings its sandboxes are built from.
+
+    Empty for a machine its owner sizes, whose one tier is a placeholder.
+    """
+    if not provider_class(kind).recreatable:
+        return []
+    tiers = sandbox.settings_for(kind).resource_tiers
+    return [
+        ComputerTierSpec(
+            tier=name, cpu=preset.cpu, memory_gib=preset.memory, disk_gib=preset.disk
+        )
+        for name, preset in sorted(
+            tiers.items(), key=lambda item: (item[1].cpu, item[1].memory, item[1].disk)
+        )
+    ]
 
 
 async def _counted_response(computer: Dict[str, Any]) -> ComputerResponse:

@@ -18,6 +18,7 @@ Endpoints:
 - DELETE /api/v1/workspaces/{workspace_id} - Delete workspace
 """
 
+import asyncio
 import contextlib
 import logging
 from typing import Literal, Optional
@@ -28,7 +29,9 @@ from fastapi.responses import Response, StreamingResponse
 from src.server.services.persistence.sync_result import BackupIncomplete
 from src.server.utils.api import CurrentUserId, require_workspace_owner
 from src.server.dependencies.usage_limits import (
+    COMPUTER_COUNT_QUOTA,
     DISPLAYED_ENTITLEMENTS,
+    get_capacity_status,
     get_entitlement_statuses,
 )
 from src.server.app.background_starts import schedule_start
@@ -74,6 +77,7 @@ from src.server.services.workspace_move import move_error_detail, move_from_row
 from src.server.services.computer_errors import (
     ComputerNotFoundError,
     ComputerPreparingError,
+    UnknownResourceTier,
 )
 from ptc_agent.core.sandbox.providers.ssh_errors import connect_failure
 from ptc_agent.core.sandbox.runtime import SandboxGoneError, SandboxTransientError
@@ -131,6 +135,8 @@ async def _workspace_action_errors(action: str, workspace_id: str):
     except (WorkspaceNameTaken, WorkspaceNameInvalid) as e:
         # Before the ValueError arm: an unusable name is not a missing workspace.
         raise _name_error(e) from None
+    except UnknownResourceTier as e:
+        raise HTTPException(status_code=400, detail=str(e)) from None
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except BackupIncomplete as e:
@@ -334,17 +340,22 @@ async def list_workspaces(
 # Declared before the `/{workspace_id}` routes so `/quota` isn't captured as an id.
 @router.get("/quota", response_model=WorkspaceQuotaResponse)
 async def get_workspace_quota(x_user_id: CurrentUserId):
-    """Per-capability count quotas for the change-spec / always-on UI.
+    """Per-capability count quotas for the spec pickers, always-on and New computer.
 
     Platform mode only — every field is null in OSS mode, so the UI just omits the
     remaining-count hint. Fails open: a capability the platform can't report comes
     back null rather than erroring the whole call.
     """
-    statuses = await get_entitlement_statuses(x_user_id, DISPLAYED_ENTITLEMENTS)
+    statuses, computers = await asyncio.gather(
+        get_entitlement_statuses(x_user_id, DISPLAYED_ENTITLEMENTS),
+        get_capacity_status(x_user_id, COMPUTER_COUNT_QUOTA),
+    )
     return WorkspaceQuotaResponse(
         performance=statuses["performance"],
         max=statuses["max"],
+        xlarge=statuses["xlarge"],
         always_on=statuses["always_on"],
+        computers=computers,
     )
 
 
@@ -696,7 +707,7 @@ async def set_workspace_spec(
     x_user_id: CurrentUserId,
 ):
     """
-    Change a workspace's sandbox spec tier (standard, performance, max).
+    Change a workspace's sandbox spec tier (standard, performance, max, xlarge).
 
     Gated by the platform entitlement layer (403 if the tier is not on the
     user's plan, 429 if the per-tier count quota is exhausted); both are

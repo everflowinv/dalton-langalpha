@@ -1,7 +1,9 @@
 // @vitest-environment node
 import { describe, it, expect, vi } from 'vitest';
 import { prependSubagentRuns, projectSubagentHistory } from '../projectHistory';
-import { handleSubagentMessageChunk, handleTaskSteeringAccepted, returnTaskInstruction } from '../liveEventHandlers';
+import {
+  addPendingTaskInstruction, handleSubagentMessageChunk, handleTaskSteeringAccepted, returnTaskInstruction,
+} from '../liveEventHandlers';
 import { createSubagentHistoryStore, type SubagentHistorySnapshot } from '../historyStore';
 import type { SubagentRuntime } from '../../runtime';
 import type { SSEEvent } from '../../types';
@@ -215,6 +217,99 @@ describe('projectSubagentHistory steering', () => {
       ['Skip 2019', null],
     ]);
   });
+
+  const replayMarks = (events: Record<string, unknown>[]) => {
+    const rt = makeRuntime();
+    projectSubagentHistory(
+      rt,
+      new Map([['task:k7Xm2p', { messages: [], events: events as unknown as SSEEvent[] }]]),
+    );
+    return (rt.subagentHistory.get().entries['task:k7Xm2p']!.messages as Record<string, unknown>[])
+      .filter((m) => m.role === 'user')
+      .map((m) => [m.content, m.steeringDelivered === true]);
+  };
+
+  it('marks what a running run took in as steered, and the instruction a run opens with as not', () => {
+    expect(replayMarks([
+      { event: 'user_message', role: 'user', content: 'Pull the 10-K' },
+      { event: 'message_chunk', role: 'assistant', content_type: 'text', content: 'Revenue' },
+      { event: 'steering_delivered', content: 'Focus on margins', entries: [{ input_id: 'a1', content: 'Focus on margins', sender: 'user' }] },
+      { event: 'message_chunk', role: 'assistant', content_type: 'text', content: 'Margins' },
+      // The run's resume opens the next, as the first instruction opened the first.
+      { event: 'user_message', role: 'user', content: 'Now cover guidance' },
+      { event: 'message_chunk', role: 'assistant', content_type: 'text', content: 'Guidance' },
+    ])).toEqual([
+      ['Pull the 10-K', false],
+      ['Focus on margins', true],
+      ['Now cover guidance', false],
+    ]);
+  });
+
+  it('marks a legacy follow-up as steered, and a legacy turn boundary as not', () => {
+    expect(replayMarks([
+      { event: 'user_message', role: 'user', content: 'Pull the 10-K' },
+      { event: 'message_chunk', role: 'assistant', content_type: 'text', content: 'Revenue' },
+      { event: 'subagent_followup_injected', content: 'Skip 2019' },
+      { event: 'message_chunk', role: 'assistant', content_type: 'text', content: 'Margins' },
+      { event: 'turn_start', content: 'Cover guidance' },
+    ])).toEqual([
+      ['Pull the 10-K', false],
+      ['Skip 2019', true],
+      ['Cover guidance', false],
+    ]);
+  });
+});
+
+describe('handleTaskSteeringAccepted: the steered flag', () => {
+  const accept = ({ steered, entries, pending }: {
+    steered: boolean;
+    entries?: Parameters<typeof handleTaskSteeringAccepted>[0]['entries'];
+    pending?: { inputId: string; content: string };
+  }) => {
+    const rt = makeRuntime();
+    const updateSubagentCard = vi.fn();
+    const refs = {
+      contentOrderCounterRef: { current: 0 },
+      currentReasoningIdRef: { current: null },
+      currentToolCallIdRef: { current: null },
+      subagentStateRefs: rt.subagentStateRefsRef.current,
+    };
+    if (pending) addPendingTaskInstruction({ taskId: 'task:t', ...pending, subagentStateRefs: refs.subagentStateRefs, updateSubagentCard });
+    handleTaskSteeringAccepted({ taskId: 'task:t', content: 'Focus on margins\nAlso cover 2024', entries, steered, refs, updateSubagentCard });
+    return refs.subagentStateRefs['task:t'].messages.filter((m) => m.role === 'user');
+  };
+  const TWO = [
+    { input_id: 'a1', content: 'Focus on margins', sender: 'user' as const },
+    { input_id: 'b2', content: 'Also cover 2024', sender: 'agent' as const },
+  ];
+
+  it('marks every instruction a steered delivery took, whoever sent it', () => {
+    const delivered = accept({ steered: true, entries: TWO });
+    expect(delivered.map((m) => [m.content, m.steeringDelivered])).toEqual([
+      ['Focus on margins', true],
+      ['Also cover 2024', true],
+    ]);
+  });
+
+  it('marks none when what it took is the instruction a run opens with', () => {
+    const delivered = accept({ steered: false, entries: TWO });
+    expect(delivered).toHaveLength(2);
+    expect(delivered.map((m) => m.steeringDelivered)).toEqual([undefined, undefined]);
+  });
+
+  it('marks a delivery that names no entries by its text', () => {
+    expect(accept({ steered: true })[0].steeringDelivered).toBe(true);
+    expect(accept({ steered: false })[0].steeringDelivered).toBeUndefined();
+  });
+
+  it('marks the bubble it confirms as it confirms it', () => {
+    const pending = { inputId: 'a1', content: 'Focus on margins' };
+    const [bubble] = accept({ steered: true, entries: [TWO[0]], pending });
+    expect(bubble).toMatchObject({ content: 'Focus on margins', isPending: false, steeringDelivered: true });
+    const [opening] = accept({ steered: false, entries: [TWO[0]], pending });
+    expect(opening.isPending).toBe(false);
+    expect(opening.steeringDelivered).toBeUndefined();
+  });
 });
 
 describe('projectSubagentHistory returned steering', () => {
@@ -332,7 +427,7 @@ describe('prependSubagentRuns', () => {
       refs,
       updateSubagentCard,
     });
-    handleTaskSteeringAccepted({ taskId: 'task:t', content: 'third', refs, updateSubagentCard });
+    handleTaskSteeringAccepted({ taskId: 'task:t', content: 'third', steered: false, refs, updateSubagentCard });
     stream('C');
     rt.subagentTokenUsageRef.current['task:t'] = { input: 13, output: 7, total: 20 };
 

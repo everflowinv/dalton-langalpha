@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import contextvars
 from collections.abc import Callable, Sequence
+from datetime import UTC, datetime
 from typing import Any
 
 import structlog
@@ -21,8 +22,10 @@ from ptc_agent.config.core import DaytonaConfig, PlatformSecretDefinition
 from ptc_agent.core.paths import DEFAULT_SANDBOX_ROOT
 from ptc_agent.core.sandbox._defaults import SANDBOX_FALLBACK_CPU
 from ptc_agent.core.sandbox.runtime import (
+    MetricSample,
     SandboxFailureKind,
     SandboxProvider,
+    SandboxRateLimitedError,
 )
 from ptc_agent.core.sandbox.platform_secrets import (
     ReconciledPlatformSecret,
@@ -37,6 +40,7 @@ from ptc_agent.core.sandbox.providers._image_recipe import (
     image_identity,
     image_steps,
 )
+from ptc_agent.core.sandbox.providers._metrics import normalize_samples
 from ptc_agent.core.sandbox.providers._tiers import TierChoice, resolve_tier
 from ptc_agent.core.sandbox.providers.daytona_runtime import DaytonaRuntime
 from ptc_agent.core.sandbox.providers.daytona_secrets import (
@@ -86,6 +90,7 @@ class DaytonaProvider(SandboxProvider):
     label = "Daytona"
     platform_secret_namespace_env = DaytonaConfig.ENV_FIELDS["secret_namespace"]
     scrubs_platform_secrets = True
+    reports_metrics = True
 
     def __init__(
         self,
@@ -182,6 +187,27 @@ class DaytonaProvider(SandboxProvider):
             sdk_sandbox,
             default_working_dir=self._working_dir,
         )
+
+    async def metrics_since(
+        self,
+        sandbox_id: str,
+        since: datetime,
+        *,
+        until: datetime | None = None,
+    ) -> list[MetricSample]:
+        # ``get`` is an API lookup that leaves a stopped sandbox stopped.
+        # History is the telemetry backend's aggregated buckets, kept 3 days.
+        # That backend has a rate limit of its own, far below the control
+        # plane's (measured 2026-10-23: about 40 reads at once, then about 1/s),
+        # and refuses with a bare DaytonaError whose 429 is only on its cause.
+        try:
+            sdk_sandbox = await self._client.get(sandbox_id)
+            raw = await sdk_sandbox.get_metrics(since, until or datetime.now(UTC))
+        except Exception as e:
+            if _daytona_error_status(e) == 429:
+                raise SandboxRateLimitedError(str(e).split("\n", 1)[0]) from e
+            raise
+        return normalize_samples(raw, since, until)
 
     async def close(self) -> None:
         try:

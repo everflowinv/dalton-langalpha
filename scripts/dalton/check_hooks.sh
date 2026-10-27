@@ -29,6 +29,7 @@ ALLOWED_HOOKS=(
   "llm-sdk-dispatch"
   "oauth-dispatch"
   "provider-kill-switch"
+  "native-compaction-lines"
   "native-oauth-ui"
   "sandbox-port-bind"
   "catalog-cache"
@@ -137,7 +138,11 @@ is_allowed() {
 }
 
 # Compute upstream merge-base (P0F.2: always compare against upstream/main merge-base or 8e0dce94)
-MERGE_BASE="$(git merge-base HEAD upstream/main 2>/dev/null || echo 8e0dce94)"
+if git rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then
+  MERGE_BASE="$(git merge-base MERGE_HEAD upstream/main 2>/dev/null || git rev-parse MERGE_HEAD)"
+else
+  MERGE_BASE="$(git merge-base HEAD upstream/main 2>/dev/null || echo 8e0dce94)"
+fi
 if [[ "$STRICT" -eq 1 ]]; then
   BASE_REF="$MERGE_BASE"
 else

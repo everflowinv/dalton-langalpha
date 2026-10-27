@@ -11,7 +11,7 @@ import { screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 
 import { renderWithProviders } from '@/test/utils';
-import type { UnsavedFile, WorkspaceQuota } from '@/types/api';
+import type { ComputerProviderOption, UnsavedFile, WorkspaceQuota } from '@/types/api';
 
 vi.mock('@/config/hostMode', () => ({
   HOST_MODE: 'platform',
@@ -38,6 +38,24 @@ const LOW_DISK = {
 const NOT_ON_PLAN: WorkspaceQuota = { performance: { used: 0, limit: 0 }, max: null, always_on: null };
 const ON_PLAN: WorkspaceQuota = { performance: { used: 0, limit: 2 }, max: null, always_on: null };
 
+// As `GET /computers/providers` lists them: Daytona runs three sizes, E2B four.
+const DAYTONA: ComputerProviderOption = {
+  kind: 'daytona',
+  is_default: true,
+  allowed: null,
+  tiers: [
+    { tier: 'standard', cpu: 1, memory_gib: 2, disk_gib: 5 },
+    { tier: 'performance', cpu: 2, memory_gib: 4, disk_gib: 10 },
+    { tier: 'max', cpu: 2, memory_gib: 8, disk_gib: 10 },
+  ],
+};
+const E2B: ComputerProviderOption = {
+  kind: 'e2b',
+  is_default: false,
+  allowed: true,
+  tiers: [...(DAYTONA.tiers ?? []), { tier: 'xlarge', cpu: 4, memory_gib: 8, disk_gib: 20 }],
+};
+
 function radio(name: string) {
   return screen.getByRole('radio', { name: new RegExp(`^${name}`) });
 }
@@ -53,14 +71,14 @@ describe('ChangeSpecDialog, seeding on a low-disk machine', () => {
       <ChangeSpecDialog target={LOW_DISK} onClose={() => {}} onSubmit={onSubmit} busy={false} quota={undefined} />,
     );
     // Before the quota lands the step up is the seed, as on a plan that allows it.
-    expect(radio('Performance')).toBeChecked();
+    expect(radio('Medium')).toBeChecked();
 
     rerender(
       <ChangeSpecDialog target={LOW_DISK} onClose={() => {}} onSubmit={onSubmit} busy={false} quota={NOT_ON_PLAN} />,
     );
-    expect(radio('Performance')).toBeDisabled();
-    expect(radio('Performance')).not.toBeChecked();
-    expect(radio('Standard')).toBeChecked();
+    expect(radio('Medium')).toBeDisabled();
+    expect(radio('Medium')).not.toBeChecked();
+    expect(radio('Small')).toBeChecked();
     expect(apply()).toBeDisabled();
     await userEvent.click(apply());
     expect(onSubmit).not.toHaveBeenCalled();
@@ -70,7 +88,7 @@ describe('ChangeSpecDialog, seeding on a low-disk machine', () => {
     renderWithProviders(
       <ChangeSpecDialog target={LOW_DISK} onClose={() => {}} onSubmit={() => {}} busy={false} quota={ON_PLAN} />,
     );
-    expect(radio('Performance')).toBeChecked();
+    expect(radio('Medium')).toBeChecked();
     expect(apply()).toBeEnabled();
   });
 
@@ -78,11 +96,11 @@ describe('ChangeSpecDialog, seeding on a low-disk machine', () => {
     const { rerender } = renderWithProviders(
       <ChangeSpecDialog target={LOW_DISK} onClose={() => {}} onSubmit={() => {}} busy={false} quota={undefined} />,
     );
-    await userEvent.click(radio('Max'));
+    await userEvent.click(radio('Large'));
     rerender(
       <ChangeSpecDialog target={LOW_DISK} onClose={() => {}} onSubmit={() => {}} busy={false} quota={NOT_ON_PLAN} />,
     );
-    expect(radio('Max')).toBeChecked();
+    expect(radio('Large')).toBeChecked();
     expect(apply()).toBeEnabled();
   });
 });
@@ -106,12 +124,12 @@ describe('ChangeSpecDialog, after an interrupted change', () => {
     renderWithProviders(
       <ChangeSpecDialog target={INTERRUPTED} onClose={() => {}} onSubmit={() => {}} busy={false} quota={ON_PLAN} />,
     );
-    expect(radio('Standard')).toBeChecked();
+    expect(radio('Small')).toBeChecked();
     // Current is the tier it runs at, not the one the row still names.
-    expect(radio('Standard')).toHaveAccessibleDescription(/^Current/);
-    expect(radio('Performance')).not.toHaveAccessibleDescription(/Current/);
+    expect(radio('Small')).toHaveAccessibleDescription(/^Current/);
+    expect(radio('Medium')).not.toHaveAccessibleDescription(/Current/);
     expect(apply()).toBeDisabled();
-    await userEvent.click(radio('Performance'));
+    await userEvent.click(radio('Medium'));
     expect(apply()).toBeEnabled();
   });
 });
@@ -123,14 +141,14 @@ describe('ChangeSpecDialog, the current tier', () => {
     renderWithProviders(
       <ChangeSpecDialog target={HEALTHY} onClose={() => {}} onSubmit={() => {}} busy={false} quota={ON_PLAN} />,
     );
-    expect(radio('Standard')).toBeChecked();
-    expect(radio('Standard')).toHaveAccessibleDescription(/^Current/);
-    expect(radio('Max')).not.toHaveAccessibleDescription(/Current/);
+    expect(radio('Small')).toBeChecked();
+    expect(radio('Small')).toHaveAccessibleDescription(/^Current/);
+    expect(radio('Large')).not.toHaveAccessibleDescription(/Current/);
     expect(apply()).toBeDisabled();
 
-    await userEvent.click(radio('Performance'));
+    await userEvent.click(radio('Medium'));
     expect(apply()).toBeEnabled();
-    await userEvent.click(radio('Standard'));
+    await userEvent.click(radio('Small'));
     expect(apply()).toBeDisabled();
   });
 
@@ -145,7 +163,111 @@ describe('ChangeSpecDialog, the current tier', () => {
         quota={quota}
       />,
     );
-    expect(radio('Performance')).toHaveAccessibleDescription(/^Current/);
-    expect(radio('Performance')).not.toHaveAccessibleDescription(/1 of 2 left/);
+    expect(radio('Medium')).toHaveAccessibleDescription(/^Current/);
+    expect(radio('Medium')).not.toHaveAccessibleDescription(/1 of 2 left/);
+  });
+});
+
+describe("ChangeSpecDialog, the provider's sizes", () => {
+  const HEALTHY = { ...LOW_DISK, disk: null };
+  const LARGE_LOW_DISK = { ...LOW_DISK, resource_tier: 'max' } as const;
+
+  it('describes each size with the machine the provider runs', () => {
+    renderWithProviders(
+      <ChangeSpecDialog target={HEALTHY} onClose={() => {}} onSubmit={() => {}} busy={false} provider={E2B} />,
+    );
+    expect(radio('Large')).toHaveAccessibleDescription(/^2 vCPU\s*·\s*8 GB RAM\s*·\s*10 GB disk$/);
+    expect(radio('Extra Large')).toHaveAccessibleDescription(/^4 vCPU\s*·\s*8 GB RAM\s*·\s*20 GB disk$/);
+  });
+
+  it('offers Extra Large only where the provider runs it', () => {
+    renderWithProviders(
+      <ChangeSpecDialog target={HEALTHY} onClose={() => {}} onSubmit={() => {}} busy={false} provider={DAYTONA} />,
+    );
+    expect(screen.getAllByRole('radio')).toHaveLength(3);
+    expect(screen.queryByRole('radio', { name: /^Extra Large/ })).not.toBeInTheDocument();
+  });
+
+  it('seeds a low-disk Large machine on the next size only where there is one', () => {
+    const { unmount } = renderWithProviders(
+      <ChangeSpecDialog target={LARGE_LOW_DISK} onClose={() => {}} onSubmit={() => {}} busy={false} provider={DAYTONA} />,
+    );
+    expect(radio('Large')).toBeChecked();
+    unmount();
+
+    renderWithProviders(
+      <ChangeSpecDialog target={LARGE_LOW_DISK} onClose={() => {}} onSubmit={() => {}} busy={false} provider={E2B} />,
+    );
+    expect(radio('Extra Large')).toBeChecked();
+  });
+
+  it('holds Extra Large when it is not on the plan, and says where to get it', () => {
+    renderWithProviders(
+      <ChangeSpecDialog
+        target={LARGE_LOW_DISK}
+        onClose={() => {}}
+        onSubmit={() => {}}
+        busy={false}
+        provider={E2B}
+        quota={{ ...ON_PLAN, xlarge: { used: 0, limit: 0 } }}
+      />,
+    );
+    expect(radio('Extra Large')).toBeDisabled();
+    expect(radio('Extra Large')).toHaveAccessibleDescription(/^Not on your plan/);
+    expect(radio('Large')).toBeChecked();
+    expect(screen.getByTestId('spec-plan-cta')).toBeInTheDocument();
+  });
+
+  it('seeds a low-disk Small machine on a Pro plan past the Medium it lacks to Large', () => {
+    renderWithProviders(
+      <ChangeSpecDialog
+        target={LOW_DISK}
+        onClose={() => {}}
+        onSubmit={() => {}}
+        busy={false}
+        provider={DAYTONA}
+        quota={{ ...NOT_ON_PLAN, max: { used: 0, limit: 1 }, xlarge: { used: 0, limit: 0 } }}
+      />,
+    );
+    expect(radio('Medium')).toBeDisabled();
+    expect(radio('Large')).toBeChecked();
+    expect(apply()).toBeEnabled();
+  });
+
+  it('does not tell a plan at the top size to upgrade for the sizes it leaves out', () => {
+    renderWithProviders(
+      <ChangeSpecDialog
+        target={HEALTHY}
+        onClose={() => {}}
+        onSubmit={() => {}}
+        busy={false}
+        provider={DAYTONA}
+        quota={{ ...NOT_ON_PLAN, max: { used: 0, limit: 0 }, xlarge: { used: 0, limit: 1 } }}
+      />,
+    );
+    expect(radio('Medium')).toBeDisabled();
+    expect(radio('Large')).toBeDisabled();
+    expect(screen.queryByTestId('spec-plan-cta')).not.toBeInTheDocument();
+  });
+
+  it('shows names alone and keeps the current size for a provider no longer offered', () => {
+    renderWithProviders(
+      <ChangeSpecDialog
+        target={{ ...HEALTHY, resource_tier: 'xlarge' }}
+        onClose={() => {}}
+        onSubmit={() => {}}
+        busy={false}
+        provider={undefined}
+      />,
+    );
+    expect(screen.getAllByRole('radio').map((r) => r.getAttribute('value'))).toEqual([
+      'standard',
+      'performance',
+      'max',
+      'xlarge',
+    ]);
+    expect(radio('Extra Large')).toBeChecked();
+    expect(radio('Extra Large')).toHaveAccessibleDescription(/^Current$/);
+    expect(radio('Small')).not.toHaveAccessibleDescription(/vCPU/);
   });
 });

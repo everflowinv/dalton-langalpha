@@ -494,3 +494,31 @@ async def test_a_retried_delete_is_logged_at_info(manager, caplog):
     [record] = [r for r in caplog.records if "accepted after" in r.getMessage()]
     assert record.levelno == logging.INFO
     assert "1 refusal" in record.getMessage()
+
+
+@pytest.mark.asyncio
+async def test_an_empty_machine_reads_its_metrics_before_its_session_deletes_it(
+    manager,
+):
+    order: list[str] = []
+    manager._claim_machine_for_stop = AsyncMock(return_value="claim")
+    manager._machine_has_active_tasks = AsyncMock(return_value=False)
+    manager._settle_machine_stop = AsyncMock()
+    manager._cancel_mcp_discovery = MagicMock()
+    manager._fold_usage_before_delete = AsyncMock(
+        side_effect=lambda computer_id: order.append(f"fold {computer_id}")
+    )
+    # The session's cleanup is what deletes a live sandbox.
+    manager._clear_session = AsyncMock(side_effect=lambda _c: order.append("delete"))
+    manager._destroy_sandbox = AsyncMock()
+
+    with (
+        patch(f"{_SPEC}.get_live_workspace_ids_for_computer", AsyncMock(return_value=[])),
+        patch(f"{_SPEC}.clear_computer_disk", AsyncMock()),
+        patch(f"{_SPEC}.SessionManager"),
+    ):
+        assert await manager._drop_empty_machine_sandbox(
+            {"computer_id": "c-1", "user_id": "u-1", "kind": "daytona"}, "sb-1"
+        )
+
+    assert order == ["fold c-1", "delete"]

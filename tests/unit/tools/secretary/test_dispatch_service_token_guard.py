@@ -30,6 +30,15 @@ _ORIGIN = {
 }
 
 
+def _owed() -> rb_executor.OwedAnalystReport:
+    return rb_executor.OwedAnalystReport(
+        origin=_ORIGIN,
+        dispatcher_thread_id=DISPATCHER_THREAD_ID,
+        ptc_thread_id=PTC_THREAD_ID,
+        final_status="completed",
+    )
+
+
 def _tool_call(args: dict, call_id: str = "call_test") -> dict:
     # ``state`` is what the graph injects; nothing here was approved in advance.
     return {"name": "delegate_to_analyst", "args": {**args, "state": {}}, "id": call_id, "type": "tool_call"}
@@ -145,9 +154,7 @@ async def test_report_back_drops_when_service_token_unset(monkeypatch):
         "aiohttp.ClientSession",
         MagicMock(side_effect=AssertionError("report-back HTTP must not run")),
     ):
-        status, run_id = await rb_executor._post_report_back(
-            cache, DISPATCHER_THREAD_ID, PTC_THREAD_ID, _ORIGIN, final_status="completed"
-        )
+        status, run_id = await rb_executor._post_report_back(cache, _owed())
 
     assert status == "drop"
     assert run_id is None
@@ -186,13 +193,7 @@ async def test_report_back_oss_mode_posts_without_token(monkeypatch):
 
     session = _FakeSession(_FakeResp(200, {"run_id": "rid-1"}))
     with patch("aiohttp.ClientSession", MagicMock(return_value=session)):
-        outcome = await rb_executor._post_report_back(
-            cache=None,
-            dispatcher_thread_id=DISPATCHER_THREAD_ID,
-            ptc_thread_id=PTC_THREAD_ID,
-            origin=_ORIGIN,
-            final_status="completed",
-        )
+        outcome = await rb_executor._post_report_back(None, _owed())
 
     assert outcome == ("dispatched", "rid-1")
     assert session.post_calls == 1

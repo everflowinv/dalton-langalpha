@@ -898,6 +898,7 @@
             "x-dashscope-session-cache": "enabled"
           },
           "region": "intl",
+          "own_api_key": true,
           "display_name": "DashScope (Intl)"
         }
       }
@@ -930,7 +931,9 @@
       "variants": {
         "moonshot-coding": {
           "base_url": "https://api.kimi.com/coding",
+          "env_key": "MOONSHOT_CODING_API_KEY",
           "access_type": "coding_plan",
+          "own_api_key": true,
           "operator_channel": null
         }
       }
@@ -977,7 +980,8 @@
         "minimax-coding": {
           "base_url": "https://api.minimax.io/anthropic",
           "env_key": "MINIMAX_CODING_API_KEY",
-          "access_type": "coding_plan"
+          "access_type": "coding_plan",
+          "own_api_key": true
         }
       }
     },

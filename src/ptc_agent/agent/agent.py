@@ -411,6 +411,7 @@ class PTCAgent:
             create_execute_bash_tool,
             backend,
             thread_id=short_thread_id,
+            session=session,
             call_context=call_context,
             file_tools_only=file_tools_only,
         )
@@ -715,6 +716,7 @@ class PTCAgent:
             registry=_bg_registry,
             checkpointer=checkpointer,
             namespace_owner=namespace_owner,
+            subagent_models=self.config.subagent_models,
         )
         main_only_middleware.append(background_middleware)
         if not disable_subagents:

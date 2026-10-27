@@ -9,7 +9,8 @@ import { mediumTime } from '@/lib/format';
 import { useNow } from '@/hooks/useNow';
 import { DURATION } from '@/lib/motion';
 import { cn } from '@/lib/utils';
-import { DispatchStatusGlyph, DispatchStatusIndicator, LiveSpinner } from '../dispatchStatusUi';
+import { DispatchStatusGlyph, DispatchStatusIndicator } from '../dispatchStatusUi';
+import { RunGlyph } from '../messageList/runCard';
 import type { PTCDispatchStatus } from '../../hooks/usePTCDispatchStatus';
 import { useOpenDispatchedThread, type DispatcherContext } from '../../hooks/useOpenDispatchedThread';
 import type { WakeupList } from '@/types/wakeups';
@@ -275,7 +276,7 @@ export function TrayDock({ ref, phase, contents, onOpen }: TrayDockProps) {
         )}
       >
         {contents.watch && <PulseDot />}
-        {working && <LiveSpinner />}
+        {working && <RunGlyph kind="live" />}
         <ChevronUp aria-hidden="true" className="h-3 w-3 shrink-0" />
       </span>
     </button>
@@ -334,7 +335,7 @@ export function ReconnectingChip() {
   // The gap is a translate: the stack's sibling gap zeroes a bottom margin.
   return (
     <div className={cn(CHIP, 'absolute bottom-full left-4 -translate-y-2')} role="status" aria-live="polite">
-      <LiveSpinner />
+      <RunGlyph kind="live" />
       {t('chat.reconnecting', 'Reconnecting…')}
     </div>
   );
@@ -343,7 +344,7 @@ export function ReconnectingChip() {
 function StatusChip({ label }: { label: string }) {
   return (
     <div className={CHIP} role="status" aria-live="polite">
-      <LiveSpinner />
+      <RunGlyph kind="live" />
       <span className="truncate">{label}</span>
     </div>
   );
@@ -360,7 +361,7 @@ function ListChip({ label, heading, title, working, children }: { label: string;
     <Popover>
       <PopoverTrigger asChild>
         <button type="button" className={cn(CHIP_BUTTON, 'group')} title={title}>
-          {working && <LiveSpinner />}
+          {working && <RunGlyph kind="live" />}
           <span>{label}</span>
           <ChevronUp aria-hidden="true" className="h-3 w-3 shrink-0 transition-transform group-data-[state=open]:rotate-180" />
         </button>
@@ -453,7 +454,7 @@ function AnalystsChip({ threads, from }: { threads: RosterAnalyst[]; from: Dispa
       : (name ?? t('agents.tray.analysts', { count: 1 }));
     return (
       <button type="button" className={CHIP_BUTTON} title={thread.title ?? undefined} onClick={() => openThread(thread)}>
-        {thread.running ? <LiveSpinner /> : thread.status && <DispatchStatusGlyph status={thread.status} />}
+        {thread.running ? <RunGlyph kind="live" /> : thread.status && <DispatchStatusGlyph status={thread.status} />}
         <span className="max-w-64 truncate">{label}</span>
         <ArrowUpRight aria-hidden="true" className="h-3 w-3 shrink-0" />
       </button>

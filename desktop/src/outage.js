@@ -2,7 +2,7 @@
 
 const path = require('node:path')
 const { pathToFileURL } = require('node:url')
-const { BrowserWindow, ipcMain, net, shell } = require('electron')
+const { ipcMain, net, shell } = require('electron')
 
 const config = require('./config')
 const store = require('./store')
@@ -10,6 +10,7 @@ const theme = require('./theme')
 const { probe } = require('./probe')
 const captive = require('./captive')
 const { forDisplay } = require('./redact')
+const { senderWindow } = require('./sender')
 
 // ---------------------------------------------------------------------------
 // The outage page.
@@ -340,8 +341,7 @@ function registerIpc({ onRetry }) {
  * that does not depend on the renderer behaving.
  */
 function showingWindow(event) {
-  const win = BrowserWindow.fromWebContents(event.sender)
-  return win && isShowing(win) ? win : null
+  return senderWindow(event, isShowing)
 }
 
 module.exports = {

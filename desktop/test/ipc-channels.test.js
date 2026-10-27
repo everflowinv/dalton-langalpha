@@ -50,9 +50,9 @@ describe('ipc channels', () => {
     // empty and every assertion below vacuously true. The floors are today's
     // counts on purpose: they only ever rise, and deliberately removing a
     // channel should land whoever did it in this file.
-    assert.ok(remote.size >= 8, `found only ${remote.size} channels in the remote preload`)
+    assert.ok(remote.size >= 11, `found only ${remote.size} channels in the remote preload`)
     assert.ok(setup.size >= 3, `found only ${setup.size} channels in the setup preload`)
-    assert.ok(handled.size >= 11, `found only ${handled.size} handled channels`)
+    assert.ok(handled.size >= 14, `found only ${handled.size} handled channels`)
   })
 
   test('every channel a renderer invokes has a handler', () => {
@@ -81,6 +81,16 @@ describe('ipc channels', () => {
     // feature detection: a missing one degrades to "no listener" and sends every
     // desktop connect down the hosted path, silently.
     for (const c of ['shell:mcp-oauth-begin', 'shell:mcp-oauth-bind', 'shell:mcp-oauth-cancel']) {
+      assert.ok(remote.has(c), `${c} is not invoked by the remote preload`)
+      assert.ok(handled.has(c), `${c} has no handler`)
+    }
+  })
+
+  test('so are the three remote control rests on', () => {
+    // The web feature-detects these by method name and offers "This Mac" only
+    // when they answer, so a channel spelled differently on one side is a
+    // feature that silently never appears.
+    for (const c of ['shell:remote-control-status', 'shell:remote-control-enable', 'shell:remote-control-disable']) {
       assert.ok(remote.has(c), `${c} is not invoked by the remote preload`)
       assert.ok(handled.has(c), `${c} has no handler`)
     }

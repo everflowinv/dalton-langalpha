@@ -124,12 +124,8 @@ class TestCreateDaytonaConfig:
             cfg = DaytonaConfig.from_section(dict(_REQUIRED))
         assert cfg.host_unavailable_rebuild_after_minutes == 60
 
-    def test_over_ceiling_tier_is_clamped_and_logged(self, caplog):
-        """A tier above the org ceiling is clamped to it, with a warning."""
-        import logging
-
-        from ptc_agent.config.core import RESOURCE_TIER_CEILING
-
+    def test_a_tier_above_the_ceiling_is_refused(self):
+        """A size Daytona cannot build fails the load rather than shrinking."""
         data = {
             "base_url": "https://test.daytona.io/api",
             "auto_stop_interval": 1800,
@@ -138,19 +134,12 @@ class TestCreateDaytonaConfig:
             "python_version": "3.11",
             "resource_tiers": {
                 "standard": {"cpu": 1, "memory": 1, "disk": 3},
-                "huge": {"cpu": 32, "memory": 64, "disk": 100},
+                "huge": {"cpu": 4, "memory": 8, "disk": 20},
             },
         }
         with patch.dict(os.environ, {"DAYTONA_API_KEY": "test-key"}):
-            with caplog.at_level(logging.WARNING):
-                cfg = DaytonaConfig.from_section(data)
-        huge = cfg.resource_tiers["huge"]
-        assert (huge.cpu, huge.memory, huge.disk) == (
-            RESOURCE_TIER_CEILING["cpu"],
-            RESOURCE_TIER_CEILING["memory"],
-            RESOURCE_TIER_CEILING["disk"],
-        )
-        assert any("exceeds the org ceiling" in r.message for r in caplog.records)
+            with pytest.raises(ValueError, match=r"resource_tiers\['huge'\].*disk=20 \(max 10\)"):
+                DaytonaConfig.from_section(data)
 
     def test_tier_fields_default_when_absent(self):
         """No tier keys in yaml → the DaytonaConfig defaults apply untouched."""

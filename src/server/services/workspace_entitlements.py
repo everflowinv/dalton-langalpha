@@ -155,6 +155,8 @@ class WorkspaceEntitlementsMixin:
         fresh = replace(fresh, resource_tier=entitled_tier)
         sandbox_id = fresh.provider_ref
         if sandbox_id:
+            # Daytona's metric history goes with the sandbox.
+            await self._fold_usage_before_delete(computer_id)
             try:
                 await self._destroy_sandbox(sandbox_id, binding=fresh)
             except Exception as e:
@@ -163,6 +165,7 @@ class WorkspaceEntitlementsMixin:
                     f"for computer {computer_id}; replacement aborted: {e}"
                 )
                 raise
+            await self._end_replaced_usage_run(computer_id, sandbox_id)
         if self._cached_session(computer_id) is session:
             await self._clear_session(computer_id, evict_session=session)
         # _clear_session clears pending_lazy_sync; re-arm it so a recovery

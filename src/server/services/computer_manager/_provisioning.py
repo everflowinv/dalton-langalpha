@@ -131,6 +131,7 @@ class ProvisioningMixin:
     ) -> None:
         computer_id = binding.computer_id
         durable_sandbox_id = binding.provider_ref
+        await self._fold_usage_before_delete(computer_id)
         if session is not None and attached_sandbox_id != durable_sandbox_id:
             # Cleanup would delete a stale handle's sandbox, which this machine does not own.
             await self._retire_session(
@@ -1441,6 +1442,9 @@ class ProvisioningMixin:
         # After claiming, every failure must release starting; new starts can claim
         # only stopped, so an uncompensated exit strands the workspace.
         try:
+            # Before the cleanup, which deletes the sandbox and Daytona's
+            # metric history with it.
+            await self._fold_usage_before_delete(binding.computer_id)
             self._drop_session(binding.computer_id)
             try:
                 await SessionManager.cleanup_session(binding.computer_id)
@@ -1455,6 +1459,7 @@ class ProvisioningMixin:
                     )
                 else:
                     raise
+            await self._end_replaced_usage_run(binding.computer_id, old_sandbox_id)
 
             core_config = self._core_config_for(binding)
             new_session = await self._recover_sandbox(binding, user_id, core_config)

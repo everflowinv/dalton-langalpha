@@ -1535,6 +1535,20 @@ _STEER_HELD_SQL = """({a}.payload ? 'steered_run_id' AND (
     )
 ))"""
 
+# The run that took a steer in, as text, else NULL: the turn it became
+# (``claim_steer_for_turn``, or its executor's ``finish_claimed_steer``), the
+# run that read it (``confirm_jobs``), or a running turn holding it for its
+# next model call. A hold counts as taken, but a release or its run's ending
+# without reading it hands the steer back, so taken can turn queued again.
+_STEER_TAKER_SQL = (
+    "(CASE WHEN {a}.payload->>'outcome' = 'turn'"
+    " THEN {a}.payload->>'dispatched_run_id'"
+    " WHEN {a}.payload->>'outcome' = 'delivered'"
+    " THEN {a}.payload->>'steered_run_id'"
+    " WHEN " + _LIVE_STEER_SQL + " AND " + _STEER_HELD_SQL
+    + " THEN {a}.payload->>'steered_run_id' END)"
+)
+
 # What a live agent may take in: live, held by no live agent, not yet the input
 # of a turn of its own. A claimed row is taken from its executor (whose fenced
 # writes then miss). A chat-app steer belongs to the gateway, which resubmits
@@ -2328,6 +2342,11 @@ _THREAD_STEERS_SQL = (
 # from a surface langalpha draws, which also carries a ``platform``.
 _IS_PLATFORM_SQL = "COALESCE((o.payload->>'chat_app')::boolean, false)"
 _IS_USER_SQL = "COALESCE(o.payload->>'sender', 'user') = 'user'"
+# A hand-off: an agent's steer to the thread.
+_HAND_OFF_STEER_SQL = (
+    "(o.hook_type = 'steer' AND " + _steer_sql(_TARGET_SQL) + " = 'thread'"
+    " AND NOT " + _IS_USER_SQL + ")"
+)
 # A user's steer that a stop answered without (``keep_unanswered_steers``).
 _KEPT_BY_STOP_SQL = (
     "COALESCE(o.payload->>'kept_by_stop' = %(run_id)s::text, false)"
@@ -2744,6 +2763,26 @@ async def list_pending_steers(thread_id: str) -> List[Dict[str, Any]]:
                 {"okey": steer_ordering_key(thread_id)},
             )
             return [_returned_entry(dict(r)) for r in await cur.fetchall()]
+
+
+async def list_taken_hand_offs(thread_id: str, run_ids: List[str]) -> List[str]:
+    """Ids of the hand-offs on the thread that one of ``run_ids`` took in
+    (``_STEER_TAKER_SQL``), oldest first."""
+    if not run_ids:
+        return []
+    async with pool.get_db_connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                f"""
+                SELECT o.hook_outbox_id FROM hook_outbox o
+                WHERE o.ordering_key = %(okey)s
+                  AND {_HAND_OFF_STEER_SQL}
+                  AND {_steer_sql(_STEER_TAKER_SQL)} = ANY(%(runs)s::text[])
+                ORDER BY o.created_at, o.hook_outbox_id
+                """,
+                {"okey": steer_ordering_key(thread_id), "runs": list(run_ids)},
+            )
+            return [str(r[0]) for r in await cur.fetchall()]
 
 
 # ---------------------------------------------------------------------------

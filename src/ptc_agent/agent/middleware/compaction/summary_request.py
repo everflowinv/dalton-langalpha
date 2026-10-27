@@ -43,30 +43,10 @@ logger = logging.getLogger(__name__)
 
 _COMPACTION_USER_NUDGE = "Generate the summary now."
 
-# Summarization prompt. Instructions only: the conversation
-# history is delivered in a separate HumanMessage so the system channel stays
-# bounded and cacheable, and so BaseChatModel.format() doesn't try to interpret
-# message content as further format placeholders.
-DEFAULT_SUMMARY_PROMPT = """<role>
-Conversation Context Summarizer
-</role>
-
-<context>
-You're nearing your input token limit. The conversation history in the user
-message will be replaced with the context you extract. This is critical -
-ensure you capture all important information so you can continue the work
-without losing progress.
-
-The most recent messages are not in this history: they stay in context, word
-for word, right after your summary, so the work may have moved on from where
-this history ends. Describe unfinished work as where it stood at that point,
-not as still to do.
-</context>
-
-<objective>
+# What a summary holds, whoever writes it.
+_SUMMARY_BODY = """<objective>
 Extract the most important context to preserve continuity and prevent
-repeating completed work. Think deeply about what information is essential to
-achieving the user's overall goal.
+repeating completed work.
 </objective>
 
 <instructions>
@@ -110,6 +90,50 @@ Make sure you maintain the user original query and goal.
 Then organize naturally using markdown headers.
 Write as if briefing a colleague who needs to continue your work without repeating what's done.
 </output_format>"""
+
+# The transcript summarizer's prompt. Instructions only: the conversation
+# history is delivered in a separate HumanMessage so the system channel stays
+# bounded and cacheable, and so BaseChatModel.format() doesn't try to interpret
+# message content as further format placeholders.
+DEFAULT_SUMMARY_PROMPT = (
+    """<role>
+Conversation Context Summarizer
+</role>
+
+<context>
+You're nearing your input token limit. The conversation history in the user
+message will be replaced with the context you extract. This is critical -
+ensure you capture all important information so you can continue the work
+without losing progress.
+
+The most recent messages are not in this history: they stay in context, word
+for word, right after your summary, so the work may have moved on from where
+this history ends. Describe unfinished work as where it stood at that point,
+not as still to do.
+</context>
+
+"""
+    + _SUMMARY_BODY
+)
+
+# The prompt for the model that holds the conversation, which summarizes it in
+# place (a provider's own compaction): no role of its own, since it is still
+# the agent, and the history is the conversation above, not a user message.
+NATIVE_SUMMARY_PROMPT = (
+    """<context>
+You're nearing your context limit. Everything above will be replaced by the
+summary you write now, so capture all you need to continue the work without
+losing progress.
+
+The most recent messages are not above: they stay in context, word for word,
+right after your summary, so the work may have moved on from where this
+conversation ends. Describe unfinished work as where it stood at that point,
+not as still to do.
+</context>
+
+"""
+    + _SUMMARY_BODY
+)
 
 # Appended only when the history carries transcript markers: without a
 # transcript there is no file to cite, and an instruction to cite one would

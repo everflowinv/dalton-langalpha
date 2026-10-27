@@ -33,6 +33,7 @@ from langchain_core.runnables.base import RunnableBindingBase
 from langgraph.constants import TAG_NOSTREAM
 
 from src.llms.content_utils import format_llm_content
+from src.llms.provider_compaction import is_opaque
 
 from ptc_agent.agent.middleware.compaction.model import max_input_tokens
 from ptc_agent.agent.middleware.compaction.summary_request import trim_for_summary
@@ -50,13 +51,13 @@ from ptc_agent.agent.transcript.steer_text import report_text, sender_name, sent
 
 logger = logging.getLogger(__name__)
 
-SummarySource = Literal["model", "fallback", "server"]
+SummarySource = Literal["provider", "model", "fallback", "server"]
 
 #: The summary model's share of the budget when another model waits behind
 #: it, so a hung summary model still leaves the fallback a real call. A
 #: model still writing at the end of its share goes on: what it wrote would
 #: be lost, and the fallback would start over in what is left.
-_FIRST_SHARE = 2 / 3
+FIRST_SHARE = 2 / 3
 #: How long a model that has begun writing may go without a chunk past its
 #: share before it is taken for hung. Mid-summary gaps measure seconds.
 _STALL_S = 60.0
@@ -83,6 +84,14 @@ _LEAD = (
     "it, and the tool calls in between are left out."
 )
 _LEAD_TRANSCRIPT = " The transcript described at the end keeps them in full."
+#: The lead of a digest written beside a provider's own compaction, which only
+#: that provider can read, for every other reader.
+PROVIDER_LEAD = (
+    "The earlier conversation was compacted into an encrypted summary that "
+    "only the model that wrote it can read. What follows is a plain record of "
+    "it instead: each request followed by the last reply to it, with the tool "
+    "calls in between left out."
+)
 
 
 @dataclass(frozen=True)
@@ -93,6 +102,12 @@ class Summary:
     #: are read from: the trimmed stretch a model was sent, or the turns the
     #: server copied without a cut.
     covered: list[AnyMessage]
+    #: What a provider's own compaction answered with (see
+    #: ``src.llms.provider_compaction.native_answer``), and the route that
+    #: wrote it. Claude's block holds ``text``; OpenAI's items hold nothing
+    #: readable, so ``text`` is a digest of the same messages.
+    native: dict[str, Any] | None = None
+    origin: str | None = None
 
 
 #: Given the most tokens a model's window leaves for the history (None when
@@ -173,7 +188,7 @@ async def awrite_summary(
         if remaining <= 0:
             logger.warning("[Compaction] no time left for the %s summary", source)
             break
-        share = remaining * _FIRST_SHARE if len(candidates) > 1 and source == "model" else remaining
+        share = remaining * FIRST_SHARE if len(candidates) > 1 and source == "model" else remaining
         try:
             # Each attempt counts from zero: the count is the summary's size.
             covered, response = await _attempt(
@@ -255,12 +270,13 @@ def server_summary(
     raw_messages: Sequence[AnyMessage],
     turns: TranscriptTurns | None,
     window: Window,
+    lead: str = _LEAD,
 ) -> Summary:
     """A summary built without a model: each request and the reply to it,
     the newest first to stay when they do not all fit, plus an earlier
     summary and the todo list. ``turns`` is set when the transcript is
     readable, and names the file each turn is in. ``window`` is what was
-    trimmed from the head of ``raw_messages``."""
+    trimmed from the head of ``raw_messages``. ``lead`` says why."""
     head = list(to_summarize[:1]) if to_summarize and is_summary_message(to_summarize[0]) else []
     numbers = (
         turns.turns if turns is not None else message_turns(raw_messages, base=window.runs)
@@ -275,7 +291,7 @@ def server_summary(
         # last, so it keeps its end where a model's summary, which opens on
         # the goal, keeps its start.
         text = parse_summary_message(head[0])
-        by_server = summary_source(head[0]) == "server"
+        by_server = summary_source(head[0]) == "server" or is_opaque(head[0])
         body = text.partition("\n\n")[2] if by_server else text
         cut = (_cut_start if by_server else _cut)(body, _EARLIER_CHARS)
         if cut == body and head[0].id:
@@ -311,7 +327,7 @@ def server_summary(
     if todos:
         sections.append(f"## Todo list\n{_cut(todos, _TODO_CHARS)}")
 
-    lead = _LEAD + (_LEAD_TRANSCRIPT if turns is not None else "")
+    lead += _LEAD_TRANSCRIPT if turns is not None else ""
     return Summary(
         "\n\n".join([lead, *sections]),
         "server",

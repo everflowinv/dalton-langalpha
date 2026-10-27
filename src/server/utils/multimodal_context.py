@@ -9,8 +9,10 @@ import asyncio
 import base64
 import logging
 import uuid
+from collections.abc import Collection
 from typing import Any, Dict, List, Optional, Tuple
 
+from ptc_agent.agent.middleware.file_operations.image_fit import usable_image
 from ptc_agent.core.project_context import ProjectContext
 
 from src.server.models.additional_context import MultimodalContext
@@ -94,6 +96,34 @@ async def build_attachment_metadata(
         return meta
 
     return list(await asyncio.gather(*(_process(ctx) for ctx in contexts)))
+
+
+async def find_unreadable_images(
+    contexts: List[MultimodalContext],
+    accepted: frozenset[str],
+) -> List[MultimodalContext]:
+    """Image attachments that can't reach a route taking ``accepted`` as images.
+
+    What Pillow decodes can, the call-time fit converting a format the route
+    does not take; so can a HEIC or HEIF the route takes as is. Off the event
+    loop, since each file is decoded in full.
+    """
+
+    def scan() -> List[MultimodalContext]:
+        unreadable = []
+        for ctx in contexts:
+            if not ctx.data.startswith("data:image/"):
+                continue
+            try:
+                raw = base64.b64decode(ctx.data.split(",", 1)[1])
+            except (ValueError, IndexError):
+                unreadable.append(ctx)
+                continue
+            if not usable_image(raw, accepted):
+                unreadable.append(ctx)
+        return unreadable
+
+    return await asyncio.to_thread(scan)
 
 
 def inject_multimodal_context(
@@ -244,6 +274,7 @@ def _ext_from_desc(desc: str) -> str:
 def filter_multimodal_by_capability(
     contexts: list,
     modalities: list[str],
+    unreadable: Collection = (),
 ) -> Tuple[list, list, list]:
     """Filter multimodal contexts by model capabilities.
 
@@ -252,25 +283,32 @@ def filter_multimodal_by_capability(
     because no model can consume them natively — they always require sandbox
     processing via Python.
 
+    An image in ``unreadable`` (see :func:`find_unreadable_images`) goes with
+    them on every model: the route can't be given it as a content block, and in
+    the sandbox the agent can still convert it.
+
     Args:
         contexts: List of MultimodalContext objects (or dicts with a ``data`` key).
         modalities: List of modality strings the model supports (e.g.
             ``["text", "image", "pdf"]``).
+        unreadable: Image items the route can't be given as images.
 
     Returns:
         Tuple of (supported, unsupported, file_only).
 
         - **supported**: image/PDF items the model handles natively.
         - **unsupported**: image/PDF items the model cannot handle.
-        - **file_only**: non-image/non-PDF items (always need sandbox + Python).
+        - **file_only**: non-image/non-PDF items (always need sandbox + Python)
+          and unreadable images.
     """
     supported: list = []
     unsupported: list = []
     file_only: list = []
+    undecodable = {id(ctx) for ctx in unreadable}
     for ctx in contexts:
         data = ctx.data if hasattr(ctx, "data") else ctx.get("data", "")
         is_pdf = data.startswith("data:application/pdf")
-        is_image = data.startswith("data:image/")
+        is_image = data.startswith("data:image/") and id(ctx) not in undecodable
         if is_pdf or is_image:
             needed = "pdf" if is_pdf else "image"
             if needed in modalities:

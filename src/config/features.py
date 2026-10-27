@@ -146,6 +146,25 @@ FEATURES: dict[str, FeatureSpec] = {
             "own files."
         ),
     ),
+    "provider_compaction": FeatureSpec(
+        key="provider_compaction",
+        label="Provider compaction",
+        description=(
+            "When a long thread is compacted, Claude and OpenAI models "
+            "summarize it with their provider's own compaction rather than "
+            "ours, which keeps more of what they knew: Claude keeps its "
+            "reasoning in the turns it keeps. To turn it off for one model "
+            "only, use Per-model settings on the Model tab."
+        ),
+        enabled=True,
+        gate=FeatureGate.OPT_OUT,
+        tradeoffs=(
+            "OpenAI's summary is encrypted, so only OpenAI models can read it "
+            "and the compaction card shows a plain record of the conversation "
+            "instead. Switch such a thread to another provider's model and it "
+            "gets that record, which leaves out the earlier tool results."
+        ),
+    ),
     "a_share_pack": FeatureSpec(
         key="a_share_pack",
         label="A-share market pack",

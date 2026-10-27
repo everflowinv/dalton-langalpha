@@ -530,6 +530,22 @@ describe('buildVisibleModels', () => {
     expect(rawMetadata['model-shared'].display_name).toBe('Model Shared');
   });
 
+  it('a shadowing custom entry offers no provider compaction', () => {
+    // The server compacts natively only on a client carrying the manifest's
+    // own request settings, which a custom entry never inherits, so the
+    // settings must not offer a choice that does nothing.
+    const rawApiModels = { 'parent-prov': { models: ['model-shared'], display_name: 'Parent' } };
+    const rawMetadata: Record<string, ModelMetadataEntry> = {
+      'model-shared': { provider: 'parent-prov', native_compaction: 'anthropic', prompt_guidance: 'lean' },
+    };
+    const customModels = [{ name: 'model-shared', model_id: 'model-shared', provider: 'byok-variant' }];
+
+    const result = buildVisibleModels(rawApiModels, rawMetadata, customModels, {}, null, []);
+
+    expect(result.metadata['model-shared'].native_compaction).toBeUndefined();
+    expect(result.metadata['model-shared'].prompt_guidance).toBe('lean');
+  });
+
   it('platform mode: filters by tier, custom models pass', () => {
     const rawApiModels = {
       openai: { models: ['gpt-4o', 'gpt-4o-mini'], display_name: 'OpenAI' },

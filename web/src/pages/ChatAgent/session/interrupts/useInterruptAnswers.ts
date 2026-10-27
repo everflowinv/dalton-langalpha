@@ -7,7 +7,7 @@
 
 import { useCallback, useMemo } from 'react';
 import type { HitlDecisionBody, HitlResponseBody, HitlResumeEntry } from '@/types/api';
-import type { AssistantMessage, ToolApprovalPosition } from '@/types/chat';
+import type { AssistantMessage, PTCAgentProposalState, ToolApprovalPosition } from '@/types/chat';
 import type { ReportBackWatch } from '../../hooks/useReportBackWatch';
 import type { PendingInterrupt, SetMessages } from '../types';
 import type { AnswerBoard } from './answerBoard';
@@ -85,7 +85,7 @@ export function useInterruptAnswers({
   // The clicked PTC card supplies its own proposal and interrupt ids, for the
   // same reason the board exists.
   const handleApprovePTCAgent = useCallback((
-    pad?: Record<string, unknown>,
+    proposal?: PTCAgentProposalState,
     overrides?: { report_back?: boolean },
     proposalId?: string,
     interruptId?: string,
@@ -95,7 +95,7 @@ export function useInterruptAnswers({
     // The resumed stream's tool_call_result backfills the dispatched thread
     // onto this card. The id comes from the card's own proposal data, so it
     // stays right under parallel dispatches.
-    const toolCallId = pad?.tool_call_id as string | undefined;
+    const toolCallId = proposal?.tool_call_id;
     if (toolCallId) {
       pendingPTCBackfillRef.current.set(toolCallId, proposalId);
     }
@@ -117,7 +117,7 @@ export function useInterruptAnswers({
   }, [collectHitlResponseAndMaybeResume, setMessages, pendingPTCBackfillRef, armReportBackWatch, threadIdRef]);
 
   const handleRejectPTCAgent = useCallback((
-    _pad?: Record<string, unknown>,
+    _proposal?: PTCAgentProposalState,
     proposalId?: string,
     interruptId?: string,
   ) => {

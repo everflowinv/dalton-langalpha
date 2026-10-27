@@ -329,6 +329,7 @@ async def execute(
             code_hash=code_hash,
             charts=charts,
             mcp_trace=mcp_trace,
+            exit_code=exit_code,
         )
 
         # Auto-install missing packages and retry if enabled

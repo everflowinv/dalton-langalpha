@@ -49,13 +49,15 @@ def analyst_request_key(job_id: str) -> str:
 
 @dataclass(frozen=True)
 class OwedAnalystReport:
-    """An analyst's report still owed: the origin it reports under and the
-    thread it reports to."""
+    """An analyst's report still owed: the origin it reports under, the
+    thread it reports to, and the run it reports on, as its finalize left
+    it."""
 
     origin: dict
     dispatcher_thread_id: str
     ptc_thread_id: str
     final_status: str
+    run_id: str | None = None
 
     def steerable_into(self, thread_id: str) -> bool:
         """Whether a live turn on ``thread_id`` can take this report in. A
@@ -170,12 +172,8 @@ async def analyst_report_verdict(cache, job: dict) -> OwedAnalystReport | NotOwe
     # Already terminal-cleared (duplicate completion event, or a reclaimed job
     # whose summary turn already finished and watch-cleared): nothing to do.
     if not await cache.client.sismember(watch_key(dispatcher_thread_id), ptc_thread_id):
-        return _not_owed(
-            "its pair was already cleared",
-            dispatcher_thread_id=dispatcher_thread_id,
-            ptc_thread_id=ptc_thread_id,
-            dispatch_gen=effective_gen,
-        )
+        return NotOwed("its pair was already cleared", wake=False)
+    run_id = job.get("run_id")
     return OwedAnalystReport(
         origin=origin,
         dispatcher_thread_id=dispatcher_thread_id,
@@ -183,6 +181,7 @@ async def analyst_report_verdict(cache, job: dict) -> OwedAnalystReport | NotOwe
         # Rows enqueued before the field existed carry none, and only
         # completed runs were enqueued then.
         final_status=payload.get("final_status") or "completed",
+        run_id=str(run_id) if run_id else None,
     )
 
 
@@ -359,15 +358,11 @@ async def execute_report_back(job: dict) -> None:
             origin.pop(pointer.AWAITING_RESUME_FIELD, None)
         outcome, rb_run_id = await _post_report_back(
             cache,
-            dispatcher_thread_id,
-            ptc_thread_id,
-            origin,
+            owed,
             request_key=job_request_key,
             heartbeat=_fence,
             dispatch_gen=dispatch_gen,
-            final_status=final_status,
             still_due=_still_due,
-            run_id=analyst_run_id,
             resumable=resumable,
         )
 
@@ -600,14 +595,55 @@ _OUTCOME_INSTRUCTIONS = {
 }
 
 
+async def _reported_runs(ptc_thread_id: str, run_id) -> list[str]:
+    """The reported run and the interrupted runs it continued, oldest first.
+    A read that fails or finds nothing names the reported run alone rather
+    than hold the report."""
+    if not run_id:
+        return []
+    from src.server.database.runs import lifecycle as tl_db
+
+    try:
+        chain = await tl_db.get_continued_runs(ptc_thread_id, str(run_id))
+    except Exception:
+        logger.debug(
+            f"[HANDOFF_REPORT_BACK] Could not read the runs {run_id} continued",
+            exc_info=True,
+        )
+        chain = []
+    return chain or [str(run_id)]
+
+
+async def _taken_hand_offs(
+    ptc_thread_id: str, run_ids: list[str]
+) -> list[str] | None:
+    """The hand-off steers ``run_ids`` took in, oldest first. None when that
+    is unknown, with no run to ask about or a read that failed, since a view
+    takes any list as final and could then never match a steered hand-off
+    to this report; the report goes all the same."""
+    if not run_ids:
+        return None
+    from src.server.database.runs import outbox as outbox_db
+
+    try:
+        return await outbox_db.list_taken_hand_offs(ptc_thread_id, run_ids)
+    except Exception:
+        logger.debug(
+            f"[HANDOFF_REPORT_BACK] Could not read the hand-offs {run_ids} took in",
+            exc_info=True,
+        )
+        return None
+
+
 async def report_message(
-    ptc_thread_id: str,
-    origin: dict,
-    final_status: str,
+    owed: OwedAnalystReport,
     *,
     steered: bool = False,
-    run_id: str | None = None,
+    # DALTON-HOOK(handoff-keep-on-resumable): a caller that already evaluated
+    # the resumable verdict (the executor and steer both stamp awaiting_resume
+    # off it) hands it in; None evaluates it here from the run row.
     resumable: bool | None = None,
+
 ) -> tuple[str, "AnalystReport"]:
     """What the report says to the agent, as its own turn or as a steer, and
     the source history labels it with: the message is model-facing and
@@ -615,6 +651,8 @@ async def report_message(
     reminder inline, where its own turn sends it as additional context."""
     from src.server.models.chat import AnalystReport
 
+    ptc_thread_id, origin = owed.ptc_thread_id, owed.origin
+    final_status = owed.final_status
     ptc_workspace_id = origin.get("ptc_workspace_id")
     ws_name = await _workspace_name(ptc_workspace_id)
     ws_label = f'the "{ws_name}" workspace' if ws_name else "a workspace"
@@ -626,7 +664,7 @@ async def report_message(
     # run was a resumable interruption that will report back again on finish.
     if final_status == "error":
         is_resumable = (
-            await is_resumable_analyst_failure(run_id)
+            await is_resumable_analyst_failure(owed.run_id)
             if resumable is None
             else resumable
         )
@@ -645,27 +683,32 @@ async def report_message(
         from src.server.utils.directive_context import build_directive_reminder
 
         message += build_directive_reminder([DirectiveContext(content=reminder)]) or ""
+    run_ids = await _reported_runs(ptc_thread_id, owed.run_id)
     report_source = AnalystReport(
         kind="analyst",
         thread_id=ptc_thread_id,
         workspace_id=str(ptc_workspace_id) if ptc_workspace_id else None,
         workspace_name=ws_name,
+        # One of the three the message has words for, or it raised above.
+        outcome=final_status,
+        # Matches the report to its hand-off, whose result named the first.
+        run_ids=run_ids or None,
+        # And to a hand-off steered into a run that ended before reading it,
+        # whose result named the steer. Empty when the runs took none in;
+        # absent when that is unknown.
+        steer_ids=await _taken_hand_offs(ptc_thread_id, run_ids),
     )
     return message, report_source
 
 
 async def _post_report_back(
     cache,
-    dispatcher_thread_id: str,
-    ptc_thread_id: str,
-    origin: dict,
+    owed: OwedAnalystReport,
     *,
     request_key: str | None = None,
     heartbeat=None,
     dispatch_gen: str | None = None,
-    final_status: str,
     still_due=None,
-    run_id: str | None = None,
     resumable: bool | None = None,
 ) -> tuple[str, str | None]:
     """POST the synthetic report-back message to the Chief of Staff thread.
@@ -680,19 +723,15 @@ async def _post_report_back(
     """
     from src.server.services.report_back.notify_turn import post_notification_turn
 
+    ptc_thread_id, origin = owed.ptc_thread_id, owed.origin
     # DALTON-HOOK(handoff-keep-on-resumable): use the resumable verdict already
     # computed by execute_report_back, or evaluate it when called directly.
     if resumable is None:
-        resumable = final_status == "error" and await is_resumable_analyst_failure(
-            run_id
+        resumable = (
+            owed.final_status == "error"
+            and await is_resumable_analyst_failure(owed.run_id)
         )
-    message, report_source = await report_message(
-        ptc_thread_id,
-        origin,
-        final_status,
-        run_id=run_id,
-        resumable=resumable,
-    )
+    message, report_source = await report_message(owed, resumable=resumable)
     body = {
         "messages": [{"role": "user", "content": message}],
         # The dispatching thread's workspace, which is Home.
@@ -725,7 +764,7 @@ async def _post_report_back(
     # DALTON-HOOK(handoff-keep-on-resumable): dispatch summary turn after
     # awaiting_resume has been atomically stamped on ptc_origin.
     return await post_notification_turn(
-        thread_id=dispatcher_thread_id,
+        thread_id=owed.dispatcher_thread_id,
         body=body,
         user_id=origin.get("user_id"),
         wait_cap=leases.RB_BUSY_WAIT_CAP,

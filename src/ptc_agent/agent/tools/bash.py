@@ -7,14 +7,19 @@ from langchain_core.tools import BaseTool, tool
 
 from ptc_agent.agent.backends.sandbox import SandboxBackend
 from ptc_agent.agent.tools.mount_guard import run_guarded
-from ptc_agent.agent.tools.utils import mark_sandbox_failed
+from ptc_agent.agent.tools.utils import mark_sandbox_failed, note_sandbox_exit, resource_tier_of
 from ptc_agent.core.paths import (
     MEMO_USER_DIR,
     MEMORY_USER_DIR,
     WorkspaceLayout,
 )
 from ptc_agent.core.sandbox import livefs_mount
-from src.observability import TOOL_CHANNEL, TOOL_PROVIDER, mark_tool_failed
+from src.observability import (
+    TOOL_CHANNEL,
+    TOOL_PROVIDER,
+    mark_tool_failed,
+    stamp_resource_tier,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -72,6 +77,7 @@ def create_execute_bash_tool(
     backend: SandboxBackend,
     thread_id: str = "",
     *,
+    session: Any = None,
     call_context: livefs_mount.CallContext | None = None,
     file_tools_only: tuple[str, ...] = (),
     allowed_servers: frozenset[str] | None = None,
@@ -81,6 +87,8 @@ def create_execute_bash_tool(
     Args:
         backend: SandboxBackend wrapping the sandbox
         thread_id: Short thread ID (first 8 chars) for thread-scoped script storage
+        session: The machine's session, read at call time for its
+            ``resource_tier`` to tag the run
         call_context: Who the command runs for, which a save through the file
             mount reads its defaults from
         file_tools_only: Directories under the sandbox root only the file
@@ -142,6 +150,9 @@ def create_execute_bash_tool(
         run_in_background: bool | None,
         call_id: str | None,
     ) -> tuple[str, dict[str, Any]]:
+        # Every run, not only a failed one; read per call because a long
+        # turn's session can be rebound after the tool is built.
+        stamp_resource_tier(resource_tier_of(session, backend))
         try:
             logger.debug(
                 "Executing bash command",
@@ -193,6 +204,8 @@ def create_execute_bash_tool(
 
             if result.get("failure"):
                 mark_sandbox_failed(result["failure"])
+            if not run_in_background:
+                await note_sandbox_exit(backend, result.get("exit_code"), result.get("failure"))
             # Command failed — Daytona returns combined stdout+stderr in "stdout"
             stdout = result.get("stdout", "")
             stderr = result.get("stderr", "")

@@ -759,6 +759,84 @@ class TestServerSummaryAfterAnEarlierSummary:
         assert "sent a new message" not in text
 
 
+class TestServerSummaryLead:
+    """The digest's lead says why no model wrote it; beside a provider's own
+    compaction it says the real summary is one only that model can read."""
+
+    @staticmethod
+    def _raw():
+        from langchain_core.messages import AIMessage
+
+        return [
+            HumanMessage(content="first request", id="h1"),
+            AIMessage(content="first reply", id="a1"),
+            HumanMessage(content="second request", id="h2"),
+            AIMessage(content="second reply", id="a2"),
+        ]
+
+    def test_the_given_lead_opens_the_digest(self):
+        from ptc_agent.agent.middleware.compaction.summarize import PROVIDER_LEAD, server_summary
+        from ptc_agent.agent.transcript import Window
+
+        raw = self._raw()
+        default = server_summary(raw, [], raw_messages=raw, turns=None, window=Window()).text
+        text = server_summary(
+            raw, [], raw_messages=raw, turns=None, window=Window(), lead=PROVIDER_LEAD
+        ).text
+
+        assert text.startswith(PROVIDER_LEAD + "\n\n")
+        assert text.partition("\n\n")[2] == default.partition("\n\n")[2]
+        assert not default.startswith(PROVIDER_LEAD)
+
+    def test_an_opaque_earlier_summary_is_read_like_a_server_one(self):
+        """Its text is a digest too, so its lead is not repeated."""
+        from ptc_agent.agent.middleware.compaction.summarize import PROVIDER_LEAD, server_summary
+        from ptc_agent.agent.middleware.compaction.utils import build_summary_message
+        from ptc_agent.agent.transcript import Window
+
+        raw = self._raw()
+        earlier = build_summary_message(
+            f"{PROVIDER_LEAD}\n\n## Turn 1\nRequest: first request\nLast reply: first reply",
+            None,
+            source="provider",
+            native={"items": [{"type": "compaction", "encrypted_content": "opaque"}]},
+            origin="openai",
+        )
+
+        text = server_summary(
+            [earlier, raw[2], raw[3]],
+            [],
+            raw_messages=raw,
+            turns=None,
+            window=Window(),
+            lead=PROVIDER_LEAD,
+        ).text
+
+        assert text.count(PROVIDER_LEAD) == 1
+        assert "## Earlier summary\n## Turn 1\nRequest: first request" in text
+
+    def test_a_readable_provider_summary_keeps_its_opening(self):
+        """A Claude block's summary is the model's own, read from its start."""
+        from ptc_agent.agent.middleware.compaction.summarize import server_summary
+        from ptc_agent.agent.middleware.compaction.utils import build_summary_message
+        from ptc_agent.agent.transcript import Window
+
+        raw = self._raw()
+        earlier = build_summary_message(
+            "Goal: chart AAPL.\n\nProgress: data pulled.",
+            None,
+            source="provider",
+            native={"block": {"type": "compaction", "content": "x", "signature": "s"}},
+            origin="anthropic",
+        )
+
+        text = server_summary(
+            [earlier, raw[2], raw[3]], [], raw_messages=raw, turns=None, window=Window()
+        ).text
+
+        assert "## Earlier summary\nGoal: chart AAPL.\n\nProgress: data pulled." in text
+
+
 class TestTrimForSummary:
     """The summarizer gets the newest messages that fit, and never loses the
     request they serve: once the summary replaces the history it is the

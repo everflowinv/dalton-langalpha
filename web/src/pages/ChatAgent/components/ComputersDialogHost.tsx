@@ -24,7 +24,7 @@ import {
 import { computerOutcomeWatch, reduceComputerOutcomes } from '../hooks/computerOutcomes';
 import { takePrepareFailures } from '../hooks/computerPreparation';
 import { useComputerActions } from '../hooks/useComputerActions';
-import { invalidateMachine, invalidateMachineStorage, useComputers } from '../hooks/useComputers';
+import { invalidateMachine, invalidateMachineStorage, useComputerProviders, useComputers } from '../hooks/useComputers';
 import { useTierQuota } from '../hooks/useTierQuota';
 import ChangeSpecDialog from './ChangeSpecDialog';
 import ComputersDialog from './ComputersDialog';
@@ -48,6 +48,8 @@ function ComputersDialogHost() {
   const { spec } = useComputerActions();
   const [specError, setSpecError] = useState<SpecError | null>(null);
   const { data: quota } = useTierQuota({ enabled: !!specTarget });
+  const { data: providerData } = useComputerProviders({ enabled: !!specTarget });
+  const specProvider = specTarget ? providerData?.providers.find((p) => p.kind === specTarget.kind) : undefined;
 
   useForgetRecoveredDismissals(computers);
 
@@ -151,6 +153,7 @@ function ComputersDialogHost() {
         onSubmit={submitSpec}
         busy={spec.isPending}
         quota={quota}
+        provider={specProvider}
         error={specError}
         // Opened from a disk warning there is no Computers panel to dim the page.
         stacked={!!panel}

@@ -70,7 +70,10 @@ def _uninstall_sh(tunnel_id: str) -> str:
     The folder is found by the id it holds, which no other deployment hands
     out, so a tunnel another deployment keeps on the same login is left alone
     whatever its folder is called. Detached, so the command answers before the
-    tunnel it rides on goes; a machine that already took it away is no error.
+    tunnel it rides on goes; a machine that already took it away is no error,
+    and neither is one LangAlpha's helper answers for, which installs no
+    folder: once the tunnel is released the gateway refuses it, and the app on
+    that Mac turns the helper off.
     """
     return (
         f"id={shlex.quote(tunnel_id)}\n"

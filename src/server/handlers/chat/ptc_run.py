@@ -307,7 +307,7 @@ async def astream_ptc_workflow(
             workspace_id=workspace_id,
             steer_job_id=request.steer_job_id,
             # A hand-off into a running turn answers the dispatch primer
-            # with DISPATCH_STEERED_MARKER and that run's id.
+            # with ``HandOffSteered``: that run's id and the steer's.
             agent=agent_steer_of(request, dispatched=dispatched, run_id=run_id),
             can_steer=steer_allowed(
                 request, dispatched=dispatched, steerable=steerable

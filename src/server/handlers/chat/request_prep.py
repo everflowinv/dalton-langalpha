@@ -63,10 +63,16 @@ logger = logging.getLogger("src.server.handlers.chat_handler")
 # stream.
 DISPATCH_STARTED_MARKER = "__dispatch_run_started__"
 
-# Yielded instead, followed by the live run's id, when a dispatched hand-off
-# met a running turn and was accepted into it as a steer: no run of its own
-# starts, and the primer answers with the run that takes it in.
-DISPATCH_STEERED_MARKER = "__dispatch_run_steered__:"
+
+@dataclass(frozen=True)
+class HandOffSteered:
+    """Yielded instead when a dispatched hand-off met a running turn and went
+    into it as a steer: no run of its own starts, and the primer answers with
+    ``run_id``, the run it was sent into, and ``steer_id``, the steer's row,
+    which names a later run that takes it in if that one ends first."""
+
+    run_id: str
+    steer_id: str
 
 
 # ---------------------------------------------------------------------------

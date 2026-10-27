@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import json
+import shlex
 import shutil
 import subprocess
 import time
@@ -474,6 +475,27 @@ async def test_an_expired_command_says_so_instead_of_failing_silently(monkeypatc
 
     assert run.returncode == 1
     assert "expired" in run.stderr
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("login_from", [[], ["203.0.113.7"]])
+async def test_the_helper_is_given_the_line_the_script_would_authorize(
+    monkeypatch, login_from
+):
+    _serve(monkeypatch)
+    settings = SSHConfig(login_from=login_from)
+
+    line = await script.pairing_key("abc", settings)
+
+    assert line == authorized_key_line(f"{_KEY} langalpha", login_from)
+    assert shlex.quote(line) in await script.render_script("abc", settings)
+
+
+@pytest.mark.asyncio
+async def test_an_expired_pairing_gives_the_helper_no_key(monkeypatch):
+    monkeypatch.setattr(state, "load", AsyncMock(return_value=None))
+
+    assert await script.pairing_key("gone", _SETTINGS) is None
 
 
 class _Redis:
@@ -1116,3 +1138,42 @@ async def test_connect_by_address_spends_one_dial(redis, dial_budget):
     )
 
     assert dial_budget.spent == [1]
+
+
+@pytest.mark.asyncio
+async def test_a_machine_with_no_ssh_server_is_sent_to_tunnel_undialed(
+    redis, dial_budget, monkeypatch
+):
+    monkeypatch.setattr(flow, "tunnels_enabled", lambda: True)
+    monkeypatch.setattr(dial, "tunnels_enabled", lambda: True)
+    await _store()
+
+    status, _ = await flow.report(
+        "abc",
+        _report(**_CHECKED_IN, tunnel_only="1"),
+        sources=[],
+        settings=_ANYWHERE,
+    )
+
+    assert status == 202
+    assert dial_budget.spent == [0]
+    assert dial_budget.dialed == []
+
+
+@pytest.mark.asyncio
+async def test_a_machine_with_no_ssh_server_is_refused_where_tunnels_are_off(
+    redis, dial_budget, monkeypatch
+):
+    monkeypatch.setattr(flow, "tunnels_enabled", lambda: False)
+    await _store()
+
+    status, message = await flow.report(
+        "abc",
+        _report(**_CHECKED_IN, tunnel_only="1"),
+        sources=[],
+        settings=_ANYWHERE,
+    )
+
+    assert (status, message) == (422, flow._NO_TUNNEL)
+    assert dial_budget.dialed == []
+    assert (await state.load("abc")).view().status == "failed"

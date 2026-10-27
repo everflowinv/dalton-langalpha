@@ -5,7 +5,8 @@
  */
 import type { useTranslation } from 'react-i18next';
 
-import type { Computer, ComputerProviderOption } from '@/types/api';
+import { isPlatformMode } from '@/config/hostMode';
+import type { Computer, ComputerProviderOption, WorkspaceQuota } from '@/types/api';
 
 import type { RadioCardOption } from './radioCardGroup';
 
@@ -76,13 +77,36 @@ export function providerDescription(kind: string, t: Translate): string {
   return ui ? t(ui.descKey) : '';
 }
 
-export function isProviderLocked(provider: ComputerProviderOption): boolean {
-  return provider.allowed === false;
+/**
+ * Whether a computer on this provider counts toward the plan's computer cap.
+ * A machine the user brings is theirs to keep, so it never does.
+ */
+export function providerCountsTowardCap(kind: string): boolean {
+  return !providerUi(kind)?.ownMachine;
+}
+
+/** Whether the user holds as many counted computers as the plan allows. Unknown never is. */
+export function computerCapReached(quota: WorkspaceQuota | null | undefined): boolean {
+  const cap = quota?.computers;
+  return isPlatformMode && !!cap && cap.limit >= 0 && cap.used >= cap.limit;
+}
+
+/**
+ * Why a new computer cannot go on this provider, or null when it can: the
+ * plan lacks the provider, or `atCap` and the provider's computers count.
+ */
+export function providerLock(provider: ComputerProviderOption, atCap: boolean): 'not_on_plan' | 'at_cap' | null {
+  if (provider.allowed === false) return 'not_on_plan';
+  return atCap && providerCountsTowardCap(provider.kind) ? 'at_cap' : null;
+}
+
+export function isProviderLocked(provider: ComputerProviderOption, atCap = false): boolean {
+  return providerLock(provider, atCap) !== null;
 }
 
 /** The deployment default when the plan allows it, else the first one it does. */
-export function defaultProviderKind(providers: readonly ComputerProviderOption[]): string | null {
-  const open = providers.filter((p) => !isProviderLocked(p));
+export function defaultProviderKind(providers: readonly ComputerProviderOption[], atCap = false): string | null {
+  const open = providers.filter((p) => !isProviderLocked(p, atCap));
   return (open.find((p) => p.is_default) ?? open[0])?.kind ?? null;
 }
 
@@ -97,12 +121,40 @@ export function rowsShowProvider(
   return (providers?.length ?? 0) > 1 || new Set(computers.map((c) => c.kind)).size > 1;
 }
 
-export function providerOptions(t: Translate, providers: readonly ComputerProviderOption[]): RadioCardOption<string>[] {
-  return providers.map((p) => ({
-    value: p.kind,
-    title: providerLabel(p.kind, t),
-    description: providerDescription(p.kind, t),
-    note: isProviderLocked(p) ? t('workspace.quotaNotOnPlan', 'Not on your plan') : null,
-    disabled: isProviderLocked(p),
-  }));
+export function providerOptions(
+  t: Translate,
+  providers: readonly ComputerProviderOption[],
+  atCap = false,
+): RadioCardOption<string>[] {
+  return providers.map((p) => {
+    const lock = providerLock(p, atCap);
+    return {
+      value: p.kind,
+      title: providerLabel(p.kind, t),
+      description: providerDescription(p.kind, t),
+      note: lock === 'not_on_plan'
+        ? t('workspace.quotaNotOnPlan', 'Not on your plan')
+        : lock === 'at_cap' ? t('computer.provider.capReached', 'Limit reached') : null,
+      disabled: lock !== null,
+    };
+  });
+}
+
+/** The This Mac card's value. Not a provider kind: this Mac is added by remote control as an `ssh` computer. */
+export const THIS_MAC_OPTION = 'this-mac';
+
+/** Whether this Mac can still be added, or a computer already is this Mac. */
+export type ThisMacCard = 'offered' | 'added';
+
+/** This Mac's card, which leads the providers in the desktop app on a Mac. */
+export function thisMacOption(t: Translate, state: ThisMacCard): RadioCardOption<string> {
+  return {
+    value: THIS_MAC_OPTION,
+    title: t('computer.remoteControl.cardTitle', 'This Mac'),
+    description: t('computer.remoteControl.cardDesc', 'Let the agent work on this Mac, even while LangAlpha is closed.'),
+    note: state === 'added'
+      ? t('computer.remoteControl.alreadyAdded', 'Already added')
+      : t('computer.ssh.previewLabel', 'Preview'),
+    disabled: state === 'added',
+  };
 }

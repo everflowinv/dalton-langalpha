@@ -32,7 +32,7 @@ from ptc_agent.agent.middleware.background_subagent import (
     run_executor,
     task_actions,
 )
-
+from ptc_agent.config.agent import SubagentModel
 
 if TYPE_CHECKING:
     pass
@@ -68,6 +68,7 @@ class BackgroundSubagentMiddleware(AgentMiddleware):
         registry: BackgroundTaskRegistry | None = None,
         checkpointer: Any | None = None,
         namespace_owner: Any | None = None,
+        subagent_models: dict[str, SubagentModel] | None = None,
     ) -> None:
         """
         Args:
@@ -79,6 +80,8 @@ class BackgroundSubagentMiddleware(AgentMiddleware):
                 (``acquire_task_ns(task_id) -> bool`` / ``release_task_ns``, e.g.
                 the run's WriterGuard). None = single-writer deployment; spawn and
                 resume skip the fence.
+            subagent_models: the subagent types that run a model other than
+                the main agent's; each run of one carries it from admission.
         """
         super().__init__()
         self.registry = registry or BackgroundTaskRegistry()
@@ -87,6 +90,7 @@ class BackgroundSubagentMiddleware(AgentMiddleware):
         self.checkpointer = checkpointer
         self.namespace_owner = namespace_owner
         self.subagent_types = frozenset(subagent_types)
+        self.subagent_models = dict(subagent_models or {})
         # Task ids with a resume mid-flight: the liveness check and the
         # writer spawn are separated by awaits, so two parallel resume calls
         # in one model step could otherwise both pass and double-spawn (the
@@ -210,6 +214,7 @@ class BackgroundSubagentMiddleware(AgentMiddleware):
                 subagent_type=task.subagent_type,
                 parent_run_id=parent_run_id,
                 launch_tool_call_id=launch_tool_call_id,
+                model=self.subagent_models.get(task.subagent_type),
             )
         except TaskRunRejected as e:
             logger.warning(

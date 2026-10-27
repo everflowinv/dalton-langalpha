@@ -18,6 +18,7 @@ from ptc_agent.agent.subagents.merge import turn_roster
 from src.llms.preferences import (
     Tuning,
     compaction_profile_for,
+    custom_model,
     resolve_tuning,
 )
 from src.server.services.features import effective_flags_for_user
@@ -40,6 +41,7 @@ from .subagents import (
     demote_clientless,
     read_user_subagents,
     resolve_user_subagents,
+    subagent_models,
     subagent_roles,
 )
 from . import user_models
@@ -230,16 +232,36 @@ async def load_user_context(
     config.skill_command_overrides = dict(bundle.command_overrides)
 
 
-def apply_compaction(config, tuning: Tuning, entry: dict[str, Any] | None) -> None:
-    """Apply the named compaction preset (aggressive/moderate/extended/relaxed).
+#: The most of a model's window a compaction threshold may claim. The rest is
+#: the reply, the tool results that land before the next check, and the
+#: summary call itself, which reads past the threshold.
+_THRESHOLD_SHARE = (3, 4)
+
+
+def apply_compaction(
+    config, tuning: Tuning, entry: dict[str, Any] | None, *, custom: bool = False
+) -> None:
+    """Apply the named compaction preset, capped to what the model's window
+    can hold.
 
     The user's choice wins; failing that the model answers for itself, by
     declaration or by the band its context window falls in. Only a model that
     states no window keeps the YAML default, which is one number for every
     model and so is right for almost none of them.
+
+    An account-wide preset reaches every model, so a 750k preset chosen for a
+    1M model also lands on a 400k one, where it would never trigger and every
+    long turn would compact only after the provider refused it.
+
+    ``native`` is the user's per-model choice. A ``custom`` model never
+    compacts natively: the settings offer the choice only for manifest models,
+    so one of the user's own would compact with no switch to turn it off. The
+    ``provider_compaction`` feature, and whether the provider can compact for
+    this turn, are weighed when the middleware is built and called.
     """
     from ptc_agent.config.agent import COMPACTION_PROFILES
 
+    config.compaction.native = not custom and tuning.native_compaction is not False
     profile = tuning.compaction_profile
     if not isinstance(profile, str):
         profile = compaction_profile_for(entry)
@@ -249,6 +271,12 @@ def apply_compaction(config, tuning: Tuning, entry: dict[str, Any] | None) -> No
     for field, value in preset.items():
         setattr(config.compaction, field, value)
     config.compaction.profile = profile
+    context = (entry or {}).get("context")
+    if isinstance(context, int) and context > 0:
+        share, of = _THRESHOLD_SHARE
+        config.compaction.token_threshold = min(
+            config.compaction.token_threshold, context * share // of
+        )
 
 
 def apply_fetch_override(config) -> None:
@@ -385,7 +413,12 @@ async def resolve_llm_config(
         # model and a 1M one.
         tuning = resolve_tuning(model_pref, selection.effective_model)
         config.prompt_guidance = user_models.guidance_for(model_pref, selection.effective_model)
-        apply_compaction(config, tuning, user_models.model_entry(model_pref, selection.effective_model))
+        apply_compaction(
+            config,
+            tuning,
+            user_models.model_entry(model_pref, selection.effective_model),
+            custom=custom_model(model_pref, selection.effective_model) is not None,
+        )
         permits = await gate_capabilities(config, user_id, model_pref)
 
         # After the gate, whose tier check the merge reuses, and before the
@@ -431,5 +464,9 @@ async def resolve_llm_config(
     # DALTON-HOOK(subagent-model-pin): only inspect subagents compiled for this
     # turn's role on the primary slot.
     demote_clientless(config, role=role, slot=slot)
+    if slot == "primary":
+        config.subagent_models = subagent_models(
+            config, model_pref, selection.effective_model, role=role,
+        )
 
     return config

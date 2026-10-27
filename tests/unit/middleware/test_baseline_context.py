@@ -53,7 +53,16 @@ from ptc_agent.agent.middleware.runtime_context import (
 )
 from ptc_agent.agent.middleware.runtime_context.baseline import _workspace_block
 from ptc_agent.agent.middleware.runtime_context.changes import render_diff, sha256_text
-from ptc_agent.agent.middleware.runtime_context.epoch import OTHER_COMPUTERS, Workspace
+from ptc_agent.agent.middleware.runtime_context.epoch import (
+    ANALYST_MACHINE,
+    HOME_MACHINE,
+    HOSTED,
+    MAC_TOOLS,
+    MACHINE_PHRASES,
+    MOVED,
+    OTHER_COMPUTERS,
+    Workspace,
+)
 from ptc_agent.agent.middleware.runtime_context.harness_blocks import (
     harness_update_kind,
 )
@@ -1380,6 +1389,111 @@ class TestRendering:
         ]
         assert rows[0].text.splitlines()[-1] == "Computer: Lab (the frozen block says Big box)"
         assert OTHER_COMPUTERS not in rows[0].text
+
+    @pytest.mark.parametrize("computer", ["", "Big box"])
+    def test_a_hosted_computer_freezes_the_hash_it_froze_before(self, computer):
+        """No machine stays out of the state and the hash, so an epoch frozen
+        before machines were told files no row on the next turn."""
+        before = Workspace(name="Semis", description="Chips", computer=computer)
+        legacy = f"Semis\nChips\n{computer}" if computer else "Semis\nChips"
+        assert before.sha() == sha256_text(legacy)
+        assert "machine" not in before.to_state()
+        mac = Workspace(
+            name="Semis",
+            description="Chips",
+            computer=computer,
+            machine="own",
+            root="/home/dev/langalpha",
+        )
+        assert Workspace.from_state(mac.to_state()) == mac
+        assert mac.sha() != before.sha()
+
+    @pytest.mark.parametrize("role", ["analyst", "chief_of_staff"])
+    @pytest.mark.parametrize("machine", ["personal_mac", "personal", "own_mac", "own"])
+    def test_the_users_own_machine_is_said_last_and_a_macs_tools_after_it(
+        self, role, machine
+    ):
+        workspace = Workspace(
+            name="Semis",
+            computer="Studio Mac",
+            machine=machine,
+            root="/Users/me/a<b",
+        )
+        template = HOME_MACHINE if role == "chief_of_staff" else ANALYST_MACHINE
+        expected = [
+            template.format(phrase=MACHINE_PHRASES[machine], root="/Users/me/a&lt;b")
+        ]
+        if machine.endswith("_mac"):
+            expected.append(MAC_TOOLS)
+        lines = _workspace_block(workspace, role).splitlines()
+        assert lines[-len(expected) - 1 :] == [*expected, "</workspace>"]
+        assert lines[2] == "Computer: Studio Mac"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("frozen", "now", "expected"),
+        [
+            # An epoch frozen before machines were told: no move to name.
+            (
+                ("", ""),
+                ("personal_mac", "/Users/me/langalpha"),
+                [
+                    ANALYST_MACHINE.format(
+                        phrase=MACHINE_PHRASES["personal_mac"],
+                        root="/Users/me/langalpha",
+                    ),
+                    MAC_TOOLS,
+                ],
+            ),
+            (
+                ("own_mac", "/Users/me/langalpha"),
+                ("", ""),
+                [
+                    MOVED.format(
+                        subject="This workspace",
+                        old=MACHINE_PHRASES["own_mac"],
+                        new=HOSTED,
+                    )
+                ],
+            ),
+            # Off a Mac onto another machine of theirs: the Mac's tools go.
+            (
+                ("own_mac", "/Users/me/langalpha"),
+                ("own", "/home/me/langalpha"),
+                [
+                    MOVED.format(
+                        subject="This workspace",
+                        old=MACHINE_PHRASES["own_mac"],
+                        new="another computer",
+                    ),
+                    ANALYST_MACHINE.format(
+                        phrase=MACHINE_PHRASES["own"], root="/home/me/langalpha"
+                    ),
+                ],
+            ),
+        ],
+    )
+    async def test_a_machine_change_is_a_row_in_the_blocks_words(
+        self, frozen, now, expected
+    ):
+        machine, root = frozen
+        first = _middleware(
+            _session("# Notes"),
+            workspace=Workspace(name="Semis", machine=machine, root=root),
+        )
+        state = await first.abefore_agent({}, None)
+        machine, root = now
+        later = _middleware(
+            _session("# Notes"),
+            workspace=Workspace(name="Semis", machine=machine, root=root),
+        )
+        rows = [
+            runtime_update_from_message(m)
+            for m in _rows(await later.abefore_agent(state, None))
+        ]
+        assert [r.kind for r in rows] == ["workspace_changed"]
+        # The row's own lines, after its heading and what it says of them.
+        assert rows[0].text.split("\n\n", 2)[2].splitlines() == expected
 
 
 # ---------------------------------------------------------------------------

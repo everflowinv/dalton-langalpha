@@ -545,6 +545,14 @@ export function useThreadRunStatus(threadId: string): PublicRunStatus {
   );
 }
 
+/** `useThreadRunStatus` for several threads from ONE subscription, in the
+ *  order asked. The snapshot is a string, so an emit about any other thread
+ *  re-renders nothing. */
+export function useThreadRunStatuses(threadIds: readonly string[]): readonly PublicRunStatus[] {
+  const joined = useSyncExternalStore(subscribe, () => threadIds.map((id) => state.effStatus.get(id) ?? 'idle').join('|'));
+  return useMemo(() => (joined ? (joined.split('|') as PublicRunStatus[]) : []), [joined]);
+}
+
 export interface ThreadRunStates {
   /** Each thread's effective public status: 'idle' when nothing is known,
    *  including a live run a snapshot has since shown is over. */

@@ -93,6 +93,24 @@ async def try_session_lock(key: str | int) -> AsyncIterator[bool]:
             await release_session_lock(conn, key)
 
 
+@asynccontextmanager
+async def try_own_session_lock(key: str | int) -> AsyncIterator[bool]:
+    """``try_session_lock`` on a session outside the pool, closed on exit.
+
+    For a holder that reads and writes through the pool while it holds the
+    lock across slow calls: a pooled session would keep a slot for the whole
+    hold, and with a pool of one, leave none for the holder's own reads.
+    Closing the session is the release, however the holder ends.
+    """
+    conn = await pool.open_session_connection()
+    try:
+        cur = await conn.execute(f"SELECT pg_try_advisory_lock({_lock_arg(key)})", (key,))
+        row = await cur.fetchone()
+        yield bool(row and row[0])
+    finally:
+        await await_settled(asyncio.ensure_future(conn.close()))
+
+
 class SharedLockBusy(Exception):
     """An exclusive holder kept the key for the whole wait."""
 

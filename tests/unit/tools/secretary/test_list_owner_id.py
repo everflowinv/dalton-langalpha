@@ -67,7 +67,8 @@ async def test_workspace_list_rows_carry_only_what_a_hand_off_reads():
 async def test_the_chief_of_staff_sees_a_folder_only_on_homes_computer():
     """Home reads its siblings' folders on its own computer. A workspace on
     another computer has no folder there, so its row names none, and with
-    more than one computer each row names the computer it is on."""
+    more than one computer each row names the computer it is on, and whether
+    that is the user's own."""
     from src.tools.secretary.chief_of_staff import chief_of_staff_workspaces
 
     rows = [
@@ -77,7 +78,13 @@ async def test_the_chief_of_staff_sees_a_folder_only_on_homes_computer():
     read_computers = AsyncMock(
         return_value=[
             {"computer_id": "cmp-home", "name": "Cloud computer", "is_home": True},
-            {"computer_id": "cmp-other", "name": "Big box", "is_home": False},
+            {
+                "computer_id": "cmp-other",
+                "name": "Big box",
+                "is_home": False,
+                "kind": "ssh",
+                "provider_config": {"os": "Linux"},
+            },
         ]
     )
     with patch(
@@ -94,8 +101,12 @@ async def test_the_chief_of_staff_sees_a_folder_only_on_homes_computer():
             config={"configurable": {"user_id": OWNER}},
         )
     listed = json.loads(command.update["messages"][0].content)["workspaces"]
-    assert {ws["workspace_id"]: (ws["dir_name"], ws["computer"]) for ws in listed} == {
-        "ws-here": ("semis", "Cloud computer"),
-        "ws-there": (None, "Big box"),
+    assert {
+        ws["workspace_id"]: (ws["dir_name"], ws["computer"], ws.get("machine"))
+        for ws in listed
+    } == {
+        "ws-here": ("semis", "Cloud computer", None),
+        "ws-there": (None, "Big box", "the user's own machine"),
     }
+    assert "machine" not in listed[0]
     read_computers.assert_awaited_once_with(OWNER)

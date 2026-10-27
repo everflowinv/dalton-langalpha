@@ -7,6 +7,7 @@ from langchain_core.tools import BaseTool, tool
 
 from ptc_agent.agent.backends.sandbox import SandboxBackend
 from ptc_agent.agent.limits import pending_read
+from ptc_agent.agent.tools.utils import note_sandbox_exit
 from ptc_agent.core.sandbox import livefs_mount
 from src.observability import TOOL_CHANNEL, TOOL_PROVIDER, mark_tool_failed
 
@@ -102,6 +103,9 @@ def create_bash_output_tool(
                 status = "COMPLETED (success)"
             else:
                 status = f"COMPLETED (exit code {exit_code})"
+            if not is_running:
+                # The one read that sees it finish: the session goes with it.
+                await note_sandbox_exit(backend, exit_code, result.get("failure"))
 
             parts = [f"Status: {status}"]
             if stdout:

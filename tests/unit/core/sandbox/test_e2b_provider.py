@@ -19,6 +19,7 @@ from e2b import (
     BuildException,
     CommandExitException,
     FileNotFoundException,
+    RateLimitException,
     SandboxException,
     SandboxNotFoundException,
     SandboxNotRunningException,
@@ -34,7 +35,11 @@ from ptc_agent.core.sandbox.platform_secrets import (
 )
 from ptc_agent.core.sandbox.providers import e2b as e2b_module
 from ptc_agent.core.sandbox.providers.e2b import E2BProvider
-from ptc_agent.core.sandbox.providers.e2b_runtime import E2BRuntime, _window
+from ptc_agent.core.sandbox.providers.e2b_runtime import (
+    E2BRuntime,
+    _exit_status,
+    _window,
+)
 from ptc_agent.core.sandbox.providers.e2b_secrets import (
     E2BSecretReconciler,
     egress_rules,
@@ -42,6 +47,7 @@ from ptc_agent.core.sandbox.providers.e2b_secrets import (
 from ptc_agent.core.sandbox.runtime import (
     RuntimeState,
     SandboxFailureKind,
+    SandboxRateLimitedError,
     SandboxTransientError,
 )
 
@@ -207,6 +213,43 @@ class TestExec:
         command = sandbox.commands.run.await_args.args[0]
         assert command.startswith("exec 2>&1\n")
         assert sandbox.commands.run.await_args.kwargs["user"] == "root"
+
+
+class TestExitStatus:
+    """envd reports a signal death as exit -1; the shell's status is 128 + signal."""
+
+    @pytest.mark.parametrize(
+        ("exit_code", "error", "expected"),
+        [
+            (-1, "signal: hangup", 129),
+            (-1, "signal: interrupt", 130),
+            (-1, "signal: aborted", 134),
+            (-1, "signal: bus error", 135),
+            (-1, "signal: killed", 137),
+            (-1, "signal: segmentation fault", 139),
+            (-1, "signal: terminated", 143),
+            (-1, "signal: segmentation fault (core dumped)", 139),
+            (-1, "signal: weird", -1),
+            (-1, None, -1),
+            (3, "exit status 3", 3),
+            (3, "signal: killed", 3),
+        ],
+    )
+    def test_maps_a_named_signal_to_the_shell_status(self, exit_code, error, expected):
+        assert _exit_status(exit_code, error) == expected
+
+    @pytest.mark.asyncio
+    async def test_a_command_killed_by_a_signal_returns_the_shell_status(self):
+        sandbox = MagicMock()
+        sandbox.commands.run = AsyncMock(
+            side_effect=CommandExitException(
+                stderr="", stdout="", exit_code=-1, error="signal: killed"
+            )
+        )
+
+        result = await E2BRuntime._run(sandbox, "sleep 60", timeout=30)
+
+        assert result.exit_code == 137
 
 
 class TestLifetimeAndTiers:
@@ -602,3 +645,177 @@ class TestSecretReconciler:
         with pytest.raises(PlatformSecretConfigurationError, match="needs a header"):
             await self._reconciler(update=update).reconcile([headerless])
         update.assert_not_awaited()
+
+
+class TestMetricsSince:
+    """E2B's metrics read is a class-level API call: no connect, so no resume."""
+
+    @staticmethod
+    def _sample(ts: datetime, **fields) -> SimpleNamespace:
+        values = {
+            "cpu_count": 2,
+            "cpu_used_pct": 12.5,
+            "disk_total": 10 * 2**30,
+            "disk_used": 2**30,
+            "mem_total": 4 * 2**30,
+            "mem_used": 2**29,
+            "mem_cache": 2**28,
+        }
+        return SimpleNamespace(timestamp=ts, **{**values, **fields})
+
+    @staticmethod
+    def _provider_with(samples) -> tuple[E2BProvider, SimpleNamespace]:
+        client = _client()
+        client.AsyncSandbox.get_metrics = AsyncMock(return_value=samples)
+        return _provider(client), client
+
+    T0 = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
+
+    def test_reports_metrics(self):
+        assert E2BProvider.reports_metrics is True
+
+    @pytest.mark.asyncio
+    async def test_maps_fields_through_the_class_level_read(self):
+        T0 = self.T0
+        until = T0 + timedelta(hours=1)
+        provider, client = self._provider_with([self._sample(T0 + timedelta(minutes=1))])
+
+        [sample] = await provider.metrics_since("sbx-1", T0, until=until)
+
+        client.AsyncSandbox.get_metrics.assert_awaited_once_with(
+            "sbx-1", start=T0, end=until
+        )
+        client.AsyncSandbox.connect.assert_not_awaited()
+        assert sample.timestamp == T0 + timedelta(minutes=1)
+        assert sample.cpu_used_pct == 12.5
+        assert sample.cpu_count == 2
+        assert sample.mem_used_bytes == 2**29 + 2**28
+        assert sample.mem_cache_bytes == 2**28
+        assert sample.mem_total_bytes == 4 * 2**30
+        assert sample.disk_used_bytes == 2**30
+        assert sample.disk_total_bytes == 10 * 2**30
+
+    @pytest.mark.asyncio
+    async def test_a_rate_limit_refusal_is_a_rate_limited_error(self):
+        provider, client = self._provider_with([])
+        client.AsyncSandbox.get_metrics.side_effect = RateLimitException("slow down")
+
+        with pytest.raises(SandboxRateLimitedError, match="slow down"):
+            await provider.metrics_since("sbx-1", self.T0)
+
+    @pytest.mark.asyncio
+    async def test_a_429_status_is_a_rate_limited_error(self):
+        provider, client = self._provider_with([])
+        client.AsyncSandbox.get_metrics.side_effect = SandboxException(
+            "too many requests", status_code=429
+        )
+
+        with pytest.raises(SandboxRateLimitedError):
+            await provider.metrics_since("sbx-1", self.T0)
+
+    @pytest.mark.asyncio
+    async def test_another_sandbox_error_propagates_as_itself(self):
+        provider, client = self._provider_with([])
+        error = SandboxException("boom", status_code=500)
+        client.AsyncSandbox.get_metrics.side_effect = error
+
+        with pytest.raises(SandboxException) as raised:
+            await provider.metrics_since("sbx-1", self.T0)
+
+        assert raised.value is error
+        assert not isinstance(raised.value, SandboxRateLimitedError)
+
+    @pytest.mark.asyncio
+    async def test_a_template_before_envd_0_2_4_has_no_disk(self):
+        provider, _ = self._provider_with(
+            [self._sample(self.T0 + timedelta(minutes=1), disk_total=0, disk_used=0)]
+        )
+
+        [sample] = await provider.metrics_since("sbx-1", self.T0)
+
+        assert sample.disk_total_bytes is None
+        assert sample.disk_used_bytes is None
+        assert sample.mem_total_bytes == 4 * 2**30
+
+    @pytest.mark.asyncio
+    async def test_zero_memory_total_and_cpu_count_are_none(self):
+        provider, _ = self._provider_with(
+            [
+                self._sample(
+                    self.T0 + timedelta(minutes=1),
+                    mem_total=0,
+                    cpu_count=0,
+                    cpu_used_pct=0.0,
+                )
+            ]
+        )
+
+        [sample] = await provider.metrics_since("sbx-1", self.T0)
+
+        assert sample.mem_total_bytes is None
+        assert sample.cpu_count is None
+        assert sample.cpu_used_pct == 0.0
+
+    @pytest.mark.asyncio
+    async def test_the_sample_at_since_is_dropped_though_e2b_floors_start(self):
+        since = self.T0 + timedelta(milliseconds=400)
+        floored = self.T0
+        provider, _ = self._provider_with(
+            [
+                self._sample(floored),
+                self._sample(since),
+                self._sample(since + timedelta(milliseconds=1)),
+                self._sample(self.T0 + timedelta(seconds=5)),
+            ]
+        )
+
+        samples = await provider.metrics_since("sbx-1", since)
+
+        assert [s.timestamp for s in samples] == [
+            since + timedelta(milliseconds=1),
+            self.T0 + timedelta(seconds=5),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_until_bounds_the_window_inclusively(self):
+        until = self.T0 + timedelta(minutes=10)
+        provider, _ = self._provider_with(
+            [
+                self._sample(until + timedelta(seconds=1)),
+                self._sample(until),
+                self._sample(self.T0 + timedelta(minutes=5)),
+            ]
+        )
+
+        samples = await provider.metrics_since("sbx-1", self.T0, until=until)
+
+        assert [s.timestamp for s in samples] == [self.T0 + timedelta(minutes=5), until]
+
+    @pytest.mark.asyncio
+    async def test_samples_are_oldest_first_and_utc(self):
+        naive = datetime(2026, 1, 1, 12, 5)
+        provider, _ = self._provider_with(
+            [
+                self._sample(self.T0 + timedelta(minutes=9)),
+                self._sample(naive),
+                self._sample(self.T0 + timedelta(minutes=7)),
+            ]
+        )
+
+        samples = await provider.metrics_since("sbx-1", self.T0)
+
+        assert [s.timestamp for s in samples] == [
+            self.T0 + timedelta(minutes=5),
+            self.T0 + timedelta(minutes=7),
+            self.T0 + timedelta(minutes=9),
+        ]
+        assert all(s.timestamp.utcoffset() == timedelta(0) for s in samples)
+
+    @pytest.mark.asyncio
+    async def test_sdk_errors_propagate(self):
+        provider, client = self._provider_with([])
+        client.AsyncSandbox.get_metrics.side_effect = SandboxNotFoundException("gone")
+
+        with pytest.raises(SandboxNotFoundException):
+            await provider.metrics_since("sbx-1", self.T0)
+        client.AsyncSandbox.connect.assert_not_awaited()

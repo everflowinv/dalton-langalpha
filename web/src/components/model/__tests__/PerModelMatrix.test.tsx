@@ -21,7 +21,11 @@ const profilesCatalog = {
   aggressive: { token_threshold: 100000, keep_messages: 5 },
   moderate: { token_threshold: 130000, keep_messages: 8 },
   extended: { token_threshold: 200000, keep_messages: 10 },
+  economy: { token_threshold: 250000, keep_messages: 12 },
   relaxed: { token_threshold: 300000, keep_messages: 15 },
+  spacious: { token_threshold: 400000, keep_messages: 18 },
+  expansive: { token_threshold: 500000, keep_messages: 20 },
+  maximal: { token_threshold: 750000, keep_messages: 25 },
 };
 
 const metadata: Record<string, ModelMetadataEntry> = {
@@ -29,6 +33,8 @@ const metadata: Record<string, ModelMetadataEntry> = {
   'narrow-model': { provider: 'p', compaction_profile: 'moderate' },
   'unknown-window': { provider: 'p' },
   'lean-model': { provider: 'p', prompt_guidance: 'lean' },
+  'native-claude': { provider: 'p', native_compaction: 'anthropic' },
+  'native-gpt': { provider: 'p', native_compaction: 'openai' },
 };
 
 /** A row only appears for a model that already carries some override, so give
@@ -37,13 +43,23 @@ const PROFILES = Object.fromEntries(
   Object.keys(metadata).map((m) => [m, { reasoning_effort: 'high' }]),
 );
 
-function renderMatrix(account: Record<string, unknown> = {}, over: { validModelNames?: Set<string> } = {}) {
+function renderMatrix(
+  account: Record<string, unknown> = {},
+  over: {
+    validModelNames?: Set<string>;
+    profiles?: Record<string, Record<string, unknown>>;
+    providerCompaction?: boolean;
+  } = {},
+) {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false, staleTime: Infinity } },
   });
   queryClient.setQueryData(queryKeys.user.preferences(), {
-    model_preference: { ...account, profiles: PROFILES },
+    model_preference: { ...account, profiles: { ...PROFILES, ...over.profiles } },
   });
+  queryClient.setQueryData(queryKeys.features.list(), [
+    { key: 'provider_compaction', enabled: over.providerCompaction ?? true },
+  ]);
   return render(
     <QueryClientProvider client={queryClient}>
       <PerModelMatrix
@@ -112,5 +128,48 @@ describe('PerModelMatrix rows', () => {
     expect(screen.queryByLabelText('narrow-model Effort')).toBeNull();
     // The reachable row still renders its controls.
     expect(screen.getByLabelText('wide-model Effort')).toBeTruthy();
+  });
+});
+
+describe('PerModelMatrix provider compaction cell', () => {
+  const column = 'Provider compaction';
+
+  it('appears only for a model whose provider can compact for it', () => {
+    renderMatrix();
+    expect(screen.getByLabelText(`native-claude ${column}`)).toBeTruthy();
+    expect(screen.getByLabelText(`native-gpt ${column}`)).toBeTruthy();
+    expect(screen.queryByLabelText(`wide-model ${column}`)).toBeNull();
+  });
+
+  it('names the default: on for every provider', () => {
+    renderMatrix();
+    expect(inheritedLabel('native-claude', column)).toBe('Default (On)');
+    expect(inheritedLabel('native-gpt', column)).toBe('Default (On)');
+  });
+
+  it('lets the account value outrank the default', () => {
+    renderMatrix({ native_compaction: false });
+    expect(inheritedLabel('native-gpt', column)).toBe('Default (Off)');
+  });
+
+  it('shows the per-model choice over both', () => {
+    renderMatrix(
+      { native_compaction: true },
+      { profiles: { 'native-claude': { native_compaction: false } } },
+    );
+    expect((screen.getByLabelText(`native-claude ${column}`) as HTMLSelectElement).value).toBe('off');
+  });
+
+  it('is hidden while the provider_compaction feature is off', () => {
+    renderMatrix({}, { providerCompaction: false });
+    expect(screen.queryByText(column)).toBeNull();
+    expect(screen.queryByLabelText(`native-claude ${column}`)).toBeNull();
+    expect(screen.queryByText(/Claude summarizes the conversation itself/)).toBeNull();
+  });
+
+  it('states the trade-off of each provider a reachable row takes, once', () => {
+    renderMatrix({}, { validModelNames: new Set(['native-claude', 'wide-model']) });
+    expect(screen.getByText(/Claude summarizes the conversation itself/)).toBeTruthy();
+    expect(screen.queryByText(/OpenAI compacts the conversation/)).toBeNull();
   });
 });

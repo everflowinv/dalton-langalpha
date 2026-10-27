@@ -9,6 +9,8 @@ import { afterEach, describe, it, expect, vi } from 'vitest';
 import type { ThreadMuxSink } from '../../stream/threadStreamMux';
 import type { SubagentRuntime } from '../../runtime';
 import { createSubagentMuxController } from '../muxSink';
+import { createSubagentHistoryStore } from '../historyStore';
+import type { SubagentHistoryEntry } from '../../types';
 
 const attached = vi.hoisted(() => ({ sink: null as ThreadMuxSink | null }));
 vi.mock('../../stream/threadStreamMux', () => ({
@@ -20,8 +22,12 @@ const NOW = 1_700_000_500_000;
 function setup(historyStatus?: string) {
   vi.useFakeTimers({ now: NOW, toFake: ['Date'] });
   const updateSubagentCard = vi.fn();
+  const subagentHistory = createSubagentHistoryStore();
+  if (historyStatus) {
+    subagentHistory.putEntries({ 'task:Qm3xLp': { status: historyStatus } as SubagentHistoryEntry });
+  }
   const rt = {
-    subagentHistory: { get: () => ({ entries: historyStatus ? { 'task:Qm3xLp': { status: historyStatus } } : {} }) },
+    subagentHistory,
     terminalTaskOutcomesRef: { current: new Map<string, string>() },
     updateSubagentCard,
     subagentStateRefsRef: { current: {} },
@@ -36,7 +42,8 @@ function setup(historyStatus?: string) {
     .attachSubagentMux('thread-1', vi.fn());
   const close = () => attached.sink!.onTaskRunClosed('Qm3xLp', 'completed');
   const written = () => updateSubagentCard.mock.calls.map(([, data]) => data as Record<string, unknown>);
-  return { close, written };
+  const runs = () => Object.fromEntries(subagentHistory.get().runs);
+  return { close, written, runs };
 }
 
 afterEach(() => {
@@ -53,6 +60,37 @@ describe('muxSink: when a closed task went quiet', () => {
       { status: 'completed', isActive: false, lastActivityMs: NOW },
       { status: 'completed', isActive: false },
     ]);
+  });
+
+  it('dates a close that is news by the ledger\'s finish of the task\'s latest run', () => {
+    const { close, written } = setup();
+    const sink = attached.sink!;
+    sink.onTaskRun!('Qm3xLp', 'run-1', { startedAtMs: 1_700_000_100_000 });
+    sink.onTaskRun!('Qm3xLp', 'run-1', { finishedAtMs: 1_700_000_200_000 });
+    sink.onTaskRun!('Qm3xLp', 'run-2', { startedAtMs: 1_700_000_300_000 });
+    sink.onTaskRun!('Qm3xLp', 'run-2', { finishedAtMs: 1_700_000_400_000 });
+    close();
+    expect(written()).toEqual([{ status: 'completed', isActive: false, lastActivityMs: 1_700_000_400_000 }]);
+  });
+
+  it('files each run\'s facts under the run, and writes no card for them', () => {
+    const { written, runs } = setup();
+    const sink = attached.sink!;
+    const glm = { id: 'glm-5.3-cn', provider: 'z-ai-cn' };
+    // The channel opens before anything has made the task a card.
+    sink.onTaskRun!('Qm3xLp', 'run-1', { startedAtMs: 1_700_000_100_000 });
+    sink.onTaskRun!('Qm3xLp', 'run-1', { launchToolCallId: 'launch-1', model: glm });
+    sink.onTaskRun!('Qm3xLp', 'run-1', { finishedAtMs: 1_700_000_200_000 });
+    expect(written()).toEqual([]);
+    expect(runs()).toEqual({
+      'run-1': {
+        taskId: 'task:Qm3xLp',
+        launchToolCallId: 'launch-1',
+        startedAtMs: 1_700_000_100_000,
+        finishedAtMs: 1_700_000_200_000,
+        model: glm,
+      },
+    });
   });
 
   it('leaves the clock of a task the page loaded as settled', () => {

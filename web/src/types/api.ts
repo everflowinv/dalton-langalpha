@@ -79,8 +79,8 @@ export interface FeatureState {
 
 // --- Workspace ---
 
-/** Sandbox resource tier. */
-export type ResourceTier = 'standard' | 'performance' | 'max';
+/** Sandbox resource tier. Shown as Small, Medium, Large and Extra Large. */
+export type ResourceTier = 'standard' | 'performance' | 'max' | 'xlarge';
 
 export interface Workspace {
   workspace_id: string;
@@ -156,7 +156,15 @@ export interface WorkspaceCapacity {
 export interface WorkspaceQuota {
   performance: WorkspaceCapacity | null;
   max: WorkspaceCapacity | null;
+  /** Absent from an older server, which is read as unknown. */
+  xlarge?: WorkspaceCapacity | null;
   always_on: WorkspaceCapacity | null;
+  /**
+   * Computers the user holds against the plan's cap, stopped ones included.
+   * Only computers the deployment runs count; a machine the user brings never
+   * does. Absent from an older server, which is read as unknown.
+   */
+  computers?: WorkspaceCapacity | null;
 }
 
 // --- Computer ---
@@ -185,6 +193,8 @@ export interface ComputerSsh {
   tunnel: boolean;
   /** Whether the tunnel is up now; null when the computer has none. */
   tunnel_connected: boolean | null;
+  /** Answered by LangAlpha's helper (remote control of a Mac) rather than the machine's own sshd. */
+  helper: boolean;
 }
 
 export interface Computer {
@@ -337,11 +347,24 @@ export interface ComputerProviderOption {
   /** False when the user's plan lacks it; null when it is not gated or the
    *  platform did not say, which is treated as allowed. */
   allowed: boolean | null;
+  /** The sizes it offers, smallest first, from its server config. Empty for a
+   *  machine the user sizes; absent from an older server, which is unknown. */
+  tiers?: ComputerTierSpec[];
+}
+
+/** One size a provider offers, as its server config defines it. */
+export interface ComputerTierSpec {
+  tier: string;
+  cpu: number;
+  memory_gib: number;
+  disk_gib: number;
 }
 
 /** The providers a user can create a computer on, default first. */
 export interface ComputerProvidersResponse {
   providers: ComputerProviderOption[];
+  /** Whether this server runs a tunnel gateway, which a machine that cannot be dialed connects out to. */
+  tunnels: boolean;
 }
 
 // --- Workspace move ---
@@ -442,6 +465,8 @@ export interface SshProbeResult {
   suggested_root_dir: string;
   /** The machine's own name, the default name of the computer; empty when it gave none. */
   hostname: string;
+  /** Answered by LangAlpha's helper (remote control of a Mac) rather than the machine's own sshd. */
+  helper: boolean;
 }
 
 export type SshProbeErrorCode =
@@ -519,6 +544,9 @@ export interface ThreadOrigin {
   agent?: DispatchingAgent;
 }
 
+/** How an analyst's reported run ended. */
+export type ReportOutcome = 'completed' | 'error' | 'cancelled';
+
 /**
  * What a report-back turn reports on, stamped on its query row. The turn's own
  * message is written for the model, so history labels the turn from this
@@ -526,9 +554,24 @@ export interface ThreadOrigin {
  */
 export type ReportSource =
   /** A dispatched analyst's thread reporting back, and its workspace. */
-  | { kind: 'analyst'; thread_id: string; workspace_id?: string; workspace_name?: string }
+  | {
+      kind: 'analyst'; thread_id: string; workspace_id?: string; workspace_name?: string;
+      /** How the reported run ended. Absent on reports from before it was kept. */
+      outcome?: ReportOutcome;
+      /** The run reported on and the interrupted runs it continued, oldest
+       *  first, so the run reported on is last. */
+      run_ids?: string[];
+      /** The hand-off steers those runs took in: empty when they took none,
+       *  absent when unknown (a report from before it was kept, or one the
+       *  server could not read it for). */
+      steer_ids?: string[];
+    }
   /** A background subagent task in this thread, finished or failed. */
-  | { kind: 'task'; task_id: string; display_id: string; description?: string; failed: boolean };
+  | {
+      kind: 'task'; task_id: string; display_id: string; description?: string; failed: boolean;
+      /** The subagent's role. Absent on reports from before it was kept. */
+      subagent_type?: string;
+    };
 
 export interface ThreadMetadata {
   origin?: ThreadOrigin;

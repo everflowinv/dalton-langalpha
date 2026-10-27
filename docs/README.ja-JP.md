@@ -319,7 +319,7 @@ LangAlpha はフロンティアモデルだけに合わせて調整されてい�
 
 - **Prompt guidance。** フロンティアモデルには簡潔な prompt を、小さなモデルには具体例と段階的な手順を含む詳細な prompt を渡します。どちらも 1 つのテンプレートから生成されるので、内容がずれることはありません。
 - **Reasoning effort。** `none` から `max` までの 1 つの尺度で、各ベンダー独自のパラメーターに書き込まれ、モデルが提供する最も近いレベルまで引き下げられます。入力欄から、メッセージ単位で上書きすることもできます。
-- **Compaction profile。** 積極的なものから緩やかなものまで 4 つのプリセットがあり、長い thread をどれだけ早く compaction するかを決めます。デフォルトでは、モデルの context window に応じて 1 つが選ばれます。
+- **Compaction profile。** 100K から 750K tokens まで 8 つのプリセットがあり、長い thread をどれだけ早く compaction するかを決めます。デフォルトでは Claude と GPT は 500K で、その他のモデルは context window に応じたプリセットで compaction します。
 
 | 接続方法 | Provider |
 | --- | --- |

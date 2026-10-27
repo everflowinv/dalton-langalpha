@@ -13,10 +13,13 @@ without importing server modules).
 import json
 import logging
 import uuid
+from datetime import datetime
 from typing import Any, Dict, Optional
 
 from ptc_agent.agent.middleware.background_subagent.registry import TaskRunRejected
+from ptc_agent.config.agent import SubagentModel
 
+from src.server.contracts.run_times import epoch_ms
 from src.server.contracts.status import REPORT_BACK_STATUSES
 from src.server.database import replay_facts as facts_db
 from src.server.database.runs import subagent_runs as sr_db
@@ -32,6 +35,16 @@ def v2_stream_key(thread_id: str, task_run_id: str) -> str:
     nothing resets or re-incarnates a key readers may hold cursors into.
     """
     return f"subagent:stream:{thread_id}:{task_run_id}"
+
+
+def _run_end_payload(outcome: str, finalized_at: Optional[datetime]) -> Dict[str, Any]:
+    """``run_end``'s payload: the outcome, and when the CAS settled the run
+    (``finished``, epoch ms), so a live card ends its run where the ledger
+    did rather than whenever the frame reached it."""
+    payload: Dict[str, Any] = {"outcome": outcome}
+    if finalized_at is not None:
+        payload["finished"] = epoch_ms(finalized_at)
+    return payload
 
 
 def _refresh_launching_turn(thread_id: Any, parent_run_id: Any) -> None:
@@ -83,9 +96,12 @@ class SubagentRunCoordinator:
         subagent_type: str = "general-purpose",
         parent_run_id: Optional[str] = None,
         launch_tool_call_id: Optional[str] = None,
+        model: Optional[SubagentModel] = None,
     ) -> str:
         """Bear the run row (in_progress) and open its v2 stream; returns the
-        new task_run_id.
+        new task_run_id. ``model`` is the model the run will use, given only
+        when it is not its launcher's; the row and ``lane_open`` both carry
+        it, so a live card and a replayed one agree.
 
         Called under the task's namespace guard, BEFORE the writer spawns.
         Any constraint conflict raises TaskRunRejected — the spawn/resume
@@ -120,6 +136,7 @@ class SubagentRunCoordinator:
                 launch_tool_call_id=launch_tool_call_id,
                 predecessor_run_id=predecessor_run_id,
                 start_checkpoint_id=start_checkpoint_id,
+                model=model,
             )
         except sr_db.DuplicateLaunchError as e:
             raise TaskRunRejected(
@@ -152,6 +169,7 @@ class SubagentRunCoordinator:
                     "launch_tool_call_id": launch_tool_call_id,
                     "description": description,
                     "subagent_type": subagent_type,
+                    **({"model": model} if model else {}),
                 },
                 required=True,
             )
@@ -285,7 +303,7 @@ class SubagentRunCoordinator:
                     task_run_id,
                     lane=f"task:{run['task_id']}",
                     frame_type="run_end",
-                    payload={"outcome": run["status"]},
+                    payload=_run_end_payload(run["status"], run.get("finalized_at")),
                     terminal=True,
                 )
             if run["status"] in REPORT_BACK_STATUSES and run.get("parent_run_id"):
@@ -301,12 +319,18 @@ class SubagentRunCoordinator:
         return result
 
     async def append_run_end(
-        self, task_run_id: str, *, task_id: str, outcome: str
+        self,
+        task_run_id: str,
+        *,
+        task_id: str,
+        outcome: str,
+        finalized_at: datetime,
     ) -> None:
         """Cursor-bearing terminal frame for the wrapper's deferred path —
         appended after the run's steering_returned frames so they precede it
         and nothing follows it. Idempotent by last-frame
-        inspection, so it is safe to race a recovery finalizer."""
+        inspection, so it is safe to race a recovery finalizer.
+        ``finalized_at`` is the settling row's, from the CAS."""
         try:
             from src.utils.cache.redis_cache import get_cache_client
 
@@ -330,7 +354,7 @@ class SubagentRunCoordinator:
             task_run_id,
             lane=f"task:{task_id}",
             frame_type="run_end",
-            payload={"outcome": outcome},
+            payload=_run_end_payload(outcome, finalized_at),
             terminal=True,
         )
 

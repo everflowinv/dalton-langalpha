@@ -214,7 +214,8 @@ def _alive(pid):
         try:
             with open(f"/proc/{pid}/stat") as f:
                 state = f.read().rsplit(")", 1)[1].split()[0]
-        except FileNotFoundError:
+        except (FileNotFoundError, ProcessLookupError):
+            # The process can go between the open and the read.
             return False
     else:
         state = subprocess.run(

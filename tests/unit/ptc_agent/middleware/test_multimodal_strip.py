@@ -4,12 +4,14 @@ Its counterpart, the Read interception that puts an attachment into history in
 the first place, is covered in ``test_multimodal_read``.
 """
 
+import base64
 import io
 import types
 
 import pypdf
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from PIL import Image
 
 from ptc_agent.agent.middleware._message_utils import order_tool_results_first
 from ptc_agent.agent.middleware.file_operations.multimodal_strip import (
@@ -316,10 +318,15 @@ class TestAwrapModelCall:
 
     @staticmethod
     def _image_history():
+        # A real image: a vision target now also has each image fitted to its
+        # pixel limit, and bytes that do not decode are replaced.
+        png = io.BytesIO()
+        Image.new("RGB", (4, 4), "white").save(png, "PNG")
+        url = "data:image/png;base64," + base64.b64encode(png.getvalue()).decode()
         return [
             HumanMessage(content=[
                 {"type": "text", "text": "Look at this"},
-                {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+                {"type": "image_url", "image_url": {"url": url}},
             ]),
         ]
 

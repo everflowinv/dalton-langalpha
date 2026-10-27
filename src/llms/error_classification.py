@@ -16,6 +16,14 @@ import re
 # params. 408 and 429 are absent on purpose — those are transient.
 NON_RETRYABLE_STATUSES: frozenset[int] = frozenset({400, 401, 403, 404, 405, 413, 422})
 
+# Raised by our own or an SDK's code on input it cannot handle: a field the
+# provider never sent, a value of the wrong type, a method a proxy's payload
+# lacks. The same response parses the same way, so a retry raises it again.
+# The transports never raise these for a transient failure: httpx and httpcore
+# map connection and timeout failures to their own classes, and the Anthropic
+# and OpenAI SDKs re-raise those as their connection and timeout errors.
+_PROGRAMMING_ERRORS = (AttributeError, TypeError, KeyError)
+
 _STATUS_CODE_RE = re.compile(r"\b([45]\d{2})\b")
 
 
@@ -89,11 +97,25 @@ def is_mid_stream_error(exc: BaseException) -> bool:
     )
 
 
+def is_programming_error(exc: BaseException) -> bool:
+    """Whether a crash in the call path, not the provider or the network, caused it.
+
+    Looked for along the whole chain because the SDKs wrap whatever their
+    transport raises in a connection error, which hides the crash one level down.
+    """
+    return any(
+        isinstance(current, _PROGRAMMING_ERRORS)
+        for current in _iter_exception_chain(exc)
+    )
+
+
 def is_retryable_error(exc: BaseException, status_code: int | None = None) -> bool:
     """Whether retrying the same model could plausibly succeed.
 
     Errors with no extractable status (connection resets, timeouts) stay
-    retryable.
+    retryable, unless a programming error sits in the chain: it fails the same
+    way on every attempt. A status the provider reported decides first, so the
+    check never overrides a provider's own verdict.
     """
     if status_code is None:
         status_code = extract_status_code(exc)
@@ -108,4 +130,6 @@ def is_retryable_error(exc: BaseException, status_code: int | None = None) -> bo
             return True
     except Exception:
         pass
+    if status_code is None:
+        return not is_programming_error(exc)
     return status_code not in NON_RETRYABLE_STATUSES

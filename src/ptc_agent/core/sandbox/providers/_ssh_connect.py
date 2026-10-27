@@ -513,6 +513,17 @@ async def connect(target: SSHTarget, private_key: str) -> asyncssh.SSHClientConn
             await asyncio.sleep(delay)
 
 
+# How LangAlpha's helper identifies itself in the SSH handshake. A machine it
+# answers for runs no sshd, and keeps the deployment's key in the helper's own
+# folder rather than in ~/.ssh/authorized_keys.
+HELPER_ID_PREFIX = "SSH-2.0-LangAlphaHelper_"
+
+
+def answered_by_helper(conn: asyncssh.SSHClientConnection) -> bool:
+    """Whether LangAlpha's helper, rather than an sshd, answered the handshake."""
+    return str(conn.get_extra_info("server_version") or "").startswith(HELPER_ID_PREFIX)
+
+
 def host_key_line(conn: asyncssh.SSHClientConnection) -> tuple[str, str]:
     """The key the machine presented, as an OpenSSH line, and its fingerprint."""
     key = conn.get_server_host_key()

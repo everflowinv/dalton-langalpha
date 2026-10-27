@@ -210,6 +210,6 @@ export function applyHistoryToolResult({ event, assistantMessageId, pairState, p
   }
 
   // Resolve pending create_workspace, start_question, ptc_agent, or secretary action interrupt from tool_call_result
-  settleProposalFromResult(pending, event.tool_call_id as string | undefined, event.content, setMessages);
+  settleProposalFromResult(pending, event.tool_call_id as string | undefined, event, setMessages);
 }
 

@@ -194,6 +194,7 @@ def task_report(payload: dict) -> "TaskReport":
         # Pre-final_status jobs (enqueued before the field existed) carry no
         # status; only completed runs were enqueued then.
         failed=payload.get("final_status") == "error",
+        subagent_type=payload.get("subagent_type") or None,
     )
 
 

@@ -41,7 +41,7 @@ export interface CustomProviderEntry {
  * The stored model bag: catalog, routing, and the account-wide tuning a model
  * inherits when its own profile is silent.
  *
- * Extends `ModelProfile` because the four tuning fields are the same settings
+ * Extends `ModelProfile` because the tuning fields are the same settings
  * at the account layer that a profile overrides per model.
  */
 export interface ModelPreferences extends ModelProfile {
@@ -143,14 +143,15 @@ export const MOVED_MODEL_KEYS: ReadonlySet<string> = new Set<string>(MOVED_KEYS)
  */
 export const MODEL_PREF_KEYS: ReadonlySet<string> = new Set<string>([
   ...MOVED_KEYS,
-  // None ever lived in `other_preference`: `profiles`, `default_model_scope`
-  // and `background_follows` are new, and `prompt_guidance` appears there only if
-  // 034's downgrade puts it back. They route to the model column without
-  // having a copy to read underneath.
+  // None ever lived in `other_preference`: `profiles`, `default_model_scope`,
+  // `background_follows` and `native_compaction` are new, and `prompt_guidance`
+  // appears there only if 034's downgrade puts it back. They route to the model
+  // column without having a copy to read underneath.
   'profiles',
   'prompt_guidance',
   'default_model_scope',
   'background_follows',
+  'native_compaction',
   // DALTON-HOOK(settings-section): route Dalton model settings to model_preference
   'dalton_audit_model',
   'dalton_language_model',

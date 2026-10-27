@@ -17,7 +17,7 @@ import { useAnalystRoster } from '../useAnalystRoster';
 const liveness = vi.hoisted(() => vi.fn<(ids: string[]) => Promise<DispatchLiveness[]>>());
 vi.mock('../../../utils/api', async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),
-  getDispatchLiveness: liveness,
+  getHandoffLiveness: async ({ threads }: { threads: string[] }) => ({ liveness: await liveness(threads), runs: [], steers: [] }),
 }));
 
 const failedHandOff: AnalystCandidate = {

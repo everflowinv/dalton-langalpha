@@ -30,9 +30,41 @@ sandbox:
   docker:
     memory_limit: "3g"
     cpu_count: 2.0
+    # Product decision 7/12: keep `max` at 4 vCPU (and 4 code slots) so existing
+    # `max` computers are never downsized by upstream #604's 4 -> 2 vCPU reduction.
+    resource_tiers:
+      standard:
+        cpu: 1
+        memory: 2
+        disk: 5
+      performance:
+        cpu: 2
+        memory: 4
+        disk: 10
+      max:
+        cpu: 4
+        memory: 8
+        disk: 10
+      xlarge:
+        cpu: 4
+        memory: 8
+        disk: 20
   daytona:
     # Used by WorkspaceManager to derive idle auto-stop threshold (2400 - 600 = 1800s = 30 min)
     auto_stop_interval: 2400
+    resource_tiers:
+      standard:
+        cpu: 1
+        memory: 2
+        disk: 5
+      performance:
+        cpu: 2
+        memory: 4
+        disk: 10
+      max:
+        cpu: 4
+        memory: 8
+        disk: 10
 
 mcp:
   servers:

@@ -11,12 +11,13 @@ from typing import Any
 
 from ptc_agent.core.project_context import ProjectContext
 
-from src.llms.llm import get_input_modalities
+from src.llms.llm import get_image_types, get_input_modalities, image_route
 from src.server.models.chat import ChatRequest
 from src.server.utils.multimodal_context import (
     build_file_reminder,
     build_unsupported_reminder,
     filter_multimodal_by_capability,
+    find_unreadable_images,
     inject_multimodal_context,
     parse_multimodal_contexts,
     upload_to_sandbox,
@@ -65,10 +66,19 @@ async def attach_request_files(
             f"[PTC_CHAT] Uploaded {len(multimodal_contexts)} attachment(s) to sandbox"
         )
 
-    # 2. Filter by model capability for native content blocks
+    # 2. Filter by model capability for native content blocks. An image the
+    # turn's route can't be given takes the file-only route on every model.
     modalities = _modalities(effective_model, config)
+    client = getattr(config, "llm_client", None)
+    route = image_route(
+        getattr(client, "metadata", None) or {"manifest_model": effective_model}
+    )
     supported, unsupported, file_only = filter_multimodal_by_capability(
-        multimodal_contexts, modalities
+        multimodal_contexts,
+        modalities,
+        unreadable=await find_unreadable_images(
+            multimodal_contexts, get_image_types(route)
+        ),
     )
 
     # 3. Inject supported as native content blocks (merged into user message)

@@ -19,8 +19,10 @@ interface RemoveComputerDialogProps {
   filesKeptIn: string | null;
   /** Our key sits in the machine's authorized_keys, so the user may choose to take it out. */
   holdsOurKey: boolean;
+  /** The computer is this Mac, whose remote control goes off with it. */
+  turnsOffRemoteControl?: boolean;
   onClose: () => void;
-  /** `removeKey` is the box's state; true where the box is not shown, which the server ignores. */
+  /** `removeKey` is the box's state, and false where the box is not shown. */
   onConfirm: (removeKey: boolean) => void;
   /** The request is in flight. */
   busy: boolean;
@@ -28,7 +30,16 @@ interface RemoveComputerDialogProps {
   error: string | null;
 }
 
-function RemoveComputerDialog({ name, filesKeptIn, holdsOurKey, onClose, onConfirm, busy, error }: RemoveComputerDialogProps) {
+function RemoveComputerDialog({
+  name,
+  filesKeptIn,
+  holdsOurKey,
+  turnsOffRemoteControl = false,
+  onClose,
+  onConfirm,
+  busy,
+  error,
+}: RemoveComputerDialogProps) {
   const { t } = useTranslation();
   const titleId = useId();
   // On by default: a login left behind on a machine we no longer use is the
@@ -40,7 +51,7 @@ function RemoveComputerDialog({ name, filesKeptIn, holdsOurKey, onClose, onConfi
       <Button type="button" variant="ghost" onClick={onClose} disabled={busy}>
         {t('common.cancel')}
       </Button>
-      <Button type="button" variant="destructive" onClick={() => onConfirm(removeKey)} disabled={busy} aria-busy={busy}>
+      <Button type="button" variant="destructive" onClick={() => onConfirm(holdsOurKey && removeKey)} disabled={busy} aria-busy={busy}>
         {busy ? t('computer.removing', 'Removing...') : t('computer.removeConfirm', 'Remove computer')}
       </Button>
     </div>
@@ -66,6 +77,11 @@ function RemoveComputerDialog({ name, filesKeptIn, holdsOurKey, onClose, onConfi
             )
           : t('computer.removeBody', "Its sandbox and everything on its disk are deleted. This can't be undone.")}
       </p>
+      {turnsOffRemoteControl && (
+        <p className="text-sm" style={{ color: 'var(--color-text-secondary)' }}>
+          {t('computer.remoteControl.removeTurnsOff', 'Remote control on this Mac turns off too.')}
+        </p>
+      )}
       {holdsOurKey && (
         <CheckboxChoice
           checked={removeKey}

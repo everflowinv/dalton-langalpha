@@ -1660,11 +1660,29 @@ describe('packaging a saas build', () => {
         // pathname of `https://u:p@host` is '/'.
         DESKTOP_APP_ORIGIN: 'https://deploy:hunter2@app.example.com',
         DESKTOP_PLATFORM_ORIGIN: 'https://platform.example.com',
+        DESKTOP_PAIRING_ORIGIN: 'https://api.example.com',
       },
     })
     assert.equal(run.status, 1)
     assert.match(run.stderr, /without a username or password/)
     assert.doesNotMatch(run.stderr, /hunter2/, 'and does not echo the password it refused')
+    assert.equal(fs.existsSync(written), before, 'and wrote nothing')
+  })
+
+  test('a saas package names the one server it pairs this Mac with', () => {
+    const before = fs.existsSync(written)
+    const run = spawnSync(process.execPath, [script], {
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        DESKTOP_EDITION: 'saas',
+        DESKTOP_APP_ORIGIN: 'https://app.example.com',
+        DESKTOP_PLATFORM_ORIGIN: 'https://platform.example.com',
+        DESKTOP_PAIRING_ORIGIN: '',
+      },
+    })
+    assert.equal(run.status, 1)
+    assert.match(run.stderr, /DESKTOP_PAIRING_ORIGIN is required/)
     assert.equal(fs.existsSync(written), before, 'and wrote nothing')
   })
 
@@ -1679,6 +1697,7 @@ describe('packaging a saas build', () => {
         // The same origin wearing a trailing slash, because `new URL().origin`
         // normalizes it away and a string compare on the input would not.
         DESKTOP_PLATFORM_ORIGIN: 'https://app.example.com/',
+        DESKTOP_PAIRING_ORIGIN: 'https://api.example.com',
       },
     })
     assert.equal(run.status, 1, 'packaging failed rather than producing a broken build')
@@ -1887,7 +1906,8 @@ describe('the bridge says what the shell can do', () => {
     const bridge = loadPreload().langalphaDesktop
     const callable = Object.keys(bridge).filter((k) => typeof bridge[k] === 'function').sort()
     assert.deepEqual(callable, [
-      'beginMcpOAuth', 'bindMcpOAuth', 'cancelMcpOAuth', 'openExternal', 'savePdf', 'setTheme',
+      'beginMcpOAuth', 'bindMcpOAuth', 'cancelMcpOAuth', 'disableRemoteControl', 'enableRemoteControl',
+      'getRemoteControl', 'openExternal', 'savePdf', 'setTheme',
     ])
   })
 
@@ -1982,8 +2002,14 @@ describe('the two editions can sit on one machine', () => {
   const read = (rel) => fs.readFileSync(path.join(__dirname, '..', rel), 'utf8')
 
   const IDENTITY = {
-    saas: { appId: 'ai.langalpha.desktop', appName: 'LangAlpha', scheme: 'langalpha' },
-    oss: { appId: 'ai.langalpha.desktop.oss', appName: 'LangAlpha OSS', scheme: 'langalpha-oss' },
+    saas: {
+      appId: 'ai.langalpha.desktop', appName: 'LangAlpha', scheme: 'langalpha',
+      helperLabel: 'ai.langalpha.desktop.helper',
+    },
+    oss: {
+      appId: 'ai.langalpha.desktop.oss', appName: 'LangAlpha OSS', scheme: 'langalpha-oss',
+      helperLabel: 'ai.langalpha.desktop.oss.helper',
+    },
   }
 
   test('nothing about the two identities is shared', () => {
@@ -1993,13 +2019,22 @@ describe('the two editions can sit on one machine', () => {
     assert.notEqual(saas.appId, oss.appId)
     assert.notEqual(saas.appName, oss.appName, 'an equal name means an equal userData directory')
     assert.notEqual(saas.scheme, oss.scheme, 'an equal scheme means the OS picks one for both')
+    assert.notEqual(saas.helperLabel, oss.helperLabel, 'an equal label is one launchd job for both')
+  })
+
+  // `<appId>.helper` is the contract the helper, the web and this shell share;
+  // the label is the plist's stem and the name SMAppService is asked about.
+  test('each helper label is its edition\'s bundle id, extended', () => {
+    for (const id of Object.values(IDENTITY)) assert.equal(id.helperLabel, `${id.appId}.helper`)
   })
 
   for (const edition of ['saas', 'oss']) {
     test(`the running ${edition} app agrees with what was packaged`, () => {
-      const { config, deeplink } = loadShell({ edition })
+      const { config, deeplink, remoteControl } = loadShell({ edition })
       assert.equal(config.appName, IDENTITY[edition].appName)
       assert.equal(config.scheme, IDENTITY[edition].scheme)
+      assert.equal(config.helperLabel, IDENTITY[edition].helperLabel)
+      assert.equal(remoteControl.SERVICE_NAME, `${IDENTITY[edition].helperLabel}.plist`)
       // deeplink registers with the OS and parses incoming links off this, so a
       // config it did not read is a scheme nothing answers on.
       assert.equal(deeplink.SCHEME, IDENTITY[edition].scheme)

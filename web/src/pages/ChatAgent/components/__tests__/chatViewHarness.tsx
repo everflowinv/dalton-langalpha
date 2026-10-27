@@ -126,6 +126,8 @@ const baseChatState = () => ({
   reconnectIfStaleRun: vi.fn<() => Promise<boolean>>().mockResolvedValue(true),
   isOwnRun: () => false,
   getSubagentHistory: vi.fn().mockReturnValue(null),
+  getTaskRuns: vi.fn().mockReturnValue([]),
+  putTaskRun: vi.fn(),
   subagentHistoryEntries: {},
   resolveSubagentIdToAgentId: vi.fn((id: string) => id),
 });

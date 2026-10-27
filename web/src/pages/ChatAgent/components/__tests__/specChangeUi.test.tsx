@@ -23,12 +23,20 @@ describe('SpecChangeProgress', () => {
     render(<SpecChangeProgress change={upgrading} />);
     const [status, ...rest] = screen.getAllByRole('status');
     expect(rest).toHaveLength(0);
-    expect(status).toHaveTextContent('Upgrading to Performance…');
+    expect(status).toHaveTextContent('Upgrading to Medium…');
   });
 
   it('stays silent as a label, loader included', () => {
     render(<SpecChangeProgress change={upgrading} asLabel />);
     expect(screen.queryByRole('status')).toBeNull();
-    expect(screen.getByText('Upgrading to Performance…')).toBeInTheDocument();
+    expect(screen.getByText('Upgrading to Medium…')).toBeInTheDocument();
+  });
+
+  it.each([
+    ['max', 'xlarge', 'Upgrading to Extra Large…'],
+    ['xlarge', 'max', 'Changing spec to Large…'],
+  ] as const)('reads %s to %s on the full ladder', (from_tier, target_tier, label) => {
+    render(<SpecChangeProgress change={{ ...upgrading, from_tier, target_tier }} />);
+    expect(screen.getByRole('status')).toHaveTextContent(label);
   });
 });

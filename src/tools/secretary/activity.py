@@ -209,6 +209,8 @@ def _workspace_line(
         facts.append(f"last active {_date(active, zone)}")
     if computer := placement.computer(ws):
         facts.append(f'computer "{_one_line(computer, _TITLE_CHARS)}"')
+    if machine := placement.machine(ws):
+        facts.append(machine)
     if folder := placement.folder(ws):
         facts.append(f"folder `{_one_line(folder, _TITLE_CHARS)}`")
     facts.append(f"workspace_id `{ws['workspace_id']}`")

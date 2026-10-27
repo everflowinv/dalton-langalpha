@@ -1087,6 +1087,8 @@ async def _prefs_endpoint(stored_model_preference=None):
         {"prompt_guidance": "verbose"},
         {"compaction_profile": "enormous"},
         {"profiles": {"some-model": {"fast_mode": "yes"}}},
+        {"native_compaction": "on"},
+        {"profiles": {"some-model": {"native_compaction": "on"}}},
     ],
 )
 @pytest.mark.asyncio

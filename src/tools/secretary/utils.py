@@ -476,6 +476,23 @@ def computer_label(name: str | None, computers: int) -> str | None:
     return name.strip() or "Untitled"
 
 
+def computer_machine(
+    kind: str | None, provider_config: Mapping[str, Any] | None
+) -> str:
+    """Whose machine a computer is, as a token the agent's context words.
+
+    "" for a computer this deployment hosts. Otherwise the machine is the
+    user's ("own"), and the one they work on ("personal") when the desktop
+    app's helper paired it; "_mac" follows when it runs macOS. A computer
+    added before its system was kept reads as not a Mac.
+    """
+    if kind != "ssh":
+        return ""
+    config = provider_config or {}
+    owner = "personal" if config.get("helper") else "own"
+    return f"{owner}_mac" if config.get("os") == "Darwin" else owner
+
+
 @dataclass(frozen=True, slots=True)
 class ComputerPlacement:
     """Which computer each of the user's workspaces is on, as the Chief of Staff is told.
@@ -487,6 +504,7 @@ class ComputerPlacement:
 
     home_computer_id: str | None = None
     names: Mapping[str, str] = field(default_factory=dict)
+    machines: Mapping[str, str] = field(default_factory=dict)
 
     @classmethod
     def from_rows(cls, rows: Sequence[Mapping[str, Any]]) -> "ComputerPlacement":
@@ -495,8 +513,14 @@ class ComputerPlacement:
             for row in rows
             if (label := computer_label(row["name"], len(rows))) is not None
         }
+        machines = {
+            str(row["computer_id"]): computer_machine(
+                row.get("kind"), row.get("provider_config")
+            )
+            for row in rows
+        }
         home = next((str(row["computer_id"]) for row in rows if row["is_home"]), None)
-        return cls(home_computer_id=home, names=names)
+        return cls(home_computer_id=home, names=names, machines=machines)
 
     def folder(self, workspace: Mapping[str, Any]) -> str | None:
         # With Home on no computer nothing matches, since str() is never None.
@@ -506,6 +530,19 @@ class ComputerPlacement:
 
     def computer(self, workspace: Mapping[str, Any]) -> str | None:
         return self.names.get(str(workspace.get("computer_id")))
+
+    def machine(self, workspace: Mapping[str, Any]) -> str | None:
+        """What sets the workspace's computer apart when it is the user's own.
+
+        Said only beside the computer's name: with one computer, Home's own
+        block says whose it is.
+        """
+        if self.computer(workspace) is None:
+            return None
+        machine = self.machines.get(str(workspace.get("computer_id")), "")
+        if machine.endswith("_mac"):
+            return "the user's own Mac"
+        return "the user's own machine" if machine else None
 
 
 async def read_computer_placement(user_id: str) -> ComputerPlacement:

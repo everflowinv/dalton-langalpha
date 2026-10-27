@@ -4,7 +4,7 @@
  * form: people paste the `ssh` line they already use, so that is accepted as
  * well as a bare `user@host[:port]`.
  */
-import type { ComputerCreate, SshProbeResult, SshTarget } from '@/types/api';
+import type { ComputerCreate, SshPairingStatus, SshProbeResult, SshTarget } from '@/types/api';
 
 export const SSH_DEFAULT_PORT = 22;
 
@@ -134,6 +134,11 @@ export function formatSshReached(target: SshTarget, tunneled: boolean): string {
 export interface SshReady {
   target: SshTarget;
   probe: SshProbeResult;
+}
+
+/** The machine a pairing reached, once it is ready; null until then. */
+export function pairingReady(pairing: SshPairingStatus | undefined): SshReady | null {
+  return pairing?.status === 'ready' && pairing.target && pairing.probe ? { target: pairing.target, probe: pairing.probe } : null;
 }
 
 /** The name a computer gets when the user leaves the prefill alone. */

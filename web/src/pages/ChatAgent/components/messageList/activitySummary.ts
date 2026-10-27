@@ -5,10 +5,7 @@ import {
   getCompletedSummary,
   type ToolCategory,
 } from '../toolDisplayConfig';
-import { formatThoughtFor } from '@/lib/elapsed';
-
-/** Translation function signature compatible with i18next's t(). */
-type TFn = (key: string, opts?: Record<string, unknown>) => string;
+import { formatThoughtFor, type TFn } from '@/lib/elapsed';
 
 import type { ActivityItem, ToolActivityItem } from './activityTypes';
 export type { ActivityItem, LiveState } from './activityTypes';

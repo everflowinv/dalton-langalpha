@@ -45,6 +45,11 @@ CLAIMABLE_FOR_START = (ComputerStatus.STOPPED, ComputerStatus.CREATING)
 
 ComputerKind = Literal["daytona", "docker", "e2b", "ssh"]
 
+# Spec presets a request may name. Shown as Small, Medium, Large and Extra
+# Large; the ids predate those names and are persisted on computer rows. Each
+# provider offers its own subset (xlarge is E2B's alone).
+ResourceTierId = Literal["standard", "performance", "max", "xlarge"]
+
 
 _HOSTNAME = re.compile(
     r"^(?=.{1,253}$)[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
@@ -172,7 +177,7 @@ class ComputerCreate(BaseModel):
         max_length=255,
         description="User-facing computer name; a default is used when absent",
     )
-    resource_tier: Literal["standard", "performance", "max"] = Field(
+    resource_tier: ResourceTierId = Field(
         "standard",
         description="Spec preset the computer is created at",
     )
@@ -244,6 +249,10 @@ class ComputerSSHProbeResponse(BaseModel):
         description="Why it cannot, or what will not work, one sentence each",
     )
     hostname: str = Field("", description="The machine's own name for itself")
+    helper: bool = Field(
+        False,
+        description="LangAlpha's helper answers for the machine rather than an sshd",
+    )
     suggested_root_dir: str = Field(
         description=(
             "The folder a computer created without root_dir would work in: "
@@ -364,6 +373,9 @@ class ComputerSSHPairingReport(_ScriptForm):
     ports: str = ""
     addresses: str = ""
     can_tunnel: str = ""
+    # "1" from a machine with no SSH server to dial, such as one LangAlpha's
+    # helper answers for: it is reached through a tunnel or not at all.
+    tunnel_only: str = ""
     tunnel_id: str = ""
     # The run of the command that sent this, a report or a stop.
     run: str = ""
@@ -399,6 +411,23 @@ class ComputerSSHInfo(BaseModel):
         None,
         description="Whether the tunnel is up now; null when there is none or it is not known",
     )
+    helper: bool = Field(
+        False,
+        description=(
+            "LangAlpha's helper answers for the machine rather than an sshd, "
+            "as on a Mac under remote control; our key is then in the helper's "
+            "own folder, never in ~/.ssh/authorized_keys"
+        ),
+    )
+
+
+class ComputerTierSpec(BaseModel):
+    """One spec preset a provider offers, as its config sizes it."""
+
+    tier: str = Field(description="Tier id, as a create or spec change names it")
+    cpu: int = Field(description="vCPU cores")
+    memory_gib: int = Field(description="Memory in GiB")
+    disk_gib: int = Field(description="Disk in GiB")
 
 
 class ComputerProviderOption(BaseModel):
@@ -414,6 +443,13 @@ class ComputerProviderOption(BaseModel):
             "not gated or the answer is unknown, and the create is then allowed"
         )
     )
+    tiers: List[ComputerTierSpec] = Field(
+        default_factory=list,
+        description=(
+            "The spec presets offered here, smallest first; empty where the "
+            "machine is its owner's and they size it"
+        ),
+    )
 
 
 class ComputerProvidersResponse(BaseModel):
@@ -422,12 +458,19 @@ class ComputerProvidersResponse(BaseModel):
     providers: List[ComputerProviderOption] = Field(
         default_factory=list, description="The default provider first"
     )
+    tunnels: bool = Field(
+        False,
+        description=(
+            "Whether an ssh machine may connect out to this server through a "
+            "tunnel, which one with no SSH server of its own needs"
+        ),
+    )
 
 
 class ComputerSpecRequest(BaseModel):
     """Request model for changing a computer's spec tier."""
 
-    tier: Literal["standard", "performance", "max"] = Field(
+    tier: ResourceTierId = Field(
         description="Target spec preset",
     )
 
@@ -577,7 +620,10 @@ class ComputerResponse(BaseModel):
     )
     resource_tier: str = Field(
         "standard",
-        description="Spec preset: standard, performance, max",
+        description=(
+            "Spec preset: standard (Small), performance (Medium), max (Large), "
+            "xlarge (Extra Large)"
+        ),
     )
     is_always_on: bool = Field(
         False,

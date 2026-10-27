@@ -33,7 +33,19 @@ export interface CompactionProfilePreset {
   keep_messages: number;
 }
 
-export type CompactionProfileName = 'aggressive' | 'moderate' | 'extended' | 'relaxed';
+export type CompactionProfileName =
+  | 'aggressive'
+  | 'moderate'
+  | 'extended'
+  | 'economy'
+  | 'relaxed'
+  | 'spacious'
+  | 'expansive'
+  | 'maximal';
+
+/** Whose compaction a model takes, on unless the user turns it off. The twin
+ *  of `NativeKind` in `src/llms/provider_compaction.py`. */
+export type NativeCompactionKind = 'anthropic' | 'openai';
 
 export type CompactionProfileCatalog = Record<CompactionProfileName, CompactionProfilePreset>;
 

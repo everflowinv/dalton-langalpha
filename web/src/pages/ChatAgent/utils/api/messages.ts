@@ -337,8 +337,10 @@ export interface DispatchLiveness {
   status: string;
   run_id: string | null;
   can_reconnect: boolean;
-  /** ISO start of the live run; null once it settled. */
+  /** ISO start of the thread's latest run, live or settled. */
   run_started_at?: string | null;
+  /** ISO time that run settled; null while it is live. */
+  run_finished_at?: string | null;
   /** ISO time the thread's latest turn started or settled, whoever sent it. */
   last_activity_at?: string | null;
   /** The thread's title; null until it is named. */
@@ -347,29 +349,81 @@ export interface DispatchLiveness {
   workspace_name?: string | null;
 }
 
+/** A run read by its id beside the threads: one asked for, or the run that
+ *  took in a steer asked for. */
+export interface DispatchRunLiveness {
+  run_id: string;
+  thread_id: string;
+  /** The same public vocabulary as a thread's row. */
+  status: string;
+  run_started_at?: string | null;
+  /** Null while the run is live. */
+  run_finished_at?: string | null;
+}
+
 /**
- * Batched dispatch liveness for a turn's PTC cards: one request resolves the
- * status + run_id of many dispatched threads at once, replacing N per-card
- * `/status` polls. Foreign/unknown/expired ids are omitted from the response.
- * Returns `[]` without a request for an empty id list.
+ * A hand-off's steer into a run already going, read by its id: `taken` by the
+ * run it names, whose view is in `runs` whether it was asked for or not,
+ * `queued` until a run takes it in, or `dropped` once it settled with none.
  */
-/** The most ids the liveness route reads per request; it drops the rest. */
+export interface DispatchSteerLiveness {
+  steer_id: string;
+  thread_id: string;
+  state: 'taken' | 'queued' | 'dropped';
+  /** Set exactly when the steer was taken. */
+  run_id: string | null;
+}
+
+/** One batched read: each thread's latest run, the runs asked for by id with
+ *  the run of each steer taken, and the steers asked for. */
+export interface HandoffLiveness {
+  liveness: DispatchLiveness[];
+  runs: DispatchRunLiveness[];
+  steers: DispatchSteerLiveness[];
+}
+
+/** What one liveness read asks about, by id: threads for their latest run,
+ *  runs on their own, and steers for the run that took each in. */
+export interface LivenessAsk {
+  threads: readonly string[];
+  runs: readonly string[];
+  steers: readonly string[];
+}
+
+/** The most ids of each kind the liveness route reads per request; it drops the rest. */
 const LIVENESS_IDS_PER_REQUEST = 100;
 
-export async function getDispatchLiveness(
-  threadIds: string[],
-): Promise<DispatchLiveness[]> {
-  const batches: string[][] = [];
-  for (let i = 0; i < threadIds.length; i += LIVENESS_IDS_PER_REQUEST) {
-    batches.push(threadIds.slice(i, i + LIVENESS_IDS_PER_REQUEST));
-  }
-  const pages = await Promise.all(batches.map(async (ids) => {
+/**
+ * Batched liveness for a turn's hand-offs: one request resolves the latest run
+ * of many dispatched threads, and any runs and steers named by id, at once,
+ * replacing N per-card `/status` polls. Foreign/unknown/expired ids are
+ * omitted from the response. Resolves empty without a request when nothing is
+ * asked.
+ */
+export async function getHandoffLiveness({ threads, runs, steers }: LivenessAsk): Promise<HandoffLiveness> {
+  const batches = Math.ceil(Math.max(threads.length, runs.length, steers.length) / LIVENESS_IDS_PER_REQUEST);
+  const pages = await Promise.all(Array.from({ length: batches }, async (_, i) => {
+    const start = i * LIVENESS_IDS_PER_REQUEST;
+    const page = (all: readonly string[]) => all.slice(start, start + LIVENESS_IDS_PER_REQUEST).join(',');
+    const [ids, runIds, steerIds] = [page(threads), page(runs), page(steers)];
     const { data } = await api.get('/api/v1/threads/dispatches/liveness', {
-      params: { ids: ids.join(',') },
+      params: {
+        ...(ids ? { ids } : {}),
+        ...(runIds ? { runs: runIds } : {}),
+        ...(steerIds ? { steers: steerIds } : {}),
+      },
     });
-    return (data?.liveness ?? []) as DispatchLiveness[];
+    return {
+      liveness: (data?.liveness ?? []) as DispatchLiveness[],
+      runs: (data?.runs ?? []) as DispatchRunLiveness[],
+      steers: (data?.steers ?? []) as DispatchSteerLiveness[],
+    };
   }));
-  return pages.flat();
+  return {
+    liveness: pages.flatMap((p) => p.liveness),
+    runs: pages.flatMap((p) => p.runs),
+    steers: pages.flatMap((p) => p.steers),
+  };
 }
 
 // SSE event name of a report-back wake on GET /threads/{id}/watch. Contract:
@@ -660,7 +714,20 @@ export async function sendSubagentMessage(threadId: string, taskId: string, cont
 export async function getSubagentTaskStatus(
   threadId: string,
   taskId: string,
-): Promise<{ task_id: string; status: string | null; error: string | null; last_activity_ms?: number | null }> {
+): Promise<{
+  task_id: string;
+  status: string | null;
+  error: string | null;
+  last_activity_ms?: number | null;
+  /** The latest run's id, which its facts are filed under beside the ones
+   *  the stream and replay found. */
+  run_id?: string | null;
+  /** The latest run's ledger bounds (epoch ms); no finish while it runs. */
+  started_ms?: number | null;
+  finished_ms?: number | null;
+  /** That run's model, present only when it was not its launcher's. */
+  model?: { id: string; provider: string };
+}> {
   const { data } = await api.get(
     `/api/v1/threads/${threadId}/tasks/${taskId}/status`,
   );

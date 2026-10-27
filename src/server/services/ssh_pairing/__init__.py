@@ -17,13 +17,18 @@ instead: it asks for a tunnel, installs a service that keeps one open, and
 reports again with its id. The server then reaches the machine's own sshd
 through the gateway, with the same keys as a direct dial.
 
+A machine running LangAlpha's helper, which answers SSH itself and has no
+sshd, pairs through the same routes without the script: it takes the key
+from ``/key``, keeps it in its own folder, and reports ``tunnel_only``, so
+it is sent straight to a tunnel rather than dialed.
+
 State lives in Redis: the mint, the script's reports and the dialog's polls
 may each land on a different worker.
 """
 
 from src.server.services.ssh_pairing.dial import source_addresses
 from src.server.services.ssh_pairing.flow import connect, issue_tunnel, report
-from src.server.services.ssh_pairing.script import render_script
+from src.server.services.ssh_pairing.script import pairing_key, render_script
 from src.server.services.ssh_pairing.state import (
     EXPIRED,
     PairingNotFound,
@@ -37,6 +42,7 @@ __all__ = [
     "connect",
     "create_pairing",
     "issue_tunnel",
+    "pairing_key",
     "pairing_status",
     "render_script",
     "report",

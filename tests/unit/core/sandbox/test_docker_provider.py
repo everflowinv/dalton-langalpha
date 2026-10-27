@@ -31,7 +31,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from ptc_agent.config.core import (
-    RESOURCE_TIER_CEILING,
     DockerConfig,
     ResourceTier,
 )
@@ -1773,7 +1772,7 @@ class TestDockerProviderResourceTiers:
 
         host_config = _created_host_config(client)
         assert host_config["Memory"] == 8 * _GIB
-        assert host_config["NanoCpus"] == 4_000_000_000
+        assert host_config["NanoCpus"] == 2_000_000_000
 
     @pytest.mark.asyncio
     async def test_performance_tier_sizes_from_the_preset(self):
@@ -1845,14 +1844,15 @@ class TestDockerProviderResourceTiers:
         assert host_config["NanoCpus"] == 3_000_000_000
 
     @pytest.mark.asyncio
-    async def test_tier_above_the_ceiling_is_clamped(self):
+    async def test_a_tier_larger_than_other_providers_build_is_honoured(self):
+        """The host is Docker's only ceiling, and the daemon refuses past it."""
         provider = DockerProvider(
             DockerConfig(
                 memory_limit="1g",
                 cpu_count=1.0,
                 resource_tiers={
                     "standard": ResourceTier(cpu=1, memory=1, disk=3),
-                    "huge": ResourceTier(cpu=64, memory=256, disk=999),
+                    "huge": ResourceTier(cpu=16, memory=32, disk=100),
                 },
             ),
             working_dir="/home/workspace",
@@ -1863,8 +1863,8 @@ class TestDockerProviderResourceTiers:
         await provider.create(tier="huge")
 
         host_config = _created_host_config(client)
-        assert host_config["NanoCpus"] == RESOURCE_TIER_CEILING["cpu"] * 1_000_000_000
-        assert host_config["Memory"] == RESOURCE_TIER_CEILING["memory"] * _GIB
+        assert host_config["NanoCpus"] == 16 * 1_000_000_000
+        assert host_config["Memory"] == 32 * _GIB
 
 
 class TestDockerProviderTierDisk:
@@ -1971,7 +1971,7 @@ class TestDockerProviderTierFailsLoudly:
         client, container = _make_tier_client(
             applied_host_config={
                 "Memory": 8 * _GIB,
-                "CpuQuota": 400_000,
+                "CpuQuota": 200_000,
                 "CpuPeriod": 100_000,
             }
         )
@@ -2010,9 +2010,9 @@ class TestDockerProviderThreadPools:
         await provider.create(tier="max")
 
         env = _created_env(client)
-        assert env["OMP_NUM_THREADS"] == "4"
-        assert env["OPENBLAS_NUM_THREADS"] == "4"
-        assert env["MKL_NUM_THREADS"] == "4"
+        assert env["OMP_NUM_THREADS"] == "2"
+        assert env["OPENBLAS_NUM_THREADS"] == "2"
+        assert env["MKL_NUM_THREADS"] == "2"
 
     @pytest.mark.asyncio
     async def test_thread_pools_follow_the_applied_size_not_the_preset(self):
@@ -2063,19 +2063,19 @@ class TestReconnectResourceRepair:
     @pytest.mark.parametrize("quota", [False, True])
     async def test_repairs_only_smaller_limits_and_rechecks(self, quota):
         host = {"Memory": 2 * 1024**3, "MemorySwap": 4 * 1024**3}
-        host.update({"CpuQuota": 200000, "CpuPeriod": 100000} if quota else {"NanoCpus": 2_000_000_000})
+        host.update({"CpuQuota": 100000, "CpuPeriod": 100000} if quota else {"NanoCpus": 1_000_000_000})
         container = SimpleNamespace(show=AsyncMock(side_effect=[
             {"Id": "existing", "HostConfig": host},
-            {"HostConfig": {"NanoCpus": 4_000_000_000, "Memory": 8 * 1024**3}},
+            {"HostConfig": {"NanoCpus": 2_000_000_000, "Memory": 8 * 1024**3}},
         ]), delete=AsyncMock())
-        provider = DockerProvider(DockerConfig())
+        provider = DockerProvider(DockerConfig(cpu_count=1.0))
         client = SimpleNamespace(_query_json=AsyncMock())
         provider._client = client
         runtime = SimpleNamespace(_container=container, id="existing")
         await provider.prepare_reconnect(runtime, tier="max")
         changes = client._query_json.await_args.kwargs["data"]
         assert changes == {
-            ("CpuQuota" if quota else "NanoCpus"): (400000 if quota else 4_000_000_000),
+            ("CpuQuota" if quota else "NanoCpus"): (200000 if quota else 2_000_000_000),
             "Memory": 8 * 1024**3, "MemorySwap": 8 * 1024**3,
         }
         assert container.show.await_count == 2

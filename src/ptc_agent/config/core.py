@@ -30,11 +30,6 @@ DEFAULT_ALLOWED_IMPORTS = [
 DEFAULT_BLOCKED_PATTERNS: list[str] = []
 
 
-# Organization resource ceiling — every tier is clamped to these maxima.
-# cpu in vCPU cores, memory in GiB, disk in GiB.
-RESOURCE_TIER_CEILING = {"cpu": 4, "memory": 8, "disk": 10}
-
-
 class ResourceTier(BaseModel):
     """A named sandbox resource preset (vCPU cores, memory GiB, disk GiB)."""
 
@@ -43,20 +38,37 @@ class ResourceTier(BaseModel):
     disk: int = Field(ge=1)
 
 
+# Daytona's largest sandbox; a tier above it is refused at create.
+DAYTONA_TIER_CEILING = ResourceTier(cpu=4, memory=8, disk=10)
+# E2B Pro's largest template. Its disk is free space on top of the image, and a
+# 20 GiB build is accepted (2026-10: 25 GiB root, 21 GiB free).
+E2B_TIER_CEILING = ResourceTier(cpu=8, memory=8, disk=20)
+
+
 def _default_resource_tiers() -> dict[str, ResourceTier]:
     return {
-        "standard": ResourceTier(cpu=1, memory=1, disk=3),
-        "performance": ResourceTier(cpu=2, memory=4, disk=5),
-        "max": ResourceTier(cpu=4, memory=8, disk=10),
+        "standard": ResourceTier(cpu=1, memory=2, disk=5),
+        "performance": ResourceTier(cpu=2, memory=4, disk=10),
+        "max": ResourceTier(cpu=2, memory=8, disk=10),
     }
 
 
-class ResourceTieredConfig(BaseModel):
-    """Named cpu/memory/disk presets, shared by every provider that sizes sandboxes.
+def _e2b_resource_tiers() -> dict[str, ResourceTier]:
+    # xlarge exceeds Daytona's ceiling, so only E2B offers it.
+    return {**_default_resource_tiers(), "xlarge": ResourceTier(cpu=4, memory=8, disk=20)}
 
-    A tier name is persisted on the workspace row and outlives the provider that
-    created it, so both providers have to resolve the same name to the same size.
+
+class ResourceTieredConfig(BaseModel):
+    """Named cpu/memory/disk presets, declared by every provider that sizes sandboxes.
+
+    A tier name is persisted on the computer row and outlives any config edit,
+    so every provider that offers a name resolves it to the same size. A
+    provider may offer fewer names than another: a tier above its ceiling is
+    left out rather than shrunk to fit.
     """
+
+    # The largest sandbox the provider builds; None when it sets no limit.
+    TIER_CEILING: ClassVar[ResourceTier | None] = None
 
     default_tier: str = "standard"
     resource_tiers: dict[str, ResourceTier] = Field(
@@ -65,19 +77,28 @@ class ResourceTieredConfig(BaseModel):
 
     @field_validator("resource_tiers")
     @classmethod
-    def _clamp_tiers_to_ceiling(
+    def _tiers_fit_the_ceiling(
         cls, v: dict[str, ResourceTier]
     ) -> dict[str, ResourceTier]:
-        """Clamp every tier to the org ceiling (clamp, never reject)."""
+        """Refuse a tier the provider cannot build.
+
+        Clamping one sold a size the machine never had, and the provider
+        refuses it at create anyway, so the error belongs at load.
+        """
+        ceiling = cls.TIER_CEILING
+        if ceiling is None:
+            return v
         for name, tier in v.items():
-            for resource, ceiling in RESOURCE_TIER_CEILING.items():
-                value = getattr(tier, resource)
-                if value > ceiling:
-                    logger.warning(
-                        "resource_tiers[%r].%s=%s exceeds the org ceiling %s; clamping",
-                        name, resource, value, ceiling,
-                    )
-                    setattr(tier, resource, ceiling)
+            over = [
+                f"{resource}={getattr(tier, resource)} (max {getattr(ceiling, resource)})"
+                for resource in ("cpu", "memory", "disk")
+                if getattr(tier, resource) > getattr(ceiling, resource)
+            ]
+            if over:
+                raise ValueError(
+                    f"resource_tiers[{name!r}] exceeds what {cls.__name__} "
+                    f"can build: {', '.join(over)}"
+                )
         return v
 
     @model_validator(mode="after")
@@ -147,6 +168,7 @@ class DaytonaConfig(CredentialedSandboxConfig):
         "secret_namespace": "DAYTONA_SECRET_NAMESPACE",
     }
     API_KEY_HELP: ClassVar[str] = "DAYTONA_API_KEY"
+    TIER_CEILING: ClassVar[ResourceTier | None] = DAYTONA_TIER_CEILING
 
     base_url: str = "https://app.daytona.io/api"
     auto_stop_interval: int = 3600  # 1 hour
@@ -191,6 +213,11 @@ class E2BConfig(CredentialedSandboxConfig):
     }
     API_KEY_HELP: ClassVar[str] = (
         "E2B_API_KEY (create one at https://e2b.dev/dashboard?tab=keys)"
+    )
+    TIER_CEILING: ClassVar[ResourceTier | None] = E2B_TIER_CEILING
+
+    resource_tiers: dict[str, ResourceTier] = Field(
+        default_factory=_e2b_resource_tiers, validate_default=True
     )
 
     domain: str = ""
@@ -412,6 +439,8 @@ class DockerConfig(ResourceTieredConfig):
             - "/secrets/keys:/run/secrets:ro"
     """
 
+    # No TIER_CEILING: the host is the limit, and Docker refuses a container
+    # above it at create.
     image: str = "langalpha-sandbox:latest"
     working_dir: str = "/home/workspace"  # fallback; filesystem.working_directory is authoritative
     # Docker never stops a container on idle, so the server's idle reaper
@@ -461,6 +490,14 @@ class SSHConfig(ResourceTieredConfig):
     # which only the server sets. With one, ``host`` is the machine's name and
     # ``port`` its sshd's port on the machine itself; nothing dials either.
     tunnel: str = ""
+    # LangAlpha's helper answers for the machine rather than an sshd, which
+    # only the server sets, from the probe. The helper keeps the key in its
+    # own folder, so nothing of ours is in the login's ~/.ssh.
+    helper: bool = False
+    # The machine's system as ``uname -s`` names it ("Darwin", "Linux"), which
+    # only the server sets, from the probe. Nothing connects by it: it tells
+    # the agent a Mac's command line tools are not GNU's.
+    os: str = ""
     # The machine never stops on idle, so the server's idle reaper stops a
     # quiet one by this interval. Stopping only ends this computer's own
     # processes there; the machine keeps running.
@@ -509,6 +546,8 @@ class SSHConfig(ResourceTieredConfig):
         "host_key",
         "key_owner",
         "tunnel",
+        "helper",
+        "os",
     )
 
     @field_validator("login_from")

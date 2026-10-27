@@ -57,10 +57,14 @@ export function BrandMark({
       className={cn(
         'shrink-0 object-contain',
         TILE_SIZES[size],
-        // A logo drawn as a transparent dark glyph disappears on a dark
-        // surface; the ones that ship that way say so and get a light bed.
-        art.padded && 'bg-white p-0.5',
+        // A mark drawn in black would vanish on the dark theme's surfaces, so
+        // it is turned light there; the half turn of hue puts an accent it
+        // carries back near its own color after the inversion.
+        art.ink && 'invert hue-rotate-180 [[data-theme=light]_&]:filter-none',
         className,
+        // After the caller's class, whose rounding is for the stand-in: a bare
+        // glyph has no edge to round, only corners to lose.
+        art.bare && 'rounded-none',
       )}
       onError={() => setFailedSrc(art.src)}
     />

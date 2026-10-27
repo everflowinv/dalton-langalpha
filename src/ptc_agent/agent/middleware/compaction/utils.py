@@ -33,6 +33,7 @@ from ptc_agent.agent.transcript import TranscriptTarget
 from ptc_agent.agent.transcript.classify import LEGACY_SUMMARY_PREFIX, is_summary_message
 from ptc_agent.agent.transcript.pointer import SummarySpan, transcript_note
 from src.llms.attachment_payload import FILE_BLOCK_TYPES, IMAGE_BLOCK_TYPES
+from src.llms.provider_compaction import SIDECAR_KEY, sidecar
 from ptc_agent.agent.middleware.compaction.types import (
     CONTEXT_SUMMARY_PREFIX,
     NON_CRITICAL_READ_PREFIXES,
@@ -526,6 +527,25 @@ def find_group_safe_cutoff(messages: list[AnyMessage], cutoff_index: int) -> int
     return 0
 
 
+def provider_cutoff(messages: list[AnyMessage], cutoff_index: int) -> int:
+    """The latest cut at or before ``cutoff_index`` that a provider's own
+    compaction takes, or 0 when there is none.
+
+    The kept part opens on an assistant turn right after a user-side one, so
+    the API cannot merge it into the messages summarized, and at least two
+    messages are summarized, so there is more than an earlier summary to
+    condense.
+    """
+    for i in range(min(cutoff_index, len(messages) - 1), 1, -1):
+        if (
+            isinstance(messages[i], AIMessage)
+            and isinstance(messages[i - 1], (HumanMessage, ToolMessage))
+            and find_group_safe_cutoff(messages, i) == i
+        ):
+            return i
+    return 0
+
+
 def strip_orphan_tool_messages(tail: list[AnyMessage]) -> list[AnyMessage]:
     """Drop tool results in ``tail`` that no preceding message asked for.
 
@@ -753,6 +773,8 @@ def build_summary_message(
     skills: Sequence[str] = (),
     source: str = "model",
     notes: str = "",
+    native: Mapping[str, Any] | None = None,
+    origin: str | None = None,
 ) -> HumanMessage:
     """Build the summary HumanMessage, pointing at the transcript when there is one.
 
@@ -763,18 +785,20 @@ def build_summary_message(
     ``skill_reload_note``). ``source`` says what wrote the summary (see
     ``summarize``). ``notes`` (the scratchpad pointer, already rendered) goes
     last; the stamped length is what keeps it out of the summary a reader
-    parses back.
+    parses back. ``native`` is what a provider's own compaction answered
+    with, sent in place of ``summary`` with the notes after it where the
+    provider can read it (see ``src.llms.provider_compaction``).
     """
-    content = f"{CONTEXT_SUMMARY_PREFIX}{summary}"
-    if transcript is not None:
-        content += transcript_note(transcript, span, index)
-    content += skill_reload_note(list(skills))
-    content += notes
+    note = transcript_note(transcript, span, index) if transcript is not None else ""
+    note += skill_reload_note(list(skills)) + notes
+    content = f"{CONTEXT_SUMMARY_PREFIX}{summary}{note}"
+    carried = {SIDECAR_KEY: sidecar(native, origin, note.lstrip())} if native else {}
 
     return HumanMessage(
         content=content,
         id=str(uuid.uuid4()),
         additional_kwargs={
+            **carried,
             "lc_source": _SUMMARY_SOURCE,
             "summarize_complete": {
                 "summary_length": len(summary),

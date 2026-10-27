@@ -81,3 +81,40 @@ async def test_home_names_its_folder_and_its_computer():
     with ctx:
         workspace = await _read_workspace_naming(WS, "chief_of_staff")
     assert (workspace.name, workspace.computer) == (HOME_FOLDER, "Cloud computer")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("role", ["analyst", "chief_of_staff"])
+@pytest.mark.parametrize(
+    ("kind", "provider_config", "machine"),
+    [
+        ("ssh", {"helper": True, "os": "Darwin"}, "personal_mac"),
+        ("ssh", {"helper": True, "os": "Linux"}, "personal"),
+        ("ssh", {"helper": False, "os": "Darwin"}, "own_mac"),
+        # Added before its system was kept.
+        ("ssh", {"host": "203.0.113.10"}, "own"),
+        ("daytona", {"helper": True, "os": "Darwin"}, ""),
+        (None, None, ""),
+    ],
+)
+async def test_whose_machine_it_is_is_told_with_one_computer_too(
+    role, kind, provider_config, machine
+):
+    """Where the work runs is the user's machine whether or not a second
+    computer gets it named."""
+    ctx, _ = _patched_row(
+        {
+            "name": "Semis",
+            "description": "",
+            "computer_name": "Studio Mac",
+            "computers": 1,
+            "computer_kind": kind,
+            "provider_config": provider_config,
+            "root_dir": "/Users/me/langalpha",
+        }
+    )
+    with ctx:
+        workspace = await _read_workspace_naming(WS, role)
+    # The folder goes with a machine of theirs, and a hosted one's is no rule.
+    root = "/Users/me/langalpha" if machine else ""
+    assert (workspace.computer, workspace.machine, workspace.root) == ("", machine, root)

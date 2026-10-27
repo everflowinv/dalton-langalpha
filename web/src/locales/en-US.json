@@ -451,8 +451,13 @@
       "deep": "Deep"
     },
     "compactionProfile": "Compaction Profile",
-    "compactionProfileDesc": "Bundled preset for compaction trigger and retention. Leave on system default and each model gets the preset that fits its context window.",
+    "compactionProfileDesc": "Bundled preset for compaction trigger and retention. Leave on system default and each model gets its own: 500k for Claude and GPT, and what the context window affords for the rest.",
     "compactionProfileUseDefault": "Use system default",
+    "nativeCompaction": "Provider compaction",
+    "nativeCompactionOn": "On",
+    "nativeCompactionOff": "Off",
+    "nativeCompactionAnthropicDesc": "Claude summarizes the conversation itself when it compacts, so it keeps its reasoning in the turns it keeps. Its summary is readable, and a model you switch to reads the same one.",
+    "nativeCompactionOpenAIDesc": "OpenAI compacts the conversation into an encrypted summary that only OpenAI models can read, through the API or a ChatGPT login. The compaction card shows a plain record of the conversation instead. Switch the thread to another provider's model and it gets that record, not the summary, so it loses detail from earlier tool results.",
     "compactionProfilePreset": "{{tokens}}k tokens · keep {{keep}}",
     "compactionProfiles": {
       "aggressive": {
@@ -465,11 +470,27 @@
       },
       "extended": {
         "label": "Extended",
-        "description": "Preserve more context. Best for 400k–1M context models."
+        "description": "Preserve more context. Good default for 400k-context models."
+      },
+      "economy": {
+        "label": "Economy",
+        "description": "Stays under 272k, past which OpenAI bills a whole request at long-context rates."
       },
       "relaxed": {
         "label": "Relaxed",
-        "description": "Maximum context. Best for 1M-context models."
+        "description": "More room before a summary on 1M-context models."
+      },
+      "spacious": {
+        "label": "Spacious",
+        "description": "Long sessions on 1M-context models."
+      },
+      "expansive": {
+        "label": "Expansive",
+        "description": "Half of a 1M window before a summary. Each call costs more as the thread grows."
+      },
+      "maximal": {
+        "label": "Maximum",
+        "description": "Most of a 1M window. Highest cost per call; for 1M-context models only."
       }
     },
     "modelTuning": {
@@ -1351,14 +1372,15 @@
     "alwaysOnFailed": "Could not change always-on",
     "tierBadgeTitle": "{{tier}} sandbox spec",
     "tier": {
-      "standard": "Standard",
-      "performance": "Performance",
-      "max": "Max"
+      "standard": "Small",
+      "performance": "Medium",
+      "max": "Large",
+      "xlarge": "Extra Large"
     },
-    "tierSpec": {
-      "standard": "1 vCPU · 1 GB RAM · 3 GB disk",
-      "performance": "2 vCPU · 4 GB RAM · 5 GB disk",
-      "max": "4 vCPU · 8 GB RAM · 10 GB disk"
+    "tierFact": {
+      "cpu": "{{count}} vCPU",
+      "memory": "{{count}} GB RAM",
+      "disk": "{{count}} GB disk"
     },
     "specUpdated": "Computer spec updated",
     "duplicate": "Duplicate",
@@ -1460,6 +1482,10 @@
     "createDesc": "A separate machine with its own files. Workspaces you put on it start and stop with it.",
     "planLimitedProvider": "Need a provider your plan doesn't include?",
     "planLimitedBoth": "Need a provider or spec your plan doesn't include?",
+    "capReached": "You have as many computers as your plan allows. Remove one to add another.",
+    "capPlanLimited": "Need more computers than your plan includes?",
+    "tierElsewhere": "{{tier}} is available on {{provider}}.",
+    "switchProvider": "Switch to {{provider}}",
     "computerLabel": "Computer",
     "computerHint": "Workspaces on one computer share its disk and start and stop together.",
     "primaryOption": "{{name}} (Primary)",
@@ -1471,7 +1497,8 @@
       "e2bDesc": "Stopping keeps memory and running programs, so it picks up where it left off.",
       "dockerDesc": "Runs on this machine.",
       "sshDesc": "Any Linux server or Mac you can SSH into. Stopping ends only the agent's programs.",
-      "sshLabel": "Your machine (SSH)"
+      "sshLabel": "Your machine (SSH)",
+      "capReached": "Limit reached"
     },
     "newComputer": "New computer",
     "create": "Create computer",
@@ -1694,6 +1721,37 @@
         "rateLimited_other": "This account has tried too many SSH connections in the last hour. Try again in {{count}} minutes.",
         "generic": "Could not connect. Try again."
       }
+    },
+    "remoteControl": {
+      "cardTitle": "This Mac",
+      "cardDesc": "Let the agent work on this Mac, even while LangAlpha is closed.",
+      "alreadyAdded": "Already added",
+      "title": "Remote control of this Mac",
+      "intro": "LangAlpha's agent will work on this Mac as {{account}}, with everything that account can do.",
+      "meansLabel": "What it means",
+      "meansAccess": "It can run any command and read or change any file {{account}} can, in any folder. Its work stays in the folder you pick, but nothing on this Mac holds it there.",
+      "meansBackground": "It keeps working after you close LangAlpha. Remote control runs in the background and starts again when you log in, until you turn it off.",
+      "meansCredentials": "It can read what command line tools keep for {{account}}, such as Git and cloud sign-ins, and reach your home or office network.",
+      "meansAccount": "Anyone who signs in to your LangAlpha account can direct it.",
+      "stopLabel": "Stopping it",
+      "stop": "Pause it any time from the LangAlpha menu, or in System Settings under General, Login Items. Removing this computer in LangAlpha turns it off and deletes its keys from this Mac.",
+      "folderPrompts": "macOS may ask whether LangAlpha can open folders such as Documents or Desktop. You can say no: the agent's own folder does not need it.",
+      "previewNotice": "Remote control is in preview while we build more safeguards. Until then the agent has the same access you do, so turn it on only on a Mac where that is all right.",
+      "acknowledge": "I understand LangAlpha's agent can run commands and change files on this Mac as {{account}}.",
+      "turnOn": "Turn on remote control",
+      "turningOn": "Turning on remote control…",
+      "connecting": "Connecting this Mac…",
+      "needsApproval": "macOS needs your OK. In System Settings, under General, Login Items, allow LangAlpha in the background, then continue.",
+      "continue": "Continue",
+      "tryAgain": "Try again",
+      "failed": "Couldn't turn on remote control. Try again.",
+      "insecure": "Remote control needs this server's address to start with https, so this Mac can trust the pairing it is sent.",
+      "thisMacBadge": "This Mac",
+      "provider": "Remote control",
+      "asAccount": "as {{account}}",
+      "notConnected": "Not connected",
+      "paused": "Remote control is paused. Resume it from the LangAlpha menu.",
+      "removeTurnsOff": "Remote control on this Mac turns off too."
     }
   },
   "thread": {
@@ -1920,10 +1978,15 @@
       "automationNamed": "Automation · {{name}}",
       "viaChannel": "Via {{platform}}",
       "fromMainAgent": "From main agent",
-      "reportFrom": "Report from {{name}}",
-      "reportFromAnalyst": "Report from an Analyst",
-      "taskFinished": "{{id}} finished",
-      "taskFailed": "{{id}} failed"
+      "steered": "Steered",
+      "steeredHint": "Taken in by a run already going",
+      "analyst": "{{name}} analyst",
+      "analystUnnamed": "The analyst",
+      "reportedBack": "reported back",
+      "couldntFinish": "couldn't finish",
+      "stopped": "was stopped",
+      "taskFinished": "finished",
+      "taskFailed": "failed"
     },
     "taskCard": {
       "statusRunning": "Running",
@@ -1944,15 +2007,26 @@
       "title": "Out of credits"
     },
     "subagentCard": {
-      "titleFallback": "Subagent Task",
-      "viewDetails": "View task details",
-      "openUpdated": "Click to view updated subagent",
-      "openResumed": "Click to view resumed subagent",
-      "openRunning": "Click to view running subagent",
-      "openDetails": "Click to view subagent details",
-      "toolUnit_one": "tool",
-      "toolUnit_other": "tools",
-      "tokenUnit": "tokens"
+      "titleFallback": "Subagent Task"
+    },
+    "subagentRun": {
+      "starting": "Starting up",
+      "couldntStart": "Couldn't start",
+      "subagentsOff": "Subagents are off for this chat",
+      "openLabel": "Open subagent: {{title}}",
+      "count_one": "{{count}} subagent",
+      "count_other": "{{count}} subagents",
+      "tally": {
+        "working": "{{count}} working",
+        "done": "{{count}} done",
+        "failed": "{{count}} failed",
+        "stopped": "{{count}} stopped",
+        "updated": "{{count}} updated",
+        "resumed": "{{count}} resumed"
+      },
+      "finishedIn": "Finished in {{duration}}",
+      "finished": "Finished",
+      "model": "Model: {{model}}"
     },
     "subagentBar": {
       "completedWithTools_one": "Completed ({{count}} tool call)",
@@ -1997,25 +2071,40 @@
       "noProgress": "No recorded progress for this run."
     },
     "ptcCard": {
-      "awaitingApproval": "Awaiting approval",
-      "researchDeclined": "Research declined",
+      "handOffTo": "Hand off to the analyst <ws>in {{name}}</ws>",
+      "handOffToAnalyst": "Hand off to the analyst",
+      "waitingForYou": "Waiting for you",
+      "briefMore": "Read the whole brief",
+      "briefLess": "Show less",
       "reportBack": "Report back with a summary",
-      "approve": "Approve",
+      "handOff": "Hand off",
       "decline": "Decline",
+      "declined": "Hand-off declined",
       "statusWorking": "Working",
       "statusStarting": "Starting…",
       "statusNeedsInput": "Needs input",
       "statusCompleted": "Completed",
       "statusFailed": "Failed",
       "statusStopped": "Stopped",
-      "hintProvisioning": "Provisioning sandbox…",
-      "hintWorking": "Running in the background",
-      "hintFailed": "Run stopped before finishing",
-      "hintNotStarted": "Run couldn't start",
-      "hintStopped": "Run was stopped",
-      "ctaOpenThread": "Open thread",
-      "ctaAnswerContinue": "Answer & continue",
-      "ctaViewThread": "View thread",
+      "needsAnswer": "Needs your answer",
+      "answer": "Answer",
+      "open": "Open",
+      "seeReport": "See report",
+      "finished": "Finished",
+      "finishedAfter": "Finished after {{duration}}",
+      "couldntFinish": "Couldn't finish",
+      "stopped": "Stopped",
+      "stoppedAfter": "Stopped after {{duration}}",
+      "couldntStart": "Couldn't start",
+      "groupTitle_one": "Handed off to {{count}} analyst",
+      "groupTitle_other": "Handed off to {{count}} analysts",
+      "summaryWorking": "{{count}} working",
+      "summaryNeedsAnswer_one": "{{count}} needs your answer",
+      "summaryNeedsAnswer_other": "{{count}} need your answer",
+      "summaryFinished": "{{count}} finished",
+      "summaryCouldntFinish": "{{count}} couldn't finish",
+      "summaryStopped": "{{count}} stopped",
+      "summaryCouldntStart": "{{count}} couldn't start",
       "alwaysApprove": "Always allow",
       "alwaysApproveHint": "Hand this and later work to Analysts without asking. Turn it off in Settings."
     },

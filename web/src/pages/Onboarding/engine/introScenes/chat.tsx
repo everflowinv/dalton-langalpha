@@ -1,5 +1,6 @@
 import { useTranslation } from 'react-i18next';
 import {
+  ArrowUpRight,
   Brain,
   ChevronRight,
   FileSpreadsheet,
@@ -26,9 +27,8 @@ import {
   ChartCard,
   DeliveryPill,
   FileStack,
-  HandoffCard,
   FromChiefOfStaff,
-  Provenance,
+  HandoffSlip,
   ViaApp,
   WorkflowCard,
   WorkspaceLine,
@@ -51,15 +51,32 @@ import { CapexThread, PTC, PTC_CHAT } from './capexThread';
 
 /* ── chat · step 1: one hand-off, from both sides ──────────────────────── */
 
-/** The caption alone in place of a report-back's hidden message
-    (`MessageProvenanceLabel`): `Report from <name>`, right-aligned, shown
-    at `at`. Only the chat scenes show one, so it stays here, clear of the
+/** An Analyst's report-back, drawn in place of its hidden message as a line
+    of its own (`ReportRow`), right-aligned and shown at `at`: the inbox a
+    report arrives in, the Analyst, how its run ended, and the way into its
+    thread. Only the chat scenes show one, so it stays here, clear of the
     parts the thread intro loads. */
-function ReportFrom({ at, name }: { at: number; name: string }) {
+function ReportBack({ at, workspace }: { at: number; workspace: string }) {
   const { t } = useTranslation();
   return (
     <Appear at={at} className="flex justify-end">
-      <Provenance icon={Inbox}>{t('chat.provenance.reportFrom', { name })}</Provenance>
+      <span
+        className="flex min-w-0 items-center gap-[3.5px] text-[7px] leading-none"
+        style={{ color: 'var(--color-text-secondary)' }}
+      >
+        <Inbox className="h-[7px] w-[7px] shrink-0" />
+        <span className="truncate font-medium" style={{ color: 'var(--color-text-primary)' }}>
+          {t('chat.provenance.analyst', { name: workspace })}
+        </span>
+        <span className="shrink-0 whitespace-nowrap">{t('chat.provenance.reportedBack')}</span>
+        <span
+          className="ml-[4.5px] flex shrink-0 items-center gap-[2px] font-medium"
+          style={{ color: 'var(--color-text-primary)' }}
+        >
+          {t('chat.ptcCard.open')}
+          <ArrowUpRight className="h-[7px] w-[7px]" />
+        </span>
+      </span>
     </Appear>
   );
 }
@@ -195,10 +212,9 @@ function TwoModes() {
             <Reply text="**Up 29% in six months,** 2% off its August high." at={MODES.answered} />
             <UserBubble at={MODES.follow}>{MODES.request}</UserBubble>
             <WorkspaceLine name={MODES.workspace} at={made} done={created} />
-            <HandoffCard
+            <HandoffSlip
               workspace={MODES.workspace}
               title="NVDA valuation into earnings"
-              brief="Value it three ways into the Q3 print."
               at={MODES.handoff}
               started={MODES.task}
               finished={MODES.files[1]}
@@ -207,7 +223,7 @@ function TwoModes() {
               text="**An Analyst in NVDA deep dive is on it.** I'll report back when it's done."
               at={MODES.said}
             />
-            <ReportFrom at={MODES.report} name={MODES.workspace} />
+            <ReportBack at={MODES.report} workspace={MODES.workspace} />
             <Reply
               text="**NVDA looks fully priced.** Only the bull case clears today's $182; the base case is $171. The model is in valuation.xlsx."
               at={MODES.reply}
@@ -387,10 +403,9 @@ function ChiefOfStaffAnswer() {
                   at={COS.think}
                   done={COS.handoff}
                 />
-                <HandoffCard
+                <HandoffSlip
                   workspace="AI capex"
                   title="Build a hyperscaler capex tracker"
-                  brief="Four hyperscalers, eight calls each."
                   at={COS.handoff}
                   started={COS.started}
                   finished={COS.finished}
@@ -403,7 +418,7 @@ function ChiefOfStaffAnswer() {
             )}
             {/* the Analyst's report comes back, and goes on to the phone the
                 request came from, the dashboard attached */}
-            <ReportFrom at={COS.report} name="AI capex" />
+            <ReportBack at={COS.report} workspace="AI capex" />
             {now >= send && (
               <div className="mr-12 flex flex-col gap-1.5">
                 <ToolRow

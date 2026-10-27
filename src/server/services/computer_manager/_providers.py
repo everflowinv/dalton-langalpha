@@ -423,9 +423,18 @@ class ProviderMixin:
 
         if isinstance(exc, SandboxGoneError):
             return True
-        key = binding.provider_identity if binding is not None else (None, "{}")
-        classifier = self._error_classifiers.get(key)
-        if classifier is None:
-            classifier = self._provider_for(binding)
-            self._error_classifiers[key] = classifier
+        classifier = self._cached_provider(binding)
         return classifier.classify_error(exc) is SandboxFailureKind.SANDBOX_GONE
+
+    def _cached_provider(self, binding: Optional[ComputerBinding]):
+        """One provider per backend for this worker's life, closed at shutdown.
+
+        For calls that need no session and come often (error classification,
+        the usage sweep's metric reads), where a provider each would open an
+        SDK client each."""
+        key = binding.provider_identity if binding is not None else (None, "{}")
+        provider = self._error_classifiers.get(key)
+        if provider is None:
+            provider = self._provider_for(binding)
+            self._error_classifiers[key] = provider
+        return provider

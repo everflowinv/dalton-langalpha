@@ -23,8 +23,12 @@ from typing import Any
 import httpx
 from langchain.agents.middleware import AgentMiddleware
 from langchain_core.messages import ToolMessage
-from PIL import Image
 
+from ptc_agent.agent.middleware.file_operations.image_fit import (
+    UnreadableImage,
+    UnsupportedImageFormat,
+    identify_image,
+)
 from ptc_agent.agent.tools.file_ops import is_memo_text_path
 from src.tools.web.inhouse.guard import BlockedAddressError, GuardedAsyncTransport
 
@@ -38,15 +42,6 @@ DOCUMENT_EXTENSIONS = frozenset({".pdf"})
 
 # Combined visual extensions
 VISUAL_EXTENSIONS = IMAGE_EXTENSIONS | DOCUMENT_EXTENSIONS
-
-# PIL reports a format name; providers speak MIME. A format outside this map is
-# one no provider accepts, so it is refused rather than given a near-miss guess.
-_PIL_FORMAT_TO_MIME = {
-    "PNG": "image/png",
-    "JPEG": "image/jpeg",
-    "GIF": "image/gif",
-    "WEBP": "image/webp",
-}
 
 # The widest per-request page ceiling any provider we ship publishes (Gemini's).
 # Deliberately not the tightest: injection cannot know which model will consume
@@ -89,14 +84,11 @@ def _detect_mime_type(content: bytes) -> tuple[str, int | None]:
         return "application/pdf", pages
 
     try:
-        img = Image.open(io.BytesIO(content))
-        img.verify()
-    except Exception:
+        return identify_image(content), None
+    except UnsupportedImageFormat as exc:
+        raise _UnusableContent(str(exc)) from None
+    except UnreadableImage:
         raise _UnusableContent("not a readable image or PDF") from None
-    mime_type = _PIL_FORMAT_TO_MIME.get(img.format or "")
-    if mime_type is None:
-        raise _UnusableContent(f"in {img.format} format, which no provider accepts")
-    return mime_type, None
 
 
 def _is_visual_request(file_path: str) -> bool:
@@ -133,7 +125,7 @@ def build_content_blocks(
     annotation and never reaches the wire.
 
     ``mime_type`` comes from ``_detect_mime_type``, which admits PDFs and the
-    four image formats in ``_PIL_FORMAT_TO_MIME`` and nothing else.
+    four image formats ``identify_image`` accepts and nothing else.
     """
     if mime_type == "application/pdf":
         # LangChain's file block, which converts to Anthropic's document format.

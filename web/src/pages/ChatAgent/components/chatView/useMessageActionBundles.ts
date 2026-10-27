@@ -14,6 +14,7 @@ export interface MessageActionSources {
   onDownloadFile: Action<'onDownloadFile'>;
   downloadKeyFor: Action<'downloadKeyFor'>;
   onRevealFiles: Action<'onRevealFiles'>;
+  onRevealMessage: Action<'onRevealMessage'>;
   onOpenSources: Action<'onOpenSources'>;
   onToolCallDetailClick: Action<'onToolCallDetailClick'>;
   onOpenChart: Action<'onOpenChart'>;
@@ -65,6 +66,7 @@ export function useMessageActionBundles(src: MessageActionSources): {
   const stableDownloadFile = useStableHandler(src.onDownloadFile);
   const stableDownloadKeyFor = useStableHandler(src.downloadKeyFor);
   const stableRevealFiles = useStableHandler(src.onRevealFiles);
+  const stableRevealMessage = useStableHandler(src.onRevealMessage);
   const stableOpenSources = useStableHandler(src.onOpenSources);
   const stableToolCallDetail = useStableHandler(src.onToolCallDetailClick);
   const stableOpenChart = useStableHandler(src.onOpenChart);
@@ -107,6 +109,7 @@ export function useMessageActionBundles(src: MessageActionSources): {
           onDownloadFile: stableDownloadFile,
           downloadKeyFor: stableDownloadKeyFor,
           onRevealFiles: stableRevealFiles,
+          onRevealMessage: stableRevealMessage,
           onOpenSources: stableOpenSources,
           onToolCallDetailClick: stableToolCallDetail,
           onOpenChart: stableOpenChart,
@@ -118,6 +121,7 @@ export function useMessageActionBundles(src: MessageActionSources): {
           onDownloadFile: stableDownloadFile,
           downloadKeyFor: stableDownloadKeyFor,
           onRevealFiles: stableRevealFiles,
+          onRevealMessage: stableRevealMessage,
           onOpenSources: stableOpenSources,
           onToolCallDetailClick: stableToolCallDetail,
           onOpenChart: stableOpenChart,
@@ -146,7 +150,7 @@ export function useMessageActionBundles(src: MessageActionSources): {
         }
   ), [
     readOnly,
-    stableOpenFile, stableDownloadFile, stableDownloadKeyFor, stableRevealFiles, stableOpenSources, stableToolCallDetail,
+    stableOpenFile, stableDownloadFile, stableDownloadKeyFor, stableRevealFiles, stableRevealMessage, stableOpenSources, stableToolCallDetail,
     stableOpenChart, stableOpenSubagentTask, stableOpenDispatcher, stableAnswerQuestion, stableSkipQuestion, stableApproveCreateWorkspace,
     stableRejectCreateWorkspace, stableApproveStartQuestion, stableRejectStartQuestion,
     stableApprovePTCAgent, stableRejectPTCAgent, stableApproveSecretaryAction,

@@ -278,8 +278,7 @@ export function analystCandidates(
         title: str(card.proposal.question),
         seenMs: at,
         owed: false,
-        // Drawn only for a dispatch that succeeded.
-        dispatchFailed: false,
+        dispatchFailed: card.proposal.dispatch_failed === true,
       });
     }
   }

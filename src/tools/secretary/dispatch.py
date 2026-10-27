@@ -78,12 +78,17 @@ async def _confirm_dispatch_admission(
 
 
 def _unknown_dispatch_command(
-    error: str, thread_id: str, workspace_id: str | None, tool_call_id: str
+    error: str,
+    thread_id: str,
+    workspace_id: str | None,
+    tool_call_id: str,
+    handed_to: dict | None = None,
 ) -> Command:
     """Ambiguous dispatch outcome: the reservation is retained and the run may
     already be live on ``thread_id`` — surface that id so the model checks
     agent_output before re-dispatching (a blind retry would occupy a second
-    cap slot and can produce a duplicate report-back)."""
+    cap slot and can produce a duplicate report-back). ``handed_to`` is what
+    a pre-approved hand-off's card is drawn from."""
     return Command(
         update={
             "messages": [
@@ -93,6 +98,7 @@ def _unknown_dispatch_command(
                             "success": False,
                             "error": error,
                             "outcome": "unknown_retained",
+                            **(handed_to or {}),
                             "thread_id": thread_id,
                             "workspace_id": workspace_id,
                             "note": (
@@ -265,12 +271,26 @@ async def dispatch(
         if not approved:
             return decline_routing_command("the hand-off", response, tool_call_id)
 
-        # Apply user overrides from HITL decision (e.g. toggling report_back)
-        decisions = response.get("decisions", [])
-        if decisions:
-            overrides = decisions[0].get("overrides", {})
-            if "report_back" in overrides:
-                report_back = overrides["report_back"]
+        # The card's report-back switch, when the user moved it. A resume
+        # that names no overrides keeps what the call asked for.
+        overrides = (response.get("decisions") or [{}])[0].get("overrides")
+        if isinstance(overrides, dict) and isinstance(
+            overrides.get("report_back"), bool
+        ):
+            report_back = overrides["report_back"]
+
+    # A hand-off approved in advance has no card but the one its result
+    # draws, so a failure from here on still says where it was going. A new
+    # thread's id is left out: no thread has it unless the run starts.
+    handed_to: dict = {}
+    if preapproved:
+        handed_to = {
+            "preapproved": True,
+            "workspace_id": workspace_id,
+            "workspace_name": workspace_name,
+        }
+        if is_continuation:
+            handed_to["thread_id"] = thread_id
 
     if not is_continuation:
         thread_id = str(uuid.uuid4())
@@ -303,7 +323,12 @@ async def dispatch(
         requested_from=requested_from.of_turn(configurable, question),
     ) as slot:
 
-        def dispatched(run_id: str | None = None, *, steered: bool = False) -> Command:
+        def dispatched(
+            run_id: str | None = None,
+            *,
+            steered: bool = False,
+            steer_id: str | None = None,
+        ) -> Command:
             # The card for a pre-approved hand-off is drawn from this result,
             # since no approval request carried the workspace's name.
             result = {
@@ -326,11 +351,15 @@ async def dispatch(
                 result["run_id"] = run_id
             if preapproved:
                 result["preapproved"] = True
-            return success_command(result, tool_call_id)
+            # The steer's row names the run that takes the hand-off in if
+            # ``run_id`` ends before reading it. The view reads it from the
+            # artifact, which the model never sees.
+            artifact = {"steer_id": steer_id} if steer_id else None
+            return success_command(result, tool_call_id, artifact=artifact)
 
         # Cap rejection or a fail-closed origin write — abort (reserve rolls back).
         if slot.error is not None:
-            return error_command(slot.error, tool_call_id)
+            return error_command(slot.error, tool_call_id, **handed_to)
         # ``rejected``: a definitive non-scheduling proof was observed — a
         # cancellation landing while the response and session close must then
         # NOT commit. ``ambiguous_error``: delivery unproven either way;
@@ -339,6 +368,7 @@ async def dispatch(
         ambiguous_error: str | None = None
         run_id: str | None = None
         steered = False
+        steer_id: str | None = None
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.post(
@@ -385,8 +415,12 @@ async def dispatch(
                             # compacting, or reporting to another Home thread.
                             # Say so, or the model reports a failure and
                             # retries into the same 409.
-                            return error_command(_THREAD_BUSY, tool_call_id)
-                        return error_command("dispatch_failed", tool_call_id)
+                            return error_command(
+                                _THREAD_BUSY, tool_call_id, **handed_to
+                            )
+                        return error_command(
+                            "dispatch_failed", tool_call_id, **handed_to
+                        )
                     if resp.status != 200:
                         # Not the endpoint's reply (it answers exactly 200;
                         # redirects are disabled): some other hop spoke —
@@ -419,6 +453,7 @@ async def dispatch(
                         else:
                             run_id = body.get("run_id")
                             steered = body.get("status") == "steered"
+                            steer_id = body.get("steer_id") if steered else None
         except asyncio.CancelledError:
             # Cancellation mid-exchange (the dispatching turn cancelled, worker
             # shutdown) is as ambiguous as a lost response: the endpoint may
@@ -432,7 +467,7 @@ async def dispatch(
             # The request provably never reached the endpoint, so rolling the
             # reservation back is safe.
             logger.error(f"PTC dispatch connection failed: {e}")
-            return error_command("dispatch_failed", tool_call_id)
+            return error_command("dispatch_failed", tool_call_id, **handed_to)
         except (aiohttp.ClientError, ValueError) as e:
             logger.error(f"PTC dispatch HTTP error: {e}")
             ambiguous_error = "dispatch_failed"
@@ -467,7 +502,7 @@ async def dispatch(
                 # retain without probing.
                 slot.commit()
                 return _unknown_dispatch_command(
-                    ambiguous_error, thread_id, workspace_id, tool_call_id
+                    ambiguous_error, thread_id, workspace_id, tool_call_id, handed_to
                 )
             try:
                 confirmed = await _confirm_dispatch_admission(
@@ -482,8 +517,8 @@ async def dispatch(
                 # The lost reply was a real acceptance of THIS request.
                 return dispatched()
             return _unknown_dispatch_command(
-                ambiguous_error, thread_id, workspace_id, tool_call_id
+                ambiguous_error, thread_id, workspace_id, tool_call_id, handed_to
             )
 
         slot.commit()
-        return dispatched(run_id, steered=steered)
+        return dispatched(run_id, steered=steered, steer_id=steer_id)

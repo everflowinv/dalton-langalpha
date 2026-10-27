@@ -32,6 +32,7 @@ from ptc_agent.core.paths import DEFAULT_SANDBOX_ROOT
 from ptc_agent.core.sandbox.providers._ssh_connect import (
     GatewayAccess,
     SSHTarget,
+    answered_by_helper,
     connect,
     host_key_line,
     is_public_address,
@@ -194,6 +195,8 @@ class SSHProbe:
     supported: bool
     problems: list[str] = field(default_factory=list)
     hostname: str = ""
+    # LangAlpha's helper answers for the machine, not an sshd.
+    helper: bool = False
 
 
 async def probe_ssh_target(
@@ -249,7 +252,9 @@ async def probe_ssh_target(
             line, fingerprint = host_key_line(link.conn)
             facts = await _probe_facts(link, connect_timeout)
             sftp_ok = await _sftp_works(link.conn, connect_timeout)
-            result = _probe_result(line, fingerprint, facts, sftp_ok)
+            result = _probe_result(
+                line, fingerprint, facts, sftp_ok, helper=answered_by_helper(link.conn)
+            )
             if root_dir and result.supported:
                 # Checked, never made: the create makes it, by the same rule.
                 exit_code = await _check_root(
@@ -411,7 +416,12 @@ async def _sftp_works(conn: Any, timeout: float) -> bool:
 
 
 def _probe_result(
-    line: str, fingerprint: str, facts: dict[str, str], sftp_ok: bool
+    line: str,
+    fingerprint: str,
+    facts: dict[str, str],
+    sftp_ok: bool,
+    *,
+    helper: bool = False,
 ) -> SSHProbe:
     os_name = facts.get("os", "")
     arch = facts.get("arch", "")
@@ -484,6 +494,7 @@ def _probe_result(
         supported=not blocking,
         problems=problems,
         hostname=facts.get("hostname", ""),
+        helper=helper,
     )
 
 

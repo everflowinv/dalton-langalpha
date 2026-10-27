@@ -13,20 +13,24 @@ connect.
 from __future__ import annotations
 
 import asyncio
+import functools
 import ipaddress
 import socket
 from collections.abc import Mapping
+from concurrent.futures import Executor
 from dataclasses import dataclass
 from urllib.parse import urlsplit, urlunsplit
 
 __all__ = [
     "EgressBlockedError",
+    "EgressResolutionError",
     "MCP_PROTOCOL_HEADERS",
     "PinnedTarget",
     "RESERVED_HEADERS",
     "RESERVED_REQUEST_HEADERS",
     "pin_public_url",
     "resolve_public_ips",
+    "resolve_public_ips_sync",
     "strip_configured_headers",
     "strip_reserved_headers",
 ]
@@ -93,6 +97,11 @@ class EgressBlockedError(ValueError):
     """The target host failed egress policy (scheme, resolution, or IP range)."""
 
 
+class EgressResolutionError(EgressBlockedError):
+    """The host resolved to nothing. Unlike a range refusal this can be a
+    resolver hiccup, so a caller that retries connection errors may retry it."""
+
+
 @dataclass(frozen=True)
 class PinnedTarget:
     """A URL rewritten to a validated IP, plus what the transport must restore.
@@ -123,9 +132,42 @@ class PinnedTarget:
         return self.url, sent, {"sni_hostname": self.host}
 
 
+# IPv6 ranges that carry an IPv4 address in their last 32 bits, which is where
+# a connection to them goes: the NAT64 well-known prefix (a NAT64 gateway on
+# the server's network translates it to that IPv4 address there), the
+# deprecated IPv4-compatible form, and the IPv4-mapped form a dual-stack socket
+# dials as IPv4. ``is_global`` passes the first two whatever they carry.
+_EMBEDS_IPV4 = (
+    ipaddress.IPv6Network("64:ff9b::/96"),
+    ipaddress.IPv6Network("::/96"),
+    ipaddress.IPv6Network("::ffff:0:0/96"),
+)
+
+# Blocks that are not globally reachable but that ``is_global`` passes on
+# Python 3.13 and 3.14 alike, found by checking every IANA special-purpose
+# registry entry marked not globally reachable, and the multicast ranges,
+# block by block against both. Python's lists trail the registries, so recheck
+# on a new registry entry or Python. Local-use NAT64 is listed although both
+# refuse it, since that refusal is a recent Python fix.
+_NOT_GLOBAL = (
+    ipaddress.IPv4Network("192.88.99.0/24"),  # 6to4 relay anycast, deprecated; 6a44 relay (RFC 6751)
+    ipaddress.IPv4Network("224.0.0.0/4"),  # multicast
+    ipaddress.IPv6Network("64:ff9b:1::/48"),  # local-use NAT64 (RFC 8215)
+    ipaddress.IPv6Network("100:0:0:1::/64"),  # dummy prefix (RFC 9780)
+    ipaddress.IPv6Network("5f00::/16"),  # SRv6 SIDs (RFC 9602)
+    ipaddress.IPv6Network("fec0::/10"),  # site-local, deprecated but still routed where configured
+    ipaddress.IPv6Network("ff00::/8"),  # multicast
+)
+
+
 def _classify(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
-    # is_global covers private/loopback/link-local/reserved/multicast/
-    # unspecified AND CGNAT — same predicate as the write-time validator.
+    # is_global covers private/loopback/link-local/reserved/unspecified AND
+    # CGNAT; the write-time validator stops there, this adds _NOT_GLOBAL.
+    if any(ip in net for net in _NOT_GLOBAL):
+        return False
+    if ip.version == 6 and any(ip in net for net in _EMBEDS_IPV4):
+        embedded = ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
+        return ip.is_global and _classify(embedded)
     return ip.is_global
 
 
@@ -134,31 +176,77 @@ async def resolve_public_ips(
     *,
     port: int = 443,
     allow_non_global: bool = False,
+    executor: Executor | None = None,
 ) -> list[str]:
     """Resolve ``host`` and return its addresses, rejecting non-global ones.
+
+    The lookup blocks a thread of ``executor``, the loop's default when None.
 
     Every resolved address must pass — a name that maps to one public and one
     private address is an attack shape, not a configuration.
     """
-    candidate = host.lower().rstrip(".").strip("[]")
-    try:
-        literal = ipaddress.ip_address(candidate)
-    except ValueError:
-        literal = None
+    candidate = _candidate(host)
+    literal = _literal_ips(host, candidate, allow_non_global)
     if literal is not None:
-        if not allow_non_global and not _classify(literal):
-            raise EgressBlockedError(
-                f"egress to {host!r} is blocked: non-global address"
-            )
-        return [str(literal)]
+        return literal
 
     loop = asyncio.get_running_loop()
     try:
-        infos = await loop.getaddrinfo(
+        infos = await loop.run_in_executor(
+            executor,
+            functools.partial(
+                socket.getaddrinfo,
+                candidate,
+                port,
+                type=socket.SOCK_STREAM,
+                proto=socket.IPPROTO_TCP,
+            ),
+        )
+    # A name IDNA cannot encode (a label over 63 bytes, an empty one) fails
+    # before any lookup, as UnicodeError, and resolves to nothing all the same.
+    except (OSError, UnicodeError) as exc:
+        raise EgressResolutionError(f"egress to {host!r} is blocked: DNS resolution failed") from exc
+    return _checked_ips(host, infos, allow_non_global)
+
+
+def resolve_public_ips_sync(
+    host: str,
+    *,
+    port: int = 443,
+    allow_non_global: bool = False,
+) -> list[str]:
+    """:func:`resolve_public_ips` for a caller already off the event loop (a
+    synchronous HTTP transport), so one policy covers both client shapes."""
+    candidate = _candidate(host)
+    literal = _literal_ips(host, candidate, allow_non_global)
+    if literal is not None:
+        return literal
+    try:
+        infos = socket.getaddrinfo(
             candidate, port, type=socket.SOCK_STREAM, proto=socket.IPPROTO_TCP
         )
-    except OSError as exc:
-        raise EgressBlockedError(f"egress to {host!r} is blocked: DNS resolution failed") from exc
+    except (OSError, UnicodeError) as exc:
+        raise EgressResolutionError(f"egress to {host!r} is blocked: DNS resolution failed") from exc
+    return _checked_ips(host, infos, allow_non_global)
+
+
+def _candidate(host: str) -> str:
+    return host.lower().rstrip(".").strip("[]")
+
+
+def _literal_ips(host: str, candidate: str, allow_non_global: bool) -> list[str] | None:
+    try:
+        literal = ipaddress.ip_address(candidate)
+    except ValueError:
+        return None
+    if not allow_non_global and not _classify(literal):
+        raise EgressBlockedError(
+            f"egress to {host!r} is blocked: non-global address"
+        )
+    return [str(literal)]
+
+
+def _checked_ips(host: str, infos, allow_non_global: bool) -> list[str]:
     ips: list[str] = []
     for _family, _type, _proto, _canon, sockaddr in infos:
         addr = ipaddress.ip_address(sockaddr[0])
@@ -169,7 +257,7 @@ async def resolve_public_ips(
         if str(addr) not in ips:
             ips.append(str(addr))
     if not ips:
-        raise EgressBlockedError(f"egress to {host!r} is blocked: no addresses resolved")
+        raise EgressResolutionError(f"egress to {host!r} is blocked: no addresses resolved")
     return ips
 
 

@@ -368,6 +368,8 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     reconnectIfStaleRun,
     isOwnRun,
     getSubagentHistory,
+    getTaskRuns,
+    putTaskRun,
     subagentHistoryEntries,
     resolveSubagentIdToAgentId,
     hydrateTaskTranscript,
@@ -475,6 +477,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     restoredForThreadRef,
     pinToMessage,
     revealFiles,
+    revealMessage,
     holdPlace,
     entryRestored,
     pinTargetRef,
@@ -521,6 +524,8 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     updateSubagentCard,
     sendSubagentInstruction,
     getSubagentHistory,
+    getTaskRuns,
+    putTaskRun,
     resolveSubagentIdToAgentId,
     hydrateTaskTranscript,
     saveScrollPosition,
@@ -529,6 +534,10 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     activeAgentIdRef,
     resolvedThreadIdRef,
   });
+  const subagentTelemetry = useMemo(
+    () => ({ resolve: resolveSubagentTelemetry, followsRuns: true }),
+    [resolveSubagentTelemetry],
+  );
 
   // Whether the open subagent's turn is still running. A bubble's own
   // `isStreaming` goes false between two model calls of one agent loop, so a
@@ -1042,6 +1051,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     onDownloadFile: handleDownloadFileFromChat,
     downloadKeyFor,
     onRevealFiles: revealFiles,
+    onRevealMessage: revealMessage,
     onOpenSources: handleOpenSourcesFromChat,
     onToolCallDetailClick: handleToolCallDetailClick,
     onOpenChart: handleOpenChart,
@@ -1563,7 +1573,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                 history does, not per main-agent token, and only context
                 consumers re-render: MessageBubble / MessageContentSegments
                 stay React.memo'd. */}
-            <SubagentTelemetryContext value={resolveSubagentTelemetry}>
+            <SubagentTelemetryContext value={subagentTelemetry}>
             <WorkflowRunContext value={resolveWorkflowRun}>
             <TranscriptDisplayContext value={transcriptDisplay}>
             <div

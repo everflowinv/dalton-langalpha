@@ -1,6 +1,7 @@
 /**
- * Elapsed-time copy: the chat's turn and thought headers, and how long an
- * automation run took, so both read a duration in the same words.
+ * Elapsed-time copy: the chat's turn and thought headers, how long an
+ * automation run took, and how long a subagent or an analyst's run took, so
+ * each reads a duration in the same words.
  *
  * Import-free on purpose, like `liveZoneTiming`: the header's duration is the
  * kind of thing a Node-side spec wants to assert, and the render-block module
@@ -9,7 +10,7 @@
  */
 
 /** Translation function signature compatible with i18next's t(). */
-type TFn = (key: string, opts?: Record<string, unknown>) => string;
+export type TFn = (key: string, opts?: Record<string, unknown>) => string;
 
 /**
  * Each scale is one key rather than an interpolated unit, because a language
@@ -74,4 +75,39 @@ export function formatTook(ms: number, t: TFn): string {
     return t(SCALE_KEYS.wholeMinutes, { minutes: totalMinutes });
   }
   return formatThoughtFor(elapsed, t);
+}
+
+/**
+ * How long a finished run took, to the minute once it ran a minute: a report
+ * is read as "18m", and the seconds past it are noise beside a run that long.
+ */
+export function formatRunLength(ms: number, t: TFn): string {
+  return formatTook(ms >= 60_000 ? Math.floor(ms / 60_000) * 60_000 : ms, t);
+}
+
+/** A wire timestamp as epoch ms; null when absent or unparseable. */
+export function epochMs(iso: string | null | undefined): number | null {
+  if (!iso) return null;
+  const ms = Date.parse(iso);
+  return Number.isFinite(ms) ? ms : null;
+}
+
+/** A settled run's length, when the ledger gave both ends of it. */
+export function runLengthMs(startedAt: number | undefined, finishedAt: number | undefined): number | undefined {
+  if (startedAt === undefined || finishedAt === undefined || finishedAt < startedAt) return undefined;
+  return finishedAt - startedAt;
+}
+
+/**
+ * `0:04`, `3:12`, `1:02:09`: elapsed time as a clock, for a column of runs
+ * read side by side. Digits and colons only, so it needs no translation, and
+ * at a fixed width in tabular figures the column stays aligned as it ticks.
+ * Truncated like `formatWorkedFor`, never rounded up.
+ */
+export function formatClock(ms: number): string {
+  const totalSeconds = Math.floor(Number.isFinite(ms) && ms > 0 ? ms / 1000 : 0);
+  const seconds = String(totalSeconds % 60).padStart(2, '0');
+  const totalMinutes = Math.floor(totalSeconds / 60);
+  if (totalMinutes < 60) return `${totalMinutes}:${seconds}`;
+  return `${Math.floor(totalMinutes / 60)}:${String(totalMinutes % 60).padStart(2, '0')}:${seconds}`;
 }

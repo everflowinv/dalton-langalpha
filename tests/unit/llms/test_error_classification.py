@@ -7,6 +7,7 @@ from langchain_openai.chat_models._client_utils import StreamChunkTimeoutError
 from src.llms.error_classification import (
     NON_RETRYABLE_STATUSES,
     extract_status_code,
+    is_programming_error,
     is_retryable_error,
     is_stalled_stream,
 )
@@ -92,6 +93,96 @@ class TestIsRetryableError:
         # must not matter.
         exc = Exception("Error code: 500")
         assert is_retryable_error(exc, status_code=400) is False
+
+
+def _chained(outer, inner):
+    try:
+        try:
+            raise inner
+        except Exception as e:
+            raise outer from e
+    except Exception as wrapped:
+        return wrapped
+
+
+class TestProgrammingErrors:
+    """A crash in parsing is the same on every attempt, so it is not retried."""
+
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            AttributeError("'dict' object has no attribute 'model_dump'"),
+            TypeError("'NoneType' object is not iterable"),
+            KeyError("choices"),
+        ],
+    )
+    def test_not_retryable(self, exc):
+        assert is_programming_error(exc)
+        assert is_retryable_error(exc) is False
+
+    def test_found_anywhere_in_the_chain(self):
+        # The SDKs wrap whatever their transport raised in a connection error.
+        import anthropic
+        import httpx
+
+        request = httpx.Request("POST", "https://example.test/v1/messages")
+        wrapped = _chained(
+            anthropic.APIConnectionError(request=request),
+            AttributeError("'dict' object has no attribute 'model_dump'"),
+        )
+        assert is_retryable_error(wrapped) is False
+        assert is_retryable_error(_chained(RuntimeError("model call failed"), KeyError("x"))) is False
+
+    def test_as_the_implicit_context_too(self):
+        try:
+            try:
+                raise TypeError("bad")
+            except TypeError:
+                raise RuntimeError("while handling")
+        except RuntimeError as outer:
+            assert is_retryable_error(outer) is False
+
+    def test_a_reported_status_still_decides(self):
+        exc = _chained(Exception("overloaded"), KeyError("error"))
+        exc.status_code = 529
+        assert is_retryable_error(exc) is True
+
+        crash = TypeError("bad")
+        crash.status_code = 400
+        assert is_retryable_error(crash) is False
+
+    def test_a_cycle_does_not_loop(self):
+        exc = KeyError("x")
+        exc.__context__ = exc
+        assert is_retryable_error(exc) is False
+
+    def test_network_failures_stay_retryable(self):
+        import httpx
+
+        request = httpx.Request("POST", "https://example.test/v1/messages")
+        for exc in (
+            httpx.ConnectError("refused", request=request),
+            httpx.ReadTimeout("slow", request=request),
+            httpx.RemoteProtocolError("closed mid-stream", request=request),
+            ConnectionResetError("reset by peer"),
+            TimeoutError("timed out"),
+            StreamChunkTimeoutError(120.0, chunks_received=3),
+        ):
+            assert not is_programming_error(exc), type(exc)
+            assert is_retryable_error(exc) is True, type(exc)
+
+    def test_sdk_connection_errors_stay_retryable(self):
+        # Built the way each SDK builds them around a transport failure.
+        import anthropic
+        import httpx
+        import openai
+
+        request = httpx.Request("POST", "https://example.test/v1/messages")
+        transport = httpx.ConnectError("refused", request=request)
+        for sdk in (anthropic, openai):
+            for outer in (sdk.APIConnectionError(request=request), sdk.APITimeoutError(request=request)):
+                exc = _chained(outer, transport)
+                assert is_retryable_error(exc) is True, type(outer)
 
 
 class TestDashScopeFailureStatus:

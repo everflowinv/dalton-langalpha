@@ -10,7 +10,7 @@ from __future__ import annotations
 import re
 import shlex
 from importlib.resources import files
-from typing import Dict
+from typing import Dict, Optional
 
 from ptc_agent.config.core import SSHConfig
 from ptc_agent.core.sandbox.providers._ssh_authorized_key import authorized_key_line
@@ -52,6 +52,26 @@ def _fill(template: str, values: Dict[str, str]) -> str:
     return _SLOTS.sub(lambda m: values[m.group(1)], template)
 
 
+async def pairing_key(token: str, settings: SSHConfig) -> Optional[str]:
+    """The line the script would authorize, for a machine that pairs without it.
+
+    LangAlpha's helper keeps the line in its own folder rather than
+    ``~/.ssh/authorized_keys``, so it asks for the line alone. None once the
+    pairing has expired.
+
+    Raises:
+        SSHUnavailable: As for :func:`ensure_client_key`.
+    """
+    pairing = await state.load(token)
+    return None if pairing is None else await _key_line(pairing.user_id, settings)
+
+
+async def _key_line(user_id: str, settings: SSHConfig) -> str:
+    return authorized_key_line(
+        (await ensure_client_key(user_id))["public_key"], settings.login_from
+    )
+
+
 async def render_script(token: str, settings: SSHConfig) -> str:
     """The script for a live pairing, or one that says the command expired.
 
@@ -61,9 +81,7 @@ async def render_script(token: str, settings: SSHConfig) -> str:
     pairing = await state.load(token)
     if pairing is None:
         return _EXPIRED_SCRIPT
-    key = authorized_key_line(
-        (await ensure_client_key(pairing.user_id))["public_key"], settings.login_from
-    )
+    key = await _key_line(pairing.user_id, settings)
     pairing_url = state.script_url(token, pairing.base).removesuffix("/script")
     values = {
         "PRODUCT": state.PRODUCT,

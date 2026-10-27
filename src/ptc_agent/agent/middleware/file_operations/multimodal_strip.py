@@ -12,13 +12,21 @@ agent wires both: an agent with no filesystem tool has nothing to intercept,
 but still inherits history full of blocks it may not be able to read.
 """
 
+from collections.abc import Collection
 from typing import Any
 
 from langchain.agents.middleware import AgentMiddleware
 
 from ptc_agent.agent.middleware._message_utils import order_tool_results_first
+from ptc_agent.agent.middleware.file_operations.image_fit import fit_images
 from src.llms.attachment_payload import FILE_BLOCK_TYPES, IMAGE_BLOCK_TYPES, block_type
-from src.llms.llm import get_input_modalities, get_max_pdf_pages
+from src.llms.llm import (
+    get_image_types,
+    get_input_modalities,
+    get_max_image_side,
+    get_max_pdf_pages,
+    image_route,
+)
 
 
 def _placeholder_for(
@@ -82,8 +90,12 @@ def strip_unsupported_content_blocks(
     has_pdf: bool,
     max_pdf_pages: int | None = None,
     guidance: str = "",
+    unreadable: Collection[tuple[int, int]] = (),
 ) -> list:
     """Replace image/file blocks this target can't read with text placeholders.
+
+    ``unreadable`` is the positions (message, block) of images this target
+    can't be given though it reads images, as ``fit_images`` reports them.
 
     ``max_pdf_pages`` is the target's own page ceiling (None = unbounded). A PDF
     over it is dropped here rather than refused at injection, because the ceiling
@@ -102,7 +114,7 @@ def strip_unsupported_content_blocks(
     # stays cached.
     said = False
 
-    for msg in messages:
+    for i, msg in enumerate(messages):
         content = getattr(msg, "content", None)
         if not isinstance(content, list):
             result.append(msg)
@@ -110,9 +122,13 @@ def strip_unsupported_content_blocks(
 
         new_blocks = []
         changed = False
-        for block in content:
+        for j, block in enumerate(content):
             placeholder = _placeholder_for(
-                block, has_image, has_pdf, max_pdf_pages, "" if said else guidance
+                block,
+                has_image and (i, j) not in unreadable,
+                has_pdf,
+                max_pdf_pages,
+                "" if said else guidance,
             )
             if placeholder is not None:
                 changed = True
@@ -204,12 +220,27 @@ class MultimodalStripMiddleware(AgentMiddleware):
         # the tool side deliberately no longer attempts.
         max_pdf_pages = get_max_pdf_pages(stamped) if stamped and has_pdf else None
 
+        unreadable: frozenset[tuple[int, int]] = frozenset()
+        if has_image:
+            route = image_route(getattr(request.model, "metadata", None))
+            messages, unreadable = await fit_images(
+                messages,
+                get_image_types(route),
+                lambda count: get_max_image_side(route, count),
+            )
         # Decided on the call where the target is known: a tool-time note judged
         # the configured model and froze that verdict into the transcript, which
         # a subagent on its own model then inherited wrongly. The system prompt
-        # is left alone so the cached prefix does not move with the strip.
+        # is left alone so the cached prefix does not move with the strip, and
+        # every placeholder, an image the fit could not use among them, is
+        # written in this one pass so the guidance stays on the first.
         messages = strip_unsupported_content_blocks(
-            messages, has_image, has_pdf, max_pdf_pages, PLACEHOLDER_GUIDANCE
+            messages,
+            has_image,
+            has_pdf,
+            max_pdf_pages,
+            PLACEHOLDER_GUIDANCE,
+            unreadable=unreadable,
         )
         if messages is not request.messages:
             return await handler(request.override(messages=messages))

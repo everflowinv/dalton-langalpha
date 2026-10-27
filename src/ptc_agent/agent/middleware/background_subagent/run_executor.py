@@ -444,6 +444,7 @@ async def _settle_terminal_run(
                 task.task_run_id,
                 task_id=task.task_id,
                 outcome=terminal_status,
+                finalized_at=run_row.get("finalized_at"),
             )
         except Exception:
             logger.warning(

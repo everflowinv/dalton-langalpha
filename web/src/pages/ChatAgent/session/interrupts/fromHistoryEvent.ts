@@ -248,7 +248,7 @@ export function projectHistoryInterrupt(
               [proposalId]: {
                 workspace_id: proposalData.workspace_id,
                 workspace_name: proposalData.workspace_name,
-                question: proposalData.question,
+                question: proposalData.question ?? '',
                 report_back: proposalData.report_back ?? true,
                 interruptId: event.interrupt_id,
                 tool_call_id: proposalData.tool_call_id,

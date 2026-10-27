@@ -102,3 +102,64 @@ describe('revealing a deck under a streaming turn', () => {
     expect(api.isNearBottomRef.current).toBe(true);
   });
 });
+
+// A hand-off's report link: the report row 1200px into the transcript, short
+// of its end, and a thread kept mounted behind this one that holds a row of
+// the same name.
+const REPORT_AT = 1200;
+const measureReport = (el: HTMLElement | null) => {
+  if (el) el.getBoundingClientRect = () => rect(REPORT_AT - viewport().scrollTop, 26);
+};
+
+function LinkHarness() {
+  api = useChatScroll({
+    activeAgentId: 'main',
+    messages: [{ id: 'a0' }, { id: 'r1' }],
+    isActive: true,
+    isActiveRef: { current: true },
+    isLoadingHistory: false,
+    historyLoadFailed: false,
+    isStreaming: false,
+    currentThreadId: 't1',
+    threadId: 't1',
+  });
+  return (
+    <>
+      <div style={{ display: 'none' }}><div data-message-id="r1" tabIndex={-1} data-testid="behind" /></div>
+      <div ref={api.scrollAreaRef}>
+        <div data-radix-scroll-area-viewport ref={measureViewport}>
+          <div data-message-id="a0">reply</div>
+          <div data-message-id="r1" tabIndex={-1} ref={measureReport} data-testid="report">report</div>
+        </div>
+      </div>
+    </>
+  );
+}
+
+describe('revealing a message a link points to', () => {
+  beforeEach(() => {
+    HTMLElement.prototype.scrollTo = function (this: HTMLElement, opts?: unknown) {
+      const top = (opts as { top?: number } | undefined)?.top;
+      if (typeof top === 'number' && this === viewport()) scrollTo(top);
+    } as HTMLElement['scrollTo'];
+  });
+
+  it('lands this transcript\'s own row under the view top and focuses it', async () => {
+    const { getByTestId } = render(<LinkHarness />);
+    let shown = false;
+    await act(async () => { shown = api.revealMessage('r1'); await Promise.resolve(); });
+
+    expect(shown).toBe(true);
+    expect(getByTestId('report')).toHaveFocus();
+    expect(api.pinTargetRef.current).toMatchObject({ mode: 'anchor', id: 'r1' });
+    expect(viewport().scrollTop).toBeLessThan(REPORT_AT);
+    expect(viewport().scrollTop).toBeGreaterThan(REPORT_AT - 100);
+    // Above the end, so the follow stays off and the row stays put.
+    expect(api.isNearBottomRef.current).toBe(false);
+  });
+
+  it('says it could not when the row is not drawn, so the link opens the thread instead', () => {
+    render(<LinkHarness />);
+    expect(api.revealMessage('gone')).toBe(false);
+  });
+});

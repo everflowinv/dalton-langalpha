@@ -12,21 +12,16 @@ import contextlib
 import os
 import random
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from typing import Any
 
 import structlog
 
 logger = structlog.get_logger(__name__)
 
-# One slot per tier vCPU.
-CODE_SLOTS_BY_TIER: dict[str, int] = {
-    "standard": 1,
-    "performance": 2,
-    "max": 4,
-}
-
-# Unknown deployment tiers get the safest bound: overserialization beats oversubscription.
+# A tier the machine's provider does not size (a row from another colour, a
+# tier since removed) gets the safest bound: overserialization beats
+# oversubscription.
 DEFAULT_CODE_SLOTS = 1
 
 # Jitter prevents workers from repeatedly colliding after a release.
@@ -47,8 +42,24 @@ def code_run_key(computer_id: str) -> str:
     return f"sandbox:code_run:{computer_id}"
 
 
-def code_slots_for_tier(tier: str | None) -> int:
-    return CODE_SLOTS_BY_TIER.get((tier or "").strip().lower(), DEFAULT_CODE_SLOTS)
+def code_slots_for_tier(tier: str | None, resource_tiers: Mapping[str, Any] | None) -> int:
+    """One slot per vCPU of the tier as the machine's provider sizes it.
+
+    Read off the preset rather than the name, since a name does not fix a size:
+    Large went from 4 vCPU to 2 while keeping its id.
+    """
+    preset = (resource_tiers or {}).get((tier or "").strip().lower())
+    cpu = getattr(preset, "cpu", None)
+    return cpu if isinstance(cpu, int) and cpu >= 1 else DEFAULT_CODE_SLOTS
+
+
+def resource_tiers_of(session: Any) -> Mapping[str, Any] | None:
+    """The tiers of the provider the session's machine runs on; None when unknown."""
+    sandbox = getattr(getattr(session, "config", None), "sandbox", None)
+    try:
+        return sandbox.settings_for(sandbox.provider).resource_tiers
+    except (AttributeError, ValueError):
+        return None
 
 
 def reap_horizon_seconds(max_execution_time: int | None = None) -> int:
@@ -162,6 +173,7 @@ async def code_run_slot(
     computer_id: str | None,
     *,
     tier: str | None = None,
+    resource_tiers: Mapping[str, Any] | None = None,
     max_execution_time: int | None = None,
 ) -> AsyncIterator[str | None]:
     if not computer_id:
@@ -177,7 +189,7 @@ async def code_run_slot(
     slot_id = await _queue_for_slot(
         client,
         key,
-        limit=code_slots_for_tier(tier),
+        limit=code_slots_for_tier(tier, resource_tiers),
         stale_after=reap_horizon_seconds(max_execution_time),
         queue_timeout=queue_timeout_seconds(max_execution_time),
     )

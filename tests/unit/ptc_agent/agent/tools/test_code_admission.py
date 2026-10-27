@@ -13,12 +13,24 @@ import pytest
 
 from ptc_agent.agent.tools import code_admission
 from ptc_agent.agent.tools.code_admission import (
-    CODE_SLOTS_BY_TIER,
     code_run_key,
     code_run_slot,
     code_slots_for_tier,
     reap_horizon_seconds,
+    resource_tiers_of,
 )
+from ptc_agent.config.core import (
+    CoreConfig,
+    DaytonaConfig,
+    E2BConfig,
+    FilesystemConfig,
+    LoggingConfig,
+    MCPConfig,
+    SandboxConfig,
+    SecurityConfig,
+)
+
+E2B_TIERS = E2BConfig().resource_tiers
 
 
 class _FakePipeline:
@@ -105,16 +117,37 @@ def _holders(redis, computer_id="comp-1"):
 # ---------------------------------------------------------------------------
 
 class TestSizing:
-    def test_each_tier_gets_its_vcpu_count(self):
-        assert CODE_SLOTS_BY_TIER == {"standard": 1, "performance": 2, "max": 4}
-        assert code_slots_for_tier("performance") == 2
-        assert code_slots_for_tier("MAX") == 4
+    def test_each_tier_gets_its_presets_vcpu_count(self):
+        """Read off the size, not the name: Large is 2 vCPU now."""
+        assert code_slots_for_tier("standard", E2B_TIERS) == 1
+        assert code_slots_for_tier("performance", E2B_TIERS) == 2
+        assert code_slots_for_tier("max", E2B_TIERS) == 2
+        assert code_slots_for_tier("XLARGE", E2B_TIERS) == 4
 
     def test_an_unknown_tier_gets_the_most_restrictive_entry(self):
-        """A tier this build has never heard of is a row from another colour;
-        over-serialising one machine is cheaper than over-subscribing it."""
-        assert code_slots_for_tier(None) == 1
-        assert code_slots_for_tier("titanic") == 1
+        """A tier this provider does not size is a row from another colour or a
+        removed tier; over-serialising one machine is cheaper than
+        over-subscribing it."""
+        assert code_slots_for_tier(None, E2B_TIERS) == 1
+        assert code_slots_for_tier("titanic", E2B_TIERS) == 1
+        assert code_slots_for_tier("xlarge", DaytonaConfig().resource_tiers) == 1
+        assert code_slots_for_tier("max", None) == 1
+
+    def test_the_tiers_are_the_sessions_own_providers(self):
+        def session(provider):
+            return SimpleNamespace(
+                config=CoreConfig(
+                    sandbox=SandboxConfig(provider=provider),
+                    security=SecurityConfig(),
+                    mcp=MCPConfig(),
+                    logging=LoggingConfig(),
+                    filesystem=FilesystemConfig(),
+                )
+            )
+
+        assert "xlarge" in resource_tiers_of(session("e2b"))
+        assert "xlarge" not in resource_tiers_of(session("daytona"))
+        assert resource_tiers_of(SimpleNamespace()) is None
 
     def test_the_reap_horizon_outlasts_the_longest_legitimate_hold(self):
         # Three attempts of max_execution_time plus transport, plus margin.
@@ -175,7 +208,9 @@ class TestAdmission:
         entered = asyncio.Event()
 
         async def run(hold: float):
-            async with code_run_slot("comp-1", tier="performance"):
+            async with code_run_slot(
+                "comp-1", tier="performance", resource_tiers=E2B_TIERS
+            ):
                 entered.set()
                 await asyncio.sleep(hold)
                 return len(_holders(redis))

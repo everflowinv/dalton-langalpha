@@ -13,9 +13,7 @@ import { INTERVAL_LABEL } from '@/lib/bars';
 import { LARGE_TOOL_RESULTS_PREFIX } from './filePanel/fileMeta';
 import { messagingAppName, platformOf } from './messaging/messageDelivery';
 import { quietArg, wakeupArgListed } from '../session/wakeupArgs';
-
-/** Translation function signature compatible with i18next's t() */
-type TFn = (key: string, opts?: Record<string, unknown>) => string;
+import type { TFn } from '@/lib/elapsed';
 
 interface ToolDisplayEntry {
   displayName: string;

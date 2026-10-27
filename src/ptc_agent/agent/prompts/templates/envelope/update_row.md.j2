@@ -135,9 +135,9 @@ The earlier time limit no longer applies
 
 This turn has a new time limit, so the note above about it running out is withdrawn, and your tools run again.
 {% elif update.kind == "workspace_changed" %}
-The workspace was renamed or redescribed after the copy in <workspace> was frozen
+The workspace changed after the copy in <workspace> was frozen
 
-Each line below gives the current value and what the frozen block still says. Trust these values over the block until it is rebuilt. A later workspace row supersedes this one.
+The lines below say what is true now. Where the frozen block says otherwise, trust these until it is rebuilt. A later workspace row supersedes this one.
 
 {{ update.text }}
 {% elif harness %}

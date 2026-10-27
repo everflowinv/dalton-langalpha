@@ -1,7 +1,8 @@
 /**
  * Subagent history as one copy-on-write snapshot: the per-task projection that
- * replay and lazy transcript hydration build, plus the tool-call id to task id
- * index that points an inline card at its task.
+ * replay and lazy transcript hydration build, plus two indexes the projection
+ * never rebuilds: the tool-call id to task id index that points an inline card
+ * at its task, and each run's ledger facts (`taskRuns.ts`).
  *
  * Every write swaps in a new snapshot and hands it to `onChange`, so the hook
  * can hold it as state and its getters take a new identity exactly when the
@@ -10,10 +11,13 @@
  * every streamed token. Lanes that run between renders read `get()`.
  */
 import type { SubagentHistoryEntry } from '../types';
+import { putTaskRun, type TaskRun, type TaskRunIndex } from './taskRuns';
 
 export interface SubagentHistorySnapshot {
   readonly entries: Readonly<Record<string, SubagentHistoryEntry>>;
   readonly agentIdByToolCallId: ReadonlyMap<string, string>;
+  /** Each run's facts by run id. */
+  readonly runs: TaskRunIndex;
 }
 
 /** What `getSubagentHistory` hands a card: the entry under its resolved id. */
@@ -29,6 +33,11 @@ export interface ToolCallAgentIndex {
 export interface SubagentHistoryStore {
   get(): SubagentHistorySnapshot;
   readonly toolCalls: ToolCallAgentIndex;
+  readonly runs: {
+    /** File what a writer learned of a run (`putTaskRun`): each fact it
+     *  names fills the run's, the rest stay. */
+    put(runId: string, patch: TaskRun): void;
+  };
   /** Replace each named entry wholesale, in one snapshot. */
   putEntries(entries: Record<string, SubagentHistoryEntry>): void;
   /** Merge fields into an existing entry; a missing entry stays missing. */
@@ -38,6 +47,7 @@ export interface SubagentHistoryStore {
 export const EMPTY_SUBAGENT_HISTORY: SubagentHistorySnapshot = {
   entries: {},
   agentIdByToolCallId: new Map(),
+  runs: new Map(),
 };
 
 export function resolveHistoryAgentId(index: SubagentHistorySnapshot['agentIdByToolCallId'], subagentId: string): string {
@@ -71,6 +81,12 @@ export function createSubagentHistoryStore(
         const index = new Map(snapshot.agentIdByToolCallId);
         index.set(toolCallId, agentId);
         commit({ ...snapshot, agentIdByToolCallId: index });
+      },
+    },
+    runs: {
+      put: (runId, patch) => {
+        const runs = putTaskRun(snapshot.runs, runId, patch);
+        if (runs !== snapshot.runs) commit({ ...snapshot, runs });
       },
     },
     putEntries: (entries) => {

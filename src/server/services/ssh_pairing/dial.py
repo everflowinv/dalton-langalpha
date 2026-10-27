@@ -123,6 +123,8 @@ def parse_report(
         if ip is not None and not ip.is_unspecified:
             addresses.append(str(ip))
 
+    # A machine with no SSH server to dial can only connect out.
+    tunnel_only = form.tunnel_only.strip() == "1"
     return ReportedMachine(
         username=username,
         hostname=printable(form.hostname, 255),
@@ -130,7 +132,8 @@ def parse_report(
         addresses=_unique(addresses),
         host_keys=_unique(host_keys)[:_MAX_HOST_KEYS],
         ports=[int(p) for p in ports],
-        can_tunnel=form.can_tunnel.strip() == "1",
+        can_tunnel=tunnel_only or form.can_tunnel.strip() == "1",
+        tunnel_only=tunnel_only,
         tunnel_id=_tunnel_id(form.tunnel_id),
         run=form.run.strip()[:64],
     )
@@ -166,10 +169,13 @@ def candidates(
     """Where to try the machine, best first.
 
     Through its tunnel alone when it has one, at its sshd's first reported
-    port: the tunnel is there because a direct dial failed.
+    port: the tunnel is there because a direct dial failed. Nowhere else for
+    a machine that is reached only through one.
     """
     if tunnel_id is not None:
         return [Candidate(machine_name(machine.hostname), machine.ports[0], tunnel_id)]
+    if machine.tunnel_only:
+        return []
     dialable = [
         a
         for a in machine.addresses

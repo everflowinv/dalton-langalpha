@@ -33,6 +33,7 @@ from langchain.agents.middleware.types import (
 )
 from langchain_core.messages import AIMessage, AnyMessage
 
+from src.llms.provider_compaction import adopt
 from src.llms.reasoning_lineage import (
     ANTHROPIC_LINEAGE,
     UNKNOWN_LINEAGE,
@@ -275,6 +276,11 @@ class ReasoningCompatibilityMiddleware(AgentMiddleware):
             target_lineage,
             pad_tool_turns=tool_turns_need_reasoning(route),
         )
+        # A summary a provider signed goes as its block to a client that can
+        # take one, inside the lineage that signed it, and as text elsewhere.
+        adopted = adopt(sanitized, request.model, route)
+        if adopted is not None:
+            sanitized = adopted
         if stats:
             # Sanitizing is read-side and the checkpoint keeps the foreign
             # blocks, so one provider switch re-sanitizes on every later call
@@ -288,6 +294,7 @@ class ReasoningCompatibilityMiddleware(AgentMiddleware):
                 target_lineage=target_lineage,
                 **stats.as_log_fields(),
             )
+        if stats or adopted is not None:
             request = request.override(messages=sanitized)
         return request, route
 

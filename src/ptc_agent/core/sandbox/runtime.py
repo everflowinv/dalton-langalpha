@@ -24,6 +24,14 @@ class SandboxTransientError(RuntimeError):
     """
 
 
+class SandboxRateLimitedError(SandboxTransientError):
+    """The provider refused the call for its rate limit.
+
+    More calls of the same kind only draw more refusals until its window
+    refills, so a caller with many to make stops instead of working through them.
+    """
+
+
 class SandboxGoneError(RuntimeError):
     """The sandbox no longer exists (deleted, expired, or in an unrecoverable state).
 
@@ -185,6 +193,29 @@ class CodeRunResult:
     stderr: str
     exit_code: int
     artifacts: list[Artifact] = field(default_factory=list)
+
+
+@dataclass(frozen=True, slots=True)
+class MetricSample:
+    """One resource reading of a sandbox, in the same units for every provider.
+
+    ``cpu_used_pct`` is the share of the sandbox's own CPUs in use, 0 to 100.
+    ``mem_used_bytes`` includes the page cache, ``mem_cache_bytes`` of it,
+    which is how Daytona reports it; E2B reports use without the cache, and
+    its provider adds the cache back. A size or a reading the provider did
+    not report is None, never 0: an E2B
+    template built before envd 0.2.4 reports no disk at all, and a missing
+    total read as 0 would turn every peak into a division by zero downstream.
+    """
+
+    timestamp: datetime
+    cpu_used_pct: float
+    cpu_count: float | None = None
+    mem_used_bytes: int | None = None
+    mem_cache_bytes: int | None = None
+    mem_total_bytes: int | None = None
+    disk_used_bytes: int | None = None
+    disk_total_bytes: int | None = None
 
 
 # One ranged read of a streamed download. Large enough that a file costs few
@@ -498,6 +529,9 @@ class SandboxProvider(ABC):
     # False where the owner brings and pays for the machine, so no plan cap
     # (computers, always-on) counts it.
     metered: ClassVar[bool] = True
+    # Whether ``metrics_since`` can answer, so a caller holding only the kind
+    # skips building a provider for one that never will.
+    reports_metrics: ClassVar[bool] = False
     # True where the machine outlives every create, so a change to the env
     # this deployment gives a new computer reaches it only by being written
     # again at each open (``SandboxRuntime.replace_env``).
@@ -581,6 +615,24 @@ class SandboxProvider(ABC):
         self, runtime: SandboxRuntime, *, tier: str | None = None
     ) -> None:
         """Providers with mutable limits can repair an existing runtime before use."""
+
+    async def metrics_since(
+        self,
+        sandbox_id: str,
+        since: datetime,
+        *,
+        until: datetime | None = None,
+    ) -> list[MetricSample]:
+        """The sandbox's resource samples taken after *since*, oldest first.
+
+        Strictly after *since*, so a caller passing the last sample it kept
+        never folds that sample twice; up to *until*, or now. Read from the
+        provider's own history without connecting, which would resume a
+        paused sandbox. Empty where the backend keeps no history (Docker, an
+        SSH machine). A provider failure raises; the caller decides what a
+        missed reading costs.
+        """
+        return []
 
     @abstractmethod
     async def close(self) -> None:

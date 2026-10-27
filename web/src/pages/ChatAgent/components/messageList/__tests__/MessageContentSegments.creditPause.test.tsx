@@ -12,21 +12,27 @@ import { render, screen } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import type { CreditPauseState, SubagentTaskRecord } from '@/types/chat';
 import { MessageContentSegments } from '../MessageContentSegments';
-import { CreditPausePendingProvider } from '../../CreditPausePendingContext';
+import { SubagentTelemetryContext } from '../../SubagentTelemetryContext';
 
-// The status chip paints its word twice (the ascii liveness glyph carries it as
-// its screen-reader label, the chip renders it visibly), so count instead of
+// The row paints its word twice (the ascii liveness glyph carries it as its
+// screen-reader label, the step line falls back to it), so count instead of
 // asserting a single node.
 const shows = (label: string): boolean => screen.queryAllByText(label).length > 0;
 
 type SegmentsProps = React.ComponentProps<typeof MessageContentSegments>;
 
-/** MessageBubble wraps every message in this provider; the cards read it. */
+// A run that has begun: without a sign of life a running task reads as
+// starting up, which is not the state these pin.
+const BEGUN = {
+  resolve: () => ({ toolCalls: 2, tokenUsage: { input: 10, output: 5, total: 15 } }),
+  followsRuns: true,
+};
+
 function Segments(p: SegmentsProps): React.ReactElement {
   return (
-    <CreditPausePendingProvider creditPauses={p.creditPauses}>
+    <SubagentTelemetryContext.Provider value={BEGUN}>
       <MessageContentSegments {...p} />
-    </CreditPausePendingProvider>
+    </SubagentTelemetryContext.Provider>
   );
 }
 
@@ -96,7 +102,7 @@ describe('MessageContentSegments — credit pause and task status', () => {
       'tc-1': { ...RUNNING_TASK['tc-1'], status: 'completed' },
     };
     render(<Segments {...props(PENDING)} subagentTasks={completed} />);
-    expect(shows('Completed')).toBe(true);
+    expect(shows('Finished')).toBe(true);
     expect(shows('Finishing current step')).toBe(false);
   });
 });

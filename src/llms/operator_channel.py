@@ -104,11 +104,11 @@ import re
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from typing import Any, Literal
-from urllib.parse import urlparse
 
 from langchain_core.messages import SystemMessage
 from langchain_openai.chat_models.base import BaseChatOpenAI
 
+from src.llms.endpoints import OFFICIAL_ANTHROPIC_HOST, url_host
 from src.llms.reasoning_lineage import ROUTE_ENDPOINT_SEP
 
 logger = logging.getLogger(__name__)
@@ -125,7 +125,6 @@ OPERATOR_CHANNEL_KEY = "lc_operator_channel"
 #: something other than the envelope passes its own ``source``.
 RUNTIME_CONTEXT_SOURCE = "runtime_context"
 
-_ANTHROPIC_HOST = "api.anthropic.com"
 _OFFICIAL_OPENAI_HOST = "api.openai.com"
 
 #: The first Claude generation, as ``(major, minor)``, that accepts
@@ -267,16 +266,9 @@ def _off_declared_host(model: Any, entry: dict[str, Any]) -> bool:
         return False
     declared = entry.get("base_url")
     if declared:
-        return _host(str(declared)) != _host(str(resolved))
+        return url_host(str(declared)) != url_host(str(resolved))
     override = os.getenv("OPENAI_API_BASE") or os.getenv("OPENAI_BASE_URL")
-    return bool(override) and _host(override) == _host(str(resolved))
-
-
-def _host(url: str) -> str:
-    parsed = urlparse(url)
-    if parsed.hostname is None:
-        parsed = urlparse(f"//{url}")
-    return (parsed.hostname or "").lower()
+    return bool(override) and url_host(override) == url_host(str(resolved))
 
 
 def _provider_entry(provider: str) -> dict[str, Any] | None:
@@ -341,12 +333,7 @@ def _resolved_host(base_url: str | None) -> str:
     into the field before the client is built, so there is no env chain to
     re-walk here.
     """
-    if not base_url:
-        return _ANTHROPIC_HOST
-    parsed = urlparse(base_url)
-    if parsed.hostname is None:
-        parsed = urlparse(f"//{base_url}")
-    return (parsed.hostname or "").lower()
+    return url_host(base_url) if base_url else OFFICIAL_ANTHROPIC_HOST
 
 
 def _in_allowlist(model_id: Any, allowed: frozenset[str]) -> bool:
@@ -373,7 +360,7 @@ def _any_model(_model_id: Any) -> bool:
 #: A table rather than a chain of ifs because the split is per host: Anthropic
 #: serves the role on part of its own fleet, the compatible hosts on all of it.
 _ANTHROPIC_SYSTEM_HOSTS: dict[str, Callable[[Any], bool]] = {
-    _ANTHROPIC_HOST: _accepts_midturn_system,
+    OFFICIAL_ANTHROPIC_HOST: _accepts_midturn_system,
     **{host: _any_model for host in _ANTHROPIC_COMPATIBLE_HOSTS},
 }
 
