@@ -4,6 +4,12 @@ Providers refuse an inline image above about 5 MB and a request above about
 32 MB (Anthropic); Gemini takes about 20 MB inline. An attachment inlined into
 the user message also stays in the checkpoint and is resent every turn, so one
 that is too large breaks the thread rather than one call.
+
+DALTON-HOOK(attachment-native-cap): these caps are a deliberately conservative
+policy — two inline PDFs large enough individually must not together blow the
+request limit, and the checkpoint must not grow by their bytes every turn.
+They are expected to be replaced once the upstream attachment adaptation (B5)
+lands and sizes to the actual per-provider request budget.
 """
 
 from __future__ import annotations
@@ -11,7 +17,11 @@ from __future__ import annotations
 from typing import Any
 
 NATIVE_IMAGE_MAX_BYTES = 5 * 1024 * 1024
-NATIVE_PDF_MAX_BYTES = 20 * 1024 * 1024
+NATIVE_PDF_MAX_BYTES = 10 * 1024 * 1024
+# Per-message budget over every inlined attachment together (decoded bytes):
+# inline-eligible files are admitted in attachment order until the running
+# total reaches this; the rest ride the sandbox path only.
+NATIVE_MESSAGE_MAX_BYTES = 10 * 1024 * 1024
 
 
 def _decoded_size(data: str) -> int:
@@ -23,8 +33,16 @@ def split_oversized(contexts: list[Any]) -> tuple[list[Any], list[Any]]:
     """(inline, sandbox-only) for image/PDF contexts the model supports."""
     inline: list[Any] = []
     oversized: list[Any] = []
+    inline_total = 0
     for ctx in contexts:
         data = ctx.data if hasattr(ctx, "data") else ctx.get("data", "")
         cap = NATIVE_PDF_MAX_BYTES if data.startswith("data:application/pdf") else NATIVE_IMAGE_MAX_BYTES
-        (oversized if _decoded_size(data) > cap else inline).append(ctx)
+        size = _decoded_size(data)
+        fits_alone = size <= cap
+        fits_message = inline_total + size <= NATIVE_MESSAGE_MAX_BYTES
+        if fits_alone and fits_message:
+            inline.append(ctx)
+            inline_total += size
+        else:
+            oversized.append(ctx)
     return inline, oversized

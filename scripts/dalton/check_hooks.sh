@@ -318,6 +318,9 @@ pinned_modified_sha256 = {
     "direct:get_quote": "3048022c2ebe1b63286a638dcfb09da38f4510fb24b3006b840c8a1a54ca93cd",
     "mcp:price_data:get_asset_data": "ddaeb61647241627897cbf68ae19a28bd8ed3b015e0060e7649421b6fbb75372",
     "mcp:price_data:get_stock_data": "1207da227ebdfcfd4d706e737fec94345e54cb7cdd32f21c3087e0dfa53336e8",
+    # Prod-fix batch 2 (FMP 402): routes US statements to researchdata SEC
+    # first and names the yfinance fallback source.
+    "mcp:fundamentals:get_financial_statements": "e1aac0cb68f187c3e64395b670cb78915faeacdd98dfa771bbc2742363af0362",
     "mcp:yf_price:get_multiple_stocks_history": "f7c61b74abe894ccbe723329e971a2e2ea27d8c735ae6ddb490b4ea6c33f12ad",
     "mcp:yf_price:get_stock_history": "bc8586db7b45021313669c22a045a3a554403fa5a334056772aef8c8e09ca0ad",
 }

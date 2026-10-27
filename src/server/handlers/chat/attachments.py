@@ -94,20 +94,39 @@ async def attach_request_files(
         )
 
     # Helper to build per-file path notes
-    def _file_note(ctx, idx):
+    # DALTON-HOOK(attachment-native-cap): oversized or unsaved attachments get
+    # an explicit note — never a bare filename the model would ignore.
+    def _file_note(ctx, idx, *, oversized_ctx: bool = False):
         desc = ctx.description or "file"
         data = ctx.data
         mime = data.split(":")[1].split(";")[0] if ":" in data else "unknown"
         fpath = file_paths[idx] if file_paths and idx < len(file_paths) else None
-        if fpath:
+        if not fpath:
+            # Never just a bare filename: the model must say so and point the
+            # user at the file panel, not silently drop the attachment.
+            if oversized_ctx:
+                why = "It exceeds the size that can be viewed inline"
+            else:
+                why = "This model cannot view it natively"
             return (
-                f"The user attached a file ({desc}, {mime}). "
-                f"It has been saved to {fpath}. "
-                f"Use Python to process it."
+                f"The user attached a file ({desc}, {mime}). {why}, and saving it "
+                "to the workspace failed, so it cannot be read here. Tell the "
+                "user to upload it again from the file panel."
             )
-        return f"The user attached a file ({desc}, {mime})."
+        note = f"The user attached a file ({desc}, {mime}). It has been saved to {fpath}."
+        if oversized_ctx and mime.startswith("image/"):
+            return note + (
+                " The image is over 5 MB — the Read tool cannot open it; shrink "
+                "it below 5 MB with Python (PIL) first, then view it with Read."
+            )
+        if oversized_ctx and mime == "application/pdf":
+            return note + (
+                " Read it page by page with the Read tool, or extract its text with Python."
+            )
+        return note + " Use Python to process it."
 
     # 4. Unsupported image/PDF: "cannot view" warning + file paths
+    # DALTON-HOOK(attachment-native-cap): the explicit-note contract above.
     if unsupported:
         notes = [
             _file_note(ctx, i)
@@ -116,10 +135,11 @@ async def attach_request_files(
         ]
         _append_to_last_user_message(messages, build_unsupported_reminder(notes))
 
-    # 5. File-only (xlsx, csv, etc.): path notes only, no "cannot view"
+    # 5. File-only (xlsx, csv, etc.) + oversized image/PDF: path notes only
+    # DALTON-HOOK(attachment-native-cap): oversized ones get their reading path.
     if file_only:
         notes = [
-            _file_note(ctx, i)
+            _file_note(ctx, i, oversized_ctx=ctx in oversized)
             for i, ctx in enumerate(multimodal_contexts)
             if ctx in file_only
         ]

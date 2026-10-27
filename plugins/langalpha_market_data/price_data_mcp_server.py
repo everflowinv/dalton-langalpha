@@ -60,6 +60,7 @@ try:
         make_response,
         normalize_interval,
     )
+    from _yf_common import boundary as _yf_boundary
 except ModuleNotFoundError:  # imported as a package module (tests)
     from mcp_servers._envelope import (
         error_from_exception,
@@ -68,6 +69,7 @@ except ModuleNotFoundError:  # imported as a package module (tests)
         make_response,
         normalize_interval,
     )
+    from mcp_servers._yf_common import boundary as _yf_boundary
 
 from mcp_servers._schemas import (
     OBJECT,
@@ -90,7 +92,10 @@ logger = logging.getLogger(__name__)
 _ginlix = get_ginlix_mcp_client()
 
 # Intervals served by each family. Stock/index route through the ginlix-data
-# (CN daily, US) + FMP (global) fetch clients, which cover intraday + daily only.
+# (CN daily, US) + yfinance + FMP (global) fetch clients, which cover intraday
+# + daily only.
+# DALTON-HOOK(market-data-fallback): yfinance sits ahead of FMP (Dalton's
+# market_data.providers order; see the _yf import block).
 _STOCK_INTRADAY = {"1min", "5min", "15min", "30min", "1hour", "4hour"}
 _STOCK_INTERVALS = _STOCK_INTRADAY | {"1day"}
 # FMP commodity/crypto/forex intraday coverage is narrower.
@@ -180,6 +185,97 @@ def _http_miss(exc: httpx.HTTPError) -> str:
     return type(exc).__name__
 
 
+# DALTON-HOOK(market-data-fallback): Dalton's provider order (config.dalton.yaml
+# market_data.providers) answers free yfinance ahead of FMP wherever both can
+# serve, so FMP's ~250 calls/day free quota survives for what only FMP has. The
+# sandbox ships MCP server processes neither config.yaml nor the config loader
+# (only data_client + market_protocol, see _SANDBOX_INTERNAL_PACKAGES), and
+# mcp.json passes no APP_ENV, so the order cannot be read from the deployed
+# overlay — it is pinned here to match it.
+try:
+    import yfinance as _yf
+except ImportError:  # an image without yfinance keeps the FMP chain
+    _yf = None  # type: ignore[assignment]
+
+_YF_INTERVALS: dict[str, str] = {
+    "1min": "1m",
+    "5min": "5m",
+    "15min": "15m",
+    "30min": "30m",
+    "1hour": "1h",
+    "1day": "1d",
+}
+#: Calendar days of history an undated request gets, keyed by yfinance
+#: interval — inside Yahoo's caps (1m: 8d, sub-hour: 60d, 1h: 730d) and as
+#: deep as the daily default the rest of the chain serves.
+_YF_LOOKBACK_DAYS: dict[str, int] = {"1m": 6, "5m": 57, "15m": 57, "30m": 57, "1h": 727, "1d": 730}
+
+
+def _yf_exclusive_end(end: str) -> str:
+    """Advance an inclusive end date to yfinance's exclusive ``end`` bound."""
+    try:
+        return ((datetime.strptime(end, "%Y-%m-%d") + timedelta(days=1)).date()).isoformat()
+    except ValueError:
+        return end
+
+
+def _yf_fetch_history(
+    display: str,
+    canonical: str,
+    start_date: Optional[str],
+    end_date: Optional[str],
+    *,
+    extended_hours: bool = False,
+) -> list[dict]:
+    """Synchronous yfinance history → epoch-ms OHLCV rows (`normalize_bars` shape).
+
+    Raises nothing the caller can't treat as a soft miss; an empty history
+    returns ``[]`` so the chain falls through to FMP.
+    """
+    yf_symbol = _yf_boundary(display)[1]
+    kwargs: dict[str, Any] = {
+        "interval": _YF_INTERVALS[canonical],
+        # Split-adjusted only, the whole chain's declared price treatment —
+        # conventions never blend across a provider failover.
+        "auto_adjust": False,
+    }
+    if extended_hours and canonical != "1day":
+        kwargs["prepost"] = True
+    if start_date:
+        kwargs["start"] = start_date[:10]
+    if end_date:
+        kwargs["end"] = _yf_exclusive_end(end_date)
+    if not start_date and not end_date:
+        lookback = timedelta(days=_YF_LOOKBACK_DAYS.get(_YF_INTERVALS[canonical], 730))
+        kwargs["start"] = (datetime.now(_tz.utc) - lookback).strftime("%Y-%m-%d")
+
+    df = _yf.Ticker(yf_symbol).history(**kwargs)
+    if df is None or df.empty:
+        return []
+    # A NaN-priced row (halted session, gap padding) must not propagate NaN
+    # into the response — drop it here.
+    df = df.copy().dropna(subset=["Open", "High", "Low", "Close"])
+    rows: list[dict] = []
+    for idx, row in df.iterrows():
+        try:
+            ts = int(idx.timestamp() * 1000)
+        except (AttributeError, OSError, OverflowError, ValueError):
+            continue
+        volume = row["Volume"]
+        rows.append(
+            {
+                "time": ts,
+                "open": float(row["Open"]),
+                "high": float(row["High"]),
+                "low": float(row["Low"]),
+                "close": float(row["Close"]),
+                # NaN != NaN: index/sparse rows carry NaN volume.
+                "volume": int(volume) if volume == volume else 0,
+            }
+        )
+    return rows
+
+
 async def _fetch_stock_series(
     symbol: str,
     interval: str,
@@ -187,7 +283,10 @@ async def _fetch_stock_series(
     end_date: Optional[str],
     extended_hours: bool = False,  # DALTON-HOOK(stock-move-upgrade)
 ) -> tuple[Optional[dict], Optional[dict]]:
-    """Fetch stock OHLCV: ginlix-data (CN daily, then US) → FMP fallback (global).
+    """Fetch stock OHLCV: ginlix-data (CN daily, then US) → yfinance → FMP fallback (global).
+
+    DALTON-HOOK(market-data-fallback): the yfinance-before-FMP order matches
+    Dalton's market_data.providers (see the _yf import block).
 
     Returns ``(make_response_kwargs, None)`` on success or ``(None, error)``.
     The success kwargs carry canonical ``symbol``/``interval``, ``currency``,
@@ -294,6 +393,34 @@ async def _fetch_stock_bars(
             "timezone": timezone,
         }, None
 
+    # DALTON-HOOK(market-data-fallback): free yfinance answers ahead of FMP
+    # (Dalton's market_data.providers order — see the _yf import block). Any
+    # miss — no library, unsupported interval, empty history, an error — falls
+    # through to FMP unchanged.
+    scale = minor_unit_scale(legacy)
+    if _yf is not None and canonical in _YF_INTERVALS:
+        try:
+            yf_rows = await asyncio.to_thread(
+                _yf_fetch_history,
+                display,
+                canonical,
+                start_date,
+                end_date,
+                extended_hours=extended_hours,
+            )
+        except Exception:  # noqa: BLE001 - soft miss, chain continues
+            logger.warning("yfinance history failed for %s", display, exc_info=True)
+            yf_rows = []
+        if yf_rows:
+            return {
+                "data": _display_rows(yf_rows, legacy, intraday=intraday, scale=scale),
+                "source": "yfinance",
+                "symbol": display,
+                "interval": canonical,
+                "currency": currency,
+                "timezone": timezone,
+            }, None
+
     # FMP fallback (all markets; converts GBX/pence to pounds).
     try:
         client = await get_fmp_client()
@@ -304,7 +431,6 @@ async def _fetch_stock_bars(
             symbol=display,
         )
 
-    scale = minor_unit_scale(legacy)
     try:
         if canonical in DAILY_INTERVALS:
             rows = await client.get_stock_price(legacy, from_date=start_date, to_date=end_date)

@@ -14,6 +14,10 @@ export function getSlashCommandIcon(cmd: SlashCommand, className: string) {
 // DALTON-HOOK(attachment-native-cap): 30 MB; above what a model reads inline the
 // server keeps the file in the sandbox only.
 export const MAX_FILE_SIZE = 30 * 1024 * 1024;
+// DALTON-HOOK(attachment-native-cap): cap on one message's whole attachment
+// payload — a single file may pass MAX_FILE_SIZE yet push the total past what
+// the request can carry. Files past the budget are not added.
+export const MAX_TOTAL_ATTACHMENTS_BYTES = 60 * 1024 * 1024;
 export const MAX_FILES = 5;
 export const PASTE_PILL_MIN_CHARS = 1500;
 export const PASTE_PILL_MIN_LINES = 15;

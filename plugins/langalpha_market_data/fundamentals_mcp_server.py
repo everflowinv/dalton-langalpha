@@ -35,6 +35,7 @@ except ModuleNotFoundError:  # imported as a package module (tests)
     from mcp_servers._bootstrap import MCPServer
 
 import asyncio
+import json  # DALTON-HOOK(market-data-fallback): serializes the yfinance fallback statements
 import logging
 from typing import Literal
 
@@ -66,6 +67,20 @@ from market_protocol.symbology import (
 )
 
 logger = logging.getLogger(__name__)
+
+# DALTON-HOOK(market-data-fallback): FMP's free plan does not cover every
+# listing the tool names in its docstring (e.g. some HK tickers); when a 402
+# says so, yfinance statements answer instead so the agent gets data rather
+# than an error it cannot fix by changing arguments.
+try:
+    import yfinance as _yf
+except ImportError:  # an image without yfinance keeps returning the 402 error
+    _yf = None  # type: ignore[assignment]
+
+try:
+    from _yf_common import boundary as _yf_boundary
+except ModuleNotFoundError:  # imported as a package module (tests)
+    from mcp_servers._yf_common import boundary as _yf_boundary
 
 
 _lifespan = closing_lifespan(close_ginlix_mcp_client, close_fmp_client)
@@ -126,6 +141,67 @@ def _http_miss(exc: httpx.HTTPError) -> str:
     return type(exc).__name__
 
 
+# DALTON-HOOK(market-data-fallback): yfinance statements stand in when FMP's
+# plan does not cover the symbol (402). Yahoo-native shape: {metric: {date:
+# value}}, dates "YYYY-MM-DD" newest-first — a different basis from FMP's
+# camelCase rows, which the response's note says out loud.
+def _yf_serialize_statement(df) -> dict:
+    if df is None or df.empty:
+        return {}
+    import pandas as pd
+
+    df = df.copy()
+    if isinstance(df.index, pd.DatetimeIndex):
+        df.index = df.index.strftime("%Y-%m-%d")
+    if isinstance(df.columns, pd.DatetimeIndex):
+        df.columns = df.columns.strftime("%Y-%m-%d")
+    return json.loads(df.fillna("N/A").to_json(orient="index"))
+
+
+def _yf_statements(symbol: str, statement_type: str, period: str) -> dict | None:
+    """Synchronous yfinance statements fetch; None when yfinance cannot serve.
+
+    Raises nothing the caller cannot treat as a soft miss back to the 402
+    error. ``limit`` has no yfinance equivalent — Yahoo returns the periods it
+    holds (typically 4-5), which a fallback answer accepts.
+    """
+    if _yf is None:
+        return None
+    _, yf_symbol, _ = _yf_boundary(symbol)
+    ticker = _yf.Ticker(yf_symbol)
+    quarterly = period == "quarter"
+
+    def _pick(quarterly_df_attr: str, annual_df_attr: str) -> dict:
+        df = getattr(ticker, quarterly_df_attr) if quarterly else getattr(ticker, annual_df_attr)
+        return _yf_serialize_statement(df)
+
+    try:
+        if statement_type == "income":
+            data: dict = _pick("quarterly_income_stmt", "income_stmt")
+        elif statement_type == "balance":
+            data = _pick("quarterly_balance_sheet", "balance_sheet")
+        elif statement_type == "cash":
+            data = _pick("quarterly_cashflow", "cashflow")
+        else:  # "all"
+            data = {
+                "income_statement": _pick("quarterly_income_stmt", "income_stmt"),
+                "balance_sheet": _pick("quarterly_balance_sheet", "balance_sheet"),
+                "cash_flow": _pick("quarterly_cashflow", "cashflow"),
+            }
+    except Exception:  # noqa: BLE001 — soft miss, the 402 error answers
+        logger.warning("yfinance statements failed for %s", symbol, exc_info=True)
+        return None
+    if not populated(data):
+        return None
+    return data
+
+
+_YF_STATEMENTS_NOTE = (
+    "FMP plan does not cover this request; statements served from yfinance — "
+    "口径可能与 FMP 不同 (field names, accounting basis, and units may differ)."
+)
+
+
 async def _from_tushare(disp: str, fetch, *, data_type: str, **extra):
     """Serve a CN tool from tushare, or ``None`` to fall through to FMP.
 
@@ -167,6 +243,9 @@ _OUT_GET_FINANCIAL_STATEMENTS = output_model(
 )
 
 
+# DALTON-HOOK(market-data-fallback): route US statements to researchdata's
+# SEC data first (primary-source, free); yfinance answers HK/A-share and any
+# FMP plan gap.
 @mcp.tool()
 async def get_financial_statements(
     symbol: str,
@@ -176,6 +255,8 @@ async def get_financial_statements(
 ) -> _OUT_GET_FINANCIAL_STATEMENTS:
     """Fetch raw historical financial statements for trend analysis or model
     building. statement_type="all" returns income, balance sheet, and cash flow.
+    US: prefer SEC data finance(route="sec", operation="financials") (primary,
+    free); HK/A-share: yfinance statement tools.
 
     Args:
         symbol: Ticker, e.g. "AAPL", "0700.HK", "600519.SH".
@@ -247,7 +328,23 @@ async def get_financial_statements(
         )
 
     except Exception as e:  # noqa: BLE001
-        return error_from_exception(e, _UPSTREAM_FAILED, symbol=disp)
+        err = error_from_exception(e, _UPSTREAM_FAILED, symbol=disp)
+        # DALTON-HOOK(market-data-fallback): a 402 is about the FMP plan, not
+        # the request — no argument change fixes it, so yfinance answers
+        # instead of returning an error the agent would retry blind.
+        if err.get("error") == "plan_not_covered" or getattr(e, "status_code", None) == 402:
+            yf_data = await asyncio.to_thread(_yf_statements, disp, statement_type, period)
+            if yf_data is not None:
+                return make_response(
+                    yf_data,
+                    source="yfinance",
+                    symbol=disp,
+                    data_type="financial_statements",
+                    statement_type=statement_type,
+                    period=period,
+                    note=_YF_STATEMENTS_NOTE,
+                )
+        return err
 
 
 _OUT_GET_FINANCIAL_RATIOS = output_model(

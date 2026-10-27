@@ -2,7 +2,7 @@ import { useCallback, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useToast } from './use-toast';
 import type { FileAttachment } from './chat-input.types';
-import { MAX_FILES, MAX_FILE_SIZE } from './chat-input.helpers';
+import { MAX_FILES, MAX_FILE_SIZE, MAX_TOTAL_ATTACHMENTS_BYTES } from './chat-input.helpers'; // DALTON-HOOK(attachment-native-cap)
 
 /** Attachment handling for the chat composer: validation (count and size),
  * dataUrl reading with previews, drag & drop, and paste capture. */
@@ -14,9 +14,11 @@ export function useFileAttachments() {
 
   const handleFiles = useCallback((newFilesList: FileList | File[]) => {
     const currentCount = attachedFiles.length;
+    const currentBytes = attachedFiles.reduce((sum, f) => sum + f.file.size, 0);
     const fileArray = Array.from(newFilesList);
 
-    const validFiles = [];
+    const validFiles: File[] = [];
+    let acceptedBytes = currentBytes;
     for (const file of fileArray) {
       if (currentCount + validFiles.length >= MAX_FILES) break;
       if (file.size > MAX_FILE_SIZE) {
@@ -27,6 +29,20 @@ export function useFileAttachments() {
         });
         continue;
       }
+      // DALTON-HOOK(attachment-native-cap): the message's whole payload is
+      // capped too (see MAX_TOTAL_ATTACHMENTS_BYTES in the helpers); a file
+      // that fits alone but breaks the budget is not added.
+      if (acceptedBytes + file.size > MAX_TOTAL_ATTACHMENTS_BYTES) {
+        toast({
+          title: t('chat.attachmentsTotalTooLarge', {
+            name: file.name,
+            max: MAX_TOTAL_ATTACHMENTS_BYTES / (1024 * 1024),
+          }),
+          variant: 'destructive',
+        });
+        continue;
+      }
+      acceptedBytes += file.size;
       validFiles.push(file);
     }
 
@@ -60,7 +76,7 @@ export function useFileAttachments() {
       };
       reader.readAsDataURL(f.file);
     });
-  }, [attachedFiles.length, t, toast]);
+  }, [attachedFiles.length, t, toast]); // DALTON-HOOK(attachment-native-cap)
 
   const removeFile = useCallback((id: string) => {
     setAttachedFiles((prev) => {
