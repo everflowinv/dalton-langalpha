@@ -205,6 +205,7 @@ def task_item(
     )
 
 
+# DALTON-HOOK(subagent-caps): a queued task's detail leads with its queue state
 def task_detail(
     row: Mapping[str, Any], now: datetime, progress: str | None = None, queued: str | None = None
 ) -> str:

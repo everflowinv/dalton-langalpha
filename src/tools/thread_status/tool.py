@@ -361,6 +361,7 @@ class _Tasks:
         rows = await subagent_runs.list_reporting_tasks(
             self.r.thread_id, since=self.r.now - RECENT
         )
+        # DALTON-HOOK(subagent-caps): a task waiting for a slot is listed as queued
         return [
             listing.task_item(
                 row, self.r.now, await self.r.progress(row), await self.r.queued(row)
@@ -382,6 +383,7 @@ class _Tasks:
         if not rows:
             return None
         row = rows[0]
+        # DALTON-HOOK(subagent-caps): the detail says queued too
         detail = listing.task_detail(
             row, self.r.now, await self.r.progress(row), await self.r.queued(row)
         )
