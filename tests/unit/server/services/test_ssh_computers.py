@@ -327,3 +327,276 @@ def test_a_new_computer_keeps_its_system_only_when_the_probe_named_one(os, store
 
     assert config.get("os") == stored
     assert ("os" in config) is bool(stored)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model", ["MacBook Pro", ""])
+async def test_a_macs_model_builds_a_provider_and_reaches_the_listing(
+    monkeypatch, model
+):
+    """The model is display data. ``provider_config`` refuses any key the
+    provider is not built from, so a model there failed every create, session
+    and usage read of the Mac it was probed on."""
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from ptc_agent.config.core import SSHConfig
+    from ptc_agent.core.sandbox.providers.ssh import SSHProbe
+    from src.server.models.computer import ComputerSSHSpec
+    from src.server.services import ssh_computers
+    from src.server.services.computer_manager._providers import ProviderMixin
+
+    found = SSHProbe(
+        host_key=_KEY,
+        fingerprint="SHA256:x",
+        os="Darwin",
+        arch="arm64",
+        distro="macOS 26.1",
+        home="/Users/dev",
+        shell="/bin/zsh",
+        is_root=False,
+        has_sudo=False,
+        disk_free_bytes=None,
+        supported=True,
+        hostname="studio",
+        model=model,
+    )
+    monkeypatch.setattr(ssh_computers, "check_ssh_capacity", AsyncMock())
+    monkeypatch.setattr(ssh_computers, "has_client_key", AsyncMock(return_value=True))
+    monkeypatch.setattr(ssh_computers, "spend_dials", AsyncMock())
+    monkeypatch.setattr(ssh_computers, "client_key", AsyncMock(return_value="k"))
+    monkeypatch.setattr(ssh_computers, "probe", AsyncMock(return_value=found))
+    monkeypatch.setattr(
+        ssh_computers, "get_computers_for_user", AsyncMock(return_value=[])
+    )
+    spec = ComputerSSHSpec(
+        host="203.0.113.10",
+        port=22,
+        username="dev",
+        host_key=_KEY,
+        root_dir="/Users/dev/langalpha",
+    )
+
+    plan = await ssh_computers.plan_create("user-1", spec, settings=SSHConfig())
+    kwargs = plan.create_kwargs()
+
+    manager = SimpleNamespace(
+        config=SimpleNamespace(
+            to_core_config=lambda: SimpleNamespace(
+                sandbox=SimpleNamespace(settings_for=lambda kind: SSHConfig())
+            )
+        )
+    )
+    settings = ProviderMixin._provider_settings(
+        manager, "ssh", kwargs["provider_config"]
+    )
+    assert settings.os == "Darwin"
+    row = {
+        "kind": "ssh",
+        "provider_config": kwargs["provider_config"],
+        "config": kwargs["config"],
+    }
+    assert ssh_computers.ssh_info(row).model == (model or None)
+
+
+# -- Taking over a folder another computer marked ---------------------------
+
+_MARKED = "dd44d9d0ddb144d6b135d767eaecc5b7"
+
+
+def _marked_spec(**extra):
+    from src.server.models.computer import ComputerSSHSpec
+
+    return ComputerSSHSpec(
+        host="203.0.113.10",
+        port=22,
+        username="dev",
+        host_key=_KEY,
+        root_dir="/Users/dev/langalpha",
+        **extra,
+    )
+
+
+def _plan_create_against(monkeypatch, *, computers, probe):
+    from unittest.mock import AsyncMock
+
+    from src.server.services import ssh_computers
+
+    monkeypatch.setattr(ssh_computers, "check_ssh_capacity", AsyncMock())
+    monkeypatch.setattr(ssh_computers, "has_client_key", AsyncMock(return_value=True))
+    monkeypatch.setattr(ssh_computers, "spend_dials", AsyncMock())
+    monkeypatch.setattr(ssh_computers, "client_key", AsyncMock(return_value="k"))
+    monkeypatch.setattr(ssh_computers, "probe", probe)
+    monkeypatch.setattr(
+        ssh_computers, "get_computers_for_user", AsyncMock(return_value=computers)
+    )
+
+
+def _theirs(status="running"):
+    # On another machine, so only its id ties it to the folder's mark.
+    row = _ssh("/home/ubuntu/langalpha", host="198.51.100.7")
+    return {**row, "status": status, "provider_ref": _MARKED}
+
+
+@pytest.mark.asyncio
+async def test_a_take_over_leaves_the_computer_it_names_until_the_create_is_decided(
+    monkeypatch,
+):
+    """The plan's probe only lets the mark pass; the recheck, under the lock
+    the insert holds, is what stops and clears that computer."""
+    from unittest.mock import AsyncMock
+
+    from ptc_agent.config.core import SSHConfig
+    from src.server.services import ssh_computers
+
+    probe = AsyncMock(side_effect=RuntimeError("stop"))
+    _plan_create_against(monkeypatch, computers=[], probe=probe)
+
+    with pytest.raises(RuntimeError):
+        await ssh_computers.plan_create(
+            "user-1", _marked_spec(take_over=_MARKED), settings=SSHConfig()
+        )
+
+    assert probe.await_args.kwargs["taking_over"] == _MARKED
+    assert _MARKED not in probe.await_args.kwargs["reclaim"]
+
+    take_over = AsyncMock()
+    monkeypatch.setattr(ssh_computers.ssh_provider, "take_over_root", take_over)
+    plan = ssh_computers.SSHCreatePlan(
+        spec=_marked_spec(take_over=_MARKED),
+        provider_config={},
+        root_dir="/Users/dev/langalpha",
+        default_name="box",
+        settings=SSHConfig(),
+    )
+
+    await plan.recheck("user-1")
+
+    assert take_over.await_args.kwargs["owner"] == _MARKED
+    assert take_over.await_args.kwargs["root_dir"] == "/Users/dev/langalpha"
+
+
+@pytest.mark.asyncio
+async def test_a_take_over_finding_the_callers_own_mark_says_it_is_theirs(monkeypatch):
+    """Marked meanwhile by one of the caller's own computers: never offered."""
+    from unittest.mock import AsyncMock
+
+    from ptc_agent.config.core import SSHConfig
+    from ptc_agent.core.sandbox.providers.ssh_errors import SSHFolderMarked
+    from src.server.services import ssh_computers
+
+    _plan_create_against(monkeypatch, computers=[_theirs()], probe=AsyncMock())
+    monkeypatch.setattr(
+        ssh_computers.ssh_provider,
+        "take_over_root",
+        AsyncMock(side_effect=SSHFolderMarked("marked", _MARKED)),
+    )
+    monkeypatch.setattr(ssh_computers, "_unshared_root_dir", AsyncMock())
+    plan = ssh_computers.SSHCreatePlan(
+        spec=_marked_spec(take_over="ee55e0e0eee155e7c246e878fbfdd6c8"),
+        provider_config={},
+        root_dir="/Users/dev/langalpha",
+        default_name="box",
+        settings=SSHConfig(),
+    )
+
+    with pytest.raises(ssh_computers.SSHFolderTaken, match='Your computer "box"'):
+        await plan.recheck("user-1")
+
+
+@pytest.mark.asyncio
+async def test_a_refused_take_over_create_never_clears_the_computer(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from ptc_agent.config.core import SSHConfig
+    from src.server.services import ssh_computers
+
+    probe = AsyncMock()
+    _plan_create_against(monkeypatch, computers=[], probe=probe)
+    take_over = AsyncMock()
+    monkeypatch.setattr(ssh_computers.ssh_provider, "take_over_root", take_over)
+    monkeypatch.setattr(
+        ssh_computers,
+        "check_ssh_capacity",
+        AsyncMock(side_effect=ssh_computers.SSHComputerLimit("full")),
+    )
+    plan = ssh_computers.SSHCreatePlan(
+        spec=_marked_spec(take_over=_MARKED),
+        provider_config={},
+        root_dir="/Users/dev/langalpha",
+        default_name="box",
+        settings=SSHConfig(),
+    )
+
+    with pytest.raises(ssh_computers.SSHComputerLimit):
+        await plan.recheck("user-1")
+
+    take_over.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_live_computer_of_the_callers_is_never_taken_over(monkeypatch):
+    """Clearing it would stop a computer the caller still has; removing it
+    is how its folder frees."""
+    from unittest.mock import AsyncMock
+
+    from ptc_agent.config.core import SSHConfig
+    from src.server.services import ssh_computers
+
+    probe = AsyncMock()
+    _plan_create_against(monkeypatch, computers=[_theirs()], probe=probe)
+
+    with pytest.raises(ssh_computers.SSHFolderTaken, match='Your computer "box"'):
+        await ssh_computers.plan_create(
+            "user-1", _marked_spec(take_over=_MARKED), settings=SSHConfig()
+        )
+
+    probe.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_mark_of_the_callers_own_computer_is_not_offered_to_take_over(
+    monkeypatch,
+):
+    from unittest.mock import AsyncMock
+
+    from ptc_agent.config.core import SSHConfig
+    from ptc_agent.core.sandbox.providers.ssh_errors import SSHFolderMarked
+    from src.server.services import ssh_computers
+
+    probe = AsyncMock(side_effect=SSHFolderMarked("marked", _MARKED))
+    _plan_create_against(monkeypatch, computers=[_theirs()], probe=probe)
+
+    with pytest.raises(ssh_computers.SSHFolderTaken, match='Your computer "box"'):
+        await ssh_computers.plan_create("user-1", _marked_spec(), settings=SSHConfig())
+
+
+@pytest.mark.asyncio
+async def test_a_mark_of_a_computer_the_caller_does_not_have_is_offered(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from ptc_agent.config.core import SSHConfig
+    from ptc_agent.core.sandbox.providers.ssh_errors import SSHFolderMarked
+    from src.server.services import ssh_computers
+
+    probe = AsyncMock(side_effect=SSHFolderMarked("marked", _MARKED))
+    # Removed, so the probe would have cleared its mark had it been this one.
+    _plan_create_against(monkeypatch, computers=[], probe=probe)
+
+    with pytest.raises(SSHFolderMarked) as caught:
+        await ssh_computers.plan_create("user-1", _marked_spec(), settings=SSHConfig())
+
+    assert caught.value.detail() == {
+        "code": "folder_marked",
+        "message": "marked",
+        "owner": _MARKED,
+    }
+
+
+@pytest.mark.parametrize("take_over", ["../..", "c1", _MARKED.upper(), _MARKED + "0"])
+def test_a_take_over_names_only_a_machine_id(take_over):
+    """It becomes a path on the machine, whose folder is deleted."""
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        _marked_spec(take_over=take_over)

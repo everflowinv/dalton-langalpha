@@ -1,16 +1,18 @@
 /**
  * The computer surface, rendered against the live `GET /api/v1/computers`
- * payload from the wt3 stack.
+ * payload from the wt3 stack. Its details and an opening onto New computer
+ * have suites of their own beside this one.
  *
  * `@/config/hostMode` is mocked rather than inherited: `web/.env` sets
  * VITE_HOST_MODE and Vite loads it for the Vitest run too, so a test that let
  * the mode default would be asserting whichever mode the developer's env
  * happened to carry.
  */
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { Mock } from 'vitest';
 import { act, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
+import { useLocation } from 'react-router';
 
 import { renderWithProviders } from '@/test/utils';
 import { runAuthResets } from '@/lib/authResets';
@@ -24,29 +26,7 @@ vi.mock('@/config/hostMode', () => ({
 
 vi.mock('@/components/ui/use-toast', () => ({ toast: vi.fn() }));
 
-vi.mock('../../utils/api', async () => {
-  // The real readers, so a refusal is worded by the same code as in the app.
-  const errors = await vi.importActual<typeof import('../../utils/api/errors')>('../../utils/api/errors');
-  return {
-    getComputers: vi.fn(),
-    getComputerProviders: vi.fn(),
-    createComputer: vi.fn(),
-    startComputer: vi.fn(),
-    stopComputer: vi.fn(),
-    deleteComputer: vi.fn(),
-    setComputerAlwaysOn: vi.fn(),
-    setComputerFilesBackup: vi.fn(),
-    apiErrorObject: errors.apiErrorObject,
-    apiErrorReason: errors.apiErrorReason,
-    getWorkspaceQuota: vi.fn(async () => ({ performance: null, max: null, always_on: null })),
-    streamComputerEvents: vi.fn(async () => {}),
-    streamWorkspaceEvents: vi.fn(async () => {}),
-    apiErrorStatus: errors.apiErrorStatus,
-    apiErrorDetailMessage: errors.apiErrorDetailMessage,
-    formatApiErrorDetail: (err: unknown) =>
-      (err as { message?: string })?.message ?? 'Request failed',
-  };
-});
+vi.mock('../../utils/api', () => import('./computersDialogApi').then((m) => m.computersApi()));
 
 import { toast } from '@/components/ui/use-toast';
 import {
@@ -54,7 +34,9 @@ import {
   deleteComputer,
   getComputerProviders,
   getComputers,
+  getComputerStorage,
   getWorkspaceQuota,
+  getWorkspaces,
   setComputerAlwaysOn,
   setComputerFilesBackup,
   startComputer,
@@ -62,94 +44,46 @@ import {
 } from '../../utils/api';
 import type { ComputerProviderOption } from '@/types/api';
 import { recordPrepareStage } from '../../hooks/computerPreparation';
+import { getStoredThreadId, setStoredThreadId } from '../../hooks/utils/threadStorage';
 import ComputersDialog from '../ComputersDialog';
+import {
+  CREATED,
+  DAYTONA_AND_E2B,
+  DAYTONA_ONLY,
+  LIVE_LIST,
+  NEW_ID,
+  PRIMARY_ID,
+  SECOND_ID,
+  backToRail,
+  backdropOf,
+  computersDialog,
+  openDetails,
+  openDialog as open,
+  withSecond,
+  type User,
+} from './computersDialogHarness';
 
 const mockGetComputers = getComputers as Mock;
 const mockProviders = getComputerProviders as Mock;
 const mockQuota = getWorkspaceQuota as Mock;
+const mockWorkspaces = getWorkspaces as Mock;
 const mockCreate = createComputer as Mock;
 const mockStart = startComputer as Mock;
 const mockStop = stopComputer as Mock;
 const mockDelete = deleteComputer as Mock;
 const mockSetAlwaysOn = setComputerAlwaysOn as Mock;
 const mockSetFilesBackup = setComputerFilesBackup as Mock;
+const mockStorage = getComputerStorage as Mock;
 const mockToast = toast as unknown as Mock;
 
-const PRIMARY_ID = '5319ad0e-7835-4ca6-9541-b7c2961a7bf6';
-const SECOND_ID = '3b788b47-352e-4cfb-94f0-920b599ea227';
-
-// Verbatim from curl against :8060. `workspace_count` is the server's own
-// count of the folders on each machine, which is the whole point: the dialog is
-// handed no workspace list to count for itself.
-const LIVE_LIST = {
-  computers: [
-    {
-      computer_id: PRIMARY_ID,
-      user_id: 'wp13-final-1789525377',
-      kind: 'daytona',
-      name: 'Alpha Research',
-      status: 'running',
-      resource_tier: 'standard',
-      is_always_on: false,
-      is_primary: true,
-      workspace_count: 3,
-      root_dir: '/home/workspace',
-      provider_ref: '91885905-79ed-48dc-81ac-0a3d2d608458',
-      config: {},
-    },
-    {
-      computer_id: SECOND_ID,
-      user_id: 'wp13-final-1789525377',
-      kind: 'daytona',
-      name: 'Second machine',
-      status: 'stopped',
-      resource_tier: 'performance',
-      is_always_on: false,
-      is_primary: false,
-      workspace_count: 0,
-      root_dir: '/home/workspace',
-      provider_ref: null,
-      config: {},
-    },
-  ],
-  total: 2,
-};
-
-const NEW_ID = 'b7d1f0c2-9a4e-4f3b-8c61-2e5d7a9f0b13';
-
-// The row `POST /api/v1/computers` answers with: its sandbox is being built.
-const CREATED = {
-  computer_id: NEW_ID,
-  user_id: 'wp13-final-1789525377',
-  kind: 'e2b',
-  name: 'Research box',
-  status: 'starting',
-  resource_tier: 'performance',
-  is_always_on: false,
-  is_primary: false,
-  workspace_count: 0,
-  root_dir: '/home/workspace',
-  provider_ref: null,
-  config: {},
-};
-
-const DAYTONA_ONLY: ComputerProviderOption[] = [{ kind: 'daytona', is_default: true, allowed: null }];
-const DAYTONA_AND_E2B: ComputerProviderOption[] = [
-  { kind: 'daytona', is_default: true, allowed: null },
-  { kind: 'e2b', is_default: false, allowed: true },
-];
 const E2B_NOT_ON_PLAN: ComputerProviderOption[] = [
   { kind: 'daytona', is_default: true, allowed: null },
   { kind: 'e2b', is_default: false, allowed: false },
 ];
 
-function open() {
-  return renderWithProviders(<ComputersDialog open onOpenChange={() => {}} />);
-}
-
-async function openCreateForm(user: ReturnType<typeof userEvent.setup>) {
+async function openCreateForm(user: User) {
   open();
-  await user.click(await screen.findByRole('button', { name: 'New computer' }));
+  await user.click(await screen.findByRole('button', { name: 'Add a computer' }));
   return screen.findByRole('dialog', { name: 'New computer' });
 }
 
@@ -157,36 +91,29 @@ function radio(name: string) {
   return screen.getByRole('radio', { name: new RegExp(`^${name}`) });
 }
 
-/** The list with the second machine changed, as the server would report it. */
-function withSecond(patch: Record<string, unknown>) {
-  return {
-    ...LIVE_LIST,
-    computers: LIVE_LIST.computers.map((computer) =>
-      computer.computer_id === SECOND_ID ? { ...computer, ...patch } : computer),
-  };
+/** A row of the workspace list, as `GET /api/v1/workspaces` pages it. */
+function workspaceOn(computerId: string, workspaceId: string, name: string) {
+  return { workspace_id: workspaceId, computer_id: computerId, name };
 }
 
 async function secondRow() {
-  return (await screen.findAllByTestId('computer-row'))[1];
+  return (await screen.findAllByTestId('computer-card'))[1];
+}
+
+/** The second machine's Remove, in its details. */
+async function secondRemove(user: User = userEvent.setup()) {
+  await openDetails(user, 'Second machine');
+  return screen.getByRole('button', { name: 'Remove' });
 }
 
 /** A 409 as the API client rejects it, with the route's coded detail. */
-function conflict(code: string, message: string) {
-  const detail = { code, message };
+function conflict(code: string, message: string, extra: Record<string, unknown> = {}) {
+  const detail = { code, message, ...extra };
   return Object.assign(new Error('Request failed with status code 409'), {
     status: 409,
     response: { status: 409, data: { detail }, headers: {} },
   });
 }
-
-// Found by its title: covered, it is hidden from the tree, and a role query
-// cannot name a dialog whose label sits inside the hidden part.
-const computersDialog = () =>
-  screen.getByText('Computers', { selector: 'h3' }).closest<HTMLElement>('[role="dialog"]') as HTMLElement;
-// The shell's backdrop is the dialog's parent; it carries the dimming.
-const backdropOf = (dialog: HTMLElement) => dialog.parentElement as HTMLElement;
-
-const scrollIntoView = vi.fn();
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -194,12 +121,8 @@ beforeEach(() => {
   runAuthResets();
   mockGetComputers.mockResolvedValue(LIVE_LIST);
   mockProviders.mockResolvedValue({ providers: DAYTONA_ONLY });
-  // jsdom has no layout, so no scrollIntoView either.
-  Element.prototype.scrollIntoView = scrollIntoView;
-});
-
-afterEach(() => {
-  delete (Element.prototype as { scrollIntoView?: unknown }).scrollIntoView;
+  mockWorkspaces.mockResolvedValue({ workspaces: [], total: 0 });
+  mockStorage.mockResolvedValue({ live: true, disk: null, workspaces: [], other_bytes: 0 });
 });
 
 describe('ComputersDialog', () => {
@@ -220,8 +143,9 @@ describe('ComputersDialog', () => {
 
   it("says how many workspaces a machine holds, from the machine's own count", async () => {
     open();
-    expect(await screen.findByText('3 workspaces')).toBeInTheDocument();
-    expect(screen.getByText('0 workspaces')).toBeInTheDocument();
+    const cards = await screen.findAllByTestId('computer-card');
+    const counts = cards.map((card) => within(card).getByText('Workspaces').nextElementSibling?.textContent);
+    expect(counts).toEqual(expect.arrayContaining(['3', '0']));
   });
 
   it('stops the running machine', async () => {
@@ -256,7 +180,7 @@ describe('ComputersDialog', () => {
     });
     open();
 
-    const row = (await screen.findAllByTestId('computer-row'))[1];
+    const row = (await screen.findAllByTestId('computer-card'))[1];
     // The first frame usually goes out before anyone listens, so no stage is step one.
     expect(row).toHaveTextContent('Preparing · Creating the sandbox (1 of 3)');
     expect(row).toHaveTextContent("You can create workspaces on it once it's ready.");
@@ -268,7 +192,7 @@ describe('ComputersDialog', () => {
   it('moves the step on as the stream names it, and never back', async () => {
     mockGetComputers.mockResolvedValue({ computers: [CREATED], total: 1 });
     open();
-    const row = await screen.findByTestId('computer-row');
+    const row = await screen.findByTestId('computer-card');
 
     act(() => recordPrepareStage(NEW_ID, 'tools'));
     expect(row).toHaveTextContent('Preparing · Installing tools (2 of 3)');
@@ -281,7 +205,7 @@ describe('ComputersDialog', () => {
   it('falls back to the plain label for a stage this build does not know', async () => {
     mockGetComputers.mockResolvedValue({ computers: [CREATED], total: 1 });
     open();
-    const row = await screen.findByTestId('computer-row');
+    const row = await screen.findByTestId('computer-card');
 
     act(() => recordPrepareStage(NEW_ID, 'warming_cache'));
     expect(row).toHaveTextContent('Preparing');
@@ -312,6 +236,7 @@ describe('ComputersDialog', () => {
     });
     open();
 
+    await openDetails(userEvent.setup(), 'Alpha Research');
     const toggle = await screen.findByRole('switch', { name: 'Always-on' });
     if (disabled) expect(toggle).toBeDisabled();
     else expect(toggle).toBeEnabled();
@@ -337,10 +262,11 @@ describe('ComputersDialog', () => {
 
     expect(mockCreate).toHaveBeenCalledWith({ name: 'Research box', resource_tier: 'performance', kind: 'e2b' });
     await waitFor(() => expect(screen.queryByRole('dialog', { name: 'New computer' })).not.toBeInTheDocument());
-    const rows = await screen.findAllByTestId('computer-row');
+    const rows = await screen.findAllByTestId('computer-card');
     const row = rows.find((r) => r.textContent?.includes('Research box'));
     expect(row).toBeDefined();
-    expect(scrollIntoView.mock.contexts).toContain(row);
+    // Brought to the middle of the rail, where a card takes input.
+    expect(row).toHaveClass('is-active');
     // Nothing waits on the build: the row says it is under way.
     expect(row).toHaveTextContent('Preparing · Creating the sandbox (1 of 3)');
   });
@@ -421,18 +347,13 @@ describe('ComputersDialog', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent(copy);
   });
 
-  it.each([
-    ['one provider, one kind', DAYTONA_ONLY, LIVE_LIST.computers, false],
-    ['two providers', DAYTONA_AND_E2B, LIVE_LIST.computers, true],
-    ['machines on two kinds', DAYTONA_ONLY, [...LIVE_LIST.computers, CREATED], true],
-  ])('names the provider on the rows only when there is more than one (%s)', async (_case, providers, computers, shown) => {
-    mockProviders.mockResolvedValue({ providers });
-    mockGetComputers.mockResolvedValue({ computers, total: computers.length });
+  it("names a hosted machine's provider once, in its card's corner", async () => {
+    mockProviders.mockResolvedValue({ providers: DAYTONA_AND_E2B });
+    mockGetComputers.mockResolvedValue({ computers: [...LIVE_LIST.computers, CREATED], total: 3 });
     open();
     expect(await screen.findByText('Alpha Research')).toBeInTheDocument();
     await waitFor(() => expect(mockProviders).toHaveBeenCalled());
-    if (shown) expect(await screen.findAllByText('Daytona')).toHaveLength(2);
-    else expect(screen.queryByText('Daytona')).not.toBeInTheDocument();
+    expect(await screen.findAllByText('Daytona')).toHaveLength(2);
   });
 
   it('shows the quota service\'s own sentence on a 429, not copy written here', async () => {
@@ -462,7 +383,7 @@ describe('ComputersDialog', () => {
   });
 
   it('does not fetch while closed', () => {
-    renderWithProviders(<ComputersDialog open={false} onOpenChange={() => {}} />);
+    renderWithProviders(<ComputersDialog panel={null} onClose={() => {}} />);
     expect(mockGetComputers).not.toHaveBeenCalled();
   });
 });
@@ -476,7 +397,7 @@ describe('ComputersDialog: at the computer cap', () => {
     mockQuota.mockResolvedValue(AT_CAP);
     open();
 
-    const button = await screen.findByRole('button', { name: 'New computer' });
+    const button = await screen.findByRole('button', { name: 'Add a computer' });
     await waitFor(() => expect(button).toBeDisabled());
     expect(button).toHaveAccessibleDescription(
       'You have as many computers as your plan allows. Remove one to add another.',
@@ -493,7 +414,7 @@ describe('ComputersDialog: at the computer cap', () => {
     mockProviders.mockResolvedValue({ providers });
     mockQuota.mockResolvedValue(AT_CAP);
     open();
-    await waitFor(() => expect(screen.getByRole('button', { name: 'New computer' })).toBeDisabled());
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Add a computer' })).toBeDisabled());
   });
 
   it("opens onto the user's own machine when SSH is open", async () => {
@@ -505,7 +426,7 @@ describe('ComputersDialog: at the computer cap', () => {
     await screen.findAllByText('Daytona');
     await waitFor(() => expect(mockQuota).toHaveBeenCalled());
 
-    const button = screen.getByRole('button', { name: 'New computer' });
+    const button = screen.getByRole('button', { name: 'Add a computer' });
     expect(button).toBeEnabled();
     expect(screen.queryByTestId('computers-cap-plan-cta')).not.toBeInTheDocument();
     await user.click(button);
@@ -523,7 +444,7 @@ describe('ComputersDialog: at the computer cap', () => {
     mockQuota.mockResolvedValue(quota);
     const { queryClient } = open();
     await waitFor(() => expect(queryClient.getQueryData(queryKeys.workspaces.quota())).toBeDefined());
-    expect(screen.getByRole('button', { name: 'New computer' })).toBeEnabled();
+    expect(screen.getByRole('button', { name: 'Add a computer' })).toBeEnabled();
   });
 
   it('re-reads the count once a computer is created', async () => {
@@ -541,17 +462,20 @@ describe('ComputersDialog: at the computer cap', () => {
 
 describe('ComputersDialog: removing a computer', () => {
   it('offers Remove on every computer but the primary', async () => {
+    const user = userEvent.setup();
     open();
-    const [primary, second] = await screen.findAllByTestId('computer-row');
-    expect(within(primary).queryByRole('button', { name: 'Remove' })).not.toBeInTheDocument();
-    const remove = within(second).getByRole('button', { name: 'Remove' });
+    await openDetails(user, 'Alpha Research');
+    expect(screen.queryByRole('button', { name: 'Remove' })).not.toBeInTheDocument();
+    await backToRail(user);
+    const remove = await secondRemove(user);
     expect(remove).toBeEnabled();
     expect(remove).not.toHaveAccessibleDescription();
   });
 
   it('offers Make primary on a hosted computer', async () => {
     open();
-    expect(within(await secondRow()).getByRole('button', { name: 'Make primary' })).toBeInTheDocument();
+    await openDetails(userEvent.setup(), 'Second machine');
+    expect(screen.getByRole('button', { name: 'Make primary' })).toBeInTheDocument();
   });
 
   it('never offers Make primary on a machine its owner brought', async () => {
@@ -559,9 +483,9 @@ describe('ComputersDialog: removing a computer', () => {
       withSecond({ kind: 'ssh', ssh: { host: 'box.example.com', port: 22, username: 'dev', fingerprint: 'SHA256:x' } }),
     );
     open();
-    const owned = await secondRow();
-    expect(within(owned).queryByRole('button', { name: 'Make primary' })).not.toBeInTheDocument();
-    expect(within(owned).getByRole('button', { name: 'Remove' })).toBeInTheDocument();
+    await openDetails(userEvent.setup(), 'Second machine');
+    expect(screen.queryByRole('button', { name: 'Make primary' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Remove' })).toBeInTheDocument();
   });
 
   it('names no tier for a machine its owner brought, even while its address is unknown', async () => {
@@ -572,14 +496,140 @@ describe('ComputersDialog: removing a computer', () => {
   });
 
   it.each([
-    [2, 'Delete its 2 workspaces to remove it.'],
-    [1, 'Delete its workspace to remove it.'],
-  ])('holds Remove on a computer with %i workspace(s), and says why', async (count, hint) => {
+    [2, 'Remove computer and 2 workspaces'],
+    [1, 'Remove computer and workspace'],
+  ])('offers Remove on a computer with %i workspace(s), and names them on the confirm', async (count, button) => {
+    const user = userEvent.setup();
+    const mine = Array.from({ length: count }, (_, i) => workspaceOn(SECOND_ID, `ws-${i}`, `Held workspace ${i}`));
     mockGetComputers.mockResolvedValue(withSecond({ workspace_count: count }));
+    mockWorkspaces.mockResolvedValue({ workspaces: mine, total: mine.length });
     open();
-    const remove = within(await secondRow()).getByRole('button', { name: 'Remove' });
-    expect(remove).toBeDisabled();
-    expect(remove).toHaveAccessibleDescription(hint);
+    const remove = await secondRemove(user);
+    expect(remove).toBeEnabled();
+    expect(remove).not.toHaveAccessibleDescription();
+    await user.click(remove);
+
+    const confirm = await screen.findByRole('dialog', { name: 'Remove Second machine?' });
+    for (const w of mine) expect(await within(confirm).findByText(w.name)).toBeInTheDocument();
+    // Held until the user says they read the list.
+    expect(within(confirm).getByRole('button', { name: button })).toBeDisabled();
+    await user.click(within(confirm).getByRole('checkbox', { name: /^I understand/ }));
+    await user.click(within(confirm).getByRole('button', { name: button }));
+    await waitFor(() =>
+      expect(mockDelete).toHaveBeenCalledWith(SECOND_ID, { removeKey: false, deleteWorkspaces: mine.map((w) => w.workspace_id), deleteFiles: false }),
+    );
+  });
+
+  it('waits for the workspace list on the confirm, then sends only the ones it names', async () => {
+    const user = userEvent.setup();
+    let answer: (v: unknown) => void = () => {};
+    mockGetComputers.mockResolvedValue(withSecond({ workspace_count: 1 }));
+    mockWorkspaces.mockImplementation(() => new Promise((resolve) => { answer = resolve; }));
+    open();
+    await user.click(await secondRemove(user));
+
+    const confirm = await screen.findByRole('dialog', { name: 'Remove Second machine?' });
+    expect(within(confirm).getByRole('button', { name: 'Remove computer' })).toBeDisabled();
+    await act(async () => answer({
+      workspaces: [workspaceOn(SECOND_ID, 'ws-here', 'Listed here'), workspaceOn(PRIMARY_ID, 'ws-away', 'On the primary')],
+      total: 2,
+    }));
+
+    expect(await within(confirm).findByText('Listed here')).toBeInTheDocument();
+    expect(within(confirm).queryByText('On the primary')).not.toBeInTheDocument();
+    await user.click(within(confirm).getByRole('checkbox', { name: 'I understand Listed here and its threads are deleted for good' }));
+    await user.click(within(confirm).getByRole('button', { name: 'Remove computer and workspace' }));
+    await waitFor(() =>
+      expect(mockDelete).toHaveBeenCalledWith(SECOND_ID, { removeKey: false, deleteWorkspaces: ['ws-here'], deleteFiles: false }),
+    );
+  });
+
+  it.each([
+    // One moved off it meanwhile still exists: it stays remembered, and open.
+    ['the ones the server deleted', ['ws-gone'], '/chat/ws-moved'],
+    // An older backend does not say, and there every one named went.
+    ['every one named, from an older backend', undefined, '/chat'],
+  ])('forgets and leaves %s', async (_case, deleted, path) => {
+    const user = userEvent.setup();
+    const named = [workspaceOn(SECOND_ID, 'ws-gone', 'Gone'), workspaceOn(SECOND_ID, 'ws-moved', 'Moved')];
+    mockGetComputers.mockResolvedValue(withSecond({ workspace_count: 2 }));
+    mockWorkspaces.mockResolvedValue({ workspaces: named, total: 2 });
+    mockDelete.mockResolvedValue({ key: null, ...(deleted ? { workspaces_deleted: deleted } : {}) });
+    for (const w of named) setStoredThreadId(w.workspace_id, `thread-${w.workspace_id}`);
+    let location = '';
+    function Where() {
+      location = useLocation().pathname;
+      return null;
+    }
+    renderWithProviders(
+      <>
+        <ComputersDialog panel={{ view: 'list' }} onClose={() => {}} currentWorkspaceId="ws-moved" />
+        <Where />
+      </>,
+      { route: '/chat/ws-moved' },
+    );
+    await user.click(await secondRemove(user));
+    const confirm = await screen.findByRole('dialog', { name: 'Remove Second machine?' });
+    await user.click(await within(confirm).findByRole('checkbox', { name: /^I understand/ }));
+    await user.click(within(confirm).getByRole('button', { name: 'Remove computer and 2 workspaces' }));
+
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Remove Second machine?' })).not.toBeInTheDocument());
+    expect(getStoredThreadId('ws-gone')).toBe('__default__');
+    expect(getStoredThreadId('ws-moved')).toBe(deleted ? 'thread-ws-moved' : '__default__');
+    expect(location).toBe(path);
+  });
+
+  it('forgets and leaves the ones a refusal names as already deleted', async () => {
+    const user = userEvent.setup();
+    const named = [workspaceOn(SECOND_ID, 'ws-gone', 'Gone'), workspaceOn(SECOND_ID, 'ws-kept', 'Kept')];
+    mockGetComputers.mockResolvedValue(withSecond({ workspace_count: 2 }));
+    mockWorkspaces.mockResolvedValue({ workspaces: named, total: 2 });
+    // A workspace landed on it once the named ones had started to go.
+    mockDelete.mockRejectedValue(
+      conflict('has_workspaces', 'Computer cannot be removed right now', { workspaces_deleted: ['ws-gone'] }),
+    );
+    for (const w of named) setStoredThreadId(w.workspace_id, `thread-${w.workspace_id}`);
+    let location = '';
+    function Where() {
+      location = useLocation().pathname;
+      return null;
+    }
+    renderWithProviders(
+      <>
+        <ComputersDialog panel={{ view: 'list' }} onClose={() => {}} currentWorkspaceId="ws-gone" />
+        <Where />
+      </>,
+      { route: '/chat/ws-gone' },
+    );
+    await user.click(await secondRemove(user));
+    const confirm = await screen.findByRole('dialog', { name: 'Remove Second machine?' });
+    await user.click(await within(confirm).findByRole('checkbox', { name: /^I understand/ }));
+    await user.click(within(confirm).getByRole('button', { name: 'Remove computer and 2 workspaces' }));
+
+    expect(await within(confirm).findByRole('alert')).toHaveTextContent('A workspace not listed here is on it now.');
+    expect(getStoredThreadId('ws-gone')).toBe('__default__');
+    expect(getStoredThreadId('ws-kept')).toBe('thread-ws-kept');
+    await waitFor(() => expect(location).toBe('/chat'));
+  });
+
+  it('asks again when a workspace lands on it under the confirm', async () => {
+    const user = userEvent.setup();
+    const first = workspaceOn(SECOND_ID, 'ws-here', 'Listed here');
+    mockGetComputers.mockResolvedValue(withSecond({ workspace_count: 1 }));
+    mockWorkspaces.mockResolvedValue({ workspaces: [first], total: 1 });
+    const { queryClient } = open();
+    await user.click(await secondRemove(user));
+    const confirm = await screen.findByRole('dialog', { name: 'Remove Second machine?' });
+    await user.click(await within(confirm).findByRole('checkbox', { name: /^I understand/ }));
+    expect(within(confirm).getByRole('button', { name: 'Remove computer and workspace' })).toBeEnabled();
+
+    // Made in another tab: the list the tick was for is not the one it would send.
+    mockWorkspaces.mockResolvedValue({ workspaces: [first, workspaceOn(SECOND_ID, 'ws-new', 'Made since')], total: 2 });
+    await act(() => queryClient.invalidateQueries({ queryKey: queryKeys.workspaces.all }));
+
+    expect(await within(confirm).findByText('Made since')).toBeInTheDocument();
+    expect(within(confirm).getByRole('checkbox', { name: /^I understand/ })).not.toBeChecked();
+    expect(within(confirm).getByRole('button', { name: 'Remove computer and 2 workspaces' })).toBeDisabled();
   });
 
   it.each([
@@ -600,7 +650,7 @@ describe('ComputersDialog: removing a computer', () => {
   ])('holds Remove while %s', async (_case, patch, hint) => {
     mockGetComputers.mockResolvedValue(withSecond(patch));
     open();
-    const remove = within(await secondRow()).getByRole('button', { name: 'Remove' });
+    const remove = await secondRemove();
     expect(remove).toBeDisabled();
     expect(remove).toHaveAccessibleDescription(hint);
   });
@@ -608,11 +658,10 @@ describe('ComputersDialog: removing a computer', () => {
   it("points a preparing computer's Remove at the hint the row already shows", async () => {
     mockGetComputers.mockResolvedValue(withSecond({ status: 'starting' }));
     open();
-    const row = await secondRow();
-    const remove = within(row).getByRole('button', { name: 'Remove' });
+    const remove = await secondRemove();
     expect(remove).toBeDisabled();
     expect(remove).toHaveAccessibleDescription(/You can create workspaces on it once it's ready\./);
-    expect(row).not.toHaveTextContent(/You can remove it/);
+    expect(screen.queryByText(/You can remove it/)).not.toBeInTheDocument();
   });
 
   it('removes on confirm: the row leaves, a toast says so, and focus stays in the dialog', async () => {
@@ -623,7 +672,7 @@ describe('ComputersDialog: removing a computer', () => {
       return { key: null };
     });
     open();
-    await user.click(within(await secondRow()).getByRole('button', { name: 'Remove' }));
+    await user.click(await secondRemove(user));
 
     const confirm = await screen.findByRole('dialog', { name: 'Remove Second machine?' });
     expect(confirm).toHaveTextContent("Its sandbox and everything on its disk are deleted. This can't be undone.");
@@ -631,9 +680,9 @@ describe('ComputersDialog: removing a computer', () => {
     expect(within(confirm).queryByRole('checkbox')).not.toBeInTheDocument();
     await user.click(within(confirm).getByRole('button', { name: 'Remove computer' }));
 
-    expect(mockDelete).toHaveBeenCalledWith(SECOND_ID, { removeKey: false });
+    expect(mockDelete).toHaveBeenCalledWith(SECOND_ID, { removeKey: false, deleteWorkspaces: [], deleteFiles: false });
     await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Remove Second machine?' })).not.toBeInTheDocument());
-    expect(screen.getAllByTestId('computer-row')).toHaveLength(1);
+    expect(screen.getAllByTestId('computer-card')).toHaveLength(1);
     expect(screen.queryByText('Second machine')).not.toBeInTheDocument();
     expect(mockToast).toHaveBeenCalledWith({ title: 'Second machine removed', description: undefined });
     // The button that opened the confirm went with its row.
@@ -648,7 +697,7 @@ describe('ComputersDialog: removing a computer', () => {
       ssh: { host: 'box.example.com', port: 22, username: 'dev', fingerprint: 'SHA256:x' },
     }));
     open();
-    await user.click(within(await secondRow()).getByRole('button', { name: 'Remove' }));
+    await user.click(await secondRemove(user));
 
     const confirm = await screen.findByRole('dialog', { name: 'Remove Second machine?' });
     expect(confirm).toHaveTextContent('Your files in /home/dev/langalpha stay');
@@ -665,7 +714,7 @@ describe('ComputersDialog: removing a computer', () => {
     async function confirmSsh(user: ReturnType<typeof userEvent.setup>, uncheck = false) {
       mockGetComputers.mockResolvedValue(withSecond(SSH_ROW));
       open();
-      await user.click(within(await secondRow()).getByRole('button', { name: 'Remove' }));
+      await user.click(await secondRemove(user));
       const confirm = await screen.findByRole('dialog', { name: 'Remove Second machine?' });
       const box = within(confirm).getByRole('checkbox', { name: 'Remove our key from ~/.ssh/authorized_keys' });
       expect(box).toBeChecked();
@@ -676,13 +725,36 @@ describe('ComputersDialog: removing a computer', () => {
     it('is checked by default and sends remove_key true', async () => {
       mockDelete.mockResolvedValue({ key: null });
       await confirmSsh(userEvent.setup());
-      await waitFor(() => expect(mockDelete).toHaveBeenCalledWith(SECOND_ID, { removeKey: true }));
+      await waitFor(() => expect(mockDelete).toHaveBeenCalledWith(SECOND_ID, { removeKey: true, deleteWorkspaces: [], deleteFiles: false }));
+    });
+
+    it("deletes LangAlpha's files only when asked, and says what stayed", async () => {
+      const user = userEvent.setup();
+      mockDelete.mockResolvedValue({ key: null, files: { outcome: 'deleted', root_kept: false, runtime_kept: true } });
+      mockGetComputers.mockResolvedValue(withSecond(SSH_ROW));
+      open();
+      await user.click(await secondRemove(user));
+      const confirm = await screen.findByRole('dialog', { name: 'Remove Second machine?' });
+      const box = within(confirm).getByRole('checkbox', { name: /^Also delete LangAlpha's files from this machine/ });
+      expect(box).not.toBeChecked();
+      await user.click(box);
+      await user.click(within(confirm).getByRole('button', { name: 'Remove computer' }));
+
+      await waitFor(() =>
+        expect(mockDelete).toHaveBeenCalledWith(SECOND_ID, { removeKey: true, deleteWorkspaces: [], deleteFiles: true }),
+      );
+      await waitFor(() =>
+        expect(mockToast).toHaveBeenCalledWith({
+          title: 'Second machine removed',
+          description: 'Its files were deleted from the machine. ~/.langalpha stays, since another computer uses it.',
+        }),
+      );
     });
 
     it('keeps the key when unchecked', async () => {
       mockDelete.mockResolvedValue({ key: null });
       await confirmSsh(userEvent.setup(), true);
-      await waitFor(() => expect(mockDelete).toHaveBeenCalledWith(SECOND_ID, { removeKey: false }));
+      await waitFor(() => expect(mockDelete).toHaveBeenCalledWith(SECOND_ID, { removeKey: false, deleteWorkspaces: [], deleteFiles: false }));
     });
 
     const KEY = { used_by: null, fingerprint: 'SHA256:abc/def+', comment: 'langalpha' };
@@ -733,7 +805,7 @@ describe('ComputersDialog: removing a computer', () => {
     let finish: () => void = () => {};
     mockDelete.mockImplementation(() => new Promise<void>((resolve) => { finish = resolve; }));
     open();
-    await user.click(within(await secondRow()).getByRole('button', { name: 'Remove' }));
+    await user.click(await secondRemove(user));
     const confirm = await screen.findByRole('dialog', { name: 'Remove Second machine?' });
     await user.click(within(confirm).getByRole('button', { name: 'Remove computer' }));
 
@@ -744,13 +816,13 @@ describe('ComputersDialog: removing a computer', () => {
 
   it.each([
     ['busy', 'This computer is busy. Try again in a moment.'],
-    ['has_workspaces', 'Delete the workspaces on this computer first.'],
+    ['has_workspaces', 'A workspace not listed here is on it now. Check the list and try again.'],
     ['primary', "Your primary computer can't be removed."],
   ])('keeps the confirm open and words a %s refusal itself', async (code, copy) => {
     const user = userEvent.setup();
     mockDelete.mockRejectedValue(conflict(code, 'Computer cannot be removed right now'));
     open();
-    await user.click(within(await secondRow()).getByRole('button', { name: 'Remove' }));
+    await user.click(await secondRemove(user));
     const confirm = await screen.findByRole('dialog', { name: 'Remove Second machine?' });
     await user.click(within(confirm).getByRole('button', { name: 'Remove computer' }));
 
@@ -758,7 +830,8 @@ describe('ComputersDialog: removing a computer', () => {
     expect(alert).toHaveTextContent(copy);
     expect(alert).not.toHaveTextContent('Computer cannot be removed right now');
     expect(within(confirm).getByRole('button', { name: 'Remove computer' })).toBeEnabled();
-    expect(screen.getAllByTestId('computer-row')).toHaveLength(2);
+    // Still in its details, under the confirm: nothing sent the view back to the rail.
+    expect(screen.getByRole('button', { name: 'Computers', hidden: true })).toBeInTheDocument();
     expect(mockToast).not.toHaveBeenCalled();
   });
 
@@ -766,7 +839,7 @@ describe('ComputersDialog: removing a computer', () => {
     const user = userEvent.setup();
     mockDelete.mockRejectedValue(Object.assign(new Error('Network Error'), {}));
     open();
-    await user.click(within(await secondRow()).getByRole('button', { name: 'Remove' }));
+    await user.click(await secondRemove(user));
     const confirm = await screen.findByRole('dialog', { name: 'Remove Second machine?' });
     await user.click(within(confirm).getByRole('button', { name: 'Remove computer' }));
 
@@ -800,7 +873,7 @@ describe('ComputersDialog: one panel at a time', () => {
   it('steps back while the remove confirm is open', async () => {
     const user = userEvent.setup();
     open();
-    await user.click(within(await secondRow()).getByRole('button', { name: 'Remove' }));
+    await user.click(await secondRemove(user));
     const confirm = await screen.findByRole('dialog', { name: 'Remove Second machine?' });
 
     expect(computersDialog()).toHaveAttribute('inert');
@@ -819,9 +892,11 @@ describe('ComputersDialog: one panel at a time', () => {
     mockSetAlwaysOn.mockResolvedValue({ ...first, is_always_on: false });
     open();
 
-    const [withIt, without] = await screen.findAllByTestId('computer-row');
-    expect(within(without).queryByRole('switch', { name: 'Always-on' })).not.toBeInTheDocument();
-    const toggle = within(withIt).getByRole('switch', { name: 'Always-on' });
+    await openDetails(user, 'Second machine');
+    expect(screen.queryByRole('switch', { name: 'Always-on' })).not.toBeInTheDocument();
+    await backToRail(user);
+    await openDetails(user, 'Alpha Research');
+    const toggle = screen.getByRole('switch', { name: 'Always-on' });
     expect(toggle).toBeChecked();
 
     await user.click(toggle);
@@ -845,9 +920,11 @@ describe('ComputersDialog: file backup', () => {
     });
     open();
 
-    const [hosted, row] = await screen.findAllByTestId('computer-row');
-    expect(within(hosted).queryByRole('switch', { name: 'Back up files' })).not.toBeInTheDocument();
-    const toggle = within(row).getByRole('switch', { name: 'Back up files' });
+    await openDetails(user, 'Alpha Research');
+    expect(screen.queryByRole('switch', { name: 'Back up files' })).not.toBeInTheDocument();
+    await backToRail(user);
+    await openDetails(user, 'Second machine');
+    const toggle = screen.getByRole('switch', { name: 'Back up files' });
     expect(toggle).toBeChecked();
 
     await user.click(toggle);
@@ -857,10 +934,10 @@ describe('ComputersDialog: file backup', () => {
 
     await user.click(within(confirm).getByRole('button', { name: 'Stop backing up' }));
     await waitFor(() => expect(mockSetFilesBackup).toHaveBeenCalledWith(SECOND_ID, false));
-    await waitFor(() => expect(within(row).getByRole('switch', { name: 'Back up files' })).not.toBeChecked());
+    await waitFor(() => expect(screen.getByRole('switch', { name: 'Back up files' })).not.toBeChecked());
 
     // Back on needs no confirmation.
-    await user.click(within(row).getByRole('switch', { name: 'Back up files' }));
+    await user.click(screen.getByRole('switch', { name: 'Back up files' }));
     await waitFor(() => expect(mockSetFilesBackup).toHaveBeenCalledWith(SECOND_ID, true));
     expect(screen.queryByRole('dialog', { name: 'Stop backing up files?' })).not.toBeInTheDocument();
   });
@@ -875,8 +952,8 @@ describe('ComputersDialog: file backup', () => {
     mockSetFilesBackup.mockRejectedValue(refusal);
     open();
 
-    const brought = await secondRow();
-    const toggle = within(brought).getByRole('switch', { name: 'Back up files' });
+    await openDetails(user, 'Second machine');
+    const toggle = screen.getByRole('switch', { name: 'Back up files' });
     expect(toggle).not.toBeChecked();
 
     await user.click(toggle);
@@ -885,6 +962,7 @@ describe('ComputersDialog: file backup', () => {
       title: "Couldn't change file backup",
       description: 'This computer is being changed. Try again shortly.',
     }));
-    expect(within(brought).getByRole('switch', { name: 'Back up files' })).not.toBeChecked();
+    expect(screen.getByRole('switch', { name: 'Back up files' })).not.toBeChecked();
   });
 });
+

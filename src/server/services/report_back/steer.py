@@ -9,20 +9,21 @@ the eligibility reads a report needs.
 
 Report-backs a live turn takes in as a steer:
 
-A report owed to a thread (a task's ``task_report_back``, an analyst's
-``report_back``) waits in the outbox until its executor posts it as a turn of
-its own, which it does only once the thread has no live turn. While the
-thread's agent is still working, the turn takes the report in instead, before
-its next model call: ``SteeredReportInbox.take`` holds every report it can
-deliver and returns what the model reads and what the reader is shown, and
+A report owed to a thread (a task's ``task_report_back``, a background
+command's ``command_report_back``, an analyst's ``report_back``) waits in the
+outbox until its executor posts it as a turn of its own, which it does only
+once the thread has no live turn. While the thread's agent is still working,
+the turn takes the report in instead, before its next model call:
+``SteeredReportInbox.take`` holds every report it can deliver and returns
+what the model reads and what the reader is shown, and
 ``SteeredReportInbox.confirm`` closes them from the model step that reads
 them, by which point the message carrying them is checkpointed. A held report
 its turn never confirms (the turn died first) is posted as its own turn when
 that turn ends, as is a report that lands after the turn's last model call.
 
 Whether a report is still owed is its executor's verdict
-(``task_report_verdict``, ``analyst_report_verdict``), so the two paths never
-disagree. What is left to the executor: a report an executor holds (its POST
+(``task_report_verdict``, ``command_report_verdict``,
+``analyst_report_verdict``), so the two paths never disagree. What is left to the executor: a report an executor holds (its POST
 may be in flight), one whose own turn was already admitted (its POST landed
 before the job recorded it), an analyst's report from an automation run (the
 turn carries that run's delivery stamp, which a steer cannot), and anything
@@ -31,12 +32,15 @@ any more is closed without a word, as the executor would drop it.
 
 A market-watch target's notice (``market_target``) takes the same road, as
 an alert the reader is shown as its own row (``market_targets/inline.py``),
-and so does a wakeup's (``wakeup``, ``wakeups/inline.py``). Every close of
-one it was read for stamps the notice delivered first. One whose own wake
-turn was admitted is not left to its executor: it is stamped to that turn
-and closed. Each is read once more after the hold, so one that stopped
-being owed in between (delivered elsewhere, or a wakeup a cancel ended
-outright) is closed rather than shown.
+and so does a wakeup's (``wakeup``, ``wakeups/inline.py``), and a background
+command's held for the thread's next turn (``command_notice``), which is
+never posted: a turn's ending only drops its hold, for the turn after to
+take it in. Every close of one it was read for stamps the notice delivered
+first, as it does a background command's (``command_runs.result_delivered_at``).
+One whose own wake turn was admitted is not left to its executor: it is
+stamped to that turn and closed. Each is read once more after the hold, so
+one that stopped being owed in between (delivered elsewhere, or a wakeup a
+cancel ended outright) is closed rather than shown.
 """
 
 from __future__ import annotations
@@ -47,7 +51,8 @@ from collections.abc import Sequence
 
 from ptc_agent.agent.middleware.steering import ALL_KINDS, SteeredReport
 from src.server.services.market_targets import inline as market_inline
-from src.server.services.report_back.notify_turn import NotOwed
+from src.server.services.report_back import command as command_rb
+from src.server.services.report_back.notify_turn import NotOwed, ReportPipeline
 from src.server.services.wakeups import inline as wakeup_inline
 
 logger = logging.getLogger(__name__)
@@ -58,10 +63,14 @@ logger = logging.getLogger(__name__)
 _ALERT_OFFERS = {
     "market_target": lambda job: market_inline.market_alert_offer(job),
     "wakeup": lambda job: wakeup_inline.wakeup_offer(job),
+    # It has no executor and no turn of its own, so this is its only way in.
+    "command_notice": lambda job: _command_offer(job, own_turn=False),
 }
-_ALERT_STAMPS = {
+_NOTICE_STAMPS = {
     "market_target": lambda jobs, run_id: market_inline.stamp_held_alerts(jobs, run_id),
     "wakeup": lambda jobs, run_id: wakeup_inline.stamp_held_wakeups(jobs, run_id),
+    "command_report_back": lambda jobs, run_id: command_rb.stamp_seen(jobs),
+    "command_notice": lambda jobs, run_id: command_rb.stamp_seen(jobs),
 }
 # The block each group of reports a turn takes in together reads as, by the
 # kind its offers carry.
@@ -438,16 +447,18 @@ async def _alerts_settled_since_read(held: list[dict], run_id: str) -> set[str]:
 
 
 async def _stamp_held_notices(job_ids: list[str], run_id: str) -> None:
-    """Stamp the alerts among ``job_ids`` delivered to ``run_id`` ahead of
-    the confirm that closes them, each by its own type. Raises when the read
-    fails, or a stamp its type will not close without."""
+    """Stamp the notices among ``job_ids`` delivered to ``run_id`` ahead of
+    the confirm that closes them, each by its own type: the alerts, and the
+    background commands' ends. Raises when the read fails, or a stamp its
+    type will not close without."""
     from src.server.database.runs import outbox as outbox_db
 
     by_type: dict[str, list[dict]] = {}
-    for job in await outbox_db.held_alert_jobs(job_ids, run_id):
-        by_type.setdefault(job["hook_type"], []).append(job)
+    for job in await outbox_db.held_notice_jobs(job_ids, run_id):
+        if job["hook_type"] in _NOTICE_STAMPS:
+            by_type.setdefault(job["hook_type"], []).append(job)
     for hook_type, jobs in by_type.items():
-        await _ALERT_STAMPS[hook_type](jobs, run_id)
+        await _NOTICE_STAMPS[hook_type](jobs, run_id)
 
 
 async def _decide(job: dict, thread_id: str) -> SteeredReport | NotOwed | None:
@@ -456,6 +467,8 @@ async def _decide(job: dict, thread_id: str) -> SteeredReport | NotOwed | None:
     try:
         if job["hook_type"] == "task_report_back":
             return await _task_offer(job)
+        if job["hook_type"] == "command_report_back":
+            return await _command_offer(job)
         offer = _ALERT_OFFERS.get(job["hook_type"])
         if offer is not None:
             return await offer(job)
@@ -470,26 +483,39 @@ async def _decide(job: dict, thread_id: str) -> SteeredReport | NotOwed | None:
 
 
 async def _task_offer(job: dict) -> SteeredReport | NotOwed | None:
-    from src.server.database.runs import lifecycle as tl_db
-    from src.server.services.report_back.subagent import (
-        task_report_verdict,
-        task_request_key,
-    )
+    from src.server.services.report_back.subagent import TASK_PIPELINE
 
-    job_id = str(job["hook_outbox_id"])
     payload = job.get("payload") or {}
     if not payload.get("task_run_id") or not payload.get("task_id"):
         return None
-    if await tl_db.find_run_by_request_key(task_request_key(job_id)):
-        # Its own turn was admitted; the executor recovers the job from there.
+    return await _pipeline_offer(job, TASK_PIPELINE)
+
+
+async def _command_offer(job: dict, *, own_turn: bool = True) -> SteeredReport | NotOwed | None:
+    """A background command's notice. ``own_turn``: it may have posted a
+    turn of its own, which a ``command_notice`` never does."""
+    if not (job.get("payload") or {}).get("command_id"):
         return None
-    verdict = await task_report_verdict(job)
+    return await _pipeline_offer(job, command_rb.COMMAND_PIPELINE, own_turn=own_turn)
+
+
+async def _pipeline_offer(
+    job: dict, pipeline: ReportPipeline, *, own_turn: bool = True
+) -> SteeredReport | NotOwed | None:
+    """A report-back's offer by its pipeline's verdict; None when its own
+    turn was admitted, which its executor recovers the job from."""
+    from src.server.database.runs import lifecycle as tl_db
+
+    job_id = str(job["hook_outbox_id"])
+    if own_turn and await tl_db.find_run_by_request_key(pipeline.request_key(job_id)):
+        return None
+    verdict = await pipeline.verdict(job)
     if isinstance(verdict, NotOwed):
         return verdict
     return SteeredReport(
         job_id=job_id,
         content=verdict.message(steered=True),
-        shown={"report_source": verdict.report.model_dump(exclude_none=True)},
+        shown={"report_source": verdict.report_source},
     )
 
 

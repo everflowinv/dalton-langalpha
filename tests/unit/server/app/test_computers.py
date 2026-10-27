@@ -1727,9 +1727,53 @@ async def test_remove_of_a_hosted_computer_has_no_key_to_report(
         resp = await client.delete(f"/api/v1/computers/{COMPUTER_ID}")
 
     assert resp.status_code == 200
-    assert resp.json() == {"key": None}
-    mock_computer_manager.remove_computer.assert_awaited_once_with(COMPUTER_ID)
+    assert resp.json() == {"key": None, "files": None, "workspaces_deleted": []}
+    # Naming none, the computer must be empty: nothing on it is deleted.
+    mock_computer_manager.remove_computer_with_workspaces.assert_awaited_once_with(
+        COMPUTER_ID, [], delete_files=False
+    )
     leave.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_remove_naming_workspaces_deletes_those_first(
+    client, computer, mock_computer_manager
+):
+    # One named but moved off meanwhile is skipped, and the client must not
+    # forget it: the answer names only the ones that went.
+    mock_computer_manager.remove_computer_with_workspaces.return_value = ["ws-a"]
+    get_row, get_manager = _removing(computer, mock_computer_manager)
+    with get_row, get_manager:
+        resp = await client.request(
+            "DELETE",
+            f"/api/v1/computers/{COMPUTER_ID}",
+            json={"delete_workspaces": ["ws-a", "ws-b"]},
+        )
+
+    assert resp.status_code == 200
+    assert resp.json()["workspaces_deleted"] == ["ws-a"]
+    mock_computer_manager.remove_computer_with_workspaces.assert_awaited_once_with(
+        COMPUTER_ID, ["ws-a", "ws-b"], delete_files=False
+    )
+
+
+@pytest.mark.asyncio
+async def test_remove_joins_the_workspaces_an_older_client_names_in_the_query(
+    client, computer, mock_computer_manager
+):
+    get_row, get_manager = _removing(computer, mock_computer_manager)
+    with get_row, get_manager:
+        resp = await client.request(
+            "DELETE",
+            f"/api/v1/computers/{COMPUTER_ID}",
+            params=[("delete_workspaces", "ws-a"), ("delete_workspaces", "ws-b")],
+            json={"delete_workspaces": ["ws-b", "ws-c"]},
+        )
+
+    assert resp.status_code == 200
+    mock_computer_manager.remove_computer_with_workspaces.assert_awaited_once_with(
+        COMPUTER_ID, ["ws-a", "ws-b", "ws-c"], delete_files=False
+    )
 
 
 def _ssh_row(computer, *, tunnel=""):
@@ -1748,6 +1792,30 @@ def _ssh_row(computer, *, tunnel=""):
 
 
 @pytest.mark.asyncio
+async def test_remove_asked_to_delete_files_passes_it_on_and_reports_them(
+    client, computer, mock_computer_manager
+):
+    from src.server.models.computer import ComputerFilesRemoval
+    from src.server.services.ssh_removal import MachineLeft
+
+    files = ComputerFilesRemoval(outcome="deleted", runtime_kept=True)
+    leave = AsyncMock(return_value=MachineLeft(key=None, tunnel_released=False, files=files))
+    get_row, get_manager = _removing(_ssh_row(computer), mock_computer_manager)
+    with get_row, get_manager, patch("src.server.app.computers.leave_machine", leave):
+        resp = await client.delete(
+            f"/api/v1/computers/{COMPUTER_ID}",
+            params=[("delete_workspaces", "ws-a"), ("delete_files", "true")],
+        )
+
+    assert resp.status_code == 200
+    assert resp.json()["files"] == files.model_dump()
+    mock_computer_manager.remove_computer_with_workspaces.assert_awaited_once_with(
+        COMPUTER_ID, ["ws-a"], delete_files=True
+    )
+    assert leave.await_args.kwargs["delete_files"] is True
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("query", "remove_key"), [("", True), ("?remove_key=false", False)]
 )
@@ -1758,15 +1826,15 @@ async def test_remove_of_an_ssh_computer_reports_its_key_after_the_delete(
     from src.server.services.ssh_removal import MachineLeft
 
     events = []
-    mock_computer_manager.remove_computer.side_effect = (
-        lambda *_: events.append("delete")
+    mock_computer_manager.remove_computer_with_workspaces.side_effect = (
+        lambda *_, **__: events.append("delete") or []
     )
     key = ComputerKeyRemoval(
         outcome="removed", fingerprint="SHA256:abc/def+", comment="langalpha"
     )
 
-    async def _leave(user_id, row, *, settings, remove_key):
-        events.append(("leave", user_id, row["computer_id"], remove_key))
+    async def _leave(user_id, row, *, settings, remove_key, delete_files):
+        events.append(("leave", user_id, row["computer_id"], remove_key, delete_files))
         return MachineLeft(key=key if remove_key else None, tunnel_released=False)
 
     row = _ssh_row(computer)
@@ -1776,7 +1844,7 @@ async def test_remove_of_an_ssh_computer_reports_its_key_after_the_delete(
 
     assert resp.status_code == 200
     assert resp.json()["key"] == (key.model_dump() if remove_key else None)
-    assert events == ["delete", ("leave", USER, COMPUTER_ID, remove_key)]
+    assert events == ["delete", ("leave", USER, COMPUTER_ID, remove_key, False)]
 
 
 @pytest.mark.asyncio
@@ -1811,7 +1879,7 @@ async def test_remove_of_an_unknown_computer_is_404(client, mock_computer_manage
         resp = await client.delete(f"/api/v1/computers/{COMPUTER_ID}")
 
     assert resp.status_code == 404
-    mock_computer_manager.remove_computer.assert_not_awaited()
+    mock_computer_manager.remove_computer_with_workspaces.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1824,7 +1892,7 @@ async def test_remove_is_forbidden_for_another_user(
         resp = await client.delete(f"/api/v1/computers/{COMPUTER_ID}")
 
     assert resp.status_code == 403
-    mock_computer_manager.remove_computer.assert_not_awaited()
+    mock_computer_manager.remove_computer_with_workspaces.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1835,7 +1903,7 @@ async def test_a_refused_remove_is_409_with_the_code_the_client_words(
     from src.server.services.computer_errors import ComputerRemovalRefused
 
     refusal = ComputerRemovalRefused(code)
-    mock_computer_manager.remove_computer.side_effect = refusal
+    mock_computer_manager.remove_computer_with_workspaces.side_effect = refusal
     get_row, get_manager = _removing(computer, mock_computer_manager)
     with get_row, get_manager:
         resp = await client.delete(f"/api/v1/computers/{COMPUTER_ID}")
@@ -1846,11 +1914,28 @@ async def test_a_refused_remove_is_409_with_the_code_the_client_words(
 
 
 @pytest.mark.asyncio
+async def test_a_remove_refused_partway_names_the_workspaces_already_deleted(
+    client, computer, mock_computer_manager
+):
+    from src.server.services.computer_errors import ComputerRemovalRefused
+
+    mock_computer_manager.remove_computer_with_workspaces.side_effect = (
+        ComputerRemovalRefused("has_workspaces", deleted=["ws-a"])
+    )
+    get_row, get_manager = _removing(computer, mock_computer_manager)
+    with get_row, get_manager:
+        resp = await client.delete(f"/api/v1/computers/{COMPUTER_ID}")
+
+    assert resp.status_code == 409
+    assert resp.json()["detail"]["workspaces_deleted"] == ["ws-a"]
+
+
+@pytest.mark.asyncio
 async def test_a_computer_retired_under_the_remove_is_404(
     client, computer, mock_computer_manager
 ):
     """Another remove, or the last workspace leaving, retired it first."""
-    mock_computer_manager.remove_computer.side_effect = ValueError(
+    mock_computer_manager.remove_computer_with_workspaces.side_effect = ValueError(
         f"Computer {COMPUTER_ID} not found"
     )
     get_row, get_manager = _removing(computer, mock_computer_manager)

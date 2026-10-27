@@ -10,17 +10,11 @@ import type { Computer } from '@/types/api';
 import { deleteWorkspace, duplicateWorkspace } from '../utils/api';
 import { entitlementErrorMessage } from '../utils/entitlementErrors';
 import { workspaceNameErrorMessage } from '../utils/workspaceName';
-import { invalidateNewWorkspace, invalidateWorkspaceMembership, removeCachedWorkspace } from '../hooks/workspaceRowActions';
-import { forgetStableNavOrder } from '../hooks/useNavigationData';
-import { forgetSharedWorkspaceThreads } from '@/lib/navThreadsStore';
-import { removeStoredThreadId } from '../hooks/utils/threadStorage';
+import { forgetDeletedWorkspace, invalidateNewWorkspace, invalidateWorkspaceMembership } from '../hooks/workspaceRowActions';
 import { useComputers } from '../hooks/useComputers';
 import { liveComputers, takesWorkspaces } from '../utils/computerStatus';
 import { providerKeepsFilesOnRemove } from './providerUi';
-import { clearAllMarketThreadsForWorkspace } from '../../MarketView/utils/threadPersistence';
-import { forgetNavPanelExpansion } from './navExpansionStore';
 import { lazyWithMotion } from '@/lib/lazyWithMotion';
-import { scrollMemory } from '@/lib/scrollMemory';
 import DeleteConfirmModal, { type OwnMachineFolder } from './DeleteConfirmModal';
 import DuplicateWorkspaceDialog from './DuplicateWorkspaceDialog';
 import { WorkspaceMoveOutcomes } from './WorkspaceMoveOutcomes';
@@ -203,18 +197,8 @@ export function useWorkspaceActions({
     try {
       // Only a choice the dialog offered: elsewhere the server deletes the folder anyway.
       await deleteWorkspace(wsId, { deleteFiles: !!deleteOwnMachine && deleteFiles });
-      // Same cleanup set as the gallery's delete: stored thread pointers
-      // (chat + market), remembered tree expansion, frozen nav orders, and the
-      // shared thread lists — so nothing re-expands or 404s a dead workspace.
-      removeStoredThreadId(wsId);
-      clearAllMarketThreadsForWorkspace(wsId);
-      forgetNavPanelExpansion(wsId);
-      forgetStableNavOrder(wsId);
-      forgetSharedWorkspaceThreads(wsId);
-      scrollMemory.forget(`threads:${wsId}:active`);
-      scrollMemory.forget(`threads:${wsId}:archived`);
       // Gone from every list now; the refetch then confirms it.
-      removeCachedWorkspace(queryClient, wsId);
+      forgetDeletedWorkspace(queryClient, wsId);
       invalidateWorkspaceMembership(queryClient);
       // The breakdown drops a deleted project's folder; only an open one refetches.
       if (typeof deleteTarget.computer_id === 'string') {

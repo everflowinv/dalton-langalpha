@@ -51,6 +51,7 @@ from src.server.database.conversation.threads_write import (
     update_thread_fields,
     update_thread_title_cas,
     ws_exists_key,
+    forget_workspace_exists,
 )
 from src.server.database.conversation.queries import (
     create_query,
@@ -126,5 +127,6 @@ __all__ = [
     "stamp_thread_seen",
     "upsert_feedback",
     "ws_exists_key",
+    "forget_workspace_exists",
 ]
 

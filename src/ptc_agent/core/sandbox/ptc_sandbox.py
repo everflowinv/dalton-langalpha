@@ -22,6 +22,15 @@ from ptc_agent.core.sandbox.platform_secrets import (
 )
 from ptc_agent.core.sandbox.providers import create_provider
 from ptc_agent.core.sandbox.providers._image_recipe import builtin_mcp_packages
+from ptc_agent.core.sandbox.jobs import (
+    Ended,
+    Failed,
+    JobOutcome,
+    JobRef,
+    JobSpec,
+    Running,
+    StoppedJob,
+)
 from ptc_agent.core.sandbox.livefs_mount import HistoryFiles, MountHandle, TranscriptReach
 from ptc_agent.core.sandbox.retry import RetryPolicy, async_retry_with_backoff
 from ptc_agent.core.sandbox.runtime import (
@@ -44,7 +53,6 @@ from ..tool_generator import ToolFunctionGenerator
 
 from ptc_agent.core.sandbox._shared import (
     REPLACE_UNLESS_NEWER_SCRIPT,
-    ExecutionResult,
     SyncResult,
     _internal_package_files,
     publish_private_file,
@@ -85,8 +93,6 @@ class PTCSandbox:
         self.runtime: SandboxRuntime | None = None
         self.sandbox_id: str | None = None
         self.tool_generator = ToolFunctionGenerator()
-        self.execution_count = 0
-        self.bash_execution_count = 0
         # Set by the host while the file mount serves this sandbox; None
         # means the store-backed paths are not on its filesystem.
         self.livefs: MountHandle | None = None
@@ -109,9 +115,6 @@ class PTCSandbox:
         self._reconnects_running = 0
         self._tool_refresh_lock = asyncio.Lock()
         self._download_semaphore = asyncio.Semaphore(4)
-
-        # Track per-thread code dirs that have been created (avoids repeated mkdir)
-        self._thread_dirs_created: set[str] = set()
 
         # Per-port sessions for preview servers (port → (session_id, cmd_id))
         self._preview_sessions: dict[int, tuple[str, str]] = {}
@@ -240,6 +243,11 @@ class PTCSandbox:
     def _user_servers(self) -> list:
         """The user's own (``source="user"``, untrusted) servers from the effective set."""
         return [s for s in self.config.mcp.servers if is_untrusted_server(s)]
+
+    async def wait_ready(self) -> None:
+        """``_wait_ready`` for a caller outside the sandbox package: one handed
+        a sandbox a lazy reconnect is still starting."""
+        await self._wait_ready()
 
     async def _wait_ready(self) -> None:
         """Wait for sandbox to be ready. Call at start of methods needing sandbox.
@@ -791,8 +799,8 @@ class PTCSandbox:
         await self._ensure_workspace_dirs(dir_name)
 
         # Sweep orphaned MCP trace files from a prior/reused session
-        # (best-effort). Normal cleanup is per-execution in _collect_mcp_trace;
-        # this bounds leakage when a run dies before its trace is collected.
+        # (best-effort). Normally a job's trace is deleted when its end is
+        # read (``jobs``); this bounds leakage when nothing ever reads it.
         try:
             assert self.runtime is not None
             await self._runtime_call(
@@ -890,31 +898,6 @@ class PTCSandbox:
     # ── Unified sync entry point ─────────────────────────────────────
 
 
-    @staticmethod
-    def _classify_execution_error(
-        e: Exception,
-        duration: float,
-        timeout_limit: float,
-        timeout_message: str,
-    ) -> tuple[bool, str, str]:
-        """Classify a sandbox execution exception as timeout or generic error.
-
-        Returns:
-            (is_timeout, error_detail, stderr_msg)
-        """
-        error_detail = f"{type(e).__name__}: {e!s}" if str(e) else type(e).__name__
-        error_lower = str(e).lower()
-        is_timeout = (
-            duration >= timeout_limit * 0.95
-            or "timed out" in error_lower
-            or "timeout" in error_lower
-        )
-        if is_timeout:
-            stderr_msg = timeout_message
-        else:
-            stderr_msg = f"Sandbox execution error: {error_detail}"
-        return is_timeout, error_detail, stderr_msg
-
     async def _ensure_sandbox_connected(self) -> None:
         await _reconnect.ensure_connected(self)
 
@@ -994,9 +977,6 @@ class PTCSandbox:
         if self.runtime is None:
             return None
         return self.runtime.proxy_domain
-
-
-    _MAX_BG_SESSIONS = 20
 
 
     @staticmethod
@@ -1231,57 +1211,72 @@ class PTCSandbox:
     async def _start_internal_mcp_servers(self, *, replace: bool = False) -> bool | None:
         return await _mcp_setup._start_internal_mcp_servers(self, replace=replace)
 
-    def _detect_missing_imports(self, stderr: str) -> list[str]:
-        return _mcp_setup._detect_missing_imports(self, stderr)
-
     async def _install_package(self, package: str) -> bool:
         return await _mcp_setup._install_package(self, package)
 
 
     # -- execution --
 
-    async def _collect_mcp_trace(self, trace_path: str) -> list[dict]:
-        return await _execution._collect_mcp_trace(self, trace_path)
-
-    async def execute(
-        self,
-        code: str,
-        timeout: int | None = None,
-        *,
-        auto_install: bool = True,
-        max_retries: int = 2,
-        thread_id: str | None = None,
-        call_id: str | None = None,
-        allowed_servers: frozenset[str] | None = None,
-        _carry_mcp_trace: list[dict] | None = None,
-    ) -> ExecutionResult:
-        return await _execution.execute(self, code, timeout, auto_install=auto_install, max_retries=max_retries, thread_id=thread_id, call_id=call_id, allowed_servers=allowed_servers, _carry_mcp_trace=_carry_mcp_trace)
-
     async def execute_bash_command(
         self,
         command: str,
         working_dir: str | None = None,
         timeout: int = 60,
+    ) -> dict[str, Any]:
+        return await _execution.execute_bash_command(self, command, working_dir, timeout)
+
+    async def start_bash_job(
+        self,
+        command: str,
         *,
-        background: bool = False,
+        working_dir: str | None = None,
+        wait_s: float | None,
         thread_id: str | None = None,
         call_id: str | None = None,
         allowed_servers: frozenset[str] | None = None,
-    ) -> dict[str, Any]:
-        return await _execution.execute_bash_command(self, command, working_dir, timeout, background=background, thread_id=thread_id, call_id=call_id, allowed_servers=allowed_servers)
-
-    def _build_trace_env_command(
-        self,
-        bash_id: str,
-        full_command: str,
-        call_id: str | None = None,
-        trace_path: str | None = None,
-        own_shell: bool = False,
-        allowed_servers: frozenset[str] | None = None,
-    ) -> tuple[str, str]:
-        return _execution._build_trace_env_command(
-            self, bash_id, full_command, call_id, trace_path, own_shell, allowed_servers
+    ) -> JobOutcome:
+        return await _execution.start_bash_job(
+            self,
+            command,
+            working_dir=working_dir,
+            wait_s=wait_s,
+            thread_id=thread_id,
+            call_id=call_id,
+            allowed_servers=allowed_servers,
         )
+
+    async def run_foreground(self, spec: JobSpec, timeout: int) -> Ended | Failed:
+        return await _execution.run_foreground(self, spec, timeout)
+
+    async def start_code_job(
+        self,
+        code: str,
+        *,
+        wait_s: float | None,
+        thread_id: str | None = None,
+        call_id: str | None = None,
+        allowed_servers: frozenset[str] | None = None,
+    ) -> JobOutcome:
+        return await _execution.start_code_job(
+            self,
+            code,
+            wait_s=wait_s,
+            thread_id=thread_id,
+            call_id=call_id,
+            allowed_servers=allowed_servers,
+        )
+
+    async def continue_job(self, outcome: Running, wait_s: float | None) -> JobOutcome:
+        return await _execution.continue_job(self, outcome, wait_s)
+
+    async def read_ended_job(self, outcome: Running) -> JobOutcome:
+        return await _execution.read_ended_job(self, outcome)
+
+    async def stop_job(self, ref: JobRef, *, discard: bool = False) -> bool:
+        return await _execution.stop_job(self, ref, discard=discard)
+
+    async def stop_job_with_trace(self, outcome: Running) -> StoppedJob:
+        return await _execution.stop_job_with_trace(self, outcome)
 
     # -- sessions --
 
@@ -1318,15 +1313,6 @@ class PTCSandbox:
             startup_timeout=startup_timeout,
             owner=owner,
         )
-
-    async def _create_bg_session(self) -> str:
-        return await _sessions._create_bg_session(self)
-
-    async def get_background_command_status(self, cmd_id: str) -> dict[str, Any]:
-        return await _sessions.get_background_command_status(self, cmd_id)
-
-    async def stop_background_command(self, cmd_id: str) -> bool:
-        return await _sessions.stop_background_command(self, cmd_id)
 
     async def get_preview_server_logs(self, port: int) -> dict[str, Any]:
         return await _sessions.get_preview_server_logs(self, port)

@@ -142,7 +142,7 @@ async def test_workflow_failure_messages_mandate_run_workflow_resume_only_when_r
         error=lost_msg,
         result={"success": False, "error": lost_msg},
     )
-    settled = await _settled_text(registry, resumable_task, listed=False)
+    settled = await _settled_text(registry, resumable_task)
     assert "RunWorkflow(workflow=<same workflow>, resume='s_rL_A')" in settled
     assert "do NOT manually re-dispatch Task subagents" in settled
 
@@ -171,9 +171,7 @@ async def test_workflow_failure_messages_mandate_run_workflow_resume_only_when_r
         error=non_resumable_err,
         result={"success": False, "error": non_resumable_err},
     )
-    settled_non_resumable = await _settled_text(
-        registry, non_resumable_task, listed=False
-    )
+    settled_non_resumable = await _settled_text(registry, non_resumable_task)
     assert "resume='x_bad1'" not in settled_non_resumable
 
     missing_non_resumable = await _compose_missing_reply(
@@ -570,20 +568,21 @@ async def test_sandbox_pip_install_uses_system_and_skips_local_workspace_dirs(
 
     sandbox._runtime_call.side_effect = _runtime_call
 
-    # 1. _detect_missing_imports immediately drops the workspace dir_name ('ai_strategy_lp')
-    tb = (
-        "Traceback (most recent call last):\n"
-        '  File "/home/workspace/ai_strategy_lp/run.py", line 1, in <module>\n'
-        "    import ai_strategy_lp\n"
-        "ModuleNotFoundError: No module named 'ai_strategy_lp'\n"
-        "ModuleNotFoundError: No module named 'local_helper'\n"
-        "ModuleNotFoundError: No module named 'scipy'\n"
+    # 1. missing_import reads only the RAISED_FILE record's own name, takes its
+    # base package, and nothing a run printed can name one: a forged
+    # "ModuleNotFoundError" line (or any text with shell metacharacters) fails
+    # the dotted-path match, so no dependency-confusion install can fire.
+    assert mcp_setup.missing_import("scipy.stats") == "scipy"
+    assert mcp_setup.missing_import("ai_strategy_lp") == "ai_strategy_lp"
+    assert mcp_setup.missing_import(None) is None
+    assert (
+        mcp_setup.missing_import("ModuleNotFoundError: No module named 'evil'")
+        is None
     )
-    detected = mcp_setup._detect_missing_imports(sandbox, tb)
-    assert "ai_strategy_lp" not in detected
-    assert set(detected) == {"local_helper", "scipy"}
 
-    # 2. _filter_local_packages drops 'local_helper' discovered on disk in the workspace
+    # 2. The retry loop's Dalton filter drops the workspace dir_name
+    # ('ai_strategy_lp') by known name and 'local_helper' by the on-disk probe.
+    detected = ["ai_strategy_lp", "local_helper", "scipy"]
     filtered = await mcp_setup._filter_local_packages(sandbox, detected)
     assert filtered == ["scipy"]
 
@@ -636,6 +635,86 @@ async def test_sandbox_pip_install_uses_system_and_skips_local_workspace_dirs(
     sandbox.execute_bash_command.assert_awaited_once_with(
         "uv pip install --system openpyxl", timeout=120
     )
+
+    # 5. execution.start_code_job (P0-11 hook site) skips auto-install and retry
+    # for local workspace folders (outcome.raised='ai_strategy_lp'), and installs
+    # with --system + retries once for genuine packages (outcome.raised='scipy.stats').
+    from ptc_agent.core.sandbox import execution as sandbox_execution
+    from ptc_agent.core.sandbox.jobs import Ended, JobHandle, JobRef
+
+    sandbox.execution_count = 0
+    fake_ref = JobRef(
+        job_id="job-1",
+        cwd="/home/workspace/ai_strategy_lp",
+        state_dir="/home/workspace/ai_strategy_lp/.agents/threads/t1/jobs/job-1",
+        log_abs="/home/workspace/ai_strategy_lp/.agents/threads/t1/commands/bg-000000000001.log",
+    )
+    fake_handle = JobHandle(
+        command_id="bg-000000000001",
+        log_path=".agents/threads/t1/commands/bg-000000000001.log",
+        ref=fake_ref,
+    )
+    monkeypatch.setattr(
+        sandbox_execution,
+        "_new_job",
+        create_autospec(sandbox_execution._new_job, return_value=fake_handle),
+    )
+    monkeypatch.setattr(
+        sandbox_execution,
+        "_upload_code",
+        create_autospec(sandbox_execution._upload_code, return_value="/tmp/code.py"),
+    )
+    launch_spy = create_autospec(sandbox_execution._launch_job, return_value=None)
+    monkeypatch.setattr(sandbox_execution, "_launch_job", launch_spy)
+
+    # 5a. Local folder 'ai_strategy_lp': filtered out -> no uv pip install, no retry
+    commands.clear()
+    attempt_local = create_autospec(
+        sandbox_execution._run_job_attempt,
+        return_value=Ended(
+            handle=fake_handle,
+            exit_code=1,
+            stdout="",
+            stderr="ModuleNotFoundError: No module named 'ai_strategy_lp'",
+            raised="ai_strategy_lp",
+        ),
+    )
+    monkeypatch.setattr(sandbox_execution, "_run_job_attempt", attempt_local)
+    out_local = await sandbox_execution.start_code_job(
+        sandbox, "import ai_strategy_lp", wait_s=5.0
+    )
+    assert isinstance(out_local, Ended) and out_local.exit_code == 1
+    assert attempt_local.await_count == 1
+    assert not any("uv pip install" in c for c in commands)
+
+    # 5b. Genuine package 'scipy.stats': installed with --system and retried once
+    commands.clear()
+    attempt_scipy = create_autospec(
+        sandbox_execution._run_job_attempt,
+        side_effect=[
+            Ended(
+                handle=fake_handle,
+                exit_code=1,
+                stdout="",
+                stderr="ModuleNotFoundError: No module named 'scipy'",
+                raised="scipy.stats",
+            ),
+            Ended(
+                handle=fake_handle,
+                exit_code=0,
+                stdout="ok\n",
+                stderr="",
+                raised=None,
+            ),
+        ],
+    )
+    monkeypatch.setattr(sandbox_execution, "_run_job_attempt", attempt_scipy)
+    out_scipy = await sandbox_execution.start_code_job(
+        sandbox, "import scipy.stats", wait_s=5.0
+    )
+    assert isinstance(out_scipy, Ended) and out_scipy.exit_code == 0
+    assert attempt_scipy.await_count == 2
+    assert "uv pip install --system -q scipy" in commands
 
 
 # ---------------------------------------------------------------------------

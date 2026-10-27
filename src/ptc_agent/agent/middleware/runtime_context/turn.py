@@ -41,7 +41,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -169,6 +169,15 @@ def _run_clock() -> tuple[datetime, timedelta, timedelta] | None:
         configurable = get_config().get("configurable") or {}
     except RuntimeError:  # outside a runnable context
         return None
+    return run_clock(configurable)
+
+
+def run_clock(
+    configurable: Mapping[str, Any] | None,
+) -> tuple[datetime, timedelta, timedelta] | None:
+    """``_run_clock`` read off a config's ``configurable``, for a caller that
+    holds the config rather than running inside it."""
+    configurable = configurable or {}
     end = configurable.get(TURN_DEADLINE_KEY)
     if not isinstance(end, int | float):
         return None

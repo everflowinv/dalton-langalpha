@@ -10,7 +10,6 @@ Design principles:
 - Every SandboxRuntime abstract method is implemented with real behavior
 - File I/O is backed by a dict[str, bytes] in-memory filesystem
 - exec() runs commands via asyncio subprocess (real shell)
-- code_run() executes Python code via subprocess with env injection
 - State machine (start/stop/delete/archive) is fully functional
 - No mocks — this IS the provider, just an in-process one
 """
@@ -23,12 +22,7 @@ import tempfile
 import uuid
 from typing import Any
 
-from ptc_agent.core.sandbox.providers._chart_capture import (
-    build_code_wrapper,
-    extract_artifacts,
-)
 from ptc_agent.core.sandbox.runtime import (
-    CodeRunResult,
     ExecResult,
     RuntimeState,
     SandboxProvider,
@@ -42,7 +36,7 @@ from ptc_agent.core.sandbox.runtime import (
 class MemoryRuntime(SandboxRuntime):
     """In-memory sandbox runtime backed by a temp directory and real subprocesses.
 
-    Uses a real temp directory for file I/O so that exec/code_run can access
+    Uses a real temp directory for file I/O so that exec can access
     the files they create. This gives us realistic behavior while remaining
     fully self-contained.
     """
@@ -124,57 +118,6 @@ class MemoryRuntime(SandboxRuntime):
             return ExecResult(stdout="", stderr="timeout", exit_code=-1)
         except Exception as e:
             return ExecResult(stdout="", stderr=str(e), exit_code=-1)
-
-    async def code_run(
-        self,
-        code: str,
-        env: dict[str, str] | None = None,
-        timeout: int = 300,
-    ) -> CodeRunResult:
-        self._check_running()
-
-        # Write code to temp file and execute with Python
-        code_file = os.path.join(self._work_dir, f"_exec_{uuid.uuid4().hex[:8]}.py")
-
-        # Wrap code to capture chart artifacts (matches Daytona behavior)
-        wrapper = build_code_wrapper(code)
-        with open(code_file, "w") as f:
-            f.write(wrapper)
-
-        run_env = {**os.environ, **self._env_vars, **(env or {})}
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "python3",
-                code_file,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=self._work_dir,
-                env=run_env,
-            )
-            stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                proc.communicate(), timeout=timeout
-            )
-            stdout = (stdout_bytes or b"").decode("utf-8", errors="replace")
-            stderr = (stderr_bytes or b"").decode("utf-8", errors="replace")
-
-            # Extract artifacts from stdout markers
-            artifacts, clean_stdout = extract_artifacts(stdout)
-
-            return CodeRunResult(
-                stdout=clean_stdout,
-                stderr=stderr,
-                exit_code=proc.returncode or 0,
-                artifacts=artifacts,
-            )
-        except asyncio.TimeoutError:
-            return CodeRunResult(
-                stdout="", stderr="Execution timed out", exit_code=-1
-            )
-        finally:
-            try:
-                os.unlink(code_file)
-            except OSError:
-                pass
 
     # -- File I/O --
 

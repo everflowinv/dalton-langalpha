@@ -59,10 +59,7 @@ const RETAINED_ARTIFACTS = new Set(['preview_url', 'chart_annotation', 'order_re
 function foldRole(block: RenderBlock): FoldRole {
   if (block.type === 'text') return 'text';
   if (RETAINED_TYPES.has(block.type)) return 'retain';
-  if (block.type === 'compact_artifact') {
-    const artifact = (block.proc.toolCallResult as { artifact?: { type?: string } } | undefined)?.artifact;
-    if (RETAINED_ARTIFACTS.has(artifact?.type as string)) return 'retain';
-  }
+  if (block.type === 'compact_artifact' && block.card && RETAINED_ARTIFACTS.has(block.card.type)) return 'retain';
   return 'process';
 }
 
@@ -94,6 +91,11 @@ function shareBlock(next: RenderBlock, old: RenderBlock | undefined): RenderBloc
   }
   if (next.type === 'text' && old.type === 'text') {
     return sameFields(next.segment, old.segment) ? old : next;
+  }
+  if (next.type === 'compact_artifact' && old.type === 'compact_artifact') {
+    // Its artifact and card are read off the call, and the card is a new
+    // object on every build.
+    return next.proc === old.proc && next.toolCallId === old.toolCallId ? old : next;
   }
   return sameFields(next, old) ? old : next;
 }
@@ -127,8 +129,7 @@ function shareProjection(next: ContentProjection, prev: ContentProjection | unde
  * change (see `shareProjection`). */
 export function projectContent(input: ContentInput, prev?: ContentProjection): ContentProjection {
   // A hidden tool is dropped here too, or it would show as preparing until
-  // it landed and vanished. Only by its name, which a route that streams
-  // arguments alone (Anthropic's) does not send, so there it still shows.
+  // it landed and vanished.
   const preparingToolCall = preparingCallsOf(input.pendingToolCallChunks, input.toolCallProcesses, HIDDEN_TOOL_CALL_NAMES);
   const { blocks, nextExpiry, pinnedLive, pinnedSettledAt } = buildRenderBlocks(groupSegments(input.segments), {
     ...input, preparing: preparingToolCall !== null,

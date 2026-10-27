@@ -14,6 +14,7 @@ import { Copy, Check } from 'lucide-react';
 import { useTheme } from '@/contexts/ThemeContext';
 import { GuardedLink } from '@/components/GuardedLink';
 import { appRoutePath } from '@/lib/appRoutes';
+import { copyText } from '@/lib/clipboard';
 import WorkspaceImage from './WorkspaceImage';
 import { isFilePath, isImagePath, normalizeFilePath, parseSiblingHref, parseWsPath } from '../utils/filePaths';
 import { useWorkspaceFolders } from '../contexts/WorkspaceContext';
@@ -150,7 +151,7 @@ const CodeBlock = React.memo(function CodeBlock({ language, code, compact = fals
   // Confirmed once the write lands (it rejects when the document has lost
   // focus); a second copy restarts the one timer rather than racing it.
   const handleCopy = (): void => {
-    navigator.clipboard.writeText(code).then(() => {
+    copyText(code).then(() => {
       setCopied(true);
       if (copiedTimer.current) clearTimeout(copiedTimer.current);
       copiedTimer.current = setTimeout(() => setCopied(false), CODE_COPIED_MS);

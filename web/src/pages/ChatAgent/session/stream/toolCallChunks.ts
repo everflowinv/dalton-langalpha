@@ -47,10 +47,10 @@ export function byArrival(pending: PendingCalls): string[] {
  * `pending` once the call `toolCallId` has landed: its own entry goes, and so
  * does every entry written before it, whose call has landed or never will (a
  * call the producer dropped). Each later call keeps its entry, and with it its
- * row, until it lands itself. A producer that streams arguments with no id
- * (the Anthropic route) is matched by order instead: a call landing for the
- * first time takes the earliest entry nobody has named. Clearing everything,
- * as this once did, took every parallel call's row away when the first landed.
+ * row, until it lands itself. A producer that streams arguments with no id is
+ * matched by order instead: a call landing for the first time takes the
+ * earliest entry nobody has named. Clearing everything, as this once did, took
+ * every parallel call's row away when the first landed.
  */
 export function removeLandedToolCall(pending: PendingCalls, toolCallId: string, firstLanding: boolean): PendingCalls {
   const order = byArrival(pending);

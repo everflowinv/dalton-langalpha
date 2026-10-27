@@ -6,7 +6,6 @@ from typing import Any
 
 import structlog
 from daytona import (
-    CodeRunParams,
     DaytonaNotFoundError,
     FileUpload,
     SessionExecuteRequest,
@@ -14,8 +13,6 @@ from daytona import (
 
 from ptc_agent.core.paths import DEFAULT_SANDBOX_ROOT
 from ptc_agent.core.sandbox.runtime import (
-    Artifact,
-    CodeRunResult,
     ExecResult,
     PreviewInfo,
     RuntimeState,
@@ -191,66 +188,6 @@ class DaytonaRuntime(SandboxRuntime):
             stdout = str(result) if result else ""
         exit_code = getattr(result, "exit_code", 0)
         return ExecResult(stdout=stdout, stderr="", exit_code=exit_code)
-
-    async def code_run(
-        self,
-        code: str,
-        env: dict[str, str] | None = None,
-        timeout: int = 300,
-    ) -> CodeRunResult:
-        params = CodeRunParams(env=env or {})
-        result = await self._sandbox.process.code_run(
-            code, params=params, timeout=timeout
-        )
-
-        # Parse stdout
-        if hasattr(result, "result"):
-            stdout = result.result or ""
-        elif hasattr(result, "stdout"):
-            stdout = result.stdout or ""
-        else:
-            stdout = ""
-
-        # Parse stderr
-        if hasattr(result, "stderr"):
-            stderr = result.stderr or ""
-        elif hasattr(result, "artifacts") and hasattr(result.artifacts, "stderr"):
-            stderr = result.artifacts.stderr or ""
-        else:
-            stderr = ""
-
-        exit_code = getattr(result, "exit_code", None)
-        if exit_code is None:
-            exit_code = 0
-
-        # Parse chart artifacts
-        artifacts: list[Artifact] = []
-        if (
-            hasattr(result, "artifacts")
-            and result.artifacts
-            and hasattr(result.artifacts, "charts")
-            and result.artifacts.charts
-        ):
-            for chart in result.artifacts.charts:
-                chart_type = (
-                    chart.type.value
-                    if hasattr(chart.type, "value")
-                    else str(chart.type)
-                )
-                artifacts.append(
-                    Artifact(
-                        type=chart_type,
-                        data=chart.png if hasattr(chart, "png") else "",
-                        name=chart.title if hasattr(chart, "title") else None,
-                    )
-                )
-
-        return CodeRunResult(
-            stdout=stdout,
-            stderr=stderr,
-            exit_code=exit_code,
-            artifacts=artifacts,
-        )
 
     # -- File I/O --
 

@@ -136,6 +136,24 @@ async def test_get_snapshots_accepts_options_asset_type():
 
 
 @pytest.mark.asyncio
+async def test_get_movers_reads_the_tickers_list():
+    # The movers route answers under `tickers`, not the `results` the other
+    # snapshot routes use; reading `results` made every movers call empty.
+    pages = [{"status": "OK", "tickers": [{"ticker": "ZZZZ", "change_percent": 12.5}]}]
+    client, _ = await _client_with(pages)
+    assert await client.get_movers("gainers") == [{"ticker": "ZZZZ", "change_percent": 12.5}]
+
+
+@pytest.mark.asyncio
+async def test_get_movers_refuses_a_body_without_tickers():
+    # An envelope without the list is a broken contract, which the tool reports
+    # as an error; an empty list would read as a market with no movers.
+    client, _ = await _client_with([{"status": "OK", "results": []}])
+    with pytest.raises(ValueError):
+        await client.get_movers("gainers")
+
+
+@pytest.mark.asyncio
 async def test_userless_call_authenticates_as_the_service():
     # ginlix-data 401s a service token without a user id; directory, fundamentals
     # and feed reads have no user, so they must name the service instead.

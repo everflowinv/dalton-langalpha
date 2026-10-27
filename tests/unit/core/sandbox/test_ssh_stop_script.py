@@ -160,3 +160,54 @@ def test_a_group_that_only_took_a_records_id_is_left_alone(tmp_path):
         assert not _gone(member, timeout=1.5)
     finally:
         _kill(member)
+
+
+
+def _stat_line(pid: int, start: int, state: str) -> str:
+    """A /proc/<pid>/stat line in ``state`` for a group leader, whose start
+    time (field 22) is ``start``."""
+    return f"{pid} (a) b (c) {state} 0 {pid} {' '.join(['0'] * 16)} {start} 0 0\n"
+
+
+def test_a_pid_a_zombie_took_between_the_rounds_is_not_trusted(tmp_path):
+    """A group proven on the TERM round is trusted on the KILL round only
+    while its pid names no process at all: a zombie there now is not the
+    leader recorded. Over a /proc moved into a temp dir and rewritten between
+    the rounds, with a real process that ignores TERM standing in for the
+    group."""
+    proc = tmp_path / "proc"
+    (proc / "1").mkdir(parents=True)
+    (proc / "1" / "stat").write_text(_stat_line(1, 100, "S"))
+    cdir = tmp_path / "c1"
+    (cdir / "execs").mkdir(parents=True)
+    victim = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+            "print(flush=True); time.sleep(30)",
+        ],
+        stdout=subprocess.PIPE,
+        start_new_session=True,
+    )
+    try:
+        victim.stdout.readline()
+        stat = proc / str(victim.pid) / "stat"
+        stat.parent.mkdir()
+        stat.write_text(_stat_line(victim.pid, 300, "S"))
+        (cdir / "execs" / str(victim.pid)).write_text(f"{victim.pid} 300\n")
+        rounds = "if sig TERM; then sleep 1; sig KILL; fi"
+        script = stop_script(str(cdir), root=False).replace("/proc/", f"{proc}/")
+        assert rounds in script
+        reused = shlex.quote(_stat_line(victim.pid, 999, "Z"))
+        script = script.replace(
+            rounds, f"if sig TERM; then printf %s {reused} > {stat}; sig KILL; fi"
+        )
+
+        subprocess.run(["bash", "-c", script], check=True, timeout=30)
+
+        assert victim.poll() is None
+    finally:
+        _kill(victim.pid)
+        victim.wait()
+        victim.stdout.close()

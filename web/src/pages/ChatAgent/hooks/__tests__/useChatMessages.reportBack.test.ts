@@ -1984,6 +1984,34 @@ describe('useChatMessages: report-back watch (PTC → report-back)', () => {
     expect(result.current.awaitingReportBack).toBe(true);
   });
 
+  it('a background command still running arms the watch with no tip, and the turn its end starts attaches in place', async () => {
+    // The command's turn ended and it runs on: nothing is owed yet, and the
+    // tray shows the command's own row, so the tip stays down.
+    mockStatus.mockResolvedValue(threadStatus({ active_commands: ['bg-3f9a1c2e7d10'] }));
+    const watchCalls = captureWatch();
+
+    const { result } = renderHookWithProviders(() => useChatMessages('ws-rb', 'th-rb'));
+    await waitFor(() => expect(result.current.awaitingReportBack).toBe(true));
+    expect(result.current.reportBackOwed).toBe(false);
+
+    // An idle read while it runs keeps the watch, still with no tip.
+    await act(async () => {
+      await watchCalls[0].cb({ cleared: true });
+      await new Promise((r) => setTimeout(r, 0));
+    });
+    expect(result.current.awaitingReportBack).toBe(true);
+    expect(result.current.reportBackOwed).toBe(false);
+    expect(watchCalls[0].controller.signal.aborted).toBe(false);
+
+    // It ends and its report starts a turn: the wake names it, and the view
+    // attaches it in place rather than reloading the transcript.
+    await act(async () => {
+      await watchCalls[0].cb({ run_id: 'rb-command' });
+      await new Promise((r) => setTimeout(r, 0));
+    });
+    expect(mockReconnect.mock.calls.some((c) => c[1] === 'rb-command')).toBe(true);
+  });
+
   it('tail load: live subagents alone arm the watch, and a task-run close never disarms it', async () => {
     // The mid-run refresh case: main turn done, subagent still writing, no
     // pendingness yet. The load must arm from active_tasks; the later

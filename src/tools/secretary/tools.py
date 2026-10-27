@@ -406,11 +406,10 @@ async def threads_delete(
 
     try:
         from src.server.database.conversation.threads_read import get_thread_by_id
-        from src.server.database.conversation.threads_write import delete_thread
+        from src.server.services.commands.control import delete_thread_ending_commands
         from src.server.services.thread_mutation import (
             MutationConflict,
             MutationUnavailable,
-            ThreadMutationRunner,
         )
 
         # The row is gone after the delete, and the prune needs its workspace.
@@ -423,10 +422,7 @@ async def threads_delete(
         # unfenced delete here would cascade away a live run's ledger rows
         # out from under a writer on any worker.
         try:
-            async with ThreadMutationRunner.get_instance().exclusive(
-                thread_id, "delete"
-            ) as mutation:
-                await delete_thread(thread_id, conn=mutation.conn)
+            await delete_thread_ending_commands(thread_id)
         except MutationConflict as e:
             detail = e.detail if isinstance(e.detail, dict) else {}
             return error_command(

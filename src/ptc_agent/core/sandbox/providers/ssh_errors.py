@@ -64,6 +64,30 @@ class SSHConnectError(RuntimeError):
         return f"{self} {CHECK_MACHINE}"
 
 
+# A computer's id on its machine, as its folder's mark holds it. Only an id
+# of this shape is ever named back to the machine as a path.
+MACHINE_ID_PATTERN = r"^[0-9a-f]{32}$"
+
+
+class SSHFolderMarked(SSHConnectError):
+    """The folder is the root of a computer whose own files are still on the machine.
+
+    ``owner`` is that computer's id, from the folder's mark. A create that
+    names it as ``take_over`` clears that computer from the machine, as its
+    removal would have, and takes the folder.
+    """
+
+    code_name = "folder_marked"
+
+    def __init__(self, message: str, owner: str) -> None:
+        super().__init__("root_dir", message)
+        self.owner = owner
+
+    def detail(self) -> dict[str, str]:
+        """The refusal as an API detail, whose ``owner`` a retry takes over."""
+        return {"code": self.code_name, "message": str(self), "owner": self.owner}
+
+
 def connect_failure(exc: BaseException) -> SSHConnectError | None:
     """The :class:`SSHConnectError` behind *exc*, however it was wrapped.
 

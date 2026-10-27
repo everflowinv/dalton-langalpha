@@ -15,6 +15,8 @@ from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from ptc_agent.core.sandbox.providers.ssh_errors import MACHINE_ID_PATTERN
+
 from src.server.services.persistence.sync_result import UnsavedReason
 
 
@@ -143,6 +145,15 @@ class ComputerSSHSpec(ComputerSSHTarget):
             "name, and port its SSH port on the machine itself"
         ),
     )
+    take_over: Optional[str] = Field(
+        None,
+        pattern=MACHINE_ID_PATTERN,
+        description=(
+            "The owner a 409 folder_marked named: that computer, which the "
+            "caller does not have, is cleared from the machine as its removal "
+            "would have, and root_dir taken from it. Its files stay"
+        ),
+    )
 
     @field_validator("host_key")
     @classmethod
@@ -243,6 +254,10 @@ class ComputerSSHProbeResponse(BaseModel):
         description="Whether the account may sudo without a password"
     )
     disk_free_bytes: Optional[int] = None
+    model: str = Field("", description="A Mac's model name; empty elsewhere")
+    cpu: str = Field("", description="The processor as the system names it; empty when not read")
+    cores: Optional[int] = None
+    memory_bytes: Optional[int] = None
     supported: bool = Field(description="Whether a computer can run on the machine")
     problems: List[str] = Field(
         default_factory=list,
@@ -419,6 +434,21 @@ class ComputerSSHInfo(BaseModel):
             "own folder, never in ~/.ssh/authorized_keys"
         ),
     )
+    os: Optional[str] = Field(
+        None,
+        description="The machine's system as uname -s names it; null on a computer added before it was kept",
+    )
+    model: Optional[str] = Field(
+        None,
+        description="A Mac's model name, as System Information gives it (\"MacBook Pro\"); null elsewhere",
+    )
+    distro: Optional[str] = Field(
+        None, description='The system and its version ("macOS 15.4", "Ubuntu 24.04 LTS")'
+    )
+    arch: Optional[str] = Field(None, description="The processor architecture, as uname -m names it")
+    cpu: Optional[str] = Field(None, description="The processor as the system names it")
+    cores: Optional[int] = None
+    memory_bytes: Optional[int] = None
 
 
 class ComputerTierSpec(BaseModel):
@@ -766,12 +796,69 @@ class ComputerKeyRemoval(BaseModel):
     )
 
 
+FilesRemovalOutcome = Literal["deleted", "unreached", "failed"]
+
+
+class ComputerFilesRemoval(BaseModel):
+    """What became of LangAlpha's files on a removed ssh computer's machine,
+    its owner having asked for them to go."""
+
+    outcome: FilesRemovalOutcome = Field(
+        description=(
+            "deleted: its folders in the root went, and the runtime in ~/.langalpha "
+            "unless kept below. unreached: the deletion never reached the machine, "
+            "so nothing went. failed: it reached the machine but did not finish, "
+            "so part may have gone"
+        )
+    )
+    root_kept: bool = Field(
+        False,
+        description=(
+            "Only with deleted: the root folder stays, holding files the owner "
+            "put there or a set-aside folder of theirs that could not go back"
+        ),
+    )
+    runtime_kept: bool = Field(
+        False,
+        description=(
+            "Only with deleted: ~/.langalpha stays, since another computer on "
+            "the login uses it or an install holds it"
+        ),
+    )
+
+
+class ComputerRemoveRequest(BaseModel):
+    """Request body for removing a computer.
+
+    The workspaces ride here rather than in the query, which a computer with
+    a hundred or so would push past the request line limits of common proxies.
+    """
+
+    delete_workspaces: List[str] = Field(
+        default_factory=list,
+        description=(
+            "Workspaces on it to delete first, each as its own delete would. "
+            "One on it this does not name keeps the computer, and nothing is deleted"
+        ),
+    )
+
+
 class ComputerRemoveResponse(BaseModel):
     """What a removal left behind that its owner may want to know about."""
 
     key: Optional[ComputerKeyRemoval] = Field(
         None,
         description="Null for a computer on any kind but ssh, and when the key was kept on request",
+    )
+    files: Optional[ComputerFilesRemoval] = Field(
+        None, description="Null unless the removal was asked to delete the machine's files"
+    )
+    workspaces_deleted: List[str] = Field(
+        default_factory=list,
+        description=(
+            "The named workspaces it deleted. One named but moved off the computer, "
+            "or deleted by another request, meanwhile is not among them"
+        ),
     )
 
 

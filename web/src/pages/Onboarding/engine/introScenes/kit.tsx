@@ -241,6 +241,22 @@ export function Typed({ text, at, cps = 32 }: { text: string; at: number; cps?: 
   );
 }
 
+/** A field's text typed in place: an invisible copy of the finished text
+    holds the line's size, so nothing around it moves while it types. A
+    focused field that has not started typing shows the caret. */
+export function TypedInPlace({ text, at, focus }: { text: string; at: number; focus: boolean }) {
+  const t = useSceneTime();
+  return (
+    <span className="grid">
+      <span className="invisible [grid-area:1/1]">{text}</span>
+      <span className="[grid-area:1/1]">
+        <Typed text={text} at={at} />
+        {focus && t < at && <Caret />}
+      </span>
+    </span>
+  );
+}
+
 const LOADER_FRAMES = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏';
 
 /** The app's `Loader`: a braille glyph stepping every 80ms on the scene
@@ -402,6 +418,78 @@ export function Cursor({
           style={{ ...rv(0), color: 'var(--color-bg-page)', fill: 'var(--color-text-primary)' }}
         />
       </span>
+    </div>
+  );
+}
+
+/* ── dialogs and menus ─────────────────────────────────────────────────── */
+
+/**
+ * The dim a dialog sits over, filling the page. With `on` it fades in and
+ * out on the app's enter motion; a scene that drives the fade itself passes
+ * `opacity` instead (its dialog can sit inside, as children, and fade with it).
+ */
+export function Scrim({
+  on = true,
+  opacity,
+  className,
+  children,
+}: {
+  on?: boolean;
+  opacity?: number;
+  className?: string;
+  children?: ReactNode;
+}) {
+  return (
+    <div
+      className={cn('absolute inset-0', className)}
+      style={{
+        background: 'var(--color-bg-overlay-strong)',
+        opacity: opacity ?? (on ? 1 : 0),
+        transition: opacity == null ? 'opacity var(--motion-enter) var(--ease-out)' : undefined,
+      }}
+    >
+      {children}
+    </div>
+  );
+}
+
+/**
+ * A dialog centered on the page, `width` px wide. The centering transform
+ * lives on this static wrapper: the dialog's own pop animates `transform`
+ * and would clobber a translate on itself.
+ */
+export function CenteredDialog({ width, children }: { width: number; children: ReactNode }) {
+  return (
+    <div
+      className="absolute left-1/2 top-1/2 -translate-y-1/2"
+      style={{ width, marginLeft: -width / 2 }}
+    >
+      {children}
+    </div>
+  );
+}
+
+/** A dropdown's surface: the popover fill, a hairline, the menu shadow. */
+export function MenuSurface({
+  className,
+  style,
+  children,
+}: {
+  className?: string;
+  style?: CSSProperties;
+  children: ReactNode;
+}) {
+  return (
+    <div
+      className={cn('rounded-[5px] border p-[3px] shadow-md', className)}
+      style={{
+        background: 'hsl(var(--popover))',
+        borderColor: 'var(--color-border-muted)',
+        ...style,
+      }}
+    >
+      {children}
     </div>
   );
 }

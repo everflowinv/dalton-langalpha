@@ -2,7 +2,7 @@ import React, { useState, useEffect, useLayoutEffect, useMemo, useCallback, memo
 import ActivityBlock from '../ActivityBlock';
 import type { ActivityItem } from './activityTypes';
 import { INLINE_ARTIFACT_MAP, openCardTarget } from '../charts/InlineArtifactCards';
-import { PILL_ROW_CLASS, isPillArtifactType } from '../charts/pillArtifacts';
+import { PILL_ROW_CLASS } from '../charts/pillArtifacts';
 import type { OpenFileHandler } from '../../utils/fileLocation';
 import UserQuestionCard from '../UserQuestionCard';
 import CreateWorkspaceCard from '../CreateWorkspaceCard';
@@ -28,12 +28,13 @@ import { parseStructuredResult } from '../../utils/structuredResult';
 import { useMessageActions } from './MessageActionsContext';
 import { useWorkspaceFolders } from '../../contexts/WorkspaceContext';
 import { FoldPanel } from './FoldPanel';
+import { CardArrivals, type ArrivingCard } from './CardArrivals';
+import { useMotionSafe } from '@/lib/reducedMotion';
 import { useProseReport } from './proseTyping';
 import { projectContent, blockIsProcess, blockVisible, streamingTextBlockIndex, type ContentProjection } from './contentProjection';
 import { EMPTY_OBJ } from './types';
 import type { ContentSegmentRecord, FoldState, ToolCallProcessRecord } from './types';
 import type {
-  CompactArtifactRenderBlock,
   CreateWorkspaceRenderBlock,
   CreditPauseRenderBlock,
   HtmlWidgetRenderBlock,
@@ -112,13 +113,6 @@ function isBlankText(block: RenderBlock): boolean {
   return block.type === 'text' && !((block as TextRenderBlock).segment.content ?? '').trim();
 }
 
-/** A compact artifact whose card is a pill, which sits beside its neighbours. */
-function isPillBlock(block: RenderBlock): boolean {
-  if (block.type !== 'compact_artifact') return false;
-  const result = (block as CompactArtifactRenderBlock).proc.toolCallResult as Record<string, unknown> | undefined;
-  return isPillArtifactType((result?.artifact as Record<string, unknown> | undefined)?.type);
-}
-
 function TextBlock({ block, isStreaming, isSubagentView, isReplyStart, onOpenFile, onRevealed, messageId }: TextBlockProps): React.ReactElement | null {
   // Told twice: the message holds what follows this block for it, and the
   // list holds the turn running while it types (see ProseTyping).
@@ -164,6 +158,7 @@ function TextBlock({ block, isStreaming, isSubagentView, isReplyStart, onOpenFil
 
 export const MessageContentSegments = memo(function MessageContentSegments({ segments, contentProjection, reasoningProcesses, toolCallProcesses, todoListProcesses: _todoListProcesses, subagentTasks, userQuestions = EMPTY_OBJ, workspaceProposals = EMPTY_OBJ, questionProposals = EMPTY_OBJ, pendingToolCallChunks = EMPTY_OBJ, isStreaming, fold = 'unfolded', isTurnTail = false, isSubagentView = false, readOnly = false, ptcAgentProposals = EMPTY_OBJ, secretaryActionProposals = EMPTY_OBJ, creditPauses = EMPTY_OBJ, toolApprovals = EMPTY_OBJ, htmlWidgetProcesses = EMPTY_OBJ, dispatcherContext, messageId }: MessageContentSegmentsProps): React.ReactElement {
   const { turnDisplay } = useTranscriptDisplay();
+  const motionSafe = useMotionSafe();
   const {
     onOpenSubagentTask, onOpenFile, onToolCallDetailClick, onOpenChart,
     onAnswerQuestion, onSkipQuestion,
@@ -267,7 +262,7 @@ export const MessageContentSegments = memo(function MessageContentSegments({ seg
 
   /** Blocks drawn as one row or group with their like neighbours. */
   const runKind = (block: RenderBlock): 'pill' | 'subagent' | 'analyst' | null => {
-    if (isPillBlock(block)) return 'pill';
+    if (block.type === 'compact_artifact') return block.card?.kind === 'pill' ? 'pill' : null;
     if (block.type === 'subagent_task') {
       const id = block.segment.subagentId;
       // A workflow run has a card of its own and breaks a run of spawns.
@@ -280,6 +275,31 @@ export const MessageContentSegments = memo(function MessageContentSegments({ seg
 
   const blockIsVisible = renderBlocks.map((block) => blockVisible(projection, block, fold, isTurnTail));
   const blockFolds = renderBlocks.map((block) => fold !== 'unfolded' && blockIsProcess(projection, block, isTurnTail));
+
+  // A lookup's card draws one box with the lookup card of its type above it:
+  // a series of quotes or charts reads as one, but a search under a chart
+  // would read as part of it. Each stays a block of its own, keyed by itself,
+  // so a call landing ahead of a card already drawn moves that card rather
+  // than drawing it again, cutting its arrival short. Blank text between the
+  // two parts nothing; a block held for the prose, or folding or showing
+  // apart from its neighbour, does.
+  const lookupType = renderBlocks.map((block) => (block.type === 'compact_artifact' && block.card?.kind === 'call'
+    && projection.roles.get(block.key) === 'process' ? block.card.type : null));
+  const joinsAbove: boolean[] = new Array(renderBlocks.length).fill(false);
+  for (let i = 0, above = -1; i < renderBlocks.length; i++) {
+    if (isBlankText(renderBlocks[i])) continue;
+    joinsAbove[i] = above >= 0 && lookupType[i] !== null && lookupType[i] === lookupType[above]
+      && !heldForProse[i] && !heldForProse[above]
+      && blockFolds[i] === blockFolds[above] && blockIsVisible[i] === blockIsVisible[above];
+    above = i;
+  }
+
+  // The cards a row can hand its place to as its call lands.
+  const arrivingCards: ArrivingCard[] = [];
+  renderBlocks.forEach((block, i) => {
+    if (heldForProse[i] || !blockIsVisible[i] || block.type !== 'compact_artifact' || block.card?.kind !== 'call') return;
+    arrivingCards.push({ key: block.key, call: block.toolCallId, settledAt: block.proc._settledAt as number | undefined });
+  });
 
   const renderBlock = (block: RenderBlock, blockIdx: number): React.ReactElement | null => {
 
@@ -307,15 +327,19 @@ export const MessageContentSegments = memo(function MessageContentSegments({ seg
         }
 
         if (block.type === 'compact_artifact') {
-          const artifact = ((block as CompactArtifactRenderBlock).proc.toolCallResult as Record<string, unknown> | undefined)?.artifact as Record<string, unknown> | undefined;
-          const ChartComponent = artifact ? INLINE_ARTIFACT_MAP[artifact.type as string] : null;
-          if (!ChartComponent) return null;
+          const { artifact, card, toolCallId } = block;
+          if (!card) return null;
+          const Card = INLINE_ARTIFACT_MAP[card.type];
           return (
-            <div key={block.key}>
-              <ChartComponent
-                artifact={artifact!}
-                toolArgs={(block as CompactArtifactRenderBlock).proc.toolCall?.args}
-                onClick={() => openCardTarget(artifact, onOpenChart, () => onToolCallDetailClick?.((block as CompactArtifactRenderBlock).toolCallId))}
+            <div
+              key={block.key}
+              data-card-arrival={card.kind === 'call' ? block.key : undefined}
+              data-card-join={joinsAbove[blockIdx] ? '' : undefined}
+            >
+              <Card
+                artifact={artifact}
+                toolArgs={block.proc.toolCall?.args}
+                onClick={() => openCardTarget(artifact, onOpenChart, () => onToolCallDetailClick?.(toolCallId))}
               />
             </div>
           );
@@ -502,7 +526,7 @@ export const MessageContentSegments = memo(function MessageContentSegments({ seg
   // sibling-space-y, not space-y: FoldPanel reads the gap off the top of the
   // block after it, and a folded (hidden) panel must leave none behind.
   return (
-    <div className="sibling-space-y-3">
+    <CardArrivals cards={arrivingCards} live={fold === 'live' || !!isStreaming} motionSafe={motionSafe} className="sibling-space-y-3">
       {(() => {
         // One element per block, except that a run of consecutive blocks of
         // one kind (pills, subagent spawns, analyst hand-offs) sharing a fold
@@ -592,6 +616,6 @@ export const MessageContentSegments = memo(function MessageContentSegments({ seg
           second. Last is where the turn's outcome belongs. It renders nothing
           unless a task here was stopped for credits. */}
       <SubagentStopNotices subagentIds={taskSubagentIds} />
-    </div>
+    </CardArrivals>
   );
 });

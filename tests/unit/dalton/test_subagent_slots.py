@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import create_autospec
 
@@ -327,6 +328,63 @@ def make_fake_cache(
     else:
         cache.client = None
     return cache, engine
+
+
+def _task_row(task: BackgroundTask, *, thread_id: str) -> dict:
+    """A ledger row for ``task`` as ThreadStatus's task listing reads it."""
+    now = datetime.now(tz=UTC)
+    return {
+        "task_id": task.task_id,
+        "task_run_id": str(getattr(task, "task_run_id", "") or ""),
+        "conversation_thread_id": thread_id,
+        "status": "in_progress",
+        "subagent_type": task.subagent_type,
+        "description": task.description,
+        "started_at": now,
+        "finalized_at": None,
+    }
+
+
+def _patch_reporting_tasks(
+    monkeypatch: pytest.MonkeyPatch, tasks: list[BackgroundTask], thread_id: str
+) -> None:
+    """Serve ``tasks`` as ThreadStatus's task listing rows (B7: the queued
+    overview lives in ThreadStatus, since TaskOutput's aggregate went away)."""
+    from src.server.database.runs import subagent_runs as sr_db
+
+    async def _list(
+        thread_id_arg: str, *, since: Any = None, task_id: str | None = None
+    ) -> list[dict]:
+        if task_id is not None:
+            return []
+        return [_task_row(t, thread_id=thread_id) for t in tasks]
+
+    monkeypatch.setattr(
+        sr_db,
+        "list_reporting_tasks",
+        create_autospec(sr_db.list_reporting_tasks, side_effect=_list),
+    )
+
+
+async def _thread_status_tasks(
+    thread_id: str, registry: BackgroundTaskRegistry
+) -> str:
+    """ThreadStatus's task-only listing, as the agent reads it."""
+    from src.tools.thread_status.tool import build_thread_status_tool
+
+    tool = build_thread_status_tool(
+        thread_id=thread_id, user_id="u-1", registry=registry
+    )
+    message = await tool.ainvoke(
+        {
+            "type": "tool_call",
+            "id": "call-1",
+            "name": "ThreadStatus",
+            "args": {"type": "task"},
+        },
+        {"configurable": {"timezone": "UTC"}},
+    )
+    return str(message.content)
 
 
 class FakeMiddleware:
@@ -1277,20 +1335,24 @@ class TestTaskOutputQueuedDisplay:
         mw_spec.registry = mw.registry
         tool = create_task_output_tool(mw_spec)
 
-        # Overview lists 1 running, 1 queued (排队中)
-        overview_text, mark = await tool.coroutine(task_id=None)
-        assert mark is not None
-        assert "1 running, 1 queued (排队中)" in overview_text
-        assert "[QUEUED] (排队中)" in overview_text
-        assert (
-            "已排队：本对话正在运行 1 个子代理（上限 1），前面还有 0 个在排队，会自动开始，不要重复派发"
-            in overview_text
-        )
+        # B7: the overview lives in ThreadStatus's task listing — 1 running,
+        # 1 queued (排队中) with its rank, read from Redis across workers.
+        _patch_reporting_tasks(monkeypatch, [t1, t2], "thread-output")
+        overview_text = await _thread_status_tasks("thread-output", mw.registry)
+        queued_lines = [ln for ln in overview_text.splitlines() if "排队中" in ln]
+        assert len(queued_lines) == 1
+        assert f"Task-{t2.task_id}" in queued_lines[0]
+        assert "queued (排队中), 0 ahead of it, auto-starts" in queued_lines[0]
+        assert f"Task-{t1.task_id}" in overview_text
 
         # Single-task TaskOutput on queued task shows [QUEUED] (排队中)
         single_text, single_mark = await tool.coroutine(task_id=t2.task_id)
         assert single_mark is not None
         assert "[QUEUED] (排队中)" in single_text
+        assert (
+            "已排队：本对话正在运行 1 个子代理（上限 1），前面还有 0 个在排队，会自动开始，不要重复派发"
+            in single_text
+        )
 
         gate.set()
         await asyncio.gather(

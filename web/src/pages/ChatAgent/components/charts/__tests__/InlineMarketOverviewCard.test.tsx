@@ -1,7 +1,7 @@
 import { render, screen, fireEvent } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 
-import { InlineMarketOverviewCard } from '../InlineArtifactCards';
+import { InlineMarketOverviewCard } from '../InlineMarketCards';
 
 // The composite `market_overview` artifact nests the FULL legacy
 // market_indices / sector_performance artifacts verbatim under `indices` /
@@ -112,7 +112,9 @@ describe('InlineMarketOverviewCard', () => {
     fireEvent.click(screen.getByText('XX'));
     expect(onClick).toHaveBeenCalledTimes(1);
   });
-  it('badges an index row whose provider declares a 15-minute delay', () => {
+  // Freshness is said once, in the header, and a row whose state differs
+  // keeps its own mark.
+  it('says the shared freshness once and marks the row that differs', () => {
     render(
       <InlineMarketOverviewCard
         artifact={{
@@ -129,6 +131,8 @@ describe('InlineMarketOverviewCard', () => {
       />,
     );
 
-    expect(screen.getAllByLabelText(/Delayed 15 min/)).toHaveLength(1);
+    expect(screen.getByText('Delayed 15 min')).toBeInTheDocument();
+    expect(screen.queryByLabelText(/Delayed 15 min/)).not.toBeInTheDocument();
+    expect(screen.getAllByLabelText(/Realtime/)).toHaveLength(1);
   });
 });

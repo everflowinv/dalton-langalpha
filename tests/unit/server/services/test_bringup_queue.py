@@ -357,18 +357,13 @@ async def test_a_resumed_sandbox_queues_every_workspace_for_its_sync(
     """A stop leaves each workspace attached to the same sandbox, so no later
     open looks again; the resume queues them itself, and a workspace whose
     folder is mid-move does not keep the others from theirs."""
-    from src.server.services.computer_manager import _machines
-    from src.server.services.computer_manager._machines import MachineLifecycleMixin
-
     steps.folders["B"] = None
     with patch.object(
-        _machines,
+        _bringup,
         "get_live_workspace_ids_for_computer",
         AsyncMock(return_value=["A", "B", "C"]),
     ):
-        await MachineLifecycleMixin._queue_reconnect_syncs(
-            manager, "computer-1", sandbox
-        )
+        await BringUpMixin._queue_reconnect_syncs(manager, "computer-1", sandbox)
     await _drain(manager)
     assert _steps(steps.order) == ["restore:A", "restore:C", "sync:A", "sync:C"]
 

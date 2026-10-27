@@ -14,6 +14,7 @@ import re
 import uuid
 from typing import ClassVar
 
+from ptc_agent.core.sandbox.providers._proc_sh import EXEC_MARK, PROC_SH, ps_start_sh
 from ptc_agent.core.sandbox.runtime import (
     SandboxRuntime,
     SessionCommandResult,
@@ -25,54 +26,11 @@ _SESSION_ID_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
 # Session state sits on the sandbox's disk, which outlives a stop, while the
 # processes it names do not. ``R`` is the current run's directory, named by the
 # runtime's boot key, which every start that ends processes replaces, so a
-# restart begins with no sessions, as on Daytona.
-#
-# ``st`` prints a pid's start time in clock ticks since boot: field 22 of its
-# stat, counted after the command name, which may hold spaces. A process later
-# given the same pid starts later, so a command's .pid holds its wrapper's pid
-# and start time, and ``live`` checks that the wrapper is still the process
-# behind that pid before the command reads as running or is signalled. With
-# no /proc (macOS) it is ps's start time instead, its words run together so
-# the record stays two fields: to the second, which tells a reused pid apart.
+# restart begins with no sessions, as on Daytona. A command's .pid holds its
+# wrapper's pid and start time, which ``plive`` and ``psig`` (``_proc_sh``)
+# check before the command reads as running or is signalled.
 _SESSIONS_ROOT = "/tmp/.sessions"
 
-
-def ps_start_sh(pid: str) -> str:
-    """Shell printing ``pid``'s start time as one word, where there is no /proc."""
-    return f'set -- $(LC_ALL=C ps -o lstart= -p {pid} 2>/dev/null); echo "$1$2$3$4$5"'
-
-
-SESSION_FUNCTIONS_SH = (
-    "st() { local s; if [ ! -d /proc/1 ]; then s=$(" + ps_start_sh('"$1"') + "); "
-    '[ -n "$s" ] && echo "$s"; return; fi; '
-    '{ read -r s < "/proc/$1/stat"; } 2>/dev/null || return 1; '
-    's=${s##*) }; set -- $s; echo "${20}"; }; '
-    'live() { local p t; { read -r p t < "$1"; } 2>/dev/null; '
-    'case $p in ""|*[!0-9]*) return 1;; esac; '
-    '[ -n "$t" ] && [ "$(st "$p")" = "$t" ]; }; '
-)
-
-# Every command's wrapper exports its record as ``EXEC_MARK=<pid>-<start>``,
-# which whatever the command starts inherits.
-EXEC_MARK = "LANGALPHA_EXEC"
-# ``ours PGID MARK`` succeeds when a process in group PGID carries the mark.
-# With the leader gone, the group's id alone proves nothing: once the group
-# empties, the id may go to someone else's group, which the mark tells apart.
-# A process shows the environment it was started with, so a subshell that ran
-# no program, or a program that cleared its environment, shows none, and with
-# no /proc (macOS) ps hides that of Apple's own binaries. A group left with
-# only those stays unproven, and running.
-GROUP_MARK_SH = (
-    f'ours() {{ local g="$1" m="{EXEC_MARK}=$2" f l; '
-    "if [ -d /proc/1 ]; then for f in /proc/[0-9]*/stat; do "
-    '{ read -r l < "$f"; } 2>/dev/null || continue; l=${l##*) }; set -- $l; '
-    '[ "$3" = "$g" ] || continue; '
-    r"""tr '\000' '\n' 2>/dev/null < "${f%/stat}/environ" | grep -qxF -- "$m" """
-    "&& return 0; done; return 1; fi; "
-    "LC_ALL=C ps -axwwE -o pgid=,command= 2>/dev/null | "
-    """G="$g" M="$m" awk '$1 == ENVIRON["G"] { for (i = 2; i <= NF; i++) """
-    """if ($i == ENVIRON["M"]) { f = 1; exit } } END { exit !f }'; }; """
-)
 # The code a shell reports for a SIGKILL, which is how a wrapper ends without
 # writing its exit code (the OOM killer, or a kill -9).
 _KILLED_EXIT = 137
@@ -86,7 +44,7 @@ def _status_sh(name: str) -> str:
     coming. A command with no .pid yet is still launching.
     """
     return (
-        f"a=1; [ ! -e {name}.pid ] || live {name}.pid || a=0; "
+        f"a=1; [ ! -e {name}.pid ] || plive {name}.pid || a=0; "
         f"e=$(cat {name}.exit 2>/dev/null); "
         f"[ -n \"$e\" ] || [ $a = 1 ] || e={_KILLED_EXIT}; "
     )
@@ -98,7 +56,7 @@ class ExecSessionRuntime(SandboxRuntime):
     # Shell expression that changes exactly when the sandbox's processes were
     # all ended. A container's PID 1 is replaced on every start, so its start
     # time serves; a VM overrides it.
-    session_boot_key_sh: ClassVar[str] = "$(st 1)"
+    session_boot_key_sh: ClassVar[str] = "$(pstart 1)"
 
     @property
     def _sessions_root(self) -> str:
@@ -115,7 +73,7 @@ class ExecSessionRuntime(SandboxRuntime):
     def _session_sh(self) -> str:
         """Every session script starts with this."""
         return (
-            f"{SESSION_FUNCTIONS_SH}"
+            f"{PROC_SH}"
             f'R="{self._sessions_root}/run-{self.session_boot_key_sh}"; '
         )
 
@@ -151,7 +109,7 @@ class ExecSessionRuntime(SandboxRuntime):
         # .exit write, and with no arguments, so the session directory the
         # wrapper takes as $1 stays out of its view.
         # The wrapper is bash, so field 22 of its stat is its start time;
-        # with no stat to read, it is the one ``st`` reads from ps.
+        # with no stat to read, it is the one ``pstart`` reads from ps.
         # Its .pid is written aside and renamed in, so no reader sees half
         # of it. A stop can land before then: delete_session moves the
         # session aside before reading PIDs, so the rename fails and a
@@ -242,7 +200,7 @@ class ExecSessionRuntime(SandboxRuntime):
             f'{self._session_sh}cd "$R" 2>/dev/null || exit 0; '
             "for d in */; do [ -d \"$d\" ] || continue; n=0; r=0; "
             "for p in \"$d\"*.pid; do [ -e \"$p\" ] || continue; n=1; "
-            "live \"$p\" && [ ! -e \"${p%.pid}.exit\" ] && r=1; done; "
+            "plive \"$p\" && [ ! -e \"${p%.pid}.exit\" ] && r=1; done; "
             "[ $n = 0 ] && r=1; "
             "echo \"${d%/} $r\"; done",
             timeout=10,
@@ -262,21 +220,17 @@ class ExecSessionRuntime(SandboxRuntime):
         # runs (session_execute). Hidden, so list_sessions skips it. Exit 3
         # marks a missing session.
         #
-        # Kill the entire process group (negative PID) so child processes
-        # spawned by the session command are also terminated. With the wrapper
-        # gone, a group by its id is the command's only while a member carries
-        # its mark (``ours``). A pid that names another process now is not
-        # this command's to signal.
+        # The whole process group goes, so what the command started goes
+        # with it, but only a group proven the command's (``psig``), which a
+        # killed wrapper left a zombie still proves.
         result = await self.exec(
-            f'{self._session_sh}{GROUP_MARK_SH}'
+            f"{self._session_sh}"
             f'D="$R/{session_id}"; X="$R/.{session_id}.$$"; '
             'mv "$D" "$X" || { [ -e "$D" ] || exit 3; exit 1; }; '
             'for f in "$X"/*.pid; do '
             "  { read -r pid start < \"$f\"; } 2>/dev/null; "
             "  case $pid in \"\"|*[!0-9]*) continue;; esac; "
-            "  now=$(st $pid); "
-            "  if [ \"$now\" = \"$start\" ]; then kill -- -$pid; kill $pid; "
-            "  elif [ -z \"$now\" ] && ours $pid \"$pid-$start\"; then kill -- -$pid; fi; "
+            '  psig TERM "$pid" "$start" z; '
             'done 2>/dev/null; rm -rf -- "$X"',
             timeout=10,
         )

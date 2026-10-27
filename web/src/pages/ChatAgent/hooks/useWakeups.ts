@@ -6,6 +6,7 @@ import { queryKeys } from '@/lib/queryKeys';
 import type { WakeupList, WakeupsResponse } from '@/types/wakeups';
 import { cancelWakeups, fetchWakeups } from '../utils/api';
 import { isValidUuid } from '../utils/uuid';
+import { patchListingAfterMutation } from './utils/patchListing';
 import { nextWakeupLapse, wakeupsAt } from '../components/wakeupLabels';
 
 // setTimeout keeps its delay in a signed 32-bit count and fires at once past
@@ -137,17 +138,11 @@ export function useCancelWakeups(threadId: string | null | undefined) {
       if (!isValidUuid(threadId)) return Promise.reject(new Error('No thread to cancel wakeups in'));
       return cancelWakeups(threadId, which);
     },
-    onSuccess: async ({ wakeups }) => {
-      const queryKey = queryKeys.threads.wakeups(threadId as string);
-      // The refetch replaces a read in flight, whose answer predates the cancel.
-      if (!wakeups) return queryClient.invalidateQueries({ queryKey });
-      // A read in flight began before the cancel landed, so its answer would
-      // show a cancelled wakeup as armed again.
-      await queryClient.cancelQueries({ queryKey });
-      // The answer has no zone, so the cached one is kept.
-      const prev = queryClient.getQueryData<WakeupsResponse>(queryKey);
-      if (prev) queryClient.setQueryData<WakeupsResponse>(queryKey, { ...prev, wakeups });
-      else void queryClient.invalidateQueries({ queryKey });
-    },
+    // The answer has no zone, so the cached one is kept.
+    onSuccess: ({ wakeups }) => patchListingAfterMutation<WakeupsResponse>(
+      queryClient,
+      queryKeys.threads.wakeups(threadId ?? ''),
+      wakeups ? (prev) => ({ ...prev, wakeups }) : null,
+    ),
   });
 }

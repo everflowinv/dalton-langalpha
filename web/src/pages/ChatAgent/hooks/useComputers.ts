@@ -145,28 +145,41 @@ export function useComputerRootDirs(options: { enabled: boolean }): readonly str
   return data;
 }
 
+// The fetch is wrapped so the api module is read at call time, not at import.
+const providersQuery = queryOptions({
+  queryKey: queryKeys.computers.providers(),
+  queryFn: () => getComputerProviders(),
+  staleTime: 60_000,
+});
+
 /**
  * The providers a new computer can go on. Read by the create form and by the
  * rows, which name a machine's provider once there is more than one to tell
  * apart. `enabled` is the caller's gate: fetch while a computer surface is open.
  */
 export function useComputerProviders(options: { enabled: boolean }) {
-  return useQuery({
-    queryKey: queryKeys.computers.providers(),
-    queryFn: getComputerProviders,
-    enabled: options.enabled,
-    staleTime: 60_000,
-  });
+  return useQuery({ ...providersQuery, enabled: options.enabled });
 }
 
-/** Put a machine the server just created on every cached list, ahead of the refetch. */
+/** Read the providers ahead of the New computer form, which waits on them. */
+export function prefetchComputerProviders(queryClient: QueryClient) {
+  return queryClient.prefetchQuery(providersQuery);
+}
+
+/**
+ * Put a machine the server just created on every cached list, ahead of the
+ * refetch, where the refetch will put it: the server lists the primary first,
+ * then the most recently active, which a machine just made is.
+ */
 export function addComputerRow(queryClient: QueryClient, computer: Computer) {
   queryClient.setQueriesData<ComputersResponse | undefined>(
     { queryKey: queryKeys.computers.lists() },
-    (prev) => !prev?.computers || prev.computers.some((c) => c.computer_id === computer.computer_id) ? prev : {
-      ...prev,
-      computers: [...prev.computers, computer],
-      ...(typeof prev.total === 'number' ? { total: prev.total + 1 } : {}),
+    (prev) => {
+      if (!prev?.computers || prev.computers.some((c) => c.computer_id === computer.computer_id)) return prev;
+      const computers = [...prev.computers];
+      const at = computer.is_primary ? 0 : computers.filter((c) => c.is_primary).length;
+      computers.splice(at, 0, computer);
+      return { ...prev, computers, ...(typeof prev.total === 'number' ? { total: prev.total + 1 } : {}) };
     },
   );
 }

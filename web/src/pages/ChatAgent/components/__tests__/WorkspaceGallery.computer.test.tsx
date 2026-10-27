@@ -221,12 +221,30 @@ describe('WorkspaceGallery, machine line', () => {
     expect(within(named).queryByTestId('machine-state')).toBeNull();
   });
 
-  it('opens the Computers dialog on that computer from the chip', async () => {
+  it('opens a menu from the chip that names the machine, manages it and adds another', async () => {
     const user = userEvent.setup();
     renderWithProviders(<WorkspaceGallery onWorkspaceSelect={vi.fn()} />);
 
-    await user.click(await chip());
-    expect(openComputersPanel).toHaveBeenCalledWith({ computerId: COMPUTER_ID });
+    const named = await chip();
+    // Still named for the machine it opens onto.
+    expect(named).toHaveAccessibleName(/Alpha Research/);
+    await user.click(named);
+    expect(openComputersPanel).not.toHaveBeenCalled();
+
+    const menu = screen.getByRole('menu');
+    // The machine is shown, not offered: nothing to pick with one.
+    const machine = within(menu).getByTestId('computer-menu-machine');
+    expect(machine).toHaveTextContent('Alpha Research');
+    expect(within(machine).getByTestId('computer-badge')).toHaveTextContent('Daytona·Small');
+    expect(within(menu).queryAllByRole('menuitemradio')).toHaveLength(0);
+    expect(within(menu).getAllByRole('menuitem').map((i) => i.textContent)).toEqual(['Manage computer…', 'New computer…']);
+
+    await user.click(within(menu).getByRole('menuitem', { name: 'Manage computer…' }));
+    expect(openComputersPanel).toHaveBeenCalledWith({ view: 'list', computerId: COMPUTER_ID });
+
+    await user.click(named);
+    await user.click(screen.getByRole('menuitem', { name: 'New computer…' }));
+    expect(openComputersPanel).toHaveBeenLastCalledWith({ view: 'create' });
   });
 
   it('spells out a stopped computer on the chip, reading the state from the computer, not the row', async () => {
@@ -247,12 +265,43 @@ describe('WorkspaceGallery, machine line', () => {
     for (const card of await cards()) expect(within(card).queryByText(/Disk/)).toBeNull();
   });
 
-  it('shows no chip when there is no computer', async () => {
+  it('offers New computer in the chip\'s place when there is no computer', async () => {
+    const user = userEvent.setup();
     mockGetComputers.mockResolvedValue(computers());
+    renderWithProviders(<WorkspaceGallery onWorkspaceSelect={vi.fn()} />);
+
+    const add = await screen.findByTestId('new-computer');
+    expect(within(screen.getByTestId('gallery-toolbar')).getByRole('button', { name: 'New computer' })).toBe(add);
+    expect(screen.queryByTestId('computer-chip')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('computer-filter')).not.toBeInTheDocument();
+
+    await user.click(add);
+    expect(openComputersPanel).toHaveBeenCalledWith({ view: 'create' });
+  });
+
+  it('keeps the computer reachable before the first workspace, with nothing to search or sort', async () => {
+    const user = userEvent.setup();
+    mockUseAllWorkspaces.mockImplementation(() => listed([HOME]));
+    renderWithProviders(<WorkspaceGallery onWorkspaceSelect={vi.fn()} />);
+
+    const named = await chip();
+    expect(screen.queryByTestId('gallery-toolbar')).not.toBeInTheDocument();
+    expect(screen.queryByRole('searchbox')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('gallery-sort')).not.toBeInTheDocument();
+
+    await user.click(named);
+    await user.click(screen.getByRole('menuitem', { name: 'New computer…' }));
+    expect(openComputersPanel).toHaveBeenCalledWith({ view: 'create' });
+  });
+
+  it('leaves the computer slot empty while the list is still being read', async () => {
+    mockGetComputers.mockImplementation(() => new Promise(() => {}));
     renderWithProviders(<WorkspaceGallery onWorkspaceSelect={vi.fn()} />);
 
     await cards();
     await waitFor(() => expect(mockGetComputers).toHaveBeenCalled());
+    expect(screen.getByTestId('gallery-toolbar')).toBeInTheDocument();
+    expect(screen.queryByTestId('new-computer')).not.toBeInTheDocument();
     expect(screen.queryByTestId('computer-chip')).not.toBeInTheDocument();
     expect(screen.queryByTestId('computer-filter')).not.toBeInTheDocument();
   });
@@ -527,10 +576,12 @@ describe('WorkspaceGallery, machine line', () => {
     expect(screen.queryByText('Always-on')).not.toBeInTheDocument();
   });
 
-  it('offers the computers surface from the gallery header', async () => {
+  it('leaves the computers to the toolbar, with no Computers button in the header', async () => {
     renderWithProviders(<WorkspaceGallery onWorkspaceSelect={vi.fn()} />);
-    const buttons = await screen.findAllByRole('button', { name: /computers/i });
-    expect(buttons.length).toBeGreaterThan(0);
+
+    await chip();
+    expect(screen.queryByRole('button', { name: /^computers$/i })).not.toBeInTheDocument();
+    expect(screen.getAllByRole('button', { name: 'New workspace' }).length).toBeGreaterThan(0);
   });
 });
 
@@ -572,6 +623,31 @@ describe('WorkspaceGallery, toolbar', () => {
     expect(within(narrowed[0]).getByText('Live Beta')).toBeInTheDocument();
     expect(screen.getByTestId('computer-filter')).toHaveTextContent("Alan's MacBook Pro");
     expect(screen.getByTestId('computer-filter')).toHaveAccessibleName("Filter by computer: Alan's MacBook Pro");
+  });
+
+  it('manages the machine the grid is narrowed to, or all of them, and adds one, from the filter menu', async () => {
+    const user = userEvent.setup();
+    onTwoMachines();
+    renderWithProviders(<WorkspaceGallery onWorkspaceSelect={vi.fn()} />);
+
+    await user.click(await screen.findByTestId('computer-filter'));
+    // The filter rows stay as they were; the actions follow them, outside the choice.
+    expect(screen.getAllByRole('menuitemradio')).toHaveLength(3);
+    expect(screen.getAllByRole('menuitem').map((i) => i.textContent)).toEqual(['Manage computers…', 'New computer…']);
+    expect(within(screen.getByRole('group')).queryAllByRole('menuitem')).toHaveLength(0);
+
+    await user.click(screen.getByRole('menuitem', { name: 'Manage computers…' }));
+    expect(openComputersPanel).toHaveBeenLastCalledWith({ view: 'list', computerId: null });
+
+    await user.click(screen.getByTestId('computer-filter'));
+    await user.click(screen.getByRole('menuitemradio', { name: /MacBook/ }));
+    await user.click(screen.getByTestId('computer-filter'));
+    await user.click(screen.getByRole('menuitem', { name: 'Manage computers…' }));
+    expect(openComputersPanel).toHaveBeenLastCalledWith({ view: 'list', computerId: MAC_ID });
+
+    await user.click(screen.getByTestId('computer-filter'));
+    await user.click(screen.getByRole('menuitem', { name: 'New computer…' }));
+    expect(openComputersPanel).toHaveBeenLastCalledWith({ view: 'create' });
   });
 
   describe('a filter on a machine that leaves the list', () => {
@@ -775,7 +851,8 @@ describe('WorkspaceGallery, a user with only Home', () => {
 
     expect(await screen.findByText('No workspaces yet')).toBeInTheDocument();
     expect(screen.getByTestId('chief-of-staff')).toBeInTheDocument();
-    expect(screen.queryByTestId('gallery-toolbar')).not.toBeInTheDocument();
+    // The computer stays reachable; there is just nothing to search.
+    expect(screen.queryByRole('searchbox')).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Create Workspace' })).toBeInTheDocument();
   });
 });

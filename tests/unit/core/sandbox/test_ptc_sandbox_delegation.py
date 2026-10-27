@@ -15,7 +15,6 @@ Covers:
 - close -> provider.close
 """
 
-import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -30,7 +29,6 @@ from ptc_agent.config.core import (
     SecurityConfig,
 )
 from ptc_agent.core.sandbox.runtime import (
-    CodeRunResult,
     ExecResult,
     RuntimeState,
     SandboxGoneError,
@@ -61,7 +59,6 @@ def mock_runtime():
     runtime.upload_files = AsyncMock()
     runtime.download_file = AsyncMock(return_value=b"data")
     runtime.list_files = AsyncMock(return_value=[{"name": "file.txt", "is_dir": False}])
-    runtime.code_run = AsyncMock(return_value=CodeRunResult("result", "", 0, []))
     runtime.get_state = AsyncMock(return_value=RuntimeState.RUNNING)
     runtime.start = AsyncMock()
     runtime.stop = AsyncMock()
@@ -95,35 +92,6 @@ class TestPTCSandboxDelegation:
 
         await sandbox.execute_bash_command("ls -la")
         mock_runtime.exec.assert_called()
-
-    @patch("ptc_agent.core.sandbox.ptc_sandbox.create_provider")
-    @pytest.mark.asyncio
-    async def test_execute_bash_injects_mcp_trace_env_and_harvests(
-        self, mock_create_provider, mock_provider, mock_runtime
-    ):
-        # A python script run via Bash must record the same MCP provenance
-        # ExecuteCode does: the foreground command carries an MCP_TRACE_FILE env +
-        # the wrapper PYTHONPATH, and the harvested trace is returned for the
-        # provenance middleware. (Closes the bash provenance bypass.)
-        from ptc_agent.core.sandbox.ptc_sandbox import PTCSandbox
-
-        mock_create_provider.return_value = mock_provider
-        mock_runtime.fetch_working_dir = AsyncMock(return_value="/home/workspace")
-        sandbox = PTCSandbox(config=_make_config())
-        sandbox.runtime = mock_runtime
-
-        trace = [{"server": "marketdata", "tool": "quote", "result_sha256": "a" * 64}]
-        with patch.object(
-            sandbox, "_collect_mcp_trace", AsyncMock(return_value=trace)
-        ) as collect:
-            result = await sandbox.execute_bash_command("python analysis.py")
-
-        exec_cmds = [c.args[0] for c in mock_runtime.exec.call_args_list if c.args]
-        main_cmd = next(c for c in exec_cmds if "python analysis.py" in c)
-        assert "export MCP_TRACE_FILE=" in main_cmd
-        assert "export PYTHONPATH=" in main_cmd
-        collect.assert_awaited_once()
-        assert result["mcp_trace"] == trace
 
     @patch("ptc_agent.core.sandbox.ptc_sandbox.create_provider")
     @pytest.mark.asyncio
@@ -442,130 +410,6 @@ class TestPTCSandboxDelegation:
         await sandbox.cleanup()
 
         mock_runtime.delete.assert_awaited_once()
-
-
-class TestBackgroundBashTrace:
-    """The background-bash provenance bypass closure (BashOutput is the only
-    result-bearing path for a backgrounded command, so the MCP trace must be
-    injected at launch and harvested on the status read that sees completion)."""
-
-    def _sandbox(self, mock_create_provider, mock_provider, mock_runtime):
-        from ptc_agent.core.sandbox.ptc_sandbox import PTCSandbox
-
-        mock_create_provider.return_value = mock_provider
-        sandbox = PTCSandbox(config=_make_config())
-        sandbox.runtime = mock_runtime
-        return sandbox
-
-    @patch("ptc_agent.core.sandbox.ptc_sandbox.create_provider")
-    @pytest.mark.asyncio
-    async def test_launch_injects_trace_env_named_after_the_session(
-        self, mock_create_provider, mock_provider, mock_runtime
-    ):
-        sandbox = self._sandbox(mock_create_provider, mock_provider, mock_runtime)
-        mock_runtime.fetch_working_dir = AsyncMock(return_value="/home/workspace")
-        mock_runtime.list_sessions = AsyncMock(return_value=[])
-        mock_runtime.create_session = AsyncMock()
-        mock_runtime.session_execute = AsyncMock(return_value="cmd-xyz")
-
-        result = await sandbox.execute_bash_command(
-            "python long_job.py", background=True
-        )
-
-        # The executed bg command carries the MCP trace env (so a backgrounded
-        # python script importing the wrappers records its calls) ...
-        session_id = mock_runtime.create_session.call_args.args[0]
-        bg_cmd = mock_runtime.session_execute.call_args.args[1]
-        assert "export MCP_TRACE_FILE=" in bg_cmd
-        assert "export PYTHONPATH=" in bg_cmd
-        assert "python long_job.py" in bg_cmd
-        # ... at a path any worker can derive from the command_id it returns.
-        assert f"{session_id}.jsonl" in bg_cmd
-        assert f"command_id: {session_id}" in result["stdout"]
-        # A child shell, so the command's own `exit` cannot end the session's
-        # shell before the exit code is recorded.
-        assert bg_cmd.startswith("bash -c ")
-
-    @patch("ptc_agent.core.sandbox.ptc_sandbox.create_provider")
-    @pytest.mark.asyncio
-    async def test_status_harvests_trace_and_ends_session_on_completion(
-        self, mock_create_provider, mock_provider, mock_runtime
-    ):
-        from ptc_agent.core.sandbox.runtime import SessionCommandResult
-
-        sandbox = self._sandbox(mock_create_provider, mock_provider, mock_runtime)
-        mock_runtime.session_logs = AsyncMock(
-            return_value=SessionCommandResult(
-                cmd_id="c", exit_code=0, stdout="done", stderr=""
-            )
-        )
-        mock_runtime.delete_session = AsyncMock()
-        trace = [{"server": "marketdata", "tool": "quote", "result_sha256": "a" * 64}]
-        with patch.object(
-            sandbox, "_collect_mcp_trace", AsyncMock(return_value=trace)
-        ) as collect:
-            result = await sandbox.get_background_command_status("bg-0123456789ab")
-
-        assert collect.await_args.args[0].endswith("/bg-0123456789ab.jsonl")
-        assert result["mcp_trace"] == trace
-        assert result["found"] and result["stdout"] == "done"
-        mock_runtime.delete_session.assert_awaited_once_with("bg-0123456789ab")
-
-    @patch("ptc_agent.core.sandbox.ptc_sandbox.create_provider")
-    @pytest.mark.asyncio
-    async def test_status_while_running_does_not_harvest(
-        self, mock_create_provider, mock_provider, mock_runtime
-    ):
-        from ptc_agent.core.sandbox.runtime import SessionCommandResult
-
-        sandbox = self._sandbox(mock_create_provider, mock_provider, mock_runtime)
-        mock_runtime.session_logs = AsyncMock(
-            return_value=SessionCommandResult(
-                cmd_id="c", exit_code=None, stdout="...", stderr=""
-            )
-        )
-        mock_runtime.delete_session = AsyncMock()
-        with patch.object(
-            sandbox, "_collect_mcp_trace", AsyncMock(return_value=[])
-        ) as collect:
-            result = await sandbox.get_background_command_status("bg-0123456789ab")
-
-        collect.assert_not_awaited()
-        mock_runtime.delete_session.assert_not_awaited()
-        assert result["is_running"] and result["mcp_trace"] == []
-
-    @patch("ptc_agent.core.sandbox.ptc_sandbox.create_provider")
-    @pytest.mark.asyncio
-    async def test_status_unknown_cmd_is_not_found(
-        self, mock_create_provider, mock_provider, mock_runtime
-    ):
-        sandbox = self._sandbox(mock_create_provider, mock_provider, mock_runtime)
-        mock_runtime.session_logs = AsyncMock(return_value=None)
-        result = await sandbox.get_background_command_status("bg-0123456789ab")
-        assert result["found"] is False and result["mcp_trace"] == []
-        # An id that could not be a background session never reaches the sandbox.
-        mock_runtime.session_logs.reset_mock()
-        result = await sandbox.get_background_command_status("nope")
-        assert result["found"] is False
-        mock_runtime.session_logs.assert_not_called()
-
-    @patch("ptc_agent.core.sandbox.ptc_sandbox.create_provider")
-    @pytest.mark.asyncio
-    async def test_stop_drops_the_trace(
-        self, mock_create_provider, mock_provider, mock_runtime
-    ):
-        from ptc_agent.core.sandbox import sessions
-
-        sandbox = self._sandbox(mock_create_provider, mock_provider, mock_runtime)
-        mock_runtime.delete_session = AsyncMock()
-        mock_runtime.exec = AsyncMock()
-
-        stopped = await sandbox.stop_background_command("bg-0123456789ab")
-        assert stopped is True
-        # A stopped command yields no output, so nothing to attest. The rm
-        # follows the stop rather than holding it up.
-        await asyncio.gather(*list(sessions._housekeeping))
-        assert "bg-0123456789ab.jsonl" in mock_runtime.exec.call_args.args[0]
 
 
 class TestEgressRelayCredentialPush:

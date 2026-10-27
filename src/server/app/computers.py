@@ -15,7 +15,11 @@ from fastapi import APIRouter, HTTPException, Query, Response
 from fastapi.responses import StreamingResponse
 
 from ptc_agent.core.sandbox.providers import provider_class
-from ptc_agent.core.sandbox.providers.ssh_errors import SSHConnectError, connect_failure
+from ptc_agent.core.sandbox.providers.ssh_errors import (
+    SSHConnectError,
+    SSHFolderMarked,
+    connect_failure,
+)
 from ptc_agent.core.sandbox.runtime import SandboxGoneError, SandboxTransientError
 from src.server.services.persistence.sync_result import BackupIncomplete
 from src.server.services.background_starts import schedule_start
@@ -57,6 +61,7 @@ from src.server.models.computer import (
     ComputerProviderOption,
     ComputerProvidersResponse,
     ComputerTierSpec,
+    ComputerRemoveRequest,
     ComputerRemoveResponse,
     ComputerRenameRequest,
     ComputerResponse,
@@ -186,9 +191,10 @@ async def _computer_action_errors(action: str, computer_id: str, *, spec: bool =
         raise HTTPException(status_code=409, detail=spec_refusal("busy", str(e))) from None
     except ComputerRemovalRefused as e:
         logger.warning("Refused to %s computer %s: %s", action, computer_id, e.code)
-        raise HTTPException(
-            status_code=409, detail={"code": e.code, "message": str(e)}
-        ) from None
+        detail = {"code": e.code, "message": str(e)}
+        if e.deleted:
+            detail["workspaces_deleted"] = e.deleted
+        raise HTTPException(status_code=409, detail=detail) from None
     except (ProviderNotOffered, UnknownResourceTier) as e:
         raise HTTPException(status_code=400, detail=str(e)) from None
     except ValueError as e:
@@ -479,6 +485,8 @@ def _ssh_create_refusals():
             detail=str(e),
             headers={"Retry-After": str(e.retry_after)},
         ) from None
+    except SSHFolderMarked as e:
+        raise HTTPException(status_code=409, detail=e.detail()) from None
     except SSHConnectError as e:
         raise HTTPException(status_code=422, detail=str(e)) from None
     except SSHUnavailable as e:
@@ -600,33 +608,65 @@ async def remove_computer(
             "unless another of the user's computers logs in through the same file"
         ),
     ),
+    delete_workspaces: list[str] = Query(
+        default=[],
+        description=(
+            "As the body's delete_workspaces, which this joins; kept for clients "
+            "that name them here"
+        ),
+    ),
+    delete_files: bool = Query(
+        False,
+        description=(
+            "On an ssh computer, also delete LangAlpha's files from its machine: "
+            "the folders of the workspaces deleted with it, its folders in the root, "
+            "and the runtime in ~/.langalpha when no other computer uses it"
+        ),
+    ),
+    body: Optional[ComputerRemoveRequest] = None,
 ):
     """Remove a computer and its sandbox for good.
 
-    Only an empty one other than the primary, which is where new workspaces
-    go, so a removal never takes a workspace with it. A refusal the user can
-    act on is a 409 whose ``code`` the client words. On an ssh computer,
+    Any but the primary, which is where new workspaces go. One with workspaces
+    is refused unless ``delete_workspaces`` names every one of them, the ones
+    the owner was shown, so a removal never takes a workspace they did not
+    see (one created meanwhile, in another tab). The body carries them, as
+    the query would overflow a request line limit on a full computer; the
+    query an older client names them in still counts. ``workspaces_deleted``
+    answers the ones that went, for the client to forget. Their folders, and
+    on an ssh computer anything else LangAlpha put on the machine, stay unless
+    ``delete_files`` says to delete them too. A refusal the
+    user can act on is a 409 whose ``code`` the client words. On an ssh computer,
     ``key`` says what became of the key's line on its machine. The tunnel of
     a machine left with no computer goes on the connection the delete ran
     on, or without one in the background, where a machine that does not
     answer holds up nobody.
     """
+    named = list(dict.fromkeys([*delete_workspaces, *(body.delete_workspaces if body else ())]))
     async with _computer_action_errors("remove", computer_id):
         computer = await _owned_computer(computer_id, x_user_id)
-        await _computer_manager().remove_computer(computer_id)
+        deleted = await _computer_manager().remove_computer_with_workspaces(
+            computer_id, named, delete_files=delete_files
+        )
         logger.info("Removed computer %s for user %s", computer_id, x_user_id)
         if computer.get("kind") != SSH_KIND:
-            return ComputerRemoveResponse()
+            return ComputerRemoveResponse(workspaces_deleted=deleted)
         settings = _sandbox_config().settings_for(SSH_KIND)
         left = await leave_machine(
-            x_user_id, computer, settings=settings, remove_key=remove_key
+            x_user_id,
+            computer,
+            settings=settings,
+            remove_key=remove_key,
+            delete_files=delete_files,
         )
         if tunnel_of(computer) and not left.tunnel_released:
             schedule_start(
                 f"tunnel-release:{computer_id}",
                 lambda: release_tunnel(x_user_id, computer, settings=settings),
             )
-    return ComputerRemoveResponse(key=left.key)
+    return ComputerRemoveResponse(
+        key=left.key, files=left.files, workspaces_deleted=deleted
+    )
 
 
 @router.get("/{computer_id}/storage", response_model=ComputerStorageResponse)

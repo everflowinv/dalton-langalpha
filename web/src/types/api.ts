@@ -1,5 +1,7 @@
 /** Core API types — User, Workspace, Thread, and response wrappers */
 
+import type { CommandFailureReason, CommandTool } from './commands';
+
 // --- User ---
 
 export interface User {
@@ -199,6 +201,18 @@ export interface ComputerSsh {
   tunnel_connected: boolean | null;
   /** Answered by LangAlpha's helper (remote control of a Mac) rather than the machine's own sshd. */
   helper: boolean;
+  /** The system as `uname -s` names it ("Darwin", "Linux"); null on a computer added before it was kept. */
+  os?: string | null;
+  /** A Mac's model name ("MacBook Pro", "Mac Studio"); null elsewhere, and before it was read. */
+  model?: string | null;
+  /** The system and its version ("macOS 15.4", "Ubuntu 24.04 LTS"), read as the machine starts. Each of these is null until read. */
+  distro?: string | null;
+  /** As `uname -m` names it ("arm64", "x86_64"). */
+  arch?: string | null;
+  /** The processor as the system names it ("Apple M4 Max"). */
+  cpu?: string | null;
+  cores?: number | null;
+  memory_bytes?: number | null;
 }
 
 export interface Computer {
@@ -330,6 +344,18 @@ export interface ComputerActionResponse {
 export interface ComputerRemoveResponse {
   /** What happened to our key line on an SSH computer's machine; null for other kinds, and when remove_key was false. */
   key: ComputerKeyRemoval | null;
+  /** What happened to LangAlpha's files on an SSH computer's machine; null unless delete_files was asked. */
+  files?: ComputerFilesRemoval | null;
+  /** The named workspaces it deleted, not one moved off it meanwhile; absent from an older backend. */
+  workspaces_deleted?: string[];
+}
+
+export interface ComputerFilesRemoval {
+  outcome: 'deleted' | 'unreached' | 'failed';
+  /** The root folder stays, holding files the owner put there. */
+  root_kept: boolean;
+  /** ~/.langalpha stays, since another computer on the login uses it. */
+  runtime_kept: boolean;
 }
 
 export interface ComputerKeyRemoval {
@@ -430,7 +456,12 @@ export interface ComputerCreate {
   /** Omitted means the deployment's default provider. */
   kind?: string;
   /** The target of an `ssh` computer, with the host key it answered with when the server connected. */
-  ssh?: SshTarget & { host_key: string; root_dir?: string };
+  ssh?: SshTarget & {
+    host_key: string;
+    root_dir?: string;
+    /** The owner a 409 `folder_marked` named, whose folder the user chose to take over. */
+    take_over?: string;
+  };
   /** Keep a backup of each workspace's files. Omitted means on; the server
    *  refuses off for a machine it runs. */
   files_backup?: boolean;
@@ -469,6 +500,8 @@ export interface SshProbeResult {
   suggested_root_dir: string;
   /** The machine's own name, the default name of the computer; empty when it gave none. */
   hostname: string;
+  /** A Mac's model name ("MacBook Pro"); empty elsewhere, and from an older server. */
+  model?: string;
   /** Answered by LangAlpha's helper (remote control of a Mac) rather than the machine's own sshd. */
   helper: boolean;
 }
@@ -577,6 +610,18 @@ export type ReportSource =
       kind: 'task'; task_id: string; display_id: string; description?: string; failed: boolean;
       /** The subagent's role. Absent on reports from before it was kept. */
       subagent_type?: string;
+    }
+  /** A Bash or ExecuteCode call in this thread that ran on in the background
+   *  and has now ended. Of the stops, only the user's reports. */
+  | {
+      kind: 'command_report'; command_id: string; tool: CommandTool; description?: string | null;
+      status: 'completed' | 'failed' | 'stopped';
+      /** Why a failed one failed; `after_turn_limit` is one stopped an hour
+       *  after its turn ended, which reads as stopped early. */
+      failure_reason?: CommandFailureReason | null;
+      /** The call it started from, whose tool card the report opens; null
+       *  for a command whose call had no id. */
+      tool_call_id?: string | null;
     };
 
 export interface ThreadMetadata {

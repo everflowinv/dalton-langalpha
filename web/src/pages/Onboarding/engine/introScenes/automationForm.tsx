@@ -215,30 +215,6 @@ export function FormActions({ label, pressed }: { label: string; pressed?: strin
   );
 }
 
-/** A dropdown's surface: the popover fill, a hairline, the menu shadow. */
-export function MenuSurface({
-  className,
-  style,
-  children,
-}: {
-  className?: string;
-  style?: CSSProperties;
-  children: ReactNode;
-}) {
-  return (
-    <div
-      className={cn('rounded-[5px] border p-[3px] shadow-md', className)}
-      style={{
-        background: 'hsl(var(--popover))',
-        borderColor: 'var(--color-border-muted)',
-        ...style,
-      }}
-    >
-      {children}
-    </div>
-  );
-}
-
 /** The form's title, one step under the page's. */
 export function FormTitle({ children }: { children: ReactNode }) {
   return (

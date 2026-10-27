@@ -230,6 +230,11 @@
     "connected": "Connected",
     "manageProviders": "Manage providers",
     "fontSize": "Font size",
+    "cardStyle": "Card style",
+    "cardStyleDesc": "How data cards and their detail panels look in chat.",
+    "cardStyleTerminal": "Terminal",
+    "cardStyleBalanced": "Balanced",
+    "cardStyleQuiet": "Quiet",
     "userInfo": "User Info",
     "preferences": "Preferences",
     "model": "Model",
@@ -1356,6 +1361,9 @@
     "sortRecent": "Recent",
     "allComputers": "All computers",
     "filterByComputer": "Filter by computer",
+    "manageComputers": "Manage computers…",
+    "manageComputerMenu": "Manage computer…",
+    "newComputerMenu": "New computer…",
     "customSortHint": "Drag cards to arrange",
     "dragInstructions": "To pick up a workspace, press Space. Use the arrow keys to move it, Space again to drop it, or Escape to cancel.",
     "dragPickedUp": "Picked up {{name}}.",
@@ -1489,7 +1497,9 @@
     "filesUploaded": "{{count}} file(s) uploaded",
     "filesFailed": "· {{count}} failed",
     "openWorkspace": "Open Workspace",
-    "fileTooLarge": "{{name}} is too large to upload ({{size}} MB)."
+    "fileTooLarge": "{{name}} is too large to upload ({{size}} MB).",
+    "cosWorksOn": "Works on",
+    "cosComputerHint": "{{name}} works on your primary computer, in a Home folder beside your workspaces. Make another computer primary and it moves there."
   },
   "computer": {
     "computers": "Computers",
@@ -1497,6 +1507,7 @@
     "loading": "Loading computers",
     "empty": "No computers yet. Your first workspace creates one.",
     "nameLabel": "Name",
+    "nameFromMachine": "Defaults to the machine's name",
     "namePlaceholderCloud": "Cloud computer",
     "namePlaceholderLocal": "Local computer",
     "tierLabel": "Computer spec",
@@ -1507,8 +1518,11 @@
     "capPlanLimited": "Need more computers than your plan includes?",
     "tierElsewhere": "{{tier}} is available on {{provider}}.",
     "switchProvider": "Switch to {{provider}}",
+    "takeOverFolder": "Take over this folder",
+    "takeOverFolderNote": "The other computer stops working in it. The files in it stay.",
     "computerLabel": "Computer",
     "computerHint": "Workspaces on one computer share its disk and start and stop together.",
+    "nameWithSource": "{{name}} · {{source}}",
     "primaryOption": "{{name}} (Primary)",
     "preparingOption": "{{name}} (Preparing)",
     "primaryPreparingOption": "{{name}} (Primary, Preparing)",
@@ -1574,7 +1588,25 @@
     "removeTitle": "Remove {{name}}?",
     "removeBody": "Its sandbox and everything on its disk are deleted. This can't be undone.",
     "removeBodyOwnMachine": "We stop using this machine and remove what we set up there for it. Your files in {{folder}} stay.",
+    "removeBodyOwnMachineDelete": "We stop using this machine and delete what LangAlpha put there.",
+    "alsoDeleteFiles": "Also delete LangAlpha's files from this machine",
+    "alsoDeleteFilesHint": "Deletes {{folder}}, its workspaces' folders included, and LangAlpha's runtime in ~/.langalpha (about 3 GB) unless another computer uses it. Files you put in {{folder}} yourself stay. The machine has to be connected.",
+    "filesDeleted": "Its files were deleted from the machine.",
+    "filesRootKept": "{{folder}} stays, since it holds files of yours.",
+    "filesRuntimeKept": "~/.langalpha stays, since another computer uses it.",
+    "filesUnreached": "We could not reach the machine, so its files are still there.",
+    "filesFailed": "We could not finish deleting its files from the machine.",
     "removeConfirm": "Remove computer",
+    "removeWithWorkspaces_one": "Remove computer and workspace",
+    "removeWithWorkspaces_other": "Remove computer and {{count}} workspaces",
+    "removeWorkspaces_one": "This workspace is deleted with it:",
+    "removeWorkspaces_other": "These {{count}} workspaces are deleted with it:",
+    "removeWorkspacesMore_one": "and {{count}} more",
+    "removeWorkspacesMore_other": "and {{count}} more",
+    "removeWorkspacesAcknowledgeOne": "I understand {{name}} and its threads are deleted for good",
+    "removeWorkspacesAcknowledge_other": "I understand these {{count}} workspaces and their threads are deleted for good",
+    "removeWorkspacesLoading": "Finding the workspaces on it...",
+    "removeWorkspacesFailed": "Couldn't read the workspaces on it. Close this and try again.",
     "removing": "Removing...",
     "removeKey": "Remove our key from ~/.ssh/authorized_keys",
     "keyRemoved": "We also removed our key from ~/.ssh/authorized_keys.",
@@ -1585,15 +1617,13 @@
     "removed": "{{name}} removed",
     "removeFailed": "Couldn't remove this computer. Try again.",
     "removeBlocked": {
-      "workspaces_one": "Delete its workspace to remove it.",
-      "workspaces_other": "Delete its {{count}} workspaces to remove it.",
       "specChange": "You can remove it once the spec change finishes.",
       "starting": "You can remove it once it has started.",
       "stopping": "You can remove it once it has stopped."
     },
     "removeRefused": {
       "primary": "Your primary computer can't be removed.",
-      "hasWorkspaces": "Delete the workspaces on this computer first.",
+      "hasWorkspaces": "A workspace not listed here is on it now. Check the list and try again.",
       "busy": "This computer is busy. Try again in a moment."
     },
     "manageComputer": "Manage {{name}}",
@@ -1605,8 +1635,17 @@
       "offConfirm": "Stop backing up",
       "failed": "Couldn't change file backup"
     },
+    "machine": {
+      "system": "System",
+      "processor": "Processor",
+      "cores": "Cores",
+      "memory": "Memory",
+      "folder": "Folder",
+      "gb": "{{count}} GB"
+    },
     "prepare": {
       "sandbox": "Creating the sandbox",
+      "runtime": "Installing the runtime",
       "tools": "Installing tools",
       "finishing": "Finishing setup",
       "step": "{{step}} ({{index}} of {{total}})",
@@ -1785,7 +1824,27 @@
       "asAccount": "as {{account}}",
       "notConnected": "Not connected",
       "paused": "Remote control is paused. Resume it from the LangAlpha menu.",
-      "removeTurnsOff": "Remote control on this Mac turns off too."
+      "removeTurnsOff": "Remote control on this Mac turns off too.",
+      "cardTitlePc": "This PC",
+      "windowsSoon": "Windows support is coming soon",
+      "needsApp": "Needs the desktop app",
+      "needsAppHint": "To add this Mac, <download>get the desktop app</download> and open this form there."
+    },
+    "card": {
+      "spec": "Spec",
+      "changeSpec": "Change",
+      "workspaces": "Workspaces",
+      "disk": "Disk",
+      "position": "{{n}} / {{total}}",
+      "previous": "Previous computer",
+      "next": "Next computer",
+      "newOwn": "A cloud computer, or a machine you already have, reached over SSH.",
+      "newCloud": "Another cloud computer, for work you want kept on its own machine.",
+      "add": "Add a computer",
+      "ownMachine": "Own machine",
+      "details": "Details",
+      "storage": "Storage",
+      "previewPending": "Drawn once it's reached"
     }
   },
   "thread": {
@@ -2019,7 +2078,25 @@
       "tasksRunning_one": "{{count}} task · {{running}} running",
       "tasksRunning_other": "{{count}} tasks · {{running}} running",
       "tasksHeading": "From this thread",
+      "commandsHeading": "Running in the background",
       "show": "Show this thread's work"
+    },
+    "commands": {
+      "chip_one": "{{count}} command running",
+      "chip_other": "{{count}} commands running",
+      "pickedUp_one": "The Agent picks this up when it finishes.",
+      "pickedUp_other": "The Agent picks each one up when it finishes.",
+      "inBackground": "In background {{duration}}",
+      "completedIn": "Completed in {{duration}}",
+      "failedAfter": "Failed after {{duration}}",
+      "stoppedAfter": "Stopped after {{duration}}",
+      "stoppedEarlyAfter": "Stopped early after {{duration}}",
+      "completed": "Completed",
+      "failed": "Failed",
+      "stopped": "Stopped",
+      "stoppedEarly": "Stopped early",
+      "stopLabel": "Stop {{name}}",
+      "stopFailed": "Couldn't stop it. Try again."
     },
     "provenance": {
       "fromChiefOfStaff": "From Chief of Staff",
@@ -2035,7 +2112,8 @@
       "couldntFinish": "couldn't finish",
       "stopped": "was stopped",
       "taskFinished": "finished",
-      "taskFailed": "failed"
+      "taskFailed": "failed",
+      "commandStoppedEarly": "stopped early"
     },
     "taskCard": {
       "statusRunning": "Running",
@@ -3142,7 +3220,7 @@
     "profitMargins": "Profit Margins",
     "epsActualVsEstimate": "EPS: Actual vs Estimate",
     "cashFlowQuarterly": "Cash Flow (Quarterly)",
-    "openInMarketView": "Open in Market View ↗",
+    "openInMarketView": "Open in Market View",
     "revenue": "Revenue",
     "netIncome": "Net Income",
     "grossMargin": "Gross Margin",
@@ -3255,8 +3333,6 @@
     "resultSavedToFilesystem": "The full result has been saved to the workspace filesystem.",
     "openFullResult": "Open full result",
     "preview": "Preview",
-    "nSearchResults": "{{count}} result for \"{{query}}\"",
-    "nSearchResults_other": "{{count}} results for \"{{query}}\"",
     "untitled": "Untitled",
     "nReasoning": "{{count}} reasoning",
     "thoughtFor": "thought for {{duration}}",
@@ -3304,6 +3380,7 @@
       "executeCode": "Execute Code",
       "thinking": "Thinking",
       "taskOutput": "Task Output",
+      "threadStatus": "Thread Status",
       "automations": "Automations",
       "createAutomation": "Create Automation",
       "manageAutomation": "Manage Automation",
@@ -3319,7 +3396,9 @@
       "user": "Account",
       "sendMessage": "Send Message",
       "messageTargets": "Message Targets",
-      "scheduleWakeup": "Wakeups"
+      "scheduleWakeup": "Wakeups",
+      "optionsChain": "Options Chain",
+      "marketMovers": "Market Movers"
     },
     "completed": {
       "activatedSkill": "Activated skill",
@@ -3406,6 +3485,7 @@
       "waitingForSubagent": "waiting for subagent...",
       "fetchingTaskOutput": "fetching task output...",
       "checkingAutomations": "checking automations...",
+      "checkingThreadStatus": "checking what is running...",
       "creatingName": "creating {{name}}...",
       "creatingAutomation": "creating automation...",
       "actionAutomation": "{{action}} automation...",
@@ -3415,7 +3495,11 @@
       "sendingTo": "sending to {{app}}...",
       "sendingMessage": "sending message...",
       "listingMessageTargets": "listing message targets...",
-      "processing": "processing..."
+      "processing": "processing...",
+      "fetchingSymbolOptions": "fetching {{symbol}} options...",
+      "fetchingOptions": "fetching options...",
+      "fetchingGainers": "fetching top gainers...",
+      "fetchingLosers": "fetching top losers..."
     },
     "preparing": {
       "writingCode": "writing code{{size}}...",
@@ -3578,6 +3662,11 @@
       "orderReceipt": {
         "viewInOrders": "View in Orders",
         "openAt": "Open in {{vendor}}"
+      },
+      "orderTerm": {
+        "limit": "Limit",
+        "avgFill": "Avg fill",
+        "stop": "Stop"
       }
     },
     "messageDelivery": {
@@ -3599,6 +3688,76 @@
       "message": "Message",
       "files": "Files",
       "sentEarlier": "Sent earlier"
+    },
+    "termHead": {
+      "sym": "Sym",
+      "name": "Name",
+      "last": "Last",
+      "change": "Chg",
+      "mktCap": "Mkt cap",
+      "dayRange": "Day range",
+      "extended": "Ext hrs",
+      "filed": "Filed",
+      "items": "Items",
+      "press": "Press",
+      "asOf": "As of",
+      "filing": "Filing",
+      "strike": "Strike",
+      "exp": "Exp",
+      "type": "Type",
+      "vol": "Vol"
+    },
+    "annualReport": "Annual report",
+    "quarterlyReport": "Quarterly report",
+    "filedOn": "Filed {{date}}",
+    "source": "Source",
+    "edgarLink": "EDGAR ↗",
+    "filingCount": "{{count}} filing",
+    "filingCount_other": "{{count}} filings",
+    "nDays": "{{count}} day",
+    "nDays_other": "{{count}} days",
+    "pressReleaseShort": "PR",
+    "nMoreResults": "+{{count}} more result",
+    "nMoreResults_other": "+{{count}} more results",
+    "nTotalItems": "{{count}} total",
+    "automationStatus": {
+      "active": "Active",
+      "paused": "Paused",
+      "failed": "Failed",
+      "completed": "Completed",
+      "disabled": "Disabled",
+      "created": "Created",
+      "executing": "Running"
+    },
+    "termRange": {
+      "day": "Day",
+      "week52": "52 wk"
+    },
+    "quote": "Quote",
+    "optionsChain": "Options Chain",
+    "options": "Options",
+    "optionType": {
+      "call": "Call",
+      "put": "Put"
+    },
+    "optionTypes": {
+      "call": "Calls",
+      "put": "Puts"
+    },
+    "expiresOn": "Exp {{date}}",
+    "expiration": "Expiry",
+    "contract": "Contract",
+    "change": "Change",
+    "nMoreContracts": "+{{count}} more contract",
+    "nMoreContracts_other": "+{{count}} more contracts",
+    "noOptionsData": "No options data available",
+    "topGainers": "Top Gainers",
+    "topLosers": "Top Losers",
+    "marketMovers": "Market Movers",
+    "noMoversData": "No movers data available",
+    "optionsOfType": {
+      "call": "Options · Calls",
+      "put": "Options · Puts"
     }
   },
   "setup": {
@@ -4050,6 +4209,14 @@
         "models": {
           "title": "Choose your models",
           "desc": "Pick default models and connect providers."
+        },
+        "desktopApp": {
+          "title": "Get the desktop app",
+          "desc": "LangAlpha in a window of its own, and on a Mac, your Mac as a computer."
+        },
+        "remoteControl": {
+          "title": "Turn on remote control",
+          "desc": "Let the agent work on this Mac, even with LangAlpha closed."
         },
         "integrations": {
           "title": "Connect a chat app",

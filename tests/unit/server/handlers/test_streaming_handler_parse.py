@@ -108,6 +108,7 @@ class TestParseErrorEmission:
         producer.anthropic_tool_call_state[("agent", 0)] = {
             "name": "execute_code",
             "id": "call-broken",
+            "message_id": "msg-1",
             "args_accumulated": '"just a string"',  # valid JSON, non-dict: unrepairable
         }
         chunk = AIMessageChunk(content="", id="msg-1")
@@ -141,6 +142,7 @@ class TestParseErrorEmission:
         producer.anthropic_tool_call_state[("agent", 0)] = {
             "name": "execute_code",
             "id": "call-ok",
+            "message_id": "msg-2",
             "args_accumulated": '{"code": "print(1)"}',
         }
         chunk = AIMessageChunk(content="", id="msg-2")

@@ -164,13 +164,11 @@ export function RemoteControlSetup({
   state,
   account,
   busy,
-  nameMaxLength,
 }: {
   state: RemoteControlSetupState;
   /** The macOS account the agent will work as, named in the disclosure. */
   account: string;
   busy: boolean;
-  nameMaxLength: number;
 }) {
   const { t } = useTranslation();
   const headingId = useId();
@@ -185,7 +183,7 @@ export function RemoteControlSetup({
       </div>
       {phase.kind === 'ready' ? (
         // No "Use a different machine": this Mac is the only one this way adds.
-        <ReadySummary step={state.readyStep} ready={phase.ready} busy={busy} nameMaxLength={nameMaxLength} />
+        <ReadySummary step={state.readyStep} ready={phase.ready} busy={busy} />
       ) : (
         <>
           {phase.kind === 'disclosure' && <Disclosure state={state} account={account} busy={busy} />}

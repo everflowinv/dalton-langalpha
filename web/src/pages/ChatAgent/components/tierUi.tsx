@@ -233,7 +233,7 @@ function slotLine(t: Translate, slot: WorkspaceCapacity): string {
  * so the row says what the machine will be. None while that is unknown:
  * a name with no numbers beats numbers that may be wrong.
  */
-function tierFacts(t: Translate, spec: ComputerTierSpec | undefined): string[] | undefined {
+export function tierFacts(t: Translate, spec: ComputerTierSpec | undefined): string[] | undefined {
   if (!spec) return undefined;
   return [
     t('workspace.tierFact.cpu', '{{count}} vCPU', { count: spec.cpu }),

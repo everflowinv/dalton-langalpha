@@ -20,7 +20,6 @@ import pytest
 from ptc_agent.config.core import DaytonaConfig
 from ptc_agent.core.sandbox._defaults import SANDBOX_IMAGE_ENV, sandbox_thread_env
 from ptc_agent.core.sandbox.runtime import (
-    CodeRunResult,
     ExecResult,
     RuntimeState,
     SandboxGoneError,
@@ -42,9 +41,6 @@ class TestDaytonaRuntime:
         sandbox.state = "started"
         sandbox.process.exec = AsyncMock(
             return_value=MagicMock(output="hello", exit_code=0)
-        )
-        sandbox.process.code_run = AsyncMock(
-            return_value=MagicMock(output="42", exit_code=0, artifacts=[])
         )
         sandbox.fs.upload_file = AsyncMock()
         sandbox.fs.upload_files = AsyncMock()
@@ -72,13 +68,6 @@ class TestDaytonaRuntime:
         result = await runtime.exec("echo hello")
         mock_sdk_sandbox.process.exec.assert_called_once()
         assert isinstance(result, ExecResult)
-        assert result.exit_code == 0
-
-    @pytest.mark.asyncio
-    async def test_code_run_delegates(self, runtime, mock_sdk_sandbox):
-        result = await runtime.code_run("print(42)")
-        mock_sdk_sandbox.process.code_run.assert_called_once()
-        assert isinstance(result, CodeRunResult)
         assert result.exit_code == 0
 
     @pytest.mark.asyncio

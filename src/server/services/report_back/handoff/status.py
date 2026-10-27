@@ -12,6 +12,8 @@ import asyncio
 import json
 import logging
 from collections.abc import Iterable
+from dataclasses import dataclass, field
+from typing import TypedDict
 
 from src.server.services.report_back.handoff import reserve
 from src.server.services.report_back.handoff.keys import (
@@ -25,6 +27,34 @@ from src.server.services.report_back.handoff.keys import (
 
 # Same hard-coded logger name request_prep uses — existing log routing keys off it.
 logger = logging.getLogger("src.server.handlers.chat_handler")
+
+
+class OwedThread(TypedDict):
+    """An analyst's thread that still owes a report, as ``get_thread_labels``
+    names it."""
+
+    thread_id: str
+    workspace_name: str | None
+    title: str | None
+
+
+@dataclass(frozen=True)
+class _Watch:
+    """A thread's watch set as the slice derives it; empty with no cache."""
+
+    pending: bool = False
+    run_id: str | None = None
+    recent: list[str] = field(default_factory=list)
+    ended: list[str] = field(default_factory=list)
+    owed: list[str] = field(default_factory=list)
+
+
+async def read_owed_analysts(thread_id: str, user_id: str | None) -> list[OwedThread]:
+    """The analysts still owing ``thread_id`` a report, unsettled members and
+    the analysts of queued jobs alike, as ``read_report_back_status`` names
+    them in ``owed_threads``. Raises when the registry or the labels cannot be
+    read. ``user_id`` is the thread's owner; no owner names nothing."""
+    return await _owed_labels((await _read_watch(thread_id)).owed, user_id)
 
 
 async def read_report_back_status(thread_id: str, user_id: str | None) -> dict:
@@ -42,161 +72,146 @@ async def read_report_back_status(thread_id: str, user_id: str | None) -> dict:
     ``user_id``, the thread's owner, that a report is still owed by: unsettled
     members and the analysts of queued jobs alike (``None`` when unknown).
     """
-    pending_report_back: bool | None = False
-    report_back_run_id = None
-    recent_report_back_run_ids: list[str] = []
-    ended: list[str] = []
-    owed: list[str] = []
-    owed_threads: list[dict] | None = []
     try:
-        from src.utils.cache.redis_cache import get_cache_client
-
-        cache = get_cache_client()
-        if cache.enabled and cache.client:
-            # Membership is the source of truth for "pending"; execution
-            # progress lives in the durable outbox, not process memory.
-            pipe = cache.client.pipeline(transaction=False)
-            pipe.smembers(watch_key(thread_id))
-            pipe.lrange(rb_done_key(thread_id), 0, RB_DONE_MAX - 1)
-            members_raw, recent_raw = await pipe.execute()
-
-            recent_report_back_run_ids = [decode(r) for r in (recent_raw or [])]
-            members = [decode(m) for m in (members_raw or [])]
-            origins: dict[str, dict | None] = {}
-            if members:
-                # A member without an origin is dead state and must not keep
-                # this thread pending forever — under-cap threads never hit the
-                # reserve-path reaper, and successful reserves keep refreshing
-                # the shared set's TTL. Filter them out of the derivation and
-                # reap them best-effort (the Lua re-checks EXISTS per member,
-                # so a racing reserve is never touched).
-                origins_raw = await cache.client.mget(
-                    [ptc_origin_key(m) for m in members]
-                )
-                origins = {m: _json_dict(o) for m, o in zip(members, origins_raw)}
-                orphans = [m for m, o in zip(members, origins_raw) if o is None]
-                if orphans:
-                    members = [m for m in members if m not in orphans]
-                    try:
-                        reaped = await reserve.reap_listed_orphans(
-                            cache, watch_key(thread_id), orphans
-                        )
-                        if reaped:
-                            logger.info(
-                                f"[HANDOFF_REPORT_BACK] Status read reaped {reaped} "
-                                f"orphaned member(s) for thread={thread_id}"
-                            )
-                    except Exception:
-                        logger.warning(
-                            f"Orphan reap during status read failed for {thread_id}",
-                            exc_info=True,
-                        )
-            if members:
-                # Each member's per-(dispatcher, ptc) run pointer names its summary
-                # run once one is dispatched, and survives until teardown, so
-                # it can name a run that already ended. One MGET vs N serial
-                # GETs; values are raw serialized JSON.
-                ptr_raw = await cache.client.mget(
-                    [rb_run_key(thread_id, ptc) for ptc in members]
-                )
-                pointers = {
-                    m: ptr
-                    for m, ptr in zip(members, map(_json_dict, ptr_raw))
-                    if ptr and ptr.get("run_id")
-                }
-                # A later run on an analyst's thread under the same dispatch
-                # (a continuation, a subagent's report) queues another job
-                # behind the one its pointer names. Each job is owed until
-                # the summary it dispatched ends, as on the task slice.
-                from src.server.database.runs import outbox as outbox_db
-
-                jobs = await outbox_db.list_open_notification_jobs(
-                    thread_id, "report_back"
-                )
-                payloads = [job.get("payload") or {} for job in jobs]
-                ended = await ended_run_ids(
-                    [
-                        *(ptr["run_id"] for ptr in pointers.values()),
-                        *(p.get("dispatched_run_id") for p in payloads),
-                    ]
-                )
-                unsettled = [
-                    m
-                    for m in members
-                    if not _settles(pointers.get(m), origins.get(m), ended)
-                ]
-                open_jobs = [
-                    p for p in payloads if p.get("dispatched_run_id") not in ended
-                ]
-                pending_report_back = bool(unsettled or open_jobs)
-                # A report queued behind an ended summary is owed by the
-                # thread its job names, though that member has settled.
-                owed = list(
-                    dict.fromkeys(
-                        t
-                        for t in [
-                            *unsettled,
-                            *(p.get("ptc_thread_id") for p in open_jobs),
-                        ]
-                        if t
-                    )
-                )
-                report_back_run_id = next(
-                    (
-                        ptr["run_id"]
-                        for m in members
-                        if (ptr := pointers.get(m)) and ptr["run_id"] not in ended
-                    ),
-                    None,
-                )
+        watch: _Watch | None = await _read_watch(thread_id)
     except Exception:
         logger.warning(
             f"Report-back status read failed for {thread_id}; reporting unknown",
             exc_info=True,
         )
-        pending_report_back = None
-        report_back_run_id = None
-        recent_report_back_run_ids = []
-        ended = []
-        owed = []
-        owed_threads = None
-    if owed:
-        owed_threads = await _owed_thread_labels(thread_id, owed, user_id)
+        watch = None
+    owed_threads: list[OwedThread] | None = None
+    if watch is not None:
+        # Apart from the registry read, so a label failure can never turn
+        # pendingness unknown.
+        try:
+            owed_threads = await _owed_labels(watch.owed, user_id)
+        except Exception:
+            logger.warning(
+                f"Owed-thread label read failed for {thread_id}; reporting unknown",
+                exc_info=True,
+            )
 
     return {
         "thread_id": thread_id,
-        "pending_report_back": pending_report_back,
-        "report_back_run_id": report_back_run_id,
-        "recent_report_back_run_ids": list(
-            dict.fromkeys([*ended, *recent_report_back_run_ids])
+        "pending_report_back": watch.pending if watch is not None else None,
+        "report_back_run_id": watch.run_id if watch is not None else None,
+        "recent_report_back_run_ids": (
+            list(dict.fromkeys([*watch.ended, *watch.recent])) if watch is not None else []
         ),
         "owed_threads": owed_threads,
-        # Hand-offs carry no subagent tasks; present for shape parity with
-        # the task slice so watch snapshots decode uniformly.
+        # Hand-offs carry no subagent tasks or commands; present for shape
+        # parity with the task slice so watch snapshots decode uniformly.
         "active_tasks": [],
+        "active_commands": [],
     }
 
 
-async def _owed_thread_labels(
-    thread_id: str, owed: list[str], user_id: str | None
-) -> list[dict] | None:
-    """Labels for the owed members, or ``None`` when the read fails.
+async def _read_watch(thread_id: str) -> _Watch:
+    """Read and derive the thread's watch set; raises when Redis or the
+    outbox cannot be read."""
+    from src.utils.cache.redis_cache import get_cache_client
 
-    Kept out of the registry read's ``try`` so a label failure can never turn
-    pendingness unknown. No owner (the thread is gone) names nothing.
-    """
-    if user_id is None:
+    cache = get_cache_client()
+    if not (cache.enabled and cache.client):
+        return _Watch()
+    # Membership is the source of truth for "pending"; execution
+    # progress lives in the durable outbox, not process memory.
+    pipe = cache.client.pipeline(transaction=False)
+    pipe.smembers(watch_key(thread_id))
+    pipe.lrange(rb_done_key(thread_id), 0, RB_DONE_MAX - 1)
+    members_raw, recent_raw = await pipe.execute()
+
+    recent = [decode(r) for r in (recent_raw or [])]
+    members = [decode(m) for m in (members_raw or [])]
+    origins: dict[str, dict | None] = {}
+    if members:
+        # A member without an origin is dead state and must not keep
+        # this thread pending forever — under-cap threads never hit the
+        # reserve-path reaper, and successful reserves keep refreshing
+        # the shared set's TTL. Filter them out of the derivation and
+        # reap them best-effort (the Lua re-checks EXISTS per member,
+        # so a racing reserve is never touched).
+        origins_raw = await cache.client.mget([ptc_origin_key(m) for m in members])
+        origins = {m: _json_dict(o) for m, o in zip(members, origins_raw)}
+        orphans = [m for m, o in zip(members, origins_raw) if o is None]
+        if orphans:
+            members = [m for m in members if m not in orphans]
+            try:
+                reaped = await reserve.reap_listed_orphans(
+                    cache, watch_key(thread_id), orphans
+                )
+                if reaped:
+                    logger.info(
+                        f"[HANDOFF_REPORT_BACK] Status read reaped {reaped} "
+                        f"orphaned member(s) for thread={thread_id}"
+                    )
+            except Exception:
+                logger.warning(
+                    f"Orphan reap during status read failed for {thread_id}",
+                    exc_info=True,
+                )
+    if not members:
+        return _Watch(recent=recent)
+    # Each member's per-(dispatcher, ptc) run pointer names its summary
+    # run once one is dispatched, and survives until teardown, so
+    # it can name a run that already ended. One MGET vs N serial
+    # GETs; values are raw serialized JSON.
+    ptr_raw = await cache.client.mget([rb_run_key(thread_id, ptc) for ptc in members])
+    pointers = {
+        m: ptr
+        for m, ptr in zip(members, map(_json_dict, ptr_raw))
+        if ptr and ptr.get("run_id")
+    }
+    # A later run on an analyst's thread under the same dispatch
+    # (a continuation, a subagent's report) queues another job
+    # behind the one its pointer names. Each job is owed until
+    # the summary it dispatched ends, as on the task slice.
+    from src.server.database.runs import outbox as outbox_db
+
+    jobs = await outbox_db.list_open_notification_jobs(thread_id, "report_back")
+    payloads = [job.get("payload") or {} for job in jobs]
+    ended = await ended_run_ids(
+        [
+            *(ptr["run_id"] for ptr in pointers.values()),
+            *(p.get("dispatched_run_id") for p in payloads),
+        ]
+    )
+    unsettled = [
+        m for m in members if not _settles(pointers.get(m), origins.get(m), ended)
+    ]
+    open_jobs = [p for p in payloads if p.get("dispatched_run_id") not in ended]
+    return _Watch(
+        pending=bool(unsettled or open_jobs),
+        run_id=next(
+            (
+                ptr["run_id"]
+                for m in members
+                if (ptr := pointers.get(m)) and ptr["run_id"] not in ended
+            ),
+            None,
+        ),
+        recent=recent,
+        ended=ended,
+        # A report queued behind an ended summary is owed by the
+        # thread its job names, though that member has settled.
+        owed=list(
+            dict.fromkeys(
+                t
+                for t in [*unsettled, *(p.get("ptc_thread_id") for p in open_jobs)]
+                if t
+            )
+        ),
+    )
+
+
+async def _owed_labels(owed: list[str], user_id: str | None) -> list[OwedThread]:
+    """Labels for the owed members. No owner (the thread is gone) names nothing."""
+    if not owed or user_id is None:
         return []
-    try:
-        from src.server.database.conversation.threads_read import get_thread_labels
+    from src.server.database.conversation.threads_read import get_thread_labels
 
-        return await get_thread_labels(owed, user_id)
-    except Exception:
-        logger.warning(
-            f"Owed-thread label read failed for {thread_id}; reporting unknown",
-            exc_info=True,
-        )
-        return None
+    return await get_thread_labels(owed, user_id)
 
 
 async def read_report_back_slice(thread_id: str, user_id: str | None = None) -> dict:
@@ -235,7 +250,18 @@ async def read_report_back_slice(thread_id: str, user_id: str | None = None) -> 
         # Only an analyst hand-off is owed by another thread; the task
         # slice's subagents run in this one.
         "owed_threads": handoffs["owed_threads"],
+        "owed_report_kinds": _owed_kinds(
+            tasks["owed_report_kinds"], handoffs["pending_report_back"]
+        ),
     }
+
+
+def _owed_kinds(task_kinds: list[str] | None, analyst_owed: bool | None) -> list[str] | None:
+    """Whose reports are owed: the task slice's (a subagent's, a command's) and
+    an analyst's while a hand-off is; None when either read failed."""
+    if task_kinds is None or analyst_owed is None:
+        return None
+    return sorted({*task_kinds, *(("analyst",) if analyst_owed else ())})
 
 
 def _either_pending(a: bool | None, b: bool | None) -> bool | None:

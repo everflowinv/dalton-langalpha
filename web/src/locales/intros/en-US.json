@@ -14,7 +14,7 @@
     },
     "workspace": {
       "title": "Meet workspaces",
-      "body": "A workspace is a desk for one project: its threads share the same files, data and results, kept apart from your other work. Your workspaces and Home all run on one computer, which starts when you start typing."
+      "body": "A workspace is a desk for one project: its threads share the same files, data and results, kept apart from your other work. Each one lives on a computer: Home is on your primary one, and you can add more, including your own Mac by remote control."
     },
     "create": {
       "title": "Give real tasks their own workspace",

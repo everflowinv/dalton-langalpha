@@ -62,8 +62,9 @@ _WRAPPER_CODEGEN_MAJOR = "5"
 # trace small (per call still capped at RESULT_BODY_MAX_BYTES; this bounds
 # their sum to ~4 MiB). It is NOT a host-memory security bound: MCP_TRACE_FILE
 # is visible to agent code, which can append to the JSONL directly and bypass
-# this counter. The hard host-side bound on what _collect_mcp_trace reads lives
-# in ptc_sandbox (it sizes the file and skips one far past any legit trace).
+# this counter. The hard host-side bound on what a job's trace read takes
+# lives in sandbox/jobs/protocol.py (``_TRACE_READ_MAX``: the read sizes the
+# file and skips one far past any legit trace).
 RESULT_BODY_TRACE_BUDGET_BYTES = 4 * 1024 * 1024
 
 

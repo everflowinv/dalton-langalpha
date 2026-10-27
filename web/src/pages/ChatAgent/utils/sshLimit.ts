@@ -20,3 +20,12 @@ export function sshLimitMessage(err: unknown, t: Translate): string | null {
     defaultValue_other: 'You can have up to {{count}} SSH computers. Remove one to add another.',
   });
 }
+
+/**
+ * The computer a 409 `folder_marked` names: one this account does not have,
+ * whose mark holds the folder. A create that names it takes the folder over.
+ */
+export function folderMarkedOwner(err: unknown): string | null {
+  const owner = apiErrorCoded(err, 'folder_marked')?.owner;
+  return typeof owner === 'string' && owner ? owner : null;
+}

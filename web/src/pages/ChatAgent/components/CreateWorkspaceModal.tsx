@@ -1,4 +1,5 @@
 import React, { useState, useRef, useCallback, useEffect, useId } from 'react';
+import type { TFunction } from 'i18next';
 import { useTranslation } from 'react-i18next';
 import { X, Upload, FileText, CheckCircle2, Circle, AlertCircle } from 'lucide-react';
 import { Loader } from '@/components/ui/loader';
@@ -6,12 +7,13 @@ import { Input } from '../../../components/ui/input';
 import { Select } from '@/components/ui/select';
 import { useLocale } from '@/hooks/useLocale';
 import { formatBytes } from '@/lib/format';
-import type { Workspace } from '@/types/api';
+import type { Computer, Workspace } from '@/types/api';
 import { startWorkspace, uploadWorkspaceFile } from '../utils/api';
 import { createWorkspaceDenialMessage, denialMessage } from '../utils/denialMessage';
 import { clampWorkspaceName } from '../utils/workspaceName';
 import type { NewWorkspace } from '../hooks/useCreateWorkspace';
 import { useComputers } from '../hooks/useComputers';
+import { useComputerSource } from '../hooks/useComputerSource';
 import { isComputerPreparing, liveComputers, takesWorkspaces } from '../utils/computerStatus';
 import './CreateWorkspaceModal.css';
 
@@ -62,6 +64,9 @@ function CreateWorkspaceModal({ isOpen, onClose, onCreate, onComplete }: CreateW
   const { data: computerData } = useComputers({ enabled: isOpen });
   const computers = liveComputers(computerData?.computers);
   const choosesComputer = computers.length > 1;
+  // Each option says what the machine runs on, so a Mac and a cloud sandbox
+  // are told apart here too.
+  const sourceOf = useComputerSource(computers, { enabled: isOpen && choosesComputer });
   // The machine the workspace would land on, named or not. A pick that has
   // left the list (deleted elsewhere) falls back to the primary. The fan-out
   // moves its row to running when the preparation ends, which lifts the hold.
@@ -417,20 +422,11 @@ function CreateWorkspaceModal({ isOpen, onClose, onCreate, onComplete }: CreateW
                 onChange={(e) => setPickedComputerId(e.target.value)}
                 disabled={submitting}
               >
-                {computers.map((c) => {
-                  const preparing = isComputerPreparing(c);
-                  return (
-                    <option key={c.computer_id} value={c.computer_id} disabled={!takesWorkspaces(c)}>
-                      {c.is_primary
-                        ? preparing
-                          ? t('computer.primaryPreparingOption', '{{name}} (Primary, Preparing)', { name: c.name })
-                          : t('computer.primaryOption', '{{name}} (Primary)', { name: c.name })
-                        : preparing
-                          ? t('computer.preparingOption', '{{name}} (Preparing)', { name: c.name })
-                          : c.name}
-                    </option>
-                  );
-                })}
+                {computers.map((c) => (
+                  <option key={c.computer_id} value={c.computer_id} disabled={!takesWorkspaces(c)}>
+                    {computerOptionLabel(t, c, sourceOf(c))}
+                  </option>
+                ))}
               </Select>
               <div className="cwm-field-hint">
                 {t(
@@ -578,3 +574,15 @@ function StepRow({ label, status }: StepRowProps) {
 }
 
 export default CreateWorkspaceModal;
+
+/** A machine as the picker lists it: its name, what it runs on where that tells it apart, and whether it is the primary or still preparing. */
+function computerOptionLabel(t: TFunction, computer: Computer, source: string | null): string {
+  const name = source ? t('computer.nameWithSource', '{{name}} · {{source}}', { name: computer.name, source }) : computer.name;
+  const preparing = isComputerPreparing(computer);
+  if (computer.is_primary) {
+    return preparing
+      ? t('computer.primaryPreparingOption', '{{name}} (Primary, Preparing)', { name })
+      : t('computer.primaryOption', '{{name}} (Primary)', { name });
+  }
+  return preparing ? t('computer.preparingOption', '{{name}} (Preparing)', { name }) : name;
+}

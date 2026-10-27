@@ -1,7 +1,7 @@
 """Background subagent management tools.
 
-This module provides tools for the main agent to interact with background
-subagents: reading results and checking progress.
+This module provides the tool the main agent reads one background subagent's
+result or progress with. ThreadStatus lists the tasks.
 """
 
 from __future__ import annotations
@@ -30,17 +30,17 @@ if TYPE_CHECKING:
 
 logger = structlog.get_logger(__name__)
 
-TASK_OUTPUT_DESCRIPTION = """Get the output of a background subagent task, or an overview of all of them.
+TASK_OUTPUT_DESCRIPTION = """Get the result of a background subagent task. ThreadStatus lists them.
 
 Args:
-    task_id: A specific task's ID, e.g. "k7Xm2p". Omit to see every task.
+    task_id: The task's ID, e.g. "k7Xm2p".
 
 Returns:
     The task's result once it has completed, or its progress so far."""
 
 
 def _settled_label(task: BackgroundTask) -> str:
-    """How a settled task is labeled in the aggregate views."""
+    """How a settled task with a result is labeled."""
     return {
         "cancelled": "stopped by the user",
         "timeout": "timed out",
@@ -142,8 +142,8 @@ async def _delivered_result_text(registry, task) -> str:
     return _format_result(result)
 
 
-async def _settled_text(registry, task: BackgroundTask, *, listed: bool) -> str:
-    """A settled task as a single-task reply, or as its entry in the listing.
+async def _settled_text(registry, task: BackgroundTask) -> str:
+    """A settled task's reply.
 
     A stopped or never-started task has no result to show, so its notice IS
     the reply; anything else renders its delivered result. Reading the notice
@@ -170,8 +170,6 @@ async def _settled_text(registry, task: BackgroundTask, *, listed: bool) -> str:
             f"to replay completed dispatches from its journal — do NOT manually re-dispatch "
             f"Task subagents (such as data-prep or dalton-evidence)."
         )
-    if listed:
-        return f"### {task.display_id} ({task.subagent_type}) - {label}\n{body}"
     return f"**{task.display_id}** ({task.subagent_type}) {label}:\n\n{body}"
 
 
@@ -387,41 +385,33 @@ async def _resolve_task_reply(
     return (is_terminal, reply)
 
 
-async def _task_reply(registry, task: BackgroundTask, *, listed: bool) -> tuple[bool, str]:
+async def _task_reply(registry, task: BackgroundTask) -> tuple[bool, str]:
     """One task's TaskOutput answer, and whether the task is still pending.
 
     A stale cross-worker shell (or a run settled or superseded on another
     worker) defers to the durable ledger; past that the local object is
-    authoritative. A listed entry carries the listing's separator: a progress
-    block ends in one newline, anything else in a blank line.
+    authoritative.
     """
     _sync_task_completion(task)
     resolved = await _resolve_task_reply(registry, task)
     if resolved is not None:
         is_terminal, text = resolved
-        pending, end = not is_terminal, "\n\n"
-    elif not task.completed:
+        return not is_terminal, text
+    if not task.completed:
         # DALTON-HOOK(subagent-caps): resolve Redis queue status when local lease is absent.
         from src.dalton.subagent_slots import resolve_task_queued_status
 
         queued_status = await resolve_task_queued_status(
             task, getattr(registry, "thread_id", "")
         )
-        pending, text, end = (
-            True,
-            _format_task_progress(task, queued_status=queued_status),
-            "\n",
-        )
-    else:
-        # Marked seen even when the reply is a stop notice: that notice IS
-        # this task's delivery, and without it the orchestrator's
-        # settled-but-unseen sweep announces the task all over again and the
-        # agent re-reports a stop it already reported.
-        task.result_seen = True
-        await registry.mark_result_delivered(task)
-        pending, end = False, "\n\n"
-        text = await _settled_text(registry, task, listed=listed)
-    return pending, text + end if listed else text
+        return True, _format_task_progress(task, queued_status=queued_status)
+    # Marked seen even when the reply is a stop notice: that notice IS this
+    # task's delivery, and without it the orchestrator's settled-but-unseen
+    # sweep announces the task all over again and the agent re-reports a stop
+    # it already reported.
+    task.result_seen = True
+    await registry.mark_result_delivered(task)
+    return False, await _settled_text(registry, task)
 
 
 def create_task_output_tool(middleware: BackgroundSubagentMiddleware) -> StructuredTool:
@@ -429,13 +419,14 @@ def create_task_output_tool(middleware: BackgroundSubagentMiddleware) -> Structu
 
     It answers with what is known now: a finished task's result reaches the
     agent on its own, mid-turn as a steer or as a new turn once the turn ends.
+    Results only: ThreadStatus lists the thread's tasks, from the ledger.
     """
 
-    async def task_output(task_id: str | None = None) -> tuple[str, dict | None]:
-        """Get background task output.
+    async def task_output(task_id: str) -> tuple[str, dict | None]:
+        """Get a background task's result.
 
         Args:
-            task_id: Task ID (e.g., 'k7Xm2p') or None for all
+            task_id: Task ID (e.g., 'k7Xm2p')
 
         Returns:
             Result if completed, progress if still running
@@ -446,50 +437,15 @@ def create_task_output_tool(middleware: BackgroundSubagentMiddleware) -> Structu
         pending, reply = await _read(task_id)
         return reply, pending_read() if pending else None
 
-    async def _read(task_id: str | None) -> tuple[bool, str]:
+    async def _read(task_id: str) -> tuple[bool, str]:
         registry = middleware.registry
-        task_id = bare_task_id(task_id)
-
-        if task_id is not None:
-            task = await registry.get_by_task_id(task_id)
-            if not task:
-                return await _missing_task_reply(registry, task_id)
-            return await _task_reply(registry, task, listed=False)
-
-        # Workflow-owned children are hidden from the aggregate view (their
-        # results belong to the driver) but remain individually addressable
-        # via TaskOutput(task_id=...) as the drill-in escape hatch.
-        all_tasks = await registry.get_turn_visible_tasks()
-        if not all_tasks:
-            return False, "No background tasks have been assigned yet."
-
-        # Each entry and its pending flag come from one reading of the task, so
-        # the header's counts cannot disagree with the body.
-        entries = [
-            await _task_reply(registry, task, listed=True)
-            for task in sorted(all_tasks, key=lambda t: t.task_id)
-        ]
-        pending_count = sum(1 for pending, _ in entries if pending)
-        completed_count = len(entries) - pending_count
-        # DALTON-HOOK(subagent-caps): surface queued count in TaskOutput overview (including cross-worker).
-        from src.dalton.subagent_slots import resolve_task_queued_status
-
-        queued_statuses = [
-            await resolve_task_queued_status(task, getattr(registry, "thread_id", ""))
-            for task in all_tasks
-            if not task.completed and task.terminal_status is None
-        ]
-        queued_count = sum(1 for qs in queued_statuses if qs is not None)
-        running_summary = (
-            f"{max(0, pending_count - queued_count)} running, {queued_count} queued (排队中)"
-            if queued_count > 0
-            else f"{pending_count} running"
-        )
-        header = (
-            f"**Background Tasks** ({len(all_tasks)} total: "
-            f"{completed_count} completed, {running_summary})\n\n"
-        )
-        return pending_count > 0, header + "".join(entry for _, entry in entries)
+        task_id = bare_task_id(task_id) or ""
+        # A workflow's own children stay addressable here by id: their results
+        # belong to the driver, but this is the drill-in.
+        task = await registry.get_by_task_id(task_id)
+        if not task:
+            return await _missing_task_reply(registry, task_id)
+        return await _task_reply(registry, task)
 
     return StructuredTool.from_function(
         name="TaskOutput",
@@ -618,6 +574,8 @@ def _format_task_progress(task: BackgroundTask, queued_status: Any = None) -> st
 
     return (
         f"### {task.display_id}: {task.subagent_type}\n"
+        # Only a task still running is shown as progress; a settled one shows
+        # its result or its notice instead.
         f"  Status: {status} | Elapsed: {elapsed:.1f}s{tool_summary}{activity}{staleness}\n"
         f"  Task: {task.description[:100]}{'...' if len(task.description) > 100 else ''}"
     )

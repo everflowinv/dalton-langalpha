@@ -3,7 +3,7 @@ import { MemoryRouter } from 'react-router';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import i18n from '@/i18n';
-import { CompanyOverviewCard } from '../MarketDataCharts';
+import { CompanyOverviewCard } from '../CompanyOverviewDetail';
 import type { CompanyOverviewArtifact } from '@/lib/quotes/overview';
 
 // Neutral placeholder names and fabricated numbers; `^GSPC` is a public
@@ -47,8 +47,10 @@ describe('CompanyOverviewCard', () => {
     renderCard(INDEX_OVERVIEW);
 
     expect(screen.getByText('5,812.34')).toBeInTheDocument();
-    expect(screen.getByText('+12.30 (+0.21%)')).toBeInTheDocument();
-    expect(screen.getByText('4,950.20 - 5,880.75')).toBeInTheDocument();
+    expect(screen.getByText('+12.30')).toBeInTheDocument();
+    expect(screen.getByText('0.21%')).toBeInTheDocument();
+    expect(screen.getByText('4,950.20')).toBeInTheDocument();
+    expect(screen.getByText('5,880.75')).toBeInTheDocument();
     expect(screen.queryAllByText(/\$/)).toHaveLength(0);
     expect(screen.getByText('S&P 500')).toBeInTheDocument();
     expect(screen.getAllByText('^GSPC')).toHaveLength(1);
@@ -58,13 +60,15 @@ describe('CompanyOverviewCard', () => {
     renderCard(EQUITY_OVERVIEW);
 
     expect(screen.getByText('$100.00')).toBeInTheDocument();
-    expect(screen.getByText('+$2.00 (+2.04%)')).toBeInTheDocument();
+    expect(screen.getByText('+$2.00')).toBeInTheDocument();
+    expect(screen.getByText('2.04%')).toBeInTheDocument();
     expect(screen.getByText('$102.50')).toBeInTheDocument();
-    expect(screen.getByText('+$2.50 (+2.50%)')).toBeInTheDocument();
-    expect(screen.getByText('12.35M')).toBeInTheDocument();
+    expect(screen.getByText('+$2.50')).toBeInTheDocument();
+    expect(screen.getByText('2.50%')).toBeInTheDocument();
+    expect(screen.getByText('12.3M')).toBeInTheDocument();
     expect(screen.getByText('9.87B')).toBeInTheDocument();
 
     await act(() => i18n.changeLanguage('zh-CN'));
-    expect(screen.getByText('1234.57万')).toBeInTheDocument();
+    expect(screen.getByText('1234.6万')).toBeInTheDocument();
   });
 });

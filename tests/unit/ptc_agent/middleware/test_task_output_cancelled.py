@@ -360,7 +360,7 @@ async def test_a_run_stopped_at_its_clock_reads_as_a_timeout_from_the_ledger():
 # ---------------------------------------------------------------------------
 
 
-def _read(tool, task_id=None) -> ToolMessage:
+def _read(tool, task_id) -> ToolMessage:
     call = {"name": "TaskOutput", "args": {"task_id": task_id}, "id": "c1", "type": "tool_call"}
     return tool.ainvoke(call)
 
@@ -385,28 +385,6 @@ async def test_a_read_of_a_running_task_is_marked_pending_and_its_text_is_unchan
     task.result = {"success": True, "result": "Paris is the capital."}
     task.terminal_status = "completed"
     assert not is_pending_read(await _read(tool, task.task_id))
-
-
-@pytest.mark.asyncio
-async def test_the_listing_is_pending_while_any_task_runs():
-    registry = BackgroundTaskRegistry(thread_id="")
-    done = await registry.register(
-        tool_call_id="tc-1", description="d", prompt="p", subagent_type="research"
-    )
-    done.result = {"success": True, "result": "Paris is the capital."}
-    done.terminal_status = "completed"
-    live = await registry.register(
-        tool_call_id="tc-2", description="d", prompt="p", subagent_type="research"
-    )
-    middleware = MagicMock()
-    middleware.registry = registry
-    tool = create_task_output_tool(middleware)
-
-    assert is_pending_read(await _read(tool))
-
-    live.result = {"success": True, "result": "Lyon is not."}
-    live.terminal_status = "completed"
-    assert not is_pending_read(await _read(tool))
 
 
 @pytest.mark.asyncio

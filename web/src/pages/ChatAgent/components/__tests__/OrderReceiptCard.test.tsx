@@ -195,12 +195,16 @@ describe('OrderReceiptCard', () => {
   it.each(STATUSES)('names a verdict for %s', (status) => {
     renderWithProviders(<OrderReceiptCard artifact={artifactWith({ status })} />);
 
-    const pill = screen.getByTestId(`order-status-${status}`);
-    const key = pill.textContent || '';
-    // A sentence from the catalog, never the wire value: the card is the only
-    // place a person reads what happened to their order.
-    expect(key).toMatch(/^toolArtifact\.directTool\.orderStatus\./);
+    // A word from the catalog on the card's edge and the sentence under the
+    // order, never the wire value: the card is the only place a person reads
+    // what happened to their order. (`t` echoes keys here, so the sentence
+    // never reads as the word again and is always drawn.)
+    const key = screen.getByTestId(`order-status-${status}`).textContent || '';
+    expect(key).toMatch(/^toolArtifact\.directTool\.orderStatusShort\./);
     expect(typeof lookup(enUS, key)).toBe('string');
+    const sentence = screen.getByTestId('order-status-sentence').textContent || '';
+    expect(sentence).toMatch(/^toolArtifact\.directTool\.orderStatus\./);
+    expect(typeof lookup(enUS, sentence)).toBe('string');
   });
 
   it('gives each status its own verdict', () => {
@@ -223,8 +227,9 @@ describe('OrderReceiptCard', () => {
     expect(card).toHaveTextContent('plugins.detail.orderModePaper');
     expect(card).toHaveTextContent('moomoo · ••••4567');
     expect(card).not.toHaveTextContent('1234567');
-    // The side is a word, not a colour.
-    expect(screen.getByTestId('order-headline')).toHaveTextContent('orders.side.buy AAPL');
+    // The side is a word, not a colour, and the size sits between it and what
+    // is traded, as a ticket reads.
+    expect(screen.getByTestId('order-headline')).toHaveTextContent('orders.side.buy 1 AAPL');
   });
 
   // The card is a settled record, so it opens the call like every other card
@@ -241,21 +246,23 @@ describe('OrderReceiptCard', () => {
     expect(onClick).toHaveBeenCalledTimes(1);
   });
 
-  it('opens the call from the keyboard, and leaves keys on its links to them', () => {
+  // The title is the card's one control, a native button, so a keyboard opens
+  // it as a click does. The card is not a button itself: it holds links.
+  it('opens the call from its title button, and leaves its links to themselves', () => {
     const onClick = vi.fn();
     renderWithProviders(
       <OrderReceiptCard artifact={artifactWith({ status: 'submitted' })} onClick={onClick} />,
     );
     const card = screen.getByTestId('order-receipt');
-    expect(card).toHaveAttribute('role', 'button');
-    expect(card).toHaveAttribute('tabindex', '0');
+    expect(card).not.toHaveAttribute('role');
+    const title = card.querySelector('button.term-card-title');
+    expect(title).not.toBeNull();
 
-    fireEvent.keyDown(screen.getByRole('link'), { key: 'Enter' });
+    fireEvent.click(screen.getByRole('link'));
     expect(onClick).not.toHaveBeenCalled();
 
-    fireEvent.keyDown(card, { key: 'Enter' });
-    fireEvent.keyDown(card, { key: ' ' });
-    expect(onClick).toHaveBeenCalledTimes(2);
+    fireEvent.click(title!);
+    expect(onClick).toHaveBeenCalledTimes(1);
   });
 
   it('is not a control when nothing opens it', () => {
@@ -263,6 +270,7 @@ describe('OrderReceiptCard', () => {
     const card = screen.getByTestId('order-receipt');
     expect(card).not.toHaveAttribute('role');
     expect(card).not.toHaveAttribute('tabindex');
+    expect(card.querySelector('button.term-card-title')).toBeNull();
   });
 
   it('shows the vendor order id, the fills and the fees when there are any', () => {
@@ -278,16 +286,18 @@ describe('OrderReceiptCard', () => {
       />,
     );
 
-    const card = screen.getByTestId('order-receipt');
-    expect(card).toHaveTextContent('900101');
+    // The fill's figures sit in the grid with the order's; its sentence under it.
+    const figures = within(screen.getByTestId('order-figures'));
+    expect(figures.getByText('toolArtifact.directTool.orderOutcome.orderId')).toBeInTheDocument();
+    expect(figures.getByText('900101')).toBeInTheDocument();
+    expect(figures.getByText('toolArtifact.directTool.orderTerm.avgFill')).toBeInTheDocument();
+    expect(figures.getByText('49.50')).toBeInTheDocument();
+    expect(figures.getByText('toolArtifact.directTool.orderOutcome.fees')).toBeInTheDocument();
+    expect(figures.getByText('$0.99')).toBeInTheDocument();
     expect(screen.getByTestId('order-fill')).toHaveTextContent(
-      'toolArtifact.directTool.orderOutcome.avgFillPrice 49.50',
-    );
-    expect(screen.getByTestId('order-fill')).toHaveTextContent(
-      'toolArtifact.directTool.orderOutcome.fees $0.99',
+      'toolArtifact.directTool.orderOutcome.filledOf',
     );
     // What has filled so far is the total, while the order is still open.
-    const figures = within(screen.getByTestId('order-figures'));
     expect(figures.getByText('toolArtifact.directTool.orderTotal.partial')).toBeInTheDocument();
     expect(figures.getByText('198.00')).toBeInTheDocument();
   });
@@ -328,8 +338,8 @@ describe('OrderReceiptCard', () => {
     const card = screen.getByTestId('order-receipt');
     expect(card).not.toHaveTextContent('49.5');
     expect(card).not.toHaveTextContent('0.99');
-    // The size, the limit and the total.
-    expect(within(screen.getByTestId('order-figures')).getAllByText(HIDDEN)).toHaveLength(3);
+    // The size, the limit, the total and the fees.
+    expect(within(screen.getByTestId('order-figures')).getAllByText(HIDDEN)).toHaveLength(4);
     expect(screen.getByTestId('order-fill')).toHaveTextContent(
       `toolArtifact.directTool.orderOutcome.fill ${HIDDEN}`,
     );
@@ -359,7 +369,7 @@ describe('OrderReceiptCard', () => {
     renderWithProviders(<OrderReceiptCard artifact={artifact} />);
 
     expect(screen.getByTestId('order-headline')).toHaveTextContent(
-      'orders.side.buy AAPL 2026-11-20 250 orders.optionRight.C',
+      'orders.side.buy 1 AAPL 2026-11-20 250 orders.optionRight.C',
     );
     expect(screen.getByTestId('order-receipt')).toHaveTextContent('orders.session.rth');
   });
@@ -647,6 +657,9 @@ describe('what a staged order says it is waiting on', () => {
     renderWithProviders(<OrderReceiptCard artifact={stagedArtifact()} />);
 
     expect(screen.getByTestId('order-status-submitted')).toHaveTextContent(
+      'toolArtifact.directTool.orderStatusShort.submittedStaged',
+    );
+    expect(screen.getByTestId('order-status-sentence')).toHaveTextContent(
       'toolArtifact.directTool.orderStatus.submittedStaged',
     );
   });
@@ -655,19 +668,18 @@ describe('what a staged order says it is waiting on', () => {
   // the broker really was sent.
   it('leaves every other mode alone', () => {
     renderWithProviders(<OrderReceiptCard artifact={artifactWith({ status: 'submitted' })} />);
-    expect(screen.getByTestId('order-status-submitted')).toHaveTextContent(
+    expect(screen.getByTestId('order-status-sentence')).toHaveTextContent(
       'toolArtifact.directTool.orderStatus.submitted',
     );
-    expect(screen.getByTestId('order-status-submitted')).not.toHaveTextContent(
-      'Staged',
-    );
+    expect(screen.getByTestId('order-receipt')).not.toHaveTextContent('Staged');
   });
 
   it('says a handed-off instruction left the broker, not that it was sent', () => {
     shipped.brokerages = [{ name: 'ibkr', label: 'Interactive Brokers' }];
     renderWithProviders(<OrderReceiptCard artifact={stagedArtifact('handed_off')} />);
 
-    expect(screen.getByTestId('order-status-handed_off')).toHaveTextContent(
+    expect(screen.getByTestId('order-status-handed_off')).toBeInTheDocument();
+    expect(screen.getByTestId('order-status-sentence')).toHaveTextContent(
       'toolArtifact.directTool.orderStatus.handedOffStaged',
     );
   });
@@ -675,6 +687,9 @@ describe('what a staged order says it is waiting on', () => {
   it('changes no other staged state', () => {
     renderWithProviders(<OrderReceiptCard artifact={stagedArtifact('cancelled')} />);
     expect(screen.getByTestId('order-status-cancelled')).toHaveTextContent(
+      'toolArtifact.directTool.orderStatusShort.cancelled',
+    );
+    expect(screen.getByTestId('order-status-sentence')).toHaveTextContent(
       'toolArtifact.directTool.orderStatus.cancelled',
     );
   });

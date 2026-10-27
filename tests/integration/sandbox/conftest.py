@@ -360,7 +360,7 @@ async def sandbox_runtime(sandbox_provider) -> SandboxRuntime:
     """A fresh runtime per test, with guaranteed cleanup.
 
     Use for tests that stop/start/delete the sandbox.
-    For read-only tests (exec, code_run, file_io), prefer ``shared_runtime``
+    For read-only tests (exec, file_io), prefer ``shared_runtime``
     which reuses one container across the class -- much faster on Docker.
     """
     runtime = await sandbox_provider.create(env_vars={"TEST_VAR": "hello"})

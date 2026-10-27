@@ -24,7 +24,6 @@ from ptc_agent.config.core import (
     SecurityConfig,
 )
 from ptc_agent.core.sandbox.runtime import (
-    CodeRunResult,
     ExecResult,
     RuntimeState,
     SandboxHostUnavailableError,
@@ -65,7 +64,6 @@ def mock_runtime():
     runtime.list_files = AsyncMock(
         return_value=[{"name": "file.txt", "is_dir": False}]
     )
-    runtime.code_run = AsyncMock(return_value=CodeRunResult("result", "", 0, []))
     runtime.get_state = AsyncMock(return_value=RuntimeState.RUNNING)
     runtime.start = AsyncMock()
     runtime.stop = AsyncMock()

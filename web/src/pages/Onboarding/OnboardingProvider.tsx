@@ -13,6 +13,7 @@ import { useLocation, useNavigate } from 'react-router';
 import { useUser } from '@/hooks/useUser';
 import { useWorkspaces } from '@/hooks/useWorkspaces';
 import { useIsMobile } from '@/hooks/useIsMobile';
+import { isDesktopShell } from '@/lib/desktop';
 import {
   isPersonalizationSnoozed,
   subscribePersonalizationSnooze,
@@ -21,16 +22,17 @@ import { isPlatformMode } from '@/config/hostMode';
 import { isDaltonBuild } from '@/config/brand'; // DALTON-HOOK(hide-trading)
 import { useOnboardingPrefs } from './useOnboardingPrefs';
 import { useFirstTurnThread } from './useFirstTurnThread';
+import { useThisMacTask } from './useThisMacTask';
 import { shouldAutoOpenWelcome } from './welcome/autoOpen';
 import { WELCOME_PATH, isLegacyOnboardingSearch, legacyOnboardingTarget } from './welcome/paths';
 import { readMirror, type OnboardingMirror } from './mirror';
-import { ANNOUNCEMENTS, DEPLOYED_INTROS, DEPLOYED_TASKS } from './registry';
+import { ANNOUNCEMENTS, DEPLOYED_INTROS, DEPLOYED_TASKS, GETTING_STARTED_TASKS } from './registry';
 import { unseenReleases, latestReleaseVersion } from './engine/whatsNew';
 import {
   useOnboardingOrchestrator,
   type OnboardingPhase,
 } from './engine/useOnboardingOrchestrator';
-import type { AnnouncementDef, GettingStartedTaskDef, PageIntroDef } from './registry';
+import type { AnnouncementDef, DoneSignal, GettingStartedTaskDef, PageIntroDef } from './registry';
 
 export interface GettingStartedTaskState {
   def: GettingStartedTaskDef;
@@ -324,30 +326,42 @@ export function OnboardingProvider({ children }: { children: ReactNode }) {
     }
   }, [isLoading, pathname, search, prefs, markTaskDone]);
 
-  // "Create a workspace": any workspace other than Home exists. An
-  // independent lightweight probe (limit:1 keys its own cache entry, distinct
-  // from the gallery's limit:20); only fetched while the list needs it, and
-  // stamped once true so later sessions skip the lookup.
-  const workspaceStamped = prefs.gettingStartedDoneAt['createWorkspace'] != null;
+  // Derived signals. The workspace probe is its own lightweight query (limit:1
+  // keys its own cache entry, distinct from the gallery's limit:20), and it and
+  // this Mac's reads run only while their task is still open: once true, a
+  // signal is stamped, so later sessions skip the lookup.
+  const listShown = !isLoading && prefs.gettingStartedDismissedAt === null;
+  const stamped = (id: string) => prefs.gettingStartedDoneAt[id] != null;
   const { data: workspacesData } = useWorkspaces({
     limit: 1,
-    enabled: !isLoading && prefs.gettingStartedDismissedAt === null && !workspaceStamped,
+    enabled: listShown && !stamped('createWorkspace'),
   });
-  const hasWorkspace =
-    (workspacesData?.workspaces?.length ?? 0) > 0;
+  const thisMac = useThisMacTask(listShown && !stamped('remoteControl'));
+  const signals: Record<DoneSignal, boolean> = {
+    hasWorkspace: (workspacesData?.workspaces?.length ?? 0) > 0,
+    onboardingCompleted,
+    thisMacAdded: thisMac.added,
+    inDesktopApp: !isLoading && isDesktopShell(),
+  };
   useEffect(() => {
-    if (hasWorkspace && !workspaceStamped) markTaskDone('createWorkspace');
-  }, [hasWorkspace, workspaceStamped, markTaskDone]);
+    // Every task, not only this app's: the desktop app stamps the task to get
+    // it, which only a browser's list shows.
+    for (const task of GETTING_STARTED_TASKS) {
+      // A saved profile is read live from the user row, so a reset un-checks it.
+      if (!task.doneWhen || task.doneWhen === 'onboardingCompleted' || !signals[task.doneWhen]) continue;
+      if (prefs.gettingStartedDoneAt[task.id] == null) markTaskDone(task.id);
+    }
+  }, [signals, prefs, markTaskDone]);
 
   const gettingStarted = useMemo<GettingStartedState>(() => {
-    const tasks = DEPLOYED_TASKS.map((def) => ({
+    // This Mac's task shows where this Mac can be a computer, and stays once done.
+    const offered = DEPLOYED_TASKS.filter((def) => def.offeredOn !== 'thisMac' || thisMac.offered || stamped(def.id));
+    const tasks = offered.map((def) => ({
       def,
       done:
-        // Live from the user row, never stamped, so a profile reset un-checks it.
         def.doneWhen === 'onboardingCompleted'
           ? onboardingCompleted
-          : prefs.gettingStartedDoneAt[def.id] != null ||
-            (def.doneWhen === 'hasWorkspace' && hasWorkspace),
+          : stamped(def.id) || (!!def.doneWhen && signals[def.doneWhen]),
     }));
     const doneCount = tasks.filter((t) => t.done).length;
     return {
@@ -363,7 +377,7 @@ export function OnboardingProvider({ children }: { children: ReactNode }) {
       dismiss: dismissGettingStarted,
       completeTask: markTaskDone,
     };
-  }, [prefs, onboardingCompleted, hasWorkspace, isLoading, inWelcomeChat, dismissGettingStarted, markTaskDone]);
+  }, [prefs, onboardingCompleted, signals, thisMac.offered, isLoading, inWelcomeChat, dismissGettingStarted, markTaskDone]);
 
   useOnboardingOrchestrator({
     isLoading,

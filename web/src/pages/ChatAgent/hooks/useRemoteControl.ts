@@ -21,7 +21,7 @@ import {
 import { queryKeys } from '@/lib/queryKeys';
 import type { Computer, ComputerProvidersResponse } from '@/types/api';
 
-import { CREATE_COMPUTER_MUTATION_KEY, fetchComputerList } from './useComputers';
+import { CREATE_COMPUTER_MUTATION_KEY, fetchComputerList, useComputerProviders, useComputers } from './useComputers';
 
 /**
  * How often the status is read again while a computer surface shows it.
@@ -30,15 +30,19 @@ import { CREATE_COMPUTER_MUTATION_KEY, fetchComputerList } from './useComputers'
  */
 export const REMOTE_CONTROL_POLL_MS = 10_000;
 
-/** The helper's status, read only in a shell that can turn it on and off; null when the shell gave no answer. */
-export function useRemoteControl(options: { enabled: boolean }) {
+/**
+ * The helper's status, read only in a shell that can turn it on and off; null
+ * when the shell gave no answer. `poll: false` for a reader that needs no
+ * pause noticed (it still sees what a polling reader of the same key reads).
+ */
+export function useRemoteControl(options: { enabled: boolean; poll?: boolean }) {
   return useQuery({
     queryKey: queryKeys.desktop.remoteControl(),
     queryFn: getRemoteControl,
     enabled: options.enabled && canRemoteControl(),
     staleTime: 0,
     retry: false,
-    refetchInterval: REMOTE_CONTROL_POLL_MS,
+    refetchInterval: options.poll === false ? false : REMOTE_CONTROL_POLL_MS,
   });
 }
 
@@ -77,8 +81,29 @@ export function remoteControlOffered(
   status: RemoteControlStatus | null | undefined,
   providers: ComputerProvidersResponse | undefined,
 ): boolean {
+  return !!status?.supported && serverTakesRemoteControl(providers);
+}
+
+/** The server's half: it takes SSH computers, and runs the tunnel gateway a helper connects out to. */
+export function serverTakesRemoteControl(providers: ComputerProvidersResponse | undefined): boolean {
   const ssh = providers?.providers.find((p) => p.kind === 'ssh');
-  return !!status?.supported && !!ssh && ssh.allowed !== false && providers?.tunnels === true;
+  return !!ssh && ssh.allowed !== false && providers?.tunnels === true;
+}
+
+/**
+ * Whether this Mac is offered as a computer here, and whether a computer
+ * already is it: undefined while the list that says so is still loading.
+ * Read only while `enabled`, and each read waits on the one before, so a
+ * browser, or a Mac the helper cannot run on, asks the server nothing.
+ * `poll: false` as for `useRemoteControl`.
+ */
+export function useThisMacAvailability(options: { enabled: boolean; poll?: boolean }) {
+  const { data: status } = useRemoteControl(options);
+  const { data: providers } = useComputerProviders({ enabled: options.enabled && !!status?.supported });
+  const offered = options.enabled && remoteControlOffered(status, providers);
+  const { data: list } = useComputers({ enabled: offered });
+  const added = !offered ? false : list?.computers.some((c) => isThisMac(c, status?.fingerprint));
+  return { offered, added, status };
 }
 
 /**

@@ -1240,6 +1240,7 @@ async def test_clearing_a_deleted_workspace_runs_the_real_script(root, monkeypat
     monkeypatch.setattr(_folders, "retarget_folder_cleanup", retarget)
     monkeypatch.setattr(_folders, "get_workspace_dir_name", AsyncMock(return_value="Research"))
     monkeypatch.setattr(_folders, "computer_run_in_progress", AsyncMock(return_value=False))
+    monkeypatch.setattr(_folders, "computer_command_running", AsyncMock(return_value=False))
     monkeypatch.setattr(_folders, "hold_workspace_folder", AsyncMock(return_value=True))
     _folder(root, "Research", "dead")
     moved = await _folders.FolderSettleMixin._clear_tombstone_folder(
@@ -1266,6 +1267,7 @@ async def test_a_deleted_workspace_a_file_change_holds_is_not_cleared_yet(root, 
     monkeypatch.setattr(_folders, "workspace_folders_lock", lock)
     monkeypatch.setattr(_folders, "get_workspace_dir_name", AsyncMock(return_value="Research"))
     monkeypatch.setattr(_folders, "computer_run_in_progress", AsyncMock(return_value=False))
+    monkeypatch.setattr(_folders, "computer_command_running", AsyncMock(return_value=False))
     monkeypatch.setattr(_folders, "hold_workspace_folder", AsyncMock(return_value=False))
     _folder(root, "Research", "dead")
     runtime = _SubprocessRuntime()
@@ -1278,9 +1280,11 @@ async def test_a_deleted_workspace_a_file_change_holds_is_not_cleared_yet(root, 
 
 
 @pytest.mark.asyncio
-async def test_a_deleted_workspace_is_not_cleared_while_a_sibling_runs(root, monkeypatch):
-    """A sibling's code may still write ../Research; moving it now would let
-    that write recreate the name for the next workspace to take it."""
+@pytest.mark.parametrize("busy", ["computer_run_in_progress", "computer_command_running"])
+async def test_a_deleted_workspace_is_not_cleared_while_a_sibling_runs(root, monkeypatch, busy):
+    """A sibling's code may still write ../Research, from a run or a command
+    handed off past its turn; moving it now would let that write recreate the
+    name for the next workspace to take it."""
     from contextlib import asynccontextmanager
     from unittest.mock import AsyncMock
 
@@ -1293,7 +1297,9 @@ async def test_a_deleted_workspace_is_not_cleared_while_a_sibling_runs(root, mon
     hold = AsyncMock(return_value=True)
     monkeypatch.setattr(_folders, "workspace_folders_lock", lock)
     monkeypatch.setattr(_folders, "get_workspace_dir_name", AsyncMock(return_value="Research"))
-    monkeypatch.setattr(_folders, "computer_run_in_progress", AsyncMock(return_value=True))
+    monkeypatch.setattr(_folders, "computer_run_in_progress", AsyncMock(return_value=False))
+    monkeypatch.setattr(_folders, "computer_command_running", AsyncMock(return_value=False))
+    monkeypatch.setattr(_folders, busy, AsyncMock(return_value=True))
     monkeypatch.setattr(_folders, "hold_workspace_folder", hold)
     _folder(root, "Research", "dead")
     runtime = _SubprocessRuntime()

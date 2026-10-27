@@ -21,9 +21,11 @@ interface MachineSummaryProps {
   isThisMac: boolean;
   /** Makes the name a button that opens the Computers dialog on this machine. */
   onOpen?: (computerId: string) => void;
+  /** Leaves the badge's words out, for a line short of room; its glyph still says the kind. */
+  compact?: boolean;
 }
 
-export function MachineSummary({ computer, isThisMac, onOpen }: MachineSummaryProps) {
+export function MachineSummary({ computer, isThisMac, onOpen, compact = false }: MachineSummaryProps) {
   const { t } = useTranslation();
   const preparing = isComputerPreparing(computer);
   const running = computer.status === 'running' && !preparing;
@@ -58,7 +60,7 @@ export function MachineSummary({ computer, isThisMac, onOpen }: MachineSummaryPr
       ) : (
         <span className="flex min-w-0 items-center gap-1.5">{name}</span>
       )}
-      <ComputerBadge computer={computer} isThisMac={isThisMac} name={computer.name} variant="plain" />
+      {!compact && <ComputerBadge computer={computer} isThisMac={isThisMac} name={computer.name} variant="plain" />}
       {!running && (
         <>
           <span aria-hidden="true">·</span>

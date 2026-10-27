@@ -332,6 +332,7 @@ class TestMintingAComputer(_Base):
             resource_tier="performance",
             root_dir="/home/workspace",
             provider_config=None,
+            config=None,
             files_backup=True,
         )
 

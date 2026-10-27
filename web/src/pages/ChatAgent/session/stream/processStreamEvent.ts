@@ -12,7 +12,7 @@ import { noteLiveRun } from '../latestRun';
 import type { StructuredError } from '@/utils/rateLimitError';
 import { applyAnnotationArtifact } from '@/pages/MarketView/stores/chartAnnotationStore';
 import type { AssistantMessage, ChatMessage } from '@/types/chat';
-import { CREDIT_STOP_ERROR_TYPE, isDeliveredNotice, isDeliveredSteer } from '@/types/sse';
+import { CREDIT_STOP_ERROR_TYPE, isDeliveredNotice, isDeliveredReport, isDeliveredSteer } from '@/types/sse';
 import { setStoredThreadId } from '../../hooks/utils/threadStorage';
 import { createAssistantMessage, updateMessage } from '../../hooks/utils/messageHelpers';
 import { turnOf } from '../../components/messageList/turnProjection';
@@ -53,13 +53,15 @@ import type { StreamRuntime } from '../runtime';
 import { preapprovedReportBack } from '../../utils/preapprovedCards';
 import { dispatchResultFields } from '../../utils/dispatchResult';
 
-type RefreshOnResult = 'refreshMarketWatch' | 'refreshWakeups';
+type RefreshOnResult = 'refreshMarketWatch' | 'refreshWakeups' | 'refreshCommands';
 
 /** The tools whose result is when the chip and the Status panel re-read what
  *  the call changed, rather than at turn end. */
 const REFRESH_ON_RESULT = new Map<string, RefreshOnResult>([
   ['watch_market', 'refreshMarketWatch'],
   [SCHEDULE_WAKEUP, 'refreshWakeups'],
+  // A status read can stop a command.
+  ['ThreadStatus', 'refreshCommands'],
 ]);
 
 export interface StreamRouterDeps {
@@ -76,11 +78,15 @@ export interface StreamRouterDeps {
   /** Re-read the thread's wakeups, after one fired or the agent set or
    * cancelled some. */
   refreshWakeups: () => void;
+  /** Re-read the thread's background commands, after one moved to the
+   * background, was stopped, or reported its end. */
+  refreshCommands: () => void;
   /** Re-read the workspace row, whose folder a run's sandbox acquisition may
    * have moved; null with no workspace. */
   refreshWorkspaceFolder: (() => void) | null;
-  /** Watch this thread for a hand-off's report-back. */
-  armReportBack: () => void;
+  /** Watch this thread for a hand-off's report-back; `owed` as the watch's
+   *  arm takes it (null arms without touching the tip). */
+  armReportBack: (owed?: boolean | null) => void;
   /** Re-read the user's workspaces after an agent changed one. */
   refreshWorkspaces: () => void;
   /** Hears the turn the server admitted the run to, before the run's bubbles
@@ -222,6 +228,8 @@ export const createStreamEventProcessor = (rt: StreamRuntime, deps: StreamRouter
           const { run_id: runId, report_source: source, turn_index: turn } = event;
           const beforeId = rt.currentMessageRef.current;
           rt.setMessages((prev) => withLiveReportRow(prev, runId, source, beforeId, turn));
+          // The command it reports on has ended, which its tool card shows.
+          if (source.kind === 'command_report') deps.refreshCommands();
         } else {
           // A wake, attached live, draws its opener row from this frame,
           // keyed on the turn as replay keys it, so a later load replaces it
@@ -353,6 +361,10 @@ export const createStreamEventProcessor = (rt: StreamRuntime, deps: StreamRouter
       // A delivered alert or wakeup moved its wakeup on the server, which the
       // chip and the Status panel show.
       if (entries.some(isDeliveredNotice)) deps.refreshWakeups();
+      // A command's report taken into the turn: the command has ended.
+      if (entries.some((entry) => isDeliveredReport(entry) && entry.report_source.kind === 'command_report')) {
+        deps.refreshCommands();
+      }
 
       // 1. Roll back old assistant message to the snapshot taken at steering_accepted
       //    time, removing any content that leaked due to stream-mode multiplexing.
@@ -1069,6 +1081,14 @@ export const createStreamEventProcessor = (rt: StreamRuntime, deps: StreamRouter
       if (event.artifact?.task_id && toolCallId) {
         const agentId = `task:${event.artifact.task_id}`;
         rt.subagentHistory.toolCalls.set(toolCallId, agentId);
+      }
+      // A call that moved its command to the background, or started one
+      // there, names it on its artifact. Its end can start a turn of its own,
+      // which the report-back watch attaches in place, so the watch is armed
+      // too; it owes nothing the tray names, since the command's row is there.
+      if (event.artifact?.command_id) {
+        deps.refreshCommands();
+        deps.armReportBack(null);
       }
 
       handleToolCallResult({

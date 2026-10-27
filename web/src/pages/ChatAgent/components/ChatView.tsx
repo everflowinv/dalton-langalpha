@@ -72,6 +72,8 @@ import SubagentStatusBar from './SubagentStatusBar';
 import TodoDrawer from './TodoDrawer';
 import { ComposerTray, ReconnectingChip, TrayDock } from './chatView/ComposerTray';
 import { useTrayContents } from './chatView/useTrayContents';
+import { useThreadCommands } from '../hooks/useCommands';
+import { ThreadCommandsContext } from './commands/threadCommandsContext';
 import { useTrayFold } from './chatView/useTrayFold';
 import { ErrorBanner } from '@/components/ui/error-banner';
 import { motion, AnimatePresence, type PanInfo } from '@/lib/framer';
@@ -327,6 +329,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     awaitingReportBack,
     reportBackOwed,
     reportBackOwedThreads,
+    reportBackOwedKinds,
     workspaceStarting,
     turnHeld,
     isCompacting,
@@ -978,8 +981,12 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
   // tray folds into the composer's toolbar, on the jump-to-latest pill's
   // signal and until the pill's glide to the end has landed. Clicking the
   // folded dock pours it back out where the reader is, until they scroll on.
+  // The thread's background commands, read once here for the tray and the
+  // tool cards, which watch this read in the cache.
+  const commands = useThreadCommands(panelThreadId, isActive);
   const trayContents = useTrayContents({
     marketWatch,
+    commands,
     threadId: panelThreadId ?? null,
     isActive,
     cards,
@@ -989,6 +996,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     hasActiveSubagents,
     reportBackOwed,
     owedThreads: reportBackOwedThreads,
+    owedKinds: reportBackOwedKinds,
     isHome,
   });
   // A roster task the page only knows from history or its report has no card
@@ -1427,6 +1435,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
         panel's own exits do. */}
     <RouteLeaveGuardContext value={leaveFiles}>
     <ShareLinkOpenerContext value={handleOpenShareLink}>
+    <ThreadCommandsContext value={panelThreadId ?? null}>
     {/* `h-full`, never `h-screen`: this fills the shell's content column, which
         is the viewport only when nothing else is in it. Pinning it to 100vh
         pushes it out of its own box the moment anything is (the offline
@@ -1803,6 +1812,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                         from={dispatcherContext}
                         onOpenTask={openTaskFromTray}
                         onOpenWatch={handleOpenStatusFromChat}
+                        onOpenCommand={handleToolCallDetailClick}
                         threadId={panelThreadId ?? null}
                       />
                     )}
@@ -2071,6 +2081,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
       )}
 
     </div>
+    </ThreadCommandsContext>
     </ShareLinkOpenerContext>
     </RouteLeaveGuardContext>
     </WorkspaceProvider>

@@ -1223,21 +1223,6 @@ class TestDockerRuntimeSessions:
             await runtime.session_command_logs("preview-8080", "../etc/passwd")
 
     @pytest.mark.asyncio
-    async def test_delete_session(self, runtime):
-        """delete_session kills process groups and removes directory."""
-        runtime._container.exec = AsyncMock(
-            return_value=_make_exec_mock(exit_code=0)
-        )
-        await runtime.delete_session("preview-8080")
-        call_args = runtime._container.exec.call_args
-        cmd = call_args[1].get("cmd", call_args[0][0] if call_args[0] else None)
-        cmd_str = cmd[-1] if isinstance(cmd, list) else str(cmd)
-        # Kills entire process group (negative PID) and the process itself
-        assert "kill -- -$pid" in cmd_str
-        assert "kill $pid" in cmd_str
-        assert "rm -rf" in cmd_str
-
-    @pytest.mark.asyncio
     async def test_delete_missing_session_raises_not_found(self, runtime):
         """A stop tells "no such command" from a failed delete by this."""
         runtime._container.exec = AsyncMock(return_value=_make_exec_mock(exit_code=3))

@@ -36,6 +36,7 @@ from src.server.database.workspace_folders import (
     MOVING_DIR,
     accepted_landings,
     busy_workspace_ids,
+    computer_command_running,
     computer_run_in_progress,
     hold_workspace_folder,
     is_top_level,
@@ -993,7 +994,9 @@ class FolderSettleMixin:
                 if current not in (None, leftovers_path(workspace_id)):
                     raise RuntimeError(f"deleted workspace now records folder {current!r}")
                 return current
-            if await computer_run_in_progress(conn, computer_id):
+            if await computer_run_in_progress(
+                conn, computer_id
+            ) or await computer_command_running(conn, computer_id):
                 # A sibling's code reaches this folder as ../<folder>; a write
                 # after the move would recreate the name for the next
                 # workspace to take it. The settle defers tombstones the same way.

@@ -94,14 +94,25 @@ export interface GettingStartedTaskDef {
   external?: boolean;
   /** Only offered on the hosted platform (e.g. channel integrations). */
   platformOnly?: boolean;
+  /**
+   * Where else it is offered. `browser`: outside the desktop app. `thisMac`:
+   * in the desktop app on a Mac this server can take as a computer (remote
+   * control), the task kept once done there.
+   */
+  offeredOn?: 'browser' | 'thisMac';
+  /** Opens a surface before following `to`, one the page at `to` shows however it is reached. */
+  open?: () => void;
   /** Auto-completes when a visited location matches (stamped into prefs). */
   visitRoute?: (pathname: string, search: string) => boolean;
   /**
-   * Derived completion signal — live done state without a prefs stamp.
-   * `hasWorkspace`: at least one workspace other than Home exists (stamped
-   * once true so the lookup stops re-running). `onboardingCompleted`: the
-   * user row says the investing profile is saved (never stamped, so a reset
-   * un-checks it).
+   * Derived completion signal, stamped once true so later sessions skip its
+   * lookup; a task with one is not stamped by its click. `hasWorkspace`: a
+   * workspace other than Home exists. `thisMacAdded`: a computer is this Mac.
+   * `inDesktopApp`: the desktop app is open, which the browser's list then
+   * shows too. `onboardingCompleted`: the user row says the investing profile
+   * is saved, never stamped, so a reset un-checks it.
    */
-  doneWhen?: 'hasWorkspace' | 'onboardingCompleted';
+  doneWhen?: DoneSignal;
 }
+
+export type DoneSignal = 'hasWorkspace' | 'onboardingCompleted' | 'thisMacAdded' | 'inDesktopApp';

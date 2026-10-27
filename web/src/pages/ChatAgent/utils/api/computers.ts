@@ -30,6 +30,7 @@ import { streamStatusEvents, type StatusFrame } from './statusStream';
 // Matches the workspace module's bounds: starting a machine legitimately runs
 // tens of seconds, while a read that hangs should surface as a failure.
 const COMPUTER_MUTATION_TIMEOUT_MS = 120000;
+const WORKSPACES_REMOVAL_TIMEOUT_MS = 600000;
 // `du` across every folder on the machine. The server bounds the reading at the
 // exec's 30 s plus a 5 s connect, then answers the stored reading instead of
 // failing; wait past that so a slow machine shows its last reading.
@@ -148,18 +149,40 @@ export async function setComputerSpec(computerId: string, tier: ResourceTier): P
  * became of our key line on an SSH computer's machine (`key`, null for other
  * kinds, for one a helper answers, and when `removeKey` was false).
  * `removeKey` is sent explicitly, so the choice the user saw is the one that
- * is made. It refuses with a 409 whose `detail.code` says why: `primary`,
- * `has_workspaces`, or `busy` (moving between states, being prepared,
- * changing spec, or held by another action).
+ * is made. `deleteWorkspaces` names the workspaces on it to delete first, the
+ * ones the user was shown; one it does not name keeps the computer. They go in
+ * the body, since a computer full of them would overflow a request line limit
+ * in the query, and in the query too while they fit there, for a backend from
+ * before the body and a proxy that drops a DELETE's body. `workspaces_deleted`
+ * answers which went: one moved off it meanwhile still exists.
+ * `deleteFiles`, on an SSH computer, also deletes LangAlpha's files from its
+ * machine, the named workspaces' folders among them. It refuses
+ * with a 409 whose `detail.code` says why: `primary`, `has_workspaces`, or
+ * `busy` (moving between states, being prepared, changing spec, a workspace
+ * moving, or held by another action).
  */
+/** As many ids as a request line keeps well under the 8 KB proxies allow. */
+const QUERY_WORKSPACES_MAX = 30;
+
 export async function deleteComputer(
   computerId: string,
-  { removeKey }: { removeKey: boolean },
+  {
+    removeKey,
+    deleteWorkspaces = [],
+    deleteFiles = false,
+  }: { removeKey: boolean; deleteWorkspaces?: readonly string[]; deleteFiles?: boolean },
 ): Promise<ComputerRemoveResponse> {
   if (!computerId) throw new Error('Computer ID is required');
+  const params = new URLSearchParams({ remove_key: String(removeKey) });
+  if (deleteFiles) params.set('delete_files', 'true');
+  if (deleteWorkspaces.length <= QUERY_WORKSPACES_MAX) {
+    for (const id of deleteWorkspaces) params.append('delete_workspaces', id);
+  }
   const { data } = await api.delete<ComputerRemoveResponse>(`/api/v1/computers/${computerId}`, {
-    params: { remove_key: removeKey },
-    timeout: COMPUTER_MUTATION_TIMEOUT_MS,
+    params,
+    data: { delete_workspaces: deleteWorkspaces },
+    // Each workspace takes a last backup on its way out.
+    timeout: deleteWorkspaces.length ? WORKSPACES_REMOVAL_TIMEOUT_MS : COMPUTER_MUTATION_TIMEOUT_MS,
   });
   return data;
 }

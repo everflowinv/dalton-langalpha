@@ -41,6 +41,7 @@ interface ActivityBlockProps {
 }
 
 const NO_CALLS: readonly PreparingCall[] = [];
+
 const SUMMARY_TEXT: React.CSSProperties = { paddingTop: '5px', paddingBottom: '5px', fontSize: '0.8125rem', color: 'var(--Labels-Tertiary)' };
 
 const ActivityBlock = memo(function ActivityBlock({
@@ -144,7 +145,7 @@ const ActivityBlock = memo(function ActivityBlock({
   }
 
   if (timeline.length === 0 && charts.length === 0 && calls.length === 0) return null;
-  return <div>
+  return <div data-activity-block="">
     {chartGroups.map((group) => group.pill && group.cards.length > 1
       ? <div key={group.key} data-pill-row className={`mb-1.5 ${PILL_ROW_CLASS}`}>{group.cards.map((c) => c.node)}</div>
       : group.cards.map((c) => <div key={c.key} className="mb-1.5">{c.node}</div>))}
@@ -154,7 +155,7 @@ const ActivityBlock = memo(function ActivityBlock({
         by it and then folded in turn, so every fold in a burst moved the page
         twice. */}
     <AnimatePresence initial={status && fresh}>
-      {slot && <LiveRow key="summary" gap="0px" gapBottom={rows.length > 0 ? '8px' : '0px'}>
+      {slot && <LiveRow key="summary" gap="0px" gapBottom={rows.length > 0 ? '8px' : '0px'} calls={slot.calls}>
         {/* The step the block opened on lifts out as the count rises in. */}
         <SwapCell swapKey={slot.kind} riseKey={slot.kind} layerClassName="clips-focus-ring">
           {/* One tree whether the step is running or settled, so a reply
@@ -181,7 +182,8 @@ const ActivityBlock = memo(function ActivityBlock({
         <AnimatePresence initial={fresh}>
           {/* Segment spacing owns the outside gap, and standalone rows already
               have padding. */}
-          {rows.map((row) => <LiveRow key={row.key} gap="0px">
+          {/* A row gives its place to the card its call lands as. */}
+          {rows.map((row) => <LiveRow key={row.key} gap="0px" calls={row.calls}>
             <div role="listitem" data-activity-state={row.live ? 'live' : 'settled'}
               data-status-line={row.kind === 'line' ? '' : undefined}>{rowNode(row)}</div>
           </LiveRow>)}

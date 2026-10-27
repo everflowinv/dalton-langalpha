@@ -27,6 +27,7 @@ have.
 
 import logging
 from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import psycopg
@@ -965,6 +966,39 @@ async def list_thread_tasks(thread_ids: list[str]) -> List[Dict[str, Any]]:
                 (list(thread_ids),),
             )
             return [dict(row) for row in await cur.fetchall()]
+
+
+async def list_reporting_tasks(
+    thread_id: str, *, since: Optional[datetime] = None, task_id: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    """A thread's tasks, each with its latest run, oldest first: by
+    ``task_id`` that one task whatever drives it; otherwise those that report
+    back to the thread, still running or ended at or after ``since``.
+
+    A workflow's own children have no parent run (they report to their
+    driver, never to the thread), so a listing leaves them out."""
+    thread_id = normalize_uuid(thread_id)
+    if thread_id is None:
+        return []
+    async with pool.get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                SELECT t.task_id, t.description, t.subagent_type, r.task_run_id,
+                       r.status, r.started_at, r.finalized_at, r.result_delivered_at,
+                       r.failure->>'error_type' AS error_type
+                FROM subagent_tasks t
+                JOIN subagent_runs r ON r.task_run_id = t.latest_run_id
+                WHERE t.thread_id = %(thread)s
+                  AND (%(task)s::text IS NULL OR t.task_id = %(task)s::text)
+                  AND (%(task)s::text IS NOT NULL OR r.parent_run_id IS NOT NULL)
+                  AND (%(since)s::timestamptz IS NULL OR r.status = 'in_progress'
+                       OR COALESCE(r.finalized_at, r.started_at) >= %(since)s::timestamptz)
+                ORDER BY r.started_at
+                """,
+                {"thread": thread_id, "task": task_id, "since": since},
+            )
+            return [dict(r) for r in await cur.fetchall()]
 
 
 async def get_task(thread_id: str, task_id: str) -> Optional[Dict[str, Any]]:

@@ -206,23 +206,33 @@ class ProviderMixin:
         *,
         runtime: Optional[SandboxRuntime] = None,
     ) -> bool:
+        """``keep_computer_alive`` for the computer a workspace is on. The row
+        is read, never adopted onto a computer, since this runs for traffic
+        rather than for anything the owner asked."""
+        from src.server.database.computer import get_computer_for_workspace
+
+        computer = await get_computer_for_workspace(workspace_id)
+        return await self.keep_computer_alive(computer, sandbox_id, runtime=runtime)
+
+    async def keep_computer_alive(
+        self,
+        computer: Optional[Dict[str, Any]],
+        sandbox_id: str,
+        *,
+        runtime: Optional[SandboxRuntime] = None,
+    ) -> bool:
         """Count use neither the provider nor a turn shows (preview traffic, an
-        open preview's health poll) as activity. False when the computer is not
-        running this sandbox, which then stays as it is.
+        open preview's health poll, a background command) as activity. False
+        when the computer is not running this sandbox, which then stays as it
+        is.
 
         Both clocks are pushed out: the provider's deadline, and the stamp the
         idle sweep reads, which otherwise moves only for turns and would stop
-        a computer someone is using through its preview. Never resumes: the
-        caller's *runtime* when it holds one, else a detached one. The row is
-        read, never adopted onto a computer, since this runs for traffic rather
-        than for anything the owner asked.
+        a computer someone is using. Never resumes: the caller's *runtime*
+        when it holds one, else a detached one.
         """
-        from src.server.database.computer import (
-            get_computer_for_workspace,
-            update_computer_activity,
-        )
+        from src.server.database.computer import update_computer_activity
 
-        computer = await get_computer_for_workspace(workspace_id)
         if (
             computer is None
             or computer.get("status") != ComputerStatus.RUNNING
@@ -233,7 +243,7 @@ class ProviderMixin:
             if runtime is not None:
                 await runtime.note_activity()
             else:
-                binding = self._binding_from_computer(workspace_id, computer)
+                binding = self._binding_from_computer("", computer)
                 async with self._detached_runtime(
                     sandbox_id, binding=binding
                 ) as detached:

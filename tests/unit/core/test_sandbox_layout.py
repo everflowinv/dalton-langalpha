@@ -80,6 +80,7 @@ EXPECTED_ABSOLUTE = {
     "system": "/home/workspace/.system",
     "system_code": "/home/workspace/.system/code",
     "system_trace": "/home/workspace/.system/trace",
+    "system_jobs": "/home/workspace/.system/jobs",
     "internal": "/home/workspace/_internal",
     "internal_src": "/home/workspace/_internal/src",
     "packs": "/home/workspace/_internal/packs",
@@ -115,6 +116,7 @@ EXPECTED_RELATIVE = {
     "SYSTEM_DIR": ".system",
     "SYSTEM_CODE_DIR": ".system/code",
     "SYSTEM_TRACE_DIR": ".system/trace",
+    "SYSTEM_JOBS_DIR": ".system/jobs",
     "INTERNAL_DIR": "_internal",
     "INTERNAL_SRC_DIR": "_internal/src",
     "PACKS_DIR": "_internal/packs",
@@ -124,6 +126,7 @@ EXPECTED_RELATIVE = {
     "EGRESS_RELAY_FILE": "_internal/.egress_relay.json",
     "VAULT_SECRETS_FILE": "_internal/.vault_secrets.json",
     "MCP_CHECK_PREFIX": "_internal/.mcp_check_",
+    "LEFTOVERS_DIR": "_internal/leftovers",
 }
 
 # The workspace tier, relative to the workspace folder rather than the root.

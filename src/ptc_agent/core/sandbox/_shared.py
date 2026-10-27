@@ -6,7 +6,7 @@ import json
 import secrets
 import shlex
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final
 
@@ -80,41 +80,14 @@ TURN_CWD_SANDBOX_NAME = "sitecustomize.py"
 _TURN_CWD_SOURCE = Path(__file__).with_name("turn_cwd_sitecustomize.py")
 #: Names the directory that ``sitecustomize.py`` chdirs into.
 TURN_CWD_ENV = "PTC_TURN_CWD"
-
-
-@dataclass
-class ChartData:
-    """Captured chart from matplotlib execution."""
-
-    type: str
-    title: str
-    png_base64: str | None = None
-    elements: list[Any] = field(default_factory=list)
+#: Names the file ``sitecustomize.py`` writes a code run's own unhandled
+#: exception to, the only text a missing import is read from.
+EXCEPTION_FILE_ENV = "PTC_EXCEPTION_FILE"
 
 
 # The ``failure`` of a code or bash call that hit its time limit, which a tool
 # counts apart from a sandbox that raised.
 SANDBOX_TIMEOUT: Final = "timeout"
-
-
-@dataclass
-class ExecutionResult:
-    """Result of code execution in sandbox."""
-
-    success: bool
-    stdout: str
-    stderr: str
-    duration: float
-    execution_id: str
-    code_hash: str
-    charts: list[ChartData] = field(default_factory=list)
-    mcp_trace: list[dict] = field(default_factory=list)
-    # Set only when the sandbox failed rather than the code: SANDBOX_TIMEOUT,
-    # or the class of what the call raised. A nonzero exit leaves it None, so a
-    # tool can count the sandbox's faults apart from the agent's.
-    failure: str | None = None
-    # The code's exit status; None where the run never produced one.
-    exit_code: int | None = None
 
 
 @dataclass

@@ -1561,6 +1561,9 @@ class WorkspaceBusyError(RuntimeError):
 MOVING_DELETE_REFUSAL = (
     "This workspace is moving to another computer. Delete it once the move finishes."
 )
+ACTIVE_WORK_DELETE_REFUSAL = (
+    "This workspace has active work. Stop it or wait for it to finish before deleting."
+)
 
 
 class WorkspaceMovingError(SandboxTransientError):
@@ -1581,6 +1584,13 @@ async def workspace_is_moving(workspace_id: str, *, conn=None) -> bool:
             f"SELECT {workspace_move_fences('%s')} AS moving", (workspace_id,)
         )
         return bool((await cur.fetchone())["moving"])
+
+
+async def workspace_has_active_work(workspace_id: str) -> bool:
+    """Whether a run is in progress on any of the workspace's threads, which
+    its delete would refuse; read unlocked, for a caller asking before it starts."""
+    async with _ws_cursor() as cur:
+        return await workspace_has_live_runs(cur, workspace_id)
 
 
 async def lock_run_workspace(conn, thread_id: str) -> None:
@@ -1650,9 +1660,7 @@ async def delete_workspace(
                 if bound_to is not None and str((locked or {}).get("computer_id")) != str(bound_to):
                     raise WorkspaceBusyError(MOVING_DELETE_REFUSAL)
                 if await workspace_has_live_runs(cur, workspace_id):
-                    raise WorkspaceBusyError(
-                        "This workspace has active work. Stop it or wait for it to finish before deleting."
-                    )
+                    raise WorkspaceBusyError(ACTIVE_WORK_DELETE_REFUSAL)
                 # A move puts the folder back if it fails, after the delete
                 # would have cleared a folder it found missing.
                 if await workspace_is_moving(workspace_id, conn=owned):

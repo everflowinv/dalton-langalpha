@@ -246,13 +246,27 @@ interface ThreadReportBackStatus {
   // while this list is non-empty an `idle` read must not be taken as drained.
   // Optional: older backends and a dispatching thread's slice omit it.
   active_tasks?: string[];
+  // The thread's background commands still running. Each one's end can start
+  // a turn of its own, so they keep the watch armed, but owe nothing the tray
+  // names: their rows are there. Optional: older backends omit it.
+  active_commands?: string[];
   // The dispatched threads still owed, oldest first; null when the read
   // failed. [] can come with a pending report: a PTC thread's slice names the
   // analysts its hand-offs went to but not its own subagents, and a thread in
   // a deleted workspace or another owner's has no label. Optional: older
   // backends omit it.
   owed_threads?: ReportBackOwedThread[] | null;
+  // Whose reports are owed, so the tray names what it waits on; null when the
+  // read failed. Optional: older backends omit it.
+  owed_report_kinds?: OwedReportKind[] | null;
 }
+
+/** Whose report a thread is owed: a subagent's, a background command's, or
+ *  an Analyst's. */
+export type OwedReportKind = 'task' | 'command' | 'analyst';
+
+/** What a status read in hand says is owed, which an arm seeds the watch with. */
+export type OwedReportsRead = Pick<Partial<ThreadReportBackStatus>, 'owed_threads' | 'owed_report_kinds'>;
 
 /** A dispatched thread that has yet to report back to the thread that sent it. */
 export interface ReportBackOwedThread {

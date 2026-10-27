@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any, Optional
 
 from ptc_agent.core.paths import WorkspaceLayout
 from src.server.database.computer import DEFAULT_ROOT_DIR, get_computer_for_workspace
+from src.server.database.workspace import get_live_workspace_ids_for_computer
 from src.server.database.workspace_file import WorkspaceSyncBusy
 from src.server.database.workspace_folders import WorkspaceFolderMoving
 from src.server.services import transcripts
@@ -350,6 +351,55 @@ class BringUpMixin:
 
             job.task = asyncio.create_task(_run(job))
         job.add(workspace_id, urgent=urgent)
+
+    async def _on_session_attached(
+        self, computer_id: str, session: Any, *, resumed: bool
+    ) -> None:
+        """What a worker owes a machine once it holds a session on it.
+
+        A sandbox brought back with its processes (a provider's pause, an
+        E2B deadline) may still run jobs whose commands are over, so those
+        are ended without holding up the attach. ``resumed``: the machine
+        started again on the sandbox it stopped on, whose disk still holds
+        the threads deleted or gone idle meanwhile, and no worker's attach
+        will look again (projects stay attached across a stop on the same
+        sandbox), so every project's sync is queued too."""
+        if resumed:
+            await self._queue_reconnect_syncs(computer_id, session.sandbox)
+        self.end_stale_jobs_soon(computer_id, session.sandbox)
+
+    async def _queue_reconnect_syncs(self, computer_id: str, sandbox: Any) -> None:
+        """Queue every project on a resumed sandbox; the restore step finds
+        nothing deferred on a warm disk, so each costs only its sync."""
+        for workspace_id in await get_live_workspace_ids_for_computer(computer_id):
+            self._queue_bring_up(
+                computer_id, workspace_id, sandbox, sandbox.working_dir, urgent=False
+            )
+
+    def end_stale_jobs_soon(self, computer_id: str, sandbox: Any) -> None:
+        """End the jobs a machine this worker just connected to holds that
+        nothing follows (``commands.reconcile``), without holding up the
+        connect. A failure leaves them to the next connect."""
+        from src.server.services.commands.reconcile import end_stale_jobs
+
+        async def _run() -> None:
+            try:
+                # A lazy reconnect is still starting the sandbox.
+                await sandbox.wait_ready()
+                runtime = sandbox.runtime
+                if runtime is None:
+                    return
+                root = sandbox.working_dir or DEFAULT_ROOT_DIR
+                await end_stale_jobs(computer_id, runtime, root)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    f"Could not end stale jobs on computer {computer_id}: "
+                    f"{type(e).__name__}: {e}"
+                )
+
+        task = asyncio.create_task(_run())
+        self._prune_tasks.add(task)
+        task.add_done_callback(self._prune_tasks.discard)
 
     def prune_thread_dirs_soon(self, workspace_id: str) -> None:
         """``prune_thread_dirs_if_running`` without holding up the thread

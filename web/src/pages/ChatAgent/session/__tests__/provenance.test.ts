@@ -100,6 +100,22 @@ describe('reportRowProvenance', () => {
     });
   });
 
+  it('names a background command by what the agent said it does, and how it ended', () => {
+    expect(reportRowProvenance({
+      kind: 'command_report', command_id: 'bg-3f9a1c2e7d10', tool: 'Bash', description: 'Run 10-year backtest',
+      status: 'completed', tool_call_id: 'call_1',
+    })).toEqual({
+      kind: 'command_report', tool: 'Bash', description: 'Run 10-year backtest',
+      status: 'completed', failureReason: null, toolCallId: 'call_1',
+    });
+    expect(reportRowProvenance({
+      kind: 'command_report', command_id: 'bg-77c0e41a9b2e', tool: 'ExecuteCode', status: 'failed', failure_reason: 'after_turn_limit',
+    })).toEqual({
+      kind: 'command_report', tool: 'ExecuteCode', description: null,
+      status: 'failed', failureReason: 'after_turn_limit', toolCallId: null,
+    });
+  });
+
   it('keeps a report-back without a source hidden', () => {
     // A share's replay drops the source; older rows never had one.
     expect(reportRowProvenance(undefined)).toBeNull();

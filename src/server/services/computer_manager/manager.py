@@ -91,6 +91,7 @@ class ComputerManager(
         # asyncio holds weak task refs; retain publishes until PUBLISH completes.
         self._status_publish_tasks: set[asyncio.Task] = set()
         self._prune_tasks: set[asyncio.Task] = set()
+        self._facts_tasks: set[asyncio.Task] = set()
 
         # Cache one classifier per backend: SDK error shapes differ and constructing
         # a provider for every failed teardown leaks HTTP clients.
@@ -104,6 +105,7 @@ class ComputerManager(
         self._cleanup_task: Optional[asyncio.Task] = None
         self._left_folders_task: Optional[asyncio.Task] = None
         self._usage_task: Optional[asyncio.Task] = None
+        self._stuck_stopping_task: Optional[asyncio.Task] = None
         self._shutdown = False
 
         logger.info(
@@ -144,7 +146,12 @@ class ComputerManager(
 
         loops = [
             t
-            for t in (self._cleanup_task, self._left_folders_task, self._usage_task)
+            for t in (
+                self._cleanup_task,
+                self._left_folders_task,
+                self._usage_task,
+                self._stuck_stopping_task,
+            )
             if t
         ]
         for task in loops:
@@ -155,6 +162,7 @@ class ComputerManager(
             except asyncio.CancelledError:
                 pass
         self._cleanup_task = self._left_folders_task = self._usage_task = None
+        self._stuck_stopping_task = None
 
         for task in list(self._mcp_discovery_tasks):
             task.cancel()

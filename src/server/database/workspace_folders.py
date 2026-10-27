@@ -23,6 +23,7 @@ from psycopg.errors import UniqueViolation
 from psycopg.rows import dict_row
 from psycopg.types.json import Json
 
+from ptc_agent.core.paths import SandboxLayout
 from src.server.database import pool
 from src.server.database.home_workspace import is_home_row
 from src.server.database.pool import get_db_connection
@@ -45,7 +46,7 @@ MOVING_DIR = "_internal/moving"
 # One pass holds the folder lock, and the acquisition waiting on it, until it
 # ends; the rest of a long backlog clears on later acquisitions.
 TOMBSTONES_PER_PASS = 200
-LEFTOVERS_DIR = "_internal/leftovers"
+LEFTOVERS_DIR = SandboxLayout.LEFTOVERS_DIR
 PREVIOUS_DIR_NAMES_MAX = 8
 # The layout the folder-per-workspace split landed in; older machines keep
 # files at the root, where no folder of theirs can move.
@@ -411,6 +412,12 @@ _RUNNING_SQL = """
     LIMIT 1
 """
 
+_COMMAND_RUNNING_SQL = """
+    SELECT 1 FROM command_runs
+    WHERE computer_id = %(computer)s AND status = 'running'
+    LIMIT 1
+"""
+
 
 async def read_folder_rows(computer_id: str) -> tuple[Optional[int], list[FolderRow]]:
     """The computer's observed layout version and every row holding a folder on it."""
@@ -449,13 +456,22 @@ async def computer_run_in_progress(
     return await cur.fetchone() is not None
 
 
+async def computer_command_running(db, computer_id: str) -> bool:
+    """Whether a handed-off command still runs on the computer. Its code
+    reaches the folders there as a run's does, and it can outlive every turn."""
+    cur = await db.execute(_COMMAND_RUNNING_SQL, {"computer": computer_id})
+    return await cur.fetchone() is not None
+
+
 async def _busy(
     cur, computer_id: str, rows: Iterable[FolderRow], own_run_id: Optional[str]
 ) -> set[str]:
-    """Every row while any run on the computer is in progress, else any being
-    moved off it, whose folder the move sets aside by the name it has now."""
+    """Every row while any run or command on the computer is in progress, else
+    any being moved off it, whose folder the move sets aside by the name it has now."""
     rows = list(rows)
-    if await computer_run_in_progress(cur, computer_id, own_run_id=own_run_id):
+    if await computer_run_in_progress(
+        cur, computer_id, own_run_id=own_run_id
+    ) or await computer_command_running(cur, computer_id):
         return {r.workspace_id for r in rows}
     if not rows:
         return set()

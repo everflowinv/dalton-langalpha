@@ -63,6 +63,14 @@ def lexical_path(path: str) -> str:
     return posixpath.normpath(path)
 
 
+# Name prefixes, not paths, so not on SandboxLayout, whose every constant is a
+# path under the root. A removal's trash in ``SandboxLayout.LEFTOVERS_DIR``,
+# which it deletes detached:
+LEFTOVERS_TRASH_PREFIX = "removed."
+# The script an SSH computer writes at its root to run code, deleted after:
+EXEC_SCRIPT_PREFIX = "_exec_"
+
+
 def _class_constants(cls: type, names: Sequence[str]) -> dict[str, str]:
     return {name: getattr(cls, name) for name in names}
 
@@ -110,6 +118,10 @@ class SandboxLayout:
     SYSTEM_DIR: ClassVar[str] = ".system"
     SYSTEM_CODE_DIR: ClassVar[str] = ".system/code"
     SYSTEM_TRACE_DIR: ClassVar[str] = ".system/trace"
+    # Detached commands' state (pid, exit code), one directory each. Kept by
+    # the computer rather than a workspace folder, so a folder renamed while a
+    # command runs never makes it look lost.
+    SYSTEM_JOBS_DIR: ClassVar[str] = ".system/jobs"
 
     # Runtime paths must remain hidden from agents and denied by path validation.
     INTERNAL_DIR: ClassVar[str] = "_internal"
@@ -122,6 +134,9 @@ class SandboxLayout:
     VAULT_SECRETS_FILE: ClassVar[str] = "_internal/.vault_secrets.json"
     # An MCP check's files, which hold a copy of the server's vault secrets.
     MCP_CHECK_PREFIX: ClassVar[str] = "_internal/.mcp_check_"
+    # Folders of the owner's set aside out of a workspace folder's way, and
+    # deleted workspaces' folders waiting to go or kept for the owner.
+    LEFTOVERS_DIR: ClassVar[str] = "_internal/leftovers"
 
     #: Relative names the uploaded sandbox client reads back out of the
     #: emitted block. Only these are emitted: the emission rides
@@ -226,6 +241,10 @@ class SandboxLayout:
     @property
     def system_trace(self) -> str:
         return self.join(self.SYSTEM_TRACE_DIR)
+
+    @property
+    def system_jobs(self) -> str:
+        return self.join(self.SYSTEM_JOBS_DIR)
 
     @property
     def internal(self) -> str:

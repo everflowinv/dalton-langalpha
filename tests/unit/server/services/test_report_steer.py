@@ -233,7 +233,7 @@ async def test_a_held_report_whose_thread_cannot_be_read_again_is_given_back():
 @pytest.mark.asyncio
 async def test_confirm_closes_the_runs_held_reports_and_never_raises():
     # No alert among them: nothing to stamp ahead of the close.
-    no_alerts = patch(f"{_OUTBOX}.held_alert_jobs", new=AsyncMock(return_value=[]))
+    no_alerts = patch(f"{_OUTBOX}.held_notice_jobs", new=AsyncMock(return_value=[]))
     confirm = AsyncMock(return_value=["job-1"])
     with no_alerts, patch(f"{_OUTBOX}.confirm_jobs", new=confirm):
         await steer.SteeredReportInbox().confirm("run-A", ["job-1"])
@@ -285,7 +285,11 @@ async def test_task_offer_closes_a_report_its_stopped_turn_covered():
         "parent_run_id": "run-P",
         "finalized_at": _STOPPED_AT - timedelta(seconds=30),
     }
-    parent = {"status": "cancelled", "cancel_requested_at": _STOPPED_AT}
+    parent = {
+        "status": "cancelled",
+        "cancel_requested_at": _STOPPED_AT,
+        "metadata": {"cancelled_by_user": True},
+    }
     with (
         patch(_SR, new=AsyncMock(return_value=run_row)),
         patch(_TL, new=AsyncMock(return_value=parent)) as get_run,
@@ -319,7 +323,7 @@ async def test_task_offer_steers_an_owed_report():
     # DALTON-HOOK(i18n): task_report_message includes system-language notice
     assert offer.content == (
         "<system>\n"
-        "Background subagent Task-abc123 (research) finished while you were "
+        "Background subagent Task-abc123 (research) completed while you were "
         "working.\n"
         "Task description: look things up\n"
         "This notice is from the system, not the user. Keep writing to the user in the language of their request.\n"
@@ -342,7 +346,7 @@ def test_task_report_message_includes_language_notice_and_preserves_fields():
     msg_posted = task_report_message(report, "dalton-evidence", steered=False)
     assert msg_posted == (
         "<system>\n"
-        "Background subagent Task-abc123 (dalton-evidence) finished.\n"
+        "Background subagent Task-abc123 (dalton-evidence) completed.\n"
         "Task description: collect Cloud segment revenue\n"
         "This notice is from the system, not the user. Keep writing to the user in the language of their request.\n"
         "</system>"
@@ -350,7 +354,7 @@ def test_task_report_message_includes_language_notice_and_preserves_fields():
 
     msg_steered = task_report_message(report, "dalton-evidence", steered=True)
     assert (
-        "Background subagent Task-abc123 (dalton-evidence) finished while you were working.\n"
+        "Background subagent Task-abc123 (dalton-evidence) completed while you were working.\n"
         in msg_steered
     )
     assert "Task description: collect Cloud segment revenue\n" in msg_steered

@@ -33,11 +33,12 @@ import { specErrorFiles, specErrorFrom, specErrorFromOutcome, type SpecError } f
 import { normalizeTier, tierLabel } from './tierUi';
 import { WorkspaceMoveOutcomes } from './WorkspaceMoveOutcomes';
 
-function ComputersDialogHost() {
+/** `currentWorkspaceId` is the workspace the page shows, which a computer's removal can delete. */
+function ComputersDialogHost({ currentWorkspaceId = null }: { currentWorkspaceId?: string | null }) {
   const { t } = useTranslation();
   const locale = useLocale();
   const queryClient = useQueryClient();
-  const { panel, specComputerId } = useComputersPanel();
+  const { panel, opening, specComputerId } = useComputersPanel();
   // Always on: the fan-out at the same root reads this list anyway, and the
   // outcome watch below needs every refetch, whoever triggered it.
   const { data } = useComputers();
@@ -139,13 +140,13 @@ function ComputersDialogHost() {
   return (
     <>
       <ComputersDialog
-        open={!!panel}
-        onOpenChange={(open) => { if (!open) closeComputersPanel(); }}
-        focusComputerId={panel?.computerId ?? null}
-        expandStorage={panel?.expandStorage ?? false}
+        panel={panel}
+        opening={opening}
+        onClose={closeComputersPanel}
         // One panel at a time: Change spec opened from a row takes the
         // Computers panel's place until it closes.
         covered={!!specTarget}
+        currentWorkspaceId={currentWorkspaceId}
       />
       <ChangeSpecDialog
         target={specTarget}

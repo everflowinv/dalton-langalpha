@@ -26,10 +26,6 @@ import structlog
 
 from ptc_agent.config.core import DockerConfig, PlatformSecretDefinition
 from ptc_agent.core.sandbox._defaults import sandbox_thread_env
-from ptc_agent.core.sandbox.providers._chart_capture import (
-    build_code_wrapper,
-    extract_artifacts,
-)
 from ptc_agent.core.sandbox.providers._exec_sessions import ExecSessionRuntime
 from ptc_agent.core.sandbox.providers._tiers import (
     TierSizing,
@@ -38,7 +34,6 @@ from ptc_agent.core.sandbox.providers._tiers import (
     resolve_tier,
 )
 from ptc_agent.core.sandbox.runtime import (
-    CodeRunResult,
     ExecResult,
     PreviewInfo,
     RuntimeState,
@@ -233,84 +228,6 @@ class DockerRuntime(ExecSessionRuntime):
             if _is_container_gone(e):
                 raise SandboxTransientError(str(e)) from e
             return ExecResult(stdout="", stderr=str(e), exit_code=-1)
-
-    async def code_run(
-        self,
-        code: str,
-        env: dict[str, str] | None = None,
-        timeout: int = 300,
-    ) -> CodeRunResult:
-        wrapper = build_code_wrapper(code)
-        encoded = base64.b64encode(wrapper.encode("utf-8")).decode("ascii")
-
-        script_name = f"_exec_{uuid.uuid4().hex[:8]}.py"
-        script_path = f"{self._working_dir}/{script_name}"
-
-        # Write script via exec (avoids tar overhead for a single small file)
-        write_cmd = (
-            f"python3 -I -c \"import base64,sys; "
-            f"sys.stdout.buffer.write(base64.b64decode('{encoded}'))\" "
-            f"> {shlex.quote(script_path)}"
-        )
-        write_result = await self.exec(write_cmd, timeout=15)
-        if write_result.exit_code != 0:
-            return CodeRunResult(
-                stdout="",
-                stderr=f"Failed to write script: {write_result.stderr or write_result.stdout}",
-                exit_code=write_result.exit_code,
-                artifacts=[],
-            )
-
-        # Build environment exports
-        env_prefix = ""
-        if env:
-            exports = " ".join(f"{k}={_shell_escape(v)}" for k, v in env.items())
-            env_prefix = f"export {exports} && "
-
-        stderr_path = f"{self._working_dir}/_stderr_{uuid.uuid4().hex[:8]}.txt"
-        run_cmd = (
-            f"{env_prefix}python3 {shlex.quote(script_path)} "
-            f"2>{shlex.quote(stderr_path)}"
-        )
-
-        # Run the code. We parse combined stdout for artifacts. The turn's
-        # own directory is reached by the shipped ``sitecustomize.py``, which
-        # reads ``PTC_TURN_CWD`` out of ``env`` above; the script and its
-        # stderr file are runtime scratch and stay where the container puts
-        # them.
-        exec_result = await self.exec(run_cmd, timeout=timeout)
-
-        # Extract chart artifacts from stdout markers
-        artifacts, clean_stdout = extract_artifacts(exec_result.stdout)
-
-        # Read stderr from temp file only on failure (avoids extra exec round-trip
-        # on the happy path — the consumer only needs stderr for auto-install detection)
-        stderr = ""
-        if exec_result.exit_code != 0:
-            try:
-                cat_result = await self.exec(
-                    f"cat {shlex.quote(stderr_path)} 2>/dev/null", timeout=5
-                )
-                if cat_result.exit_code == 0:
-                    stderr = cat_result.stdout
-            except Exception:
-                pass
-
-        # Cleanup temp files (best-effort)
-        try:
-            await self.exec(
-                f"rm -f {shlex.quote(script_path)} {shlex.quote(stderr_path)}",
-                timeout=5,
-            )
-        except Exception:
-            pass
-
-        return CodeRunResult(
-            stdout=clean_stdout,
-            stderr=stderr,
-            exit_code=exec_result.exit_code,
-            artifacts=artifacts,
-        )
 
     # -- File I/O --
 

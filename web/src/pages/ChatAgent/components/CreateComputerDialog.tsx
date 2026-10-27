@@ -1,8 +1,9 @@
 /**
- * Create a computer: a name, where it runs, and its spec.
+ * Create a computer: a name, where it runs, and its spec, under a drawing of
+ * the machine that follows the picks.
  *
- * Opened over the Computers dialog, which owns the request and scrolls to the
- * new row once it lands. Mounted only while open, so every opening starts
+ * Opened over the Computers dialog, which owns the request and brings the
+ * new card to the middle of its rail once it lands. Mounted only while open, so every opening starts
  * from a blank form. The provider and the tier are locked by plan the same
  * way, and either lock brings up the same way out as the spec dialog. At the
  * plan's computer cap only a machine the user brings is left open, and the
@@ -11,16 +12,19 @@
  * computer.
  */
 import { useEffect, useId, useRef, useState, type FormEvent } from 'react';
-import { useTranslation } from 'react-i18next';
+import { Trans, useTranslation } from 'react-i18next';
 
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { ModalShell } from '@/components/ui/ModalShell';
 import { isPlatformMode } from '@/config/hostMode';
-import type { Computer, ComputerCreate, ComputerProviderOption, ResourceTier, WorkspaceQuota } from '@/types/api';
+import { clientOs } from '@/lib/clientOs';
+import { isDesktopShell } from '@/lib/desktop';
+import { DesktopDownloadLink } from '@/pages/Plugins/components/DesktopDownloadLink';
+import type { ComputerCreate, ComputerProviderOption, ResourceTier, WorkspaceQuota } from '@/types/api';
 
 import { useComputerProviders } from '../hooks/useComputers';
-import { remoteControlOffered, useThisMac } from '../hooks/useRemoteControl';
+import { serverTakesRemoteControl, useThisMacAvailability } from '../hooks/useRemoteControl';
 import { useTierQuota } from '../hooks/useTierQuota';
 import { COMPUTER_NAME_MAX } from './computerName';
 import { SshSetup } from './sshSetup';
@@ -41,6 +45,8 @@ import {
   type ThisMacCard,
 } from './providerUi';
 import { RadioCardGroup, type RadioCardOption } from './radioCardGroup';
+import { MachinePreview } from './machineArt/MachinePreview';
+import { hostedPreview, ownPreview } from './machineArt/machine';
 import {
   TIER_ORDER,
   TierRadioGroup,
@@ -75,26 +81,36 @@ function sourceOf(
   return kind === 'ssh' ? 'ssh' : { hosted: kind };
 }
 
+/**
+ * The panel's height while a pick can change its body: a hosted pick's form,
+ * the spec list and the plan line under it, fits whole, and a longer body
+ * (this Mac's disclosure, the SSH steps) scrolls.
+ */
+const FORM_HEIGHT = 800;
+
 interface CreateComputerDialogProps {
-  /** The user's computers once the list has answered, so the This Mac card can say it is already one. */
-  computers: readonly Computer[] | undefined;
   onClose: () => void;
   onSubmit: (body: ComputerCreate) => void;
   /** The request is in flight. */
   busy: boolean;
   /** The last refusal, already worded for the user. */
   error: string | null;
+  /** The computer whose mark refused the folder, one this account does not
+   *  have: the user may take the folder from it. */
+  takeOver?: string | null;
+  /** The source picked as it opens; one not on offer falls back as any pick does. */
+  initialPick?: string | null;
 }
 
-function CreateComputerDialog({ computers, onClose, onSubmit, busy, error }: CreateComputerDialogProps) {
+function CreateComputerDialog({ onClose, onSubmit, busy, error, takeOver = null, initialPick = null }: CreateComputerDialogProps) {
   const { t } = useTranslation();
   const titleId = useId();
   const formId = useId();
   const nameId = useId();
   const [name, setName] = useState('');
-  const [picked, setPicked] = useState<string | null>(null);
+  const [picked, setPicked] = useState<string | null>(initialPick);
   const [pickedTier, setPickedTier] = useState<ResourceTier>('standard');
-  const errorRef = useRef<HTMLParagraphElement>(null);
+  const errorRef = useRef<HTMLDivElement>(null);
 
   // The SSH summary makes the form taller than the dialog, so a refusal would
   // land below the fold with nothing visible changing.
@@ -113,11 +129,19 @@ function CreateComputerDialog({ computers, onClose, onSubmit, busy, error }: Cre
 
   // This Mac, where the desktop app can pair it and this server can reach it.
   // Once a computer is this Mac the card says so instead of pairing it again,
-  // so the card waits for the list to answer that.
-  const thisMac = useThisMac({ enabled: true });
-  const thisMacCard: ThisMacCard | null = !remoteControlOffered(thisMac.status, providerData) || !computers
-    ? null
-    : computers.some((c) => thisMac.of(c) !== null) ? 'added' : 'offered';
+  // so the card waits for the list to answer that. Where this server could
+  // take it but this app cannot pair it, the card still shows, held, saying
+  // what it would take: the desktop app, on a Mac in a browser; on Windows,
+  // support that is still to come.
+  const thisMac = useThisMacAvailability({ enabled: true });
+  let thisMacCard: ThisMacCard | null = null;
+  if (thisMac.offered) {
+    if (thisMac.added !== undefined) thisMacCard = thisMac.added ? 'added' : 'offered';
+  } else if (serverTakesRemoteControl(providerData)) {
+    const os = clientOs();
+    if (os === 'windows') thisMacCard = 'windows';
+    else if (os === 'mac' && !isDesktopShell()) thisMacCard = 'needsApp';
+  }
 
   const source = sourceOf(picked, providers, thisMacCard, atCap);
   const hosted = typeof source === 'object' ? source.hosted : null;
@@ -127,8 +151,8 @@ function CreateComputerDialog({ computers, onClose, onSubmit, busy, error }: Cre
     offer.tiers.includes(pickedTier) && !isTierBlocked(tierCapacity(quota, pickedTier)) ? pickedTier : 'standard';
   const ssh = useSshSetup(source === 'ssh');
   const mac = useRemoteControlSetup(source === 'thisMac');
-  // A machine the user brings is named in its own setup and sized by them, so
-  // it has no name field here and its tier is never a pick.
+  // A machine the user brings is sized by them, so its tier is never a pick,
+  // and left unnamed it goes by its hostname once it has answered.
   const own = source === 'thisMac' ? mac : source === 'ssh' ? ssh : null;
 
   // A size the plan allows that this provider does not run but another open
@@ -152,8 +176,9 @@ function CreateComputerDialog({ computers, onClose, onSubmit, busy, error }: Cre
   // the user brings, this Mac included, sends its setup's part and always names
   // its kind, since the server takes a target only with it.
   const trimmedName = name.trim();
+  const ownName = trimmedName || own?.defaultName;
   const fields: ComputerCreate | null = own
-    ? own.create && { ...own.create, resource_tier: 'standard', kind: 'ssh' }
+    ? own.create && { ...own.create, ...(ownName ? { name: ownName } : {}), resource_tier: 'standard', kind: 'ssh' }
     : {
       ...(trimmedName ? { name: trimmedName } : {}),
       resource_tier: tier,
@@ -213,30 +238,43 @@ function CreateComputerDialog({ computers, onClose, onSubmit, busy, error }: Cre
       // Wide enough for three providers side by side, each name on one line.
       width="wide"
       density="form"
+      // Every provider shows the same name field and cards over a body of its
+      // own, so a pick changes only that body: the panel holds its size and a
+      // longer body (this Mac's disclosure) scrolls. Sized for the spec list.
+      fixedHeight={options.length > 1 ? FORM_HEIGHT : undefined}
       stacked
       footer={footer}
     >
       <form id={formId} onSubmit={submit} className="flex flex-col gap-4">
-        {!own && (
-          <div className="flex flex-col gap-1.5">
-            <label htmlFor={nameId} className="text-xs font-medium" style={{ color: 'var(--color-text-secondary)' }}>
-              {t('computer.nameLabel', 'Name')}{' '}
-              <span className="font-normal" style={{ color: 'var(--color-text-tertiary)' }}>{t('common.optional')}</span>
-            </label>
-            <Input
-              id={nameId}
-              value={name}
-              maxLength={COMPUTER_NAME_MAX}
-              onChange={(e) => setName(e.target.value)}
-              disabled={busy}
-              style={{
-                backgroundColor: 'var(--color-bg-input)',
-                borderColor: 'var(--color-border-muted)',
-                color: 'var(--color-text-primary)',
-              }}
-            />
-          </div>
-        )}
+        <MachinePreview
+          machine={
+            own
+              ? ownPreview(t, own.ready, source === 'thisMac')
+              : hostedPreview(t, hosted ?? providers[0]?.kind ?? null, offer, tier)
+          }
+        />
+        <div className="flex flex-col gap-1.5">
+          <label htmlFor={nameId} className="text-xs font-medium" style={{ color: 'var(--color-text-secondary)' }}>
+            {t('computer.nameLabel', 'Name')}{' '}
+            <span className="font-normal" style={{ color: 'var(--color-text-tertiary)' }}>{t('common.optional')}</span>
+          </label>
+          <Input
+            id={nameId}
+            value={name}
+            maxLength={COMPUTER_NAME_MAX}
+            onChange={(e) => setName(e.target.value)}
+            disabled={busy}
+            autoComplete="off"
+            spellCheck={false}
+            // A machine the user brings is named after itself unless they say otherwise.
+            placeholder={own ? (own.defaultName ?? t('computer.nameFromMachine', "Defaults to the machine's name")) : undefined}
+            style={{
+              backgroundColor: 'var(--color-bg-input)',
+              borderColor: 'var(--color-border-muted)',
+              color: 'var(--color-text-primary)',
+            }}
+          />
+        </div>
 
         {options.length > 1 && (
           <RadioCardGroup
@@ -251,10 +289,20 @@ function CreateComputerDialog({ computers, onClose, onSubmit, busy, error }: Cre
           />
         )}
 
+        {thisMacCard === 'needsApp' && (
+          <p className="-mt-2 text-xs" style={{ color: 'var(--color-text-tertiary)' }} data-testid="this-mac-needs-app">
+            <Trans
+              i18nKey="computer.remoteControl.needsAppHint"
+              defaults="To add this Mac, <download>get the desktop app</download> and open this form there."
+              components={{ download: <DesktopDownloadLink /> }}
+            />
+          </p>
+        )}
+
         {source === 'thisMac' ? (
-          <RemoteControlSetup state={mac} account={thisMac.status?.account ?? ''} busy={busy} nameMaxLength={COMPUTER_NAME_MAX} />
+          <RemoteControlSetup state={mac} account={thisMac.status?.account ?? ''} busy={busy} />
         ) : source === 'ssh' ? (
-          <SshSetup state={ssh} busy={busy} nameMaxLength={COMPUTER_NAME_MAX} />
+          <SshSetup state={ssh} busy={busy} />
         ) : (
           <TierRadioGroup
             offer={offer}
@@ -289,9 +337,24 @@ function CreateComputerDialog({ computers, onClose, onSubmit, busy, error }: Cre
         {upgradeLead && <PlanUpgradeHint lead={upgradeLead} testId="create-computer-plan-cta" />}
 
         {error && !busy && (
-          <p ref={errorRef} className="text-sm" role="alert" style={{ color: 'var(--color-icon-danger)' }}>
-            {error}
-          </p>
+          <div ref={errorRef} role="alert" className="flex flex-col gap-1.5">
+            <p className="text-sm" style={{ color: 'var(--color-icon-danger)' }}>
+              {error}
+            </p>
+            {takeOver && fields?.ssh && (
+              <p className="text-xs" style={{ color: 'var(--color-text-secondary)' }}>
+                {t('computer.takeOverFolderNote', 'The other computer stops working in it. The files in it stay.')}{' '}
+                <button
+                  type="button"
+                  className="underline font-medium"
+                  style={{ color: 'var(--color-text-primary)' }}
+                  onClick={() => onSubmit({ ...fields, ssh: { ...fields.ssh!, take_over: takeOver } })}
+                >
+                  {t('computer.takeOverFolder', 'Take over this folder')}
+                </button>
+              </p>
+            )}
+          </div>
         )}
       </form>
     </ModalShell>

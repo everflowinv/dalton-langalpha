@@ -481,6 +481,28 @@ async def clear_computer_retirement_pending(
         return cur.rowcount > 0
 
 
+async def record_machine_facts(
+    computer_id: str, shown: Dict[str, Any], *, conn=None
+) -> bool:
+    """Keep what a machine said of itself as it started, for its details.
+
+    Display data only, written over the last reading: a system updates, and
+    nothing else reads it, so it neither bumps ``updated_at`` nor fences on
+    anything but the row still being there.
+    """
+    async with _computer_cursor(conn) as cur:
+        await cur.execute(
+            f"""
+            UPDATE computers
+            SET config = COALESCE(config, '{{}}'::jsonb) || %s::jsonb
+            WHERE computer_id = %s
+              AND {FENCE_NOT_DELETED}
+            """,
+            (Json(shown), computer_id),
+        )
+        return cur.rowcount > 0
+
+
 async def create_computer(
     user_id: str,
     *,

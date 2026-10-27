@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
-from unittest.mock import ANY, AsyncMock, MagicMock
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -23,10 +23,11 @@ from ptc_agent.agent.backends.automations import AutomationsBackend
 from ptc_agent.agent.backends.db_json_route import Plan
 from ptc_agent.agent.filesystem_routes import IdentityGates, build_filesystem_backend
 from ptc_agent.agent.tools.bash import create_execute_bash_tool
-from ptc_agent.agent.tools.bash_output import create_bash_output_tool
 from ptc_agent.agent.tools.code_execution import create_execute_code_tool
+from ptc_agent.agent.tools.command_handoff import HandOff
 from ptc_agent.core.sandbox.livefs_mount import CallContext
 from src.server.services.automations.file import AutomationFile, FilePlan
+from tests.unit.ptc_agent.agent.job_fakes import outcome, tool_call
 
 ROOT = "/home/workspace"
 FILE_NAME = "morning-brief.json"
@@ -189,17 +190,22 @@ class _Mounted:
         self.asked_for.append(workspace_id)
         return self.livefs
 
-    async def aexecute_bash(self, command, *, call_id=None, **_):
+    async def start_bash_job(self, command, *, call_id=None, wait_s=None, **_):
         self.mount.events.append(("run", call_id))
-        return {"success": True, "stdout": "ok", "stderr": "", "exit_code": 0}
+        return outcome(done=wait_s != 0, output="ok")
 
-    async def aexecute_code(self, code, *, thread_id=None, call_id=None, **_):
+    async def start_code_job(self, code, *, call_id=None, **_):
         self.mount.events.append(("run", call_id))
-        return SimpleNamespace(success=True, stdout="ok", stderr="", mcp_trace=[])
+        return outcome(output="ok")
 
-    async def aget_background_command_status(self, command_id):
-        self.mount.events.append(("run", command_id))
-        return {"is_running": False, "exit_code": 0, "stdout": "done"}
+
+def _hand_off() -> HandOff:
+    return HandOff(
+        thread_id=THREAD,
+        user_id=USER,
+        workspace_id=WORKSPACE,
+        wakeups=True,
+    )
 
 
 class TestWithTheMount:
@@ -209,36 +215,25 @@ class TestWithTheMount:
         """A background command outlives its call, and its saves still read
         this conversation's defaults."""
         backend = _Mounted()
-        tool = create_execute_bash_tool(backend, call_context=CONTEXT)
+        tool = create_execute_bash_tool(
+            backend,
+            session=SimpleNamespace(computer_id="00000000-0000-4000-8000-00000000cccc"),
+            call_context=CONTEXT,
+            hand_off=_hand_off(),
+        )
 
-        await tool.ainvoke({"command": f"cat {FILE_PATH}", "run_in_background": background})
+        record = AsyncMock()
+        with patch("src.server.database.runs.command_runs.record_handoff", new=record):
+            await tool.ainvoke(
+                tool_call("Bash", command=f"cat {FILE_PATH}", run_in_background=background)
+            )
 
+        assert record.await_count == background
         (_, call_id, context), run, report = backend.mount.events
         assert call_id and context == CONTEXT
         assert run == ("run", call_id) and report == ("report", call_id)
         # The mount is asked for the folder the command runs in.
         assert backend.asked_for == [CONTEXT.workspace_id]
-
-    @pytest.mark.asyncio
-    async def test_reading_a_background_job_reports_its_later_saves(self):
-        """The job saves after the Bash call that launched it returned, so its
-        refusals wait on the thread's late list for this read to collect."""
-        backend = _Mounted()
-
-        async def report(call_id, output, context=None):
-            backend.mount.events.append(("report", call_id, context))
-            return "NOT SAVED: - x.json: invalid JSON (from an earlier command)"
-
-        backend.mount.report = report
-        tool = create_bash_output_tool(backend, call_context=CONTEXT)
-
-        content = await tool.ainvoke({"command_id": "job-1"})
-
-        (_, call_id, context), run, report_event = backend.mount.events
-        assert call_id and context == CONTEXT
-        assert run == ("run", "job-1") and report_event == ("report", call_id, CONTEXT)
-        assert content.startswith("Status: COMPLETED (success)")
-        assert content.endswith("(from an earlier command)")
 
     @pytest.mark.asyncio
     async def test_execute_code_files_who_the_code_runs_for_before_it_runs(self):

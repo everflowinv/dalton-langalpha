@@ -130,6 +130,7 @@ class MachineLifecycleMixin:
         is_primary: bool = False,
         prepare: bool = False,
         provider_config: Optional[Dict[str, Any]] = None,
+        config: Optional[Dict[str, Any]] = None,
         root_dir: Optional[str] = None,
         default_name: Optional[str] = None,
         files_backup: bool = True,
@@ -144,8 +145,9 @@ class MachineLifecycleMixin:
         ``resource_tier`` it is created at "standard", which a provider that
         lacks it resolves to its default size. ``provider_config`` holds the
         machine's own settings over the kind's (an ssh computer's target), and
-        is validated here so a bad one never reaches a row; ``default_name``
-        is what an unnamed machine is called before numbering.
+        is validated here so a bad one never reaches a row; ``config`` is the
+        row's own facts, which no provider reads (an ssh Mac's model name);
+        ``default_name`` is what an unnamed machine is called before numbering.
 
         Raises:
             ProviderNotOffered: ``kind`` is not one a new computer may run on.
@@ -173,6 +175,7 @@ class MachineLifecycleMixin:
             resource_tier=resource_tier or "standard",
             root_dir=root_dir or self.config.filesystem.working_directory,
             provider_config=provider_config,
+            config=config,
             files_backup=files_backup,
         )
 
@@ -808,11 +811,7 @@ class MachineLifecycleMixin:
                         f"{project_binding.workspace_id} after binding: {e}"
                     )
             if reconnected:
-                # The disk outlived the stop, but it still holds the threads
-                # deleted or gone idle meanwhile, and no worker's attach will
-                # look again: projects stay attached across a stop on the
-                # same sandbox. The bring-up job reconciles each one.
-                await self._queue_reconnect_syncs(computer_id, session.sandbox)
+                await self._on_session_attached(computer_id, session, resumed=True)
             self._record_sync(computer_id)
             if not reconnected:
                 # What starts with the machine (an always-on app) reads market
@@ -824,6 +823,7 @@ class MachineLifecycleMixin:
                 f"Computer {computer_id} is running on sandbox {sandbox_id} "
                 f"({'reconnected' if reconnected else 'built'})"
             )
+            self._read_machine_facts_soon(computer_id, binding.kind, runtime)
             return session
         except (Exception, asyncio.CancelledError):
             if reconnected:
@@ -844,14 +844,6 @@ class MachineLifecycleMixin:
         await publish_computer_status_change(
             computer_id, ComputerStatus.STARTING, extra={"stage": stage}
         )
-
-    async def _queue_reconnect_syncs(self, computer_id: str, sandbox: Any) -> None:
-        """Queue every project on a resumed sandbox; the restore step finds
-        nothing deferred on a warm disk, so each costs only its sync."""
-        for workspace_id in await get_live_workspace_ids_for_computer(computer_id):
-            self._queue_bring_up(
-                computer_id, workspace_id, sandbox, sandbox.working_dir, urgent=False
-            )
 
     async def _revert_machine_start(self, computer_id: str) -> None:
         """CAS only from starting so failure cannot stop a machine another worker moved."""
@@ -895,6 +887,30 @@ class MachineLifecycleMixin:
             return await try_claim_computer_for_start(
                 computer_id, from_status=from_status, conn=conn,
             )
+
+    def _read_machine_facts_soon(self, computer_id: str, kind: str, runtime: Any) -> None:
+        """Read what a machine the user brings says of itself (its system and
+        hardware) and keep it for its details. Off the start's path, since only
+        the Computers dialog reads it; a failure keeps the last reading."""
+        from ptc_agent.core.sandbox.providers.ssh import MACHINE_FACTS_SCRIPT, read_machine
+        from src.server.database.computer import record_machine_facts
+        from src.server.services.ssh_computers import SSH_KIND, machine_config
+
+        if kind != SSH_KIND:
+            return
+
+        async def read() -> None:
+            try:
+                result = await runtime.exec(MACHINE_FACTS_SCRIPT, timeout=30)
+                model, machine = read_machine(result.stdout or "")
+                if machine:
+                    await record_machine_facts(computer_id, machine_config(model, machine))
+            except Exception as e:  # noqa: BLE001 - display data, never worth a start
+                logger.info(f"Could not read the machine facts of computer {computer_id}: {e}")
+
+        task = asyncio.create_task(read())
+        self._facts_tasks.add(task)
+        task.add_done_callback(self._facts_tasks.discard)
 
     async def _start_machine(
         self,
@@ -945,19 +961,37 @@ class MachineLifecycleMixin:
                 )
                 return None
 
-            try:
-                if on_start_claimed is not None:
-                    on_start_claimed()
-                async with self._computer_start_heartbeat(computer_id):
-                    return await self._build_machine_session(
-                        computer, user_id=user_id, on_state_observed=on_state_observed
-                    )
-            except (Exception, asyncio.CancelledError):
-                # CancelledError is a BaseException: a client dropping mid
-                # provision would otherwise leave the machine at 'starting'
-                # for every project on it until the reaper runs.
-                await asyncio.shield(self._revert_machine_start(computer_id))
-                raise
+            return await self._build_started_machine(
+                computer,
+                user_id=user_id,
+                on_state_observed=on_state_observed,
+                on_start_claimed=on_start_claimed,
+            )
+
+    async def _build_started_machine(
+        self,
+        computer: Dict[str, Any],
+        *,
+        user_id: str | None = None,
+        on_state_observed: Callable[[str], None] | None = None,
+        on_start_claimed: Callable[[], None] | None = None,
+    ) -> Session:
+        """Bring up a machine its caller claimed for start, or is reconnecting
+        to, under the machine lock the caller holds; a failure puts it back."""
+        computer_id = str(computer["computer_id"])
+        try:
+            if on_start_claimed is not None:
+                on_start_claimed()
+            async with self._computer_start_heartbeat(computer_id):
+                return await self._build_machine_session(
+                    computer, user_id=user_id, on_state_observed=on_state_observed
+                )
+        except (Exception, asyncio.CancelledError):
+            # CancelledError is a BaseException: a client dropping mid
+            # provision would otherwise leave the machine at 'starting'
+            # for every project on it until the reaper runs.
+            await asyncio.shield(self._revert_machine_start(computer_id))
+            raise
 
     async def pick_for_user(
         self, user_id: str, *, workspace_id: str | None = None

@@ -73,6 +73,21 @@ export function providerLabel(kind: string, t: Translate): string {
   return ui?.labelKey ? t(ui.labelKey) : (ui?.label ?? kind);
 }
 
+/**
+ * What a machine runs on, as a list of computers names it: this Mac, a Mac
+ * under remote control, or its provider. A helper is an `ssh` computer only
+ * underneath, so it is not called one.
+ */
+export function computerSourceLabel(
+  t: Translate,
+  computer: Pick<Computer, 'kind' | 'ssh'>,
+  thisMac: boolean,
+): string {
+  if (thisMac) return t('computer.remoteControl.thisMacBadge', 'This Mac');
+  if (computer.ssh?.helper) return t('computer.remoteControl.provider', 'Remote control');
+  return providerLabel(computer.kind, t);
+}
+
 export function providerDescription(kind: string, t: Translate): string {
   const ui = providerUi(kind);
   return ui ? t(ui.descKey) : '';
@@ -144,18 +159,32 @@ export function providerOptions(
 /** The This Mac card's value. Not a provider kind: this Mac is added by remote control as an `ssh` computer. */
 export const THIS_MAC_OPTION = 'this-mac';
 
-/** Whether this Mac can still be added, or a computer already is this Mac. */
-export type ThisMacCard = 'offered' | 'added';
+/**
+ * Whether this Mac can still be added, or a computer already is this Mac; or,
+ * held, what adding the machine the reader is on would take: the desktop app,
+ * on a Mac in a browser (`needsApp`), or Windows support (`windows`).
+ */
+export type ThisMacCard = 'offered' | 'added' | 'needsApp' | 'windows';
 
-/** This Mac's card, offered in the desktop app on a Mac after the hosted providers. */
+/** This Mac's card, after the hosted providers: offered in the desktop app on a Mac, held elsewhere. */
 export function thisMacOption(t: Translate, state: ThisMacCard): RadioCardOption<string> {
+  if (state === 'windows') {
+    return {
+      value: THIS_MAC_OPTION,
+      title: t('computer.remoteControl.cardTitlePc', 'This PC'),
+      description: t('computer.remoteControl.windowsSoon', 'Windows support is coming soon'),
+      disabled: true,
+    };
+  }
   return {
     value: THIS_MAC_OPTION,
     title: t('computer.remoteControl.cardTitle', 'This Mac'),
-    description: t('computer.remoteControl.cardDesc', 'Works even with LangAlpha closed'),
+    description: state === 'needsApp'
+      ? t('computer.remoteControl.needsApp', 'Needs the desktop app')
+      : t('computer.remoteControl.cardDesc', 'Works even with LangAlpha closed'),
     note: state === 'added'
       ? t('computer.remoteControl.alreadyAdded', 'Already added')
-      : t('computer.ssh.previewLabel', 'Preview'),
-    disabled: state === 'added',
+      : state === 'offered' ? t('computer.ssh.previewLabel', 'Preview') : null,
+    disabled: state !== 'offered',
   };
 }

@@ -37,6 +37,6 @@ describe('where an automation card says it ran', () => {
         data={{ type: 'automations', mode: 'detail', automation: card({ agent_mode: 'home' }), executions: [] }}
       />,
     );
-    expect(screen.getByText('Agent').nextElementSibling).toHaveTextContent('Chief of Staff');
+    expect(screen.getByText('Agent').parentElement).toHaveTextContent('Chief of Staff');
   });
 });

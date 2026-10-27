@@ -26,7 +26,7 @@ import {
   startComputer,
   stopComputer,
 } from '../utils/api';
-import { apiErrorReason } from '../utils/api/errors';
+import { apiErrorObject, apiErrorReason } from '../utils/api/errors';
 import { entitlementErrorMessage } from '../utils/entitlementErrors';
 import { releaseRemoteControl } from './useRemoteControl';
 import { tierLabel } from '../components/tierUi';
@@ -41,10 +41,46 @@ import {
   removeComputerRow,
 } from './useComputers';
 import { seedWorkspaceMove, watchMove } from './useWorkspaceMove';
+import { forgetDeletedWorkspace, invalidateWorkspaceMembership } from './workspaceRowActions';
 
 export type PowerAction = 'start' | 'stop';
 
+export interface RemoveComputerVariables {
+  computerId: string;
+  name: string;
+  removeKey: boolean;
+  /** The workspaces on it the user was shown, deleted before it is removed. */
+  workspaceIds: readonly string[];
+  /** Also delete LangAlpha's files from a machine the user brought. */
+  deleteFiles: boolean;
+  /** Its root folder, named when the files' outcome is told. */
+  folder?: string | null;
+  fingerprint?: string | null;
+}
+
 type Translate = ReturnType<typeof useTranslation>['t'];
+
+/** What became of LangAlpha's files on the machine; undefined when they were not asked to go. */
+function filesRemovalNote(
+  files: ComputerRemoveResponse['files'],
+  folder: string | null | undefined,
+  t: Translate,
+): string | undefined {
+  if (!files) return undefined;
+  if (files.outcome === 'unreached') {
+    return t('computer.filesUnreached', 'We could not reach the machine, so its files are still there.');
+  }
+  if (files.outcome === 'failed') {
+    return t('computer.filesFailed', 'We could not finish deleting its files from the machine.');
+  }
+  return [
+    t('computer.filesDeleted', 'Its files were deleted from the machine.'),
+    files.root_kept && folder
+      ? t('computer.filesRootKept', '{{folder}} stays, since it holds files of yours.', { folder })
+      : null,
+    files.runtime_kept ? t('computer.filesRuntimeKept', '~/.langalpha stays, since another computer uses it.') : null,
+  ].filter(Boolean).join(' ');
+}
 
 /** What became of our key line, in a sentence or two; undefined when there is nothing to say. */
 function keyRemovalNote(key: ComputerRemoveResponse['key'] | undefined, t: Translate): string | undefined {
@@ -216,28 +252,41 @@ export function useComputerActions() {
   // name rides in the variables because the row is gone by the time it is read,
   // and so does the host key of an SSH computer: when it was this Mac, remote
   // control turns off with it here, where a dialog closing mid-removal cannot
-  // drop it.
+  // drop it. The workspaces it deleted first leave with it, and only those: one
+  // moved off it meanwhile still exists. An older backend does not say which,
+  // and there every one named went.
   const remove = useMutation({
-    mutationFn: ({ computerId, removeKey }: { computerId: string; name: string; removeKey: boolean; fingerprint?: string | null }) =>
-      deleteComputer(computerId, { removeKey }),
-    onSuccess: (res, { computerId, name, fingerprint }) => {
+    mutationFn: async ({ computerId, removeKey, workspaceIds, deleteFiles }: RemoveComputerVariables) => {
+      const res = await deleteComputer(computerId, { removeKey, deleteWorkspaces: workspaceIds, deleteFiles });
+      return { ...res, workspaces_deleted: res.workspaces_deleted ?? [...workspaceIds] };
+    },
+    onSuccess: (res, { computerId, name, fingerprint, workspaceIds, folder }) => {
       removeComputerRow(queryClient, computerId);
       queryClient.removeQueries({ queryKey: queryKeys.computers.storage(computerId) });
+      for (const id of res.workspaces_deleted) forgetDeletedWorkspace(queryClient, id);
+      if (workspaceIds.length) invalidateWorkspaceMembership(queryClient);
       invalidateMachine(queryClient);
       if (fingerprint) void releaseRemoteControl(queryClient, { onlyFor: fingerprint });
-      // A key left behind is the user's to remove and the fingerprint is
-      // something to copy, so those stay until closed. Still the plain
-      // variant: the removal itself succeeded.
-      const stays = res.key?.outcome === 'skipped' || res.key?.outcome === 'unreached';
+      // A key or files left behind are the user's to remove, and the
+      // fingerprint is something to copy, so those stay until closed. Still
+      // the plain variant: the removal itself succeeded.
+      const stays = res.key?.outcome === 'skipped' || res.key?.outcome === 'unreached'
+        || (!!res.files && res.files.outcome !== 'deleted');
+      const description = [filesRemovalNote(res.files, folder, t), keyRemovalNote(res.key, t)].filter(Boolean).join(' ');
       toast({
         title: t('computer.removed', '{{name}} removed', { name }),
-        description: keyRemovalNote(res.key, t),
+        description: description || undefined,
         ...(stays ? { duration: Infinity } : {}),
       });
     },
     // A refusal can mean the row moved under the dialog (a workspace landed,
-    // a start began), so the list re-reads to show why.
-    onError: () => invalidateMachine(queryClient),
+    // a start began), so the list re-reads to show why. One that came once
+    // some named workspaces were deleted says which, and those are forgotten.
+    onError: (err, { workspaceIds }) => {
+      invalidateMachine(queryClient);
+      for (const id of deletedBeforeRefusal(err)) forgetDeletedWorkspace(queryClient, id);
+      if (workspaceIds.length) invalidateWorkspaceMembership(queryClient);
+    },
   });
 
   const renameComputerTo = useCallback(
@@ -246,4 +295,10 @@ export function useComputerActions() {
   );
 
   return { power, rename, renameComputerTo, spec, makePrimary, turnOffAlwaysOn, setFilesBackup, create, remove };
+}
+
+/** The workspaces a refused removal had already deleted, which it names. */
+export function deletedBeforeRefusal(err: unknown): string[] {
+  const ids = apiErrorObject(err)?.workspaces_deleted;
+  return Array.isArray(ids) ? ids.filter((id): id is string => typeof id === 'string') : [];
 }

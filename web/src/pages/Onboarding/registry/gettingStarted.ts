@@ -1,14 +1,17 @@
-import { PLATFORM_URL } from '@/config/supportLinks';
+import { DESKTOP_DOWNLOAD_URL, PLATFORM_URL } from '@/config/supportLinks';
+import { openComputersPanel } from '@/pages/ChatAgent/hooks/computerPanelStore';
 import { WELCOME_PATH } from '../welcome/paths';
 import type { GettingStartedTaskDef } from './types';
 
 /**
  * The getting-started checklist, in presentation order: tour the pages first,
  * then the investing profile, then create a PTC workspace and run a first
- * research in it, then model configuration, then channel integrations. Tasks
+ * research in it, then model configuration, then the desktop app (from the
+ * browser) or remote control of this Mac (in the app), then channel
+ * integrations. Tasks
  * complete via a route visit (stamped into prefs), a derived signal
- * (`doneWhen`), or — for external destinations — the click itself; clicking a
- * pending task navigates to `to`.
+ * (`doneWhen`), or, for an external destination with neither, the click
+ * itself; clicking a pending task navigates to `to`.
  */
 export const GETTING_STARTED_TASKS: GettingStartedTaskDef[] = [
   {
@@ -52,6 +55,26 @@ export const GETTING_STARTED_TASKS: GettingStartedTaskDef[] = [
     descKey: 'onboarding.gettingStarted.tasks.models.desc',
     to: '/settings?tab=model',
     visitRoute: (p, s) => p === '/settings' && new URLSearchParams(s).get('tab') === 'model',
+  },
+  {
+    id: 'desktopApp',
+    titleKey: 'onboarding.gettingStarted.tasks.desktopApp.title',
+    descKey: 'onboarding.gettingStarted.tasks.desktopApp.desc',
+    to: DESKTOP_DOWNLOAD_URL,
+    external: true,
+    offeredOn: 'browser',
+    doneWhen: 'inDesktopApp',
+  },
+  {
+    id: 'remoteControl',
+    titleKey: 'onboarding.gettingStarted.tasks.remoteControl.title',
+    descKey: 'onboarding.gettingStarted.tasks.remoteControl.desc',
+    to: '/chat',
+    // The Computers panel mounts with the chat page and reads its store as it
+    // does, so it opens onto the form however the page is reached.
+    open: () => openComputersPanel({ view: 'create', pick: 'thisMac' }),
+    offeredOn: 'thisMac',
+    doneWhen: 'thisMacAdded',
   },
   {
     id: 'integrations',

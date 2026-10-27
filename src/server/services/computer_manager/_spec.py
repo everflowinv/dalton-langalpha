@@ -517,6 +517,42 @@ class ComputerSpecMixin:
             logger.info(
                 f"Computer {computer_id} has no sandbox; persisted tier {tier!r} only"
             )
+        elif (
+            status == ComputerStatus.RUNNING
+            and not workspace_id
+            and not await get_live_workspace_ids_for_computer(computer_id)
+        ):
+            # No workspace on it: nothing to back up or restore, and the
+            # rebuild is workspace-addressed. Its sandbox goes, and a start
+            # builds one at the new tier, here under the change's locks: one
+            # after them could find the running slot this machine held taken,
+            # and a failure there would reach no one. It replaces a running
+            # machine, so the start takes no new slot.
+            await self._assert_spec_claim_owned(computer_id, claim_id)
+            if not await self._drop_empty_machine_sandbox(computer, sandbox_id):
+                raise ComputerBusyError(
+                    "This computer changed while preparing the spec change; retry"
+                )
+            current = await get_computer(computer_id)
+            if current is None or (current.get("config") or {}).get("retire_when_empty"):
+                # Gone, or its last workspace went while the change held the
+                # machine: a start would build a sandbox only to retire it.
+                return
+            claimed = await try_claim_computer_for_start(
+                computer_id, from_status=ComputerStatus.STOPPED
+            )
+            if claimed is None:
+                current = await get_computer(computer_id)
+                if current is not None and current.get("status") in (
+                    ComputerStatus.STARTING,
+                    ComputerStatus.RUNNING,
+                ):
+                    # Another start took it, at the tier persisted above.
+                    return
+                raise ComputerBusyError(
+                    "This computer changed while preparing the spec change; retry"
+                )
+            await self._build_started_machine(claimed, user_id=user_id)
         elif status == ComputerStatus.RUNNING:
             await self._replace_running_sandbox(
                 binding,

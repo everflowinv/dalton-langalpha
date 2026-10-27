@@ -2,7 +2,7 @@
 Tests for ptc_agent.core.sandbox.runtime — ABCs and data classes.
 
 Covers:
-- ExecResult, CodeRunResult, Artifact, RuntimeState data classes
+- ExecResult, RuntimeState data classes
 - SandboxRuntime ABC contract (cannot instantiate, subclass works, optional abilities, archive)
 - SandboxProvider ABC contract (cannot instantiate, is_transient_error default)
 """
@@ -10,8 +10,6 @@ Covers:
 import pytest
 
 from ptc_agent.core.sandbox.runtime import (
-    Artifact,
-    CodeRunResult,
     ExecResult,
     RuntimeState,
     SandboxProvider,
@@ -35,38 +33,6 @@ class TestExecResult:
         r = ExecResult(stdout="", stderr="fail", exit_code=1)
         assert r.exit_code == 1
         assert r.stderr == "fail"
-
-
-class TestArtifact:
-    def test_required_fields(self):
-        a = Artifact(type="image/png", data="base64data")
-        assert a.type == "image/png"
-        assert a.data == "base64data"
-
-    def test_name_default_none(self):
-        a = Artifact(type="text/plain", data="abc")
-        assert a.name is None
-
-    def test_name_provided(self):
-        a = Artifact(type="image/png", data="xyz", name="chart.png")
-        assert a.name == "chart.png"
-
-
-class TestCodeRunResult:
-    def test_fields(self):
-        r = CodeRunResult(stdout="42", stderr="", exit_code=0)
-        assert r.stdout == "42"
-        assert r.exit_code == 0
-
-    def test_artifacts_default_empty(self):
-        r = CodeRunResult(stdout="", stderr="", exit_code=0)
-        assert r.artifacts == []
-
-    def test_with_artifacts(self):
-        art = Artifact(type="image/png", data="aaa")
-        r = CodeRunResult(stdout="", stderr="", exit_code=0, artifacts=[art])
-        assert len(r.artifacts) == 1
-        assert r.artifacts[0].type == "image/png"
 
 
 class TestRuntimeState:
@@ -145,9 +111,6 @@ class TestSandboxRuntimeABC:
             async def exec(self, command, timeout=60):
                 return ExecResult("", "", 0)
 
-            async def code_run(self, code, env=None, timeout=300):
-                return CodeRunResult("", "", 0)
-
             async def upload_file(self, content, dest_path):
                 pass
 
@@ -190,9 +153,6 @@ class TestSandboxRuntimeABC:
 
             async def exec(self, command, timeout=60):
                 return ExecResult("", "", 0)
-
-            async def code_run(self, code, env=None, timeout=300):
-                return CodeRunResult("", "", 0)
 
             async def upload_file(self, content, dest_path):
                 pass
@@ -237,9 +197,6 @@ class TestSandboxRuntimeABC:
             async def exec(self, command, timeout=60):
                 return ExecResult("", "", 0)
 
-            async def code_run(self, code, env=None, timeout=300):
-                return CodeRunResult("", "", 0)
-
             async def upload_file(self, content, dest_path):
                 pass
 
@@ -281,9 +238,6 @@ class TestSandboxRuntimeABC:
 
             async def exec(self, command, timeout=60):
                 return ExecResult("", "", 0)
-
-            async def code_run(self, code, env=None, timeout=300):
-                return CodeRunResult("", "", 0)
 
             async def upload_file(self, content, dest_path):
                 pass

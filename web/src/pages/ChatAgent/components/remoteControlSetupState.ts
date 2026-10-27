@@ -193,8 +193,11 @@ export function useRemoteControlSetup(active: boolean) {
     /** Turn on, Continue and Try again alike: each mints a pairing and hands it to the helper. */
     start,
     readyStep: fields.step,
+    /** What the helper found on this Mac, once it is ready. */
+    ready: phase.kind === 'ready' ? phase.ready : null,
     /** The machine's part of the create body, once a supported Mac is ready. */
     create: fields.create,
+    defaultName: fields.defaultName,
   };
 }
 

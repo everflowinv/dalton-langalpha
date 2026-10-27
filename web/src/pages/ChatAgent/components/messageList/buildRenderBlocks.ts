@@ -1,5 +1,6 @@
 import { chartInstanceKey, planChartAnnotationCards } from '../chartAnnotationGrouping';
-import { INLINE_ARTIFACT_TOOLS, isInlineArtifactReady } from '../charts/InlineArtifactCards';
+import { INLINE_ARTIFACT_MAP, INLINE_ARTIFACT_TOOLS, isInlineArtifactReady } from '../charts/InlineArtifactCards';
+import { isPillArtifactType } from '../charts/pillArtifacts';
 import { normalizeSubagentText } from './normalizeSubagentText';
 import { isUserDataReadmePath } from '../../utils/agentPaths';
 import { MIN_LIVE_EXPOSURE_MS } from './liveZoneTiming';
@@ -32,6 +33,28 @@ export interface CompactArtifactRenderBlock {
   key: string;
   toolCallId: string;
   proc: ToolCallProcessRecord;
+  /** The call's artifact, which its card draws. */
+  artifact: Record<string, unknown>;
+  /** Null for an artifact let through by its tool's name that no card of
+   *  this build draws: the block draws nothing. */
+  card: ArtifactCard | null;
+}
+
+/** The card a compact artifact is drawn as, decided once where its block is built. */
+export interface ArtifactCard {
+  /** Its entry in `INLINE_ARTIFACT_MAP`. */
+  type: string;
+  /** `pill`: a one-line pill, in a wrapping row with the pills beside it.
+   *  `call`: its call's own card on a line of its own, which takes the call's
+   *  row over as the call lands (CardArrivals).
+   *  `chart`: a chart annotation's card, which every draw on the chart feeds. */
+  kind: 'pill' | 'call' | 'chart';
+}
+
+function cardOf(artifact: Record<string, unknown>): ArtifactCard | null {
+  const { type } = artifact;
+  if (typeof type !== 'string' || !INLINE_ARTIFACT_MAP[type]) return null;
+  return { type, kind: isPillArtifactType(type) ? 'pill' : type === 'chart_annotation' ? 'chart' : 'call' };
 }
 export interface SubagentTaskRenderBlock {
   type: 'subagent_task';
@@ -324,8 +347,8 @@ export function buildRenderBlocks(
           const createdAt = proc._createdAt as number | undefined;
           const age = createdAt ? now - createdAt : Infinity;
 
-          const artifactResult = (proc.toolCallResult as Record<string, unknown> | undefined)?.artifact as Record<string, unknown> | undefined;
-          const isArtifactReady = isInlineArtifactReady(proc.toolName as string, artifactResult);
+          const artifactResult = proc.toolCallResult?.artifact;
+          const isArtifactReady = isInlineArtifactReady(proc.toolName, artifactResult);
 
           const isAlwaysLive = ALWAYS_LIVE_TOOLS.has(proc.toolName as string);
 
@@ -353,10 +376,10 @@ export function buildRenderBlocks(
                 computedNextExpiry = expiry;
               }
             }
-          } else if (isArtifactReady) {
-            const isChartAnnotation = (artifactResult as Record<string, unknown>).type === 'chart_annotation';
+          } else if (artifactResult && isArtifactReady) {
+            const isChartAnnotation = artifactResult.type === 'chart_annotation';
             const plan = isChartAnnotation
-              ? chartCardPlan.get(chartInstanceKey(artifactResult as Record<string, unknown>))
+              ? chartCardPlan.get(chartInstanceKey(artifactResult))
               : undefined;
             if (isChartAnnotation && plan && plan.anchorCallId !== seg.toolCallId) {
               // A later draw on a chart whose card is already pinned at its first
@@ -369,13 +392,17 @@ export function buildRenderBlocks(
               // freshest cumulative artifact so it grows in place. Key is the
               // chart instance, not the tool-call id, so the element persists
               // across draws (no remount).
-              const freshestProc = (toolCallProcesses[plan.freshestCallId] as typeof proc) ?? proc;
+              const freshestProc = toolCallProcesses[plan.freshestCallId] ?? proc;
+              // The plan picked the freshest draw for its artifact.
+              const artifact = freshestProc.toolCallResult?.artifact ?? artifactResult;
               flushActivity();
               blocks.push({
                 type: 'compact_artifact',
-                key: `chart-${chartInstanceKey(artifactResult as Record<string, unknown>)}`,
+                key: `chart-${chartInstanceKey(artifactResult)}`,
                 toolCallId: plan.freshestCallId,
                 proc: freshestProc,
+                artifact,
+                card: cardOf(artifact),
               });
             } else {
               flushActivity();
@@ -384,6 +411,8 @@ export function buildRenderBlocks(
                 key: `compact-${seg.toolCallId}`,
                 toolCallId: seg.toolCallId!,
                 proc,
+                artifact: artifactResult,
+                card: cardOf(artifactResult),
               });
             }
           } else if (!streamEnded && age < MIN_LIVE_EXPOSURE_MS && !INLINE_ARTIFACT_TOOLS.has(proc.toolName as string)) {

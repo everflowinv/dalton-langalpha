@@ -618,62 +618,25 @@ async def _filter_local_packages(
     return remaining
 
 
-def _detect_missing_imports(sandbox: "PTCSandbox", stderr: str) -> list[str]:
-    """Extract missing module names from the executed script's own traceback.
+def missing_import(raised: str | None) -> str | None:
+    """The base package of the module a code run failed to import, read
+    from its own ``RAISED_FILE`` record; None when it names none.
 
-        Args:
-            stderr: Standard error output from code execution
-
-        Returns:
-            List of missing package names (base package only, e.g., 'foo' from 'foo.bar')
-        """
-    import re
-
-    # Whatever comes out of here is handed to `uv pip install` in the sandbox,
-    # so the input is trusted as narrowly as possible against two attacks:
-    #
-    # 1. Shell injection — the capture is a real dotted module path, never
-    #    "anything between the quotes". A name with a space or ``;`` fails to
-    #    match at all (and could never name an installable package anyway).
-    # 2. Dependency confusion — a third-party MCP server spawned during the run
-    #    shares this stderr stream and could inject a fake
-    #    "ModuleNotFoundError: No module named 'evil'" to make us install an
-    #    attacker-registered package (whose sdist build runs code). So only the
-    #    executed script's OWN unhandled exception is trusted: the FINAL
-    #    traceback block of stderr, and only when it carries a genuine frame
-    #    line. A server's mid-stream text, or a preceding block, is ignored.
-    marker = "Traceback (most recent call last):"
-    start = stderr.rfind(marker)
-    if start == -1:
-        return []
-    final_tb = stderr[start:]
-    if '\n  File "' not in final_tb:
-        # No real frame → not a Python interpreter traceback; don't trust it.
-        return []
-
-    patterns = [
-        r"ModuleNotFoundError: No module named ['\"]([A-Za-z_][A-Za-z0-9_.]*)['\"]",
-        r"ImportError: No module named ['\"]([A-Za-z_][A-Za-z0-9_.]*)['\"]",
-    ]
-
-    matches = []
-    for pattern in patterns:
-        matches.extend(re.findall(pattern, final_tb))
-
-    # Handle submodule imports (e.g., "foo.bar" -> "foo")
-    # DALTON-HOOK(sandbox-pip-system): also deduplicate and filter known workspace/layout folder names
-    known_local = _known_local_names(sandbox) if sandbox is not None else set()
-    base_packages = [
-        pkg for pkg in {m.split(".")[0] for m in matches} if pkg not in known_local
-    ]
-
-    if base_packages:
-        logger.info(
-            "Detected missing imports",
-            packages=base_packages,
-        )
-
-    return base_packages
+    Whatever comes out of here is handed to `uv pip install` in the sandbox.
+    The record holds only the ``name`` the import machinery set on the run's
+    own ``ModuleNotFoundError`` (the shipped sitecustomize writes nothing
+    else), so no text the run printed or an exception carried (a third-party
+    MCP server's error message, a fetched page) can name a package: that
+    would be a dependency-confusion install whose sdist build runs code. The
+    name must still be a whole dotted module path, so nothing but one
+    reaches the shell.
+    """
+    name = (raised or "").strip()
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.]*", name):
+        return None
+    package = name.split(".")[0]
+    logger.info("Detected missing imports", packages=[package])
+    return package
 
 
 async def _install_package(sandbox: "PTCSandbox", package: str) -> bool:
@@ -692,7 +655,7 @@ async def _install_package(sandbox: "PTCSandbox", package: str) -> bool:
             sandbox.runtime.exec,
             # Quoted at the sink as well as filtered at the parser: this is the
             # only place a caller-supplied name becomes shell text, so it should
-            # be safe for callers that don't come through _detect_missing_imports.
+            # be safe for callers that don't come through missing_import.
             # DALTON-HOOK(sandbox-pip-system): pass --system to uv pip install.
             f"uv pip install --system -q {shlex.quote(package)}",
             retry_policy=RetryPolicy.SAFE,

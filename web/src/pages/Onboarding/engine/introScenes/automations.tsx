@@ -30,7 +30,6 @@ import {
   FormRow,
   FormTitle,
   InstructionBox,
-  MenuSurface,
   MoreToggle,
   Readout,
   TriggerChips,
@@ -40,7 +39,7 @@ import {
 } from './automationForm';
 import { CLOSE, Camera, REST, type Shot, VIEW, corner, shot } from './camera';
 import { during, ease, useSceneTime } from './clock';
-import { Appear, Caret, Typed, pointerScript, pressAt } from './kit';
+import { Appear, Caret, MenuSurface, Typed, pointerScript, pressAt } from './kit';
 import type { IntroScene } from './types';
 
 /* Scenes for the Automations page: making a price alert beside a weekday

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { toast } from '@/components/ui/use-toast';
+import { copyText } from '@/lib/clipboard';
 import { shareLinkHref } from '@/pages/ChatAgent/utils/api/shareLinks';
 
 const COPIED_MS = 2000;
@@ -26,7 +27,7 @@ export function useCopyShareLink(): {
 
   const copy = useCallback(async (code: string, path?: string | null) => {
     try {
-      await navigator.clipboard.writeText(shareLinkHref(code, path));
+      await copyText(shareLinkHref(code, path));
     } catch (err) {
       console.error('[useCopyShareLink] Copy failed:', err);
       toast({ description: t('filePanel.shareLinkFailed'), variant: 'destructive' });

@@ -3,7 +3,7 @@ import { User, LogOut, Sun, Moon, Monitor } from 'lucide-react';
 import { Input } from '@/components/ui/input';
 import { Select } from '@/components/ui/select';
 import { ToggleSwitch } from '@/components/ui/switch';
-import { SegmentedControl } from '@/components/ui/segmented-control';
+import { SegmentedControl, type SegmentedOption } from '@/components/ui/segmented-control';
 import { updateCurrentUser, uploadAvatar } from '@/pages/Dashboard/utils/api';
 import { useAuth } from '@/contexts/AuthContext';
 import { useUser } from '@/hooks/useUser';
@@ -13,8 +13,9 @@ import { useQueryClient } from '@tanstack/react-query';
 import { queryKeys } from '@/lib/queryKeys';
 import { useTheme } from '@/contexts/ThemeContext';
 import { FONT_SCALES, getFontScale, setFontScale, type FontScale } from '@/lib/fontScale';
+import { CARD_STYLES, getCardStyle, setCardStyle, type CardStyle } from '@/lib/cardStyle';
 import { isDesktopShell } from '@/lib/desktop';
-import { getShareLinkOpen, setShareLinkOpen, type ShareLinkOpen } from '@/lib/shareLinkOpen';
+import { getShareLinkOpen, setShareLinkOpen } from '@/lib/shareLinkOpen';
 import { turnEndScrollPatch, readTurnEndScroll, type TurnEndScroll } from '@/lib/turnEndScroll';
 import {
   readStreamingMode,
@@ -38,6 +39,31 @@ import TimezonePicker from '@/components/TimezonePicker';
 import { deviceTimezone } from '@/lib/deviceTimezone';
 import type { Preferences } from './types';
 
+interface SegmentedSettingRowProps<T extends string> {
+  label: string;
+  description: string;
+  value: T;
+  onChange: (value: T) => void;
+  options: ReadonlyArray<SegmentedOption<T>>;
+}
+
+/** A setting answered by one of a few values: its name and what it does, and
+ *  the choice beside them, wrapping under on a narrow panel. */
+function SegmentedSettingRow<T extends string>({ label, description, value, onChange, options }: SegmentedSettingRowProps<T>) {
+  const labelId = useId();
+  return (
+    <div className="settings-row flex-wrap">
+      <div className="flex-1 basis-64">
+        <label id={labelId} className="text-[0.8125rem] font-medium" style={{ color: 'var(--color-text-primary)' }}>{label}</label>
+        <p className="mt-0.5 text-xs" style={{ color: 'var(--color-text-tertiary)' }}>{description}</p>
+      </div>
+      <div className="flex shrink-0">
+        <SegmentedControl labelledBy={labelId} value={value} onChange={onChange} options={options} />
+      </div>
+    </div>
+  );
+}
+
 /** User-info tab: avatar, name/timezone/locale with debounced auto-save,
  * theme preference, voice-input toggle, and logout. */
 export function UserInfoTab() {
@@ -49,16 +75,17 @@ export function UserInfoTab() {
   const queryClient = useQueryClient();
   const { theme: _theme, preference, setTheme: setThemePref } = useTheme();
   const [fontScale, setFontScaleState] = useState(getFontScale);
+  const [cardStyle, setCardStyleState] = useState(getCardStyle);
   const [shareLinkOpen, setShareLinkOpenState] = useState(getShareLinkOpen);
   const themeLabelId = useId();
   const fontSizeLabelId = useId();
-  const turnEndLabelId = useId();
-  const shareLinkOpenLabelId = useId();
-  const turnDisplayLabelId = useId();
-  const streamingModeLabelId = useId();
-  const toolCallLayoutLabelId = useId();
   const { t, i18n } = useTranslation();
   const activeLocale = useLocale();
+  const cardStyleLabels: Record<CardStyle, string> = {
+    quiet: t('settings.cardStyleQuiet'),
+    balanced: t('settings.cardStyleBalanced'),
+    terminal: t('settings.cardStyleTerminal'),
+  };
 
   const [avatarUrl, setAvatarUrl] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -355,25 +382,27 @@ export function UserInfoTab() {
         />
       </div>
 
+      {/* How the chat's data cards and their panels are drawn */}
+      <SegmentedSettingRow
+        label={t('settings.cardStyle')}
+        description={t('settings.cardStyleDesc')}
+        value={cardStyle}
+        onChange={(v) => { setCardStyle(v); setCardStyleState(v); }}
+        options={CARD_STYLES.map((style) => ({ value: style, label: cardStyleLabels[style] }))}
+      />
+
       {/* Desktop only: the browser has tabs, and keeps them for these links */}
       {isDesktopShell() && (
-        <div className="settings-row flex-wrap">
-          <div className="flex-1 basis-64">
-            <label id={shareLinkOpenLabelId} className="text-[0.8125rem] font-medium" style={{ color: 'var(--color-text-primary)' }}>{t('settings.shareLinkOpen')}</label>
-            <p className="mt-0.5 text-xs" style={{ color: 'var(--color-text-tertiary)' }}>{t('settings.shareLinkOpenDesc')}</p>
-          </div>
-          <div className="flex shrink-0">
-            <SegmentedControl
-              labelledBy={shareLinkOpenLabelId}
-              value={shareLinkOpen}
-              onChange={(v: ShareLinkOpen) => { setShareLinkOpen(v); setShareLinkOpenState(v); }}
-              options={[
-                { value: 'panel', label: t('settings.shareLinkOpenPanel') },
-                { value: 'browser', label: t('settings.shareLinkOpenBrowser') },
-              ]}
-            />
-          </div>
-        </div>
+        <SegmentedSettingRow
+          label={t('settings.shareLinkOpen')}
+          description={t('settings.shareLinkOpenDesc')}
+          value={shareLinkOpen}
+          onChange={(v) => { setShareLinkOpen(v); setShareLinkOpenState(v); }}
+          options={[
+            { value: 'panel', label: t('settings.shareLinkOpenPanel') },
+            { value: 'browser', label: t('settings.shareLinkOpenBrowser') },
+          ]}
+        />
       )}
 
       {/* Voice Input Toggle */}
@@ -390,80 +419,52 @@ export function UserInfoTab() {
       </div>
 
       {/* Where the transcript lands when a reply finishes */}
-      <div className="settings-row flex-wrap">
-        <div className="flex-1 basis-64">
-          <label id={turnEndLabelId} className="text-[0.8125rem] font-medium" style={{ color: 'var(--color-text-primary)' }}>{t('settings.turnEndScroll')}</label>
-          <p className="mt-0.5 text-xs" style={{ color: 'var(--color-text-tertiary)' }}>{t('settings.turnEndScrollDesc')}</p>
-        </div>
-        <div className="flex shrink-0">
-          <SegmentedControl
-            labelledBy={turnEndLabelId}
-            value={turnEndScroll}
-            onChange={(v) => { void handleTurnEndScrollChange(v); }}
-            options={[
-              { value: 'bottom', label: t('settings.turnEndScrollBottom') },
-              { value: 'reply_start', label: t('settings.turnEndScrollReplyStart') },
-            ]}
-          />
-        </div>
-      </div>
+      <SegmentedSettingRow
+        label={t('settings.turnEndScroll')}
+        description={t('settings.turnEndScrollDesc')}
+        value={turnEndScroll}
+        onChange={(v) => { void handleTurnEndScrollChange(v); }}
+        options={[
+          { value: 'bottom', label: t('settings.turnEndScrollBottom') },
+          { value: 'reply_start', label: t('settings.turnEndScrollReplyStart') },
+        ]}
+      />
 
       {/* Whether reasoning is shown as it streams */}
-      <div className="settings-row flex-wrap">
-        <div className="flex-1 basis-64">
-          <label id={turnDisplayLabelId} className="text-[0.8125rem] font-medium" style={{ color: 'var(--color-text-primary)' }}>{t('settings.turnDisplay')}</label>
-          <p className="mt-0.5 text-xs" style={{ color: 'var(--color-text-tertiary)' }}>{t('settings.turnDisplayDesc')}</p>
-        </div>
-        <div className="flex shrink-0">
-          <SegmentedControl
-            labelledBy={turnDisplayLabelId}
-            value={turnDisplay}
-            onChange={(v) => { void handleTurnDisplayChange(v); }}
-            options={[
-              { value: 'lean', label: t('settings.turnDisplayLean') },
-              { value: 'verbose', label: t('settings.turnDisplayVerbose') },
-            ]}
-          />
-        </div>
-      </div>
+      <SegmentedSettingRow
+        label={t('settings.turnDisplay')}
+        description={t('settings.turnDisplayDesc')}
+        value={turnDisplay}
+        onChange={(v) => { void handleTurnDisplayChange(v); }}
+        options={[
+          { value: 'lean', label: t('settings.turnDisplayLean') },
+          { value: 'verbose', label: t('settings.turnDisplayVerbose') },
+        ]}
+      />
 
       {/* How response text appears while it streams */}
-      <div className="settings-row flex-wrap">
-        <div className="flex-1 basis-64">
-          <label id={streamingModeLabelId} className="text-[0.8125rem] font-medium" style={{ color: 'var(--color-text-primary)' }}>{t('settings.streamingMode')}</label>
-          <p className="mt-0.5 text-xs" style={{ color: 'var(--color-text-tertiary)' }}>{t('settings.streamingModeDesc')}</p>
-        </div>
-        <div className="flex shrink-0">
-          <SegmentedControl
-            labelledBy={streamingModeLabelId}
-            value={streamingMode}
-            onChange={(v) => { void handleStreamingModeChange(v); }}
-            options={[
-              { value: 'token', label: t('settings.streamingModeToken') },
-              { value: 'paragraph', label: t('settings.streamingModeParagraph') },
-            ]}
-          />
-        </div>
-      </div>
+      <SegmentedSettingRow
+        label={t('settings.streamingMode')}
+        description={t('settings.streamingModeDesc')}
+        value={streamingMode}
+        onChange={(v) => { void handleStreamingModeChange(v); }}
+        options={[
+          { value: 'token', label: t('settings.streamingModeToken') },
+          { value: 'paragraph', label: t('settings.streamingModeParagraph') },
+        ]}
+      />
 
       {/* How a running turn shows its tool calls */}
-      <div className="settings-row flex-wrap">
-        <div className="flex-1 basis-64">
-          <label id={toolCallLayoutLabelId} className="text-[0.8125rem] font-medium" style={{ color: 'var(--color-text-primary)' }}>{t('settings.toolCallLayout')}</label>
-          <p className="mt-0.5 text-xs" style={{ color: 'var(--color-text-tertiary)' }}>{t('settings.toolCallLayoutDesc')}</p>
-        </div>
-        <div className="flex shrink-0">
-          <SegmentedControl
-            labelledBy={toolCallLayoutLabelId}
-            value={toolCallLayout}
-            onChange={(v) => { void handleToolCallLayoutChange(v); }}
-            options={[
-              { value: 'rows', label: t('settings.toolCallLayoutRows') },
-              { value: 'status', label: t('settings.toolCallLayoutStatus') },
-            ]}
-          />
-        </div>
-      </div>
+      <SegmentedSettingRow
+        label={t('settings.toolCallLayout')}
+        description={t('settings.toolCallLayoutDesc')}
+        value={toolCallLayout}
+        onChange={(v) => { void handleToolCallLayoutChange(v); }}
+        options={[
+          { value: 'rows', label: t('settings.toolCallLayoutRows') },
+          { value: 'status', label: t('settings.toolCallLayoutStatus') },
+        ]}
+      />
       </div>
 
       {error && (

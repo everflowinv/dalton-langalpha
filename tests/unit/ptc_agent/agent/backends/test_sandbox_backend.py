@@ -2,7 +2,7 @@
 
 Covers:
 - Protocol methods (als, aread, awrite[overwrite=], aedit, agrep, aglob, aexecute).
-- Rich adapter-extension methods (path helpers, agrep_rich, aexecute_bash, etc.).
+- Rich adapter-extension methods (path helpers, agrep_rich, etc.).
 - Sync-stub removal: assert direct overrides of every async method so the
   protocol base class's async-dispatches-to-sync default can never fire.
 """
@@ -61,9 +61,6 @@ def _make_sandbox(working_dir: str = "/home/workspace") -> MagicMock:
     sandbox.execute_bash_command = AsyncMock(
         return_value={"success": True, "stdout": "", "stderr": "", "exit_code": 0}
     )
-    sandbox.execute = AsyncMock()
-    sandbox.stop_background_command = AsyncMock(return_value=True)
-    sandbox.get_background_command_status = AsyncMock(return_value={})
     sandbox.start_and_get_preview_url = AsyncMock()
     return sandbox
 
@@ -595,43 +592,6 @@ class TestAgrepRich:
         assert kwargs["multiline"] is True
         assert kwargs["head_limit"] == 100
         assert kwargs["offset"] == 5
-
-
-class TestRichExec:
-    @pytest.mark.asyncio
-    async def test_aexecute_bash_forwards_options(self, sandbox, backend):
-        await backend.aexecute_bash(
-            "npm test",
-            working_dir="/src",
-            timeout=300,
-            background=True,
-            thread_id="abc12345",
-        )
-        kwargs = sandbox.execute_bash_command.call_args.kwargs
-        assert kwargs["command"] == "npm test"
-        assert kwargs["working_dir"] == "/src"
-        assert kwargs["timeout"] == 300
-        assert kwargs["background"] is True
-        assert kwargs["thread_id"] == "abc12345"
-
-    @pytest.mark.asyncio
-    async def test_astop_background_command_delegates(self, sandbox, backend):
-        sandbox.stop_background_command.return_value = True
-        result = await backend.astop_background_command("bash_0001")
-        assert result is True
-        sandbox.stop_background_command.assert_awaited_with("bash_0001")
-
-    @pytest.mark.asyncio
-    async def test_aget_background_command_status_delegates(self, sandbox, backend):
-        sandbox.get_background_command_status.return_value = {"is_running": True}
-        result = await backend.aget_background_command_status("bash_0001")
-        assert result == {"is_running": True}
-
-    @pytest.mark.asyncio
-    async def test_aexecute_code_forwards_thread_id(self, sandbox, backend):
-        await backend.aexecute_code("print(1)", thread_id="th12345")
-        sandbox.execute.assert_awaited_once()
-        assert sandbox.execute.call_args.kwargs["thread_id"] == "th12345"
 
 
 class TestMiscRich:

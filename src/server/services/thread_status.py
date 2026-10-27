@@ -155,10 +155,12 @@ async def read_thread_runtime_status(
 
         rb = await read_report_back_slice(thread_id, user_id)
         active_tasks = rb.get("active_tasks", [])
+        active_commands = rb.get("active_commands", [])
         pending_report_back = rb["pending_report_back"]
         report_back_run_id = rb["report_back_run_id"]
         recent_report_back_run_ids = rb.get("recent_report_back_run_ids", [])
         owed_threads = rb.get("owed_threads")
+        owed_report_kinds = rb.get("owed_report_kinds")
 
         # Staleness signal for cached (never-unmounted) frontend views: once a
         # run is terminal there is no reconnectable run_id, so the persisted
@@ -187,11 +189,13 @@ async def read_thread_runtime_status(
             "last_update": last_update,
             "progress": checkpoint_info,
             "active_tasks": active_tasks,
+            "active_commands": active_commands,
             "is_shared": is_shared,
             "pending_report_back": pending_report_back,
             "report_back_run_id": report_back_run_id,
             "recent_report_back_run_ids": recent_report_back_run_ids,
             "owed_threads": owed_threads,
+            "owed_report_kinds": owed_report_kinds,
         }
 
         logger.debug(f"Status check for {thread_id}: {status}")

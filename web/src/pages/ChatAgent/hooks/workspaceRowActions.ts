@@ -8,9 +8,14 @@
  * their own presentation side effects through `onAfterPin`.
  */
 import type { QueryClient, QueryKey } from '@tanstack/react-query';
+import { forgetSharedWorkspaceThreads } from '@/lib/navThreadsStore';
 import { queryKeys } from '@/lib/queryKeys';
+import { scrollMemory } from '@/lib/scrollMemory';
+import { clearAllMarketThreadsForWorkspace } from '../../MarketView/utils/threadPersistence';
+import { forgetNavPanelExpansion } from '../components/navExpansionStore';
 import { updateWorkspace } from '../utils/api';
-import { resetWorkspaceOrderFreeze } from './useNavigationData';
+import { forgetStableNavOrder, resetWorkspaceOrderFreeze } from './useNavigationData';
+import { removeStoredThreadId } from './utils/threadStorage';
 
 // Shape of a cached workspace-list query entry (queryKeys.workspaces.lists()).
 interface CachedWorkspaceList {
@@ -81,6 +86,24 @@ export function removeCachedWorkspace(queryClient: QueryClient, wsId: string): v
       };
     },
   );
+}
+
+/**
+ * Everything this tab keeps about a workspace that is now deleted: stored
+ * thread pointers (chat and market), remembered tree expansion, frozen nav
+ * orders, the shared thread lists, scroll positions, and its row in every
+ * cached list, so nothing re-expands or 404s a dead workspace while the
+ * refetch the caller starts is in flight.
+ */
+export function forgetDeletedWorkspace(queryClient: QueryClient, wsId: string): void {
+  removeStoredThreadId(wsId);
+  clearAllMarketThreadsForWorkspace(wsId);
+  forgetNavPanelExpansion(wsId);
+  forgetStableNavOrder(wsId);
+  forgetSharedWorkspaceThreads(wsId);
+  scrollMemory.forget(`threads:${wsId}:active`);
+  scrollMemory.forget(`threads:${wsId}:archived`);
+  removeCachedWorkspace(queryClient, wsId);
 }
 
 /** A cached list read in the custom order (the gallery's under Custom, the sidebar's). */

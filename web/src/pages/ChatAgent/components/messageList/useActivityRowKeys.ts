@@ -23,7 +23,7 @@ function advance(prev: RowKeys, items: ActivityItem[], calls: readonly Preparing
   const byId = new Map(prev.byId);
   // Calls that stopped streaming, in the order they were written. Each one
   // that landed hands its row to its item: by id when the producer named the
-  // call, else by order (the Anthropic route streams arguments anonymously).
+  // call, else by order.
   const ended = prev.calls.filter((call) => !streaming.has(call.pendingKey));
   for (const item of items) {
     if (item.type !== 'tool_call' || known.has(item.id)) continue;

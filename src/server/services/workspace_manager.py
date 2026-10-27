@@ -10,9 +10,9 @@ project rather than a machine: creating one and deleting one.
 import asyncio
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, NamedTuple, Optional
 
 from ptc_agent.core.sandbox.runtime import RuntimeState, SandboxTransientError
 from ptc_agent.core.session import Session
@@ -24,8 +24,10 @@ from src.server.database.computer import (
     get_computers_by_status,
     update_computer_status,
 )
+from src.server.database.conversation import forget_workspace_exists
 from src.server.database.home_workspace import is_home_row
 from src.server.database.workspace import (
+    ACTIVE_WORK_DELETE_REFUSAL,
     MOVING_DELETE_REFUSAL,
     SERVER_OWNED_CONFIG_KEYS,
     WorkspaceBusyError,
@@ -34,7 +36,9 @@ from src.server.database.workspace import (
     create_workspace_on_computer,
     delete_workspace as db_delete_workspace,
     files_restore_offered,
+    get_live_workspace_ids_for_computer,
     get_pending_workspace_folder_cleanups,
+    workspace_has_active_work,
     workspace_is_moving,
 )
 from src.server.database.workspace_folders import (
@@ -44,20 +48,38 @@ from src.server.database.workspace_folders import (
 )
 from src.server.database.workspace_names import checked_workspace_name
 from src.server.models.computer import ComputerStatus
+from src.server.services.path_lock_coordination import STOP_HEARTBEAT_UNAVAILABLE_RECOVERY_S
 from src.server.services.computer_errors import (
     ComputerNotFoundError,
     ComputerPreparingError,
+    ComputerRemovalRefused,
+    Retirement,
 )
 from src.server.services.computer_manager import ComputerManager
+from src.server.services.computer_manager._types import (
+    WorkspaceNotFound,
+    WorkspaceNotOnComputer,
+)
 from src.server.services.persistence.file import FilePersistenceService
 
 logger = logging.getLogger(__name__)
+
+
+class IdleWindow(NamedTuple):
+    """When the idle sweep stops a running computer if nothing more counts as
+    activity, and the idle timeout that time is its last activity plus."""
+
+    stop_at: datetime
+    timeout_s: int
+
 
 # How many consecutive idle-stop failures on one machine before the sweep stops
 # trying it, and for how long. Without this a machine that cannot be stopped
 # repeats its error every cycle for as long as the process lives.
 _IDLE_REAP_FAILURE_LIMIT = 3
 _IDLE_REAP_BACKOFF_SECONDS = 3600.0
+# Past a provider stop's own bound, for one reconcile of a stuck stop.
+STUCK_STOP_RECONCILE_TIMEOUT_S = 150.0
 
 
 class WorkspaceManager(ComputerManager):
@@ -333,6 +355,7 @@ class WorkspaceManager(ComputerManager):
         workspace_id: str,
         *,
         delete_files: bool = False,
+        on_computer: Optional[str] = None,
     ) -> bool:
         """
         Delete a workspace: the project only, never its machine by itself.
@@ -351,12 +374,21 @@ class WorkspaceManager(ComputerManager):
         Args:
             workspace_id: Workspace UUID
             delete_files: The owner asked for the folder on their machine to go too.
+            on_computer: Only from this computer; a workspace a move has
+                taken elsewhere is left alone.
 
         Returns:
             True if deleted successfully
+
+        Raises:
+            WorkspaceNotFound: It is deleted already, or not on ``on_computer``.
+            WorkspaceBusyError: A move or a turn holds it.
+            ValueError: It is Home, or has no computer.
         """
         binding = await self.resolve_binding(workspace_id)
         computer_id = binding.computer_id
+        if on_computer is not None and str(computer_id) != str(on_computer):
+            raise WorkspaceNotFound(workspace_id, computer_id=on_computer)
         try:
             owners_machine = not binding.provider.recreatable
         except ValueError:
@@ -366,7 +398,7 @@ class WorkspaceManager(ComputerManager):
         async with self._observed_lock(computer_id, "workspace.delete"):
             workspace = await self.workspace_row(workspace_id)
             if not workspace:
-                raise ValueError(f"Workspace {workspace_id} not found")
+                raise WorkspaceNotFound(workspace_id)
             if is_home_row(workspace):
                 # Here rather than only at the route: an agent's tool deletes
                 # through this method too.
@@ -375,10 +407,21 @@ class WorkspaceManager(ComputerManager):
             # move instead; the delete's own transaction checks again.
             if await workspace_is_moving(workspace_id):
                 raise WorkspaceBusyError(MOVING_DELETE_REFUSAL)
+            # Before its commands are ended below, which a delete refused for
+            # a live run would otherwise have stopped for nothing.
+            if await workspace_has_active_work(workspace_id):
+                raise WorkspaceBusyError(ACTIVE_WORK_DELETE_REFUSAL)
 
             logger.info(f"Deleting workspace {workspace_id}")
 
             retired = False
+
+            # Ended here, before the last backup reads the folder: a command
+            # left running would keep writing into a folder that is going,
+            # and report into a project that is gone.
+            from src.server.services.commands.control import end_workspace_commands
+
+            await end_workspace_commands(workspace_id)
 
             try:
                 # The project's last mirror sync, before anything on the
@@ -419,6 +462,9 @@ class WorkspaceManager(ComputerManager):
         from src.server.services.wakeups import cancel as wakeups_cancel
 
         await wakeups_cancel.cancel_on_workspace_delete(workspace_id)
+        # Every delete, whoever asked for it (the route, the agent's tool, a
+        # removed computer's workspaces), so the next thread write reads the row.
+        await forget_workspace_exists(workspace_id)
 
         if not retired:
             # Its proxied previews stop now rather than at expiry; a retired
@@ -429,6 +475,74 @@ class WorkspaceManager(ComputerManager):
             await revoke(binding.provider_ref)
 
         return True
+
+    async def remove_computer_with_workspaces(
+        self,
+        computer_id: str,
+        named: Collection[str] = (),
+        *,
+        delete_files: bool = False,
+    ) -> list[str]:
+        """Remove a computer its owner no longer wants, deleting the workspaces
+        on it first, and answer the ones deleted.
+
+        ``named`` are the workspaces its owner was shown, and every one on it
+        must be among them, so an empty computer needs none. What would refuse
+        the remove anyway is asked first (``removal_held``), so a refusal
+        deletes nothing: the primary, a transition, a workspace not named, a
+        workspace a move holds or a run is working in, and Home, which no
+        delete takes. A named one no longer on it is left alone, and is not
+        among those answered, so the client forgets only what went. Each goes
+        as its own delete would take it, so a machine the user brought keeps
+        its folders unless ``delete_files``. On a provider that builds machines
+        the last delete retires the computer, which is this removal done.
+
+        Raises:
+            ComputerRemovalRefused: nothing was deleted, or something landed
+                on it meanwhile, and ``deleted`` names the workspaces already
+                gone; ``code`` says why.
+            ValueError: there is no such computer, or it is already gone.
+        """
+        computer = await get_computer(computer_id)
+        if computer is None:
+            raise ValueError(f"Computer {computer_id} not found")
+        held = self.removal_held(computer)
+        workspace_ids = await get_live_workspace_ids_for_computer(computer_id)
+        shown = {str(i) for i in named}
+        for workspace_id in workspace_ids if held is None else ():
+            row = await self.workspace_row(workspace_id)
+            if str(workspace_id) not in shown or (row and is_home_row(row)):
+                held = Retirement.HAS_WORKSPACES
+            elif await workspace_is_moving(workspace_id) or await workspace_has_active_work(
+                workspace_id
+            ):
+                held = Retirement.BUSY
+            if held is not None:
+                break
+        if held is not None:
+            raise ComputerRemovalRefused(held)
+        deleted: list[str] = []
+        for workspace_id in workspace_ids:
+            try:
+                await self.delete_workspace(
+                    workspace_id, delete_files=delete_files, on_computer=computer_id
+                )
+            except WorkspaceBusyError:
+                # A move or a run that started since the check above.
+                raise ComputerRemovalRefused(Retirement.BUSY, deleted=deleted) from None
+            except (WorkspaceNotFound, WorkspaceNotOnComputer):
+                # Deleted by another request since the list was read, or
+                # moved off this computer.
+                continue
+            deleted.append(str(workspace_id))
+        if workspace_ids and await get_computer(computer_id) is None:
+            return deleted
+        try:
+            await self.remove_computer(computer_id)
+        except ComputerRemovalRefused as e:
+            # A workspace landed on it meanwhile; the ones deleted stay so.
+            raise ComputerRemovalRefused(e.code, deleted=deleted) from None
+        return deleted
 
     async def cleanup_idle_workspaces(self) -> int:
         """Stop computers that have gone quiet, and reconcile always-on.
@@ -470,28 +584,16 @@ class WorkspaceManager(ComputerManager):
             ):
                 continue
 
-            # A machine nothing has stamped, such as one a migration carried
-            # over, has been idle since its row last changed. Skipping it left
-            # the row 'running' for good once the provider stopped the sandbox:
-            # short of the user stopping it, nothing else moves a running row.
-            last_activity = computer.get("last_activity_at") or computer.get(
-                "updated_at"
-            )
-            if not last_activity:
-                continue
-
-            # Handle timezone-aware comparison
-            if last_activity.tzinfo is None:
-                last_activity = last_activity.replace(tzinfo=timezone.utc)
-
-            idle_seconds = (now - last_activity).total_seconds()
             try:
-                idle_timeout = self._idle_timeout_for(computer)
+                window = self._idle_window(computer)
             except ValueError as e:
                 # Settings the stop could not build a provider from either.
                 self._note_idle_reap_failure(computer_id, e)
                 continue
-            if idle_seconds <= idle_timeout:
+            if window is None:
+                continue
+            idle_seconds = window.timeout_s + (now - window.stop_at).total_seconds()
+            if now <= window.stop_at:
                 continue
 
             # Skip machines that still have an active agent workflow. The gate
@@ -545,6 +647,44 @@ class WorkspaceManager(ComputerManager):
             ):
                 completed += 1
         return completed
+
+    def _idle_window(self, computer: Dict[str, Any]) -> Optional[IdleWindow]:
+        """When the sweep stops this running computer if nothing more counts
+        as activity, and the idle timeout that time comes from; None for a
+        row with no stamp at all.
+
+        A machine nothing has stamped, such as one a migration carried over,
+        has been idle since its row last changed. Skipping it left the row
+        'running' for good once the provider stopped the sandbox: short of
+        the user stopping it, nothing else moves a running row.
+
+        Raises:
+            ValueError: The computer's provider settings are unreadable.
+        """
+        last_activity = computer.get("last_activity_at") or computer.get("updated_at")
+        if not last_activity:
+            return None
+        if last_activity.tzinfo is None:
+            last_activity = last_activity.replace(tzinfo=timezone.utc)
+        idle_timeout = self._idle_timeout_for(computer)
+        return IdleWindow(last_activity + timedelta(seconds=idle_timeout), idle_timeout)
+
+    def idle_stop_window(self, computer: Dict[str, Any]) -> Optional[IdleWindow]:
+        """``_idle_window`` for a reader outside the sweep, such as the
+        background command watcher keeping a computer up: None where the sweep
+        never stops the machine.
+
+        An always-on flag exempts it. The sweep exempts exactly the flagged
+        machines once it has reconciled them, since it clears the flag of one
+        whose owner lost the entitlement before it reaps; a machine whose
+        settings no provider can be built from is never stopped either.
+        """
+        if computer.get("is_always_on"):
+            return None
+        try:
+            return self._idle_window(computer)
+        except ValueError:
+            return None
 
     def _idle_timeout_for(self, computer: Dict[str, Any]) -> int:
         """Seconds idle before the sweep stops this computer.
@@ -682,8 +822,49 @@ class WorkspaceManager(ComputerManager):
 
         return reverted
 
+    async def reap_stuck_stopping_computers(self) -> int:
+        """Settle computers a stop left in 'stopping' with no stopper alive.
+
+        A worker that dies mid-stop (a deploy, a crash) leaves the row
+        'stopping', and only a start or a workspace's bring-up used to ask the
+        provider about it: a machine with neither stayed 'stopping', which
+        refuses both its start and its removal. Each row past a provider
+        stop's bound goes through the reconcile a start runs, which leaves a
+        stopper still renewing its heartbeat be and settles the rest from the
+        provider's state.
+
+        Returns:
+            Number of computers no longer 'stopping'.
+        """
+        cutoff = datetime.now(timezone.utc) - timedelta(
+            seconds=STOP_HEARTBEAT_UNAVAILABLE_RECOVERY_S
+        )
+        settled = 0
+        for computer in await get_computers_by_status("stopping", limit=1000):
+            updated_at = computer.get("updated_at")
+            if not updated_at:
+                continue
+            if updated_at.tzinfo is None:
+                updated_at = updated_at.replace(tzinfo=timezone.utc)
+            if updated_at > cutoff:
+                continue
+            computer_id = str(computer["computer_id"])
+            try:
+                # A dark machine answers within its dial timeout; this bounds
+                # one that never does, so the rest are still reached.
+                async with asyncio.timeout(STUCK_STOP_RECONCILE_TIMEOUT_S):
+                    after = await self.reconcile_stopping_computer(computer_id)
+            except Exception as e:
+                logger.warning(f"Could not settle stuck stop of computer {computer_id}: {e!r}")
+                continue
+            if after is not None and after.get("status") != ComputerStatus.STOPPING:
+                logger.info(f"Settled computer {computer_id}, stuck in 'stopping', as {after.get('status')!r}")
+                settled += 1
+        return settled
+
     async def start_cleanup_task(self) -> None:
-        """Start the background cleanup task, and the left-folder and usage sweeps beside it.
+        """Start the background cleanup task, and the left-folder, usage and
+        stuck-stop sweeps beside it.
 
         Both sweeps dial machines or providers, any of which may be dark or
         slow, so each runs in a loop of its own rather than ahead of idle
@@ -723,6 +904,17 @@ class WorkspaceManager(ComputerManager):
                 except Exception as e:
                     logger.error(f"Error in left-folder sweep loop: {e}")
 
+        async def stuck_stopping_loop():
+            while not self._shutdown:
+                try:
+                    await asyncio.sleep(self.cleanup_interval)
+                    if not self._shutdown:
+                        await self.reap_stuck_stopping_computers()
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    logger.error(f"Error in stuck-stop sweep loop: {e}")
+
         async def usage_loop():
             # First at once, so a deploy opens runs for the computers already
             # running rather than a cycle later.
@@ -739,6 +931,7 @@ class WorkspaceManager(ComputerManager):
         self._cleanup_task = asyncio.create_task(cleanup_loop())
         self._left_folders_task = asyncio.create_task(left_folders_loop())
         self._usage_task = asyncio.create_task(usage_loop())
+        self._stuck_stopping_task = asyncio.create_task(stuck_stopping_loop())
         logger.info("Workspace cleanup task started")
 
 
@@ -755,3 +948,4 @@ def prune_if_archived_soon(thread_id: str) -> None:
     manager = WorkspaceManager.current()
     if manager is not None:
         manager.prune_if_archived_soon(thread_id)
+

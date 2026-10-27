@@ -47,6 +47,7 @@ from src.server.database.workspace import (
 )
 from src.server.database.workspace_folders import (
     PREVIOUS_DIR_NAMES_MAX,
+    computer_command_running,
     computer_run_in_progress,
     folder_allocation,
     is_top_level,
@@ -196,6 +197,10 @@ async def claim_workspace_move(
                 raise MoveRefused("turn_active")
             if await computer_run_in_progress(cur, str(workspace["computer_id"])):
                 raise MoveRefused("busy")
+            if not from_backup and await computer_command_running(
+                cur, str(workspace["computer_id"])
+            ):
+                raise MoveRefused("command_running")
             await cur.execute(
                 f"""
                 INSERT INTO workspace_moves (
@@ -298,13 +303,14 @@ async def stage_workspace_move(
     and no run may be in progress anywhere on the source, since sibling
     workspaces use each other's folders. A turn admitted while a lapsed row
     fenced nothing is seen here too. Raises ``MoveRefused("busy")`` while one
-    runs.
+    runs, and ``MoveRefused("command_running")`` while a command does, unless
+    the move is from the backup, which leaves the source's folder as it is.
     """
     async with get_db_connection() as conn, conn.transaction(), conn.cursor(
         row_factory=dict_row
     ) as cur:
         await cur.execute(
-            "SELECT source_computer_id FROM workspace_moves WHERE move_id = %s",
+            "SELECT source_computer_id, from_backup FROM workspace_moves WHERE move_id = %s",
             (move_id,),
         )
         move = await cur.fetchone()
@@ -321,6 +327,8 @@ async def stage_workspace_move(
         )
         if await computer_run_in_progress(cur, source):
             raise MoveRefused("busy")
+        if not move["from_backup"] and await computer_command_running(cur, source):
+            raise MoveRefused("command_running")
         await cur.execute(
             f"""
             UPDATE workspace_moves

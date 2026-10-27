@@ -4,10 +4,10 @@
  * forty times. It stands where the computer filter stands once there are two.
  *
  * Its state, badge and a filling disk are the machine's, so they ride here
- * too, and a click opens the Computers dialog on it, as a card's machine name
- * does when there are several.
+ * too. It is the trigger of the toolbar's computer menu, so it takes the
+ * trigger's props and ref and puts them on its button.
  */
-import type { CSSProperties } from 'react';
+import type { ComponentPropsWithRef } from 'react';
 import { useTranslation } from 'react-i18next';
 
 import type { Computer } from '@/types/api';
@@ -17,15 +17,12 @@ import { ComputerStatusIndicator } from '../computerStatusUi';
 import { PREPARING_UI, computerStatusUi, isComputerPreparing } from '../../utils/computerStatus';
 import { DiskPercent } from './DiskPercent';
 
-interface ComputerChipProps {
+interface ComputerChipProps extends Omit<ComponentPropsWithRef<'button'>, 'children'> {
   computer: Computer;
   isThisMac: boolean;
-  onOpen: (computerId: string) => void;
-  className?: string;
-  style?: CSSProperties;
 }
 
-export function ComputerChip({ computer, isThisMac, onOpen, className, style }: ComputerChipProps) {
+export function ComputerChip({ computer, isThisMac, ...button }: ComputerChipProps) {
   const { t } = useTranslation();
   const preparing = isComputerPreparing(computer);
   const running = computer.status === 'running' && !preparing;
@@ -34,11 +31,8 @@ export function ComputerChip({ computer, isThisMac, onOpen, className, style }: 
   return (
     <button
       type="button"
-      className={className}
-      style={style}
-      title={t('computer.manageComputer', 'Manage {{name}}', { name: computer.name })}
-      onClick={() => onOpen(computer.computer_id)}
       data-testid="computer-chip"
+      {...button}
     >
       {/* The glyph names the state for a screen reader; the word after is for the eye. */}
       <ComputerStatusIndicator status={computer.status} preparing={preparing} glyphSize={10} glyphOnly className="shrink-0" />

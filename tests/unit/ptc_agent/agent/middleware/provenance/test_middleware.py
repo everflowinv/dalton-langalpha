@@ -920,102 +920,13 @@ async def test_bash_strips_mcp_trace_from_artifact(middleware):
     assert result.artifact["other"] == "kept"
 
 
-# ----- BashOutput shares the same pipeline (the completion-poll entry point) --
-
-
-@pytest.mark.asyncio
-async def test_bash_output_extracts_mcp_trace_like_execute_code(middleware):
-    # A backgrounded script's MCP calls are harvested on the BashOutput that
-    # observes completion, so BashOutput surfaces the same mcp_trace artifact and
-    # must produce identical mcp_tool provenance, attributed to the BashOutput call.
-    artifact = {
-        "mcp_trace": [
-            {
-                "server": "marketdata",
-                "tool": "quote",
-                "args": {"symbol": "TST"},
-                "result_sha256": "a" * 64,
-                "result_size": 12,
-                "result_snippet": "snip",
-                "timestamp": "2026-01-01T00:00:00+00:00",
-            }
-        ]
-    }
-    emitted = []
-    await _run(
-        middleware,
-        _make_request("BashOutput", {"command_id": "cmd-1"}, tool_call_id="bashout-1"),
-        _result(content="done", artifact=artifact),
-        emitted,
-    )
-    assert len(emitted) == 1
-    assert emitted[0]["identifier"] == "marketdata:quote"
-    assert emitted[0]["source_type"] == "mcp_tool"
-    assert emitted[0]["tool_call_id"] == "bashout-1"
-
-
-@pytest.mark.asyncio
-async def test_bash_output_records_despite_error_content(middleware):
-    # BashOutput is exempt from the error-result skip like Bash/ExecuteCode: the
-    # polled command may have exited non-zero after an MCP call already succeeded.
-    artifact = {
-        "mcp_trace": [
-            {
-                "server": "finance",
-                "tool": "get_prices",
-                "args": {"symbol": "TST"},
-                "result_sha256": "abc",
-                "result_size": 10,
-                "result_snippet": "ok",
-            }
-        ]
-    }
-    emitted = []
-    await _run(
-        middleware,
-        _make_request("BashOutput", {"command_id": "cmd-1"}, tool_call_id="bashout-1"),
-        _result(content="ERROR: Command failed (exit code 1)", artifact=artifact),
-        emitted,
-    )
-    assert len(emitted) == 1
-    assert emitted[0]["source_type"] == "mcp_tool"
-
-
-@pytest.mark.asyncio
-async def test_bash_output_strips_mcp_trace_from_artifact(middleware):
-    """mcp_trace must not survive on the BashOutput artifact either."""
-    artifact = {
-        "mcp_trace": [
-            {
-                "server": "marketdata",
-                "tool": "quote",
-                "args": {"symbol": "TST"},
-                "result_sha256": "a" * 64,
-                "result_size": 12,
-                "result_snippet": "snip",
-            }
-        ],
-        "other": "kept",
-    }
-    result = await _run(
-        middleware,
-        _make_request("BashOutput", {"command_id": "cmd-1"}, tool_call_id="bashout-1"),
-        _result(content="done", artifact=artifact),
-        [],
-    )
-    assert "mcp_trace" not in result.artifact
-    assert result.artifact["other"] == "kept"
-
-
 # ----- host-side caps on the untrusted in-sandbox trace ----------------------
 
 
 @pytest.mark.asyncio
 async def test_execute_code_caps_entries_and_snippet(middleware):
-    from ptc_agent.agent.middleware.provenance.middleware import (
-        _MAX_TRACE_ENTRIES,
-        SNIPPET_MAX_CHARS,
-    )
+    from ptc_agent.agent.provenance import SNIPPET_MAX_CHARS
+    from ptc_agent.agent.provenance.trace import MAX_TRACE_ENTRIES
 
     trace = [
         {
@@ -1025,7 +936,7 @@ async def test_execute_code_caps_entries_and_snippet(middleware):
             "result_size": 1,
             "result_snippet": "x" * (SNIPPET_MAX_CHARS + 50),
         }
-        for i in range(_MAX_TRACE_ENTRIES + 25)
+        for i in range(MAX_TRACE_ENTRIES + 25)
     ]
     emitted = []
     await _run(
@@ -1034,7 +945,7 @@ async def test_execute_code_caps_entries_and_snippet(middleware):
         _result(content="SUCCESS", artifact={"mcp_trace": trace}),
         emitted,
     )
-    assert len(emitted) == _MAX_TRACE_ENTRIES  # entries capped
+    assert len(emitted) == MAX_TRACE_ENTRIES  # entries capped
     assert all(len(e["result_snippet"]) <= SNIPPET_MAX_CHARS for e in emitted)
 
 

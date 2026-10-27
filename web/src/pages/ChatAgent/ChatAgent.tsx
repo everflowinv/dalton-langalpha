@@ -142,6 +142,9 @@ function ChatAgent(): React.ReactElement | null {
   if (workspaceId && workspaceId !== resolvedWorkspaceId) {
     setResolvedWorkspaceId(workspaceId);
   }
+  // The workspace on screen: a thread's, or the one whose threads are listed.
+  // The gallery of every workspace shows none, whatever was resolved last.
+  const shownWorkspaceId = (threadId || urlWorkspaceId) ? workspaceId : null;
 
   // DALTON-HOOK(team-sharing): only publish active thread / seen cursor when ownership is confirmed
   const { data: activeWorkspace } = useWorkspace(isDaltonAuth ? workspaceId : null);
@@ -382,7 +385,7 @@ function ChatAgent(): React.ReactElement | null {
         {!threadId && galleryContent}
         {chatViews}
         {accessDeniedContent}
-        <ComputersDialogHost />
+        <ComputersDialogHost currentWorkspaceId={shownWorkspaceId} />
       </div>
     );
   }
@@ -418,7 +421,7 @@ function ChatAgent(): React.ReactElement | null {
       {accessDeniedContent}
       {/* Computer management and change-spec, opened from the gallery, a
           card's machine line, or a disk warning in any chat. */}
-      <ComputersDialogHost />
+      <ComputersDialogHost currentWorkspaceId={shownWorkspaceId} />
     </div>
   );
 }

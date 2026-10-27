@@ -2,7 +2,7 @@ import { afterEach, describe, it, expect, vi } from 'vitest';
 import { act, render, screen } from '@testing-library/react';
 import i18n from '@/i18n';
 
-vi.mock('../../../ChatAgent/components/charts/MarketDataCharts', () => {
+vi.mock('../../../ChatAgent/components/charts/CompanyCharts', () => {
   const Stub = () => null;
   return {
     PerformanceBarChart: Stub,

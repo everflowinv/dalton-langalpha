@@ -19,7 +19,6 @@ processes it started.
 from __future__ import annotations
 
 import asyncio
-import base64
 import contextlib
 import errno
 import json
@@ -27,7 +26,6 @@ import posixpath
 import re
 import stat
 import time
-import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from datetime import UTC, datetime
 from typing import Any
@@ -42,17 +40,12 @@ from ptc_agent.core.sandbox.providers._ssh_authorized_key import (
     authorized_key_line,
     converge_script,
 )
-from ptc_agent.core.sandbox.providers._chart_capture import (
-    build_code_wrapper,
-    extract_artifacts,
-)
 from ptc_agent.core.sandbox.providers._exec_sessions import ExecSessionRuntime
 from ptc_agent.core.sandbox.providers._ssh_connect import SSHTarget
 from ptc_agent.core.sandbox.providers._ssh_shell import (
     BOOT_KEY_SH,
     SUDO_CHECK,
     check_env,
-    code_run_command,
     computer_dir,
     computers_dir,
     delete_script,
@@ -79,7 +72,6 @@ from ptc_agent.core.sandbox.providers._ssh_transport import (
 from ptc_agent.core.sandbox.providers.ssh_errors import SSHConnectError
 from ptc_agent.core.sandbox.runtime import (
     STREAM_CHUNK_BYTES,
-    CodeRunResult,
     ExecResult,
     PreviewInfo,
     RuntimeState,
@@ -694,8 +686,8 @@ class SSHRuntime(ExecSessionRuntime):
     def _outcome(
         self, result: FramedResult, *, timeout: float, what: str
     ) -> tuple[str, str, int]:
-        """A framed run's stdout, stderr and exit code, as exec and code_run
-        report them.
+        """A framed run's stdout, stderr and exit code, as exec
+        reports them.
 
         Raises:
             SandboxTransientError: The computer is marked stopped.
@@ -771,31 +763,6 @@ class SSHRuntime(ExecSessionRuntime):
             facts.has_sudo = result.exit_code == 0
             facts.sudo_needs_tty = not facts.has_sudo and b"tty" in result.stdout
         return facts.has_sudo
-
-    async def code_run(
-        self,
-        code: str,
-        env: dict[str, str] | None = None,
-        timeout: int = 300,
-    ) -> CodeRunResult:
-        link = await self._link()
-        script = f"{self._working_dir}/_exec_{uuid.uuid4().hex[:8]}.py"
-        payload = base64.b64encode(build_code_wrapper(code).encode()).decode()
-        # The command travels on stdin, so the script rides inside it at any
-        # size. The turn's own directory is reached by the shipped
-        # ``sitecustomize.py``, which reads ``PTC_TURN_CWD`` out of ``env``.
-        result = await self._framed(
-            link,
-            code_run_command(script, payload),
-            timeout=timeout,
-            env=env,
-            merge=False,
-        )
-        stdout, stderr, exit_code = self._outcome(result, timeout=timeout, what="code")
-        artifacts, clean_stdout = extract_artifacts(stdout)
-        return CodeRunResult(
-            stdout=clean_stdout, stderr=stderr, exit_code=exit_code, artifacts=artifacts
-        )
 
     # -- File I/O --
 

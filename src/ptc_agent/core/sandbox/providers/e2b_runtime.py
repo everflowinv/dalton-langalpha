@@ -10,10 +10,7 @@ the window.
 from __future__ import annotations
 
 import asyncio
-import base64
-import shlex
 import time
-import uuid
 from collections.abc import AsyncIterator, Mapping
 from datetime import UTC, datetime
 from typing import Any
@@ -29,15 +26,10 @@ from e2b import (
 from e2b.sandbox.filesystem.filesystem import FileType, WriteEntry
 
 from ptc_agent.config.core import PlatformSecretDefinition
-from ptc_agent.core.paths import DEFAULT_SANDBOX_ROOT
-from ptc_agent.core.sandbox.providers._chart_capture import (
-    build_code_wrapper,
-    extract_artifacts,
-)
+from ptc_agent.core.paths import DEFAULT_SANDBOX_ROOT, SandboxLayout
 from ptc_agent.core.sandbox.providers._exec_sessions import ExecSessionRuntime
 from ptc_agent.core.sandbox.providers.e2b_secrets import egress_rules
 from ptc_agent.core.sandbox.runtime import (
-    CodeRunResult,
     ExecResult,
     PreviewInfo,
     RuntimeState,
@@ -62,13 +54,13 @@ _STREAM_TIMEOUT_S = 60 * 60
 # Pausing snapshots memory at about 4 s per GiB, so the largest tier needs more
 # than a plain request gets.
 _PAUSE_TIMEOUT_S = 180
+# The stop's one exec that ends the computer's jobs before the pause: a TERM
+# grace of 3 s, and the round trip.
+_END_JOBS_TIMEOUT_S = 30
 # Headroom past a command's own timeout, so the deadline never lands mid-command.
 _COMMAND_MARGIN_S = 120
 # How long a state read stays good enough to attach on without reading again.
 _STATE_FRESH_S = 10.0
-# The longest script code_run sends inside its command. The command reaches
-# bash as one argument, which Linux caps at 128 KiB.
-_INLINE_SCRIPT_MAX = 96 * 1024
 # The header E2B requires on every request to a port of a sandbox created
 # without public traffic.
 TRAFFIC_TOKEN_HEADER = "e2b-traffic-access-token"
@@ -195,12 +187,38 @@ class E2BRuntime(ExecSessionRuntime):
         self._alive_until = time.monotonic() + self._window_s
 
     async def stop(self, timeout: int = 60, *, force: bool = False) -> None:
+        await self._end_jobs()
         await self._client.AsyncSandbox.pause(
             self._id, request_timeout=max(timeout, _PAUSE_TIMEOUT_S)
         )
         self._sandbox = None
         self._state = RuntimeState.STOPPED
         self._alive_until = 0.0
+
+    async def _end_jobs(self) -> None:
+        """End the computer's detached jobs before a pause, which keeps every
+        process: a job would otherwise run on once the computer starts again,
+        long after its command was reported lost. Best effort, and only on a
+        sandbox already running (an exec never resumes one); what this misses,
+        the bring-up after the next start ends."""
+        from ptc_agent.core.sandbox import jobs
+
+        if self._sandbox is None and self._state is not RuntimeState.RUNNING:
+            return
+        try:
+            async with asyncio.timeout(_END_JOBS_TIMEOUT_S):
+                ended = await jobs.end_jobs(
+                    self.exec, SandboxLayout(self._working_dir).system_jobs
+                )
+        except Exception as e:  # noqa: BLE001 - the pause must go on
+            logger.warning(
+                "Could not end jobs before pausing E2B sandbox",
+                sandbox_id=self._id,
+                error=str(e) or type(e).__name__,
+            )
+            return
+        if ended:
+            logger.info("Ended jobs before pausing E2B sandbox", sandbox_id=self._id, jobs=ended)
 
     async def delete(self) -> None:
         # False means it was already gone, which is the outcome asked for.
@@ -341,55 +359,6 @@ class E2BRuntime(ExecSessionRuntime):
             # A nonzero exit is a result here, not an error.
             exc.exit_code = _exit_status(exc.exit_code, exc.error)
             return exc
-
-    async def code_run(
-        self,
-        code: str,
-        env: dict[str, str] | None = None,
-        timeout: int = 300,
-    ) -> CodeRunResult:
-        sandbox = await self._ready(timeout)
-        script_path = f"{self._working_dir}/_exec_{uuid.uuid4().hex[:8]}.py"
-        script = shlex.quote(script_path)
-        wrapped = build_code_wrapper(code)
-        payload = base64.b64encode(wrapped.encode()).decode()
-        # One round trip: the script travels in the command, which writes it,
-        # runs it and removes it. Only a script too long for a command line
-        # costs a separate write first.
-        if len(payload) <= _INLINE_SCRIPT_MAX:
-            write = f"printf %s {payload} | base64 -d > {script} && "
-        else:
-            await sandbox.files.write(
-                script_path,
-                wrapped,
-                user=_USER,
-                request_timeout=_FS_TIMEOUT_S,
-            )
-            write = ""
-        # The turn's own directory is reached by the shipped
-        # ``sitecustomize.py``, which reads ``PTC_TURN_CWD`` out of ``env``.
-        try:
-            result = await self._run(
-                sandbox,
-                f"{write}python3 {script}; rc=$?; rm -f {script}; exit $rc",
-                timeout=timeout,
-                envs=env,
-            )
-        except BaseException:
-            # The command's own cleanup did not get to run.
-            try:
-                await sandbox.files.remove(script_path, user=_USER)
-            except Exception:
-                pass
-            raise
-
-        artifacts, clean_stdout = extract_artifacts(result.stdout)
-        return CodeRunResult(
-            stdout=clean_stdout,
-            stderr=result.stderr,
-            exit_code=result.exit_code,
-            artifacts=artifacts,
-        )
 
     # -- File I/O --
 

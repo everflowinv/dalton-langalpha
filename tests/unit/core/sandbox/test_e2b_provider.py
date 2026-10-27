@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from e2b import (
@@ -192,6 +192,52 @@ class TestKeepAlive:
 
         client.AsyncSandbox.set_timeout.assert_not_awaited()
         assert await runtime.get_state() is RuntimeState.STOPPED
+
+
+class TestStopEndsJobs:
+    """A pause keeps every process, so the stop ends the computer's jobs first."""
+
+    def _runtime(self, client: SimpleNamespace, **kw) -> E2BRuntime:
+        return E2BRuntime(
+            client, "sbx-1", window_s=3600, max_timeout_s=86400,
+            default_working_dir="/home/workspace", **kw,
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_jobs_end_before_the_pause(self):
+        order: list[str] = []
+        client = _client()
+        client.AsyncSandbox.pause.side_effect = lambda *a, **k: order.append("pause")
+
+        async def end_jobs(exec_fn, jobs_dir, *a, **k):
+            order.append(f"end {jobs_dir}")
+            return 2
+
+        runtime = self._runtime(client, sandbox=MagicMock())
+        with patch("ptc_agent.core.sandbox.jobs.end_jobs", new=end_jobs):
+            await runtime.stop()
+
+        assert order == ["end /home/workspace/.system/jobs", "pause"]
+
+    @pytest.mark.asyncio
+    async def test_a_failed_end_still_pauses(self):
+        client = _client()
+        runtime = self._runtime(client, sandbox=MagicMock())
+        with patch(
+            "ptc_agent.core.sandbox.jobs.end_jobs", new=AsyncMock(side_effect=TimeoutError())
+        ):
+            await runtime.stop()
+        client.AsyncSandbox.pause.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_a_paused_sandbox_is_not_resumed_to_end_its_jobs(self):
+        client = _client(_info("paused"))
+        runtime = await _provider(client).get("sbx-1")
+        end = AsyncMock()
+        with patch("ptc_agent.core.sandbox.jobs.end_jobs", new=end):
+            await runtime.stop()
+        end.assert_not_awaited()
+        client.AsyncSandbox.connect.assert_not_awaited()
 
 
 class TestExec:

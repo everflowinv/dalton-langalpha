@@ -370,7 +370,7 @@ class BackgroundSubagentOrchestrator:
                     f"instruction rather than re-dispatching."
                 )
             return (
-                f"Your background subagent task has finished: **{task.display_id}**.\n\n"
+                f"Your background subagent task has completed: **{task.display_id}**.\n\n"
                 f"Call `TaskOutput(task_id=\"{task.task_id}\")` to see the result."
             )
 
@@ -380,10 +380,9 @@ class BackgroundSubagentOrchestrator:
             for t in sorted_tasks
         )
         return (
-            f"Your background subagent tasks have finished: {task_list}.\n\n"
-            f"Call `TaskOutput()` to see all results, or "
-            f"`TaskOutput(task_id=\"...\")` for a specific task. A task marked "
-            f"stopped produced no result; do not re-dispatch it unless asked."
+            f"Your background subagent tasks have completed: {task_list}.\n\n"
+            f"Call `TaskOutput(task_id=\"...\")` for each task's result. A task "
+            f"marked stopped produced no result; do not re-dispatch it unless asked."
         )
 
     def get_pending_tasks_status(self) -> dict[str, Any]:

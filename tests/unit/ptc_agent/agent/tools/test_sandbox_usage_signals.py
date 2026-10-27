@@ -7,16 +7,18 @@ counts against the computer's open usage run and never costs the tool a thing.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from ptc_agent.agent.tools import utils
 from ptc_agent.agent.tools.bash import create_execute_bash_tool
-from ptc_agent.agent.tools.bash_output import create_bash_output_tool
 from ptc_agent.agent.tools.code_execution import create_execute_code_tool
+from ptc_agent.agent.tools.command_handoff import HandOff
+from tests.unit.ptc_agent.agent.job_fakes import outcome
 
 RECORD = "src.server.database.computer_runs.record_oom_kill"
 
@@ -42,30 +44,18 @@ def _backend(*, tier: str | None = None, sandbox_id: str | None = "sbx-1", **res
     backend.channel = "daytona"
     backend.sandbox_id = sandbox_id
     backend.sandbox = SimpleNamespace(resource_tier=tier)
-    backend.aexecute_code = AsyncMock(return_value=results.get("code"))
-    backend.aexecute_bash = AsyncMock(return_value=results.get("bash"))
+    backend.start_code_job = AsyncMock(return_value=results.get("code"))
+    backend.start_bash_job = AsyncMock(return_value=results.get("bash"))
+    backend.stop_job = AsyncMock(return_value=True)
     return backend
 
 
 def _code_result(exit_code: int | None = 0, *, failure: str | None = None):
-    return SimpleNamespace(
-        success=exit_code == 0 and not failure,
-        stdout="out",
-        stderr="err",
-        mcp_trace=[],
-        failure=failure,
-        exit_code=exit_code,
-    )
+    return outcome(exit_code=exit_code, output="err" if exit_code else "out", failure=failure)
 
 
-def _bash_result(exit_code: int = 0, **extra: Any):
-    return {
-        "success": exit_code == 0,
-        "stdout": "out",
-        "stderr": "",
-        "exit_code": exit_code,
-        **extra,
-    }
+def _bash_result(exit_code: int | None = 0, *, failure: str | None = None):
+    return outcome(exit_code=exit_code, output="out", failure=failure)
 
 
 def _code_call() -> dict:
@@ -117,7 +107,7 @@ class TestResourceTierTag:
             _backend(code=_code_result(1)), None, session=session
         )
         raising = _backend()
-        raising.aexecute_bash = AsyncMock(side_effect=RuntimeError("boom"))
+        raising.start_bash_job = AsyncMock(side_effect=RuntimeError("boom"))
         bash = create_execute_bash_tool(raising, session=session)
 
         _, code_meta = await traced_tool(code, _code_call())
@@ -146,12 +136,10 @@ class TestOomKillCount:
         assert "exit code 137" in out.content
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("exit_code", [0, 1, 2, 130, 139, None])
+    @pytest.mark.parametrize("exit_code", [0, 1, 2, 130, 139])
     async def test_other_exits_are_not_counted(self, _computer_runs, exit_code):
         code = create_execute_code_tool(_backend(code=_code_result(exit_code)), None)
-        bash = create_execute_bash_tool(
-            _backend(bash={**_bash_result(1), "exit_code": exit_code})
-        )
+        bash = create_execute_bash_tool(_backend(bash=_bash_result(exit_code)))
 
         await code.ainvoke(_code_call())
         await bash.ainvoke(_bash_call())
@@ -159,39 +147,28 @@ class TestOomKillCount:
         _computer_runs.record_oom_kill.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_a_background_start_is_not_counted(self, _computer_runs):
-        # It answers with a command id, never the command's exit.
-        tool = create_execute_bash_tool(
-            _backend(bash=_bash_result(137, command_id="cmd-1"))
-        )
-
-        await tool.ainvoke(_bash_call(run_in_background=True))
-
-        _computer_runs.record_oom_kill.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_a_background_job_is_counted_by_the_read_that_sees_it_finish(
-        self, _computer_runs
+    @pytest.mark.parametrize("background", [False, True], ids=["handed-off", "background"])
+    async def test_a_command_moved_to_the_background_is_not_counted(
+        self, _computer_runs, background
     ):
-        backend = _backend()
-        done = {"is_running": False, "exit_code": 137, "stdout": "", "stderr": ""}
-        backend.aget_background_command_status = AsyncMock(
-            side_effect=[{**done, "is_running": True, "exit_code": None}, done]
+        # It answers with a command id, never the command's exit.
+        session = SimpleNamespace(computer_id="00000000-0000-4000-8000-00000000cccc")
+        hand_off = HandOff(
+            thread_id="00000000-0000-4000-8000-000000000001",
+            user_id="user-1",
+            workspace_id="00000000-0000-4000-8000-00000000aaaa",
+            wakeups=True,
         )
-        tool = create_bash_output_tool(backend)
-        call = {
-            "type": "tool_call",
-            "name": "BashOutput",
-            "args": {"command_id": "cmd-1"},
-            "id": "o1",
-        }
+        tool = create_execute_bash_tool(
+            _backend(bash=outcome(done=False)), session=session, hand_off=hand_off
+        )
 
-        await tool.ainvoke(call)
+        with patch(
+            "src.server.database.runs.command_runs.record_handoff", new=AsyncMock()
+        ):
+            await tool.ainvoke(_bash_call(run_in_background=background))
+
         _computer_runs.record_oom_kill.assert_not_awaited()
-        out = await tool.ainvoke(call)
-
-        _computer_runs.record_oom_kill.assert_awaited_once_with("daytona", "sbx-1")
-        assert "exit code 137" in out.content
 
     @pytest.mark.asyncio
     async def test_a_sandbox_failure_is_not_counted(self, _computer_runs):
@@ -206,6 +183,23 @@ class TestOomKillCount:
         await bash.ainvoke(_bash_call())
 
         _computer_runs.record_oom_kill.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_job_that_vanished_is_not_counted(self, _computer_runs):
+        """Its 137 is a shell's reading of a wrapper gone with no exit
+        written; nobody saw it OOM-killed, as the watcher's finalize holds."""
+        code = create_execute_code_tool(
+            _backend(code=dataclasses.replace(_code_result(137), killed=True)), None
+        )
+        bash = create_execute_bash_tool(
+            _backend(bash=dataclasses.replace(_bash_result(137), killed=True))
+        )
+
+        await code.ainvoke(_code_call())
+        out = await bash.ainvoke(_bash_call())
+
+        _computer_runs.record_oom_kill.assert_not_awaited()
+        assert "exit code 137" in out.content
 
     @pytest.mark.asyncio
     async def test_a_sandbox_without_an_id_is_not_counted(self, _computer_runs):

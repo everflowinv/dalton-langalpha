@@ -5,6 +5,7 @@ import { Shield, Copy, Check } from 'lucide-react';
 import type { TestResult } from '@/components/model/ApiKeyInput';
 import { api } from '@/api/client';
 import { CheckboxChoice } from '@/components/ui/choice';
+import { copyText } from '@/lib/clipboard';
 import type { AccessType, RegionVariant } from '@/components/model/types';
 import { returnFromSetup } from '@/lib/setupReturn';
 import { cn } from '@/lib/utils';
@@ -166,11 +167,11 @@ export function CopyButton({ text }: { text: string }) {
 
   const handleCopy = useCallback(async () => {
     try {
-      await navigator.clipboard.writeText(text);
+      await copyText(text);
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
     } catch {
-      // Fallback
+      // The browser refused the copy; the button just doesn't confirm.
     }
   }, [text]);
 

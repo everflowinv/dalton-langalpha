@@ -280,15 +280,18 @@ export function GettingStartedLauncher(props: GettingStartedLauncherProps) {
 
   const select = (def: GettingStartedTaskDef) => {
     if (!def.external) {
+      def.open?.();
       navigate(def.to);
       return;
     }
+    // A task with its own signal is done by that, not by the visit.
+    const stamps = !def.doneWhen;
     if (isDesktopShell()) {
       // The portal shares this window in the desktop app, as Usage & Plan
       // does, and the shell answers a window.open with a window of its own or
       // the browser. Leaving unloads the page, so the stamp goes first.
       const waited = new Promise<void>((resolve) => setTimeout(resolve, STAMP_WAIT_MS));
-      void Promise.race([completeTask(def.id), waited]).then(() => window.location.assign(def.to));
+      void Promise.race([stamps ? completeTask(def.id) : undefined, waited]).then(() => window.location.assign(def.to));
       return;
     }
     // Cross-app page — no route of ours to observe, so a successful open is
@@ -300,7 +303,7 @@ export function GettingStartedLauncher(props: GettingStartedLauncherProps) {
     const win = window.open(def.to, '_blank');
     if (win) {
       win.opener = null;
-      completeTask(def.id);
+      if (stamps) completeTask(def.id);
     }
   };
 

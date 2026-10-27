@@ -60,6 +60,21 @@ class WorkspaceNotOnComputer(ValueError):
         )
 
 
+class WorkspaceNotFound(ValueError):
+    """The workspace is deleted, or is not on the computer the caller named.
+
+    A ValueError, as a route answers any not found, and a type of its own so
+    a caller that expects another request to have deleted it can tell that
+    from every other refusal a delete raises as a ValueError."""
+
+    def __init__(self, workspace_id: str, *, computer_id: Optional[str] = None):
+        self.workspace_id = workspace_id
+        super().__init__(
+            f"Workspace {workspace_id} not found"
+            + (f" on computer {computer_id}" if computer_id else "")
+        )
+
+
 @dataclass(frozen=True)
 class ComputerBinding:
     """Which machine a project is on, and how to reach that machine's backend.

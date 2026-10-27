@@ -14,17 +14,19 @@ import { queryKeys } from '@/lib/queryKeys';
 
 vi.mock('../../utils/api', () => ({
   getComputers: vi.fn(),
+  getComputerProviders: vi.fn(),
   uploadWorkspaceFile: vi.fn(),
   startWorkspace: vi.fn(),
   formatApiErrorDetail: (err: unknown) =>
     (err as { message?: string })?.message ?? 'Request failed',
 }));
 
-import { getComputers, startWorkspace, uploadWorkspaceFile } from '../../utils/api';
+import { getComputerProviders, getComputers, startWorkspace, uploadWorkspaceFile } from '../../utils/api';
 import CreateWorkspaceModal from '../CreateWorkspaceModal';
 
 const mockUpload = uploadWorkspaceFile as Mock;
 const mockGetComputers = getComputers as Mock;
+const mockProviders = getComputerProviders as Mock;
 
 // POST /api/v1/workspaces, captured verbatim.
 const LIVE_CREATED = {
@@ -69,6 +71,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   vi.mocked(startWorkspace).mockResolvedValue({ workspace_id: LIVE_CREATED.workspace_id, status: 'running' });
   mockGetComputers.mockResolvedValue({ computers: [PRIMARY], total: 1 });
+  mockProviders.mockResolvedValue({ providers: [{ kind: 'daytona', is_default: true, allowed: null }] });
 });
 
 function setup(onCreate: Mock, onComplete = vi.fn(), onClose = vi.fn()) {
@@ -138,6 +141,23 @@ describe('CreateWorkspaceModal', () => {
     await waitFor(() =>
       expect(onCreate).toHaveBeenCalledWith({ name: 'On the second', description: '', computerId: SECOND_ID }),
     );
+  });
+
+  it('names what each computer runs on once the providers differ', async () => {
+    mockGetComputers.mockResolvedValue({
+      computers: [PRIMARY, machine(SECOND_ID, 'Second machine', { kind: 'e2b' })],
+      total: 2,
+    });
+    mockProviders.mockResolvedValue({
+      providers: [
+        { kind: 'daytona', is_default: true, allowed: null },
+        { kind: 'e2b', is_default: false, allowed: true },
+      ],
+    });
+    setup(vi.fn());
+
+    expect(await screen.findByRole('option', { name: 'Alpha Research · Daytona (Primary)' })).toBeInTheDocument();
+    expect(screen.getByRole('option', { name: 'Second machine · E2B' })).toBeInTheDocument();
   });
 
   it('has no resource-tier picker: the tier belongs to the machine', async () => {

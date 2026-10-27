@@ -17,6 +17,7 @@ from fastapi import HTTPException
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool, tool
 
+from ptc_agent.core.sandbox.jobs import Failed, Running
 from src.dalton.access_tiers import get_user_tier
 from src.dalton.auth import (
     resolve_caller_home_workspace_id,
@@ -202,6 +203,13 @@ def _validate_and_normalize_workspace_file_path(
     return ws_root, rel_path, None
 
 
+#: How long a metadata-inspection code job may run before the gate fails
+#: closed. The check itself (`stat`/`realpath`) is subsecond; the budget only
+#: has to cover the sandbox python's startup and imports, so a cold container
+#: gets seconds, not minutes.
+_METADATA_JOB_WAIT_S: float = 20.0
+
+
 async def _exec_sandbox_argv(
     backend: Any,
     argv: list[str],
@@ -210,8 +218,12 @@ async def _exec_sandbox_argv(
 ) -> tuple[int, str]:
     """Execute `argv` (`stat` or `realpath`) in the sandbox as an argument list without a shell.
 
-    Never interpolates any argument into a shell command string. Raises `RuntimeError`
-    if execution fails or is unsupported so callers always fail closed.
+    Never interpolates any argument into a shell command string: the argv rides
+    base64-encoded into a Python one-shot the sandbox runs as a code job.
+    Raises `RuntimeError` if execution fails, is unsupported, or outlives its
+    wait — this is a synchronous fail-closed gate, so a check that cannot
+    complete must never read as passed, and a job that outlives the wait is
+    stopped rather than left dangling.
     """
     if not isinstance(argv, list) or not argv:
         raise RuntimeError("argv must be a non-empty list")
@@ -221,41 +233,49 @@ async def _exec_sandbox_argv(
         if not isinstance(arg, str) or "\x00" in arg or _FORBIDDEN_PATH_CHARS_RE.search(arg):
             raise RuntimeError("Invalid argument in argv list")
 
-    aexec_argv_fn = getattr(backend, "aexec_argv", None)
-    if callable(aexec_argv_fn):
-        res = await aexec_argv_fn(list(argv), timeout=timeout)
-        exit_code = getattr(res, "exit_code", None)
-        output = getattr(res, "output", None)
-        if not isinstance(exit_code, int) or isinstance(exit_code, bool) or not isinstance(output, str):
-            raise RuntimeError("Backend aexec_argv returned invalid response")
-        return exit_code, output
+    start_code_job_fn = getattr(backend, "start_code_job", None)
+    if not callable(start_code_job_fn):
+        raise RuntimeError("Filesystem backend does not support code jobs")
 
-    aexecute_code_fn = getattr(backend, "aexecute_code", None)
-    if callable(aexecute_code_fn):
-        argv_b64 = base64.b64encode(json.dumps(list(argv)).encode("utf-8")).decode("ascii")
-        code = (
-            "import base64, json, subprocess, sys\n"
-            f"argv = json.loads(base64.b64decode('{argv_b64}').decode('utf-8'))\n"
-            "proc = subprocess.run(argv, shell=False, check=False, capture_output=True, text=True)\n"
-            "print(json.dumps({'exit_code': proc.returncode, 'stdout': proc.stdout, 'stderr': proc.stderr}))\n"
+    argv_b64 = base64.b64encode(json.dumps(list(argv)).encode("utf-8")).decode("ascii")
+    code = (
+        "import base64, json, subprocess, sys\n"
+        f"argv = json.loads(base64.b64decode('{argv_b64}').decode('utf-8'))\n"
+        "proc = subprocess.run(argv, shell=False, check=False, capture_output=True, text=True)\n"
+        "print(json.dumps({'exit_code': proc.returncode, 'stdout': proc.stdout, 'stderr': proc.stderr}))\n"
+    )
+    outcome = await start_code_job_fn(code, wait_s=_METADATA_JOB_WAIT_S)
+    if isinstance(outcome, Running):
+        try:
+            await backend.stop_job(outcome.handle.ref, discard=True)
+        except Exception:
+            logger.warning(
+                "Could not stop metadata inspection job %s",
+                outcome.handle.ref.command_id,
+                exc_info=True,
+            )
+        raise RuntimeError("Sandbox metadata inspection outlived its wait")
+    if isinstance(outcome, Failed):
+        raise RuntimeError(f"Sandbox metadata inspection failed: {outcome.message}")
+    if outcome.exit_code != 0:
+        # The one-shot python itself failed (startup, import): its own exit
+        # code, never the payload's, since none was printed.
+        raise RuntimeError(
+            f"Sandbox metadata inspection job failed (exit={outcome.exit_code})"
         )
-        exec_res = await aexecute_code_fn(code)
-        if getattr(exec_res, "success", None) is not True:
-            raise RuntimeError("Sandbox aexecute_code metadata inspection failed")
-        stdout_raw = getattr(exec_res, "stdout", None)
-        if not isinstance(stdout_raw, str) or not stdout_raw.strip():
-            raise RuntimeError("Sandbox aexecute_code returned empty stdout")
-        last_line = stdout_raw.strip().splitlines()[-1]
-        parsed = json.loads(last_line)
-        if not isinstance(parsed, dict):
-            raise RuntimeError("Sandbox aexecute_code returned non-dict payload")
-        exit_code = parsed.get("exit_code")
-        stdout_str = parsed.get("stdout")
-        if not isinstance(exit_code, int) or isinstance(exit_code, bool) or not isinstance(stdout_str, str):
-            raise RuntimeError("Sandbox aexecute_code returned malformed result")
-        return exit_code, stdout_str
 
-    raise RuntimeError("Filesystem backend does not support non-shell argv execution")
+    stdout_raw = outcome.output
+    if not isinstance(stdout_raw, str) or not stdout_raw.strip():
+        raise RuntimeError("Sandbox code job returned empty stdout")
+    last_line = stdout_raw.strip().splitlines()[-1]
+    parsed = json.loads(last_line)
+    if not isinstance(parsed, dict):
+        raise RuntimeError("Sandbox code job returned non-dict payload")
+    exit_code = parsed.get("exit_code")
+    stdout_str = parsed.get("stdout")
+    if not isinstance(exit_code, int) or isinstance(exit_code, bool) or not isinstance(stdout_str, str):
+        raise RuntimeError("Sandbox code job returned malformed result")
+    return exit_code, stdout_str
 
 
 async def _read_workspace_file_safely(

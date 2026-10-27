@@ -18,13 +18,18 @@ export interface LineStep {
   running: boolean;
 }
 
-export type Slot =
+/** The tool calls a row or the slot draws, by id: the one whose card lands
+ *  takes over its place (LiveRow, CardArrivals). */
+type Draws = { calls: readonly string[] };
+
+export type Slot = Draws & (
   | { kind: 'summary'; counted: ActivityItem[] }
   /** The step the block opened on, run where the summary will be, and the
    *  status line while the line names it. */
-  | { kind: 'lead'; key: string; step: Step; isLine: boolean };
+  | { kind: 'lead'; key: string; step: Step; isLine: boolean }
+);
 
-export type Row = { key: string; live: boolean } & (
+export type Row = { key: string; live: boolean } & Draws & (
   | { kind: 'line'; line: LineStep }
   /** One item, or a run of calls of one file verb drawn as a row. */
   | { kind: 'run'; run: ActivityItem[] }
@@ -54,10 +59,18 @@ export function isOpenThought(item: ActivityItem, liveReasoningOpen: boolean): b
   return item.type === 'reasoning' && isRunning(item) && liveReasoningOpen;
 }
 
-const runRow = (keys: RowKeys, run: ActivityItem[]): Row =>
-  ({ kind: 'run', key: keys.forItem(run[0]), run, live: run.some((entry) => entry._liveState !== 'completed') });
+const NO_CALLS: readonly string[] = [];
 
-const callRow = (keys: RowKeys, call: PreparingCall): Row => ({ kind: 'call', key: keys.forCall(call), call, live: true });
+const callsOf = (items: readonly ActivityItem[]): readonly string[] =>
+  items.flatMap((item) => (item.type === 'tool_call' ? [item.id] : []));
+
+const runRow = (keys: RowKeys, run: ActivityItem[]): Row => ({
+  kind: 'run', key: keys.forItem(run[0]), run, calls: callsOf(run),
+  live: run.some((entry) => entry._liveState !== 'completed'),
+});
+
+/** A call still being written has no card to hand over to. */
+const callRow = (keys: RowKeys, call: PreparingCall): Row => ({ kind: 'call', key: keys.forCall(call), call, calls: NO_CALLS, live: true });
 
 /** A settled block of nothing but thoughts shows them rather than a count of
  *  them. */
@@ -80,7 +93,7 @@ export function layoutRows({ timeline, calls, keys, expanded, inline }: LayoutIn
   // A row per call, so a second call streaming beside the first is its own row
   // from its first chunk, and each one carries on into its result.
   for (const call of calls) rows.push(callRow(keys, call));
-  return { slot: counted.length > 0 && !bare ? { kind: 'summary', counted } : null, rows };
+  return { slot: counted.length > 0 && !bare ? { kind: 'summary', counted, calls: NO_CALLS } : null, rows };
 }
 
 /**
@@ -116,15 +129,20 @@ export function layoutStatusLine({ timeline, calls, keys, expanded, liveReasonin
     ? first : null;
 
   const rows: Row[] = [];
-  if (onLine && !(lead && firstOnLine)) rows.push({ kind: 'line', key: 'status-line', line: onLine, live: onLine.running });
+  // The line stands for the block's work in flight, so it gives its place to
+  // whichever of the block's calls lands and takes it away.
+  if (onLine && !(lead && firstOnLine)) {
+    rows.push({ kind: 'line', key: 'status-line', line: onLine, calls: callsOf(timeline), live: onLine.running });
+  }
   for (const run of groupFileToolRuns(timeline)) {
     if (lead && run[0] === firstItem) continue;
     if (expanded || bare || isOpenThought(run[0], liveReasoningOpen)) rows.push(runRow(keys, run));
   }
   if (expanded) for (const call of calls) rows.push(callRow(keys, call));
 
-  const slot: Slot | null = lead && firstKey ? { kind: 'lead', key: firstKey, step: lead, isLine: firstOnLine }
-    : counted.length > 0 && (onLine || !bare) ? { kind: 'summary', counted }
+  const slot: Slot | null = lead && firstKey
+    ? { kind: 'lead', key: firstKey, step: lead, isLine: firstOnLine, calls: lead.kind === 'item' ? callsOf([lead.item]) : NO_CALLS }
+    : counted.length > 0 && (onLine || !bare) ? { kind: 'summary', counted, calls: NO_CALLS }
     : null;
   return { slot, rows };
 }

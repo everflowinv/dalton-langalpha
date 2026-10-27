@@ -1298,6 +1298,7 @@ class SessionLifecycleMixin:
                     self._drop_session(computer_id)
                 raise
             did_init = True
+            await self._on_session_attached(computer_id, session, resumed=False)
 
         self._put_session(computer_id, session, workspace_id=workspace_id)
         return session, did_init
@@ -1566,6 +1567,7 @@ class SessionLifecycleMixin:
                 # Refresh activity so idle cleanup cannot act on a stale timestamp.
                 await update_workspace_activity(workspace_id)
                 logger.info(f"Workspace {workspace_id} restarted successfully")
+            await self._on_session_attached(computer_id, session, resumed=False)
             # Lazy timing covers initiation, not background readiness; still record it
             # to keep lazy starts represented in the latency histogram.
             safe_record(

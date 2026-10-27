@@ -25,6 +25,7 @@ import type { Computer, WorkspaceMove, WorkspaceMoveError } from '@/types/api';
 import { apiErrorReason, moveRefusal } from '../utils/api';
 import { PREPARING_UI, computerStatusUi, isComputerPreparing, liveComputers, takesWorkspaces } from '../utils/computerStatus';
 import { useComputers } from '../hooks/useComputers';
+import { useComputerSource } from '../hooks/useComputerSource';
 import {
   isMoveActive,
   isMoveCancellable,
@@ -42,6 +43,7 @@ import { RadioCardGroup, type RadioCardOption } from './radioCardGroup';
 import { effectiveTier } from './specChangeUi';
 import { specErrorFiles } from './specErrors';
 import { tierLabel } from './tierUi';
+import { providerManagesSpec } from './providerUi';
 
 type Translate = ReturnType<typeof useTranslation>['t'];
 
@@ -106,9 +108,10 @@ function MovePanel({ workspace, onClose }: { workspace: MoveWorkspaceTarget; onC
         : move?.source_computer_id ?? null;
   const nameOf = (computerId: string | null | undefined) =>
     computers.find((c) => c.computer_id === computerId)?.name ?? '';
+  const sourceOf = useComputerSource(computers, { enabled: true });
   const options = computers
     .filter((c) => c.computer_id !== currentId)
-    .map((c) => computerOption(t, c));
+    .map((c) => computerOption(t, c, sourceOf(c)));
   const selectable = options.filter((o) => !o.disabled);
   const selected = picked && selectable.some((o) => o.value === picked) ? picked : selectable[0]?.value ?? null;
 
@@ -376,15 +379,20 @@ function MovePanel({ workspace, onClose }: { workspace: MoveWorkspaceTarget; onC
   );
 }
 
-/** A picker card for one computer: disabled while it cannot take a workspace. */
-function computerOption(t: Translate, computer: Computer): RadioCardOption<string> {
+/**
+ * A picker card for one computer, described as the Computers dialog describes
+ * it: `source` where that tells it apart, a tier only where the app sizes it.
+ * Disabled while it cannot take a workspace.
+ */
+function computerOption(t: Translate, computer: Computer, source: string | null): RadioCardOption<string> {
   const status = isComputerPreparing(computer) ? PREPARING_UI : computerStatusUi(computer.status);
   return {
     value: computer.computer_id,
     title: computer.name,
     facts: [
       t(status.labelKey, status.fallback),
-      tierLabel(t, effectiveTier(computer)),
+      ...(source ? [source] : []),
+      ...(providerManagesSpec(computer.kind) ? [tierLabel(t, effectiveTier(computer))] : []),
       ...(typeof computer.workspace_count === 'number'
         ? [t('computer.workspaceCount', { count: computer.workspace_count })]
         : []),

@@ -1,4 +1,4 @@
-import React, { useContext, useEffectEvent, useLayoutEffect, useRef } from 'react';
+import React, { useContext, useEffectEvent, useLayoutEffect, useRef, useState } from 'react';
 import {
   animate,
   motion,
@@ -10,6 +10,7 @@ import {
 } from '@/lib/framer';
 import { DURATION, SPRING_SNAPPY, TWEEN } from '@/lib/motion';
 import { ROW_FOLD } from './liveZoneTiming';
+import { CardCallsContext } from './cardCalls';
 
 /**
  * Enter/exit wrapper for the live-zone rows that never hands framer `auto`.
@@ -66,10 +67,10 @@ const GAP_CLOSE = ROW_FOLD;
  *  exit takes: a leaving row should not draw the eye. */
 const LEAVE = { opacity: TWEEN.exit, height: { ...ROW_FOLD, delay: DURATION.exit } };
 /** How open the box is before the content comes in, and how far the content
- *  rises in and lifts out. */
+ *  rises in and lifts out. A card taking a row's place moves the same way. */
 const RISE_AT = 0.9;
-const RISE_IN_PX = 4;
-const RISE_OUT_PX = 3;
+export const RISE_IN_PX = 4;
+export const RISE_OUT_PX = 3;
 
 function paddingOf(el: HTMLElement): { top: number; bottom: number } {
   const style = getComputedStyle(el);
@@ -89,10 +90,13 @@ interface LiveRowProps {
    *  segment spacing around the block owns the gap on the outside. */
   gap?: string;
   gapBottom?: string;
+  /** The tool calls the row draws: the one whose card lands takes over the
+   *  row's place (`CardArrivals` finds the row by them). */
+  calls?: readonly string[];
   children: React.ReactNode;
 }
 
-export function LiveRow({ opacity = 1, className, gap = ROW_GAP, gapBottom = gap, children }: LiveRowProps) {
+export function LiveRow({ opacity = 1, className, gap = ROW_GAP, gapBottom = gap, calls, children }: LiveRowProps) {
   const outerRef = useRef<HTMLDivElement>(null);
   const innerRef = useRef<HTMLDivElement>(null);
   const height = useMotionValue(0);
@@ -110,6 +114,20 @@ export function LiveRow({ opacity = 1, className, gap = ROW_GAP, gapBottom = gap
   const skipEnterRef = useRef(useContext(PresenceContext)?.initial === false);
   const reduceMotion = useReducedMotion();
   const readReduceMotion = useEffectEvent(() => reduceMotion);
+  // Leaving because its call landed as a card. The card's box takes the
+  // row's space in the commit it lands and shows the row fading there, so the
+  // row gives its height up at once: folding it as well would move the page
+  // by the row twice. Read on the exit's own render, which is the first one
+  // to see the card, and marked on the row for the card to find. Decided
+  // there once: a row already folding when its card lands keeps folding in
+  // its own place, and is not the place the card takes.
+  const cardCalls = useContext(CardCallsContext);
+  const landedAsCard = !!calls?.some((id) => cardCalls.has(id));
+  const [leftForCard, setLeftForCard] = useState<boolean | null>(null);
+  if (!isPresent && leftForCard === null) setLeftForCard(landedAsCard);
+  if (isPresent && leftForCard !== null) setLeftForCard(null);
+  const handedOver = !isPresent && (leftForCard ?? landedAsCard);
+  const readHandedOver = useEffectEvent(() => handedOver);
   const settleRef = useRef<(reenter?: boolean) => void>(() => {});
   const liftRef = useRef<() => void>(() => {});
   // The gap on screen, in px, which mid-tween is neither the old prop nor the new.
@@ -252,18 +270,33 @@ export function LiveRow({ opacity = 1, className, gap = ROW_GAP, gapBottom = gap
   // Re-measure and reopen it.
   useLayoutEffect(() => {
     if (isPresent && !wasPresentRef.current) settleRef.current(true);
-    if (!isPresent && wasPresentRef.current) liftRef.current();
+    if (!isPresent && wasPresentRef.current) {
+      const outer = outerRef.current;
+      // Gone in this commit, so the card measures the list without it. The
+      // value as well as the style: framer writes the row's values back from
+      // a microtask after every render, and its instant exit only lands on
+      // the next frame. A jump, as in a settle, so an opening spring still
+      // running stops rather than writing its height back.
+      if (readHandedOver() && outer) {
+        height.jump(0);
+        outer.style.height = '0px';
+      } else {
+        liftRef.current();
+      }
+    }
     wasPresentRef.current = isPresent;
-  }, [isPresent]);
+  }, [isPresent, height]);
 
   return (
     <motion.div
       ref={outerRef}
       initial={{ opacity: 0 }}
       animate={{ opacity }}
-      exit={{ opacity: 0, height: 0, transition: reduceMotion ? { duration: 0 } : LEAVE }}
+      exit={{ opacity: 0, height: 0, transition: reduceMotion || handedOver ? { duration: 0 } : LEAVE }}
       transition={FADE_IN}
       style={{ height, overflow: 'hidden' }}
+      data-call-row={calls?.length ? calls.join(' ') : undefined}
+      data-handed-over={handedOver ? '' : undefined}
     >
       <div ref={innerRef} style={{ paddingTop: gap, paddingBottom: gapBottom }}>
         <div className={className}>{children}</div>

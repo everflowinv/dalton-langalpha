@@ -84,7 +84,9 @@ const FRESH_STEPS_MS = 2000;
 /** Whether every step a block mounts with arrived a moment ago, so the block
  *  is new rather than drawn again (a reload mid-run, the main view coming back
  *  from a subagent tab). A step from history has no arrival, and one a
- *  reconnect replayed arrived at 1. Reads the clock, so only a mount may ask. */
+ *  reconnect replayed arrived at 1. Reads the clock, which a compiled render
+ *  would freeze at its first answer: a function component asks once, from a
+ *  state initializer, and only a class's render (CardArrivals) asks each time. */
 export function isFreshArrival(arrivals: ReadonlyArray<number | undefined>): boolean {
   const now = Date.now();
   return arrivals.length > 0 && arrivals.every((at) => at !== undefined && now - at < FRESH_STEPS_MS);
@@ -93,8 +95,8 @@ export function isFreshArrival(arrivals: ReadonlyArray<number | undefined>): boo
 const EASE = cssEase(EASE_OUT);
 
 /**
- * Fades `el` in over quick and, given a rise, lifts it that many px over fold,
- * after `delay` seconds. Opacity and transform only, so the layout is final
+ * Fades `el` in over quick and, given a rise, lifts it that many px over
+ * `riseDuration` (fold unless asked), after `delay` seconds. Opacity and transform only, so the layout is final
  * from the first frame and anything measuring it (the scroll pin) lands at
  * once. Played from script, never a CSS animation: those start over each time
  * their element is drawn again, which a cached thread is on coming back from
@@ -102,12 +104,12 @@ const EASE = cssEase(EASE_OUT);
  * nothing is left on the element afterwards: a kept transform would make it
  * the containing block of every fixed-position child. Returns the cancel.
  */
-export function playEntrance(el: HTMLElement, rise = 0, delay = 0): () => void {
+export function playEntrance(el: HTMLElement, rise = 0, delay = 0, riseDuration: number = DURATION.fold): () => void {
   if (typeof el.animate !== 'function' || isPageUnseen()) return () => {};
   const timing = { delay: delay * 1000, fill: delay > 0 ? 'backwards' : 'none', easing: EASE } as const;
   const fade = el.animate([{ opacity: 0 }, { opacity: 1 }], { ...timing, duration: DURATION.quick * 1000 });
   const lift = rise && !prefersReducedMotion()
-    ? el.animate([{ transform: `translateY(${rise}px)` }, { transform: 'none' }], { ...timing, duration: DURATION.fold * 1000 })
+    ? el.animate([{ transform: `translateY(${rise}px)` }, { transform: 'none' }], { ...timing, duration: riseDuration * 1000 })
     : null;
   return () => {
     fade.cancel();

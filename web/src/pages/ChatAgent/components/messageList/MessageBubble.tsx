@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next';
 import { Check, Copy, FileSearch, Info, Pencil, RefreshCw, RotateCcw, StopCircle, ThumbsDown, ThumbsUp } from 'lucide-react';
 import ThumbDownModal from '../ThumbDownModal';
 import FigureEightLoading, { FADE_MS } from '@/components/ui/figure-eight-loading';
+import { copyText } from '@/lib/clipboard';
 import { AnimatePresence, motion } from '@/lib/framer';
 import { DURATION, EASE_COLLAPSE } from '@/lib/motion';
 import { useTranscriptDisplay } from '@/lib/transcriptDisplay';
@@ -330,7 +331,7 @@ export const MessageBubble = memo(function MessageBubble({ message, contentProje
     // Confirm only after the write lands (it can reject when the document
     // loses focus); rapid re-copies reset the shared timer instead of
     // stacking timers that would cut the newer indicator short.
-    navigator.clipboard.writeText(text).then(() => {
+    copyText(text).then(() => {
       setCopied(true);
       if (copyTimerRef.current) clearTimeout(copyTimerRef.current);
       copyTimerRef.current = setTimeout(() => setCopied(false), COPIED_MS);

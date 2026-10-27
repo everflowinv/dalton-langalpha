@@ -36,6 +36,20 @@ async def get_wakeup(wakeup_id: str) -> Optional[Dict[str, Any]]:
             return normalize(await cur.fetchone())
 
 
+async def get_thread_wakeup(thread_id: str, short_id: str) -> Optional[Dict[str, Any]]:
+    """The thread's wakeup by its short id, as ``get_wakeup`` reads one."""
+    if not is_uuid(thread_id):
+        return None
+    async with get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                f"SELECT {cols('w')}, {attempt_sql('w')} FROM wakeups w"
+                " WHERE w.conversation_thread_id = %s AND w.short_id = %s",
+                (str(thread_id), short_id),
+            )
+            return normalize(await cur.fetchone())
+
+
 async def list_pending(thread_id: str) -> List[Dict[str, Any]]:
     """What can still fire, in the order it was set, each order's with ``attempt``."""
     async with get_db_connection() as conn:

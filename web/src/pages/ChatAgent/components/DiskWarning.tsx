@@ -179,7 +179,7 @@ export function DiskWarning({ computer, className }: DiskWarningProps) {
       size="sm"
       variant="ghost"
       className={cn(ACTION_CLASS, 'gap-1.5')}
-      onClick={() => openComputersPanel({ computerId: computer.computer_id, expandStorage: true })}
+      onClick={() => openComputersPanel({ view: 'details', computerId: computer.computer_id })}
     >
       <HardDrive className="h-3.5 w-3.5" />
       {t('computer.disk.openBreakdown', 'Open storage breakdown')}

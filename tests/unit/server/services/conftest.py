@@ -48,12 +48,16 @@ def _folder_hold_is_free():
 @pytest.fixture(autouse=True)
 def _no_workspace_moving():
     """Acquiring a session and deleting a workspace both refuse one that is
-    moving, a row read these pool-less tests cannot make. A test of the
-    refusal patches it inside this one."""
+    moving, and a delete one with a live run, before it ends its commands:
+    row reads these pool-less tests cannot make. A test of a refusal patches
+    it inside this one."""
     with patch(
         "src.server.services.workspace_manager.workspace_is_moving",
         AsyncMock(return_value=False),
-    ) as moving:
+    ) as moving, patch(
+        "src.server.services.workspace_manager.workspace_has_active_work",
+        AsyncMock(return_value=False),
+    ):
         yield moving
 
 

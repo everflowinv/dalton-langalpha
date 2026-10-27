@@ -118,8 +118,6 @@ function machineAddress(machine: SshPairingMachine | null): string {
 
 /** What the ready step shows and sets; `startOver` is offered only where another machine can be picked. */
 export interface SshReadyStep {
-  name: string;
-  setName: (name: string) => void;
   folder: string;
   setFolder: (folder: string) => void;
   folderOpen: boolean;
@@ -130,33 +128,26 @@ export interface SshReadyStep {
 }
 
 /**
- * The machine's name, folder and backup choice on the ready step, and the
- * create body they make: shared by every way a machine comes in, so each
- * names and files it the same way.
+ * The machine's folder and backup choice on the ready step, and the create
+ * body they make: shared by every way a machine comes in, so each files it
+ * the same way. The name is the dialog's own field, the same for every
+ * provider; a machine left unnamed there goes by `defaultName`.
  */
 export function useSshReadyFields(ready: SshReady | null) {
-  // The name and folder the user typed, or null while they show our prefill,
-  // so a later probe can replace a prefill but never what was typed.
-  const [typedName, setTypedName] = useState<string | null>(null);
+  // The folder the user typed, or null while it shows our prefill, so a later
+  // probe can replace a prefill but never what was typed.
   const [typedFolder, setTypedFolder] = useState<string | null>(null);
   const [folderOpen, setFolderOpen] = useState(false);
   // On unless the user says otherwise: a folder lost on their machine can then
   // be restored.
   const [filesBackup, setFilesBackup] = useState(true);
 
-  const name = typedName ?? (ready ? sshDefaultName(ready) : '');
   const folder = typedFolder ?? ready?.probe.suggested_root_dir ?? '';
-  // The machine's part of the create body, or null until a supported one is
-  // in. It is named in its summary, prefilled from its hostname.
+  // The machine's part of the create body, or null until a supported one is in.
   const body = sshCreateBody(ready, folder);
-  const trimmedName = name.trim();
-  const create = body
-    ? { ...(trimmedName ? { name: trimmedName } : {}), ssh: body, files_backup: filesBackup }
-    : null;
+  const create = body ? { ssh: body, files_backup: filesBackup } : null;
 
   const step: SshReadyStep = {
-    name,
-    setName: setTypedName,
     folder,
     setFolder: setTypedFolder,
     folderOpen,
@@ -168,9 +159,10 @@ export function useSshReadyFields(ready: SshReady | null) {
   return {
     create,
     step,
+    /** Its hostname, once a machine is in. */
+    defaultName: ready ? sshDefaultName(ready) : null,
     /** Back to the prefill, for another machine. */
     reset: () => {
-      setTypedName(null);
       setTypedFolder(null);
       setFolderOpen(false);
     },
@@ -340,6 +332,7 @@ export function useSshSetup(active: boolean) {
     ready,
     readyStep: { ...fields.step, startOver },
     create: fields.create,
+    defaultName: fields.defaultName,
     pairing: {
       unavailable: mint.isError,
       // Why the one-line command was refused, when the reason is the cap.

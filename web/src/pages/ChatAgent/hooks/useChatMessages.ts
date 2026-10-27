@@ -21,7 +21,7 @@ import type { WorkflowStatusResponse } from '../utils/api';
 import type { CancelOutcome, HeldSteer } from '../utils/cancelOutcome';
 // Imported from the dependency-free signal module (not `../utils/api`) so this
 // keeps decoding wire status even in the hook tests that fully mock `../utils/api`.
-import { shouldArmForStatus } from '../utils/reportBackSignal';
+import { reportOwedForStatus, shouldArmForStatus } from '../utils/reportBackSignal';
 import { useReportBackWatch } from './useReportBackWatch';
 import { useChatFeedback } from './useChatFeedback';
 import { toast } from '@/components/ui/use-toast';
@@ -50,6 +50,7 @@ import { settleStoppedBubble } from '../session/stream/stopBubble';
 import { withoutPending } from '../session/stream/toolCallChunks';
 import { useMarketWatch } from './useMarketWatch';
 import { invalidateThreadWakeups } from './useWakeups';
+import { invalidateThreadCommands } from './useCommands';
 import { refreshComputersAfterTurn } from './useComputers';
 // Chart-annotation live bridge: writes agent-drawn annotations into the
 // shared MarketView store so the desktop MarketView chat panel (which uses
@@ -564,7 +565,10 @@ export function useChatMessages(
   // `arm` is identity-stable (facade over a latest-impl ref), so callbacks that
   // dispatch through it can dep on it without churning per render — the whole
   // reportBackWatch object would change identity on awaitingReportBack flips.
-  const { awaitingReportBack, reportBackOwed, owedThreads: reportBackOwedThreads, arm: armReportBackWatch } = reportBackWatch;
+  const {
+    awaitingReportBack, reportBackOwed, owedThreads: reportBackOwedThreads, owedKinds: reportBackOwedKinds,
+    arm: armReportBackWatch,
+  } = reportBackWatch;
 
   // Batch back-to-back offload events into a single notification
   const offloadBatchRef = useRef<OffloadBatch>({ args: 0, reads: 0, timer: null });
@@ -581,6 +585,13 @@ export function useChatMessages(
   // an event, so a turn's end needs no read of its own.
   const refreshWakeups = useCallback(
     () => invalidateThreadWakeups(queryClient, threadIdRef.current),
+    [queryClient, threadIdRef],
+  );
+  // The same for the thread's background commands: the stream says when one
+  // moved to the background or reported its end, and the listing polls while
+  // one runs, so a turn's end needs no read of its own either.
+  const refreshCommands = useCallback(
+    () => invalidateThreadCommands(queryClient, threadIdRef.current),
     [queryClient, threadIdRef],
   );
 
@@ -1436,7 +1447,10 @@ export function useChatMessages(
         // A reload catches up on turns this view missed, a wake among them,
         // and the wakeups those turns fired or set; a first load is the
         // list's own seed.
-        if (reloadAsked) refreshWakeups();
+        if (reloadAsked) {
+          refreshWakeups();
+          refreshCommands();
+        }
         const refused = refusalAfterReloadRef.current;
         refusalAfterReloadRef.current = null;
         // Only while a steer still holds it: one the replay delivered is gone.
@@ -1489,7 +1503,9 @@ export function useChatMessages(
         // reconcile ONLY when the thread isn't also active — poking would race
         // the reconnect branch's attach of status.run_id (double-attach); the
         // seeded id is picked up once that active stream ends.
-        reportBackWatch.arm(threadId, status.report_back_run_id, status.can_reconnect ? null : 'load', status.owed_threads);
+        reportBackWatch.arm(
+          threadId, status.report_back_run_id, status.can_reconnect ? null : 'load', status, reportOwedForStatus(status),
+        );
       }
 
       // The report-back watch attaches its runs on a wake, which can land
@@ -3645,8 +3661,9 @@ export function useChatMessages(
     setMarketWatch,
     refreshMarketWatch,
     refreshWakeups,
+    refreshCommands,
     refreshWorkspaceFolder,
-    armReportBack: () => armReportBackWatch(threadIdRef.current, null, null),
+    armReportBack: (owed) => armReportBackWatch(threadIdRef.current, null, null, undefined, owed),
     refreshWorkspaces: () => invalidateNewWorkspace(queryClient),
     // A turn other than the one this view counted for the run's bubble means
     // turns were added where the view never saw them. The stream stamps the
@@ -3689,6 +3706,7 @@ export function useChatMessages(
     awaitingReportBack,
     reportBackOwed,
     reportBackOwedThreads,
+    reportBackOwedKinds,
     workspaceStarting,
     turnHeld,
     isCompacting,

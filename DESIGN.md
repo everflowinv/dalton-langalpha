@@ -120,6 +120,30 @@ never substitutes for it.
   (`web/src/pages/ChatAgent/components/taskStatusUi.tsx`); surfaces declare
   overrides there instead of restating ladders.
 
+## Data cards
+
+A tool call that returns data (a quote, a chart, a filing, an order) lands in
+the transcript as a card and opens a detail panel in the same language
+(`web/src/pages/ChatAgent/components/charts/TermCard.tsx`, `TermPanel.tsx`).
+The reader picks one of three styles in Settings, per device
+(`web/src/lib/cardStyle.ts`, stamped on `<html>` as `data-card-style`):
+
+- **Balanced**, the default: Terminal's frame, its title set into the top edge,
+  with words in the text face, figures in mono and tags as pills. Data reads as
+  data beside the filled cards a reply opens (files, dashboards).
+- **Quiet**: the same type and marks in the platform's own card, filled, its
+  title inside, on the warm grays.
+- **Terminal**: the unfilled frame with mono throughout, bracket tags, dashed
+  rules and dotted leaders, on a cool palette (the `--color-term-*` tokens) so
+  a figure reads as data against the warm page.
+
+Terminal is the cards' own stylesheets. Balanced and Quiet live in
+`charts/termCardStyles.css` and only take marks away, so all three share one
+layout and one set of components. A new card takes its words from the kit's
+classes (`term-label`, `term-caps`, `term-fill`; `term-code` for an identifier
+that stays mono), never from an inline `text-transform`, or the quieter styles
+cannot reach it.
+
 ## Motion
 
 Motion says something changed: it arrived, left, opened, closed or was pressed.
@@ -189,6 +213,51 @@ top of the transcript and the reply fills the room under it; once the reply
 outgrows that room the view glides after its tail
 (`web/src/pages/ChatAgent/components/chatView/useChatScroll.ts`).
 
+## Illustrations
+
+The Computers dialog draws each machine a computer runs on
+(`web/src/pages/ChatAgent/components/machineArt/`), and the New computer form
+draws the one it will add. A machine the user brings is drawn front on from
+its maker's own shots, so a MacBook Pro or a Mac Studio is recognisably that
+machine; a laptop is drawn the way Apple draws its own (the `macbook` SF
+Symbol), its base wider than the lid, since the true elevation, where the two
+are one width, reads as a box on a box. It is kept smaller than a hosted box's
+stage, so the two read at one scale. Until it has been reached and its model
+read, it is the two it could be, a laptop and a Linux desk, in dashed
+outline with no fill or shading, and the corner says it is drawn once
+reached. A hosted computer is a small box of our
+own on a desk, never a maker's product, sized by its spec on one shared scale,
+so a bigger spec is a bigger box. A drawing carries its own shading, from
+the `--color-art-*` tokens: lit from the upper left, a top and four side
+shades, hairlines in three weights that stay 0.6px at any scale, and a soft
+contact shadow. No gradients and no glow. The one colour in a drawing is the
+machine's light, which says what its status line says (success while it runs,
+the accent while it gets ready or goes down), and its screen shows the app in
+the reader's theme while it runs. While it gets ready (made, set up or
+starting) its light flickers like a disk at work and its screen types a few
+lines of setup at one corner, a line a beat, then waits on a cursor: small and
+faint, to be glanced at rather than read. Both stop as it comes up, the app
+fading in over the log; going down, the light holds still and the screen goes
+dark. Reduced motion shows the log whole and the light steady. A laptop is
+always drawn open: front on, a shut one is a slab the width of its base,
+which the narrower lid of this drawing cannot become, so a new one boots on
+its screen rather than opening.
+
+## Alignment
+
+- **A menu's rows share one leading column.** Every row starts with a glyph of
+  one width, an item's icon or a computer's status dot centred in that width,
+  so every label starts at one x. A row with nothing to show there gets an
+  icon (All computers takes the server glyph), never an empty indent.
+- **What trails a row sits flush with its right edge**: a badge, a count, a
+  shortcut. Nothing holds an empty column for a mark only one row shows: the
+  chosen row's check takes its room at its end, and only there, so the other
+  rows' badges reach the edge (the computer filter). A menu of choices alone,
+  where the labels must not move as the choice does (the sort menu), keeps
+  its check column.
+- **Drawings side by side share one floor**: each stands on the bottom of its
+  frame (§ Illustrations), so a laptop and a box beside it line up.
+
 ## Empty states
 
 Dot-grid texture is reserved for empty states only — never behind content.
@@ -206,3 +275,6 @@ Dot-grid texture is reserved for empty states only — never behind content.
 4. Liveness = glyph + text, per the vocabulary above; motion = the tokens in
    § Motion.
 5. When in doubt, remove decoration rather than add it.
+6. Check alignment by looking at it: a screenshot of the real surface, in both
+   themes, at the widths it ships at. A reserved column or an edge a few px
+   off reads fine in the markup and wrong on screen.

@@ -366,6 +366,54 @@ test.describe('activity live zone', () => {
   });
 
 
+  test('grows a lookup card out of its row without moving what is under it', async ({ page }) => {
+    await openThread(page);
+    const quote = { type: 'quote', quotes: ['NVDA', 'AMD', 'AVGO', 'TSM'].map((symbol, i) => ({ symbol, name: `${symbol} Holdings`, price: 100 + i })) };
+    await configureSSE({ method: 'POST', path: `/api/v1/threads/${TH}/messages`, events: [
+      sseEvents.toolCalls([{ name: 'get_quote', args: { symbol: 'NVDA,AMD,AVGO,TSM' }, id: 'quote1' }]),
+      { ...sseEvents.finishToolCalls(), delayAfter: 1500 },
+      { ...sseEvents.toolCallResult('quote1', 'Quote', quote), delayAfter: 1500 },
+      sseEvents.messageChunk('Quoted.'),
+      sseEvents.finishStop(),
+      sseEvents.creditUsage(),
+    ], delay: 30 });
+    await send(page, 'Quote the chip names');
+    // The call's row is the block's only item, so the block goes with it.
+    await expect(page.getByTestId('activity-live-zone')).toBeVisible();
+    // The indicator under the reply, from the reply's top: every frame, and in
+    // the commit the card lands in, read before any frame can move it.
+    await page.evaluate(() => {
+      const below = () => {
+        const reply = [...document.querySelectorAll('[data-message-role="assistant"]')].at(-1);
+        return document.querySelector('[data-testid="streaming-indicator"]').getBoundingClientRect().top - reply.getBoundingClientRect().top;
+      };
+      const probe = window.cardArrivalProbe = { frames: [], landed: null, done: false };
+      new MutationObserver((_, observer) => {
+        if (!document.querySelector('[data-card-arrival]')) return;
+        probe.landed = below();
+        observer.disconnect();
+      }).observe(document.querySelector('main'), { childList: true, subtree: true });
+      const sample = () => {
+        probe.frames.push({ y: below(), card: !!document.querySelector('[data-card-arrival]') });
+        if (probe.frames.filter((f) => f.card).length < 40) requestAnimationFrame(sample);
+        else probe.done = true;
+      };
+      requestAnimationFrame(sample);
+    });
+    await page.waitForFunction(() => window.cardArrivalProbe.done, null, { timeout: 10000 });
+    const { frames, landed } = await page.evaluate(() => window.cardArrivalProbe);
+    const before = frames.filter((f) => !f.card).at(-1).y;
+    const after = frames.filter((f) => f.card).map((f) => f.y);
+    // The card's box starts in the space the row gave up, so the commit that
+    // swaps them moves nothing under it...
+    expect(Math.abs(landed - before)).toBeLessThan(1);
+    // ...and then grows to the card, pushing what is under it down only.
+    const steps = [before, ...after].slice(1).map((y, i) => y - [before, ...after][i]);
+    expect(Math.min(...steps)).toBeGreaterThan(-0.5);
+    expect(after.at(-1) - before).toBeGreaterThan(50);
+    await expect(page.locator('[data-arriving]')).toHaveCount(0);
+  });
+
   for (const width of [1280, 390]) {
     test(`spaces live cards, reasoning, batched fetches and the waiting indicator at ${width}px`, async ({ page }) => {
       await page.setViewportSize({ width, height: 1400 });

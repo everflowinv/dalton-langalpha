@@ -28,7 +28,14 @@ import { liveComputers } from '../utils/computerStatus';
 import { GalleryActions } from './workspaceGallery/GalleryActions';
 import { GalleryEmptyState } from './workspaceGallery/GalleryEmptyState';
 import { Kicker } from './workspaceGallery/Kicker';
-import { ALL_COMPUTERS, GALLERY_SORTS, GalleryToolbar, type GallerySort } from './workspaceGallery/GalleryToolbar';
+import {
+  ALL_COMPUTERS,
+  ComputerControl,
+  GALLERY_SORTS,
+  GalleryToolbar,
+  type ComputerControlProps,
+  type GallerySort,
+} from './workspaceGallery/GalleryToolbar';
 import { ChiefOfStaffCard } from './workspaceGallery/ChiefOfStaffCard';
 import { CardGrid } from './workspaceGallery/CardGrid';
 import { GALLERY_COLUMN, GALLERY_FRAME, GALLERY_PAGE } from './workspaceGallery/layout';
@@ -207,6 +214,10 @@ function WorkspaceGallery({ onWorkspaceSelect, prefetchThreads }: WorkspaceGalle
   // rather than stand over the results as if it were one. With no workspaces
   // left there is no search box to clear a query, so it comes back.
   const showChief = !!homeRow && (!query || !hasUserWorkspaces);
+  const primary = computers.find((c) => c.is_primary) ?? null;
+  // The machine Home is on: the primary, except while a make-primary is
+  // still moving it there.
+  const homeComputer = homeRow?.computer_id ? computersById.get(homeRow.computer_id) ?? null : primary;
   // A card names its machine only when it is not on the usual one: the
   // primary computer, or the one holding the most workspaces when the primary
   // holds none. Most cards then carry no line and the few that live elsewhere
@@ -215,15 +226,24 @@ function WorkspaceGallery({ onWorkspaceSelect, prefetchThreads }: WorkspaceGalle
   // one machine names it in the toolbar, so no card repeats it either.
   const held = new Map<string, number>();
   for (const ws of userRows) if (ws.computer_id) held.set(ws.computer_id, (held.get(ws.computer_id) ?? 0) + 1);
-  const primaryId = computers.find((c) => c.is_primary)?.computer_id;
   // Ties go to the lower id, so a sort or new activity never moves it.
-  const usualComputerId = primaryId && held.has(primaryId)
-    ? primaryId
+  const usualComputerId = primary && held.has(primary.computer_id)
+    ? primary.computer_id
     : [...held].sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1))[0]?.[0];
   const machineOf = (ws: WorkspaceRecord) =>
     activeFilter === ALL_COMPUTERS && ws.computer_id && ws.computer_id !== usualComputerId
       ? computersById.get(ws.computer_id) ?? null
       : null;
+  const computerControl: ComputerControlProps | null = computerData
+    ? {
+        computers,
+        isThisMac,
+        computerFilter: activeFilter,
+        onComputerFilterChange: setComputerFilter,
+        onManageComputers: (computerId) => openComputersPanel({ view: 'list', computerId }),
+        onNewComputer: () => openComputersPanel({ view: 'create' }),
+      }
+    : null;
   // Cards drag in the Custom order over the whole list: a search or a filter
   // leaves cards out, and an order read off part of the list has no place for
   // them. And they hold still while the list is read again, the last order's
@@ -323,7 +343,7 @@ function WorkspaceGallery({ onWorkspaceSelect, prefetchThreads }: WorkspaceGalle
               onSelect={onWorkspaceSelect}
               onTogglePin={handleTogglePin}
               onRenameStart={setRenameTarget}
-              onOpenComputer={(computerId) => openComputersPanel({ computerId })}
+              onOpenComputer={(computerId) => openComputersPanel({ view: 'list', computerId })}
               onDuplicate={wsActions.openDuplicate}
               onMove={wsActions.openMove}
               onDelete={wsActions.openDelete}
@@ -359,25 +379,18 @@ function WorkspaceGallery({ onWorkspaceSelect, prefetchThreads }: WorkspaceGalle
               <h1 className="text-2xl font-semibold title-font" style={{ color: 'var(--color-text-primary)' }}>
                 {t('workspace.workspaces')}
               </h1>
-              <GalleryActions
-                onNewWorkspace={() => setIsModalOpen(true)}
-                onOpenComputers={() => openComputersPanel()}
-              />
+              <GalleryActions onNewWorkspace={() => setIsModalOpen(true)} />
             </div>
           </header>
 
           <div className={`mt-4 ${GALLERY_COLUMN}`}>
-            {/* Below a laptop's width the two labeled actions do not fit beside
-                the title, so they take the row beneath it, in equal halves. */}
+            {/* Below a laptop's width the labeled action does not fit beside
+                the title, so it takes the row beneath it. */}
             <div className="flex flex-col gap-3 mb-4 md:hidden">
               <h1 className="text-xl font-semibold title-font" style={{ color: 'var(--color-text-primary)' }}>
                 {t('workspace.workspaces')}
               </h1>
-              <GalleryActions
-                stacked
-                onNewWorkspace={() => setIsModalOpen(true)}
-                onOpenComputers={() => openComputersPanel()}
-              />
+              <GalleryActions stacked onNewWorkspace={() => setIsModalOpen(true)} />
             </div>
 
             {alertComputer && (
@@ -386,22 +399,24 @@ function WorkspaceGallery({ onWorkspaceSelect, prefetchThreads }: WorkspaceGalle
               </div>
             )}
 
-            {hasUserWorkspaces && (
+            {/* With no workspaces yet only the computer control shows, the
+                page's one way to the computers, once the list is read. */}
+            {(hasUserWorkspaces || computerControl) && (
               <div className="pb-3 enter-fade-up enter-fade-up-d1">
-                <GalleryToolbar
-                  search={searchQuery}
-                  onSearchChange={setSearchQuery}
-                  computers={computers}
-                  isThisMac={isThisMac}
-                  computerFilter={activeFilter}
-                  onComputerFilterChange={setComputerFilter}
-                  sortBy={sortBy}
-                  onSortChange={(sort) => {
-                    pickSort(sort);
-                    scrollToTop();
-                  }}
-                  onOpenComputer={(computerId) => openComputersPanel({ computerId })}
-                />
+                {hasUserWorkspaces ? (
+                  <GalleryToolbar
+                    search={searchQuery}
+                    onSearchChange={setSearchQuery}
+                    computerControl={computerControl}
+                    sortBy={sortBy}
+                    onSortChange={(sort) => {
+                      pickSort(sort);
+                      scrollToTop();
+                    }}
+                  />
+                ) : (
+                  computerControl && <ComputerControl {...computerControl} />
+                )}
               </div>
             )}
           </div>
@@ -421,6 +436,9 @@ function WorkspaceGallery({ onWorkspaceSelect, prefetchThreads }: WorkspaceGalle
             {showChief && homeRow && (
               <ChiefOfStaffCard
                 workspace={homeRow}
+                computer={homeComputer}
+                isThisMac={!!homeComputer && isThisMac(homeComputer)}
+                onOpenComputer={(computerId) => openComputersPanel({ view: 'list', computerId })}
                 now={now}
                 entrance={!introduced}
                 onOpenThreads={onWorkspaceSelect}

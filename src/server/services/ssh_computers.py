@@ -11,18 +11,19 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import binascii
 import hashlib
 import logging
 import posixpath
 import re
-from dataclasses import asdict, dataclass
-from typing import Any, Dict, Iterable, Iterator, List, Optional
+from dataclasses import asdict, dataclass, field
+from typing import Any, AsyncIterator, Dict, Iterable, Iterator, List, Optional
 
 from ptc_agent.config.core import SSHConfig
 from ptc_agent.core.sandbox.providers import ssh as ssh_provider
 from ptc_agent.core.sandbox.providers._ssh_authorized_key import authorized_key_line
-from ptc_agent.core.sandbox.providers.ssh_errors import SSHConnectError
+from ptc_agent.core.sandbox.providers.ssh_errors import SSHConnectError, SSHFolderMarked
 from src.server.database.computer import (
     count_live_computers_of_kind,
     get_computers_for_user,
@@ -196,6 +197,7 @@ async def probe(
     root_dir: Optional[str] = None,
     tunnel_id: Optional[str] = None,
     reclaim: Iterable[str] = (),
+    taking_over: Optional[str] = None,
 ) -> ssh_provider.SSHProbe:
     """Connect to the machine with the user's key and report what is there.
 
@@ -204,7 +206,7 @@ async def probe(
     holds the several keys a machine reported of itself. ``root_dir`` given,
     the folder a computer would work in is checked as well, without being made,
     and a mark there left by one of ``reclaim``, the user's removed computers,
-    cleared. ``tunnel_id`` reaches the machine through its tunnel, where ``host`` is
+    cleared; one left by ``taking_over`` passes, left for the create to clear. ``tunnel_id`` reaches the machine through its tunnel, where ``host`` is
     only its name and ``port`` its SSH port on the machine itself.
 
     Raises:
@@ -226,6 +228,7 @@ async def probe(
                 root_dir=root_dir,
                 tunnel=tunnel_id,
                 reclaim=frozenset(reclaim),
+                taking_over=taking_over,
             )
     except TimeoutError:
         raise SSHConnectError(
@@ -435,6 +438,11 @@ def _nested(a: str, b: str) -> bool:
     return a == b or a.startswith(f"{b}/") or b.startswith(f"{a}/")
 
 
+def machine_config(model: str, machine: Dict[str, Any]) -> Dict[str, Any]:
+    """The display facts a computer's ``config`` keeps of its machine."""
+    return ({"model": model} if model else {}) | ({"machine": machine} if machine else {})
+
+
 @dataclass(frozen=True)
 class SSHCreatePlan:
     """A new ssh computer's create arguments, its machine already logged in to."""
@@ -444,20 +452,30 @@ class SSHCreatePlan:
     root_dir: str
     default_name: str
     settings: SSHConfig
+    # A Mac's model name, and the system and hardware the details show.
+    # Display data, so they go in the row's ``config``: ``provider_config``
+    # holds only what the provider is built from, and refuses any other key.
+    model: str = ""
+    machine: Dict[str, Any] = field(default_factory=dict)
 
     async def recheck(self, user_id: str) -> None:
         """The limit and the folder checked again, under the lock the insert
-        holds, and the tunnel's pairing renewed.
+        holds, the tunnel's pairing renewed, and a folder being taken over
+        cleared.
 
         Two creates both pass the checks made before the probe, which is too
         slow to hold the lock. A tunnel left unused since its pairing may
         meanwhile be claimed for taking off its machine; renewed here, before
-        the row that names it exists, it is not.
+        the row that names it exists, it is not. The computer a take-over
+        names is stopped and cleared from the folder last, once nothing else
+        can refuse the create, so a refused one leaves it working.
 
         Raises:
             SSHComputerLimit: Another create took the last one since.
             SSHFolderTaken: Another of the caller's computers took it since.
-            SSHConnectError: The tunnel is gone, or being taken off its machine.
+            SSHConnectError: The tunnel is gone, or being taken off its
+                machine, or the folder taken over could not be cleared.
+            SSHFolderMarked: Another computer marked the folder since.
         """
         await check_ssh_capacity(user_id, self.settings)
         await _unshared_root_dir(user_id, self.spec, self.root_dir)
@@ -472,10 +490,35 @@ class SSHCreatePlan:
                     else "That machine's tunnel is being taken off it. Run the "
                     "command on the machine again in a minute.",
                 )
+        if self.spec.take_over is not None:
+            if self.spec.tunnel_id is None:
+                await spend_dials(user_id, 1, settings=self.settings)
+            async with _create_dial_errors(user_id, self.spec):
+                try:
+                    async with asyncio.timeout(PROBE_TIMEOUT_S):
+                        await ssh_provider.take_over_root(
+                            host=self.spec.host,
+                            port=self.spec.port,
+                            username=self.spec.username,
+                            private_key=await client_key(user_id),
+                            host_key=self.spec.host_key,
+                            root_dir=self.root_dir,
+                            owner=self.spec.take_over,
+                            connect_timeout=self.settings.connect_timeout,
+                            allow_private_addresses=self.settings.allow_private_addresses,
+                            tunnel=self.spec.tunnel_id,
+                        )
+                except TimeoutError:
+                    raise SSHConnectError(
+                        "timeout",
+                        f"{self.spec.host} did not finish answering within "
+                        f"{int(PROBE_TIMEOUT_S)} seconds.",
+                    ) from None
 
     def create_kwargs(self) -> Dict[str, Any]:
         return {
             "provider_config": self.provider_config,
+            "config": machine_config(self.model, self.machine) or None,
             "root_dir": self.root_dir,
             "default_name": self.default_name,
         }
@@ -503,6 +546,8 @@ async def plan_create(
             cannot use.
         SSHFolderTaken: Another of the caller's computers there works in the
             folder.
+        SSHFolderMarked: The folder is the root of a computer the caller does
+            not have, which ``spec.take_over`` naming it would clear.
     """
     await check_ssh_capacity(user_id, settings)
     if not await has_client_key(user_id):
@@ -536,6 +581,8 @@ async def plan_create(
             user_id, 1 if spec.root_dir is not None else 2, settings=settings
         )
     private_key = await client_key(user_id)
+    reclaim = await _removed_ssh_computers(user_id)
+    await _refuse_taking_over_own(user_id, spec.take_over)
 
     async def dial(root_dir: Optional[str] = None) -> ssh_provider.SSHProbe:
         return await probe(
@@ -547,10 +594,11 @@ async def plan_create(
             host_key=spec.host_key,
             root_dir=root_dir,
             tunnel_id=spec.tunnel_id,
-            reclaim=await _removed_ssh_computers(user_id) if root_dir else (),
+            reclaim=reclaim if root_dir else (),
+            taking_over=spec.take_over if root_dir else None,
         )
 
-    try:
+    async with _create_dial_errors(user_id, spec):
         root_dir = spec.root_dir
         if root_dir is None:
             # The default folder is in the login's home, which only the
@@ -566,15 +614,6 @@ async def plan_create(
             )
         await _unshared_root_dir(user_id, spec, root_dir)
         found = await dial(root_dir)
-    except SSHConnectError as e:
-        if e.code != "host_key_mismatch":
-            raise
-        # The provider words this for a computer that already exists.
-        raise SSHConnectError(
-            "host_key_mismatch",
-            f"{spec.host} presented a different host key from the one given. "
-            "Test the connection again and confirm the key it shows.",
-        ) from None
     if not found.supported:
         raise SSHConnectError(
             "unsupported",
@@ -595,7 +634,32 @@ async def plan_create(
         root_dir=root_dir,
         default_name=found.hostname or spec.host,
         settings=settings,
+        model=found.model,
+        machine=found.machine(),
     )
+
+
+@contextlib.asynccontextmanager
+async def _create_dial_errors(user_id: str, spec: ComputerSSHSpec) -> AsyncIterator[None]:
+    """A create's dials refused in its own words: a folder marked by one of
+    the caller's own computers, which the folder check did not see as on
+    this machine, is theirs and never offered to take over, and the host
+    key the provider words for a computer that already exists."""
+    try:
+        yield
+    except SSHFolderMarked as e:
+        mine = _ssh_computer_by_machine_id(await get_computers_for_user(user_id), e.owner)
+        if mine is not None:
+            raise _folder_taken(mine) from None
+        raise
+    except SSHConnectError as e:
+        if e.code != "host_key_mismatch":
+            raise
+        raise SSHConnectError(
+            "host_key_mismatch",
+            f"{spec.host} presented a different host key from the one given. "
+            "Test the connection again and confirm the key it shows.",
+        ) from None
 
 
 async def _removed_ssh_computers(user_id: str) -> List[str]:
@@ -626,11 +690,39 @@ async def _unshared_root_dir(
         tunnel_id=spec.tunnel_id,
     )
     if sibling is not None:
-        raise SSHFolderTaken(
-            f'Your computer "{sibling.get("name")}" already works in '
-            f"{sibling.get('root_dir')} on this machine. Choose a folder "
-            "outside it."
-        )
+        raise _folder_taken(sibling)
+
+
+def _folder_taken(computer: Dict[str, Any]) -> SSHFolderTaken:
+    return SSHFolderTaken(
+        f'Your computer "{computer.get("name")}" already works in '
+        f"{computer.get('root_dir')} on this machine. Choose a folder "
+        "outside it."
+    )
+
+
+def _ssh_computer_by_machine_id(
+    computers: Iterable[Dict[str, Any]], machine_id: str
+) -> Optional[Dict[str, Any]]:
+    return next(
+        (
+            c
+            for c in computers
+            if c.get("kind") == SSH_KIND and str(c.get("provider_ref") or "") == machine_id
+        ),
+        None,
+    )
+
+
+async def _refuse_taking_over_own(user_id: str, take_over: Optional[str]) -> None:
+    """``take_over`` names a computer the caller does not have, whose mark they
+    chose to take the folder from. One of their own live computers is never
+    taken over: removing it is how that folder frees."""
+    if take_over is None:
+        return
+    mine = _ssh_computer_by_machine_id(await get_computers_for_user(user_id), take_over)
+    if mine is not None:
+        raise _folder_taken(mine)
 
 
 def tunnel_of(computer: Dict[str, Any]) -> str:
@@ -694,6 +786,8 @@ def ssh_info(
             "Could not fingerprint the host key of computer %s",
             computer.get("computer_id"),
         )
+    shown = computer.get("config") or {}
+    machine = shown.get("machine") if isinstance(shown.get("machine"), dict) else {}
     tunnel_id = tunnel_of(computer)
     connected = None
     if tunnel_id and tunnels is not None:
@@ -707,4 +801,7 @@ def ssh_info(
         tunnel=bool(tunnel_id),
         tunnel_connected=connected,
         helper=bool(config.get("helper")),
+        os=config.get("os") or None,
+        model=shown.get("model") or None,
+        **{k: machine.get(k) for k in ("distro", "arch", "cpu", "cores", "memory_bytes")},
     )

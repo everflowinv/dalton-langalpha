@@ -12,6 +12,7 @@ import {
   DropdownMenuSubContent,
 } from '@/components/ui/dropdown-menu';
 import { toast } from '@/components/ui/use-toast';
+import { copyText } from '@/lib/clipboard';
 import { useTranslation } from 'react-i18next';
 import { cn } from '@/lib/utils';
 import { fileExtension } from '../utils/filePaths';
@@ -164,7 +165,7 @@ function FileHeaderActions({
     try {
       // Fetch full content to avoid copying truncated text for large files
       const { content } = await readFileFullFn(workspaceId, selectedFile);
-      await navigator.clipboard.writeText(content);
+      await copyText(content);
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
     } catch {

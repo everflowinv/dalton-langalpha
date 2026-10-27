@@ -71,11 +71,14 @@ class ComputerRemovalRefused(RuntimeError):
     """The computer stays, for a reason its owner can act on.
 
     The client words its own copy from ``code``; the message is the server's
-    sentence for a client that shows it as it is.
+    sentence for a client that shows it as it is. ``deleted`` names the
+    workspaces a removal had already deleted when something that landed
+    meanwhile refused it, for the client to forget.
     """
 
-    def __init__(self, code: Retirement):
+    def __init__(self, code: Retirement, *, deleted: list[str] | None = None):
         self.code = code
+        self.deleted = deleted or []
         super().__init__(_REMOVAL_REFUSALS[code])
 
 

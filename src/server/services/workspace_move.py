@@ -33,6 +33,10 @@ MOVE_MESSAGES: Dict[str, str] = {
         "This workspace has work running. Wait for it to finish or stop it, "
         "then move it."
     ),
+    "command_running": (
+        "A command is still running on this computer. Wait for it to end or "
+        "stop it in its chat, then move the workspace."
+    ),
     "move_in_progress": (
         "A workspace is already moving. Wait for that move to finish, then try again."
     ),

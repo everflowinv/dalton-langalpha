@@ -151,7 +151,7 @@ export const PREPARING_UI: ComputerStatusUi = {
   color: 'var(--color-accent-primary)',
 };
 
-/** The build steps of a new sandbox, in the order the server runs them. */
+/** The build steps of a new computer, in the order the server runs them. */
 const PREPARE_STAGES = [
   { stage: 'sandbox', labelKey: 'computer.prepare.sandbox', fallback: 'Creating the sandbox' },
   { stage: 'tools', labelKey: 'computer.prepare.tools', fallback: 'Installing tools' },
@@ -169,12 +169,22 @@ export function prepareStageIndex(stage: string | undefined | null): number {
  * the row, usually before anyone is listening. A stage this build does not
  * know has no place to count from, so it gets no step and the plain label stands.
  */
-export function prepareStepLabel(t: Translate, stage: string | undefined | null): string | null {
+export function prepareStepLabel(
+  t: Translate,
+  stage: string | undefined | null,
+  kind?: Computer['kind'],
+): string | null {
   const index = stage == null ? 0 : prepareStageIndex(stage);
   if (index < 0) return null;
   const step = PREPARE_STAGES[index];
+  // A machine the user brings has no sandbox made for it: its first step
+  // lays out the folder and installs the runtime there.
+  const label =
+    kind === 'ssh' && step.stage === 'sandbox'
+      ? t('computer.prepare.runtime', 'Installing the runtime')
+      : t(step.labelKey, step.fallback);
   return t('computer.prepare.step', '{{step}} ({{index}} of {{total}})', {
-    step: t(step.labelKey, step.fallback),
+    step: label,
     index: index + 1,
     total: PREPARE_STAGES.length,
   });

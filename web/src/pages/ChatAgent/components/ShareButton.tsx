@@ -3,6 +3,7 @@ import { Share2, Copy, Check, Link2, Lock, FileText } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
 import { toast } from '@/components/ui/use-toast';
+import { copyText } from '@/lib/clipboard';
 import { cn } from '@/lib/utils';
 import { shortMonthDay } from '@/lib/format';
 import { useCopyShareLink } from '@/hooks/useCopyShareLink';
@@ -165,7 +166,7 @@ export default function ShareButton({ threadId, initialIsShared = false, workspa
   const handleCopy = useCallback(() => {
     if (!shareState?.share_url) return;
     const fullUrl = `${window.location.origin}${shareState.share_url}`;
-    navigator.clipboard.writeText(fullUrl).then(() => {
+    copyText(fullUrl).then(() => {
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
     });

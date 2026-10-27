@@ -30,8 +30,10 @@ interface ChoiceProps {
   children: ReactNode;
 }
 
+// `relative` keeps the hidden input inside its row. Placed against a farther
+// box, focusing it scrolls that box: inside a dialog, the whole panel.
 function rowClassName(disabled: boolean | undefined, className: string | undefined): string {
-  return cn('rings-within flex', disabled ? 'cursor-not-allowed opacity-50' : 'cursor-pointer', className);
+  return cn('rings-within relative flex', disabled ? 'cursor-not-allowed opacity-50' : 'cursor-pointer', className);
 }
 
 /** The ring grows with the text beside it, as the checkbox's box does. */

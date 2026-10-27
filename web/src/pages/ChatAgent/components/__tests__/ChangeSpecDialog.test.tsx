@@ -23,6 +23,7 @@ import ChangeSpecDialog from '../ChangeSpecDialog';
 
 const LOW_DISK = {
   name: 'Alpha Research',
+  kind: 'daytona',
   resource_tier: 'standard',
   status: 'running',
   spec_change: null,

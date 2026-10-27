@@ -12,14 +12,14 @@ import re
 import shlex
 from collections.abc import Iterable, Mapping
 
-from ptc_agent.core.paths import SandboxLayout
-from ptc_agent.core.sandbox.providers import _ssh_bootstrap as bootstrap
-from ptc_agent.core.sandbox.providers._exec_sessions import (
-    EXEC_MARK,
-    GROUP_MARK_SH,
-    SESSION_FUNCTIONS_SH,
-    ps_start_sh,
+from ptc_agent.core.paths import (
+    EXEC_SCRIPT_PREFIX,
+    LEFTOVERS_TRASH_PREFIX,
+    SandboxLayout,
+    WorkspaceLayout,
 )
+from ptc_agent.core.sandbox.providers import _ssh_bootstrap as bootstrap
+from ptc_agent.core.sandbox.providers._proc_sh import EXEC_MARK, PROC_SH, ps_start_sh
 from ptc_agent.core.sandbox.providers.ssh_errors import SSHConnectError
 
 # The login shell parses only this line. Its quoted part holds no ' or \, which
@@ -150,6 +150,141 @@ def home_shared_script(sandbox_ids: Iterable[str]) -> str:
     )
 
 
+# A tunnel's folder in ``~/.langalpha`` holds this, which takes the folder and
+# the tunnel away again; the runtime's uninstall leaves such a folder to it.
+TUNNEL_UNINSTALL_SCRIPT = "uninstall.sh"
+
+# What LangAlpha makes at the top of a root besides workspace folders, the
+# internal folder aside: what it holds is the owner's in part.
+_ROOT_SETUP = (
+    SandboxLayout.AGENTS_DIR,
+    SandboxLayout.MCP_SERVERS_DIR,
+    SandboxLayout.SYSTEM_DIR,
+)
+# Made at the root by every start, empty unless the agent wrote there: it goes
+# only empty.
+_ROOT_DATA = WorkspaceLayout.DATA_DIR
+
+
+def uninstall_script(root: str, sandbox_id: str) -> str:
+    """Deletes what LangAlpha set up on the machine for a removed computer,
+    its owner having asked: its folders in *root*, the root once nothing
+    else is in it, and the login's runtime once no computer is left on it.
+
+    Run after the computer's own folder under ``~/.langalpha`` is gone. Only a
+    root marked as this computer's is touched, any other kept as it is, and in
+    it only names LangAlpha makes: files the owner put there stay, and the folders the root folder
+    script set aside for them (theirs that stood in a workspace folder's way,
+    a deleted workspace's they kept) go back to the root's top. One that
+    cannot, its name taken there, keeps the leftovers folder and so the root.
+    A root kept keeps its mark too, naming a computer that is gone, which
+    lets the next computer claim the folder as LangAlpha's rather than refuse
+    it as the owner's. The root is read and emptied under the claims' hold,
+    so a computer added there meanwhile is not emptied with it.
+    The runtime stays for any other computer whose folder is on the login, of
+    this deployment or another, for a root inside it, and while an install
+    holds its lock, which the uninstall takes too. Everything else in ``~/.langalpha`` goes,
+    including what the agent put there itself (a browser it downloaded), but a
+    tunnel's folder, which stays for its own uninstall. A ``python3.X`` link
+    an older install left in ``~/.local/bin`` goes with the runtime it points
+    into. Both are moved out of their names, then deleted detached, so a
+    runtime of a few GB does not hold the removal up. Prints ``root kept`` and
+    ``runtime kept`` for what stays, and exits 1 when anything it set out to
+    delete or put back did not go.
+    """
+    q = shlex.quote
+    state = f'"$HOME"/{q(bootstrap.STATE_DIR)}'
+    setup = " ".join(q(n) for n in _ROOT_SETUP)
+    trash_prefix = q(LEFTOVERS_TRASH_PREFIX)
+    return (
+        f"r={q(root.rstrip('/'))}; me={q(sandbox_id)}\n"
+        f's={state}; c="$HOME"/{q(_COMPUTERS)}\n'
+        f'i="$r"/{q(SandboxLayout.INTERNAL_DIR)}; l="$r"/{q(SandboxLayout.LEFTOVERS_DIR)}\n'
+        f'm="$r"/{q(ROOT_MARKER)}; f=0\n'
+        # A trash beside the folder it empties, on its disk, so moving into
+        # it is a rename; deleted in place where none can be made.
+        "trash() {\n"
+        '  t=$(mktemp -d "$1/.langalpha-removing.XXXXXX" 2>/dev/null) || t=\n'
+        "}\n"
+        "drop() {\n"
+        '  [ -e "$1" ] || [ -L "$1" ] || return 0\n'
+        '  if [ -n "$t" ]; then mv -- "$1" "$t"/ 2>/dev/null && return 0; fi\n'
+        '  rm -rf -- "$1" && return 0\n'
+        "  f=1; return 1\n"
+        "}\n"
+        "gone() {\n"
+        '  [ -n "$t" ] && nohup rm -rf -- "$t" >/dev/null 2>&1 &\n'
+        "}\n"
+        f"{bootstrap.LOCK_SH}"
+        f"{_CLAIM_HOLD}"
+        'o=; { read -r o < "$m"; } 2>/dev/null\n'
+        'if [ -d "$r" ] && [ ! -L "$r" ] && [ -n "$o" ] && [ "$o" = "$me" ]; then\n'
+        # A root that is a disk of its own empties into a trash on that disk,
+        # since one beside it would make every move a copy; such a root can
+        # never go itself, so it is kept. Its mount point ends df's line,
+        # spaces and all.
+        '  case "$(df -P -- "$r" 2>/dev/null | sed -n 2p)" in\n'
+        '    *" $r") trash "$r" ;;\n'
+        '    *) trash "$(dirname -- "$r")" ;;\n'
+        "  esac\n"
+        "  k=0\n"
+        '  for x in "$l"/* "$l"/.[!.]* "$l"/..?*; do\n'
+        '    [ -e "$x" ] || [ -L "$x" ] || continue\n'
+        '    b=${x##*/}\n'
+        # A removal's trash, deleting itself, and a copy aside cut short,
+        # whose folder is still where it was.
+        f'    case "$b" in {trash_prefix}*) continue ;; *.copying) drop "$x"; continue ;; esac\n'
+        '    if [ -e "$r/$b" ] || [ -L "$r/$b" ]; then k=1\n'
+        '    elif ! mv -- "$x" "$r/$b"; then k=1; f=1; fi\n'
+        "  done\n"
+        f'  for n in {setup}; do drop "$r/$n"; done\n'
+        '  if [ "$k" = 0 ]; then drop "$i"; else\n'
+        '    for x in "$i"/* "$i"/.[!.]* "$i"/..?*; do\n'
+        '      [ -e "$x" ] || [ -L "$x" ] || continue\n'
+        '      [ "$x" = "$l" ] || drop "$x"\n'
+        "    done\n"
+        "  fi\n"
+        f'  for x in "$r"/{q(EXEC_SCRIPT_PREFIX)}*.py; do drop "$x"; done\n'
+        f'  rmdir -- "$r"/{q(_ROOT_DATA)} 2>/dev/null\n'
+        "  gone\n"
+        # Finder's view settings, left in any folder a Mac has shown, are
+        # no file of the owner's.
+        f'  if [ -n "$(ls -A -- "$r" | grep -vxF -e {q(ROOT_MARKER)} -e .DS_Store | head -n 1)" ]; then echo root kept\n'
+        '  else rm -f -- "$m" "$r"/.DS_Store; rmdir -- "$r" 2>/dev/null || echo root kept; fi\n'
+        # Not this computer's (its mark gone, or another's): left as it is.
+        'elif [ -e "$r" ] || [ -L "$r" ]; then echo root kept\n'
+        "fi\n"
+        'rmdir -- "$h" 2>/dev/null\n'
+        'if [ -d "$s" ] && [ ! -L "$s" ]; then\n'
+        # The install's lock, so none starts, or is part done, while the
+        # runtime goes; under it, a ``.install.*`` left is a dead install's.
+        f'  u=; {{ exec 9>>"$s"/{q(bootstrap.LOCK_FILE)}; }} 2>/dev/null && lock 5 || u=install\n'
+        # A root in the runtime's folder is the owner's to keep.
+        '  [ -n "$u" ] || case "$r/" in "$s"/*) u=root ;; esac\n'
+        '  [ -n "$u" ] || u=$(ls -A -- "$c" 2>/dev/null | grep -vxF -- "$me" | head -n 1)\n'
+        '  if [ -n "$u" ]; then echo runtime kept; else\n'
+        '    trash "$HOME"\n'
+        '    for x in "$HOME"/.local/bin/python3*; do\n'
+        '      [ -L "$x" ] || continue\n'
+        '      case "$(readlink -- "$x")" in "$s"/python/*) rm -f -- "$x" || f=1 ;; esac\n'
+        "    done\n"
+        '    for x in "$s"/* "$s"/.[!.]* "$s"/..?*; do\n'
+        '      [ -e "$x" ] || [ -L "$x" ] || continue\n'
+        f'      case "$x" in "$c"|"$s"/{q(bootstrap.LOCK_FILE)}) continue ;; esac\n'
+        f'      [ -f "$x"/{q(TUNNEL_UNINSTALL_SCRIPT)} ] || drop "$x"\n'
+        "    done\n"
+        # A computer whose folder arrived since the read keeps its folder,
+        # and the lock its install waits on.
+        '    drop "$c/$me"; rmdir -- "$c" 2>/dev/null\n'
+        f'    [ -e "$c" ] || rm -f -- "$s"/{q(bootstrap.LOCK_FILE)}\n'
+        "    gone\n"
+        '    rmdir -- "$s" 2>/dev/null\n'
+        "  fi\n"
+        "fi\n"
+        '[ "$f" = 0 ]\n'
+    )
+
+
 def read_state_script(cdir: str) -> str:
     """Prints 1 when the computer is marked running on this boot, else 0."""
     return f"d={shlex.quote(cdir)}; {state_sh('$d')}echo $__la_up\n"
@@ -269,6 +404,22 @@ def env_file(env: Mapping[str, str], home: str, root: str) -> str:
 ROOT_MARKER = ".langalpha-root"
 
 
+# One claim of a root at a time on the login, from the look at the folder to
+# the mark: two starts that both found it free would each mark it, and an
+# uninstall taking a root's folders out holds it too, so no claim lands
+# between its look at the mark and what it deletes. Held in ``$c``, the
+# computers folder. A claim takes moments, so a hold older than that was cut
+# off; one still held after the wait is exit 15, inside the command's timeout.
+_CLAIM_HOLD = (
+    'h="$c/.claiming"; n=0; mkdir -p -- "$c" || exit 9\n'
+    'until mkdir -- "$h" 2>/dev/null; do\n'
+    '  n=$((n + 1)); [ "$n" -le 20 ] || exit 15\n'
+    '  if [ -n "$(find "$h" -prune -mmin +2 2>/dev/null)" ]; then rmdir -- "$h" 2>/dev/null; else sleep 1; fi\n'
+    "done\n"
+    "trap 'rmdir -- \"$h\" 2>/dev/null' EXIT; trap 'exit 1' HUP INT TERM\n"
+)
+
+
 def root_dir_script(path: str, *, computers: str, computer_id: str | None) -> str:
     """Exit 0 when *path* is, or can become, this computer's own root folder.
 
@@ -302,18 +453,7 @@ def root_dir_script(path: str, *, computers: str, computer_id: str | None) -> st
         make = 'mkdir -p -- "$w" 2>/dev/null && claim'
         sudo = 'sudo -n install -d -o "$(id -un)" -g "$(id -gn)" -- "$w"'
         claim = "claim"
-        # One claim at a time on the login, from the look at the folder to
-        # the mark: two starts that both found it free would each mark it.
-        # A claim takes moments, so a hold older than that was cut off; one
-        # still held after the wait is exit 15, inside the command's timeout.
-        hold = (
-            'l="$c/.claiming"; n=0; mkdir -p -- "$c" || exit 9\n'
-            'until mkdir -- "$l" 2>/dev/null; do\n'
-            '  n=$((n + 1)); [ "$n" -le 20 ] || exit 15\n'
-            '  if [ -n "$(find "$l" -prune -mmin +2 2>/dev/null)" ]; then rmdir -- "$l" 2>/dev/null; else sleep 1; fi\n'
-            "done\n"
-            "trap 'rmdir -- \"$l\" 2>/dev/null' EXIT; trap 'exit 1' HUP INT TERM\n"
-        )
+        hold = _CLAIM_HOLD
     return (
         f"w={shlex.quote(path)}; c={shlex.quote(computers)}; "
         f'me={shlex.quote(computer_id or "")}; m="$w/{ROOT_MARKER}"; o=\n'
@@ -410,6 +550,16 @@ def root_dir_error(
     return SSHConnectError("root_dir", f"{message} {choose}")
 
 
+
+def folder_marked_message(path: str, host: str) -> str:
+    """The refusal of a folder another computer marked. The client offers the
+    take-over itself, so a build without the offer reads it as whole."""
+    return (
+        f"{path} on {host} is the folder of a LangAlpha computer this account "
+        "does not have, perhaps one from another account or an earlier "
+        "install. Choose a new or empty folder."
+    )
+
 # -- Process groups and sessions ------------------------------------------------
 
 # A command's group is not all it started: ``timeout``, and any job control,
@@ -454,8 +604,8 @@ SESSION_SH = _proc_or_ps(_SESSION_LINUX_SH, _SESSION_PS_SH)
 # time, so a stop never signals a pid that has since gone to someone else,
 # and exports them as the mark that proves a group it left is its own.
 # macOS's bash 3.2 has no $BASHPID, so the leader learns its pid as the parent
-# of a process it execs, and with no /proc its start time is ps's, as ``st``
-# reads it (``_exec_sessions``).
+# of a process it execs, and with no /proc its start time is ps's, as
+# ``pstart`` reads it (``_proc_sh``).
 _PIDFILE_SH = (
     "__la_me=${BASHPID:-$(exec sh -c 'echo $PPID')}; "
     'if { read -r __la_s < "/proc/$__la_me/stat"; } 2>/dev/null; then '
@@ -545,20 +695,6 @@ def kill_group_script(computer_dir: str, pgid: int, *, root: bool) -> str:
     )
 
 
-def code_run_command(path: str, payload: str) -> str:
-    """Write base64 *payload* to *path* and run it, removing the file however
-    the run ends.
-
-    A timeout or a cancel ends the group with a TERM, which the trap turns into
-    an exit so the EXIT trap still runs; only the KILL after the grace skips it.
-    """
-    return (
-        f"__la_py={shlex.quote(path)}; "
-        "trap 'rm -f -- \"$__la_py\"' EXIT; trap 'exit 143' TERM HUP INT; "
-        f'printf %s {payload} | base64 -d > "$__la_py" || exit 1; python3 "$__la_py"'
-    )
-
-
 # -- Stopping -------------------------------------------------------------------
 
 # ``la_sup ROOT`` prints the login's processes running the MCP supervisor of
@@ -592,14 +728,16 @@ _SUPERVISOR_SH = _proc_or_ps(_SUPERVISOR_LINUX_SH, _SUPERVISOR_PS_SH)
 def stop_script(cdir: str, *, root: bool, computer_root: str = "") -> str:
     """Mark the computer stopped and end every process group it left.
 
-    A group is signalled only while its leader is the process recorded, or
-    once the leader is gone, while a member carries the command's mark
-    (``GROUP_MARK_SH``). Records from before a reboot name nothing alive, and
-    their ids may be anyone's now, so they are dropped unsignalled. ``root``
-    ends only the records ``exec_as_root`` left, and prints nothing;
-    otherwise ``has-root`` says such records remain. Given ``computer_root``,
-    the computer's MCP supervisor and the servers in its session end too,
-    however it was started.
+    A group is signalled only while it is proven the record's (``psig``):
+    its leader is the process recorded, a zombie one included, or a member
+    carries the command's mark. Records from before a reboot name nothing alive, and their ids may
+    be anyone's now, so they are dropped unsignalled. ``root`` ends only the
+    records ``exec_as_root`` left, and prints nothing; otherwise ``has-root``
+    says such records remain. Given ``computer_root``, the computer's MCP
+    supervisor and the servers in its session end too, however it was
+    started, and so do its detached jobs (``sandbox/jobs``), which leave the
+    session of the exec that started them. A job's record stays, so it reads
+    as having vanished.
     """
     supervisor = ""
     if root:
@@ -610,6 +748,7 @@ def stop_script(cdir: str, *, root: bool, computer_root: str = "") -> str:
         records = '"$d"/sessions/run-*/*/*.pid "$d"/execs/[0-9]*'
         cleanup = 'rm -rf "$d"/sessions/run-*; rm -f "$d"/execs/[0-9]*'
         if computer_root:
+            records += f" {shlex.quote(computer_root)}/{SandboxLayout.SYSTEM_JOBS_DIR}/*/pid"
             supervisor = (
                 f"  for pid in $(la_sup {shlex.quote(computer_root)}); do\n"
                 '    S="$S $(la_sid "$pid")"; kill -"$1" -- "-$pid"; kill -"$1" "$pid"; n=1\n'
@@ -627,21 +766,21 @@ def stop_script(cdir: str, *, root: bool, computer_root: str = "") -> str:
         )
     return f"""d={shlex.quote(cdir)}
 [ -d "$d" ] || exit 0
-{mark}{SESSION_FUNCTIONS_SH}{GROUP_MARK_SH}
-{SESSION_SH}{_SUPERVISOR_SH if supervisor else ""}S= P=
+{mark}{PROC_SH}{SESSION_SH}{_SUPERVISOR_SH if supervisor else ""}S= P=
 sig() {{
   n=0
   for f in {records}; do
     [ -e "$f" ] || continue
     {{ read -r pid start < "$f"; }} 2>/dev/null
     case $pid in ""|*[!0-9]*) continue;; esac
-    now=$(st "$pid")
-    if [ "$now" = "$start" ]; then
-      S="$S $(la_sid "$pid")"; kill -"$1" -- "-$pid"; kill -"$1" "$pid"; n=1
-    elif [ -z "$now" ] && case " $P " in *" $pid "*) ;; *) ours "$pid" "$pid-$start";; esac; then
-      # Proven on the TERM round and trusted on the KILL round a second
-      # later: what outlived the TERM may carry no mark of its own.
-      P="$P $pid"; S="$S $(la_sid "$pid")"; kill -"$1" -- "-$pid" && n=1
+    # Proven on the TERM round and trusted on the KILL round a second later,
+    # while its pid names no process, not even a zombie: what outlived the
+    # TERM may carry no mark of its own. A group's session is read before the
+    # signal, while the group still has it.
+    if case " $P " in *" $pid "*) [ -z "$(pstart "$pid" z)" ];; *) false;; esac; then
+      kill -"$1" "-$pid" && n=1
+    else
+      s=$(la_sid "$pid"); if psig "$1" "$pid" "$start" z; then P="$P $pid"; S="$S $s"; n=1; fi
     fi
   done 2>/dev/null
 {supervisor}  for s in $S; do la_sk "$1" "$s" && n=1; done

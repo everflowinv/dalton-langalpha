@@ -1,7 +1,7 @@
 import { fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { InlineStockPriceCard } from '../InlineArtifactCards';
+import { InlineStockPriceCard } from '../InlineStockPriceCard';
 
 // Neutral placeholder symbol and fabricated bars only.
 const OHLCV = [
@@ -105,7 +105,8 @@ describe('InlineStockPriceCard freshness line', () => {
     const daily = [{ time: venueMidnight(13), close: 1500 }, { time: venueMidnight(14), close: 1510 }];
     for (const symbol of ['600519.SH', '0700.HK']) {
       const { unmount } = render(<InlineStockPriceCard artifact={{ ...artifact({}), symbol, ohlcv: daily }} />);
-      expect(screen.getByText('2026-07-13, 2026-07-14')).toBeInTheDocument();
+      // The range reads in the venue's days, Jul 13 to 14, not New York's 12 to 13.
+      expect(screen.getByText(/^Jul 13\s*–\s*14, 2026$/)).toBeInTheDocument();
       unmount();
     }
   });
@@ -114,5 +115,19 @@ describe('InlineStockPriceCard freshness line', () => {
     render(<InlineStockPriceCard artifact={{ ...artifact({}), symbol: '600519.SS', price_currency: 'CNY' }} />);
     expect(screen.getByText(/¥\d/)).toBeInTheDocument();
     expect(screen.queryByText(/\$\d/)).not.toBeInTheDocument();
+  });
+});
+
+describe('InlineStockPriceCard headline', () => {
+  it('prints no price for a bar still forming, and dates the card to its day', () => {
+    const { container } = render(
+      <InlineStockPriceCard
+        artifact={artifact({ ohlcv: [...OHLCV, { date: '2026-07-15', close: null }] })}
+      />,
+    );
+
+    // The last close is the forming bar's, which has none yet: the day before's is not the price.
+    expect(container.querySelector('.term-big')).toBeNull();
+    expect(container.querySelector('.term-card-meta')?.textContent).toMatch(/15/);
   });
 });

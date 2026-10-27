@@ -1917,6 +1917,31 @@ class TestFetchOptionsChain:
         assert first_call[1]["strike_price_gte"] == 150.0
 
     @pytest.mark.asyncio
+    async def test_artifact_keeps_each_contracts_session(self):
+        """The card prints close, change and volume, so the artifact keeps the
+        snapshot session the text table is built from."""
+        chain = {"results": [
+            {"ticker": "O:ZZZZ250117C00010000", "contract_type": "call", "strike_price": 10.0, "expiration_date": "2025-01-17"},
+            {"ticker": "O:ZZZZ250117C00011000", "contract_type": "call", "strike_price": 11.0, "expiration_date": "2025-01-17"},
+        ]}
+        intel = _make_fake_intel_source(options_chain=chain)
+        intel.get_options_snapshot = AsyncMock(return_value=[
+            {"ticker": "O:ZZZZ250117C00010000", "market_status": "closed",
+             "session": {"close": 1.25, "change_percent": 4.0, "volume": 30.0}},
+        ])
+        provider = _make_fake_financial_provider(intel=intel)
+
+        with patch(f"{_QUOTES_MOD}.get_financial_data_provider", return_value=provider):
+            _, artifact = await fetch_options_chain("ZZZZ", contract_type="call")
+
+        priced, unpriced = artifact["results"]
+        assert priced["session"] == {"close": 1.25, "change_percent": 4.0, "volume": 30.0}
+        assert unpriced["session"] is None
+        assert artifact["market_status"] == "closed"
+        assert artifact["contract_type"] == "call"
+        assert artifact["currency"] == "USD"
+
+    @pytest.mark.asyncio
     async def test_empty_results(self):
         intel = _make_fake_intel_source(options_chain={"results": []})
         provider = _make_fake_financial_provider(intel=intel)
@@ -1958,12 +1983,18 @@ class TestFetchOptionsChain:
 # fetch_market_movers
 # ---------------------------------------------------------------------------
 
+def _mover(symbol, *, price, change_percent):
+    """A mover as a MarketIntelSource hands it over."""
+    return {"symbol": symbol, "price": price, "change": None,
+            "change_percent": change_percent, "volume": None}
+
+
 class TestFetchMarketMovers:
     @pytest.mark.asyncio
     async def test_gainers(self):
         movers = [
-            {"ticker": "NVDA", "name": "NVIDIA Corp", "price": 950.0, "change_percent": 8.5},
-            {"ticker": "AMD", "name": "AMD Inc", "price": 180.0, "change_percent": 5.2},
+            _mover("NVDA", price=950.0, change_percent=8.5),
+            _mover("AMD", price=180.0, change_percent=5.2),
         ]
         intel = _make_fake_intel_source(movers=movers)
         provider = _make_fake_financial_provider(intel=intel)
@@ -1980,10 +2011,33 @@ class TestFetchMarketMovers:
         assert len(artifact["results"]) == 2
 
     @pytest.mark.asyncio
-    async def test_losers(self):
+    async def test_vendor_row_is_priced_at_its_last_trade(self):
+        """The vendor's row has no price or name field: the last trade is the
+        price its change was measured at, the day bar's close stands in."""
+        from src.data_client.ginlix_data.market_intel_source import GinlixMarketIntelSource
+
         movers = [
-            {"ticker": "INTC", "name": "Intel Corp", "price": 20.0, "change_percent": -6.3},
+            {"ticker": "ZZZZ", "change": 1.5, "change_percent": 50.0,
+             "day": {"close": 4.4, "volume": 1200.0}, "last_trade": {"price": 4.5}},
+            {"ticker": "YYYY", "change": 0.5, "change_percent": 25.0, "day": {"close": 2.5, "volume": 900.0}},
         ]
+        # The vendor row reaches the tool through the source that shapes it.
+        client = AsyncMock()
+        client.get_movers = AsyncMock(return_value=movers)
+        provider = _make_fake_financial_provider(intel=GinlixMarketIntelSource(client))
+
+        with patch(f"{_QUOTES_MOD}.get_financial_data_provider", return_value=provider):
+            content, artifact = await fetch_market_movers(direction="gainers")
+
+        assert "$4.50" in content and "$2.50" in content
+        first, second = artifact["results"]
+        assert first == {"symbol": "ZZZZ", "name": None, "price": 4.5, "change": 1.5,
+                         "change_percent": 50.0, "volume": 1200.0, "currency": "USD"}
+        assert second["price"] == 2.5
+
+    @pytest.mark.asyncio
+    async def test_losers(self):
+        movers = [_mover("INTC", price=20.0, change_percent=-6.3)]
         intel = _make_fake_intel_source(movers=movers)
         provider = _make_fake_financial_provider(intel=intel)
 

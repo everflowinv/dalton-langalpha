@@ -1,10 +1,12 @@
 """What a removed ssh computer leaves on its machine: the folders its owner
-asked to have deleted, the key's line and the tunnel.
+asked to have deleted, LangAlpha's own files when they asked for those too,
+the key's line and the tunnel.
 
 All three go after the computer's delete, on the connection the delete ran on
 (``ssh.removal_link``): a machine the delete could not reach is not dialed
 again. The folders go first, since the tunnel's uninstall may take this
-connection with it: each leaves its name by a rename and is then deleted
+connection with it, then LangAlpha's files for the same reason: each leaves
+its name by a rename and is then deleted
 detached, as the uninstall is, so the removal answers its owner before a large
 folder is gone. With a tunnel to take off, the key's line goes
 in the uninstall's own command, just ahead of it, since the key is the login a
@@ -14,16 +16,20 @@ went out. The removal has happened by then, so nothing here raises.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import shlex
 from dataclasses import dataclass, field
 from typing import Any, Dict, Mapping, Optional
 
 from ptc_agent.config.core import SSHConfig
-from ptc_agent.core.paths import workspace_root
+from ptc_agent.core.paths import LEFTOVERS_TRASH_PREFIX, workspace_root
 from ptc_agent.core.sandbox.providers import ssh as ssh_provider
 from ptc_agent.core.sandbox.providers._ssh_authorized_key import remove_script
-from ptc_agent.core.sandbox.providers._ssh_shell import home_shared_script
+from ptc_agent.core.sandbox.providers._ssh_shell import (
+    home_shared_script,
+    uninstall_script,
+)
 from ptc_agent.core.sandbox.providers._ssh_transport import TRANSPORT_ERRORS, Link
 from src.server.database.computer import get_computers_for_user
 from src.server.database.ssh_keys import get_user_ssh_public_key
@@ -36,7 +42,11 @@ from src.server.database.workspace_folders import (
     is_top_level,
     leftovers_path,
 )
-from src.server.models.computer import ComputerKeyRemoval, KeyRemovalOutcome
+from src.server.models.computer import (
+    ComputerFilesRemoval,
+    ComputerKeyRemoval,
+    KeyRemovalOutcome,
+)
 from src.server.services.ssh_computers import (
     computer_sharing_login,
     key_line_logins,
@@ -48,6 +58,8 @@ logger = logging.getLogger(__name__)
 
 # One short command on a connection already open.
 _KEY_TIMEOUT_S = 20.0
+# Renames and the small folders the trash could not take, on one connection.
+_FILES_TIMEOUT_S = 60.0
 
 
 @dataclass(frozen=True)
@@ -57,6 +69,7 @@ class MachineLeft:
     # connection open must, and one after a release here failed or while
     # another release or the sweep is taking it off.
     tunnel_released: bool
+    files: Optional[ComputerFilesRemoval] = None
 
 
 @dataclass(frozen=True)
@@ -90,6 +103,7 @@ async def leave_machine(
     *,
     settings: SSHConfig,
     remove_key: bool,
+    delete_files: bool = False,
 ) -> MachineLeft:
     """Take what a removed ssh computer owes off its machine: the folders its
     owner asked to have deleted, the key's line, and its tunnel.
@@ -99,6 +113,7 @@ async def leave_machine(
     calls, so the connection found is the one its delete used. A machine
     LangAlpha's helper answers for has no line of ours in ``~/.ssh`` to take,
     so ``remove_key`` is not asked of it: its key goes with the helper's folder.
+    ``delete_files`` also takes LangAlpha's own files off (``uninstall_script``).
     """
     remove_key = remove_key and not (computer.get("provider_config") or {}).get(
         "helper"
@@ -116,6 +131,9 @@ async def leave_machine(
                         "Could not delete the folders of removed computer %s",
                         computer.get("computer_id"),
                     )
+            files = None
+            if delete_files:
+                files = await _remove_files(computer, link)
             line = await _key_line(user_id, computer, link) if remove_key else None
             ahead = Ahead(line.script) if line is not None and line.script else None
             released = False
@@ -127,7 +145,7 @@ async def leave_machine(
             key = None
             if line is not None:
                 key = await _take_key_line(line, link, ahead, tunnel_left=tunnel_left)
-            return MachineLeft(key=key, tunnel_released=released)
+            return MachineLeft(key=key, files=files, tunnel_released=released)
     except Exception:  # noqa: BLE001 - the removal it follows already succeeded
         logger.exception(
             "Could not finish leaving the machine of removed computer %s",
@@ -135,8 +153,59 @@ async def leave_machine(
         )
         return MachineLeft(
             key=ComputerKeyRemoval(outcome="skipped") if remove_key else None,
+            files=ComputerFilesRemoval(outcome="failed") if delete_files else None,
             tunnel_released=False,
         )
+
+
+async def _remove_files(
+    computer: Dict[str, Any], link: Optional[Link]
+) -> ComputerFilesRemoval:
+    """LangAlpha's files off the machine, after the computer's own folder went
+    with its delete; a machine that delete could not reach keeps them all."""
+    computer_id = computer.get("computer_id")
+    root = computer.get("root_dir") or ""
+    sandbox_id = computer.get("provider_ref") or ""
+    if link is None:
+        return ComputerFilesRemoval(outcome="unreached")
+    if not root or not sandbox_id:
+        logger.warning("No root to delete files from for removed computer %s", computer_id)
+        return ComputerFilesRemoval(outcome="failed")
+    # Link.run, split where the script goes out: a failure before is a
+    # machine that deleted nothing, one after may have deleted part.
+    sent = False
+    try:
+        async with link.in_use(), asyncio.timeout(_FILES_TIMEOUT_S):
+            run = await link.start(
+                uninstall_script(root, sandbox_id), slot=link.control_slot
+            )
+            sent = True
+            try:
+                result = await run.finish()
+            except BaseException:
+                run.abandon()
+                raise
+    except (TimeoutError, *TRANSPORT_ERRORS) as e:
+        logger.info(
+            "Lost removed computer %s's machine deleting its files (%s): %r",
+            computer_id,
+            "after sending" if sent else "before sending",
+            e,
+        )
+        return ComputerFilesRemoval(outcome="failed" if sent else "unreached")
+    said = result.stdout.decode(errors="replace").splitlines()
+    if result.exit_code != 0:
+        logger.warning(
+            "Could not delete the files of removed computer %s: %s",
+            computer_id,
+            (result.stderr or b"").decode(errors="replace").strip()[:200],
+        )
+        return ComputerFilesRemoval(outcome="failed")
+    return ComputerFilesRemoval(
+        outcome="deleted",
+        root_kept="root kept" in said,
+        runtime_kept="runtime kept" in said,
+    )
 
 
 async def _remove_owed_folders(computer: Dict[str, Any], link: Link) -> None:
@@ -166,7 +235,8 @@ async def _remove_owed_folders(computer: Dict[str, Any], link: Link) -> None:
     if not owed:
         return
     leftovers = shlex.quote(f"{root}/{LEFTOVERS_DIR}")
-    script = [f"t=$(mkdir -p {leftovers} && mktemp -d {leftovers}/removed.XXXXXX) || exit 1"]
+    trash = shlex.quote(f"{root}/{LEFTOVERS_DIR}/{LEFTOVERS_TRASH_PREFIX}")
+    script = [f"t=$(mkdir -p {leftovers} && mktemp -d {trash}XXXXXX) || exit 1"]
     for i, (_, dir_name) in enumerate(owed):
         folder = shlex.quote(workspace_root(root, dir_name))
         # Says which are out of their name: gone already, or moved now.

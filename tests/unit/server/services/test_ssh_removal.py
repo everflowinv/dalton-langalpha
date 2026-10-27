@@ -1,5 +1,6 @@
 """What a removed ssh computer leaves on its machine: the folders its owner
-asked to have deleted, the key's line and the tunnel.
+asked to have deleted, LangAlpha's files when they asked for those too, the
+key's line and the tunnel.
 
 The outcome reaches the owner as is, so each one is pinned to what happened
 on the machine, and nothing here may fail a removal that already happened.
@@ -8,7 +9,9 @@ on the machine, and nothing here may fail a removal that already happened.
 from __future__ import annotations
 
 import contextlib
+import os
 import shlex
+import sys
 from typing import Any
 from unittest.mock import AsyncMock
 
@@ -17,8 +20,13 @@ import pytest
 
 from ptc_agent.config.core import SSHConfig
 from ptc_agent.core.sandbox.providers._ssh_authorized_key import remove_script
-from ptc_agent.core.sandbox.providers._ssh_shell import home_shared_script
+from ptc_agent.core.sandbox.providers._ssh_shell import (
+    home_shared_script,
+    root_dir_script,
+    uninstall_script,
+)
 from ptc_agent.core.sandbox.providers._ssh_transport import ScriptResult
+from src.server.models.computer import ComputerFilesRemoval
 from src.server.services import ssh_removal, ssh_tunnel_sweep
 
 _HOST_KEY = (
@@ -59,17 +67,49 @@ def _computer(
     }
 
 
+class _Unsent:
+    """An answer that fails before the script reaches the machine."""
+
+    def __init__(self, error: BaseException) -> None:
+        self.error = error
+
+
+class _Run:
+    def __init__(self, answer: Any) -> None:
+        self._answer = answer
+
+    async def finish(self) -> ScriptResult:
+        if isinstance(self._answer, BaseException):
+            raise self._answer
+        return self._answer
+
+    def abandon(self) -> None:
+        pass
+
+
 class _Link:
+    """The connection, answering each script in turn: a result, an error once
+    the script was sent, or ``_Unsent`` for one raised before."""
+
+    control_slot = None
+
     def __init__(self, *answers: Any) -> None:
         self.scripts: list[str] = []
         self._answers = list(answers)
 
-    async def run(self, script: str, *, timeout: float, **_: Any) -> ScriptResult:
+    @contextlib.asynccontextmanager
+    async def in_use(self):
+        yield
+
+    async def start(self, script: str, **_: Any) -> _Run:
         self.scripts.append(script)
         answer = self._answers.pop(0)
-        if isinstance(answer, BaseException):
-            raise answer
-        return answer
+        if isinstance(answer, _Unsent):
+            raise answer.error
+        return _Run(answer)
+
+    async def run(self, script: str, *, timeout: float, **_: Any) -> ScriptResult:
+        return await (await self.start(script)).finish()
 
 
 def _said(text: str, exit_code: int = 0) -> ScriptResult:
@@ -146,9 +186,13 @@ def machine(monkeypatch):
     return state
 
 
-async def _leave(computer, *, remove_key=True):
+async def _leave(computer, *, remove_key=True, delete_files=False):
     return await ssh_removal.leave_machine(
-        USER, computer, settings=SSHConfig(), remove_key=remove_key
+        USER,
+        computer,
+        settings=SSHConfig(),
+        remove_key=remove_key,
+        delete_files=delete_files,
     )
 
 
@@ -511,3 +555,308 @@ async def test_an_uninstall_on_an_open_connection_logs_in_to_nothing(monkeypatch
 
     assert link.scripts == [ssh_tunnel_sweep._uninstall_sh("t-1")]
     dial.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_files_go_before_the_tunnel_when_asked(machine):
+    """The tunnel's uninstall may take the connection with it, so LangAlpha's
+    files go first, by the computer's own root and sandbox id."""
+    computer = _computer(tunnel="tun-1")
+    machine["link"] = link = _Link(_said(""), _said("removed\n"))
+
+    left = await _leave(computer, remove_key=False, delete_files=True)
+
+    assert link.scripts[0] == uninstall_script(computer["root_dir"], "ref-c-1")
+    assert machine["events"].index(("release", "c-1", link)) > 0
+    assert left.files.model_dump() == {
+        "outcome": "deleted",
+        "root_kept": False,
+        "runtime_kept": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_files_the_machine_kept_are_said(machine):
+    machine["link"] = _Link(_said("root kept\nruntime kept\n"))
+
+    left = await _leave(_computer(), remove_key=False, delete_files=True)
+
+    assert (left.files.root_kept, left.files.runtime_kept) == (True, True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("answer", "outcome"),
+    [
+        (None, "unreached"),
+        (_Unsent(ConnectionResetError()), "unreached"),
+        # Sent, so part of it may have run.
+        (TimeoutError(), "failed"),
+        (ConnectionResetError(), "failed"),
+        (_said("", 1), "failed"),
+    ],
+    ids=["no-connection", "lost-before-sending", "timed-out", "lost-after-sending", "script-failed"],
+)
+async def test_files_not_deleted_are_said(machine, answer, outcome):
+    machine["link"] = None if answer is None else _Link(answer)
+
+    left = await _leave(_computer(), remove_key=False, delete_files=True)
+
+    assert left.files.outcome == outcome
+
+
+@pytest.mark.asyncio
+async def test_files_stay_unless_asked(machine):
+    machine["link"] = link = _Link()
+
+    left = await _leave(_computer(), remove_key=False)
+
+    assert left.files is None
+    assert link.scripts == []
+
+
+def _uninstall(
+    home, root: str, sandbox_id: str = "c1", *, path: str = "/usr/bin:/bin"
+) -> ComputerFilesRemoval:
+    """The real script, through ``_remove_files``, in bash with *home* as $HOME;
+    returns once the detached deletes are done."""
+    import asyncio
+    import subprocess
+    import time
+
+    class _LocalRun:
+        def __init__(self, script: str) -> None:
+            self._script = script
+
+        async def finish(self) -> ScriptResult:
+            done = subprocess.run(
+                ["bash", "-c", self._script],
+                capture_output=True,
+                env={"HOME": str(home), "PATH": path},
+            )
+            return ScriptResult(
+                exit_code=done.returncode, stdout=done.stdout, stderr=done.stderr
+            )
+
+        def abandon(self) -> None:
+            pass
+
+    class _LocalLink(_Link):
+        async def start(self, script: str, **_: Any) -> _LocalRun:
+            return _LocalRun(script)
+
+    computer = {"computer_id": "c-1", "root_dir": root, "provider_ref": sandbox_id}
+    files = asyncio.run(ssh_removal._remove_files(computer, _LocalLink()))
+    deadline = time.monotonic() + 10
+    while any(home.rglob(".langalpha-removing.*")) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    return files
+
+
+def _machine_with_a_computer(home) -> Any:
+    """c1's root, its runtime, and a tunnel's folder beside the runtime."""
+    root = home / "langalpha"
+    for folder in (
+        "_internal/tools",
+        "_internal/leftovers/removed.abc123",
+        "_internal/leftovers/notes.copying",
+        ".agents/skills",
+        "mcp_servers",
+        ".system",
+        "data",
+    ):
+        (root / folder).mkdir(parents=True)
+    (root / ".langalpha-root").write_text("c1\n")
+    (root / "_exec_1a2b3c4d.py").write_text("print()\n")
+    runtime = home / ".langalpha"
+    for folder in ("venv/bin", "computers", ".install.dead", "tun-1"):
+        (runtime / folder).mkdir(parents=True)
+    (runtime / ".bootstrap").write_text("stamp\n")
+    (runtime / "tun-1" / "uninstall.sh").write_text("#!/bin/sh\n")
+    return root
+
+
+def _set_aside(root, name: str, text: str) -> None:
+    folder = root / "_internal" / "leftovers" / name
+    folder.mkdir(parents=True)
+    (folder / "plan.md").write_text(text)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell")
+def test_the_uninstall_takes_what_langalpha_made_and_gives_back_the_owners(tmp_path):
+    home = tmp_path.resolve()
+    root = _machine_with_a_computer(home)
+    (root / "mine.txt").write_text("the owner's\n")
+    _set_aside(root, "notes-20261024120000-a1b2c3", "set aside\n")
+    # A deleted workspace's folder the owner kept, set aside by its id.
+    _set_aside(root, "0b7c4f6e-1d2a-4e3b-9c8d-7f6e5d4c3b2a", "kept\n")
+
+    files = _uninstall(home, str(root))
+
+    assert files.model_dump() == {
+        "outcome": "deleted",
+        "root_kept": True,
+        "runtime_kept": False,
+    }
+    assert sorted(p.name for p in root.iterdir()) == [
+        ".langalpha-root",
+        "0b7c4f6e-1d2a-4e3b-9c8d-7f6e5d4c3b2a",
+        "mine.txt",
+        "notes-20261024120000-a1b2c3",
+    ]
+    assert (root / "notes-20261024120000-a1b2c3" / "plan.md").read_text() == "set aside\n"
+    # Only the tunnel's folder stays, for its own uninstall.
+    assert [p.name for p in (home / ".langalpha").iterdir()] == ["tun-1"]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell")
+def test_a_kept_root_is_free_for_the_next_computer(tmp_path):
+    """Its mark stays, so the owner's files in it do not read as a stranger's."""
+    import subprocess
+
+    home = tmp_path.resolve()
+    root = _machine_with_a_computer(home)
+    (root / "mbp" / ".agents").mkdir(parents=True)
+
+    assert _uninstall(home, str(root)).root_kept
+
+    check = root_dir_script(
+        str(root), computers=str(home / ".langalpha" / "computers"), computer_id=None
+    )
+    done = subprocess.run(
+        ["bash", "-c", check], env={"HOME": str(home), "PATH": "/usr/bin:/bin"}
+    )
+    assert done.returncode == 0
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell")
+@pytest.mark.parametrize("name", ["langalpha", "my data"])
+def test_a_root_that_is_a_disk_of_its_own_empties_on_that_disk(tmp_path, name):
+    """A trash beside it would be on another disk, where every move is a copy
+    of what the removal set out to delete."""
+    home = tmp_path.resolve()
+    root = _machine_with_a_computer(home)
+    if name != root.name:
+        root = root.rename(root.with_name(name))
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    # Reports every path as on a disk mounted at the root.
+    (bin_dir / "df").write_text(
+        f"#!/bin/sh\necho 'Filesystem 1024-blocks Used Available Capacity Mounted on'\n"
+        f"echo '/dev/disk9 100 1 99 1% {root}'\n"
+    )
+    (bin_dir / "df").chmod(0o755)
+
+    files = _uninstall(home, str(root), path=f"{bin_dir}:/usr/bin:/bin")
+
+    assert (files.outcome, files.root_kept) == ("deleted", True)
+    assert sorted(p.name for p in root.iterdir()) == [".langalpha-root"]
+    assert not any(home.glob(".langalpha-removing.*"))
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell")
+def test_a_root_a_mac_has_shown_still_goes_once_empty(tmp_path):
+    home = tmp_path.resolve()
+    root = _machine_with_a_computer(home)
+    (root / ".DS_Store").write_bytes(b"\0")
+
+    files = _uninstall(home, str(root))
+
+    assert (files.outcome, files.root_kept) == ("deleted", False)
+    assert not root.exists()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell")
+def test_a_root_not_marked_as_this_computers_is_kept_and_said_so(tmp_path):
+    home = tmp_path.resolve()
+    root = _machine_with_a_computer(home)
+    (root / ".langalpha-root").unlink()
+
+    files = _uninstall(home, str(root))
+
+    assert (files.outcome, files.root_kept) == ("deleted", True)
+    assert (root / ".agents" / "skills").is_dir()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell")
+def test_a_root_inside_the_runtime_folder_keeps_the_runtime(tmp_path):
+    home = tmp_path.resolve()
+    _machine_with_a_computer(home)
+    root = home / ".langalpha" / "work"
+    (root / "notes").mkdir(parents=True)
+    (root / ".langalpha-root").write_text("c1\n")
+
+    files = _uninstall(home, str(root))
+
+    assert (files.root_kept, files.runtime_kept) == (True, True)
+    assert (root / "notes").is_dir()
+    assert (home / ".langalpha" / "venv" / "bin").is_dir()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell")
+def test_an_empty_root_goes_and_another_computer_keeps_the_runtime(tmp_path):
+    home = tmp_path.resolve()
+    root = _machine_with_a_computer(home)
+    (home / ".langalpha" / "computers" / "c2").mkdir()
+
+    files = _uninstall(home, str(root))
+
+    assert (files.outcome, files.root_kept, files.runtime_kept) == ("deleted", False, True)
+    assert not root.exists()
+    assert (home / ".langalpha" / "venv" / "bin").is_dir()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell")
+def test_a_folder_that_cannot_go_back_keeps_the_leftovers_and_the_root(tmp_path):
+    """Its name at the root's top is taken, by a folder of the owner's too."""
+    home = tmp_path.resolve()
+    root = _machine_with_a_computer(home)
+    name = "notes-20261024120000-a1b2c3"
+    _set_aside(root, name, "set aside\n")
+    (root / name).mkdir()
+    (root / name / "plan.md").write_text("at the top\n")
+
+    files = _uninstall(home, str(root))
+
+    assert (files.outcome, files.root_kept) == ("deleted", True)
+    assert (root / name / "plan.md").read_text() == "at the top\n"
+    leftovers = root / "_internal" / "leftovers"
+    assert (leftovers / name / "plan.md").read_text() == "set aside\n"
+    assert not (leftovers / "notes.copying").exists()
+    assert sorted(p.name for p in (root / "_internal").iterdir()) == ["leftovers"]
+    assert not (root / ".agents").exists()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell")
+@pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0, reason="root ignores permissions"
+)
+def test_a_folder_that_will_not_delete_fails_the_uninstall(tmp_path):
+    home = tmp_path.resolve()
+    root = _machine_with_a_computer(home)
+    stuck = root / ".system"
+    (stuck / "trace").mkdir()
+    stuck.chmod(0o555)
+    try:
+        files = _uninstall(home, str(root))
+    finally:
+        stuck.chmod(0o755)
+
+    assert files.outcome == "failed"
+    assert (stuck / "trace").is_dir()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell")
+def test_an_install_holding_the_lock_keeps_the_runtime(tmp_path):
+    """An install takes the lock before it makes anything, so the runtime it
+    is building never goes from under it."""
+    import fcntl
+
+    home = tmp_path.resolve()
+    root = _machine_with_a_computer(home)
+    with open(home / ".langalpha" / ".bootstrap.lock", "w") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        files = _uninstall(home, str(root))
+
+    assert (files.outcome, files.runtime_kept) == ("deleted", True)
+    assert (home / ".langalpha" / "venv" / "bin").is_dir()

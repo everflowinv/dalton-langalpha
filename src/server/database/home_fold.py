@@ -90,6 +90,7 @@ STAYS: dict[str, str] = {
     "workspace_mcp_tool_schemas": "cached for the MCP selection, where Home's wins",
     "workspace_vault_secrets": "Home's own secret selection wins",
     "order_attempts": "a record of where it ran",
+    "command_runs": "a command runs on the row's computer, and a never-bound row has none",
     "workspace_moves": "a record of the row's own moves, and a never-bound row has none",
     "user_skills": "nothing offers Home as a skill's workspace, so a former Home holds none",
     "workspace_skill_disables": "Home's own skill selection wins",

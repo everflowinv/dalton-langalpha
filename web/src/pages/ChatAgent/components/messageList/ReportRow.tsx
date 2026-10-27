@@ -5,13 +5,14 @@
  */
 import React, { useId } from 'react';
 import { useTranslation } from 'react-i18next';
-import { ArrowUpRight, Inbox } from 'lucide-react';
+import { ArrowUpRight, CircleCheck, CircleStop, CircleX, Inbox } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import type { MessageProvenance } from '@/types/chat';
 import { mapReportOutcome } from '../../hooks/usePTCDispatchStatus';
 import { useOpenDispatchedThread, type DispatcherContext } from '../../hooks/useOpenDispatchedThread';
 import { OPEN_ACTION } from '../analystHandoff/HandoffParts';
 import { HANDOFF_PHASES, handoffPhase } from '../analystHandoff/handoffModel';
+import { commandName, commandOutcome, OUTCOME_KEYS } from '../commands/commandWords';
 import { SubagentGlyph } from '../mcp/subagentGlyph';
 import { useMessageActions } from './MessageActionsContext';
 import { RunAvatar, RunGlyph, type RunGlyphKind } from './runCard';
@@ -19,7 +20,8 @@ import { summarize } from './subagentRun/text';
 
 type AnalystReport = Extract<MessageProvenance, { kind: 'analyst_report' }>;
 type TaskReport = Extract<MessageProvenance, { kind: 'task_report' }>;
-export type ReportProvenance = AnalystReport | TaskReport;
+type CommandReport = Extract<MessageProvenance, { kind: 'command_report' }>;
+export type ReportProvenance = AnalystReport | TaskReport | CommandReport;
 
 // The ring is for a keyboard reader a hand-off's report link brought here,
 // drawn on the line rather than the full-width row that takes the focus.
@@ -56,9 +58,11 @@ export function ReportRow({
       // Inline, to win over the list's sibling spacing.
       style={together ? { marginTop: 0 } : undefined}
     >
-      {analyst
+      {provenance.kind === 'analyst_report'
         ? <AnalystReportRow provenance={provenance} readOnly={readOnly} dispatcherContext={dispatcherContext} />
-        : <TaskReportRow provenance={provenance} readOnly={readOnly} />}
+        : provenance.kind === 'command_report'
+          ? <CommandReportRow provenance={provenance} readOnly={readOnly} />
+          : <TaskReportRow provenance={provenance} readOnly={readOnly} />}
     </div>
   );
 }
@@ -169,6 +173,37 @@ function TaskReportRow({ provenance, readOnly }: { provenance: TaskReport; readO
       onOpen={taskId && onOpenSubagentTask && !readOnly
         ? () => onOpenSubagentTask({ subagentId: `task:${taskId}`, description: description ?? undefined })
         : undefined}
+    />
+  );
+}
+
+// The stop is the one the command's own row draws for a stopped command.
+const COMMAND_LEADS = {
+  completed: { Lead: CircleCheck, tone: 'text-(--color-success)' },
+  failed: { Lead: CircleX, tone: 'text-(--color-icon-danger)' },
+  stopped: { Lead: CircleStop, tone: 'text-(--color-text-tertiary)' },
+} as const satisfies Record<CommandReport['status'], { Lead: React.ComponentType<{ className?: string }>; tone: string }>;
+
+/**
+ * A background command's report in its agent's transcript: how it ended, by
+ * the description the agent gave it, in the words a task's report uses (one
+ * stopped an hour after its turn reads as stopped early, not failed), and
+ * the way back to the tool card it started from. A command that named no
+ * call has no way in, as a share's row has none.
+ */
+function CommandReportRow({ provenance, readOnly }: { provenance: CommandReport; readOnly?: boolean }): React.ReactElement {
+  const { t } = useTranslation();
+  const { onToolCallDetailClick } = useMessageActions();
+  const { tool, description, status, failureReason, toolCallId } = provenance;
+  const outcome = commandOutcome(status, failureReason);
+  const { Lead, tone } = COMMAND_LEADS[status];
+  return (
+    <ReportLineParts
+      lead={<Lead aria-hidden className={cn('h-3.5 w-3.5 shrink-0', tone)} />}
+      name={commandName(description, tool, t)}
+      glyph={null}
+      outcomeKey={OUTCOME_KEYS[outcome].report}
+      onOpen={toolCallId && onToolCallDetailClick && !readOnly ? () => onToolCallDetailClick(toolCallId) : undefined}
     />
   );
 }

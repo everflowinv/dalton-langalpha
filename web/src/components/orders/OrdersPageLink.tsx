@@ -16,12 +16,19 @@ import { GuardedLink } from '@/components/GuardedLink';
  * route change goes through the host's leave guard, since a panel holding
  * unsaved drafts is otherwise unmounted with no question asked.
  */
-export function OrdersPageLink({ attemptId }: { attemptId: string }): React.ReactElement {
+export function OrdersPageLink({
+  attemptId,
+  className: ownClassName,
+}: {
+  attemptId: string;
+  /** The surface's own look in place of the quiet link's, for a card drawn in
+   *  its own type. */
+  className?: string;
+}): React.ReactElement {
   const { t } = useTranslation();
   const inRouter = useInRouterContext();
   const href = `/orders?detail=order:${encodeURIComponent(attemptId)}`;
-  const className = 'inline-flex items-center gap-1 text-xs hover:underline';
-  const style = { color: 'var(--color-text-tertiary)' };
+  const className = ownClassName ?? 'inline-flex items-center gap-1 text-xs hover:underline text-(--color-text-tertiary)';
   const label = (
     <>
       {t('toolArtifact.directTool.orderReceipt.viewInOrders')}
@@ -31,11 +38,11 @@ export function OrdersPageLink({ attemptId }: { attemptId: string }): React.Reac
   return (
     <div className="shrink-0">
       {inRouter ? (
-        <GuardedLink to={href} className={className} style={style} onClick={(e) => e.stopPropagation()}>
+        <GuardedLink to={href} className={className} onClick={(e) => e.stopPropagation()}>
           {label}
         </GuardedLink>
       ) : (
-        <a href={href} className={className} style={style} onClick={(e) => e.stopPropagation()}>
+        <a href={href} className={className} onClick={(e) => e.stopPropagation()}>
           {label}
         </a>
       )}

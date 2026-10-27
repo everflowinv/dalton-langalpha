@@ -1,5 +1,6 @@
 import React from 'react';
 import { useIsMobile } from '@/hooks/useIsMobile';
+import { CardColumn } from './charts/TermCard';
 import { useStableArray } from '@/hooks/useStableArray';
 import { NotificationDivider } from './messageList/NotificationDivider';
 import { WakeupRow } from './messageList/WakeupRow';
@@ -386,7 +387,9 @@ function MessageList({ messages: latest, isLoading, isLoadingHistory, isSubagent
   const list = (
     <ProseTypingContext value={typing}>
     <CollapseClockContext value={collapseClock}>
-    <div className={`font-content ${isMobile ? 'sibling-space-y-4' : 'sibling-space-y-6'}`}>
+    {/* Measured, so the cards lay out for this column: a desktop chat panel
+        beside a chart is narrower than any phone layout assumes. */}
+    <CardColumn className={`font-content ${isMobile ? 'sibling-space-y-4' : 'sibling-space-y-6'}`}>
       {items.map((item) => {
         if (item.kind === 'quiet') {
           return <QuietChecksRow key={`quiet-checks-${item.checks[0].turnIndex}`} checks={item.checks} />;
@@ -472,7 +475,7 @@ function MessageList({ messages: latest, isLoading, isLoadingHistory, isSubagent
           </div>
         );
       })}
-    </div>
+    </CardColumn>
     </CollapseClockContext>
     </ProseTypingContext>
   );

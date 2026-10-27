@@ -44,7 +44,7 @@ async def test_a_claim_out_of_attempts_is_held_not_dead(
     assert hold.startswith("WITH held AS ( UPDATE hook_outbox o SET status = 'pending'")
     assert "next_retry_at = 'infinity'::timestamptz" in hold
     assert "jsonb_build_object('exhausted', true)" in hold
-    assert "o.hook_type IN ('market_target', 'wakeup')" in hold
+    assert "o.hook_type IN ('market_target', 'wakeup', 'command_notice')" in hold
     # A wakeup's riders are held with their head, keeping the head they rode.
     assert "'exhausted', true, 'rode', r.payload->>'rides')" in hold
     assert _flat(outbox._AT_CEILING_SQL) in hold
@@ -63,7 +63,7 @@ async def test_the_park_sweep_holds_alerts_and_dead_letters_the_rest(
     hold, dead = _statements(mock_cursor)[-2:]
     assert "jsonb_build_object('exhausted', true)" in hold
     assert "o.lease_expires_at <= NOW()" in hold
-    assert "hook_type NOT IN ('steer', 'market_target', 'wakeup')" in dead
+    assert "hook_type NOT IN ('steer', 'market_target', 'wakeup', 'command_notice')" in dead
 
 
 @pytest.mark.asyncio
@@ -110,11 +110,13 @@ async def test_the_revive_sweep_makes_an_owed_dead_alert_due_a_bounded_number_of
     # The fence token survives revival.
     assert "attempts" not in head
 
+    # Only an alert that wakes its thread, one that never does is never due,
+    # and a command's report, a type a build before commands kills.
     assert where.startswith(
-        "o.status = 'dead' AND o.hook_type IN ('market_target', 'wakeup')"
+        "o.status = 'dead' AND o.hook_type IN ('market_target', 'wakeup', 'command_report_back')"
     )
     assert f"{_flat(outbox._ALERT_REVIVALS_SQL)} < %(max)s" in where
-    assert _flat(outbox._ALERT_OWED_SQL) in where
+    assert _flat(outbox._REVIVED_OWED_SQL) in where
     assert mock_cursor.execute.call_args.args[1] == {
         "cooldown": 600,
         "window": 86400,
@@ -156,21 +158,22 @@ async def test_the_close_sweep_ends_unheld_alerts_no_turn_will_take(
     sql = _statements(mock_cursor)[-1]
     assert "SET status = 'done'" in sql
     assert (
-        "WHERE o.hook_type IN ('market_target', 'wakeup') AND o.status = 'pending'"
-        " AND NOT (o.payload ? 'steered_run_id')"
+        "WHERE o.hook_type IN ('market_target', 'wakeup', 'command_notice')"
+        " AND o.status = 'pending' AND NOT (o.payload ? 'steered_run_id')"
     ) in sql
     # Not owed: only a waiting one, which nothing else would close.
     assert (
         f"({_flat(outbox.waiting_alert_sql('o'))} AND NOT {_flat(outbox._ALERT_OWED_SQL)})"
     ) in sql
-    # No turn will come: any pending one, held or merely parked.
+    # No turn will come: any pending one, held or merely parked, a command's
+    # notice held for the next turn among them, which no executor claims.
     assert "LEFT JOIN workspaces w ON w.workspace_id = c.workspace_id" in sql
     assert "AND (c.archived_at IS NOT NULL OR w.status = 'deleted')" in sql
     # Except a wakeup's notice still owed, which its executor must end first.
     assert f"(o.hook_type <> 'wakeup' OR NOT {_flat(outbox._ALERT_OWED_SQL)})" in sql
     due = _statements(mock_cursor)[-2]
     assert "SET next_retry_at = NOW()" in due
-    assert f"AND {_flat(outbox._NO_TURN_SQL)} AND {_flat(outbox.WAKEUP_OWED_SQL)}" in due
+    assert f"AND {_flat(outbox.NO_TURN_SQL)} AND {_flat(outbox.WAKEUP_OWED_SQL)}" in due
     assert "ORDER BY (o.payload ? 'rides'), o.hook_outbox_id FOR UPDATE SKIP LOCKED" in due
 
 

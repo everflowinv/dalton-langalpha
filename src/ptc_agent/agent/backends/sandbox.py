@@ -47,8 +47,17 @@ from deepagents.backends.protocol import (
 
 from ptc_agent.agent.backends.results import EditTextResult
 from ptc_agent.core.paths import on_file_mount, resolve_agent_path
-from ptc_agent.core.sandbox import ExecutionResult, PTCSandbox
+from ptc_agent.core.sandbox import PTCSandbox
 from ptc_agent.core.sandbox.grep_render import GrepLine
+from ptc_agent.core.sandbox.jobs import (
+    Ended,
+    Failed,
+    JobOutcome,
+    JobRef,
+    JobSpec,
+    Running,
+    StoppedJob,
+)
 from ptc_agent.core.sandbox.livefs_mount import MountHandle, TranscriptReach
 from ptc_agent.core.sandbox.runtime import PreviewInfo
 
@@ -511,8 +520,8 @@ class SandboxBackend(SandboxBackendProtocol):
     # Langalpha-specific rich methods (not part of SandboxBackendProtocol).
     #
     # Tool factories call these directly to preserve PTCSandbox features the
-    # protocol's minimal surface doesn't expose (rich grep options, background
-    # bash, native Python code execution, path helpers, preview URL). Middleware
+    # protocol's minimal surface doesn't expose (rich grep options, Bash and
+    # code jobs, path helpers, preview URL). Middleware
     # only uses the protocol methods above. All rich methods are thin
     # passthroughs — this class is an adapter, not an interface redesign.
     # ---------------------------------------------------------------------
@@ -653,57 +662,65 @@ class SandboxBackend(SandboxBackendProtocol):
         """Return glob matches as a flat list of paths (no dataclass wrapper)."""
         return await self.sandbox.aglob_files(pattern, path, hide_history=True)
 
-    # --- Execution (bash + Python code) ---
+    # --- Detached jobs (Bash and ExecuteCode that can outlast their call) ---
 
-    async def aexecute_bash(
+    async def start_bash_job(
         self,
         command: str,
-        working_dir: str | None = None,
-        timeout: int = 60,
         *,
-        background: bool = False,
+        working_dir: str | None = None,
+        wait_s: float | None,
         thread_id: str | None = None,
         call_id: str | None = None,
         allowed_servers: frozenset[str] | None = None,
-    ) -> dict[str, Any]:
-        """Run a bash command with full PTCSandbox options (working_dir, background, thread_id).
-
-        Used by the Bash tool. Returns PTCSandbox's raw result dict.
-        """
-        return await self.sandbox.execute_bash_command(
-            command=command,
+    ) -> JobOutcome:
+        """Start a bash command as a job; wait up to ``wait_s`` (None: until it ends)."""
+        return await self.sandbox.start_bash_job(
+            command,
             working_dir=working_dir,
-            timeout=timeout,
-            background=background,
+            wait_s=wait_s,
             thread_id=thread_id,
             call_id=call_id,
             allowed_servers=allowed_servers,
         )
 
-    async def astop_background_command(self, command_id: str) -> bool:
-        """Stop a previously started background bash command."""
-        return await self.sandbox.stop_background_command(command_id)
+    async def run_foreground(self, spec: JobSpec, timeout: int) -> Ended | Failed:
+        """Run a command whose job could not be set up in the foreground."""
+        return await self.sandbox.run_foreground(spec, timeout)
 
-    async def aget_background_command_status(self, command_id: str) -> dict[str, Any]:
-        """Return status + buffered output for a background bash command."""
-        return await self.sandbox.get_background_command_status(command_id)
-
-    async def aexecute_code(
+    async def start_code_job(
         self,
         code: str,
         *,
+        wait_s: float | None,
         thread_id: str | None = None,
         call_id: str | None = None,
         allowed_servers: frozenset[str] | None = None,
-    ) -> ExecutionResult:
-        """Execute Python code in the sandbox (Jupyter-style).
-
-        Distinct from `aexecute` (shell) — returns rich `ExecutionResult`
-        with stdout/charts/mcp_trace.
-        """
-        return await self.sandbox.execute(
-            code, thread_id=thread_id, call_id=call_id, allowed_servers=allowed_servers
+    ) -> JobOutcome:
+        """Start Python code as a job; wait up to ``wait_s`` (None: until it ends)."""
+        return await self.sandbox.start_code_job(
+            code,
+            wait_s=wait_s,
+            thread_id=thread_id,
+            call_id=call_id,
+            allowed_servers=allowed_servers,
         )
+
+    async def continue_job(self, outcome: Running, wait_s: float | None) -> JobOutcome:
+        """Keep waiting on a job a start returned still running."""
+        return await self.sandbox.continue_job(outcome, wait_s)
+
+    async def read_ended_job(self, outcome: Running) -> JobOutcome:
+        """Read a job a stop found already ended; a failed read raises."""
+        return await self.sandbox.read_ended_job(outcome)
+
+    async def stop_job(self, ref: JobRef, *, discard: bool = False) -> bool:
+        """End a job's process group; True if it was running."""
+        return await self.sandbox.stop_job(ref, discard=discard)
+
+    async def stop_job_with_trace(self, outcome: Running) -> StoppedJob:
+        """End a job's process group and read its MCP trace in the same call."""
+        return await self.sandbox.stop_job_with_trace(outcome)
 
     # --- File transfer (single-file helpers used by ShowWidget) ---
 

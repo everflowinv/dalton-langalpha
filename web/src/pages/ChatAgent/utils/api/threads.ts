@@ -4,6 +4,7 @@
 import { api } from '@/api/client';
 import type { Thread } from '@/types/api';
 import type { WakeupCancelResponse, WakeupsResponse } from '@/types/wakeups';
+import type { CommandStopResponse, CommandsResponse } from '@/types/commands';
 
 export interface ThreadCreatedInfo {
   thread_id: string;
@@ -107,6 +108,23 @@ export async function cancelWakeups(
   if (!threadId) throw new Error('Thread ID is required');
   const body = which === 'all' ? { all: true } : { wakeup_ids: which };
   const { data } = await api.post<WakeupCancelResponse>(`/api/v1/threads/${threadId}/wakeups/cancel`, body);
+  return data;
+}
+
+/** The thread's background commands: those still running and those that
+ *  ended, newest first. */
+export async function fetchCommands(threadId: string): Promise<CommandsResponse> {
+  if (!threadId) throw new Error('Thread ID is required');
+  const { data } = await api.get<CommandsResponse>(`/api/v1/threads/${threadId}/commands`);
+  return data;
+}
+
+/** Stop a background command. A stopped command does not report back. */
+export async function stopCommand(threadId: string, commandId: string): Promise<CommandStopResponse> {
+  if (!threadId) throw new Error('Thread ID is required');
+  const { data } = await api.post<CommandStopResponse>(
+    `/api/v1/threads/${threadId}/commands/${encodeURIComponent(commandId)}/stop`,
+  );
   return data;
 }
 

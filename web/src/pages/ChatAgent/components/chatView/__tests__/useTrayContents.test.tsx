@@ -9,6 +9,7 @@ import type { ReactNode } from 'react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { renderHook, waitFor } from '@testing-library/react';
 import type { Wakeup } from '@/types/wakeups';
+import type { CommandRun } from '@/types/commands';
 
 vi.mock('@/hooks/useFeatures', () => ({ useFeatureEnabled: () => true }));
 vi.mock('../../../utils/api', async (importOriginal) => ({
@@ -16,7 +17,7 @@ vi.mock('../../../utils/api', async (importOriginal) => ({
   fetchWakeups: vi.fn(),
 }));
 
-import { fetchWakeups } from '../../../utils/api';
+import { fetchWakeups, type OwedReportKind } from '../../../utils/api';
 import { trayWorking, useTrayContents } from '../useTrayContents';
 
 const THREAD = '7d1c2a4e-0b3f-4c55-9a61-2f8e5d9b0c17';
@@ -26,6 +27,7 @@ function readTray(hasActiveSubagents: boolean) {
   const wrapper = ({ children }: { children: ReactNode }) => <QueryClientProvider client={client}>{children}</QueryClientProvider>;
   const { result } = renderHook(() => useTrayContents({
     marketWatch: null,
+    commands: [],
     threadId: null,
     isActive: true,
     cards: {},
@@ -35,6 +37,7 @@ function readTray(hasActiveSubagents: boolean) {
     hasActiveSubagents,
     reportBackOwed: false,
     owedThreads: null,
+    owedKinds: null,
     isHome: false,
   }), { wrapper });
   return result.current;
@@ -72,6 +75,7 @@ async function readWakeups(items: Wakeup[]) {
   const wrapper = ({ children }: { children: ReactNode }) => <QueryClientProvider client={client}>{children}</QueryClientProvider>;
   const { result } = renderHook(() => useTrayContents({
     marketWatch: null,
+    commands: [],
     threadId: THREAD,
     isActive: true,
     cards: {},
@@ -81,6 +85,7 @@ async function readWakeups(items: Wakeup[]) {
     hasActiveSubagents: false,
     reportBackOwed: false,
     owedThreads: null,
+    owedKinds: null,
     isHome: false,
   }), { wrapper });
   await waitFor(() => expect(fetchWakeups).toHaveBeenCalledWith(THREAD));
@@ -103,5 +108,84 @@ describe('useTrayContents: wakeups', () => {
 
   it('drops it once every wakeup has ended', async () => {
     expect(await readWakeups([wakeup({ state: 'fired' }), wakeup({ wakeup_id: 'b', state: 'cancelled' })])).toBeNull();
+  });
+});
+
+describe('useTrayContents: background commands', () => {
+  function readCommands(commands: CommandRun[]) {
+    const client = new QueryClient();
+    const wrapper = ({ children }: { children: ReactNode }) => <QueryClientProvider client={client}>{children}</QueryClientProvider>;
+    const { result } = renderHook(() => useTrayContents({
+      marketWatch: null,
+      commands,
+      threadId: null,
+      isActive: true,
+      cards: {},
+      taskHistory: {},
+      messages: [],
+      isLoading: false,
+      hasActiveSubagents: false,
+      reportBackOwed: false,
+      owedThreads: null,
+    owedKinds: null,
+      isHome: false,
+    }), { wrapper });
+    return result.current;
+  }
+
+  const row = (over: Partial<CommandRun>): CommandRun => ({
+    command_id: 'bg-3f9a1c2e7d10', tool: 'Bash', description: 'Run 10-year backtest', status: 'running',
+    exit_code: null, failure_reason: null, tool_call_id: 'call_1', log_path: '.agents/threads/x/commands/bg-3f9a1c2e7d10.log',
+    started_at: '2030-01-01T10:00:00Z', handed_off_at: '2030-01-01T10:05:00Z', ended_at: null,
+    ...over,
+  }) as CommandRun;
+
+  it('keeps a chip for the running ones only, and works while one runs', () => {
+    const running = row({});
+    const contents = readCommands([running, row({ command_id: 'bg-b', status: 'completed', ended_at: '2030-01-01T10:41:00Z' })]);
+    expect(contents?.commands).toEqual([running]);
+    expect(trayWorking(contents!)).toBe(true);
+  });
+
+  it('draws no chip once every command has ended', () => {
+    expect(readCommands([row({ status: 'stopped', ended_at: '2030-01-01T10:20:00Z' })])).toBeNull();
+  });
+});
+
+function readOwed(owedKinds: OwedReportKind[] | null, isHome: boolean) {
+  const client = new QueryClient();
+  const wrapper = ({ children }: { children: ReactNode }) => <QueryClientProvider client={client}>{children}</QueryClientProvider>;
+  const { result } = renderHook(() => useTrayContents({
+    marketWatch: null,
+    commands: [],
+    threadId: null,
+    isActive: true,
+    cards: {},
+    taskHistory: {},
+    messages: [],
+    isLoading: false,
+    hasActiveSubagents: false,
+    reportBackOwed: true,
+    owedThreads: null,
+    owedKinds,
+    isHome,
+  }), { wrapper });
+  return result.current?.reportBackLabel ?? null;
+}
+
+describe('useTrayContents: an owed report is named by whose it is', () => {
+  it('names nothing for a background command, whose notice needs no wait', () => {
+    expect(readOwed(['command'], true)).toBeNull();
+    expect(readOwed(['command'], false)).toBeNull();
+  });
+
+  it("names a subagent's on Home and an Analyst's anywhere", () => {
+    expect(readOwed(['command', 'task'], true)).toBe('Waiting for subagent results to report back');
+    expect(readOwed(['analyst', 'task'], true)).toBe('Waiting for the Analyst to report back');
+  });
+
+  it('falls back to who usually reports back when the read named no kinds', () => {
+    expect(readOwed(null, true)).toBe('Waiting for the Analyst to report back');
+    expect(readOwed([], false)).toBe('Waiting for subagent results to report back');
   });
 });

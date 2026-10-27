@@ -108,6 +108,9 @@ ALLOWED_HOOKS=(
   "subagent-caps"
   "global-search"
   "hide-experiments"
+  # B7: P0-9 — the conversation-digest delete rides the retained synchronous
+  # `aexecute`; a marker here keeps future interface sweeps from missing it.
+  "conversation-archive"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

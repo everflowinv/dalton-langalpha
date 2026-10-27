@@ -138,6 +138,10 @@ _REDIS_BACKGROUND_SINGLETONS: tuple[tuple[str, str], ...] = (
     # Ends uploads their browser abandoned and takes over pulls whose worker
     # died; a claim on each upload's row in Postgres dedups it across workers.
     ("UploadSweeper", "src.server.services.workspace_upload_pull"),
+    # Follows handed-off background commands to their end and keeps their
+    # computers up while covered; claims on each command's row in Postgres
+    # dedup it across workers.
+    ("CommandWatcher", "src.server.services.commands.watcher"),
 )
 
 
@@ -543,6 +547,7 @@ async def lifespan(app: FastAPI):
     # that must crash the worker loudly — swallowed, it leaves the drainer
     # permanently off behind one WARN line (report-backs undelivered, burst
     # slots leaking).
+    from src.server.services.report_back import command as command_report
     from src.server.services.report_back import steer_executor, subagent
     from src.server.services.report_back.handoff import core as handoff_core
     from src.server.services import automation_settlement, thread_lifecycle_feed
@@ -554,6 +559,7 @@ async def lifespan(app: FastAPI):
 
     handoff_core.register_outbox_executors()
     subagent.register_outbox_executors()
+    command_report.register_outbox_executors()
     steer_executor.register_outbox_executors()
     thread_lifecycle_feed.register_outbox_executors()
     automation_settlement.register_outbox_executors()

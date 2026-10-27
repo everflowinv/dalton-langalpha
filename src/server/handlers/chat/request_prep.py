@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple, Optional
 
 
 from ptc_agent.agent.limits import UNBOUNDED_RECURSION_LIMIT
+from ptc_agent.agent.middleware.provenance.command_trace import REPORT_COMMAND_KEY
 from ptc_agent.agent.middleware.runtime_context import TurnContext, parse_surface
 from src.config.settings import (
     get_langsmith_metadata,
@@ -36,7 +37,7 @@ from src.server.database import conversation as qr_db
 from src.server.database.conversation.threads_write import remember_thread_llm_model
 from src.server.services.llm.thread_model import NamedModel
 from src.server.database.runs import lifecycle as tl_db
-from src.server.models.chat import summarize_hitl_response_map
+from src.server.models.chat import CommandReport, summarize_hitl_response_map
 from src.server.utils.skill_context import (
     detect_slash_commands,
     parse_skill_contexts,
@@ -898,6 +899,12 @@ def build_graph_config(
         # server-only, so no client can claim it.
         "wake_turn": request.query_type == WAKE_QUERY_TYPE,
     }
+    # A command's report-back turn names the command, so the call that reads
+    # its notice brings the command's data sources with it. Its own field
+    # (``report_source``) is server-only; the trace stays on the command's row.
+    report = request.report_source
+    if isinstance(report, CommandReport):
+        configurable[REPORT_COMMAND_KEY] = report.command_id
     if extra_configurable:
         configurable.update(extra_configurable)
     if skill_contexts:

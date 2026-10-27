@@ -40,9 +40,8 @@ def resource_tier_of(session: Any, backend: Any) -> str | None:
 
 
 async def note_sandbox_exit(backend: Any, exit_code: int | None, failure: str | None) -> None:
-    """Count an exit-137 run against the computer's open usage run: a
-    foreground one by its own call, a background one by the BashOutput read
-    that sees it finish.
+    """Count an exit-137 run against the computer's open usage run, by the
+    call that saw it end within its wait.
 
     Never raises or waits long: usage accounting must not break or slow the
     tool. A call that failed in the sandbox (a timeout kills the process too)

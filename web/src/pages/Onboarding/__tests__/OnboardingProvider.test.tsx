@@ -481,13 +481,13 @@ describe('OnboardingProvider', () => {
     expect(phase()).toBe('idle');
   });
 
-  it('getting-started: visible for a fresh user, platform-only tasks filtered out in OSS', () => {
+  it('getting-started: visible for a fresh user, platform-only and in-app tasks filtered out in an OSS browser', () => {
     mockUser = { user_id: 'u1' };
     renderAt('/settings');
     expect(card()).toBe('visible');
     expect(screen.getByTestId('done').textContent).toBe('0');
     expect(screen.getByTestId('taskIds').textContent).toBe(
-      'dashboard,market,profile,createWorkspace,firstChat,models'
+      'dashboard,market,profile,createWorkspace,firstChat,models,desktopApp'
     );
   });
 
@@ -549,9 +549,10 @@ describe('OnboardingProvider', () => {
         market: 4,
         models: 5,
         createWorkspace: 6,
+        desktopApp: 7,
       },
     };
-    renderAt('/settings'); // profile done from the user row → all 6 complete
+    renderAt('/settings'); // profile done from the user row → all 7 complete
     expect(card()).toBe('hidden');
   });
 

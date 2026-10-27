@@ -38,6 +38,10 @@ MAX_CONCURRENT_JOBS = 10
 # share so a burst of tail completions can't starve hand-off report-backs and
 # cheap wakes. Excluded types stay unclaimed but still head their chains.
 TASK_RB_INFLIGHT_QUOTA = 3
+# command_report_back jobs hold their slot through a whole notification turn
+# too, and one deploy restarting many computers can end many commands at
+# once, so they get the same share.
+COMMAND_RB_INFLIGHT_QUOTA = 3
 # market_target jobs ride out admission refusals holding their slot, and each
 # thread's notices are their own chain, so one market-wide move (or a session
 # close, which every target on the venue warns ahead of) makes a job due on
@@ -51,6 +55,7 @@ MARKET_TARGET_INFLIGHT_QUOTA = 3
 WAKEUP_INFLIGHT_QUOTA = 3
 _INFLIGHT_QUOTAS = {
     "task_report_back": TASK_RB_INFLIGHT_QUOTA,
+    "command_report_back": COMMAND_RB_INFLIGHT_QUOTA,
     "market_target": MARKET_TARGET_INFLIGHT_QUOTA,
     "wakeup": WAKEUP_INFLIGHT_QUOTA,
 }
@@ -259,7 +264,8 @@ class HookOutboxDrainer:
 
             # An alert out of attempts waits for its thread's next turn
             # instead of going dead. One an older build dead-lettered is
-            # made due again, at most twice, while its notice is owed; one no
+            # made due again, at most twice, while its notice is owed, as is
+            # a command's report, a type an older build cannot run; one no
             # turn will take in (not owed, or its thread archived or its
             # workspace deleted) is closed rather than left pending for good.
             if time.monotonic() >= self._next_alert_revive:
@@ -284,7 +290,7 @@ class HookOutboxDrainer:
                 try:
                     for closed in await outbox_db.close_unowed_waiting_alerts():
                         logger.info(
-                            f"[HookOutbox] closed alert job="
+                            f"[HookOutbox] closed notice job="
                             f"{closed.get('hook_outbox_id')} "
                             f"key={closed.get('ordering_key')}: no turn will "
                             f"take it in"

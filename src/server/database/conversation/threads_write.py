@@ -33,6 +33,14 @@ def thread_exists_key(thread_id: str) -> str:
     return f"thread_exists:{thread_id}"
 
 
+async def forget_workspace_exists(workspace_id: str) -> None:
+    """Drop the stamp a thread write trusts in place of the workspace's row,
+    once the row is deleted."""
+    from src.utils.cache.redis_cache import get_cache_client
+
+    await get_cache_client().delete(ws_exists_key(workspace_id))
+
+
 async def calculate_next_thread_index(workspace_id: str, conn=None) -> int:
     """
     Calculate the next thread_index for a workspace (0-based).

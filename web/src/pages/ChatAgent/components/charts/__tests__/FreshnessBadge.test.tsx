@@ -37,17 +37,21 @@ describe('<FreshnessBadge />', () => {
   });
 
   it('keeps a delay neutral and gives the warning color to stale and incomplete rows', () => {
-    const dotColor = (el: HTMLElement) => (el.querySelector('[aria-hidden]') as HTMLElement).style.background;
+    // The dot's tone picks its ink (termCard.css); a delay draws no warning.
+    const dotTone = (el: HTMLElement) => el.querySelector<HTMLElement>('[aria-hidden]')?.dataset.tone;
     const delayed = render(<FreshnessBadge tier="delayed_15m" />);
-    expect(dotColor(delayed.container)).toBe('var(--color-text-tertiary)');
+    expect(dotTone(delayed.container)).toBe('neutral');
     delayed.unmount();
 
     const stale = render(<FreshnessBadge freshness={f({ label: 'stale', measured: true })} />);
-    expect(dotColor(stale.container)).toBe('var(--color-warning)');
+    expect(dotTone(stale.container)).toBe('warning');
     stale.unmount();
 
     const incomplete = render(<FreshnessBadge freshness={f({ label: 'incomplete', measured: true })} />);
-    expect(dotColor(incomplete.container)).toBe('var(--color-warning)');
+    expect(dotTone(incomplete.container)).toBe('warning');
+
+    const compact = render(<FreshnessBadge freshness={f({ label: 'stale', measured: true })} compact />);
+    expect(dotTone(compact.container)).toBe('warning');
   });
 
   it('takes focus only when it has a tooltip to open, and names a bare dot as a graphic', () => {

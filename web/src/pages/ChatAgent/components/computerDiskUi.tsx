@@ -111,3 +111,14 @@ export function DiskBar({ disk, className }: DiskBarProps) {
     </div>
   );
 }
+
+/** The usage in words, in its level's colour once it is low; says so while unmeasured. */
+export function DiskUsageText({ disk }: { disk: ComputerDisk | null }) {
+  const { t } = useTranslation();
+  const locale = useLocale();
+  return (
+    <span style={disk && disk.level !== 'healthy' ? { color: diskLevelColor(disk.level) } : undefined}>
+      {disk ? diskUsageLabel(t, disk, locale) : t('computer.disk.unknown', 'Storage not measured yet')}
+    </span>
+  );
+}

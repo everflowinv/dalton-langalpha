@@ -192,10 +192,12 @@ async def test_reading_a_fire_lets_the_next_slot_fire(thread, db_conn):
 
 
 async def test_cancel_outcomes_by_id_and_by_short_id(thread):
+    from src.server.database.wakeups import read
     from src.server.database.wakeups.cancel import cancel_wakeups
 
     future = datetime.now(timezone.utc) + timedelta(hours=1)
     row = await _arm(thread, kind="at", timezone="UTC", schedule=(future,))
+    assert (await read.get_thread_wakeup(thread.id, row["short_id"]))["wakeup_id"] == row["wakeup_id"]
 
     [first] = await cancel_wakeups(thread.id, [row["short_id"]], by="agent")
     assert first.outcome == "cancelled"

@@ -3,7 +3,8 @@ import {
   TrendingUp, Building2, BarChart3, PieChart, Search, Globe,
   FilePlus, FileText, FilePen, FolderSearch, SquareChevronRight, Wrench,
   Newspaper, Brain, User, FileBarChart, Clock, ClipboardList, Zap, Settings, Terminal,
-  Sparkles, BookText, BookMarked, BookPlus, PenLine, Eye, Plug, Send, Contact, AlarmClock,
+  Sparkles, BookText, BookMarked, BookPlus, PenLine, Eye, Plug, Send, Contact, AlarmClock, Activity,
+  Layers, ArrowUpDown,
 } from 'lucide-react';
 import {
   classifyAgentPath, topicFromMemoryKey, type AgentPathInfo, type UserDataEntity,
@@ -65,6 +66,8 @@ export const TOOL_DISPLAY_CONFIG: Record<string, ToolDisplayEntry> = {
   get_market_indices:       { displayName: 'Market Indices',       i18nKey: 'marketIndices',       icon: BarChart3 },
   get_sector_performance:   { displayName: 'Sector Performance',   i18nKey: 'sectorPerformance',   icon: PieChart },
   screen_stocks:            { displayName: 'Stock Screener',       i18nKey: 'stockScreener',       icon: Search },
+  get_options_chain:        { displayName: 'Options Chain',        i18nKey: 'optionsChain',        icon: Layers },
+  get_market_movers:        { displayName: 'Market Movers',        i18nKey: 'marketMovers',        icon: ArrowUpDown },
   // Market watch (live price injection) — one tool, action="watch"/"unwatch"
   watch_market:             { displayName: 'Watch Market',         i18nKey: 'watchMarket',         icon: Eye },
   // The agent's own follow-ups: set, cancel or list them, or end a check quietly
@@ -99,6 +102,9 @@ export const TOOL_DISPLAY_CONFIG: Record<string, ToolDisplayEntry> = {
   think_tool:               { displayName: 'Thinking',             i18nKey: 'thinking',            icon: Brain },
   // Background subagent management
   TaskOutput:               { displayName: 'Task Output',          i18nKey: 'taskOutput',          icon: ClipboardList },
+  // What will report back to the thread; it replaced BashOutput, whose calls
+  // in older threads keep the generic row they always had.
+  ThreadStatus:             { displayName: 'Thread Status',        i18nKey: 'threadStatus',        icon: Activity },
   // Automations
   check_automations:        { displayName: 'Automations',          i18nKey: 'automations',         icon: Clock },
   create_automation:        { displayName: 'Create Automation',    i18nKey: 'createAutomation',    icon: Zap },
@@ -308,6 +314,13 @@ export function getInProgressText(rawToolName: string, toolCall: ToolCall | unde
       return tr?.('fetchingSectorData') ?? 'fetching sector data...';
     case 'screen_stocks':
       return tr?.('screeningStocks') ?? 'screening stocks...';
+    case 'get_options_chain':
+      return args?.underlying
+        ? (tr?.('fetchingSymbolOptions', { symbol: args.underlying }) ?? `fetching ${args.underlying} options...`)
+        : (tr?.('fetchingOptions') ?? 'fetching options...');
+    case 'get_market_movers':
+      if (args?.direction === 'losers') return tr?.('fetchingLosers') ?? 'fetching top losers...';
+      return tr?.('fetchingGainers') ?? 'fetching top gainers...';
     case 'watch_market': {
       if (args?.action === 'unwatch') return tr?.('unwatchingMarket') ?? 'stopping market watch...';
       if (args?.action === 'cancel') return tr?.('cancellingPriceTargets') ?? 'cancelling price targets...';
@@ -388,6 +401,8 @@ export function getInProgressText(rawToolName: string, toolCall: ToolCall | unde
         : (tr?.('fetchingTaskOutput') ?? 'fetching task output...');
     case 'check_automations':
       return tr?.('checkingAutomations') ?? 'checking automations...';
+    case 'ThreadStatus':
+      return tr?.('checkingThreadStatus') ?? 'checking what is running...';
     case 'create_automation':
       return args?.name
         ? (tr?.('creatingName', { name: args.name }) ?? `creating ${args.name}...`)

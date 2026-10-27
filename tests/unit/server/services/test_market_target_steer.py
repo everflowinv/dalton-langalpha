@@ -228,7 +228,7 @@ async def test_confirm_stamps_held_alerts_before_closing_their_jobs():
     close = AsyncMock(side_effect=lambda *a, **k: order.append("close") or a[0])
     held = [_held("job-1", "tg-1", "hit"), _held("job-2", "tg-2", "expiring")]
     with (
-        patch(f"{_OUTBOX}.held_alert_jobs", new=AsyncMock(return_value=held)) as read,
+        patch(f"{_OUTBOX}.held_notice_jobs", new=AsyncMock(return_value=held)) as read,
         patch(f"{_MT_DB}.mark_delivered", new=mark),
         patch(f"{_OUTBOX}.confirm_jobs", new=close),
     ):
@@ -248,7 +248,7 @@ async def test_a_failed_stamp_still_closes_the_job():
     mark = AsyncMock(side_effect=[RuntimeError("db down"), True])
     close = AsyncMock(return_value=["job-1", "job-2"])
     with (
-        patch(f"{_OUTBOX}.held_alert_jobs", new=AsyncMock(return_value=held)),
+        patch(f"{_OUTBOX}.held_notice_jobs", new=AsyncMock(return_value=held)),
         patch(f"{_MT_DB}.mark_delivered", new=mark),
         patch(f"{_OUTBOX}.confirm_jobs", new=close),
     ):
@@ -268,7 +268,7 @@ async def _confirm_found(owner: tuple[str, str]):
             "ptc_agent.agent.middleware.steering.checkpointed_holds",
             return_value={"job-1"},
         ),
-        patch(f"{_OUTBOX}.held_alert_jobs", new=read),
+        patch(f"{_OUTBOX}.held_notice_jobs", new=read),
         patch(f"{_MT_DB}.mark_delivered", new=mark),
         patch(f"{_OUTBOX}.confirm_jobs", new=close),
     ):

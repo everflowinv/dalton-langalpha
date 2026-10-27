@@ -14,7 +14,12 @@ only this turn machinery is shared.
 import asyncio
 import logging
 import os
+import uuid
 from dataclasses import dataclass
+from datetime import datetime
+from typing import Any, Awaitable, Callable, Mapping, Optional, Protocol
+
+from src.server.contracts.status import is_user_stop
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +62,255 @@ def is_resumable_failure(failure_error: object) -> bool:
         return any(is_resumable_failure(v) for v in failure_error.values())
     text = str(failure_error)
     return "worker_lost" in text or "RESUMABLE" in text
+
+
+def stop_already_covered(parent: Mapping[str, Any] | None, settled_at: datetime | None) -> bool:
+    """Whether the user stopped the turn behind a report after the work it
+    reports on had settled (``settled_at``).
+
+    A cancel finalize releases every parked report-back on the thread, so
+    without this the stop itself opens a synthetic turn: billable model work
+    a second after the user asked for none. Narrow on purpose: only a result
+    that had already settled when they stopped. A run that ended *after* the
+    cancel is news the stop cannot have been about, and announcing it is the
+    entire job of a report-back; a blanket "the thread was cancelled once"
+    test would silence every later completion instead.
+
+    Read off the work's own parent attempt, never the thread's newest one: a
+    task launched by turn A can settle while turn B runs, and cancelling B
+    must not read A's earlier settle as covered; and once the user starts
+    another turn after the stop, the drop still holds, whichever of the
+    drainer or that turn reaches the report first.
+
+    Undecidable without both stamps, and silence is the worse failure, so a
+    missing one notifies. A shutdown or recovery cancels a turn too, and asked
+    for nothing, so only the user's own stop counts.
+    """
+    if not is_user_stop(parent):
+        return False
+    stopped_at = parent.get("cancel_requested_at")
+    if stopped_at is None or settled_at is None:
+        return False
+    return settled_at <= stopped_at
+
+
+class Owed(Protocol):
+    """A report still owed, as its pipeline's verdict reads it."""
+
+    @property
+    def user_id(self) -> Optional[str]: ...
+
+    @property
+    def workspace_id(self) -> Optional[str]: ...
+
+    @property
+    def report_source(self) -> Optional[dict]:
+        """What history captions the hidden turn with; None for no caption."""
+
+    def message(self, *, steered: bool) -> str: ...
+
+
+@dataclass(frozen=True)
+class ReportPipeline:
+    """One kind of report-back on its thread's own chain: how its executor
+    posts it as a turn of its own (``run_report_back``) and how a live turn
+    takes it in (``report_back.steer``)."""
+
+    log_prefix: str
+    #: Its own request-key namespace, so a job id never mints the same key
+    #: for two pipelines.
+    request_ns: uuid.UUID
+    #: How long a POST waits out a busy thread before the job re-parks.
+    busy_cap: float
+    #: How long the job stays open waiting for its turn to end.
+    terminal_cap: float
+    #: ``NotOwed`` or an ``Owed``, against the ledger: the one eligibility
+    #: the executor and a live turn decide by.
+    verdict: Callable[[Mapping[str, Any]], Awaitable["Owed | NotOwed"]]
+    #: The short label log lines name the report by.
+    subject: Callable[[Mapping[str, Any]], str]
+    #: Ask the verdict again before each POST: for a report the agent may
+    #: see some other way while the POST waits, which must then open no turn.
+    recheck: bool = False
+    #: Runs once the turn carrying the report was admitted, on a resume too.
+    on_dispatched: Optional[Callable[[Mapping[str, Any]], Awaitable[None]]] = None
+    #: Completes an owed report with the owner and workspace a turn of its own
+    #: posts as, where the verdict cannot read them for free; only the
+    #: executor needs them, so a live turn's offer never pays the read.
+    owner: Optional[Callable[[Mapping[str, Any], Any], Awaitable["Owed | NotOwed"]]] = None
+
+    def request_key(self, job_id: str) -> str:
+        """The request key a job's notification turn is admitted under."""
+        return str(uuid.uuid5(self.request_ns, job_id))
+
+
+async def run_report_back(job: dict, p: ReportPipeline) -> None:
+    """Execute one report-back job of pipeline ``p``.
+
+    Sole caller is the hook-outbox drainer: raising nacks, returning acks.
+    The job stays open (lease-heartbeated) until the notification run ends,
+    so the thread's chain stays in order. Crash-safe resume via
+    ``dispatched_run_id`` and the job-deterministic request key. A thread
+    found busy or interrupted, or a busy-wait cap, re-parks the job instead
+    of dropping it: the thread's next dead-turn finalize releases it.
+    """
+    from src.server.database.runs import lifecycle as tl_db
+    from src.server.database.runs import outbox as outbox_db
+    from src.server.services.hook_outbox import LEASE_SECONDS, MAX_ATTEMPTS
+    from src.server.services.report_back.handoff import wake
+    from src.server.services.report_back.subagent import publish_cleared_wake
+    from src.utils.cache.redis_cache import get_cache_client
+
+    payload = job.get("payload") or {}
+    thread_id = job.get("conversation_thread_id") or payload.get("thread_id")
+    job_id = str(job["hook_outbox_id"])
+    attempts = job["attempts"]
+    subject = p.subject(job)
+    log = p.log_prefix
+
+    if not thread_id:
+        logger.warning(f"{log} Job {job_id} missing thread; dropping")
+        return
+    # psycopg returns uuid columns as UUID objects; wake payloads are
+    # json.dumps'd.
+    thread_id = str(thread_id)
+
+    async def _fence() -> bool:
+        return await outbox_db.extend_job_lease(job_id, LEASE_SECONDS, attempts=attempts)
+
+    async def _repark() -> str | None:
+        status = await outbox_db.defer_claimed_job(
+            job_id, attempts=attempts, max_attempts=MAX_ATTEMPTS
+        )
+        logger.info(
+            f"{log} Re-parked job {job_id} for {subject} on thread {thread_id} "
+            f"(status={status})"
+        )
+        return status
+
+    rb_run_id = payload.get("dispatched_run_id")
+    if not rb_run_id:
+        # The job was enqueued unconditionally with the work's end; whether a
+        # notification is still owed is decided here, at claim time.
+        verdict = await p.verdict(job)
+        if p.owner is not None and not isinstance(verdict, NotOwed):
+            verdict = await p.owner(job, verdict)
+        if isinstance(verdict, NotOwed):
+            logger.info(f"{log} Dropping {subject} on thread {thread_id}: {verdict.reason}")
+            if verdict.wake:
+                # Watchers may be riding the pending chip on this job: tell
+                # them to reconcile now instead of via the backstop.
+                await publish_cleared_wake(thread_id)
+            return
+        if not verdict.user_id:
+            logger.warning(
+                f"{log} Job {job_id} on thread {thread_id}: owner unresolvable; dropping"
+            )
+            return
+
+        # Read before the look: a turn whose finalize runs while this job is
+        # claimed releases nothing for it, and this is how a capped wait
+        # below tells that one ended meanwhile.
+        at_claim = run_marker(await tl_db.get_latest_attempt(thread_id))
+
+        # A live turn takes the report in as a steer before its next model
+        # call (``report_back.steer``).
+        if await park_while_thread_busy(
+            job_id, attempts, thread_id, log_prefix=log, subject=subject
+        ):
+            return
+
+        body = {
+            "messages": [{"role": "user", "content": verdict.message(steered=False)}],
+            "workspace_id": verdict.workspace_id,
+            "query_type": "system",
+            "request_key": p.request_key(job_id),
+        }
+        # The message is hidden, so history captions the turn from this.
+        if verdict.report_source:
+            body["report_source"] = verdict.report_source
+
+        async def _still_due() -> bool:
+            return not isinstance(await p.verdict(job), NotOwed)
+
+        outcome, rb_run_id = await post_notification_turn(
+            thread_id=thread_id,
+            body=body,
+            user_id=verdict.user_id,
+            wait_cap=p.busy_cap,
+            heartbeat=_fence,
+            log_prefix=log,
+            subject=subject,
+            still_due=_still_due if p.recheck else None,
+        )
+        if outcome == "lost":
+            return  # reclaimed: the live owner resumes; no teardown
+        if outcome == "superseded":
+            await publish_cleared_wake(thread_id)
+            return
+        if outcome == "cap":
+            # Busy thread. Not a failure: park until the next dead-turn
+            # finalize re-releases the job, or now if a turn ended while this
+            # claim held it. Only on an ending: a thread that refused every
+            # POST while idle (no credit) would otherwise spin the job
+            # through its attempts to dead.
+            if await _repark() == "pending" and await release_if_a_turn_ended(
+                thread_id, at_claim
+            ):
+                logger.info(
+                    f"{log} A turn on thread {thread_id} ended during the claim; "
+                    f"released {subject} for one more look"
+                )
+            return
+        if outcome in ("deleted", "drop"):
+            return  # thread gone or terminal rejection: ack, nothing owed
+        if rb_run_id is None:
+            raise RuntimeError(
+                f"{log} {subject} dispatched without a run_id; nacking to recover "
+                f"it via request_key dedup"
+            )
+        # The resume pointer: after this a reclaim resumes the terminal wait
+        # (before it, request_key dedup makes the re-POST safe). A failed
+        # merge must nack: recents are derived from dispatched_run_id on done
+        # rows, so acking without it erases the notification from wake-miss
+        # recovery.
+        try:
+            await outbox_db.merge_job_payload(job_id, {"dispatched_run_id": rb_run_id})
+        except Exception:
+            logger.warning(
+                f"{log} Failed persisting dispatched_run_id {rb_run_id} on job "
+                f"{job_id}; nacking (request_key dedup makes the re-POST safe)",
+                exc_info=True,
+            )
+            raise
+        # Best effort and unfenced: a stale owner's wake still points at the
+        # real run.
+        try:
+            await wake.publish_wake(get_cache_client(), thread_id, run_id=rb_run_id)
+        except Exception:
+            pass
+    else:
+        logger.info(
+            f"{log} Resuming in-flight notification run {rb_run_id} for {subject} "
+            f"on thread {thread_id} (no re-dispatch)"
+        )
+    if p.on_dispatched is not None:
+        # Again on a resume: the claim that dispatched may have died before it.
+        await p.on_dispatched(job)
+
+    outcome = await await_run_terminal(
+        job_id, attempts, rb_run_id, wait_cap=p.terminal_cap, log_prefix=log
+    )
+    if outcome == "timeout":
+        # Nothing to tear down: ack and release the chain; the run row is the
+        # durable record of what happened.
+        logger.warning(
+            f"{log} Terminal wait cap hit for {subject} on thread {thread_id}; "
+            f"acking anyway"
+        )
+    # No recovery-ledger write here: the drainer's ack (status='done' +
+    # completed_at) is the ledger, which the status slice derives its
+    # recents from.
 
 
 async def park_while_thread_busy(

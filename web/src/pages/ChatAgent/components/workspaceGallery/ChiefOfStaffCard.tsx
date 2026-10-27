@@ -8,25 +8,30 @@
  * Nothing here is a composer: a starter question opens a new thread with the
  * question in its composer, unsent, for the user to edit or send.
  *
+ * Beside its actions, the computer it works on: the one Home is on, which
+ * is the primary but for the moment a make-primary takes to move it.
+ *
  * Its name, description and glyph come from `useWorkspaceText` and
  * `HomeRowIcon`, the one place Home is named, so this card never spells it.
  */
 import { useEffect, useMemo, useState } from 'react';
 import { useInfiniteQuery } from '@tanstack/react-query';
-import { ArrowUpRight, ChevronRight, Plus } from 'lucide-react';
+import { ArrowUpRight, ChevronRight, Info, Plus } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { useNavigate } from 'react-router';
 
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
 import { HomeRowIcon } from '@/hooks/useHomeWorkspace';
 import { useIsMobile } from '@/hooks/useIsMobile';
 import { useLocale } from '@/hooks/useLocale';
 import { useWorkspaceText } from '@/hooks/useWorkspaceLabel';
 import { relativeTime } from '@/lib/format';
 import { cn } from '@/lib/utils';
-import type { Thread } from '@/types/api';
+import type { Computer, Thread } from '@/types/api';
 
 import { threadGalleryQuery } from '../../utils/threadGalleryQuery';
 import { Kicker } from './Kicker';
+import { MachineSummary } from './MachineSummary';
 import type { WorkspaceRecord } from './types';
 
 const RECENT_COUNT = 3;
@@ -41,9 +46,24 @@ interface ChiefOfStaffCardProps {
   /** Open the Chief of Staff's threads, as a workspace card opens its own. */
   onOpenThreads: (wsId: string, name?: string, status?: string) => void;
   prefetchThreads?: (wsId: string) => void;
+  /** The machine it works on, once the computer list is in. */
+  computer?: Computer | null;
+  /** Whether that machine is the Mac this desktop app runs on. */
+  isThisMac?: boolean;
+  /** Open the Computers dialog on that machine. */
+  onOpenComputer?: (computerId: string) => void;
 }
 
-export function ChiefOfStaffCard({ workspace, now, entrance = true, onOpenThreads, prefetchThreads }: ChiefOfStaffCardProps) {
+export function ChiefOfStaffCard({
+  workspace,
+  now,
+  entrance = true,
+  onOpenThreads,
+  prefetchThreads,
+  computer = null,
+  isThisMac = false,
+  onOpenComputer,
+}: ChiefOfStaffCardProps) {
   const { t } = useTranslation();
   const locale = useLocale();
   const isMobile = useIsMobile();
@@ -125,7 +145,7 @@ export function ChiefOfStaffCard({ workspace, now, entrance = true, onOpenThread
           <p className="mt-2.5 max-w-md text-sm leading-relaxed" style={{ color: 'var(--color-text-secondary)' }}>
             {text.description}
           </p>
-          <div className="mt-auto flex items-center gap-4 pt-4">
+          <div className="mt-auto flex flex-wrap items-center gap-x-4 gap-y-3 pt-4">
             <button
               type="button"
               data-testid="chief-of-staff-new-thread"
@@ -149,6 +169,8 @@ export function ChiefOfStaffCard({ workspace, now, entrance = true, onOpenThread
                 <ChevronRight className="h-3.5 w-3.5 transition-transform duration-quick motion-safe:group-hover:translate-x-0.5" aria-hidden="true" />
               </button>
             )}
+            {/* In the gap beside the actions; under them where the row runs out. */}
+            {computer && <WorksOn name={text.name} computer={computer} isThisMac={isThisMac} onOpen={onOpenComputer} />}
           </div>
         </div>
 
@@ -214,6 +236,39 @@ export function ChiefOfStaffCard({ workspace, now, entrance = true, onOpenThread
         </div>
       </div>
     </section>
+  );
+}
+
+/** The computer line, and why it is that one. */
+function WorksOn({ name, computer, isThisMac, onOpen }: { name: string; computer: Computer; isThisMac: boolean; onOpen?: (computerId: string) => void }) {
+  const { t } = useTranslation();
+  const why = t('workspace.cosComputerHint', {
+    name,
+    defaultValue: '{{name}} works on your primary computer, in a Home folder beside your workspaces. Make another computer primary and it moves there.',
+  });
+  return (
+    <div className="flex min-w-0 items-center gap-1.5 text-xs" data-testid="chief-of-staff-computer" style={{ color: 'var(--color-text-tertiary)' }}>
+      <span className="shrink-0">{t('workspace.cosWorksOn', 'Works on')}</span>
+      <div className="min-w-0">
+        <MachineSummary computer={computer} isThisMac={isThisMac} onOpen={onOpen} compact />
+      </div>
+      <TooltipProvider delayDuration={200}>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <button
+              type="button"
+              aria-label={why}
+              className="-m-1 grid shrink-0 place-items-center rounded p-1 transition-colors hover:text-(--color-text-secondary)"
+            >
+              <Info className="h-3 w-3" aria-hidden="true" />
+            </button>
+          </TooltipTrigger>
+          <TooltipContent side="top" className="max-w-72 leading-relaxed">
+            {why}
+          </TooltipContent>
+        </Tooltip>
+      </TooltipProvider>
+    </div>
   );
 }
 

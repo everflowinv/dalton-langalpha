@@ -133,6 +133,9 @@ export const queryKeys = {
     // The wakeups the agent set in the thread, and its price targets from
     // before them. Under the prefix, so a feed reconnect's resync re-reads it.
     wakeups:     (threadId: string) => [...queryKeys.threads.all, 'wakeups', threadId],
+    // The commands that outlasted their tool's wait and ran on in the
+    // background. Under the prefix for the same reason as the wakeups.
+    commands:    (threadId: string) => [...queryKeys.threads.all, 'commands', threadId],
     // Batched dispatch-liveness read for a turn's PTC cards: their threads,
     // the hand-offs' own runs, and the steers of those steered into a run
     // already going. The base key targets every id-set variant for

@@ -133,8 +133,8 @@ async def through_mount(
     to its output what its saves through the mount reported.
 
     The id is collected once ``run`` returns, so the later saves of a command
-    it only launched reach the next command's result or a BashOutput read. A
-    cancelled run reports nothing.
+    it handed off reach the next command's result. A cancelled run reports
+    nothing.
     """
     if mount is None:
         return await run(None)

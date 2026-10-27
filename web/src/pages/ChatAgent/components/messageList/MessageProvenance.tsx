@@ -83,6 +83,7 @@ export function MessageProvenanceLabel({ provenance, readOnly, className }: Mess
       break;
     case 'analyst_report':
     case 'task_report':
+    case 'command_report':
       // The list draws a report as a line of its own (`ReportRow`), never as
       // a caption over a bubble.
       return null;

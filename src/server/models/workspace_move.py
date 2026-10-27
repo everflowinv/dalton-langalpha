@@ -24,6 +24,7 @@ MoveRefusalCode = Literal[
     "target_unavailable",
     "not_primary",
     "turn_active",
+    "command_running",
     "move_in_progress",
     "not_cancellable",
     "no_backup",

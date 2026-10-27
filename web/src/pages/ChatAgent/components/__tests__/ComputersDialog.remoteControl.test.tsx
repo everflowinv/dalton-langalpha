@@ -62,6 +62,7 @@ import {
   getSshPairing,
 } from '../../utils/api';
 import ComputersDialog from '../ComputersDialog';
+import { openDetails } from './computersDialogHarness';
 
 const mockGetComputers = getComputers as Mock;
 const mockProviders = getComputerProviders as Mock;
@@ -116,15 +117,14 @@ beforeEach(() => {
   bridge.disableRemoteControl = disable;
   mockGetComputers.mockResolvedValue({ computers: [PRIMARY, MAC, BOX], total: 3 });
   mockProviders.mockResolvedValue({ providers: [{ kind: 'daytona', is_default: true, allowed: null }] });
-  Element.prototype.scrollIntoView = vi.fn();
 });
 
 function open() {
-  return renderWithProviders(<ComputersDialog open onOpenChange={() => {}} />);
+  return renderWithProviders(<ComputersDialog panel={{ view: 'list' }} onClose={() => {}} />);
 }
 
 async function rowNamed(name: string) {
-  const rows = await screen.findAllByTestId('computer-row');
+  const rows = await screen.findAllByTestId('computer-card');
   const found = rows.find((r) => within(r).queryByText(name));
   if (!found) throw new Error(`No row named ${name}`);
   return found;
@@ -142,7 +142,8 @@ async function settle() {
 }
 
 async function removeRow(user: ReturnType<typeof userEvent.setup>, name: string) {
-  await user.click(within(await rowNamed(name)).getByRole('button', { name: 'Remove' }));
+  await openDetails(user, name);
+  await user.click(screen.getByRole('button', { name: 'Remove' }));
   return screen.findByRole('dialog', { name: `Remove ${name}?` });
 }
 
@@ -207,9 +208,9 @@ describe('the rows', () => {
 
     const confirm = await removeRow(user, 'alex-mac');
     expect(confirm).not.toHaveTextContent('Remote control');
-    expect(within(confirm).queryByRole('checkbox')).not.toBeInTheDocument();
+    expect(within(confirm).queryByRole('checkbox', { name: /authorized_keys/ })).not.toBeInTheDocument();
     await user.click(within(confirm).getByRole('button', { name: 'Remove computer' }));
-    expect(mockDelete).toHaveBeenCalledWith('c-mac', { removeKey: false });
+    expect(mockDelete).toHaveBeenCalledWith('c-mac', { removeKey: false, deleteWorkspaces: [], deleteFiles: false });
   });
 });
 
@@ -226,11 +227,11 @@ describe('removing this Mac', () => {
     const confirm = await removeRow(user, 'alex-mac');
     expect(confirm).toHaveTextContent('Remote control on this Mac turns off too.');
     // Its key is in the helper's own folder, which turning it off deletes.
-    expect(within(confirm).queryByRole('checkbox')).not.toBeInTheDocument();
+    expect(within(confirm).queryByRole('checkbox', { name: /authorized_keys/ })).not.toBeInTheDocument();
     expect(disable).not.toHaveBeenCalled();
 
     await user.click(within(confirm).getByRole('button', { name: 'Remove computer' }));
-    expect(mockDelete).toHaveBeenCalledWith('c-mac', { removeKey: false });
+    expect(mockDelete).toHaveBeenCalledWith('c-mac', { removeKey: false, deleteWorkspaces: [], deleteFiles: false });
     await waitFor(() => expect(disable).toHaveBeenCalledTimes(1));
   });
 
@@ -278,7 +279,7 @@ describe('removing this Mac', () => {
     expect(confirm).not.toHaveTextContent('Remote control');
     expect(within(confirm).getByRole('checkbox', { name: 'Remove our key from ~/.ssh/authorized_keys' })).toBeChecked();
     await user.click(within(confirm).getByRole('button', { name: 'Remove computer' }));
-    expect(mockDelete).toHaveBeenCalledWith('c-box', { removeKey: true });
+    expect(mockDelete).toHaveBeenCalledWith('c-box', { removeKey: true, deleteWorkspaces: [], deleteFiles: false });
     await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Remove build box?' })).not.toBeInTheDocument());
     await settle();
     expect(disable).not.toHaveBeenCalled();
@@ -366,7 +367,7 @@ describe('adding a computer', () => {
 
   async function turnOnThisMac(user: ReturnType<typeof userEvent.setup>) {
     const view = open();
-    await user.click(await screen.findByRole('button', { name: 'New computer' }));
+    await user.click(await screen.findByRole('button', { name: 'Add a computer' }));
     await user.click(await screen.findByRole('radio', { name: 'This Mac' }));
     await user.click(screen.getByRole('checkbox', { name: /^I understand LangAlpha's agent/ }));
     await user.click(screen.getByRole('button', { name: 'Turn on remote control' }));

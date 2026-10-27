@@ -149,7 +149,17 @@ async def test_streamed_tool_args_join_into_one_frame() -> None:
         ),
     )
     chunks = [data["tool_call_chunks"] for _, event, data in frames if event == "tool_call_chunks"]
-    assert chunks == [[{"args": '{"command": "ls"}', "index": 1, "type": "tool_call_chunk"}]]
+    assert chunks == [
+        [
+            {
+                "name": "bash",
+                "args": '{"command": "ls"}',
+                "id": "call-1",
+                "index": 1,
+                "type": "tool_call_chunk",
+            }
+        ]
+    ]
 
 
 @pytest.mark.asyncio

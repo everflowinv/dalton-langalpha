@@ -110,7 +110,7 @@ describe('clicking an inline artifact card', () => {
     renderTranscript(onToolCallDetailClick);
 
     const card = screen.getByTestId('order-receipt');
-    expect(card.className).toContain('cursor-pointer');
+    expect(card.querySelector('button.term-card-title')).not.toBeNull();
     fireEvent.click(screen.getByRole('link'));
     expect(onToolCallDetailClick).not.toHaveBeenCalled();
 

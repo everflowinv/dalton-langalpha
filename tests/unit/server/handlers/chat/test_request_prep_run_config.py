@@ -207,6 +207,34 @@ class TestBuildGraphConfig:
         config = self._build(extra_configurable={"custom_flag": True})
         assert config["configurable"]["custom_flag"] is True
 
+    def test_a_command_report_back_names_its_command(self):
+        """The call that reads the notice brings the command's data sources,
+        read off its row by this id; the trace itself never rides the body."""
+        from ptc_agent.agent.middleware.provenance.command_trace import (
+            REPORT_COMMAND_KEY,
+        )
+        from src.server.models.chat import CommandReport, TaskReport
+
+        command = CommandReport(
+            kind="command_report",
+            command_id="bg-0123456789ab",
+            tool="ExecuteCode",
+            status="completed",
+        )
+        task = TaskReport(kind="task", task_id="t-1", display_id="Task-abc123")
+
+        def _config(report):
+            return self._build(
+                request=MagicMock(
+                    locale="en-US", checkpoint_id=None, platform=None,
+                    report_source=report,
+                )
+            )["configurable"]
+
+        assert _config(command)[REPORT_COMMAND_KEY] == "bg-0123456789ab"
+        assert REPORT_COMMAND_KEY not in _config(task)
+        assert REPORT_COMMAND_KEY not in _config(None)
+
     def test_graph_metadata_stays_turn_identity(self):
         """A subagent inherits this dict wholesale while running its own model at
         its own effort, so anything the LLM owns is asserted for calls it was

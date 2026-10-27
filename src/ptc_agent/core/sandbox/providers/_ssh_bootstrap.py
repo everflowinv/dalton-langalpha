@@ -2,15 +2,20 @@
 
 Everything lands under ``~/.langalpha`` on the machine and nothing outside it
 changes: a pinned uv, a uv-managed Python 3.12, a venv holding the sandbox's
-default packages, a static ripgrep and Playwright's Chromium. No system
-package is installed, so a machine missing the libraries Chromium needs keeps
-a browser that does not start, and everything else works.
+default packages and a static ripgrep. No system package is installed.
+
+No browser is downloaded: Chromium is about 600 MB on disk, and most machines
+have a browser of their own. Where Playwright looks for its Chromium, the
+install leaves a launcher that runs the machine's Chrome, Chromium, Edge or
+Brave, found when it starts, so a browser installed later is used too and any
+Playwright code works unchanged. A machine with none says so at launch. A
+machine that got Chromium from an earlier install keeps it.
 
 The install is stamped with a hash of this recipe, so a start finds a current
 machine with one read, and a changed recipe reinstalls on the next start. A
 reinstall redoes only the layers whose inputs changed: uv and ripgrep by their
-version, Python by the venv's interpreter, the packages and Chromium by a
-hash each in ``.bootstrap.layers``. Concurrent installs (two computers on one
+version, Python by the venv's interpreter, the packages by a hash in
+``.bootstrap.layers``. Concurrent installs (two computers on one
 login, two workers) queue on a lock, and the one that waited usually finds
 nothing left to do.
 
@@ -60,9 +65,61 @@ _OVERRIDES = ("curl_cffi>=0.14",)
 # zoneinfo falls back to this package.
 _MACHINE_PACKAGES = ("tzdata",)
 _PACKAGES = (*DEFAULT_DEPENDENCIES, *_MACHINE_PACKAGES)
-# Chromium is about 300 MB and only browsing needs it, so a slow download
-# costs that alone, never the install.
-_BROWSER_TIMEOUT_S = 900
+
+# The scrape server rewords a launch that fails with this (_NO_BROWSER there).
+NO_OWN_BROWSER = (
+    "No Chrome, Chromium, Edge or Brave is installed on this machine, so "
+    "Playwright has no browser to run. This is the user's own computer, and "
+    "installing a browser downloads about 500 MB onto it, so ask the user "
+    "before installing one."
+)
+# Stands where Playwright expects its Chromium and runs the machine's own
+# browser with Playwright's arguments. Playwright reaches the browser over the
+# pipes it opened, which exec keeps, and the browser still gets a profile of
+# Playwright's own.
+_LAUNCHER = f"""#!/bin/sh
+# Written by langalpha in place of Playwright's Chromium.
+for b in "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \\
+  "/Applications/Chromium.app/Contents/MacOS/Chromium" \\
+  "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge" \\
+  "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"; do
+  for d in "" "$HOME"; do [ -x "$d$b" ] && exec "$d$b" "$@"; done
+done
+for n in google-chrome google-chrome-stable chromium chromium-browser microsoft-edge brave-browser; do
+  b=$(command -v "$n") && exec "$b" "$@"
+done
+echo "{NO_OWN_BROWSER}" >&2
+exit 127
+"""
+# Prints the executables Playwright finds missing, by launching each Chromium
+# it can choose: the headless shell by default, the full build by channel.
+# Asking Playwright keeps the paths right across its versions.
+_MISSING_BROWSERS = r"""import re
+from playwright.sync_api import sync_playwright
+with sync_playwright() as p:
+    for options in ({}, {"channel": "chromium"}):
+        try:
+            p.chromium.launch(**options).close()
+        except Exception as e:
+            missing = re.search(r"Executable doesn't exist at ([^\r\n]+)", str(e))
+            if missing is None:
+                raise
+            print(missing.group(1).strip())
+"""
+
+
+# What every script that changes the runtime holds while it does: an install,
+# and an uninstall deleting it (``_ssh_shell.uninstall_script``). Each opens the
+# file on descriptor 9 and then calls ``lock <seconds to wait>``.
+LOCK_FILE = ".bootstrap.lock"
+LOCK_SH = """lock() {
+  if command -v flock >/dev/null 2>&1; then flock -w "$1" 9; return; fi
+  # macOS has no flock(1). Perl takes the same flock(2) lock on descriptor 9,
+  # and the lock stays with this shell's copy of it after perl exits.
+  perl -MFcntl=:flock -e 'open(my $f, ">&=", 9) or exit 1; my $end = time + shift;
+    until (flock($f, LOCK_EX | LOCK_NB)) { exit 1 if time >= $end; select(undef, undef, undef, 0.2) }' "$1"
+}
+"""
 
 
 def recipe_hash() -> str:
@@ -73,7 +130,7 @@ def recipe_hash() -> str:
         "packages": _PACKAGES,
         "overrides": _OVERRIDES,
         "ripgrep": [RIPGREP_VERSION, _RIPGREP_SHA256],
-        "playwright": SANDBOX_PLAYWRIGHT_VERSION,
+        "browsers": layer_hashes()["browsers"],
         "revision": 2,
     }
     return hashlib.sha256(json.dumps(recipe, sort_keys=True).encode()).hexdigest()[:16]
@@ -88,7 +145,7 @@ def layer_hashes() -> dict[str, str]:
     hash changes."""
     return {
         "packages": _hash(_PACKAGES, _OVERRIDES),
-        "browsers": _hash(SANDBOX_PLAYWRIGHT_VERSION),
+        "browsers": _hash(SANDBOX_PLAYWRIGHT_VERSION, _LAUNCHER, _MISSING_BROWSERS),
     }
 
 
@@ -171,16 +228,11 @@ now() {{ if [ -n "${{EPOCHREALTIME:-}}" ]; then echo "${{EPOCHREALTIME/,/.}}"; e
 phase() {{ echo "{PHASE_MARK}$1 $(now)"; }}
 mkdir -p "{p.bin}" "{p.cache}"
 chmod 700 "$L"
-exec 9>"$L/.bootstrap.lock"
-lock() {{
-  if command -v flock >/dev/null 2>&1; then flock -w "$1" 9; return; fi
-  # macOS has no flock(1). Perl takes the same flock(2) lock on descriptor 9,
-  # and the lock stays with this shell's copy of it after perl exits.
-  perl -MFcntl=:flock -e 'open(my $f, ">&=", 9) or exit 1; my $end = time + shift;
-    until (flock($f, LOCK_EX | LOCK_NB)) {{ exit 1 if time >= $end; select(undef, undef, undef, 0.2) }}' "$1"
-}}
-phase lock
+exec 9>"$L/{LOCK_FILE}"
+{LOCK_SH}phase lock
 lock {int(lock_wait_s)} || {{ echo "Another install of the runtime is still running." >&2; exit 75; }}
+# Again, under the lock: a removal that held it may have taken them.
+mkdir -p "{p.bin}" "{p.cache}"
 phase check
 if [ "$(cat "$L/.bootstrap" 2>/dev/null)" = {want} ]; then phase end; exit 0; fi
 case "$(uname -m)" in
@@ -235,7 +287,9 @@ export UV_PYTHON_INSTALL_DIR="{p.python}" UV_CACHE_DIR="{p.uv_cache}" UV_NO_CONF
 if ! "{p.venv_bin}/python" -c "import sys; raise SystemExit('%d.%d' % sys.version_info[:2] != '{PYTHON_VERSION}')" 2>/dev/null; then
   phase python
   echo "Installing Python {PYTHON_VERSION}"
-  "{p.bin}/uv" python install {PYTHON_VERSION}
+  # --no-bin: by default uv also links python3.X into ~/.local/bin, on the
+  # owner's own PATH, where it would shadow theirs.
+  "{p.bin}/uv" python install --no-bin {PYTHON_VERSION}
   rm -rf "{p.venv}"
   "{p.bin}/uv" venv --seed --python {PYTHON_VERSION} --python-preference only-managed "{p.venv}"
   record packages ""
@@ -252,15 +306,28 @@ fi
 
 if ! current browsers {layers["browsers"]}; then
   phase browsers
-  echo "Installing Chromium for Playwright"
-  # Left unstamped when it fails, so the next reinstall tries it again.
-  # timeout(1) is not on macOS: the alarm outlives the exec and ends the
-  # install, which stays in the install's group, so a cancel ends it too.
-  if PLAYWRIGHT_BROWSERS_PATH="{p.browsers}" "{p.venv_bin}/python" -c \\
-      'import os, signal, sys; signal.alarm({_BROWSER_TIMEOUT_S}); os.execv(sys.executable, [sys.executable, "-m", "playwright", "install", "chromium"])'; then
+  B="{p.browsers}"
+  mkdir -p "$B"
+  # Launchers from an earlier install go first, so the probe sees only
+  # Playwright's own browsers. One that `playwright install` has since
+  # replaced with the real build, marked complete, stays.
+  for d in "$B"/*/; do
+    if [ -f "$d.langalpha-launcher" ] && [ ! -f "${{d}}INSTALLATION_COMPLETE" ]; then rm -rf "$d"; fi
+  done
+  # Left unstamped when it fails, so the next reinstall tries it again, and
+  # never failing the install: browsing alone goes without. set -e does not
+  # reach into an if's condition, so each write's failure is checked. The
+  # mark goes first, so a launcher left half written is cleared as one.
+  if missing=$(PLAYWRIGHT_BROWSERS_PATH="$B" "{p.venv_bin}/python" -c {shlex.quote(_MISSING_BROWSERS)}) &&
+    printf '%s\\n' "$missing" | while IFS= read -r f; do
+      case "$f" in "$B"/*) ;; *) continue ;; esac
+      rel="${{f#"$B"/}}"
+      {{ mkdir -p "$(dirname "$f")" && : > "$B/${{rel%%/*}}/.langalpha-launcher" &&
+        printf '%s' {shlex.quote(_LAUNCHER)} > "$f" && chmod 755 "$f"; }} || exit 1
+    done; then
     record browsers {layers["browsers"]}
   else
-    echo "Chromium did not install; browsing stays unavailable on this machine." >&2
+    echo "Playwright's browser launcher was not set up." >&2
   fi
 fi
 

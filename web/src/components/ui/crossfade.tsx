@@ -17,6 +17,10 @@ const GRID_STYLE = { display: 'grid', gridTemplateColumns: 'minmax(0, 1fr)', min
 /** How far a state rises in, and the one it replaces lifts out. */
 const RISE_PX = 5;
 const LAYER_STYLE = { gridArea: '1 / 1', minWidth: 0 } as const;
+// Where a leaving layer sits once out of flow: where it was, cut to the cell.
+// A taller one left hanging out would give a scrolling box around the cell
+// more to scroll, and flash its scrollbar until the layer is gone.
+const LEAVING_STYLE = { position: 'absolute', inset: 0, overflow: 'clip' } as const;
 
 /** The cell's latest swap: which key is on show, and how the swap travels.
  *  Handed to the layers through context rather than framer's `custom`, which
@@ -33,9 +37,11 @@ interface Swap {
   scale: boolean;
   enterDelay: number;
   enterDuration: number;
+  /** A leaving layer fades out over the cell rather than holding it open. */
+  sizeToIncoming: boolean;
 }
 
-const SwapContext = createContext<Swap>({ current: null, rise: null, scale: false, enterDelay: 0, enterDuration: DURATION.quick });
+const SwapContext = createContext<Swap>({ current: null, rise: null, scale: false, enterDelay: 0, enterDuration: DURATION.quick, sizeToIncoming: false });
 
 // Only the keys a swap moves are written, so a plain fade leaves the layer
 // without a transform at all.
@@ -77,6 +83,12 @@ interface SwapCellProps {
   /** Plays the first state's entrance on mount too. By default a cell that
    *  mounts settled (history, a reconnect, a page coming back) just is. */
   appear?: boolean;
+  /** Takes the incoming state's size at once, the leaving one fading out over
+   *  it, for a cell in a box that resizes to fit (a dialog's body): stacked,
+   *  the box would hold the taller state's size until it had gone, and only
+   *  then start to resize. By default a cell keeps the larger of the two, so
+   *  nothing around it moves for the swap. */
+  sizeToIncoming?: boolean;
   children?: React.ReactNode;
 }
 
@@ -95,6 +107,7 @@ export function SwapCell({
   enterDelay = 0,
   enterDuration = DURATION.quick,
   appear = false,
+  sizeToIncoming = false,
   children,
 }: SwapCellProps): React.ReactElement {
   const Root = as;
@@ -108,8 +121,8 @@ export function SwapCell({
   }
   const rise = riseKey === undefined ? null : swap.rises;
   return (
-    <Root className={cn(className)} style={GRID_STYLE}>
-      <SwapContext value={{ current: swapKey, shift, rise, scale, enterDelay, enterDuration }}>
+    <Root className={cn(className)} style={sizeToIncoming ? { ...GRID_STYLE, position: 'relative' } : GRID_STYLE}>
+      <SwapContext value={{ current: swapKey, shift, rise, scale, enterDelay, enterDuration, sizeToIncoming }}>
         <AnimatePresence initial={appear}>
           {swapKey !== null && (
             <SwapLayer key={swapKey} layerKey={swapKey} as={as} className={layerClassName}>
@@ -141,7 +154,7 @@ function SwapLayer({
   return (
     <Layer
       className={className}
-      style={LAYER_STYLE}
+      style={!present && swap.sizeToIncoming ? { ...LAYER_STYLE, ...LEAVING_STYLE } : LAYER_STYLE}
       aria-hidden={present ? undefined : true}
       inert={!present}
       initial={{ opacity: 0, ...placed(swap, 1) }}

@@ -54,5 +54,11 @@ export function isSteeringContinuation(message: MessageLike): boolean {
 export function isReportRow(message: MessageLike & { provenance?: unknown }): boolean {
   if (message.role !== 'user') return false;
   const kind = (message.provenance as MessageProvenance | undefined)?.kind;
-  return kind === 'analyst_report' || kind === 'task_report';
+  return isReportKind(kind);
+}
+
+/** The provenance kinds a report-back's row carries, drawn as a line of its
+ *  own and never counted as a turn the user started. */
+export function isReportKind(kind: MessageProvenance['kind'] | undefined): boolean {
+  return kind === 'analyst_report' || kind === 'task_report' || kind === 'command_report';
 }

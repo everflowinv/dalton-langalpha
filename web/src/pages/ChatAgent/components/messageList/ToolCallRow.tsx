@@ -10,6 +10,8 @@ import { classifyAgentPath } from '../../utils/agentPaths';
 import { RunningTitle, RowIcon, FailedIconBadge } from './ActivityRowParts';
 import { SwapCell } from '@/components/ui/crossfade';
 import type { ToolActivityItem, PreparingCall } from './activityTypes';
+import { ToolCallCommandState } from '../commands/CommandState';
+import { isCommandTool } from '../commands/commandWords';
 
 const RUNNING_VERB_KEY: Record<string, string> = { Read: 'read', Edit: 'edit', Write: 'write' };
 
@@ -136,6 +138,9 @@ export const ToolCallRow = memo(function ToolCallRow({ item, onClick, running = 
                   </button>
                 </span>
               )}
+              {/* A call that moved to the background returned before its
+                  command ended; the row follows the command from there. */}
+              {isCommandTool(toolName) && <ToolCallCommandState toolCallId={item.toolCallId} />}
             </>
           )}
         </SwapCell>

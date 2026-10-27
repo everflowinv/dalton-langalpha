@@ -176,8 +176,9 @@ async function confirm(win, host, who, { replacing = false } = {}) {
     detail += '\n\nThis Mac is already connected to LangAlpha, perhaps for another account. '
       + 'Continuing disconnects it, and any computer using it stops working.'
   }
+  // No `type`: macOS then shows the app's icon. 'warning' swaps in the
+  // system caution triangle, and the page has already shown the warning.
   const options = {
-    type: 'warning',
     title: 'Turn on remote control?',
     message: `Let LangAlpha's agent use this Mac as ${who}?`,
     detail,

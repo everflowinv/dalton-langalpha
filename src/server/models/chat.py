@@ -12,6 +12,7 @@ from typing import Annotated, Any, Dict, List, Literal, Mapping, Optional, Union
 from pydantic import AfterValidator, BaseModel, Field, field_validator
 
 from src.server.models.additional_context import AdditionalContext
+from src.server.models.command import FailureReason
 
 from src.llms.reasoning import ReasoningLevel
 
@@ -341,12 +342,36 @@ class TaskReport(BaseModel):
     subagent_type: Optional[str] = None
 
 
+class CommandReport(BaseModel):
+    """A background command (Bash) or code run (ExecuteCode) in this thread
+    that ended on its own, completed or failed, or that the user stopped (no
+    other stop reports).
+
+    ``tool_call_id`` is the call that started it, whose card the caption
+    opens. ``failure_reason`` says why a failed one failed: ``exit`` (a
+    non-zero exit), ``lost`` (its computer stopped under it), ``vanished``
+    (no exit recorded while its computer ran) or ``after_turn_limit``
+    (stopped an hour after its turn ended, which the caption calls stopped
+    early).
+    """
+
+    kind: Literal["command_report"]
+    command_id: str
+    tool: Literal["Bash", "ExecuteCode"]
+    description: Optional[str] = None
+    status: Literal["completed", "failed", "stopped"]
+    failure_reason: Optional[FailureReason] = None
+    tool_call_id: Optional[str] = None
+
+
 # What a report-back turn announces, kept on its query row for display only.
 # The turn's own message is model-facing and hidden from the user, so history
 # shows a labelled row built from this instead. Only the server's own
 # report-back requests keep it: any other request has it dropped once parsed,
 # so a malformed one is still refused there.
-ReportSource = Annotated[AnalystReport | TaskReport, Field(discriminator="kind")]
+ReportSource = Annotated[
+    AnalystReport | TaskReport | CommandReport, Field(discriminator="kind")
+]
 
 
 class ChatRequest(BaseModel):

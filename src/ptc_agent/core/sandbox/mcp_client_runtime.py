@@ -543,7 +543,7 @@ def _resolve_relay(cfg):
 
 # Per-execution running sum of emitted result_body bytes. Each execute_code runs
 # in a FRESH interpreter process — both the Daytona and Docker providers spawn a
-# new `python` per code_run (a one-shot run, NOT a persistent kernel/session), so
+# new `python` per execute_code (a one-shot run, NOT a persistent kernel/session), so
 # this module is re-imported and the counter resets to 0 every run. It therefore
 # accumulates only across the MCP calls within ONE execute_code, never session-
 # wide. Caps supplied via the config
@@ -551,8 +551,8 @@ def _resolve_relay(cfg):
 # the budget is the aggregate ceiling): once the running sum crosses the budget
 # we stop emitting result_body (snippet/sha/size still recorded) to keep a
 # cooperative run's trace small. This is a courtesy bound only — agent code can
-# write MCP_TRACE_FILE directly; the hard host-memory bound is in
-# sandbox/execution.py:_collect_mcp_trace, which sizes the file before reading it.
+# write MCP_TRACE_FILE directly; the hard host-memory bound is the job trace
+# read's in sandbox/jobs/protocol.py, which sizes the file before reading it.
 _result_body_emitted_bytes = 0
 
 

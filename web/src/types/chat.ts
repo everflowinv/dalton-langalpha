@@ -10,6 +10,7 @@ import type {
 } from './sse';
 import type { ErrorLinkSpec, StructuredError } from '@/utils/rateLimitError';
 import type { DispatchingAgent, ReportOutcome } from './api';
+import type { CommandFailureReason, CommandTool } from './commands';
 
 // --- Content Segments (discriminated union) ---
 
@@ -478,6 +479,14 @@ export type MessageProvenance =
       kind: 'task_report'; taskId: string; displayId: string; description: string | null; failed: boolean;
       /** The subagent's role; absent on older reports. */
       subagentType?: string;
+    }
+  /** A background command of the agent's that ended. `toolCallId` is the
+   *  call it started from, whose tool card the report opens; null for a
+   *  command whose call had no id. */
+  | {
+      kind: 'command_report'; tool: CommandTool; description: string | null; status: 'completed' | 'failed' | 'stopped';
+      failureReason: CommandFailureReason | null;
+      toolCallId: string | null;
     };
 
 export type UserMessage = {

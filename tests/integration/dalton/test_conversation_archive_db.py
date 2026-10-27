@@ -18,6 +18,7 @@ from unittest.mock import create_autospec
 import pytest
 from psycopg.rows import dict_row
 
+from deepagents.backends.protocol import ExecuteResponse
 from ptc_agent.agent.backends.sandbox import SandboxBackend
 from scripts.dalton import conversation_archive as archive_cli
 from src.config.env import LOCAL_DEV_USER_ID
@@ -294,11 +295,11 @@ async def test_conversation_archive_end_to_end_pipeline_db(
 
     nvda_backend = create_autospec(SandboxBackend, instance=True)
     nvda_backend.awrite_text.side_effect = _write_nvda
-    nvda_backend.aexecute_bash.return_value = {"exit_code": 0, "stdout": "", "stderr": ""}
+    nvda_backend.aexecute.return_value = ExecuteResponse(output="", exit_code=0, truncated=False)
 
     home_backend = create_autospec(SandboxBackend, instance=True)
     home_backend.awrite_text.side_effect = _write_home
-    home_backend.aexecute_bash.return_value = {"exit_code": 0, "stdout": "", "stderr": ""}
+    home_backend.aexecute.return_value = ExecuteResponse(output="", exit_code=0, truncated=False)
 
     extracted_calls: list[tuple[str, int]] = []
     fail_second_split_chunk = True

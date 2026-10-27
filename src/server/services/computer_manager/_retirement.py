@@ -101,6 +101,19 @@ class RetirementMixin:
             )
             return False
 
+    @staticmethod
+    def removal_held(computer: Dict[str, Any]) -> Optional[Retirement]:
+        """What refuses the owner's remove whatever is on the computer, read
+        off the row: the primary, then a transition another owner holds,
+        which only a retirement owed to a delete may claim from under it.
+
+        Asked before emptying one for its removal, which would otherwise
+        delete its workspaces only to be refused, and again under the key by
+        ``_removal_refusal``, where it is decisive."""
+        if computer.get("is_primary"):
+            return Retirement.PRIMARY
+        return Retirement.BUSY if _mid_transition(computer) else None
+
     async def remove_computer(self, computer_id: str) -> None:
         """Retire an empty computer its owner no longer wants.
 
@@ -254,16 +267,16 @@ class RetirementMixin:
     ) -> Optional[Retirement]:
         """None when the owner's remove may go ahead; decisive only under the key.
 
-        What keeps any computer, then a transition another owner holds, which
-        only a retirement owed to a delete may claim from under it."""
-        kept = await self._why_machine_is_kept(computer_id, computer)
-        if kept is None and _mid_transition(computer):
+        ``removal_held``, then the workspaces still on it."""
+        held = self.removal_held(computer)
+        if held is None:
+            return await self._why_machine_is_kept(computer_id, computer)
+        if held is Retirement.BUSY:
             logger.info(
                 f"Computer {computer_id} is {computer['status']!r} or "
                 "changing spec; leaving it to that transition"
             )
-            return Retirement.BUSY
-        return kept
+        return held
 
     @staticmethod
     async def _why_machine_is_kept(

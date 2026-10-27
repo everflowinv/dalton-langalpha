@@ -19,6 +19,8 @@ vi.mock('@/config/hostMode', () => ({
 
 vi.mock('../../utils/api', () => ({
   getComputerProviders: vi.fn(),
+  // Read only where this Mac is offered, which it never is here.
+  getComputers: vi.fn(),
   getWorkspaceQuota: vi.fn(async () => ({ performance: null, max: null, always_on: null })),
   createSshPairing: vi.fn(),
   getSshPairing: vi.fn(),
@@ -82,7 +84,7 @@ function apiError(code: number, detail: unknown) {
 }
 
 function open(onSubmit = vi.fn()) {
-  renderWithProviders(<CreateComputerDialog computers={[]} onClose={() => {}} onSubmit={onSubmit} busy={false} error={null} />);
+  renderWithProviders(<CreateComputerDialog onClose={() => {}} onSubmit={onSubmit} busy={false} error={null} />);
   return onSubmit;
 }
 
@@ -106,13 +108,14 @@ describe('pairing', () => {
   it('mints one command once SSH is picked and waits for the machine', async () => {
     const user = userEvent.setup();
     open();
-    // The hosted kinds keep the name field at the top; SSH names the machine in its summary.
+    // The name field sits at the top for every provider, SSH included.
     expect(await screen.findByRole('textbox', { name: /^Name/ })).toBeInTheDocument();
     expect(mockMint).not.toHaveBeenCalled();
 
     await pickSsh(user);
 
-    expect(screen.queryByRole('textbox', { name: /^Name/ })).not.toBeInTheDocument();
+    // Until the machine answers, the field says it will be named after it.
+    expect(screen.getByRole('textbox', { name: /^Name/ })).toHaveAttribute('placeholder', "Defaults to the machine's name");
     expect(await screen.findByText(pairing('tok1').command)).toBeInTheDocument();
     const script = screen.getByRole('link', { name: 'View script' });
     expect(script).toHaveAttribute('href', pairing('tok1').script_url);
@@ -140,7 +143,11 @@ describe('pairing', () => {
     const summary = await screen.findByTestId('ssh-ready');
     expect(within(summary).getByText('me@198.51.100.7')).toBeInTheDocument();
     expect(within(summary).getByText('Ubuntu 24.04 · x86_64 · sudo available')).toBeInTheDocument();
-    expect(within(summary).getByRole('textbox', { name: 'Name' })).toHaveValue('devbox');
+    // The summary has no name of its own: the top field shows the hostname as its default.
+    expect(within(summary).queryByRole('textbox', { name: /^Name/ })).not.toBeInTheDocument();
+    const top = screen.getByRole('textbox', { name: /^Name/ });
+    expect(top).toHaveValue('');
+    expect(top).toHaveAttribute('placeholder', 'devbox');
     expect(within(summary).getByText('Workspaces go in /home/me/langalpha.')).toBeInTheDocument();
     expect(within(summary).getByText('Host key SHA256:abc123')).toBeInTheDocument();
 
@@ -180,9 +187,7 @@ describe('pairing', () => {
     await pickSsh(user);
 
     const summary = await screen.findByTestId('ssh-ready');
-    const name = within(summary).getByRole('textbox', { name: 'Name' });
-    await user.clear(name);
-    await user.type(name, 'Lab box');
+    await user.type(screen.getByRole('textbox', { name: /^Name/ }), 'Lab box');
     await user.click(within(summary).getByRole('button', { name: 'Change' }));
     const folder = within(summary).getByRole('textbox', { name: 'Folder' });
     expect(folder).toHaveFocus();
@@ -195,6 +200,44 @@ describe('pairing', () => {
       name: 'Lab box',
       ssh: expect.objectContaining({ root_dir: '/srv/agent' }),
     }));
+  });
+
+  it('offers to take over a folder another computer marked, and sends the one it named', async () => {
+    mockStatus.mockResolvedValue(READY);
+    const user = userEvent.setup();
+    const onSubmit = vi.fn();
+    renderWithProviders(
+      <CreateComputerDialog
+        onClose={() => {}}
+        onSubmit={onSubmit}
+        busy={false}
+        error="/home/me/langalpha on devbox is the folder of a LangAlpha computer this account does not have."
+        takeOver="dd44d9d0ddb144d6b135d767eaecc5b7"
+      />,
+    );
+    await pickSsh(user);
+    await screen.findByTestId('ssh-ready');
+
+    await user.click(screen.getByRole('button', { name: 'Take over this folder' }));
+    expect(onSubmit).toHaveBeenCalledWith(expect.objectContaining({
+      ssh: expect.objectContaining({
+        root_dir: '/home/me/langalpha',
+        take_over: 'dd44d9d0ddb144d6b135d767eaecc5b7',
+      }),
+    }));
+  });
+
+  it('offers no take-over for any other refusal', async () => {
+    mockStatus.mockResolvedValue(READY);
+    const user = userEvent.setup();
+    renderWithProviders(
+      <CreateComputerDialog onClose={() => {}} onSubmit={vi.fn()} busy={false} error="/home/me/langalpha on devbox already holds files." />,
+    );
+    await pickSsh(user);
+    await screen.findByTestId('ssh-ready');
+
+    expect(screen.getByRole('alert')).toHaveTextContent('already holds files');
+    expect(screen.queryByRole('button', { name: 'Take over this folder' })).not.toBeInTheDocument();
   });
 
   it('starts a new pairing for a different machine', async () => {
@@ -344,7 +387,7 @@ describe('by hand', () => {
     expect(within(summary).getByText('me@203.0.113.10:2222')).toBeInTheDocument();
     expect(within(summary).getByText('Connecting as root.')).toBeInTheDocument();
     // No hostname: the name falls back to the host.
-    expect(within(summary).getByRole('textbox', { name: 'Name' })).toHaveValue('203.0.113.10');
+    expect(screen.getByRole('textbox', { name: /^Name/ })).toHaveAttribute('placeholder', '203.0.113.10');
 
     await user.click(screen.getByRole('button', { name: 'Add computer' }));
     expect(onSubmit).toHaveBeenCalledWith(expect.objectContaining({

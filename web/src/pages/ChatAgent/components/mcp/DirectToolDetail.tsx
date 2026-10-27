@@ -1,10 +1,11 @@
 import React from 'react';
 import { useTranslation } from 'react-i18next';
-import { Ban, XCircle } from 'lucide-react';
-import { CodeBlock } from '../Markdown';
+import { Ban, XCircle, type LucideIcon } from 'lucide-react';
+import { TermCard } from '../charts/TermCard';
+import { TermCopy, TermPanelHead } from '../charts/TermPanel';
 import { ArgsTable } from './ArgsTable';
 import { JsonTree } from './JsonTree';
-import { DirectToolTileMark } from './DirectToolMark';
+import { DirectToolRowMark } from './DirectToolMark';
 import { useDirectToolVendorLabel } from './useDirectToolVendor';
 import {
   directToolRejectionReason,
@@ -15,25 +16,15 @@ import {
 } from '../../utils/directTools';
 import { humanizeKey } from '../../utils/structuredResult';
 
-function SectionLabel({ children }: { children: React.ReactNode }): React.ReactElement {
+/** Why the call has no answer: the state on a line, the reason under it as written. */
+function Notice({ icon: Icon, title, body }: { icon: LucideIcon; title: string; body?: string }): React.ReactElement {
   return (
-    <div className="text-xs font-medium uppercase tracking-wider mb-2 px-1" style={{ color: 'var(--color-text-tertiary)' }}>
-      {children}
-    </div>
-  );
-}
-
-function Notice({ icon, title, body }: { icon: React.ReactNode; title: string; body?: string }): React.ReactElement {
-  return (
-    <div
-      className="rounded-lg px-4 py-3 flex items-start gap-3"
-      style={{ backgroundColor: 'var(--color-bg-elevated)', border: '1px solid var(--color-border-default)' }}
-    >
-      {icon}
-      <div className="min-w-0 space-y-1">
-        <p className="text-sm font-medium" style={{ color: 'var(--color-text-primary)' }}>{title}</p>
-        {body && <p className="text-xs wrap-break-word" style={{ color: 'var(--color-text-tertiary)' }}>{body}</p>}
-      </div>
+    <div className="term-direct-notice">
+      <p className="term-direct-notice-title">
+        <Icon className="term-direct-notice-mark" aria-hidden="true" />
+        {title}
+      </p>
+      {body && <p className="term-prose term-direct-notice-body">{body}</p>}
     </div>
   );
 }
@@ -49,45 +40,63 @@ export function DirectToolResultView({ result }: { result: DirectToolResult }): 
   const { t } = useTranslation();
   switch (result.kind) {
     case 'refused':
-      return (
-        <Notice
-          icon={<Ban className="h-4 w-4 shrink-0 mt-0.5" style={{ color: 'var(--color-text-tertiary)' }} />}
-          title={t('toolArtifact.directTool.refused')}
-          body={result.reason}
-        />
-      );
+      return <Notice icon={Ban} title={t('toolArtifact.directTool.refused')} body={result.reason} />;
     case 'rejected':
       return (
         <Notice
-          icon={<XCircle className="h-4 w-4 shrink-0 mt-0.5" style={{ color: 'var(--color-text-tertiary)' }} />}
+          icon={XCircle}
           title={t('toolArtifact.directTool.rejected')}
           body={directToolRejectionReason(result.reason) || undefined}
         />
       );
     case 'blocks':
       return (
-        // sibling-space-y, not space-y: CodeBlock's inline margin would
-        // otherwise win over the gap on one side of it.
-        <div className="sibling-space-y-3">
+        <div className="term-direct-blocks">
           {result.blocks.map((b, i) =>
             b.json !== undefined ? (
-              <JsonTree key={i} value={maskAccountIdsDeep(b.json)} />
+              <div key={i} className="term-direct-json">
+                <JsonTree value={maskAccountIdsDeep(b.json)} />
+              </div>
             ) : (
-              <CodeBlock key={i} language="text" code={b.text} />
+              <pre key={i} className="term-direct-text">{b.text}</pre>
             ),
           )}
         </div>
       );
     case 'json':
-      return <JsonTree value={maskAccountIdsDeep(result.json)} />;
+      return (
+        <div className="term-direct-json">
+          <JsonTree value={maskAccountIdsDeep(result.json)} />
+        </div>
+      );
     case 'text':
-      return <CodeBlock language="text" code={result.text} />;
+      return <pre className="term-direct-text">{result.text}</pre>;
     case 'empty':
-      return <div className="text-xs" style={{ color: 'var(--color-text-quaternary)' }}>{t('toolArtifact.noResultContent')}</div>;
+      return <div className="term-t3">{t('toolArtifact.noResultContent')}</div>;
   }
 }
 
-/** Detail-panel body for a `mcp__<server>__<tool>` call: vendor, input, output. */
+/** The answer as text to copy, masked as it is shown; nothing for a call with no answer. */
+function resultText(result: DirectToolResult): string | null {
+  switch (result.kind) {
+    case 'json':
+      return JSON.stringify(maskAccountIdsDeep(result.json), null, 2);
+    case 'text':
+      return result.text;
+    case 'blocks':
+      return result.blocks
+        .map((b) => (b.json !== undefined ? JSON.stringify(maskAccountIdsDeep(b.json), null, 2) : b.text))
+        .join('\n\n');
+    default:
+      return null;
+  }
+}
+
+/**
+ * Detail-panel body for a `mcp__<server>__<tool>` call: the tool and its
+ * vendor, the arguments sent, and the answer. It is what an order's receipt
+ * opens, so the vendor reads as it does on the receipt's edge.
+ */
 export function DirectToolDetail({
   toolName,
   args,
@@ -105,34 +114,40 @@ export function DirectToolDetail({
   const parsed = directToolIdentity(toolName, artifact) || { server: '', tool: toolName };
   const vendorLabel = useDirectToolVendorLabel(parsed.server);
   const result = parseDirectToolResult(content, isFailed);
+  const copyText = resultText(result);
 
   return (
-    <div className="space-y-5">
-      <div className="flex items-center gap-3">
-        <DirectToolTileMark server={parsed.server} />
-        <div className="min-w-0">
-          <div className="text-sm font-medium truncate" style={{ color: 'var(--color-text-primary)' }}>
-            {humanizeKey(parsed.tool)}
-          </div>
-          <div className="text-xs truncate font-mono" style={{ color: 'var(--color-text-tertiary)' }}>
-            {vendorLabel} · {parsed.tool}
-          </div>
-        </div>
-      </div>
+    <>
+      <TermPanelHead
+        title={humanizeKey(parsed.tool)}
+        sub={
+          <>
+            {vendorLabel && (
+              <>
+                <DirectToolRowMark server={parsed.server} className="term-direct-mark h-3 w-3" />
+                {vendorLabel}
+                <span aria-hidden="true"> · </span>
+              </>
+            )}
+            {/* The vendor's own name for it, as its docs spell it. */}
+            <span className="term-direct-id">{parsed.tool}</span>
+          </>
+        }
+      />
 
-      <div>
-        <SectionLabel>{t('toolArtifact.input')}</SectionLabel>
-        <div className="px-1">
+      {/* ArgsTable and JsonTree are the approval cards' too; here they take
+          the panel's inks. */}
+      <TermCard title={t('toolArtifact.input')}>
+        <div className="term-direct-body">
           <ArgsTable args={args || {}} emptyLabel={t('toolArtifact.directTool.noArguments')} />
         </div>
-      </div>
+      </TermCard>
 
-      <div>
-        <SectionLabel>{t('toolArtifact.output')}</SectionLabel>
-        <div className="px-1">
+      <TermCard title={t('toolArtifact.output')} meta={copyText ? <TermCopy text={copyText} /> : undefined}>
+        <div className="term-direct-body">
           <DirectToolResultView result={result} />
         </div>
-      </div>
-    </div>
+      </TermCard>
+    </>
   );
 }

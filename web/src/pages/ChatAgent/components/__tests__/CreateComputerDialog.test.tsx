@@ -22,6 +22,8 @@ vi.mock('@/config/hostMode', () => ({
 
 vi.mock('../../utils/api', () => ({
   getComputerProviders: vi.fn(),
+  // Read only where this Mac is offered, which it never is here.
+  getComputers: vi.fn(),
   getWorkspaceQuota: vi.fn(),
   // SSH setup mints a pairing once SSH is the kind; none of it lands here.
   createSshPairing: vi.fn(() => new Promise(() => {})),
@@ -61,7 +63,7 @@ const OPEN_QUOTA: WorkspaceQuota = {
 };
 
 function open(onSubmit = vi.fn()) {
-  renderWithProviders(<CreateComputerDialog computers={[]} onClose={() => {}} onSubmit={onSubmit} busy={false} error={null} />);
+  renderWithProviders(<CreateComputerDialog onClose={() => {}} onSubmit={onSubmit} busy={false} error={null} />);
   return onSubmit;
 }
 

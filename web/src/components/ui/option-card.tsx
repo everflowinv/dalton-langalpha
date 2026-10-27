@@ -98,7 +98,7 @@ export function OptionCard<V extends string>({
       data-testid={testId}
       data-state={checked ? 'checked' : 'unchecked'}
       className={cn(
-        'rings-within flex items-start gap-3 rounded-lg border px-4 py-3.5',
+        'rings-within relative flex items-start gap-3 rounded-lg border px-4 py-3.5',
         // Ink, as the app's other choice rows are: amber annotates, it does
         // not select (DESIGN.md, accent discipline).
         checked

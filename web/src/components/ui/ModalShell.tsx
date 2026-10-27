@@ -91,6 +91,7 @@ export function ModalShell({
   density = 'form',
   covered = false,
   stacked = false,
+  fixedHeight,
   footer,
   children,
 }: {
@@ -124,6 +125,16 @@ export function ModalShell({
    * outside, but paints nothing, since the shell underneath already dims.
    */
   stacked?: boolean;
+  /**
+   * Hold the panel at this many pixels, the viewport permitting, whatever the
+   * body holds. For a form whose body changes shape at the user's pick: the
+   * panel and the controls above the change stay put, and a longer body
+   * scrolls rather than growing the panel. A prop rather than the caller
+   * sizing its own children, since the body's padding and scroll are the
+   * shell's: a caller's fixed box would scroll inside that padding, a second
+   * scroller in the first.
+   */
+  fixedHeight?: number;
   /** Pinned under the scroll body; lay the buttons out yourself. */
   footer?: React.ReactNode;
   children: React.ReactNode;
@@ -206,8 +217,10 @@ export function ModalShell({
         aria-labelledby={labelId}
         tabIndex={-1}
         inert={covered}
+        // Clipped, not hidden: an overflow-hidden box can still be scrolled
+        // by focus, which would slide the header out of a pinned panel.
         className={cn(
-          'relative w-full flex flex-col overflow-hidden',
+          'relative w-full flex flex-col overflow-clip',
           WIDTH[width],
           isMobile ? 'rounded-t-3xl' : 'rounded-lg',
         )}
@@ -225,7 +238,12 @@ export function ModalShell({
         <div
           ref={measuredRef}
           className="flex flex-col"
-          style={{ maxHeight: isMobile ? '90dvh' : '85vh' }}
+          style={{
+            maxHeight: isMobile ? '90dvh' : '85vh',
+            // Not shrunk to the panel, whose height is read off this box:
+            // as a flex item it would settle wherever the panel was.
+            ...(fixedHeight ? { height: fixedHeight, flexShrink: 0 } : {}),
+          }}
         >
           {isMobile && (
             <div

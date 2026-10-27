@@ -176,25 +176,6 @@ class SessionState:
     running: bool
 
 
-@dataclass
-class Artifact:
-    """An artifact produced by code execution (e.g. a chart image)."""
-
-    type: str  # MIME type, e.g. "image/png"
-    data: str  # base64-encoded content
-    name: str | None = None
-
-
-@dataclass
-class CodeRunResult:
-    """Result of a code execution with optional artifacts."""
-
-    stdout: str
-    stderr: str
-    exit_code: int
-    artifacts: list[Artifact] = field(default_factory=list)
-
-
 @dataclass(frozen=True, slots=True)
 class MetricSample:
     """One resource reading of a sandbox, in the same units for every provider.
@@ -353,24 +334,6 @@ class SandboxRuntime(ABC):
         to do, such as mounting. A runtime whose commands already run as root
         keeps this default."""
         return await self.exec(command, timeout, env=env)
-
-    @abstractmethod
-    async def code_run(
-        self,
-        code: str,
-        env: dict[str, str] | None = None,
-        timeout: int = 300,
-    ) -> CodeRunResult:
-        """Execute code (Python) and return the result with artifacts.
-
-        No working directory: a turn's Python lands in its own workspace via
-        the ``PTC_TURN_CWD`` entry in *env*, which the shipped
-        ``sitecustomize.py`` reads at interpreter startup. One provider's
-        ``code_run`` accepts no directory at all, and prepending a ``chdir``
-        to the submitted source costs a ``from __future__`` import and every
-        traceback line number.
-        """
-        ...
 
     # -- File I/O --
 

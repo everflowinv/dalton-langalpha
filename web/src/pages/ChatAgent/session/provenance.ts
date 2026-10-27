@@ -55,6 +55,15 @@ export function reportRowProvenance(source?: ReportSource): MessageProvenance | 
         failed: source.failed,
         ...(source.subagent_type ? { subagentType: source.subagent_type } : {}),
       };
+    case 'command_report':
+      return {
+        kind: 'command_report',
+        tool: source.tool,
+        description: source.description ?? null,
+        status: source.status,
+        failureReason: source.failure_reason ?? null,
+        toolCallId: source.tool_call_id ?? null,
+      };
     default:
       return null;
   }

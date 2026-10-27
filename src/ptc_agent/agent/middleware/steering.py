@@ -153,6 +153,26 @@ def checkpointed_holds(messages: Sequence[Any], owner_id: str) -> set[str]:
     return found
 
 
+def since_model_response(
+    messages: Sequence[Any], *, stop_at_resume: bool = False
+) -> list[Any]:
+    """The messages after the last model response, oldest first.
+
+    A ``Task(action="resume")`` call this middleware made (``_resume_call``)
+    is not a model response: what was injected before it is still unread.
+    ``stop_at_resume`` ends the window at one anyway."""
+    window: list[Any] = []
+    for message in reversed(messages or []):
+        if isinstance(message, AIMessage) and (
+            stop_at_resume
+            or (message.additional_kwargs or {}).get("lc_source") != "steering"
+        ):
+            break
+        window.append(message)
+    window.reverse()
+    return window
+
+
 class SteeringMiddleware(AgentMiddleware):
     """Takes in what reached the thread while the agent works, before each LLM call.
 
@@ -340,14 +360,9 @@ class SteeringMiddleware(AgentMiddleware):
         call confirm again, which closes nothing twice."""
         if self.report_inbox is None:
             return
-        for message in reversed((state or {}).get("messages") or []):
+        # A resume call in the window holds no rows of its own.
+        for message in since_model_response((state or {}).get("messages") or []):
             kwargs = getattr(message, "additional_kwargs", None) or {}
-            if isinstance(message, AIMessage):
-                # A resume this middleware called is not a model response:
-                # what was injected before it is still unconfirmed.
-                if kwargs.get("lc_source") == "steering":
-                    continue
-                return
             held: _HeldJobs | None = kwargs.get(_HELD_JOBS) or kwargs.get(_LEGACY_HELD)
             if held and held.get("run_id") and held.get("job_ids"):
                 try:
@@ -439,23 +454,21 @@ def _opened_with(
     opened with ahead of its input, while the model has not answered it."""
     if not input_id or not run_id:
         return []
-    messages = list((state or {}).get("messages") or [])
-    for i in range(len(messages) - 1, -1, -1):
-        if isinstance(messages[i], AIMessage):
-            return []
-        if getattr(messages[i], "id", None) == input_id:
-            break
-    else:
+    # A resume call after the input ends the window too: the call ahead of
+    # it already showed them.
+    window = since_model_response(
+        (state or {}).get("messages") or [], stop_at_resume=True
+    )
+    ids = [getattr(m, "id", None) for m in window]
+    if input_id not in ids:
         return []
     opened: list[dict[str, Any]] = []
-    for message in reversed(messages[:i]):
-        if isinstance(message, AIMessage):
-            break
+    for message in window[: ids.index(input_id)]:
         kwargs = getattr(message, "additional_kwargs", None) or {}
         held = kwargs.get(_HELD_JOBS) or {}
         delivered = kwargs.get("steering_delivered")
         if held.get("run_id") == run_id and isinstance(delivered, dict):
-            opened.insert(0, delivered)
+            opened.append(delivered)
     return opened
 
 

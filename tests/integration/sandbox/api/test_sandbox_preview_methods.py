@@ -1,13 +1,13 @@
-"""Integration tests for the sandbox's preview server and background command methods.
+"""Integration tests for the sandbox's preview server methods.
 
-A real PTCSandbox on MemoryProvider: start/stop/logs for preview servers and
-background commands. The legacy ``/api/v1/preview`` redirect never touches a
-sandbox, so its tests are unit tests (``tests/unit/core/sandbox/test_preview.py``).
+A real PTCSandbox on MemoryProvider: start/stop/logs for preview servers. The
+legacy ``/api/v1/preview`` redirect never touches a sandbox, so its tests are
+unit tests (``tests/unit/core/sandbox/test_preview.py``).
 """
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
 import pytest
 import pytest_asyncio
@@ -269,96 +269,3 @@ class TestGetPreviewServerLogs:
         assert logs["is_running"] is False
         assert logs["exit_code"] == 1
         assert "Address already in use" in logs["stderr"]
-
-
-# ---------------------------------------------------------------------------
-# Sandbox method tests: Background command lifecycle
-# ---------------------------------------------------------------------------
-
-
-async def _launch(sandbox, command: str = "sleep 999") -> str:
-    """Start a background command on faked sessions; returns its command_id."""
-    created = []
-
-    async def fake_create_session(session_id):
-        created.append(session_id)
-
-    sandbox.runtime.create_session = fake_create_session
-    sandbox.runtime.session_execute = AsyncMock(return_value="c1")
-    sandbox.runtime.list_sessions = AsyncMock(return_value=[])
-
-    result = await sandbox.execute_bash_command(command, background=True)
-
-    assert result["success"] is True
-    [cmd_id] = created
-    assert f'command_id="{cmd_id}"' in result["stdout"]
-    return cmd_id
-
-
-class TestBackgroundCommandStop:
-    """PTCSandbox.stop_background_command via execute_bash_command(background=True)."""
-
-    async def test_run_and_stop_background_command(self, sandbox):
-        """The command_id a launch hands back is the session a stop deletes."""
-        cmd_id = await _launch(sandbox)
-        delete = sandbox.runtime.delete_session = AsyncMock()
-
-        assert await sandbox.stop_background_command(cmd_id) is True
-        delete.assert_awaited_once_with(cmd_id)
-
-    async def test_stop_unknown_command_returns_false(self, sandbox):
-        """Stopping a non-existent command ID returns False."""
-        result = await sandbox.stop_background_command("nonexistent-cmd")
-        assert result is False
-
-    async def test_stop_of_a_session_already_gone_returns_false(self, sandbox):
-        sandbox.runtime.delete_session = AsyncMock(side_effect=FileNotFoundError)
-        assert await sandbox.stop_background_command("bg-0123456789ab") is False
-
-
-class TestGetBackgroundCommandStatus:
-    """PTCSandbox.get_background_command_status with mocked sessions."""
-
-    async def test_status_of_running_command(self, sandbox):
-        """A running command reports its output so far and keeps its session."""
-        cmd_id = await _launch(sandbox)
-        sandbox.runtime.session_logs = AsyncMock(
-            return_value=SessionCommandResult(
-                cmd_id="c1", exit_code=None, stdout="working...\n", stderr=""
-            )
-        )
-        delete = sandbox.runtime.delete_session = AsyncMock()
-
-        status = await sandbox.get_background_command_status(cmd_id)
-
-        assert status["is_running"] is True
-        assert status["cmd_id"] == cmd_id
-        assert "working" in status["stdout"]
-        sandbox.runtime.session_logs.assert_awaited_once_with(cmd_id)
-        delete.assert_not_awaited()
-
-    async def test_status_of_completed_command_auto_cleans(self, sandbox):
-        """Reading a finished command's output deletes its session."""
-        cmd_id = await _launch(sandbox, "echo hello")
-        sandbox.runtime.session_logs = AsyncMock(
-            return_value=SessionCommandResult(cmd_id="c1", exit_code=0, stdout="done\n", stderr="")
-        )
-        delete = sandbox.runtime.delete_session = AsyncMock()
-
-        status = await sandbox.get_background_command_status(cmd_id)
-
-        assert status["is_running"] is False
-        assert status["success"] is True
-        assert status["exit_code"] == 0
-        delete.assert_awaited_once_with(cmd_id)
-
-    async def test_status_of_unknown_command(self, sandbox):
-        """An id with no session behind it, or not shaped like one, is not found."""
-        sandbox.runtime.session_logs = AsyncMock(return_value=None)
-
-        for cmd_id in ("bg-0123456789ab", "nonexistent"):
-            status = await sandbox.get_background_command_status(cmd_id)
-            assert status["found"] is False
-            assert status["success"] is False
-            assert status["is_running"] is False
-        sandbox.runtime.session_logs.assert_awaited_once_with("bg-0123456789ab")

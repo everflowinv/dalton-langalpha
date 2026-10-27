@@ -21,8 +21,10 @@ import { DiskBar, diskUpgradeTier, diskUsageLabel, isDiskAlertLevel } from './co
 import { specErrorFiles, type SpecError } from './specErrors';
 import { activeSpecChange, effectiveTier, specChangeLabel } from './specChangeUi';
 import { PlanUpgradeHint } from './planUpgradeHint';
+import { MachinePreview } from './machineArt/MachinePreview';
+import { hostedPreview } from './machineArt/machine';
 
-type SpecTarget = Pick<Computer, 'name' | 'resource_tier' | 'status' | 'disk' | 'spec_change'>;
+type SpecTarget = Pick<Computer, 'name' | 'kind' | 'resource_tier' | 'status' | 'disk' | 'spec_change'>;
 
 interface ChangeSpecDialogProps {
   target: SpecTarget | null;
@@ -90,6 +92,8 @@ function ChangeSpecPanel({
   const isRunning = target.status === 'running';
   const errorFiles = specErrorFiles(error?.files, t, locale);
   const change = activeSpecChange(target);
+  // The box it becomes: the size picked, or the one a running change moves to.
+  const shownTier = change ? normalizeTier(change.target_tier) : tier;
   // A bigger tier the plan keeps closed can't be picked here, so the dialog
   // points to where that is decided instead of leaving a dead end. Only where
   // a bigger plan opens it: a plan at the top size is not told to upgrade.
@@ -155,6 +159,7 @@ function ChangeSpecPanel({
       stacked={stacked}
       footer={footer}
     >
+      <MachinePreview machine={hostedPreview(t, target.kind, offer, shownTier)} />
       {target.disk && (
         <div className="flex flex-col gap-1.5">
           <DiskBar disk={target.disk} />

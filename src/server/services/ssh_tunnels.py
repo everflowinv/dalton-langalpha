@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from typing import Optional, Tuple
 from urllib.parse import urlsplit
 
+from ptc_agent.core.sandbox.providers._ssh_shell import TUNNEL_UNINSTALL_SCRIPT
 from ptc_agent.core.sandbox.providers.ssh import (
     GatewayAccess,
     generate_client_key,
@@ -39,7 +40,7 @@ DEFAULT_PORT = 2022
 # by :func:`tunnel_name`: its key, the gateway's pinned key, the loop that keeps
 # the tunnel open, and ``uninstall.sh``, which takes all of it away again.
 TUNNEL_PARENT = ".langalpha"
-UNINSTALL_SCRIPT = "uninstall.sh"
+UNINSTALL_SCRIPT = TUNNEL_UNINSTALL_SCRIPT
 
 
 @dataclass(frozen=True)

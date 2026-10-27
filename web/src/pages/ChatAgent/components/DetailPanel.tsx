@@ -1,5 +1,6 @@
 import React from 'react';
 import { useIsMobile } from '@/hooks/useIsMobile';
+import { cn } from '@/lib/utils';
 import { XCircle } from 'lucide-react';
 import { getDisplayName, isTaskTool } from './toolDisplayConfig';
 import { ToolIcon } from './ToolIcon';
@@ -48,7 +49,7 @@ function DetailPanel({ toolCallProcess, onOpenFile, onOpenSubagentTask }: Detail
 
   return (
     <div
-      className={isMobile && artifact?.type !== 'sec_filing' ? '' : 'h-full flex flex-col'}
+      className={cn('term-panel-host', !isMobile && 'h-full flex flex-col')}
       style={{ backgroundColor: 'transparent' }}
     >
       {isMobile && (

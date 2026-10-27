@@ -94,7 +94,7 @@ function OrderHeadline({
 /** The instrument at headline weight. An option's contract (expiry, strike,
  *  call or put) is one thing to check, so it is set as one, a step lighter
  *  than the underlying it is a contract on. */
-function InstrumentName({ instrument }: { instrument: OrderInstrument }): React.ReactElement {
+export function InstrumentName({ instrument }: { instrument: OrderInstrument }): React.ReactElement {
   const { t } = useTranslation();
   switch (instrument.kind) {
     case 'equity':

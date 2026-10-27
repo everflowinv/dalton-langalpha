@@ -37,6 +37,17 @@ export const INITIAL_LOAD_DAYS: Record<string, number> = {
   '1hour': 180, '4hour': 365, '1day': 0,
 };
 
+// Days to prepend on scroll-left per interval
+export const SCROLL_CHUNK_DAYS: Record<string, number> = {
+  '1min': 5, '5min': 20, '15min': 30, '30min': 60,
+  '1hour': 120, '4hour': 180, '1day': 365,
+};
+
+// Scroll-load: how close to left edge (in bars) before fetching more data
+export const SCROLL_LOAD_THRESHOLD = 20;
+// Debounce delay for visible range changes (ms)
+export const RANGE_CHANGE_DEBOUNCE_MS = 300;
+
 // Stage 1 (fast) initial load — days to fetch for immediate render.
 // Intervals not listed here skip staged loading entirely.
 export const STAGE1_LOAD_DAYS: Record<string, number> = {

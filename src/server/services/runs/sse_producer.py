@@ -281,7 +281,7 @@ class RunSSEProducer:
 
         # Track tool_use state for Anthropic (per agent)
         # Anthropic sends name/id in initial tool_use, then streams args via input_json_delta
-        # Key: (agent_name, index), Value: {name, id, args_accumulated}
+        # Key: (agent_name, index), Value: {name, id, message_id, args_accumulated}
         self.anthropic_tool_call_state: dict = {}
 
         # Event sequence numbering for reconnection support
@@ -1225,15 +1225,20 @@ class RunSSEProducer:
                     # Anthropic sends tool name/id in initial tool_use chunk, then streams args via input_json_delta
                     elif item.get('type') == 'tool_use':
                         index = item.get("index", 0)
-                        state_key = (agent_name, index)
 
-                        # Initialize state for this tool call
-                        if state_key not in self.anthropic_tool_call_state:
-                            self.anthropic_tool_call_state[state_key] = {
-                                "name": item.get("name"),
-                                "id": item.get("id"),
-                                "args_accumulated": ""
-                            }
+                        # A tool_use block always opens a new call, and block
+                        # indexes restart at 0 on every model call. An entry
+                        # already at this index is an earlier call that never
+                        # went out (a stream that died mid-arguments and was
+                        # retried here): kept, it would lend this call its
+                        # name, id and arguments. Its entries at other indexes
+                        # go at this message's finish.
+                        self.anthropic_tool_call_state[(agent_name, index)] = {
+                            "name": item.get("name"),
+                            "id": item.get("id"),
+                            "message_id": message_id,
+                            "args_accumulated": "",
+                        }
 
                         logger.debug(
                             f"[TOOL_USE_METADATA] agent={agent_name} name={item.get('name')} "
@@ -1250,12 +1255,16 @@ class RunSSEProducer:
                         index = item.get("index", 0)
 
                         # Accumulate for completion handler
-                        state_key = (agent_name, index)
-                        if state_key in self.anthropic_tool_call_state:
-                            self.anthropic_tool_call_state[state_key]["args_accumulated"] += partial_json
+                        state = self.anthropic_tool_call_state.get((agent_name, index), {})
+                        if state:
+                            state["args_accumulated"] += partial_json
 
+                        # Named on every chunk, as the Response API route is:
+                        # the client hides and labels a preparing call by name.
                         tool_call_chunk = {
+                            "name": state.get("name"),
                             "args": partial_json,
+                            "id": state.get("id"),
                             "index": index,
                             "type": "tool_call_chunk"
                         }
@@ -1269,8 +1278,8 @@ class RunSSEProducer:
                         }
 
                         logger.debug(
-                            f"[INPUT_JSON_DELTA_EXTRACTED] agent={agent_name} "
-                            f"partial_json_length={len(partial_json)} accumulated={len(self.anthropic_tool_call_state.get(state_key, {}).get('args_accumulated', ''))}"
+                            f"[INPUT_JSON_DELTA_EXTRACTED] agent={agent_name} name={state.get('name')} "
+                            f"partial_json_length={len(partial_json)} accumulated={len(state.get('args_accumulated', ''))}"
                         )
 
                         yield self._build_sse_event("tool_call_chunks", event_stream_message)
@@ -1380,6 +1389,19 @@ class RunSSEProducer:
         # Normalize finish_reason to standard values for consistent handling
         original_finish_reason = finish_reason
         if finish_reason:
+            # A finish speaks for its own message's calls. A Claude entry
+            # another message left in this lane is a call whose stream died
+            # mid-arguments before a retry or a fallback, to any provider,
+            # streamed here: kept, it would go out as a call that never runs
+            # and turn a plain answer's finish into tool_calls. Every chunk of
+            # one Claude call carries the same message id.
+            for stale_key in [
+                key
+                for key, state in self.anthropic_tool_call_state.items()
+                if key[0] == agent_name and state.get("message_id") != message_id
+            ]:
+                del self.anthropic_tool_call_state[stale_key]
+
             # Check if we have tool call state for this agent to disambiguate "completed"
             has_response_api_tool_state = any(
                 key[0] == agent_name and state.get("args_accumulated") and state.get("name")

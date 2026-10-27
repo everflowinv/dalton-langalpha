@@ -15,6 +15,7 @@ import pytest
 from ptc_agent.agent.tools.bash import create_execute_bash_tool
 from ptc_agent.agent.tools.code_execution import create_execute_code_tool
 from ptc_agent.core.paths import SandboxLayout
+from tests.unit.ptc_agent.agent.job_fakes import outcome
 
 ONLY = (SandboxLayout.CHANNELS_DIR,)
 
@@ -48,13 +49,13 @@ class _Mounted:
     async def settled_livefs(self, workspace_id=None):
         return self.livefs
 
-    async def aexecute_bash(self, command, *, call_id=None, **_):
+    async def start_bash_job(self, command, *, call_id=None, **_):
         self.ran.append(command)
-        return {"success": True, "stdout": "ok", "stderr": "", "exit_code": 0}
+        return outcome(output="ok")
 
-    async def aexecute_code(self, code, *, thread_id=None, call_id=None, **_):
+    async def start_code_job(self, code, *, call_id=None, **_):
         self.ran.append(code)
-        return SimpleNamespace(success=True, stdout="ok", stderr="", mcp_trace=[])
+        return outcome(output="ok")
 
 
 COMMANDS = [

@@ -14,6 +14,10 @@ from src.server.models.automation import MarketType
 from src.server.services.market_targets.changes import targets_changed
 from src.server.services.market_targets.listing import watch_spelling
 from src.server.services.wakeups import cancel as wakeups_cancel
+from src.server.services.commands.control import (
+    delete_thread_ending_commands,
+    request_running_stops,
+)
 from src.server.services.llm.thread_model import require_selectable_model
 from src.server.services.thread_lifecycle import project_lifecycle
 from src.server.services.thread_lifecycle_feed import (
@@ -48,7 +52,6 @@ from src.server.database.conversation import (
     external_id_conflict_payload,
     get_workspace_threads,
     get_threads_for_user,
-    delete_thread,
     stamp_thread_seen,
     update_thread_fields,
     update_thread_external_id,
@@ -344,7 +347,6 @@ async def delete_thread_endpoint(thread_id: str, x_user_id: CurrentUserId):
     from src.server.services.thread_mutation import (
         MutationConflict,
         MutationUnavailable,
-        ThreadMutationRunner,
     )
 
     try:
@@ -358,16 +360,18 @@ async def delete_thread_endpoint(thread_id: str, x_user_id: CurrentUserId):
         # Guarded delete (v4 2.4): exclusive T(thread) refuses while a fenced
         # run or tail writer is live on ANY worker; the ledger gate refuses on
         # an in_progress row (cancel the run first). The delete statement runs
-        # on the locked session so fence and effect die together.
+        # on the locked session so fence and effect die together, and the
+        # thread's commands are ended once it has committed.
         try:
-            async with ThreadMutationRunner.get_instance().exclusive(
-                thread_id, "delete"
-            ) as mutation:
+            await delete_thread_ending_commands(
+                thread_id,
                 # Before the delete and on its session: nothing is left that
                 # could answer or spend an order still waiting in this thread,
                 # and a refusal outliving a failed delete fails closed.
-                await refuse_attempts_on_thread_delete(thread_id, conn=mutation.conn)
-                await delete_thread(thread_id, conn=mutation.conn)
+                before_delete=lambda conn: refuse_attempts_on_thread_delete(
+                    thread_id, conn=conn
+                ),
+            )
         except MutationConflict as e:
             raise HTTPException(status_code=409, detail=e.detail)
         except MutationUnavailable as e:
@@ -538,6 +542,9 @@ async def update_thread_endpoint(
                 # Archiving ends the thread's scratchpad.
                 prune_thread_dirs_soon(str(updated_thread["workspace_id"]))
                 await wakeups_cancel.cancel_on_archive(thread_id)
+                # No turn starts here again, so a command's report would
+                # only be dropped; its computer need not stay up for it.
+                await request_running_stops(thread_id=thread_id, by="archive")
         item = _thread_list_item(updated_thread)
         if "llm_model" in updates and updates["llm_model"] != switched_from:
             from src.server.handlers.thread_maintenance import hand_off_on_switch

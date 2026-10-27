@@ -108,8 +108,6 @@ function apiError(code: number, detail: unknown) {
 
 // What the helper reports, which an enable that pairs moves on.
 let macStatus: RemoteControlStatus;
-// The account's computers, as the Computers dialog hands them down.
-let listed: Computer[];
 let getStatus: Mock;
 let enable: Mock;
 let disable: Mock;
@@ -117,7 +115,6 @@ let disable: Mock;
 beforeEach(() => {
   vi.clearAllMocks();
   macStatus = UNPAIRED;
-  listed = [];
   getStatus = vi.fn(async () => macStatus);
   enable = vi.fn(async (): Promise<RemoteControlResult> => {
     macStatus = PAIRED;
@@ -137,7 +134,7 @@ beforeEach(() => {
 });
 
 function open(onSubmit = vi.fn()) {
-  const view = renderWithProviders(<CreateComputerDialog computers={listed} onClose={() => {}} onSubmit={onSubmit} busy={false} error={null} />);
+  const view = renderWithProviders(<CreateComputerDialog onClose={() => {}} onSubmit={onSubmit} busy={false} error={null} />);
   return { ...view, onSubmit };
 }
 
@@ -209,7 +206,7 @@ describe('the This Mac option', () => {
 
   it('says it is already added once a computer is this Mac, rather than pairing again', async () => {
     macStatus = PAIRED;
-    listed = [macRow(MAC_KEY)];
+    mockGetComputers.mockResolvedValue({ computers: [macRow(MAC_KEY)], total: 1 });
     open();
     const card = await screen.findByRole('radio', { name: 'This Mac' });
     expect(card).toBeDisabled();
@@ -227,8 +224,8 @@ describe('turning it on', () => {
     expect(disclosure).toHaveTextContent("LangAlpha's agent will work on this Mac as alex, with everything that account can do.");
     expect(disclosure).toHaveTextContent('Anyone who signs in to your LangAlpha account can direct it.');
     expect(screen.getByTestId('remote-control-preview-notice')).toHaveTextContent('Remote control is in preview');
-    // A Mac has no tier to pick and is named on its summary.
-    expect(screen.queryByRole('textbox', { name: /^Name/ })).not.toBeInTheDocument();
+    // A Mac has no tier to pick, and the name field at the top says it is named after the machine.
+    expect(screen.getByRole('textbox', { name: /^Name/ })).toHaveAttribute('placeholder', "Defaults to the machine's name");
     expect(screen.queryByRole('radio', { name: /^Standard/ })).not.toBeInTheDocument();
 
     const turnOn = screen.getByRole('button', { name: 'Turn on remote control' });
@@ -265,7 +262,8 @@ describe('turning it on', () => {
     expect(summary).not.toHaveTextContent('tunnel');
     // This Mac is the only machine this way adds.
     expect(screen.queryByRole('button', { name: 'Use a different machine' })).not.toBeInTheDocument();
-    expect(screen.getByRole('textbox', { name: 'Name' })).toHaveValue('alex-mac');
+    // Named as the machine unless the user types over it: the top field shows it as its default.
+    expect(screen.getByRole('textbox', { name: /^Name/ })).toHaveAttribute('placeholder', 'alex-mac');
 
     await user.click(screen.getByRole('button', { name: 'Add computer' }));
     expect(onSubmit).toHaveBeenCalledWith({

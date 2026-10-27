@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import re
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Sequence
@@ -43,6 +44,7 @@ from ptc_agent.core.sandbox.providers._ssh_shell import (
     computer_dir,
     computers_dir,
     delete_script,
+    folder_marked_message,
     home_problem,
     root_dir_error,
     root_dir_script,
@@ -50,7 +52,9 @@ from ptc_agent.core.sandbox.providers._ssh_shell import (
 )
 from ptc_agent.core.sandbox.providers._ssh_transport import TRANSPORT_ERRORS, Link, pool
 from ptc_agent.core.sandbox.providers.ssh_errors import (
+    MACHINE_ID_PATTERN,
     SSHConnectError,
+    SSHFolderMarked,
     connect_failure,
 )
 from ptc_agent.core.sandbox.providers.ssh_runtime import (
@@ -112,12 +116,24 @@ _REQUIRED_TOOLS_DARWIN = (
 )
 # The installed runtime takes about this much of the home's filesystem.
 _DISK_NEEDED_BYTES = 3 * 1024**3
-_PROBE_SCRIPT = r"""
-echo "os=$(uname -s)"
+# What the Computers dialog shows of a machine: its system and its hardware.
+# Read by the probe, and again as the machine starts, since a system updates.
+MACHINE_FACTS_SCRIPT = r"""
 echo "arch=$(uname -m)"
-echo "hostname=$(hostname 2>/dev/null || uname -n)"
 if [ "$(uname -s)" = Darwin ]; then echo "distro=macOS $(sw_vers -productVersion 2>/dev/null)"
-else echo "distro=$( . /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-}")"; fi
+echo "model=$(system_profiler -json SPHardwareDataType 2>/dev/null | sed -n 's/^[[:space:]]*"machine_name"[[:space:]]*:[[:space:]]*\("[^"\\]*\(\\.[^"\\]*\)*"\).*/\1/p' | head -n 1)"
+echo "cpu=$(sysctl -n machdep.cpu.brand_string 2>/dev/null)"
+echo "cores=$(sysctl -n hw.ncpu 2>/dev/null)"
+echo "memory=$(sysctl -n hw.memsize 2>/dev/null)"
+else echo "distro=$( . /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-}")"
+echo "cpu=$({ sed -n 's/^model name[[:space:]]*:[[:space:]]*//p' /proc/cpuinfo; lscpu | sed -n 's/^Model name:[[:space:]]*//p'; } 2>/dev/null | head -n 1)"
+echo "cores=$(nproc 2>/dev/null)"
+echo "memory=$(awk '/^MemTotal:/ {printf "%.0f", $2 * 1024}' /proc/meminfo 2>/dev/null)"; fi
+"""
+_PROBE_SCRIPT = (r"""
+echo "os=$(uname -s)"
+echo "hostname=$(hostname 2>/dev/null || uname -n)"
+""" + MACHINE_FACTS_SCRIPT + r"""
 h=$(cd -P -- "$HOME" 2>/dev/null && env pwd -P) || h=$HOME; echo "home=$h"
 echo "shell=${SHELL:-}"
 echo "uid=$(id -u)"
@@ -131,7 +147,7 @@ m=""; for t in $tools; do command -v "$t" >/dev/null 2>&1 || m="$m $t"; done; ec
 [ -n "$(sysctl -n kern.bootsessionuuid 2>/dev/null)" ] && echo bootid=1
 d="$HOME/.langalpha"; [ -d "$d" ] || d="$HOME"
 echo "disk=$(df -Pk "$d" 2>/dev/null | awk 'NR==2 {print $4 * 1024}')"
-""".replace("DARWIN_TOOLS", " ".join(_REQUIRED_TOOLS_DARWIN)).replace(
+""").replace("DARWIN_TOOLS", " ".join(_REQUIRED_TOOLS_DARWIN)).replace(
     "TOOLS", " ".join(_REQUIRED_TOOLS)
 )
 _KEY_LINE = re.compile(r"^\S+ \S+")
@@ -197,6 +213,22 @@ class SSHProbe:
     hostname: str = ""
     # LangAlpha's helper answers for the machine, not an sshd.
     helper: bool = False
+    # A Mac's model name ("MacBook Pro", "Mac Studio"), empty elsewhere. Only
+    # the Computers dialog reads it, to draw the machine.
+    model: str = ""
+    # The processor as the system names it, its cores, and the memory. Only
+    # the Computers dialog reads them; empty or None when not read.
+    cpu: str = ""
+    cores: int | None = None
+    memory_bytes: int | None = None
+
+    def machine(self) -> dict[str, Any]:
+        """The facts kept on the computer for its details, only those read."""
+        return machine_facts(
+            {"distro": self.distro, "arch": self.arch, "cpu": self.cpu}
+            | ({"cores": str(self.cores)} if self.cores else {})
+            | ({"memory": str(self.memory_bytes)} if self.memory_bytes else {})
+        )
 
 
 async def probe_ssh_target(
@@ -211,6 +243,7 @@ async def probe_ssh_target(
     root_dir: str | None = None,
     tunnel: str | None = None,
     reclaim: Collection[str] = (),
+    taking_over: str | None = None,
 ) -> SSHProbe:
     """Log in once and report whether the machine can host a computer.
 
@@ -227,7 +260,9 @@ async def probe_ssh_target(
     without being made on a machine that is otherwise supported. ``reclaim``
     names computers the caller removed: one whose removal never reached the
     machine still marks its folder, and is cleared from it as that removal
-    would have done (see :func:`_check_root`).
+    would have done (see :func:`_check_root`). A mark naming ``taking_over``
+    passes the check untouched: that computer is cleared only once its owner's
+    create is decided, by :func:`take_over_root`.
 
     ``tunnel`` reaches the machine through the gateway, where ``host`` is only
     its name and ``port`` its sshd's port on the machine.
@@ -257,13 +292,19 @@ async def probe_ssh_target(
             )
             if root_dir and result.supported:
                 # Checked, never made: the create makes it, by the same rule.
-                exit_code = await _check_root(
+                exit_code, owner = await _check_root(
                     link,
                     root_dir,
                     home=result.home,
                     reclaim=reclaim,
                     timeout=connect_timeout + 20,
                 )
+                if exit_code == 10 and taking_over and owner == taking_over:
+                    return result
+                if exit_code == 10 and re.match(MACHINE_ID_PATTERN, owner):
+                    raise SSHFolderMarked(
+                        folder_marked_message(root_dir, host), owner
+                    )
                 error = root_dir_error(
                     exit_code, path=root_dir, user=username, host=host
                 )
@@ -281,6 +322,66 @@ async def probe_ssh_target(
     return result
 
 
+async def take_over_root(
+    *,
+    host: str,
+    port: int,
+    username: str,
+    private_key: str,
+    host_key: str,
+    root_dir: str,
+    owner: str,
+    connect_timeout: float = 10,
+    allow_private_addresses: bool = False,
+    tunnel: str | None = None,
+) -> None:
+    """Stop *owner*, the computer whose mark is on *root_dir*, and clear it
+    from the folder, for a create its owner chose to take the folder over.
+
+    Only that step, after the create's own probe already checked the machine,
+    so it is short enough to run under the lock the insert holds. A mark
+    there of any other computer is refused as the probe refuses it.
+
+    Raises:
+        SSHFolderMarked: Another computer's mark is on the folder now.
+        SSHConnectError: As :func:`probe_ssh_target` raises it.
+    """
+    target = SSHTarget(
+        host=host,
+        port=port,
+        username=username,
+        host_key=host_key,
+        key_owner="",
+        connect_timeout=connect_timeout,
+        allow_private=allow_private_addresses,
+        tunnel=tunnel or None,
+    )
+    async with _one_off(target, private_key) as link:
+        try:
+            found = await link.run(
+                'cd -P -- "$HOME" 2>/dev/null && env pwd -P || printf "%s\\n" "$HOME"',
+                timeout=connect_timeout,
+            )
+            home = found.stdout.decode(errors="replace").strip()
+            exit_code, marked = await _check_root(
+                link, root_dir, home=home, reclaim=(owner,), timeout=connect_timeout + 20
+            )
+            if exit_code == 10 and re.match(MACHINE_ID_PATTERN, marked):
+                raise SSHFolderMarked(folder_marked_message(root_dir, host), marked)
+            error = root_dir_error(exit_code, path=root_dir, user=username, host=host)
+            if error is not None:
+                raise error
+        except TimeoutError:
+            raise SSHConnectError(
+                "timeout", f"{host} stopped answering while it was being checked."
+            ) from None
+        except TRANSPORT_ERRORS as e:
+            raise SSHConnectError(
+                "unreachable",
+                f"{host} closed the connection while it was being checked.",
+            ) from e
+
+
 async def _check_root(
     link: Link,
     root_dir: str,
@@ -288,8 +389,9 @@ async def _check_root(
     home: str,
     reclaim: Collection[str],
     timeout: float,
-) -> int | None:
-    """``root_dir_script``'s exit for *root_dir*, which it checks.
+) -> tuple[int | None, str]:
+    """``root_dir_script``'s exit for *root_dir*, which it checks, and the id
+    of the computer whose mark refused it ("" for any other exit).
 
     A folder marked by one of *reclaim*, a computer whose removal could not
     reach the machine, holds what that removal would have taken: the
@@ -301,7 +403,7 @@ async def _check_root(
     check = await link.run(script, timeout=timeout)
     owner = check.stdout.decode(errors="replace").strip()
     if check.exit_code != 10 or owner not in reclaim:
-        return check.exit_code
+        return check.exit_code, owner if check.exit_code == 10 else ""
     cdir = computer_dir(home, owner)
     stop = await link.run(
         stop_script(cdir, root=False, computer_root=root_dir), timeout=timeout
@@ -311,7 +413,8 @@ async def _check_root(
         if sudo.exit_code == 0:
             await link.run(stop_script(cdir, root=True), timeout=timeout, root=True)
     await link.run(delete_script(cdir, root=root_dir), timeout=timeout)
-    return (await link.run(script, timeout=timeout)).exit_code
+    again = await link.run(script, timeout=timeout)
+    return again.exit_code, again.stdout.decode(errors="replace").strip()
 
 
 async def run_script(
@@ -415,6 +518,44 @@ async def _sftp_works(conn: Any, timeout: float) -> bool:
         return False
 
 
+def _mac_model(raw: str) -> str:
+    """The model name from the probe's ``model=`` line: ``machine_name``'s JSON
+    string as ``system_profiler -json`` gives it. The JSON keys, unlike the
+    text report's labels, are the same in every language a Mac is set to."""
+    try:
+        name = json.loads(raw) if raw.startswith('"') else ""
+    except ValueError:
+        return ""
+    return " ".join(name.split())[:64] if isinstance(name, str) else ""
+
+
+def machine_facts(facts: dict[str, str]) -> dict[str, Any]:
+    """``MACHINE_FACTS_SCRIPT``'s lines as the computer keeps them, leaving out
+    any the machine did not answer. The model is the drawing's, kept apart."""
+    out: dict[str, Any] = {}
+    for key in ("distro", "arch", "cpu"):
+        value = " ".join(facts.get(key, "").split())[:80]
+        # A virtual machine's lscpu names its processor "-".
+        if re.search(r"[0-9A-Za-z]", value) and value != "macOS":
+            out[key] = value
+    for key, name in (("cores", "cores"), ("memory", "memory_bytes")):
+        value = facts.get(key, "").strip()
+        if value.isdigit() and int(value) > 0:
+            out[name] = int(value)
+    return out
+
+
+def read_machine(stdout: str) -> tuple[str, dict[str, Any]]:
+    """``MACHINE_FACTS_SCRIPT``'s output: the Mac's model name (empty
+    elsewhere) and the facts ``machine_facts`` keeps."""
+    facts: dict[str, str] = {}
+    for line in stdout.splitlines():
+        key, sep, value = line.partition("=")
+        if sep:
+            facts[key] = value
+    return _mac_model(facts.get("model", "")), machine_facts(facts)
+
+
 def _probe_result(
     line: str,
     fingerprint: str,
@@ -480,6 +621,7 @@ def _probe_result(
             "Turning requiretty off for the account lifts it."
         )
     uid = facts.get("uid", "")
+    read = machine_facts(facts)
     return SSHProbe(
         host_key=line,
         fingerprint=fingerprint,
@@ -495,6 +637,10 @@ def _probe_result(
         problems=problems,
         hostname=facts.get("hostname", ""),
         helper=helper,
+        model=_mac_model(facts.get("model", "")),
+        cpu=read.get("cpu", ""),
+        cores=read.get("cores"),
+        memory_bytes=read.get("memory_bytes"),
     )
 
 

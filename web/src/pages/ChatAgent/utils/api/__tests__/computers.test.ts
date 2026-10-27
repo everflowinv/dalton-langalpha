@@ -218,7 +218,29 @@ describe('deleteComputer', () => {
     mockDelete.mockResolvedValueOnce({ data: body, status: 200, headers: {} });
     await expect(deleteComputer('c1', { removeKey })).resolves.toEqual(body);
     expect(mockDelete.mock.calls[0][0]).toBe('/api/v1/computers/c1');
-    expect(mockDelete.mock.calls[0][1]).toMatchObject({ params: { remove_key: removeKey } });
+    expect(String(mockDelete.mock.calls[0][1].params)).toBe(`remove_key=${removeKey}`);
+  });
+
+  it('names each workspace to delete in the body and the query, and waits out their backups', async () => {
+    const body = { key: null, workspaces_deleted: ['w1'] };
+    mockDelete.mockResolvedValueOnce({ data: body, status: 200, headers: {} });
+    await expect(
+      deleteComputer('c1', { removeKey: false, deleteWorkspaces: ['w1', 'w2'], deleteFiles: true }),
+    ).resolves.toEqual(body);
+    const opts = mockDelete.mock.calls[0][1];
+    // The query too, for a backend from before the body or a proxy that drops it.
+    expect(String(opts.params)).toBe('remove_key=false&delete_files=true&delete_workspaces=w1&delete_workspaces=w2');
+    expect(opts.data).toEqual({ delete_workspaces: ['w1', 'w2'] });
+    expect(opts.timeout).toBe(600000);
+  });
+
+  it('keeps a full computer\'s workspaces out of the query, which they would overflow', async () => {
+    mockDelete.mockResolvedValueOnce({ data: { key: null }, status: 200, headers: {} });
+    const ids = Array.from({ length: 31 }, (_, i) => `00000000-0000-0000-0000-${String(i).padStart(12, '0')}`);
+    await deleteComputer('c1', { removeKey: false, deleteWorkspaces: ids });
+    const opts = mockDelete.mock.calls[0][1];
+    expect(String(opts.params)).toBe('remove_key=false');
+    expect(opts.data).toEqual({ delete_workspaces: ids });
   });
 
   it('refuses an empty id rather than deleting a route with a hole in it', async () => {

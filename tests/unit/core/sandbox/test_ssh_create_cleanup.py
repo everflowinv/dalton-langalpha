@@ -148,9 +148,11 @@ def test_two_computers_cannot_both_take_a_root(tmp_path, at_once):
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell")
-@pytest.mark.parametrize("reclaim,exit_code", [((), 10), (("c1",), 0)])
+@pytest.mark.parametrize(
+    "reclaim,checked", [((), (10, "c1")), (("c1",), (0, ""))]
+)
 def test_the_create_probe_clears_only_a_removed_computers_mark(
-    tmp_path, reclaim, exit_code
+    tmp_path, reclaim, checked
 ):
     """A removal that never reached the machine left c1's folder and mark,
     which would refuse the folder to every new computer."""
@@ -170,7 +172,7 @@ def test_the_create_probe_clears_only_a_removed_computers_mark(
     link = SimpleNamespace(run=run)
     assert (
         asyncio.run(_check_root(link, root, home=home, reclaim=reclaim, timeout=30))
-        == exit_code
+        == checked
     )
     assert (tmp_path / ".langalpha" / "computers" / "c1").exists() is not bool(reclaim)
 

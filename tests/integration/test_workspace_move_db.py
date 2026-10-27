@@ -9,6 +9,7 @@ the database rather than string-matched mocks.
 import asyncio
 import json
 import uuid
+from datetime import UTC, datetime
 from typing import Optional
 
 import pytest
@@ -16,6 +17,7 @@ import pytest
 from src.server.database import workspace as workspaces
 from src.server.database.computer import create_computer, get_computer
 from src.server.database.conversation.threads_write import create_thread
+from src.server.database.runs import command_runs
 from src.server.database.runs.lifecycle import start_run
 from src.server.database.runs.subagent_runs import start_task_run
 from src.server.database.sql_fences import MOVE_STALE_SECONDS
@@ -539,6 +541,62 @@ async def test_staging_waits_out_every_run_on_the_source(seed_user, seed_respons
         )
         is None
     )
+
+
+async def _command_on(user_id, workspace_id, computer_id) -> str:
+    """A command handed off from a turn on ``workspace_id`` that has ended."""
+    thread_id = str(uuid.uuid4())
+    await create_thread(thread_id, workspace_id, "completed")
+    command_id = "bg-" + uuid.uuid4().hex[:12]
+    await command_runs.record_handoff(
+        command_id=command_id,
+        thread_id=thread_id,
+        user_id=user_id,
+        workspace_id=workspace_id,
+        computer_id=computer_id,
+        run_id=None,
+        tool_call_id="toolu_1",
+        tool="Bash",
+        description="",
+        command_preview="python serve.py",
+        log_path="l",
+        job_ref={
+            "command_id": command_id, "state_dir": "/s", "log_path": "/l",
+            "trace_path": "/t", "log_relpath": "l",
+        },
+        started_at=datetime.now(UTC),
+    )
+    return command_id
+
+
+async def test_a_command_running_on_the_source_refuses_the_move_until_it_ends(seed_user):
+    """A handed-off command reaches every folder on its computer as a turn's
+    code does, and outlives every turn."""
+    user_id = seed_user["user_id"]
+    primary, second = await _machines(user_id)
+    workspace_id = await _workspace(user_id, "Research", primary)
+    sibling = await _workspace(user_id, "Sibling", primary)
+    move_id, runner = await _backing_up(user_id, workspace_id, second)
+    command_id = await _command_on(user_id, sibling, primary)
+
+    with pytest.raises(MoveRefused) as refused:
+        await stage_workspace_move(
+            move_id, runner, source_folder="Research", leftovers_path="away"
+        )
+    assert refused.value.code == "command_running"
+    await cancel_workspace_move(workspace_id, user_id)
+    await _refused(
+        "command_running", user_id=user_id, workspace_id=workspace_id, target_computer_id=second
+    )
+
+    ended = await command_runs.finalize(
+        {"command_id": command_id, "stopped_by": None}, command_runs.Outcome("stopped")
+    )
+    assert ended is not None
+    move = await claim_workspace_move(
+        user_id=user_id, workspace_id=workspace_id, target_computer_id=second
+    )
+    assert move["phase"] == "preparing"
 
 
 async def test_a_target_in_error_since_the_claim_takes_no_commit(seed_user, test_db_pool):

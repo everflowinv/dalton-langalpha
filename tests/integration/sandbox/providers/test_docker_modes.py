@@ -77,9 +77,9 @@ class TestTarMode:
         downloaded = await runtime.download_file(dest)
         assert downloaded == content
 
-    async def test_code_run_basic(self, runtime: DockerRuntime):
-        """code_run should execute Python and return stdout."""
-        result = await runtime.code_run("print('hello from docker')")
+    async def test_python_exec_basic(self, runtime: DockerRuntime):
+        """exec should run Python and return stdout."""
+        result = await runtime.exec("python3 -c \"print('hello from docker')\"")
         assert result.exit_code == 0
         assert "hello from docker" in result.stdout
 
@@ -156,86 +156,12 @@ class TestBindMountMode:
         assert result.exit_code == 0
         assert "I am visible" in result.stdout
 
-    async def test_code_run_in_bind_mode(self, runtime_and_dir):
-        """code_run should work in bind-mount mode."""
+    async def test_python_exec_in_bind_mode(self, runtime_and_dir):
+        """exec should run Python in bind-mount mode."""
         runtime, _ = runtime_and_dir
-        result = await runtime.code_run("print(2 + 2)")
+        result = await runtime.exec("python3 -c 'print(2 + 2)'")
         assert result.exit_code == 0
         assert "4" in result.stdout
-
-
-# ---------------------------------------------------------------------------
-# Chart capture integration
-# ---------------------------------------------------------------------------
-
-
-class TestChartCapture:
-    """Test matplotlib chart capture in Docker containers.
-
-    Requires the sandbox image to have matplotlib installed.
-    """
-
-    @pytest_asyncio.fixture(scope="class", loop_scope="class")
-    async def runtime(self):
-        provider = DockerProvider(DockerConfig(
-            image=os.environ.get("DOCKER_SANDBOX_IMAGE", "langalpha-sandbox:latest"),
-            dev_mode=False,
-        ))
-        rt = await provider.create()
-        yield rt
-        try:
-            await rt.delete()
-        except Exception:
-            pass
-        await provider.close()
-
-    async def test_chart_capture_produces_artifact(self, runtime: DockerRuntime):
-        """code_run with plt.show() should produce a chart artifact."""
-        code = """\
-import matplotlib.pyplot as plt
-plt.figure()
-plt.plot([1, 2, 3], [1, 4, 9])
-plt.title("Test Chart")
-plt.show()
-print("done")
-"""
-        result = await runtime.code_run(code)
-        assert result.exit_code == 0
-        assert "done" in result.stdout
-        assert len(result.artifacts) == 1
-        assert result.artifacts[0].type == "image/png"
-        assert result.artifacts[0].name == "chart_1.png"
-        # Artifact data should be non-empty base64
-        assert len(result.artifacts[0].data) > 100
-
-    async def test_multiple_charts(self, runtime: DockerRuntime):
-        """Multiple plt.show() calls should produce multiple artifacts."""
-        code = """\
-import matplotlib.pyplot as plt
-
-plt.figure()
-plt.plot([1, 2], [1, 2])
-plt.show()
-
-plt.figure()
-plt.bar([1, 2], [3, 4])
-plt.show()
-
-print("two charts")
-"""
-        result = await runtime.code_run(code)
-        assert result.exit_code == 0
-        assert "two charts" in result.stdout
-        assert len(result.artifacts) == 2
-        assert result.artifacts[0].name == "chart_1.png"
-        assert result.artifacts[1].name == "chart_2.png"
-
-    async def test_no_matplotlib_no_crash(self, runtime: DockerRuntime):
-        """Code that does not use matplotlib should work fine."""
-        result = await runtime.code_run("print('no charts here')")
-        assert result.exit_code == 0
-        assert "no charts here" in result.stdout
-        assert result.artifacts == []
 
 
 # ---------------------------------------------------------------------------
