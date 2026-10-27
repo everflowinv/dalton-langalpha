@@ -323,11 +323,13 @@ def create_knowledge_tools(filesystem_backend: Any = None) -> list[BaseTool]:
                     "verdict 已入库、agenda 未更新，按以下两步补救"
                     "（不要重复调用 knowledge_append_verdict，会写第二条 verdict）：\n"
                     f'1. 读当前版本：knowledge_read({ws_arg}doc="agenda")，'
-                    "取返回 JSON 里的 version（如 3）；\n"
+                    "取返回 JSON 里的 latest_version_no（最新版本，含校验失败的行——"
+                    "不要用 version，那是最新有效版本，用它必然 version_conflict）；\n"
                     f'2. 带 base_version 重试：knowledge_update({ws_arg}doc="agenda", '
-                    "ops=[…按 detail 里的期望结构…], base_version=<第 1 步读到的 version>, "
+                    "ops=[…按 detail 里的期望结构…], "
+                    "base_version=<第 1 步读到的 latest_version_no>, "
                     f'reason="补写 verdict {verdict_id} 的 agenda 更新")。'
-                    "\n第 1 步返回没有 version（agenda 尚不存在）时："
+                    "\n返回的 latest_version_no 为 null（库里没有任何 agenda 行）时："
                     'ops 用 [{"op":"create","value":{…}}]，base_version=null。'
                 )
                 return json.dumps(
@@ -358,7 +360,7 @@ def create_knowledge_tools(filesystem_backend: Any = None) -> list[BaseTool]:
             limit: Maximum number of verdicts to return when doc is "verdicts" or "all" (default 20).
 
         Returns:
-            JSON string with the requested knowledge document(s) and/or verdicts.
+            JSON string with the requested knowledge document(s) and/or verdicts. 单文档时带 latest_version_no（最新版本号，含校验失败的行；无任何行为 null）——做 knowledge_update 时用它作 base_version（version 是最新有效版本号，最新行无效时用它会 version_conflict）。
         """
         user_id, cfg_workspace_id, _, _ = _extract_run_identity(config)
         target_ws_id = (str(workspace_id).strip() if workspace_id else "") or (
@@ -383,12 +385,21 @@ def create_knowledge_tools(filesystem_backend: Any = None) -> list[BaseTool]:
 
         if cleaned_doc in DOC_KEYS:
             row = await db_knowledge.latest_valid_version(target_ws_id, cleaned_doc)
+            # latest_version_no is the LATEST row's number, valid or not — the
+            # exact value apply_update validates base_version against. It is
+            # the number to retry knowledge_update with when the newest write
+            # was rejected (invalid), where `version` (latest VALID) would
+            # collide.
+            latest_row = await db_knowledge.latest_version(target_ws_id, cleaned_doc)
             return json.dumps(
                 {
                     "ok": True,
                     "workspace_id": target_ws_id,
                     "doc": cleaned_doc,
                     "version": row.get("version_no") if row else None,
+                    "latest_version_no": (
+                        latest_row.get("version_no") if latest_row else None
+                    ),
                     "content": row.get("content") if row else None,
                 },
                 ensure_ascii=False,

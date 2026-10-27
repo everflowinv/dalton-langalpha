@@ -149,8 +149,9 @@ async def test_partial_success_returns_verdict_saved_and_recovery(
     # would only hit version_conflict and fail again.
     assert 'knowledge_read(workspace_id="ws-1", doc="agenda")' in recovery
     assert 'knowledge_update(workspace_id="ws-1", doc="agenda"' in recovery
-    assert "base_version=<第 1 步读到的 version>" in recovery
-    # No agenda yet: the create branch, with base_version=null.
+    assert "base_version=<第 1 步读到的 latest_version_no>" in recovery
+    # No agenda rows at all: the create branch, with base_version=null.
+    assert "返回的 latest_version_no 为 null" in recovery
     assert '"op":"create"' in recovery and "base_version=null" in recovery
     assert "不要重复调用 knowledge_append_verdict" in recovery
     assert "ops 校验失败" in payload["detail"]
@@ -222,3 +223,155 @@ async def test_partial_success_recovery_omits_workspace_id_for_own_workspace(
     assert 'knowledge_read(doc="agenda")' in recovery
     assert 'knowledge_update(doc="agenda"' in recovery
     assert "workspace_id=" not in recovery
+
+
+# --- latest_version_no: the retry number is the LATEST row, valid or not -----
+
+
+def _version_row(no: int, *, valid: bool) -> dict:
+    return {"version_no": no, "content": {}, "schema_valid": valid, "reason": "r"}
+
+
+def _patch_read_versions(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    latest_valid: dict | None,
+    latest: dict | None,
+) -> None:
+    import src.dalton.database.knowledge as db_knowledge
+
+    monkeypatch.setattr(
+        kt_mod,
+        "verify_workspace_access",
+        create_autospec(kt_mod.verify_workspace_access, return_value={"workspace_id": "ws-1"}),
+    )
+    monkeypatch.setattr(
+        db_knowledge,
+        "latest_valid_version",
+        create_autospec(db_knowledge.latest_valid_version, return_value=latest_valid),
+    )
+    monkeypatch.setattr(
+        db_knowledge,
+        "latest_version",
+        create_autospec(db_knowledge.latest_version, return_value=latest),
+    )
+
+
+async def _read_agenda() -> dict:
+    tools = create_knowledge_tools(None)
+    reader = {t.name: t for t in tools}["knowledge_read"]
+    res = await reader.ainvoke(
+        {
+            "name": "knowledge_read",
+            "id": "tc-read-agenda",
+            "type": "tool_call",
+            "args": {"workspace_id": "ws-1", "doc": "agenda"},
+        },
+        config={"configurable": {"user_id": "u-1", "workspace_id": "ws-1"}},
+    )
+    return json.loads(res.content if hasattr(res, "content") else str(res))
+
+
+@pytest.mark.asyncio
+async def test_latest_version_no_is_the_latest_row_even_when_invalid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Newest write was rejected (invalid v4), v3 is the latest VALID row:
+    latest_version_no reports 4 — the number apply_update checks base_version
+    against — while `version` keeps reporting 3 for its existing callers."""
+    _patch_read_versions(
+        monkeypatch,
+        latest_valid=_version_row(3, valid=True),
+        latest=_version_row(4, valid=False),
+    )
+    payload = await _read_agenda()
+    assert payload["version"] == 3
+    assert payload["latest_version_no"] == 4
+
+
+@pytest.mark.asyncio
+async def test_latest_version_no_non_null_with_only_invalid_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only an invalid row exists: `version` is null (no valid row) but
+    latest_version_no names it — the create branch must NOT be taken."""
+    _patch_read_versions(
+        monkeypatch,
+        latest_valid=None,
+        latest=_version_row(2, valid=False),
+    )
+    payload = await _read_agenda()
+    assert payload["version"] is None
+    assert payload["latest_version_no"] == 2
+
+
+@pytest.mark.asyncio
+async def test_latest_version_no_null_with_no_rows_at_all(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No agenda row exists at all: latest_version_no is null → the recovery's
+    create branch (op='create', base_version=null)."""
+    _patch_read_versions(monkeypatch, latest_valid=None, latest=None)
+    payload = await _read_agenda()
+    assert payload["version"] is None
+    assert payload["latest_version_no"] is None
+
+
+@pytest.mark.asyncio
+async def test_retry_with_latest_version_no_avoids_version_conflict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Following the fixed guidance end to end: with an INVALID latest row v4,
+    base_version=4 (latest_version_no) passes apply_update's conflict check —
+    the old number (3, the latest VALID) is what collides."""
+    import src.dalton.database.knowledge as db_knowledge
+    from src.dalton.knowledge import service
+
+    monkeypatch.setattr(
+        service,
+        "verify_workspace_access",
+        create_autospec(service.verify_workspace_access, return_value={"workspace_id": "ws-1"}),
+    )
+    invalid_latest = _version_row(4, valid=False)
+    monkeypatch.setattr(
+        db_knowledge,
+        "latest_version",
+        create_autospec(db_knowledge.latest_version, return_value=invalid_latest),
+    )
+    # The invalid latest row makes apply_update re-read the latest VALID row
+    # (for the hard invariants) — stub that query as well.
+    monkeypatch.setattr(
+        db_knowledge,
+        "latest_valid_version",
+        create_autospec(
+            db_knowledge.latest_valid_version,
+            return_value=_version_row(3, valid=True),
+        ),
+    )
+    monkeypatch.setattr(
+        db_knowledge,
+        "insert_version",
+        create_autospec(
+            db_knowledge.insert_version,
+            return_value={**invalid_latest, "version_no": 5, "knowledge_version_id": "kv-5"},
+        ),
+    )
+
+    async def _update(base_version: int | None) -> dict:
+        return await service.apply_update(
+            user_id="u-1",
+            workspace_id="ws-1",
+            doc_key="agenda",
+            ops=[{"op": "set", "path": "/watch/x", "value": 1}],
+            reason="补写 verdict 的 agenda 更新",
+            base_version=base_version,
+        )
+
+    # The OLD guidance's number (latest VALID, 3) collides with the latest row.
+    old_way = await _update(3)
+    assert old_way.get("error") == "version_conflict"
+    # The fixed guidance's number (latest_version_no, 4) does not: the update
+    # proceeds past the conflict check (any later problem is a schema matter,
+    # never version_conflict).
+    new_way = await _update(4)
+    assert new_way.get("error") != "version_conflict"
