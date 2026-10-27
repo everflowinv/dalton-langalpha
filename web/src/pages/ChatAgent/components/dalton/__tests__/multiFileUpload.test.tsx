@@ -325,6 +325,53 @@ describe('useFileUpload — workspace switch / unmount guard', () => {
     expect(refreshB).toHaveBeenCalledTimes(1);
   });
 
+  it('a cancel that lands after a switch leaves the new workspace queue alone', async () => {
+    // A's upload ignores its signal until told to fail (a request waiting on
+    // a token refresh), so the cancel only lands after the switch.
+    const settlers: Array<{ ok: () => void; fail: () => void }> = [];
+    mockUpload.mockImplementation(() => new Promise<{ path: string }>((resolve, reject) => {
+      settlers.push({
+        ok: () => resolve({ path: 'uploaded' }),
+        fail: () => reject(Object.assign(new Error('canceled'), { name: 'CanceledError' })),
+      });
+    }));
+    const refreshA = vi.fn();
+    const refreshB = vi.fn();
+    const { result, rerender } = renderUploadHook({ ws: 'ws-A', refresh: refreshA });
+
+    act(() => {
+      result.current.handleDrop(dropEvent([makeFile('a1.txt')]) as React.DragEvent);
+    });
+    act(() => {
+      result.current.cancelUpload();
+    });
+    rerender({ ws: 'ws-B', refresh: refreshB });
+    act(() => {
+      result.current.handleDrop(dropEvent([makeFile('b1.txt'), makeFile('b2.txt')]) as React.DragEvent);
+    });
+    expect(result.current.uploadStatus).toMatchObject({ current: 1, total: 2, fileName: 'b1.txt' });
+
+    // A's cancel lands now: B's queue and progress stay.
+    await act(async () => {
+      settlers[0].fail();
+      await settle();
+    });
+    expect(result.current.uploadStatus).toMatchObject({ current: 1, total: 2, fileName: 'b1.txt' });
+
+    await act(async () => {
+      settlers[1].ok();
+      await settle();
+    });
+    expect(mockUpload).toHaveBeenNthCalledWith(3, 'ws-B', expect.any(File), expect.anything());
+    await act(async () => {
+      settlers[2].ok();
+      await settle();
+    });
+    expect(result.current.uploadStatus).toBeNull();
+    expect(refreshB).toHaveBeenCalledTimes(1);
+    expect(refreshA).not.toHaveBeenCalled();
+  });
+
   it('unmounting mid-upload: queued files dropped, the landed file still refreshes its own list', async () => {
     let release: (() => void) | null = null;
     mockUpload.mockImplementation(() => new Promise<{ path: string }>((resolve) => {

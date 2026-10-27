@@ -143,7 +143,14 @@ export function useFileUpload({ workspaceId, onRefreshFiles }: {
           landed = true;
         } catch (err: unknown) {
           if (ctrl.signal.aborted) {
-            queueRef.current = [];
+            // DALTON-HOOK(multi-file-upload): a cancel that lands after a
+            // workspace switch belongs to the stranded loop; the queue and the
+            // panel are the new workspace's now.
+            if (runGuardRef.current !== guard) {
+              abandoned = true;
+            } else {
+              queueRef.current = [];
+            }
             break;
           }
           console.error('[FilePanel] Upload failed:', err);
