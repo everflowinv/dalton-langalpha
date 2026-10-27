@@ -366,20 +366,22 @@ def _yf_covers_start(
     except ValueError:
         return True
     if intraday:
+        # DALTON-HOOK(market-data-fallback): within the start's own session
+        # the bar clock matters too: a first bar at 14:00 does not cover a
+        # 09:30 request even though the dates match. The deadline — the start
+        # anchored to the next open when it sits off-hours (past the close,
+        # a weekend, a holiday), plus one interval — subsumes the day check,
+        # so it decides first; the day-level check alone cannot see that an
+        # off-hours start belongs to the *next* session's first bar. Only
+        # when the deadline cannot be computed (no venue calendar,
+        # unparseable timestamps) does the day-granular verdict stand.
+        deadline_ms = _yf_start_deadline_ms(display, s, interval)
+        first_ms = _yf_parse_exchange_bound_ms(first_date, display, is_end=False)
+        if deadline_ms is not None and first_ms is not None:
+            return first_ms <= deadline_ms
         expected = _yf_expected_session_day(display, start_day)
-        if expected is not None:
-            if first_day > expected:
-                return False
-            # DALTON-HOOK(market-data-fallback): within the start's own session
-            # the bar clock matters too: a first bar at 14:00 does not cover a
-            # 09:30 request even though the dates match. The deadline is the
-            # start (rolled to the next open when off-hours) plus one interval;
-            # without a venue calendar the day-granular verdict stands.
-            deadline_ms = _yf_start_deadline_ms(display, s, interval)
-            first_ms = _yf_parse_exchange_bound_ms(first_date, display, is_end=False)
-            if deadline_ms is not None and first_ms is not None:
-                return first_ms <= deadline_ms
-            return True
+        if expected is not None and first_day > expected:
+            return False
     return (first_day - start_day).days <= 4
 
 

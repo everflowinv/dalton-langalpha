@@ -470,6 +470,25 @@ def _yf_fiscal_period(
     return f"Q{quarter}", str(fiscal_year)
 
 
+def _yf_column_date(col: Any) -> str:
+    """A statement column's period-end date string (``2026-07-31``)."""
+    return col.strftime("%Y-%m-%d") if hasattr(col, "strftime") else str(col)[:10]
+
+
+def _yf_stmt_off_month_end(df: Any) -> bool:
+    """Whether any period-end column of a statement DataFrame is off a month-end."""
+    if df is None or getattr(df, "empty", True):
+        return False
+    for col in df.columns:
+        try:
+            end = date.fromisoformat(_yf_column_date(col))
+        except ValueError:
+            continue
+        if not _yf_month_end(end):
+            return True
+    return False
+
+
 def _yf_serialize_statement(
     df: Any,
     stmt_kind: str,
@@ -487,8 +506,7 @@ def _yf_serialize_statement(
     field_map = _YF_FMP_STATEMENT_FIELDS.get(stmt_kind, {})
     col_pairs: list[tuple[str, Any]] = []
     for col in df.columns:
-        date_str = col.strftime("%Y-%m-%d") if hasattr(col, "strftime") else str(col)[:10]
-        col_pairs.append((date_str, col))
+        col_pairs.append((_yf_column_date(col), col))
     col_pairs.sort(key=lambda pair: pair[0], reverse=True)
     if limit is not None and limit > 0:
         col_pairs = col_pairs[:limit]
@@ -544,6 +562,18 @@ def _yf_serialize_statement(
     return records
 
 
+_YF_STATEMENT_ATTRS: dict[str, tuple[str, str]] = {
+    "income": ("quarterly_income_stmt", "income_stmt"),
+    "balance": ("quarterly_balance_sheet", "balance_sheet"),
+    "cash": ("quarterly_cashflow", "cashflow"),
+}
+_YF_ALL_KEYS: dict[str, str] = {
+    "income": "income_statement",
+    "balance": "balance_sheet",
+    "cash": "cash_flow",
+}
+
+
 def _yf_statements(
     symbol: str,
     statement_type: str,
@@ -578,48 +608,54 @@ def _yf_statements(
     if not isinstance(financial_currency, str) or not financial_currency:
         financial_currency = None
     fy_end_date = _yf_fiscal_year_end(info)
-    # A fiscal year end off a month-end is the 52/53-week signature: no column
-    # of such an issuer can be month-labeled, so the date reaches the serializer
-    # as unknown rather than half the columns guessing.
-    week_based = fy_end_date is not None and not _yf_month_end(fy_end_date)
-
-    def _pick(stmt_kind: str, quarterly_df_attr: str, annual_df_attr: str) -> list[dict[str, Any]]:
-        df = getattr(ticker, quarterly_df_attr) if quarterly else getattr(ticker, annual_df_attr)
-        return _yf_serialize_statement(
-            df,
-            stmt_kind,
-            symbol=disp,
-            currency=financial_currency,
-            period=period,
-            limit=limit,
-            fy_end_date=None if week_based else fy_end_date,
-        )
+    if statement_type in _YF_STATEMENT_ATTRS:
+        stmt_kinds = [statement_type]
+    else:  # "all"
+        stmt_kinds = list(_YF_STATEMENT_ATTRS)
 
     try:
-        if statement_type == "income":
-            data: list[dict[str, Any]] | dict[str, list[dict[str, Any]]] = _pick(
-                "income", "quarterly_income_stmt", "income_stmt"
+        fetched = [
+            (
+                kind,
+                getattr(ticker, _YF_STATEMENT_ATTRS[kind][0 if quarterly else 1]),
             )
-        elif statement_type == "balance":
-            data = _pick("balance", "quarterly_balance_sheet", "balance_sheet")
-        elif statement_type == "cash":
-            data = _pick("cash", "quarterly_cashflow", "cashflow")
-        else:  # "all"
-            data = {
-                "income_statement": _pick("income", "quarterly_income_stmt", "income_stmt"),
-                "balance_sheet": _pick("balance", "quarterly_balance_sheet", "balance_sheet"),
-                "cash_flow": _pick("cash", "quarterly_cashflow", "cashflow"),
-            }
+            for kind in stmt_kinds
+        ]
+        # DALTON-HOOK(market-data-fallback): a fiscal year end off a
+        # month-end — or any period-end column off one, on any of the fetched
+        # statements — is the 52/53-week signature. Judged on the raw
+        # DataFrames before serialization and the ``limit`` slice, so no
+        # column can carry a month-derived label its drifting calendar does
+        # not support: a month-end year end alone is not acquittal, and the
+        # serializer reaches it as unknown rather than half the columns
+        # guessing.
+        week_based = fy_end_date is not None and (
+            not _yf_month_end(fy_end_date)
+            or any(_yf_stmt_off_month_end(df) for _, df in fetched)
+        )
+        records = {
+            kind: _yf_serialize_statement(
+                df,
+                kind,
+                symbol=disp,
+                currency=financial_currency,
+                period=period,
+                limit=limit,
+                fy_end_date=None if week_based else fy_end_date,
+            )
+            for kind, df in fetched
+        }
     except Exception:  # noqa: BLE001 — soft miss, the 402 error answers
         logger.warning("yfinance statements failed for %s", symbol, exc_info=True)
         return None, False
+    if len(records) == 1:
+        data: list[dict[str, Any]] | dict[str, list[dict[str, Any]]] = next(
+            iter(records.values())
+        )
+    else:
+        data = {_YF_ALL_KEYS[kind]: records[kind] for kind in stmt_kinds}
     if not populated(data):
         return None, False
-    if fy_end_date is not None and _yf_any_period_off_month_end(data):
-        # Month-end year end but a period end off a month-end: still a
-        # week-based calendar, just one whose year end happened to land on a
-        # month-end this year.
-        week_based = True
     return data, week_based
 
 
@@ -655,24 +691,6 @@ def _yf_periods_unknown(data: Any) -> bool:
             isinstance(r, dict) and r.get("period") is None for r in records
         ):
             return True
-    return False
-
-
-def _yf_any_period_off_month_end(data: Any) -> bool:
-    """Whether any served record's period end is off a calendar month-end."""
-    groups = data.values() if isinstance(data, dict) else [data]
-    for records in groups:
-        if not isinstance(records, list):
-            continue
-        for r in records:
-            if not isinstance(r, dict):
-                continue
-            try:
-                end = date.fromisoformat(str(r.get("date") or "")[:10])
-            except ValueError:
-                continue
-            if not _yf_month_end(end):
-                return True
     return False
 
 

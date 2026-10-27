@@ -347,6 +347,49 @@ class TestYfCoversStart:
             rows, "2026-10-24 10:00", intraday=True, display="AAPL", interval="5min"
         )
 
+    def test_an_after_hours_friday_start_is_covered_by_mondays_open_bar(self):
+        # 2026-10-23 is a Friday; 20:00 sits past the 16:00 close, so the
+        # start belongs to Monday's open. The day-level check alone read
+        # Monday's first bar as late (Monday > Friday) and burned FMP quota
+        # re-asking a served window.
+        import plugins.langalpha_market_data.price_data_mcp_server as mod
+
+        rows = [{"date": "2026-10-26 09:30:00"}]
+        assert mod._yf_covers_start(
+            rows, "2026-10-23 20:00", intraday=True, display="AAPL", interval="5min"
+        )
+
+    def test_a_post_close_start_is_covered_by_the_next_days_open_bar(self):
+        # 17:00 is past the 16:00 close of 2026-10-26 (a Monday); the next
+        # session's open bar on the 27th covers it.
+        import plugins.langalpha_market_data.price_data_mcp_server as mod
+
+        rows = [{"date": "2026-10-27 09:30:00"}]
+        assert mod._yf_covers_start(
+            rows, "2026-10-26 17:00", intraday=True, display="AAPL", interval="5min"
+        )
+
+    def test_a_start_after_an_early_close_is_covered_by_the_next_session(self):
+        # 2026-11-27 (the Friday after Thanksgiving) closes early at 13:00;
+        # a 14:00 start that day is past the close, so Monday 11-30's open
+        # bar covers it.
+        import plugins.langalpha_market_data.price_data_mcp_server as mod
+
+        rows = [{"date": "2026-11-30 09:30:00"}]
+        assert mod._yf_covers_start(
+            rows, "2026-11-27 14:00", intraday=True, display="AAPL", interval="5min"
+        )
+
+    def test_an_after_hours_friday_start_with_a_tuesday_first_bar_is_a_gap(self):
+        # The deadline for a Friday-20:00 start is Monday's open plus one
+        # interval, so a first bar on Tuesday is a real gap, not slack.
+        import plugins.langalpha_market_data.price_data_mcp_server as mod
+
+        rows = [{"date": "2026-10-27 09:30:00"}]
+        assert not mod._yf_covers_start(
+            rows, "2026-10-23 20:00", intraday=True, display="AAPL", interval="5min"
+        )
+
     def test_an_afternoon_first_bar_does_not_cover_a_morning_start(self):
         # Date-only comparison called a day whose first bar is 14:00 covered
         # for a 09:30 request; the bar clock must matter inside the session.
@@ -690,6 +733,137 @@ class TestStatementsFiscalShape:
         assert all(r["calendarYear"] == r["date"][:4] for r in result["data"])
         assert "周制" in result["note"]
         assert "period / fiscalYear 未知" in result["note"]
+
+    @pytest.mark.asyncio
+    async def test_a_month_end_year_end_with_off_month_end_quarters_is_week_based(self):
+        # lastFiscalYearEnd 2026-01-31 is itself a month-end, but the quarter
+        # ending 2026-05-01 is not: a 52/53-week calendar whose year end
+        # happened to land on a month-end. The verdict must fall before
+        # serialization, so even the month-end column (2026-07-31, which
+        # month arithmetic would label Q2 FY2027) carries no label.
+        import pandas as pd
+        import plugins.langalpha_market_data.fundamentals_mcp_server as mod
+
+        client = _fmp_client()
+        client.get_income_statement.side_effect = FMPRequestError(
+            "FMP API request failed (402)", status_code=402
+        )
+        df = pd.DataFrame(
+            {
+                "2026-07-31": [500.0],
+                "2026-05-01": [400.0],
+                "2026-01-31": [300.0],
+            },
+            index=pd.Index(["Total Revenue"]),
+        )
+        ticker_inst = create_autospec(mod._yf.Ticker, instance=True)
+        ticker_inst.quarterly_income_stmt = df
+        ticker_inst.info = {
+            "financialCurrency": "USD",
+            "lastFiscalYearEnd": _epoch(2026, 1, 31),
+        }
+        ticker_cls = create_autospec(mod._yf.Ticker, return_value=ticker_inst)
+
+        with patch(f"{_FUND_MOD}.get_fmp_client", return_value=client), \
+             patch.object(mod._yf, "Ticker", new=ticker_cls):
+            result = await mod.get_financial_statements(
+                "COST", statement_type="income", period="quarter", limit=3
+            )
+
+        assert result["source"] == "yfinance"
+        assert all(r["period"] is None and r["fiscalYear"] is None for r in result["data"])
+        assert all(r["calendarYear"] == r["date"][:4] for r in result["data"])
+        assert "周制" in result["note"]
+        assert "period / fiscalYear 未知" in result["note"]
+
+    @pytest.mark.asyncio
+    async def test_the_week_based_verdict_reads_columns_the_limit_slice_drops(self):
+        # Annual columns 2026-01-31 and 2025-01-31 are month-ends and would be
+        # labeled FY; the off-month-end 2024-01-27 is what reveals the issuer
+        # as week-based, and it is the oldest column — dropped by limit=2.
+        # The verdict has to be read off the raw DataFrame, not the served
+        # records, or the two month-end columns ship with FY labels.
+        import pandas as pd
+        import plugins.langalpha_market_data.fundamentals_mcp_server as mod
+
+        client = _fmp_client()
+        client.get_income_statement.side_effect = FMPRequestError(
+            "FMP API request failed (402)", status_code=402
+        )
+        df = pd.DataFrame(
+            {
+                "2026-01-31": [500.0],
+                "2025-01-31": [400.0],
+                "2024-01-27": [300.0],
+            },
+            index=pd.Index(["Total Revenue"]),
+        )
+        ticker_inst = create_autospec(mod._yf.Ticker, instance=True)
+        ticker_inst.income_stmt = df
+        ticker_inst.info = {
+            "financialCurrency": "USD",
+            "lastFiscalYearEnd": _epoch(2026, 1, 31),
+        }
+        ticker_cls = create_autospec(mod._yf.Ticker, return_value=ticker_inst)
+
+        with patch(f"{_FUND_MOD}.get_fmp_client", return_value=client), \
+             patch.object(mod._yf, "Ticker", new=ticker_cls):
+            result = await mod.get_financial_statements(
+                "COST", statement_type="income", period="annual", limit=2
+            )
+
+        assert result["source"] == "yfinance"
+        assert [r["date"] for r in result["data"]] == ["2026-01-31", "2025-01-31"]
+        assert all(r["period"] is None and r["fiscalYear"] is None for r in result["data"])
+        assert "周制" in result["note"]
+
+    @pytest.mark.asyncio
+    async def test_statement_type_all_judges_week_based_across_all_three_statements(self):
+        # Only the balance sheet carries an off-month-end column; the income
+        # and cash-flow columns are all month-ends. The verdict is joint, so
+        # every record of every statement is unlabeled.
+        import pandas as pd
+        import plugins.langalpha_market_data.fundamentals_mcp_server as mod
+
+        client = _fmp_client()
+        client.get_income_statement.side_effect = FMPRequestError(
+            "FMP API request failed (402)", status_code=402
+        )
+        inc_df = pd.DataFrame(
+            {"2026-07-31": [500.0], "2026-04-30": [450.0]},
+            index=pd.Index(["Total Revenue"]),
+        )
+        bal_df = pd.DataFrame(
+            {"2026-08-01": [2000.0], "2026-04-30": [1900.0]},
+            index=pd.Index(["Total Assets"]),
+        )
+        cf_df = pd.DataFrame(
+            {"2026-07-31": [120.0], "2026-04-30": [110.0]},
+            index=pd.Index(["Operating Cash Flow"]),
+        )
+        ticker_inst = create_autospec(mod._yf.Ticker, instance=True)
+        ticker_inst.quarterly_income_stmt = inc_df
+        ticker_inst.quarterly_balance_sheet = bal_df
+        ticker_inst.quarterly_cashflow = cf_df
+        ticker_inst.info = {
+            "financialCurrency": "USD",
+            "lastFiscalYearEnd": _epoch(2026, 7, 31),
+        }
+        ticker_cls = create_autospec(mod._yf.Ticker, return_value=ticker_inst)
+
+        with patch(f"{_FUND_MOD}.get_fmp_client", return_value=client), \
+             patch.object(mod._yf, "Ticker", new=ticker_cls):
+            result = await mod.get_financial_statements(
+                "COST", statement_type="all", period="quarter", limit=2
+            )
+
+        assert result["source"] == "yfinance"
+        for key in ("income_statement", "balance_sheet", "cash_flow"):
+            assert all(
+                r["period"] is None and r["fiscalYear"] is None
+                for r in result["data"][key]
+            ), key
+        assert "周制" in result["note"]
 
     @pytest.mark.asyncio
     async def test_without_fiscal_metadata_both_labels_are_none_and_noted(self):
