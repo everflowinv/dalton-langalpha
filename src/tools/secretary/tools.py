@@ -89,9 +89,19 @@ async def workspaces_list(user_id: str, tool_call_id: str) -> Command:
         if is_dalton_supabase_auth_enabled():
             from src.dalton.sharing import list_colleague_cos_workspaces
 
-            payload["colleague_workspaces"] = await list_colleague_cos_workspaces(
-                user_id
-            )
+            colleague_list = await list_colleague_cos_workspaces(user_id)
+            payload["colleague_workspaces"] = colleague_list
+            if colleague_list:
+                # Said here, where the model reads the list it is about to
+                # route by: promising a dispatch into one of these was the
+                # incident, and dispatch refuses them.
+                payload["colleague_workspaces_note"] = (
+                    "同事共享的工作区当前只能读取（list_files / read_file；rw 时可 "
+                    "write_file 写文件），delegate_to_analyst 不能向同事的工作区派发"
+                    "任务（会被拒绝）。要在同事工作区里做的事：用 manage_workspaces"
+                    '(action="create") 在用户自己名下新建工作区，再把任务派发给它的'
+                    "分析师。"
+                )
         # --- DALTON-HOOK(workspace-sharing-settings): end ---
         content = json.dumps(payload, default=str)
     except Exception as e:
@@ -462,6 +472,93 @@ async def threads_delete(
 
 
 # --- DALTON-HOOK(workspace-sharing-settings): begin ---
+def _is_home_workspace(workspace: dict) -> bool:
+    """Whether ``workspace`` is the user's Home workspace."""
+    if bool(workspace.get("is_home")):
+        return True
+    own_dir = str(workspace.get("dir_name") or "").strip()
+    own_name = str(workspace.get("name") or "").strip()
+    return own_dir == "Home" or (not own_dir and own_name == "Home")
+
+
+async def _has_subdirectory(
+    sandbox: object, work_dir: str, subdir_name: str, *, fail_open: bool
+) -> bool:
+    """True when ``<work_dir>/<subdir_name>`` already exists as a directory.
+
+    A listing failure never refuses or rewrites the write: it logs a warning
+    and answers ``fail_open`` — every caller passes True so the write proceeds
+    on the ORIGINAL path rather than telling the model to strip a prefix the
+    caller may genuinely mean."""
+    try:
+        entries = await sandbox.als_directory(work_dir)
+    except Exception as e:
+        logger.warning(
+            f"Could not list directory {work_dir} when checking subdirectory {subdir_name!r}: {e}"
+        )
+        return fail_open
+    for entry in entries or ():
+        if (
+            isinstance(entry, dict)
+            and bool(entry.get("is_dir"))
+            and str(entry.get("name") or "") == subdir_name
+        ):
+            return True
+    return False
+
+
+async def _sibling_folder_named(
+    rel_path: str, workspace: dict, sandbox: object, work_dir: str
+) -> str | None:
+    """The path's first segment when ``workspace`` is Home, the first segment
+    matches a LIVE (non-deleted) sibling workspace's folder on this computer,
+    and Home does not already contain a subdirectory of that name."""
+    if not _is_home_workspace(workspace):
+        return None
+    parts = rel_path.split("/", 1)
+    if len(parts) < 2 or not parts[0].strip() or not parts[1].strip():
+        return None
+    first = parts[0].strip()
+    computer_id = workspace.get("computer_id")
+    if not computer_id:
+        logger.warning(
+            f"Could not check sibling workspace folders for Home ({workspace.get('workspace_id')}): computer_id is empty"
+        )
+        return None
+    try:
+        from src.server.database.workspace import (
+            get_live_workspace_folders_for_computer,
+        )
+
+        live_rows = await get_live_workspace_folders_for_computer(str(computer_id))
+    except Exception as e:
+        logger.warning(
+            f"Could not read live workspace folders of computer {computer_id}: {e}"
+        )
+        return None
+    own_id = str(workspace.get("workspace_id") or "").strip()
+    own_dir = str(workspace.get("dir_name") or "Home").strip()
+    matched_sibling: str | None = None
+    for row in live_rows or ():
+        if isinstance(row, dict):
+            if own_id and str(row.get("workspace_id") or "") == own_id:
+                continue
+            folder = str(row.get("dir_name") or row.get("name") or "").strip()
+        else:
+            folder = str(row or "").strip()
+        # Exact match: the sandbox is Linux and filenames are case-sensitive,
+        # so "nvda/" in Home is an ordinary folder even beside an "NVDA"
+        # workspace — same rule as the own-prefix and subdirectory checks.
+        if folder and folder != own_dir and folder == first:
+            matched_sibling = folder
+            break
+    if matched_sibling is None:
+        return None
+    if await _has_subdirectory(sandbox, work_dir, first, fail_open=True):
+        return None
+    return matched_sibling
+
+
 async def workspace_files_list_cos(
     user_id: str,
     workspace_id: str | None,
@@ -700,8 +797,46 @@ async def workspace_file_write_cos(
         ):
             work_dir = owner_work_dir(live_ws)
             previous_dirs = previous_dir_names_of(live_ws)
+            # DALTON-HOOK(workspace-sharing-settings): keep CoS writes inside the named workspace
+            rel_path = _normalize_requested_path(path, work_dir, previous_dirs)
+            if _is_non_owner_blocked_path(rel_path):
+                return error_command(
+                    "403 Forbidden: Cannot write system, hidden, or virtual files",
+                    tool_call_id,
+                )
+            own_dir = str(live_ws.get("dir_name") or "").strip()
+            parts = rel_path.split("/", 1)
+            if (
+                own_dir
+                and len(parts) == 2
+                and parts[1].strip()
+                and parts[0].strip() == own_dir
+            ):
+                if not await _has_subdirectory(
+                    sandbox, work_dir, own_dir, fail_open=True
+                ):
+                    rest = parts[1].strip().lstrip("/")
+                    return error_command(
+                        f"路径应相对该工作区自己的文件夹，去掉开头的 `{own_dir}/`（如 '{rest}'）。",
+                        tool_call_id,
+                    )
+            sibling = await _sibling_folder_named(
+                rel_path, live_ws, sandbox, work_dir
+            )
+            if sibling is not None:
+                # The incident's shape: "DASH/..." written into Home (or any
+                # workspace but DASH) as a way to "put it in the workspace".
+                # Refuse it naming the workspace-relative path, or the write
+                # silently lands in the wrong workspace's folder.
+                return error_command(
+                    f"路径以 {sibling}/ 开头：那是同一电脑上另一个工作区的文件夹，"
+                    f"不是工作区 {ws.get('name') or workspace_id} 内的路径，写入不会"
+                    "落到目标工作区。请改用该工作区内的相对路径（如 'sources/x.md'），"
+                    "或把 workspace_id 换成那个工作区。",
+                    tool_call_id,
+                )
             normalized = await _contained_target(
-                sandbox, path, work_dir, previous_dirs
+                sandbox, rel_path, work_dir, previous_dirs
             )
             client_path = _to_client_path(sandbox, normalized, work_dir)
             if _is_non_owner_blocked_path(client_path):

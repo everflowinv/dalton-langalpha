@@ -51,6 +51,9 @@ ERROR_CODES = frozenset(
         "rate_limited",
         "upstream_error",
         "client_unavailable",
+        # DALTON-HOOK(market-data-fallback): FMP's 402 "plan does not cover
+        # this" — a class of its own, not a 4xx argument problem.
+        "plan_not_covered",
     }
 )
 
@@ -132,6 +135,15 @@ def error_from_upstream(
         code = "auth_failed"
     elif status == 429:
         code = "rate_limited"
+    elif status == 402:
+        # DALTON-HOOK(market-data-fallback): FMP's 402 is the plan, not the
+        # request — a 4xx-shaped "not covered". Left in the generic bucket the
+        # agent read it as an argument problem and retried with new limits.
+        code = "plan_not_covered"
+        detail = (
+            "FMP 套餐不覆盖该请求，改参数重试无效，请换数据源"
+            f"（{detail}）"
+        )
     elif status is not None and 400 <= status < 500:
         code = "invalid_argument"
     else:

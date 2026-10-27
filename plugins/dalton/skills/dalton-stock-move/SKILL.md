@@ -206,7 +206,7 @@ python3 .agents/skills/dalton-stock-move/scripts/move_quant.py analyze \
 
 ### 收尾门禁：汇报完成前必须过完成契约（`dalton_check_done`）
 
-- 向 PM 汇报“完成”（或静默 beta 轮次记 `NO_CHANGE` 收尾）前，必须调用 `dalton_check_done(workflow="dalton-stock-move", params={"ticker": ..., "as_of": "<异动日 YYYY-MM-DD>"})`（`as_of` 传本次异动发生的那一天，与归因笔记 `research/<异动日 YYYY-MM-DD>-stock-move.md` 的日期一致）。
+- 向 PM 汇报“完成”（或静默 beta 轮次记 `NO_CHANGE` 收尾）前，必须调用 `dalton_check_done(workflow="dalton-stock-move", params={"ticker": ..., "as_of": "<异动日 YYYY-MM-DD>"})`（`as_of` 传本次异动发生的那一天——美东交易日，与归因笔记 `research/<异动日 YYYY-MM-DD>-stock-move.md` 的日期一致；新近度按本轮运行开始时间核对）。
 - 契约要求：`research/<异动日>-stock-move.md` 归因笔记、本轮 `trigger.kind="price_move"` 的 verdict；verdict 不是 `NO_CHANGE` 时，`thesis`/`debate`/`drivers`/`management` 至少一份须有本轮 `knowledge_update` 写入的新版本，且本轮写入的 `research/push/<异动日>-stock-move.md` 须完成两轮 `check_language`。
 - `done=false` 时按 `missing` 先补齐再查（归因笔记缺失就补写、verdict 未写就 `knowledge_append_verdict`、非 `NO_CHANGE` 却没有知识更新就对受影响的文档 `knowledge_update`、非 `NO_CHANGE` 且推送稿未在本轮重写或缺语言审查轮次就补写并跑 `check_language`）；补不了的缺项只能汇报“未完成”并列出缺项与原因，不得汇报“完成”。
 

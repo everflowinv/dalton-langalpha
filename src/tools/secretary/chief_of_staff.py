@@ -65,14 +65,16 @@ async def chief_of_staff_workspaces(
 
     Use "list_files", "read_file", and "write_file" to inspect or update files in a colleague's
     shared workspace (which does not share this computer's filesystem); use "write_file" only
-    when the workspace's access is "rw".
+    when the workspace's access is "rw". You cannot delegate into a colleague's shared
+    workspace — delegate_to_analyst refuses it; to act on that work, create a workspace of
+    the user's own and hand off to its analyst.
 
     Args:
         action: "list", "create", "delete", "list_files", "read_file", or "write_file".
         name: Name for the new workspace; required for "create".
         description: What the new workspace is for; optional.
         workspace_id: Target workspace ID; required for "delete", "list_files", "read_file", and "write_file". Home cannot be deleted.
-        path: Relative directory or file path in workspace_id; optional prefix for "list_files", required for "read_file" and "write_file".
+        path: Relative directory or file path INSIDE workspace_id's own folder (sources/x.md, not DASH/sources/x.md); optional prefix for "list_files", required for "read_file" and "write_file". Workspace folders sit beside Home (../<folder>), never inside it — a path starting with a workspace folder name is refused, because it would silently land in the wrong workspace.
         content: Full UTF-8 text to write; required for "write_file" (requires "rw" access).
 
     Returns:

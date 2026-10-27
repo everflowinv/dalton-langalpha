@@ -50,7 +50,6 @@ from langchain_core.messages import (
 from langchain_core.messages.ai import OutputTokenDetails, UsageMetadata
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
 from langchain_core.tools import BaseTool
-from pydantic import PrivateAttr
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +67,27 @@ ANTIGRAVITY_DEFAULT_PROJECT = "aicode-consumers"
 _EFFORT_SUFFIXES = {"low": "LOW", "medium": "MEDIUM", "high": "HIGH"}
 
 _THOUGHT_SIGNATURES_KEY = "antigravity_thought_signatures"
+# Which functionCall each signature rode on, by call id. Its presence marks a
+# message whose signatures can be replayed exactly; one without it predates the
+# map, and its list cannot be matched to calls.
+_CALL_SIGNATURES_KEY = "antigravity_call_signatures"
+# Gemini's documented stand-in for a call it did not sign (a Claude call, a
+# call from before the map): it validates every functionCall of the current
+# turn and refuses one with no signature or with another call's.
+_SKIP_SIGNATURE = "skip_thought_signature_validator"
+
+
+class _SignatureState:
+    """The signatures of one response; never shared between calls."""
+
+    def __init__(self) -> None:
+        self.ordered: list[str] = []
+        self.by_call: dict[str, str] = {}
+
+    def kwargs(self) -> dict[str, Any]:
+        if not self.ordered:
+            return {}
+        return {_THOUGHT_SIGNATURES_KEY: list(self.ordered), _CALL_SIGNATURES_KEY: dict(self.by_call)}
 
 
 class AntigravityApiError(RuntimeError):
@@ -142,7 +162,9 @@ def _part_from_block(block: Any) -> dict | None:
     return None
 
 
-def _messages_to_gemini(messages: Sequence[BaseMessage]) -> tuple[dict | None, list[dict]]:
+def _messages_to_gemini(
+    messages: Sequence[BaseMessage], *, gemini_target: bool = False
+) -> tuple[dict | None, list[dict]]:
     """LangChain messages → (systemInstruction, contents).
 
     AIMessage tool calls become functionCall parts, ToolMessages become
@@ -209,18 +231,34 @@ def _messages_to_gemini(messages: Sequence[BaseMessage]) -> tuple[dict | None, l
 
         role = "model" if isinstance(message, AIMessage) else "user"
         parts: list[dict] = []
+        # An Anthropic-SDK message names each call twice, as a tool_use block
+        # and in tool_calls; the tool_calls loop below sends it once, signed.
+        listed_ids = {str(c.get("id")) for c in (getattr(message, "tool_calls", None) or []) if c.get("id")}
+        block_calls: list[dict] = []
         for block in _content_blocks(message):
             if isinstance(block, dict) and block.get("type") == "tool_use":
                 if block.get("id") and block.get("name"):
                     tool_call_names[str(block["id"])] = str(block["name"])
+                if str(block.get("id")) in listed_ids:
+                    continue
             part = _part_from_block(block)
             if part:
+                if "functionCall" in part:
+                    block_calls.append(part)
                 parts.append(part)
         if isinstance(message, AIMessage):
             # The endpoint validates that functionCall parts carry their
-            # thought_signature (it 400s without one); replay captured
-            # signatures in order onto the calls, leftovers as standalone.
-            signatures = list((message.additional_kwargs or {}).get(_THOUGHT_SIGNATURES_KEY, []))
+            # thought_signature (it 400s without one). A mapped message
+            # replays each call's own signature; Gemini gets the stand-in for
+            # any call not in the map, and for every call of an unmapped one,
+            # whose list may hold a text part's signature first.
+            extra = message.additional_kwargs or {}
+            by_call = extra.get(_CALL_SIGNATURES_KEY)
+            signatures = list(extra.get(_THOUGHT_SIGNATURES_KEY, []))
+            if isinstance(by_call, dict):
+                signatures = [sig for sig in signatures if sig not in by_call.values()]
+            elif gemini_target:
+                signatures = []
             for call in message.tool_calls or []:
                 call_id = call.get("id")
                 call_name = call.get("name", "")
@@ -232,9 +270,24 @@ def _messages_to_gemini(messages: Sequence[BaseMessage]) -> tuple[dict | None, l
                 part_fc: dict = {
                     "functionCall": fc_payload
                 }
-                if signatures:
+                if isinstance(by_call, dict):
+                    signature = by_call.get(str(call_id)) if call_id else None
+                    if signature:
+                        part_fc["thoughtSignature"] = signature
+                    elif gemini_target:
+                        part_fc["thoughtSignature"] = _SKIP_SIGNATURE
+                elif gemini_target:
+                    part_fc["thoughtSignature"] = _SKIP_SIGNATURE
+                elif signatures:
                     part_fc["thoughtSignature"] = signatures.pop(0)
                 parts.append(part_fc)
+            for part_fc in block_calls:
+                block_id = str(part_fc["functionCall"].get("id") or "")
+                signature = by_call.get(block_id) if isinstance(by_call, dict) else None
+                if signature:
+                    part_fc["thoughtSignature"] = signature
+                elif gemini_target:
+                    part_fc["thoughtSignature"] = _SKIP_SIGNATURE
             for signature in signatures:
                 parts.append({"thoughtSignature": signature})
         if parts:
@@ -430,9 +483,6 @@ class ChatAntigravity(BaseChatModel):
     default_headers: dict[str, str] = {}
     tools: list[dict] = []  # bound Gemini functionDeclarations
 
-    # Thought signatures observed in the current response, replayed on the
-    # next turn of this conversation (cleared at the start of every call).
-    _signatures: list[str] = PrivateAttr(default_factory=list)
 
     @property
     def _llm_type(self) -> str:
@@ -473,7 +523,9 @@ class ChatAntigravity(BaseChatModel):
         stop: Optional[Sequence[str]] = None,
         thinking_level_override: Optional[str] = None,
     ) -> dict:
-        system_instruction, contents = _messages_to_gemini(messages)
+        system_instruction, contents = _messages_to_gemini(
+            messages, gemini_target="gemini" in (self.model or "").lower()
+        )
 
         inner: dict[str, Any] = {"contents": contents}
         if system_instruction:
@@ -592,7 +644,9 @@ class ChatAntigravity(BaseChatModel):
 
     # -- chunk assembly ----------------------------------------------------
 
-    def _chunks_from_frame(self, envelope: dict) -> list[AIMessageChunk]:
+    def _chunks_from_frame(
+        self, envelope: dict, sigs: _SignatureState | None = None
+    ) -> list[AIMessageChunk]:
         """One SSE envelope → zero or more AIMessageChunks.
 
         Thought parts become ``reasoning_content`` in additional_kwargs
@@ -600,6 +654,9 @@ class ChatAntigravity(BaseChatModel):
         parts become tool_call_chunks; thoughtSignature parts are captured
         for replay on the next turn.
         """
+        # Per call, not on the client: one cached client serves concurrent
+        # turns, and a shared list mixed their signatures.
+        sigs = sigs if sigs is not None else _SignatureState()
         response = envelope.get("response") or {}
         candidates = response.get("candidates") or []
         if not candidates:
@@ -629,19 +686,27 @@ class ChatAntigravity(BaseChatModel):
                 text_parts.append(part["text"])
             elif "functionCall" in part:
                 call = part["functionCall"]
+                # Capture normalizes the id to a string: replay looks calls up
+                # by str(call_id), and a chunk with an int id fails validation.
+                call_id = (
+                    str(call["id"])
+                    if call.get("id")
+                    else f"antigravity_call_{uuid.uuid4().hex[:8]}"
+                )
+                if "thoughtSignature" in part:
+                    sigs.by_call[call_id] = part["thoughtSignature"]
                 tool_chunks.append(
                     {
                         "name": call.get("name", ""),
                         "args": json.dumps(call.get("args", {})),
-                        "id": call.get("id") or f"antigravity_call_{uuid.uuid4().hex[:8]}",
+                        "id": call_id,
                         "index": len(tool_chunks),
                         "type": "tool_call_chunk",
                     }
                 )
 
         chunks: list[AIMessageChunk] = []
-        if signatures:
-            self._signatures.extend(signatures)
+        sigs.ordered.extend(signatures)
         if reasoning_parts:
             chunks.append(
                 AIMessageChunk(
@@ -685,9 +750,7 @@ class ChatAntigravity(BaseChatModel):
             if trace_id:
                 meta["trace_id"] = trace_id
             usage = ChatAntigravity._usage_metadata(response)
-            finish_kwargs: dict[str, Any] = {}
-            if self._signatures:
-                finish_kwargs[_THOUGHT_SIGNATURES_KEY] = list(self._signatures)
+            finish_kwargs: dict[str, Any] = sigs.kwargs()
             chunks.append(
                 AIMessageChunk(
                     content="",
@@ -744,8 +807,10 @@ class ChatAntigravity(BaseChatModel):
         additional_kwargs: dict[str, Any] = {}
         if reasoning:
             additional_kwargs["reasoning_content"] = reasoning
-        if self._signatures:
-            additional_kwargs[_THOUGHT_SIGNATURES_KEY] = list(self._signatures)
+        for c in chunks:
+            if c.additional_kwargs.get(_THOUGHT_SIGNATURES_KEY):
+                additional_kwargs[_THOUGHT_SIGNATURES_KEY] = list(c.additional_kwargs[_THOUGHT_SIGNATURES_KEY])
+                additional_kwargs[_CALL_SIGNATURES_KEY] = dict(c.additional_kwargs.get(_CALL_SIGNATURES_KEY) or {})
 
         usage = None
         metadata: dict[str, Any] = {}
@@ -772,11 +837,10 @@ class ChatAntigravity(BaseChatModel):
         run_manager: CallbackManagerForLLMRun | None = None,
         **kwargs: Any,
     ) -> Iterator[ChatGenerationChunk]:
-        # R6-1: clear per-response signatures so they never accumulate across turns
-        self._signatures = []
+        sigs = _SignatureState()
         payload = self._build_payload(messages, stop=stop, thinking_level_override=kwargs.get("thinking_level"))
         for envelope in self._stream_raw(payload):
-            for chunk in self._chunks_from_frame(envelope):
+            for chunk in self._chunks_from_frame(envelope, sigs):
                 if run_manager and chunk.content:
                     run_manager.on_llm_new_token(chunk.content, chunk=chunk)
                 yield ChatGenerationChunk(message=chunk)
@@ -788,11 +852,10 @@ class ChatAntigravity(BaseChatModel):
         run_manager: AsyncCallbackManagerForLLMRun | None = None,
         **kwargs: Any,
     ) -> AsyncIterator[ChatGenerationChunk]:
-        # R6-1: clear per-response signatures so they never accumulate across turns
-        self._signatures = []
+        sigs = _SignatureState()
         payload = self._build_payload(messages, stop=stop, thinking_level_override=kwargs.get("thinking_level"))
         async for envelope in self._astream_raw(payload):
-            for chunk in self._chunks_from_frame(envelope):
+            for chunk in self._chunks_from_frame(envelope, sigs):
                 if run_manager and chunk.content:
                     await run_manager.on_llm_new_token(chunk.content, chunk=chunk)
                 yield ChatGenerationChunk(message=chunk)

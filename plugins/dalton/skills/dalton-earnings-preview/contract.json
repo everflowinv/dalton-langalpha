@@ -13,7 +13,9 @@
       "artifacts": [
         {
           "path": "drafts/{as_of}-preview-{quarter}.md",
-          "min_bytes": 300
+          "min_bytes": 300,
+          "variant_glob": "drafts/*-preview-{quarter}.md",
+          "fresh_this_run": true
         }
       ]
     },
@@ -22,7 +24,8 @@
       "artifacts": [
         {
           "path": "research/{as_of}-preview-{quarter}/predictions.json",
-          "min_bytes": 50
+          "min_bytes": 50,
+          "fresh_this_run": true
         }
       ],
       "validators": [

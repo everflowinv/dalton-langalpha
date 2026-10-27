@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import http.client
 import io
+import json
 import urllib.error
 import urllib.request
 from email.message import Message
@@ -214,9 +215,19 @@ async def test_x_search_tool_uses_x_specific_error_messages() -> None:
     }
 
     tool_fn = build_x_search_tool(wrapper=mock_wrapper)
-    content, _ = await tool_fn.coroutine(query="NVDA")
+    content, art = await tool_fn.coroutine(query="NVDA")
     assert isinstance(content, str)
-    assert content.startswith(f"{X_ANSWER_ONLY_HEADING}\n{X_UNTRUSTED_NOTICE}\n")
+    # No source links: the summary is marked no_evidence and says so up front.
+    from src.dalton.web_search.x_search import (
+        X_NO_EVIDENCE_NOTICE,
+        X_NO_EVIDENCE_TAG,
+    )
+
+    assert content.startswith(
+        f"{X_ANSWER_ONLY_HEADING} [{X_NO_EVIDENCE_TAG}]\n{X_NO_EVIDENCE_NOTICE}\n"
+    )
+    assert art.get("no_evidence") is True
+    assert art.get("evidence_count") == 0
 
     # Parameter validation error (> 20 handles)
     bad_handles = [f"user{i}" for i in range(21)]
@@ -691,3 +702,177 @@ def test_summary_excerpt_second_bare_status_url_with_path_and_query_joins_the_it
     for suffix in ("/photo/1?s=20", "?s=20#details"):
         text = f"- 两位作者都认为需求增长。[[1]]({_U1})\n{_U2}{suffix}\n总体情绪转弱。"
         assert _extract_unique_summary_excerpt(text, _U1, "2112925226740683159", 1) is None, suffix
+
+
+# --- Generated summary vs post evidence (prod incident: answer-only output
+# read as normal results — fabricated "CEO quotes", <｜eos｜> markers, repeats)
+
+
+def _broker_reply(answer: str, citations: list) -> dict:
+    """A broker reply whose answer is wrapped the way the gateway sends it."""
+    return {
+        "ok": True,
+        "provider": "xai",
+        "result": {
+            "content": [
+                {
+                    "type": "text",
+                    "text": (
+                        '{"query":"T","provider":"xai",'
+                        '"content":"<<<EXTERNAL_UNTRUSTED_CONTENT id=\\"1\\">>>\\n'
+                        + answer.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+                        + '\\n<<<END_EXTERNAL_UNTRUSTED_CONTENT id=\\"1\\">>>",'
+                        + '"citations":' + json.dumps(citations) + "}"
+                    ),
+                }
+            ]
+        },
+    }
+
+
+def test_no_evidence_answer_is_marked_and_unquotes_only_long_quotes() -> None:
+    """No citations: the result is marked no_evidence, unquotes >=20-char quoted
+    spans (keeping their text so it is not presented as a direct quote), and
+    leaves short quoted terms (<20 chars) like "AI", "priced in", "EPS" intact
+    across straight and Chinese quote styles."""
+    answer = (
+        'The CEO said "we will double capex next fiscal year" per traders on "AI" '
+        'and "EPS" being "priced in". '
+        '另有传闻称“管理层预计四季度云业务增速将超过市场预期五个百分点”，'
+        '以及「明年资本开支指引将进一步上调至百亿美元级别」与『下半年整体毛利率预计将稳定维持在百分之六十以上的高位区间』，'
+        '但「毛利率」本身仍是焦点。Sentiment bullish.'
+    )
+    cleaned, artifact = map_x_search_response(
+        _broker_reply(answer, []), query="NVDA"
+    )
+    assert cleaned == []
+    assert artifact["no_evidence"] is True
+    assert artifact["evidence_count"] == 0
+    ans = artifact["answer"]
+    # Long quotes (>= 20 chars) lose their surrounding quote marks but keep their text.
+    assert '"we will double capex next fiscal year"' not in ans
+    assert "we will double capex next fiscal year" in ans
+    assert "“管理层预计四季度云业务增速将超过市场预期五个百分点”" not in ans
+    assert "管理层预计四季度云业务增速将超过市场预期五个百分点" in ans
+    assert "「明年资本开支指引将进一步上调至百亿美元级别」" not in ans
+    assert "明年资本开支指引将进一步上调至百亿美元级别" in ans
+    assert "『下半年整体毛利率预计将稳定维持在百分之六十以上的高位区间』" not in ans
+    assert "下半年整体毛利率预计将稳定维持在百分之六十以上的高位区间" in ans
+    # Short quotes (< 20 chars) keep their quotes and text untouched.
+    assert '"AI"' in ans
+    assert '"EPS"' in ans
+    assert '"priced in"' in ans
+    assert "「毛利率」" in ans
+    assert "Sentiment bullish" in ans
+
+
+def test_control_token_fullwidth_and_ascii_in_sourced_and_unsourced_summaries() -> None:
+    """Full-width <｜eos｜> and ASCII <|eos|> markers:
+    - Sourced summaries strip only the marker itself and keep trailing content.
+    - No-evidence summaries truncate at the marker."""
+    from src.dalton.web_search.x_search import X_SUMMARY_TRUNCATED_NOTE
+
+    for marker in ("<｜eos｜>", "<|eos|>"):
+        sourced_answer = f"First solid paragraph.{marker}Second valid paragraph."
+        cleaned, artifact = map_x_search_response(
+            _broker_reply(
+                sourced_answer,
+                ["https://x.com/NickRokke/status/2112925226740683159"],
+            ),
+            query="NVDA",
+        )
+        assert artifact["summary_issues"] == ["control_marker"]
+        assert marker not in artifact["answer"]
+        assert "First solid paragraph." in artifact["answer"]
+        assert "Second valid paragraph." in artifact["answer"]
+        assert X_SUMMARY_TRUNCATED_NOTE in artifact["answer"]
+        assert cleaned and cleaned[0]["type"] == "x_post"
+
+        unsourced_answer = f"First solid paragraph.{marker}Garbage after the marker"
+        cleaned_no_ev, artifact_no_ev = map_x_search_response(
+            _broker_reply(unsourced_answer, []),
+            query="NVDA",
+        )
+        assert cleaned_no_ev == []
+        assert artifact_no_ev["summary_issues"] == ["control_marker"]
+        assert marker not in artifact_no_ev["answer"]
+        assert "First solid paragraph." in artifact_no_ev["answer"]
+        assert "Garbage after the marker" not in artifact_no_ev["answer"]
+
+
+def test_repeated_paragraph_sourced_keeps_later_paragraphs_while_unsourced_truncates() -> None:
+    """For a sourced summary, only the duplicate paragraph is removed and
+    subsequent unique paragraphs are preserved; for a no-evidence summary, it
+    truncates from the repeat onward."""
+    from src.dalton.web_search.x_search import X_SUMMARY_TRUNCATED_NOTE
+
+    answer = (
+        "Traders report demand is strong into quarter end.\n\n"
+        "Traders report demand is strong into quarter end.\n\n"
+        "Second unique paragraph with distinct takeaway."
+    )
+    _cleaned, sourced_artifact = map_x_search_response(
+        _broker_reply(
+            answer,
+            ["https://x.com/NickRokke/status/2112925226740683159"],
+        ),
+        query="NVDA",
+    )
+    assert sourced_artifact["summary_issues"] == ["repeated_block"]
+    assert sourced_artifact["answer"].count("Traders report demand is strong") == 1
+    assert "Second unique paragraph with distinct takeaway." in sourced_artifact["answer"]
+    assert X_SUMMARY_TRUNCATED_NOTE in sourced_artifact["answer"]
+
+    _cleaned_no_ev, unsourced_artifact = map_x_search_response(
+        _broker_reply(answer, []),
+        query="NVDA",
+    )
+    assert unsourced_artifact["summary_issues"] == ["repeated_block"]
+    assert unsourced_artifact["answer"].count("Traders report demand is strong") == 1
+    assert "Second unique paragraph with distinct takeaway." not in unsourced_artifact["answer"]
+
+
+def test_inline_source_url_at_end_extracted_before_summary_cleanup() -> None:
+    """When citations=[] and the post URL is at the end of answer_text after a
+    repeated block or <｜eos｜> marker, sources are extracted first so the
+    response is NOT misclassified as no_evidence."""
+    answer = (
+        "Traders report demand is strong into quarter end.\n\n"
+        "Traders report demand is strong into quarter end.<｜eos｜>\n\n"
+        "Source post: https://x.com/NickRokke/status/2112925226740683159"
+    )
+    cleaned, artifact = map_x_search_response(
+        _broker_reply(answer, []),
+        query="NVDA",
+    )
+    assert len(cleaned) == 1
+    assert cleaned[0]["url"] == "https://x.com/NickRokke/status/2112925226740683159"
+    assert artifact.get("no_evidence") is not True
+    assert artifact["evidence_count"] == 1
+    assert "https://x.com/NickRokke/status/2112925226740683159" in artifact["answer"]
+
+
+def test_short_quoted_terms_pair_correctly_and_stay_quoted() -> None:
+    """Two short quoted terms on one line pair each with its OWN closing quote
+    (never spanning from one term's closing quote to the next term's opener),
+    and both stay quoted verbatim."""
+    from src.dalton.web_search.x_search import _strip_quoted_spans
+
+    answer = (
+        '"AI" demand continues to grow over the next several quarters "GPU"'
+    )
+    assert _strip_quoted_spans(answer) == answer
+
+    # A long quote between short terms: only the long one loses its marks.
+    mixed = 'Short "AI" note. "the datacenter buildout is far from finished per management" end.'
+    out = _strip_quoted_spans(mixed)
+    assert '"AI"' in out
+    assert '"the datacenter buildout' not in out
+    assert "the datacenter buildout is far from finished per management" in out
+
+    # Chinese pairs behave the same.
+    zh = "“AI”需求持续，“管理层在电话会上表示未来三个季度的资本开支将明显高于市场预期”结束。"
+    zh_out = _strip_quoted_spans(zh)
+    assert "“AI”" in zh_out
+    assert "“管理层在电话会上" not in zh_out
+    assert "管理层在电话会上表示未来三个季度的资本开支将明显高于市场预期" in zh_out

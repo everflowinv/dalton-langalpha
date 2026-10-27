@@ -140,7 +140,9 @@ class TestExtendedHoursPassThrough:
         mock_fmp.get_intraday_chart.return_value = [
             {"date": "2026-10-21 08:00:00", "open": 180.0, "high": 181.0, "low": 179.0, "close": 180.5, "volume": 100}
         ]
-        with patch.object(pd_mcp._ginlix, "fetch_stock_data", autospec=True) as mock_ginlix_fetch, patch("plugins.langalpha_market_data.price_data_mcp_server.get_fmp_client", autospec=True) as mock_get_fmp:
+        # DALTON-HOOK(market-data-fallback): yfinance sits ahead of FMP in the
+        # chain; this test pins what FMP receives, so the yfinance leg misses.
+        with patch.object(pd_mcp._ginlix, "fetch_stock_data", autospec=True) as mock_ginlix_fetch, patch.object(pd_mcp, "_yf_fetch_history", new=create_autospec(pd_mcp._yf_fetch_history, return_value=[])), patch("plugins.langalpha_market_data.price_data_mcp_server.get_fmp_client", autospec=True) as mock_get_fmp:
             mock_ginlix_fetch.return_value = None
             mock_get_fmp.return_value = mock_fmp
             res = await pd_mcp.get_stock_data(
