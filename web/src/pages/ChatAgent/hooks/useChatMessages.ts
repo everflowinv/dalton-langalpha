@@ -856,6 +856,11 @@ export function useChatMessages(
         // thread A's queued payload into thread B (and B doesn't inherit A's
         // stale compacting indicator).
         setQueuedSend(false);
+        // DALTON-HOOK(composer-drafts): the parked send dies with the thread it
+        // was queued on — settle it as failed so its draft is not left holding
+        // an unsettled promise (chatDrafts ignores it if a newer send on the
+        // key already owns the draft).
+        queuedSendRef.current?.settleQueued(false);
         queuedSendRef.current = null;
         // So do refused steers waiting to open its next turn, and those still
         // waiting on their answers. Their bubbles go with the messages above,
@@ -1640,6 +1645,12 @@ export function useChatMessages(
   useEffect(() => () => {
     sessionEpochRef.current += 1;
     historyWindow.reset();
+    // DALTON-HOOK(composer-drafts): a send still parked for compaction dies
+    // with the component — settle it as failed so the composer's stored draft
+    // is not left behind an unsettled promise (chatDrafts ignores the settle
+    // when a newer send on the key already owns the draft).
+    queuedSendRef.current?.settleQueued(false);
+    queuedSendRef.current = null;
   }, [historyWindow]);
 
   /**
@@ -2339,6 +2350,13 @@ export function useChatMessages(
       // message) so the user sees what will send. Only the latest queued
       // message is held, so replace any earlier optimistic bubble.
       const prevQueuedId = queuedSendRef.current?.messageId;
+      // DALTON-HOOK(composer-drafts): the earlier park is dropped by this
+      // replacement — settle it as failed so its draft returns to the composer
+      // (a widget send takes the queue without touching the composer, so the
+      // displaced text belongs back in the input). A second composer send
+      // already owns the draft key, and chatDrafts' supersession guard
+      // ignores the settle there.
+      queuedSendRef.current?.settleQueued(false);
       // A placeholder: the send it becomes adds a bubble of its own.
       const queuedMsg = createUserMessage(message, undefined, {
         attachments: attachmentMeta as AttachmentMeta[] | null,

@@ -217,16 +217,17 @@ describe('useChatMessages – send acceptance (DALTON composer drafts)', () => {
     const DRAFT_KEY = 'thread:compaction-draft';
 
     /** The chat hook bound to a real composer draft, the way ChatInput wires them. */
-    function useDraftChatHarness() {
-      const chat = useChatMessages('ws-test');
+    function useDraftChatHarness(threadId?: string) {
+      const chat = useChatMessages('ws-test', threadId);
       const composer = useComposerDraft({ draftKey: DRAFT_KEY });
       return { chat, composer };
     }
 
     /** Parks a composer send while compacting. The real acceptance callback
-     *  (the composer's acceptSend) stays on the send; `accepted` observes it. */
-    function parkWhileCompacting(accepted: Mock) {
-      const { result } = renderHookWithProviders(() => useDraftChatHarness());
+     *  (the composer's acceptSend) stays on the send; `accepted` observes it.
+     *  `getTid` lets a test re-render the harness onto another thread. */
+    function parkWhileCompacting(accepted: Mock, getTid?: () => string | undefined) {
+      const { result, rerender, unmount } = renderHookWithProviders(() => useDraftChatHarness(getTid?.()));
       act(() => {
         result.current.composer.setMessage('held while compacting');
       });
@@ -245,7 +246,7 @@ describe('useChatMessages – send acceptance (DALTON composer drafts)', () => {
           return sendPromise;
         });
       });
-      return { result, sendPromise };
+      return { result, rerender, unmount, sendPromise };
     }
 
     beforeEach(() => {
@@ -338,6 +339,71 @@ describe('useChatMessages – send acceptance (DALTON composer drafts)', () => {
       expect(result.current.chat.queuedSend).toBe(false);
       expect(result.current.composer.message).toBe('');
       expect(load(DRAFT_KEY)).toBe('');
+    });
+
+    it('settles the parked composer send as failed and restores its draft when a widget send replaces it in the queue', async () => {
+      mockSendStream.mockResolvedValue({ disconnected: false });
+
+      const accepted = vi.fn();
+      const { result, sendPromise } = parkWhileCompacting(accepted);
+      expect(result.current.chat.queuedSend).toBe('held while compacting');
+      expect(result.current.composer.message).toBe('');
+
+      // A widget prompt arrives mid-compaction with no onAccepted callback,
+      // replacing the parked composer send in queuedSendRef.
+      let outcome: boolean | undefined;
+      let widgetOutcome: boolean | undefined;
+      await act(async () => {
+        widgetOutcome = await result.current.chat.handleSendMessage('widget prompt B');
+        outcome = await sendPromise;
+      });
+
+      // Displaced composer send settles false → draft returns to the input;
+      // widget send B takes the queue as usual.
+      expect(accepted).not.toHaveBeenCalled();
+      expect(outcome).toBe(false);
+      expect(widgetOutcome).toBe(true);
+      expect(result.current.composer.message).toBe('held while compacting');
+      expect(load(DRAFT_KEY)).toBe('held while compacting');
+      expect(result.current.chat.queuedSend).toBe('widget prompt B');
+    });
+
+    it('settles the parked send as failed when switching threads mid-compaction', async () => {
+      mockSendStream.mockResolvedValue({ disconnected: false });
+
+      let tid: string | undefined = 'thread-A';
+      const accepted = vi.fn();
+      const { result, rerender, sendPromise } = parkWhileCompacting(accepted, () => tid);
+      expect(result.current.chat.queuedSend).toBe('held while compacting');
+
+      let outcome: boolean | undefined;
+      await act(async () => {
+        tid = 'thread-B';
+        rerender();
+        outcome = await sendPromise;
+      });
+
+      expect(accepted).not.toHaveBeenCalled();
+      expect(outcome).toBe(false);
+      expect(result.current.chat.queuedSend).toBe(false);
+      expect(load(DRAFT_KEY)).toBe('held while compacting');
+    });
+
+    it('settles the parked send as failed when the component unmounts mid-compaction', async () => {
+      mockSendStream.mockResolvedValue({ disconnected: false });
+
+      const accepted = vi.fn();
+      const { unmount, sendPromise } = parkWhileCompacting(accepted);
+
+      let outcome: boolean | undefined;
+      await act(async () => {
+        unmount();
+        outcome = await sendPromise;
+      });
+
+      expect(accepted).not.toHaveBeenCalled();
+      expect(outcome).toBe(false);
+      expect(load(DRAFT_KEY)).toBe('held while compacting');
     });
   });
 });
