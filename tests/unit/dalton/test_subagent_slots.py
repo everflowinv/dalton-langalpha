@@ -1747,13 +1747,13 @@ class TestRound2Fixes:
         assert engine._zcard(global_slots_key()) == 0
 
     @pytest.mark.asyncio
-    async def test_cross_worker_task_output_without_local_lease_reads_queued_state_from_redis(
+    async def test_cross_worker_thread_status_without_local_lease_reads_queued_state_from_redis(
         self,
         monkeypatch: pytest.MonkeyPatch,
         fast_polling: ControllableClock,
     ) -> None:
-        """Fix 4: When TaskOutput runs on another worker (no local task.slot_lease),
-        it queries Redis by deterministic slot_member and displays [QUEUED] (排队中) and rank.
+        """Fix 4: ThreadStatus on another worker (no local task.slot_lease) reads
+        a task's queue state from Redis and lists it as queued (排队中) with its rank.
         """
         cache, _ = make_fake_cache()
         monkeypatch.setattr(subagent_slots, "get_cache_client", lambda: cache)
@@ -1788,7 +1788,8 @@ class TestRound2Fixes:
         assert is_subagent_queued(t2_a)
         assert is_subagent_queued(t3_a)
 
-        # Worker B has checkpoint-hydrated shells with slot_lease=None and asyncio_task=None
+        # Worker B holds checkpoint-hydrated shells only: slot_lease=None and
+        # asyncio_task=None, so nothing local can say what is queued.
         mw_worker_b = FakeMiddleware(thread_id="thread-xworker")
         for src_task in (t1_a, t2_a, t3_a):
             shell = BackgroundTask(
@@ -1805,42 +1806,85 @@ class TestRound2Fixes:
                 shell.tool_call_id
             )
 
-        mw_b_spec = create_autospec(BackgroundSubagentMiddleware, instance=True)
-        mw_b_spec.registry = mw_worker_b.registry
-        tool_b = create_task_output_tool(mw_b_spec)
+        # The thread's records as any worker reads them from the ledger: a task
+        # waiting for a slot is in_progress there, its queue state only in Redis.
+        from src.server.database import automation
+        from src.server.database.runs import command_runs, subagent_runs
+        from src.server.database.wakeups import read as wakeups_db
+        from src.tools.thread_status.tool import build_thread_status_tool
 
-        # 1. Hydrated shell without ledger: overview & single task query Redis
-        overview_b, _ = await tool_b.coroutine(task_id=None)
-        assert "1 running, 2 queued (排队中)" in overview_b
-        assert "[QUEUED] (排队中)" in overview_b
-        assert "前面还有 1 个在排队" in overview_b
+        rows = [
+            {
+                "task_id": t.task_id,
+                "task_run_id": t.task_run_id,
+                "status": "in_progress",
+                "subagent_type": t.subagent_type,
+                "description": t.description,
+                "started_at": datetime.now(UTC),
+                "finalized_at": None,
+            }
+            for t in (t1_a, t2_a, t3_a)
+        ]
 
-        single_b, _ = await tool_b.coroutine(task_id=t3_a.task_id)
-        assert "[QUEUED] (排队中)" in single_b
-        assert (
-            "已排队：本对话正在运行 1 个子代理（上限 1），前面还有 1 个在排队，会自动开始，不要重复派发"
-            in single_b
+        def _reporting_tasks(thread_id: str, **kw: Any) -> list[dict[str, Any]]:
+            wanted = kw.get("task_id")
+            return [r for r in rows if wanted is None or r["task_id"] == wanted]
+
+        monkeypatch.setattr(
+            command_runs,
+            "list_for_thread",
+            create_autospec(command_runs.list_for_thread, return_value=[]),
+        )
+        monkeypatch.setattr(
+            subagent_runs,
+            "list_reporting_tasks",
+            create_autospec(subagent_runs.list_reporting_tasks, side_effect=_reporting_tasks),
+        )
+        monkeypatch.setattr(
+            wakeups_db,
+            "list_thread_wakeups",
+            create_autospec(wakeups_db.list_thread_wakeups, return_value=[]),
+        )
+        monkeypatch.setattr(
+            automation,
+            "list_all_automations",
+            create_autospec(automation.list_all_automations, return_value=[]),
         )
 
-        # 2. Missing from local registry / resolved via ledger 'in_progress' on Worker B
-        mw_worker_c = FakeMiddleware(thread_id="thread-xworker")
-        ledger_c = create_autospec(_RunLedgerSpec, instance=True)
-        ledger_c.get_latest_run.return_value = {
-            "status": "in_progress",
-            "task_run_id": t3_a.task_run_id,
-        }
-        mw_worker_c.registry.run_ledger = ledger_c
-        mw_c_spec = create_autospec(BackgroundSubagentMiddleware, instance=True)
-        mw_c_spec.registry = mw_worker_c.registry
-        tool_c = create_task_output_tool(mw_c_spec)
-
-        ledger_reply, ledger_mark = await tool_c.coroutine(task_id=t3_a.task_id)
-        assert ledger_mark is not None
-        assert "[QUEUED] (排队中" in ledger_reply
-        assert (
-            "已排队：本对话正在运行 1 个子代理（上限 1），前面还有 1 个在排队，会自动开始，不要重复派发"
-            in ledger_reply
+        config = {"configurable": {"timezone": "UTC"}}
+        status_b = build_thread_status_tool(
+            thread_id="thread-xworker", user_id="user-1", registry=mw_worker_b.registry
         )
+        listing_b = (
+            await status_b.ainvoke(
+                {"type": "tool_call", "id": "call-1", "name": "ThreadStatus", "args": {}},
+                config,
+            )
+        ).content
+        # Both waiting tasks say queued, with their rank in the queue.
+        assert listing_b.count("queued (排队中)") == 2
+        assert "queued (排队中), 0 ahead of it, auto-starts" in listing_b
+        assert "queued (排队中), 1 ahead of it, auto-starts" in listing_b
+
+        detail_args = {"id": f"Task-{t3_a.task_id}"}
+        detail_b = (
+            await status_b.ainvoke(
+                {"type": "tool_call", "id": "call-2", "name": "ThreadStatus", "args": detail_args},
+                config,
+            )
+        ).content
+        assert "queued (排队中), 1 ahead of it, auto-starts" in detail_b
+
+        # 2. A worker that knows the task from the ledger alone (no registry of
+        # its own at all) reads the same queue state from Redis.
+        status_c = build_thread_status_tool(thread_id="thread-xworker", user_id="user-1")
+        detail_c = (
+            await status_c.ainvoke(
+                {"type": "tool_call", "id": "call-3", "name": "ThreadStatus", "args": detail_args},
+                config,
+            )
+        ).content
+        assert "queued (排队中), 1 ahead of it, auto-starts" in detail_c
 
         gate.set()
         await asyncio.gather(

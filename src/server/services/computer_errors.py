@@ -27,6 +27,9 @@ class Retirement(StrEnum):
     PRIMARY = "primary"
     OWNERS_MACHINE = "owners_machine"
     HAS_WORKSPACES = "has_workspaces"
+    # DALTON-HOOK(workspace-delete-guard): a workspace with immutable published
+    # reports is archived, never deleted, so a computer carrying one stays.
+    PUBLISHED_REPORTS = "published_reports"
     BUSY = "busy"
     DEFERRED = "deferred"
     WITHDRAWN = "withdrawn"
@@ -35,6 +38,10 @@ class Retirement(StrEnum):
 _REMOVAL_REFUSALS: dict[Retirement, str] = {
     Retirement.PRIMARY: "Your primary computer can't be removed.",
     Retirement.HAS_WORKSPACES: "Delete the workspaces on this computer first.",
+    # DALTON-HOOK(workspace-delete-guard)
+    Retirement.PUBLISHED_REPORTS: (
+        "该计算机下有工作区含已发布研报，只能归档，不能删除。"
+    ),
     Retirement.BUSY: "This computer is busy. Try again in a moment.",
 }
 

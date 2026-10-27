@@ -1118,12 +1118,16 @@ async def test_ingest_company_wiki_remote_sandbox_realpath_symlinks_shell_chars_
             datetime.now(tz=timezone.utc),
         )
 
-    def _make_ended(exit_code: int, stdout_text: str) -> Ended:
-        return Ended(
-            _handle(),
-            exit_code=0,
-            output=json.dumps({"exit_code": exit_code, "stdout": stdout_text, "stderr": ""}),
+    def _make_ended(exit_code: int, stdout_text: str, *, job_exit_code: int = 0) -> Ended:
+        # `job_exit_code` is the one-shot python's own exit (the branch the gate
+        # reads first); a run that died non-zero printed no payload, so `output`
+        # carries one only when the job ended 0.
+        output = (
+            json.dumps({"exit_code": exit_code, "stdout": stdout_text, "stderr": ""})
+            if job_exit_code == 0
+            else ""
         )
+        return Ended(_handle(), exit_code=job_exit_code, output=output)
 
     # 2. Metadata check job failure (`Failed` outcome) -> fail closed (rejected)
     backend.start_code_job.side_effect = None
@@ -1145,7 +1149,7 @@ async def test_ingest_company_wiki_remote_sandbox_realpath_symlinks_shell_chars_
     backend.adownload_files.assert_not_called()
 
     # 2b. One-shot python itself exited non-zero -> fail closed
-    backend.start_code_job.return_value = _make_ended(1, "")
+    backend.start_code_job.return_value = _make_ended(0, "", job_exit_code=1)
     res_py_fail = await tool_fn.ainvoke(
         {
             "target_type": "company",
@@ -1158,6 +1162,8 @@ async def test_ingest_company_wiki_remote_sandbox_realpath_symlinks_shell_chars_
         config=cfg,
     )
     assert res_py_fail.startswith("ERROR:")
+    # The job's own exit, not a payload's: none was printed, so the gate's
+    # non-zero branch is what refused it.
     backend.adownload_files.assert_not_called()
 
     # 2c. Job outlived its wait (Running) -> stopped, never read as success,

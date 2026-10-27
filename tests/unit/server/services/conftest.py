@@ -62,6 +62,18 @@ def _no_workspace_moving():
 
 
 @pytest.fixture(autouse=True)
+def _no_published_reports():
+    """DALTON-HOOK(workspace-delete-guard): every delete path asks the
+    publications table; a row read these pool-less tests cannot make. A test
+    of the refusal patches it inside this one."""
+    with patch(
+        "src.server.services.workspace_manager._has_published_reports",
+        AsyncMock(return_value=False),
+    ) as published:
+        yield published
+
+
+@pytest.fixture(autouse=True)
 def _no_backup_stamp():
     """Every backup stamps the time once it completes: a row write these
     pool-less tests cannot make."""

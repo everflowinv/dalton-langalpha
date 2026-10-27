@@ -636,85 +636,83 @@ async def test_sandbox_pip_install_uses_system_and_skips_local_workspace_dirs(
         "uv pip install --system openpyxl", timeout=120
     )
 
-    # 5. execution.start_code_job (P0-11 hook site) skips auto-install and retry
-    # for local workspace folders (outcome.raised='ai_strategy_lp'), and installs
-    # with --system + retries once for genuine packages (outcome.raised='scipy.stats').
+    # 5. execution.start_code_job (P0-11 hook site): a code run that ended on a
+    # missing import installs it and runs again — unless the name is a local
+    # workspace folder, or the local probe could not say, in which case nothing
+    # is installed and the failed outcome is returned as it stands.
     from ptc_agent.core.sandbox import execution as sandbox_execution
     from ptc_agent.core.sandbox.jobs import Ended, JobHandle, JobRef
 
-    sandbox.execution_count = 0
-    fake_ref = JobRef(
-        job_id="job-1",
-        cwd="/home/workspace/ai_strategy_lp",
-        state_dir="/home/workspace/ai_strategy_lp/.agents/threads/t1/jobs/job-1",
-        log_abs="/home/workspace/ai_strategy_lp/.agents/threads/t1/commands/bg-000000000001.log",
-    )
-    fake_handle = JobHandle(
-        command_id="bg-000000000001",
-        log_path=".agents/threads/t1/commands/bg-000000000001.log",
-        ref=fake_ref,
-    )
-    monkeypatch.setattr(
-        sandbox_execution,
-        "_new_job",
-        create_autospec(sandbox_execution._new_job, return_value=fake_handle),
-    )
-    monkeypatch.setattr(
-        sandbox_execution,
-        "_upload_code",
-        create_autospec(sandbox_execution._upload_code, return_value="/tmp/code.py"),
-    )
-    launch_spy = create_autospec(sandbox_execution._launch_job, return_value=None)
-    monkeypatch.setattr(sandbox_execution, "_launch_job", launch_spy)
+    def _code_run(raised: str | None, *, exit_code: int) -> Ended:
+        """One ended code run as the retry loop reads it: the module its own
+        unhandled exception failed to import sits in ``raised``, apart from the
+        output."""
+        ref = JobRef(
+            command_id="bg-000000000001",
+            state_dir="/root/.system/jobs/bg-000000000001",
+            log_path=(
+                "/home/workspace/ai_strategy_lp/.agents/threads/t1/"
+                "commands/bg-000000000001.log"
+            ),
+            trace_path="/root/.system/trace/bg-000000000001.jsonl",
+            log_relpath=".agents/threads/t1/commands/bg-000000000001.log",
+        )
+        handle = JobHandle(ref=ref, started_at=datetime.now(timezone.utc), kind="code")
+        return Ended(handle=handle, exit_code=exit_code, output="", raised=raised)
+
+    # The install goes through the double's _install_package into the real
+    # mcp_setup one, so the --system wording in `commands` is what ran, not a
+    # mock's record of the call.
+    async def _real_install(package: str) -> bool:
+        return await mcp_setup._install_package(sandbox, package)
+
+    sandbox._install_package.side_effect = _real_install
+    run_code = create_autospec(sandbox_execution._run_code)
+    monkeypatch.setattr(sandbox_execution, "_run_code", run_code)
 
     # 5a. Local folder 'ai_strategy_lp': filtered out -> no uv pip install, no retry
     commands.clear()
-    attempt_local = create_autospec(
-        sandbox_execution._run_job_attempt,
-        return_value=Ended(
-            handle=fake_handle,
-            exit_code=1,
-            stdout="",
-            stderr="ModuleNotFoundError: No module named 'ai_strategy_lp'",
-            raised="ai_strategy_lp",
-        ),
-    )
-    monkeypatch.setattr(sandbox_execution, "_run_job_attempt", attempt_local)
+    run_code.reset_mock()
+    run_code.side_effect = [_code_run("ai_strategy_lp", exit_code=1)]
     out_local = await sandbox_execution.start_code_job(
         sandbox, "import ai_strategy_lp", wait_s=5.0
     )
     assert isinstance(out_local, Ended) and out_local.exit_code == 1
-    assert attempt_local.await_count == 1
+    assert run_code.await_count == 1
+    sandbox._install_package.assert_not_awaited()
     assert not any("uv pip install" in c for c in commands)
 
-    # 5b. Genuine package 'scipy.stats': installed with --system and retried once
+    # 5b. Genuine package 'scipy': installed with --system and rerun once
     commands.clear()
-    attempt_scipy = create_autospec(
-        sandbox_execution._run_job_attempt,
-        side_effect=[
-            Ended(
-                handle=fake_handle,
-                exit_code=1,
-                stdout="",
-                stderr="ModuleNotFoundError: No module named 'scipy'",
-                raised="scipy.stats",
-            ),
-            Ended(
-                handle=fake_handle,
-                exit_code=0,
-                stdout="ok\n",
-                stderr="",
-                raised=None,
-            ),
-        ],
-    )
-    monkeypatch.setattr(sandbox_execution, "_run_job_attempt", attempt_scipy)
+    run_code.reset_mock()
+    sandbox._install_package.reset_mock()
+    run_code.side_effect = [
+        _code_run("scipy", exit_code=1),
+        _code_run(None, exit_code=0),
+    ]
     out_scipy = await sandbox_execution.start_code_job(
         sandbox, "import scipy.stats", wait_s=5.0
     )
     assert isinstance(out_scipy, Ended) and out_scipy.exit_code == 0
-    assert attempt_scipy.await_count == 2
+    assert run_code.await_count == 2
+    sandbox._install_package.assert_awaited_once_with("scipy")
     assert "uv pip install --system -q scipy" in commands
+
+    # 5c. The local probe failing: no install, no retry, the outcome stands
+    commands.clear()
+    run_code.reset_mock()
+    sandbox._install_package.reset_mock()
+    sandbox._runtime_call.side_effect = _probe_nonzero
+    run_code.side_effect = [_code_run("scipy", exit_code=1)]
+    out_probe = await sandbox_execution.start_code_job(
+        sandbox, "import scipy", wait_s=5.0
+    )
+    assert isinstance(out_probe, Ended) and out_probe.exit_code == 1
+    assert run_code.await_count == 1
+    sandbox._install_package.assert_not_awaited()
+    assert not any("uv pip install" in c for c in commands)
+
+    sandbox._runtime_call.side_effect = _runtime_call
 
 
 # ---------------------------------------------------------------------------

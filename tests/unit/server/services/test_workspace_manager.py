@@ -1776,6 +1776,43 @@ class TestDeleteWorkspace:
         wm.backup_project_files.assert_not_awaited()
         mock_db_delete.assert_not_awaited()
 
+    @pytest.mark.asyncio
+    @patch(
+        "src.server.services.workspace_manager.db_delete_workspace",
+        new_callable=AsyncMock,
+    )
+    @cm_patch("db_get_workspace", new_callable=AsyncMock)
+    async def test_a_workspace_with_published_reports_is_refused_whatever_the_caller(
+        self, mock_db_get, mock_db_delete
+    ):
+        """DALTON-HOOK(workspace-delete-guard): the guard lives in the shared
+        delete, so an agent's delete tool — a caller the route's own check
+        never sees — is refused the same way, before anything is touched."""
+        from src.server.database.workspace import WorkspaceBusyError
+        from src.server.services.workspace_manager import PUBLISHED_REPORTS_DELETE_REFUSAL
+
+        ws_id = str(uuid.uuid4())
+        mock_db_get.return_value = _make_workspace(
+            workspace_id=ws_id, status="running", dir_name="test-ab12"
+        )
+        wm = WorkspaceManager(_make_config())
+        wm.backup_project_files = AsyncMock()
+        wm._remove_workspace_folder = AsyncMock()
+        wm._teardown_machine = AsyncMock()
+
+        with patch(
+            f"{_WORKSPACE_MANAGER}._has_published_reports",
+            AsyncMock(return_value=True),
+        ) as published:
+            with pytest.raises(WorkspaceBusyError, match=PUBLISHED_REPORTS_DELETE_REFUSAL):
+                await wm.delete_workspace(ws_id)
+
+        published.assert_awaited_once_with(ws_id)
+        wm.backup_project_files.assert_not_awaited()
+        mock_db_delete.assert_not_awaited()
+        wm._remove_workspace_folder.assert_not_awaited()
+        wm._teardown_machine.assert_not_awaited()
+
 
 class TestDeleteOnASharedMachine:
     """Deleting a project takes the project, never the machine under a sibling.
@@ -2109,7 +2146,14 @@ class TestRemoveComputerWithWorkspaces:
         self.wm.delete_workspace.side_effect = delete
 
     async def _remove(
-        self, named, *, primary=False, moving=(), working=(), on=("ws-a", "ws-b")
+        self,
+        named,
+        *,
+        primary=False,
+        moving=(),
+        working=(),
+        published=(),
+        on=("ws-a", "ws-b"),
     ):
         computer = _make_computer(computer_id=_STUB_COMPUTER_ID, is_primary=primary)
         with (
@@ -2128,6 +2172,11 @@ class TestRemoveComputerWithWorkspaces:
             patch(
                 f"{_WORKSPACE_MANAGER}.workspace_has_active_work",
                 AsyncMock(side_effect=lambda ws_id: ws_id in working),
+            ),
+            # DALTON-HOOK(workspace-delete-guard)
+            patch(
+                f"{_WORKSPACE_MANAGER}._has_published_reports",
+                AsyncMock(side_effect=lambda ws_id: ws_id in published),
             ),
         ):
             return await self.wm.remove_computer_with_workspaces(
@@ -2179,6 +2228,21 @@ class TestRemoveComputerWithWorkspaces:
         self.wm.remove_computer.assert_awaited_once_with(_STUB_COMPUTER_ID)
 
     @pytest.mark.asyncio
+    async def test_a_workspace_with_published_reports_refuses_the_whole_removal(self):
+        """DALTON-HOOK(workspace-delete-guard): the guard on the single
+        delete, sunk into the batch — one hit and nothing on the computer
+        goes, so the sandbox under them stays."""
+        from src.server.services.computer_errors import ComputerRemovalRefused
+
+        with pytest.raises(ComputerRemovalRefused) as refused:
+            await self._remove(["ws-a", "ws-b"], published=("ws-b",))
+
+        assert refused.value.code == "published_reports"
+        assert refused.value.deleted == []
+        self.wm.delete_workspace.assert_not_awaited()
+        self.wm.remove_computer.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_a_refusal_once_some_went_names_them(self):
         """A workspace that landed on it meanwhile keeps the computer; the
         ones already deleted stay so, and the client is told which."""
@@ -2211,8 +2275,16 @@ class TestRemoveComputerWithWorkspaces:
             ({"named": ["ws-a", "ws-b"], "primary": True}, "primary"),
             ({"named": ["ws-a", "ws-b"], "moving": ("ws-b",)}, "busy"),
             ({"named": ["ws-a", "ws-b"], "working": ("ws-b",)}, "busy"),
+            # DALTON-HOOK(workspace-delete-guard)
+            ({"named": ["ws-a", "ws-b"], "published": ("ws-b",)}, "published_reports"),
         ],
-        ids=["one-not-named", "primary", "one-moving", "one-working"],
+        ids=[
+            "one-not-named",
+            "primary",
+            "one-moving",
+            "one-working",
+            "one-published",
+        ],
     )
     async def test_a_refusal_deletes_nothing(self, kwargs, code):
         from src.server.services.computer_errors import ComputerRemovalRefused

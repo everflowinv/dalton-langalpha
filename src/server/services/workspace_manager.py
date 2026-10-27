@@ -64,6 +64,19 @@ from src.server.services.persistence.file import FilePersistenceService
 
 logger = logging.getLogger(__name__)
 
+# DALTON-HOOK(workspace-delete-guard): the sentence the workspace route has
+# always answered a delete of a workspace with immutable published reports,
+# now raised from every delete path, not only that route.
+PUBLISHED_REPORTS_DELETE_REFUSAL = "该工作区含已发布研报，禁止删除；请归档。"
+
+
+async def _has_published_reports(workspace_id: str) -> bool:
+    # DALTON-HOOK(workspace-delete-guard): imported lazily, as every other
+    # dalton read the server makes.
+    from src.dalton.database.publications import has_published_reports
+
+    return await has_published_reports(workspace_id)
+
 
 class IdleWindow(NamedTuple):
     """When the idle sweep stops a running computer if nothing more counts as
@@ -403,6 +416,11 @@ class WorkspaceManager(ComputerManager):
                 # Here rather than only at the route: an agent's tool deletes
                 # through this method too.
                 raise ValueError("Cannot delete Home")
+            # DALTON-HOOK(workspace-delete-guard): the route's guard, sunk into
+            # the shared delete so every entry point — the agent's delete tool,
+            # a computer's removal — is refused the same way.
+            if await _has_published_reports(workspace_id):
+                raise WorkspaceBusyError(PUBLISHED_REPORTS_DELETE_REFUSAL)
             # Before the last backup holds the folder, which would fail the
             # move instead; the delete's own transaction checks again.
             if await workspace_is_moving(workspace_id):
@@ -490,12 +508,13 @@ class WorkspaceManager(ComputerManager):
         must be among them, so an empty computer needs none. What would refuse
         the remove anyway is asked first (``removal_held``), so a refusal
         deletes nothing: the primary, a transition, a workspace not named, a
-        workspace a move holds or a run is working in, and Home, which no
-        delete takes. A named one no longer on it is left alone, and is not
-        among those answered, so the client forgets only what went. Each goes
-        as its own delete would take it, so a machine the user brought keeps
-        its folders unless ``delete_files``. On a provider that builds machines
-        the last delete retires the computer, which is this removal done.
+        workspace a move holds or a run is working in, one with published
+        reports, and Home, which no delete takes. A named one no longer on it
+        is left alone, and is not among those answered, so the client forgets
+        only what went. Each goes as its own delete would take it, so a
+        machine the user brought keeps its folders unless ``delete_files``. On
+        a provider that builds machines the last delete retires the computer,
+        which is this removal done.
 
         Raises:
             ComputerRemovalRefused: nothing was deleted, or something landed
@@ -509,6 +528,9 @@ class WorkspaceManager(ComputerManager):
         held = self.removal_held(computer)
         workspace_ids = await get_live_workspace_ids_for_computer(computer_id)
         shown = {str(i) for i in named}
+        # DALTON-HOOK(workspace-delete-guard): each workspace's delete guard
+        # is asked here, before any delete, so one with published reports
+        # keeps them all and the computer under them.
         for workspace_id in workspace_ids if held is None else ():
             row = await self.workspace_row(workspace_id)
             if str(workspace_id) not in shown or (row and is_home_row(row)):
@@ -517,6 +539,8 @@ class WorkspaceManager(ComputerManager):
                 workspace_id
             ):
                 held = Retirement.BUSY
+            elif await _has_published_reports(workspace_id):
+                held = Retirement.PUBLISHED_REPORTS
             if held is not None:
                 break
         if held is not None:
