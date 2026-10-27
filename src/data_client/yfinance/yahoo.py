@@ -8,7 +8,7 @@ goes back through ``display_spelling`` before it leaves the package.
 
 from __future__ import annotations
 
-import math
+import math  # DALTON-HOOK(yfinance-prev-close)
 
 import yfinance as yf
 from market_protocol import vendor_spelling
