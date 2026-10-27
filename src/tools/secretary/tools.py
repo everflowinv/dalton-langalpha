@@ -6,6 +6,7 @@ The tools themselves are in ``chief_of_staff``; a hand-off runs through
 
 import json
 import logging
+from typing import Any
 
 from langchain_core.messages import ToolMessage
 from langgraph.types import Command
@@ -121,6 +122,138 @@ async def workspaces_list(user_id: str, tool_call_id: str) -> Command:
 # workspace the user already holds never rides the standing approval — the
 # middleware withholds it when the model proposes the call, and the duplicate
 # is named on the card, so the user can just reuse it.
+# --- DALTON-HOOK(workspace-folder-ready): begin ---
+_FOLDER_NOT_READY_HINT = (
+    "计算机启动后才会创建该文件夹；需要交接文件时，先放在 Home 下，并把路径写进派发说明"
+)
+_FOLDER_CHECK_NOTE = "复制或清理前先确认 folder_path 已存在且非空"
+
+
+async def _folder_ready_result(
+    manager: Any, user_id: str, workspace: dict
+) -> dict:
+    """``folder_ready``/``folder_path`` for a just-created workspace.
+
+    A new row owns a folder name but no folder until the machine's next
+    acquisition builds it, which left the Chief of Staff copying hand-off
+    files into a directory that did not exist yet.
+
+    The path a created folder must have is whatever the SANDBOX would use at
+    bring-up — ``session.sandbox.layout.for_workspace(dir_name).setup_dirs[0]``,
+    the exact expression ``PTCSandbox._ensure_workspace_dirs`` mkdirs — because
+    a reconnect can repoint the sandbox's working dir away from the computer
+    row's root, and a folder created at any other root is not the folder the
+    attach will find. So whenever the folder is actually created (the new
+    workspace is on THIS turn's Home computer and this worker holds the turn's
+    cached session for it — a peek, never an acquire), the layout of that
+    live sandbox is the one source for the path, for ``mkdir``, for ``test -d``
+    and for the returned ``folder_path`` alike.
+
+    Not creating (different computer, no cached session) answers the binding's
+    ``root_dir``/``dir_name`` as a best-effort ``folder_path`` — display only,
+    nothing was built there. A failed binding read never falls back to the
+    global default root to build anything; it answers a default-derived path
+    for display and ``folder_ready: False``. Even when creating, ``mkdir`` and
+    a separate ``test -d`` must both exit 0 before ``folder_ready`` is true —
+    a swallowed mkdir failure never reports ready. No case here may raise or
+    fail the create, which already succeeded.
+    """
+    workspace_id = str(workspace.get("workspace_id") or "")
+    dir_name = str(workspace.get("dir_name") or "").strip()
+    computer_id = str(workspace.get("computer_id") or "").strip()
+
+    result: dict = {"folder_ready": False, "folder_hint": _FOLDER_NOT_READY_HINT}
+
+    binding = None
+    try:
+        binding = await manager.resolve_binding(workspace_id)
+    except Exception as e:
+        logger.warning(f"Could not resolve the folder path for {workspace_id}: {e}")
+    if binding is None:
+        # Display-only path from the same default math the file routes use;
+        # never a root to build on.
+        if dir_name:
+            try:
+                from src.server.app.workspace_files._shared import work_dir_for
+
+                path = work_dir_for(workspace, manager=manager)
+                if path:
+                    result["folder_path"] = str(path)
+            except Exception as e:
+                logger.warning(
+                    f"Could not compute the folder path for {workspace_id}: {e}"
+                )
+        return result
+
+    root = str(getattr(binding, "root_dir", None) or "").rstrip("/")
+    if root and dir_name:
+        result["folder_path"] = f"{root}/{dir_name}"
+    if not (root and dir_name and computer_id):
+        return result
+
+    try:
+        from src.server.database.home_workspace import get_home_workspace_id
+        from src.server.database.workspace import get_workspace as _get_workspace
+
+        home = await _get_workspace(get_home_workspace_id(user_id))
+        home_computer_id = str((home or {}).get("computer_id") or "")
+    except Exception as e:
+        logger.warning(f"Could not read Home's computer for user {user_id}: {e}")
+        return result
+    if home_computer_id != computer_id:
+        return result
+
+    # This worker's live session for the Home computer — a peek, never an
+    # acquire: a machine with no cached session here is not running this turn.
+    session = manager._cached_session(computer_id)
+    sandbox = getattr(session, "sandbox", None) if session is not None else None
+    if sandbox is None:
+        return result
+
+    try:
+        # The one path bring-up would create: taken from the live sandbox's
+        # own layout, which may differ from the binding root after a
+        # reconnect repointed the sandbox's working dir.
+        folder_path = str(
+            sandbox.layout.for_workspace(dir_name).setup_dirs[0]
+        )
+    except Exception as e:
+        logger.warning(
+            f"Could not derive the sandbox folder path for {workspace_id}: {e}"
+        )
+        return result
+    result["folder_path"] = folder_path
+
+    import shlex
+
+    def _exit_code(res: Any) -> int:
+        try:
+            return int((res or {}).get("exit_code"))
+        except (TypeError, ValueError):
+            return 1
+
+    quoted = shlex.quote(folder_path)
+    try:
+        made = await sandbox.execute_bash_command(
+            command=f"mkdir -p {quoted}", timeout=30
+        )
+        verified = await sandbox.execute_bash_command(
+            command=f"test -d {quoted}", timeout=15
+        )
+        if _exit_code(made) == 0 and _exit_code(verified) == 0:
+            return {
+                "folder_ready": True,
+                "folder_path": folder_path,
+            }
+        logger.warning(
+            f"Folder for {workspace_id} was not confirmed at {folder_path}"
+        )
+    except Exception as e:
+        logger.warning(f"Could not create the folder for {workspace_id}: {e}")
+    return result
+# --- DALTON-HOOK(workspace-folder-ready): end ---
+
+
 async def workspaces_create(
     user_id: str,
     name: str | None,
@@ -185,6 +318,15 @@ async def workspaces_create(
             "workspace_id": str(workspace["workspace_id"]),
             "workspace_name": workspace["name"],
         }
+        # --- DALTON-HOOK(workspace-folder-ready): begin ---
+        # The folder is only built at the machine's next acquire, so say where
+        # it will be and whether it is there now — the incident's hand-off
+        # copied into a directory that did not exist yet.
+        result.update(
+            await _folder_ready_result(workspace_manager, user_id, workspace)
+        )
+        result["folder_note"] = _FOLDER_CHECK_NOTE
+        # --- DALTON-HOOK(workspace-folder-ready): end ---
         if preapproved:
             # The card for it is drawn from this result.
             result["preapproved"] = True

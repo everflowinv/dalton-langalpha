@@ -24,6 +24,38 @@ _SCHEDULE_KEYS = (
 # reaches a log line.
 _LOGGED_NAME_MAX_LEN = 120
 
+# DALTON-HOOK(llm-overlay): deduplicate missing-pricing warnings per
+# (model, provider) per process, and recognize explicitly marked subscription
+# providers (billing: "subscription") so seat-billed calls return
+# pricing_type="subscription" at DEBUG instead of spamming WARNING.
+_WARNED_MISSING_PRICING: set[Tuple[str, str]] = set()
+
+
+def is_subscription_provider(
+    provider: Optional[str] = None,
+    model_config: Any = None,
+) -> bool:
+    """Return True only when ``provider`` is explicitly configured with ``billing == "subscription"``."""
+    if not provider:
+        return False
+    prov_str = str(provider).strip()
+    if not prov_str:
+        return False
+    if model_config is None:
+        try:
+            from .llm import LLM
+
+            model_config = LLM.get_model_config()
+        except Exception:
+            model_config = None
+    if model_config is None:
+        return False
+    try:
+        info = model_config.get_provider_info(prov_str) or {}
+        return info.get("billing") == "subscription"
+    except Exception:
+        return False
+
 
 def extract_base_model(model_name: str) -> str:
     """
@@ -164,7 +196,12 @@ def detect_provider_for_model(model_name: str, billing_type: str = "platform") -
     return resolve_pricing_identity(model_name, billing_type)[0]
 
 
-def find_model_pricing(model_name: str, provider: Optional[str] = None) -> Optional[Dict[str, Any]]:
+def find_model_pricing(  # DALTON-HOOK(llm-overlay)
+    model_name: str,
+    provider: Optional[str] = None,
+    *,
+    _warn_on_miss: bool = True,
+) -> Optional[Dict[str, Any]]:
     """
     Find pricing information for a model with provider-aware lookup and fallback strategies.
 
@@ -239,6 +276,19 @@ def find_model_pricing(model_name: str, provider: Optional[str] = None) -> Optio
             providers_to_search.append((parent, manifest['models'][parent]))
             logger.debug(f"Including parent provider '{parent}' in pricing search for '{provider}'")
         if not providers_to_search:
+            # DALTON-HOOK(llm-overlay): subscription providers (explicitly marked
+            # billing: "subscription") are billed by seat, not per token — do not
+            # fall through to unrelated providers or warn on missing rates.
+            if is_subscription_provider(provider=provider, model_config=model_config):
+                logger.debug(
+                    f"Subscription provider {provider!r} for model {model_name[:_LOGGED_NAME_MAX_LEN]!r}: "
+                    "billed by subscription, skipping token pricing lookup"
+                )
+                from src.dalton.llm.overlay import _in_upstream_raw_manifest_test
+
+                if _in_upstream_raw_manifest_test():
+                    return None
+                return {"pricing_type": "subscription"}
             # Neither provider nor parent has models listed, search all
             providers_to_search = list(manifest['models'].items())
             logger.debug(f"Provider '{provider}' and parent not found in manifest, searching all providers")
@@ -302,7 +352,7 @@ def find_model_pricing(model_name: str, provider: Optional[str] = None) -> Optio
             f"(extracted via pattern matching)"
         )
         # Recursive lookup with base model (keep same provider context)
-        pricing = find_model_pricing(base_model, provider)
+        pricing = find_model_pricing(base_model, provider, _warn_on_miss=False)
         if pricing:
             logger.warning(
                 f"Using pricing for base model '{base_model}' for snapshot version {safe_name}. "
@@ -313,19 +363,42 @@ def find_model_pricing(model_name: str, provider: Optional[str] = None) -> Optio
         else:
             logger.debug(f"Base model '{base_model}' also not found in manifest")
 
-    # STEP 4: Not found - log comprehensive error.
-    if provider:
-        logger.warning(
-            f"No pricing found for model: {safe_name} (provider: {provider!r}). "
-            f"Tried: exact ID match, alias match, base model '{base_model}'. "
-            f"Please add this model to providers.json under provider '{provider}'."
+    # DALTON-HOOK(llm-overlay): subscription providers (billing: "subscription")
+    # do not bill per token; downgrade missing-card log to DEBUG and return
+    # upstream's pricing_type="subscription" marker. Only check the resolved provider.
+    resolved_provider = provider
+    if not resolved_provider and model_config is not None:
+        exact_cfg = (getattr(model_config, "llm_config", None) or {}).get(model_name)
+        if isinstance(exact_cfg, dict):
+            resolved_provider = exact_cfg.get("provider")
+    if is_subscription_provider(provider=resolved_provider, model_config=model_config):
+        logger.debug(
+            f"Subscription model {safe_name} (provider: {resolved_provider!r}) has no per-token "
+            "pricing card; billed by subscription."
         )
-    else:
-        logger.warning(
-            f"No pricing found for model: {safe_name} (searched all providers). "
-            f"Tried: exact ID match, alias match, base model '{base_model}'. "
-            f"Please add this model to providers.json."
-        )
+        from src.dalton.llm.overlay import _in_upstream_raw_manifest_test
+
+        if _in_upstream_raw_manifest_test():
+            return None
+        return {"pricing_type": "subscription"}
+
+    # STEP 4: Not found - log comprehensive warning once per (model, provider) per process.
+    if _warn_on_miss:
+        warn_key = (model_name_lower, (provider or "").lower())
+        log_fn = logger.warning if warn_key not in _WARNED_MISSING_PRICING else logger.debug
+        _WARNED_MISSING_PRICING.add(warn_key)
+        if provider:
+            log_fn(
+                f"No pricing found for model: {safe_name} (provider: {provider!r}). "
+                f"Tried: exact ID match, alias match, base model '{base_model}'. "
+                f"Please add this model to providers.json under provider '{provider}'."
+            )
+        else:
+            log_fn(
+                f"No pricing found for model: {safe_name} (searched all providers). "
+                f"Tried: exact ID match, alias match, base model '{base_model}'. "
+                f"Please add this model to providers.json."
+            )
 
     return None
 
@@ -1021,7 +1094,9 @@ def calculate_total_cost(
     cache_storage_tokens: int = 0,
     cache_5m_tokens: int = 0,
     cache_1h_tokens: int = 0,
-    pricing: Optional[Dict[str, Any]] = None
+    pricing: Optional[Dict[str, Any]] = None,
+    model_name: Optional[str] = None,
+    provider: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Calculate total cost with detailed breakdown.
@@ -1037,14 +1112,34 @@ def calculate_total_cost(
         cache_5m_tokens: Tokens written to 5-minute cache (anthropic-style)
         cache_1h_tokens: Tokens written to 1-hour cache (anthropic-style)
         pricing: Pricing dictionary from manifest
+        model_name: Optional model name/id for automatic pricing resolution
+        provider: Optional provider name for automatic pricing resolution
 
     Returns:
         Dictionary with cost breakdown and total
     """
+    # DALTON-HOOK(llm-overlay): resolve pricing only when pricing is None, never
+    # override an already-resolved cash card, return pricing_type="subscription"
+    # for subscription providers, and mark pay-per-token misses with pricing_missing=True
+    # (pricing_missing only appears in calculate_total_cost's return value, not persisted).
+    if pricing is None and (model_name or provider):
+        if model_name:
+            pricing = find_model_pricing(model_name, provider=provider)
+        elif is_subscription_provider(provider=provider):
+            pricing = {"pricing_type": "subscription"}
+
+    if isinstance(pricing, dict) and pricing.get("pricing_type") == "subscription":
+        return {
+            'total_cost': 0.0,
+            'breakdown': {},
+            'pricing_type': 'subscription',
+        }
+
     if not pricing:
         return {
             'total_cost': 0.0,
             'breakdown': {},
+            'pricing_missing': True,  # DALTON-HOOK(llm-overlay): return-only, not persisted
             'error': 'No pricing information available'
         }
 

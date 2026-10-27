@@ -109,6 +109,10 @@ ALLOWED_HOOKS=(
   "subagent-caps"
   "global-search"
   "hide-experiments"
+  "provenance-full-archive"
+  "loop-stall-stack"
+  "fetch-binary-route"
+  "workspace-folder-ready"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)
@@ -321,8 +325,8 @@ pinned_modified_sha256 = {
     # Prod-fix batch 2 (FMP 402): routes US statements to researchdata SEC
     # first and names the yfinance fallback source.
     "mcp:fundamentals:get_financial_statements": "e1aac0cb68f187c3e64395b670cb78915faeacdd98dfa771bbc2742363af0362",
-    "mcp:yf_price:get_multiple_stocks_history": "f7c61b74abe894ccbe723329e971a2e2ea27d8c735ae6ddb490b4ea6c33f12ad",
-    "mcp:yf_price:get_stock_history": "bc8586db7b45021313669c22a045a3a554403fa5a334056772aef8c8e09ca0ad",
+    "mcp:yf_price:get_multiple_stocks_history": "599dfce8a175bffc69f28b28565c405fe26376cedfc70ec332d5bdc9ce38140f",
+    "mcp:yf_price:get_stock_history": "a863f62db0e6469a860973a71183cd36df5c7ac9512e9745dc37022922436b68",
 }
 errors = []
 for k, expected_sha in pinned_modified_sha256.items():

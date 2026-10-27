@@ -82,12 +82,14 @@ class TestGetStockHistory:
             interval="1day", count=5,  # canonical echo for yfinance "1d"
         )
         assert result["period"] == "1y"
+        assert result["price_treatment"] == "split_dividend_adjusted"
         assert "timezone" not in result  # tz-naive index → omitted
         assert result["data"][0]["date"] == "2024-01-01"
         assert result["data"][0]["close"] == 151.0
         assert result["data"][2]["dividends"] == 0.24
+        # DALTON-HOOK(stock-move-upgrade): explicit auto_adjust and price_treatment metadata.
         mock_ticker_cls.return_value.history.assert_called_once_with(
-            period="1y", interval="1d"
+            period="1y", interval="1d", auto_adjust=True
         )
 
     @patch("plugins.yfinance.yf_price_mcp_server.yf.Ticker")
@@ -98,7 +100,7 @@ class TestGetStockHistory:
 
         assert_ok_envelope(result, interval="1month")
         mock_ticker_cls.return_value.history.assert_called_once_with(
-            period="1y", interval="1mo"
+            period="1y", interval="1mo", auto_adjust=True
         )
 
     @patch("plugins.yfinance.yf_price_mcp_server.yf.Ticker")
@@ -109,7 +111,7 @@ class TestGetStockHistory:
         assert_ok_envelope(result, interval="1week")  # yfinance "1wk" → canonical
         assert result["period"] == "6mo"
         mock_ticker_cls.return_value.history.assert_called_once_with(
-            period="6mo", interval="1wk"
+            period="6mo", interval="1wk", auto_adjust=True
         )
 
     @patch("plugins.yfinance.yf_price_mcp_server.yf.Ticker")
@@ -120,7 +122,36 @@ class TestGetStockHistory:
 
         assert_ok_envelope(result, interval="3mo")
         mock_ticker_cls.return_value.history.assert_called_once_with(
-            period="1y", interval="3mo"
+            period="1y", interval="3mo", auto_adjust=True
+        )
+
+    # DALTON-HOOK(stock-move-upgrade): verify adjusted=True/False auto_adjust and price_treatment with create_autospec.
+    def test_adjusted_and_raw_modes_with_autospec(self, monkeypatch, mock_history_df):
+        from unittest.mock import create_autospec
+
+        import yfinance as yf
+
+        import plugins.yfinance.yf_price_mcp_server as yf_srv
+
+        ticker_instance = create_autospec(yf.Ticker, instance=True)
+        ticker_instance.history.return_value = mock_history_df
+        ticker_instance.history_metadata = {"currency": "USD"}
+        ticker_cls = create_autospec(yf.Ticker, return_value=ticker_instance)
+        monkeypatch.setattr(yf_srv.yf, "Ticker", ticker_cls)
+
+        res_adj = get_stock_history("AAPL")
+        assert_ok_envelope(res_adj, symbol="AAPL", currency="USD")
+        assert res_adj["price_treatment"] == "split_dividend_adjusted"
+        ticker_instance.history.assert_called_once_with(
+            period="1y", interval="1d", auto_adjust=True
+        )
+
+        ticker_instance.history.reset_mock()
+        res_raw = get_stock_history("AAPL", adjusted=False)
+        assert_ok_envelope(res_raw, symbol="AAPL", currency="USD")
+        assert res_raw["price_treatment"] == "raw"
+        ticker_instance.history.assert_called_once_with(
+            period="1y", interval="1d", auto_adjust=False
         )
 
     @patch("plugins.yfinance.yf_price_mcp_server.yf.Ticker")
@@ -339,6 +370,37 @@ class TestGetMultipleStocksHistory:
         assert_ok_envelope(result, count=0)
         assert result["data"]["X"]["count"] == 0
         assert result["data"]["Y"]["count"] == 0
+
+    # DALTON-HOOK(stock-move-upgrade): verify adjusted=True/False auto_adjust and price_treatment in batch tool.
+    def test_multiple_stocks_history_adjusted_and_raw_with_autospec(
+        self, monkeypatch, mock_history_df
+    ):
+        from unittest.mock import create_autospec
+
+        import yfinance as yf
+
+        import plugins.yfinance.yf_price_mcp_server as yf_srv
+
+        ticker_instance = create_autospec(yf.Ticker, instance=True)
+        ticker_instance.history.return_value = mock_history_df
+        ticker_instance.history_metadata = {"currency": "USD"}
+        ticker_cls = create_autospec(yf.Ticker, return_value=ticker_instance)
+        monkeypatch.setattr(yf_srv.yf, "Ticker", ticker_cls)
+
+        res_adj = get_multiple_stocks_history(["AAPL"])
+        assert res_adj["price_treatment"] == "split_dividend_adjusted"
+        assert res_adj["data"]["AAPL"]["price_treatment"] == "split_dividend_adjusted"
+        ticker_instance.history.assert_called_once_with(
+            period="1y", interval="1d", auto_adjust=True
+        )
+
+        ticker_instance.history.reset_mock()
+        res_raw = get_multiple_stocks_history(["AAPL"], adjusted=False)
+        assert res_raw["price_treatment"] == "raw"
+        assert res_raw["data"]["AAPL"]["price_treatment"] == "raw"
+        ticker_instance.history.assert_called_once_with(
+            period="1y", interval="1d", auto_adjust=False
+        )
 
 
 # ============================================================================

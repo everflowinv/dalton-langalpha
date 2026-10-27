@@ -3493,20 +3493,33 @@ def _hint_conflicts_with_category(category: str, hint: str) -> bool:
     return False
 
 
-# Upstream "found nothing for that concept/attachment id" messages (SEC): a
-# completed search with nothing to show, not an outage.
-_UPSTREAM_NO_MATCH_MARKERS: tuple[str, ...] = (
-    "no concepts matching",
-    "no concepts found",
-    "requested attachment was not found",
+# Upstream "found nothing for that concept/attachment/filing/item/accession"
+# messages (SEC): a completed lookup with nothing to show, not an outage.
+_SEC_OBJECT_NOT_FOUND_RE = re.compile(
+    r"(?i)\b(?:"
+    r"no\s+(?:concepts?|attachments?|filings?|items?|accessions?)\s+(?:matching|found)"
+    r"|(?:requested\s+)?(?:concept|attachment|filing|item|accession(?:\s+number)?)"
+    r"(?:\s+(?:'[^']*'|\"[^\"]*\"|[A-Za-z0-9_.:-]+))?\s+(?:was\s+|is\s+)?not\s+found"
+    r")\b"
 )
 
 
-def _upstream_no_match_marker(err_lower: str) -> str | None:
-    for marker in _UPSTREAM_NO_MATCH_MARKERS:
-        if marker in err_lower:
-            return marker
-    return None
+def _sec_data_error_text(payload: dict[str, Any]) -> str:
+    data_obj = payload.get("data")
+    if isinstance(data_obj, dict):
+        inner = str(data_obj.get("error") or "").strip()
+        if inner:
+            return inner
+    return str(payload.get("error") or "").strip()
+
+
+def _is_sec_object_not_found(route: str, payload: dict[str, Any]) -> bool:
+    if route != "sec":
+        return False
+    err_field = _sec_data_error_text(payload)
+    if not err_field:
+        return False
+    return bool(_SEC_OBJECT_NOT_FOUND_RE.search(err_field))
 
 
 def _reason_is_upstream_argument_error(reason: str) -> bool:
@@ -3568,13 +3581,13 @@ def _classify_error_category_and_hint(
         or "does not support" in err_lower
         or ("not allowed" in err_lower and status != "paid_source_not_allowed")
     )
-    no_match_marker = _upstream_no_match_marker(err_lower)
+    sec_no_match = _is_sec_object_not_found(route, payload)
 
     if existing_cat in ("参数错误", "上游不可用", "权限或额度", "没有匹配"):
         category = existing_cat
-    elif no_match_marker is not None:
-        # An unknown concept or attachment id found nothing; the upstream
-        # answered, so neither "参数错误" nor "上游暂不可用，可重试" is the fix.
+    elif sec_no_match:
+        # An unknown concept/attachment/filing/item/accession found nothing;
+        # the upstream answered, so neither "参数错误" nor "上游暂不可用，可重试" is the fix.
         category = "没有匹配"
     elif other_param_signal or e_bad_signal:
         _succeeded, failed_legs = (
@@ -3662,11 +3675,8 @@ def _classify_error_category_and_hint(
                 "若无替代源必须在报告中如实写明该数据源因权限/配额取数失败，禁止写成“没有相关信息”。"
             )
     elif category == "没有匹配":
-        if no_match_marker is not None:
-            hint = (
-                "SEC 未找到匹配的概念或附件 ID；先调用 finance(route='sec', operation='list-filings' 或 'attachments', "
-                "ticker=...) 拿到可用的 filing/attachment ID 再读取，不要猜文件名或章节 ID。"
-            )
+        if sec_no_match:
+            hint = "先用 search-concepts / list-filings / attachments 拿到可用的名称或 ID 再读，不要猜"
         elif route == "transcript":
             hint = TRANSCRIPT_NO_MATCH_HINT
         elif tool_name == "community":
@@ -10694,6 +10704,12 @@ class ResearchDataBridge:
         grant_email = str(body.get("grant_email") or "").strip().lower()
 
         def _create(client: FeishuClient) -> dict[str, Any]:
+            block_ids, blocks = client.convert_markdown(markdown)
+            if not block_ids:
+                raise FeishuApiError(
+                    "markdown_convert_empty", "markdown conversion produced no blocks"
+                )
+
             node_token = ""
             document_id = ""
             if space_id:
@@ -10715,17 +10731,21 @@ class ResearchDataBridge:
                         f"document created but its body was NOT written ({reason}); "
                         f"fix manually at {url}"
                     ),
+                    "detail": reason,
                     "document_id": document_id,
                     "url": url,
                 }
 
             try:
-                block_ids, blocks = client.convert_markdown(markdown)
-                if not block_ids:
-                    return _content_insert_failed("markdown conversion produced no blocks")
                 client.insert_descendants(document_id, document_id, block_ids, blocks, 0)
             except FeishuApiError as exc:
-                return _content_insert_failed(f"{exc.error_code}: {str(exc)[:200]}")
+                sanitized_reason = _sanitize_feishu_response_preview(
+                    f"{exc.error_code}: {str(exc)}",
+                    secrets=(client.app_secret, client._tenant_token),
+                    dynamic_ids=(document_id, node_token, space_id, parent_node_token, folder_token),
+                    limit=200,
+                )
+                return _content_insert_failed(sanitized_reason)
             readback = client.get_document(document_id)
 
             payload: dict[str, Any] = {
@@ -10778,12 +10798,47 @@ class ResearchDataBridge:
             return 400, {"ok": False, "error": "markdown_required"}
 
         def _append(client: FeishuClient) -> dict[str, Any]:
-            document_id, _node = resolve_feishu_document(client, kind, token)
+            document_id, node = resolve_feishu_document(client, kind, token)
             block_ids, blocks = client.convert_markdown(markdown)
             if not block_ids:
-                raise FeishuApiError("markdown_convert_empty")
-            index = client.root_children_count(document_id)
-            client.insert_descendants(document_id, document_id, block_ids, blocks, index)
+                raise FeishuApiError(
+                    "markdown_convert_empty", "markdown conversion produced no blocks"
+                )
+            node_token = (
+                str(node.get("node_token") or "")
+                if isinstance(node, dict) and node.get("node_token")
+                else (token if kind == "wiki" else "")
+            )
+            try:
+                index = client.root_children_count(document_id)
+                client.insert_descendants(document_id, document_id, block_ids, blocks, index)
+            except FeishuApiError as exc:
+                url = feishu_doc_url(document_id, node_token)
+                reason = _sanitize_feishu_response_preview(
+                    f"{exc.error_code}: {str(exc)}",
+                    secrets=(client.app_secret, client._tenant_token),
+                    dynamic_ids=(document_id, node_token, token),
+                    limit=200,
+                )
+                outcome = (
+                    "unknown"
+                    if _feishu_outcome_unknown(exc.error_code)
+                    else "rejected"
+                )
+                lead = (
+                    "追加请求结果未知，可能已经写入；请先打开文档检查，不要直接重试"
+                    if outcome == "unknown"
+                    else "追加内容没有写入，原文档未改变"
+                )
+                return {
+                    "ok": False,
+                    "error": "content_insert_failed",
+                    "outcome": outcome,
+                    "message": f"{lead} ({reason}); url={url}",
+                    "detail": reason,
+                    "document_id": document_id,
+                    "url": url,
+                }
             return {
                 "ok": True,
                 "document_id": document_id,
@@ -10791,6 +10846,8 @@ class ResearchDataBridge:
             }
 
         code, result = await self._run_feishu(_append)
+        if result.get("error") == "content_insert_failed":
+            return 502, result
         return code, result
 
 
@@ -11183,6 +11240,25 @@ class FeishuApiError(RuntimeError):
         self.error_code = error_code
 
 
+#: Codes where Feishu never returned a definite verdict: the connection died
+#: mid-response or the body was unparseable, so a write may have been committed
+#: anyway. Callers must not claim nothing was written for these.
+_FEISHU_UNKNOWN_OUTCOME_CODES: frozenset[str] = frozenset({
+    "feishu_network_error",
+    "feishu_invalid_response",
+    "feishu_empty_error_response",
+})
+
+
+def _feishu_outcome_unknown(error_code: str) -> bool:
+    """Whether a Feishu failure leaves it unknown if the write landed: no
+    response, an unparseable or empty error body, or a 5xx (a gateway may
+    answer after the upstream committed). Only a 4xx with a body is a refusal."""
+    return error_code in _FEISHU_UNKNOWN_OUTCOME_CODES or error_code.startswith(
+        "feishu_http_5"
+    )
+
+
 #: OpenClaw's Eve tracking group (internal team), the default share target for
 #: docs the bot creates; override with FEISHU_DEFAULT_GRANT_CHAT_ID.
 FEISHU_DEFAULT_GRANT_CHAT_ID = "oc_397207208fb52a0b09969794ef3cd421"
@@ -11380,6 +11456,131 @@ def resolve_feishu_node_for_check(
     return token, {}
 
 
+_FEISHU_STATIC_PATH_SEGMENTS: frozenset[str] = frozenset({
+    "open-apis", "auth", "v1", "v2", "v3", "tenant_access_token", "internal",
+    "docx", "documents", "blocks", "convert", "raw_content", "descendant",
+    "children", "wiki", "spaces", "get_node", "nodes", "drive", "permissions",
+    "members", "files", "download", "im", "messages", "chats", "bitable",
+    "apps", "tables", "records", "fields",
+})
+_FEISHU_AUTH_TOKEN_RE = re.compile(
+    r"(?i)\b(?:(?:t|u)-[A-Za-z0-9._\-]{6,}|cli_[A-Za-z0-9._\-]{6,})\b"
+)
+_FEISHU_DOC_ID_RE = re.compile(
+    r"(?i)\b(?:doc|dox|wik|bas|box|fld)[A-Za-z0-9]{8,}\b"
+)
+_FEISHU_DYNAMIC_ID_KEYS: frozenset[str] = frozenset({
+    "document_id",
+    "block_id",
+    "node_token",
+    "space_id",
+    "folder_token",
+    "parent_node_token",
+    "obj_token",
+    "origin_node_token",
+    "origin_space_id",
+    "token",
+    "member_id",
+})
+
+
+def _feishu_path_template(path: str) -> str:
+    clean = urllib.parse.urlsplit(str(path or "")).path or "/"
+    parts = [p for p in clean.split("/") if p]
+    out: list[str] = []
+    for i, seg in enumerate(parts):
+        prev = parts[i - 1] if i > 0 else ""
+        if prev == "documents" and seg not in _FEISHU_STATIC_PATH_SEGMENTS:
+            out.append("{document_id}")
+        elif prev == "blocks" and seg not in _FEISHU_STATIC_PATH_SEGMENTS:
+            out.append("{block_id}")
+        elif prev == "spaces" and seg not in _FEISHU_STATIC_PATH_SEGMENTS:
+            out.append("{space_id}")
+        elif prev == "permissions" and seg not in _FEISHU_STATIC_PATH_SEGMENTS:
+            out.append("{token}")
+        elif seg not in _FEISHU_STATIC_PATH_SEGMENTS:
+            out.append("{token}")
+        else:
+            out.append(seg)
+    return "/" + "/".join(out)
+
+
+def _feishu_collect_dynamic_ids(node: Any, ids: list[str]) -> None:
+    """Collect dynamic Feishu ids from a nested request payload, at any depth.
+
+    An id-shaped key (`*_id`, `*_token`, plus `children`/`cells`, which carry
+    bare block ids) marks every string under it — its own value or each string
+    item of its list, e.g. `descendants[*].block_id` or a child block's
+    `children` — as an id; everything else is only recursed into.
+    """
+    if isinstance(node, dict):
+        for key, val in node.items():
+            k = str(key)
+            if k.endswith(("_id", "_token")) or k in ("children", "cells"):
+                if isinstance(val, str):
+                    if val.strip():
+                        ids.append(val.strip())
+                    continue
+                if isinstance(val, list):
+                    for item in val:
+                        if isinstance(item, str):
+                            if item.strip():
+                                ids.append(item.strip())
+                        else:
+                            _feishu_collect_dynamic_ids(item, ids)
+                    continue
+            _feishu_collect_dynamic_ids(val, ids)
+    elif isinstance(node, list):
+        for item in node:
+            _feishu_collect_dynamic_ids(item, ids)
+
+
+def _feishu_request_dynamic_ids(
+    path: str,
+    query: dict[str, Any] | None = None,
+    json_body: dict[str, Any] | None = None,
+) -> tuple[str, ...]:
+    clean = urllib.parse.urlsplit(str(path or "")).path or "/"
+    ids: list[str] = [
+        seg for seg in clean.split("/") if seg and seg not in _FEISHU_STATIC_PATH_SEGMENTS
+    ]
+    if isinstance(query, dict):
+        for key, val in query.items():
+            if key in _FEISHU_DYNAMIC_ID_KEYS and isinstance(val, str) and val.strip():
+                ids.append(val.strip())
+    _feishu_collect_dynamic_ids(json_body, ids)
+    # Sort longest-first so a longer id is replaced before a shorter prefix.
+    return tuple(sorted(set(ids), key=len, reverse=True))
+
+
+def _sanitize_feishu_response_preview(
+    raw: str,
+    *,
+    secrets: tuple[str, ...] = (),
+    dynamic_ids: tuple[str, ...] = (),
+    limit: int = 120,
+) -> str:
+    text = " ".join((raw or "").split())
+    if not text:
+        return ""
+    for sec in secrets:
+        if sec:
+            text = text.replace(sec, "[REDACTED]")
+    for did in dynamic_ids:
+        if did:
+            text = text.replace(did, "<id>")
+    # Take the leading slice first (with a small lookahead buffer so tokens
+    # straddling the boundary still match regexes) rather than calling
+    # sanitize_stderr_text(), which truncates to the *last* 500 chars.
+    text = text[: max(limit * 2, 240)]
+    for pat, repl in _STDERR_SECRET_PATTERNS:
+        text = pat.sub(repl, text)
+    text = _FEISHU_AUTH_TOKEN_RE.sub("[REDACTED]", text)
+    text = _FEISHU_DOC_ID_RE.sub("<id>", text)
+    text = " ".join(text.split())
+    return text[:limit]
+
+
 class FeishuClient:
     """Minimal blocking Feishu OpenAPI client (tenant token + docx/wiki/permissions).
 
@@ -11417,6 +11618,27 @@ class FeishuClient:
         self._token_expires_at = now + ttl - FEISHU_TOKEN_REFRESH_MARGIN_S
         return token
 
+    def _invalid_response_detail(
+        self,
+        status: int,
+        content_type: str,
+        path: str,
+        raw: str,
+        *,
+        query: dict[str, Any] | None = None,
+        json_body: dict[str, Any] | None = None,
+    ) -> str:
+        ct = " ".join((content_type or "").split()) or "unknown"
+        tmpl = _feishu_path_template(path)
+        dynamic_ids = _feishu_request_dynamic_ids(path, query=query, json_body=json_body)
+        preview = _sanitize_feishu_response_preview(
+            raw,
+            secrets=(self.app_secret, self._tenant_token),
+            dynamic_ids=dynamic_ids,
+            limit=120,
+        )
+        return f"http_{status} content_type={ct} path={tmpl} body={preview!r}"
+
     def _request(
         self,
         method: str,
@@ -11440,24 +11662,50 @@ class FeishuClient:
         )
         req = urllib.request.Request(url, data=data_bytes, method=method, headers=headers)
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        content_type = ""
         try:
             with opener.open(req, timeout=self.timeout_s) as resp:
                 raw = resp.read().decode("utf-8", errors="replace")
                 status = resp.status
+                resp_headers = getattr(resp, "headers", None)
+                if resp_headers is not None and hasattr(resp_headers, "get"):
+                    content_type = str(
+                        resp_headers.get("Content-Type") or resp_headers.get("content-type") or ""
+                    )
         except urllib.error.HTTPError as exc:
             try:
                 raw = exc.read().decode("utf-8", errors="replace")
             except Exception:
                 raw = ""
             status = exc.code
+            exc_headers = getattr(exc, "headers", None)
+            if exc_headers is not None and hasattr(exc_headers, "get"):
+                content_type = str(
+                    exc_headers.get("Content-Type") or exc_headers.get("content-type") or ""
+                )
         except Exception as exc:
             raise FeishuApiError("feishu_network_error", type(exc).__name__) from exc
+        if status >= 500 and not raw.strip():
+            # A server error with no body says nothing about whether the request
+            # took effect (an empty gateway 502 after a committed write). An
+            # empty 4xx is still a refusal and keeps its feishu_http_4xx code.
+            raise FeishuApiError("feishu_empty_error_response", f"http_{status}")
         try:
             payload = json.loads(raw) if raw.strip() else {}
         except ValueError:
-            raise FeishuApiError("feishu_invalid_response", f"http_{status}") from None
+            raise FeishuApiError(
+                "feishu_invalid_response",
+                self._invalid_response_detail(
+                    status, content_type, path, raw, query=query, json_body=json_body
+                ),
+            ) from None
         if not isinstance(payload, dict):
-            raise FeishuApiError("feishu_invalid_response", f"http_{status}")
+            raise FeishuApiError(
+                "feishu_invalid_response",
+                self._invalid_response_detail(
+                    status, content_type, path, raw, query=query, json_body=json_body
+                ),
+            )
         if status < 200 or status >= 300:
             raise FeishuApiError(
                 f"feishu_http_{status}",
@@ -11503,7 +11751,7 @@ class FeishuClient:
         """
         data = self._request(
             "POST",
-            "/open-apis/docx/v1/blocks/convert",
+            "/open-apis/docx/v1/documents/blocks/convert",
             json_body={"content_type": "markdown", "content": markdown},
         )
         ids = data.get("first_level_block_ids")

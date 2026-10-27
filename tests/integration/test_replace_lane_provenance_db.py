@@ -87,8 +87,8 @@ async def test_a_lane_write_replaces_its_lane_only(response_row, db_conn):
             lanes=(MAIN_PROVENANCE_LANE,),
         )
 
-    assert await replace_lane_provenance(response_row, [TASK_PROVENANCE], LANES)
-    assert await replace_lane_provenance(response_row, [TASK_PROVENANCE], LANES)
+    assert await replace_lane_provenance(response_row, [TASK_PROVENANCE], LANES) == 1
+    assert await replace_lane_provenance(response_row, [TASK_PROVENANCE], LANES) == 1
 
     assert await _lane_rows(db_conn, response_row) == [
         ("main", "https://a.example", False),
@@ -96,7 +96,9 @@ async def test_a_lane_write_replaces_its_lane_only(response_row, db_conn):
     ]
 
     # A later write with none of the lane's sources saved empties it.
-    assert await replace_lane_provenance(response_row, [], LANES)
+    # DALTON-HOOK(provenance-full-archive): replace_lane_provenance returns int | None
+    empty_written = await replace_lane_provenance(response_row, [], LANES)
+    assert empty_written is not None and empty_written == 0
 
     assert await _lane_rows(db_conn, response_row) == [
         ("main", "https://a.example", False),
@@ -106,6 +108,10 @@ async def test_a_lane_write_replaces_its_lane_only(response_row, db_conn):
 async def test_missing_row_reports_false(patched_get_db_connection):
     from src.server.database.conversation.responses import replace_lane_provenance
 
-    assert not await replace_lane_provenance(
-        str(uuid.uuid4()), [TASK_PROVENANCE], LANES
+    # DALTON-HOOK(provenance-full-archive): missing response row returns None
+    assert (
+        await replace_lane_provenance(
+            str(uuid.uuid4()), [TASK_PROVENANCE], LANES
+        )
+        is None
     )

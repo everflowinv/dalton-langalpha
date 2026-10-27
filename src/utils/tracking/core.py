@@ -10,6 +10,10 @@ logger = logging.getLogger(__name__)
 # reaches a log line.
 _LOGGED_NAME_MAX_LEN = 120
 
+# DALTON-HOOK(llm-overlay): deduplicate platform missing-pricing warnings per
+# (model, provider) per process so repeated turns do not spam WARNING logs.
+_WARNED_TRACKING_MISSING_PRICING: set[Tuple[str, str]] = set()
+
 # Which key space ``by_model`` uses, read off the row rather than inferred from
 # created_at — during a blue/green drain both shapes are written concurrently,
 # which is exactly when a timestamp boundary stops working. Derived per payload
@@ -265,7 +269,15 @@ def calculate_cost_from_per_call_records(
                 "recording tokens with zero cost"
             )
             if billing_type == "platform":
-                logger.warning(miss)
+                # DALTON-HOOK(llm-overlay): warn once per (model, provider) per process.
+                warn_key = (pricing_id.lower(), (provider or "").lower())
+                log_fn = (
+                    logger.warning
+                    if warn_key not in _WARNED_TRACKING_MISSING_PRICING
+                    else logger.debug
+                )
+                _WARNED_TRACKING_MISSING_PRICING.add(warn_key)
+                log_fn(miss)
             else:
                 logger.debug(miss)
         elif pricing.get("pricing_type") == "subscription":
@@ -360,6 +372,8 @@ def calculate_cost_from_per_call_records(
             call_cost = cost_result['total_cost']
             call_breakdown = cost_result.get('breakdown', {})
         else:
+            # DALTON-HOOK(llm-overlay): pricing_missing only appears in
+            # calculate_total_cost's return value and is not persisted into usage records.
             call_cost = 0.0
             call_breakdown = {}
 

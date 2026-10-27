@@ -412,3 +412,102 @@ async def test_yfinance_analyst_price_targets_maps_consensus_to_mean(monkeypatch
             "targetConsensus": 215.5,
         }
     ]
+
+
+@pytest.mark.parametrize(
+    ("raw_symbol", "expected_yahoo"),
+    [
+        ("USDCNY", "USDCNY=X"),
+        ("USDCNY=X", "USDCNY=X"),
+        ("USD-CNY", "USDCNY=X"),
+        ("EURUSD", "EURUSD=X"),
+        ("USDHKD", "USDHKD=X"),
+        ("BTC-USD", "BTC-USD"),
+        ("AAPL", "AAPL"),
+        ("GOOGL", "GOOGL"),
+    ],
+)
+def test_yahoo_symbol_normalizes_fx_pairs(raw_symbol: str, expected_yahoo: str):
+    from src.data_client.yfinance.yahoo import yahoo_symbol
+
+    assert yahoo_symbol(raw_symbol) == expected_yahoo
+
+
+@pytest.mark.parametrize(
+    ("input_symbol", "expected_yf_symbol", "expected_price"),
+    [
+        ("USDCNY", "USDCNY=X", 7.1234),
+        ("USDCNY=X", "USDCNY=X", 7.1234),
+        ("EURUSD", "EURUSD=X", 1.0845),
+        ("USDHKD", "USDHKD=X", 7.7721),
+    ],
+)
+@pytest.mark.asyncio
+async def test_fetch_quote_fx_served_by_yfinance_when_fmp_quota_exhausted(
+    monkeypatch: pytest.MonkeyPatch,
+    input_symbol: str,
+    expected_yf_symbol: str,
+    expected_price: float,
+):
+    import yfinance as yf_mod
+
+    import src.data_client.yfinance.yahoo as yf_yahoo
+    import src.tools.market_data.quotes as quotes_mod
+    from src.data_client.fmp.data_source import FMPDataSource
+    from src.data_client.market_data_provider import MarketDataProvider, ProviderEntry
+    from src.data_client.yfinance.data_source import YFinanceDataSource
+
+    real_ticker_cls = yf_mod.Ticker
+    seen_yf_symbols: list[str] = []
+
+    def _build_ticker(sym: str):
+        seen_yf_symbols.append(sym)
+        ticker = create_autospec(real_ticker_cls, instance=True)
+        if sym == expected_yf_symbol:
+            ticker.fast_info = {
+                "lastPrice": expected_price,
+                "regularMarketPreviousClose": round(expected_price - 0.01, 4),
+                "open": round(expected_price - 0.005, 4),
+                "dayHigh": round(expected_price + 0.01, 4),
+                "dayLow": round(expected_price - 0.02, 4),
+                "lastVolume": 0,
+            }
+            ticker.history_metadata = {"regularMarketTime": 1761523200}
+        else:
+            ticker.fast_info = {"lastPrice": None}
+            ticker.history_metadata = {}
+        return ticker
+
+    ticker_factory = create_autospec(real_ticker_cls, side_effect=_build_ticker)
+    monkeypatch.setattr(yf_yahoo.yf, "Ticker", ticker_factory)
+
+    fmp_source = create_autospec(FMPDataSource, instance=True)
+    fmp_source.get_snapshots.side_effect = FmpQuotaExhausted(RESET)
+
+    provider = MarketDataProvider(
+        entries=[
+            ProviderEntry(name="yfinance", source=YFinanceDataSource(), markets={"all"}),
+            ProviderEntry(name="fmp", source=fmp_source, markets={"all"}),
+        ]
+    )
+    monkeypatch.setattr(
+        quotes_mod,
+        "get_market_data_provider",
+        create_autospec(quotes_mod.get_market_data_provider, return_value=provider),
+    )
+    monkeypatch.setattr(
+        quotes_mod,
+        "fill_quote_names",
+        create_autospec(quotes_mod.fill_quote_names, return_value=None),
+    )
+
+    content, artifact = await quotes_mod.fetch_quote([input_symbol])
+
+    assert seen_yf_symbols == [expected_yf_symbol]
+    fmp_source.get_snapshots.assert_not_awaited()
+    assert len(artifact["quotes"]) == 1
+    quote_row = artifact["quotes"][0]
+    assert quote_row["source"] == "yfinance"
+    assert quote_row["price"] == pytest.approx(expected_price)
+    assert "(no data:" not in content
+

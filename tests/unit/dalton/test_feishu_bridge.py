@@ -447,7 +447,7 @@ async def test_append_insert_body_carries_descendants(monkeypatch: pytest.Monkey
     assert [r.full_url for r in seen] == [
         "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
         "https://open.feishu.cn/open-apis/wiki/v2/spaces/get_node?token=w1",
-        "https://open.feishu.cn/open-apis/docx/v1/blocks/convert",
+        "https://open.feishu.cn/open-apis/docx/v1/documents/blocks/convert",
         "https://open.feishu.cn/open-apis/docx/v1/documents/doccnA/blocks/doccnA/children?page_size=50",
         "https://open.feishu.cn/open-apis/docx/v1/documents/doccnA/blocks/doccnA/descendant",
     ]
@@ -479,8 +479,8 @@ async def test_create_insert_failure_reports_created_doc_and_url(
         monkeypatch,
         [
             (200, {"code": 0, "msg": "ok", "tenant_access_token": "t-real-1", "expire": 7200}),
-            (200, {"code": 0, "data": {"document": {"document_id": "doccnHalf", "title": "T"}}}),
             (200, {"code": 0, "data": {"first_level_block_ids": ["b1"], "blocks": [{"block_id": "b1"}]}}),
+            (200, {"code": 0, "data": {"document": {"document_id": "doccnHalf", "title": "T"}}}),
             (400, {"code": 1770043, "msg": "no edit permission for this document"}),
         ],
     )
@@ -499,9 +499,229 @@ async def test_create_insert_failure_reports_created_doc_and_url(
     assert payload["url"] == "https://feishu.cn/docx/doccnHalf"
     assert "NOT written" in payload["message"]
     assert "1770043" in payload["message"]
-    # No grant attempt and no readback on a failed insert.
+    # Convert runs before document creation; no grant attempt and no readback on a failed insert.
+    assert [r.full_url for r in seen] == [
+        "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
+        "https://open.feishu.cn/open-apis/docx/v1/documents/blocks/convert",
+        "https://open.feishu.cn/open-apis/docx/v1/documents",
+        "https://open.feishu.cn/open-apis/docx/v1/documents/doccnHalf/blocks/doccnHalf/descendant",
+    ]
     assert all("/permissions/" not in r.full_url for r in seen)
     assert all("/documents/doccnHalf?" not in r.full_url for r in seen)
+
+
+@pytest.mark.asyncio
+async def test_create_convert_failure_does_not_create_document_or_wiki_doc(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """When markdown conversion fails or produces no blocks, neither create_document nor create_wiki_doc is called."""
+    bridge = _make_bridge(monkeypatch, tmp_path)
+
+    def _convert_fail(markdown: str):
+        raise rb.FeishuApiError(
+            "feishu_invalid_response",
+            "http_404 content_type=text/plain path=/open-apis/docx/v1/documents/blocks/convert body='404 page not found'",
+        )
+
+    client_drive = _stub_feishu_client(bridge, convert_markdown=_convert_fail)
+    code, payload = await bridge.handle_feishu_doc_create({"title": "T", "markdown": "# hi"})
+    assert code == 502
+    assert payload["ok"] is False
+    assert payload["error"] == "feishu_invalid_response"
+    assert "http_404" in payload["detail"]
+    client_drive.create_document.assert_not_called()
+    client_drive.create_wiki_doc.assert_not_called()
+
+    client_wiki = _stub_feishu_client(bridge, convert_markdown=_convert_fail)
+    code_w, payload_w = await bridge.handle_feishu_doc_create(
+        {"title": "T", "markdown": "# hi", "space_id": "sp1"}
+    )
+    assert code_w == 502
+    assert payload_w["ok"] is False
+    client_wiki.create_document.assert_not_called()
+    client_wiki.create_wiki_doc.assert_not_called()
+
+    # Empty convert result also aborts before creating any document.
+    client_empty = _stub_feishu_client(bridge, convert_markdown=([], []))
+    code_e, payload_e = await bridge.handle_feishu_doc_create({"title": "T", "markdown": "# hi"})
+    assert code_e == 502
+    assert payload_e["error"] == "markdown_convert_empty"
+    client_empty.create_document.assert_not_called()
+    client_empty.create_wiki_doc.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_append_insert_failure_reports_doc_url_and_detail(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    bridge = _make_bridge(monkeypatch, tmp_path)
+
+    def _insert_fail(doc_id, block_id, children_ids, descendants, index):
+        raise rb.FeishuApiError("feishu_http_400", "code=1770001 msg=invalid block")
+
+    _stub_feishu_client(bridge, insert_descendants=_insert_fail)
+    code, payload = await bridge.handle_feishu_doc_append(
+        {"token": "https://x.feishu.cn/wiki/wikinode1", "markdown": "# more"}
+    )
+    assert code == 502
+    assert payload["ok"] is False
+    assert payload["error"] == "content_insert_failed"
+    assert payload["outcome"] == "rejected"
+    assert payload["document_id"] == "doccnWiki1"
+    assert payload["url"] == "https://feishu.cn/wiki/wikinode1"
+    assert "追加内容没有写入，原文档未改变" in payload["message"]
+    assert "1770001" in payload["message"]
+    assert "1770001" in payload["detail"]
+
+
+@pytest.mark.asyncio
+async def test_append_network_error_reports_unknown_outcome_not_unchanged(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A timeout after Feishu may have committed the append: never claim the doc
+    is unchanged, and tell the caller to check the doc instead of retrying."""
+    bridge = _make_bridge(monkeypatch, tmp_path)
+
+    def _insert_timeout(doc_id, block_id, children_ids, descendants, index):
+        raise rb.FeishuApiError("feishu_network_error", "timeout")
+
+    _stub_feishu_client(bridge, insert_descendants=_insert_timeout)
+    code, payload = await bridge.handle_feishu_doc_append(
+        {"token": "https://x.feishu.cn/wiki/wikinode1", "markdown": "# more"}
+    )
+    assert code == 502
+    assert payload["ok"] is False
+    assert payload["error"] == "content_insert_failed"
+    assert payload["outcome"] == "unknown"
+    assert payload["document_id"] == "doccnWiki1"
+    assert payload["url"] == "https://feishu.cn/wiki/wikinode1"
+    assert "追加请求结果未知，可能已经写入" in payload["message"]
+    assert "不要直接重试" in payload["message"]
+    assert "原文档未改变" not in payload["message"]
+
+
+def test_request_non_json_error_carries_status_content_type_path_template_without_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import email
+    import io
+    import urllib.error
+    import urllib.request
+
+    hdrs = email.message.Message()
+    hdrs["Content-Type"] = "text/plain; charset=utf-8"
+    # Over 600 chars so tail-truncating sanitizers would lose the leading 404 message;
+    # echoes doccnSecretDoc123456 and custom dynamic IDs from the request.
+    raw_body = (
+        "404 page not found doc=doccnSecretDoc123456 block=blkCustom987 "
+        "Authorization: Bearer t-secretTokenValue999 "
+        "token=u-userSecretToken888 fake-app-secret "
+        + ("x" * 600)
+    )
+
+    opener = create_autospec(urllib.request.OpenerDirector, instance=True)
+
+    def _open(req: Any, timeout: Any = None) -> Any:
+        raise urllib.error.HTTPError(
+            req.full_url, 404, "Not Found", hdrs, io.BytesIO(raw_body.encode("utf-8"))
+        )
+
+    opener.open.side_effect = _open
+    monkeypatch.setattr(
+        rb.urllib.request,
+        "build_opener",
+        create_autospec(urllib.request.build_opener, return_value=opener),
+    )
+
+    client = rb.FeishuClient("fake-app-id", "fake-app-secret", timeout_s=1.0)
+    client._tenant_token = "t-secretTokenValue999"
+    client._token_expires_at = time.time() + 3600.0
+
+    with pytest.raises(rb.FeishuApiError) as excinfo:
+        client._request(
+            "POST",
+            "/open-apis/docx/v1/documents/doccnSecretDoc123456/blocks/blkCustom987/descendant",
+            query={"page_token": "pt_secret_query", "access_token": "t-secretTokenValue999"},
+            json_body={"index": 0},
+        )
+
+    msg = str(excinfo.value)
+    assert excinfo.value.error_code == "feishu_invalid_response"
+    assert "http_404" in msg
+    assert "text/plain; charset=utf-8" in msg
+    assert "/open-apis/docx/v1/documents/{document_id}/blocks/{block_id}/descendant" in msg
+    assert "404 page not found" in msg
+    assert "doc=<id>" in msg
+    assert "block=<id>" in msg
+    # No token, document_id, secret, or query string leaked in the error detail.
+    for forbidden in (
+        "doccnSecretDoc123456",
+        "blkCustom987",
+        "t-secretTokenValue999",
+        "u-userSecretToken888",
+        "fake-app-secret",
+        "pt_secret_query",
+        "access_token",
+    ):
+        assert forbidden not in msg
+
+
+def test_request_dynamic_ids_collected_recursively_from_nested_bodies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ids nested in the request body — `descendants[*].block_id` and a child
+    block's `children` list — are redacted from non-JSON error previews too."""
+    import email
+    import io
+    import urllib.error
+    import urllib.request
+
+    hdrs = email.message.Message()
+    hdrs["Content-Type"] = "text/html; charset=utf-8"
+    raw_body = "Bad Gateway: failed to insert blkChild987 under blkTop456 in doccnTarget123456"
+
+    opener = create_autospec(urllib.request.OpenerDirector, instance=True)
+
+    def _open(req: Any, timeout: Any = None) -> Any:
+        raise urllib.error.HTTPError(
+            req.full_url, 502, "Bad Gateway", hdrs, io.BytesIO(raw_body.encode("utf-8"))
+        )
+
+    opener.open.side_effect = _open
+    monkeypatch.setattr(
+        rb.urllib.request,
+        "build_opener",
+        create_autospec(urllib.request.build_opener, return_value=opener),
+    )
+
+    client = rb.FeishuClient("fake-app-id", "fake-app-secret", timeout_s=1.0)
+    client._tenant_token = "t-secretTokenValue999"
+    client._token_expires_at = time.time() + 3600.0
+
+    with pytest.raises(rb.FeishuApiError) as excinfo:
+        client._request(
+            "POST",
+            "/open-apis/docx/v1/documents/doccnTarget123456/blocks/doccnTarget123456/descendant",
+            json_body={
+                "children_id": ["blkTop456"],
+                "index": 0,
+                "descendants": [
+                    {
+                        "block_id": "blkTop456",
+                        "block_type": 2,
+                        "children": ["blkChild987"],
+                    },
+                    {"block_id": "blkChild987", "block_type": 2, "parent_id": "blkTop456"},
+                ],
+            },
+        )
+
+    msg = str(excinfo.value)
+    assert excinfo.value.error_code == "feishu_invalid_response"
+    # The child id only appears in the body's nested fields, not the path.
+    assert "blkChild987" not in msg
+    assert "blkTop456" not in msg
+    assert "<id>" in msg
 
 
 @pytest.mark.asyncio
@@ -711,3 +931,53 @@ def test_grant_chat_full_access_request_shape() -> None:
         query={"type": "docx", "need_notification": "false"},
         json_body={"member_type": "openchat", "member_id": "oc_team", "perm": "full_access"},
     )
+
+
+@pytest.mark.parametrize(
+    ("error_code", "unknown"),
+    [
+        ("feishu_network_error", True),
+        ("feishu_invalid_response", True),
+        ("feishu_empty_error_response", True),
+        ("feishu_http_502", True),
+        ("feishu_http_503", True),
+        ("feishu_http_400", False),
+        ("feishu_api_error", False),
+    ],
+)
+def test_feishu_outcome_unknown_only_when_the_write_may_have_landed(
+    error_code: str, unknown: bool
+) -> None:
+    assert rb._feishu_outcome_unknown(error_code) is unknown
+
+
+def test_request_empty_error_body_is_an_unknown_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An empty 502 from a gateway after a committed write must not read as a refusal."""
+    import email
+    import io
+    import urllib.error
+    import urllib.request
+
+    opener = create_autospec(urllib.request.OpenerDirector, instance=True)
+
+    def _open(req: Any, timeout: Any = None) -> Any:
+        raise urllib.error.HTTPError(
+            req.full_url, 502, "Bad Gateway", email.message.Message(), io.BytesIO(b"")
+        )
+
+    opener.open.side_effect = _open
+    monkeypatch.setattr(
+        rb.urllib.request,
+        "build_opener",
+        create_autospec(urllib.request.build_opener, return_value=opener),
+    )
+    client = rb.FeishuClient("fake-app-id", "fake-app-secret", timeout_s=1.0)
+    client._tenant_token = "t-token"
+    client._token_expires_at = time.time() + 3600.0
+
+    with pytest.raises(rb.FeishuApiError) as excinfo:
+        client._request("POST", "/open-apis/docx/v1/documents/d/blocks/d/descendant", json_body={})
+    assert excinfo.value.error_code == "feishu_empty_error_response"
+    assert rb._feishu_outcome_unknown(excinfo.value.error_code)

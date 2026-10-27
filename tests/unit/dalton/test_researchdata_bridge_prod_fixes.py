@@ -95,6 +95,73 @@ def test_sec_attachment_not_found_is_a_no_match():
     assert "暂不可用" not in hint
 
 
+def test_sec_concept_not_found_in_data_error_is_no_match():
+    payload = {
+        "ok": False,
+        "status": "error",
+        "data": {
+            "error": "Concept 'NoSuchConceptXyz123' not found. Use search-concepts first.",
+        },
+    }
+    rb._apply_error_and_empty_contract(
+        "finance",
+        "sec",
+        "facts",
+        payload,
+        {"route": "sec", "operation": "facts", "ticker": "AAPL", "concept": "NoSuchConceptXyz123"},
+    )
+    assert payload["error_category"] == "没有匹配"
+    assert payload["hint"] == "先用 search-concepts / list-filings / attachments 拿到可用的名称或 ID 再读，不要猜"
+
+
+def test_sec_object_not_found_variants_and_non_sec_isolation():
+    for err_msg in (
+        "Concept 'NoSuchConceptXyz123' not found. Use search-concepts first.",
+        "Attachment 'ex10-1.htm' not found",
+        "Filing '0000320193-25-000001' not found",
+        "Item 'Item 1A' not found",
+        "Accession '0000320193-25-000001' not found",
+    ):
+        payload = {"ok": False, "status": "error", "data": {"error": err_msg}}
+        category, hint = rb._classify_error_category_and_hint(
+            "finance", "sec", "facts", payload
+        )
+        assert category == "没有匹配", err_msg
+        assert hint == "先用 search-concepts / list-filings / attachments 拿到可用的名称或 ID 再读，不要猜"
+
+    # Generic upstream 404 or non-SEC route must NOT be misclassified as "没有匹配".
+    upstream_outage = {
+        "ok": False,
+        "status": "error",
+        "data": {"error": "HTTP 404 page not found from gateway"},
+    }
+    cat_outage, _ = rb._classify_error_category_and_hint(
+        "finance", "sec", "facts", upstream_outage
+    )
+    assert cat_outage == "上游不可用"
+
+    non_sec = {
+        "ok": False,
+        "status": "error",
+        "data": {"error": "Concept 'NoSuchConceptXyz123' not found. Use search-concepts first."},
+    }
+    cat_non_sec, _ = rb._classify_error_category_and_hint(
+        "research", "alphaengine", "search", non_sec
+    )
+    assert cat_non_sec == "上游不可用"
+
+    # Top-level error fallback when data is a dict without an "error" key.
+    top_level_sec_miss = {
+        "ok": False,
+        "error": "No concepts matching 'X'",
+        "data": {"count": 0},
+    }
+    cat_top, _ = rb._classify_error_category_and_hint(
+        "finance", "sec", "search-concepts", top_level_sec_miss
+    )
+    assert cat_top == "没有匹配"
+
+
 def test_a_ticker_on_a_query_only_route_folds_into_the_query():
     normalized, _, err = rb._normalize_and_validate_call_args(
         "research",
