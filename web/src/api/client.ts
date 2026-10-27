@@ -282,4 +282,10 @@ export const api = {
   patch: <T = Untyped>(url: string, data?: unknown, config?: RequestConfig) => request<T>('PATCH', url, data, config),
   /** The URL a GET would request, for handing to the browser directly. */
   getUri: ({ url, params }: { url: string; params?: QueryParams }) => buildUrl(url, params),
+  /**
+   * A PUT to a URL the backend signed, such as one part of an upload to object
+   * storage. None of the app's headers go with it: the signature says what the
+   * request may carry, and a bearer token has no business on another origin.
+   */
+  putSigned: (url: string, body: Blob, config: RequestConfig = {}) => send('PUT', url, {}, body, config),
 };

@@ -20,6 +20,13 @@ Endpoints:
 - POST   /api/v1/workspaces/{workspace_id}/files/upload
 - DELETE /api/v1/workspaces/{workspace_id}/files
 
+Uploads sent through object storage (``uploads``):
+- POST   /api/v1/workspaces/{workspace_id}/files/uploads
+- POST   /api/v1/workspaces/{workspace_id}/files/uploads/{upload_id}/parts
+- POST   /api/v1/workspaces/{workspace_id}/files/uploads/{upload_id}/complete
+- GET    /api/v1/workspaces/{workspace_id}/files/uploads/{upload_id}
+- DELETE /api/v1/workspaces/{workspace_id}/files/uploads/{upload_id}
+
 Plus a path-style serving router whose credential is a signed, expiring
 owner grant (``services/file_grants``):
 - GET    /api/v1/wsfiles/g/{grant}/{path:path}
@@ -27,5 +34,8 @@ owner grant (``services/file_grants``):
 
 from .crud import router
 from .serve import wsfiles_router
+from .uploads import router as _uploads_router
+
+router.include_router(_uploads_router)
 
 __all__ = ["router", "wsfiles_router"]

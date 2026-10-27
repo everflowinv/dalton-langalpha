@@ -25,6 +25,7 @@ from src.llms.provider_compaction import (
     native_answer,
     native_compaction_kind,
     native_kind,
+    replays,
     without_blocks,
 )
 from src.llms.reasoning_lineage import ROUTE_ENDPOINT_SEP
@@ -448,6 +449,49 @@ class TestIsOpaque:
 
     def test_a_plain_message(self):
         assert not is_opaque(HumanMessage("plain"))
+
+
+class TestReplays:
+    """Whether a model a thread moves to is sent the summary's item, as
+    ``adopt`` would send it, or reads its digest: only an OpenAI client in the
+    lineage that wrote the item, its route read off the client."""
+
+    _ITEMS = {"items": [_USER_ITEM, _COMPACTION_ITEM], "origin": "openai", "text": ""}
+
+    @pytest.mark.parametrize("route", ["openai", "codex-oauth"])
+    def test_an_openai_client_in_the_items_lineage(self, route):
+        assert replays(_summary(self._ITEMS), _gpt(metadata={"provider_route": route}))
+
+    @pytest.mark.parametrize(
+        "client",
+        [
+            pytest.param(lambda: _gpt(metadata={"provider_route": "anthropic"}), id="other-route"),
+            pytest.param(lambda: _gpt(), id="no-route"),
+            pytest.param(
+                lambda: _gpt(metadata={"provider_route": "openai"}, output_version=None),
+                id="no-responses",
+            ),
+            pytest.param(
+                lambda: _gpt(
+                    metadata={"provider_route": "openai"}, base_url="https://proxy.example/v1"
+                ),
+                id="other-host",
+            ),
+            pytest.param(lambda: _claude(metadata={"provider_route": "anthropic"}), id="claude"),
+            pytest.param(lambda: object(), id="not-a-client"),
+        ],
+    )
+    def test_any_other_model_reads_the_digest(self, client):
+        assert not replays(_summary(self._ITEMS), client())
+
+    def test_a_message_carrying_no_answer(self):
+        client = _gpt(metadata={"provider_route": "openai"})
+        assert not replays(HumanMessage("[Context Summary] readable", id="s"), client)
+
+    def test_a_claude_block_in_its_lineage_replays_to_claude(self):
+        summary = _summary({"block": _BLOCK, "origin": "anthropic", "text": ""})
+        assert replays(summary, _claude(metadata={"provider_route": "anthropic"}))
+        assert not replays(summary, _gpt(metadata={"provider_route": "openai"}))
 
 
 def _texts(items: list[dict]) -> list[str]:

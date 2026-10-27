@@ -43,9 +43,9 @@ _WSMGR_PATCH = "src.server.app.workspace_files.serve.WorkspaceManager"
 # The row the route re-reads after a live read, to prove the folder the read
 # went to was still this workspace's.
 _RECHECK_PATCH = "src.server.app.workspace_files._shared.db_get_workspace"
-# The serve root is resolved in the shared helpers, so a test about resolving
-# it patches the manager they read the computer root from, not the route's.
-_SHARED_WSMGR_PATCH = "src.server.app.workspace_files._shared.WorkspaceManager"
+# The serve root is resolved in the file service, so a test about resolving
+# it patches the manager the service reads the computer root from, not the route's.
+_LAYOUT_WSMGR_PATCH = "src.server.services.workspace_files.WorkspaceManager"
 _RENDER_PATCH = "src.server.services.pdf_render.render_workspace_pdf"
 _PDF_INTERNAL_BASE = "http://127.0.0.1:8000"
 _GRANT_KEY = b"k" * 32
@@ -230,6 +230,8 @@ async def test_traversal_returns_uniform_404():
         "mcp_servers/server.py",
         ".system/config.json",
         "_internal/secret.txt",
+        # A transfer's partial or staged file at the folder root.
+        ".wsfiles-upload-00000000-0000-4000-8000-000000000001",
     ],
 )
 async def test_system_and_hidden_paths_return_404(mock_ws, _wd, mock_fp, blocked_path):
@@ -243,6 +245,21 @@ async def test_system_and_hidden_paths_return_404(mock_ws, _wd, mock_fp, blocked
     assert exc.value.status_code == 404
     # Blocked before the DB is ever consulted.
     mock_fp.get_file_content.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "path, hidden",
+    [
+        (".wsfiles-upload-abc", True),
+        ("/.wsfiles-3f2a9c", True),
+        ("data/.wsfiles-notes", False),
+        ("wsfiles-notes", False),
+    ],
+)
+def test_only_a_transfers_name_at_the_folder_root_is_hidden(path, hidden):
+    from src.server.app.workspace_files._shared import _is_always_hidden_path
+
+    assert _is_always_hidden_path(path) is hidden
 
 
 # --- Unknown workspace or unbound Home → uniform 404 ----------------------
@@ -289,7 +306,7 @@ _ROOTED_ROUTES = (
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("route", _ROOTED_ROUTES, ids=["serve", "pdf"])
-@patch(_SHARED_WSMGR_PATCH)
+@patch(_LAYOUT_WSMGR_PATCH)
 @patch(_DBWS_PATCH, new_callable=AsyncMock)
 async def test_workspace_that_names_no_folder_returns_uniform_404(
     mock_ws, mock_mgr, route

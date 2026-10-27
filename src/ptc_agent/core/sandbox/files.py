@@ -12,7 +12,7 @@ import hashlib
 import json
 import posixpath
 import shlex
-from collections.abc import AsyncIterator, Iterable
+from collections.abc import AsyncIterator, Callable, Iterable
 from contextlib import AbstractAsyncContextManager
 from pathlib import Path
 from typing import Any
@@ -258,6 +258,58 @@ async def adownload_file_bytes(sandbox: "PTCSandbox", filepath: str) -> bytes | 
     except Exception as e:
         await _raise_normalized(sandbox, e, op="download_file", path=filepath)
         return None
+
+
+class FileOverCap(Exception):
+    """A capped download passed its cap, which it carries."""
+
+    def __init__(self, limit: int) -> None:
+        super().__init__(limit)
+        self.limit = limit
+
+
+async def adownload_file_bytes_capped(
+    sandbox: "PTCSandbox", filepath: str, cap: Callable[[bytes], int]
+) -> bytes | None:
+    """Download a whole file, stopping as soon as it passes ``cap`` of what has
+    arrived. None if the file does not exist.
+
+    Streamed, so the cap fires mid-transfer, where ``adownload_file_bytes``
+    holds the whole file first. Nothing leaves before the download ends, so
+    unlike ``astream_file_bytes`` a transient failure starts it over, under
+    the retry and the semaphore ``adownload_file_bytes`` has.
+
+    Raises:
+        FileOverCap: When the bytes pass the cap.
+        SandboxGoneError, SandboxTransientError: As ``adownload_file_bytes``.
+    """
+    await sandbox._wait_ready()
+
+    async def download() -> bytes:
+        # Read per attempt: a reconnect between attempts replaces the runtime.
+        stream = sandbox.runtime.download_file_stream(filepath)
+        buffer = bytearray()
+        try:
+            async for chunk in stream:
+                buffer.extend(chunk)
+                limit = cap(buffer)
+                if len(buffer) > limit:
+                    raise FileOverCap(limit)
+        finally:
+            await stream.aclose()
+        return bytes(buffer)
+
+    try:
+        async with sandbox._download_semaphore:
+            result = await sandbox._runtime_call(download, retry_policy=RetryPolicy.SAFE)
+    except FileOverCap:
+        raise
+    except Exception as e:
+        await _raise_normalized(sandbox, e, op="download_file_stream", path=filepath)
+        return None
+    if result:
+        safe_record(workspace_fs_bytes, len(result), {"op": "read"})
+    return result
 
 
 async def astream_file_bytes(

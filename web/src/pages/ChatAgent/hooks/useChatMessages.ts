@@ -153,6 +153,9 @@ export function useChatMessages(
   // false | 'starting' (generic cold start) | 'archived' (slow ~90s restore from cold storage).
   // Widen this union when backend adds a new sandbox_state discriminator.
   const [workspaceStarting, setWorkspaceStarting] = useState<false | 'starting' | 'archived'>(false);
+  // Why this send waits on a thread mutation (the `turn_held` reason: 'compact',
+  // 'offload', 'handoff', or another/empty), null when it is not held.
+  const [turnHeld, setTurnHeld] = useState<string | null>(null);
   const [isCompacting, setIsCompactingState] = useState<string | false>(false);  // Context compaction in progress (summarize/offload)
   // About how many tokens the summary being written has written, null until
   // the server first says.
@@ -684,6 +687,7 @@ export function useChatMessages(
     setPendingInterrupt,
     setThreadId,
     setWorkspaceStarting,
+    setTurnHeld,
     // ref containers (stable identity, ref-current reads)
     threadIdRef,
     isStreamingRef,
@@ -831,6 +835,8 @@ export function useChatMessages(
         notRunningGenRef.current += 1;
         for (const q of notRunningSendsRef.current.splice(0)) requestKeyRef.current.settle(q.requestKey);
         setIsCompacting(false);
+        // A send held on the thread we're leaving is no wait of B's.
+        setTurnHeld(null);
         // Reset refs
         contentOrderCounterRef.current = 0;
         currentReasoningIdRef.current = null;
@@ -1760,6 +1766,7 @@ export function useChatMessages(
     // (isReconnecting is handled by the reconnect finally's ownership check: the
     // abort above unwinds the reader, whose finally still owns and clears it.)
     setWorkspaceStarting(false);
+    setTurnHeld(null);
     setIsCompacting(false);
     clearModelStatus();
     // Drop any message queued during compaction: the user just cancelled, so it
@@ -3609,6 +3616,7 @@ export function useChatMessages(
     reportBackOwed,
     reportBackOwedThreads,
     workspaceStarting,
+    turnHeld,
     isCompacting,
     setIsCompacting,
     compactionTokens,

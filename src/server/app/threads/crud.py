@@ -52,6 +52,7 @@ from src.server.database.conversation import (
     stamp_thread_seen,
     update_thread_fields,
     update_thread_external_id,
+    get_thread_auth_meta,
     get_thread_by_id,
 )
 
@@ -457,6 +458,7 @@ async def update_thread_endpoint(
             updates["is_pinned"] = request.is_pinned
         if "archived" in provided and request.archived is not None:
             updates["archived"] = request.archived
+        switched_from: str | None = None
         if "llm_model" in provided:
             # null returns the thread to the account default; a name has to
             # resolve to a model, in the catalog or the user's own, or every
@@ -465,6 +467,7 @@ async def update_thread_endpoint(
             if request.llm_model is not None:
                 await require_selectable_model(x_user_id, request.llm_model)
             updates["llm_model"] = request.llm_model
+            switched_from = (await get_thread_auth_meta(thread_id) or {}).get("llm_model")
         if "subagents_allowed" in provided:
             # null, or the side the owner's default is on, returns the thread
             # to following the default (decided in the UPDATE). Read by the
@@ -535,7 +538,14 @@ async def update_thread_endpoint(
                 # Archiving ends the thread's scratchpad.
                 prune_thread_dirs_soon(str(updated_thread["workspace_id"]))
                 await wakeups_cancel.cancel_on_archive(thread_id)
-        return _thread_list_item(updated_thread)
+        item = _thread_list_item(updated_thread)
+        if "llm_model" in updates and updates["llm_model"] != switched_from:
+            from src.server.handlers.thread_maintenance import hand_off_on_switch
+
+            item.summary_handoff = await hand_off_on_switch(
+                thread_id, x_user_id, switched_from
+            )
+        return item
 
     except HTTPException:
         raise

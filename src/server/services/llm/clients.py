@@ -693,7 +693,7 @@ def role_registry(config, model_pref, turn_model: str | None = None) -> list[LLM
     if turn_model and compaction != turn_model:
         summary_fallback = turn_model
     else:
-        summary_fallback = next(iter(config.llm.fallback or []), None)
+        summary_fallback = next(iter(config.llm.fallbacks_for(compaction)), None)
     roles = [
         LLMRole(
             "compaction", compaction,

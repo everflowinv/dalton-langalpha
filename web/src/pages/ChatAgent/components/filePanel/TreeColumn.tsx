@@ -58,6 +58,8 @@ export interface TreeColumnProps {
   readOnly: boolean;
   uploadDisabled: boolean;
   onUpload: () => void;
+  /** Set while a file is being sent; the upload button becomes its cancel. */
+  onCancelUpload: (() => void) | null;
   onOpenSettings: (() => void) | null;
   workspaceName?: string;
   /** The backup restore did not finish, so the listing may be short. */
@@ -166,14 +168,25 @@ export function TreeColumn(props: TreeColumnProps): React.ReactElement {
                   >
                     <CheckSquare className="h-4 w-4" />
                   </button>
-                  <button
-                    onClick={props.onUpload}
-                    className="file-panel-icon-btn"
-                    title={t('filePanel.uploadFile')}
-                    disabled={props.uploadDisabled}
-                  >
-                    <Upload className="h-4 w-4" />
-                  </button>
+                  {props.onCancelUpload ? (
+                    <button
+                      onClick={props.onCancelUpload}
+                      className="file-panel-icon-btn"
+                      title={t('filePanel.cancelUpload')}
+                      aria-label={t('filePanel.cancelUpload')}
+                    >
+                      <X className="h-4 w-4" />
+                    </button>
+                  ) : (
+                    <button
+                      onClick={props.onUpload}
+                      className="file-panel-icon-btn"
+                      title={t('filePanel.uploadFile')}
+                      disabled={props.uploadDisabled}
+                    >
+                      <Upload className="h-4 w-4" />
+                    </button>
+                  )}
                   {backup.canBackUp && (
                     <button onClick={backup.handleBackup} className="file-panel-icon-btn" title={t('filePanel.backupFiles')} disabled={backup.backingUp}>
                       <HardDrive className={`h-4 w-4 ${backup.backingUp ? 'animate-pulse' : ''}`} />

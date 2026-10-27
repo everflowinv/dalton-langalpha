@@ -76,6 +76,14 @@ class WorkspaceThreadListItem(BaseModel):
         description="Number of turns (user queries) in the thread; only the "
         "list queries compute it — other constructor sites omit it.",
     )
+    summary_handoff: Optional[bool] = Field(
+        None,
+        description="Only on the response to a model change: whether the "
+        "model the thread was on is writing out, for the new one, the "
+        "summary its provider compacted the thread into, which no other "
+        "provider can read. Until it is written the new model reads a plain "
+        "record of the compacted part.",
+    )
     created_at: datetime = Field(..., description="Creation timestamp")
     updated_at: datetime = Field(..., description="Last update timestamp")
 

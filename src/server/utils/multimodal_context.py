@@ -7,6 +7,7 @@ content blocks into user messages so the LLM receives native multimodal input.
 
 import asyncio
 import base64
+import io
 import logging
 import uuid
 from collections.abc import Collection
@@ -126,16 +127,59 @@ async def find_unreadable_images(
     return await asyncio.to_thread(scan)
 
 
+def pdf_page_count(data_url: str) -> Optional[int]:
+    """Pages in a PDF data URL, or None when it cannot be read (encrypted or corrupt).
+
+    Blocking: decoding and parsing a large PDF takes long enough to stall the
+    event loop, so async callers run it in a thread.
+    """
+    try:
+        import pypdf
+
+        raw = base64.b64decode(data_url.split(",", 1)[1])
+        # A broken page tree can parse as zero pages without raising, and
+        # "0 pages" would read as an empty document rather than an unreadable one.
+        return len(pypdf.PdfReader(io.BytesIO(raw)).pages) or None
+    except Exception:
+        return None
+
+
+async def pdf_page_counts(contexts: List[MultimodalContext]) -> List[Optional[int]]:
+    """Page counts parallel to ``contexts``: None for anything not a readable PDF.
+
+    In one thread, as ``find_unreadable_images`` reads its images: a thread per
+    PDF would take as many of the shared executor's workers as a request has
+    PDFs.
+    """
+
+    def count() -> List[Optional[int]]:
+        return [
+            pdf_page_count(ctx.data) if ctx.data.startswith("data:application/pdf") else None
+            for ctx in contexts
+        ]
+
+    return await asyncio.to_thread(count)
+
+
 def inject_multimodal_context(
     messages: List[Dict[str, Any]],
     multimodal_contexts: List[MultimodalContext],
     file_paths: Optional[List[Optional[str]]] = None,
+    pdf_pages: Optional[List[Optional[int]]] = None,
 ) -> List[Dict[str, Any]]:
     """Merge image/PDF content blocks into the last user message.
 
     Prepends content blocks before the user's text content so the LLM sees
     the attachment context first. Non-image/non-PDF contexts are skipped
     (they are handled via system-reminder with sandbox path only).
+
+    A PDF saved to the sandbox goes in as a note with its page count and path,
+    not as a document: inlined whole, a long one fills the context window on
+    its first turn and every turn after, while from the path the agent can
+    search it with code and Read only the pages it needs. With no saved path
+    the document is the only way in, so it is inlined, stamped with its page
+    count so the read side can hold it to the model's page ceiling, and as
+    unsaved so what replaces it there offers no copy to extract from.
 
     .. note::
         Mutates ``messages`` in place (modifies the last user message's
@@ -147,6 +191,7 @@ def inject_multimodal_context(
         multimodal_contexts: List of MultimodalContext objects to inject
         file_paths: Optional parallel list of sandbox virtual paths. When
             provided, path references are included in the label text.
+        pdf_pages: Optional parallel list of PDF page counts (None where unknown).
 
     Returns:
         Modified messages list with content blocks merged into user message
@@ -159,19 +204,29 @@ def inject_multimodal_context(
     for idx, ctx in enumerate(multimodal_contexts):
         data_url = ctx.data
         desc = ctx.description or "file"
-        path_note = ""
-        if file_paths and idx < len(file_paths) and file_paths[idx]:
-            path_note = f" (saved to {file_paths[idx]})"
+        path = file_paths[idx] if file_paths and idx < len(file_paths) else None
+        path_note = f" (saved to {path})" if path else ""
 
         if data_url.startswith("data:application/pdf"):
+            pages = pdf_pages[idx] if pdf_pages and idx < len(pdf_pages) else None
+            if path:
+                size = f", {pages} page{'' if pages == 1 else 's'}" if pages else ""
+                blocks.append({"type": "text", "text": f"[Attached PDF: {desc}{size}{path_note}]"})
+                continue
             raw_b64 = data_url.split(",", 1)[1] if "," in data_url else data_url
-            blocks.append({"type": "text", "text": f"[Attached PDF: {desc}{path_note}]"})
-            blocks.append({
+            blocks.append({"type": "text", "text": f"[Attached PDF: {desc}]"})
+            file_block: Dict[str, Any] = {
                 "type": "file",
                 "base64": raw_b64,
                 "mime_type": "application/pdf",
                 "filename": desc,
-            })
+            }
+            if pages:
+                file_block["pages"] = pages
+            # Read off by the strip, which must not point the model at a
+            # workspace copy when the page ceiling or a model switch drops it.
+            file_block["unsaved"] = True
+            blocks.append(file_block)
         elif data_url.startswith("data:image/"):
             blocks.append({"type": "text", "text": f"[Attached image: {desc}{path_note}]"})
             blocks.append({"type": "image_url", "image_url": {"url": data_url}})

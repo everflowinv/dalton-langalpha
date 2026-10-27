@@ -544,7 +544,7 @@ def _is_membership(value: object) -> bool:
 
 
 async def _fetch_platform_membership(
-    user_id: str, *, refresh: bool = False
+    user_id: str, *, refresh: bool = False, recheck: bool = False
 ) -> Optional[dict]:
     """The user's platform membership: ``{"access_tier", "plan_display_name"}``.
 
@@ -553,7 +553,9 @@ async def _fetch_platform_membership(
     answered for this user within the last-known TTL. An outage is not a plan,
     so no caller may read None as -1. While the platform is unreachable the last
     membership it gave stands in. ``refresh`` asks now, past the 5-minute cache
-    and any pause. No-op in OSS mode.
+    and any pause, for a plan known to have changed. ``recheck`` asks past the
+    cache only, for one that may have, and leaves the cache to the user's other
+    reads meanwhile. No-op in OSS mode.
     """
     if not platform_gating_active():
         return {"access_tier": -1, "plan_display_name": None}
@@ -573,7 +575,7 @@ async def _fetch_platform_membership(
         # not take the plan it was asked to replace back from the cache.
         await cache.delete(platform_membership_cache_key(user_id))
     else:
-        if _is_membership(cached):
+        if not recheck and _is_membership(cached):
             # An entry an older worker wrote has no last-known record beside it.
             # Not from a -1, which an older worker also caches for a failed ask.
             if last_known is None and int(cached.get("access_tier", -1)) >= 0:
@@ -608,9 +610,9 @@ async def _fetch_platform_membership(
     return last_known
 
 
-async def _fetch_platform_tier(user_id: str) -> Optional[int]:
+async def _fetch_platform_tier(user_id: str, *, recheck: bool = False) -> Optional[int]:
     """Only the access tier, from the same cache; None when it is unknown."""
-    membership = await _fetch_platform_membership(user_id)
+    membership = await _fetch_platform_membership(user_id, recheck=recheck)
     if membership is None:
         return None
     return int(membership.get("access_tier", -1))

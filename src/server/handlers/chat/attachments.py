@@ -20,6 +20,7 @@ from src.server.utils.multimodal_context import (
     find_unreadable_images,
     inject_multimodal_context,
     parse_multimodal_contexts,
+    pdf_page_counts,
     upload_to_sandbox,
 )
 
@@ -49,8 +50,9 @@ async def attach_request_files(
     """Upload the turn's attachments and describe them to the PTC agent.
 
     All attachments are uploaded to sandbox (when available) so the agent always
-    has file access. Model-supported modalities also get native content blocks
-    merged into the user message.
+    has file access. Images the model accepts also go in as native content
+    blocks; a PDF it accepts goes in as a note with its page count once it is
+    saved, and inline only when it is not.
     """
     multimodal_contexts = parse_multimodal_contexts(request.additional_context)
     if not multimodal_contexts or request.hitl_response:
@@ -89,7 +91,10 @@ async def attach_request_files(
             if ctx in supported
         ] if file_paths else None
         messages = inject_multimodal_context(
-            messages, supported, file_paths=supported_paths
+            messages,
+            supported,
+            file_paths=supported_paths,
+            pdf_pages=await pdf_page_counts(supported),
         )
         logger.info(
             f"[PTC_CHAT] Multimodal context injected: "

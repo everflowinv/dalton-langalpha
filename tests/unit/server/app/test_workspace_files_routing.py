@@ -149,15 +149,15 @@ async def test_backup_status_of_a_stopped_workspace_lists_files_only(mock_get_ws
 async def test_mutation_rejects_shared_agent_root_after_canonicalization():
     from types import SimpleNamespace
     from fastapi import HTTPException
-    from src.server.app.workspace_files.crud import _contained_target
+    from src.server.services.workspace_files import contained_target
 
     sandbox = SimpleNamespace(validate_path=lambda _path: True)
     with patch(
-        "src.server.app.workspace_files.crud.contained_sandbox_path",
+        "src.server.services.workspace_files.contained_sandbox_path",
         AsyncMock(return_value="/home/workspace/.agents/tools/docs/server.md"),
     ):
         with pytest.raises(HTTPException) as error:
-            await _contained_target(sandbox, "linked-doc.md", "/home/workspace/project")
+            await contained_target(sandbox, "linked-doc.md", "/home/workspace/project")
     assert error.value.status_code == 404
 
 
@@ -188,10 +188,10 @@ async def test_backup_scans_the_folder_read_under_the_folder_hold():
     sync = AsyncMock(side_effect=scan)
     with (
         patch("src.server.app.workspace_files.crud.db_get_workspace", AsyncMock(return_value=row)),
-        patch("src.server.app.workspace_files._shared._acquire_sandbox", acquire),
-        patch("src.server.app.workspace_files._shared.workspace_folder_in_use", hold),
+        patch("src.server.services.workspace_files.acquire_sandbox", acquire),
+        patch("src.server.services.workspace_files.workspace_folder_in_use", hold),
         patch(
-            "src.server.app.workspace_files._shared.db_get_workspace",
+            "src.server.services.workspace_files.db_get_workspace",
             AsyncMock(return_value={**row, "dir_name": "Macro"}),
         ),
         patch("src.server.app.workspace_files.crud.FilePersistenceService.sync_to_db", sync),
@@ -221,15 +221,15 @@ async def test_a_backup_that_found_the_folder_gone_answers_as_a_standing_offer()
             AsyncMock(return_value={"computer_id": "comp-1", "files_backup": True}),
         ),
         patch(
-            "src.server.app.workspace_files._shared.workspace_folder_in_use",
+            "src.server.services.workspace_files.workspace_folder_in_use",
             lambda _workspace_id: nullcontext(),
         ),
         patch(
-            "src.server.app.workspace_files._shared._acquire_sandbox",
+            "src.server.services.workspace_files.acquire_sandbox",
             AsyncMock(return_value=(object(), {**row, "dir_name": "Research"})),
         ),
         patch(
-            "src.server.app.workspace_files._shared.db_get_workspace",
+            "src.server.services.workspace_files.db_get_workspace",
             AsyncMock(return_value={**row, "dir_name": "Research"}),
         ),
         patch(
@@ -277,12 +277,12 @@ async def test_a_backup_asked_for_by_hand_is_refused_before_the_machine_is_reach
     acquire = AsyncMock()
     sync = AsyncMock()
     with (
-        patch("src.server.app.workspace_files._shared.db_get_workspace", AsyncMock(return_value=row)),
+        patch("src.server.services.workspace_files.db_get_workspace", AsyncMock(return_value=row)),
         patch(
             "src.server.app.workspace_files.crud.get_computer",
             AsyncMock(return_value={"computer_id": "comp-1", "files_backup": files_backup}),
         ),
-        patch("src.server.app.workspace_files._shared._acquire_sandbox", acquire),
+        patch("src.server.services.workspace_files.acquire_sandbox", acquire),
         patch("src.server.app.workspace_files.crud.FilePersistenceService.sync_to_db", sync),
         pytest.raises(HTTPException) as refused,
     ):
@@ -324,9 +324,9 @@ async def test_backup_status_falls_back_when_the_folder_is_moving(moving):
     scan = AsyncMock(return_value={})
     with (
         patch("src.server.app.workspace_files.crud.db_get_workspace", AsyncMock(return_value=row)),
-        patch("src.server.app.workspace_files._shared.WorkspaceManager", manager),
-        patch("src.server.app.workspace_files._shared.workspace_folder_in_use", hold),
-        patch("src.server.app.workspace_files._shared.db_get_workspace", AsyncMock(return_value=held_row)),
+        patch("src.server.services.workspace_files.WorkspaceManager", manager),
+        patch("src.server.services.workspace_files.workspace_folder_in_use", hold),
+        patch("src.server.services.workspace_files.db_get_workspace", AsyncMock(return_value=held_row)),
         patch("src.server.app.workspace_files.crud.FilePersistenceService.list_sandbox_files", scan),
         patch(
             "src.server.database.workspace_file.get_file_metadata_for_sync",

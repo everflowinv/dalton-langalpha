@@ -135,6 +135,28 @@ not as still to do.
     + _SUMMARY_BODY
 )
 
+# The prompt for the model whose provider compacted the conversation into a
+# summary only that provider can read, when the user moves the thread to a
+# model of another provider. Sent as the last user message after that summary,
+# so the provider reads the summary itself, from its cache.
+HANDOFF_SUMMARY_PROMPT = (
+    """<context>
+This conversation is moving to a model from another provider, which cannot
+read the compacted summary above. Write it out in full for that model: what
+you write replaces the compacted summary for it, so capture all it needs to
+continue the work without losing progress. This request comes from the
+system, not the user, and is not part of the work: leave it out of what you
+write.
+
+The messages that came after the compacted summary stay in context, word for
+word, right after yours, so the work may have moved on from where it ends.
+Describe unfinished work as where it stood at that point, not as still to do.
+</context>
+
+"""
+    + _SUMMARY_BODY
+)
+
 # Appended only when the history carries transcript markers: without a
 # transcript there is no file to cite, and an instruction to cite one would
 # invite made-up names.

@@ -79,6 +79,7 @@ _SANDBOX = "sandbox state, and a never-bound row has no sandbox"
 
 STAYS: dict[str, str] = {
     "workspace_files": _SANDBOX,
+    "workspace_file_uploads": _SANDBOX,
     "livefs_links": _SANDBOX,
     "share_links": _SANDBOX,
     "sandbox_egress_grants": _SANDBOX,

@@ -293,12 +293,32 @@ def adopt(
     return adopted if changed else None
 
 
+def replays(message: AnyMessage, model: Any) -> bool:
+    """Whether ``model`` is sent the provider's answer ``message`` carries,
+    rather than its text (see :func:`adopt`)."""
+    kind = native_kind(model)
+    if kind is None:
+        return False
+    route = (getattr(model, "metadata", None) or {}).get("provider_route")
+    route = route if isinstance(route, str) and route else None
+    return _native(message, _native_lineage(route), kind) is not None
+
+
 def _native(message: AnyMessage, lineage: str, kind: NativeKind) -> list[AnyMessage] | None:
     carried = _carried(message)
     if carried is None:
         return None
     origin = carried.get("origin")
-    if not isinstance(origin, str) or _native_lineage(origin) != lineage:
+    # DALTON-HOOK(native-compaction-lines): never replay a summary whose origin
+    # is on a Dalton relay, even when its lineage group matches the target
+    # (e.g. claude-oauth -> anthropic).
+    from src.dalton.llm.native_compaction_lines import native_compaction_disabled
+
+    if (
+        not isinstance(origin, str)
+        or native_compaction_disabled(origin.split(ROUTE_ENDPOINT_SEP, 1)[0])
+        or _native_lineage(origin) != lineage
+    ):
         return None
     text = carried.get("text")
     text = text if isinstance(text, str) and text else None

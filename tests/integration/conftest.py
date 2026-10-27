@@ -64,6 +64,7 @@ _ALL_TABLES = [
     "workspace_skill_disables",
     "user_skills",
     "user_plugins",
+    "workspace_file_uploads",
     "workspace_files",
     "workspace_file_blobs",
     "watchlist_items",

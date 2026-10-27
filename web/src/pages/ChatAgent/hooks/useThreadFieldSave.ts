@@ -23,6 +23,8 @@ interface UseThreadFieldSaveOptions<F extends ThreadField> {
   failedMessage: string;
   /** Puts the composer back after that failure, called only while it still shows the thread. */
   onFailed: (save: ThreadFieldSave<FieldValue<F>>) => void;
+  /** Hears the server's answer to each save that lands. */
+  onSaved?: (saved: Thread) => void;
 }
 
 /** What the server is known to hold, or null when no row was cached to restore. */
@@ -44,6 +46,7 @@ export function useThreadFieldSave<F extends ThreadField>({
   field,
   failedMessage,
   onFailed,
+  onSaved,
 }: UseThreadFieldSaveOptions<F>) {
   const queryClient = useQueryClient();
 
@@ -91,6 +94,7 @@ export function useThreadFieldSave<F extends ThreadField>({
     },
     onSuccess: (saved, { threadId: id, value }) => {
       confirmedRef.current.set(id, { value: answered(saved, value) });
+      if (saved) onSaved?.(saved);
     },
     onError: (_error, save, context) => {
       if (queryClient.isMutating({ mutationKey: threadFieldMutationKey(save.threadId, field) }) !== 1) return;

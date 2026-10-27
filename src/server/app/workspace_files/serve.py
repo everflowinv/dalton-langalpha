@@ -33,20 +33,20 @@ from src.server.utils.secret_redactor import (
 )
 from src.utils.mime import resolve_content_type
 
-from ._containment import (
+from src.server.services.workspace_file_containment import (
     contained_absolute_path,
     contained_relative_path,
     FileTooLargeToServe,
     read_contained_sandbox_file,
 )
+from src.server.services.workspace_files import previous_dir_names_of, record_fs_bytes
+
 from ._shared import (
     _is_text_content_type,
     _is_utf8,
     _is_serve_blocked_path,
-    _record_fs_bytes,
     _to_client_path,
     folder_unmoved,
-    previous_dir_names_of,
     work_dir_for,
 )
 
@@ -460,7 +460,7 @@ async def serve_workspace_file(
         ),
         "X-Content-Type-Options": "nosniff",
     }
-    _record_fs_bytes("serve", len(content))
+    record_fs_bytes("serve", len(content))
     return Response(content=content, media_type=content_type, headers=headers)
 
 
@@ -555,7 +555,7 @@ async def render_workspace_file_pdf(
         ),
         "Cache-Control": _WSFILES_CACHE_CONTROL,
     }
-    _record_fs_bytes("pdf", len(pdf_bytes))
+    record_fs_bytes("pdf", len(pdf_bytes))
     return Response(content=pdf_bytes, media_type="application/pdf", headers=headers)
 
 

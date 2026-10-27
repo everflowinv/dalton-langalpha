@@ -1,5 +1,6 @@
 """Tests for LLM error status extraction and retryability classification."""
 
+import httpx
 import pytest
 
 from langchain_openai.chat_models._client_utils import StreamChunkTimeoutError
@@ -7,6 +8,7 @@ from langchain_openai.chat_models._client_utils import StreamChunkTimeoutError
 from src.llms.error_classification import (
     NON_RETRYABLE_STATUSES,
     extract_status_code,
+    is_context_overflow,
     is_programming_error,
     is_retryable_error,
     is_stalled_stream,
@@ -269,3 +271,86 @@ class TestStreamTimeouts:
         assert is_stalled_stream(StreamChunkTimeoutError(120.0, chunks_received=0))
         assert not is_stalled_stream(TimeoutError("read timed out"))
         assert not is_stalled_stream(Exception("chunks_received=5"))
+
+
+class TestContextOverflow:
+    """Each message is one a provider sent for a request over its window."""
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            # DeepSeek, on its Anthropic route too
+            "Error code: 400 - {'error': {'message': \"This model's maximum context length "
+            "is 1048576 tokens. However, you requested 2514832 tokens\", 'type': "
+            "'invalid_request_error', 'code': 'invalid_request_error'}}",
+            # Moonshot
+            "Invalid request: Your request exceeded model token limit: 262144 (requested: 428479)",
+            # DashScope chat
+            "<400> InternalError.Algo.InvalidParameter: Range of input length should be [1, 229376]",
+            # Volcengine Ark
+            "Total tokens of image and text exceed max message tokens. Request id: x",
+            # MiniMax
+            "invalid params, context window exceeds limit (2013)",
+            # Z.ai's own API, in both wordings
+            "Error code: 400 - {'error': {'code': '1261', 'message': 'Prompt exceeds max length'}}",
+            "Prompt 超长",
+            # Anthropic and its compatible endpoints
+            "prompt is too long: 250000 tokens > 200000 maximum",
+            # Anthropic, when the input fits but leaves no room for max_tokens
+            "Error code: 400 - {'type': 'error', 'error': {'type': 'invalid_request_error', "
+            "'message': 'input length and `max_tokens` exceed context limit: 188240 + 21333 "
+            "> 200000, decrease input length or `max_tokens` and try again'}}",
+            # Gemini
+            "The input token count exceeds the maximum number of tokens allowed (65536).",
+            # OpenAI Responses, reported inside the stream
+            "Your input exceeds the context window of this model.",
+        ],
+    )
+    def test_each_provider_wording_is_an_overflow(self, message):
+        assert is_context_overflow(Exception(message))
+
+    def test_langchains_own_classification_is_trusted(self):
+        from langchain_core.exceptions import ContextOverflowError
+
+        assert is_context_overflow(ContextOverflowError("anything"))
+
+    def test_the_code_in_an_sdk_body_is_enough(self):
+        exc = Exception("Bad request")
+        exc.body = {"error": {"code": "context_length_exceeded", "message": "..."}}
+        assert is_context_overflow(exc)
+
+    def test_a_payload_the_provider_refused_as_too_large(self):
+        exc = Exception("Request Entity Too Large")
+        exc.status_code = 413
+        assert is_context_overflow(exc)
+
+    def test_a_413_set_only_on_the_response(self):
+        # httpx.HTTPStatusError carries its status on the response alone.
+        request = httpx.Request("POST", "https://example.test/v1/messages")
+        exc = httpx.HTTPStatusError(
+            "Request Entity Too Large",
+            request=request,
+            response=httpx.Response(413, request=request),
+        )
+        assert is_context_overflow(exc)
+
+    def test_found_through_the_cause_chain(self):
+        try:
+            try:
+                raise Exception("prompt is too long")
+            except Exception as inner:
+                raise RuntimeError("model call failed") from inner
+        except RuntimeError as outer:
+            assert is_context_overflow(outer)
+
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            Exception("tools.0.input_schema: unsupported keyword"),
+            Exception("Rate limit reached for requests"),
+            Exception("413 mentioned in prose is not the status"),
+            StreamChunkTimeoutError(120.0, chunks_received=413),
+        ],
+    )
+    def test_other_failures_are_not(self, exc):
+        assert not is_context_overflow(exc)

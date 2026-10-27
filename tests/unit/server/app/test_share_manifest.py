@@ -477,7 +477,7 @@ async def test_a_live_walk_holds_the_folder_until_the_list_is_built(monkeypatch)
         finally:
             events.append("released")
 
-    monkeypatch.setattr(sm, "_acquire_sandbox_to_change", acquire)
+    monkeypatch.setattr(sm, "acquire_sandbox_to_change", acquire)
     monkeypatch.setattr(sm, "owner_work_dir", lambda workspace: WORK_DIR)
     monkeypatch.setattr(sm, "_SandboxReader", lambda *args: live)
 

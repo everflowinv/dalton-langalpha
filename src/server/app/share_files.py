@@ -25,22 +25,13 @@ from src.server.app.share_access import (
     resolve_shared_files,
 )
 from src.server.app.share_pages import unavailable_response
-from src.server.app.workspace_files._containment import (
-    contained_listing_path,
-    contained_relative_path,
-    contained_sandbox_path,
-    FileTooLargeToServe,
-    is_within,
-)
 from src.server.app.workspace_files._shared import (
     DEFAULT_READ_LIMIT_LINES,
-    HOME_NOT_ON_COMPUTER_REASON,
     _is_binary,
     _is_text_content_type,
     _is_utf8,
     _to_client_path,
     folder_unmoved,
-    previous_dir_names_of,
     previous_roots_of,
 )
 from src.server.app.workspace_files.file_refs import (
@@ -59,6 +50,17 @@ from src.server.app.workspace_files.serve import (
 from src.server.database.home_workspace import is_unbound
 from src.server.services.persistence.file import FilePersistenceService
 from src.server.services.persistence.resolve import resolve_file_bytes_or_none
+from src.server.services.workspace_file_containment import (
+    contained_listing_path,
+    contained_relative_path,
+    contained_sandbox_path,
+    FileTooLargeToServe,
+    is_within,
+)
+from src.server.services.workspace_files import (
+    HOME_NOT_ON_COMPUTER_REASON,
+    previous_dir_names_of,
+)
 from src.server.utils.error_sanitization import single_line
 from src.server.utils.http_headers import content_disposition
 from src.server.utils.secret_redactor import (

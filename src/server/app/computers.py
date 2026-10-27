@@ -18,7 +18,7 @@ from ptc_agent.core.sandbox.providers import provider_class
 from ptc_agent.core.sandbox.providers.ssh_errors import SSHConnectError, connect_failure
 from ptc_agent.core.sandbox.runtime import SandboxGoneError, SandboxTransientError
 from src.server.services.persistence.sync_result import BackupIncomplete
-from src.server.app.background_starts import schedule_start
+from src.server.services.background_starts import schedule_start
 from src.server.app.status_stream import (
     SSE_HEADERS,
     sse_status_event,

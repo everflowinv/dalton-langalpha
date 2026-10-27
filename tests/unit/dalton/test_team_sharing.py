@@ -37,6 +37,7 @@ from src.server.dependencies.usage_limits import ChatAuthResult
 from src.server.models.chat import ChatRequest
 from src.server.models.conversation import ThreadUpdateRequest
 from src.server.models.workspace import WorkspaceUpdate
+from src.server.services import workspace_files as ws_files_service
 from src.server.services.persistence.file import FilePersistenceService
 from src.server.services.turn_runtime import requested_workspace
 
@@ -707,8 +708,13 @@ class TestReadEndpointsAllowColleagues:
             "db_get_workspace",
             create_autospec(ws_files_crud.db_get_workspace, return_value=ws),
         )
-        acquire_spy = create_autospec(ws_files_crud._acquire_sandbox_to_change)
-        monkeypatch.setattr(ws_files_crud, "_acquire_sandbox_to_change", acquire_spy)
+        monkeypatch.setattr(
+            ws_files_service,
+            "db_get_workspace",
+            create_autospec(ws_files_service.db_get_workspace, return_value=ws),
+        )
+        acquire_spy = create_autospec(ws_files_crud.acquire_sandbox_to_change)
+        monkeypatch.setattr(ws_files_crud, "acquire_sandbox_to_change", acquire_spy)
         monkeypatch.setattr(
             ws_files_crud,
             "owner_work_dir",
@@ -1068,12 +1074,10 @@ class TestWriteEndpointsRejectColleagues:
     ) -> None:
         _enable_dalton_auth(monkeypatch)
         ws = _sample_workspace(user_id="u-richard", status="running")
-        from src.server.app.workspace_files import _shared as ws_files_shared
-
         monkeypatch.setattr(
-            ws_files_shared,
+            ws_files_service,
             "db_get_workspace",
-            create_autospec(ws_files_shared.db_get_workspace, return_value=ws),
+            create_autospec(ws_files_service.db_get_workspace, return_value=ws),
         )
 
         # Write file -> 403
@@ -1220,12 +1224,18 @@ class TestWriteEndpointsRejectColleagues:
             "db_get_workspace",
             create_autospec(ws_files_crud.db_get_workspace, return_value=stopped_ws),
         )
+        owned_mock = create_autospec(
+            ws_files_service.owned_workspace_on_computer, return_value=stopped_ws
+        )
+        monkeypatch.setattr(
+            ws_files_service,
+            "owned_workspace_on_computer",
+            owned_mock,
+        )
         monkeypatch.setattr(
             ws_files_crud,
             "owned_workspace_on_computer",
-            create_autospec(
-                ws_files_crud.owned_workspace_on_computer, return_value=stopped_ws
-            ),
+            owned_mock,
         )
         monkeypatch.setattr(
             ws_files_crud,

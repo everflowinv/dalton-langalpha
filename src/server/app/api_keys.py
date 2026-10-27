@@ -830,6 +830,27 @@ def _build_provider_catalog() -> list[dict]:
     return catalog
 
 
+@functools.lru_cache(maxsize=1)
+def _build_key_candidates() -> dict[str, dict]:
+    """Where a turn looks for each provider's stored key, so the client can
+    tell which saved models the user's own keys serve without re-deriving the
+    walk: ``slugs`` in ``_candidate_slugs`` order, ``shared`` the ones whose
+    key the vendor issues as one with the provider's. A key under another slug
+    serves it only when saved with a base URL; a custom model takes any.
+    """
+    from src.llms.llm import LLM
+    from src.server.services.llm.clients import _candidate_slugs
+
+    mc = LLM.get_model_config()
+    out = {}
+    for key, info in mc.flat_providers.items():
+        if info.get("platform") or info.get("access_type") == "oauth":
+            continue
+        slugs = _candidate_slugs(key, mc)
+        out[key] = {"slugs": slugs, "shared": [s for s in slugs if mc.shares_api_key(key, s)]}
+    return out
+
+
 @router.get("/api/v1/models")
 async def list_models():
     """
@@ -912,4 +933,5 @@ async def list_models():
         "task_cost_baseline": task_cost_baseline(),
         "search_providers": search_providers,
         "provider_catalog": _build_provider_catalog(),
+        "key_candidates": _build_key_candidates(),
     }

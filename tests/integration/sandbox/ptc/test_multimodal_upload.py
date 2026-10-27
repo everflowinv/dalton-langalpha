@@ -249,7 +249,8 @@ class TestMultimodalUploadPipeline:
         assert "Use Python to process it" in reminder
 
     async def test_ptc_mixed_image_pdf_xlsx(self, shared_sandbox):
-        """PTC + Claude + image + PDF + xlsx: all uploaded, image+PDF get blocks, xlsx gets file note."""
+        """PTC + Claude + image + PDF + xlsx: all uploaded, the image gets a block,
+        the saved PDF a note naming its path, the xlsx a file note."""
         image, pdf, xlsx = _make_image(), _make_pdf(), _make_xlsx()
         contexts = [image, pdf, xlsx]
 
@@ -274,7 +275,10 @@ class TestMultimodalUploadPipeline:
 
         blocks = messages[0]["content"]
         assert any(b.get("type") == "image_url" for b in blocks)
-        assert any(b.get("type") == "file" for b in blocks)
+        # Saved, the PDF is a note to Read it from, not the document inline.
+        note = {"type": "text", "text": f"[Attached PDF: report.pdf (saved to {supported_paths[1]})]"}
+        assert note in blocks
+        assert not any(b.get("type") == "file" for b in blocks)
         assert blocks[-1] == {"type": "text", "text": "analyze all files"}
 
         # File-only reminder (no "cannot view")

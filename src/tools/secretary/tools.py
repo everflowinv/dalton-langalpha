@@ -483,23 +483,27 @@ async def workspace_files_list_cos(
         return err
     try:
         from src.server.app.workspace_files._shared import (
-            _acquire_sandbox_to_change,
             _is_non_owner_blocked_path,
-            _normalize_requested_path,
             owner_work_dir,
-            previous_dir_names_of,
         )
         from src.server.app.workspace_files.crud import _live_listing
         from src.server.database.workspace import get_workspace
         from src.server.models.workspace import served_from_mirror
         from src.server.services.persistence.file import FilePersistenceService
+        from src.server.services.workspace_file_containment import (
+            normalize_requested_path,
+        )
+        from src.server.services.workspace_files import (
+            acquire_sandbox_to_change,
+            previous_dir_names_of,
+        )
 
         ws = await get_workspace(workspace_id)
         if not ws:
             return error_command("workspace not found", tool_call_id)
         work_dir = owner_work_dir(ws)
         previous_dirs = previous_dir_names_of(ws)
-        normalized_path = _normalize_requested_path(
+        normalized_path = normalize_requested_path(
             path or ".", work_dir, previous_dirs
         )
         if normalized_path and _is_non_owner_blocked_path(normalized_path):
@@ -524,7 +528,7 @@ async def workspace_files_list_cos(
             ]
         else:
             owner_id = str(ws.get("user_id") or user_id)
-            async with _acquire_sandbox_to_change(workspace_id, owner_id) as (
+            async with acquire_sandbox_to_change(workspace_id, owner_id) as (
                 sandbox,
                 live_ws,
             ):
@@ -563,20 +567,24 @@ async def workspace_file_read_cos(
     try:
         from fastapi import HTTPException
         from src.server.app.workspace_files._shared import (
-            _acquire_sandbox_to_change,
             _decode_file_text,
             _is_binary,
             _is_non_owner_blocked_path,
-            _normalize_requested_path,
             _to_client_path,
             http_file_text,
             owner_work_dir,
-            previous_dir_names_of,
         )
         from src.server.app.workspace_files.crud import _read_contained_target
         from src.server.database.workspace import get_workspace
         from src.server.models.workspace import served_from_mirror
         from src.server.services.persistence.file import FilePersistenceService
+        from src.server.services.workspace_file_containment import (
+            normalize_requested_path,
+        )
+        from src.server.services.workspace_files import (
+            acquire_sandbox_to_change,
+            previous_dir_names_of,
+        )
         from src.server.utils.secret_redactor import (
             get_redactor,
             get_vault_secrets_for_redaction,
@@ -587,7 +595,7 @@ async def workspace_file_read_cos(
             return error_command("workspace not found", tool_call_id)
         work_dir = owner_work_dir(ws)
         previous_dirs = previous_dir_names_of(ws)
-        normalized_path = _normalize_requested_path(path, work_dir, previous_dirs)
+        normalized_path = normalize_requested_path(path, work_dir, previous_dirs)
         if not normalized_path or _is_non_owner_blocked_path(normalized_path):
             return error_command("file not found", tool_call_id)
 
@@ -604,7 +612,7 @@ async def workspace_file_read_cos(
             text_content = await http_file_text(file_record, user_id=owner_id)
             out_path = normalized_path
         else:
-            async with _acquire_sandbox_to_change(workspace_id, owner_id) as (
+            async with acquire_sandbox_to_change(workspace_id, owner_id) as (
                 sandbox,
                 live_ws,
             ):
@@ -664,19 +672,21 @@ async def workspace_file_write_cos(
         return err
     try:
         from src.server.app.workspace_files._shared import (
-            _acquire_sandbox_to_change,
             _is_non_owner_blocked_path,
-            _normalize_requested_path,
             _to_client_path,
             owner_work_dir,
-            previous_dir_names_of,
         )
-        from src.server.app.workspace_files.crud import (
-            MAX_WRITE_BYTES,
-            _contained_target,
-        )
+        from src.server.app.workspace_files.crud import MAX_WRITE_BYTES
         from src.server.database.workspace import get_workspace
         from src.server.models.workspace import served_from_mirror
+        from src.server.services.workspace_file_containment import (
+            normalize_requested_path,
+        )
+        from src.server.services.workspace_files import (
+            acquire_sandbox_to_change,
+            contained_target,
+            previous_dir_names_of,
+        )
 
         ws = await get_workspace(workspace_id)
         if not ws:
@@ -688,7 +698,7 @@ async def workspace_file_write_cos(
             )
         work_dir = owner_work_dir(ws)
         previous_dirs = previous_dir_names_of(ws)
-        normalized_req_path = _normalize_requested_path(path, work_dir, previous_dirs)
+        normalized_req_path = normalize_requested_path(path, work_dir, previous_dirs)
         if _is_non_owner_blocked_path(normalized_req_path):
             return error_command(
                 "403 Forbidden: Cannot write system, hidden, or virtual files",
@@ -700,13 +710,13 @@ async def workspace_file_write_cos(
             return error_command("File content too large (max 10MB)", tool_call_id)
 
         owner_id = str(ws.get("user_id") or user_id)
-        async with _acquire_sandbox_to_change(workspace_id, owner_id) as (
+        async with acquire_sandbox_to_change(workspace_id, owner_id) as (
             sandbox,
             live_ws,
         ):
             work_dir = owner_work_dir(live_ws)
             previous_dirs = previous_dir_names_of(live_ws)
-            normalized = await _contained_target(
+            normalized = await contained_target(
                 sandbox, path, work_dir, previous_dirs
             )
             client_path = _to_client_path(sandbox, normalized, work_dir)

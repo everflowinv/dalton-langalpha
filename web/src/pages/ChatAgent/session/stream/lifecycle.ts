@@ -182,6 +182,10 @@ export const reconnectToStream = async (
   if (runId !== undefined) rt.currentRunIdRef.current = runId;
   if (runId) noteLiveRun(rt, runId);
   if (resetCursor) rt.lastEventIdRef.current = null;
+  // A held send's `released` frame rides only the stream that sent it, so a
+  // send that dropped before it would keep the line up through the answer.
+  // The reconnect's own status stands in for it from here.
+  rt.setTurnHeld(null);
 
   console.log('[Reconnect] Starting reconnection for thread:', tid);
 
@@ -1019,6 +1023,7 @@ export const cleanupAfterStreamEnd = (
 ) => {
   rt.setIsLoading(false);
   rt.setWorkspaceStarting(false);
+  rt.setTurnHeld(null);
   rt.setIsCompacting(false);
   deps.clearModelStatus();
   // A settled turn is the cheapest moment to learn the edge has moved on: the

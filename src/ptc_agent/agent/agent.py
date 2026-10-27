@@ -784,8 +784,33 @@ class PTCAgent:
         )
 
         # --- Build final middleware stacks ---
+        # The strip goes inside model_resilience so it judges the post-fallback
+        # model: a vision primary falling back to a text-only candidate would
+        # otherwise replay image/PDF blocks and earn the 400 the fallback exists
+        # to avoid. Both halves go in both stacks because a subagent on its own
+        # model needs the same treatment; the strip reads that model off each
+        # request, so the two stacks share one instance rather than one apiece.
+        #
+        # Unconditional, unlike the read half's old combined form, because the
+        # two halves are no longer switched on together. ``model_name`` only
+        # decides whether the user's per-model override applies; the target is
+        # read off each request, and an unresolvable one is judged text-only. So
+        # a config with no llm gets a strip that removes everything rather than
+        # no strip at all, which is the safe direction: without it the read half
+        # would keep attaching blocks that nothing removes.
+        multimodal_strip = MultimodalStripMiddleware(
+            model_name=self.config.llm.name if self.config.llm else None,
+            custom_modalities=self.config.input_modalities,
+        )
+        # Compaction counts only the attachments the strip leaves a model, as
+        # it judges them, and a PDF page at what that model's vendor charges,
+        # so a target that reads none, or pays little, is not summarized early.
         compaction = CompactionMiddleware.for_agent(
-            self.config, backend=backend, workspace_id=workspace_id_for_memory
+            self.config,
+            backend=backend,
+            workspace_id=workspace_id_for_memory,
+            receives=multimodal_strip.receives,
+            page_tokens=multimodal_strip.pdf_page_tokens,
         )
         # The main agent is asked to update its scratchpad notes before each
         # summary, and its summaries name them; a subagent's do not. Without
@@ -811,24 +836,6 @@ class PTCAgent:
 
         model_resilience = [build_model_resilience_middleware(self.config, turn)]
 
-        # The strip goes inside model_resilience so it judges the post-fallback
-        # model: a vision primary falling back to a text-only candidate would
-        # otherwise replay image/PDF blocks and earn the 400 the fallback exists
-        # to avoid. Both halves go in both stacks because a subagent on its own
-        # model needs the same treatment; the strip reads that model off each
-        # request, so the two stacks share one instance rather than one apiece.
-        #
-        # Unconditional, unlike the read half's old combined form, because the
-        # two halves are no longer switched on together. ``model_name`` only
-        # decides whether the user's per-model override applies; the target is
-        # read off each request, and an unresolvable one is judged text-only. So
-        # a config with no llm gets a strip that removes everything rather than
-        # no strip at all, which is the safe direction: without it the read half
-        # would keep attaching blocks that nothing removes.
-        multimodal_strip = MultimodalStripMiddleware(
-            model_name=self.config.llm.name if self.config.llm else None,
-            custom_modalities=self.config.input_modalities,
-        )
         multimodal_read = MultimodalMiddleware(sandbox=sandbox)
 
         # Placed before (outer to) model_resilience so sandbox images are

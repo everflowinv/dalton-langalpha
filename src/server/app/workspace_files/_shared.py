@@ -1,15 +1,13 @@
-"""Path classification, decode, and sandbox-access helpers shared by the
-CRUD (`crud.py`) and serving (`serve.py`) routers."""
+"""Path classification, decode, and serving helpers shared by the CRUD
+(`crud.py`) and serving (`serve.py`) routers; the sandbox access they share is
+in ``services/workspace_files``."""
 
 from __future__ import annotations
 
 import asyncio
 import logging
-import posixpath
-from collections.abc import AsyncIterator, Mapping, Sequence
-from contextlib import AsyncExitStack, asynccontextmanager
+from collections.abc import Mapping, Sequence
 from typing import Any
-from urllib.parse import unquote
 
 from charset_normalizer import from_bytes
 from fastapi import HTTPException
@@ -19,48 +17,32 @@ from ptc_agent.agent.backends.db_json_route import DbJsonRoute
 from ptc_agent.agent.filesystem_routes import USER_DATA_ROUTES, route_for
 from ptc_agent.core.paths import (
     AGENT_SYSTEM_DIRS,
-    SANDBOX_ROOTS,
     USER_DATA_DIRS,
     ALWAYS_HIDDEN_BASENAMES as _SHARED_BASENAMES,
     ALWAYS_HIDDEN_DIR_NAMES,
     ALWAYS_HIDDEN_PATH_SEGMENTS,
     ALWAYS_HIDDEN_SUFFIXES,
     HIDDEN_DIR_NAMES,
+    TRANSIENT_ROOT_PREFIX,
     SandboxLayout,
-    WorkspaceLayout,
     logged_path,
-    strip_previous_dir_name,
 )
 from ptc_agent.core.sandbox.runtime import STREAM_CHUNK_BYTES
 from src.server.database.blob_keys import RELAY_MAX_BYTES
-from src.server.database.home_workspace import is_unbound
 from src.server.database.workspace import get_workspace as db_get_workspace
-from src.server.database.workspace_folders import (
-    WorkspaceFolderMoving,
-    is_top_level,
-    workspace_folder_in_use,
-)
+from src.server.database.workspace_folders import is_top_level
 from src.server.services.persistence.transfer import (
     INPROCESS_MAX_INFLIGHT_BYTES,
     ByteBudget,
-)
-from src.server.services.workspace_manager import WorkspaceManager
-from src.server.services.workspace_layout import (
-    WorkspaceLayoutUnavailable,
-    layout_from_binding,
 )
 from src.server.services.persistence.resolve import (
     FileBytesUnavailable,
     resolve_file_bytes,
     too_large_to_serve,
 )
-from src.server.utils.api import require_workspace_owner
-from src.server.utils.error_sanitization import (
-    sandbox_failure_http,
-    sandbox_unreachable_detail,
-    single_line,
-)
-from src.observability import safe_record, workspace_fs_bytes
+from src.server.services.workspace_file_containment import normalize_requested_path
+from src.server.services.workspace_files import layout_for, owner_layout
+from src.server.utils.error_sanitization import single_line
 
 logger = logging.getLogger(__name__)
 
@@ -105,12 +87,6 @@ async def http_file_text(file_record: dict[str, Any], *, user_id: str) -> str:
     data = await http_file_bytes(file_record, user_id=user_id)
     return data.decode("utf-8", errors="replace")
 
-
-def _record_fs_bytes(op: str, size: int | None) -> None:
-    """Emit workspace.fs.bytes histogram. No-op when size is unknown / negative."""
-    if not size or size < 0:
-        return
-    safe_record(workspace_fs_bytes, int(size), {"op": op})
 
 # Image MIME types that benefit from HTTP caching
 _CACHEABLE_IMAGE_TYPES = frozenset(
@@ -329,118 +305,6 @@ def _decode_file_text(raw_bytes: bytes) -> str | None:
     return str(match)
 
 
-# Home joins the user's computer on its first start or turn (ensure_home);
-# until then a request for its files or sandbox has nothing to reach. The
-# reason is the same fact for a response that answers rather than refuses.
-HOME_NOT_ON_COMPUTER = "Home is not on a computer yet"
-HOME_NOT_ON_COMPUTER_REASON = "home_not_on_computer"
-
-
-async def owned_workspace_on_computer(
-    workspace_id: str, user_id: str, *, need: str | None = None
-) -> dict[str, Any]:
-    """The caller's workspace, for a route that reaches its files or sandbox.
-
-    Refused as any owner check refuses, and with a 400 while it is Home not
-    yet on a computer.
-    """
-    workspace = await db_get_workspace(workspace_id)
-    # --- DALTON-HOOK(workspace-sharing-settings): begin ---
-    if need in ("read", "write"):
-        from src.dalton.settings import is_dalton_supabase_auth_enabled
-
-        if is_dalton_supabase_auth_enabled():
-            from src.dalton.sharing import require_workspace_access
-
-            workspace = await require_workspace_access(
-                workspace, user_id, channel="web", need=need
-            )
-        else:
-            require_workspace_owner(workspace, user_id=user_id)
-    else:
-        require_workspace_owner(workspace, user_id=user_id)
-    # --- DALTON-HOOK(workspace-sharing-settings): end ---
-    if is_unbound(workspace):
-        raise HTTPException(status_code=400, detail=HOME_NOT_ON_COMPUTER)
-    return workspace
-
-
-async def _acquire_sandbox(
-    workspace_id: str, user_id: str
-) -> tuple[Any, dict[str, Any]]:
-    """A ready sandbox and the workspace row as the acquisition left it, or the
-    failure's answer: 503, or 422 when an owner's SSH machine refused.
-
-    Acquiring is where a renamed workspace's folder moves, so a row read before
-    it can name a folder that is gone: a route builds every sandbox path from
-    the row this returns, never from the one it read to check ownership. A
-    settle on another worker can still move it before the sandbox is read, so
-    a file route takes ``_acquire_sandbox_to_change`` rather than this.
-    """
-    manager = WorkspaceManager.get_instance()
-    try:
-        session = await manager.get_session_for_workspace(workspace_id, user_id=user_id)
-    except Exception as e:
-        # The app-level handler's answer, status and wording: the file panel
-        # categorizes on the 503's detail, whose "starting" sub-case has to
-        # survive the boundary, and a refusal is the 422 every route gives it.
-        logger.warning(
-            f"Sandbox unreachable for workspace {workspace_id}: {single_line(str(e))}"
-        )
-        raise sandbox_failure_http(e) from None
-
-    sandbox = getattr(session, "sandbox", None)
-    if sandbox is None:
-        raise HTTPException(
-            status_code=503,
-            detail="Sandbox is not reachable: no sandbox attached to the session",
-        )
-    workspace = await db_get_workspace(workspace_id)
-    if not workspace:
-        raise HTTPException(status_code=404, detail="Workspace not found")
-    return sandbox, workspace
-
-
-@asynccontextmanager
-async def _acquire_sandbox_to_change(
-    workspace_id: str, user_id: str
-) -> AsyncIterator[tuple[Any, dict[str, Any]]]:
-    """``_acquire_sandbox`` for a route that touches files by path: the folder
-    stays put until the block ends, and the row is read under that hold.
-
-    Reads need it as much as changes: a folder moved between the row read and
-    the sandbox read is gone, or is a sibling's that landed on the old name,
-    whose files would answer as this workspace's.
-    """
-    sandbox, _ = await _acquire_sandbox(workspace_id, user_id)
-    async with held_workspace_row(workspace_id) as workspace:
-        yield sandbox, workspace
-
-
-@asynccontextmanager
-async def held_workspace_row(workspace_id: str) -> AsyncIterator[dict[str, Any]]:
-    """The workspace row, read with its folder held until the block ends, for
-    any sandbox work on a path under the folder; a folder mid-move is a 503."""
-    async with AsyncExitStack() as held:
-        try:
-            await held.enter_async_context(workspace_folder_in_use(workspace_id))
-        except WorkspaceFolderMoving as e:
-            raise HTTPException(
-                status_code=503, detail=sandbox_unreachable_detail(e)
-            ) from None
-        workspace = await db_get_workspace(workspace_id)
-        if not workspace:
-            raise HTTPException(status_code=404, detail="Workspace not found")
-        dir_name = workspace.get("dir_name")
-        if dir_name and not is_top_level(dir_name):
-            # A move a settle could not finish; the acquisition refuses it too.
-            raise HTTPException(
-                status_code=503,
-                detail=sandbox_unreachable_detail(WorkspaceFolderMoving(workspace_id)),
-            )
-        yield workspace
-
-
 async def folder_unmoved(workspace_id: str, dir_name: str | None) -> bool:
     """Whether the row still names ``dir_name`` as a settled folder.
 
@@ -507,6 +371,11 @@ def _is_hidden_path(client_path: str) -> bool:
 def _is_always_hidden_path(client_path: str) -> bool:
     normalized = f"/{client_path.lstrip('/')}"
 
+    # A transfer's partial or staged file, whose bytes are not yet the file
+    # they will become; one a user edits or removes fails the transfer.
+    if normalized.rfind("/") == 0 and normalized[1:].startswith(TRANSIENT_ROOT_PREFIX):
+        return True
+
     if normalized.endswith(_ALWAYS_HIDDEN_BASENAMES):
         return True
 
@@ -564,65 +433,13 @@ def _is_non_owner_blocked_path(client_path: str) -> bool:
 # --- DALTON-HOOK(workspace-sharing-settings): end ---
 
 
-def layout_for(workspace: dict[str, Any], *, manager: Any = None) -> WorkspaceLayout:
-    """The folder this project owns on its computer: every route's serve root.
-
-    Several projects share one computer root, so the root on its own is no
-    longer a serve root for any of them. Takes the row the caller already read
-    and raises ``WorkspaceLayoutUnavailable`` when it cannot name a folder,
-    because widening to the computer would serve a sibling's files.
-    """
-    root = workspace.get("computer_root_dir")
-    if not root:
-        manager = manager or WorkspaceManager.get_instance()
-        root = manager.config.to_core_config().filesystem.working_directory
-    workspace_id = str((workspace or {}).get("workspace_id") or "")
-    return layout_from_binding(workspace_id, workspace, root=root)
-
-
 def work_dir_for(workspace: dict[str, Any], *, manager: Any = None) -> str:
     """The serve root as a path, for the routes that only need the string."""
     return layout_for(workspace, manager=manager).workspace
 
 
-def owner_layout(workspace: dict[str, Any], *, manager: Any = None) -> WorkspaceLayout:
-    """``layout_for`` as an HTTP answer, for a route that authenticated its owner.
-
-    503 rather than 404: the placement is a fact the row is expected to carry,
-    so its absence is a workspace that is not ready rather than a workspace
-    that has no files. The owner gets the failure instead of a listing, since
-    the only wider answer available is their neighbours' files.
-    """
-    try:
-        return layout_for(workspace, manager=manager)
-    except WorkspaceLayoutUnavailable as e:
-        logger.warning(
-            f"Refusing file access to workspace "
-            f"{(workspace or {}).get('workspace_id')}: {single_line(str(e))}"
-        )
-        raise HTTPException(
-            status_code=503, detail="Workspace files are not available yet"
-        ) from None
-
-
 def owner_work_dir(workspace: dict[str, Any], *, manager: Any = None) -> str:
     return owner_layout(workspace, manager=manager).workspace
-
-
-def previous_dir_names_of(workspace: Mapping[str, Any] | None) -> tuple[str, ...]:
-    """The folders a rename moved this workspace out of, for folding old spellings.
-
-    Unlike the agent's fold, a former folder a sibling has taken since still
-    folds here: a route only ever serves this workspace's folder, so the
-    spelling answers as this workspace's file or not at all, and a link that
-    carries it was written while the folder was this workspace's.
-    """
-    current = (workspace or {}).get("dir_name")
-    return tuple(
-        name
-        for name in ((workspace or {}).get("previous_dir_names") or ())
-        if name and name != current
-    )
 
 
 def previous_roots_of(workspace: Mapping[str, Any] | None) -> tuple[str, ...]:
@@ -635,124 +452,11 @@ def previous_roots_of(workspace: Mapping[str, Any] | None) -> tuple[str, ...]:
     return tuple(sorted((r for r in roots if r), key=len, reverse=True))
 
 
-_FILE_URL_SCHEME = "file://"
-
-
-def _file_url_path(raw: str) -> str:
-    """The local path a ``file:`` URL names, percent-decoded.
-
-    Transcript links carry this spelling. The scheme says the rest is an
-    absolute path however many slashes followed it, so an authority-shaped
-    remainder (``file://home/...``) folds to the same path as
-    ``file:///home/...``. Decoding happens before the escape checks, so an
-    encoded ``..`` is refused rather than smuggled through as a literal segment.
-    """
-    if raw[: len(_FILE_URL_SCHEME)].lower() != _FILE_URL_SCHEME:
-        return raw
-    rest = unquote(raw[len(_FILE_URL_SCHEME) :])
-    if rest.lower().startswith("localhost/"):
-        rest = rest[len("localhost") :]
-    return rest if rest.startswith("/") else f"/{rest}"
-
-
-def _fold_relative(path: str) -> str:
-    """Drop the ``./`` and trailing-slash noise a relative spelling carries."""
-    out = path
-    while out.startswith("./"):
-        out = out[2:]
-    out = out.rstrip("/")
-    return "" if out == "." else out
-
-
-def _known_roots(work_dir: str) -> tuple[str, ...]:
-    """Absolute prefixes a requested path may carry, most specific first.
-
-    The workspace folder sorts ahead of the computer root it sits on because it
-    is the longer string, and that ordering is what decides the one ambiguous
-    spelling: ``<work_dir>/<dir_name>/x`` reads as this folder's own
-    subdirectory rather than as a root-level folder named after the workspace.
-    """
-    roots = {work_dir.rstrip("/"), *(root.rstrip("/") for root in SANDBOX_ROOTS)}
-    return tuple(sorted((r for r in roots if r), key=lambda r: (-len(r), r)))
-
-
-def workspace_relative_path(
-    path: str,
-    work_dir: str,
-    previous_dir_names: Sequence[str] = (),
-    *,
-    previous_roots: Sequence[str] = (),
-) -> str:
-    """Every spelling of a requested path folded to one ``work_dir``-relative form.
-
-    A path arrives relative to the workspace, under the workspace folder, under
-    a computer root that folder sits on (the layout before the split spelled
-    every path that way, and transcripts still hold those), under a folder the
-    workspace was renamed out of, or as a ``file:`` URL of any of these. The
-    sweep that split the root physically moved those entries into the folder,
-    and a rename moves the folder, so each spelling names the same file the
-    folder spelling does. So does a move, for the folder spelled under a root
-    in ``previous_roots`` (most specific first) by any of its names.
-
-    A leading slash survives a path no root claimed: whether that names a
-    workspace file or nothing at all is the caller's policy, not this fold's.
-    """
-    raw = _file_url_path((path or "").strip()).replace("\\", "/")
-    folder = work_dir.rstrip("/")
-    if raw != folder and not raw.startswith(f"{folder}/"):
-        # Another folder under a root left behind was a sibling's, so only
-        # this folder's own names fold there.
-        names = (posixpath.basename(folder), *previous_dir_names)
-        for root in previous_roots:
-            if raw.startswith(f"{root}/"):
-                inside = strip_previous_dir_name(
-                    _fold_relative(raw[len(root) + 1 :]), names
-                )
-                if inside is not None:
-                    return inside
-    for root in _known_roots(work_dir):
-        if raw == root:
-            return ""
-        if raw.startswith(f"{root}/"):
-            relative = _fold_relative(raw[len(root) + 1 :])
-            if root != folder:
-                inside = strip_previous_dir_name(relative, previous_dir_names)
-                if inside is not None:
-                    return inside
-            return relative
-    # A former folder sat beside this one, on the computer's root, which a
-    # configured working directory puts outside the stock roots.
-    beside = posixpath.dirname(folder).rstrip("/")
-    if previous_dir_names and raw.startswith(f"{beside}/"):
-        inside = strip_previous_dir_name(
-            _fold_relative(raw[len(beside) + 1 :]), previous_dir_names
-        )
-        if inside is not None:
-            return inside
-    return raw if raw.startswith("/") else _fold_relative(raw)
-
-
-def _normalize_requested_path(
-    path: str, work_dir: str, previous_dir_names: Sequence[str] = ()
-) -> str:
-    """The folded path, reading a slash no root claimed as the workspace root.
-
-    That is the client's virtual-absolute spelling, so one leading slash comes
-    off and only one: ``//etc/passwd`` stays absolute and the containment check
-    that follows refuses it. ``clean_path`` refuses the same spelling outright,
-    because its callers glob what it returns.
-    """
-    relative = workspace_relative_path(path, work_dir, previous_dir_names)
-    if relative.startswith("/"):
-        return _fold_relative(relative[1:])
-    return relative
-
-
 def _requested_hidden_ok(
     path: str, work_dir: str, previous_dir_names: Sequence[str] = ()
 ) -> bool:
     """Return True if caller explicitly requested a hidden directory."""
-    normalized = _normalize_requested_path(path, work_dir, previous_dir_names)
+    normalized = normalize_requested_path(path, work_dir, previous_dir_names)
     if not normalized:
         return False
     internal = SandboxLayout.INTERNAL_DIR
@@ -763,7 +467,7 @@ def _requested_system_ok(
     path: str, work_dir: str, previous_dir_names: Sequence[str] = ()
 ) -> bool:
     """Return True if caller explicitly requested a system directory."""
-    normalized = _normalize_requested_path(path, work_dir, previous_dir_names)
+    normalized = normalize_requested_path(path, work_dir, previous_dir_names)
     if not normalized:
         return False
     return any(

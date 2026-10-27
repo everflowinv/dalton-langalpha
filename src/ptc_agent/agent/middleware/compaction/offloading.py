@@ -12,11 +12,14 @@ from langchain_core.messages import AIMessage, AnyMessage, ToolMessage
 from langgraph.config import get_config
 
 from ptc_agent.core.paths import WorkspaceLayout
+from ptc_agent.agent.middleware.file_operations.multimodal_strip import remove_attachments
 from src.llms.attachment_payload import FILE_BLOCK_TYPES
 from ptc_agent.agent.middleware.compaction.types import OffloadSettings, TRUNCATABLE_TOOLS
 from ptc_agent.agent.middleware.compaction.utils import (
     get_effective_messages,
     oversized_arg_calls,
+    pdf_pages,
+    read_ahead,
     read_offload_marker,
     stale_read_ids,
     strip_base64_from_messages,
@@ -61,6 +64,10 @@ def recorded_offloads(state: Mapping[str, Any]) -> Offloads:
         set(state.get("_offloaded_tool_call_ids") or ()),
         set(state.get("_offloaded_read_result_ids") or ()),
     )
+
+
+def removed_attachments(state: Mapping[str, Any]) -> set[str]:
+    return set(state.get("_removed_attachment_ids") or ())
 
 
 def record_offloads(state: Mapping[str, Any], args: set[str], reads: set[str]) -> dict[str, Any]:
@@ -115,7 +122,7 @@ def is_idle(state: Mapping[str, Any], settings: OffloadSettings, now: float) -> 
     return settings.idle_seconds is not None and bool(last) and now - last >= settings.idle_seconds
 
 
-def offload_view(
+async def offload_view(
     messages: list[AnyMessage],
     state: Mapping[str, Any],
     *,
@@ -124,7 +131,8 @@ def offload_view(
     shell: bool = True,
 ) -> list[AnyMessage]:
     """What the model is sent of ``messages``: the view after ``state``'s
-    last summary, with every offload ``state`` recorded applied.
+    last summary, with every offload ``state`` recorded applied and the
+    attachments it removed to fit the context window taken out.
 
     An offload is a view over the checkpoint, not a rewrite of it: the id sets
     are the record, and every call cuts them again, so a call cut once stays
@@ -141,7 +149,12 @@ def offload_view(
         if arg_ids and transcript is not None
         else None
     )
-    return apply_recorded_offloads(effective, arg_ids, read_ids, max_length, turns, shell=shell)
+    view = apply_recorded_offloads(effective, arg_ids, read_ids, max_length, turns, shell=shell)
+    removed = removed_attachments(state)
+    # A removed PDF's placeholder gives its page count, which a block with no
+    # stamp is parsed for.
+    await read_ahead(msg for msg in view if getattr(msg, "id", None) in removed)
+    return remove_attachments(view, removed, pages=pdf_pages)
 
 
 def apply_recorded_offloads(

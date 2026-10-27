@@ -103,6 +103,10 @@ class CompactionState(AgentState):
     #: of checkpoints offloaded is what these grew by across it.
     _offloaded_args_total: Annotated[NotRequired[int], PrivateStateAttr]
     _offloaded_reads_total: Annotated[NotRequired[int], PrivateStateAttr]
+    #: Messages whose attachments were taken out of the view to fit the
+    #: context window, by message id. Re-applied on every call like the
+    #: offloads, so what was sent once without them stays without them.
+    _removed_attachment_ids: Annotated[NotRequired[set[str]], PrivateStateAttr]
     _cached_input_tokens: Annotated[NotRequired[int], PrivateStateAttr]
     _cached_output_tokens: Annotated[NotRequired[int], PrivateStateAttr]
     _last_model_response_at: Annotated[NotRequired[float], PrivateStateAttr]

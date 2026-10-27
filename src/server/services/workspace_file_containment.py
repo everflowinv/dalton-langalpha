@@ -1,7 +1,9 @@
 """Canonical containment for mirrored and sandbox file reads.
 
-Mirror keys need canonical relative paths; sandbox checks need realpath because
-lexical validation misses .. and symlinks that can expose sibling files.
+A requested path is first folded to one spelling relative to the workspace
+folder, whichever form it arrived in. Mirror keys need canonical relative
+paths; sandbox checks need realpath because lexical validation misses .. and
+symlinks that can expose sibling files.
 """
 
 from __future__ import annotations
@@ -13,12 +15,11 @@ import posixpath
 import shlex
 from collections.abc import Sequence
 from typing import Any
+from urllib.parse import unquote
 from uuid import uuid4
 
-from ptc_agent.core.paths import SandboxLayout
+from ptc_agent.core.paths import SANDBOX_ROOTS, SandboxLayout, strip_previous_dir_name
 from ptc_agent.core.sandbox.runtime import SandboxTransientError
-
-from ._shared import _normalize_requested_path
 from src.server.utils.error_sanitization import single_line
 
 logger = logging.getLogger(__name__)
@@ -69,13 +70,126 @@ class FileTooLargeToServe(Exception):
         self.size = size
 
 
+_FILE_URL_SCHEME = "file://"
+
+
+def _file_url_path(raw: str) -> str:
+    """The local path a ``file:`` URL names, percent-decoded.
+
+    Transcript links carry this spelling. The scheme says the rest is an
+    absolute path however many slashes followed it, so an authority-shaped
+    remainder (``file://home/...``) folds to the same path as
+    ``file:///home/...``. Decoding happens before the escape checks, so an
+    encoded ``..`` is refused rather than smuggled through as a literal segment.
+    """
+    if raw[: len(_FILE_URL_SCHEME)].lower() != _FILE_URL_SCHEME:
+        return raw
+    rest = unquote(raw[len(_FILE_URL_SCHEME) :])
+    if rest.lower().startswith("localhost/"):
+        rest = rest[len("localhost") :]
+    return rest if rest.startswith("/") else f"/{rest}"
+
+
+def _fold_relative(path: str) -> str:
+    """Drop the ``./`` and trailing-slash noise a relative spelling carries."""
+    out = path
+    while out.startswith("./"):
+        out = out[2:]
+    out = out.rstrip("/")
+    return "" if out == "." else out
+
+
+def _known_roots(work_dir: str) -> tuple[str, ...]:
+    """Absolute prefixes a requested path may carry, most specific first.
+
+    The workspace folder sorts ahead of the computer root it sits on because it
+    is the longer string, and that ordering is what decides the one ambiguous
+    spelling: ``<work_dir>/<dir_name>/x`` reads as this folder's own
+    subdirectory rather than as a root-level folder named after the workspace.
+    """
+    roots = {work_dir.rstrip("/"), *(root.rstrip("/") for root in SANDBOX_ROOTS)}
+    return tuple(sorted((r for r in roots if r), key=lambda r: (-len(r), r)))
+
+
+def workspace_relative_path(
+    path: str,
+    work_dir: str,
+    previous_dir_names: Sequence[str] = (),
+    *,
+    previous_roots: Sequence[str] = (),
+) -> str:
+    """Every spelling of a requested path folded to one ``work_dir``-relative form.
+
+    A path arrives relative to the workspace, under the workspace folder, under
+    a computer root that folder sits on (the layout before the split spelled
+    every path that way, and transcripts still hold those), under a folder the
+    workspace was renamed out of, or as a ``file:`` URL of any of these. The
+    sweep that split the root physically moved those entries into the folder,
+    and a rename moves the folder, so each spelling names the same file the
+    folder spelling does. So does a move, for the folder spelled under a root
+    in ``previous_roots`` (most specific first) by any of its names.
+
+    A leading slash survives a path no root claimed: whether that names a
+    workspace file or nothing at all is the caller's policy, not this fold's.
+    """
+    raw = _file_url_path((path or "").strip()).replace("\\", "/")
+    folder = work_dir.rstrip("/")
+    if raw != folder and not raw.startswith(f"{folder}/"):
+        # Another folder under a root left behind was a sibling's, so only
+        # this folder's own names fold there.
+        names = (posixpath.basename(folder), *previous_dir_names)
+        for root in previous_roots:
+            if raw.startswith(f"{root}/"):
+                inside = strip_previous_dir_name(
+                    _fold_relative(raw[len(root) + 1 :]), names
+                )
+                if inside is not None:
+                    return inside
+    for root in _known_roots(work_dir):
+        if raw == root:
+            return ""
+        if raw.startswith(f"{root}/"):
+            relative = _fold_relative(raw[len(root) + 1 :])
+            if root != folder:
+                inside = strip_previous_dir_name(relative, previous_dir_names)
+                if inside is not None:
+                    return inside
+            return relative
+    # A former folder sat beside this one, on the computer's root, which a
+    # configured working directory puts outside the stock roots.
+    beside = posixpath.dirname(folder).rstrip("/")
+    if previous_dir_names and raw.startswith(f"{beside}/"):
+        inside = strip_previous_dir_name(
+            _fold_relative(raw[len(beside) + 1 :]), previous_dir_names
+        )
+        if inside is not None:
+            return inside
+    return raw if raw.startswith("/") else _fold_relative(raw)
+
+
+def normalize_requested_path(
+    path: str, work_dir: str, previous_dir_names: Sequence[str] = ()
+) -> str:
+    """The folded path, reading a slash no root claimed as the workspace root.
+
+    That is the client's virtual-absolute spelling, so one leading slash comes
+    off and only one: ``//etc/passwd`` stays absolute and the containment check
+    that follows refuses it. ``clean_path`` refuses the same spelling outright,
+    because its callers glob what it returns.
+    """
+    relative = workspace_relative_path(path, work_dir, previous_dir_names)
+    if relative.startswith("/"):
+        return _fold_relative(relative[1:])
+    return relative
+
+
 def contained_relative_path(
     path: str, work_dir: str, previous_dir_names: Sequence[str] = ()
 ) -> str | None:
     """Canonicalize before mirror lookup; sandbox lexical normalization misses .. and symlinks."""
     # The NUL check reads the folded path, not the request: a ``file:`` URL
     # spells one percent-encoded, and the fold is where it decodes.
-    normalized = _normalize_requested_path(path or "", work_dir, previous_dir_names)
+    normalized = normalize_requested_path(path or "", work_dir, previous_dir_names)
     if not normalized or "\x00" in normalized:
         return None
     canonical = posixpath.normpath(normalized)

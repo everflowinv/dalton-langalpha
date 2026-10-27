@@ -14,6 +14,8 @@ export interface ConfiguredProvider {
    * itself. Carried through so model filters can treat the brand as
    * configured when any of its variants are (e.g. z-ai-coding → z-ai). */
   brand_key?: string;
+  /** Saved with the key; the key then goes there, whatever model it serves. */
+  base_url?: string | null;
   /** Connected subscription plan for OAuth providers (e.g. "pro", "team").
    * Consulted by the ``oauth_plans`` per-model gate; null/absent = unknown. */
   plan_type?: string | null;
@@ -56,6 +58,7 @@ export function useConfiguredProviders() {
           access_type?: string;
           has_key?: boolean;
           brand_key?: string;
+          base_url?: string | null;
         }>) {
           if (p.has_key) {
             result.push({
@@ -63,6 +66,7 @@ export function useConfiguredProviders() {
               display_name: p.display_name ?? p.provider,
               access_type: (p.access_type as ConfiguredProvider['access_type']) ?? 'api_key',
               brand_key: p.brand_key ?? p.provider,
+              base_url: p.base_url ?? null,
             });
           }
         }
@@ -103,6 +107,9 @@ export function useConfiguredProviders() {
     providers,
     configuredSet,
     hasAny: providers.length > 0,
+    /** The account's BYOK switch: off, the server runs no turn on a stored key. */
+    byokEnabled: (apiKeys as Record<string, unknown> | null)?.byok_enabled === true,
+    // DALTON-HOOK(native-oauth-ui): include daltonLoading in provider loading state
     isLoading: keysLoading || codexLoading || claudeLoading || daltonLoading,
   };
 }

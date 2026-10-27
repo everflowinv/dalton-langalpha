@@ -238,6 +238,13 @@ def test_the_recorded_offloads_shrink_to_the_window() -> None:
     assert "_offloaded_read_result_ids" not in update
 
 
+def test_the_removed_attachments_shrink_to_the_window() -> None:
+    messages = _thread(3)
+    state = {"messages": messages, "_removed_attachment_ids": {"t-1-0", "t-3-0"}}
+    update = _trim(state, _index(messages, "h-2"))
+    assert update["_removed_attachment_ids"] == {"t-3-0"}
+
+
 def test_each_carry_reads_the_trimmed_runs() -> None:
     seen = []
 

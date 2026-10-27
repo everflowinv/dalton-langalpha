@@ -1003,6 +1003,41 @@ async def test_a_failed_refresh_does_not_keep_the_plan_it_replaces():
 
 
 @pytest.mark.asyncio
+async def test_a_refusal_asks_past_the_cache_and_leaves_it_in_place():
+    """A plan bought minutes ago must count, and the cached plan must stay for
+    the user's other reads while the ask is out, or each would ask too."""
+    mock_client = AsyncMock()
+    mock_client.post = AsyncMock(
+        return_value=httpx.Response(200, json={"valid": True, "access_tier": 3})
+    )
+    cache = _mock_cache(PRO, last_known=PRO)
+
+    with _platform(mock_client, cache):
+        from src.server.dependencies.usage_limits import _fetch_platform_tier
+
+        assert await _fetch_platform_tier("user-123", recheck=True) == 3
+
+    mock_client.post.assert_awaited_once()
+    cache.delete.assert_not_awaited()
+    cache.set_many.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_a_refusal_during_the_outage_pause_takes_the_last_known_plan():
+    """A client retrying a refused model must not reach a platform that has
+    just failed to answer: the pause holds for a refusal too."""
+    mock_client = AsyncMock()
+    cache = _mock_cache(PRO, last_known=PRO, paused=True)
+
+    with _platform(mock_client, cache):
+        from src.server.dependencies.usage_limits import _fetch_platform_tier
+
+        assert await _fetch_platform_tier("user-123", recheck=True) == 2
+
+    mock_client.post.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_an_entry_without_a_last_known_record_seeds_one():
     """An older worker's entry carries no last-known record; without one, its
     expiry during an outage would leave the user with no plan on record."""

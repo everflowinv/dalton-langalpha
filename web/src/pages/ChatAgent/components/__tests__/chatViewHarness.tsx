@@ -80,6 +80,7 @@ const baseChatState = () => ({
   awaitingReportBack: false,
   reportBackOwed: false,
   workspaceStarting: false as const,
+  turnHeld: null,
   isCompacting: false as const,
   setIsCompacting: vi.fn(),
   queuedSend: null,

@@ -34,10 +34,14 @@ logger = logging.getLogger(__name__)
 
 
 def _load_storage_setting(name: str, env_var: str, default: str) -> str:
-    """One ``storage.<name>`` key from agent_config.yaml, else ``env_var``."""
+    """One ``storage.<name>`` key from agent_config.yaml, else ``env_var``.
+
+    A key set to a false value counts as set, so ``browser_uploads: false``
+    turns the feature off whatever the environment says.
+    """
     try:
         value = (load_agent_config().get("storage") or {}).get(name)
-        if value:
+        if value is not None and value != "":
             return str(value).lower()
     except (OSError, yaml.YAMLError) as e:
         logger.warning(f"Failed to load {AGENT_CONFIG_FILE}: {e}")
@@ -74,6 +78,14 @@ if STORAGE_PROVIDER != "none" and not _configured_bucket(STORAGE_PROVIDER):
 BLOB_TRANSFER_MODE = _load_storage_setting("blob_transfer", "STORAGE_BLOB_TRANSFER", "auto")
 _BLOB_TRANSFER_MODES = ("auto", "direct", "relay")
 
+#: Whether a browser may send an upload's parts to the store itself. The
+#: bucket has to accept a PUT from the app's origins (CORS) for that, which
+#: nothing here can check, so it stays off until the operator says so; off,
+#: an upload takes the one request through the server, and its cap.
+BROWSER_UPLOADS = _load_storage_setting(
+    "browser_uploads", "STORAGE_BROWSER_UPLOADS", "false"
+) in ("true", "1", "yes", "on")
+
 
 def get_blob_transfer_mode(sandbox_provider: str | None) -> str:
     """Resolve ``auto`` against the provider pair; returns ``direct`` or ``relay``."""
@@ -97,6 +109,11 @@ def get_blob_transfer_mode(sandbox_provider: str | None) -> str:
 def is_storage_enabled() -> bool:
     """Check if cloud storage uploads are enabled."""
     return STORAGE_PROVIDER != "none"
+
+
+def browser_uploads_enabled() -> bool:
+    """Whether upload parts may go from a browser to the store; OSS signs none."""
+    return BROWSER_UPLOADS and STORAGE_PROVIDER not in ("none", "oss")
 
 
 def get_provider_name() -> str:
@@ -221,8 +238,12 @@ else:
         get_public_url,
         get_signed_url,
         has_multipart_cleanup_rule,
+        list_uploaded_parts,
+        object_size,
+        open_multipart_upload,
         sanitize_storage_key,
         sha256_object,
+        sign_upload_part,
         upload_base64,
         upload_bytes,
         upload_chart,
@@ -257,6 +278,26 @@ if STORAGE_PROVIDER in ("none", "oss"):
     def abort_multipart_upload(key: str, upload_id: str) -> bool:
         return False
 
+    def open_multipart_upload(key: str, *, content_type: str) -> str | None:
+        return None
+
+    def sign_upload_part(
+        key: str,
+        upload_id: str,
+        *,
+        part_number: int,
+        size: int,
+        expires_in: int = 900,
+        for_browser: bool = False,
+    ) -> str | None:
+        return None
+
+    def list_uploaded_parts(key: str, upload_id: str) -> list[dict[str, Any]] | None:
+        return None
+
+    def object_size(key: str) -> int | None:
+        return None
+
     def has_multipart_cleanup_rule() -> bool | None:
         return None
 
@@ -268,6 +309,7 @@ if STORAGE_PROVIDER in ("none", "oss"):
 
 __all__ = [
     "abort_multipart_upload",
+    "browser_uploads_enabled",
     "complete_multipart_upload",
     "create_signed_multipart_upload",
     "delete_object",
@@ -282,8 +324,12 @@ __all__ = [
     "get_signed_url",
     "has_multipart_cleanup_rule",
     "is_storage_enabled",
+    "list_uploaded_parts",
+    "object_size",
+    "open_multipart_upload",
     "sanitize_storage_key",
     "sha256_object",
+    "sign_upload_part",
     "upload_base64",
     "upload_bytes",
     "upload_chart",

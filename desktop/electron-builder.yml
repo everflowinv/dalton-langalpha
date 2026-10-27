@@ -79,8 +79,8 @@ protocols:
 # remote-control helper: `extraFiles`, the binary into Contents/MacOS and its
 # generated launchd plist into Contents/Library/LaunchAgents, both build outputs
 # rather than source; and `sign`, scripts/sign-mac.mjs, which signs the helper
-# without the JIT entitlements below. A build without the helper keeps
-# electron-builder's own signer.
+# first, without the JIT entitlements below, then the rest with electron-builder's
+# own signer. A build without the helper keeps that signer alone.
 mac:
   category: public.app-category.finance
   target:

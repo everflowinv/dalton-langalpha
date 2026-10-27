@@ -4,6 +4,7 @@ Its counterpart, the strip that decides what the model about to be called can
 still read, is covered in ``test_multimodal_strip``.
 """
 
+import asyncio
 import io
 import types
 
@@ -14,6 +15,7 @@ from langchain_core.messages import ToolMessage
 from PIL import Image
 
 from ptc_agent.agent.middleware.file_operations import multimodal
+from ptc_agent.core.sandbox import files as sandbox_files
 from ptc_agent.agent.middleware.file_operations.multimodal import (
     MultimodalMiddleware,
     _is_visual_request,
@@ -48,21 +50,37 @@ def _png_bytes() -> bytes:
 
 
 class _Sandbox:
-    """Stands in for PTCSandbox — which normalizes on its own, not on download."""
+    """Stands in for PTCSandbox — which normalizes on its own, not on download.
+
+    The capped download is the real one, over a runtime that streams
+    ``content``; ``stream`` is what a test overrides.
+    """
 
     def __init__(self, content: bytes = b"", *, work_dir: str = "/home/workspace"):
         self._content = content
         self._work_dir = work_dir
         self.downloaded: str | None = None
+        self.runtime = types.SimpleNamespace(download_file_stream=self.stream)
+        self._download_semaphore = asyncio.Semaphore(4)
 
     def normalize_path(self, path: str) -> str:
         if path.startswith((self._work_dir, "/tmp")):
             return path
         return f"{self._work_dir}/{path.lstrip('/')}"
 
-    async def adownload_file_bytes(self, path: str) -> bytes:
+    async def stream(self, path: str):
         self.downloaded = path
-        return self._content
+        for start in range(0, len(self._content), 1024):
+            yield self._content[start : start + 1024]
+
+    async def _wait_ready(self) -> None:
+        pass
+
+    async def _runtime_call(self, func, *args, retry_policy, **kwargs):
+        return await func(*args)
+
+    async def adownload_file_bytes_capped(self, path: str, cap):
+        return await sandbox_files.adownload_file_bytes_capped(self, path, cap)
 
 
 class TestVisualRequestRouting:
@@ -363,49 +381,6 @@ class TestPDFsAreVerifiedNotSniffed:
         assert "not a readable PDF" in result.content
 
     @pytest.mark.asyncio
-    async def test_a_pdf_over_the_page_ceiling_is_refused_with_its_count(
-        self, monkeypatch
-    ):
-        """Page count is the ceiling that binds: this fixture is a few KB, so no
-        byte cap would catch it. The message names the count so the agent can
-        split the document rather than retry the same read. The cap is patched
-        down because what is under test is that it is enforced, not its value."""
-        monkeypatch.setattr(multimodal, "MAX_PDF_PAGES", 3)
-        mw = MultimodalMiddleware(sandbox=_Sandbox(_pdf_bytes(4)))
-
-        result = await mw._handle_sandbox_content(
-            "long.pdf", _ack(), "call-1"
-        )
-        assert isinstance(result, ToolMessage)
-        assert isinstance(result.content, str)
-        assert "4-page" in result.content
-
-    @pytest.mark.asyncio
-    async def test_a_pdf_at_the_page_ceiling_is_accepted(self, monkeypatch):
-        """The limit is inclusive — off-by-one here silently rejects a legal doc."""
-        monkeypatch.setattr(multimodal, "MAX_PDF_PAGES", 3)
-        mw = MultimodalMiddleware(sandbox=_Sandbox(_pdf_bytes(3)))
-
-        result = await mw._handle_sandbox_content(
-            "long.pdf", _ack(), "call-1"
-        )
-        assert isinstance(result, ToolMessage)
-        assert result.content[-1]["mime_type"] == "application/pdf"
-
-    @pytest.mark.asyncio
-    async def test_the_injection_cap_is_the_widest_ceiling_not_the_tightest(self):
-        """The case that motivated splitting the cap in two: a 150-page filing is
-        legal on a 1M-context route, and injection cannot know it isn't headed
-        there, so refusing it at tool time would be a guess against the user."""
-        mw = MultimodalMiddleware(sandbox=_Sandbox(_pdf_bytes(150)))
-
-        result = await mw._handle_sandbox_content(
-            "filing.pdf", _ack(), "call-1"
-        )
-        assert isinstance(result, ToolMessage)
-        assert result.content[-1]["pages"] == 150
-
-    @pytest.mark.asyncio
     async def test_trailing_bytes_do_not_condemn_an_otherwise_readable_pdf(self):
         """Verification has to reject damage, not tidiness. Real PDFs routinely
         carry junk after the final %%EOF, and providers accept them."""
@@ -470,3 +445,250 @@ class TestTheAttachmentRidesOnTheToolResult:
             ToolMessage(content="ok", tool_call_id="call-1"), blocks
         )
         assert blocks == before
+
+
+def _numbered_pdf(pages: int, *, page_bytes: int = 0) -> bytes:
+    """A PDF whose page i is 100 + i points wide, so a window's pages can be
+    told apart from any others. ``page_bytes`` gives each page a content
+    stream of incompressible bytes, the weight of a scanned page."""
+    import os
+
+    from pypdf.generic import DecodedStreamObject, NameObject
+
+    writer = pypdf.PdfWriter()
+    for i in range(pages):
+        page = writer.add_blank_page(width=100 + i, height=72)
+        if page_bytes:
+            stream = DecodedStreamObject()
+            # A PDF comment line: valid content that draws nothing.
+            stream.set_data(b"%" + os.urandom(page_bytes // 2).hex().encode() + b"\n")
+            page[NameObject("/Contents")] = writer._add_object(stream)
+    buf = io.BytesIO()
+    writer.write(buf)
+    return buf.getvalue()
+
+
+class TestPdfPageWindows:
+    """A Read attaches a window of a PDF's pages, so no single Read can fill
+    the context window with one document."""
+
+    @staticmethod
+    async def _read(
+        pdf: bytes, path: str = "docs/r.pdf", *, caps: dict | None = None, **args
+    ) -> ToolMessage:
+        mw = MultimodalMiddleware(sandbox=_Sandbox(pdf))
+        for name, value in (caps or {}).items():
+            setattr(mw, name, value)
+        request = types.SimpleNamespace(
+            tool_call={"name": "Read", "args": {"file_path": path, **args}, "id": "call-1"}
+        )
+
+        async def handler(_request):
+            return ToolMessage(content=f"Loading document: {path}", tool_call_id="call-1")
+
+        return await mw.awrap_tool_call(request, handler)
+
+    @staticmethod
+    def _attached(result: ToolMessage) -> list[int]:
+        import base64
+
+        reader = pypdf.PdfReader(io.BytesIO(base64.b64decode(result.content[-1]["base64"])))
+        return [int(page.mediabox.width) - 100 for page in reader.pages]
+
+    @pytest.mark.asyncio
+    async def test_a_long_pdf_comes_back_as_its_first_pages_and_where_to_go_on(self):
+        result = await self._read(_numbered_pdf(45))
+
+        assert self._attached(result) == list(range(20))
+        assert result.content[-1]["pages"] == 20
+        assert result.content[0]["text"] == (
+            "Loading document: docs/r.pdf\n[Viewing PDF: r.pdf]\n"
+            "[Pages 1-20 of 45. Read(file_path='docs/r.pdf', offset=20) for the next pages.]"
+        )
+
+    @pytest.mark.asyncio
+    async def test_offset_skips_pages_and_limit_counts_them(self):
+        result = await self._read(_numbered_pdf(45), offset=10, limit=3)
+
+        assert self._attached(result) == [10, 11, 12]
+        assert result.content[0]["text"].endswith(
+            "[Pages 11-13 of 45. Read(file_path='docs/r.pdf', offset=13) for the next pages.]"
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_last_window_has_no_marker(self):
+        result = await self._read(_numbered_pdf(45), offset=40)
+
+        assert self._attached(result) == [40, 41, 42, 43, 44]
+        assert result.content[0]["text"] == "Loading document: docs/r.pdf\n[Viewing PDF: r.pdf]"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("limit", [2000, 0, -5, "many"])
+    async def test_a_limit_past_the_window_or_unusable_is_the_window(self, limit):
+        # The model sizes limit in lines unless it means pages.
+        result = await self._read(_numbered_pdf(45), limit=limit)
+
+        assert result.content[-1]["pages"] == 20
+
+    @pytest.mark.asyncio
+    async def test_a_pdf_whose_page_tree_reads_empty_goes_whole(self):
+        # pypdf counts no pages where a writer left the tree empty or broken;
+        # the provider may still read it, so it is not refused as past its end.
+        empty = _numbered_pdf(0)
+        result = await self._read(empty)
+
+        assert result.status != "error"
+        assert result.content[-1]["type"] == "file"
+        assert "pages" not in result.content[-1]
+
+        refused = await self._read(empty, caps={"MAX_CONTENT_BYTES": len(empty) - 1})
+        assert refused.status == "error"
+        assert "past the last page" not in refused.content
+
+    @pytest.mark.asyncio
+    async def test_an_offset_past_the_end_says_how_long_the_pdf_is(self):
+        result = await self._read(_numbered_pdf(45), offset=45)
+
+        assert result.status == "error"
+        assert result.content == (
+            "ERROR: offset=45 is past the last page of this 45-page PDF: docs/r.pdf"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_pdf_inside_one_window_is_sent_as_written(self):
+        import base64
+
+        pdf = _numbered_pdf(5)
+        result = await self._read(pdf)
+
+        assert base64.b64decode(result.content[-1]["base64"]) == pdf
+        assert result.content[-1]["pages"] == 5
+
+    @pytest.mark.asyncio
+    async def test_a_url_pdf_is_windowed_too(self, monkeypatch):
+        url = "https://files.example.com/report.pdf"
+        monkeypatch.setattr(
+            multimodal,
+            "GuardedAsyncTransport",
+            lambda: httpx.MockTransport(
+                lambda request: httpx.Response(200, content=_numbered_pdf(30))
+            ),
+        )
+
+        result = await self._read(b"", path=url, offset=20)
+
+        assert self._attached(result) == list(range(20, 30))
+        assert "Read(file_path=" not in result.content[0]["text"]
+
+    @pytest.mark.asyncio
+    async def test_a_one_page_window_names_its_page(self):
+        result = await self._read(_numbered_pdf(45), offset=7, limit=1)
+
+        assert result.content[0]["text"].endswith(
+            "[Page 8 of 45. Read(file_path='docs/r.pdf', offset=8) for the next pages.]"
+        )
+
+
+class TestPdfByteCaps:
+    """A PDF source is bounded apart from the window cut from it: only the
+    window reaches the checkpoint, which is what MAX_CONTENT_BYTES is for."""
+
+    _read = staticmethod(TestPdfPageWindows._read)
+    _attached = staticmethod(TestPdfPageWindows._attached)
+
+    @pytest.mark.asyncio
+    async def test_a_source_over_the_block_cap_loads_a_window_halved_to_fit(self):
+        # Pages of ~2 KB under a 9 KB cap: 20 pages, then 10, then 5, then 2.
+        pdf = _numbered_pdf(45, page_bytes=2048)
+        assert len(pdf) > 9_000
+
+        result = await self._read(pdf, offset=4, caps={"MAX_CONTENT_BYTES": 9_000})
+
+        assert self._attached(result) == [4, 5]
+        assert result.content[-1]["pages"] == 2
+        assert result.content[0]["text"].endswith(
+            "[Pages 5-6 of 45. Read(file_path='docs/r.pdf', offset=6) for the next pages.]"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_single_page_over_the_block_cap_is_refused(self):
+        result = await self._read(
+            _numbered_pdf(3, page_bytes=8192), caps={"MAX_CONTENT_BYTES": 4096}
+        )
+
+        assert result.status == "error"
+        assert result.content == (
+            "ERROR: Content is larger than the 0MB limit and was not loaded: docs/r.pdf"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_source_over_the_pdf_cap_is_refused_naming_it(self):
+        pdf = b"%PDF-1.7\n" + b"0" * (2 * 1024 * 1024)
+
+        result = await self._read(pdf, caps={"MAX_PDF_SOURCE_BYTES": 1024 * 1024})
+
+        assert result.content == (
+            "ERROR: Content is larger than the 1MB limit and was not loaded: docs/r.pdf"
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_sandbox_stream_is_closed_when_the_cap_stops_it(self):
+        closed = []
+
+        class _Closing(_Sandbox):
+            async def stream(self, path):
+                try:
+                    while True:
+                        yield b"x" * 1024
+                finally:
+                    closed.append(path)
+
+        mw = MultimodalMiddleware(sandbox=_Closing())
+        result = await mw._handle_sandbox_content("/home/workspace/big.png", _ack(), "call-1")
+
+        assert result.content.startswith("ERROR: Content is larger than the 5MB limit")
+        assert closed == ["/home/workspace/big.png"]
+
+    @pytest.mark.asyncio
+    async def test_parallel_reads_load_four_at_a_time(self):
+        # A 64 MiB source is held with its copies while its window is cut, so
+        # a parallel batch of Reads waits for a slot rather than all loading.
+        loading, most, release = 0, 0, asyncio.Event()
+
+        class _Slow(_Sandbox):
+            async def stream(self, path):
+                nonlocal loading, most
+                loading += 1
+                most = max(most, loading)
+                await release.wait()
+                loading -= 1
+                yield _png_bytes()
+
+        # Plenty of download slots: they are given back before the window is
+        # cut, and a URL takes none, so they are not what holds this to four.
+        sandbox = _Slow()
+        sandbox._download_semaphore = asyncio.Semaphore(100)
+        mw = MultimodalMiddleware(sandbox=sandbox)
+
+        def read(i):
+            request = types.SimpleNamespace(
+                tool_call={"name": "Read", "args": {"file_path": f"c{i}.png"}, "id": f"call-{i}"}
+            )
+
+            async def handler(_request):
+                return ToolMessage(content="ok", tool_call_id=f"call-{i}")
+
+            return mw.awrap_tool_call(request, handler)
+
+        reads = asyncio.gather(*(read(i) for i in range(7)))
+        for _ in range(20):
+            await asyncio.sleep(0)
+        assert most == 4
+        release.set()
+        results = await reads
+        assert most == 4
+        assert all(r.content[-1]["type"] == "image_url" for r in results)
+
+    def test_the_caps(self):
+        assert MultimodalMiddleware.MAX_CONTENT_BYTES == 5 * 1024 * 1024
+        assert MultimodalMiddleware.MAX_PDF_SOURCE_BYTES == 64 * 1024 * 1024

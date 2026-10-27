@@ -16,11 +16,12 @@ from typing import Annotated, Any
 
 from pydantic import BaseModel, Field, StringConstraints
 
+from src.server.services.workspace_file_containment import workspace_relative_path
+
 from ._shared import (
     _is_always_hidden_path,
     _is_hidden_path,
     _is_system_path,
-    workspace_relative_path,
 )
 
 _GLOB_SPECIAL_RE = re.compile(r"([*?\[{\\])")

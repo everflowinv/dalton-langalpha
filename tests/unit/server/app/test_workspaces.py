@@ -1128,7 +1128,8 @@ async def test_drain_start_tasks_cancels_in_flight_warms():
     """A warm scheduled through the workspace route is cancelled and awaited by
     the shared drain, so a task cancelled mid-Phase-2 can revert its row
     instead of being torn down with the loop."""
-    from src.server.app import background_starts, workspaces as ws_mod
+    from src.server.app import workspaces as ws_mod
+    from src.server.services import background_starts
 
     started = asyncio.Event()
 

@@ -118,6 +118,8 @@ _SANDBOX_TAIL = " For fine detail, crop the original in the sandbox."
 # The label an upload saved to the sandbox carries (``inject_multimodal_context``
 # writes it just before the image), the one place its sandbox copy is stated.
 _SAVED_UPLOAD_LABEL = re.compile(r"\[Attached image: .* \(saved to [^()]+\)\]", re.DOTALL)
+# The same label with no path: the image block is the upload's only copy.
+_UPLOAD_LABEL = re.compile(r"\[Attached image: (.*)\]", re.DOTALL)
 
 
 @dataclass(frozen=True)
@@ -544,6 +546,16 @@ def _note(fitted: _Fitted, in_sandbox: bool) -> dict[str, str]:
 def _saved_upload(label: Any) -> bool:
     text = label.get("text") if block_type(label) == "text" else None
     return isinstance(text, str) and _SAVED_UPLOAD_LABEL.fullmatch(text) is not None
+
+
+def unsaved_upload_name(label: Any) -> str | None:
+    """The name an upload's label gives when no copy of it was saved, or None
+    when ``label`` is no such label."""
+    text = label.get("text") if block_type(label) == "text" else None
+    if not isinstance(text, str) or _saved_upload(label):
+        return None
+    match = _UPLOAD_LABEL.fullmatch(text)
+    return match.group(1) if match else None
 
 
 def _path_read_calls(messages: list) -> set[str]:

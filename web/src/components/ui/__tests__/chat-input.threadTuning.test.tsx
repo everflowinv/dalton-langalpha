@@ -43,6 +43,7 @@ vi.mock('@/hooks/useAllModels', () => ({
     },
     isLoading: false,
     systemDefaults: { default_model: 'model-default' },
+    offPlanModels: new Set(),
   }),
 }));
 

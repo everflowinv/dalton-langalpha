@@ -40,6 +40,8 @@ class _Bucket(ThreadingHTTPServer):
         self.objects: dict[str, bytes] = {}
         self.fail_500: set[str] = set()
         self.redirects: set[str] = set()
+        # Path -> how many more GETs end halfway, the length still declared whole.
+        self.cut: dict[str, int] = {}
         self.hits: dict[str, int] = {}
 
 
@@ -98,6 +100,11 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
+        if self.server.cut.get(self.path, 0) > 0:
+            self.server.cut[self.path] -= 1
+            self.wfile.write(body[: len(body) // 2])
+            self.close_connection = True
+            return
         self.wfile.write(body)
 
 
@@ -674,6 +681,26 @@ def test_pull_mismatch_leaves_no_file(tmp_path, bucket):
     out = rt.pull({"root": str(tmp_path), "items": [item]})
     assert out["results"]["a.bin"]["status"] == "mismatch"
     assert not (tmp_path / "a.bin").exists()
+    assert not [p for p in os.listdir(tmp_path) if p.startswith(".wsfiles-")]
+
+
+@pytest.mark.enable_socket
+@pytest.mark.parametrize(
+    "cuts, status, hits", [(1, "ok", 2), (3, "unreachable", 3)], ids=["once", "every-time"]
+)
+def test_pull_retries_a_body_the_store_cut_short(tmp_path, bucket, cuts, status, hits):
+    """A body that ends before its Content-Length is a transfer that broke,
+    not other bytes: it is fetched again, and never reported a mismatch."""
+    data = os.urandom(1000)
+    item = _file_item(bucket, "a.bin", data, sha256=None)
+    bucket.cut[f"/{_sha(data)}"] = cuts
+    out = rt.pull({"root": str(tmp_path), "items": [item]})
+    assert out["results"]["a.bin"]["status"] == status
+    assert bucket.hits[f"/{_sha(data)}"] == hits
+    if status == "ok":
+        assert (tmp_path / "a.bin").read_bytes() == data
+    else:
+        assert not (tmp_path / "a.bin").exists()
     assert not [p for p in os.listdir(tmp_path) if p.startswith(".wsfiles-")]
 
 

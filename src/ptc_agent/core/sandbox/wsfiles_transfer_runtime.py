@@ -1040,6 +1040,12 @@ def _download_to_temp(url: str, parent: str, timeout_s: float) -> tuple[str, str
                 h.update(chunk)
                 n += len(chunk)
                 tmp.write(chunk)
+            # http.client ends a body the store closed early as though it
+            # were whole, so a cut transfer would reach ``_verify`` as other
+            # bytes, which nothing retries.
+            declared = resp.getheader("Content-Length")
+            if declared is not None and declared.isdigit() and n < int(declared):
+                raise http.client.IncompleteRead(b"", int(declared) - n)
         except BaseException:
             _drop_response_connection(resp)
             raise

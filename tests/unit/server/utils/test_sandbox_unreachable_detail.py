@@ -78,7 +78,7 @@ def test_refresh_does_not_answer_with_the_provider_text(raised, expect_reraise):
     """The one route the sanitization sweep missed.
 
     ``refresh_workspace`` makes the same ``get_session_for_workspace`` call
-    ``_acquire_sandbox`` does, but kept a bare ``except Exception`` that
+    ``acquire_sandbox`` does, but kept a bare ``except Exception`` that
     interpolated the exception into the 503 body. Typed errors now re-raise for
     the app-level handler; anything else still answers 503, but sanitized.
     """

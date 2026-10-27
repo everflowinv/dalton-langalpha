@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import itertools
 
+import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from ptc_agent.agent.middleware.compaction import utils
@@ -704,3 +705,210 @@ def test_stale_reads_match_history_dirs_in_absolute_paths():
         ]
 
     assert utils.stale_read_ids(messages, len(messages)) == {"r1", "r2"}
+
+
+class TestAttachmentEstimates:
+    """What the summary trigger counts an attachment at. A provider is sent
+    the bytes, which the text counter sees only as a short label."""
+
+    @staticmethod
+    def _pdf(pages: int) -> str:
+        import base64
+        import io
+
+        import pypdf
+
+        writer = pypdf.PdfWriter()
+        for _ in range(pages):
+            writer.add_blank_page(width=612, height=792)
+        out = io.BytesIO()
+        writer.write(out)
+        return base64.b64encode(out.getvalue()).decode()
+
+    @staticmethod
+    def _png(width: int, height: int) -> dict:
+        import base64
+        import io
+
+        from PIL import Image
+
+        out = io.BytesIO()
+        Image.new("RGB", (width, height)).save(out, format="PNG")
+        data = base64.b64encode(out.getvalue()).decode()
+        return {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{data}"}}
+
+    def test_a_pdf_counts_its_stamped_pages(self):
+        block = {"type": "file", "base64": "JVBERi0=", "mime_type": "application/pdf", "pages": 7}
+        assert utils.block_tokens(block) == 7 * utils.PDF_PAGE_TOKENS
+
+    def test_an_unstamped_pdf_is_counted_from_its_pages(self):
+        # The composer's, and any checkpointed before the stamp.
+        block = {"type": "file", "base64": self._pdf(3), "mime_type": "application/pdf"}
+        assert utils.pdf_pages(block) == 3
+        assert utils.block_tokens(block) == 3 * utils.PDF_PAGE_TOKENS
+
+    def test_an_unreadable_pdf_counts_as_a_page(self):
+        block = {"type": "file", "base64": "bm90IGEgcGRm", "mime_type": "application/pdf"}
+        assert utils.pdf_pages(block) is None
+        assert utils.block_tokens(block) == utils.PDF_PAGE_TOKENS
+
+    def test_an_unstamped_pdf_is_parsed_once_however_often_it_is_counted(self, monkeypatch):
+        # Counted on every model call, on the event loop; each checkpoint load
+        # brings an equal string, not the same one.
+        import pypdf
+
+        parsed = []
+        real = pypdf.PdfReader
+
+        def reader(stream, *args, **kwargs):
+            parsed.append(1)
+            return real(stream, *args, **kwargs)
+
+        monkeypatch.setattr(pypdf, "PdfReader", reader)
+        monkeypatch.setattr(utils, "_PARSED", type(utils._PARSED)())
+        data = self._pdf(4)
+        for copy in (data, data, "".join(list(data))):
+            block = {"type": "file", "base64": copy, "mime_type": "application/pdf"}
+            assert utils.pdf_pages(block) == 4
+        assert len(parsed) == 1
+
+    @pytest.mark.asyncio
+    async def test_an_unstamped_pdf_is_read_ahead_off_the_event_loop(self, monkeypatch):
+        # Counting is synchronous on every model call; a PDF an older build
+        # checkpointed without its pages is parsed in a thread before it.
+        import threading
+
+        import pypdf
+
+        threads = []
+        real = pypdf.PdfReader
+
+        def reader(stream, *args, **kwargs):
+            threads.append(threading.current_thread())
+            return real(stream, *args, **kwargs)
+
+        monkeypatch.setattr(pypdf, "PdfReader", reader)
+        monkeypatch.setattr(utils, "_PARSED", type(utils._PARSED)())
+        block = {"type": "file", "base64": self._pdf(3), "mime_type": "application/pdf"}
+        view = [ToolMessage(content=[{"type": "text", "text": "pdf"}, block], tool_call_id="c1")]
+
+        await utils.read_ahead(view)
+        assert utils.pdf_pages(block) == 3
+        assert threads and threads[0] is not threading.main_thread()
+        assert len(threads) == 1
+
+    def test_an_image_read_past_its_header_is_decoded_once(self, monkeypatch):
+        # EXIF ahead of the frame pushes the size past the header's 64K
+        # characters, so each count would decode the whole image again.
+        import base64
+        import io
+
+        from PIL import Image
+
+        buf = io.BytesIO()
+        Image.new("RGB", (40, 30), "red").save(buf, format="JPEG", exif=b"Exif\x00\x00" + b"\x00" * 60_000)
+        data = base64.b64encode(buf.getvalue()).decode()
+        assert len(data) > utils._IMAGE_HEADER_CHARS
+        opened = []
+        real = Image.open
+
+        def open_(fp, *args, **kwargs):
+            opened.append(1)
+            return real(fp, *args, **kwargs)
+
+        monkeypatch.setattr(Image, "open", open_)
+        monkeypatch.setattr(utils, "_PARSED", type(utils._PARSED)())
+        for copy in (data, data, "".join(list(data))):
+            block = {"type": "image", "base64": copy, "mime_type": "image/jpeg"}
+            assert utils._image_size(block) == (40, 30)
+        assert len(opened) == 2
+
+    def test_an_image_counts_its_scaled_pixels(self):
+        # 1000x1000 is under both bounds: a token per 750 pixels.
+        assert utils.block_tokens(self._png(1000, 1000)) == 1334
+        # 4000x3000 is scaled to 1.15 megapixels first.
+        assert utils.block_tokens(self._png(4000, 3000)) == 1534
+        assert utils.block_tokens(self._png(10, 10)) == 85
+
+    def test_text_costs_nothing_here(self):
+        assert utils.block_tokens({"type": "text", "text": "x" * 10_000}) == 0
+
+    def test_what_came_after_the_measurement_is_added_to_it(self):
+        pdf = {"type": "file", "base64": "JVBERi0=", "mime_type": "application/pdf", "pages": 4}
+        view = [
+            HumanMessage("go"),
+            AIMessage("", tool_calls=[{"name": "Read", "args": {}, "id": "c1"}]),
+            ToolMessage(content=[{"type": "text", "text": "pdf"}, pdf], tool_call_id="c1"),
+        ]
+        state = {"_cached_input_tokens": 1_000, "_cached_output_tokens": 50}
+        counter = lambda msgs: 10 * len(list(msgs))  # noqa: E731
+
+        assert utils.context_tokens(state, view, counter) == 1_050 + 10 + 4 * utils.PDF_PAGE_TOKENS
+        # Unmeasured, the whole view is estimated, attachments included.
+        assert utils.context_tokens({}, view, counter) == 30 + 4 * utils.PDF_PAGE_TOKENS
+
+
+class TestWithSummaryText:
+    """A summary only its provider can read, written out as text by its model
+    for a model of another provider (the hand-off at a model switch)."""
+
+    NOTES = "\n\nYour notes are in .agents/scratchpad/abc/note/."
+
+    def _opaque(self) -> HumanMessage:
+        from ptc_agent.agent.middleware.compaction.utils import build_summary_message
+
+        return build_summary_message(
+            "a digest",
+            None,
+            original_message_count=12,
+            source="provider",
+            skills=["dcf-model"],
+            notes=self.NOTES,
+            native={"items": [{"type": "compaction", "encrypted_content": "opaque"}]},
+            origin="openai",
+        )
+
+    def test_the_text_replaces_the_summary_and_the_note_stays_after_it(self):
+        from ptc_agent.agent.middleware.compaction.types import CONTEXT_SUMMARY_PREFIX
+        from ptc_agent.agent.middleware.compaction.utils import (
+            parse_summary_message,
+            with_summary_text,
+        )
+
+        opaque = self._opaque()
+        after = opaque.content[len(CONTEXT_SUMMARY_PREFIX) + len("a digest") :]
+
+        written = with_summary_text(opaque, "Goal: chart AAPL.")
+
+        assert written.content == f"{CONTEXT_SUMMARY_PREFIX}Goal: chart AAPL.{after}"
+        assert "dcf-model" in after and after.endswith(self.NOTES)
+        assert parse_summary_message(written) == "Goal: chart AAPL."
+
+    def test_it_is_the_same_summary_handed_off(self):
+        """The id is kept, so the marker that names the summary still finds
+        it; the provider is sent its sidecar, which stays as it was."""
+        from ptc_agent.agent.middleware.compaction.utils import handed_off, with_summary_text
+        from src.llms.provider_compaction import SIDECAR_KEY
+
+        opaque = self._opaque()
+
+        written = with_summary_text(opaque, "Goal: chart AAPL.")
+
+        assert written.id == opaque.id
+        assert written.additional_kwargs[SIDECAR_KEY] == opaque.additional_kwargs[SIDECAR_KEY]
+        assert written.additional_kwargs["lc_source"] == "summarization"
+        assert written.additional_kwargs["summarize_complete"] == {
+            "summary_length": len("Goal: chart AAPL."),
+            "original_message_count": 12,
+            "source": "provider",
+            "handed_off": True,
+        }
+        assert handed_off(written)
+        assert not handed_off(opaque)
+        assert opaque.content.startswith("[Context Summary]")
+        assert "Goal" not in opaque.content
+
+    def test_a_message_not_built_as_a_summary_is_none(self):
+        from ptc_agent.agent.middleware.compaction.utils import with_summary_text
+
+        assert with_summary_text(HumanMessage("plain"), "text") is None

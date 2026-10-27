@@ -350,7 +350,7 @@ describe('augmentPlatformWithLocal', () => {
       { provider: 'anthropic', display_name: 'Anthropic', access_type: 'api_key' },
     ];
 
-    const result = augmentPlatformWithLocal(platform, providers);
+    const result = augmentPlatformWithLocal(platform, providers, true);
 
     expect(result.byok_providers).toEqual(['openai', 'anthropic']);
     expect(result.oauth_providers).toEqual([]);
@@ -363,15 +363,28 @@ describe('augmentPlatformWithLocal', () => {
       { provider: 'claude-oauth', display_name: 'Claude', access_type: 'oauth' },
     ];
 
-    const result = augmentPlatformWithLocal(platform, providers);
+    const result = augmentPlatformWithLocal(platform, providers, true);
 
     expect(result.oauth_providers).toEqual(['codex-oauth', 'claude-oauth']);
+  });
+
+  it('adds no stored key while the BYOK switch is off, and OAuth connections still', () => {
+    const platform = makePlatform();
+    const providers: ConfiguredProvider[] = [
+      { provider: 'anthropic', display_name: 'Anthropic', access_type: 'api_key' },
+      { provider: 'codex-oauth', display_name: 'Codex', access_type: 'oauth' },
+    ];
+
+    const result = augmentPlatformWithLocal(platform, providers, false);
+
+    expect(result.byok_providers).toEqual([]);
+    expect(result.oauth_providers).toEqual(['codex-oauth']);
   });
 
   it('returns unchanged platform when no local providers', () => {
     const platform = makePlatform({ byok_providers: ['openai'], oauth_providers: ['codex-oauth'] });
 
-    const result = augmentPlatformWithLocal(platform, []);
+    const result = augmentPlatformWithLocal(platform, [], true);
 
     expect(result.byok_providers).toEqual(['openai']);
     expect(result.oauth_providers).toEqual(['codex-oauth']);
@@ -641,7 +654,7 @@ describe('variant isolation (no brand_key promotion)', () => {
         access_type: 'coding_plan',
         brand_key: 'z-ai',
       },
-    ]);
+    ], true);
     expect(augmented.byok_providers).toContain('z-ai-coding');
     expect(augmented.byok_providers).not.toContain('z-ai');
   });

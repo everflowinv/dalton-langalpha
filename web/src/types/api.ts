@@ -599,6 +599,9 @@ export interface Thread {
   reasoning_effort?: string | null;
   /** The thread's own fast mode; null (or absent) follows Settings. */
   fast_mode?: boolean | null;
+  /** Only on a model change's response: the model the thread was on is
+   *  writing out, for the new one, a summary only its provider can read. */
+  summary_handoff?: boolean | null;
   /** Turn count (list responses only). */
   turn_count?: number;
   created_at?: string;

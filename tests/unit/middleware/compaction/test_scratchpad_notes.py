@@ -657,6 +657,27 @@ async def test_the_fill_counts_the_last_calls_output_too():
     assert "80%" in row.text
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("removed", "asked"), [(set(), True), ({"t1"}, False)])
+async def test_the_fill_leaves_out_attachments_compaction_removed(removed, asked):
+    # Nothing measured, as on the first call after an idle cut: the view is
+    # counted whole, and a removed 20-page PDF is not in what is sent.
+    pdf = {"type": "file", "base64": "JVBERi0=", "mime_type": "application/pdf", "pages": 20}
+    state = {
+        "messages": [
+            HumanMessage("go", id="h0"),
+            AIMessage("", id="a0", tool_calls=[{"name": "Read", "args": {"file_path": "a.pdf"}, "id": "c1"}]),
+            ToolMessage(content=[{"type": "text", "text": "a.pdf"}, pdf], tool_call_id="c1", id="t1"),
+        ],
+        "_removed_attachment_ids": removed,
+        "_notes_below_mark": None,
+    }
+
+    written = await _middleware(100_000).abefore_model(state)
+
+    assert (written is not None) is asked
+
+
 def test_the_reminder_measures_as_the_main_compaction_does():
     """Read off the compaction it comes before, so a threshold that compaction
     derives cannot leave the reminder on another."""

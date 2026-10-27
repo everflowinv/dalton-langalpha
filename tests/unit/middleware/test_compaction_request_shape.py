@@ -836,6 +836,37 @@ class TestServerSummaryLead:
 
         assert "## Earlier summary\nGoal: chart AAPL.\n\nProgress: data pulled." in text
 
+    def test_an_opaque_summary_its_model_wrote_out_keeps_its_opening(self):
+        """Handed off at a model switch, its text is the model's summary, no
+        longer a digest with a lead to drop."""
+        from ptc_agent.agent.middleware.compaction.summarize import PROVIDER_LEAD, server_summary
+        from ptc_agent.agent.middleware.compaction.utils import (
+            build_summary_message,
+            with_summary_text,
+        )
+        from ptc_agent.agent.transcript import Window
+
+        raw = self._raw()
+        opaque = build_summary_message(
+            f"{PROVIDER_LEAD}\n\n## Turn 1\nRequest: first request",
+            None,
+            source="provider",
+            native={"items": [{"type": "compaction", "encrypted_content": "opaque"}]},
+            origin="openai",
+        )
+        earlier = with_summary_text(opaque, "Goal: chart AAPL.\n\nProgress: data pulled.")
+
+        text = server_summary(
+            [earlier, raw[2], raw[3]],
+            [],
+            raw_messages=raw,
+            turns=None,
+            window=Window(),
+            lead=PROVIDER_LEAD,
+        ).text
+
+        assert "## Earlier summary\nGoal: chart AAPL.\n\nProgress: data pulled." in text
+
 
 class TestTrimForSummary:
     """The summarizer gets the newest messages that fit, and never loses the

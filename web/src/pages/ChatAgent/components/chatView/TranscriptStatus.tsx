@@ -21,6 +21,8 @@ interface TranscriptStatusProps {
   isLoading: boolean;
   retired: RetiredModel | null;
   workspaceStarting: WarmingDisplay;
+  /** Why this send waits on a thread mutation, null when it is not held. */
+  turnHeld: string | null;
   isCompacting: string | false;
   /** About how many tokens the summary being written has written. */
   compactionTokens: number | null;
@@ -43,6 +45,7 @@ export function TranscriptStatus({
   isLoading,
   retired,
   workspaceStarting,
+  turnHeld,
   isCompacting,
   compactionTokens,
   queuedSend,
@@ -56,6 +59,7 @@ export function TranscriptStatus({
       <ModelStatusPill modelStatus={modelStatus} isLoading={isLoading} />
       {retired && <RetiredModelNotice {...retired} />}
       {workspaceStarting && <WorkspaceStartingLine archived={workspaceStarting === 'archived'} />}
+      {turnHeld !== null && <TurnHeldLine reason={turnHeld} />}
       {isCompacting && (
         <div className="flex items-center gap-2">
           <StatusLine glyph={<Loader size={14} className="text-(--color-accent-primary)" />}>
@@ -80,6 +84,21 @@ export function TranscriptStatus({
       )}
       <QueuedAutomationNotice threadId={threadId} active={active} />
     </div>
+  );
+}
+
+function turnHeldKey(reason: string): string {
+  if (reason === 'compact') return 'chat.compacting';
+  if (reason === 'handoff') return 'chat.turnHeld.handoff';
+  return 'chat.turnHeld.other';
+}
+
+function TurnHeldLine({ reason }: { reason: string }): React.ReactElement {
+  const { t } = useTranslation();
+  return (
+    <StatusLine glyph={<Loader size={12} className="text-(--color-accent-primary)" />}>
+      {t(turnHeldKey(reason))}
+    </StatusLine>
   );
 }
 

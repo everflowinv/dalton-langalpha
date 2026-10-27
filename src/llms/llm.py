@@ -1389,6 +1389,21 @@ def get_max_pdf_pages(model_name: str) -> int | None:
     return _ANTHROPIC_MAX_PDF_PAGES
 
 
+# What a request is charged for one PDF page, per vendor, where that was
+# measured to sit far from the 3,000 the context estimate uses otherwise
+# (``PDF_PAGE_TOKENS`` in the compaction utils). Measured on a 10-page window
+# of arXiv 2112.10752, an image-heavy paper: Gemini 520 a page, which reads a
+# page as its image, 560 being the most its default resolution charges; OpenAI
+# 3,230, close enough to the default that it keeps it.
+_PDF_PAGE_TOKENS = {"gemini": 560}
+
+
+def get_pdf_page_tokens(route: str) -> int | None:
+    """What ``route`` (from :func:`image_route`) charges for a PDF page, or
+    None where no measurement sets it apart from the default estimate."""
+    return _PDF_PAGE_TOKENS.get(route)
+
+
 # Published per-side pixel ceilings for an image in a request, per vendor: the
 # largest side, then (image count, tighter side) steps that apply from that
 # count on. Two tighten with the number of images in the request, which is why

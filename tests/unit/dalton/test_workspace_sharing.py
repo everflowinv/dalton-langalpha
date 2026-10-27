@@ -27,6 +27,9 @@ from src.server.app import workspaces as workspaces_app
 from src.server.app.threads import crud as threads_crud
 from src.server.app.workspace_files import _shared as ws_files_shared
 from src.server.app.workspace_files import crud as ws_files_crud
+from src.server.app.workspace_files import uploads as ws_files_uploads
+from src.server.services import workspace_files as ws_files_service
+from src.server.services import workspace_upload_pull as ws_upload_pull
 from src.server.database import computer as computer_db
 from src.server.database import conversation as conv_db
 from src.server.database import home_workspace as home_ws_db
@@ -693,6 +696,11 @@ class TestWebChannelEndpoints:
             "db_get_workspace",
             create_autospec(ws_files_crud.db_get_workspace, return_value=ws),
         )
+        monkeypatch.setattr(
+            ws_files_service,
+            "db_get_workspace",
+            create_autospec(ws_files_service.db_get_workspace, return_value=ws),
+        )
 
         with pytest.raises(HTTPException) as exc_ws:
             await workspaces_app.get_workspace(ws["workspace_id"], x_user_id="u-chao")
@@ -726,10 +734,10 @@ class TestWebChannelEndpoints:
         _enable_dalton_auth(monkeypatch)
         ws = _sample_workspace(user_id="u-richard", status="running")
         shared_get_ws_mock = create_autospec(
-            ws_files_shared.db_get_workspace, return_value=ws
+            ws_files_service.db_get_workspace, return_value=ws
         )
         monkeypatch.setattr(
-            ws_files_shared,
+            ws_files_service,
             "db_get_workspace",
             shared_get_ws_mock,
         )
@@ -795,9 +803,17 @@ class TestWebChannelEndpoints:
 
         monkeypatch.setattr(
             ws_files_crud,
-            "_acquire_sandbox_to_change",
+            "acquire_sandbox_to_change",
             create_autospec(
-                ws_files_crud._acquire_sandbox_to_change,
+                ws_files_crud.acquire_sandbox_to_change,
+                side_effect=_fake_acquire,
+            ),
+        )
+        monkeypatch.setattr(
+            ws_files_service,
+            "acquire_sandbox_to_change",
+            create_autospec(
+                ws_files_service.acquire_sandbox_to_change,
                 side_effect=_fake_acquire,
             ),
         )
@@ -824,6 +840,14 @@ class TestWebChannelEndpoints:
             "contained_sandbox_path",
             create_autospec(
                 ws_files_crud.contained_sandbox_path,
+                side_effect=_resolve_sandbox_path,
+            ),
+        )
+        monkeypatch.setattr(
+            ws_files_service,
+            "contained_sandbox_path",
+            create_autospec(
+                ws_files_service.contained_sandbox_path,
                 side_effect=_resolve_sandbox_path,
             ),
         )
@@ -1014,6 +1038,256 @@ class TestWebChannelEndpoints:
         assert exc_home_w.value.status_code == 403
 
     @pytest.mark.asyncio
+    async def test_multipart_object_store_uploads_permission_matrix(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """#606 multipart object-store upload routes enforce the same sharing & path matrix."""
+        _enable_dalton_auth(monkeypatch)
+        ws = _sample_workspace(user_id="u-richard", status="running")
+        shared_get_ws_mock = create_autospec(
+            ws_files_service.db_get_workspace, return_value=ws
+        )
+        monkeypatch.setattr(
+            ws_files_service,
+            "db_get_workspace",
+            shared_get_ws_mock,
+        )
+
+        # No S3 configured -> begin_workspace_upload falls back to relay mode
+        monkeypatch.setattr(
+            ws_files_uploads,
+            "browser_uploads_enabled",
+            create_autospec(ws_files_uploads.browser_uploads_enabled, return_value=False),
+        )
+        monkeypatch.setattr(
+            ws_files_uploads,
+            "owner_work_dir",
+            create_autospec(
+                ws_files_uploads.owner_work_dir,
+                return_value="/home/workspace/NVDA_Deep_Dive",
+            ),
+        )
+
+        # 1. Owner and rw colleague allowed on normal path (falls back to relay when store disabled)
+        _set_sharing(monkeypatch, cos_access="ro", web_access="rw")
+        owner_begin = await ws_files_uploads.begin_workspace_upload(
+            ws["workspace_id"],
+            x_user_id="u-richard",
+            body=ws_files_uploads.BeginUploadRequest(path="data/big.bin", size=1024),
+        )
+        assert owner_begin["mode"] == "relay"
+
+        rw_begin = await ws_files_uploads.begin_workspace_upload(
+            ws["workspace_id"],
+            x_user_id="u-chao",
+            body=ws_files_uploads.BeginUploadRequest(path="data/big.bin", size=1024),
+        )
+        assert rw_begin["mode"] == "relay"
+
+        # rw colleague blocked on hidden/system path (.agents/..., .file_sync_marker, _internal/...)
+        for blocked in (".agents/memory/secret.md", ".file_sync_marker", "_internal/key.txt"):
+            with pytest.raises(HTTPException) as exc_blk:
+                await ws_files_uploads.begin_workspace_upload(
+                    ws["workspace_id"],
+                    x_user_id="u-chao",
+                    body=ws_files_uploads.BeginUploadRequest(path=blocked, size=1024),
+                )
+            assert exc_blk.value.status_code == 403
+
+        # 2. Follow-up multipart endpoints (sign_parts, complete, get, cancel) via _owned_upload
+        upload_row = {
+            "upload_id": "00000000-0000-0000-0000-000000000999",
+            "workspace_id": ws["workspace_id"],
+            "user_id": "u-chao",
+            "sandbox_id": None,
+            "path": "data/big.bin",
+            "size": 10 * 1024 * 1024,
+            "part_size": 10 * 1024 * 1024,
+            "part_count": 1,
+            "object_key": "uploads/ws/u/big.bin",
+            "store_upload_id": "store-1",
+            "state": "uploading",
+            "expires_at": datetime(2099, 1, 1, tzinfo=UTC),
+            "error": None,
+        }
+        monkeypatch.setattr(
+            ws_files_uploads.db,
+            "get_upload",
+            create_autospec(ws_files_uploads.db.get_upload, return_value=upload_row),
+        )
+        monkeypatch.setattr(
+            ws_files_uploads.db,
+            "extend_upload",
+            create_autospec(ws_files_uploads.db.extend_upload, return_value=upload_row),
+        )
+        monkeypatch.setattr(
+            ws_files_uploads,
+            "sign_upload_part",
+            create_autospec(
+                ws_files_uploads.sign_upload_part,
+                return_value="https://s3.example/part1",
+            ),
+        )
+
+        # rw colleague can sign parts and inspect status on their upload
+        signed = await ws_files_uploads.sign_workspace_upload_parts(
+            ws["workspace_id"],
+            upload_row["upload_id"],
+            x_user_id="u-chao",
+            body=ws_files_uploads.SignPartsRequest(part_numbers=[1]),
+        )
+        assert signed["parts"] == [
+            {
+                "part_number": 1,
+                "offset": 0,
+                "size": 10 * 1024 * 1024,
+                "url": "https://s3.example/part1",
+            }
+        ]
+
+        status_res = await ws_files_uploads.get_workspace_upload(
+            ws["workspace_id"],
+            upload_row["upload_id"],
+            x_user_id="u-chao",
+        )
+        assert status_res["state"] == "uploading"
+
+        # 3. ro colleague rejected (403) on begin and follow-up endpoints (even if previously rw)
+        _set_sharing(monkeypatch, cos_access="ro", web_access="ro")
+        with pytest.raises(HTTPException) as exc_ro_begin:
+            await ws_files_uploads.begin_workspace_upload(
+                ws["workspace_id"],
+                x_user_id="u-chao",
+                body=ws_files_uploads.BeginUploadRequest(path="data/big.bin", size=1024),
+            )
+        assert exc_ro_begin.value.status_code == 403
+
+        with pytest.raises(HTTPException) as exc_ro_sign:
+            await ws_files_uploads.sign_workspace_upload_parts(
+                ws["workspace_id"],
+                upload_row["upload_id"],
+                x_user_id="u-chao",
+                body=ws_files_uploads.SignPartsRequest(part_numbers=[1]),
+            )
+        assert exc_ro_sign.value.status_code == 403
+
+        with pytest.raises(HTTPException) as exc_ro_complete:
+            await ws_files_uploads.complete_workspace_upload(
+                ws["workspace_id"],
+                upload_row["upload_id"],
+                x_user_id="u-chao",
+            )
+        assert exc_ro_complete.value.status_code == 403
+
+        with pytest.raises(HTTPException) as exc_ro_get:
+            await ws_files_uploads.get_workspace_upload(
+                ws["workspace_id"],
+                upload_row["upload_id"],
+                x_user_id="u-chao",
+            )
+        assert exc_ro_get.value.status_code == 403
+
+        with pytest.raises(HTTPException) as exc_ro_cancel:
+            await ws_files_uploads.cancel_workspace_upload(
+                ws["workspace_id"],
+                upload_row["upload_id"],
+                x_user_id="u-chao",
+            )
+        assert exc_ro_cancel.value.status_code == 403
+
+        # 4. hidden colleague rejected (404) on begin and follow-up endpoints
+        _set_sharing(monkeypatch, cos_access="ro", web_access="hidden")
+        with pytest.raises(HTTPException) as exc_hid_begin:
+            await ws_files_uploads.begin_workspace_upload(
+                ws["workspace_id"],
+                x_user_id="u-chao",
+                body=ws_files_uploads.BeginUploadRequest(path="data/big.bin", size=1024),
+            )
+        assert exc_hid_begin.value.status_code == 404
+
+        with pytest.raises(HTTPException) as exc_hid_sign:
+            await ws_files_uploads.sign_workspace_upload_parts(
+                ws["workspace_id"],
+                upload_row["upload_id"],
+                x_user_id="u-chao",
+                body=ws_files_uploads.SignPartsRequest(part_numbers=[1]),
+            )
+        assert exc_hid_sign.value.status_code == 404
+
+        # 5. Outsider / external member rejected (403) even when workspace is rw
+        _set_sharing(monkeypatch, cos_access="rw", web_access="rw")
+        with pytest.raises(HTTPException) as exc_out_begin:
+            await ws_files_uploads.begin_workspace_upload(
+                ws["workspace_id"],
+                x_user_id="u-outsider",
+                body=ws_files_uploads.BeginUploadRequest(path="data/big.bin", size=1024),
+            )
+        assert exc_out_begin.value.status_code == 403
+
+        # 6. Background pull (_pull_once) enforces write permission, acquires owner sandbox,
+        # and rejects symlinks resolving to system paths for non-owners.
+        fake_sandbox = create_autospec(PTCSandbox, instance=True)
+        fake_sandbox.is_ready.return_value = True
+        fake_sandbox.validate_path.return_value = True
+        fake_sandbox.virtualize_path.side_effect = lambda p, project=None: p.replace(
+            "/home/workspace/NVDA_Deep_Dive/", ""
+        )
+        acquired_users: list[str] = []
+
+        @asynccontextmanager
+        async def _fake_pull_acquire(workspace_id: str, user_id: str):
+            acquired_users.append(user_id)
+            yield fake_sandbox, ws
+
+        monkeypatch.setattr(
+            ws_upload_pull,
+            "acquire_sandbox_to_change",
+            create_autospec(
+                ws_upload_pull.acquire_sandbox_to_change,
+                side_effect=_fake_pull_acquire,
+            ),
+        )
+        from src.server.services.workspace_layout import layout_from_binding
+
+        monkeypatch.setattr(
+            ws_upload_pull,
+            "owner_layout",
+            create_autospec(
+                ws_upload_pull.owner_layout,
+                return_value=layout_from_binding(
+                    ws["workspace_id"],
+                    {**ws, "dir_name": "NVDA_Deep_Dive"},
+                    root="/home/workspace",
+                ),
+            ),
+        )
+        monkeypatch.setattr(
+            ws_upload_pull,
+            "contained_target",
+            create_autospec(
+                ws_upload_pull.contained_target,
+                return_value="/home/workspace/NVDA_Deep_Dive/.agents/skills/alpha/SKILL.md",
+            ),
+        )
+        with pytest.raises(ws_upload_pull._Refused):
+            await ws_upload_pull._pull_once(
+                {**upload_row, "path": "notes/symlink_skill.md"},
+                {},
+            )
+        assert acquired_users == ["u-richard"]
+
+        # 7. Home workspace rejected (403) for colleague even when rw
+        home_ws = _sample_workspace(user_id="u-richard", is_home=True)
+        shared_get_ws_mock.return_value = home_ws
+        with pytest.raises(HTTPException) as exc_home_begin:
+            await ws_files_uploads.begin_workspace_upload(
+                home_ws["workspace_id"],
+                x_user_id="u-chao",
+                body=ws_files_uploads.BeginUploadRequest(path="data/big.bin", size=1024),
+            )
+        assert exc_home_begin.value.status_code == 403
+
+    @pytest.mark.asyncio
     async def test_owner_only_operations_still_rejected_for_rw_colleague(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -1036,9 +1310,9 @@ class TestWebChannelEndpoints:
             ),
         )
         monkeypatch.setattr(
-            ws_files_shared,
+            ws_files_service,
             "db_get_workspace",
-            create_autospec(ws_files_shared.db_get_workspace, return_value=ws),
+            create_autospec(ws_files_service.db_get_workspace, return_value=ws),
         )
 
         # Rename / config update -> 403
@@ -1336,18 +1610,18 @@ class TestChiefOfStaffChannel:
             yield fake_cos_sandbox, running_ws
 
         monkeypatch.setattr(
-            ws_files_shared,
-            "_acquire_sandbox_to_change",
+            ws_files_service,
+            "acquire_sandbox_to_change",
             create_autospec(
-                ws_files_shared._acquire_sandbox_to_change,
+                ws_files_service.acquire_sandbox_to_change,
                 side_effect=_fake_cos_acquire,
             ),
         )
         monkeypatch.setattr(
             ws_files_crud,
-            "_acquire_sandbox_to_change",
+            "acquire_sandbox_to_change",
             create_autospec(
-                ws_files_crud._acquire_sandbox_to_change,
+                ws_files_crud.acquire_sandbox_to_change,
                 side_effect=_fake_cos_acquire,
             ),
         )
@@ -1362,6 +1636,14 @@ class TestChiefOfStaffChannel:
             "contained_sandbox_path",
             create_autospec(
                 ws_files_crud.contained_sandbox_path,
+                side_effect=_cos_resolve_path,
+            ),
+        )
+        monkeypatch.setattr(
+            ws_files_service,
+            "contained_sandbox_path",
+            create_autospec(
+                ws_files_service.contained_sandbox_path,
                 side_effect=_cos_resolve_path,
             ),
         )

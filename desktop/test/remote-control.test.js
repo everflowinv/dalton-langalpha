@@ -1014,27 +1014,82 @@ describe('how the bundle is signed', () => {
     additionalArguments: ['--deep-verify-off'],
   })
 
-  test('the helper alone is signed with no entitlements, and keeps everything else', async () => {
-    const { withUnentitledHelper, HELPER_ENTITLEMENTS } = await scripts('sign-mac.mjs')
+  test('the helper is signed with no entitlements, and everything else electron-builder resolved', async () => {
+    const { helperSignArgs, HELPER_ENTITLEMENTS } = await scripts('sign-mac.mjs')
     const opts = { app: APP, identity: 'ABCDEF', keychain: '/tmp/k.keychain', optionsForFile: builderOptions }
-    const signed = withUnentitledHelper(opts)
+
+    assert.deepEqual(helperSignArgs(opts), [
+      '--sign', 'ABCDEF', '--force', '--keychain', '/tmp/k.keychain',
+      '--timestamp=http://timestamp.example.com', '--options', 'runtime', '--deep-verify-off',
+      '--entitlements', HELPER_ENTITLEMENTS, `${APP}/Contents/MacOS/langalpha-helper`,
+    ])
+    assert.throws(() => helperSignArgs({ ...opts, identity: undefined }), /no signing identity/)
+  })
+
+  test("electron-builder's signer skips the helper and keeps every other file and skip", async () => {
+    const { withoutHelper } = await scripts('sign-mac.mjs')
+    const opts = { app: APP, identity: 'ABCDEF', optionsForFile: builderOptions, ignore: (file) => file.endsWith('.DS_Store') }
+    const signed = withoutHelper(opts)
 
     assert.equal(signed.identity, 'ABCDEF')
-    assert.equal(signed.keychain, '/tmp/k.keychain')
-    assert.deepEqual(
-      signed.optionsForFile(`${APP}/Contents/MacOS/langalpha-helper`),
-      { ...builderOptions(), entitlements: HELPER_ENTITLEMENTS },
-    )
+    assert.equal(signed.optionsForFile, builderOptions)
+    assert.equal(typeof signed.ignore, 'function')
+    assert.equal(signed.ignore(`${APP}/Contents/MacOS/langalpha-helper`), true)
+    assert.equal(signed.ignore(`${APP}/Contents/Resources/.DS_Store`), true)
     for (const file of [
       APP,
       `${APP}/Contents/MacOS/LangAlpha OSS`,
-      `${APP}/Contents/Frameworks/LangAlpha OSS Helper (Renderer).app`,
       `${APP}/Contents/Frameworks/Electron Framework.framework/Versions/A/Electron Framework`,
       `${APP}/Contents/Resources/langalpha-helper`,
       `${APP}/Contents/MacOS/langalpha-helper-old`,
     ]) {
-      assert.deepEqual(signed.optionsForFile(file), builderOptions(), file)
+      assert.equal(signed.ignore(file), false, file)
     }
+    assert.equal(withoutHelper({ app: APP }).ignore(`${APP}/Contents/MacOS/LangAlpha OSS`), false)
+  })
+
+  // The real signer walks Contents/MacOS in directory order and reached the main
+  // executable first, which codesign refuses while the helper beside it is
+  // unsigned. Signed ad hoc, so it needs no certificate.
+  test('an app with the helper beside its executable signs and verifies', { skip: process.platform !== 'darwin' }, async () => {
+    const { sign } = await scripts('sign-mac.mjs')
+    const app = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'la-sign-')), 'LangAlpha OSS.app')
+    const macos = path.join(app, 'Contents', 'MacOS')
+    fs.mkdirSync(macos, { recursive: true })
+    fs.writeFileSync(path.join(app, 'Contents', 'Info.plist'), [
+      '<?xml version="1.0" encoding="UTF-8"?>',
+      '<plist version="1.0"><dict>',
+      '<key>CFBundleExecutable</key><string>LangAlpha OSS</string>',
+      '<key>CFBundleIdentifier</key><string>ai.langalpha.desktop.test</string>',
+      '</dict></plist>',
+    ].join('\n'))
+    for (const name of ['LangAlpha OSS', 'langalpha-helper']) {
+      fs.copyFileSync('/usr/bin/true', path.join(macos, name))
+      assert.equal(spawnSync('codesign', ['--remove-signature', path.join(macos, name)]).status, 0)
+    }
+    const entitlements = path.join(__dirname, '..', 'resources', 'entitlements.mac.plist')
+
+    await sign({
+      app,
+      identity: '-',
+      identityValidation: false,
+      platform: 'darwin',
+      type: 'distribution',
+      preAutoEntitlements: false,
+      preEmbedProvisioningProfile: false,
+      ignore: () => false,
+      optionsForFile: () => ({ entitlements, hardenedRuntime: true, timestamp: 'none', additionalArguments: [] }),
+    })
+
+    const verify = spawnSync('codesign', ['--verify', '--deep', '--strict', app], { encoding: 'utf8' })
+    assert.equal(verify.status, 0, verify.stderr)
+    const granted = (name) =>
+      spawnSync('codesign', ['-d', '--entitlements', '-', '--xml', path.join(macos, name)], { encoding: 'utf8' }).stdout
+    assert.match(granted('LangAlpha OSS'), /allow-jit/)
+    assert.match(granted('langalpha-helper'), /<dict><\/dict>/)
+    const helper = spawnSync('codesign', ['-dv', path.join(macos, 'langalpha-helper')], { encoding: 'utf8' })
+    assert.match(helper.stderr, /flags=0x\w+\([^)]*runtime/)
+    fs.rmSync(path.dirname(app), { recursive: true, force: true })
   })
 
   test('no entitlements means an empty set, since the signer falls back to its own for none', async () => {

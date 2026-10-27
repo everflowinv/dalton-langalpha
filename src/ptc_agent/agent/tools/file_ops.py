@@ -105,15 +105,17 @@ def create_filesystem_tools(
 
         Args:
             file_path: Path to file (relative or absolute), or an image/PDF URL.
-            offset: Line offset (0-indexed). Default 0. Ignored for images/PDFs.
-            limit: Maximum number of lines. Default 2000. Ignored for images/PDFs.
+            offset: Line offset (0-indexed), or for a PDF the number of pages to skip. Default 0. Ignored for images.
+            limit: Maximum number of lines (default 2000), or of PDF pages (default and maximum 20). Ignored for images.
 
         Returns:
             File contents prefixed with line numbers (cat -n format), capped at
             `limit` lines and ~160k characters. If a cap fires the output ends with
-            a marker giving the offset to resume from.
+            a marker giving the offset to resume from. A PDF comes back as the
+            requested pages, with a marker giving the offset of the next ones.
 
         Strip the line-number prefix before passing text to Edit.
+        For a long PDF, extract or search its text with code first, then Read only the pages you need.
         """
         try:
             # Middleware injects the actual content; this return is just a sentinel.

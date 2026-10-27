@@ -26,14 +26,18 @@ vi.mock('react-i18next', () => ({
   }),
 }));
 
-vi.mock('@/pages/ChatAgent/utils/api', () => ({
-  uploadWorkspaceFile: vi.fn(),
-}));
+vi.mock('@/pages/ChatAgent/utils/workspaceUpload', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/pages/ChatAgent/utils/workspaceUpload')>();
+  return {
+    ...actual,
+    uploadToWorkspace: vi.fn(),
+  };
+});
 
-import { uploadWorkspaceFile } from '@/pages/ChatAgent/utils/api';
+import { uploadToWorkspace } from '@/pages/ChatAgent/utils/workspaceUpload';
 import { useFileUpload } from '../../filePanel/useFileUpload';
 
-const mockUpload = vi.mocked(uploadWorkspaceFile);
+const mockUpload = vi.mocked(uploadToWorkspace);
 
 function makeFile(name: string): File {
   return new File(['content'], name, { type: 'text/plain' });
@@ -289,7 +293,10 @@ describe('useFileUpload — workspace switch / unmount guard', () => {
     act(() => {
       result.current.handleDrop(dropEvent([makeFile('b1.txt')]) as React.DragEvent);
     });
-    expect(mockUpload).toHaveBeenNthCalledWith(2, 'ws-B', expect.any(File), null, expect.anything());
+    expect(mockUpload).toHaveBeenNthCalledWith(2, 'ws-B', expect.any(File), expect.objectContaining({
+      signal: expect.any(AbortSignal),
+      onProgress: expect.any(Function),
+    }));
     expect(result.current.uploadStatus).toMatchObject({ current: 1, total: 1, fileName: 'b1.txt' });
 
     // a1.txt lands: A's loop abandons, refreshes A's own list once (the

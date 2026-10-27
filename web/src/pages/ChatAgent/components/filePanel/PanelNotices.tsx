@@ -24,7 +24,7 @@ interface PanelNoticesProps {
   /** The restore is short and the tree that would say so is not on screen. */
   filesRestoreIncomplete?: boolean;
   onRefreshFiles?: () => void;
-  /** A delete or a backup is running; neither reports a percentage. */
+  /** A delete, a backup, or the last step of an upload is running; none reports a percentage. */
   busy: boolean;
   backupResult: BackupResult | null;
   onDismissBackupResult: () => void;

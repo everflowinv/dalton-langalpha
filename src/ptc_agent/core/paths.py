@@ -604,6 +604,11 @@ ALWAYS_HIDDEN_BASENAMES: tuple[str, ...] = (
     ".profile",
 )
 ALWAYS_HIDDEN_SUFFIXES: tuple[str, ...] = (".pyc",)
+#: Every transient file the transfer runtime or the server writes into a
+#: workspace folder sits at its root under this prefix: a download on its way
+#: in, a staged upload. There, and only there, the name is never a user's file
+#: (``wsfiles_transfer_runtime._TEMP_PREFIX``, which ships stdlib-only).
+TRANSIENT_ROOT_PREFIX = ".wsfiles-"
 
 #: How a thread's scratch, results, scratchpad and transcript directories are
 #: named: the first 8 characters of its id.

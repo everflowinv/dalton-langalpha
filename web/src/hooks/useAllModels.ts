@@ -5,7 +5,7 @@ import { getModelAccess, usePlatformModels, useModelAccessMap } from './usePlatf
 import { buildVisibleModels, augmentPlatformWithLocal } from './useFilteredModels';
 import type { BuildVisibleModelsResult, ModelMetadataEntry } from './useFilteredModels';
 import { useConfiguredProviders } from './useConfiguredProviders';
-import type { ProviderModelsData, CustomModelEntry } from '@/components/model/types';
+import type { ProviderModelsData, CustomModelEntry, KeyCandidates } from '@/components/model/types';
 import type { PlatformModelsResponse, ModelAccess } from '@/types/platform';
 import { modelPrefs } from '@/lib/modelPreferences';
 
@@ -77,6 +77,9 @@ export interface UseAllModelsResult {
   /** The models the plan holds back, by provider: listed in a picker, but
    *  not pickable. */
   lockedModels: Record<string, ProviderModelsData>;
+  /** Every listed model the server refuses when a turn names it: outside the
+   *  plan and the user's own keys. Empty without a platform. */
+  offPlanModels: Set<string>;
   /** Platform response (null in OSS mode or when endpoint unavailable). */
   platform: PlatformModelsResponse | null;
   /** System-level default model selections from the API. */
@@ -112,7 +115,7 @@ export function useAllModels(): UseAllModelsResult {
   const { models: modelsData, isLoading: modelsLoading } = useModels();
   const { preferences, isLoading: prefsLoading, isLoaded: prefsLoaded } = usePreferences();
   const { platform: rawPlatform, isLoading: platformLoading } = usePlatformModels();
-  const { providers: configuredProviders, isLoading: configuredLoading } = useConfiguredProviders();
+  const { providers: configuredProviders, byokEnabled, isLoading: configuredLoading } = useConfiguredProviders();
 
   const customModels = useMemo<CustomModelEntry[]>(() => {
     if (!preferences) return [];
@@ -145,8 +148,8 @@ export function useAllModels(): UseAllModelsResult {
   // Augment platform with locally-known BYOK/OAuth providers so the
   // tier filter recognises connections that the platform service may not know about.
   const platform = useMemo(
-    () => rawPlatform ? augmentPlatformWithLocal(rawPlatform, configuredProviders) : null,
-    [rawPlatform, configuredProviders],
+    () => rawPlatform ? augmentPlatformWithLocal(rawPlatform, configuredProviders, byokEnabled) : null,
+    [rawPlatform, configuredProviders, byokEnabled],
   );
 
   /** System defaults from the models API response */
@@ -231,12 +234,53 @@ export function useAllModels(): UseAllModelsResult {
     return out;
   }, [visible, platform]);
 
+  // Hidden by the plan filter, a tier-less model without the user's key
+  // included, unless a key the server finds for it serves it: the filter reads
+  // only a key under the model's own provider. An OAuth model is left out, as
+  // the server leaves it: a lapsed connection is refused with its reconnect
+  // prompt, not swapped for another. A custom model under a built-in's name
+  // passes that filter as the user's own, but without a key for it the server
+  // judges it as the built-in, which is what runs in its place.
+  const offPlanModels = useMemo(() => {
+    const out = new Set<string>();
+    if (!platform || !modelsData) return out;
+    const raw = modelsData as Record<string, unknown>;
+    const candidates = (raw.key_candidates ?? {}) as Record<string, KeyCandidates>;
+    const keyed = new Set(platform.byok_providers);
+    // Saved with a base URL, a key goes where the user pointed it, so it
+    // serves whichever model it is found for.
+    const pointed = new Set(
+      byokEnabled ? configuredProviders.filter((p) => p.base_url).map((p) => p.provider) : [],
+    );
+    const ownKey = (provider: string, anyKey: boolean) => {
+      const { slugs, shared } = candidates[provider] ?? { slugs: [provider], shared: [provider] };
+      return (anyKey ? slugs : shared).some((s) => keyed.has(s)) || slugs.some((s) => pointed.has(s));
+    };
+    const { rawModels, validModelNames, metadata } = visible;
+    for (const [group, data] of Object.entries(rawModels)) {
+      for (const m of data.models ?? []) {
+        const meta = metadata[m];
+        if (validModelNames.has(m) || meta?.access_type === 'oauth') continue;
+        if (!ownKey(meta?.provider ?? group, false)) out.add(m);
+      }
+    }
+    const builtIns = (raw.model_metadata ?? {}) as Record<string, ModelMetadataEntry>;
+    for (const cm of customModels) {
+      const builtIn = builtIns[cm.name];
+      if (!builtIn) continue;
+      const covered = typeof builtIn.tier === 'number' && builtIn.tier <= platform.model_tier;
+      if (!covered && !keyed.has(cm.name) && !ownKey(cm.provider, true)) out.add(cm.name);
+    }
+    return out;
+  }, [visible, platform, modelsData, customModels, configuredProviders, byokEnabled]);
+
   return {
     models: visible.models,
     metadata: visible.metadata,
     rawModels: visible.rawModels,
     modelAccessMap,
     lockedModels,
+    offPlanModels,
     platform,
     systemDefaults,
     customModels,

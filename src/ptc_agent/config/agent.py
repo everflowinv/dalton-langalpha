@@ -284,6 +284,15 @@ class LLMConfig(BaseModel):
     def fetch_name(self) -> str | None:
         return self.fetch or self.background
 
+    def fallbacks_for(self, model: str | None) -> list[str]:
+        """``fallback`` as a chain behind ``model``: without ``model`` itself
+        and without repeats, in order.
+
+        Either one sends the request that just failed back to the model that
+        refused it, which costs a full attempt and can only fail the same way.
+        """
+        return list(dict.fromkeys(m for m in self.fallback or () if m and m != model))
+
 
 class AgentConfig(BaseModel):
     """Agent-specific configuration.

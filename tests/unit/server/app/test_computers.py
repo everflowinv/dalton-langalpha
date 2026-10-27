@@ -2525,7 +2525,7 @@ async def _drain_start_tasks():
     """Await whatever schedule_computer_start left running."""
     import asyncio
 
-    from src.server.app import background_starts
+    from src.server.services import background_starts
 
     await asyncio.gather(
         *list(background_starts._start_tasks.values()), return_exceptions=True
@@ -2607,7 +2607,8 @@ async def test_a_drained_start_publishes_nothing(mock_computer_manager):
     coming down with the worker, so its subscribers are told nothing."""
     import asyncio
 
-    from src.server.app import background_starts, computers
+    from src.server.app import computers
+    from src.server.services import background_starts
 
     started = asyncio.Event()
 
@@ -2642,7 +2643,8 @@ async def test_drain_cancels_in_flight_starts(mock_computer_manager):
     it can leave the row wedged in 'starting'."""
     import asyncio
 
-    from src.server.app import background_starts, computers
+    from src.server.app import computers
+    from src.server.services import background_starts
 
     started = asyncio.Event()
 
@@ -2669,7 +2671,8 @@ async def test_a_second_lazy_start_joins_the_one_in_flight(mock_computer_manager
     once it has settled does a new schedule start the machine again."""
     import asyncio
 
-    from src.server.app import background_starts, computers
+    from src.server.app import computers
+    from src.server.services import background_starts
 
     started = asyncio.Event()
     release = asyncio.Event()

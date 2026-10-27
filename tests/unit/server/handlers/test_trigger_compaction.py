@@ -1,9 +1,11 @@
 """
 Tests for trigger_compaction() — the manual /compact endpoint handler.
 
-Regression coverage for the bug where the manual /compact path bypassed
-resolve_llm_config and therefore always used the base YAML compaction model
-instead of the user's compaction_model preference.
+Manual /compact is sent as the agent's own model call between turns
+(``ask_between_turns``), on an agent built and resolved as the thread's next
+turn would be: the user's compaction_model, the thread's own model, effort,
+fast mode, workspace and role. An agent that compacts nothing falls back to
+the summarizer alone (``compact_messages``) on the same config.
 """
 
 from contextlib import AsyncExitStack, ExitStack, asynccontextmanager, contextmanager
@@ -20,6 +22,8 @@ from ptc_agent.config.core import (
     SandboxConfig,
     SecurityConfig,
 )
+from ptc_agent.agent.middleware.compaction import NoCompaction
+from ptc_agent.core.project_context import ProjectContext
 from fastapi import HTTPException
 
 from src.server.database.workspace_folders import WorkspaceFolderMoving
@@ -30,6 +34,10 @@ USER_MODELS = "src.server.services.llm.user_models"
 CLIENTS = "src.server.services.llm.clients"
 LLM_HANDLER = "src.server.services.llm.config"
 COMPACT = "ptc_agent.agent.middleware.compaction.compact"
+ASK = "ptc_agent.agent.middleware.compaction.ask_between_turns"
+COMPACT_MESSAGES = "ptc_agent.agent.middleware.compaction.compact_messages"
+THREAD_META = "src.server.database.conversation.get_thread_auth_meta"
+WORKSPACE_ROW = "src.server.database.workspace.get_workspace"
 
 
 def _make_agent_config(
@@ -73,7 +81,8 @@ def base_config():
 
 
 def _compaction(preserved=None):
-    """A compaction as ``compact_messages`` returns it."""
+    """A compaction as the agent's model chain (or ``compact_messages``)
+    answers it."""
     from langchain_core.messages import HumanMessage
 
     from ptc_agent.agent.middleware.compaction import Compaction
@@ -84,16 +93,21 @@ def _compaction(preserved=None):
 
 
 def _summary_model(cfg):
-    """The model ``Summarizer.for_agent`` runs for ``cfg``. One resolved by
-    name comes back as ``"by-name:<name>"``."""
+    """The model ``Summarizer.for_agent`` runs for ``cfg``, which the graph
+    built on ``cfg`` summarizes with. One resolved by name comes back as
+    ``"by-name:<name>"``."""
     from ptc_agent.agent.middleware.compaction.compact import Summarizer
 
     with patch(f"{COMPACT}.create_llm", side_effect=lambda name, **_: f"by-name:{name}"):
         return Summarizer.for_agent(cfg).model
 
 
-def _stub_resolve_graph_and_state():
-    """Return a coroutine factory producing the tuple _resolve_graph_and_state yields."""
+PROJECT = ProjectContext("ws-1", "Macro")
+
+
+def _stub_thread_agent():
+    """A coroutine standing in for ``_thread_agent``, yielding its ThreadAgent."""
+    from src.server.handlers.thread_maintenance import ThreadAgent
 
     graph = MagicMock()
     graph.aupdate_state = AsyncMock(return_value=None)
@@ -102,20 +116,62 @@ def _stub_resolve_graph_and_state():
     messages = [MagicMock(id="m1"), MagicMock(id="m2")]
     backend = None
 
-    async def _stub(thread_id, verb, config=None, checkpointer=None, user_id=None, held=None):
+    async def _stub(
+        thread_id, verb, config=None, checkpointer=None, user_id=None, held=None, role="analyst"
+    ):
         _stub.captured_config = config
         _stub.captured_checkpointer = checkpointer
         _stub.captured_user_id = user_id
-        return graph, state, messages, "ws-1", backend
+        _stub.captured_role = role
+        return ThreadAgent(thread_id, graph, state, messages, "ws-1", backend, PROJECT)
 
     _stub.captured_config = None
     _stub.captured_checkpointer = None
     _stub.captured_user_id = None
+    _stub.captured_role = None
     _stub.graph = graph
     _stub.state = state
+    _stub.messages = messages
     return _stub
 
 
+def _asked(answer=None, *, error=None):
+    """An ``ask_between_turns`` stand-in answering ``answer`` (a fresh
+    compaction by default), or raising ``error``; ``.projects`` records the
+    project bound around each call."""
+    from ptc_agent.core.project_context import current_project
+
+    projects: list = []
+
+    async def _ask(agent, state, ask, **kwargs):
+        projects.append(current_project())
+        if error is not None:
+            raise error
+        return answer if answer is not None else _compaction()
+
+    mock = AsyncMock(side_effect=_ask)
+    mock.projects = projects
+    return mock
+
+
+@pytest.fixture(autouse=True)
+def thread_row():
+    """The thread's row and its workspace, as ``thread_route`` reads them: an
+    analyst's workspace, no model, effort or fast mode of its own. Tests
+    change the dict in place, or patch the reads themselves."""
+    meta = {
+        "workspace_id": "ws-1",
+        "llm_model": None,
+        "reasoning_effort": None,
+        "fast_mode": None,
+        "msg_type": "ptc",
+    }
+    workspace = {"workspace_id": "ws-1", "user_id": "user-1", "status": "running"}
+    with (
+        patch(THREAD_META, new=AsyncMock(side_effect=lambda _t: meta)),
+        patch(WORKSPACE_ROW, new=AsyncMock(side_effect=lambda _w: workspace)),
+    ):
+        yield {"meta": meta, "workspace": workspace}
 
 
 RUNNER_GET_INSTANCE = (
@@ -161,22 +217,23 @@ def mutation_runner():
 
 @pytest.mark.asyncio
 async def test_manual_compact_uses_user_compaction_model(base_config):
-    """When user_id is passed and pref sets compaction_model, that model is used."""
+    """When user_id is passed and pref sets compaction_model, the agent the
+    compaction is asked of is built on it."""
+    from ptc_agent.agent.middleware.compaction import Compact
+    from src.server.app import setup
     from src.server.handlers.thread_maintenance import trigger_compaction
 
-    stub_resolve = _stub_resolve_graph_and_state()
-
-    compact_mock = AsyncMock(return_value=_compaction())
+    stub_resolve = _stub_thread_agent()
+    ask = _asked()
+    compact_mock = AsyncMock(side_effect=AssertionError("the summarizer alone ran"))
 
     mock_mc = _mock_model_config()
 
     with (
         patch("src.server.app.setup.agent_config", base_config),
-        patch(f"{HANDLER}._resolve_graph_and_state", new=stub_resolve),
-        patch(
-            "ptc_agent.agent.middleware.compaction.compact_messages",
-            new=compact_mock,
-        ),
+        patch(f"{HANDLER}._thread_agent", new=stub_resolve),
+        patch(ASK, new=ask),
+        patch(COMPACT_MESSAGES, new=compact_mock),
         patch(
             "src.server.database.api_keys.is_byok_active",
             new_callable=AsyncMock,
@@ -196,24 +253,90 @@ async def test_manual_compact_uses_user_compaction_model(base_config):
     ):
         await trigger_compaction("thread-1", keep_messages=5, user_id="user-1")
 
-    assert compact_mock.await_count == 1
-    # Graph building and the summary both run on the resolved
+    # Asked of the built agent, on the state the next turn starts from, with
+    # the turn's project bound as a run binds it.
+    ask.assert_awaited_once_with(
+        stub_resolve.graph.agent,
+        stub_resolve.state.values,
+        Compact(5),
+        thread_id="thread-1",
+        store=setup.store,
+    )
+    assert ask.projects == [PROJECT]
+    compact_mock.assert_not_awaited()
+    # The graph, and the summary its compaction writes, run on the resolved
     # (user-overridden) config, not the untouched base config.
     resolved = stub_resolve.captured_config
     assert resolved is not None
     assert resolved.llm.compaction == "user-compaction-model"
-    assert compact_mock.await_args.args[2] is resolved
     model = _summary_model(resolved)
     assert model == "by-name:user-compaction-model", (
         "Manual /compact must honor the user's compaction_model preference, "
         f"got {model!r}"
     )
-    # The summary points at the transcript only once this folder can read it.
-    assert compact_mock.await_args.kwargs["workspace_id"] == "ws-1"
 
     # The session acquire behind it resolves MCP/OAuth per owner, so the caller
     # identity must not be dropped on the way down.
     assert stub_resolve.captured_user_id == "user-1"
+    assert stub_resolve.captured_role == "analyst"
+
+
+@pytest.mark.asyncio
+async def test_an_agent_that_compacts_nothing_falls_back_to_the_summarizer(base_config):
+    """Compaction off in the agent's config leaves no middleware to answer:
+    the summarizer alone writes the summary, on the same resolved config, and
+    the compact installs it as it would the agent's."""
+    from src.server.handlers.thread_maintenance import trigger_compaction
+
+    stub_resolve = _stub_thread_agent()
+    ask = _asked(error=NoCompaction("the agent has no compaction to ask"))
+    compaction = _compaction()
+    compact_mock = AsyncMock(return_value=compaction)
+
+    with (
+        patch("src.server.app.setup.agent_config", base_config),
+        patch(f"{HANDLER}._thread_agent", new=stub_resolve),
+        patch(ASK, new=ask),
+        patch(COMPACT_MESSAGES, new=compact_mock),
+    ):
+        result = await trigger_compaction("thread-1", keep_messages=5)
+
+    ask.assert_awaited_once()
+    compact_mock.assert_awaited_once()
+    args, kwargs = compact_mock.await_args.args, compact_mock.await_args.kwargs
+    assert args == (stub_resolve.messages, stub_resolve.state.values, base_config)
+    assert kwargs["thread_id"] == "thread-1"
+    assert kwargs["keep_messages"] == 5
+    # The summary points at the transcript only once this folder can read it.
+    assert kwargs["workspace_id"] == "ws-1"
+    assert kwargs["backend"] is None
+    assert kwargs["notes_dir"] is None
+    update = stub_resolve.graph.aupdate_state.await_args.args[1]
+    assert update["_summarization_event"] is compaction.event
+    assert result["summary_text"] == "ok"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "message",
+    ["Not enough messages to compact. Have 2, need more than 5 to preserve.",
+     "Cannot determine valid cutoff point for compaction"],
+)
+async def test_a_view_with_nothing_to_compact_is_a_400(base_config, message):
+    from src.server.handlers.thread_maintenance import trigger_compaction
+
+    stub_resolve = _stub_thread_agent()
+    with (
+        patch("src.server.app.setup.agent_config", base_config),
+        patch(f"{HANDLER}._thread_agent", new=stub_resolve),
+        patch(ASK, new=_asked(error=ValueError(message))),
+        pytest.raises(HTTPException) as refused,
+    ):
+        await trigger_compaction("thread-1", keep_messages=5)
+
+    assert refused.value.status_code == 400
+    assert refused.value.detail == message
+    stub_resolve.graph.aupdate_state.assert_not_awaited()
 
 
 THREAD_MODEL = "src.server.services.llm.thread_model"
@@ -230,22 +353,22 @@ async def _compact_on_thread_model(base_config, resolve_stub):
         asked.append((request_model, slot))
         return await resolve_stub(base_cfg, request_model)
 
-    compact_mock = AsyncMock(return_value=_compaction())
+    ask = _asked()
     with (
         patch("src.server.app.setup.agent_config", base_config),
-        patch(f"{HANDLER}._resolve_graph_and_state", new=_stub_resolve_graph_and_state()),
-        patch("ptc_agent.agent.middleware.compaction.compact_messages", new=compact_mock),
+        patch(f"{HANDLER}._thread_agent", new=_stub_thread_agent()),
+        patch(ASK, new=ask),
         patch("src.server.database.api_keys.is_byok_active", new_callable=AsyncMock, return_value=False),
         patch(
-            "src.server.database.conversation.get_thread_auth_meta",
+            THREAD_META,
             new_callable=AsyncMock,
-            return_value={"llm_model": "m-thread", "msg_type": "ptc"},
+            return_value={"llm_model": "m-thread", "msg_type": "ptc", "workspace_id": "ws-1"},
         ),
         patch(f"{THREAD_MODEL}.turn_model", new_callable=AsyncMock, side_effect=lambda *a, held, **k: held),
         patch(f"{LLM_HANDLER}.resolve_llm_config", new=_resolve),
     ):
         await trigger_compaction("thread-1", keep_messages=5, user_id="user-1")
-    compact_mock.assert_awaited_once()
+    ask.assert_awaited_once()
     return asked
 
 
@@ -276,33 +399,77 @@ async def test_manual_compact_runs_the_default_when_the_threads_model_cannot_run
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("home", [False, True], ids=["analyst", "chief_of_staff"])
+async def test_the_compact_resolves_as_the_threads_next_turn(base_config, thread_row, home):
+    """The thread's own effort and fast mode, in the workspace and role its
+    next turn runs in, reach the resolver, and the agent is built in that
+    role: a call between turns sends that turn's prompt and tools, or the
+    provider's cache misses."""
+    from src.server.database.home_workspace import get_home_workspace_id
+    from src.server.handlers.thread_maintenance import trigger_compaction
+
+    workspace_id = get_home_workspace_id("user-1") if home else "ws-1"
+    thread_row["meta"].update(
+        workspace_id=workspace_id, reasoning_effort="high", fast_mode=True
+    )
+    thread_row["workspace"]["workspace_id"] = workspace_id
+    stub_resolve = _stub_thread_agent()
+    resolve = AsyncMock(side_effect=lambda base_cfg, *a, **k: base_cfg.model_copy(deep=True))
+
+    with (
+        patch("src.server.app.setup.agent_config", base_config),
+        patch(f"{HANDLER}._thread_agent", new=stub_resolve),
+        patch(ASK, new=_asked()),
+        patch("src.server.database.api_keys.is_byok_active", new_callable=AsyncMock, return_value=True),
+        patch(f"{THREAD_MODEL}.turn_model", new_callable=AsyncMock, return_value=None),
+        patch(f"{LLM_HANDLER}.resolve_llm_config", new=resolve),
+    ):
+        await trigger_compaction("thread-1", keep_messages=5, user_id="user-1")
+
+    role = "chief_of_staff" if home else "analyst"
+    resolve.assert_awaited_once_with(
+        base_config,
+        "user-1",
+        None,
+        True,
+        reasoning_effort="high",
+        fast_mode=True,
+        thread_id="thread-1",
+        enabled_subagents=None,
+        workspace_id=workspace_id,
+        role=role,
+    )
+    assert stub_resolve.captured_role == role
+
+
+@pytest.mark.asyncio
 async def test_manual_compact_without_user_id_uses_base_config(base_config):
     """No user_id → no resolve_llm_config call; base YAML compaction model is used."""
     from src.server.handlers.thread_maintenance import trigger_compaction
 
-    stub_resolve = _stub_resolve_graph_and_state()
-
-    compact_mock = AsyncMock(return_value=_compaction())
+    stub_resolve = _stub_thread_agent()
+    ask = _asked()
 
     # Guard: if resolve_llm_config is called we want the test to fail loudly.
     resolve_spy = AsyncMock(side_effect=AssertionError("resolve_llm_config called without user_id"))
+    route_spy = AsyncMock(side_effect=AssertionError("thread route read without user_id"))
 
     with (
         patch("src.server.app.setup.agent_config", base_config),
-        patch(f"{HANDLER}._resolve_graph_and_state", new=stub_resolve),
-        patch(
-            "ptc_agent.agent.middleware.compaction.compact_messages",
-            new=compact_mock,
-        ),
+        patch(f"{HANDLER}._thread_agent", new=stub_resolve),
+        patch(ASK, new=ask),
         patch(f"{LLM_HANDLER}.resolve_llm_config", new=resolve_spy),
+        patch(f"{HANDLER}.thread_route", new=route_spy),
     ):
         await trigger_compaction("thread-1", keep_messages=5)
 
-    assert compact_mock.await_count == 1
-    cfg = compact_mock.await_args.args[2]
+    ask.assert_awaited_once()
+    cfg = stub_resolve.captured_config
     assert cfg is base_config
     assert _summary_model(cfg) == "by-name:system-compaction"
+    assert stub_resolve.captured_role == "analyst"
     assert resolve_spy.await_count == 0
+    assert route_spy.await_count == 0
 
 
 @pytest.mark.asyncio
@@ -310,19 +477,15 @@ async def test_resolve_failure_falls_back_to_base_config(base_config):
     """If resolve_llm_config raises, manual /compact logs and falls back cleanly."""
     from src.server.handlers.thread_maintenance import trigger_compaction
 
-    stub_resolve = _stub_resolve_graph_and_state()
-
-    compact_mock = AsyncMock(return_value=_compaction())
+    stub_resolve = _stub_thread_agent()
+    ask = _asked()
 
     failing_resolve = AsyncMock(side_effect=RuntimeError("db down"))
 
     with (
         patch("src.server.app.setup.agent_config", base_config),
-        patch(f"{HANDLER}._resolve_graph_and_state", new=stub_resolve),
-        patch(
-            "ptc_agent.agent.middleware.compaction.compact_messages",
-            new=compact_mock,
-        ),
+        patch(f"{HANDLER}._thread_agent", new=stub_resolve),
+        patch(ASK, new=ask),
         patch(
             "src.server.database.api_keys.is_byok_active",
             new_callable=AsyncMock,
@@ -333,7 +496,8 @@ async def test_resolve_failure_falls_back_to_base_config(base_config):
         await trigger_compaction("thread-1", keep_messages=5, user_id="user-1")
 
     # Fell back to base YAML compaction model; did not raise.
-    cfg = compact_mock.await_args.args[2]
+    ask.assert_awaited_once()
+    cfg = stub_resolve.captured_config
     assert cfg is base_config
     assert _summary_model(cfg) == "by-name:system-compaction"
 
@@ -346,9 +510,7 @@ async def test_manual_compact_summarizes_with_the_subsidiary_oauth_client(base_c
     Codex/Claude OAuth or BYOK get billed wrong or 4xx."""
     from src.server.handlers.thread_maintenance import trigger_compaction
 
-    stub_resolve = _stub_resolve_graph_and_state()
-
-    compact_mock = AsyncMock(return_value=_compaction())
+    stub_resolve = _stub_thread_agent()
 
     oauth_client = MagicMock(name="oauth-codex-client")
     resolve_kwargs: dict = {}
@@ -362,11 +524,8 @@ async def test_manual_compact_summarizes_with_the_subsidiary_oauth_client(base_c
 
     with (
         patch("src.server.app.setup.agent_config", base_config),
-        patch(f"{HANDLER}._resolve_graph_and_state", new=stub_resolve),
-        patch(
-            "ptc_agent.agent.middleware.compaction.compact_messages",
-            new=compact_mock,
-        ),
+        patch(f"{HANDLER}._thread_agent", new=stub_resolve),
+        patch(ASK, new=_asked()),
         patch(
             "src.server.database.api_keys.is_byok_active",
             new_callable=AsyncMock,
@@ -376,7 +535,7 @@ async def test_manual_compact_summarizes_with_the_subsidiary_oauth_client(base_c
     ):
         await trigger_compaction("thread-1", keep_messages=5, user_id="user-1")
 
-    cfg = compact_mock.await_args.args[2]
+    cfg = stub_resolve.captured_config
     assert cfg.llm.compaction == "user-compaction-model"
     model = _summary_model(cfg)
     # A copy, as every role gets, so nothing done to it reaches the shared
@@ -403,20 +562,16 @@ async def test_manual_compact_without_a_role_client_runs_the_turns_model():
     base_config = _make_agent_config(compaction_model=None)
     base_config.llm_client = None
     base_config.subsidiary_llm_clients.pop("compaction", None)
-
-    compact_mock = AsyncMock(return_value=_compaction())
+    stub_resolve = _stub_thread_agent()
 
     with (
         patch("src.server.app.setup.agent_config", base_config),
-        patch(f"{HANDLER}._resolve_graph_and_state", new=_stub_resolve_graph_and_state()),
-        patch(
-            "ptc_agent.agent.middleware.compaction.compact_messages",
-            new=compact_mock,
-        ),
+        patch(f"{HANDLER}._thread_agent", new=stub_resolve),
+        patch(ASK, new=_asked()),
     ):
         await trigger_compaction("thread-1", keep_messages=5)
 
-    cfg = compact_mock.await_args.args[2]
+    cfg = stub_resolve.captured_config
     model_config = MagicMock()
     model_config.get_reasoning_efforts.return_value = ["low", "medium", "high", "max"]
     with (
@@ -437,7 +592,7 @@ async def test_manual_compact_resets_the_token_cache_and_prunes_dead_offloads(ba
 
     from src.server.handlers.thread_maintenance import trigger_compaction
 
-    stub_resolve = _stub_resolve_graph_and_state()
+    stub_resolve = _stub_thread_agent()
     stub_resolve.state.values = {
         "_summarization_event": None,
         "_cached_input_tokens": 150_000,
@@ -446,20 +601,17 @@ async def test_manual_compact_resets_the_token_cache_and_prunes_dead_offloads(ba
         "_offloaded_read_result_ids": {"r-summarized"},
     }
     kept = AIMessage("", id="a-kept", tool_calls=[{"name": "Write", "id": "w-kept", "args": {}}])
-    compact_mock = AsyncMock(return_value=_compaction(preserved=[kept]))
+    compaction = _compaction(preserved=[kept])
 
     with (
         patch("src.server.app.setup.agent_config", base_config),
-        patch(f"{HANDLER}._resolve_graph_and_state", new=stub_resolve),
-        patch(
-            "ptc_agent.agent.middleware.compaction.compact_messages",
-            new=compact_mock,
-        ),
+        patch(f"{HANDLER}._thread_agent", new=stub_resolve),
+        patch(ASK, new=_asked(compaction)),
     ):
         await trigger_compaction("thread-1", keep_messages=5)
 
     update = stub_resolve.graph.aupdate_state.await_args.args[1]
-    assert update["_summarization_event"] is compact_mock.return_value.event
+    assert update["_summarization_event"] is compaction.event
     assert update["_cached_input_tokens"] == update["_cached_output_tokens"] == 0
     assert update["_offloaded_tool_call_ids"] == {"w-kept"}
     assert update["_offloaded_read_result_ids"] == set()
@@ -472,16 +624,12 @@ async def test_manual_compact_writes_its_marker_naming_the_summary(base_config):
     compaction of its own, and reads its text from it."""
     from src.server.handlers.thread_maintenance import trigger_compaction
 
-    stub_resolve = _stub_resolve_graph_and_state()
-    compact_mock = AsyncMock(return_value=_compaction())
+    stub_resolve = _stub_thread_agent()
 
     with (
         patch("src.server.app.setup.agent_config", base_config),
-        patch(f"{HANDLER}._resolve_graph_and_state", new=stub_resolve),
-        patch(
-            "ptc_agent.agent.middleware.compaction.compact_messages",
-            new=compact_mock,
-        ),
+        patch(f"{HANDLER}._thread_agent", new=stub_resolve),
+        patch(ASK, new=_asked()),
     ):
         result = await trigger_compaction("thread-1", keep_messages=5)
 
@@ -542,16 +690,13 @@ async def _compact_after(base_config, values, reader):
     """Compact a thread whose commit pointer holds ``values``; the update."""
     from src.server.handlers.thread_maintenance import trigger_compaction
 
-    stub_resolve = _stub_resolve_graph_and_state()
+    stub_resolve = _stub_thread_agent()
     stub_resolve.state.values = values
     stub_resolve.state.config = {"configurable": {"checkpoint_id": "cp-tail"}}
     with (
         patch("src.server.app.setup.agent_config", base_config),
-        patch(f"{HANDLER}._resolve_graph_and_state", new=stub_resolve),
-        patch(
-            "ptc_agent.agent.middleware.compaction.compact_messages",
-            new=AsyncMock(return_value=_compaction()),
-        ),
+        patch(f"{HANDLER}._thread_agent", new=stub_resolve),
+        patch(ASK, new=_asked()),
         patch(READER_GET_INSTANCE, return_value=reader),
     ):
         await trigger_compaction("thread-1", keep_messages=5)
@@ -631,13 +776,13 @@ async def test_a_summary_from_before_the_turn_is_not_copied(base_config, written
 async def test_manual_offload_writes_its_marker_with_the_ids(base_config):
     from src.server.handlers.thread_maintenance import trigger_offload
 
-    stub_resolve = _stub_resolve_graph_and_state()
+    stub_resolve = _stub_thread_agent()
     stub_resolve.state.values = {}
     offload_mock = AsyncMock(return_value=({"w1", "w2"}, {"r1"}))
 
     with (
         patch("src.server.app.setup.agent_config", base_config),
-        patch(f"{HANDLER}._resolve_graph_and_state", new=stub_resolve),
+        patch(f"{HANDLER}._thread_agent", new=stub_resolve),
         patch(
             "ptc_agent.agent.middleware.compaction.offload_tool_args",
             new=offload_mock,
@@ -657,7 +802,6 @@ async def test_manual_offload_writes_its_marker_with_the_ids(base_config):
         "offloaded_args": 2,
         "offloaded_reads": 1,
     }
-
 
 # ---------------------------------------------------------------------------
 # Gate: reject manual /compact + /offload while a workflow is streaming
@@ -692,16 +836,13 @@ class TestMutationFence:
 
         from src.server.handlers.thread_maintenance import trigger_compaction
 
-        compact_mock = AsyncMock()  # must NEVER run
-        stub_resolve = _stub_resolve_graph_and_state()
+        ask_mock = AsyncMock()  # must NEVER run
+        stub_resolve = _stub_thread_agent()
 
         with (
             patch("src.server.app.setup.agent_config", base_config),
-            patch(f"{HANDLER}._resolve_graph_and_state", new=stub_resolve),
-            patch(
-                "ptc_agent.agent.middleware.compaction.compact_messages",
-                new=compact_mock,
-            ),
+            patch(f"{HANDLER}._thread_agent", new=stub_resolve),
+            patch(ASK, new=ask_mock),
             patch(
                 RUNNER_GET_INSTANCE,
                 return_value=_fake_runner(refusal=self._conflict(code, "compact")),
@@ -715,7 +856,7 @@ class TestMutationFence:
         assert isinstance(detail, dict)
         assert detail["code"] == code
         assert detail["verb"] == "compact"
-        assert compact_mock.await_count == 0
+        assert ask_mock.await_count == 0
         assert stub_resolve.captured_config is None
 
     @pytest.mark.asyncio
@@ -725,11 +866,11 @@ class TestMutationFence:
         from src.server.handlers.thread_maintenance import trigger_offload
 
         offload_mock = AsyncMock()  # must NEVER run
-        stub_resolve = _stub_resolve_graph_and_state()
+        stub_resolve = _stub_thread_agent()
 
         with (
             patch("src.server.app.setup.agent_config", base_config),
-            patch(f"{HANDLER}._resolve_graph_and_state", new=stub_resolve),
+            patch(f"{HANDLER}._thread_agent", new=stub_resolve),
             patch(
                 "ptc_agent.agent.middleware.compaction.offload_tool_args",
                 new=offload_mock,
@@ -760,18 +901,15 @@ class TestMutationFence:
         from src.server.handlers.thread_maintenance import trigger_compaction
         from src.server.services.thread_mutation import MutationUnavailable
 
-        compact_mock = AsyncMock()  # must NEVER run
+        ask_mock = AsyncMock()  # must NEVER run
 
         with (
             patch("src.server.app.setup.agent_config", base_config),
             patch(
-                f"{HANDLER}._resolve_graph_and_state",
-                new=_stub_resolve_graph_and_state(),
+                f"{HANDLER}._thread_agent",
+                new=_stub_thread_agent(),
             ),
-            patch(
-                "ptc_agent.agent.middleware.compaction.compact_messages",
-                new=compact_mock,
-            ),
+            patch(ASK, new=ask_mock),
             patch(
                 RUNNER_GET_INSTANCE,
                 return_value=_fake_runner(
@@ -783,7 +921,7 @@ class TestMutationFence:
                 await trigger_compaction("thread-1", keep_messages=5)
 
         assert exc_info.value.status_code == 503
-        assert compact_mock.await_count == 0
+        assert ask_mock.await_count == 0
 
     @pytest.mark.asyncio
     async def test_compact_holds_fence_and_threads_fence_saver(self, base_config):
@@ -794,16 +932,13 @@ class TestMutationFence:
 
         fence_saver = object()
         runner = _fake_runner(saver=fence_saver)
-        stub_resolve = _stub_resolve_graph_and_state()
-        compact_mock = AsyncMock(return_value=_compaction())
+        stub_resolve = _stub_thread_agent()
+        ask_mock = AsyncMock(return_value=_compaction())
 
         with (
             patch("src.server.app.setup.agent_config", base_config),
-            patch(f"{HANDLER}._resolve_graph_and_state", new=stub_resolve),
-            patch(
-                "ptc_agent.agent.middleware.compaction.compact_messages",
-                new=compact_mock,
-            ),
+            patch(f"{HANDLER}._thread_agent", new=stub_resolve),
+            patch(ASK, new=ask_mock),
             patch(RUNNER_GET_INSTANCE, return_value=runner),
         ):
             await trigger_compaction("thread-1", keep_messages=5)
@@ -818,12 +953,12 @@ class TestMutationFence:
 
         fence_saver = object()
         runner = _fake_runner(saver=fence_saver)
-        stub_resolve = _stub_resolve_graph_and_state()
+        stub_resolve = _stub_thread_agent()
         offload_mock = AsyncMock(return_value=(set(), set()))
 
         with (
             patch("src.server.app.setup.agent_config", base_config),
-            patch(f"{HANDLER}._resolve_graph_and_state", new=stub_resolve),
+            patch(f"{HANDLER}._thread_agent", new=stub_resolve),
             patch(
                 "ptc_agent.agent.middleware.compaction.offload_tool_args",
                 new=offload_mock,
@@ -844,12 +979,12 @@ class TestMutationFence:
         from src.server.handlers.thread_maintenance import trigger_offload
 
         runner = _fake_runner()
-        stub_resolve = _stub_resolve_graph_and_state()
+        stub_resolve = _stub_thread_agent()
         offload_mock = AsyncMock(return_value=(set(), set()))
 
         with (
             patch("src.server.app.setup.agent_config", base_config),
-            patch(f"{HANDLER}._resolve_graph_and_state", new=stub_resolve),
+            patch(f"{HANDLER}._thread_agent", new=stub_resolve),
             patch(
                 "ptc_agent.agent.middleware.compaction.offload_tool_args",
                 new=offload_mock,
@@ -869,18 +1004,15 @@ class TestMutationFence:
         from src.server.handlers.thread_maintenance import trigger_compaction
 
         runner = _fake_runner()
-        compact_mock = AsyncMock(side_effect=RuntimeError("boom"))
+        ask_mock = AsyncMock(side_effect=ConnectionError("boom"))
 
         with (
             patch("src.server.app.setup.agent_config", base_config),
             patch(
-                f"{HANDLER}._resolve_graph_and_state",
-                new=_stub_resolve_graph_and_state(),
+                f"{HANDLER}._thread_agent",
+                new=_stub_thread_agent(),
             ),
-            patch(
-                "ptc_agent.agent.middleware.compaction.compact_messages",
-                new=compact_mock,
-            ),
+            patch(ASK, new=ask_mock),
             patch(RUNNER_GET_INSTANCE, return_value=runner),
         ):
             with pytest.raises(HTTPException) as exc_info:
@@ -892,7 +1024,7 @@ class TestMutationFence:
     @pytest.mark.asyncio
     async def test_compact_cancelled_surfaces_clean_http(self, base_config):
         """A user Stop (/cancel → runner.request_stop) cancels this request
-        task, often mid summarize-LLM call. ``CancelledError`` is a
+        task, often mid model call. ``CancelledError`` is a
         BaseException, so without handling it bubbles to ASGI as a raw 500 —
         the shared ``cancellation_as_http`` wrapper converts it to a clean
         409 ``request_cancelled``; the fence must still be released."""
@@ -903,18 +1035,15 @@ class TestMutationFence:
         from src.server.handlers.thread_maintenance import trigger_compaction
 
         runner = _fake_runner()
-        compact_mock = AsyncMock(side_effect=asyncio.CancelledError())
+        ask_mock = AsyncMock(side_effect=asyncio.CancelledError())
 
         with (
             patch("src.server.app.setup.agent_config", base_config),
             patch(
-                f"{HANDLER}._resolve_graph_and_state",
-                new=_stub_resolve_graph_and_state(),
+                f"{HANDLER}._thread_agent",
+                new=_stub_thread_agent(),
             ),
-            patch(
-                "ptc_agent.agent.middleware.compaction.compact_messages",
-                new=compact_mock,
-            ),
+            patch(ASK, new=ask_mock),
             patch(RUNNER_GET_INSTANCE, return_value=runner),
         ):
             with pytest.raises(HTTPException) as exc_info:
@@ -942,8 +1071,8 @@ class TestMutationFence:
         with (
             patch("src.server.app.setup.agent_config", base_config),
             patch(
-                f"{HANDLER}._resolve_graph_and_state",
-                new=_stub_resolve_graph_and_state(),
+                f"{HANDLER}._thread_agent",
+                new=_stub_thread_agent(),
             ),
             patch(
                 "ptc_agent.agent.middleware.compaction.offload_tool_args",
@@ -972,7 +1101,7 @@ class TestSessionAcquireIdentity:
     async def test_the_caller_identity_reaches_the_session_acquire(self, base_config):
         """An acquire with no user_id resolves the owner's server set empty, and
         a recovery taken from that path would carry the gap into provisioning."""
-        from src.server.handlers.thread_maintenance import _resolve_graph_and_state
+        from src.server.handlers.thread_maintenance import _thread_agent
 
         from src.server.services.workspace_manager import WorkspaceManager
 
@@ -1005,7 +1134,7 @@ class TestSessionAcquireIdentity:
                 new=AsyncMock(return_value=None),
             ),
         ):
-            await _resolve_graph_and_state(
+            await _thread_agent(
                 "thread-1",
                 "compact",
                 config=base_config,
@@ -1015,6 +1144,80 @@ class TestSessionAcquireIdentity:
             )
 
         assert manager.get_session_for_workspace.await_args.kwargs["user_id"] == "user-1"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("binds", [True, False], ids=["bound", "unbound"])
+    async def test_the_agent_is_built_as_the_threads_next_turn(self, base_config, binds):
+        """A model call between turns sends the turn's prompt and tools, or
+        the provider's cache misses: the caller's profile with its trading
+        rule, the direct tools (none when they cannot be bound, as a turn
+        runs without them), the store, the project and the role."""
+        from src.server.app import setup
+        from src.server.handlers.thread_maintenance import _thread_agent
+        from src.server.services.egress.direct_tools import DirectMCPBinding
+        from src.server.services.workspace_manager import WorkspaceManager
+
+        session = MagicMock(sandbox=None)
+        manager = MagicMock(spec=WorkspaceManager)
+        manager.get_session_for_workspace = AsyncMock(return_value=session)
+        view = manager.tool_view.return_value
+        graph = MagicMock()
+        graph.aget_state = AsyncMock(
+            return_value=MagicMock(values={"messages": [MagicMock(id="m1")]})
+        )
+        direct = [MagicMock(name="direct-tool")]
+        bind = AsyncMock(
+            return_value=direct if binds else None,
+            side_effect=None if binds else RuntimeError("relay down"),
+        )
+
+        with (
+            patch(
+                "src.server.database.conversation.get_thread_with_summary",
+                new=AsyncMock(return_value={"workspace_id": "ws-1"}),
+            ),
+            patch(
+                "src.server.services.workspace_manager.WorkspaceManager.get_instance",
+                return_value=manager,
+            ),
+            patch(
+                "ptc_agent.agent.graph.build_ptc_graph_with_session",
+                new=AsyncMock(return_value=graph),
+            ) as build,
+            patch(f"{HANDLER}.turn_base_checkpoint_id", new=AsyncMock(return_value=None)),
+            patch(
+                "src.server.database.user.get_user_profile_for_prompt",
+                new=AsyncMock(return_value={"name": "profile"}),
+            ),
+            patch(
+                "src.server.services.trading_rule.with_trading_rule",
+                side_effect=lambda profile, rule: {**profile, "rule": rule},
+            ),
+            patch("src.server.services.egress.direct_tools.bind_direct_mcp_tools", new=bind),
+        ):
+            agent = await _thread_agent(
+                "thread-1",
+                "compact",
+                config=base_config,
+                checkpointer=MagicMock(),
+                user_id="user-1",
+                held=AsyncExitStack(),
+                role="chief_of_staff",
+            )
+
+        built = build.await_args.kwargs
+        assert built["tool_view"] is view
+        assert built["config"] is base_config
+        assert built["user_id"] == "user-1"
+        assert built["user_profile"] == {"name": "profile", "rule": view.trading_rule}
+        assert built["thread_id"] == "thread-1"
+        assert built["store"] is setup.store
+        # A relay that is down costs the turn its direct tools, not the turn.
+        assert built["direct_mcp"] == (direct if binds else DirectMCPBinding(user_id="user-1"))
+        assert built["role"] == "chief_of_staff"
+        # A session with no sandbox has no folder to bind.
+        assert built["project"] is None and agent.project is None
+        bind.assert_awaited_once_with(session, user_id="user-1", workspace_id="ws-1", view=view)
 
 
 class TestTheBackendsFolder:
@@ -1060,29 +1263,33 @@ class TestTheBackendsFolder:
                  AsyncMock(return_value=None)),
                 ("src.server.database.workspace_folders.workspace_folder_in_use", hold),
                 ("src.server.database.workspace.get_workspace", read_row),
+                # The turn's project is its own read (see resolve_project_context).
+                ("src.server.services.workspace_layout.resolve_project_context",
+                 AsyncMock(return_value=PROJECT)),
             ):
                 stack.enter_context(patch(target, new))
             yield
 
     @pytest.mark.asyncio
     async def test_the_backend_writes_to_the_folder_read_under_the_hold(self, base_config):
-        from src.server.handlers.thread_maintenance import _resolve_graph_and_state
+        from src.server.handlers.thread_maintenance import _thread_agent
 
         events = []
         with self._resolving(events):
             async with AsyncExitStack() as held:
-                *_, backend = await _resolve_graph_and_state(
+                agent = await _thread_agent(
                     "thread-1", "offload", config=base_config, checkpointer=MagicMock(), held=held
                 )
                 events.append("offload")
 
         assert events == ["hold ws-1", "read", "offload", "release"]
-        assert backend.root_dir == "/home/workspace/Macro"
+        assert agent.backend.root_dir == "/home/workspace/Macro"
+        assert agent.project is PROJECT
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("moving", ["staged", "held by a settle"])
     async def test_a_folder_a_settle_is_moving_is_refused_for_a_retry(self, base_config, moving):
-        from src.server.handlers.thread_maintenance import _resolve_graph_and_state
+        from src.server.handlers.thread_maintenance import _thread_agent
 
         events = []
         resolving = self._resolving(
@@ -1092,7 +1299,7 @@ class TestTheBackendsFolder:
         )
         with resolving, pytest.raises(HTTPException) as refused:
             async with AsyncExitStack() as held:
-                await _resolve_graph_and_state(
+                await _thread_agent(
                     "thread-1", "offload", config=base_config, checkpointer=MagicMock(), held=held
                 )
 
@@ -1107,7 +1314,7 @@ async def test_the_session_is_acquired_with_the_workspace_id_as_a_str(base_confi
     """A cold-start /compact failed in asset sync, which encodes the id."""
     import uuid
 
-    from src.server.handlers.thread_maintenance import _resolve_graph_and_state
+    from src.server.handlers.thread_maintenance import _thread_agent
 
     workspace_id = uuid.uuid4()
     received = []
@@ -1131,7 +1338,7 @@ async def test_the_session_is_acquired_with_the_workspace_id_as_a_str(base_confi
         pytest.raises(HTTPException),
     ):
         async with AsyncExitStack() as held:
-            await _resolve_graph_and_state(
+            await _thread_agent(
                 "thread-1", "compact", config=base_config, held=held
             )
 

@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
+import base64
+import io
 import json
+import math
 import re
 import uuid
-from collections.abc import Iterable, Mapping, Sequence
+from collections import OrderedDict
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any
 
 import tiktoken
@@ -32,12 +37,13 @@ from ptc_agent.agent.middleware.skills.registry import (
 from ptc_agent.agent.transcript import TranscriptTarget
 from ptc_agent.agent.transcript.classify import LEGACY_SUMMARY_PREFIX, is_summary_message
 from ptc_agent.agent.transcript.pointer import SummarySpan, transcript_note
-from src.llms.attachment_payload import FILE_BLOCK_TYPES, IMAGE_BLOCK_TYPES
+from src.llms.attachment_payload import FILE_BLOCK_TYPES, IMAGE_BLOCK_TYPES, block_type
 from src.llms.provider_compaction import SIDECAR_KEY, sidecar
 from ptc_agent.agent.middleware.compaction.types import (
     CONTEXT_SUMMARY_PREFIX,
     NON_CRITICAL_READ_PREFIXES,
     CompactionEvent,
+    TokenCounter,
     TRUNCATABLE_TOOLS,
 )
 
@@ -148,6 +154,212 @@ def count_tokens_tiktoken(messages: Iterable[MessageLikeRepresentation]) -> int:
 
         total += len(enc.encode(text)) + 3  # +3 for role/message overhead
     return total
+
+
+# =============================================================================
+# Attachment estimates
+# =============================================================================
+
+#: What one PDF page is counted at where the target's own charge is not known
+#: (``get_pdf_page_tokens``). Anthropic documents 1,500 to 3,000 text tokens a
+#: page, and sends each page as an image besides (about 1,500 tokens for a
+#: letter page scaled to its 1.15 megapixel bound); OpenAI also reads a page as
+#: text plus image, and measured 3,230 a page on an image-heavy paper. The top
+#: of the text range covers a typical page with its image. A denser one runs
+#: past it, and the provider's count of that send corrects the estimate (see
+#: ``CompactionMiddleware._measured_fit``), or its refusal sends the call to
+#: compaction anyway. A vendor that charges far less, as Gemini does, is
+#: counted at its own charge, since this would take out pages it can carry.
+PDF_PAGE_TOKENS = 3_000
+
+#: Anthropic's per-image bound (1,568 px on the long edge, 1.15 megapixels,
+#: a token per 750 px), the most any route charges for one image.
+_IMAGE_MAX_EDGE = 1568
+_IMAGE_MAX_PIXELS = 1_150_000
+_IMAGE_PIXELS_PER_TOKEN = 750
+#: OpenAI's base charge, the least an image costs anywhere.
+_IMAGE_MIN_TOKENS = 85
+#: An image whose size can't be read is counted at the bound.
+_IMAGE_UNKNOWN_TOKENS = 1_600
+
+#: Base64 enough for an image header: PNG's is in its first 24 bytes, a
+#: JPEG's after whatever EXIF precedes it.
+_IMAGE_HEADER_CHARS = 64 * 1024
+
+
+def attachment_tokens(
+    messages: Iterable[Any], cost: Callable[[Any], int] | None = None
+) -> int:
+    """What the image and PDF blocks in ``messages`` cost a provider.
+
+    Apart from ``count_tokens_tiktoken``, which counts an attachment by its
+    short label: that is what the summary model is sent once the attachments
+    are saved to files, while a model reading the history is sent the bytes.
+    ``cost`` is what the target is charged for a block (``target_cost``);
+    None counts every attachment at the default rates.
+    """
+    cost = cost or block_tokens
+    total = 0
+    for msg in messages:
+        content = message_field(msg, "content")
+        if isinstance(content, list):
+            total += sum(cost(block) for block in content)
+    return total
+
+
+def target_cost(
+    sent: Callable[[Any], bool] | None, page_tokens: int | None
+) -> Callable[[Any], int]:
+    """What a target is charged for a block: nothing for one it is not sent
+    as it is, which goes out as a placeholder of a few tokens, and a PDF page
+    at ``page_tokens``, or ``PDF_PAGE_TOKENS`` where that is not known."""
+    per_page = page_tokens or PDF_PAGE_TOKENS
+    return lambda block: block_tokens(block, per_page) if sent is None or sent(block) else 0
+
+
+def block_tokens(block: Any, page_tokens: int = PDF_PAGE_TOKENS) -> int:
+    """One block's cost as an attachment, 0 for anything else."""
+    kind = block_type(block)
+    if kind in FILE_BLOCK_TYPES:
+        # One that can't be read counts as a page.
+        return max(pdf_pages(block) or 1, 1) * page_tokens
+    if kind in IMAGE_BLOCK_TYPES:
+        size = _image_size(block)
+        if size is None:
+            return _IMAGE_UNKNOWN_TOKENS
+        width, height = size
+        scale = min(
+            1.0,
+            _IMAGE_MAX_EDGE / max(width, height, 1),
+            (_IMAGE_MAX_PIXELS / max(width * height, 1)) ** 0.5,
+        )
+        pixels = (width * scale) * (height * scale)
+        return max(_IMAGE_MIN_TOKENS, math.ceil(pixels / _IMAGE_PIXELS_PER_TOKEN))
+    return 0
+
+
+def _inline_base64(block: dict) -> str | None:
+    """The base64 an attachment block carries, in any of its shapes."""
+    if block.get("type") == "image_url":
+        url = (block.get("image_url") or {}).get("url", "")
+        return url.split(";base64,", 1)[1] if ";base64," in url else None
+    data = block.get("base64")
+    source = block.get("source")
+    if data is None and isinstance(source, dict) and source.get("type") == "base64":
+        data = source.get("data")
+    return data if isinstance(data, str) else None
+
+
+#: What was read from an inline attachment, a PDF's page count or an image's
+#: size, by its kind and its base64's hash and length. Each is counted on every
+#: model call, on the event loop, so each is read once rather than per call. A
+#: pure function of the bytes, so a cache per process agrees with every other.
+_PARSED: OrderedDict[tuple[str, int, int], Any] = OrderedDict()
+_PARSED_MAX = 256
+
+
+def _parsed(kind: str, data: str, read: Callable[[str], Any]) -> Any:
+    """``read(data)``, kept in ``_PARSED``; a failed read is kept as None too."""
+    # A string caches its own hash, so a block counted again costs nothing.
+    key = (kind, hash(data), len(data))
+    if key in _PARSED:
+        _PARSED.move_to_end(key)
+        return _PARSED[key]
+    return _keep(key, _read_safely(read, data))
+
+
+def _read_safely(read: Callable[[str], Any], data: str) -> Any:
+    try:
+        return read(data)
+    except Exception:
+        return None
+
+
+def _keep(key: tuple[str, int, int], value: Any) -> Any:
+    _PARSED[key] = value
+    if len(_PARSED) > _PARSED_MAX:
+        _PARSED.popitem(last=False)
+    return value
+
+
+async def read_ahead(messages: Iterable[Any]) -> None:
+    """Read off the event loop what counting ``messages`` would parse on it.
+
+    The counts are synchronous and run on every model call. An attachment
+    with no stamp, such as a PDF checkpointed by an older build, would be
+    decoded and parsed there on its first count, so each one not yet in
+    ``_PARSED`` is read in a worker thread first, and kept on the loop.
+    """
+    misses: dict[tuple[str, int, int], tuple[str, Callable[[str], Any]]] = {}
+    for msg in messages:
+        content = message_field(msg, "content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            kind = block_type(block)
+            if kind in FILE_BLOCK_TYPES and not isinstance(block.get("pages"), int):
+                read, name = _read_pages, "pdf"
+            elif kind in IMAGE_BLOCK_TYPES:
+                read, name = _read_size, "image"
+            else:
+                continue
+            data = _inline_base64(block)
+            if data and (key := (name, hash(data), len(data))) not in _PARSED:
+                misses[key] = (data, read)
+    if not misses:
+        return
+    values = await asyncio.to_thread(
+        lambda: [_read_safely(read, data) for data, read in misses.values()]
+    )
+    for key, value in zip(misses, values):
+        _keep(key, value)
+
+
+def pdf_pages(block: dict) -> int | None:
+    """A PDF block's page count, None when it can't be read.
+
+    The stamp, else parsed: a block checkpointed before the stamp, or one the
+    composer attached inline, carries none. Never guessed from its size, since
+    bytes per page run from a few KB of text to a megabyte of scan.
+    """
+    pages = block.get("pages")
+    if isinstance(pages, int):
+        return pages
+    data = _inline_base64(block)
+    if not data:
+        return None
+    return _parsed("pdf", data, _read_pages)
+
+
+def _read_pages(data: str) -> int:
+    import pypdf
+
+    return len(pypdf.PdfReader(io.BytesIO(base64.b64decode(data))).pages)
+
+
+def _image_size(block: dict) -> tuple[int, int] | None:
+    """An inline image's width and height, read from its header."""
+    data = _inline_base64(block)
+    if not data:
+        return None
+    return _parsed("image", data, _read_size)
+
+
+def _read_size(data: str) -> tuple[int, int] | None:
+    from PIL import Image
+
+    # The header first, the whole image only when it lies past that.
+    for chars in (_IMAGE_HEADER_CHARS, len(data)):
+        head = data[: chars - chars % 4]
+        try:
+            with Image.open(io.BytesIO(base64.b64decode(head))) as img:
+                return img.size
+        except Exception:
+            if chars >= len(data):
+                return None
+    return None
 
 
 # =============================================================================
@@ -681,6 +893,35 @@ def measured_tokens(state: Mapping[str, Any]) -> int | None:
     return cached_input + (state.get("_cached_output_tokens") or 0)
 
 
+def context_tokens(
+    state: Mapping[str, Any],
+    view: Sequence[AnyMessage],
+    counter: TokenCounter,
+    system: Sequence[Any] = (),
+    cost: Callable[[Any], int] | None = None,
+) -> int:
+    """The context ``view`` makes, as the summary trigger reads it: what the
+    last call measured plus an estimate of what has been added since, else
+    an estimate of the whole of it. ``cost`` is as for ``attachment_tokens``.
+
+    The measurement ends at the newest answer, which its output tokens
+    count, so everything after it is new: the results of that answer's tool
+    calls, which are where a Read's attachments land. Reading the measurement
+    alone missed exactly those, and the call that carried them in went out
+    unsummarized however large they were.
+    """
+    measured = measured_tokens(state)
+    if measured is None:
+        whole = [*system, *view]
+        return counter(whole) + attachment_tokens(whole, cost)
+    answered = next(
+        (i for i in range(len(view) - 1, -1, -1) if isinstance(view[i], AIMessage)),
+        None,
+    )
+    added = view[answered + 1 :] if answered is not None else ()
+    return measured + (counter(added) + attachment_tokens(added, cost) if added else 0)
+
+
 def resolve_cutoff_index(messages: Sequence[AnyMessage], event: Mapping[str, Any]) -> int:
     """Where ``event``'s boundary falls in ``messages`` as they are now.
 
@@ -884,6 +1125,41 @@ def summary_source(message: Any) -> str | None:
     """What wrote a summary message (see ``summarize``), as it was stamped."""
     stamp = (getattr(message, "additional_kwargs", None) or {}).get("summarize_complete")
     return stamp.get("source") if isinstance(stamp, dict) else None
+
+
+def handed_off(message: Any) -> bool:
+    """Whether a summary only its provider can read has been written out as
+    text by its model, so its text is a summary rather than a digest."""
+    stamp = (getattr(message, "additional_kwargs", None) or {}).get("summarize_complete")
+    return isinstance(stamp, dict) and stamp.get("handed_off") is True
+
+
+def with_summary_text(message: HumanMessage, text: str) -> HumanMessage | None:
+    """``message``, a summary message, with ``text`` in place of its summary
+    and everything after it (the transcript pointer, the notes) kept; None for
+    a message not built by ``build_summary_message``.
+
+    The id is kept, so the marker that names the summary still finds it. What
+    the provider is sent in its place is the sidecar, which stays as it was.
+    """
+    content = message.content if isinstance(message.content, str) else ""
+    if not content.startswith(CONTEXT_SUMMARY_PREFIX):
+        return None
+    after = content[len(CONTEXT_SUMMARY_PREFIX) + len(parse_summary_message(message)) :]
+    stamp = message.additional_kwargs.get("summarize_complete") or {}
+    return message.model_copy(
+        update={
+            "content": f"{CONTEXT_SUMMARY_PREFIX}{text}{after}",
+            "additional_kwargs": {
+                **message.additional_kwargs,
+                "summarize_complete": {
+                    **stamp,
+                    "summary_length": len(text),
+                    "handed_off": True,
+                },
+            },
+        }
+    )
 
 
 def parse_summary_message(message: HumanMessage) -> str:

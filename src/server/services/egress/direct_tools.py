@@ -23,7 +23,7 @@ import json
 import logging
 import re
 import warnings
-from collections.abc import AsyncIterator, Awaitable, Sequence
+from collections.abc import AsyncIterator, Sequence
 from contextlib import AsyncExitStack, aclosing
 from dataclasses import dataclass, field
 from hashlib import sha1
@@ -633,32 +633,46 @@ async def prepare_direct_mcp_tools(
 
 
 async def direct_tools_for_turn(
-    binding: Awaitable[DirectMCPBinding],
+    session: "Session",
+    *,
+    user_id: str | None,
+    workspace_id: str,
+    view: "WorkspaceToolView | None" = None,
+) -> DirectMCPBinding:
+    """A turn's direct toolset, bound but not opened (the run opens it,
+    ``drive``).
+
+    A binder that fails costs the turn its direct tools and not the turn: the
+    rest of the toolset is still reachable through the sandbox.
+    """
+    try:
+        return await bind_direct_mcp_tools(
+            session, user_id=user_id, workspace_id=workspace_id, view=view
+        )
+    except Exception:
+        logger.warning("[DIRECT_MCP] binding failed; running without", exc_info=True)
+        return DirectMCPBinding(user_id=user_id)
+
+
+def order_ledger_for_turn(
     *,
     user_id: str | None,
     workspace_id: str,
     thread_id: str,
     run_id: str,
     turn_index: int,
-) -> tuple[DirectMCPBinding, "OrderAttemptLedger | None"]:
-    """This turn's direct toolset, and the ledger its orders are written to.
+) -> "OrderAttemptLedger | None":
+    """The ledger a turn's orders are written to, None without a user.
 
-    A binder that fails costs the turn its direct tools and not the turn: the
-    rest of the toolset is still reachable through the sandbox. The ledger carries ids only, because every
-    transition it makes is a guarded statement against the row: the worker that
-    ends up holding the tool call is never assumed to be the one that proposed
-    it.
+    It carries ids only, because every transition it makes is a guarded
+    statement against the row: the worker that ends up holding the tool call
+    is never assumed to be the one that proposed it.
     """
     from src.server.services.egress.order_ledger import OrderAttemptLedger
 
-    try:
-        bound = await binding
-    except Exception:
-        logger.warning("[DIRECT_MCP] binding failed; running without", exc_info=True)
-        bound = DirectMCPBinding(user_id=user_id)
     if not user_id:
-        return bound, None
-    return bound, OrderAttemptLedger(
+        return None
+    return OrderAttemptLedger(
         user_id=user_id,
         workspace_id=workspace_id,
         thread_id=thread_id,

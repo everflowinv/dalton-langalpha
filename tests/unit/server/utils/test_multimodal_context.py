@@ -13,6 +13,7 @@ from src.server.utils.multimodal_context import (
     build_attachment_metadata,
     inject_multimodal_context,
     parse_multimodal_contexts,
+    pdf_page_counts,
 )
 from src.utils.storage import sanitize_storage_key
 
@@ -336,3 +337,40 @@ class TestInjectMultimodalContext:
         assert isinstance(result[3]["content"], list)
         # First user message untouched
         assert result[1]["content"] == "first"
+
+
+class TestPdfPageCounts:
+    @pytest.mark.asyncio
+    async def test_a_request_counts_its_pdfs_in_one_thread(self):
+        """A thread per PDF would hold as many of the shared executor's workers
+        as one request carries PDFs."""
+        import base64
+        import io
+        import threading
+        import time
+
+        import pypdf
+
+        def pdf(pages: int) -> str:
+            writer = pypdf.PdfWriter()
+            for _ in range(pages):
+                writer.add_blank_page(width=612, height=792)
+            out = io.BytesIO()
+            writer.write(out)
+            return "data:application/pdf;base64," + base64.b64encode(out.getvalue()).decode()
+
+        contexts = [
+            *(MultimodalContext(type="pdf", data=pdf(n)) for n in (1, 2, 3)),
+            MultimodalContext(type="image", data="data:image/png;base64,abc"),
+        ]
+        threads = set()
+        real = pypdf.PdfReader
+
+        def reader(stream, *args, **kwargs):
+            threads.add(threading.current_thread())
+            time.sleep(0.02)  # long enough that a parse per thread would overlap
+            return real(stream, *args, **kwargs)
+
+        with patch.object(pypdf, "PdfReader", reader):
+            assert await pdf_page_counts(contexts) == [1, 2, 3, None]
+        assert len(threads) == 1 and threading.main_thread() not in threads

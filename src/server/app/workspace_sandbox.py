@@ -34,10 +34,10 @@ from src.server.database.workspace import (
     get_workspace_dir_name as db_get_workspace_dir_name,
 )
 from src.server.database.workspace_folders import is_top_level, workspace_folder_in_use
-from src.server.app.workspace_files._shared import (
+from src.server.app.workspace_files._shared import work_dir_for
+from src.server.services.workspace_files import (
     held_workspace_row,
     owned_workspace_on_computer,
-    work_dir_for,
 )
 from src.server.services.workspace_layout import WorkspaceLayoutUnavailable
 from src.server.utils.error_sanitization import sandbox_failure_http

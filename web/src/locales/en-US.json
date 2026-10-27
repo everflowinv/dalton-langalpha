@@ -1960,6 +1960,7 @@
       "pickFailed": "Couldn't change this thread's model",
       "retired": "{{model}} is no longer available. This thread now uses {{fallback}}.",
       "offer": "This thread uses {{model}}. New threads start on {{defaultModel}}.",
+      "handoff": "OpenAI compacted part of this thread into a summary only its models can read. The previous model is writing it out for {{model}}, so your next message may take a little longer to start.",
       "makeDefault": "Make {{model}} my default"
     },
     "backgroundTasksRunning": "Background tasks are still running",
@@ -2217,6 +2218,10 @@
     "compacting": "Compacting conversation...",
     "compactingTokens": "{{value}} tokens written",
     "offloading": "Offloading context...",
+    "turnHeld": {
+      "handoff": "Waiting for the previous model to write out its summary...",
+      "other": "Waiting for the current operation on this conversation to finish..."
+    },
     "compactionStopped": "Compaction stopped",
     "queuedSend": "Message queued — sends when compaction finishes",
     "automationWaiting": "{{name}} is due. It runs when this turn ends.",
@@ -2524,6 +2529,8 @@
     "uploadingNth": "Uploading {{current}} / {{total}}: {{name}} — {{percent}}%",
     "uploadFailedSummary_one": "1 file failed to upload: {{details}}",
     "uploadFailedSummary_other": "{{count}} files failed to upload: {{details}}",
+    "cancelUpload": "Cancel upload",
+    "uploadSendFailed": "The file could not be sent. Check your connection and try again.",
     "backupFiles": "Backup files to database",
     "backupOff": "File backup is off for this computer.",
     "backupSummary_one": "Backed up 1 file",

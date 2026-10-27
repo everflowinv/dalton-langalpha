@@ -40,7 +40,7 @@ _M = "src.server.app.share_links"
 _DBWS = f"{_M}.db_get_workspace"
 # What a workspace's own share routes read the row through, Home's guard
 # included.
-_OWNED_DBWS = "src.server.app.workspace_files._shared.db_get_workspace"
+_OWNED_DBWS = "src.server.services.workspace_files.db_get_workspace"
 _GET_LINK = f"{_M}.get_link"
 _CREATE = f"{_M}.ensure_file_link"
 _SET_SHARED = f"{_M}.set_shared"

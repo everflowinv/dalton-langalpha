@@ -155,6 +155,71 @@ class TestPTCSandboxDelegation:
 
     @patch("ptc_agent.core.sandbox.ptc_sandbox.create_provider")
     @pytest.mark.asyncio
+    async def test_a_capped_download_starts_over_after_a_transient_failure(
+        self, mock_create_provider, mock_provider, mock_runtime
+    ):
+        """Nothing has left before the download ends, so a reset mid-file is
+        retried from the start, as the whole-file download is."""
+        from ptc_agent.core.sandbox.ptc_sandbox import PTCSandbox
+
+        mock_create_provider.return_value = mock_provider
+        mock_provider.is_transient_error = MagicMock(
+            side_effect=lambda e: isinstance(e, ConnectionResetError)
+        )
+        attempts = []
+
+        async def stream(path):
+            attempts.append(path)
+            yield b"%PDF-1.7 "
+            if len(attempts) == 1:
+                raise ConnectionResetError("connection reset")
+            yield b"rest"
+
+        mock_runtime.download_file_stream = stream
+        sandbox = PTCSandbox(config=_make_config())
+        sandbox.runtime = mock_runtime
+
+        with patch("asyncio.sleep", new=AsyncMock()):
+            data = await sandbox.adownload_file_bytes_capped("/w/r.pdf", lambda head: 1024)
+
+        assert data == b"%PDF-1.7 rest"
+        assert attempts == ["/w/r.pdf", "/w/r.pdf"]
+
+    @patch("ptc_agent.core.sandbox.ptc_sandbox.create_provider")
+    @pytest.mark.asyncio
+    async def test_a_capped_download_stops_at_the_cap_and_holds_a_download_slot(
+        self, mock_create_provider, mock_provider, mock_runtime
+    ):
+        from ptc_agent.core.sandbox.files import FileOverCap
+        from ptc_agent.core.sandbox.ptc_sandbox import PTCSandbox
+
+        mock_create_provider.return_value = mock_provider
+        sandbox = PTCSandbox(config=_make_config())
+        sandbox.runtime = mock_runtime
+        free = []
+        closed = []
+
+        async def stream(path):
+            try:
+                while True:
+                    free.append(sandbox._download_semaphore._value)
+                    yield b"x" * 512
+            finally:
+                closed.append(path)
+
+        mock_runtime.download_file_stream = stream
+
+        with pytest.raises(FileOverCap) as raised:
+            await sandbox.adownload_file_bytes_capped("/w/big.png", lambda head: 1024)
+
+        assert raised.value.limit == 1024
+        assert closed == ["/w/big.png"]
+        # One slot taken while it read, given back after.
+        assert set(free) == {3}
+        assert sandbox._download_semaphore._value == 4
+
+    @patch("ptc_agent.core.sandbox.ptc_sandbox.create_provider")
+    @pytest.mark.asyncio
     async def test_als_directory_routes_to_runtime(
         self, mock_create_provider, mock_provider, mock_runtime
     ):

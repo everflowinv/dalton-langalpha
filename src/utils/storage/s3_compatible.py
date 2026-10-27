@@ -598,42 +598,120 @@ def create_signed_multipart_upload(
         # rejected outright. The caller's single-PUT signature covers this.
         return None
     part_count = -(-content_length // part_size)
+    upload_id = open_multipart_upload(key, content_type=content_type)
+    if upload_id is None:
+        return None
+
+    parts: list[dict[str, Any]] = []
+    for number in range(1, part_count + 1):
+        offset = (number - 1) * part_size
+        size = min(part_size, content_length - offset)
+        url = sign_upload_part(
+            key, upload_id, part_number=number, size=size, expires_in=expires_in
+        )
+        if url is None:
+            # Nothing has been uploaded yet, but the open upload would sit as
+            # an invisible partial object until a lifecycle rule reaped it.
+            abort_multipart_upload(key, upload_id)
+            return None
+        parts.append({"part_number": number, "offset": offset, "size": size, "url": url})
+    return upload_id, parts
+
+
+def open_multipart_upload(key: str, *, content_type: str) -> str | None:
+    """Start a multipart upload under ``key``; its upload id, or ``None`` if refused."""
     try:
-        client = _get_client()
-        created = client.create_multipart_upload(
+        created = _get_client().create_multipart_upload(
             Bucket=StorageConfig.BUCKET_NAME, Key=key, ContentType=content_type
         )
-        upload_id = created["UploadId"]
+        return created["UploadId"]
     except Exception as e:
         logger.error(f"Failed to open a multipart upload for {key}: {e}")
         return None
 
-    parts: list[dict[str, Any]] = []
+
+def sign_upload_part(
+    key: str,
+    upload_id: str,
+    *,
+    part_number: int,
+    size: int,
+    expires_in: int = 900,
+    for_browser: bool = False,
+) -> str | None:
+    """Presign one part's PUT with its length signed in; ``None`` if signing failed.
+
+    The length binds the body, so whoever holds the URL writes exactly that
+    many bytes to that part or nothing. ``for_browser`` signs for
+    ``STORAGE_BROWSER_ENDPOINT_URL`` when one is set, as a download link does.
+    """
     try:
-        for number in range(1, part_count + 1):
-            offset = (number - 1) * part_size
-            size = min(part_size, content_length - offset)
-            url = client.generate_presigned_url(
-                "upload_part",
-                Params={
-                    "Bucket": StorageConfig.BUCKET_NAME,
-                    "Key": key,
-                    "UploadId": upload_id,
-                    "PartNumber": number,
-                    "ContentLength": size,
-                },
-                ExpiresIn=expires_in,
-            )
-            parts.append(
-                {"part_number": number, "offset": offset, "size": size, "url": url}
-            )
+        client = _get_browser_client() if for_browser else _get_client()
+        return client.generate_presigned_url(
+            "upload_part",
+            Params={
+                "Bucket": StorageConfig.BUCKET_NAME,
+                "Key": key,
+                "UploadId": upload_id,
+                "PartNumber": part_number,
+                "ContentLength": size,
+            },
+            ExpiresIn=expires_in,
+        )
     except Exception as e:
-        # Nothing has been uploaded yet, but the open upload would sit as an
-        # invisible partial object until a lifecycle rule reaped it.
-        logger.error(f"Failed to presign multipart parts for {key}: {e}")
-        abort_multipart_upload(key, upload_id)
+        logger.error(f"Failed to presign part {part_number} of {key}: {e}")
         return None
-    return upload_id, parts
+
+
+def list_uploaded_parts(key: str, upload_id: str) -> list[dict[str, Any]] | None:
+    """The parts the store holds for an open upload, in order, as it counts them.
+
+    Each is ``{"part_number", "size", "etag"}``. ``None`` when the store cannot
+    say, including for an upload that no longer exists. Read from the store
+    rather than taken from the uploader, so assembling never trusts a client's
+    word for which parts arrived or how large they were.
+    """
+    parts: list[dict[str, Any]] = []
+    marker = 0
+    try:
+        client = _get_client()
+        while True:
+            page = client.list_parts(
+                Bucket=StorageConfig.BUCKET_NAME,
+                Key=key,
+                UploadId=upload_id,
+                PartNumberMarker=marker,
+            )
+            for part in page.get("Parts") or []:
+                parts.append(
+                    {
+                        "part_number": int(part["PartNumber"]),
+                        "size": int(part["Size"]),
+                        "etag": part["ETag"],
+                    }
+                )
+            if not page.get("IsTruncated"):
+                break
+            marker = int(page["NextPartNumberMarker"])
+    except Exception as e:
+        logger.error(f"Failed to list the parts of {key}: {e}")
+        return None
+    parts.sort(key=lambda p: p["part_number"])
+    return parts
+
+
+def object_size(key: str) -> int | None:
+    """The stored object's length, or ``None`` when there is none or the store did not say."""
+    try:
+        head = _get_client().head_object(Bucket=StorageConfig.BUCKET_NAME, Key=key)
+        return int(head["ContentLength"])
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") not in ("404", "NoSuchKey"):
+            logger.error(f"Failed to read the size of {key}: {e}")
+        return None
+    except Exception as e:
+        logger.error(f"Failed to read the size of {key}: {e}")
+        return None
 
 
 def complete_multipart_upload(
@@ -697,10 +775,11 @@ def sha256_object(
 def abort_multipart_upload(key: str, upload_id: str) -> bool:
     """Discard an unfinished multipart upload and the parts already stored.
 
-    Returns whether the store agreed. An upload left open holds its parts as
-    an object nothing lists and no registry row references, so a caller that
-    cannot reach this, or gets ``False`` back, has leaked storage that only
-    the bucket's lifecycle rule will reap.
+    Returns whether the store agreed, which an upload it no longer knows
+    counts as: aborted before, or assembled, it holds no parts. An upload left
+    open holds its parts as an object nothing lists and no registry row
+    references, so a caller that cannot reach this, or gets ``False`` back,
+    has leaked storage that only the bucket's lifecycle rule will reap.
     """
     try:
         client = _get_client()
@@ -708,6 +787,14 @@ def abort_multipart_upload(key: str, upload_id: str) -> bool:
             Bucket=StorageConfig.BUCKET_NAME, Key=key, UploadId=upload_id
         )
         return True
+    except ClientError as e:
+        if (
+            e.response.get("Error", {}).get("Code") == "NoSuchUpload"
+            or e.response.get("ResponseMetadata", {}).get("HTTPStatusCode") == 404
+        ):
+            return True
+        logger.error(f"Failed to abort multipart upload for {key}: {e}")
+        return False
     except Exception as e:
         logger.error(f"Failed to abort multipart upload for {key}: {e}")
         return False

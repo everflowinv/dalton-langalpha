@@ -243,3 +243,16 @@ class TestListModelsResponse:
         assert metadata["claude-opus-5-5-oauth"]["provider"] == "claude-oauth"
         assert kinds.get("claude-opus-5-5-oauth") is None
         assert kinds["gpt-6-luna-oauth"] == "openai"
+
+
+def test_key_candidates_name_where_a_turn_looks_for_each_providers_key():
+    """The client reads these to tell which saved models the user's keys
+    serve: a coding-plan key is looked for beside its brand's, but its vendor
+    issues it apart, so it serves the brand's models only with a base URL."""
+    from src.server.app.api_keys import _build_key_candidates
+
+    _build_key_candidates.cache_clear()
+    moonshot = _build_key_candidates()["moonshot"]
+
+    assert moonshot["slugs"] == ["moonshot", "moonshot-coding"]
+    assert moonshot["shared"] == ["moonshot"]

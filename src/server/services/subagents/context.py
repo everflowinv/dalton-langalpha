@@ -70,7 +70,7 @@ class SubagentContext:
         Shared with the per-turn merge so a model the pane accepts is one the
         turn runs, and a key or subscription for its provider lifts the plan.
         """
-        from src.server.services.llm.subagents import model_on_plan
+        from src.server.services.llm.availability import model_on_plan
 
         return await model_on_plan(
             self.user_id, name, model_pref=self.model_pref, permits=self.permits,

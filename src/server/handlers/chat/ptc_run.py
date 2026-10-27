@@ -21,6 +21,7 @@ from fastapi import HTTPException
 from langgraph.types import Command
 
 from ptc_agent.core.project_context import ProjectContext, run_with_project
+from src.config.settings import get_sse_keepalive_interval
 from src.server.app import setup
 from src.server.database.conversation.threads_read import (
     read_thread_subagents_allowed,
@@ -37,7 +38,6 @@ from src.server.models.chat import (
 from src.server.services.background_registry_store import BackgroundRegistryStore
 from src.server.services.runs.executor import LocalRunExecutor
 from src.server.services.workspace_manager import WorkspaceManager
-from src.server.services.workspace_layout import resolve_project_placement
 from src.observability import (
     chat_turn_phase_duration_ms,
     safe_record,
@@ -112,28 +112,10 @@ from .run_stream_reader import stream_from_log
 from .detached import fire_and_forget as _fire_and_forget
 
 
-async def _resolve_project(session, workspace_id: str) -> ProjectContext | None:
-    """The workspace folder this turn runs in, for the sandbox path layer.
-
-    One read: the folder, and the folders parked beside it on the same machine
-    so the agent can name a sibling directory as someone else's work rather
-    than as material it is expected to read.
-
-    Propagates ``WorkspaceLayoutUnavailable``, which fails the turn. The turn
-    would otherwise run at the computer root, where it writes into a shared
-    directory and mirrors every sibling's files back as its own.
-    """
-    sandbox = getattr(session, "sandbox", None)
-    if sandbox is None:
-        return None
-    placement = await resolve_project_placement(workspace_id, root=sandbox.working_dir)
-    return ProjectContext(
-        workspace_id=workspace_id,
-        dir_name=placement.dir_name,
-        sibling_dir_names=placement.sibling_dir_names,
-        layout_origin=placement.layout_origin,
-        previous_dir_names=placement.previous_dir_names,
-    )
+def _turn_held(data: dict) -> str:
+    """A ``turn_held`` frame. Id 0 like ``workspace_status``: it comes before
+    the run has a stream to resume, so no cursor counts it."""
+    return f"id: 0\nevent: turn_held\ndata: {json.dumps(data)}\n\n"
 
 
 async def _resolve_origin_meta(request, thread_id: str) -> dict:
@@ -294,9 +276,21 @@ async def astream_ptc_workflow(
         # registered anywhere yet; its row commits at START, below).
         if needs_startup:
             await manager.cancel_stale_workflow(thread_id)
+        from src.server.services.thread_mutation import ThreadMutationRunner
+
+        # A send held behind a thread mutation (a /compact, the hand-off at a
+        # model switch) is told why it waits, as a cold start is. Not a
+        # dispatch's primer or a steer probe, which read the first frame as
+        # their answer.
+        held_by = (
+            None
+            if dispatched or request.steer_only
+            else await ThreadMutationRunner.get_instance().holding_verb(thread_id)
+        )
         # Admit a fresh turn, steer the running one, or 409 — see
         # ``wait_or_steer``; who may steer at all is ``steer_allowed``.
-        ready, steering_event = await wait_or_steer(
+        admit = partial(
+            wait_or_steer,
             manager,
             thread_id,
             user_input,
@@ -313,6 +307,21 @@ async def astream_ptc_workflow(
                 request, dispatched=dispatched, steerable=steerable
             ),
         )
+        if held_by is None:
+            ready, steering_event = await admit()
+        else:
+            yield _turn_held({"status": "held", "reason": held_by})
+            waiting = asyncio.ensure_future(admit())
+            try:
+                # The wait can outlast an edge proxy's idle cutoff, so the
+                # stream shows it is alive until the turn is admitted.
+                beat = get_sse_keepalive_interval()
+                while not (await asyncio.wait({waiting}, timeout=beat))[0]:
+                    yield ":keepalive\n\n"
+                ready, steering_event = waiting.result()
+            finally:
+                waiting.cancel()
+            yield _turn_held({"status": "released"})
         if not ready:
             await scope.release_slot()
             # Release admission immediately — no workflow will register
@@ -647,36 +656,26 @@ async def astream_ptc_workflow(
         # Build graph with the workspace's session
         # Note: agent.md is injected by the runtime-context baseline middleware
         # on every model call, ensuring it's always the latest content.
-        from src.server.services.preview_links import cache_tool_preview
-        from src.server.services.egress.direct_tools import (
-            bind_direct_mcp_tools,
-            direct_tools_for_turn,
-        )
-        from src.server.services.trading_rule import with_trading_rule
+        from src.server.services.egress.direct_tools import order_ledger_for_turn
+        from src.server.services.thread_agent import AgentInputs
         from src.server.services.wakeups.cancel_notice import ThreadCancelNotices
 
-        # Resolved once and used three times: the agent build mounts the
-        # workspace's memory off it, the post-turn reconcile materialises that
-        # folder's skills, and the run's own task binds it for the path layer.
-        project = await _resolve_project(session, workspace_id)
-
-        # Frozen for this project at acquire; the session's own MCP fields are
-        # whichever sibling on the machine resolved last.
-        tool_view = workspace_manager.tool_view(session, workspace_id)
-
-        # One relay session per directly bound server, held for the run.
-        direct_mcp, order_ledger = await direct_tools_for_turn(
-            bind_direct_mcp_tools(
-                session, user_id=user_id, workspace_id=workspace_id, view=tool_view
-            ),
+        # What shapes the prompt and the tools, read as a call between turns
+        # reads it. Its project is resolved once and used three times: the
+        # agent build mounts the workspace's memory off it, the post-turn
+        # reconcile materialises that folder's skills, and the run's own task
+        # binds it for the path layer.
+        inputs = await AgentInputs.read(
+            session,
             user_id=user_id,
             workspace_id=workspace_id,
             thread_id=thread_id,
-            run_id=run_id,
-            turn_index=run_handle.turn_index,
+            role=route.role,
+            user_profile=user_profile,
         )
-        # Off the resolve, not the bind, so it moves only when a setting does.
-        user_profile = with_trading_rule(user_profile, tool_view.trading_rule)
+        project = inputs.project
+        # One relay session per directly bound server, held for the run.
+        direct_mcp = inputs.direct_mcp
 
         ptc_graph = await build_ptc_graph_with_session(
             session=session,
@@ -695,17 +694,15 @@ async def astream_ptc_workflow(
             # each background subagent takes exclusive N(thread, task:id) on
             # the run's pinned session before it may write.
             namespace_owner=run_handle.guard,
-            user_id=user_id,
-            user_profile=user_profile,
-            thread_id=thread_id,
-            store=setup.store,
-            on_signed_url=partial(cache_tool_preview, workspace_id=workspace_id),
-            direct_mcp=direct_mcp,
-            order_ledger=order_ledger,
+            **inputs.build_kwargs(),
+            order_ledger=order_ledger_for_turn(
+                user_id=user_id,
+                workspace_id=workspace_id,
+                thread_id=thread_id,
+                run_id=run_id,
+                turn_index=run_handle.turn_index,
+            ),
             turn_context=turn_context,
-            project=project,
-            tool_view=tool_view,
-            role=route.role,
             # A port, not a value: the switch can flip mid-turn from any
             # worker, so the agent re-reads the row on every call.
             subagent_switch=partial(read_thread_subagents_allowed, thread_id),

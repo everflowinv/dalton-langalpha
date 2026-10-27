@@ -173,11 +173,13 @@ export async function deleteWorkspaceFiles(workspaceId: string, paths: string[])
 
 // --- Sandbox ---
 
+/** Sends the file in one request through the backend; `beginWorkspaceUpload` says when this is the path. */
 export async function uploadWorkspaceFile(
   workspaceId: string,
   file: File,
   destPath: string | null = null,
-  onProgress: ((percent: number) => void) | null = null
+  onProgress: ((percent: number) => void) | null = null,
+  signal?: AbortSignal,
 ) {
   const formData = new FormData();
   formData.append('file', file);
@@ -187,12 +189,105 @@ export async function uploadWorkspaceFile(
     formData,
     {
       params,
+      signal,
       onUploadProgress: onProgress
         ? (e) => onProgress(Math.round((e.loaded * 100) / (e.total || 1)))
         : undefined,
     }
   );
   return data;
+}
+
+export type UploadBegin =
+  | { mode: 'relay' }
+  | {
+    mode: 'direct';
+    upload_id: string;
+    /** Where the file will land, relative to the workspace folder. */
+    path: string;
+    part_size: number;
+    part_count: number;
+    expires_at: string;
+  };
+
+export interface SignedUploadPart {
+  part_number: number;
+  offset: number;
+  size: number;
+  url: string;
+}
+
+export interface UploadStatus {
+  upload_id: string;
+  state: 'uploading' | 'completing' | 'pulling' | 'done' | 'failed' | 'aborted';
+  path: string;
+  size: number;
+  error: string | null;
+}
+
+const uploadsPath = (workspaceId: string, uploadId?: string) =>
+  `/api/v1/workspaces/${workspaceId}/files/uploads${uploadId ? `/${uploadId}` : ''}`;
+
+export async function beginWorkspaceUpload(
+  workspaceId: string,
+  body: { path: string; size: number; sha256?: string },
+  signal?: AbortSignal,
+): Promise<UploadBegin> {
+  const { data } = await api.post(uploadsPath(workspaceId), body, { signal });
+  return data as UploadBegin;
+}
+
+export async function signWorkspaceUploadParts(
+  workspaceId: string,
+  uploadId: string,
+  partNumbers: number[],
+  signal?: AbortSignal,
+): Promise<{ parts: SignedUploadPart[]; expires_in: number }> {
+  const { data } = await api.post(`${uploadsPath(workspaceId, uploadId)}/parts`, { part_numbers: partNumbers }, { signal });
+  return data;
+}
+
+export async function completeWorkspaceUpload(
+  workspaceId: string,
+  uploadId: string,
+  signal?: AbortSignal,
+): Promise<UploadStatus> {
+  const { data } = await api.post(`${uploadsPath(workspaceId, uploadId)}/complete`, undefined, { signal });
+  return data as UploadStatus;
+}
+
+export async function getWorkspaceUpload(
+  workspaceId: string,
+  uploadId: string,
+  signal?: AbortSignal,
+): Promise<UploadStatus> {
+  const { data } = await api.get(uploadsPath(workspaceId, uploadId), { signal });
+  return data as UploadStatus;
+}
+
+export async function cancelWorkspaceUpload(workspaceId: string, uploadId: string): Promise<void> {
+  await api.delete(uploadsPath(workspaceId, uploadId));
+}
+
+/**
+ * Ends an upload as the page goes away. A keepalive request outlives the page
+ * that sent it, where the API client's would be cut off with the page; the
+ * caller hands over the auth headers, since there is no time left to fetch them.
+ */
+export function cancelWorkspaceUploadOnUnload(
+  workspaceId: string,
+  uploadId: string,
+  headers: Record<string, string>,
+): void {
+  try {
+    void fetch(api.getUri({ url: uploadsPath(workspaceId, uploadId) }), {
+      method: 'DELETE',
+      keepalive: true,
+      headers,
+    }).catch(() => {});
+  } catch {
+    /* best effort: the row still expires */
+  }
 }
 
 // --- Vault Secrets ---

@@ -34,7 +34,7 @@ from src.server.dependencies.usage_limits import (
     get_capacity_status,
     get_entitlement_statuses,
 )
-from src.server.app.background_starts import schedule_start
+from src.server.services.background_starts import schedule_start
 from src.server.app.status_stream import (
     SSE_HEADERS,
     sse_status_event,
@@ -938,7 +938,7 @@ async def refresh_workspace(
         # rather than spelling a fourth variant of this 503 here.
         raise
     except Exception as e:
-        # Everything else answers as _acquire_sandbox does, never with the raw
+        # Everything else answers as acquire_sandbox does, never with the raw
         # text: this is the same call, and its exceptions quote provider URLs
         # and sandbox ids.
         raise sandbox_failure_http(e) from None

@@ -84,4 +84,7 @@ def build_model_resilience_middleware(
         initial_delay=1.0,
         max_delay=60.0,
         jitter=True,
+        # Every stack built from this config mounts compaction outside
+        # resilience exactly when it is on.
+        compacts_overflow=config.compaction.enabled,
     )

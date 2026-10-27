@@ -53,6 +53,9 @@ vi.mock('@/hooks/useAllModels', () => ({
     metadata: {},
     isLoading: false,
     systemDefaults: { default_model: 'model-default', background_model: '' },
+    offPlanModels: new Set(),
+    platform: { model_tier: 0, byok_providers: [], oauth_providers: [] },
+    rawApiResponse: {},
   }),
 }));
 

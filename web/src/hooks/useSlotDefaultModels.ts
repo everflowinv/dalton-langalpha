@@ -1,6 +1,7 @@
 import { useAllModels } from './useAllModels';
 import { usePreferences } from './usePreferences';
 import { slotDefaultModel, modelPrefs, type ModelSlot } from '@/lib/modelPreferences';
+import { isPlatformMode } from '@/config/hostMode';
 
 /**
  * The account's default model for each slot, as the composer, the
@@ -23,7 +24,19 @@ export function useSlotDefaultModels(): Record<ModelSlot, string | null> {
   };
 }
 
-/** The account's Default slot, which every composer and thread starts on. */
+/**
+ * The model every composer and thread starts on: the account's Default slot,
+ * or the deployment's while the user's plan does not cover the saved one. A
+ * downgrade leaves the paid model saved, and the server refuses a turn that
+ * would run it on the platform's key.
+ *
+ * `null` until the catalog and the plan's answer load, and on a platform where
+ * either did not come, since without both an off-plan model reads as on plan;
+ * a send naming none runs what the server resolves.
+ */
 export function useDefaultModel(): string | null {
-  return useSlotDefaultModels().default;
+  const saved = useSlotDefaultModels().default;
+  const { offPlanModels, systemDefaults, platform, rawApiResponse, isLoading } = useAllModels();
+  if (saved === null || isLoading || (isPlatformMode && !(platform && rawApiResponse))) return null;
+  return offPlanModels.has(saved) ? systemDefaults?.default_model ?? null : saved;
 }

@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from typing import Any, Mapping, Optional
 
 from ptc_agent.core.paths import SandboxLayout, WorkspaceLayout
+from ptc_agent.core.project_context import ProjectContext
 
 from src.server.database.workspace import get_workspace_dir_name
 from src.server.database.workspace_folders import (
@@ -121,6 +122,31 @@ async def resolve_project_placement(
             f"Could not read the folder for workspace {workspace_id}: {e}"
         ) from e
     return placement_from_binding(workspace_id, binding, root=root)
+
+
+async def resolve_project_context(session: Any, workspace_id: str) -> ProjectContext | None:
+    """The workspace folder a turn on ``workspace_id`` runs in, for the
+    sandbox path layer; None for a session with no sandbox.
+
+    One read: the folder, and the folders parked beside it on the same machine
+    so the agent can name a sibling directory as someone else's work rather
+    than as material it is expected to read.
+
+    Propagates ``WorkspaceLayoutUnavailable``, which fails the turn. The turn
+    would otherwise run at the computer root, where it writes into a shared
+    directory and mirrors every sibling's files back as its own.
+    """
+    sandbox = getattr(session, "sandbox", None)
+    if sandbox is None:
+        return None
+    placement = await resolve_project_placement(workspace_id, root=sandbox.working_dir)
+    return ProjectContext(
+        workspace_id=workspace_id,
+        dir_name=placement.dir_name,
+        sibling_dir_names=placement.sibling_dir_names,
+        layout_origin=placement.layout_origin,
+        previous_dir_names=placement.previous_dir_names,
+    )
 
 
 async def resolve_workspace_layout(

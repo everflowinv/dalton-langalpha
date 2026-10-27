@@ -92,6 +92,7 @@ vi.mock('../../hooks/useChatMessages', async (importOriginal) => ({
     awaitingReportBack: false,
     reportBackOwed: false,
     workspaceStarting: false,
+    turnHeld: null,
     isCompacting: false,
     setIsCompacting: vi.fn(),
     queuedSend: null,

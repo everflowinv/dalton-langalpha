@@ -6,6 +6,9 @@ pair so that:
 - non-retryable errors (bad request / auth / unknown model, or a crash in
   parsing the response) skip straight to the next fallback model instead of
   burning retries on a call that cannot succeed,
+- a context overflow moves on only to a fallback with a larger window, and
+  otherwise goes up to compaction, the one thing that makes the request
+  smaller, when the stack has compaction,
 - every retry and fallback switch is emitted as a custom stream event
   (``model_retry`` / ``model_fallback``) for the client to render, and
 - on total exhaustion the PRIMARY model's exception is re-raised with the full
@@ -16,8 +19,12 @@ pair so that:
 from __future__ import annotations
 
 import asyncio
+import math
 import random
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, NoReturn
 
@@ -31,6 +38,7 @@ from langchain.agents.middleware.types import (
 
 from src.llms.error_classification import (
     extract_status_code,
+    is_context_overflow,
     is_mid_stream_error,
     is_retryable_error,
     is_stalled_stream,
@@ -49,6 +57,21 @@ logger = structlog.get_logger(__name__)
 RESILIENCE_TRACE_ATTR = "__model_resilience__"
 
 _ERROR_SUMMARY_MAX_CHARS = 300
+
+_as_sent: ContextVar[bool] = ContextVar("model_resilience_as_sent", default=False)
+
+
+@contextmanager
+def as_sent() -> Iterator[None]:
+    """Model calls made inside go to the primary as sent, retried but never
+    moved to a fallback or stripped of reasoning: for an answer only that
+    model reading that request can give, such as a summary of what only its
+    provider can read."""
+    token = _as_sent.set(True)
+    try:
+        yield
+    finally:
+        _as_sent.reset(token)
 
 
 def _last_message_id(request: ModelRequest) -> str | None:
@@ -89,6 +112,36 @@ def _model_display_name(model: Any) -> str:
         if isinstance(value, str) and value:
             return value
     return type(model).__name__
+
+
+def _manifest_name(model: Any) -> str | None:
+    """The models.json name ``LLM.get_llm()`` stamped on a client, which is
+    the namespace fallback names are in; None for an unstamped client."""
+    metadata = getattr(model, "metadata", None)
+    stamped = metadata.get("manifest_model") if isinstance(metadata, dict) else None
+    return stamped if isinstance(stamped, str) and stamped else None
+
+
+def _window(model: Any) -> int | None:
+    """The context window a client's profile declares, None when it declares none."""
+    profile = getattr(model, "profile", None)
+    window = profile.get("max_input_tokens") if isinstance(profile, dict) else None
+    return window if isinstance(window, int) and window > 0 else None
+
+
+def _distinct(fallbacks: list[tuple[str, Any]], primary: str | None) -> list[tuple[str, Any]]:
+    """``fallbacks`` without ``primary`` and without a name listed twice.
+
+    Moving to the model that just failed re-sends the same request to it, so
+    the "fallback" is one more identical attempt that fails the same way.
+    """
+    seen = {primary} if primary else set()
+    distinct = []
+    for name, client in fallbacks:
+        if name not in seen:
+            seen.add(name)
+            distinct.append((name, client))
+    return distinct
 
 
 def build_fallback_pairs(config: Any) -> list[tuple[str, Any]]:
@@ -151,16 +204,24 @@ class ModelResilienceMiddleware(AgentMiddleware):
         initial_delay: float = 1.0,
         max_delay: float = 60.0,
         jitter: bool = True,
+        compacts_overflow: bool = False,
     ) -> None:
         super().__init__()
         self.primary_name = primary_name
         self.primary_client = primary_client
-        self.fallbacks = list(fallbacks or [])
+        # Repeats only; the model a request targets is dropped per request,
+        # as the instance is shared into subagents on other models.
+        self.fallbacks = _distinct(list(fallbacks or []), None)
         self.max_retries = max_retries
         self.backoff_factor = backoff_factor
         self.initial_delay = initial_delay
         self.max_delay = max_delay
         self.jitter = jitter
+        # Whether a compaction middleware outside this one takes an overflow.
+        # Without one, nothing would make the request smaller, so an overflow
+        # moves down the chain like any other refusal, where a fallback with a
+        # longer window may take it.
+        self.compacts_overflow = compacts_overflow
         # DALTON-HOOK(oauth-dispatch): clients rebuilt after a mid-turn 401, keyed by the
         # id of the client they replace (kept alongside, so the id cannot be reused). Lives
         # on this per-build instance only; every later call of the turn uses the fresh one.
@@ -292,8 +353,12 @@ class ModelResilienceMiddleware(AgentMiddleware):
             # invocations); resilience must not depend on it.
             logger.debug("[ModelResilience] ui emit unavailable, skipping fallback event")
 
-    def _raise_exhausted(self, records: list[_AttemptRecord]) -> NoReturn:
+    def _raise_exhausted(
+        self, records: list[_AttemptRecord], raised: Exception | None = None
+    ) -> NoReturn:
+        """Raise ``raised``, else the primary's error, with the attempt trace."""
         primary = records[0]
+        exc = raised or primary.exc
         trace = {
             "model": primary.model,
             "attempted_models": [
@@ -307,26 +372,76 @@ class ModelResilienceMiddleware(AgentMiddleware):
             ],
         }
         try:
-            setattr(primary.exc, RESILIENCE_TRACE_ATTR, trace)
+            setattr(exc, RESILIENCE_TRACE_ATTR, trace)
         except Exception:
             # Exceptions with __slots__ reject arbitrary attributes; the
             # primary error still surfaces, just without the trace.
             pass
         logger.warning(
-            "[ModelResilience] All models exhausted",
+            "[ModelResilience] All models exhausted"
+            if raised is None
+            else "[ModelResilience] Context overflow, left to compaction",
             primary_model=primary.model,
             attempted=[r.model for r in records],
         )
-        raise primary.exc
+        raise exc
+
+    def _hands_up(self, exc: Exception) -> bool:
+        return self.compacts_overflow and is_context_overflow(exc)
+
+    def _raise_overflow(self, records: list[_AttemptRecord], exc: Exception) -> NoReturn:
+        """Hand an overflow up to compaction, which sits outside this middleware.
+
+        Reached once no fallback with a larger window is left: one no larger
+        is sent the same history and refuses it the same way, so the compacted
+        request is the one worth sending, and it comes back through here with
+        the whole chain. The overflow is what is raised even when another
+        candidate failed otherwise, since it is the failure the compaction can
+        act on.
+        """
+        self._raise_exhausted(records, exc)
+
+    @staticmethod
+    def _worth_trying(
+        request: ModelRequest, candidate: tuple[str, Any | None], refused_at: float | None
+    ) -> bool:
+        """Whether ``candidate`` may take a request a window of ``refused_at``
+        refused as too long; every candidate may before any overflow. A window
+        that is not declared is not known to be larger."""
+        if refused_at is None:
+            return True
+        window = _window(request.model if candidate[1] is None else candidate[1])
+        return window is not None and window > refused_at
+
+    def _next_tried(
+        self,
+        request: ModelRequest,
+        candidates: list[tuple[str, Any | None]],
+        index: int,
+        refused_at: float | None,
+    ) -> int | None:
+        return next(
+            (
+                j
+                for j in range(index + 1, len(candidates))
+                if self._worth_trying(request, candidates[j], refused_at)
+            ),
+            None,
+        )
 
     def _candidates(self, request: ModelRequest) -> list[tuple[str, Any | None]]:
         primary = (self._primary_display_name(request), None)
         # A compaction request asks the primary's provider for its own
         # summary; another model would answer it as a turn, and the caller
         # has a summarizer of its own to fall back to.
-        if is_compaction_request(request.model_settings):
+        if is_compaction_request(request.model_settings) or _as_sent.get():
             return [primary]
-        return [primary, *self.fallbacks]
+        if self.primary_client is None or request.model is self.primary_client:
+            target = self.primary_name
+        else:
+            # A subagent on its own model, which may be one of the fallbacks.
+            target = _manifest_name(request.model)
+        return [primary, *_distinct(self.fallbacks, target)]
 
     def _classify(self, exc: Exception) -> tuple[int | None, bool]:
         status = extract_status_code(exc)
@@ -381,13 +496,26 @@ class ModelResilienceMiddleware(AgentMiddleware):
         waits out the whole bound before failing, so the full count held one
         candidate for most of an hour before its fallback, and stalls seen in
         prod repeated at the same point on every attempt.
+
+        A context overflow gets nothing, with compaction or without: the same
+        request is over the window on every attempt, with or without its
+        reasoning, and a provider's summary read as its text instead is no
+        smaller for certain. Whether the chain then moves on or hands it to
+        compaction is the loop's call.
         """
         status, retryable = self._classify(exc)
+        if is_context_overflow(exc):
+            return status, None
         if retryable and is_stalled_stream(exc) and attempts > 1:
             retryable = False
         if retryable and attempts <= self.max_retries:
             return status, _Recovery(delay=self._calculate_delay(attempts - 1))
-        if not escalated and status == 400 and not is_mid_stream_error(exc):
+        if (
+            not escalated
+            and status == 400
+            and not is_mid_stream_error(exc)
+            and not _as_sent.get()
+        ):
             stripped = self._escalate_reasoning(req)
             if stripped is not None:
                 return status, _Recovery(request=stripped)
@@ -405,8 +533,14 @@ class ModelResilienceMiddleware(AgentMiddleware):
         # only driven async) — time.sleep here would stall an event loop.
         candidates = self._candidates(request)
         records: list[_AttemptRecord] = []
+        # The largest window that refused the request as too long (infinite
+        # when it declared none), and the refusal compaction is handed.
+        refused_at: float | None = None
+        overflow: Exception | None = None
 
         for index, (name, client) in enumerate(candidates):
+            if not self._worth_trying(request, candidates[index], refused_at):
+                continue
             req = request if client is None else request.override(model=client)
             attempts = 0
             escalated = False
@@ -420,6 +554,9 @@ class ModelResilienceMiddleware(AgentMiddleware):
                     )
                     if recovery is None:
                         records.append(_AttemptRecord(name, exc, status, attempts))
+                        if self._hands_up(exc):
+                            overflow = exc
+                            refused_at = max(refused_at or 0, _window(req.model) or math.inf)
                         break
                     self._emit_retry(name, attempts, exc, status, recovery.delay)
                     if recovery.request is not None:
@@ -427,14 +564,17 @@ class ModelResilienceMiddleware(AgentMiddleware):
                     elif recovery.delay > 0:
                         time.sleep(recovery.delay)
                     continue
-            if index + 1 < len(candidates):
+            following = self._next_tried(request, candidates, index, refused_at)
+            if following is not None:
                 self._emit_fallback(
                     records[-1],
-                    candidates[index + 1][0],
+                    candidates[following][0],
                     request,
                     from_is_primary=index == 0,
                 )
 
+        if overflow is not None:
+            self._raise_overflow(records, overflow)
         return self._raise_exhausted(records)
 
     async def awrap_model_call(
@@ -444,8 +584,14 @@ class ModelResilienceMiddleware(AgentMiddleware):
     ) -> ModelCallResult:
         candidates = self._candidates(request)
         records: list[_AttemptRecord] = []
+        # The largest window that refused the request as too long (infinite
+        # when it declared none), and the refusal compaction is handed.
+        refused_at: float | None = None
+        overflow: Exception | None = None
 
         for index, (name, client) in enumerate(candidates):
+            if not self._worth_trying(request, candidates[index], refused_at):
+                continue
             req = request if client is None else request.override(model=client)
             # DALTON-HOOK(oauth-dispatch): use a client already refreshed earlier in the turn;
             # on a 401 rebuild it once with a fresh token and retry the same model before
@@ -477,6 +623,9 @@ class ModelResilienceMiddleware(AgentMiddleware):
                     )
                     if recovery is None:
                         records.append(_AttemptRecord(name, exc, status, attempts))
+                        if self._hands_up(exc):
+                            overflow = exc
+                            refused_at = max(refused_at or 0, _window(req.model) or math.inf)
                         break
                     self._emit_retry(name, attempts, exc, status, recovery.delay)
                     if recovery.request is not None:
@@ -484,12 +633,15 @@ class ModelResilienceMiddleware(AgentMiddleware):
                     elif recovery.delay > 0:
                         await asyncio.sleep(recovery.delay)
                     continue
-            if index + 1 < len(candidates):
+            following = self._next_tried(request, candidates, index, refused_at)
+            if following is not None:
                 self._emit_fallback(
                     records[-1],
-                    candidates[index + 1][0],
+                    candidates[following][0],
                     request,
                     from_is_primary=index == 0,
                 )
 
+        if overflow is not None:
+            self._raise_overflow(records, overflow)
         return self._raise_exhausted(records)

@@ -308,6 +308,14 @@ export const createStreamEventProcessor = (rt: StreamRuntime, deps: StreamRouter
       return;
     }
 
+    // turn_held: this send waits on a thread mutation (compact, offload, a
+    // model-switch handoff). `released` ends the wait; the stream's end clears
+    // it too, so an error frame in between cannot leave the line up.
+    if (eventType === 'turn_held') {
+      rt.setTurnHeld(event.status === 'held' ? String(event.reason ?? '') : null);
+      return;
+    }
+
     // (b) Live market-watch stamp — keep the persistent watch chip current
     // mid-turn. Swallowed here so it never leaks into the message stream.
     if (eventType === 'market_watch_update') {

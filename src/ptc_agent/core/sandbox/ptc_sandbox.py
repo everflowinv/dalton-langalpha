@@ -1343,6 +1343,11 @@ class PTCSandbox:
     async def adownload_file_bytes(self, filepath: str) -> bytes | None:
         return await _files.adownload_file_bytes(self, filepath)
 
+    async def adownload_file_bytes_capped(
+        self, filepath: str, cap: Callable[[bytes], int]
+    ) -> bytes | None:
+        return await _files.adownload_file_bytes_capped(self, filepath, cap)
+
     async def astream_file_bytes(self, filepath: str) -> AsyncIterator[bytes] | None:
         return await _files.astream_file_bytes(self, filepath)
 

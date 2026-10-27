@@ -418,11 +418,14 @@ its login item.
   `DESKTOP_REQUIRE_HELPER=1` makes that an error instead. The plist makes the job
   `Interactive`, as macOS does its own sshd: with no type launchd throttles the CPU
   and I/O of every command the agent runs.
-- **Signing.** electron-builder signs every nested Mach-O with `entitlementsInherit`,
-  the JIT pair Electron's helpers need. `scripts/sign-mac.mjs` wraps its signer to
-  give the helper an empty set (`resources/entitlements.helper.plist`): it takes
-  logins from the network and runs no JIT. `build.mjs` sets it as the signer only on
-  a build that carries the helper.
+- **Signing.** `scripts/sign-mac.mjs` signs the helper itself, then hands the rest
+  of the bundle to electron-builder's signer with the helper skipped. First, because
+  that signer reaches the app's main executable before the helper beside it, and
+  codesign refuses to seal a bundle with unsigned code in `Contents/MacOS`. Itself,
+  because electron-builder signs every nested Mach-O with `entitlementsInherit`, the
+  JIT pair Electron's helpers need, and the helper takes logins from the network and
+  runs no JIT, so it gets an empty set (`resources/entitlements.helper.plist`).
+  `build.mjs` sets it as the signer only on a build that carries the helper.
 - **Enable** checks the URL's shape (https, or http on loopback, and exactly the
   pairing script path), then asks in a native dialog naming the host and the macOS
   account, Cancel the default. A saas build first refuses any server but its

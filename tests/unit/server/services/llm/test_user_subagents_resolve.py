@@ -334,8 +334,10 @@ async def test_the_plan_check_exempts_a_model_the_user_brings_a_key_or_subscript
     monkeypatch, host_mode, classified, is_byok, has_key, access_type, expected
 ):
     monkeypatch.setattr("src.config.settings.HOST_MODE", host_mode)
+    monkeypatch.setattr("src.server.dependencies.usage_limits.platform_gating_active", lambda: host_mode == "platform")
     mc = MagicMock()
     mc.get_provider_info.return_value = {"access_type": access_type} if access_type else {}
+    mc.get_model_config.return_value = None  # no built-in under the custom model's name
     walk = AsyncMock(return_value=({"key": "k"} if has_key else None, None))
 
     with (

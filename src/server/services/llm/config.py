@@ -29,13 +29,16 @@ from .availability import (
     _MODEL_PREF_KEYS,
     cleanup_stale_model_preferences,
     drop_dead_models,
+    drop_off_plan_models,
+    model_on_plan,
     raise_byok_key_required,
+    raise_model_not_on_plan,
     raise_model_removed,
 )
 
 from . import logger
 
-from .capabilities import gate_capabilities
+from .capabilities import PlanTier, gate_capabilities
 from .clients import resolve_clients
 from .subagents import (
     demote_clientless,
@@ -196,11 +199,65 @@ def select_model(
     user_fallback = model_pref.get("fallback_models")
     if user_fallback is not None:
         config.llm.fallback = user_fallback
+    # Repeats only: the turn's own model stays, since a subagent on another
+    # model may still fall back to it. The resilience middleware drops
+    # whichever model a request targets.
+    if config.llm.fallback:
+        config.llm.fallback = config.llm.fallbacks_for(None)
 
     return ModelSelection(
         effective_model=slot_model(config.llm, slot),
         model_field=model_field,
     )
+
+
+async def gate_models_by_plan(
+    base_config, user_id: str, model_pref: dict, request_model: str | None,
+    *, slot: str, permits: PlanTier, is_byok: bool,
+) -> dict:
+    """``model_pref`` once the plan has had its say on what runs on the
+    platform's key.
+
+    A model the turn names is refused when the plan does not cover it:
+    someone chose it, and running another would answer a question they did
+    not ask. Every saved model reads as unset instead
+    (``drop_off_plan_models``), the Default included, so a turn that names
+    none runs the deployment's, as the composer starts on it. The
+    deployment's defaults are the operator's call, as a subagent's own pin
+    is, and pass where they would run unasked: its main model anywhere, its
+    Background only in the Background slot and the roles that inherit it,
+    not as a primary turn's own model.
+    """
+    llm = base_config.llm
+    main = frozenset({llm.name}) if llm else frozenset()
+    background = main | {slot_model(llm, "background")} if llm else frozenset()
+    exempt = {key: background for key in _MODEL_PREF_KEYS}
+    exempt["preferred_model"] = exempt["fallback_models"] = main
+    named_exempt = background if slot == "background" else main
+    byok_cache: dict[str, dict | None] = {}
+
+    async def on_plan(name: str) -> bool:
+        return await model_on_plan(
+            user_id, name, model_pref=model_pref, permits=permits,
+            is_byok=is_byok, byok_cache=byok_cache,
+        )
+
+    if request_model and request_model not in named_exempt and not await on_plan(request_model):
+        await permits.refresh()
+        if not await on_plan(request_model):
+            if await permits.tier() is None:
+                from src.server.dependencies.usage_limits import quota_service_unavailable
+
+                raise quota_service_unavailable()
+            raise_model_not_on_plan(request_model)
+
+    view, dropped = await drop_off_plan_models(
+        user_id, model_pref, permits=permits, is_byok=is_byok,
+        byok_cache=byok_cache, exempt=exempt,
+    )
+    if dropped:
+        logger.info(f"[CHAT] Ignoring saved models off plan for user={user_id}: {dropped}")
+    return view
 
 
 async def load_user_context(
@@ -374,13 +431,7 @@ async def resolve_llm_config(
     metadata): nobody would see the ``model_removed`` CTA, so its own saved
     model is read like a role and nothing is scrubbed.
     """
-    # The user's own subagents, for a build that compiles any. Their reads
-    # depend on nothing below, so they start now and the merge waits for them.
-    reads = (
-        asyncio.create_task(read_user_subagents(user_id, base_config.subagents))
-        if slot == "primary" and user_facing
-        else None
-    )
+    reads: asyncio.Task | None = None
     try:
         if is_byok is None:
             from src.server.database.api_keys import is_byok_active
@@ -403,6 +454,20 @@ async def resolve_llm_config(
         if dropped:
             logger.info(f"[CHAT] Ignoring saved models not in the manifest for user={user_id}: {dropped}")
 
+        # One tier read for every plan gate the turn runs.
+        permits = PlanTier(user_id)
+        model_pref = await gate_models_by_plan(
+            base_config, user_id, model_pref, request_model,
+            slot=slot, permits=permits, is_byok=is_byok,
+        )
+
+        # The user's own subagents, for a build that compiles any. Their reads
+        # depend on nothing below, so they start now and the merge waits for
+        # them; not before the plan check, whose refusal is routine and would
+        # cancel them inside their transaction.
+        if slot == "primary" and user_facing:
+            reads = asyncio.create_task(read_user_subagents(user_id, base_config.subagents))
+
         await load_user_context(config, user_id, workspace_id, model_pref)
         selection = select_model(config, model_pref, slot, request_model)
 
@@ -419,7 +484,7 @@ async def resolve_llm_config(
             user_models.model_entry(model_pref, selection.effective_model),
             custom=custom_model(model_pref, selection.effective_model) is not None,
         )
-        permits = await gate_capabilities(config, user_id, model_pref)
+        await gate_capabilities(config, user_id, model_pref, permits)
 
         # After the gate, whose tier check the merge reuses, and before the
         # clients, which read the merged definitions for their roles.

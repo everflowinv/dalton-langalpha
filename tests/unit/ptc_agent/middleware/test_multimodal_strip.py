@@ -15,8 +15,11 @@ from PIL import Image
 
 from ptc_agent.agent.middleware._message_utils import order_tool_results_first
 from ptc_agent.agent.middleware.file_operations.multimodal_strip import (
+    _IF_NOT,
     PLACEHOLDER_GUIDANCE,
     MultimodalStripMiddleware,
+    placeholder_guidance,
+    remove_attachments,
     strip_unsupported_content_blocks,
 )
 from src.llms.llm import LLM, get_input_modalities
@@ -41,6 +44,111 @@ def _pdf_bytes(pages: int = 1) -> bytes:
     buf = io.BytesIO()
     writer.write(buf)
     return buf.getvalue()
+
+
+def _read_result(call_id: str, path: str, block: dict | None = None) -> list:
+    """A Read call and its result carrying an attachment."""
+    block = block or {
+        "type": "file", "base64": "JVBERi0=", "mime_type": "application/pdf",
+        "filename": "x.pdf", "pages": 3,
+    }
+    return [
+        AIMessage(content="", tool_calls=[
+            {"name": "Read", "args": {"file_path": path}, "id": call_id}
+        ]),
+        ToolMessage(
+            content=[{"type": "text", "text": f"Loading: {path}"}, block],
+            tool_call_id=call_id,
+            id=f"t-{call_id}",
+        ),
+    ]
+
+
+class TestRemoveAttachments:
+    """What stands in for an attachment taken out to fit the context window."""
+
+    def test_a_pdf_read_names_its_path_and_pages(self):
+        msgs = _read_result("c1", "docs/a.pdf")
+        (_, result) = remove_attachments(msgs, {"t-c1"})
+        assert result.content[1]["text"] == (
+            "[docs/a.pdf (3 pages) was removed from the conversation to fit the context "
+            "window. Read it again by page range if you need it.]"
+        )
+        assert result.content[0] == msgs[1].content[0]
+
+    def test_a_one_page_pdf_is_one_page(self):
+        msgs = _read_result("c1", "docs/a.pdf")
+        (_, result) = remove_attachments(msgs, {"t-c1"}, pages=lambda block: 1)
+        assert result.content[1]["text"].startswith("[docs/a.pdf (1 page) was removed")
+
+    def test_an_image_read_names_its_path(self):
+        image = {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}}
+        (_, result) = remove_attachments(_read_result("c1", "charts/c.png", image), {"t-c1"})
+        assert result.content[1]["text"] == (
+            "[Image charts/c.png was removed from the conversation to fit the context window.]"
+        )
+
+    def test_an_upload_names_what_it_carries(self):
+        upload = HumanMessage(id="h1", content=[
+            {"type": "text", "text": "[Attached PDF: q3.pdf (saved to work/uploads/q3.pdf)]"},
+            {"type": "file", "base64": "JVBERi0=", "mime_type": "application/pdf",
+             "filename": "q3.pdf"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+        ])
+        (result,) = remove_attachments([upload], {"h1"}, pages=lambda block: None)
+        assert [b["text"] for b in result.content[1:]] == [
+            "[q3.pdf was removed from the conversation to fit the context window. "
+            "Read it again by page range if you need it.]",
+            "[Image was removed from the conversation to fit the context window.]",
+        ]
+
+    def test_an_unsaved_upload_asks_for_it_again_instead_of_a_read(self):
+        upload = HumanMessage(id="h1", content=[
+            {"type": "file", "base64": "JVBERi0=", "mime_type": "application/pdf",
+             "filename": "q3.pdf", "unsaved": True},
+        ])
+        (result,) = remove_attachments([upload], {"h1"}, pages=lambda block: 12)
+        assert result.content == [{"type": "text", "text": (
+            "[q3.pdf (12 pages) was removed from the conversation to fit the context "
+            "window, and no copy was saved. Ask the user to attach it again if you need it.]"
+        )}]
+
+    def test_an_image_uploaded_with_no_saved_copy_asks_for_it_again(self):
+        upload = HumanMessage(id="h1", content=[
+            {"type": "text", "text": "[Attached image: chart.png]"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+            {"type": "text", "text": "[Attached image: kept.png (saved to work/uploads/kept.png)]"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,def"}},
+        ])
+        (result,) = remove_attachments([upload], {"h1"})
+        assert [b["text"] for b in result.content] == [
+            "[Attached image: chart.png]",
+            "[Image chart.png was removed from the conversation to fit the context window, "
+            "and no copy was saved. Ask the user to attach it again if you need it.]",
+            "[Attached image: kept.png (saved to work/uploads/kept.png)]",
+            "[Image was removed from the conversation to fit the context window.]",
+        ]
+
+    @pytest.mark.parametrize("path", [None, "work/uploads/chart.png"], ids=["unsaved", "saved"])
+    def test_the_label_the_server_writes_is_the_one_read_back(self, path):
+        from src.server.models.additional_context import MultimodalContext
+        from src.server.utils.multimodal_context import inject_multimodal_context
+
+        image = MultimodalContext(
+            type="image", data="data:image/png;base64,abc", description="chart.png"
+        )
+        (written,) = inject_multimodal_context(
+            [{"role": "user", "content": "what is this?"}], [image], file_paths=[path]
+        )
+        upload = HumanMessage(id="h1", content=written["content"])
+        (result,) = remove_attachments([upload], {"h1"})
+        asked = "Ask the user to attach it again" in result.content[1]["text"]
+        assert asked is (path is None)
+
+    def test_messages_not_named_are_the_same_objects(self):
+        msgs = _read_result("c1", "docs/a.pdf")
+        assert remove_attachments(msgs, {"other"}) is msgs
+        assert remove_attachments(msgs, set()) is msgs
 
 
 class TestStripUnsupportedContentBlocks:
@@ -77,6 +185,32 @@ class TestStripUnsupportedContentBlocks:
         assert len(placeholders) == 3
         assert "Ask for a description." in placeholders[0]
         assert all("Ask for a description" not in p for p in placeholders[1:])
+
+    def test_a_url_read_is_not_said_to_be_in_the_workspace(self):
+        # The server fetched it; nothing wrote it into the workspace.
+        url = "https://example.test/report.pdf"
+        msgs = [
+            *_read_result("c1", "docs/a.pdf"),
+            *_read_result("c2", url),
+            *_read_result("c3", "docs/b.pdf"),
+        ]
+        result = strip_unsupported_content_blocks(
+            msgs, has_image=True, has_pdf=False, guidance=placeholder_guidance
+        )
+        texts = [m.content[1]["text"] for m in result if isinstance(m, ToolMessage)]
+
+        assert texts[0].endswith(f" {PLACEHOLDER_GUIDANCE}]")
+        assert texts[1] == (
+            "[PDF attached in a prior turn, not visible to the current model. "
+            f"The file is at {url}: download it in the sandbox and extract it yourself "
+            "with Python (a PDF's text or page renders, OCR or image analysis) before "
+            "giving up. If that cannot answer the question, tell the user: an unsupported "
+            "input type means switching to a model that accepts it, a page-limit rejection "
+            "means splitting the document or a longer-context model. Answer in best effort "
+            "otherwise.]"
+        )
+        # Each guidance is said once, on the first block it applies to.
+        assert texts[2] == "[PDF attached in a prior turn, not visible to the current model.]"
 
     def test_text_only_strips_image_blocks(self):
         msgs = [
@@ -293,6 +427,29 @@ class TestResolveModalities:
         is not that model."""
         mw = MultimodalStripMiddleware(model_name="my-custom-vlm", custom_modalities=["text", "image"])
         assert mw._resolve_target(_request(None))[1] == ["text"]
+
+
+class TestReceives:
+    """What compaction counts toward its trigger: the blocks this strip
+    would send a model as they are, nothing it turns into a placeholder."""
+
+    PDF = {"type": "file", "base64": "JVBERi0=", "mime_type": "application/pdf", "pages": 20}
+    IMAGE = {"type": "image", "base64": "iVBORw0KGgo=", "mime_type": "image/png"}
+
+    def test_a_text_only_model_is_sent_neither(self):
+        receives = MultimodalStripMiddleware().receives(_request("glm-5.2").model)
+        assert not receives(self.PDF) and not receives(self.IMAGE)
+        assert receives({"type": "text", "text": "x"})
+
+    def test_a_pdf_model_is_sent_one_within_its_page_ceiling(self):
+        receives = MultimodalStripMiddleware().receives(_request("glm-5.3-flash-cn").model)
+        assert receives(self.PDF) and receives(self.IMAGE)
+        assert not receives({**self.PDF, "pages": 142})  # over its 100 pages
+
+    def test_an_override_applies_to_the_configured_model_only(self):
+        mw = MultimodalStripMiddleware(model_name="glm-5.2", custom_modalities=["text", "image"])
+        assert mw.receives(_request("glm-5.2").model)(self.IMAGE)
+        assert not mw.receives(_request(None).model)(self.IMAGE)
 
 
 class _ModelCallRequest:
@@ -629,6 +786,21 @@ class TestPDFPageCeilingIsPerTarget:
         assert PLACEHOLDER_GUIDANCE in blocks[1]["text"]
 
     @pytest.mark.asyncio
+    async def test_an_unsaved_upload_over_it_is_not_pointed_at_a_copy(self, route_200k):
+        """A composer PDF inlined because nothing could save it: no workspace
+        copy exists, so only what to tell the user follows."""
+        upload = HumanMessage(content=[
+            {"type": "text", "text": "[Attached PDF: filing.pdf]"},
+            {"type": "file", "base64": "abc", "mime_type": "application/pdf",
+             "filename": "filing.pdf", "pages": 300, "unsaved": True},
+        ])
+        blocks, _ = await _blocks_reaching(route_200k, upload)
+        assert blocks[1]["text"] == (
+            "[PDF filing.pdf (300 pages) is over the current model's 100-page limit "
+            f"and was not sent. {_IF_NOT}]"
+        )
+
+    @pytest.mark.asyncio
     async def test_a_pdf_inside_the_200k_ceiling_still_reaches_it(self, route_200k):
         blocks, _ = await _blocks_reaching(route_200k, _pdf_block(80))
         assert [b["type"] for b in blocks] == ["text", "file"]
@@ -663,3 +835,12 @@ class TestPageStampStaysLocal:
         document = [b for b in payload[0]["content"] if b["type"] == "document"][0]
         assert "pages" not in document
         assert "pages" not in document["source"]
+
+    def test_the_unsaved_mark_never_reaches_the_wire(self):
+        from langchain_anthropic.chat_models import _format_messages
+
+        message = _pdf_block(3)
+        message.content[1]["unsaved"] = True
+        _, payload = _format_messages([message], model="claude-sonnet-4-6")
+        document = [b for b in payload[0]["content"] if b["type"] == "document"][0]
+        assert "unsaved" not in document and "unsaved" not in document["source"]

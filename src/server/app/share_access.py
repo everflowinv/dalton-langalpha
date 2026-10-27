@@ -16,16 +16,13 @@ from typing import Any
 from fastapi import HTTPException
 
 from ptc_agent.core.paths import is_agent_notes_path
-from src.server.app.workspace_files._containment import contained_relative_path
-from src.server.app.workspace_files._shared import (
-    _is_serve_blocked_path,
-    previous_dir_names_of,
-    work_dir_for,
-)
+from src.server.app.workspace_files._shared import _is_serve_blocked_path, work_dir_for
 from src.server.database.conversation import get_thread_by_share_token
 from src.server.database.share_codes import is_share_code
 from src.server.database.share_links import KIND_FILE, ShareLink, get_link
 from src.server.database.workspace import get_workspace as db_get_workspace
+from src.server.services.workspace_file_containment import contained_relative_path
+from src.server.services.workspace_files import previous_dir_names_of
 from src.server.services.workspace_layout import WorkspaceLayoutUnavailable
 from src.server.utils.error_sanitization import single_line
 

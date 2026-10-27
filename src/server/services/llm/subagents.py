@@ -25,7 +25,7 @@ from ptc_agent.config.agent import SubagentModel, SubagentsConfig
 from src.llms.preferences import resolve_tuning
 
 from . import logger, user_models
-from .availability import model_resolves
+from .availability import model_on_plan, model_resolves
 from .capabilities import TierPermits, gate_search
 from .clients import LLMRole
 
@@ -185,53 +185,6 @@ async def _demote_unservable(
     if not changed:
         return resolved
     return replace(resolved, definitions=definitions)
-
-
-async def model_on_plan(
-    user_id: str,
-    model: str,
-    *,
-    model_pref: dict,
-    permits: TierPermits,
-    is_byok: bool,
-    byok_cache: dict[str, dict | None],
-) -> bool:
-    """Whether the user may run ``model``, in the model list's order.
-
-    A provider the user holds a key or a subscription for is never gated by
-    plan, so a free-plan user who pins a model to their own key keeps it. A
-    model with no tier is one no plan includes, which the list offers only to
-    such a user.
-    """
-    from src.config.settings import HOST_MODE
-
-    if HOST_MODE != "platform":
-        return True
-    source, entry = await user_models.classify_model(user_id, model, _pref_cache=model_pref)
-    if source != user_models.ModelSource.SYSTEM:
-        # A custom model runs on the user's own key or not at all, which the
-        # pass after the clients are built settles.
-        return True
-    tier = entry.get("tier")
-    if isinstance(tier, int) and await permits(tier):
-        return True
-
-    from src.llms.llm import LLM as LLMFactory
-
-    from .clients import _walk_byok_candidates
-
-    provider = entry.get("provider")
-    if not provider:
-        return False
-    mc = LLMFactory.get_model_config()
-    if mc.get_provider_info(provider).get("access_type") == "oauth":
-        # Served on the user's subscription or not at all; with none, the
-        # role gets no client and the pass after the clients demotes it.
-        return True
-    if not is_byok:
-        return False
-    found, _ = await _walk_byok_candidates(user_id, provider, mc, _byok_cache=byok_cache)
-    return found is not None
 
 
 def subagent_roles(

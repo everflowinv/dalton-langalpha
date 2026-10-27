@@ -119,15 +119,15 @@ async def files_client(mock_session, sandbox):
     workspace = AsyncMock(return_value=_make_workspace())
     with (
         patch("src.server.app.workspace_files.crud.db_get_workspace", workspace),
-        patch("src.server.app.workspace_files._shared.db_get_workspace", workspace),
+        patch("src.server.services.workspace_files.db_get_workspace", workspace),
         # The folder hold is an advisory lock; the database is mocked here.
         patch(
-            "src.server.app.workspace_files._shared.workspace_folder_in_use",
+            "src.server.services.workspace_files.workspace_folder_in_use",
             lambda _workspace_id: nullcontext(),
         ),
         patch("src.server.app.workspace_files.crud.WorkspaceManager") as MockWM,
         patch(
-            "src.server.app.workspace_files._shared.WorkspaceManager"
+            "src.server.services.workspace_files.WorkspaceManager"
         ) as MockWMShared,
         patch(
             "src.server.app.workspace_files.serve.WorkspaceManager"
@@ -220,7 +220,7 @@ async def sandbox_client(mock_session, sandbox):
 
     with (
         patch(
-            "src.server.app.workspace_files._shared.db_get_workspace",
+            "src.server.services.workspace_files.db_get_workspace",
             AsyncMock(return_value=_make_workspace()),
         ),
         patch("src.server.app.workspace_sandbox.WorkspaceManager") as MockWM,

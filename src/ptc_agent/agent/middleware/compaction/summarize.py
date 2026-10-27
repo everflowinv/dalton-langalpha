@@ -38,7 +38,11 @@ from src.llms.provider_compaction import is_opaque
 from ptc_agent.agent.middleware.compaction.model import max_input_tokens
 from ptc_agent.agent.middleware.compaction.summary_request import trim_for_summary
 from ptc_agent.agent.middleware.compaction.types import _DEFAULT_FALLBACK_MESSAGE_COUNT
-from ptc_agent.agent.middleware.compaction.utils import parse_summary_message, summary_source
+from ptc_agent.agent.middleware.compaction.utils import (
+    handed_off,
+    parse_summary_message,
+    summary_source,
+)
 from ptc_agent.agent.transcript.classify import (
     human_kind,
     is_run_boundary_message,
@@ -291,7 +295,9 @@ def server_summary(
         # last, so it keeps its end where a model's summary, which opens on
         # the goal, keeps its start.
         text = parse_summary_message(head[0])
-        by_server = summary_source(head[0]) == "server" or is_opaque(head[0])
+        by_server = summary_source(head[0]) == "server" or (
+            is_opaque(head[0]) and not handed_off(head[0])
+        )
         body = text.partition("\n\n")[2] if by_server else text
         cut = (_cut_start if by_server else _cut)(body, _EARLIER_CHARS)
         if cut == body and head[0].id:

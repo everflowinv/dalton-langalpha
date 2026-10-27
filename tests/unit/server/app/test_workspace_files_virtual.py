@@ -20,13 +20,13 @@ from fastapi import HTTPException
 from ptc_agent.agent.backends.automations import AutomationsBackend
 from ptc_agent.agent.backends.user_data import UserDataBackend
 from ptc_agent.agent.filesystem_routes import route_for
-from src.server.app.workspace_files import _shared, crud
+from src.server.app.workspace_files import crud
 from src.server.app.workspace_files._shared import (
     _present_virtual_file,
     _virtual_file,
     _virtual_files_in_scope,
 )
-from src.server.services import user_data_io
+from src.server.services import user_data_io, workspace_files
 from src.server.services.automations import file as automations_file
 from tests.unit.server.services.automations.file._support import _row
 
@@ -129,7 +129,7 @@ async def test_a_reference_the_names_cannot_be_read_for_resolves_to_its_route(mo
 @pytest.fixture
 def workspace(monkeypatch):
     monkeypatch.setattr(crud, "db_get_workspace", AsyncMock(return_value=WORKSPACE))
-    monkeypatch.setattr(_shared, "db_get_workspace", AsyncMock(return_value=WORKSPACE))
+    monkeypatch.setattr(workspace_files, "db_get_workspace", AsyncMock(return_value=WORKSPACE))
     monkeypatch.setattr(crud, "owner_work_dir", lambda _ws: ROOT)
     monkeypatch.setattr(crud, "owner_layout", lambda _ws: SimpleNamespace(workspace=ROOT))
 
@@ -155,7 +155,7 @@ async def test_the_panel_lists_the_data_files_running_or_stopped(workspace, file
     async def _acquire(*_):
         yield sandbox, WORKSPACE
 
-    monkeypatch.setattr(crud, "_acquire_sandbox_to_change", _acquire)
+    monkeypatch.setattr(crud, "acquire_sandbox_to_change", _acquire)
     monkeypatch.setattr(crud, "contained_sandbox_path", AsyncMock(return_value=ROOT))
     stored = ["notes.md", AUTOMATIONS, ".agents/user/automations/gone.json"]
     monkeypatch.setattr(
@@ -229,7 +229,7 @@ def held_elsewhere(monkeypatch):
     def _status(status: str) -> None:
         read = AsyncMock(return_value={**WORKSPACE, "status": status})
         monkeypatch.setattr(crud, "db_get_workspace", read)
-        monkeypatch.setattr(_shared, "db_get_workspace", read)
+        monkeypatch.setattr(workspace_files, "db_get_workspace", read)
 
     @asynccontextmanager
     async def _acquire(*_):
@@ -237,7 +237,7 @@ def held_elsewhere(monkeypatch):
         yield
 
     unreachable = AsyncMock(side_effect=AssertionError("a data file reached the stored copy"))
-    monkeypatch.setattr(crud, "_acquire_sandbox_to_change", _acquire)
+    monkeypatch.setattr(crud, "acquire_sandbox_to_change", _acquire)
     monkeypatch.setattr(crud.FilePersistenceService, "get_file_content", unreachable)
     monkeypatch.setattr(crud, "mirror_download_link", unreachable)
     return _status
@@ -313,7 +313,7 @@ async def test_the_panel_never_deletes_a_data_file(workspace, monkeypatch):
     async def _acquire(*_):
         yield sandbox, WORKSPACE
 
-    monkeypatch.setattr(crud, "_acquire_sandbox_to_change", _acquire)
+    monkeypatch.setattr(crud, "acquire_sandbox_to_change", _acquire)
     monkeypatch.setattr(
         crud, "contained_sandbox_paths", AsyncMock(side_effect=lambda _sb, paths, work_dir: paths)
     )
@@ -346,7 +346,7 @@ def _sandbox_to_change(monkeypatch, probe) -> MagicMock:
     async def _acquire(*_):
         yield sandbox, WORKSPACE
 
-    monkeypatch.setattr(crud, "_acquire_sandbox_to_change", _acquire)
+    monkeypatch.setattr(crud, "acquire_sandbox_to_change", _acquire)
     monkeypatch.setattr(crud, "contained_sandbox_paths", probe)
     return sandbox
 

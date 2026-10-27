@@ -147,16 +147,20 @@ export function buildConfiguredSet(
  * the platform service may not reflect recent connections (OAuth tokens
  * live in the local DB). Merging ensures the tier filter recognizes
  * locally-configured providers.
+ *
+ * A stored key counts only while `byokEnabled`: with the switch off the
+ * server runs no turn on it, so its models fall back to what the plan covers.
  */
 export function augmentPlatformWithLocal(
   platform: PlatformModelsResponse,
   configuredProviders: ConfiguredProvider[],
+  byokEnabled: boolean,
 ): PlatformModelsResponse {
   const localByok: string[] = [];
   const localOAuth: string[] = [];
   for (const p of configuredProviders) {
-    const bucket = p.access_type === 'oauth' ? localOAuth : localByok;
-    bucket.push(p.provider);
+    if (p.access_type === 'oauth') localOAuth.push(p.provider);
+    else if (byokEnabled) localByok.push(p.provider);
     // No brand_key promotion. A configured variant (e.g. moonshot-coding)
     // does not imply the parent brand (moonshot) is accessible — their keys
     // and endpoints are distinct. Promoting the brand would show models the
