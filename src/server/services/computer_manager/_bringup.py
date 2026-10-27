@@ -13,9 +13,17 @@ from typing import TYPE_CHECKING, Any, Optional
 
 from ptc_agent.core.paths import WorkspaceLayout
 from src.server.database.computer import DEFAULT_ROOT_DIR, get_computer_for_workspace
-from src.server.database.workspace import get_live_workspace_ids_for_computer
+# DALTON-HOOK(bringup-owner-check): the placement row and folder hold the
+# per-step owner check reads, before any restore, prune or transcript sync.
+from src.server.database.workspace import (
+    get_live_workspace_ids_for_computer,
+    get_workspace_placement,
+)
 from src.server.database.workspace_file import WorkspaceSyncBusy
-from src.server.database.workspace_folders import WorkspaceFolderMoving
+from src.server.database.workspace_folders import (
+    WorkspaceFolderMoving,
+    workspace_folder_in_use,
+)
 from src.server.services import transcripts
 from src.server.services.computer_manager import _thread_dirs
 from src.server.services.livefs import cache
@@ -149,11 +157,13 @@ class BringUp:
 
     def __init__(
         self,
+        computer_id: str,
         sandbox: Any,
         sandbox_id: Optional[str],
         root: str,
         forget: Callable[[str], None],
     ) -> None:
+        self.computer_id = computer_id  # DALTON-HOOK(bringup-owner-check)
         self.sandbox = sandbox
         self.sandbox_id = sandbox_id
         self.root = root
@@ -199,6 +209,14 @@ class BringUp:
                     pass
                 continue
             workspace_id, step = min(ready, key=lambda item: item[1])
+            # DALTON-HOOK(bringup-owner-check): a queued step can outlive the
+            # binding it was queued for, so each one is re-checked against the
+            # database before any restore, prune or sync runs (see
+            # ``_still_ours``, which both dispatch branches pass through).
+            if not await self._still_ours(workspace_id):
+                self.pending.pop(workspace_id, None)
+                self._forget(workspace_id)
+                continue
             if step.restored:
                 synced = await self._sync(workspace_id)
                 self.pending.pop(workspace_id, None)
@@ -208,6 +226,48 @@ class BringUp:
                     self._forget(workspace_id)
             else:
                 await self._restore(workspace_id, step)
+
+    # DALTON-HOOK(bringup-owner-check): a restart's queue can outlive the
+    # binding its workspaces were queued under — one moved to another computer
+    # while the queue worked through the rest, and a move from a backup leaves
+    # the folder behind under its name, so no folder-level signal names it.
+    # The placement row (deleted filtered, current computer_id) is the
+    # commit's truth, and the folder hold it is read under is the move's own
+    # gate for the folder, so the answer cannot sit beside a half-done
+    # set-aside of this workspace's folder. Dropped is not failed: the
+    # workspace's next acquisition on whichever computer holds it now queues
+    # the work where it belongs, and the dropped attach key lets it.
+    async def _still_ours(self, workspace_id: str) -> bool:
+        """Whether the workspace still lives on this job's computer, read
+        fresh from the database; False also when the read itself fails, since
+        the safe side of not knowing is to write nothing."""
+        try:
+            async with workspace_folder_in_use(workspace_id):
+                placement = await get_workspace_placement(workspace_id)
+        except WorkspaceFolderMoving:
+            logger.info(
+                f"Bring-up of workspace {workspace_id} found no settled "
+                f"folder; its next acquisition queues it again"
+            )
+            return False
+        except Exception as e:  # noqa: BLE001 - no answer means no writes here
+            logger.warning(
+                f"Bring-up of workspace {workspace_id} on computer "
+                f"{self.computer_id} skipped: its placement could not be read "
+                f"({type(e).__name__}: {e})"
+            )
+            return False
+        where = placement.get("computer_id") if placement else None
+        if where is not None:
+            where = str(where)
+        if where != self.computer_id:
+            logger.info(
+                f"Bring-up of workspace {workspace_id} dropped: it no longer "
+                f"lives on computer {self.computer_id} (now "
+                f"{'unbound' if where is None and placement else where or 'deleted'})"
+            )
+            return False
+        return True
 
     async def _unchanged(self, workspace_id: str) -> bool:
         stamp = await _read_stamp(workspace_id)
@@ -335,7 +395,8 @@ class BringUpMixin:
         if job is None or job.sandbox_id != sandbox_id:
             if job is not None:
                 job.cancel()
-            job = machine.bring_up = BringUp(
+            job = machine.bring_up = BringUp(  # DALTON-HOOK(bringup-owner-check)
+                computer_id,
                 sandbox,
                 sandbox_id,
                 root or DEFAULT_ROOT_DIR,

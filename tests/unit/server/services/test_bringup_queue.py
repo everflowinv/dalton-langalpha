@@ -74,6 +74,18 @@ def steps():
     live: dict[str, ThreadPrefixes] = {}
     #: What a delete or archive during a workspace's pass leaves its threads at.
     moved: dict[str, ThreadPrefixes] = {}
+    # DALTON-HOOK(bringup-owner-check): the placement each step's owner check
+    # reads; a workspace here but for another computer, or absent (deleted),
+    # has its step dropped before any restore, prune or sync.
+    placements: dict[str, dict | None] = {}
+
+    async def placement_of(workspace_id):
+        default = {"workspace_id": workspace_id, "computer_id": "computer-1"}
+        return placements.get(workspace_id, default)
+
+    @asynccontextmanager
+    async def folder_in_use(workspace_id):
+        yield
 
     def kept_of(workspace_id):
         default = frozenset({f"live-{workspace_id}"})
@@ -122,6 +134,8 @@ def steps():
         patch.object(_bringup, "held_workspace_layout", held),
         patch.object(_bringup, "_inventory", inventory_of),
         patch.object(_bringup, "_thread_prefixes", live_threads),
+        patch.object(_bringup, "get_workspace_placement", placement_of),  # DALTON-HOOK(bringup-owner-check)
+        patch.object(_bringup, "workspace_folder_in_use", folder_in_use),
         patch.object(_bringup.cache, "client", lambda: None),
         patch.object(_bringup, "_BUSY_PAUSE_S", 0.0),
         patch.object(_bringup._thread_dirs, "prune_dead_thread_dirs", prune),
@@ -134,6 +148,7 @@ def steps():
             folders=folders,
             live=live,
             moved=moved,
+            placements=placements,
             short=short,
             unpruned=unpruned,
             unsynced=unsynced,

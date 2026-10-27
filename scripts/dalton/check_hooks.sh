@@ -115,6 +115,11 @@ ALLOWED_HOOKS=(
   # and `file` beside upstream's poppler-utils; a Chinese-PDF ingest chain
   # failed online without them. Takes effect when langalpha-sandbox:sync is built.
   "sandbox-pdf-deps"
+  # B8 review fix: a restart's bring-up queue re-checks each workspace still
+  # lives on its computer (DB read under the folder hold) before restoring,
+  # pruning or syncing, so a workspace moved while queued is not written to
+  # on the machine it left.
+  "bringup-owner-check"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)
