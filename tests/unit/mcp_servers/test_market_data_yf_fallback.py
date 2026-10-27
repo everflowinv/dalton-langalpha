@@ -380,6 +380,60 @@ class TestYfCoversStart:
             rows, "2026-11-27 14:00", intraday=True, display="AAPL", interval="5min"
         )
 
+    def test_an_after_hours_start_with_extended_hours_needs_an_after_hours_bar(self):
+        # extended_hours=True asks yfinance for pre/post bars, so 17:00 sits
+        # inside the 20:00 after-hours session of 2026-10-26 (a Monday): the
+        # deadline is 17:05, and a symbol whose first bar is Tuesday's open is
+        # a real gap — judged against the regular close it read as covered and
+        # skipped FMP with no coverage note.
+        import plugins.langalpha_market_data.price_data_mcp_server as mod
+
+        rows = [{"date": "2026-10-27 09:30:00"}]
+        assert not mod._yf_covers_start(
+            rows, "2026-10-26 17:00", intraday=True, display="AAPL",
+            interval="5min", extended_hours=True,
+        )
+        # The 17:05 bar itself is coverage, not a gap.
+        rows = [{"date": "2026-10-26 17:05:00"}]
+        assert mod._yf_covers_start(
+            rows, "2026-10-26 17:00", intraday=True, display="AAPL",
+            interval="5min", extended_hours=True,
+        )
+
+    def test_an_early_close_afternoon_start_with_extended_hours_needs_an_after_hours_bar(self):
+        # 2026-11-27 closes early at 13:00, after-hours to 17:00: with
+        # extended_hours=True a 14:00 start sits inside the extended session
+        # (deadline 14:05), so Monday 11-30's open bar does not cover it — the
+        # extended_hours=False counterpart above is the one it answers.
+        import plugins.langalpha_market_data.price_data_mcp_server as mod
+
+        rows = [{"date": "2026-11-30 09:30:00"}]
+        assert not mod._yf_covers_start(
+            rows, "2026-11-27 14:00", intraday=True, display="AAPL",
+            interval="5min", extended_hours=True,
+        )
+
+    def test_a_pre_market_start_with_extended_hours_anchors_to_the_pre_session(self):
+        # 07:00 sits in the 04:00–09:30 pre-market of 2026-10-26: with
+        # extended_hours=True only a bar by 07:05 covers the start, whereas
+        # without it the day's first bar is the 09:30 open either way.
+        import plugins.langalpha_market_data.price_data_mcp_server as mod
+
+        rows = [{"date": "2026-10-26 09:30:00"}]
+        assert not mod._yf_covers_start(
+            rows, "2026-10-26 07:00", intraday=True, display="AAPL",
+            interval="5min", extended_hours=True,
+        )
+        rows = [{"date": "2026-10-26 07:05:00"}]
+        assert mod._yf_covers_start(
+            rows, "2026-10-26 07:00", intraday=True, display="AAPL",
+            interval="5min", extended_hours=True,
+        )
+        rows = [{"date": "2026-10-26 09:30:00"}]
+        assert mod._yf_covers_start(
+            rows, "2026-10-26 07:00", intraday=True, display="AAPL", interval="5min"
+        )
+
     def test_an_after_hours_friday_start_with_a_tuesday_first_bar_is_a_gap(self):
         # The deadline for a Friday-20:00 start is Monday's open plus one
         # interval, so a first bar on Tuesday is a real gap, not slack.

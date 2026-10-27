@@ -307,7 +307,9 @@ def _yf_expected_session_day(display: str, start_day: date) -> Optional[date]:
 # Only a real gap counts as uncovered (a capped 1m history serving the last
 # 7 days of a two-month request); the old timestamp comparison read every
 # off-hours start as a miss and burned FMP quota re-asking a served window.
-def _yf_start_deadline_ms(display: str, start_date: str, interval: str) -> Optional[int]:
+def _yf_start_deadline_ms(
+    display: str, start_date: str, interval: str, *, extended_hours: bool = False
+) -> Optional[int]:
     """The latest first bar that still covers an intraday *start_date*.
 
     The start itself anchors it when it sits inside trading hours; otherwise
@@ -315,6 +317,10 @@ def _yf_start_deadline_ms(display: str, start_date: str, interval: str) -> Optio
     venue's midday break, that session's open when it is earlier, the next
     session's open when it is past the close or on a non-trading day. One bar
     interval of slack rides on top (the 13:05 bar covers a 13:01 5min start).
+    With *extended_hours* the session widens to the venue's pre-market open
+    and after-hours close where it has them, so a start inside those hours
+    anchors to itself — a 17:00 start on a 16:00-close venue is covered by a
+    17:05 after-hours bar, not handed to the next day's open.
     """
     start_ms = _yf_parse_exchange_bound_ms(start_date, display, is_end=False)
     if start_ms is None:
@@ -326,12 +332,28 @@ def _yf_start_deadline_ms(display: str, start_date: str, interval: str) -> Optio
         cal = get_calendar(ref.calendar_id)
     except Exception:  # noqa: BLE001 — no calendar: caller keeps day granularity
         return None
+    # Only XcalsCalendar carries extended bounds; hand-rolled regimes (and a
+    # False flag) keep the regular session, which for them is the whole day.
+    extended_bounds = (
+        getattr(cal, "extended_bounds_ms", None) if extended_hours else None
+    )
     day = datetime.fromtimestamp(start_ms / 1000, cal.tz).date()
     for _ in range(15):  # enough to bridge the longest venue holiday closure
         if cal.is_trading_day(day):
             bounds = session_bounds(ref.calendar_id, day.isoformat())
             if bounds and bounds[0] is not None:
                 open_ms, close_ms, brk_start, brk_end = bounds
+                if extended_bounds is not None:
+                    # DALTON-HOOK(market-data-fallback): the fetch asked for
+                    # pre/post bars, so coverage runs on the extended data day;
+                    # judged against the regular close, a start in after-hours
+                    # would look answered by the next session's open even when
+                    # the symbol printed nothing until then. None means this
+                    # venue has no extended hours: outside the regular session
+                    # it is simply closed, regular bounds decide.
+                    ext = extended_bounds(day)
+                    if ext is not None:
+                        open_ms, close_ms = ext
                 if start_ms <= open_ms:
                     anchor = open_ms
                 elif brk_start is not None and brk_end is not None and brk_start <= start_ms < brk_end:
@@ -353,6 +375,7 @@ def _yf_covers_start(
     intraday: bool,
     display: str = "",
     interval: str = "",
+    extended_hours: bool = False,
 ) -> bool:
     if not start_date or not rows:
         return True
@@ -375,7 +398,7 @@ def _yf_covers_start(
         # off-hours start belongs to the *next* session's first bar. Only
         # when the deadline cannot be computed (no venue calendar,
         # unparseable timestamps) does the day-granular verdict stand.
-        deadline_ms = _yf_start_deadline_ms(display, s, interval)
+        deadline_ms = _yf_start_deadline_ms(display, s, interval, extended_hours=extended_hours)
         first_ms = _yf_parse_exchange_bound_ms(first_date, display, is_end=False)
         if deadline_ms is not None and first_ms is not None:
             return first_ms <= deadline_ms
@@ -647,6 +670,7 @@ async def _fetch_stock_bars(
                     intraday=intraday,
                     display=display,
                     interval=canonical,
+                    extended_hours=extended_hours,
                 ):
                     return {
                         "data": yf_data,
