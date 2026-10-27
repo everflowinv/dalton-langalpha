@@ -11,6 +11,8 @@ import ChatInput, { type ChatInputHandle } from '@/components/ui/chat-input';
 import type { ComposerScope } from '@/components/ui/chat-input.types';
 import { useStableHandler } from '@/hooks/useStableHandler';
 import { useWorkspace } from '@/hooks/useWorkspace';
+// DALTON-HOOK(team-sharing): gate the seen cursor on workspace ownership
+import { isDaltonAuth } from '@/config/daltonAuth';
 import { usePreferences } from '@/hooks/usePreferences';
 import { useLocale } from '@/hooks/useLocale';
 import { compactNumber } from '@/lib/format';
@@ -30,6 +32,8 @@ import { ThreadNotices } from '../../ChatAgent/components/chatView/ThreadNotices
 import { DispatchStatusProvider } from '../../ChatAgent/hooks/usePTCDispatchStatus';
 import { useStreamFollow } from '../../ChatAgent/components/chatView/transcriptFollow';
 import { useTranscriptFollow } from '../../ChatAgent/components/chatView/useTranscriptFollow';
+// DALTON-HOOK(team-sharing): read-only access check for the seen cursor
+import { useTeamReadOnly } from '../../ChatAgent/components/dalton/TeamSharing';
 import { useActiveThreadPublisher } from '@/lib/threadLifecycle/useActiveThreadPublisher';
 import { appendPathSuffix, getPreviewUrl, summarizeThread, offloadThread } from '../../ChatAgent/utils/api';
 import { attachmentsToContexts } from '../../ChatAgent/utils/fileUpload';
@@ -456,7 +460,14 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
 
   // The market panel's thread is what the user is looking at — same active
   // contract as ChatAgent (no unseen dot for watched finishes, seen on open).
-  useActiveThreadPublisher(threadId);
+  // DALTON-HOOK(team-sharing): a read-only colleague must not mark a shared
+  // thread seen — the server refuses the write, and the dot would only come
+  // back on reload. Same gate as ChatAgent: the workspace row must be loaded
+  // and confirm the caller is not a read-only teammate.
+  const { data: activeWorkspace } = useWorkspace(activeWorkspaceId);
+  const teamReadOnly = useTeamReadOnly(activeWorkspaceId, activeWorkspace);
+  const canMarkSeen = !isDaltonAuth || Boolean(activeWorkspaceId && activeWorkspace && !teamReadOnly.isReadOnly);
+  useActiveThreadPublisher(threadId, { canMarkSeen });
 
   // The Chief of Staff runs the default model, as the full agent does in a workspace.
   const threadModel = useThreadModel({ threadId, isLoading });

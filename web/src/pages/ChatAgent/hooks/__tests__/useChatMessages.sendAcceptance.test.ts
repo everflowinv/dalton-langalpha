@@ -34,9 +34,14 @@ vi.mock('../../session/threadCreation', () => ({
   ensureThreadId: vi.fn().mockResolvedValue({ threadId: 'thread-created', aborted: false }),
 }));
 
+vi.mock('@/hooks/useUser', () => ({
+  useUser: () => ({ user: null, isLoading: false, isError: false }),
+}));
+
 import { sendChatMessageStream } from '../../utils/api';
 import { ensureThreadId } from '../../session/threadCreation';
 import { useChatMessages } from '../useChatMessages';
+import { useComposerDraft, load } from '@/lib/dalton/chatDrafts';
 
 const mockSendStream = sendChatMessageStream as Mock;
 const mockEnsureThreadId = ensureThreadId as Mock;
@@ -204,22 +209,135 @@ describe('useChatMessages – send acceptance (DALTON composer drafts)', () => {
     expect(outcome).toBe(true);
   });
 
-  it('fires onAccepted when a send is queued during compaction', async () => {
-    mockSendStream.mockResolvedValue({ disconnected: false });
+  // DALTON-HOOK(composer-drafts): a send parked during compaction is not
+  // acceptance — the message may still be dropped by a stop, so the composer
+  // draft stays live until the flushed send goes out (accepted → draft
+  // cleared) or the queue is dropped (settled as failed → draft restored).
+  describe('a send queued during compaction (DALTON composer drafts)', () => {
+    const DRAFT_KEY = 'thread:compaction-draft';
 
-    const accepted = vi.fn();
-    const { result } = renderHookWithProviders(() => useChatMessages('ws-test'));
+    /** The chat hook bound to a real composer draft, the way ChatInput wires them. */
+    function useDraftChatHarness() {
+      const chat = useChatMessages('ws-test');
+      const composer = useComposerDraft({ draftKey: DRAFT_KEY });
+      return { chat, composer };
+    }
 
-    act(() => {
-      result.current.setIsCompacting('summarize');
-    });
-    await act(async () => {
-      await result.current.handleSendMessage('held while compacting', null, null, {
-        onAccepted: accepted,
+    /** Parks a composer send while compacting. The real acceptance callback
+     *  (the composer's acceptSend) stays on the send; `accepted` observes it. */
+    function parkWhileCompacting(accepted: Mock) {
+      const { result } = renderHookWithProviders(() => useDraftChatHarness());
+      act(() => {
+        result.current.composer.setMessage('held while compacting');
       });
+      act(() => {
+        result.current.chat.setIsCompacting('summarize');
+      });
+      let sendPromise!: Promise<boolean>;
+      act(() => {
+        result.current.composer.submitWithDraft((onAccepted) => {
+          sendPromise = result.current.chat.handleSendMessage(
+            'held while compacting',
+            null,
+            null,
+            { onAccepted: () => { onAccepted(); accepted(); } },
+          );
+          return sendPromise;
+        });
+      });
+      return { result, sendPromise };
+    }
+
+    beforeEach(() => {
+      localStorage.clear();
     });
 
-    expect(accepted).toHaveBeenCalledTimes(1);
-    expect(result.current.queuedSend).toBe('held while compacting');
+    it('does not accept the parked send — its promise stays open and the draft stays live', () => {
+      mockSendStream.mockImplementation(
+        async (_msg: string, _ws: string, _tid: string | null, opts: StreamOptions) => {
+          opts.onEvent?.({ event: 'metadata', thread_id: 'thread-queued', run_id: 'run-queued' } as never);
+          return { disconnected: false };
+        },
+      );
+
+      const accepted = vi.fn();
+      const { result, sendPromise } = parkWhileCompacting(accepted);
+
+      // Parked, not taken: no stream, no acceptance, and the send's outcome is
+      // still undecided — a stop may yet drop the message.
+      expect(mockSendStream).not.toHaveBeenCalled();
+      expect(accepted).not.toHaveBeenCalled();
+      let settled = false;
+      void sendPromise.then(() => { settled = true; });
+      expect(settled).toBe(false);
+      expect(result.current.chat.queuedSend).toBe('held while compacting');
+      // The composer input is clear for the next thought, but the draft text
+      // survives in storage — the queue cleared nothing.
+      expect(result.current.composer.message).toBe('');
+      expect(load(DRAFT_KEY)).toBe('held while compacting');
+    });
+
+    it('settles the parked send as failed when the user stops, so the draft returns to the composer', async () => {
+      mockSendStream.mockResolvedValue({ disconnected: false });
+
+      const accepted = vi.fn();
+      const { result, sendPromise } = parkWhileCompacting(accepted);
+      expect(result.current.chat.queuedSend).toBe('held while compacting');
+
+      await act(async () => {
+        await result.current.chat.stopWorkflow();
+        await sendPromise;
+      });
+
+      // The parked message never reached the server: the send resolves false,
+      // which the draft lifecycle maps to a restore — the text is back in the
+      // input and still in storage.
+      expect(mockSendStream).not.toHaveBeenCalled();
+      expect(accepted).not.toHaveBeenCalled();
+      expect(result.current.chat.queuedSend).toBe(false);
+      expect(result.current.composer.message).toBe('held while compacting');
+      expect(load(DRAFT_KEY)).toBe('held while compacting');
+    });
+
+    it('accepts the parked send once compaction finishes and it actually goes out, clearing the draft', async () => {
+      mockSendStream.mockImplementation(
+        async (_msg: string, _ws: string, _tid: string | null, opts: StreamOptions) => {
+          opts.onEvent?.({ event: 'thread_id', thread_id: 'thread-queued' });
+          opts.onRunIdResolved?.('run-queued', 'thread-queued');
+          // The header's run id is minted before admission: not acceptance yet.
+          await Promise.resolve();
+          opts.onEvent?.({ event: 'metadata', thread_id: 'thread-queued', run_id: 'run-queued' } as never);
+          return { disconnected: false };
+        },
+      );
+
+      const accepted = vi.fn();
+      const { result, sendPromise } = parkWhileCompacting(accepted);
+      expect(accepted).not.toHaveBeenCalled();
+      expect(result.current.chat.queuedSend).toBe('held while compacting');
+
+      let outcome: boolean | undefined;
+      await act(async () => {
+        result.current.chat.setIsCompacting(false);
+        await Promise.resolve();
+      });
+      // The flushed send goes out and its metadata frame reports acceptance.
+      await waitFor(() => {
+        expect(accepted).toHaveBeenCalledTimes(1);
+      });
+      await act(async () => {
+        outcome = await sendPromise;
+        await Promise.resolve();
+      });
+
+      // The flushed send went out for real: acceptance fired at its metadata
+      // frame, the deferred outcome settled true, and the draft is cleared.
+      expect(mockSendStream).toHaveBeenCalledTimes(1);
+      expect(mockSendStream.mock.calls[0][0]).toBe('held while compacting');
+      expect(outcome).toBe(true);
+      expect(result.current.chat.queuedSend).toBe(false);
+      expect(result.current.composer.message).toBe('');
+      expect(load(DRAFT_KEY)).toBe('');
+    });
   });
 });

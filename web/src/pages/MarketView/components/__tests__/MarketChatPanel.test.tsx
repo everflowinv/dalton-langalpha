@@ -145,6 +145,40 @@ vi.mock('@/pages/ChatAgent/utils/api', async (importActual) => ({
   offloadThread: api.offloadThread,
 }));
 
+// DALTON-HOOK(team-sharing): capture the seen-gating the panel hands the
+// active-thread publisher (the publisher itself maps canMarkSeen:false to
+// "no POST /threads/{id}/seen", pinned in TeamSharing.test.tsx).
+const team = vi.hoisted(() => ({
+  auth: false,
+  readOnly: false,
+  publisherCalls: [] as Array<{ threadId: string | null; canMarkSeen: boolean | undefined }>,
+}));
+
+vi.mock('@/lib/threadLifecycle/useActiveThreadPublisher', () => ({
+  useActiveThreadPublisher: (threadId: string | null, options?: { canMarkSeen?: boolean }) => {
+    team.publisherCalls.push({ threadId, canMarkSeen: options?.canMarkSeen });
+  },
+}));
+
+vi.mock('@/config/daltonAuth', async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  get isDaltonAuth() {
+    return team.auth;
+  },
+}));
+
+vi.mock('@/pages/ChatAgent/components/dalton/TeamSharing', async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  useTeamReadOnly: () => ({
+    access: team.readOnly ? 'ro' : 'owner',
+    isColleague: team.readOnly,
+    isReadOnly: team.readOnly,
+    canWriteFiles: !team.readOnly,
+    ownerName: null,
+    ownerEmail: null,
+  }),
+}));
+
 import MarketChatPanel from '../MarketChatPanel';
 import { useChatMessages } from '@/pages/ChatAgent/hooks/useChatMessages';
 import { chartSelectionStore } from '../../stores/chartSelectionStore';
@@ -852,6 +886,45 @@ describe('MarketChatPanel', () => {
       expect(ci.props?.scope).toBe('all');
       act(() => (ci.props?.onScopeChange as (scope: string) => void)('workspace'));
       expect(onScopeChange).toHaveBeenCalledWith('workspace');
+    });
+  });
+
+  // DALTON-HOOK(team-sharing): the seen cursor must respect workspace
+  // ownership — a read-only colleague opening a shared thread from the chart
+  // must not mark it seen (the server 403s the write and the unseen dot only
+  // comes back on reload).
+  describe('the thread seen cursor (DALTON team sharing)', () => {
+    beforeEach(() => {
+      team.auth = true;
+      team.publisherCalls.length = 0;
+    });
+    afterEach(() => {
+      team.auth = false;
+      team.readOnly = false;
+    });
+
+    it('does not mark the open thread seen for a read-only colleague', async () => {
+      team.readOnly = true;
+      renderPanel();
+
+      // The shared thread is in view, but seen-marking is gated off — the
+      // publisher receives canMarkSeen:false and never POSTs /seen.
+      await vi.waitFor(() => {
+        const last = team.publisherCalls[team.publisherCalls.length - 1];
+        expect(last).toMatchObject({ threadId: 'thread-xyz', canMarkSeen: false });
+      });
+    });
+
+    it('marks the open thread seen for the owner once the workspace row loads', async () => {
+      team.readOnly = false;
+      renderPanel();
+
+      // Ownership confirmed (workspace detail loaded, not read-only) → the
+      // publisher may stamp the seen cursor.
+      await vi.waitFor(() => {
+        const last = team.publisherCalls[team.publisherCalls.length - 1];
+        expect(last).toMatchObject({ threadId: 'thread-xyz', canMarkSeen: true });
+      });
     });
   });
 });

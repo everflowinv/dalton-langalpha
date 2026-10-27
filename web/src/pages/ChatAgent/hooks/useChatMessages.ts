@@ -235,6 +235,13 @@ export function useChatMessages(
     // id of the optimistic shimmer bubble shown while parked, so it can be
     // removed on flush (before the real send re-adds it) or on stop.
     messageId: string;
+    // DALTON-HOOK(composer-drafts): the queueing send's composer linkage. A
+    // queued position is not acceptance — a stop can still drop the message —
+    // so the draft stays unsettled while parked: acceptance rides onAccepted
+    // into the flushed send, and settleQueued resolves the queueing call's
+    // deferred boolean (false on drop, the flushed send's outcome otherwise).
+    onAccepted?: () => void;
+    settleQueued: (sent: boolean) => void;
   } | null>(null);
   const [messageError, setMessageError] = useState<string | StructuredError | null>(null);
   // Steer text for the composer: the user's steers a stop took back from the
@@ -1737,11 +1744,16 @@ export function useChatMessages(
 
   // Forget a message parked during compaction (clear ref + chip + optimistic shimmer bubble).
   const dropQueuedSend = () => {
-    const queuedMsgId = queuedSendRef.current?.messageId;
+    const queued = queuedSendRef.current;
     queuedSendRef.current = null;
     setQueuedSend(false);
-    if (queuedMsgId) {
-      setMessages((prev) => prev.filter((m) => m.id !== queuedMsgId));
+    if (queued) {
+      setMessages((prev) => prev.filter((m) => m.id !== queued.messageId));
+      // DALTON-HOOK(composer-drafts): the parked message never reached the
+      // server — settle its send as failed so the composer draft returns to
+      // the input. chatDrafts ignores the settle when a newer send on the
+      // same key already owns the draft.
+      queued.settleQueued(false);
     }
   };
 
@@ -2334,6 +2346,18 @@ export function useChatMessages(
         chartSelections,
       });
       const queuedMessage: ChatMessage = { ...queuedMsg, queued: true };
+      // DALTON-HOOK(composer-drafts): a queued position is not acceptance — a
+      // stop can still drop the message, and the draft must come back with it.
+      // The composer caller (the one that passed onAccepted) receives a promise
+      // that settles only on the flushed send's outcome or on drop; callers
+      // without onAccepted keep the immediate boolean this branch has always
+      // returned.
+      let resolveQueued: (sent: boolean) => void = () => {};
+      const outcome = onAccepted
+        ? new Promise<boolean>((resolve) => {
+            resolveQueued = resolve;
+          })
+        : null;
       // The subagents setting stays behind: compaction only runs on a thread
       // that exists, whose row a flip made since has already PATCHed, and the
       // value captured now would store over that flip when the send flushes.
@@ -2343,15 +2367,16 @@ export function useChatMessages(
         attachmentMeta,
         modelOptions: { model, reasoningEffort, fastMode, widgetSnapshots, chartSelections },
         messageId: queuedMessage.id as string,
+        onAccepted,
+        settleQueued: resolveQueued,
       };
       setMessages((prev) => {
         const base = prevQueuedId ? prev.filter((m) => m.id !== prevQueuedId) : prev;
         return appendMessage(base, queuedMessage);
       });
       setQueuedSend(message.trim() || '…');
-      // DALTON-HOOK(composer-drafts): a queued position counts as accepted; the draft settles sent
-      notifyAccepted();
-      return true;
+      // DALTON-HOOK(composer-drafts): no acceptance here — see the promise above
+      return outcome ?? true;
     }
 
     // The resend of a refused steer is the queue's own; anything else waits behind it.
@@ -2689,14 +2714,19 @@ export function useChatMessages(
     if (!queued) return;
     queuedSendRef.current = null;
     setQueuedSend(false);
-    const { message, additionalContext, attachmentMeta, modelOptions, messageId } = queued;
+    const { message, additionalContext, attachmentMeta, modelOptions, messageId, onAccepted: queuedAccepted, settleQueued } = queued;
     // Drop the optimistic shimmer bubble; the send path re-adds the real one
     // (steering shimmer if a turn is still running, else a normal user bubble)
     // in its place, in the same batch.
     if (messageId) {
       setMessages((prev) => prev.filter((m) => m.id !== messageId));
     }
-    void handleSendMessage(message, additionalContext, attachmentMeta, modelOptions, { shown: { userId: messageId } });
+    // DALTON-HOOK(composer-drafts): the flushed send inherits the parked
+    // send's acceptance callback and settles its deferred outcome, so the
+    // draft clears only on real acceptance (a metadata frame carrying a
+    // run_id and the like) and comes back when the flushed send is refused.
+    void handleSendMessage(message, additionalContext, attachmentMeta, { ...modelOptions, onAccepted: queuedAccepted }, { shown: { userId: messageId } })
+      .then(settleQueued);
     // Fires on isCompacting transitions. The send handler is captured from
     // the render where isCompacting went false — that render is the correct
     // moment to decide steer-vs-fresh. Handlers are omitted from
