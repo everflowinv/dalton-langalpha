@@ -1846,6 +1846,13 @@ async def test_delete_workspace_success(client, query, delete_files):
             return_value=ws,
         ),
         patch("src.server.app.workspaces.WorkspaceManager") as MockWM,
+        # DALTON-HOOK(workspace-delete-guard): the route asks the publications
+        # table before deleting; this workspace holds none.
+        patch(
+            "src.dalton.database.publications.has_published_reports",
+            new_callable=AsyncMock,
+            return_value=False,
+        ),
     ):
         mock_manager = AsyncMock()
         mock_manager.delete_workspace = AsyncMock()
@@ -1859,6 +1866,35 @@ async def test_delete_workspace_success(client, query, delete_files):
     mock_manager.delete_workspace.assert_awaited_once_with(
         ws["workspace_id"], delete_files=delete_files
     )
+
+
+@pytest.mark.asyncio
+async def test_delete_workspace_with_published_reports_is_refused(client):
+    """DALTON-HOOK(workspace-delete-guard): a workspace holding immutable
+    published reports is not deletable — the guard answers 409 and the
+    manager is never reached."""
+    ws = _ws(status="stopped")
+    with (
+        patch(
+            "src.server.app.workspaces.db_get_workspace",
+            new_callable=AsyncMock,
+            return_value=ws,
+        ),
+        patch("src.server.app.workspaces.WorkspaceManager") as MockWM,
+        patch(
+            "src.dalton.database.publications.has_published_reports",
+            new_callable=AsyncMock,
+            return_value=True,
+        ),
+    ):
+        mock_manager = AsyncMock()
+        MockWM.get_instance.return_value = mock_manager
+
+        resp = await client.delete(f"/api/v1/workspaces/{ws['workspace_id']}")
+
+    assert resp.status_code == 409
+    assert "已发布研报" in resp.json()["detail"]
+    mock_manager.delete_workspace.assert_not_awaited()
 
 
 @pytest.mark.asyncio

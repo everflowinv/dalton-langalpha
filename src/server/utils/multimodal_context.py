@@ -30,6 +30,17 @@ logger = logging.getLogger(__name__)
 INLINE_UNSAVED_PDF_MAX_BYTES = 10 * 1024 * 1024
 
 
+def data_url_decoded_size(data_url: str) -> int:
+    """Decoded byte size of a base64 data URL, without decoding it.
+
+    DALTON-HOOK(attachment-native-cap): the trailing ``=`` padding is not
+    payload, so a file exactly at a limit stated in decoded bytes reads at
+    it, not a hair over.
+    """
+    payload = data_url.split(",", 1)[1] if "," in data_url else ""
+    return len(payload) // 4 * 3 - (len(payload) - len(payload.rstrip("=")))
+
+
 def parse_multimodal_contexts(
     additional_context: Optional[List[Any]],
 ) -> List[MultimodalContext]:

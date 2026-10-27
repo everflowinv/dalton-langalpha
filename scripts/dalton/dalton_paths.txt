@@ -48,4 +48,5 @@ tests/unit/tools/web/inhouse/test_fetch_binary_route.py
 tests/unit/mcp_servers/test_market_data_yf_fallback.py
 tests/unit/server/handlers/chat/test_attachments_notes.py
 tests/unit/server/handlers/chat/test_unreadable_image_upload.py
+tests/unit/server/handlers/conftest.py
 tests/unit/ptc_agent/middleware/test_image_byte_fit.py

@@ -96,9 +96,10 @@ async def test_an_undecodable_image_without_a_sandbox_gets_the_note(monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_a_small_image_without_a_sandbox_still_inlines(monkeypatch):
-    """No sandbox to save to is no save failure for a readable image: the
-    inline block is its own copy, and no reupload note appears."""
+async def test_a_small_image_without_a_sandbox_inlines_and_says_so(monkeypatch):
+    """No sandbox to save to is no reason to drop the note: the inline block
+    is its own copy, and the reminder beside it says the workspace copy is
+    what is missing and sends the user back to the file panel."""
     content = await _run(
         monkeypatch,
         [_png_attachment("ok.png")],
@@ -108,7 +109,29 @@ async def test_a_small_image_without_a_sandbox_still_inlines(monkeypatch):
     texts = [b for b in content if isinstance(b, dict) and b.get("type") == "text"]
     assert any("[Attached image: ok.png]" in b["text"] for b in texts)
     assert any(isinstance(b, dict) and b.get("type") == "image_url" for b in content)
-    assert not any("saving it to the workspace failed" in str(b) for b in content)
+    assert any(
+        "shown inline above" in b["text"]
+        and "saving it to the workspace failed" in b["text"]
+        and "file panel" in b["text"]
+        for b in texts
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_image_whose_upload_failed_inlines_with_the_note_too(monkeypatch):
+    """A sandbox that refuses the upload is the same state: the block rides,
+    the reminder says no workspace copy exists."""
+    content = await _run(
+        monkeypatch,
+        [_png_attachment("late.png")],
+        [None],
+    )
+    assert isinstance(content, list)
+    assert any(isinstance(b, dict) and b.get("type") == "image_url" for b in content)
+    texts = [b for b in content if isinstance(b, dict) and b.get("type") == "text"]
+    assert any(
+        "shown inline above" in b["text"] and "file panel" in b["text"] for b in texts
+    )
 
 
 @pytest.mark.asyncio
@@ -143,6 +166,34 @@ async def test_an_unsaved_pdf_over_the_ceiling_is_not_inlined(monkeypatch):
     assert "saving it to the workspace failed" in content
     assert "file panel" in content
     assert "base64" not in content
+
+
+@pytest.mark.asyncio
+async def test_an_unsaved_pdf_of_exactly_the_ceiling_inlines(monkeypatch):
+    """Padding is not payload: a PDF whose decoded size sits exactly at the
+    ceiling inlines, not a hair over it through the base64 tail."""
+    from src.server.utils.multimodal_context import data_url_decoded_size
+
+    raw = b"%PDF-1.4\n" + os.urandom(INLINE_UNSAVED_PDF_MAX_BYTES - len(b"%PDF-1.4\n"))
+    assert len(raw) == INLINE_UNSAVED_PDF_MAX_BYTES
+    data_url = (
+        "data:application/pdf;base64,"
+        + base64.b64encode(raw).decode()
+    )
+    assert data_url_decoded_size(data_url) == INLINE_UNSAVED_PDF_MAX_BYTES
+    content = await _run(
+        monkeypatch,
+        [{"type": "image", "data": data_url, "description": "edge.pdf"}],
+        None,
+    )
+    assert isinstance(content, list)
+    [file_block] = [
+        b for b in content if isinstance(b, dict) and b.get("type") == "file"
+    ]
+    assert file_block["unsaved"] is True
+    # The inline copy rides, with the unsaved reminder beside it.
+    texts = [b for b in content if isinstance(b, dict) and b.get("type") == "text"]
+    assert any("shown inline above" in b["text"] for b in texts)
 
 
 @pytest.mark.asyncio

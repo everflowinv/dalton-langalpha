@@ -147,10 +147,13 @@ async def test_a_422_names_each_field_with_its_message_and_options(client):
 async def test_a_put_returns_the_saved_view(client, name):
     version = await _version(client, name, "read")
 
-    resp = await client.put(f"{URL}/{name}", json={"version": version, "fields": {"brokerages": "off"}})
+    # DALTON-HOOK(hide-trading): brokerages defaults to "off" in Dalton, so
+    # submitting it saves nothing; memory is a field that genuinely deviates
+    # from the base, which is what a save has to show.
+    resp = await client.put(f"{URL}/{name}", json={"version": version, "fields": {"memory": True}})
 
     assert resp.status_code == 200
-    assert resp.json()["brokerages"] == "off"
+    assert resp.json()["memory"] is True
     # The view returned carries the version the next write sends.
     assert resp.json()["version"] == await _version(client, name, "read")
 
@@ -165,10 +168,13 @@ async def test_a_deployment_name_with_a_slash_can_be_tuned_and_reset(client, wor
     world.offered = (*world.offered, "team/research")
     path = f"{URL}/{quote('team/research', safe='')}"
 
+    # DALTON-HOOK(hide-trading): a field that deviates from the base, so the
+    # save creates the override row the assertions below ride on.
     resp = await client.put(path, json={"version": await _version(client, "team/research", "read"),
-                                        "fields": {"brokerages": "off"}})
+                                        "fields": {"memory": True}})
     assert resp.status_code == 200
     assert resp.json()["name"] == "team/research"
+    assert resp.json()["memory"] is True
     assert "team/research" in world.rows
 
     resp = await client.delete(path, params={"version": await _version(client, "team/research", "read")})
