@@ -5,6 +5,10 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import enUS from '@/locales/en-US.json';
 import zhCN from '@/locales/zh-CN.json';
 
+// DALTON-HOOK(brand-name): AppSidebar now mounts upstream's Getting Started gate, which needs
+// the onboarding provider these brand/search harnesses do not mount.
+vi.mock('@/pages/Onboarding/GettingStartedGate', () => ({ default: () => null, GettingStartedGate: () => null }));
+
 vi.mock('@/contexts/ThemeContext', () => ({
   useTheme: () => ({ theme: 'dark', preference: 'dark', setTheme: vi.fn(), toggleTheme: vi.fn() }),
 }));

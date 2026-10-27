@@ -1,14 +1,14 @@
 import { useEffect, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 import { AlertCircle } from 'lucide-react';
+import { useTheme } from '@/contexts/ThemeContext';
 import { Button } from '@/components/ui/button';
 import { Loader } from '@/components/ui/loader';
-import { useTheme } from '@/contexts/ThemeContext';
-import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
-import { oneDark, oneLight } from 'react-syntax-highlighter/dist/esm/styles/prism';
+import SyntaxHighlighter, { oneDark, oneLight } from '../SyntaxHighlighter';
 import { useHtmlSandbox } from './html/useHtmlSandbox';
 import { useServedHtml } from './html/useServedHtml';
 import { SERVED_HTML_SANDBOX } from './html/sandbox';
+import './HtmlViewer.css';
 
 interface HtmlViewerProps {
   /** Full source (read unlimited so Source isn't truncated). */

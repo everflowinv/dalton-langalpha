@@ -16,6 +16,10 @@ import type { GlobalSearchResponse } from '@/lib/dalton/searchApi';
 import type { LocationState } from '@/pages/ChatAgent/components/chatView/types';
 import type { PanelTarget } from '@/pages/ChatAgent/components/filePanel/types';
 
+// DALTON-HOOK(brand-name): AppSidebar now mounts upstream's Getting Started gate, which needs
+// the onboarding provider these brand/search harnesses do not mount.
+vi.mock('@/pages/Onboarding/GettingStartedGate', () => ({ default: () => null, GettingStartedGate: () => null }));
+
 // Valid v4 UUIDs: usePanelLinkOpen ignores a link whose workspace id fails isValidUuid.
 const WS_NVDA = '11111111-1111-4111-8111-111111111111';
 const WS_AMD = '22222222-2222-4222-8222-222222222222';

@@ -10,6 +10,8 @@ import type { useChatMessages as useChatMessagesType } from '@/pages/ChatAgent/h
 import type { ChatMessage } from '@/types/chat';
 
 vi.mock('@/components/ui/dropdown-menu', () => ({
+  // upstream's context menu reads this class constant from the dropdown module
+  DESTRUCTIVE_ITEM: 'text-destructive',
   DropdownMenu: ({ children }: { children: React.ReactNode }) => (
     <div data-testid="dropdown-menu">{children}</div>
   ),
