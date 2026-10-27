@@ -78,7 +78,7 @@ async def chief_of_staff_workspaces(
         content: Full UTF-8 text to write; required for "write_file" (requires "rw" access).
 
     Returns:
-        Workspace rows (with colleague owner and access level) for "list", the new id for "create", or file paths/content for file actions.
+        Workspace rows (with colleague owner and access level) for "list"; for "create" the new id with `folder_path` and `folder_ready` (before copying or cleaning into a new workspace, confirm `folder_path` exists and is non-empty — until `folder_ready` is true the folder is not on the machine yet); file paths/content for file actions.
     """
     user_id = config.get("configurable", {}).get("user_id")
     if not user_id:

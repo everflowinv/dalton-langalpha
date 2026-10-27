@@ -109,6 +109,8 @@ ALLOWED_HOOKS=(
   "subagent-caps"
   "global-search"
   "hide-experiments"
+  "fetch-binary-route"
+  "workspace-folder-ready"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

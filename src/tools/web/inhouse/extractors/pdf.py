@@ -35,6 +35,29 @@ class PdfExtractor(ContentExtractor):
         title = self._title_from_url(url)
         return CrawlOutput(title=title, html="", markdown=text)
 
+    # DALTON-HOOK(fetch-binary-route): entry for payloads the crawler already
+    # downloaded through an extension-less redirect. Extraction failures are
+    # stated in the output instead of returning None, because there is no
+    # fallback left that could do better with the same bytes.
+    async def extract_bytes(self, content: bytes, *, url: str) -> CrawlOutput:
+        if len(content) > _MAX_PDF_SIZE:
+            return CrawlOutput(
+                title=self._title_from_url(url),
+                html="",
+                markdown=(
+                    f"PDF 文本提取失败：文件超过 {_MAX_PDF_SIZE // (1024 * 1024)}MB 上限"
+                    f"（{len(content)} 字节）；最终地址：{url}"
+                ),
+            )
+        text = await self._extract_text(content)
+        if text is None or not text.strip():
+            return CrawlOutput(
+                title=self._title_from_url(url),
+                html="",
+                markdown=f"PDF 文本提取失败：pdfplumber 与 pypdf 均未提取出文本（可能是扫描件）；最终地址：{url}",
+            )
+        return CrawlOutput(title=self._title_from_url(url), html="", markdown=text)
+
     async def _download(self, url: str) -> bytes | None:
         """Download PDF with size guard. Returns None if too large or wrong type."""
         try:

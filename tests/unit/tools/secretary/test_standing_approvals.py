@@ -288,12 +288,19 @@ async def test_a_workspace_created_without_asking_carries_its_card():
             USER_ID, "Research", "Q3 notes", "call-1", preapproved=True
         )
 
+    # DALTON-HOOK(workspace-folder-ready): every create result also carries the
+    # folder fields; against this machine double the folder is never ready.
     assert _payload(result) == {
         "success": True,
         "workspace_id": "ws-1",
         "workspace_name": "Research",
         "preapproved": True,
         "workspace_description": "Q3 notes",
+        "folder_ready": False,
+        "folder_hint": (
+            "计算机启动后才会创建该文件夹；需要交接文件时，先放在 Home 下，并把路径写进派发说明"
+        ),
+        "folder_note": "复制或清理前先确认 folder_path 已存在且非空",
     }
 
 

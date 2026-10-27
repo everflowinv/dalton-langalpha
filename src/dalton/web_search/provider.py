@@ -32,6 +32,7 @@ from src.dalton.web_search.broker_protocol import (
     HTTP_TIMEOUT_MARGIN_SECONDS,
     compute_http_timeout_seconds,
 )
+from src.dalton.web_search.redirects import resolve_grounding_redirects
 from src.tools.utils.validation_utils import validate_date_format
 from src.tools.web.providers._shared import (
     SNIPPET_MAX,
@@ -50,6 +51,7 @@ BRIDGE_UNAVAILABLE_MESSAGE = "OpenClaw 网页搜索桥不可用"
 BRIDGE_BUSY_MESSAGE = "OpenClaw 网页搜索繁忙，请稍后重试"
 RATE_LIMITED_MESSAGE = "OpenClaw 网页搜索触发限流，请稍后重试"
 EMPTY_RESULTS_MESSAGE = "OpenClaw 网页搜索返回空结果"
+EMPTY_GENERATION_MESSAGE = "搜索模型这次没有给出回答，可以换个说法重试一次"
 ANSWER_ONLY_HEADING = "OpenClaw 综合答案（无来源链接）"
 ANSWER_WITH_SOURCES_HEADING = "OpenClaw 综合答案（来源见下）"
 
@@ -74,6 +76,10 @@ _UNTRUSTED_WRAPPER_RE = re.compile(
     r"^\s*<<<EXTERNAL_UNTRUSTED_CONTENT[^>]*>>>\s*(?:Source:[^\n]*\n---\n)?(.*?)\s*<<<END_EXTERNAL_UNTRUSTED_CONTENT[^>]*>>>\s*$",
     re.DOTALL,
 )
+
+# Broker wording for "the search model returned nothing" — the empty-generation
+# class keys off the message because the error code is a generic PROVIDER_ERROR.
+_EMPTY_GENERATION_RE = re.compile(r"no final answer|empty (?:model )?(?:answer|response)", re.IGNORECASE)
 
 
 class OpenClawSearchBridgeUnavailableError(RuntimeError):
@@ -103,6 +109,20 @@ class OpenClawSearchEmptyResultError(RuntimeError):
 
     def __init__(self, message: str = EMPTY_RESULTS_MESSAGE) -> None:
         super().__init__(message or EMPTY_RESULTS_MESSAGE)
+
+
+class OpenClawSearchEmptyGenerationError(RuntimeError):
+    """Raised when the bridge is fine but the search model produced no answer.
+
+    The broker reports it as a PROVIDER_ERROR ("no final answer"); the bridge
+    being up means no transport/troubleshooting path should fire — the caller
+    retries once and then tells the model to rephrase, not that the bridge is
+    down.
+    """
+
+    def __init__(self, detail: str = "") -> None:
+        cleaned = detail.strip()
+        super().__init__(EMPTY_GENERATION_MESSAGE if not cleaned else cleaned)
 
 
 def _answer_with_sources(answer: str, results: List[Dict[str, Any]]) -> Union[str, List[Dict[str, Any]]]:
@@ -197,6 +217,13 @@ def _raise_for_bridge_error_payload(
             detail,
             code=code or "PROVIDER_RATE_LIMITED",
         )
+
+    # The model generated no answer this round ("no final answer"). The bridge
+    # and broker did their jobs, so this must NOT fall into the
+    # bridge-unavailable bucket below, which reads as "the search bridge is
+    # down" and invites troubleshooting instead of one retry with a rephrase.
+    if raw_message and _EMPTY_GENERATION_RE.search(raw_message):
+        raise OpenClawSearchEmptyGenerationError(EMPTY_GENERATION_MESSAGE)
 
     # A broker-side INVALID_JSON arrives as 5xx: that is the bridge failing, not a bad request.
     if http_status == 400 or (code in _PARAM_ERROR_CODES and http_status in (None, 400)):
@@ -584,12 +611,24 @@ def build_web_search_tool(
             )
             api = _get_api_wrapper()
             start_t = time.monotonic()
-            raw = await api.raw_results(
-                query=query,
-                max_results=max_results,
-                date_after=date_after,
-                date_before=date_before,
-            )
+            try:
+                raw = await api.raw_results(
+                    query=query,
+                    max_results=max_results,
+                    date_after=date_after,
+                    date_before=date_before,
+                )
+            except OpenClawSearchEmptyGenerationError:
+                # The bridge answered; only the model's generation came back
+                # empty. One in-provider retry, then the message below tells the
+                # model to rephrase — this is never a bridge-unavailable signal.
+                logger.warning("OpenClaw web search empty generation; retrying once")
+                raw = await api.raw_results(
+                    query=query,
+                    max_results=max_results,
+                    date_after=date_after,
+                    date_before=date_before,
+                )
             elapsed = time.monotonic() - start_t
             cleaned_results, artifact = map_broker_response(
                 raw,
@@ -597,6 +636,7 @@ def build_web_search_tool(
                 response_time=elapsed,
                 include_favicon=include_favicon,
             )
+            await resolve_grounding_redirects(cleaned_results, artifact.get("results") or [])
             if artifact.get("answer"):
                 return _answer_with_sources(artifact["answer"], cleaned_results), artifact
             return cleaned_results, artifact
@@ -604,6 +644,14 @@ def build_web_search_tool(
             error_message = str(exc)
             logger.warning("OpenClaw web search returned empty results")
             return error_message, {"error": error_message, "query": query}
+        except OpenClawSearchEmptyGenerationError as exc:
+            error_message = str(exc)
+            logger.warning("OpenClaw web search empty generation after retry")
+            return error_message, {
+                "error": error_message,
+                "code": "empty_generation",
+                "query": query,
+            }
         except OpenClawSearchRequestError as exc:
             error_message = str(exc)
             logger.warning("OpenClaw web search request error: %s", exc.code)
@@ -653,9 +701,11 @@ __all__ = [
     "DEFAULT_HTTP_TIMEOUT_SECONDS",
     "DEFAULT_QUEUE_TIMEOUT_SECONDS",
     "DEFAULT_TIMEOUT_MS",
+    "EMPTY_GENERATION_MESSAGE",
     "EMPTY_RESULTS_MESSAGE",
     "HTTP_TIMEOUT_MARGIN_SECONDS",
     "OpenClawSearchBridgeUnavailableError",
+    "OpenClawSearchEmptyGenerationError",
     "OpenClawSearchEmptyResultError",
     "OpenClawSearchRequestError",
     "OpenClawSearchWrapper",

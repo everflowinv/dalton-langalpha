@@ -6,6 +6,7 @@ The tools themselves are in ``chief_of_staff``; a hand-off runs through
 
 import json
 import logging
+from typing import Any
 
 from langchain_core.messages import ToolMessage
 from langgraph.types import Command
@@ -121,6 +122,57 @@ async def workspaces_list(user_id: str, tool_call_id: str) -> Command:
 # workspace the user already holds never rides the standing approval — the
 # middleware withholds it when the model proposes the call, and the duplicate
 # is named on the card, so the user can just reuse it.
+# --- DALTON-HOOK(workspace-folder-ready): begin ---
+_FOLDER_NOT_READY_HINT = (
+    "计算机启动后才会创建该文件夹；需要交接文件时，先放在 Home 下，并把路径写进派发说明"
+)
+_FOLDER_CHECK_NOTE = "复制或清理前先确认 folder_path 已存在且非空"
+
+
+async def _folder_ready_result(
+    manager: Any, user_id: str, workspace: dict
+) -> dict:
+    """``folder_ready``/``folder_path`` for a just-created workspace.
+
+    A new row owns a folder name but no folder until the machine's next
+    acquisition builds it, which left the Chief of Staff copying hand-off
+    files into a directory that did not exist yet. When the machine is
+    already running, a warm acquire through the ordinary attach path creates
+    the folder now; otherwise the result says so and points the hand-off at
+    Home. Any failure along the way degrades to ``folder_ready: False`` —
+    the create itself already succeeded and must not fail with it.
+    """
+    workspace_id = str(workspace.get("workspace_id") or "")
+    dir_name = str(workspace.get("dir_name") or "").strip()
+    computer_id = str(workspace.get("computer_id") or "").strip()
+    try:
+        from src.server.database.computer import get_computer
+
+        computer = await get_computer(computer_id) if computer_id else None
+        running = bool(computer) and str((computer or {}).get("status") or "") == "running"
+    except Exception as e:
+        logger.warning(f"Could not read computer status for {workspace_id}: {e}")
+        running = False
+    if not running or not dir_name:
+        return {"folder_ready": False, "folder_hint": _FOLDER_NOT_READY_HINT}
+    try:
+        # Reuses the standing acquire path: its project attach creates the
+        # folder (ComputerManager._ensure_workspace_dirs), so no ad-hoc mkdir.
+        await manager.get_session_for_workspace(workspace_id, user_id=user_id)
+        binding = await manager.resolve_binding(workspace_id)
+        root = str(getattr(binding, "root_dir", None) or "").rstrip("/")
+        folder = str(getattr(binding, "dir_name", None) or dir_name)
+        if not root or not folder:
+            return {"folder_ready": False, "folder_hint": _FOLDER_NOT_READY_HINT}
+        return {"folder_ready": True, "folder_path": f"{root}/{folder}"}
+    except Exception as e:
+        logger.warning(
+            f"Could not prepare the folder for workspace {workspace_id}: {e}"
+        )
+        return {"folder_ready": False, "folder_hint": _FOLDER_NOT_READY_HINT}
+# --- DALTON-HOOK(workspace-folder-ready): end ---
+
+
 async def workspaces_create(
     user_id: str,
     name: str | None,
@@ -185,6 +237,15 @@ async def workspaces_create(
             "workspace_id": str(workspace["workspace_id"]),
             "workspace_name": workspace["name"],
         }
+        # --- DALTON-HOOK(workspace-folder-ready): begin ---
+        # The folder is only built at the machine's next acquire, so say where
+        # it will be and whether it is there now — the incident's hand-off
+        # copied into a directory that did not exist yet.
+        result.update(
+            await _folder_ready_result(workspace_manager, user_id, workspace)
+        )
+        result["folder_note"] = _FOLDER_CHECK_NOTE
+        # --- DALTON-HOOK(workspace-folder-ready): end ---
         if preapproved:
             # The card for it is drawn from this result.
             result["preapproved"] = True
