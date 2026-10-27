@@ -249,3 +249,21 @@ def test_guidepoint_string_keywords_become_a_single_element_list():
     )
     assert err is None
     assert normalized["params"]["keywords"] == ["reels"]
+
+
+def test_guidepoint_fanout_carries_normalized_nested_start_and_end_dates(monkeypatch):
+    monkeypatch.setattr(rb, "_bridge_today", lambda: "2026-10-26")
+    normalized, _, err = rb._normalize_and_validate_call_args(
+        "research",
+        {
+            "route": "all",
+            "query": "Meta advertising",
+            "params": {"start_date": "2026-09", "end_date": "2026-10-30T08:00:00"},
+        },
+    )
+    assert err is None
+    gp_args = rb.ResearchDataBridge._build_guidepoint_fanout_args(
+        _fanout_bridge(), normalized
+    )
+    assert gp_args["params"]["start_date"] == "2026-09-01"
+    assert gp_args["params"]["end_date"] == "2026-10-26"

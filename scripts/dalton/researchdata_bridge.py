@@ -1244,6 +1244,7 @@ INTERNAL_LIBRARY_ROUTES: frozenset[str] = frozenset(
 # ticker into the query instead of letting the call die upstream.
 TICKER_FOLDS_INTO_QUERY_ROUTES: frozenset[str] = frozenset(
     {
+        "all",
         "alphaengine",
         "guidepoint",
         "company-wiki",
@@ -1253,6 +1254,19 @@ TICKER_FOLDS_INTO_QUERY_ROUTES: frozenset[str] = frozenset(
         "funda-ai",
     }
 )
+
+
+def _query_contains_ticker(query: str, ticker: str) -> bool:
+    """True when ``ticker`` already appears in ``query`` as a whole token (non-alphanumeric boundaries, case-insensitive)."""
+    if not ticker or not query:
+        return False
+    return bool(
+        re.search(
+            rf"(?<![A-Za-z0-9]){re.escape(ticker)}(?![A-Za-z0-9])",
+            query,
+            re.IGNORECASE,
+        )
+    )
 INTERNAL_LIBRARY_READ_OPERATIONS: frozenset[str] = frozenset({"read"})
 MAX_CHARS_FLOOR: int = 1
 MAX_CHARS_CEILING: int = 30000
@@ -1909,6 +1923,8 @@ ROUTE_CONTRACT_SPECS: dict[str, dict[str, Any]] = {
             "indexed_since",
             "keywords",
             "recency_bias",
+            "start_date",
+            "end_date",
         ],
         "required_params": {
             "search": ["query 或 ticker"],
@@ -1917,7 +1933,7 @@ ROUTE_CONTRACT_SPECS: dict[str, dict[str, Any]] = {
         },
         "optional_params": ["start", "end", "limit", "params"],
         "param_formats": {
-            "ticker": "股票代码（如 'META'、'0700.HK'、'300750.SZ'）",
+            "ticker": "股票代码（如 'META'、'0700.HK'、'300750.SZ'）；会并入 query 检索词（上游不支持单独的 ticker 参数）",
             "start": "YYYY-MM-DD",
             "end": "YYYY-MM-DD",
             "document": "带库前缀的文档 ID（如 'wiki:123'、'mail:456'、'tmtb:789'、'funda:10'）",
@@ -2766,7 +2782,7 @@ def _normalize_and_validate_call_args(
         folded_ticker = str(normalized.pop("ticker", "") or "").strip()
         if folded_ticker:
             folded_query = str(normalized.get("query") or "").strip()
-            if folded_ticker.lower() not in folded_query.lower():
+            if not _query_contains_ticker(folded_query, folded_ticker):
                 normalized["query"] = (
                     f"{folded_ticker} {folded_query}".strip() if folded_query else folded_ticker
                 )
@@ -3515,23 +3531,28 @@ def _classify_error_category_and_hint(
         # answered, so neither "参数错误" nor "上游暂不可用，可重试" is the fix.
         category = "没有匹配"
     elif other_param_signal or e_bad_signal:
-        if e_bad_signal and not other_param_signal:
-            _succeeded, failed_legs = _collect_multi_source_health(payload)
-            if failed_legs and not all(
-                _reason_is_upstream_argument_error(reason) for _, reason in failed_legs
-            ):
-                # A mixed fan-out (one E_BAD_* leg, one timeout/...) is not a
-                # parameter error as a whole; keep the per-leg categories so
-                # the agent can see which leg needs which fix.
-                payload["leg_categories"] = {
-                    name: _classify_error_category_and_hint(
-                        tool_name, route, operation, {"error": reason}
-                    )[0]
-                    for name, reason in failed_legs
-                }
-                category = "上游不可用"
-            else:
+        _succeeded, failed_legs = (
+            _collect_multi_source_health(payload) if route == "all" else ([], [])
+        )
+        if failed_legs:
+            # Classify each failed leg individually first: a mixed fan-out (one
+            # parameter-error leg and one timeout/outage leg, even when the
+            # parameter error says "E_BAD_ARGS: 参数...") is only a whole-call
+            # parameter error when every failed leg is a parameter error.
+            leg_cats = {
+                name: _classify_error_category_and_hint(
+                    tool_name,
+                    name if name in ROUTE_CONTRACT_SPECS else route,
+                    operation,
+                    {"error": reason},
+                )[0]
+                for name, reason in failed_legs
+            }
+            if all(cat == "参数错误" for cat in leg_cats.values()):
                 category = "参数错误"
+            else:
+                payload["leg_categories"] = leg_cats
+                category = "上游不可用"
         else:
             category = "参数错误"
     elif (
@@ -4752,7 +4773,7 @@ class ResearchDataBridge:
         """
         query = str(arguments.get("query") or "").strip()
         ticker = str(arguments.get("ticker") or "").strip()
-        if ticker and ticker.lower() not in query.lower():
+        if ticker and not _query_contains_ticker(query, ticker):
             query = f"{ticker} {query}".strip() if query else ticker
 
         ae_args: dict[str, Any] = {
@@ -4805,7 +4826,7 @@ class ResearchDataBridge:
         """
         query = str(arguments.get("query") or "").strip()
         ticker = str(arguments.get("ticker") or "").strip()
-        if ticker and ticker.lower() not in query.lower():
+        if ticker and not _query_contains_ticker(query, ticker):
             query = f"{ticker} {query}".strip() if query else ticker
 
         gp_args: dict[str, Any] = {
@@ -4841,7 +4862,17 @@ class ResearchDataBridge:
                 gp_params["keywords"] = [raw_keywords.strip()]
             if isinstance(raw_params.get("recency_bias"), str) and raw_params["recency_bias"].strip():
                 gp_params["recency_bias"] = raw_params["recency_bias"].strip()
+            for nested_date_k, as_field in (("start_date", "start"), ("end_date", "end")):
+                raw_nd = raw_params.get(nested_date_k)
+                if raw_nd is not None and str(raw_nd).strip():
+                    coerced_nd = _normalize_date_param(as_field, raw_nd)
+                    gp_params[nested_date_k] = (
+                        min(coerced_nd, _bridge_today())
+                        if coerced_nd is not None and as_field == "end"
+                        else (coerced_nd if coerced_nd is not None else str(raw_nd).strip())
+                    )
             if gp_params:
+                _normalize_date_window("guidepoint", gp_args, gp_params)
                 gp_args["params"] = gp_params
 
         gp_args["timeout"] = self._compute_fanout_timeout(

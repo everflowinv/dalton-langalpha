@@ -46,7 +46,7 @@ from data_client.ginlix_data import (
     get_ginlix_mcp_client,
 )
 from data_client.market_data_provider import symbol_market
-from data_client.normalize import minor_unit_scale, normalize_bars, scale_price
+from data_client.normalize import minor_unit_scale, normalize_bars, scale_price, symbol_timezone  # DALTON-HOOK(market-data-fallback)
 from data_client.ginlix_data.cn_source import GinlixDataCnSource
 from data_client.ginlix_data.directory import NameDirectory
 from market_protocol import is_family_index, to_canonical, to_display, to_legacy_api  # DALTON-HOOK(stock-move-upgrade)
@@ -214,9 +214,89 @@ _YF_LOOKBACK_DAYS: dict[str, int] = {"1m": 6, "5m": 57, "15m": 57, "30m": 57, "1
 def _yf_exclusive_end(end: str) -> str:
     """Advance an inclusive end date to yfinance's exclusive ``end`` bound."""
     try:
-        return ((datetime.strptime(end, "%Y-%m-%d") + timedelta(days=1)).date()).isoformat()
+        return ((datetime.strptime(end.strip()[:10], "%Y-%m-%d") + timedelta(days=1)).date()).isoformat()
     except ValueError:
         return end
+
+
+# DALTON-HOOK(market-data-fallback): interpret intraday start/end strings with
+# HH:MM[:SS] in the instrument's exchange timezone and filter returned bars to
+# the requested window.
+def _yf_parse_exchange_bound_ms(
+    bound: Optional[str], display: str, *, is_end: bool
+) -> Optional[int]:
+    if not bound:
+        return None
+    s = bound.strip().replace("T", " ")
+    if not s:
+        return None
+    tz = symbol_timezone(display)
+    dt: Optional[datetime] = None
+    if len(s) == 10:
+        try:
+            dt = datetime.strptime(s, "%Y-%m-%d")
+            if is_end:
+                dt = dt.replace(hour=23, minute=59, second=59, microsecond=999999)
+        except ValueError:
+            return None
+    else:
+        for fmt, pad_end_seconds in (("%Y-%m-%d %H:%M:%S", False), ("%Y-%m-%d %H:%M", True)):
+            try:
+                dt = datetime.strptime(s, fmt)
+                if is_end and pad_end_seconds:
+                    dt = dt.replace(second=59, microsecond=999999)
+                break
+            except ValueError:
+                continue
+    if dt is None:
+        return None
+    return int(dt.replace(tzinfo=tz).timestamp() * 1000)
+
+
+def _filter_display_rows_to_window(
+    rows: list[dict],
+    start_date: Optional[str],
+    end_date: Optional[str],
+    *,
+    intraday: bool,
+) -> list[dict]:
+    if not rows or (not start_date and not end_date):
+        return rows
+    start_bound: Optional[str] = None
+    end_bound: Optional[str] = None
+    if start_date:
+        s = start_date.strip().replace("T", " ")
+        if intraday:
+            start_bound = f"{s} 00:00:00" if len(s) == 10 else (f"{s}:00" if len(s) == 16 else s[:19])
+        else:
+            start_bound = s[:10]
+    if end_date:
+        e = end_date.strip().replace("T", " ")
+        if intraday:
+            end_bound = f"{e} 23:59:59" if len(e) == 10 else (f"{e}:59" if len(e) == 16 else e[:19])
+        else:
+            end_bound = e[:10]
+    return [
+        r
+        for r in rows
+        if (not start_bound or r["date"] >= start_bound)
+        and (not end_bound or r["date"] <= end_bound)
+    ]
+
+
+def _yf_covers_start(
+    rows: list[dict], start_date: Optional[str], *, intraday: bool
+) -> bool:
+    if not start_date or not rows:
+        return True
+    s = start_date.strip().replace("T", " ")
+    first_date = str(rows[0].get("date") or "").strip()
+    if not first_date:
+        return True
+    if intraday and len(s) > 10:
+        req_start = f"{s}:00" if len(s) == 16 else s[:19]
+        return first_date <= req_start
+    return first_date[:10] <= s[:10]
 
 
 def _yf_fetch_history(
@@ -242,7 +322,7 @@ def _yf_fetch_history(
     if extended_hours and canonical != "1day":
         kwargs["prepost"] = True
     if start_date:
-        kwargs["start"] = start_date[:10]
+        kwargs["start"] = start_date.strip()[:10]
     if end_date:
         kwargs["end"] = _yf_exclusive_end(end_date)
     if not start_date and not end_date:
@@ -255,11 +335,17 @@ def _yf_fetch_history(
     # A NaN-priced row (halted session, gap padding) must not propagate NaN
     # into the response — drop it here.
     df = df.copy().dropna(subset=["Open", "High", "Low", "Close"])
+    start_ms = _yf_parse_exchange_bound_ms(start_date, display, is_end=False)
+    end_ms = _yf_parse_exchange_bound_ms(end_date, display, is_end=True)
     rows: list[dict] = []
     for idx, row in df.iterrows():
         try:
             ts = int(idx.timestamp() * 1000)
         except (AttributeError, OSError, OverflowError, ValueError):
+            continue
+        if start_ms is not None and ts < start_ms:
+            continue
+        if end_ms is not None and ts > end_ms:
             continue
         volume = row["Volume"]
         rows.append(
@@ -396,8 +482,10 @@ async def _fetch_stock_bars(
     # DALTON-HOOK(market-data-fallback): free yfinance answers ahead of FMP
     # (Dalton's market_data.providers order — see the _yf import block). Any
     # miss — no library, unsupported interval, empty history, an error — falls
-    # through to FMP unchanged.
+    # through to FMP unchanged; partial coverage of start_date also tries FMP
+    # first and falls back to the partial yfinance bars with a coverage note.
     scale = minor_unit_scale(legacy)
+    partial_yf: Optional[dict] = None
     if _yf is not None and canonical in _YF_INTERVALS:
         try:
             yf_rows = await asyncio.to_thread(
@@ -412,19 +500,44 @@ async def _fetch_stock_bars(
             logger.warning("yfinance history failed for %s", display, exc_info=True)
             yf_rows = []
         if yf_rows:
-            return {
-                "data": _display_rows(yf_rows, legacy, intraday=intraday, scale=scale),
-                "source": "yfinance",
-                "symbol": display,
-                "interval": canonical,
-                "currency": currency,
-                "timezone": timezone,
-            }, None
+            yf_data = _filter_display_rows_to_window(
+                _display_rows(yf_rows, legacy, intraday=intraday, scale=scale),
+                start_date,
+                end_date,
+                intraday=intraday,
+            )
+            if yf_data:
+                if _yf_covers_start(yf_data, start_date, intraday=intraday):
+                    return {
+                        "data": yf_data,
+                        "source": "yfinance",
+                        "symbol": display,
+                        "interval": canonical,
+                        "currency": currency,
+                        "timezone": timezone,
+                    }, None
+                actual_start = yf_data[0]["date"]
+                actual_end = yf_data[-1]["date"]
+                partial_yf = {
+                    "data": yf_data,
+                    "source": "yfinance",
+                    "symbol": display,
+                    "interval": canonical,
+                    "currency": currency,
+                    "timezone": timezone,
+                    "note": (
+                        f"yfinance partial coverage: actual covered range is "
+                        f"{actual_start} to {actual_end} (requested start_date={start_date}; "
+                        f"FMP fallback unavailable)."
+                    ),
+                }
 
-    # FMP fallback (all markets; converts GBX/pence to pounds).
+    # DALTON-HOOK(market-data-fallback): FMP fallback (all markets; converts GBX/pence to pounds).
     try:
         client = await get_fmp_client()
     except Exception:  # noqa: BLE001
+        if partial_yf is not None:
+            return partial_yf, None
         return None, refused or make_error(
             "client_unavailable",
             "FMP client unavailable (FMP_API_KEY not configured).",
@@ -443,16 +556,22 @@ async def _fetch_stock_bars(
                 **({"extended": True} if extended_hours else {}),  # DALTON-HOOK(stock-move-upgrade)
             )
     except Exception as e:  # noqa: BLE001
+        if partial_yf is not None:
+            return partial_yf, None
         return None, refused or error_from_exception(
             e, "FMP fetch failed.", symbol=display, interval=canonical
         )
     if not isinstance(rows or [], list):
         # FMP answers some failures with a 200 and an error object, not rows.
+        if partial_yf is not None:
+            return partial_yf, None
         return None, refused or make_error(
             "upstream_error", "FMP fetch failed.", symbol=display, interval=canonical
         )
 
     data = _display_rows(rows or [], legacy, intraday=intraday, scale=scale)
+    if not data and partial_yf is not None:  # DALTON-HOOK(market-data-fallback)
+        return partial_yf, None
     if refused and not data:
         return None, refused
     return {

@@ -35,9 +35,8 @@ except ModuleNotFoundError:  # imported as a package module (tests)
     from mcp_servers._bootstrap import MCPServer
 
 import asyncio
-import json  # DALTON-HOOK(market-data-fallback): serializes the yfinance fallback statements
 import logging
-from typing import Literal
+from typing import Any, Literal  # DALTON-HOOK(market-data-fallback)
 
 import httpx
 
@@ -142,51 +141,345 @@ def _http_miss(exc: httpx.HTTPError) -> str:
 
 
 # DALTON-HOOK(market-data-fallback): yfinance statements stand in when FMP's
-# plan does not cover the symbol (402). Yahoo-native shape: {metric: {date:
-# value}}, dates "YYYY-MM-DD" newest-first — a different basis from FMP's
-# camelCase rows, which the response's note says out loud.
-def _yf_serialize_statement(df) -> dict:
+# plan does not cover the symbol (402). Each table is converted to FMP-shaped
+# period records (newest-first, camelCase keys, None for missing/unmapped
+# FMP fields) so downstream skills can index records the same way as FMP.
+_YF_FMP_STATEMENT_FIELDS: dict[str, dict[str, tuple[str, ...]]] = {
+    "income": {
+        "revenue": ("Total Revenue", "TotalRevenue", "Operating Revenue", "OperatingRevenue"),
+        "costOfRevenue": ("Cost Of Revenue", "CostOfRevenue", "Reconciled Cost Of Revenue", "ReconciledCostOfRevenue"),
+        "grossProfit": ("Gross Profit", "GrossProfit"),
+        "grossProfitRatio": (),
+        "researchAndDevelopmentExpenses": ("Research And Development", "ResearchAndDevelopment"),
+        "generalAndAdministrativeExpenses": ("General And Administrative Expense", "GeneralAndAdministrativeExpense"),
+        "sellingAndMarketingExpenses": ("Selling And Marketing Expense", "SellingAndMarketingExpense"),
+        "sellingGeneralAndAdministrativeExpenses": ("Selling General And Administration", "SellingGeneralAndAdministration"),
+        "otherExpenses": ("Other Operating Expenses", "OtherOperatingExpenses"),
+        "operatingExpenses": ("Operating Expense", "OperatingExpense"),
+        "costAndExpenses": ("Total Expenses", "TotalExpenses"),
+        "interestIncome": ("Interest Income", "InterestIncome", "Interest Income Non Operating", "InterestIncomeNonOperating"),
+        "interestExpense": ("Interest Expense", "InterestExpense", "Interest Expense Non Operating", "InterestExpenseNonOperating"),
+        "depreciationAndAmortization": (
+            "Reconciled Depreciation",
+            "ReconciledDepreciation",
+            "Depreciation And Amortization In Income Statement",
+            "DepreciationAndAmortizationInIncomeStatement",
+            "Depreciation Amortization Depletion Income Statement",
+            "DepreciationAmortizationDepletionIncomeStatement",
+        ),
+        "ebitda": ("EBITDA", "Normalized EBITDA", "NormalizedEBITDA"),
+        "ebitdaratio": (),
+        "operatingIncome": ("Operating Income", "OperatingIncome", "Total Operating Income As Reported", "TotalOperatingIncomeAsReported"),
+        "operatingIncomeRatio": (),
+        "ebit": ("EBIT", "Operating Income", "OperatingIncome"),
+        "nonOperatingIncomeExcludingInterest": ("Other Non Operating Income Expenses", "OtherNonOperatingIncomeExpenses"),
+        "totalOtherIncomeExpensesNet": ("Other Income Expense", "OtherIncomeExpense"),
+        "incomeBeforeTax": ("Pretax Income", "PretaxIncome"),
+        "incomeBeforeTaxRatio": (),
+        "incomeTaxExpense": ("Tax Provision", "TaxProvision"),
+        "netIncomeFromContinuingOperations": (
+            "Net Income Continuous Operations",
+            "NetIncomeContinuousOperations",
+            "Net Income From Continuing Operation Net Minority Interest",
+            "NetIncomeFromContinuingOperationNetMinorityInterest",
+        ),
+        "netIncome": ("Net Income", "NetIncome", "Net Income Common Stockholders", "NetIncomeCommonStockholders"),
+        "netIncomeRatio": (),
+        "eps": ("Basic EPS", "BasicEPS"),
+        "epsdiluted": ("Diluted EPS", "DilutedEPS"),
+        "epsDiluted": ("Diluted EPS", "DilutedEPS"),
+        "weightedAverageShsOut": ("Basic Average Shares", "BasicAverageShares"),
+        "weightedAverageShsOutDil": ("Diluted Average Shares", "DilutedAverageShares"),
+    },
+    "balance": {
+        "cashAndCashEquivalents": ("Cash And Cash Equivalents", "CashAndCashEquivalents", "Cash Financial", "CashFinancial"),
+        "shortTermInvestments": ("Other Short Term Investments", "OtherShortTermInvestments"),
+        "cashAndShortTermInvestments": (
+            "Cash Cash Equivalents And Short Term Investments",
+            "CashCashEquivalentsAndShortTermInvestments",
+            "Cash And Cash Equivalents",
+            "CashAndCashEquivalents",
+        ),
+        "netReceivables": ("Accounts Receivable", "AccountsReceivable", "Receivables"),
+        "accountsReceivables": ("Accounts Receivable", "AccountsReceivable"),
+        "otherReceivables": ("Other Receivables", "OtherReceivables"),
+        "inventory": ("Inventory",),
+        "prepaids": ("Prepaid Assets", "PrepaidAssets"),
+        "otherCurrentAssets": ("Other Current Assets", "OtherCurrentAssets"),
+        "totalCurrentAssets": ("Current Assets", "CurrentAssets"),
+        "propertyPlantEquipmentNet": ("Net PPE", "NetPPE"),
+        "goodwill": ("Goodwill",),
+        "intangibleAssets": ("Other Intangible Assets", "OtherIntangibleAssets"),
+        "goodwillAndIntangibleAssets": ("Goodwill And Other Intangible Assets", "GoodwillAndOtherIntangibleAssets"),
+        "longTermInvestments": ("Investments And Advances", "InvestmentsAndAdvances", "Long Term Equity Investment", "LongTermEquityInvestment"),
+        "taxAssets": (
+            "Non Current Deferred Taxes Assets",
+            "NonCurrentDeferredTaxesAssets",
+            "Current Deferred Taxes Assets",
+            "CurrentDeferredTaxesAssets",
+        ),
+        "otherNonCurrentAssets": ("Other Non Current Assets", "OtherNonCurrentAssets"),
+        "totalNonCurrentAssets": ("Total Non Current Assets", "TotalNonCurrentAssets"),
+        "otherAssets": (),
+        "totalAssets": ("Total Assets", "TotalAssets"),
+        "totalPayables": ("Payables", "Payables And Accrued Expenses", "PayablesAndAccruedExpenses"),
+        "accountPayables": ("Accounts Payable", "AccountsPayable"),
+        "otherPayables": ("Other Payable", "OtherPayable"),
+        "accruedExpenses": ("Current Accrued Expenses", "CurrentAccruedExpenses"),
+        "shortTermDebt": ("Current Debt", "CurrentDebt", "Current Debt And Capital Lease Obligation", "CurrentDebtAndCapitalLeaseObligation"),
+        "capitalLeaseObligationsCurrent": ("Current Capital Lease Obligation", "CurrentCapitalLeaseObligation"),
+        "taxPayables": ("Income Tax Payable", "IncomeTaxPayable", "Total Tax Payable", "TotalTaxPayable"),
+        "deferredRevenue": ("Current Deferred Revenue", "CurrentDeferredRevenue"),
+        "otherCurrentLiabilities": ("Other Current Liabilities", "OtherCurrentLiabilities"),
+        "totalCurrentLiabilities": ("Current Liabilities", "CurrentLiabilities"),
+        "longTermDebt": ("Long Term Debt", "LongTermDebt", "Long Term Debt And Capital Lease Obligation", "LongTermDebtAndCapitalLeaseObligation"),
+        "capitalLeaseObligationsNonCurrent": ("Long Term Capital Lease Obligation", "LongTermCapitalLeaseObligation"),
+        "capitalLeaseObligations": ("Capital Lease Obligations", "CapitalLeaseObligations"),
+        "deferredRevenueNonCurrent": ("Non Current Deferred Revenue", "NonCurrentDeferredRevenue"),
+        "deferredTaxLiabilitiesNonCurrent": ("Non Current Deferred Taxes Liabilities", "NonCurrentDeferredTaxesLiabilities"),
+        "otherNonCurrentLiabilities": ("Other Non Current Liabilities", "OtherNonCurrentLiabilities"),
+        "totalNonCurrentLiabilities": ("Total Non Current Liabilities Net Minority Interest", "TotalNonCurrentLiabilitiesNetMinorityInterest"),
+        "otherLiabilities": (),
+        "totalLiabilities": ("Total Liabilities Net Minority Interest", "TotalLiabilitiesNetMinorityInterest"),
+        "preferredStock": ("Preferred Stock", "PreferredStock", "Preferred Stock Equity", "PreferredStockEquity"),
+        "commonStock": ("Common Stock", "CommonStock", "Capital Stock", "CapitalStock"),
+        "additionalPaidInCapital": ("Additional Paid In Capital", "AdditionalPaidInCapital"),
+        "retainedEarnings": ("Retained Earnings", "RetainedEarnings"),
+        "accumulatedOtherComprehensiveIncomeLoss": (
+            "Gains Losses Not Affecting Retained Earnings",
+            "GainsLossesNotAffectingRetainedEarnings",
+            "Other Equity Adjustments",
+            "OtherEquityAdjustments",
+        ),
+        "treasuryStock": ("Treasury Stock", "TreasuryStock"),
+        "othertotalStockholdersEquity": ("Other Equity Interest", "OtherEquityInterest"),
+        "totalStockholdersEquity": ("Stockholders Equity", "StockholdersEquity", "Common Stock Equity", "CommonStockEquity"),
+        "totalEquity": ("Total Equity Gross Minority Interest", "TotalEquityGrossMinorityInterest", "Stockholders Equity", "StockholdersEquity"),
+        "minorityInterest": ("Minority Interest", "MinorityInterest"),
+        "totalLiabilitiesAndStockholdersEquity": (),
+        "totalInvestments": ("Investments And Advances", "InvestmentsAndAdvances"),
+        "totalDebt": ("Total Debt", "TotalDebt"),
+        "netDebt": ("Net Debt", "NetDebt"),
+    },
+    "cash": {
+        "netIncome": ("Net Income From Continuing Operations", "NetIncomeFromContinuingOperations"),
+        "depreciationAndAmortization": (
+            "Depreciation And Amortization",
+            "DepreciationAndAmortization",
+            "Depreciation Amortization Depletion",
+            "DepreciationAmortizationDepletion",
+            "Depreciation",
+        ),
+        "deferredIncomeTax": ("Deferred Income Tax", "DeferredIncomeTax", "Deferred Tax", "DeferredTax"),
+        "stockBasedCompensation": ("Stock Based Compensation", "StockBasedCompensation"),
+        "changeInWorkingCapital": ("Change In Working Capital", "ChangeInWorkingCapital"),
+        "accountsReceivables": ("Changes In Account Receivables", "ChangesInAccountReceivables", "Change In Receivables", "ChangeInReceivables"),
+        "inventory": ("Change In Inventory", "ChangeInInventory"),
+        "accountsPayables": (
+            "Change In Account Payable",
+            "ChangeInAccountPayable",
+            "Change In Payable",
+            "ChangeInPayable",
+            "Change In Payables And Accrued Expense",
+            "ChangeInPayablesAndAccruedExpense",
+        ),
+        "otherWorkingCapital": ("Change In Other Working Capital", "ChangeInOtherWorkingCapital"),
+        "otherNonCashItems": ("Other Non Cash Items", "OtherNonCashItems"),
+        "netCashProvidedByOperatingActivities": (
+            "Operating Cash Flow",
+            "OperatingCashFlow",
+            "Cash Flow From Continuing Operating Activities",
+            "CashFlowFromContinuingOperatingActivities",
+        ),
+        "operatingCashFlow": (
+            "Operating Cash Flow",
+            "OperatingCashFlow",
+            "Cash Flow From Continuing Operating Activities",
+            "CashFlowFromContinuingOperatingActivities",
+        ),
+        "investmentsInPropertyPlantAndEquipment": (
+            "Capital Expenditure",
+            "CapitalExpenditure",
+            "Purchase Of PPE",
+            "PurchaseOfPPE",
+            "Net PPE Purchase And Sale",
+            "NetPPEPurchaseAndSale",
+        ),
+        "capitalExpenditure": (
+            "Capital Expenditure",
+            "CapitalExpenditure",
+            "Capital Expenditure Reported",
+            "CapitalExpenditureReported",
+            "Purchase Of PPE",
+            "PurchaseOfPPE",
+        ),
+        "acquisitionsNet": ("Net Business Purchase And Sale", "NetBusinessPurchaseAndSale", "Purchase Of Business", "PurchaseOfBusiness"),
+        "purchasesOfInvestments": ("Purchase Of Investment", "PurchaseOfInvestment"),
+        "salesMaturitiesOfInvestments": ("Sale Of Investment", "SaleOfInvestment"),
+        "otherInvestingActivites": ("Net Other Investing Changes", "NetOtherInvestingChanges"),
+        "otherInvestingActivities": ("Net Other Investing Changes", "NetOtherInvestingChanges"),
+        "netCashUsedForInvestingActivites": (
+            "Investing Cash Flow",
+            "InvestingCashFlow",
+            "Cash Flow From Continuing Investing Activities",
+            "CashFlowFromContinuingInvestingActivities",
+        ),
+        "netCashProvidedByInvestingActivities": (
+            "Investing Cash Flow",
+            "InvestingCashFlow",
+            "Cash Flow From Continuing Investing Activities",
+            "CashFlowFromContinuingInvestingActivities",
+        ),
+        "investingCashFlow": (
+            "Investing Cash Flow",
+            "InvestingCashFlow",
+            "Cash Flow From Continuing Investing Activities",
+            "CashFlowFromContinuingInvestingActivities",
+        ),
+        "debtRepayment": ("Repayment Of Debt", "RepaymentOfDebt", "Long Term Debt Payments", "LongTermDebtPayments"),
+        "netDebtIssuance": ("Net Issuance Payments Of Debt", "NetIssuancePaymentsOfDebt", "Issuance Of Debt", "IssuanceOfDebt"),
+        "longTermNetDebtIssuance": ("Net Long Term Debt Issuance", "NetLongTermDebtIssuance", "Long Term Debt Issuance", "LongTermDebtIssuance"),
+        "shortTermNetDebtIssuance": ("Net Short Term Debt Issuance", "NetShortTermDebtIssuance", "Short Term Debt Issuance", "ShortTermDebtIssuance"),
+        "commonStockIssued": ("Common Stock Issuance", "CommonStockIssuance", "Issuance Of Capital Stock", "IssuanceOfCapitalStock"),
+        "commonStockRepurchased": ("Repurchase Of Capital Stock", "RepurchaseOfCapitalStock", "Common Stock Payments", "CommonStockPayments"),
+        "dividendsPaid": ("Cash Dividends Paid", "CashDividendsPaid", "Common Stock Dividend Paid", "CommonStockDividendPaid"),
+        "commonDividendsPaid": ("Common Stock Dividend Paid", "CommonStockDividendPaid", "Cash Dividends Paid", "CashDividendsPaid"),
+        "preferredDividendsPaid": ("Preferred Stock Dividend Paid", "PreferredStockDividendPaid"),
+        "otherFinancingActivites": ("Net Other Financing Charges", "NetOtherFinancingCharges"),
+        "otherFinancingActivities": ("Net Other Financing Charges", "NetOtherFinancingCharges"),
+        "netCashUsedProvidedByFinancingActivities": (
+            "Financing Cash Flow",
+            "FinancingCashFlow",
+            "Cash Flow From Continuing Financing Activities",
+            "CashFlowFromContinuingFinancingActivities",
+        ),
+        "netCashProvidedByFinancingActivities": (
+            "Financing Cash Flow",
+            "FinancingCashFlow",
+            "Cash Flow From Continuing Financing Activities",
+            "CashFlowFromContinuingFinancingActivities",
+        ),
+        "financingCashFlow": (
+            "Financing Cash Flow",
+            "FinancingCashFlow",
+            "Cash Flow From Continuing Financing Activities",
+            "CashFlowFromContinuingFinancingActivities",
+        ),
+        "effectOfForexChangesOnCash": ("Effect Of Exchange Rate Changes", "EffectOfExchangeRateChanges"),
+        "netChangeInCash": ("Changes In Cash", "ChangesInCash"),
+        "cashAtEndOfPeriod": ("End Cash Position", "EndCashPosition"),
+        "cashAtBeginningOfPeriod": ("Beginning Cash Position", "BeginningCashPosition"),
+        "freeCashFlow": ("Free Cash Flow", "FreeCashFlow"),
+        "incomeTaxesPaid": ("Income Tax Paid Supplemental Data", "IncomeTaxPaidSupplementalData"),
+        "interestPaid": ("Interest Paid Supplemental Data", "InterestPaidSupplementalData"),
+    },
+}
+
+
+def _yf_period_label(date_str: str, period: str) -> str:
+    if period != "quarter":
+        return "FY"
+    try:
+        month = int(date_str[5:7])
+        return f"Q{(month - 1) // 3 + 1}"
+    except (IndexError, ValueError):
+        return "Q1"
+
+
+def _yf_serialize_statement(
+    df: Any,
+    stmt_kind: str,
+    *,
+    symbol: str = "",
+    currency: str | None = None,
+    period: str = "annual",
+    limit: int | None = None,
+) -> list[dict[str, Any]]:
     if df is None or df.empty:
-        return {}
+        return []
     import pandas as pd
 
-    df = df.copy()
-    if isinstance(df.index, pd.DatetimeIndex):
-        df.index = df.index.strftime("%Y-%m-%d")
-    if isinstance(df.columns, pd.DatetimeIndex):
-        df.columns = df.columns.strftime("%Y-%m-%d")
-    return json.loads(df.fillna("N/A").to_json(orient="index"))
+    field_map = _YF_FMP_STATEMENT_FIELDS.get(stmt_kind, {})
+    col_pairs: list[tuple[str, Any]] = []
+    for col in df.columns:
+        date_str = col.strftime("%Y-%m-%d") if hasattr(col, "strftime") else str(col)[:10]
+        col_pairs.append((date_str, col))
+    col_pairs.sort(key=lambda pair: pair[0], reverse=True)
+    if limit is not None and limit > 0:
+        col_pairs = col_pairs[:limit]
+
+    records: list[dict[str, Any]] = []
+    for date_str, col in col_pairs:
+        year_str = date_str[:4] if len(date_str) >= 4 else ""
+        rec: dict[str, Any] = {
+            "date": date_str,
+            "symbol": symbol,
+            "reportedCurrency": currency,
+            "cik": None,
+            "fillingDate": None,
+            "acceptedDate": None,
+            "calendarYear": year_str,
+            "fiscalYear": year_str,
+            "period": _yf_period_label(date_str, period),
+        }
+        for fmp_field, yf_labels in field_map.items():
+            val_out: float | None = None
+            for label in yf_labels:
+                if label in df.index:
+                    raw_val = df.loc[label, col]
+                    if hasattr(raw_val, "iloc"):
+                        raw_val = raw_val.iloc[0]
+                    if raw_val is not None and not pd.isna(raw_val):
+                        val_out = float(raw_val)
+                        break
+            rec[fmp_field] = val_out
+        records.append(rec)
+    return records
 
 
-def _yf_statements(symbol: str, statement_type: str, period: str) -> dict | None:
+def _yf_statements(
+    symbol: str,
+    statement_type: str,
+    period: str,
+    limit: int = 10,
+) -> list[dict[str, Any]] | dict[str, list[dict[str, Any]]] | None:
     """Synchronous yfinance statements fetch; None when yfinance cannot serve.
 
     Raises nothing the caller cannot treat as a soft miss back to the 402
-    error. ``limit`` has no yfinance equivalent — Yahoo returns the periods it
-    holds (typically 4-5), which a fallback answer accepts.
+    error. Converts each statement DataFrame into FMP-compatible period records
+    (newest-first) and slices to ``limit``.
     """
     if _yf is None:
         return None
-    _, yf_symbol, _ = _yf_boundary(symbol)
+    disp, yf_symbol, currency = _yf_boundary(symbol)
     ticker = _yf.Ticker(yf_symbol)
     quarterly = period == "quarter"
 
-    def _pick(quarterly_df_attr: str, annual_df_attr: str) -> dict:
+    def _pick(stmt_kind: str, quarterly_df_attr: str, annual_df_attr: str) -> list[dict[str, Any]]:
         df = getattr(ticker, quarterly_df_attr) if quarterly else getattr(ticker, annual_df_attr)
-        return _yf_serialize_statement(df)
+        return _yf_serialize_statement(
+            df,
+            stmt_kind,
+            symbol=disp,
+            currency=currency,
+            period=period,
+            limit=limit,
+        )
 
     try:
         if statement_type == "income":
-            data: dict = _pick("quarterly_income_stmt", "income_stmt")
+            data: list[dict[str, Any]] | dict[str, list[dict[str, Any]]] = _pick(
+                "income", "quarterly_income_stmt", "income_stmt"
+            )
         elif statement_type == "balance":
-            data = _pick("quarterly_balance_sheet", "balance_sheet")
+            data = _pick("balance", "quarterly_balance_sheet", "balance_sheet")
         elif statement_type == "cash":
-            data = _pick("quarterly_cashflow", "cashflow")
+            data = _pick("cash", "quarterly_cashflow", "cashflow")
         else:  # "all"
             data = {
-                "income_statement": _pick("quarterly_income_stmt", "income_stmt"),
-                "balance_sheet": _pick("quarterly_balance_sheet", "balance_sheet"),
-                "cash_flow": _pick("quarterly_cashflow", "cashflow"),
+                "income_statement": _pick("income", "quarterly_income_stmt", "income_stmt"),
+                "balance_sheet": _pick("balance", "quarterly_balance_sheet", "balance_sheet"),
+                "cash_flow": _pick("cash", "quarterly_cashflow", "cashflow"),
             }
     except Exception:  # noqa: BLE001 — soft miss, the 402 error answers
         logger.warning("yfinance statements failed for %s", symbol, exc_info=True)
@@ -197,8 +490,9 @@ def _yf_statements(symbol: str, statement_type: str, period: str) -> dict | None
 
 
 _YF_STATEMENTS_NOTE = (
-    "FMP plan does not cover this request; statements served from yfinance — "
-    "口径可能与 FMP 不同 (field names, accounting basis, and units may differ)."
+    "FMP plan does not cover this request; statements served from yfinance "
+    "(mapped to FMP camelCase period records; 口径与细分科目可能与 FMP 不同, "
+    "unmapped fields are None)."
 )
 
 
@@ -333,7 +627,7 @@ async def get_financial_statements(
         # the request — no argument change fixes it, so yfinance answers
         # instead of returning an error the agent would retry blind.
         if err.get("error") == "plan_not_covered" or getattr(e, "status_code", None) == 402:
-            yf_data = await asyncio.to_thread(_yf_statements, disp, statement_type, period)
+            yf_data = await asyncio.to_thread(_yf_statements, disp, statement_type, period, limit)
             if yf_data is not None:
                 return make_response(
                     yf_data,

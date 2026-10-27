@@ -38,3 +38,5 @@ web/src/config/__tests__/daltonAuth.test.ts
 web/src/components/Sidebar/__tests__/TeamSharing.test.tsx
 web/src/components/dalton/
 web/src/lib/dalton/
+tests/unit/mcp_servers/test_market_data_yf_fallback.py
+tests/unit/server/handlers/chat/test_attachments_notes.py

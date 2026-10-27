@@ -143,21 +143,22 @@ def test_a_call_only_in_content_is_signed_too():
     assert [c["thoughtSignature"] for c in _calls(contents)] == [_SKIP_SIGNATURE]
 
 
-def test_gemini_puts_the_first_unmapped_signature_on_the_first_unsigned_call():
-    # The signature rode a text part; the calls themselves carry none. The
-    # pre-mapping behavior (list[0] → first call) measured working on Gemini
-    # Flash, so the first call takes it and the rest keep the stand-in.
+def test_gemini_unsigned_calls_get_stand_in_and_unmapped_text_signature_stays_separate():
+    # A text/thought signature is not a functionCall signature: Gemini requires
+    # each signature to stay on the Part that produced it, so unsigned calls in
+    # a mapped message get the stand-in while unmapped signatures replay as
+    # standalone thoughtSignature parts.
     _, contents = _messages_to_gemini(
         _history({_THOUGHT_SIGNATURES_KEY: ["sig-text"], _CALL_SIGNATURES_KEY: {}}),
         gemini_target=True,
     )
     calls = _calls(contents)
-    assert calls[0]["thoughtSignature"] == "sig-text"
+    assert calls[0]["thoughtSignature"] == _SKIP_SIGNATURE
     assert calls[1]["thoughtSignature"] == _SKIP_SIGNATURE
-    assert not any(set(p) == {"thoughtSignature"} for p in _flat_parts(contents))
+    assert {"thoughtSignature": "sig-text"} in _flat_parts(contents)
 
 
-def test_gemini_first_unsigned_call_gets_the_text_signature_a_later_call_keeps_its_own():
+def test_gemini_first_unsigned_call_gets_stand_in_and_later_call_keeps_its_own():
     _, contents = _messages_to_gemini(
         _history({
             _THOUGHT_SIGNATURES_KEY: ["sig-text", "sig-c2"],
@@ -166,9 +167,9 @@ def test_gemini_first_unsigned_call_gets_the_text_signature_a_later_call_keeps_i
         gemini_target=True,
     )
     calls = _calls(contents)
-    assert calls[0]["thoughtSignature"] == "sig-text"
+    assert calls[0]["thoughtSignature"] == _SKIP_SIGNATURE
     assert calls[1]["thoughtSignature"] == "sig-c2"
-    assert not any(set(p) == {"thoughtSignature"} for p in _flat_parts(contents))
+    assert {"thoughtSignature": "sig-text"} in _flat_parts(contents)
 
 
 def test_gemini_keeps_the_stand_in_when_the_first_call_is_mapped():

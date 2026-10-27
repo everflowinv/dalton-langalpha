@@ -68,8 +68,11 @@ async def test_a_saved_oversized_pdf_gets_the_paged_read_path(monkeypatch):
         [_attachment("application/pdf", 11 * 1024 * 1024, "big.pdf")],
         ["work/uploads/big.pdf_x1.pdf"],
     )
-    assert "page by page" in content
-    assert "Python" in content
+    assert "over 5 MB" in content
+    assert "Read tool cannot open it" in content
+    assert "pypdf" in content and "pdfplumber" in content
+    assert "< 5 MB" in content
+    assert "page by page with the Read tool" not in content
 
 
 @pytest.mark.asyncio

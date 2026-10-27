@@ -250,7 +250,7 @@ def _messages_to_gemini(
             # The endpoint validates that functionCall parts carry their
             # thought_signature (it 400s without one). A mapped message
             # replays each call's own signature; Gemini gets the stand-in for
-            # a call nothing signed, and for every call of an unmapped one,
+            # any call not in the map, and for every call of an unmapped one,
             # whose list may hold a text part's signature first.
             extra = message.additional_kwargs or {}
             by_call = extra.get(_CALL_SIGNATURES_KEY)
@@ -259,26 +259,6 @@ def _messages_to_gemini(
                 signatures = [sig for sig in signatures if sig not in by_call.values()]
             elif gemini_target:
                 signatures = []
-            # Gemini only, and only for a mapped message whose first
-            # functionCall has no signature of its own while the message
-            # carries unmapped ones (a signature riding a text/thought part):
-            # the first unmapped signature goes on that first call, the
-            # pre-mapping behavior, measured to work on Gemini Flash. Every
-            # other unsigned call keeps the stand-in.
-            first_call_id: str | None = None
-            if block_calls:
-                first_call_id = str(block_calls[0]["functionCall"].get("id") or "")
-            elif message.tool_calls:
-                first_call_id = str((message.tool_calls[0] or {}).get("id") or "")
-            first_call_signature: str | None = None
-            if (
-                gemini_target
-                and isinstance(by_call, dict)
-                and signatures
-                and first_call_id is not None
-                and first_call_id not in by_call
-            ):
-                first_call_signature = signatures.pop(0)
             for call in message.tool_calls or []:
                 call_id = call.get("id")
                 call_name = call.get("name", "")
@@ -295,29 +275,19 @@ def _messages_to_gemini(
                     if signature:
                         part_fc["thoughtSignature"] = signature
                     elif gemini_target:
-                        if (
-                            first_call_signature is not None
-                            and call_id is not None
-                            and str(call_id) == first_call_id
-                        ):
-                            part_fc["thoughtSignature"] = first_call_signature
-                        else:
-                            part_fc["thoughtSignature"] = _SKIP_SIGNATURE
+                        part_fc["thoughtSignature"] = _SKIP_SIGNATURE
                 elif gemini_target:
                     part_fc["thoughtSignature"] = _SKIP_SIGNATURE
                 elif signatures:
                     part_fc["thoughtSignature"] = signatures.pop(0)
                 parts.append(part_fc)
-            for block_idx, part_fc in enumerate(block_calls):
+            for part_fc in block_calls:
                 block_id = str(part_fc["functionCall"].get("id") or "")
                 signature = by_call.get(block_id) if isinstance(by_call, dict) else None
                 if signature:
                     part_fc["thoughtSignature"] = signature
                 elif gemini_target:
-                    if first_call_signature is not None and block_idx == 0:
-                        part_fc["thoughtSignature"] = first_call_signature
-                    else:
-                        part_fc["thoughtSignature"] = _SKIP_SIGNATURE
+                    part_fc["thoughtSignature"] = _SKIP_SIGNATURE
             for signature in signatures:
                 parts.append({"thoughtSignature": signature})
         if parts:

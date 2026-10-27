@@ -130,8 +130,51 @@ def test_transcript_keeps_its_native_ticker():
     assert normalized["ticker"] == "NVDA"
 
 
+def test_a_mixed_e_bad_with_param_keyword_and_timeout_is_still_upstream_unavailable():
+    # One leg fails with "E_BAD_ARGS: 参数..." (matching both e_bad_signal and
+    # other_param_signal) while another leg times out; route="all" classifies
+    # per leg first and only marks the whole call 参数错误 if all failed legs are.
+    payload = _mixed_all_failure_payload()
+    payload["source_status"]["alphaengine"] = {
+        "ok": False,
+        "status": "failed",
+        "error": "E_BAD_ARGS: 参数 format is invalid",
+        "count": 0,
+    }
+    payload["error"] = (
+        "部分数据源调用失败 "
+        "(alphaengine: E_BAD_ARGS: 参数 format is invalid; "
+        "guidepoint: guidepoint timed out after 90s)"
+    )
+    rb._apply_error_and_empty_contract("research", "all", "search", payload, {})
+    assert payload["error_category"] == "上游不可用"
+    assert payload["leg_categories"] == {
+        "alphaengine": "参数错误",
+        "guidepoint": "上游不可用",
+    }
+
+
+def test_short_ticker_t_is_not_dropped_by_substring_match_and_route_all_folds_ticker():
+    normalized, _, err = rb._normalize_and_validate_call_args(
+        "research",
+        {"route": "all", "ticker": "T", "query": "dividend policy"},
+    )
+    assert err is None
+    assert "ticker" not in normalized
+    assert normalized["query"] == "T dividend policy"
+
+    # Whole-word match (case-insensitive, non-alphanumeric boundary) is not duplicated.
+    normalized_dup, _, err_dup = rb._normalize_and_validate_call_args(
+        "research",
+        {"route": "all", "ticker": "T", "query": "T dividend policy"},
+    )
+    assert err_dup is None
+    assert "ticker" not in normalized_dup
+    assert normalized_dup["query"] == "T dividend policy"
+
+
 def test_the_catalog_still_advertises_ticker_with_the_folding_note():
-    for route in ("alphaengine", "guidepoint", "company-wiki", "sales-notes", "sales-mail", "tmtb", "funda-ai"):
+    for route in rb.TICKER_FOLDS_INTO_QUERY_ROUTES:
         spec = rb.ROUTE_CONTRACT_SPECS[route]
         assert "ticker" in spec["accepted_params"], route
         assert "并入 query" in spec["param_formats"]["ticker"], route

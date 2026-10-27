@@ -3,7 +3,11 @@
 Providers refuse an inline image above about 5 MB and a request above about
 32 MB (Anthropic); Gemini takes about 20 MB inline. An attachment inlined into
 the user message also stays in the checkpoint and is resent every turn, so one
-that is too large breaks the thread rather than one call.
+that is too large breaks the thread rather than one call. Across turns,
+``DaltonAttachmentBudgetMiddleware`` (`src/dalton/middleware/attachments.py`)
+caps the cumulative inline attachment bytes sent on each model request to 12 MB
+by replacing older turns' attachment blocks with text pointers on the model-call
+copy while leaving the checkpoint messages intact.
 
 DALTON-HOOK(attachment-native-cap): these caps are a deliberately conservative
 policy — two inline PDFs large enough individually must not together blow the
@@ -16,12 +20,28 @@ from __future__ import annotations
 
 from typing import Any
 
+from src.dalton.middleware.attachments import (
+    NATIVE_REQUEST_MAX_BYTES,
+    DaltonAttachmentBudgetMiddleware,
+    trim_request_inline_attachments,
+)
+
 NATIVE_IMAGE_MAX_BYTES = 5 * 1024 * 1024
 NATIVE_PDF_MAX_BYTES = 10 * 1024 * 1024
 # Per-message budget over every inlined attachment together (decoded bytes):
 # inline-eligible files are admitted in attachment order until the running
 # total reaches this; the rest ride the sandbox path only.
 NATIVE_MESSAGE_MAX_BYTES = 10 * 1024 * 1024
+
+__all__ = [
+    "DaltonAttachmentBudgetMiddleware",
+    "NATIVE_IMAGE_MAX_BYTES",
+    "NATIVE_MESSAGE_MAX_BYTES",
+    "NATIVE_PDF_MAX_BYTES",
+    "NATIVE_REQUEST_MAX_BYTES",
+    "split_oversized",
+    "trim_request_inline_attachments",
+]
 
 
 def _decoded_size(data: str) -> int:

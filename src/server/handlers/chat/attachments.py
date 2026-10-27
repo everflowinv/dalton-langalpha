@@ -121,7 +121,9 @@ async def attach_request_files(
             )
         if oversized_ctx and mime == "application/pdf":
             return note + (
-                " Read it page by page with the Read tool, or extract its text with Python."
+                " The PDF is over 5 MB — the Read tool cannot open it; extract "
+                "its text with Python (pypdf / pdfplumber), or split it into "
+                "< 5 MB page files / render pages to images before viewing with Read."
             )
         return note + " Use Python to process it."
 
