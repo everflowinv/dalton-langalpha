@@ -2544,6 +2544,8 @@ class TestHandoffKeepOnResumable:
                 "conversation_response_id": "ptc-run-1",
                 "status": "interrupted",
                 "errors": [],
+                # The /retry of the worker-lost run.
+                "retry_of_run_id": "ptc-run-0",
             },
             "ptc-run-2": {
                 "conversation_response_id": "ptc-run-2",
@@ -2643,14 +2645,21 @@ class TestHandoffKeepOnResumable:
             )
             assert after_ordinary_err_src.run_ids == ["ptc-run-1", "ptc-run-2"]
 
-            # 5) DB failure when reading preceding run: falls back to upstream chain
+            # 5) A fresh turn after a resumable failure (not its /retry) answers
+            # its own hand-off: the failed run is not chained
+            predecessor_map["ptc-run-1"] = runs_by_id["ptc-run-0"]
+            runs_by_id["ptc-run-1"].pop("retry_of_run_id")
+            _, fresh_turn_src = await executor.report_message(
+                _make_owed("completed", "ptc-run-2")
+            )
+            assert fresh_turn_src.run_ids == ["ptc-run-1", "ptc-run-2"]
+
+            # 6) DB failure when reading preceding run: falls back to upstream chain
             prev_mock.side_effect = RuntimeError("db down")
             _, fallback_src = await executor.report_message(
                 _make_owed("completed", "ptc-run-2")
             )
             assert fallback_src.run_ids == ["ptc-run-1", "ptc-run-2"]
-
-
 
 
 

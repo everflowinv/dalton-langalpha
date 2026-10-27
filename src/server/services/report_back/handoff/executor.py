@@ -637,9 +637,13 @@ async def _reported_runs(ptc_thread_id: str, run_id) -> list[str]:
             prev_status = prev.get("status")
             if prev_status == "interrupted":
                 extended.insert(0, prev_id)
-            elif prev_status == "error" and await is_resumable_analyst_failure(
-                prev_id
+            elif (
+                prev_status == "error"
+                and await _retries(extended[0], prev_id)
+                and await is_resumable_analyst_failure(prev_id)
             ):
+                # Only the /retry of that run continues it; a fresh turn after
+                # a resumable failure answers its own hand-off, not this one.
                 extended.insert(0, prev_id)
             else:
                 break
@@ -650,6 +654,16 @@ async def _reported_runs(ptc_thread_id: str, run_id) -> list[str]:
             exc_info=True,
         )
         return base_chain
+
+
+async def _retries(run_id: str, failed_run_id: str) -> bool:
+    """Whether ``run_id`` is the retry attempt of ``failed_run_id``."""
+    from src.server.database.runs import lifecycle as tl_db
+
+    row = await tl_db.get_run(str(run_id))
+    return isinstance(row, dict) and str(row.get("retry_of_run_id") or "") == str(
+        failed_run_id
+    )
 
 
 async def _taken_hand_offs(
