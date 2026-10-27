@@ -156,7 +156,7 @@ describe('ActivityBlock, unified timeline', () => {
   });
 
   it('binds an anonymous preparing row to the landed tool without an exit overlay', () => {
-    const { container, rerender } = render(<ActivityBlock items={[]} preparingToolCall={{ toolName: 'Read', argsLength: 2 }} isStreaming presentation="folded" />);
+    const { container, rerender } = render(<ActivityBlock items={[]} preparingToolCall={{ calls: [{ pendingKey: '0@1', toolName: 'Read', argsLength: 2 }] }} isStreaming presentation="folded" />);
     const row = container.querySelector('[data-activity-state="live"]');
     rerender(<ActivityBlock items={[toolItem('active')]} isStreaming presentation="folded" />);
     expect(container.querySelectorAll('[data-activity-state="live"]')).toHaveLength(1);

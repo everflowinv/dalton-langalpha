@@ -36,6 +36,7 @@ import { saveChatSession } from '../hooks/utils/chatSessionRestore';
 import iconComputerLight from '../../../assets/img/icon-computer.svg';
 import iconComputerDark from '../../../assets/img/icon-computer-dark.svg';
 import { useTheme } from '../../../contexts/ThemeContext';
+import { PresenceFold } from '@/components/ui/Disclosure';
 import { motion, AnimatePresence } from '@/lib/framer';
 // DALTON-HOOK(team-sharing): read-only state, banner, and disabled composer for colleague workspaces
 import {
@@ -47,6 +48,7 @@ import {
 import { WorkspaceTrackingToggle } from './dalton/WorkspaceTrackingToggle';
 // DALTON-HOOK(workspace-sharing-settings): per-workspace sharing settings modal
 import { WorkspaceSharingModal } from './dalton/WorkspaceSharingModal';
+import { DURATION, EASE_OUT, TWEEN } from '@/lib/motion';
 
 interface ThreadRecord {
   thread_id: string;
@@ -905,17 +907,17 @@ function ThreadGallery({ workspaceId, onBack, onThreadSelect }: ThreadGalleryPro
                 // cross-fade — a fresh inner Presence with initial={false}
                 // keeps the bulk swap from playing 20 concurrent card
                 // animations. It dims while showing placeholder (outgoing)
-                // rows during the archived-toggle fetch. Per-card exit +
+                // rows during the archived-toggle fetch. Per-card fold +
                 // layout animate the single-card case: archive/unarchive
-                // collapses the card while neighbors glide up. Card spacing
-                // lives INSIDE the motion wrapper (pb-2, not container gap)
-                // so the exit collapse swallows the gap too.
+                // folds the card shut while neighbors glide up. Card spacing
+                // lives INSIDE the fold (pb-2, not container gap) so the
+                // collapse swallows the gap too.
                 <motion.div
                   key={`${workspaceId}:${showArchived}`}
                   className="flex flex-col"
                   initial={{ opacity: 0 }}
                   animate={{ opacity: isPlaceholderData ? 0.45 : 1 }}
-                  transition={{ duration: 0.15, ease: 'easeInOut' }}
+                  transition={TWEEN.quick}
                 >
                   <AnimatePresence initial={false}>
                     {threads.map((thread) => (
@@ -923,32 +925,24 @@ function ThreadGallery({ workspaceId, onBack, onThreadSelect }: ThreadGalleryPro
                         key={thread.thread_id}
                         layout="position"
                         layoutDependency={threadOrderSignature}
-                        className="pb-2"
-                        // Restores what the exit moves: a card re-entering
-                        // after its own exit finished keeps exit-only values.
-                        animate={{ height: 'auto', opacity: 1 }}
-                        exit={{ height: 0, opacity: 0 }}
-                        transition={{
-                          layout: { duration: 0.22, ease: [0.22, 1, 0.36, 1] },
-                          height: { duration: 0.18, ease: 'easeInOut' },
-                          opacity: { duration: 0.15, ease: 'easeInOut' },
-                        }}
-                        style={{ overflow: 'hidden' }}
+                        transition={{ layout: TWEEN.fold }}
                       >
-                        {/* Archive affordances derive from the ROW, not the
-                            view toggle: while isPlaceholderData shows the
-                            previous view's rows the toggle has already
-                            flipped, so the view flag would offer Archive on
-                            an archived row. */}
-                        {/* DALTON-HOOK(workspace-sharing-settings): hide thread mutation actions for colleagues */}
-                        <ThreadCard
-                          thread={thread}
-                          onClick={handleThreadClick}
-                          onDelete={teamReadOnly.isColleague ? undefined : handleDeleteClick}
-                          onRename={teamReadOnly.isColleague ? undefined : handleRenameClick}
-                          onArchive={!teamReadOnly.isColleague && !thread.archived_at ? handleArchive : undefined}
-                          onUnarchive={!teamReadOnly.isColleague && thread.archived_at ? handleUnarchive : undefined}
-                        />
+                        <PresenceFold className="pb-2">
+                          {/* Archive affordances derive from the ROW, not the
+                              view toggle: while isPlaceholderData shows the
+                              previous view's rows the toggle has already
+                              flipped, so the view flag would offer Archive on
+                              an archived row. */}
+                          {/* DALTON-HOOK(workspace-sharing-settings): hide thread mutation actions for colleagues */}
+                          <ThreadCard
+                            thread={thread}
+                            onClick={handleThreadClick}
+                            onDelete={teamReadOnly.isColleague ? undefined : handleDeleteClick}
+                            onRename={teamReadOnly.isColleague ? undefined : handleRenameClick}
+                            onArchive={!teamReadOnly.isColleague && !thread.archived_at ? handleArchive : undefined}
+                            onUnarchive={!teamReadOnly.isColleague && thread.archived_at ? handleUnarchive : undefined}
+                          />
+                        </PresenceFold>
                       </motion.div>
                     ))}
                   </AnimatePresence>
@@ -974,7 +968,7 @@ function ThreadGallery({ workspaceId, onBack, onThreadSelect }: ThreadGalleryPro
             initial={isMobile ? { x: '100%' } : { width: 0, opacity: 0 }}
             animate={isMobile ? { x: 0 } : { width: filePanelWidth + DIVIDER_WIDTH, opacity: 1 }}
             exit={isMobile ? { x: '100%' } : { width: 0, opacity: 0 }}
-            transition={{ duration: isDragging ? 0 : 0.25, ease: [0.22, 1, 0.36, 1] }}
+            transition={{ duration: isDragging ? 0 : DURATION.fold, ease: EASE_OUT }}
             className={isMobile ? 'flex overflow-hidden' : 'flex shrink-0 overflow-hidden'}
             style={isMobile ? { position: 'absolute', inset: 0, zIndex: 30 } : undefined}
           >

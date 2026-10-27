@@ -20,11 +20,11 @@ html.desktop-mac .wizard-topbar {
    `both`, so a part holds no style once it is in. A part that appears later
    (a line saying what the flow is waiting for) fades in the same way. */
 .wizard-step > * {
-  animation: wizard-fade-in 260ms cubic-bezier(0.33, 1, 0.68, 1) backwards;
+  animation: wizard-fade-in var(--motion-fold) var(--ease-reveal) backwards;
 }
-.wizard-step > :nth-child(2) { animation-delay: 60ms; }
-.wizard-step > :nth-child(3) { animation-delay: 110ms; }
-.wizard-step > :nth-child(n + 4) { animation-delay: 150ms; }
+.wizard-step > :nth-child(2) { animation-delay: var(--motion-stagger); }
+.wizard-step > :nth-child(3) { animation-delay: calc(var(--motion-stagger) * 2); }
+.wizard-step > :nth-child(n + 4) { animation-delay: calc(var(--motion-stagger) * 3); }
 
 /* The check a step takes when it is left answered, as the rail's dot moves
    off it. */
@@ -33,14 +33,5 @@ html.desktop-mac .wizard-topbar {
 }
 
 .wizard-mark-in {
-  animation: wizard-mark-in 240ms cubic-bezier(0.16, 1, 0.3, 1) 80ms backwards;
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .wizard-step > * {
-    animation: none;
-  }
-  .wizard-mark-in {
-    animation-name: wizard-fade-in;
-  }
+  animation: wizard-mark-in var(--motion-fold) var(--ease-out) calc(var(--motion-stagger) * 2) backwards;
 }

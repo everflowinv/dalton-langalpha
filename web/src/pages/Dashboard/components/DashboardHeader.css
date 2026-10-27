@@ -61,7 +61,7 @@
   font-size: 0.875rem;
   text-align: left;
   cursor: pointer;
-  transition: background-color 0.15s;
+  transition: background-color var(--motion-quick) var(--ease-out);
 }
 
 .dashboard-search-dropdown-item:hover {

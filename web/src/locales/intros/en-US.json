@@ -2,11 +2,11 @@
   "chat": {
     "modes": {
       "title": "Two ways to work",
-      "body": "Pick a workspace and its Analyst does the work there, with that workspace's files. Pick All workspaces and your Chief of Staff takes it: it answers quick questions itself and hands deep work to the right Analyst."
+      "body": "Pick a workspace and its Analyst does the work there, with that workspace's files. Pick your Chief of Staff and it takes it from there: it answers quick questions itself and hands deep work to the right Analyst."
     },
     "chiefOfStaff": {
-      "title": "All workspaces: your Chief of Staff",
-      "body": "Just say what you need, here or from a chat app like Slack or iMessage. Your Chief of Staff answers quick questions, creates workspaces, hands deep work to their Analysts and reports back where you asked, and manages your automations. Its threads sit under All workspaces, and its own files live in Home."
+      "title": "Your Chief of Staff: ask it anything",
+      "body": "Just say what you need, here or from a chat app like Slack or iMessage. Your Chief of Staff answers quick questions, creates workspaces, hands deep work to their Analysts and reports back where you asked, and manages your automations. Its threads are listed under Chief of Staff, and its own files live in Home."
     },
     "ptc": {
       "title": "A workspace: its Analyst does the work",

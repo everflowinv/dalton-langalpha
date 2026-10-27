@@ -1,7 +1,9 @@
 import React, { useState, useMemo } from 'react';
 import { TrendingUp, Clock, Briefcase, Eye, Search, X } from 'lucide-react';
-import { motion, AnimatePresence } from '@/lib/framer';
+import { motion } from '@/lib/framer';
+import { staggerDelay, TWEEN } from '@/lib/motion';
 import { useTranslation } from 'react-i18next';
+import { SwapCell } from '@/components/ui/crossfade';
 import { useIsMobile } from '@/hooks/useIsMobile';
 import { useNow } from '@/hooks/useNow';
 import { useLocale } from '@/hooks/useLocale';
@@ -52,7 +54,7 @@ function NewsRow({ item, idx, onNewsClick, skipAnimation }: NewsRowProps) {
   const motionProps = skipAnimation ? {} : {
     initial: { opacity: 0, y: 10 },
     animate: { opacity: 1, y: 0 },
-    transition: { delay: Math.min(idx, 10) * 0.05 },
+    transition: { ...TWEEN.quick, delay: staggerDelay(idx) },
   };
 
   return (
@@ -76,7 +78,7 @@ function NewsRow({ item, idx, onNewsClick, skipAnimation }: NewsRowProps) {
           <img
             src={item.image}
             alt=""
-            className="h-full w-full object-cover transition-transform duration-500 group-hover:scale-110"
+            className="h-full w-full object-cover"
             onError={(e) => { (e.target as HTMLImageElement).style.display = 'none'; }}
           />
         </div>
@@ -315,7 +317,7 @@ function NewsFeedCard({
               backgroundColor: 'var(--color-bg-input, var(--color-bg-tag))',
               borderColor: 'var(--color-border-muted)',
               width: tickerFilter ? 160 : 130,
-              transition: 'width 0.2s',
+              transition: 'width var(--motion-quick) var(--ease-out)',
             }}
           >
             <Search size={12} style={{ color: 'var(--color-text-secondary)', flexShrink: 0 }} />
@@ -370,27 +372,26 @@ function NewsFeedCard({
         </div>
       </div>
 
-      {/* Tab content */}
-      <AnimatePresence mode="wait">
-        <motion.div
-          key={activeTab}
-          initial={{ opacity: 0, y: 8 }}
-          animate={{ opacity: 1, y: 0 }}
-          exit={{ opacity: 0, y: -8 }}
-          transition={{ duration: 0.2 }}
-          className="flex flex-col gap-1"
-        >
-          {loading ? (
-            <SkeletonRows />
-          ) : filteredItems.length === 0 ? (
-            <EmptyState tab={activeTab} hasFilters={hasFilters} />
-          ) : (
-            filteredItems.map((item, idx) => (
-              <NewsRow key={item.id || idx} item={item} idx={idx} onNewsClick={onNewsClick} skipAnimation={isMobile} />
-            ))
-          )}
-        </motion.div>
-      </AnimatePresence>
+      {/* Tab content. A tab change dissolves in one grid cell: the old list
+          leaves as the new one arrives, never through an empty card. */}
+      <SwapCell
+        as="div"
+        className="items-start"
+        appear
+        shift={{ y: 8 }}
+        swapKey={activeTab}
+        layerClassName="flex flex-col gap-1"
+      >
+        {loading ? (
+          <SkeletonRows />
+        ) : filteredItems.length === 0 ? (
+          <EmptyState tab={activeTab} hasFilters={hasFilters} />
+        ) : (
+          filteredItems.map((item, idx) => (
+            <NewsRow key={item.id || idx} item={item} idx={idx} onNewsClick={onNewsClick} skipAnimation={isMobile} />
+          ))
+        )}
+      </SwapCell>
     </div>
   );
 }

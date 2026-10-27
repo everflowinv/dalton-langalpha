@@ -1,5 +1,7 @@
 import { registerAuthReset } from '@/lib/authResets';
-import { buildRenderBlocks, groupSegments, type RenderBlock } from './buildRenderBlocks';
+import type { PendingToolCallChunk } from '@/types/chat';
+import { buildRenderBlocks, groupSegments, HIDDEN_TOOL_CALL_NAMES, type RenderBlock } from './buildRenderBlocks';
+import { preparingCallsOf, samePreparing } from './pendingToolCalls';
 import type { ActivityItem, PreparingToolCallData } from './activityTypes';
 import { EMPTY_OBJ, type ContentSegmentRecord, type FoldState, type MessageRecord, type ToolCallProcessRecord } from './types';
 import type { ProjectedMessage } from './turnProjection';
@@ -8,7 +10,7 @@ export interface ContentInput {
   segments: ContentSegmentRecord[];
   reasoningProcesses: Record<string, Record<string, unknown>>;
   toolCallProcesses: Record<string, ToolCallProcessRecord>;
-  pendingToolCallChunks?: Record<string, Record<string, unknown>>;
+  pendingToolCallChunks?: Record<string, PendingToolCallChunk>;
   isStreaming?: boolean;
   isSubagentView?: boolean;
   /** See `buildRenderBlocks`; the current time when omitted. */
@@ -113,7 +115,7 @@ function shareProjection(next: ContentProjection, prev: ContentProjection | unde
     return shared;
   });
   const preparingToolCall = next.preparingToolCall && prev.preparingToolCall
-    && sameFields(next.preparingToolCall, prev.preparingToolCall) ? prev.preparingToolCall : next.preparingToolCall;
+    && samePreparing(next.preparingToolCall, prev.preparingToolCall) ? prev.preparingToolCall : next.preparingToolCall;
   if (unchanged && preparingToolCall === prev.preparingToolCall && next.nextExpiry === prev.nextExpiry
     && next.hasPinnedLive === prev.hasPinnedLive && next.pinnedSettledAt === prev.pinnedSettledAt) return prev;
   return { ...next, blocks: unchanged ? prev.blocks : blocks, preparingToolCall };
@@ -124,12 +126,10 @@ function shareProjection(next: ContentProjection, prev: ContentProjection | unde
  * earlier projection of the same message, lends it every part that did not
  * change (see `shareProjection`). */
 export function projectContent(input: ContentInput, prev?: ContentProjection): ContentProjection {
-  const chunks = Object.values(input.pendingToolCallChunks ?? EMPTY_OBJ);
-  const name = chunks.find((chunk) => typeof chunk.toolName === 'string')?.toolName;
-  const preparingToolCall = chunks.length ? {
-    toolName: typeof name === 'string' ? name : undefined,
-    argsLength: chunks.reduce((sum, chunk) => sum + (typeof chunk.argsLength === 'number' ? chunk.argsLength : 0), 0),
-  } : null;
+  // A hidden tool is dropped here too, or it would show as preparing until
+  // it landed and vanished. Only by its name, which a route that streams
+  // arguments alone (Anthropic's) does not send, so there it still shows.
+  const preparingToolCall = preparingCallsOf(input.pendingToolCallChunks, input.toolCallProcesses, HIDDEN_TOOL_CALL_NAMES);
   const { blocks, nextExpiry, pinnedLive, pinnedSettledAt } = buildRenderBlocks(groupSegments(input.segments), {
     ...input, preparing: preparingToolCall !== null,
   });

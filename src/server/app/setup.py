@@ -1265,6 +1265,9 @@ app.add_middleware(
         "OPTIONS",
     ],  # Use the configured list of methods
     allow_headers=["*"],  # Now allow all headers, but can be restricted further
+    # A ranged file download is read by script, which sees only these past the
+    # safelisted few when the app is served from another origin.
+    expose_headers=["Content-Range", "Accept-Ranges", "ETag"],
 )
 
 # Previews of private sandboxes, picked out by Host before any middleware

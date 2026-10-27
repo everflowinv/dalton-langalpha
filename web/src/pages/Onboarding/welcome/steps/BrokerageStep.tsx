@@ -166,12 +166,12 @@ function ElsewhereRow({ onClick }: { onClick: () => void }) {
         type="button"
         onClick={onClick}
         data-testid="welcome-elsewhere"
-        className="group inline-flex h-10 shrink-0 items-center justify-center gap-1.5 rounded-md border border-(--color-border-default) px-4 text-sm font-medium text-(--color-text-primary) transition-[background-color,scale] duration-150 hover:bg-(--color-bg-hover) motion-safe:active:scale-[0.98]"
+        className="group inline-flex h-10 shrink-0 items-center justify-center gap-1.5 rounded-md border border-(--color-border-default) px-4 text-sm font-medium text-(--color-text-primary) press hover:bg-(--color-bg-hover)"
       >
         <span>{t('onboarding.welcome.brokerage.elsewhereAction')}</span>
         <ArrowRight
           aria-hidden="true"
-          className="h-3.5 w-3.5 transition-transform duration-150 motion-safe:group-hover:translate-x-0.5"
+          className="h-3.5 w-3.5 transition-transform motion-safe:group-hover:translate-x-0.5"
         />
       </button>
     </div>

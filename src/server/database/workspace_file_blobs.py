@@ -287,24 +287,36 @@ async def fetch_blob_range(
     *,
     expected_sha256: str | None = None,
 ) -> bytes:
-    """Read one member's bytes out of a pack chunk, verifying them.
+    """Read a byte range of an object: one member out of a pack chunk, or a
+    slice of a file a ranged download asked for.
 
     A member row carries the file's own digest as ``content_hash``; checking
     the slice against it catches a wrong offset or a mis-keyed chunk as
-    loudly as :func:`fetch_blob` catches a corrupt object.
+    loudly as :func:`fetch_blob` catches a corrupt object. A slice that is
+    the whole file is checked the same way; any other has no digest of its
+    own, so only its length is. The check runs in the read's thread, as
+    :func:`fetch_blob`'s does.
     """
     key = blob_key(user_id, sha256)
-    data = await asyncio.to_thread(_storage_get_bytes_range, key, offset, length)
+    return await asyncio.to_thread(
+        _verified_get_range, key, offset, length, expected_sha256
+    )
+
+
+def _verified_get_range(
+    key: str, offset: int, length: int, sha256: str | None
+) -> bytes:
+    data = _storage_get_bytes_range(key, offset, length)
     if data is None:
-        msg = f"Pack {key} could not be read from object storage"
+        msg = f"Object {key} could not be read from object storage"
         raise BlobFetchError(msg)
     if len(data) != length:
-        msg = f"Pack {key} range {offset}+{length} returned {len(data)} bytes"
+        msg = f"Object {key} range {offset}+{length} returned {len(data)} bytes"
         raise BlobFetchError(msg)
-    if expected_sha256 is not None:
+    if sha256 is not None:
         actual = hashlib.sha256(data).hexdigest()
-        if actual != expected_sha256:
-            msg = f"Pack {key} member at {offset} hash mismatch (got {actual})"
+        if actual != sha256:
+            msg = f"Object {key} range at {offset} hash mismatch (got {actual})"
             raise BlobFetchError(msg)
     return data
 

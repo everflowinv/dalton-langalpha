@@ -134,7 +134,7 @@
   font-size: 0.78125rem;
   white-space: nowrap;
   cursor: pointer;
-  transition: background-color 120ms ease;
+  transition: background-color var(--motion-quick) var(--ease-out);
 }
 .connector-btn:hover { background: var(--color-bg-hover); }
 .connector-btn:disabled { opacity: 0.5; cursor: default; }
@@ -196,7 +196,7 @@
   height: 14px;
   margin-top: 2px;
   color: var(--color-text-quaternary);
-  transition: transform 120ms ease;
+  transition: transform var(--motion-quick) var(--ease-out);
 }
 .tool-row.is-open .tool-row-chevron { transform: rotate(90deg); }
 .tool-row-text { min-width: 0; display: flex; flex-direction: column; gap: 3px; }

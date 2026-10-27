@@ -1,4 +1,5 @@
 import { AnimatePresence, motion } from '@/lib/framer';
+import { TWEEN } from '@/lib/motion';
 import { useTranslation } from 'react-i18next';
 import { Eye } from 'lucide-react';
 import { useDashboardContext } from '../framework/DashboardDataContext';
@@ -95,12 +96,13 @@ function WatchlistWidget({ instance }: WidgetRenderProps<WatchlistConfig>) {
         </div>
       </div>
       <div className="flex-1 min-h-0 overflow-y-auto pr-1">
-        <AnimatePresence mode="wait">
+        <AnimatePresence>
           <motion.div
             key="watchlist"
             initial={{ opacity: 0, y: 10 }}
             animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0, y: -10 }}
+            exit={{ opacity: 0, y: -10, transition: TWEEN.exit }}
+            transition={TWEEN.quick}
             className="flex flex-col gap-1"
           >
             {showSkeleton ? (

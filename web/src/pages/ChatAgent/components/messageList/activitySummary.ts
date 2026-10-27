@@ -120,16 +120,24 @@ function fragmentLabel(f: SummaryFragment, t: TFn): string {
   return t('toolArtifact.categoryCount.generic', { count: f.count });
 }
 
+function failedCall(item: ActivityItem): boolean {
+  return item.type === 'tool_call' && (item.isFailed === true || item._liveState === 'failed');
+}
+
 /**
  * The run's one-line account of itself, e.g. "Ran 2 searches · read 3 files and
  * more". `expanded` drops the fold cap, since the rows themselves are on screen.
+ * `countFailures` adds "1 failed", never cut by the cap: on the status line a
+ * failed call has no row of its own, and the summary is where it stays findable.
  */
 export function summarizeCompletedItems(
   items: ActivityItem[],
   t: TFn,
-  options?: { expanded?: boolean },
+  options?: { expanded?: boolean; countFailures?: boolean },
 ): string | undefined {
   const fragments = summaryFragments(items);
+  const failures = options?.countFailures ? items.filter(failedCall).length : 0;
+  const failed = failures > 0 ? [t('toolArtifact.categoryCount.failed', { count: failures })] : [];
   let label: string | undefined;
 
   const reasoning = fragments.find((f) => f.slot === 'reasoning');
@@ -146,13 +154,15 @@ export function summarizeCompletedItems(
     const ordered = [...fragments.filter(isPriority), ...fragments.filter((f) => !isPriority(f))];
     const overflowing = !options?.expanded && ordered.length > FOLDED_MAX;
     const visible = overflowing ? ordered.slice(0, FOLDED_MAX) : ordered;
-    label = visible.map((f) => fragmentLabel(f, t)).join(' · ');
-    if (overflowing) label = `${label} ${t('toolArtifact.andMore')}`;
+    // "and more" ends the counts it cuts, before the failures: after them it
+    // read as more calls having failed.
+    const shown = visible.map((f) => fragmentLabel(f, t)).join(' · ');
+    label = [overflowing ? `${shown} ${t('toolArtifact.andMore')}` : shown, ...failed].join(' · ');
   } else if (fragments.length === 1 && reasoning?.thoughtMs !== undefined) {
     // A run that was only thought: say how long, not how many.
     label = fragmentLabel(reasoning, t);
   } else if (items.length > 0) {
-    label = t('toolArtifact.nStepsCompleted', { count: items.length });
+    label = [t('toolArtifact.nStepsCompleted', { count: items.length }), ...failed].join(' · ');
   }
 
   // Capitalize the first character only — embedded proper nouns and casing

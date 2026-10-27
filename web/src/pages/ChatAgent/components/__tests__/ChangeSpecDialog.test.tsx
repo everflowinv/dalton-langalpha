@@ -11,7 +11,7 @@ import { screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 
 import { renderWithProviders } from '@/test/utils';
-import type { ComputerProviderOption, UnsavedFile, WorkspaceQuota } from '@/types/api';
+import type { ComputerProviderOption, UnsavedFile, WorkspaceCapacity, WorkspaceQuota } from '@/types/api';
 
 vi.mock('@/config/hostMode', () => ({
   HOST_MODE: 'platform',
@@ -37,6 +37,21 @@ const LOW_DISK = {
 
 const NOT_ON_PLAN: WorkspaceQuota = { performance: { used: 0, limit: 0 }, max: null, always_on: null };
 const ON_PLAN: WorkspaceQuota = { performance: { used: 0, limit: 2 }, max: null, always_on: null };
+// A plan has one slot for a computer bigger than Small, open at every size up
+// to its largest, and each size counts every computer held in it.
+const PRO: WorkspaceQuota = {
+  performance: { used: 0, limit: 1 },
+  max: { used: 0, limit: 1 },
+  xlarge: { used: 0, limit: 0 },
+  always_on: null,
+};
+const MAX_PLAN: WorkspaceQuota = { ...PRO, xlarge: { used: 0, limit: 1 } };
+
+/** The quota once the user holds one computer bigger than Small. */
+function holdingOne(quota: WorkspaceQuota): WorkspaceQuota {
+  const held = (c: WorkspaceCapacity | null | undefined) => (c ? { ...c, used: 1 } : null);
+  return { ...quota, performance: held(quota.performance), max: held(quota.max), xlarge: held(quota.xlarge) };
+}
 
 // As `GET /computers/providers` lists them: Daytona runs three sizes, E2B four.
 const DAYTONA: ComputerProviderOption = {
@@ -132,6 +147,21 @@ describe('ChangeSpecDialog, after an interrupted change', () => {
     await userEvent.click(radio('Medium'));
     expect(apply()).toBeEnabled();
   });
+
+  it('judges the slot by the size the row holds, as the server does', () => {
+    // A Large moved to Small and was interrupted after the row took Small, and
+    // another Large now holds the slot: the server counts this one as Small.
+    const movedDown = {
+      ...INTERRUPTED,
+      resource_tier: 'standard',
+      spec_change: { ...INTERRUPTED.spec_change, target_tier: 'standard', from_tier: 'max' },
+    } as const;
+    renderWithProviders(
+      <ChangeSpecDialog target={movedDown} onClose={() => {}} onSubmit={() => {}} busy={false} quota={holdingOne(PRO)} />,
+    );
+    expect(radio('Medium')).toBeDisabled();
+    expect(radio('Medium')).toHaveAccessibleDescription(/^None left/);
+  });
 });
 
 describe('ChangeSpecDialog, the current tier', () => {
@@ -164,7 +194,7 @@ describe('ChangeSpecDialog, the current tier', () => {
       />,
     );
     expect(radio('Medium')).toHaveAccessibleDescription(/^Current/);
-    expect(radio('Medium')).not.toHaveAccessibleDescription(/1 of 2 left/);
+    expect(radio('Medium')).not.toHaveAccessibleDescription(/left/);
   });
 });
 
@@ -218,7 +248,7 @@ describe("ChangeSpecDialog, the provider's sizes", () => {
     expect(screen.getByTestId('spec-plan-cta')).toBeInTheDocument();
   });
 
-  it('seeds a low-disk Small machine on a Pro plan past the Medium it lacks to Large', () => {
+  it('seeds a low-disk Small machine on a Pro plan on Medium, the smallest size with more disk', () => {
     renderWithProviders(
       <ChangeSpecDialog
         target={LOW_DISK}
@@ -226,27 +256,28 @@ describe("ChangeSpecDialog, the provider's sizes", () => {
         onSubmit={() => {}}
         busy={false}
         provider={DAYTONA}
-        quota={{ ...NOT_ON_PLAN, max: { used: 0, limit: 1 }, xlarge: { used: 0, limit: 0 } }}
+        quota={PRO}
       />,
     );
-    expect(radio('Medium')).toBeDisabled();
-    expect(radio('Large')).toBeChecked();
+    expect(radio('Medium')).toBeChecked();
+    expect(radio('Large')).toBeEnabled();
     expect(apply()).toBeEnabled();
   });
 
-  it('does not tell a plan at the top size to upgrade for the sizes it leaves out', () => {
+  it('opens every size of a Max plan, with no upgrade line', () => {
     renderWithProviders(
       <ChangeSpecDialog
         target={HEALTHY}
         onClose={() => {}}
         onSubmit={() => {}}
         busy={false}
-        provider={DAYTONA}
-        quota={{ ...NOT_ON_PLAN, max: { used: 0, limit: 0 }, xlarge: { used: 0, limit: 1 } }}
+        provider={E2B}
+        quota={MAX_PLAN}
       />,
     );
-    expect(radio('Medium')).toBeDisabled();
-    expect(radio('Large')).toBeDisabled();
+    expect(radio('Medium')).toBeEnabled();
+    expect(radio('Large')).toBeEnabled();
+    expect(radio('Extra Large')).toBeEnabled();
     expect(screen.queryByTestId('spec-plan-cta')).not.toBeInTheDocument();
   });
 
@@ -269,5 +300,69 @@ describe("ChangeSpecDialog, the provider's sizes", () => {
     expect(radio('Extra Large')).toBeChecked();
     expect(radio('Extra Large')).toHaveAccessibleDescription(/^Current$/);
     expect(radio('Small')).not.toHaveAccessibleDescription(/vCPU/);
+  });
+});
+
+describe('ChangeSpecDialog, the slot a larger computer holds', () => {
+  const HEALTHY = { ...LOW_DISK, disk: null };
+
+  it('moves a Large on a Pro plan to Medium in the slot it holds', async () => {
+    const onSubmit = vi.fn();
+    renderWithProviders(
+      <ChangeSpecDialog
+        target={{ ...HEALTHY, resource_tier: 'max' }}
+        onClose={() => {}}
+        onSubmit={onSubmit}
+        busy={false}
+        provider={E2B}
+        quota={holdingOne(PRO)}
+      />,
+    );
+    expect(radio('Medium')).toBeEnabled();
+    expect(radio('Medium')).toHaveAccessibleDescription(/^2 vCPU/);
+    // The slot is this computer's own, so there is nothing to say of it.
+    expect(screen.queryByTestId('tier-slot')).not.toBeInTheDocument();
+    expect(radio('Large')).toHaveAccessibleDescription(/^Current/);
+    expect(radio('Extra Large')).toBeDisabled();
+    expect(radio('Extra Large')).toHaveAccessibleDescription(/^Not on your plan/);
+    expect(screen.getByTestId('spec-plan-cta')).toBeInTheDocument();
+
+    await userEvent.click(radio('Medium'));
+    await userEvent.click(apply());
+    expect(onSubmit).toHaveBeenCalledWith('performance');
+  });
+
+  it('opens every other larger size on a Max plan to the Medium that holds its slot', () => {
+    renderWithProviders(
+      <ChangeSpecDialog
+        target={{ ...HEALTHY, resource_tier: 'performance' }}
+        onClose={() => {}}
+        onSubmit={() => {}}
+        busy={false}
+        provider={E2B}
+        quota={holdingOne(MAX_PLAN)}
+      />,
+    );
+    expect(radio('Large')).toBeEnabled();
+    expect(radio('Extra Large')).toBeEnabled();
+    expect(screen.queryByTestId('spec-plan-cta')).not.toBeInTheDocument();
+  });
+
+  it('holds every larger size for a Small while another computer fills the slot', () => {
+    renderWithProviders(
+      <ChangeSpecDialog
+        target={HEALTHY}
+        onClose={() => {}}
+        onSubmit={() => {}}
+        busy={false}
+        provider={E2B}
+        quota={holdingOne(MAX_PLAN)}
+      />,
+    );
+    for (const name of ['Medium', 'Large', 'Extra Large']) {
+      expect(radio(name)).toBeDisabled();
+      expect(radio(name)).toHaveAccessibleDescription(/^None left/);
+    }
+    expect(screen.getByTestId('tier-slot')).toHaveTextContent("Your plan's computer larger than Small is in use.");
   });
 });

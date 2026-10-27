@@ -174,11 +174,13 @@ describe('useChatMessages: a steer the server refuses as not_running', () => {
       await Promise.resolve();
     });
 
-    // One copy of the message, now a plain send, with a turn of its own.
+    // One copy of the message, now a plain send, with a turn of its own. It
+    // keeps the waiting bubble's id, so the list keeps that bubble mounted.
     const copies = result.current.messages.filter(
       (m): m is UserMessage => m.role === 'user' && m.content === 'follow-up steering',
     );
     expect(copies).toHaveLength(1);
+    expect(copies[0].id).toBe(waiting[0].id);
     expect((copies[0] as UserMessage & { steering?: boolean }).steering).toBeFalsy();
     const assistantsAfter = result.current.messages.filter(
       (m): m is AssistantMessage => m.role === 'assistant',
@@ -483,6 +485,7 @@ describe('useChatMessages: refused steers go out one at a time, oldest first', (
     await settle(() => hook.result.current.handleSendMessage('typed later'));
     expect(posts).toHaveLength(2);
     expect(userBubbles(hook, 'typed later')).toMatchObject([{ steering: true }]);
+    const waitingId = userBubbles(hook, 'typed later')[0].id;
 
     await settle(() => posts[0].end());
     await waitFor(() => expect(posts).toHaveLength(3));
@@ -497,7 +500,7 @@ describe('useChatMessages: refused steers go out one at a time, oldest first', (
     expect(posts[3].message).toBe('typed later');
     expect(posts[3].opts.steerOnly).toBeFalsy();
     expect(posts[3].opts.requestKey).not.toBe(posts[1].opts.requestKey);
-    expect(userBubbles(hook, 'typed later')).toHaveLength(1);
+    expect(userBubbles(hook, 'typed later')).toMatchObject([{ id: waitingId }]);
   });
 
   it('steers as usual once the queue has drained', async () => {

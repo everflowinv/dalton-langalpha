@@ -174,12 +174,13 @@ export function WorkspaceTrackingToggle({
           disabled={!canEdit || mutation.isPending}
           onClick={handleToggle}
           data-testid="workspace-tracking-switch"
-          className={`relative inline-flex h-4 w-7 shrink-0 rounded-full transition-colors duration-150 ${
+          // DALTON-HOOK(coverage-tracking): house timing token instead of a literal duration-150
+          className={`relative inline-flex h-4 w-7 shrink-0 rounded-full transition-colors duration-quick ${
             !canEdit ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer'
           } ${isEnabled ? 'bg-emerald-500' : 'bg-zinc-400/50 dark:bg-zinc-600'}`}
         >
           <span
-            className={`inline-block h-3 w-3 transform rounded-full bg-white transition-transform duration-150 mt-0.5 ${
+            className={`inline-block h-3 w-3 transform rounded-full bg-white transition-transform duration-quick mt-0.5 ${
               isEnabled ? 'translate-x-3.5' : 'translate-x-0.5'
             }`}
           />

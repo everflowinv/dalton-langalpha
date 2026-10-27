@@ -178,7 +178,7 @@ function DashboardAttach() {
                     className={
                       'absolute right-0.5 top-1/2 flex h-3.5 w-3.5 -translate-y-1/2 ' +
                       'items-center justify-center rounded-full ' +
-                      'transition-[opacity,background-color,color] duration-150'
+                      'transition-[opacity,background-color,color] duration-quick'
                     }
                     style={{
                       opacity: hovered ? 1 : 0,

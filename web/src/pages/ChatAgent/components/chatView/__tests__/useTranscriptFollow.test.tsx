@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { renderHook } from '@testing-library/react';
 import type { TurnEndScroll } from '@/lib/turnEndScroll';
 import type { ChatMessage } from '@/types/chat';
@@ -42,40 +42,45 @@ function setup(initial: Props) {
 
 describe('useTranscriptFollow turn starters', () => {
   it.each([
-    ['handleSendMessage', ['hi', false, null, null, {}]],
-    ['handleEditMessage', ['u1', 'edited', {}]],
-    ['handleRegenerate', ['a1', {}]],
-    ['handleRetry', [{}]],
-  ] as const)('%s starts the turn, then rejoins the follow', (name, args) => {
+    ['handleSendMessage', ['hi', false, null, null, {}], 'send'],
+    ['handleEditMessage', ['u1', 'edited', {}], 'restart'],
+    ['handleRegenerate', ['a1', {}], 'restart'],
+    ['handleRetry', [{}], 'restart'],
+  ] as const)('%s starts the turn, then rejoins the follow as a %s', (name, args, kind) => {
     const { follow, starters, result } = setup({ messages: [], isLoading: false });
     const started = (result.current[name] as (...a: unknown[]) => unknown)(...args);
 
     expect(starters[name]).toHaveBeenCalledWith(...args);
     expect(starters[name].mock.invocationCallOrder[0]).toBeLessThan(follow.rejoin.mock.invocationCallOrder[0]);
+    expect(follow.rejoin).toHaveBeenCalledWith(kind);
     expect(started).toBe(starters[name].mock.results[0].value);
+  });
+
+  // A message into a turn still running adds to it, so it goes to the turn's
+  // end rather than pinning a new one.
+  it('rejoins as a steer when the turn is streaming', () => {
+    const { follow, result } = setup({ messages: [user('u1'), assistant('a1')], isLoading: true });
+    result.current.handleSendMessage('more');
+    expect(follow.rejoin).toHaveBeenCalledWith('steer');
+  });
+
+  // The send steers only while loading, so with an interrupt pending (a widget
+  // prompt; the composer is shut) it opens a turn of its own, and pins.
+  it('pins a send made while the turn waits on an answer', () => {
+    const { follow, result } = setup({ messages: [user('u1'), assistant('a1')], isLoading: false, pendingInterrupt: { id: 'i1' } });
+    result.current.handleSendMessage('more');
+    expect(follow.rejoin).toHaveBeenCalledWith('send');
   });
 });
 
 describe('useTranscriptFollow turn end', () => {
-  afterEach(() => vi.unstubAllGlobals());
-
-  it('lands instantly when the reader prefers reduced motion', () => {
-    vi.stubGlobal('matchMedia', (q: string) => ({ matches: q.includes('reduce'), media: q, addEventListener() {}, removeEventListener() {} }));
-    const before = [user('u1'), assistant('a1')];
-    const { follow, rerender } = setup({ messages: before, isLoading: false });
-    const pending = [...before, user('u2'), assistant('a2')];
-    rerender({ messages: pending, isLoading: true });
-    rerender({ messages: pending, isLoading: false });
-    expect(follow.landOnReply).toHaveBeenCalledWith('a2', 'auto');
-  });
-
   it('lands on the reply that the turn produced', () => {
     const before = [user('u1'), assistant('a1')];
     const { follow, rerender } = setup({ messages: before, isLoading: false });
     const pending = [...before, user('u2'), assistant('a2')];
     rerender({ messages: pending, isLoading: true });
     rerender({ messages: pending, isLoading: false });
-    expect(follow.landOnReply).toHaveBeenCalledWith('a2', 'smooth');
+    expect(follow.landOnReply).toHaveBeenCalledWith('a2');
   });
 
   it('leaves a finished turn at the end under the default preference', () => {
@@ -96,7 +101,7 @@ describe('useTranscriptFollow turn end', () => {
     expect(follow.landOnReply).not.toHaveBeenCalled();
     rerender({ messages: pending, isLoading: true });
     rerender({ messages: pending, isLoading: false });
-    expect(follow.landOnReply).toHaveBeenCalledWith('a2', 'smooth');
+    expect(follow.landOnReply).toHaveBeenCalledWith('a2');
   });
 
   it('stays put when a preflight rolls the old transcript back', () => {
@@ -113,6 +118,6 @@ describe('useTranscriptFollow turn end', () => {
     const streaming = [user('u1'), assistant('a1')];
     const { follow, rerender } = setup({ messages: streaming, isLoading: true });
     rerender({ messages: [user('u1'), { ...assistant('a1') }], isLoading: false });
-    expect(follow.landOnReply).toHaveBeenCalledWith('a1', 'smooth');
+    expect(follow.landOnReply).toHaveBeenCalledWith('a1');
   });
 });

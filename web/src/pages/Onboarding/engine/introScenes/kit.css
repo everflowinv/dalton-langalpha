@@ -21,7 +21,7 @@
   --iv-line: rgba(255, 255, 255, 0.14);
   --iv-line-2: rgba(255, 255, 255, 0.3);
   --iv-mk-shadow: 0 10px 28px rgba(0, 0, 0, 0.35);
-  --iv-ease: cubic-bezier(0.16, 1, 0.3, 1);
+  --iv-ease: var(--ease-out);
 
   font-size: 16px;
   line-height: 1.5;
@@ -66,7 +66,8 @@
 
 /* Staggered reveal — set `--rv` per element. */
 .intro-rv {
-  animation: intro-rv-enter 0.65s var(--iv-ease) both;
+  /* motion-exempt: the illustration's own pace, a picture of the app being built rather than UI timing */
+  animation: intro-rv-enter 650ms var(--iv-ease) both;
   animation-delay: var(--rv, 0s);
 }
 
@@ -83,7 +84,8 @@
 
 /* Element popping in after a scripted click (e.g. the created modal). */
 .intro-pop {
-  animation: intro-pop 0.45s var(--iv-ease) both;
+  /* motion-exempt: the illustration's own pace, a picture of the app being built rather than UI timing */
+  animation: intro-pop 450ms var(--iv-ease) both;
   animation-delay: var(--rv, 0s);
 }
 
@@ -108,6 +110,7 @@
   margin-left: 1px;
   vertical-align: -0.1em;
   background: var(--color-accent-primary);
+  /* motion-exempt: the caret's blink period */
   animation: intro-caret 0.9s steps(1) infinite;
 }
 
@@ -177,6 +180,7 @@
   -webkit-background-clip: text;
   background-clip: text;
   color: transparent;
+  /* motion-exempt: the loop's period; a tour illustration of the app's shimmer */
   animation: intro-shimmer 2s linear infinite;
 }
 

@@ -72,7 +72,7 @@ function IndexCard({
         {grouped2(index.prev * (1 + v / 100), locale)}
       </span>
       <span
-        className={'font-mono text-[6px] leading-none tabular-nums transition-colors duration-300'}
+        className={'font-mono text-[6px] leading-none tabular-nums transition-colors duration-quick'}
         style={{ color: signColor(v) }}
       >
         {signedFixed2(v, locale)}%
@@ -120,7 +120,7 @@ export function WatchRow({ row, live = false }: { row: (typeof WATCH)[number]; l
         <span
           className={
             'font-mono text-[5px] font-medium leading-none tabular-nums transition-colors ' +
-            'duration-300'
+            'duration-quick'
           }
           style={{ color: c }}
         >
@@ -130,7 +130,7 @@ export function WatchRow({ row, live = false }: { row: (typeof WATCH)[number]; l
       <span
         className={
           'min-w-[27px] rounded-[3px] px-[3px] py-[2px] text-center text-[6px] font-bold ' +
-          'leading-none tabular-nums transition-colors duration-300'
+          'leading-none tabular-nums transition-colors duration-quick'
         }
         style={{
           background: signColor(v, true),
@@ -399,7 +399,7 @@ export function NewsRow({
   const locale = useLocale();
   return (
     <div
-      className="relative flex items-start gap-1.5 rounded-[4px] px-1 py-1 transition-colors duration-150"
+      className="relative flex items-start gap-1.5 rounded-[4px] px-1 py-1 transition-colors duration-quick"
       style={{ background: hovered ? 'var(--color-bg-card-hover)' : 'transparent' }}
     >
       <NewsThumb thumb={item.thumb} />

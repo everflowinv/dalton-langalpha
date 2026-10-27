@@ -1,6 +1,7 @@
 import React, { useLayoutEffect, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 import { AnimatePresence, motion } from '@/lib/framer';
+import { SwapCell } from '@/components/ui/crossfade';
 import { MobileBottomSheet } from '@/components/ui/mobile-bottom-sheet';
 import { useIsMobile } from '@/hooks/useIsMobile';
 import { useScrollMemory } from '@/lib/scrollMemory';
@@ -74,9 +75,11 @@ export default function ManageView({
       <h2 className="title-font automation-form-title">
         {t(form.props.original ? 'automation.editAutomation' : 'automation.newAutomation')}
       </h2>
-      <AnimatePresence initial={false} mode="wait">
-        <AutomationInlineForm key={form.key} {...form.props} />
-      </AnimatePresence>
+      {/* Another automation's form dissolves over this one in a single grid
+          cell, so the pane is never an empty frame between the two. */}
+      <SwapCell as="div" className="items-start" swapKey={String(form.key)}>
+        <AutomationInlineForm {...form.props} />
+      </SwapCell>
     </div>
   );
 

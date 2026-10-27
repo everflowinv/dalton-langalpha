@@ -27,6 +27,45 @@ html {
   input, select, textarea { font-size: max(16px, 1rem) !important; }
 }
 
+/* ---------- Motion ----------
+   `lib/motion.ts` for CSS, the same numbers under the same names (DESIGN.md
+   § Motion). A stylesheet reaches for these and never writes a duration or a
+   curve of its own; `styles/__tests__/motionTokens.test.ts` fails on one.
+
+   The curves are Tailwind theme variables, so they double as utilities
+   (`ease-out`, `ease-reveal`, `ease-collapse`). Tailwind's own `ease-out`
+   (0, 0, .2, 1) is a different curve under the same name, and this replaces
+   it rather than leaving two. The durations become `duration-quick` and its
+   siblings. The two defaults put every bare `transition-*` class on the quick
+   duration and the house curve, where Tailwind would put 150ms on the
+   Material curve. `static` emits them all whether or not a class uses
+   them, since plain stylesheets read them too. */
+@theme static {
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-reveal: cubic-bezier(0.33, 1, 0.68, 1);
+  --ease-collapse: cubic-bezier(0.45, 0, 0.2, 1);
+  --transition-duration-press: var(--motion-press);
+  --transition-duration-quick: var(--motion-quick);
+  --transition-duration-fold: var(--motion-fold);
+  --transition-duration-enter: var(--motion-enter);
+  --transition-duration-exit: var(--motion-exit);
+  --default-transition-duration: var(--motion-quick);
+  --default-transition-timing-function: var(--ease-out);
+}
+
+:root {
+  --motion-press: 100ms;
+  --motion-quick: 160ms;
+  --motion-fold: 240ms;
+  --motion-enter: 280ms;
+  --motion-exit: 140ms;
+  --motion-reveal: 360ms;
+  /* `lib/motion.ts` STAGGER: the gap between items of a batch arriving. */
+  --motion-stagger: 40ms;
+  /* `lib/motion.ts` PRESS_SCALE: how far a committing button presses in. */
+  --press-scale: 0.97;
+}
+
 /* ---------- Semantic color tokens (hex/rgba for inline use) ---------- */
 :root {
   /* Font roles: Sora is the app's voice (chrome, nav, controls); Geist is

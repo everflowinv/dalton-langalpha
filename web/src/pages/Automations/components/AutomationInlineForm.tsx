@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next';
 import { useQueryClient } from '@tanstack/react-query';
 import { resolveChatWorkspace } from '@/hooks/useHomeWorkspace';
 import { motion } from '@/lib/framer';
+import { TWEEN } from '@/lib/motion';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Textarea } from '@/components/ui/textarea';
@@ -60,7 +61,7 @@ export default function AutomationInlineForm({
   const isEdit = !!opened.automation;
   const [form, setForm] = useState<FormState>(initialValues);
   const queryClient = useQueryClient();
-  // Reading Home's id for All workspaces, before the save starts.
+  // Reading Home's id for the Chief of Staff, before the save starts.
   const [placing, setPlacing] = useState(false);
   const [moreOpen, setMoreOpen] = useState(false);
   // The delivery entries the last save was refused over, until the delivery
@@ -115,7 +116,7 @@ export default function AutomationInlineForm({
   };
 
   return (
-    <motion.div {...PANE_ENTER} exit={{ opacity: 0 }}>
+    <motion.div {...PANE_ENTER} exit={{ opacity: 0, transition: TWEEN.exit }}>
       <form onSubmit={handleSubmit} className="automation-form">
         <div className="automation-form-rows">
           <FormRow label={t('common.name')} htmlFor={ids.name}>
@@ -161,7 +162,7 @@ export default function AutomationInlineForm({
           <Button
             type="submit"
             disabled={loading || placing}
-            className="transition-opacity hover:opacity-90"
+            className="hover:opacity-90"
             style={{ backgroundColor: 'var(--color-btn-primary-bg)', color: 'var(--color-btn-primary-text)' }}
           >
             {loading || placing ? t('common.saving') : isEdit ? t('automation.saveChanges') : t('common.create')}

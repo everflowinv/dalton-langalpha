@@ -152,7 +152,9 @@ describe('revealing a message a link points to', () => {
     expect(shown).toBe(true);
     expect(getByTestId('report')).toHaveFocus();
     expect(api.pinTargetRef.current).toMatchObject({ mode: 'anchor', id: 'r1' });
-    expect(viewport().scrollTop).toBeLessThan(REPORT_AT);
+    // The jump is the follow's own glide, a frame at a time, so it is read
+    // once it has landed.
+    await vi.waitFor(() => expect(viewport().scrollTop).toBeLessThan(REPORT_AT));
     expect(viewport().scrollTop).toBeGreaterThan(REPORT_AT - 100);
     // Above the end, so the follow stays off and the row stays put.
     expect(api.isNearBottomRef.current).toBe(false);

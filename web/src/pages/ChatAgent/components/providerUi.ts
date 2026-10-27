@@ -1,7 +1,8 @@
 /**
- * The provider vocabulary: what each sandbox backend is called and what
- * stopping a computer on it keeps. One table, read by the create form and by
- * the computer rows, so a provider is described the same way everywhere.
+ * The provider vocabulary: what each sandbox backend is called, how it is
+ * described, and whether it is a machine the user brings. One table, read by
+ * the create form and by the computer rows, so a provider is described the
+ * same way everywhere.
  */
 import type { useTranslation } from 'react-i18next';
 
@@ -146,12 +147,12 @@ export const THIS_MAC_OPTION = 'this-mac';
 /** Whether this Mac can still be added, or a computer already is this Mac. */
 export type ThisMacCard = 'offered' | 'added';
 
-/** This Mac's card, which leads the providers in the desktop app on a Mac. */
+/** This Mac's card, offered in the desktop app on a Mac after the hosted providers. */
 export function thisMacOption(t: Translate, state: ThisMacCard): RadioCardOption<string> {
   return {
     value: THIS_MAC_OPTION,
     title: t('computer.remoteControl.cardTitle', 'This Mac'),
-    description: t('computer.remoteControl.cardDesc', 'Let the agent work on this Mac, even while LangAlpha is closed.'),
+    description: t('computer.remoteControl.cardDesc', 'Works even with LangAlpha closed'),
     note: state === 'added'
       ? t('computer.remoteControl.alreadyAdded', 'Already added')
       : t('computer.ssh.previewLabel', 'Preview'),

@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { type SubagentTokenUsage, ZERO_USAGE } from '../utils/tokenUsage';
 import { isTerminalStatus } from '../session/subagents/subagentStatus';
 import { createFrameQueue } from '../session/stream/frameQueue';
+import { withoutPending } from '../session/stream/toolCallChunks';
 
 // --- Card-level types ---
 
@@ -203,7 +204,8 @@ export function useCardState(initialCards: CardsMap = {}): UseCardStateResult {
         if (isTerminalStatus(finalStatus) && finalMessages.length > 0) {
           finalMessages = finalMessages.map(msg => {
             if (msg.role !== 'assistant') return msg;
-            const m: SubagentMessage = { ...msg, isStreaming: false };
+            // A call still preparing never lands now, so its row goes too.
+            const m: SubagentMessage = { ...withoutPending(msg), isStreaming: false };
             if (m.toolCallProcesses) {
               const procs = { ...m.toolCallProcesses };
               for (const [id, proc] of Object.entries(procs)) {

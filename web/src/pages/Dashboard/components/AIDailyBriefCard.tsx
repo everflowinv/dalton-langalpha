@@ -1,6 +1,8 @@
 import React, { useEffect, useState, useCallback, useRef } from 'react';
 import { Sparkles, ArrowRight, Newspaper, Clock, ChevronDown } from 'lucide-react';
-import { motion, AnimatePresence } from '@/lib/framer';
+import { Disclosure } from '@/components/ui/Disclosure';
+import { motion } from '@/lib/framer';
+import { TWEEN } from '@/lib/motion';
 import { Loader } from '@/components/ui/loader';
 import { useTranslation } from 'react-i18next';
 import TopicBadge from './TopicBadge';
@@ -315,7 +317,7 @@ function AIDailyBriefCard({ onReadFull, instanceId }: AIDailyBriefCardProps) {
         layout
         initial={{ opacity: 0, y: 20 }}
         animate={{ opacity: 1, y: 0 }}
-        transition={{ delay: 0.2 }}
+        transition={TWEEN.enter}
         className="relative group rounded-3xl overflow-hidden border"
         style={{
           borderColor: 'var(--color-border-default)',
@@ -503,84 +505,74 @@ function AIDailyBriefCard({ onReadFull, instanceId }: AIDailyBriefCardProps) {
         </div>
 
         {/* Expanded timeline — inside the main card */}
-        <AnimatePresence>
-          {expanded && older.length > 0 && (
-            <motion.div
-              initial={{ height: 0, opacity: 0 }}
-              animate={{ height: 'auto', opacity: 1 }}
-              exit={{ height: 0, opacity: 0 }}
-              transition={{ duration: 0.3, ease: [0.4, 0, 0.2, 1] }}
-              className="overflow-hidden"
-            >
-              <div
-                className="mx-8 mb-6 border-t pt-5"
-                style={{ borderColor: 'var(--color-border-muted)' }}
+        <Disclosure open={expanded && older.length > 0}>
+          <div
+            className="mx-8 mb-6 border-t pt-5"
+            style={{ borderColor: 'var(--color-border-muted)' }}
+          >
+            <div className="flex items-center gap-2 mb-4">
+              <span
+                className="text-[0.625rem] font-semibold uppercase tracking-wider"
+                style={{ color: 'var(--color-text-tertiary)' }}
               >
-                <div className="flex items-center gap-2 mb-4">
-                  <span
-                    className="text-[0.625rem] font-semibold uppercase tracking-wider"
-                    style={{ color: 'var(--color-text-tertiary)' }}
-                  >
-                    {t('dashboard.brief.earlierInsights')}
-                  </span>
-                </div>
+                {t('dashboard.brief.earlierInsights')}
+              </span>
+            </div>
 
-                <div className="space-y-1">
-                  {older.map((item) => {
-                    const cfg = TYPE_CONFIG[item.type] || TYPE_CONFIG.market_update;
-                    return (
-                      <div key={item.market_insight_id} className="row-attach-host relative">
-                        <button
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            onReadFull?.(item.market_insight_id);
-                          }}
-                          className="w-full flex items-center gap-4 px-4 py-3 rounded-xl text-left transition-colors group/item"
-                          style={{ color: 'var(--color-text-secondary)' }}
-                          onMouseEnter={(e) => (e.currentTarget.style.backgroundColor = 'var(--color-bg-hover)')}
-                          onMouseLeave={(e) => (e.currentTarget.style.backgroundColor = 'transparent')}
-                        >
-                          <span
-                            className="text-xs font-medium shrink-0 w-16 text-right tabular-nums"
-                            style={{ color: 'var(--color-text-tertiary)' }}
-                          >
-                            {formatTime(item.completed_at, locale)}
-                          </span>
+            <div className="space-y-1">
+              {older.map((item) => {
+                const cfg = TYPE_CONFIG[item.type] || TYPE_CONFIG.market_update;
+                return (
+                  <div key={item.market_insight_id} className="row-attach-host relative">
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onReadFull?.(item.market_insight_id);
+                      }}
+                      className="w-full flex items-center gap-4 px-4 py-3 rounded-xl text-left transition-colors group/item"
+                      style={{ color: 'var(--color-text-secondary)' }}
+                      onMouseEnter={(e) => (e.currentTarget.style.backgroundColor = 'var(--color-bg-hover)')}
+                      onMouseLeave={(e) => (e.currentTarget.style.backgroundColor = 'transparent')}
+                    >
+                      <span
+                        className="text-xs font-medium shrink-0 w-16 text-right tabular-nums"
+                        style={{ color: 'var(--color-text-tertiary)' }}
+                      >
+                        {formatTime(item.completed_at, locale)}
+                      </span>
 
-                          <span
-                            className="w-2 h-2 rounded-full shrink-0"
-                            style={{ backgroundColor: cfg.accent }}
-                          />
+                      <span
+                        className="w-2 h-2 rounded-full shrink-0"
+                        style={{ backgroundColor: cfg.accent }}
+                      />
 
-                          <span
-                            className="text-[0.625rem] font-semibold uppercase tracking-wider shrink-0 px-2 py-0.5 rounded"
-                            style={{
-                              color: cfg.accent,
-                              backgroundColor: `color-mix(in srgb, ${cfg.accent} 15%, transparent)`,
-                            }}
-                          >
-                            {t(cfg.labelKey)}
-                          </span>
+                      <span
+                        className="text-[0.625rem] font-semibold uppercase tracking-wider shrink-0 px-2 py-0.5 rounded"
+                        style={{
+                          color: cfg.accent,
+                          backgroundColor: `color-mix(in srgb, ${cfg.accent} 15%, transparent)`,
+                        }}
+                      >
+                        {t(cfg.labelKey)}
+                      </span>
 
-                          <span
-                            className="text-sm truncate flex-1 group-hover/item:text-(--color-text-primary) transition-colors"
-                          >
-                            {item.headline}
-                          </span>
-                        </button>
-                        {instanceId && (
-                          <span className="absolute right-2 top-1/2 -translate-y-1/2 z-10">
-                            <RowAttachButton instanceId={instanceId} rowId={item.market_insight_id} />
-                          </span>
-                        )}
-                      </div>
-                    );
-                  })}
-                </div>
-              </div>
-            </motion.div>
-          )}
-        </AnimatePresence>
+                      <span
+                        className="text-sm truncate flex-1 group-hover/item:text-(--color-text-primary) transition-colors"
+                      >
+                        {item.headline}
+                      </span>
+                    </button>
+                    {instanceId && (
+                      <span className="absolute right-2 top-1/2 -translate-y-1/2 z-10">
+                        <RowAttachButton instanceId={instanceId} rowId={item.market_insight_id} />
+                      </span>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        </Disclosure>
       </motion.div>
 
       {/* Bottom padding for stacked shadow effect */}

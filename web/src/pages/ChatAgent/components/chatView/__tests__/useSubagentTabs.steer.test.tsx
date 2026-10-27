@@ -85,8 +85,6 @@ function harness() {
         resolveSubagentIdToAgentId: ((id: string) => id) as never,
         hydrateTaskTranscript: (async () => null) as never,
         saveScrollPosition: () => {},
-        scrollPositionsRef: { current: {} },
-        skipSubagentAutoScrollRef: { current: false },
         activeAgentIdRef,
         resolvedThreadIdRef: { current: 'thread-1' },
       });

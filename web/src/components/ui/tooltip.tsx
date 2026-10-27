@@ -22,7 +22,7 @@ function TooltipContent({
         sideOffset={sideOffset}
         collisionPadding={collisionPadding}
         className={cn(
-          "z-1030 overflow-hidden rounded-md px-2.5 py-1.5 text-xs shadow-md animate-fade-in",
+          "z-1030 overflow-hidden rounded-md px-2.5 py-1.5 text-xs shadow-md pop-in",
           className
         )}
         style={{

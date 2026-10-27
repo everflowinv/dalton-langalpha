@@ -1,5 +1,6 @@
 import { useMemo } from 'react';
 import { motion } from '@/lib/framer';
+import { staggerDelay, TWEEN } from '@/lib/motion';
 import { useTranslation } from 'react-i18next';
 import { useNavigate } from 'react-router';
 import {
@@ -81,7 +82,7 @@ export function WatchlistRowItem({ item, index, marketStatus, onDelete }: Watchl
     <motion.div
       initial={{ opacity: 0, y: 8 }}
       animate={{ opacity: 1, y: 0 }}
-      transition={{ delay: Math.min(index, 8) * 0.05 }}
+      transition={{ ...TWEEN.quick, delay: staggerDelay(index) }}
       className="flex items-center gap-2 p-3 rounded-xl border border-transparent transition-all cursor-pointer"
       onClick={() => navigate(`/market?symbol=${encodeURIComponent(item.symbol)}`)}
       onMouseEnter={(e) => {
@@ -227,7 +228,7 @@ export function PortfolioRowItem({
     <motion.div
       initial={{ opacity: 0, y: 8 }}
       animate={{ opacity: 1, y: 0 }}
-      transition={{ delay: Math.min(index, 8) * 0.05 }}
+      transition={{ ...TWEEN.quick, delay: staggerDelay(index) }}
       className="flex items-center gap-2 p-3 rounded-xl border border-transparent transition-all cursor-pointer"
       onClick={() => navigate(`/market?symbol=${encodeURIComponent(item.symbol)}`)}
       onMouseEnter={(e) => {

@@ -31,7 +31,7 @@
   }
 }
 .welcome-chat__rise {
-  animation: welcome-chat-rise 360ms cubic-bezier(0.22, 1, 0.36, 1) backwards;
+  animation: welcome-chat-rise var(--motion-enter) var(--ease-out) backwards;
 }
 /* The composer opens on the last turn, where what is written in it goes to
    the agent with the answers. Its edge comes up in the accent, short of the
@@ -39,11 +39,4 @@
    box's own border transition carries the change. */
 .welcome-chat__composer--cue .chat-input-container:not(:focus-within, .recording) {
   border-color: color-mix(in srgb, var(--color-accent-primary) 70%, var(--color-border-input));
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .welcome-chat__rise {
-    animation-name: wizard-fade-in;
-    animation-duration: 160ms;
-  }
 }

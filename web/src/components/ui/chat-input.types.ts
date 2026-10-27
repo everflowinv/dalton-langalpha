@@ -86,7 +86,7 @@ export interface ReadyAttachment {
 }
 
 /**
- * Where a send goes: All workspaces, which the Chief of Staff answers in Home,
+ * Where a send goes: the Chief of Staff, which answers in Home,
  * or the selected workspace's analyst. Both run the full agent, so the scope
  * is a target, not a mode.
  */

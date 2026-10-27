@@ -9,10 +9,10 @@ import { ownerOfToolCall } from '../toolCallOwner';
 import { deriveTaskSegment, applyTaskSegment, applyLaunchReply } from '../subagents/taskSegmentBuilder';
 import type { MessageRecord, SetMessages, ToolCallRecord, ToolCallResultRecord, TodoPayload, HtmlWidgetData } from '../../hooks/utils/types';
 import type { ProvenanceEvent } from '@/types/sse';
-import type { ContentSegment, ProvenanceRecord, SubagentTaskRecord, TextSegment } from '@/types/chat';
+import type { ContentSegment, PendingToolCallChunk, ProvenanceRecord, SubagentTaskRecord, TextSegment } from '@/types/chat';
 import { provenanceEventToRecord, provenanceRecordKey } from './provenance';
 import { appendTextChunk } from './textChunks';
-import { nextArrivalSeq } from '../streamRefs';
+import { addToolCallChunk, hasPreparing, removeLandedToolCall, withoutPending } from './toolCallChunks';
 import type { StreamRefs, ToolCallChunkRecord } from '../streamRefs';
 
 /**
@@ -179,19 +179,25 @@ export function handleTextContent({ assistantMessageId, content, finishReason, r
   // Handle finish_reason
   if (finishReason) {
     if (finishReason === 'tool_calls' && !content) {
-      // Message is requesting tool calls, don't mark as complete yet
+      // Message is requesting tool calls, don't mark as complete yet. Its
+      // calls have all landed by now.
+      setMessages((prev: MessageRecord[]) =>
+        prev.some((msg) => msg.id === assistantMessageId && hasPreparing(msg))
+          ? prev.map((msg) => (msg.id === assistantMessageId ? withoutPending(msg) : msg))
+          : prev
+      );
       return false; // Let tool_calls handler process this
     } else if (!content) {
       // Metadata chunk with finish_reason but no content. A "stopped" reason
       // (synthetic from a user stop, live or replayed) also stamps the message
-      // so the per-message "⏹ Stopped" chip renders, and clears any in-flight
-      // tool-call chunks so the "generating (~N chars)…" preparing row stops
-      // shimmering (the partial tool call never completed and is discarded).
+      // so the per-message "⏹ Stopped" chip renders. Either way the model call
+      // is over, so any in-flight tool-call chunks go and the preparing row
+      // stops shimmering (the partial tool call never completed).
       const isStopped = finishReason === 'stopped';
       setMessages((prev: MessageRecord[]) =>
         prev.map((msg: MessageRecord) =>
           msg.id === assistantMessageId
-            ? { ...msg, isStreaming: false, ...(isStopped ? { stopped: true, pendingToolCallChunks: {} } : {}) }
+            ? { ...withoutPending(msg), isStreaming: false, ...(isStopped ? { stopped: true } : {}) }
             : msg
         )
       );
@@ -218,7 +224,6 @@ export function handleTextContent({ assistantMessageId, content, finishReason, r
           content: accumulatedText,
           contentType: 'text',
           isStreaming: true,
-          arrivalSeq: nextArrivalSeq(msg),
         };
       })
     );
@@ -279,6 +284,7 @@ export function handleToolCalls({ assistantMessageId, toolCalls, finishReason: _
 
           const toolCallProcesses = { ...((msg.toolCallProcesses as Record<string, Record<string, unknown>>) || {}) };
           const contentSegments = [...((msg.contentSegments as Record<string, unknown>[]) || [])];
+          const firstLanding = !toolCallProcesses[toolCallId];
 
           let currentOrder: number;
 
@@ -323,7 +329,8 @@ export function handleToolCalls({ assistantMessageId, toolCalls, finishReason: _
             contentSegments,
             toolCallProcesses,
             subagentTasks,
-            pendingToolCallChunks: {},
+            pendingToolCallChunks: removeLandedToolCall(
+              (msg.pendingToolCallChunks as Record<string, PendingToolCallChunk> | undefined) ?? {}, toolCallId, firstLanding),
           };
         })
       );
@@ -634,22 +641,11 @@ export function handleToolCallChunks({ assistantMessageId, chunks, setMessages }
   const seenAt = Date.now();
 
   chunks.forEach((chunk: ToolCallChunkRecord) => {
-    const key = `${chunk.index ?? 0}`;
-
     setMessages((prev: MessageRecord[]) =>
       prev.map((msg: MessageRecord) => {
         if (msg.id !== assistantMessageId) return msg;
-        const pending = { ...((msg.pendingToolCallChunks as Record<string, Record<string, unknown>>) || {}) };
-        const existing = pending[key] || { toolName: null, chunkCount: 0, argsLength: 0, firstSeenAt: seenAt };
-
-        pending[key] = {
-          toolName: chunk.name || existing.toolName,
-          chunkCount: (existing.chunkCount as number) + 1,
-          argsLength: (existing.argsLength as number) + (chunk.args?.length || 0),
-          firstSeenAt: existing.firstSeenAt,
-        };
-
-        return { ...msg, pendingToolCallChunks: pending };
+        const pending = (msg.pendingToolCallChunks as Record<string, PendingToolCallChunk> | undefined) ?? {};
+        return { ...msg, pendingToolCallChunks: addToolCallChunk(pending, chunk, seenAt) };
       })
     );
   });

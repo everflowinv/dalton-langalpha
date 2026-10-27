@@ -79,6 +79,56 @@ async def resolve_file_bytes(file_record: dict, *, user_id: str) -> bytes | None
     return None
 
 
+async def resolve_file_byte_range(
+    file_record: dict, offset: int, length: int, *, user_id: str
+) -> tuple[bytes, int] | None:
+    """Up to ``length`` bytes of a stored file from ``offset``, and the file's
+    size, reading only those bytes from storage.
+
+    None for a row to answer whole: an inline row, which a slice would load in
+    full every time, and a row without a size or a stored object. The size is
+    the one the row was synced with. Empty bytes mean ``offset`` is at or past
+    the end. Only a slice that is the whole file can be checked against the
+    file's digest, and it is, as :func:`resolve_file_bytes` checks every read;
+    any other slice is checked for its length alone.
+    """
+    if (
+        file_record.get("content_binary") is not None
+        or file_record.get("content_text") is not None
+    ):
+        return None
+
+    size = file_record.get("file_size")
+    if size is None:
+        return None
+    size = int(size)
+    blob_sha256 = file_record.get("blob_sha256")
+    pack_sha256 = file_record.get("pack_sha256")
+    if blob_sha256:
+        source, start, digest = blob_sha256, offset, blob_sha256
+    elif pack_sha256:
+        source = pack_sha256
+        start = int(file_record.get("pack_offset") or 0) + offset
+        digest = file_record.get("content_hash")
+    else:
+        return None
+    length = min(length, size - offset)
+    if length <= 0:
+        return b"", size
+    whole = offset == 0 and length == size
+    try:
+        data = await fetch_blob_range(
+            user_id,
+            source,
+            start,
+            length,
+            expected_sha256=digest if whole else None,
+        )
+    except BlobError as e:
+        raise FileBytesUnavailable(str(e)) from e
+    return data, size
+
+
 async def resolve_file_bytes_or_none(
     file_record: dict, *, user_id: str, context: str
 ) -> bytes | None:

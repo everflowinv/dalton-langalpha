@@ -1,7 +1,9 @@
-import React, { useState } from 'react';
+import React, { useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Plus, ArrowUpRight, ArrowDownRight, Trash2, Pencil, Eye, EyeOff, Sunrise, Sunset, MoreVertical } from 'lucide-react';
-import { motion, AnimatePresence } from '@/lib/framer';
+import { motion } from '@/lib/framer';
+import { staggerDelay, TWEEN } from '@/lib/motion';
+import { SwapCell } from '@/components/ui/crossfade';
 import { useNavigate } from 'react-router';
 import { getExtendedHoursInfo } from '@/lib/marketUtils';
 import { deriveQuoteDisplay, formatSignedPct2, roundQuote2 } from '@/lib/quotes'; // DALTON-HOOK(extended-hours-quotes)
@@ -121,7 +123,7 @@ function WatchlistItem({ item, index, onDelete, marketStatus, isMobile }: Watchl
       data-testid={item.symbol ? `watchlist-row-${item.symbol}` : undefined}
       initial={{ opacity: 0, y: 8 }}
       animate={{ opacity: 1, y: 0 }}
-      transition={{ delay: index * 0.05 }}
+      transition={{ ...TWEEN.quick, delay: staggerDelay(index) }}
       className="flex items-center gap-2 p-3 rounded-xl border border-transparent transition-all cursor-pointer"
       style={{ backgroundColor: 'transparent' }}
       onClick={() => navigate(`/market?symbol=${encodeURIComponent(item.symbol)}`)}
@@ -282,7 +284,7 @@ function PortfolioItem({ item, index, onEdit, onDelete, valuesHidden, marketStat
       data-testid={item.symbol ? `portfolio-row-${item.symbol}` : undefined}
       initial={{ opacity: 0, y: 8 }}
       animate={{ opacity: 1, y: 0 }}
-      transition={{ delay: index * 0.05 }}
+      transition={{ ...TWEEN.quick, delay: staggerDelay(index) }}
       className="flex items-center gap-2 p-3 rounded-xl border border-transparent transition-all cursor-pointer"
       style={{ backgroundColor: 'transparent' }}
       onClick={() => navigate(`/market?symbol=${encodeURIComponent(item.symbol)}`)}
@@ -461,9 +463,13 @@ function PortfolioWatchlistCard({
   const [activeTab, setActiveTabRaw] = useState<PWTabKey>(() => (localStorage.getItem('portfolio_active_tab') as PWTabKey) || 'watchlist');
   const [valuesHidden, setValuesHiddenRaw] = useState(() => localStorage.getItem('portfolio_values_hidden') === 'true');
 
+  // The two tabs dissolve in one cell at the same scroll offset, so a tab
+  // opens at its top rather than out of view below a short list.
+  const contentRef = useRef<HTMLDivElement>(null);
   const setActiveTab = (tab: PWTabKey) => {
     setActiveTabRaw(tab);
     localStorage.setItem('portfolio_active_tab', tab);
+    if (tab !== activeTab) contentRef.current?.scrollTo({ top: 0 });
   };
   const setValuesHidden = (updater: boolean | ((prev: boolean) => boolean)) => {
     setValuesHiddenRaw((prev) => {
@@ -522,17 +528,19 @@ function PortfolioWatchlistCard({
         </div>
       </div>
 
-      {/* Content */}
-      <div className="flex-1 min-h-0 overflow-y-auto pr-1 space-y-1">
-        <AnimatePresence mode="wait">
+      {/* Content. The tabs dissolve in one grid cell, so a switch never passes
+          through an empty card. */}
+      <div ref={contentRef} className="flex-1 min-h-0 overflow-y-auto pr-1">
+        <SwapCell
+          as="div"
+          className="items-start"
+          appear
+          shift={{ y: 10 }}
+          swapKey={activeTab}
+          layerClassName="flex flex-col gap-1"
+        >
           {activeTab === 'watchlist' ? (
-            <motion.div
-              key="watchlist"
-              initial={{ opacity: 0, y: 10 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: -10 }}
-              className="flex flex-col gap-1"
-            >
+            <>
               {watchlistLoading
                 ? Array.from({ length: 5 }).map((_, i) => (
                     <div key={i} className="flex items-center gap-3 p-3 animate-pulse">
@@ -559,15 +567,9 @@ function PortfolioWatchlistCard({
                     />
                   ))}
               <AddNewButton label={t('dashboard.portfolioWatchlistCard.addSymbol')} onClick={onWatchlistAdd} />
-            </motion.div>
+            </>
           ) : (
-            <motion.div
-              key="portfolio"
-              initial={{ opacity: 0, y: 10 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: -10 }}
-              className="flex flex-col gap-1"
-            >
+            <>
               {/* Summary card */}
               {hasRealHoldings && (
                 <div
@@ -658,9 +660,9 @@ function PortfolioWatchlistCard({
                     />
                   ))}
               <AddNewButton label={t('dashboard.portfolioWatchlistCard.addTransaction')} onClick={onPortfolioAdd} />
-            </motion.div>
+            </>
           )}
-        </AnimatePresence>
+        </SwapCell>
       </div>
     </div>
   );

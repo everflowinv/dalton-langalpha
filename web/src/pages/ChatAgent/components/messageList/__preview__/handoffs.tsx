@@ -24,7 +24,8 @@ import { ReportRow } from '../ReportRow';
  * Dev-only harness for the Chief of Staff's hand-offs to workspace analysts:
  * every slip state, the approval card, a declined row, a group, the same in a
  * narrow column, and the report rows, drawn from fixtures; then the same parts
- * wired to a stubbed liveness read, as a reply puts them. Open
+ * wired to a stubbed liveness read, as a reply puts them, and a run of cards
+ * to answer by hand, to watch each answer resolve in place. Open
  * /handoffs-preview.html on the dev server.
  *
  *   ?theme=dark&locale=zh-CN&bar=0
@@ -240,6 +241,30 @@ const RUN_PINNED: AnalystHandoffMember[] = [
 ];
 const RUN_UNKNOWN: AnalystHandoffMember[] = [approved('f', 'th-f', 'Biotech Catalysts', { dispatch_failed: true, dispatch_unknown: true })];
 const WIRED_REPORT = 'msg-report-c';
+
+// Four cards to answer by hand. Approved, each reads one of the stubbed
+// threads, so the slip it becomes has a run to show.
+const ASKING: AnalystHandoffMember[] = [
+  ['q1', 'NVDA Deep Dive'],
+  ['q2', 'Semis Comps'],
+  ['q3', 'Supply Chain'],
+  ['q4', 'Macro Rates'],
+].map(([key, workspace]) => ({
+  key,
+  proposalId: `p-${key}`,
+  proposal: {
+    status: 'pending',
+    question: BRIEF_LONG,
+    workspace_name: workspace,
+    workspace_id: `ws-${key}`,
+    tool_call_id: `tc-${key}`,
+    report_back: true,
+    interruptId: `i-${key}`,
+  },
+}));
+const ASKING_THREADS: Record<string, string> = Object.fromEntries(
+  [['p-q1', 'th-a'], ['p-q2', 'th-b'], ['p-q3', 'th-c'], ['p-q4', 'th-d']],
+);
 const WIRED_PLACES: ReadonlyMap<string, HandoffPlace> = new Map([
   ['tc-c', { reportId: WIRED_REPORT }],
   ['tc-f', { madeAt: NOW - 2 * MIN }],
@@ -394,6 +419,45 @@ function Wired() {
   );
 }
 
+function Answering() {
+  const [round, setRound] = useState(0);
+  const [members, setMembers] = useState(ASKING);
+  const answer = (proposalId: string, status: 'approved' | 'rejected') => setMembers((ms) => ms.map((m) => (
+    m.proposalId === proposalId
+      ? { ...m, proposal: { ...m.proposal, status, ...(status === 'approved' ? { thread_id: ASKING_THREADS[proposalId] } : {}) } }
+      : m
+  )));
+  return (
+    <Section id="answering" title="Answered live">
+      <DispatchStatusProvider>
+        <MessageActionsProvider actions={REVEAL}>
+          <div className="sibling-space-y-3">
+            <Prose>Four hand-offs to answer in any order: one alone, one beside a slip, one beside a group, one declined.</Prose>
+            <AnalystHandoffRun
+              key={round}
+              members={members}
+              onApprove={(_proposal, _overrides, proposalId) => answer(proposalId, 'approved')}
+              onReject={(_proposal, proposalId) => answer(proposalId, 'rejected')}
+            />
+            <Prose>The reply goes on under the run, and glides once with each answer.</Prose>
+            <button
+              type="button"
+              onClick={() => {
+                setRound((r) => r + 1);
+                setMembers(ASKING);
+              }}
+              className="cursor-pointer rounded-full border border-(--color-border-default) px-2.5 py-0.5 text-[0.6875rem]"
+              style={{ color: 'var(--color-text-secondary)' }}
+            >
+              ask again
+            </button>
+          </div>
+        </MessageActionsProvider>
+      </DispatchStatusProvider>
+    </Section>
+  );
+}
+
 function Btn({ on, onClick, children }: { on: boolean; onClick: () => void; children: string }) {
   return (
     <button
@@ -449,6 +513,7 @@ function Preview() {
                 <main className="font-content mx-auto w-full max-w-3xl space-y-10">
                   <Gallery />
                   <Wired />
+                  <Answering />
                 </main>
               </div>
             }

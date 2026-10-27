@@ -141,7 +141,7 @@ export function RunFoldChevron({ open }: { open: boolean }): React.ReactElement 
     <ChevronRight
       aria-hidden
       className={cn(
-        'h-3.5 w-3.5 shrink-0 text-(--color-text-tertiary) transition-transform duration-200 group-hover/run:text-(--color-text-secondary) motion-reduce:transition-none',
+        'h-3.5 w-3.5 shrink-0 text-(--color-text-tertiary) transition-transform duration-fold group-hover/run:text-(--color-text-secondary) motion-reduce:transition-none',
         open && 'rotate-90',
       )}
     />

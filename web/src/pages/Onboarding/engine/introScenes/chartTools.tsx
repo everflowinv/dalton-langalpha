@@ -124,7 +124,7 @@ export function CommentBox({
           {text ?? t('marketView.selection.commentPlaceholder')}
         </span>
         <span
-          className="flex h-3 w-3 shrink-0 items-center justify-center rounded-full transition-transform duration-150"
+          className="flex h-3 w-3 shrink-0 items-center justify-center rounded-full transition-transform duration-press"
           style={{
             background: 'var(--color-btn-primary-bg)',
             color: 'var(--color-btn-primary-text)',

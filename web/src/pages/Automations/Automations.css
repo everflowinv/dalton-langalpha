@@ -101,7 +101,7 @@
   font-size: 0.75rem;
   color: var(--color-text-secondary);
   border-radius: 4px;
-  transition: color 0.12s ease;
+  transition: color var(--motion-quick) var(--ease-out);
 }
 
 .automation-link:hover {
@@ -160,7 +160,7 @@
   padding-inline: var(--starter-bleed);
   border-radius: 8px;
   text-align: left;
-  transition: background-color 0.12s ease;
+  transition: background-color var(--motion-quick) var(--ease-out);
 }
 
 .automations-starter:hover {

@@ -1,6 +1,6 @@
 import type { CSSProperties, ReactNode } from 'react';
 import { useTranslation } from 'react-i18next';
-import { FileText, GripVertical, Pin, Plus, Search, Server, Upload, X } from 'lucide-react';
+import { FileText, Pin, Plus, Search, Server, Upload, X } from 'lucide-react';
 import { HomeRowIcon } from '@/hooks/useHomeWorkspace';
 import { useLocale } from '@/hooks/useLocale';
 import { shortMonthDay } from '@/lib/format';
@@ -71,7 +71,7 @@ function GalleryHeader({
       <span
         className={cn(
           'flex shrink-0 items-center gap-1 rounded-md px-1.5 py-1',
-          'transition-transform duration-150'
+          'transition-transform duration-press'
         )}
         style={{
           background: 'var(--color-btn-primary-bg)',
@@ -125,7 +125,7 @@ interface Desk {
 /**
  * A card in the gallery (`WorkspaceCard`): name, one line of description,
  * the machine it runs on with that machine's state, and when it was updated.
- * All workspaces is the flat elevated card with the home glyph and no
+ * The Chief of Staff is the flat elevated card with Home's glyph and no
  * machine line; every other card sits on the card fill.
  */
 function GalleryCard({
@@ -208,7 +208,7 @@ function GalleryCard({
 /** The gallery, kept calm: the cards come in, the one machine they share
     starts (each card's machine line turns at once), then two of them read
     as updated today as agents finish work in them. Sorted by activity:
-    All workspaces, the pinned card, then the most recently updated. */
+    The Chief of Staff, the pinned card, then the most recently updated. */
 const GRID = {
   cards: [150, 230, 310, 390, 470, 550],
   starting: 2000,
@@ -264,8 +264,8 @@ function GalleryPage({
 }) {
   const { t } = useTranslation();
   const home: Desk = {
-    name: t('agents.allWorkspaces'),
-    description: t('agents.widgets.allWorkspacesDesc'),
+    name: t('agents.chiefOfStaff'),
+    description: t('agents.widgets.chiefOfStaffDesc'),
     updated: GRID.today,
   };
   return (
@@ -284,7 +284,6 @@ function GalleryPage({
           {t('workspace.sortBy')}
         </span>
         <OutlineButton>{t('workspace.activity')}</OutlineButton>
-        <OutlineButton icon={GripVertical}>{t('workspace.reorder')}</OutlineButton>
       </div>
       <div className="grid min-h-0 flex-1 auto-rows-fr grid-cols-2 gap-2">
         {[home, ...GRID.desks].map((desk, i) => (
@@ -438,6 +437,7 @@ function UploadRow({ name, size, at }: { name: string; size: string; at: number 
               style={{
                 width: `${p * 100}%`,
                 background: 'var(--color-accent-primary)',
+                // eslint-disable-next-line no-restricted-syntax -- smooths the fill between the script's ticks, not a UI timing
                 transition: 'width 90ms linear',
               }}
             />
@@ -471,7 +471,7 @@ function CreateWorkspace() {
     <Camera shots={NEW_WS_SHOTS} pointer={NEW_WS_POINTER}>
       <div className="relative" style={VIEW}>
         {/* the gallery, dimmed behind the modal once it opens */}
-        <div style={{ opacity: open ? 0.45 : 1, transition: 'opacity 300ms ease' }}>
+        <div style={{ opacity: open ? 0.45 : 1, transition: 'opacity var(--motion-enter) var(--ease-out)' }}>
           <GalleryPage machine="running" pressNew={pressAt(now, NEW_WS.clickNew)} />
         </div>
         {/* the modal the click opens (`CreateWorkspaceModal`): name,
@@ -558,7 +558,7 @@ function CreateWorkspace() {
                 <span
                   className={cn(
                     'rounded-[4px] px-2 py-1 text-[8px] font-medium leading-none',
-                    'transition-transform duration-150'
+                    'transition-transform duration-press'
                   )}
                   style={{
                     background: 'var(--color-btn-primary-bg)',

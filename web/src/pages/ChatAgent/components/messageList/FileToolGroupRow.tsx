@@ -1,12 +1,14 @@
 import React, { memo, useState } from 'react';
-import { SPRING_FOLD } from './liveZoneTiming';
-import { motion, AnimatePresence } from '@/lib/framer';
+import { SPRING_FOLD } from '@/lib/motion';
+import { motion } from '@/lib/framer';
 import { ChevronDown } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { categorizeTool, getToolIcon, getCompletedRowTitle, getCompletedSummary } from '../toolDisplayConfig';
 import { classifyAgentPath } from '../../utils/agentPaths';
 import { RunningLine } from './ToolCallRow';
-import { RunningIcon, FailedIconBadge } from './ActivityRowParts';
+import { RowIcon, FailedIconBadge } from './ActivityRowParts';
+import { FoldPanel } from './FoldPanel';
+import { SwapCell } from '@/components/ui/crossfade';
 import { announceAnchoredToggle } from '../../utils/anchoredToggle';
 import { EditDiff } from './EditDiff';
 import { editStrings, filePathOf } from './groupFileToolRuns';
@@ -72,64 +74,59 @@ export const FileToolGroupRow = memo(function FileToolGroupRow({ items, onOpenFi
   const openSingle = () => singlePath ? openPath(singlePath) : onToolCallClick?.(item);
   const pills = single ? (singlePath && singleLabel ? [{ path: singlePath, label: singleLabel }] : [])
     : paths.map((path) => ({ path, label: path.split('/').pop() }));
+  // Only a lone call has a running line of its own; a run's title holds still
+  // while its newest call is out.
+  const runningSingle = isStreaming && single;
 
   return (
     <div className={`titem${isFailed ? ' failed' : ''}${isStreaming ? ' running' : ''}`} data-file-group={single ? undefined : toolName}>
       <div className="titem-icon" title={isFailed ? failedLabel : undefined}>
-        <RunningIcon running={isStreaming}><IconComponent className="h-4 w-4" /></RunningIcon>
-        {isFailed && <FailedIconBadge label={failedLabel} />}
+        <RowIcon running={isStreaming}><IconComponent className="h-4 w-4" /></RowIcon>
+        <FailedIconBadge failed={isFailed} label={failedLabel} />
       </div>
-      <div className="titem-body">
-        <div className="titem-line" style={{ flexWrap: 'wrap', rowGap: '4px' }}>
-          {isStreaming && single ? <RunningLine item={item} onOpenPill={openSingle} /> : <>
+      {/* No flex gap: the diffs' spacing rides inside their fold, so it opens
+          and closes with them instead of landing whole on the first frame. */}
+      <div className="titem-body" style={{ gap: 0 }}>
+        <SwapCell swapKey={runningSingle ? 'running' : 'settled'} layerClassName="titem-line flex-wrap gap-y-[4px]">
+          {runningSingle ? <RunningLine item={item} onOpenPill={openSingle} /> : <>
             {pills.length > 0 ? <span className="titem-title">{title}</span>
                 : <button type="button" onClick={openSingle} className="titem-title titem-title-button" title={openLabel}>{title}</button>}
             {pills.map(({ path, label }) => <span key={path} className="titem-pill-wrap">
               <button type="button" onClick={() => openPath(path)} className="obj" title={openLabel}>{label}</button>
             </span>)}
+            {repeat && <span style={{ opacity: 0.55, fontSize: '0.8125rem' }}>{repeat}</span>}
+            {hasDiff && !isStreaming && (
+              <button
+                type="button"
+                onClick={(e) => { announceAnchoredToggle(e.currentTarget); setExpanded(!expanded); }}
+                className="inline-flex items-center shrink-0 bg-transparent border-0 p-0 cursor-pointer"
+                style={{ color: 'inherit', alignSelf: 'center' }}
+                aria-expanded={expanded}
+                aria-label={expanded ? t('toolArtifact.a11y.collapseDiff') : t('toolArtifact.a11y.expandDiff')}
+              >
+                <motion.span className="inline-flex" animate={{ rotate: expanded ? 90 : 0 }} transition={SPRING_FOLD}>
+                  <ChevronDown className="h-3 w-3 -rotate-90" style={{ opacity: 0.5 }} />
+                </motion.span>
+              </button>
+            )}
           </>}
-          {repeat && <span style={{ opacity: 0.55, fontSize: '0.8125rem' }}>{repeat}</span>}
-          {hasDiff && !isStreaming && (
-            <button
-              type="button"
-              onClick={(e) => { announceAnchoredToggle(e.currentTarget); setExpanded(!expanded); }}
-              className="inline-flex items-center shrink-0 bg-transparent border-0 p-0 cursor-pointer"
-              style={{ color: 'inherit', alignSelf: 'center' }}
-              aria-expanded={expanded}
-              aria-label={expanded ? t('toolArtifact.a11y.collapseDiff') : t('toolArtifact.a11y.expandDiff')}
-            >
-              <motion.div animate={{ rotate: expanded ? 90 : 0 }} transition={SPRING_FOLD}>
-                <ChevronDown className="h-3 w-3 -rotate-90" style={{ opacity: 0.5 }} />
-              </motion.div>
-            </button>
-          )}
-        </div>
+        </SwapCell>
 
-        <AnimatePresence initial={false}>
-          {expanded && hasDiff && !isStreaming && (
-            <motion.div
-              key="diffs"
-              initial={{ height: 0, opacity: 0 }}
-              animate={{ height: 'auto', opacity: 1 }}
-              exit={{ height: 0, opacity: 0 }}
-              transition={SPRING_FOLD}
-              style={{ overflow: 'hidden' }}
-            >
-              <div className="mt-2 flex flex-col gap-2">
-                {diffs.map((d, i) => (
-                  <div key={d.item.id || i}>
-                    {paths.length > 1 && d.path && (
-                      <div className="font-mono mb-1" style={{ fontSize: '0.6875rem', color: 'var(--Labels-Tertiary)' }}>
-                        {d.path.split('/').pop()}
-                      </div>
-                    )}
-                    <EditDiff oldStr={d.oldStr} newStr={d.newStr} />
+        <FoldPanel open={expanded && hasDiff && !isStreaming}>
+          {/* The body's former 6px gap plus the 8px the diffs kept above them. */}
+          <div className="pt-3.5 flex flex-col gap-2">
+            {diffs.map((d, i) => (
+              <div key={d.item.id || i}>
+                {paths.length > 1 && d.path && (
+                  <div className="font-mono mb-1" style={{ fontSize: '0.6875rem', color: 'var(--Labels-Tertiary)' }}>
+                    {d.path.split('/').pop()}
                   </div>
-                ))}
+                )}
+                <EditDiff oldStr={d.oldStr} newStr={d.newStr} />
               </div>
-            </motion.div>
-          )}
-        </AnimatePresence>
+            ))}
+          </div>
+        </FoldPanel>
       </div>
     </div>
   );

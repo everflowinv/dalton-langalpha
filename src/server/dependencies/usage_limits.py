@@ -734,12 +734,30 @@ def _extract_capacity(quota: dict) -> tuple[int | None, int | None]:
     return used, limit
 
 
-async def enforce_capacity(user_id: str, check_quota: str) -> None:
+def _allowed_returning_a_slot(quota: dict) -> bool:
+    """Whether the quota allows one more once a slot the caller holds is given back.
+
+    The platform's ``allowed`` counts that slot as taken, so the counts decide
+    here instead: one fewer used, a limit of 0 still the plan leaving it out,
+    and -1 unlimited. Without both counts the platform's own answer stands.
+    """
+    used, limit = _extract_capacity(quota)
+    if used is None or limit is None:
+        return quota.get("allowed") is not False
+    limit = int(limit)
+    return limit == -1 or (limit > 0 and int(used) - 1 < limit)
+
+
+async def enforce_capacity(
+    user_id: str, check_quota: str, *, returning_slot: bool = False
+) -> None:
     """Raise 429 when the platform reports the named count quota is exhausted.
 
     Generalizes ``enforce_computer_limit`` over ``check_quota`` (``always_on``,
-    ``spec_performance``, ``spec_max``, ``spec_xlarge``). No-op in OSS mode and fail-open when the
-    platform is unreachable or omits the quota object.
+    ``spec_performance``, ``spec_max``, ``spec_xlarge``). ``returning_slot``
+    is for a caller that already holds one of the slots the quota counts and
+    gives it up for the one it asks for. No-op in OSS mode and fail-open when
+    the platform is unreachable or omits the quota object.
     """
     if not platform_gating_active():
         return
@@ -752,7 +770,12 @@ async def enforce_capacity(user_id: str, check_quota: str) -> None:
     if not quota:
         return
 
-    if quota.get("allowed") is False:
+    allowed = (
+        _allowed_returning_a_slot(quota)
+        if returning_slot
+        else quota.get("allowed") is not False
+    )
+    if not allowed:
         current, limit = _extract_capacity(quota)
         headers = {"X-RateLimit-Remaining": "0"}
         if limit is not None:
@@ -832,7 +855,9 @@ ALWAYS_ON_SCOPE = "workspace:always_on"
 ALWAYS_ON_QUOTA = "always_on"
 
 # spec tier -> (required scope, count-quota name). Absent tiers (standard,
-# unknown) are ungated.
+# unknown) are ungated. A plan has one slot for a computer bigger than
+# standard, at any size its scopes reach, so the platform counts all three
+# quotas over the same computers: every one held at any of these tiers.
 _SPEC_ENTITLEMENTS: dict[str, tuple[str, str]] = {
     "performance": ("workspace:spec:performance", "spec_performance"),
     "max": ("workspace:spec:max", "spec_max"),
@@ -848,12 +873,17 @@ DISPLAYED_ENTITLEMENTS: dict[str, tuple[str, str]] = {
 
 
 async def _assert_hybrid_gate(
-    user_id: str, scope: str, check_quota: str, *, count: bool = True
+    user_id: str,
+    scope: str,
+    check_quota: str,
+    *,
+    count: bool = True,
+    returning_slot: bool = False,
 ) -> None:
     """Shared workspace-entitlement gate: scope 403 then optional count 429."""
     await require_workspace_scope(user_id, scope)
     if count:
-        await enforce_capacity(user_id, check_quota)
+        await enforce_capacity(user_id, check_quota, returning_slot=returning_slot)
 
 
 async def assert_spec_allowed(
@@ -861,17 +891,24 @@ async def assert_spec_allowed(
 ) -> None:
     """Gate a move to ``tier`` (scope 403 + count 429). Standard is never gated.
 
-    The count quota is skipped only when ``current_tier == tier`` (no new slot).
-    A step down into another metered tier counts too: a plan caps each tier on
-    its own, so an uncounted step down would let a user free their top-tier
-    slot, fill it again, and hold two elevated computers. Standard stays the
-    step down that is always open. No-op in OSS mode.
+    The count quota is skipped when ``current_tier == tier`` (no new slot). A
+    move from one elevated tier to another keeps the slot the computer already
+    holds, which the platform counts as used, so that one is handed back
+    before the count decides: Large to Medium is open on a plan whose one
+    slot the Large fills, while a limit of 0 still refuses. A move up from
+    standard takes a new slot. No-op in OSS mode.
     """
     entitlement = _SPEC_ENTITLEMENTS.get(tier)
     if entitlement is None:
         return  # standard / unknown tiers are ungated
     scope, check_quota = entitlement
-    await _assert_hybrid_gate(user_id, scope, check_quota, count=tier != current_tier)
+    await _assert_hybrid_gate(
+        user_id,
+        scope,
+        check_quota,
+        count=tier != current_tier,
+        returning_slot=current_tier in _SPEC_ENTITLEMENTS,
+    )
 
 
 async def assert_always_on_allowed(user_id: str) -> None:
@@ -930,7 +967,7 @@ async def spec_grantable(
     gate) for service-layer callers that must not import/catch ``HTTPException``.
 
     Returns True when the user may hold a workspace at ``tier`` and False when the
-    gate would reject (missing scope or exhausted per-tier count). ``standard``/
+    gate would reject (missing scope or exhausted count). ``standard``/
     unknown tiers and OSS mode fail open to True. Confines HTTP semantics to this
     dependency layer.
     """

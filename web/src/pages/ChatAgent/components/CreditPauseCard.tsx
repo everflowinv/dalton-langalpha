@@ -1,10 +1,10 @@
 import React from 'react';
-import { motion } from '@/lib/framer';
 import { useTranslation } from 'react-i18next';
 import { Check, PauseCircle, Play } from 'lucide-react';
 import { Loader } from '@/components/ui/loader';
 import { ErrorLink } from '@/components/ui/error-banner';
 import type { CreditPauseState } from '@/types/chat';
+import { ResolveSwap } from './decisionCardMotion';
 
 interface CreditPauseCardProps {
   pauseData: CreditPauseState;
@@ -37,24 +37,18 @@ function CreditPauseCard({ pauseData, onResume }: CreditPauseCardProps) {
   const isResuming = pauseData.status === 'resuming';
 
   // --- Resolved (resumed) ---
-  if (pauseData.status === 'resumed') {
-    return (
-      <div className="flex items-center gap-2 py-1">
-        <Check className="h-4 w-4 shrink-0" style={{ color: 'var(--color-accent-light)' }} />
-        <span className="text-sm" style={{ color: 'var(--color-text-tertiary)' }}>
-          {t('chat.creditPause.resumedLabel')}
-        </span>
-      </div>
-    );
-  }
+  const settled = (
+    <div className="flex items-center gap-2 py-1">
+      <Check className="h-4 w-4 shrink-0" style={{ color: 'var(--color-accent-light)' }} />
+      <span className="text-sm" style={{ color: 'var(--color-text-tertiary)' }}>
+        {t('chat.creditPause.resumedLabel')}
+      </span>
+    </div>
+  );
 
   // --- Pending: interactive ---
   return (
-    <motion.div
-      initial={{ opacity: 0, y: 8 }}
-      animate={{ opacity: 1, y: 0 }}
-      transition={{ duration: 0.4, ease: [0.22, 1, 0.36, 1] }}
-    >
+    <ResolveSwap resolved={pauseData.status === 'resumed'} settled={settled}>
       {/* Header */}
       <div className="flex items-center gap-2 pb-3">
         <PauseCircle className="h-4 w-4 shrink-0" style={{ color: 'var(--color-accent-light)' }} />
@@ -88,22 +82,20 @@ function CreditPauseCard({ pauseData, onResume }: CreditPauseCardProps) {
       {/* Actions */}
       {onResume && (
         <div className="pt-3 flex items-center gap-2">
-          <motion.button
+          <button
             onClick={(e: React.MouseEvent) => { e.stopPropagation(); if (!isResuming) onResume(); }}
             disabled={isResuming}
-            className="flex items-center gap-1.5 text-sm px-4 py-2 rounded-md font-medium transition-colors hover:brightness-110 disabled:cursor-default disabled:opacity-60 disabled:hover:brightness-100"
+            className="press flex items-center gap-1.5 text-sm px-4 py-2 rounded-md font-medium hover:brightness-110 disabled:cursor-default disabled:opacity-60 disabled:hover:brightness-100"
             style={{ backgroundColor: 'var(--color-btn-primary-bg)', color: 'var(--color-btn-primary-text)' }}
-            whileHover={isResuming ? undefined : { scale: 1.02 }}
-            whileTap={isResuming ? undefined : { scale: 0.98 }}
           >
             {isResuming
               ? <Loader size={14} className="shrink-0" style={{ color: 'inherit' }} />
               : <Play className="h-3.5 w-3.5 stroke-[2.5]" />}
             {isResuming ? t('chat.creditPause.resuming') : t('chat.creditPause.resume')}
-          </motion.button>
+          </button>
         </div>
       )}
-    </motion.div>
+    </ResolveSwap>
   );
 }
 

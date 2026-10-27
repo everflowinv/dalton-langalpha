@@ -51,7 +51,7 @@ export function ChipGroup<V extends string>({ values, onChange, options, labelle
             key={option.value}
             data-state={checked ? 'checked' : 'unchecked'}
             className={cn(
-              'rings-within relative inline-flex h-9 cursor-pointer items-center rounded-full border px-[19px] text-sm transition-[color,background-color,border-color,scale] duration-150 motion-safe:active:scale-[0.96]',
+              'rings-within relative inline-flex h-9 cursor-pointer items-center rounded-full border px-[19px] text-sm press',
               checked
                 ? 'border-(--color-text-primary) bg-(--color-bg-tag) text-(--color-text-primary)'
                 : 'border-(--color-border-muted) bg-(--color-bg-card) text-(--color-text-secondary) hover:border-(--color-border-default) hover:text-(--color-text-primary)',
@@ -75,7 +75,7 @@ export function ChipGroup<V extends string>({ values, onChange, options, labelle
             <Check
               aria-hidden="true"
               className={cn(
-                'absolute left-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 transition-[opacity,scale] duration-200 ease-[cubic-bezier(0.16,1,0.3,1)]',
+                'absolute left-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 transition-[opacity,scale]',
                 checked ? 'scale-100 opacity-100' : 'opacity-0 motion-safe:scale-50',
               )}
               strokeWidth={2.5}
@@ -83,7 +83,7 @@ export function ChipGroup<V extends string>({ values, onChange, options, labelle
             />
             <span
               className={cn(
-                'whitespace-nowrap transition-[translate] duration-200 ease-[cubic-bezier(0.16,1,0.3,1)] motion-reduce:transition-none',
+                'whitespace-nowrap transition-[translate] motion-reduce:transition-none',
                 checked ? 'translate-x-[7px]' : 'translate-x-0',
               )}
             >

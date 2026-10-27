@@ -10,7 +10,7 @@ import type { Computer } from '@/types/api';
 import { deleteWorkspace, duplicateWorkspace } from '../utils/api';
 import { entitlementErrorMessage } from '../utils/entitlementErrors';
 import { workspaceNameErrorMessage } from '../utils/workspaceName';
-import { invalidateNewWorkspace, invalidateWorkspaceMembership } from '../hooks/workspaceRowActions';
+import { invalidateNewWorkspace, invalidateWorkspaceMembership, removeCachedWorkspace } from '../hooks/workspaceRowActions';
 import { forgetStableNavOrder } from '../hooks/useNavigationData';
 import { forgetSharedWorkspaceThreads } from '@/lib/navThreadsStore';
 import { removeStoredThreadId } from '../hooks/utils/threadStorage';
@@ -137,22 +137,19 @@ export type WorkspaceMutationOp = 'duplicate';
 
 export interface UseWorkspaceActionsOptions {
   currentWorkspaceId?: string | null;
-  /** After a successful CRUD flow. The gallery re-snaps to page 0 on 'duplicate' (the copy lands at the top). */
+  /** After a successful CRUD flow. The gallery scrolls to its top on 'duplicate' (the copy lands there). */
   onAfterMutate?: (op: WorkspaceMutationOp) => void;
-  /** After a successful delete, with the removed id — a paginated host may need to step back a page. */
-  onAfterDelete?: (wsId: string) => void;
 }
 
 /**
  * Self-contained duplicate / move / delete actions with their dialogs. The canonical implementation for every host (gallery card,
  * sidebar tree, mobile drawer): same mutations, entitlement mapping, toasts,
  * and delete cleanup; deleting the currently-open workspace navigates back to
- * the gallery. Host-specific presentation lands in the two callbacks.
+ * the gallery. Host-specific presentation lands in the callback.
  */
 export function useWorkspaceActions({
   currentWorkspaceId,
   onAfterMutate,
-  onAfterDelete,
 }: UseWorkspaceActionsOptions): WorkspaceActions {
   const { t } = useTranslation();
   const navigate = useNavigate();
@@ -216,12 +213,13 @@ export function useWorkspaceActions({
       forgetSharedWorkspaceThreads(wsId);
       scrollMemory.forget(`threads:${wsId}:active`);
       scrollMemory.forget(`threads:${wsId}:archived`);
+      // Gone from every list now; the refetch then confirms it.
+      removeCachedWorkspace(queryClient, wsId);
       invalidateWorkspaceMembership(queryClient);
       // The breakdown drops a deleted project's folder; only an open one refetches.
       if (typeof deleteTarget.computer_id === 'string') {
         void queryClient.invalidateQueries({ queryKey: queryKeys.computers.storage(deleteTarget.computer_id) });
       }
-      onAfterDelete?.(wsId);
       if (currentWorkspaceId === wsId) {
         navigate('/chat');
       }

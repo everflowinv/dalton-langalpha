@@ -2,7 +2,6 @@ import React, { useState, useRef, useCallback } from 'react';
 import { useTranslation } from 'react-i18next';
 import { MessageSquarePlus, Send, X } from 'lucide-react';
 import { Loader } from '@/components/ui/loader';
-import { cn } from '../../../lib/utils';
 import iconRobo from '../../../assets/img/icon-robo.png';
 import iconRoboSing from '../../../assets/img/icon-robo-sing.png';
 import Markdown from './Markdown';
@@ -151,10 +150,7 @@ function SubagentStatusBar({ agent, onSendInstruction }: SubagentStatusBarProps)
       >
         {/* Agent avatar */}
         <div
-          className={cn(
-            "w-10 h-10 rounded-lg flex items-center justify-center shrink-0",
-            isActive && !isCompleted && "nav-panel-agent-pulse"
-          )}
+          className="w-10 h-10 rounded-lg flex items-center justify-center shrink-0"
           style={{
             backgroundColor: isActive && !isCompleted
               ? 'var(--color-accent-soft)'

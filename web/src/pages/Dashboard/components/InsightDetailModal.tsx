@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { X, ExternalLink, Sparkles, ChevronDown, Paperclip } from 'lucide-react';
 import { motion, AnimatePresence } from '@/lib/framer';
+import { TWEEN } from '@/lib/motion';
 import { useTranslation } from 'react-i18next';
 import TopicBadge from './TopicBadge';
 import { getInsightDetail } from '../utils/api';
@@ -404,7 +405,8 @@ function InsightDetailModal({ marketInsightId, onClose }: InsightDetailModalProp
           <motion.div
             initial={{ opacity: 0, scale: 0.95, y: 20 }}
             animate={{ opacity: 1, scale: 1, y: 0 }}
-            exit={{ opacity: 0, scale: 0.95, y: 20 }}
+            exit={{ opacity: 0, scale: 0.95, y: 20, transition: TWEEN.exit }}
+            transition={TWEEN.enter}
             className="w-full max-w-4xl max-h-[90vh] rounded-3xl overflow-hidden shadow-2xl flex flex-col relative border"
             style={{
               backgroundColor: 'var(--color-bg-elevated)',

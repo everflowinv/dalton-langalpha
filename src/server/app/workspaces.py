@@ -710,7 +710,7 @@ async def set_workspace_spec(
     Change a workspace's sandbox spec tier (standard, performance, max, xlarge).
 
     Gated by the platform entitlement layer (403 if the tier is not on the
-    user's plan, 429 if the per-tier count quota is exhausted); both are
+    user's plan, 429 if the plan's slot for a larger spec is taken); both are
     no-ops in OSS mode. Re-applying the workspace's current tier skips the
     count check. Sizing lives in per-tier snapshots, so a tier change recreates
     the sandbox (files persisted to the DB and restored) rather than resizing.

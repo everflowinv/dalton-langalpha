@@ -1,5 +1,6 @@
 import React, { useMemo } from 'react';
 import { motion } from '@/lib/framer';
+import { TWEEN } from '@/lib/motion';
 import { Popover, PopoverTrigger, PopoverContent } from './popover';
 
 const SIZE = 16;
@@ -78,7 +79,7 @@ export function TokenUsageRing({ tokenUsage }: TokenUsageRingProps) {
               strokeDasharray={CIRCUMFERENCE}
               initial={false}
               animate={{ strokeDashoffset: dashOffset }}
-              transition={{ duration: 0.6, ease: 'easeOut' }}
+              transition={TWEEN.fold}
               style={{ transform: 'rotate(-90deg)', transformOrigin: '50% 50%' }}
             />
           </svg>

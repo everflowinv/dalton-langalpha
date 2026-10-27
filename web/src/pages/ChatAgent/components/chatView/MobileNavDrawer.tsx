@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router';
 import { useTranslation } from 'react-i18next';
 import { Minus } from 'lucide-react';
 import { motion, AnimatePresence, type PanInfo } from '@/lib/framer';
+import { TWEEN } from '@/lib/motion';
 import NavigationPanel from '../NavigationPanel';
 import NavDisplayOptions from '../NavDisplayOptions';
 import { useNavTreeProps, type NavTreeAgents } from '../../hooks/useNavTreeProps';
@@ -119,8 +120,8 @@ export function MobileNavDrawer({ visible, slideIn, onMinimize, isActive, worksp
             <motion.div
               initial={slideIn ? { x: '-100%', opacity: 0 } : false}
               animate={{ x: 0, opacity: 1 }}
-              exit={{ x: '-100%', opacity: 0 }}
-              transition={{ duration: 0.2, ease: [0.22, 1, 0.36, 1] }}
+              exit={{ x: '-100%', opacity: 0, transition: TWEEN.exit }}
+              transition={TWEEN.enter}
               drag="x"
               dragConstraints={{ left: -320, right: 0 }}
               dragElastic={{ left: 0.3, right: 0 }}

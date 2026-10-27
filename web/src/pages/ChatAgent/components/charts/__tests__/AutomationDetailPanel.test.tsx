@@ -19,15 +19,15 @@ function renderList(...automations: Record<string, unknown>[]) {
 }
 
 describe('where an automation card says it ran', () => {
-  it('reads a card that ran outside a workspace as All workspaces and a ptc card as a workspace', () => {
+  it('reads a card that ran outside a workspace as Chief of Staff and a ptc card as a workspace', () => {
     renderList(card({ agent_mode: 'home' }), card({ agent_mode: 'ptc' }));
-    expect(screen.getByText('All workspaces')).toBeInTheDocument();
+    expect(screen.getByText('Chief of Staff')).toBeInTheDocument();
     expect(screen.getByText('Workspace')).toBeInTheDocument();
   });
 
   it('says nothing for a card that names no agent', () => {
     renderList(card({}));
-    expect(screen.queryByText('All workspaces')).not.toBeInTheDocument();
+    expect(screen.queryByText('Chief of Staff')).not.toBeInTheDocument();
     expect(screen.queryByText('Workspace')).not.toBeInTheDocument();
   });
 
@@ -37,6 +37,6 @@ describe('where an automation card says it ran', () => {
         data={{ type: 'automations', mode: 'detail', automation: card({ agent_mode: 'home' }), executions: [] }}
       />,
     );
-    expect(screen.getByText('Agent').nextElementSibling).toHaveTextContent('All workspaces');
+    expect(screen.getByText('Agent').nextElementSibling).toHaveTextContent('Chief of Staff');
   });
 });

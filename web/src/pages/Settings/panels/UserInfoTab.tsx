@@ -18,10 +18,13 @@ import { getShareLinkOpen, setShareLinkOpen, type ShareLinkOpen } from '@/lib/sh
 import { turnEndScrollPatch, readTurnEndScroll, type TurnEndScroll } from '@/lib/turnEndScroll';
 import {
   readStreamingMode,
+  readToolCallLayout,
   readTurnDisplay,
   streamingModePatch,
+  toolCallLayoutPatch,
   turnDisplayPatch,
   type StreamingMode,
+  type ToolCallLayout,
   type TurnDisplay,
 } from '@/lib/transcriptDisplay';
 import { useTranslation } from 'react-i18next';
@@ -53,6 +56,7 @@ export function UserInfoTab() {
   const shareLinkOpenLabelId = useId();
   const turnDisplayLabelId = useId();
   const streamingModeLabelId = useId();
+  const toolCallLayoutLabelId = useId();
   const { t, i18n } = useTranslation();
   const activeLocale = useLocale();
 
@@ -197,6 +201,20 @@ export function UserInfoTab() {
     if (next === streamingMode) return;
     try {
       await updatePrefsMutation.mutateAsync(streamingModePatch(next));
+    } catch {
+      toast({
+        variant: 'destructive',
+        title: t('common.error'),
+        description: t('settings.failedToSaveSettings'),
+      });
+    }
+  };
+
+  const toolCallLayout = readToolCallLayout(prefsData);
+  const handleToolCallLayoutChange = async (next: ToolCallLayout) => {
+    if (next === toolCallLayout) return;
+    try {
+      await updatePrefsMutation.mutateAsync(toolCallLayoutPatch(next));
     } catch {
       toast({
         variant: 'destructive',
@@ -423,6 +441,25 @@ export function UserInfoTab() {
             options={[
               { value: 'token', label: t('settings.streamingModeToken') },
               { value: 'paragraph', label: t('settings.streamingModeParagraph') },
+            ]}
+          />
+        </div>
+      </div>
+
+      {/* How a running turn shows its tool calls */}
+      <div className="settings-row flex-wrap">
+        <div className="flex-1 basis-64">
+          <label id={toolCallLayoutLabelId} className="text-[0.8125rem] font-medium" style={{ color: 'var(--color-text-primary)' }}>{t('settings.toolCallLayout')}</label>
+          <p className="mt-0.5 text-xs" style={{ color: 'var(--color-text-tertiary)' }}>{t('settings.toolCallLayoutDesc')}</p>
+        </div>
+        <div className="flex shrink-0">
+          <SegmentedControl
+            labelledBy={toolCallLayoutLabelId}
+            value={toolCallLayout}
+            onChange={(v) => { void handleToolCallLayoutChange(v); }}
+            options={[
+              { value: 'rows', label: t('settings.toolCallLayoutRows') },
+              { value: 'status', label: t('settings.toolCallLayoutStatus') },
             ]}
           />
         </div>

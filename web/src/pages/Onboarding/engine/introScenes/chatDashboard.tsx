@@ -194,7 +194,7 @@ const FILTER_MS = 360;
 function Chip({ co, active, children }: { co?: Company; active: boolean; children: ReactNode }) {
   return (
     <span
-      className="flex h-[11px] items-center gap-[2.5px] rounded-[3px] border px-[4px] text-[5.5px] font-medium leading-none transition-colors duration-150"
+      className="flex h-[11px] items-center gap-[2.5px] rounded-[3px] border px-[4px] text-[5.5px] font-medium leading-none transition-colors duration-quick"
       style={
         active
           ? {
@@ -310,7 +310,7 @@ function CapexChart({ at, f }: { at: number; f: number }) {
                   bottom: `calc(${onAxis(label)} + 1.5px)`,
                   color: 'var(--color-text-secondary)',
                   opacity: p > 0.85 ? 1 : 0,
-                  transition: 'opacity 160ms',
+                  transition: 'opacity var(--motion-quick) var(--ease-out)',
                 }}
               >
                 {label.toFixed(1)}

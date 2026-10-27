@@ -5,7 +5,7 @@ import { X } from 'lucide-react';
 import { useBackdropDismiss, useDialogA11y } from '@/hooks/useDialogA11y';
 import { useIsMobile } from '@/hooks/useIsMobile';
 import { useSwipeToDismiss } from '@/hooks/useSwipeToDismiss';
-import { DURATION, EASE_OUT } from '@/lib/motion';
+import { DURATION, TWEEN } from '@/lib/motion';
 import { cn } from '@/lib/utils';
 
 /**
@@ -154,7 +154,7 @@ export function ModalShell({
         return;
       }
       if (height.get() === next) return;
-      animate(height, next, reducedMotion ? { duration: 0 } : { duration: DURATION.fold, ease: EASE_OUT });
+      animate(height, next, reducedMotion ? { duration: 0 } : TWEEN.fold);
     });
     ro.observe(el);
     return () => ro.disconnect();
@@ -220,7 +220,7 @@ export function ModalShell({
         {...panelMotion}
         animate={covered ? coveredMotion : panelMotion.animate}
         exit={{ ...panelMotion.exit, transition: { duration: DURATION.exit } }}
-        transition={{ duration: DURATION.enter, ease: EASE_OUT }}
+        transition={TWEEN.enter}
       >
         <div
           ref={measuredRef}

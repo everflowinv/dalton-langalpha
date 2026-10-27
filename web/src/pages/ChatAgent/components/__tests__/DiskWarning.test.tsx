@@ -9,6 +9,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { Mock } from 'vitest';
 import { act, screen, waitFor } from '@testing-library/react';
+import type { QueryClient } from '@tanstack/react-query';
 
 import { renderWithProviders } from '@/test/utils';
 import type { Computer, ComputerTierSpec, WorkspaceQuota } from '@/types/api';
@@ -43,7 +44,16 @@ const FREE: WorkspaceQuota = {
   xlarge: { used: 0, limit: 0 },
   always_on: null,
 };
-const MAX_PLAN: WorkspaceQuota = { ...FREE, xlarge: { used: 0, limit: 1 } };
+// A plan has one slot for a computer bigger than Small, open at every size up
+// to its largest, and each size counts every computer held in it.
+const PRO: WorkspaceQuota = { ...FREE, performance: { used: 0, limit: 1 }, max: { used: 0, limit: 1 } };
+const MAX_PLAN: WorkspaceQuota = { ...PRO, xlarge: { used: 0, limit: 1 } };
+const MAX_HOLDING_ONE: WorkspaceQuota = {
+  ...FREE,
+  performance: { used: 1, limit: 1 },
+  max: { used: 1, limit: 1 },
+  xlarge: { used: 1, limit: 1 },
+};
 
 function machine(overrides: Partial<Computer> = {}): Computer {
   return {
@@ -83,12 +93,14 @@ beforeEach(() => {
   });
 });
 
-// Both fetches: until the sizes land, the next size up is assumed to have
-// more disk, so a banner judged on the quota alone can offer a change.
-async function settled() {
+// Both fetches landed, not just asked: until the sizes land, the next size up
+// is assumed to have more disk, so a banner judged on the quota alone can offer
+// a change. A fetch that was called can still be resolving under a loaded run.
+async function settled(queryClient: QueryClient) {
   await waitFor(() => {
     expect(mockQuota).toHaveBeenCalled();
     expect(mockProviders).toHaveBeenCalled();
+    expect(queryClient.isFetching()).toBe(0);
   });
   await act(async () => {});
 }
@@ -103,28 +115,29 @@ describe('DiskWarning, the call to action', () => {
   });
 
   it('offers nothing to a Medium on Daytona, where no size has more disk', async () => {
-    mockQuota.mockResolvedValue({ ...FREE, max: { used: 0, limit: 1 } });
-    renderWithProviders(<DiskWarning computer={machine({ resource_tier: 'performance' })} />);
-    await settled();
+    mockQuota.mockResolvedValue(PRO);
+    const { queryClient } = renderWithProviders(<DiskWarning computer={machine({ resource_tier: 'performance' })} />);
+    await settled(queryClient);
 
     expect(screen.getByTestId('disk-warning')).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Change spec' })).not.toBeInTheDocument();
     expect(screen.queryByTestId('disk-plan-cta')).not.toBeInTheDocument();
   });
 
-  it('offers the change to a Medium on E2B, where Extra Large has more disk', async () => {
-    mockQuota.mockResolvedValue(MAX_PLAN);
-    renderWithProviders(<DiskWarning computer={machine({ kind: 'e2b', resource_tier: 'performance' })} />);
+  it('offers the change to a Medium on E2B, where Extra Large has more disk, in the slot it holds', async () => {
+    mockQuota.mockResolvedValue(MAX_HOLDING_ONE);
+    const { queryClient } = renderWithProviders(<DiskWarning computer={machine({ kind: 'e2b', resource_tier: 'performance' })} />);
+    await settled(queryClient);
 
-    expect(await screen.findByRole('button', { name: 'Change spec' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Change spec' })).toBeInTheDocument();
   });
 
-  it('does not tell a Max plan on Daytona to upgrade', async () => {
+  it('offers a Small on a Max plan the change rather than an upgrade', async () => {
     mockQuota.mockResolvedValue(MAX_PLAN);
-    renderWithProviders(<DiskWarning computer={machine()} />);
-    await settled();
+    const { queryClient } = renderWithProviders(<DiskWarning computer={machine()} />);
+    await settled(queryClient);
 
-    expect(screen.queryByRole('button', { name: 'Change spec' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Change spec' })).toBeInTheDocument();
     expect(screen.queryByTestId('disk-plan-cta')).not.toBeInTheDocument();
   });
 });

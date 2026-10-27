@@ -129,7 +129,7 @@ function ThreadCard({ thread, onClick, onDelete, onRename, onArchive, onUnarchiv
           {onArchive && (
             <button
               onClick={(e) => { e.stopPropagation(); onArchive(thread); }}
-              className="p-1.5 rounded-md transition hover:bg-foreground/10 active:scale-90"
+              className="p-1.5 rounded-md press hover:bg-foreground/10"
               style={{ color: 'var(--color-text-tertiary)' }}
               title={t('thread.archive')}
             >
@@ -139,7 +139,7 @@ function ThreadCard({ thread, onClick, onDelete, onRename, onArchive, onUnarchiv
           {onUnarchive && (
             <button
               onClick={(e) => { e.stopPropagation(); onUnarchive(thread); }}
-              className="p-1.5 rounded-md transition hover:bg-foreground/10 active:scale-90"
+              className="p-1.5 rounded-md press hover:bg-foreground/10"
               style={{ color: 'var(--color-text-tertiary)' }}
               title={t('thread.unarchive')}
             >

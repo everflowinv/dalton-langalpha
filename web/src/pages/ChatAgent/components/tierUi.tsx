@@ -30,9 +30,14 @@ export const TIER_ORDER: ResourceTier[] = ['standard', 'performance', 'max', 'xl
  */
 const BASE_TIERS: readonly ResourceTier[] = ['standard', 'performance', 'max'];
 
+/** The tier a value names, or null for a missing or unknown one. */
+export function knownTier(tier: unknown): ResourceTier | null {
+  return TIER_ORDER.find((id) => id === tier) ?? null;
+}
+
 /** Coerce an unknown/legacy tier value to a known tier (defaults to standard). */
 export function normalizeTier(tier: unknown): ResourceTier {
-  return TIER_ORDER.find((id) => id === tier) ?? 'standard';
+  return knownTier(tier) ?? 'standard';
 }
 
 /** Localized display name for a tier. */
@@ -75,6 +80,29 @@ export function tierCapacity(
 }
 
 /**
+ * The quota as a spec change on a computer at `current` reads it. A plan has
+ * one slot for a computer bigger than Small, open at any size up to its
+ * largest, and every larger size counts the computers held in it. A computer
+ * already there gives its slot up as it moves, so each limited size reads one
+ * fewer used, as the server's gate counts it. A size the plan leaves out
+ * stays out.
+ */
+export function quotaForSpecChange(
+  quota: WorkspaceQuota | null | undefined,
+  current: ResourceTier,
+): WorkspaceQuota | null | undefined {
+  if (!quota || current === 'standard') return quota;
+  const returned = (capacity: WorkspaceCapacity | null) =>
+    capacity && capacity.limit > 0 ? { ...capacity, used: Math.max(0, capacity.used - 1) } : capacity;
+  return {
+    ...quota,
+    performance: returned(quota.performance),
+    max: returned(quota.max),
+    xlarge: quota.xlarge && returned(quota.xlarge),
+  };
+}
+
+/**
  * Why a tier cannot be picked: the plan excludes it, or its quota is spent.
  * Null when it can. A negative limit is unlimited.
  */
@@ -89,14 +117,32 @@ export function isTierBlocked(capacity: WorkspaceCapacity | null | undefined): b
 }
 
 /**
- * Whether only a bigger plan opens `tier`: the plan leaves it out and holds
- * nothing of its size or above. Each plan holds one computer at its top size,
- * and a size it leaves out below that top no upgrade opens either, so a Max
- * plan is never told to upgrade for a Medium.
+ * Whether only a bigger plan opens `tier`: the plan leaves it out and every
+ * size above it too. A plan opens every size up to its largest, so a size it
+ * leaves out sits above that, and a Max plan is never told to upgrade.
  */
 export function needsBiggerPlan(quota: WorkspaceQuota | null | undefined, tier: ResourceTier): boolean {
   if (tierBlockReason(tierCapacity(quota, tier)) !== 'not_on_plan') return false;
   return TIER_ORDER.slice(TIER_ORDER.indexOf(tier)).every((id) => (tierCapacity(quota, id)?.limit ?? 0) === 0);
+}
+
+/**
+ * The plan's one slot for computers bigger than Small, which every larger
+ * size counts against: what each of them reports, as one count. Null where
+ * there is nothing to say of it: an unknown quota, an unlimited plan, or a
+ * plan with no larger size at all.
+ */
+export function largerSlot(quota: WorkspaceQuota | null | undefined): WorkspaceCapacity | null {
+  const capacities = TIER_ORDER.slice(1)
+    .map((id) => tierCapacity(quota, id))
+    .filter((c): c is WorkspaceCapacity => !!c);
+  if (capacities.some((c) => c.limit < 0)) return null;
+  const limited = capacities.filter((c) => c.limit > 0);
+  if (!limited.length) return null;
+  return {
+    used: Math.max(...limited.map((c) => c.used)),
+    limit: Math.max(...limited.map((c) => c.limit)),
+  };
 }
 
 interface TierRadioGroupProps {
@@ -104,9 +150,9 @@ interface TierRadioGroupProps {
   offer: TierOffer;
   value: ResourceTier;
   onChange: (tier: ResourceTier) => void;
-  /** Shown above the cards, and the group's accessible name. */
+  /** Shown above the rows, and the group's accessible name. */
   label: string;
-  /** Per-tier count quotas (platform mode only); null/undefined hides the capacity hint. */
+  /** Per-tier count quotas (platform mode only); null/undefined hides every quota note. */
   quota?: WorkspaceQuota | null;
   /**
    * The tier the computer is on now. It reads "Current" in place of a quota
@@ -117,10 +163,10 @@ interface TierRadioGroupProps {
 }
 
 /**
- * The tier picker, three across where the space allows and two by two for
- * four, which three across would leave one short. In platform mode
- * each elevated tier shows its remaining count quota and goes unselectable
- * when the plan excludes it or its quota is spent.
+ * The tier picker, one row per size. In platform mode a size the plan
+ * excludes or whose slot is spent goes unselectable and says why, and one
+ * line under the rows says what is left of the slot every larger size shares,
+ * which a note on each would count three times.
  */
 export function TierRadioGroup({
   offer,
@@ -139,26 +185,52 @@ export function TierRadioGroup({
       facts: tierFacts(t, offer.specs.find((s) => s.tier === id)),
       // The current tier takes no new slot, so what is left of the quota
       // says nothing about it.
-      note: id === currentTier
-        ? t('computer.spec.current', 'Current')
-        : isPlatformMode && capacity ? capacityNote(t, capacity) : null,
+      note: id === currentTier ? t('computer.spec.current', 'Current') : blockNote(t, capacity),
       disabled: id !== currentTier && isTierBlocked(capacity),
     };
   });
+  // A computer already bigger than Small holds the slot itself, and the rows
+  // say what it can move to.
+  const slot = isPlatformMode && (currentTier ?? 'standard') === 'standard' ? largerSlot(quota) : null;
   return (
-    <RadioCardGroup
-      options={options}
-      value={value}
-      onChange={onChange}
-      label={label}
-      columns={options.length === 4 ? 2 : 3}
-    />
+    <div className="flex flex-col gap-1.5">
+      <RadioCardGroup options={options} value={value} onChange={onChange} label={label} layout="rows" />
+      {slot && (
+        <p className="text-xs" data-testid="tier-slot" style={{ color: 'var(--color-text-tertiary)' }}>
+          {slotLine(t, slot)}
+        </p>
+      )}
+    </div>
   );
+}
+
+function blockNote(t: Translate, capacity: WorkspaceCapacity | null): string | null {
+  const reason = tierBlockReason(capacity);
+  if (reason === 'not_on_plan') return t('workspace.quotaNotOnPlan', 'Not on your plan');
+  if (reason === 'used_up') return t('workspace.quotaNoneLeft', 'None left');
+  return null;
+}
+
+function slotLine(t: Translate, slot: WorkspaceCapacity): string {
+  const count = slot.limit;
+  const remaining = Math.max(0, slot.limit - slot.used);
+  const small = tierLabel(t, 'standard');
+  if (remaining === 0) {
+    return t('computer.largerSlot.inUse', "Your plan's computer larger than {{small}} is in use.", { count, small });
+  }
+  if (slot.used > 0) {
+    return t('computer.largerSlot.partly', 'Your plan includes {{count}} computers larger than {{small}}, {{remaining}} left.', {
+      count,
+      remaining,
+      small,
+    });
+  }
+  return t('computer.largerSlot.open', 'Your plan includes {{count}} computer larger than {{small}}.', { count, small });
 }
 
 /**
  * vCPU, RAM and disk, from the provider's config rather than the catalogs,
- * so the card says what the machine will be. None while that is unknown:
+ * so the row says what the machine will be. None while that is unknown:
  * a name with no numbers beats numbers that may be wrong.
  */
 function tierFacts(t: Translate, spec: ComputerTierSpec | undefined): string[] | undefined {
@@ -168,13 +240,4 @@ function tierFacts(t: Translate, spec: ComputerTierSpec | undefined): string[] |
     t('workspace.tierFact.memory', '{{count}} GB RAM', { count: spec.memory_gib }),
     t('workspace.tierFact.disk', '{{count}} GB disk', { count: spec.disk_gib }),
   ];
-}
-
-function capacityNote(t: Translate, capacity: WorkspaceCapacity): string {
-  if (capacity.limit < 0) return t('workspace.quotaUnlimited', 'Unlimited');
-  if (capacity.limit === 0) return t('workspace.quotaNotOnPlan', 'Not on your plan');
-  return t('workspace.quotaRemaining', '{{remaining}} of {{limit}} left', {
-    remaining: Math.max(0, capacity.limit - capacity.used),
-    limit: capacity.limit,
-  });
 }

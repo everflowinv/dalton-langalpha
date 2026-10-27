@@ -50,7 +50,7 @@
   text-align: left;
   text-decoration: none;
   cursor: pointer;
-  transition: background-color 120ms ease, color 120ms ease;
+  transition: background-color var(--motion-quick) var(--ease-out), color var(--motion-quick) var(--ease-out);
 }
 .plugins-rail-link:hover { background: var(--color-bg-subtle); color: var(--color-text-primary); }
 .plugins-rail-link.is-active { background: var(--color-bg-hover); color: var(--color-text-primary); }
@@ -86,7 +86,7 @@
   flex-shrink: 0;
   color: var(--color-text-quaternary);
 }
-.plugins-rail-chevron svg { transition: transform 120ms ease; }
+.plugins-rail-chevron svg { transition: transform var(--motion-quick) var(--ease-out); }
 
 /* ---------- Content column ---------- */
 .plugins-scroll {
@@ -110,7 +110,7 @@
      animation applied, which makes this a stacking context for good, and the
      dialogs render inside it (ModalShell does not portal), so on a phone the
      fixed tab bar painted over every one of them, buttons included. */
-  animation: plugins-section-in 140ms ease-out backwards;
+  animation: plugins-section-in var(--motion-quick) var(--ease-out) backwards;
 }
 @keyframes plugins-section-in {
   from { opacity: 0; }
@@ -231,7 +231,7 @@
   font-size: 0.78125rem;
   line-height: 20px;
   cursor: pointer;
-  transition: background-color 120ms ease, color 120ms ease;
+  transition: background-color var(--motion-quick) var(--ease-out), color var(--motion-quick) var(--ease-out);
 }
 .plugins-view button:hover { color: var(--color-text-primary); }
 .plugins-view button[aria-pressed='true'] {

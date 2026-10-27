@@ -56,9 +56,9 @@ seen is refused.
 
 | Field | Meaning |
 |-------|---------|
-| `default` | The workspace a chat runs in when it has no entry in its app's `chats`: `workspace_id` null is All workspaces, where the Chief of Staff answers; an id is that workspace, where its Analyst answers. |
+| `default` | The workspace a chat runs in when it has no entry in its app's `chats`: `workspace_id` null is the Chief of Staff, who answers from Home; an id is that workspace, where its Analyst answers. |
 | `<app>` | One key per connected app. Connecting or removing an app happens in the app, not here: keep every key. |
-| `<app>.chats` | Per chat address: `workspace_id`, null for All workspaces. Applies to new threads started in that chat; a thread already running keeps its workspace. A chat with no entry follows `default`. |
+| `<app>.chats` | Per chat address: `workspace_id`, null for the Chief of Staff. Applies to new threads started in that chat; a thread already running keeps its workspace. A chat with no entry follows `default`. |
 | `<app>.preferred` | Where to send on this app when the user names only the app. `null` means the user's direct messages. A preferred chat counts as allowed. |
 | `<app>.automation_output` | Per workspace id: the chat that automation results from that workspace go to on this app. |
 | `<app>.agent_messages` | `enabled`: whether you may message the user on this app at all. `allowed`: the shared chats you may send to, besides the conversation you are in and the user's direct messages. |

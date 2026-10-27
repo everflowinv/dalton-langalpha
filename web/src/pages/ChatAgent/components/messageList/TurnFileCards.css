@@ -4,16 +4,14 @@
  * SourcesPanel.css, itself in step with the chat-input snapshot deck): same
  * easing curve, same durations, so every stack in the transcript expands
  * alike. Per-card top/transform/opacity are set inline (they depend on index +
- * fan state); these rules carry the chrome, the transitions and the entrance. */
+ * fan state); these rules carry the chrome and the transitions. The deck's
+ * entrance and its faces' fade are played from script (TurnFileCards.tsx), so
+ * a deck drawn again, on a thread coming back, does not play them over. */
 .turn-files {
   position: relative;
   width: 100%;
   margin-top: 12px;
-  transition: height 260ms cubic-bezier(0.16, 1, 0.3, 1);
-  /* The entrance rides the container, not the cards: a card's own transform is
-     what the fan animates, and an animation on that property outranks the
-     transition for as long as it is running. */
-  animation: turnFilesIn 300ms cubic-bezier(0.16, 1, 0.3, 1);
+  transition: height var(--motion-fold) var(--ease-out);
 }
 
 .turn-file-card {
@@ -30,10 +28,10 @@
   background: var(--color-bg-card);
   color: var(--color-text-primary);
   transition:
-    transform 260ms cubic-bezier(0.16, 1, 0.3, 1),
-    opacity 260ms cubic-bezier(0.16, 1, 0.3, 1),
-    background 140ms ease,
-    border-color 140ms ease;
+    transform var(--motion-fold) var(--ease-out),
+    opacity var(--motion-fold) var(--ease-out),
+    background var(--motion-quick) var(--ease-out),
+    border-color var(--motion-quick) var(--ease-out);
 }
 /* One card in the flow of a message rather than in a deck: the running app
    an agent published, or a chart it annotated, wears the same card as the
@@ -118,7 +116,7 @@
 .turn-file-sheet {
   background: var(--color-bg-elevated);
   transform: translate(-3px, 3px) rotate(-5deg);
-  transition: transform 220ms cubic-bezier(0.16, 1, 0.3, 1);
+  transition: transform var(--motion-fold) var(--ease-out);
 }
 .turn-file-page {
   display: flex;
@@ -202,7 +200,7 @@
   border-radius: 8px 0 0 8px;
   font-size: 0.75rem;
   color: var(--color-text-tertiary);
-  transition: color 140ms ease, border-color 140ms ease;
+  transition: color var(--motion-quick) var(--ease-out), border-color var(--motion-quick) var(--ease-out);
 }
 /* A door with no caret beside it closes its own right edge: an annotated
    chart's card offers nothing beyond the open the stripe already takes, so
@@ -223,7 +221,10 @@
   color: var(--color-text-tertiary);
   cursor: pointer;
   pointer-events: auto;
-  transition: color 140ms ease, border-color 140ms ease, background 140ms ease;
+  transition:
+    color var(--motion-quick) var(--ease-out),
+    border-color var(--motion-quick) var(--ease-out),
+    background var(--motion-quick) var(--ease-out);
 }
 .turn-file-more:hover,
 .turn-file-more[data-state='open'] {
@@ -260,30 +261,10 @@
   font-weight: 500;
 }
 
-@keyframes turnFilesIn {
-  from {
-    opacity: 0;
-    transform: translateY(-6px);
-  }
-}
-
-/* A card's face arrives with the card, so the content a peek gains on fanning
-   fades in over the slide instead of appearing on the first frame. */
-.turn-file-card > * {
-  animation: turnFileFaceIn 200ms cubic-bezier(0.16, 1, 0.3, 1);
-}
-@keyframes turnFileFaceIn {
-  from {
-    opacity: 0;
-  }
-}
-
 @media (prefers-reduced-motion: reduce) {
   .turn-files,
   .turn-file-card,
-  .turn-file-card > *,
   .turn-file-sheet {
     transition: none;
-    animation: none;
   }
 }

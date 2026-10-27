@@ -272,7 +272,7 @@ export function TrayDock({ ref, phase, contents, onOpen }: TrayDockProps) {
       <span
         className={cn(
           'inline-flex items-center gap-1.5',
-          folded ? 'opacity-100 transition-opacity duration-150 motion-reduce:transition-none' : 'opacity-0',
+          folded ? 'opacity-100 transition-opacity duration-quick motion-reduce:transition-none' : 'opacity-0',
         )}
       >
         {contents.watch && <PulseDot />}

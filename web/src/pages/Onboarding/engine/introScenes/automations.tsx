@@ -528,7 +528,7 @@ function EditForm() {
         <Grow p={ease(now, DLV.clickMore, 350)}>
           <FormRow label={t('thread.workspace')}>
             <Field chevron className="w-[120px]">
-              {t('agents.allWorkspaces')}
+              {t('agents.chiefOfStaff')}
             </Field>
           </FormRow>
           <FormRow label={t('automation.threadStrategy')}>

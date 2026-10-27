@@ -111,7 +111,8 @@ export function SceneClock({ length, children }: { length: number; children: Rea
   const fading = !still && t > period - FADE_MS;
 
   return (
-    <div style={{ opacity: fading ? 0 : 1, transition: `opacity ${FADE_MS}ms ease` }}>
+    // eslint-disable-next-line no-restricted-syntax -- the loop's fade, timed with the script's restart (FADE_MS)
+    <div style={{ opacity: fading ? 0 : 1, transition: `opacity ${FADE_MS}ms var(--ease-out)` }}>
       <SceneTime.Provider value={t}>
         <Fragment key={cycle}>{children}</Fragment>
       </SceneTime.Provider>

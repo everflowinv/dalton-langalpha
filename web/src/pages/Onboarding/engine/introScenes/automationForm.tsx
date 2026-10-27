@@ -114,7 +114,7 @@ export function Field({
         background: 'var(--color-bg-input)',
         borderColor: focus ? 'var(--color-accent-primary)' : 'var(--color-border-muted)',
         color: 'var(--color-text-primary)',
-        transition: 'border-color 120ms ease',
+        transition: 'border-color var(--motion-quick) var(--ease-out)',
       }}
     >
       {/* a taller line than the field's, so the clip keeps descenders */}
@@ -195,7 +195,7 @@ export function FormActions({ label, pressed }: { label: string; pressed?: strin
       <span
         className={cn(
           'inline-flex h-[15px] items-center rounded-[4px] px-2 text-[7px] font-medium',
-          'leading-none transition-transform duration-150'
+          'leading-none transition-transform duration-press'
         )}
         style={{
           background: 'var(--color-btn-primary-bg)',
@@ -283,7 +283,7 @@ export function MoreToggle({ open, summary }: { open: boolean; summary: string }
       >
         {t('automation.moreOptions')}
         <ChevronRight
-          className="h-[7px] w-[7px] transition-transform duration-200"
+          className="h-[7px] w-[7px] transition-transform duration-fold"
           style={{ transform: open ? 'rotate(90deg)' : undefined }}
         />
       </span>
@@ -303,7 +303,7 @@ export function MoreToggle({ open, summary }: { open: boolean; summary: string }
 export function useSummary(): string {
   const { t } = useTranslation();
   return [
-    t('agents.allWorkspaces'),
+    t('agents.chiefOfStaff'),
     t('automation.continueExisting'),
     t('automation.noDelivery'),
     t('automation.stopsAfter', { count: 3 }),

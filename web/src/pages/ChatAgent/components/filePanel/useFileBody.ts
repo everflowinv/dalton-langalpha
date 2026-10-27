@@ -1,11 +1,29 @@
 import { useCallback, useMemo } from 'react';
-import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { replaceEqualDeep, useQuery, useQueryClient } from '@tanstack/react-query';
 import { queryKeys } from '@/lib/queryKeys';
+import { isStale } from '@/lib/rangedFile';
 import { bodyMode, readFileBody, type BodyReaders, type FileBody } from './fileBody';
 import { categorizeFileError, type FileError } from './fileErrors';
 
 /** A body is worth re-reading after a minute; a tab switch inside that window is free. */
 const BODY_STALE_MS = 60_000;
+
+/**
+ * A re-read that finds a ranged file at the version already open keeps the
+ * body it had, so the document on screen keeps its loader and the pages it has
+ * read rather than reloading over an unchanged file. One marked stale, found
+ * changed or with a slice its viewer lost, is replaced all the same: its
+ * document waits on a slice it will never give.
+ * The file is kept or replaced whole, never merged into a copy, which would
+ * not be the object its own reads mark stale.
+ */
+function keepSameVersion(prev: unknown, next: unknown): unknown {
+  const was = (prev as FileBody | undefined)?.ranged;
+  const now = (next as FileBody).ranged;
+  if (!was && !now) return replaceEqualDeep(prev, next);
+  const same = was && now && !isStale(was) && was.etag === now.etag && was.length === now.length;
+  return same ? prev : next;
+}
 
 interface BodyCacheArgs {
   /** The workspace id, or the panel's mount id where a share has none. */
@@ -32,6 +50,7 @@ export function useFileBodyCache({ scope, workspaceId, readers }: BodyCacheArgs)
     queryKey: keyFor(path),
     queryFn: () => readFileBody(readers, workspaceId, path),
     staleTime: BODY_STALE_MS,
+    structuralSharing: keepSameVersion,
     // A file that is not there does not become there by asking three more
     // times, and the error is the thing the panel has to show.
     retry: false,

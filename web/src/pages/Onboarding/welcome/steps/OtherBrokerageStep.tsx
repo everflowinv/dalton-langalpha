@@ -188,12 +188,12 @@ function MethodPanel({ value, open, children }: { value: HoldingsMethod; open: b
       inert={!open}
       aria-hidden={open ? undefined : true}
       className={cn(
-        '[grid-area:1/1] transition-[opacity,translate,visibility] ease-[cubic-bezier(0.33,1,0.68,1)] motion-reduce:transition-none',
+        '[grid-area:1/1] transition-[opacity,translate,visibility] ease-reveal motion-reduce:transition-none',
         // The one leaving is nearly gone before the next comes in, so the two
         // are never read over each other.
         open
-          ? 'visible translate-y-0 opacity-100 duration-200 delay-75'
-          : 'invisible opacity-0 duration-100 motion-safe:translate-y-1',
+          ? 'visible translate-y-0 opacity-100 duration-quick delay-(--motion-exit)'
+          : 'invisible opacity-0 duration-exit motion-safe:translate-y-1',
       )}
     >
       {children}

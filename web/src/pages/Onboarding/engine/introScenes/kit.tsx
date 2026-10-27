@@ -168,7 +168,7 @@ export function InputDock({
         </span>
         <Mic className="h-2.5 w-2.5 shrink-0" style={{ color: 'var(--color-icon-muted)' }} />
         <span
-          className="flex h-4 w-4 shrink-0 items-center justify-center rounded-md transition-transform duration-150"
+          className="flex h-4 w-4 shrink-0 items-center justify-center rounded-md transition-transform duration-press"
           style={{
             background: filled ? 'var(--color-btn-primary-bg)' : 'var(--color-bg-elevated)',
             transform: down ? 'scale(0.85)' : undefined,
@@ -393,7 +393,7 @@ export function Cursor({
   return (
     <div className="pointer-events-none absolute z-10" style={{ left: x, top: y }}>
       <span
-        className="block transition-transform duration-100"
+        className="block transition-transform duration-press"
         style={{ transform: down ? 'scale(0.82)' : undefined, transformOrigin: 'top left' }}
       >
         <MousePointer2

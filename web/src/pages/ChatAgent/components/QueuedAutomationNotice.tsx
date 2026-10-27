@@ -2,25 +2,21 @@ import React from 'react';
 import { useTranslation } from 'react-i18next';
 import { Clock } from 'lucide-react';
 import { useAutomationMutations } from '@/pages/Automations/hooks/useAutomationMutations';
-import { useWaitingAutomations } from '@/pages/Automations/hooks/useWaitingAutomations';
+import type { AutomationRun } from '@/types/automation';
 import { StatusLine } from './chatView/StatusLine';
 
 /**
- * Automations that came due on this thread while a turn runs here. They wait
+ * Automations that came due on this thread while a turn runs here
+ * (useWaitingAutomations, read by the status lines that show this). They wait
  * for the turn to end rather than steering into it; the run each one starts
  * reaches this view like any run started elsewhere (ChatView's feed effect).
  */
-export function QueuedAutomationNotice({ threadId, active }: { threadId: string; active: boolean }) {
+export function QueuedAutomationNotice({ runs }: { runs: AutomationRun[] }) {
   const { t } = useTranslation();
-  const waiting = useWaitingAutomations(threadId, active);
   const { skip, busy } = useAutomationMutations();
-
-  // Absent rather than empty: the status lines' column pads itself only while
-  // it holds a line.
-  if (!waiting.length) return null;
   return (
     <div role="status" aria-live="polite">
-      {waiting.map((run) => {
+      {runs.map((run) => {
         // Truncated beside the Skip button, so the whole line is its title.
         const line = t('chat.automationWaiting', { name: run.automation_name });
         return (

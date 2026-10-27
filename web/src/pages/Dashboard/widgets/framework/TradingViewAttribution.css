@@ -8,7 +8,7 @@
   color: var(--color-text-quaternary, var(--color-text-tertiary));
   text-decoration: none;
   border-radius: 4px;
-  transition: color 0.12s ease, background-color 0.12s ease;
+  transition: color var(--motion-quick) var(--ease-out), background-color var(--motion-quick) var(--ease-out);
 }
 
 .tv-attribution:hover {

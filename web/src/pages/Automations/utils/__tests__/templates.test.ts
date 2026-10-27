@@ -31,7 +31,7 @@ describe('applyTemplate', () => {
     expect(form.trigger_type).toBe('once');
   });
 
-  it.each<TemplateId>(['custom', 'price_alert', 'morning_briefing'])('starts %s in All workspaces', (id) => {
+  it.each<TemplateId>(['custom', 'price_alert', 'morning_briefing'])('starts %s in the Chief of Staff', (id) => {
     expect(applyTemplate(id, en, 'UTC').place).toBe(ALL_WORKSPACES);
   });
 
@@ -48,12 +48,12 @@ describe('applyTemplate', () => {
     expect(applyTemplate('morning_briefing', i18n.getFixedT('zh-CN')).name).toBe('早盘简报');
   });
 
-  it('returns INITIAL_FORM in All workspaces for custom', () => {
+  it('returns INITIAL_FORM in the Chief of Staff for custom', () => {
     const form = applyTemplate('custom', en);
     expect(form).toEqual({ ...INITIAL_FORM, place: ALL_WORKSPACES });
   });
 
-  it('returns INITIAL_FORM in All workspaces for unknown id', () => {
+  it('returns INITIAL_FORM in the Chief of Staff for unknown id', () => {
     const form = applyTemplate('nonexistent' as TemplateId, en);
     expect(form).toEqual({ ...INITIAL_FORM, place: ALL_WORKSPACES });
   });

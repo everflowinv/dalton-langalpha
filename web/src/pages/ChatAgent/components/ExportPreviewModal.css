@@ -60,7 +60,7 @@
   color: var(--color-text-secondary);
   border-radius: 4px;
   cursor: pointer;
-  transition: all 0.12s;
+  transition: all var(--motion-quick) var(--ease-out);
 }
 .export-preview-stepper-btn:hover:not(:disabled) {
   background: var(--color-bg-hover);
@@ -94,7 +94,7 @@
   font-size: 0.8125rem;
   font-weight: 600;
   cursor: pointer;
-  transition: all 0.15s;
+  transition: all var(--motion-quick) var(--ease-out);
   margin-top: auto;
 }
 .export-preview-save-btn:hover {
@@ -263,6 +263,7 @@
   height: 16px;
   border-radius: 4px;
   background: #d1d5db;
+  /* motion-exempt: the skeleton loop's period, and a loop breathes on ease-in-out rather than the one-shot entrance curve */
   animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
 }
 @keyframes pulse {
@@ -290,7 +291,7 @@
   color: var(--color-text-primary);
   font-size: 0.8125rem;
   cursor: pointer;
-  transition: all 0.15s;
+  transition: all var(--motion-quick) var(--ease-out);
 }
 .export-preview-retry-btn:hover {
   background: var(--color-bg-hover);
@@ -303,7 +304,7 @@
   color: var(--color-text-secondary);
   font-size: 0.8125rem;
   cursor: pointer;
-  transition: all 0.15s;
+  transition: all var(--motion-quick) var(--ease-out);
 }
 .export-preview-anyway-btn:hover {
   color: var(--color-text-primary);

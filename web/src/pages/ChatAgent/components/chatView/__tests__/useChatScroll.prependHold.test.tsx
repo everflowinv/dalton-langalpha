@@ -197,7 +197,7 @@ describe('an older page landing above the reader', () => {
   it('puts the reader back on their bubble when a page landed behind a subagent tab', async () => {
     const { rerender } = await mountAt(1050);
     // The tab switch saves the transcript's offset to restore on return.
-    scroll.scrollPositionsRef.current.main = viewport().scrollTop;
+    scroll.saveScrollPosition();
     rerender(<Harness bubbles={PAGE} activeAgentId="task:t" />);
 
     act(() => { scroll.holdPlace(OLDER.length, () => prepend(rerender, 0, { activeAgentId: 'task:t' })); });

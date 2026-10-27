@@ -48,7 +48,7 @@
   font-size: 0.75rem;
   cursor: pointer;
   user-select: none;
-  transition: background-color 0.15s, color 0.15s;
+  transition: background-color var(--motion-quick) var(--ease-out), color var(--motion-quick) var(--ease-out);
 }
 .file-panel-tab:hover {
   background-color: var(--color-bg-hover);
@@ -129,7 +129,7 @@
   color: var(--color-text-tertiary);
   cursor: pointer;
   opacity: 0;
-  transition: opacity 0.15s, background-color 0.15s;
+  transition: opacity var(--motion-quick) var(--ease-out), background-color var(--motion-quick) var(--ease-out);
 }
 /* The X is a hover affordance, not a badge: the active pill stays as quiet as
    the rest until the pointer is on it. Its room is reserved either way, so

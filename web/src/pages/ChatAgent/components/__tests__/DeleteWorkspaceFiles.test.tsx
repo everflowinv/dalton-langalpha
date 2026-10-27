@@ -5,7 +5,9 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { Mock } from 'vitest';
 import { fireEvent, screen, waitFor } from '@testing-library/react';
+import { QueryClient } from '@tanstack/react-query';
 
+import { queryKeys } from '@/lib/queryKeys';
 import { renderWithProviders } from '@/test/utils';
 import type { Computer } from '@/types/api';
 
@@ -123,6 +125,24 @@ describe('deleting a workspace on the owner\'s machine', () => {
     fireEvent.click(screen.getByText('open'));
 
     expect(await screen.findByText(/will be permanently deleted/)).toBeInTheDocument();
+  });
+
+  it('takes the deleted row off every cached list before the refetch lands', async () => {
+    // Kept while unobserved, as a list another page cached would be.
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    renderWithProviders(<Harness workspace={onCloud} />, { queryClient });
+    const gallery = queryKeys.workspaces.list({ view: 'all', sortBy: 'activity', includeHome: true });
+    const sidebar = queryKeys.workspaces.list({ limit: 20, includeHome: true, sortBy: 'custom', offset: 0 });
+    for (const key of [gallery, sidebar]) {
+      queryClient.setQueryData(key, { workspaces: [onLaptop, onCloud], total: 2 });
+    }
+    fireEvent.click(screen.getByText('open'));
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Delete' }));
+    await waitFor(() => expect(mockDelete).toHaveBeenCalledWith('ws-2', { deleteFiles: false }));
+    await waitFor(() => expect(queryClient.getQueryData(gallery)).toEqual({ workspaces: [onLaptop], total: 1 }));
+    expect(queryClient.getQueryData(sidebar)).toEqual({ workspaces: [onLaptop], total: 1 });
+    queryClient.clear();
   });
 
   it('never offers it for a thread', () => {

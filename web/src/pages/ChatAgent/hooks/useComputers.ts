@@ -91,6 +91,21 @@ export function useComputers(options: { enabled?: boolean } = {}) {
 }
 
 /**
+ * One machine off the shared list, for a row that only names it (the sidebar's
+ * folders): the row re-renders when that machine changes, not when any other
+ * does or the list polls a spec change. It reads what the list already holds
+ * rather than refetch on every row that mounts.
+ */
+export function useComputer(computerId: string | null) {
+  return useQuery({
+    ...computersList(),
+    enabled: !!computerId,
+    refetchOnMount: false,
+    select: (data) => data.computers.find((c) => c.computer_id === computerId) ?? null,
+  });
+}
+
+/**
  * The server's list, for a decision made outside render, such as whether a
  * machine is still in use. Never the cached one: that can predate the removal
  * the decision is about, made on another device. Rejects rather than answering

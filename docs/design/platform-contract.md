@@ -185,8 +185,8 @@ they may name; the gateway holds both, with the same two headers:
   (`workspace_id`, to which langalpha adds `workspace`) and one key per linked app: `preferred`
   (an address, or null for the user's direct messages), `chats` (address → `workspace_id`,
   `workspace`, `name`), `automation_output` (workspace id → address) and `agent_messages`
-  (`enabled`, `allowed`). A binding's `workspace_id` is null for All workspaces, where the Chief
-  of Staff answers, or a workspace, where its Analyst answers; a chat with no entry in `chats`
+  (`enabled`, `allowed`). A binding's `workspace_id` is null for the Chief of Staff,
+  who answers from Home, or a workspace, where its Analyst answers; a chat with no entry in `chats`
   follows `default`. A preferred chat counts as allowed, and `name` is the gateway's read-only
   label. Preferring a chat not in `allowed` adds it there, and a save that drops the preferred
   chat from `allowed` while leaving `preferred` as it was resets `preferred` to the direct

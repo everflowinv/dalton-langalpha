@@ -28,7 +28,7 @@ import { useTierQuota } from '../hooks/useTierQuota';
 import { diskLevelRank, diskUpgradeTier, isDiskAlertLevel, largerDiskTiers } from './computerDiskUi';
 import { PlanUpgradeHint } from './planUpgradeHint';
 import { activeSpecChange, effectiveTier, SpecChangeProgress } from './specChangeUi';
-import { needsBiggerPlan, offeredTiers } from './tierUi';
+import { needsBiggerPlan, normalizeTier, offeredTiers, quotaForSpecChange } from './tierUi';
 
 // --- Dismissal, per computer for the browser session --------------------------
 
@@ -132,7 +132,7 @@ export function DiskWarning({ computer, className }: DiskWarningProps) {
   // (Medium and Large share one, and only E2B runs Extra Large), and whether
   // it can be picked on what the plan allows.
   const { data: providerData } = useComputerProviders({ enabled: visible && isDiskAlertLevel(level) });
-  const { data: quota } = useTierQuota({ enabled: visible && isDiskAlertLevel(level) });
+  const { data: planQuota } = useTierQuota({ enabled: visible && isDiskAlertLevel(level) });
 
   if (!visible || !disk || !isDiskAlertLevel(level)) return null;
 
@@ -142,6 +142,8 @@ export function DiskWarning({ computer, className }: DiskWarningProps) {
   const tier = effectiveTier(computer);
   const provider = providerData?.providers.find((p) => p.kind === computer.kind);
   const offer = offeredTiers(provider, tier);
+  // The slot is the size the row holds, which the server counts.
+  const quota = quotaForSpecChange(planQuota, normalizeTier(computer.resource_tier));
   const managesSpec = providerManagesSpec(computer.kind);
   const canGrow = managesSpec && diskUpgradeTier(tier, offer, quota) !== null;
   const planLimited =

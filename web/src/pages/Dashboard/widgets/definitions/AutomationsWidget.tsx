@@ -94,7 +94,7 @@ function AutomationRow({
 
   return (
     <div
-      className="group relative w-full flex items-center gap-3 py-2 pr-2 pl-3 rounded-md transition-colors duration-150"
+      className="group relative w-full flex items-center gap-3 py-2 pr-2 pl-3 rounded-md transition-colors"
       onMouseEnter={(e) => {
         e.currentTarget.style.backgroundColor = 'var(--color-bg-hover)';
       }}

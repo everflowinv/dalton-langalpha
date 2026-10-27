@@ -232,7 +232,7 @@ export function BarChart({
                   background: surface,
                   color: bar.mark ? 'var(--color-text-primary)' : 'var(--color-text-tertiary)',
                   opacity: p > 0.6 ? 1 : 0,
-                  transition: 'opacity 160ms',
+                  transition: 'opacity var(--motion-quick) var(--ease-out)',
                 }}
               >
                 {bar.shown}

@@ -2,8 +2,9 @@ import React, { useEffect, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 import { motion } from '@/lib/framer';
 import { Download, MoreVertical, Plus } from 'lucide-react';
+import { PresenceFold } from '@/components/ui/Disclosure';
 import { Loader } from '@/components/ui/loader';
-import { EASE_OUT } from '@/lib/motion';
+import { SPRING_INDICATOR, TWEEN } from '@/lib/motion';
 import { cn } from '@/lib/utils';
 
 /**
@@ -14,24 +15,17 @@ import { cn } from '@/lib/utils';
  * here; the surfaces keep only their own semantics.
  */
 
-// Matches the spring used across the chat UI (ActivityBlock) so motion feels
-// consistent. The toggle knob's travel IS the state change, so it springs.
-const SPRING_SNAPPY = { type: 'spring' as const, stiffness: 200, damping: 22 };
-
+// The toggle knob's travel IS the state change, so it springs, on the house
+// indicator spring so it settles on arrival instead of overshooting.
 // Rows never travel. A filter answers a question — which servers match — and
 // the answer is the list, not a journey to it; sliding a card in from a
 // position it never occupied narrates a move the user did not make. So no
 // `layout` prop and no y-offset: membership changes read as fade in, close
 // up. The one vertical motion left is a leaving row collapsing its own
 // height, which is the list closing the gap it just made, in place.
-const FADE_IN = { duration: 0.15, ease: EASE_OUT };
+const FADE_IN = TWEEN.quick;
 
-// Exits tween rather than spring: a spring's settle tail makes a batch of
-// leaving rows hold phantom height for ~350ms and then vanish in one frame
-// (the presence wrapper waits for every spring to rest). A short
-// deterministic tween ends all exits together, so a filter swap reads as one
-// clean motion.
-const EXIT_TWEEN = { duration: 0.15, ease: EASE_OUT };
+const NO_SIBLING_MARGIN = { marginTop: 0 };
 
 /** Row container: identity tile + content column left, actions column right.
  *  `onOpen` makes the content column a pointer target for the row's detail
@@ -50,26 +44,25 @@ export function ServerRowShell({
   actions: React.ReactNode;
   onOpen?: () => void;
 }) {
-  // The presence box collapses; the row inside never changes shape. `animate`
-  // restores every key the exit moves: on framer-motion 12.39+ a row that
-  // re-enters after its own exit finished (a sibling's still running) keeps
-  // any exit-only value, so a filter typed and cleared fast left rows at zero
-  // height. The list's gap moves inside the box so the collapse swallows it,
-  // and the box clips, so the row rings inward.
+  // The fold collapses; the row inside never changes shape. It shuts over the
+  // exit beat, a tween rather than a spring: a spring's settle tail made a
+  // batch of leaving rows hold phantom height for ~350ms and then vanish in
+  // one frame, since the list waits for every row to finish. The list's gap
+  // moves inside the fold, so the collapse swallows it: the box takes no
+  // sibling margin, and a row after the first pads its own top instead.
   return (
-    <motion.div
-      initial={{ opacity: 0 }}
-      animate={{ opacity: 1, height: 'auto' }}
-      exit={{ opacity: 0, height: 0, transition: EXIT_TWEEN }}
-      transition={FADE_IN}
-      className="overflow-hidden clips-focus-ring [&:not(:first-child)>*]:mt-1.5"
-      style={{ marginTop: 0 }}
+    <PresenceFold
+      className="clips-focus-ring [:not(:first-child)>&]:pt-1.5"
+      style={NO_SIBLING_MARGIN}
     >
-      <div
+      <motion.div
+        initial={{ opacity: 0 }}
+        animate={{ opacity: 1 }}
+        transition={FADE_IN}
         className={`flex items-start justify-between gap-3 py-2.5 px-3 rounded-lg overflow-hidden bg-(--color-bg-card)${
           // The fill lives in the class (not style) so the hover twin can win;
           // only rows that open a detail view invite the pointer.
-          onOpen ? ' transition-colors duration-150 hover:bg-(--color-bg-card-hover)' : ''
+          onOpen ? ' transition-colors hover:bg-(--color-bg-card-hover)' : ''
         }`}
         data-testid={testid}
       >
@@ -81,8 +74,8 @@ export function ServerRowShell({
           {main}
         </div>
         <div className="flex items-center gap-2 shrink-0">{actions}</div>
-      </div>
-    </motion.div>
+      </motion.div>
+    </PresenceFold>
   );
 }
 
@@ -256,7 +249,7 @@ export function EnabledToggle({
       <motion.span
         className="inline-block h-4 w-4 rounded-full bg-white"
         animate={{ x: enabled ? 18 : 2 }}
-        transition={SPRING_SNAPPY}
+        transition={SPRING_INDICATOR}
       />
     </button>
   );

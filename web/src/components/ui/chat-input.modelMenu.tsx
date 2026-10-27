@@ -29,9 +29,10 @@ function TriggerBody({
   isCodexModel: boolean;
   accent?: boolean;
 }) {
+  const { t } = useTranslation();
   return (
     <>
-      <span className="min-w-0 max-w-[120px] truncate">{getModelDisplayName(selectedModel, metadata) || 'Model'}</span>
+      <span className="min-w-0 max-w-[120px] truncate">{getModelDisplayName(selectedModel, metadata) || t('chat.modelSelector.fallbackName')}</span>
       {effortLabel && (
         <span className="flex-none" style={{ color: 'var(--color-text-tertiary)' }}>{effortLabel}</span>
       )}
@@ -248,7 +249,7 @@ export function ChatInputModelMenu({
           className={`model-selector-trigger ${TRIGGER_CLASS} cursor-pointer transition-colors disabled:cursor-progress`}
           onClick={(e) => e.stopPropagation()}
           type="button"
-          title="Select model"
+          title={t('chat.modelSelector.select')}
         >
           <TriggerBody selectedModel={selectedModel} metadata={metadata} effortLabel={effortLabel} fastMode={fastMode === true} isCodexModel={isCodexModel} accent />
         </button>

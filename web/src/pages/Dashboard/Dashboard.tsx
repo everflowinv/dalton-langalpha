@@ -24,6 +24,7 @@ import { useDashboardData } from './hooks/useDashboardData';
 import { useOnboarding, snoozePersonalization } from './hooks/useOnboarding';
 import { WelcomeBanner } from '../Onboarding/welcome/WelcomeBanner';
 import { useScrollMemory } from '@/lib/scrollMemory';
+import { scrollMotion } from '@/lib/reducedMotion';
 import './Dashboard.css';
 
 interface DeleteConfirmState {
@@ -46,7 +47,7 @@ function Dashboard({ layoutToggle }: DashboardProps = {}) {
   const mainRef = useRef<HTMLElement>(null);
   useScrollMemory(mainRef, 'page:dashboard');
   const handleScrollToTop = useCallback(() => {
-    mainRef.current?.scrollTo({ top: 0, behavior: 'smooth' });
+    mainRef.current?.scrollTo({ top: 0, behavior: scrollMotion() });
   }, []);
   // News modal state
   const [selectedNewsId, setSelectedNewsId] = useState<string | null>(null);

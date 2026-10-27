@@ -1,5 +1,4 @@
 import React, { useState } from 'react';
-import { motion } from '@/lib/framer';
 import { Check, X } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { Loader } from '@/components/ui/loader';
@@ -10,6 +9,7 @@ import { OrderApprovalCard } from './mcp/OrderApprovalCard';
 import { useDirectToolVendorLabel } from './mcp/useDirectToolVendor';
 import { SettledStep } from './SettledStep';
 import { PublishApprovalCard } from './dalton/PublishApprovalCard'; // DALTON-HOOK(publish-card)
+import { ResolveSwap } from './decisionCardMotion';
 import { humanizeKey } from '../utils/structuredResult';
 
 interface ToolApprovalCardProps {
@@ -73,89 +73,81 @@ function ToolApprovalCard({ data, onApprove, onReject, resultPending, resultLost
     </div>
   );
 
-  if (isApproved || isRejected) {
-    return (
-      <SettledStep
-        verdict={isApproved ? 'approved' : 'rejected'}
-        reason={isRejected ? data.reason : null}
-        label={
-          isApproved
-            ? t('toolArtifact.directTool.approvedAction', { vendor: vendorLabel, tool: toolLabel })
-            : t('toolArtifact.directTool.rejectedAction', { vendor: vendorLabel, tool: toolLabel })
-        }
-      >
-        {detailBlock}
-      </SettledStep>
-    );
-  }
-
   const canAct = !!onApprove || !!onReject;
 
   return (
-    <motion.div
-      initial={{ opacity: 0, y: 8 }}
-      animate={{ opacity: 1, y: 0 }}
-      transition={{ duration: 0.4, ease: [0.22, 1, 0.36, 1] }}
-      data-testid="tool-approval-card"
+    <ResolveSwap
+      resolved={isApproved || isRejected}
+      settled={
+        <SettledStep
+          verdict={isApproved ? 'approved' : 'rejected'}
+          reason={isRejected ? data.reason : null}
+          label={
+            isApproved
+              ? t('toolArtifact.directTool.approvedAction', { vendor: vendorLabel, tool: toolLabel })
+              : t('toolArtifact.directTool.rejectedAction', { vendor: vendorLabel, tool: toolLabel })
+          }
+        >
+          {detailBlock}
+        </SettledStep>
+      }
     >
-      <div className="flex items-center gap-3 pb-3">
-        <DirectToolTileMark server={server} />
-        <div className="min-w-0 flex-1">
-          <div className="text-[0.9375rem] font-medium truncate" style={{ color: 'var(--color-text-primary)' }}>
-            {canAct
-              ? t('toolArtifact.directTool.approvalTitle')
-              : t('toolArtifact.directTool.unansweredTitle')}
+      <div data-testid="tool-approval-card">
+        <div className="flex items-center gap-3 pb-3">
+          <DirectToolTileMark server={server} />
+          <div className="min-w-0 flex-1">
+            <div className="text-[0.9375rem] font-medium truncate" style={{ color: 'var(--color-text-primary)' }}>
+              {canAct
+                ? t('toolArtifact.directTool.approvalTitle')
+                : t('toolArtifact.directTool.unansweredTitle')}
+            </div>
+            <div className="text-xs truncate" style={{ color: 'var(--color-text-tertiary)' }}>
+              {vendorLabel} · {toolLabel}
+            </div>
           </div>
-          <div className="text-xs truncate" style={{ color: 'var(--color-text-tertiary)' }}>
-            {vendorLabel} · {toolLabel}
-          </div>
+          {canAct && (
+            <Loader size={14} className="ml-auto shrink-0 text-(--color-icon-muted)" />
+          )}
         </div>
+
+        {detailBlock}
+
         {canAct && (
-          <Loader size={14} className="ml-auto shrink-0 text-(--color-icon-muted)" />
+          <div className="pt-3 flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              onClick={(e: React.MouseEvent) => { e.stopPropagation(); onApprove?.(); }}
+              disabled={!onApprove}
+              className="press flex items-center gap-1.5 text-sm px-4 py-2 rounded-md font-medium hover:brightness-110 disabled:opacity-50"
+              style={{ backgroundColor: 'var(--color-btn-primary-bg)', color: 'var(--color-btn-primary-text)' }}
+            >
+              <Check className="h-3.5 w-3.5 stroke-[2.5]" />
+              {t('toolArtifact.directTool.approve')}
+            </button>
+            <button
+              type="button"
+              onClick={(e: React.MouseEvent) => { e.stopPropagation(); onReject?.(reason.trim() || undefined); }}
+              disabled={!onReject}
+              className="press flex items-center gap-1.5 text-sm px-4 py-2 rounded-md font-medium disabled:opacity-50"
+              style={{ backgroundColor: 'var(--color-border-muted)', color: 'var(--color-text-tertiary)' }}
+            >
+              <X className="h-3.5 w-3.5" />
+              {t('toolArtifact.directTool.reject')}
+            </button>
+            <input
+              type="text"
+              value={reason}
+              onChange={(e) => setReason(e.target.value)}
+              maxLength={200}
+              placeholder={t('toolArtifact.directTool.reasonPlaceholder')}
+              aria-label={t('toolArtifact.directTool.reasonPlaceholder')}
+              className="flex-1 min-w-40 text-sm px-3 py-2 rounded-md bg-transparent outline-hidden"
+              style={{ border: '1px solid var(--color-border-muted)', color: 'var(--color-text-primary)' }}
+            />
+          </div>
         )}
       </div>
-
-      {detailBlock}
-
-      {canAct && (
-        <div className="pt-3 flex flex-wrap items-center gap-2">
-          <motion.button
-            type="button"
-            onClick={(e: React.MouseEvent) => { e.stopPropagation(); onApprove?.(); }}
-            disabled={!onApprove}
-            className="flex items-center gap-1.5 text-sm px-4 py-2 rounded-md font-medium transition-colors hover:brightness-110 disabled:opacity-50"
-            style={{ backgroundColor: 'var(--color-btn-primary-bg)', color: 'var(--color-btn-primary-text)' }}
-            whileHover={{ scale: 1.02 }}
-            whileTap={{ scale: 0.98 }}
-          >
-            <Check className="h-3.5 w-3.5 stroke-[2.5]" />
-            {t('toolArtifact.directTool.approve')}
-          </motion.button>
-          <motion.button
-            type="button"
-            onClick={(e: React.MouseEvent) => { e.stopPropagation(); onReject?.(reason.trim() || undefined); }}
-            disabled={!onReject}
-            className="flex items-center gap-1.5 text-sm px-4 py-2 rounded-md font-medium transition-colors disabled:opacity-50"
-            style={{ backgroundColor: 'var(--color-border-muted)', color: 'var(--color-text-tertiary)' }}
-            whileHover={{ scale: 1.02 }}
-            whileTap={{ scale: 0.98 }}
-          >
-            <X className="h-3.5 w-3.5" />
-            {t('toolArtifact.directTool.reject')}
-          </motion.button>
-          <input
-            type="text"
-            value={reason}
-            onChange={(e) => setReason(e.target.value)}
-            maxLength={200}
-            placeholder={t('toolArtifact.directTool.reasonPlaceholder')}
-            aria-label={t('toolArtifact.directTool.reasonPlaceholder')}
-            className="flex-1 min-w-40 text-sm px-3 py-2 rounded-md bg-transparent outline-hidden"
-            style={{ border: '1px solid var(--color-border-muted)', color: 'var(--color-text-primary)' }}
-          />
-        </div>
-      )}
-    </motion.div>
+    </ResolveSwap>
   );
 }
 

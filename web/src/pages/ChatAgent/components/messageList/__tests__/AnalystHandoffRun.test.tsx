@@ -166,6 +166,66 @@ describe('AnalystHandoffRun', () => {
     expect(screen.queryByText('Steered')).toBeNull();
   });
 
+  describe('answered in place', () => {
+    /** The run, re-drawable with its members as an answer changes them. */
+    function renderLive(members: AnalystHandoffMember[]) {
+      const tree = (ms: AnalystHandoffMember[]) => (
+        <DispatchStatusProvider>
+          <HandoffPlacesContext value={new Map()}>
+            <AnalystHandoffRun members={ms} onApprove={vi.fn()} onReject={vi.fn()} />
+          </HandoffPlacesContext>
+        </DispatchStatusProvider>
+      );
+      const { rerender } = renderWithProviders(tree(members));
+      return (next: AnalystHandoffMember[]) => rerender(tree(next));
+    }
+
+    it('takes an approved hand-off into the group beside it, which grows rather than remounts', async () => {
+      // Above the group, so the group's first member changes, and the group
+      // keeps the key it was drawn under rather than its new first member's.
+      mockLiveness.mockResolvedValue([]);
+      const answer = renderLive([member('p', 'pending'), member('a', 'approved', 'th-a'), member('b', 'approved', 'th-b')]);
+      const header = screen.getByRole('button', { name: 'Handed off to 2 analysts' });
+
+      answer([member('p', 'approved', 'th-p'), member('a', 'approved', 'th-a'), member('b', 'approved', 'th-b')]);
+      // The same header, now counting three: the group took the row in.
+      expect(screen.getByRole('button', { name: 'Handed off to 3 analysts' })).toBe(header);
+      expect(screen.getByRole('button', { name: 'Brief p' })).toBeInTheDocument();
+      // The card folds out of the run, and cannot be answered again meanwhile.
+      expect(document.querySelector('[data-handoff-approval]')!.closest('[inert]')).not.toBeNull();
+      await waitFor(() => expect(document.querySelector('[data-handoff-approval]')).toBeNull());
+    });
+
+    it('hands keyboard focus from the answered card to the slip it became', () => {
+      mockLiveness.mockResolvedValue([]);
+      const answer = renderLive([member('p', 'pending')]);
+      screen.getByRole('button', { name: 'Hand off' }).focus();
+
+      // Approved a moment ago, it has no thread to open yet: the row holds focus.
+      answer([member('p', 'approved')]);
+      expect(document.activeElement).toHaveAttribute('data-handoff-member', 'p');
+    });
+
+    it('hands keyboard focus from the declined card to its line\'s toggle', () => {
+      const answer = renderLive([member('p', 'pending')]);
+      screen.getByRole('button', { name: 'Decline' }).focus();
+
+      answer([member('p', 'rejected')]);
+      expect(document.activeElement).toHaveTextContent('Hand-off declined');
+      expect(document.activeElement).toHaveAttribute('aria-expanded', 'false');
+    });
+
+    it('leaves focus the reader took elsewhere where it is', () => {
+      const answer = renderLive([member('p', 'pending'), member('q', 'pending')]);
+      screen.getAllByRole('button', { name: 'Hand off' })[0].focus();
+      const elsewhere = screen.getAllByRole('button', { name: 'Hand off' })[1];
+      elsewhere.focus();
+
+      answer([member('p', 'approved'), member('q', 'pending')]);
+      expect(document.activeElement).toBe(elsewhere);
+    });
+  });
+
   it('keeps the order: a declined hand-off between two splits them into slips', () => {
     mockLiveness.mockResolvedValue([]);
     renderRun([member('a', 'approved', 'th-a'), member('x', 'rejected'), member('b', 'approved', 'th-b')]);

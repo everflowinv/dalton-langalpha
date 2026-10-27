@@ -71,7 +71,7 @@ export default function MoreOptions({
     panel: `${uid}-panel`,
   };
 
-  // The list leaves Home out; All workspaces is offered in its place.
+  // The list leaves Home out; the Chief of Staff is offered in its place.
   const workspaces = useWorkspaceOptions();
   const allWorkspaces = form.place === ALL_WORKSPACES;
   const workspaceName = workspaceNameOf(workspaces, form.place);
@@ -91,7 +91,7 @@ export default function MoreOptions({
 
   // What the folded options are set to, so they can stay folded.
   const summary = [
-    allWorkspaces ? t('agents.allWorkspaces') : placeLabel({ workspace_id: form.place }, workspaceName),
+    allWorkspaces ? t('agents.chiefOfStaff') : placeLabel({ workspace_id: form.place }, workspaceName),
     t(form.thread_strategy === 'continue' ? 'automation.continueExisting' : 'automation.newThreadEachRun'),
     form.delivery_methods.length
       ? t('automation.deliversTo', { method: form.delivery_methods.map(entryName).join(', ') })
@@ -129,7 +129,7 @@ export default function MoreOptions({
             </SelectTrigger>
             <SelectPopover>
               <SelectListBox>
-                <SelectItem id={ALL_WORKSPACES}>{t('agents.allWorkspaces')}</SelectItem>
+                <SelectItem id={ALL_WORKSPACES}>{t('agents.chiefOfStaff')}</SelectItem>
                 {workspaces.map((ws) => (
                   <SelectItem key={ws.workspace_id} id={ws.workspace_id}>
                     {ws.name}

@@ -63,7 +63,7 @@ export async function getWorkspace(workspaceId: string): Promise<Workspace> {
 }
 
 /**
- * Get or create the user's Home, the workspace All workspaces runs in.
+ * Get or create the user's Home, the workspace the Chief of Staff runs in.
  * Idempotent, so safe to call on every app load.
  */
 export async function getHomeWorkspace(): Promise<Workspace> {

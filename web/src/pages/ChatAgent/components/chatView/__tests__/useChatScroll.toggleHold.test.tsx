@@ -2,6 +2,9 @@
  * Opening a row under a streaming turn is a reader choosing a place. When the
  * hold that keeps the row under the pointer lets go, the follow must not carry
  * them to the bottom just because nothing scrolled while it held.
+ *
+ * The follow glides over animation frames, which the fake timers run, so a
+ * check of where it lands lets the glide finish first.
  */
 import React from 'react';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
@@ -63,6 +66,11 @@ function scrollTo(top: number) {
   v.dispatchEvent(new Event('scroll'));
 }
 
+/** Long enough for any glide to land. */
+async function glide() {
+  await act(async () => { vi.advanceTimersByTime(1000); });
+}
+
 describe('a disclosure opened near the bottom of a streaming turn', () => {
   const OriginalRO = window.ResizeObserver;
 
@@ -118,11 +126,14 @@ describe('a disclosure opened near the bottom of a streaming turn', () => {
     await act(async () => { vi.advanceTimersByTime(1100); });
     contentH += 20;
     act(() => { resize(contentH); });
+    await glide();
 
     expect(viewport().scrollTop).toBe(contentH - VIEW_H);
   });
 
-  it('lets a send right after the toggle take the reader to the end', async () => {
+  // A steer, a message into the turn still running, goes to its end; a send
+  // that opens a turn pins the reader's message instead (ChatView.sendRejoin).
+  it('lets a steer right after the toggle take the reader to the end', async () => {
     render(<Harness />);
     act(() => { scrollTo(contentH - VIEW_H); });
     act(() => { resize(contentH); });
@@ -135,15 +146,46 @@ describe('a disclosure opened near the bottom of a streaming turn', () => {
     const row = document.querySelector<HTMLElement>('[data-row]')!;
     row.getBoundingClientRect = () => rect(1100 - viewport().scrollTop, 24);
     act(() => { announceAnchoredToggle(row); });
-    act(() => { scroll.follow.rejoin(); });
+    act(() => { scroll.follow.rejoin('steer'); });
     contentH += 100;
     act(() => { resize(contentH); });
+    await glide();
     expect(viewport().scrollTop).toBe(contentH - VIEW_H);
 
-    // The reply's first token lands after both the hold and the settle window.
+    // The reply's next token lands after both the hold and the settle window.
     await act(async () => { vi.advanceTimersByTime(2000); });
     contentH += 40;
     act(() => { resize(contentH); });
+    await glide();
+    expect(viewport().scrollTop).toBe(contentH - VIEW_H);
+  });
+
+  // From the very end a steer has nowhere to glide, so nothing but the steer
+  // itself can end the toggle's hold.
+  it('lets a steer from the very end, right after a toggle, carry the reader with the reply', async () => {
+    render(<Harness />);
+    act(() => { scrollTo(contentH - VIEW_H); });
+    act(() => { resize(contentH); });
+
+    // A row collapsed at the end: the transcript shrinks and the view clamps
+    // onto its new end. The reader sends into the running turn from there.
+    act(() => { announceAnchoredToggle(document.querySelector<HTMLElement>('[data-row]')); });
+    contentH -= 200;
+    act(() => { scrollTo(contentH - VIEW_H); });
+    act(() => { resize(contentH); });
+    act(() => { scroll.follow.rejoin('steer'); });
+
+    // Their message and the reply's first lines, inside the hold's window.
+    contentH += 100;
+    act(() => { resize(contentH); });
+    await glide();
+    expect(viewport().scrollTop).toBe(contentH - VIEW_H);
+
+    // And the reply's next lines, once the window has passed.
+    await act(async () => { vi.advanceTimersByTime(1100); });
+    contentH += 40;
+    act(() => { resize(contentH); });
+    await glide();
     expect(viewport().scrollTop).toBe(contentH - VIEW_H);
   });
 });

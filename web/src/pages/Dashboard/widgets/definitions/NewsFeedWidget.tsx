@@ -1,8 +1,10 @@
 import { useEffect, useEffectEvent, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { AnimatePresence, motion } from '@/lib/framer';
+import { motion } from '@/lib/framer';
+import { staggerDelay, TWEEN } from '@/lib/motion';
 import { Newspaper, Clock, Search, X } from 'lucide-react';
 import { Loader } from '@/components/ui/loader';
+import { SwapCell } from '@/components/ui/crossfade';
 import { useNow } from '@/hooks/useNow';
 import { useLocale } from '@/hooks/useLocale';
 import { relativeTime } from '@/lib/format';
@@ -75,7 +77,7 @@ function NewsRow({
     <motion.div
       initial={{ opacity: 0, y: 8 }}
       animate={{ opacity: 1, y: 0 }}
-      transition={{ delay: Math.min(idx, 8) * 0.03 }}
+      transition={{ ...TWEEN.quick, delay: staggerDelay(idx) }}
       onClick={onClick}
       className="group flex items-start gap-3 px-2 py-2.5 rounded-md border border-transparent transition-colors cursor-pointer"
       onMouseEnter={(e) => {
@@ -90,7 +92,7 @@ function NewsRow({
           <img
             src={item.image}
             alt=""
-            className="h-full w-full object-cover transition-transform duration-500 group-hover:scale-110"
+            className="h-full w-full object-cover"
             onError={(e) => {
               (e.target as HTMLImageElement).style.display = 'none';
             }}
@@ -231,6 +233,9 @@ function NewsFeedWidget({ instance, updateConfig }: WidgetRenderProps<NewsFeedCo
   );
 
   const switchTab = (key: NewsFeedSource) => {
+    // The feeds dissolve in one cell at the same scroll offset, so the next
+    // one opens at its top rather than out of view below a short list.
+    if (key !== activeTab) scrollRef.current?.scrollTo({ top: 0 });
     setActiveTab(key);
     setTickerFilter('');
     setDateRange('all');
@@ -362,7 +367,7 @@ function NewsFeedWidget({ instance, updateConfig }: WidgetRenderProps<NewsFeedCo
             backgroundColor: 'var(--color-bg-subtle)',
             borderColor: 'var(--color-border-muted)',
             width: tickerFilter ? 160 : 130,
-            transition: 'width 0.2s',
+            transition: 'width var(--motion-quick) var(--ease-out)',
           }}
         >
           <Search size={12} style={{ color: 'var(--color-text-tertiary)', flexShrink: 0 }} />
@@ -455,93 +460,93 @@ function NewsFeedWidget({ instance, updateConfig }: WidgetRenderProps<NewsFeedCo
       </div>
 
       <div ref={scrollRef} className="flex-1 min-h-0 overflow-y-auto -mx-1 px-1">
-        <AnimatePresence mode="wait">
-          <motion.div
-            key={activeTab}
-            initial={{ opacity: 0, y: 6 }}
-            animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0, y: -6 }}
-            transition={{ duration: 0.15 }}
-            className="flex flex-col gap-0.5"
-          >
-            {loading && filteredItems.length === 0 ? (
-              Array.from({ length: 5 }).map((_, i) => (
-                <div key={i} className="flex items-start gap-3 p-2 animate-pulse">
-                  <div
-                    className="h-12 w-16 shrink-0 rounded-md"
-                    style={{ backgroundColor: 'var(--color-bg-subtle)' }}
-                  />
-                  <div className="flex-1">
-                    <div
-                      className="h-3 rounded mb-1.5"
-                      style={{ backgroundColor: 'var(--color-bg-subtle)', width: '35%' }}
-                    />
-                    <div
-                      className="h-3.5 rounded"
-                      style={{ backgroundColor: 'var(--color-bg-subtle)', width: `${60 + (i % 3) * 15}%` }}
-                    />
-                  </div>
-                </div>
-              ))
-            ) : filteredItems.length === 0 ? (
-              <div className="h-full flex flex-col items-center justify-center gap-2 py-8">
+        {/* The tabs dissolve in one grid cell, so a switch never passes through
+            an empty feed. */}
+        <SwapCell
+          as="div"
+          className="items-start"
+          appear
+          shift={{ y: 6 }}
+          swapKey={activeTab}
+          layerClassName="flex flex-col gap-0.5"
+        >
+          {loading && filteredItems.length === 0 ? (
+            Array.from({ length: 5 }).map((_, i) => (
+              <div key={i} className="flex items-start gap-3 p-2 animate-pulse">
                 <div
-                  className="h-9 w-9 rounded-full flex items-center justify-center"
+                  className="h-12 w-16 shrink-0 rounded-md"
                   style={{ backgroundColor: 'var(--color-bg-subtle)' }}
-                >
-                  <Newspaper className="h-4 w-4" style={{ color: 'var(--color-text-tertiary)' }} />
-                </div>
-                <div
-                  className="dashboard-mono text-sm"
-                  style={{ color: 'var(--color-text-primary)' }}
-                >
-                  {hasFilters
-                    ? t('dashboard.widgets.newsFeed.emptyFiltered')
-                    : activeTab === 'market'
-                      ? t('dashboard.widgets.newsFeed.emptyMarket')
-                      : activeTab === 'top'
-                        ? t('dashboard.widgets.newsFeed.emptyTop')
-                        : t('dashboard.widgets.newsFeed.emptyAddTo', { label: t(SOURCE_KEY[activeTab]).toLowerCase() })}
+                />
+                <div className="flex-1">
+                  <div
+                    className="h-3 rounded mb-1.5"
+                    style={{ backgroundColor: 'var(--color-bg-subtle)', width: '35%' }}
+                  />
+                  <div
+                    className="h-3.5 rounded"
+                    style={{ backgroundColor: 'var(--color-bg-subtle)', width: `${60 + (i % 3) * 15}%` }}
+                  />
                 </div>
               </div>
-            ) : (
-              filteredItems.map((item, idx) => {
-                const rowId = String(item.id ?? `${item.title}`);
-                return (
-                  <div
-                    key={item.id ?? `${idx}-${item.title}`}
-                    className="row-attach-host relative"
-                  >
-                    <NewsRow
-                      item={item}
-                      idx={idx}
-                      onClick={() => {
-                        if (item.id != null) {
-                          modals.openNews(item.id, {
-                            title: item.title,
-                            source: item.source,
-                            publishedAt: item.publishedAt ?? null,
-                            tickers: item.tickers,
-                            articleUrl: item.articleUrl ?? null,
-                            author: item.author ?? null,
-                            description: item.description ?? null,
-                            keywords: item.keywords,
-                            sentiments: item.sentiments ?? null,
-                            imageUrl: item.image ?? null,
-                            favicon: item.favicon ?? null,
-                          });
-                        }
-                      }}
-                    />
-                    <span className="absolute right-1 top-1/2 -translate-y-1/2 z-10">
-                      <RowAttachButton instanceId={instance.id} rowId={rowId} />
-                    </span>
-                  </div>
-                );
-              })
-            )}
-          </motion.div>
-        </AnimatePresence>
+            ))
+          ) : filteredItems.length === 0 ? (
+            <div className="h-full flex flex-col items-center justify-center gap-2 py-8">
+              <div
+                className="h-9 w-9 rounded-full flex items-center justify-center"
+                style={{ backgroundColor: 'var(--color-bg-subtle)' }}
+              >
+                <Newspaper className="h-4 w-4" style={{ color: 'var(--color-text-tertiary)' }} />
+              </div>
+              <div
+                className="dashboard-mono text-sm"
+                style={{ color: 'var(--color-text-primary)' }}
+              >
+                {hasFilters
+                  ? t('dashboard.widgets.newsFeed.emptyFiltered')
+                  : activeTab === 'market'
+                    ? t('dashboard.widgets.newsFeed.emptyMarket')
+                    : activeTab === 'top'
+                      ? t('dashboard.widgets.newsFeed.emptyTop')
+                      : t('dashboard.widgets.newsFeed.emptyAddTo', { label: t(SOURCE_KEY[activeTab]).toLowerCase() })}
+              </div>
+            </div>
+          ) : (
+            filteredItems.map((item, idx) => {
+              const rowId = String(item.id ?? `${item.title}`);
+              return (
+                <div
+                  key={item.id ?? `${idx}-${item.title}`}
+                  className="row-attach-host relative"
+                >
+                  <NewsRow
+                    item={item}
+                    idx={idx}
+                    onClick={() => {
+                      if (item.id != null) {
+                        modals.openNews(item.id, {
+                          title: item.title,
+                          source: item.source,
+                          publishedAt: item.publishedAt ?? null,
+                          tickers: item.tickers,
+                          articleUrl: item.articleUrl ?? null,
+                          author: item.author ?? null,
+                          description: item.description ?? null,
+                          keywords: item.keywords,
+                          sentiments: item.sentiments ?? null,
+                          imageUrl: item.image ?? null,
+                          favicon: item.favicon ?? null,
+                        });
+                      }
+                    }}
+                  />
+                  <span className="absolute right-1 top-1/2 -translate-y-1/2 z-10">
+                    <RowAttachButton instanceId={instance.id} rowId={rowId} />
+                  </span>
+                </div>
+              );
+            })
+          )}
+        </SwapCell>
 
         {/* Infinite-scroll trigger (Top + Market feeds). Sits below the list so
             the observer fires as the user nears the end and prefetches the next page. */}

@@ -1,7 +1,6 @@
 import type { TurnEndScroll } from '@/lib/turnEndScroll';
-import { prefersReducedMotion } from '@/lib/reducedMotion';
 import type { useChatMessages } from '../../hooks/useChatMessages';
-import type { StreamFollowControls } from './streamFollow';
+import type { StreamFollowControls, TurnStart } from './streamFollow';
 import { findTurnReply, useTurnEnd } from './turnEnd';
 
 type ChatHandle = ReturnType<typeof useChatMessages>;
@@ -18,11 +17,12 @@ export function isTurnOpen({ isLoading, pendingInterrupt }: TurnState): boolean 
 /**
  * The follow policy of both chat surfaces, each over its own scroll engine. A
  * turn the reader starts (a send or steer, an edit, a regenerate or retry)
- * takes them to the end wherever they had scrolled, since their message and
- * the reply land there. A finished turn lands where the "When a reply
- * finishes" preference says. Returns the chat's turn starters with the rejoin
- * built in, so a new send site cannot leave it out. A turn that resumes on its
- * own (an answered approval, a reconnect) is not the reader's to follow.
+ * takes them to it wherever they had scrolled, since their message and the
+ * reply land there; a message sent into a turn still running is a steer. A
+ * finished turn lands where the "When a reply finishes" preference says.
+ * Returns the chat's turn starters with the rejoin built in, so a new send
+ * site cannot leave it out. A turn that resumes on its own (an answered
+ * approval, a reconnect) is not the reader's to follow.
  */
 export function useTranscriptFollow(
   chat: TurnStarters & TurnState,
@@ -35,17 +35,20 @@ export function useTranscriptFollow(
     if (turnEndScroll !== 'reply_start') return;
     const c = getScroller();
     const id = c && findTurnReply(c, messages);
-    if (id) follow.landOnReply(id, prefersReducedMotion() ? 'auto' : 'smooth');
+    if (id) follow.landOnReply(id);
   });
-  const rejoining = <A extends unknown[], R>(start: (...args: A) => R) => (...args: A): R => {
+  const rejoining = <A extends unknown[], R>(kind: Exclude<TurnStart, 'steer'>, start: (...args: A) => R) => (...args: A): R => {
+    // A steer by the send's own test: with only an interrupt pending, what the
+    // reader sends opens a turn of its own.
+    const steer = chat.isLoading;
     const started = start(...args);
-    follow.rejoin();
+    follow.rejoin(steer ? 'steer' : kind);
     return started;
   };
   return {
-    handleSendMessage: rejoining(chat.handleSendMessage),
-    handleEditMessage: rejoining(chat.handleEditMessage),
-    handleRegenerate: rejoining(chat.handleRegenerate),
-    handleRetry: rejoining(chat.handleRetry),
+    handleSendMessage: rejoining('send', chat.handleSendMessage),
+    handleEditMessage: rejoining('restart', chat.handleEditMessage),
+    handleRegenerate: rejoining('restart', chat.handleRegenerate),
+    handleRetry: rejoining('restart', chat.handleRetry),
   };
 }

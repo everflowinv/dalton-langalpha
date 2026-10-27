@@ -99,7 +99,7 @@ function Btn({
     <span
       className={cn(
         'inline-flex shrink-0 items-center gap-[3px] whitespace-nowrap rounded-[4px] border',
-        'px-1.5 py-[3px] text-[6px] leading-none transition-transform duration-150',
+        'px-1.5 py-[3px] text-[6px] leading-none transition-transform duration-press',
         className
       )}
       style={{ ...look, transform: pressed }}
@@ -308,7 +308,7 @@ function ListRow({
 }) {
   return (
     <div
-      className="flex items-start gap-1 rounded-[4px] px-1 py-[4px] transition-colors duration-200"
+      className="flex items-start gap-1 rounded-[4px] px-1 py-[4px] transition-colors duration-quick"
       style={{ background: selected ? 'var(--color-bg-hover)' : undefined }}
     >
       <span className="min-w-0 flex-1">
@@ -463,7 +463,7 @@ export function Inspector({ which, pressEdit }: { which: 'brief' | 'alert'; pres
       <Kicker>
         {[
           t(brief ? 'automation.stateScheduled' : 'automation.stateWatching'),
-          t('agents.allWorkspaces'),
+          t('agents.chiefOfStaff'),
         ].join(' · ')}
       </Kicker>
       <div

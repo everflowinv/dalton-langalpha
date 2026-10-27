@@ -121,9 +121,9 @@ function AutomationAsk() {
   return (
     <Camera shots={ASK_SHOTS} page={PAGE}>
       <div className="flex flex-col" style={PAGE}>
-        {/* the thread's header: back, its place, the agent it runs with, and
-            the file panel's toggle */}
-        <ThreadHeader title={t('agents.allWorkspaces')} agent={names.home}>
+        {/* the thread's header: back, its place, and the file panel's
+            toggle. The place is the Chief of Staff, so no agent tag repeats it */}
+        <ThreadHeader title={names.home}>
           <PanelToggle />
         </ThreadHeader>
         <div

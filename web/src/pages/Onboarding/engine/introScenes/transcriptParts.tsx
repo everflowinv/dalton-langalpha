@@ -37,7 +37,8 @@ export function ThreadHeader({
   children,
 }: {
   title: ReactNode;
-  agent: ReactNode;
+  /** Left out where the title already names the agent, as Home's does. */
+  agent?: ReactNode;
   className?: string;
   children?: ReactNode;
 }) {
@@ -55,7 +56,7 @@ export function ThreadHeader({
       >
         {title}
       </span>
-      <Tag>{agent}</Tag>
+      {agent && <Tag>{agent}</Tag>}
       {children && <span className="ml-auto flex shrink-0">{children}</span>}
     </div>
   );

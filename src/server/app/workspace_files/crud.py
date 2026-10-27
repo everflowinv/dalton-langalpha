@@ -57,6 +57,8 @@ from .file_refs import (
 from src.server.models.workspace import served_from_mirror
 
 from src.server.services.workspace_file_containment import (
+    UTF8_SNIFF_BYTES,
+    FileChangedWhileRead,
     FileTooLargeToServe,
     contained_absolute_path,
     contained_sandbox_paths,
@@ -65,6 +67,7 @@ from src.server.services.workspace_file_containment import (
     is_within,
     normalize_requested_path,
     read_contained_sandbox_file,
+    read_contained_sandbox_range,
 )
 from src.server.services.workspace_files import (
     HOME_NOT_ON_COMPUTER_REASON,
@@ -101,9 +104,14 @@ from ._shared import (
     _present_virtual_file,
     _virtual_file,
     _virtual_files_in_scope,
+    folder_unmoved,
+    http_file_byte_range,
     http_file_bytes,
     http_file_text,
+    may_be_utf8,
+    requested_byte_range,
 )
+from .serve import warm_sandbox
 
 logger = logging.getLogger(__name__)
 
@@ -836,6 +844,208 @@ def _build_download_response(
     return Response(content=content, media_type=mime, headers=headers)
 
 
+# The most one ranged answer carries, so a range of any width holds a bounded
+# slice in memory and a client loops on a short answer. It also bounds a live
+# slice's exec output, so it must not pass EXEC_READ_MAX_BYTES, the most one
+# exec read may carry.
+RANGE_MAX_BYTES = 8 * 1024 * 1024
+
+
+def _range_length(first: int, last: int) -> int:
+    """The most a range is answered with; the file's end can cut it shorter."""
+    return min(last - first + 1, RANGE_MAX_BYTES)
+
+
+def _starts_as_text(head: bytes, size: int) -> bool:
+    """Whether a file whose first bytes are ``head`` might be text, which goes
+    whole so that it is redacted like any other text answer."""
+    return may_be_utf8(head, whole=len(head) >= size)
+
+
+def _range_response(
+    content: bytes,
+    first: int,
+    size: int,
+    etag: str,
+    filename: str,
+    mime: str,
+    disposition: str,
+) -> Response:
+    """A 206 carrying ``content`` from byte ``first`` of a binary file.
+
+    Unredacted, like a streamed download and the signed link: redaction needs
+    the whole body, so only a file whose type and first bytes already rule out
+    text takes a range, and its whole answer would not be redacted either.
+    """
+    return Response(
+        content=content,
+        status_code=206,
+        media_type=mime,
+        headers={
+            "Content-Range": f"bytes {first}-{first + len(content) - 1}/{size}",
+            "Accept-Ranges": "bytes",
+            "ETag": f'"{etag}"',
+            # The reader holds what it fetched. A slice the browser stored would
+            # only be revalidated against a route that answers every range anew.
+            # Each slice is held to the first's exact ETag; re-encoding weakens it.
+            "Cache-Control": "private, no-store, no-transform",
+            "Content-Disposition": content_disposition(
+                filename, disposition=disposition
+            ),
+        },
+    )
+
+
+def _unsatisfiable(size: int) -> HTTPException:
+    return HTTPException(
+        status_code=416,
+        detail="Requested range not satisfiable",
+        headers={"Content-Range": f"bytes */{size}"},
+    )
+
+
+async def _live_range_response(
+    sandbox: Any,
+    candidate: str,
+    work_dir: str,
+    byte_range: tuple[int, int],
+    disposition: str,
+) -> Response | None:
+    """A range of a live file, read in the exec that checks its containment.
+
+    None for a file that goes whole: one that may be text (a binary name linked
+    to a text file, or text under a binary type), and one the sandbox gave no
+    version for, whose size alone cannot tell two versions apart. A 416
+    carries no validator, so it is decided on the size alone.
+    """
+    first, last = byte_range
+    try:
+        sliced = await read_contained_sandbox_range(
+            sandbox,
+            candidate,
+            work_dir=work_dir,
+            offset=first,
+            length=_range_length(first, last),
+        )
+    except FileChangedWhileRead:
+        # The file panel tells this apart from an unreachable sandbox by code.
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "file_changed",
+                "message": "File changed while it was read",
+            },
+            headers={"Retry-After": "1"},
+        ) from None
+    if sliced is None:
+        raise HTTPException(status_code=404, detail="File not found")
+    client_path = _to_client_path(sandbox, sliced.canonical, work_dir)
+    if _is_always_hidden_path(client_path):
+        raise HTTPException(status_code=404, detail="File not found")
+    filename = client_path.split("/")[-1] if client_path else "download"
+    mime = resolve_content_type(filename)
+    if _is_text_content_type(mime):
+        return None
+    if sliced.content is None:
+        raise _unsatisfiable(sliced.size)
+    if sliced.version is None or _starts_as_text(sliced.head, sliced.size):
+        return None
+    record_fs_bytes("download", len(sliced.content))
+    return _range_response(
+        sliced.content,
+        first,
+        sliced.size,
+        f"{sliced.size}-{sliced.version}",
+        filename,
+        mime,
+        disposition,
+    )
+
+
+async def _warm_range_response(
+    workspace: dict[str, Any],
+    workspace_id: str,
+    candidate: str,
+    work_dir: str,
+    byte_range: tuple[int, int],
+    disposition: str,
+) -> tuple[bool, Response | None]:
+    """:func:`_live_range_response` through the session this worker already
+    holds, without a folder hold, as ``(settled, answer)``.
+
+    An acquisition per slice would hold the folder nearly the whole time a
+    reader scrolls, which keeps a rename's settle from ever moving it. So, like
+    the URL-only routes, the read goes unheld and its answer stands only if the
+    folder ``workspace`` names was still this workspace's afterwards. Without a
+    warm session, a sandbox that answers, or that folder, ``settled`` is False
+    and the request goes through the acquisition.
+    """
+    sandbox = warm_sandbox(workspace, workspace_id)
+    if sandbox is None or not sandbox.validate_path(candidate):
+        return False, None
+    try:
+        answer = await _live_range_response(
+            sandbox, candidate, work_dir, byte_range, disposition
+        )
+    except RuntimeError as e:
+        logger.info(
+            f"Warm ranged read failed for workspace {workspace_id}; "
+            f"acquiring instead: {single_line(str(e))}"
+        )
+        return False, None
+    except HTTPException as e:
+        # A workspace moving to another computer keeps its folder's name while
+        # the folder is set aside, so a file missing here may only be away for
+        # the move, which the acquisition answers as a 503 to retry.
+        if e.status_code != 404 and await folder_unmoved(
+            workspace_id, workspace.get("dir_name")
+        ):
+            raise
+        return False, None
+    if not await folder_unmoved(workspace_id, workspace.get("dir_name")):
+        return False, None
+    return True, answer
+
+
+async def _stored_range_response(
+    file_record: dict[str, Any],
+    byte_range: tuple[int, int],
+    filename: str,
+    mime: str,
+    disposition: str,
+    *,
+    user_id: str,
+) -> Response | None:
+    """A range of a mirrored file, reading only that slice and the file's
+    first bytes from storage.
+
+    None for a row that goes whole: one stored inline or without a digest to
+    version it, and one that may be text.
+    """
+    etag = file_record.get("content_hash") or file_record.get("blob_sha256")
+    if not etag:
+        return None
+    first, last = byte_range
+    length = _range_length(first, last)
+    if first == 0 and length >= UTF8_SNIFF_BYTES:
+        read = head_read = await http_file_byte_range(
+            file_record, 0, length, user_id=user_id
+        )
+    else:
+        head_read, read = await asyncio.gather(
+            http_file_byte_range(file_record, 0, UTF8_SNIFF_BYTES, user_id=user_id),
+            http_file_byte_range(file_record, first, length, user_id=user_id),
+        )
+    if read is None or head_read is None:
+        return None
+    content, size = read
+    if not content:
+        raise _unsatisfiable(size)
+    if _starts_as_text(head_read[0][:UTF8_SNIFF_BYTES], size):
+        return None
+    return _range_response(content, first, size, etag, filename, mime, disposition)
+
+
 @router.get("/{workspace_id}/files/download")
 async def download_workspace_file(
     workspace_id: str,
@@ -848,6 +1058,7 @@ async def download_workspace_file(
 ) -> Response:
     """Download raw bytes from the workspace's sandbox, or from DB if stopped."""
     disposition = "attachment" if attachment else "inline"
+    byte_range = requested_byte_range(request.headers)
 
     # --- DALTON-HOOK(workspace-sharing-settings): begin ---
     workspace = await owned_workspace_on_computer(workspace_id, x_user_id, need="read")
@@ -880,15 +1091,23 @@ async def download_workspace_file(
         if is_non_owner_reader and _is_non_owner_blocked_path(normalized_path):
             raise HTTPException(status_code=404, detail="File not found")
 
-        # Parallel: fetch vault secrets + file content in one round-trip window
-        vault_secrets, file_record = await asyncio.gather(
-            get_vault_secrets_for_redaction(workspace["user_id"]),
-            FilePersistenceService.get_file_content(workspace_id, normalized_path),
-        )
+        if byte_range is None:
+            # Parallel: fetch vault secrets + file content in one round-trip window
+            vault_secrets, file_record = await asyncio.gather(
+                get_vault_secrets_for_redaction(workspace["user_id"]),
+                FilePersistenceService.get_file_content(workspace_id, normalized_path),
+            )
+        else:
+            # A ranged answer is never redacted, so the secrets wait for the
+            # row to say whether the range applies.
+            file_record = await FilePersistenceService.get_file_content(
+                workspace_id, normalized_path
+            )
         if not file_record:
             raise HTTPException(status_code=404, detail="File not found")
 
-        # DALTON-HOOK(team-sharing): reject binary file download for non-owner readers
+        # DALTON-HOOK(team-sharing): reject binary file download for non-owner
+        # readers before any Range answer, so ro colleagues never receive a 206
         if is_non_owner_reader and (
             file_record.get("is_binary") or _is_binary(normalized_path)
         ):
@@ -897,10 +1116,26 @@ async def download_workspace_file(
                 detail="Binary file download is not available in read-only mode",
             )
 
-        content = await http_file_bytes(file_record, user_id=workspace["user_id"])
-
         filename = file_record.get("file_name", "download")
         mime = file_record.get("mime_type") or "application/octet-stream"
+
+        # DALTON-HOOK(team-sharing): ro colleagues never take a stored Range
+        # answer; the whole-file rules below keep text redacted and reject binaries
+        if byte_range is not None:
+            if not is_non_owner_reader and not _is_text_content_type(mime):
+                ranged = await _stored_range_response(
+                    file_record,
+                    byte_range,
+                    filename,
+                    mime,
+                    disposition,
+                    user_id=workspace["user_id"],
+                )
+                if ranged is not None:
+                    return ranged
+            vault_secrets = await get_vault_secrets_for_redaction(workspace["user_id"])
+
+        content = await http_file_bytes(file_record, user_id=workspace["user_id"])
 
         if is_non_owner_reader and not (
             _is_text_content_type(mime) or _is_utf8(content)
@@ -917,6 +1152,23 @@ async def download_workspace_file(
 
     # DALTON-HOOK(workspace-sharing-settings): acquire owner sandbox for live download and re-check canonical path
     sandbox_owner_id = str(workspace.get("user_id") or x_user_id)
+    # DALTON-HOOK(team-sharing): ro colleagues never take a live Range answer;
+    # the checks inside the acquisition reject binary files with 403
+    if byte_range is not None and not is_non_owner_reader:
+        candidate = contained_absolute_path(path, work_dir, previous_dirs)
+        if candidate is not None and not _is_text_content_type(
+            resolve_content_type(candidate.rsplit("/", 1)[-1])
+        ):
+            settled, ranged = await _warm_range_response(
+                workspace, workspace_id, candidate, work_dir, byte_range, disposition
+            )
+            if ranged is not None:
+                return ranged
+            if settled:
+                # The file goes whole, which another ranged read would only
+                # find again.
+                byte_range = None
+
     async with AsyncExitStack() as folder:
         # A streamed file is read by path chunk after chunk, so its hold goes
         # with the response; a settle moving the folder between two chunks
@@ -930,6 +1182,19 @@ async def download_workspace_file(
         candidate = contained_absolute_path(path, work_dir, previous_dirs)
         if candidate is None or not sandbox.validate_path(candidate):
             raise HTTPException(status_code=404, detail="File not found")
+        # DALTON-HOOK(team-sharing): ro colleagues never take a live Range answer
+        if (
+            byte_range is not None
+            and not is_non_owner_reader
+            and not _is_text_content_type(
+                resolve_content_type(candidate.rsplit("/", 1)[-1])
+            )
+        ):
+            ranged = await _live_range_response(
+                sandbox, candidate, work_dir, byte_range, disposition
+            )
+            if ranged is not None:
+                return ranged
         try:
             resolved = await read_contained_sandbox_file(
                 sandbox, candidate, work_dir=work_dir

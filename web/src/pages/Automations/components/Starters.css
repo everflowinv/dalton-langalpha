@@ -36,7 +36,7 @@
 
 .automations-ledger-go {
   color: var(--color-text-tertiary);
-  transition: transform 0.12s ease, color 0.12s ease;
+  transition: transform var(--motion-quick) var(--ease-out), color var(--motion-quick) var(--ease-out);
 }
 
 .automations-ledger-row:hover .automations-ledger-go {

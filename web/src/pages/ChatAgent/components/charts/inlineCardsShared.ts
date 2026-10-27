@@ -44,7 +44,7 @@ export const cardStyle: React.CSSProperties = {
   borderRadius: 8,
   padding: '12px 14px',
   cursor: 'pointer',
-  transition: 'border-color 0.15s',
+  transition: 'border-color var(--motion-quick) var(--ease-out)',
   outline: 'none',
   WebkitTapHighlightColor: 'transparent',
   userSelect: 'none',

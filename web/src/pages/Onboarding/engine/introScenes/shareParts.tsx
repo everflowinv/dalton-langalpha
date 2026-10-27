@@ -33,14 +33,14 @@ const xs = 'text-[6px] leading-none';
 function Switch({ on, offFill }: { on: boolean; offFill: string }) {
   return (
     <span
-      className="relative inline-flex h-[10.5px] w-[19px] shrink-0 rounded-full border transition-colors duration-200"
+      className="relative inline-flex h-[10.5px] w-[19px] shrink-0 rounded-full border transition-colors duration-quick"
       style={{
         background: on ? 'var(--color-accent-primary)' : offFill,
         borderColor: on ? 'transparent' : 'var(--color-border-muted)',
       }}
     >
       <span
-        className="absolute left-[0.75px] top-[0.75px] h-[8px] w-[8px] rounded-full bg-white shadow-sm transition-transform duration-200"
+        className="absolute left-[0.75px] top-[0.75px] h-[8px] w-[8px] rounded-full bg-white shadow-sm transition-transform duration-quick"
         style={{ transform: on ? 'translateX(8.5px)' : undefined }}
       />
     </span>

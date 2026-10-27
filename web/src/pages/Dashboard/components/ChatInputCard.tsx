@@ -4,6 +4,7 @@ import ChatInput, { type ChatInputHandle } from '../../../components/ui/chat-inp
 import { useChatInput } from '../hooks/useChatInput';
 import { useIsMobile } from '@/hooks/useIsMobile';
 import { MobileFabChat } from '@/components/ui/mobile-fab-chat';
+import { staggerDelay } from '@/lib/motion';
 
 /**
  * Floating chat input wrapper for dashboard.
@@ -94,7 +95,7 @@ function ChatInputCard() {
                 type="button"
                 data-testid="dashboard-suggestion-bubble"
                 className="dashboard-suggestion-bubble"
-                style={{ animationDelay: `${i * 60}ms` }}
+                style={{ animationDelay: `${staggerDelay(i)}s` }}
                 onMouseDown={(e) => e.preventDefault()}
                 onClick={() => chatInputRef.current?.setValue(label)}
               >

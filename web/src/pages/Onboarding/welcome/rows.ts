@@ -9,7 +9,7 @@
  * of its own. Units that start on the same line (the chips of a wrapped group,
  * a two-column grid) are a row and rise together.
  */
-import { DURATION, EASE_OUT } from '@/lib/motion';
+import { cssEase, DURATION, EASE_OUT } from '@/lib/motion';
 
 /** Between one row and the next, for a card with few rows. */
 const STEP_MS = 40;
@@ -82,7 +82,7 @@ export function riseInRows(root: HTMLElement, lead = 0): void {
   const delays = rowDelays(rows.length, lead);
   const timing = {
     duration: DURATION.reveal * 1000,
-    easing: `cubic-bezier(${EASE_OUT.join(', ')})`,
+    easing: cssEase(EASE_OUT),
     fill: 'backwards' as const,
   };
   rows.forEach((row, i) => {

@@ -1,16 +1,15 @@
-import React, { useState, useEffect, useLayoutEffect, useRef, useMemo, memo } from 'react';
+import React, { useContext, useState, useEffect, useLayoutEffect, useRef, useMemo, memo } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Check, Copy, FileSearch, Info, Pencil, RefreshCw, RotateCcw, StopCircle, ThumbsDown, ThumbsUp } from 'lucide-react';
 import ThumbDownModal from '../ThumbDownModal';
 import FigureEightLoading, { FADE_MS } from '@/components/ui/figure-eight-loading';
 import { AnimatePresence, motion } from '@/lib/framer';
-import { EXIT_TWEEN } from './liveZoneTiming';
-import { visibleParagraphPrefix } from '@/lib/paragraphGate';
+import { DURATION, EASE_COLLAPSE } from '@/lib/motion';
 import { useTranscriptDisplay } from '@/lib/transcriptDisplay';
 import { CitationMetadataProvider } from '../CitationMetadataContext';
 import TextMessageContent, { TurnErrorCard } from '../TextMessageContent';
 import type { StructuredError } from '@/utils/rateLimitError';
-import { countDedupedSources, type CreditPauseState, type MessageProvenance, type ProvenanceRecord, type PTCAgentProposalState, type SubagentTaskRecord, type ToolApprovalState } from '@/types/chat';
+import { countDedupedSources, type CreditPauseState, type MessageProvenance, type PendingToolCallChunk, type ProvenanceRecord, type PTCAgentProposalState, type SubagentTaskRecord, type ToolApprovalState } from '@/types/chat';
 import { TextShimmer } from '@/components/ui/text-shimmer';
 import type { SelectionPreviewShape } from '../SelectionContextPreview';
 import { AttachmentCard, InlineSelectionCards, InlineWidgetDeck } from './attachments';
@@ -19,7 +18,6 @@ import { MessageContentSegments } from './MessageContentSegments';
 import { OverflowCollapse } from './OverflowCollapse';
 import { useMessageActions } from './MessageActionsContext';
 import { useWorkspaceFolders } from '../../contexts/WorkspaceContext';
-import { OpenThoughtContext, openThoughtLength, useArrivalQuiet, useOpenThoughts } from './useArrivalQuiet';
 import { useStableHandler } from '@/hooks/useStableHandler';
 import { useEditDraft, useEditDraftStore } from '../../hooks/utils/editDrafts';
 import { isSteeringUserMessage } from './messagePredicates';
@@ -27,20 +25,62 @@ import { UserBubble } from './UserBubble';
 import { MessageTime } from './MessageTime';
 import { assistantText } from './messageText';
 import { TurnFileCards } from './TurnFileCards';
+import { InPlaceSwap } from '@/components/ui/crossfade';
+import { CollapseClockContext, isFreshSend, playEntrance, turnEndDelays } from './transcriptMotion';
+import { useMessageTyping, useProseReport } from './proseTyping';
 import type { TurnFile } from '../../utils/turnFiles';
-import { projectMessageContent, streamingTextBlockIndex, type ContentProjection } from './contentProjection';
+import { projectMessageContent, type ContentProjection } from './contentProjection';
 import { EMPTY_OBJ } from './types';
 import type { ContentSegmentRecord, FeedbackResult, FoldState, MessageRecord, ToolCallProcessRecord } from './types';
 
 // --- MessageBubble ---
 
-/** Pause without new text before the streaming indicator fades back in. Longer
- *  than a token-cadence gap and the typewriter's own lag, shorter than a tool
- *  call or a thinking pause. */
-const ARRIVAL_QUIET_MS = 700;
+/** How long answer text must sit still before the streaming indicator fades
+ *  back in. Longer than a token-cadence gap, shorter than a tool call or a
+ *  thinking pause. */
+const TEXT_STILL_MS = 700;
+
+/** Whether `busy` has stayed false for `ms`. Turns false the moment it holds. */
+function useStillFor(busy: boolean, ms: number): boolean {
+  const [still, setStill] = useState(!busy);
+  if (busy && still) setStill(false);
+  useEffect(() => {
+    if (busy) return;
+    const timer = setTimeout(() => setStill(true), ms);
+    return () => clearTimeout(timer);
+  }, [busy, ms]);
+  return still;
+}
 
 /** Collapsed bound for long user messages (~10 lines of chat text). */
 const USER_MESSAGE_COLLAPSE_PX = 240;
+
+/** How long Copy shows its check before it turns back. */
+const COPIED_MS = 1500;
+
+/** How far a message just sent rises into place, in px. */
+const SEND_RISE_PX = 8;
+
+/** What a bubble opening on a tool call hands its segments while the call
+ *  streams: it has no segment until the call lands, and its projection
+ *  already carries the call as a preparing activity block. */
+const NO_SEGMENTS: ContentSegmentRecord[] = [];
+
+/** The indicator's row closes in px (never from `auto`: an auto exit inside
+ *  the chat scroller forces a layout a row short and clamps the scroll). */
+const INDICATOR_EXIT = { duration: DURATION.exit, ease: EASE_COLLAPSE };
+
+/** The footer's icon buttons: hover changes the fill, a press presses in. */
+const ACTION_BUTTON = 'press p-1 min-h-7 min-w-7 inline-flex items-center justify-center rounded hover:bg-(--color-bg-elevated)';
+const ICON = 'h-3.5 w-3.5';
+const QUIET_INK = { color: 'var(--color-text-tertiary)' };
+
+/** A reply with no segments, an older message's shape, drawn as one block of
+ *  prose that reports its typing as a segment's would. */
+function SegmentlessText({ messageId, ...props }: { messageId?: string } & Omit<React.ComponentProps<typeof TextMessageContent>, 'onRevealed'>): React.ReactElement | null {
+  const report = useProseReport(messageId, 'content');
+  return <TextMessageContent {...props} onRevealed={report} />;
+}
 
 interface MessageBubbleProps {
   message: MessageRecord;
@@ -119,16 +159,18 @@ export const MessageBubble = memo(function MessageBubble({ message, contentProje
     if (copyTimerRef.current) clearTimeout(copyTimerRef.current);
   }, []);
 
-  // Feedback state
-  const [feedbackRating, setFeedbackRating] = useState<string | null>(null);
-  const [showThumbDownModal, setShowThumbDownModal] = useState(false);
-
-  // Seed from the turn's stored rating. Data, not a lookup callback: the old
-  // `getFeedbackForMessage` identity changed on every load/submit and re-seeded
-  // EVERY mounted bubble; `feedback` changes only for the turn it belongs to.
-  useEffect(() => {
+  // Feedback state, seeded from the turn's stored rating. Data, not a lookup
+  // callback: the old `getFeedbackForMessage` identity changed on every
+  // load/submit and re-seeded EVERY mounted bubble; `feedback` changes only for
+  // the turn it belongs to. Seeded in render, so a rating loaded with the
+  // thread is drawn rather than crossfaded in a commit later.
+  const [feedbackRating, setFeedbackRating] = useState<string | null>(() => (isAssistant && feedback ? feedback.rating : null));
+  const [seededFrom, setSeededFrom] = useState(feedback);
+  if (seededFrom !== feedback) {
+    setSeededFrom(feedback);
     if (isAssistant && feedback) setFeedbackRating(feedback.rating);
-  }, [isAssistant, feedback]);
+  }
+  const [showThumbDownModal, setShowThumbDownModal] = useState(false);
 
   const handleThumbUpClick = async () => {
     if (!onThumbUp || turnIndex === null) return;
@@ -162,18 +204,39 @@ export const MessageBubble = memo(function MessageBubble({ message, contentProje
   // it hides every other turn's controls while the session loads.
   const showActions = canShowActions && !turnLive && !isLoading;
 
-  // The stream stamps `arrivalSeq` on every landed reply text chunk, whatever
-  // the typewriter has shown of it. The streaming indicator hides while it
-  // climbs and shows in the pauses. Thought text counts only while its row is
-  // open: folded, it streams out of sight, and an indicator that hid for it
-  // blinked off and on with every burst of thinking. Tool calls never count,
-  // being written or running: the indicator keeps going under their rows.
+  // The streaming indicator stays under the turn's last bubble for as long as
+  // the turn runs. `isStreaming` is per model call and drops on any
+  // content-free finish but a tool call's, so an indicator on it left the turn
+  // looking finished between two calls.
+  const showIndicator = isAssistant && isTurnTail && turnLive;
+  // Answer text typing out is its own sign the turn is alive, so the indicator
+  // fades out for it, and back in once the text has sat still for
+  // TEXT_STILL_MS: a reply that pauses mid-paragraph still reads as working,
+  // and the gaps between bursts don't blink it. Thoughts and tool calls never
+  // hide it. Paragraph delivery shows text whole, so a paragraph held back is a
+  // pause, not typing.
+  const typing = useMessageTyping(message.id as string, showIndicator);
+  // Only a reply's prose holds its turn running while it types, so only a
+  // reply reports its typing.
+  const replyId = isAssistant ? message.id as string : undefined;
   const { streamingMode } = useTranscriptDisplay();
-  const arrivalSeq = (message.arrivalSeq as number | undefined) ?? 0;
-  const [openThoughts, markOpenThought] = useOpenThoughts();
-  const thoughtSeq = openThoughtLength(message.reasoningProcesses as Record<string, Record<string, unknown>> | undefined, openThoughts);
-  const thoughtQuiet = useArrivalQuiet(thoughtSeq, isStreaming, ARRIVAL_QUIET_MS);
-  const arrivalQuiet = useArrivalQuiet(arrivalSeq, isStreaming, ARRIVAL_QUIET_MS) && thoughtQuiet;
+  const textStill = useStillFor(typing && streamingMode !== 'paragraph', TEXT_STILL_MS);
+  // Whether this bubble has drawn its turn running, so what the end brings
+  // (the deck, the Sources pill) arrives in order rather than being there.
+  const [sawLive, setSawLive] = useState(!!turnLive);
+  if (!sawLive && turnLive) setSawLive(true);
+  // The Sources pill is there, faded, while the turn runs, and arrives in its
+  // ending once the work above has folded (see turnEndDelays). Played from
+  // the settle itself: a regenerate takes it away through its transition, and
+  // a bubble drawn settled is simply there.
+  const pillRef = useRef<HTMLDivElement>(null);
+  const pillWasLive = useRef(!!turnLive);
+  const collapseClock = useContext(CollapseClockContext);
+  useLayoutEffect(() => {
+    const settled = pillWasLive.current && !turnLive;
+    pillWasLive.current = !!turnLive;
+    return settled && pillRef.current ? playEntrance(pillRef.current, 0, turnEndDelays(collapseClock).sources) : undefined;
+  }, [turnLive, collapseClock]);
 
   // Provenance count for the Sources pill, deduped by (source_type,
   // identifier): the same URL fetched twice in one turn counts once. It counts
@@ -242,6 +305,26 @@ export const MessageBubble = memo(function MessageBubble({ message, contentProje
       if (document.activeElement === el) draftStore.markFocus(key);
     };
   }, [isEditing, draftStore, turnIndex, originalText, messageId]);
+
+  // A message just sent rises into place under the reader's eye; one drawn
+  // from history, a replay or a remount is simply there (see `isFreshSend`).
+  // The column moves rather than the row, so the row's box, which the scroll
+  // pin measures, is final from the first frame.
+  const columnRef = useRef<HTMLDivElement>(null);
+  const [enterAsSent] = useState(() => isUser && isFreshSend(message.sentHere === true, message.timestamp));
+  useLayoutEffect(() => (
+    enterAsSent && columnRef.current ? playEntrance(columnRef.current, SEND_RISE_PX) : undefined
+  ), [enterAsSent]);
+  // Opening and closing the edit box swaps the column's content in place;
+  // the new content fades in rather than snapping. Not on a mount, so a
+  // reload that reopens the box draws it as it was.
+  const shownEditing = useRef(isEditing);
+  useLayoutEffect(() => {
+    if (shownEditing.current === isEditing) return;
+    shownEditing.current = isEditing;
+    return columnRef.current ? playEntrance(columnRef.current) : undefined;
+  }, [isEditing]);
+
   const handleCopy = useStableHandler(() => {
     const text = assistantText(message);
     // Confirm only after the write lands (it can reject when the document
@@ -250,7 +333,7 @@ export const MessageBubble = memo(function MessageBubble({ message, contentProje
     navigator.clipboard.writeText(text).then(() => {
       setCopied(true);
       if (copyTimerRef.current) clearTimeout(copyTimerRef.current);
-      copyTimerRef.current = setTimeout(() => setCopied(false), 2000);
+      copyTimerRef.current = setTimeout(() => setCopied(false), COPIED_MS);
     }).catch(() => {});
   });
 
@@ -319,10 +402,10 @@ export const MessageBubble = memo(function MessageBubble({ message, contentProje
     {isUser && onEditMessage && !isSteering && (
       <button
         onClick={handleStartEdit}
-        className="p-1 min-h-7 min-w-7 inline-flex items-center justify-center rounded transition-colors hover:bg-(--color-bg-elevated)"
+        className={ACTION_BUTTON}
         title={t('chat.actions.editMessage')}
       >
-        <Pencil className="h-3.5 w-3.5" style={{ color: 'var(--color-text-tertiary)' }} />
+        <Pencil className={ICON} style={QUIET_INK} />
       </button>
     )}
 
@@ -330,37 +413,42 @@ export const MessageBubble = memo(function MessageBubble({ message, contentProje
         Then assistant-only: ThumbUp -> ThumbDown -> Regenerate/Retry */}
     <button
       onClick={handleCopy}
-      className="p-1 min-h-7 min-w-7 inline-flex items-center justify-center rounded transition-colors hover:bg-(--color-bg-elevated)"
+      className={ACTION_BUTTON}
       title={copied ? t('chat.actions.copied') : t('chat.actions.copyMessage')}
     >
-      {copied
-        ? <Check className="h-3.5 w-3.5" style={{ color: 'var(--color-profit)' }} />
-        : <Copy className="h-3.5 w-3.5" style={{ color: 'var(--color-text-tertiary)' }} />
-      }
+      {/* The check is ink, not a gain: copying is done, not good news. */}
+      <InPlaceSwap
+        swapped={copied}
+        scale
+        from={<Copy className={ICON} style={QUIET_INK} />}
+        to={<Check className={ICON} style={{ color: 'var(--color-text-primary)' }} />}
+      />
     </button>
     {isAssistant && !hasError && onThumbUp && (
       <button
         onClick={handleThumbUpClick}
-        className="p-1 min-h-7 min-w-7 inline-flex items-center justify-center rounded transition-colors hover:bg-(--color-bg-elevated)"
+        className={ACTION_BUTTON}
         title={feedbackRating === 'thumbs_up' ? t('chat.actions.removeRating') : t('chat.actions.goodResponse')}
       >
-        <ThumbsUp
-          className="h-3.5 w-3.5"
-          fill={feedbackRating === 'thumbs_up' ? 'currentColor' : 'none'}
-          style={{ color: feedbackRating === 'thumbs_up' ? 'var(--color-profit)' : 'var(--color-text-tertiary)' }}
+        <InPlaceSwap
+          swapped={feedbackRating === 'thumbs_up'}
+          scale
+          from={<ThumbsUp className={ICON} style={QUIET_INK} />}
+          to={<ThumbsUp className={ICON} fill="currentColor" style={{ color: 'var(--color-profit)' }} />}
         />
       </button>
     )}
     {isAssistant && !hasError && onThumbDown && (
       <button
         onClick={() => setShowThumbDownModal(true)}
-        className="p-1 min-h-7 min-w-7 inline-flex items-center justify-center rounded transition-colors hover:bg-(--color-bg-elevated)"
+        className={ACTION_BUTTON}
         title={feedbackRating === 'thumbs_down' ? t('chat.actions.feedbackSubmitted') : t('chat.actions.reportIssue')}
       >
-        <ThumbsDown
-          className="h-3.5 w-3.5"
-          fill={feedbackRating === 'thumbs_down' ? 'currentColor' : 'none'}
-          style={{ color: feedbackRating === 'thumbs_down' ? 'var(--color-loss)' : 'var(--color-text-tertiary)' }}
+        <InPlaceSwap
+          swapped={feedbackRating === 'thumbs_down'}
+          scale
+          from={<ThumbsDown className={ICON} style={QUIET_INK} />}
+          to={<ThumbsDown className={ICON} fill="currentColor" style={{ color: 'var(--color-loss)' }} />}
         />
       </button>
     )}
@@ -372,19 +460,19 @@ export const MessageBubble = memo(function MessageBubble({ message, contentProje
     {isAssistant && (!hasError || unloaded) && onRegenerate && isTurnTail && canRegenerate && (
       <button
         onClick={() => onRegenerate(messageId)}
-        className="p-1 min-h-7 min-w-7 inline-flex items-center justify-center rounded transition-colors hover:bg-(--color-bg-elevated)"
+        className={ACTION_BUTTON}
         title={t('chat.actions.regenerate')}
       >
-        <RefreshCw className="h-3.5 w-3.5" style={{ color: 'var(--color-text-tertiary)' }} />
+        <RefreshCw className={ICON} style={QUIET_INK} />
       </button>
     )}
     {isAssistant && hasError && !unloaded && onRetry && isLatestReply && (
       <button
         onClick={onRetry}
-        className="p-1 min-h-7 min-w-7 inline-flex items-center justify-center rounded transition-colors hover:bg-(--color-bg-elevated)"
+        className={ACTION_BUTTON}
         title={t('chat.actions.retry')}
       >
-        <RotateCcw className="h-3.5 w-3.5" style={{ color: 'var(--color-text-tertiary)' }} />
+        <RotateCcw className={ICON} style={QUIET_INK} />
       </button>
     )}
     {!isUser && shownTime}
@@ -406,13 +494,14 @@ export const MessageBubble = memo(function MessageBubble({ message, contentProje
         </TextShimmer>
       ) : (
       <>
-      {/* Render content segments in chronological order */}
-      {(message.contentSegments as ContentSegmentRecord[] | undefined) && (message.contentSegments as ContentSegmentRecord[]).length > 0 ? (
+      {/* Render content segments in chronological order. A call streaming
+          before any of them draws too, or the turn's first call would show
+          nothing until it landed. */}
+      {((message.contentSegments as ContentSegmentRecord[] | undefined)?.length ?? 0) > 0 || projection.preparingToolCall !== null ? (
         <CitationMetadataProvider toolCallProcesses={(message.toolCallProcesses as Record<string, Record<string, unknown>>) || EMPTY_OBJ}>
-        <OpenThoughtContext value={markOpenThought}>
         <MessageContentSegments
           contentProjection={projection}
-          segments={message.contentSegments as ContentSegmentRecord[]}
+          segments={(message.contentSegments as ContentSegmentRecord[] | undefined)?.length ? message.contentSegments as ContentSegmentRecord[] : NO_SEGMENTS}
           reasoningProcesses={(message.reasoningProcesses as Record<string, Record<string, unknown>>) || EMPTY_OBJ}
           toolCallProcesses={(message.toolCallProcesses as Record<string, ToolCallProcessRecord>) || EMPTY_OBJ}
           todoListProcesses={(message.todoListProcesses as Record<string, Record<string, unknown>>) || EMPTY_OBJ}
@@ -420,7 +509,7 @@ export const MessageBubble = memo(function MessageBubble({ message, contentProje
           userQuestions={(message.userQuestions as Record<string, Record<string, unknown>>) || EMPTY_OBJ}
           workspaceProposals={(message.workspaceProposals as Record<string, Record<string, unknown>>) || EMPTY_OBJ}
           questionProposals={(message.questionProposals as Record<string, Record<string, unknown>>) || EMPTY_OBJ}
-          pendingToolCallChunks={(message.pendingToolCallChunks as Record<string, Record<string, unknown>>) || EMPTY_OBJ}
+          pendingToolCallChunks={(message.pendingToolCallChunks as Record<string, PendingToolCallChunk> | undefined) ?? EMPTY_OBJ}
           isStreaming={message.isStreaming as boolean}
           fold={fold}
           isTurnTail={isTurnTail}
@@ -432,13 +521,14 @@ export const MessageBubble = memo(function MessageBubble({ message, contentProje
           htmlWidgetProcesses={(message.htmlWidgetProcesses as Record<string, Record<string, unknown>>) || EMPTY_OBJ}
           readOnly={readOnly}
           dispatcherContext={dispatcherContext}
+          messageId={replyId}
         />
-        </OpenThoughtContext>
         </CitationMetadataProvider>
       ) : (
         // Fallback for messages without segments (backward compatibility) - main chat shows text only
         ((message.contentType as string) === 'text' || !(message.contentType as string)) && (
-          <TextMessageContent
+          <SegmentlessText
+            messageId={replyId}
             content={message.content as string}
             isStreaming={message.isStreaming as boolean}
             onOpenFile={onOpenFile}
@@ -457,52 +547,33 @@ export const MessageBubble = memo(function MessageBubble({ message, contentProje
         </div>
       )}
 
-      {/* Streaming indicator. Stays mounted for the whole stream and only
-          fades: while text is landing it is invisible (the text is the
-          liveness signal), in a pause it fades back in so the turn never
-          looks finished. Fading rather than unmounting keeps its row, so
-          the transcript bottom does not hop by a line on every pause. */}
+      {/* Streaming indicator, for the whole turn (see `showIndicator`). While
+          answer text types it fades rather than unmounts, so its row stays
+          and the transcript bottom does not hop by a line on every pause. */}
       <AnimatePresence initial={false}>
-      {isStreaming && (() => {
+      {showIndicator && (() => {
         const hasContent = projection.blocks.length > 0 || (message.content as string)?.trim();
-        // Arriving bytes are not visible progress while paragraph delivery
-        // is holding the tail back. The question is whether anything that
-        // arrived is unpainted, not whether the whole bubble is blank:
-        // requiring every block to be wholly invisible text went false for
-        // the rest of the reply the moment the first paragraph landed, and
-        // was never true at all once the turn called a tool, so the
-        // indicator vanished and a reply mid-paragraph looked finished.
-        // Only the block still being written is held. Asking every block
-        // counted a sentence a tool call followed, which shows whole, and
-        // held the indicator up through the rest of the turn.
-        const streamingText = projection.blocks[streamingTextBlockIndex(projection.blocks)];
-        const tail = streamingText?.type === 'text' ? streamingText.segment.content || '' : '';
-        const waitingForParagraph = streamingMode === 'paragraph'
-          && visibleParagraphPrefix(tail).length < tail.length;
-        const quiet = arrivalQuiet || waitingForParagraph;
         const size = isMobile ? 20 : 24;
         // The gap above the glyph is padding inside the row, not a margin:
         // content that renders zero-height (text still held back, a block
         // with nothing to show yet) lets a margin collapse out through the
         // bubble's top, and the bubble then jumps up as the first visible
-        // content lands. The row leaves in px, never from `auto`: an auto
-        // exit inside the chat scroller forces a layout a row short and
-        // clamps the scroll.
+        // content lands.
         const gap = hasContent ? 12 : 0;
         return (
           <motion.div
             key="streaming-indicator"
             className="transition-opacity"
-            style={{ opacity: quiet ? 1 : 0, transitionDuration: `${FADE_MS}ms`, height: size + gap, paddingTop: gap, overflow: 'hidden' }}
-            exit={{ height: 0, paddingTop: 0, opacity: 0, transition: EXIT_TWEEN }}
-            aria-hidden={!quiet}
+            // eslint-disable-next-line no-restricted-syntax -- the dots' own fade, shared with their settle timer, which no token names
+            style={{ opacity: textStill ? 1 : 0, transitionDuration: `${FADE_MS}ms`, height: size + gap, paddingTop: gap, overflow: 'hidden' }}
+            exit={{ height: 0, paddingTop: 0, opacity: 0, transition: INDICATOR_EXIT }}
+            aria-hidden={!textStill}
             data-testid="streaming-indicator"
             // What the welcome flow's pending mark becomes in its hand-off
             // (welcome/handoff.css), named only while that runs.
             data-handoff="agent"
-            data-quiet={quiet ? 'true' : 'false'}
           >
-            <FigureEightLoading active={quiet} className={`${isMobile ? 'h-[20px]' : 'h-[24px]'} text-(--color-accent-primary)`} />
+            <FigureEightLoading active={textStill} className={`${isMobile ? 'h-[20px]' : 'h-[24px]'} text-(--color-accent-primary)`} />
           </motion.div>
         );
       })()}
@@ -518,7 +589,7 @@ export const MessageBubble = memo(function MessageBubble({ message, contentProje
     >
 
       {/* Message content column -- bubble + standalone attachment cards */}
-      <div className={isUser ? (isEditing && isMobile ? 'w-full' : 'max-w-[80%]') + ' flex flex-col items-end gap-2' : 'w-full min-w-0'}>
+      <div ref={columnRef} className={isUser ? (isEditing && isMobile ? 'w-full' : 'max-w-[80%]') + ' flex flex-col items-end gap-2' : 'w-full min-w-0'}>
 
         {/* ===== EDIT MODE (user messages) ===== */}
         {isEditing && isUser ? (
@@ -532,11 +603,13 @@ export const MessageBubble = memo(function MessageBubble({ message, contentProje
               </div>
             )}
 
-            {/* Bordered textarea container */}
+            {/* The box the composer is: a neutral edge it takes the accent
+                on for its field while focused (owns-its-edge), so the field
+                draws no edge of its own inside it. */}
             <div
-              className="rounded-xl px-4 py-3"
+              className="owns-its-edge rounded-xl px-4 py-3 transition-[border-color,box-shadow] ease-out"
               style={{
-                border: '2px solid var(--color-accent-overlay)',
+                border: '1px solid var(--color-border-input)',
                 backgroundColor: 'transparent',
                 color: 'var(--color-text-primary)',
               }}
@@ -566,24 +639,24 @@ export const MessageBubble = memo(function MessageBubble({ message, contentProje
               <div className={`flex gap-2 shrink-0 ${isMobile ? 'justify-end' : ''}`}>
                 <button
                   onClick={handleCancelEdit}
-                  className="px-4 py-1.5 rounded-full text-sm font-medium transition-colors"
+                  className="press px-4 py-1.5 rounded-full text-sm font-medium"
                   style={{
                     color: 'var(--color-text-primary)',
                     border: '1px solid var(--color-border-muted)',
                   }}
                 >
-                  Cancel
+                  {t('common.cancel')}
                 </button>
                 <button
                   onClick={handleSubmitEdit}
                   disabled={isLoading}
-                  className="px-4 py-1.5 rounded-full text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                  className="press px-4 py-1.5 rounded-full text-sm font-medium disabled:opacity-50 disabled:cursor-not-allowed"
                   style={{
                     color: 'var(--color-btn-primary-text)',
                     backgroundColor: 'var(--color-btn-primary-bg)',
                   }}
                 >
-                  Save
+                  {t('common.save')}
                 </button>
               </div>
             </div>
@@ -615,6 +688,7 @@ export const MessageBubble = memo(function MessageBubble({ message, contentProje
         {showTurnFiles && (
           <TurnFileCards
             files={turnFiles}
+            entering={sawLive}
             onOpenFile={onOpenFile}
             onDownloadFile={onDownloadFile}
             onReveal={() => onRevealFiles?.(message.id as string)}
@@ -655,14 +729,19 @@ export const MessageBubble = memo(function MessageBubble({ message, contentProje
           <div className={`flex items-center gap-2 ${showTurnFiles ? 'mt-3' : 'mt-1'}`}>
             {sourceCount > 0 && !isSubagentView && (
             <div
-              className="transition-opacity duration-200"
-              style={{ opacity: turnLive ? 0 : 1 }}
+              ref={pillRef}
+              style={{
+                opacity: turnLive ? 0 : 1,
+                // Only leaving is a transition; arriving is the entrance above,
+                // whose first frame holds it out through the delay.
+                transition: turnLive ? 'opacity var(--motion-exit) var(--ease-out)' : 'none',
+              }}
               inert={turnLive}
             >
               <button
                 type="button"
                 onClick={() => onOpenSources?.(message.id as string)}
-                className="inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium transition-colors"
+                className="press inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium"
                 style={{
                   backgroundColor: 'var(--color-bg-elevated)',
                   color: 'var(--color-text-secondary)',

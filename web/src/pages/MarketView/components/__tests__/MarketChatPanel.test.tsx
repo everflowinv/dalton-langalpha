@@ -152,7 +152,7 @@ import { userLocalStorage } from '@/lib/userStorage';
 
 type PanelProps = React.ComponentProps<typeof MarketChatPanel>;
 
-/** All workspaces, which runs in Home's row. */
+/** The Chief of Staff, which runs in Home's row. */
 const ALL: Partial<PanelProps> = { scope: 'all', activeWorkspaceId: 'home-ws' };
 
 const baseProps: PanelProps = {
@@ -216,6 +216,26 @@ function renderPanel(override: Partial<PanelProps> = {}, entry = '/market') {
 const observers: { cb: ResizeObserverCallback; targets: Element[] }[] = [];
 const scrollTo = vi.fn();
 
+// The follow glides, one write per animation frame, so the frames are run by
+// hand: `glide()` runs them until it has landed.
+const frameQueue = new Map<number, FrameRequestCallback>();
+let frameId = 0;
+let frameClock = 0;
+function glideOneFrame() {
+  frameClock += 1000 / 60;
+  const due = [...frameQueue.values()];
+  frameQueue.clear();
+  for (const cb of due) cb(frameClock);
+}
+function glide() {
+  for (let i = 0; i < 240 && frameQueue.size; i++) {
+    frameClock += 1000 / 60;
+    const due = [...frameQueue.values()];
+    frameQueue.clear();
+    for (const cb of due) cb(frameClock);
+  }
+}
+
 class CapturingResizeObserver {
   targets: Element[] = [];
   constructor(cb: ResizeObserverCallback) {
@@ -239,9 +259,9 @@ function renderTranscript(override: Partial<PanelProps> = {}) {
     scrollHeight: { get: () => layout.height, configurable: true },
     clientHeight: { get: () => 400, configurable: true },
   });
-  // A follow moves at once; its scroll event comes with the next frame.
+  // A write moves the view at once; its scroll event comes with the next frame.
   scrollTo.mockImplementation(({ top: to }: ScrollToOptions) => {
-    layout.top = to!;
+    layout.top = Math.max(0, Math.min(to!, layout.height - 400));
   });
   const grow = (to: number) => {
     layout.height = to;
@@ -284,7 +304,13 @@ describe('MarketChatPanel', () => {
     const originalScrollTo = HTMLElement.prototype.scrollTo;
     beforeEach(() => {
       observers.length = 0;
+      frameQueue.clear();
       vi.stubGlobal('ResizeObserver', CapturingResizeObserver);
+      vi.stubGlobal('requestAnimationFrame', (cb: FrameRequestCallback) => {
+        frameQueue.set(++frameId, cb);
+        return frameId;
+      });
+      vi.stubGlobal('cancelAnimationFrame', (id: number) => { frameQueue.delete(id); });
       HTMLElement.prototype.scrollTo = scrollTo as HTMLElement['scrollTo'];
     });
     afterEach(() => {
@@ -296,48 +322,60 @@ describe('MarketChatPanel', () => {
       h.isLoading = true;
       const { rerender, container, layout, grow, nextFrame, userScroll } = renderTranscript();
 
+      // Opening on the end is not motion: it lands at once.
       grow(1000);
       expect(scrollTo).toHaveBeenLastCalledWith({ top: 600 });
       nextFrame();
 
-      // A chart lands between a follow and its scroll event.
+      // Growth is glided after, over frames rather than in one step.
       grow(1100);
+      glideOneFrame();
+      expect(layout.top).toBeGreaterThan(600);
+      expect(layout.top).toBeLessThan(700);
+      // A chart lands mid-glide: the glide goes on to the new end.
       layout.height = 1400;
       nextFrame();
       grow(1400);
-      expect(scrollTo).toHaveBeenLastCalledWith({ top: 1000 });
+      glide();
+      expect(layout.top).toBe(1000);
       nextFrame();
 
       // A notch up, still inside the band a downward scroll rejoins at.
       scrollTo.mockClear();
       userScroll(990);
       grow(1500);
+      glide();
       expect(scrollTo).not.toHaveBeenCalled();
 
       userScroll(1050);
       grow(1600);
-      expect(scrollTo).toHaveBeenLastCalledWith({ top: 1200 });
+      glide();
+      expect(layout.top).toBe(1200);
 
-      // A notch up before that follow's scroll event arrives.
-      scrollTo.mockClear();
-      userScroll(1190);
+      // A notch up while the glide is still under way.
       grow(1700);
+      glideOneFrame();
+      scrollTo.mockClear();
+      userScroll(layout.top - 10);
+      glide();
       expect(scrollTo).not.toHaveBeenCalled();
 
-      // Back at the end, the turn settles with one more line, followed in
+      // Back at the end, the turn settles with one more line, followed from
       // the commit that ends it.
       userScroll(1300);
       layout.height = 1750;
       h.isLoading = false;
       rerender({ quickQueries: [] });
-      expect(scrollTo).toHaveBeenLastCalledWith({ top: 1350 });
+      glide();
+      expect(layout.top).toBe(1350);
       nextFrame();
 
       // The reply's actions and the text the typewriter still held land
       // after the turn has ended, and are followed too.
       grow(1750);
       grow(1800);
-      expect(scrollTo).toHaveBeenLastCalledWith({ top: 1400 });
+      glide();
+      expect(layout.top).toBe(1400);
       nextFrame();
 
       // A row the reader opens at the end of the settled turn stays where it
@@ -345,11 +383,13 @@ describe('MarketChatPanel', () => {
       scrollTo.mockClear();
       fireEvent.pointerDown(container);
       grow(2000);
+      glide();
       expect(scrollTo).not.toHaveBeenCalled();
     });
 
     it('stops following the end of a turn once the transcript has been quiet', () => {
-      vi.useFakeTimers();
+      // The settle window's timers only: the frames stay the test's own.
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
       try {
         h.isLoading = true;
         const { rerender, layout, grow, nextFrame } = renderTranscript();
@@ -360,10 +400,12 @@ describe('MarketChatPanel', () => {
         rerender({ quickQueries: [] });
         nextFrame();
 
+        glide();
         scrollTo.mockClear();
         act(() => { vi.advanceTimersByTime(1600); });
         grow(1100);
         grow(1300);
+        glide();
         expect(scrollTo).not.toHaveBeenCalled();
       } finally {
         vi.useRealTimers();
@@ -371,7 +413,7 @@ describe('MarketChatPanel', () => {
     });
 
     it('takes a reader who scrolled up to the end when they send, and follows the reply', () => {
-      const { rerender, grow, nextFrame, userScroll } = scrolledUpReader();
+      const { rerender, layout, grow, nextFrame, userScroll } = scrolledUpReader();
 
       h.handleSendMessage.mockImplementationOnce(() => {
         h.isLoading = true;
@@ -380,22 +422,26 @@ describe('MarketChatPanel', () => {
         m: string, att: unknown[], cmds: unknown[], opts: unknown,
       ) => void;
       act(() => onSend('and the next quarter?', [], [], {}));
-      expect(scrollTo).toHaveBeenLastCalledWith({ top: 600 });
+      glide();
+      expect(layout.top).toBe(600);
       nextFrame();
 
       // Their message lands, then the reply grows under it.
       rerender({});
       grow(1150);
-      expect(scrollTo).toHaveBeenLastCalledWith({ top: 750 });
+      glide();
+      expect(layout.top).toBe(750);
       nextFrame();
       grow(1400);
-      expect(scrollTo).toHaveBeenLastCalledWith({ top: 1000 });
+      glide();
+      expect(layout.top).toBe(1000);
       nextFrame();
 
       // The follow keeps its rules: a scroll up leaves it again.
       scrollTo.mockClear();
       userScroll(800);
       grow(1500);
+      glide();
       expect(scrollTo).not.toHaveBeenCalled();
     });
 
@@ -404,9 +450,10 @@ describe('MarketChatPanel', () => {
       ['a regenerate', 'onRegenerate', ['m1']],
       ['a retry', 'onRetry', []],
     ])('takes a reader who scrolled up to the end on %s', (_name, action, args) => {
-      scrolledUpReader();
+      const { layout } = scrolledUpReader();
       act(() => (ml.actions![action] as (...a: unknown[]) => void)(...args));
-      expect(scrollTo).toHaveBeenLastCalledWith({ top: 600 });
+      glide();
+      expect(layout.top).toBe(600);
     });
 
     describe('when a reply finishes', () => {
@@ -432,7 +479,8 @@ describe('MarketChatPanel', () => {
         container.querySelector<HTMLElement>('[data-message-id="a2"] [data-reply-start]')!.getBoundingClientRect =
           () => ({ top: layout.replyAt - layout.top }) as DOMRect;
         grow(1600);
-        expect(scrollTo).toHaveBeenLastCalledWith({ top: 1200 });
+        glide();
+        expect(layout.top).toBe(1200);
         nextFrame();
         scrollTo.mockClear();
         return { container, layout, grow, nextFrame, userScroll, setLoading };
@@ -443,7 +491,11 @@ describe('MarketChatPanel', () => {
         const { container, layout, grow, nextFrame, setLoading } = streamTurn();
         layout.replyAt = 900;
         setLoading(false);
-        expect(scrollTo).toHaveBeenLastCalledWith({ top: 884, behavior: 'smooth' });
+        glideOneFrame();
+        expect(layout.top).toBeLessThan(1200);
+        expect(layout.top).toBeGreaterThan(884);
+        glide();
+        expect(layout.top).toBe(884);
         nextFrame();
 
         // The settled turn folds its work away above the reply: the line is held
@@ -468,6 +520,7 @@ describe('MarketChatPanel', () => {
         const { layout, grow, nextFrame, setLoading } = streamTurn();
         layout.replyAt = 900;
         setLoading(false);
+        glide();
         nextFrame();
         h.handleSendMessage.mockImplementationOnce(() => {
           h.isLoading = true;
@@ -476,11 +529,13 @@ describe('MarketChatPanel', () => {
           m: string, att: unknown[], cmds: unknown[], opts: unknown,
         ) => void;
         act(() => onSend('and the next quarter?', [], [], {}));
-        expect(scrollTo).toHaveBeenLastCalledWith({ top: 1200 });
+        glide();
+        expect(layout.top).toBe(1200);
         nextFrame();
         setLoading(true);
         grow(1700);
-        expect(scrollTo).toHaveBeenLastCalledWith({ top: 1300 });
+        glide();
+        expect(layout.top).toBe(1300);
       });
 
       it('lands at once for a reader who prefers reduced motion', () => {
@@ -489,7 +544,8 @@ describe('MarketChatPanel', () => {
         const { layout, setLoading } = streamTurn();
         layout.replyAt = 900;
         setLoading(false);
-        expect(scrollTo).toHaveBeenLastCalledWith({ top: 884, behavior: 'auto' });
+        expect(scrollTo).toHaveBeenLastCalledWith({ top: 884 });
+        expect(frameQueue.size).toBe(0);
       });
 
       it('moves nothing when the reply fits on screen', () => {
@@ -497,6 +553,7 @@ describe('MarketChatPanel', () => {
         const { layout, setLoading } = streamTurn();
         layout.replyAt = 1300;
         setLoading(false);
+        glide();
         expect(scrollTo).not.toHaveBeenCalled();
         expect(layout.top).toBe(1200);
       });
@@ -505,6 +562,7 @@ describe('MarketChatPanel', () => {
         const { layout, setLoading } = streamTurn();
         layout.replyAt = 900;
         setLoading(false);
+        glide();
         expect(scrollTo).not.toHaveBeenCalled();
         expect(layout.top).toBe(1200);
       });
@@ -515,6 +573,7 @@ describe('MarketChatPanel', () => {
         layout.replyAt = 900;
         userScroll(800);
         setLoading(false);
+        glide();
         expect(scrollTo).not.toHaveBeenCalled();
         expect(layout.top).toBe(800);
       });
@@ -740,7 +799,7 @@ describe('MarketChatPanel', () => {
       expect((h.handleSendMessage.mock.calls[0][3] as Record<string, unknown>).subagentsAllowed).toBeUndefined();
     });
 
-    it('rides an All workspaces send too', async () => {
+    it('rides a Chief of Staff send too', async () => {
       h.threadId = '__default__';
       renderPanel(ALL);
       await vi.waitFor(() => expect(ci.props).not.toBeNull());
@@ -759,7 +818,7 @@ describe('MarketChatPanel', () => {
     expect(screen.getByText(/no longer in the chat/i)).toBeInTheDocument();
   });
 
-  describe('All workspaces', () => {
+  describe('the Chief of Staff', () => {
     it("runs on Home's row", async () => {
       renderPanel(ALL);
       await screen.findByTestId('chat-input');

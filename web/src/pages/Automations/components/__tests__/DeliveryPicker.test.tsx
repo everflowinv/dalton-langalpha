@@ -213,7 +213,7 @@ describe('the delivery picker', () => {
     expect(picked()).toEqual(['discord']);
   });
 
-  it("reads the chats of an automation in All workspaces with Home's id, and offers no default", async () => {
+  it("reads the chats of an automation in the Chief of Staff with Home's id, and offers no default", async () => {
     // The server answers for Home as for a run in no workspace.
     serve({ ...OPTIONS, workspace_id: null });
     renderPicker(['slack:T1/C2'], { ...INITIAL_FORM, place: ALL_WORKSPACES });

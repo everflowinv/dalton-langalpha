@@ -188,13 +188,16 @@ function CreateComputerDialog({ computers, onClose, onSubmit, busy, error }: Cre
     </div>
   );
 
-  // This Mac leads, where a desktop user looks first.
+  // The hosted sandboxes come first, then the user's own machines: This Mac,
+  // then SSH, both in preview.
+  const providerCards = providerOptions(t, providers, atCap).map((o) =>
+    // Beside the title, where a lock note would sit; a lock note wins.
+    o.value === 'ssh' && !o.note ? { ...o, note: t('computer.ssh.previewLabel', 'Preview') } : o,
+  );
   const options: RadioCardOption<string>[] = [
+    ...providerCards.filter((o) => providerManagesSpec(o.value)),
     ...(thisMacCard ? [thisMacOption(t, thisMacCard)] : []),
-    ...providerOptions(t, providers, atCap).map((o) =>
-      // Beside the title, where a lock note would sit; a lock note wins.
-      o.value === 'ssh' && !o.note ? { ...o, note: t('computer.ssh.previewLabel', 'Preview') } : o,
-    ),
+    ...providerCards.filter((o) => !providerManagesSpec(o.value)),
   ];
 
   return (
@@ -207,7 +210,8 @@ function CreateComputerDialog({ computers, onClose, onSubmit, busy, error }: Cre
       )}
       onClose={onClose}
       closeDisabled={busy}
-      width="standard"
+      // Wide enough for three providers side by side, each name on one line.
+      width="wide"
       density="form"
       stacked
       footer={footer}
@@ -240,8 +244,10 @@ function CreateComputerDialog({ computers, onClose, onSubmit, busy, error }: Cre
             value={source === 'thisMac' ? THIS_MAC_OPTION : source === 'ssh' ? 'ssh' : hosted}
             onChange={setPicked}
             label={t('computer.provider.label', 'Provider')}
-            // Side by side keeps the form short; a third option joins the row.
-            columns={options.length >= 3 ? 3 : 2}
+            // Side by side keeps the form short; a third option joins the row,
+            // and four, This Mac among them, go two by two rather than leave
+            // one alone or squeeze each name onto two lines.
+            columns={options.length === 3 ? 3 : 2}
           />
         )}
 

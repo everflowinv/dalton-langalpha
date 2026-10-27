@@ -128,7 +128,7 @@ export default function MarketChatHistoryButton({
             {activeTitle}
           </span>
           <ChevronDown
-            className="h-3 w-3 shrink-0 transition-transform duration-200 group-data-[state=open]:rotate-180"
+            className="h-3 w-3 shrink-0 transition-transform group-data-[state=open]:rotate-180"
             style={{ color: 'var(--color-text-tertiary)' }}
           />
         </button>
@@ -207,7 +207,7 @@ export default function MarketChatHistoryButton({
             </button>
             <span
               role="tooltip"
-              className="pointer-events-none absolute right-0 top-full mt-1.5 w-60 rounded-md px-2.5 py-2 text-[0.6875rem] leading-snug opacity-0 translate-y-[-2px] transition-all duration-150 group-hover/hint:opacity-100 group-hover/hint:translate-y-0 group-focus-within/hint:opacity-100 group-focus-within/hint:translate-y-0"
+              className="pointer-events-none absolute right-0 top-full mt-1.5 w-60 rounded-md px-2.5 py-2 text-[0.6875rem] leading-snug opacity-0 translate-y-[-2px] transition-all group-hover/hint:opacity-100 group-hover/hint:translate-y-0 group-focus-within/hint:opacity-100 group-focus-within/hint:translate-y-0"
               style={{
                 backgroundColor: 'var(--color-bg-elevated)',
                 color: 'var(--color-text-secondary)',

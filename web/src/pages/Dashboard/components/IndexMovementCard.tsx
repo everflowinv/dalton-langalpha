@@ -2,6 +2,7 @@ import React, { useState, useCallback } from 'react';
 import { useNavigate } from 'react-router';
 import { LineChart, Line, YAxis, Tooltip } from 'recharts';
 import { motion, AnimatePresence, type PanInfo } from '@/lib/framer';
+import { SPRING_DRAG, staggerDelay, TWEEN } from '@/lib/motion';
 import { useIsMobile } from '@/hooks/useIsMobile';
 import { useTranslation } from 'react-i18next';
 import { useLocale } from '@/hooks/useLocale';
@@ -178,7 +179,7 @@ function IndexCard({ index, delay }: IndexCardProps) {
     <motion.div
       initial={{ opacity: 0, y: 20 }}
       animate={{ opacity: 1, y: 0 }}
-      transition={{ duration: 0.4, delay: delay * 0.1 }}
+      transition={{ ...TWEEN.enter, delay: staggerDelay(delay) }}
       className="overflow-hidden rounded-2xl border transition-colors group flex flex-col cursor-pointer"
       style={{
         borderColor: 'var(--color-border-muted)',
@@ -295,7 +296,7 @@ function IndexStackWidget({ indices }: { indices: IndexData[] }) {
             initial="enter"
             animate="center"
             exit="exit"
-            transition={{ type: 'spring', stiffness: 350, damping: 32, mass: 0.8 }}
+            transition={SPRING_DRAG}
             drag="x"
             dragConstraints={{ left: 0, right: 0 }}
             dragElastic={0.12}
@@ -320,7 +321,7 @@ function IndexStackWidget({ indices }: { indices: IndexData[] }) {
             key={i}
             onClick={() => goTo(i)}
             aria-label={t('dashboard.widgets.marketsOverview.showIndex', { name: indices[i]?.name })}
-            className="rounded-full transition-all duration-200"
+            className="rounded-full transition-all"
             style={{
               width: i === current ? 18 : 6,
               height: 6,

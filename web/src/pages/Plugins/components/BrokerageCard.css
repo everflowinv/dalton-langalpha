@@ -18,7 +18,7 @@
   border: 1px solid var(--color-border-subtle);
   border-radius: 12px;
   background: var(--color-bg-card);
-  transition: border-color 120ms ease-out;
+  transition: border-color var(--motion-quick) var(--ease-out);
 }
 .broker-card:hover,
 .broker-card:focus-within { border-color: var(--color-border-muted); }

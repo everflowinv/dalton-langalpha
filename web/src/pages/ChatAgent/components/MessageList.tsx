@@ -1,5 +1,4 @@
 import React from 'react';
-import { motion } from '@/lib/framer';
 import { useIsMobile } from '@/hooks/useIsMobile';
 import { useStableArray } from '@/hooks/useStableArray';
 import { NotificationDivider } from './messageList/NotificationDivider';
@@ -13,9 +12,11 @@ import { isReportRow, opensTurn } from './messageList/messagePredicates';
 import { ReportRow, type ReportProvenance } from './messageList/ReportRow';
 import { HandoffPlacesContext, placeHandoffs, samePlaces } from './analystHandoff/reportLinks';
 import {
-  computeTurnTails, hasTurn, hiddenOpenerTurns, liveTurns, messageTimeMs, projectTurns,
+  computeTurnTails, hasTurn, hiddenOpenerTurns, liveTurns, messageTimeMs, projectTurns, type ProjectedMessage,
 } from './messageList/turnProjection';
 import { planQuietChecks } from './messageList/quietChecks';
+import { CollapseClock, CollapseClockContext } from './messageList/transcriptMotion';
+import { ProseTyping, ProseTypingContext } from './messageList/proseTyping';
 import { useLiveMessages, type LiveMessages } from '../session/stream/liveMessages';
 import type { ChatMessage, WakeupArrival } from '@/types/chat';
 import { turnFilesByTurn } from '../utils/turnFiles';
@@ -32,10 +33,81 @@ interface TurnFoldInfo {
   isLive: boolean;
   /** Nothing stands for the turn once folded, so it settles to `process`. */
   noAnswer: boolean;
+  /** The turn has process or commentary to fold away. One that ran here with
+   *  none keeps the row it worked under, as a label. */
+  foldable: boolean;
+  /** The turn's opening message was sent from this view. */
+  sentHere: boolean;
 }
 
-/** The activity accordion's fold spring, so the two levels move alike. */
-const FOLD_ROW_ENTER = { type: 'spring' as const, stiffness: 260, damping: 30 };
+/**
+ * Which turns the list draws as running, and which its view has drawn running.
+ *
+ * A turn that stops while its reply is still typing out is drawn running until
+ * the typing ends. Settling folds the turn's work away above the reply and
+ * brings the Sources pill and the deck in below it: done under a sentence still
+ * being typed, that moved the line being read by the height of the work and
+ * showed the files before the sentence naming them. A turn settles once: text
+ * that types again afterwards (a reconcile rewriting it) does not reopen it.
+ * One loaded settled was never drawn running, so it settles at once.
+ *
+ * The turns that ran here are also kept in `remembered`, which the view owns:
+ * its main list unmounts while a subagent tab is open, and a list coming back
+ * that had forgotten them dropped the row of every turn that ran here with
+ * nothing to fold, moving the transcript up a row for each.
+ */
+function useTurnPresentation(
+  live: ReadonlySet<number>,
+  turned: readonly ProjectedMessage[],
+  typing: ProseTyping,
+  remembered?: Set<number>,
+): { running: ReadonlySet<number>; ranHere: ReadonlySet<number> } {
+  const [shown, setShown] = React.useState(() => ({
+    running: live,
+    ranHere: remembered?.size ? new Set([...remembered, ...live]) : live,
+  }));
+  React.useEffect(() => {
+    if (remembered) for (const turn of shown.ranHere) remembered.add(turn);
+  }, [remembered, shown.ranHere]);
+  let next = shown;
+  let running: Set<number> | null = null;
+  let ranHere: Set<number> | null = null;
+  for (const turn of live) {
+    if (!shown.running.has(turn)) (running ??= new Set(shown.running)).add(turn);
+    if (!shown.ranHere.has(turn)) (ranHere ??= new Set(shown.ranHere)).add(turn);
+  }
+  if (running || ranHere) {
+    next = { running: running ?? shown.running, ranHere: ranHere ?? shown.ranHere };
+    setShown(next);
+  }
+  // Only the prose knows whether it is still typing, and it says so from
+  // layout effects, which run before this one in the same commit. Settling in
+  // render decided before the commit's text had answered, so a reply whose
+  // last words came with the end of its stream settled under them. A turn
+  // still typing waits here for its prose to call back.
+  const drawnRunning = next.running;
+  React.useLayoutEffect(() => {
+    const waiting = [...drawnRunning].filter((turn) => !live.has(turn));
+    if (waiting.length === 0) return;
+    const settle = () => {
+      const typingTurns = new Set<number | null>();
+      for (const { message, turnIndex } of turned) {
+        if (typing.isTyping(message.id as string)) typingTurns.add(turnIndex);
+      }
+      const done = waiting.filter((turn) => !typingTurns.has(turn));
+      if (done.length === 0) return;
+      setShown((prev) => {
+        if (!done.some((turn) => prev.running.has(turn))) return prev;
+        const settled = new Set(prev.running);
+        for (const turn of done) settled.delete(turn);
+        return { ...prev, running: settled };
+      });
+    };
+    settle();
+    return typing.subscribe(settle);
+  }, [drawnRunning, live, turned, typing]);
+  return next;
+}
 
 // --- MessageList ---
 
@@ -53,9 +125,24 @@ interface MessageListProps {
   /** A first turn is about to land (the welcome flow's), so an empty list is
    *  not an empty chat and draws no prompt to type. */
   starting?: boolean;
+  /** The turns this view has drawn running, kept by the view so they outlive
+   *  the list (see `useTurnPresentation`). */
+  ranHere?: Set<number>;
 }
 
-function MessageList({ messages, isLoading, isLoadingHistory, isSubagentView, readOnly, allowFiles, feedbackByTurn, dispatcherContext, starting }: MessageListProps): React.ReactElement | null {
+function MessageList({ messages: latest, isLoading, isLoadingHistory, isSubagentView, readOnly, allowFiles, feedbackByTurn, dispatcherContext, starting, ranHere: rememberedRanHere }: MessageListProps): React.ReactElement | null {
+  // A history load writes the transcript an event at a time as its response
+  // arrives. Drawn as it went, a finished turn showed its work open above no
+  // answer and then folded it away once the answer and its end landed. The
+  // list keeps what it drew before the load until the load ends, whose last
+  // commit holds the whole transcript (loadConversationHistory's reveal). A
+  // list that mounts mid-load (main shown again while the thread loads) drew
+  // nothing before it, and what the load has written so far is the half it
+  // must not show, so it holds nothing, which draws the skeleton.
+  const [held, setHeld] = React.useState<MessageRecord[] | null>(() => (isLoadingHistory ? [] : null));
+  if (isLoadingHistory && held === null) setHeld(latest);
+  if (!isLoadingHistory && held !== null) setHeld(null);
+  const messages = isLoadingHistory ? held ?? latest : latest;
   const isMobile = useIsMobile();
   const { onOpenFile } = useMessageActions();
   // The deck keeps the workspace's own notes file out on every surface; its
@@ -132,6 +219,10 @@ function MessageList({ messages, isLoading, isLoadingHistory, isSubagentView, re
     [turned, newestTurn, isLoading, isSubagentView, folders?.rootDir],
   );
 
+  const [typing] = React.useState(() => new ProseTyping());
+  const { running, ranHere } = useTurnPresentation(live, turned, typing, rememberedRanHere);
+  const [collapseClock] = React.useState(() => new CollapseClock());
+
   // Both display preferences fold finished turns; only live reasoning differs.
   // The same pass times every settled turn, whose reply shows when it ended.
   const { turnFolds, turnEnds } = React.useMemo(() => {
@@ -139,6 +230,7 @@ function MessageList({ messages, isLoading, isLoadingHistory, isSubagentView, re
     const ends = new Map<number, number>();
 
     const startedAt = new Map<number, number>();
+    const sentHere = new Map<number, boolean>();
     const firstReplyAt = new Map<number, number>();
     const rowPos = new Map<number, number>();
     const assistantBubbles = new Map<number, MessageRecord[]>();
@@ -171,6 +263,7 @@ function MessageList({ messages, isLoading, isLoadingHistory, isSubagentView, re
         const ts = messageTimeMs(message.timestamp);
         if (ts !== undefined) startedAt.set(turnIndex, ts);
         else startedAt.delete(turnIndex);
+        sentHere.set(turnIndex, message.sentHere === true);
         rowPos.delete(turnIndex);
         firstReplyAt.delete(turnIndex);
         assistantBubbles.delete(turnIndex);
@@ -201,7 +294,7 @@ function MessageList({ messages, isLoading, isLoadingHistory, isSubagentView, re
       const { message, turnIndex } = visible[i];
       if (turnIndex === null) continue;
       const contents = (assistantBubbles.get(turnIndex) ?? []).map((bubble) => projectMessageContent(bubble, isSubagentView, folders?.rootDir));
-      const isLive = live.has(turnIndex);
+      const isLive = running.has(turnIndex);
       // A pinned call outlives the stream that launched it, so the stream-close
       // stamp was taken before the turn's work was done and a fold reading it
       // counts backwards, from `Working for 2m` to `Worked for 5s`. The server's
@@ -214,12 +307,17 @@ function MessageList({ messages, isLoading, isLoadingHistory, isSubagentView, re
           : end),
         observedEnd,
       );
-      const completedAt = isLive ? undefined : messageTimeMs(endStamp.completedAt) ?? localEnd;
+      const completedAt = live.has(turnIndex) ? undefined : messageTimeMs(endStamp.completedAt) ?? localEnd;
       if (completedAt !== undefined) ends.set(turnIndex, completedAt);
       const start = startedAt.get(turnIndex);
       const pos = rowPos.get(turnIndex);
       if (start === undefined || pos === undefined) continue;
-      if (!contents.some((content) => content.hasProcess) && contents.reduce((sum, content) => sum + content.textCount, 0) < 2) continue;
+      // A running turn has its row from the first frame, whatever it has done
+      // so far: a row that waited for something foldable arrived above prose
+      // already typing and pushed it down a line. A settled turn with nothing
+      // to fold has no row, unless it ran here and the row is already there.
+      const foldable = contents.some((content) => content.hasProcess) || contents.reduce((sum, content) => sum + content.textCount, 0) >= 2;
+      if (!foldable && !isLive && !ranHere.has(turnIndex)) continue;
       const hasFiles = !!onOpenFile && (!readOnly || allowFiles) && (filesByTurn.get(turnIndex)?.length ?? 0) > 0;
       folds.set(turnIndex, {
         noAnswer: !(contents.at(-1)?.lastTextKey || contents.some((content) => content.hasRetained) || hasFiles),
@@ -227,10 +325,12 @@ function MessageList({ messages, isLoading, isLoadingHistory, isSubagentView, re
         startedAt: start,
         completedAt,
         isLive,
+        foldable,
+        sentHere: sentHere.get(turnIndex) ?? false,
       });
     }
     return { turnFolds: folds, turnEnds: ends };
-  }, [visible, turned, turnTails, live, isSubagentView, folders?.rootDir, filesByTurn, onOpenFile, readOnly, allowFiles]);
+  }, [visible, turned, turnTails, live, running, ranHere, isSubagentView, folders?.rootDir, filesByTurn, onOpenFile, readOnly, allowFiles]);
 
   const items = React.useMemo(
     () => planQuietChecks(visible, turned, live, isSubagentView),
@@ -284,6 +384,8 @@ function MessageList({ messages, isLoading, isLoadingHistory, isSubagentView, re
   // sibling-space-y, not space-y: NotificationDivider's own my-1 would
   // otherwise replace the gap below it.
   const list = (
+    <ProseTypingContext value={typing}>
+    <CollapseClockContext value={collapseClock}>
     <div className={`font-content ${isMobile ? 'sibling-space-y-4' : 'sibling-space-y-6'}`}>
       {items.map((item) => {
         if (item.kind === 'quiet') {
@@ -311,14 +413,17 @@ function MessageList({ messages, isLoading, isLoadingHistory, isSubagentView, re
           );
         }
         // A bubble only ever folds when its turn shows the row that unfolds it:
-        // a turn with no fold row (no initiating message, nothing foldable yet)
-        // keeps the verbose shape rather than hiding prose behind nothing.
+        // a turn with no fold row (no initiating message) keeps the verbose
+        // shape rather than hiding prose behind nothing, as does a settled turn
+        // with nothing to fold.
         const info = turnIndex === null ? undefined : turnFolds.get(turnIndex);
         const fold: FoldState = !info
           ? 'unfolded'
           : info.isLive
             ? 'live'
-            : turnIndex !== null && expandedTurns.has(turnIndex) ? 'expanded' : info.noAnswer ? 'process' : 'collapsed';
+            : !info.foldable
+              ? 'unfolded'
+              : turnIndex !== null && expandedTurns.has(turnIndex) ? 'expanded' : info.noAnswer ? 'process' : 'collapsed';
         const bubbleProps = {
           message,
           contentProjection: projectMessageContent(message, isSubagentView, folders?.rootDir),
@@ -334,7 +439,7 @@ function MessageList({ messages, isLoading, isLoadingHistory, isSubagentView, re
           // over results the running task can still change.
           isTurnLive: info
             ? info.isLive
-            : (turnIndex !== null && live.has(turnIndex)) || !!message.isStreaming,
+            : (turnIndex !== null && running.has(turnIndex)) || !!message.isStreaming,
           turnFiles: turnTails[i] && turnIndex !== null ? filesByTurn.get(turnIndex) : undefined,
           completedAt: turnTails[i] && turnIndex !== null ? turnEnds.get(turnIndex) : undefined,
           feedback: turnIndex === null ? null : feedbackByTurn?.[turnIndex] ?? null,
@@ -346,36 +451,30 @@ function MessageList({ messages, isLoading, isLoadingHistory, isSubagentView, re
           isMobile,
           dispatcherContext,
         };
-        // Every bubble gets the wrapper from its first paint: the fold row
-        // only exists once the turn has something foldable, and switching a
-        // streaming bubble from bare to wrapped at the same key would remount it.
+        // Every bubble gets the wrapper from its first paint: a turn's row comes
+        // with its first assistant bubble, and switching a bubble from bare to
+        // wrapped at the same key would remount it.
         // The row and the answer it heads are one item of the list's rhythm, so
         // the gap between them is the row's own margin, not the list's.
         return (
           <div key={message.id as string}>
             {info && turnIndex !== null && info.rowPos === i && (
-              /* A row that arrives over a turn already streaming unfolds
-                 rather than pushing the reply down a line in one paint. A
-                 settled turn's row was there before the reader was. */
-              <motion.div
-                initial={info.isLive ? { height: 0, opacity: 0 } : false}
-                animate={{ height: 'auto', opacity: 1 }}
-                transition={FOLD_ROW_ENTER}
-                style={{ overflow: 'hidden' }}
-              >
-                <TurnFold
-                  state={fold === 'live' ? 'live' : fold === 'collapsed' ? 'collapsed' : fold === 'process' ? 'process' : 'expanded'}
-                  startedAt={info.startedAt}
-                  completedAt={info.completedAt}
-                  onToggle={() => toggleTurn(turnIndex)}
-                />
-              </motion.div>
+              <TurnFold
+                state={fold}
+                startedAt={info.startedAt}
+                completedAt={info.completedAt}
+                sentHere={info.sentHere}
+                turnIndex={turnIndex}
+                onToggle={toggleTurn}
+              />
             )}
             <MessageBubble {...bubbleProps} />
           </div>
         );
       })}
     </div>
+    </CollapseClockContext>
+    </ProseTypingContext>
   );
   return <HandoffPlacesContext value={places}>{list}</HandoffPlacesContext>;
 }

@@ -1,5 +1,5 @@
 import React, { memo, useEffect, useMemo, useState, useRef, useId } from 'react';
-import { motion, AnimatePresence } from '@/lib/framer';
+import { motion } from '@/lib/framer';
 import { Brain, ChevronDown } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { TextShimmer } from '@/components/ui/text-shimmer';
@@ -9,8 +9,10 @@ import { announceAnchoredToggle } from '../../utils/anchoredToggle';
 import { extractLeadingBoldHeader, extractReasoningHeaders } from '../../utils/reasoningHeaders';
 import { formatThoughtFor } from '@/lib/elapsed';
 import { useNow } from '@/hooks/useNow';
-import { SPRING_FOLD } from './liveZoneTiming';
-import { useMarkOpenThought } from './useArrivalQuiet';
+import { SPRING_FOLD } from '@/lib/motion';
+import { FoldPanel } from './FoldPanel';
+import { RowIcon } from './ActivityRowParts';
+import { SwapCell } from '@/components/ui/crossfade';
 import type { ReasoningActivityItem } from './activityTypes';
 
 function capitalizeFirst(text: string): string {
@@ -97,10 +99,6 @@ export const ReasoningRow = memo(function ReasoningRow({ item, defaultExpanded =
   // body, and the open row showed it twice.
   const displayContent = headers.length <= 1 && extractedTitle ? extractedBody : item.content;
   const hasContent = !!displayContent;
-  // Marked open before any text lands, not once it has: the mark comes from an
-  // effect, so one that waited for text would land after the first chunk and
-  // the bubble would count that chunk as already there.
-  useMarkOpenThought(item.id, isStreaming && expanded);
   // A row with no header of its own is named by its time, not its text: a
   // line of thought copied up as a label is noise down a timeline. Live it
   // ticks, settled it states the duration, and only a thought whose duration
@@ -112,37 +110,31 @@ export const ReasoningRow = memo(function ReasoningRow({ item, defaultExpanded =
     : '';
   const title = effectiveTitle || clock || durationTitle || t('toolArtifact.reasoning');
   const titleKey = clock ? 'thinking' : title;
-  // The label swaps with a short vertical slide, keyed on its text, so a new
-  // phase reads as arriving rather than the old words silently changing.
+  // The label crossfades in place, keyed on its text, so a new phase reads as
+  // arriving rather than the old words silently changing. The shimmer is an
+  // inline-block whose overflow puts its baseline at its bottom edge, so on
+  // the baseline it sat over the line's descender space and a thinking row
+  // stood 3.4px taller than the thought it settled into.
   const titleNode = (
-    <span className="titem-title truncate inline-flex min-w-0 relative">
-      <AnimatePresence initial={false} mode="popLayout">
-        <motion.span
-          key={titleKey}
-          className="truncate"
-          initial={{ opacity: 0, y: 6 }}
-          animate={{ opacity: 1, y: 0 }}
-          exit={{ opacity: 0, y: -6 }}
-          transition={{ duration: 0.18, ease: 'easeOut' }}
-        >
-          {isStreaming ? (
-            <TextShimmer
-              as="span"
-              className="truncate [--base-color:var(--color-text-primary)] [--base-gradient-color:var(--Labels-Tertiary)]"
-              duration={1.5}
-            >
-              {title}
-            </TextShimmer>
-          ) : title}
-        </motion.span>
-      </AnimatePresence>
+    <span className="titem-title inline-flex min-w-0" style={{ flexShrink: 1 }}>
+      <SwapCell swapKey={titleKey} layerClassName="truncate">
+        {isStreaming ? (
+          <TextShimmer
+            as="span"
+            className="truncate align-top [--base-color:var(--color-text-primary)] [--base-gradient-color:var(--Labels-Tertiary)]"
+            duration={1.5}
+          >
+            {title}
+          </TextShimmer>
+        ) : title}
+      </SwapCell>
     </span>
   );
 
   return (
     <div className="titem">
       <div className="titem-icon">
-        <Brain className="h-4 w-4" />
+        <RowIcon running={isStreaming} pulse={false}><Brain className="h-4 w-4" /></RowIcon>
       </div>
       <div className="titem-body" style={{ gap: 0 }}>
         <button
@@ -165,24 +157,13 @@ export const ReasoningRow = memo(function ReasoningRow({ item, defaultExpanded =
             </motion.div>
           )}
         </button>
-        <AnimatePresence initial={false}>
-          {expanded && displayContent && (
-            <motion.div
-              key="reasoning-content"
-              initial={{ height: 0, opacity: 0 }}
-              animate={{ height: 'auto', opacity: 1 }}
-              exit={{ height: 0, opacity: 0 }}
-              transition={SPRING_FOLD}
-              style={{ overflow: 'hidden' }}
-            >
-              <div id={contentId} className="titem-reasoning-card">
-                {isStreaming
-                  ? <AnimatedReasoningContent content={displayContent} isStreaming />
-                  : <Markdown variant="compact" content={displayContent} />}
-              </div>
-            </motion.div>
-          )}
-        </AnimatePresence>
+        <FoldPanel open={expanded && hasContent}>
+          <div id={contentId} className="titem-reasoning-card">
+            {isStreaming
+              ? <AnimatedReasoningContent content={displayContent} isStreaming />
+              : <Markdown variant="compact" content={displayContent} />}
+          </div>
+        </FoldPanel>
       </div>
     </div>
   );

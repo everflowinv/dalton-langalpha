@@ -71,7 +71,7 @@ export function FiredRun({ land = 0, done = 0 }: { land?: number; done?: number 
   const B = useBook();
   const now = useSceneTime();
   const live = now < done;
-  const place = t('agents.allWorkspaces');
+  const place = t('agents.chiefOfStaff');
   return (
     <Grow p={ease(now, land, 450)}>
       <RunEntry
@@ -121,9 +121,9 @@ export function BriefRun({
       name={B.brief}
       meta={
         <>
-          {[t('agents.allWorkspaces'), B.took(252_000)].join(' · ')}
+          {[t('agents.chiefOfStaff'), B.took(252_000)].join(' · ')}
           {delivered && (
-            <span style={{ opacity: shown ? 1 : 0, transition: 'opacity 300ms ease' }}>
+            <span style={{ opacity: shown ? 1 : 0, transition: 'opacity var(--motion-quick) var(--ease-out)' }}>
               {' · '}
               <span style={{ color: 'var(--color-text-secondary)' }}>
                 {t('automation.deliveredVia', { method: delivered })}

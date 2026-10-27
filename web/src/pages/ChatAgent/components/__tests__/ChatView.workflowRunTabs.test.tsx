@@ -16,6 +16,8 @@ import { renderWithProviders } from '@/test/utils';
 
 vi.mock('@/lib/framer', async () => {
   const ReactActual = await vi.importActual<typeof import('react')>('react');
+  // The real curve: the transcript's scroll engine lands on it.
+  const { cubicBezier } = await vi.importActual<typeof import('@/lib/framer')>('@/lib/framer');
   const FRAMER_ONLY_PROPS = new Set([
     'initial', 'animate', 'exit', 'transition', 'variants',
     'whileHover', 'whileTap', 'whileInView', 'layout', 'layoutId',
@@ -51,6 +53,7 @@ vi.mock('@/lib/framer', async () => {
     useTransform: () => ({ get: () => 0, set: () => {}, on: () => () => {} }),
     useSpring: (v: unknown) => ({ get: () => v, set: () => {}, on: () => () => {} }),
     useReducedMotion: () => false,
+    cubicBezier,
   };
 });
 

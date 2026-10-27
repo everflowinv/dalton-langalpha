@@ -128,6 +128,7 @@ class SSHRuntime(ExecSessionRuntime):
 
     # Changes when every process on the machine was ended (see BOOT_KEY_SH).
     session_boot_key_sh = f'$({BOOT_KEY_SH}echo "$__la_k")'
+    exec_output_cap = OUTPUT_CAP
 
     def __init__(
         self,

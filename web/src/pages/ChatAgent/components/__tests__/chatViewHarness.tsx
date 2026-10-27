@@ -22,8 +22,11 @@ const FRAMER_ONLY_PROPS = new Set([
   'dragElastic', 'onDragEnd',
 ]);
 
-/** `@/lib/framer` with every motion element rendered as its plain tag. */
-export function framerMock() {
+/** `@/lib/framer` with every motion element rendered as its plain tag. The
+ *  easing curves are the real ones: the transcript's scroll engine lands on
+ *  them. */
+export async function framerMock() {
+  const { cubicBezier } = await vi.importActual<typeof import('@/lib/framer')>('@/lib/framer');
   const createEl = React.createElement as (type: unknown, props?: unknown, ...children: unknown[]) => React.ReactElement;
   // Cached per tag: a fresh stub identity per access would remount ChatView's
   // subtree on every rerender, and with it the scroll controller.
@@ -51,6 +54,7 @@ export function framerMock() {
     useTransform: () => ({ get: () => 0, set: () => {}, on: () => () => {} }),
     useSpring: (v: unknown) => ({ get: () => v, set: () => {}, on: () => () => {} }),
     useReducedMotion: () => false,
+    cubicBezier,
   };
 }
 

@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo, useCallback, memo } from 'react';
+import React, { useState, useEffect, useLayoutEffect, useMemo, useCallback, memo } from 'react';
 import ActivityBlock from '../ActivityBlock';
 import type { ActivityItem } from './activityTypes';
 import { INLINE_ARTIFACT_MAP, openCardTarget } from '../charts/InlineArtifactCards';
@@ -16,7 +16,7 @@ import SubagentRun, { type SubagentRunMember } from './SubagentRun';
 import AnalystHandoffRun, { type AnalystHandoffMember } from './AnalystHandoffRun';
 import { WORKFLOW_TASK_TYPE } from '../../session/subagents/workflowRunState';
 import { SubagentStopNotices } from '../SubagentStopNotice';
-import type { CreditPauseState, PTCAgentProposalState, SubagentTaskRecord, ToolApprovalState } from '@/types/chat';
+import type { CreditPauseState, PendingToolCallChunk, PTCAgentProposalState, SubagentTaskRecord, ToolApprovalState } from '@/types/chat';
 import TextMessageContent from '../TextMessageContent';
 import { visibleParagraphPrefix } from '@/lib/paragraphGate';
 import { useTranscriptDisplay } from '@/lib/transcriptDisplay';
@@ -28,6 +28,7 @@ import { parseStructuredResult } from '../../utils/structuredResult';
 import { useMessageActions } from './MessageActionsContext';
 import { useWorkspaceFolders } from '../../contexts/WorkspaceContext';
 import { FoldPanel } from './FoldPanel';
+import { useProseReport } from './proseTyping';
 import { projectContent, blockIsProcess, blockVisible, streamingTextBlockIndex, type ContentProjection } from './contentProjection';
 import { EMPTY_OBJ } from './types';
 import type { ContentSegmentRecord, FoldState, ToolCallProcessRecord } from './types';
@@ -60,7 +61,7 @@ interface MessageContentSegmentsProps {
   userQuestions?: Record<string, Record<string, unknown>>;
   workspaceProposals?: Record<string, Record<string, unknown>>;
   questionProposals?: Record<string, Record<string, unknown>>;
-  pendingToolCallChunks?: Record<string, Record<string, unknown>>;
+  pendingToolCallChunks?: Record<string, PendingToolCallChunk>;
   isStreaming?: boolean;
   /** How much of the turn this bubble draws; `unfolded` is the full transcript. */
   fold?: FoldState;
@@ -74,6 +75,8 @@ interface MessageContentSegmentsProps {
   toolApprovals?: Record<string, ToolApprovalState>;
   htmlWidgetProcesses?: Record<string, Record<string, unknown>>;
   dispatcherContext?: { threadId: string; workspaceId: string } | null;
+  /** The message these are, under which its prose reports its typing. */
+  messageId?: string;
 }
 
 interface TextBlockProps {
@@ -84,6 +87,7 @@ interface TextBlockProps {
   isReplyStart: boolean;
   onOpenFile?: OpenFileHandler;
   onRevealed?: (key: string, done: boolean) => void;
+  messageId?: string;
 }
 
 /** Blocks that wait for the prose above them to finish typing.
@@ -115,8 +119,14 @@ function isPillBlock(block: RenderBlock): boolean {
   return isPillArtifactType((result?.artifact as Record<string, unknown> | undefined)?.type);
 }
 
-function TextBlock({ block, isStreaming, isSubagentView, isReplyStart, onOpenFile, onRevealed }: TextBlockProps): React.ReactElement | null {
-  const report = useCallback((done: boolean) => onRevealed?.(block.key, done), [onRevealed, block.key]);
+function TextBlock({ block, isStreaming, isSubagentView, isReplyStart, onOpenFile, onRevealed, messageId }: TextBlockProps): React.ReactElement | null {
+  // Told twice: the message holds what follows this block for it, and the
+  // list holds the turn running while it types (see ProseTyping).
+  const reportTyping = useProseReport(messageId, block.key);
+  const report = useCallback((done: boolean) => {
+    onRevealed?.(block.key, done);
+    reportTyping(done);
+  }, [onRevealed, block.key, reportTyping]);
   const { streamingMode } = useTranscriptDisplay();
   const raw = block.segment.content ?? '';
   // A schema-constrained subagent answers with one JSON object, which the
@@ -140,8 +150,8 @@ function TextBlock({ block, isStreaming, isSubagentView, isReplyStart, onOpenFil
       onRevealed={report}
     />
   );
-  // A structured result lands whole.
-  useEffect(() => { if (structured) report(true); }, [structured, report]);
+  // A structured result lands whole. Reported when the prose would be.
+  useLayoutEffect(() => { if (structured) report(true); }, [structured, report]);
   // What will actually be painted, which is not the same as what has arrived:
   // paragraph mode holds the sentence being written and renders nothing until
   // the first boundary lands. The wrapper keys on this rather than on the raw
@@ -152,7 +162,7 @@ function TextBlock({ block, isStreaming, isSubagentView, isReplyStart, onOpenFil
   return isReplyStart && rendersNow ? <div data-reply-start="">{textEl}</div> : textEl;
 }
 
-export const MessageContentSegments = memo(function MessageContentSegments({ segments, contentProjection, reasoningProcesses, toolCallProcesses, todoListProcesses: _todoListProcesses, subagentTasks, userQuestions = EMPTY_OBJ, workspaceProposals = EMPTY_OBJ, questionProposals = EMPTY_OBJ, pendingToolCallChunks = EMPTY_OBJ, isStreaming, fold = 'unfolded', isTurnTail = false, isSubagentView = false, readOnly = false, ptcAgentProposals = EMPTY_OBJ, secretaryActionProposals = EMPTY_OBJ, creditPauses = EMPTY_OBJ, toolApprovals = EMPTY_OBJ, htmlWidgetProcesses = EMPTY_OBJ, dispatcherContext }: MessageContentSegmentsProps): React.ReactElement {
+export const MessageContentSegments = memo(function MessageContentSegments({ segments, contentProjection, reasoningProcesses, toolCallProcesses, todoListProcesses: _todoListProcesses, subagentTasks, userQuestions = EMPTY_OBJ, workspaceProposals = EMPTY_OBJ, questionProposals = EMPTY_OBJ, pendingToolCallChunks = EMPTY_OBJ, isStreaming, fold = 'unfolded', isTurnTail = false, isSubagentView = false, readOnly = false, ptcAgentProposals = EMPTY_OBJ, secretaryActionProposals = EMPTY_OBJ, creditPauses = EMPTY_OBJ, toolApprovals = EMPTY_OBJ, htmlWidgetProcesses = EMPTY_OBJ, dispatcherContext, messageId }: MessageContentSegmentsProps): React.ReactElement {
   const { turnDisplay } = useTranscriptDisplay();
   const {
     onOpenSubagentTask, onOpenFile, onToolCallDetailClick, onOpenChart,
@@ -207,8 +217,7 @@ export const MessageContentSegments = memo(function MessageContentSegments({ seg
   // last token of the prose it follows: mounted at once, its row would sit
   // under a paragraph still being typed, and the reader sees the tools land
   // before the words. So an activity block waits for the prose above it to
-  // catch up (only `false` holds: a block that has not reported is not
-  // typing), and prose with an activity block after it is finished, so it
+  // catch up, and prose with an activity block after it is finished, so it
   // types its tail out in the finish window rather than at reading pace.
   const [revealed, setRevealed] = useState<Record<string, boolean>>({});
   const onRevealed = useCallback((key: string, done: boolean) => {
@@ -244,11 +253,10 @@ export const MessageContentSegments = memo(function MessageContentSegments({ seg
     for (let i = 0; i < renderBlocks.length; i++) {
       const b = renderBlocks[i];
       if (isBlankText(b)) continue;
-      // Unreported holds too. A text block reports from an effect, so on the
-      // commit that first paints it there is no answer yet, and reading that
-      // silence as "revealed" painted the card beneath it for one frame and
-      // then took it away. Every streaming text block reports on its first
-      // effect, so the wait is released a frame later at worst.
+      // Unreported holds too. A text block reports from a layout effect of
+      // the commit that first draws it, and reading the silence before it as
+      // "revealed" mounted the card beneath it only to take it away again.
+      // The report lands before that commit paints, so the wait costs nothing.
       if (b.type === 'text') waiting = revealed[b.key] !== true;
       else heldForProse[i] = waiting && HOLDS_FOR_PROSE.has(b.type);
     }
@@ -282,6 +290,11 @@ export const MessageContentSegments = memo(function MessageContentSegments({ seg
               items={block.items}
               preparingToolCall={blockIdx === lastActivityBlockIdx ? preparingToolCall : null}
               isStreaming={isStreaming ?? false}
+              /* One status line per turn: the newest activity of a running
+                 turn holds it, so it moves to a later block when one opens.
+                 The turn's liveness, not the stream's, which drops between
+                 model calls and would take the line away in every gap. */
+              holdsLine={fold === 'live' && isTurnTail && blockIdx === lastActivityBlockIdx}
               presentation={fold === 'unfolded' ? 'inline' : fold === 'expanded' ? 'expanded' : 'folded'}
               /* Verbose: a thought still streaming shows its text; settled, it
                  folds like any other. The preference reaches no further. */
@@ -325,6 +338,7 @@ export const MessageContentSegments = memo(function MessageContentSegments({ seg
               isSubagentView={isSubagentView}
               onOpenFile={onOpenFile}
               onRevealed={onRevealed}
+              messageId={messageId}
             />
           );
         }

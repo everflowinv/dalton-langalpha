@@ -143,6 +143,14 @@ describe('what goes on the wire', () => {
     expect(sent().init.method).toBe('DELETE');
     expect(sent().init.body).toBe('{"paths":["a"]}');
   });
+
+  it('hands fetch the cache mode a call asks for, and none otherwise', async () => {
+    reply(json(200, {}));
+    await api.get('/range', { cache: 'no-store' });
+    await api.get('/plain');
+    expect(sent(0).init.cache).toBe('no-store');
+    expect(sent(1).init.cache).toBeUndefined();
+  });
 });
 
 describe('what comes back', () => {
@@ -191,6 +199,9 @@ describe('failures without a response', () => {
     const err = await failure(api.post('/slow', undefined, { timeout: 5 }));
     expect(err.message).toBe('timeout of 5ms exceeded');
     expect(err.code).toBe('ECONNABORTED');
+    // Told apart from an abort and from an answer, so a retry reads it as transient.
+    expect(err.name).toBe('ApiError');
+    expect(err.status).toBeUndefined();
   });
 
   it('leaves no listener on a caller signal reused across timed requests', async () => {
@@ -215,6 +226,139 @@ describe('failures without a response', () => {
     expect(err.message).toBe('Network Error');
     expect(err.code).toBe('ERR_NETWORK');
     expect(err.response).toBeUndefined();
+  });
+});
+
+/**
+ * An answer whose body the test hands over chunk by chunk, so a stall and a
+ * slow trickle can be told apart. An abort fails a read in progress, as it
+ * fails a fetch body's.
+ */
+function handAnswer(status = 200, headersAfter = 0) {
+  type Read = ReadableStreamReadResult<Uint8Array>;
+  const waiting: { resolve: (read: Read) => void; reject: (err: unknown) => void }[] = [];
+  const ready: Read[] = [];
+  const give = (read: Read) => {
+    const reader = waiting.shift();
+    if (reader) reader.resolve(read);
+    else ready.push(read);
+  };
+  const read = () => (ready.length > 0
+    ? Promise.resolve(ready.shift()!)
+    : new Promise<Read>((resolve, reject) => waiting.push({ resolve, reject })));
+  const getReader = vi.fn(() => ({ read }));
+  const cancel = vi.fn(async () => {});
+  fetchMock.mockImplementation(async (_url, init) => {
+    init.signal?.addEventListener('abort', () => {
+      for (const reader of waiting.splice(0)) reader.reject(new DOMException('aborted', 'AbortError'));
+    });
+    if (headersAfter) await new Promise((resolve) => setTimeout(resolve, headersAfter));
+    return {
+      ok: status >= 200 && status < 300, status, statusText: '', headers: new Headers(), body: { getReader, cancel },
+    } as unknown as Response;
+  });
+  return {
+    push: (text: string) => give({ done: false, value: new TextEncoder().encode(text) }),
+    end: () => give({ done: true, value: undefined }),
+    getReader,
+    cancel,
+  };
+}
+
+/** Whether a call has settled yet, read without awaiting it. */
+function watch<T>(call: Promise<T>) {
+  const state = { settled: false, outcome: call.finally(() => { state.settled = true; }) };
+  return state;
+}
+
+describe('an idle bound', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('fails an answer that goes silent for that long, as a timeout does', async () => {
+    const answer = handAnswer();
+    const call = watch(failure(api.get('/x', { idleTimeout: 1000, responseType: 'arraybuffer' })));
+    await vi.advanceTimersByTimeAsync(600);
+    answer.push('a');
+    // The chunk at 600 put the bound off to 1600.
+    await vi.advanceTimersByTimeAsync(999);
+    expect(call.settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    const err = await call.outcome;
+    expect(err.message).toBe('timeout of 1000ms exceeded');
+    expect(err.code).toBe('ECONNABORTED');
+    expect(err.name).toBe('ApiError');
+    expect(err.status).toBeUndefined();
+  });
+
+  it('lets a slow answer finish while each chunk comes inside it', async () => {
+    const answer = handAnswer();
+    const call = watch(api.get('/x', { idleTimeout: 1000, responseType: 'arraybuffer' }));
+    for (const chunk of ['a', 'b', 'c', 'd', 'e']) {
+      await vi.advanceTimersByTimeAsync(600);
+      answer.push(chunk);
+    }
+    answer.end();
+    const res = await call.outcome;
+    expect(new TextDecoder().decode(res.data as ArrayBuffer)).toBe('abcde');
+  });
+
+  it('counts the wait for headers', async () => {
+    fetchMock.mockImplementation((_url, init) => new Promise((_resolve, reject) => {
+      init.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
+    }));
+    const call = watch(failure(api.get('/x', { idleTimeout: 1000 })));
+    await vi.advanceTimersByTimeAsync(999);
+    expect(call.settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    expect((await call.outcome).code).toBe('ECONNABORTED');
+  });
+
+  it('puts the bound off when the headers arrive', async () => {
+    const answer = handAnswer(200, 900);
+    const call = watch(api.get('/x', { idleTimeout: 1000, responseType: 'text' }));
+    await vi.advanceTimersByTimeAsync(1500);
+    answer.push('late but there');
+    answer.end();
+    expect((await call.outcome).data).toBe('late but there');
+  });
+
+  it('keeps a total deadline given beside it', async () => {
+    const answer = handAnswer();
+    const call = watch(failure(api.get('/x', { timeout: 2000, idleTimeout: 1000 })));
+    for (let i = 0; i < 4; i++) {
+      await vi.advanceTimersByTimeAsync(600);
+      answer.push('a');
+    }
+    const err = await call.outcome;
+    expect(err.message).toBe('timeout of 2000ms exceeded');
+    expect(err.code).toBe('ECONNABORTED');
+  });
+});
+
+describe('an expected status', () => {
+  it('hands back another success with no body, its stream cancelled unread', async () => {
+    const answer = handAnswer(200);
+    answer.push('the whole file');
+    for (const idleTimeout of [undefined, 1000]) {
+      const res = await api.get('/x', { expectStatus: 206, idleTimeout, responseType: 'arraybuffer' });
+      expect(res.status).toBe(200);
+      expect(res.data).toBeNull();
+    }
+    expect(answer.cancel).toHaveBeenCalledTimes(2);
+    expect(answer.getReader).not.toHaveBeenCalled();
+  });
+
+  it('reads the body of the status it expects, and of a refusal', async () => {
+    reply({ status: 206, body: 'abc' }, json(503, { detail: 'busy' }));
+    const res = await api.get('/x', { expectStatus: 206, responseType: 'text' });
+    expect(res.data).toBe('abc');
+    const err = await failure(api.get('/x', { expectStatus: 206 }));
+    expect(err.response?.data).toEqual({ detail: 'busy' });
   });
 });
 

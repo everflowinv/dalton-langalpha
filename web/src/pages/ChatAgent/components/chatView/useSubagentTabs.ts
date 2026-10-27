@@ -54,8 +54,6 @@ export function useSubagentTabs({
   resolveSubagentIdToAgentId,
   hydrateTaskTranscript,
   saveScrollPosition,
-  scrollPositionsRef,
-  skipSubagentAutoScrollRef,
   activeAgentIdRef,
   resolvedThreadIdRef,
 }: {
@@ -74,8 +72,6 @@ export function useSubagentTabs({
   resolveSubagentIdToAgentId: ChatMessagesAPI['resolveSubagentIdToAgentId'];
   hydrateTaskTranscript: ChatMessagesAPI['hydrateTaskTranscript'];
   saveScrollPosition: () => void;
-  scrollPositionsRef: { current: Record<string, number> };
-  skipSubagentAutoScrollRef: { current: boolean };
   activeAgentIdRef: { current: string };
   resolvedThreadIdRef: { current: string };
 }) {
@@ -90,10 +86,6 @@ export function useSubagentTabs({
     if (newAgentId === activeAgentIdRef.current) return;
     const wasMain = activeAgentIdRef.current === 'main';
     saveScrollPosition();
-    // If destination has a saved position, skip auto-scroll so restore wins
-    if (scrollPositionsRef.current[newAgentId] != null) {
-      skipSubagentAutoScrollRef.current = true;
-    }
     setActiveAgentId(newAgentId);
 
     // Sync URL with active agent
@@ -109,7 +101,7 @@ export function useSubagentTabs({
       // browser back should return to the parent view just left.
       navigate(`/chat/t/${tid}/${taskSlug}`, { replace: !wasMain && !opts?.push, state: { workspaceId } });
     }
-  }, [saveScrollPosition, threadId, workspaceId, navigate, activeAgentIdRef, scrollPositionsRef, skipSubagentAutoScrollRef, resolvedThreadIdRef, setActiveAgentId]);
+  }, [saveScrollPosition, threadId, workspaceId, navigate, activeAgentIdRef, resolvedThreadIdRef, setActiveAgentId]);
 
   // Ensure new active agents are visible (remove from hidden list)
   useEffect(() => {
@@ -463,12 +455,9 @@ export function useSubagentTabs({
     const urlAgentId = initialTaskId ? `task:${initialTaskId}` : 'main';
     if (urlAgentId !== activeAgentIdRef.current) {
       saveScrollPosition();
-      if (scrollPositionsRef.current[urlAgentId] != null) {
-        skipSubagentAutoScrollRef.current = true;
-      }
       setActiveAgentId(urlAgentId);
     }
-  }, [initialTaskId, saveScrollPosition, activeAgentIdRef, scrollPositionsRef, skipSubagentAutoScrollRef, setActiveAgentId]);
+  }, [initialTaskId, saveScrollPosition, activeAgentIdRef, setActiveAgentId]);
 
   // Refresh subagent card data on deep link / browser forward (guarded to run once per taskId)
   const lastRefreshedTaskRef = useRef<string | undefined>(undefined);

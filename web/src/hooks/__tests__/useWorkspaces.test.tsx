@@ -108,4 +108,25 @@ describe('useAllWorkspaces', () => {
     expect(result.current.data?.workspaces).toHaveLength(105);
     expect(mockGetWorkspaces).toHaveBeenNthCalledWith(2, 100, 100, 'custom', false);
   });
+
+  it('keeps the first copy of a row that moved up between pages', async () => {
+    // ws-150 is used between the two reads and jumps to the top, so the
+    // second page, read at offset 100, starts one row later and repeats it.
+    const before = Array.from({ length: 205 }, (_, i) => ({ workspace_id: `ws-${i}`, name: `before-${i}` }));
+    const after = [before[150], ...before.filter((_, i) => i !== 150)].map((ws) => ({ ...ws, name: 'after' }));
+    mockGetWorkspaces.mockImplementation(async (limit: number, offset: number) => ({
+      workspaces: (offset === 0 ? before : after).slice(offset, offset + limit),
+      total: 205,
+    }));
+
+    const { result } = renderHookWithProviders(() => useAllWorkspaces({ sortBy: 'activity' }));
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    const ids = result.current.data!.workspaces.map((ws) => ws.workspace_id);
+    expect(new Set(ids).size).toBe(ids.length);
+    expect(ids).toHaveLength(204);
+    expect(result.current.data!.workspaces.find((ws) => ws.workspace_id === 'ws-99')?.name).toBe('before-99');
+    // Paged by what the server sent, not by what was kept.
+    expect(mockGetWorkspaces).toHaveBeenNthCalledWith(3, 100, 200, 'activity', false);
+  });
 });

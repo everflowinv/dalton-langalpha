@@ -1,6 +1,6 @@
 import { useId } from 'react';
 import { cn } from '@/lib/utils';
-import { RUN_HOVER, RUN_ROW, RunGlyph } from '../messageList/runCard';
+import { RUN_FOCUS, RUN_HOVER, RUN_ROW, RunGlyph } from '../messageList/runCard';
 import { AnalystMark } from './AnalystMark';
 import { columnGlyph, type HandoffView } from './handoffModel';
 import { HandoffAction, HandoffAnnouncement, HandoffMetaLine, HandoffStatus, HandoffTitleLine } from './HandoffParts';
@@ -15,16 +15,25 @@ import { HandoffAction, HandoffAnnouncement, HandoffMetaLine, HandoffStatus, Han
  * stands for every row's avatar, so the avatar's place holds where the run
  * stands, centered under the mark, and the line under the task keeps only
  * the words.
+ *
+ * The row can hold focus, though Tab passes it by, for the card it replaced
+ * to hand focus on to: a hand-off approved a moment ago has no thread to open
+ * yet, so nothing in it is a control, and a keyboard user's place would
+ * otherwise fall to the page.
  */
 export function HandoffSlip({ view, grouped = false }: { view: HandoffView; grouped?: boolean }) {
   const taskId = useId();
   const metaId = useId();
   const statusId = useId();
   const { phase, onOpen } = view;
-  const Row = grouped ? 'li' : 'div';
 
   return (
-    <Row data-handoff-phase={phase} className={cn(RUN_ROW, '@container', onOpen && RUN_HOVER)}>
+    <div
+      data-handoff-phase={phase}
+      data-handoff-member={view.id}
+      tabIndex={-1}
+      className={cn(RUN_ROW, RUN_FOCUS, '@container', onOpen && RUN_HOVER)}
+    >
       {grouped ? (
         <span aria-hidden className="flex justify-center">
           <RunGlyph kind={columnGlyph(phase)} large />
@@ -49,6 +58,6 @@ export function HandoffSlip({ view, grouped = false }: { view: HandoffView; grou
         read={view.read}
         live={!grouped}
       />
-    </Row>
+    </div>
   );
 }

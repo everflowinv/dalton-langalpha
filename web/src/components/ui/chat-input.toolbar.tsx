@@ -62,7 +62,7 @@ export function useToolbarItems({
 
   const allSelected = scope === 'all';
   const scopeLabel = allSelected
-    ? t('agents.allWorkspaces')
+    ? t('agents.chiefOfStaff')
     : workspaces?.find((w) => w.workspace_id === selectedWorkspaceId)?.name || t('nav.workspaceFallback');
   // Shown in the picker when the host can say why its workspace list is empty.
   const noWorkspacesHint = !workspaces?.length ? emptyWorkspacesHint : null;
@@ -128,9 +128,9 @@ export function useToolbarItems({
             <span className="min-w-0 max-w-[120px] truncate">{scopeLabel}</span>
           </DropdownMenuSubTrigger>
           <DropdownMenuSubContent className="max-h-64 overflow-y-auto">
-            <DropdownMenuItem title={t('agents.allWorkspacesHint')} onSelect={pickAll}>
+            <DropdownMenuItem title={t('agents.chiefOfStaffHint')} onSelect={pickAll}>
               <Layers className="h-4 w-4 shrink-0" />
-              <span className="truncate">{t('agents.allWorkspaces')}</span>
+              <span className="truncate">{t('agents.chiefOfStaff')}</span>
               {allSelected && <Check className="ml-auto h-4 w-4 shrink-0" />}
             </DropdownMenuItem>
             {hasSecondSection && <DropdownMenuSeparator />}

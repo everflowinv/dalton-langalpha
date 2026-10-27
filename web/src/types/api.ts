@@ -88,7 +88,7 @@ export interface Workspace {
   /** Lifecycle of the workspace's computer. Home reads `'unbound'` until its
    *  first start or turn puts it on one. */
   status?: string;
-  /** The user's Home, where All workspaces runs. Never read Home off `status`. */
+  /** The user's Home, where the Chief of Staff runs. Never read Home off `status`. */
   is_home: boolean;
   description?: string;
   config?: Record<string, unknown>;
@@ -126,6 +126,10 @@ export interface Workspace {
   files_backed_up_at?: string | null;
   created_at?: string;
   updated_at?: string;
+  /** When the workspace was last used; null until it first is. The `activity`
+   *  order reads this, falling back to `updated_at`, which a rename, pin or
+   *  reorder also bumps. */
+  last_activity_at?: string | null;
   [key: string]: unknown;
 }
 

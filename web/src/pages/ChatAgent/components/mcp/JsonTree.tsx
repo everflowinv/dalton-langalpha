@@ -65,7 +65,7 @@ function JsonNode({ value, depth, openDepth, label }: { value: unknown; depth: n
         aria-expanded={open}
       >
         <ChevronRight
-          className="h-3 w-3 shrink-0 transition-transform duration-150"
+          className="h-3 w-3 shrink-0 transition-transform duration-fold"
           style={{ color: 'var(--color-text-tertiary)', transform: open ? 'rotate(90deg)' : 'rotate(0deg)' }}
         />
         <span>

@@ -6,7 +6,7 @@
  * where the reader finishes reading, and collapses to a single card carrying
  * the count, so a turn that wrote six files still ends on one object.
  */
-import React, { useState } from 'react';
+import React, { useContext, useLayoutEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { ChevronDown, Download, PanelRight } from 'lucide-react';
 import {
@@ -21,6 +21,7 @@ import type { OpenFileHandler } from '../../utils/fileLocation';
 import { cardDownloadKey, downloadLabel, useDownloadState } from '../../utils/downloadNotice';
 import type { TurnFile } from '../../utils/turnFiles';
 import { useMessageActions } from './MessageActionsContext';
+import { CollapseClockContext, playEntrance, turnEndDelays } from './transcriptMotion';
 import './TurnFileCards.css';
 
 /** Taller cards than the sources deck, since each carries a name and a meta line. */
@@ -33,8 +34,18 @@ const GEOMETRY: DeckGeometry = {
   minPeekScale: 0.9,
 };
 
+/** The deck drops into place from this far above, in px. */
+const ENTER_RISE_PX = -6;
+
+/** What a fan or a fold puts on the cards: a peek card's content, and the
+ *  front card's count or its door. The front card's own name stays put. */
+const FACES = '.turn-file-card:not(:first-child) > *, .turn-file-count, .turn-file-actions';
+
 interface TurnFileCardsProps {
   files: TurnFile[];
+  /** The reader watched this turn run, so the deck arrives in its ending
+   *  rather than being drawn there (see turnEndDelays). */
+  entering?: boolean;
   onOpenFile: OpenFileHandler;
   onDownloadFile?: (path: string, workspaceId?: string) => void;
   /** Asks the host to bring the unfolded deck into view. Walking up to a scroll
@@ -65,15 +76,37 @@ function CardDownloadItem({ file, onDownloadFile }: {
   );
 }
 
-export function TurnFileCards({ files, onOpenFile, onDownloadFile, onReveal }: TurnFileCardsProps): React.ReactElement | null {
+export function TurnFileCards({ files, entering = false, onOpenFile, onDownloadFile, onReveal }: TurnFileCardsProps): React.ReactElement | null {
   const { t } = useTranslation();
   const [fanned, setFanned] = useState(false);
+  // Fixed at mount: only a deck arriving plays the entrance.
+  const [enter] = useState(entering);
+  const clock = useContext(CollapseClockContext);
   // A card's menu portals outside the deck, so an open menu suspends the
   // outside-click and Escape collapse: otherwise choosing Download would fold
   // the deck shut under the pointer, and Escape would close both at once.
   const [menuOpen, setMenuOpen] = useState(false);
   const n = files.length;
   const rootRef = useDeckCollapse({ open: fanned, onCollapse: () => setFanned(false), suspend: menuOpen });
+
+  // The entrance rides the container, not the cards: a card's own transform
+  // is what the fan animates, and an animation on that property outranks the
+  // transition for as long as it is running.
+  useLayoutEffect(() => (
+    enter && rootRef.current ? playEntrance(rootRef.current, ENTER_RISE_PX, turnEndDelays(clock).deck) : undefined
+  ), [enter, clock, rootRef]);
+
+  // A card's face arrives with the card, so what a fan or a fold puts on the
+  // cards fades in over the slide instead of appearing on the first frame.
+  // Played on the change: kept on as a CSS animation, it played again on every
+  // face each time the deck was drawn anew (a mount, a thread coming back).
+  const shownFan = useRef(fanned);
+  useLayoutEffect(() => {
+    if (shownFan.current === fanned) return;
+    shownFan.current = fanned;
+    const cancels = [...(rootRef.current?.querySelectorAll<HTMLElement>(FACES) ?? [])].map((face) => playEntrance(face));
+    return () => cancels.forEach((cancel) => cancel());
+  }, [fanned, rootRef]);
 
   // Unfolding is two things: the deck opens, and the transcript makes room for
   // it. The second is the host's to do, so it is asked in the same breath.

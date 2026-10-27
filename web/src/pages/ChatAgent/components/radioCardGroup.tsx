@@ -1,11 +1,11 @@
 /**
- * A labelled radiogroup of bordered option cards: a title, a short
- * description and an optional note (what is left, why it is locked, which one
- * is current).
+ * A labelled radiogroup of bordered options: a title, a short description or
+ * a line of facts, and an optional note (why it is locked, which one is
+ * current).
  *
  * The computer pickers (tier and provider) share it, so a locked option reads
  * and behaves the same in both: faded, unselectable, skipped by the arrows.
- * Each card is a `RadioChoice`, whose native input owns the keyboard.
+ * Each option is a `RadioChoice`, whose native input owns the keyboard.
  */
 import React, { useId } from 'react';
 
@@ -15,14 +15,11 @@ import { cn } from '@/lib/utils';
 export interface RadioCardOption<V extends string> {
   value: V;
   title: string;
-  /** A sentence under the title. */
+  /** A short line under the title. */
   description?: string;
-  /**
-   * Short facts in place of a sentence, such as a spec's vCPU, RAM and disk:
-   * one dotted line on a stacked card, one per line on a narrow column.
-   */
+  /** Short facts in place of a sentence, such as a spec's vCPU, RAM and disk, read as one dotted line. */
   facts?: string[];
-  /** Beside the title, or under the text on a narrow column. */
+  /** Beside the title on a card, at the far end of a row. */
   note?: string | null;
   disabled: boolean;
 }
@@ -31,7 +28,7 @@ interface RadioCardGroupProps<V extends string> {
   options: RadioCardOption<V>[];
   value: V | null;
   onChange: (value: V) => void;
-  /** Shown above the cards, and the group's accessible name. */
+  /** Shown above the options, and the group's accessible name. */
   label: string;
   /**
    * Cards side by side once the group is wide enough for that many, stacked
@@ -39,6 +36,13 @@ interface RadioCardGroupProps<V extends string> {
    * narrower than the screen it sits on.
    */
   columns?: 1 | 2 | 3;
+  /**
+   * `rows` sets each option on one compact row, its facts on a single line
+   * after the title and its note at the far end, for options told apart by a
+   * few facts (the sizes). The facts drop under the title, whole, on a row
+   * too narrow for them.
+   */
+  layout?: 'cards' | 'rows';
 }
 
 // Literal class names, so Tailwind's scanner sees them.
@@ -50,13 +54,15 @@ export function RadioCardGroup<V extends string>({
   onChange,
   label,
   columns = 1,
+  layout = 'cards',
 }: RadioCardGroupProps<V>) {
   // One id names the native group and prefixes every element id below it.
   const name = useId();
   const labelId = `${name}-label`;
-  // Three across leaves a card too narrow for a note beside its title, so
-  // there the note drops under the text and the facts stack.
-  const narrow = columns === 3;
+  const rows = layout === 'rows';
+  // Three across leaves a card little room: its padding tightens there, and
+  // its note moves under the text.
+  const narrow = !rows && columns === 3;
 
   return (
     <div className="flex flex-col gap-1.5">
@@ -64,7 +70,11 @@ export function RadioCardGroup<V extends string>({
         {label}
       </span>
       <div className="@container">
-        <div className={cn('grid gap-2', GRID_COLUMNS[columns])} role="radiogroup" aria-labelledby={labelId}>
+        <div
+          className={cn('grid', rows ? 'gap-1.5' : cn('gap-2', GRID_COLUMNS[columns]))}
+          role="radiogroup"
+          aria-labelledby={labelId}
+        >
           {options.map(({ value: id, title, description, facts, note, disabled }, index) => {
             const selected = value === id;
             const hasFacts = !!facts?.length;
@@ -75,6 +85,51 @@ export function RadioCardGroup<V extends string>({
             // Named by its title alone, so the note and the detail are read as
             // its description rather than as part of the name.
             const describedBy = [note && noteId, hasDetail && detailId].filter(Boolean).join(' ') || undefined;
+            const titleEl = (
+              <span
+                id={titleId}
+                className={cn('text-sm font-medium', rows && 'w-24 shrink-0')}
+                style={{ color: 'var(--color-text-primary)' }}
+              >
+                {title}
+              </span>
+            );
+            const noteEl = note && (
+              <span
+                id={noteId}
+                className={cn(
+                  'text-xs whitespace-nowrap',
+                  rows && 'ms-auto',
+                  // Three across, a note beside a long title would break the
+                  // title, so it closes the card instead.
+                  narrow && '@md:order-last @md:mt-0.5 @md:basis-full',
+                )}
+                style={{ color: 'var(--color-text-tertiary)' }}
+              >
+                {note}
+              </span>
+            );
+            const detailEl = hasDetail && (
+              <span
+                id={detailId}
+                className={cn(
+                  'text-xs',
+                  hasFacts && 'tabular-nums',
+                  // Whole, so a fact never breaks away from the line it is on.
+                  rows ? 'whitespace-nowrap' : 'mt-0.5 basis-full',
+                )}
+                style={{ color: 'var(--color-text-tertiary)' }}
+              >
+                {hasFacts
+                  ? facts?.map((fact, i) => (
+                      <React.Fragment key={i}>
+                        {i > 0 && ' · '}
+                        {fact}
+                      </React.Fragment>
+                    ))
+                  : description}
+              </span>
+            );
             return (
               <RadioChoice
                 key={id}
@@ -86,10 +141,11 @@ export function RadioCardGroup<V extends string>({
                 size="md"
                 aria-labelledby={titleId}
                 aria-describedby={describedBy}
-                markClassName="mt-0.5"
+                markClassName={rows ? undefined : 'mt-0.5'}
                 className={cn(
-                  'items-start gap-3 rounded-lg border p-3 transition-colors',
-                  narrow && '@md:gap-2 @md:p-2.5',
+                  'gap-3 rounded-lg border transition-colors',
+                  rows ? 'items-center px-3 py-2.5' : 'items-start p-3',
+                  narrow && '@md:p-2.5',
                   !selected && !disabled && 'hover:bg-(--color-bg-subtle)',
                 )}
                 // Selection is carried by neutrals that hold on any fill, the
@@ -100,40 +156,19 @@ export function RadioCardGroup<V extends string>({
                   backgroundColor: selected ? 'var(--color-bg-hover)' : undefined,
                 }}
               >
-                <span className="flex min-w-0 flex-1 flex-wrap items-baseline justify-between gap-x-2">
-                  <span id={titleId} className="text-sm font-medium" style={{ color: 'var(--color-text-primary)' }}>
-                    {title}
+                {rows ? (
+                  <span className="flex min-w-0 flex-1 flex-wrap items-baseline gap-x-3 gap-y-0.5">
+                    {titleEl}
+                    {detailEl}
+                    {noteEl}
                   </span>
-                  {note && (
-                    <span
-                      id={noteId}
-                      className={cn(
-                        'text-xs whitespace-nowrap',
-                        narrow && '@md:order-last @md:mt-1 @md:basis-full @md:whitespace-normal',
-                      )}
-                      style={{ color: 'var(--color-text-tertiary)' }}
-                    >
-                      {note}
-                    </span>
-                  )}
-                  {hasDetail && (
-                    <span
-                      id={detailId}
-                      className={cn('mt-0.5 basis-full text-xs', hasFacts && 'tabular-nums')}
-                      style={{ color: 'var(--color-text-tertiary)' }}
-                    >
-                      {hasFacts
-                        ? facts?.map((fact, i) => (
-                            <React.Fragment key={i}>
-                              {/* Heard on a column too, where the lines alone separate them. */}
-                              {i > 0 && <span className={cn(narrow && '@md:sr-only')}> · </span>}
-                              <span className={cn(narrow && '@md:block')}>{fact}</span>
-                            </React.Fragment>
-                          ))
-                        : description}
-                    </span>
-                  )}
-                </span>
+                ) : (
+                  <span className="flex min-w-0 flex-1 flex-wrap items-baseline justify-between gap-x-2">
+                    {titleEl}
+                    {noteEl}
+                    {detailEl}
+                  </span>
+                )}
               </RadioChoice>
             );
           })}

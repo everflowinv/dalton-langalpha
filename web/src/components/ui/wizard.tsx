@@ -11,7 +11,7 @@ import { Check } from 'lucide-react';
 import { LanguageToggle } from '@/components/LanguageToggle';
 import { Loader } from '@/components/ui/loader';
 import { AnimatePresence, motion, useIsPresent, useReducedMotion, type Variants } from '@/lib/framer';
-import { EASE_OUT, EASE_REVEAL } from '@/lib/motion';
+import { DURATION, EASE_REVEAL, SPRING_INDICATOR, TWEEN } from '@/lib/motion';
 import { useTheme } from '@/contexts/ThemeContext';
 import { cn } from '@/lib/utils';
 import logoLight from '@/assets/img/logo.svg';
@@ -141,8 +141,11 @@ const STEP_SHIFT = 24;
  * fades as it moves off the way the user is going, and the next comes in from
  * that side once it is nearly gone, so the two are never read over each other.
  * The step a flow opens on has no direction to tell and rises into place.
- * Exits are shorter than entrances, as everywhere (lib/motion.ts).
+ * Exits are shorter than entrances, as everywhere (lib/motion.ts), and the
+ * next step waits half the exit, by when the one leaving is nearly gone.
  */
+const STEP_HANDOVER = DURATION.exit / 2;
+
 const STEP_MOTION: Variants = {
   enter: ({ direction, still }: StepCustom) =>
     still ? { opacity: 0 } : direction === 0 ? { opacity: 0, y: 8 } : { opacity: 0, x: direction * STEP_SHIFT },
@@ -151,14 +154,14 @@ const STEP_MOTION: Variants = {
     x: 0,
     y: 0,
     transition: {
-      default: { delay: 0.07, duration: 0.34, ease: EASE_OUT },
-      opacity: { delay: 0.07, duration: 0.24, ease: EASE_REVEAL },
+      default: { ...TWEEN.enter, delay: STEP_HANDOVER },
+      opacity: { delay: STEP_HANDOVER, duration: DURATION.fold, ease: EASE_REVEAL },
     },
   },
   leave: ({ direction, still }: StepCustom) => ({
     opacity: 0,
     x: still ? 0 : direction * -(STEP_SHIFT / 2),
-    transition: { duration: 0.1, ease: [0.4, 0, 1, 1] },
+    transition: TWEEN.exit,
   }),
 };
 
@@ -295,7 +298,7 @@ export function WizardProgress({ steps, current, label }: WizardProgressProps) {
               {i > 0 && <span aria-hidden="true" className="h-px w-4 bg-(--color-border-default)" />}
               <span
                 className={cn(
-                  'flex items-center gap-1.5 whitespace-nowrap text-xs transition-colors duration-200',
+                  'flex items-center gap-1.5 whitespace-nowrap text-xs transition-colors',
                   state === 'current' && 'font-medium text-(--color-text-primary)',
                   state === 'done' && 'text-(--color-text-secondary)',
                   state === 'upcoming' && 'text-(--color-text-tertiary)',
@@ -332,7 +335,7 @@ function StepMark({ state, dot }: { state: 'done' | 'current' | 'upcoming'; dot:
     return (
       <motion.span
         layoutId={dot}
-        transition={{ duration: 0.34, ease: EASE_OUT }}
+        transition={SPRING_INDICATOR}
         aria-hidden="true"
         className="h-1.5 w-1.5 rounded-full bg-(--color-accent-primary)"
       />
@@ -349,7 +352,7 @@ export function WizardExit({ label, onClick, testId }: { label: string; onClick:
       type="button"
       onClick={onClick}
       data-testid={testId}
-      className="inline-flex h-8 items-center rounded-md px-2.5 text-sm text-(--color-text-secondary) transition-[color,background-color,scale] duration-150 hover:bg-(--color-bg-hover) hover:text-(--color-text-primary) motion-safe:active:scale-[0.97]"
+      className="inline-flex h-8 items-center rounded-md px-2.5 text-sm text-(--color-text-secondary) press hover:bg-(--color-bg-hover) hover:text-(--color-text-primary)"
     >
       {label}
     </button>
@@ -432,7 +435,7 @@ export interface WizardFooterProps {
 // felt before the next screen arrives; never when it is disabled, since that
 // press does nothing.
 const ghost =
-  'inline-flex h-10 items-center justify-center rounded-md px-3 text-sm font-medium text-(--color-text-secondary) transition-[color,background-color,scale] duration-150 hover:bg-(--color-bg-hover) hover:text-(--color-text-primary) motion-safe:active:scale-[0.97]';
+  'inline-flex h-10 items-center justify-center rounded-md px-3 text-sm font-medium text-(--color-text-secondary) press hover:bg-(--color-bg-hover) hover:text-(--color-text-primary)';
 
 /**
  * Back on the left, the way forward on the right, in the same place on every
@@ -467,7 +470,7 @@ export function WizardFooter({ back, skip, primary }: WizardFooterProps) {
           onClick={primary.onClick}
           disabled={disabled}
           aria-busy={primary.busy || undefined}
-          className="inline-flex h-11 w-full items-center justify-center rounded-md bg-(--color-btn-primary-bg) px-5 text-sm font-medium text-(--color-btn-primary-text) transition-[opacity,scale] duration-150 hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-40 motion-safe:enabled:active:scale-[0.98] sm:h-10 sm:w-auto sm:min-w-[7.5rem]"
+          className="inline-flex h-11 w-full items-center justify-center rounded-md bg-(--color-btn-primary-bg) px-5 text-sm font-medium text-(--color-btn-primary-text) press hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-40 sm:h-10 sm:w-auto sm:min-w-[7.5rem]"
         >
           {/* Live work: the shared glyph beside the label, never in its place. */}
           {primary.busy && (

@@ -45,7 +45,7 @@ function WorkspaceTile({
     <button
       type="button"
       onClick={onOpen}
-      className="group relative flex flex-col text-left overflow-hidden rounded-[10px] border transition-colors duration-200"
+      className="group relative flex flex-col text-left overflow-hidden rounded-[10px] border transition-colors"
       style={{
         background: isHome
           ? 'linear-gradient(135deg, var(--color-accent-soft) 0%, var(--color-bg-card) 75%)'
@@ -86,7 +86,7 @@ function WorkspaceTile({
           </span>
         </div>
         <ArrowUpRight
-          className="h-3.5 w-3.5 shrink-0 opacity-0 -translate-x-0.5 translate-y-0.5 transition-all duration-200 group-hover:opacity-100 group-hover:translate-x-0 group-hover:translate-y-0"
+          className="h-3.5 w-3.5 shrink-0 opacity-0 -translate-x-0.5 translate-y-0.5 transition-all group-hover:opacity-100 group-hover:translate-x-0 group-hover:translate-y-0"
           style={{ color: 'var(--color-text-secondary)' }}
         />
       </div>

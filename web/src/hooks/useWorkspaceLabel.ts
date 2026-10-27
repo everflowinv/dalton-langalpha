@@ -18,8 +18,8 @@ export interface WorkspaceText {
 
 /**
  * A workspace's display text. Home, where the Chief of Staff runs, keeps its
- * stored name and description for older clients; the UI calls it "All
- * workspaces", the choice it stands for, and describes that choice.
+ * stored name and description for older clients; the UI names it after the
+ * agent you talk to there, "Chief of Staff", and says what that agent does.
  */
 export function useWorkspaceText(): (workspace: LabelledWorkspace | null | undefined) => WorkspaceText {
   const { t } = useTranslation();
@@ -27,9 +27,9 @@ export function useWorkspaceText(): (workspace: LabelledWorkspace | null | undef
     (workspace) => {
       if (isHomeWorkspace(workspace)) {
         return {
-          name: t('agents.allWorkspaces'),
-          description: t('agents.widgets.allWorkspacesDesc'),
-          tag: t('agents.widgets.tagAllWorkspaces'),
+          name: t('agents.chiefOfStaff'),
+          description: t('agents.widgets.chiefOfStaffDesc'),
+          tag: t('agents.widgets.tagChiefOfStaff'),
         };
       }
       return {

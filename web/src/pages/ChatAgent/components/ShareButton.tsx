@@ -227,14 +227,14 @@ export default function ShareButton({ threadId, initialIsShared = false, workspa
               <button
                 onClick={() => handleToggleShare(!isShared)}
                 disabled={updating}
-                className="relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200"
+                className="relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors"
                 style={{
                   backgroundColor: isShared ? 'var(--color-accent-primary)' : 'var(--color-border-muted)',
                   opacity: updating ? 0.6 : 1,
                 }}
               >
                 <span
-                  className="pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow-sm ring-0 transition duration-200"
+                  className="pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow-sm ring-0 transition"
                   style={{ transform: isShared ? 'translateX(16px)' : 'translateX(0)' }}
                 />
               </button>

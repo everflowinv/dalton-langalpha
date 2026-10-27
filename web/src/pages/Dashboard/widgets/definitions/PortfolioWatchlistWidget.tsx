@@ -1,7 +1,7 @@
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useLocale } from '@/hooks/useLocale';
-import { AnimatePresence, motion } from '@/lib/framer';
+import { SwapCell } from '@/components/ui/crossfade';
 import { Wallet } from 'lucide-react';
 import { useDashboardContext } from '../framework/DashboardDataContext';
 import { registerWidget } from '../framework/WidgetRegistry';
@@ -200,7 +200,11 @@ function PortfolioWatchlistWidget({
     },
   });
 
+  // The tabs dissolve in one cell at the same scroll offset, so a tab opens at
+  // its top rather than out of view below a short list.
+  const contentRef = useRef<HTMLDivElement>(null);
   const switchTab = (tab: PWTabKey) => {
+    if (tab !== activeTab) contentRef.current?.scrollTo({ top: 0 });
     setActiveTab(tab);
     updateConfig({ defaultTab: tab });
   };
@@ -289,16 +293,19 @@ function PortfolioWatchlistWidget({
         </div>
       </div>
 
-      <div className="flex-1 min-h-0 overflow-y-auto pr-1">
-        <AnimatePresence mode="wait">
+      {/* The tabs dissolve in one grid cell, so a switch never passes through
+          an empty widget. */}
+      <div ref={contentRef} className="flex-1 min-h-0 overflow-y-auto pr-1">
+        <SwapCell
+          as="div"
+          className="items-start"
+          appear
+          shift={{ y: 10 }}
+          swapKey={activeTab}
+          layerClassName="flex flex-col gap-1"
+        >
           {activeTab === 'watchlist' ? (
-            <motion.div
-              key="watchlist"
-              initial={{ opacity: 0, y: 10 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: -10 }}
-              className="flex flex-col gap-1"
-            >
+            <>
               {showWatchlistSkeleton ? (
                 <HoldingsSkeleton count={5} />
               ) : (
@@ -323,15 +330,9 @@ function PortfolioWatchlistWidget({
                 ))
               )}
               <HoldingsAddButton label={t('dashboard.widgets.portfolioWatchlist.addSymbol')} onClick={watchlistHandlers.onAdd} />
-            </motion.div>
+            </>
           ) : (
-            <motion.div
-              key="portfolio"
-              initial={{ opacity: 0, y: 10 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: -10 }}
-              className="flex flex-col gap-1"
-            >
+            <>
               {hasRealHoldings && (
                 <PortfolioNavSummary
                   rows={portfolio.rows}
@@ -367,9 +368,9 @@ function PortfolioWatchlistWidget({
               )}
 
               <HoldingsAddButton label={t('dashboard.widgets.portfolioWatchlist.addTransaction')} onClick={portfolioHandlers.onAdd} />
-            </motion.div>
+            </>
           )}
-        </AnimatePresence>
+        </SwapCell>
       </div>
     </div>
   );

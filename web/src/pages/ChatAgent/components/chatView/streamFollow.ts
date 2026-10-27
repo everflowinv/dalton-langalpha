@@ -1,200 +1,303 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, type RefObject } from 'react';
+import { cubicBezier } from '@/lib/framer';
+import { DURATION, EASE_REVEAL } from '@/lib/motion';
+import { isPageUnseen } from '@/lib/pageVisibility';
 import { prefersReducedMotion } from '@/lib/reducedMotion';
-import { AT_BOTTOM_PX, NEAR_BOTTOM_PX, createSettleWindow, isNearBottom } from '../../utils/scrollHelpers';
-import { anchorTop, findMessageElement, type AnchorPart } from '../../utils/scrollDom';
+import { AT_BOTTOM_PX, NEAR_BOTTOM_PX, isNearBottom } from '../../utils/scrollHelpers';
 
 /**
- * Following a streaming transcript. A reader near the bottom is moved to the
- * new bottom in the frame the transcript grows, instantly: a timer of smooth
- * scrolls lagged a fast stream, absorbed the wheel input of a reader trying to
- * leave, and when a block landed mid-animation it stopped short, read as
- * "left", and never followed again. Direction decides intent: an upward scroll
- * leaves unless it ends at the very bottom, so a notch at a time gets away, and
- * a downward one rejoins inside the band. A fold that clamps scrollTop moves up
- * too, but lands on the bottom, so it keeps following.
+ * Following a streaming transcript. A reader near the bottom is carried toward
+ * the new bottom by a glide this engine drives itself, one write per frame.
+ * Not the browser's smooth scroll: a timer of those lagged a fast stream,
+ * absorbed the wheel input of a reader trying to leave, and when a block
+ * landed mid-animation it stopped short, read as "left", and never followed
+ * again. Not an instant set either, which steps the text up a line at a time
+ * and a whole table at once.
+ *
+ * The glide is a critically damped spring toward a bottom re-read every
+ * frame, so growth that lands mid-glide only moves the target. Every position
+ * it writes is recorded, and a scroll event at that position is its own and
+ * decides nothing; anything else is the reader's, or a fold clamping the view.
+ * This record is the one way the scroll code tells its own scrolls from the
+ * reader's, so every scroll it makes goes through here (`jump`, `land`).
+ * Direction decides intent: an upward scroll leaves unless it ends at the very
+ * bottom, so a notch at a time gets away, and a downward one rejoins inside the
+ * band. A move up that leaves the end no further away is layout's (a fold
+ * clamping, the browser's scroll anchoring) and decides nothing; it is judged
+ * as soon as layout makes it (`resized`), since by its scroll event the end may
+ * have grown away. A reader's input stops a glide in the frame it arrives
+ * (`stop`, on INTENT_EVENTS). With reduced motion, or on a page nobody is
+ * watching, every move is instant, as the follow always was.
  */
 export interface StreamFollow {
-  /** Reads a scroll event. False for a follow's own, which decides nothing.
-   *  `judge` false leaves the flag alone, for a landing something else chose. */
-  scrolled(judge?: boolean): boolean;
-  /** Moves a following reader to the new bottom, for growth. */
+  /** Reads a scroll event, and for the reader's own move decides whether they
+   *  still ride the end. False for this engine's own, for any move under a
+   *  landing, and for a move up that layout made, which decide nothing. */
+  scrolled(): boolean;
+  /** Reads the view right after a layout that resized the transcript (its
+   *  ResizeObserver). A move up that layout made there is known from then on,
+   *  as a write is: its scroll event comes a frame later, and growth landing
+   *  before it would leave the end further away and pass the clamp off as the
+   *  reader leaving. A reader's move up only adds to the distance, so it is
+   *  left for its scroll event to judge. */
+  resized(): void;
+  /** Carries a following reader toward the new bottom, for growth. */
   follow(): void;
+  /** Glides to `target`, re-read every frame so it can move while the view
+   *  travels, and calls `onEnd` once it is there or was stopped short. Null
+   *  from `target` ends it where it is. */
+  land(target: () => number | null, onEnd?: () => void): void;
+  /** Puts the view at `top` now, as this engine's own scroll. */
+  jump(top: number): void;
+  /** Ends a glide or a landing where it is. */
+  stop(): void;
+  /** The reader is moving the view toward the start (`towardStart`). For as
+   *  long as one such move takes, a move up is theirs even when the end
+   *  shrinks in with it, as it does while a row below folds. */
+  pulled(): void;
+  /** A landing is under way: it owns the position until it ends. */
+  readonly landing: boolean;
 }
 
+// The chase's natural frequency, rad/s. Its time constant (1/ω, 83 ms) spreads
+// a new line over about a quarter second, so lines arriving at a reading pace
+// blend into one slow drift instead of a step per line, and a following reader
+// trails a steady stream by 2u/ω (10 px at a typical 60 px/s).
+const CHASE_OMEGA = 12;
+// Past this gap the spring stiffens with the square root of it, so a burst
+// several lines tall still lands within a few hundred ms and a fast stream's
+// lag stays under the room the streaming indicator and the bottom padding
+// leave below the newest line.
+const CHASE_LAG_PX = 64;
+// A frame that took longer (a long task, a tab coming back) integrates as this
+// long rather than as one leap across the whole gap.
+const MAX_STEP_S = 0.05;
+const FIRST_STEP_S = 1 / 60;
+// About as long as a browser's smooth scroll for one wheel notch or key press.
+const PULL_MS = 300;
+
+/** Moves that should land at once: the reader asked for less motion, or the
+ *  page applies them unseen (see lib/pageVisibility). */
+function instantMoves(): boolean {
+  return prefersReducedMotion() || isPageUnseen();
+}
+
+const landEase = cubicBezier(...EASE_REVEAL);
+const LAND_MS = DURATION.reveal * 1000;
+
+type Motion =
+  | { kind: 'chase' }
+  | { kind: 'land'; from: number; start: number | null; target: () => number | null; onEnd?: () => void };
+
 export function createStreamFollow(c: HTMLElement, following: { current: boolean }): StreamFollow {
+  const bottom = () => Math.max(0, c.scrollHeight - c.clientHeight);
+  // Where the view last was by this engine's, layout's or the reader's doing.
+  // A write sets it, so a reader who scrolls between a write and its scroll
+  // event (a frame later) is measured from where the engine put them, or a
+  // notch up from there would read as a move down and be pulled back.
   let lastTop = c.scrollTop;
-  // The scroll event of a follow arrives a frame after it. A block that lands
-  // in between, a chart or a table, leaves the bottom further away than the
-  // band, so that event is the follow's own and changes nothing. A reader who
-  // scrolls in between is measured from where the follow put them, or a notch
-  // up from there would read as a move down and be pulled back.
-  let followTop: number | null = null;
+  // How far the end was from there.
+  let lastGap = bottom() - lastTop;
+  // Where the view is known to be before its scroll event says so: the last
+  // write as the scroller reports it (rounded to its pixel grid), or a move
+  // layout made (`resized`). A scroll event there is not the reader's.
+  let wrote: number | null = null;
+  // The glide's own position, unrounded, and its velocity in px/s.
+  let x = c.scrollTop;
+  let v = 0;
+  let motion: Motion | null = null;
+  let raf = 0;
+  let lastFrame = 0;
+  // Set across a write, for a scroll event dispatched inside it, before
+  // `wrote` can say where it landed.
+  let writing = false;
+  // When the reader last moved the view toward the start.
+  let pulledAt = -Infinity;
+
+  // Takes where the view is as this engine's own: its scroll event, when it
+  // comes, decides nothing.
+  const own = (top: number) => {
+    wrote = top;
+    lastTop = top;
+    lastGap = bottom() - top;
+  };
+  const write = (top: number) => {
+    x = top;
+    writing = true;
+    try {
+      c.scrollTo({ top });
+    } finally {
+      writing = false;
+    }
+    own(c.scrollTop);
+  };
+  // A move up from the last known place that leaves the end no further away:
+  // anchoring holds the view as a row above it closes, and a clamp follows the
+  // bottom in. The reader's own move up adds itself to the distance, which
+  // growth below only adds to, but a row folding below takes it away again,
+  // so while the reader is moving up the move is theirs.
+  const byLayout = (top: number, gap: number) => {
+    const up = lastTop - top;
+    return up > 0 && gap - lastGap < up - 1 && performance.now() - pulledAt >= PULL_MS;
+  };
+  const schedule = () => {
+    if (!raf) raf = requestAnimationFrame(frame);
+  };
+  // Ends whatever is moving the view, and tells a landing it is over.
+  const end = () => {
+    if (raf) cancelAnimationFrame(raf);
+    raf = 0;
+    lastFrame = 0;
+    v = 0;
+    const was = motion;
+    motion = null;
+    if (was?.kind === 'land') was.onEnd?.();
+  };
+
+  function frame(now: number) {
+    raf = 0;
+    const m = motion;
+    if (!m) return;
+    const dt = lastFrame ? Math.min(MAX_STEP_S, Math.max(0, (now - lastFrame) / 1000)) : FIRST_STEP_S;
+    lastFrame = now;
+    // Moved by something else since the last write (a fold clamping the view,
+    // a pin, the browser's scroll anchoring): carry on from there, at rest.
+    if (wrote === null || Math.abs(c.scrollTop - wrote) >= 1) {
+      x = c.scrollTop;
+      v = 0;
+    }
+    if (m.kind === 'land') {
+      const target = m.target();
+      if (target == null) return end();
+      // Timed from the frame before its first, on the frames' own clock, so
+      // the first frame already moves.
+      m.start ??= now - FIRST_STEP_S * 1000;
+      const p = Math.min(1, Math.max(0, now - m.start) / LAND_MS);
+      write(m.from + (Math.min(Math.max(0, target), bottom()) - m.from) * landEase(p));
+      if (p >= 1) return end();
+    } else {
+      if (!following.current) return end();
+      const target = bottom();
+      const gap = target - x;
+      if (gap < 0.5) {
+        // There, or the bottom receded under the view, which the browser has
+        // already clamped to.
+        if (gap > 0) write(target);
+        return end();
+      }
+      // The exact step of a critically damped spring over dt: no overshoot
+      // from rest, and stable at any frame time.
+      const w = CHASE_OMEGA * Math.max(1, Math.sqrt(gap / CHASE_LAG_PX));
+      const e = x - target;
+      const k = v + w * e;
+      const decay = Math.exp(-w * dt);
+      v = (v - w * k * dt) * decay;
+      const next = target + (e + k * dt) * decay;
+      if (next >= target) v = 0;
+      write(Math.min(target, next));
+    }
+    schedule();
+  }
+
   return {
-    scrolled(judge = true) {
-      const from = followTop ?? lastTop;
-      const own = followTop !== null && Math.abs(c.scrollTop - followTop) < 1;
-      followTop = null;
-      lastTop = c.scrollTop;
-      if (own) return false;
-      if (!judge) return true;
-      const metrics = { scrollTop: c.scrollTop, scrollHeight: c.scrollHeight, clientHeight: c.clientHeight };
-      following.current = isNearBottom(metrics, c.scrollTop < from ? AT_BOTTOM_PX : NEAR_BOTTOM_PX);
+    scrolled() {
+      if (writing) return false;
+      const top = c.scrollTop;
+      const gap = bottom() - top;
+      const known = wrote !== null && Math.abs(top - wrote) < 1;
+      const layout = byLayout(top, gap);
+      const up = lastTop - top;
+      lastTop = top;
+      lastGap = gap;
+      if (known) return false;
+      // The view has left the last known place, so its scroll event has been
+      // and gone: a reader who comes back to that position later is not it.
+      wrote = null;
+      // A reader's input on the scroller stops a landing before the view moves
+      // (INTENT_EVENTS), so a move under one is layout's: the browser's scroll
+      // anchoring holding content in place as a row above changes size, or a
+      // clamp. Read as the reader's, it took the view from a send's pin halfway
+      // there and left the message wherever the landing had got to.
+      if (motion?.kind === 'land') return false;
+      // Read as the reader's, a fold closing above dropped a glide trailing
+      // the end by more than AT_BOTTOM_PX.
+      if (layout) return false;
+      const metrics = { scrollTop: top, scrollHeight: c.scrollHeight, clientHeight: c.clientHeight };
+      following.current = isNearBottom(metrics, up > 0 ? AT_BOTTOM_PX : NEAR_BOTTOM_PX);
       return true;
     },
+    resized() {
+      if (writing || c.clientHeight === 0) return;
+      const top = c.scrollTop;
+      if (!byLayout(top, bottom() - top)) return;
+      // A glide carries on from here, at rest, as from any move not its own.
+      x = top;
+      v = 0;
+      own(top);
+    },
     follow() {
-      if (!following.current) return;
-      const bottom = c.scrollHeight - c.clientHeight;
-      if (bottom <= c.scrollTop) return;
-      followTop = bottom;
-      c.scrollTo({ top: bottom });
+      if (!following.current || motion?.kind === 'land') return;
+      if (instantMoves()) {
+        end();
+        const target = bottom();
+        if (target > c.scrollTop) write(target);
+        return;
+      }
+      motion ??= { kind: 'chase' };
+      schedule();
+    },
+    land(target, onEnd) {
+      end();
+      if (instantMoves()) {
+        const top = target();
+        if (top != null) write(Math.max(0, top));
+        onEnd?.();
+        return;
+      }
+      motion = { kind: 'land', from: c.scrollTop, start: null, target, onEnd };
+      schedule();
+    },
+    jump(top) {
+      end();
+      write(Math.max(0, top));
+    },
+    stop: end,
+    pulled() {
+      pulledAt = performance.now();
+    },
+    get landing() {
+      return motion?.kind === 'land';
     },
   };
 }
 
-/** What the follow policy (useTranscriptFollow) asks of a scroll engine. */
+/** How a turn the reader starts moves the transcript: 'send' and 'restart'
+ *  (an edit, a regenerate, a retry) open a turn under the reader's message,
+ *  'steer' adds to one already running. */
+export type TurnStart = 'send' | 'restart' | 'steer';
+
+/** What the follow policy (useTranscriptFollow) asks of a transcript's follow. */
 export interface StreamFollowControls {
-  /** Follows again from the bottom wherever the reader was, for a turn the
-   *  reader starts. */
-  rejoin(): void;
+  /** Takes the reader to the turn they just started, wherever they were. */
+  rejoin(start: TurnStart): void;
   /** Brings the start of reply bubble `id` under the viewport top, for a turn
    *  that finished under the 'reply_start' preference. */
-  landOnReply(id: string, behavior: 'auto' | 'smooth'): void;
+  landOnReply(id: string): void;
 }
 
 // What a reader does to scroll: a wheel or trackpad, a touch, the scrollbar or
-// a click, a key. A landing's own scrolls cannot be told from the reader's by
-// position (a smooth one passes through any), so one of these ends the hold.
+// a click, a key. A move the reader makes is never told from a glide's by
+// position alone, so one of these stops the glide before it writes again.
 export const INTENT_EVENTS = ['wheel', 'touchstart', 'pointerdown', 'keydown'] as const;
 
-/**
- * The follow for a scroller that keeps no position to restore, so the first
- * observation follows too and a thread opens at its end. `shown` re-attaches
- * it when the content mounts. Later growth is followed only while `active`:
- * in a settled transcript it is the reader's own doing, a row opened, and
- * stays where they put it. `landOnReply` moves only a reader the follow was
- * carrying and stops following, and a reply that fits on screen moves nothing.
- * `reveal` is a link's jump to a message (`onRevealMessage`).
- */
-export function useStreamFollow(
-  scroller: RefObject<HTMLElement | null>,
-  content: RefObject<HTMLElement | null>,
-  shown: boolean,
-  active: boolean,
-): StreamFollowControls & { reveal(id: string): boolean } {
-  const activeRef = useRef(active);
-  const attachedRef = useRef<(StreamFollowControls & { settled(): void; reveal(id: string): boolean }) | null>(null);
-  // The commit that ends a turn or a history load carries its last growth,
-  // and the observer reports it only after this has marked the transcript
-  // settled. Followed here instead, where layout already measures it, and
-  // for one settle window after, while the typewriter types out what it still
-  // held and late media lands.
-  useLayoutEffect(() => {
-    if (activeRef.current && !active) attachedRef.current?.settled();
-    activeRef.current = active;
-  }, [active]);
-  useEffect(() => {
-    const c = scroller.current;
-    const el = content.current;
-    if (!c || !el) return;
-    const following = { current: true };
-    const stream = createStreamFollow(c, following);
-    // A landed reply, or a message a link jumped to, is held under the
-    // viewport top through the main chat's settle window, re-measured on every
-    // resize: the settled turn folds its work away above the reply right after
-    // it lands.
-    let held: { id: string; part?: AnchorPart; top: number } | null = null;
-    const settle = createSettleWindow(() => {
-      held = null;
-    });
-    // After a turn ends, its growth is still followed until the transcript
-    // has been quiet for the settle window or the reader does anything.
-    let tail = false;
-    const tailWindow = createSettleWindow(() => {
-      tail = false;
-    });
-    const release = () => {
-      held = null;
-      settle.clear();
-      tail = false;
-      tailWindow.clear();
-    };
-    let lastHeight = -1;
-    const ro = new ResizeObserver((entries) => {
-      const height = entries[0]?.contentRect.height ?? lastHeight;
-      const follow = lastHeight < 0 || (height > lastHeight && (activeRef.current || tail));
-      lastHeight = height;
-      if (held) {
-        const top = anchorTop(c, held.id, held.part);
-        if (top == null) {
-          release();
-          return;
-        }
-        // Growth below the reply moves nothing, and leaves a smooth landing
-        // still under way alone.
-        if (Math.abs(top - held.top) >= 1) {
-          held.top = top;
-          c.scrollTo({ top });
-        }
-        settle.arm();
-      } else if (follow) {
-        stream.follow();
-        if (tail) tailWindow.arm();
-      }
-    });
-    const onScroll = () => { stream.scrolled(!held); };
-    c.addEventListener('scroll', onScroll, { passive: true });
-    for (const type of INTENT_EVENTS) c.addEventListener(type, release, { passive: true });
-    ro.observe(el);
-    attachedRef.current = {
-      settled() {
-        tail = true;
-        tailWindow.arm();
-        stream.follow();
-      },
-      rejoin() {
-        release();
-        following.current = true;
-        stream.follow();
-      },
-      landOnReply(id, behavior) {
-        if (!following.current) return;
-        const top = anchorTop(c, id, 'reply');
-        if (top == null || top >= c.scrollHeight - c.clientHeight - 1) return;
-        following.current = false;
-        held = { id, part: 'reply', top };
-        c.scrollTo({ top, behavior });
-        settle.arm();
-      },
-      reveal(id) {
-        const el = findMessageElement(c, id);
-        const top = el && anchorTop(c, id);
-        if (!el || top == null) return false;
-        // Under the viewport top and held there, as the main chat's jump
-        // lands; a message too near the end for that is where the follow
-        // already reads.
-        const bottom = c.scrollHeight - c.clientHeight;
-        const atEnd = top >= bottom - 1;
-        following.current = atEnd;
-        held = atEnd ? null : { id, top };
-        c.scrollTo({ top: Math.min(top, bottom), behavior: prefersReducedMotion() ? 'auto' : 'smooth' });
-        if (!atEnd) settle.arm();
-        el.focus({ preventScroll: true });
-        return true;
-      },
-    };
-    return () => {
-      release();
-      attachedRef.current = null;
-      c.removeEventListener('scroll', onScroll);
-      for (const type of INTENT_EVENTS) c.removeEventListener(type, release);
-      ro.disconnect();
-    };
-  }, [scroller, content, shown]);
-  const rejoin = useCallback(() => attachedRef.current?.rejoin(), []);
-  const landOnReply = useCallback(
-    (id: string, behavior: 'auto' | 'smooth') => attachedRef.current?.landOnReply(id, behavior),
-    [],
-  );
-  const reveal = useCallback((id: string) => attachedRef.current?.reveal(id) ?? false, []);
-  return { rejoin, landOnReply, reveal };
+// Keys that scroll toward the start.
+const UP_KEYS = new Set(['ArrowUp', 'PageUp', 'Home']);
+
+/** Whether an INTENT_EVENTS event moves the view toward the start: a wheel up,
+ *  or a key that scrolls up. A pointer or a touch does not say which way, and
+ *  a pointer is as often a click on a row that folds. */
+export function towardStart(e: Event): boolean {
+  if (e.type === 'wheel') return (e as WheelEvent).deltaY < 0;
+  if (e.type !== 'keydown') return false;
+  const { key, shiftKey } = e as KeyboardEvent;
+  return UP_KEYS.has(key) || (key === ' ' && shiftKey);
 }

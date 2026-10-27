@@ -7,7 +7,6 @@ import type { SSEEvent, ContextWindowCallbacks, TokenUsage } from '../../session
 import type { AssistantMessage } from '@/types/chat';
 import type { ThreadTokenTotals } from '../../utils/api/messages';
 import { updateMessage } from './messageHelpers';
-import { nextArrivalSeq } from '../../session/streamRefs';
 
 /**
  * One model call's usage folded into the ring's state. The newest call sets
@@ -100,7 +99,6 @@ function handleContextWindowEvent(event: SSEEvent, { getMsgId, nextOrder, setMes
           return {
             ...aMsg,
             contentSegments: [...(aMsg.contentSegments || []), { type: 'notification' as const, content: text, order, detail }],
-            arrivalSeq: nextArrivalSeq(aMsg),
           };
         }));
       } else {
@@ -152,7 +150,6 @@ function handleContextWindowEvent(event: SSEEvent, { getMsgId, nextOrder, setMes
               return {
                 ...aMsg,
                 contentSegments: [...(aMsg.contentSegments || []), { type: 'notification' as const, content: text, order }],
-                arrivalSeq: nextArrivalSeq(aMsg),
               };
             }));
           } else {

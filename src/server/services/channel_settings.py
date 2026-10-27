@@ -58,7 +58,7 @@ class _Model(BaseModel):
 
 
 class _Binding(_Model):
-    # Null is All workspaces, where the Chief of Staff answers.
+    # Null is the Chief of Staff, who answers from Home.
     workspace_id: str | None
     # Labels for the reader, ignored on input: the workspace's name, which
     # this server fills, and the chat's, which the gateway keeps.

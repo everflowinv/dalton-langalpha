@@ -20,18 +20,18 @@ function snapshot(overrides: Partial<ChartSelectionSnapshot> = {}): ChartSelecti
 describe('createUserMessage — chartSelections', () => {
   it('attaches a non-empty chartSelections array', () => {
     const sels = [snapshot()];
-    const msg = createUserMessage('hi', undefined, null, null, sels);
+    const msg = createUserMessage('hi', undefined, { chartSelections: sels });
     expect(msg.chartSelections).toBe(sels);
     expect(msg.chartSelections).toHaveLength(1);
   });
 
   it('leaves chartSelections undefined for an empty array', () => {
-    const msg = createUserMessage('hi', undefined, null, null, []);
+    const msg = createUserMessage('hi', undefined, { chartSelections: [] });
     expect(msg.chartSelections).toBeUndefined();
   });
 
   it('leaves chartSelections undefined for null', () => {
-    const msg = createUserMessage('hi', undefined, null, null, null);
+    const msg = createUserMessage('hi', undefined, { chartSelections: null });
     expect(msg.chartSelections).toBeUndefined();
   });
 
@@ -41,7 +41,7 @@ describe('createUserMessage — chartSelections', () => {
   });
 
   it('builds a well-formed user message regardless of selections', () => {
-    const msg = createUserMessage('analyze this', undefined, null, null, [snapshot()]);
+    const msg = createUserMessage('analyze this', undefined, { chartSelections: [snapshot()] });
     expect(msg.role).toBe('user');
     expect(msg.content).toBe('analyze this');
     expect(msg.contentType).toBe('text');

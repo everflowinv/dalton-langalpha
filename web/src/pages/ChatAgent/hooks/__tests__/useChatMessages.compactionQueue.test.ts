@@ -181,6 +181,7 @@ describe('useChatMessages – queued send during compaction', () => {
       await result.current.handleSendMessage('deferred question');
     });
     expect(mockSendStream).not.toHaveBeenCalled();
+    const parkedId = result.current.messages.find((m) => m.role === 'user')?.id;
 
     // Compaction completes → the flush effect starts a fresh turn (no turn was
     // running, so it is sent rather than steered).
@@ -193,6 +194,12 @@ describe('useChatMessages – queued send during compaction', () => {
     });
     expect(mockSendStream.mock.calls[0][0]).toBe('deferred question');
     expect(result.current.queuedSend).toBe(false);
+    // The sent message takes over the parked bubble's id, so the list keeps
+    // that bubble mounted instead of playing its entrance a second time.
+    const userMsgs = result.current.messages.filter((m) => m.role === 'user');
+    expect(userMsgs).toHaveLength(1);
+    expect(userMsgs[0].id).toBe(parkedId);
+    expect((userMsgs[0] as { queued?: boolean }).queued).toBeUndefined();
   });
 
   it('drops the queued message when the user stops mid-compaction', async () => {
@@ -419,6 +426,9 @@ describe('useChatMessages – queued send during compaction', () => {
       await result.current.handleSendMessage('deferred');
     });
     expect(result.current.queuedSend).toBe('deferred');
+    const parkedId = result.current.messages.find(
+      (m) => m.role === 'user' && (m as { queued?: boolean }).queued,
+    )?.id;
 
     // Compaction finishes; turn still running → steer.
     await act(async () => {
@@ -431,8 +441,9 @@ describe('useChatMessages – queued send during compaction', () => {
       expect(mockSendStream).toHaveBeenCalledTimes(2);
     });
     const userMsgs = result.current.messages.filter((m) => m.role === 'user');
-    const lastUser = userMsgs[userMsgs.length - 1] as { steering?: boolean };
+    const lastUser = userMsgs[userMsgs.length - 1] as { steering?: boolean; id?: unknown };
     expect(lastUser?.steering).toBe(true);
+    expect(lastUser?.id).toBe(parkedId);
     expect(result.current.queuedSend).toBe(false);
 
     firstHang.resolve({ disconnected: false });
@@ -440,6 +451,70 @@ describe('useChatMessages – queued send during compaction', () => {
       await firstSend.catch(() => undefined);
       await Promise.resolve();
     });
+  });
+
+  it('keeps the parked bubble\'s id while it waits behind a refused steer, and when it goes out', async () => {
+    // A steer refused as not_running waits for the ended turn to let go. The
+    // message parked meanwhile joins it at the flush, and goes out after it:
+    // one bubble on screen throughout, so it never enters a second time.
+    const firstHang = deferred<{ disconnected: boolean }>();
+    mockSendStream.mockImplementation(
+      async (_msg: string, _ws: string, _tid: string | null, { onEvent }: { onEvent: OnEvent }) => {
+        const call = mockSendStream.mock.calls.length;
+        if (call === 1) {
+          onEvent({ event: 'thread_id', thread_id: 'thread-q-3' });
+          return firstHang.promise;
+        }
+        if (call === 2) {
+          throw Object.assign(new Error('The turn has ended.'), {
+            status: 409,
+            errorInfo: { code: 'not_running', message: 'The turn has ended.' },
+          });
+        }
+        return { disconnected: false };
+      },
+    );
+    const { result } = renderHookWithProviders(() => useChatMessages('ws-test'));
+    const bubbles = (text: string) =>
+      result.current.messages.filter((m) => m.role === 'user' && m.content === text) as Array<{ id: string; steering?: boolean }>;
+
+    let firstSend: Promise<unknown> = Promise.resolve();
+    await act(async () => {
+      firstSend = result.current.handleSendMessage('running turn');
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(result.current.isLoading).toBe(true));
+    await act(async () => {
+      await result.current.handleSendMessage('refused steer');
+    });
+    expect(mockSendStream).toHaveBeenCalledTimes(2);
+
+    act(() => {
+      result.current.setIsCompacting('summarize');
+    });
+    await act(async () => {
+      await result.current.handleSendMessage('deferred');
+    });
+    const parkedId = bubbles('deferred')[0]?.id;
+    expect(parkedId).toBeDefined();
+
+    await act(async () => {
+      result.current.setIsCompacting(false);
+      await Promise.resolve();
+    });
+    expect(mockSendStream).toHaveBeenCalledTimes(2);
+    expect(bubbles('deferred')).toMatchObject([{ id: parkedId, steering: true }]);
+
+    firstHang.resolve({ disconnected: false });
+    await act(async () => {
+      await firstSend.catch(() => undefined);
+    });
+    await waitFor(() => expect(mockSendStream).toHaveBeenCalledTimes(4));
+    expect(mockSendStream.mock.calls[2][0]).toBe('refused steer');
+    expect(mockSendStream.mock.calls[3][0]).toBe('deferred');
+    expect(bubbles('deferred')).toHaveLength(1);
+    expect(bubbles('deferred')[0].id).toBe(parkedId);
+    expect(bubbles('deferred')[0].steering).toBeFalsy();
   });
 
   it('preserves widget snapshots on the steered bubble after compaction flush', async () => {

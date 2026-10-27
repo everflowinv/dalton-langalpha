@@ -408,7 +408,7 @@
   border: 1px solid var(--color-border-muted);
   cursor: pointer;
   white-space: nowrap;
-  transition: color 0.15s, background 0.15s, border-color 0.15s;
+  transition: color var(--motion-quick) var(--ease-out), background var(--motion-quick) var(--ease-out), border-color var(--motion-quick) var(--ease-out);
 }
 
 .excel-sheet-tab:hover {

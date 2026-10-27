@@ -46,7 +46,7 @@ export function LanguageToggle({ className }: { className?: string }) {
           aria-label={t('common.languageCurrent', { language: here.short })}
           data-testid="language-toggle"
           className={cn(
-            'inline-flex h-8 w-8 shrink-0 items-center justify-center gap-1.5 rounded-md text-sm text-(--color-text-secondary) transition-[color,background-color,scale] duration-150 hover:bg-(--color-bg-hover) hover:text-(--color-text-primary) data-[state=open]:bg-(--color-bg-hover) data-[state=open]:text-(--color-text-primary) motion-safe:active:scale-[0.97] sm:w-auto sm:px-2.5',
+            'inline-flex h-8 w-8 shrink-0 items-center justify-center gap-1.5 rounded-md text-sm text-(--color-text-secondary) press hover:bg-(--color-bg-hover) hover:text-(--color-text-primary) data-[state=open]:bg-(--color-bg-hover) data-[state=open]:text-(--color-text-primary) sm:w-auto sm:px-2.5',
             className,
           )}
         >

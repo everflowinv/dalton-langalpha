@@ -44,18 +44,6 @@ interface ToolCallChunkRecord {
 }
 
 /**
- * Next value of a message's monotonic arrival counter. Every landed reply
- * text chunk or context notice bumps it, so a bubble can tell "text is still
- * flowing" from "the turn has gone quiet" without re-measuring everything it
- * holds. Thought text does not: its row may be folded, so the bubble counts
- * it itself, and only while the row is open. Nor do tool-argument chunks: the
- * indicator keeps going through a tool call.
- */
-export function nextArrivalSeq(msg: { arrivalSeq?: unknown }): number {
-  return ((msg.arrivalSeq as number) ?? 0) + 1;
-}
-
-/**
  * Initializes per-task ref state if it doesn't exist yet.
  * Shared by all subagent event handlers to avoid repeated boilerplate.
  * @param {Object} refs - Refs object with subagentStateRefs

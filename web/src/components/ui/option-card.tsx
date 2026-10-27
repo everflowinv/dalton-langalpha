@@ -98,14 +98,14 @@ export function OptionCard<V extends string>({
       data-testid={testId}
       data-state={checked ? 'checked' : 'unchecked'}
       className={cn(
-        'rings-within flex items-start gap-3 rounded-lg border px-4 py-3.5 transition-[color,background-color,border-color,scale] duration-150',
+        'rings-within flex items-start gap-3 rounded-lg border px-4 py-3.5',
         // Ink, as the app's other choice rows are: amber annotates, it does
         // not select (DESIGN.md, accent discipline).
         checked
           ? 'border-(--color-text-primary) bg-(--color-bg-tag)'
           : 'border-(--color-border-muted) bg-(--color-bg-card) hover:border-(--color-border-default)',
         // A press gives a little, so a pick is felt as the check fills.
-        'cursor-pointer motion-safe:active:scale-[0.99]',
+        'cursor-pointer press',
       )}
     >
       <input
@@ -130,7 +130,7 @@ export function OptionCard<V extends string>({
       {icon && (
         <span
           aria-hidden="true"
-          className="mt-px flex h-5 shrink-0 items-center transition-colors duration-150"
+          className="mt-px flex h-5 shrink-0 items-center transition-colors"
           style={{ color: checked ? 'var(--color-text-primary)' : 'var(--color-text-tertiary)' }}
         >
           {icon}
@@ -140,7 +140,7 @@ export function OptionCard<V extends string>({
         // A well, as a quote list sets its charts in.
         <span
           aria-hidden="true"
-          className="flex shrink-0 rounded-md bg-(--color-bg-page) shadow-[inset_0_0_0_1px_var(--color-border-muted)] transition-colors duration-150"
+          className="flex shrink-0 rounded-md bg-(--color-bg-page) shadow-[inset_0_0_0_1px_var(--color-border-muted)] transition-colors"
           style={{ color: checked ? 'var(--color-text-primary)' : 'var(--color-text-tertiary)' }}
         >
           <svg width={MEDIA_WIDTH} height={MEDIA_HEIGHT} viewBox={`0 0 ${MEDIA_WIDTH} ${MEDIA_HEIGHT}`} fill="none">
@@ -177,7 +177,7 @@ function CheckMark({ checked }: { checked: boolean }) {
   return (
     <span
       aria-hidden="true"
-      className="mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded-full border transition-colors duration-150"
+      className="mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded-full border transition-colors"
       style={
         checked
           ? { backgroundColor: 'var(--color-btn-primary-bg)', borderColor: 'var(--color-btn-primary-bg)' }
@@ -186,7 +186,7 @@ function CheckMark({ checked }: { checked: boolean }) {
     >
       <Check
         className={cn(
-          'h-2.5 w-2.5 transition-[opacity,scale] duration-200 ease-[cubic-bezier(0.16,1,0.3,1)]',
+          'h-2.5 w-2.5 transition-[opacity,scale]',
           checked ? 'scale-100 opacity-100' : 'opacity-0 motion-safe:scale-50',
         )}
         strokeWidth={3.5}

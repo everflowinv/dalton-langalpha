@@ -2,6 +2,7 @@ import React from 'react';
 import { useTranslation } from 'react-i18next';
 import type { OrderAction, OrderMode } from '@/types/orders';
 import { cn } from '@/lib/utils';
+import { Disclosure } from '@/components/ui/Disclosure';
 import { DirectToolRowMark } from './DirectToolMark';
 import { OrderModeBadge } from '@/components/orders/OrderModeBadge';
 import { OrderTicket } from './OrderTicket';
@@ -102,11 +103,15 @@ export function OrderCard({
       </div>
       {ticket && <OrderTicket ticket={ticket} />}
       {notice}
-      {footer && (
-        <div className="mt-2.5 pt-2.5" style={{ borderTop: '1px solid var(--color-border-muted)' }}>
+      {/* Folds shut rather than dropping out: an approved order keeps its card
+          until the brokerage answers, and a footer gone in one frame jumped
+          everything below it. Padding, not margin, so the space above the
+          rule folds with it. */}
+      <Disclosure open={!!footer} className="pt-2.5">
+        <div className="pt-2.5" style={{ borderTop: '1px solid var(--color-border-muted)' }}>
           {footer}
         </div>
-      )}
+      </Disclosure>
     </div>
   );
 }

@@ -305,6 +305,8 @@ export interface TodoListProcess {
 
 export interface PendingToolCallChunk {
   toolName: string | null;
+  /** From the first chunk when the producer sends it; matches the landed call. */
+  toolCallId: string | null;
   chunkCount: number;
   argsLength: number;
   firstSeenAt: number;
@@ -539,6 +541,9 @@ export type UserMessage = {
    *  of it: the bubble opens no turn of the server's, and an edit of it goes
    *  out as a send. */
   unadmitted?: boolean;
+  /** Sent from this view, as against drawn from history, a replay or a
+   *  reconnect: only such a bubble arrives with an entrance (isFreshSend). */
+  sentHere?: true;
 };
 
 export type AssistantMessage = {
@@ -594,10 +599,6 @@ export type AssistantMessage = {
    *  flags its own copy too, and a turn with it offers no Regenerate
    *  (`hiddenOpenerTurns`). */
   hiddenOpener?: boolean;
-  /** Monotonic counter bumped by every landed reply text chunk or context
-   *  notice (`nextArrivalSeq`). The streaming indicator reads it to tell
-   *  arriving text from a pause. */
-  arrivalSeq?: number;
   /** Server settlement instant supplied by historical replay. */
   completedAt?: number;
   /** Local observation of completion, stop, or failure. Not set on transport

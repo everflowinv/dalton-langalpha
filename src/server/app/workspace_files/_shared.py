@@ -5,8 +5,11 @@ in ``services/workspace_files``."""
 from __future__ import annotations
 
 import asyncio
+import codecs
 import logging
-from collections.abc import Mapping, Sequence
+import re
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from typing import Any
 
 from charset_normalizer import from_bytes
@@ -37,6 +40,7 @@ from src.server.services.persistence.transfer import (
 )
 from src.server.services.persistence.resolve import (
     FileBytesUnavailable,
+    resolve_file_byte_range,
     resolve_file_bytes,
     too_large_to_serve,
 )
@@ -67,16 +71,36 @@ async def http_file_bytes(file_record: dict[str, Any], *, user_id: str) -> bytes
     """
     if too_large_to_serve(file_record):
         raise HTTPException(status_code=413, detail=TOO_LARGE_DETAIL)
-    try:
+    with _unavailable_as_503(file_record):
         content = await resolve_file_bytes(file_record, user_id=user_id)
+    if content is None:
+        raise HTTPException(status_code=404, detail="File content not available")
+    return content
+
+
+async def http_file_byte_range(
+    file_record: dict[str, Any], offset: int, length: int, *, user_id: str
+) -> tuple[bytes, int] | None:
+    """``resolve_file_byte_range`` with :func:`http_file_bytes`'s 503.
+
+    Not bound by the serving limit, since nothing holds the whole file. None
+    is a row to answer whole, which is also where an empty row gets its 404.
+    """
+    with _unavailable_as_503(file_record):
+        return await resolve_file_byte_range(
+            file_record, offset, length, user_id=user_id
+        )
+
+
+@contextmanager
+def _unavailable_as_503(file_record: dict[str, Any]) -> Iterator[None]:
+    try:
+        yield
     except FileBytesUnavailable as e:
         logger.warning(f"Blob unavailable for {file_record.get('file_path')!r}: {e}")
         raise HTTPException(
             status_code=503, detail="File content temporarily unavailable"
         ) from None
-    if content is None:
-        raise HTTPException(status_code=404, detail="File content not available")
-    return content
 
 
 async def http_file_text(file_record: dict[str, Any], *, user_id: str) -> str:
@@ -485,6 +509,56 @@ def _is_text_content_type(content_type: str) -> bool:
         or ct.endswith("+json")
         or ct.endswith("+xml")
     )
+
+
+# One closed range. The digit bound keeps a position inside what the shell's
+# integers can hold, and nothing longer than the longest such header is parsed.
+_BYTE_RANGE = re.compile(r"bytes=(\d{1,18})-(\d{1,18})", re.ASCII | re.IGNORECASE)
+_BYTE_RANGE_MAX_CHARS = 64
+_PRECONDITIONS = (
+    "if-range",
+    "if-match",
+    "if-none-match",
+    "if-modified-since",
+    "if-unmodified-since",
+)
+
+
+def requested_byte_range(headers: Mapping[str, str]) -> tuple[int, int] | None:
+    """``(first, last)`` of a request asking for one closed byte range.
+
+    Anything else goes whole, as without the header, which a server may always
+    do: an open-ended range, since a client resuming a download with
+    ``bytes=N-`` would keep a capped answer as the rest of the file; several
+    ranges or a suffix, which no client of these routes sends; and any
+    conditional request, since its validator belongs to the whole answer.
+    """
+    header = headers.get("range")
+    if not header or len(header) > _BYTE_RANGE_MAX_CHARS:
+        return None
+    if any(name in headers for name in _PRECONDITIONS):
+        return None
+    match = _BYTE_RANGE.fullmatch(header.strip())
+    if match is None:
+        return None
+    first, last = int(match[1]), int(match[2])
+    if last < first:
+        return None
+    return first, last
+
+
+
+def may_be_utf8(head: bytes, *, whole: bool) -> bool:
+    """False once a file's first bytes already rule out :func:`_is_utf8` of the
+    whole file, the test that decides whether a whole answer is redacted.
+
+    A character the head cuts off is no error unless the head is the file.
+    """
+    try:
+        codecs.getincrementaldecoder("utf-8")().decode(head, final=whole)
+    except UnicodeDecodeError:
+        return False
+    return True
 
 
 def _is_utf8(data: bytes) -> bool:

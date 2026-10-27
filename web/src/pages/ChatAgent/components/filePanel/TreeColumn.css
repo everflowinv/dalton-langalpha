@@ -6,7 +6,7 @@
      a status dot without wrapping, which is what buys the tighter padding. */
   padding: 5px 10px;
   cursor: pointer;
-  transition: background-color 0.15s;
+  transition: background-color var(--motion-quick) var(--ease-out);
 }
 .file-panel-item:hover,
 .file-panel-item-context-active {
@@ -30,7 +30,7 @@
   background-color: var(--color-border-muted);
   opacity: 0;
   pointer-events: none;
-  transition: opacity 0.15s ease;
+  transition: opacity var(--motion-quick) var(--ease-out);
 }
 .file-tree-root:hover .file-tree-indent-guide {
   opacity: 1;
@@ -74,7 +74,7 @@
   background: transparent;
   color: var(--color-text-tertiary);
   cursor: pointer;
-  transition: all 0.15s;
+  transition: all var(--motion-quick) var(--ease-out);
   white-space: nowrap;
 }
 .file-panel-chip:hover {
@@ -116,7 +116,7 @@
   font-size: 0.75rem;
   color: var(--color-text-tertiary);
   cursor: pointer;
-  transition: background-color 0.1s;
+  transition: background-color var(--motion-quick) var(--ease-out);
 }
 .file-panel-sort-item:hover {
   background-color: var(--color-border-muted);
@@ -134,7 +134,7 @@
   padding: 6px 16px;
   cursor: pointer;
   user-select: none;
-  transition: background-color 0.15s;
+  transition: background-color var(--motion-quick) var(--ease-out);
 }
 .file-panel-dir-header:hover {
   background-color: var(--color-border-muted);
@@ -158,9 +158,9 @@
   background: var(--color-loss-soft);
   color: var(--color-loss);
   cursor: pointer;
-  transition: all 0.15s;
+  transition: all var(--motion-quick) var(--ease-out);
   white-space: nowrap;
-  animation: confirm-pulse 0.3s ease-out;
+  animation: confirm-pulse var(--motion-enter) var(--ease-out);
 }
 .file-panel-delete-confirm-btn:hover:not(:disabled) {
   background: var(--color-loss-soft);
@@ -191,7 +191,7 @@
   height: 6px;
   border-radius: 50%;
   flex-shrink: 0;
-  transition: all 0.2s ease;
+  transition: all var(--motion-quick) var(--ease-out);
 }
 .file-panel-backup-dot.backed-up {
   background-color: var(--color-profit-muted);

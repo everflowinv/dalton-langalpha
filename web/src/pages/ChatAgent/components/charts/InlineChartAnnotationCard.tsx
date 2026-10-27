@@ -134,7 +134,7 @@ export function InlineChartAnnotationCard({
           fontSize: '0.75rem',
           color: TEXT_COLOR,
           cursor: 'pointer',
-          transition: 'border-color 0.15s',
+          transition: 'border-color var(--motion-quick) var(--ease-out)',
         }}
         onMouseEnter={(e) => (e.currentTarget.style.borderColor = ACCENT)}
         onMouseLeave={(e) =>

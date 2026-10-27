@@ -28,7 +28,7 @@ import { useThreadSubagents } from '../../ChatAgent/hooks/useThreadSubagents';
 import { useThreadTuning } from '../../ChatAgent/hooks/useThreadTuning';
 import { ThreadNotices } from '../../ChatAgent/components/chatView/ThreadNotices';
 import { DispatchStatusProvider } from '../../ChatAgent/hooks/usePTCDispatchStatus';
-import { useStreamFollow } from '../../ChatAgent/components/chatView/streamFollow';
+import { useStreamFollow } from '../../ChatAgent/components/chatView/transcriptFollow';
 import { useTranscriptFollow } from '../../ChatAgent/components/chatView/useTranscriptFollow';
 import { useActiveThreadPublisher } from '@/lib/threadLifecycle/useActiveThreadPublisher';
 import { appendPathSuffix, getPreviewUrl, summarizeThread, offloadThread } from '../../ChatAgent/utils/api';
@@ -94,7 +94,7 @@ interface MarketChatPanelProps {
   interval: string;
   scope: ComposerScope;
   onScopeChange: (scope: ComposerScope) => void;
-  /** The workspace the chat runs in: Home under All workspaces, else the
+  /** The workspace the chat runs in: Home under the Chief of Staff, else the
    *  selected one. Null until it resolves. */
   activeWorkspaceId: string | null;
   workspaces: Workspace[];
@@ -306,7 +306,10 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
   // Set when the user stops a running turn, so the input placeholder reflects it.
   const [wasStopped, setWasStopped] = useState(false);
 
-  const messagesContainerRef = useRef<HTMLDivElement | null>(null);
+  // The transcript's scroller and its content, as elements for its follow:
+  // the content mounts only once there is a transcript to show.
+  const [messagesContainer, setMessagesContainer] = useState<HTMLDivElement | null>(null);
+  const [transcript, setTranscript] = useState<HTMLDivElement | null>(null);
 
   // The user's confirmed chart selections (region / price level). Render a chip
   // per selection that still matches the live chart instance — selections drawn
@@ -319,7 +322,7 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
     [selections, liveSym, liveTf],
   );
 
-  // With no workspace to pick, the scope picker still offers All workspaces
+  // With no workspace to pick, the scope picker still offers the Chief of Staff
   // and says why the workspace list is empty.
   const emptyWorkspacesHint = workspaces.length === 0 ? t('agents.market.workspaceDisabledReason') : null;
 
@@ -455,7 +458,7 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
   // contract as ChatAgent (no unseen dot for watched finishes, seen on open).
   useActiveThreadPublisher(threadId);
 
-  // All workspaces runs the default model, as the full agent does in a workspace.
+  // The Chief of Staff runs the default model, as the full agent does in a workspace.
   const threadModel = useThreadModel({ threadId, isLoading });
   const threadSubagents = useThreadSubagents({ threadId });
   const { toSend: subagentsToSend } = threadSubagents;
@@ -481,13 +484,12 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
     queryClient.invalidateQueries({ queryKey: queryKeys.threads.byWorkspace(activeWorkspaceId) });
   }, [threadId, symbol, activeWorkspaceId, setSearchParams, queryClient]);
 
-  const transcriptRef = useRef<HTMLDivElement | null>(null);
   const showTranscript = messages.length > 0 || isLoading || isLoadingHistory;
-  const follow = useStreamFollow(messagesContainerRef, transcriptRef, showTranscript, isLoading || isLoadingHistory);
+  const follow = useStreamFollow(messagesContainer, transcript, { live: isLoading, loading: isLoadingHistory });
   const { handleSendMessage, handleEditMessage, handleRegenerate, handleRetry } = useTranscriptFollow(
     chat,
     follow,
-    () => messagesContainerRef.current,
+    () => messagesContainer,
     readTurnEndScroll(preferences),
   );
 
@@ -752,9 +754,9 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
     stableThumbUp, stableThumbDown, stableWidgetSendPrompt, follow.reveal,
   ]);
 
-  // In All workspaces, carry the source thread/workspace into a PTC-agent
+  // In the Chief of Staff, carry the source thread/workspace into a PTC-agent
   // proposal so its "open in chat" deep-link lands back here. Null in a
-  // workspace, since only All workspaces hands work off to the workspaces.
+  // workspace, since only the Chief of Staff hands work off to the workspaces.
   // Memoized: a fresh object per render would defeat the memoized bubbles downstream.
   const dispatcherContext = useMemo(
     () =>
@@ -791,7 +793,7 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
     fontSize: '0.75rem',
     fontWeight: 500,
     cursor: 'pointer',
-    transition: 'background 0.15s, border-color 0.15s, color 0.15s',
+    transition: 'background var(--motion-quick) var(--ease-out), border-color var(--motion-quick) var(--ease-out), color var(--motion-quick) var(--ease-out)',
   };
   const headerBtnHover = (e: React.MouseEvent<HTMLButtonElement>) => {
     e.currentTarget.style.background = 'var(--color-bg-hover)';
@@ -868,7 +870,7 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
 
       {/* Messages */}
       <div
-        ref={messagesContainerRef}
+        ref={setMessagesContainer}
         style={{ flex: 1, minHeight: 0, overflowY: 'auto', overflowX: 'hidden' }}
       >
         {!showTranscript ? (
@@ -884,7 +886,7 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
             )}
           </div>
         ) : (
-          <div ref={transcriptRef} style={{ padding: '16px 24px', maxWidth: '100%' }}>
+          <div ref={setTranscript} style={{ padding: '16px 24px', maxWidth: '100%' }}>
             <ChartSurfaceContext value={chartSurface}>
               <SubagentTelemetryContext value={subagentTelemetry}>
                 <MessageActionsProvider actions={messageActions}>

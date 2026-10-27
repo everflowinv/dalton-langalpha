@@ -3,6 +3,7 @@ import { motion } from '@/lib/framer';
 import { Check, ChevronDown, ChevronRight, FileCheck2, X } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { Loader } from '@/components/ui/loader';
+import { TWEEN } from '@/lib/motion'; // DALTON-HOOK(publish-card): house motion vocabulary replaces the literal tween
 import type { ToolApprovalState } from '@/types/chat';
 import { SettledStep } from '../SettledStep';
 
@@ -513,7 +514,7 @@ export function PublishApprovalCard({
     <motion.div
       initial={{ opacity: 0, y: 8 }}
       animate={{ opacity: 1, y: 0 }}
-      transition={{ duration: 0.4, ease: [0.22, 1, 0.36, 1] }}
+      transition={TWEEN.enter}
       data-testid="publish-approval-card"
     >
       <div className="flex items-center gap-3 pb-3">

@@ -76,9 +76,6 @@ export const DRAG_ACTIVATION_DISTANCE = 8;
 /** Marks a section's drag handle in both kits, so a drag can cross the swap. */
 export const DRAG_HANDLE_ATTR = 'data-drag-handle';
 
-/** The thread block and each thread row clip while their height animates. */
-export const CLIP_STYLE: CSSProperties = { overflow: 'hidden' };
-
 /** A section at rest, as the sortable one styles itself when nothing is dragged. */
 export const SECTION_STYLE: CSSProperties = { position: 'relative', opacity: 1 };
 
@@ -109,16 +106,32 @@ function StaticSection({ wsId, disabled, children }: SectionProps) {
   );
 }
 
+// The shape the interactive kit's measured fold (components/ui/Disclosure)
+// has at rest, open or shut, so the swap between the two moves nothing.
+function StaticFold({ open, children }: { open: boolean; children: ReactNode }) {
+  return (
+    <div hidden={!open} inert={!open || undefined}>
+      <div className="flow-root">{open ? children : null}</div>
+    </div>
+  );
+}
+
 function StaticCollapse({ show, children }: { show: boolean; children: ReactNode }) {
-  return show ? <div style={CLIP_STYLE}>{children}</div> : null;
+  return <StaticFold open={show}>{children}</StaticFold>;
 }
 
 function StaticThreadList({ children }: { children: ReactNode }) {
   return <>{children}</>;
 }
 
+// The interactive row glides in a wrapper of its own, around the fold it
+// arrives and leaves in.
 function StaticThreadItem({ children }: { order: string; children: ReactNode }) {
-  return <div style={CLIP_STYLE}>{children}</div>;
+  return (
+    <div>
+      <StaticFold open>{children}</StaticFold>
+    </div>
+  );
 }
 
 function StaticPinGlyph({ children }: { pinned: boolean; children: ReactNode }) {

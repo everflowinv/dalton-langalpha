@@ -1,6 +1,7 @@
 import React, { useId, useState } from 'react';
-import { AnimatePresence, motion } from '@/lib/framer';
-import { Check, ChevronRight, Circle, X } from 'lucide-react';
+import { Check, Circle, X } from 'lucide-react';
+import { Disclosure } from '@/components/ui/Disclosure';
+import { FoldChevron } from './decisionCardMotion';
 
 /** `none` is a question nobody answered, which only an older thread's plan
  *  can be now. */
@@ -20,6 +21,7 @@ export function SettledStep({
   label,
   reason,
   badge,
+  icon,
   order = false,
   defaultOpen = false,
   testId = 'tool-approval-settled',
@@ -33,6 +35,9 @@ export function SettledStep({
   /** Anything the verdict line carries between the label and the reason, such
    *  as the mode an order was placed in. */
   badge?: React.ReactNode;
+  /** Drawn in place of the verdict's glyph, for an answer the verdict only
+   *  approximates, such as a question skipped. */
+  icon?: React.ReactNode;
   /** Marks the step as an order's, which is what a transcript test keys on to
    *  tell the two settled cards apart. */
   order?: boolean;
@@ -53,16 +58,14 @@ export function SettledStep({
         aria-controls={bodyId}
         className="flex items-center gap-2 py-1 cursor-pointer w-full text-left"
       >
-        <motion.div animate={{ rotate: collapsed ? 0 : 90 }} transition={{ duration: 0.2 }}>
-          <ChevronRight className="h-3.5 w-3.5 shrink-0" style={{ color: 'var(--color-icon-muted)' }} />
-        </motion.div>
-        {approved ? (
+        <FoldChevron open={!collapsed} />
+        {icon ?? (approved ? (
           <Check className="h-4 w-4 shrink-0" style={{ color: 'var(--color-accent-light)' }} />
         ) : rejected ? (
           <X className="h-4 w-4 shrink-0" style={{ color: 'var(--color-text-tertiary)' }} />
         ) : (
           <Circle className="h-3.5 w-3.5 shrink-0" style={{ color: 'var(--color-icon-muted)' }} />
-        )}
+        ))}
         <span
           className="text-sm truncate"
           style={{ color: approved ? 'var(--color-text-tertiary)' : 'var(--color-text-quaternary)' }}
@@ -76,22 +79,11 @@ export function SettledStep({
           </span>
         )}
       </button>
-      <AnimatePresence initial={false}>
-        {!collapsed && (
-          <motion.div
-            id={bodyId}
-            initial={{ height: 0, opacity: 0 }}
-            animate={{ height: 'auto', opacity: 1 }}
-            exit={{ height: 0, opacity: 0 }}
-            transition={{ duration: 0.25, ease: [0.22, 1, 0.36, 1] }}
-            className="overflow-hidden"
-          >
-            <div className="pt-2 pb-1 pl-6" style={{ opacity: rejected ? 0.6 : 0.8 }}>
-              {children}
-            </div>
-          </motion.div>
-        )}
-      </AnimatePresence>
+      <Disclosure open={!collapsed} id={bodyId}>
+        <div className="pt-2 pb-1 pl-6" style={{ opacity: rejected ? 0.6 : 0.8 }}>
+          {children}
+        </div>
+      </Disclosure>
     </div>
   );
 }

@@ -151,10 +151,10 @@ function scheduleLabel(auto: Record<string, unknown> | null | undefined, t: TFun
 /** Where the card's automation ran, or null when the card does not say.
  *  The tool that drew these cards is gone, so every one is kept history, and
  *  names the agent it ran on rather than a workspace: `ptc` ran in one, and
- *  the other, outside any, is All workspaces now. */
+ *  the other, outside any, is the Chief of Staff now. */
 function cardPlace(auto: Record<string, unknown>, t: TFunction): string | null {
   if (!auto.agent_mode) return null;
-  return auto.agent_mode === 'ptc' ? t('automation.detailWorkspace') : t('agents.allWorkspaces');
+  return auto.agent_mode === 'ptc' ? t('automation.detailWorkspace') : t('agents.chiefOfStaff');
 }
 
 const ACCENT = 'var(--color-accent-primary)';

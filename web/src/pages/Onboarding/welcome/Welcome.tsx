@@ -27,8 +27,8 @@ import { useSyncUserLocale } from '@/hooks/useSyncUserLocale';
 import { useUpdatePreferences } from '@/hooks/useUpdatePreferences';
 import { useUser } from '@/hooks/useUser';
 import { formatList } from '@/lib/format';
-import { useReducedMotion } from '@/lib/framer';
 import { queryKeys } from '@/lib/queryKeys';
+import { scrollMotion } from '@/lib/reducedMotion';
 import { warmWorkspace } from '@/pages/ChatAgent/utils/warmWorkspace';
 import { getPreferences } from '@/pages/Dashboard/utils/api';
 import { useOnboarding } from '../OnboardingProvider';
@@ -225,7 +225,6 @@ export function WelcomeFlow({
   // ends, so the agent writes in it from the first reply on.
   const keepLocale = useKeepAccountLocale();
   const brokers = useBrokers();
-  const still = useReducedMotion() ?? false;
 
   const [step, setStep] = useState<WelcomeStepId>(initialStep);
   const [profile, setProfile] = useState<InvestingProfile>(initialProfile);
@@ -334,8 +333,8 @@ export function WelcomeFlow({
     const first = !placedRef.current;
     placedRef.current = true;
     if (!el || (first && current === steps[0])) return;
-    el.scrollIntoView?.({ block: 'start', behavior: first || still ? 'auto' : 'smooth' });
-  }, [current, steps, still]);
+    el.scrollIntoView?.({ block: 'start', behavior: first ? 'auto' : scrollMotion() });
+  }, [current, steps]);
 
   const change = (patch: Partial<InvestingProfile>) => setProfile((p) => ({ ...p, ...patch }));
 

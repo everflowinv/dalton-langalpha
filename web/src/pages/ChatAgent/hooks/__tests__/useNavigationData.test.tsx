@@ -12,8 +12,10 @@ import React from 'react';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { Mock } from 'vitest';
 import { renderHook, waitFor, act } from '@testing-library/react';
-import { QueryClientProvider } from '@tanstack/react-query';
+import { QueryClientProvider, type QueryClient } from '@tanstack/react-query';
 import { createTestQueryClient } from '@/test/utils';
+import { allWorkspacesKey } from '@/hooks/useAllWorkspaces';
+import type { WorkspacesResponse } from '@/types/api';
 import {
   useNavigationData,
   applyStableOrder,
@@ -537,8 +539,47 @@ describe('useNavigationData — drag-reorder workspaces', () => {
     );
     const rendered = renderHook(() => useNavigationData('ws-1'), { wrapper });
     const wsIds = () => rendered.result.current.workspaces.map((ws) => ws.workspace_id);
-    return { ...rendered, wsIds };
+    return { ...rendered, wsIds, queryClient };
   }
+
+  // The gallery's Custom list, cached with no gallery mounted to observe it.
+  const GALLERY_KEY = allWorkspacesKey('custom', true);
+  function seedGallery(queryClient: QueryClient) {
+    queryClient.setQueryDefaults(GALLERY_KEY, { gcTime: Infinity });
+    const rows = ['ws-pin', 'ws-home', 'ws-1', 'ws-2', 'ws-3', 'ws-4'].map((id) => ({ workspace_id: id }));
+    queryClient.setQueryData(GALLERY_KEY, { workspaces: rows, total: rows.length });
+    return () => (queryClient.getQueryData(GALLERY_KEY) as WorkspacesResponse).workspaces;
+  }
+
+  it("puts the gallery's cached list in the new order at once, before the save lands", async () => {
+    const { wsIds, result, queryClient } = setup();
+    await waitFor(() => expect(wsIds().length).toBe(5));
+    const gallery = seedGallery(queryClient);
+    mockReorderWorkspaces.mockReturnValueOnce(new Promise<void>(() => {}));
+
+    act(() => { void result.current.reorderWorkspace('ws-3', 'ws-1'); });
+
+    // A drag there now moves from this order, not the one before it. A row
+    // the sidebar has not loaded keeps its place after the ones it wrote.
+    expect(gallery().map((ws) => ws.workspace_id)).toEqual(['ws-pin', 'ws-home', 'ws-3', 'ws-1', 'ws-2', 'ws-4']);
+    expect(gallery().map((ws) => ws.sort_order)).toEqual([0, 1, 2, 3, 4, undefined]);
+    expect(wsIds()).toEqual(['ws-pin', 'ws-home', 'ws-3', 'ws-1', 'ws-2']);
+  });
+
+  it("puts the gallery's cached list back when persisting fails", async () => {
+    const { wsIds, result, queryClient } = setup();
+    await waitFor(() => expect(wsIds().length).toBe(5));
+    const gallery = seedGallery(queryClient);
+    mockReorderWorkspaces.mockRejectedValueOnce(new Error('boom'));
+
+    await act(async () => {
+      await result.current.reorderWorkspace('ws-3', 'ws-1');
+    });
+
+    expect(gallery().map((ws) => ws.workspace_id)).toEqual(['ws-pin', 'ws-home', 'ws-1', 'ws-2', 'ws-3', 'ws-4']);
+    expect(gallery().every((ws) => ws.sort_order === undefined)).toBe(true);
+    expect(wsIds()).toEqual(['ws-pin', 'ws-home', 'ws-1', 'ws-2', 'ws-3']);
+  });
 
   it('moves the dragged workspace and persists sequential sort_order including Home', async () => {
     const { wsIds, result } = setup();

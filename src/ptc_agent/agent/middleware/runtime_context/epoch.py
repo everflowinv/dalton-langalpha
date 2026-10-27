@@ -101,7 +101,7 @@ class Workspace:
 OTHER_COMPUTERS = (
     "A workspace the user names that has no sibling folder is on another "
     "computer, out of reach of your files. Say so, and that they can use it "
-    "from that workspace or ask their Chief of Staff in All workspaces."
+    "from that workspace or ask their Chief of Staff."
 )
 
 # A computer that is the user's own machine, by its ``computer_machine`` token.

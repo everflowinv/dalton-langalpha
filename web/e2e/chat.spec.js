@@ -137,7 +137,8 @@ test.describe('Workspace Gallery', () => {
     await page.goto('/chat');
     await page.getByPlaceholder('Search workspaces...').fill('Needle');
 
-    await expect(page.getByText('Needle Research', { exact: true })).toBeVisible({
+    // Scoped to the card: the sidebar tree lists the same name.
+    await expect(workspaceCard(page, 'Needle Research')).toBeVisible({
       timeout: 10000,
     });
   });

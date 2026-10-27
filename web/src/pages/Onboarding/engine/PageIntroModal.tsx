@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { AnimatePresence, motion, useReducedMotion, type Variants } from '@/lib/framer';
+import { SwapCell } from '@/components/ui/crossfade';
 import {
   Dialog,
   DialogContent,
@@ -8,11 +8,17 @@ import {
   DialogTitle,
   DialogDescription,
 } from '@/components/ui/dialog';
+import { DURATION } from '@/lib/motion';
 import { cn } from '@/lib/utils';
 import { SceneStage } from './introScenes/SceneStage';
 import { useIntro } from './loadIntro';
 import type { PageIntroDef } from '../registry';
 import './pageIntro.css';
+
+// The intro is a story told a page at a time, so a page turns out and then in
+// rather than crossfading: what arrives waits for what leaves to be gone, and
+// takes the entrance beat. Still one grid cell, so nothing jumps between them.
+const PAGE_TURN = { enterDelay: DURATION.exit, enterDuration: DURATION.enter };
 
 /**
  * One-time contextual intro for the page the user just landed on. Two
@@ -31,7 +37,6 @@ export function PageIntroModal({
   onAbandon: () => void;
 }) {
   const { t } = useTranslation();
-  const reduceMotion = useReducedMotion();
   // Suspends until this intro's copy and scenes are in, so the modal opens
   // whole and the copy below is already there.
   const scenes = useIntro(intro);
@@ -45,21 +50,6 @@ export function PageIntroModal({
   const goTo = (i: number) => {
     setDir(i > stepIdx ? 1 : -1);
     setStepIdx(Math.min(Math.max(i, 0), intro.steps.length - 1));
-  };
-  // Slide distance collapses to a pure (instant) crossfade under reduced motion.
-  const slide = reduceMotion ? 0 : 28;
-  const copyVariants: Variants = {
-    enter: (d: number) => ({ opacity: 0, x: slide * d }),
-    center: {
-      opacity: 1,
-      x: 0,
-      transition: { duration: reduceMotion ? 0 : 0.3, ease: [0.16, 1, 0.3, 1] },
-    },
-    exit: (d: number) => ({
-      opacity: 0,
-      x: -slide * d,
-      transition: { duration: reduceMotion ? 0 : 0.15, ease: 'easeIn' },
-    }),
   };
   const shown = Math.min(stepIdx, intro.steps.length - 1);
   const step = intro.steps[shown];
@@ -116,32 +106,23 @@ export function PageIntroModal({
             </span>
 
             {/* Directional slide-fade per stage: the old copy eases out the way
-                travel is headed, the new copy follows it in. */}
-            <AnimatePresence mode="wait" initial={false} custom={dir}>
-              <motion.div
-                key={step.id}
-                custom={dir}
-                variants={copyVariants}
-                initial="enter"
-                animate="center"
-                exit="exit"
-              >
-                <DialogHeader className="space-y-3 text-left">
-                  <DialogTitle
-                    className="text-2xl font-semibold leading-tight sm:text-[1.75rem]"
-                    style={{ color: 'var(--color-text-primary)' }}
-                  >
-                    {tCopy(`${intro.id}.${step.id}.title`)}
-                  </DialogTitle>
-                  <DialogDescription
-                    className="text-sm leading-relaxed sm:text-[0.9375rem]"
-                    style={{ color: 'var(--color-text-secondary)' }}
-                  >
-                    {tCopy(`${intro.id}.${step.id}.body`)}
-                  </DialogDescription>
-                </DialogHeader>
-              </motion.div>
-            </AnimatePresence>
+                travel is headed, then the new copy follows it in. */}
+            <SwapCell as="div" className="items-start" swapKey={step.id} shift={{ x: 28 * dir }} {...PAGE_TURN}>
+              <DialogHeader className="space-y-3 text-left">
+                <DialogTitle
+                  className="text-2xl font-semibold leading-tight sm:text-[1.75rem]"
+                  style={{ color: 'var(--color-text-primary)' }}
+                >
+                  {tCopy(`${intro.id}.${step.id}.title`)}
+                </DialogTitle>
+                <DialogDescription
+                  className="text-sm leading-relaxed sm:text-[0.9375rem]"
+                  style={{ color: 'var(--color-text-secondary)' }}
+                >
+                  {tCopy(`${intro.id}.${step.id}.body`)}
+                </DialogDescription>
+              </DialogHeader>
+            </SwapCell>
 
             <div className="mt-auto flex items-center gap-3 pt-6">
               <div className="flex items-center gap-1.5">
@@ -153,7 +134,7 @@ export function PageIntroModal({
                     aria-current={i === stepIdx ? 'step' : undefined}
                     onClick={() => goTo(i)}
                     className={cn(
-                      'h-1.5 rounded-full transition-all duration-300 hover:opacity-80 focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2',
+                      'h-1.5 rounded-full transition-all duration-fold hover:opacity-80 focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2',
                       i === stepIdx ? 'w-6' : 'w-1.5'
                     )}
                     style={{
@@ -195,33 +176,25 @@ export function PageIntroModal({
             </div>
           </div>
 
-          {/* Blueprint mockup panel — hidden on small screens where the copy
-              needs the room. Keyed by step: the outgoing scene crossfades
-              out, then the incoming one fades in and its script starts from
-              the top. The motion wrapper only animates opacity, so the
-              stage's scale transform is left alone. */}
+          {/* Blueprint mockup panel, hidden on small screens where the copy
+              needs the room. Keyed by step: the outgoing scene fades out,
+              then the incoming one fades in and its script starts from the
+              top. The swap only animates opacity, so the stage's scale
+              transform is left alone. */}
           <div
-            className={cn('intro-visual hidden items-center sm:flex', visualFirst && 'sm:order-1')}
+            className={cn('intro-visual hidden sm:block', visualFirst && 'sm:order-1')}
             aria-hidden
             data-testid="intro-illustration"
           >
-            <AnimatePresence mode="wait" initial={false}>
-              <motion.div
-                key={step.id}
-                className="flex w-full items-center"
-                initial={{ opacity: 0 }}
-                animate={{
-                  opacity: 1,
-                  transition: { duration: reduceMotion ? 0 : 0.25, ease: 'easeOut' },
-                }}
-                exit={{
-                  opacity: 0,
-                  transition: { duration: reduceMotion ? 0 : 0.15, ease: 'easeIn' },
-                }}
-              >
-                {scene && <SceneStage scene={scene} />}
-              </motion.div>
-            </AnimatePresence>
+            <SwapCell
+              as="div"
+              className="h-full items-center"
+              swapKey={step.id}
+              layerClassName="flex w-full items-center"
+              {...PAGE_TURN}
+            >
+              {scene && <SceneStage scene={scene} />}
+            </SwapCell>
           </div>
         </div>
       </DialogContent>

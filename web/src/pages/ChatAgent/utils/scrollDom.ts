@@ -3,7 +3,7 @@
 // where a reply starts).
 
 // Gap left above a bubble the transcript is pinned to.
-const ANCHOR_OFFSET_PX = 16;
+export const ANCHOR_OFFSET_PX = 16;
 
 export type AnchorPart = 'reply';
 
@@ -44,4 +44,30 @@ export function anchorTop(c: HTMLElement, id: string, part?: AnchorPart, delta?:
   const el = (part === 'reply' && msg.querySelector<HTMLElement>('[data-reply-start]')) || msg;
   const gap = delta == null ? ANCHOR_OFFSET_PX : -delta;
   return Math.max(0, c.scrollTop + el.getBoundingClientRect().top - c.getBoundingClientRect().top - gap);
+}
+
+/** The floating composer's height, which the transcript keeps clear under its
+ *  last line (--composer-h): the band under it is not viewport anything can
+ *  be read in. */
+export function composerHeight(c: HTMLElement): number {
+  return parseFloat(getComputedStyle(c).getPropertyValue('--composer-h')) || 0;
+}
+
+// Breathing room left under a deliverables deck brought into view.
+const REVEAL_GAP_PX = 12;
+
+/** scrollTop that brings the deliverables deck on bubble `id` into view, capped
+ *  so the deck's own top never leaves it: a deck taller than the viewport is
+ *  read from its first card rather than chased past it. Null once the deck is
+ *  gone, which is what retires the pin. */
+export function revealTop(c: HTMLElement, id: string): number | null {
+  const deck = findMessageElement(c, id)?.querySelector<HTMLElement>('.turn-files');
+  if (!deck) return null;
+  const view = c.getBoundingClientRect();
+  const rect = deck.getBoundingClientRect();
+  // clientHeight, not the rect's own bottom: a horizontal scrollbar is not
+  // viewport a card can be read in, and neither is the band under the composer.
+  const needed = Math.max(0, rect.bottom + REVEAL_GAP_PX - (view.top + c.clientHeight - composerHeight(c)));
+  const headroom = Math.max(0, rect.top - view.top);
+  return c.scrollTop + Math.min(needed, headroom);
 }

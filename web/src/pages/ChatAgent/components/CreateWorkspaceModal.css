@@ -60,7 +60,7 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  transition: background-color 0.15s;
+  transition: background-color var(--motion-quick) var(--ease-out);
 }
 
 .cwm-close-btn:hover {
@@ -123,7 +123,7 @@
   border: 1px solid var(--color-border-muted);
   color: var(--color-text-primary);
   font-family: inherit;
-  transition: border-color 0.15s;
+  transition: border-color var(--motion-quick) var(--ease-out);
 }
 
 /* ---- Dropzone ---- */
@@ -154,7 +154,7 @@
   border: 1.5px dashed var(--color-border-muted);
   border-radius: 8px;
   cursor: pointer;
-  transition: border-color 0.15s, background-color 0.15s;
+  transition: border-color var(--motion-quick) var(--ease-out), background-color var(--motion-quick) var(--ease-out);
 }
 
 .cwm-dropzone:hover {
@@ -233,7 +233,7 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  transition: color 0.15s, background-color 0.15s;
+  transition: color var(--motion-quick) var(--ease-out), background-color var(--motion-quick) var(--ease-out);
 }
 
 .cwm-file-remove:hover {
@@ -265,7 +265,7 @@
   background: none;
   border: none;
   cursor: pointer;
-  transition: background-color 0.15s;
+  transition: background-color var(--motion-quick) var(--ease-out);
 }
 
 .cwm-btn-cancel:hover {
@@ -289,7 +289,7 @@
   background-color: var(--color-btn-primary-bg);
   border: none;
   cursor: pointer;
-  transition: opacity 0.15s;
+  transition: opacity var(--motion-quick) var(--ease-out);
 }
 
 .cwm-btn-create:disabled {
@@ -407,7 +407,7 @@
   height: 100%;
   border-radius: 2px;
   background-color: var(--color-accent-primary);
-  transition: width 0.2s ease;
+  transition: width var(--motion-fold) var(--ease-out);
 }
 
 /* ---- Done / Error summary ---- */

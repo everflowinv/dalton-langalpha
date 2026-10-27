@@ -231,7 +231,7 @@ describe('the mobile market composer', () => {
   it('keeps a model pick across a fold and sends it into a new chat in Home', async () => {
     renderPage();
     expand();
-    expect(screen.getByRole('button', { name: 'All workspaces' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Chief of Staff' })).toBeInTheDocument();
     expect(screen.getByText('pill:model-p0')).toBeInTheDocument();
     fireEvent.click(screen.getByText('pick-x'));
     expect(screen.getByText('pill:model-x')).toBeInTheDocument();
@@ -251,7 +251,7 @@ describe('the mobile market composer', () => {
   it('sends into the selected workspace once the scope moves to it', async () => {
     renderPage();
     expand();
-    fireEvent.click(screen.getByRole('button', { name: 'All workspaces' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Chief of Staff' }));
     fireEvent.click(within(screen.getByRole('menu')).getByRole('menuitemradio', { name: 'Workspace 1' }));
     expect(screen.getByRole('button', { name: 'Workspace 1' })).toBeInTheDocument();
 

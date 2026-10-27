@@ -17,7 +17,7 @@
   background-color: hsl(var(--bg-main));
   overflow: auto;
   box-sizing: border-box;
-  transition: padding-left 0.25s cubic-bezier(0.22, 1, 0.36, 1);
+  transition: padding-left var(--motion-fold) var(--ease-out);
 }
 
 /* Fixed overlays positioned off --sidebar-width. They are viewport-anchored, so
@@ -25,8 +25,8 @@
    to the new column while .app-main is still easing into it. */
 .sidebar-tracking {
   transition:
-    left 0.25s cubic-bezier(0.22, 1, 0.36, 1),
-    transform 0.25s cubic-bezier(0.22, 1, 0.36, 1);
+    left var(--motion-fold) var(--ease-out),
+    transform var(--motion-fold) var(--ease-out);
 }
 
 .main {

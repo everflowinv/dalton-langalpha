@@ -3,6 +3,7 @@ import { Link } from 'react-router';
 import { BRAND_NAME } from '@/config/brand'; // DALTON-HOOK(brand-name)
 import { ArrowLeft, FolderOpen, PanelRight } from 'lucide-react';
 import { motion, type PanInfo } from '@/lib/framer';
+import { TWEEN } from '@/lib/motion';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { Loader } from '@/components/ui/loader';
 import { cn } from '@/lib/utils';
@@ -652,7 +653,10 @@ export default function SharedChatView({ shareToken, metadata }: SharedChatViewP
               <ScrollArea ref={scrollAreaRef} className="h-full w-full">
                 <div className="px-6 py-4 flex justify-center">
                   <div className="w-full max-w-3xl">
-                    {loading && messages.length === 0 ? (
+                    {/* Until the replay is whole: it writes the transcript an
+                        event at a time, and drawn as it went a finished turn
+                        showed its work open, then folded it away. */}
+                    {loading ? (
                       <div className="flex items-center justify-center py-20">
                         <span aria-hidden="true" className="shrink-0">
                           <Loader size={20} className="text-(--color-text-tertiary)" />
@@ -731,7 +735,7 @@ export default function SharedChatView({ shareToken, metadata }: SharedChatViewP
           key="file"
           initial={{ x: '100%' }}
           animate={{ x: 0 }}
-          transition={{ duration: 0.25, ease: [0.22, 1, 0.36, 1] }}
+          transition={TWEEN.enter}
           // A chart pans with the same rightward swipe, so a chart tab closes by its button.
           drag={panelTabKind === 'chart' ? false : 'x'}
           dragConstraints={{ left: 0, right: 0 }}

@@ -4,7 +4,7 @@ import { motion, AnimatePresence } from '@/lib/framer';
 import { ChevronRight, Info } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { WizardStepHeader } from '@/components/ui/wizard';
-import { EASE_OUT } from '@/lib/motion';
+import { TWEEN } from '@/lib/motion';
 import { SetupFooter } from '../SetupFooter';
 import { Loader } from '@/components/ui/loader';
 import { ModelTierConfig } from '@/components/model/ModelTierConfig';
@@ -178,7 +178,7 @@ export default function DefaultsStep() {
           aria-expanded={advancedOpen}
         >
           <ChevronRight
-            className={cn('h-3 w-3 transition-transform duration-200', advancedOpen && 'rotate-90')}
+            className={cn('h-3 w-3 transition-transform', advancedOpen && 'rotate-90')}
           />
           {t('settings.modelTuning.advanced')}
         </button>
@@ -190,8 +190,8 @@ export default function DefaultsStep() {
             <motion.div
               initial={{ opacity: 0, y: -4 }}
               animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0 }}
-              transition={{ duration: 0.18, ease: EASE_OUT }}
+              exit={{ opacity: 0, transition: TWEEN.exit }}
+              transition={TWEEN.quick}
             >
               <div className="flex flex-col pt-4" style={{ gap: '24px' }}>
                 <ModelSelector

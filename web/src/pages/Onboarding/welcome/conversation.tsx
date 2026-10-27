@@ -220,7 +220,7 @@ export function UserTurn({
           onClick={onEdit}
           aria-label={editLabel}
           title={editLabel}
-          className="mt-1.5 inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-(--color-text-tertiary) opacity-0 transition-[opacity,color,background-color] duration-150 hover:bg-(--color-bg-hover) hover:text-(--color-text-primary) focus-visible:opacity-100 group-hover:opacity-100 [@media(hover:none)]:opacity-100"
+          className="mt-1.5 inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-(--color-text-tertiary) opacity-0 transition-[opacity,color,background-color] hover:bg-(--color-bg-hover) hover:text-(--color-text-primary) focus-visible:opacity-100 group-hover:opacity-100 [@media(hover:none)]:opacity-100"
         >
           <Pencil className="h-3.5 w-3.5" />
         </button>

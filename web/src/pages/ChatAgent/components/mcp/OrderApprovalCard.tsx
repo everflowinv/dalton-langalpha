@@ -1,6 +1,5 @@
 import React, { useState } from 'react';
-import { AnimatePresence, motion } from '@/lib/framer';
-import { AlertTriangle, Check, ChevronRight, MinusCircle, X } from 'lucide-react';
+import { AlertTriangle, Check, MinusCircle, X } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { OrderStatusPill } from '@/components/orders/OrderStatusPill';
 import { OrdersPageLink } from '@/components/orders/OrdersPageLink';
@@ -17,6 +16,8 @@ import { OrderCard } from './OrderCard';
 import { maskAccountId } from '@/pages/ChatAgent/utils/directTools';
 import { ORDER_ACTION_KEY, orderReadFully, orderTicket } from './orderSummary';
 import { SettledStep } from '../SettledStep';
+import { Disclosure } from '@/components/ui/Disclosure';
+import { FoldChevron, ResolveSwap } from '../decisionCardMotion';
 import { useDirectToolVendorLabel } from './useDirectToolVendor';
 
 /**
@@ -95,22 +96,20 @@ export function OrderApprovalCard({
     />
   );
 
-  if (isRejected || (isApproved && !resultPending)) {
-    return (
-      <SettledOrderStep
-        order={order}
-        approved={isApproved}
-        reason={data.reason}
-        args={argsTable}
-        // The verdict alone would read as the whole story on a card whose
-        // order may have filled. The pill rides the verdict line; the link out
-        // cannot, because that line is a button and a link inside one fights
-        // the fold it opens.
-        status={ledgerRow?.status}
-        attemptId={ledgerRow ? data.attemptId : undefined}
-      />
-    );
-  }
+  const settled = (
+    <SettledOrderStep
+      order={order}
+      approved={isApproved}
+      reason={data.reason}
+      args={argsTable}
+      // The verdict alone would read as the whole story on a card whose
+      // order may have filled. The pill rides the verdict line; the link out
+      // cannot, because that line is a button and a link inside one fights
+      // the fold it opens.
+      status={ledgerRow?.status}
+      attemptId={ledgerRow ? data.attemptId : undefined}
+    />
+  );
 
   const pill = isApproved ? (
     // The window between the click and the brokerage's answer. The receipt
@@ -132,74 +131,69 @@ export function OrderApprovalCard({
   );
 
   return (
-    <motion.div
-      initial={{ opacity: 0, y: 8 }}
-      animate={{ opacity: 1, y: 0 }}
-      transition={{ duration: 0.4, ease: [0.22, 1, 0.36, 1] }}
-      data-testid="order-approval-card"
-      data-order-state={isApproved ? 'sending' : canAct ? 'pending' : 'unanswered'}
-    >
-      <OrderCard
-        vendor={order.vendor || data.server || ''}
-        action={order.action}
-        mode={order.mode}
-        vendorLabel={vendorLabel}
-        account={order.account_ref ? maskAccountId(order.account_ref) : null}
-        pill={pill}
-        ticket={orderTicket(order, { hidden: false, locale })}
-        notice={readFully ? null : <IncompleteNotice />}
-        testid="order-approval"
-        footer={
-          canAct && !isApproved ? (
-            <div className="flex items-center gap-2 flex-wrap">
-              <input
-                type="text"
-                value={reason}
-                onChange={(e) => setReason(e.target.value)}
-                maxLength={200}
-                placeholder={t('toolArtifact.directTool.orderApproval.reasonPlaceholder')}
-                aria-label={t('toolArtifact.directTool.orderApproval.reasonPlaceholder')}
-                className="flex-1 min-w-40 text-sm px-3 py-1.5 rounded-md bg-transparent"
-                style={{ border: '1px solid var(--color-border-muted)', color: 'var(--color-text-primary)' }}
-              />
-              <motion.button
-                type="button"
-                onClick={(e: React.MouseEvent) => {
-                  e.stopPropagation();
-                  onReject?.(reason.trim() || undefined);
-                }}
-                disabled={!onReject}
-                className="flex items-center gap-1.5 text-sm px-4 py-1.5 rounded-md font-medium transition-colors disabled:opacity-50"
-                style={{ backgroundColor: 'var(--color-border-muted)', color: 'var(--color-text-tertiary)' }}
-                whileHover={{ scale: 1.02 }}
-                whileTap={{ scale: 0.98 }}
-              >
-                <X className="h-3.5 w-3.5" />
-                {t('toolArtifact.directTool.reject')}
-              </motion.button>
-              <motion.button
-                type="button"
-                onClick={(e: React.MouseEvent) => {
-                  e.stopPropagation();
-                  onApprove?.();
-                }}
-                disabled={!onApprove}
-                className="flex items-center gap-1.5 text-sm px-4 py-1.5 rounded-md font-medium transition-colors hover:brightness-110 disabled:opacity-50"
-                style={{ backgroundColor: 'var(--color-btn-primary-bg)', color: 'var(--color-btn-primary-text)' }}
-                whileHover={{ scale: 1.02 }}
-                whileTap={{ scale: 0.98 }}
-              >
-                <Check className="h-3.5 w-3.5 stroke-[2.5]" />
-                {t('toolArtifact.directTool.approve')}
-              </motion.button>
-            </div>
-          ) : null
-        }
-      />
-      <ArgsDisclosure open={argsOpen} onToggle={() => setArgsOpen((v) => !v)}>
-        {argsTable}
-      </ArgsDisclosure>
-    </motion.div>
+    <ResolveSwap resolved={isRejected || (isApproved && !resultPending)} settled={settled}>
+      <div
+        data-testid="order-approval-card"
+        data-order-state={isApproved ? 'sending' : canAct ? 'pending' : 'unanswered'}
+      >
+        <OrderCard
+          vendor={order.vendor || data.server || ''}
+          action={order.action}
+          mode={order.mode}
+          vendorLabel={vendorLabel}
+          account={order.account_ref ? maskAccountId(order.account_ref) : null}
+          pill={pill}
+          ticket={orderTicket(order, { hidden: false, locale })}
+          notice={readFully ? null : <IncompleteNotice />}
+          testid="order-approval"
+          footer={
+            canAct && !isApproved ? (
+              <div className="flex items-center gap-2 flex-wrap">
+                <input
+                  type="text"
+                  value={reason}
+                  onChange={(e) => setReason(e.target.value)}
+                  maxLength={200}
+                  placeholder={t('toolArtifact.directTool.orderApproval.reasonPlaceholder')}
+                  aria-label={t('toolArtifact.directTool.orderApproval.reasonPlaceholder')}
+                  className="flex-1 min-w-40 text-sm px-3 py-1.5 rounded-md bg-transparent"
+                  style={{ border: '1px solid var(--color-border-muted)', color: 'var(--color-text-primary)' }}
+                />
+                <button
+                  type="button"
+                  onClick={(e: React.MouseEvent) => {
+                    e.stopPropagation();
+                    onReject?.(reason.trim() || undefined);
+                  }}
+                  disabled={!onReject}
+                  className="press flex items-center gap-1.5 text-sm px-4 py-1.5 rounded-md font-medium disabled:opacity-50"
+                  style={{ backgroundColor: 'var(--color-border-muted)', color: 'var(--color-text-tertiary)' }}
+                >
+                  <X className="h-3.5 w-3.5" />
+                  {t('toolArtifact.directTool.reject')}
+                </button>
+                <button
+                  type="button"
+                  onClick={(e: React.MouseEvent) => {
+                    e.stopPropagation();
+                    onApprove?.();
+                  }}
+                  disabled={!onApprove}
+                  className="press flex items-center gap-1.5 text-sm px-4 py-1.5 rounded-md font-medium hover:brightness-110 disabled:opacity-50"
+                  style={{ backgroundColor: 'var(--color-btn-primary-bg)', color: 'var(--color-btn-primary-text)' }}
+                >
+                  <Check className="h-3.5 w-3.5 stroke-[2.5]" />
+                  {t('toolArtifact.directTool.approve')}
+                </button>
+              </div>
+            ) : null
+          }
+        />
+        <ArgsDisclosure open={argsOpen} onToggle={() => setArgsOpen((v) => !v)}>
+          {argsTable}
+        </ArgsDisclosure>
+      </div>
+    </ResolveSwap>
   );
 }
 
@@ -300,28 +294,12 @@ function ArgsDisclosure({
         style={{ color: 'var(--color-text-tertiary)' }}
         aria-expanded={open}
       >
-        <motion.span
-          animate={{ rotate: open ? 90 : 0 }}
-          transition={{ duration: 0.2 }}
-          className="inline-flex"
-        >
-          <ChevronRight className="h-3 w-3" style={{ color: 'var(--color-icon-muted)' }} />
-        </motion.span>
+        <FoldChevron open={open} className="h-3 w-3" />
         {t('toolArtifact.directTool.orderApproval.arguments')}
       </button>
-      <AnimatePresence initial={false}>
-        {open && (
-          <motion.div
-            initial={{ height: 0, opacity: 0 }}
-            animate={{ height: 'auto', opacity: 1 }}
-            exit={{ height: 0, opacity: 0 }}
-            transition={{ duration: 0.25, ease: [0.22, 1, 0.36, 1] }}
-            className="overflow-hidden"
-          >
-            <div className="pt-2 pl-4">{children}</div>
-          </motion.div>
-        )}
-      </AnimatePresence>
+      <Disclosure open={open} className="pt-2 pl-4">
+        {children}
+      </Disclosure>
     </div>
   );
 }

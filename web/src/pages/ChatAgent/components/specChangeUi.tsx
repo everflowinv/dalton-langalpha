@@ -10,7 +10,7 @@ import { Loader } from '@/components/ui/loader';
 import { cn } from '@/lib/utils';
 import type { Computer, ComputerSpecChange, ResourceTier } from '@/types/api';
 
-import { TIER_ORDER, normalizeTier, tierLabel } from './tierUi';
+import { TIER_ORDER, knownTier, normalizeTier, tierLabel } from './tierUi';
 
 type Translate = ReturnType<typeof useTranslation>['t'];
 
@@ -33,11 +33,22 @@ export function activeSpecChange(
 export function effectiveTier(
   computer: Pick<Computer, 'resource_tier' | 'spec_change'> | null | undefined,
 ): ResourceTier {
+  return normalizeTier(shownTierValue(computer));
+}
+
+/** As `effectiveTier`, but null where the row names no tier this build knows. */
+export function knownEffectiveTier(
+  computer: Pick<Computer, 'resource_tier' | 'spec_change'> | null | undefined,
+): ResourceTier | null {
+  return knownTier(shownTierValue(computer));
+}
+
+function shownTierValue(computer: Pick<Computer, 'resource_tier' | 'spec_change'> | null | undefined): unknown {
   const change = computer?.spec_change;
   if (change?.state === 'failed' && change.error?.code === 'interrupted' && change.from_tier) {
-    return normalizeTier(change.from_tier);
+    return change.from_tier;
   }
-  return normalizeTier(computer?.resource_tier);
+  return computer?.resource_tier;
 }
 
 /** "Upgrading to Performance…" or, for a move down, "Changing spec to Standard…". */

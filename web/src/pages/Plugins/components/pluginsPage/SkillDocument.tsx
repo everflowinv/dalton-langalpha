@@ -6,6 +6,7 @@ import { FileCode, FileText } from 'lucide-react';
 import { Loader } from '@/components/ui/loader';
 import { useLocale } from '@/hooks/useLocale';
 import { formatBytes } from '@/lib/format';
+import { scrollMotion } from '@/lib/reducedMotion';
 import { cn } from '@/lib/utils';
 import { isMarkdownPath } from './skillPaths';
 
@@ -168,7 +169,7 @@ export function SkillDocument({
   }
 
   function jump(id: string) {
-    document.getElementById(id)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    document.getElementById(id)?.scrollIntoView({ behavior: scrollMotion(), block: 'start' });
   }
 
   return (

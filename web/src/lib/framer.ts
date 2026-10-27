@@ -24,6 +24,7 @@
  */
 import { MotionGlobalConfig } from 'framer-motion';
 import { isPageUnseen, onPageUnseenChange } from './pageVisibility';
+import { useMotionSafe } from './reducedMotion';
 
 function apply(): void {
   MotionGlobalConfig.skipAnimations = isPageUnseen();
@@ -35,3 +36,14 @@ if (typeof document !== 'undefined') {
 }
 
 export * from 'framer-motion';
+
+/**
+ * framer's own hook reads the OS setting once, into state it never updates,
+ * so a component mounted before the reader asks for less motion goes on
+ * moving as if they had not. This one follows the setting live. A local
+ * export wins over the star re-export above, so every `useReducedMotion`
+ * imported from here is this one.
+ */
+export function useReducedMotion(): boolean {
+  return !useMotionSafe();
+}

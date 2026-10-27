@@ -15,7 +15,7 @@ import { useIsMobile } from '@/hooks/useIsMobile';
 import { useNarrowContainer } from '@/hooks/useNarrowContainer';
 import {
   readWorkspaceFile, readWorkspaceFileFull, writeWorkspaceFile, downloadWorkspaceFileAsArrayBuffer,
-  triggerFileDownload, resolveWorkspaceFile,
+  openWorkspaceFileRanged, triggerFileDownload, resolveWorkspaceFile,
 } from '../utils/api';
 import { folderLinkTarget, linkCandidates } from '../utils/fileRefResolver';
 import { useWorkspaceFolders } from '../contexts/WorkspaceContext';
@@ -200,7 +200,7 @@ function FilePanel({
   // A share reads through its own endpoints, which take no workspace id.
   // Memoised as one object: every hook below closes over these, and rebuilding
   // them per render would make each of those callbacks unstable in turn.
-  const { readFileFn, readFileFullFn, downloadFileAsArrayBufferFn, triggerDownloadFn, writeFileFn, resolveFileFn } = useMemo(() => {
+  const { readFileFn, readFileFullFn, downloadFileAsArrayBufferFn, openRangedFn, triggerDownloadFn, writeFileFn, resolveFileFn } = useMemo(() => {
     const adapter: ApiAdapter = apiAdapter ?? {};
     const { readFile, readFileFull, downloadFileAsArrayBuffer, triggerDownload, writeFile, resolveFile } = adapter;
     return {
@@ -209,6 +209,8 @@ function FilePanel({
       downloadFileAsArrayBufferFn: downloadFileAsArrayBuffer
         ? (_: string, p: string) => downloadFileAsArrayBuffer(p)
         : downloadWorkspaceFileAsArrayBuffer,
+      // A share's route redacts each file whole, so it has no ranges to read.
+      openRangedFn: apiAdapter ? undefined : openWorkspaceFileRanged,
       triggerDownloadFn: triggerDownload ? (_: string, p: string) => triggerDownload(p) : triggerFileDownload,
       writeFileFn: writeFile ? (_: string, p: string, c: string) => writeFile(p, c) : writeWorkspaceFile,
       resolveFileFn: apiAdapter
@@ -234,8 +236,11 @@ function FilePanel({
   const mountId = useId();
   const scope = workspaceId || `adapter:${mountId}`;
   const readers = useMemo(
-    () => ({ readFile: readFileFn, readFileFull: readFileFullFn, downloadFileAsArrayBuffer: downloadFileAsArrayBufferFn }),
-    [readFileFn, readFileFullFn, downloadFileAsArrayBufferFn],
+    () => ({
+      readFile: readFileFn, readFileFull: readFileFullFn,
+      downloadFileAsArrayBuffer: downloadFileAsArrayBufferFn, openRanged: openRangedFn,
+    }),
+    [readFileFn, readFileFullFn, downloadFileAsArrayBufferFn, openRangedFn],
   );
   const cache = useFileBodyCache({ scope, workspaceId, readers });
 
@@ -468,6 +473,14 @@ function FilePanel({
   const retry = useStableHandler(() => {
     downloads.clearError();
     retryOpen(selectedFile);
+  });
+  // A large PDF lost a slice, to a change in its file or a failed read. Not
+  // `retry`: for a tab a reference opened, that re-asks the lookup, which
+  // answers from the cache. Invalidating re-reads the body, since the tab on
+  // show observes it. The path is the failed viewer's own: a slice can fail
+  // just after another file opened, before that viewer has let go.
+  const reloadChanged = useStableHandler((path: string) => {
+    cache.invalidate(path);
   });
 
   // --- file actions ---
@@ -910,6 +923,7 @@ function FilePanel({
                   loading: fileLoading,
                   error: fileError,
                   onRetry: retry,
+                  onFileChanged: reloadChanged,
                   onDownload: handleDownloadSelected,
                   downloadState: selectedDownloadState,
                   onDownloadInFallback: handleDownloadInFallback,

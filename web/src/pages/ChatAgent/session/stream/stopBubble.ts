@@ -1,6 +1,7 @@
 import type { StructuredError } from '@/utils/rateLimitError';
 import { failAssistantMessage, finalizeAssistantMessage } from './finalizeMessage';
 import { continuationChain, holdsContent } from './continuedBubbles';
+import { withoutPending } from './toolCallChunks';
 import type { MessageRecord, SetMessages } from '../../hooks/utils/types';
 import type { StreamRefs } from '../streamRefs';
 
@@ -62,12 +63,11 @@ function settleTurnEnd(
     if (chain.length === 0) return prev;
     const target = chain.find(holdsContent) ?? chain[chain.length - 1];
     const settled = new Map(chain.map((msg): [string, MessageRecord] => {
-      const closed = {
+      const closed = withoutPending({
         ...msg,
         toolCallProcesses: closeToolRows(msg),
         reasoningProcesses: closeThoughts(msg, closedAt, fromBacklog),
-        pendingToolCallChunks: {},
-      };
+      });
       if (msg !== target) return [msg.id as string, msg.isStreaming ? finalizeAssistantMessage(closed, 'disconnected') : closed];
       return [msg.id as string, settle(closed)];
     }));

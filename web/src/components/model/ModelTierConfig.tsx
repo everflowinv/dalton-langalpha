@@ -3,6 +3,7 @@ import { useTranslation } from "react-i18next"
 import { motion, AnimatePresence } from "@/lib/framer"
 import { ChevronRight, Lightbulb } from "lucide-react"
 import { cn } from "@/lib/utils"
+import { TWEEN } from "@/lib/motion"
 import { BACKGROUND_AUTO } from "@/lib/modelPreferences"
 import { ModelSelector } from "./ModelSelector"
 import { useModelSlotCopy } from "./useModelSlotCopy"
@@ -90,7 +91,7 @@ export function ModelTierConfig({
             </span>
             <ChevronRight
               className={cn(
-                "h-4 w-4 shrink-0 transition-transform duration-200",
+                "h-4 w-4 shrink-0 transition-transform duration-fold",
                 explainerOpen && "rotate-90",
               )}
               style={{ color: "var(--color-text-tertiary)" }}
@@ -103,7 +104,7 @@ export function ModelTierConfig({
                 initial={{ height: 0, opacity: 0 }}
                 animate={{ height: "auto", opacity: 1 }}
                 exit={{ height: 0, opacity: 0 }}
-                transition={{ duration: 0.2, ease: "easeInOut" }}
+                transition={TWEEN.fold}
                 className="overflow-hidden"
               >
                 <div className="px-4 pb-4 flex flex-col gap-3">

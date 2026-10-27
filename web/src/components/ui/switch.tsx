@@ -26,7 +26,7 @@ export function ToggleSwitch({ checked, onChange, disabled, className, ariaLabel
       onClick={onChange}
       disabled={disabled}
       className={cn(
-        'relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out',
+        'relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors',
         className,
       )}
       style={{
@@ -35,7 +35,7 @@ export function ToggleSwitch({ checked, onChange, disabled, className, ariaLabel
       }}
     >
       <span
-        className="pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow-sm ring-0 transition duration-200 ease-in-out"
+        className="pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow-sm ring-0 transition"
         style={{
           transform: checked ? 'translateX(16px)' : 'translateX(0)',
         }}

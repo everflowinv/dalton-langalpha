@@ -96,6 +96,22 @@ function DropdownMenuCheckboxItem({
   )
 }
 
+const DropdownMenuRadioGroup = DropdownMenuPrimitive.RadioGroup
+
+// One choice of several: Radix gives it role="menuitemradio" and aria-checked
+// from the group's value. As with the checkbox item, the caller draws the mark.
+function DropdownMenuRadioItem({
+  className,
+  ...props
+}: React.ComponentProps<typeof DropdownMenuPrimitive.RadioItem>) {
+  return (
+    <DropdownMenuPrimitive.RadioItem
+      className={cn(ITEM_BOX, ITEM_HIGHLIGHT, className)}
+      {...props}
+    />
+  )
+}
+
 function DropdownMenuLabel({
   className,
   ...props
@@ -177,6 +193,8 @@ export {
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuCheckboxItem,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
   DropdownMenuLabel,
   DropdownMenuSeparator,
   DropdownMenuGroup,

@@ -33,9 +33,23 @@ export interface RequestConfig {
   signal?: AbortSignal;
   /** Milliseconds. Unset means no bound. */
   timeout?: number;
+  /**
+   * Milliseconds the answer may go without a byte, the wait for its headers
+   * included, before the call fails as `timeout` does. A slow answer that keeps
+   * arriving never trips it. The XHR path a progress callback takes ignores it.
+   */
+  idleTimeout?: number;
+  /**
+   * Read the body only when the answer has this status. Any other success
+   * comes back with no body, its stream cancelled, so an answer far larger
+   * than the one asked for is never downloaded. The XHR path ignores it too.
+   */
+  expectStatus?: number;
   responseType?: 'json' | 'text' | 'blob' | 'arraybuffer';
   /** A DELETE body, which has no positional argument. */
   data?: unknown;
+  /** fetch's cache mode. The XHR a progress callback moves the call onto has none, and ignores it. */
+  cache?: RequestCache;
   /** Either progress callback sends the request over XHR: fetch cannot report upload progress. */
   onUploadProgress?: (event: TransferProgress) => void;
   onDownloadProgress?: (event: TransferProgress) => void;
@@ -119,17 +133,47 @@ interface Sent {
   rawHeaders: Iterable<[string, string]>;
 }
 
+/** A body read chunk by chunk, each one reported to `alive`. */
+async function readChunks(res: Response, alive: () => void): Promise<Uint8Array<ArrayBuffer>> {
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  const reader = res.body?.getReader();
+  while (reader) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    alive();
+    chunks.push(value);
+    size += value.byteLength;
+  }
+  const out = new Uint8Array(size);
+  let at = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, at);
+    at += chunk.byteLength;
+  }
+  return out;
+}
+
 async function viaFetch(
   method: string, url: string, headers: Record<string, string>, body: XMLHttpRequestBodyInit | undefined,
-  config: RequestConfig, signal: AbortSignal | undefined,
+  config: RequestConfig, signal: AbortSignal | undefined, alive?: () => void,
 ): Promise<Sent> {
-  const res = await fetch(url, { method, headers, body, signal });
+  const res = await fetch(url, { method, headers, body, signal, cache: config.cache });
+  const head = { status: res.status, statusText: res.statusText, rawHeaders: res.headers };
+  if (config.expectStatus !== undefined && res.ok && res.status !== config.expectStatus) {
+    await res.body?.cancel();
+    return { data: null, ...head };
+  }
+  alive?.();
+  // Read in chunks only under an idle bound: `arrayBuffer()` and its kin say
+  // nothing until the last byte, and every chunk has to put the bound off.
+  const source = alive ? new Response(await readChunks(res, alive), { headers: res.headers }) : res;
   const type = config.responseType;
-  const data = type === 'blob' ? await res.blob()
-    : type === 'arraybuffer' ? await res.arrayBuffer()
-    : type === 'text' ? await res.text()
-    : parse(await res.text());
-  return { data, status: res.status, statusText: res.statusText, rawHeaders: res.headers };
+  const data = type === 'blob' ? await source.blob()
+    : type === 'arraybuffer' ? await source.arrayBuffer()
+    : type === 'text' ? await source.text()
+    : parse(await source.text());
+  return { data, ...head };
 }
 
 function viaXhr(
@@ -171,25 +215,40 @@ async function send(
   method: string, url: string, headers: Record<string, string>, body: XMLHttpRequestBodyInit | undefined,
   config: RequestConfig,
 ): Promise<ApiResponse> {
-  const { signal, timeout } = config;
-  // One controller carries both the caller's abort and the deadline, so the
+  const { signal, timeout, idleTimeout } = config;
+  // One controller carries both the caller's abort and the deadlines, so the
   // transport takes a single signal and nothing outlives the request.
   const ctrl = new AbortController();
   const onAbort = () => ctrl.abort();
   if (signal?.aborted) ctrl.abort();
   else signal?.addEventListener('abort', onAbort, { once: true });
-  let timedOut = false;
-  const timer = timeout ? setTimeout(() => { timedOut = true; ctrl.abort(); }, timeout) : undefined;
-  const transport = config.onUploadProgress || config.onDownloadProgress ? viaXhr : viaFetch;
+  let expired: string | null = null;
+  const expire = (message: string) => () => {
+    expired = message;
+    ctrl.abort();
+  };
+  const timer = timeout ? setTimeout(expire(`timeout of ${timeout}ms exceeded`), timeout) : undefined;
+  const xhr = !!(config.onUploadProgress || config.onDownloadProgress);
+  let idleTimer: ReturnType<typeof setTimeout> | undefined;
+  const alive = idleTimeout && !xhr
+    ? () => {
+      clearTimeout(idleTimer);
+      idleTimer = setTimeout(expire(`timeout of ${idleTimeout}ms exceeded`), idleTimeout);
+    }
+    : undefined;
+  alive?.();
   let sent: Sent;
   try {
-    sent = await transport(method, url, headers, body, config, ctrl.signal);
+    sent = xhr
+      ? await viaXhr(method, url, headers, body, config, ctrl.signal)
+      : await viaFetch(method, url, headers, body, config, ctrl.signal, alive);
   } catch {
     if (signal?.aborted) throw new ApiError('canceled', 'ERR_CANCELED');
-    if (timedOut) throw new ApiError(`timeout of ${timeout}ms exceeded`, 'ECONNABORTED');
+    if (expired) throw new ApiError(expired, 'ECONNABORTED');
     throw new ApiError('Network Error', 'ERR_NETWORK');
   } finally {
     clearTimeout(timer);
+    clearTimeout(idleTimer);
     signal?.removeEventListener('abort', onAbort);
   }
   // A caller that aborted while the body was arriving asked for no answer.

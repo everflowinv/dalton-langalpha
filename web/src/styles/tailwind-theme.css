@@ -47,7 +47,9 @@
   --radius-md: calc(var(--radius) - 2px);
   --radius-sm: calc(var(--radius) - 4px);
 
-  --animate-fade-in: fade-in 0.2s ease-out;
+  /* A small thing appearing in place (a renamed title, a chip): quick, on the
+     house curve. */
+  --animate-fade-in: fade-in var(--motion-quick) var(--ease-out);
 
   @keyframes fade-in {
     from {

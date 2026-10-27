@@ -78,8 +78,9 @@ html[data-handoff] .sidebar > * {
    where the thread does. Stacked in the order they read in: what travels
    above the sidebar it may cross, the sidebar above what is leaving. */
 html[data-handoff]::view-transition-group(*) {
+  /* motion-exempt: the hand-off's one long travel; the other legs are timed against it */
   animation-duration: 480ms;
-  animation-timing-function: cubic-bezier(0.16, 1, 0.3, 1);
+  animation-timing-function: var(--ease-out);
 }
 html[data-handoff]::view-transition-group(handoff-transcript) {
   z-index: 2;
@@ -104,15 +105,18 @@ html[data-handoff]::view-transition-group(handoff-wordmark) {
    comes up under what travels. Blended normally, not added: the two grounds
    are one color, and adding them brightens the dark one mid-fade. */
 html[data-handoff]::view-transition-old(root) {
-  animation: handoff-fade-out 180ms cubic-bezier(0.16, 1, 0.3, 1) both;
+  /* motion-exempt: the top bar leaves quickly, timed against the 480ms travel */
+  animation: handoff-fade-out 180ms var(--ease-out) both;
 }
 html[data-handoff]::view-transition-new(root) {
-  animation: handoff-fade-in 360ms cubic-bezier(0.16, 1, 0.3, 1) 60ms both;
+  /* motion-exempt: the app's ground comes up under the travelling objects, timed against the 480ms travel */
+  animation: handoff-fade-in 360ms var(--ease-out) 60ms both;
 }
 
 /* The answered turns drift up and off as the thread takes their place. */
 html[data-handoff]::view-transition-old(handoff-transcript) {
-  animation: handoff-drift-out 300ms cubic-bezier(0.16, 1, 0.3, 1) both;
+  /* motion-exempt: the answered turns leave over most of the travel, so the thread's rise reads as taking their place */
+  animation: handoff-drift-out 300ms var(--ease-out) both;
 }
 
 /* Each of these is one object drawn a little differently on each side: the
@@ -123,13 +127,15 @@ html[data-handoff]::view-transition-old(handoff-transcript) {
 html[data-handoff]::view-transition-old(handoff-agent),
 html[data-handoff]::view-transition-old(handoff-task),
 html[data-handoff]::view-transition-old(handoff-composer) {
-  animation: handoff-fade-out 200ms cubic-bezier(0.16, 1, 0.3, 1) both;
+  /* motion-exempt: the two pictures cross early in the move, timed against the 480ms travel */
+  animation: handoff-fade-out 200ms var(--ease-out) both;
   mix-blend-mode: plus-lighter;
 }
 html[data-handoff]::view-transition-new(handoff-agent),
 html[data-handoff]::view-transition-new(handoff-task),
 html[data-handoff]::view-transition-new(handoff-composer) {
-  animation: handoff-fade-in 200ms cubic-bezier(0.16, 1, 0.3, 1) both;
+  /* motion-exempt: the two pictures cross early in the move, timed against the 480ms travel */
+  animation: handoff-fade-in 200ms var(--ease-out) both;
   mix-blend-mode: plus-lighter;
 }
 
@@ -137,12 +143,15 @@ html[data-handoff]::view-transition-new(handoff-composer) {
    its edge, then the thread's header. What only the flow has (the logo where
    no sidebar draws one) leaves with its top bar. */
 html[data-handoff]::view-transition-new(handoff-sidebar) {
-  animation: handoff-slide-in 440ms cubic-bezier(0.16, 1, 0.3, 1) 90ms both;
+  /* motion-exempt: the sidebar arrives as the travelling objects land, offset against the 480ms travel */
+  animation: handoff-slide-in 440ms var(--ease-out) 90ms both;
 }
 html[data-handoff]::view-transition-new(handoff-header) {
-  animation: handoff-drop-in 360ms cubic-bezier(0.16, 1, 0.3, 1) 140ms both;
+  /* motion-exempt: the header follows the sidebar by a beat, offset against the 480ms travel */
+  animation: handoff-drop-in 360ms var(--ease-out) 140ms both;
 }
 html[data-handoff]::view-transition-old(handoff-logo):only-child,
 html[data-handoff]::view-transition-old(handoff-wordmark):only-child {
-  animation: handoff-fade-out 180ms cubic-bezier(0.16, 1, 0.3, 1) both;
+  /* motion-exempt: the flow's logo leaves with its top bar, timed against the 480ms travel */
+  animation: handoff-fade-out 180ms var(--ease-out) both;
 }

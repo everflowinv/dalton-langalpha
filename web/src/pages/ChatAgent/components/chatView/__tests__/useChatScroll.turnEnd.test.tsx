@@ -3,6 +3,9 @@
  * ends the turn adds its actions, then the typewriter types out what it still
  * held. A reader riding the end must be carried through that, and a settled
  * transcript must not be followed for good.
+ *
+ * The follow glides over animation frames, which the fake timers run, so each
+ * check lets a glide finish first.
  */
 import React from 'react';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
@@ -56,6 +59,11 @@ function grow(by: number) {
   act(() => { resize(contentH); });
 }
 
+/** Long enough for any glide to land. */
+async function glide() {
+  await act(async () => { vi.advanceTimersByTime(1000); });
+}
+
 describe('a reader following a reply as its turn ends', () => {
   const OriginalRO = window.ResizeObserver;
 
@@ -80,7 +88,7 @@ describe('a reader following a reply as its turn ends', () => {
     vi.useRealTimers();
   });
 
-  function followToTurnEnd() {
+  async function followToTurnEnd() {
     const { rerender } = render(<Harness isStreaming />);
     // The reader's own scroll ends the entry pin, so only the follow is left
     // to carry them.
@@ -90,24 +98,40 @@ describe('a reader following a reply as its turn ends', () => {
     });
     act(() => { resize(contentH); });
     grow(40);
+    await glide();
     expect(viewport().scrollTop).toBe(contentH - VIEW_H);
     rerender(<Harness isStreaming={false} />);
   }
 
   it('is carried to the end of what lands after the stream stops', async () => {
-    followToTurnEnd();
+    await followToTurnEnd();
     grow(32);
     await act(async () => { vi.advanceTimersByTime(300); });
     grow(49);
+    await glide();
     expect(viewport().scrollTop).toBe(contentH - VIEW_H);
   });
 
   it('is left alone once the finished transcript has been quiet', async () => {
-    followToTurnEnd();
+    await followToTurnEnd();
     grow(32);
-    const settled = viewport().scrollTop;
     await act(async () => { vi.advanceTimersByTime(1600); });
+    const settled = viewport().scrollTop;
+    expect(settled).toBe(contentH - VIEW_H);
     grow(200);
+    await glide();
     expect(viewport().scrollTop).toBe(settled);
+  });
+
+  it('glides to the end over several frames rather than jumping there', async () => {
+    await followToTurnEnd();
+    const from = viewport().scrollTop;
+    grow(120);
+    await act(async () => { vi.advanceTimersByTime(17); });
+    const first = viewport().scrollTop;
+    expect(first).toBeGreaterThan(from);
+    expect(first).toBeLessThan(contentH - VIEW_H);
+    await glide();
+    expect(viewport().scrollTop).toBe(contentH - VIEW_H);
   });
 });

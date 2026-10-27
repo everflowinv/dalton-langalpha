@@ -88,28 +88,106 @@ never substitutes for it.
 
 ## Status & liveness vocabulary
 
-- **Live work** renders the shared ascii `Loader` glyph (amber) + text — never
-  a spinning lucide icon.
+- **Live work** renders an amber liveness glyph beside text that says what is
+  running, never a spinning lucide icon. The ascii `Loader`
+  (`web/src/components/ui/loader.tsx`) marks running rows, chips and cards; the
+  `FigureEightLoading` orbit sits under a reply while its text is still, the
+  agent at work with nothing yet to type. Reduced motion slows both rather than
+  stopping them: a glyph that changes is not movement across the screen.
+- **A running label shimmers**, and it is the one looping text treatment:
+  `TextShimmer` sweeps the title of a running tool call, the reasoning row's
+  label while it streams, the reader's own message while it is still being
+  delivered (pending, steering or queued), and a chart's loading label. It
+  ends with the work, it stops under reduced motion, and nothing else loops on
+  text.
 - **Completed** on dense surfaces (nav subagent rows) renders **no glyph**:
   absence of the liveness glyph is the done state. Roomier surfaces (status
   bar) may keep a celebratory check.
 - Exceptional terminal states keep informative glyphs (error = alert,
   cancelled = stop, spawned-idle = hollow circle).
+- A running turn lists its tool calls a row per call. The status line, opt-in
+  in Settings while it is being tried out (`other_preference.tool_call_layout:
+  'status'`), shows one line naming the current step under the counts of the
+  finished ones, in the same glyphs and shimmer. A turn shows one line, on its
+  newest activity. Between steps the line holds the step that last finished,
+  settled, until the next one takes its place, and it stays while the reply
+  types under it; it goes when the turn ends and folds its work away. The step
+  a turn opens on, a thought or a call, runs where the counts will be, at their
+  height, so nothing is held empty above the line: a reply finds it where it
+  ran, and the next step turns it into the count in place, with the line coming
+  in under it. The line's steps are drawn at that height too.
 - Status/icon mappings live in one table per vocabulary
   (`web/src/pages/ChatAgent/components/taskStatusUi.tsx`); surfaces declare
   overrides there instead of restating ladders.
 
 ## Motion
 
-Entrance animations are shared utilities (`web/src/styles/animations.css`):
-staggered fade-up with `cubic-bezier(0.16, 1, 0.3, 1)`, ≤ 500ms. No ambient or
-looping decoration; motion signals state change only. Respect
-`prefers-reduced-motion`.
+Motion says something changed: it arrived, left, opened, closed or was pressed.
+Nothing moves for decoration. A loop says something is live: the vocabulary
+above, a loading skeleton, a live-data dot, a microphone listening.
 
-Streamed chat text fades in as the typewriter reveals it, on its own gentler
-curve (`EASE_REVEAL`, `DURATION.reveal` in `web/src/lib/motion.ts`): the
-entrance curve is at half opacity a tenth of the way in, which on a word reads
-as a pop.
+**One vocabulary**, `web/src/lib/motion.ts`, mirrored for CSS in `tokens.css`:
+
+| Token | Value | For |
+|---|---|---|
+| `DURATION.press` · `--motion-press` | 100ms | the press scale |
+| `DURATION.quick` · `--motion-quick` | 160ms | color and hover, a menu, tooltip or chip appearing |
+| `DURATION.fold` · `--motion-fold` | 240ms | a section folding, a panel growing to fit |
+| `DURATION.enter` · `--motion-enter` | 280ms | a dialog, sheet or card entering |
+| `DURATION.exit` · `--motion-exit` | 140ms | anything leaving |
+| `DURATION.reveal` · `--motion-reveal` | 360ms | streamed text fading in as it is typed |
+| `STAGGER` · `--motion-stagger` | 40ms | between the items of a batch |
+
+Curves: `EASE_OUT` (`--ease-out`), fast out with a long settle, for nearly
+everything; `EASE_REVEAL` (`--ease-reveal`) for a fade that must not pop, such
+as streamed text, which `EASE_OUT` has at half opacity a tenth of the way in;
+`EASE_COLLAPSE` (`--ease-collapse`) for a tall box closing, so the content
+under it does not leap. Springs: `SPRING_FOLD` (disclosures, chevrons),
+`SPRING_SNAPPY` (live rows), `SPRING_INDICATOR` (knobs, sliding markers) and
+`SPRING_DRAG` (whatever a finger lets go of), each damped to at least 0.85 of
+critical, so nothing overshoots. Tailwind's bare `transition` and
+`transition-colors` already run `quick` on `EASE_OUT`, and `duration-*` and
+`ease-*` take the token names.
+
+- **Enter and settle; leave faster.** A small surface pops in at its anchor
+  (`.pop-in`: menus, popovers, hover cards, tooltips), a dialog uses
+  `.pop-in-center` and a sheet `.sheet-in`. One state replacing another in
+  place crossfades rather than cutting, through `SwapCell`
+  (`web/src/components/ui/crossfade.tsx`), which keeps the leaving state from
+  screen readers and clicks.
+- **Folds are measured.** A box changes height by tweening measured px, through
+  the one fold, `Disclosure` (`web/src/components/ui/Disclosure.tsx`). Inside
+  the chat scroller nothing hands framer `auto` or a `layout` prop: resolving
+  one forces a layout that clamps the scroll offset.
+- **Live rows open, then rise in.** A row of a running turn opens its space
+  first, and its content rises a few px into it as it fades in once the space
+  is nearly open; leaving, the content fades and lifts first and the space
+  closes after (`LiveRow`). A step that replaces another on the status line
+  rises in as the old one lifts out (`SwapCell`'s `riseKey`). A box opening
+  over content already showing drew every glyph top first, cut off at the
+  bottom. A row opening from rest is launched at its spring's own rate, so the
+  space is nearly open in 160ms and the content comes in that much sooner.
+- **Press, not hover.** A committing button scales to 0.97 (`PRESS_SCALE`,
+  `--press-scale`) over `press`, through the shared `Button` or the `press`
+  class, which carries its own transition list and so never sits beside a
+  `transition-*` class. Hover changes color, background or border and never
+  size. What moves on hover moves 2px at most: an arrow nudging toward where it
+  leads, a chip or the sign-in buttons lifting 1px.
+- **Stagger only a batch the reader asked for**, and only its first few items.
+- **Reduced motion** is one block in `styles/animations.css` for every CSS
+  transition and keyframe, plus framer's `MotionConfig` for transforms. What
+  neither reaches (a framer opacity loop, an imperative `animate()`, a smooth
+  scroll) asks `useMotionSafe()` or `scrollMotion()` in
+  `web/src/lib/reducedMotion.ts`.
+- **No literals.** A duration, curve or spring written outside `motion.ts`,
+  `tokens.css` and `animations.css` fails lint for scripts and
+  `styles/__tests__/motionTokens.test.ts` for CSS. A value no token names on
+  purpose, such as a loop's period, takes an exemption with its reason.
+
+**Pin your message, then follow.** On send the reader's message holds near the
+top of the transcript and the reply fills the room under it; once the reply
+outgrows that room the view glides after its tail
+(`web/src/pages/ChatAgent/components/chatView/useChatScroll.ts`).
 
 ## Empty states
 
@@ -125,5 +203,6 @@ Dot-grid texture is reserved for empty states only — never behind content.
 3. Buttons are quiet: `--color-btn-primary-*` for primary, neutral borders for
    secondary. `--color-text-on-accent` exists solely for text sitting on an
    amber accent fill (rare, annotation-scale).
-4. Liveness = glyph + text, per the vocabulary above.
+4. Liveness = glyph + text, per the vocabulary above; motion = the tokens in
+   § Motion.
 5. When in doubt, remove decoration rather than add it.

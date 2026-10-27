@@ -1,6 +1,6 @@
 import React, { memo } from 'react';
-import { motion, AnimatePresence } from '@/lib/framer';
-import { Wrench, X as XIcon } from 'lucide-react';
+import { motion } from '@/lib/framer';
+import { Wrench } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { TextShimmer } from '@/components/ui/text-shimmer';
@@ -8,8 +8,12 @@ import { DotLoader } from '@/components/ui/dot-loader';
 import { ToolIcon } from '../ToolIcon';
 import { getDisplayName, getToolIcon, getPreparingText } from '../toolDisplayConfig';
 import { liveToolLabel, completedToolTitle, completedToolSummary } from './activitySummary';
-import { SPRING_SNAPPY } from './liveZoneTiming';
-import type { ToolActivityItem, LiveState, PreparingToolCallData } from './activityTypes';
+import { TWEEN } from '@/lib/motion';
+import { FailedIconBadge, RunningIcon } from './ActivityRowParts';
+import { SwapCell } from '@/components/ui/crossfade';
+import type { ToolActivityItem, LiveState, PreparingCall } from './activityTypes';
+
+const DIM = TWEEN.quick;
 
 interface ToolCallLiveRowProps {
   tc: ToolActivityItem;
@@ -20,9 +24,9 @@ interface ToolCallLiveRowProps {
  *
  * Active state:    2px left rule (.nrow.state-active::before) + label shimmer
  *                  + gentle icon pulse.
- * Completing state: no badge, row dims via opacity 0.7 and the title flips
- *                  to past tense. (We deliberately dropped the green ✓ to
- *                  avoid the SaaS-default badge look.)
+ * Completing state: no badge, row dims via opacity 0.7 and the title
+ *                  crossfades to past tense. (We deliberately dropped the
+ *                  green ✓ to avoid the SaaS-default badge look.)
  * Failed state:    gray ✕ badge overlaid on the tool icon + past-tense title.
  */
 export const ToolCallLiveRow = memo(function ToolCallLiveRow({ tc, liveState }: ToolCallLiveRowProps): React.ReactElement {
@@ -44,55 +48,40 @@ export const ToolCallLiveRow = memo(function ToolCallLiveRow({ tc, liveState }: 
   return (
     <motion.div
       className={`nrow ${stateClass} flex items-center gap-2 pl-3 pr-3 py-1.5`}
-      animate={{ opacity: isInProgress ? 1 : 0.7, y: isInProgress ? 0 : 1 }}
-      transition={{ duration: 0.25, ease: 'easeOut' }}
+      animate={{ opacity: isInProgress ? 1 : 0.7 }}
+      transition={DIM}
       style={{ fontSize: '0.8125rem', color: 'var(--Labels-Secondary)' }}
     >
       <div className="relative shrink-0 flex items-center justify-center h-5 w-5">
-        <motion.span
-          animate={isInProgress ? { opacity: [0.85, 1, 0.85] } : { opacity: 1 }}
-          transition={isInProgress ? { duration: 1.5, repeat: Infinity, ease: 'easeInOut' } : { duration: 0.2 }}
-          style={{ display: 'inline-flex' }}
-        >
+        <RunningIcon running={isInProgress}>
           <ToolIcon toolName={toolName} args={args} artifact={artifact} className="h-4 w-4" />
-        </motion.span>
-        <AnimatePresence>
-          {liveState === 'failed' && (
-            <motion.span
-              key="fail"
-              className="nrow-badge"
-              initial={{ scale: 0, opacity: 0 }}
-              animate={{ scale: 1, opacity: 1 }}
-              transition={SPRING_SNAPPY}
-              aria-label={t('toolArtifact.a11y.toolCallFailed')}
-            >
-              <XIcon className="h-3 w-3" />
-            </motion.span>
-          )}
-        </AnimatePresence>
+        </RunningIcon>
+        <FailedIconBadge failed={liveState === 'failed'} label={t('toolArtifact.a11y.toolCallFailed')} />
       </div>
-      {isInProgress ? (
-        <TextShimmer
-          as="span"
-          className="font-medium text-[0.8125rem] [--base-color:var(--Labels-Secondary)] [--base-gradient-color:var(--color-text-primary)] truncate"
-          duration={1.5}
-        >
-          {activeLabel || ''}
-        </TextShimmer>
-      ) : (
-        <>
-          <span className="font-medium shrink-0 whitespace-nowrap">{completedTitle}</span>
-          {summary
-            ? <span className="truncate min-w-0" style={{ opacity: 0.55 }}>&mdash; {summary}</span>
-            : <span style={{ opacity: 0.55 }}>{t('toolArtifact.done')}</span>}
-        </>
-      )}
+      <SwapCell swapKey={isInProgress ? 'running' : 'settled'} className="flex-1" layerClassName="flex items-center gap-2">
+        {isInProgress ? (
+          <TextShimmer
+            as="span"
+            className="font-medium text-[0.8125rem] [--base-color:var(--Labels-Secondary)] [--base-gradient-color:var(--color-text-primary)] truncate"
+            duration={1.5}
+          >
+            {activeLabel || ''}
+          </TextShimmer>
+        ) : (
+          <>
+            <span className="font-medium shrink-0 whitespace-nowrap">{completedTitle}</span>
+            {summary
+              ? <span className="truncate min-w-0" style={{ opacity: 0.55 }}>&mdash; {summary}</span>
+              : <span style={{ opacity: 0.55 }}>{t('toolArtifact.done')}</span>}
+          </>
+        )}
+      </SwapCell>
     </motion.div>
   );
 });
 
 interface PreparingToolCallRowProps {
-  tc: PreparingToolCallData;
+  tc: PreparingCall;
 }
 
 /** Preparing row -- shown while tool_call_chunks are still streaming.

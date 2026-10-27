@@ -11,11 +11,12 @@ import {
   type WorkflowLifecycleFrame, type WorkflowRunState,
 } from './workflowRunState';
 import type { MessageRecord, ToolCallRecord, ToolCallResultRecord } from '../../hooks/utils/types';
-import { getOrCreateTaskRefs, nextArrivalSeq } from '../streamRefs';
+import { getOrCreateTaskRefs } from '../streamRefs';
 import { isTaskAgentId } from '../../utils/agentId';
 import { appendTextChunk } from '../stream/textChunks';
+import { addToolCallChunk, hasPreparing, removeLandedToolCall, withoutPending } from '../stream/toolCallChunks';
 import { MAIN_AGENT_PROVENANCE } from '../provenance';
-import type { ContentSegment } from '@/types/chat';
+import type { ContentSegment, PendingToolCallChunk } from '@/types/chat';
 import type {
   StreamRefs, TaskRefs, ToolCallChunkRecord, UpdateSubagentCard,
 } from '../streamRefs';
@@ -76,14 +77,20 @@ export function handleSubagentMessageChunk({
 
   // Handle finishReason with no content — model call complete
   if (finishReason && !content && contentType !== 'reasoning_signal') {
+    const updatedMessages = [...taskRefs.messages];
+    const msgIdx = updatedMessages.findIndex((m: MessageRecord) => m.id === assistantMessageId);
     if (finishReason === 'tool_calls') {
+      // Its calls have all landed by now.
+      if (msgIdx !== -1 && hasPreparing(updatedMessages[msgIdx])) {
+        updatedMessages[msgIdx] = withoutPending(updatedMessages[msgIdx]);
+        taskRefs.messages = updatedMessages;
+        updateSubagentCard(taskId, { messages: updatedMessages });
+      }
       return false; // More work coming, let tool_calls handler process
     }
     // finish_reason: "stop" — subagent's model call is done
-    const updatedMessages = [...taskRefs.messages];
-    const msgIdx = updatedMessages.findIndex((m: MessageRecord) => m.id === assistantMessageId);
     if (msgIdx !== -1) {
-      updatedMessages[msgIdx] = { ...updatedMessages[msgIdx], isStreaming: false };
+      updatedMessages[msgIdx] = { ...withoutPending(updatedMessages[msgIdx]), isStreaming: false };
       taskRefs.messages = updatedMessages;
       updateSubagentCard(taskId, { messages: updatedMessages });
     }
@@ -266,7 +273,6 @@ export function handleSubagentMessageChunk({
       content: ((prev.content as string) || '') + content,
       contentType: 'text',
       isStreaming: true,
-      arrivalSeq: nextArrivalSeq(prev),
     };
 
     taskRefs.messages = updatedMessages;
@@ -318,17 +324,11 @@ export function handleSubagentToolCallChunks({ taskId, assistantMessageId, chunk
   }
 
   const msg = { ...updatedMessages[messageIndex] };
-  const pending = { ...((msg.pendingToolCallChunks as Record<string, Record<string, unknown>>) || {}) };
+  let pending = (msg.pendingToolCallChunks as Record<string, PendingToolCallChunk> | undefined) ?? {};
+  const seenAt = Date.now();
 
   chunks.forEach((chunk: ToolCallChunkRecord) => {
-    const key = `${chunk.index ?? 0}`;
-    const existing = pending[key] || { toolName: null, chunkCount: 0, argsLength: 0, firstSeenAt: Date.now() };
-    pending[key] = {
-      toolName: chunk.name || existing.toolName,
-      chunkCount: (existing.chunkCount as number) + 1,
-      argsLength: (existing.argsLength as number) + (chunk.args?.length || 0),
-      firstSeenAt: existing.firstSeenAt,
-    };
+    pending = addToolCallChunk(pending, chunk, seenAt);
   });
 
   msg.pendingToolCallChunks = pending;
@@ -390,6 +390,7 @@ export function handleSubagentToolCalls({ taskId, assistantMessageId, toolCalls,
       if (atMs !== undefined && typeof msg.openedAtMs !== 'number') msg.openedAtMs = atMs;
       const toolCallProcesses = { ...((msg.toolCallProcesses as Record<string, Record<string, unknown>>) || {}) };
       const contentSegments = [...((msg.contentSegments as Record<string, unknown>[]) || [])];
+      const firstLanding = !toolCallProcesses[toolCallId];
 
       if (!toolCallProcesses[toolCallId]) {
         contentOrderCounterRef.current++;
@@ -420,8 +421,9 @@ export function handleSubagentToolCalls({ taskId, assistantMessageId, toolCalls,
 
       msg.contentSegments = contentSegments;
       msg.toolCallProcesses = toolCallProcesses;
-      // Clear pending chunks now that the final tool_calls event has arrived
-      msg.pendingToolCallChunks = {};
+      // This call's arguments are complete; parallel calls after it keep theirs.
+      msg.pendingToolCallChunks = removeLandedToolCall(
+        (msg.pendingToolCallChunks as Record<string, PendingToolCallChunk> | undefined) ?? {}, toolCallId, firstLanding);
       taskRefs.messages = updatedMessages;
     }
   });

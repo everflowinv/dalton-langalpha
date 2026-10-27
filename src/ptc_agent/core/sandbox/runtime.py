@@ -291,6 +291,10 @@ class SandboxRuntime(ABC):
     # cannot, the env is fixed for the sandbox's life.
     updates_env: ClassVar[bool] = False
 
+    # The stdout one ``exec`` keeps before cutting the rest, where the provider
+    # cuts it; a read that prints a file has to fit under it.
+    exec_output_cap: ClassVar[int | None] = None
+
     async def update_env(
         self, env: dict[str, str], *, unset: Sequence[str] = ()
     ) -> None:

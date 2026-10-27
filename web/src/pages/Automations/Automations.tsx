@@ -80,7 +80,7 @@ export default function Automations() {
   } = useAutomationMutations();
   const homeZone = useHomeTimezone();
   const queryClient = useQueryClient();
-  // A row in Home names Home's id, which an edit reads as All workspaces, so
+  // A row in Home names Home's id, which an edit reads as the Chief of Staff, so
   // an edit opens once Home is known (or could not be read).
   const { data: homeRow, isPending: homePending } = useQuery(homeWorkspaceQuery(queryClient));
   const readings = useWatchedReadings(automations);

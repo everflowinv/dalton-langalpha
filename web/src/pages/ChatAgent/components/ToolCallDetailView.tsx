@@ -290,7 +290,7 @@ function CodeToolDisplay({ toolName, toolCallProcess, rawContent }: CodeToolDisp
             className="flex items-center gap-1.5 mb-2 px-1 group"
           >
             <ChevronRight
-              className="h-3 w-3 shrink-0 transition-transform duration-200"
+              className="h-3 w-3 shrink-0 transition-transform duration-fold"
               style={{
                 color: 'var(--color-text-tertiary)',
                 transform: inputExpanded ? 'rotate(90deg)' : 'rotate(0deg)',
@@ -521,7 +521,7 @@ function WebSearchCards({ data }: WebSearchCardsProps): React.ReactElement {
             backgroundColor: 'var(--color-bg-surface)',
             border: '1px solid var(--color-border-muted)',
             textDecoration: 'none',
-            transition: 'border-color 0.15s, background-color 0.15s',
+            transition: 'border-color var(--motion-quick) var(--ease-out), background-color var(--motion-quick) var(--ease-out)',
           }}
           onMouseEnter={(e: React.MouseEvent<HTMLAnchorElement>) => {
             e.currentTarget.style.borderColor = 'var(--color-border-elevated)';

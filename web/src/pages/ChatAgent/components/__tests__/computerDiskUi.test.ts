@@ -16,7 +16,7 @@ vi.mock('@/config/hostMode', () => ({
 }));
 
 import { diskUpgradeTier, largerDiskTiers } from '../computerDiskUi';
-import { offeredTiers } from '../tierUi';
+import { offeredTiers, quotaForSpecChange } from '../tierUi';
 
 // As `GET /computers/providers` lists them: Daytona runs three sizes, E2B four.
 const BASE_SPECS: ComputerTierSpec[] = [
@@ -32,10 +32,18 @@ const E2B: ComputerProviderOption = {
   tiers: [...BASE_SPECS, { tier: 'xlarge', cpu: 4, memory_gib: 8, disk_gib: 20 }],
 };
 
+// A plan has one slot for a computer bigger than Small, open at every size up
+// to its largest, and each size counts every computer held in it.
 const PRO: WorkspaceQuota = {
-  performance: { used: 0, limit: 0 },
+  performance: { used: 0, limit: 1 },
   max: { used: 0, limit: 1 },
   xlarge: { used: 0, limit: 0 },
+  always_on: null,
+};
+const MAX_HOLDING_ONE: WorkspaceQuota = {
+  performance: { used: 1, limit: 1 },
+  max: { used: 1, limit: 1 },
+  xlarge: { used: 1, limit: 1 },
   always_on: null,
 };
 const FREE: WorkspaceQuota = {
@@ -64,11 +72,40 @@ describe('diskUpgradeTier', () => {
     expect(diskUpgradeTier('performance', offeredTiers(DAYTONA), undefined)).toBeNull();
   });
 
-  it('points a Pro plan on Small past the Medium it lacks to Large', () => {
-    expect(diskUpgradeTier('standard', offeredTiers(DAYTONA), PRO)).toBe('max');
+  it('points a Pro plan on Small to Medium, the smallest size with more disk', () => {
+    expect(diskUpgradeTier('standard', offeredTiers(DAYTONA), PRO)).toBe('performance');
+  });
+
+  it('points a Medium to Extra Large in the slot it holds', () => {
+    const offer = offeredTiers(E2B);
+    expect(diskUpgradeTier('performance', offer, MAX_HOLDING_ONE)).toBeNull();
+    expect(diskUpgradeTier('performance', offer, quotaForSpecChange(MAX_HOLDING_ONE, 'performance'))).toBe('xlarge');
   });
 
   it('points nowhere when the plan allows no size with more disk', () => {
     expect(diskUpgradeTier('standard', offeredTiers(E2B), FREE)).toBeNull();
+  });
+});
+
+describe('quotaForSpecChange', () => {
+  it('hands the slot a larger computer holds back to every limited size', () => {
+    const quota: WorkspaceQuota = { ...MAX_HOLDING_ONE, xlarge: { used: 1, limit: 0 } };
+    expect(quotaForSpecChange(quota, 'max')).toEqual({
+      performance: { used: 0, limit: 1 },
+      max: { used: 0, limit: 1 },
+      // A size the plan leaves out stays out.
+      xlarge: { used: 1, limit: 0 },
+      always_on: null,
+    });
+  });
+
+  it('leaves the quota as it is for a Small, which holds no slot', () => {
+    expect(quotaForSpecChange(MAX_HOLDING_ONE, 'standard')).toBe(MAX_HOLDING_ONE);
+    expect(quotaForSpecChange(undefined, 'max')).toBeUndefined();
+  });
+
+  it('keeps unlimited and unknown sizes as they are', () => {
+    const quota: WorkspaceQuota = { performance: { used: 3, limit: -1 }, max: null, always_on: null };
+    expect(quotaForSpecChange(quota, 'performance')).toEqual({ ...quota, xlarge: undefined });
   });
 });

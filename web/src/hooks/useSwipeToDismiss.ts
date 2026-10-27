@@ -1,5 +1,6 @@
 import { useRef, useEffect, useEffectEvent, useState, useCallback } from 'react';
 import { useMotionValue, animate, type MotionValue } from '@/lib/framer';
+import { SPRING_DRAG } from '@/lib/motion';
 
 interface UseSwipeToDismissOptions {
   onDismiss: () => void;
@@ -127,7 +128,7 @@ export function useSwipeToDismiss({
         if (velocityY > 300 || dy > 120) {
           dismiss();
         } else {
-          animate(dragY, 0, { type: 'spring', damping: 28, stiffness: 280 });
+          animate(dragY, 0, SPRING_DRAG);
         }
       }
       mode = 'idle';
@@ -182,7 +183,7 @@ export function useSwipeToDismiss({
       if (velocityY > 300 || dy > 120) {
         dismiss();
       } else {
-        animate(dragY, 0, { type: 'spring', damping: 28, stiffness: 280 });
+        animate(dragY, 0, SPRING_DRAG);
       }
     };
 

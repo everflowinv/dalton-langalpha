@@ -12,6 +12,7 @@ import {
   needsBiggerPlan,
   normalizeTier,
   offeredTiers,
+  quotaForSpecChange,
   tierCapacity,
   tierLabel,
   type TierOffer,
@@ -61,7 +62,7 @@ function ChangeSpecPanel({
   onClose,
   onSubmit,
   busy,
-  quota,
+  quota: planQuota,
   provider,
   error,
   stacked = false,
@@ -71,6 +72,11 @@ function ChangeSpecPanel({
   const titleId = useId();
   const currentTier = effectiveTier(target);
   const offer = offeredTiers(provider, currentTier);
+  // A computer bigger than Small moves in the slot it holds, so the other
+  // larger sizes the plan allows stay open to it. The slot is the size the row
+  // holds, which the server counts, even when an interrupted change shows the
+  // size it came from.
+  const quota = quotaForSpecChange(planQuota, normalizeTier(target.resource_tier));
   // Derived rather than seeded: the quota and the provider's sizes land after
   // the dialog opens and can refetch while it is open, and the row behind
   // `target` is replaced on every list refetch. A pick holds while the

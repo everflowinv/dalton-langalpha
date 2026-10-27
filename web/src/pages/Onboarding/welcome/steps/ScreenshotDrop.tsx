@@ -215,7 +215,7 @@ export function ScreenshotDrop({ shots, onChange, onPreparing, active = true }: 
           onClick={openPicker}
           data-dragging={dragging}
           className={cn(
-            'flex w-full flex-col items-center justify-center gap-1 rounded-lg border border-dashed px-4 py-10 text-center transition-[opacity,transform] duration-150 motion-safe:active:scale-[0.99]',
+            'flex w-full flex-col items-center justify-center gap-1 rounded-lg border border-dashed px-4 py-10 text-center press',
             dragging
               ? 'border-(--color-text-primary) bg-(--color-bg-hover)'
               : 'border-(--color-border-default) bg-(--color-bg-card) hover:bg-(--color-bg-hover)',
@@ -247,7 +247,7 @@ export function ScreenshotDrop({ shots, onChange, onPreparing, active = true }: 
                 onClick={() => remove(shot.id)}
                 aria-label={t('onboarding.welcome.shots.remove', { name: shot.name })}
                 className={cn(
-                  'absolute right-1 top-1 flex h-6 w-6 items-center justify-center rounded-full border border-(--color-border-default) bg-(--color-bg-card) text-(--color-text-primary) transition-[opacity,transform] duration-150 hover:bg-(--color-bg-hover) motion-safe:active:scale-90',
+                  'absolute right-1 top-1 flex h-6 w-6 items-center justify-center rounded-full border border-(--color-border-default) bg-(--color-bg-card) text-(--color-text-primary) press hover:bg-(--color-bg-hover)',
                   FOCUS,
                 )}
               >
@@ -270,7 +270,7 @@ export function ScreenshotDrop({ shots, onChange, onPreparing, active = true }: 
                 onClick={openPicker}
                 aria-label={addLabel}
                 className={cn(
-                  'flex aspect-square w-full items-center justify-center rounded-lg border border-dashed border-(--color-border-default) bg-(--color-bg-card) text-(--color-text-secondary) transition-[opacity,transform] duration-150 hover:bg-(--color-bg-hover) hover:text-(--color-text-primary) motion-safe:active:scale-[0.97]',
+                  'flex aspect-square w-full items-center justify-center rounded-lg border border-dashed border-(--color-border-default) bg-(--color-bg-card) text-(--color-text-secondary) press hover:bg-(--color-bg-hover) hover:text-(--color-text-primary)',
                   FOCUS,
                 )}
               >

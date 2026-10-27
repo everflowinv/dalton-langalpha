@@ -157,11 +157,15 @@ async function settle() {
 }
 
 describe('the This Mac option', () => {
-  it('leads the choices in the desktop app, marked as a preview', async () => {
+  it('sits after the hosted providers and before SSH in the desktop app, marked as a preview', async () => {
     open();
     const card = await screen.findByRole('radio', { name: 'This Mac' });
-    expect(screen.getAllByRole('radio')[0]).toBe(card);
-    expect(card).toHaveAccessibleDescription(/Preview.*Let the agent work on this Mac, even while LangAlpha is closed\./);
+    expect(screen.getAllByRole('radio').slice(0, 3)).toEqual([
+      screen.getByRole('radio', { name: 'Daytona' }),
+      card,
+      screen.getByRole('radio', { name: 'Your machine (SSH)' }),
+    ]);
+    expect(card).toHaveAccessibleDescription(/Preview.*Works even with LangAlpha closed/);
     expect(card).not.toBeChecked();
   });
 

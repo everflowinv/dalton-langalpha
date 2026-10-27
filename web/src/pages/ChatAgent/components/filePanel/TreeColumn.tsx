@@ -4,7 +4,7 @@ import {
 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { motion } from '@/lib/framer';
-import { DURATION, EASE_OUT } from '@/lib/motion';
+import { TWEEN } from '@/lib/motion';
 import { cn } from '@/lib/utils';
 import { Loader } from '@/components/ui/loader';
 import type { MemoEntry } from '../../utils/api';
@@ -97,15 +97,14 @@ export function TreeColumn(props: TreeColumnProps): React.ReactElement {
   // floating, it slides in from the edge it hangs off. Exits are shorter.
   // Full, it arrives with its tab as any tab's body does, and a file opened
   // from it narrows it to the column on the same width the fold uses.
-  const enter = { duration: DURATION.fold, ease: EASE_OUT };
-  const exit = { duration: DURATION.exit, ease: EASE_OUT };
+  const enter = TWEEN.fold;
   const overlay = props.overlay && !props.full;
   const columnMotion = overlay
-    ? { initial: { x: '100%' }, animate: { x: 0, transition: enter }, exit: { x: '100%', transition: exit } }
+    ? { initial: { x: '100%' }, animate: { x: 0, transition: enter }, exit: { x: '100%', transition: TWEEN.exit } }
     : {
       initial: props.full ? false as const : { width: 0 },
       animate: { width: props.full ? '100%' : TREE_WIDTH, transition: enter },
-      exit: { width: 0, transition: exit },
+      exit: { width: 0, transition: TWEEN.exit },
     };
 
   return (
@@ -117,7 +116,7 @@ export function TreeColumn(props: TreeColumnProps): React.ReactElement {
           aria-hidden="true"
           initial={{ opacity: 0 }}
           animate={{ opacity: 1, transition: enter }}
-          exit={{ opacity: 0, transition: exit }}
+          exit={{ opacity: 0, transition: TWEEN.exit }}
         />
       )}
       <motion.aside

@@ -1,7 +1,7 @@
 import React, { Suspense, useCallback, useState, useEffect, useRef } from 'react';
 import { useParams, useNavigate, useLocation } from 'react-router';
 import { useTranslation } from 'react-i18next';
-import { motion, AnimatePresence } from '@/lib/framer';
+import { SwapCell } from '@/components/ui/crossfade';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useIsMobile } from '@/hooks/useIsMobile';
 import { queryKeys } from '../../lib/queryKeys';
@@ -22,19 +22,6 @@ import { isDaltonAuth } from '@/config/daltonAuth';
 import { useWorkspace } from '@/hooks/useWorkspace';
 import { useTeamReadOnly } from './components/dalton/TeamSharing';
 import './ChatAgent.css';
-
-// View depth for direction-aware transitions: gallery(0) → threads(1) → chat(2)
-function getViewDepth(threadId?: string, workspaceId?: string): number {
-  if (threadId) return 2;
-  if (workspaceId) return 1;
-  return 0;
-}
-
-const desktopFadeVariants = {
-  enter: { opacity: 0 },
-  center: { opacity: 1 },
-  exit: { opacity: 0 },
-};
 
 const WorkspaceGallery = React.lazy(() => import('./components/WorkspaceGallery'));
 const ThreadGallery = React.lazy(() => import('./components/ThreadGallery'));
@@ -81,30 +68,9 @@ function ChatAgent(): React.ReactElement | null {
   const urlWorkspaceId = isValidUuid(rawUrlWorkspaceId) ? rawUrlWorkspaceId : undefined;
   const stateWorkspaceId = state?.workspaceId && isValidUuid(state.workspaceId) ? state.workspaceId : null;
 
-  // Detect browser-initiated navigation (iOS swipe-back, Android back button).
-  // When popstate triggers navigation, iOS Safari already shows its own page
-  // transition animation. Setting direction=0 tells our variants to skip animation
-  // so we don't get a double-transition flicker.
-  const popstateNavRef = useRef(false);
-  useEffect(() => {
-    const onPopState = () => { popstateNavRef.current = true; };
-    window.addEventListener('popstate', onPopState);
-    return () => window.removeEventListener('popstate', onPopState);
-  }, []);
-
-  // Track navigation direction synchronously (must be computed during render
-  // so AnimatePresence popLayout mode gets the correct custom prop immediately)
-  const prevDepthRef = useRef(getViewDepth(threadId, urlWorkspaceId));
-  const navDirectionRef = useRef(1);
-  const currentDepth = getViewDepth(threadId, urlWorkspaceId);
-  if (currentDepth !== prevDepthRef.current) {
-    navDirectionRef.current = currentDepth > prevDepthRef.current ? 1 : -1;
-    prevDepthRef.current = currentDepth;
-  }
-  // On mobile, use direction=0 for popstate navigations to skip our animations
-  const isPopstateNav = isMobile && popstateNavRef.current;
-  if (popstateNavRef.current) popstateNavRef.current = false;
-  const navDirection = isPopstateNav ? 0 : navDirectionRef.current;
+  // DALTON-HOOK(team-sharing): the upstream bare useActiveThreadPublisher(threadId)
+  // call is dropped here; the ownership-gated call below publishes the same
+  // threadId with canMarkSeen resolved for colleague read-only views.
 
   // Session restore: when landing at /chat (gallery) with a saved session,
   // navigate to the deep route. This creates the natural history stack:
@@ -423,27 +389,29 @@ function ChatAgent(): React.ReactElement | null {
 
   return (
     <div style={{ height: '100%', position: 'relative' }}>
-      {/* Gallery views — animated transitions. No z-index on this wrapper: it
-          would make it a stacking context, and every dialog the gallery opens
-          (sandbox settings and the MCP and skill forms inside it) would paint
-          under the app sidebar however high its own layer. */}
-      <div style={{ position: threadId ? 'absolute' : 'relative', height: threadId ? 0 : '100%', width: '100%', overflow: 'hidden' }}>
-        <AnimatePresence mode="wait" custom={navDirection}>
-          {!threadId && (
-            <motion.div
-              key={viewKey}
-              custom={navDirection}
-              variants={desktopFadeVariants}
-              initial="enter"
-              animate="center"
-              exit="exit"
-              transition={{ duration: 0.2, ease: [0.22, 1, 0.36, 1] }}
-              style={{ height: '100%' }}
-            >
-              {galleryContent}
-            </motion.div>
-          )}
-        </AnimatePresence>
+      {/* Gallery views. The outgoing view dissolves over the incoming one in
+          a single grid cell (SwapCell), so a switch never passes through an
+          empty frame. No z-index on this wrapper: it would make it
+          a stacking context, and every dialog the gallery opens (sandbox
+          settings and the MCP and skill forms inside it) would paint under the
+          app sidebar however high its own layer. */}
+      <div
+        style={{
+          position: threadId ? 'absolute' : 'relative',
+          height: threadId ? 0 : '100%',
+          width: '100%',
+          overflow: 'hidden',
+        }}
+      >
+        <SwapCell
+          as="div"
+          swapKey={threadId ? null : viewKey}
+          appear
+          className="h-full min-h-0 grid-rows-[minmax(0,1fr)]"
+          layerClassName="h-full min-h-0"
+        >
+          {galleryContent}
+        </SwapCell>
       </div>
       {/* Cached ChatViews — visibility toggled, never unmounted on thread switch */}
       {chatViews}

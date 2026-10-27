@@ -15,7 +15,7 @@
   align-items: center;
   border-right: 1px solid hsl(var(--sidebar-border));
   z-index: 1000;
-  transition: width 0.25s cubic-bezier(0.22, 1, 0.36, 1);
+  transition: width var(--motion-fold) var(--ease-out);
 }
 
 /* Mode-switch choreography: the aside persists (width transitions) while each
@@ -38,9 +38,9 @@
    never `none` — permanently turning each child into a containing block for
    fixed-position descendants (it re-anchored the workspace-drag DragOverlay in
    .sidebar-tree, drifting the chip by the tree's viewport offset). Backwards
-   still covers the 0.06s delay, and the end state equals the natural style. */
+   still covers the delay, and the end state equals the natural style. */
 .sidebar > * {
-  animation: sidebar-content-in 0.18s ease 0.06s backwards;
+  animation: sidebar-content-in var(--motion-quick) var(--ease-out) var(--motion-stagger) backwards;
 }
 
 /* Rail content settles leftward (panel shrank), panel content rightward. */
@@ -78,7 +78,7 @@
   right: 3px;
   width: 2px;
   background: transparent;
-  transition: background-color 0.15s ease;
+  transition: background-color var(--motion-quick) var(--ease-out);
 }
 
 .sidebar-resize-handle:hover::after,
@@ -206,7 +206,7 @@ html.desktop-mac .sidebar-history {
   color: var(--color-icon-muted);
   cursor: pointer;
   opacity: 0.7;
-  transition: opacity 0.15s ease, background-color 0.15s ease;
+  transition: opacity var(--motion-quick) var(--ease-out), background-color var(--motion-quick) var(--ease-out);
   flex-shrink: 0;
 }
 
@@ -243,7 +243,7 @@ html.desktop-mac .sidebar-history {
   font-weight: 500;
   text-align: left;
   cursor: pointer;
-  transition: background-color 0.15s ease, color 0.15s ease;
+  transition: background-color var(--motion-quick) var(--ease-out), color var(--motion-quick) var(--ease-out);
 }
 
 .sidebar-panel-item:hover {
@@ -295,7 +295,7 @@ html.desktop-mac .sidebar-history {
   text-transform: uppercase;
   color: var(--color-text-quaternary);
   cursor: pointer;
-  transition: color 0.15s ease;
+  transition: color var(--motion-quick) var(--ease-out);
 }
 
 .sidebar-section-title:hover {
@@ -307,7 +307,7 @@ html.desktop-mac .sidebar-history {
   align-items: center;
   gap: 2px;
   opacity: 0;
-  transition: opacity 0.15s ease;
+  transition: opacity var(--motion-quick) var(--ease-out);
 }
 
 .sidebar-section-header:hover .sidebar-section-actions,
@@ -380,7 +380,7 @@ html.desktop-mac .sidebar-history {
   border-radius: 8px;
   background: transparent;
   cursor: pointer;
-  transition: background-color 0.15s ease;
+  transition: background-color var(--motion-quick) var(--ease-out);
 }
 
 .sidebar-account-row:hover {
@@ -471,7 +471,10 @@ html.desktop-mac .sidebar-history {
   align-items: center;
   justify-content: center;
   cursor: pointer;
-  transition: all 0.2s ease;
+  transition:
+    background-color var(--motion-quick) var(--ease-out),
+    color var(--motion-quick) var(--ease-out),
+    scale var(--motion-press) var(--ease-out);
   color: hsl(var(--sidebar-icon));
 }
 
@@ -479,8 +482,10 @@ html.desktop-mac .sidebar-history {
   background: hsl(var(--sidebar-hover));
 }
 
-.sidebar-nav-item:active {
-  transform: scale(0.94);
+@media (prefers-reduced-motion: no-preference) {
+  .sidebar-nav-item:active {
+    scale: var(--press-scale);
+  }
 }
 
 .sidebar-nav-item.active {
@@ -533,7 +538,7 @@ html.desktop-mac .sidebar-history {
   cursor: pointer;
   overflow: visible;
   padding: 0;
-  transition: border-color 0.15s ease, transform 0.15s ease, box-shadow 0.15s ease;
+  transition: border-color var(--motion-quick) var(--ease-out), transform var(--motion-quick) var(--ease-out), box-shadow var(--motion-quick) var(--ease-out);
 }
 
 .sidebar-account-trigger:hover {

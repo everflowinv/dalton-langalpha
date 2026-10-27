@@ -180,7 +180,7 @@ export function Spark({
             vectorEffect="non-scaling-stroke"
             strokeLinejoin="round"
             strokeLinecap="round"
-            className="transition-colors duration-300"
+            className="transition-colors duration-quick"
           />
           {!stretch && <circle cx={end.x} cy={end.y} r="3" fill={color} />}
         </>
@@ -206,10 +206,10 @@ function ModeToggle({ custom }: { custom: boolean }) {
       className="flex items-center rounded-md border p-[1.5px]"
       style={{ background: 'var(--color-bg-input)', borderColor: 'var(--color-border-muted)' }}
     >
-      <span className={cn(cls, 'transition-colors duration-150')} style={seg(!custom)}>
+      <span className={cn(cls, 'transition-colors duration-quick')} style={seg(!custom)}>
         {t('dashboard.layoutToggle.classic')}
       </span>
-      <span className={cn(cls, 'transition-colors duration-150')} style={seg(custom)}>
+      <span className={cn(cls, 'transition-colors duration-quick')} style={seg(custom)}>
         <LayoutGrid className="h-[7px] w-[7px]" />
         {t('dashboard.layoutToggle.custom')}
       </span>
@@ -262,7 +262,7 @@ export function DashTopbar({
           <span
             className={
               'flex h-3.5 w-3.5 items-center justify-center rounded-[4px] transition-colors ' +
-              'duration-150'
+              'duration-quick'
             }
             style={{
               opacity: custom ? 1 : 0,
