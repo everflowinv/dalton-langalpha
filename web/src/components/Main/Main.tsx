@@ -47,7 +47,8 @@ const routePreloads = {
   market: MarketView.preload,
   news: NewsDetailPage.preload,
   automations: Automations.preload,
-  // DALTON-HOOK(hide-trading): the Orders page is not mounted, so it has no preload
+  // DALTON-HOOK(hide-trading): the Orders page is not mounted; /orders warms the dashboard.
+  orders: Dashboard.preload,
   plugins: Plugins.preload,
   settings: Settings.preload,
   connectors: Plugins.preload,
@@ -69,7 +70,8 @@ export function preloadRouteChunk(pathname: string): void {
 }
 
 // Warmed in the order the rail lists them, the likeliest next stops first.
-const WARM_ORDER = ['dashboard', 'chat', 'market', 'automations', 'plugins', 'settings', 'orders', 'news'] as const satisfies readonly AppSection[];
+// DALTON-HOOK(hide-trading): no 'orders' — its warm is the dashboard's, already first.
+const WARM_ORDER = ['dashboard', 'chat', 'market', 'automations', 'plugins', 'settings', 'news'] as const satisfies readonly AppSection[];
 const WARM_IDLE_TIMEOUT_MS = 2000;
 
 /** Warms every section's chunk once the shell is idle, one at a time so none

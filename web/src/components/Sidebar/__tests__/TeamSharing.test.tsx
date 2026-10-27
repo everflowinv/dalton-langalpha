@@ -1183,7 +1183,7 @@ describe('Dalton Team Sharing', () => {
 
     // 5. Re-open, verify all two 3-option radio groups reflect initial state, edit, and save
     fireEvent.click(trigger);
-    expect(screen.getByText('别人的 Chief of Staff')).toBeInTheDocument();
+    expect(screen.getByText('别人的研究总监')).toBeInTheDocument();
     expect(screen.getByText('别人的网页界面')).toBeInTheDocument();
     expect(screen.getByTestId('sharing-home-note')).toHaveTextContent(
       'Home 工作区始终不对他人开放',
