@@ -324,10 +324,10 @@ class TestCalculateTotalCost:
         assert result["total_cost"] == 0.0
         assert result["breakdown"] == {}
 
-    # DALTON-HOOK(llm-overlay): subscription providers log DEBUG without WARNING and return billing="subscription";
-    # missing pay-per-token models log WARNING once per (model, provider) and return pricing_missing=True;
-    # openrouter openai/gpt-oss-120b resolves and prices accurately.
-    def test_subscription_providers_do_not_warn_and_return_subscription_billing(self, caplog):
+    # DALTON-HOOK(llm-overlay): subscription providers log DEBUG without WARNING and return pricing_type="subscription";
+    # claude-oauth / codex-oauth are pay-per-token and still warn once per process on missing price;
+    # cash models without provider still price normally; openrouter openai/gpt-oss-120b resolves and prices accurately.
+    def test_subscription_providers_do_not_warn_and_return_subscription_pricing_type(self, caplog):
         import logging
 
         from src.llms.pricing_utils import find_model_pricing
@@ -335,6 +335,7 @@ class TestCalculateTotalCost:
         sub_cases = [
             ("gemini-4-argon-low", "antigravity-oauth"),
             ("gemini-3.8-flash-medium", "antigravity-oauth"),
+            ("gemini-2.5-pro", "antigravity-oauth"),
             ("claude-opus-5-5-high", "antigravity-oauth"),
             ("gpt-oss-120b-medium", "antigravity-oauth"),
             ("muse-wonder-1.0", "muse-oauth"),
@@ -345,9 +346,7 @@ class TestCalculateTotalCost:
         with caplog.at_level(logging.DEBUG, logger="src.llms.pricing_utils"):
             for model_name, provider in sub_cases:
                 card = find_model_pricing(model_name, provider=provider)
-                assert card is not None
-                assert card.get("billing") == "subscription"
-                assert card.get("total_cost") == 0.0
+                assert card == {"pricing_type": "subscription"}
 
                 cost_res = calculate_total_cost(
                     input_tokens=100_000,
@@ -356,11 +355,119 @@ class TestCalculateTotalCost:
                     provider=provider,
                 )
                 assert cost_res["total_cost"] == 0.0
-                assert cost_res["billing"] == "subscription"
+                assert cost_res["pricing_type"] == "subscription"
                 assert "pricing_missing" not in cost_res
 
         warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
         assert warnings == []
+        debug_msgs = [r.message for r in caplog.records if r.levelno == logging.DEBUG]
+        assert any("antigravity-oauth" in m for m in debug_msgs)
+        assert any("muse-oauth" in m for m in debug_msgs)
+        assert any("xai-oauth" in m for m in debug_msgs)
+
+    def test_non_subscription_oauth_providers_still_warn_once_and_record_zero(self, caplog):
+        import logging
+
+        from src.llms.pricing_utils import (
+            _WARNED_MISSING_PRICING,
+            find_model_pricing,
+            is_subscription_provider,
+        )
+
+        for provider in ("claude-oauth", "codex-oauth"):
+            assert is_subscription_provider(provider) is False
+            missing_model = f"unpriced-{provider}-model-xyz"
+            _WARNED_MISSING_PRICING.discard((missing_model, provider))
+            caplog.clear()
+            with caplog.at_level(logging.WARNING, logger="src.llms.pricing_utils"):
+                res1 = calculate_total_cost(
+                    input_tokens=5000,
+                    output_tokens=1000,
+                    model_name=missing_model,
+                    provider=provider,
+                )
+                res2 = calculate_total_cost(
+                    input_tokens=5000,
+                    output_tokens=1000,
+                    model_name=missing_model,
+                    provider=provider,
+                )
+                assert find_model_pricing(missing_model, provider=provider) is None
+
+            assert res1["total_cost"] == 0.0
+            assert res1["pricing_missing"] is True
+            assert "pricing_type" not in res1
+            assert res2["pricing_missing"] is True
+            matching_warnings = [
+                r
+                for r in caplog.records
+                if r.levelno == logging.WARNING and missing_model in r.message
+            ]
+            assert len(matching_warnings) == 1
+
+    def test_cash_model_without_provider_prices_normally_and_cash_card_not_overridden(self):
+        from src.llms.pricing_utils import find_model_pricing
+
+        # Calling without provider on a cash model must resolve the cash card and bill normally.
+        card = find_model_pricing("claude-opus-5-5")
+        assert card is not None
+        assert card.get("pricing_type") != "subscription"
+        assert card["input"] > 0
+
+        res = calculate_total_cost(
+            input_tokens=100_000,
+            output_tokens=20_000,
+            model_name="claude-opus-5-5",
+        )
+        assert res["total_cost"] > 0.0
+        assert "pricing_type" not in res
+        assert "pricing_missing" not in res
+
+        # An already-resolved cash card must never be overridden by provider="antigravity-oauth".
+        explicit_res = calculate_total_cost(
+            input_tokens=100_000,
+            output_tokens=20_000,
+            pricing=card,
+            model_name="claude-opus-5-5",
+            provider="antigravity-oauth",
+        )
+        assert explicit_res["total_cost"] == pytest.approx(res["total_cost"])
+
+    def test_tracking_layer_deduplicates_missing_pricing_warning_across_turns(self, caplog):
+        import logging
+
+        from src.llms.pricing_utils import _WARNED_MISSING_PRICING
+        from src.utils.tracking.core import (
+            _WARNED_TRACKING_MISSING_PRICING,
+            calculate_cost_from_per_call_records,
+        )
+
+        missing_model = "unpriced-platform-model-xyz"
+        _WARNED_MISSING_PRICING.discard((missing_model, "openrouter"))
+        _WARNED_TRACKING_MISSING_PRICING.discard((missing_model, "openrouter"))
+        records = [
+            {
+                "model_name": missing_model,
+                "pricing_model_id": missing_model,
+                "pricing_provider": "openrouter",
+                "billing_type": "platform",
+                "usage": {"input_tokens": 1000, "output_tokens": 500},
+            }
+        ]
+        with caplog.at_level(logging.WARNING, logger="src.utils.tracking.core"):
+            out1 = calculate_cost_from_per_call_records(records)
+            out2 = calculate_cost_from_per_call_records(records)
+
+        assert out1["total_cost"] == 0.0
+        assert out2["total_cost"] == 0.0
+        tracking_warnings = [
+            r
+            for r in caplog.records
+            if r.name == "src.utils.tracking.core"
+            and r.levelno == logging.WARNING
+            and missing_model in r.message
+        ]
+        assert len(tracking_warnings) == 1
 
     def test_missing_cash_model_warns_once_per_model_provider_and_sets_pricing_missing(
         self, caplog

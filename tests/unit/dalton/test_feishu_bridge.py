@@ -568,6 +568,7 @@ async def test_append_insert_failure_reports_doc_url_and_detail(
     assert payload["error"] == "content_insert_failed"
     assert payload["document_id"] == "doccnWiki1"
     assert payload["url"] == "https://feishu.cn/wiki/wikinode1"
+    assert "追加内容没有写入，原文档未改变" in payload["message"]
     assert "1770001" in payload["message"]
     assert "1770001" in payload["detail"]
 
@@ -582,10 +583,13 @@ def test_request_non_json_error_carries_status_content_type_path_template_withou
 
     hdrs = email.message.Message()
     hdrs["Content-Type"] = "text/plain; charset=utf-8"
+    # Over 600 chars so tail-truncating sanitizers would lose the leading 404 message;
+    # echoes doccnSecretDoc123456 and custom dynamic IDs from the request.
     raw_body = (
-        "404 page not found Authorization: Bearer t-secretTokenValue999 "
-        "token=u-userSecretToken888 fake-app-secret doxcnSecretDoc123456 "
-        + ("x" * 200)
+        "404 page not found doc=doccnSecretDoc123456 block=blkCustom987 "
+        "Authorization: Bearer t-secretTokenValue999 "
+        "token=u-userSecretToken888 fake-app-secret "
+        + ("x" * 600)
     )
 
     opener = create_autospec(urllib.request.OpenerDirector, instance=True)
@@ -609,7 +613,7 @@ def test_request_non_json_error_carries_status_content_type_path_template_withou
     with pytest.raises(rb.FeishuApiError) as excinfo:
         client._request(
             "POST",
-            "/open-apis/docx/v1/documents/doxcnSecretDoc123456/blocks/doxcnSecretDoc123456/descendant",
+            "/open-apis/docx/v1/documents/doccnSecretDoc123456/blocks/blkCustom987/descendant",
             query={"page_token": "pt_secret_query", "access_token": "t-secretTokenValue999"},
             json_body={"index": 0},
         )
@@ -620,9 +624,12 @@ def test_request_non_json_error_carries_status_content_type_path_template_withou
     assert "text/plain; charset=utf-8" in msg
     assert "/open-apis/docx/v1/documents/{document_id}/blocks/{block_id}/descendant" in msg
     assert "404 page not found" in msg
-    # No token, secret, or query string leaked in the error detail.
+    assert "doc=<id>" in msg
+    assert "block=<id>" in msg
+    # No token, document_id, secret, or query string leaked in the error detail.
     for forbidden in (
-        "doxcnSecretDoc123456",
+        "doccnSecretDoc123456",
+        "blkCustom987",
         "t-secretTokenValue999",
         "u-userSecretToken888",
         "fake-app-secret",

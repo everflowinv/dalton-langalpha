@@ -118,3 +118,44 @@ async def test_watchdog_disabled_via_env_does_not_start_thread(
         assert monitor._watchdog_thread is None
     finally:
         await monitor.stop()
+
+
+@pytest.mark.asyncio
+async def test_watchdog_releases_frame_reference_so_blocked_locals_are_gc_collected(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import gc
+    import weakref
+
+    class _LargeLocalObject:
+        def __init__(self) -> None:
+            self.payload = bytearray(1024 * 64)
+
+    def _blocker_with_large_local(duration_s: float) -> weakref.ReferenceType[_LargeLocalObject]:
+        local_obj = _LargeLocalObject()
+        ref = weakref.ref(local_obj)
+        time.sleep(duration_s)
+        return ref
+
+    monitor = EventLoopLagMonitor(
+        stall_threshold_s=0.06,
+        stall_cooldown_s=60.0,
+        interval_s=0.02,
+    )
+    with caplog.at_level(logging.WARNING, logger="src.observability.loop_lag"):
+        monitor.start()
+        try:
+            await asyncio.sleep(0.03)
+            ref = _blocker_with_large_local(0.18)
+            stall_warnings = [
+                r
+                for r in caplog.records
+                if r.levelno == logging.WARNING and "heartbeat stalled" in r.message
+            ]
+            assert len(stall_warnings) == 1
+            assert "_blocker_with_large_local" in stall_warnings[0].message
+
+            gc.collect()
+            assert ref() is None, "Watchdog must not retain frame references to local objects"
+        finally:
+            await monitor.stop()

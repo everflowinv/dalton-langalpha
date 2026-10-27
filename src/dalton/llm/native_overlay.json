@@ -740,6 +740,7 @@
         "variants": {
           "antigravity-oauth": {
             "display_name": "Antigravity (Google Account)",
+            "billing": "subscription",
             "comment": "Native v1internal protocol; login via Google OAuth loopback PKCE. Includes Claude Opus/Sonnet 5.5 and GPT-OSS models under the same subscription."
           }
         }
@@ -754,6 +755,7 @@
         "variants": {
           "muse-oauth": {
             "display_name": "Muse Code (Meta Account)",
+            "billing": "subscription",
             "comment": "Native OpenAI Responses API at api.meta.ai/v1 with Muse client headers; login via Meta device code flow. Contributor variants trade data-for-training for cheaper quota."
           }
         }
@@ -774,6 +776,7 @@
         "base_url": "https://cli-chat-proxy.grok.com/v1",
         "env_key": null,
         "access_type": "oauth",
+        "billing": "subscription",
         "use_response_api": true,
         "prompt_cache_key": true,
         "display_name": "xAI Grok (SuperGrok OAuth)"

@@ -150,6 +150,17 @@ def test_sec_object_not_found_variants_and_non_sec_isolation():
     )
     assert cat_non_sec == "上游不可用"
 
+    # Top-level error fallback when data is a dict without an "error" key.
+    top_level_sec_miss = {
+        "ok": False,
+        "error": "No concepts matching 'X'",
+        "data": {"count": 0},
+    }
+    cat_top, _ = rb._classify_error_category_and_hint(
+        "finance", "sec", "search-concepts", top_level_sec_miss
+    )
+    assert cat_top == "没有匹配"
+
 
 def test_a_ticker_on_a_query_only_route_folds_into_the_query():
     normalized, _, err = rb._normalize_and_validate_call_args(

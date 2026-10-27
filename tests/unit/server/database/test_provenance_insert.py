@@ -201,15 +201,26 @@ class TestInsertProvenanceRecords:
 
     # DALTON-HOOK(provenance-full-archive): 2500 records written in 3 batches of 1000/1000/500.
     @pytest.mark.asyncio
-    async def test_batches_2500_records_into_three_inserts(
-        self, mock_connection, mock_cursor
-    ):
+    async def test_batches_2500_records_into_three_inserts(self):
+        from unittest.mock import create_autospec
+        import psycopg
+
+        conn = create_autospec(psycopg.AsyncConnection, instance=True)
+        cur = create_autospec(psycopg.AsyncCursor, instance=True)
+        txn = create_autospec(psycopg.AsyncTransaction, instance=True)
+        cur.__aenter__.return_value = cur
+        cur.__aexit__.return_value = False
+        txn.__aenter__.return_value = txn
+        txn.__aexit__.return_value = False
+        conn.cursor.return_value = cur
+        conn.transaction.return_value = txn
+
         records = [
             _record(identifier=f"https://example.test/{i}", result_sha256=f"sha-{i}")
             for i in range(2500)
         ]
         n = await insert_provenance_records(
-            mock_connection,
+            conn,
             conversation_response_id=RESPONSE_ID,
             conversation_thread_id=THREAD_ID,
             turn_index=0,
@@ -220,7 +231,7 @@ class TestInsertProvenanceRecords:
 
         insert_calls = [
             c
-            for c in mock_cursor.execute.call_args_list
+            for c in cur.execute.call_args_list
             if "INSERT INTO provenance_records" in c.args[0]
         ]
         assert len(insert_calls) == 3
@@ -236,9 +247,20 @@ class TestInsertProvenanceRecords:
 class TestSyncProvenanceForResponse:
     # DALTON-HOOK(provenance-full-archive): returns deduplicated count across batched inserts.
     @pytest.mark.asyncio
-    async def test_returns_deduplicated_count_across_batches(
-        self, mock_connection, mock_cursor
-    ):
+    async def test_returns_deduplicated_count_across_batches(self):
+        from unittest.mock import create_autospec
+        import psycopg
+
+        conn = create_autospec(psycopg.AsyncConnection, instance=True)
+        cur = create_autospec(psycopg.AsyncCursor, instance=True)
+        txn = create_autospec(psycopg.AsyncTransaction, instance=True)
+        cur.__aenter__.return_value = cur
+        cur.__aexit__.return_value = False
+        txn.__aenter__.return_value = txn
+        txn.__aexit__.return_value = False
+        conn.cursor.return_value = cur
+        conn.transaction.return_value = txn
+
         unique_events = [
             {
                 "event": "provenance",
@@ -251,7 +273,7 @@ class TestSyncProvenanceForResponse:
         ]
         duplicate_events = unique_events[:391]
         n = await sync_provenance_for_response(
-            mock_connection,
+            conn,
             conversation_response_id=RESPONSE_ID,
             conversation_thread_id=THREAD_ID,
             turn_index=0,
@@ -261,7 +283,7 @@ class TestSyncProvenanceForResponse:
         assert n == 2500
         insert_calls = [
             c
-            for c in mock_cursor.execute.call_args_list
+            for c in cur.execute.call_args_list
             if "INSERT INTO provenance_records" in c.args[0]
         ]
         assert len(insert_calls) == 3

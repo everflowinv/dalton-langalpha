@@ -25,17 +25,22 @@ _SCHEDULE_KEYS = (
 _LOGGED_NAME_MAX_LEN = 120
 
 # DALTON-HOOK(llm-overlay): deduplicate missing-pricing warnings per
-# (model, provider) per process, and recognize OAuth/subscription providers so
-# seat-billed calls return billing="subscription" at DEBUG instead of spamming WARNING.
+# (model, provider) per process, and recognize explicitly marked subscription
+# providers (billing: "subscription") so seat-billed calls return
+# pricing_type="subscription" at DEBUG instead of spamming WARNING.
 _WARNED_MISSING_PRICING: set[Tuple[str, str]] = set()
 
 
 def is_subscription_provider(
     provider: Optional[str] = None,
-    model_name: Optional[str] = None,
     model_config: Any = None,
 ) -> bool:
-    """Return True when ``provider`` (or ``model_name``) is billed via OAuth/subscription."""
+    """Return True only when ``provider`` is explicitly configured with ``billing == "subscription"``."""
+    if not provider:
+        return False
+    prov_str = str(provider).strip()
+    if not prov_str:
+        return False
     if model_config is None:
         try:
             from .llm import LLM
@@ -43,48 +48,13 @@ def is_subscription_provider(
             model_config = LLM.get_model_config()
         except Exception:
             model_config = None
-
-    def _provider_is_sub(prov: Optional[str]) -> bool:
-        if not prov:
-            return False
-        prov_str = str(prov).strip()
-        if not prov_str:
-            return False
-        if prov_str.lower().endswith("-oauth"):
-            return True
-        if model_config is not None:
-            try:
-                info = model_config.get_provider_info(prov_str) or {}
-                if info.get("access_type") == "oauth" or info.get("billing") == "subscription":
-                    return True
-                parent = model_config.get_parent_provider(prov_str)
-                if parent and parent != prov_str:
-                    pinfo = model_config.get_provider_info(parent) or {}
-                    if pinfo.get("access_type") == "oauth" or pinfo.get("billing") == "subscription":
-                        return True
-            except Exception:
-                pass
+    if model_config is None:
         return False
-
-    if _provider_is_sub(provider):
-        return True
-
-    if model_name and not provider and model_config is not None:
-        try:
-            llm_cfg = getattr(model_config, "llm_config", None) or {}
-            m_lower = model_name.lower()
-            for key, cfg in llm_cfg.items():
-                if not isinstance(cfg, dict):
-                    continue
-                if key.lower() == m_lower or str(cfg.get("model_id") or "").lower() == m_lower:
-                    if _provider_is_sub(cfg.get("provider")):
-                        return True
-                    if (cfg.get("dalton") or {}).get("billing") == "subscription":
-                        return True
-        except Exception:
-            pass
-
-    return False
+    try:
+        info = model_config.get_provider_info(prov_str) or {}
+        return info.get("billing") == "subscription"
+    except Exception:
+        return False
 
 
 def extract_base_model(model_name: str) -> str:
@@ -306,10 +276,10 @@ def find_model_pricing(  # DALTON-HOOK(llm-overlay)
             providers_to_search.append((parent, manifest['models'][parent]))
             logger.debug(f"Including parent provider '{parent}' in pricing search for '{provider}'")
         if not providers_to_search:
-            # DALTON-HOOK(llm-overlay): OAuth/subscription providers without a
-            # parent rate card are billed by subscription, not per token — do
-            # not fall through to unrelated providers or warn on missing rates.
-            if is_subscription_provider(provider=provider, model_name=model_name, model_config=model_config):
+            # DALTON-HOOK(llm-overlay): subscription providers (explicitly marked
+            # billing: "subscription") are billed by seat, not per token — do not
+            # fall through to unrelated providers or warn on missing rates.
+            if is_subscription_provider(provider=provider, model_config=model_config):
                 logger.debug(
                     f"Subscription provider {provider!r} for model {model_name[:_LOGGED_NAME_MAX_LEN]!r}: "
                     "billed by subscription, skipping token pricing lookup"
@@ -318,11 +288,7 @@ def find_model_pricing(  # DALTON-HOOK(llm-overlay)
 
                 if _in_upstream_raw_manifest_test():
                     return None
-                return {
-                    "pricing_type": "subscription",
-                    "billing": "subscription",
-                    "total_cost": 0.0,
-                }
+                return {"pricing_type": "subscription"}
             # Neither provider nor parent has models listed, search all
             providers_to_search = list(manifest['models'].items())
             logger.debug(f"Provider '{provider}' and parent not found in manifest, searching all providers")
@@ -397,22 +363,24 @@ def find_model_pricing(  # DALTON-HOOK(llm-overlay)
         else:
             logger.debug(f"Base model '{base_model}' also not found in manifest")
 
-    # DALTON-HOOK(llm-overlay): OAuth/subscription models do not bill per token;
-    # downgrade missing-card log to DEBUG and return subscription billing marker.
-    if is_subscription_provider(provider=provider, model_name=model_name, model_config=model_config):
+    # DALTON-HOOK(llm-overlay): subscription providers (billing: "subscription")
+    # do not bill per token; downgrade missing-card log to DEBUG and return
+    # upstream's pricing_type="subscription" marker. Only check the resolved provider.
+    resolved_provider = provider
+    if not resolved_provider and model_config is not None:
+        exact_cfg = (getattr(model_config, "llm_config", None) or {}).get(model_name)
+        if isinstance(exact_cfg, dict):
+            resolved_provider = exact_cfg.get("provider")
+    if is_subscription_provider(provider=resolved_provider, model_config=model_config):
         logger.debug(
-            f"Subscription model {safe_name} (provider: {provider!r}) has no per-token "
+            f"Subscription model {safe_name} (provider: {resolved_provider!r}) has no per-token "
             "pricing card; billed by subscription."
         )
         from src.dalton.llm.overlay import _in_upstream_raw_manifest_test
 
         if _in_upstream_raw_manifest_test():
             return None
-        return {
-            "pricing_type": "subscription",
-            "billing": "subscription",
-            "total_cost": 0.0,
-        }
+        return {"pricing_type": "subscription"}
 
     # STEP 4: Not found - log comprehensive warning once per (model, provider) per process.
     if _warn_on_miss:
@@ -1150,37 +1118,28 @@ def calculate_total_cost(
     Returns:
         Dictionary with cost breakdown and total
     """
-    # DALTON-HOOK(llm-overlay): resolve pricing when model_name/provider is
-    # given, return billing="subscription" for OAuth/subscription calls, and
-    # mark pay-per-token missing pricing with pricing_missing=True.
+    # DALTON-HOOK(llm-overlay): resolve pricing only when pricing is None, never
+    # override an already-resolved cash card, return pricing_type="subscription"
+    # for subscription providers, and mark pay-per-token misses with pricing_missing=True
+    # (pricing_missing only appears in calculate_total_cost's return value, not persisted).
     if pricing is None and (model_name or provider):
         if model_name:
             pricing = find_model_pricing(model_name, provider=provider)
         elif is_subscription_provider(provider=provider):
-            pricing = {
-                "pricing_type": "subscription",
-                "billing": "subscription",
-                "total_cost": 0.0,
-            }
+            pricing = {"pricing_type": "subscription"}
 
-    if is_subscription_provider(provider=provider, model_name=model_name) or (
-        isinstance(pricing, dict)
-        and (
-            pricing.get("pricing_type") == "subscription"
-            or pricing.get("billing") == "subscription"
-        )
-    ):
+    if isinstance(pricing, dict) and pricing.get("pricing_type") == "subscription":
         return {
             'total_cost': 0.0,
             'breakdown': {},
-            'billing': 'subscription',
+            'pricing_type': 'subscription',
         }
 
     if not pricing:
         return {
             'total_cost': 0.0,
             'breakdown': {},
-            'pricing_missing': True,  # DALTON-HOOK(llm-overlay)
+            'pricing_missing': True,  # DALTON-HOOK(llm-overlay): return-only, not persisted
             'error': 'No pricing information available'
         }
 

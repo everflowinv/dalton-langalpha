@@ -3506,11 +3506,11 @@ _SEC_OBJECT_NOT_FOUND_RE = re.compile(
 
 def _sec_data_error_text(payload: dict[str, Any]) -> str:
     data_obj = payload.get("data")
-    if isinstance(data_obj, dict) and "error" in data_obj:
-        return str(data_obj.get("error") or "").strip()
-    if not isinstance(data_obj, dict):
-        return str(payload.get("error") or "").strip()
-    return ""
+    if isinstance(data_obj, dict):
+        inner = str(data_obj.get("error") or "").strip()
+        if inner:
+            return inner
+    return str(payload.get("error") or "").strip()
 
 
 def _is_sec_object_not_found(route: str, payload: dict[str, Any]) -> bool:
@@ -10739,7 +10739,13 @@ class ResearchDataBridge:
             try:
                 client.insert_descendants(document_id, document_id, block_ids, blocks, 0)
             except FeishuApiError as exc:
-                return _content_insert_failed(f"{exc.error_code}: {str(exc)[:200]}")
+                sanitized_reason = _sanitize_feishu_response_preview(
+                    f"{exc.error_code}: {str(exc)}",
+                    secrets=(client.app_secret, client._tenant_token),
+                    dynamic_ids=(document_id, node_token, space_id, parent_node_token, folder_token),
+                    limit=200,
+                )
+                return _content_insert_failed(sanitized_reason)
             readback = client.get_document(document_id)
 
             payload: dict[str, Any] = {
@@ -10808,13 +10814,18 @@ class ResearchDataBridge:
                 client.insert_descendants(document_id, document_id, block_ids, blocks, index)
             except FeishuApiError as exc:
                 url = feishu_doc_url(document_id, node_token)
-                reason = f"{exc.error_code}: {str(exc)[:200]}"
+                reason = _sanitize_feishu_response_preview(
+                    f"{exc.error_code}: {str(exc)}",
+                    secrets=(client.app_secret, client._tenant_token),
+                    dynamic_ids=(document_id, node_token, token),
+                    limit=200,
+                )
                 return {
                     "ok": False,
                     "error": "content_insert_failed",
                     "message": (
-                        f"markdown converted but appending to document failed ({reason}); "
-                        f"fix manually at {url}"
+                        f"追加内容没有写入，原文档未改变 ({reason}); "
+                        f"url={url}"
                     ),
                     "detail": reason,
                     "document_id": document_id,
@@ -11425,9 +11436,25 @@ _FEISHU_STATIC_PATH_SEGMENTS: frozenset[str] = frozenset({
     "members", "files", "download", "im", "messages", "chats", "bitable",
     "apps", "tables", "records", "fields",
 })
-_FEISHU_TOKEN_RE = re.compile(
-    r"(?i)\b(?:(?:t|u)-[A-Za-z0-9._\-]{6,}|cli_[A-Za-z0-9._\-]{6,}|(?:dox|wik|bas|box|fld)[A-Za-z0-9]{8,})\b"
+_FEISHU_AUTH_TOKEN_RE = re.compile(
+    r"(?i)\b(?:(?:t|u)-[A-Za-z0-9._\-]{6,}|cli_[A-Za-z0-9._\-]{6,})\b"
 )
+_FEISHU_DOC_ID_RE = re.compile(
+    r"(?i)\b(?:doc|dox|wik|bas|box|fld)[A-Za-z0-9]{8,}\b"
+)
+_FEISHU_DYNAMIC_ID_KEYS: frozenset[str] = frozenset({
+    "document_id",
+    "block_id",
+    "node_token",
+    "space_id",
+    "folder_token",
+    "parent_node_token",
+    "obj_token",
+    "origin_node_token",
+    "origin_space_id",
+    "token",
+    "member_id",
+})
 
 
 def _feishu_path_template(path: str) -> str:
@@ -11451,15 +11478,53 @@ def _feishu_path_template(path: str) -> str:
     return "/" + "/".join(out)
 
 
+def _feishu_request_dynamic_ids(
+    path: str,
+    query: dict[str, Any] | None = None,
+    json_body: dict[str, Any] | None = None,
+) -> tuple[str, ...]:
+    clean = urllib.parse.urlsplit(str(path or "")).path or "/"
+    ids: list[str] = [
+        seg for seg in clean.split("/") if seg and seg not in _FEISHU_STATIC_PATH_SEGMENTS
+    ]
+    for mapping in (query, json_body):
+        if not isinstance(mapping, dict):
+            continue
+        for key, val in mapping.items():
+            if key in _FEISHU_DYNAMIC_ID_KEYS and isinstance(val, str) and val.strip():
+                ids.append(val.strip())
+            elif key == "children_id" and isinstance(val, list):
+                for item in val:
+                    if isinstance(item, str) and item.strip():
+                        ids.append(item.strip())
+    # Sort longest-first so a longer id is replaced before a shorter prefix.
+    return tuple(sorted(set(ids), key=len, reverse=True))
+
+
 def _sanitize_feishu_response_preview(
-    raw: str, *, secrets: tuple[str, ...] = (), limit: int = 120
+    raw: str,
+    *,
+    secrets: tuple[str, ...] = (),
+    dynamic_ids: tuple[str, ...] = (),
+    limit: int = 120,
 ) -> str:
-    text = raw or ""
+    text = " ".join((raw or "").split())
+    if not text:
+        return ""
     for sec in secrets:
         if sec:
             text = text.replace(sec, "[REDACTED]")
-    text = sanitize_stderr_text(text)
-    text = _FEISHU_TOKEN_RE.sub("[REDACTED]", text)
+    for did in dynamic_ids:
+        if did:
+            text = text.replace(did, "<id>")
+    # Take the leading slice first (with a small lookahead buffer so tokens
+    # straddling the boundary still match regexes) rather than calling
+    # sanitize_stderr_text(), which truncates to the *last* 500 chars.
+    text = text[: max(limit * 2, 240)]
+    for pat, repl in _STDERR_SECRET_PATTERNS:
+        text = pat.sub(repl, text)
+    text = _FEISHU_AUTH_TOKEN_RE.sub("[REDACTED]", text)
+    text = _FEISHU_DOC_ID_RE.sub("<id>", text)
     text = " ".join(text.split())
     return text[:limit]
 
@@ -11502,13 +11567,22 @@ class FeishuClient:
         return token
 
     def _invalid_response_detail(
-        self, status: int, content_type: str, path: str, raw: str
+        self,
+        status: int,
+        content_type: str,
+        path: str,
+        raw: str,
+        *,
+        query: dict[str, Any] | None = None,
+        json_body: dict[str, Any] | None = None,
     ) -> str:
         ct = " ".join((content_type or "").split()) or "unknown"
         tmpl = _feishu_path_template(path)
+        dynamic_ids = _feishu_request_dynamic_ids(path, query=query, json_body=json_body)
         preview = _sanitize_feishu_response_preview(
             raw,
             secrets=(self.app_secret, self._tenant_token),
+            dynamic_ids=dynamic_ids,
             limit=120,
         )
         return f"http_{status} content_type={ct} path={tmpl} body={preview!r}"
@@ -11564,12 +11638,16 @@ class FeishuClient:
         except ValueError:
             raise FeishuApiError(
                 "feishu_invalid_response",
-                self._invalid_response_detail(status, content_type, path, raw),
+                self._invalid_response_detail(
+                    status, content_type, path, raw, query=query, json_body=json_body
+                ),
             ) from None
         if not isinstance(payload, dict):
             raise FeishuApiError(
                 "feishu_invalid_response",
-                self._invalid_response_detail(status, content_type, path, raw),
+                self._invalid_response_detail(
+                    status, content_type, path, raw, query=query, json_body=json_body
+                ),
             )
         if status < 200 or status >= 300:
             raise FeishuApiError(

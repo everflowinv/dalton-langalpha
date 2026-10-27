@@ -151,11 +151,16 @@ class EventLoopLagMonitor:
             self._last_stall_sample_at = now
             tid = self._loop_thread_id
             frame = sys._current_frames().get(tid) if tid is not None else None
-            if frame is not None:
-                extracted = traceback.extract_stack(frame, limit=_STALL_MAX_FRAMES)
-                stack_text = "".join(traceback.format_list(extracted)).rstrip()
-            else:
-                stack_text = "<no frame found for event loop thread>"
+            try:
+                if frame is not None:
+                    extracted = traceback.extract_stack(frame, limit=_STALL_MAX_FRAMES)
+                    stack_text = "".join(traceback.format_list(extracted)).rstrip()
+                else:
+                    stack_text = "<no frame found for event loop thread>"
+            finally:
+                # Immediately drop the frame reference so finished request frames
+                # and their local objects are not retained until the next stall.
+                frame = None
             logger.warning(
                 "[loop-lag] event loop heartbeat stalled %.2f s "
                 "(threshold %.2f s, thread_id=%s) — call stack (max %d frames):\n%s",

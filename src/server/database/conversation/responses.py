@@ -12,16 +12,6 @@ from src.server.database.conversation import _sql
 logger = logging.getLogger(__name__)
 
 
-# DALTON-HOOK(provenance-full-archive): return the actual written count from
-# provenance sync helpers while keeping replace_lane_provenance truthy whenever
-# the target response row exists (even when 0 records are written).
-class _SyncedProvenanceCount(int):
-    """Written provenance count that evaluates truthy when the response row existed."""
-
-    def __bool__(self) -> bool:
-        return True
-
-
 def _has_provenance(events: Optional[Any]) -> bool:
     """True if any SSE event is a provenance entry."""
     if not events:
@@ -73,13 +63,13 @@ async def replace_lane_provenance(
     conversation_response_id: str,
     events: List[Dict[str, Any]],
     lanes: Collection[str],
-) -> int | bool:  # DALTON-HOOK(provenance-full-archive)
+) -> int | None:  # DALTON-HOOK(provenance-full-archive)
     """Rewrite ``lanes``' provenance on a response from ``events``.
 
     ``events`` hold each lane's whole record, so a lane they name no
     provenance for loses its rows; other lanes keep theirs. Raises on a
-    failed write, so the caller can retry it; returns False when the row is
-    missing, or the actual written count (as a truthy int) when synced.
+    failed write, so the caller can retry it; returns None when the row is
+    missing, or the actual written count (int, where 0 is valid) when synced.
     """  # DALTON-HOOK(provenance-full-archive)
     async with pool.get_db_connection() as conn:
         async with conn.transaction():
@@ -95,7 +85,7 @@ async def replace_lane_provenance(
                     f"[conversation_db] replace_lane_provenance: no row found for "
                     f"response_id={conversation_response_id}"
                 )
-                return False
+                return None  # DALTON-HOOK(provenance-full-archive)
             written = await _sync_provenance_for_response(  # DALTON-HOOK(provenance-full-archive)
                 conn,
                 conversation_response_id=conversation_response_id,
@@ -106,7 +96,7 @@ async def replace_lane_provenance(
                 appended_only=False,
                 lanes=lanes,
             )
-            return _SyncedProvenanceCount(written)  # DALTON-HOOK(provenance-full-archive)
+            return written  # DALTON-HOOK(provenance-full-archive)
 
 
 async def get_recent_responses_for_thread(
