@@ -214,7 +214,7 @@ export function useWatchlistData() {
   // Watchlist membership (items) is its own query so add/delete invalidation and
   // polling still key on ['watchlistData']; the per-symbol quotes come from the
   // shared quote layer so overlapping watchlists/portfolios share one fetch.
-  const { data: itemsData = { items: [], currentWatchlistId: null }, isLoading: itemsLoading, refetch: refetchItems } = useQuery({
+  const { data: itemsData = { items: [], currentWatchlistId: null }, isLoading: itemsLoading, isSuccess: loaded, refetch: refetchItems } = useQuery({
     ...watchlistItemsQuery,
     refetchInterval: 60000,
     refetchIntervalInBackground: false,
@@ -339,6 +339,8 @@ export function useWatchlistData() {
   return {
     rows,
     loading,
+    /** The items arrived, as opposed to a read that failed or never ran. */
+    loaded,
     modalOpen,
     setModalOpen,
     currentWatchlistId,

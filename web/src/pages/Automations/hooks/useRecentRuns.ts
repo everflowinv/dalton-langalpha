@@ -1,5 +1,5 @@
 import { useMemo } from 'react';
-import { useInfiniteQuery } from '@tanstack/react-query';
+import { infiniteQueryOptions, useInfiniteQuery } from '@tanstack/react-query';
 import { queryKeys } from '@/lib/queryKeys';
 import type { AutomationRun } from '@/types/automation';
 import { isRunLive } from '../utils/status';
@@ -7,6 +7,20 @@ import { IDLE_POLL_MS, isDeliverySettling, pollMs } from '../utils/polling';
 import { listRecentRuns, type RunFeedPage } from '../utils/api';
 
 const PAGE_SIZE = 25;
+
+/** The run feed's pages, for a reader that only needs to start the read or
+ *  know it is in: the page starts it beside the automations list rather than
+ *  once the feed mounts after it. */
+export const recentRunsQuery = () =>
+  infiniteQueryOptions({
+    queryKey: queryKeys.automations.runs(),
+    queryFn: async ({ pageParam }) =>
+      (await listRecentRuns({ limit: PAGE_SIZE, offset: pageParam })).data,
+    initialPageParam: 0,
+    getNextPageParam: (lastPage: RunFeedPage, pages: RunFeedPage[]) =>
+      lastPage.has_more ? pages.reduce((n, p) => n + p.executions.length, 0) : undefined,
+    staleTime: 5000,
+  });
 
 /**
  * Every automation's runs, newest first, paged by offset.
@@ -27,12 +41,7 @@ const PAGE_SIZE = 25;
  */
 export function useRecentRuns(delivers: (automationId: string) => boolean) {
   const query = useInfiniteQuery({
-    queryKey: queryKeys.automations.runs(),
-    queryFn: async ({ pageParam }) =>
-      (await listRecentRuns({ limit: PAGE_SIZE, offset: pageParam })).data,
-    initialPageParam: 0,
-    getNextPageParam: (lastPage: RunFeedPage, pages: RunFeedPage[]) =>
-      lastPage.has_more ? pages.reduce((n, p) => n + p.executions.length, 0) : undefined,
+    ...recentRunsQuery(),
     refetchInterval: (q) => {
       const pages = q.state.data?.pages ?? [];
       const settling = pages.some((p) =>
@@ -42,7 +51,6 @@ export function useRecentRuns(delivers: (automationId: string) => boolean) {
       return pollMs(settling || !!pages[0]?.executions.some((r) => isRunLive(r.status)));
     },
     refetchIntervalInBackground: false,
-    staleTime: 5000,
   });
 
   const runs = useMemo(() => {

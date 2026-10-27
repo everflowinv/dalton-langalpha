@@ -105,21 +105,6 @@
   .hover-lift:hover { transform: translateY(-2px); }
 }
 
-/* === Route entrance ===
-
-   Main keys the desktop route wrapper on the top-level section, so a new
-   section mounts fresh and fades in. Opacity only: a transform, even one that
-   ends at none, makes the wrapper the containing block for every fixed
-   descendant for as long as it runs. */
-@keyframes route-fade-in {
-  from { opacity: 0; }
-  to   { opacity: 1; }
-}
-
-.route-fade-in {
-  animation: route-fade-in var(--motion-quick) var(--ease-out);
-}
-
 /* === Dialog overlay fade ===
 
    The one animation the Radix dialog layer draws for itself. It is a keyframe

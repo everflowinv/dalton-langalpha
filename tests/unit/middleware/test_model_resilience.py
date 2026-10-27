@@ -1,8 +1,11 @@
 """Tests for ModelResilienceMiddleware — retry, fallback, events, error trace."""
 
 import pytest
+from langchain.agents.middleware.types import ModelResponse
+from langchain_core.messages import AIMessage
 
 from ptc_agent.agent.middleware.model_resilience import (
+    FALLBACK_KEY,
     RESILIENCE_TRACE_ATTR,
     ModelResilienceMiddleware,
     build_fallback_pairs,
@@ -169,6 +172,25 @@ class TestRetryBehavior:
         assert fallbacks[0]["from_is_primary"] is True
         assert fallbacks[0]["attempts_on_from"] == 1
         assert fallbacks[0]["status_code"] == 404
+
+    @pytest.mark.asyncio
+    async def test_an_answer_a_fallback_wrote_names_it(self, events):
+        client = _FakeModel("primary-model")
+        fallback_client = _FakeModel("fallback-a")
+        mw = _make_middleware(client, fallbacks=[("fallback-a", fallback_client)])
+        down = True
+
+        async def handler(req):
+            if down and req.model is client:
+                raise _status_error("Error code: 404 - model not found", status=404)
+            return ModelResponse(result=[AIMessage("ok", response_metadata={"model_name": "x"})])
+
+        by_fallback = await mw.awrap_model_call(_FakeRequest(client), handler)
+        down = False
+        by_primary = await mw.awrap_model_call(_FakeRequest(client), handler)
+
+        assert by_fallback.result[0].response_metadata == {"model_name": "x", FALLBACK_KEY: "fallback-a"}
+        assert by_primary.result[0].response_metadata == {"model_name": "x"}
 
 
 class TestProgrammingErrors:

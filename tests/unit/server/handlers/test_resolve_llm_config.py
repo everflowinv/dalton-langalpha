@@ -378,7 +378,6 @@ class TestOtherModelPreferences:
             config = await resolve_llm_config(base_config, "user-1", None, False)
         preset = COMPACTION_PROFILES["aggressive"]
         assert config.compaction.token_threshold == preset["token_threshold"]
-        assert config.compaction.keep_messages == preset["keep_messages"]
 
     @pytest.mark.asyncio
     async def test_compaction_profile_extended_applies_preset(self, base_config):
@@ -398,7 +397,6 @@ class TestOtherModelPreferences:
             config = await resolve_llm_config(base_config, "user-1", None, False)
         preset = COMPACTION_PROFILES["extended"]
         assert config.compaction.token_threshold == preset["token_threshold"]
-        assert config.compaction.keep_messages == preset["keep_messages"]
 
     @pytest.mark.asyncio
     async def test_compaction_profile_relaxed_applies_preset(self, base_config):
@@ -419,7 +417,6 @@ class TestOtherModelPreferences:
             config = await resolve_llm_config(base_config, "user-1", None, False)
         preset = COMPACTION_PROFILES["relaxed"]
         assert config.compaction.token_threshold == preset["token_threshold"]
-        assert config.compaction.keep_messages == preset["keep_messages"]
 
     @pytest.mark.asyncio
     async def test_compaction_profile_invalid_falls_through_to_yaml(self, base_config):
@@ -440,7 +437,7 @@ class TestOtherModelPreferences:
             ):
                 config = await resolve_llm_config(base_config, "user-1", None, False)
             assert config.compaction.token_threshold == baseline.token_threshold
-            assert config.compaction.keep_messages == baseline.keep_messages
+            assert config.compaction.keep_tokens == baseline.keep_tokens
 
 
 # ---------------------------------------------------------------------------

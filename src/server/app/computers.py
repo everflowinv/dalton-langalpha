@@ -60,6 +60,8 @@ from src.server.models.computer import (
     ComputerListResponse,
     ComputerProviderOption,
     ComputerProvidersResponse,
+    ComputerReconnectRequest,
+    ComputerReinstallRequest,
     ComputerTierSpec,
     ComputerRemoveRequest,
     ComputerRemoveResponse,
@@ -75,9 +77,14 @@ from src.server.services.computer_disk import (
     disk_from_row,
     storage_breakdown,
 )
+from src.server.services.computer_start_failure import (
+    record_start_failure,
+    start_failure_from_row,
+)
 from src.server.services.computer_errors import (
     ComputerBusyError,
     ComputerRemovalRefused,
+    ComputerRepairRefused,
     MachineBusyError,
     ProviderNotOffered,
     UnknownResourceTier,
@@ -312,6 +319,7 @@ def computer_to_response(
         disk=disk_from_row(computer),
         spec_change=spec_change_from_row(computer),
         ssh=ssh_info(computer, tunnels),
+        start_failure=start_failure_from_row(computer),
     )
 
 
@@ -325,19 +333,32 @@ async def _report_start_failure(computer_id: str, exc: Exception) -> None:
     """A background start behind 202 must publish failure or subscribers wait until timeout.
 
     Settle any surviving claim before publishing so clients re-reading on error
-    see the settled row; the start's own revert normally owns this cleanup.
+    see the settled row; the start's own revert normally owns this cleanup. The
+    failure is on the row before the frame goes out, which carries it too: the
+    start records its own as it reverts, and a claim settled here is recorded
+    here.
     """
+    recorded = None
     try:
         row = await get_computer(computer_id)
         if row is not None and row.get("status") == "starting":
-            await update_computer_status(computer_id, "stopped", expected="starting")
+            settled = await update_computer_status(
+                computer_id, "stopped", expected="starting"
+            )
+            if settled is not None:
+                await record_start_failure(computer_id, exc, kind=settled["kind"])
+            row = await get_computer(computer_id)
+        failure = start_failure_from_row(row) if row is not None else None
+        if failure is not None:
+            recorded = failure.model_dump(mode="json")
     except Exception:
         logger.exception(
             "Could not settle computer %s after a failed start", computer_id
         )
-    await publish_computer_status_change(
-        computer_id, "error", extra={"error": sandbox_failure_http(exc).detail}
-    )
+    extra: Dict[str, Any] = {"error": sandbox_failure_http(exc).detail}
+    if recorded is not None:
+        extra["start_failure"] = recorded
+    await publish_computer_status_change(computer_id, "error", extra=extra)
 
 
 async def _run_computer_start(
@@ -741,9 +762,15 @@ async def computer_status_events(computer_id: str, x_user_id: CurrentUserId):
         sandbox_state: str | None = None,
         error: str | None = None,
         stage: str | None = None,
+        start_failure: dict | None = None,
     ) -> str:
         return sse_status_event(
-            {"computer_id": computer_id}, status, sandbox_state, error, stage
+            {"computer_id": computer_id},
+            status,
+            sandbox_state,
+            error,
+            stage,
+            start_failure,
         )
 
     async def _read_status() -> str | None:
@@ -995,3 +1022,135 @@ async def set_computer_always_on(
             f"for user {x_user_id}"
         )
         return await _counted_response(updated)
+
+
+@contextlib.contextmanager
+def _repair_refusals():
+    """A reinstall or reconnect refused before it changed anything, as a detail
+    with the ``code`` the client words its copy from.
+
+    A machine that answered and refused is a 422, one that did not a 503, as
+    a start answers them; a folder another computer holds is a 409.
+    """
+    try:
+        yield
+    except ComputerRepairRefused as e:
+        raise HTTPException(status_code=e.status, detail=e.detail()) from None
+    except SSHDialBudgetExceeded as e:
+        raise HTTPException(
+            status_code=429,
+            detail={"code": e.code, "message": str(e), "retry_after": e.retry_after},
+            headers={"Retry-After": str(e.retry_after)},
+        ) from None
+    except SSHKeyMissing as e:
+        raise HTTPException(
+            status_code=409, detail={"code": "key_missing", "message": str(e)}
+        ) from None
+    except SSHUnavailable as e:
+        raise HTTPException(
+            status_code=503, detail={"code": "ssh_unavailable", "message": str(e)}
+        ) from None
+    except SSHFolderMarked as e:
+        raise HTTPException(status_code=409, detail=e.detail()) from None
+    except SSHConnectError as e:
+        if e.answered:
+            raise HTTPException(
+                status_code=422, detail={"code": e.code, "message": str(e)}
+            ) from None
+        raise HTTPException(
+            status_code=503, detail={"code": e.code, "message": e.for_owner}
+        ) from None
+
+
+async def _accepted_repair_start(computer_id: str, message: str) -> ComputerActionResponse:
+    """Start the repaired computer as a lazy start does, answering once its
+    claim is on the row."""
+    status = await _schedule_claimed_start(computer_id)
+    return ComputerActionResponse(computer_id=computer_id, status=status, message=message)
+
+
+@router.post(
+    "/{computer_id}/reinstall", response_model=ComputerActionResponse, status_code=202
+)
+async def reinstall_computer(
+    computer_id: str,
+    request: ComputerReinstallRequest,
+    x_user_id: CurrentUserId,
+):
+    """Give a stopped ssh computer a folder it may have, then start it.
+
+    For a start refused because the computer's folder is another computer's
+    (``start_failure.remedy`` ``reinstall``). ``take_back`` clears that other
+    computer, which ``take_over`` names as ``start_failure.owner`` did, from
+    the machine, as its removal would have, under this computer's own login; a
+    mark of any other computer refuses with 409 ``folder_marked`` and its
+    ``owner``, one of the caller's own live computers is never cleared (409
+    ``folder_owned``), and a folder no other computer marks just starts.
+    ``new`` moves this computer to ``root_dir``, which must be missing or empty
+    (422 ``root_dir``) and no other computer's (409 ``folder_marked`` with its
+    ``owner``, unless ``take_over`` names it, or ``folder_owned``); each
+    workspace's files are then restored there from its backup. Refused with 400
+    ``not_ssh``, 409 ``not_stopped``, ``spec_in_progress`` or ``busy``, and 503
+    when the machine does not answer. Accepted, the start is scheduled as a
+    lazy start is and its outcome lands on the row.
+    """
+    async with _computer_action_errors("reinstall", computer_id):
+        await _owned_computer(computer_id, x_user_id)
+        settings = _sandbox_config().settings_for(SSH_KIND)
+        with _repair_refusals():
+            await _computer_manager().reinstall_computer(
+                computer_id,
+                folder=request.folder,
+                root_dir=request.root_dir,
+                settings=settings,
+                take_over=request.take_over,
+            )
+        logger.info(
+            "Reinstalled computer %s (%s) for user %s",
+            computer_id,
+            request.folder,
+            x_user_id,
+        )
+        return await _accepted_repair_start(computer_id, "Computer reinstalled; starting")
+
+
+@router.post(
+    "/{computer_id}/reconnect", response_model=ComputerActionResponse, status_code=202
+)
+async def reconnect_computer(
+    computer_id: str,
+    request: ComputerReconnectRequest,
+    x_user_id: CurrentUserId,
+):
+    """Point a stopped ssh computer at its machine as a pairing reached it again, then start it.
+
+    For a start refused because the machine no longer answers as it was paired
+    (``start_failure.remedy`` ``reconnect``). ``ssh`` is the ready pairing's
+    target and its probe's host key; a pairing bound to this computer
+    (``POST /ssh/pairings`` with its ``computer_id``) suggests its folder. The
+    folder is checked as this computer's: its own mark passes, another computer's
+    refuses with 409 ``folder_marked`` and its ``owner``, which
+    ``ssh.take_over`` naming takes the folder from once the new target is
+    saved. A machine that is not the computer's (another host key, and neither
+    the computer's own folder in the login's home nor its mark) is refused with
+    409 ``different_machine`` unless ``ssh.move`` says the owner chose to move
+    it there, where each backed-up workspace is restored. A tunnel the computer
+    no longer names is taken off its machine afterwards. Refusals as for a
+    reinstall, 422 for a machine that refused, and 503 for one that did not
+    answer or a tunnel that is not the caller's.
+    """
+    async with _computer_action_errors("reconnect", computer_id):
+        await _owned_computer(computer_id, x_user_id)
+        settings = _sandbox_config().settings_for(SSH_KIND)
+        with _repair_refusals():
+            updated, before = await _computer_manager().reconnect_computer(
+                computer_id, request.ssh, settings=settings
+            )
+        left = tunnel_of(before)
+        if left and left != tunnel_of(updated):
+            schedule_start(
+                f"tunnel-release:{computer_id}:{left}",
+                lambda: release_tunnel(x_user_id, before, settings=settings),
+            )
+        logger.info("Reconnected computer %s for user %s", computer_id, x_user_id)
+        return await _accepted_repair_start(computer_id, "Computer reconnected; starting")

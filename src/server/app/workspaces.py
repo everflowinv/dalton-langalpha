@@ -386,6 +386,7 @@ async def workspace_status_events(workspace_id: str, x_user_id: CurrentUserId):
         sandbox_state: str | None = None,
         error: str | None = None,
         stage: str | None = None,
+        start_failure: dict | None = None,
     ) -> str:
         return sse_status_event(
             {"workspace_id": workspace_id, "computer_id": computer_id},
@@ -393,6 +394,7 @@ async def workspace_status_events(workspace_id: str, x_user_id: CurrentUserId):
             sandbox_state,
             error,
             stage,
+            start_failure,
         )
 
     async def _read_status() -> str | None:

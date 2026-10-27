@@ -15,7 +15,8 @@ import itertools
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
-from ptc_agent.agent.middleware.compaction import utils
+from ptc_agent.agent.middleware.compaction import measure, utils
+from ptc_agent.agent.middleware.compaction.measure import Estimate
 from ptc_agent.agent.middleware.compaction.types import CompactionEvent
 from ptc_agent.agent.middleware.compaction.utils import (
     build_compaction_event,
@@ -833,7 +834,8 @@ class TestAttachmentEstimates:
     def test_text_costs_nothing_here(self):
         assert utils.block_tokens({"type": "text", "text": "x" * 10_000}) == 0
 
-    def test_what_came_after_the_measurement_is_added_to_it(self):
+    @pytest.mark.asyncio
+    async def test_what_came_after_the_measurement_is_added_to_it(self):
         pdf = {"type": "file", "base64": "JVBERi0=", "mime_type": "application/pdf", "pages": 4}
         view = [
             HumanMessage("go"),
@@ -843,9 +845,11 @@ class TestAttachmentEstimates:
         state = {"_cached_input_tokens": 1_000, "_cached_output_tokens": 50}
         counter = lambda msgs: 10 * len(list(msgs))  # noqa: E731
 
-        assert utils.context_tokens(state, view, counter) == 1_050 + 10 + 4 * utils.PDF_PAGE_TOKENS
+        reading = await measure.context_tokens(state, view, Estimate(counter))
+        assert reading.tokens == 1_050 + 10 + 4 * utils.PDF_PAGE_TOKENS
         # Unmeasured, the whole view is estimated, attachments included.
-        assert utils.context_tokens({}, view, counter) == 30 + 4 * utils.PDF_PAGE_TOKENS
+        whole = await measure.context_tokens({}, view, Estimate(counter))
+        assert whole.tokens == 30 + 4 * utils.PDF_PAGE_TOKENS
 
 
 class TestWithSummaryText:

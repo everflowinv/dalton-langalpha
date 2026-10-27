@@ -10,6 +10,8 @@ const LIST_PARAMS = { limit: 100, offset: 0 };
 interface UseAutomationsResult {
   automations: Automation[];
   loading: boolean;
+  /** The list arrived, as opposed to a read that failed or never ran. */
+  loaded: boolean;
   error: Error | null;
 }
 
@@ -27,6 +29,7 @@ export function useAutomations(): UseAutomationsResult {
   return {
     automations: data?.automations ?? EMPTY,
     loading: isLoading,
+    loaded: data !== undefined,
     error,
   };
 }

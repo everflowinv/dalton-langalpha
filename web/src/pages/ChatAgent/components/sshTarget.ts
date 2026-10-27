@@ -4,7 +4,7 @@
  * form: people paste the `ssh` line they already use, so that is accepted as
  * well as a bare `user@host[:port]`.
  */
-import type { ComputerCreate, SshPairingStatus, SshProbeResult, SshTarget } from '@/types/api';
+import type { ComputerCreate, ComputerReconnectTarget, SshPairingStatus, SshProbeResult, SshTarget } from '@/types/api';
 
 export const SSH_DEFAULT_PORT = 22;
 
@@ -168,4 +168,15 @@ export function sshCreateBody(ready: SshReady | null, folder: string): ComputerC
   const { host, port, username, tunnel_id: tunnelId } = ready.target;
   const rootDir = expandHome(folder.trim(), ready.probe.home);
   return { host, port, username, ...(tunnelId ? { tunnel_id: tunnelId } : {}), host_key: ready.probe.host_key, ...(rootDir ? { root_dir: rootDir } : {}) };
+}
+
+/**
+ * What a reconnect sends: where a pairing bound to the computer reached the
+ * machine, and the host key that answered there, or null until a supported
+ * machine is in. The folder is the computer's own, so none is sent.
+ */
+export function sshReconnectTarget(ready: SshReady | null): ComputerReconnectTarget | null {
+  if (!ready || !ready.probe.supported) return null;
+  const { host, port, username, tunnel_id: tunnelId } = ready.target;
+  return { host, port, username, ...(tunnelId ? { tunnel_id: tunnelId } : {}), host_key: ready.probe.host_key };
 }

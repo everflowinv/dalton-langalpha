@@ -50,6 +50,7 @@ from ptc_agent.core.sandbox.providers._ssh_shell import (
     computers_dir,
     delete_script,
     env_file,
+    folder_marked_message,
     framed_script,
     layout_script,
     mark_running_script,
@@ -69,7 +70,11 @@ from ptc_agent.core.sandbox.providers._ssh_transport import (
     run_framed,
     write_atomic,
 )
-from ptc_agent.core.sandbox.providers.ssh_errors import SSHConnectError
+from ptc_agent.core.sandbox.providers.ssh_errors import (
+    MACHINE_ID_PATTERN,
+    SSHConnectError,
+    SSHFolderMarked,
+)
 from ptc_agent.core.sandbox.runtime import (
     STREAM_CHUNK_BYTES,
     ExecResult,
@@ -484,6 +489,8 @@ class SSHRuntime(ExecSessionRuntime):
         Sudo makes it only where the user cannot. See ``root_dir_script``.
 
         Raises:
+            SSHFolderMarked: Another computer's mark is on the folder, named
+                as the probe names it so the owner can take the folder back.
             SSHConnectError: ``root_dir``, the folder cannot be the user's.
         """
         assert link.facts is not None
@@ -503,6 +510,13 @@ class SSHRuntime(ExecSessionRuntime):
             raise SandboxTransientError(
                 f"{self._target.host} is still setting up another computer's folder"
             )
+        if result.exit_code == 10:
+            owner = result.stdout.decode(errors="replace").strip()
+            if re.match(MACHINE_ID_PATTERN, owner):
+                raise SSHFolderMarked(
+                    folder_marked_message(self._working_dir, self._target.host),
+                    owner,
+                )
         error = root_dir_error(
             result.exit_code,
             path=self._working_dir,

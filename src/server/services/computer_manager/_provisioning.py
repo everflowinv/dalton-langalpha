@@ -1140,6 +1140,13 @@ class ProvisioningMixin:
         if not session.sandbox:
             return
         restored = await self._maybe_restore_files(binding, session.sandbox)
+        if not restored:
+            # A key from before a stop on this sandbox would have the next
+            # acquisition trust a folder this check never saw, and skip the
+            # restore that queues its bring-up.
+            self._projects_attached.pop(
+                (binding.workspace_id, self._session_sandbox_id(session)), None
+            )
         attach_key = (
             self._claim_attached(binding, session)
             if synced is not None and restored and user_id

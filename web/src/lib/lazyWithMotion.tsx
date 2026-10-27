@@ -27,38 +27,53 @@ export function lazyWithMotion<
 >(
   load: () => Promise<{ default: T }>,
 ): PreloadableLazy<T> {
+  return preloadableLazy(async () => {
+    const [{ default: Component }, MotionConfig] = await Promise.all([
+      load(),
+      // Destructured right in the `.then`, the shape the bundler reads as
+      // "only MotionConfig". Handed the whole namespace, it re-exports all of
+      // framer from a chunk of its own, 11 kB gz on every route.
+      import('./framer').then(({ MotionConfig }) => MotionConfig),
+    ]);
+    function WithMotion(props: ComponentProps<T>) {
+      return (
+        <MotionConfig reducedMotion="user">
+          <Component {...props} />
+        </MotionConfig>
+      );
+    }
+    // Props pass through untouched, so the wrapper keeps T's contract.
+    return { default: WithMotion as unknown as T };
+  });
+}
+
+/**
+ * `React.lazy` that can be loaded before it renders, for a root with no motion
+ * below it. Loaded ahead, it is handed over by a thenable that answers at
+ * once, which React.lazy takes as resolved and renders without suspending. A
+ * settled promise still answers a tick later, and a boundary mounting fresh
+ * shows its fallback for that tick, then holds the content behind it for
+ * React's fallback throttle, 300ms: so warming a chunk alone does not spare a
+ * first visit the loader.
+ */
+export function preloadableLazy<
+  // React.lazy's own constraint: `any` is what admits every props type.
+  T extends ComponentType<any>,
+>(
+  load: () => Promise<{ default: T }>,
+): PreloadableLazy<T> {
   let loaded: { default: T } | null = null;
   let loading: Promise<{ default: T }> | null = null;
   const resolve = () =>
-    (loading ??= (async () => {
-      const [{ default: Component }, MotionConfig] = await Promise.all([
-        load(),
-        // Destructured right in the `.then`, the shape the bundler reads as
-        // "only MotionConfig". Handed the whole namespace, it re-exports all of
-        // framer from a chunk of its own, 11 kB gz on every route.
-        import('./framer').then(({ MotionConfig }) => MotionConfig),
-      ]);
-      function WithMotion(props: ComponentProps<T>) {
-        return (
-          <MotionConfig reducedMotion="user">
-            <Component {...props} />
-          </MotionConfig>
-        );
-      }
-      // Props pass through untouched, so the wrapper keeps T's contract.
-      loaded = { default: WithMotion as unknown as T };
-      return loaded;
-    })().catch((error: unknown) => {
-      // Not kept: the next try imports again, as a mount after a failed
-      // preload always has.
-      loading = null;
-      throw error;
-    }));
-  // Loaded ahead, it is handed over by a thenable that answers at once, which
-  // React.lazy takes as resolved and renders without suspending. A settled
-  // promise still answers a tick later, and a boundary mounting fresh shows
-  // its fallback for that tick, then holds the content behind it for React's
-  // fallback throttle, 300ms.
+    (loading ??= load().then(
+      (module) => (loaded = module),
+      (error: unknown) => {
+        // Not kept: the next try imports again, as a mount after a failed
+        // preload always has.
+        loading = null;
+        throw error;
+      },
+    ));
   const component = lazy(() => {
     const ready = loaded;
     if (!ready) return resolve();

@@ -135,6 +135,33 @@ not as still to do.
     + _SUMMARY_BODY
 )
 
+_SUMMARY_OPEN, _SUMMARY_END = "<summary>", "</summary>"
+
+# The prompt for the model that holds the conversation writing the summary as
+# text, sent as the last user message of its own request. Reading its own
+# reasoning, it takes steps it only planned for done; with its tools bound it
+# may call one instead; and some providers stop mid-word under a normal stop
+# reason, which the closing line is there to show.
+SELF_SUMMARY_PROMPT = NATIVE_SUMMARY_PROMPT + (
+    "\n\nCount as done only what a tool result above shows was done: a step you "
+    "planned in your reasoning that no tool carried out is not done, and a file "
+    "no tool wrote does not exist. Write the summary as text; do not call a tool."
+    f"\n\nEnd the summary with the line `{_SUMMARY_END}` on its own."
+)
+
+
+def finished_summary(text: str) -> str | None:
+    """The summary a model wrote to ``SELF_SUMMARY_PROMPT``, without its tags
+    or anything it said around them, or None when it did not reach the
+    closing line."""
+    body, closed, after = text.rpartition(_SUMMARY_END)
+    # A tag mid-line with text after it is quoted, by a summary cut off later.
+    if not closed or (after.strip() and body.rsplit("\n", 1)[-1].strip()):
+        return None
+    _, opened, inside = body.partition(_SUMMARY_OPEN)
+    return (inside if opened else body).strip() or None
+
+
 # The prompt for the model whose provider compacted the conversation into a
 # summary only that provider can read, when the user moves the thread to a
 # model of another provider. Sent as the last user message after that summary,

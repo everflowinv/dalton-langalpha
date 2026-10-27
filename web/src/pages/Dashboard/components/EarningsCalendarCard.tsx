@@ -5,6 +5,7 @@ import { ChevronRight, X, Calendar } from 'lucide-react';
 import { motion, AnimatePresence } from '@/lib/framer';
 import { TWEEN } from '@/lib/motion';
 import { SwapCell } from '@/components/ui/crossfade';
+import { useLastHeight } from '@/lib/lastShape';
 import { useBackdropDismiss } from '@/hooks/useDialogA11y';
 import { useLocale } from '@/hooks/useLocale';
 import { useNow } from '@/hooks/useNow';
@@ -386,6 +387,8 @@ function EarningsCalendarCard() {
   // DALTON-HOOK(user-coverage): default to "mine" ("我的") tab; React Query keys by scope + user so switching tabs never races
   const [scope, setScope] = useState<EarningsScope>('mine');
   const [modalOpen, setModalOpen] = useState(false);
+  // The list's height last time here, so its skeleton holds that room.
+  const { ref: listRef, height: lastListHeight } = useLastHeight('dashboard:earnings.height');
 
   const now = useNow();
   const todayStr = localDateStr(now);
@@ -432,46 +435,58 @@ function EarningsCalendarCard() {
           </button>
         </div>
 
-        <div className="flex flex-col gap-1">
+        {/* The skeleton crossfades to the list in place. */}
+        <SwapCell
+          as="div"
+          className="items-start"
+          swapKey={loading ? 'loading' : 'ready'}
+          layerClassName="flex flex-col gap-1"
+        >
           {loading ? (
-            Array.from({ length: 4 }).map((_, i) => (
-              <div key={i} className="flex items-center gap-3 p-3 animate-pulse">
-                <div
-                  className="w-10 h-10 rounded-lg"
-                  style={{ backgroundColor: 'var(--color-border-default)' }}
-                />
-                <div className="flex-1">
+            <div className="flex flex-col gap-1 overflow-hidden" style={{ height: lastListHeight ?? undefined }}>
+              {Array.from({ length: 4 }).map((_, i) => (
+                <div key={i} className="flex items-center gap-3 p-3 animate-pulse">
                   <div
-                    className="h-4 rounded mb-1"
-                    style={{ backgroundColor: 'var(--color-border-default)', width: '50%' }}
+                    className="w-10 h-10 rounded-lg"
+                    style={{ backgroundColor: 'var(--color-border-default)' }}
                   />
-                  <div
-                    className="h-3 rounded"
-                    style={{ backgroundColor: 'var(--color-border-default)', width: '70%' }}
-                  />
+                  <div className="flex-1">
+                    <div
+                      className="h-4 rounded mb-1"
+                      style={{ backgroundColor: 'var(--color-border-default)', width: '50%' }}
+                    />
+                    <div
+                      className="h-3 rounded"
+                      style={{ backgroundColor: 'var(--color-border-default)', width: '70%' }}
+                    />
+                  </div>
                 </div>
-              </div>
-            ))
-          ) : previewItems.length === 0 ? (
-            /* DALTON-HOOK(user-coverage): per-scope empty state copy ("暂无财报数据" vs market empty period) */
-            <p className="text-sm py-4 text-center" style={{ color: 'var(--color-text-secondary)' }}>
-              {scope === 'mine'
-                ? t('dashboard.earningsCalendarCard.emptyData')
-                : t('dashboard.earningsCalendarCard.emptyPeriod')}
-            </p>
+              ))}
+            </div>
           ) : (
-            <>
-              {previewItems.some((e) => e._isPast) && <SectionLabel label={t('dashboard.earningsCalendarCard.sectionRecent')} />}
-              {previewItems.filter((e) => e._isPast).map((item, i) => (
-                <EarningsItem key={item.symbol + item.date + i} item={item} index={i} isPast />
-              ))}
-              {previewItems.some((e) => !e._isPast) && <SectionLabel label={t('dashboard.earningsCalendarCard.sectionUpcoming')} />}
-              {previewItems.filter((e) => !e._isPast).map((item, i) => (
-                <EarningsItem key={item.symbol + item.date + i} item={item} index={i} />
-              ))}
-            </>
+            <div ref={listRef} className="flex flex-col gap-1">
+              {previewItems.length === 0 ? (
+                /* DALTON-HOOK(user-coverage): per-scope empty state copy ("暂无财报数据" vs market empty period) */
+                <p className="text-sm py-4 text-center" style={{ color: 'var(--color-text-secondary)' }}>
+                  {scope === 'mine'
+                    ? t('dashboard.earningsCalendarCard.emptyData')
+                    : t('dashboard.earningsCalendarCard.emptyPeriod')}
+                </p>
+              ) : (
+                <>
+                  {previewItems.some((e) => e._isPast) && <SectionLabel label={t('dashboard.earningsCalendarCard.sectionRecent')} />}
+                  {previewItems.filter((e) => e._isPast).map((item, i) => (
+                    <EarningsItem key={item.symbol + item.date + i} item={item} index={i} isPast />
+                  ))}
+                  {previewItems.some((e) => !e._isPast) && <SectionLabel label={t('dashboard.earningsCalendarCard.sectionUpcoming')} />}
+                  {previewItems.filter((e) => !e._isPast).map((item, i) => (
+                    <EarningsItem key={item.symbol + item.date + i} item={item} index={i} />
+                  ))}
+                </>
+              )}
+            </div>
           )}
-        </div>
+        </SwapCell>
       </div>
 
       {createPortal(

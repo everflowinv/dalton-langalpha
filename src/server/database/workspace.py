@@ -277,7 +277,9 @@ async def get_workspace(
         async with _ws_cursor(conn) as cur:
             await cur.execute(
                 f"""
-                SELECT {_ws_cols("w")}, c.root_dir AS computer_root_dir
+                SELECT {_ws_cols("w")}, c.root_dir AS computer_root_dir,
+                       c.kind AS computer_kind,
+                       c.provider_config AS computer_provider_config
                 FROM workspaces w
                 LEFT JOIN computers c ON c.computer_id = w.computer_id
                 WHERE w.workspace_id = %s AND w.status != 'deleted'
@@ -322,6 +324,8 @@ async def get_workspace_identity(workspace_id: str) -> Optional[Dict[str, Any]]:
     detect split bindings where only the computer half committed and the losing
     provisioner deleted the sandbox still named by the workspace, and the
     machine's root owner, which the layout migration needs on this same path.
+    The computer's root and target fence a cached ssh session a repair on
+    another worker left behind.
     """
     workspace_id = normalize_uuid(workspace_id)
     if workspace_id is None:
@@ -333,7 +337,9 @@ async def get_workspace_identity(workspace_id: str) -> Optional[Dict[str, Any]]:
                 """
                 SELECT w.status, w.sandbox_id, w.computer_id,
                        c.provider_ref, c.status AS computer_status,
-                       c.origin_workspace_id
+                       c.origin_workspace_id, c.kind AS computer_kind,
+                       c.root_dir AS computer_root_dir,
+                       c.provider_config AS computer_provider_config
                 FROM workspaces w
                 LEFT JOIN computers c ON c.computer_id = w.computer_id
                 WHERE w.workspace_id = %s
@@ -1253,9 +1259,12 @@ async def update_workspace_status(
 
         stopped_at_clause = ", stopped_at = %(now)s" if status == "stopped" else ""
         if _mirrors_to_computer(status):
-            # As in update_computer_status: running ends any host outage.
+            # As in update_computer_status: running ends any host outage and
+            # the last start's failure.
             running_clause = (
-                ", host_unavailable_since = NULL" if status == "running" else ""
+                ", host_unavailable_since = NULL, start_failure = NULL"
+                if status == "running"
+                else ""
             )
             always_on_guard = (
                 "\n                  AND c.is_always_on = %(expected_always_on)s"

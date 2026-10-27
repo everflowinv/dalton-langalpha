@@ -114,7 +114,11 @@ function actionFor(phase: RemoteControlPhase): RemoteControlAction | null {
   }
 }
 
-export function useRemoteControlSetup(active: boolean) {
+/**
+ * `computerId` pairs the helper to reconnect that computer rather than to
+ * add this Mac as a new one.
+ */
+export function useRemoteControlSetup(active: boolean, { computerId = null }: { computerId?: string | null } = {}) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
   // Kept through a cancel or a failure: the user read it once and said yes.
@@ -172,7 +176,7 @@ export function useRemoteControlSetup(active: boolean) {
     // computer even when the user then said no.
     void withRemoteControl(async () => {
       if (!current()) return;
-      const minted = await createSshPairing();
+      const minted = await createSshPairing(computerId ? { computerId } : undefined);
       if (!current()) return;
       setAttempt({ step: 'starting', token: minted.token });
       const result = await enableRemoteControl(minted.script_url);

@@ -650,6 +650,49 @@ async def test_a_refused_report_fails_its_pairing_for_the_dialog(redis):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "computer_status,refused",
+    [("stopped", False), ("starting", True), ("running", True)],
+)
+async def test_a_bound_report_is_refused_once_its_computer_started(
+    redis, monkeypatch, computer_status, refused
+):
+    """Started meanwhile (another tab, a turn): pairing the machine again
+    would drop the tunnel the running computer is reached through, and the
+    reconnect naming the new one would be refused. Refused before the
+    machine takes the new key and tunnel, which it does only on an answer."""
+    pairing = _pairing()
+    minted = {
+        "user_id": pairing.user_id,
+        "base": pairing.base,
+        "expires_at": pairing.expires_at.isoformat(),
+        "computer_id": "c-1",
+    }
+    await state._write(pairing, {"pairing": json.dumps(minted)})
+    computer = {
+        "computer_id": "c-1",
+        "user_id": pairing.user_id,
+        "kind": "ssh",
+        "status": computer_status,
+        "config": {},
+    }
+    monkeypatch.setattr(flow, "get_computer", AsyncMock(return_value=computer))
+
+    status, message = await flow.report(
+        "abc", _report(user="dev@corp.example", hostname="box"), sources=[],
+        settings=_SETTINGS,
+    )
+
+    if refused:
+        assert (status, message) == (409, "Stop the computer before you repair it.")
+        view = (await state.load("abc")).view()
+        assert (view.status, view.error.message) == ("failed", message)
+    else:
+        # Past the check, to the report's own refusal of that login.
+        assert status == 422
+
+
+@pytest.mark.asyncio
 async def test_a_report_through_a_tunnel_being_taken_off_waits_for_it(
     redis, monkeypatch
 ):
@@ -1177,3 +1220,43 @@ async def test_a_machine_with_no_ssh_server_is_refused_where_tunnels_are_off(
     assert (status, message) == (422, flow._NO_TUNNEL)
     assert dial_budget.dialed == []
     assert (await state.load("abc")).view().status == "failed"
+
+
+@pytest.mark.asyncio
+async def test_a_pairing_for_a_computer_suggests_that_computers_folder(
+    redis, monkeypatch
+):
+    """Its own mark is on that folder, which reads to a new computer as
+    another's, so the next numbered folder would be the wrong suggestion."""
+    computer = {
+        "computer_id": "c-1",
+        "user_id": "u",
+        "kind": "ssh",
+        "root_dir": "/home/dev/langalpha",
+        "provider_config": {"host": "box", "host_key": _KEY},
+    }
+    monkeypatch.setattr(flow, "get_computer", AsyncMock(return_value=computer))
+    monkeypatch.setattr(flow, "get_computers_for_user", AsyncMock(return_value=[computer]))
+    pairing = await _store()
+    pairing = pairing.model_copy(update={"computer_id": "c-1"})
+    reached = dial.Reached(host="203.0.113.10", port=22, tunnel_id=None, found=_found())
+
+    result = await flow._settle(pairing, _machine(), reached, [], tunnel_id=None)
+
+    assert result.probe.suggested_root_dir == "/home/dev/langalpha"
+
+    unbound = pairing.model_copy(update={"computer_id": None})
+    result = await flow._settle(unbound, _machine(), reached, [], tunnel_id=None)
+    assert result.probe.suggested_root_dir == "/home/dev/langalpha-2"
+
+
+@pytest.mark.asyncio
+async def test_a_bound_pairing_keeps_its_computer_across_workers(redis, monkeypatch):
+    monkeypatch.setattr(state, "ensure_client_key", AsyncMock())
+    monkeypatch.setattr(state, "effective_relay_base_url", lambda kind: "https://example.com")
+
+    minted = await state.create_pairing(
+        "u", request_base="https://example.com", computer_id="c-1"
+    )
+
+    assert (await state.load(minted.token)).computer_id == "c-1"

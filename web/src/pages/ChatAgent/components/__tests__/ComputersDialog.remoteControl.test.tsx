@@ -40,6 +40,7 @@ vi.mock('../../utils/api', async () => {
     deleteComputer: vi.fn(),
     getWorkspaceQuota: vi.fn(async () => ({ performance: null, max: null, always_on: null })),
     createSshPairing: vi.fn(),
+    reconnectComputer: vi.fn(),
     getSshPairing: vi.fn(),
     connectSshPairing: vi.fn(),
     probeSsh: vi.fn(),
@@ -60,6 +61,7 @@ import {
   getComputerProviders,
   getComputers,
   getSshPairing,
+  reconnectComputer,
 } from '../../utils/api';
 import ComputersDialog from '../ComputersDialog';
 import { openDetails } from './computersDialogHarness';
@@ -70,6 +72,7 @@ const mockDelete = deleteComputer as Mock;
 const mockCreate = createComputer as Mock;
 const mockMint = createSshPairing as Mock;
 const mockPairing = getSshPairing as Mock;
+const mockReconnect = reconnectComputer as Mock;
 
 const MAC_KEY = 'SHA256:helperHostKey';
 
@@ -422,5 +425,119 @@ describe('adding a computer', () => {
     await waitFor(() => expect(mockGetComputers).toHaveBeenCalled());
     await settle();
     expect(disable).not.toHaveBeenCalled();
+  });
+});
+
+describe('reconnecting this Mac', () => {
+  const OLD_KEY = 'SHA256:helperKeyBeforeReset';
+  const UNPAIRED: RemoteControlStatus = {
+    supported: true, service: 'off', helper: null, paired: false, fingerprint: null, account: 'alex',
+  };
+  // The row before: its helper was reset, so its pinned key is no longer the helper's.
+  const BROKEN = sshRow('c-mac', 'alex-mac', OLD_KEY, {
+    status: 'stopped',
+    provider_ref: 'alex-mac',
+    start_failure: {
+      code: 'not_connected', message: 'alex-mac is not connected.', owner: null, remedy: 'reconnect',
+      at: '2026-10-25T16:40:00Z',
+    },
+  });
+  // The row once the server took the new connection.
+  const RECONNECTED = sshRow('c-mac', 'alex-mac', MAC_KEY, { status: 'starting', provider_ref: 'alex-mac' });
+  const READY: SshPairingStatus = {
+    status: 'ready', expires_at: '2026-10-25T17:00:00Z', error: null,
+    target: { host: 'alex-mac', port: 22, username: 'alex', tunnel_id: 'tun-2' },
+    probe: {
+      host_key: 'ssh-ed25519 AAAAhelper', fingerprint: MAC_KEY, os: 'Darwin', arch: 'arm64', distro: 'macOS 15.1',
+      home: '/Users/alex', shell: '/bin/zsh', is_root: false, has_sudo: true, disk_free_bytes: null, supported: true,
+      problems: [], suggested_root_dir: '/Users/alex/langalpha', hostname: 'alex-mac', helper: true,
+    },
+    machine: { username: 'alex', hostname: 'alex-mac', os: 'Darwin', addresses: [] },
+  };
+
+  beforeEach(() => {
+    getStatus.mockResolvedValue(UNPAIRED);
+    enable.mockImplementation(async (): Promise<RemoteControlResult> => {
+      getStatus.mockResolvedValue(STATUS);
+      return { ok: true, status: STATUS };
+    });
+    mockGetComputers.mockResolvedValue({ computers: [PRIMARY, BROKEN], total: 2 });
+    mockMint.mockResolvedValue({
+      token: 'tok-mac', script_url: 'https://api.example.com/api/v1/computers/ssh/pairings/tok-mac/script',
+      command: 'curl', expires_at: '2026-10-25T17:00:00Z', local_only: false,
+    });
+    mockPairing.mockResolvedValue(READY);
+  });
+
+  async function pairAgain(user: ReturnType<typeof userEvent.setup>) {
+    const view = open();
+    await user.click(within(await rowNamed('alex-mac')).getByRole('button', { name: 'Reconnect…' }));
+    const dialog = await screen.findByRole('dialog', { name: 'Reconnect alex-mac' });
+    await user.click(within(dialog).getByRole('checkbox', { name: /^I understand LangAlpha's agent/ }));
+    await user.click(within(dialog).getByRole('button', { name: 'Turn on remote control' }));
+    await within(dialog).findByTestId('ssh-ready');
+    expect(mockMint).toHaveBeenCalledWith({ computerId: 'c-mac' });
+    expect(enable).toHaveBeenCalledWith('https://api.example.com/api/v1/computers/ssh/pairings/tok-mac/script');
+    return { view, dialog };
+  }
+
+  it("re-pairs the helper to this computer and keeps it on once the row names the helper's new key", async () => {
+    mockReconnect.mockImplementation(async () => {
+      mockGetComputers.mockResolvedValue({ computers: [PRIMARY, RECONNECTED], total: 2 });
+      return { computer_id: 'c-mac', status: 'starting' };
+    });
+    const user = userEvent.setup();
+    const { dialog } = await pairAgain(user);
+    expect(dialog).toHaveTextContent('Workspaces stay in /Users/alex/langalpha.');
+
+    await user.click(within(dialog).getByRole('button', { name: 'Reconnect' }));
+    expect(mockReconnect).toHaveBeenCalledWith('c-mac', {
+      host: 'alex-mac', port: 22, username: 'alex', tunnel_id: 'tun-2', host_key: 'ssh-ed25519 AAAAhelper',
+    });
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Reconnect alex-mac' })).not.toBeInTheDocument());
+    // The row is this Mac again at once, and closing on it left remote control on.
+    await within(await rowNamed('alex-mac')).findByText('This Mac');
+    await settle();
+    expect(disable).not.toHaveBeenCalled();
+  });
+
+  it('waits for a reconnect still in flight before deciding the helper is unused', async () => {
+    const answer = deferred<{ computer_id: string; status: string }>();
+    mockReconnect.mockImplementation(() => answer.promise);
+    const user = userEvent.setup();
+    const { view, dialog } = await pairAgain(user);
+    await user.click(within(dialog).getByRole('button', { name: 'Reconnect' }));
+    expect(mockReconnect).toHaveBeenCalled();
+
+    // The panel goes while the request runs; the server still has the old key.
+    view.unmount();
+    await settle();
+    expect(disable).not.toHaveBeenCalled();
+    mockGetComputers.mockResolvedValue({ computers: [PRIMARY, RECONNECTED], total: 2 });
+    await act(async () => answer.resolve({ computer_id: 'c-mac', status: 'starting' }));
+    await waitFor(() => expect(getStatus.mock.calls.length).toBeGreaterThan(2));
+    await settle();
+    expect(disable).not.toHaveBeenCalled();
+  });
+
+  it('turns the helper off again when the dialog is left without reconnecting', async () => {
+    const user = userEvent.setup();
+    const { dialog } = await pairAgain(user);
+    await user.click(within(dialog).getByRole('button', { name: 'Cancel' }));
+    await waitFor(() => expect(disable).toHaveBeenCalledTimes(1));
+    expect(mockReconnect).not.toHaveBeenCalled();
+  });
+
+  it('is not offered on a Mac that is already another computer', async () => {
+    getStatus.mockResolvedValue(STATUS);
+    mockGetComputers.mockResolvedValue({ computers: [PRIMARY, BROKEN, sshRow('c-other', 'studio', MAC_KEY)], total: 3 });
+    const user = userEvent.setup();
+    open();
+    await within(await rowNamed('studio')).findByText('This Mac');
+    await user.click(within(await rowNamed('alex-mac')).getByRole('button', { name: 'Reconnect…' }));
+    const dialog = await screen.findByRole('dialog', { name: 'Reconnect alex-mac' });
+    expect(within(dialog).getByTestId('reconnect-other-mac')).toHaveTextContent('This Mac is already studio.');
+    expect(within(dialog).queryByRole('button', { name: 'Turn on remote control' })).not.toBeInTheDocument();
+    expect(mockMint).not.toHaveBeenCalled();
   });
 });

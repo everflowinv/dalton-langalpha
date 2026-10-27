@@ -352,8 +352,13 @@ class BringUpMixin:
             job.task = asyncio.create_task(_run(job))
         job.add(workspace_id, urgent=urgent)
 
-    async def _on_session_attached(
-        self, computer_id: str, session: Any, *, resumed: bool
+    def _on_session_attached(
+        self,
+        computer_id: str,
+        session: Any,
+        *,
+        resumed: bool,
+        opened: Optional[str] = None,
     ) -> None:
         """What a worker owes a machine once it holds a session on it.
 
@@ -363,18 +368,59 @@ class BringUpMixin:
         started again on the sandbox it stopped on, whose disk still holds
         the threads deleted or gone idle meanwhile, and no worker's attach
         will look again (projects stay attached across a stop on the same
-        sandbox), so every project's sync is queued too."""
+        sandbox), so every project's sync is queued too, but ``opened``'s,
+        which its own start queued. A lazy restart has no runtime yet when
+        it attaches, so its Phase 2 queues them."""
         if resumed:
-            await self._queue_reconnect_syncs(computer_id, session.sandbox)
+            self._queue_reconnect_syncs_soon(
+                computer_id, session.sandbox, opened=opened
+            )
         self.end_stale_jobs_soon(computer_id, session.sandbox)
 
-    async def _queue_reconnect_syncs(self, computer_id: str, sandbox: Any) -> None:
-        """Queue every project on a resumed sandbox; the restore step finds
-        nothing deferred on a warm disk, so each costs only its sync."""
-        for workspace_id in await get_live_workspace_ids_for_computer(computer_id):
-            self._queue_bring_up(
-                computer_id, workspace_id, sandbox, sandbox.working_dir, urgent=False
+    def _queue_reconnect_syncs_soon(
+        self, computer_id: str, sandbox: Any, *, opened: Optional[str] = None
+    ) -> None:
+        """``_queue_reconnect_syncs`` in a task of its own. The start is up by
+        now, and a cancel landing in the listing would unwind it."""
+        task = asyncio.create_task(
+            self._queue_reconnect_syncs(computer_id, sandbox, opened=opened)
+        )
+        self._prune_tasks.add(task)
+        task.add_done_callback(self._prune_tasks.discard)
+
+    async def _queue_reconnect_syncs(
+        self, computer_id: str, sandbox: Any, *, opened: Optional[str] = None
+    ) -> None:
+        """Queue every project on a resumed sandbox but ``opened``; the restore
+        step finds nothing deferred on a warm disk, so each costs only its
+        sync. The start is up by now, so a failed listing does not fail it:
+        this worker forgets what it attached to the sandbox instead, and each
+        project's next acquisition here attaches again and queues its own."""
+        try:
+            workspace_ids = await get_live_workspace_ids_for_computer(computer_id)
+        except Exception as e:  # noqa: BLE001
+            sandbox_id = str(sandbox.sandbox_id) if sandbox.sandbox_id else None
+            self._projects_attached = {
+                key: epoch
+                for key, epoch in self._projects_attached.items()
+                if key[1] != sandbox_id or key[0] == opened
+            }
+            logger.warning(
+                f"Could not list the workspaces on computer {computer_id} to "
+                f"sync them after its start; each attaches again here on its "
+                f"next open: {e}"
             )
+            return
+        cached = self._cached_session(computer_id)
+        if cached is None or cached.sandbox is not sandbox:
+            # Replaced while the listing ran: queued on this sandbox, they
+            # would cancel the replacement's own bring-up (_queue_bring_up).
+            return
+        for workspace_id in workspace_ids:
+            if workspace_id != opened:
+                self._queue_bring_up(
+                    computer_id, workspace_id, sandbox, sandbox.working_dir, urgent=False
+                )
 
     def end_stale_jobs_soon(self, computer_id: str, sandbox: Any) -> None:
         """End the jobs a machine this worker just connected to holds that

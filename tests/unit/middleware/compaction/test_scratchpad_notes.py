@@ -29,6 +29,7 @@ from ptc_agent.agent.middleware.compaction.notes import (
 from ptc_agent.agent.middleware.compaction.summary_request import _summarizable
 from ptc_agent.agent.middleware.compaction.utils import (
     build_summary_message,
+    count_tokens_claude,
     parse_summary_message,
 )
 from ptc_agent.agent.middleware.runtime_context import runtime_update_from_message
@@ -253,15 +254,17 @@ def _chars(messages) -> int:
     return sum(len(m.content) for m in messages)
 
 
-def _middleware(threshold: int = 300_000) -> NotesDueMiddleware:
+def _middleware(threshold: int = 300_000, model: str = "m") -> NotesDueMiddleware:
     """The reminder beside a main compaction summarizing at ``threshold``,
     counting a message's characters as its tokens."""
     compaction = CompactionMiddleware(
         Summarizer(GenericFakeChatModel(messages=iter([])), limit=threshold, counter=_chars),
         token_threshold=threshold,
-        keep_messages=6,
+        keep_tokens=6,
     )
-    return NotesDueMiddleware(SCRATCHPAD, compaction.with_scratchpad_notes(NOTES))
+    return NotesDueMiddleware(
+        SCRATCHPAD, compaction.with_scratchpad_notes(NOTES), SimpleNamespace(model_name=model)
+    )
 
 
 async def _ask(
@@ -684,7 +687,9 @@ def test_the_reminder_measures_as_the_main_compaction_does():
     notes_due = _middleware(123_000)
 
     assert notes_due._token_threshold == 123_000
-    assert notes_due._counter is _chars
+    assert notes_due._estimate.counter is _chars
+    # And counts as the turn's model does, as the trigger counts it.
+    assert _middleware(model="claude-sonnet-5-5")._estimate.counter is count_tokens_claude
 
 
 def test_only_the_main_agents_copy_names_the_notes():
@@ -692,7 +697,7 @@ def test_only_the_main_agents_copy_names_the_notes():
     shared = CompactionMiddleware(
         Summarizer(GenericFakeChatModel(messages=iter([])), limit=100_000, counter=len),
         token_threshold=40_000,
-        keep_messages=6,
+        keep_tokens=6,
     )
 
     main = shared.with_scratchpad_notes(NOTES)

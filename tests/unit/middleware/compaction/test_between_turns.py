@@ -62,14 +62,14 @@ def _model(*answers: AIMessage) -> GenericFakeChatModel:
     return GenericFakeChatModel(messages=iter(answers))
 
 
-def _agent(model, *, summary="the summarizer's summary", compaction=True):
+def _agent(model, *, summary="the summarizer's summary", compaction=True, keep_tokens=2):
     sent = _Sent()
     middleware = []
     if compaction:
         summarizer = Summarizer(_model(AIMessage(summary)), limit=100_000, counter=len)
         # Never past the threshold: only an ask summarizes.
         middleware.append(
-            CompactionMiddleware(summarizer, token_threshold=10**9, keep_messages=2)
+            CompactionMiddleware(summarizer, token_threshold=10**9, keep_tokens=keep_tokens)
         )
     agent = create_agent(model=model, tools=[], middleware=[*middleware, sent])
     return agent, sent
@@ -117,7 +117,7 @@ class TestCompact:
         agent, sent = _agent(_model())
         state = {"messages": _history()}
 
-        answer = await ask_between_turns(agent, state, Compact(2), thread_id="t-1")
+        answer = await ask_between_turns(agent, state, Compact(), thread_id="t-1")
 
         assert isinstance(answer, Compaction)
         assert sent.requests == []
@@ -129,11 +129,11 @@ class TestCompact:
         assert "_summarization_event" not in state
 
     async def test_a_view_no_longer_than_what_is_kept_has_nothing_to_compact(self):
-        agent, sent = _agent(_model())
+        agent, sent = _agent(_model(), keep_tokens=6)
 
-        with pytest.raises(ValueError, match="Not enough messages to compact"):
+        with pytest.raises(ValueError, match="Nothing to compact yet"):
             await ask_between_turns(
-                agent, {"messages": _history()}, Compact(6), thread_id="t-1"
+                agent, {"messages": _history()}, Compact(), thread_id="t-1"
             )
         assert sent.requests == []
 
@@ -142,7 +142,7 @@ class TestCompact:
 
         with pytest.raises(NoCompaction, match="no compaction"):
             await ask_between_turns(
-                agent, {"messages": _history()}, Compact(2), thread_id="t-1"
+                agent, {"messages": _history()}, Compact(), thread_id="t-1"
             )
         # Told apart before the model would be called as if for a turn.
         assert sent.requests == []
@@ -152,7 +152,7 @@ class TestCompact:
         from ptc_agent.agent.middleware.compaction.between_turns import asked
 
         agent, _ = _agent(_model())
-        await ask_between_turns(agent, {"messages": _history()}, Compact(2), thread_id="t-1")
+        await ask_between_turns(agent, {"messages": _history()}, Compact(), thread_id="t-1")
 
         assert asked() is None
 

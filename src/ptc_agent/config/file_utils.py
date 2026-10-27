@@ -218,6 +218,21 @@ def refuse_renamed_llm_keys(config: Any, source: str | Path) -> None:
         raise ValueError(f"llm.flash was renamed to llm.background (in {source})")
 
 
+def warn_retired_compaction_keys(config: Any, source: str | Path) -> None:
+    """Warn on ``compaction.keep_messages``, which a summary no longer reads.
+
+    Ignored as an unknown key, it would change what a deployment keeps with
+    no word of it. Warned, not refused: the token tail that replaces it is a
+    safe default, and a file kept from before it should still load.
+    """
+    compaction = config.get("compaction") if isinstance(config, dict) else None
+    if isinstance(compaction, dict) and "keep_messages" in compaction:
+        logger.warning(
+            f"compaction.keep_messages is no longer read (in {source}); a summary "
+            "keeps the newest compaction.keep_tokens instead"
+        )
+
+
 def load_yaml_config(file_path: str, use_cache: bool = True) -> dict[str, Any]:
     """Load and process YAML configuration file with env var substitution.
 
@@ -237,6 +252,7 @@ def load_yaml_config(file_path: str, use_cache: bool = True) -> dict[str, Any]:
 
     raw_config = _read_yaml(file_path)
     refuse_renamed_llm_keys(raw_config, file_path)
+    warn_retired_compaction_keys(raw_config, file_path)
 
     if app_env:
         base = Path(file_path)
@@ -246,6 +262,7 @@ def load_yaml_config(file_path: str, use_cache: bool = True) -> dict[str, Any]:
             if not isinstance(overlay_config, dict):
                 raise ValueError(f"{overlay} must be a mapping of config keys")
             refuse_renamed_llm_keys(overlay_config, overlay)
+            warn_retired_compaction_keys(overlay_config, overlay)
             raw_config = _deep_merge(raw_config, overlay_config)
             logger.info(f"Applied {overlay.name} over {file_path}")
         else:

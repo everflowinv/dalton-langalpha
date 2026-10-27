@@ -1,8 +1,8 @@
 import React, { useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Plus, ArrowUpRight, ArrowDownRight, Trash2, Pencil, Eye, EyeOff, Sunrise, Sunset, MoreVertical } from 'lucide-react';
-import { motion } from '@/lib/framer';
-import { staggerDelay, TWEEN } from '@/lib/motion';
+import { motion, AnimatePresence } from '@/lib/framer';
+import { TWEEN } from '@/lib/motion';
 import { SwapCell } from '@/components/ui/crossfade';
 import { useNavigate } from 'react-router';
 import { getExtendedHoursInfo } from '@/lib/marketUtils';
@@ -18,6 +18,7 @@ import {
   normalizePortfolioCurrency,
   summarizePortfolioByCurrency,
 } from '../utils/portfolioSummary';
+import { HoldingsSkeleton, useHoldingsSkeletonRows } from '../widgets/definitions/_holdingsPrimitives';
 
 const fmt1 = createFormatter({ minimumFractionDigits: 1, maximumFractionDigits: 1 });
 
@@ -77,13 +78,12 @@ type MarketStatusData = Parameters<typeof getExtendedHoursInfo>[0];
 
 interface WatchlistItemProps {
   item: WatchlistRow;
-  index: number;
   onDelete?: (id: string) => void;
   marketStatus: MarketStatusData;
   isMobile: boolean;
 }
 
-function WatchlistItem({ item, index, onDelete, marketStatus, isMobile }: WatchlistItemProps) {
+function WatchlistItem({ item, onDelete, marketStatus, isMobile }: WatchlistItemProps) {
   const { t } = useTranslation();
   const locale = useLocale();
   const navigate = useNavigate();
@@ -123,7 +123,7 @@ function WatchlistItem({ item, index, onDelete, marketStatus, isMobile }: Watchl
       data-testid={item.symbol ? `watchlist-row-${item.symbol}` : undefined}
       initial={{ opacity: 0, y: 8 }}
       animate={{ opacity: 1, y: 0 }}
-      transition={{ ...TWEEN.quick, delay: staggerDelay(index) }}
+      transition={TWEEN.quick}
       className="flex items-center gap-2 p-3 rounded-xl border border-transparent transition-all cursor-pointer"
       style={{ backgroundColor: 'transparent' }}
       onClick={() => navigate(`/market?symbol=${encodeURIComponent(item.symbol)}`)}
@@ -237,7 +237,6 @@ function WatchlistItem({ item, index, onDelete, marketStatus, isMobile }: Watchl
 
 interface PortfolioItemProps {
   item: PortfolioRow;
-  index: number;
   onEdit?: (item: PortfolioRow) => void;
   onDelete?: (id: string) => void;
   valuesHidden: boolean;
@@ -245,7 +244,7 @@ interface PortfolioItemProps {
   isMobile: boolean;
 }
 
-function PortfolioItem({ item, index, onEdit, onDelete, valuesHidden, marketStatus, isMobile }: PortfolioItemProps) {
+function PortfolioItem({ item, onEdit, onDelete, valuesHidden, marketStatus, isMobile }: PortfolioItemProps) {
   const { t } = useTranslation();
   const locale = useLocale();
   const navigate = useNavigate();
@@ -284,7 +283,7 @@ function PortfolioItem({ item, index, onEdit, onDelete, valuesHidden, marketStat
       data-testid={item.symbol ? `portfolio-row-${item.symbol}` : undefined}
       initial={{ opacity: 0, y: 8 }}
       animate={{ opacity: 1, y: 0 }}
-      transition={{ ...TWEEN.quick, delay: staggerDelay(index) }}
+      transition={TWEEN.quick}
       className="flex items-center gap-2 p-3 rounded-xl border border-transparent transition-all cursor-pointer"
       style={{ backgroundColor: 'transparent' }}
       onClick={() => navigate(`/market?symbol=${encodeURIComponent(item.symbol)}`)}
@@ -433,10 +432,14 @@ type PWTabKey = 'watchlist' | 'portfolio';
 interface PortfolioWatchlistCardProps {
   watchlistRows?: WatchlistRow[];
   watchlistLoading?: boolean;
+  /** The watchlist arrived, as opposed to a read that failed or never ran. */
+  watchlistLoaded?: boolean;
   onWatchlistAdd?: () => void;
   onWatchlistDelete?: (id: string) => void;
   portfolioRows?: PortfolioRow[];
   portfolioLoading?: boolean;
+  /** The holdings arrived, as opposed to a read that failed or never ran. */
+  portfolioLoaded?: boolean;
   hasRealHoldings?: boolean;
   onPortfolioAdd?: () => void;
   onPortfolioDelete?: (id: string) => void;
@@ -447,10 +450,12 @@ interface PortfolioWatchlistCardProps {
 function PortfolioWatchlistCard({
   watchlistRows = [],
   watchlistLoading = false,
+  watchlistLoaded = false,
   onWatchlistAdd,
   onWatchlistDelete,
   portfolioRows = [],
   portfolioLoading = false,
+  portfolioLoaded = false,
   hasRealHoldings = false,
   onPortfolioAdd,
   onPortfolioDelete,
@@ -462,6 +467,8 @@ function PortfolioWatchlistCard({
   const isMobile = useIsMobile();
   const [activeTab, setActiveTabRaw] = useState<PWTabKey>(() => (localStorage.getItem('portfolio_active_tab') as PWTabKey) || 'watchlist');
   const [valuesHidden, setValuesHiddenRaw] = useState(() => localStorage.getItem('portfolio_values_hidden') === 'true');
+  const watchlistSkeletonRows = useHoldingsSkeletonRows('watchlist', watchlistLoaded ? watchlistRows.length : null);
+  const portfolioSkeletonRows = useHoldingsSkeletonRows('portfolio', portfolioLoaded ? portfolioRows.length : null);
 
   // The two tabs dissolve in one cell at the same scroll offset, so a tab
   // opens at its top rather than out of view below a short list.
@@ -529,43 +536,34 @@ function PortfolioWatchlistCard({
       </div>
 
       {/* Content. The tabs dissolve in one grid cell, so a switch never passes
-          through an empty card. */}
+          through an empty card. A tab the reader picks rises; the skeleton
+          giving way to its rows crossfades, and rows present at first render
+          never enter one by one. */}
       <div ref={contentRef} className="flex-1 min-h-0 overflow-y-auto pr-1">
         <SwapCell
           as="div"
           className="items-start"
-          appear
-          shift={{ y: 10 }}
-          swapKey={activeTab}
+          riseKey={activeTab}
+          swapKey={`${activeTab}:${(activeTab === 'watchlist' ? watchlistLoading : portfolioLoading) ? 'loading' : 'ready'}`}
           layerClassName="flex flex-col gap-1"
         >
           {activeTab === 'watchlist' ? (
             <>
               {watchlistLoading
-                ? Array.from({ length: 5 }).map((_, i) => (
-                    <div key={i} className="flex items-center gap-3 p-3 animate-pulse">
-                      <div className="flex-1">
-                        <div
-                          className="h-4 rounded mb-1"
-                          style={{ backgroundColor: 'var(--color-border-default)', width: '40%' }}
+                ? <HoldingsSkeleton count={watchlistSkeletonRows} />
+                : (
+                    <AnimatePresence initial={false}>
+                      {watchlistRows.map((item) => (
+                        <WatchlistItem
+                          key={item.watchlist_item_id ?? item.symbol}
+                          item={item}
+                          onDelete={onWatchlistDelete}
+                          marketStatus={marketStatus}
+                          isMobile={isMobile}
                         />
-                        <div
-                          className="h-3 rounded"
-                          style={{ backgroundColor: 'var(--color-border-default)', width: '25%' }}
-                        />
-                      </div>
-                    </div>
-                  ))
-                : watchlistRows.map((item, i) => (
-                    <WatchlistItem
-                      key={item.watchlist_item_id ?? item.symbol}
-                      item={item}
-                      index={i}
-                      onDelete={onWatchlistDelete}
-                      marketStatus={marketStatus}
-                      isMobile={isMobile}
-                    />
-                  ))}
+                      ))}
+                    </AnimatePresence>
+                  )}
               <AddNewButton label={t('dashboard.portfolioWatchlistCard.addSymbol')} onClick={onWatchlistAdd} />
             </>
           ) : (
@@ -633,32 +631,22 @@ function PortfolioWatchlistCard({
               )}
 
               {portfolioLoading
-                ? Array.from({ length: 3 }).map((_, i) => (
-                    <div key={i} className="flex items-center gap-3 p-3 animate-pulse">
-                      <div className="flex-1">
-                        <div
-                          className="h-4 rounded mb-1"
-                          style={{ backgroundColor: 'var(--color-border-default)', width: '40%' }}
+                ? <HoldingsSkeleton count={portfolioSkeletonRows} />
+                : (
+                    <AnimatePresence initial={false}>
+                      {portfolioRows.map((item) => (
+                        <PortfolioItem
+                          key={item.user_portfolio_id ?? item.symbol}
+                          item={item}
+                          onEdit={onPortfolioEdit}
+                          onDelete={onPortfolioDelete}
+                          valuesHidden={valuesHidden}
+                          marketStatus={marketStatus}
+                          isMobile={isMobile}
                         />
-                        <div
-                          className="h-3 rounded"
-                          style={{ backgroundColor: 'var(--color-border-default)', width: '25%' }}
-                        />
-                      </div>
-                    </div>
-                  ))
-                : portfolioRows.map((item, i) => (
-                    <PortfolioItem
-                      key={item.user_portfolio_id ?? item.symbol}
-                      item={item}
-                      index={i}
-                      onEdit={onPortfolioEdit}
-                      onDelete={onPortfolioDelete}
-                      valuesHidden={valuesHidden}
-                      marketStatus={marketStatus}
-                      isMobile={isMobile}
-                    />
-                  ))}
+                      ))}
+                    </AnimatePresence>
+                  )}
               <AddNewButton label={t('dashboard.portfolioWatchlistCard.addTransaction')} onClick={onPortfolioAdd} />
             </>
           )}

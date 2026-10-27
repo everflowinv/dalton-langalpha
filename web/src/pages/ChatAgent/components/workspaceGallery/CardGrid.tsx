@@ -36,6 +36,7 @@ import { SortableContext, rectSortingStrategy, sortableKeyboardCoordinates, useS
 import { CSS } from '@dnd-kit/utilities';
 
 import { isEffectivelyPinned } from '../../hooks/useNavigationData';
+import { GALLERY_GRID } from './layout';
 import type { WorkspaceRecord } from './types';
 
 // Hoisted: dnd-kit memoizes on these objects' identity. The distance matches
@@ -147,12 +148,8 @@ export function CardGrid({ workspaces, canDrag, saving, refreshing, onMove, labe
       onDragCancel={() => setActiveId(null)}
     >
       <SortableContext items={ids} strategy={rectSortingStrategy}>
-        {/* As many columns as fit at a readable card width: one on a phone,
-            two on a small laptop, three from a 16-inch one up to the column's
-            cap. Every row is as tall as the tallest, so the cards read as one
-            even field at every width. */}
         <div
-          className="grid grid-cols-1 auto-rows-fr gap-3 md:gap-4 md:grid-cols-[repeat(auto-fill,minmax(min(100%,23.75rem),1fr))]"
+          className={GALLERY_GRID}
           data-testid="workspace-card-grid"
           data-draggable={canDrag && !held ? 'true' : undefined}
         >
@@ -175,8 +172,8 @@ export function CardGrid({ workspaces, canDrag, saving, refreshing, onMove, labe
           })}
         </div>
       </SortableContext>
-      {/* On <body>: the overlay is fixed, and a transformed ancestor (the
-          cards' entrance animation) would carry it off the pointer. */}
+      {/* On <body>: the overlay is fixed, and a transformed ancestor would
+          carry it off the pointer. */}
       {createPortal(
         <DragOverlay zIndex={60}>
           {active ? renderCard(active, ids.indexOf(active.workspace_id), { state: 'lifted', dragging: true, held: false }) : null}

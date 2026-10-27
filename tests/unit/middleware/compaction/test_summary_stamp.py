@@ -22,12 +22,23 @@ from ptc_agent.agent.middleware.compaction.utils import (
     build_summary_message,
     compaction_summary,
 )
+from ptc_agent.agent.middleware.compaction.measure import context_growth
+from ptc_agent.agent.middleware.model_resilience import FALLBACK_KEY
 
 pytestmark = pytest.mark.asyncio
 
 
+class _Model(GenericFakeChatModel):
+    """A model named "m", as its answers are."""
+
+    model_name: str = "m"
+
+
 def _history() -> list:
-    return [HumanMessage("go", id="h0"), *(AIMessage(f"a{i}", id=f"a{i}") for i in range(8))]
+    return [
+        HumanMessage("go", id="h0"),
+        *(AIMessage(f"a{i}", id=f"a{i}", response_metadata={"model_name": "m"}) for i in range(8)),
+    ]
 
 
 def _middleware(summary_message: HumanMessage) -> CompactionMiddleware:
@@ -47,24 +58,40 @@ def _middleware(summary_message: HumanMessage) -> CompactionMiddleware:
     return CompactionMiddleware(
         SimpleNamespace(counter=len, compact=compact),
         token_threshold=100,
-        keep_messages=2,
+        keep_tokens=2,
+        self_summary=False,
     )
 
 
-async def _answer(mw: CompactionMiddleware, measured: int) -> AIMessage:
-    answer = AIMessage("done", id="ai-done")
+async def _answer(
+    mw: CompactionMiddleware,
+    measured: int,
+    *,
+    history: list | None = None,
+    input_tokens: int = 0,
+    metadata: dict | None = None,
+) -> AIMessage:
+    """The response to one call, reporting ``input_tokens`` from model "m"."""
+    answer = AIMessage("done", id="ai-done", response_metadata={"model_name": "m", **(metadata or {})})
+    if input_tokens:
+        answer.usage_metadata = {
+            "input_tokens": input_tokens,
+            "output_tokens": 1,
+            "total_tokens": input_tokens + 1,
+        }
 
     async def handler(request):
         return ModelResponse(result=[answer])
 
+    history = history or _history()
     request = ModelRequest(
-        model=GenericFakeChatModel(messages=iter([])),
-        messages=_history(),
+        model=_Model(messages=iter([])),
+        messages=history,
         system_message=None,
         tool_choice=None,
         tools=[],
         response_format=None,
-        state={"messages": _history(), "_cached_input_tokens": measured},
+        state={"messages": history, "_cached_input_tokens": measured},
         runtime=None,
     )
     await mw.awrap_model_call(request, handler)
@@ -78,7 +105,7 @@ async def test_the_response_to_a_compacted_call_carries_the_signal_it_followed(
     monkeypatch.setattr(mw_module, "get_stream_writer", lambda: signals.append)
     summary_message = build_summary_message("condensed", None, original_message_count=9)
 
-    answer = await _answer(_middleware(summary_message), measured=500)
+    answer = await _answer(_middleware(summary_message), measured=500, input_tokens=600)
 
     (complete,) = [
         s for s in signals if s["action"] == "summarize" and s["signal"] == "complete"
@@ -102,3 +129,58 @@ async def test_a_call_that_did_not_compact_carries_no_summary():
     answer = await _answer(_middleware(summary_message), measured=50)
 
     assert compaction_summary(answer) is None
+
+
+def _since(model: str, metadata: dict | None = None) -> list:
+    """An answer from ``model``, and one message after it."""
+    return [
+        HumanMessage("go", id="h0"),
+        AIMessage("a0", id="a0", response_metadata={"model_name": model, **(metadata or {})}),
+        HumanMessage("more", id="h1"),
+    ]
+
+
+async def test_a_call_carries_what_its_context_grew_by_since_the_last():
+    summary_message = build_summary_message("condensed", None)
+
+    answer = await _answer(
+        _middleware(summary_message), measured=50, history=_since("m"), input_tokens=80
+    )
+
+    # Measured from the last call's 50 input tokens; estimated as a0 and h1,
+    # a token a message.
+    assert context_growth(answer, "m") == (30, 2)
+    # Another model counts the stretch its own way.
+    assert context_growth(answer, "other") is None
+
+
+async def test_no_growth_is_stamped_across_models_or_a_summary():
+    summary_message = build_summary_message("condensed", None)
+
+    other = await _answer(
+        _middleware(summary_message), measured=50, history=_since("other"), input_tokens=80
+    )
+    compacted = await _answer(_middleware(summary_message), measured=500, input_tokens=600)
+
+    assert context_growth(other, "m") is None
+    assert context_growth(compacted, "m") is None
+
+
+async def test_no_growth_is_stamped_across_a_fallback_answer():
+    """Both answers can come from one fallback, which counts its own tokens."""
+    summary_message = build_summary_message("condensed", None)
+    fallback = {FALLBACK_KEY: "fallback-a"}
+
+    after = await _answer(
+        _middleware(summary_message), measured=50, history=_since("m", fallback), input_tokens=80
+    )
+    by = await _answer(
+        _middleware(summary_message),
+        measured=50,
+        history=_since("m", fallback),
+        input_tokens=80,
+        metadata=fallback,
+    )
+
+    assert context_growth(after, "m") is None
+    assert context_growth(by, "m") is None

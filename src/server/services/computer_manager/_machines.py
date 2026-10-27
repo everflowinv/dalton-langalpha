@@ -46,6 +46,7 @@ from src.server.database.workspace import (
     WorkspaceDirNameTaken,
 )
 from src.server.models.computer import CLAIMABLE_FOR_START, ComputerStatus
+from src.server.services.computer_start_failure import record_start_failure
 from src.server.services.computer_errors import (
     ProviderNotOffered,
     UnknownResourceTier,
@@ -568,6 +569,10 @@ class MachineLifecycleMixin:
             return None
         if self._session_sandbox_id(session) != computer.get("provider_ref"):
             return None
+        # A reinstall or reconnect another worker ran keeps the ref.
+        binding = self._binding_from_computer("", computer)
+        if self._machine_target_is_stale(binding, session) is not None:
+            return None
         return session
 
     async def _sync_machine_assets(
@@ -811,7 +816,7 @@ class MachineLifecycleMixin:
                         f"{project_binding.workspace_id} after binding: {e}"
                     )
             if reconnected:
-                await self._on_session_attached(computer_id, session, resumed=True)
+                self._on_session_attached(computer_id, session, resumed=True)
             self._record_sync(computer_id)
             if not reconnected:
                 # What starts with the machine (an always-on app) reads market
@@ -986,7 +991,14 @@ class MachineLifecycleMixin:
                 return await self._build_machine_session(
                     computer, user_id=user_id, on_state_observed=on_state_observed
                 )
-        except (Exception, asyncio.CancelledError):
+        except (Exception, asyncio.CancelledError) as e:
+            # Recorded first, while the row is still this start's, so a
+            # client reading it on the stopped frame finds the reason. A
+            # cancel is a shutdown or a dropped client, not the machine's.
+            if not isinstance(e, asyncio.CancelledError):
+                await asyncio.shield(
+                    record_start_failure(computer_id, e, kind=computer["kind"])
+                )
             # CancelledError is a BaseException: a client dropping mid
             # provision would otherwise leave the machine at 'starting'
             # for every project on it until the reaper runs.

@@ -111,3 +111,23 @@ class UnknownResourceTier(ValueError):
     Each provider declares its own presets, so a tier one offers may not exist
     on another. A ValueError answered with 400, like ``ProviderNotOffered``.
     """
+
+
+class ComputerRepairRefused(RuntimeError):
+    """A reinstall or reconnect refused before it changed anything.
+
+    ``code`` is what the client words its copy from and ``status`` the HTTP
+    status the route answers; ``extra`` rides along in the detail, as the
+    ``owner`` a folder's mark names.
+    """
+
+    def __init__(
+        self, code: str, message: str, *, status: int = 409, **extra: str
+    ) -> None:
+        self.code = code
+        self.status = status
+        self.extra = extra
+        super().__init__(message)
+
+    def detail(self) -> dict[str, str]:
+        return {"code": self.code, "message": str(self), **self.extra}

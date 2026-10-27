@@ -55,7 +55,11 @@ from ptc_agent.agent.transcript.steer_text import report_text, sender_name, sent
 
 logger = logging.getLogger(__name__)
 
-SummarySource = Literal["provider", "model", "fallback", "server"]
+#: What wrote a summary: the agent's provider compacting the conversation
+#: (``provider``), the agent's model writing it from its own request
+#: (``self``), the summary model or its fallback reading the transcript, or
+#: the server listing each request and reply.
+SummarySource = Literal["provider", "self", "model", "fallback", "server"]
 
 #: The summary model's share of the budget when another model waits behind
 #: it, so a hung summary model still leaves the fallback a real call. A

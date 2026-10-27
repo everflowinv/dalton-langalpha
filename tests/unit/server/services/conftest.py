@@ -85,6 +85,18 @@ def _no_backup_stamp():
 
 
 @pytest.fixture(autouse=True)
+def _no_workspaces_to_resync():
+    """A restart on the sandbox the machine stopped on queues every workspace
+    on it for its bring-up, listed by a row read these pool-less tests cannot
+    make. A test of that queue patches it inside this one."""
+    with patch(
+        "src.server.services.computer_manager._bringup.get_live_workspace_ids_for_computer",
+        AsyncMock(return_value=[]),
+    ) as live:
+        yield live
+
+
+@pytest.fixture(autouse=True)
 def _folder_allocation_is_free():
     """An adoption picks its folder under a transaction-scoped advisory lock
     these pool-less tests cannot take; the reads and the bind under it are patched."""

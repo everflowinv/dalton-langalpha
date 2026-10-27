@@ -16,7 +16,14 @@ import type { Computer } from '@/types/api';
 import type { ThisMac } from '../hooks/useRemoteControl';
 import { DiskBar, DiskUsageText } from './computerDiskUi';
 import { ComputerFacts } from './computerFacts';
-import { ComputerNotes, ComputerSpecRows, MachineFrame, PowerButton, type MachineActions } from './computerParts';
+import {
+  ComputerNotes,
+  ComputerSpecRows,
+  MachineFrame,
+  PowerButton,
+  StartFailureAction,
+  type MachineActions,
+} from './computerParts';
 import { railCard, type RailPlace } from './computerRailState';
 
 interface ComputerCardProps {
@@ -72,6 +79,7 @@ function ComputerCard({ computer, place, thisMac, showProvider, actions, onOpenD
         )}
 
         <div className="computer-card-actions">
+          <StartFailureAction computer={computer} actions={actions} />
           <PowerButton computer={computer} actions={actions} />
           <Button variant="ghost" size="sm" className="ml-auto gap-0.5" onClick={onOpenDetails} data-computer-details>
             {t('computer.card.details', 'Details')}

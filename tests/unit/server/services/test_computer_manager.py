@@ -3519,7 +3519,7 @@ class TestAStartAttachesItsOwnProject(_Base):
     KEY = ("ws-a", "sandbox-abc")
 
     @staticmethod
-    async def _start(manager, session, *, stats, synced=True):
+    async def _start(manager, session, *, stats, synced=True, restored=True):
         @asynccontextmanager
         async def held(_workspace_id):
             yield "alpha-1a2b"
@@ -3536,7 +3536,7 @@ class TestAStartAttachesItsOwnProject(_Base):
             ("_apply_session_mcp", AsyncMock(return_value=None)),
             ("_freeze_tool_view", MagicMock()),
             ("_sync_sandbox_assets", AsyncMock(return_value=object() if synced else None)),
-            ("_maybe_restore_files", AsyncMock(return_value=True)),
+            ("_maybe_restore_files", AsyncMock(return_value=restored)),
             ("_held_workspace_folder", held),
             ("_record_sync", MagicMock()),
         )
@@ -3632,6 +3632,23 @@ class TestAStartAttachesItsOwnProject(_Base):
         await self._start(manager, session, stats=ReconcileStats(link_failed=True))
 
         assert self.KEY in manager._projects_attached
+
+    @pytest.mark.asyncio
+    async def test_a_restore_check_that_failed_withdraws_the_key_a_stop_left(self):
+        """A stop on this sandbox leaves the project attached; trusting that
+        key after the start's check failed would skip the restore that queues
+        its bring-up, so the attach that follows runs it instead."""
+        from src.server.services.user_skills.reconcile import ReconcileStats
+
+        manager = _make_manager()
+        session = _make_session()
+        manager._projects_attached[self.KEY] = None
+
+        await self._start(manager, session, stats=ReconcileStats(), restored=False)
+
+        assert self.KEY not in manager._projects_attached
+        _, restore = await self._attach(manager, session)
+        restore.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------
@@ -4185,6 +4202,58 @@ class TestAFailedStartRevokesWhatItWrote(_Base):
             manager._revoke_data_token.assert_awaited_once_with("comp-1")
         else:
             manager._revoke_data_token.assert_not_awaited()
+
+
+class TestALazyStartKeepsWhyBeforeItReverts(_Base):
+    """The revert publishes stopped, and a client reads the row on that frame,
+    so the failure is on the row before the status write, not after it."""
+
+    @staticmethod
+    def _lazy(manager, failure):
+        manager._machine_if_known = MagicMock(
+            return_value=SimpleNamespace(pending_lazy_sync=True)
+        )
+        return manager._revert_unpromoted_lazy_start(
+            _make_binding(computer_id="comp-1"), failure=failure
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("target", "unwind"),
+        [
+            (
+                f"{_LIFECYCLE}.update_computer_status",
+                lambda m, f: m._release_lost_lazy_start(
+                    "comp-1", "sandbox-abc", failure=f, kind="ssh"
+                ),
+            ),
+            (f"{_LIFECYCLE}.update_workspace_status", _lazy),
+        ],
+        ids=["lost-lazy-start", "lazy-phase-2"],
+    )
+    async def test_the_failure_is_recorded_before_the_stopped_write(
+        self, target, unwind
+    ):
+        manager = _make_manager()
+        manager._revoke_data_token = AsyncMock()
+        order: list[str] = []
+        failure = RuntimeError("boom")
+
+        async def _record(computer_id, exc, *, kind):
+            assert (computer_id, exc) == ("comp-1", failure)
+            order.append("record")
+
+        async def _status(*_a, **_k):
+            order.append("stopped")
+            return {"status": "stopped"}
+
+        with (
+            patch(f"{_LIFECYCLE}.record_start_failure", AsyncMock(side_effect=_record)),
+            patch(target, AsyncMock(side_effect=_status)),
+        ):
+            await unwind(manager, failure)
+
+        assert order == ["record", "stopped"]
 
 
 class TestFreshBuildSettlesEachRestoreAfterTheBind(_Base):

@@ -137,6 +137,8 @@ class PairingState(BaseModel):
     user_id: str
     base: str
     expires_at: datetime
+    # The owner's ssh computer whose machine this pairs again, if any.
+    computer_id: Optional[str] = None
     machine: Optional[ReportedMachine] = None
     bound: Optional[Binding] = None
     # The latest run's check-in; empty before any.
@@ -435,11 +437,13 @@ def base_is_local(base: str) -> bool:
 
 
 async def create_pairing(
-    user_id: str, *, request_base: str
+    user_id: str, *, request_base: str, computer_id: Optional[str] = None
 ) -> ComputerSSHPairingResponse:
     """A pairing for the dialog to show, with the command that completes it.
 
-    The base is kept with it, so the script reports back the way it came.
+    The base is kept with it, so the script reports back the way it came, and
+    *computer_id*, the computer whose machine it pairs again, which the
+    caller checked is theirs.
 
     Raises:
         SSHUnavailable: Keys cannot be stored here, or Redis is off.
@@ -449,6 +453,8 @@ async def create_pairing(
     expires_at = datetime.now(timezone.utc) + timedelta(seconds=PAIRING_TTL_S)
     base = pairing_base(request_base)
     pairing = {"user_id": user_id, "base": base, "expires_at": expires_at.isoformat()}
+    if computer_id is not None:
+        pairing["computer_id"] = computer_id
     async with _redis().pipeline(transaction=True) as pipe:
         pipe.hset(_key(token), "pairing", json.dumps(pairing))
         pipe.pexpireat(_key(token), int(expires_at.timestamp() * 1000))

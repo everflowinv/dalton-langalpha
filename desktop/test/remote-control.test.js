@@ -31,6 +31,8 @@ const ACCOUNT = os.userInfo().username
 // The folder's files as each side writes them, shared with the helper's tests.
 const CONTRACT = path.join(__dirname, '..', '..', 'helper', 'contract')
 const contract = (name) => fs.readFileSync(path.join(CONTRACT, name), 'utf8')
+// This Mac's hardware UUID, as the helper writes it to the folder it made.
+const THIS_MAC = contract('machine').trim()
 const scripts = (name) => import(pathToFileURL(path.join(__dirname, '..', 'scripts', name)).href)
 
 let rc
@@ -54,6 +56,7 @@ function onMac(overrides = {}) {
     systemVersion: '14.5.0',
     agentPlist,
     timing: FAST,
+    machine: THIS_MAC,
     ...overrides,
   })
 }
@@ -215,6 +218,20 @@ describe('what the status says', () => {
     assert.deepEqual(remote.status(), {
       supported: true, service: 'on', helper: 'connected', paired: true, fingerprint: 'SHA256:abc', account: ACCOUNT,
     })
+  })
+
+  test("a folder carried over from another Mac says nothing of that Mac's pairing", () => {
+    const remote = onMac()
+    writeState(remote.dir, { state: 'unpaired', tunnel_id: 'tun_1', fingerprint: 'SHA256:abc' })
+    fs.writeFileSync(path.join(remote.dir, 'machine'), '00000000-0000-4000-8000-00000000000B\n')
+    assert.deepEqual(remote.status(), {
+      supported: true, service: 'off', helper: null, paired: false, fingerprint: null, account: ACCOUNT,
+    })
+    // The helper made it here, or before it named a machine at all.
+    fs.writeFileSync(path.join(remote.dir, 'machine'), contract('machine'))
+    assert.equal(remote.status().fingerprint, 'SHA256:abc')
+    fs.rmSync(path.join(remote.dir, 'machine'))
+    assert.equal(remote.status().fingerprint, 'SHA256:abc')
   })
 
   test('a pid worth waiting on is never a group, launchd or this process', () => {
@@ -625,6 +642,18 @@ describe('turning it on', () => {
     assert.ok(fs.existsSync(path.join(remote.dir, 'state')))
     assert.doesNotMatch(fs.readFileSync(path.join(remote.dir, 'pairing'), 'utf8'), /^id=1{32}$/m)
   })
+})
+
+test("another Mac's pairing carried over is not a paired Mac: no warning, nothing torn down", async () => {
+  loginItems.status = 'requires-approval'
+  const remote = onMac()
+  writeState(remote.dir, { state: 'connected', tunnel_id: 'tun_1', fingerprint: 'SHA256:abc' })
+  fs.writeFileSync(path.join(remote.dir, 'machine'), '00000000-0000-4000-8000-00000000000B\n')
+  const result = await remote.enable(SCRIPT)
+  assert.equal(result.error, 'needs_approval')
+  assert.ok(!messageBoxes[0].at(-1).detail.includes('already connected'))
+  assert.deepEqual(loginItems.calls, [])
+  assert.ok(fs.existsSync(path.join(remote.dir, 'pairing')))
 })
 
 describe('turning it off', () => {

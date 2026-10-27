@@ -1,7 +1,8 @@
 import React, { useCallback, useMemo, useRef, useState } from 'react';
 import { useSearchParams } from 'react-router';
 import { useTranslation } from 'react-i18next';
-import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { useInfiniteQuery, useQuery, useQueryClient } from '@tanstack/react-query';
+import { SwapCell } from '@/components/ui/crossfade';
 import { useHomeTimezone } from '@/hooks/useHomeTimezone';
 import { homeWorkspaceQuery } from '@/hooks/useHomeWorkspace';
 import { ListError, ListSkeleton } from '@/components/mcp/McpPrimitives';
@@ -10,11 +11,13 @@ import ConfirmDialog from '@/pages/Dashboard/components/ConfirmDialog';
 import AutomationsHeader, { type AutomationsView } from './components/AutomationsHeader';
 import AutomationInlineForm, { type FormSubmission } from './components/AutomationInlineForm';
 import ConfirmDeleteDialog from './components/ConfirmDeleteDialog';
-import FeedView from './components/FeedView';
+import FeedView, { FeedSkeleton } from './components/FeedView';
+import { useLastShape } from '@/lib/lastShape';
 import ManageView, { type FormHost, type ManageSelection } from './components/ManageView';
 import Starters from './components/Starters';
 import { useAutomations } from './hooks/useAutomations';
 import { useOrderedGroups } from './hooks/useOrderedGroups';
+import { recentRunsQuery } from './hooks/useRecentRuns';
 import { useAutomationMutations } from './hooks/useAutomationMutations';
 import { useWatchedReadings } from './hooks/useWatchedReadings';
 import { automationToFormState } from './utils/form';
@@ -44,8 +47,8 @@ function storeView(view: AutomationsView): void {
 type FormMode = { kind: 'create'; template: TemplateId; nonce: number } | { kind: 'edit'; automationId: string };
 
 /** The feed's scroller, which comes back where it was left. Its own
- *  component so it mounts with the feed, after the loading state, and the
- *  memory attaches to the element that actually scrolls. */
+ *  component so the memory attaches to the element that actually scrolls;
+ *  it mounts with the feed's skeleton and restores once the runs fill it. */
 function RememberedScroll({ memoryKey, children }: { memoryKey: string; children: React.ReactNode }) {
   const ref = useRef<HTMLDivElement>(null);
   useScrollMemory(ref, memoryKey);
@@ -69,7 +72,11 @@ function RememberedScroll({ memoryKey, children }: { memoryKey: string; children
  */
 export default function Automations() {
   const { t } = useTranslation();
-  const { automations, loading, error } = useAutomations();
+  const { automations, loading, loaded, error } = useAutomations();
+  // A list that was empty last time here is drawn empty from the first frame:
+  // the starting points, not a feed skeleton that turns into them. Only a list
+  // that arrived counts: a failed read is not an empty one.
+  const lastCount = useLastShape('automations.count', loaded ? automations.length : null);
   // The page awaits these to close the form or the dialog. `mutateAsync`
   // keeps one identity across renders where its mutation object does not.
   const {
@@ -89,9 +96,21 @@ export default function Automations() {
   const [storedView, setStoredView] = useState(readStoredView);
   const selectedId = searchParams.get('id');
   const runId = searchParams.get('run');
+  // A link to one automation or run says the list holds something, whatever
+  // it held last time here: it loads as a list, not as the starters, and the
+  // linked one is never "not found" before the list arrives.
+  const listLoading = loading && (lastCount !== 0 || !!selectedId || !!runId);
   const urlView = searchParams.get('view');
   const view: AutomationsView =
     urlView === 'feed' || urlView === 'manage' ? urlView : selectedId || runId ? 'manage' : storedView ?? 'feed';
+  // The feed's runs, read beside the automations rather than once the feed
+  // mounts after them, so the feed waits on one round trip, not two. Only
+  // whether they are in reaches this page; the feed reads them itself.
+  const { isPending: runsPending } = useInfiniteQuery({
+    ...recentRunsQuery(),
+    enabled: view === 'feed',
+    notifyOnChangeProps: ['isPending'],
+  });
 
   const [form, setForm] = useState<FormMode | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<Automation | null>(null);
@@ -245,7 +264,34 @@ export default function Automations() {
         </div>
       </div>
     );
-  } else if (loading) {
+  } else if (view === 'feed') {
+    // One skeleton in the feed's shape from the first frame until the
+    // automations and their runs are both in, then the feed (or the starting
+    // points, for nobody's automations) in its place.
+    const feedState = listLoading || (runsPending && automations.length > 0) ? 'loading' : automations.length === 0 ? 'empty' : 'feed';
+    body = (
+      <RememberedScroll memoryKey="page:automations:feed">
+        <div className="automations-frame">
+          <SwapCell as="div" swapKey={feedState}>
+            {feedState === 'loading' ? (
+              <FeedSkeleton />
+            ) : feedState === 'empty' ? (
+              <Starters onPick={startCreate} />
+            ) : (
+              <FeedView
+                automations={automations}
+                readings={readings}
+                onOpenAutomation={openAutomation}
+                onOpenRun={openRun}
+                onManage={() => changeView('manage')}
+                onNew={startCreate}
+              />
+            )}
+          </SwapCell>
+        </div>
+      </RememberedScroll>
+    );
+  } else if (listLoading) {
     body = (
       <div className="automations-scroll">
         <div className="automations-frame">
@@ -267,21 +313,6 @@ export default function Automations() {
           )}
         </div>
       </div>
-    );
-  } else if (view === 'feed') {
-    body = (
-      <RememberedScroll memoryKey="page:automations:feed">
-        <div className="automations-frame">
-          <FeedView
-            automations={automations}
-            readings={readings}
-            onOpenAutomation={openAutomation}
-            onOpenRun={openRun}
-            onManage={() => changeView('manage')}
-            onNew={startCreate}
-          />
-        </div>
-      </RememberedScroll>
     );
   } else {
     body = (
@@ -305,7 +336,7 @@ export default function Automations() {
       {/* Doubles as the window titlebar in the desktop shell; inert elsewhere. */}
       <div className="chrome-drag-strip" aria-hidden="true" />
       <div className="automations-frame">
-        <AutomationsHeader automations={automations} view={view} onViewChange={changeView} onNew={startCreate} />
+        <AutomationsHeader automations={automations} loading={listLoading} view={view} onViewChange={changeView} onNew={startCreate} />
       </div>
       <div className="automations-body">{body}</div>
 

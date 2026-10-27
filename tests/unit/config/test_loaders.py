@@ -368,13 +368,13 @@ class TestLoadFromDictCompaction:
         config = load_from_dict(_full_config_dict())
         assert config.compaction.enabled is True
         assert config.compaction.token_threshold == 120000
-        assert config.compaction.keep_messages == 5
+        assert config.compaction.keep_tokens == 20_000
 
     def test_custom_compaction(self):
         data = _full_config_dict(compaction={
             "enabled": False,
             "token_threshold": 80000,
-            "keep_messages": 3,
+            "keep_tokens": 3,
             "truncate_args_idle_minutes": 30,
             "truncate_args_keep_messages": 10,
             "truncate_args_max_length": 1000,
@@ -382,14 +382,14 @@ class TestLoadFromDictCompaction:
         config = load_from_dict(data)
         assert config.compaction.enabled is False
         assert config.compaction.token_threshold == 80000
-        assert config.compaction.keep_messages == 3
+        assert config.compaction.keep_tokens == 3
         assert config.compaction.truncate_args_idle_minutes == 30
 
     def test_partial_compaction(self):
         """Partial compaction section uses defaults for missing fields."""
-        data = _full_config_dict(compaction={"enabled": True, "keep_messages": 10})
+        data = _full_config_dict(compaction={"enabled": True, "keep_tokens": 10})
         config = load_from_dict(data)
-        assert config.compaction.keep_messages == 10
+        assert config.compaction.keep_tokens == 10
         assert config.compaction.token_threshold == 120000  # default
 
     def test_default_search_api(self):

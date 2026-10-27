@@ -76,6 +76,37 @@
   color: var(--color-text-tertiary);
 }
 
+/* Why the last start failed: the alert glyph and words, never a bar. */
+.computer-card-failure {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  color: var(--color-text-secondary);
+}
+.computer-card-failure-glyph {
+  flex-shrink: 0;
+  width: 12px;
+  height: 12px;
+  margin-top: 2.5px;
+  color: var(--color-icon-danger);
+}
+.computer-card-failure-text {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.computer-card-failure-lead {
+  font-weight: 500;
+  color: var(--color-text-primary);
+}
+/* A card holds a few lines of it; the details hold all of it. */
+.computer-card-body .computer-card-failure-text {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  line-clamp: 3;
+  overflow: hidden;
+}
+
 .computer-card-spec {
   display: grid;
   gap: 7px;
@@ -248,7 +279,8 @@
   flex-direction: column;
   gap: 6px;
 }
-.computer-details-actions > button:first-child { width: 100%; }
+.computer-details-actions > button:first-child,
+.computer-details-actions > [data-computer-power] { width: 100%; }
 .computer-details-rarer {
   display: flex;
   align-items: center;

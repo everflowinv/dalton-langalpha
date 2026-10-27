@@ -169,7 +169,15 @@ export function useSshReadyFields(ready: SshReady | null) {
   };
 }
 
-export function useSshSetup(active: boolean) {
+/**
+ * `computerId` makes the pairing one that reconnects that SSH computer: its
+ * command is minted for it, and cached apart from a new machine's. `address`
+ * starts the form by hand at the address the computer was reached at.
+ */
+export function useSshSetup(
+  active: boolean,
+  { computerId = null, address: knownAddress = '' }: { computerId?: string | null; address?: string } = {},
+) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
   const [mode, setMode] = useState<SshMode>('pairing');
@@ -182,7 +190,7 @@ export function useSshSetup(active: boolean) {
   };
 
   // --- Pairing ---
-  const mint = useSshPairingMint({ enabled: active && mode === 'pairing' });
+  const mint = useSshPairingMint({ enabled: active && mode === 'pairing', computerId });
   // A pairing that cannot be had leaves the form by hand, with a note saying why.
   const view: SshMode = mode === 'pairing' && !mint.isError ? 'pairing' : 'manual';
   // A token the user moved on from ("use a different machine") while its
@@ -203,11 +211,11 @@ export function useSshSetup(active: boolean) {
   const setConnectError = (message: string | null) => setPairError(token && message ? { token, message } : null);
 
   // --- By hand ---
-  const [address, setAddress] = useState('');
+  const [address, setAddress] = useState(knownAddress);
   const [addressError, setAddressError] = useState<string | null>(null);
   const [probed, setProbed] = useState<SshReady | null>(null);
   const [probeFailure, setProbeFailure] = useState<SshFailure | null>(null);
-  const probe = useMutation({ mutationFn: (target: SshTarget) => probeSsh(target) });
+  const probe = useMutation({ mutationFn: (target: SshTarget) => probeSsh(target, { computerId }) });
   // Only needed once a connection by hand is refused, but fetched with the
   // form so the key step has it the moment it opens.
   const key = useSshKey({ enabled: active && view === 'manual' });
@@ -226,7 +234,7 @@ export function useSshSetup(active: boolean) {
     flushSync(() => setMode(next));
     // A pairing that failed to mint is asked for again; the view follows once
     // it is pending, so there is nothing to focus yet.
-    if (retry) void queryClient.resetQueries({ queryKey: queryKeys.sshPairings.mint(), exact: true });
+    if (retry) void queryClient.resetQueries({ queryKey: queryKeys.sshPairings.mint(computerId), exact: true });
     else focusEntry();
   };
 

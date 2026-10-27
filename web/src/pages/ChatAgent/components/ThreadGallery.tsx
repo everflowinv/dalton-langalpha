@@ -1,6 +1,8 @@
 import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import { ArrowLeft, Folder, FileText, Archive } from 'lucide-react';
 import { Loader } from '@/components/ui/loader';
+import { SwapCell } from '@/components/ui/crossfade';
+import { SkeletonBar } from '@/components/ui/skeleton';
 import { cn } from '@/lib/utils';
 import { useIsMobile } from '@/hooks/useIsMobile';
 import { useWorkspaceLabel } from '@/hooks/useWorkspaceLabel';
@@ -49,6 +51,25 @@ import { WorkspaceTrackingToggle } from './dalton/WorkspaceTrackingToggle';
 // DALTON-HOOK(workspace-sharing-settings): per-workspace sharing settings modal
 import { WorkspaceSharingModal } from './dalton/WorkspaceSharingModal';
 import { DURATION, EASE_OUT, TWEEN } from '@/lib/motion';
+
+/** Placeholder rows while the list is read: the first screen's worth. */
+const THREAD_SKELETON_ROWS = 5;
+
+/** A thread card's place while the list is read, in the card's box and with
+ *  its two lines, spaced as the list spaces its cards. */
+function ThreadCardSkeleton({ index }: { index: number }) {
+  return (
+    <div className="pb-2" aria-hidden="true" data-testid="thread-card-skeleton">
+      <div className="rounded-lg px-4 py-3 flex items-center gap-3" style={{ borderBottom: '1px solid var(--color-border-muted)' }}>
+        <div className="w-2 h-2 rounded-full shrink-0 animate-pulse" style={{ backgroundColor: 'var(--color-border-default)' }} />
+        <div className="flex-1 min-w-0">
+          <div className="text-sm"><SkeletonBar style={{ width: `${40 + (index % 3) * 15}%` }} /></div>
+          <div className="text-xs mt-0.5"><SkeletonBar className="w-12" /></div>
+        </div>
+      </div>
+    </div>
+  );
+}
 
 interface ThreadRecord {
   thread_id: string;
@@ -107,6 +128,11 @@ function ThreadGallery({ workspaceId, onBack, onThreadSelect }: ThreadGalleryPro
   // the shared row patcher reaches this list's pages the same way it reaches
   // the sidebar's finite pages.
   const [showArchived, setShowArchived] = useState(false);
+  // Whether the reader has switched views yet, in this workspace. The list the
+  // gallery opens on arrives through the skeleton's crossfade; only a view the
+  // reader picked fades in on its own.
+  const [switchedIn, setSwitchedIn] = useState<string | null>(null);
+  const viewSwitched = switchedIn === workspaceId;
 
   // Paged thread list. React Query owns the pages, the total, and the
   // has-more arithmetic; the rows are rendered straight from the cache so a
@@ -163,7 +189,9 @@ function ThreadGallery({ workspaceId, onBack, onThreadSelect }: ThreadGalleryPro
     (threadError as { response?: { status?: number } } | null)?.response?.status === 404 ||
     (wsError as { response?: { status?: number } } | null)?.response?.status === 404;
 
-  const isLoading = isThreadsLoading;
+  // An empty outgoing list held while the other view loads says nothing about
+  // that view: it loads as placeholders, not as "no threads".
+  const isLoading = isThreadsLoading || (isPlaceholderData && threads.length === 0);
   const error = threadError && !accessDenied && !wsNotFound ? t('thread.failedLoadThreads') : null;
   const [deleteModal, setDeleteModal] = useState<DeleteModalState>({ isOpen: false, thread: null });
   const [isDeleting, setIsDeleting] = useState(false);
@@ -669,27 +697,6 @@ function ThreadGallery({ workspaceId, onBack, onThreadSelect }: ThreadGalleryPro
     dragCleanupRef.current = teardown;
   }, [filePanelWidth]);
 
-  if (isLoading) {
-    return (
-      // A branch that replaces the whole route replaces its top bar too, so it
-      // owes the window a titlebar of its own -- otherwise the column beside the
-      // sidebar stops moving the window for as long as the fetch is in flight.
-      <div className="h-full flex flex-col">
-        <div className="chrome-drag-strip" aria-hidden="true" />
-        <div className="flex-1 min-h-0 flex items-center justify-center">
-          <div className="flex flex-col items-center gap-4">
-            <span aria-hidden="true" className="shrink-0">
-              <Loader size={32} className="text-(--color-accent-primary)" />
-            </span>
-            <p className="text-sm" style={{ color: 'var(--color-text-tertiary)' }}>
-              {t('thread.loadingThreads')}
-            </p>
-          </div>
-        </div>
-      </div>
-    );
-  }
-
   if (error) {
     return (
       <div className="h-full flex flex-col">
@@ -731,7 +738,7 @@ function ThreadGallery({ workspaceId, onBack, onThreadSelect }: ThreadGalleryPro
             in the desktop shell: it is the top bar the content column already
             has, so it costs no layout, and the back button wins its own clicks
             back through the `no-drag` list in chrome.css. */}
-        <div className="shrink-0 px-6 py-4 enter-fade-up" data-chrome="drag" style={{ paddingTop: 'calc(var(--page-top) - 4px)' }}>
+        <div className="shrink-0 px-6 py-4" data-chrome="drag" style={{ paddingTop: 'calc(var(--page-top) - 4px)' }}>
           <button
             onClick={onBack}
             className="p-2 rounded-md transition-colors"
@@ -749,13 +756,20 @@ function ThreadGallery({ workspaceId, onBack, onThreadSelect }: ThreadGalleryPro
           <div className="w-full max-w-[768px] mx-auto flex flex-col gap-8">
 
             {/* Workspace Header */}
-            <div className="w-full flex flex-col items-center mt-2 md:mt-[8vh] enter-fade-up enter-fade-up-d1">
+            <div className="w-full flex flex-col items-center mt-2 md:mt-[8vh]">
+              {/* Which icon, and whether it opens machine settings, waits on
+                  the workspace row: until then Home reads as any workspace,
+                  whose settings it does not have. A row that failed to load
+                  (a 403 or 404 redirects instead) draws the plain icon, inert,
+                  rather than loading for good. */}
               {/* DALTON-HOOK(workspace-sharing-settings): disable sandbox settings panel and show access banner for colleague workspaces */}
               <div
-                className={`flex items-center justify-center transition-colors ${!isHome && !teamReadOnly.isColleague ? 'cursor-pointer' : ''}`}
-                onClick={!isHome && !teamReadOnly.isColleague ? () => setShowSandboxPanel(true) : undefined}
+                className={cn('flex items-center justify-center transition-colors', wsData && !isHome && !teamReadOnly.isColleague && 'cursor-pointer')}
+                onClick={wsData && !isHome && !teamReadOnly.isColleague ? () => setShowSandboxPanel(true) : undefined}
               >
-                {isHome ? (
+                {!wsData && !wsError ? (
+                  <SkeletonBar className="w-10 h-10 rounded-lg" />
+                ) : isHome ? (
                   <HomeRowIcon className="w-10 h-10" style={{ color: 'var(--color-accent-primary)' }} />
                 ) : (
                   <img src={iconComputer} alt="Workspace" className="w-10 h-10" />
@@ -765,7 +779,7 @@ function ThreadGallery({ workspaceId, onBack, onThreadSelect }: ThreadGalleryPro
                 className="text-xl font-medium mt-3 text-center title-font"
                 style={{ color: 'var(--color-text-primary)' }}
               >
-                {workspaceName}
+                {workspaceName || (wsError ? '\u00a0' : <SkeletonBar className="w-40" />)}
               </h1>
               {teamReadOnly.isColleague && (
                 <div className="mt-2">
@@ -775,7 +789,11 @@ function ThreadGallery({ workspaceId, onBack, onThreadSelect }: ThreadGalleryPro
               <div className="flex items-center gap-2 mt-2 text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
                 <span>{t('thread.workspace')}</span>
                 <div className="size-[3px] rounded-full bg-current opacity-50"></div>
-                <span>{totalThreads ?? threads.length} {(totalThreads ?? threads.length) === 1 ? t('thread.thread') : t('thread.threads')}</span>
+                {isLoading ? (
+                  <SkeletonBar className="w-14" />
+                ) : (
+                  <span>{totalThreads ?? threads.length} {(totalThreads ?? threads.length) === 1 ? t('thread.thread') : t('thread.threads')}</span>
+                )}
               </div>
               {/* DALTON-HOOK(coverage-tracking): company workspace auto-tracking toggle */}
               {/* DALTON-HOOK(workspace-sharing-settings): company workspace sharing settings modal */}
@@ -794,7 +812,7 @@ function ThreadGallery({ workspaceId, onBack, onThreadSelect }: ThreadGalleryPro
             </div>
 
             {/* Chat Input */}
-            <div className="w-full enter-fade-up enter-fade-up-d2 relative z-20">
+            <div className="w-full relative z-20">
               {/* DALTON-HOOK(workspace-sharing-settings): replace writable ChatInput with disabled colleague composer */}
               {teamReadOnly.isColleague ? (
                 <TeamReadOnlyComposer ownerName={teamReadOnly.ownerName} access={teamReadOnly.access} />
@@ -818,7 +836,7 @@ function ThreadGallery({ workspaceId, onBack, onThreadSelect }: ThreadGalleryPro
             </div>
 
             {/* Files Card */}
-            <div className="w-full enter-fade-up enter-fade-up-d3">
+            <div className="w-full">
               <div
                 className="flex-1 min-w-0 flex flex-col ps-[16px] pt-[12px] pb-[14px] pe-[20px] rounded-[12px] border cursor-pointer hover:bg-foreground/5 transition-colors"
                 style={{
@@ -872,14 +890,17 @@ function ThreadGallery({ workspaceId, onBack, onThreadSelect }: ThreadGalleryPro
             </div>
 
             {/* Threads Section */}
-            <div className="w-full flex flex-col gap-4 pb-8 enter-fade-up enter-fade-up-d4">
+            <div className="w-full flex flex-col gap-4 pb-8">
               <div className="flex items-center justify-between">
                 <h2 className="text-base font-medium" style={{ color: 'var(--color-text-primary)' }}>
                   {showArchived ? t('thread.archivedTasks') : t('thread.tasks')}
                 </h2>
                 <button
                   type="button"
-                  onClick={() => setShowArchived((v) => !v)}
+                  onClick={() => {
+                    setShowArchived((v) => !v);
+                    setSwitchedIn(workspaceId);
+                  }}
                   className="flex items-center gap-1.5 text-xs px-2 py-1 rounded-md transition-colors hover:bg-foreground/5"
                   style={{ color: showArchived ? 'var(--color-text-primary)' : 'var(--color-text-tertiary)' }}
                   aria-pressed={showArchived}
@@ -889,73 +910,81 @@ function ThreadGallery({ workspaceId, onBack, onThreadSelect }: ThreadGalleryPro
                 </button>
               </div>
 
-              {threads.length === 0 ? (
-                // Empty state
-                <div className="flex flex-col items-center justify-center py-12">
-                  <p className="text-sm mb-2" style={{ color: 'var(--color-text-tertiary)' }}>
-                    {showArchived ? t('thread.noArchivedThreads') : t('thread.noThreadsYet')}
-                  </p>
-                  {!showArchived && (
-                    <p className="text-xs text-center max-w-md" style={{ color: 'var(--color-text-tertiary)' }}>
-                      {t('thread.startConversation')}
+              {/* The rows take the placeholders' places in one crossfade. */}
+              <SwapCell as="div" swapKey={isLoading ? 'loading' : 'list'}>
+                {isLoading ? (
+                  <div className="flex flex-col" aria-busy="true">
+                    <span className="sr-only">{t('thread.loadingThreads')}</span>
+                    {Array.from({ length: THREAD_SKELETON_ROWS }, (_, i) => <ThreadCardSkeleton key={i} index={i} />)}
+                  </div>
+                ) : threads.length === 0 ? (
+                  // Empty state
+                  <div className="flex flex-col items-center justify-center py-12">
+                    <p className="text-sm mb-2" style={{ color: 'var(--color-text-tertiary)' }}>
+                      {showArchived ? t('thread.noArchivedThreads') : t('thread.noThreadsYet')}
                     </p>
-                  )}
-                </div>
-              ) : (
-                // Thread list. The container is keyed per view (workspace +
-                // archived flag) so a view swap remounts it with a single
-                // cross-fade — a fresh inner Presence with initial={false}
-                // keeps the bulk swap from playing 20 concurrent card
-                // animations. It dims while showing placeholder (outgoing)
-                // rows during the archived-toggle fetch. Per-card fold +
-                // layout animate the single-card case: archive/unarchive
-                // folds the card shut while neighbors glide up. Card spacing
-                // lives INSIDE the fold (pb-2, not container gap) so the
-                // collapse swallows the gap too.
-                <motion.div
-                  key={`${workspaceId}:${showArchived}`}
-                  className="flex flex-col"
-                  initial={{ opacity: 0 }}
-                  animate={{ opacity: isPlaceholderData ? 0.45 : 1 }}
-                  transition={TWEEN.quick}
-                >
-                  <AnimatePresence initial={false}>
-                    {threads.map((thread) => (
-                      <motion.div
-                        key={thread.thread_id}
-                        layout="position"
-                        layoutDependency={threadOrderSignature}
-                        transition={{ layout: TWEEN.fold }}
-                      >
-                        <PresenceFold className="pb-2">
-                          {/* Archive affordances derive from the ROW, not the
-                              view toggle: while isPlaceholderData shows the
-                              previous view's rows the toggle has already
-                              flipped, so the view flag would offer Archive on
-                              an archived row. */}
-                          {/* DALTON-HOOK(workspace-sharing-settings): hide thread mutation actions for colleagues */}
-                          <ThreadCard
-                            thread={thread}
-                            onClick={handleThreadClick}
-                            onDelete={teamReadOnly.isColleague ? undefined : handleDeleteClick}
-                            onRename={teamReadOnly.isColleague ? undefined : handleRenameClick}
-                            onArchive={!teamReadOnly.isColleague && !thread.archived_at ? handleArchive : undefined}
-                            onUnarchive={!teamReadOnly.isColleague && thread.archived_at ? handleUnarchive : undefined}
-                          />
-                        </PresenceFold>
-                      </motion.div>
-                    ))}
-                  </AnimatePresence>
-                  {/* Infinite-scroll sentinel + its spinner */}
-                  {hasNextPage && (
-                    <div ref={loadMoreSentinelRef} className="flex items-center justify-center py-4">
-                      {isFetchingNextPage && (
-                        <Loader size={20} className="text-(--color-accent-primary)" />
-                      )}
-                    </div>
-                  )}
-                </motion.div>
-              )}
+                    {!showArchived && (
+                      <p className="text-xs text-center max-w-md" style={{ color: 'var(--color-text-tertiary)' }}>
+                        {t('thread.startConversation')}
+                      </p>
+                    )}
+                  </div>
+                ) : (
+                  // Thread list. The container is keyed per view (workspace +
+                  // archived flag) so a view the reader switches to remounts it
+                  // with a single fade in — a fresh inner Presence with
+                  // initial={false} keeps the bulk swap from playing 20
+                  // concurrent card animations. It dims while showing placeholder (outgoing)
+                  // rows during the archived-toggle fetch. Per-card fold +
+                  // layout animate the single-card case: archive/unarchive
+                  // folds the card shut while neighbors glide up. Card spacing
+                  // lives INSIDE the fold (pb-2, not container gap) so the
+                  // collapse swallows the gap too.
+                  <motion.div
+                    key={`${workspaceId}:${showArchived}`}
+                    className="flex flex-col"
+                    initial={viewSwitched ? { opacity: 0 } : false}
+                    animate={{ opacity: isPlaceholderData ? 0.45 : 1 }}
+                    transition={TWEEN.quick}
+                  >
+                    <AnimatePresence initial={false}>
+                      {threads.map((thread) => (
+                        <motion.div
+                          key={thread.thread_id}
+                          layout="position"
+                          layoutDependency={threadOrderSignature}
+                          transition={{ layout: TWEEN.fold }}
+                        >
+                          <PresenceFold className="pb-2">
+                            {/* Archive affordances derive from the ROW, not the
+                                view toggle: while isPlaceholderData shows the
+                                previous view's rows the toggle has already
+                                flipped, so the view flag would offer Archive on
+                                an archived row. */}
+                            {/* DALTON-HOOK(workspace-sharing-settings): hide thread mutation actions for colleagues */}
+                            <ThreadCard
+                              thread={thread}
+                              onClick={handleThreadClick}
+                              onDelete={teamReadOnly.isColleague ? undefined : handleDeleteClick}
+                              onRename={teamReadOnly.isColleague ? undefined : handleRenameClick}
+                              onArchive={!teamReadOnly.isColleague && !thread.archived_at ? handleArchive : undefined}
+                              onUnarchive={!teamReadOnly.isColleague && thread.archived_at ? handleUnarchive : undefined}
+                            />
+                          </PresenceFold>
+                        </motion.div>
+                      ))}
+                    </AnimatePresence>
+                    {/* Infinite-scroll sentinel + its spinner */}
+                    {hasNextPage && (
+                      <div ref={loadMoreSentinelRef} className="flex items-center justify-center py-4">
+                        {isFetchingNextPage && (
+                          <Loader size={20} className="text-(--color-accent-primary)" />
+                        )}
+                      </div>
+                    )}
+                  </motion.div>
+                )}
+              </SwapCell>
             </div>
           </div>
         </div>

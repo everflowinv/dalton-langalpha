@@ -1393,11 +1393,10 @@ async def cancel_thread(
 async def summarize_thread(
     thread_id: str,
     x_user_id: CurrentUserId,
-    keep_messages: int = Query(
-        default=5, ge=1, le=20, description="Number of recent messages to preserve"
-    ),
 ):
-    """Manually trigger context compaction for a thread.
+    """Manually trigger context compaction for a thread, keeping the tail
+    automatic compaction keeps. A ``keep_messages`` count older clients send
+    is ignored.
 
     Endpoint path ``/summarize`` and function name preserved for REST contract
     compatibility — clients may call the older URL.
@@ -1405,7 +1404,7 @@ async def summarize_thread(
     await auth_api.require_thread_owner(thread_id, x_user_id)
     from src.server.handlers.thread_maintenance import trigger_compaction
 
-    return await trigger_compaction(thread_id, keep_messages, user_id=x_user_id)
+    return await trigger_compaction(thread_id, user_id=x_user_id)
 
 
 @router.post("/{thread_id}/offload", status_code=200)

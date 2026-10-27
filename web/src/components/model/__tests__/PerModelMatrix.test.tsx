@@ -18,14 +18,14 @@ vi.mock('@/pages/Dashboard/utils/api', () => ({
 }));
 
 const profilesCatalog = {
-  aggressive: { token_threshold: 100000, keep_messages: 5 },
-  moderate: { token_threshold: 130000, keep_messages: 8 },
-  extended: { token_threshold: 200000, keep_messages: 10 },
-  economy: { token_threshold: 250000, keep_messages: 12 },
-  relaxed: { token_threshold: 300000, keep_messages: 15 },
-  spacious: { token_threshold: 400000, keep_messages: 18 },
-  expansive: { token_threshold: 500000, keep_messages: 20 },
-  maximal: { token_threshold: 750000, keep_messages: 25 },
+  aggressive: { token_threshold: 100000 },
+  moderate: { token_threshold: 130000 },
+  extended: { token_threshold: 200000 },
+  economy: { token_threshold: 250000 },
+  relaxed: { token_threshold: 300000 },
+  spacious: { token_threshold: 400000 },
+  expansive: { token_threshold: 500000 },
+  maximal: { token_threshold: 750000 },
 };
 
 const metadata: Record<string, ModelMetadataEntry> = {

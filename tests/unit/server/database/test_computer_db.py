@@ -662,3 +662,40 @@ class TestMcpConfigVersionStamp:
         sql = _sql(cursor)
         assert "UPDATE computers" in sql
         assert "UPDATE workspaces" not in sql
+
+
+class TestStartFailure:
+    """Why the last start failed lives until a start succeeds, on every path
+    that marks the machine running."""
+
+    @pytest.mark.asyncio
+    async def test_running_clears_it_and_a_revert_to_stopped_keeps_it(self, db, cursor):
+        await C.update_computer_status(COMPUTER_ID, "running")
+        assert "start_failure = NULL" in _sql(cursor)
+
+        await C.update_computer_status(COMPUTER_ID, "stopped", expected="starting")
+        assert "start_failure = NULL" not in _sql(cursor)
+
+    @pytest.mark.asyncio
+    async def test_a_bind_clears_it(self, db, cursor):
+        await C.try_bind_computer_provider_ref(
+            COMPUTER_ID,
+            provider_ref="sbx-2",
+            expected_previous_provider_ref="sbx-1",
+            platform_secret_version=1,
+        )
+        assert "start_failure = NULL" in _sql(cursor)
+
+    @pytest.mark.asyncio
+    async def test_a_failure_is_never_written_over_a_running_row(self, db, cursor):
+        """A start that won on another worker has already cleared it."""
+        cursor.rowcount = 1
+        failure = {"code": "root_dir", "message": "m", "owner": None, "remedy": "reinstall"}
+
+        assert await C.record_computer_start_failure(COMPUTER_ID, failure) is True
+
+        sql = _sql(cursor)
+        assert "status <> 'running'" in sql and "status <> 'deleted'" in sql
+        # Stamped on the database clock, whichever worker failed.
+        assert "jsonb_build_object('at', NOW())" in sql
+        assert "updated_at" not in sql

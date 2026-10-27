@@ -164,11 +164,17 @@ export function RemoteControlSetup({
   state,
   account,
   busy,
+  keeps,
+  moving = false,
 }: {
   state: RemoteControlSetupState;
   /** The macOS account the agent will work as, named in the disclosure. */
   account: string;
   busy: boolean;
+  /** The folder of the computer this reconnects, which the ready step says it keeps. */
+  keeps?: string;
+  /** This Mac holds nothing of that computer, which moves here. */
+  moving?: boolean;
 }) {
   const { t } = useTranslation();
   const headingId = useId();
@@ -183,7 +189,7 @@ export function RemoteControlSetup({
       </div>
       {phase.kind === 'ready' ? (
         // No "Use a different machine": this Mac is the only one this way adds.
-        <ReadySummary step={state.readyStep} ready={phase.ready} busy={busy} />
+        <ReadySummary step={state.readyStep} ready={phase.ready} busy={busy} keeps={keeps} moving={moving} />
       ) : (
         <>
           {phase.kind === 'disclosure' && <Disclosure state={state} account={account} busy={busy} />}

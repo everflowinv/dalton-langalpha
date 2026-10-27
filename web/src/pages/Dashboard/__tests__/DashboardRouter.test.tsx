@@ -1,3 +1,4 @@
+import { Suspense } from 'react';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, act } from '@testing-library/react';
 import { QueryClientProvider, QueryClient } from '@tanstack/react-query';
@@ -21,6 +22,11 @@ vi.mock('@/hooks/usePreferences', () => ({
 vi.mock('@/hooks/useUpdatePreferences', () => ({
   useUpdatePreferences: () => ({ mutate: mockMutate, isPending: false }),
 }));
+// A read that never answers, for the cold-cache case.
+vi.mock('../utils/api', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../utils/api')>()),
+  getPreferences: () => new Promise(() => {}),
+}));
 vi.mock('../Dashboard', () => ({
   __esModule: true,
   default: (props: { layoutToggle?: { mode: string; onModeChange: (n: 'classic' | 'custom') => void } }) => {
@@ -42,7 +48,9 @@ function renderRouter(queryClient: QueryClient) {
   return render(
     <QueryClientProvider client={queryClient}>
       <MemoryRouter>
-        <DashboardRouter />
+        <Suspense fallback={<div data-testid="route-loading" />}>
+          <DashboardRouter />
+        </Suspense>
       </MemoryRouter>
     </QueryClientProvider>,
   );
@@ -156,21 +164,22 @@ describe('DashboardRouter', () => {
     expect((payload.other_preference.dashboard?.widgets?.length ?? 0)).toBeGreaterThan(0);
   });
 
-  it('cold-cache gate: onModeChange is a no-op while preferences are still loading', () => {
-    // Regression: a fast click before the GET resolves would PUT a dashboard
-    // built from nothing and wipe the user's saved layout (the server
-    // replaces the dashboard key wholesale).
+  it('cold-cache gate: holds the route loader, not a guessed dashboard, while preferences load', () => {
+    // A guessed Classic page was drawn in full and then replaced by a custom
+    // one, and its toggle could PUT a dashboard built from nothing before the
+    // GET resolved, wiping the saved layout (the server replaces the dashboard
+    // key wholesale). Suspending shows neither page, so neither can happen.
     loadingState.isLoading = true;
     prefsState.current = null;
     const queryClient = new QueryClient({
       defaultOptions: { queries: { retry: false, gcTime: Infinity }, mutations: { retry: false } },
     });
     // Cache empty (no setQueryData) — simulates cold load.
-    renderRouter(queryClient);
-    expect(lastDashboardProps.current).not.toBeNull();
-    act(() => {
-      lastDashboardProps.current!.onModeChange('custom');
-    });
+    const { getByTestId, queryByTestId } = renderRouter(queryClient);
+    expect(getByTestId('route-loading')).toBeInTheDocument();
+    expect(queryByTestId('classic-dashboard')).toBeNull();
+    expect(queryByTestId('custom-dashboard')).toBeNull();
+    expect(lastDashboardProps.current).toBeNull();
     expect(mockMutate).not.toHaveBeenCalled();
   });
 });

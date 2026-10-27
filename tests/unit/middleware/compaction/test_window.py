@@ -366,7 +366,7 @@ def test_a_copy_from_before_entries_named_their_messages_is_not_carried() -> Non
 
 def _middleware(coverage=None) -> CompactionMiddleware:
     middleware = CompactionMiddleware(
-        Summarizer(None, limit=10**9, counter=len), token_threshold=10**9, keep_messages=4
+        Summarizer(None, limit=10**9, counter=len), token_threshold=10**9, keep_tokens=4
     )
     return middleware.with_window(coverage) if coverage else middleware
 

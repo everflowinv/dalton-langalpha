@@ -21,7 +21,13 @@ import {
 import { queryKeys } from '@/lib/queryKeys';
 import type { Computer, ComputerProvidersResponse } from '@/types/api';
 
-import { CREATE_COMPUTER_MUTATION_KEY, fetchComputerList, useComputerProviders, useComputers } from './useComputers';
+import {
+  CREATE_COMPUTER_MUTATION_KEY,
+  fetchComputerList,
+  RECONNECT_COMPUTER_MUTATION_KEY,
+  useComputerProviders,
+  useComputers,
+} from './useComputers';
 
 /**
  * How often the status is read again while a computer surface shows it.
@@ -107,12 +113,15 @@ export function useThisMacAvailability(options: { enabled: boolean; poll?: boole
 }
 
 /**
- * Resolves once no computer is being created. A create stops counting only
- * after its own onSuccess has put the new row on the list, so what is read
- * after this holds a computer a setup just added.
+ * Resolves once no computer is being created or reconnected. Either stops
+ * counting only after its own onSuccess has updated the list, so what is read
+ * after this holds a computer a setup just added, or the new host key of one
+ * it just reconnected.
  */
 function createsLanded(queryClient: QueryClient): Promise<void> {
-  const creating = () => queryClient.isMutating({ mutationKey: CREATE_COMPUTER_MUTATION_KEY }) > 0;
+  const creating = () =>
+    queryClient.isMutating({ mutationKey: CREATE_COMPUTER_MUTATION_KEY }) > 0 ||
+    queryClient.isMutating({ mutationKey: RECONNECT_COMPUTER_MUTATION_KEY }) > 0;
   return new Promise((resolve) => {
     if (!creating()) {
       resolve();
@@ -166,7 +175,7 @@ export function releaseRemoteControl(
     const status = await getRemoteControl();
     if (!status?.supported) return;
     if (onlyFor !== undefined && status.fingerprint !== onlyFor) return;
-    // A setup closes on the computer it has just created.
+    // A setup closes on the computer it has just created or reconnected.
     await createsLanded(queryClient);
     if (await inUse(queryClient, status.fingerprint)) return;
     setRemoteControlStatus(queryClient, await disableRemoteControl());

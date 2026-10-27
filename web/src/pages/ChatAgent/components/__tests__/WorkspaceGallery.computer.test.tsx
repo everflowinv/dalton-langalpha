@@ -759,15 +759,17 @@ describe('WorkspaceGallery, toolbar', () => {
     expect(await cards()).toHaveLength(2);
   });
 
-  it('rises the cards in on the first paint only, not when a search brings them back', async () => {
-    const user = userEvent.setup();
-    renderWithProviders(<WorkspaceGallery onWorkspaceSelect={vi.fn()} />);
-    for (const card of await cards()) expect(card).toHaveClass('enter-fade-up');
+  it('stands its frame up while the list is read, and the cards land in the placeholders without an entrance', async () => {
+    mockUseAllWorkspaces.mockImplementation(() => ({ data: undefined, isLoading: true, error: null }));
+    const { rerender } = renderWithProviders(<WorkspaceGallery onWorkspaceSelect={vi.fn()} />);
+    expect(screen.getAllByRole('heading', { name: 'Workspaces' }).length).toBeGreaterThan(0);
+    expect(screen.getByRole('searchbox')).toBeInTheDocument();
+    expect(screen.getByTestId('chief-of-staff')).toBeInTheDocument();
+    expect(screen.getAllByTestId('workspace-card-skeleton').length).toBeGreaterThan(0);
+    expect(screen.queryByTestId('workspace-card')).not.toBeInTheDocument();
 
-    // jsdom has no AnimationEvent, so React listens for the prefixed name.
-    fireEvent(screen.getByTestId('workspace-grid'), new Event('webkitAnimationEnd', { bubbles: true }));
-    await user.type(screen.getByRole('searchbox'), 'zzz');
-    await user.clear(screen.getByRole('searchbox'));
+    mockUseAllWorkspaces.mockImplementation(() => listed([HOME, ...WORKSPACES]));
+    rerender(<WorkspaceGallery onWorkspaceSelect={vi.fn()} />);
     for (const card of await cards()) expect(card).not.toHaveClass('enter-fade-up');
     expect(screen.getByTestId('chief-of-staff')).not.toHaveClass('enter-fade-up');
   });

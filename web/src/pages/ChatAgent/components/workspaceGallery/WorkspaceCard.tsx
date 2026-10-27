@@ -1,9 +1,10 @@
-import { useState, type KeyboardEvent } from 'react';
+import type { KeyboardEvent } from 'react';
 import { MoreHorizontal, Pin } from 'lucide-react';
 
 import { useTranslation } from 'react-i18next';
 
 import { DropdownMenu, DropdownMenuContent, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
+import { SkeletonBar } from '@/components/ui/skeleton';
 import { useWorkspaceText } from '@/hooks/useWorkspaceLabel';
 import { useIsMobile } from '@/hooks/useIsMobile';
 import { useLocale } from '@/hooks/useLocale';
@@ -73,15 +74,20 @@ interface WorkspaceCardProps {
   onMove?: (workspace: WorkspaceRecord) => void;
   onDelete: (workspace: WorkspaceRecord) => void;
   prefetchThreads?: (wsId: string) => void;
-  index?: number;
-  /** Rise in with the gallery's first paint. Read once, at mount: a card a
-   *  search or a filter brings back later just appears. */
-  entrance?: boolean;
   /** From the grid: whether and by what the card drags, and how it is drawn mid-drag. */
   drag?: CardDrag;
 }
 
 const RESTING: CardDrag = { state: 'resting', dragging: false, held: false };
+
+// The card's box, shared with its skeleton so a placeholder is the card's size.
+const CARD_BODY = 'relative flex h-full w-full flex-col gap-1.5 overflow-hidden rounded-xl py-3.5 pl-[18px] pr-4 md:px-5 md:py-4';
+const CARD_SURFACE = {
+  background: 'var(--color-bg-card-gradient, linear-gradient(to bottom, var(--color-border-muted), var(--color-border-muted)))',
+  border: '1px solid var(--lift-edge, var(--color-bg-card-border, var(--color-border-muted)))',
+  backdropFilter: 'blur(8px)',
+  WebkitBackdropFilter: 'blur(8px)',
+} as const;
 
 /**
  * A workspace in the gallery grid: its name and when it was last used, its
@@ -101,11 +107,8 @@ export function WorkspaceCard({
   onMove,
   onDelete,
   prefetchThreads,
-  index,
-  entrance = true,
   drag = RESTING,
 }: WorkspaceCardProps) {
-  const [rises] = useState(entrance);
   const locale = useLocale();
   const isMobile = useIsMobile();
   const text = useWorkspaceText()(workspace);
@@ -149,8 +152,7 @@ export function WorkspaceCard({
 
   return (
     <div
-      className={`relative group h-full${rises && !lifted ? ' enter-fade-up' : ''}`}
-      style={rises && !lifted ? { animationDelay: `calc(var(--motion-stagger) * ${Math.min(index ?? 0, 5)})` } : undefined}
+      className="relative group h-full"
       data-testid={lifted ? 'workspace-card-lifted' : 'workspace-card'}
       data-drag-state={state === 'resting' ? undefined : state}
       onMouseEnter={!isMobile ? () => prefetchThreads?.(workspace.workspace_id) : undefined}
@@ -168,7 +170,7 @@ export function WorkspaceCard({
           onKeyDown={onKeyDown}
           onClick={open}
           className={[
-            'relative flex h-full w-full flex-col gap-1.5 overflow-hidden rounded-xl py-3.5 pl-[18px] pr-4 md:px-5 md:py-4',
+            CARD_BODY,
             lifted
               ? 'cursor-grabbing scale-[1.02] shadow-xl'
               : 'cursor-pointer press',
@@ -181,12 +183,7 @@ export function WorkspaceCard({
           style={placeholder ? {
             background: 'transparent',
             border: '1.5px dashed var(--color-border-default)',
-          } : {
-            background: 'var(--color-bg-card-gradient, linear-gradient(to bottom, var(--color-border-muted), var(--color-border-muted)))',
-            border: '1px solid var(--lift-edge, var(--color-bg-card-border, var(--color-border-muted)))',
-            backdropFilter: 'blur(8px)',
-            WebkitBackdropFilter: 'blur(8px)',
-          }}
+          } : CARD_SURFACE}
         >
           {/* Where the menu always shows (a touch screen), the row leaves it its
               corner and the time sits clear of it. */}
@@ -230,6 +227,26 @@ export function WorkspaceCard({
             {menu}
           </div>
         )}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * A card's place while the list is read: the card's box with its name and the
+ * two description lines it always holds, so the grid it stands in is the
+ * grid the cards land in.
+ */
+export function WorkspaceCardSkeleton({ index = 0 }: { index?: number }) {
+  return (
+    <div className={CARD_BODY} style={CARD_SURFACE} data-testid="workspace-card-skeleton" aria-hidden="true">
+      <div className="font-medium">
+        <SkeletonBar style={{ width: `${36 + (index % 3) * 12}%` }} />
+      </div>
+      <div className="text-sm min-h-[2lh]">
+        <SkeletonBar className="w-11/12" />
+        <br />
+        <SkeletonBar style={{ width: `${45 + ((index + 1) % 3) * 15}%` }} />
       </div>
     </div>
   );

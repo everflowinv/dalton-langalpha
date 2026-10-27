@@ -191,11 +191,14 @@ function PairingView({
   state,
   busy,
   focusTarget,
+  reconnecting,
 }: {
   state: SshSetupState;
   busy: boolean;
   /** Takes focus when the user switches to this view. */
   focusTarget: (el: HTMLElement | null) => void;
+  /** The pairing reconnects a computer, whose login it should run as. */
+  reconnecting?: { username: string };
 }) {
   const { t } = useTranslation();
   const { pairing } = state;
@@ -240,7 +243,9 @@ function PairingView({
       <p style={labelStyle}>
         {pairing.localOnly
           ? t('computer.ssh.pairIntroLocal', 'Run this in a terminal on the computer running LangAlpha, as the user the agent should work as. To add another machine, set it up by hand.')
-          : t('computer.ssh.pairIntro', 'Run this on the machine you are adding (Linux or macOS), as the user the agent should work as:')}
+          : reconnecting
+            ? t('computer.reconnect.pairIntro', 'Run this on the machine, as {{username}}:', { username: reconnecting.username })
+            : t('computer.ssh.pairIntro', 'Run this on the machine you are adding (Linux or macOS), as the user the agent should work as:')}
       </p>
       {pairing.command && (
         <>
@@ -368,10 +373,20 @@ export function ReadySummary({
   step,
   ready,
   busy,
+  keeps,
+  moving = false,
 }: {
   step: SshReadyStep;
   ready: SshReady;
   busy: boolean;
+  /**
+   * The folder of the computer this machine reconnects, which it keeps: the
+   * summary says so in place of the folder and backup choices, and offers no
+   * other machine.
+   */
+  keeps?: string;
+  /** The machine holds nothing of that computer, which moves there: its folder is filled from backup. */
+  moving?: boolean;
 }) {
   const { t } = useTranslation();
   const locale = useLocale();
@@ -385,7 +400,7 @@ export function ReadySummary({
     : target.tunnel_id
       ? t('computer.ssh.readyTunnel', '{{hostname}}, through a tunnel', { hostname: formatSshReached(target, true) })
       : formatSshReached(target, false);
-  const startOver = step.startOver && (
+  const startOver = !keeps && step.startOver && (
     <LinkButton onClick={step.startOver} disabled={busy} className="ml-auto shrink-0 self-auto">
       {t('computer.ssh.differentMachine', 'Use a different machine')}
     </LinkButton>
@@ -437,7 +452,13 @@ export function ReadySummary({
         {access && <span>{access}</span>}
       </div>
 
-      {step.folderOpen ? (
+      {keeps ? (
+        <span className="min-w-0 break-all">
+          {moving
+            ? t('computer.reconnect.folderRestored', 'Workspaces come back in {{folder}} from their backup.', { folder: keeps })
+            : t('computer.reconnect.folderKept', 'Workspaces stay in {{folder}}.', { folder: keeps })}
+        </span>
+      ) : step.folderOpen ? (
         <div className="flex flex-col gap-1">
           <label htmlFor={folderId} style={labelStyle}>{t('computer.ssh.folder', 'Folder')}</label>
           <Input
@@ -467,24 +488,26 @@ export function ReadySummary({
         </div>
       )}
 
-      <div className="flex flex-col gap-1">
-        <CheckboxChoice
-          checked={step.filesBackup}
-          onCheckedChange={step.setFilesBackup}
-          disabled={busy}
-          aria-describedby={backupHintId}
-          className="items-center gap-2 rounded-md text-xs"
-          style={labelStyle}
-        >
-          <span>{t('computer.ssh.filesBackup', 'Back up workspace files')}</span>
-        </CheckboxChoice>
-        <span id={backupHintId} style={mutedStyle}>
-          {t(
-            'computer.ssh.filesBackupHint',
-            "Keeps a copy of each workspace's files on the server, so a lost folder can be restored. Version control and dependency folders are left out.",
-          )}
-        </span>
-      </div>
+      {!keeps && (
+        <div className="flex flex-col gap-1">
+          <CheckboxChoice
+            checked={step.filesBackup}
+            onCheckedChange={step.setFilesBackup}
+            disabled={busy}
+            aria-describedby={backupHintId}
+            className="items-center gap-2 rounded-md text-xs"
+            style={labelStyle}
+          >
+            <span>{t('computer.ssh.filesBackup', 'Back up workspace files')}</span>
+          </CheckboxChoice>
+          <span id={backupHintId} style={mutedStyle}>
+            {t(
+              'computer.ssh.filesBackupHint',
+              "Keeps a copy of each workspace's files on the server, so a lost folder can be restored. Version control and dependency folders are left out.",
+            )}
+          </span>
+        </div>
+      )}
 
       <span className="break-all" style={mutedStyle}>
         {t('computer.ssh.hostKey', 'Host key {{fingerprint}}', { fingerprint: probe.fingerprint })}
@@ -514,20 +537,41 @@ export function PreviewNotice({ children, className, testId }: { children: React
   );
 }
 
-export function SshSetup({ state, busy }: { state: SshSetupState; busy: boolean }) {
+export function SshSetup({
+  state,
+  busy,
+  reconnecting,
+}: {
+  state: SshSetupState;
+  busy: boolean;
+  /**
+   * The computer this setup reconnects: its login and the folder it keeps.
+   * It was added with its warning read, so that is not shown again, and
+   * the ready step offers no choices it already made.
+   */
+  reconnecting?: { username: string; folder: string; moving?: boolean };
+}) {
   const { t } = useTranslation();
   return (
     <div data-testid="ssh-setup">
-      <PreviewNotice className="mb-3" testId="ssh-preview-notice">
-        {t(
-          'computer.ssh.previewNotice',
-          'Connecting your own machine is new, so use it with care. The agent can do anything the account you connect can do, so connect an account made for it rather than your own.',
-        )}
-      </PreviewNotice>
+      {!reconnecting && (
+        <PreviewNotice className="mb-3" testId="ssh-preview-notice">
+          {t(
+            'computer.ssh.previewNotice',
+            'Connecting your own machine is new, so use it with care. The agent can do anything the account you connect can do, so connect an account made for it rather than your own.',
+          )}
+        </PreviewNotice>
+      )}
       {state.ready ? (
-        <ReadySummary step={state.readyStep} ready={state.ready} busy={busy} />
+        <ReadySummary
+          step={state.readyStep}
+          ready={state.ready}
+          busy={busy}
+          keeps={reconnecting?.folder}
+          moving={reconnecting?.moving}
+        />
       ) : state.view === 'pairing' ? (
-        <PairingView state={state} busy={busy} focusTarget={state.setEntry} />
+        <PairingView state={state} busy={busy} focusTarget={state.setEntry} reconnecting={reconnecting} />
       ) : (
         <ManualView state={state} busy={busy} />
       )}

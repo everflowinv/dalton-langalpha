@@ -105,7 +105,7 @@ export function usePortfolioData() {
   // Holdings membership is its own query (keyed ['portfolioData'] so CRUD
   // invalidation + polling are unchanged); per-symbol quotes come from the
   // shared quote layer so a symbol held here and watched elsewhere fetch once.
-  const { data: holdings = [], isLoading: holdingsLoading, refetch: refetchHoldings } = useQuery({
+  const { data: holdings = [], isLoading: holdingsLoading, isSuccess: loaded, refetch: refetchHoldings } = useQuery({
     ...portfolioHoldingsQuery,
     refetchInterval: 60000,
     refetchIntervalInBackground: false,
@@ -280,6 +280,8 @@ export function usePortfolioData() {
   return {
     rows,
     loading,
+    /** The holdings arrived, as opposed to a read that failed or never ran. */
+    loaded,
     hasRealHoldings,
     modalOpen,
     setModalOpen,

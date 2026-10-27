@@ -51,6 +51,7 @@ from src.server.database.workspace import (
 from src.server.models.computer import CLAIMABLE_FOR_START, ComputerStatus
 from src.server.services.computer_manager._providers import host_outage_of
 from src.server.services.computer_manager._types import ComputerBinding
+from src.server.services.computer_start_failure import record_start_failure
 from src.server.services.path_lock_coordination import (
     STOP_HEARTBEAT_UNAVAILABLE_RECOVERY_S,
     computer_stop_heartbeat,
@@ -812,6 +813,10 @@ class SessionLifecycleMixin:
                         )
                         await update_workspace_activity(workspace_id)
                         machine.pending_lazy_sync = False
+                        # After the promotion, so the start is usable first.
+                        self._queue_reconnect_syncs_soon(
+                            computer_id, session.sandbox, opened=workspace_id
+                        )
                 elif mcp_changed or (
                     skills_signature is not None
                     and session.skills_signature != skills_signature
@@ -886,11 +891,14 @@ class SessionLifecycleMixin:
                             self._core_config_for(binding),
                             outage_since=host_outage_of(e),
                         )
-                except BaseException:
+                except BaseException as recovery_error:
                     if was_unpromoted_lazy:
                         release = asyncio.create_task(
                             self._release_lost_lazy_start(
-                                computer_id, claimed_sandbox_id
+                                computer_id,
+                                claimed_sandbox_id,
+                                failure=recovery_error,
+                                kind=binding.kind,
                             )
                         )
                         try:
@@ -898,8 +906,8 @@ class SessionLifecycleMixin:
                         except asyncio.CancelledError:
                             pass
                     raise
-            except LayoutMigrationError:
-                await self._revert_unpromoted_lazy_start(binding)
+            except LayoutMigrationError as e:
+                await self._revert_unpromoted_lazy_start(binding, failure=e)
                 raise
             except SandboxTransientError as e:
                 # Failed initialization needs eviction; post-init transients leave a healthy
@@ -912,7 +920,7 @@ class SessionLifecycleMixin:
                     # Revert before cleanup drops pending_lazy_sync, or reversion becomes a
                     # no-op. Guard identity here and across cleanup awaits so a concurrent
                     # replacement survives.
-                    await self._revert_unpromoted_lazy_start(binding)
+                    await self._revert_unpromoted_lazy_start(binding, failure=e)
                     if self._cached_session(computer_id) is session:
                         await self._clear_session(computer_id, evict_session=session)
                     raise
@@ -922,7 +930,7 @@ class SessionLifecycleMixin:
                 )
                 # Capture before reverting, the revert clears pending_lazy_sync.
                 was_unpromoted_lazy = machine.pending_lazy_sync
-                await self._revert_unpromoted_lazy_start(binding)
+                await self._revert_unpromoted_lazy_start(binding, failure=e)
                 if was_unpromoted_lazy:
                     # Returning a healthy sandbox after reverting its row to stopped lets
                     # another worker claim and spawn a duplicate; force clean reacquisition.
@@ -944,7 +952,7 @@ class SessionLifecycleMixin:
                 logger.warning(f"Phase 2 sync failed for workspace {workspace_id}: {e}")
                 # Capture before reverting, the revert clears pending_lazy_sync.
                 was_unpromoted_lazy = machine.pending_lazy_sync
-                await self._revert_unpromoted_lazy_start(binding)
+                await self._revert_unpromoted_lazy_start(binding, failure=e)
                 if was_unpromoted_lazy:
                     # Never return a half-synced sandbox whose row was reverted to stopped;
                     # raise so the caller reclaims cleanly.
@@ -972,16 +980,23 @@ class SessionLifecycleMixin:
         if machine is not None and machine.phase2_event is phase2_event:
             machine.phase2_event = None
 
-    async def _revert_unpromoted_lazy_start(self, binding: ComputerBinding) -> None:
+    async def _revert_unpromoted_lazy_start(
+        self, binding: ComputerBinding, *, failure: BaseException | None = None
+    ) -> None:
         """Release failed lazy-start claims so other workers can retry immediately.
 
         Waiters otherwise spend start_wait_timeout on a stranded starting row.
-        pending_lazy_sync restricts reversion to unpromoted lazy starts."""
+        pending_lazy_sync restricts reversion to unpromoted lazy starts, and
+        only such a start records *failure* as the machine's: first, while the
+        row is still this start's, so a client reading it on the stopped frame
+        finds the reason."""
         machine = self._machine_if_known(binding.computer_id)
         if machine is None or not machine.pending_lazy_sync:
             return
         machine.pending_lazy_sync = False
         workspace_id = binding.workspace_id
+        if failure is not None:
+            await record_start_failure(binding.computer_id, failure, kind=binding.kind)
         try:
             reverted = await update_workspace_status(
                 workspace_id=workspace_id, status="stopped"
@@ -998,11 +1013,20 @@ class SessionLifecycleMixin:
             await self._revoke_data_token(binding.computer_id)
 
     async def _release_lost_lazy_start(
-        self, computer_id: str, sandbox_id: str | None
+        self,
+        computer_id: str,
+        sandbox_id: str | None,
+        *,
+        failure: BaseException | None = None,
+        kind: str = "",
     ) -> None:
         """Only while the row is still this start's. A recovery on another
         worker may have bound its own sandbox meanwhile, and that start's
-        status is not this one's to revert."""
+        status is not this one's to revert. *failure* is recorded first, so a
+        client reading the row on the stopped frame finds the reason; a
+        recovery that won clears it as it reaches running."""
+        if failure is not None and not isinstance(failure, asyncio.CancelledError):
+            await record_start_failure(computer_id, failure, kind=kind)
         try:
             released = await update_computer_status(
                 computer_id,
@@ -1298,7 +1322,7 @@ class SessionLifecycleMixin:
                     self._drop_session(computer_id)
                 raise
             did_init = True
-            await self._on_session_attached(computer_id, session, resumed=False)
+            self._on_session_attached(computer_id, session, resumed=False)
 
         self._put_session(computer_id, session, workspace_id=workspace_id)
         return session, did_init
@@ -1344,17 +1368,23 @@ class SessionLifecycleMixin:
                 lazy_init=True,
                 on_state_observed=_observe_and_broadcast,
             )
-        except (Exception, asyncio.CancelledError):
+        except (Exception, asyncio.CancelledError) as e:
             # Do not mask the start error if revert fails; waiters still have the 300s timeout.
             # CancelledError included: a dropped SSE client mid-provision must
             # not leave the claim standing for every sibling on the machine.
-            try:
-                await asyncio.shield(
-                    update_workspace_status(
-                        workspace_id=workspace_id,
-                        status="stopped",
+            # The failure goes on the row first, so the stopped frame finds
+            # it, and both under one shield, so a cancel cannot skip the revert.
+            async def _settle(error: BaseException) -> None:
+                if not isinstance(error, asyncio.CancelledError):
+                    await record_start_failure(
+                        claimed_computer_id, error, kind=binding.kind
                     )
+                await update_workspace_status(
+                    workspace_id=workspace_id, status="stopped"
                 )
+
+            try:
+                await asyncio.shield(_settle(e))
             except Exception:
                 logger.exception(
                     f"Failed to revert workspace {workspace_id} status after start error"
@@ -1567,7 +1597,11 @@ class SessionLifecycleMixin:
                 # Refresh activity so idle cleanup cannot act on a stale timestamp.
                 await update_workspace_activity(workspace_id)
                 logger.info(f"Workspace {workspace_id} restarted successfully")
-            await self._on_session_attached(computer_id, session, resumed=False)
+            # A lazy start has no runtime yet to queue the siblings' syncs on;
+            # its Phase 2 queues them once it promotes the start.
+            self._on_session_attached(
+                computer_id, session, resumed=not lazy_init, opened=workspace_id
+            )
             # Lazy timing covers initiation, not background readiness; still record it
             # to keep lazy starts represented in the latency histogram.
             safe_record(

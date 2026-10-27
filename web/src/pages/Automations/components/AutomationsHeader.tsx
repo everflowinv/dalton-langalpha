@@ -1,6 +1,7 @@
 import React, { useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
 import { SegmentedControl } from '@/components/ui/segmented-control';
+import { SkeletonBar } from '@/components/ui/skeleton';
 import type { Automation } from '@/types/automation';
 import { automationCensus } from '../utils/status';
 import type { TemplateId } from '../utils/templates';
@@ -10,13 +11,17 @@ export type AutomationsView = 'feed' | 'manage';
 
 interface AutomationsHeaderProps {
   automations: Automation[];
+  /** The list is still being read: the header holds the shape it has with
+   *  automations, the census to come and the actions in place, so it does
+   *  not change height or grow its actions when they land. */
+  loading?: boolean;
   view: AutomationsView;
   onViewChange: (view: AutomationsView) => void;
   onNew: (template: TemplateId) => void;
 }
 
 /** Title, a one-line census of what is set up, and the two ways to look at it. */
-export default function AutomationsHeader({ automations, view, onViewChange, onNew }: AutomationsHeaderProps) {
+export default function AutomationsHeader({ automations, loading = false, view, onViewChange, onNew }: AutomationsHeaderProps) {
   const { t } = useTranslation();
 
   // What is set up, so a finished automation is left out. Paused and switched
@@ -36,13 +41,15 @@ export default function AutomationsHeader({ automations, view, onViewChange, onN
 
   // With nothing set up the page below is the invitation, so the header
   // carries no actions of its own (the workspace gallery does the same).
-  const empty = automations.length === 0;
+  const empty = !loading && automations.length === 0;
 
   return (
     <header className="automations-header">
       <div className="min-w-0">
         <h1 className="title-font automations-title">{t('automation.automations')}</h1>
-        {census.length > 0 ? (
+        {loading ? (
+          <p className="automation-mono automations-census"><SkeletonBar className="w-28" /></p>
+        ) : census.length > 0 ? (
           <p className="automation-mono automations-census">{census.join(' · ')}</p>
         ) : (
           <p className="automations-tagline">{t('automation.tagline')}</p>

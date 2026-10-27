@@ -11,7 +11,7 @@ from typing import List, Optional, Sequence, Tuple
 
 from ptc_agent.config.core import SSHConfig
 from ptc_agent.core.sandbox.providers import ssh as ssh_provider
-from src.server.database.computer import get_computers_for_user
+from src.server.database.computer import get_computer, get_computers_for_user
 from src.server.database.ssh_tunnels import (
     MAX_TUNNELS_PER_USER,
     TooManyTunnels,
@@ -28,6 +28,8 @@ from src.server.models.computer import (
     ComputerSSHPairingTarget,
     ComputerSSHTunnelRequest,
 )
+from src.server.services.computer_errors import ComputerRepairRefused
+from src.server.services.ssh_computer_repair import check_repairable
 from src.server.services.ssh_dial_budget import SSHDialBudgetExceeded, spend_dials
 from src.server.services.ssh_computers import (
     client_key,
@@ -128,6 +130,9 @@ async def report(
         return 404, EXPIRED
     if form.failed is not None:
         return await _script_failed(pairing, form.failed, run=form.run.strip()[:64])
+    refused = await _bound_not_repairable(pairing)
+    if refused is not None:
+        return await _refuse(pairing, 409, refused)
     try:
         machine = dial.parse_report(form, sources)
     except ValueError as e:
@@ -231,7 +236,8 @@ async def report(
             f"{PRODUCT} reached {name}, but it cannot host a computer: "
             + " ".join(reached.found.problems)
         )
-    return 200, f"Connected. Go back to {PRODUCT} to add {name}."
+    then = "reconnect" if pairing.computer_id else "add"
+    return 200, f"Connected. Go back to {PRODUCT} to {then} {name}."
 
 
 async def _unpinned(pairing: PairingState, machine: ReportedMachine) -> Tuple[int, str]:
@@ -288,7 +294,7 @@ async def _settle(
         )
     else:
         found = reached.found
-        root_dir = suggested_root_dir(
+        root_dir = await _bound_root_dir(pairing) or suggested_root_dir(
             await get_computers_for_user(pairing.user_id),
             home=found.home,
             host_key=found.host_key,
@@ -318,6 +324,40 @@ async def _settle(
     if not await state.settle(pairing, result, supersede_stop=supersede_stop):
         return None
     return result
+
+
+async def _bound_not_repairable(pairing: PairingState) -> Optional[str]:
+    """Why the computer a pairing pairs again may no longer be repaired, as a
+    start begun since (in another tab, or by a turn) makes it; None when it
+    may, or when the pairing adds a machine.
+
+    Asked before the machine takes the new key and tunnel: a running
+    computer's machine paired again would drop the tunnel the computer is
+    reached through, and the reconnect that would name the new one is
+    refused.
+    """
+    if pairing.computer_id is None:
+        return None
+    try:
+        check_repairable(await get_computer(pairing.computer_id))
+    except (ValueError, ComputerRepairRefused) as e:
+        return str(e)
+    return None
+
+
+async def _bound_root_dir(pairing: PairingState) -> Optional[str]:
+    """The folder of the computer a pairing pairs again, which a reconnect
+    keeps; None for a pairing that adds a machine.
+
+    Suggesting a new folder would be wrong for it: the computer's own mark is
+    on that folder, which reads to a new computer as another's.
+    """
+    if pairing.computer_id is None:
+        return None
+    computer = await get_computer(pairing.computer_id)
+    if computer is None or str(computer.get("user_id")) != pairing.user_id:
+        return None
+    return computer.get("root_dir") or None
 
 
 async def _ask_to_connect_out(pairing: PairingState) -> Tuple[int, str]:

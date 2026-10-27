@@ -131,7 +131,7 @@ class TestWindowCap:
         from src.server.services.llm.config import apply_compaction
 
         config = SimpleNamespace(
-            compaction=SimpleNamespace(token_threshold=0, keep_messages=0, profile=None),
+            compaction=SimpleNamespace(token_threshold=0, profile=None),
         )
         apply_compaction(config, Tuning(compaction_profile=profile), entry)
         return config.compaction
@@ -139,7 +139,6 @@ class TestWindowCap:
     def test_a_preset_wider_than_the_window_is_capped(self):
         applied = self._applied("maximal", {"context": 400_000})
         assert applied.token_threshold == 300_000
-        assert applied.keep_messages == COMPACTION_PROFILES["maximal"]["keep_messages"]
         assert applied.profile == "maximal"
 
     def test_a_preset_that_fits_is_untouched(self):
@@ -163,7 +162,7 @@ class TestNativeChoice:
 
         config = SimpleNamespace(
             compaction=SimpleNamespace(
-                token_threshold=0, keep_messages=0, profile=None, native="stale"
+                token_threshold=0, profile=None, native="stale"
             ),
         )
         apply_compaction(config, tuning, entry, custom=custom)

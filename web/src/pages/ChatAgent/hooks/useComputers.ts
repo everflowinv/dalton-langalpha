@@ -119,6 +119,13 @@ export function fetchComputerList(queryClient: QueryClient): Promise<ComputersRe
 export const CREATE_COMPUTER_MUTATION_KEY = ['computers', 'create'] as const;
 
 /**
+ * Names a reconnect, which moves a computer onto a new host key: turning
+ * remote control off once no row is this Mac must wait for it, or it reads
+ * the list before the row names the helper's new key.
+ */
+export const RECONNECT_COMPUTER_MUTATION_KEY = ['computers', 'reconnect'] as const;
+
+/**
  * The root a computer keeps its workspace folders under, off the shared list.
  * Selected, so a refetch that only moved a status leaves its readers alone.
  */
@@ -394,6 +401,10 @@ export function useComputerStatusFanout(): void {
   useEffect(() => {
     if (!watchedComputerKey) return;
     const controller = new AbortController();
+    const reconcile = () => Promise.all([
+      queryClient.invalidateQueries({ queryKey: queryKeys.computers.lists() }),
+      queryClient.invalidateQueries({ queryKey: queryKeys.workspaces.lists() }),
+    ]);
 
     for (const computerId of watchedComputerKey.split(',')) {
       void (async () => {
@@ -415,9 +426,18 @@ export function useComputerStatusFanout(): void {
               // Before the status lands, so whoever reads the failure off the
               // list finds its reason waiting.
               if (status === 'error' && frame.error) recordPrepareFailure(computerId, frame.error);
+              // The frame brings the failure the row keeps, so the card has it
+              // even if the re-read below is slow or fails.
+              if (frame.start_failure) patchComputerRow(queryClient, computerId, { start_failure: frame.start_failure });
               patchComputerStatusInCaches(queryClient, computerId, status);
               // A breakdown read while the machine was down only says to start it.
               if (status === 'running') invalidateMachineStorage(queryClient, computerId);
+              // A failed start still needs the row: the server keeps why on
+              // it (`start_failure`) before it sends 'error', or 'stopped' for
+              // a start that reverted. Asked here, not after the close: either
+              // leaves the watch set, so this effect is torn down, and its
+              // signal aborted, on the next render.
+              if (status === 'error' || status === 'stopped') void reconcile();
             },
             controller.signal,
           );
@@ -427,10 +447,7 @@ export function useComputerStatusFanout(): void {
           // holding a transition that finished without us: reconcile, and if
           // the machine is still moving, listen again.
           if (isComputerStatusTerminal(lastStatus)) return;
-          await Promise.all([
-            queryClient.invalidateQueries({ queryKey: queryKeys.computers.lists() }),
-            queryClient.invalidateQueries({ queryKey: queryKeys.workspaces.lists() }),
-          ]);
+          await reconcile();
           if (controller.signal.aborted) return;
           if (!isComputerStatusTransitional(cachedComputerStatus(queryClient, computerId))) return;
           if (attempt >= STATUS_RECONNECT.maxAttempts) return;
@@ -523,12 +540,14 @@ export const SSH_PAIRING_POLL_MS = 2000;
  * reuses the one in flight instead of minting another. Never refetched on its
  * own: a new command replaces the one the user may already have pasted, so
  * only an expiry or "use a different machine" asks for one. Dropped on unmount,
- * so the next opening starts a fresh pairing.
+ * so the next opening starts a fresh pairing. With `computerId` it is a
+ * pairing that reconnects that computer, cached apart from a new machine's.
  */
-export function useSshPairingMint(options: { enabled: boolean }) {
+export function useSshPairingMint(options: { enabled: boolean; computerId?: string | null }) {
+  const computerId = options.computerId ?? null;
   return useQuery({
-    queryKey: queryKeys.sshPairings.mint(),
-    queryFn: () => createSshPairing(),
+    queryKey: queryKeys.sshPairings.mint(computerId),
+    queryFn: () => createSshPairing({ computerId }),
     enabled: options.enabled,
     staleTime: Infinity,
     gcTime: 0,

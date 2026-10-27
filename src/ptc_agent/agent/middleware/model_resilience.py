@@ -35,6 +35,7 @@ from langchain.agents.middleware.types import (
     ModelRequest,
     ModelResponse,
 )
+from langchain_core.messages import AIMessage
 
 from src.llms.error_classification import (
     extract_status_code,
@@ -57,6 +58,11 @@ logger = structlog.get_logger(__name__)
 RESILIENCE_TRACE_ATTR = "__model_resilience__"
 
 _ERROR_SUMMARY_MAX_CHARS = 300
+
+#: The ``response_metadata`` key naming the fallback that wrote an answer. Its
+#: usage counts that model's tokens, so compaction measures nothing for the
+#: primary by it.
+FALLBACK_KEY = "model_fallback"
 
 _as_sent: ContextVar[bool] = ContextVar("model_resilience_as_sent", default=False)
 
@@ -127,6 +133,13 @@ def _window(model: Any) -> int | None:
     profile = getattr(model, "profile", None)
     window = profile.get("max_input_tokens") if isinstance(profile, dict) else None
     return window if isinstance(window, int) and window > 0 else None
+
+
+def _mark_fallback(response: ModelResponse, name: str) -> ModelResponse:
+    for msg in getattr(response, "result", None) or ():
+        if isinstance(msg, AIMessage):
+            msg.response_metadata = {**(msg.response_metadata or {}), FALLBACK_KEY: name}
+    return response
 
 
 def _distinct(fallbacks: list[tuple[str, Any]], primary: str | None) -> list[tuple[str, Any]]:
@@ -547,7 +560,8 @@ class ModelResilienceMiddleware(AgentMiddleware):
             while True:
                 attempts += 1
                 try:
-                    return handler(req)
+                    response = handler(req)
+                    return _mark_fallback(response, name) if index else response
                 except Exception as exc:
                     status, recovery = self._decide(
                         exc, attempts, req, escalated=escalated
@@ -606,7 +620,8 @@ class ModelResilienceMiddleware(AgentMiddleware):
             while True:
                 attempts += 1
                 try:
-                    return await handler(req)
+                    response = await handler(req)
+                    return _mark_fallback(response, name) if index else response
                 except Exception as exc:
                     if not oauth_refreshed and extract_status_code(exc) == 401:
                         oauth_refreshed = True

@@ -34,6 +34,7 @@ from src.server.database.workspace import (
 from src.server.database.workspace_folders import WorkspaceFolderMoving
 from src.server.services.computer_manager._types import (
     ComputerBinding,
+    MachineTarget,
     WorkspaceToolView,
 )
 from src.server.services.user_skills.reconcile import reconcile_workspace_skills
@@ -169,7 +170,9 @@ class McpSecretsMixin:
                 continue
             identity = await db_get_workspace_identity(workspace_id)
             session = self.get_session_if_ready(
-                workspace_id, expected_sandbox_id=(identity or {}).get("sandbox_id")
+                workspace_id,
+                expected_sandbox_id=(identity or {}).get("sandbox_id"),
+                target=MachineTarget.of_workspace(identity),
             )
             if session is not None:
                 sandboxes[computer_id] = session.sandbox
@@ -592,14 +595,18 @@ class McpSecretsMixin:
         machine.discovery_tasks.clear()
 
     def get_applied_mcp_config_version(
-        self, workspace_id: str, *, expected_sandbox_id: str | None
+        self,
+        workspace_id: str,
+        *,
+        expected_sandbox_id: str | None,
+        target: MachineTarget,
     ) -> int | None:
         """Only report versions from a ready, identity-checked session.
 
         The UI treats this as applied state; a superseded session cannot vouch for
         what the live sandbox has loaded."""
         session = self.get_session_if_ready(
-            workspace_id, expected_sandbox_id=expected_sandbox_id
+            workspace_id, expected_sandbox_id=expected_sandbox_id, target=target
         )
         if session is None:
             return None
@@ -702,7 +709,9 @@ class McpSecretsMixin:
         if not ws or not ws.get("sandbox_id"):
             return
         session = self.get_session_if_ready(
-            workspace_id, expected_sandbox_id=str(ws["sandbox_id"])
+            workspace_id,
+            expected_sandbox_id=str(ws["sandbox_id"]),
+            target=MachineTarget.of_workspace(ws),
         )
         if session is None:
             return

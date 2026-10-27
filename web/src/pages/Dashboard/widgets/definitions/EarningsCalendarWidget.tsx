@@ -6,6 +6,7 @@ import { useNow } from '@/hooks/useNow';
 import { shortMonthDay, shortWeekday } from '@/lib/format';
 import { localDateStr } from '@/lib/utils';
 import { CalendarDays } from 'lucide-react';
+import { SwapCell } from '@/components/ui/crossfade';
 import { getEarningsCalendar } from '../../utils/api';
 import { registerWidget } from '../framework/WidgetRegistry';
 import { useWidgetContextExport } from '../framework/contextSnapshot';
@@ -329,51 +330,59 @@ function EarningsCalendarWidget({ instance }: WidgetRenderProps<EarningsConfig>)
       </div>
 
       <div className="flex-1 min-h-0 overflow-y-auto -mx-1 px-1">
-        {loading && upcoming.length === 0 ? (
-          <div className="space-y-1.5 py-1">
-            {Array.from({ length: 5 }).map((_, i) => (
-              <div
-                key={i}
-                className="h-10 rounded animate-pulse"
-                style={{
-                  backgroundColor: 'var(--color-bg-subtle)',
-                  opacity: 1 - i * 0.1,
-                }}
-              />
-            ))}
-          </div>
-        ) : upcoming.length === 0 ? (
-          <div className="h-full flex flex-col items-center justify-center gap-3 py-6">
-            <div
-              className="h-9 w-9 rounded-full flex items-center justify-center"
-              style={{ backgroundColor: 'var(--color-bg-subtle)' }}
-            >
-              <CalendarDays className="h-4 w-4" style={{ color: 'var(--color-text-tertiary)' }} />
+        {/* The skeleton crossfades to the list in place. The empty state
+            stands in the middle of the widget, so its layer takes the height. */}
+        <SwapCell
+          as="div"
+          className={!loading && upcoming.length === 0 ? 'h-full' : 'items-start'}
+          swapKey={loading && upcoming.length === 0 ? 'loading' : 'ready'}
+        >
+          {loading && upcoming.length === 0 ? (
+            <div className="space-y-1.5 py-1">
+              {Array.from({ length: 5 }).map((_, i) => (
+                <div
+                  key={i}
+                  className="h-10 rounded animate-pulse"
+                  style={{
+                    backgroundColor: 'var(--color-bg-subtle)',
+                    opacity: 1 - i * 0.1,
+                  }}
+                />
+              ))}
             </div>
-            <div className="text-center">
+          ) : upcoming.length === 0 ? (
+            <div className="h-full flex flex-col items-center justify-center gap-3 py-6">
               <div
-                className="dashboard-mono text-sm mb-0.5"
-                style={{ color: 'var(--color-text-primary)' }}
+                className="h-9 w-9 rounded-full flex items-center justify-center"
+                style={{ backgroundColor: 'var(--color-bg-subtle)' }}
               >
-                {t('dashboard.widgets.earningsCalendar.empty')}
+                <CalendarDays className="h-4 w-4" style={{ color: 'var(--color-text-tertiary)' }} />
               </div>
-              <div
-                className="text-[0.6875rem]"
-                style={{ color: 'var(--color-text-tertiary)' }}
-              >
-                {t('dashboard.widgets.earningsCalendar.emptyHint', { days: windowDays })}
+              <div className="text-center">
+                <div
+                  className="dashboard-mono text-sm mb-0.5"
+                  style={{ color: 'var(--color-text-primary)' }}
+                >
+                  {t('dashboard.widgets.earningsCalendar.empty')}
+                </div>
+                <div
+                  className="text-[0.6875rem]"
+                  style={{ color: 'var(--color-text-tertiary)' }}
+                >
+                  {t('dashboard.widgets.earningsCalendar.emptyHint', { days: windowDays })}
+                </div>
               </div>
             </div>
-          </div>
-        ) : (
-          <div className="flex flex-col gap-3">
-            <BucketSection label={t(BUCKET_KEY.today)} items={grouped.today} bucket="today" instanceId={instance.id} />
-            <BucketSection label={t(BUCKET_KEY.tomorrow)} items={grouped.tomorrow} bucket="tomorrow" instanceId={instance.id} />
-            <BucketSection label={t(BUCKET_KEY.week)} items={grouped.week} bucket="week" instanceId={instance.id} />
-            <BucketSection label={t(BUCKET_KEY.next)} items={grouped.next} bucket="next" instanceId={instance.id} />
-            <BucketSection label={t(BUCKET_KEY.later)} items={grouped.later} bucket="later" instanceId={instance.id} />
-          </div>
-        )}
+          ) : (
+            <div className="flex flex-col gap-3">
+              <BucketSection label={t(BUCKET_KEY.today)} items={grouped.today} bucket="today" instanceId={instance.id} />
+              <BucketSection label={t(BUCKET_KEY.tomorrow)} items={grouped.tomorrow} bucket="tomorrow" instanceId={instance.id} />
+              <BucketSection label={t(BUCKET_KEY.week)} items={grouped.week} bucket="week" instanceId={instance.id} />
+              <BucketSection label={t(BUCKET_KEY.next)} items={grouped.next} bucket="next" instanceId={instance.id} />
+              <BucketSection label={t(BUCKET_KEY.later)} items={grouped.later} bucket="later" instanceId={instance.id} />
+            </div>
+          )}
+        </SwapCell>
       </div>
 
     </div>

@@ -1,6 +1,7 @@
 import React, { useCallback, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
-import { HeaderButton, ListError, ListSkeleton } from '@/components/mcp/McpPrimitives';
+import { HeaderButton, ListError } from '@/components/mcp/McpPrimitives';
+import { SkeletonBar } from '@/components/ui/skeleton';
 import { useLocale } from '@/hooks/useLocale';
 import { useNow } from '@/hooks/useNow';
 import { relativeTime } from '@/lib/format';
@@ -59,7 +60,7 @@ export default function FeedView({ automations, readings, onOpenAutomation, onOp
         {error && runs.length === 0 ? (
           <ListError>{t('automation.loadFailed')}</ListError>
         ) : isLoading ? (
-          <ListSkeleton rows={4} />
+          <FeedDaySkeleton />
         ) : runs.length === 0 ? (
           <p className="automations-quiet-note">{t('automation.noRunsYet')}</p>
         ) : (
@@ -97,6 +98,65 @@ export default function FeedView({ automations, readings, onOpenAutomation, onOp
         onManage={onManage}
         onNew={onNew}
       />
+    </div>
+  );
+}
+
+/**
+ * The feed while it is read: a day of runs beside the rail, drawn in the
+ * classes the real ones take, so the runs land where their placeholders stood
+ * and the page around them does not move.
+ */
+export function FeedSkeleton() {
+  return (
+    <div className="automations-feed" aria-busy="true">
+      <section className="automations-feed-main">
+        <FeedDaySkeleton />
+      </section>
+      <aside className="automations-rail" aria-hidden="true" data-testid="feed-skeleton-rail">
+        <section className="automations-rail-section">
+          <h2 className="automations-kicker"><SkeletonBar className="w-16" /></h2>
+          {[55, 70, 45, 60].map((width) => (
+            <div key={width} className="automations-rail-row">
+              <span className="automation-mono automations-rail-when"><SkeletonBar className="w-20" /></span>
+              <span className="automations-rail-name flex-1"><SkeletonBar style={{ width: `${width}%` }} /></span>
+            </div>
+          ))}
+        </section>
+        <span className="automation-link self-start"><span><SkeletonBar className="w-24" /></span></span>
+      </aside>
+    </div>
+  );
+}
+
+function FeedDaySkeleton() {
+  const { t } = useTranslation();
+  return (
+    <div className="automations-day">
+      <span className="sr-only">{t('common.loading')}</span>
+      <div className="automations-kicker automations-day-heading" aria-hidden="true" data-testid="feed-skeleton-heading">
+        <SkeletonBar className="w-12" />
+      </div>
+      {[0, 1, 2, 3].map((i) => (
+        <div key={i} className="automation-run" aria-hidden="true" data-testid="feed-skeleton-run">
+          <div className="automation-mono automation-run-time"><SkeletonBar className="w-14" /></div>
+          <div className="min-w-0 flex-1">
+            <div className="automation-run-head">
+              <span className="automation-run-name"><SkeletonBar style={{ width: `${30 + (i % 3) * 10}%` }} /></span>
+            </div>
+            <div className="automation-mono automation-run-meta"><SkeletonBar className="w-24" /></div>
+            <p className="automation-run-excerpt">
+              <SkeletonBar className="w-full" />
+              <br />
+              <SkeletonBar style={{ width: `${55 + (i % 2) * 20}%` }} />
+            </p>
+            {/* The link is a flex box, so its bar sits in a span that keeps the line's height. */}
+            <div className="automation-run-actions">
+              <span className="automation-link"><span><SkeletonBar className="w-20" /></span></span>
+            </div>
+          </div>
+        </div>
+      ))}
     </div>
   );
 }

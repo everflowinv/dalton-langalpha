@@ -33,10 +33,8 @@ from langchain.agents.middleware.types import (
 )
 from langchain_core.messages import AIMessage
 
-from ptc_agent.agent.middleware.compaction.utils import (
-    context_tokens,
-    read_ahead,
-)
+from ptc_agent.agent.middleware.compaction.measure import context_tokens
+from ptc_agent.agent.middleware.compaction.utils import read_ahead
 from ptc_agent.agent.middleware.runtime_context.changes import UPDATE_SCHEMA_VERSION
 from ptc_agent.agent.middleware.runtime_context.durable import (
     DurableUpdate,
@@ -256,13 +254,16 @@ class NotesDueMiddleware(AgentMiddleware):
 
     state_schema = NotesDueState
 
-    def __init__(self, scratchpad: ThreadScratchpad, compaction: CompactionMiddleware) -> None:
+    def __init__(
+        self, scratchpad: ThreadScratchpad, compaction: CompactionMiddleware, model: Any
+    ) -> None:
         super().__init__()
         self._scratchpad = scratchpad
         # The fill is a share of the size the main agent's compaction
-        # summarizes at, measured as it measures, so the two cannot drift.
+        # summarizes at, measured as it measures for the turn's ``model``, so
+        # the two cannot drift.
         self._token_threshold = compaction._token_threshold
-        self._counter = compaction._summarizer.counter
+        self._estimate = compaction._estimate(model)
         self._view = compaction.view
         self._notes_folder = _notes_pattern(scratchpad.notes_subdir)
 
@@ -310,7 +311,8 @@ class NotesDueMiddleware(AgentMiddleware):
         """
         view = await self._view(state.get("messages") or [], state)
         await read_ahead(view)
-        return context_tokens(state, view, self._counter) / self._token_threshold
+        reading = await context_tokens(state, view, self._estimate)
+        return reading.tokens / self._token_threshold
 
     def _notes_due(self, state: Any, fill: float, since: str | None) -> DurableUpdate | None:
         if fill < notes_due_at(self._token_threshold):

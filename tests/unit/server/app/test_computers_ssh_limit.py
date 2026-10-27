@@ -67,3 +67,104 @@ async def test_a_user_at_the_limit_is_refused_before_any_machine_is_touched(
         "limit": 3,
     }
     touched.assert_not_awaited()
+
+
+_COMPUTER_ID = "11111111-1111-4111-8111-111111111111"
+
+
+@pytest.mark.asyncio
+async def test_pairing_a_computers_machine_again_is_not_another_computer(
+    client, sample_computer_dict
+):
+    """At the limit too: a reconnect adds nothing, and the pairing carries the
+    computer for its ready probe to suggest that computer's folder."""
+    computer = sample_computer_dict(computer_id=_COMPUTER_ID, kind="ssh", status="stopped")
+    minted = AsyncMock(
+        return_value={
+            "token": "t",
+            "command": "c",
+            "script_url": "u",
+            "expires_at": "2026-10-25T17:00:00+00:00",
+        }
+    )
+    counted = AsyncMock(return_value=3)
+    with (
+        patch.object(computers_ssh, "get_computer", AsyncMock(return_value=computer)),
+        patch(
+            "src.server.services.ssh_computers.count_live_computers_of_kind", counted
+        ),
+        patch.object(computers_ssh.ssh_pairing, "create_pairing", minted),
+    ):
+        answer = await client.post(
+            "/api/v1/computers/ssh/pairings", json={"computer_id": _COMPUTER_ID}
+        )
+
+    assert answer.status_code == 201, answer.text
+    counted.assert_not_awaited()
+    assert minted.await_args.kwargs["computer_id"] == _COMPUTER_ID
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("overrides", "status"),
+    [({"user_id": "someone-else"}, 404), ({"kind": "daytona"}, 400)],
+    ids=["another-users", "not-ssh"],
+)
+async def test_a_pairing_is_bound_only_to_the_callers_own_ssh_computer(
+    client, sample_computer_dict, overrides, status
+):
+    computer = sample_computer_dict(**{"computer_id": _COMPUTER_ID, "kind": "ssh", **overrides})
+    minted = AsyncMock()
+    with (
+        patch.object(computers_ssh, "get_computer", AsyncMock(return_value=computer)),
+        patch.object(computers_ssh.ssh_pairing, "create_pairing", minted),
+    ):
+        answer = await client.post(
+            "/api/v1/computers/ssh/pairings", json={"computer_id": _COMPUTER_ID}
+        )
+
+    assert answer.status_code == status
+    minted.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_reaching_a_computers_machine_again_by_hand_is_not_another_computer(
+    client, sample_computer_dict
+):
+    from ptc_agent.core.sandbox.providers.ssh_errors import SSHConnectError
+
+    computer = sample_computer_dict(computer_id=_COMPUTER_ID, kind="ssh", status="stopped")
+    counted = AsyncMock(return_value=3)
+    dialed = AsyncMock(side_effect=SSHConnectError("unreachable", "No answer."))
+    with (
+        patch.object(computers_ssh, "get_computer", AsyncMock(return_value=computer)),
+        patch("src.server.services.ssh_computers.count_live_computers_of_kind", counted),
+        patch.object(computers_ssh, "spend_dials", AsyncMock()),
+        patch.object(computers_ssh, "client_key", AsyncMock(return_value="key")),
+        patch.object(computers_ssh, "probe", dialed),
+    ):
+        answer = await client.post(
+            "/api/v1/computers/ssh/probe", json={**_HOST, "computer_id": _COMPUTER_ID}
+        )
+
+    assert answer.status_code == 422
+    counted.assert_not_awaited()
+    dialed.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_a_probe_names_only_the_callers_own_ssh_computer(client, sample_computer_dict):
+    computer = sample_computer_dict(
+        computer_id=_COMPUTER_ID, kind="ssh", user_id="someone-else"
+    )
+    dialed = AsyncMock()
+    with (
+        patch.object(computers_ssh, "get_computer", AsyncMock(return_value=computer)),
+        patch.object(computers_ssh, "probe", dialed),
+    ):
+        answer = await client.post(
+            "/api/v1/computers/ssh/probe", json={**_HOST, "computer_id": _COMPUTER_ID}
+        )
+
+    assert answer.status_code == 404
+    dialed.assert_not_awaited()

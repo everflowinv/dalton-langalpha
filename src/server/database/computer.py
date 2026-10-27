@@ -129,9 +129,10 @@ def bind_provider_ref_statement(
 
     IS NOT DISTINCT FROM fences the previous ref; lifecycle fencing prevents a
     racing bind from reviving a stopped machine. A bind is a sandbox that
-    started, so it ends any host outage the row was timing. A rebuild a host
-    outage authorized also fences on that outage still running: the old
-    sandbox resuming meanwhile ends it, and then the old one is kept.
+    started, so it ends any host outage the row was timing and clears the
+    last start's failure. A rebuild a host outage authorized also fences on
+    that outage still running: the old sandbox resuming meanwhile ends it,
+    and then the old one is kept.
     """
     always_on_guard = (
         "\n                  AND c.is_always_on = %(expected_always_on)s"
@@ -149,7 +150,8 @@ def bind_provider_ref_statement(
             "status = 'running',\n"
             "                    provider_ref = %(provider_ref)s,\n"
             "                    platform_secret_version = %(platform_secret_version)s,\n"
-            "                    host_unavailable_since = NULL"
+            "                    host_unavailable_since = NULL,\n"
+            "                    start_failure = NULL"
         ),
         "workspace_set": (
             "status = 'running',\n"
@@ -503,6 +505,40 @@ async def record_machine_facts(
         return cur.rowcount > 0
 
 
+async def record_computer_start_failure(
+    computer_id: str, failure: Dict[str, Any], *, conn=None
+) -> bool:
+    """Keep why a start failed, stamped on the database clock.
+
+    Not on a running row: a start that won on another worker has already
+    cleared it, and a failure of this one's is no longer the machine's
+    state. Leaves ``updated_at`` alone, since the start fences on it.
+    """
+    async with _computer_cursor(conn) as cur:
+        await cur.execute(
+            f"""
+            UPDATE computers
+            SET start_failure = %s::jsonb || jsonb_build_object('at', NOW())
+            WHERE computer_id = %s
+              AND {FENCE_NOT_DELETED}
+              AND status <> 'running'
+            """,
+            (Json(failure), computer_id),
+        )
+        return cur.rowcount > 0
+
+
+async def clear_computer_start_failure(computer_id: str, *, conn=None) -> bool:
+    """Forget the last failed start, for a repair accepted to try again."""
+    async with _computer_cursor(conn) as cur:
+        await cur.execute(
+            "UPDATE computers SET start_failure = NULL"
+            " WHERE computer_id = %s AND start_failure IS NOT NULL",
+            (computer_id,),
+        )
+        return cur.rowcount > 0
+
+
 async def create_computer(
     user_id: str,
     *,
@@ -642,10 +678,13 @@ async def update_computer_status(
         )
     stopped_clause = ", stopped_at = NOW()" if status == "stopped" else ""
     primary_clause = ", is_primary = FALSE" if status == "deleted" else ""
-    # Running is a start that succeeded, which ends any host outage; a revert
-    # to stopped after a refused start keeps the clock going.
+    # Running is a start that succeeded, which ends any host outage and the
+    # last start's failure; a revert to stopped after a refused start keeps
+    # the clock going and the failure shown.
     running_clause = (
-        ", host_unavailable_since = NULL" if status == "running" else ""
+        ", host_unavailable_since = NULL, start_failure = NULL"
+        if status == "running"
+        else ""
     )
 
     params: Dict[str, Any] = {

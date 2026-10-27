@@ -97,10 +97,12 @@ function Dashboard({ layoutToggle }: DashboardProps = {}) {
   const portfolioWatchlistProps = {
     watchlistRows: watchlist.rows,
     watchlistLoading: watchlist.loading,
+    watchlistLoaded: watchlist.loaded,
     onWatchlistAdd: () => { setShowWatchlistSheet(false); watchlist.setModalOpen(true); },
     onWatchlistDelete: (id: string) => { setShowWatchlistSheet(false); watchlist.handleDelete(id); },
     portfolioRows: portfolio.rows,
     portfolioLoading: portfolio.loading,
+    portfolioLoaded: portfolio.loaded,
     hasRealHoldings: portfolio.hasRealHoldings,
     onPortfolioAdd: () => { setShowWatchlistSheet(false); portfolio.setModalOpen(true); },
     onPortfolioDelete: (id: string) => { setShowWatchlistSheet(false); handleDeletePortfolioItem(id); },

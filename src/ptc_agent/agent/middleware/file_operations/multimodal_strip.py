@@ -329,6 +329,15 @@ class MultimodalStripMiddleware(AgentMiddleware):
         self.model_name = model_name
         self.custom_modalities = custom_modalities
 
+    @classmethod
+    def for_config(cls, config: Any) -> "MultimodalStripMiddleware":
+        """The strip an agent built from ``config`` runs, which manual
+        compaction also judges attachments by when that agent has none."""
+        return cls(
+            model_name=config.llm.name if config.llm else None,
+            custom_modalities=config.input_modalities,
+        )
+
     def _resolve_target(self, request: Any) -> tuple[str | None, list[str]]:
         """Name and modalities of the model this request will actually reach.
 

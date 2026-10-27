@@ -4,12 +4,34 @@ import { useScrollMemory } from '@/lib/scrollMemory';
 import { useUser } from '@/hooks/useUser';
 import { usePreferences } from '@/hooks/usePreferences';
 import { useTranslation } from 'react-i18next';
+import { SwapCell } from '@/components/ui/crossfade';
+import { SkeletonBar } from '@/components/ui/skeleton';
 import { UserInfoTab } from './panels/UserInfoTab';
 import { PreferencesTab } from './panels/PreferencesTab';
 import { ModelTab } from './panels/ModelTab';
 import { ExperimentsTab } from './panels/ExperimentsTab';
 import { isDaltonAuth } from '@/config/daltonAuth'; // DALTON-HOOK(hide-experiments)
 import './Settings.css';
+
+/** A tab's rows while the account is read on a cold load: a name and a line
+ *  under it on the left, the control on the right, as the tabs lay theirs out. */
+function SettingsSkeleton() {
+  const { t } = useTranslation();
+  return (
+    <div className="settings-rows" aria-busy="true">
+      <span className="sr-only">{t('common.loading')}</span>
+      {[30, 22, 36, 26, 32].map((width) => (
+        <div key={width} className="settings-row" aria-hidden="true">
+          <div className="flex-1">
+            <div className="text-[0.8125rem]"><SkeletonBar style={{ width: `${width}%` }} /></div>
+            <div className="mt-0.5 text-xs"><SkeletonBar style={{ width: `${width + 25}%` }} /></div>
+          </div>
+          <SkeletonBar className="h-7 w-28 rounded-md" />
+        </div>
+      ))}
+    </div>
+  );
+}
 
 function Settings() {
   const [searchParams, setSearchParams] = useSearchParams();
@@ -101,21 +123,22 @@ function Settings() {
           </div>
 
           <div className="settings-content">
-            {isLoading && (
-              <div className="flex items-center justify-center py-8">
-                <p className="text-sm" style={{ color: 'var(--color-text-primary)', opacity: 0.7 }}>{t('common.loading')}</p>
-              </div>
-            )}
-
-            {!isLoading && activeTab === 'userInfo' && <UserInfoTab />}
-
-            {!isLoading && activeTab === 'preferences' && <PreferencesTab />}
-
-            {!isLoading && activeTab === 'model' && <ModelTab />}
-
-            {/* Text-heavy tab: cap the measure so descriptions stay readable
-                instead of spanning the full settings container. */}
-            {!isLoading && !isDaltonAuth && activeTab === 'experiments' && <ExperimentsTab />} {/* DALTON-HOOK(hide-experiments) */}
+            {/* Only a cold load waits here: the app shell has usually read
+                both already. The tab takes the placeholder rows' place in a
+                crossfade. */}
+            <SwapCell as="div" swapKey={isLoading ? 'loading' : 'ready'}>
+              {isLoading ? (
+                <SettingsSkeleton />
+              ) : activeTab === 'userInfo' ? (
+                <UserInfoTab />
+              ) : activeTab === 'preferences' ? (
+                <PreferencesTab />
+              ) : activeTab === 'model' ? (
+                <ModelTab />
+              ) : !isDaltonAuth && activeTab === 'experiments' ? ( /* DALTON-HOOK(hide-experiments) */
+                <ExperimentsTab />
+              ) : null}
+            </SwapCell>
           </div>
         </div>
       </div>

@@ -198,6 +198,7 @@ async def probe(
     tunnel_id: Optional[str] = None,
     reclaim: Iterable[str] = (),
     taking_over: Optional[str] = None,
+    known_as: Optional[str] = None,
 ) -> ssh_provider.SSHProbe:
     """Connect to the machine with the user's key and report what is there.
 
@@ -208,6 +209,8 @@ async def probe(
     and a mark there left by one of ``reclaim``, the user's removed computers,
     cleared; one left by ``taking_over`` passes, left for the create to clear. ``tunnel_id`` reaches the machine through its tunnel, where ``host`` is
     only its name and ``port`` its SSH port on the machine itself.
+    ``known_as`` asks whether the machine holds that computer
+    (``knows_computer``).
 
     Raises:
         SSHConnectError: The machine refused, could not be reached, presented
@@ -229,6 +232,7 @@ async def probe(
                 tunnel=tunnel_id,
                 reclaim=frozenset(reclaim),
                 taking_over=taking_over,
+                known_as=known_as,
             )
     except TimeoutError:
         raise SSHConnectError(

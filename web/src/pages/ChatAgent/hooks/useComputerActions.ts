@@ -13,12 +13,22 @@ import { useTranslation } from 'react-i18next';
 
 import { toast } from '@/components/ui/use-toast';
 import { queryKeys } from '@/lib/queryKeys';
-import type { ComputerCreate, ComputerRemoveResponse, ComputersResponse, ResourceTier } from '@/types/api';
+import type {
+  Computer,
+  ComputerCreate,
+  ComputerReconnectTarget,
+  ComputerReinstall,
+  ComputerRemoveResponse,
+  ComputersResponse,
+  ResourceTier,
+} from '@/types/api';
 
 import {
   createComputer,
   deleteComputer,
   makeComputerPrimary,
+  reconnectComputer,
+  reinstallComputer,
   renameComputer,
   setComputerAlwaysOn,
   setComputerFilesBackup,
@@ -38,6 +48,7 @@ import {
   invalidateMachineStorage,
   patchComputerRow,
   patchComputerStatusInCaches,
+  RECONNECT_COMPUTER_MUTATION_KEY,
   removeComputerRow,
 } from './useComputers';
 import { seedWorkspaceMove, watchMove } from './useWorkspaceMove';
@@ -59,6 +70,30 @@ export interface RemoveComputerVariables {
 }
 
 type Translate = ReturnType<typeof useTranslation>['t'];
+
+export interface ReconnectComputerVariables {
+  computerId: string;
+  ssh: ComputerReconnectTarget;
+  /** What the pairing found there: the host key's fingerprint, and whether a helper answered. */
+  fingerprint: string;
+  helper: boolean;
+}
+
+/** The row's `ssh` once it is reached at `target`, ahead of the server's next read of it. */
+function reconnectedSsh(row: Computer, { ssh: target, fingerprint, helper }: ReconnectComputerVariables): Computer['ssh'] {
+  if (!row.ssh) return row.ssh;
+  const tunnel = !!target.tunnel_id;
+  return {
+    ...row.ssh,
+    host: target.host,
+    port: target.port,
+    username: target.username,
+    fingerprint,
+    helper,
+    tunnel,
+    tunnel_connected: tunnel ? true : null,
+  };
+}
 
 /** What became of LangAlpha's files on the machine; undefined when they were not asked to go. */
 function filesRemovalNote(
@@ -289,12 +324,67 @@ export function useComputerActions() {
     },
   });
 
+  // Accepted, the start runs in the background like a lazy one: the 202's
+  // 'starting' arms the status stream, and the failure that sent the user
+  // here is gone from the row, which the server cleared too.
+  const settleRestart = (computerId: string, status: string, patch: Partial<Computer> = {}) => {
+    patchComputerRow(queryClient, computerId, { ...patch, start_failure: null });
+    patchComputerStatusInCaches(queryClient, computerId, status);
+    invalidateMachine(queryClient);
+    invalidateMachineStorage(queryClient, computerId);
+  };
+
+  // A new folder moves every workspace's folder with it, so the workspace
+  // rows re-read along with the machine's.
+  const reinstall = useMutation({
+    mutationFn: ({ computerId, body }: { computerId: string; body: ComputerReinstall }) =>
+      reinstallComputer(computerId, body),
+    onSuccess: async (res, { computerId }) => {
+      await queryClient.cancelQueries({ queryKey: queryKeys.computers.lists() });
+      settleRestart(res.computer_id || computerId, res.status);
+    },
+    onError: () => invalidateMachine(queryClient),
+  });
+
+  // The row takes the new host key before anything else reads it: this Mac
+  // is told apart by that key, and remote control turns itself off once no
+  // row names the helper's. Keyed, so that check waits for this to land.
+  const reconnect = useMutation({
+    mutationKey: RECONNECT_COMPUTER_MUTATION_KEY,
+    mutationFn: ({ computerId, ssh }: ReconnectComputerVariables) => reconnectComputer(computerId, ssh),
+    onSuccess: async (res, vars) => {
+      await queryClient.cancelQueries({ queryKey: queryKeys.computers.lists() });
+      queryClient.setQueriesData<ComputersResponse | undefined>(
+        { queryKey: queryKeys.computers.lists() },
+        (prev) => !prev?.computers ? prev : {
+          ...prev,
+          computers: prev.computers.map((c) =>
+            c.computer_id === vars.computerId ? { ...c, ssh: reconnectedSsh(c, vars) } : c),
+        },
+      );
+      settleRestart(res.computer_id || vars.computerId, res.status);
+    },
+    onError: () => invalidateMachine(queryClient),
+  });
+
   const renameComputerTo = useCallback(
     (computerId: string, name: string) => rename.mutate({ computerId, name }),
     [rename],
   );
 
-  return { power, rename, renameComputerTo, spec, makePrimary, turnOffAlwaysOn, setFilesBackup, create, remove };
+  return {
+    power,
+    rename,
+    renameComputerTo,
+    spec,
+    makePrimary,
+    turnOffAlwaysOn,
+    setFilesBackup,
+    create,
+    remove,
+    reinstall,
+    reconnect,
+  };
 }
 
 /** The workspaces a refused removal had already deleted, which it names. */

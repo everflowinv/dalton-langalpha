@@ -823,10 +823,7 @@ class PTCAgent:
         # a config with no llm gets a strip that removes everything rather than
         # no strip at all, which is the safe direction: without it the read half
         # would keep attaching blocks that nothing removes.
-        multimodal_strip = MultimodalStripMiddleware(
-            model_name=self.config.llm.name if self.config.llm else None,
-            custom_modalities=self.config.input_modalities,
-        )
+        multimodal_strip = MultimodalStripMiddleware.for_config(self.config)
         # Compaction counts only the attachments the strip leaves a model, as
         # it judges them, and a PDF page at what that model's vendor charges,
         # so a target that reads none, or pays little, is not summarized early.
@@ -845,7 +842,7 @@ class PTCAgent:
             notes_rows = NotesOffMiddleware()
         elif compaction is not None:
             main_compaction = compaction.with_scratchpad_notes(scratchpad.notes_dir)
-            notes_rows = NotesDueMiddleware(scratchpad, main_compaction)
+            notes_rows = NotesDueMiddleware(scratchpad, main_compaction, turn.client)
         # Each carry writes a field ``MainAgentState`` declares, so a build
         # without the carry's reader (a notification turn has no switch)
         # trims too.

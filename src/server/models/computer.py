@@ -116,8 +116,26 @@ class ComputerSSHTarget(ComputerSSHAddress):
         return value
 
 
-class ComputerSSHSpec(ComputerSSHTarget):
-    """The SSH machine a new computer runs on, as the probe confirmed it."""
+def normal_root_dir(value: str) -> str:
+    """*value* as the absolute folder a computer works in, or ValueError.
+
+    normpath keeps a leading "//", which would make one folder two to the
+    check that keeps computers out of each other's folders.
+    """
+    if not value.startswith("/") or any(ord(c) < 32 for c in value):
+        raise ValueError("root_dir must be an absolute path")
+    normal = posixpath.normpath("/" + value.lstrip("/"))
+    if normal == "/" or ".." in normal.split("/"):
+        raise ValueError("root_dir must be a folder below /")
+    return normal
+
+
+# computers.root_dir is VARCHAR(255).
+ROOT_DIR_MAX = 255
+
+
+class ComputerSSHPinnedTarget(ComputerSSHTarget):
+    """A machine to log in to with the host key its owner confirmed."""
 
     host_key: str = Field(
         min_length=1,
@@ -127,15 +145,6 @@ class ComputerSSHSpec(ComputerSSHTarget):
             "probe returned and the user confirmed. Any other key is refused."
         ),
     )
-    root_dir: Optional[str] = Field(
-        None,
-        max_length=1024,
-        description=(
-            "Absolute folder the computer works in on the machine; when "
-            "absent, ~/langalpha in the login's home, or the next free "
-            "~/langalpha-N when another of the caller's computers uses it"
-        ),
-    )
     tunnel_id: Optional[str] = Field(
         None,
         pattern=_TUNNEL_ID,
@@ -143,15 +152,6 @@ class ComputerSSHSpec(ComputerSSHTarget):
             "The caller's tunnel the pairing reached the machine through. The "
             "machine is then reached through the gateway: host is only its "
             "name, and port its SSH port on the machine itself"
-        ),
-    )
-    take_over: Optional[str] = Field(
-        None,
-        pattern=MACHINE_ID_PATTERN,
-        description=(
-            "The owner a 409 folder_marked named: that computer, which the "
-            "caller does not have, is cleared from the machine as its removal "
-            "would have, and root_dir taken from it. Its files stay"
         ),
     )
 
@@ -164,19 +164,143 @@ class ComputerSSHSpec(ComputerSSHTarget):
         # The comment carries nothing the pin needs.
         return f"{match.group(1)} {match.group(2)}"
 
+
+class ComputerSSHSpec(ComputerSSHPinnedTarget):
+    """The SSH machine a new computer runs on, as the probe confirmed it."""
+
+    root_dir: Optional[str] = Field(
+        None,
+        max_length=1024,
+        description=(
+            "Absolute folder the computer works in on the machine; when "
+            "absent, ~/langalpha in the login's home, or the next free "
+            "~/langalpha-N when another of the caller's computers uses it"
+        ),
+    )
+    take_over: Optional[str] = Field(
+        None,
+        pattern=MACHINE_ID_PATTERN,
+        description=(
+            "The owner a 409 folder_marked named: that computer, which the "
+            "caller does not have, is cleared from the machine as its removal "
+            "would have, and root_dir taken from it. Its files stay"
+        ),
+    )
+
     @field_validator("root_dir")
     @classmethod
     def _check_root_dir(cls, value: Optional[str]) -> Optional[str]:
         if value is None or value == "":
             return None
-        if not value.startswith("/") or any(ord(c) < 32 for c in value):
-            raise ValueError("root_dir must be an absolute path")
-        # normpath keeps a leading "//", which would make one folder two to
-        # the check that keeps computers out of each other's folders.
-        normal = posixpath.normpath("/" + value.lstrip("/"))
-        if normal == "/" or ".." in normal.split("/"):
-            raise ValueError("root_dir must be a folder below /")
-        return normal
+        return normal_root_dir(value)
+
+
+class ComputerReinstallRequest(BaseModel):
+    """How a reinstall gives the computer a folder it may have."""
+
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    folder: Literal["take_back", "new"] = Field(
+        description=(
+            "take_back clears the computer whose mark is on this computer's "
+            "folder from the machine, as its removal would have, and keeps "
+            "the folder; new moves this computer to root_dir"
+        )
+    )
+    root_dir: Optional[str] = Field(
+        None,
+        max_length=ROOT_DIR_MAX,
+        description=(
+            "With new: the folder to move to, absolute or under ~ (the login's "
+            "home). It must be missing or empty"
+        ),
+    )
+    take_over: Optional[str] = Field(
+        None,
+        pattern=MACHINE_ID_PATTERN,
+        description=(
+            "The computer the caller chose to take the folder from: with "
+            "take_back, the start_failure's owner; with new, the owner a 409 "
+            "folder_marked named for root_dir. That computer, which the caller "
+            "does not have, is cleared from the machine as its removal would "
+            "have. A folder marked by any other refuses with folder_marked"
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _root_dir_with_new(self) -> "ComputerReinstallRequest":
+        if self.folder == "take_back":
+            self.root_dir = None
+            return self
+        value = self.root_dir or ""
+        if value == "~" or value.startswith("~/"):
+            if any(ord(c) < 32 for c in value):
+                raise ValueError("root_dir must be an absolute path")
+            return self
+        if not value:
+            raise ValueError("folder new needs root_dir")
+        self.root_dir = normal_root_dir(value)
+        return self
+
+
+class ComputerSSHReconnectTarget(ComputerSSHPinnedTarget):
+    """The machine as a pairing reached it again."""
+
+    take_over: Optional[str] = Field(
+        None,
+        pattern=MACHINE_ID_PATTERN,
+        description=(
+            "The owner a 409 folder_marked named for this computer's folder. "
+            "The reconnect is saved and that computer, which the caller does "
+            "not have, is then cleared from the machine through the new target"
+        ),
+    )
+    move: bool = Field(
+        False,
+        description=(
+            "After a 409 different_machine: the caller chose to move the "
+            "computer to this machine, which holds nothing of it. Each "
+            "backed-up workspace's files are restored there"
+        ),
+    )
+
+
+class ComputerReconnectRequest(BaseModel):
+    """The machine as a pairing reached it again."""
+
+    ssh: ComputerSSHReconnectTarget = Field(
+        description=(
+            "The ready pairing's target (host, port, username, tunnel_id) "
+            "with its probe's host_key"
+        )
+    )
+
+
+class ComputerSSHProbeRequest(ComputerSSHTarget):
+    """A machine to probe, and the computer it is probed again for."""
+
+    computer_id: Optional[str] = Field(
+        None,
+        max_length=64,
+        description=(
+            "An ssh computer of the caller's whose machine is being reached "
+            "again by hand; the probe then skips the computer limit"
+        ),
+    )
+
+
+class ComputerSSHPairingCreate(BaseModel):
+    """What a pairing is for: a new machine, or one of the caller's computers."""
+
+    computer_id: Optional[str] = Field(
+        None,
+        max_length=64,
+        description=(
+            "An ssh computer of the caller's whose machine is being paired "
+            "again; the pairing then skips the computer limit and suggests "
+            "that computer's folder"
+        ),
+    )
 
 
 class ComputerCreate(BaseModel):
@@ -635,6 +759,35 @@ class ComputerSpecChange(BaseModel):
     )
 
 
+StartFailureRemedy = Literal["reinstall", "reconnect", "retry"]
+
+
+class StartFailure(BaseModel):
+    """Why the computer's last start failed, kept until one succeeds."""
+
+    code: str = Field(
+        description=(
+            "folder_marked (another computer's mark is on the root), an SSH "
+            "connect code (root_dir, not_connected, auth_failed, "
+            "host_key_mismatch, unreachable, timeout, gateway_unreachable, "
+            "unsupported, private_address, host_key_invalid), or start_failed "
+            "for anything else"
+        )
+    )
+    message: str = Field(description="A sentence the client may show as is")
+    owner: Optional[str] = Field(
+        None,
+        description="With folder_marked: the computer the folder's mark names",
+    )
+    remedy: StartFailureRemedy = Field(
+        description=(
+            "What fixes it: reinstall (take the folder back or pick another), "
+            "reconnect (pair the machine again), or retry (start again)"
+        )
+    )
+    at: datetime = Field(description="When the start failed")
+
+
 class ComputerResponse(BaseModel):
     """Response model for computer details."""
 
@@ -716,6 +869,13 @@ class ComputerResponse(BaseModel):
     )
     ssh: Optional[ComputerSSHInfo] = Field(
         None, description="The machine an ssh computer runs on; null for other kinds"
+    )
+    start_failure: Optional[StartFailure] = Field(
+        None,
+        description=(
+            "Why the last start failed; null once a start succeeds or a "
+            "reinstall or reconnect is accepted"
+        ),
     )
 
     model_config = ConfigDict(from_attributes=True)

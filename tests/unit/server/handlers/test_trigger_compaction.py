@@ -251,14 +251,14 @@ async def test_manual_compact_uses_user_compaction_model(base_config):
         ),
         patch("src.llms.llm.LLM.get_model_config", return_value=mock_mc),
     ):
-        await trigger_compaction("thread-1", keep_messages=5, user_id="user-1")
+        await trigger_compaction("thread-1", user_id="user-1")
 
     # Asked of the built agent, on the state the next turn starts from, with
     # the turn's project bound as a run binds it.
     ask.assert_awaited_once_with(
         stub_resolve.graph.agent,
         stub_resolve.state.values,
-        Compact(5),
+        Compact(),
         thread_id="thread-1",
         store=setup.store,
     )
@@ -299,14 +299,13 @@ async def test_an_agent_that_compacts_nothing_falls_back_to_the_summarizer(base_
         patch(ASK, new=ask),
         patch(COMPACT_MESSAGES, new=compact_mock),
     ):
-        result = await trigger_compaction("thread-1", keep_messages=5)
+        result = await trigger_compaction("thread-1")
 
     ask.assert_awaited_once()
     compact_mock.assert_awaited_once()
     args, kwargs = compact_mock.await_args.args, compact_mock.await_args.kwargs
     assert args == (stub_resolve.messages, stub_resolve.state.values, base_config)
     assert kwargs["thread_id"] == "thread-1"
-    assert kwargs["keep_messages"] == 5
     # The summary points at the transcript only once this folder can read it.
     assert kwargs["workspace_id"] == "ws-1"
     assert kwargs["backend"] is None
@@ -332,7 +331,7 @@ async def test_a_view_with_nothing_to_compact_is_a_400(base_config, message):
         patch(ASK, new=_asked(error=ValueError(message))),
         pytest.raises(HTTPException) as refused,
     ):
-        await trigger_compaction("thread-1", keep_messages=5)
+        await trigger_compaction("thread-1")
 
     assert refused.value.status_code == 400
     assert refused.value.detail == message
@@ -367,7 +366,7 @@ async def _compact_on_thread_model(base_config, resolve_stub):
         patch(f"{THREAD_MODEL}.turn_model", new_callable=AsyncMock, side_effect=lambda *a, held, **k: held),
         patch(f"{LLM_HANDLER}.resolve_llm_config", new=_resolve),
     ):
-        await trigger_compaction("thread-1", keep_messages=5, user_id="user-1")
+        await trigger_compaction("thread-1", user_id="user-1")
     ask.assert_awaited_once()
     return asked
 
@@ -424,7 +423,7 @@ async def test_the_compact_resolves_as_the_threads_next_turn(base_config, thread
         patch(f"{THREAD_MODEL}.turn_model", new_callable=AsyncMock, return_value=None),
         patch(f"{LLM_HANDLER}.resolve_llm_config", new=resolve),
     ):
-        await trigger_compaction("thread-1", keep_messages=5, user_id="user-1")
+        await trigger_compaction("thread-1", user_id="user-1")
 
     role = "chief_of_staff" if home else "analyst"
     resolve.assert_awaited_once_with(
@@ -461,7 +460,7 @@ async def test_manual_compact_without_user_id_uses_base_config(base_config):
         patch(f"{LLM_HANDLER}.resolve_llm_config", new=resolve_spy),
         patch(f"{HANDLER}.thread_route", new=route_spy),
     ):
-        await trigger_compaction("thread-1", keep_messages=5)
+        await trigger_compaction("thread-1")
 
     ask.assert_awaited_once()
     cfg = stub_resolve.captured_config
@@ -493,7 +492,7 @@ async def test_resolve_failure_falls_back_to_base_config(base_config):
         ),
         patch(f"{LLM_HANDLER}.resolve_llm_config", new=failing_resolve),
     ):
-        await trigger_compaction("thread-1", keep_messages=5, user_id="user-1")
+        await trigger_compaction("thread-1", user_id="user-1")
 
     # Fell back to base YAML compaction model; did not raise.
     ask.assert_awaited_once()
@@ -533,7 +532,7 @@ async def test_manual_compact_summarizes_with_the_subsidiary_oauth_client(base_c
         ),
         patch(f"{LLM_HANDLER}.resolve_llm_config", new=_resolve_stub),
     ):
-        await trigger_compaction("thread-1", keep_messages=5, user_id="user-1")
+        await trigger_compaction("thread-1", user_id="user-1")
 
     cfg = stub_resolve.captured_config
     assert cfg.llm.compaction == "user-compaction-model"
@@ -569,7 +568,7 @@ async def test_manual_compact_without_a_role_client_runs_the_turns_model():
         patch(f"{HANDLER}._thread_agent", new=stub_resolve),
         patch(ASK, new=_asked()),
     ):
-        await trigger_compaction("thread-1", keep_messages=5)
+        await trigger_compaction("thread-1")
 
     cfg = stub_resolve.captured_config
     model_config = MagicMock()
@@ -608,7 +607,7 @@ async def test_manual_compact_resets_the_token_cache_and_prunes_dead_offloads(ba
         patch(f"{HANDLER}._thread_agent", new=stub_resolve),
         patch(ASK, new=_asked(compaction)),
     ):
-        await trigger_compaction("thread-1", keep_messages=5)
+        await trigger_compaction("thread-1")
 
     update = stub_resolve.graph.aupdate_state.await_args.args[1]
     assert update["_summarization_event"] is compaction.event
@@ -631,7 +630,7 @@ async def test_manual_compact_writes_its_marker_naming_the_summary(base_config):
         patch(f"{HANDLER}._thread_agent", new=stub_resolve),
         patch(ASK, new=_asked()),
     ):
-        result = await trigger_compaction("thread-1", keep_messages=5)
+        result = await trigger_compaction("thread-1")
 
     assert stub_resolve.graph.aupdate_state.await_count == 1
     update = stub_resolve.graph.aupdate_state.await_args.args[1]
@@ -699,7 +698,7 @@ async def _compact_after(base_config, values, reader):
         patch(ASK, new=_asked()),
         patch(READER_GET_INSTANCE, return_value=reader),
     ):
-        await trigger_compaction("thread-1", keep_messages=5)
+        await trigger_compaction("thread-1")
     return stub_resolve.graph.aupdate_state.await_args.args[1]
 
 
@@ -849,7 +848,7 @@ class TestMutationFence:
             ),
         ):
             with pytest.raises(HTTPException) as exc_info:
-                await trigger_compaction("thread-1", keep_messages=5)
+                await trigger_compaction("thread-1")
 
         assert exc_info.value.status_code == 409
         detail = exc_info.value.detail
@@ -918,7 +917,7 @@ class TestMutationFence:
             ),
         ):
             with pytest.raises(HTTPException) as exc_info:
-                await trigger_compaction("thread-1", keep_messages=5)
+                await trigger_compaction("thread-1")
 
         assert exc_info.value.status_code == 503
         assert ask_mock.await_count == 0
@@ -941,7 +940,7 @@ class TestMutationFence:
             patch(ASK, new=ask_mock),
             patch(RUNNER_GET_INSTANCE, return_value=runner),
         ):
-            await trigger_compaction("thread-1", keep_messages=5)
+            await trigger_compaction("thread-1")
 
         assert runner.held == [("thread-1", "compact")]
         assert runner.released == [("thread-1", "compact")]
@@ -1016,7 +1015,7 @@ class TestMutationFence:
             patch(RUNNER_GET_INSTANCE, return_value=runner),
         ):
             with pytest.raises(HTTPException) as exc_info:
-                await trigger_compaction("thread-1", keep_messages=5)
+                await trigger_compaction("thread-1")
 
         assert exc_info.value.status_code == 500
         assert runner.released == [("thread-1", "compact")]
@@ -1047,7 +1046,7 @@ class TestMutationFence:
             patch(RUNNER_GET_INSTANCE, return_value=runner),
         ):
             with pytest.raises(HTTPException) as exc_info:
-                await trigger_compaction("thread-1", keep_messages=5)
+                await trigger_compaction("thread-1")
 
         assert exc_info.value.status_code == 409
         detail = exc_info.value.detail

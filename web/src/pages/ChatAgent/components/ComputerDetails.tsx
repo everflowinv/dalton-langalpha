@@ -27,7 +27,15 @@ import { COMPUTER_NAME_MAX } from './computerName';
 import { MakePrimaryButton } from './MakePrimaryDialog';
 import { providerCanBePrimary, providerManagesSpec } from './providerUi';
 import { ComputerFacts } from './computerFacts';
-import { ComputerNotes, ComputerSpecRows, MachineFrame, PowerButton, SpecRow, type MachineActions } from './computerParts';
+import {
+  ComputerNotes,
+  ComputerSpecRows,
+  MachineFrame,
+  PowerButton,
+  SpecRow,
+  StartFailureAction,
+  type MachineActions,
+} from './computerParts';
 import { railOrdinal } from './computerRailState';
 
 type Translate = ReturnType<typeof useTranslation>['t'];
@@ -86,6 +94,7 @@ function ComputerDetails({ computer, index, total, height, onBack, thisMac, show
           <MachineFrame computer={computer} index={index} thisMac={thisMac} />
           <MachineFacts computer={computer} onChangeSpec={actions.changeSpec} />
           <div className="computer-details-actions">
+            <StartFailureAction computer={computer} actions={actions} />
             <PowerButton computer={computer} actions={actions} />
             {(canBePrimary || !computer.is_primary) && (
               <div className="computer-details-rarer">

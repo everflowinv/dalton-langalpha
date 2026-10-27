@@ -420,6 +420,70 @@ _CLAIM_HOLD = (
 )
 
 
+def knows_computer_script(home: str, computer_id: str, root: str | None) -> str:
+    """Prints 1 when the machine holds *computer_id*: its own folder in the
+    login's home, which every start keeps, or its mark on *root*.
+
+    Either is only ever written by that computer on that machine, so finding
+    one tells a machine paired again from a different one; a host key does
+    not, since reinstalling the system makes a new one.
+    """
+    q = shlex.quote
+    lines = [f"[ -d {q(computer_dir(home, computer_id))} ] && {{ echo 1; exit 0; }}"]
+    if root:
+        lines.append(
+            f"o=; {{ read -r o < {q(root.rstrip('/') + '/' + ROOT_MARKER)}; }} 2>/dev/null; "
+            f'[ "$o" = {q(computer_id)} ] && echo 1'
+        )
+    return "\n".join(lines) + "\nexit 0\n"
+
+
+def claim_root_script(
+    path: str,
+    computer_id: str | None,
+    *,
+    computers: str,
+    cleared: str,
+    forget: Iterable[str] = (),
+) -> str:
+    """Mark *path* as *computer_id*'s root, once *cleared*, the computer that
+    marked it, was cleared from it.
+
+    The cleared computer's mark would otherwise stay until a start marks the
+    folder, and that computer's own uninstall empties a folder its mark names.
+    *forget* are paths under each folder in the root that only vouch for what
+    the cleared computer laid there, such as a restore's marker, removed so
+    they cannot stand for this computer's files.
+
+    Under the claim hold starts take in *computers*, and only over the cleared
+    computer's mark (or none, or the taker's own): a start that took the
+    folder since it was cleared is refused with exit 10 and its id printed,
+    not overwritten. Any other exit is one ``root_dir_error`` words.
+    *computer_id* None, a computer with no id on the machine yet, forgets
+    without marking: its first start marks the folder, which the cleared
+    computer's mark no longer keeps from it.
+    """
+    q = shlex.quote
+    lines = [
+        f"r={q(path.rstrip('/'))}; c={q(computers)}",
+        '[ -d "$r" ] && [ ! -L "$r" ] || exit 0',
+        _CLAIM_HOLD.rstrip("\n"),
+        f'm="$r"/{q(ROOT_MARKER)}; o=; {{ read -r o < "$m"; }} 2>/dev/null',
+        f'[ -z "$o" ] || [ "$o" = {q(cleared)} ] || [ "$o" = {q(computer_id or "")} ] '
+        '|| { printf \'%s\\n\' "$o"; exit 10; }',
+    ]
+    names = [n for n in forget if n]
+    if names:
+        targets = " ".join(f'"$d"/{q(n)}' for n in names)
+        lines.append(
+            'for d in "$r"/*; do [ -d "$d" ] && [ ! -L "$d" ] || continue; '
+            f"rm -f -- {targets}; done"
+        )
+    if computer_id:
+        lines.append(f'printf %s {q(computer_id)} > "$m" || exit 9')
+    return "\n".join(lines) + "\n"
+
+
 def root_dir_script(path: str, *, computers: str, computer_id: str | None) -> str:
     """Exit 0 when *path* is, or can become, this computer's own root folder.
 

@@ -1,6 +1,7 @@
 import { useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useLocale } from '@/hooks/useLocale';
+import { AnimatePresence } from '@/lib/framer';
 import { SwapCell } from '@/components/ui/crossfade';
 import { Wallet } from 'lucide-react';
 import { useDashboardContext } from '../framework/DashboardDataContext';
@@ -20,6 +21,7 @@ import { watchlistQuoteRow } from '../../hooks/useWatchlistData';
 import {
   HoldingsAddButton,
   HoldingsSkeleton,
+  useHoldingsSkeletonRows,
   PortfolioNavSummary,
   PortfolioRowItem,
   WatchlistRowItem,
@@ -217,6 +219,9 @@ function PortfolioWatchlistWidget({
 
   const showWatchlistSkeleton = watchlist.loading && watchlist.rows.length === 0;
   const showPortfolioSkeleton = portfolio.loading && portfolio.rows.length === 0;
+  const showSkeleton = activeTab === 'watchlist' ? showWatchlistSkeleton : showPortfolioSkeleton;
+  const watchlistSkeletonRows = useHoldingsSkeletonRows('watchlist', watchlist.loaded ? watchlist.rows.length : null);
+  const portfolioSkeletonRows = useHoldingsSkeletonRows('portfolio', portfolio.loaded ? portfolio.rows.length : null);
   const hasRealHoldings = portfolio.hasRealHoldings;
 
   const activeCount =
@@ -241,9 +246,11 @@ function PortfolioWatchlistWidget({
               ? t('dashboard.widgets.portfolioWatchlist.headerWatchlist')
               : t('dashboard.widgets.portfolioWatchlist.headerHoldings')}
           </span>
+          {/* Held but unseen while the rows load: a count of 0 that turns into
+              the real one reads as a change, not a load. */}
           <span
             className="title-font text-lg leading-none dashboard-mono"
-            style={{ color: 'var(--color-text-primary)' }}
+            style={{ color: 'var(--color-text-primary)', visibility: showSkeleton ? 'hidden' : undefined }}
           >
             {activeCount}
           </span>
@@ -294,40 +301,42 @@ function PortfolioWatchlistWidget({
       </div>
 
       {/* The tabs dissolve in one grid cell, so a switch never passes through
-          an empty widget. */}
+          an empty widget. A tab the reader picks rises; the skeleton giving way
+          to its rows crossfades, and rows present at first render never enter
+          one by one. */}
       <div ref={contentRef} className="flex-1 min-h-0 overflow-y-auto pr-1">
         <SwapCell
           as="div"
           className="items-start"
-          appear
-          shift={{ y: 10 }}
-          swapKey={activeTab}
+          riseKey={activeTab}
+          swapKey={`${activeTab}:${showSkeleton ? 'loading' : 'ready'}`}
           layerClassName="flex flex-col gap-1"
         >
           {activeTab === 'watchlist' ? (
             <>
               {showWatchlistSkeleton ? (
-                <HoldingsSkeleton count={5} />
+                <HoldingsSkeleton count={watchlistSkeletonRows} />
               ) : (
-                watchlist.rows.map((row, i) => (
-                  <div
-                    key={row.watchlist_item_id ?? row.symbol}
-                    className="row-attach-host relative"
-                  >
-                    <WatchlistRowItem
-                      item={row}
-                      index={i}
-                      marketStatus={dashboard.marketStatus}
-                      onDelete={watchlistHandlers.onDelete}
-                    />
-                    <span className="absolute right-1 top-1/2 -translate-y-1/2">
-                      <RowAttachButton
-                        instanceId={instance.id}
-                        rowId={String(row.watchlist_item_id ?? row.symbol)}
+                <AnimatePresence initial={false}>
+                  {watchlist.rows.map((row) => (
+                    <div
+                      key={row.watchlist_item_id ?? row.symbol}
+                      className="row-attach-host relative"
+                    >
+                      <WatchlistRowItem
+                        item={row}
+                        marketStatus={dashboard.marketStatus}
+                        onDelete={watchlistHandlers.onDelete}
                       />
-                    </span>
-                  </div>
-                ))
+                      <span className="absolute right-1 top-1/2 -translate-y-1/2">
+                        <RowAttachButton
+                          instanceId={instance.id}
+                          rowId={String(row.watchlist_item_id ?? row.symbol)}
+                        />
+                      </span>
+                    </div>
+                  ))}
+                </AnimatePresence>
               )}
               <HoldingsAddButton label={t('dashboard.widgets.portfolioWatchlist.addSymbol')} onClick={watchlistHandlers.onAdd} />
             </>
@@ -342,29 +351,30 @@ function PortfolioWatchlistWidget({
               )}
 
               {showPortfolioSkeleton ? (
-                <HoldingsSkeleton count={3} />
+                <HoldingsSkeleton count={portfolioSkeletonRows} />
               ) : (
-                portfolio.rows.map((row, i) => (
-                  <div
-                    key={row.user_portfolio_id ?? row.symbol}
-                    className="row-attach-host relative"
-                  >
-                    <PortfolioRowItem
-                      item={row}
-                      index={i}
-                      marketStatus={dashboard.marketStatus}
-                      valuesHidden={valuesHidden}
-                      onEdit={portfolioHandlers.onEdit}
-                      onDelete={portfolioHandlers.onDelete}
-                    />
-                    <span className="absolute right-1 top-1/2 -translate-y-1/2">
-                      <RowAttachButton
-                        instanceId={instance.id}
-                        rowId={String(row.user_portfolio_id ?? row.symbol)}
+                <AnimatePresence initial={false}>
+                  {portfolio.rows.map((row) => (
+                    <div
+                      key={row.user_portfolio_id ?? row.symbol}
+                      className="row-attach-host relative"
+                    >
+                      <PortfolioRowItem
+                        item={row}
+                        marketStatus={dashboard.marketStatus}
+                        valuesHidden={valuesHidden}
+                        onEdit={portfolioHandlers.onEdit}
+                        onDelete={portfolioHandlers.onDelete}
                       />
-                    </span>
-                  </div>
-                ))
+                      <span className="absolute right-1 top-1/2 -translate-y-1/2">
+                        <RowAttachButton
+                          instanceId={instance.id}
+                          rowId={String(row.user_portfolio_id ?? row.symbol)}
+                        />
+                      </span>
+                    </div>
+                  ))}
+                </AnimatePresence>
               )}
 
               <HoldingsAddButton label={t('dashboard.widgets.portfolioWatchlist.addTransaction')} onClick={portfolioHandlers.onAdd} />

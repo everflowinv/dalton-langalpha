@@ -1246,3 +1246,33 @@ async def test_the_metrics_half_counts_without_capturing_the_result() -> None:
 
     registry.update_metrics.assert_awaited_once_with("task-tc", "Bash")
     assert _captured_results(registry) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("hidden", [False, True], ids=["the task's call", "a hidden call"])
+async def test_a_call_kept_out_of_the_stream_captures_no_tool_calls(hidden) -> None:
+    """A compaction summary written by the task's model runs as a hidden call;
+    a tool call it returns is never run, so the task's card must not show it."""
+    from langchain_core.messages import AIMessage
+    from langchain_core.runnables.config import var_child_runnable_config
+    from langchain.agents.middleware.types import ModelResponse
+    from langgraph.constants import TAG_NOSTREAM
+
+    registry = _capture_registry()
+    middleware = SubagentEventCaptureMiddleware(registry=registry)
+
+    async def model(_req):
+        return ModelResponse(
+            result=[AIMessage("", tool_calls=[{"name": "Bash", "id": "c1", "args": {}}])]
+        )
+
+    task = current_background_tool_call_id.set("task-tc")
+    tags = var_child_runnable_config.set({"tags": [TAG_NOSTREAM] if hidden else []})
+    try:
+        await middleware.awrap_model_call(MagicMock(), model)
+    finally:
+        var_child_runnable_config.reset(tags)
+        current_background_tool_call_id.reset(task)
+
+    captured = [c.args[1]["event"] for c in registry.append_captured_event.await_args_list]
+    assert captured == ([] if hidden else ["tool_calls"])

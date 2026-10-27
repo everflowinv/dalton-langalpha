@@ -6,6 +6,8 @@
  * 30 s keepalive, same 600 s cap, same terminal set. Two hand-rolled parsers
  * would be two places for a frame shape that changes in one.
  */
+import type { ComputerStartFailure } from '@/types/api';
+
 import { baseURL, getAuthHeaders } from './transport';
 
 /**
@@ -25,10 +27,16 @@ export interface StatusFrame {
   stage?: string;
   /** Why a background start failed, on the `error` frame that ends it. */
   error?: string;
+  /** The row's `start_failure` as that start recorded it, on the same frame. */
+  start_failure?: ComputerStartFailure;
 }
 
 function readString(value: unknown): string | undefined {
   return typeof value === 'string' ? value : undefined;
+}
+
+function readFailure(value: unknown): ComputerStartFailure | undefined {
+  return value && typeof value === 'object' && !Array.isArray(value) ? (value as ComputerStartFailure) : undefined;
 }
 
 /**
@@ -90,6 +98,7 @@ export async function streamStatusEvents(
                 workspace_id: readString(parsed.workspace_id),
                 stage: readString(parsed.stage),
                 error: readString(parsed.error),
+                start_failure: readFailure(parsed.start_failure),
               });
             }
           } catch { /* ignore malformed payload */ }

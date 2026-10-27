@@ -211,6 +211,18 @@ describe('the This Mac option', () => {
     const card = await screen.findByRole('radio', { name: 'This Mac' });
     expect(card).toBeDisabled();
     expect(card).toHaveAccessibleDescription(/Already added/);
+    expect(screen.getByTestId('this-mac-another')).toHaveTextContent(
+      'To add another Mac, get the desktop app on it and open this form there.',
+    );
+  });
+
+  it('offers a second Mac while another Mac is already a computer of this account', async () => {
+    mockGetComputers.mockResolvedValue({ computers: [macRow('SHA256:anotherMac')], total: 1 });
+    open();
+    const card = await screen.findByRole('radio', { name: 'This Mac' });
+    await waitFor(() => expect(card).toBeEnabled());
+    expect(card).not.toHaveAccessibleDescription(/Already added/);
+    expect(screen.queryByTestId('this-mac-another')).not.toBeInTheDocument();
   });
 });
 

@@ -252,7 +252,49 @@ export interface Computer {
   /** The last spec change and how it went. The change runs after its request
    *  has answered, so this row is where its outcome is read. */
   spec_change?: ComputerSpecChange | null;
+  /** Why the last start failed, kept until a start succeeds or a reinstall or
+   *  reconnect is accepted. Absent from an older server. */
+  start_failure?: ComputerStartFailure | null;
 }
+
+/** What fixes a failed start, decided by the server from its code. */
+export type StartFailureRemedy = 'reinstall' | 'reconnect' | 'retry';
+
+export interface ComputerStartFailure {
+  /** `folder_marked`, an SSH connect code (`root_dir`, `not_connected`, ...),
+   *  or `start_failed`. Kept plain: the remedy is what the client acts on. */
+  code: string;
+  /** A user-facing sentence from the server. */
+  message: string;
+  /** On `folder_marked`: the computer whose folder it is, one this account
+   *  does not have. */
+  owner?: string | null;
+  remedy: StartFailureRemedy;
+  at: string;
+}
+
+/** `POST /computers/{id}/reinstall`: keep the folder (taking it back) or move to a new one. */
+export type ComputerReinstall =
+  | {
+      folder: 'take_back';
+      /** The computer the user was shown holding the folder (`start_failure.owner`). */
+      take_over?: string;
+    }
+  | {
+      folder: 'new';
+      root_dir: string;
+      /** The owner a 409 `folder_marked` named for the new folder, which the user chose to take. */
+      take_over?: string;
+    };
+
+/** `POST /computers/{id}/reconnect`: the target a pairing bound to the computer reached. */
+export type ComputerReconnectTarget = SshTarget & {
+  host_key: string;
+  /** The owner a 409 `folder_marked` named for the computer's folder, which the user chose to take back. */
+  take_over?: string;
+  /** After a 409 `different_machine`: the user chose to move the computer to this machine. */
+  move?: boolean;
+};
 
 export type SpecChangeState = 'in_progress' | 'succeeded' | 'failed';
 

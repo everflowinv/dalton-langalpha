@@ -69,7 +69,14 @@ class CompactionConfig(BaseModel):
 
     enabled: bool = True
     token_threshold: int = 120000
-    keep_messages: int = 5
+    #: How much of the newest history a summary keeps word for word, in
+    #: tokens (see ``keep_cutoff``). The same for every preset: a larger tail
+    #: only brings the next summary sooner.
+    keep_tokens: int = 20_000
+    #: The same for a Claude model. Its tokenizer counts about 1.6 times
+    #: the others' for the same text, in every language measured, so this
+    #: keeps about the work ``keep_tokens`` keeps elsewhere.
+    claude_keep_tokens: int = 32_000
     truncate_args_idle_minutes: int | None = 90
     truncate_args_keep_messages: int = 20
     truncate_args_max_length: int = 2000
@@ -86,26 +93,29 @@ class CompactionConfig(BaseModel):
     #: feature gates it when the middleware is built.
     native: bool = True
 
+    #: Whether a model whose provider does not compact the conversation
+    #: writes its own summary, from its cached request, with the transcript
+    #: summarizer as the fallback (see ``CompactionMiddleware._writes_own``).
+    self_summary: bool = True
 
-# Named presets that bundle the two user-facing compaction knobs
-# (token_threshold, keep_messages). Applied at request time in
-# ``resolve_llm_config`` when the user selects a profile, and listed here in
-# ascending order, which the settings pages draw them in.
+
+# Named presets for when a thread compacts (token_threshold). Applied at
+# request time in ``resolve_llm_config`` when the user selects a profile, and
+# listed here in ascending order, which the settings pages draw them in.
 #
 # Thresholds leave headroom under common context windows: 100k-130k for 200k
 # models, 200k for 400k models, 300k-750k for 1M models. ``economy`` stops
 # short of 272k, past which OpenAI bills a whole request at long-context
-# rates. The kept tail scales with the threshold so that later profiles also
-# keep more recent history.
+# rates.
 COMPACTION_PROFILES: dict[str, dict[str, int]] = {
-    "aggressive": {"token_threshold": 100000, "keep_messages": 5},
-    "moderate": {"token_threshold": 130000, "keep_messages": 8},
-    "extended": {"token_threshold": 200000, "keep_messages": 10},
-    "economy": {"token_threshold": 250000, "keep_messages": 12},
-    "relaxed": {"token_threshold": 300000, "keep_messages": 15},
-    "spacious": {"token_threshold": 400000, "keep_messages": 18},
-    "expansive": {"token_threshold": 500000, "keep_messages": 20},
-    "maximal": {"token_threshold": 750000, "keep_messages": 25},
+    "aggressive": {"token_threshold": 100000},
+    "moderate": {"token_threshold": 130000},
+    "extended": {"token_threshold": 200000},
+    "economy": {"token_threshold": 250000},
+    "relaxed": {"token_threshold": 300000},
+    "spacious": {"token_threshold": 400000},
+    "expansive": {"token_threshold": 500000},
+    "maximal": {"token_threshold": 750000},
 }
 
 

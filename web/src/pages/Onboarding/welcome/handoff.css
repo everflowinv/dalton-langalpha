@@ -34,11 +34,10 @@ html[data-handoff] .sidebar {
   view-transition-name: handoff-sidebar;
 }
 
-/* The app's own entrances would run inside the transition's, as a second fade
-   of the content and of the sidebar's rows. Their length goes to nothing
-   rather than their name: a name put back as the flag comes off starts the
-   animation again, where a length put back leaves one long finished alone. */
-html[data-handoff] .route-fade-in,
+/* The sidebar rows' own entrance would run inside the transition's, as a
+   second fade of the rows. Its length goes to nothing rather than its name: a
+   name put back as the flag comes off starts the animation again, where a
+   length put back leaves one long finished alone. */
 html[data-handoff] .sidebar > * {
   animation-duration: 0s;
   animation-delay: 0s;

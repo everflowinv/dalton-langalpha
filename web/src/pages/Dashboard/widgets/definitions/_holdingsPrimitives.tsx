@@ -1,6 +1,8 @@
 import { useMemo } from 'react';
 import { motion } from '@/lib/framer';
-import { staggerDelay, TWEEN } from '@/lib/motion';
+import { SkeletonBar } from '@/components/ui/skeleton';
+import { useLastShape } from '@/lib/lastShape';
+import { TWEEN } from '@/lib/motion';
 import { useTranslation } from 'react-i18next';
 import { useNavigate } from 'react-router';
 import {
@@ -39,12 +41,11 @@ const fmt1 = createFormatter({ minimumFractionDigits: 1, maximumFractionDigits: 
 
 interface WatchlistRowItemProps {
   item: WatchlistRow;
-  index: number;
   marketStatus: MarketStatusData;
   onDelete?: (id: string) => void;
 }
 
-export function WatchlistRowItem({ item, index, marketStatus, onDelete }: WatchlistRowItemProps) {
+export function WatchlistRowItem({ item, marketStatus, onDelete }: WatchlistRowItemProps) {
   const { t } = useTranslation();
   const locale = useLocale();
   const navigate = useNavigate();
@@ -82,7 +83,7 @@ export function WatchlistRowItem({ item, index, marketStatus, onDelete }: Watchl
     <motion.div
       initial={{ opacity: 0, y: 8 }}
       animate={{ opacity: 1, y: 0 }}
-      transition={{ ...TWEEN.quick, delay: staggerDelay(index) }}
+      transition={TWEEN.quick}
       className="flex items-center gap-2 p-3 rounded-xl border border-transparent transition-all cursor-pointer"
       onClick={() => navigate(`/market?symbol=${encodeURIComponent(item.symbol)}`)}
       onMouseEnter={(e) => {
@@ -177,7 +178,6 @@ export function WatchlistRowItem({ item, index, marketStatus, onDelete }: Watchl
 
 interface PortfolioRowItemProps {
   item: PortfolioRow;
-  index: number;
   marketStatus: MarketStatusData;
   valuesHidden: boolean;
   onEdit?: (row: PortfolioRow) => void;
@@ -186,7 +186,6 @@ interface PortfolioRowItemProps {
 
 export function PortfolioRowItem({
   item,
-  index,
   marketStatus,
   valuesHidden,
   onEdit,
@@ -228,7 +227,7 @@ export function PortfolioRowItem({
     <motion.div
       initial={{ opacity: 0, y: 8 }}
       animate={{ opacity: 1, y: 0 }}
-      transition={{ ...TWEEN.quick, delay: staggerDelay(index) }}
+      transition={TWEEN.quick}
       className="flex items-center gap-2 p-3 rounded-xl border border-transparent transition-all cursor-pointer"
       onClick={() => navigate(`/market?symbol=${encodeURIComponent(item.symbol)}`)}
       onMouseEnter={(e) => {
@@ -431,24 +430,36 @@ export function PortfolioNavSummary({ rows, valuesHidden, onToggleHidden }: Port
   );
 }
 
+const SKELETON_ROWS = { watchlist: 5, portfolio: 3 } as const;
+const MAX_SKELETON_ROWS = 10;
+
+/** How many skeleton rows a list should show: as many as it held the last
+ *  time it loaded here, so the card neither grows nor shrinks when the rows
+ *  land. `loadedCount` is null until the list has arrived, so neither a
+ *  skeleton nor a failed read is remembered as the list's size. */
+export function useHoldingsSkeletonRows(list: keyof typeof SKELETON_ROWS, loadedCount: number | null): number {
+  const last = useLastShape(`dashboard:${list}.rows`, loadedCount);
+  return Math.min(last ?? SKELETON_ROWS[list], MAX_SKELETON_ROWS);
+}
+
 interface HoldingsSkeletonProps {
   count: number;
 }
 
+/** Rows built from a loaded row's own box and text lines, so each is as tall
+ *  as the row that replaces it. */
 export function HoldingsSkeleton({ count }: HoldingsSkeletonProps) {
   return (
     <>
       {Array.from({ length: count }).map((_, i) => (
-        <div key={i} className="flex items-center gap-3 p-3 animate-pulse">
-          <div className="flex-1">
-            <div
-              className="h-4 rounded mb-1"
-              style={{ backgroundColor: 'var(--color-border-default)', width: '40%' }}
-            />
-            <div
-              className="h-3 rounded"
-              style={{ backgroundColor: 'var(--color-border-default)', width: '25%' }}
-            />
+        <div key={i} className="flex items-center gap-2 p-3 rounded-xl border border-transparent">
+          <div className="flex-1 min-w-0">
+            <div className="font-bold text-sm">
+              <SkeletonBar style={{ width: '40%' }} />
+            </div>
+            <div className="text-xs">
+              <SkeletonBar style={{ width: '25%' }} />
+            </div>
           </div>
         </div>
       ))}

@@ -23,7 +23,7 @@ import json
 import re
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import asyncssh
@@ -41,7 +41,9 @@ from ptc_agent.core.sandbox.providers._ssh_connect import (
 )
 from ptc_agent.core.sandbox.providers._ssh_shell import (
     SUDO_CHECK,
+    claim_root_script,
     computer_dir,
+    knows_computer_script,
     computers_dir,
     delete_script,
     folder_marked_message,
@@ -221,6 +223,9 @@ class SSHProbe:
     cpu: str = ""
     cores: int | None = None
     memory_bytes: int | None = None
+    # Whether the machine holds the computer the probe was asked about
+    # (``known_as``); False when it was asked about none.
+    knows_computer: bool = False
 
     def machine(self) -> dict[str, Any]:
         """The facts kept on the computer for its details, only those read."""
@@ -244,6 +249,7 @@ async def probe_ssh_target(
     tunnel: str | None = None,
     reclaim: Collection[str] = (),
     taking_over: str | None = None,
+    known_as: str | None = None,
 ) -> SSHProbe:
     """Log in once and report whether the machine can host a computer.
 
@@ -263,6 +269,10 @@ async def probe_ssh_target(
     would have done (see :func:`_check_root`). A mark naming ``taking_over``
     passes the check untouched: that computer is cleared only once its owner's
     create is decided, by :func:`take_over_root`.
+
+    ``known_as``, a computer's id on its machine, sets ``knows_computer``
+    when the machine holds that computer (see :func:`knows_computer_script`),
+    read before any reclaim touches the folder.
 
     ``tunnel`` reaches the machine through the gateway, where ``host`` is only
     its name and ``port`` its sshd's port on the machine.
@@ -290,6 +300,13 @@ async def probe_ssh_target(
             result = _probe_result(
                 line, fingerprint, facts, sftp_ok, helper=answered_by_helper(link.conn)
             )
+            if known_as and result.home:
+                result = replace(
+                    result,
+                    knows_computer=await _knows_computer(
+                        link, result.home, known_as, root_dir, connect_timeout
+                    ),
+                )
             if root_dir and result.supported:
                 # Checked, never made: the create makes it, by the same rule.
                 exit_code, owner = await _check_root(
@@ -322,6 +339,18 @@ async def probe_ssh_target(
     return result
 
 
+async def _knows_computer(
+    link: Link, home: str, computer_id: str, root_dir: str | None, timeout: float
+) -> bool:
+    try:
+        script = knows_computer_script(home, computer_id, root_dir)
+    except SSHConnectError:
+        # A home no computer can live in holds none.
+        return False
+    found = await link.run(script, timeout=timeout)
+    return found.stdout.decode(errors="replace").strip() == "1"
+
+
 async def take_over_root(
     *,
     host: str,
@@ -334,6 +363,8 @@ async def take_over_root(
     connect_timeout: float = 10,
     allow_private_addresses: bool = False,
     tunnel: str | None = None,
+    claim_as: str | None = None,
+    forget: Sequence[str] = (),
 ) -> None:
     """Stop *owner*, the computer whose mark is on *root_dir*, and clear it
     from the folder, for a create its owner chose to take the folder over.
@@ -341,6 +372,11 @@ async def take_over_root(
     Only that step, after the create's own probe already checked the machine,
     so it is short enough to run under the lock the insert holds. A mark
     there of any other computer is refused as the probe refuses it.
+
+    *claim_as*, a computer that already has its id on the machine, marks the
+    folder as its own at once (see :func:`claim_root_script`, which *forget*
+    is passed to); a create's computer marks it at its first start, and so
+    does one with no id yet, whose *forget* still runs.
 
     Raises:
         SSHFolderMarked: Another computer's mark is on the folder now.
@@ -371,6 +407,27 @@ async def take_over_root(
             error = root_dir_error(exit_code, path=root_dir, user=username, host=host)
             if error is not None:
                 raise error
+            if claim_as or forget:
+                # Under the hold starts take: one that took the folder since
+                # it was cleared keeps it, and the take-over is refused.
+                claimed = await link.run(
+                    claim_root_script(
+                        root_dir,
+                        claim_as,
+                        computers=computers_dir(home),
+                        cleared=owner,
+                        forget=forget,
+                    ),
+                    timeout=connect_timeout + 20,
+                )
+                taker = claimed.stdout.decode(errors="replace").strip()
+                if claimed.exit_code == 10 and re.match(MACHINE_ID_PATTERN, taker):
+                    raise SSHFolderMarked(folder_marked_message(root_dir, host), taker)
+                error = root_dir_error(
+                    claimed.exit_code, path=root_dir, user=username, host=host
+                )
+                if error is not None:
+                    raise error
         except TimeoutError:
             raise SSHConnectError(
                 "timeout", f"{host} stopped answering while it was being checked."

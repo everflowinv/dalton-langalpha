@@ -131,7 +131,7 @@ class TestListModelsResponse:
         profiles = body["compaction_profiles"]
         assert list(profiles) == list(COMPACTION_PROFILE_NAMES)
         for preset in profiles.values():
-            assert set(preset) == {"token_threshold", "keep_messages"}
+            assert set(preset) == {"token_threshold"}
         # Thresholds strictly increase in the order the settings pages draw them
         thresholds = [profiles[name]["token_threshold"] for name in COMPACTION_PROFILE_NAMES]
         assert thresholds == sorted(thresholds)

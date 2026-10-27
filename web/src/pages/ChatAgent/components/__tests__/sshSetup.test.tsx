@@ -378,7 +378,7 @@ describe('by hand', () => {
     await user.type(field, 'ssh -p 2222 me@203.0.113.10');
     await user.click(screen.getByRole('button', { name: 'Connect' }));
 
-    expect(mockProbe).toHaveBeenCalledWith({ host: '203.0.113.10', port: 2222, username: 'me' });
+    expect(mockProbe).toHaveBeenCalledWith({ host: '203.0.113.10', port: 2222, username: 'me' }, { computerId: null });
     expect(await screen.findByText("Our key isn't on me@203.0.113.10 yet. Run this there as me, then Connect again:")).toBeInTheDocument();
     expect(await screen.findByText("sh -c 'mkdir -p ~/.ssh && echo key >> ~/.ssh/authorized_keys'")).toBeInTheDocument();
 

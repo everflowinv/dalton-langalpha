@@ -57,12 +57,16 @@
 .automations-tagline {
   margin-top: 6px;
   font-size: 0.875rem;
+  /* One line box for the tagline and the census, so the header keeps its
+     height whichever of the two a loaded page turns out to show. */
+  line-height: 1.3125rem;
   color: var(--color-text-secondary);
 }
 
 .automations-census {
   margin-top: 6px;
   font-size: 0.75rem;
+  line-height: 1.3125rem;
   color: var(--color-text-tertiary);
   white-space: nowrap;
   overflow: hidden;

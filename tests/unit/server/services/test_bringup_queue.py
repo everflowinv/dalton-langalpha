@@ -180,6 +180,11 @@ def _schedule(manager, sandbox, workspace_id: str, *, urgent: bool) -> None:
     manager._queue_bring_up("computer-1", workspace_id, sandbox, ROOT, urgent=urgent)
 
 
+def _holding(manager, sandbox) -> None:
+    """This worker's session on the computer is on ``sandbox``."""
+    manager._machine("computer-1").session = SimpleNamespace(sandbox=sandbox)
+
+
 async def _drain(manager) -> None:
     job = manager._machine("computer-1").bring_up
     if job is not None:
@@ -358,6 +363,7 @@ async def test_a_resumed_sandbox_queues_every_workspace_for_its_sync(
     open looks again; the resume queues them itself, and a workspace whose
     folder is mid-move does not keep the others from theirs."""
     steps.folders["B"] = None
+    _holding(manager, sandbox)
     with patch.object(
         _bringup,
         "get_live_workspace_ids_for_computer",
@@ -366,6 +372,66 @@ async def test_a_resumed_sandbox_queues_every_workspace_for_its_sync(
         await BringUpMixin._queue_reconnect_syncs(manager, "computer-1", sandbox)
     await _drain(manager)
     assert _steps(steps.order) == ["restore:A", "restore:C", "sync:A", "sync:C"]
+
+
+async def test_a_restart_leaves_out_the_workspace_it_opened(steps, manager, sandbox):
+    """That workspace's own start queued it, urgent; queued again after its
+    pass ends, it would run the whole pass a second time."""
+    _holding(manager, sandbox)
+    with patch.object(
+        _bringup,
+        "get_live_workspace_ids_for_computer",
+        AsyncMock(return_value=["A", "B"]),
+    ):
+        await BringUpMixin._queue_reconnect_syncs(
+            manager, "computer-1", sandbox, opened="A"
+        )
+    await _drain(manager)
+    assert _steps(steps.order) == ["restore:B", "sync:B"]
+
+
+async def test_a_listing_that_fails_lets_each_workspace_attach_again_here(
+    manager, sandbox
+):
+    """The start is up by the time it lists, so the failure does not reach
+    it. A workspace this worker still holds attached to the sandbox would
+    skip its next attach, and with it the bring-up nothing else queues."""
+    manager._projects_attached = {
+        ("A", "sandbox-1"): "epoch",
+        ("B", "sandbox-1"): "epoch",
+        ("C", "sandbox-2"): "epoch",
+    }
+    with patch.object(
+        _bringup,
+        "get_live_workspace_ids_for_computer",
+        AsyncMock(side_effect=RuntimeError("pool closed")),
+    ):
+        await BringUpMixin._queue_reconnect_syncs(
+            manager, "computer-1", sandbox, opened="A"
+        )
+    assert manager._machine("computer-1").bring_up is None
+    assert manager._projects_attached == {
+        ("A", "sandbox-1"): "epoch",
+        ("C", "sandbox-2"): "epoch",
+    }
+
+
+async def test_a_sandbox_replaced_during_the_listing_gets_nothing_queued(
+    steps, manager, sandbox
+):
+    """Queued on the old sandbox, the listed workspaces would cancel the
+    replacement's own bring-up and run against a sandbox that is gone."""
+    replacement = SimpleNamespace(runtime=object(), sandbox_id="sandbox-2")
+    _schedule(manager, replacement, "C", urgent=False)
+    _holding(manager, replacement)
+    with patch.object(
+        _bringup,
+        "get_live_workspace_ids_for_computer",
+        AsyncMock(return_value=["A", "B"]),
+    ):
+        await BringUpMixin._queue_reconnect_syncs(manager, "computer-1", sandbox)
+    await _drain(manager)
+    assert _steps(steps.order) == ["restore:C", "sync:C"]
 
 
 async def test_each_restore_reads_the_folder_where_it_is_when_it_runs(

@@ -1305,10 +1305,10 @@ async def restore_deferred(
     The marker is written only when every row came back, and ``done`` says
     the sandbox has it; until then backups keep these rows (see
     DEFERRED_RESTORE_DIRS) and the next bring-up resumes. On a machine its
-    owner brought, a batch whose folder waits on their choice stops the pass
-    (``folder_waits_on_owner``). A lock held past ``lock_wait`` raises
-    WorkspaceSyncBusy with the batches before it kept. ``inventory`` is a
-    probe the caller already took.
+    owner brought, a folder waiting on their choice stops the pass at a batch
+    or, with none, before the marker (``folder_waits_on_owner``). A lock held
+    past ``lock_wait`` raises WorkspaceSyncBusy with the batches before it
+    kept. ``inventory`` is a probe the caller already took.
     """
     from src.server.database.conversation import get_workspace_thread_prefixes
 
@@ -1427,6 +1427,14 @@ async def restore_deferred(
             f"bring-up retries and backups keep their rows until then"
         )
         return result
+    if not batches and not sandbox.recreatable:
+        # No batch asked, and the marker lays the folder again if its owner
+        # took it away.
+        async with workspace_sync_lock(workspace_id, wait=lock_wait) as conn:
+            if await folder_waits_on_owner(
+                workspace_id, sandbox, layout=layout, conn=conn
+            ):
+                return result
     result["done"] = bool(
         await sandbox.aupload_file_bytes(
             layout.join(DEFERRED_MARKER),

@@ -32,9 +32,7 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class Compact:
-    """Summarize all but the newest ``keep_messages`` of the view."""
-
-    keep_messages: int
+    """Summarize all but the tail automatic compaction keeps."""
 
 
 @dataclass(frozen=True)

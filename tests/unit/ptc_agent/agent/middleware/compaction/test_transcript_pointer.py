@@ -63,7 +63,8 @@ def _middleware(monkeypatch, backend) -> CompactionMiddleware:
             counter=len,
         ),
         token_threshold=6,
-        keep_messages=2,
+        keep_tokens=2,
+        self_summary=False,
         backend=backend,
         workspace_id="ws-1",
     )

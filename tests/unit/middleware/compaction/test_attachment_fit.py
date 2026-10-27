@@ -14,7 +14,11 @@ from ptc_agent.agent.middleware.compaction.compact import Compaction
 from ptc_agent.agent.middleware.compaction.middleware import CompactionMiddleware
 from ptc_agent.agent.middleware.compaction.offloading import offload_view
 from ptc_agent.agent.middleware.compaction.summarize import Summary
-from ptc_agent.agent.middleware.compaction.utils import PDF_PAGE_TOKENS, build_summary_message
+from ptc_agent.agent.middleware.compaction.utils import (
+    PDF_PAGE_TOKENS,
+    build_summary_message,
+    find_group_safe_cutoff,
+)
 
 pytestmark = pytest.mark.asyncio
 
@@ -94,13 +98,20 @@ def _middleware(
 
     # Ten tokens a message, so the attachments decide every fit below.
     counter = lambda msgs: 10 * len(list(msgs))  # noqa: E731
-    return CompactionMiddleware(
+    mw = CompactionMiddleware(
         SimpleNamespace(counter=counter, compact=compact),
         token_threshold=threshold,
-        keep_messages=keep,
+        keep_tokens=0,
+        self_summary=False,
         receives=receives,
         page_tokens=page_tokens,
     )
+    # The newest ``keep`` messages stay, whatever their attachments weigh: what
+    # is fitted below is what a summary kept, however it was sized.
+    mw._cutoff = lambda view, model: (
+        find_group_safe_cutoff(view, len(view) - keep) if len(view) > keep else 0
+    )
+    return mw
 
 
 async def _call(

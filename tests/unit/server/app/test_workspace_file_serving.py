@@ -32,6 +32,7 @@ from src.server.app.workspace_files.serve import (
     serve_workspace_file_endpoint,
 )
 from src.server.services import file_grants, pdf_render
+from src.server.services.computer_manager import MachineTarget
 
 WS_ID = "ws-test-0001"
 OWNER = "user-test-1"
@@ -474,7 +475,9 @@ async def test_superseded_handle_uses_db_and_never_wakes_a_sandbox(
     assert resp.status_code == 200
     assert b"from-db" in resp.body
     mgr.get_session_if_ready.assert_called_once_with(
-        WS_ID, expected_sandbox_id="sb-existing"
+        WS_ID,
+        expected_sandbox_id="sb-existing",
+        target=MachineTarget.of_workspace(_workspace("running")),
     )
     mgr.get_session_for_workspace.assert_not_called()
 

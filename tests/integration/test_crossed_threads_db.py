@@ -107,7 +107,7 @@ def _agent(saver, thread_id: str, model, summary, *, threshold: int, asked: list
     compaction = CompactionMiddleware(
         Summarizer(summary, limit=10**9, counter=len),
         token_threshold=threshold,
-        keep_messages=KEEP,
+        keep_tokens=KEEP,
         offload=OFFLOAD,
         backend=_backend(),
         workspace_id="ws-1",
@@ -422,8 +422,9 @@ async def test_a_crossed_thread_trims_and_the_models_are_sent_the_same(saver, tw
     assert "<transcript_citations>" in sent[on][1][0]
     # The delta turns' summary kept the view from Answer 5, so the first turn
     # trims turns 1-4. Its anchor's run then opens the list, which leaves
-    # nothing to cut until the second turn's summary, kept from Answer 7: the
-    # third trims turns 5 and 6.
+    # nothing to cut until the second turn's summary. Its zero threshold
+    # leaves no room for a tail (a third of the threshold at most), so it
+    # keeps only Question 9, and the third trims turns 5 to 8.
     assert head.runs == 4
-    assert asked[on] == [(4, True), (6, True)]
-    assert windows == {on: [4, 4, 6], off: [0, 0, 0]}
+    assert asked[on] == [(4, True), (8, True)]
+    assert windows == {on: [4, 4, 8], off: [0, 0, 0]}

@@ -2,13 +2,13 @@ import { Component as ReactComponent, Suspense, useCallback, useEffect, useMemo,
 import { useTranslation } from 'react-i18next';
 import {
   ResponsiveGridLayout,
-  useContainerWidth,
   type Layout,
   type LayoutItem,
   type ResponsiveLayouts,
 } from 'react-grid-layout';
 import 'react-grid-layout/css/styles.css';
 import { WidgetFrame } from './WidgetFrame';
+import { useGridWidth } from './useGridWidth';
 import { getWidget } from './WidgetRegistry';
 import { reconcileLayouts } from './reconcile';
 import { newWidgetId } from './ids';
@@ -114,7 +114,7 @@ function fromLayout(layout: Layout): RGLItem[] {
 
 export function DashboardGrid({ prefs, editMode, onChange, onOpenSettings }: DashboardGridProps) {
   const [currentBp, setCurrentBp] = useState<BreakpointKey>(prefs.lastBreakpoint ?? 'lg');
-  const { width, containerRef, mounted } = useContainerWidth();
+  const { width, containerRef } = useGridWidth();
 
   const reconciled = useMemo(() => reconcileLayouts(prefs.widgets, prefs.layouts), [prefs.widgets, prefs.layouts]);
   const latestPrefsRef = useRef(prefs);
@@ -456,7 +456,7 @@ export function DashboardGrid({ prefs, editMode, onChange, onOpenSettings }: Das
 
   return (
     <div ref={containerRef} className="widget-grid-container">
-      {mounted && width > 0 && (
+      {width > 0 && (
         <ResponsiveGridLayout
           width={width}
           className={`widget-grid ${editMode ? 'widget-grid--edit' : ''}`}

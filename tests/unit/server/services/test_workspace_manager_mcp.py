@@ -22,12 +22,14 @@ import pytest
 
 from src.server.models.computer import ComputerStatus
 
-from src.server.services.computer_manager import ComputerBinding
+from src.server.services.computer_manager import ComputerBinding, MachineTarget
 from src.server.services.egress.session_binding import RelayBind
 from src.server.services.workspace_manager import WorkspaceManager
 from tests.computer_manager_patch import cm_patch
 from tests.unit.server.mcp_builders import resolved_mcp
 from tests.unit.server.services.conftest import _patch_identity, _patch_machine_bind
+
+_NOT_SSH = MachineTarget(kind="daytona")
 
 
 @pytest.fixture(autouse=True)
@@ -1111,7 +1113,9 @@ class TestAppliedVersionAndProactiveApply:
         """No warm session ⇒ the config isn't loaded anywhere live ⇒ None."""
         wm = WorkspaceManager.get_instance(config=_make_config())
         assert (
-            wm.get_applied_mcp_config_version("ws-x", expected_sandbox_id="sb-1")
+            wm.get_applied_mcp_config_version(
+                "ws-x", expected_sandbox_id="sb-1", target=_NOT_SSH
+            )
             is None
         )
 
@@ -1122,7 +1126,12 @@ class TestAppliedVersionAndProactiveApply:
         wm._put_session(
             "computer-1", _make_session(version=7, summary="s"), workspace_id="ws"
         )
-        assert wm.get_applied_mcp_config_version("ws", expected_sandbox_id="sb-1") == 7
+        assert (
+            wm.get_applied_mcp_config_version(
+                "ws", expected_sandbox_id="sb-1", target=_NOT_SSH
+            )
+            == 7
+        )
 
     def test_applied_version_none_when_session_holds_a_superseded_sandbox(self):
         """The version claims what a LIVE sandbox applied. A session bound to a
@@ -1132,7 +1141,10 @@ class TestAppliedVersionAndProactiveApply:
             "computer-1", _make_session(version=7, summary="s"), workspace_id="ws"
         )
         assert (
-            wm.get_applied_mcp_config_version("ws", expected_sandbox_id="sb-2") is None
+            wm.get_applied_mcp_config_version(
+                "ws", expected_sandbox_id="sb-2", target=_NOT_SSH
+            )
+            is None
         )
 
     @pytest.mark.asyncio
@@ -1851,7 +1863,7 @@ class TestVaultPushPublishesTheOwnersVault:
         sandboxes = {c: MagicMock(name=c) for c in set(computers.values())}
         manager._live_session_computer = MagicMock(side_effect=computers.get)
         manager.get_session_if_ready = MagicMock(
-            side_effect=lambda wid, expected_sandbox_id: (
+            side_effect=lambda wid, expected_sandbox_id, target: (
                 SimpleNamespace(sandbox=sandboxes[computers[wid]])
                 if wid in ready
                 else None
@@ -1948,7 +1960,7 @@ class TestVaultPushPublishesTheOwnersVault:
             )
             manager = McpSecretsMixin()
             manager._live_session_computer = lambda wid: "comp-1"
-            manager.get_session_if_ready = lambda wid, expected_sandbox_id: (
+            manager.get_session_if_ready = lambda wid, expected_sandbox_id, target: (
                 SimpleNamespace(sandbox=sandbox)
             )
             return manager, sandbox

@@ -22,16 +22,17 @@ from starlette.requests import ClientDisconnect
 from ptc_agent.config.core import SSHConfig
 from ptc_agent.core.sandbox.providers.ssh_errors import SSHConnectError
 from src.server.app import computers
-from src.server.database.computer import get_computers_for_user
+from src.server.database.computer import get_computer, get_computers_for_user
 from src.server.dependencies.usage_limits import assert_provider_allowed
 from src.server.models.computer import (
     ComputerSSHAddress,
     ComputerSSHKeyResponse,
+    ComputerSSHPairingCreate,
     ComputerSSHPairingReport,
     ComputerSSHPairingResponse,
     ComputerSSHPairingStatus,
+    ComputerSSHProbeRequest,
     ComputerSSHProbeResponse,
-    ComputerSSHTarget,
     ComputerSSHTunnelRequest,
 )
 from src.server.services import ssh_pairing
@@ -184,18 +185,23 @@ async def get_ssh_key(x_user_id: CurrentUserId):
 
 
 @router.post("/probe", response_model=ComputerSSHProbeResponse)
-async def probe_ssh(request: ComputerSSHTarget, x_user_id: CurrentUserId):
+async def probe_ssh(request: ComputerSSHProbeRequest, x_user_id: CurrentUserId):
     """Log in to a machine with the caller's key and report what is there.
 
     Its host key comes back for the user to confirm; the create pins it. A
     machine that refuses or cannot be reached answers 422 with a ``code`` the
     client words its copy from and a sentence it may show as is; a caller with
-    as many ssh computers as allowed, 409 ``ssh_computer_limit``.
+    as many ssh computers as allowed, 409 ``ssh_computer_limit``, unless
+    ``computer_id`` names the computer the machine is reached again for, as
+    for a bound pairing.
     """
     settings = await _ssh_settings(x_user_id)
+    if request.computer_id is not None:
+        await _repairable_ssh_computer(request.computer_id, x_user_id)
     with _ssh_errors(structured=True):
         # At the cap a dial would only find a machine it cannot add.
-        await check_ssh_capacity(x_user_id, settings)
+        if request.computer_id is None:
+            await check_ssh_capacity(x_user_id, settings)
         await spend_dials(x_user_id, 1, settings=settings)
         found = await probe(
             await client_key(x_user_id),
@@ -217,7 +223,11 @@ async def probe_ssh(request: ComputerSSHTarget, x_user_id: CurrentUserId):
 
 
 @router.post("/pairings", response_model=ComputerSSHPairingResponse, status_code=201)
-async def create_ssh_pairing(request: Request, x_user_id: CurrentUserId):
+async def create_ssh_pairing(
+    request: Request,
+    x_user_id: CurrentUserId,
+    body: Optional[ComputerSSHPairingCreate] = None,
+):
     """A command that adds a machine by being run on it, as the dialog shows it.
 
     It authorizes the caller's key and reports how to reach the machine, which
@@ -225,12 +235,36 @@ async def create_ssh_pairing(request: Request, x_user_id: CurrentUserId):
     needs. It lives 15 minutes, and running it again re-checks the machine.
     A caller with as many ssh computers as allowed is refused with 409
     ``ssh_computer_limit``, before the command puts the key on a machine.
+
+    With ``computer_id``, one of the caller's ssh computers, the command pairs
+    that computer's machine again, for ``POST /{computer_id}/reconnect``: no
+    computer is added, so the limit is not asked, and the ready probe suggests
+    the computer's own folder (404 for no such computer, 400 ``not_ssh``).
     """
     settings = await _ssh_settings(x_user_id)
+    computer_id = body.computer_id if body is not None else None
+    if computer_id is not None:
+        await _repairable_ssh_computer(computer_id, x_user_id)
     with _ssh_errors():
-        await check_ssh_capacity(x_user_id, settings)
+        if computer_id is None:
+            await check_ssh_capacity(x_user_id, settings)
         return await ssh_pairing.create_pairing(
-            x_user_id, request_base=str(request.base_url)
+            x_user_id, request_base=str(request.base_url), computer_id=computer_id
+        )
+
+
+async def _repairable_ssh_computer(computer_id: str, user_id: str) -> None:
+    """Refuse a bound pairing for anything but the caller's own ssh computer."""
+    computer = await get_computer(computer_id)
+    if computer is None or str(computer.get("user_id")) != user_id:
+        raise HTTPException(status_code=404, detail="Computer not found")
+    if computer.get("kind") != SSH_KIND:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "not_ssh",
+                "message": "Only a computer on a machine you brought can be paired again.",
+            },
         )
 
 

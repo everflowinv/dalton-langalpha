@@ -299,6 +299,17 @@ function CreateComputerDialog({ onClose, onSubmit, busy, error, takeOver = null,
           </p>
         )}
 
+        {/* Each Mac pairs itself, from the app running on it. */}
+        {thisMacCard === 'added' && (
+          <p className="-mt-2 text-xs" style={{ color: 'var(--color-text-tertiary)' }} data-testid="this-mac-another">
+            <Trans
+              i18nKey="computer.remoteControl.anotherMacHint"
+              defaults="To add another Mac, <download>get the desktop app</download> on it and open this form there."
+              components={{ download: <DesktopDownloadLink /> }}
+            />
+          </p>
+        )}
+
         {source === 'thisMac' ? (
           <RemoteControlSetup state={mac} account={thisMac.status?.account ?? ''} busy={busy} />
         ) : source === 'ssh' ? (

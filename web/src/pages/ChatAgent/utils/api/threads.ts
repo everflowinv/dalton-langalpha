@@ -243,11 +243,9 @@ export async function updateThreadSharing(threadId: string, body: Record<string,
 // The endpoint path `/summarize` and the `summarizeThread` function name are
 // preserved for REST contract compatibility.
 
-export async function summarizeThread(threadId: string, keepMessages: number = 5) {
+export async function summarizeThread(threadId: string) {
   if (!threadId) throw new Error('Thread ID is required');
-  const { data } = await api.post(`/api/v1/threads/${threadId}/summarize`, null, {
-    params: { keep_messages: keepMessages },
-  });
+  const { data } = await api.post(`/api/v1/threads/${threadId}/summarize`);
   return data;
 }
 

@@ -33,8 +33,12 @@ vi.mock('@/lib/authToken', () => ({
 import { api } from '@/api/client';
 import {
   createComputer,
+  createSshPairing,
   deleteComputer,
   getComputers,
+  probeSsh,
+  reconnectComputer,
+  reinstallComputer,
   setComputerFilesBackup,
   startComputer,
   stopComputer,
@@ -319,6 +323,16 @@ describe('streamComputerEvents', () => {
     expect(onFrame.mock.calls[1][0]).toMatchObject({ status: 'error', error: 'Sandbox image build failed' });
   });
 
+  it('hands over the failure a failed start recorded, as the row keeps it', async () => {
+    const failure = { code: 'folder_marked', message: 'The folder is held.', owner: 'other-1', remedy: 'reinstall', at: '2026-10-26T04:00:00Z' };
+    mockSSEResponse([
+      `event: status\ndata: ${JSON.stringify({ computer_id: 'c1', status: 'error', error: 'The folder is held.', start_failure: failure })}\n\n`,
+    ]);
+    const onFrame = vi.fn();
+    await streamComputerEvents('c1', onFrame, ctrl());
+    expect(onFrame.mock.calls[0][0]).toMatchObject({ status: 'error', start_failure: failure });
+  });
+
   it('stops at the server timeout event', async () => {
     mockSSEResponse([
       'event: status\ndata: {"computer_id": "c1", "status": "starting"}\n\n',
@@ -340,5 +354,54 @@ describe('streamComputerEvents', () => {
     global.fetch = fetchMock as unknown as typeof fetch;
     await streamComputerEvents('', vi.fn(), ctrl());
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('fixing a failed start', () => {
+  beforeEach(() => mockPost.mockClear());
+
+  it('asks a reinstall to take the folder back', async () => {
+    mockPost.mockResolvedValueOnce({ data: { computer_id: 'c1', status: 'starting' } });
+    const res = await reinstallComputer('c1', { folder: 'take_back' });
+    expect(mockPost).toHaveBeenCalledWith(
+      '/api/v1/computers/c1/reinstall',
+      { folder: 'take_back' },
+      expect.objectContaining({ timeout: expect.any(Number) }),
+    );
+    expect(res).toEqual({ computer_id: 'c1', status: 'starting' });
+  });
+
+  it('asks a reinstall for a new folder, as typed', async () => {
+    mockPost.mockResolvedValueOnce({ data: { computer_id: 'c1', status: 'starting' } });
+    await reinstallComputer('c1', { folder: 'new', root_dir: '~/langalpha-2' });
+    expect(mockPost.mock.calls[0][1]).toEqual({ folder: 'new', root_dir: '~/langalpha-2' });
+  });
+
+  it('sends a reconnect the target the pairing reached, under ssh', async () => {
+    mockPost.mockResolvedValueOnce({ data: { computer_id: 'c1', status: 'starting' } });
+    const ssh = { host: 'box', port: 22, username: 'dev', tunnel_id: 'tun-1', host_key: 'ssh-ed25519 AAAA' };
+    await reconnectComputer('c1', ssh);
+    expect(mockPost).toHaveBeenCalledWith(
+      '/api/v1/computers/c1/reconnect',
+      { ssh },
+      expect.objectContaining({ timeout: expect.any(Number) }),
+    );
+  });
+
+  it('mints a pairing for a computer with its id, and a new machine with no body', async () => {
+    mockPost.mockResolvedValue({ data: { token: 't' } });
+    await createSshPairing({ computerId: 'c1' });
+    expect(mockPost).toHaveBeenLastCalledWith('/api/v1/computers/ssh/pairings', { computer_id: 'c1' });
+    await createSshPairing();
+    expect(mockPost).toHaveBeenLastCalledWith('/api/v1/computers/ssh/pairings');
+  });
+
+  it('probes a machine reached again by hand with the computer it is for', async () => {
+    mockPost.mockResolvedValue({ data: {} });
+    const target = { host: 'box', port: 22, username: 'dev' };
+    await probeSsh(target, { computerId: 'c1' });
+    expect(mockPost.mock.calls.at(-1)?.[1]).toEqual({ ...target, computer_id: 'c1' });
+    await probeSsh(target);
+    expect(mockPost.mock.calls.at(-1)?.[1]).toEqual(target);
   });
 });

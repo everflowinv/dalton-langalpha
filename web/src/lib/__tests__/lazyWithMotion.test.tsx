@@ -1,7 +1,7 @@
 import { Suspense } from 'react';
 import { describe, expect, it, vi } from 'vitest';
 import { act, render, screen } from '@testing-library/react';
-import { lazyWithMotion } from '../lazyWithMotion';
+import { lazyWithMotion, preloadableLazy } from '../lazyWithMotion';
 
 const Page = () => <span>page</span>;
 
@@ -13,9 +13,12 @@ function mount(Component: React.ComponentType) {
   );
 }
 
-describe('lazyWithMotion', () => {
+describe.each([
+  ['lazyWithMotion', lazyWithMotion],
+  ['preloadableLazy', preloadableLazy],
+] as const)('%s', (_name, lazyLoad) => {
   it('suspends on a first render nothing loaded ahead', async () => {
-    const Lazy = lazyWithMotion(() => Promise.resolve({ default: Page }));
+    const Lazy = lazyLoad(() => Promise.resolve({ default: Page }));
     mount(Lazy);
     expect(screen.getByText('fallback')).toBeInTheDocument();
     expect(await screen.findByText('page')).toBeInTheDocument();
@@ -23,7 +26,7 @@ describe('lazyWithMotion', () => {
 
   it('renders at once, with no fallback, once preloaded', async () => {
     const load = vi.fn(() => Promise.resolve({ default: Page }));
-    const Lazy = lazyWithMotion(load);
+    const Lazy = lazyLoad(load);
     await Lazy.preload();
     act(() => {
       mount(Lazy);
@@ -39,7 +42,7 @@ describe('lazyWithMotion', () => {
       .fn<() => Promise<{ default: typeof Page }>>()
       .mockRejectedValueOnce(new Error('chunk gone'))
       .mockResolvedValue({ default: Page });
-    const Lazy = lazyWithMotion(load);
+    const Lazy = lazyLoad(load);
     await expect(Lazy.preload()).rejects.toThrow('chunk gone');
     mount(Lazy);
     expect(await screen.findByText('page')).toBeInTheDocument();

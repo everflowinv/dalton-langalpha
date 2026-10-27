@@ -23,6 +23,7 @@ from src.server.services.computer_manager._mcp import McpSecretsMixin
 from src.server.services.computer_manager._move import WorkspaceMoveMixin
 from src.server.services.computer_manager._providers import ProviderMixin
 from src.server.services.computer_manager._provisioning import ProvisioningMixin
+from src.server.services.computer_manager._repair import ComputerRepairMixin
 from src.server.services.computer_manager._retirement import RetirementMixin
 from src.server.services.computer_manager._sessions import SessionCacheMixin
 from src.server.services.computer_manager._spec import ComputerSpecMixin
@@ -44,6 +45,7 @@ class ComputerManager(
     MachineLifecycleMixin,
     RetirementMixin,
     ComputerSpecMixin,
+    ComputerRepairMixin,
     WorkspaceMoveMixin,
     WorkspaceEntitlementsMixin,
     UsageMixin,

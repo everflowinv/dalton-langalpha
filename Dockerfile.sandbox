@@ -41,7 +41,10 @@ RUN echo 'debconf debconf/frontend select Noninteractive' | debconf-set-selectio
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates curl ripgrep jq git unzip gcc \
-        poppler-utils pandoc qpdf fuse3 \
+        # DALTON-HOOK(sandbox-pdf-deps): poppler-data ships the Adobe-CNS1 CMaps
+        # pdftotext needs for Chinese PDFs, and `file` the type probe the wiki
+        # ingest and PDF handlers shell out to; both absent from upstream's list.
+        poppler-utils poppler-data file pandoc qpdf fuse3 \
         libreoffice-writer libreoffice-calc libreoffice-impress libreoffice-draw \
         fonts-noto-cjk fonts-dejavu-core fonts-opensymbol \
     # -- uv (Python package manager) — relocate BOTH uv and uvx; the MCP

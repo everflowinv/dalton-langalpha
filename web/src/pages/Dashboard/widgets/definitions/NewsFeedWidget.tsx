@@ -1,7 +1,5 @@
 import { useEffect, useEffectEvent, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { motion } from '@/lib/framer';
-import { staggerDelay, TWEEN } from '@/lib/motion';
 import { Newspaper, Clock, Search, X } from 'lucide-react';
 import { Loader } from '@/components/ui/loader';
 import { SwapCell } from '@/components/ui/crossfade';
@@ -60,11 +58,9 @@ interface NewsItem {
 
 function NewsRow({
   item,
-  idx,
   onClick,
 }: {
   item: NewsItem;
-  idx: number;
   onClick: () => void;
 }) {
   const locale = useLocale();
@@ -74,10 +70,7 @@ function NewsRow({
   const tickers = (item.tickers?.length ?? 0) > 0 ? item.tickers! : null;
 
   return (
-    <motion.div
-      initial={{ opacity: 0, y: 8 }}
-      animate={{ opacity: 1, y: 0 }}
-      transition={{ ...TWEEN.quick, delay: staggerDelay(idx) }}
+    <div
       onClick={onClick}
       className="group flex items-start gap-3 px-2 py-2.5 rounded-md border border-transparent transition-colors cursor-pointer"
       onMouseEnter={(e) => {
@@ -162,7 +155,7 @@ function NewsRow({
           </div>
         ) : null}
       </div>
-    </motion.div>
+    </div>
   );
 }
 
@@ -259,6 +252,7 @@ function NewsFeedWidget({ instance, updateConfig }: WidgetRenderProps<NewsFeedCo
     }
     return result;
   }, [items, tickerFilter, sourceFilter, dateRange, now]);
+  const showSkeleton = loading && filteredItems.length === 0;
 
   // Snapshot exporter: full = visible filtered list, rows = single headline.
   useWidgetContextExport(instance.id, {
@@ -328,9 +322,11 @@ function NewsFeedWidget({ instance, updateConfig }: WidgetRenderProps<NewsFeedCo
           >
             {t('dashboard.widgets.newsFeed.header', { label: t(SOURCE_KEY[activeTab]) })}
           </span>
+          {/* Held but unseen while the feed loads: a count of 0 that turns into
+              the real one reads as a change, not a load. */}
           <span
             className="title-font text-lg leading-none dashboard-mono"
-            style={{ color: 'var(--color-text-primary)' }}
+            style={{ color: 'var(--color-text-primary)', visibility: showSkeleton ? 'hidden' : undefined }}
           >
             {items.length}
           </span>
@@ -461,16 +457,16 @@ function NewsFeedWidget({ instance, updateConfig }: WidgetRenderProps<NewsFeedCo
 
       <div ref={scrollRef} className="flex-1 min-h-0 overflow-y-auto -mx-1 px-1">
         {/* The tabs dissolve in one grid cell, so a switch never passes through
-            an empty feed. */}
+            an empty feed. A tab the reader picks rises; the skeleton giving way
+            to its rows crossfades, and rows never enter one by one. */}
         <SwapCell
           as="div"
           className="items-start"
-          appear
-          shift={{ y: 6 }}
-          swapKey={activeTab}
+          riseKey={activeTab}
+          swapKey={`${activeTab}:${showSkeleton ? 'loading' : 'ready'}`}
           layerClassName="flex flex-col gap-0.5"
         >
-          {loading && filteredItems.length === 0 ? (
+          {showSkeleton ? (
             Array.from({ length: 5 }).map((_, i) => (
               <div key={i} className="flex items-start gap-3 p-2 animate-pulse">
                 <div
@@ -520,7 +516,6 @@ function NewsFeedWidget({ instance, updateConfig }: WidgetRenderProps<NewsFeedCo
                 >
                   <NewsRow
                     item={item}
-                    idx={idx}
                     onClick={() => {
                       if (item.id != null) {
                         modals.openNews(item.id, {

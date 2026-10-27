@@ -1,5 +1,6 @@
 import { useState, useEffect, useMemo, useRef } from 'react';
-import { Loader } from '@/components/ui/loader';
+import { SwapCell } from '@/components/ui/crossfade';
+import { useLastShape } from '@/lib/lastShape';
 import { useParams } from 'react-router';
 import { useTranslation } from 'react-i18next';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
@@ -38,9 +39,9 @@ import {
 } from './workspaceGallery/GalleryToolbar';
 import { ChiefOfStaffCard } from './workspaceGallery/ChiefOfStaffCard';
 import { CardGrid } from './workspaceGallery/CardGrid';
-import { GALLERY_COLUMN, GALLERY_FRAME, GALLERY_PAGE } from './workspaceGallery/layout';
+import { GALLERY_COLUMN, GALLERY_FRAME, GALLERY_GRID, GALLERY_PAGE } from './workspaceGallery/layout';
 import { useGalleryReorder } from './workspaceGallery/useGalleryReorder';
-import { WorkspaceCard } from './workspaceGallery/WorkspaceCard';
+import { WorkspaceCard, WorkspaceCardSkeleton } from './workspaceGallery/WorkspaceCard';
 import type { WorkspaceRecord } from './workspaceGallery/types';
 
 /**
@@ -49,6 +50,11 @@ import type { WorkspaceRecord } from './workspaceGallery/types';
  * forgets on reload.
  */
 const SORT_KEY = 'workspaceGallery.sort';
+
+/** Placeholder cards while the list is read, before this device has seen it:
+ *  two rows at a laptop's width. After that, as many as it last held. */
+const SKELETON_CARDS = 6;
+const MAX_SKELETON_CARDS = 12;
 
 const readSort = (): GallerySort => {
   const stored = safeLocalStorage.getItem(SORT_KEY);
@@ -97,15 +103,17 @@ function WorkspaceGallery({ onWorkspaceSelect, prefetchThreads }: WorkspaceGalle
   });
 
   // Every workspace, one scrolled list: search and the computer filter both
-  // narrow it here, so neither needs a query of its own. Waits for Home, which
-  // the first read may have to create.
+  // narrow it here, so neither needs a query of its own. Read beside Home, not
+  // after it: the list only reads, and when the first Home read is the one
+  // that creates it, the list has no row for it yet and the Home query's row
+  // stands in (homeRow below).
   const {
     data: wsData,
     isLoading: isWsLoading,
     error: wsError,
     isFetching: isWsFetching,
     isPlaceholderData,
-  } = useAllWorkspaces({ sortBy, includeHome: true, enabled: !isHomeLoading });
+  } = useAllWorkspaces({ sortBy, includeHome: true });
   const reorder = useGalleryReorder();
 
   // The machines behind the cards. The status fan-out itself is mounted at the
@@ -137,12 +145,6 @@ function WorkspaceGallery({ onWorkspaceSelect, prefetchThreads }: WorkspaceGalle
   useEffect(() => {
     clearChatSession();
   }, []);
-
-  // The cards rise in once, when the gallery first shows them; the first
-  // entrance to finish ends that. A card a search or a filter brings back
-  // later just appears: replaying the staggered entrance there leaves holes in
-  // the grid until the late ones arrive.
-  const [introduced, setIntroduced] = useState(false);
 
   const scrollToTop = () => {
     for (const el of [pageRef.current, scrollRef.current]) el?.scrollTo?.({ top: 0, behavior: 'smooth' });
@@ -201,6 +203,12 @@ function WorkspaceGallery({ onWorkspaceSelect, prefetchThreads }: WorkspaceGalle
   const homeRow = rows.find((ws) => isHomeWorkspace(ws)) ?? (homeWs as WorkspaceRecord | null | undefined) ?? null;
   const userRows = rows.filter((ws) => !isHomeWorkspace(ws));
   const hasUserWorkspaces = userRows.length > 0;
+  // The list's shape last time here: that many placeholders, and a list that
+  // was empty is drawn empty from the first frame rather than as a grid with a
+  // toolbar that both go when the list arrives. Only a list that arrived
+  // counts: a failed read is not an empty one.
+  const lastCount = useLastShape('gallery.workspaces', wsData ? userRows.length : null);
+  const showSkeleton = isWsLoading && lastCount !== 0;
 
   // Server handles sort order; the client only narrows by search and machine
   // and enforces the ordering rule shared with the nav tree: the pinned block
@@ -213,7 +221,9 @@ function WorkspaceGallery({ onWorkspaceSelect, prefetchThreads }: WorkspaceGalle
   // A search is for workspaces: the Chief of Staff steps aside while one runs,
   // rather than stand over the results as if it were one. With no workspaces
   // left there is no search box to clear a query, so it comes back.
-  const showChief = !!homeRow && (!query || !hasUserWorkspaces);
+  // While Home is read the card stands without it rather than arrive later
+  // and push the grid down.
+  const showChief = (!!homeRow || isHomeLoading) && (!query || !hasUserWorkspaces);
   const primary = computers.find((c) => c.is_primary) ?? null;
   // The machine Home is on: the primary, except while a make-primary is
   // still moving it there.
@@ -252,27 +262,6 @@ function WorkspaceGallery({ onWorkspaceSelect, prefetchThreads }: WorkspaceGalle
   const canDrag = sortBy === 'custom' && !query && activeFilter === ALL_COMPUTERS;
   const refreshing = sortBy === 'custom' && (isWsFetching || isPlaceholderData);
 
-  if (isWsLoading || isHomeLoading) {
-    return (
-      // A branch that replaces the whole route replaces its top bar too, so it
-      // owes the window a titlebar of its own -- otherwise the column beside the
-      // sidebar stops moving the window for as long as the fetch is in flight.
-      <div className="h-full flex flex-col">
-        <div className="chrome-drag-strip" aria-hidden="true" />
-        <div className="flex-1 min-h-0 flex items-center justify-center">
-          <div className="flex flex-col items-center gap-4">
-            <span aria-hidden="true" className="shrink-0">
-              <Loader size={32} className="text-(--color-accent-primary)" />
-            </span>
-            <p className="text-sm" style={{ color: 'var(--color-text-tertiary)' }}>
-              {t('workspace.loadingWorkspaces')}
-            </p>
-          </div>
-        </div>
-      </div>
-    );
-  }
-
   // A failed refetch keeps the list it had: the full-screen error is only for
   // a gallery with nothing to show.
   if (wsError && !wsData) {
@@ -304,9 +293,7 @@ function WorkspaceGallery({ onWorkspaceSelect, prefetchThreads }: WorkspaceGalle
     // A user with nothing but Home is welcomed, not shown a search box.
     if (!hasUserWorkspaces) {
       return (
-        <div className={introduced ? undefined : 'enter-fade-up'}>
-          <GalleryEmptyState isFiltered={false} onNewWorkspace={() => setIsModalOpen(true)} />
-        </div>
+        <GalleryEmptyState isFiltered={false} onNewWorkspace={() => setIsModalOpen(true)} />
       );
     }
     if (visibleWorkspaces.length === 0) {
@@ -329,7 +316,7 @@ function WorkspaceGallery({ onWorkspaceSelect, prefetchThreads }: WorkspaceGalle
         refreshing={refreshing}
         onMove={reorder.drop}
         label={label}
-        renderCard={(workspace, index, drag) => {
+        renderCard={(workspace, _index, drag) => {
           const computer = machineOf(workspace);
           return (
             <WorkspaceCard
@@ -337,8 +324,6 @@ function WorkspaceGallery({ onWorkspaceSelect, prefetchThreads }: WorkspaceGalle
               computer={computer}
               isThisMac={!!computer && isThisMac(computer)}
               now={now}
-              index={index}
-              entrance={!introduced}
               drag={drag}
               onSelect={onWorkspaceSelect}
               onTogglePin={handleTogglePin}
@@ -372,7 +357,7 @@ function WorkspaceGallery({ onWorkspaceSelect, prefetchThreads }: WorkspaceGalle
         <div className={`shrink-0 md:overflow-hidden ${GALLERY_FRAME}`}>
           {/* Header (desktop only) */}
           <header
-            className={`hidden md:flex items-start pb-2 enter-fade-up ${GALLERY_COLUMN}`}
+            className={`hidden md:flex items-start pb-2 ${GALLERY_COLUMN}`}
             style={{ paddingTop: 'calc(var(--page-top) - 4px)' }}
           >
             <div className="flex w-full items-center justify-between gap-4" style={{ minHeight: 36 }}>
@@ -399,11 +384,13 @@ function WorkspaceGallery({ onWorkspaceSelect, prefetchThreads }: WorkspaceGalle
               </div>
             )}
 
-            {/* With no workspaces yet only the computer control shows, the
-                page's one way to the computers, once the list is read. */}
-            {(hasUserWorkspaces || computerControl) && (
-              <div className="pb-3 enter-fade-up enter-fade-up-d1">
-                {hasUserWorkspaces ? (
+            {/* Drawn while the list is read too, unless it was empty last time
+                here: it goes only for a list that turns out to have none. With
+                no workspaces only the computer control shows, the page's one
+                way to the computers, once the list is read. */}
+            {(hasUserWorkspaces || showSkeleton || computerControl) && (
+              <div className="pb-3">
+                {hasUserWorkspaces || showSkeleton ? (
                   <GalleryToolbar
                     search={searchQuery}
                     onSearchChange={setSearchQuery}
@@ -428,19 +415,17 @@ function WorkspaceGallery({ onWorkspaceSelect, prefetchThreads }: WorkspaceGalle
             toolbar's gap gives up, so the first row is not clipped. */}
         <div
           ref={scrollRef}
-          onAnimationEnd={introduced ? undefined : () => setIntroduced(true)}
           className={`pt-1 pb-8 md:flex-1 md:min-h-0 md:overflow-y-auto ${GALLERY_FRAME}`}
           data-testid="workspace-grid"
         >
           <div className={GALLERY_COLUMN}>
-            {showChief && homeRow && (
+            {showChief && (
               <ChiefOfStaffCard
                 workspace={homeRow}
                 computer={homeComputer}
                 isThisMac={!!homeComputer && isThisMac(homeComputer)}
                 onOpenComputer={(computerId) => openComputersPanel({ view: 'list', computerId })}
                 now={now}
-                entrance={!introduced}
                 onOpenThreads={onWorkspaceSelect}
                 prefetchThreads={prefetchThreads}
               />
@@ -453,7 +438,17 @@ function WorkspaceGallery({ onWorkspaceSelect, prefetchThreads }: WorkspaceGalle
                   {hasUserWorkspaces ? `${t('workspace.workspaces')} · ${visibleWorkspaces.length}` : t('workspace.workspaces')}
                 </Kicker>
               )}
-              {renderList()}
+              {/* The cards take the placeholders' places in one crossfade. */}
+              <SwapCell as="div" swapKey={showSkeleton ? 'loading' : 'list'}>
+                {showSkeleton ? (
+                  <div className={GALLERY_GRID} aria-busy="true">
+                    <span className="sr-only">{t('workspace.loadingWorkspaces')}</span>
+                    {Array.from({ length: Math.min(lastCount ?? SKELETON_CARDS, MAX_SKELETON_CARDS) }, (_, i) => <WorkspaceCardSkeleton key={i} index={i} />)}
+                  </div>
+                ) : (
+                  renderList()
+                )}
+              </SwapCell>
             </div>
           </div>
         </div>

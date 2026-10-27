@@ -3,6 +3,7 @@
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
+const { execFileSync } = require('node:child_process')
 const { randomBytes } = require('node:crypto')
 const { app, dialog, shell, ipcMain } = require('electron')
 
@@ -75,6 +76,35 @@ function helperDir() {
 function bundledPlist() {
   if (!app.isPackaged || !process.resourcesPath) return null
   return path.join(process.resourcesPath, '..', 'Library', 'LaunchAgents', SERVICE_NAME)
+}
+
+/**
+ * This Mac's hardware UUID, the one the helper writes to D/machine when it
+ * makes its keys; null where it cannot be read.
+ */
+function thisMachine() {
+  try {
+    const shown = execFileSync('/usr/sbin/ioreg', ['-rd1', '-c', 'IOPlatformExpertDevice'], { encoding: 'utf8', timeout: 5000 })
+    return /"IOPlatformUUID" = "([^"]+)"/.exec(shown)?.[1] ?? null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Whether D was made on this Mac. One Migration Assistant or a restore carried
+ * over from another Mac still holds that Mac's pairing and keys, which the
+ * helper drops as it next starts; until then its state is the other Mac's, and
+ * read as this one's it would call that Mac's computer this Mac. A folder that
+ * names no machine was made by a helper from before it wrote one.
+ */
+function madeHere(dir, machine) {
+  if (!machine) return true
+  try {
+    return fs.readFileSync(path.join(dir, 'machine'), 'utf8').trim() === machine
+  } catch (err) {
+    return err.code === 'ENOENT'
+  }
 }
 
 function readState(dir) {
@@ -213,9 +243,9 @@ function unsupported(dir, reason) {
  * The remote-control half of the shell for one helper folder.
  *
  * The options are the parts of this machine a test has to stand in for: the
- * folder, the OS, the bundle, and how long to wait. Everything else goes
- * through Electron. `onMenuChange` is called when what the app menu shows for
- * remote control has changed, and only then.
+ * folder, the OS, the bundle, this Mac's hardware UUID, and how long to wait.
+ * Everything else goes through Electron. `onMenuChange` is called when what the
+ * app menu shows for remote control has changed, and only then.
  */
 function createRemoteControl({
   dir = helperDir(),
@@ -224,9 +254,11 @@ function createRemoteControl({
   agentPlist = bundledPlist(),
   timing = TIMING,
   onMenuChange = () => {},
+  machine,
 } = {}) {
   const reason = unsupportedReason({ platform, systemVersion, packaged: !!agentPlist && fs.existsSync(agentPlist) })
   if (reason) return unsupported(dir, reason)
+  if (machine === undefined) machine = thisMachine()
 
   // Replaced by every enable the user agreed to and every disable, so a wait
   // still running stands down once a newer call has replaced its file or D has
@@ -264,7 +296,10 @@ function createRemoteControl({
     }
   }
 
-  const status = () => ({ ...toStatus(service(), readState(dir), isRunning), account: account() })
+  // D's state, none while D is another Mac's.
+  const stateOf = () => (madeHere(dir, machine) ? readState(dir) : null)
+
+  const status = () => ({ ...toStatus(service(), stateOf(), isRunning), account: account() })
 
   const failure = (error, message) => ({ ok: false, error, ...(message ? { message } : {}), status: status() })
 
@@ -304,7 +339,7 @@ function createRemoteControl({
    * folder whole, so what is left is the pairing it had rather than half of one.
    */
   async function teardown(signal) {
-    const pid = pidOf(readState(dir))
+    const pid = pidOf(stateOf())
     if (service() !== 'off') {
       if (!setLoginItem(false) || service() !== 'off') {
         console.error('[remote] the login item did not unregister')
@@ -313,7 +348,7 @@ function createRemoteControl({
       // launchd stops the helper when the item goes. Deleting D under a helper
       // still on its way out would race it writing `state` back, and `stopped`
       // is the last thing it writes, so either that or its exit ends the wait.
-      if (pid) await waitFor(() => !isRunning(pid) || readState(dir)?.state === 'stopped', timing.exit, signal)
+      if (pid) await waitFor(() => !isRunning(pid) || stateOf()?.state === 'stopped', timing.exit, signal)
     }
     if (signal.aborted) return { unregistered: true, removed: false }
     try {
@@ -334,7 +369,7 @@ function createRemoteControl({
   async function waitForPairing(id, signal) {
     const deadline = Date.now() + timing.pair
     const ours = () => {
-      const state = readState(dir)
+      const state = stateOf()
       return state?.pairing_id === id ? state : undefined
     }
     const ended = () => {
@@ -383,7 +418,7 @@ function createRemoteControl({
     // Asked of the folder before the dialog, so the user is told what a yes
     // undoes. A pairing file alone is not a paired Mac: that is a pairing still
     // waiting for approval, which a new one simply replaces.
-    const replacing = !!readState(dir)?.tunnel_id
+    const replacing = !!stateOf()?.tunnel_id
     confirming = true
     let agreed
     try {
@@ -446,7 +481,7 @@ function createRemoteControl({
    */
   async function reconcile() {
     if (confirming || enabling || reconciling || service() !== 'on') return
-    const state = readState(dir)
+    const state = stateOf()
     if (state?.tunnel_id || state?.pairing === 'running') return
     if (['paired', 'pairing', 'pairing.taken'].some((name) => fs.existsSync(path.join(dir, name)))) return
     reconciling = true

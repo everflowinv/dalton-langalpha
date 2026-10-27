@@ -11,9 +11,10 @@
  * reader clicks through them one at a time; the last card adds another. A
  * card's Details takes the rail's place with the rest of that machine.
  *
- * The dialogs it opens (New computer, Change spec, Make primary, Remove) take
- * its place rather than piling on top: while one is open this panel steps
- * back, and the page stays dimmed exactly as much as with this panel alone.
+ * The dialogs it opens (New computer, Change spec, Make primary, Remove,
+ * Reinstall, Reconnect) take its place rather than piling on top: while one
+ * is open this panel steps back, and the page stays dimmed exactly as much as
+ * with this panel alone.
  */
 import { Suspense, useEffect, useId, useRef, useState } from 'react';
 import { useNavigate } from 'react-router';
@@ -26,12 +27,12 @@ import { Loader } from '@/components/ui/loader';
 import { useHomeWorkspaceId } from '@/hooks/useHomeWorkspace';
 import { lazyWithMotion } from '@/lib/lazyWithMotion';
 import { DURATION } from '@/lib/motion';
-import type { Computer, ComputerCreate } from '@/types/api';
+import type { Computer, ComputerCreate, ComputerReinstall } from '@/types/api';
 
 import { useComputerProviders, useComputers } from '../hooks/useComputers';
 import { useReleaseRefusedRemoteControl, useThisMac } from '../hooks/useRemoteControl';
 import { openComputerSpec, type ComputersPanelView } from '../hooks/computerPanelStore';
-import { deletedBeforeRefusal, useComputerActions } from '../hooks/useComputerActions';
+import { deletedBeforeRefusal, useComputerActions, type ReconnectComputerVariables } from '../hooks/useComputerActions';
 import { useTierQuota } from '../hooks/useTierQuota';
 import { isMoveActive, useWorkspaceMove } from '../hooks/useWorkspaceMove';
 import ComputerCard from './ComputerCard';
@@ -41,6 +42,7 @@ import type { MachineActions } from './computerParts';
 import './computerCards.css';
 import FilesBackupOffDialog from './FilesBackupOffDialog';
 import RemoveComputerDialog from './RemoveComputerDialog';
+import ReinstallDialog from './ReinstallDialog';
 import MakePrimaryDialog from './MakePrimaryDialog';
 import { PlanUpgradeHint } from './planUpgradeHint';
 import {
@@ -62,6 +64,8 @@ type Translate = ReturnType<typeof useTranslation>['t'];
 // so the panel fetches it as it opens and New computer renders at once rather
 // than suspending on its first open.
 const CreateComputerDialog = lazyWithMotion(() => import('./CreateComputerDialog'));
+// Off it for the same reason: it pairs a machine as New computer does.
+const ReconnectDialog = lazyWithMotion(() => import('./ReconnectDialog'));
 
 interface ComputersDialogProps {
   /** What it is open onto, null while closed. */
@@ -124,6 +128,10 @@ function ComputersPanel({
   const [removeTargetId, setRemoveTargetId] = useState<string | null>(null);
   const [primaryTargetId, setPrimaryTargetId] = useState<string | null>(null);
   const [backupOffTargetId, setBackupOffTargetId] = useState<string | null>(null);
+  const [reinstallTargetId, setReinstallTargetId] = useState<string | null>(null);
+  const [reconnectTargetId, setReconnectTargetId] = useState<string | null>(null);
+  // The source the Add dialog opens on when a reconnect sends the user there.
+  const [createPick, setCreatePick] = useState<string | null>(null);
 
   const { data, isLoading } = useComputers();
   const computers = data?.computers ?? [];
@@ -134,6 +142,8 @@ function ComputersPanel({
   const removeTarget = find(removeTargetId);
   const primaryTarget = find(primaryTargetId);
   const backupOffTarget = find(backupOffTargetId);
+  const reinstallTarget = find(reinstallTargetId);
+  const reconnectTarget = find(reconnectTargetId);
   const { data: providerData, isLoading: providersLoading } = useComputerProviders({ enabled: true });
   const showProvider = rowsShowProvider(providerData?.providers, computers);
   const { data: quota, isLoading: quotaLoading } = useTierQuota({ enabled: true });
@@ -151,7 +161,8 @@ function ComputersPanel({
   }
   const createOpen = createForm === 'fromRail' || createForm === 'destination';
 
-  const { power, renameComputerTo, turnOffAlwaysOn, setFilesBackup, create, remove, makePrimary } = useComputerActions();
+  const { power, renameComputerTo, turnOffAlwaysOn, setFilesBackup, create, remove, makePrimary, reinstall, reconnect } =
+    useComputerActions();
   // In the desktop app, the row whose host key is this Mac's helper is this Mac.
   const thisMac = useThisMac({ enabled: true });
   useReleaseRefusedRemoteControl(thisMac.status);
@@ -193,6 +204,14 @@ function ComputersPanel({
       remove: () => {
         remove.reset();
         setRemoveTargetId(computerId);
+      },
+      reinstall: () => {
+        reinstall.reset();
+        setReinstallTargetId(computerId);
+      },
+      reconnect: () => {
+        reconnect.reset();
+        setReconnectTargetId(computerId);
       },
       movingHome: homeMoving?.target_computer_id === computerId,
       // One move at a time per user, and Home's is the one this button starts.
@@ -254,6 +273,30 @@ function ComputersPanel({
     );
   };
 
+  // Each closes once its request is accepted: the row then says 'starting',
+  // and for a reconnect it already names the machine's new host key, which
+  // remote control on this Mac is kept on for.
+  const submitReinstall = (body: ComputerReinstall) => {
+    if (!reinstallTarget || reinstall.isPending) return;
+    reinstall.mutate(
+      { computerId: reinstallTarget.computer_id, body },
+      { onSuccess: () => setReinstallTargetId(null) },
+    );
+  };
+
+  const submitReconnect = (vars: Omit<ReconnectComputerVariables, 'computerId'>) => {
+    if (!reconnectTarget || reconnect.isPending) return;
+    reconnect.mutate(
+      { computerId: reconnectTarget.computer_id, ...vars },
+      { onSuccess: () => setReconnectTargetId(null) },
+    );
+  };
+
+  // In the desktop app, another computer that is this Mac: its helper is
+  // that computer's, so pairing it to this one would break that one.
+  const thisMacIsOther = (computer: Computer) =>
+    computers.find((c) => c.computer_id !== computer.computer_id && c.status !== 'deleted' && thisMac.of(c))?.name ?? null;
+
   const confirmFilesBackupOff = () => {
     if (backupOffTarget) setFilesBackup.mutate({ computerId: backupOffTarget.computer_id, enabled: false });
     setBackupOffTargetId(null);
@@ -276,7 +319,15 @@ function ComputersPanel({
         onClose={onClose}
         width="wide"
         density="form"
-        covered={covered || createForm !== 'closed' || !!removeTarget || !!primaryTarget || !!backupOffTarget}
+        covered={
+          covered ||
+          createForm !== 'closed' ||
+          !!removeTarget ||
+          !!primaryTarget ||
+          !!backupOffTarget ||
+          !!reinstallTarget ||
+          !!reconnectTarget
+        }
       >
         {isLoading ? (
           <div className="flex items-center gap-2 py-6 justify-center" style={{ color: 'var(--color-text-tertiary)' }}>
@@ -350,9 +401,13 @@ function ComputersPanel({
                 // Opened onto the form, leaving it leaves the panel.
                 if (createForm === 'destination') onClose();
                 else setCreateForm('closed');
+                setCreatePick(null);
               }}
               onSubmit={submitCreate}
-              initialPick={opened.view === 'create' && opened.pick === 'thisMac' && createForm === 'destination' ? THIS_MAC_OPTION : null}
+              initialPick={
+                createPick
+                ?? (opened.view === 'create' && opened.pick === 'thisMac' && createForm === 'destination' ? THIS_MAC_OPTION : null)
+              }
               busy={create.isPending}
               error={createError}
               takeOver={folderMarkedOwner(create.error)}
@@ -375,6 +430,37 @@ function ComputersPanel({
             busy={remove.isPending}
             error={removeError}
           />
+        )}
+      </AnimatePresence>
+      <AnimatePresence propagate>
+        {reinstallTarget && (
+          <ReinstallDialog
+            computer={reinstallTarget}
+            onClose={() => { if (!reinstall.isPending) setReinstallTargetId(null); }}
+            onSubmit={submitReinstall}
+            busy={reinstall.isPending}
+            error={reinstall.error}
+          />
+        )}
+      </AnimatePresence>
+      <AnimatePresence propagate>
+        {reconnectTarget && (
+          <Suspense fallback={null}>
+            <ReconnectDialog
+              computer={reconnectTarget}
+              thisMacIs={thisMacIsOther(reconnectTarget)}
+              onClose={() => { if (!reconnect.isPending) setReconnectTargetId(null); }}
+              onSubmit={submitReconnect}
+              busy={reconnect.isPending}
+              error={reconnect.error}
+              onAddInstead={(pick) => {
+                reconnect.reset();
+                setReconnectTargetId(null);
+                setCreatePick(pick);
+                setCreateForm('fromRail');
+              }}
+            />
+          </Suspense>
         )}
       </AnimatePresence>
       <AnimatePresence propagate>

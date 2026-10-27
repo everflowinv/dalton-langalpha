@@ -11,6 +11,8 @@ import type {
   ComputerActionResponse,
   ComputerCreate,
   ComputerProvidersResponse,
+  ComputerReconnectTarget,
+  ComputerReinstall,
   ComputerRemoveResponse,
   ComputerStorage,
   ComputersResponse,
@@ -87,6 +89,43 @@ export async function startComputer(
   const { data } = await api.post<ComputerActionResponse>(
     `/api/v1/computers/${computerId}/start${params}`,
     null,
+    { timeout: COMPUTER_MUTATION_TIMEOUT_MS },
+  );
+  return data;
+}
+
+/**
+ * Set a stopped SSH computer up again on its machine after a start that
+ * failed on its folder: take the folder back from the computer whose it is
+ * now, or move to a new folder. A 202 says 'starting', and the start runs in
+ * the background as a lazy one does. Refusals are a coded `detail`:
+ * `folder_owned` (409, the folder is another computer of this account's),
+ * `folder_marked` (409, the new folder is another computer's, with its
+ * `owner`), `root_dir` (422, the new folder cannot be used), `not_stopped`,
+ * `spec_in_progress`, `not_ssh`.
+ */
+export async function reinstallComputer(computerId: string, body: ComputerReinstall): Promise<ComputerActionResponse> {
+  if (!computerId) throw new Error('Computer ID is required');
+  const { data } = await api.post<ComputerActionResponse>(`/api/v1/computers/${computerId}/reinstall`, body, {
+    timeout: COMPUTER_MUTATION_TIMEOUT_MS,
+  });
+  return data;
+}
+
+/**
+ * Point an SSH computer at the connection a pairing bound to it reached, and
+ * start it. A 202 says 'starting'. A 409 `folder_marked` means the machine
+ * answered but its folder is another computer's now; sent again with that
+ * `take_over`, the folder is taken back.
+ */
+export async function reconnectComputer(
+  computerId: string,
+  ssh: ComputerReconnectTarget,
+): Promise<ComputerActionResponse> {
+  if (!computerId) throw new Error('Computer ID is required');
+  const { data } = await api.post<ComputerActionResponse>(
+    `/api/v1/computers/${computerId}/reconnect`,
+    { ssh },
     { timeout: COMPUTER_MUTATION_TIMEOUT_MS },
   );
   return data;
@@ -271,17 +310,30 @@ export async function getSshKey(): Promise<SshKeyResponse> {
 // The server bounds its own dial; this only keeps a hung request from lingering.
 const SSH_PROBE_TIMEOUT_MS = 60000;
 
-/** Connect to the machine once and report what is on it, without creating anything. */
-export async function probeSsh(target: SshTarget): Promise<SshProbeResult> {
-  const { data } = await api.post<SshProbeResult>('/api/v1/computers/ssh/probe', target, {
+/**
+ * Connect to the machine once and report what is on it, without creating
+ * anything. With `computerId`, one of the user's SSH computers reached again
+ * by hand, the computer limit is not asked.
+ */
+export async function probeSsh(target: SshTarget, { computerId = null }: { computerId?: string | null } = {}): Promise<SshProbeResult> {
+  const body = computerId ? { ...target, computer_id: computerId } : target;
+  const { data } = await api.post<SshProbeResult>('/api/v1/computers/ssh/probe', body, {
     timeout: SSH_PROBE_TIMEOUT_MS,
   });
   return data;
 }
 
-/** Start pairing a machine: the one-line command the user runs on it. */
-export async function createSshPairing(): Promise<SshPairing> {
-  const { data } = await api.post<SshPairing>('/api/v1/computers/ssh/pairings');
+/**
+ * Start pairing a machine: the one-line command the user runs on it. With a
+ * `computerId` the pairing reconnects that SSH computer rather than adding
+ * one: it is not counted against the SSH limit, and the machine it reaches
+ * keeps the computer's folder.
+ */
+export async function createSshPairing({ computerId }: { computerId?: string | null } = {}): Promise<SshPairing> {
+  const url = '/api/v1/computers/ssh/pairings';
+  const { data } = computerId
+    ? await api.post<SshPairing>(url, { computer_id: computerId })
+    : await api.post<SshPairing>(url);
   return data;
 }
 

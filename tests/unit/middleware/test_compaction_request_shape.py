@@ -19,6 +19,7 @@ from ptc_agent.agent.middleware.compaction.summary_request import (
     _COMPACTION_USER_NUDGE,
     build_summary_request as _build_summary_request,
 )
+from ptc_agent.agent.middleware.compaction.utils import count_tokens_tiktoken
 from ptc_agent.core.sandbox.livefs_mount import TranscriptReach
 from src.llms import maybe_disable_streaming
 
@@ -76,6 +77,8 @@ def _config(main):
         filesystem=FilesystemConfig(),
     )
     cfg.llm_client = main
+    # Only the newest message is kept, so a few short ones leave some to compact.
+    cfg.compaction.keep_tokens = 0
     return cfg
 
 
@@ -292,7 +295,7 @@ async def test_compact_messages_calls_llm_with_system_message(monkeypatch):
     ]
 
     await compact_module.compact_messages(
-        messages, {}, _config(fake_llm), thread_id="thread-1", keep_messages=1
+        messages, {}, _config(fake_llm), thread_id="thread-1"
     )
 
     assert len(fake_llm.sent) == 1
@@ -333,8 +336,10 @@ async def test_chained_compaction_anchors_and_reconstructs_safely(monkeypatch):
     messages = [m for i in range(6) for m in _turn(i)]
 
     config = _config(fake_llm)
+    # Keep the last four messages, the newest turn and the result before it.
+    config.compaction.keep_tokens = sum(count_tokens_tiktoken([m]) for m in messages[-4:])
     first = await compact_module.compact_messages(
-        messages, {}, config, thread_id="thread-1", keep_messages=4
+        messages, {}, config, thread_id="thread-1"
     )
     event1 = first.event
     assert event1.get("anchor_message_id") is not None
@@ -345,7 +350,7 @@ async def test_chained_compaction_anchors_and_reconstructs_safely(monkeypatch):
     # one left.
     messages2 = messages + _turn(99)
     second = await compact_module.compact_messages(
-        messages2, first.update({}), config, thread_id="thread-1", keep_messages=4
+        messages2, first.update({}), config, thread_id="thread-1"
     )
     event2 = second.event
     anchor = event2.get("anchor_message_id")
@@ -396,7 +401,6 @@ async def test_compact_messages_summarizes_the_offload_view(monkeypatch):
         {"_offloaded_tool_call_ids": {"w1"}},
         _config(fake_llm),
         thread_id="abcd1234-0000",
-        keep_messages=1,
         backend=backend,
     )
 
@@ -425,7 +429,7 @@ class TestCompactMessagesNeverStoresAnError:
             HumanMessage(content="c", id="3"),
         ]
         return await compact_module.compact_messages(
-            messages, {}, _config(self.fake_llm), thread_id="thread-1", keep_messages=1
+            messages, {}, _config(self.fake_llm), thread_id="thread-1"
         )
 
     def _assert_server_summary(self, result):
@@ -521,7 +525,7 @@ class TestCompactWindowClose:
                 counter=lambda msgs: sum(len(str(m.content)) for m in msgs),
             ),
             token_threshold=100_000,
-            keep_messages=5,
+            keep_tokens=5,
         )
 
         async def _passthrough(backend, messages, **kwargs):
@@ -629,7 +633,7 @@ class TestSummaryFallback:
                 fallback=labelled(_summary_model("from the summarizer's fallback"), "turn-model"),
             ),
             token_threshold=100_000,
-            keep_messages=5,
+            keep_tokens=5,
         )
         monkeypatch.setattr(mw, "_emit_context_signal", lambda *a, **k: None)
         messages = [HumanMessage(content="hi", id="h")]

@@ -30,3 +30,12 @@ export const GALLERY_PAGE = 'flex-1 min-h-0 overflow-y-auto max-md:[scrollbar-gu
  * ultrawide monitor stays one the eye can follow.
  */
 export const GALLERY_COLUMN = 'mx-auto w-full max-w-[1440px]';
+
+/**
+ * The card grid: as many columns as fit at a readable card width, one on a
+ * phone, two on a small laptop, three from a 16-inch one up to the column's
+ * cap. Every row is as tall as the tallest, so the cards read as one even
+ * field at every width. Shared with the skeleton the grid replaces, so the
+ * placeholders take the cards' places exactly.
+ */
+export const GALLERY_GRID = 'grid grid-cols-1 auto-rows-fr gap-3 md:gap-4 md:grid-cols-[repeat(auto-fill,minmax(min(100%,23.75rem),1fr))]';

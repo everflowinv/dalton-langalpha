@@ -105,7 +105,9 @@ export const queryKeys = {
   // must never mint a new command under the one the user is running.
   sshPairings: {
     all:    ['ssh-pairings'],
-    mint:   () => [...queryKeys.sshPairings.all, 'mint'],
+    // One per computer it reconnects, and one for a new machine, so a create
+    // and a reconnect never show each other's command.
+    mint:   (computerId?: string | null) => [...queryKeys.sshPairings.all, 'mint', computerId ?? 'new'],
     status: (token: string) => [...queryKeys.sshPairings.all, 'status', token],
   },
   // Read from the desktop shell, not the server: what this Mac's own helper

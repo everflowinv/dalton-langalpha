@@ -23,6 +23,7 @@ from fastapi.responses import Response
 
 from src.server.database.home_workspace import is_unbound
 from src.server.database.workspace import get_workspace as db_get_workspace
+from src.server.services.computer_manager import MachineTarget
 from src.server.services.workspace_manager import WorkspaceManager
 from src.server.services.workspace_layout import WorkspaceLayoutUnavailable
 from src.server.services.persistence.file import FilePersistenceService
@@ -282,7 +283,9 @@ def warm_sandbox(workspace: dict[str, Any], workspace_id: str) -> Any | None:
     if workspace.get("status") != "running":
         return None
     session = WorkspaceManager.get_instance().get_session_if_ready(
-        workspace_id, expected_sandbox_id=workspace.get("sandbox_id")
+        workspace_id,
+        expected_sandbox_id=workspace.get("sandbox_id"),
+        target=MachineTarget.of_workspace(workspace),
     )
     return getattr(session, "sandbox", None) if session else None
 

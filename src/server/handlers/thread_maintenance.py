@@ -319,7 +319,7 @@ async def _resolver(user_id: str, thread_id: str, meta: dict, route):
     )
 
 
-async def _summarize(agent: ThreadAgent, config, keep_messages: int):
+async def _summarize(agent: ThreadAgent, config):
     """The pipeline automatic compaction runs when the agent compacts nothing,
     on the user's resolved config, naming the notes when the user's flag is
     on, as the agent build does."""
@@ -337,7 +337,6 @@ async def _summarize(agent: ThreadAgent, config, keep_messages: int):
         agent.state.values,
         config,
         thread_id=agent.thread_id,
-        keep_messages=keep_messages,
         backend=agent.backend,
         workspace_id=agent.workspace_id,
         notes_dir=scratchpad.notes_dir if scratchpad is not None else None,
@@ -347,7 +346,6 @@ async def _summarize(agent: ThreadAgent, config, keep_messages: int):
 @cancellation_as_http("compact")
 async def trigger_compaction(
     thread_id: str,
-    keep_messages: int = 5,
     *,
     user_id: str | None = None,
 ) -> dict:
@@ -406,9 +404,9 @@ async def trigger_compaction(
             )
             try:
                 try:
-                    compaction = await agent.ask(Compact(keep_messages))
+                    compaction = await agent.ask(Compact())
                 except NoCompaction:
-                    compaction = await _summarize(agent, agent_cfg, keep_messages)
+                    compaction = await _summarize(agent, agent_cfg)
             except ValueError as e:
                 raise HTTPException(status_code=400, detail=str(e))
 

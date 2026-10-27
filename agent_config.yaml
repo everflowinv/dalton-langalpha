@@ -243,7 +243,13 @@ subagents:
 compaction:
   enabled: true # Enable/disable context compaction
   token_threshold: 120000 # Trigger full compaction when messages exceed this token count
-  keep_messages: 10 # Preserve last N messages after compaction
+  keep_tokens: 20000 # Newest history a summary keeps word for word, in the model's tokens
+  claude_keep_tokens: 32000 # The same for Claude, whose tokens hold about 1.6x less text
+  # A model whose provider does not compact the conversation writes its own
+  # summary from its cached request. The summary model reading the transcript
+  # is the fallback, and writes it instead when a separate compaction model is
+  # picked. false: always the transcript summarizer.
+  self_summary: true
   # Tier 1: when a turn starts this long after the model's last response
   # (the prompt cache is cold by then), hide large tool args and stale Read
   # results in older messages. null turns it off.

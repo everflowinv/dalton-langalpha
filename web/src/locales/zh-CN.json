@@ -459,14 +459,14 @@
       "deep": "深度"
     },
     "compactionProfile": "压缩预设",
-    "compactionProfileDesc": "用于控制压缩触发与保留的预设组合。保持系统默认时，每个模型使用各自的预设：Claude 和 GPT 为 500k，其他模型按其上下文窗口匹配。",
+    "compactionProfileDesc": "决定对话何时压缩。保持系统默认时，每个模型使用各自的预设：Claude 和 GPT 为 500k，其他模型按其上下文窗口匹配。",
     "compactionProfileUseDefault": "使用系统默认",
     "nativeCompaction": "服务商压缩",
     "nativeCompactionOn": "开启",
     "nativeCompactionOff": "关闭",
     "nativeCompactionAnthropicDesc": "压缩时由 Claude 自己总结对话，因此它在保留下来的轮次里仍能保留自己的推理过程。这份摘要可以直接阅读，切换到其他模型后，新模型读取的也是它。",
     "nativeCompactionOpenAIDesc": "OpenAI 会把对话压缩成一份加密摘要，只有 OpenAI 的模型能读取，无论通过 API 还是 ChatGPT 登录。压缩卡片显示的是对话的简要记录，而不是摘要。若把这个对话切换到其他服务商的模型，它拿到的是这份记录而不是摘要，会丢失早先工具结果中的细节。",
-    "compactionProfilePreset": "{{tokens}}k tokens · 保留 {{keep}} 条",
+    "compactionProfilePreset": "{{tokens}}k tokens",
     "compactionProfiles": {
       "aggressive": {
         "label": "激进",
@@ -1555,7 +1555,7 @@
       "button": "设为默认",
       "title": "将 {{name}} 设为默认？",
       "body": "新工作区将创建在 {{name}} 上。",
-      "bodyHomeMoves": "新工作区将创建在 {{name}} 上，Chief of Staff Agent 存放文件的 Home 也会一并迁移过去。",
+      "bodyHomeMoves": "新工作区将创建在 {{name}} 上，研究总监存放文件的 Home 也会一并迁移过去。",
       "movingHome": "正在迁移 Home…",
       "done": "{{name}} 已设为默认计算机",
       "failedTitle": "无法将 {{name}} 设为默认",
@@ -1823,7 +1823,8 @@
       "cardTitlePc": "这台电脑",
       "windowsSoon": "即将支持 Windows",
       "needsApp": "需要桌面应用",
-      "needsAppHint": "要添加这台 Mac，请<download>下载桌面应用</download>，并在应用中打开此表单。"
+      "needsAppHint": "要添加这台 Mac，请<download>下载桌面应用</download>，并在应用中打开此表单。",
+      "anotherMacHint": "要添加另一台 Mac，请在那台 Mac 上<download>下载桌面应用</download>，并在应用中打开此表单。"
     },
     "card": {
       "spec": "配置",
@@ -1840,6 +1841,62 @@
       "details": "详情",
       "storage": "存储",
       "previewPending": "连接后显示"
+    },
+    "startFailure": {
+      "lead": "无法启动。",
+      "reinstall": "重新安装…",
+      "reconnect": "重新连接…"
+    },
+    "restartRefused": {
+      "folderMarked": "该文件夹属于另一台计算机，可能来自另一个 LangAlpha 账户或服务器。",
+      "folderOwned": "你的另一台计算机正在使用该文件夹。移除那台计算机即可释放该文件夹。",
+      "notStopped": "这台计算机正在启动或运行中。请在它停止后重试。",
+      "specInProgress": "这台计算机正在更改配置。请在完成后重试。",
+      "unanswered": "该机器没有响应。请确认它已开机并已连接，然后重试。",
+      "reinstallFailed": "无法重新安装这台计算机，请重试。",
+      "reconnectFailed": "无法重新连接这台计算机，请重试。"
+    },
+    "reinstall": {
+      "title": "重新安装 {{name}}",
+      "desc": "选择这台计算机在其机器上使用的文件夹。设置完成后它会重新启动。",
+      "folderLabel": "文件夹",
+      "takeBack": "收回该文件夹",
+      "takeBackDesc": "继续使用 {{folder}}。如果另一台计算机正在使用它，那台计算机将无法再在这台机器上工作。文件夹中的文件会保留。",
+      "takeBackOwned": "继续使用 {{folder}}。另一台计算机正在使用它，可能来自另一个 LangAlpha 账户或服务器。那台计算机将无法再在这台机器上工作。文件夹中的文件会保留。",
+      "newFolder": "使用新文件夹",
+      "newFolderDesc": "在这台机器上的另一个文件夹中重新开始。旧文件夹保持原样。",
+      "newFolderLabel": "新文件夹",
+      "newFolderBackup": "工作区文件会从备份中恢复。",
+      "newFolderNoBackup": "这台计算机未开启备份，工作区文件会留在 {{folder}} 中。如有需要，请自行复制过去。",
+      "takeNew": "使用此文件夹",
+      "takeBackAgainNote": "收回后，那台计算机将无法再在其中工作。其中的文件会保留。",
+      "takeBackAgain": "从那台计算机收回",
+      "takeNewNote": "使用后，那台计算机将无法再在其中工作。其中的文件会保留。你也可以输入其他文件夹。",
+      "submit": "重新安装",
+      "submitting": "正在重新安装..."
+    },
+    "reconnect": {
+      "title": "重新连接 {{name}}",
+      "desc": "将这台计算机重新连接到它的机器。它的文件夹和工作区保持不变。",
+      "pairIntro": "以 {{username}} 身份在该机器上运行：",
+      "folderKept": "工作区仍保存在 {{folder}} 中。",
+      "onThatMac": "{{name}} 由其 Mac 上的 LangAlpha 应用连接。请在那台 Mac 上打开 LangAlpha，并在那里选择重新连接。",
+      "otherMac": "这台 Mac 已是 {{other}}。要重新连接 {{name}}，请在它所在的 Mac 上打开 LangAlpha，并在那里选择重新连接。",
+      "takeBackNote": "{{folder}} 是这台计算机的文件夹。收回后，另一台计算机将无法再在其中工作。其中的文件会保留。",
+      "submit": "重新连接",
+      "submitting": "正在重新连接...",
+      "moveToMac": "移到这台 Mac",
+      "moveToMachine": "移到这台机器",
+      "notThisMac": "这台 Mac 不是 {{name}} 原来所在的 Mac：它的文件夹和文件不在这里。工作区文件会从备份恢复；从未备份的内容仍留在原来的 Mac 上。",
+      "notThisMachine": "这不是 {{name}} 原来所在的机器：它的文件夹和文件不在这里。工作区文件会从备份恢复；从未备份的内容仍留在原来的机器上。",
+      "notThisMacNoBackup": "这台 Mac 不是 {{name}} 原来所在的 Mac：它的文件夹和文件不在这里。这台计算机未开启备份，工作区文件会留在原来的 Mac 上；之前备份过的工作区会提供恢复该备份的选项。",
+      "notThisMachineNoBackup": "这不是 {{name}} 原来所在的机器：它的文件夹和文件不在这里。这台计算机未开启备份，工作区文件会留在原来的机器上；之前备份过的工作区会提供恢复该备份的选项。",
+      "folderRestored": "工作区会从备份恢复到 {{folder}}。",
+      "moveDesc": "把这台计算机移到下面这台机器。确认后它会在那里启动。",
+      "keepBothMacNote": "如要两台都保留，可将这台 Mac 添加为一台独立的计算机，再在 {{name}} 原来所在的 Mac 上重新连接它。",
+      "keepBothNote": "如要两台都保留，可将这台机器添加为一台独立的计算机，再将 {{name}} 重新连接到原来的机器。",
+      "addThisMac": "将这台 Mac 添加为新计算机",
+      "addThisMachine": "将这台机器添加为新计算机"
     }
   },
   "thread": {
@@ -2092,7 +2149,7 @@
       "stopFailed": "未能停止，请重试。"
     },
     "provenance": {
-      "fromChiefOfStaff": "来自 CoS Agent",
+      "fromChiefOfStaff": "来自研究总监",
       "automation": "自动化",
       "automationNamed": "自动化 · {{name}}",
       "viaChannel": "来自 {{platform}}",
@@ -4216,7 +4273,7 @@
       "chat": {
         "greeting": "你好，{{name}}。",
         "greetingNoName": "你好。",
-        "intro": "我是你在 LangAlpha 的 Chief of Staff Agent，帮你协调 AI 分析师、管理各个工作区。",
+        "intro": "我是你在 LangAlpha 的研究总监，帮你协调 AI 分析师、管理各个工作区。",
         "introNext": "先问你几个问题，了解一下你的投资组合和投资习惯。",
         "editIntro": "这是你的投资画像。修改任意一项后保存即可。",
         "lead": {
@@ -6034,9 +6091,9 @@
       },
       "audience": {
         "analyst": "工作区分析师",
-        "chiefOfStaff": "Chief of Staff Agent（Home）",
+        "chiefOfStaff": "研究总监（Home）",
         "analystFact": "工作区分析师",
-        "chiefOfStaffFact": "CoS Agent"
+        "chiefOfStaffFact": "研究总监"
       },
       "source": {
         "custom": "你添加的",
@@ -6172,7 +6229,7 @@
     "chiefOfStaff": "研究总监",
     "analyst": "分析师",
     "pickWhere": "选择 Agent 的工作范围",
-    "backToChiefOfStaff": "返回 CoS Agent",
+    "backToChiefOfStaff": "返回研究总监",
     "reportBackPending": "等待分析师汇报结果",
     "tray": {
       "waitingOn": "等待 {{name}}",
@@ -6199,7 +6256,7 @@
       "fallbackModelsDesc": "当默认模型或后台模型不可用时，按顺序依次尝试。请只添加你有权访问的模型。未选择时不使用备用模型。",
       "chooseYourModelsDesc": "为对话选择一个模型，并为后台任务选择一个更经济的模型。之后可随时更改。",
       "explainerTitle": "两个模型",
-      "explainerDefaultBody": "运行所有对话：跨所有工作区的 Chief of Staff Agent，以及各工作区的分析师。",
+      "explainerDefaultBody": "运行所有对话：跨所有工作区的研究总监，以及各工作区的分析师。",
       "explainerBackgroundBody": "不运行任何对话，只处理对话周边的工作，因此更快、更便宜的模型通常就够用。",
       "defaultPlaceholder": "选择默认模型..."
     },
@@ -6350,7 +6407,7 @@
     },
     "sharing": {
       "title": "共享设置",
-      "cosLabel": "别人的 Chief of Staff",
+      "cosLabel": "别人的研究总监",
       "webLabel": "别人的网页界面",
       "levelRw": "可读写",
       "levelRo": "仅可读",

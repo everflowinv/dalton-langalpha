@@ -300,6 +300,59 @@ describe('useComputerStatusFanout', () => {
     expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.computers.storage(COMPUTER_ID) });
   });
 
+  // The server settles a failed start back to stopped and keeps why on the
+  // row before it sends the frame, so the row is read again rather than
+  // left without its reason until some later read: 'error' from a start
+  // route, 'stopped' from a start a chat turn made, which reverts its claim.
+  it.each(['error', 'stopped'])('reads the row back after a failed start ending %s, which brings its persisted failure', async (frameStatus) => {
+    mockGetComputers.mockResolvedValue(computer('starting'));
+    mockStreamComputer.mockImplementation(async (_id: string, onFrame: ComputerOnFrame) => {
+      mockGetComputers.mockResolvedValue({
+        ...computer('stopped'),
+        computers: [{
+          ...computer('stopped').computers[0],
+          start_failure: { code: 'root_dir', message: 'The folder cannot be used.', owner: null, remedy: 'reinstall', at: '2026-10-25T16:40:00Z' },
+        }],
+      });
+      onFrame(frameStatus === 'error' ? { status: 'error', error: 'The folder cannot be used.' } : { status: 'stopped' });
+      // Held open past the render the frame causes, which tears the watch down.
+      await new Promise(() => {});
+    });
+    const { queryClient } = mount();
+    const invalidate = vi.spyOn(queryClient, 'invalidateQueries');
+
+    await waitFor(() => expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.computers.lists() }));
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.workspaces.lists() });
+    await waitFor(() => {
+      const row = queryClient.getQueryData<{ computers: Array<{ status: string; start_failure?: { remedy: string } }> }>(
+        queryKeys.computers.lists(),
+      )?.computers[0];
+      expect(row?.status).toBe('stopped');
+      expect(row?.start_failure?.remedy).toBe('reinstall');
+    });
+  });
+
+  it('keeps the failure the frame brought when the re-read fails', async () => {
+    mockGetComputers.mockResolvedValue(computer('starting'));
+    mockStreamComputer.mockImplementation(async (_id: string, onFrame: ComputerOnFrame) => {
+      mockGetComputers.mockRejectedValue(new Error('offline'));
+      onFrame({
+        status: 'error',
+        error: 'The folder is held.',
+        start_failure: { code: 'folder_marked', message: 'The folder is held.', owner: 'other-1', remedy: 'reinstall', at: '2026-10-26T04:00:00Z' },
+      });
+      await new Promise(() => {});
+    });
+    const { queryClient } = mount();
+
+    await waitFor(() => {
+      const row = queryClient.getQueryData<{ computers: Array<{ start_failure?: { remedy: string } | null }> }>(
+        queryKeys.computers.lists(),
+      )?.computers[0];
+      expect(row?.start_failure?.remedy).toBe('reinstall');
+    });
+  });
+
   it('aborts its streams on unmount', async () => {
     mockGetComputers.mockResolvedValue(computer('starting'));
     let signal: AbortSignal | null = null;

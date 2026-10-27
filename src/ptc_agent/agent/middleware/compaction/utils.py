@@ -10,7 +10,7 @@ import math
 import re
 import uuid
 from collections import OrderedDict
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from typing import Any
 
 import tiktoken
@@ -43,7 +43,6 @@ from ptc_agent.agent.middleware.compaction.types import (
     CONTEXT_SUMMARY_PREFIX,
     NON_CRITICAL_READ_PREFIXES,
     CompactionEvent,
-    TokenCounter,
     TRUNCATABLE_TOOLS,
 )
 
@@ -115,7 +114,52 @@ def _extract_text_from_content(content: str | list) -> str:
 def count_tokens_tiktoken(messages: Iterable[MessageLikeRepresentation]) -> int:
     """Count tokens using tiktoken (accurate for all languages including CJK)."""
     enc = _get_tiktoken_encoder()
+    return sum(len(enc.encode(text)) + 3 for text in _sent_texts(messages))
+
+
+#: Claude's count from tiktoken's, fitted to 175 samples Claude's
+#: ``count_tokens`` counted: code, English, Chinese and Japanese prose,
+#: market-data JSON, price tables, printed frames and 13 languages. Words count
+#: about 1.6 times tiktoken, text outside ASCII about as tiktoken counts it,
+#: and numbers as tiktoken counts them, which the digit term takes back. The
+#: term is per digit and tiktoken packs three to a token, so a long number or
+#: an id dump would come to almost nothing; each text is held to 0.95 times
+#: tiktoken, which errs high only on the few Claude counts lower (Hindi,
+#: printed frames).
+_CLAUDE_PER_ASCII = 1.59
+_CLAUDE_PER_OTHER = 0.99
+_CLAUDE_PER_DIGIT = -0.52
+_CLAUDE_FLOOR = 0.95
+_NON_ASCII = re.compile(r"[^\x00-\x7f]+")
+
+
+def count_tokens_claude(messages: Iterable[MessageLikeRepresentation]) -> int:
+    """Count tokens as Claude does, estimated: its tokenizer is not public,
+    and runs from about tiktoken's count on Chinese to 1.6 times it on
+    English and code, so no single factor fits.
+
+    Cross-validated, the median miss is 5% and nine in ten are within 15%;
+    number-heavy output, the likeliest to miss, by up to about 15% either
+    way. Only what no call has measured is counted this way
+    (``message_sizes``).
+    """
+    enc = _get_tiktoken_encoder()
     total = 0
+    for text in _sent_texts(messages):
+        tokens = len(enc.encode(text))
+        other = sum(len(enc.encode(run)) for run in _NON_ASCII.findall(text))
+        digits = sum(map(text.count, "0123456789"))
+        estimate = (
+            _CLAUDE_PER_ASCII * (tokens - other)
+            + _CLAUDE_PER_OTHER * other
+            + _CLAUDE_PER_DIGIT * digits
+        )
+        total += round(max(estimate, _CLAUDE_FLOOR * tokens)) + 3
+    return total
+
+
+def _sent_texts(messages: Iterable[MessageLikeRepresentation]) -> Iterator[str]:
+    """The text each message sends a model, as the counters count it."""
     for msg in convert_to_messages(messages):
         tool_calls = getattr(msg, "tool_calls", None)
         content = msg.content
@@ -152,8 +196,7 @@ def count_tokens_tiktoken(messages: Iterable[MessageLikeRepresentation]) -> int:
             )
             text = f"{text} {calls}" if text else calls
 
-        total += len(enc.encode(text)) + 3  # +3 for role/message overhead
-    return total
+        yield text
 
 
 # =============================================================================
@@ -882,44 +925,6 @@ def get_effective_messages(
     cutoff = resolve_cutoff_index(messages, event)
     tail = strip_orphan_tool_messages(messages[cutoff:])
     return [event["summary_message"], *tail]
-
-
-def measured_tokens(state: Mapping[str, Any]) -> int | None:
-    """The context size the last model call reported, which the next call's
-    summary trigger reads; None before any call has reported usage."""
-    cached_input = state.get("_cached_input_tokens") or 0
-    if cached_input <= 0:
-        return None
-    return cached_input + (state.get("_cached_output_tokens") or 0)
-
-
-def context_tokens(
-    state: Mapping[str, Any],
-    view: Sequence[AnyMessage],
-    counter: TokenCounter,
-    system: Sequence[Any] = (),
-    cost: Callable[[Any], int] | None = None,
-) -> int:
-    """The context ``view`` makes, as the summary trigger reads it: what the
-    last call measured plus an estimate of what has been added since, else
-    an estimate of the whole of it. ``cost`` is as for ``attachment_tokens``.
-
-    The measurement ends at the newest answer, which its output tokens
-    count, so everything after it is new: the results of that answer's tool
-    calls, which are where a Read's attachments land. Reading the measurement
-    alone missed exactly those, and the call that carried them in went out
-    unsummarized however large they were.
-    """
-    measured = measured_tokens(state)
-    if measured is None:
-        whole = [*system, *view]
-        return counter(whole) + attachment_tokens(whole, cost)
-    answered = next(
-        (i for i in range(len(view) - 1, -1, -1) if isinstance(view[i], AIMessage)),
-        None,
-    )
-    added = view[answered + 1 :] if answered is not None else ()
-    return measured + (counter(added) + attachment_tokens(added, cost) if added else 0)
 
 
 def resolve_cutoff_index(messages: Sequence[AnyMessage], event: Mapping[str, Any]) -> int:

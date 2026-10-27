@@ -1470,6 +1470,41 @@ async def test_a_deferred_batch_lays_nothing_while_the_folder_waits():
     ]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("waits", [True, False], ids=["waits", "settled"])
+async def test_a_deferred_pass_with_nothing_to_lay_asks_before_its_marker(waits):
+    """No batch asks for a workspace with nothing evicted, and the marker
+    alone would lay again a folder its owner took away; a restart queues
+    this pass for every workspace on the machine."""
+    sandbox = _owners_folder()
+
+    @asynccontextmanager
+    async def lock(_workspace_id, *, wait):
+        yield "conn"
+
+    with (
+        patch.object(restore, "get_files_for_workspace", AsyncMock(return_value=[])),
+        patch.object(restore, "workspace_sync_lock", lock),
+        patch.object(
+            restore, "folder_waits_on_owner", AsyncMock(return_value=waits)
+        ) as asked,
+    ):
+        result = await restore.restore_deferred(
+            "ws-1",
+            sandbox,
+            layout=LAYOUT,
+            kept=_kept(set()),
+            inventory=restore.parse_deferred(_listed()),
+        )
+
+    asked.assert_awaited_once_with("ws-1", sandbox, layout=LAYOUT, conn="conn")
+    assert result["done"] is not waits
+    assert (
+        LAYOUT.join(DEFERRED_MARKER)
+        in [c.args[0] for c in sandbox.aupload_file_bytes.await_args_list]
+    ) is not waits
+
+
 def _kept(prefixes: set[str]) -> ThreadPrefixes:
     return ThreadPrefixes(all=frozenset(prefixes), open=frozenset(prefixes))
 

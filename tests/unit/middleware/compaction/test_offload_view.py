@@ -106,7 +106,7 @@ def _middleware(
         # The default counter downloads its encoding on first use.
         Summarizer(GenericFakeChatModel(messages=iter([])), limit=100_000, counter=len),
         token_threshold=token_threshold,
-        keep_messages=5,
+        keep_tokens=5,
         offload=offload,
         backend=backend,
     )

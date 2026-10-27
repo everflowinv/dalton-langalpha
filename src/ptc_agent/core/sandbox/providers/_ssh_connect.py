@@ -414,7 +414,7 @@ def _connect_error(target: SSHTarget, exc: BaseException) -> SSHConnectError:
             "host_key_mismatch",
             f"{target.host} presented a different host key from the one pinned "
             "when this computer was added. If the machine was reinstalled, "
-            "remove the computer and add it again.",
+            "reconnect the computer to it.",
         )
     if isinstance(exc, TimeoutError):
         return SSHConnectError(

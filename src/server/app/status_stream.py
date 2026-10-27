@@ -30,7 +30,8 @@ EVENTS_TERMINAL = {"running", "error", "deleted"}
 
 # None means the subject row is gone.
 ReadStatusFn = Callable[[], Awaitable[Optional[str]]]
-# Frame callback accepts status, sandbox_state=None, error=None, and stage=None.
+# Frame callback accepts status, sandbox_state=None, error=None, stage=None and
+# start_failure=None.
 FrameFn = Callable[..., str]
 SubscribeFn = Callable[[], AbstractAsyncContextManager[Any]]
 SubscriptionKeyFn = Callable[[], object]
@@ -42,15 +43,18 @@ def sse_status_event(
     sandbox_state: Optional[str] = None,
     error: Optional[str] = None,
     stage: Optional[str] = None,
+    start_failure: Optional[Dict[str, Any]] = None,
 ) -> str:
     """subject carries ids only, never status."""
-    data: Dict[str, Optional[str]] = {**subject, "status": status}
+    data: Dict[str, Any] = {**subject, "status": status}
     if sandbox_state:
         data["sandbox_state"] = sandbox_state
     if error:
         data["error"] = error
     if stage:
         data["stage"] = stage
+    if start_failure:
+        data["start_failure"] = start_failure
     return f"event: status\ndata: {json.dumps(data)}\n\n"
 
 
@@ -141,7 +145,13 @@ async def status_event_stream(
                     # Only its error-bearing publish carries the reason and can end the wait.
                     failure = payload.get("error")
                     if hinted == "error" and isinstance(failure, str) and failure:
-                        yield frame("error", error=failure)
+                        # The row's start_failure as the start recorded it, so
+                        # a client patches its copy without a refetch.
+                        recorded = payload.get("start_failure")
+                        if isinstance(recorded, dict):
+                            yield frame("error", error=failure, start_failure=recorded)
+                        else:
+                            yield frame("error", error=failure)
                         return
                     # Confirm hints in DB: they may precede commit, be spurious, or name a sibling;
                     # trusting a terminal hint would close the stream incorrectly.

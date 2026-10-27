@@ -50,7 +50,7 @@ function row(over: Partial<WatchlistRow>): WatchlistRow {
 function renderRow(item: WatchlistRow) {
   return render(
     <MemoryRouter>
-      <WatchlistRowItem item={item} index={0} marketStatus={null} />
+      <WatchlistRowItem item={item} marketStatus={null} />
     </MemoryRouter>,
   );
 }

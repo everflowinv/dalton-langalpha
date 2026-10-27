@@ -394,7 +394,9 @@ function ChatAgent(): React.ReactElement | null {
     <div style={{ height: '100%', position: 'relative' }}>
       {/* Gallery views. The outgoing view dissolves over the incoming one in
           a single grid cell (SwapCell), so a switch never passes through an
-          empty frame. No z-index on this wrapper: it would make it
+          empty frame. The first view only appears: it draws in its final
+          frame, and a fade on top would only slow it. No
+          z-index on this wrapper: it would make it
           a stacking context, and every dialog the gallery opens (sandbox
           settings and the MCP and skill forms inside it) would paint under the
           app sidebar however high its own layer. */}
@@ -409,7 +411,6 @@ function ChatAgent(): React.ReactElement | null {
         <SwapCell
           as="div"
           swapKey={threadId ? null : viewKey}
-          appear
           className="h-full min-h-0 grid-rows-[minmax(0,1fr)]"
           layerClassName="h-full min-h-0"
         >

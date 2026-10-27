@@ -116,6 +116,39 @@ class ComputerBinding:
 
 
 @dataclass(frozen=True)
+class MachineTarget:
+    """The root and target a computer's row names now, read from Postgres by
+    the request that asks for a cached session.
+
+    An ssh computer keeps its provider_ref through a reinstall or reconnect
+    another worker ran, so a sandbox id cannot fence a session built before
+    either, and no channel tells this worker it happened."""
+
+    kind: Optional[str]
+    root_dir: Optional[str] = None
+    provider_config: Optional[Dict[str, Any]] = None
+
+    @classmethod
+    def of_computer(cls, computer: Mapping[str, Any] | None) -> "MachineTarget":
+        computer = computer or {}
+        return cls(
+            kind=computer.get("kind"),
+            root_dir=computer.get("root_dir"),
+            provider_config=computer.get("provider_config") or None,
+        )
+
+    @classmethod
+    def of_workspace(cls, workspace: Mapping[str, Any] | None) -> "MachineTarget":
+        """From a workspace row that joined its computer as ``computer_*``."""
+        workspace = workspace or {}
+        return cls(
+            kind=workspace.get("computer_kind"),
+            root_dir=workspace.get("computer_root_dir"),
+            provider_config=workspace.get("computer_provider_config") or None,
+        )
+
+
+@dataclass(frozen=True)
 class WorkspaceToolView:
     """One project's tool configuration, frozen for the turn that follows.
 

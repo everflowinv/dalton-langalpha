@@ -22,6 +22,7 @@ const REQUEST: &str = "pairing";
 const TAKEN: &str = "pairing.taken";
 const STATE: &str = "state";
 const LOCK: &str = "lock";
+const MACHINE: &str = "machine";
 pub const LOG: &str = "helper.log";
 // A pairing's failure is shown to the user as one line.
 const DETAIL_LIMIT: usize = 500;
@@ -94,6 +95,7 @@ pub struct Identity {
 
 impl Identity {
     pub fn load(dir: &Path) -> Result<Self> {
+        forget_another_machine(dir, this_machine().as_deref())?;
         Ok(Self {
             account: Account::current()?,
             host_key: own_key(&dir.join(HOST_KEY))?,
@@ -117,6 +119,70 @@ impl Identity {
     pub fn tunnel_key_line(&self) -> Result<String> {
         keys::public_line(&self.tunnel_key)
     }
+}
+
+/// This machine's hardware UUID, as macOS shows it (`IOPlatformUUID`), or
+/// Linux's machine id. None where neither can be read, and then no folder is
+/// told apart from another machine's.
+fn this_machine() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut id = [0u8; 16];
+        let wait = libc::timespec {
+            tv_sec: 5,
+            tv_nsec: 0,
+        };
+        // SAFETY: `id` is the 16 bytes a uuid_t is, and `wait` outlives the call.
+        if unsafe { libc::gethostuuid(id.as_mut_ptr(), &wait) } != 0 {
+            return None;
+        }
+        let hex: String = id.iter().map(|b| format!("{b:02X}")).collect();
+        Some(format!(
+            "{}-{}-{}-{}-{}",
+            &hex[..8],
+            &hex[8..12],
+            &hex[12..16],
+            &hex[16..20],
+            &hex[20..]
+        ))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let id = fs::read_to_string("/etc/machine-id").ok()?;
+        let id = id.trim();
+        (!id.is_empty()).then(|| id.to_string())
+    }
+}
+
+/// Drops the keys and pairing of a folder made on another machine, as one
+/// that Migration Assistant or a backup restore carried over. Kept, they would
+/// make this machine a second answer to the first one's tunnel and host key:
+/// the deployment would take either for the other, and the app here would call
+/// the first machine's computer this one. A folder that names no machine was
+/// made by a helper from before this check, and is taken as this machine's.
+fn forget_another_machine(dir: &Path, this: Option<&str>) -> Result<()> {
+    let Some(this) = this else { return Ok(()) };
+    let path = dir.join(MACHINE);
+    match fs::read_to_string(&path) {
+        Ok(made_on) if made_on.trim() == this => return Ok(()),
+        Ok(made_on) => {
+            tracing::warn!(
+                made_on = made_on.trim(),
+                "This folder was made on another machine; making this machine's own keys"
+            );
+            for name in [HOST_KEY, TUNNEL_KEY, PAIRED, STATE, TAKEN] {
+                match fs::remove_file(dir.join(name)) {
+                    Err(e) if e.kind() != ErrorKind::NotFound => {
+                        return Err(e).with_context(|| format!("removing {name}"));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Err(e) if e.kind() == ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    }
+    put(&path, &format!("{this}\n"))
 }
 
 /// A key of this machine's own, made the first time it is asked for. Both
@@ -500,6 +566,71 @@ mod tests {
         }
         let answer = format!("tunnel_id=t\ngateway_host=gw\ngateway_port=22\n{pin}");
         assert!(Paired::new(&answer, "not a key".into()).is_err());
+    }
+
+    #[test]
+    fn makes_new_keys_in_a_folder_carried_over_from_another_machine() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        forget_another_machine(dir.path(), Some("MAC-A"))?;
+        let first = own_key(&dir.path().join(HOST_KEY))?;
+        fs::write(dir.path().join(PAIRED), "tunnel_id=t\n")?;
+        fs::write(dir.path().join(STATE), "state=connected\n")?;
+        fs::write(
+            dir.path().join(REQUEST),
+            "url=https://example.com/script\nid=a\n",
+        )?;
+
+        // The same machine starting again keeps everything.
+        forget_another_machine(dir.path(), Some("MAC-A"))?;
+        assert_eq!(own_key(&dir.path().join(HOST_KEY))?, first);
+        assert!(dir.path().join(PAIRED).exists());
+
+        forget_another_machine(dir.path(), Some("MAC-B"))?;
+        for gone in [HOST_KEY, PAIRED, STATE] {
+            assert!(!dir.path().join(gone).exists(), "{gone} was kept");
+        }
+        // The app's ask, written on this machine, still stands.
+        assert!(dir.path().join(REQUEST).exists());
+        assert_ne!(own_key(&dir.path().join(HOST_KEY))?, first);
+        assert_eq!(fs::read_to_string(dir.path().join(MACHINE))?, "MAC-B\n");
+        Ok(())
+    }
+
+    #[test]
+    fn takes_a_folder_from_before_the_check_as_this_machines() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let first = own_key(&dir.path().join(HOST_KEY))?;
+        forget_another_machine(dir.path(), Some("MAC-A"))?;
+        assert_eq!(own_key(&dir.path().join(HOST_KEY))?, first);
+        // Nothing to tell machines apart by: nothing is dropped or written.
+        forget_another_machine(dir.path(), None)?;
+        assert_eq!(fs::read_to_string(dir.path().join(MACHINE))?, "MAC-A\n");
+        Ok(())
+    }
+
+    #[test]
+    fn names_the_machine_as_the_app_reads_it() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let example = include_str!("../contract/machine");
+        forget_another_machine(dir.path(), Some(example.trim()))?;
+        assert_eq!(fs::read_to_string(dir.path().join(MACHINE))?, example);
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn reads_the_machine_as_the_app_does() -> Result<()> {
+        let shown = std::process::Command::new("/usr/sbin/ioreg")
+            .args(["-rd1", "-c", "IOPlatformExpertDevice"])
+            .output()?;
+        let shown = String::from_utf8(shown.stdout)?;
+        let uuid = shown
+            .lines()
+            .find_map(|line| line.split("\"IOPlatformUUID\" = \"").nth(1))
+            .and_then(|rest| rest.split('"').next())
+            .context("no IOPlatformUUID")?;
+        assert_eq!(this_machine().as_deref(), Some(uuid));
+        Ok(())
     }
 
     #[test]

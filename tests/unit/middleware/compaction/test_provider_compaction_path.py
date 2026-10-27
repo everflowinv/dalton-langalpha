@@ -22,6 +22,7 @@ from langgraph.constants import TAG_NOSTREAM
 from ptc_agent.agent.middleware.compaction import compact as compact_module
 from ptc_agent.agent.middleware.compaction import middleware as mw_module
 from ptc_agent.agent.middleware.compaction.compact import Summarizer
+from ptc_agent.agent.middleware.compaction.measure import Estimate
 from ptc_agent.agent.middleware.compaction.middleware import CompactionMiddleware
 from ptc_agent.agent.middleware.compaction.summarize import PROVIDER_LEAD
 from ptc_agent.agent.middleware.compaction.summary_request import NATIVE_SUMMARY_PROMPT
@@ -115,10 +116,12 @@ async def _run(model, answer, *, native=True, summary_model=None, history=None):
     summary_model = summary_model or _summary_model()
     mw = CompactionMiddleware(
         Summarizer(summary_model, limit=100_000, counter=len),
-        token_threshold=5,
-        keep_messages=2,
+        token_threshold=6,
+        keep_tokens=2,
         native=native,
     )
+    # A token a message for Claude too, so the kept part is the newest two.
+    mw._estimate = lambda model: Estimate(len)
     handler = _Handler(answer)
     history = history or _history()
     request = ModelRequest(

@@ -279,7 +279,7 @@ def build_graph(
     compaction = CompactionMiddleware(
         Summarizer(run.summary_model, limit=10**9, counter=len),
         token_threshold=THRESHOLD,
-        keep_messages=KEEP,
+        keep_tokens=KEEP,
         offload=OffloadSettings(keep_messages=KEEP, max_length=200, idle_seconds=0.0),
         backend=_backend(run.store),
         workspace_id="ws-1",
@@ -287,7 +287,7 @@ def build_graph(
     scratchpad = ThreadScratchpad(
         folder=f"{WORKSPACE}/.agents/scratchpad/", notes_dir=NOTES_DIR, notes_subdir=NOTES_SUBDIR
     )
-    notes_rows = NotesDueMiddleware(scratchpad, compaction)
+    notes_rows = NotesDueMiddleware(scratchpad, compaction, run.model)
     if window:
 
         async def coverage(

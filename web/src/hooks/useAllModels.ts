@@ -30,7 +30,6 @@ interface SystemDefaults {
 
 export interface CompactionProfilePreset {
   token_threshold: number;
-  keep_messages: number;
 }
 
 export type CompactionProfileName =
