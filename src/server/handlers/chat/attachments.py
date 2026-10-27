@@ -73,7 +73,7 @@ async def attach_request_files(
     # DALTON-HOOK(attachment-native-cap): an image or PDF above what a provider
     # takes inline rides the sandbox path instead; inlined, it stays in the
     # thread's history and fails every later turn on the request size.
-    from src.dalton.attachments import split_oversized
+    from src.dalton.attachments import decoded_size, reading_path_text, split_oversized
 
     supported, oversized = split_oversized(supported)
     file_only = file_only + oversized
@@ -114,17 +114,12 @@ async def attach_request_files(
                 "user to upload it again from the file panel."
             )
         note = f"The user attached a file ({desc}, {mime}). It has been saved to {fpath}."
-        if oversized_ctx and mime.startswith("image/"):
-            return note + (
-                " The image is over 5 MB — the Read tool cannot open it; shrink "
-                "it below 5 MB with Python (PIL) first, then view it with Read."
-            )
-        if oversized_ctx and mime == "application/pdf":
-            return note + (
-                " The PDF is over 5 MB — the Read tool cannot open it; extract "
-                "its text with Python (pypdf / pdfplumber), or split it into "
-                "< 5 MB page files / render pages to images before viewing with Read."
-            )
+        if oversized_ctx:
+            # DALTON-HOOK(attachment-native-cap): one shared wording with the
+            # attachment-budget eviction pointer, so the two surfaces cannot
+            # disagree on how to read a file over Read's size limit.
+            kind = "pdf" if mime == "application/pdf" else "image"
+            return note + " " + reading_path_text(kind, decoded_size(data), lang="en")
         return note + " Use Python to process it."
 
     # 4. Unsupported image/PDF: "cannot view" warning + file paths

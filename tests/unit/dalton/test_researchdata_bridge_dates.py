@@ -267,3 +267,31 @@ def test_guidepoint_fanout_carries_normalized_nested_start_and_end_dates(monkeyp
     )
     assert gp_args["params"]["start_date"] == "2026-09-01"
     assert gp_args["params"]["end_date"] == "2026-10-26"
+
+
+def test_guidepoint_fanout_with_both_windows_sends_only_the_nested_one(monkeypatch):
+    # route='all' with a top-level window and a disagreeing nested one used to
+    # carry both on the Guidepoint leg, and the gateway rejected the whole leg
+    # with a date-parameter conflict. The nested window belongs to Guidepoint;
+    # the top-level one still rides the AlphaEngine leg untouched.
+    monkeypatch.setattr(rb, "_bridge_today", lambda: "2026-10-26")
+    arguments = {
+        "route": "all",
+        "query": "Meta advertising",
+        "start": "2026-10-01",
+        "end": "2026-10-26",
+        "params": {"start_date": "2026-09-01", "end_date": "2026-10-15"},
+    }
+    gp_args = rb.ResearchDataBridge._build_guidepoint_fanout_args(
+        _fanout_bridge(), arguments
+    )
+    assert "start" not in gp_args
+    assert "end" not in gp_args
+    assert gp_args["params"]["start_date"] == "2026-09-01"
+    assert gp_args["params"]["end_date"] == "2026-10-15"
+
+    ae_args = rb.ResearchDataBridge._build_alphaengine_fanout_args(
+        _fanout_bridge(), arguments
+    )
+    assert ae_args["start"] == "2026-10-01"
+    assert ae_args["end"] == "2026-10-26"

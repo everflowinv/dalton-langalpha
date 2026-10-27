@@ -4836,20 +4836,29 @@ class ResearchDataBridge:
         }
         start = str(arguments.get("start") or "").strip()
         end = str(arguments.get("end") or "").strip()
-        if start:
-            gp_args["start"] = start
-        if end:
-            gp_args["end"] = end
-        # Shared window rules (end truncated to `_bridge_today()`, ordering
-        # checked); a lone end stays lone — Guidepoint, unlike AlphaEngine,
-        # accepts half a window. The entry point already validated the dates.
-        _normalize_date_window("guidepoint", gp_args)
+        raw_params = arguments.get("params")
+        # A nested window (params.start_date/end_date) belongs to this leg
+        # alone; carrying the top-level start/end beside it makes the gateway
+        # reject the whole call with a date-parameter conflict when the two
+        # disagree, so when a nested window is present it is the only one sent.
+        # AlphaEngine's leg keeps the top-level window either way.
+        has_nested_window = isinstance(raw_params, dict) and any(
+            str(raw_params.get(k) or "").strip() for k in ("start_date", "end_date")
+        )
+        if not has_nested_window:
+            if start:
+                gp_args["start"] = start
+            if end:
+                gp_args["end"] = end
+            # Shared window rules (end truncated to `_bridge_today()`, ordering
+            # checked); a lone end stays lone — Guidepoint, unlike AlphaEngine,
+            # accepts half a window. The entry point already validated the dates.
+            _normalize_date_window("guidepoint", gp_args)
 
         limit = arguments.get("limit")
         if isinstance(limit, int) and not isinstance(limit, bool) and limit > 0:
             gp_args["limit"] = min(limit, 40)
 
-        raw_params = arguments.get("params")
         if isinstance(raw_params, dict):
             gp_params: dict[str, Any] = {}
             raw_keywords = raw_params.get("keywords")

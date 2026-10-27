@@ -7,6 +7,7 @@ both in the MCP servers' own chain (plugins/langalpha_market_data).
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from unittest.mock import create_autospec, patch
 
 import pytest
@@ -24,6 +25,11 @@ import plugins.langalpha_market_data.price_data_mcp_server as _price_module  # n
 
 _REAL_YF_FETCH = _price_module._yf_fetch_history
 _REAL_YF_STATEMENTS = _fund_module._yf_statements
+
+
+def _epoch(year: int, month: int, day: int) -> int:
+    """Yahoo's date fields are epoch seconds (UTC midnight of the date)."""
+    return int(datetime(year, month, day, tzinfo=timezone.utc).timestamp())
 
 # Epoch-ms rows in the shape `_yf_fetch_history` produces (normalize_bars input).
 _YF_ROWS = [
@@ -226,6 +232,129 @@ class TestGetStockDataOrder:
         assert len(result["data"]) == 2
         assert "2026-10-20 09:30:00" in result["note"]
         assert "2026-10-20 10:30:00" in result["note"]
+        # FMP errored (the 402), so the fallback itself is what was unavailable.
+        assert "FMP fallback unavailable" in result["note"]
+        assert "FMP 无该区间数据" not in result["note"]
+
+    @pytest.mark.asyncio
+    async def test_a_200_with_no_fmp_rows_says_fmp_has_no_data_for_the_range(self):
+        import plugins.langalpha_market_data.price_data_mcp_server as mod
+
+        partial_rows = [
+            {"time": 1792503000000, "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.5, "volume": 500}
+        ]
+        client = _fmp_client()
+        client.get_intraday_chart.return_value = []
+        with _ginlix_miss(mod), \
+             patch.object(mod, "_yf_fetch_history", new=create_autospec(
+                 _REAL_YF_FETCH, return_value=partial_rows
+             )), \
+             patch(f"{_PRICE_MOD}.get_fmp_client", return_value=client):
+            result = await mod.get_stock_data(
+                "AAPL",
+                interval="1min",
+                start_date="2026-10-01 09:30",
+                end_date="2026-10-26 16:00",
+            )
+
+        assert result["source"] == "yfinance"
+        # A 200 with no rows is FMP having no data in the window, not a broken
+        # fallback — the note must not claim otherwise.
+        assert "FMP 无该区间数据" in result["note"]
+        assert "FMP fallback unavailable" not in result["note"]
+
+
+# ---------------------------------------------------------------------------
+# Start-coverage judgment and midday-break bars
+# ---------------------------------------------------------------------------
+
+
+class TestYfCoversStart:
+    def test_a_weekend_start_is_covered_by_mondays_daily_bar(self):
+        import plugins.langalpha_market_data.price_data_mcp_server as mod
+
+        # 2026-10-24 is a Saturday; the first daily bar is Monday the 26th.
+        rows = [{"date": "2026-10-26"}]
+        assert mod._yf_covers_start(rows, "2026-10-24", intraday=False, display="AAPL")
+
+    def test_an_intraday_start_inside_the_1330_gap_is_still_covered(self):
+        import plugins.langalpha_market_data.price_data_mcp_server as mod
+
+        # 13:01 sits between 5-minute bars; the 13:05 bar is coverage, not a gap.
+        rows = [{"date": "2026-10-26 13:05:00"}]
+        assert mod._yf_covers_start(
+            rows, "2026-10-26 13:01", intraday=True, display="AAPL"
+        )
+
+    def test_a_weekend_intraday_start_gets_the_next_session_open(self):
+        import plugins.langalpha_market_data.price_data_mcp_server as mod
+
+        rows = [{"date": "2026-10-26 09:30:00"}]
+        assert mod._yf_covers_start(
+            rows, "2026-10-24 10:00", intraday=True, display="AAPL"
+        )
+
+    def test_a_capped_one_minute_history_of_a_two_month_request_is_not_covered(self):
+        import plugins.langalpha_market_data.price_data_mcp_server as mod
+
+        # Yahoo caps 1m history near 7 days; a request from 2026-08-25 gets
+        # bars only from 2026-10-20 — a real gap.
+        rows = [{"date": "2026-10-20 09:30:00"}]
+        assert not mod._yf_covers_start(
+            rows, "2026-08-25 09:30", intraday=True, display="AAPL"
+        )
+
+    def test_a_daily_gap_beyond_four_days_is_not_covered(self):
+        import plugins.langalpha_market_data.price_data_mcp_server as mod
+
+        rows = [{"date": "2026-10-20"}]
+        assert not mod._yf_covers_start(rows, "2026-10-01", intraday=False, display="AAPL")
+
+
+class TestMiddayBreakBars:
+    @staticmethod
+    def _ms(year, month, day, hour, minute):
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+
+        return int(datetime(year, month, day, hour, minute, tzinfo=ZoneInfo("Asia/Shanghai")).timestamp() * 1000)
+
+    def test_bars_inside_the_a_share_break_are_dropped(self):
+        # The XSHG break on 2026-10-26 runs 11:30–13:00 Asia/Shanghai.
+        import plugins.langalpha_market_data.price_data_mcp_server as mod
+
+        rows = [
+            {"time": self._ms(2026, 10, 26, 9, 30)},
+            {"time": self._ms(2026, 10, 26, 11, 25)},  # 5min bar ending exactly at the break
+            {"time": self._ms(2026, 10, 26, 11, 35)},  # wholly inside the break
+            {"time": self._ms(2026, 10, 26, 13, 0)},  # the reopen
+        ]
+        placed = mod._drop_midday_break_bars(rows, "600519.SH", "5min")
+        assert [b["time"] for b in placed] == [
+            self._ms(2026, 10, 26, 9, 30),
+            self._ms(2026, 10, 26, 11, 25),
+            self._ms(2026, 10, 26, 13, 0),
+        ]
+
+    def test_an_hourly_bar_straddling_the_break_is_reanchored_to_the_reopen(self):
+        # Yahoo's hourly grid starts a 12:30 bar inside the break; it ends at
+        # 13:30, past the reopen, so it carries the reopen's trades and moves
+        # to 13:00 rather than being dropped. A fully-inside 11:30 bar goes.
+        import plugins.langalpha_market_data.price_data_mcp_server as mod
+
+        rows = [
+            {"time": self._ms(2026, 10, 26, 11, 30)},
+            {"time": self._ms(2026, 10, 26, 12, 30)},
+        ]
+        placed = mod._drop_midday_break_bars(rows, "600519.SH", "1hour")
+        assert [b["time"] for b in placed] == [self._ms(2026, 10, 26, 13, 0)]
+
+    def test_a_venue_without_a_break_keeps_every_bar(self):
+        import plugins.langalpha_market_data.price_data_mcp_server as mod
+
+        rows = [{"time": self._ms(2026, 10, 26, 12, 0)}]
+        placed = mod._drop_midday_break_bars(rows, "AAPL", "5min")
+        assert placed == rows
 
 
 # ---------------------------------------------------------------------------
@@ -261,6 +390,11 @@ class TestStatementsPlanFallback:
         )
         ticker_inst = create_autospec(mod._yf.Ticker, instance=True)
         ticker_inst.income_stmt = df
+        # A Dec-FYE issuer reporting in HKD: annual columns stay FY/<year>.
+        ticker_inst.info = {
+            "financialCurrency": "HKD",
+            "lastFiscalYearEnd": _epoch(2025, 12, 31),
+        }
         ticker_cls = create_autospec(mod._yf.Ticker, return_value=ticker_inst)
 
         with patch(f"{_FUND_MOD}.get_fmp_client", return_value=client), \
@@ -277,6 +411,8 @@ class TestStatementsPlanFallback:
         first = result["data"][0]
         assert first["period"] == "FY"
         assert first["calendarYear"] == "2025"
+        assert first["fiscalYear"] == "2025"
+        assert first["reportedCurrency"] == "HKD"
         assert first["revenue"] == 1000.0
         assert first["netIncome"] == 220.0
         assert first["weightedAverageShsOutDil"] == 100.0
@@ -287,6 +423,7 @@ class TestStatementsPlanFallback:
         # Unmapped Yahoo metrics are not injected into period records
         assert "Unmapped Custom Metric" not in first
         assert "口径" in result["note"]
+        assert "period / fiscalYear 未知" not in result["note"]
 
     @pytest.mark.asyncio
     async def test_statement_type_all_returns_three_lists_and_total_count(self):
@@ -313,6 +450,10 @@ class TestStatementsPlanFallback:
         ticker_inst.quarterly_income_stmt = inc_df
         ticker_inst.quarterly_balance_sheet = bal_df
         ticker_inst.quarterly_cashflow = cf_df
+        ticker_inst.info = {
+            "financialCurrency": "HKD",
+            "lastFiscalYearEnd": _epoch(2025, 12, 31),
+        }
         ticker_cls = create_autospec(mod._yf.Ticker, return_value=ticker_inst)
 
         with patch(f"{_FUND_MOD}.get_fmp_client", return_value=client), \
@@ -363,6 +504,168 @@ class TestStatementsPlanFallback:
 
         assert result["error"] == "upstream_error"
         yf_spy.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# yfinance statements: reporting currency, fiscal labels, computed fields
+# ---------------------------------------------------------------------------
+
+
+class TestStatementsFiscalShape:
+    @pytest.mark.asyncio
+    async def test_reported_currency_is_the_financial_currency_not_the_listing_one(self):
+        # A mainland issuer listed in HKD that reports in CNY: the quote
+        # currency must not pose as the reporting currency.
+        import pandas as pd
+        import plugins.langalpha_market_data.fundamentals_mcp_server as mod
+
+        client = _fmp_client()
+        client.get_income_statement.side_effect = FMPRequestError(
+            "FMP API request failed (402)", status_code=402
+        )
+        df = pd.DataFrame(
+            {"2025-06-30": [500.0]},
+            index=pd.Index(["Total Revenue"]),
+        )
+        ticker_inst = create_autospec(mod._yf.Ticker, instance=True)
+        ticker_inst.quarterly_income_stmt = df
+        ticker_inst.info = {
+            "financialCurrency": "CNY",
+            "lastFiscalYearEnd": _epoch(2025, 6, 30),
+        }
+        ticker_cls = create_autospec(mod._yf.Ticker, return_value=ticker_inst)
+
+        with patch(f"{_FUND_MOD}.get_fmp_client", return_value=client), \
+             patch.object(mod._yf, "Ticker", new=ticker_cls):
+            result = await mod.get_financial_statements(
+                "3690.HK", statement_type="income", period="quarter", limit=1
+            )
+
+        assert result["source"] == "yfinance"
+        assert result["data"][0]["reportedCurrency"] == "CNY"
+
+    @pytest.mark.asyncio
+    async def test_quarter_labels_follow_the_issuer_fiscal_calendar(self):
+        # MSFT's fiscal year ends June 30, so a quarter ending 2025-09-30 is
+        # Q1 of FY2026 — not Q3 of 2025 as a calendar split would say.
+        import pandas as pd
+        import plugins.langalpha_market_data.fundamentals_mcp_server as mod
+
+        client = _fmp_client()
+        client.get_income_statement.side_effect = FMPRequestError(
+            "FMP API request failed (402)", status_code=402
+        )
+        df = pd.DataFrame(
+            {"2025-09-30": [500.0]},
+            index=pd.Index(["Total Revenue"]),
+        )
+        ticker_inst = create_autospec(mod._yf.Ticker, instance=True)
+        ticker_inst.quarterly_income_stmt = df
+        ticker_inst.info = {
+            "financialCurrency": "USD",
+            "lastFiscalYearEnd": _epoch(2026, 6, 30),
+        }
+        ticker_cls = create_autospec(mod._yf.Ticker, return_value=ticker_inst)
+
+        with patch(f"{_FUND_MOD}.get_fmp_client", return_value=client), \
+             patch.object(mod._yf, "Ticker", new=ticker_cls):
+            result = await mod.get_financial_statements(
+                "MSFT", statement_type="income", period="quarter", limit=1
+            )
+
+        first = result["data"][0]
+        assert first["period"] == "Q1"
+        assert first["fiscalYear"] == "2026"
+        assert first["calendarYear"] == "2025"
+        assert "period / fiscalYear 未知" not in result["note"]
+
+    @pytest.mark.asyncio
+    async def test_without_fiscal_metadata_both_labels_are_none_and_noted(self):
+        import pandas as pd
+        import plugins.langalpha_market_data.fundamentals_mcp_server as mod
+
+        client = _fmp_client()
+        client.get_income_statement.side_effect = FMPRequestError(
+            "FMP API request failed (402)", status_code=402
+        )
+        df = pd.DataFrame(
+            {"2025-09-30": [500.0]},
+            index=pd.Index(["Total Revenue"]),
+        )
+        ticker_inst = create_autospec(mod._yf.Ticker, instance=True)
+        ticker_inst.quarterly_income_stmt = df
+        ticker_inst.info = {}
+        ticker_cls = create_autospec(mod._yf.Ticker, return_value=ticker_inst)
+
+        with patch(f"{_FUND_MOD}.get_fmp_client", return_value=client), \
+             patch.object(mod._yf, "Ticker", new=ticker_cls):
+            result = await mod.get_financial_statements(
+                "MSFT", statement_type="income", period="quarter", limit=1
+            )
+
+        first = result["data"][0]
+        assert first["period"] is None
+        assert first["fiscalYear"] is None
+        assert first["calendarYear"] == "2025"
+        assert "period / fiscalYear 未知" in result["note"]
+
+    @pytest.mark.asyncio
+    async def test_ratios_need_both_sides_and_ebit_never_borrows_operating_income(self):
+        import pandas as pd
+        import plugins.langalpha_market_data.fundamentals_mcp_server as mod
+
+        client = _fmp_client()
+        client.get_income_statement.side_effect = FMPRequestError(
+            "FMP API request failed (402)", status_code=402
+        )
+        inc_df = pd.DataFrame(
+            {
+                "2025-09-30": [1000.0, 400.0, 300.0, 200.0, 250.0],
+                "2025-06-30": [900.0, float("nan"), 280.0, 180.0, 220.0],
+            },
+            index=pd.Index(
+                ["Total Revenue", "Gross Profit", "Operating Income", "Net Income", "EBITDA"]
+            ),
+        )
+        bal_df = pd.DataFrame(
+            {
+                "2025-09-30": [100.0, 50.0, 500.0],
+                "2025-06-30": [80.0, float("nan"), 400.0],
+            },
+            index=pd.Index(
+                ["Cash And Cash Equivalents", "Other Short Term Investments", "Total Assets"]
+            ),
+        )
+        ticker_inst = create_autospec(mod._yf.Ticker, instance=True)
+        ticker_inst.quarterly_income_stmt = inc_df
+        ticker_inst.quarterly_balance_sheet = bal_df
+        ticker_inst.info = {"financialCurrency": "USD", "lastFiscalYearEnd": _epoch(2025, 12, 31)}
+        ticker_cls = create_autospec(mod._yf.Ticker, return_value=ticker_inst)
+
+        with patch(f"{_FUND_MOD}.get_fmp_client", return_value=client), \
+             patch.object(mod._yf, "Ticker", new=ticker_cls):
+            result = await mod.get_financial_statements(
+                "AAPL", statement_type="all", period="quarter", limit=2
+            )
+
+        sep = result["data"]["income_statement"][0]  # 2025-09-30, every input present
+        assert sep["grossProfitRatio"] == 0.4
+        assert sep["operatingIncomeRatio"] == 0.3
+        assert sep["netIncomeRatio"] == 0.2
+        assert sep["ebitdaratio"] == 0.25
+        # No EBIT row on Yahoo: Operating Income must not pose as EBIT.
+        assert sep["ebit"] is None
+
+        jun = result["data"]["income_statement"][1]  # 2025-06-30, gross profit missing
+        assert jun["grossProfitRatio"] is None
+        assert jun["operatingIncomeRatio"] == round(280.0 / 900.0, 6)
+
+        bal_sep = result["data"]["balance_sheet"][0]  # cash + short-term both present
+        assert bal_sep["cashAndShortTermInvestments"] == 150.0
+        bal_jun = result["data"]["balance_sheet"][1]  # short-term missing: cash alone is not the sum
+        assert bal_jun["cashAndShortTermInvestments"] is None
+        assert "cashAndShortTermInvestments" in result["note"]
+        assert "grossProfitRatio" in result["note"]
 
 
 # ---------------------------------------------------------------------------

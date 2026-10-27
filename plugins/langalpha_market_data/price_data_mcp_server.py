@@ -33,7 +33,7 @@ except ModuleNotFoundError:  # imported as a package module (tests)
 
 import asyncio
 import logging
-from datetime import datetime, timedelta, timezone as _tz
+from datetime import date, datetime, timedelta, timezone as _tz
 from typing import Any, Literal, Optional
 
 import httpx
@@ -284,8 +284,31 @@ def _filter_display_rows_to_window(
     ]
 
 
+def _yf_expected_session_day(display: str, start_day: date) -> Optional[date]:
+    """The session an intraday start belongs to: its own day when that trades,
+    else the next session (a weekend/holiday start gets the next open)."""
+    try:
+        from market_protocol.calendars import get_calendar
+
+        cal = get_calendar(to_canonical(display).calendar_id)
+    except Exception:  # noqa: BLE001 — unknown venue, caller falls back to a grace span
+        return None
+    day = start_day
+    for _ in range(15):  # enough to bridge the longest venue holiday closure
+        if cal.is_trading_day(day):
+            return day
+        day = day + timedelta(days=1)
+    return None
+
+
+# DALTON-HOOK(market-data-fallback): the first bar need not carry the requested
+# start itself — a weekend start gets Monday's daily bar, a 13:01 intraday
+# start the 13:05 bar (or the next session's open when 13:01 sits in a break).
+# Only a real gap counts as uncovered (a capped 1m history serving the last
+# 7 days of a two-month request); the old timestamp comparison read every
+# off-hours start as a miss and burned FMP quota re-asking a served window.
 def _yf_covers_start(
-    rows: list[dict], start_date: Optional[str], *, intraday: bool
+    rows: list[dict], start_date: Optional[str], *, intraday: bool, display: str = ""
 ) -> bool:
     if not start_date or not rows:
         return True
@@ -293,10 +316,55 @@ def _yf_covers_start(
     first_date = str(rows[0].get("date") or "").strip()
     if not first_date:
         return True
-    if intraday and len(s) > 10:
-        req_start = f"{s}:00" if len(s) == 16 else s[:19]
-        return first_date <= req_start
-    return first_date[:10] <= s[:10]
+    try:
+        start_day = date.fromisoformat(s[:10])
+        first_day = date.fromisoformat(first_date[:10])
+    except ValueError:
+        return True
+    if intraday:
+        expected = _yf_expected_session_day(display, start_day)
+        if expected is not None:
+            return first_day <= expected
+    return (first_day - start_day).days <= 4
+
+
+_INTRADAY_SPAN_SECONDS: dict[str, int] = {
+    "1min": 60, "5min": 300, "15min": 900, "30min": 1800, "1hour": 3600,
+}
+
+
+def _drop_midday_break_bars(
+    rows: list[dict], display: str, canonical: str
+) -> list[dict]:
+    """Mirror the main chain's midday-break placement (yfinance
+    ``data_source._place_in_sessions``): a bar wholly inside a venue's break is
+    Yahoo's zero-volume padding and is dropped; one that starts inside the
+    break and ends past the reopen carries the reopen's trades and is
+    re-anchored there. Venues without a break have no midday window and keep
+    every bar. Built on ``market_protocol`` alone (the sandbox ships no ``src.``
+    packages), so both legs of the chain drop the same bars.
+    """
+    try:
+        from market_protocol.calendars import get_calendar, session_bounds
+
+        ref = to_canonical(display)
+        cal = get_calendar(ref.calendar_id)
+    except Exception:  # noqa: BLE001 — no calendar, no break to filter
+        return rows
+    span_ms = _INTRADAY_SPAN_SECONDS.get(canonical, 0) * 1000
+    breaks: dict[date, Optional[tuple[int, int]]] = {}
+    placed: list[dict] = []
+    for bar in rows:
+        day = datetime.fromtimestamp(bar["time"] / 1000, cal.tz).date()
+        if day not in breaks:
+            bounds = session_bounds(ref.calendar_id, day.isoformat())
+            breaks[day] = (bounds[2], bounds[3]) if bounds and bounds[2] is not None else None
+        brk = breaks[day]
+        if brk is None or not brk[0] <= bar["time"] < brk[1]:
+            placed.append(bar)
+        elif bar["time"] + span_ms > brk[1]:
+            placed.append({**bar, "time": brk[1]})
+    return placed
 
 
 def _yf_fetch_history(
@@ -359,6 +427,11 @@ def _yf_fetch_history(
                 "volume": int(volume) if volume == volume else 0,
             }
         )
+    # DALTON-HOOK(market-data-fallback): drop the break-time zero-volume bars
+    # Yahoo pads CN/HK intraday with, the same placement rule the main
+    # yfinance chain applies, so both legs return the same sessions.
+    if canonical != "1day":
+        rows = _drop_midday_break_bars(rows, display, canonical)
     return rows
 
 
@@ -507,7 +580,7 @@ async def _fetch_stock_bars(
                 intraday=intraday,
             )
             if yf_data:
-                if _yf_covers_start(yf_data, start_date, intraday=intraday):
+                if _yf_covers_start(yf_data, start_date, intraday=intraday, display=display):
                     return {
                         "data": yf_data,
                         "source": "yfinance",
@@ -518,6 +591,10 @@ async def _fetch_stock_bars(
                     }, None
                 actual_start = yf_data[0]["date"]
                 actual_end = yf_data[-1]["date"]
+                # DALTON-HOOK(market-data-fallback): the FMP clause is stamped
+                # when this partial answer is actually returned — a 200 with no
+                # rows for the window is "FMP has no data there", not an
+                # unavailable fallback.
                 partial_yf = {
                     "data": yf_data,
                     "source": "yfinance",
@@ -527,17 +604,19 @@ async def _fetch_stock_bars(
                     "timezone": timezone,
                     "note": (
                         f"yfinance partial coverage: actual covered range is "
-                        f"{actual_start} to {actual_end} (requested start_date={start_date}; "
-                        f"FMP fallback unavailable)."
+                        f"{actual_start} to {actual_end} (requested start_date={start_date}"
                     ),
                 }
+
+    def _partial_with_outcome(outcome: str) -> tuple[dict, None]:
+        return {**partial_yf, "note": f"{partial_yf['note']}; {outcome})"}, None
 
     # DALTON-HOOK(market-data-fallback): FMP fallback (all markets; converts GBX/pence to pounds).
     try:
         client = await get_fmp_client()
     except Exception:  # noqa: BLE001
         if partial_yf is not None:
-            return partial_yf, None
+            return _partial_with_outcome("FMP fallback unavailable")
         return None, refused or make_error(
             "client_unavailable",
             "FMP client unavailable (FMP_API_KEY not configured).",
@@ -557,21 +636,23 @@ async def _fetch_stock_bars(
             )
     except Exception as e:  # noqa: BLE001
         if partial_yf is not None:
-            return partial_yf, None
+            return _partial_with_outcome("FMP fallback unavailable")
         return None, refused or error_from_exception(
             e, "FMP fetch failed.", symbol=display, interval=canonical
         )
     if not isinstance(rows or [], list):
         # FMP answers some failures with a 200 and an error object, not rows.
         if partial_yf is not None:
-            return partial_yf, None
+            return _partial_with_outcome("FMP fallback unavailable")
         return None, refused or make_error(
             "upstream_error", "FMP fetch failed.", symbol=display, interval=canonical
         )
 
     data = _display_rows(rows or [], legacy, intraday=intraday, scale=scale)
     if not data and partial_yf is not None:  # DALTON-HOOK(market-data-fallback)
-        return partial_yf, None
+        # A 200 with no rows for the window: FMP has no data there, the
+        # fallback itself is fine.
+        return _partial_with_outcome("FMP 无该区间数据")
     if refused and not data:
         return None, refused
     return {

@@ -1,9 +1,12 @@
 """Cross-turn inline attachment budget middleware.
 
 Caps total decoded bytes of inline image/PDF content blocks sent in a single
-model request by walking user messages from newest to oldest and replacing
-earlier attachment blocks beyond the 12 MB request budget with a compact text
-pointer to the workspace copy, without mutating checkpoint messages.
+model request by walking messages from newest to oldest — user messages and
+tool results together, since a ``Read`` image or PDF rides on its
+``ToolMessage`` — and replacing earlier attachment blocks beyond the 12 MB
+request budget with a compact text pointer to the workspace copy, without
+mutating checkpoint messages. An evicted block is swapped inside its message,
+so a tool call/result pair always survives with its ``tool_call_id`` intact.
 """
 
 from __future__ import annotations
@@ -18,13 +21,58 @@ from src.llms.attachment_payload import is_attachment_block, is_file_block, is_t
 
 NATIVE_REQUEST_MAX_BYTES = 12 * 1024 * 1024
 
+#: The Read tool refuses an inline view above this size, so a bigger file needs
+#: a Python-first reading path (PIL shrink, pypdf/pdfplumber extraction).
+READ_INLINE_MAX_BYTES = 5 * 1024 * 1024
+
 _ATTACHED_LABEL_RE = re.compile(
-    r"^\[Attached (?:PDF|image):\s*(.+?)(?:\s*\(saved to ([^)]+)\))?\]$"
+    r"^\[(?:Attached (?:PDF|image)|Viewing (?:PDF|image)):\s*(.+?)"
+    r"(?:\s*\(saved to ([^)]+)\))?\]$"
 )
-_REMINDER_SAVED_RE = re.compile(
-    r"-\s*(?:PDF|Image|File)\s+'([^']+)'[^\n]*?\bsaved to\s+([^\s)]+)"
+# The upload note (`build_file_reminder` in src/server/utils/multimodal_context.py)
+# is where name→path is recorded per attachment: "The user attached a file
+# (name, mime). It has been saved to path." — the pairs below are matched by
+# name, never assigned by position.
+_FILE_NOTE_RE = re.compile(
+    r"The user attached a file \(([^,)]+), [^)]+\)\. It has been saved to (\S+)"
 )
 _GENERIC_SAVED_RE = re.compile(r"\bsaved to\s+([^\s)]+)")
+
+#: How to read a file the Read tool cannot take inline — one wording per
+#: language, written once for both the upload note
+#: (src/server/handlers/chat/attachments.py) and the eviction pointer below so
+#: the two surfaces cannot drift apart.
+_OVERSIZED_READING_PATHS: dict[str, dict[str, str]] = {
+    "en": {
+        "image": (
+            "The image is over 5 MB — the Read tool cannot open it; shrink "
+            "it below 5 MB with Python (PIL) first, then view it with Read."
+        ),
+        "pdf": (
+            "The PDF is over 5 MB — the Read tool cannot open it; extract "
+            "its text with Python (pypdf / pdfplumber), or split it into "
+            "< 5 MB page files / render pages to images before viewing with Read."
+        ),
+    },
+    "zh": {
+        "image": "先用 Python（PIL）缩小到 5 MB 以下再用 Read",
+        "pdf": "Read 打不开超过 5 MB 的 PDF，用 Python（pypdf / pdfplumber）提取文字，或拆成小于 5 MB 的文件再读",
+    },
+}
+
+
+def reading_path_text(kind: str, size_bytes: int | None, *, lang: str = "zh") -> str:
+    """The reading path for an image/PDF of this decoded size.
+
+    Over ``READ_INLINE_MAX_BYTES`` the wording routes around Read's size
+    refusal; at or under it Read serves the file directly. The English
+    small-file branch is unreachable today (the upload note only describes
+    oversized stashed files) and mirrors the note's plain-file tail.
+    """
+    if size_bytes is not None and size_bytes <= READ_INLINE_MAX_BYTES:
+        return "Use Python to process it." if lang == "en" else "用 Read 查看"
+    wording = _OVERSIZED_READING_PATHS.get(lang, _OVERSIZED_READING_PATHS["zh"])
+    return wording[kind]
 
 
 def _decoded_size(data: str) -> int:
@@ -65,6 +113,12 @@ def _is_user_message(msg: Any) -> bool:
     return getattr(msg, "type", None) in ("human", "user")
 
 
+def _is_tool_message(msg: Any) -> bool:
+    if isinstance(msg, dict):
+        return msg.get("role") == "tool" or msg.get("type") == "tool"
+    return getattr(msg, "type", None) == "tool"
+
+
 def _clean_path(raw_path: str | None) -> str | None:
     if not raw_path:
         return None
@@ -72,9 +126,31 @@ def _clean_path(raw_path: str | None) -> str | None:
     return cleaned or None
 
 
+def _note_pairs(content: list[Any]) -> list[tuple[str, str]]:
+    """(name, path) pairs the upload notes in this message recorded explicitly."""
+    pairs: list[tuple[str, str]] = []
+    for item in content:
+        if not is_text_block(item):
+            continue
+        for m in _FILE_NOTE_RE.finditer(str(item.get("text") or "")):
+            name = m.group(1).strip()
+            path = _clean_path(m.group(2))
+            if name and path:
+                pairs.append((name, path))
+    return pairs
+
+
 def _extract_name_and_path(
     block: dict[str, Any], idx: int, content: list[Any]
 ) -> tuple[str, str | None]:
+    """(name, path) for an attachment block, from associations recorded with it.
+
+    Only explicit ones count: the label injected in front of the block
+    (``[Attached PDF: name (saved to path)]``), the block's own filename, or an
+    upload note whose file name equals this attachment's. A path saved for a
+    different attachment is never borrowed — a wrong pointer is worse than
+    none, because the model would Read a path that is not the file it saw.
+    """
     label_name: str | None = None
     label_path: str | None = None
     if idx > 0 and is_text_block(content[idx - 1]):
@@ -90,42 +166,28 @@ def _extract_name_and_path(
     name = str(block_name or label_name or "").strip()
     path = label_path
 
-    # Scan message text blocks for upload note paths if not already resolved.
-    reminder_pairs: list[tuple[str, str]] = []
-    generic_paths: list[str] = []
-    for item in content:
-        if not is_text_block(item):
-            continue
-        text = str(item.get("text") or "")
-        for rm in _REMINDER_SAVED_RE.finditer(text):
-            n_cand = rm.group(1).strip()
-            p_cand = _clean_path(rm.group(2))
-            if n_cand and p_cand:
-                reminder_pairs.append((n_cand, p_cand))
-        for gm in _GENERIC_SAVED_RE.finditer(text):
-            p_cand = _clean_path(gm.group(1))
-            if p_cand:
-                generic_paths.append(p_cand)
-
-    if not name and reminder_pairs:
-        name, path = reminder_pairs[0]
     if not path and name:
-        for n_cand, p_cand in reminder_pairs:
+        for n_cand, p_cand in _note_pairs(content):
             if n_cand == name:
                 path = p_cand
                 break
         if not path:
-            for p_cand in generic_paths:
-                if posixpath.basename(p_cand) == name:
-                    path = p_cand
+            # A saved path counts only when the file is named exactly like this
+            # attachment (uploads get dedup suffixes, so a near-miss never
+            # matches here).
+            for item in content:
+                if not is_text_block(item):
+                    continue
+                for gm in _GENERIC_SAVED_RE.finditer(str(item.get("text") or "")):
+                    p_cand = _clean_path(gm.group(1))
+                    if p_cand and posixpath.basename(p_cand) == name:
+                        path = p_cand
+                        break
+                if path:
                     break
-    if not path and len(generic_paths) == 1:
-        path = generic_paths[0]
+
     if not name:
-        if path:
-            name = posixpath.basename(path) or ("pdf" if is_file_block(block) else "image")
-        else:
-            name = "pdf" if is_file_block(block) else "image"
+        name = "pdf" if is_file_block(block) else "image"
 
     return name, path
 
@@ -134,10 +196,20 @@ def _build_evicted_placeholder(
     block: dict[str, Any], idx: int, content: list[Any]
 ) -> dict[str, str]:
     name, path = _extract_name_and_path(block, idx, content)
-    location = f"已保存在 {path}" if path else "已保存在工作区 work/uploads/ 下"
+    if path is None:
+        return {
+            "type": "text",
+            "text": (
+                f"[附件 {name} 较早上传，已从本次请求中省略，未找到它在工作区的保存位置；"
+                "如需再看，请让用户重新上传]"
+            ),
+        }
+    guidance = reading_path_text(
+        "pdf" if is_file_block(block) else "image", _inline_block_bytes(block)
+    )
     return {
         "type": "text",
-        "text": f"[附件 {name} 较早上传，{location}；需要时用工具读取]",
+        "text": f"[附件 {name} 较早上传，已保存在 {path}；{guidance}]",
     }
 
 
@@ -146,11 +218,16 @@ def trim_request_inline_attachments(
     *,
     budget_bytes: int = NATIVE_REQUEST_MAX_BYTES,
 ) -> list[Any]:
-    """Walk user messages newest-first and replace earlier inline attachments past ``budget_bytes``.
+    """Walk messages newest-first and replace earlier inline attachments past ``budget_bytes``.
 
-    Returns the original ``messages`` list when nothing exceeds the budget, and
-    never mutates any input message or content list in place so checkpoint
-    state stays untouched.
+    User messages and tool results are accumulated together — a ``Read`` image
+    or PDF on a ``ToolMessage`` is as much request payload as an upload, and a
+    replaced block never removes its message, so tool call/result pairs keep
+    their structure. Each block is judged on what budget remains by itself: an
+    evicted block is not sent and spends nothing, so an older small attachment
+    still rides inline when it fits. Returns the original ``messages`` list
+    when nothing exceeds the budget, and never mutates any input message or
+    content list in place so checkpoint state stays untouched.
     """
     if not messages:
         return messages
@@ -160,13 +237,12 @@ def trim_request_inline_attachments(
 
     for msg_idx in range(len(messages) - 1, -1, -1):
         msg = messages[msg_idx]
-        if not _is_user_message(msg):
+        if not (_is_user_message(msg) or _is_tool_message(msg)):
             continue
         content = msg.get("content") if isinstance(msg, dict) else getattr(msg, "content", None)
         if not isinstance(content, list):
             continue
 
-        # Evaluate attachment blocks in this message; keep within budget, evict beyond.
         evicted_indices: set[int] = set()
         for blk_idx, block in enumerate(content):
             size = _inline_block_bytes(block)
@@ -175,7 +251,6 @@ def trim_request_inline_attachments(
             if accumulated + size <= budget_bytes:
                 accumulated += size
             else:
-                accumulated += size
                 evicted_indices.add(blk_idx)
 
         if evicted_indices:
@@ -230,5 +305,7 @@ class DaltonAttachmentBudgetMiddleware(AgentMiddleware):
 __all__ = [
     "DaltonAttachmentBudgetMiddleware",
     "NATIVE_REQUEST_MAX_BYTES",
+    "READ_INLINE_MAX_BYTES",
+    "reading_path_text",
     "trim_request_inline_attachments",
 ]

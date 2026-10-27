@@ -36,6 +36,7 @@ except ModuleNotFoundError:  # imported as a package module (tests)
 
 import asyncio
 import logging
+from datetime import datetime, timezone
 from typing import Any, Literal  # DALTON-HOOK(market-data-fallback)
 
 import httpx
@@ -171,7 +172,10 @@ _YF_FMP_STATEMENT_FIELDS: dict[str, dict[str, tuple[str, ...]]] = {
         "ebitdaratio": (),
         "operatingIncome": ("Operating Income", "OperatingIncome", "Total Operating Income As Reported", "TotalOperatingIncomeAsReported"),
         "operatingIncomeRatio": (),
-        "ebit": ("EBIT", "Operating Income", "OperatingIncome"),
+        # DALTON-HOOK(market-data-fallback): EBIT stands on its own row only —
+        # substituting Operating Income poses a number FMP readers treat as a
+        # distinct line (it excludes non-operating items EBIT can include).
+        "ebit": ("EBIT",),
         "nonOperatingIncomeExcludingInterest": ("Other Non Operating Income Expenses", "OtherNonOperatingIncomeExpenses"),
         "totalOtherIncomeExpensesNet": ("Other Income Expense", "OtherIncomeExpense"),
         "incomeBeforeTax": ("Pretax Income", "PretaxIncome"),
@@ -194,11 +198,13 @@ _YF_FMP_STATEMENT_FIELDS: dict[str, dict[str, tuple[str, ...]]] = {
     "balance": {
         "cashAndCashEquivalents": ("Cash And Cash Equivalents", "CashAndCashEquivalents", "Cash Financial", "CashFinancial"),
         "shortTermInvestments": ("Other Short Term Investments", "OtherShortTermInvestments"),
+        # DALTON-HOOK(market-data-fallback): the combined line only — cash
+        # alone must not pose as "cash + short-term investments". When Yahoo
+        # has no combined row, the serializer sums cash and short-term
+        # investments, but only when both exist (see _YF_COMPUTED below).
         "cashAndShortTermInvestments": (
             "Cash Cash Equivalents And Short Term Investments",
             "CashCashEquivalentsAndShortTermInvestments",
-            "Cash And Cash Equivalents",
-            "CashAndCashEquivalents",
         ),
         "netReceivables": ("Accounts Receivable", "AccountsReceivable", "Receivables"),
         "accountsReceivables": ("Accounts Receivable", "AccountsReceivable"),
@@ -376,14 +382,77 @@ _YF_FMP_STATEMENT_FIELDS: dict[str, dict[str, tuple[str, ...]]] = {
 }
 
 
-def _yf_period_label(date_str: str, period: str) -> str:
-    if period != "quarter":
-        return "FY"
+# DALTON-HOOK(market-data-fallback): FMP ships these as its own rows; yfinance
+# gives only the inputs, so they are computed here — and only when every input
+# exists, since a one-sided sum (cash alone posing as cash+investments) or a
+# ratio over a missing denominator reads downstream as reported data.
+_YF_COMPUTED_RATIOS: tuple[tuple[str, str], ...] = (
+    ("ebitdaratio", "ebitda"),
+    ("grossProfitRatio", "grossProfit"),
+    ("operatingIncomeRatio", "operatingIncome"),
+    ("incomeBeforeTaxRatio", "incomeBeforeTax"),
+    ("netIncomeRatio", "netIncome"),
+)
+
+
+def _yf_month_of(raw: Any) -> int | None:
+    """Month (1-12) of a Yahoo date field; None for anything unusable."""
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, (int, float)):
+        try:
+            return datetime.fromtimestamp(float(raw), tz=timezone.utc).month
+        except (OverflowError, OSError, ValueError):
+            return None
+    if isinstance(raw, datetime):
+        return raw.month
+    if isinstance(raw, str):
+        try:
+            return datetime.strptime(raw.strip()[:10], "%Y-%m-%d").month
+        except ValueError:
+            return None
+    return None
+
+
+def _yf_fiscal_year_end_month(info: Any) -> int | None:
+    """The issuer's fiscal-year end month, from Yahoo quote metadata.
+
+    ``lastFiscalYearEnd`` is an epoch-seconds timestamp (there is no string
+    month field in the live payload); its month is the fiscal year end month,
+    stable across years for an issuer. Unknown stays ``None`` rather than
+    guessed as December.
+    """
+    if not isinstance(info, dict):
+        return None
+    for key in ("lastFiscalYearEnd", "fiscalYearEnd"):
+        month = _yf_month_of(info.get(key))
+        if month:
+            return month
+    return None
+
+
+def _yf_fiscal_period(
+    date_str: str, period: str, fy_end_month: int | None
+) -> tuple[str | None, str | None]:
+    """(period label, fiscalYear) for a statement column, on the issuer's fiscal calendar.
+
+    Quarters are counted from the month after the fiscal year end (June-end
+    MSFT: Jul-Sep is Q1) and the fiscal year is named for the calendar year it
+    ends in (a 2025-09-30 column is FY2026). Without the fiscal year end month
+    both are ``None`` — a calendar-year-shaped guess would silently misjoin
+    against FMP rows, which carry true fiscal labels.
+    """
+    if fy_end_month is None:
+        return None, None
     try:
-        month = int(date_str[5:7])
-        return f"Q{(month - 1) // 3 + 1}"
-    except (IndexError, ValueError):
-        return "Q1"
+        end = datetime.strptime(date_str[:10], "%Y-%m-%d")
+    except ValueError:
+        return None, None
+    if period != "quarter":
+        return "FY", str(end.year)
+    fiscal_year = end.year + 1 if end.month > fy_end_month else end.year
+    quarter = (end.month - fy_end_month + 11) % 12 // 3 + 1
+    return f"Q{quarter}", str(fiscal_year)
 
 
 def _yf_serialize_statement(
@@ -394,6 +463,7 @@ def _yf_serialize_statement(
     currency: str | None = None,
     period: str = "annual",
     limit: int | None = None,
+    fy_end_month: int | None = None,
 ) -> list[dict[str, Any]]:
     if df is None or df.empty:
         return []
@@ -411,6 +481,7 @@ def _yf_serialize_statement(
     records: list[dict[str, Any]] = []
     for date_str, col in col_pairs:
         year_str = date_str[:4] if len(date_str) >= 4 else ""
+        period_label, fiscal_year = _yf_fiscal_period(date_str, period, fy_end_month)
         rec: dict[str, Any] = {
             "date": date_str,
             "symbol": symbol,
@@ -419,8 +490,8 @@ def _yf_serialize_statement(
             "fillingDate": None,
             "acceptedDate": None,
             "calendarYear": year_str,
-            "fiscalYear": year_str,
-            "period": _yf_period_label(date_str, period),
+            "fiscalYear": fiscal_year,
+            "period": period_label,
         }
         for fmp_field, yf_labels in field_map.items():
             val_out: float | None = None
@@ -433,6 +504,27 @@ def _yf_serialize_statement(
                         val_out = float(raw_val)
                         break
             rec[fmp_field] = val_out
+        # DALTON-HOOK(market-data-fallback): computed fields — see
+        # _YF_COMPUTED_RATIOS; each needs both sides, else None.
+        if stmt_kind == "income":
+            revenue = rec.get("revenue")
+            for ratio_field, numer_field in _YF_COMPUTED_RATIOS:
+                numerator = rec.get(numer_field)
+                rec[ratio_field] = (
+                    round(numerator / revenue, 6)
+                    if isinstance(revenue, (int, float))
+                    and revenue
+                    and isinstance(numerator, (int, float))
+                    else None
+                )
+        if stmt_kind == "balance" and rec.get("cashAndShortTermInvestments") is None:
+            cash = rec.get("cashAndCashEquivalents")
+            short_term = rec.get("shortTermInvestments")
+            rec["cashAndShortTermInvestments"] = (
+                cash + short_term
+                if isinstance(cash, (int, float)) and isinstance(short_term, (int, float))
+                else None
+            )
         records.append(rec)
     return records
 
@@ -451,9 +543,23 @@ def _yf_statements(
     """
     if _yf is None:
         return None
-    disp, yf_symbol, currency = _yf_boundary(symbol)
+    disp, yf_symbol, _listing_currency = _yf_boundary(symbol)
     ticker = _yf.Ticker(yf_symbol)
     quarterly = period == "quarter"
+    # DALTON-HOOK(market-data-fallback): the reporting currency is the
+    # financial-currency of the statements (`financialCurrency` in Yahoo
+    # metadata — the same source the main chain's `_stamp_reported_currency`
+    # uses), not the listing currency a HK quote trades in; unknown stays None.
+    try:
+        info = ticker.info or {}
+    except Exception:  # noqa: BLE001 — metadata is optional; statements may still serve
+        info = {}
+    if not isinstance(info, dict):
+        info = {}
+    financial_currency = info.get("financialCurrency")
+    if not isinstance(financial_currency, str) or not financial_currency:
+        financial_currency = None
+    fy_end_month = _yf_fiscal_year_end_month(info)
 
     def _pick(stmt_kind: str, quarterly_df_attr: str, annual_df_attr: str) -> list[dict[str, Any]]:
         df = getattr(ticker, quarterly_df_attr) if quarterly else getattr(ticker, annual_df_attr)
@@ -461,9 +567,10 @@ def _yf_statements(
             df,
             stmt_kind,
             symbol=disp,
-            currency=currency,
+            currency=financial_currency,
             period=period,
             limit=limit,
+            fy_end_month=fy_end_month,
         )
 
     try:
@@ -492,8 +599,27 @@ def _yf_statements(
 _YF_STATEMENTS_NOTE = (
     "FMP plan does not cover this request; statements served from yfinance "
     "(mapped to FMP camelCase period records; 口径与细分科目可能与 FMP 不同, "
-    "unmapped fields are None)."
+    "unmapped fields are None). Computed from Yahoo lines, only when every "
+    "input exists: ebitdaratio, grossProfitRatio, operatingIncomeRatio, "
+    "incomeBeforeTaxRatio, netIncomeRatio (numerator over revenue), and "
+    "cashAndShortTermInvestments (cash + short-term investments when no "
+    "combined line)."
 )
+_YF_PERIODS_UNKNOWN_NOTE = (
+    " period / fiscalYear 未知 (issuer fiscal-year end not available); "
+    "calendarYear still carries the statement date's year."
+)
+
+
+def _yf_periods_unknown(data: Any) -> bool:
+    """Whether any served record lacks its fiscal period/fiscal-year labels."""
+    groups = data.values() if isinstance(data, dict) else [data]
+    for records in groups:
+        if isinstance(records, list) and any(
+            isinstance(r, dict) and r.get("period") is None for r in records
+        ):
+            return True
+    return False
 
 
 async def _from_tushare(disp: str, fetch, *, data_type: str, **extra):
@@ -629,6 +755,11 @@ async def get_financial_statements(
         if err.get("error") == "plan_not_covered" or getattr(e, "status_code", None) == 402:
             yf_data = await asyncio.to_thread(_yf_statements, disp, statement_type, period, limit)
             if yf_data is not None:
+                note = _YF_STATEMENTS_NOTE
+                # DALTON-HOOK(market-data-fallback): say so in the note rather
+                # than guessing calendar-shaped period labels.
+                if _yf_periods_unknown(yf_data):
+                    note += _YF_PERIODS_UNKNOWN_NOTE
                 return make_response(
                     yf_data,
                     source="yfinance",
@@ -636,7 +767,7 @@ async def get_financial_statements(
                     data_type="financial_statements",
                     statement_type=statement_type,
                     period=period,
-                    note=_YF_STATEMENTS_NOTE,
+                    note=note,
                 )
         return err
 
