@@ -113,3 +113,30 @@ def test_nested_alphaengine_dates_are_normalized(monkeypatch):
         "research", {"route": "alphaengine", "query": "英伟达", "params": {"date_from": "soon"}}
     )
     assert err is not None and err["error"].startswith("[参数错误]")
+
+
+def test_a_top_level_end_and_a_nested_start_already_make_a_pair(monkeypatch):
+    monkeypatch.setattr(rb, "_bridge_today", lambda: "2026-10-26")
+    normalized, _, err = rb._normalize_and_validate_call_args(
+        "research",
+        {"route": "alphaengine", "query": "NVDA", "start": "2026-09-01", "params": {"date_to": "2026-09-30"}},
+    )
+    assert err is None
+    assert "end" not in normalized or normalized["end"] is None
+
+
+def test_a_reversed_window_is_a_parameter_error(monkeypatch):
+    monkeypatch.setattr(rb, "_bridge_today", lambda: "2026-10-26")
+    _, _, err = rb._normalize_and_validate_call_args(
+        "research", {"route": "alphaengine", "query": "NVDA", "start": "2026-09-30", "end": "2026-09-01"}
+    )
+    assert err is not None and "晚于结束日期" in err["error"]
+
+
+def test_a_current_month_end_stops_at_today(monkeypatch):
+    monkeypatch.setattr(rb, "_bridge_today", lambda: "2026-10-26")
+    normalized, _, err = rb._normalize_and_validate_call_args(
+        "research", {"route": "transcript", "ticker": "NVDA", "start": "2026-10", "end": "2026-10"}
+    )
+    assert err is None
+    assert (normalized["start"], normalized["end"]) == ("2026-10-01", "2026-10-26")

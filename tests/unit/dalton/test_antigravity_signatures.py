@@ -119,3 +119,21 @@ def test_concurrent_streams_on_one_client_keep_their_own_signatures():
     msg_b = client._final_message([g.message for g in out_b])
     assert msg_a.additional_kwargs[_CALL_SIGNATURES_KEY] == {"ca": "sig-a"}
     assert msg_b.additional_kwargs[_CALL_SIGNATURES_KEY] == {"cb": "sig-b"}
+
+
+def test_an_anthropic_message_sends_each_call_once_signed():
+    # The Anthropic SDK names a call as a tool_use block and in tool_calls.
+    msg = AIMessage(
+        content=[{"type": "text", "text": "x"}, {"type": "tool_use", "id": "c1", "name": "a", "input": {}}],
+        tool_calls=[{"name": "a", "args": {}, "id": "c1"}],
+    )
+    _, contents = _messages_to_gemini([HumanMessage(content="go"), msg], gemini_target=True)
+    calls = _calls(contents)
+    assert len(calls) == 1
+    assert calls[0]["thoughtSignature"] == _SKIP_SIGNATURE
+
+
+def test_a_call_only_in_content_is_signed_too():
+    msg = AIMessage(content=[{"type": "tool_use", "id": "c9", "name": "a", "input": {}}])
+    _, contents = _messages_to_gemini([HumanMessage(content="go"), msg], gemini_target=True)
+    assert [c["thoughtSignature"] for c in _calls(contents)] == [_SKIP_SIGNATURE]

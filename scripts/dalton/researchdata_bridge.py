@@ -2680,16 +2680,27 @@ def _normalize_and_validate_call_args(
                 err = _invalid_date_error(start_k, start_v, norm_view)
                 err["error"] = f"[参数错误] {start_k}={start_v!r} 晚于今天（{today}），没有可查的数据。"
                 return normalized, norm_view, err
+        # The window as upstream merges it: a top-level end and a nested
+        # date_from (or the reverse) already make a pair.
+        nested = params_obj if isinstance(params_obj, dict) else {}
+        win_start = normalized.get("start") or nested.get("start") or nested.get("date_from")
+        win_end = normalized.get("end") or nested.get("end") or nested.get("date_to")
         # AlphaEngine takes a date window only as a pair; one end alone is
         # refused upstream, so close it: up to today, or a year back.
-        if route == "alphaengine" and (normalized.get("start") is None) != (normalized.get("end") is None):
+        if route == "alphaengine" and (win_start is None) != (win_end is None):
             import datetime as _dt
 
-            if normalized.get("end") is None:
-                normalized["end"] = max(today, normalized["start"])
+            if win_end is None:
+                win_end = normalized["end"] = max(today, win_start)
             else:
-                end_day = _dt.date.fromisoformat(normalized["end"])
-                normalized["start"] = (end_day - _dt.timedelta(days=365)).isoformat()
+                end_day = _dt.date.fromisoformat(win_end)
+                win_start = normalized["start"] = (end_day - _dt.timedelta(days=365)).isoformat()
+        if win_start and win_end and win_start > win_end:
+            norm_view = _build_normalized_params_view(normalized, is_community=is_comm)
+            err = _invalid_date_error("start", win_start, norm_view)
+            err["error"] = f"[参数错误] 开始日期 {win_start} 晚于结束日期 {win_end}。"
+            err["hint"] = "把 start 改成不晚于 end 的日期后重试。"
+            return normalized, norm_view, err
 
     # Validate nested `params` conflicts, top-level vs nested document conflicts, and alphaengine doc_id mapping
     if isinstance(normalized.get("params"), dict):

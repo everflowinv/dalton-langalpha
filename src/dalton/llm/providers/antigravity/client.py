@@ -231,12 +231,20 @@ def _messages_to_gemini(
 
         role = "model" if isinstance(message, AIMessage) else "user"
         parts: list[dict] = []
+        # An Anthropic-SDK message names each call twice, as a tool_use block
+        # and in tool_calls; the tool_calls loop below sends it once, signed.
+        listed_ids = {str(c.get("id")) for c in (getattr(message, "tool_calls", None) or []) if c.get("id")}
+        block_calls: list[dict] = []
         for block in _content_blocks(message):
             if isinstance(block, dict) and block.get("type") == "tool_use":
                 if block.get("id") and block.get("name"):
                     tool_call_names[str(block["id"])] = str(block["name"])
+                if str(block.get("id")) in listed_ids:
+                    continue
             part = _part_from_block(block)
             if part:
+                if "functionCall" in part:
+                    block_calls.append(part)
                 parts.append(part)
         if isinstance(message, AIMessage):
             # The endpoint validates that functionCall parts carry their
@@ -273,6 +281,13 @@ def _messages_to_gemini(
                 elif signatures:
                     part_fc["thoughtSignature"] = signatures.pop(0)
                 parts.append(part_fc)
+            for part_fc in block_calls:
+                block_id = str(part_fc["functionCall"].get("id") or "")
+                signature = by_call.get(block_id) if isinstance(by_call, dict) else None
+                if signature:
+                    part_fc["thoughtSignature"] = signature
+                elif gemini_target:
+                    part_fc["thoughtSignature"] = _SKIP_SIGNATURE
             for signature in signatures:
                 parts.append({"thoughtSignature": signature})
         if parts:
