@@ -88,9 +88,14 @@ async def test_an_image_no_provider_decodes_goes_to_the_sandbox_as_a_file(data, 
 async def test_one_with_no_payload_is_still_named_without_a_block():
     content, sandbox = await _attach("data:image/png;base64", "deepseek-flash")
     assert not sandbox.files
+    # DALTON-HOOK(attachment-native-cap): no payload means nothing was saved,
+    # and a bare filename is a note the model ignores — the explicit wording
+    # sends the user back to the file panel.
     assert content == (
         "what is this?\n\n<system-reminder>\n"
-        "The user attached a file (chart.x, image/png).\n</system-reminder>"
+        "The user attached a file (chart.x, image/png), but saving it to the "
+        "workspace failed, so it cannot be read here. Tell the user to upload "
+        "it again from the file panel.\n</system-reminder>"
     )
 
 

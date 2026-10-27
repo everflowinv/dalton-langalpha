@@ -21,6 +21,14 @@ from src.utils.storage import get_public_url, is_storage_enabled, sanitize_stora
 
 logger = logging.getLogger(__name__)
 
+# DALTON-HOOK(attachment-native-cap): the largest PDF inlined whole when no
+# sandbox copy of it exists. A saved composer PDF is never inlined (a one-line
+# note with its path and page count instead); an unsaved one has no such
+# fallback, so up to this size it rides inline and past it the file-only
+# route's save-failure note, never a whole PDF the checkpoint would re-send
+# on every later turn.
+INLINE_UNSAVED_PDF_MAX_BYTES = 10 * 1024 * 1024
+
 
 def parse_multimodal_contexts(
     additional_context: Optional[List[Any]],

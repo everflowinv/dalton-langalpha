@@ -82,6 +82,30 @@ async def attach_request_files(
             multimodal_contexts, get_image_types(route)
         ),
     )
+    # DALTON-HOOK(attachment-native-cap): an unsaved PDF over the inline
+    # ceiling is not inlined at all — a whole PDF in the checkpoint re-sends
+    # on every later turn and a provider refuses an over-size request as a
+    # plain 400 nothing recovers from. It rides the file-only route's
+    # save-failure note instead, which sends the user back to the file panel
+    # (that route has no such limit of its own).
+    from src.server.utils.multimodal_context import INLINE_UNSAVED_PDF_MAX_BYTES
+
+    oversized_unsaved: list = []
+    for idx, ctx in enumerate(multimodal_contexts):
+        if ctx not in supported:
+            continue
+        data = ctx.data if hasattr(ctx, "data") else ctx.get("data", "")
+        saved = bool(file_paths and idx < len(file_paths) and file_paths[idx])
+        payload = data.split(",", 1)[1] if "," in data else ""
+        if (
+            data.startswith("data:application/pdf")
+            and not saved
+            and len(payload) * 3 // 4 > INLINE_UNSAVED_PDF_MAX_BYTES
+        ):
+            oversized_unsaved.append(ctx)
+    if oversized_unsaved:
+        supported = [ctx for ctx in supported if ctx not in oversized_unsaved]
+        file_only = file_only + oversized_unsaved
     # 3. Inject supported as native content blocks (merged into user message)
     if supported:
         supported_paths = [
