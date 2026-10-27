@@ -352,7 +352,9 @@ async def _run_written_variant(
         info = await _file_info(backend, candidate)
         if not info.exists or info.mtime_epoch is None:
             continue
-        if info.mtime_epoch < since_epoch:
+        # The same tolerance as the artifact floor: a variant written 2s
+        # before the recorded window start (clock skew) is this run's.
+        if info.mtime_epoch < since_epoch - MTIME_TOLERANCE_SECONDS:
             continue
         if best is None or info.mtime_epoch > best[1].mtime_epoch:
             best = (candidate, info)
@@ -475,26 +477,34 @@ async def _check_artifact(
     else:
         targets = concrete
 
-    # Freshness: every declared stage artifact is THIS run's deliverable,
-    # whatever way its path resolved (template, explicit ``path_param``, or
-    # variant match) — it must be written inside this run's window, or a
-    # same-day rerun passes on the earlier round's files. ``modified_on:
-    # "today"`` keeps its execution-day anchor but is tightened to the run's
-    # window when one is known (whichever starts later decides, so a rerun can
-    # never pass on the earlier round's file); ``"as_of"`` keeps its calendar
-    # day. ``MTIME_TOLERANCE_SECONDS`` matches the push-draft check.
+    # Freshness, two regimes:
+    # - ``fresh_this_run`` artifacts (a wake skill's note / draft /
+    #   predictions.json / last_run.json — the run's own deliverables) must be
+    #   written inside this run's window however their path resolved, or a
+    #   same-day rerun passes on the earlier round's files. ``modified_on:
+    #   "today"`` on such an artifact IS the window start (UTC midnight only
+    #   when even the window is unknown); ``"as_of"`` keeps its calendar day
+    #   when it starts later.
+    # - Everything else keeps the pre-window rules (existence / min_bytes /
+    #   day anchors): a legitimately reused file — dalton-publish's approved
+    #   draft, a workflow-resume carry-over — is judged on its content, not on
+    #   which round last touched it.
     modified_on = artifact.get("modified_on")
     if modified_on not in (None, "today", "as_of"):
         missing.append(f"契约字段 modified_on 非法（{name}：{modified_on!r}），请修契约。")
         return missing, warnings, resolved
+    fresh = bool(artifact.get("fresh_this_run"))
     run_floor = (
-        since_epoch - MTIME_TOLERANCE_SECONDS if since_epoch is not None else None
+        since_epoch - MTIME_TOLERANCE_SECONDS
+        if (fresh and since_epoch is not None)
+        else None
     )
     floor_epoch, floor_label = run_floor, "本轮开始时间"
-    if modified_on == "today":
-        today_utc = int(_today_start_utc().timestamp())
-        if today_utc > (floor_epoch if floor_epoch is not None else -1):
-            floor_epoch, floor_label = today_utc, "today 锚定日"
+    if modified_on == "today" and floor_epoch is None:
+        floor_epoch, floor_label = (
+            int(_today_start_utc().timestamp()),
+            "today 锚定日",
+        )
     elif modified_on == "as_of":
         anchor = params.get("as_of") or params.get("release_date") or params.get("end")
         day = str(anchor) if anchor else None
@@ -514,20 +524,26 @@ async def _check_artifact(
         if explicit_used and template_path is not None:
             resolved[template_path] = path
         info = await _file_info(backend, path)
-        if not info.exists:
-            variant = (
-                None
-                if explicit_used
-                else await _run_written_variant(
-                    backend, artifact, params, path, since_epoch
-                )
+        # A stale template file is not this run's writing either: the run may
+        # have written the variant spelling instead, so the variant search
+        # runs for an out-of-window template file exactly as for a missing one.
+        stale_template = bool(
+            fresh
+            and run_floor is not None
+            and artifact.get("variant_glob")
+            and info.exists
+            and (info.mtime_epoch is None or info.mtime_epoch < run_floor)
+        )
+        if (not info.exists or stale_template) and not explicit_used:
+            variant = await _run_written_variant(
+                backend, artifact, params, path, since_epoch
             )
             if variant is not None:
                 # The dated template guessed a different day than the file the
                 # run wrote; judge the file that exists, by this run's window.
                 path, info = variant
-            else:
-                if artifact.get("variant_glob") and not explicit_used:
+            elif not info.exists:
+                if artifact.get("variant_glob"):
                     _report(
                         f"产物文件不存在：{path}，也未找到符合条件的 "
                         f"{artifact['variant_glob']}（文件名日期须为本轮 as_of 或"
@@ -537,6 +553,8 @@ async def _check_artifact(
                 else:
                     _report(f"产物文件不存在：{path}。下一步：补齐该阶段交付物后重查。")
                 continue
+            # Stale template, no qualifying variant: the floor check below
+            # reports it with the expected path.
         if template_path is not None:
             # Later checks (check_draft, language review, sidecars) render the
             # template again; point them at the file this run actually wrote.
@@ -1704,16 +1722,18 @@ async def _contract_declared_paths(
     params: dict[str, Any],
     resolved: dict[str, str] | None = None,
 ) -> list[str]:
-    """Concrete paths the contract's stage artifacts declare, expanded the way
-    ``_check_artifact`` gates them (requires_param, requires_json, derive,
-    glob). Declared notes join the language-review targets regardless of
-    mtime — a reused note owes its records too (the same-hash two-round pass
-    satisfies it; no re-review is demanded)."""
+    """Concrete paths the contract's stage artifacts declare (each with its
+    ``fresh_this_run`` flag), expanded the way ``_check_artifact`` gates them
+    (requires_param, requires_json, derive, glob). A declared note joins the
+    language-review targets regardless of mtime unless it is fresh_this_run —
+    a reused note owes its records too (the same-hash two-round pass satisfies
+    it; no re-review is demanded), while a fresh one must be this run's
+    writing."""
     resolved_map = resolved or {}
     workspace_dir = getattr(backend, "workspace_dir", None)
     if not isinstance(workspace_dir, str):
         workspace_dir = None
-    paths: list[str] = []
+    paths: list[tuple[str, bool]] = []
     for stage in contract.get("stages") or []:
         if stage.get("requires_param") and not params.get(stage["requires_param"]):
             continue
@@ -1753,7 +1773,13 @@ async def _contract_declared_paths(
                     value = item.get(derive["field"]) if isinstance(item, dict) else None
                     if value is not None:
                         paths.append(
-                            render_template(artifact["path"], {**params, derive["field"]: str(value)})
+                            (
+                                render_template(
+                                    artifact["path"],
+                                    {**params, derive["field"]: str(value)},
+                                ),
+                                False,
+                            )
                         )
                 continue
             template = render_template(artifact["path"], params)
@@ -1769,13 +1795,22 @@ async def _contract_declared_paths(
             if artifact.get("glob"):
                 matches = await _glob(backend, concrete_path)
                 paths.extend(
-                    m for m in (matches or []) if not m.endswith(SIDECAR_SUFFIXES)
+                    (m, False)
+                    for m in (matches or [])
+                    if not m.endswith(SIDECAR_SUFFIXES)
                 )
             else:
-                paths.append(resolved_map.get(template, concrete_path))
+                paths.append(
+                    (
+                        resolved_map.get(template, concrete_path),
+                        bool(artifact.get("fresh_this_run")),
+                    )
+                )
     return [
-        rel
-        for rel in (_workspace_relative(p, workspace_dir) for p in paths)
+        (rel, fresh)
+        for rel, fresh in (
+            (_workspace_relative(p, workspace_dir), fresh) for p, fresh in paths
+        )
         if is_reviewable_deliverable(rel, workspace_dir)
     ]
 
@@ -1792,12 +1827,13 @@ async def _check_language_review(
     resolved: dict[str, str] | None = None,
 ) -> list[str]:
     """Every formal deliverable this run wrote owes two language-review rounds:
-    the contract's declared draft and notes — but only files this run wrote (a
-    reused note riding an earlier round's same-hash records is that round's
-    deliverable) — plus each reviewable file the run's dispatches reported,
-    plus what the mtime window scan of the workspace finds. Fail-closed
-    throughout. ``published/`` archives are nobody's language target (see
-    is_reviewable_deliverable): their review is the draft's."""
+    the contract's declared draft and notes — ``fresh_this_run`` ones only
+    when this run wrote them (a reused draft, e.g. dalton-publish's approved
+    original, rides its existing same-hash records) — plus each reviewable
+    file the run's dispatches reported, plus what the mtime window scan of the
+    workspace finds. Fail-closed throughout. ``published/`` archives are
+    nobody's language target (see is_reviewable_deliverable): their review is
+    the draft's."""
     resolved_map = resolved or {}
     draft_template = render_template(rule["draft"], params)
     draft = resolved_map.get(draft_template, draft_template)
@@ -1841,22 +1877,24 @@ async def _check_language_review(
         if gap:
             return gap
 
-    # 1. What the contract declares — but only files this run wrote: a reused
-    # note riding on an earlier round's same-hash records is that round's
-    # deliverable, and the artifact check reports its staleness. A declared
-    # path whose file is affirmatively absent is skipped for the same reason.
-    for declared in await _contract_declared_paths(
+    # 1. What the contract declares — only ``fresh_this_run`` files must be
+    # this run's writing; a reused draft (dalton-publish's approved original,
+    # a resume carry-over) stays a language target on its existing same-hash
+    # records. A declared path whose file is affirmatively absent is skipped —
+    # the artifact check reports the missing file itself.
+    for declared, fresh_path in await _contract_declared_paths(
         backend, contract, params, resolved=resolved_map
     ):
         status, _ = await _read_text_diagnosed(backend, declared)
         if status == "missing":
             continue
-        info = await _file_info(backend, declared)
-        if (
-            info.mtime_epoch is not None
-            and info.mtime_epoch < since_epoch - MTIME_TOLERANCE_SECONDS
-        ):
-            continue
+        if fresh_path:
+            info = await _file_info(backend, declared)
+            if (
+                info.mtime_epoch is not None
+                and info.mtime_epoch < since_epoch - MTIME_TOLERANCE_SECONDS
+            ):
+                continue
         _add(declared)
 
     # 2. What the dispatches reported writing.

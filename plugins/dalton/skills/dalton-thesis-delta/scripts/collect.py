@@ -381,7 +381,6 @@ def resolve_researchdata_transport() -> dict[str, Any]:
     try:
         with open(config_path, encoding="utf-8") as fh:
             cfg = json.load(fh)
-        enabled = set((cfg.get("servers") or {}).keys())
     except OSError as e:
         return {
             "mode": None,
@@ -394,6 +393,18 @@ def resolve_researchdata_transport() -> dict[str, Any]:
             "call": None,
             "error": f"工作区 MCP 配置不可解析（{config_path}）：{str(e)[:160]}",
         }
+    # 合法 JSON 但结构不对（顶层非对象、servers 显式给了非对象）同样是配置错误：
+    # 不能让 AttributeError 冒出来，也不能继续认为包装模块可用。
+    if not isinstance(cfg, dict) or ("servers" in cfg and not isinstance(cfg["servers"], dict)):
+        return {
+            "mode": None,
+            "call": None,
+            "error": (
+                f"工作区 MCP 配置结构不对（{config_path}）："
+                "顶层须为 JSON 对象、servers 须为对象映射"
+            ),
+        }
+    enabled = set((cfg.get("servers") or {}).keys())
     if RESEARCHDATA_SERVER not in enabled:
         return {
             "mode": None,

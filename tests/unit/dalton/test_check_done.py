@@ -3630,3 +3630,159 @@ async def test_named_run_without_readable_start_reports_retryable_gap(
         thread_id="short-1",
     )
     assert not any("无法核对本轮完成情况" in m for m in no_id["missing"])
+
+
+# --- fresh_this_run: the run-window gate is opt-in per contract artifact ----
+
+
+@pytest.mark.asyncio
+async def test_publish_reuses_last_rounds_approved_draft(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """dalton-publish on the draft awaiting_pm'd LAST round (unchanged, hash
+    and approval still valid): the draft is not fresh_this_run, so its old
+    mtime is no gap — the contract completes on content, not on which round
+    last touched the file."""
+    from src.dalton.publish.files import prepend_publication_banner
+
+    _patch_pending(monkeypatch, error=RuntimeError("must not be queried"))
+    # This round's run is named and dated (started now); the draft is a day
+    # old — that gap is exactly what must NOT matter for a non-fresh artifact.
+    monkeypatch.setattr(
+        check_done_tools,
+        "_run_start_epoch",
+        create_autospec(
+            check_done_tools._run_start_epoch,
+            return_value=int(datetime.now(timezone.utc).timestamp()),
+        ),
+    )
+    files = _publish_files()
+    files["published/2026-10-23-call-META.md"] = prepend_publication_banner(
+        files[PUB_DRAFT],
+        title="Conviction Call",
+        kind="conviction_call",
+        published_date="2026-10-23",
+        approver_user_id="user-1",
+        approved_at="2026-10-23T00:00:00Z",
+        reviewer_model="gpt-6.1-sol-oauth",
+        reviewer_family="openai",
+        publication_id="pr-1",
+    )
+    stale = int((datetime.now(timezone.utc) - timedelta(days=1)).timestamp())
+    result = await run_check_done(
+        workflow="dalton-publish",
+        params=PUB_PARAMS,
+        backend=_make_backend(files, mtimes={PUB_DRAFT: stale}),
+        workspace_id=WS,
+        user_id="user-1",
+        thread_id="short-1",
+        conversation_run_id="resp-publish",
+    )
+    assert result["done"], result["missing"]
+
+
+@pytest.mark.asyncio
+async def test_wake_skill_old_note_is_still_missing_under_fresh_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The fresh gate stays on the wake skills' own deliverables: thesis-delta's
+    note from an earlier run does not close this run (contract marks it
+    fresh_this_run)."""
+    _patch_second_run_start(monkeypatch)
+    _patch_knowledge(monkeypatch, ["thesis"])
+    _patch_verdicts(monkeypatch, [_verdict_row("THESIS_STRENGTHENED", "internal_material")])
+
+    result = await run_check_done(
+        workflow="dalton-thesis-delta",
+        params={"ticker": "META", "as_of": "2026-10-27"},
+        backend=_make_backend(
+            _second_run_files(),
+            mtimes={
+                "research/2026-10-27-delta.md": _SECOND_RUN_EPOCH - 3600,
+                "research/tracker/last_run.json": _SECOND_RUN_EPOCH + 60,
+                "research/tracker/updates.log": _SECOND_RUN_EPOCH + 60,
+            },
+        ),
+        workspace_id=WS,
+        thread_id="short-1",
+        conversation_run_id="resp-2nd",
+    )
+    assert result["done"] is False
+    assert any("不是本轮写的" in m and "research/2026-10-27-delta.md" in m for m in result["missing"])
+
+
+@pytest.mark.asyncio
+async def test_today_anchor_is_the_window_start_across_utc_midnight(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Run starts 23:50 UTC, last_run.json committed 23:59, the check runs
+    after the UTC midnight crossing: "today" anchors to the run's window
+    start (not max with UTC midnight), so the commit passes."""
+    day_d = datetime(2026, 10, 27, 23, 50, tzinfo=timezone.utc)
+    _freeze_execution_day(monkeypatch, "2026-10-28")  # the check runs the NEXT day
+    monkeypatch.setattr(
+        check_done_tools,
+        "_run_start_epoch",
+        create_autospec(check_done_tools._run_start_epoch, return_value=int(day_d.timestamp())),
+    )
+    _patch_knowledge(monkeypatch, ["thesis"])
+    _patch_verdicts(monkeypatch, [_verdict_row("THESIS_STRENGTHENED", "internal_material")])
+
+    files = _second_run_files()
+    # The note names the run's as_of day (10-27), written this run.
+    note = "research/2026-10-27-delta.md"
+    result = await run_check_done(
+        workflow="dalton-thesis-delta",
+        params={"ticker": "META", "as_of": "2026-10-27"},
+        backend=_make_backend(
+            files,
+            mtimes={
+                note: int(datetime(2026, 10, 27, 23, 55, tzinfo=timezone.utc).timestamp()),
+                "research/tracker/last_run.json": int(datetime(2026, 10, 27, 23, 59, tzinfo=timezone.utc).timestamp()),
+                "research/tracker/updates.log": int(datetime(2026, 10, 27, 23, 59, tzinfo=timezone.utc).timestamp()),
+            },
+        ),
+        workspace_id=WS,
+        thread_id="short-1",
+        conversation_run_id="resp-night",
+    )
+    assert result["done"], result["missing"]
+
+
+@pytest.mark.asyncio
+async def test_stale_template_falls_through_to_a_qualifying_variant(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The as_of-spelled note exists but is last round's; this run wrote the
+    Eastern-day spelling: the variant search runs for the STALE template file
+    too, and the qualifying variant completes the contract."""
+    _patch_knowledge(
+        monkeypatch, ["thesis"], start_epochs={"resp-wake": _WAKE_EPOCH}
+    )
+    _patch_verdicts(monkeypatch, [_verdict_row("THESIS_STRENGTHENED", "internal_material")])
+
+    old_note = "# 旧\n" + "变化" * 200
+    new_note = "# 新\n" + "变化" * 200
+    files = {
+        **_wake_delta_files(),
+        "research/2026-10-27-delta.md": old_note,  # as_of spelling, STALE
+        "research/2026-10-26-delta.md": new_note,  # Eastern-day spelling, this run
+    }
+    result = await run_check_done(
+        workflow="dalton-thesis-delta",
+        params={"ticker": "META", "as_of": "2026-10-27"},
+        backend=_make_backend(
+            files,
+            mtimes={
+                "research/2026-10-27-delta.md": _WAKE_EPOCH - 86400,
+                # 2s before the window start: inside the shared tolerance.
+                "research/2026-10-26-delta.md": _WAKE_EPOCH - 2,
+            },
+        ),
+        workspace_id=WS,
+        thread_id="short-1",
+        conversation_run_id="resp-wake",
+    )
+    assert result["done"], result["missing"]
+    # Not a pass on the stale template: no freshness gap was reported at all.
+    assert not any("不是本轮写的" in m for m in result["missing"])

@@ -177,7 +177,12 @@
         },
         "variant_glob": {
           "type": "string",
-          "description": "path 模板渲染结果不存在时的同目录通配（如 research/*-delta.md，可含 {key} 占位符）；只接受本轮窗口内（mtime ≥ 运行开始时间）的最新匹配，防止旧文件顶替本轮交付。"
+          "description": "path 模板渲染结果不存在（或存在但不是本轮写入）时的同目录通配（如 research/*-delta.md，可含 {key} 占位符）；只接受本轮窗口内（mtime ≥ 运行开始时间）的最新匹配，防止旧文件顶替本轮交付。"
+        },
+        "fresh_this_run": {
+          "type": "boolean",
+          "default": false,
+          "description": "该产物是本轮必须写出的交付物（唤醒技能的笔记/草稿/predictions.json/last_run.json 等）：无论经模板、显式路径还是 variant 找到，都要求 mtime 落在本轮窗口内。未标注的产物不做本轮窗口判定（合法复用上一轮的文件，如 dalton-publish 审批后的原草稿、workflow resume 复用的文件）。"
         }
       }
     },

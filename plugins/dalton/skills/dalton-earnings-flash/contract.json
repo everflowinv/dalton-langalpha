@@ -13,7 +13,8 @@
         {
           "path": "research/{as_of}-flash-{quarter}.md",
           "min_bytes": 300,
-          "variant_glob": "research/*-flash-{quarter}.md"
+          "variant_glob": "research/*-flash-{quarter}.md",
+          "fresh_this_run": true
         }
       ]
     }

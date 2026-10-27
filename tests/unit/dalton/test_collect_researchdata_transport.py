@@ -280,3 +280,29 @@ def test_wrapper_rejects_non_dict_result_as_format_error(
         assert res["ok"] is False
         assert res["status"] == "invalid_format"
         assert res["error"]
+
+
+def test_structurally_wrong_config_is_unconfigured_not_an_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """合法 JSON 但结构不对（顶层非对象 / null / servers 非对象）：启动探测报
+    researchdata_transport_unconfigured 并说明结构错误，不抛 AttributeError。"""
+    collect_mod = _load_collect_module()
+    monkeypatch.delenv("DALTON_RESEARCHDATA_URL", raising=False)
+    _install_wrapper_modules(monkeypatch, tmp_path)
+
+    cases = {
+        "top-level list": "[]",
+        "top-level null": "null",
+        "servers is a list": '{"servers": ["researchdata"]}',
+    }
+    for label, body in cases.items():
+        config = tmp_path / "bad_config.json"
+        config.write_text(body, encoding="utf-8")
+        monkeypatch.setenv("PTC_WORKSPACE_CONFIG", str(config))
+        transport = collect_mod.resolve_researchdata_transport()
+        assert transport["mode"] is None, label
+        assert "工作区 MCP 配置结构不对" in transport["error"], label
+        assert str(config) in transport["error"], label
+        per_call = collect_mod.call_bridge_jsonrpc("research", {"route": "tmtb"})
+        assert per_call["status"] == "researchdata_transport_unconfigured", label
