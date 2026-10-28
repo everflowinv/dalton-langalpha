@@ -2,7 +2,22 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 // DALTON-HOOK(multi-file-upload): i18n drives the batch progress and
 // failure-summary strings shown while a multi-file upload runs.
 import { useTranslation } from 'react-i18next';
-import { uploadWorkspaceFile } from '../../utils/api';
+import type { TFunction } from 'i18next';
+import { uploadToWorkspace, UploadSendError } from '../../utils/workspaceUpload';
+
+function uploadErrorMessage(err: unknown, file: globalThis.File, t: TFunction): string {
+  if (err instanceof UploadSendError) return t('filePanel.uploadSendFailed');
+  const e = err as { response?: { status?: number; data?: { detail?: unknown } }; message?: string };
+  const detail = e?.response?.data?.detail;
+  // The server's 413 names its own limit; one without a detail came from
+  // something in front of it, whose limit this page cannot know.
+  if (e?.response?.status === 413 && !detail) {
+    const sizeMB = (file.size / (1024 * 1024)).toFixed(1);
+    return `File is too large to upload (${sizeMB} MB).`;
+  }
+  // A structured detail's sentence is already the error's message.
+  return (typeof detail === 'string' && detail) || e?.message || 'Upload failed';
+}
 
 /** Where a serial upload batch is: which file is going up, and how far. */
 export interface UploadBatchStatus {
@@ -20,10 +35,14 @@ export function useFileUpload({ workspaceId, onRefreshFiles }: {
   onRefreshFiles?: () => void;
 }) {
   const { t } = useTranslation();
-  // Upload state
+  // Upload state: batch status while a file is going up, then `uploadSaving`
+  // while the workspace takes the file.
   const [uploadStatus, setUploadStatus] = useState<UploadBatchStatus | null>(null);
+  const [uploadSaving, setUploadSaving] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  // One upload at a time: a second would share the one progress bar.
+  const uploadRef = useRef<AbortController | null>(null);
 
   // Drag-and-drop state
   const [isDragOver, setIsDragOver] = useState(false);
@@ -55,7 +74,9 @@ export function useFileUpload({ workspaceId, onRefreshFiles }: {
   useEffect(() => () => {
     runGuardRef.current += 1;
     queueRef.current = [];
+    uploadRef.current = null;
     setUploadStatus(null);
+    setUploadSaving(false);
     setUploadError(null);
   }, [workspaceId]);
 
@@ -64,12 +85,15 @@ export function useFileUpload({ workspaceId, onRefreshFiles }: {
   // recorded and the rest continue. Mid-run arrivals share this loop — and its
   // failures list, so the closing summary covers the whole queue — then the
   // list refreshes once for the entire batch.
-  const handleUpload = useCallback(async (files: globalThis.File[]) => {
+  const handleUpload = useCallback(async (input: globalThis.File | globalThis.File[]) => {
+    const isBatch = Array.isArray(input);
+    const files = isBatch ? input : (input ? [input] : []);
     if (files.length === 0 || !workspaceId) return;
-    setUploadError(null);
     const guard = runGuardRef.current;
-    queueRef.current.push(...files);
     if (processingGenRef.current === guard) {
+      if (!isBatch) return;
+      setUploadError(null);
+      queueRef.current.push(...files);
       // This generation's loop drains the queue; rewrite the announced total
       // now (done so far + the file in flight + the queue behind it) instead
       // of only when the loop reaches the newly queued files.
@@ -78,6 +102,8 @@ export function useFileUpload({ workspaceId, onRefreshFiles }: {
         : s));
       return;
     }
+    setUploadError(null);
+    queueRef.current.push(...files);
     processingGenRef.current = guard;
     doneCountRef.current = 0;
     const failures: { name: string; reason: string }[] = [];
@@ -86,10 +112,13 @@ export function useFileUpload({ workspaceId, onRefreshFiles }: {
     try {
       while (queueRef.current.length > 0) {
         const file = queueRef.current.shift()!;
+        const ctrl = new AbortController();
+        uploadRef.current = ctrl;
         // current counts finished files plus the one now starting; total adds
         // what is still queued, so a mid-run drop grows the announced total.
         const done = uploaded + failures.length;
         doneCountRef.current = done;
+        setUploadSaving(false);
         setUploadStatus({
           current: done + 1,
           total: done + queueRef.current.length + 1,
@@ -98,23 +127,39 @@ export function useFileUpload({ workspaceId, onRefreshFiles }: {
         });
         let landed = false;
         try {
-          await uploadWorkspaceFile(workspaceId, file, null, (pct: number) => {
-            if (runGuardRef.current !== guard) return;
-            setUploadStatus((s) => (s ? { ...s, percent: pct } : s));
+          await uploadToWorkspace(workspaceId, file, {
+            signal: ctrl.signal,
+            onProgress: (progress) => {
+              if (runGuardRef.current !== guard) return;
+              if (progress.phase === 'saving') {
+                setUploadSaving(true);
+              } else {
+                // Parts the store did not get go again, and can be cancelled again.
+                setUploadSaving(false);
+                setUploadStatus((s) => (s ? { ...s, percent: progress.percent } : s));
+              }
+            },
           });
           landed = true;
         } catch (err: unknown) {
+          if (ctrl.signal.aborted) {
+            // DALTON-HOOK(multi-file-upload): a cancel that lands after a
+            // workspace switch belongs to the stranded loop; the queue and the
+            // panel are the new workspace's now.
+            if (runGuardRef.current !== guard) {
+              abandoned = true;
+            } else {
+              queueRef.current = [];
+            }
+            break;
+          }
           console.error('[FilePanel] Upload failed:', err);
           if (runGuardRef.current === guard) {
-            const e = err as { response?: { status?: number; data?: { detail?: string } }; message?: string };
-            let msg = e?.response?.data?.detail || e?.message || 'Upload failed';
-            // The server's 413 names its own limit; one without a detail came from
-            // something in front of it, whose limit this page cannot know.
-            if (e?.response?.status === 413 && !e?.response?.data?.detail) {
-              const sizeMB = (file.size / (1024 * 1024)).toFixed(1);
-              msg = `File is too large to upload (${sizeMB} MB).`;
-            }
-            failures.push({ name: file.name, reason: msg });
+            failures.push({ name: file.name, reason: uploadErrorMessage(err, file, t) });
+          }
+        } finally {
+          if (uploadRef.current === ctrl) {
+            uploadRef.current = null;
           }
         }
         if (runGuardRef.current !== guard) {
@@ -136,16 +181,27 @@ export function useFileUpload({ workspaceId, onRefreshFiles }: {
       if (processingGenRef.current === guard) processingGenRef.current = -1;
       if (!abandoned) {
         setUploadStatus(null);
+        setUploadSaving(false);
         if (uploaded > 0) onRefreshFiles?.();
         if (failures.length > 0) {
-          setUploadError(t('filePanel.uploadFailedSummary', {
-            count: failures.length,
-            details: failures.map((f) => `${f.name} (${f.reason})`).join('; '),
-          }));
+          if (!isBatch) {
+            setUploadError(failures[0].reason);
+          } else {
+            setUploadError(t('filePanel.uploadFailedSummary', {
+              count: failures.length,
+              details: failures.map((f) => `${f.name} (${f.reason})`).join('; '),
+            }));
+          }
         }
       }
     }
   }, [workspaceId, onRefreshFiles, t]);
+
+  /** Ends an upload still sending; once the workspace is taking the file it runs to the end. */
+  const cancelUpload = useCallback(() => {
+    queueRef.current = [];
+    uploadRef.current?.abort();
+  }, []);
 
   const handleFileInputChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
     // DALTON-HOOK(multi-file-upload): the picker is multi-select; take every file
@@ -188,12 +244,14 @@ export function useFileUpload({ workspaceId, onRefreshFiles }: {
   }, [handleUpload]);
 
   // The bar in PanelNotices wants a bare percent of the current file; null
-  // when nothing is uploading.
-  const uploadProgress = uploadStatus === null ? null : uploadStatus.percent;
+  // when nothing is uploading or while the workspace is saving the assembled file.
+  const uploadProgress = uploadStatus === null || uploadSaving ? null : uploadStatus.percent;
 
   return {
     uploadProgress,
     uploadStatus,
+    uploadSaving,
+    cancelUpload,
     uploadError,
     setUploadError,
     fileInputRef,

@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import TypedDict
+from collections.abc import Iterable
+from typing import Any, TypedDict
 
 
 class EditTextResult(TypedDict, total=False):
@@ -31,3 +32,13 @@ class WriteTextResult(TypedDict, total=False):
 
     success: bool
     message: str
+
+
+class GrepAnswer(list):
+    """A Grep answer with ``notes`` for whoever reads it, each saying what the
+    search left out, such as files a route stopped before. A plain list
+    answer has none."""
+
+    def __init__(self, entries: Iterable[Any] = (), notes: Iterable[str] = ()) -> None:
+        super().__init__(entries)
+        self.notes = tuple(notes)

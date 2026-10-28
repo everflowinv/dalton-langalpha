@@ -50,7 +50,7 @@ function row(over: Partial<WatchlistRow>): WatchlistRow {
 function renderRow(item: WatchlistRow) {
   return render(
     <MemoryRouter>
-      <WatchlistRowItem item={item} index={0} marketStatus={null} />
+      <WatchlistRowItem item={item} marketStatus={null} />
     </MemoryRouter>,
   );
 }
@@ -120,7 +120,7 @@ describe('WatchlistRowItem price', () => {
 
     const { container } = render(
       <MemoryRouter>
-        <WatchlistRowItem item={watchlistItem} index={0} marketStatus={afterHoursStatus} />
+        <WatchlistRowItem item={watchlistItem} marketStatus={afterHoursStatus} />
       </MemoryRouter>,
     );
     expect(container).toHaveTextContent('$317.28');
@@ -177,7 +177,7 @@ describe('WatchlistRowItem price', () => {
 
     const { container } = render(
       <MemoryRouter>
-        <WatchlistRowItem item={watchlistItem} index={0} marketStatus={preMarketStatus} />
+        <WatchlistRowItem item={watchlistItem} marketStatus={preMarketStatus} />
       </MemoryRouter>,
     );
     expect(container).toHaveTextContent('$320.76');
@@ -222,7 +222,7 @@ describe('WatchlistRowItem price', () => {
 
     const { container } = render(
       <MemoryRouter>
-        <WatchlistRowItem item={regularItem} index={0} marketStatus={openStatus} />
+        <WatchlistRowItem item={regularItem} marketStatus={openStatus} />
       </MemoryRouter>,
     );
     expect(container).toHaveTextContent('$317.28');
@@ -257,7 +257,7 @@ describe('WatchlistRowItem price', () => {
       <MemoryRouter>
         <PortfolioRowItem
           item={portfolioItem}
-          index={0}
+         
           marketStatus={preMarketStatus}
           valuesHidden={false}
         />
@@ -564,7 +564,7 @@ describe('WatchlistRowItem price', () => {
 
     const { container: primWlEl, unmount: unmountPrimWl } = render(
       <MemoryRouter>
-        <WatchlistRowItem item={missingRegCloseWatchlist} index={0} marketStatus={afterHoursStatus} />
+        <WatchlistRowItem item={missingRegCloseWatchlist} marketStatus={afterHoursStatus} />
       </MemoryRouter>,
     );
     expect(primWlEl).not.toHaveTextContent('$321.59');
@@ -576,7 +576,7 @@ describe('WatchlistRowItem price', () => {
       <MemoryRouter>
         <PortfolioRowItem
           item={missingRegClosePortfolio}
-          index={0}
+         
           marketStatus={afterHoursStatus}
           valuesHidden={false}
         />

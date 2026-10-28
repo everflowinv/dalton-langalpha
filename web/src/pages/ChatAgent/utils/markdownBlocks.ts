@@ -99,6 +99,47 @@ export function splitMarkdownBlocks(content: string): string[] {
   return blocks.length ? blocks : [content];
 }
 
+export interface OpenFence {
+  opener: string;
+  /** How far the opener is indented, which a fence in a list item holds its lines to. */
+  indent: number;
+  /** Where the opening line starts. */
+  at: number;
+}
+
+/**
+ * The fence still open at the end of `block`, or null. Every streaming reader
+ * of a fence takes its rules from here, so none of them holds a fence open that
+ * another has closed.
+ *
+ * Reading a fence as open when the parser has closed it would stop the prose
+ * after it from remounting, so this errs toward closed: a backtick info string
+ * holding a backtick is inline code, and a line indented less than the opener
+ * ends a fence that sat in a list item. A fence the scan misses (a block quote,
+ * a deeper list) is never reported open.
+ *
+ * `claims` is asked about each line outside a fence, and a line it claims
+ * cannot open one: display math the caller is tracking holds fence markers as
+ * text.
+ */
+export function scanFences(block: string, claims?: (body: string, offset: number) => boolean): OpenFence | null {
+  let offset = 0;
+  let fence: OpenFence | null = null;
+  for (const line of splitLines(block)) {
+    const body = line.replace(/\r?\n$/, '');
+    if (fence !== null) {
+      if (closesFence(line, fence.opener) || (!BLANK_RE.test(body) && body.length - body.trimStart().length < fence.indent)) fence = null;
+    } else if (!claims?.(body, offset)) {
+      const open = FENCE_OPEN_RE.exec(line);
+      if (open && !(open[1][0] === '`' && line.slice(open[0].length).includes('`'))) {
+        fence = { opener: open[1], indent: open[0].length - open[1].length, at: offset };
+      }
+    }
+    offset += line.length;
+  }
+  return fence;
+}
+
 /**
  * What a streaming block needs from its own text (see `MarkdownBlock`).
  * `lineKey` is the line count it remounts on, not counting lines added to a
@@ -106,29 +147,11 @@ export function splitMarkdownBlocks(content: string): string[] {
  * and remounting it per line rebuilt every highlighted token of a long fence
  * on each new line. `openFence` is where that fence's opening line starts, or
  * -1 when the block ends outside a fence.
- *
- * Reading a fence as open when the parser has closed it would stop the prose
- * after it from remounting, so this errs toward closed: a backtick info string
- * holding a backtick is inline code, and a line indented less than the opener
- * ends a fence that sat in a list item. A fence the scan misses (a block quote,
- * a deeper list) just keeps remounting per line.
  */
 export function scanStreamingBlock(block: string): { lineKey: number; openFence: number } {
-  let lines = 0;
-  let offset = 0;
-  let fence: { opener: string; indent: number; linesBefore: number; at: number } | null = null;
-  for (const line of splitLines(block)) {
-    const body = line.replace(/\r?\n$/, '');
-    if (fence === null) {
-      const open = FENCE_OPEN_RE.exec(line);
-      if (open && !(open[1][0] === '`' && line.slice(open[0].length).includes('`'))) {
-        fence = { opener: open[1], indent: open[0].length - open[1].length, linesBefore: lines, at: offset };
-      }
-    } else if (closesFence(line, fence.opener) || (!BLANK_RE.test(body) && body.length - body.trimStart().length < fence.indent)) {
-      fence = null;
-    }
-    if (line.endsWith('\n')) lines++;
-    offset += line.length;
-  }
-  return fence === null ? { lineKey: lines, openFence: -1 } : { lineKey: fence.linesBefore, openFence: fence.at };
+  const fence = scanFences(block);
+  const end = fence?.at ?? block.length;
+  let lineKey = 0;
+  for (let nl = block.indexOf('\n'); nl !== -1 && nl < end; nl = block.indexOf('\n', nl + 1)) lineKey++;
+  return { lineKey, openFence: fence?.at ?? -1 };
 }

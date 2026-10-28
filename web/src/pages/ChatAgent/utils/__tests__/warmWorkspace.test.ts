@@ -176,6 +176,20 @@ describe('warmWorkspace', () => {
     expect(patched.workspaces.map((w) => w.status)).toEqual(['starting', 'running']);
   });
 
+  it("drops the root a row was read with once a status names another computer", () => {
+    // The root is its computer's, so after a move it would read the new
+    // computer's paths against the old one until the row was read again.
+    const qc = makeClient();
+    const key = queryKeys.workspaces.detail('ws-1');
+    qc.setQueryData(key, { workspace_id: 'ws-1', computer_id: 'comp-1', root_dir: '/home/someone/langalpha', status: 'stopped' });
+
+    patchWorkspaceStatusInCaches(qc, 'ws-1', 'running', 'comp-1');
+    expect(qc.getQueryData(key)).toMatchObject({ computer_id: 'comp-1', root_dir: '/home/someone/langalpha' });
+
+    patchWorkspaceStatusInCaches(qc, 'ws-1', 'running', 'comp-2');
+    expect(qc.getQueryData(key)).toMatchObject({ computer_id: 'comp-2', root_dir: null });
+  });
+
   it('patches matching workspace in cached list query', async () => {
     const qc = makeClient();
     qc.setQueryData(queryKeys.workspaces.detail('ws-1'), {

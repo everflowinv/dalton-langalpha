@@ -9,6 +9,7 @@ import type {
   UserMessage,
   NotificationMessage,
   NotificationVariant,
+  WakeupArrival,
 } from '@/types/chat';
 import type { WidgetContextSnapshot } from '@/pages/Dashboard/widgets/framework/contextSnapshot';
 import type { ChartSelectionSnapshot } from '@/pages/MarketView/stores/chartSelectionStore';
@@ -29,23 +30,29 @@ export interface AttachmentMeta {
 /**
  * `turnIndex` is the backend turn the bubble belongs to, or undefined for one
  * whose turn the transcript's count names (see projectTurns). Required, so
- * every bubble the view creates decides its turn where it is made.
+ * every bubble the view creates decides its turn where it is made. `id` is a
+ * bubble already on screen that the message takes over.
  */
 export function createUserMessage(
   message: string,
   turnIndex: number | undefined,
-  attachments: AttachmentMeta[] | null = null,
-  widgetSnapshots: WidgetContextSnapshot[] | null = null,
-  chartSelections: ChartSelectionSnapshot[] | null = null,
+  { attachments, widgetSnapshots, chartSelections, id }: {
+    attachments?: AttachmentMeta[] | null;
+    widgetSnapshots?: WidgetContextSnapshot[] | null;
+    chartSelections?: ChartSelectionSnapshot[] | null;
+    id?: string;
+  } = {},
 ): UserMessage {
   const msg: UserMessage = {
-    id: `user-${Date.now()}-${_idSeq++}`,
+    id: id ?? `user-${Date.now()}-${_idSeq++}`,
     role: 'user',
     content: message,
     contentType: 'text',
     timestamp: new Date(),
     isStreaming: false,
     turnIndex,
+    // Every caller is a send from this view; history builds its own rows.
+    sentHere: true,
   };
   if (attachments && attachments.length > 0) {
     // AttachmentMeta is the upload-time shape (file, dataUrl, type).
@@ -128,5 +135,25 @@ export function createNotificationMessage(
     variant,
     timestamp: new Date(),
     detail,
+  };
+}
+
+/**
+ * The row a wakeup, or a price alert, draws in the transcript. The id is the
+ * caller's, so the same notice keeps one id across a live stream and every
+ * replay.
+ */
+export function createWakeupMessage(
+  id: string,
+  wakeup: WakeupArrival,
+  timestamp: Date,
+): NotificationMessage {
+  return {
+    id,
+    role: 'notification',
+    content: '',
+    variant: 'info',
+    timestamp,
+    wakeup,
   };
 }

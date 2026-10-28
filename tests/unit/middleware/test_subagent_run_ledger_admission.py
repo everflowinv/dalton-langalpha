@@ -87,7 +87,9 @@ class FakeLedger:
             "run": {"task_run_id": task_run_id, "status": status},
         }
 
-    async def append_run_end(self, task_run_id, *, task_id, outcome):
+    async def append_run_end(
+        self, task_run_id, *, task_id, outcome, finalized_at=None
+    ):
         self.journal.append(("run_end", task_run_id, outcome))
 
 
@@ -113,11 +115,15 @@ async def _ok_handler(_request) -> ToolMessage:
     return ToolMessage(content="done", tool_call_id="tc-1", name="Task")
 
 
-def _middleware(owner, ledger) -> BackgroundSubagentMiddleware:
+def _middleware(owner, ledger, subagent_models=None) -> BackgroundSubagentMiddleware:
     registry = BackgroundTaskRegistry(thread_id="")
     registry.run_ledger = ledger
     return BackgroundSubagentMiddleware(
-        registry=registry, enabled=True, subagent_types={"general-purpose"}, namespace_owner=owner
+        registry=registry,
+        enabled=True,
+        subagent_types={"general-purpose"},
+        namespace_owner=owner,
+        subagent_models=subagent_models,
     )
 
 
@@ -185,6 +191,24 @@ async def test_init_admitted_stamps_identity_and_finalizes_before_release():
     assert journal.index(("finalize", "run-uuid-9", "completed")) < journal.index(
         ("release", task.task_id)
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "models", [{"general-purpose": {"id": "glm-5.3-cn", "provider": "z-ai-cn"}}, None]
+)
+async def test_admission_records_the_model_its_type_runs(models):
+    """The row is born with the model, so every reader, live or replayed,
+    gets the one value; a type on the main agent's model records none."""
+    ledger = FakeLedger(admit="run-uuid-9")
+    mw = _middleware(FakeOwner(), ledger, subagent_models=models)
+    mw.registry.write_task_meta = AsyncMock()
+
+    await mw.awrap_tool_call(_request({"description": "d", "prompt": "p"}), _ok_handler)
+    await mw.registry._tasks["tc-1"].asyncio_task
+
+    expected = (models or {}).get("general-purpose")
+    assert ledger.started[0]["model"] == expected
 
 
 @pytest.mark.asyncio

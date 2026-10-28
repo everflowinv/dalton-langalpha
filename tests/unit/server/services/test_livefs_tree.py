@@ -236,7 +236,7 @@ def history(monkeypatch):
         if thread_id is None or short_id not in (None, thread_id[:8]):
             return []
         listed = [
-            ListedFile(thread_id, thread_id[:8], path, sha256, size)
+            ListedFile(thread_id, thread_id[:8], path, sha256, size, USER)
             for path, (sha256, size) in sorted(list_transcript(workspace_id, thread_id[:8]).items())
         ]
         return listed[:limit]
@@ -498,6 +498,16 @@ async def test_every_file_lists_the_size_version_and_content_its_read_returns(
         }
 
     # Cold, the thread index is rendered for its size; warm, the size is kept.
+    # DALTON-HOOK(hermetic-prebuilt-workflows): the prebuilt tier serves
+    # whatever workflows ship in the repo, Dalton's hermetic set included, and
+    # each rides the same size/version/content agreement the loop below pins —
+    # derived from the registry the route reads, so a workflow added or
+    # removed later carries its file into or out of the expectation by itself.
+    from ptc_agent.agent.middleware.background_subagent.workflow.prebuilt import (
+        get_prebuilt_workflows,
+    )
+
+    prebuilt = [f"workflows/{name}" for name in get_prebuilt_workflows().files()]
     for _ in range(2):
         listed = await walk()
         transcripts = f"workspaces/{HERE}/transcripts/{SHORT}/"
@@ -510,6 +520,7 @@ async def test_every_file_lists_the_size_version_and_content_its_read_returns(
             AUTOMATIONS,
             "user/agents/README.md",
             "workflows/daily.js",
+            *prebuilt,
             f"workspaces/{HERE}/memory/plan.md",
             *(transcripts + name for name in TRANSCRIPT),
             "computer/threads.jsonl",

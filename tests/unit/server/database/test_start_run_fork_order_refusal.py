@@ -40,9 +40,13 @@ FORK = ForkSpec(from_turn=2, checkpoint_id="ckpt-1", branch_tip="ckpt-tip")
 
 @pytest.fixture(autouse=True)
 def _no_steers_to_keep():
-    """The fork's steer lift reads the cursor; these tests script it for
-    the guards alone."""
+    """The fork's steer lift and the move fence read the cursor; these tests
+    script it for the guards alone."""
     with (
+        patch(
+            "src.server.database.workspace.workspace_is_moving",
+            new=AsyncMock(return_value=False),
+        ),
         patch(
             "src.server.database.runs.lifecycle.lift_fork_steers",
             new=AsyncMock(return_value=([], None)),
@@ -67,7 +71,7 @@ async def test_refusal_follows_the_guards_and_precedes_the_truncation(
     mock_connection, mock_cursor
 ):
     # No duplicate request_key, the tip where the fork read it, no live run.
-    mock_cursor.fetchone.side_effect = [{"status": "running"}, None, None]
+    mock_cursor.fetchone.side_effect = [{"workspace_id": "ws-1", "status": "running"}, None, None]
     mock_cursor.rowcount = 1
     calls: list[str] = []
 
@@ -133,7 +137,7 @@ async def test_refusal_follows_the_guards_and_precedes_the_truncation(
 async def test_a_refused_fork_refuses_no_order(
     mock_connection, mock_cursor, tip_moved, live_root, live_task, refusal
 ):
-    mock_cursor.fetchone.side_effect = [{"status": "running"}, None, live_root]
+    mock_cursor.fetchone.side_effect = [{"workspace_id": "ws-1", "status": "running"}, None, live_root]
     mock_cursor.rowcount = 0 if tip_moved else 1
     refuse = AsyncMock(return_value=[])
     truncate = AsyncMock(return_value=0)

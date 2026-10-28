@@ -16,7 +16,10 @@ vi.mock('react-grid-layout', () => ({
     latestGridProps = props;
     return <div data-testid="mock-rgl">{props.children}</div>;
   },
-  useContainerWidth: () => ({ width: 1280, mounted: true, containerRef: { current: null } }),
+}));
+
+vi.mock('../useGridWidth', () => ({
+  useGridWidth: () => ({ width: 1280, containerRef: { current: null } }),
 }));
 
 vi.mock('../WidgetFrame', () => ({

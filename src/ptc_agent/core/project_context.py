@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import contextlib
 import contextvars
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -85,6 +85,20 @@ def require_project() -> ProjectContext:
     if ctx is None:
         raise LookupError("no project bound to this context")
     return ctx
+
+
+@contextlib.contextmanager
+def project_bound(project: ProjectContext | None) -> Iterator[None]:
+    """``project`` bound for the block, for work on a turn's folder outside
+    a turn's stream; None binds nothing, as ``run_with_project`` does."""
+    if project is None:
+        yield
+        return
+    token = set_project(project)
+    try:
+        yield
+    finally:
+        _current.reset(token)
 
 
 async def run_with_project(

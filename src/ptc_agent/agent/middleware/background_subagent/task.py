@@ -365,9 +365,9 @@ class BackgroundTask:
 
     @property
     def is_turn_visible(self) -> bool:
-        """Visible to turn-level machinery (notifications, wait-all, TaskOutput
-        aggregates). Workflow-owned children are driver-scoped instead — but a
-        workflow run task itself IS turn-visible: it's what the agent awaits."""
+        """Visible to turn-level machinery (notifications, wait-all).
+        Workflow-owned children are driver-scoped instead — but a workflow run
+        task itself IS turn-visible: it's what the agent awaits."""
         return self.owner_task_id is None
 
     def force_cancel(

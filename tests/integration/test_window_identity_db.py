@@ -10,7 +10,7 @@ from __future__ import annotations
 import pytest
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
-import src.server.utils.checkpointer  # noqa: F401  (installs the walk guard)
+from ptc_agent.agent.transcript import Window
 from tests.unit.middleware.compaction import window_harness as h
 from tests.unit.server.services.history.replay_builders import SliceStore, _cache_probe
 from tests.unit.server.services.history.test_window import Thread, _page
@@ -26,7 +26,8 @@ async def _run(saver, monkeypatch, *, window: bool):
     store = SliceStore()
     page = await _page(monkeypatch, thread, store)
     head = await thread.trimmed() if window else thread.head(1)
-    covered = await window_module.runs_held(h.THREAD, head)
+    held = await window_module.runs_held(h.THREAD, Window(), thread.messages(head.runs))
+    covered = held == head
     scenario_calls = len(run.model.requests)
     await h.run_edit(run, saver, 3, window=window)
     await saver.adelete_thread(h.THREAD)

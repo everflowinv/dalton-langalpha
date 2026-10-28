@@ -12,11 +12,14 @@ from langchain_core.messages import AIMessage, AnyMessage, ToolMessage
 from langgraph.config import get_config
 
 from ptc_agent.core.paths import WorkspaceLayout
+from ptc_agent.agent.middleware.file_operations.multimodal_strip import remove_attachments
 from src.llms.attachment_payload import FILE_BLOCK_TYPES
 from ptc_agent.agent.middleware.compaction.types import OffloadSettings, TRUNCATABLE_TOOLS
 from ptc_agent.agent.middleware.compaction.utils import (
     get_effective_messages,
     oversized_arg_calls,
+    pdf_pages,
+    read_ahead,
     read_offload_marker,
     stale_read_ids,
     strip_base64_from_messages,
@@ -42,7 +45,13 @@ def tool_call_ids(messages: list[AnyMessage]) -> set[str]:
     }
 
 
-def arg_offload_marker(path: str, call_id: str) -> str:
+def arg_offload_marker(path: str, call_id: str, *, shell: bool = True) -> str:
+    if not shell:
+        return (
+            f"... [argument cut here. Its full call is in {path}: Grep that file for "
+            f'{call_id} (output_mode="content"), then Read the tool_call line it names '
+            f"with offset set to its line number minus 1 and limit=1]"
+        )
     return (
         f"... [argument cut here. Its full call is in {path}; read it with "
         f"jq -c 'select(.call_id==\"{call_id}\" and .type==\"tool_call\") "
@@ -55,6 +64,10 @@ def recorded_offloads(state: Mapping[str, Any]) -> Offloads:
         set(state.get("_offloaded_tool_call_ids") or ()),
         set(state.get("_offloaded_read_result_ids") or ()),
     )
+
+
+def removed_attachments(state: Mapping[str, Any]) -> set[str]:
+    return set(state.get("_removed_attachment_ids") or ())
 
 
 def record_offloads(state: Mapping[str, Any], args: set[str], reads: set[str]) -> dict[str, Any]:
@@ -109,22 +122,25 @@ def is_idle(state: Mapping[str, Any], settings: OffloadSettings, now: float) -> 
     return settings.idle_seconds is not None and bool(last) and now - last >= settings.idle_seconds
 
 
-def offload_view(
+async def offload_view(
     messages: list[AnyMessage],
     state: Mapping[str, Any],
     *,
     max_length: int,
     transcript: TranscriptTarget | None,
+    shell: bool = True,
 ) -> list[AnyMessage]:
     """What the model is sent of ``messages``: the view after ``state``'s
-    last summary, with every offload ``state`` recorded applied.
+    last summary, with every offload ``state`` recorded applied and the
+    attachments it removed to fit the context window taken out.
 
     An offload is a view over the checkpoint, not a rewrite of it: the id sets
     are the record, and every call cuts them again, so a call cut once stays
     cut and the prompt cache holds. A cut argument points at its call in the
-    file of its turn in ``transcript``. Where no mount serves one
-    (``transcript`` is None) arguments stay whole until one does, since a
-    pointer there would name a file nothing can read.
+    file of its turn in ``transcript``. Where nothing serves one
+    (``transcript`` is None) arguments stay whole until something does, since
+    a pointer there would name a file nothing can read. ``shell`` says whether
+    Bash sees that file, which decides how the pointer says to read it.
     """
     effective = get_effective_messages(messages, state.get("_summarization_event"))
     arg_ids, read_ids = recorded_offloads(state)
@@ -133,7 +149,12 @@ def offload_view(
         if arg_ids and transcript is not None
         else None
     )
-    return apply_recorded_offloads(effective, arg_ids, read_ids, max_length, turns)
+    view = apply_recorded_offloads(effective, arg_ids, read_ids, max_length, turns, shell=shell)
+    removed = removed_attachments(state)
+    # A removed PDF's placeholder gives its page count, which a block with no
+    # stamp is parsed for.
+    await read_ahead(msg for msg in view if getattr(msg, "id", None) in removed)
+    return remove_attachments(view, removed, pages=pdf_pages)
 
 
 def apply_recorded_offloads(
@@ -142,6 +163,8 @@ def apply_recorded_offloads(
     read_ids: set[str],
     max_length: int,
     turns: TranscriptTurns | None,
+    *,
+    shell: bool = True,
 ) -> list[AnyMessage]:
     """Cut every recorded offload in ``messages``, an argument only where
     ``turns`` names the file that keeps it. Each id is checked against its
@@ -162,7 +185,8 @@ def apply_recorded_offloads(
                 if tc["name"] == "Read" and tc["id"] in read_ids:
                     read_paths[tc["id"]] = tc.get("args", {}).get("file_path", "")
                 if path and tc["id"] in arg_ids and tc["name"] in TRUNCATABLE_TOOLS:
-                    new_tc = truncate_tool_call(tc, max_length, arg_offload_marker(path, tc["id"]))
+                    marker = arg_offload_marker(path, tc["id"], shell=shell)
+                    new_tc = truncate_tool_call(tc, max_length, marker)
                     msg_changed = msg_changed or new_tc is not tc
                     calls.append(new_tc)
                 else:

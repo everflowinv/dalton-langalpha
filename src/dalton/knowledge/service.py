@@ -722,9 +722,11 @@ async def apply_update(
     tool_call_id: str | None = None,
     now: datetime | None = None,
     dry_run: bool = False,
+    skip_access_check: bool = False,
 ) -> dict[str, Any]:
     """Execute the full PK.4 knowledge update pipeline: validate -> DB version -> write files."""
-    await verify_workspace_access(workspace_id, user_id, need="write", channel="cos")
+    if not skip_access_check:
+        await verify_workspace_access(workspace_id, user_id, need="write", channel="cos")
     if doc_key not in DOC_KEYS:
         return {
             "ok": False,
@@ -1107,9 +1109,11 @@ async def append_verdict(
     tool_call_id: str | None = None,
     origin_type: str | None = None,
     automation_execution_id: str | None = None,
+    skip_access_check: bool = False,
 ) -> dict[str, Any]:
     """Validate and record an event verdict, update agenda, and render ``verdicts.md`` (PK.4)."""
-    await verify_workspace_access(workspace_id, user_id, need="write", channel="cos")
+    if not skip_access_check:
+        await verify_workspace_access(workspace_id, user_id, need="write", channel="cos")
     v_copy = copy.deepcopy(verdict)
     consumed_signal_fields: list[str] = []
     for extra_sig_key in ("trigger_signal", "trigger_signals", "signal_id", "signal_ids", "signal_key", "signals"):
@@ -1256,6 +1260,7 @@ async def append_verdict(
             run_id=run_id,
             tool_call_id=tool_call_id,
             now=verdict_dt,
+            skip_access_check=skip_access_check,
         )
         if ag_res.get("ok"):
             agenda_version_no = ag_res.get("version_no")

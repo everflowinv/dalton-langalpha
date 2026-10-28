@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Info, MessageSquareWarning } from 'lucide-react';
+import { Info } from 'lucide-react';
 import {
   Dialog,
   DialogContent,
@@ -24,7 +24,6 @@ interface ThumbDownModalProps {
   isOpen: boolean;
   onSubmit: (issueCategories: string[], comment: string | null, consentHumanReview: boolean) => void;
   onCancel: () => void;
-  onReportWithAgent?: (instruction: string) => void;
 }
 
 /**
@@ -34,7 +33,7 @@ interface ThumbDownModalProps {
  * Allows selecting issue categories, adding comments, and
  * optionally consenting to anonymous human review for credit refund.
  */
-function ThumbDownModal({ isOpen, onSubmit, onCancel, onReportWithAgent }: ThumbDownModalProps): React.ReactElement {
+function ThumbDownModal({ isOpen, onSubmit, onCancel }: ThumbDownModalProps): React.ReactElement {
   const [selectedCategories, setSelectedCategories] = useState<Set<string>>(new Set());
   const [comment, setComment] = useState('');
   const [consentHumanReview, setConsentHumanReview] = useState(false);
@@ -149,41 +148,6 @@ function ThumbDownModal({ isOpen, onSubmit, onCancel, onReportWithAgent }: Thumb
             Share this conversation with our engineering team. Credits will be refunded for confirmed issues.
           </p>
         </div>
-
-        {/* Agent self-report CTA */}
-        {onReportWithAgent && (
-          <div
-            className="flex items-center gap-3 rounded-lg p-3 cursor-pointer transition-colors"
-            style={{
-              backgroundColor: 'var(--color-bg-surface)',
-              border: '1px solid var(--color-border-muted)',
-            }}
-            onClick={() => {
-              const categories = Array.from(selectedCategories);
-              const instruction = [
-                categories.length > 0 ? `User reported issues: ${categories.join(', ')}.` : '',
-                comment.trim() ? `User feedback: "${comment.trim()}"` : '',
-                'Reflect on your last response honestly. Identify the root cause — whether it\'s a bug in a tool, a flawed prompt instruction, bad data from an MCP server, or a reasoning error. Then file a GitHub issue via /self-improve with a truthful diagnosis.',
-              ].filter(Boolean).join(' ');
-              onReportWithAgent(instruction);
-            }}
-            onMouseEnter={(e: React.MouseEvent<HTMLDivElement>) => e.currentTarget.style.borderColor = 'var(--color-border-elevated)'}
-            onMouseLeave={(e: React.MouseEvent<HTMLDivElement>) => e.currentTarget.style.borderColor = 'var(--color-border-muted)'}
-          >
-            <MessageSquareWarning
-              className="h-5 w-5 shrink-0"
-              style={{ color: 'var(--color-accent-primary)' }}
-            />
-            <div>
-              <span className="text-sm font-medium" style={{ color: 'var(--color-text-primary)' }}>
-                Ask agent to self-report
-              </span>
-              <p className="text-xs mt-0.5" style={{ color: 'var(--color-text-tertiary)' }}>
-                The agent will reflect on what went wrong, diagnose the root cause, and file a GitHub issue via <code style={{ color: 'var(--color-accent-primary)', fontSize: '0.6875rem' }}>/self-improve</code>.
-              </p>
-            </div>
-          </div>
-        )}
 
         {/* Action buttons */}
         <DialogFooter className="flex-row justify-end gap-3 sm:gap-3">

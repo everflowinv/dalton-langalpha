@@ -20,6 +20,8 @@ import structlog
 from langchain.agents.middleware import AgentMiddleware
 from langchain.agents.middleware.types import ModelRequest, ModelResponse
 from langchain_core.messages import ToolMessage
+from langchain_core.runnables.config import var_child_runnable_config
+from langgraph.constants import TAG_NOSTREAM
 from langgraph.prebuilt.tool_node import ToolCallRequest
 from langgraph.types import Command
 
@@ -130,6 +132,10 @@ class SubagentEventCaptureMiddleware(AgentMiddleware):
     ) -> ModelResponse:
         """Capture the model's tool calls into the per-task event stream."""
         response = await handler(request)
+        # A call kept out of the stream (a compaction summary) is not a step
+        # of the task: a tool call it returns is never run.
+        if TAG_NOSTREAM in ((var_child_runnable_config.get() or {}).get("tags") or ()):
+            return response
 
         # Capture events for post-interrupt persistence
         tool_call_id = current_background_tool_call_id.get()

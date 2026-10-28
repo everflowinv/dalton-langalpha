@@ -31,6 +31,7 @@ from src.server.services.computer_manager._providers import HostOutageClock
 from src.server.services.computer_manager._types import (
     ComputerBinding,
     MachineState,
+    MachineTarget,
     SessionMetadata,
     WorkspaceNotOnComputer,
     WorkspaceToolView,
@@ -51,7 +52,7 @@ class SessionCacheMixin:
             workspace_id=workspace_id,
             computer_id=str(computer["computer_id"]),
             dir_name=computer.get("dir_name"),
-            kind=computer.get("kind"),
+            kind=computer["kind"],
             root_dir=computer.get("root_dir"),
             provider_ref=(
                 str(computer["provider_ref"]) if computer.get("provider_ref") else None
@@ -59,6 +60,10 @@ class SessionCacheMixin:
             resource_tier=computer.get("resource_tier"),
             is_always_on=bool(computer.get("is_always_on")),
             provider_config=computer.get("provider_config") or None,
+            files_epoch=(
+                str(computer["files_epoch"]) if computer.get("files_epoch") else None
+            ),
+            files_backup=computer.get("files_backup", True) is not False,
         )
 
     async def resolve_binding(
@@ -474,7 +479,32 @@ class SessionCacheMixin:
             return (
                 f"sandbox identity moved (db={db_sandbox_id}, local={local_sandbox_id})"
             )
+        moved = self._machine_target_is_stale(binding, session)
+        if moved is not None:
+            return moved
         return self._computer_identity_is_stale(binding, identity)
+
+    @staticmethod
+    def _machine_target_is_stale(
+        target: ComputerBinding | MachineTarget, session: "Session"
+    ) -> str | None:
+        """An ssh computer keeps its id on the machine through a reinstall to
+        a new folder or a reconnect to its machine paired again, so only the
+        root and target the session was built from tell a handle another
+        worker made before either from one that matches the row."""
+        if target.kind != "ssh":
+            return None
+        config = getattr(session, "config", None)
+        working = getattr(getattr(config, "filesystem", None), "working_directory", None)
+        if isinstance(working, str) and target.root_dir and working != target.root_dir:
+            return f"computer root moved (db={target.root_dir}, local={working})"
+        built = getattr(getattr(config, "sandbox", None), "ssh", None)
+        if built is None or not hasattr(type(built), "model_fields"):
+            return None
+        for key, value in (target.provider_config or {}).items():
+            if (getattr(built, key, None) or None) != (value or None):
+                return f"machine target moved ({key})"
+        return None
 
     def _computer_identity_is_stale(
         self, binding: ComputerBinding, identity: Dict[str, Any]
@@ -524,13 +554,19 @@ class SessionCacheMixin:
         return session.sandbox.is_ready()
 
     def get_session_if_ready(
-        self, workspace_id: str, *, expected_sandbox_id: str | None
+        self,
+        workspace_id: str,
+        *,
+        expected_sandbox_id: str | None,
+        target: MachineTarget,
     ) -> "Session | None":
         """Public UUID-only requests must never wake a sandbox.
 
         Combine readiness and lookup to avoid TOCTOU, and require expected_sandbox_id
-        so share links cannot serve replaced sandboxes. On mismatch, decline and
-        let routes use persistence; only async acquisition retires stale handles."""
+        so share links cannot serve replaced sandboxes, and the computer's current
+        target, since an ssh repair on another worker keeps that id. On mismatch,
+        decline and let routes use persistence; only async acquisition retires
+        stale handles."""
         computer_id = self._live_session_computer(workspace_id)
         if computer_id is None:
             return None
@@ -540,5 +576,7 @@ class SessionCacheMixin:
         if not session.sandbox.is_ready():
             return None
         if self._session_sandbox_id(session) != expected_sandbox_id:
+            return None
+        if self._machine_target_is_stale(target, session) is not None:
             return None
         return session

@@ -1,6 +1,7 @@
 import { useShareLink } from '@/hooks/useShareLink';
 import { useWorkspaceFileGrant } from '@/hooks/useWorkspaceFileGrant';
 import { shareLinkHref } from '../../../utils/api/shareLinks';
+import { useWorkspaceFolders } from '../../../contexts/WorkspaceContext';
 import { buildServeUrl } from './wsfilesUrl';
 
 export interface ServedHtml {
@@ -38,9 +39,11 @@ export function useServedHtml(
     owner && filePath ? { kind: 'file', path: filePath } : null,
   );
 
+  const root = useWorkspaceFolders()?.rootDir;
+
   const prefix = servePrefix ?? grant.data?.prefix;
-  const plainUrl = prefix && filePath ? buildServeUrl(prefix, filePath) : undefined;
-  const themedUrl = prefix && filePath ? buildServeUrl(prefix, filePath, { injectTheme: true }) : undefined;
+  const plainUrl = prefix && filePath ? buildServeUrl(prefix, filePath, { root }) : undefined;
+  const themedUrl = prefix && filePath ? buildServeUrl(prefix, filePath, { injectTheme: true, root }) : undefined;
   const openUrl = servePrefix ? plainUrl : link ? shareLinkHref(link.code) : undefined;
 
   return {

@@ -35,6 +35,7 @@ from ptc_agent.agent.backends.user_data import (
 from ptc_agent.agent.middleware.background_subagent.context import current_background_agent_id
 from ptc_agent.core.sandbox.livefs_mount import CallContext
 from src.server.services import profile_files
+from src.server.services import user_data_io
 
 
 PREFIX = "/home/workspace/.agents/user/profile/"
@@ -98,6 +99,8 @@ def mock_io():
         io.write_portfolio_diff = AsyncMock()
         io.write_watchlist_diff = AsyncMock()
         io.write_preferences = AsyncMock()
+        # The real check: it reads nothing, and a plan's input is what it returns.
+        io.check_preferences = user_data_io.check_preferences
         yield io
 
 
@@ -446,6 +449,46 @@ class TestPreferenceWrite:
         mock_io.write_preferences.assert_awaited_once_with(conn.cursor_obj, values, current, USER)
         prefs_cache.assert_awaited_once_with(USER)
         assert seen == ["committed"]
+
+    @pytest.mark.asyncio
+    async def test_a_structured_value_is_written_in_its_stored_spelling(
+        self, backend, mock_io, conn, prefs_cache
+    ):
+        await self._read(backend, mock_io)
+        current = {"investment_preference": {}}
+        conn.cursor_obj.fetchall.return_value = [current]
+        mock_io.parse_preferences.return_value = {
+            "investment_preference": {"markets": ["US", "us", "hk"], "horizon": "Years"}
+        }
+        mock_io.preferences_equal.return_value = False
+
+        assert await backend.awrite_text(PREFERENCE_PATH, "{}") is True
+
+        written = {"investment_preference": {"markets": ["us", "hk"], "horizon": "years"}}
+        mock_io.write_preferences.assert_awaited_once_with(conn.cursor_obj, written, current, USER)
+
+    @pytest.mark.asyncio
+    async def test_a_value_outside_its_vocabulary_is_refused_whole(
+        self, backend, mock_io, conn, prefs_cache
+    ):
+        """Checked against the row the save read: the stored legacy horizon
+        rides along unrefused, the new risk level does not."""
+        await self._read(backend, mock_io)
+        conn.cursor_obj.fetchall.return_value = [{"investment_preference": {"horizon": "long_term"}}]
+        mock_io.parse_preferences.return_value = {
+            "risk_preference": {"risk_level": "yolo"},
+            "investment_preference": {"horizon": "long_term"},
+        }
+        mock_io.preferences_equal.return_value = False
+
+        with pytest.raises(UserDataValidationError) as exc:
+            await backend.awrite_text(PREFERENCE_PATH, "{}")
+
+        assert exc.value.error_type == "schema_error"
+        assert [path for path, _ in exc.value.problems] == ["risk_preference.risk_level"]
+        assert exc.value.message.endswith(f"See {README_PATH} for the fields and examples.")
+        mock_io.write_preferences.assert_not_awaited()
+        prefs_cache.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_clearing_a_key_after_a_partial_read_is_refused(self, backend, mock_io, conn, prefs_cache):

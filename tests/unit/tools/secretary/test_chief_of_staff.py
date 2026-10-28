@@ -120,3 +120,24 @@ async def test_the_delete_card_names_the_workspace():
     confirm.assert_called_once_with(
         "delete_workspace", {"workspace_id": workspace_id, "workspace_name": "Lithium"},
     )
+
+
+@pytest.mark.asyncio
+async def test_an_approved_delete_leaves_files_on_the_owners_machine():
+    """The card asks about the workspace, not the folder on the user's own
+    machine, so the tool takes the manager's default, which keeps it."""
+    workspace_id = "44444444-4444-4444-4444-444444444444"
+    manager = MagicMock(delete_workspace=AsyncMock(return_value=True))
+    with patch(
+        "src.server.database.workspace.get_workspace",
+        AsyncMock(return_value={"user_id": USER_ID, "workspace_id": workspace_id, "status": "running", "name": "Lithium"}),
+    ), patch("src.tools.secretary.tools.hitl_confirm", MagicMock(return_value=(True, None))), patch(
+        "src.server.services.workspace_manager.WorkspaceManager.get_instance", return_value=manager
+    ):
+        result = await chief_of_staff_workspaces.ainvoke(
+            _delete_call(workspace_id),
+            config={"configurable": {"user_id": USER_ID, "workspace_id": HOME_ID}},
+        )
+
+    assert json.loads(result.update["messages"][0].content)["success"] is True
+    manager.delete_workspace.assert_awaited_once_with(workspace_id)

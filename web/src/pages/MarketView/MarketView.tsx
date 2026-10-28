@@ -21,8 +21,10 @@ import type { Freshness } from '@/types/market';
 import { attachmentsToContexts } from '../ChatAgent/utils/fileUpload';
 import { useThreadModel } from '../ChatAgent/hooks/useThreadModel';
 import { useThreadSubagents } from '../ChatAgent/hooks/useThreadSubagents';
+import { useThreadTuning } from '../ChatAgent/hooks/useThreadTuning';
 import { ThreadNotices } from '../ChatAgent/components/chatView/ThreadNotices';
 import { motion, AnimatePresence } from '@/lib/framer';
+import { SPRING_DRAG, TWEEN } from '@/lib/motion';
 import CompanyOverviewPanel from './components/CompanyOverviewPanel';
 import { MobileBottomSheet } from '../../components/ui/mobile-bottom-sheet';
 import { MobileFabChat } from '../../components/ui/mobile-fab-chat';
@@ -150,7 +152,7 @@ function MarketViewInner() {
 
   const [prefillMessage, setPrefillMessage] = useState<string>('');
   // The composer's scope, stored under its old pref name and values so a
-  // saved pick still reads: 'fast' is All workspaces, 'ptc' the selected
+  // saved pick still reads: 'fast' is the Chief of Staff, 'ptc' the selected
   // workspace.
   const [scope, setScope] = useState<ComposerScope>(() => {
     if (openingRoute.scope) return openingRoute.scope;
@@ -185,7 +187,7 @@ function MarketViewInner() {
     savePref('mode', scope === 'workspace' ? 'ptc' : 'fast');
   }, [scope]);
 
-  // All workspaces is always there. A stored workspace side with no
+  // The Chief of Staff is always there. A stored workspace side with no
   // workspace left to select would leave the chat panel with nothing to send
   // to, so it falls back.
   useEffect(() => {
@@ -225,20 +227,22 @@ function MarketViewInner() {
   //
   // The FAB unmounts its composer after every send, so the model lives here,
   // which outlives the FAB. No thread is behind it: a send opens a new thread
-  // in the chat view, and the pick goes with that navigation. All workspaces
+  // in the chat view, and the pick goes with that navigation. The Chief of Staff
   // opens that thread in Home, which runs the default model as a workspace
   // does.
   const threadModel = useThreadModel({ threadId: null, isLoading: false });
   // The Subagents pick lives here too, so a fold keeps it. The send carries
   // it into the thread it opens.
   const subagents = useThreadSubagents({ threadId: null });
+  // The thread's own effort and fast mode, held here for the same reason.
+  const tuning = useThreadTuning({ threadId: null });
 
-  // Home's id, which All workspaces runs in. Retried, since
-  // a failed first fetch would otherwise leave All workspaces annotations
+  // Home's id, which the Chief of Staff runs in. Retried, since
+  // a failed first fetch would otherwise leave the Chief of Staff annotations
   // unscoped until something refetches it.
   const { data: homeWorkspace } = useQuery({ ...homeWorkspaceQuery(queryClient), retry: 3 });
 
-  // The workspace the chat runs in: Home under All workspaces, the selected
+  // The workspace the chat runs in: Home under the Chief of Staff, the selected
   // one otherwise. The chart shows the agent-drawn instance for it, and since
   // annotations are keyed by (workspace_id, chart_id), this single id scopes
   // both the persistence sync and the live chart selection.
@@ -430,7 +434,7 @@ function MarketViewInner() {
     setChartImageDesc(parts.join('\n'));
   }, [selectedStock, selectedInterval, stockInfo, selectedStockDisplay, overviewData, displayPrice, quote.currency]);
 
-  const handleSendMessage = useCallback(async (message: string, attachments: AttachmentItem[] = [], _slashCommands: string[] = [], { model, reasoningEffort }: { model?: string; reasoningEffort?: string } = {}) => {
+  const handleSendMessage = useCallback(async (message: string, attachments: AttachmentItem[] = [], _slashCommands: string[] = [], { model, reasoningEffort, fastMode }: { model?: string; reasoningEffort?: string | null; fastMode?: boolean | null } = {}) => {
     // Build additional_context from chart image + file attachments.
     // The drawing tools are always bound; the chart-annotation skill rides
     // every send for its drawing guide and to tell the agent which ticker +
@@ -489,7 +493,7 @@ function MarketViewInner() {
     metaItems.push(...selectionAttachments);
     const attachmentMeta = metaItems.length > 0 ? metaItems : null;
 
-    // The selected workspace, or under All workspaces Home, which the server
+    // The selected workspace, or, under the Chief of Staff, Home, which the server
     // runs on the full agent. A failed Home lookup is the setup toast below.
     try {
       const workspaceId = await resolveChatWorkspace(queryClient, scope, selectedWorkspaceId);
@@ -516,6 +520,8 @@ function MarketViewInner() {
           ...(attachmentMeta ? { attachmentMeta } : {}),
           ...(model ? { model } : {}),
           ...(reasoningEffort ? { reasoningEffort } : {}),
+          ...(typeof fastMode === 'boolean' ? { fastMode } : {}),
+          ...tuning.toSend,
         },
       });
       chartSelectionStore.clearAll();
@@ -531,7 +537,9 @@ function MarketViewInner() {
     }
     setChartImage(null);
     setChartImageDesc(null);
-  }, [navigate, toast, t, queryClient, chartImage, chartImageDesc, scope, selectedWorkspaceId, selectedStock, selectedInterval, subagents.toSend]);
+    // DALTON-HOOK(composer-drafts): signal successful handoff so ChatInput clears the draft
+    return true;
+  }, [navigate, toast, t, queryClient, chartImage, chartImageDesc, scope, selectedWorkspaceId, selectedStock, selectedInterval, subagents.toSend, tuning.toSend]);
 
   const handleSidebarSymbolClick = useCallback((symbol: string) => {
     setSelectedStock(displaySpelling(symbol));
@@ -661,6 +669,9 @@ function MarketViewInner() {
               onPickModel={threadModel.pickModel}
               subagentsAllowed={subagents.allowed}
               onToggleSubagents={subagents.setAllowed}
+              tuning={tuning.tuning}
+              onPickReasoningEffort={tuning.setReasoningEffort}
+              onPickFastMode={tuning.setFastMode}
               workspaces={selectableWorkspaces}
               selectedWorkspaceId={selectedWorkspaceId}
               onWorkspaceChange={selectWorkspace}
@@ -685,8 +696,8 @@ function MarketViewInner() {
                 <motion.div
                   initial={{ opacity: 0 }}
                   animate={{ opacity: 1 }}
-                  exit={{ opacity: 0 }}
-                  transition={{ duration: 0.2 }}
+                  exit={{ opacity: 0, transition: TWEEN.exit }}
+                  transition={TWEEN.quick}
                   className="fixed inset-0 z-40"
                   style={{ backgroundColor: 'var(--color-bg-overlay)' }}
                   onClick={() => setMobileTab(null)}
@@ -694,8 +705,8 @@ function MarketViewInner() {
                 <motion.div
                   initial={{ x: '100%' }}
                   animate={{ x: 0 }}
-                  exit={{ x: '100%' }}
-                  transition={{ type: 'spring', damping: 30, stiffness: 300 }}
+                  exit={{ x: '100%', transition: TWEEN.exit }}
+                  transition={SPRING_DRAG}
                   className="fixed top-0 right-0 bottom-0 z-50 border-l"
                   style={{
                     width: '80vw',

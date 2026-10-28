@@ -13,6 +13,8 @@ from typing import Any
 
 from langchain_core.messages import AIMessage, AnyMessage
 
+from src.llms.provider_compaction import without_blocks
+
 # Content-block types carrying provider-bound reasoning. ``reasoning`` covers
 # both the standardized v1 block and the raw OpenAI Responses reasoning item.
 REASONING_BLOCK_TYPES = frozenset({"thinking", "redacted_thinking", "reasoning"})
@@ -114,9 +116,12 @@ def strip_all_reasoning(messages: list[AnyMessage]) -> list[AnyMessage]:
     the original list unchanged when there was nothing to strip, so callers can
     test identity to decide whether a retry is worth making.
     """
+    # A provider's signed summary goes too: it is bound to the provider as
+    # the reasoning is, and its message reads the summary text without it.
+    readable = without_blocks(messages)
+    changed = readable is not None
     result: list[AnyMessage] = []
-    changed = False
-    for msg in messages:
+    for msg in readable or messages:
         if not isinstance(msg, AIMessage):
             result.append(msg)
             continue

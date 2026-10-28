@@ -155,6 +155,14 @@ def _market_matches(markets: set[str], market: str) -> bool:
     return "non-us" in markets and market != "us"
 
 
+class MarketNotCovered(RuntimeError):
+    """No configured source serves the symbol's market.
+
+    The caller asked for something this deployment does not carry, which is
+    not a source failing; a RuntimeError still, so existing handlers catch it.
+    """
+
+
 @dataclass
 class ProviderEntry:
     name: str
@@ -362,7 +370,7 @@ class MarketDataProvider:
             is_index=bool(kwargs.get("is_index")),
         )
         if not candidates:
-            raise RuntimeError(f"No data source configured for market of {symbol}")
+            raise MarketNotCovered(f"No data source configured for market of {symbol}")
         last_exc: Exception | None = None
         first_empty: tuple[list[dict[str, Any]], str, bool] | None = None
         for entry in candidates:

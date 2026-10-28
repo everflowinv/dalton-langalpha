@@ -98,7 +98,7 @@ export function parseSiblingHref(
   href: string | undefined,
   folders: ComputerFolders | null | undefined,
 ): SiblingPath | null {
-  return href ? siblingWorkspacePath(parseAgentHref(href), folders) : null;
+  return href ? siblingWorkspacePath(parseAgentHref(href, folders?.rootDir), folders) : null;
 }
 
 /**
@@ -115,9 +115,12 @@ export function parseSiblingHref(
  * it starts at that sandbox root, which already says it names the workspace and
  * so names a file or a folder whatever it ends in.
  * A `name.py:42` line suffix is checked before the scheme test, which would
- * otherwise read `name.py:` as a URL scheme.
+ * otherwise read `name.py:` as a URL scheme. The computer's own root
+ * (`ComputerFolders.rootDir`) says "start at the workspace" the same way, and
+ * so does a path through the workspace's folder under a root it sat under
+ * before a move (`ComputerFolders.otherRoots`).
  */
-export function isFilePath(href: string | undefined): boolean {
+export function isFilePath(href: string | undefined, folders?: ComputerFolders | null): boolean {
   if (!href) return false;
   if (href.startsWith(WSREF_PREFIX)) return !!parseWsPath(href);
   if (hasLineSuffix(href) && !/^[a-z][a-z0-9+.-]*:\/\//i.test(href)) return !/^www\./i.test(href);
@@ -129,8 +132,12 @@ export function isFilePath(href: string | undefined): boolean {
     // slash. `/settings` keeps its slash through the parser and still has to
     // look like a file. Asking a rooted destination for an extension read
     // `/home/workspace/data/` as an app route, because a folder has none.
-    const parts = parseAgentPath(href);
+    const parts = parseAgentPath(href, folders?.rootDir);
     if (!parts.path.startsWith('/')) return parts.path !== '' || parts.directory;
+    // Another root keeps its slash through the parser, so it is asked the way
+    // the click reads it: a path the folder folds off is the workspace's,
+    // `/old/root/<folder>/data/` as much as `/home/workspace/data/`.
+    if (folders?.otherRoots?.length && !normalizeFilePath(href, folders).startsWith('/')) return true;
     // The extension has to be in the name, not in what follows it. Reading the
     // whole destination let a query supply one, so `/search?q=notes.md` claimed
     // to be a file, the click was swallowed, and the panel was handed
@@ -149,7 +156,7 @@ export function isFilePath(href: string | undefined): boolean {
  * routing reads it (`agentPaths.workspaceScopedPath`).
  */
 export function normalizeFilePath(path: string, folders?: ComputerFolders | null): string {
-  return workspaceScopedPath(parseAgentHref(path), folders?.dirName, folders?.previousDirNames);
+  return workspaceScopedPath(parseAgentHref(path, folders?.rootDir), folders?.dirName, folders?.previousDirNames, folders?.otherRoots);
 }
 
 /** Whether an href points at an image, by the same table the cards read. */

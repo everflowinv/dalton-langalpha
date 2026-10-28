@@ -2,11 +2,13 @@ import React, { useState, useCallback, useRef, useEffect } from 'react';
 import { RefreshCw, ExternalLink, X, LayoutDashboard, AlertCircle } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { Loader } from '@/components/ui/loader';
+import { useShareLink } from '@/hooks/useShareLink';
+import { shareLinkHref } from '../../utils/api/shareLinks';
 import { APP_PREVIEW_SANDBOX } from './html/sandbox';
 import './PreviewViewer.css';
 import type { PreviewData } from '../../hooks/utils/types';
 
-interface PreviewViewerProps extends Pick<PreviewData, 'url' | 'port' | 'title' | 'loading' | 'error'> {
+interface PreviewViewerProps extends Pick<PreviewData, 'url' | 'port' | 'title' | 'path' | 'loading' | 'error' | 'workspaceId'> {
   /** Omitted inside the file panel, where the tab's own X is the close. */
   onClose?: () => void;
   onRefresh?: () => void;
@@ -19,8 +21,11 @@ interface PreviewViewerProps extends Pick<PreviewData, 'url' | 'port' | 'title' 
   reloadToken?: number;
 }
 
-export default function PreviewViewer({ url, port, title, loading: externalLoading, error: externalError, onClose, onRefresh, isDragging, reloadToken, chrome = true }: PreviewViewerProps) {
+export default function PreviewViewer({ url, port, title, path, workspaceId, loading: externalLoading, error: externalError, onClose, onRefresh, isDragging, reloadToken, chrome = true }: PreviewViewerProps) {
   const { t } = useTranslation();
+  // The toolbar opens the app's private /a/ link, minted with the toolbar so
+  // the tab opens inside the click.
+  const { data: link } = useShareLink(workspaceId, port ? { kind: 'app', port } : null, { enabled: chrome });
   const [loading, setLoading] = useState(true);
   const [iframeKey, setIframeKey] = useState(0);
   const iframeRef = useRef<HTMLIFrameElement>(null);
@@ -66,14 +71,13 @@ export default function PreviewViewer({ url, port, title, loading: externalLoadi
     }
   }, [onRefresh]);
 
+  // Never the frame's URL: that one is a short-lived key the app opens for
+  // whoever holds it, and a tab on it dies when it lapses.
   const handleOpenExternal = useCallback(() => {
-    window.open(url, '_blank', 'noopener,noreferrer');
-  }, [url]);
+    if (link) window.open(shareLinkHref(link.code, path ?? '/'), '_blank', 'noopener,noreferrer');
+  }, [link, path]);
 
   const displayTitle = title || t('filePanel.previewTab');
-  const hostname = (() => {
-    try { return new URL(url).hostname; } catch { return ''; }
-  })();
 
   return (
     <div className={`preview-viewer${chrome ? '' : ' is-bare'}`} style={{ position: 'relative' }}>
@@ -87,7 +91,7 @@ export default function PreviewViewer({ url, port, title, loading: externalLoadi
             <button className="preview-viewer-btn" onClick={handleRefresh} title={t('filePanel.reloadApp')} aria-label={t('filePanel.reloadApp')}>
               <RefreshCw size={18} />
             </button>
-            <button className="preview-viewer-btn" onClick={handleOpenExternal} title={t('filePanel.openInBrowser')} aria-label={t('filePanel.openInBrowser')}>
+            <button className="preview-viewer-btn" onClick={handleOpenExternal} disabled={!link} title={t('filePanel.openInBrowser')} aria-label={t('filePanel.openInBrowser')}>
               <ExternalLink size={18} />
             </button>
             {onClose && (
@@ -138,7 +142,7 @@ export default function PreviewViewer({ url, port, title, loading: externalLoadi
                 <LayoutDashboard size={28} style={{ color: 'var(--color-accent-primary)' }} />
                 <div className="preview-viewer-resize-info">
                   <span className="preview-viewer-resize-title">{displayTitle}</span>
-                  {hostname && <span className="preview-viewer-resize-url">{hostname}:{port}</span>}
+                  <span className="preview-viewer-resize-url">:{port}</span>
                 </div>
               </div>
             </div>

@@ -116,7 +116,6 @@ export default function InlineWidget({ html, title, onSendPrompt, data }: Inline
       />
       {fullscreen && (
         <HtmlFullscreenModal
-          variant="widget"
           open={fullscreen}
           onOpenChange={setFullscreen}
           title={title || 'Widget'}

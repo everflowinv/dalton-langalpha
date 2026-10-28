@@ -41,15 +41,12 @@ from src.server.app.share_access import (
     resolve_link,
 )
 from src.server.app.share_files import share_files_router
-from src.server.app.workspace_sandbox import (
-    owner_preview_url,
-    signed_url_expires_at,
-    with_preview_path,
-)
+from src.server.app.workspace_sandbox import owner_preview_url, with_preview_path
 from src.server.database.conversation.replay_rows import get_replay_thread_data
 from src.server.database.pool import DATABASE_UNAVAILABLE
 from src.server.database.share_links import KIND_APP
 from src.server.services.file_grants import grant_prefix, mint_file_grant, seconds_left
+from src.server.services.preview_links import signed_url_expires_at
 from src.server.utils.api import PageViewer, Viewer, database_unavailable
 from src.server.services.share_redaction import ShareRedaction
 
@@ -135,6 +132,7 @@ async def get_shared_thread_metadata(
         return await _link_metadata(access, viewer.user_id, path)
 
     perms = get_permissions(thread)
+    allow_files = perms.get("allow_files", False)
 
     return {
         "kind": "thread",
@@ -144,8 +142,20 @@ async def get_shared_thread_metadata(
         "created_at": thread.get("created_at"),
         "updated_at": thread.get("updated_at"),
         "workspace_name": thread.get("workspace_name"),
+        # The transcript's absolute paths are spelled with these, so the viewer
+        # reads them as workspace paths the way the owner does. A turn from
+        # before a move spells them under a root the workspace has left, which
+        # only opens a file, and which this thread may never show, so those
+        # roots go only with the files. Former folder names stay out: they are
+        # old workspace names the share never showed, and the file routes
+        # still fold them.
+        "root_dir": thread.get("root_dir"),
+        "previous_root_dirs": (
+            list(thread.get("previous_root_dirs") or ()) if allow_files else []
+        ),
+        "dir_name": thread.get("dir_name"),
         "permissions": {
-            "allow_files": perms.get("allow_files", False),
+            "allow_files": allow_files,
             "allow_download": perms.get("allow_download", False),
         },
     }

@@ -85,10 +85,16 @@ MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 # Connection pool. httpx defaults keepalive_expiry to 5s, which is shorter than
 # the model latency between two execute_code blocks — so every burst of MCP
 # calls would re-pay a TCP+TLS handshake (~2 RTT) to the vendor. Holding idle
-# connections across a turn is the whole point of pooling here.
+# connections across a turn is the whole point of pooling here. Holding them
+# longer than a vendor does is safe only over HTTP/1.1; see get_relay_client.
+# Over HTTP/1.1 every call in flight holds a connection of its own, and the
+# pool closes a connection that goes idle while it holds more than the
+# keep-alive cap, so a cap below the connection limit turned every call past
+# it into a fresh handshake. An idle connection costs one descriptor, and the
+# expiry and the close check clear dead ones.
 KEEPALIVE_EXPIRY_S = 300.0
-MAX_KEEPALIVE_CONNECTIONS = 40
 MAX_UPSTREAM_CONNECTIONS = 200
+MAX_KEEPALIVE_CONNECTIONS = MAX_UPSTREAM_CONNECTIONS
 
 # Sandbox → vendor: only what the generated MCP client legitimately sends.
 # mcp-method / mcp-name carry the 2026-07-28 stateless negotiation (server/
@@ -138,7 +144,13 @@ def get_relay_client() -> httpx.AsyncClient:
     global _client
     if _client is None or _client.is_closed:
         _client = httpx.AsyncClient(
-            http2=True,
+            # HTTP/1.1, because httpcore checks an idle HTTP/1.1 connection
+            # for a server-side close before reusing it and checks an HTTP/2
+            # one only against our own expiry. A vendor edge that drops idle
+            # connections sooner than KEEPALIVE_EXPIRY_S (IBKR's does at about
+            # two minutes) then failed the first call after a quiet spell with
+            # RemoteProtocolError in a millisecond, an order call included.
+            http2=False,
             follow_redirects=False,
             trust_env=False,
             # Every user's calls share this client, so it has to be stateless:

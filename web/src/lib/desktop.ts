@@ -53,6 +53,60 @@ export interface McpOAuthFlow {
   flowId: string;
 }
 
+/**
+ * Remote control: the shell's background helper, which lets the agent use
+ * this Mac as one of the user's computers, reached through a tunnel. Where it
+ * cannot run, the shell reads nothing of the helper's and says why.
+ */
+export type RemoteControlStatus =
+  | {
+      supported: false;
+      reason: 'platform' | 'os_version' | 'not_packaged';
+      service: 'off';
+      helper: null;
+      paired: false;
+      fingerprint: null;
+      account: string;
+    }
+  | {
+      supported: true;
+      /** The login item: on, off (never registered, or paused), or waiting for the user in System Settings. */
+      service: 'on' | 'off' | 'needs_approval';
+      /** The helper's own state; null when it has none or the service is off. */
+      helper: 'unpaired' | 'connecting' | 'connected' | 'refused' | null;
+      /** Whether the helper holds a paired tunnel. */
+      paired: boolean;
+      /** The helper's SSH host key fingerprint, as a computer's `ssh.fingerprint` reports it; null before pairing. */
+      fingerprint: string | null;
+      /** The macOS account the agent acts as. */
+      account: string;
+    };
+
+export type RemoteControlError =
+  | 'unsupported'
+  | 'bad_url'
+  /** The user said no in the shell's own confirmation. */
+  | 'cancelled'
+  | 'needs_approval'
+  | 'not_started'
+  | 'failed'
+  /** A Mac paired before could not be taken down, so it was left running as it was. */
+  | 'not_replaced'
+  | 'timeout'
+  /** This side's, not the shell's: no method, a channel that threw, or no answer. */
+  | 'unavailable';
+
+export type RemoteControlResult =
+  | { ok: true; status: RemoteControlStatus }
+  | {
+      ok: false;
+      error: RemoteControlError;
+      /** For `failed`: the deployment's own sentence. */
+      message?: string;
+      /** Null only for `unavailable`. */
+      status: RemoteControlStatus | null;
+    };
+
 export interface DesktopBridge {
   readonly version: string;
   /** Node's process.platform: 'darwin' | 'win32' | 'linux'. */
@@ -115,6 +169,19 @@ export interface DesktopBridge {
    * there was one to stand down. Added in shell 0.1.3, with `beginMcpOAuth`.
    */
   cancelMcpOAuth?(flowId: string): Promise<boolean>;
+  /**
+   * Where remote control stands on this Mac. Every platform answers; only a
+   * packaged macOS 13+ app is `supported`. Like the two below, null to a page
+   * the shell does not count as the app's.
+   */
+  getRemoteControl?(): Promise<RemoteControlStatus | null>;
+  /**
+   * Pair this Mac with the pairing at `scriptUrl` and turn the helper on.
+   * Settles once the helper has paired, failed, or given up waiting.
+   */
+  enableRemoteControl?(scriptUrl: string): Promise<RemoteControlResult | null>;
+  /** Turn the helper off and delete its folder, keys and tunnel with it. Idempotent. */
+  disableRemoteControl?(): Promise<RemoteControlStatus | null>;
 }
 
 declare global {
@@ -220,5 +287,47 @@ export async function cancelMcpOAuth(flowId: string): Promise<void> {
     await desktop?.cancelMcpOAuth?.(flowId);
   } catch {
     // A shell too old to know the channel, or one already gone.
+  }
+}
+
+/**
+ * Whether this shell can turn remote control on and off again. All three
+ * methods, each detected: offering a switch the shell could not turn back
+ * off would leave the user with no way out but System Settings.
+ */
+export function canRemoteControl(): boolean {
+  return (
+    typeof desktop?.getRemoteControl === 'function' &&
+    typeof desktop.enableRemoteControl === 'function' &&
+    typeof desktop.disableRemoteControl === 'function'
+  );
+}
+
+/** Null wherever there is no answer: a browser, an older shell, a channel that threw. */
+export async function getRemoteControl(): Promise<RemoteControlStatus | null> {
+  try {
+    return (await desktop?.getRemoteControl?.()) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/** Never rejects: a shell that cannot be asked, or gave no answer, fails as `unavailable`. */
+export async function enableRemoteControl(scriptUrl: string): Promise<RemoteControlResult> {
+  try {
+    const result = await desktop?.enableRemoteControl?.(scriptUrl);
+    if (result) return result;
+  } catch {
+    // A shell too old to know the channel, or one already gone.
+  }
+  return { ok: false, error: 'unavailable', status: null };
+}
+
+/** The status it leaves, or null when the shell could not be asked. */
+export async function disableRemoteControl(): Promise<RemoteControlStatus | null> {
+  try {
+    return (await desktop?.disableRemoteControl?.()) ?? null;
+  } catch {
+    return null;
   }
 }

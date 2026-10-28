@@ -34,6 +34,9 @@ class TestIsNotificationTurn:
     def test_a_system_query_with_no_surface_is_one(self):
         assert is_notification_turn(ChatRequest(query_type="system"))
 
+    def test_a_market_targets_wake_is_one(self):
+        assert is_notification_turn(ChatRequest(query_type="market_target"))
+
     def test_a_system_query_that_names_a_surface_is_not(self):
         assert not is_notification_turn(
             ChatRequest(query_type="system", platform="slack")
@@ -71,6 +74,14 @@ class TestTurnSurface:
 
     def test_a_notification_takes_the_surface_the_thread_is_bound_to(self):
         assert turn_surface(ChatRequest(query_type="system"), SLACK_THREAD) == "slack"
+
+    def test_a_market_targets_wake_takes_the_surface_the_thread_is_bound_to(self):
+        """The agent armed the target on the channel's conversation, so the
+        alert's turn answers there."""
+        assert (
+            turn_surface(ChatRequest(query_type="market_target"), SLACK_THREAD)
+            == "slack"
+        )
 
     def test_a_resumed_interrupt_runs_where_the_attempt_it_answers_ran(self):
         """A resume that carries only the decision continues its attempt."""

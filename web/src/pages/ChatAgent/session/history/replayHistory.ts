@@ -37,6 +37,8 @@ import {
 import type {
   SSEEvent, HistoryInterruptInfo, SubagentHistoryData, PairState,
 } from '../types';
+import { foldTaskArtifact } from '../subagents/taskArtifactHistory';
+import { taskRunFromWire } from '../subagents/taskRuns';
 import { createApprovalEvidence, recordApprovalEvidence } from '../interrupts/claims';
 import { projectHistoryInterrupt } from '../interrupts/fromHistoryEvent';
 import type { HistoryRuntime } from '../runtime';
@@ -653,88 +655,34 @@ export async function loadConversationHistory(
           }
         }
         if (artifactType === 'task') {
-          const payload = event.payload || {};
-          const task_id = payload.task_id as string | undefined;
-          const rawAction = payload.action as string | undefined;
-          const description = payload.description as string | undefined;
-          const prompt = payload.prompt as string | undefined;
-          const type = payload.type as string | undefined;
-          // Backend stamps the task's real status on every replayed task artifact
-          // (payload.status). The top-level `status` is a hardcoded "completed"
-          // and MUST be ignored.
-          const stampedStatus = payload.status as string | undefined;
-          // Ledger failure reason, stamped on any task that settled with one.
-          const stampedError = payload.error as string | undefined;
-          // Its machine spelling, which is what tells a stop the user can act
-          // on (a credit stop) from one that is only worth reporting.
-          const stampedErrorType = payload.error_type as string | undefined;
-          const stampedRunStartedMs =
-            typeof payload.projected_run_started_ms === 'number'
-              ? payload.projected_run_started_ms
-              : undefined;
-          const stampedActivityMs =
-            typeof payload.last_activity_ms === 'number' ? payload.last_activity_ms : undefined;
-          const action = (() => { if (rawAction === 'spawned') return 'init'; if (rawAction === 'steering_accepted') return 'update'; if (rawAction === 'resumed') return 'resume'; return rawAction || 'init'; })();
-          if (task_id) {
-            const agentId = `task:${task_id}`;
-            if (!subagentHistoryByTaskId.has(agentId)) {
-              subagentHistoryByTaskId.set(agentId, {
-                messages: [],
-                events: [],
-                description: description || '',
-                prompt: prompt || description || '',
-                type: type || 'general-purpose',
-                status: stampedStatus,
-                error: stampedError,
-                errorType: stampedErrorType,
-                projectedRunStartedMs: stampedRunStartedMs,
-                lastActivityMs: stampedActivityMs,
+          const folded = foldTaskArtifact(subagentHistoryByTaskId, event);
+          if (folded) {
+            const { agentId } = folded;
+            const payload = event.payload || {};
+            // The run this launch started, as the ledger kept it. A launch
+            // from before the ledger names none; its row draws the task's
+            // latest run, which is what the server stamped on it.
+            if (typeof payload.task_run_id === 'string' && payload.task_run_id) {
+              rt.subagentHistory.runs.put(payload.task_run_id, {
+                taskId: agentId, launchToolCallId: event.tool_call_id, ...taskRunFromWire(payload),
               });
-            } else {
-              const existing = subagentHistoryByTaskId.get(agentId)!;
-              if (description && !existing.description) existing.description = description;
-              if (prompt && !existing.prompt) existing.prompt = prompt || description || '';
-              if (type && !existing.type) existing.type = type;
-              // The failure travels with the status it arrived with, and is
-              // replaced by it rather than merged under it. Every replayed
-              // task artifact carries a status; a resumed task's carries no
-              // failure at all, so preserving the previous run's reason is
-              // exactly how a retracted credit stop comes back on the next
-              // reload — the live session clears both writers when the task
-              // resumes, and replay would put one of them straight back.
-              if (stampedStatus) {
-                existing.status = stampedStatus;
-                existing.error = stampedError;
-                existing.errorType = stampedErrorType;
-              }
-              // Monotonic max: artifacts stamp claims-through-their-turn, and
-              // page/artifact processing order must not regress the watermark.
-              if (stampedRunStartedMs != null) {
-                existing.projectedRunStartedMs =
-                  existing.projectedRunStartedMs != null
-                    ? Math.max(existing.projectedRunStartedMs, stampedRunStartedMs)
-                    : stampedRunStartedMs;
-              }
-              if (stampedActivityMs != null) {
-                existing.lastActivityMs = Math.max(existing.lastActivityMs ?? stampedActivityMs, stampedActivityMs);
-              }
             }
             // Patch the inline card(s) for THIS artifact's tool_call_id so a
             // reborn "running" card reflects the stamped terminal status.
             handleHistoryTaskArtifactStatus({
-              toolCallId: event.tool_call_id as string | undefined,
-              taskId: task_id,
-              status: stampedStatus,
+              toolCallId: event.tool_call_id,
+              taskId: folded.taskId,
+              status: folded.status,
               setMessages: setMessagesForHandlers,
             });
             // Track steering_accepted actions for inline card "Updated" label
-            if (action === 'update') {
+            if (folded.action === 'update') {
               steeredAgentIds.add(agentId);
             }
             rt.historyPendingTaskToolCallIdsRef.current = mapToolCallIdToAgentId(
-              event.tool_call_id as string | undefined,
+              event.tool_call_id,
               agentId,
-              action,
+              folded.action,
               rt.historyPendingTaskToolCallIdsRef.current,
               rt.subagentHistory.toolCalls,
             );

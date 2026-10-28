@@ -57,7 +57,7 @@ export function buildMarketViewUrl({ symbol, timeframe, workspaceId, threadId, r
 
 export function readMarketViewRoute(searchParams: URLSearchParams): MarketViewRouteParams {
   const workspaceId = searchParams.get(PARAM.workspaceId);
-  // An old link's `mode` wins, in its old names: 'fast' is All workspaces.
+  // An old link's `mode` wins, in its old names: 'fast' is the Chief of Staff.
   const mode = searchParams.get(PARAM.mode);
   const legacyScope: ComposerScope | null = mode === 'fast' ? 'all' : mode === 'ptc' ? 'workspace' : null;
   return {

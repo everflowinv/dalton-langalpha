@@ -6,19 +6,37 @@ running unbounded rather than in a stuck turn.
 """
 
 import asyncio
+import inspect
 import time
 from types import SimpleNamespace
+from typing import Any
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from ptc_agent.agent.tools import code_admission
+from tests.unit.ptc_agent.agent.job_fakes import COMMAND_ID, outcome, tool_call
 from ptc_agent.agent.tools.code_admission import (
-    CODE_SLOTS_BY_TIER,
     code_run_key,
     code_run_slot,
     code_slots_for_tier,
+    queue_timeout_seconds,
     reap_horizon_seconds,
+    resource_tiers_of,
 )
+from ptc_agent.agent.tools.command_handoff import HANDOFF_WAIT_S
+from ptc_agent.config.core import (
+    CoreConfig,
+    DaytonaConfig,
+    E2BConfig,
+    FilesystemConfig,
+    LoggingConfig,
+    MCPConfig,
+    SandboxConfig,
+    SecurityConfig,
+)
+
+E2B_TIERS = E2BConfig().resource_tiers
 
 
 class _FakePipeline:
@@ -105,24 +123,51 @@ def _holders(redis, computer_id="comp-1"):
 # ---------------------------------------------------------------------------
 
 class TestSizing:
-    def test_each_tier_gets_its_vcpu_count(self):
-        assert CODE_SLOTS_BY_TIER == {"standard": 1, "performance": 2, "max": 4}
-        assert code_slots_for_tier("performance") == 2
-        assert code_slots_for_tier("MAX") == 4
+    def test_each_tier_gets_its_presets_vcpu_count(self):
+        """Read off the size, not the name: Large is 2 vCPU now."""
+        assert code_slots_for_tier("standard", E2B_TIERS) == 1
+        assert code_slots_for_tier("performance", E2B_TIERS) == 2
+        assert code_slots_for_tier("max", E2B_TIERS) == 2
+        assert code_slots_for_tier("XLARGE", E2B_TIERS) == 4
 
     def test_an_unknown_tier_gets_the_most_restrictive_entry(self):
-        """A tier this build has never heard of is a row from another colour;
-        over-serialising one machine is cheaper than over-subscribing it."""
-        assert code_slots_for_tier(None) == 1
-        assert code_slots_for_tier("titanic") == 1
+        """A tier this provider does not size is a row from another colour or a
+        removed tier; over-serialising one machine is cheaper than
+        over-subscribing it."""
+        assert code_slots_for_tier(None, E2B_TIERS) == 1
+        assert code_slots_for_tier("titanic", E2B_TIERS) == 1
+        assert code_slots_for_tier("xlarge", DaytonaConfig().resource_tiers) == 1
+        assert code_slots_for_tier("max", None) == 1
+
+    def test_the_tiers_are_the_sessions_own_providers(self):
+        def session(provider):
+            return SimpleNamespace(
+                config=CoreConfig(
+                    sandbox=SandboxConfig(provider=provider),
+                    security=SecurityConfig(),
+                    mcp=MCPConfig(),
+                    logging=LoggingConfig(),
+                    filesystem=FilesystemConfig(),
+                )
+            )
+
+        assert "xlarge" in resource_tiers_of(session("e2b"))
+        assert "xlarge" not in resource_tiers_of(session("daytona"))
+        assert resource_tiers_of(SimpleNamespace()) is None
 
     def test_the_reap_horizon_outlasts_the_longest_legitimate_hold(self):
-        # Three attempts of max_execution_time plus transport, plus margin.
-        assert reap_horizon_seconds(300) > 3 * 300
+        # The call's whole wait, each launch's transport and two installs.
+        assert reap_horizon_seconds() > HANDOFF_WAIT_S + 3 * 30 + 2 * 180
+
+    def test_the_slot_is_sized_from_the_wait_not_an_unread_execution_limit(self):
+        """No job reads ``security.max_execution_time``: a slot sized from an
+        operator's 30 would be reaped while still held."""
+        assert queue_timeout_seconds() > HANDOFF_WAIT_S
+        assert "max_execution_time" not in inspect.signature(code_run_slot).parameters
 
     def test_the_reap_horizon_is_overridable_for_tests(self, monkeypatch):
         monkeypatch.setenv("CODE_RUN_SLOT_TTL", "7")
-        assert reap_horizon_seconds(300) == 7
+        assert reap_horizon_seconds() == 7
 
 
 # ---------------------------------------------------------------------------
@@ -175,7 +220,9 @@ class TestAdmission:
         entered = asyncio.Event()
 
         async def run(hold: float):
-            async with code_run_slot("comp-1", tier="performance"):
+            async with code_run_slot(
+                "comp-1", tier="performance", resource_tiers=E2B_TIERS
+            ):
                 entered.set()
                 await asyncio.sleep(hold)
                 return len(_holders(redis))
@@ -276,31 +323,32 @@ class TestFailOpen:
 class TestExecuteCodeTool:
     """``ExecuteCode`` is where the bound actually binds."""
 
+    @staticmethod
+    def _backend(redis, seen: list, result) -> Any:
+        class _Backend:
+            livefs = None
+            provider = "docker"
+            channel = "docker"
+            sandbox = None
+
+            async def settled_livefs(self, workspace_id=None):
+                return None
+
+            async def start_code_job(self, code, *, wait_s, **_):
+                seen.append(dict(_holders(redis)))
+                return result
+
+        return _Backend()
+
     @pytest.mark.asyncio
     async def test_a_session_bound_run_holds_a_slot_for_its_machine(self, redis):
         from ptc_agent.agent.tools.code_execution import create_execute_code_tool
 
         seen: list = []
-
-        class _Backend:
-            livefs = None
-            sandbox = SimpleNamespace(
-                config=SimpleNamespace(
-                    security=SimpleNamespace(max_execution_time=300)
-                )
-            )
-
-            async def settled_livefs(self, workspace_id=None):
-                return None
-
-            async def aexecute_code(self, code, thread_id=None, call_id=None, **_):
-                seen.append(dict(_holders(redis)))
-                return SimpleNamespace(
-                    success=True, stdout="ok", stderr="", mcp_trace=[]
-                )
-
         session = SimpleNamespace(computer_id="comp-1", resource_tier="standard")
-        tool = create_execute_code_tool(_Backend(), None, session=session)
+        tool = create_execute_code_tool(
+            self._backend(redis, seen, outcome(output="ok")), None, session=session
+        )
 
         out = await tool.ainvoke({"code": "print(1)"})
 
@@ -309,22 +357,43 @@ class TestExecuteCodeTool:
         assert _holders(redis) == {}
 
     @pytest.mark.asyncio
+    async def test_a_run_handed_off_lets_its_slot_go(self, redis):
+        """One long run must not hold every other on the computer for an hour."""
+        from ptc_agent.agent.tools.code_execution import create_execute_code_tool
+        from ptc_agent.agent.tools.command_handoff import HandOff
+
+        seen: list = []
+        session = SimpleNamespace(computer_id="comp-1", resource_tier="standard")
+        hand_off = HandOff(
+            thread_id="00000000-0000-4000-8000-000000000001",
+            user_id="user-1",
+            workspace_id="00000000-0000-4000-8000-00000000aaaa",
+            wakeups=True,
+        )
+        tool = create_execute_code_tool(
+            self._backend(redis, seen, outcome(done=False, duration_s=300)),
+            None,
+            session=session,
+            hand_off=hand_off,
+        )
+
+        with patch(
+            "src.server.database.runs.command_runs.record_handoff", new=AsyncMock()
+        ):
+            msg = await tool.ainvoke(tool_call("ExecuteCode", code="run()"))
+
+        assert len(seen) == 1 and len(seen[0]) == 1
+        assert _holders(redis) == {}
+        assert COMMAND_ID in msg.content
+
+    @pytest.mark.asyncio
     async def test_a_run_with_no_session_skips_admission(self, redis):
         from ptc_agent.agent.tools.code_execution import create_execute_code_tool
 
-        class _Backend:
-            livefs = None
-            sandbox = None
-
-            async def settled_livefs(self, workspace_id=None):
-                return None
-
-            async def aexecute_code(self, code, thread_id=None, call_id=None, **_):
-                return SimpleNamespace(
-                    success=True, stdout="ok", stderr="", mcp_trace=[]
-                )
-
-        tool = create_execute_code_tool(_Backend(), None)
+        seen: list = []
+        backend = self._backend(redis, seen, outcome(output="ok"))
+        backend.sandbox = None
+        tool = create_execute_code_tool(backend, None)
         out = await tool.ainvoke({"code": "print(1)"})
 
         assert out.startswith("SUCCESS")

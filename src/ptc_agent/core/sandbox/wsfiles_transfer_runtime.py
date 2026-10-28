@@ -24,6 +24,7 @@ import shutil
 import socket
 import ssl
 import stat
+import subprocess
 import sys
 import tempfile
 import threading
@@ -65,6 +66,27 @@ _ERROR_BODY_LIMIT = 64 * 1024
 # ---------------------------------------------------------------------------
 # shared helpers
 # ---------------------------------------------------------------------------
+
+
+def _digest_reusable(known: Any, size: int, mtime_ns: int) -> bool:
+    """Whether the manifest's (size, mtime_ns, sha256) still names this file.
+
+    The backend stores mtimes at microsecond precision, so the check compares
+    at that granularity; an exact ns compare would rehash every file on every
+    scan. An mtime of 0 is no stamp at all: an upload that set none, or an
+    archive unpacked at the epoch, rewrites a file without moving it, so the
+    file is read again whichever side holds the 0.
+    """
+    if not known or len(known) < 3 or not known[2] or known[1] is None:
+        return False
+    recorded_us = int(known[1]) // 1000
+    current_us = mtime_ns // 1000
+    return (
+        known[0] == size
+        and recorded_us != 0
+        and current_us != 0
+        and recorded_us == current_us
+    )
 
 
 def _hash_file(path: str) -> tuple[str, bool, int]:
@@ -308,7 +330,18 @@ def _boot_id() -> str | None:
         with open("/proc/sys/kernel/random/boot_id") as f:
             return f.read().strip() or None
     except OSError:
+        pass
+    # macOS has no /proc; without an id every sweep would rescan everything.
+    try:
+        found = subprocess.run(
+            ["sysctl", "-n", "kern.bootsessionuuid"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
         return None
+    return found.stdout.strip() or None
 
 
 def _clock_offset_ns() -> int:
@@ -361,16 +394,7 @@ def scan(spec: dict[str, Any]) -> dict[str, Any]:
             oversized.append({"path": rel, "size": size})
             return
         known = prior.get(rel)
-        # The backend stores mtimes at microsecond precision, so the reuse
-        # check compares at that granularity; an exact ns compare would rehash
-        # every file on every scan.
-        if (
-            known
-            and len(known) >= 3
-            and known[0] == size
-            and known[2]
-            and int(known[1]) // 1000 == st.st_mtime_ns // 1000
-        ):
+        if _digest_reusable(known, size, st.st_mtime_ns):
             digest, is_binary = known[2], None
             counts["reused"] += 1
         elif not hash_files:
@@ -1016,6 +1040,12 @@ def _download_to_temp(url: str, parent: str, timeout_s: float) -> tuple[str, str
                 h.update(chunk)
                 n += len(chunk)
                 tmp.write(chunk)
+            # http.client ends a body the store closed early as though it
+            # were whole, so a cut transfer would reach ``_verify`` as other
+            # bytes, which nothing retries.
+            declared = resp.getheader("Content-Length")
+            if declared is not None and declared.isdigit() and n < int(declared):
+                raise http.client.IncompleteRead(b"", int(declared) - n)
         except BaseException:
             _drop_response_connection(resp)
             raise
@@ -1158,7 +1188,15 @@ def _stamp(path: str, item: dict[str, Any]) -> None:
     if mode is not None:
         os.chmod(path, int(mode))
     mtime_ns = item.get("mtime_ns")
-    if mtime_ns is not None:
+    if mtime_ns is None:
+        return
+    # A recorded 0 is no stamp (see _digest_reusable). Writing it back, or
+    # leaving a file already at 0 in place, would leave it rehashed on every
+    # scan; the restore's own time lets the next backup hash it once and
+    # record a real one.
+    if int(mtime_ns) // 1000 == 0:
+        os.utime(path)
+    else:
         os.utime(path, ns=(int(mtime_ns), int(mtime_ns)))
 
 
@@ -1765,14 +1803,7 @@ def hash_one(spec: dict[str, Any]) -> dict[str, Any]:
     if not os.path.realpath(path).startswith(real_root.rstrip(os.sep) + os.sep):
         return {"status": "missing"}
     known = spec.get("prior")
-    if (
-        known
-        and len(known) >= 3
-        and known[0] == st.st_size
-        and known[2]
-        and known[1] is not None
-        and int(known[1]) // 1000 == st.st_mtime_ns // 1000
-    ):
+    if _digest_reusable(known, st.st_size, st.st_mtime_ns):
         digest, is_binary, size = known[2], None, st.st_size
     else:
         digest, is_binary, size = _hash_file(path)

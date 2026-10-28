@@ -80,18 +80,26 @@ def _patch_session(steps):
     return session, patch("aiohttp.ClientSession", MagicMock(return_value=session))
 
 
-async def _run(steps, final_status="completed", origin=_ORIGIN, **kwargs):
+def _owed(
+    final_status="completed", origin=_ORIGIN, *, run_id=None
+) -> executor.OwedAnalystReport:
+    return executor.OwedAnalystReport(
+        origin=origin,
+        dispatcher_thread_id="cos-1",
+        ptc_thread_id="ptc-1",
+        final_status=final_status,
+        run_id=run_id,
+    )
+
+
+async def _run(
+    steps, final_status="completed", origin=_ORIGIN, *, run_id=None, **kwargs,
+):
     """Drive _post_report_back over ``steps`` with sleeps stubbed out."""
     session, sess_patch = _patch_session(steps)
+    owed = _owed(final_status, origin, run_id=run_id)
     with sess_patch, patch("asyncio.sleep", new=AsyncMock()):
-        outcome = await executor._post_report_back(
-            cache=None,
-            dispatcher_thread_id="cos-1",
-            ptc_thread_id="ptc-1",
-            origin=origin,
-            final_status=final_status,
-            **kwargs,
-        )
+        outcome = await executor._post_report_back(None, owed, **kwargs)
     return outcome, session
 
 
@@ -323,13 +331,7 @@ async def test_busy_wait_cap_exhausted_returns_cap():
         # Past deadline on the first check, so one 409 exhausts the budget.
         patch.object(leases, "RB_BUSY_WAIT_CAP", -1.0),
     ):
-        outcome = await executor._post_report_back(
-            cache=None,
-            dispatcher_thread_id="cos-1",
-            ptc_thread_id="ptc-1",
-            origin=_ORIGIN,
-            final_status="completed",
-        )
+        outcome = await executor._post_report_back(None, _owed())
     assert outcome == ("cap", None)
     assert session.post_calls == 1
 
@@ -366,20 +368,123 @@ async def test_the_summary_turn_is_told_how_the_run_ended(final_status, says, ne
     assert never_says not in message
 
 
+_CONTINUED_RUNS = "src.server.database.runs.lifecycle.get_continued_runs"
+_TAKEN_HAND_OFFS = "src.server.database.runs.outbox.list_taken_hand_offs"
+
+
+@pytest.fixture(autouse=True)
+def _taken_hand_offs():
+    """No hand-off was steered into the reported runs unless a test says so."""
+    with patch(_TAKEN_HAND_OFFS, AsyncMock(return_value=[])) as taken:
+        yield taken
+
+
+def _taken_by(thread_id, run_ids, steers):
+    """``list_taken_hand_offs`` answering ``steers`` for exactly these runs
+    on that thread, and none for any other ask."""
+    return lambda thread, runs: (
+        steers if (thread, list(runs)) == (thread_id, run_ids) else []
+    )
+
+
 @pytest.mark.asyncio
-async def test_the_body_names_the_reporting_thread_for_history():
+async def test_the_body_names_the_reporting_thread_for_history(_taken_hand_offs):
     """The summary turn's message is hidden, so history labels the turn from
-    ``report_source``; the message itself keeps naming the workspace."""
-    with patch.object(executor, "_workspace_name", AsyncMock(return_value="Chips")):
-        _, session = await _run([_FakeResp(200, json_data={"run_id": "rid-1"})])
+    ``report_source``: which thread, how its run ended, the runs it reports
+    for, back to the one an approval interrupted, and the hand-offs those
+    runs took in as steers. The message itself keeps naming the workspace."""
+    continued = AsyncMock(return_value=["ptc-run-0", "ptc-run-1"])
+    _taken_hand_offs.side_effect = _taken_by(
+        "ptc-1", ["ptc-run-0", "ptc-run-1"], ["steer-a", "steer-b"]
+    )
+    with (
+        patch.object(executor, "_workspace_name", AsyncMock(return_value="Chips")),
+        patch(_CONTINUED_RUNS, continued),
+    ):
+        _, session = await _run(
+            [_FakeResp(200, json_data={"run_id": "rid-1"})],
+            final_status="cancelled",
+            run_id="ptc-run-1",
+        )
     body = session.last_json
     assert body["report_source"] == {
         "kind": "analyst",
         "thread_id": "ptc-1",
         "workspace_id": "ws-ptc",
         "workspace_name": "Chips",
+        "outcome": "cancelled",
+        # Oldest first: the run the hand-off's result named, then its resume.
+        "run_ids": ["ptc-run-0", "ptc-run-1"],
+        # Oldest first, taken in by any of those runs: what a hand-off's
+        # result named when it was steered.
+        "steer_ids": ["steer-a", "steer-b"],
     }
     assert 'in the "Chips" workspace' in body["messages"][0]["content"]
+    continued.assert_awaited_once_with("ptc-1", "ptc-run-1")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "continued",
+    [AsyncMock(side_effect=RuntimeError("db down")), AsyncMock(return_value=[])],
+    ids=["read-fails", "run-not-found"],
+)
+async def test_a_run_whose_chain_cannot_be_read_names_itself(continued):
+    """The report still goes, naming the reported run alone."""
+    with patch(_CONTINUED_RUNS, continued):
+        _, session = await _run(
+            [_FakeResp(200, json_data={"run_id": "rid-1"})], run_id="ptc-run-1"
+        )
+    assert session.last_json["report_source"]["run_ids"] == ["ptc-run-1"]
+
+
+@pytest.mark.asyncio
+async def test_a_report_with_no_run_to_name_leaves_the_keys_out():
+    """A view tells an older report by the key being absent, not null, and
+    with no run there are no steers it could have taken in to name."""
+    _, session = await _run([_FakeResp(200, json_data={"run_id": "rid-1"})])
+    report = session.last_json["report_source"]
+    assert "run_ids" not in report
+    assert "steer_ids" not in report
+
+
+@pytest.mark.asyncio
+async def test_a_report_whose_hand_offs_cannot_be_read_leaves_steers_out(
+    _taken_hand_offs,
+):
+    """The report still goes, saying nothing of its steers: a view takes any
+    list as final, so an empty one would never match a steered hand-off."""
+    _taken_hand_offs.side_effect = RuntimeError("db down")
+    with patch(_CONTINUED_RUNS, AsyncMock(return_value=["ptc-run-1"])):
+        outcome, session = await _run(
+            [_FakeResp(200, json_data={"run_id": "rid-1"})], run_id="ptc-run-1"
+        )
+    assert outcome == ("dispatched", "rid-1")
+    report = session.last_json["report_source"]
+    assert report["run_ids"] == ["ptc-run-1"]
+    assert "steer_ids" not in report
+
+
+@pytest.mark.asyncio
+async def test_an_empty_steer_list_survives_into_history():
+    """Stored on the turn's query row as sent, and replayed from it."""
+    from src.server.handlers.chat.request_prep import provenance_metadata
+    from src.server.models.chat import ChatRequest
+    from src.server.services.history.replay.items import _user_message_item
+
+    with patch(_CONTINUED_RUNS, AsyncMock(return_value=["ptc-run-1"])):
+        _, session = await _run(
+            [_FakeResp(200, json_data={"run_id": "rid-1"})], run_id="ptc-run-1"
+        )
+    sent = session.last_json["report_source"]
+    assert sent["steer_ids"] == []
+
+    request = ChatRequest(messages=[], report_source=sent)
+    stored = provenance_metadata(request)
+    replayed = _user_message_item(
+        "cos-1", {"turn_index": 1, "type": "system", "metadata": stored}
+    )
+    assert replayed["data"]["metadata"]["report_source"]["steer_ids"] == []
 
 
 @pytest.mark.asyncio
@@ -388,11 +493,5 @@ async def test_an_unknown_ending_raises_instead_of_reading_as_completed():
     down: better than a summary telling the user the work completed."""
     session, sess_patch = _patch_session([_FakeResp(200, json_data={"run_id": "rid-1"})])
     with sess_patch, pytest.raises(KeyError):
-        await executor._post_report_back(
-            cache=None,
-            dispatcher_thread_id="cos-1",
-            ptc_thread_id="ptc-1",
-            origin=_ORIGIN,
-            final_status="interrupted",
-        )
+        await executor._post_report_back(None, _owed("interrupted"))
     assert session.post_calls == 0

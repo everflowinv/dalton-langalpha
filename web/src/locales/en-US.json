@@ -11,6 +11,7 @@
       "offlineMessage": "You are offline. Data may be out of date until your connection returns."
     },
     "copy": "Copy",
+    "copied": "Copied",
     "submit": "Submit",
     "save": "Save",
     "saving": "Saving...",
@@ -30,6 +31,8 @@
     "back": "Back",
     "done": "Done",
     "failed": "Failed",
+    "language": "Language",
+    "languageCurrent": "Language: {{language}}",
     "optional": "(Optional)"
   },
   "auth": {
@@ -46,6 +49,7 @@
     "signupEmailExists": "An account with this email already exists.",
     "signupEmailExistsHint": "<1>Sign in</1>, <2>email me a sign-in link</2>, or <3>reset your password</3>.",
     "agreeToTerms": "By continuing, you agree to our <1>Terms of Service</1> and <2>Privacy Policy</2>.",
+    "agreeToTermsOnly": "By continuing, you agree to our <1>Terms of Service</1>.",
     "forgotPassword": "Forgot password?",
     "magicLinkCta": "Email me a sign-in link",
     "continueWithEmail": "Continue with email",
@@ -214,6 +218,7 @@
     "threadNeedsInput": "Waiting for your input",
     "threadUnseen": "Finished, not yet viewed",
     "untitledThread": "Untitled",
+    "onComputer": "On {{name}} · {{kind}}",
     "noConversations": "No conversations yet",
     "workspaceFallback": "Workspace",
     "collapseAgents": "Collapse agents",
@@ -225,6 +230,11 @@
     "connected": "Connected",
     "manageProviders": "Manage providers",
     "fontSize": "Font size",
+    "cardStyle": "Card style",
+    "cardStyleDesc": "How data cards and their detail panels look in chat.",
+    "cardStyleTerminal": "Terminal",
+    "cardStyleBalanced": "Balanced",
+    "cardStyleQuiet": "Quiet",
     "userInfo": "User Info",
     "preferences": "Preferences",
     "model": "Model",
@@ -255,6 +265,10 @@
     "streamingModeDesc": "Show text as it arrives, or reveal one paragraph at a time.",
     "streamingModeToken": "Continuous",
     "streamingModeParagraph": "By paragraph",
+    "toolCallLayout": "Tool calls",
+    "toolCallLayoutDesc": "Show each step as a row, or try the new status line: one line that names the current step.",
+    "toolCallLayoutRows": "Rows",
+    "toolCallLayoutStatus": "Status line",
     "tradingPermission": {
       "title": "Trading permission",
       "desc": "How the agent handles orders at your connected brokerages. Paper orders are not affected. What you tell the agent in a conversation can narrow this, but only this setting lets orders skip your approval.",
@@ -295,7 +309,7 @@
     "logoutConfirmMsg": "Are you sure you want to logout?",
     "timezone": "Timezone",
     "selectTimezone": "Select timezone...",
-    "preferencesDesc": "Preferences are managed through conversation with the agent. Use the button below to update them.",
+    "preferencesDesc": "You can also ask the agent to change these in any chat.",
     "noPreferencesYet": "No preferences set yet. Use the button below to set up your profile.",
     "riskTolerance": "Risk Tolerance",
     "investmentStyle": "Investment Style",
@@ -310,10 +324,8 @@
     "resetPreferences": "Reset Preferences",
     "resetConfirmMsg": "This will clear all your preferences: risk tolerance, investment style, agent settings, your default models and other model settings (custom models and providers, quick-access models, per-model settings), and your dashboard layout. Conversations keep the models they use. You can set everything up again anytime in Settings or via the agent. Are you sure?",
     "resetting": "Resetting...",
-    "modifyWithAgent": "Modify with Agent",
-    "completeProfile": "Complete your profile setup",
-    "completeProfileDesc": "Set up your stocks, risk tolerance, and preferences through a quick conversation.",
-    "startOnboarding": "Start Onboarding",
+    "completeProfile": "Set up your investing profile",
+    "completeProfileDesc": "A few questions so the agent's research fits how you invest.",
     "defaultModel": "Default Model",
     "defaultModelDesc": "Used for workspace conversations (code execution, sandbox).",
     "defaultModelChange": {
@@ -449,9 +461,14 @@
       "deep": "Deep"
     },
     "compactionProfile": "Compaction Profile",
-    "compactionProfileDesc": "Bundled preset for compaction trigger and retention. Leave on system default and each model gets the preset that fits its context window.",
+    "compactionProfileDesc": "When a conversation compacts. Leave on system default and each model gets its own: 500k for Claude and GPT, and what the context window affords for the rest.",
     "compactionProfileUseDefault": "Use system default",
-    "compactionProfilePreset": "{{tokens}}k tokens · keep {{keep}}",
+    "nativeCompaction": "Provider compaction",
+    "nativeCompactionOn": "On",
+    "nativeCompactionOff": "Off",
+    "nativeCompactionAnthropicDesc": "Claude summarizes the conversation itself when it compacts, so it keeps its reasoning in the turns it keeps. Its summary is readable, and a model you switch to reads the same one.",
+    "nativeCompactionOpenAIDesc": "OpenAI compacts the conversation into an encrypted summary that only OpenAI models can read, through the API or a ChatGPT login. The compaction card shows a plain record of the conversation instead. Switch the thread to another provider's model and it gets that record, not the summary, so it loses detail from earlier tool results.",
+    "compactionProfilePreset": "{{tokens}}k tokens",
     "compactionProfiles": {
       "aggressive": {
         "label": "Aggressive",
@@ -463,11 +480,27 @@
       },
       "extended": {
         "label": "Extended",
-        "description": "Preserve more context. Best for 400k–1M context models."
+        "description": "Preserve more context. Good default for 400k-context models."
+      },
+      "economy": {
+        "label": "Economy",
+        "description": "Stays under 272k, past which OpenAI bills a whole request at long-context rates."
       },
       "relaxed": {
         "label": "Relaxed",
-        "description": "Maximum context. Best for 1M-context models."
+        "description": "More room before a summary on 1M-context models."
+      },
+      "spacious": {
+        "label": "Spacious",
+        "description": "Long sessions on 1M-context models."
+      },
+      "expansive": {
+        "label": "Expansive",
+        "description": "Half of a 1M window before a summary. Each call costs more as the thread grows."
+      },
+      "maximal": {
+        "label": "Maximum",
+        "description": "Most of a 1M window. Highest cost per call; for 1M-context models only."
       }
     },
     "modelTuning": {
@@ -542,6 +575,7 @@
     "xaiConnectTitle": "Connect xAI Grok (SuperGrok)"
   },
   "dashboard": {
+    "failedOnboarding": "Failed to set up onboarding. Please try again.",
     "title": "{{brand}}",
     "searchPlaceholder": "Search by symbol or company name...",
     "searching": "Searching...",
@@ -551,12 +585,7 @@
     "prefIncompleteMsg": "Your preference information is not complete. Please complete your preferences to get the best experience with the agent.",
     "ignoreFor24h": "Ignore for 24 hours",
     "proceed": "Proceed",
-    "failedOnboarding": "Failed to set up onboarding. Please try again.",
-    "failedPrefUpdate": "Failed to start preference update. Please try again.",
     "watchlist": "Watchlist",
-    "personalizeTitle": "Personalize your experience",
-    "personalizeDesc": "Chat with our agent to customize watchlists, risk preferences, and alerts",
-    "personalize": "Personalize",
     "layoutToggle": {
       "groupAria": "Dashboard layout",
       "classic": "Classic",
@@ -1329,8 +1358,22 @@
     "sortBy": "Sort by",
     "activity": "Activity",
     "custom": "Custom",
-    "reorder": "Reorder",
-    "dragToReorder": "Drag to reorder",
+    "sortRecent": "Recent",
+    "allComputers": "All computers",
+    "filterByComputer": "Filter by computer",
+    "manageComputers": "Manage computers…",
+    "manageComputerMenu": "Manage computer…",
+    "newComputerMenu": "New computer…",
+    "customSortHint": "Drag cards to arrange",
+    "dragInstructions": "To pick up a workspace, press Space. Use the arrow keys to move it, Space again to drop it, or Escape to cancel.",
+    "dragPickedUp": "Picked up {{name}}.",
+    "dragOver": "{{name}} is over {{over}}.",
+    "dragInPlace": "{{name}} is back in its place.",
+    "dragDropped": "{{name}} was dropped over {{over}}.",
+    "dragNotMoved": "{{name}} was dropped in its place.",
+    "dragCancelled": "Moving {{name}} was cancelled.",
+    "dragStillSaving": "{{name}} was not moved: the last move is still being saved.",
+    "reorderFailed": "Couldn't save the new order",
     "pinToTop": "Pin to top",
     "unpin": "Unpin",
     "rename": "Rename",
@@ -1344,47 +1387,96 @@
     "copyNameTaken": "A workspace named \"{{name}}\" was created at the same moment. Try again.",
     "folderMoving": "This workspace's folder is being moved. Try renaming it again in a moment.",
     "changeSpec": "Change spec",
-    "quotaRemaining": "{{remaining}} of {{limit}} left",
-    "quotaUnlimited": "Unlimited",
     "quotaNotOnPlan": "Not on your plan",
+    "quotaNoneLeft": "None left",
     "quotaUsedUp": "Plan limit reached",
-    "alwaysOnEnable": "Turn on always-on",
-    "alwaysOnBadge": "Always-on",
-    "alwaysOnBadgeTitle": "Always-on — sandbox stays running",
     "alwaysOnFailed": "Could not change always-on",
-    "alwaysOnEnableConfirm": "Turn on",
-    "tierBadgeTitle": "{{tier}} sandbox spec",
     "tier": {
-      "standard": "Standard",
-      "performance": "Performance",
-      "max": "Max"
+      "standard": "Small",
+      "performance": "Medium",
+      "max": "Large",
+      "xlarge": "Extra Large"
     },
-    "tierSpec": {
-      "standard": "1 vCPU · 1 GB RAM · 3 GB disk",
-      "performance": "2 vCPU · 4 GB RAM · 5 GB disk",
-      "max": "4 vCPU · 8 GB RAM · 10 GB disk"
+    "tierFact": {
+      "cpu": "{{count}} vCPU",
+      "memory": "{{count}} GB RAM",
+      "disk": "{{count}} GB disk"
     },
     "specUpdated": "Computer spec updated",
     "duplicate": "Duplicate",
     "duplicating": "Duplicating…",
-    "duplicateConfirm": "Create a copy of \"{{name}}\"? Files are copied; always-on starts off on the copy.",
+    "duplicateConfirm": "Create a copy of \"{{name}}\"? Files are copied.",
     "duplicated": "Workspace duplicated",
     "duplicateFailed": "Could not duplicate workspace",
+    "move": {
+      "menu": "Move to computer…",
+      "title": "Move workspace",
+      "intro": "Move {{name}} to another of your computers. Its files, threads and settings go with it.",
+      "notCopied": "Installed dependencies, caches and .git history aren't copied. They stay on {{source}} for 7 days, then are removed.",
+      "notCopiedKept": "Installed dependencies, caches and .git history aren't copied. They stay on {{source}}, in _internal/leftovers, and aren't removed.",
+      "submit": "Move",
+      "copying": "Copying files…",
+      "finishing": "Finishing up…",
+      "progressHint": "You can close this dialog. The move keeps running.",
+      "cancel": "Cancel move",
+      "cancelFailed": "Couldn't cancel the move. Try again.",
+      "done": "Moved to {{computer}}",
+      "failedTitle": "Couldn't move {{name}}",
+      "failed": "Couldn't move this workspace. Try again.",
+      "fromBackup": {
+        "offer": "{{computer}} didn't answer, so the files couldn't be copied from it. If it's gone for good, you can restore this workspace on {{target}} from its backup taken {{time}}.",
+        "offerUndated": "{{computer}} didn't answer, so the files couldn't be copied from it. If it's gone for good, you can restore this workspace on {{target}} from its backup.",
+        "button": "Restore from backup",
+        "confirm": "Restore this workspace on {{target}} from its backup taken {{time}}?",
+        "confirmUndated": "Restore this workspace on {{target}} from its backup?",
+        "caveats": "Files changed since that backup aren't included. The folder on {{computer}} is kept, moved to _internal/leftovers once it answers again.",
+        "restoring": "Restoring files from backup…"
+      }
+    },
+    "restoreOffer": {
+      "missing": "This workspace's folder is missing on {{computer}}.",
+      "missingUnnamed": "This workspace's folder is missing.",
+      "prompt": "Restore it from the backup taken {{time}}?",
+      "promptUndated": "Restore it from its backup?",
+      "restore": "Restore files",
+      "keepEmpty": "Keep it empty",
+      "restoring": "Restoring files…",
+      "keeping": "Keeping the folder empty…",
+      "keepEmptyTitle": "Keep the folder empty?",
+      "keepEmptyBody": "The backup then follows the folder as it is now, so the files in it can't be restored afterwards.",
+      "keepEmptyConfirm": "Keep it empty",
+      "failed": "Couldn't restore the files"
+    },
     "notOnPlan": "Not available on your plan. Upgrade to unlock.",
     "tierLimitReached": "You've reached your {{tier}} workspace limit.",
+    "computerPreparing": "This computer is still being prepared. Try again once it's ready.",
     "workspaceLimitReached": "You've reached your workspace limit.",
     "options": "Options",
     "noWorkspacesFound": "No workspaces found",
     "welcomeTitle": "Welcome to {{brand}}",
     "welcomeDesc": "Get started by setting up your preferences or creating a workspace.",
+    "noWorkspacesMatch": "No workspaces match “{{query}}”.",
+    "clearSearch": "Clear search",
+    "emptyTitle": "No workspaces yet",
+    "emptyDesc": "A workspace keeps a project's threads, files and computer together, with an Analyst of its own. Your Chief of Staff can set one up for you, or start one here.",
+    "cosRecent": "Recent",
+    "cosTryAsking": "Try asking",
+    "cosAllThreads": "All threads",
+    "cosStarter1": "What have my Analysts been working on this week?",
+    "cosStarter2": "Set up a workspace to track semiconductor breadth",
+    "cosStarter3": "What moved in my watchlist today, and why?",
     "createWorkspace": "Create Workspace",
     "failedLoadWorkspaces": "Failed to load workspaces. Please refresh the page.",
     "invalidWorkspace": "Invalid workspace. Please try again.",
     "failedDeleteWorkspace": "Failed to delete workspace. Please try again.",
+    "deleteOwnMachine": {
+      "cannotUndo": "The workspace and its threads are deleted, and this can't be undone.",
+      "filesStay": "Its files are in {{folder}} on {{computer}}, and they stay there.",
+      "alsoDeleteFiles": "Also delete {{folder}} from this machine"
+    },
     "loadingWorkspaces": "Loading workspaces...",
     "backToThreads": "Back to threads",
     "updated": "Updated {{time}}",
-    "recently": "recently",
     "createNewWorkspace": "Create New Workspace",
     "workspaceName": "Workspace Name",
     "enterWorkspaceName": "Enter workspace name",
@@ -1405,7 +1497,9 @@
     "filesUploaded": "{{count}} file(s) uploaded",
     "filesFailed": "· {{count}} failed",
     "openWorkspace": "Open Workspace",
-    "fileTooLarge": "{{name}} is too large to upload ({{size}} MB)."
+    "fileTooLarge": "{{name}} is too large to upload ({{size}} MB).",
+    "cosWorksOn": "Works on",
+    "cosComputerHint": "{{name}} works on your primary computer, in a Home folder beside your workspaces. Make another computer primary and it moves there."
   },
   "computer": {
     "computers": "Computers",
@@ -1413,16 +1507,65 @@
     "loading": "Loading computers",
     "empty": "No computers yet. Your first workspace creates one.",
     "nameLabel": "Name",
+    "nameFromMachine": "Defaults to the machine's name",
     "namePlaceholderCloud": "Cloud computer",
     "namePlaceholderLocal": "Local computer",
     "tierLabel": "Computer spec",
+    "createDesc": "A separate machine with its own files. Workspaces you put on it start and stop with it.",
+    "planLimitedProvider": "Need a provider your plan doesn't include?",
+    "planLimitedBoth": "Need a provider or spec your plan doesn't include?",
+    "capReached": "You have as many computers as your plan allows. Remove one to add another.",
+    "capPlanLimited": "Need more computers than your plan includes?",
+    "tierElsewhere": "{{tier}} is available on {{provider}}.",
+    "switchProvider": "Switch to {{provider}}",
+    "takeOverFolder": "Take over this folder",
+    "takeOverFolderNote": "The other computer stops working in it. The files in it stay.",
+    "computerLabel": "Computer",
+    "computerHint": "Workspaces on one computer share its disk and start and stop together.",
+    "nameWithSource": "{{name}} · {{source}}",
+    "primaryOption": "{{name}} (Primary)",
+    "preparingOption": "{{name}} (Preparing)",
+    "primaryPreparingOption": "{{name}} (Primary, Preparing)",
+    "provider": {
+      "label": "Provider",
+      "daytonaDesc": "Container-based sandbox",
+      "e2bDesc": "MicroVM",
+      "dockerDesc": "Runs on this machine",
+      "sshDesc": "Any Linux server or Mac",
+      "sshLabel": "Your machine (SSH)",
+      "capReached": "Limit reached"
+    },
+    "largerSlot": {
+      "open_one": "Your plan includes {{count}} computer larger than {{small}}.",
+      "open_other": "Your plan includes {{count}} computers larger than {{small}}.",
+      "partly_one": "Your plan includes {{count}} computer larger than {{small}}, {{remaining}} left.",
+      "partly_other": "Your plan includes {{count}} computers larger than {{small}}, {{remaining}} left.",
+      "inUse_one": "Your plan's computer larger than {{small}} is in use.",
+      "inUse_other": "Your plan's {{count}} computers larger than {{small}} are in use."
+    },
     "newComputer": "New computer",
     "create": "Create computer",
     "creating": "Creating...",
+    "add": "Add computer",
+    "adding": "Adding...",
     "start": "Start",
     "stop": "Stop",
     "primaryBadge": "Primary",
     "primaryBadgeTitle": "New workspaces are created on this computer",
+    "badge": {
+      "mac": "Mac",
+      "ssh": "SSH"
+    },
+    "makePrimary": {
+      "button": "Make primary",
+      "title": "Make {{name}} primary?",
+      "body": "New workspaces will be created on {{name}}.",
+      "bodyHomeMoves": "New workspaces will be created on {{name}}, and Home, where the Chief of Staff keeps its files, moves there too.",
+      "movingHome": "Moving Home…",
+      "done": "{{name}} is now your primary computer",
+      "failedTitle": "Couldn't make {{name}} primary",
+      "failed": "Couldn't make this computer primary. Try again."
+    },
     "workspaceCount_one": "{{count}} workspace",
     "workspaceCount_other": "{{count}} workspaces",
     "stopComputer": "Stop computer",
@@ -1437,20 +1580,91 @@
     "statusError": "Error",
     "statusDeleted": "Deleted",
     "statusUpdating": "Updating",
+    "statusPreparing": "Preparing",
     "rename": "Rename computer",
     "renameLabel": "Computer name",
     "renameFailed": "Could not rename computer",
+    "remove": "Remove",
+    "removeTitle": "Remove {{name}}?",
+    "removeBody": "Its sandbox and everything on its disk are deleted. This can't be undone.",
+    "removeBodyOwnMachine": "We stop using this machine and remove what we set up there for it. Your files in {{folder}} stay.",
+    "removeBodyOwnMachineDelete": "We stop using this machine and delete what LangAlpha put there.",
+    "alsoDeleteFiles": "Also delete LangAlpha's files from this machine",
+    "alsoDeleteFilesHint": "Deletes {{folder}}, its workspaces' folders included, and LangAlpha's runtime in ~/.langalpha (about 3 GB) unless another computer uses it. Files you put in {{folder}} yourself stay. The machine has to be connected.",
+    "filesDeleted": "Its files were deleted from the machine.",
+    "filesRootKept": "{{folder}} stays, since it holds files of yours.",
+    "filesRuntimeKept": "~/.langalpha stays, since another computer uses it.",
+    "filesUnreached": "We could not reach the machine, so its files are still there.",
+    "filesFailed": "We could not finish deleting its files from the machine.",
+    "removeConfirm": "Remove computer",
+    "removeWithWorkspaces_one": "Remove computer and workspace",
+    "removeWithWorkspaces_other": "Remove computer and {{count}} workspaces",
+    "removeWorkspaces_one": "This workspace is deleted with it:",
+    "removeWorkspaces_other": "These {{count}} workspaces are deleted with it:",
+    "removeWorkspacesMore_one": "and {{count}} more",
+    "removeWorkspacesMore_other": "and {{count}} more",
+    "removeWorkspacesAcknowledgeOne": "I understand {{name}} and its threads are deleted for good",
+    "removeWorkspacesAcknowledge_other": "I understand these {{count}} workspaces and their threads are deleted for good",
+    "removeWorkspacesLoading": "Finding the workspaces on it...",
+    "removeWorkspacesFailed": "Couldn't read the workspaces on it. Close this and try again.",
+    "removing": "Removing...",
+    "removeKey": "Remove our key from ~/.ssh/authorized_keys",
+    "keyRemoved": "We also removed our key from ~/.ssh/authorized_keys.",
+    "keyKept": "Our key stays in ~/.ssh/authorized_keys, since {{computer}} still logs in with it.",
+    "keySkipped": "We could not safely remove our key, so it still lets us log in there.",
+    "keyUnreached": "We could not reach the machine, so our key is still there.",
+    "keyRemoveYourself": "To remove it yourself, delete the line ending in {{comment}} from ~/.ssh/authorized_keys. Its fingerprint is {{fingerprint}}.",
+    "removed": "{{name}} removed",
+    "removeFailed": "Couldn't remove this computer. Try again.",
+    "removeBlocked": {
+      "specChange": "You can remove it once the spec change finishes.",
+      "starting": "You can remove it once it has started.",
+      "stopping": "You can remove it once it has stopped."
+    },
+    "removeRefused": {
+      "primary": "Your primary computer can't be removed.",
+      "hasWorkspaces": "A workspace not listed here is on it now. Check the list and try again.",
+      "busy": "This computer is busy. Try again in a moment.",
+      "published_reports": "A workspace on this computer has published reports and can only be archived, not deleted."
+    },
     "manageComputer": "Manage {{name}}",
     "alwaysOn": "Always-on",
-    "alwaysOnConfirm": "Keep \"{{name}}\" running 24/7? Every workspace on it stays available. The computer skips idle shutdown and keeps billing until always-on is turned off.",
-    "alwaysOnConfirmStopped": "Start \"{{name}}\" and keep it running 24/7? Every workspace on it stays available. The computer starts immediately and keeps billing until always-on is turned off.",
+    "filesBackup": {
+      "label": "Back up files",
+      "offTitle": "Stop backing up files?",
+      "offBody": "The last backup of each workspace on {{name}} is kept but stops updating. A folder lost on this machine could then only be restored as it was then.",
+      "offConfirm": "Stop backing up",
+      "failed": "Couldn't change file backup"
+    },
+    "machine": {
+      "system": "System",
+      "processor": "Processor",
+      "cores": "Cores",
+      "memory": "Memory",
+      "folder": "Folder",
+      "gb": "{{count}} GB"
+    },
+    "prepare": {
+      "sandbox": "Creating the sandbox",
+      "runtime": "Installing the runtime",
+      "tools": "Installing tools",
+      "finishing": "Finishing setup",
+      "step": "{{step}} ({{index}} of {{total}})",
+      "hint": "Setting up this computer can take a few minutes. You can create workspaces on it once it's ready.",
+      "blocksWorkspace": "{{name}} is being prepared. You can create a workspace on it once it's ready.",
+      "readyTitle": "{{name}} is ready",
+      "readyDesc": "You can create workspaces on it now.",
+      "failedTitle": "Couldn't prepare {{name}}",
+      "retryHint": "Start it to try again."
+    },
     "spec": {
       "title": "Change spec for {{name}}",
       "descRunning": "Every workspace on this computer is backed up first. The computer is then recreated at the new spec and your files are restored. Workspaces on it are unavailable for a few minutes.",
       "descStopped": "Every workspace on this computer is backed up first. The new spec applies the next time the computer starts, and your files are restored then.",
       "notKept": "Installed packages, caches and running apps aren't kept. The Agent reinstalls what it needs.",
-      "applying": "Applying",
+      "applying": "Applying...",
       "apply": "Back up and change spec",
+      "current": "Current",
       "turnActive": "An Agent is working on this computer. Wait for the running turn to finish, then try again.",
       "backupIncomplete": "Nothing was changed. The spec change backs up every file first, and these files could not be backed up. Move or delete them, or ask the Agent to clean up, then try again.",
       "backupIncompleteUnnamed": "Nothing was changed. This computer's files could not be backed up first. Try again in a moment.",
@@ -1472,6 +1686,7 @@
     },
     "disk": {
       "label": "Storage",
+      "percent": "Disk {{percent}}%",
       "usage": "{{used}} of {{total}} used, {{free}} free",
       "unknown": "Storage not measured yet",
       "breakdown": "By workspace",
@@ -1516,6 +1731,178 @@
       "refresh": "Refresh status",
       "archive": "Archive",
       "sandboxId": "Sandbox ID:"
+    },
+    "ssh": {
+      "filesBackup": "Back up workspace files",
+      "filesBackupHint": "Keeps a copy of each workspace's files on the server, so a lost folder can be restored. Version control and dependency folders are left out.",
+      "previewLabel": "Preview",
+      "previewNotice": "Connecting your own machine is new, so use it with care. The agent can do anything the account you connect can do, so connect an account made for it rather than your own.",
+      "pairIntro": "Run this on the machine you are adding (Linux or macOS), as the user the agent should work as:",
+      "pairIntroLocal": "Run this in a terminal on the computer running LangAlpha, as the user the agent should work as. To add another machine, set it up by hand.",
+      "pairLoading": "Getting your command...",
+      "viewScript": "View script",
+      "waiting": "Waiting for your machine...",
+      "checking": "{{username}}@{{hostname}} checked in. Connecting...",
+      "tunneling": "Connecting {{hostname}} through a tunnel. It could not be reached from the internet, so it is connecting out instead. This takes a few seconds.",
+      "readyTunnel": "{{hostname}}, through a tunnel",
+      "tunnelBadge": "tunnel",
+      "tunnelOffline": "tunnel offline",
+      "pairFailedNext": "Fix it and run the command again, or enter the address yourself:",
+      "pairRerun": "Fix it and run the command again.",
+      "pairOtherUser": "The command ran as {{username}}. To use another login, run it as that user.",
+      "limitReached_one": "You can have only {{count}} SSH computer. Remove it to add another.",
+      "limitReached_other": "You can have up to {{count}} SSH computers. Remove one to add another.",
+      "pairUnavailable": "The one-line command is not available on this server, so set it up by hand.",
+      "manualLink": "Set it up by hand instead",
+      "pairingLink": "Use the one-line command instead",
+      "addressLabel": "Host or SSH command",
+      "addressHint": "Add :2222 for another port.",
+      "addressNoUser": "Include the user, like ubuntu@203.0.113.10.",
+      "addressInvalid": "Enter an address like ubuntu@203.0.113.10.",
+      "portInvalid": "Enter a port from 1 to 65535.",
+      "connect": "Connect",
+      "connecting": "Connecting...",
+      "keyStep": "Our key isn't on {{username}}@{{host}} yet. Run this there as {{username}}, then Connect again:",
+      "keyLoading": "Getting your key...",
+      "keyUnavailable": "This server cannot store SSH keys, so it cannot connect to your machine.",
+      "keyFailed": "Could not get your key. Close this dialog and try again.",
+      "commandLabel": "command",
+      "publicKeyLabel": "public key",
+      "copyLabel": "Copy {{what}}",
+      "keyManual": "Or add the public key yourself",
+      "differentMachine": "Use a different machine",
+      "diskFree": "{{free}} free",
+      "sudoRoot": "Connecting as root.",
+      "sudoYes": "sudo available",
+      "sudoNo": "sudo is not available. Some tools may not install.",
+      "folder": "Folder",
+      "folderHint": "Where workspaces are kept on your machine.",
+      "folderShown": "Workspaces go in {{folder}}.",
+      "changeFolder": "Change",
+      "hostKey": "Host key {{fingerprint}}",
+      "error": {
+        "authFailed": "The machine did not accept our key for {{username}}.",
+        "authFailedRoot": "The machine did not accept our key for root, most likely because it does not allow root logins. Run the command as the user the agent should work as, or allow root logins by key (PermitRootLogin prohibit-password).",
+        "unreachable": "We could not reach {{address}}. It must accept SSH from the internet.",
+        "unreachableMachine": "We could not reach your machine over SSH. It must accept SSH from the internet.",
+        "unreachableMac": "We could not reach your Mac over SSH. Turn on Remote Login in System Settings, General, Sharing, then run the command again.",
+        "timeout": "The connection timed out. Check that SSH is running and its port is open.",
+        "hostKeyMismatch": "Something other than your machine answered at that address.",
+        "privateAddress": "The machine is on a private network, which we cannot reach. Use an address that is reachable from the internet.",
+        "unsupported": "This machine is not supported.",
+        "expired": "This command expired. Run the new one.",
+        "rateLimited_one": "This account has tried too many SSH connections in the last hour. Try again in {{count}} minute.",
+        "rateLimited_other": "This account has tried too many SSH connections in the last hour. Try again in {{count}} minutes.",
+        "generic": "Could not connect. Try again."
+      }
+    },
+    "remoteControl": {
+      "cardTitle": "This Mac",
+      "cardDesc": "Works even with LangAlpha closed",
+      "alreadyAdded": "Already added",
+      "title": "Remote control of this Mac",
+      "intro": "LangAlpha's agent will work on this Mac as {{account}}, with everything that account can do.",
+      "meansLabel": "What it means",
+      "meansAccess": "It can run any command and read or change any file {{account}} can, in any folder. Its work stays in the folder you pick, but nothing on this Mac holds it there.",
+      "meansBackground": "It keeps working after you close LangAlpha. Remote control runs in the background and starts again when you log in, until you turn it off.",
+      "meansCredentials": "It can read what command line tools keep for {{account}}, such as Git and cloud sign-ins, and reach your home or office network.",
+      "meansAccount": "Anyone who signs in to your LangAlpha account can direct it.",
+      "stopLabel": "Stopping it",
+      "stop": "Pause it any time from the LangAlpha menu, or in System Settings under General, Login Items. Removing this computer in LangAlpha turns it off and deletes its keys from this Mac.",
+      "folderPrompts": "macOS may ask whether LangAlpha can open folders such as Documents or Desktop. You can say no: the agent's own folder does not need it.",
+      "previewNotice": "Remote control is in preview while we build more safeguards. Until then the agent has the same access you do, so turn it on only on a Mac where that is all right.",
+      "acknowledge": "I understand LangAlpha's agent can run commands and change files on this Mac as {{account}}.",
+      "turnOn": "Turn on remote control",
+      "turningOn": "Turning on remote control…",
+      "connecting": "Connecting this Mac…",
+      "needsApproval": "macOS needs your OK. In System Settings, under General, Login Items, allow LangAlpha in the background, then continue.",
+      "continue": "Continue",
+      "tryAgain": "Try again",
+      "failed": "Couldn't turn on remote control. Try again.",
+      "insecure": "Remote control needs this server's address to start with https, so this Mac can trust the pairing it is sent.",
+      "thisMacBadge": "This Mac",
+      "provider": "Remote control",
+      "asAccount": "as {{account}}",
+      "notConnected": "Not connected",
+      "paused": "Remote control is paused. Resume it from the LangAlpha menu.",
+      "removeTurnsOff": "Remote control on this Mac turns off too.",
+      "cardTitlePc": "This PC",
+      "windowsSoon": "Windows support is coming soon",
+      "needsApp": "Needs the desktop app",
+      "needsAppHint": "To add this Mac, <download>get the desktop app</download> and open this form there.",
+      "anotherMacHint": "To add another Mac, <download>get the desktop app</download> on it and open this form there."
+    },
+    "card": {
+      "spec": "Spec",
+      "changeSpec": "Change",
+      "workspaces": "Workspaces",
+      "disk": "Disk",
+      "position": "{{n}} / {{total}}",
+      "previous": "Previous computer",
+      "next": "Next computer",
+      "newOwn": "A cloud computer, or a machine you already have, reached over SSH.",
+      "newCloud": "Another cloud computer, for work you want kept on its own machine.",
+      "add": "Add a computer",
+      "ownMachine": "Own machine",
+      "details": "Details",
+      "storage": "Storage",
+      "previewPending": "Drawn once it's reached"
+    },
+    "startFailure": {
+      "lead": "Couldn't start.",
+      "reinstall": "Reinstall…",
+      "reconnect": "Reconnect…"
+    },
+    "restartRefused": {
+      "folderMarked": "That folder is another computer's, possibly one from another LangAlpha account or server.",
+      "folderOwned": "Another of your computers works in that folder. Remove it to free the folder.",
+      "notStopped": "This computer is starting or running. Try again once it has stopped.",
+      "specInProgress": "A spec change is running on this computer. Try again once it finishes.",
+      "unanswered": "The machine didn't answer. Check that it's on and connected, then try again.",
+      "reinstallFailed": "Couldn't reinstall this computer. Try again.",
+      "reconnectFailed": "Couldn't reconnect this computer. Try again."
+    },
+    "reinstall": {
+      "title": "Reinstall {{name}}",
+      "desc": "Choose the folder this computer works in on its machine. It starts again once that is set up.",
+      "folderLabel": "Folder",
+      "takeBack": "Take the folder back",
+      "takeBackDesc": "Keep using {{folder}}. If another computer works in it now, that computer stops working on this machine. The files in the folder stay.",
+      "takeBackOwned": "Keep using {{folder}}. Another computer works in it now, possibly one from another LangAlpha account or server. That computer stops working on this machine. The files in the folder stay.",
+      "newFolder": "Use a new folder",
+      "newFolderDesc": "Start again in another folder on this machine. The old folder is left as it is.",
+      "newFolderLabel": "New folder",
+      "newFolderBackup": "Workspace files come back from their backup.",
+      "newFolderNoBackup": "Backup is off for this computer, so workspace files stay in {{folder}}. Copy them over yourself if you need them.",
+      "takeNew": "Take this folder",
+      "takeBackAgainNote": "Taking it back stops that computer working there. The files in it stay.",
+      "takeBackAgain": "Take it back from that computer",
+      "takeNewNote": "Taking it stops that computer working there. The files in it stay. Or enter another folder.",
+      "submit": "Reinstall",
+      "submitting": "Reinstalling..."
+    },
+    "reconnect": {
+      "title": "Reconnect {{name}}",
+      "desc": "Connect this computer to its machine again. Its folder and workspaces stay as they are.",
+      "pairIntro": "Run this on the machine, as {{username}}:",
+      "folderKept": "Workspaces stay in {{folder}}.",
+      "onThatMac": "{{name}} is connected by the LangAlpha app on its Mac. Open LangAlpha on that Mac and choose Reconnect there.",
+      "otherMac": "This Mac is already {{other}}. To reconnect {{name}}, open LangAlpha on the Mac it runs on and choose Reconnect there.",
+      "takeBackNote": "{{folder}} is this computer's folder. Taking it back stops the other computer working there. The files in it stay.",
+      "submit": "Reconnect",
+      "submitting": "Reconnecting...",
+      "moveToMac": "Move to this Mac",
+      "moveToMachine": "Move to this machine",
+      "notThisMac": "This Mac isn't the one {{name}} was on: its folder and files aren't here. Workspace files come back from their backup; anything never backed up stays on the old Mac.",
+      "notThisMachine": "This isn't the machine {{name}} was on: its folder and files aren't here. Workspace files come back from their backup; anything never backed up stays on the old machine.",
+      "notThisMacNoBackup": "This Mac isn't the one {{name}} was on: its folder and files aren't here. Backup is off for this computer, so workspace files stay on the old Mac; a workspace backed up before then offers to restore that backup.",
+      "notThisMachineNoBackup": "This isn't the machine {{name}} was on: its folder and files aren't here. Backup is off for this computer, so workspace files stay on the old machine; a workspace backed up before then offers to restore that backup.",
+      "folderRestored": "Workspaces come back in {{folder}} from their backup.",
+      "moveDesc": "Move this computer to the machine below. It starts there once you confirm.",
+      "keepBothMacNote": "To keep both, add this Mac as a computer of its own, and reconnect {{name}} from the Mac it was on.",
+      "keepBothNote": "To keep both, add this machine as a computer of its own, and reconnect {{name}} to the machine it was on.",
+      "addThisMac": "Add this Mac as a new computer",
+      "addThisMachine": "Add this machine as a new computer"
     }
   },
   "thread": {
@@ -1613,6 +2000,8 @@
       "subagentsOn": "Subagents on",
       "subagentsOff": "Subagents off",
       "subagentsFailed": "Couldn't change this thread's subagents setting",
+      "effortFailed": "Couldn't change this thread's reasoning effort",
+      "fastModeFailed": "Couldn't change this thread's speed",
       "watch": "Market watch",
       "watchOn": "Market watch on",
       "watchOff": "Market watch off",
@@ -1620,6 +2009,20 @@
       "manageSubagents": "Manage subagents"
     },
     "moreTools": "More tools",
+    "composer": {
+      "remove": "Remove",
+      "attachFile": "Attach file",
+      "attachChart": "Attach chart screenshot",
+      "captureChart": "Capture chart",
+      "chartAlt": "Chart",
+      "send": "Send message",
+      "dropFiles": "Drop files to upload",
+      "uploading": "Uploading"
+    },
+    "mention": {
+      "noMatching": "No matching files",
+      "noFiles": "No files available"
+    },
     "widgetContext": {
       "inContext_one": "{{count}} in context",
       "inContext_other": "{{count}} in context",
@@ -1724,6 +2127,7 @@
       "pickFailed": "Couldn't change this thread's model",
       "retired": "{{model}} is no longer available. This thread now uses {{fallback}}.",
       "offer": "This thread uses {{model}}. New threads start on {{defaultModel}}.",
+      "handoff": "OpenAI compacted part of this thread into a summary only its models can read. The previous model is writing it out for {{model}}, so your next message may take a little longer to start.",
       "makeDefault": "Make {{model}} my default"
     },
     "backgroundTasksRunning": "Background tasks are still running",
@@ -1734,7 +2138,25 @@
       "tasksRunning_one": "{{count}} task · {{running}} running",
       "tasksRunning_other": "{{count}} tasks · {{running}} running",
       "tasksHeading": "From this thread",
+      "commandsHeading": "Running in the background",
       "show": "Show this thread's work"
+    },
+    "commands": {
+      "chip_one": "{{count}} command running",
+      "chip_other": "{{count}} commands running",
+      "pickedUp_one": "The Agent picks this up when it finishes.",
+      "pickedUp_other": "The Agent picks each one up when it finishes.",
+      "inBackground": "In background {{duration}}",
+      "completedIn": "Completed in {{duration}}",
+      "failedAfter": "Failed after {{duration}}",
+      "stoppedAfter": "Stopped after {{duration}}",
+      "stoppedEarlyAfter": "Stopped early after {{duration}}",
+      "completed": "Completed",
+      "failed": "Failed",
+      "stopped": "Stopped",
+      "stoppedEarly": "Stopped early",
+      "stopLabel": "Stop {{name}}",
+      "stopFailed": "Couldn't stop it. Try again."
     },
     "provenance": {
       "fromChiefOfStaff": "From Chief of Staff",
@@ -1742,10 +2164,16 @@
       "automationNamed": "Automation · {{name}}",
       "viaChannel": "Via {{platform}}",
       "fromMainAgent": "From main agent",
-      "reportFrom": "Report from {{name}}",
-      "reportFromAnalyst": "Report from an Analyst",
-      "taskFinished": "{{id}} finished",
-      "taskFailed": "{{id}} failed"
+      "steered": "Steered",
+      "steeredHint": "Taken in by a run already going",
+      "analyst": "{{name}} analyst",
+      "analystUnnamed": "The analyst",
+      "reportedBack": "reported back",
+      "couldntFinish": "couldn't finish",
+      "stopped": "was stopped",
+      "taskFinished": "finished",
+      "taskFailed": "failed",
+      "commandStoppedEarly": "stopped early"
     },
     "taskCard": {
       "statusRunning": "Running",
@@ -1766,15 +2194,26 @@
       "title": "Out of credits"
     },
     "subagentCard": {
-      "titleFallback": "Subagent Task",
-      "viewDetails": "View task details",
-      "openUpdated": "Click to view updated subagent",
-      "openResumed": "Click to view resumed subagent",
-      "openRunning": "Click to view running subagent",
-      "openDetails": "Click to view subagent details",
-      "toolUnit_one": "tool",
-      "toolUnit_other": "tools",
-      "tokenUnit": "tokens"
+      "titleFallback": "Subagent Task"
+    },
+    "subagentRun": {
+      "starting": "Starting up",
+      "couldntStart": "Couldn't start",
+      "subagentsOff": "Subagents are off for this chat",
+      "openLabel": "Open subagent: {{title}}",
+      "count_one": "{{count}} subagent",
+      "count_other": "{{count}} subagents",
+      "tally": {
+        "working": "{{count}} working",
+        "done": "{{count}} done",
+        "failed": "{{count}} failed",
+        "stopped": "{{count}} stopped",
+        "updated": "{{count}} updated",
+        "resumed": "{{count}} resumed"
+      },
+      "finishedIn": "Finished in {{duration}}",
+      "finished": "Finished",
+      "model": "Model: {{model}}"
     },
     "subagentBar": {
       "completedWithTools_one": "Completed ({{count}} tool call)",
@@ -1819,25 +2258,40 @@
       "noProgress": "No recorded progress for this run."
     },
     "ptcCard": {
-      "awaitingApproval": "Awaiting approval",
-      "researchDeclined": "Research declined",
+      "handOffTo": "Hand off to the analyst <ws>in {{name}}</ws>",
+      "handOffToAnalyst": "Hand off to the analyst",
+      "waitingForYou": "Waiting for you",
+      "briefMore": "Read the whole brief",
+      "briefLess": "Show less",
       "reportBack": "Report back with a summary",
-      "approve": "Approve",
+      "handOff": "Hand off",
       "decline": "Decline",
+      "declined": "Hand-off declined",
       "statusWorking": "Working",
       "statusStarting": "Starting…",
       "statusNeedsInput": "Needs input",
       "statusCompleted": "Completed",
       "statusFailed": "Failed",
       "statusStopped": "Stopped",
-      "hintProvisioning": "Provisioning sandbox…",
-      "hintWorking": "Running in the background",
-      "hintFailed": "Run stopped before finishing",
-      "hintNotStarted": "Run couldn't start",
-      "hintStopped": "Run was stopped",
-      "ctaOpenThread": "Open thread",
-      "ctaAnswerContinue": "Answer & continue",
-      "ctaViewThread": "View thread",
+      "needsAnswer": "Needs your answer",
+      "answer": "Answer",
+      "open": "Open",
+      "seeReport": "See report",
+      "finished": "Finished",
+      "finishedAfter": "Finished after {{duration}}",
+      "couldntFinish": "Couldn't finish",
+      "stopped": "Stopped",
+      "stoppedAfter": "Stopped after {{duration}}",
+      "couldntStart": "Couldn't start",
+      "groupTitle_one": "Handed off to {{count}} analyst",
+      "groupTitle_other": "Handed off to {{count}} analysts",
+      "summaryWorking": "{{count}} working",
+      "summaryNeedsAnswer_one": "{{count}} needs your answer",
+      "summaryNeedsAnswer_other": "{{count}} need your answer",
+      "summaryFinished": "{{count}} finished",
+      "summaryCouldntFinish": "{{count}} couldn't finish",
+      "summaryStopped": "{{count}} stopped",
+      "summaryCouldntStart": "{{count}} couldn't start",
       "alwaysApprove": "Always allow",
       "alwaysApproveHint": "Hand this and later work to Analysts without asking. Turn it off in Settings."
     },
@@ -1849,7 +2303,70 @@
       "panelTitle": "Market watch",
       "panelUpdated": "Updated {{time}}",
       "panelWaiting": "Live prices appear here while the agent is working.",
-      "panelEmpty": "No tickers are being watched."
+      "panelEmpty": "No tickers are being watched.",
+      "pctFromClose": "{{move}} from previous close",
+      "pctFromPrice": "{{move}} from {{price}}",
+      "pctFromSet": "{{move}} from when it was set"
+    },
+    "marketAlert": {
+      "crossedAbove": "{{symbol}} crossed above {{level}}",
+      "crossedBelow": "{{symbol}} crossed below {{level}}",
+      "movedFromClose": "{{symbol}} moved {{move}} from previous close",
+      "movedFromSet": "{{symbol}} moved {{move}} since the target was set",
+      "pricedAt": "{{price}} at {{time}}",
+      "at": "at {{time}}",
+      "expiring": "{{symbol}} {{condition}} target expires at {{time}}",
+      "expiringSoon": "{{symbol}} {{condition}} target expires soon",
+      "woke": "Price alert woke the agent: {{alert}}",
+      "wokeGeneric": "Price alert woke the agent",
+      "generic": "Price alert"
+    },
+    "wakeups": {
+      "chip_one": "1 wakeup · {{time}}",
+      "chip_other": "{{count}} wakeups · next {{time}}",
+      "chipTitle": "Wakeups the agent set in this thread. Open to cancel any of them.",
+      "panelTitle": "Wakeups",
+      "panelEmpty": "No wakeups in this thread.",
+      "cancel": "Cancel",
+      "cancelAll": "Cancel all",
+      "cancelling": "Cancelling…",
+      "cancelLabel": "Cancel the wakeup {{label}}",
+      "cancelFailed": "Couldn't cancel this wakeup. Try again.",
+      "cancelTooLate": "Already with the agent. Use Stop to end its turn.",
+      "rowTitle": "{{label}}",
+      "labelAt": "At {{time}}",
+      "labelRepeat": "{{schedule}}",
+      "labelRepeatZone": "{{schedule}} · {{zone}} time",
+      "labelOrder": "Order fills or ends · {{order}}",
+      "stateNext": "Next {{time}}",
+      "stateProgress": "{{done}} of {{total}} · next {{time}}",
+      "stateLapses": "Pending · lapses {{when}}",
+      "stateHeld": "Fired · arrives when this turn ends",
+      "stateHeldUsage": "Fired · usage limit reached, arrives on your next message",
+      "stateFired": "Fired · {{time}}",
+      "stateFinished": "Finished",
+      "stateLapsed": "Lapsed",
+      "stateExpired": "Expired",
+      "stateCancelled": "Cancelled",
+      "woke": "Woke the agent: {{labels}}",
+      "wokeOrder": "Order update woke the agent: {{label}}",
+      "arrived": "Wakeup: {{label}}",
+      "check": "Check {{n}} of {{total}}",
+      "orderFilled": "{{order}} filled at {{price}}",
+      "orderPartial": "{{order}}: {{filled}} of {{qty}} filled",
+      "orderCancelled": "{{order}} cancelled",
+      "orderRejected": "{{order}} rejected",
+      "quiet_one": "1 check · nothing new · {{time}}",
+      "quiet_other": "{{count}} checks · nothing new · last {{time}}",
+      "quietEntry": "{{time}} · {{labels}} · {{status}}",
+      "chip_one_untimed": "1 wakeup",
+      "chip_other_untimed": "{{count}} wakeups",
+      "settingWakeups": "setting wakeups...",
+      "cancellingWakeups": "cancelling wakeups...",
+      "checkingWakeups": "checking wakeups...",
+      "endingQuietly": "ending the check...",
+      "orderPartialCancelled": "{{order}}: {{filled}} of {{qty}} filled, then cancelled",
+      "orderFailed": "{{order}} failed"
     },
     "missingWorkspaceOrThread": "Missing workspace or thread information",
     "accessDeniedTitle": "You don't have access to this conversation",
@@ -1887,6 +2404,10 @@
     "compacting": "Compacting conversation...",
     "compactingTokens": "{{value}} tokens written",
     "offloading": "Offloading context...",
+    "turnHeld": {
+      "handoff": "Waiting for the previous model to write out its summary...",
+      "other": "Waiting for the current operation on this conversation to finish..."
+    },
     "compactionStopped": "Compaction stopped",
     "queuedSend": "Message queued — sends when compaction finishes",
     "automationWaiting": "{{name}} is due. It runs when this turn ends.",
@@ -1922,8 +2443,7 @@
       "sector-overviewDesc": "Industry landscape report: market size, competitive dynamics, company profiles, valuation context",
       "competitive-analysisDesc": "Competitive landscape analysis: positioning, scorecards, moat assessment, market share trends",
       "initiating-coverageDesc": "Full equity research initiation: company research, financial model, valuation, charts, 30-50 page report",
-      "chart-annotationDesc": "Annotate a price chart: price lines, trendlines, zones, and event markers, live on MarketView or as a chart card in chat",
-      "report-issueDesc": "Report issues and propose fixes to improve agent capabilities"
+      "chart-annotationDesc": "Annotate a price chart: price lines, trendlines, zones, and event markers, live on MarketView or as a chart card in chat"
     },
     "compactedNotification": "Context compacted · {{from}} messages → summary",
     "taskErrorNotification": "Subagent run failed",
@@ -1955,7 +2475,9 @@
       "speed": "Speed",
       "speedStandard": "Standard",
       "speedFast": "Fast",
-      "speedFastHint": "2× credit usage, priority service tier"
+      "speedFastHint": "2× credit usage, priority service tier",
+      "select": "Select model",
+      "fallbackName": "Model"
     },
     "voice": {
       "start": "Start voice input",
@@ -2056,6 +2578,36 @@
       "alwaysApproveHint": "Create this and later workspaces without asking. Turn it off in Settings.",
       "duplicateExists": "You already have a similar workspace: {{duplicate}}. You can use it instead of creating a duplicate.",
       "duplicateUnknown": "Could not confirm whether you already have a workspace with this name or ticker."
+    },
+    "secretaryConfirm": {
+      "deleteWorkspace": {
+        "title": "Delete Workspace",
+        "approved": "Workspace deleted",
+        "rejected": "Workspace deletion declined"
+      },
+      "stopWorkspace": {
+        "title": "Stop Workspace",
+        "approved": "Workspace stopped",
+        "rejected": "Workspace stop declined"
+      },
+      "deleteThread": {
+        "title": "Delete Thread",
+        "approved": "Thread deleted",
+        "rejected": "Thread deletion declined"
+      },
+      "workspaceLabel": "Workspace:",
+      "threadLabel": "Thread:",
+      "unknownId": "unknown",
+      "confirm": "Confirm",
+      "decline": "Decline"
+    },
+    "userQuestion": {
+      "answered": "Answered: {{answer}}",
+      "noAnswer": "(no answer)",
+      "skipped": "Question skipped",
+      "custom": "Custom:",
+      "submitCount": "Submit ({{n}})",
+      "customPlaceholder": "Or type a custom answer..."
     }
   },
   "context": {
@@ -2157,13 +2709,13 @@
     "metaPages_one": "1 page",
     "metaPages_other": "{{count}} pages",
     "newTab": "New tab",
+    "back": "Back",
+    "forward": "Forward",
     "noFilesYet": "No files yet",
     "noTypeMatches": "No {{type}} files",
     "openFile": "Open a file",
-    "openFileHint": "Pick one from the tree on the right.",
-    "openFileHintUpload": "Pick one from the tree on the right, or drop a file here to upload it.",
-    "showFileTree": "Show file tree",
-    "dropToUploadHint": "Or drop a file here to upload it.",
+    "files": "Files",
+    "dropToUploadHint": "Drop a file here to upload it.",
     "openFiles": "Open tabs",
     "runningApps": "Running apps",
     "reloadApp": "Reload app",
@@ -2171,7 +2723,6 @@
     "previewFrameTitle": "App on port {{port}}",
     "openInBrowser": "Open in browser",
     "chartTab": "Chart",
-    "openChart": "Open a chart",
     "addChartToContext": "Add chart to context",
     "openInMarketView": "Open in MarketView",
     "chartContextHint": "The user is looking at the live {{symbol}} chart ({{timeframe}} candles) in the workspace panel.",
@@ -2190,11 +2741,16 @@
     "systemDirs": "System",
     "systemDirsHint": "Show system directories (.agents/, .system/, tools/, …)",
     "toggleTree": "Toggle file tree",
+    "expandPanel": "Expand panel",
+    "collapsePanel": "Show chat",
     "uploadFile": "Upload file",
     "uploadingNth": "Uploading {{current}} / {{total}}: {{name}} — {{percent}}%",
     "uploadFailedSummary_one": "1 file failed to upload: {{details}}",
     "uploadFailedSummary_other": "{{count}} files failed to upload: {{details}}",
+    "cancelUpload": "Cancel upload",
+    "uploadSendFailed": "The file could not be sent. Check your connection and try again.",
     "backupFiles": "Backup files to database",
+    "backupOff": "File backup is off for this computer.",
     "backupSummary_one": "Backed up 1 file",
     "backupSummary_other": "Backed up {{count}} files",
     "backupUnchanged": ", {{count}} unchanged",
@@ -2239,8 +2795,8 @@
     "exitFullscreen": "Exit fullscreen",
     "downloadAsHtml": "Download as HTML",
     "moreActions": "More actions",
-    "htmlPreview": "Preview",
-    "htmlSource": "Source",
+    "viewSource": "View source",
+    "viewPreview": "View page",
     "htmlPreviewFailed": "Couldn't load the preview.",
     "pdfPrintHint": "Press Cmd/Ctrl-P to save the page as a PDF.",
     "pdfGenerating": "Generating PDF…",
@@ -2724,7 +3280,7 @@
     "profitMargins": "Profit Margins",
     "epsActualVsEstimate": "EPS: Actual vs Estimate",
     "cashFlowQuarterly": "Cash Flow (Quarterly)",
-    "openInMarketView": "Open in Market View ↗",
+    "openInMarketView": "Open in Market View",
     "revenue": "Revenue",
     "netIncome": "Net Income",
     "grossMargin": "Gross Margin",
@@ -2837,8 +3393,6 @@
     "resultSavedToFilesystem": "The full result has been saved to the workspace filesystem.",
     "openFullResult": "Open full result",
     "preview": "Preview",
-    "nSearchResults": "{{count}} result for \"{{query}}\"",
-    "nSearchResults_other": "{{count}} results for \"{{query}}\"",
     "untitled": "Untitled",
     "nReasoning": "{{count}} reasoning",
     "thoughtFor": "thought for {{duration}}",
@@ -2886,6 +3440,7 @@
       "executeCode": "Execute Code",
       "thinking": "Thinking",
       "taskOutput": "Task Output",
+      "threadStatus": "Thread Status",
       "automations": "Automations",
       "createAutomation": "Create Automation",
       "manageAutomation": "Manage Automation",
@@ -2900,7 +3455,10 @@
       "preference": "Preferences",
       "user": "Account",
       "sendMessage": "Send Message",
-      "messageTargets": "Message Targets"
+      "messageTargets": "Message Targets",
+      "scheduleWakeup": "Wakeups",
+      "optionsChain": "Options Chain",
+      "marketMovers": "Market Movers"
     },
     "completed": {
       "activatedSkill": "Activated skill",
@@ -2965,6 +3523,9 @@
       "screeningStocks": "screening stocks...",
       "watchingMarket": "starting market watch...",
       "unwatchingMarket": "stopping market watch...",
+      "settingPriceTargets": "setting price targets...",
+      "cancellingPriceTargets": "cancelling price targets...",
+      "checkingMarketWatch": "checking market watch...",
       "fetchingSymbolFiling": "fetching {{symbol}} filing...",
       "fetchingFiling": "fetching filing...",
       "searchingPattern": "searching '{{pattern}}'...",
@@ -2984,6 +3545,7 @@
       "waitingForSubagent": "waiting for subagent...",
       "fetchingTaskOutput": "fetching task output...",
       "checkingAutomations": "checking automations...",
+      "checkingThreadStatus": "checking what is running...",
       "creatingName": "creating {{name}}...",
       "creatingAutomation": "creating automation...",
       "actionAutomation": "{{action}} automation...",
@@ -2993,7 +3555,11 @@
       "sendingTo": "sending to {{app}}...",
       "sendingMessage": "sending message...",
       "listingMessageTargets": "listing message targets...",
-      "processing": "processing..."
+      "processing": "processing...",
+      "fetchingSymbolOptions": "fetching {{symbol}} options...",
+      "fetchingOptions": "fetching options...",
+      "fetchingGainers": "fetching top gainers...",
+      "fetchingLosers": "fetching top losers..."
     },
     "preparing": {
       "writingCode": "writing code{{size}}...",
@@ -3032,7 +3598,9 @@
       "fileEdit": "edited {{count}} file",
       "fileEdit_other": "edited {{count}} files",
       "generic": "ran {{count}} step",
-      "generic_other": "ran {{count}} steps"
+      "generic_other": "ran {{count}} steps",
+      "failed": "{{count}} failed",
+      "failed_other": "{{count}} failed"
     },
     "fileGroup": {
       "read": "Read {{count}} files",
@@ -3102,6 +3670,9 @@
         "partiallyFilled": "Partially filled",
         "filled": "Filled",
         "cancelled": "Cancelled",
+        "handedOff": "Left the brokerage's instruction list, so it was sent, deleted or expired there. The brokerage does not say which; the account's orders show what was sent.",
+        "handedOffStaged": "Left {{vendor}}'s instruction list, so it was sent, deleted or expired in {{vendor}}. {{vendor}} does not say which; the account's orders show what was sent.",
+        "handedOffStagedUnnamed": "Left the brokerage's instruction list, so it was sent, deleted or expired there. The brokerage does not say which; the account's orders show what was sent.",
         "rejectedByVendor": "Rejected by the brokerage",
         "failed": "Failed before the brokerage answered",
         "unknown": "Outcome unknown"
@@ -3119,6 +3690,7 @@
         "partiallyFilled": "Partial fill",
         "filled": "Filled",
         "cancelled": "Cancelled",
+        "handedOff": "Handed off",
         "rejectedByVendor": "Broker rejected",
         "failed": "Failed",
         "unknown": "Unknown"
@@ -3150,6 +3722,11 @@
       "orderReceipt": {
         "viewInOrders": "View in Orders",
         "openAt": "Open in {{vendor}}"
+      },
+      "orderTerm": {
+        "limit": "Limit",
+        "avgFill": "Avg fill",
+        "stop": "Stop"
       }
     },
     "messageDelivery": {
@@ -3171,6 +3748,76 @@
       "message": "Message",
       "files": "Files",
       "sentEarlier": "Sent earlier"
+    },
+    "termHead": {
+      "sym": "Sym",
+      "name": "Name",
+      "last": "Last",
+      "change": "Chg",
+      "mktCap": "Mkt cap",
+      "dayRange": "Day range",
+      "extended": "Ext hrs",
+      "filed": "Filed",
+      "items": "Items",
+      "press": "Press",
+      "asOf": "As of",
+      "filing": "Filing",
+      "strike": "Strike",
+      "exp": "Exp",
+      "type": "Type",
+      "vol": "Vol"
+    },
+    "annualReport": "Annual report",
+    "quarterlyReport": "Quarterly report",
+    "filedOn": "Filed {{date}}",
+    "source": "Source",
+    "edgarLink": "EDGAR ↗",
+    "filingCount": "{{count}} filing",
+    "filingCount_other": "{{count}} filings",
+    "nDays": "{{count}} day",
+    "nDays_other": "{{count}} days",
+    "pressReleaseShort": "PR",
+    "nMoreResults": "+{{count}} more result",
+    "nMoreResults_other": "+{{count}} more results",
+    "nTotalItems": "{{count}} total",
+    "automationStatus": {
+      "active": "Active",
+      "paused": "Paused",
+      "failed": "Failed",
+      "completed": "Completed",
+      "disabled": "Disabled",
+      "created": "Created",
+      "executing": "Running"
+    },
+    "termRange": {
+      "day": "Day",
+      "week52": "52 wk"
+    },
+    "quote": "Quote",
+    "optionsChain": "Options Chain",
+    "options": "Options",
+    "optionType": {
+      "call": "Call",
+      "put": "Put"
+    },
+    "optionTypes": {
+      "call": "Calls",
+      "put": "Puts"
+    },
+    "expiresOn": "Exp {{date}}",
+    "expiration": "Expiry",
+    "contract": "Contract",
+    "change": "Change",
+    "nMoreContracts": "+{{count}} more contract",
+    "nMoreContracts_other": "+{{count}} more contracts",
+    "noOptionsData": "No options data available",
+    "topGainers": "Top Gainers",
+    "topLosers": "Top Losers",
+    "marketMovers": "Market Movers",
+    "noMoversData": "No movers data available",
+    "optionsOfType": {
+      "call": "Options · Calls",
+      "put": "Options · Puts"
     }
   },
   "setup": {
@@ -3186,8 +3833,8 @@
     "securityNote": "Your API keys are encrypted and never shared",
     "methodTitle": "How would you like to connect?",
     "methodSubtitle": "Choose how you'll access AI models. You can add more providers later.",
-    "methodOAuth": "Use your Claude / GPT subscription",
-    "methodOAuthDesc": "Connect via OAuth. No API key needed.",
+    "methodOAuth": "Use your Claude or ChatGPT subscription",
+    "methodOAuthDesc": "Sign in with your account. No API key needed.",
     "methodCodingPlan": "I have a coding plan",
     "methodCodingPlanDesc": "ZhipuAI, MiniMax, DashScope, Moonshot, etc.",
     "methodApiKey": "I have an API key",
@@ -3206,7 +3853,7 @@
     "doneTitle": "You're all set!",
     "doneSummary": "Your AI research assistant is configured and ready to go.",
     "goToDashboard": "Go to Dashboard",
-    "personalizeLink": "Set up investment profile",
+    "personalizeLink": "Set up investing profile",
     "invitationCodeLink": "Have an invitation code?",
     "invitationCodePlaceholder": "Enter your invitation code",
     "testButton": "Test",
@@ -3222,10 +3869,24 @@
     "stepProvider": "Provider",
     "stepModels": "Models",
     "stepReady": "Ready",
+    "progressLabel": "Setup progress",
     "exitSetup": "Exit setup",
     "providersConnected": "{{count}} providers connected",
     "providersConnected_one": "{{count}} provider connected",
     "nextStep": "Next step",
+    "skipToModels": "Skip to models",
+    "showKey": "Show API key",
+    "hideKey": "Hide API key",
+    "keyAccepted": "Key accepted",
+    "modelsFound_one": "{{count}} model found",
+    "modelsFound_other": "{{count}} models found",
+    "testUnavailable": "Test not available for this provider",
+    "testFailed": "Test request failed",
+    "modalityText": "Text",
+    "modalityImage": "Image",
+    "modalityPdf": "PDF",
+    "errorAuthFailed": "Authorization failed. Please try again.",
+    "errorFetchModels": "Could not fetch models from provider",
     "oauthBadge": "OAuth",
     "apiKeyBadge": "API key",
     "codingPlanBadge": "Coding plan",
@@ -3581,88 +4242,46 @@
     "next": "Continue",
     "done": "Start exploring",
     "step": "Step {{n}}",
-    "intros": {
-      "chat": {
-        "steps": {
-          "workspace": {
-            "title": "Meet workspaces"
-          }
-        }
-      },
-      "thread": {
-        "steps": {
-          "filePanel": {
-            "title": "Every artifact lands in the file panel",
-            "body": "Word docs, Excel models, PDFs, charts — whatever the agent produces is saved to the workspace. Open the folder icon up top to browse, preview, and download."
-          },
-          "memory": {
-            "title": "The agent remembers how you work",
-            "body": "The agent keeps long-term memory across threads: your preferences, conventions, and conclusions worth reusing. Say \"remember this\" and it persists."
-          },
-          "memo": {
-            "title": "Ground it with your memos",
-            "body": "Upload PDFs, notes, or spreadsheets as memos. The agent reads them on demand — your private research becomes part of its context."
-          }
-        }
-      },
-      "dashboard": {
-        "steps": {
-          "overview": {
-            "title": "Your market homepage",
-            "body": "Watchlist, portfolio, news, and live charts in one place — a real-time overview that's ready before you ask anything."
-          },
-          "customize": {
-            "title": "Make it yours",
-            "body": "Switch to Custom mode to add, remove, resize, and rearrange widgets. Build the exact monitor you want to wake up to."
-          },
-          "attach": {
-            "title": "Clip any widget into chat",
-            "body": "See something worth digging into? Hit the paperclip on a row to attach it to chat as context — the agent picks up exactly what you're looking at."
-          }
-        }
-      }
-    },
     "gettingStarted": {
       "title": "Get started",
       "dismiss": "Hide guide",
+      "progress": "{{done}} of {{total}} done",
       "tasks": {
         "dashboard": {
           "title": "Explore the dashboard",
-          "desc": "Watchlist, portfolio, news, and live widgets in one place."
+          "desc": "Watchlist, portfolio, and news on one live page."
         },
         "market": {
           "title": "Check live markets",
-          "desc": "Real-time charts with streaming market data."
+          "desc": "Streaming charts for any symbol."
         },
-        "stocks": {
-          "title": "Share your watchlist & portfolio",
-          "desc": "A short chat — tell the agent the tickers you watch and hold."
-        },
-        "preferences": {
-          "title": "Share your investing preferences",
-          "desc": "Set your risk tolerance, investing style, and how you want answers framed."
+        "profile": {
+          "title": "Set up your investing profile",
+          "desc": "Risk, markets, style, and how the agent works with you."
         },
         "createWorkspace": {
-          "title": "Create your first workspace"
+          "title": "Create a workspace"
         },
         "firstChat": {
           "title": "Run your first analysis",
-          "desc": "Open a chat and ask about any ticker, sector, or filing."
+          "desc": "Ask about any ticker, sector, or filing."
         },
         "models": {
-          "title": "Visit the model configuration",
-          "desc": "Choose default models and connect providers in Settings."
+          "title": "Choose your models",
+          "desc": "Pick default models and connect providers."
+        },
+        "desktopApp": {
+          "title": "Get the desktop app",
+          "desc": "LangAlpha in a window of its own, and on a Mac, your Mac as a computer."
+        },
+        "remoteControl": {
+          "title": "Turn on remote control",
+          "desc": "Let the agent work on this Mac, even with LangAlpha closed."
         },
         "integrations": {
-          "title": "Use {{brand}} on other platforms",
-          "desc": "Reach the agent from Slack, email, and more via platform integrations."
+          "title": "Connect a chat app",
+          "desc": "Talk to {{brand}} from Slack, Telegram, iMessage, and more."
         }
-      },
-      "interview": {
-        "title": "A quick chat to personalize your experience",
-        "body": "We'll open a chat where the agent asks a few questions about your portfolio, watchlist, risk tolerance, and investment preferences — so its answers fit you. You can change any of it later in Settings, or simply ask the agent to update it.",
-        "cancel": "Not now",
-        "confirm": "Start the chat"
       }
     },
     "announce": {
@@ -3684,20 +4303,283 @@
       "reset": "Reset onboarding",
       "resetDone": "Onboarding reset — tips and the guide start fresh."
     },
-    "connect": {
-      "title": "Connect your brokerage",
-      "description": "Your Chief of Staff loads your holdings and watchlists from it, then asks a few questions about the markets you follow.",
-      "continue": "Continue",
-      "turnOn": "Turn on",
-      "skip": "Continue without a brokerage",
-      "footnote": "You choose what it can do with your account on the next screen.",
-      "waiting": "Loading {{brokerage}}…",
-      "failed": "Couldn't connect {{brokerage}}. Try again, or continue without it."
-    },
     "kickoff": {
-      "connected": "I connected {{brokerage}}. Let's set up my profile.",
+      "threadTitle": "Getting started",
       "noBrokerage": "Let's set up my profile.",
       "modifyPreferences": "I'd like to review and update my preferences."
+    },
+    "welcome": {
+      "progressLabel": "Progress",
+      "skip": "Skip",
+      "cancel": "Cancel",
+      "continue": "Continue",
+      "save": "Save",
+      "optional": "Optional",
+      "saveFailed": "Couldn't save your investing profile. Try again.",
+      "loadFailed": "Couldn't load your investing profile.",
+      "entry": "Set up investing profile",
+      "edit": "Edit investing profile",
+      "chat": {
+        "greeting": "Hi {{name}}.",
+        "greetingNoName": "Hi there.",
+        "intro": "I'm your LangAlpha Chief of Staff. I help you coordinate your AI analysts and manage your workspaces.",
+        "introNext": "First, a few questions about your portfolio and how you invest.",
+        "editIntro": "Here's your investing profile. Change any answer, then save.",
+        "lead": {
+          "brokerage": "Connect a brokerage account so I can work from your actual holdings, or continue without one for now.",
+          "elsewhere": "Which brokerages do you use? Then choose how you'd like to add your holdings.",
+          "experience": "Which best describes you? It helps me explain things at the right level.",
+          "risk": "How much risk are you comfortable with? It guides how I balance potential gains against losses.",
+          "markets": "Which markets do you invest in? I'll focus my research there.",
+          "style": "What do you base your decisions on? I'll lead with that kind of analysis.",
+          "agent": "Last, how should I answer your questions by default? Quickly, with research when a question needs it, or with full research every time?"
+        },
+        "composer": {
+          "waiting": "You can message me once we're set up",
+          "start": "Add a question or context to start with (optional)"
+        },
+        "edit": "Change answer",
+        "summary": {
+          "connected": "Connected {{brokerage}}",
+          "screenshots_one": "{{count}} screenshot",
+          "screenshots_other": "{{count}} screenshots",
+          "search": "I'll add them by search",
+          "skipped": "Skipped"
+        }
+      },
+      "banner": {
+        "title": "Set up your investing profile",
+        "desc": "Answer a few questions so the agent's research fits how you invest.",
+        "start": "Set up",
+        "resume": "Resume"
+      },
+      "brokerage": {
+        "none": "No brokerage can be connected here yet.",
+        "failed": "Couldn't connect {{brokerage}}. Try again, or continue without connecting.",
+        "desktopOnly": "{{brokerages}} can only be connected from the desktop app. <download>Download the desktop app</download>",
+        "desktopOutdated": "Update the desktop app to connect a brokerage. <download>Download the latest version</download>",
+        "permissionHelper": "How the agent handles orders at your connected brokerages. You can change this later in Settings.",
+        "elsewhereTitle": "Don't see your brokerage?",
+        "elsewhereBody": "You can still add your holdings from screenshots or by search.",
+        "elsewhereAction": "Continue without connecting"
+      },
+      "elsewhere": {
+        "brokerages": {
+          "fidelity": "Fidelity",
+          "schwab": "Charles Schwab",
+          "vanguard": "Vanguard",
+          "etrade": "E*TRADE",
+          "robinhood": "Robinhood",
+          "ibkr": "Interactive Brokers",
+          "webull": "Webull",
+          "moomoo": "moomoo",
+          "futu": "Futu",
+          "tiger": "Tiger Brokers",
+          "longbridge": "Longbridge",
+          "tastytrade": "tastytrade",
+          "other": "Other",
+          "none": "No account yet"
+        },
+        "otherLabel": "Your brokerage's name",
+        "otherPlaceholder": "Brokerage name",
+        "connectable": "You can connect {{brokerages}} so the agent can read your holdings directly. <connect>Connect instead</connect>",
+        "holdingsTitle": "Add your holdings",
+        "methods": {
+          "screenshot": {
+            "title": "Upload screenshots",
+            "desc": "Capture your positions and watchlist in your brokerage app. The agent checks with you before adding anything."
+          },
+          "search": {
+            "title": "Search and add",
+            "desc": "Find each holding by name or ticker."
+          }
+        }
+      },
+      "experience": {
+        "types": {
+          "individual": {
+            "title": "Individual investor",
+            "desc": "Investing or trading my own money."
+          },
+          "professional": {
+            "title": "Finance professional",
+            "desc": "Analyst, trader, portfolio manager or advisor."
+          },
+          "student": {
+            "title": "Student",
+            "desc": "Learning how markets work."
+          }
+        },
+        "yearsTitle": "How long have you been investing or trading?",
+        "years": {
+          "under_1y": "Under 1 year",
+          "1_3y": "1–3 years",
+          "3_10y": "3–10 years",
+          "over_10y": "Over 10 years"
+        },
+        "instrumentsTitle": "Which types of investments are you interested in?"
+      },
+      "risk": {
+        "levels": {
+          "conservative": {
+            "title": "Conservative",
+            "desc": "Protect capital first and aim for modest returns."
+          },
+          "moderate": {
+            "title": "Moderate",
+            "desc": "Accept some ups and downs in pursuit of long-term growth."
+          },
+          "growth": {
+            "title": "Growth",
+            "desc": "Accept larger swings in pursuit of higher returns."
+          },
+          "aggressive": {
+            "title": "Aggressive",
+            "desc": "Take concentrated positions and accept deep drawdowns."
+          }
+        },
+        "horizonTitle": "How long do you usually hold a position?",
+        "horizons": {
+          "intraday": "Intraday",
+          "days": "Days to weeks",
+          "months": "Months",
+          "years": "Years"
+        }
+      },
+      "instruments": {
+        "stock": "Stocks",
+        "etf": "ETFs",
+        "index": "Indices",
+        "option": "Options",
+        "future": "Futures",
+        "bond": "Bonds",
+        "fund": "Mutual funds",
+        "forex": "Forex",
+        "crypto": "Crypto",
+        "commodity": "Commodities"
+      },
+      "markets": {
+        "names": {
+          "us": "United States",
+          "hk": "Hong Kong",
+          "cn": "China A-shares",
+          "jp": "Japan",
+          "eu": "Europe"
+        },
+        "helpTitle": "What would you like help with?",
+        "help": {
+          "ideas": "Finding investment ideas",
+          "research": "Researching companies",
+          "portfolio": "Tracking my portfolio",
+          "news": "Keeping up with markets",
+          "trading": "Planning trades",
+          "learning": "Learning the basics"
+        }
+      },
+      "style": {
+        "approaches": {
+          "fundamental": "Fundamental analysis",
+          "macro": "Macro trends",
+          "quantitative": "Systematic and quant signals",
+          "technical": "Technical analysis",
+          "event_driven": "Earnings and events"
+        },
+        "stylesTitle": "Which investing styles fit you?",
+        "styles": {
+          "growth": "Growth",
+          "value": "Value",
+          "income": "Dividends and income",
+          "trading": "Active trading",
+          "index": "Passive and index"
+        },
+        "sectorsTitle": "Which sectors do you follow?",
+        "sectors": {
+          "technology": "Technology",
+          "semiconductors": "Semiconductors",
+          "healthcare": "Healthcare",
+          "financials": "Financials",
+          "energy": "Energy",
+          "consumer": "Consumer",
+          "industrials": "Industrials",
+          "real_estate": "Real estate",
+          "utilities": "Utilities",
+          "materials": "Materials"
+        }
+      },
+      "agent": {
+        "depth": {
+          "light": {
+            "title": "Quick answers",
+            "desc": "A short answer from a quick check. Deeper research only when you ask."
+          },
+          "adaptive": {
+            "title": "Depends on the question",
+            "desc": "Quick for simple questions, full research when a question needs it."
+          },
+          "thorough": {
+            "title": "Full research",
+            "desc": "Data and evidence checked before every answer. Takes longer and uses more credits."
+          }
+        },
+        "deliverableTitle": "What should an answer usually look like?",
+        "deliverable": {
+          "text": {
+            "title": "Text in the chat",
+            "desc": "A written answer, with tables where they help."
+          },
+          "visual": {
+            "title": "Charts and dashboards",
+            "desc": "Interactive charts and dashboards in the chat, to explore."
+          },
+          "report": {
+            "title": "Full reports",
+            "desc": "A styled HTML report to share or save as a PDF. Takes longer to prepare and uses more credits."
+          }
+        },
+        "proactivityTitle": "When should I reach out to you?",
+        "proactivity": {
+          "proactive": {
+            "title": "Regularly",
+            "desc": "Briefings, ideas and updates on what you hold, without waiting to be asked."
+          },
+          "when_needed": {
+            "title": "When it matters",
+            "desc": "Only when something needs your attention, like a big move in a holding."
+          },
+          "on_request": {
+            "title": "Only when asked",
+            "desc": "No briefings or alerts unless you ask for them."
+          }
+        }
+      },
+      "start": {
+        "submit": "Start",
+        "waiting": "Loading {{brokerage}}…",
+        "failed": "Couldn't open the chat. Try again."
+      },
+      "holdings": {
+        "ticker": "Ticker",
+        "quantity": "Quantity",
+        "remove": "Remove {{symbol}}",
+        "failed": "Couldn't add {{symbol}}.",
+        "search": "Search by name or ticker",
+        "noResults": "No matches for “{{query}}”",
+        "toHoldings": "Add to holdings",
+        "toWatchlist": "Add to watchlist",
+        "holdingsTitle": "Holdings",
+        "watchlistTitle": "Watchlist",
+        "watchlistRemove": "Remove {{symbol}} from the watchlist",
+        "watchlistFailed": "Couldn't add {{symbol}} to the watchlist."
+      },
+      "shots": {
+        "prompt": "Add screenshots of your positions or watchlist",
+        "hint": "Drop, paste or choose up to {{max}} images",
+        "add": "Add a screenshot",
+        "remove": "Remove {{name}}",
+        "tooMany": "Up to {{max}} screenshots; the rest were left out.",
+        "notImage": "{{name}} isn't a PNG, JPEG, WebP or GIF image.",
+        "unreadable": "{{name}} couldn't be read."
+      }
     }
   },
   "mcp": {
@@ -4179,6 +5061,7 @@
       "open": "Open at the broker",
       "filled": "Filled",
       "cancelled": "Cancelled",
+      "handedOff": "Handed off",
       "rejected": "Rejected",
       "failed": "Failed"
     }
@@ -4298,7 +5181,7 @@
         "neverAvailable": "Never available",
         "neverAvailableNote": "Held back deliberately. Refused whatever you grant."
       },
-      "exclusiveNote": "Disconnects any other AI app linked to your {{broker}} account",
+      "exclusiveNote": "Disconnects other AI apps linked to this account",
       "exclusiveWarning": "This account allows one connected AI platform, so connecting here replaces whichever one is connected now.",
       "grantedNone": "Granted nothing",
       "intro": "Nothing reaches a broker until you connect it, and each connection asks first what the agent may do there.",
@@ -5461,8 +6344,7 @@
     "common": "Common"
   },
   "agents": {
-    "allWorkspaces": "All workspaces",
-    "allWorkspacesHint": "Your Chief of Staff answers here and hands deep work to each workspace's Analyst.",
+    "chiefOfStaffHint": "Coordinates the Analysts in every workspace and hands each task to the right one.",
     "home": "Home",
     "chiefOfStaff": "Chief of Staff",
     "analyst": "Analyst",
@@ -5478,10 +6360,10 @@
       "analystsHeading": "Handed off from this thread"
     },
     "inWorkspace": "In {{workspace}}",
-    "workspaceRequired": "Choose a workspace, or All workspaces.",
+    "workspaceRequired": "Choose your Chief of Staff or a workspace.",
     "widgets": {
-      "allWorkspacesDesc": "Ask anything. Your Chief of Staff handles it or hands it off.",
-      "tagAllWorkspaces": "all"
+      "chiefOfStaffDesc": "Coordinates the Analysts in every workspace. Ask here and it hands each task to the right one, then reports back.",
+      "tagChiefOfStaff": "home"
     },
     "models": {
       "defaultModel": "Default model",
@@ -5499,38 +6381,17 @@
       "defaultPlaceholder": "Select default model..."
     },
     "market": {
-      "missingThreadHint": "Don't see a thread? Threads belong to a workspace. Try All workspaces, or pick a different workspace.",
+      "missingThreadHint": "Don't see a thread? Threads belong to your Chief of Staff or to a workspace. Try your Chief of Staff, or pick a different workspace.",
       "workspaceDisabledReason": "Create a workspace in /chat to work in one",
-      "noWorkspaceToast": "Create a workspace first, or use All workspaces.",
+      "noWorkspaceToast": "Create a workspace first, or ask your Chief of Staff.",
       "setupFailed": "Couldn't open the workspace. Please try again."
     },
     "tour": {
-      "modes": {
-        "title": "Two ways to work",
-        "body": "Pick a workspace and its Analyst does the work there, with that workspace's files. Pick All workspaces and your Chief of Staff takes it: it answers quick questions itself and hands deep work to the right Analyst. The next steps show each one."
-      },
-      "chiefOfStaff": {
-        "title": "All workspaces: your Chief of Staff",
-        "body": "Just say what you need. Your Chief of Staff answers quick questions, creates and manages workspaces, hands deep work to each workspace's Analyst and reports back, and manages your automations. Its conversations are collected in the All workspaces card, and its own files live in a folder called Home."
-      },
-      "analyst": {
-        "title": "A workspace: its Analyst does the work",
-        "body": "Each workspace has its own Analyst. Every thread in the workspace shares the same files, data and prior work, so research compounds. It processes large datasets, coordinates teams of subagents, and produces any deliverable: Excel models, Word docs, PDFs, dashboards."
-      },
-      "workspace": {
-        "body": "Every workspace is a project desk: the conversations about one task live there together, sharing the same files, data and results, separate from other workspaces. All your workspaces and Home live on one computer, which starts as soon as you start typing."
-      },
-      "create": {
-        "title": "Give real tasks their own workspace",
-        "body": "If it involves data work or ends in a deliverable, give it a workspace: hit \"New workspace\" and name it after the task, or ask your Chief of Staff to set one up."
-      },
-      "createWorkspaceTask": "Spin up a dedicated workspace; its Analyst gets a full sandbox for real research."
+      "createWorkspaceTask": "A desk for one project, with its own Analyst and files."
     },
     "intro": {
-      "chiefOfStaffRun": "chief of staff",
       "handoff": "handed to an analyst",
-      "taskHandoff": "task handed to an analyst",
-      "footer": "two ways to work"
+      "taskHandoff": "task handed to an analyst"
     }
   },
   "dalton": {
@@ -5623,6 +6484,7 @@
     "publish": {
       "cardTitle": "Official Research Publication Approval (PM Final Review)",
       "labelingIncompleteWarning": "Figure labeling incomplete; colloquial figures and metric labels may not be fully verified",
+      "derivedMatchingIncompleteWarning": "Derived-figure matching was skipped after a timeout: some figures it could have verified still show as unverified",
       "failedBatchDetailItem": "Batch {{batch}} (figures {{start}}–{{end}}) labeling failed",
       "failedBatchColloquialItem": "Batch {{batch}} (colloquial figure scan) labeling failed",
       "labelingCoverageLabel": "Labeling Coverage",
@@ -5673,7 +6535,25 @@
       "levelHidden": "Hidden",
       "homeNote": "Home workspace is never open to others",
       "externalOwnerNote": "External members' workspaces are visible to admins only; sharing settings do not apply",
-      "nextPhaseNotice": "Available in the next phase"
+      "nextPhaseNotice": "Available in the next phase",
+      "cosUserToggleTitle": "Others' Chief of Staff",
+      "cosUserToggleLabel": "Allow internal colleagues' Chief of Staff to access my workspaces and dispatch tasks",
+      "cosUserToggleScopeHint": "Applies to all workspaces except Home (enabled by default for internal members; external members cannot access others' workspaces, and others cannot dispatch tasks to or ask questions in external members' workspaces).",
+      "cosUserToggleTrustNotice": "Enabling this means trusting internal colleagues to run tasks on your computer:\n• Full-machine read/write: Tasks can read and write all workspaces and Home, personal memory, profile, and automations on your computer.\n• Connections & external effects: Tasks use your data connections, MCP servers, and secrets; data is sent to the colleague's chosen model service or external endpoints, and linked external accounts may be written to or incur charges.\n• Resources & quotas: Tasks consume your machine resources and third-party API quotas (LLM token costs are billed to the dispatcher's daily budget).\n• Thread visibility & retention: You (and members with workspace access) can view dispatched threads read-only; if you delete the workspace, the dispatcher can still view their thread history read-only.\n• Revocation limits: Turning this off immediately blocks new dispatches while running tasks finish; revocation cannot recall data already read or undo effects already made.",
+      "cosManagedInSettingsHint": "Access for others' Chief of Staff is managed globally in Settings.",
+      "webDescRw": "Internal colleagues can browse this workspace and start new threads on the web",
+      "webRwWarningTitle": "Colleagues asking questions here will run on your computer, which equals trusting this computer",
+      "webRwWarningBody": "With web Read & Write enabled, threads started here by internal colleagues run on your computer:\n• Machine & knowledge base read/write: Threads can read and write all workspaces and Home, personal memory, and automations on this machine, and write to this workspace's knowledge base (verdicts, agenda, files).\n• Connections & external effects: Threads use your data connections and secrets; data is sent to the questioner's chosen model service, and linked external accounts may be written to or incur charges.\n• Resources & quotas: Threads consume your machine resources and third-party API quotas (LLM costs are billed to the questioner's daily budget).\n• Thread visibility & retention: You and members with workspace access can view these threads read-only; if you delete the workspace, the questioner can still view their thread history read-only.\n• Revocation limits: Reverting to Read-only or Hidden immediately blocks new questions while running tasks finish; revocation cannot recall data already read or undo effects already made.",
+      "dispatchedByBadge": "Dispatched by {{name}}",
+      "dispatchedThreadReadonlyHint": "Dispatched by {{name}} · Only the creator can send follow-up messages",
+      "revokedThreadReadonlyHint": "The workspace owner has revoked write access · Historical conversation is read-only"
+    },
+    "autoIngest": {
+      "on": "Auto-ingest: on",
+      "off": "Auto-ingest: off",
+      "enabledHint": "With it on, material this workspace receives is routed into sales notes or the company wiki by who is speaking, answered with a one-line receipt; suspected duplicates or an undecided classification still ask.",
+      "disabledHint": "With it off, ingests keep the two-step flow: preview first, write after the user confirms.",
+      "error": "Failed to toggle, try again"
     }
   }
 }

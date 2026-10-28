@@ -79,7 +79,7 @@ def compile_subagents(
         thread_id=thread_id,
         config=config,
         skill_registry=skill_registry,
-        skill_dirs=[d for d, _ in config.skills.local_skill_dirs_with_sandbox()],
+        skill_dirs=config.skills.local_skill_dirs(),
         project=project,
         search_tool=search_tool,
         sandbox_tools=sandbox_tools,

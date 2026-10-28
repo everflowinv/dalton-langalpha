@@ -38,7 +38,7 @@ class TestUnboundHomeHandling:
         read = AsyncMock(return_value=_make_workspace(status="unbound"))
         with (
             patch("src.server.app.workspace_files.crud.db_get_workspace", read),
-            patch("src.server.app.workspace_files._shared.db_get_workspace", read),
+            patch("src.server.services.workspace_files.db_get_workspace", read),
         ):
             async with AsyncClient(
                 transport=ASGITransport(app=app), base_url="http://test"
@@ -98,7 +98,7 @@ class TestStoppedWorkspaceWriteRejection:
         read = AsyncMock(return_value=_make_workspace(status="stopped"))
         with (
             patch("src.server.app.workspace_files.crud.db_get_workspace", read),
-            patch("src.server.app.workspace_files._shared.db_get_workspace", read),
+            patch("src.server.services.workspace_files.db_get_workspace", read),
         ):
             async with AsyncClient(
                 transport=ASGITransport(app=app), base_url="http://test"
@@ -146,7 +146,7 @@ class TestWorkspaceNotFound:
         read = AsyncMock(return_value=None)
         with (
             patch("src.server.app.workspace_files.crud.db_get_workspace", read),
-            patch("src.server.app.workspace_files._shared.db_get_workspace", read),
+            patch("src.server.services.workspace_files.db_get_workspace", read),
         ):
             async with AsyncClient(
                 transport=ASGITransport(app=app), base_url="http://test"
@@ -180,7 +180,7 @@ class TestOwnershipEnforcement:
         read = AsyncMock(return_value=_make_workspace(user_id="other-user-999"))
         with (
             patch("src.server.app.workspace_files.crud.db_get_workspace", read),
-            patch("src.server.app.workspace_files._shared.db_get_workspace", read),
+            patch("src.server.services.workspace_files.db_get_workspace", read),
         ):
             async with AsyncClient(
                 transport=ASGITransport(app=app), base_url="http://test"

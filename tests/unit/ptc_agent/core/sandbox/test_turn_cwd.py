@@ -1,11 +1,12 @@
 """Where a turn's processes start.
 
 One computer holds several workspace folders, so the working directory is a
-property of the turn, not of the machine. Python gets there through the
-``PTC_TURN_CWD`` entry of the execution env, which the shipped
-``sitecustomize.py`` reads at interpreter startup; ``execute_bash_command``
-defaults its ``cd`` to the same place. With no project bound both fall back to
-the computer root, which is what an unsplit machine has always done.
+property of the turn, not of the machine. A code run gets there through the
+``PTC_TURN_CWD`` entry of the environment its job starts with, which the
+shipped ``sitecustomize.py`` reads at interpreter startup;
+``execute_bash_command`` defaults its ``cd`` to the same place. With no
+project bound both fall back to the computer root, which is what an unsplit
+machine has always done.
 
 The provider surface carries no directory at all: nothing prepends a prelude to
 the submitted source, because a first line that is not the caller's costs a
@@ -18,6 +19,8 @@ mount reads to name the call a save through it belongs to.
 from __future__ import annotations
 
 import ast
+import base64
+import re
 import shlex
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -45,7 +48,6 @@ from ptc_agent.core.sandbox._shared import (
     _internal_package_files,
 )
 from ptc_agent.core.sandbox.runtime import (
-    CodeRunResult,
     ExecResult,
     SandboxProvider,
     SandboxRuntime,
@@ -74,7 +76,6 @@ def runtime():
     fake.working_dir = WORK_DIR
     fake.fetch_working_dir = AsyncMock(return_value=WORK_DIR)
     fake.exec = AsyncMock(return_value=ExecResult("", "", 0))
-    fake.code_run = AsyncMock(return_value=CodeRunResult("out", "", 0, []))
     fake.upload_file = AsyncMock()
     return fake
 
@@ -112,23 +113,45 @@ def project():
     project_context._current.reset(token)
 
 
+def _launch(runtime) -> str:
+    (script, *_) = [
+        c.args[0] for c in runtime.exec.await_args_list if "MCP_TRACE_FILE=" in c.args[0]
+    ]
+    return script
+
+
+def _launch_env(runtime) -> dict[str, str]:
+    """What a job's wrapper starts with: the launch's export, before its exec."""
+    words = re.search(r"\( export ([^;]*); exec ", _launch(runtime)).group(1)
+    return dict(word.split("=", 1) for word in shlex.split(words))
+
+
+def _saved_files(runtime) -> dict[str, bytes]:
+    """The files a launch writes ahead of its job, by path."""
+    return {
+        path: base64.b64decode(payload)
+        for payload, path in re.findall(
+            r"printf %s (\S+) \| base64 -d > (\S+)\.tmp\$\$", _launch(runtime)
+        )
+        for payload, path in [(shlex.split(payload)[0], shlex.split(path)[0])]
+    }
+
+
 class TestExecuteCode:
     @pytest.mark.asyncio
     async def test_the_interpreter_starts_in_the_workspace(
         self, sandbox, runtime, project
     ):
-        await sandbox.execute("print(1)", auto_install=False)
-        call = runtime.code_run.await_args
-        assert call.kwargs["env"][TURN_CWD_ENV] == WORKSPACE
-        # The directory travels in the env and nowhere else: no provider
-        # argument, and the submitted source reaches code_run untouched.
-        assert "cwd" not in call.kwargs
-        assert call.args[0] == "print(1)"
+        await sandbox.start_code_job("print(1)", wait_s=0)
+        assert _launch_env(runtime)[TURN_CWD_ENV] == WORKSPACE
+        # The directory travels in the env, and the saved source is the
+        # caller's own: a prepended chdir would cost a line number.
+        assert list(_saved_files(runtime).values()) == [b"print(1)"]
 
     @pytest.mark.asyncio
     async def test_without_a_project_it_starts_at_the_root(self, sandbox, runtime):
-        await sandbox.execute("print(1)", auto_install=False)
-        assert runtime.code_run.await_args.kwargs["env"][TURN_CWD_ENV] == WORK_DIR
+        await sandbox.start_code_job("print(1)", wait_s=0)
+        assert _launch_env(runtime)[TURN_CWD_ENV] == WORK_DIR
 
 
 class TestBash:
@@ -159,42 +182,20 @@ class TestTheCallId:
     shell's start, not in an export inside it."""
 
     @staticmethod
-    def _sent(runtime, background: bool) -> list[str]:
-        if background:
-            return [c.args[1] for c in runtime.session_execute.await_args_list]
+    def _sent(runtime) -> list[str]:
         return [c.args[0] for c in runtime.exec.await_args_list]
 
-    @pytest.mark.parametrize("background", [False, True], ids=["foreground", "background"])
+    @pytest.mark.parametrize("call_id", [None, "c0ffee00c0ffee00"], ids=["untagged", "tagged"])
     @pytest.mark.asyncio
-    async def test_a_command_with_no_call_id_runs_untagged(
-        self, sandbox, runtime, background
-    ):
-        await sandbox.execute_bash_command("pwd", background=background)
+    async def test_a_job_starts_tagged_with_its_call(self, sandbox, runtime, call_id):
+        """A job outlives its call, so the tag rides the wrapper's starting
+        environment, which every process the command starts inherits."""
+        await sandbox.start_bash_job("pwd", wait_s=0, call_id=call_id)
 
-        sent = self._sent(runtime, background)
-        assert not any(c.startswith("env ") for c in sent), sent
-        if background:
-            # Still a child shell, so the command's own `exit` cannot end the
-            # session's shell.
-            sent = [shlex.split(c)[2] for c in sent if c.startswith("bash -c ")]
-        assert any(c.endswith(f"cd {WORK_DIR} && pwd") for c in sent), sent
-
-    @pytest.mark.parametrize("background", [False, True], ids=["foreground", "background"])
-    @pytest.mark.asyncio
-    async def test_a_call_id_starts_the_whole_command_in_a_tagged_shell(
-        self, sandbox, runtime, background
-    ):
-        command = "echo \"it's\" > 'my notes.md'"
-
-        await sandbox.execute_bash_command(
-            command, call_id="c0ffee00c0ffee00", background=background
-        )
-
-        sent = self._sent(runtime, background)
-        (tagged,) = [shlex.split(c) for c in sent if c.startswith("env ")]
-        assert tagged[:4] == ["env", f"{CALL_ENV}=c0ffee00c0ffee00", "bash", "-c"]
-        assert tagged[4].endswith(f"cd {WORK_DIR} && {command}")
-        assert len(tagged) == 5
+        (launch, *_) = [c for c in self._sent(runtime) if "MCP_TRACE_FILE=" in c]
+        words = re.search(r"\( export ([^;]*); exec ", launch).group(1)
+        env = dict(word.split("=", 1) for word in shlex.split(words))
+        assert env.get(CALL_ENV) == call_id
 
 
 class TestTheShippedModule:
@@ -215,9 +216,10 @@ class TestTheShippedModule:
         assert TURN_CWD_ENV in landed
         assert "chdir" in landed
 
-        await sandbox.execute("print(1)", auto_install=False)
-        env = runtime.code_run.await_args.kwargs["env"]
-        assert sandbox.layout.internal_src in env["PYTHONPATH"].split(":")
+        await sandbox.start_code_job("print(1)", wait_s=0)
+        # Prepended to the computer's own, which the shell appends.
+        ours = _launch_env(runtime)["PYTHONPATH"].split("${")[0]
+        assert sandbox.layout.internal_src in ours.split(":")
 
     def test_the_turn_cwd_stops_at_a_nested_mcp_client(self):
         """A supervisor outlives the turn that started it and serves every
@@ -240,30 +242,18 @@ class TestTheShippedModule:
 
 
 class TestProviderSurface:
-    """Neither provider takes a directory; both hand the env to the interpreter."""
+    """Neither provider's exec takes a directory; both run at the computer root."""
 
     @pytest.mark.asyncio
-    async def test_daytona_code_run_sends_the_env_and_the_source_unchanged(self):
+    async def test_daytona_exec_gets_no_cwd(self):
         from ptc_agent.core.sandbox.providers.daytona_runtime import DaytonaRuntime
 
         inner = AsyncMock()
         inner.process.exec = AsyncMock(
             return_value=type("R", (), {"result": "", "exit_code": 0})()
         )
-        inner.process.code_run = AsyncMock(
-            return_value=type("R", (), {"result": "", "exit_code": 0})()
-        )
         runtime = DaytonaRuntime.__new__(DaytonaRuntime)
         runtime._sandbox = inner
-
-        code = "from __future__ import annotations\nprint(1)"
-        await runtime.code_run(code, env={TURN_CWD_ENV: WORKSPACE})
-        # code_run's request carries code, argv and env and no directory, so
-        # the env entry is the whole mechanism, and the first line stays the
-        # caller's: a prepended chdir would make this source a SyntaxError.
-        assert inner.process.code_run.await_args.args[0] == code
-        params = inner.process.code_run.await_args.kwargs["params"]
-        assert params.env[TURN_CWD_ENV] == WORKSPACE
 
         # exec runs from the sandbox's own working directory; a turn that wants
         # another one says so in the command (see TestBash).
@@ -272,7 +262,7 @@ class TestProviderSurface:
         assert "cwd" not in inner.process.exec.await_args.kwargs
 
     @pytest.mark.asyncio
-    async def test_docker_code_run_exports_the_turn_cwd(self):
+    async def test_docker_exec_runs_at_the_computer_root(self):
         from ptc_agent.core.sandbox.providers.docker import DockerRuntime
 
         stream = AsyncMock()
@@ -291,16 +281,6 @@ class TestProviderSurface:
         runtime._container = container
         runtime._working_dir = WORK_DIR
 
-        await runtime.code_run("print(1)", env={TURN_CWD_ENV: WORKSPACE})
-        commands = [c.kwargs["cmd"][-1] for c in container.exec.await_args_list]
-        # The interpreter process is started with the var in its environment,
-        # which is what sitecustomize.py reads. Split rather than matched so
-        # the assertion is about the value, not the quoting.
-        run_cmd = next(c for c in commands if "python3 " in c and "base64" not in c)
-        tokens = shlex.split(run_cmd)
-        assert tokens[0] == "export"
-        assert f"{TURN_CWD_ENV}={WORKSPACE}" in tokens
-
         # Every exec runs at the container's own working directory, the
         # computer root.
         await runtime.exec("true")
@@ -314,14 +294,14 @@ class TestTheRuntimesOwnFiles:
     async def test_the_saved_code_file_stays_at_the_computer_root(
         self, sandbox, runtime, project
     ):
-        await sandbox.execute("print(1)", auto_install=False)
-        dest = runtime.upload_file.await_args.args[1]
-        assert dest.startswith(f"{WORK_DIR}/.system/code/"), dest
+        await sandbox.start_code_job("print(1)", wait_s=0)
+        (dest,) = _saved_files(runtime)
+        assert dest.startswith(f"{WORK_DIR}/.system/code/bg-"), dest
 
     @pytest.mark.asyncio
     async def test_the_saved_bash_script_stays_at_the_computer_root(
         self, sandbox, runtime, project
     ):
-        await sandbox.execute_bash_command("pwd")
-        dest = runtime.upload_file.await_args.args[1]
-        assert dest.startswith(f"{WORK_DIR}/.system/code/"), dest
+        await sandbox.start_bash_job("pwd", wait_s=0)
+        (dest,) = _saved_files(runtime)
+        assert dest.startswith(f"{WORK_DIR}/.system/code/bg-") and dest.endswith(".sh"), dest

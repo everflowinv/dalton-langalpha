@@ -9,7 +9,10 @@ out of the root entirely, and one pointing at the root's reserved ``_internal``.
 
 from __future__ import annotations
 
+import base64
+import math
 import os
+import re
 import subprocess
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -26,21 +29,28 @@ from src.server.app.share_files import (
     read_shared_file,
     serve_shared_file,
 )
-from src.server.app.workspace_files._containment import (
+from src.server.services.workspace_file_containment import (
     PROBE_ESCAPED,
+    ContainedSlice,
+    FileChangedWhileRead,
+    _exec_read_max,
     contained_relative_path,
     contained_sandbox_path,
     contained_sandbox_paths,
     is_within,
     probe_command,
+    read_contained_sandbox_range,
     resolve_in_sandbox,
     serving_roots,
 )
 from src.server.app.workspace_files.crud import (
+    RANGE_MAX_BYTES,
     download_workspace_file,
     read_workspace_file,
 )
+from src.server.utils.http_headers import content_disposition
 from src.server.app.workspace_files.serve import serve_workspace_file
+from ptc_agent.core.sandbox.providers.ssh_runtime import SSHRuntime
 from ptc_agent.core.sandbox.runtime import SandboxTransientError
 
 WS_ID = "ws-containment-1"
@@ -65,12 +75,13 @@ _SHARE_VAULT = "src.server.app.share_files.get_vault_secrets_for_redaction"
 _SHARE_WSMGR = "src.server.app.workspace_files.serve.WorkspaceManager"
 _CRUD_DBWS = "src.server.app.workspace_files.crud.db_get_workspace"
 _CRUD_OWNER = "src.server.app.workspace_files.crud.require_workspace_owner"
-_CRUD_ACQUIRE_TO_CHANGE = "src.server.app.workspace_files.crud._acquire_sandbox_to_change"
+_CRUD_ACQUIRE_TO_CHANGE = "src.server.app.workspace_files.crud.acquire_sandbox_to_change"
 _CRUD_WD = "src.server.app.workspace_files.crud.owner_work_dir"
 # The row a URL-only route re-reads after a live read, to prove the folder the
-# read went to was still this workspace's, and the one an owner route's guard
-# reads.
+# read went to was still this workspace's.
 _RECHECK = "src.server.app.workspace_files._shared.db_get_workspace"
+# The row an owner route's guard reads.
+_OWNED_DBWS = "src.server.services.workspace_files.db_get_workspace"
 
 
 class _ShellRuntime:
@@ -827,7 +838,7 @@ async def test_shared_download_denies_a_traversal_path(tree) -> None:
 async def test_workspace_download_denies_a_symlink_out_of_the_root(tree) -> None:
     with (
         patch(_CRUD_DBWS, AsyncMock(return_value=_workspace())),
-        patch(_RECHECK, AsyncMock(return_value=_workspace())),
+        patch(_OWNED_DBWS, AsyncMock(return_value=_workspace())),
         patch(_CRUD_OWNER, MagicMock()),
         patch(_CRUD_WD, return_value=tree.root),
         patch(_CRUD_ACQUIRE_TO_CHANGE, _acquired(tree.sandbox, _workspace())),
@@ -854,7 +865,7 @@ def _acquired(sandbox, workspace, events=None):
 
     return acquire
 
-_EXEC_CAP = "src.server.app.workspace_files._containment.EXEC_READ_MAX_BYTES"
+_EXEC_CAP = "src.server.services.workspace_file_containment.EXEC_READ_MAX_BYTES"
 _CRUD_STORAGE = "src.server.app.workspace_files.crud.is_storage_enabled"
 
 
@@ -870,7 +881,7 @@ async def test_workspace_download_past_the_exec_limit_uses_the_provider(
     request.headers = {}
     with (
         patch(_CRUD_DBWS, AsyncMock(return_value=_workspace())),
-        patch(_RECHECK, AsyncMock(return_value=_workspace())),
+        patch(_OWNED_DBWS, AsyncMock(return_value=_workspace())),
         patch(_CRUD_OWNER, MagicMock()),
         patch(_CRUD_WD, return_value=tree.root),
         patch(_CRUD_ACQUIRE_TO_CHANGE, _acquired(tree.sandbox, _workspace())),
@@ -885,6 +896,33 @@ async def test_workspace_download_past_the_exec_limit_uses_the_provider(
 
 
 @pytest.mark.asyncio
+async def test_a_whole_read_fits_in_what_the_runtime_keeps_of_its_output(tree) -> None:
+    """An SSH exec keeps only the first 32 MiB it prints, so a file whose base64
+    would pass that streams from the provider instead of arriving cut, which
+    would read as a missing file."""
+    fits = _exec_read_max(SSHRuntime)
+    # The path line ahead of the bytes is a PATH_MAX path in base64 at most.
+    path_line = len(base64.b64encode(bytes(4096))) + 1
+    assert len(base64.encodebytes(bytes(fits))) + path_line <= SSHRuntime.exec_output_cap
+    # Room for five bytes, and chart.png has ten.
+    tree.sandbox.runtime.exec_output_cap = 64 * 1024 + 8
+    request = MagicMock()
+    request.headers = {}
+    with (
+        patch(_CRUD_DBWS, AsyncMock(return_value=_workspace())),
+        patch(_OWNED_DBWS, AsyncMock(return_value=_workspace())),
+        patch(_CRUD_OWNER, MagicMock()),
+        patch(_CRUD_WD, return_value=tree.root),
+        patch(_CRUD_ACQUIRE_TO_CHANGE, _acquired(tree.sandbox, _workspace())),
+        patch(_CRUD_STORAGE, return_value=False),
+    ):
+        response = await download_workspace_file(WS_ID, OWNER, request, path="work/chart.png")
+        body = b"".join([chunk async for chunk in response.body_iterator])
+    assert body == b"\x89PNG\r\n\x1a\n\xff\xfe"
+    assert tree.sandbox.reads == [f"{tree.root}/work/chart.png"]
+
+
+@pytest.mark.asyncio
 async def test_a_streamed_download_holds_the_folder_until_the_response_is_sent(tree) -> None:
     """The file is read by path chunk after chunk, so a settle that moved the
     folder mid-send would end the download; the hold goes with the response."""
@@ -893,7 +931,7 @@ async def test_a_streamed_download_holds_the_folder_until_the_response_is_sent(t
     events: list[str] = []
     with (
         patch(_CRUD_DBWS, AsyncMock(return_value=_workspace())),
-        patch(_RECHECK, AsyncMock(return_value=_workspace())),
+        patch(_OWNED_DBWS, AsyncMock(return_value=_workspace())),
         patch(_CRUD_OWNER, MagicMock()),
         patch(_CRUD_WD, return_value=tree.root),
         patch(_CRUD_ACQUIRE_TO_CHANGE, _acquired(tree.sandbox, _workspace(), events)),
@@ -925,7 +963,7 @@ async def test_workspace_download_fails_the_send_when_the_file_grows(tree) -> No
     request.headers = {}
     with (
         patch(_CRUD_DBWS, AsyncMock(return_value=_workspace())),
-        patch(_RECHECK, AsyncMock(return_value=_workspace())),
+        patch(_OWNED_DBWS, AsyncMock(return_value=_workspace())),
         patch(_CRUD_OWNER, MagicMock()),
         patch(_CRUD_WD, return_value=tree.root),
         patch(_CRUD_ACQUIRE_TO_CHANGE, _acquired(tree.sandbox, _workspace())),
@@ -945,7 +983,7 @@ async def test_workspace_download_past_the_exec_limit_still_denies_an_escape(
 ) -> None:
     with (
         patch(_CRUD_DBWS, AsyncMock(return_value=_workspace())),
-        patch(_RECHECK, AsyncMock(return_value=_workspace())),
+        patch(_OWNED_DBWS, AsyncMock(return_value=_workspace())),
         patch(_CRUD_OWNER, MagicMock()),
         patch(_CRUD_WD, return_value=tree.root),
         patch(_CRUD_ACQUIRE_TO_CHANGE, _acquired(tree.sandbox, _workspace())),
@@ -964,7 +1002,7 @@ async def test_workspace_download_past_the_exec_limit_still_denies_an_escape(
 async def test_workspace_read_denies_a_symlink_out_of_the_root(tree) -> None:
     with (
         patch(_CRUD_DBWS, AsyncMock(return_value=_workspace())),
-        patch(_RECHECK, AsyncMock(return_value=_workspace())),
+        patch(_OWNED_DBWS, AsyncMock(return_value=_workspace())),
         patch(_CRUD_OWNER, MagicMock()),
         patch(_CRUD_WD, return_value=tree.root),
         patch(_CRUD_ACQUIRE_TO_CHANGE, _acquired(tree.sandbox, _workspace())),
@@ -981,7 +1019,7 @@ async def test_workspace_download_returns_a_contained_file(tree) -> None:
     request.headers = {}
     with (
         patch(_CRUD_DBWS, AsyncMock(return_value=_workspace())),
-        patch(_RECHECK, AsyncMock(return_value=_workspace())),
+        patch(_OWNED_DBWS, AsyncMock(return_value=_workspace())),
         patch(_CRUD_OWNER, MagicMock()),
         patch(_CRUD_WD, return_value=tree.root),
         patch(_CRUD_ACQUIRE_TO_CHANGE, _acquired(tree.sandbox, _workspace())),
@@ -991,3 +1029,514 @@ async def test_workspace_download_returns_a_contained_file(tree) -> None:
         )
     assert response.status_code == 200
     assert response.body == b"\x89PNG\r\n\x1a\n\xff\xfe"
+
+
+# --- ranged download -------------------------------------------------------
+
+_CRUD_VAULT = "src.server.app.workspace_files.crud.get_vault_secrets_for_redaction"
+_CRUD_READ_RANGE = "src.server.app.workspace_files.crud.read_contained_sandbox_range"
+_RANGE_MAX = "src.server.app.workspace_files.crud.RANGE_MAX_BYTES"
+_CRUD_WARM = "src.server.app.workspace_files.crud.warm_sandbox"
+VAULT_SECRET = "vault-secret-value-1234"
+# A version line as stat prints it (size, mtime, ctime, inode), and the clock.
+STAMPED = "10 1700000000.5 1700000000.5 42"
+CLOCK = "1700000100"
+_VERSION_MIN_AGE = "src.server.services.workspace_file_containment._VERSION_MIN_AGE_S"
+
+
+@pytest.fixture
+def settled():
+    """Every file counts as past the two seconds in which a write could still
+    share its stamps; os.utime cannot age a ctime, and waiting costs 2 s a test."""
+    with patch(_VERSION_MIN_AGE, -math.inf):
+        yield
+
+
+async def _read_range(tree, path: str, offset: int, length: int):
+    return await read_contained_sandbox_range(
+        tree.sandbox,
+        f"{tree.root}/{path}",
+        work_dir=tree.root,
+        offset=offset,
+        length=length,
+    )
+
+
+def _exec_printing(*lines: str) -> SimpleNamespace:
+    """A runtime whose read prints ``lines`` after the canonical chart path."""
+    return SimpleNamespace(
+        exec=AsyncMock(
+            return_value=SimpleNamespace(
+                stdout="\n".join(lines) + "\n", stderr="", exit_code=0
+            )
+        )
+    )
+
+
+def _b64(data: bytes) -> str:
+    return base64.b64encode(data).decode()
+
+
+async def _ranged_download(
+    tree,
+    range_header: str | None,
+    path="work/chart.png",
+    *,
+    warm=None,
+    folder_now=None,
+    events=None,
+):
+    """The owner route's answer. ``warm`` is the sandbox of a session this
+    worker already holds, ``folder_now`` the row the recheck after a warm read
+    finds, and ``events`` notes an acquisition."""
+    request = MagicMock()
+    request.headers = {"range": range_header} if range_header else {}
+    with (
+        patch(_CRUD_DBWS, AsyncMock(return_value=_workspace())),
+        patch(_OWNED_DBWS, AsyncMock(return_value=_workspace())),
+        patch(_CRUD_OWNER, MagicMock()),
+        patch(_CRUD_WD, return_value=tree.root),
+        patch(_CRUD_ACQUIRE_TO_CHANGE, _acquired(tree.sandbox, _workspace(), events)),
+        patch(_CRUD_VAULT, AsyncMock(return_value={"API_KEY": VAULT_SECRET})),
+        patch(_CRUD_WARM, return_value=warm),
+        patch(_RECHECK, AsyncMock(return_value=folder_now or _workspace())),
+    ):
+        return await download_workspace_file(
+            WS_ID, OWNER, request, path=path, attachment=False
+        )
+
+
+@pytest.mark.usefixtures("settled")
+@pytest.mark.asyncio
+async def test_a_ranged_read_returns_the_slice_and_the_file_it_was_cut_from(
+    tree,
+) -> None:
+    chart = Path(tree.root, "work/chart.png").read_bytes()
+    sliced = await _read_range(tree, "work/chart.png", 2, 4)
+    assert sliced.canonical == f"{tree.root}/work/chart.png"
+    assert (sliced.size, sliced.content, sliced.head) == (10, chart[2:6], chart)
+    # mtime, ctime and inode from GNU or BSD stat, with the fraction both give.
+    assert re.fullmatch(r"\d+\.\d+-\d+\.\d+-\d+", sliced.version)
+
+
+@pytest.mark.usefixtures("settled")
+@pytest.mark.asyncio
+@pytest.mark.parametrize("how", ["in-place", "renamed-over"])
+async def test_a_same_size_rewrite_that_keeps_the_mtime_moves_the_version(
+    tree, how
+) -> None:
+    """A writer can set the mtime back (``cp -p``, ``touch -r``, an unpacked
+    archive), so the version also names what no writer sets: the ctime every
+    write moves, and the inode a file renamed over the name brings."""
+    chart = Path(tree.root, "work/chart.png")
+    before = await _read_range(tree, "work/chart.png", 0, 4)
+    assert before.version is not None
+    stamp = chart.stat()
+    replacement = bytes(reversed(chart.read_bytes()))
+    written = chart if how == "in-place" else chart.with_name("chart.png.part")
+    written.write_bytes(replacement)
+    os.utime(written, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+    written.replace(chart)
+    assert chart.stat().st_mtime_ns == stamp.st_mtime_ns
+
+    after = await _read_range(tree, "work/chart.png", 0, 4)
+    assert (after.size, after.content) == (10, replacement[:4])
+    assert after.version != before.version
+
+
+@pytest.mark.asyncio
+async def test_a_ranged_read_stops_at_the_end_of_the_file(tree) -> None:
+    chart = Path(tree.root, "work/chart.png").read_bytes()
+    sliced = await _read_range(tree, "work/chart.png", 6, 100)
+    assert (sliced.size, sliced.content) == (10, chart[6:])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("offset", [10, 10**17])
+async def test_a_ranged_read_past_the_end_names_the_size_and_no_bytes(
+    tree, offset
+) -> None:
+    sliced = await _read_range(tree, "work/chart.png", offset, 4)
+    assert (sliced.size, sliced.content) == (10, None)
+
+
+@pytest.mark.asyncio
+async def test_a_ranged_read_is_not_bound_by_the_exec_read_limit(tree) -> None:
+    """A range is how a file of any size gets read, so the limit that sends a
+    large file to the provider's stream never applies to one."""
+    chart = Path(tree.root, "work/chart.png").read_bytes()
+    with patch(_EXEC_CAP, 1):
+        sliced = await _read_range(tree, "work/chart.png", 0, 10)
+    assert sliced.content == chart
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "requested",
+    [
+        "work/escape/secret.txt",
+        "work/reserved/secret.txt",
+        "work/../../outside/secret.txt",
+    ],
+)
+async def test_a_ranged_read_still_refuses_an_escape(tree, requested) -> None:
+    assert await _read_range(tree, requested, 0, 4) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("after", "sliced"),
+    [
+        # A same-length rewrite between the two stats that put the mtime back.
+        ("10 1700000000.5 1700000001.5 42", b"abcd"),
+        # A same-length file renamed over the name between them.
+        ("10 1700000000.5 1700000000.5 43", b"abcd"),
+        # A slice the size read before it contradicts.
+        (STAMPED, b"ab"),
+    ],
+    ids=["ctime-moved", "inode-moved", "slice-short"],
+)
+async def test_a_file_that_changes_while_it_is_read_is_refused(
+    tree, after, sliced
+) -> None:
+    """Answering would send a validator or a Content-Range the body belies."""
+    canonical = f"{tree.root}/work/chart.png"
+    tree.sandbox.runtime = _exec_printing(
+        _b64(canonical.encode()),
+        STAMPED,
+        CLOCK,
+        _b64(b"head"),
+        _b64(sliced),
+        after,
+    )
+    with pytest.raises(FileChangedWhileRead):
+        await _read_range(tree, "work/chart.png", 0, 4)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "line",
+    [
+        # Every stat failed, and wc gave the size alone.
+        "10",
+        "10 1700000000.5",
+        "10 1700000000.5 1700000000.5",
+        "10 1700000000.5 1700000000.5 42 7",
+        "10 1700000000.5 1700000000.5 4x",
+        "10 1700000000.5 \u0661\u0667\u0660\u0660 42",
+        "10 1700000000.5e3 1700000000.5 42",
+    ],
+)
+async def test_a_version_line_without_stat_s_four_stamps_has_no_version(
+    tree, line
+) -> None:
+    """The size alone cannot tell two versions apart, and anything but stat's
+    digits would land in the ETag, so the route answers whole."""
+    canonical = f"{tree.root}/work/chart.png"
+    tree.sandbox.runtime = _exec_printing(
+        _b64(canonical.encode()), line, CLOCK, _b64(b"head"), _b64(b"abcd"), line
+    )
+    sliced = await _read_range(tree, "work/chart.png", 0, 4)
+    assert (sliced.size, sliced.version, sliced.content) == (10, None, b"abcd")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("ctime", "clock", "versioned"),
+    [
+        # BusyBox prints whole seconds; GNU on a coarse filesystem, zeros.
+        ("1700000000", "1700000001", False),
+        ("1700000000.000000000", "1700000001", False),
+        # Nanosecond digits, but stamped from a clock that steps by a tick.
+        ("1700000000.480762010", "1700000001", False),
+        ("1700000000.5", "1700000002", False),
+        # A sandbox clock behind the filesystem's, or none at all.
+        ("1700000000", "1699999990", False),
+        ("1700000000", "", False),
+        ("1700000000.5", "", False),
+        ("1700000000", "1700000002", True),
+        ("1700000000.000000000", "1700000002", True),
+        ("1700000000.480762010", "1700000003", True),
+    ],
+)
+async def test_a_ctime_counts_once_the_clock_is_two_seconds_past_it(
+    tree, ctime, clock, versioned
+) -> None:
+    """A write moves the ctime only by the clock's step, a tick or a whole
+    second, so until the clock has left it behind, the next same-size write
+    may carry every stamp this one does, whatever the ctime's precision."""
+    canonical = f"{tree.root}/work/chart.png"
+    line = f"10 1700000000.5 {ctime} 42"
+    tree.sandbox.runtime = _exec_printing(
+        _b64(canonical.encode()), line, clock, _b64(b"head"), _b64(b"abcd"), line
+    )
+    sliced = await _read_range(tree, "work/chart.png", 0, 4)
+    assert sliced.version == (f"1700000000.5-{ctime}-42" if versioned else None)
+
+
+@pytest.mark.usefixtures("settled")
+@pytest.mark.asyncio
+async def test_a_ranged_download_answers_206_with_the_slice(tree) -> None:
+    chart = Path(tree.root, "work/chart.png").read_bytes()
+    response = await _ranged_download(tree, "bytes=2-5")
+    assert response.status_code == 206
+    assert response.body == chart[2:6]
+    assert response.headers["content-range"] == "bytes 2-5/10"
+    assert response.headers["content-length"] == "4"
+    assert response.headers["accept-ranges"] == "bytes"
+    assert response.headers["cache-control"] == "private, no-store, no-transform"
+    assert response.headers["content-type"] == "image/png"
+    assert response.headers["content-disposition"] == content_disposition(
+        "chart.png", disposition="inline"
+    )
+    # Size and version from the exec that read the slice, so a rewrite moves it.
+    assert re.fullmatch(r'"10-\d+\.\d+-\d+\.\d+-\d+"', response.headers["etag"])
+
+
+@pytest.mark.usefixtures("settled")
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("header", "cap", "content_range"),
+    [
+        ("bytes=6-9", RANGE_MAX_BYTES, "bytes 6-9/10"),
+        ("bytes=6-99", RANGE_MAX_BYTES, "bytes 6-9/10"),
+        ("bytes=1-99", 4, "bytes 1-4/10"),
+        ("bytes=0-8", 4, "bytes 0-3/10"),
+    ],
+)
+async def test_a_ranged_download_stops_at_the_end_and_at_the_cap(
+    tree, header, cap, content_range
+) -> None:
+    """A client loops on a short answer, so the cap bounds one answer
+    whatever the range asked for."""
+    chart = Path(tree.root, "work/chart.png").read_bytes()
+    with patch(_RANGE_MAX, cap):
+        response = await _ranged_download(tree, header)
+    first, last = (int(n) for n in content_range[6:].split("/")[0].split("-"))
+    assert response.headers["content-range"] == content_range
+    assert response.body == chart[first : last + 1]
+
+
+@pytest.mark.asyncio
+async def test_a_file_written_moments_ago_goes_whole(tree) -> None:
+    """Its next write may still share every stamp, so no version names it."""
+    chart = Path(tree.root, "work/chart.png").read_bytes()
+    # Fresh however long the runner took between the fixture's write and the read.
+    with patch(_VERSION_MIN_AGE, math.inf):
+        response = await _ranged_download(tree, "bytes=2-5")
+    assert response.status_code == 200
+    assert response.body == chart
+    assert "content-range" not in response.headers
+
+
+@pytest.mark.asyncio
+async def test_a_range_past_the_end_is_416_with_the_size(tree) -> None:
+    with pytest.raises(HTTPException) as exc:
+        await _ranged_download(tree, "bytes=10-20")
+    assert exc.value.status_code == 416
+    assert exc.value.headers == {"Content-Range": "bytes */10"}
+
+
+@pytest.mark.asyncio
+async def test_an_empty_file_answers_any_range_with_416(tree) -> None:
+    """Decided from the size before the content is looked at, where an empty
+    body would pass for text."""
+    Path(tree.root, "work/empty.png").write_bytes(b"")
+    with pytest.raises(HTTPException) as exc:
+        await _ranged_download(tree, "bytes=0-0", path="work/empty.png")
+    assert exc.value.status_code == 416
+    assert exc.value.headers == {"Content-Range": "bytes */0"}
+
+
+@pytest.mark.asyncio
+async def test_a_range_past_the_end_is_416_without_a_version(tree) -> None:
+    """A 416 carries no validator, so a file too fresh to version gets one too."""
+    unversioned = ContainedSlice(f"{tree.root}/work/chart.png", 10, None, b"", None)
+    with patch(_CRUD_READ_RANGE, AsyncMock(return_value=unversioned)):
+        with pytest.raises(HTTPException) as exc:
+            await _ranged_download(tree, "bytes=10-20")
+    assert exc.value.status_code == 416
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("path", "header"),
+    [
+        ("work/report.html", "bytes=0-3"),
+        ("work/chart.png", "bytes=-4"),
+        ("work/chart.png", "bytes=4-"),
+        ("work/chart.png", "bytes=0-1,4-5"),
+        ("work/chart.png", None),
+    ],
+)
+async def test_a_range_the_route_does_not_honor_goes_whole(
+    tree, path, header
+) -> None:
+    """Text keeps its redaction, which needs the whole body; a suffix or
+    several ranges are shapes the route ignores rather than half-serves."""
+    response = await _ranged_download(tree, header, path=path)
+    assert response.status_code == 200
+    assert response.body == Path(tree.root, path).read_bytes()
+    assert "content-range" not in response.headers
+
+
+@pytest.mark.asyncio
+async def test_a_binary_name_linked_to_a_text_file_goes_whole_and_redacted(
+    tree,
+) -> None:
+    """The type comes from where the path lands, so a link named like a PDF
+    cannot carry a text file out unredacted a range at a time."""
+    Path(tree.root, "work/notes.txt").write_text(f"key={VAULT_SECRET}\n")
+    Path(tree.root, "work/notes.pdf").symlink_to(Path(tree.root, "work/notes.txt"))
+    response = await _ranged_download(tree, "bytes=0-3", path="work/notes.pdf")
+    assert response.status_code == 200
+    assert "content-range" not in response.headers
+    assert response.body.startswith(b"key=")
+    assert VAULT_SECRET.encode() not in response.body
+
+
+@pytest.mark.asyncio
+async def test_text_under_a_binary_name_goes_whole_and_redacted(tree) -> None:
+    """The whole answer redacts any body that decodes as UTF-8, whatever its
+    name, so a range of one would carry what that answer hides."""
+    Path(tree.root, "work/settings.bin").write_text(f"key={VAULT_SECRET}\n")
+    response = await _ranged_download(tree, "bytes=0-3", path="work/settings.bin")
+    assert response.status_code == 200
+    assert "content-range" not in response.headers
+    assert response.body.startswith(b"key=")
+    assert VAULT_SECRET.encode() not in response.body
+
+
+@pytest.mark.asyncio
+async def test_a_file_without_a_version_goes_whole(tree) -> None:
+    chart = Path(tree.root, "work/chart.png").read_bytes()
+    unversioned = ContainedSlice(
+        f"{tree.root}/work/chart.png", 10, None, chart, chart[:4]
+    )
+    with patch(_CRUD_READ_RANGE, AsyncMock(return_value=unversioned)):
+        response = await _ranged_download(tree, "bytes=0-3")
+    assert response.status_code == 200
+    assert response.body == chart
+
+
+@pytest.mark.asyncio
+async def test_a_file_that_changed_mid_read_is_a_503_to_retry(tree) -> None:
+    """Not the sandbox-unreachable answer: the sandbox is fine, the file moved."""
+    changed = AsyncMock(side_effect=FileChangedWhileRead("work/chart.png"))
+    with patch(_CRUD_READ_RANGE, changed):
+        with pytest.raises(HTTPException) as exc:
+            await _ranged_download(tree, "bytes=0-3")
+    assert exc.value.status_code == 503
+    # A code, since the file panel tells 503s apart by it.
+    assert exc.value.detail == {
+        "code": "file_changed",
+        "message": "File changed while it was read",
+    }
+    assert exc.value.headers == {"Retry-After": "1"}
+
+
+# --- ranged download through a warm session ---------------------------------
+
+
+def _ranged_commands(sandbox) -> list[str]:
+    return [c for c in sandbox.runtime.commands if "date +%s" in c]
+
+
+@pytest.mark.usefixtures("settled")
+@pytest.mark.asyncio
+async def test_a_warm_session_answers_a_range_without_an_acquisition(tree) -> None:
+    """The viewer sends a request per slice, and an acquisition for each would
+    hold the folder nearly all the time a reader scrolls, so a rename's settle
+    could never move it."""
+    chart = Path(tree.root, "work/chart.png").read_bytes()
+    events: list[str] = []
+    response = await _ranged_download(
+        tree, "bytes=2-5", warm=tree.sandbox, events=events
+    )
+    assert response.status_code == 206
+    assert response.body == chart[2:6]
+    assert events == []
+
+
+@pytest.mark.asyncio
+async def test_a_warm_refusal_stands_without_an_acquisition(tree) -> None:
+    events: list[str] = []
+    with pytest.raises(HTTPException) as exc:
+        await _ranged_download(tree, "bytes=10-20", warm=tree.sandbox, events=events)
+    assert exc.value.status_code == 416
+    assert events == []
+
+
+@pytest.mark.usefixtures("settled")
+@pytest.mark.asyncio
+@pytest.mark.parametrize("header", ["bytes=2-5", "bytes=10-20"])
+async def test_a_warm_read_whose_folder_moved_is_read_again_under_the_hold(
+    tree, header
+) -> None:
+    """Read without a hold, the folder may since have gone to a sibling that
+    landed on its name, so nothing the read found stands, a refusal included."""
+    events: list[str] = []
+    moved = {**_workspace(), "dir_name": "renamed"}
+    try:
+        response = await _ranged_download(
+            tree, header, warm=tree.sandbox, folder_now=moved, events=events
+        )
+    except HTTPException as e:
+        assert (header, e.status_code) == ("bytes=10-20", 416)
+    else:
+        assert (header, response.status_code) == ("bytes=2-5", 206)
+    assert events == ["released"]
+    assert len(_ranged_commands(tree.sandbox)) == 2
+
+
+@pytest.mark.asyncio
+async def test_a_file_the_warm_read_cannot_find_is_looked_for_under_the_hold(
+    tree,
+) -> None:
+    """A workspace moving to another computer keeps its folder's name while the
+    folder is set aside, so a warm miss may be a file away for the move, which
+    only the acquisition answers as such."""
+    events: list[str] = []
+    with pytest.raises(HTTPException) as exc:
+        await _ranged_download(
+            tree, "bytes=0-3", path="work/gone.png", warm=tree.sandbox, events=events
+        )
+    assert exc.value.status_code == 404
+    assert events == ["released"]
+    assert len(_ranged_commands(tree.sandbox)) == 2
+
+
+@pytest.mark.usefixtures("settled")
+@pytest.mark.asyncio
+async def test_a_workspace_without_a_warm_session_is_acquired(tree) -> None:
+    events: list[str] = []
+    response = await _ranged_download(tree, "bytes=2-5", events=events)
+    assert response.status_code == 206
+    assert events == ["released"]
+
+
+@pytest.mark.usefixtures("settled")
+@pytest.mark.asyncio
+async def test_a_warm_sandbox_that_does_not_answer_is_acquired(tree) -> None:
+    """The acquisition is what retires a dead handle and attaches anew."""
+    dead = _FsSandbox(tree.root)
+    dead.runtime = SimpleNamespace(
+        exec=AsyncMock(side_effect=SandboxTransientError("no answer"))
+    )
+    events: list[str] = []
+    response = await _ranged_download(tree, "bytes=2-5", warm=dead, events=events)
+    assert response.status_code == 206
+    assert events == ["released"]
+
+
+@pytest.mark.asyncio
+async def test_a_file_the_warm_read_sends_whole_is_not_ranged_again(tree) -> None:
+    Path(tree.root, "work/settings.bin").write_text(f"key={VAULT_SECRET}\n")
+    events: list[str] = []
+    response = await _ranged_download(
+        tree, "bytes=0-3", path="work/settings.bin", warm=tree.sandbox, events=events
+    )
+    assert response.status_code == 200
+    assert VAULT_SECRET.encode() not in response.body
+    assert events == ["released"]
+    assert len(_ranged_commands(tree.sandbox)) == 1

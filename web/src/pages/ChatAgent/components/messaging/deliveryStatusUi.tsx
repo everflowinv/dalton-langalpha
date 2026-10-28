@@ -5,18 +5,12 @@
  */
 import React from 'react';
 import { useTranslation } from 'react-i18next';
-import {
-  AlertCircle, Check, CheckCircle2, HelpCircle, Link2, MinusCircle, XCircle,
-  type LucideIcon,
-} from 'lucide-react';
-import { StatusPill } from '@/components/mcp/McpPrimitives';
+import { TermStatus, type TermTone } from '../charts/TermCard';
 import type { DeliveryFileStatus, DeliveryStatus } from './messageDelivery';
 
 interface DeliveryStatusUi {
   labelKey: string;
-  color: string;
-  bg: string;
-  icon: LucideIcon;
+  tone: TermTone;
 }
 
 /**
@@ -26,95 +20,42 @@ interface DeliveryStatusUi {
  * it. Failure is the danger token, not `--color-loss`, which is market P&L.
  */
 const DELIVERY_STATUS_UI: Record<DeliveryStatus, DeliveryStatusUi> = {
-  sent: {
-    labelKey: 'toolArtifact.messageDelivery.status.sent',
-    color: 'var(--color-success)',
-    bg: 'var(--color-success-soft)',
-    icon: CheckCircle2,
-  },
-  partial: {
-    labelKey: 'toolArtifact.messageDelivery.status.partial',
-    color: 'var(--color-warning)',
-    bg: 'var(--color-warning-soft)',
-    icon: AlertCircle,
-  },
-  failed: {
-    labelKey: 'toolArtifact.messageDelivery.status.failed',
-    color: 'var(--color-icon-danger)',
-    bg: 'var(--color-danger-soft)',
-    icon: XCircle,
-  },
-  unknown: {
-    labelKey: 'toolArtifact.messageDelivery.status.unknown',
-    color: 'var(--color-warning)',
-    bg: 'var(--color-warning-soft)',
-    icon: HelpCircle,
-  },
+  sent: { labelKey: 'toolArtifact.messageDelivery.status.sent', tone: 'success' },
+  partial: { labelKey: 'toolArtifact.messageDelivery.status.partial', tone: 'warning' },
+  failed: { labelKey: 'toolArtifact.messageDelivery.status.failed', tone: 'danger' },
+  unknown: { labelKey: 'toolArtifact.messageDelivery.status.unknown', tone: 'warning' },
 };
 
-export function DeliveryStatusPill({ status, capsule }: {
-  status: DeliveryStatus;
-  capsule?: boolean;
-}): React.ReactElement {
+/** The verdict as a word in brackets in its colour, `[PARTLY SENT]`, for the
+ *  pill a thread draws in the terminal type its data cards use. */
+export function DeliveryStatusWord({ status }: { status: DeliveryStatus }): React.ReactElement {
   const { t } = useTranslation();
   const ui = DELIVERY_STATUS_UI[status];
   return (
-    <StatusPill
-      icon={ui.icon}
-      label={t(ui.labelKey)}
-      color={ui.color}
-      bg={ui.bg}
-      testid={`delivery-status-${status}`}
-      capsule={capsule}
-    />
+    <TermStatus tone={ui.tone} testid={`delivery-status-${status}`}>
+      {t(ui.labelKey)}
+    </TermStatus>
   );
-}
-
-interface FileStatusUi {
-  labelKey: string;
-  color: string;
-  icon: LucideIcon;
 }
 
 /** A file that did not go is flagged; one that went as a link says so, since
  *  the recipient gets a download rather than the file. */
-const FILE_STATUS_UI: Record<Exclude<DeliveryFileStatus, null>, FileStatusUi> = {
-  sent: {
-    labelKey: 'toolArtifact.messageDelivery.file.sent',
-    color: 'var(--color-text-tertiary)',
-    icon: Check,
-  },
-  linked: {
-    labelKey: 'toolArtifact.messageDelivery.file.linked',
-    color: 'var(--color-text-tertiary)',
-    icon: Link2,
-  },
-  failed: {
-    labelKey: 'toolArtifact.messageDelivery.file.failed',
-    color: 'var(--color-icon-danger)',
-    icon: AlertCircle,
-  },
-  not_sent: {
-    labelKey: 'toolArtifact.messageDelivery.file.notSent',
-    color: 'var(--color-text-tertiary)',
-    icon: MinusCircle,
-  },
+const FILE_STATUS_KEY: Record<Exclude<DeliveryFileStatus, null>, string> = {
+  sent: 'toolArtifact.messageDelivery.file.sent',
+  linked: 'toolArtifact.messageDelivery.file.linked',
+  failed: 'toolArtifact.messageDelivery.file.failed',
+  not_sent: 'toolArtifact.messageDelivery.file.notSent',
 };
 
-/** One file's outcome as glyph + word; nothing for a file whose fate is unknown. */
-export function DeliveryFileStatusLabel({ status }: { status: DeliveryFileStatus }): React.ReactElement | null {
+/** One file's outcome as a bracket word, `[FAILED]`, quieter than the send's
+ *  own verdict; only a file that failed takes a colour. Nothing for a file
+ *  whose fate is unknown. */
+export function DeliveryFileStatusWord({ status }: { status: DeliveryFileStatus }): React.ReactElement | null {
   const { t } = useTranslation();
   if (!status) return null;
-  const ui = FILE_STATUS_UI[status];
-  const Icon = ui.icon;
   return (
-    <span
-      className="inline-flex items-center gap-1 text-xs whitespace-nowrap"
-      style={{ color: ui.color }}
-      data-testid={`delivery-file-${status}`}
-    >
-      <Icon className="h-3 w-3 shrink-0" />
-      {t(ui.labelKey)}
+    <span className="term-tag" data-tone={status === 'failed' ? 'bad' : undefined} data-testid={`delivery-file-${status}`}>
+      {t(FILE_STATUS_KEY[status])}
     </span>
   );
 }

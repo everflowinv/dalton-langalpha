@@ -14,7 +14,7 @@ import asyncio
 import hashlib
 import uuid
 from datetime import datetime, timezone
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -22,12 +22,14 @@ import pytest
 
 from src.server.models.computer import ComputerStatus
 
-from src.server.services.computer_manager import ComputerBinding
+from src.server.services.computer_manager import ComputerBinding, MachineTarget
 from src.server.services.egress.session_binding import RelayBind
 from src.server.services.workspace_manager import WorkspaceManager
 from tests.computer_manager_patch import cm_patch
 from tests.unit.server.mcp_builders import resolved_mcp
 from tests.unit.server.services.conftest import _patch_identity, _patch_machine_bind
+
+_NOT_SSH = MachineTarget(kind="daytona")
 
 
 @pytest.fixture(autouse=True)
@@ -44,6 +46,8 @@ def _stub_sibling_restore_flags():
 def _make_config():
     config = MagicMock()
     config.to_core_config.return_value = MagicMock()
+    core_sandbox = config.to_core_config.return_value.sandbox
+    core_sandbox.settings_for.side_effect = lambda kind: getattr(core_sandbox, kind)
     config.daytona = MagicMock(api_key="k", base_url="https://daytona.test")
     config.sandbox = MagicMock(provider="daytona")
     config.filesystem = MagicMock(working_directory="/home/workspace")
@@ -78,6 +82,7 @@ def _make_computer(
     return {
         "computer_id": computer_id,
         "user_id": "user-1",
+        "kind": "daytona",
         "status": status,
         "resource_tier": resource_tier,
         "provider_ref": provider_ref,
@@ -91,6 +96,7 @@ def _make_binding(workspace_id, computer_id, *, provider_ref="sb-1", **kw):
     ``provider_ref`` defaults to _make_workspace's sandbox_id, so the machine
     and the project shadow agree unless a test says otherwise.
     """
+    kw.setdefault("kind", "daytona")
     return ComputerBinding(
         workspace_id=workspace_id,
         computer_id=computer_id,
@@ -116,6 +122,10 @@ def _make_session(*, version=None, summary=None, config_owner="ws"):
     session.sandbox.config.mcp = MagicMock(servers=[])
     session.mcp_registry = MagicMock()
     session._builtin_mcp_registry = session.mcp_registry
+    # No reconnect has replaced the global snapshot, so it is the borrowed one.
+    session.refresh_builtin_registry = MagicMock(
+        side_effect=lambda: session._builtin_mcp_registry
+    )
     session.mcp_tool_summary = summary
     session.mcp_config_version = version
     # Whose composite the version belongs to. A MagicMock default would read as
@@ -147,12 +157,21 @@ def _patch_certify():
     )
 
 
-def _patch_computer_for_workspace(computer):
-    """Stub the machine lookup the proactive-apply path uses to find the cooldown."""
-    return patch(
-        "src.server.services.computer_manager._mcp.get_computer_for_workspace",
-        new=AsyncMock(return_value=computer),
-    )
+@contextmanager
+def _patch_computer_for_workspace(computer, *, moving=False):
+    """Stub the lookups the proactive-apply path makes: the machine, for the
+    cooldown, and whether a move holds the workspace."""
+    with (
+        patch(
+            "src.server.services.computer_manager._mcp.get_computer_for_workspace",
+            new=AsyncMock(return_value=computer),
+        ),
+        patch(
+            "src.server.services.computer_manager._mcp.workspace_is_moving",
+            new=AsyncMock(return_value=moving),
+        ),
+    ):
+        yield
 
 
 # ---------------------------------------------------------------------------
@@ -1094,7 +1113,9 @@ class TestAppliedVersionAndProactiveApply:
         """No warm session ⇒ the config isn't loaded anywhere live ⇒ None."""
         wm = WorkspaceManager.get_instance(config=_make_config())
         assert (
-            wm.get_applied_mcp_config_version("ws-x", expected_sandbox_id="sb-1")
+            wm.get_applied_mcp_config_version(
+                "ws-x", expected_sandbox_id="sb-1", target=_NOT_SSH
+            )
             is None
         )
 
@@ -1105,7 +1126,12 @@ class TestAppliedVersionAndProactiveApply:
         wm._put_session(
             "computer-1", _make_session(version=7, summary="s"), workspace_id="ws"
         )
-        assert wm.get_applied_mcp_config_version("ws", expected_sandbox_id="sb-1") == 7
+        assert (
+            wm.get_applied_mcp_config_version(
+                "ws", expected_sandbox_id="sb-1", target=_NOT_SSH
+            )
+            == 7
+        )
 
     def test_applied_version_none_when_session_holds_a_superseded_sandbox(self):
         """The version claims what a LIVE sandbox applied. A session bound to a
@@ -1115,7 +1141,10 @@ class TestAppliedVersionAndProactiveApply:
             "computer-1", _make_session(version=7, summary="s"), workspace_id="ws"
         )
         assert (
-            wm.get_applied_mcp_config_version("ws", expected_sandbox_id="sb-2") is None
+            wm.get_applied_mcp_config_version(
+                "ws", expected_sandbox_id="sb-2", target=_NOT_SSH
+            )
+            is None
         )
 
     @pytest.mark.asyncio
@@ -1154,6 +1183,16 @@ class TestAppliedVersionAndProactiveApply:
 
         assert not wm._sync_cooldown_ok(computer_id, "ws")
         wm._acquire_session.assert_awaited_once_with("ws", user_id="user-1")
+
+    @pytest.mark.asyncio
+    async def test_proactive_apply_leaves_a_moving_workspace_alone(self):
+        """An acquire would lay again the folder a move has set aside; the
+        next message applies the change wherever the move ends."""
+        wm = WorkspaceManager.get_instance(config=_make_config())
+        wm._acquire_session = AsyncMock()
+        with _patch_computer_for_workspace(None, moving=True):
+            await wm.proactively_apply_mcp_config("ws-x", "user-1")
+        wm._acquire_session.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_proactive_apply_swallows_errors(self):
@@ -1227,7 +1266,7 @@ class TestDiscoveryKickSeesCachedSession:
     def _stub_provisioning(wm):
         """Everything the provision path reaches that is not the kick itself."""
         wm._workspace_folder = AsyncMock(return_value="ws")
-        wm._mint_sandbox_tokens = AsyncMock(return_value={})
+        wm._keep_data_token = AsyncMock()
         wm._apply_session_mcp = AsyncMock(
             return_value=_resolved(1, servers=[_srv("alpha")])
         )
@@ -1824,7 +1863,7 @@ class TestVaultPushPublishesTheOwnersVault:
         sandboxes = {c: MagicMock(name=c) for c in set(computers.values())}
         manager._live_session_computer = MagicMock(side_effect=computers.get)
         manager.get_session_if_ready = MagicMock(
-            side_effect=lambda wid, expected_sandbox_id: (
+            side_effect=lambda wid, expected_sandbox_id, target: (
                 SimpleNamespace(sandbox=sandboxes[computers[wid]])
                 if wid in ready
                 else None
@@ -1921,7 +1960,7 @@ class TestVaultPushPublishesTheOwnersVault:
             )
             manager = McpSecretsMixin()
             manager._live_session_computer = lambda wid: "comp-1"
-            manager.get_session_if_ready = lambda wid, expected_sandbox_id: (
+            manager.get_session_if_ready = lambda wid, expected_sandbox_id, target: (
                 SimpleNamespace(sandbox=sandbox)
             )
             return manager, sandbox

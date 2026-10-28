@@ -33,7 +33,7 @@ _ERROR_TYPES = {
     "timeout": (WebErrorType.TIMEOUT, False),
     "connection_timeout": (WebErrorType.TIMEOUT, False),
     "rate_limited": (WebErrorType.RATE_LIMITED, False),
-    "circuit_open": (WebErrorType.CIRCUIT_OPEN, False),
+    "host_circuit_open": (WebErrorType.CIRCUIT_OPEN, False),
     "empty_content": (WebErrorType.EMPTY, False),
     "dns_error": (WebErrorType.PROVIDER_ERROR, False),
     "connection_refused": (WebErrorType.PROVIDER_ERROR, False),
@@ -46,6 +46,9 @@ _ERROR_TYPES = {
     # Our own capacity/infrastructure — any other URL would fail the same way.
     "queue_full": (WebErrorType.PROVIDER_ERROR, True),
     "browser_closed": (WebErrorType.PROVIDER_ERROR, True),
+    # The infra breaker, also ours, yet off so the router's breaker does not
+    # count the browser_closed failures that opened it a second time.
+    "circuit_open": (WebErrorType.CIRCUIT_OPEN, False),
 }
 
 
@@ -57,7 +60,12 @@ class InhouseFetchAdapter:
     async def _fetch_one(self, crawler, url: str) -> FetchResult:
         result = await crawler.crawl(url)
         if result.success:
-            return FetchResult(url=url, title=result.title, markdown=result.markdown)
+            return FetchResult(  # DALTON-HOOK(heavy-compute-isolation): flag rides
+                url=url,
+                title=result.title,
+                markdown=result.markdown,
+                parse_timeout=bool(result.parse_timeout),
+            )
         kind = result.error_type or "crawl_error"
         if kind == "cancelled":
             # Not a failure at all — the caller stopped. Neither retry it on

@@ -5,6 +5,7 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '
 import { initiateCodexDevice, pollCodexDevice, getCodexOAuthStatus, disconnectCodexOAuth, initiateClaudeOAuth, submitClaudeCallback, getClaudeOAuthStatus, disconnectClaudeOAuth } from '@/pages/Dashboard/utils/api';
 import { useQueryClient } from '@tanstack/react-query';
 import { queryKeys } from '@/lib/queryKeys';
+import { copyText } from '@/lib/clipboard';
 import { useTranslation } from 'react-i18next';
 // DALTON-HOOK(native-oauth-ui): P0N.3 Antigravity & Meta Muse OAuth rows
 import { AntigravityAccountRow } from './dalton/oauth/AntigravityAccountRow';
@@ -346,7 +347,7 @@ export function ConnectedAccounts() {
                 </code>
                 <button
                   type="button"
-                  onClick={() => navigator.clipboard.writeText(codexDeviceCode.user_code)}
+                  onClick={() => copyText(codexDeviceCode.user_code)}
                   className="p-1.5 rounded-md transition-colors hover:opacity-80"
                   style={{ backgroundColor: 'var(--color-bg-elevated)', border: '1px solid var(--color-border-muted)' }}
                   title={t('common.copy', 'Copy')}

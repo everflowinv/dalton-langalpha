@@ -217,7 +217,13 @@ export function useDialogA11y<T extends HTMLElement>(onClose: () => void) {
       // overlay removes the row that opened it, and focusing a detached node
       // silently drops focus to <body>, stranding keyboard users at the top of
       // the page instead of where they were.
-      if (opener?.isConnected) opener.focus?.();
+      if (opener?.isConnected && opener !== document.body) opener.focus?.();
+      // Focus still nowhere: the opener went with what this dialog did (a
+      // removed row), or was in a panel made inert while this one was open
+      // over it. A dialog still open underneath takes it back, not <body>.
+      if (!document.activeElement || document.activeElement === document.body) {
+        openDialogs.findLast(isShown)?.focus();
+      }
     };
   }, []);
 

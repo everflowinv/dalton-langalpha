@@ -8,8 +8,9 @@
   min-height: 0;
   min-width: 0;
   height: 100%;
-  /* Mask chart until layout stabilizes after page transition (autoSize ResizeObserver) */
-  animation: chart-reveal 0s 0.18s both;
+  /* Mask chart until layout stabilizes after page transition (autoSize ResizeObserver).
+     motion-exempt: the delay is a wait, not motion */
+  animation: chart-reveal 0s 180ms both;
 }
 
 .chart-subrow {
@@ -80,6 +81,15 @@
 @keyframes chart-reveal {
   from { visibility: hidden; }
   to   { visibility: visible; }
+}
+
+/* The mask's delay is the settle wait, not motion, so it outlasts the global
+   reduced-motion rule that cuts delays. */
+@media (prefers-reduced-motion: reduce) {
+  .market-chart-container {
+    /* motion-exempt: the delay is a wait, not motion */
+    animation-delay: 180ms !important;
+  }
 }
 
 /* Capture wheel over chart so K-line pan/zoom doesn't scroll the page */
@@ -165,7 +175,7 @@
   border: 1px solid transparent;
   border-radius: 3px;
   cursor: pointer;
-  transition: color 0.15s, border-color 0.15s;
+  transition: color var(--motion-quick) var(--ease-out), border-color var(--motion-quick) var(--ease-out);
 }
 
 .indicator-toggle-btn:hover {
@@ -194,7 +204,7 @@
   border: none;
   border-radius: 4px;
   cursor: pointer;
-  transition: color 0.15s, background-color 0.15s;
+  transition: color var(--motion-quick) var(--ease-out), background-color var(--motion-quick) var(--ease-out);
   display: inline-flex;
   align-items: center;
 }
@@ -220,7 +230,7 @@
   box-shadow: 0 4px 12px rgba(0,0,0,0.15);
   z-index: 20;
   pointer-events: none;
-  animation: tooltip-fade-in 0.12s ease-out;
+  animation: tooltip-fade-in var(--motion-quick) var(--ease-out);
 }
 
 @keyframes tooltip-fade-in {
@@ -253,7 +263,7 @@
   font-size: 0.75rem;
   font-weight: 500;
   font-family: 'SF Mono', 'Fira Code', monospace;
-  transition: color 0.15s, background-color 0.15s, border-color 0.15s;
+  transition: color var(--motion-quick) var(--ease-out), background-color var(--motion-quick) var(--ease-out), border-color var(--motion-quick) var(--ease-out);
   white-space: nowrap;
 }
 
@@ -331,26 +341,6 @@
   align-items: center;
   gap: 10px;
   font-size: 0.8125rem;
-}
-
-.chart-loading-shimmer {
-  background: linear-gradient(
-    90deg,
-    var(--color-border-muted) 0%,
-    var(--color-text-primary) 40%,
-    var(--color-border-muted) 80%
-  );
-  background-size: 200% 100%;
-  -webkit-background-clip: text;
-  background-clip: text;
-  -webkit-text-fill-color: transparent;
-  animation: chart-text-shimmer 2s ease-in-out infinite;
-  font-weight: 500;
-}
-
-@keyframes chart-text-shimmer {
-  0% { background-position: 100% 0; }
-  100% { background-position: -100% 0; }
 }
 
 .chart-scroll-loading {
@@ -438,7 +428,7 @@
   cursor: pointer;
   text-align: left;
   white-space: nowrap;
-  transition: color 0.15s, background-color 0.15s;
+  transition: color var(--motion-quick) var(--ease-out), background-color var(--motion-quick) var(--ease-out);
 }
 
 .interval-dropdown-item:hover {
@@ -582,7 +572,7 @@
   border: none;
   border-radius: 4px;
   cursor: pointer;
-  transition: color 0.15s, background-color 0.15s;
+  transition: color var(--motion-quick) var(--ease-out), background-color var(--motion-quick) var(--ease-out);
   white-space: nowrap;
 }
 .range-btn:hover { color: var(--color-text-primary); background: var(--color-bg-hover); }

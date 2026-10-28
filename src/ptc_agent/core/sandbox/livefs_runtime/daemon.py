@@ -33,7 +33,7 @@ from .lifecycle import (
     use_libfuse3,
     write_state,
 )
-from .links import link, unlink
+from .links import finish_set_aside, link, unlink
 from .ops import LiveFS
 from .protocol import CALL_ENV, CONFIG_ENV, MountError
 from .remote import Remote
@@ -140,23 +140,39 @@ def _serving(
 
 
 @contextlib.contextmanager
-def _as_owner(owner: os.stat_result) -> Iterator[None]:
+def _as_owner(owner: os.stat_result) -> Iterator[Callable[[], contextlib.AbstractContextManager]]:
     """Act with the rights of the user who owns the folders. The links go
     where that user writes, so as root a symlink they planted on the way
-    would aim each mkdir, rename and link at any path in the sandbox."""
+    would aim each mkdir, rename and link at any path in the sandbox.
+    Yields a context that is root again, for writes to root's own files."""
     if os.geteuid() != 0 or owner.st_uid == 0:
-        yield
+        yield contextlib.nullcontext
         return
     egid, groups = os.getegid(), os.getgroups()
-    os.setgroups([])
-    os.setegid(owner.st_gid)
-    os.seteuid(owner.st_uid)
-    try:
-        yield
-    finally:
+
+    def drop() -> None:
+        os.setgroups([])
+        os.setegid(owner.st_gid)
+        os.seteuid(owner.st_uid)
+
+    def regain() -> None:
         os.seteuid(0)
         os.setegid(egid)
         os.setgroups(groups)
+
+    @contextlib.contextmanager
+    def as_root() -> Iterator[None]:
+        regain()
+        try:
+            yield
+        finally:
+            drop()
+
+    drop()
+    try:
+        yield as_root
+    finally:
+        regain()
 
 
 def link_folders(args, paths: Paths) -> dict:
@@ -176,19 +192,36 @@ def link_folders(args, paths: Paths) -> dict:
             source, _, target = spec.partition(":")
             wanted[os.path.abspath(target)] = source
         failed, moved = {}, {}
-        with _as_owner(os.stat(args.root)):
+        copied = state.get("copied")
+        copied = copied if isinstance(copied, dict) else {}
+        with _as_owner(os.stat(args.root)) as as_root:
+
+            def keep() -> None:
+                # A copy aside, saved before the delete after it: a link
+                # killed partway through would copy what is left again.
+                with as_root():
+                    write_state(paths, {**state, "copied": copied})
+
             for target in state.get("links", ()):
                 if target not in wanted:
                     unlink(target, paths.mount)
+            for target in [t for t in copied if t not in wanted]:
+                # Kept for the next pass when it fails, as for a link.
+                with contextlib.suppress(OSError):
+                    finish_set_aside(target, copied)
             for target, source in wanted.items():
                 try:
-                    aside = link(os.path.join(paths.mount, source), target)
+                    aside = link(os.path.join(paths.mount, source), target, copied, keep)
                 except OSError as exc:
                     failed[target] = str(exc)
                 else:
                     if aside:
                         moved[target] = aside
         state["links"] = sorted(wanted)
+        # Written here, as root: the owner the links are made as cannot.
+        state["copied"] = {
+            t: c for t, c in copied.items() if t in failed or t not in wanted
+        }
         # How the daemon tells a new layout from a rewrite that kept it.
         state["sources"] = sorted(set(wanted.values()))
         write_state(paths, state)

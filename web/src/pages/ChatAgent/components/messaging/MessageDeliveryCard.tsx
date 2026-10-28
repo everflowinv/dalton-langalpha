@@ -1,9 +1,11 @@
 import React from 'react';
 import { useTranslation } from 'react-i18next';
 import { Paperclip } from 'lucide-react';
-import { FaviconImg, googleFaviconUrl } from '../charts/InlineArtifactCards';
-import type { InlineCardProps } from '../charts/inlineCardsShared';
-import { DeliveryStatusPill } from './deliveryStatusUi';
+import type { InlineCardProps } from '../charts/cardReaders';
+import { FaviconImg } from '../charts/FaviconImg';
+import '../charts/termCard.css';
+import '../charts/termCardStyles.css';
+import { DeliveryStatusWord } from './deliveryStatusUi';
 import {
   deliveredFileCount,
   messagingAppDomain,
@@ -15,6 +17,9 @@ import {
  * A message the agent sent to a chat app, as a pill: the app, how many files
  * went with it, and whether it arrived. A click opens the detail panel, which
  * carries the whole message and each file's outcome.
+ *
+ * A chip keeps a chip's shape; its type and its verdict, `[SENT]`, are the
+ * terminal ones the data cards around it use.
  */
 export function MessageDeliveryCard({ artifact, toolArgs, onClick }: InlineCardProps): React.ReactElement | null {
   const { t } = useTranslation();
@@ -40,37 +45,21 @@ export function MessageDeliveryCard({ artifact, toolArgs, onClick }: InlineCardP
       title={summary}
       aria-label={summary}
       onClick={onClick}
-      className="inline-flex items-center min-w-0 max-w-full rounded-full border border-(--color-border-elevated) bg-(--color-bg-card) hover:bg-(--color-bg-surface)"
-      style={{
-        gap: 7,
-        // The status chip is the last thing in the pill, so it sits as far
-        // from the right edge as from the top and bottom, and its corners
-        // follow the pill's.
-        padding: '5px 5px 5px 8px',
-        fontSize: 13,
-        cursor: 'pointer',
-        color: 'var(--color-text-primary)',
-      }}
+      // Unfilled, held by the same edge as the cards around it, which is also
+      // what answers a hover.
+      className="term-pill inline-flex items-center min-w-0 max-w-full rounded-full border border-(--color-term-edge) hover:border-(--color-term-edge-hover) transition-colors"
     >
-      <FaviconImg src={googleFaviconUrl(domain)} domain={label} />
-      <span className="truncate" style={{ fontWeight: 560, whiteSpace: 'nowrap' }}>{label}</span>
+      <FaviconImg domain={domain} name={label} />
+      <span className="truncate font-medium">{label}</span>
       {total > 0 && (
-        <span
-          data-testid="message-delivery-files"
-          className="inline-flex items-center shrink-0"
-          style={{
-            gap: 4,
-            color: 'var(--color-text-secondary)',
-            fontVariantNumeric: 'tabular-nums',
-          }}
-        >
-          <span aria-hidden style={{ color: 'var(--color-text-tertiary)' }}>·</span>
-          <Paperclip className="shrink-0" style={{ width: 13, height: 13 }} aria-hidden />
+        <span data-testid="message-delivery-files" className="term-pill-files inline-flex items-center shrink-0">
+          <span aria-hidden className="term-t3">·</span>
+          <Paperclip className="shrink-0" aria-hidden />
           {count}
         </span>
       )}
       <span className="shrink-0">
-        <DeliveryStatusPill status={delivery.status} capsule />
+        <DeliveryStatusWord status={delivery.status} />
       </span>
     </button>
   );

@@ -25,6 +25,7 @@ from ptc_agent.agent.middleware.background_subagent.task import (
     WORKFLOW_SUBAGENT_TYPE,
 )
 from ptc_agent.agent.middleware.background_subagent.spawn import (
+    RunLedgerUnavailable,
     SpawnError,
     SpawnStoppedError,
     TaskRunRefused,
@@ -51,6 +52,7 @@ from ptc_agent.core.paths import (
     WorkspaceLayout,
 )
 from ptc_agent.core.project_context import current_project
+from src.observability import mark_tool_failed
 
 logger = structlog.get_logger(__name__)
 
@@ -80,10 +82,14 @@ class _Refused(Exception):
     here rather than written at each raise.
     """
 
-    def __init__(self, reason: str) -> None:
+    def __init__(self, reason: str, *, failure: str | None = None) -> None:
         reply = reason if reason[:5].lower() == "error" else f"Error: {reason}"
         super().__init__(reply)
         self.reply = reply
+        # Set when the refusal is our infrastructure failing rather than the
+        # call asking for something it can't have, so tracing counts it as a
+        # tool failure; most refusals are the agent's own to correct.
+        self.failure = failure
 
     def as_reply(self, tool_call_id: str) -> str | ToolMessage:
         """The refusal as the tool's return value, carrying ``status="error"``.
@@ -307,7 +313,8 @@ def create_run_workflow_tool(
                 )
                 raise _Refused(
                     f"could not read script_path '{script_path}'. "
-                    "Try again, or pass the script inline."
+                    "Try again, or pass the script inline.",
+                    failure="script_read_failed",
                 ) from error
             if not from_file:
                 raise _Refused(
@@ -327,7 +334,8 @@ def create_run_workflow_tool(
                 )
                 raise _Refused(
                     f"could not read workflow '{workflow}' from the "
-                    "workflow store. Try again, or pass the script inline."
+                    "workflow store. Try again, or pass the script inline.",
+                    failure="workflow_store_unavailable",
                 ) from error
             if resolved is None:
                 raise _Refused(_unknown_workflow_error(workflow))
@@ -370,7 +378,8 @@ def create_run_workflow_tool(
                     run_task.mark_never_started("workflow cap ledger unreadable")
                     raise _Refused(
                         "could not read the workflow run ledger to "
-                        "check the per-thread cap. Try again shortly."
+                        "check the per-thread cap. Try again shortly.",
+                        failure=RunLedgerUnavailable.failure,
                     ) from error
                 active_ids = [
                     str(row["task_id"])
@@ -402,7 +411,8 @@ def create_run_workflow_tool(
                 run_task.mark_never_started(refusal.settle_reason)
                 raise _Refused(
                     f"could not start {run_task.display_id} — "
-                    f"{refusal.reason}."
+                    f"{refusal.reason}.",
+                    failure=refusal.failure,
                 ) from refusal
             run_task.task_run_id = admitted or None
 
@@ -672,7 +682,8 @@ def create_run_workflow_tool(
             return _stopped_reply(run_task, tool_call_id)
         except SpawnError as error:
             raise _Refused(
-                f"could not start {run_task.display_id} — {error}."
+                f"could not start {run_task.display_id} — {error}.",
+                failure=type(error).__name__,
             ) from error
 
         logger.info(
@@ -730,6 +741,8 @@ def create_run_workflow_tool(
                 resume,
             )
         except _Refused as refused:
+            if refused.failure:
+                mark_tool_failed(refused.failure)
             return refused.as_reply(tool_call_id)
 
     return run_workflow

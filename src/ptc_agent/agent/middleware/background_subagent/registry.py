@@ -359,24 +359,11 @@ class BackgroundTaskRegistry:
 
     async def get_all_tasks(self) -> list[BackgroundTask]:
         """Return all registered tasks — infrastructure view (teardown,
-        liveness, workflow child cancellation). Agent-facing aggregates must
-        use ``get_turn_visible_tasks``."""
+        liveness, workflow child cancellation). What the agent is shown in
+        aggregate filters on ``BackgroundTask.is_turn_visible``, as
+        ``wait_for_all`` and the notification scan do."""
         async with self._lock:
             return list(self._tasks.values())
-
-    async def get_turn_visible_tasks(self) -> list[BackgroundTask]:
-        """The task set the agent is allowed to see in aggregate.
-
-        The door for the TaskOutput aggregate, where applying
-        ``is_turn_visible`` per call site is how a workflow's children leaked
-        into one branch while the branch beside it filtered them out. The two
-        other visibility-filtered readers inline the predicate instead, and
-        have to: ``wait_for_all`` already holds ``self._lock``, and the
-        notification scan folds it into a compound filter. Tighten the rule
-        here and those two need the same edit.
-        """
-        async with self._lock:
-            return [t for t in self._tasks.values() if t.is_turn_visible]
 
     def _has_collectible_work(self, task: BackgroundTask) -> bool:
         """Still running, or holding capture a collector has to persist."""
@@ -537,6 +524,18 @@ class BackgroundTaskRegistry:
     async def get_task_by_task_id(self, task_id: str) -> BackgroundTask | None:
         """Alias for get_by_task_id, used by the HTTP layer."""
         return await self.get_by_task_id(task_id)
+
+    async def live_progress(self, task_id: str) -> tuple[int, str | None] | None:
+        """A task's tool calls so far and the one it is in, while its writer
+        runs on this worker; None otherwise.
+
+        Execution context, never status: the ledger alone says whether a task
+        runs. A task registered but not started yet has no progress of its
+        own: a resume keeps the earlier round's counts until it starts."""
+        task = await self.get_by_task_id(task_id)
+        if task is None or task.asyncio_task is None or not task.is_pending:
+            return None
+        return task.total_tool_calls, task.current_tool or None
 
     def get_by_tool_call_id(self, tool_call_id: str) -> BackgroundTask | None:
         """Return the task for a given tool_call_id (synchronous, no lock)."""

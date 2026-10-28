@@ -60,7 +60,7 @@ import {
   watchThread,
   reconnectToWorkflowStream,
   getReportBackStatus,
-  getDispatchLiveness,
+  getHandoffLiveness,
   // Re-exported by the API boundary from ../reportBackSignal — importing them here
   // pins that the boundary surface exposes the decoded signal.
   decodeReportBackSignal,
@@ -144,6 +144,21 @@ describe('ChatAgent API utilities', () => {
       expect(url).toBe('/api/v1/threads');
       expect(body).toEqual({ first_query: 'hi', workspace_id: 'ws-1' });
     });
+
+    it('sends the title a caller names, beside an empty first query', async () => {
+      mockPost.mockResolvedValue({ data: { thread_id: 't-1' } });
+
+      await createThreadWithTitle({ workspaceId: 'ws-1', firstQuery: '', title: 'Getting started' });
+      const [, body] = mockPost.mock.calls[0];
+      expect(body).toEqual({ first_query: '', title: 'Getting started', workspace_id: 'ws-1' });
+    });
+
+    it("stores the thread's own effort and fast mode only when picked", async () => {
+      mockPost.mockResolvedValue({ data: { thread_id: 't-1' } });
+
+      await createThreadWithTitle({ workspaceId: 'ws-1', firstQuery: 'hi', reasoningEffort: 'high', fastMode: false });
+      expect(mockPost.mock.calls[0][1]).toMatchObject({ reasoning_effort: 'high', fast_mode: false });
+    });
   });
 
   describe('createWorkspace', () => {
@@ -172,6 +187,16 @@ describe('ChatAgent API utilities', () => {
 
       await deleteWorkspace('  ws-123  ');
       expect(mockDelete).toHaveBeenCalledWith('/api/v1/workspaces/ws-123');
+    });
+
+    it('asks for the folder to go only when told to', async () => {
+      mockDelete.mockResolvedValue({});
+
+      await deleteWorkspace('ws-123', { deleteFiles: true });
+      expect(mockDelete).toHaveBeenLastCalledWith('/api/v1/workspaces/ws-123', { params: { delete_files: true } });
+
+      await deleteWorkspace('ws-123', { deleteFiles: false });
+      expect(mockDelete).toHaveBeenLastCalledWith('/api/v1/workspaces/ws-123');
     });
   });
 
@@ -949,30 +974,48 @@ describe('ChatAgent API utilities', () => {
     });
   });
 
-  describe('getDispatchLiveness', () => {
-    it('resolves to [] for an empty id list WITHOUT issuing a request', async () => {
-      const res = await getDispatchLiveness([]);
-      expect(res).toEqual([]);
+  describe('getHandoffLiveness', () => {
+    it('asks for threads, runs and steers in one request, leaving out an empty kind', async () => {
+      mockGet.mockResolvedValueOnce({
+        data: { liveness: [{ thread_id: 't-1' }], runs: [{ run_id: 'r-1' }], steers: [{ steer_id: 's-1' }] },
+      });
+      const res = await getHandoffLiveness({ threads: ['t-1'], runs: ['r-1'], steers: ['s-1'] });
+      expect(mockGet).toHaveBeenCalledWith('/api/v1/threads/dispatches/liveness', { params: { ids: 't-1', runs: 'r-1', steers: 's-1' } });
+      expect(res).toEqual({ liveness: [{ thread_id: 't-1' }], runs: [{ run_id: 'r-1' }], steers: [{ steer_id: 's-1' }] });
+
+      mockGet.mockResolvedValueOnce({ data: { liveness: [] } });
+      // A server from before runs and steers answers without the keys.
+      expect(await getHandoffLiveness({ threads: [], runs: ['r-1'], steers: [] })).toEqual({ liveness: [], runs: [], steers: [] });
+      expect(mockGet).toHaveBeenLastCalledWith('/api/v1/threads/dispatches/liveness', { params: { runs: 'r-1' } });
+    });
+
+    it('makes no request when nothing is asked', async () => {
+      expect(await getHandoffLiveness({ threads: [], runs: [], steers: [] })).toEqual({ liveness: [], runs: [], steers: [] });
       expect(mockGet).not.toHaveBeenCalled();
     });
 
-    it('resolves to [] when the response body omits `liveness`, joining ids comma-separated', async () => {
-      // Null-safe extraction: a body without the `liveness` key must not throw.
-      mockGet.mockResolvedValueOnce({ data: {} });
-      const res = await getDispatchLiveness(['t-1', 't-2']);
-      expect(res).toEqual([]);
-      expect(mockGet).toHaveBeenCalledWith('/api/v1/threads/dispatches/liveness', {
-        params: { ids: 't-1,t-2' },
-      });
-    });
-
-    it('reads more ids than the route takes in batches it does', async () => {
+    it('reads more thread ids than the route takes in batches it does', async () => {
       const ids = Array.from({ length: 150 }, (_, i) => `t-${i}`);
       mockGet.mockImplementation((_url: string, { params }: { params: { ids: string } }) =>
         Promise.resolve({ data: { liveness: params.ids.split(',').map((thread_id) => ({ thread_id })) } }));
-      const res = await getDispatchLiveness(ids);
+      const res = await getHandoffLiveness({ threads: ids, runs: [], steers: [] });
       expect(mockGet.mock.calls.map(([, { params }]) => params.ids.split(',').length)).toEqual([100, 50]);
-      expect(res.map((row) => row.thread_id)).toEqual(ids);
+      expect(res.liveness.map((row) => row.thread_id)).toEqual(ids);
+    });
+
+    it('answers with no rows when the body omits them', async () => {
+      mockGet.mockResolvedValueOnce({ data: {} });
+      expect(await getHandoffLiveness({ threads: ['t-1', 't-2'], runs: [], steers: [] })).toEqual({ liveness: [], runs: [], steers: [] });
+      expect(mockGet).toHaveBeenCalledWith('/api/v1/threads/dispatches/liveness', { params: { ids: 't-1,t-2' } });
+    });
+
+    it('batches each kind to what the route takes', async () => {
+      const runs = Array.from({ length: 120 }, (_, i) => `r-${i}`);
+      mockGet.mockImplementation((_url: string, { params }: { params: { ids?: string; runs?: string } }) =>
+        Promise.resolve({ data: { liveness: [], runs: (params.runs ?? '').split(',').filter(Boolean).map((run_id) => ({ run_id })) } }));
+      const res = await getHandoffLiveness({ threads: ['t-1'], runs, steers: [] });
+      expect(mockGet.mock.calls.map(([, { params }]) => [params.ids, params.runs?.split(',').length])).toEqual([['t-1', 100], [undefined, 20]]);
+      expect(res.runs.map((row) => row.run_id)).toEqual(runs);
     });
   });
 

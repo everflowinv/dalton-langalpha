@@ -492,7 +492,9 @@ async def test_delete_workspace_soft(ws_mock_db, mock_cursor):
     """delete_workspace (soft) updates status to 'deleted'."""
     from src.server.database.workspace import delete_workspace
 
-    mock_cursor.fetchone.return_value = {"workspace_id": "ws-1", "user_id": "user-1", "busy": False}
+    mock_cursor.fetchone.return_value = {
+        "workspace_id": "ws-1", "user_id": "user-1", "busy": False, "moving": False,
+    }
 
     deleted = await delete_workspace("ws-1")
 
@@ -506,13 +508,69 @@ async def test_delete_workspace_soft(ws_mock_db, mock_cursor):
     assert "folder_cleanup_pending" in sql
 
 
+def _delete_update(mock_cursor):
+    return next(
+        call.args for call in mock_cursor.execute.call_args_list
+        if "UPDATE workspaces" in call.args[0]
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("keep", [False, True])
+async def test_a_delete_marks_the_folder_kept_or_queued_never_both(
+    ws_mock_db, mock_cursor, keep
+):
+    """The reaper removes what is queued and the settle keeps what is kept, so
+    a row carrying both from an earlier delete would be decided twice."""
+    from src.server.database.workspace import delete_workspace
+
+    mock_cursor.fetchone.return_value = {
+        "workspace_id": "ws-1", "user_id": "user-1", "computer_id": "comp-a",
+        "busy": False, "moving": False,
+    }
+
+    assert await delete_workspace("ws-1", bound_to="comp-a", keep_folder=keep)
+
+    sql, params = _delete_update(mock_cursor)
+    assert params["keep"] is keep
+    kept_branch, queued_branch = sql.split("WHEN %(keep)s")[1].split("ELSE")[:2]
+    assert "#- '{folder_cleanup_pending}'" in kept_branch
+    assert "'{folder_kept}'" in kept_branch
+    assert "#- '{folder_kept}'" in queued_branch
+    assert "'{folder_cleanup_pending}'" in queued_branch
+
+
+@pytest.mark.asyncio
+async def test_a_delete_is_refused_once_the_workspace_moved_elsewhere(
+    ws_mock_db, mock_cursor
+):
+    """Whether the folder stays was decided for the computer the caller saw;
+    on another one the same choice could delete files its owner kept."""
+    from src.server.database.workspace import WorkspaceBusyError, delete_workspace
+
+    mock_cursor.fetchone.return_value = {
+        "workspace_id": "ws-1", "user_id": "user-1", "computer_id": "comp-b",
+        "busy": False, "moving": False,
+    }
+
+    with pytest.raises(WorkspaceBusyError):
+        await delete_workspace("ws-1", bound_to="comp-a", keep_folder=True)
+
+    assert not any(
+        "UPDATE workspaces" in call.args[0]
+        for call in mock_cursor.execute.call_args_list
+    )
+
+
 @pytest.mark.asyncio
 async def test_delete_workspace_never_removes_the_row(ws_mock_db, mock_cursor):
     """A removed row takes the layout owner's identity with it, and migration
     046's ON DELETE SET NULL then leaves its folder owned by nobody."""
     from src.server.database.workspace import delete_workspace
 
-    mock_cursor.fetchone.return_value = {"workspace_id": "ws-1", "user_id": "user-1", "busy": False}
+    mock_cursor.fetchone.return_value = {
+        "workspace_id": "ws-1", "user_id": "user-1", "busy": False, "moving": False,
+    }
 
     await delete_workspace("ws-1")
 
@@ -682,7 +740,9 @@ async def test_a_soft_delete_leaves_the_machine_alone(ws_mock_db, mock_cursor):
     share one, and the teardown belongs where the sandbox is destroyed."""
     from src.server.database.workspace import delete_workspace, update_workspace_status
 
-    mock_cursor.fetchone.return_value = {"workspace_id": "ws-1", "user_id": "user-1", "busy": False}
+    mock_cursor.fetchone.return_value = {
+        "workspace_id": "ws-1", "user_id": "user-1", "busy": False, "moving": False,
+    }
     await delete_workspace("ws-1")
     assert "computers" not in mock_cursor.execute.call_args[0][0]
 
@@ -719,6 +779,33 @@ async def test_the_activity_stamp_moves_both_rows_on_their_own_cooldowns(
     sql = _one_write_through_statement(mock_cursor)
     assert sql.count("INTERVAL '60 seconds'") == 2
     assert "c.last_activity_at IS NULL" in sql
+
+
+def _shadow_set(sql: str) -> str:
+    shadow = sql[sql.index("shadow AS") :]
+    return shadow[shadow.index("SET") : shadow.index("FROM")]
+
+
+@pytest.mark.asyncio
+async def test_only_the_workspace_s_own_use_moves_it_in_the_gallery(
+    ws_mock_db, mock_cursor
+):
+    """The gallery orders by updated_at. A machine write reaches every folder
+    on the computer, and stamping them all gave them one timestamp after each
+    idle stop; the workspace's own activity is what should move it."""
+    from src.server.database.workspace import (
+        update_workspace_activity,
+        update_workspace_status,
+    )
+
+    mock_cursor.fetchone.return_value = _workspace_row(status="stopped")
+    await update_workspace_status("ws-1", "stopped")
+    assert "updated_at" not in _shadow_set(_one_write_through_statement(mock_cursor))
+
+    mock_cursor.execute.reset_mock()
+    mock_cursor.fetchone.return_value = {"stamped": 1}
+    await update_workspace_activity("ws-1")
+    assert "updated_at = %(now)s" in _shadow_set(_one_write_through_statement(mock_cursor))
 
 
 @pytest.mark.asyncio

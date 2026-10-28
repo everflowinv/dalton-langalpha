@@ -15,7 +15,7 @@ import { MIN_COOLDOWN_MINUTES, isIndexSymbol, isPctCondition, isValidSymbol, nor
 
 // ── Form State ─────────────────────────────────────────────
 
-/** All workspaces as the form holds it, in the composer's word for that
+/** The Chief of Staff as the form holds it, in the composer's word for that
  *  scope. Only a save turns it into Home's id, so the form never waits on
  *  Home to open. */
 export const ALL_WORKSPACES = 'all' satisfies ComposerScope;
@@ -218,7 +218,7 @@ type Settings = Pick<
 type Trigger = Pick<AutomationUpdatePayload, 'cron_expression' | 'next_run_at' | 'timezone' | 'trigger_config'>;
 
 /** What every save states, whatever starts the automation. `workspaceId` is
- *  where it runs, Home's id for All workspaces. */
+ *  where it runs, Home's id for the Chief of Staff. */
 function settingsPayload(form: FormState, workspaceId: string): Settings {
   return {
     name: form.name,

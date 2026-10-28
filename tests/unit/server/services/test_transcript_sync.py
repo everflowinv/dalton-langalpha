@@ -12,7 +12,10 @@ the checkpoint redo it.
 
 from __future__ import annotations
 
+import json
 import os
+import shlex
+import sys
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -39,6 +42,7 @@ from src.server.services.transcripts import (
     _render,
     _Target,
 )
+from tests.unit.restored_overlay import archive, python3_on_path
 
 ROOT = "/home/workspace"
 LAYOUT = SandboxLayout.for_root(ROOT).for_workspace("research")
@@ -59,7 +63,7 @@ class _Runtime:
         # The delete after the fence is one line; the listing opens with its sweep.
         if "rm -rf" in command and "\n" not in command:
             return SimpleNamespace(stdout="", stderr="", exit_code=self.rm_exit)
-        if "mktemp" in command:
+        if _thread_dirs._SET_ASIDE_END in command:
             return SimpleNamespace(stdout=_thread_dirs._SET_ASIDE_END, exit_code=0)
         return SimpleNamespace(stdout=self.stdout, exit_code=0)
 
@@ -547,8 +551,8 @@ def _thread_reads(monkeypatch, plain: ThreadPrefixes, fenced: ThreadPrefixes | N
 
 def _set_aside(runtime) -> list[str]:
     """The dirs the prune's set-aside script moves, in order."""
-    (script,) = [c for c in runtime.commands if "mktemp" in c]
-    return [line.split(" ")[1] for line in script.splitlines() if line.startswith("move ")]
+    (script,) = [c for c in runtime.commands if _thread_dirs._SET_ASIDE_END in c]
+    return json.loads(shlex.split(script)[-1])["dead"]
 
 
 PRUNED = _thread_dirs._remove_set_aside(LAYOUT)
@@ -671,6 +675,34 @@ async def test_the_set_aside_and_the_removal_run_in_a_real_shell(monkeypatch, tm
 
 
 @pytest.mark.asyncio
+async def test_dead_dirs_a_restored_sandbox_cannot_rename_are_deleted_where_they_are(
+    monkeypatch, tmp_path
+):
+    """Restored from its archive, the sandbox refuses to rename them aside
+    (EXDEV), and ``mv`` would copy them while admission waits."""
+    from pathlib import Path
+
+    layout = SandboxLayout.for_root(str(tmp_path)).for_workspace("My Workspace")
+    for path in (
+        layout.join(D, T1[:8], "keep.txt"),
+        layout.join(D, "33333333", "deep", "a.txt"),
+        layout.join(R, "33333333", "b.txt"),
+    ):
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        Path(path).write_text("x")
+    python3_on_path(monkeypatch, tmp_path / "bin", archive(Path(layout.root)))
+    _thread_reads(monkeypatch, _prefixes(T1[:8]))
+
+    _, pruned = await _thread_dirs.prune_dead_thread_dirs(_Shell(), layout, "ws-1")
+
+    assert pruned
+    assert Path(layout.join(D, T1[:8], "keep.txt")).exists()
+    assert not Path(layout.join(D, "33333333")).exists()
+    assert not Path(layout.join(R, "33333333")).exists()
+    assert not list(Path(layout.agents).glob(".pruned.*"))
+
+
+@pytest.mark.asyncio
 async def test_what_an_earlier_prune_could_not_delete_goes_with_the_next_listing(
     monkeypatch, tmp_path
 ):
@@ -720,7 +752,6 @@ async def test_a_set_aside_that_stalls_past_its_deadline_moves_nothing_more(
 ):
     """Started in time is not enough: a stalled exec runs on once the fence
     is gone, so each move looks at the clock again."""
-    import shutil
     from pathlib import Path
 
     layout = SandboxLayout.for_root(str(tmp_path)).for_workspace("My Workspace")
@@ -730,13 +761,16 @@ async def test_a_set_aside_that_stalls_past_its_deadline_moves_nothing_more(
         path.write_text("x")
     # The clock reads true for the start check and the first move, then
     # jumps past the deadline, as it would after a stall.
-    bin_dir, calls = tmp_path / "bin", tmp_path / "date-calls"
-    bin_dir.mkdir()
-    (bin_dir / "date").write_text(
-        f'#!/bin/sh\nn=$(cat {calls} 2>/dev/null || echo 0)\necho $((n + 1)) > {calls}\n'
-        f'[ "$n" -lt 2 ] && exec {shutil.which("date")} "$@"\necho 9999999999\n'
+    clock = (
+        "import itertools, time; _now, _n = time.time, itertools.count(1); "
+        "time.time = lambda: _now() if next(_n) <= 2 else 9999999999.0"
     )
-    (bin_dir / "date").chmod(0o755)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "python3").write_text(
+        f'#!/bin/sh\ncode=$3; shift 3\nexec {sys.executable} -I -c "{clock}; $code" "$@"\n'
+    )
+    (bin_dir / "python3").chmod(0o755)
     monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
     _thread_reads(monkeypatch, _prefixes(T1[:8]))
 
@@ -775,7 +809,7 @@ async def test_the_fence_outlasts_a_set_aside_that_may_still_be_running(monkeypa
 
     class _Failing(_Runtime):
         async def exec(self, command, timeout=60):
-            if "mktemp" not in command:
+            if _thread_dirs._SET_ASIDE_END not in command:
                 return await super().exec(command, timeout)
             if ending == "raised":
                 raise ConnectionError("exec stream closed")
@@ -825,7 +859,7 @@ async def test_a_deleted_threads_dirs_leave_a_running_machine(monkeypatch):
         assert sandbox_id == "sb-1"
         yield runtime
 
-    manager = SimpleNamespace(_computer_runtime=computer_runtime)
+    manager = SimpleNamespace(computer_runtime=computer_runtime)
     monkeypatch.setattr(
         _bringup,
         "get_computer_for_workspace",

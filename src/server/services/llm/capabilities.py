@@ -16,6 +16,52 @@ from . import logger
 TierPermits = Callable[[int], Awaitable[bool]]
 
 
+class PlanTier:
+    """The turn's ``TierPermits``: one polarity for every plan gate. OSS
+    deployments are never gated; platform users must meet the min tier.
+
+    ``ChatAuthResult.access_tier`` is -1 for BYOK/OAuth users, so the true
+    tier is read here, lazily and Redis-cached, once per turn.
+    """
+
+    def __init__(self, user_id: str) -> None:
+        self._user_id = user_id
+        self._read = False
+        self._tier: int | None = None
+
+    async def tier(self) -> int | None:
+        """The user's tier; None when the platform has given no answer, which
+        is an outage, not a plan."""
+        if not self._read:
+            from src.server.dependencies.usage_limits import _fetch_platform_tier
+
+            self._tier = await _fetch_platform_tier(self._user_id)
+            self._read = True
+        return self._tier
+
+    async def refresh(self) -> None:
+        """Ask the platform again, past its cache: for a refusal, which should
+        not rest on a plan the user may have changed minutes ago. Every refusal
+        asks, as every admitted turn asks the credit check, so two at once each
+        see the new plan; the outage pause still holds."""
+        from src.server.dependencies.usage_limits import _fetch_platform_tier
+
+        self._tier = await _fetch_platform_tier(self._user_id, recheck=True)
+        self._read = True
+
+    async def __call__(self, min_tier: int) -> bool:
+        from src.server.dependencies.usage_limits import platform_gating_active
+
+        # A deployment with no platform to ask has no plans, rather than every
+        # user on the no-access tier.
+        if not platform_gating_active():
+            return True
+        tier = await self.tier()
+        # Unknown gates as no plan: the turn loses a capability for the
+        # outage, not its answer.
+        return (-1 if tier is None else tier) >= min_tier
+
+
 @dataclass(frozen=True)
 class SearchGate:
     """The search provider and depth to run, and why a set one was not.
@@ -83,32 +129,17 @@ async def gate_search(
     return SearchGate(chosen, inherited, provider_fallback, "not_on_plan")
 
 
-async def gate_capabilities(config, user_id: str, model_pref: dict) -> TierPermits:
+async def gate_capabilities(
+    config, user_id: str, model_pref: dict, permits: TierPermits | None = None
+) -> TierPermits:
     """Apply the user's search and crawl preferences, each behind its manifest tier.
 
     Resolve time is the enforcement point, so a stale preference left by a
     downgraded plan is ignored at consumption rather than trusted from storage.
-    Returns the tier check it used, so the rest of the turn's gates share its
-    one tier fetch.
+    Returns the tier check it used, ``permits`` when given, so the rest of the
+    turn's gates share its one tier fetch.
     """
-    from src.config.settings import HOST_MODE
-
-    is_platform = HOST_MODE == "platform"
-    user_tier: int | None = None
-
-    async def _tier_permits(min_tier: int) -> bool:
-        """One polarity for every capability gate: OSS/BYOK deployments are
-        never gated; platform users must meet the manifest min tier."""
-        nonlocal user_tier
-        if not is_platform:
-            return True
-        if user_tier is None:
-            # ChatAuthResult.access_tier is -1 for BYOK/OAuth users, so the
-            # true tier is resolved here — lazily, Redis-cached, once per turn.
-            from src.server.dependencies.usage_limits import _fetch_platform_tier
-
-            user_tier = await _fetch_platform_tier(user_id)
-        return user_tier >= min_tier
+    _tier_permits = permits or PlanTier(user_id)
 
     # The pair the search tool will run, so a depth the provider lacks reads
     # as the provider's own wherever the main agent's settings are shown.

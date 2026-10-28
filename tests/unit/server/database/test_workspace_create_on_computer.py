@@ -20,6 +20,7 @@ import pytest
 from psycopg.errors import UniqueViolation
 
 from src.server.database import workspace as W
+from src.server.database.sql_fences import FENCE_TAKES_WORKSPACES
 
 COMPUTER_ID = "11111111-1111-4111-8111-111111111111"
 WORKSPACE_ID = "22222222-2222-4222-8222-222222222222"
@@ -160,6 +161,25 @@ class TestTheStatement:
     async def test_a_tombstoned_computer_creates_nothing(self, db):
         await W.create_workspace_on_computer("user-1", "Research", COMPUTER_ID)
         assert "status <> 'deleted'" in _sql(db)
+
+    @pytest.mark.asyncio
+    async def test_a_computer_being_retired_creates_nothing(self, db):
+        """Its retirement read it empty, and a workspace landing after the
+        marker would go down with the tombstone. The fence sits in the share
+        locked read, which the marker's write waits on or is seen by."""
+        await W.create_workspace_on_computer("user-1", "Research", COMPUTER_ID)
+        sql = _sql(db)
+        assert FENCE_TAKES_WORKSPACES in sql
+        assert sql.index(FENCE_TAKES_WORKSPACES) < sql.index("FOR SHARE")
+
+    @pytest.mark.asyncio
+    async def test_a_bind_onto_a_computer_being_retired_binds_nothing(self, db):
+        await W.bind_workspace_to_computer(
+            WORKSPACE_ID, COMPUTER_ID, expected_computer_id=None
+        )
+        sql = _sql(db)
+        assert FENCE_TAKES_WORKSPACES in sql
+        assert sql.index(FENCE_TAKES_WORKSPACES) < sql.index("FOR SHARE")
 
     @pytest.mark.asyncio
     async def test_a_vanished_computer_returns_none_rather_than_raising(self, db):
@@ -381,9 +401,67 @@ class TestAdoptingTheMachinesSandbox:
         assert "w.status <> comp.status" in sql
 
     @pytest.mark.asyncio
+    async def test_a_repair_leaves_the_gallery_order_alone(self, db):
+        """The gallery orders by updated_at, and this reaches every sibling on
+        the machine; stamping them would give them all one moment."""
+        db.fetchall = AsyncMock(return_value=[])
+        await W.adopt_computer_sandbox_into_workspaces(COMPUTER_ID)
+        assert "updated_at" not in _sql(db)
+
+    @pytest.mark.asyncio
     async def test_an_unbound_home_is_out_of_reach_of_the_repair(self, db):
         """An unbound Home has no machine; handing it one of these shadows
         would invent a sandbox it never asked for."""
         db.fetchall = AsyncMock(return_value=[])
         await W.adopt_computer_sandbox_into_workspaces(COMPUTER_ID)
         assert "w.status NOT IN ('deleted', 'unbound')" in _sql(db)
+
+
+class TestDuplicateOwesItsRestore:
+    @pytest.mark.asyncio
+    async def test_the_copy_owes_its_files_in_the_transaction_that_publishes_it(
+        self, db
+    ):
+        """On a machine its owner brought, a folder without its files is
+        otherwise offered to the owner, who never removed anything from it."""
+        events = []
+        created = {"workspace_id": "ws-copy"}
+        with (
+            patch.object(
+                W,
+                "create_workspace_on_computer",
+                AsyncMock(side_effect=lambda *_a, **_k: events.append("create") or created),
+            ),
+            patch(
+                "src.server.database.workspace_file.copy_workspace_files",
+                AsyncMock(side_effect=lambda *_a, **_k: events.append("copy")),
+            ),
+            patch.object(
+                W,
+                "set_files_restore_incomplete",
+                AsyncMock(side_effect=lambda *_a, **_k: events.append("owed") or True),
+            ) as owed,
+        ):
+            assert await W.duplicate_workspace_on_computer(
+                "ws-source", "user-1", "Copy", COMPUTER_ID
+            ) is created
+
+        assert events == ["create", "copy", "owed"]
+        assert owed.await_args.args == ("ws-copy", True)
+        assert owed.await_args.kwargs["conn"] is not None
+
+
+class TestRestoreOfferSettle:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("restore", [True, False], ids=["restore", "keep"])
+    async def test_either_answer_is_a_new_arrival_of_the_files(self, db, restore):
+        """Every worker that attached the folder while the offer stood attaches
+        it again, laying the restore owed or queuing the bring-up held back,
+        rather than only the worker that took the answer."""
+        db.rowcount = 1
+        assert await W.settle_files_restore_offer("ws-1", restore=restore)
+
+        sql = _sql(db)
+        assert "files_epoch = gen_random_uuid()" in sql
+        assert ("files_restore_incomplete_at" in sql) is restore
+        assert "files_restore_offered_at IS NOT NULL" in sql

@@ -69,7 +69,7 @@ describe('useComputerActions', () => {
 
   it.each([
     ['rename', (a: ReturnType<typeof useComputerActions>) => a.rename.mutateAsync({ computerId: ID, name: 'Beta' })],
-    ['always-on', (a: ReturnType<typeof useComputerActions>) => a.alwaysOn.mutateAsync({ computerId: ID, enabled: true })],
+    ['always-on', (a: ReturnType<typeof useComputerActions>) => a.turnOffAlwaysOn.mutateAsync({ computerId: ID })],
   ])('%s refreshes the rows and leaves the storage breakdown alone', async (_name, run) => {
     const client = seeded();
     const { result } = renderHookWithProviders(() => useComputerActions(), { queryClient: client });

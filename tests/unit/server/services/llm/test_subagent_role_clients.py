@@ -221,3 +221,80 @@ async def test_a_set_effort_follows_the_subagent_onto_the_main_model(ladder, cre
     assert (client.model, client.effort) == (MAIN, "high")
     # No set effort and no own key: no copy of a main client to hand it.
     assert "subagent:untuned" not in config.subsidiary_llm_clients
+
+
+# ---------------------------------------------------------------------------
+# The model each subagent runs, as its runs record it
+# ---------------------------------------------------------------------------
+
+
+_ENTRIES = {
+    MAIN: {"model_id": "main-v1", "provider": "deepseek"},
+    "main-model-oauth": {"model_id": "main-v1", "provider": "claude-oauth"},
+    "sub-model": {"model_id": "sub-v1", "provider": "z-ai-cn"},
+    "my-proxy-model": {"model_id": "sub-v1", "provider": "my-proxy"},
+}
+
+
+def _client(manifest_model: str) -> SimpleNamespace:
+    return SimpleNamespace(metadata={"manifest_model": manifest_model})
+
+
+@pytest.fixture
+def entries(monkeypatch):
+    monkeypatch.setattr(
+        "src.server.services.llm.subagents.user_models.model_entry",
+        lambda _pref, name: _ENTRIES.get(name),
+    )
+
+
+@pytest.mark.usefixtures("entries")
+@pytest.mark.parametrize(
+    ("pin", "client", "expected"),
+    [
+        # Its own client on another model: news.
+        ("sub-model", _client("sub-model"), {"id": "sub-model", "provider": "z-ai-cn"}),
+        # A pin with no key of its own runs a copy of the main client.
+        ("sub-model", _client(MAIN), None),
+        # An effort alone is the turn's model at that effort.
+        (None, _client(MAIN), None),
+        # The turn's model on another route is still the model the user picked.
+        ("main-model-oauth", _client("main-model-oauth"), None),
+        # No client: the compiler hands the pin over by name.
+        ("sub-model", None, {"id": "sub-model", "provider": "z-ai-cn"}),
+        # Inherit: the main agent's own model.
+        (None, None, None),
+    ],
+)
+def test_a_subagent_records_its_model_only_when_it_is_not_the_turns(pin, client, expected):
+    from src.server.services.llm.subagents import subagent_models
+
+    defn = SubagentDefinition(name="desk", description="", model=pin)
+    config = SimpleNamespace(
+        subagents=SimpleNamespace(
+            resolved=ResolvedSubagents(definitions={"desk": defn}, enabled=("desk",))
+        ),
+        subsidiary_llm_clients={"subagent:desk": client} if client else {},
+    )
+
+    models = subagent_models(config, {}, MAIN)
+
+    assert models == ({"desk": expected} if expected else {})
+
+
+@pytest.mark.usefixtures("entries")
+def test_a_users_own_provider_records_the_catalog_provider_it_is_a_variant_of():
+    from src.server.services.llm.subagents import subagent_models
+
+    defn = SubagentDefinition(name="desk", description="", model="my-proxy-model")
+    config = SimpleNamespace(
+        subagents=SimpleNamespace(
+            resolved=ResolvedSubagents(definitions={"desk": defn}, enabled=("desk",))
+        ),
+        subsidiary_llm_clients={"subagent:desk": _client("my-proxy-model")},
+    )
+    pref = {"custom_providers": [{"name": "my-proxy", "parent_provider": "openai"}]}
+
+    assert subagent_models(config, pref, MAIN) == {
+        "desk": {"id": "my-proxy-model", "provider": "openai"}
+    }

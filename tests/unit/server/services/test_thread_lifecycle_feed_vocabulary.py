@@ -29,6 +29,7 @@ LIFECYCLE_TYPES = {
     "thread_title",
     "thread_pinned",
     "thread_subagents",
+    "thread_tuning",
     "thread_deleted",
     "thread_archived",
     "thread_unarchived",

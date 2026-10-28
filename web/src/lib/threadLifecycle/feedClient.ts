@@ -205,6 +205,8 @@ function onFeedEvent(raw: Record<string, unknown>): void {
     title?: string | null;
     pinned?: boolean | null;
     subagents_allowed?: boolean | null;
+    reasoning_effort?: string | null;
+    fast_mode?: boolean | null;
     updated_at?: string | null;
   };
   switch (evt.type) {
@@ -274,6 +276,26 @@ function onFeedEvent(raw: Record<string, unknown>): void {
         // until one lands; a thread no view has open has no query to read.
         const reading = qc.isFetching({ queryKey: key }) > 0;
         if (reading || !cached || (cached.subagents_allowed ?? null) !== evt.subagents_allowed) {
+          const saving = qc.isMutating({ mutationKey: threadFieldMutationKey(evt.thread_id) }) > 0;
+          void qc.invalidateQueries({ queryKey: key, ...(saving ? { refetchType: 'none' as const } : {}) });
+        }
+      }
+      return;
+    }
+    // The thread's own effort or fast mode changed, here or in another tab.
+    // Read again rather than patched, and only marked while a save there is
+    // out, for the reasons `thread_subagents` gives.
+    case 'thread_tuning': {
+      const qc = getLifecycleQueryClient();
+      // null is a value for both: the thread went back to following Settings.
+      if (qc && evt.thread_id && evt.reasoning_effort !== undefined && evt.fast_mode !== undefined) {
+        const key = queryKeys.threads.detail(evt.thread_id);
+        const cached = qc.getQueryData<Thread>(key);
+        const reading = qc.isFetching({ queryKey: key }) > 0;
+        const agrees = !!cached
+          && (cached.reasoning_effort ?? null) === evt.reasoning_effort
+          && (cached.fast_mode ?? null) === evt.fast_mode;
+        if (reading || !agrees) {
           const saving = qc.isMutating({ mutationKey: threadFieldMutationKey(evt.thread_id) }) > 0;
           void qc.invalidateQueries({ queryKey: key, ...(saving ? { refetchType: 'none' as const } : {}) });
         }

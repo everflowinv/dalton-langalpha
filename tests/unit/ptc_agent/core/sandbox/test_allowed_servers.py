@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import shlex
 from unittest.mock import AsyncMock, patch
 
@@ -21,7 +22,6 @@ from ptc_agent.config.core import (
 )
 from ptc_agent.core.sandbox import mcp_client_runtime as client
 from ptc_agent.core.sandbox.runtime import (
-    CodeRunResult,
     ExecResult,
     SandboxProvider,
     SandboxRuntime,
@@ -107,7 +107,6 @@ def runtime():
     fake.working_dir = WORK_DIR
     fake.fetch_working_dir = AsyncMock(return_value=WORK_DIR)
     fake.exec = AsyncMock(return_value=ExecResult("", "", 0))
-    fake.code_run = AsyncMock(return_value=CodeRunResult("out", "", 0, []))
     fake.upload_file = AsyncMock()
     return fake
 
@@ -133,22 +132,13 @@ def sandbox(runtime):
     return box
 
 
-def _exports(command: str) -> dict[str, str]:
-    """``export K=V`` pairs a shell command sets, through a ``bash -c`` wrapper."""
-    tokens = shlex.split(command)
-    if tokens[:2] == ["bash", "-c"]:
-        tokens = shlex.split(tokens[2])
-    return dict(
-        tokens[i + 1].split("=", 1) for i, t in enumerate(tokens[:-1]) if t == "export"
-    )
-
-
-def _shell_exports(runtime, background: bool) -> list[dict[str, str]]:
-    if background:
-        sent = [c.args[1] for c in runtime.session_execute.await_args_list]
-    else:
-        sent = [c.args[0] for c in runtime.exec.await_args_list]
-    return [_exports(c) for c in sent if "MCP_TRACE_FILE" in c]
+def _launch_env(runtime) -> dict[str, str]:
+    """What a job's wrapper starts with: the launch's export, before its exec."""
+    (script, *_) = [
+        c.args[0] for c in runtime.exec.await_args_list if "MCP_TRACE_FILE=" in c.args[0]
+    ]
+    words = re.search(r"\( export ([^;]*); exec ", script).group(1)
+    return dict(word.split("=", 1) for word in shlex.split(words))
 
 
 LIMITS = [
@@ -170,16 +160,13 @@ class TestTheExport:
 
         await tool.ainvoke({"code": "print(1)"})
 
-        env = runtime.code_run.await_args.kwargs["env"]
-        assert env.get(ENV) == exported
+        assert _launch_env(runtime).get(ENV) == exported
 
-    @pytest.mark.parametrize("background", [False, True], ids=["foreground", "background"])
     @pytest.mark.parametrize(("allowed", "exported"), LIMITS, ids=LIMIT_IDS)
     @pytest.mark.asyncio
-    async def test_bash(self, sandbox, runtime, allowed, exported, background):
+    async def test_bash(self, sandbox, runtime, allowed, exported):
         tool = create_execute_bash_tool(SandboxBackend(sandbox), allowed_servers=allowed)
 
-        await tool.ainvoke({"command": "pwd", "run_in_background": background})
+        await tool.ainvoke({"command": "pwd"})
 
-        (exports,) = _shell_exports(runtime, background)
-        assert exports.get(ENV) == exported
+        assert _launch_env(runtime).get(ENV) == exported

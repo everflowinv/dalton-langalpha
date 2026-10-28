@@ -15,7 +15,7 @@
  */
 import React from 'react';
 import type { FeedbackResult, SubagentInfo } from './types';
-import type { ToolApprovalPosition } from '@/types/chat';
+import type { PTCAgentProposalState, ToolApprovalPosition } from '@/types/chat';
 import type { OpenFileHandler } from '../../utils/fileLocation';
 import type { ChartTabSpec } from '../filePanel/types';
 import type { EditDraftStore } from '../../hooks/utils/editDrafts';
@@ -31,6 +31,10 @@ export interface MessageActions {
    *  re-asserts its own position on every content growth, which a fanning deck
    *  produces on every frame. Its absence just means the deck does not scroll. */
   onRevealFiles?: (messageId: string) => void;
+  /** Brings a message into view and focus, for a link to it further on: a
+   *  hand-off's report. Through the host's scroll controller for the reason
+   *  above. False when the message is not drawn, so the link can go elsewhere. */
+  onRevealMessage?: (messageId: string) => boolean;
   /** Saves a workspace file to disk. Separate from `onOpenFile` because a host
    *  may grant reading without granting download: a copy-link share does. Its
    *  absence is what hides the deliverable card's Download item. */
@@ -50,8 +54,8 @@ export interface MessageActions {
   onRejectCreateWorkspace?: (proposalData: Record<string, unknown>) => void;
   onApproveStartQuestion?: (proposalData: Record<string, unknown>) => void;
   onRejectStartQuestion?: (proposalData: Record<string, unknown>) => void;
-  onApprovePTCAgent?: (proposalData: Record<string, unknown>, overrides: { report_back?: boolean } | undefined, proposalId: string, interruptId: string) => void;
-  onRejectPTCAgent?: (proposalData: Record<string, unknown>, proposalId: string, interruptId: string) => void;
+  onApprovePTCAgent?: (proposal: PTCAgentProposalState, overrides: { report_back?: boolean } | undefined, proposalId: string, interruptId: string) => void;
+  onRejectPTCAgent?: (proposal: PTCAgentProposalState, proposalId: string, interruptId: string) => void;
   onApproveSecretaryAction?: (proposalData: Record<string, unknown>) => void;
   onRejectSecretaryAction?: (proposalData: Record<string, unknown>) => void;
   onResumeCreditPause?: (pauseId: string, interruptId: string) => void;
@@ -72,7 +76,6 @@ export interface MessageActions {
    *  continuation rates the turn it continues. MessageList supplies the index. */
   onThumbUp?: (turnIndex: number) => Promise<FeedbackResult | null>;
   onThumbDown?: (turnIndex: number, issueCategories: string[], comment: string | null, consentHumanReview: boolean) => Promise<FeedbackResult | null>;
-  onReportWithAgent?: (instruction: string) => void;
   onWidgetSendPrompt?: (text: string) => void;
 }
 

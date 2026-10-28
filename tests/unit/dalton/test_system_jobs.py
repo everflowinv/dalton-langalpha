@@ -8,6 +8,7 @@ import os
 import subprocess
 from contextlib import asynccontextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import create_autospec
 
@@ -1889,7 +1890,24 @@ def test_plugins_config_and_sandbox_env_exclude_bridge_admin_token(
     assert admin_secret in (by_name["leak_url_srv"].url or "")
     assert any(admin_secret in str(a) for a in by_name["leak_args_srv"].args)
 
+    class _TrustedProvider:
+        # B3's builder gates the deployment env on provider trust; the stub
+        # host is trusted so the token paths under test run.
+        @staticmethod
+        def trusted_host(config):
+            return True
+
     sandbox_stub = create_autospec(PTCSandbox, instance=True)
+    sandbox_stub.provider = _TrustedProvider()
+    # The real builder delegates to _deployment_env_vars off the instance;
+    # on the autospec stub that dispatch would hit a mock, so delegate back.
+    sandbox_stub._deployment_env_vars.side_effect = (
+        lambda bindings: PTCSandbox._deployment_env_vars(sandbox_stub, bindings)
+    )
+    # Upstream's env-var build now consults self.config for platform-secret
+    # withholding; a Docker provider never withholds, which keeps this test on
+    # the plain Dalton (oss) path.
+    sandbox_stub.config = SimpleNamespace(sandbox=SimpleNamespace(provider="docker"))
     sandbox_stub._token_file_path = "/home/workspace/.ginlix_token"
     sandbox_stub._builtin_servers.return_value = loaded_servers
 
@@ -1936,6 +1954,252 @@ def test_plugins_config_and_sandbox_env_exclude_bridge_admin_token(
     assert env_when_unset.get("SAFE_VAR") == "safe-value"
     assert all(s.enabled is True for s in clean_loaded)
     assert "enabled" not in cfg_when_unset["servers"]["clean_mcp_srv"]
+
+
+def test_sandbox_env_vars_never_resolve_admin_token_placeholders(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Lock the merged env-var loop in ``PTCSandbox._build_sandbox_env_vars``:
+    an *unexpanded* ``${DALTON_BRIDGE_ADMIN_TOKEN}`` / ``${INTERNAL_SERVICE_TOKEN}``
+    reference under any config key must never resolve into the sandbox env,
+    while bridge URLs (``DALTON_RESEARCHDATA_URL`` etc.) still do — on both the
+    Dalton oss path and upstream's platform-secret withholding path."""
+    from ptc_agent.config.core import MCPServerConfig
+    from ptc_agent.core.sandbox.ptc_sandbox import PTCSandbox
+
+    admin_secret = "admin-placeholder-secret"
+    monkeypatch.setenv("DALTON_BRIDGE_ADMIN_TOKEN", admin_secret)
+    monkeypatch.setenv("INTERNAL_SERVICE_TOKEN", "internal-platform-secret")
+    monkeypatch.setenv("DALTON_RESEARCHDATA_URL", "http://host.docker.internal:8960")
+    monkeypatch.setenv("DALTON_BRIDGE_TOKEN", "mcp-token-ok")
+
+    servers = [
+        MCPServerConfig(
+            name="stdio_srv",
+            transport="stdio",
+            command="python3",
+            env={
+                "DALTON_RESEARCHDATA_URL": "${DALTON_RESEARCHDATA_URL}",
+                "DALTON_BRIDGE_TOKEN": "${DALTON_BRIDGE_TOKEN}",
+                "RENAMED_ADMIN": "${DALTON_BRIDGE_ADMIN_TOKEN}",
+                "RENAMED_INTERNAL": "${INTERNAL_SERVICE_TOKEN}",
+                "PLAIN_VALUE": "plain-ok",
+            },
+        ),
+    ]
+    class _TrustedProvider:
+        # B3's builder gates the deployment env on provider trust; the stub
+        # host is trusted so the token paths under test run.
+        @staticmethod
+        def trusted_host(config):
+            return True
+
+    sandbox_stub = create_autospec(PTCSandbox, instance=True)
+    sandbox_stub.provider = _TrustedProvider()
+    # The real builder delegates to _deployment_env_vars off the instance;
+    # on the autospec stub that dispatch would hit a mock, so delegate back.
+    sandbox_stub._deployment_env_vars.side_effect = (
+        lambda bindings: PTCSandbox._deployment_env_vars(sandbox_stub, bindings)
+    )
+    sandbox_stub.config = SimpleNamespace(sandbox=SimpleNamespace(provider="docker"))
+    sandbox_stub._token_file_path = "/home/workspace/.ginlix_token"
+    sandbox_stub._builtin_servers.return_value = servers
+
+    env_vars = PTCSandbox._build_sandbox_env_vars(sandbox_stub, {})
+
+    assert admin_secret not in json.dumps(env_vars)
+    assert "internal-platform-secret" not in json.dumps(env_vars)
+    assert "RENAMED_ADMIN" not in env_vars
+    assert "RENAMED_INTERNAL" not in env_vars
+    assert env_vars["DALTON_RESEARCHDATA_URL"] == "http://host.docker.internal:8960"
+    assert env_vars["DALTON_BRIDGE_TOKEN"] == "mcp-token-ok"
+    assert env_vars["PLAIN_VALUE"] == "plain-ok"
+
+
+def test_sandbox_env_and_mcp_config_exclude_internal_service_token(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`INTERNAL_SERVICE_TOKEN`'s value is scrubbed by value (whatever key it
+    was expanded under) from sandbox env vars and from the generated MCP client
+    config (url / command / args / headers), with the leaking server disabled.
+    Each token is checked on its own: with only the internal token configured,
+    its leaks are scrubbed while an unset admin token never disables anything."""
+    import ptc_agent.config.plugins as plugins_mod
+    from ptc_agent.core.sandbox.ptc_sandbox import PTCSandbox
+    from ptc_agent.core.tool_generator import ToolFunctionGenerator
+
+    internal_secret = "internal-service-secret-do-not-leak"
+    monkeypatch.setenv("INTERNAL_SERVICE_TOKEN", internal_secret)
+    # Phase 1 runs with the bridge admin token unset.
+    monkeypatch.delenv("DALTON_BRIDGE_ADMIN_TOKEN", raising=False)
+    monkeypatch.setenv("DALTON_BRIDGE_TOKEN", "mcp-token-allowed")
+
+    test_plugins_dir = tmp_path / "plugins"
+    bundle_dir = test_plugins_dir / "test_internal_token_guard"
+    bundle_dir.mkdir(parents=True)
+    (bundle_dir / "plugin.json").write_text(
+        json.dumps(
+            {
+                "name": "test_internal_token_guard",
+                "version": "1.0.0",
+                "description": "Test bundle for INTERNAL_SERVICE_TOKEN boundary scrubbing",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (bundle_dir / "mcp.json").write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "leak_env_srv": {
+                        "type": "stdio",
+                        "command": "python3",
+                        "args": ["env_server.py"],
+                        "env": {
+                            "RENAMED_INTERNAL": "${INTERNAL_SERVICE_TOKEN}",
+                            "SAFE_VAR": "safe-value",
+                        },
+                    },
+                    "leak_url_srv": {
+                        "type": "streamable-http",
+                        "url": "http://host.docker.internal:9000/mcp/${INTERNAL_SERVICE_TOKEN}",
+                    },
+                    "leak_headers_srv": {
+                        "type": "streamable-http",
+                        "url": "http://host.docker.internal:9001/mcp",
+                        "headers": {"X-Internal": "Bearer ${INTERNAL_SERVICE_TOKEN}"},
+                    },
+                    "leak_args_srv": {
+                        "type": "stdio",
+                        "command": "python3",
+                        "args": [
+                            "args_server.py",
+                            "--internal=${INTERNAL_SERVICE_TOKEN}",
+                        ],
+                    },
+                    "clean_mcp_srv": {
+                        "type": "streamable-http",
+                        "url": "http://host.docker.internal:8960/mcp/${DALTON_BRIDGE_TOKEN}",
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(plugins_mod, "BUNDLES_DIR", test_plugins_dir)
+
+    # The real loader expands ${INTERNAL_SERVICE_TOKEN} into plaintext first.
+    loaded_servers = plugins_mod.bundled_mcp_servers()
+    by_name = {s.name: s for s in loaded_servers}
+    assert by_name["leak_env_srv"].env["RENAMED_INTERNAL"] == internal_secret
+
+    class _TrustedProvider:
+        # B3's builder gates the deployment env on provider trust; the stub
+        # host is trusted so the token paths under test run.
+        @staticmethod
+        def trusted_host(config):
+            return True
+
+    sandbox_stub = create_autospec(PTCSandbox, instance=True)
+    sandbox_stub.provider = _TrustedProvider()
+    sandbox_stub.config = SimpleNamespace(sandbox=SimpleNamespace(provider="docker"))
+    sandbox_stub._token_file_path = "/home/workspace/.ginlix_token"
+    sandbox_stub._builtin_servers.return_value = loaded_servers
+    # The real builder delegates to _deployment_env_vars off the instance;
+    # on the autospec stub that dispatch would hit a mock, so delegate back.
+    sandbox_stub._deployment_env_vars.side_effect = (
+        lambda bindings: PTCSandbox._deployment_env_vars(sandbox_stub, bindings)
+    )
+
+    env_vars = PTCSandbox._build_sandbox_env_vars(sandbox_stub, {})
+    gen = ToolFunctionGenerator()
+    mcp_client_cfg = gen.generate_client_config(loaded_servers)
+
+    assert internal_secret not in json.dumps(env_vars)
+    assert internal_secret not in json.dumps(mcp_client_cfg)
+    assert "RENAMED_INTERNAL" not in env_vars
+    assert env_vars.get("SAFE_VAR") == "safe-value"
+    for srv_name in ("leak_env_srv", "leak_url_srv", "leak_headers_srv", "leak_args_srv"):
+        assert by_name[srv_name].enabled is False
+        srv_entry = mcp_client_cfg["servers"][srv_name]
+        assert srv_entry.get("enabled") is False
+        assert srv_entry.get("available") is False
+    assert by_name["clean_mcp_srv"].enabled is True
+    assert mcp_client_cfg["servers"]["clean_mcp_srv"]["url"].endswith("mcp-token-allowed")
+
+    # Phase 2: with the admin token configured too, a server leaking either
+    # token is disabled — each token scrubs independently of the other.
+    admin_secret = "admin-secret-phase-two"
+    monkeypatch.setenv("DALTON_BRIDGE_ADMIN_TOKEN", admin_secret)
+    loaded_both = plugins_mod.bundled_mcp_servers()
+    by_name_both = {s.name: s for s in loaded_both}
+    sandbox_stub._builtin_servers.return_value = loaded_both
+    env_both = PTCSandbox._build_sandbox_env_vars(sandbox_stub, {})
+    cfg_both = ToolFunctionGenerator().generate_client_config(loaded_both)
+
+    assert internal_secret not in json.dumps(env_both)
+    assert admin_secret not in json.dumps(env_both)
+    assert internal_secret not in json.dumps(cfg_both)
+    assert admin_secret not in json.dumps(cfg_both)
+    assert by_name_both["leak_env_srv"].enabled is False
+    assert by_name_both["leak_url_srv"].enabled is False
+    assert by_name_both["clean_mcp_srv"].enabled is True
+
+
+def test_transformed_command_log_redacts_management_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The debug line that prints a stdio server's original args (already
+    expanded to plaintext by the plugins loader) redacts both management
+    tokens' values before the record is emitted. An earlier test's import
+    chain may configure structlog to filter DEBUG globally, so this test
+    re-enables DEBUG for a fresh, uncached logger and reads the stdout the
+    default structlog factory writes."""
+    import logging
+
+    import structlog
+
+    import src.ptc_agent.core.tool_generator as tg_mod
+    from ptc_agent.config.core import MCPServerConfig
+
+    admin_secret = "admin-secret-for-log-test"
+    internal_secret = "internal-secret-for-log-test"
+    monkeypatch.setenv("DALTON_BRIDGE_ADMIN_TOKEN", admin_secret)
+    monkeypatch.setenv("INTERNAL_SERVICE_TOKEN", internal_secret)
+    monkeypatch.delenv("DALTON_BRIDGE_TOKEN", raising=False)
+
+    server = MCPServerConfig(
+        name="log_redact_srv",
+        transport="stdio",
+        command="uv",
+        args=[
+            "run",
+            "python",
+            "some_mcp_server.py",
+            f"--admin={admin_secret}",
+            f"--internal={internal_secret}",
+        ],
+    )
+
+    saved_config = structlog.get_config()
+    structlog.configure(
+        wrapper_class=structlog.make_filtering_bound_logger(logging.DEBUG),
+        cache_logger_on_first_use=False,
+    )
+    monkeypatch.setattr(tg_mod, "logger", structlog.get_logger(tg_mod.__name__))
+    try:
+        tg_mod.ToolFunctionGenerator().generate_client_config([server])
+    finally:
+        structlog.configure(**saved_config)
+
+    emitted = capsys.readouterr().out
+
+    assert admin_secret not in emitted
+    assert internal_secret not in emitted
+    assert "--admin=***" in emitted
+    assert "--internal=***" in emitted
 
 
 @pytest.mark.asyncio

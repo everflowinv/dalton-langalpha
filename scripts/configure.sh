@@ -366,6 +366,7 @@ esac
 header "Sandbox (Code Execution)"
 printf "  ${BOLD}1${NC}) Docker — local containers, no signup needed\n"
 printf "  ${BOLD}2${NC}) Daytona — cloud sandboxes with persistent workspaces\n"
+printf "  ${BOLD}3${NC}) E2B: cloud sandboxes that pause when idle and resume in about a second\n"
 printf "\n"
 sandbox=$(prompt_choice "Choice" "1")
 
@@ -393,6 +394,21 @@ case $sandbox in
         set_env "DAYTONA_SECRET_NAMESPACE" "$namespace"
         set_env "SANDBOX_PROVIDER" "daytona"
         success "Daytona configured — namespace: $namespace"
+        ;;
+    3)
+        key=$(prompt_secret "E2B_API_KEY")
+        [ -n "$key" ] && set_env "E2B_API_KEY" "$key"
+        # E2B Secrets are shared by every deployment on one account, so the
+        # namespace gets the same machine + checkout default as Daytona's.
+        namespace_default="langalpha-local-$(printf '%s' "$(hostname)-$REPO_ROOT" | cksum | awk '{print $1}')"
+        while true; do
+            namespace=$(prompt_choice "E2B_SECRET_NAMESPACE" "$namespace_default")
+            printf '%s' "$namespace" | grep -Eq '^[A-Za-z_][A-Za-z0-9_-]{0,62}$' && break
+            printf "  Invalid namespace: must match ^[A-Za-z_][A-Za-z0-9_-]{0,62}\$ (letters/digits/_/-, max 63 chars)\n" >&2
+        done
+        set_env "E2B_SECRET_NAMESPACE" "$namespace"
+        set_env "SANDBOX_PROVIDER" "e2b"
+        success "E2B configured, namespace: $namespace. Templates build on first use, or run 'make e2b-templates' to prebuild them"
         ;;
     *)
         info "Skipping sandbox config."

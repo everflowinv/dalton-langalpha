@@ -106,6 +106,28 @@ describe('isFilePath', () => {
     expect(isFilePath('/tmp/issue%231.md')).toBe(true);
   });
 
+  it('accepts a folder through the workspace\'s own folder under a root of its own or one it moved off', () => {
+    // These roots keep their slash through the parser, so asking only the
+    // stock root's question read the folder as an app route.
+    const folders = {
+      rootDir: '/home/someone/langalpha',
+      otherRoots: ['/srv/old'],
+      dirName: 'Workspace',
+      previousDirNames: ['research-old'],
+      siblings: [],
+    };
+    expect(isFilePath('/home/someone/langalpha/Workspace/reports/', folders)).toBe(true);
+    expect(isFilePath('/srv/old/Workspace/reports/', folders)).toBe(true);
+    expect(isFilePath('/srv/old/research-old/reports/', folders)).toBe(true);
+    expect(isFilePath('/srv/old/My%20Data/', { ...folders, dirName: 'My Data' })).toBe(true);
+    // The rest of that machine is not this workspace's, and without the root
+    // the path is any other rooted destination.
+    expect(isFilePath('/srv/old/Elsewhere/reports/', folders)).toBe(false);
+    expect(isFilePath('/srv/old/', folders)).toBe(false);
+    expect(isFilePath('/srv/old/Workspace/reports/', { ...folders, otherRoots: undefined })).toBe(false);
+    expect(isFilePath('/srv/old/Workspace/reports/')).toBe(false);
+  });
+
   it('reads a line suffix as a file, not a URL scheme', () => {
     expect(isFilePath('model.py:42')).toBe(true);
     expect(isFilePath('work/code/model.py:40-55')).toBe(true);

@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Any, Mapping, Optional
 from fastapi import HTTPException
 from pydantic import TypeAdapter, ValidationError
 
+from src.server.contracts.turn_kinds import WAKE_QUERY_TYPE
 from src.server.models.chat import ChatMessage, ChatRequest, ReportSource
 from src.server.models.workflow import RetryRequest
 
@@ -169,15 +170,40 @@ _REPORT_SOURCE = TypeAdapter(ReportSource)
 
 def _stored_turn_fields(query: Mapping[str, Any]) -> dict[str, Any]:
     """The server-set fields a turn's query row keeps, for a request that runs
-    the turn again: its type, so a system turn (a report-back) runs as one,
-    and the report it announces, which labels it in history and the live
-    stream."""
-    stored = ((query.get("metadata") or {}).get("report_source")) or None
+    the turn again: its type, so a system turn (a report-back) runs as one and
+    a wake turn may still end quietly, and the report or notices it announces,
+    which label it in history and the live stream."""
+    metadata = query.get("metadata") or {}
+    stored = metadata.get("report_source") or None
     try:
         report_source = _REPORT_SOURCE.validate_python(stored) if stored else None
     except ValidationError:
         report_source = None
-    return {"query_type": query.get("type"), "report_source": report_source}
+    market_target = metadata.get("market_target")
+    wakeup = metadata.get("wakeup")
+    return {
+        "query_type": query.get("type"),
+        "report_source": report_source,
+        "market_target": market_target if isinstance(market_target, dict) else None,
+        "wakeup": wakeup if isinstance(wakeup, dict) else None,
+    }
+
+
+async def retried_wake_fields(thread_id: str, turn_index: int) -> dict[str, Any]:
+    """A wake turn's type and notices, for a retry that replays its checkpoint.
+
+    The checkpoint holds the wake block with its quiet hint, so the retry must
+    still be a wake turn, or quiet would be refused against the very message
+    it replays and the live row would lose what fired. Other turns replay as
+    they always have.
+    """
+    from src.server.database.conversation.queries import get_query_at_turn
+
+    query = await get_query_at_turn(thread_id, turn_index)
+    if query is None or query.get("type") != WAKE_QUERY_TYPE:
+        return {}
+    fields = _stored_turn_fields(query)
+    return {"query_type": fields["query_type"], "wakeup": fields["wakeup"]}
 
 
 async def unstarted_regenerate_request(

@@ -2,6 +2,7 @@ import { useCallback, useMemo, useRef } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { queryKeys } from '../../../lib/queryKeys';
 import { listWorkspaceFiles } from '../utils/api';
+import { apiErrorDetail, apiErrorStatus } from '../utils/api/errors';
 
 interface UseWorkspaceFilesOptions {
   includeSystem?: boolean;
@@ -22,6 +23,16 @@ interface RefreshSlot {
 // Stable fallback — a fresh [] per render would churn the identity of every
 // consumer's `files` prop while the query has no data yet.
 const NO_FILES: string[] = [];
+
+function filesErrorText(error: unknown): string {
+  const status = apiErrorStatus(error);
+  if (status === 503) return 'Sandbox not available';
+  // An owner's SSH machine that answered and refused: asking again gets the
+  // same answer, and the server's sentence says what to fix on the machine.
+  const detail = apiErrorDetail(error);
+  if (status === 422 && typeof detail === 'string' && detail) return detail;
+  return 'Failed to load files';
+}
 
 export function useWorkspaceFiles(
   workspaceId: string | null,
@@ -79,11 +90,7 @@ export function useWorkspaceFiles(
   return {
     files: data?.files || NO_FILES,
     loading: isLoading,
-    error: error
-      ? ((error as { response?: { status?: number } }).response?.status === 503
-        ? 'Sandbox not available'
-        : 'Failed to load files')
-      : null,
+    error: error ? filesErrorText(error) : null,
     refresh,
   };
 }

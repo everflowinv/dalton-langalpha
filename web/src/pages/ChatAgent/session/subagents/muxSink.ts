@@ -14,6 +14,7 @@ import {
 } from './subagentStatus';
 import { settleWorkflowRunFromClosure } from './liveEventHandlers';
 import type { TaskTranscriptMeta } from './hydrateTaskTranscript';
+import { latestRun, runsOfTask } from './taskRuns';
 import { isTaskAgentId, taskIdFromAgentId } from '../../utils/agentId';
 import type { SSEEvent } from '../types';
 import type { SubagentRuntime } from '../runtime';
@@ -144,6 +145,12 @@ export function createSubagentMuxController(rt: SubagentRuntime, deps: SubagentM
       // own open raises the flag. Mid-turn the tray reads the running cards.
       if (!rt.isStreamingRef.current) rt.setHasActiveSubagents(true);
     },
+    onTaskRun: (shortTaskId, runId, facts) => {
+      // Filed by run, beside the cards rather than on one: a run's channel
+      // can open before anything has made its task a card (its launch result
+      // rides another socket), and which tasks get cards is the launch's call.
+      rt.subagentHistory.runs.put(runId, { taskId: `task:${shortTaskId}`, ...facts });
+    },
     onTaskRunClosed: (shortTaskId, outcome) => {
       // Positive closure from the run ledger: honor the real terminal
       // outcome — cancelled, error, and interrupted (a failure for tasks;
@@ -153,9 +160,11 @@ export function createSubagentMuxController(rt: SubagentRuntime, deps: SubagentM
       const status =
         normalized && isTerminalStatus(normalized) ? normalized : 'completed';
       // When it went quiet, for a close that is news here, which may be the
-      // first this page hears of the task. A drain re-closing a task already
-      // settled here must not restart its clock.
+      // first this page hears of the task: when the ledger settled its latest
+      // run, else now. A drain re-closing a task already settled here must not
+      // restart its clock.
       const news = !isSettledTask(shortTaskId);
+      const finished = latestRun(runsOfTask(rt.subagentHistory.get().runs, `task:${shortTaskId}`))?.finishedAtMs;
       // Record the exact outcome so every downstream reactivation guard can seed
       // the RIGHT terminal status (a failed task must not resurface as completed).
       rt.terminalTaskOutcomesRef.current.set(shortTaskId, status);
@@ -163,7 +172,7 @@ export function createSubagentMuxController(rt: SubagentRuntime, deps: SubagentM
         rt.updateSubagentCard(`task:${shortTaskId}`, {
           status,
           isActive: false,
-          ...(news ? { lastActivityMs: Date.now() } : {}),
+          ...(news ? { lastActivityMs: finished ?? Date.now() } : {}),
         });
       }
       // A workflow run reads its own lifecycle state ahead of the card status,

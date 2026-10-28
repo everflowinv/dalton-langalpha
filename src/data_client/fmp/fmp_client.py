@@ -21,6 +21,15 @@ _CACHE_MAX_SIZE = 512
 
 logger = logging.getLogger(__name__)
 
+# Stable's ``economic-indicators`` answers at most this many days ending at
+# ``to``, so an indicator is read back in windows of that span from today in
+# UTC. Another implementation of this tool surface should walk the same windows
+# with the same caps and batches, so both serve the same rows.
+_INDICATOR_WINDOW_DAYS = 91
+_INDICATOR_MAX_WINDOWS = 64
+_INDICATOR_MAX_EMPTY_RUN = 16
+_INDICATOR_MAX_BATCH = 8
+
 
 def _vendor_symbol_params(params: Dict[str, Any]) -> Dict[str, Any]:
     """Respell the symbol params in FMP's form.
@@ -185,11 +194,13 @@ async def quota_marker_reset() -> Optional[datetime]:
         return next_quota_reset()
 
 
-async def trip_quota_marker(status: int, reset_epoch: Optional[float] = None) -> None:
-    """Write the shared marker with a TTL ending at the quota reset.
+async def trip_quota_marker(status: int, reset_epoch: Optional[float] = None) -> datetime:
+    """Write the shared marker with a TTL ending at the quota reset and return that reset.
 
     The marker covers every FMP request, not just the endpoint that tripped
     it, because the quota is one counter. *status* rides along for the log.
+    The reset is returned even when no store is reachable, so the caller can
+    raise :class:`FmpQuotaExhausted` with the same moment the marker names.
     """
     now = datetime.now(timezone.utc)
     reset = next_quota_reset(now)
@@ -201,7 +212,7 @@ async def trip_quota_marker(status: int, reset_epoch: Optional[float] = None) ->
             reset = from_header
     store = _quota_store()
     if store is None:
-        return
+        return reset
     try:
         await store.set(
             _QUOTA_KEY,
@@ -213,8 +224,9 @@ async def trip_quota_marker(status: int, reset_epoch: Optional[float] = None) ->
         logger.warning(
             "fmp.quota_exhausted | status=%s reset_at=%s", status, reset.isoformat()
         )
-    except Exception:  # noqa: BLE101 — fail open; the next 429 retries the trip
+    except Exception:  # noqa: BLE001 — fail open; the next 429 retries the trip
         logger.warning("fmp.quota_marker_failed", exc_info=True)
+    return reset
 
 
 def _limit_reached(data: Any) -> bool:
@@ -339,8 +351,12 @@ class FMPClient:
                 and response.status_code != 402
                 and _limit_reached(data)
             ):
-                await trip_quota_marker(429, _quota_reset_epoch(response))
-                raise FMPRequestError("FMP API limit reached", status_code=429)
+                # DALTON-HOOK(market-data-fallback): a "Limit Reach" body is
+                # the quota gone even at HTTP 200, so it raises the same
+                # FmpQuotaExhausted a marker hit or a 429 would — the
+                # quota-aware callers upstream only recognize that class.
+                reset_at = await trip_quota_marker(429, _quota_reset_epoch(response))
+                raise FmpQuotaExhausted(reset_at) from None
             response.raise_for_status()
             if data is None:
                 data = _own_symbol_rows(response.json())
@@ -358,11 +374,13 @@ class FMPClient:
             # Defense in depth: never stringify the httpx error. Its message
             # embeds the request URL; auth must never depend on URL hygiene.
             # DALTON-HOOK(market-data-fallback): a 429 exhausts the one
-            # shared quota, so it trips the marker for every worker; a 402
-            # may only mean this endpoint sits outside the plan, so it fails
-            # this call alone.
+            # shared quota, so it trips the marker for every worker and
+            # raises FmpQuotaExhausted so quota-aware callers recognize it;
+            # a 402 may only mean this endpoint sits outside the plan, so it
+            # fails this call alone as a plain FMPRequestError.
             if e.response.status_code == 429:
-                await trip_quota_marker(429, _quota_reset_epoch(e.response))
+                reset_at = await trip_quota_marker(429, _quota_reset_epoch(e.response))
+                raise FmpQuotaExhausted(reset_at) from e
             raise FMPRequestError(
                 f"FMP API request failed ({e.response.status_code})",
                 status_code=e.response.status_code,
@@ -1145,9 +1163,58 @@ class FMPClient:
     # =====================================================================
 
     async def get_economic_indicators(self, name: str, limit: int = 50) -> List[Dict]:
-        return await self._make_request(
-            "economic-indicators", params={"name": name, "limit": limit}
-        )
+        """The newest ``limit`` observations of an indicator, newest first.
+
+        Stable ignores ``limit`` and answers at most the 91 days ending at
+        ``to``, clamping a longer range without a word, so a quarterly series
+        such as GDP has nothing in its default window. The series is read back
+        a window at a time instead, the first alone and then a widening batch,
+        until ``limit`` rows are in hand. An answer that is not a list is FMP's
+        refusal and is returned as it came, as the single read returned it.
+        """
+        found: Dict[str, Dict] = {}
+        end = _today_utc()
+        batch, walked, empty_run = 1, 0, 0
+        while walked < _INDICATOR_MAX_WINDOWS:
+            spans = []
+            for _ in range(min(batch, _INDICATOR_MAX_WINDOWS - walked)):
+                start = end - timedelta(days=_INDICATOR_WINDOW_DAYS - 1)
+                spans.append((start.isoformat(), end.isoformat()))
+                end = start - timedelta(days=1)
+            walked += len(spans)
+            answers = await asyncio.gather(
+                *(
+                    self._make_request(
+                        "economic-indicators",
+                        params={"name": name, "from": lo, "to": hi},
+                    )
+                    for lo, hi in spans
+                ),
+                return_exceptions=True,
+            )
+            # Newest first, in window order rather than completion order: a
+            # window older than the rows already in hand, or past the empty run
+            # that ends the series, is not needed, and neither is its failure.
+            for (lo, hi), answer in zip(spans, answers):
+                if len(found) >= limit or empty_run >= _INDICATOR_MAX_EMPTY_RUN:
+                    break
+                if isinstance(answer, BaseException):
+                    raise answer
+                if not isinstance(answer, list):
+                    return answer
+                inside = [
+                    row
+                    for row in answer
+                    if isinstance(row, dict) and lo <= str(row.get("date"))[:10] <= hi
+                ]
+                for row in inside:
+                    found.setdefault(row["date"], row)
+                empty_run = 0 if inside else empty_run + 1
+            if len(found) >= limit or empty_run >= _INDICATOR_MAX_EMPTY_RUN:
+                break
+            batch = min(batch * 2, _INDICATOR_MAX_BATCH)
+        rows = sorted(found.values(), key=lambda row: row["date"], reverse=True)
+        return rows[: max(limit, 0)]
 
     async def get_economic_calendar(
         self, from_date: Optional[str] = None, to_date: Optional[str] = None

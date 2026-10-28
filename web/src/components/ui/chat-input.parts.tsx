@@ -5,10 +5,11 @@ import { useTranslation } from 'react-i18next';
 import { Loader } from '@/components/ui/loader';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
 import { useIsMobile } from '@/hooks/useIsMobile';
+import { motion, useIsPresent } from '@/lib/framer';
 import { cn } from '@/lib/utils';
 import type { WidgetContextSnapshot } from '@/pages/Dashboard/widgets/framework/contextSnapshot';
 import { WidgetContextDeck } from '@/pages/Dashboard/widgets/framework/WidgetContextDeck';
-import { getSlashCommandIcon } from './chat-input.helpers';
+import { CHIP_PRESENCE, MENU_PRESENCE, getSlashCommandIcon } from './chat-input.helpers';
 import { SUBAGENT_CORE, SUBAGENT_SEATS } from './subagents-rings.geometry';
 import type { FileAttachment, SlashCommand } from './chat-input.types';
 
@@ -20,13 +21,19 @@ const formatFileSize = (bytes: number): string => {
   return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
 };
 
-/* --- FILE PREVIEW CARD --- */
+/* --- FILE PREVIEW CARD ---
+ * Its root is a motion element: rendered as a child of an AnimatePresence, it
+ * plays CHIP_PRESENCE on the way in and on the way out. */
 export const FilePreviewCard = ({ file, onRemove }: { file: FileAttachment; onRemove: (id: string) => void }) => {
+  const { t } = useTranslation();
   const isMobilePreview = useIsMobile();
   const isImage = file.type.startsWith('image/') && file.preview;
 
   return (
-    <div className="relative group shrink-0 w-24 h-24 rounded-xl overflow-hidden border border-(--color-border-muted) bg-(--color-bg-elevated) animate-fade-in transition-all hover:border-(--color-border-default)">
+    <motion.div
+      {...CHIP_PRESENCE}
+      className="relative group shrink-0 w-24 h-24 rounded-xl overflow-hidden border border-(--color-border-muted) bg-(--color-bg-elevated) transition-colors hover:border-(--color-border-default)"
+    >
       {isImage ? (
         <div className="w-full h-full relative">
           <img src={file.preview!} alt={file.file.name} className="w-full h-full object-cover" />
@@ -55,7 +62,9 @@ export const FilePreviewCard = ({ file, onRemove }: { file: FileAttachment; onRe
 
       {/* Remove Button Overlay */}
       <button
+        type="button"
         onClick={() => onRemove(file.id)}
+        aria-label={t('chat.composer.remove')}
         className={`absolute top-1 right-1 p-1 bg-black/50 hover:bg-black/70 rounded-full text-white transition-opacity ${isMobilePreview ? 'opacity-60' : 'opacity-0 group-hover:opacity-100'}`}
       >
         <X className="w-3 h-3" />
@@ -64,10 +73,10 @@ export const FilePreviewCard = ({ file, onRemove }: { file: FileAttachment; onRe
       {/* Upload Status */}
       {file.uploadStatus === 'uploading' && (
         <div className="absolute inset-0 bg-black/40 flex items-center justify-center">
-          <Loader size={20} label="Uploading" className="text-white" />
+          <Loader size={20} label={t('chat.composer.uploading')} className="text-white" />
         </div>
       )}
-    </div>
+    </motion.div>
   );
 };
 
@@ -130,7 +139,6 @@ export function PillToggle({
     border: '1px solid transparent',
     opacity: blocked ? 0.6 : 1,
     cursor: blocked ? 'not-allowed' : 'pointer',
-    transition: 'background 0.2s, color 0.2s, border-color 0.2s',
   };
   const body = (
     <>
@@ -145,7 +153,7 @@ export function PillToggle({
       <button
         type="button"
         tabIndex={-1}
-        className={cn('inline-flex items-center rounded-full border-none whitespace-nowrap', className)}
+        className={cn('inline-flex items-center rounded-full border-none whitespace-nowrap transition-colors', className)}
         style={style}
       >
         {body}
@@ -162,7 +170,7 @@ export function PillToggle({
   return (
     <button
       ref={buttonRef}
-      className={cn('inline-flex items-center rounded-full border-none whitespace-nowrap', className)}
+      className={cn('inline-flex items-center rounded-full border-none whitespace-nowrap transition-colors', className)}
       style={style}
       onClick={(e) => { e.stopPropagation(); if (!blocked) onToggle?.(); }}
       // A press leaves focus where it was, as a menu trigger's does: the picker
@@ -223,7 +231,7 @@ export function SubagentsGlyph({ on, className, style }: { on: boolean; classNam
           style={{
             '--dx': `${CORE.x - x}px`,
             '--dy': `${CORE.y - y}px`,
-            transitionDelay: on ? `${i * 60}ms` : undefined,
+            '--seat': i,
           } as CSSProperties}
         />
       ))}
@@ -253,10 +261,9 @@ export function IconToggle({
   children: ReactNode;
   measureOnly?: boolean;
 }) {
-  const className = 'inline-flex flex-none items-center justify-center h-8 w-8 rounded-full border-none bg-transparent';
+  const className = 'inline-flex flex-none items-center justify-center h-8 w-8 rounded-full border-none bg-transparent transition-colors';
   const style: CSSProperties = {
     color: active ? 'var(--color-accent-light)' : 'var(--color-text-muted)',
-    transition: 'background 0.2s, color 0.2s',
   };
   if (measureOnly) {
     return <button type="button" tabIndex={-1} className={className} style={style}>{children}</button>;
@@ -284,7 +291,13 @@ export function IconToggle({
 
 /* --- @MENTION / /SLASH AUTOCOMPLETE LISTS ---
  * Presentation only — the matching, selection and keyboard machinery lives in
- * chat-input.useMentions / chat-input.useSlashCommands. */
+ * chat-input.useMentions / chat-input.useSlashCommands. Each root is the
+ * motion element an AnimatePresence around it opens and closes; the menu is
+ * absolutely placed, so the motion stays on the element itself, where a
+ * wrapper would take a gap in the composer's column and, while it moved, be
+ * the box the menu is placed against. A closing menu is inert: its rows still
+ * hold the draft as it was, and a second press on one would splice into the
+ * draft the first press already changed. */
 
 export function MentionAutocompleteList({
   listRef,
@@ -301,11 +314,13 @@ export function MentionAutocompleteList({
   onSelect: (path: string) => void;
   onHover: (idx: number) => void;
 }) {
+  const { t } = useTranslation();
+  const present = useIsPresent();
   return (
-    <div className="mention-autocomplete" ref={listRef}>
+    <motion.div className="mention-autocomplete" ref={listRef} inert={!present} {...MENU_PRESENCE}>
       {files.length === 0 ? (
         <div className="mention-autocomplete-empty">
-          {hasWorkspaceFiles ? 'No matching files' : 'No files available'}
+          {hasWorkspaceFiles ? t('chat.mention.noMatching') : t('chat.mention.noFiles')}
         </div>
       ) : (
         files.map((filePath, idx) => {
@@ -325,7 +340,7 @@ export function MentionAutocompleteList({
           );
         })
       )}
-    </div>
+    </motion.div>
   );
 }
 
@@ -343,8 +358,9 @@ export function SlashCommandList({
   onHover: (idx: number) => void;
 }) {
   const { t } = useTranslation();
+  const present = useIsPresent();
   return (
-    <div className="mention-autocomplete" ref={listRef}>
+    <motion.div className="mention-autocomplete" ref={listRef} inert={!present} {...MENU_PRESENCE}>
       {commands.length === 0 ? (
         <div className="mention-autocomplete-empty">{t('chat.slashCommand.noMatching')}</div>
       ) : (
@@ -361,7 +377,7 @@ export function SlashCommandList({
           </div>
         ))
       )}
-    </div>
+    </motion.div>
   );
 }
 

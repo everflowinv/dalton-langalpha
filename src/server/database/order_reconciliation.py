@@ -19,6 +19,7 @@ import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
@@ -26,7 +27,8 @@ from psycopg.rows import dict_row
 
 from src.server.database.order_attempts import row_as_json
 from src.server.database.pool import get_db_connection
-from src.server.database.session_lock import release_session_lock
+from src.server.database.session_lock import try_session_lock
+from src.server.database.wakeups.fire import fire_order_wakeups
 from src.server.services.brokerage_capabilities import OrderAction
 from src.server.services.brokerage_orders import OPEN_STATUSES, AttemptStatus
 from src.server.services.brokerage_orders.models import (
@@ -58,7 +60,7 @@ def group_lock_key(user_id: str, server: str) -> str:
 _CANDIDATE_COLUMNS = """
     attempt_id, user_id, workspace_id, thread_id, server, vendor, tool, action,
     mode, account_ref, order_json, status, vendor_order_id, route,
-    executed_at, created_at, updated_at
+    executed_at, created_at, updated_at, unlisted_at
 """
 
 # ``OPEN_STATUSES`` is the sweep's candidate set: a row in one of those states
@@ -154,12 +156,24 @@ class Observation:
     rather than on anything the vendor said about it. That is the one kind of
     evidence a later write can invalidate, so it is the one kind the write has
     to check it still holds.
+
+    ``unlisted`` marks the first complete listing to lack an order its adapter
+    ends on absence. Nothing is settled on it; the pass stamps the row, and the
+    end waits for the next read to agree, so one short or empty answer cannot
+    end every such order at once.
+
+    ``unlisted_at`` is the stamp such an end rests on, as the sweep read it, and
+    the write holds to it as it holds to the status: a sibling worker that
+    listed the order after this pass selected the row cleared the stamp, and
+    one absence after a sighting is not two.
     """
 
     status: AttemptStatus | None = None
     reason: str = ""
     ambiguous: bool = False
     from_absence: bool = False
+    unlisted: bool = False
+    unlisted_at: datetime | None = None
     vendor_order_id: str | None = None
     route: dict[str, str] | None = None
     failure: dict[str, Any] | None = None
@@ -200,7 +214,7 @@ async def record_observation(
     )
     if not allowed:
         return None
-    async with get_db_connection() as conn:
+    async with get_db_connection() as conn, conn.transaction():
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
                 f"""
@@ -219,8 +233,14 @@ async def record_observation(
                        -- so any completion time already on it predates the
                        -- answer that actually settled the order.
                        completed_at = CASE WHEN %s THEN NOW() ELSE completed_at END,
+                       -- A reading the vendor gave names the order, so a
+                       -- listing that once lacked it no longer counts toward
+                       -- ending it. An end founded on absence keeps the stamp,
+                       -- which dates the first read that found it gone.
+                       unlisted_at = CASE WHEN %s THEN unlisted_at END,
                        updated_at = NOW()
                  WHERE attempt_id = %s AND status = ANY(%s)
+                   AND (%s::timestamptz IS NULL OR unlisted_at = %s)
                 RETURNING {_CANDIDATE_COLUMNS}
                 """,
                 (
@@ -245,47 +265,42 @@ async def record_observation(
                     *((SafeJson(observation.instrument),) * 2
                       if observation.instrument else (None, None)),
                     status in TERMINAL_STATUSES,
+                    observation.from_absence,
                     attempt_id,
                     [str(s) for s in allowed],
+                    # The stamp twice: once to ask whether the end rests on
+                    # one, once to require the row to still carry it.
+                    observation.unlisted_at,
+                    observation.unlisted_at,
                 ),
             )
-            return row_as_json(await cur.fetchone())
+            row = row_as_json(await cur.fetchone())
+        if row is not None:
+            await _fire_order_wakeups(conn, attempt_id)
+        return row
 
 
-@asynccontextmanager
-async def _try_session_lock(key: str) -> AsyncIterator[bool]:
-    """Hold a session advisory lock, or yield False when someone else has it.
+async def _fire_order_wakeups(conn, attempt_id: str) -> None:
+    """Fire what this observation set off, committed with it.
 
-    Session-scoped rather than transaction-scoped: a holder makes network calls
-    between its statements, and wrapping those in a transaction would pin a
-    connection inside an open snapshot for the length of a brokerage's latency.
+    In a savepoint, and a failure is only logged: the reading is the
+    ledger's fact and must land whatever happens to a wakeup on it, and the
+    wakeup sweep checks every armed order on its next pass, so a fire lost
+    here is late rather than missing.
     """
-    async with get_db_connection() as conn:
-        try:
-            async with conn.cursor() as cur:
-                await cur.execute(
-                    "SELECT pg_try_advisory_lock(hashtextextended(%s, 0))",
-                    (key,),
-                )
-                row = await cur.fetchone()
-        except BaseException:
-            # The lock may already have been granted: a session lock survives a
-            # cancelled fetch, so release it rather than pool a locked session.
-            await release_session_lock(conn, key)
-            raise
-        if not (row and row[0]):
-            yield False
-            return
-        try:
-            yield True
-        finally:
-            await release_session_lock(conn, key)
+    try:
+        await fire_order_wakeups([attempt_id], conn=conn)
+    except Exception:
+        logger.warning(
+            "order wakeups not fired with the observation on attempt %s",
+            attempt_id, exc_info=True,
+        )
 
 
 @asynccontextmanager
 async def reconcile_pass_lock() -> AsyncIterator[bool]:
     """Hold the single-runner lock for a pass head, or False when it is held."""
-    async with _try_session_lock(PASS_LOCK_KEY) as held:
+    async with try_session_lock(PASS_LOCK_KEY) as held:
         yield held
 
 
@@ -294,10 +309,11 @@ async def reconcile_group_lock(user_id: str, server: str) -> AsyncIterator[bool]
     """Hold one account's read lock, or False when a sibling worker has it.
 
     A group another worker is already reading is skipped rather than waited on,
-    the same way a pass is. Its rows keep their ``swept_at`` stamp, so the next
-    pass finds them at the head of the queue rather than losing them.
+    the same way a pass is. Its rows keep the ``swept_at`` stamp they were taken
+    with, so they come round once the poll interval has passed, the same as a
+    row a read left open, rather than being lost.
     """
-    async with _try_session_lock(group_lock_key(user_id, server)) as held:
+    async with try_session_lock(group_lock_key(user_id, server)) as held:
         yield held
 
 
@@ -305,6 +321,7 @@ async def list_stale_attempts(
     *,
     submitting_grace_seconds: float,
     open_after_seconds: float,
+    resweep_after_seconds: float,
     limit: int,
 ) -> list[dict[str, Any]]:
     """The next batch of attempts a vendor read could still settle.
@@ -315,6 +332,19 @@ async def list_stale_attempts(
     answered, and is stale once it has gone longer than a poll interval without
     anyone asking the vendor what happened next -- which is how a working order
     becomes filled with no user in the loop.
+
+    That asking is dated by ``swept_at``, not ``updated_at``, and it holds both
+    populations to one read a poll interval. A pass that takes a row and
+    settles nothing writes only that stamp: the order is missing from a list
+    that cannot fail it, the read errored or was cut short, or the match is
+    left for a person. Gated on the last write alone, such a row was due on
+    every pass of every worker, a vendor call each time for an answer that had
+    not changed. An unanswered call past its grace window keeps the same
+    cadence, because the vendor's list is all it is waiting on too. The
+    ``updated_at`` windows still apply on top, since they are what hold off a
+    row its own turn has just written. ``resweep_after_seconds`` is the caller's
+    to set a little under the interval: a pass that came early would otherwise
+    find the row the pass before it took still held off, and skip it.
 
     An ``unknown`` row with no vendor order id joins the first population: the
     call was answered with nothing this build could read, or its answer was
@@ -355,6 +385,15 @@ async def list_stale_attempts(
                                   AND updated_at < NOW() - make_interval(secs => %s)
                                 )
                            )
+                       -- And not taken within the poll interval, by this worker
+                       -- or any other. A read that settles nothing writes only
+                       -- swept_at, so a row past the updated_at windows above
+                       -- stays past them, and on those alone every pass in the
+                       -- fleet read it again.
+                       AND (
+                             swept_at IS NULL
+                             OR swept_at < NOW() - make_interval(secs => %s)
+                           )
                      -- Least recently swept first, stamped as taken. A row no
                      -- read can settle is skipped without a write, so ordered
                      -- by updated_at alone it held the head of every pass, and
@@ -375,6 +414,7 @@ async def list_stale_attempts(
                     float(submitting_grace_seconds),
                     [str(s) for s in OPEN_STATUSES],
                     float(open_after_seconds),
+                    float(resweep_after_seconds),
                     int(limit),
                 ),
             )
@@ -576,21 +616,30 @@ async def unanswered_attempts(
             return [row_as_json(row) for row in await cur.fetchall()]  # type: ignore[misc]
 
 
-async def cancelled_by_own_attempt(
+async def own_cancel(
     user_id: str,
     vendor: str,
     vendor_order_id: str,
     *,
     account_ref: str | None,
     exclude_attempt_id: str,
+    awaiting_within: float | None = None,
 ) -> dict[str, Any] | None:
-    """A confirmed cancel of this user's that named this vendor order, or None.
+    """A cancel of this user's that named this vendor order, or None.
 
-    Vendor-neutral because the fact is the host's rather than a brokerage's: an
-    order the user cancelled and the vendor answered ``cancelled`` to is gone
-    even at a vendor whose only word for it afterwards is to stop listing it.
-    Scoped to the account, as the claimed ids are: an order id is unique only
-    within one, so a cancel in another account says nothing about this order.
+    A confirmed one first, with ``status`` ``cancelled``: an order the user
+    cancelled and the vendor answered ``cancelled`` to is gone even at a vendor
+    whose only word for it afterwards is to stop listing it. Vendor-neutral,
+    because that fact is the host's rather than a brokerage's, and scoped to
+    the account, as the claimed ids are, since an order id is unique only
+    within one.
+
+    With ``awaiting_within``, failing that, one still ``submitting`` and
+    younger than it. A vendor drops the order as it accepts the cancel, and the
+    cancel's row learns so only when the answer lands a moment later, so a list
+    read in between shows the order gone with no cancel recorded. Both states
+    come from one statement: read apart, a cancel answered between the reads is
+    seen by neither, and the end settled on that is final.
     """
     if not (vendor_order_id or "").strip() or not (vendor or "").strip():
         return None
@@ -598,18 +647,25 @@ async def cancelled_by_own_attempt(
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
                 """
-                SELECT attempt_id, tool, action, completed_at
+                SELECT attempt_id, tool, action, status, completed_at
                   FROM order_attempts
                  WHERE user_id = %s AND vendor = %s
                    AND account_ref IS NOT DISTINCT FROM %s
                    AND attempt_id <> %s::uuid
                    AND action = ANY(%s)
-                   AND status = 'cancelled'
+                   AND (
+                         status = 'cancelled'
+                         OR (
+                              status = 'submitting'
+                              AND updated_at > NOW() - make_interval(secs => %s)
+                            )
+                       )
                    AND (
                          vendor_order_id = %s
                          OR order_json ->> 'target_ref' = %s
                        )
-                 ORDER BY COALESCE(completed_at, updated_at) DESC
+                 ORDER BY status = 'cancelled' DESC,
+                          COALESCE(completed_at, updated_at) DESC
                  LIMIT 1
                 """,
                 (
@@ -618,11 +674,35 @@ async def cancelled_by_own_attempt(
                     account_ref,
                     exclude_attempt_id,
                     [str(a) for a in CANCELLING_ACTIONS],
+                    # NULL leaves the second arm matching nothing.
+                    None if awaiting_within is None else float(awaiting_within),
                     vendor_order_id,
                     vendor_order_id,
                 ),
             )
             return row_as_json(await cur.fetchone())
+
+
+async def mark_unlisted(attempt_id: str, current: AttemptStatus) -> bool:
+    """Date the first complete listing that lacked this open order.
+
+    No status and no ``updated_at``, so the row stays on the sweep's cadence.
+    It does restart ``swept_at``, which dates the take, not the read: a group
+    that waited for a slot listed long after it was taken, and a sibling could
+    take the row again moments after the stamp and end it on a second list
+    seconds after the first. Held to the state it was read in, as an end
+    founded on absence is.
+    """
+    async with get_db_connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                UPDATE order_attempts SET unlisted_at = NOW(), swept_at = NOW()
+                 WHERE attempt_id = %s AND status = %s AND unlisted_at IS NULL
+                """,
+                (attempt_id, str(current)),
+            )
+            return cur.rowcount == 1
 
 
 async def active_grant_for_connection(

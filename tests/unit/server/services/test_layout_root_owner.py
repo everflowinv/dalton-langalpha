@@ -34,8 +34,7 @@ def _make_config():
     config.filesystem = SimpleNamespace(working_directory="/home/workspace")
     config.skills = SimpleNamespace(
         enabled=False,
-        sandbox_skills_base="/home/workspace/.agents/skills",
-        local_skill_dirs_with_sandbox=lambda: None,
+        local_skill_dirs=lambda: None,
     )
     config.to_core_config.return_value = SimpleNamespace(
         sandbox=SimpleNamespace(

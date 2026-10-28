@@ -6,7 +6,8 @@
  * it is marked failed so Retry shows, and the banner says it failed. A failure
  * the turn already shows is not reported twice, and after a drop the turn
  * spans two bubbles: the one the dropped stream left, and the reconnect's own,
- * which names it.
+ * which names it. A hidden opener's reply that streamed nothing stays failed,
+ * since it is the only place its turn's Retry can live.
  */
 import { describe, expect, it, vi } from 'vitest';
 import type { ChatMessage } from '@/types/chat';
@@ -23,8 +24,8 @@ const emptyBubble = (id: string, extra: Record<string, unknown> = {}) => ({
   reasoningProcesses: {}, toolCallProcesses: {}, ...extra,
 }) as unknown as ChatMessage;
 
-function setup({ banner: initialBanner = null }: { banner?: unknown } = {}) {
-  let messages: ChatMessage[] = [emptyBubble(BUBBLE)];
+function setup({ banner: initialBanner = null, reply = {} }: { banner?: unknown; reply?: Record<string, unknown> } = {}) {
+  let messages: ChatMessage[] = [emptyBubble(BUBBLE, reply)];
   const setMessages = (updater: (prev: ChatMessage[]) => ChatMessage[]) => {
     messages = updater(messages);
   };
@@ -173,5 +174,50 @@ describe('reconnect: a drop between the stream and the run\'s end', () => {
     expect(bubble(RECONNECT)).toMatchObject({ isStreaming: false });
     expect(bubble(RECONNECT).error).toBeUndefined();
     expect(banner()).toEqual({ message: '', kind: 'internal' });
+  });
+});
+
+describe('a hidden opener\'s reply that streamed nothing', () => {
+  // The only bubble its turn has: hidden, the banner would be left with no
+  // Retry and no message on screen to send again.
+  const HIDDEN = { reply: { hiddenOpener: true } };
+  const internalCard = { message: '', kind: 'internal' };
+
+  it('stays failed when the run ends failed, with the card a reload draws', () => {
+    const { process, bubble, banner } = setup(HIDDEN);
+
+    process(runEnd);
+
+    expect(bubble()).toMatchObject({ isStreaming: false, error: true, structuredError: internalCard });
+    expect(banner()).toEqual({ message: '', kind: 'internal' });
+  });
+
+  it('stays failed on an internal error frame', () => {
+    const { process, bubble, banner } = setup(HIDDEN);
+
+    process({ event: 'error', error: 'worker lost', error_kind: 'internal' } as SSEEvent);
+
+    expect(bubble()).toMatchObject({ isStreaming: false, error: true, structuredError: internalCard });
+    expect(banner()).toEqual({ message: '', kind: 'internal' });
+  });
+
+  it('after a drop, fails the opener\'s reply rather than the reconnect\'s empty one', () => {
+    const { reconnect, bubble } = setup(HIDDEN);
+
+    reconnect()(runEnd);
+
+    expect(bubble()).toMatchObject({ error: true, structuredError: internalCard });
+    expect(bubble(RECONNECT)).toMatchObject({ isStreaming: false });
+    expect(bubble(RECONNECT).error).toBeUndefined();
+  });
+
+  it('keeps what it streamed as its reply, the card left to the banner as for any turn', () => {
+    const { process, bubble } = setup(HIDDEN);
+    process({ event: 'message_chunk', content_type: 'text', content: PROSE } as SSEEvent);
+
+    process(runEnd);
+
+    expect(bubble()).toMatchObject({ error: true, content: PROSE });
+    expect(bubble().structuredError).toBeUndefined();
   });
 });

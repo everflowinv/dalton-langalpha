@@ -22,12 +22,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from src.server.app.share_access import ShareScope, shared_path_visible
-from src.server.app.workspace_files._containment import contained_relative_path
-from src.server.app.workspace_files._shared import (
-    owned_workspace_on_computer,
-    owner_work_dir,
-    previous_dir_names_of,
-)
+from src.server.app.workspace_files._shared import owner_work_dir
 from src.server.database.share_codes import share_path
 from src.server.database.share_links import (
     KIND_FILE,
@@ -42,6 +37,11 @@ from src.server.database.share_links import (
 )
 from src.server.database.workspace import get_workspace as db_get_workspace
 from src.server.services.file_grants import grant_prefix, mint_file_grant, seconds_left
+from src.server.services.workspace_file_containment import contained_relative_path
+from src.server.services.workspace_files import (
+    owned_workspace_on_computer,
+    previous_dir_names_of,
+)
 from src.server.app.share_manifest import (
     ManifestEntry,
     ManifestEntryMissing,

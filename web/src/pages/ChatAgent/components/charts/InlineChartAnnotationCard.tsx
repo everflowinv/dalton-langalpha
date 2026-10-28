@@ -11,7 +11,7 @@
 
 import React, { useCallback, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
-import { LineChart, Check, ArrowRight, ChartCandlestick, PanelRight } from 'lucide-react';
+import { LineChart, Check, ArrowRight, ChartCandlestick } from 'lucide-react';
 import { useMessageActions } from '../messageList/MessageActionsContext';
 
 import type { StoredAnnotation } from '@/pages/MarketView/stores/chartAnnotationStore';
@@ -25,22 +25,20 @@ import { annotationLabel } from '@/pages/MarketView/utils/annotationGeometry';
 
 import { useWorkspaceId } from '../../contexts/WorkspaceContext';
 import { useChartSurface } from '../../contexts/ChartSurfaceContext';
-import { CARD_BG, CARD_BORDER } from './inlineCardsShared';
+import { text, type InlineCardProps } from './cardReaders';
 import '../messageList/TurnFileCards.css';
+import './turnFileTerm.css';
+import './termCardStyles.css';
 
 const TEXT_COLOR = 'var(--color-text-tertiary)';
 const ACCENT = 'var(--color-accent-primary)';
+const CARD_BG = 'var(--color-bg-tool-card)';
+const CARD_BORDER = 'var(--color-border-muted)';
 
 /** Stands on the tile where a file card shows its kind's icon. */
 const CHART_GLYPH = ChartCandlestick;
 
-interface InlineChartAnnotationCardProps {
-  artifact: Record<string, unknown> | null | undefined;
-}
-
-export function InlineChartAnnotationCard({
-  artifact,
-}: InlineChartAnnotationCardProps): React.ReactElement | null {
+export function InlineChartAnnotationCard({ artifact }: InlineCardProps): React.ReactElement | null {
   const { t } = useTranslation();
   const { onOpenChart } = useMessageActions();
   const ctxWorkspaceId = useWorkspaceId();
@@ -48,13 +46,13 @@ export function InlineChartAnnotationCard({
 
   // An artifact from an older thread may spell Shanghai `.SS`; the chart, its
   // annotation keys and the tab all use the display spelling.
-  const symbol = displaySpelling((artifact?.symbol as string) || '');
-  const timeframe = (artifact?.timeframe as string) || '1day';
+  const symbol = displaySpelling(text(artifact.symbol) ?? '');
+  const timeframe = text(artifact.timeframe) ?? '1day';
   const annotations = useMemo(
-    () => (artifact?.annotations as StoredAnnotation[] | undefined) ?? [],
+    () => (artifact.annotations as StoredAnnotation[] | undefined) ?? [],
     [artifact],
   );
-  const workspaceId = (artifact?.workspace_id as string | undefined) || ctxWorkspaceId || undefined;
+  const workspaceId = text(artifact.workspace_id) || ctxWorkspaceId || undefined;
   // A transcript mounted with no workspace is a share: the owner's hosts always
   // name one. The drawing lives in a workspace's store, so a chart opened from
   // here carries none, and the card must not promise it.
@@ -80,7 +78,7 @@ export function InlineChartAnnotationCard({
     onOpenChart?.({ symbol, timeframe, workspaceId });
   }, [symbol, timeframe, workspaceId, onOpenChart]);
 
-  if (!artifact || !symbol) return null;
+  if (!symbol) return null;
 
   const count = annotations.length;
 
@@ -134,7 +132,7 @@ export function InlineChartAnnotationCard({
           fontSize: '0.75rem',
           color: TEXT_COLOR,
           cursor: 'pointer',
-          transition: 'border-color 0.15s',
+          transition: 'border-color var(--motion-quick) var(--ease-out)',
         }}
         onMouseEnter={(e) => (e.currentTarget.style.borderColor = ACCENT)}
         onMouseLeave={(e) =>
@@ -170,7 +168,7 @@ export function InlineChartAnnotationCard({
   const ariaArgs = { name, count };
 
   return (
-    <div className="turn-file-card is-inline">
+    <div className="turn-file-card is-inline is-term">
       <span className="turn-file-thumb" aria-hidden="true">
         <span className="turn-file-sheet" />
         <span className="turn-file-page">
@@ -193,7 +191,6 @@ export function InlineChartAnnotationCard({
       </button>
       <span className="turn-file-actions">
         <span className="turn-file-open is-solo" aria-hidden="true">
-          <PanelRight className="h-3.5 w-3.5" />
           {t('chat.turnFiles.open')}
         </span>
       </span>

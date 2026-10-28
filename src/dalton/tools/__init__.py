@@ -24,9 +24,9 @@ def build_dalton_tools(
     """Return role-appropriate Dalton tools to bind onto the main agent (`DALTON-HOOK(dalton-tools)`).
 
     - `chief_of_staff` (Home / Research Director):
-      `dalton_coverage_board`, `dalton_record_plan`, `dalton_agenda_note`, `dalton_watch_event`, `dalton_resolve_signals`, `dalton_schedule_automation`, `dalton_coverage_tracking`, `dalton_system_jobs`, `dalton_coverage`, `conversation_search` (internal/admin only), `check_language`, `ingest_company_wiki`, `dalton_check_done` (weekly-coverage-review, dalton-earnings-calendar only), `feishu_read`, `feishu_list_wiki`, `feishu_create_doc`, `feishu_append`
+      `dalton_coverage_board`, `dalton_record_plan`, `dalton_agenda_note`, `dalton_watch_event`, `dalton_resolve_signals`, `dalton_schedule_automation`, `dalton_coverage_tracking`, `dalton_system_jobs`, `dalton_coverage`, `conversation_search` (internal/admin only), `check_language`, `ingest_company_wiki`, `dalton_check_done` (weekly-coverage-review, dalton-earnings-calendar only), `feishu_read`, `feishu_list_wiki`, `feishu_create_doc`, `feishu_append`, `feishu_grant_access`
     - `analyst` (Company workspace):
-      `knowledge_update`, `knowledge_append_verdict`, `dalton_check_done`, `check_draft`, `check_language`, `publish_report`, `ingest_company_wiki`, `dalton_schedule_automation`, `dalton_coverage_tracking`, `dalton_system_jobs`, `conversation_search` (internal/admin only), `feishu_read`, `feishu_list_wiki`, `feishu_create_doc`, `feishu_append`
+      `knowledge_update`, `knowledge_append_verdict`, `dalton_check_done`, `check_draft`, `check_language`, `publish_report`, `ingest_company_wiki`, `dalton_schedule_automation`, `dalton_coverage_tracking`, `dalton_system_jobs`, `conversation_search` (internal/admin only), `feishu_read`, `feishu_list_wiki`, `feishu_create_doc`, `feishu_append`, `feishu_grant_access`
 
     ``user_tier`` ("admin" | "internal" | "external") withholds
     ``conversation_search`` from external members, who would only reach its
@@ -56,9 +56,17 @@ def build_dalton_tools(
         try:
             from src.dalton.tools.feishu_tools import create_feishu_tools
 
-            tools.extend(create_feishu_tools())
+            tools.extend(create_feishu_tools(filesystem_backend=filesystem_backend))
         except Exception as e:
             logger.debug("[DALTON_TOOLS] feishu_tools not loaded: %s", e)
+
+        # E3: the controlled bug-report inbox — internal only, never GitHub.
+        try:
+            from src.dalton.tools.issue_tools import create_issue_tools
+
+            tools.extend(create_issue_tools())
+        except Exception as e:
+            logger.debug("[DALTON_TOOLS] issue_tools not loaded: %s", e)
 
     if role == "chief_of_staff":
         if settings.knowledge.enabled:
@@ -111,6 +119,29 @@ def build_dalton_tools(
             )
         except Exception as e:
             logger.debug("[DALTON_TOOLS] wiki_tools not loaded: %s", e)
+        # D1: the sales-notes ingest and the unified router. Internal only —
+        # both refuse external members per call, and are mounted under the
+        # same gate as the wiki ingest.
+        try:
+            from src.dalton.tools.ingest_tools import (
+                build_ingest_research_tool,
+                build_ingest_sales_note_tool,
+            )
+
+            tools.append(
+                build_ingest_sales_note_tool(
+                    filesystem_backend=filesystem_backend,
+                    allow_home_workspace=True,
+                )
+            )
+            tools.append(
+                build_ingest_research_tool(
+                    filesystem_backend=filesystem_backend,
+                    allow_home_workspace=True,
+                )
+            )
+        except Exception as e:
+            logger.debug("[DALTON_TOOLS] ingest_tools not loaded: %s", e)
         return tools
 
     # Analyst workspace tools
@@ -163,5 +194,27 @@ def build_dalton_tools(
         )
     except Exception as e:
         logger.debug("[DALTON_TOOLS] wiki_tools not loaded: %s", e)
+
+    # D1: sales-notes ingest and the unified router (analyst workspaces).
+    try:
+        from src.dalton.tools.ingest_tools import (
+            build_ingest_research_tool,
+            build_ingest_sales_note_tool,
+        )
+
+        tools.append(
+            build_ingest_sales_note_tool(
+                filesystem_backend=filesystem_backend,
+                allow_home_workspace=False,
+            )
+        )
+        tools.append(
+            build_ingest_research_tool(
+                filesystem_backend=filesystem_backend,
+                allow_home_workspace=False,
+            )
+        )
+    except Exception as e:
+        logger.debug("[DALTON_TOOLS] ingest_tools not loaded: %s", e)
 
     return tools

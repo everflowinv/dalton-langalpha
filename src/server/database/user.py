@@ -16,6 +16,7 @@ from psycopg.types.json import Json
 from src.llms.preferences import MOVED_MODEL_KEYS, TuningError
 from src.server.database.pool import get_db_connection
 from src.server.database.user_lock import lock_user_profile
+from src.server.models.profile_vocabulary import structured_preferences
 from src.server.utils.db import UpdateQueryBuilder
 from src.dalton.credentials import credential_user_id  # DALTON-HOOK(team-credentials): resolve shared team credential holder
 
@@ -893,7 +894,7 @@ _USER_PROFILE_TTL = 86400  # 24h, kept fresh by explicit invalidation
 # previous shape wrote. Bump it whenever the dict below changes keys: a
 # migration can move preference data in raw SQL, under no application write
 # path, and nothing invalidates a profile cached before it ran.
-_USER_PROFILE_SHAPE = 1
+_USER_PROFILE_SHAPE = 2
 
 
 def _user_profile_cache_key(user_id: str) -> str:
@@ -934,6 +935,10 @@ async def get_user_profile_for_prompt(user_id: str) -> Optional[Dict[str, Any]]:
                 "timezone": user.get("timezone"),
                 "locale": user.get("locale"),
                 "agent_preference": preferences.get("agent_preference"),
+                # Only the structured keys: the free-text ones written before
+                # them stay in the profile file, where the agent reads them
+                # when it needs them, rather than in every turn's prompt.
+                "investment_profile": structured_preferences(preferences),
             }
     except Exception as e:
         logger.warning(f"Failed to fetch user profile for {user_id}: {e}")

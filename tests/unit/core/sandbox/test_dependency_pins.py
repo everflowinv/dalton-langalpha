@@ -1,6 +1,6 @@
 """Guards the hand-mirrored sandbox dependency list.
 
-``DEFAULT_DEPENDENCIES`` drives the Daytona snapshot and the no-snapshot
+``DEFAULT_DEPENDENCIES`` drives the Daytona snapshot, the E2B template and the no-snapshot
 install; ``Dockerfile.sandbox`` re-spells the same list because a Docker build
 cannot import Python. Nothing enforced the mirror, so the two images could
 drift into different toolchains for the same workspace — the failure surfaces
@@ -23,7 +23,9 @@ from ptc_agent.core.sandbox._defaults import (
 _ROOT = Path(__file__).resolve().parents[4]
 _DOCKERFILE = _ROOT / "Dockerfile.sandbox"
 _MCP_SETUP = _ROOT / "src" / "ptc_agent" / "core" / "sandbox" / "mcp_setup.py"
-_DAYTONA = _ROOT / "src" / "ptc_agent" / "core" / "sandbox" / "providers" / "daytona.py"
+_IMAGE_RECIPE = (
+    _ROOT / "src" / "ptc_agent" / "core" / "sandbox" / "providers" / "_image_recipe.py"
+)
 
 # `echo '<spec>' > /tmp/…overrides.txt` — the uv --override file, written
 # inline by every install path.
@@ -100,7 +102,7 @@ def test_both_playwright_ports_ride_one_version():
     assert f"playwright@{SANDBOX_PLAYWRIGHT_VERSION}" in _expand(npm_line, args)
 
 
-@pytest.mark.parametrize("path", [_DOCKERFILE, _MCP_SETUP, _DAYTONA])
+@pytest.mark.parametrize("path", [_DOCKERFILE, _MCP_SETUP, _IMAGE_RECIPE])
 def test_curl_cffi_override_is_spelled_identically(path: Path):
     """yfinance caps curl_cffi below what scrapling[all] needs; every install
     path resolves it with the same override, or one image ships a resolver

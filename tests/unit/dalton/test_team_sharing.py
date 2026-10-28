@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import create_autospec
@@ -37,8 +38,10 @@ from src.server.dependencies.usage_limits import ChatAuthResult
 from src.server.models.chat import ChatRequest
 from src.server.models.conversation import ThreadUpdateRequest
 from src.server.models.workspace import WorkspaceUpdate
+from src.server.services import workspace_files as ws_files_service
 from src.server.services.persistence.file import FilePersistenceService
 from src.server.services.turn_runtime import requested_workspace
+from src.ptc_agent.core.sandbox import PTCSandbox
 
 TEAM_EMAILS = (
     "richard.lu@dalton.test,chao.yu@dalton.test,"
@@ -101,6 +104,11 @@ def _enable_dalton_auth(monkeypatch: pytest.MonkeyPatch) -> None:
         dalton_sharing.get_workspace_sharing, side_effect=_fake_get_sharing
     )
     monkeypatch.setattr(dalton_sharing, "get_workspace_sharing", get_sharing_mock)
+    monkeypatch.setattr(
+        conv_db,
+        "user_has_threads_in_workspace",
+        create_autospec(conv_db.user_has_threads_in_workspace, return_value=False),
+    )
 
 
 def _disable_dalton_auth(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -707,8 +715,13 @@ class TestReadEndpointsAllowColleagues:
             "db_get_workspace",
             create_autospec(ws_files_crud.db_get_workspace, return_value=ws),
         )
-        acquire_spy = create_autospec(ws_files_crud._acquire_sandbox_to_change)
-        monkeypatch.setattr(ws_files_crud, "_acquire_sandbox_to_change", acquire_spy)
+        monkeypatch.setattr(
+            ws_files_service,
+            "db_get_workspace",
+            create_autospec(ws_files_service.db_get_workspace, return_value=ws),
+        )
+        acquire_spy = create_autospec(ws_files_crud.acquire_sandbox_to_change)
+        monkeypatch.setattr(ws_files_crud, "acquire_sandbox_to_change", acquire_spy)
         monkeypatch.setattr(
             ws_files_crud,
             "owner_work_dir",
@@ -1019,7 +1032,7 @@ class TestWriteEndpointsRejectColleagues:
                 user_id="u-chao", workspace_id=ws["workspace_id"]
             )
         assert exc_new_thread.value.status_code == 403
-        assert exc_new_thread.value.detail == "该功能下一期开放"
+        assert exc_new_thread.value.detail == "该功能尚未开放"
         get_ws_mock.assert_called_once_with(ws["workspace_id"])
 
         # Route-level send_new_thread_message also rejects creating a thread in colleague's workspace
@@ -1042,7 +1055,7 @@ class TestWriteEndpointsRejectColleagues:
                 raw_request=_make_request(),
             )
         assert exc_route_new.value.status_code == 403
-        assert exc_route_new.value.detail == "该功能下一期开放"
+        assert exc_route_new.value.detail == "该功能尚未开放"
 
         # 2. Route-level send_thread_message to an existing colleague thread -> 403
         auth_meta_mock.return_value = {
@@ -1060,7 +1073,7 @@ class TestWriteEndpointsRejectColleagues:
                 raw_request=_make_request(),
             )
         assert exc_send.value.status_code == 403
-        assert exc_send.value.detail == "该功能下一期开放"
+        assert exc_send.value.detail == "该功能尚未开放"
 
     @pytest.mark.asyncio
     async def test_file_write_delete_upload_backup_rejected_on_colleague_workspace(
@@ -1068,12 +1081,10 @@ class TestWriteEndpointsRejectColleagues:
     ) -> None:
         _enable_dalton_auth(monkeypatch)
         ws = _sample_workspace(user_id="u-richard", status="running")
-        from src.server.app.workspace_files import _shared as ws_files_shared
-
         monkeypatch.setattr(
-            ws_files_shared,
+            ws_files_service,
             "db_get_workspace",
-            create_autospec(ws_files_shared.db_get_workspace, return_value=ws),
+            create_autospec(ws_files_service.db_get_workspace, return_value=ws),
         )
 
         # Write file -> 403
@@ -1220,12 +1231,18 @@ class TestWriteEndpointsRejectColleagues:
             "db_get_workspace",
             create_autospec(ws_files_crud.db_get_workspace, return_value=stopped_ws),
         )
+        owned_mock = create_autospec(
+            ws_files_service.owned_workspace_on_computer, return_value=stopped_ws
+        )
+        monkeypatch.setattr(
+            ws_files_service,
+            "owned_workspace_on_computer",
+            owned_mock,
+        )
         monkeypatch.setattr(
             ws_files_crud,
             "owned_workspace_on_computer",
-            create_autospec(
-                ws_files_crud.owned_workspace_on_computer, return_value=stopped_ws
-            ),
+            owned_mock,
         )
         monkeypatch.setattr(
             ws_files_crud,
@@ -1302,3 +1319,278 @@ class TestWriteEndpointsRejectColleagues:
         )
         assert dl_res.status_code == 200
         assert dl_res.body == b"FOO=bar"
+
+
+class TestRangeDownloadPermissionMatrix:
+    """P0-2 (B6): the HTTP Range download path (#613) under Dalton sharing.
+
+    Every ranged read enters through the same gate as the whole-file read
+    (``owned_workspace_on_computer(need="read")``); ro colleagues never
+    receive a 206 from the mirror, warm, or live range helpers.
+    """
+
+    def _mirror_patches(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        row: dict[str, Any],
+        file_bytes: bytes = b"%PDF-1.7",
+    ) -> None:
+        ws = _sample_workspace(user_id="u-richard", status="stopped")
+        monkeypatch.setattr(
+            ws_files_crud,
+            "db_get_workspace",
+            create_autospec(ws_files_crud.db_get_workspace, return_value=ws),
+        )
+        monkeypatch.setattr(
+            ws_files_service,
+            "db_get_workspace",
+            create_autospec(ws_files_service.db_get_workspace, return_value=ws),
+        )
+        monkeypatch.setattr(
+            ws_files_crud,
+            "owner_work_dir",
+            create_autospec(
+                ws_files_crud.owner_work_dir,
+                return_value="/home/workspace/NVDA_Deep_Dive",
+            ),
+        )
+        monkeypatch.setattr(
+            FilePersistenceService,
+            "get_file_content",
+            create_autospec(FilePersistenceService.get_file_content, return_value=row),
+        )
+        monkeypatch.setattr(
+            ws_files_crud,
+            "get_vault_secrets_for_redaction",
+            create_autospec(
+                ws_files_crud.get_vault_secrets_for_redaction, return_value=[]
+            ),
+        )
+        monkeypatch.setattr(
+            ws_files_crud,
+            "http_file_bytes",
+            create_autospec(ws_files_crud.http_file_bytes, return_value=file_bytes),
+        )
+
+    @pytest.mark.asyncio
+    async def test_owner_range_download_of_mirror_binary_is_206(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Owner keeps upstream's ranged mirror read (no Dalton gate bites)."""
+        _enable_dalton_auth(monkeypatch)
+        pdf = b"%PDF-1.7" + bytes(range(256)) * 4
+        row = {
+            "file_name": "report.pdf",
+            "mime_type": "application/pdf",
+            "is_binary": True,
+            "blob_sha256": "digest-of-report",
+            "file_size": len(pdf),
+        }
+        self._mirror_patches(monkeypatch, row=row)
+        monkeypatch.setattr(
+            ws_files_crud,
+            "http_file_byte_range",
+            create_autospec(
+                ws_files_crud.http_file_byte_range,
+                side_effect=lambda _row, start, n, **_: (
+                    pdf[start : start + n],
+                    len(pdf),
+                ),
+            ),
+        )
+        response = await ws_files_crud.download_workspace_file(
+            "11111111-1111-4111-8111-111111111111",
+            x_user_id="u-richard",
+            request=_make_request({"range": "bytes=0-99"}),
+            path="report.pdf",
+            attachment=False,
+        )
+        assert response.status_code == 206
+        assert response.body == pdf[:100]
+
+    @pytest.mark.asyncio
+    async def test_ro_colleague_range_of_mirror_binary_is_403_not_206(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _enable_dalton_auth(monkeypatch)
+        row = {
+            "file_name": "report.pdf",
+            "mime_type": "application/pdf",
+            "is_binary": True,
+        }
+        self._mirror_patches(monkeypatch, row=row)
+        ranged_spy = create_autospec(ws_files_crud._stored_range_response)
+        monkeypatch.setattr(ws_files_crud, "_stored_range_response", ranged_spy)
+        with pytest.raises(HTTPException) as exc:
+            await ws_files_crud.download_workspace_file(
+                "11111111-1111-4111-8111-111111111111",
+                x_user_id="u-chao",
+                request=_make_request({"range": "bytes=0-99"}),
+                path="report.pdf",
+                attachment=False,
+            )
+        assert exc.value.status_code == 403
+        ranged_spy.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_ro_colleague_range_of_mirror_text_goes_whole_and_redacted(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _enable_dalton_auth(monkeypatch)
+        row = {
+            "file_name": "memo.md",
+            "mime_type": "text/markdown",
+            "is_binary": False,
+        }
+        self._mirror_patches(
+            monkeypatch, row=row, file_bytes=b"# Thesis\nStrong buy"
+        )
+        ranged_spy = create_autospec(ws_files_crud._stored_range_response)
+        monkeypatch.setattr(ws_files_crud, "_stored_range_response", ranged_spy)
+        response = await ws_files_crud.download_workspace_file(
+            "11111111-1111-4111-8111-111111111111",
+            x_user_id="u-chao",
+            request=_make_request({"range": "bytes=0-9"}),
+            path="memo.md",
+            attachment=False,
+        )
+        assert response.status_code == 200
+        assert b"Strong buy" in response.body
+        ranged_spy.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_ro_colleague_range_of_hidden_path_is_404(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _enable_dalton_auth(monkeypatch)
+        self._mirror_patches(
+            monkeypatch,
+            row={"file_name": "note.md", "mime_type": "text/markdown"},
+        )
+        with pytest.raises(HTTPException) as exc:
+            await ws_files_crud.download_workspace_file(
+                "11111111-1111-4111-8111-111111111111",
+                x_user_id="u-chao",
+                request=_make_request({"range": "bytes=0-9"}),
+                path=".agents/scratchpad/note.md",
+                attachment=False,
+            )
+        assert exc.value.status_code == 404
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("reader", ["u-outsider", ""])
+    async def test_non_member_and_unauthenticated_range_rejected_at_gate(
+        self, monkeypatch: pytest.MonkeyPatch, reader: str
+    ) -> None:
+        """Off-allowlist caller / no identity: the Range request dies in the
+        same entry check as every other read, before any range logic."""
+        _enable_dalton_auth(monkeypatch)
+        self._mirror_patches(
+            monkeypatch,
+            row={"file_name": "report.pdf", "mime_type": "application/pdf"},
+        )
+        with pytest.raises(HTTPException) as exc:
+            await ws_files_crud.download_workspace_file(
+                "11111111-1111-4111-8111-111111111111",
+                x_user_id=reader,
+                request=_make_request({"range": "bytes=0-9"}),
+                path="report.pdf",
+                attachment=False,
+            )
+        assert exc.value.status_code in (401, 403, 404)
+
+    @pytest.mark.asyncio
+    async def test_ro_colleague_range_of_external_owned_workspace_is_404(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _enable_dalton_auth(monkeypatch)
+        ws = _sample_workspace(user_id="u-outsider", status="stopped")
+        monkeypatch.setattr(
+            ws_files_crud,
+            "db_get_workspace",
+            create_autospec(ws_files_crud.db_get_workspace, return_value=ws),
+        )
+        monkeypatch.setattr(
+            ws_files_service,
+            "db_get_workspace",
+            create_autospec(ws_files_service.db_get_workspace, return_value=ws),
+        )
+        with pytest.raises(HTTPException) as exc:
+            await ws_files_crud.download_workspace_file(
+                ws["workspace_id"],
+                x_user_id="u-chao",
+                request=_make_request({"range": "bytes=0-9"}),
+                path="report.pdf",
+                attachment=False,
+            )
+        assert exc.value.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_ro_colleague_range_of_live_binary_never_reaches_range_helpers(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Running workspace: the warm and live range reads are both skipped
+        for a colleague, and the whole-file rules reject the binary with 403."""
+        _enable_dalton_auth(monkeypatch)
+        ws = _sample_workspace(user_id="u-richard", status="running")
+        monkeypatch.setattr(
+            ws_files_crud,
+            "db_get_workspace",
+            create_autospec(ws_files_crud.db_get_workspace, return_value=ws),
+        )
+        monkeypatch.setattr(
+            ws_files_service,
+            "db_get_workspace",
+            create_autospec(ws_files_service.db_get_workspace, return_value=ws),
+        )
+        monkeypatch.setattr(
+            ws_files_crud,
+            "owner_work_dir",
+            create_autospec(
+                ws_files_crud.owner_work_dir,
+                return_value="/home/workspace/NVDA_Deep_Dive",
+            ),
+        )
+        warm_spy = create_autospec(ws_files_crud._warm_range_response)
+        live_spy = create_autospec(ws_files_crud._live_range_response)
+        monkeypatch.setattr(ws_files_crud, "_warm_range_response", warm_spy)
+        monkeypatch.setattr(ws_files_crud, "_live_range_response", live_spy)
+
+        sandbox = create_autospec(PTCSandbox, instance=True)
+        sandbox.validate_path = lambda _p: True
+
+        @asynccontextmanager
+        async def _acquire(*_args):
+            yield sandbox, ws
+
+        monkeypatch.setattr(ws_files_crud, "acquire_sandbox_to_change", _acquire)
+
+        read_mock = create_autospec(ws_files_crud.read_contained_sandbox_file)
+        read_mock.return_value = (
+            "/home/workspace/NVDA_Deep_Dive/report.pdf",
+            b"%PDF-1.7 binary",
+        )
+        monkeypatch.setattr(
+            ws_files_crud, "read_contained_sandbox_file", read_mock
+        )
+        monkeypatch.setattr(
+            ws_files_crud,
+            "contained_absolute_path",
+            create_autospec(
+                ws_files_crud.contained_absolute_path,
+                return_value="/home/workspace/NVDA_Deep_Dive/report.pdf",
+            ),
+        )
+
+        with pytest.raises(HTTPException) as exc:
+            await ws_files_crud.download_workspace_file(
+                ws["workspace_id"],
+                x_user_id="u-chao",
+                request=_make_request({"range": "bytes=0-99"}),
+                path="report.pdf",
+                attachment=False,
+            )
+        assert exc.value.status_code == 403
+        warm_spy.assert_not_called()
+        live_spy.assert_not_called()

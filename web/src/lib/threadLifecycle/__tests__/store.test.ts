@@ -10,6 +10,7 @@ import {
   applyFeedEvent,
   applySnapshot,
   pruneThread,
+  raiseSeenToEffective,
   resetThreadLifecycle,
   setActiveThread,
   type SnapshotEntry,
@@ -293,6 +294,41 @@ describe('threadLifecycleStore — run states', () => {
 
     expect(result.current.status.get('t1')).toBe('idle');
     expect(result.current.revision).not.toBe(before);
+  });
+});
+
+// The server carries the seen cursor over a quiet wakeup check only when
+// every earlier run was seen, and says so on the settle.
+describe('a quiet wakeup check', () => {
+  const carriedSettle = (threadId: string, runSeq: number) =>
+    applyFeedEvent({
+      type: 'run_settled',
+      thread_id: threadId,
+      run_id: `r-${threadId}-${runSeq}`,
+      run_seq: runSeq,
+      status: 'completed',
+      last_seen_run_seq: runSeq,
+    });
+
+  it('leaves a seen thread seen', () => {
+    feed('t1', 'completed', 5);
+    raiseSeenToEffective('t1');
+    feed('t1', 'running', 6);
+    carriedSettle('t1', 6);
+    expect(read('t1').unseen).toBe(false);
+  });
+
+  it('leaves the dot to a check the server did not carry the cursor over', () => {
+    feed('t1', 'completed', 5);
+    raiseSeenToEffective('t1');
+    feed('t1', 'running', 6);
+    feed('t1', 'completed', 6);
+    expect(read('t1').unseen).toBe(true);
+  });
+
+  it('leaves a thread seen with no earlier run known', () => {
+    carriedSettle('t1', 6);
+    expect(read('t1').unseen).toBe(false);
   });
 });
 

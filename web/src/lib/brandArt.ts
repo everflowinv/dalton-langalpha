@@ -15,64 +15,87 @@
  */
 import { baseURL } from '@/pages/ChatAgent/utils/api/transport';
 
-import iconOpenai from '@/assets/providers/openai.png';
-import iconAnthropic from '@/assets/providers/anthropic.png';
-import iconGemini from '@/assets/providers/gemini.png';
-import iconOpenrouter from '@/assets/providers/openrouter.png';
-import iconZai from '@/assets/providers/z-ai.png';
-import iconMinimax from '@/assets/providers/minimax.png';
-import iconDashscope from '@/assets/providers/dashscope.png';
-import iconVolcengine from '@/assets/providers/volcengine.png';
-import iconMoonshot from '@/assets/providers/moonshot.png';
-import iconDeepseek from '@/assets/providers/deepseek.png';
-import iconGroq from '@/assets/providers/groq.png';
-import iconCerebras from '@/assets/providers/cerebras.png';
-import iconOllama from '@/assets/providers/ollama.png';
-import iconLmStudio from '@/assets/providers/lmstudio.png';
-import iconVllm from '@/assets/providers/vllm.png';
+import iconOpenai from '@/assets/providers/openai.svg';
+import iconAnthropic from '@/assets/providers/anthropic.svg';
+import iconGemini from '@/assets/providers/gemini.svg';
+import iconOpenrouter from '@/assets/providers/openrouter.svg';
+import iconZai from '@/assets/providers/z-ai.svg';
+import iconMinimax from '@/assets/providers/minimax.svg';
+import iconQwen from '@/assets/providers/qwen.svg';
+import iconDoubao from '@/assets/providers/doubao.svg';
+import iconKimi from '@/assets/providers/kimi.svg';
+import iconDeepseek from '@/assets/providers/deepseek.svg';
+import iconGroq from '@/assets/providers/groq.svg';
+import iconCerebras from '@/assets/providers/cerebras.svg';
+import iconOllama from '@/assets/providers/ollama.svg';
+import iconLmStudio from '@/assets/providers/lmstudio.svg';
+import iconVllm from '@/assets/providers/vllm.svg';
 
 export type BrandArt = {
   src: string;
-  /** The logo is a transparent glyph and needs a light bed to stay visible. */
-  padded?: boolean;
+  /**
+   * Drawn in black for a light ground, as a monochrome mark is, so a dark
+   * surface has to turn it light. An accent it carries keeps its color.
+   */
+  ink?: boolean;
+  /** A glyph with no ground of its own, so there is no edge to round, and a
+   *  rounded box would only cut off whatever reaches its corners. */
+  bare?: boolean;
 };
 
-/** Local runtimes ship their logo as a dark glyph on transparency. */
-const PADDED = new Set(['ollama', 'lm-studio', 'vllm']);
+/*
+ * Each mark is the vendor's glyph without the app-icon tile it often sits on,
+ * since every surface here gives it a ground of its own (the subagent badge's
+ * white disc, a provider card) and a square inside that reads as a blot at
+ * badge size. A family's own mark stands in where its models are what people
+ * know (Gemini, Qwen, Doubao, Kimi).
+ */
+const mark = (src: string, ink = false): BrandArt => ({ src, ink, bare: true });
 
-const LLM_PROVIDER_ART: Record<string, string> = {
-  openai: iconOpenai,
-  'codex-oauth': iconOpenai,
-  anthropic: iconAnthropic,
-  'claude-oauth': iconAnthropic,
+const OPENAI = mark(iconOpenai, true);
+const ANTHROPIC = mark(iconAnthropic, true);
+const OPENROUTER = mark(iconOpenrouter, true);
+const ZAI = mark(iconZai, true);
+const MINIMAX = mark(iconMinimax);
+const QWEN = mark(iconQwen);
+const DOUBAO = mark(iconDoubao);
+const KIMI = mark(iconKimi, true);
+
+/** Every manifest provider and its variants, which wear their parent's mark. */
+const LLM_PROVIDER_ART: Record<string, BrandArt> = {
+  openai: OPENAI,
+  'codex-oauth': OPENAI,
+  anthropic: ANTHROPIC,
+  'claude-oauth': ANTHROPIC,
   // DALTON-HOOK(native-oauth-ui): P0N.3 Antigravity brand icon
-  'antigravity-oauth': iconGemini,
-  gemini: iconGemini,
-  openrouter: iconOpenrouter,
-  'z-ai': iconZai,
-  'z-ai-coding': iconZai,
-  'z-ai-cn': iconZai,
-  'z-ai-cn-coding': iconZai,
-  minimax: iconMinimax,
-  'minimax-coding': iconMinimax,
-  dashscope: iconDashscope,
-  volcengine: iconVolcengine,
-  'doubao-coding': iconVolcengine,
-  moonshot: iconMoonshot,
-  'moonshot-coding': iconMoonshot,
-  deepseek: iconDeepseek,
-  groq: iconGroq,
-  cerebras: iconCerebras,
-  ollama: iconOllama,
-  'lm-studio': iconLmStudio,
-  vllm: iconVllm,
+  'antigravity-oauth': mark(iconGemini),
+  gemini: mark(iconGemini),
+  openrouter: OPENROUTER,
+  // Served through an OpenRouter key, routed to DeepInfra.
+  deepinfra: OPENROUTER,
+  'z-ai': ZAI,
+  'z-ai-coding': ZAI,
+  'z-ai-cn': ZAI,
+  'z-ai-cn-coding': ZAI,
+  minimax: MINIMAX,
+  'minimax-coding': MINIMAX,
+  dashscope: QWEN,
+  'dashscope-intl': QWEN,
+  volcengine: DOUBAO,
+  'doubao-coding': DOUBAO,
+  moonshot: KIMI,
+  'moonshot-coding': KIMI,
+  deepseek: mark(iconDeepseek),
+  groq: mark(iconGroq),
+  cerebras: mark(iconCerebras, true),
+  ollama: mark(iconOllama, true),
+  'lm-studio': mark(iconLmStudio, true),
+  vllm: mark(iconVllm),
 };
 
 /** The bundled mark for an LLM provider id, or undefined for one we do not ship. */
 export function llmProviderArt(provider: string): BrandArt | undefined {
-  const src = LLM_PROVIDER_ART[provider];
-  if (!src) return undefined;
-  return { src, padded: PADDED.has(provider) };
+  return Object.hasOwn(LLM_PROVIDER_ART, provider) ? LLM_PROVIDER_ART[provider] : undefined;
 }
 
 /**

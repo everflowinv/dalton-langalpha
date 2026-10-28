@@ -5,10 +5,7 @@ import {
   getCompletedSummary,
   type ToolCategory,
 } from '../toolDisplayConfig';
-import { formatThoughtFor } from '@/lib/elapsed';
-
-/** Translation function signature compatible with i18next's t(). */
-type TFn = (key: string, opts?: Record<string, unknown>) => string;
+import { formatThoughtFor, type TFn } from '@/lib/elapsed';
 
 import type { ActivityItem, ToolActivityItem } from './activityTypes';
 export type { ActivityItem, LiveState } from './activityTypes';
@@ -54,7 +51,7 @@ const FOLDED_MAX = 3;
 export function classifyToolCall(item: ActivityItem): ToolCategory | 'reasoning' {
   return item.type === 'reasoning'
     ? 'reasoning'
-    : categorizeTool(item.toolName || '', item.toolCall);
+    : categorizeTool(item.toolName || '', item.toolCall, item.root);
 }
 
 /** Per-category counts for a run, in the order the header reads them. */
@@ -123,16 +120,24 @@ function fragmentLabel(f: SummaryFragment, t: TFn): string {
   return t('toolArtifact.categoryCount.generic', { count: f.count });
 }
 
+function failedCall(item: ActivityItem): boolean {
+  return item.type === 'tool_call' && (item.isFailed === true || item._liveState === 'failed');
+}
+
 /**
  * The run's one-line account of itself, e.g. "Ran 2 searches · read 3 files and
  * more". `expanded` drops the fold cap, since the rows themselves are on screen.
+ * `countFailures` adds "1 failed", never cut by the cap: on the status line a
+ * failed call has no row of its own, and the summary is where it stays findable.
  */
 export function summarizeCompletedItems(
   items: ActivityItem[],
   t: TFn,
-  options?: { expanded?: boolean },
+  options?: { expanded?: boolean; countFailures?: boolean },
 ): string | undefined {
   const fragments = summaryFragments(items);
+  const failures = options?.countFailures ? items.filter(failedCall).length : 0;
+  const failed = failures > 0 ? [t('toolArtifact.categoryCount.failed', { count: failures })] : [];
   let label: string | undefined;
 
   const reasoning = fragments.find((f) => f.slot === 'reasoning');
@@ -149,13 +154,15 @@ export function summarizeCompletedItems(
     const ordered = [...fragments.filter(isPriority), ...fragments.filter((f) => !isPriority(f))];
     const overflowing = !options?.expanded && ordered.length > FOLDED_MAX;
     const visible = overflowing ? ordered.slice(0, FOLDED_MAX) : ordered;
-    label = visible.map((f) => fragmentLabel(f, t)).join(' · ');
-    if (overflowing) label = `${label} ${t('toolArtifact.andMore')}`;
+    // "and more" ends the counts it cuts, before the failures: after them it
+    // read as more calls having failed.
+    const shown = visible.map((f) => fragmentLabel(f, t)).join(' · ');
+    label = [overflowing ? `${shown} ${t('toolArtifact.andMore')}` : shown, ...failed].join(' · ');
   } else if (fragments.length === 1 && reasoning?.thoughtMs !== undefined) {
     // A run that was only thought: say how long, not how many.
     label = fragmentLabel(reasoning, t);
   } else if (items.length > 0) {
-    label = t('toolArtifact.nStepsCompleted', { count: items.length });
+    label = [t('toolArtifact.nStepsCompleted', { count: items.length }), ...failed].join(' · ');
   }
 
   // Capitalize the first character only — embedded proper nouns and casing
@@ -166,15 +173,15 @@ export function summarizeCompletedItems(
 
 /** Present tense, for a call that is still running: "Reading memory about …". */
 export function liveToolLabel(item: ToolActivityItem, t: TFn): string {
-  return getActiveLabel(item.toolName || '', item.toolCall, t);
+  return getActiveLabel(item.toolName || '', item.toolCall, t, item.root);
 }
 
 /** Past tense, for a settled row: "Read memory", "Activated skill". */
 export function completedToolTitle(item: ToolActivityItem, t: TFn): string {
-  return getCompletedRowTitle(item.toolName || '', item.toolCall, t, item.toolCallResult?.artifact);
+  return getCompletedRowTitle(item.toolName || '', item.toolCall, t, { artifact: item.toolCallResult?.artifact, root: item.root });
 }
 
 /** The object a settled row names, rendered as its pill; null when there is none. */
 export function completedToolSummary(item: ToolActivityItem, t: TFn): string | null {
-  return getCompletedSummary(item.toolName || '', item.toolCall, t);
+  return getCompletedSummary(item.toolName || '', item.toolCall, t, item.root);
 }

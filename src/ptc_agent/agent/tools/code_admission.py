@@ -12,31 +12,33 @@ import contextlib
 import os
 import random
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from typing import Any
 
 import structlog
 
+from ptc_agent.agent.tools.command_handoff import HANDOFF_WAIT_S
+
 logger = structlog.get_logger(__name__)
 
-# One slot per tier vCPU.
-CODE_SLOTS_BY_TIER: dict[str, int] = {
-    "standard": 1,
-    "performance": 2,
-    "max": 4,
-}
-
-# Unknown deployment tiers get the safest bound: overserialization beats oversubscription.
+# A tier the machine's provider does not size (a row from another colour, a
+# tier since removed) gets the safest bound: overserialization beats
+# oversubscription.
 DEFAULT_CODE_SLOTS = 1
 
 # Jitter prevents workers from repeatedly colliding after a release.
 _QUEUE_BASE_DELAY_S = 0.25
 _QUEUE_MAX_DELAY_S = 2.0
 
-# Cover all three PTCSandbox.execute attempts plus transport slack.
+# A slot is held for the call's wait, which is at most HANDOFF_WAIT_S across
+# all three start_code_job launches (a run and two auto-install reruns, each
+# waiting only what is left), plus each launch's transport slack and the
+# installs between them.
 _EXECUTE_ATTEMPTS = 3
 _EXECUTE_TRANSPORT_SLACK_S = 30
-_DEFAULT_MAX_EXECUTION_TIME_S = 300
+# One auto-install: its exec is retried for up to 120 s, and the attempt in
+# flight then may run its own 60 s (``mcp_setup._install_package``).
+_INSTALL_BOUND_S = 180
 _REAP_MARGIN_S = 60
 
 # Process-local state gates logging only, never admission truth.
@@ -47,11 +49,27 @@ def code_run_key(computer_id: str) -> str:
     return f"sandbox:code_run:{computer_id}"
 
 
-def code_slots_for_tier(tier: str | None) -> int:
-    return CODE_SLOTS_BY_TIER.get((tier or "").strip().lower(), DEFAULT_CODE_SLOTS)
+def code_slots_for_tier(tier: str | None, resource_tiers: Mapping[str, Any] | None) -> int:
+    """One slot per vCPU of the tier as the machine's provider sizes it.
+
+    Read off the preset rather than the name, since a name does not fix a size:
+    Large went from 4 vCPU to 2 while keeping its id.
+    """
+    preset = (resource_tiers or {}).get((tier or "").strip().lower())
+    cpu = getattr(preset, "cpu", None)
+    return cpu if isinstance(cpu, int) and cpu >= 1 else DEFAULT_CODE_SLOTS
 
 
-def reap_horizon_seconds(max_execution_time: int | None = None) -> int:
+def resource_tiers_of(session: Any) -> Mapping[str, Any] | None:
+    """The tiers of the provider the session's machine runs on; None when unknown."""
+    sandbox = getattr(getattr(session, "config", None), "sandbox", None)
+    try:
+        return sandbox.settings_for(sandbox.provider).resource_tiers
+    except (AttributeError, ValueError):
+        return None
+
+
+def reap_horizon_seconds() -> int:
     """Exceed the longest live hold or reaping admits runs beyond the limit.
 
     CODE_RUN_SLOT_TTL overrides the horizon for tests.
@@ -59,28 +77,20 @@ def reap_horizon_seconds(max_execution_time: int | None = None) -> int:
     override = os.getenv("CODE_RUN_SLOT_TTL")
     if override:
         return int(override)
-    per_attempt = (
-        max_execution_time or _DEFAULT_MAX_EXECUTION_TIME_S
-    ) + _EXECUTE_TRANSPORT_SLACK_S
-    return _EXECUTE_ATTEMPTS * per_attempt + _REAP_MARGIN_S
+    return (
+        HANDOFF_WAIT_S
+        + _EXECUTE_ATTEMPTS * _EXECUTE_TRANSPORT_SLACK_S
+        + (_EXECUTE_ATTEMPTS - 1) * _INSTALL_BOUND_S
+        + _REAP_MARGIN_S
+    )
 
 
-def queue_timeout_seconds(max_execution_time: int | None = None) -> int:
-    """Wait through one holder attempt but not a leaked slot; CODE_RUN_QUEUE_TIMEOUT is for tests."""
+def queue_timeout_seconds() -> int:
+    """Wait through one holder's wait but not a leaked slot; CODE_RUN_QUEUE_TIMEOUT is for tests."""
     override = os.getenv("CODE_RUN_QUEUE_TIMEOUT")
     if override:
         return int(override)
-    return (
-        max_execution_time or _DEFAULT_MAX_EXECUTION_TIME_S
-    ) + _EXECUTE_TRANSPORT_SLACK_S
-
-
-def max_execution_time_of(backend: Any) -> int | None:
-    security = getattr(
-        getattr(getattr(backend, "sandbox", None), "config", None), "security", None
-    )
-    value = getattr(security, "max_execution_time", None)
-    return value if isinstance(value, int) else None
+    return HANDOFF_WAIT_S + _EXECUTE_TRANSPORT_SLACK_S
 
 
 def _log_fail_open_once(reason: str, **fields: Any) -> None:
@@ -162,7 +172,7 @@ async def code_run_slot(
     computer_id: str | None,
     *,
     tier: str | None = None,
-    max_execution_time: int | None = None,
+    resource_tiers: Mapping[str, Any] | None = None,
 ) -> AsyncIterator[str | None]:
     if not computer_id:
         yield None
@@ -177,9 +187,9 @@ async def code_run_slot(
     slot_id = await _queue_for_slot(
         client,
         key,
-        limit=code_slots_for_tier(tier),
-        stale_after=reap_horizon_seconds(max_execution_time),
-        queue_timeout=queue_timeout_seconds(max_execution_time),
+        limit=code_slots_for_tier(tier, resource_tiers),
+        stale_after=reap_horizon_seconds(),
+        queue_timeout=queue_timeout_seconds(),
     )
     try:
         yield slot_id

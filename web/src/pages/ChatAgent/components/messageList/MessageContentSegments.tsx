@@ -1,20 +1,22 @@
-import React, { useState, useEffect, useMemo, useCallback, memo } from 'react';
+import React, { useState, useEffect, useLayoutEffect, useMemo, useCallback, memo } from 'react';
 import ActivityBlock from '../ActivityBlock';
 import type { ActivityItem } from './activityTypes';
 import { INLINE_ARTIFACT_MAP, openCardTarget } from '../charts/InlineArtifactCards';
-import { PILL_ROW_CLASS, isPillArtifactType } from '../charts/pillArtifacts';
+import { PILL_ROW_CLASS } from '../charts/pillArtifacts';
 import type { OpenFileHandler } from '../../utils/fileLocation';
 import UserQuestionCard from '../UserQuestionCard';
 import CreateWorkspaceCard from '../CreateWorkspaceCard';
 import StartQuestionCard from '../StartQuestionCard';
-import PTCAgentCard from '../PTCAgentCard';
 import SecretaryConfirmCard from '../SecretaryConfirmCard';
 import CreditPauseCard from '../CreditPauseCard';
 import ToolApprovalCard from '../ToolApprovalCard';
 import PastPlanCard from '../PastPlanCard';
-import TaskSegmentCard from './TaskSegmentCard';
-import { SubagentStopNotice } from '../SubagentTaskMessageContent';
-import type { CreditPauseState, SubagentTaskRecord, ToolApprovalState } from '@/types/chat';
+import WorkflowRunCard from '../WorkflowRunCard';
+import SubagentRun, { type SubagentRunMember } from './SubagentRun';
+import AnalystHandoffRun, { type AnalystHandoffMember } from './AnalystHandoffRun';
+import { WORKFLOW_TASK_TYPE } from '../../session/subagents/workflowRunState';
+import { SubagentStopNotices } from '../SubagentStopNotice';
+import type { CreditPauseState, PendingToolCallChunk, PTCAgentProposalState, SubagentTaskRecord, ToolApprovalState } from '@/types/chat';
 import TextMessageContent from '../TextMessageContent';
 import { visibleParagraphPrefix } from '@/lib/paragraphGate';
 import { useTranscriptDisplay } from '@/lib/transcriptDisplay';
@@ -24,12 +26,15 @@ import { normalizeSubagentText } from './normalizeSubagentText';
 import StructuredResultBlock from './StructuredResultBlock';
 import { parseStructuredResult } from '../../utils/structuredResult';
 import { useMessageActions } from './MessageActionsContext';
+import { useWorkspaceFolders } from '../../contexts/WorkspaceContext';
 import { FoldPanel } from './FoldPanel';
+import { CardArrivals, type ArrivingCard } from './CardArrivals';
+import { useMotionSafe } from '@/lib/reducedMotion';
+import { useProseReport } from './proseTyping';
 import { projectContent, blockIsProcess, blockVisible, streamingTextBlockIndex, type ContentProjection } from './contentProjection';
 import { EMPTY_OBJ } from './types';
 import type { ContentSegmentRecord, FoldState, ToolCallProcessRecord } from './types';
 import type {
-  CompactArtifactRenderBlock,
   CreateWorkspaceRenderBlock,
   CreditPauseRenderBlock,
   HtmlWidgetRenderBlock,
@@ -57,7 +62,7 @@ interface MessageContentSegmentsProps {
   userQuestions?: Record<string, Record<string, unknown>>;
   workspaceProposals?: Record<string, Record<string, unknown>>;
   questionProposals?: Record<string, Record<string, unknown>>;
-  pendingToolCallChunks?: Record<string, Record<string, unknown>>;
+  pendingToolCallChunks?: Record<string, PendingToolCallChunk>;
   isStreaming?: boolean;
   /** How much of the turn this bubble draws; `unfolded` is the full transcript. */
   fold?: FoldState;
@@ -65,12 +70,14 @@ interface MessageContentSegmentsProps {
   isTurnTail?: boolean;
   isSubagentView?: boolean;
   readOnly?: boolean;
-  ptcAgentProposals?: Record<string, Record<string, unknown>>;
+  ptcAgentProposals?: Record<string, PTCAgentProposalState>;
   secretaryActionProposals?: Record<string, Record<string, unknown>>;
   creditPauses?: Record<string, CreditPauseState>;
   toolApprovals?: Record<string, ToolApprovalState>;
   htmlWidgetProcesses?: Record<string, Record<string, unknown>>;
   dispatcherContext?: { threadId: string; workspaceId: string } | null;
+  /** The message these are, under which its prose reports its typing. */
+  messageId?: string;
 }
 
 interface TextBlockProps {
@@ -81,6 +88,7 @@ interface TextBlockProps {
   isReplyStart: boolean;
   onOpenFile?: OpenFileHandler;
   onRevealed?: (key: string, done: boolean) => void;
+  messageId?: string;
 }
 
 /** Blocks that wait for the prose above them to finish typing.
@@ -98,15 +106,21 @@ const HOLDS_FOR_PROSE = new Set<RenderBlock['type']>([
   'activity', 'subagent_task', 'html_widget', 'compact_artifact', 'notification',
 ]);
 
-/** A compact artifact whose card is a pill, which sits beside its neighbours. */
-function isPillBlock(block: RenderBlock): boolean {
-  if (block.type !== 'compact_artifact') return false;
-  const result = (block as CompactArtifactRenderBlock).proc.toolCallResult as Record<string, unknown> | undefined;
-  return isPillArtifactType((result?.artifact as Record<string, unknown> | undefined)?.type);
+/** Whitespace between two blocks, such as the "\n\n" a model writes between
+ *  two tool calls. It draws nothing, so it is treated as nothing: it neither
+ *  renders nor parts the blocks on either side of it. */
+function isBlankText(block: RenderBlock): boolean {
+  return block.type === 'text' && !((block as TextRenderBlock).segment.content ?? '').trim();
 }
 
-function TextBlock({ block, isStreaming, isSubagentView, isReplyStart, onOpenFile, onRevealed }: TextBlockProps): React.ReactElement | null {
-  const report = useCallback((done: boolean) => onRevealed?.(block.key, done), [onRevealed, block.key]);
+function TextBlock({ block, isStreaming, isSubagentView, isReplyStart, onOpenFile, onRevealed, messageId }: TextBlockProps): React.ReactElement | null {
+  // Told twice: the message holds what follows this block for it, and the
+  // list holds the turn running while it types (see ProseTyping).
+  const reportTyping = useProseReport(messageId, block.key);
+  const report = useCallback((done: boolean) => {
+    onRevealed?.(block.key, done);
+    reportTyping(done);
+  }, [onRevealed, block.key, reportTyping]);
   const { streamingMode } = useTranscriptDisplay();
   const raw = block.segment.content ?? '';
   // A schema-constrained subagent answers with one JSON object, which the
@@ -130,8 +144,8 @@ function TextBlock({ block, isStreaming, isSubagentView, isReplyStart, onOpenFil
       onRevealed={report}
     />
   );
-  // A structured result lands whole.
-  useEffect(() => { if (structured) report(true); }, [structured, report]);
+  // A structured result lands whole. Reported when the prose would be.
+  useLayoutEffect(() => { if (structured) report(true); }, [structured, report]);
   // What will actually be painted, which is not the same as what has arrived:
   // paragraph mode holds the sentence being written and renders nothing until
   // the first boundary lands. The wrapper keys on this rather than on the raw
@@ -142,8 +156,9 @@ function TextBlock({ block, isStreaming, isSubagentView, isReplyStart, onOpenFil
   return isReplyStart && rendersNow ? <div data-reply-start="">{textEl}</div> : textEl;
 }
 
-export const MessageContentSegments = memo(function MessageContentSegments({ segments, contentProjection, reasoningProcesses, toolCallProcesses, todoListProcesses: _todoListProcesses, subagentTasks, userQuestions = EMPTY_OBJ, workspaceProposals = EMPTY_OBJ, questionProposals = EMPTY_OBJ, pendingToolCallChunks = EMPTY_OBJ, isStreaming, fold = 'unfolded', isTurnTail = false, isSubagentView = false, readOnly = false, ptcAgentProposals = EMPTY_OBJ, secretaryActionProposals = EMPTY_OBJ, creditPauses = EMPTY_OBJ, toolApprovals = EMPTY_OBJ, htmlWidgetProcesses = EMPTY_OBJ, dispatcherContext }: MessageContentSegmentsProps): React.ReactElement {
+export const MessageContentSegments = memo(function MessageContentSegments({ segments, contentProjection, reasoningProcesses, toolCallProcesses, todoListProcesses: _todoListProcesses, subagentTasks, userQuestions = EMPTY_OBJ, workspaceProposals = EMPTY_OBJ, questionProposals = EMPTY_OBJ, pendingToolCallChunks = EMPTY_OBJ, isStreaming, fold = 'unfolded', isTurnTail = false, isSubagentView = false, readOnly = false, ptcAgentProposals = EMPTY_OBJ, secretaryActionProposals = EMPTY_OBJ, creditPauses = EMPTY_OBJ, toolApprovals = EMPTY_OBJ, htmlWidgetProcesses = EMPTY_OBJ, dispatcherContext, messageId }: MessageContentSegmentsProps): React.ReactElement {
   const { turnDisplay } = useTranscriptDisplay();
+  const motionSafe = useMotionSafe();
   const {
     onOpenSubagentTask, onOpenFile, onToolCallDetailClick, onOpenChart,
     onAnswerQuestion, onSkipQuestion,
@@ -171,11 +186,18 @@ export const MessageContentSegments = memo(function MessageContentSegments({ seg
   // next row is due. It is state rather than a `Date.now()` inside the build:
   // a cached computation only reruns for inputs it can see.
   const [now, setNow] = useState(Date.now);
+  const root = useWorkspaceFolders()?.rootDir;
+  // `resuming` still counts: the request is in flight and no run has opened,
+  // so the tasks really are stopped until admission answers.
+  const creditPausePending = useMemo(
+    () => Object.values(creditPauses).some((p) => p.status !== 'resumed'),
+    [creditPauses],
+  );
 
   const projection = useMemo(() => {
     if (contentProjection && (contentProjection.nextExpiry === null || contentProjection.nextExpiry > now)) return contentProjection;
-    return projectContent({ segments, reasoningProcesses, toolCallProcesses, isStreaming, isSubagentView, pendingToolCallChunks, now }, contentProjection);
-  }, [contentProjection, segments, reasoningProcesses, toolCallProcesses, isStreaming, isSubagentView, pendingToolCallChunks, now]);
+    return projectContent({ segments, reasoningProcesses, toolCallProcesses, isStreaming, isSubagentView, pendingToolCallChunks, now, root }, contentProjection);
+  }, [contentProjection, segments, reasoningProcesses, toolCallProcesses, isStreaming, isSubagentView, pendingToolCallChunks, now, root]);
   const { blocks: renderBlocks, preparingToolCall, nextExpiry } = projection;
 
   useEffect(() => {
@@ -190,21 +212,18 @@ export const MessageContentSegments = memo(function MessageContentSegments({ seg
   // last token of the prose it follows: mounted at once, its row would sit
   // under a paragraph still being typed, and the reader sees the tools land
   // before the words. So an activity block waits for the prose above it to
-  // catch up (only `false` holds: a block that has not reported is not
-  // typing), and prose with an activity block after it is finished, so it
+  // catch up, and prose with an activity block after it is finished, so it
   // types its tail out in the finish window rather than at reading pace.
   const [revealed, setRevealed] = useState<Record<string, boolean>>({});
   const onRevealed = useCallback((key: string, done: boolean) => {
     setRevealed((prev) => (prev[key] === done ? prev : { ...prev, [key]: done }));
   }, []);
 
-  let lastTextBlockIdx = -1;
   let lastActivityBlockIdx = -1;
   // Task ids in this message, for the stop notices rendered after the prose.
   const taskSubagentIds: string[] = [];
   for (let i = 0; i < renderBlocks.length; i++) {
     const b = renderBlocks[i];
-    if (b.type === 'text') lastTextBlockIdx = i;
     if (b.type === 'subagent_task') {
       const id = b.segment.subagentId;
       if (id) taskSubagentIds.push(id);
@@ -228,18 +247,59 @@ export const MessageContentSegments = memo(function MessageContentSegments({ seg
     let waiting = false;
     for (let i = 0; i < renderBlocks.length; i++) {
       const b = renderBlocks[i];
-      // Unreported holds too. A text block reports from an effect, so on the
-      // commit that first paints it there is no answer yet, and reading that
-      // silence as "revealed" painted the card beneath it for one frame and
-      // then took it away. Every streaming text block reports on its first
-      // effect, so the wait is released a frame later at worst.
+      if (isBlankText(b)) continue;
+      // Unreported holds too. A text block reports from a layout effect of
+      // the commit that first draws it, and reading the silence before it as
+      // "revealed" mounted the card beneath it only to take it away again.
+      // The report lands before that commit paints, so the wait costs nothing.
       if (b.type === 'text') waiting = revealed[b.key] !== true;
       else heldForProse[i] = waiting && HOLDS_FOR_PROSE.has(b.type);
     }
   }
 
+  const proposalOf = (block: PTCAgentRenderBlock): PTCAgentProposalState | undefined =>
+    block.proposal ?? ptcAgentProposals[block.segment.proposalId!];
+
+  /** Blocks drawn as one row or group with their like neighbours. */
+  const runKind = (block: RenderBlock): 'pill' | 'subagent' | 'analyst' | null => {
+    if (block.type === 'compact_artifact') return block.card?.kind === 'pill' ? 'pill' : null;
+    if (block.type === 'subagent_task') {
+      const id = block.segment.subagentId;
+      // A workflow run has a card of its own and breaks a run of spawns.
+      return id && subagentTasks[id]?.type !== WORKFLOW_TASK_TYPE ? 'subagent' : null;
+    }
+    // DALTON-HOOK(team-sharing): render analyst handoff rows/cards in read-only mode
+    if (block.type === 'ptc_agent') return proposalOf(block) ? 'analyst' : null;
+    return null;
+  };
+
   const blockIsVisible = renderBlocks.map((block) => blockVisible(projection, block, fold, isTurnTail));
   const blockFolds = renderBlocks.map((block) => fold !== 'unfolded' && blockIsProcess(projection, block, isTurnTail));
+
+  // A lookup's card draws one box with the lookup card of its type above it:
+  // a series of quotes or charts reads as one, but a search under a chart
+  // would read as part of it. Each stays a block of its own, keyed by itself,
+  // so a call landing ahead of a card already drawn moves that card rather
+  // than drawing it again, cutting its arrival short. Blank text between the
+  // two parts nothing; a block held for the prose, or folding or showing
+  // apart from its neighbour, does.
+  const lookupType = renderBlocks.map((block) => (block.type === 'compact_artifact' && block.card?.kind === 'call'
+    && projection.roles.get(block.key) === 'process' ? block.card.type : null));
+  const joinsAbove: boolean[] = new Array(renderBlocks.length).fill(false);
+  for (let i = 0, above = -1; i < renderBlocks.length; i++) {
+    if (isBlankText(renderBlocks[i])) continue;
+    joinsAbove[i] = above >= 0 && lookupType[i] !== null && lookupType[i] === lookupType[above]
+      && !heldForProse[i] && !heldForProse[above]
+      && blockFolds[i] === blockFolds[above] && blockIsVisible[i] === blockIsVisible[above];
+    above = i;
+  }
+
+  // The cards a row can hand its place to as its call lands.
+  const arrivingCards: ArrivingCard[] = [];
+  renderBlocks.forEach((block, i) => {
+    if (heldForProse[i] || !blockIsVisible[i] || block.type !== 'compact_artifact' || block.card?.kind !== 'call') return;
+    arrivingCards.push({ key: block.key, call: block.toolCallId, settledAt: block.proc._settledAt as number | undefined });
+  });
 
   const renderBlock = (block: RenderBlock, blockIdx: number): React.ReactElement | null => {
 
@@ -250,6 +310,11 @@ export const MessageContentSegments = memo(function MessageContentSegments({ seg
               items={block.items}
               preparingToolCall={blockIdx === lastActivityBlockIdx ? preparingToolCall : null}
               isStreaming={isStreaming ?? false}
+              /* One status line per turn: the newest activity of a running
+                 turn holds it, so it moves to a later block when one opens.
+                 The turn's liveness, not the stream's, which drops between
+                 model calls and would take the line away in every gap. */
+              holdsLine={fold === 'live' && isTurnTail && blockIdx === lastActivityBlockIdx}
               presentation={fold === 'unfolded' ? 'inline' : fold === 'expanded' ? 'expanded' : 'folded'}
               /* Verbose: a thought still streaming shows its text; settled, it
                  folds like any other. The preference reaches no further. */
@@ -262,15 +327,19 @@ export const MessageContentSegments = memo(function MessageContentSegments({ seg
         }
 
         if (block.type === 'compact_artifact') {
-          const artifact = ((block as CompactArtifactRenderBlock).proc.toolCallResult as Record<string, unknown> | undefined)?.artifact as Record<string, unknown> | undefined;
-          const ChartComponent = artifact ? INLINE_ARTIFACT_MAP[artifact.type as string] : null;
-          if (!ChartComponent) return null;
+          const { artifact, card, toolCallId } = block;
+          if (!card) return null;
+          const Card = INLINE_ARTIFACT_MAP[card.type];
           return (
-            <div key={block.key}>
-              <ChartComponent
-                artifact={artifact!}
-                toolArgs={(block as CompactArtifactRenderBlock).proc.toolCall?.args}
-                onClick={() => openCardTarget(artifact, onOpenChart, () => onToolCallDetailClick?.((block as CompactArtifactRenderBlock).toolCallId))}
+            <div
+              key={block.key}
+              data-card-arrival={card.kind === 'call' ? block.key : undefined}
+              data-card-join={joinsAbove[blockIdx] ? '' : undefined}
+            >
+              <Card
+                artifact={artifact}
+                toolArgs={block.proc.toolCall?.args}
+                onClick={() => openCardTarget(artifact, onOpenChart, () => onToolCallDetailClick?.(toolCallId))}
               />
             </div>
           );
@@ -289,10 +358,11 @@ export const MessageContentSegments = memo(function MessageContentSegments({ seg
               key={block.key}
               block={block as TextRenderBlock}
               isStreaming={blockIdx === streamingTextIdx}
-              isReplyStart={blockIdx === lastTextBlockIdx}
+              isReplyStart={block.key === projection.lastTextKey}
               isSubagentView={isSubagentView}
               onOpenFile={onOpenFile}
               onRevealed={onRevealed}
+              messageId={messageId}
             />
           );
         }
@@ -316,16 +386,24 @@ export const MessageContentSegments = memo(function MessageContentSegments({ seg
           );
         }
 
+        // A workflow run; a subagent spawn is drawn by its run below.
         if (block.type === 'subagent_task') {
           const subId = (block as SubagentTaskRenderBlock).segment.subagentId!;
+          const task = subagentTasks[subId];
+          // Absent while the card is still being derived.
+          if (!task) return null;
+          const launchFailed = task.status === 'error' && !!task.launchFailed;
           return (
-            <TaskSegmentCard
+            <WorkflowRunCard
               key={block.key}
               subagentId={subId}
-              task={subagentTasks[subId]}
-              toolCallProcess={toolCallProcesses[subId] || undefined}
-              onOpen={readOnly ? undefined : onOpenSubagentTask}
-              onDetailOpen={readOnly ? undefined : onToolCallDetailClick}
+              description={task.description}
+              status={task.status}
+              launchReply={task.result}
+              launchFailed={launchFailed}
+              // A launch that never ran has nothing to open: opening it would
+              // mint a tab for a run that does not exist.
+              onOpen={readOnly || launchFailed ? undefined : onOpenSubagentTask}
             />
           );
         }
@@ -368,21 +446,6 @@ export const MessageContentSegments = memo(function MessageContentSegments({ seg
               // DALTON-HOOK(team-sharing): render proposal card without action buttons in read-only mode
               onApprove={!readOnly && onApproveStartQuestion ? () => onApproveStartQuestion(sqd) : undefined}
               onReject={!readOnly && onRejectStartQuestion ? () => onRejectStartQuestion(sqd) : undefined}
-            />
-          );
-        }
-
-        if (block.type === 'ptc_agent') {
-          const pad = (block as PTCAgentRenderBlock).proposal ?? ptcAgentProposals[(block as PTCAgentRenderBlock).segment.proposalId!];
-          if (!pad) return null;
-          return (
-            <PTCAgentCard
-              key={block.key}
-              proposalData={pad as any}
-              // DALTON-HOOK(team-sharing): render PTC card without action buttons in read-only mode
-              onApprove={!readOnly && onApprovePTCAgent ? (overrides?: { report_back?: boolean }) => onApprovePTCAgent(pad, overrides, (block as PTCAgentRenderBlock).segment.proposalId!, pad.interruptId as string) : undefined}
-              onReject={!readOnly && onRejectPTCAgent ? () => onRejectPTCAgent(pad, (block as PTCAgentRenderBlock).segment.proposalId!, pad.interruptId as string) : undefined}
-              dispatcherContext={dispatcherContext}
             />
           );
         }
@@ -463,10 +526,11 @@ export const MessageContentSegments = memo(function MessageContentSegments({ seg
   // sibling-space-y, not space-y: FoldPanel reads the gap off the top of the
   // block after it, and a folded (hidden) panel must leave none behind.
   return (
-    <div className="sibling-space-y-3">
+    <CardArrivals cards={arrivingCards} live={fold === 'live' || !!isStreaming} motionSafe={motionSafe} className="sibling-space-y-3">
       {(() => {
-        // One element per block, except that a run of consecutive pill blocks
-        // sharing a fold and visibility state is gathered into one wrapping row.
+        // One element per block, except that a run of consecutive blocks of
+        // one kind (pills, subagent spawns, analyst hand-offs) sharing a fold
+        // and visibility state is gathered into one element.
         const wrap = (blockIdx: number, content: React.ReactElement) => {
           const key = renderBlocks[blockIdx].key;
           if (blockFolds[blockIdx]) {
@@ -478,30 +542,64 @@ export const MessageContentSegments = memo(function MessageContentSegments({ seg
         for (let blockIdx = 0; blockIdx < renderBlocks.length; blockIdx++) {
           if (heldForProse[blockIdx]) continue;
           const block = renderBlocks[blockIdx];
-          if (isPillBlock(block)) {
+          if (isBlankText(block)) continue;
+          const kind = runKind(block);
+          if (kind) {
+            const first = blockIdx;
             const run: number[] = [];
-            let j = blockIdx;
-            while (
-              j < renderBlocks.length
-              && isPillBlock(renderBlocks[j])
-              && !heldForProse[j]
-              && blockFolds[j] === blockFolds[blockIdx]
-              && blockIsVisible[j] === blockIsVisible[blockIdx]
-            ) {
+            let j = first;
+            for (; j < renderBlocks.length; j++) {
+              if (isBlankText(renderBlocks[j])) continue;
+              if (
+                runKind(renderBlocks[j]) !== kind
+                || heldForProse[j]
+                || blockFolds[j] !== blockFolds[first]
+                || blockIsVisible[j] !== blockIsVisible[first]
+              ) break;
               run.push(j);
-              j++;
             }
-            const members = run
-              .map((idx) => renderBlock(renderBlocks[idx], idx))
-              .filter((c): c is React.ReactElement => c !== null);
             blockIdx = j - 1;
-            if (members.length === 0) continue;
-            // Keyed by the first member, so a pill joining the run later grows
-            // the row without remounting the ones already there.
-            const content = members.length === 1
-              ? members[0]
-              : <div key={`pills-${renderBlocks[run[0]].key}`} data-pill-row className={PILL_ROW_CLASS}>{members}</div>;
-            out.push(wrap(run[0], content));
+            // Keyed by the first member, so a block joining the run later grows
+            // it without remounting the ones already there.
+            const firstKey = renderBlocks[run[0]].key;
+            let content: React.ReactElement | null;
+            if (kind === 'subagent') {
+              const members: SubagentRunMember[] = run.map((idx) => {
+                const subId = (renderBlocks[idx] as SubagentTaskRenderBlock).segment.subagentId!;
+                return { subagentId: subId, task: subagentTasks[subId], toolCallProcess: toolCallProcesses[subId] || undefined };
+              });
+              content = (
+                <SubagentRun
+                  key={firstKey}
+                  members={members}
+                  pausing={creditPausePending}
+                  onOpen={readOnly ? undefined : onOpenSubagentTask}
+                />
+              );
+            } else if (kind === 'analyst') {
+              const members: AnalystHandoffMember[] = run.map((idx) => {
+                const b = renderBlocks[idx] as PTCAgentRenderBlock;
+                return { key: b.key, proposal: proposalOf(b)!, proposalId: b.segment.proposalId! };
+              });
+              content = (
+                <AnalystHandoffRun
+                  key={firstKey}
+                  members={members}
+                  // DALTON-HOOK(team-sharing): render analyst handoff without action buttons in read-only mode
+                  onApprove={!readOnly ? onApprovePTCAgent : undefined}
+                  onReject={!readOnly ? onRejectPTCAgent : undefined}
+                  dispatcherContext={dispatcherContext}
+                />
+              );
+            } else {
+              const members = run
+                .map((idx) => renderBlock(renderBlocks[idx], idx))
+                .filter((c): c is React.ReactElement => c !== null);
+              content = members.length === 0 ? null
+                : members.length === 1 ? members[0]
+                : <div key={`pills-${firstKey}`} data-pill-row className={PILL_ROW_CLASS}>{members}</div>;
+            }
+            if (content) out.push(wrap(run[0], content));
             continue;
           }
           const content = renderBlock(block, blockIdx);
@@ -515,12 +613,9 @@ export const MessageContentSegments = memo(function MessageContentSegments({ seg
       {/* At the foot of the message, not beside the card that stopped. The
           agent's closing prose was written before the gate fired and still
           promises a result, so a notice above it is read first and contradicted
-          second. Last is where the turn's outcome belongs. Each self-hides
-          unless its task was stopped for credits, so ordinary turns render
-          nothing here. */}
-      {taskSubagentIds.map((id) => (
-        <SubagentStopNotice key={`stop-${id}`} subagentId={id} />
-      ))}
-    </div>
+          second. Last is where the turn's outcome belongs. It renders nothing
+          unless a task here was stopped for credits. */}
+      <SubagentStopNotices subagentIds={taskSubagentIds} />
+    </CardArrivals>
   );
 });

@@ -34,13 +34,16 @@ vi.mock('../../ActivityBlock', () => ({
 // Counted, not just queried. The old guard let the card through on the commit
 // that first painted the prose and removed it once the effect reported, so by
 // the time a query runs the flash has already been and gone.
+// A spawn draws through its run and a workflow through WorkflowRunCard; both
+// are the same card to the gate. A declaration, so the hoisted factories can
+// name it before this line runs.
 const cardPaints = { n: 0 };
-vi.mock('../TaskSegmentCard', () => ({
-  default: () => {
-    cardPaints.n += 1;
-    return <div data-testid="subagent-card" />;
-  },
-}));
+function paintedCard() {
+  cardPaints.n += 1;
+  return <div data-testid="subagent-card" />;
+}
+vi.mock('../../WorkflowRunCard', () => ({ default: paintedCard }));
+vi.mock('../SubagentRun', () => ({ default: paintedCard, SubagentRun: paintedCard }));
 vi.mock('../../UserQuestionCard', () => ({
   default: () => <div data-testid="question-card" />,
 }));

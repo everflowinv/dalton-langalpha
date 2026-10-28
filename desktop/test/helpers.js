@@ -20,6 +20,8 @@ const BUILD_CONFIG = path.join(CONFIG_DIR, 'build.json')
 // loader. It is also the file `scripts/write-build-config.mjs` leaves behind
 // after packaging a saas build locally, so it is stashed here and put back by
 // `cleanup` rather than lost to having run the tests.
+// Every test file writes this one build.json, so the suite runs one file at a
+// time (package.json's test script, which CI runs as `pnpm test`).
 const STASHED_BUILD_CONFIG = fs.existsSync(BUILD_CONFIG) ? fs.readFileSync(BUILD_CONFIG) : null
 
 const opened = []
@@ -37,6 +39,28 @@ const setOnline = (value) => { online = value }
 // the PDF export, and neither is reachable without driving the dialog.
 let saveDialog = { canceled: true }
 const setSaveDialog = (value) => { saveDialog = value }
+
+// What a message box answers, and every one that was asked. The remote-control
+// confirmation is the user's to give, so agreeing and declining are both inputs
+// a test has to be able to choose.
+const messageBoxes = []
+let messageBoxResponse = 0
+const setMessageBox = (response) => { messageBoxResponse = response }
+
+// The login item the remote-control helper registers as, in memory. What a
+// register turns into is settable, because the answers that matter (macOS
+// holding the item for approval, a register that does not take) are the
+// machine's to give and none of them can be asked for from a real one here.
+const loginItems = { status: 'not-registered', onRegister: 'enabled', calls: [] }
+function resetLoginItems() {
+  loginItems.status = 'not-registered'
+  loginItems.onRegister = 'enabled'
+  loginItems.calls.length = 0
+}
+
+// What `ipcMain.handle` was given, by channel, so a test can call a handler the
+// way a renderer's invoke reaches it.
+const ipcHandlers = new Map()
 
 // What Electron falls back to with no `productName`: the package.json `name`.
 // Nothing should ever run on it — main sets the edition's name before anything
@@ -137,6 +161,11 @@ const electronStub = {
       appHandlers.get(event).push(handler)
     },
     requestSingleInstanceLock: () => true,
+    getLoginItemSettings: () => ({ openAtLogin: loginItems.status === 'enabled', status: loginItems.status }),
+    setLoginItemSettings: (settings) => {
+      loginItems.calls.push(settings)
+      loginItems.status = settings.openAtLogin ? loginItems.onRegister : 'not-registered'
+    },
     exit: (code) => { exits.push(code) },
     // Never resolves, so requiring main.js registers its policy and stops there
     // rather than trying to open windows in a runtime that has none.
@@ -147,12 +176,15 @@ const electronStub = {
   },
   dialog: {
     showErrorBox: (title, content) => { errorBoxes.push({ title, content }) },
-    showMessageBox: async () => ({ response: 0 }),
+    showMessageBox: async (...args) => {
+      messageBoxes.push(args)
+      return { response: messageBoxResponse }
+    },
     showSaveDialog: async () => saveDialog,
   },
   BrowserWindow: FakeBrowserWindow,
   Menu: { buildFromTemplate: (t) => t, setApplicationMenu: () => {} },
-  ipcMain: { on: () => {}, handle: () => {} },
+  ipcMain: { on: () => {}, handle: (channel, handler) => { ipcHandlers.set(channel, handler) } },
   // The renderer half, for running the real preload rather than reading it.
   contextBridge: { exposeInMainWorld: (key, api) => { exposed[key] = api } },
   ipcRenderer: { invoke: async () => undefined, sendSync: () => undefined },
@@ -177,6 +209,7 @@ function loadShell({ edition = 'oss', appOrigin, platformOrigin, serverUrl = nul
       edition: 'saas',
       appOrigin: appOrigin || 'https://app.example.com',
       platformOrigin: platformOrigin || 'https://platform.example.com',
+      pairingOrigin: 'https://api.example.com',
       ...(loginPath ? { loginPath } : {}),
     }))
   } else {
@@ -210,6 +243,7 @@ function loadShell({ edition = 'oss', appOrigin, platformOrigin, serverUrl = nul
     outage: require(path.join(SRC, 'outage.js')),
     pdf: require(path.join(SRC, 'pdf.js')),
     captive: require(path.join(SRC, 'captive.js')),
+    remoteControl: require(path.join(SRC, 'remoteControl.js')),
     main: require(path.join(SRC, 'main.js')),
   }
   // `oauth` is the one module here that can own an OS resource. A callback
@@ -220,6 +254,41 @@ function loadShell({ edition = 'oss', appOrigin, platformOrigin, serverUrl = nul
   // cancelled rather than passed.
   SHELLS.push(shell.oauth)
   return shell
+}
+
+/** A saas install that has signed in before, so a launch opens the app. */
+function signedIn({ consoleSharesMainWindow }) {
+  const shell = loadShell({ edition: 'saas' })
+  shell.store.set('reachedApp', true)
+  shell.store.set('appChrome', true)
+  shell.store.set('platformChrome', consoleSharesMainWindow)
+  return shell
+}
+
+/** What macOS does with a link to the registered scheme: `open-url`, for the shell to claim. */
+const openUrl = (url) => emitApp('open-url', { preventDefault() {} }, url)
+
+/** The console's window of its own, as against the main window. */
+const isAccount = (win) => win.options.title === 'Account'
+
+/** What Chromium hands `will-navigate` for a page-initiated main-frame load. */
+function navigateFrom(win, url) {
+  const event = { isMainFrame: true, defaultPrevented: false, preventDefault() { this.defaultPrevented = true } }
+  win.webContents.emit('will-navigate', event, url)
+  return event
+}
+
+/** Run `fn` with console.warn captured, and answer with every line it wrote. */
+function quietly(fn) {
+  const warned = []
+  const realWarn = console.warn
+  console.warn = (...a) => warned.push(a.join(' '))
+  try {
+    fn()
+  } finally {
+    console.warn = realWarn
+  }
+  return warned
 }
 
 /**
@@ -282,5 +351,6 @@ function cleanup() {
 
 module.exports = {
   loadShell, loadEntryWith, loadPreload, cleanup, opened, electronStub, setOnline, setSaveDialog, tempDir,
-  emitApp, windows, focusOrder,
+  emitApp, windows, focusOrder, signedIn, openUrl, isAccount, navigateFrom, quietly,
+  loginItems, resetLoginItems, messageBoxes, setMessageBox, ipcHandlers,
 }

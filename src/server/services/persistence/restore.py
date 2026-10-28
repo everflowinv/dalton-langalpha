@@ -26,12 +26,16 @@ from src.server.database.workspace_file import (
     WorkspaceSyncBusy,
     datetime_to_micros,
     get_files_for_workspace,
+    workspace_has_backup,
     workspace_sync_lock,
 )
 from src.server.database.workspace import (
     ANY_SANDBOX,
     files_restore_incomplete,
+    files_restore_offered,
+    offer_files_restore,
     set_files_restore_incomplete,
+    settle_files_restore_offer,
     workspace_owner,
 )
 from src.server.database.blob_keys import RELAY_MAX_BYTES, blob_key
@@ -120,6 +124,10 @@ def _sync_marker_path(layout: WorkspaceLayout) -> str:
 
 _FLAG_CLEAR_ATTEMPTS = 3
 _FLAG_CLEAR_BACKOFF_S = 0.2
+
+# Backed-up files looked for in a folder whose marker is gone, spread over the
+# manifest: one still there means only the marker went.
+_KEPT_FILES_PROBE = 64
 
 
 class RestoreGuardUnavailable(Exception):
@@ -877,26 +885,111 @@ async def _reconcile_flag_beside_marker(workspace_id: str, sandbox: Any) -> None
             await asyncio.sleep(_FLAG_CLEAR_BACKOFF_S * attempt)
 
 
+async def _folder_keeps_backed_up_files(
+    workspace_id: str, sandbox: Any, layout: WorkspaceLayout, conn: Any
+) -> bool:
+    """Whether any of a sample of the backed-up files is still in the folder."""
+    rows = await get_files_for_workspace(
+        workspace_id, outside=(*DEFERRED_RESTORE_DIRS, *MOUNTED_AGENT_SUBDIRS), conn=conn
+    )
+    sample = rows[:: max(1, len(rows) // _KEPT_FILES_PROBE)][:_KEPT_FILES_PROBE]
+    if not sample:
+        return False
+    paths = " ".join(shlex.quote(layout.join(row["file_path"])) for row in sample)
+    probe = await sandbox.runtime.exec(
+        f'for p in {paths}; do if [ -e "$p" ] || [ -L "$p" ]; then echo kept; exit 0; fi; '
+        f"done; echo gone"
+    )
+    answer = probe.stdout.strip()
+    if probe.exit_code != 0 or answer not in ("kept", "gone"):
+        raise RuntimeError(f"could not look for the files of {layout.workspace}")
+    return answer == "kept"
+
+
+async def folder_waits_on_owner(
+    workspace_id: str, sandbox: Any, *, layout: WorkspaceLayout, conn: Any
+) -> bool:
+    """Whether the folder, on a machine its owner brought, waits on their choice.
+
+    Their folder may go at any time, not only while the machine is off, so
+    every pass that would act on it asks: the attach, every backup, and each
+    batch of the deferred pass. A folder missing its marker and the files the
+    backup holds is offered to the owner (``offer_files_restore``) instead of
+    mirrored as emptied or laid again unasked. A restore already owed (a move
+    landing, a rollback, one the owner asked for) does not wait, and a marker
+    found beside a standing offer is the owner putting the folder back, which
+    ends it. Called under the workspace's sync lock on ``conn``, which the
+    choice takes too, so an offer never lands beside a choice settling it.
+    """
+    if await files_restore_incomplete(workspace_id, conn=conn):
+        return False
+    offered = await files_restore_offered(workspace_id, conn=conn)
+    sync_marker = _sync_marker_path(layout)
+    if await sandbox.adownload_file_bytes(sync_marker) is not None:
+        if offered:
+            await settle_files_restore_offer(workspace_id, restore=False, conn=conn)
+        return False
+    if offered:
+        return True
+    if not await workspace_has_backup(
+        workspace_id, conn=conn
+    ) or await _folder_keeps_backed_up_files(workspace_id, sandbox, layout, conn):
+        # Nothing to restore, or only the marker went (a ``git clean``, a stray
+        # delete): the folder is still the owner's, so it is mirrored again.
+        await sandbox.aupload_file_bytes(
+            sync_marker, datetime.now(timezone.utc).isoformat().encode("utf-8")
+        )
+        return False
+    if not await offer_files_restore(workspace_id, conn=conn):
+        return False
+    logger.info(
+        f"Sync marker missing for workspace {workspace_id} on its owner's "
+        f"machine; restoring its files waits on their choice."
+    )
+    return True
+
+
 async def maybe_restore(
-    workspace_id: str, sandbox: Any, *, layout: WorkspaceLayout
-) -> None:
+    workspace_id: str,
+    sandbox: Any,
+    *,
+    layout: WorkspaceLayout,
+    ask_first: bool = False,
+) -> bool:
     """
     Restore files from DB if sandbox was recreated (files lost).
 
     Checks for sync marker file. If absent, files were lost and need restore.
-    Every failure reaches the caller as itself: flattened into a warning here,
-    a restore that never ran reads downstream as checked with nothing to do,
-    and the caller records the workspace as attached over missing files.
+    ``ask_first`` is for a machine its owner brought, where the server lays
+    files only when asked (``folder_waits_on_owner``). Returns False while the
+    folder waits on that choice, which no deferred pass may pre-empt. Every
+    failure reaches the caller as itself:
+    flattened into a warning here, a restore that never ran reads downstream
+    as checked with nothing to do, and the caller records the workspace as
+    attached over missing files.
     """
     sync_marker = _sync_marker_path(layout)
     marker = await sandbox.adownload_file_bytes(sync_marker)
+    if ask_first and (marker is None or await files_restore_offered(workspace_id)):
+        # The lock only where there is something to decide: a post-turn backup
+        # holds it for its whole pass, and every open would wait on it.
+        async with workspace_sync_lock(workspace_id) as conn:
+            if await folder_waits_on_owner(
+                workspace_id, sandbox, layout=layout, conn=conn
+            ):
+                return False
+            if not await files_restore_incomplete(workspace_id, conn=conn):
+                # Settled under the lock, the folder as it is: laying files
+                # past it would answer a folder emptied since without asking.
+                return True
+        marker = await sandbox.adownload_file_bytes(sync_marker)
     if marker is not None:
         # The marker is written only by a restore that came back clean
         # and then clears the flag; a flag still standing beside it is
         # a restore that died between those two writes, and left alone
         # it would withhold pruning on every backup from here on.
         await _reconcile_flag_beside_marker(workspace_id, sandbox)
-        return
+        return True
 
     # Every kind, not just ``kind='file'``: a workspace of directories
     # and symlinks is not an empty one, and reading it as empty writes
@@ -925,7 +1018,7 @@ async def maybe_restore(
             sync_marker,
             datetime.now(timezone.utc).isoformat().encode("utf-8"),
         )
-        return
+        return True
 
     logger.info(
         f"Sync marker missing for workspace {workspace_id}. "
@@ -937,6 +1030,39 @@ async def maybe_restore(
         expected_sandbox_id=_identity_of(sandbox),
         layout=layout,
     )
+    return True
+
+
+async def settle_restore_offer(
+    workspace_id: str, sandbox: Any, *, layout: WorkspaceLayout, restore: bool
+) -> bool:
+    """End the offer by its owner's choice; False when none stood.
+
+    Under the sync lock the offer is written under, so two answers given at
+    once settle one after the other and the second finds none. Keeping writes
+    both markers before the offer ends, the deferred one first, so neither
+    restore pass lays a file afterwards and the next backup mirrors the folder
+    as it is. Restoring removes them, so the attach that follows lays the
+    files now owed even where a keep cut short, or the owner, left one.
+    """
+    markers = (layout.join(DEFERRED_MARKER), _sync_marker_path(layout))
+    async with workspace_sync_lock(workspace_id) as conn:
+        if not await files_restore_offered(workspace_id, conn=conn):
+            return False
+        if restore:
+            removal = await sandbox.runtime.exec(
+                "rm -f " + " ".join(shlex.quote(m) for m in markers)
+            )
+            if removal.exit_code != 0:
+                raise RuntimeError(f"could not remove the markers of {layout.workspace}")
+        else:
+            stamp = datetime.now(timezone.utc).isoformat().encode("utf-8")
+            for marker in markers:
+                if not await sandbox.aupload_file_bytes(marker, stamp):
+                    raise RuntimeError(f"could not write {marker}")
+        return await settle_files_restore_offer(
+            workspace_id, restore=restore, conn=conn
+        )
 
 
 async def _restamp_dirs(
@@ -1007,23 +1133,29 @@ class DeferredInventory:
 def deferred_probe_script(layout: WorkspaceLayout) -> str:
     """The shell that takes a ``DeferredInventory``, for a caller to run inside
     a script of its own and hand back through ``parse_deferred``."""
-    # Each find prints its own dir's workspace-relative name, which has no
-    # ``%``, before the path beneath it.
+    # Run from the workspace, each find prints workspace-relative paths, its
+    # own dir first. -print0, not GNU's -printf, which BSD find (a macOS
+    # machine) may lack: the error would list nothing, read as all missing.
     finds = "; ".join(
-        f"find {shlex.quote(layout.join(d))} -printf '{d}/%P\\0' 2>/dev/null"
-        for d in DEFERRED_RESTORE_DIRS
+        f"find {shlex.quote(d)} -print0 2>/dev/null" for d in DEFERRED_RESTORE_DIRS
     )
-    return _probe_script(layout, f"{finds}; {_cat_ledger(layout)}")
+    listing = f"cd {shlex.quote(layout.workspace)} 2>/dev/null && {{ {finds}; }}"
+    return _probe_script(layout, f"{listing}; {_cat_ledger(layout)}")
 
 
 def _probe_script(layout: WorkspaceLayout, listing: str) -> str:
     """``listing`` unless the marker is there, its NUL-ended paths sent as one
     line of base64: a name may hold a newline, which a line per path would
-    read as two paths, and the exec output is text a NUL may not survive."""
+    read as two paths, and the exec output is text a NUL may not survive.
+
+    The listing always holds the ledger's header, so an empty encoding is a
+    failed probe, and it exits nonzero rather than read as nothing there.
+    """
     marker = shlex.quote(layout.join(DEFERRED_MARKER))
     return (
         f"if [ -e {marker} ]; then echo '#done'; "
-        f"else {{ {listing}; }} | base64 -w0; echo; fi; true"
+        f"else __la_listed=$({{ {listing}; }} | base64 | tr -d '\\n'); "
+        '[ -n "$__la_listed" ] || exit 1; echo "$__la_listed"; fi; true'
     )
 
 
@@ -1063,8 +1195,9 @@ def parse_deferred(stdout: str) -> DeferredInventory:
 
 async def _probe(sandbox: Any, command: str) -> str:
     """A probe's output. The probes end in ``true``, so only a failed exec (a
-    timeout) exits otherwise, and its empty output would read as every path
-    missing: the pass would send backup bytes over what the sandbox holds."""
+    timeout) or listing exits otherwise, and its empty output would read as
+    every path missing: the pass would send backup bytes over what the
+    sandbox holds."""
     probe = await sandbox.runtime.exec(command)
     if probe.exit_code != 0:
         raise RuntimeError(f"deferred restore probe failed (exit {probe.exit_code})")
@@ -1103,7 +1236,7 @@ async def _batch_present(
             sandbox,
             _probe_script(
                 layout,
-                f"find {args} -maxdepth 0 -printf '%p\\0' 2>/dev/null; {_cat_ledger(layout)}",
+                f"find {args} -maxdepth 0 -print0 2>/dev/null; {_cat_ledger(layout)}",
             ),
         )
     )
@@ -1171,9 +1304,11 @@ async def restore_deferred(
 
     The marker is written only when every row came back, and ``done`` says
     the sandbox has it; until then backups keep these rows (see
-    DEFERRED_RESTORE_DIRS) and the next bring-up resumes. A lock held past
-    ``lock_wait`` raises WorkspaceSyncBusy with the batches before it kept.
-    ``inventory`` is a probe the caller already took.
+    DEFERRED_RESTORE_DIRS) and the next bring-up resumes. On a machine its
+    owner brought, a folder waiting on their choice stops the pass at a batch
+    or, with none, before the marker (``folder_waits_on_owner``). A lock held
+    past ``lock_wait`` raises WorkspaceSyncBusy with the batches before it
+    kept. ``inventory`` is a probe the caller already took.
     """
     from src.server.database.conversation import get_workspace_thread_prefixes
 
@@ -1213,6 +1348,10 @@ async def restore_deferred(
     dir_items: dict[str, dict[str, Any]] = {}
     for batch in batches:
         async with workspace_sync_lock(workspace_id, wait=lock_wait) as conn:
+            if not sandbox.recreatable and await folder_waits_on_owner(
+                workspace_id, sandbox, layout=layout, conn=conn
+            ):
+                return result
             present = await _batch_present(sandbox, layout, batch)
             if present is None:
                 result["done"] = True
@@ -1288,6 +1427,14 @@ async def restore_deferred(
             f"bring-up retries and backups keep their rows until then"
         )
         return result
+    if not batches and not sandbox.recreatable:
+        # No batch asked, and the marker lays the folder again if its owner
+        # took it away.
+        async with workspace_sync_lock(workspace_id, wait=lock_wait) as conn:
+            if await folder_waits_on_owner(
+                workspace_id, sandbox, layout=layout, conn=conn
+            ):
+                return result
     result["done"] = bool(
         await sandbox.aupload_file_bytes(
             layout.join(DEFERRED_MARKER),

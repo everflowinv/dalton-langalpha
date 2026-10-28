@@ -35,7 +35,7 @@
   padding: 6px 10px;
   border-radius: 6px;
   text-align: left;
-  transition: background-color 0.12s ease;
+  transition: background-color var(--motion-quick) var(--ease-out);
 }
 
 .automation-moment-pick:hover,
@@ -99,10 +99,10 @@
   font-weight: 500;
   color: var(--color-text-secondary);
   transition:
-    background-color 0.12s ease,
-    border-color 0.12s ease,
-    color 0.12s ease,
-    transform 0.12s cubic-bezier(0.16, 1, 0.3, 1);
+    background-color var(--motion-quick) var(--ease-out),
+    border-color var(--motion-quick) var(--ease-out),
+    color var(--motion-quick) var(--ease-out),
+    scale var(--motion-press) var(--ease-out);
 }
 
 .automation-moment-done:hover {
@@ -111,13 +111,9 @@
   color: var(--color-text-primary);
 }
 
-.automation-moment-done:active {
-  transform: scale(0.96);
-}
-
-@media (prefers-reduced-motion: reduce) {
+@media (prefers-reduced-motion: no-preference) {
   .automation-moment-done:active {
-    transform: none;
+    scale: var(--press-scale);
   }
 }
 

@@ -18,6 +18,7 @@ const { probe } = require('./probe')
 const { navigate } = require('./navigate')
 const { forDisplay } = require('./redact')
 const { buildMenu, syncNavMenu } = require('./menu')
+const { createRemoteControl, registerIpc: registerRemoteControlIpc } = require('./remoteControl')
 
 // Before anything can ask where userData lives.
 //
@@ -47,6 +48,8 @@ let deferredLink = null
 // and a second launch moves focus again before the link it carries is
 // delivered.
 let lastSentOutWindow = null
+
+const remoteControl = createRemoteControl({ onMenuChange: installMenu })
 
 const SETUP_DIR = path.join(__dirname, '..', 'setup')
 
@@ -360,6 +363,33 @@ function watchLoads(win) {
   win.webContents.on('did-navigate', (_event, url, httpResponseCode) => {
     lastNav = { url, status: httpResponseCode }
   })
+  // A same-document navigation moves the URL and keeps the document, and the
+  // status is the document's. Both SPAs move their own URL as they boot: the
+  // app's first run goes / → /dashboard → /welcome by replaceState, and when
+  // that lands before the load event the URL read at `did-finish-load` is no
+  // longer the one `did-navigate` reported. Matched on the old URL alone, that
+  // load was credited with no status at all, and the first run that went
+  // straight into the welcome flow never recorded reaching the app. Main frame
+  // only: a subframe's in-page move is not this document changing its address.
+  win.webContents.on('did-navigate-in-page', (_event, url, isMainFrame) => {
+    if (isMainFrame === false || lastNav.url === null) return
+    lastNav = { url, status: lastNav.status }
+  })
+  // A load that fails still finishes: Chromium commits its own error document
+  // at the URL that failed and reports it with `did-fail-load`, never with
+  // `did-navigate`. A reload fails at the URL the window is already on, so the
+  // page it replaced was still paired with that URL, and the error document,
+  // which declares nothing, was credited with that page's 200 and revoked the
+  // flag on a server that was only unreachable. Forgotten here, the error
+  // document finishes with no status, and the next real load sets one again.
+  //
+  // ERR_ABORTED is left alone, as the outage screen leaves it. It commits no
+  // document, and it is how a load cut short by a newer one is reported. When
+  // the newer one is on another site, that report arrives after the newer
+  // one's `did-navigate`, so forgetting then would take that load's status.
+  win.webContents.on('did-fail-load', (_event, code, _description, _url, isMainFrame) => {
+    if (outage.shouldShow({ code, isMainFrame })) lastNav = { url: null, status: 0 }
+  })
 
   win.webContents.on('did-finish-load', async () => {
     const url = win.webContents.getURL()
@@ -421,10 +451,11 @@ function shellArgs({ chromeHidden }) {
     // editions install side by side, and an email link marked for the wrong one
     // opens the other build, or nothing.
     `--langalpha-shell-scheme=${config.scheme}`,
-    // Whether this build has a console to finish an integration login or
-    // install on. An edition with no platform origin drops those links, so it
-    // must not say it can.
-    `--langalpha-integration-returns=${origins.platformOrigin() ? '1' : ''}`,
+    // Whether this build has a console to finish a return from the browser on:
+    // an integration login or install, or a console page asked to be shown
+    // again. An edition with no platform origin drops those links, so it must
+    // not say it can.
+    `--langalpha-console-returns=${origins.platformOrigin() ? '1' : ''}`,
   ]
 }
 
@@ -658,12 +689,14 @@ function openDeepLink(win, raw, base) {
 }
 
 /**
- * An integration login or install handed back from the browser, already mapped
- * onto the console's callback page. It goes back to the page that started it:
- * the console window that sent the user to the browser, or else any window
- * showing the console. Either can be the one, and both can show it at once: an
- * account window opened before the console reserved the strip stays open after
- * the main window starts showing the console too.
+ * A return from the browser, already mapped onto a console page: an
+ * integration login or install landing on the console's callback page, or a
+ * console page asked to be shown again after a trip to a third party's page.
+ * It goes back to the page that started it: the console window that sent the
+ * user to the browser, or else any window showing the console. Either can be
+ * the one, and both can show it at once: an account window opened before the
+ * console reserved the strip stays open after the main window starts showing
+ * the console too.
  *
  * With no window showing the console, it goes wherever a navigation to the
  * console goes, decided here and before the load: `navigate` is loadURL and
@@ -672,10 +705,9 @@ function openDeepLink(win, raw, base) {
  * its own when the main one cannot show it.
  *
  * Restored as well as raised: the window may have been minimized while the
- * browser had the login or install, and show() does not bring a minimized
- * window back.
+ * browser had the user, and show() does not bring a minimized window back.
  */
-function openIntegrationReturn(url) {
+function openConsoleReturn(url) {
   const showsConsole = (w) => Boolean(w) && !w.isDestroyed()
     && (w === platformWindow || (w === mainWindow && origins.isPlatform(w.webContents.getURL())))
   let win = [lastSentOutWindow, mainWindow, platformWindow].find(showsConsole)
@@ -693,16 +725,26 @@ function openIntegrationReturn(url) {
   return win
 }
 
+// What the log says about a link addressed to the console that this build
+// refuses, by the kind `deeplink.toConsole` read it as. Never any of the link:
+// its values are the provider's or the third party's answer.
+const REFUSED_CONSOLE_LINK = {
+  integration: '[shell] ignoring an integration link this build cannot finish',
+  console: '[shell] ignoring a console link this build cannot open',
+}
+
 /** Where a link the OS handed us goes: every arrival path ends here. */
 function onDeepLink(raw) {
   // Settled before any window is picked, because the answer picks it, and never
   // left to fall through: the app's /callback would try to redeem the
-  // provider's answer as a sign-in. That includes an edition with no console,
-  // which has nowhere to finish one.
-  if (deeplink.isIntegrationReturn(raw)) {
-    const target = deeplink.toIntegrationUrl(raw)
-    if (target) openIntegrationReturn(target)
-    else console.warn('[shell] ignoring an integration link this build cannot finish')
+  // provider's answer as a sign-in. That covers an integration login or
+  // install and any link under the console host, so a console page this build
+  // does not know is dropped rather than redeemed, and it includes an edition
+  // with no console, which has nowhere to finish one.
+  const link = deeplink.toConsole(raw)
+  if (link) {
+    if (link.url) openConsoleReturn(link.url)
+    else console.warn(REFUSED_CONSOLE_LINK[link.kind])
     return
   }
 
@@ -737,66 +779,8 @@ function openLaunchWindows() {
 function registerIpc() {
   ipcMain.handle('shell:open-external', openExternallyFrom)
 
-  // The one auth-shaped thing the page may ask for, and it hands back a local
-  // URL rather than anything secret. Our own sign-in stays intercepted and
-  // unreachable from here; this is for a connector whose authorization server
-  // refuses a hosted callback, where the page has to name the loopback URI when
-  // it asks its backend to mint the flow. `oauth.beginMcp` re-checks the asking
-  // window itself, so a message from anywhere unexpected is refused there.
-  ipcMain.handle('shell:mcp-oauth-begin', (event, returnUrl) => {
-    const win = BrowserWindow.fromWebContents(event.sender)
-    return win ? oauth.beginMcp(returnUrl, win) : null
-  })
-
-  // The second half of the handshake: the flow's `state` exists only after the
-  // backend has minted it, and until the shell has been told it, the armed flow
-  // accepts no callback. `oauth.bindMcp` re-checks the window and the flow id.
-  ipcMain.handle('shell:mcp-oauth-bind', (event, flowId, state) => {
-    const win = BrowserWindow.fromWebContents(event.sender)
-    return win ? oauth.bindMcp(win, flowId, state) : false
-  })
-
-  // The other half of that handshake: the page armed before it knew whether
-  // its backend would mint a flow at all, so it needs a way to say it did not.
-  // Named by flow id, so a start that failed cannot stand down a later connect
-  // that is still running.
-  ipcMain.handle('shell:mcp-oauth-cancel', (event, flowId) => {
-    const win = BrowserWindow.fromWebContents(event.sender)
-    return win ? oauth.cancelMcp(win, flowId) : false
-  })
-
-  // Theme has to come from the page: the shell cannot read a CSS variable, and
-  // the user's choice lives in the renderer's localStorage, not the OS setting.
-  ipcMain.on('shell:set-theme', (event, value) => {
-    // Answered rather than dropped: the ack exists so a renderer can tell a
-    // shell that understands this message from one that does not, and returning
-    // undefined for a value this shell simply rejected says the wrong thing.
-    if (!theme.isTheme(value)) {
-      event.returnValue = false
-      return
-    }
-    // Painted before the store is consulted, because the guard below is about
-    // the disk write and this is an in-memory native call. A window is created
-    // with whatever colour the store held then, so a sibling window moving the
-    // store between this one's creation and its first report would leave this
-    // one wearing the old theme with the guard suppressing the correction.
-    //
-    // Only the window that reported it. The app and the console are separate
-    // deploys resolving their own preference, so painting both from one message
-    // gives the other window a frame in a theme its page is not using, which is
-    // the mismatched resize band this exists to prevent.
-    const reporting = BrowserWindow.fromWebContents(event.sender)
-    if (reporting && !reporting.isDestroyed()) reporting.setBackgroundColor(theme.backgroundFor(value))
-    // Unchanged is the common case, not the rare one: every page load reports
-    // the theme it resolved, nearly always the stored one, and this is
-    // sendSync, so the renderer blocks on it. Writing anyway put a synchronous
-    // mkdir and a synchronous file write on the main event loop of every load,
-    // which is the whole app — menus, both windows — waiting on a disk for a
-    // value that already had that value.
-    if (store.get('theme') !== value) store.set('theme', value)
-    // Acknowledged only so a renderer can tell an old shell from a new one.
-    event.returnValue = true
-  })
+  oauth.registerIpc()
+  theme.registerIpc()
 
   outage.registerIpc({ onRetry: (win, url) => navigate(win, url) })
 
@@ -826,6 +810,44 @@ function registerIpc() {
   ipcMain.handle('server:current', () => store.get('serverUrl'))
 
   pdf.registerIpc()
+
+  registerRemoteControlIpc(remoteControl)
+}
+
+// ---------------------------------------------------------------------------
+// Application menu
+// ---------------------------------------------------------------------------
+
+function installMenu() {
+  Menu.setApplicationMenu(buildMenu({
+    isSaas: config.isSaas,
+    onChangeServer: showServerPicker,
+    onOpenAccount: () => {
+      const platform = origins.platformOrigin()
+      if (!platform) return
+      // The menu item and the app's own "Usage & Plan" link are the same
+      // journey and must not land in different windows.
+      if (policy.platformFitsMainWindow()) showInMainWindow(platform)
+      else openPlatformWindow(platform)
+    },
+    onCheckForUpdates: (win) => updater.checkManually(win || focusedOrMain()),
+    onReload: reloadWindow,
+    onBack: (win) => {
+      const history = win.webContents.navigationHistory
+      if (history.canGoBack()) history.goBack()
+    },
+    onForward: (win) => {
+      const history = win.webContents.navigationHistory
+      if (history.canGoForward()) history.goForward()
+    },
+    onHome: (win) => goHome(win, { isMainWindow: win === mainWindow }),
+    onOpenInBrowser: openCurrentInBrowser,
+    remoteControl: remoteControl.menuView(),
+    onPauseRemoteControl: remoteControl.pause,
+    onResumeRemoteControl: remoteControl.resume,
+  }))
+  // A rebuilt menu starts with Back and Forward disabled.
+  syncNavMenu(BrowserWindow.getFocusedWindow())
 }
 
 // ---------------------------------------------------------------------------
@@ -858,30 +880,8 @@ if (!app.requestSingleInstanceLock()) {
     await oauth.startCallbackServer()
     registerIpc()
 
-    Menu.setApplicationMenu(buildMenu({
-      isSaas: config.isSaas,
-      onChangeServer: showServerPicker,
-      onOpenAccount: () => {
-        const platform = origins.platformOrigin()
-        if (!platform) return
-        // The menu item and the app's own "Usage & Plan" link are the same
-        // journey and must not land in different windows.
-        if (policy.platformFitsMainWindow()) showInMainWindow(platform)
-        else openPlatformWindow(platform)
-      },
-      onCheckForUpdates: (win) => updater.checkManually(win || focusedOrMain()),
-      onReload: reloadWindow,
-      onBack: (win) => {
-        const history = win.webContents.navigationHistory
-        if (history.canGoBack()) history.goBack()
-      },
-      onForward: (win) => {
-        const history = win.webContents.navigationHistory
-        if (history.canGoForward()) history.goForward()
-      },
-      onHome: (win) => goHome(win, { isMainWindow: win === mainWindow }),
-      onOpenInBrowser: openCurrentInBrowser,
-    }))
+    installMenu()
+    remoteControl.watch()
 
     openLaunchWindows()
     updater.init(() => mainWindow)
@@ -902,6 +902,7 @@ app.on('window-all-closed', () => {
 app.on('before-quit', () => {
   oauth.stopCallbackServer()
   updater.stop()
+  remoteControl.unwatch()
 })
 
 // A remote-URL shell loads code it did not build; a stray permission prompt from

@@ -23,6 +23,7 @@ from fastapi.responses import Response
 
 from src.server.database.home_workspace import is_unbound
 from src.server.database.workspace import get_workspace as db_get_workspace
+from src.server.services.computer_manager import MachineTarget
 from src.server.services.workspace_manager import WorkspaceManager
 from src.server.services.workspace_layout import WorkspaceLayoutUnavailable
 from src.server.services.persistence.file import FilePersistenceService
@@ -33,20 +34,20 @@ from src.server.utils.secret_redactor import (
 )
 from src.utils.mime import resolve_content_type
 
-from ._containment import (
+from src.server.services.workspace_file_containment import (
     contained_absolute_path,
     contained_relative_path,
     FileTooLargeToServe,
     read_contained_sandbox_file,
 )
+from src.server.services.workspace_files import previous_dir_names_of, record_fs_bytes
+
 from ._shared import (
     _is_text_content_type,
     _is_utf8,
     _is_serve_blocked_path,
-    _record_fs_bytes,
     _to_client_path,
     folder_unmoved,
-    previous_dir_names_of,
     work_dir_for,
 )
 
@@ -282,7 +283,9 @@ def warm_sandbox(workspace: dict[str, Any], workspace_id: str) -> Any | None:
     if workspace.get("status") != "running":
         return None
     session = WorkspaceManager.get_instance().get_session_if_ready(
-        workspace_id, expected_sandbox_id=workspace.get("sandbox_id")
+        workspace_id,
+        expected_sandbox_id=workspace.get("sandbox_id"),
+        target=MachineTarget.of_workspace(workspace),
     )
     return getattr(session, "sandbox", None) if session else None
 
@@ -460,7 +463,7 @@ async def serve_workspace_file(
         ),
         "X-Content-Type-Options": "nosniff",
     }
-    _record_fs_bytes("serve", len(content))
+    record_fs_bytes("serve", len(content))
     return Response(content=content, media_type=content_type, headers=headers)
 
 
@@ -555,7 +558,7 @@ async def render_workspace_file_pdf(
         ),
         "Cache-Control": _WSFILES_CACHE_CONTROL,
     }
-    _record_fs_bytes("pdf", len(pdf_bytes))
+    record_fs_bytes("pdf", len(pdf_bytes))
     return Response(content=pdf_bytes, media_type="application/pdf", headers=headers)
 
 

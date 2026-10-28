@@ -31,7 +31,11 @@ from src.server.database.conversation import ThreadPrefixes
 from src.server.database.workspace_file import WorkspaceSyncBusy
 from src.server.services.persistence import restore
 from src.server.services.persistence.resolve import FileBytesUnavailable
-from src.server.services.persistence.transfer import DEFERRED_LEDGER, TransferRuntimeError
+from src.server.services.persistence.transfer import (
+    DEFERRED_LEDGER,
+    DEFERRED_MARKER,
+    TransferRuntimeError,
+)
 
 import hashlib
 
@@ -1091,6 +1095,414 @@ async def test_maybe_restore_treats_an_unreadable_manifest_as_a_missing_guard(mo
     with pytest.raises(restore.RestoreGuardUnavailable):
         await restore.maybe_restore("ws-1", sandbox, layout=LAYOUT)
     restore_flag.assert_not_awaited()
+
+
+@pytest.fixture
+def offer():
+    """The workspace row's restore offer: none standing, a backup to restore
+    whose files are gone from the folder, and recording one lands."""
+    with (
+        patch.object(restore, "files_restore_offered", AsyncMock(return_value=False)) as offered,
+        patch.object(restore, "offer_files_restore", AsyncMock(return_value=True)) as record,
+        patch.object(restore, "settle_files_restore_offer", AsyncMock(return_value=True)) as settle,
+        patch.object(restore, "workspace_has_backup", AsyncMock(return_value=True)) as backup,
+        patch.object(
+            restore, "_folder_keeps_backed_up_files", AsyncMock(return_value=False)
+        ) as kept,
+    ):
+        yield SimpleNamespace(
+            offered=offered, record=record, settle=settle, backup=backup, kept=kept
+        )
+
+
+def _owners_folder(*present: str) -> MagicMock:
+    """A folder on a machine its owner brought, holding ``present`` and
+    keeping what is written to it."""
+    sandbox = _mock_sandbox()
+    sandbox.recreatable = False
+    held = {path: b"2026" for path in present}
+
+    async def upload(path, data):
+        held[path] = data
+        return True
+
+    sandbox.adownload_file_bytes = AsyncMock(side_effect=lambda path: held.get(path))
+    sandbox.aupload_file_bytes = AsyncMock(side_effect=upload)
+    return sandbox
+
+
+@pytest.mark.asyncio
+@patch("src.server.services.persistence.restore.get_files_for_workspace", new_callable=AsyncMock)
+async def test_a_folder_gone_from_an_owners_machine_is_offered_not_restored(
+    mock_get, offer, restore_flag
+):
+    """The owner may have removed the folder on purpose, and laying the backup
+    there unasked would bring back what they removed. Neither the flag nor the
+    marker is written: either would read as a restore under way or done."""
+    mock_get.return_value = [_file("a.txt")]
+    sandbox = _owners_folder()
+
+    with patch.object(restore, "restore_to_sandbox", new_callable=AsyncMock) as restore_fn:
+        assert await restore.maybe_restore(
+            "ws-1", sandbox, layout=LAYOUT, ask_first=True
+        ) is False
+
+    offer.record.assert_awaited_once_with("ws-1", conn="conn")
+    restore_fn.assert_not_awaited()
+    restore_flag.assert_not_awaited()
+    sandbox.aupload_file_bytes.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_standing_offer_waits_without_reading_the_backup(offer):
+    """Every acquisition and every backup runs this check while the owner has
+    not chosen."""
+    offer.offered.return_value = True
+
+    assert await restore.maybe_restore(
+        "ws-1", _owners_folder(), layout=LAYOUT, ask_first=True
+    ) is False
+
+    offer.backup.assert_not_awaited()
+    offer.record.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@patch("src.server.services.persistence.restore.get_files_for_workspace", new_callable=AsyncMock)
+async def test_a_restore_already_owed_runs_without_asking(mock_get, offer, flag_state):
+    """A move landing, a rollback or the owner's own choice owes the folder its
+    files, which is not the owner's to decline again."""
+    flag_state.return_value = True
+    mock_get.return_value = [_file("a.txt")]
+
+    with patch.object(restore, "restore_to_sandbox", new_callable=AsyncMock) as restore_fn:
+        assert await restore.maybe_restore(
+            "ws-1", _owners_folder(), layout=LAYOUT, ask_first=True
+        ) is True
+
+    restore_fn.assert_awaited_once()
+    offer.offered.assert_not_awaited()
+    offer.record.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@patch("src.server.services.persistence.restore.get_files_for_workspace", new_callable=AsyncMock)
+async def test_an_offer_refused_by_a_restore_owed_since_restores(mock_get, offer, flag_state):
+    """The offer write refuses beside the flag, which a move may raise between
+    the flag's read and that write; the restore it owes then runs here."""
+    offer.record.return_value = False
+    flag_state.side_effect = [False, True, True]
+    mock_get.return_value = [_file("a.txt")]
+
+    with patch.object(restore, "restore_to_sandbox", new_callable=AsyncMock) as restore_fn:
+        assert await restore.maybe_restore(
+            "ws-1", _owners_folder(), layout=LAYOUT, ask_first=True
+        ) is True
+
+    restore_fn.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_a_folder_its_owner_put_back_ends_the_offer(offer):
+    """The marker came back with the folder, so the choice the offer waited on
+    is made, and the backup it was holding may run again."""
+    offer.offered.return_value = True
+    sandbox = _owners_folder(restore._sync_marker_path(LAYOUT))
+
+    with patch.object(restore, "restore_to_sandbox", new_callable=AsyncMock) as restore_fn:
+        assert await restore.maybe_restore(
+            "ws-1", sandbox, layout=LAYOUT, ask_first=True
+        ) is True
+
+    offer.settle.assert_awaited_once_with("ws-1", restore=False, conn="conn")
+    restore_fn.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_folder_that_lost_only_its_marker_is_marked_not_offered(offer):
+    """A ``git clean`` or a stray delete takes the dotfile alone, and the
+    folder still holding its files is the owner's to mirror, not to be told it
+    is missing."""
+    offer.kept.return_value = True
+    sandbox = _owners_folder()
+
+    with patch.object(restore, "restore_to_sandbox", new_callable=AsyncMock) as restore_fn:
+        assert await restore.maybe_restore(
+            "ws-1", sandbox, layout=LAYOUT, ask_first=True
+        ) is True
+
+    offer.record.assert_not_awaited()
+    restore_fn.assert_not_awaited()
+    assert [c.args[0] for c in sandbox.aupload_file_bytes.await_args_list] == [
+        restore._sync_marker_path(LAYOUT)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_folder_in_place_opens_without_the_sync_lock(offer):
+    """A post-turn backup holds the lock for its whole pass, and an open with
+    nothing to decide would wait out that pass."""
+
+    @asynccontextmanager
+    async def lock(_workspace_id, *, conn=None):
+        raise AssertionError("took the sync lock")
+        yield
+
+    sandbox = _owners_folder(restore._sync_marker_path(LAYOUT))
+    with patch.object(restore, "workspace_sync_lock", lock):
+        assert await restore.maybe_restore(
+            "ws-1", sandbox, layout=LAYOUT, ask_first=True
+        ) is True
+
+    offer.record.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("present", "answer"), [(("notes/b.txt",), True), ((), False)], ids=["kept", "gone"]
+)
+@patch("src.server.services.persistence.restore.get_files_for_workspace", new_callable=AsyncMock)
+async def test_the_probe_looks_for_backed_up_files_in_the_folder(
+    mock_get, tmp_path, present, answer
+):
+    """Through the shell, as the machine runs it, with names a shell would split."""
+    import subprocess
+
+    layout = SandboxLayout.for_root(str(tmp_path)).for_workspace("My Workspace")
+    for path in present:
+        (tmp_path / "My Workspace" / path).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / "My Workspace" / path).write_text("b")
+    mock_get.return_value = [_file("a b.txt"), _file("notes/b.txt")]
+
+    class _Shell:
+        async def exec(self, script):
+            ran = subprocess.run(["sh", "-c", script], capture_output=True, text=True)
+            return SimpleNamespace(stdout=ran.stdout, exit_code=ran.returncode)
+
+    sandbox = SimpleNamespace(runtime=_Shell())
+    assert await restore._folder_keeps_backed_up_files("ws-1", sandbox, layout, "conn") is answer
+
+
+@pytest.mark.asyncio
+@patch("src.server.services.persistence.restore.get_files_for_workspace", new_callable=AsyncMock)
+async def test_an_empty_backup_is_marked_rather_than_offered(mock_get, offer):
+    """Nothing to restore is nothing to ask about, and without the marker every
+    open, and every backup, would find the folder missing again."""
+    offer.backup.return_value = False
+    sandbox = _owners_folder()
+
+    assert await restore.maybe_restore(
+        "ws-1", sandbox, layout=LAYOUT, ask_first=True
+    ) is True
+
+    offer.record.assert_not_awaited()
+    mock_get.assert_not_awaited()
+    assert [c.args[0] for c in sandbox.aupload_file_bytes.await_args_list] == [
+        restore._sync_marker_path(LAYOUT)
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("marker", [None, b"2026"], ids=["gone", "present"])
+@patch("src.server.services.persistence.restore.get_files_for_workspace", new_callable=AsyncMock)
+async def test_a_machine_the_server_rebuilds_never_reads_the_offer(mock_get, offer, marker):
+    """Its folders are laid again from the backup whenever it is rebuilt, so no
+    owner is asked and the offer is no part of that path."""
+    mock_get.return_value = [_file("a.txt")]
+    sandbox = _mock_sandbox()
+    sandbox.adownload_file_bytes = AsyncMock(return_value=marker)
+
+    with patch.object(restore, "restore_to_sandbox", new_callable=AsyncMock) as restore_fn:
+        assert await restore.maybe_restore("ws-1", sandbox, layout=LAYOUT) is True
+
+    assert restore_fn.await_count == (1 if marker is None else 0)
+    offer.offered.assert_not_awaited()
+    offer.record.assert_not_awaited()
+    offer.settle.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_the_offer_is_written_under_the_lock_a_choice_takes(offer):
+    """A backup that found the folder gone and a choice settling the offer
+    serialize on the sync lock, so no offer lands beside a choice it undoes."""
+    events: list[str] = []
+
+    @asynccontextmanager
+    async def lock(_workspace_id, *, conn=None):
+        events.append("lock")
+        yield "conn"
+        events.append("unlock")
+
+    offer.record.side_effect = lambda *_a, **_k: events.append("offer") or True
+    with patch.object(restore, "workspace_sync_lock", lock):
+        assert await restore.maybe_restore(
+            "ws-1", _owners_folder(), layout=LAYOUT, ask_first=True
+        ) is False
+
+    assert events == ["lock", "offer", "unlock"]
+
+
+@pytest.mark.asyncio
+async def test_keeping_the_folder_marks_it_current_before_the_offer_ends(offer):
+    """Both markers, the deferred pass's first: with either one missing once
+    the offer is gone, a pass lays backed-up files into the folder the owner
+    chose to keep as it is, and a sync marker alone would read to the next
+    backup as the folder put back with the offer still standing."""
+    offer.offered.return_value = True
+    order: list[str] = []
+
+    @asynccontextmanager
+    async def lock(_workspace_id, *, conn=None):
+        order.append("lock")
+        yield "conn"
+        order.append("unlock")
+
+    sandbox = _mock_sandbox()
+    sandbox.aupload_file_bytes = AsyncMock(
+        side_effect=lambda path, _data: order.append(path) or True
+    )
+    offer.settle.side_effect = lambda *_a, **_k: order.append("settle") or True
+
+    with patch.object(restore, "workspace_sync_lock", lock):
+        assert await restore.settle_restore_offer(
+            "ws-1", sandbox, layout=LAYOUT, restore=False
+        ) is True
+
+    assert order == [
+        "lock",
+        LAYOUT.join(DEFERRED_MARKER),
+        restore._sync_marker_path(LAYOUT),
+        "settle",
+        "unlock",
+    ]
+    offer.settle.assert_awaited_once_with("ws-1", restore=False, conn="conn")
+
+
+@pytest.mark.asyncio
+async def test_a_marker_that_does_not_land_leaves_the_offer_standing(offer):
+    """The choice holds only once the folder says it is current; ended before
+    that, the next open finds no marker and asks again."""
+    offer.offered.return_value = True
+    sandbox = _mock_sandbox()
+    sandbox.aupload_file_bytes = AsyncMock(return_value=False)
+
+    with pytest.raises(RuntimeError, match="could not write"):
+        await restore.settle_restore_offer("ws-1", sandbox, layout=LAYOUT, restore=False)
+
+    offer.settle.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_restoring_clears_the_markers_before_owing_the_files(offer):
+    """A keep cut short, or the owner, may have left a marker, beside which the
+    attach would take the folder as current and clear the flag the restore
+    needs. Removed first, the attach lays every file now owed."""
+    offer.offered.return_value = True
+    order: list[str] = []
+    sandbox = _mock_sandbox()
+    sandbox.runtime.exec = AsyncMock(
+        side_effect=lambda cmd: order.append(cmd) or MagicMock(exit_code=0)
+    )
+    offer.settle.side_effect = lambda *_a, **_k: order.append("settle") or True
+
+    assert await restore.settle_restore_offer(
+        "ws-1", sandbox, layout=LAYOUT, restore=True
+    ) is True
+
+    removal, settle = order
+    assert removal.startswith("rm -f ")
+    assert LAYOUT.join(DEFERRED_MARKER) in removal
+    assert restore._sync_marker_path(LAYOUT) in removal
+    assert settle == "settle"
+    offer.settle.assert_awaited_once_with("ws-1", restore=True, conn="conn")
+    sandbox.aupload_file_bytes.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("choice", [True, False], ids=["restore", "keep"])
+async def test_a_second_answer_finds_the_offer_settled(offer, choice):
+    """Two tabs answering at once: the one that takes the lock second sees no
+    offer, and touches neither the folder nor the row."""
+    sandbox = _mock_sandbox()
+    sandbox.runtime.exec = AsyncMock()
+
+    assert await restore.settle_restore_offer(
+        "ws-1", sandbox, layout=LAYOUT, restore=choice
+    ) is False
+
+    sandbox.aupload_file_bytes.assert_not_awaited()
+    sandbox.runtime.exec.assert_not_awaited()
+    offer.settle.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_deferred_batch_lays_nothing_while_the_folder_waits():
+    """The bring-up's second pass, or a reconnect's, would otherwise lay the
+    evicted results into a folder its owner has not chosen to restore."""
+    base = f"{WorkspaceLayout.LARGE_TOOL_RESULTS_DIR}/abcd1234"
+    rows = [_file(f"{base}/a.txt", "aaaaa")]
+    sandbox = _owners_folder()
+    sandbox.runtime.exec = AsyncMock(return_value=MagicMock(stdout="", exit_code=0))
+
+    async def get_files(_workspace_id, *, paths=None, under=None, **_kw):
+        return [r for r in rows if r["file_path"].startswith(under + "/")]
+
+    @asynccontextmanager
+    async def lock(_workspace_id, *, wait):
+        yield "conn"
+
+    transfer = AsyncMock()
+    with (
+        patch.object(restore, "get_files_for_workspace", get_files),
+        patch.object(restore, "workspace_sync_lock", lock),
+        patch.object(restore, "_transfer_rows", transfer),
+        patch.object(restore, "folder_waits_on_owner", AsyncMock(return_value=True)) as waits,
+    ):
+        result = await restore.restore_deferred(
+            "ws-1", sandbox, layout=LAYOUT, kept=_kept({"abcd1234"})
+        )
+
+    waits.assert_awaited_once_with("ws-1", sandbox, layout=LAYOUT, conn="conn")
+    transfer.assert_not_awaited()
+    assert result["done"] is False
+    assert LAYOUT.join(DEFERRED_MARKER) not in [
+        c.args[0] for c in sandbox.aupload_file_bytes.await_args_list
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("waits", [True, False], ids=["waits", "settled"])
+async def test_a_deferred_pass_with_nothing_to_lay_asks_before_its_marker(waits):
+    """No batch asks for a workspace with nothing evicted, and the marker
+    alone would lay again a folder its owner took away; a restart queues
+    this pass for every workspace on the machine."""
+    sandbox = _owners_folder()
+
+    @asynccontextmanager
+    async def lock(_workspace_id, *, wait):
+        yield "conn"
+
+    with (
+        patch.object(restore, "get_files_for_workspace", AsyncMock(return_value=[])),
+        patch.object(restore, "workspace_sync_lock", lock),
+        patch.object(
+            restore, "folder_waits_on_owner", AsyncMock(return_value=waits)
+        ) as asked,
+    ):
+        result = await restore.restore_deferred(
+            "ws-1",
+            sandbox,
+            layout=LAYOUT,
+            kept=_kept(set()),
+            inventory=restore.parse_deferred(_listed()),
+        )
+
+    asked.assert_awaited_once_with("ws-1", sandbox, layout=LAYOUT, conn="conn")
+    assert result["done"] is not waits
+    assert (
+        LAYOUT.join(DEFERRED_MARKER)
+        in [c.args[0] for c in sandbox.aupload_file_bytes.await_args_list]
+    ) is not waits
 
 
 def _kept(prefixes: set[str]) -> ThreadPrefixes:

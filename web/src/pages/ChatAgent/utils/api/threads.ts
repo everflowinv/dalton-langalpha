@@ -3,6 +3,8 @@
  */
 import { api } from '@/api/client';
 import type { Thread } from '@/types/api';
+import type { WakeupCancelResponse, WakeupsResponse } from '@/types/wakeups';
+import type { CommandStopResponse, CommandsResponse } from '@/types/commands';
 
 export interface ThreadCreatedInfo {
   thread_id: string;
@@ -10,6 +12,9 @@ export interface ThreadCreatedInfo {
   thread_index: number;
   title: string;
   msg_type: string;
+  /** The tuning overrides the create stored, echoed back; null follows Settings. */
+  reasoning_effort?: string | null;
+  fast_mode?: boolean | null;
 }
 
 /**
@@ -18,27 +23,40 @@ export interface ThreadCreatedInfo {
  * Resolves with the created row so the caller can navigate and paint the
  * sidebar row immediately. The generated title is NOT awaited here: it lands
  * on the lifecycle feed's `thread_title` event (and on the next list refetch),
- * which is the single delivery path for it. Rejects on HTTP failure or
- * timeout — callers fall back to the legacy `__default__` send path.
+ * which is the single delivery path for it. A `title` the caller names is
+ * stored as given and none is generated. Rejects on HTTP failure or timeout —
+ * callers fall back to the legacy `__default__` send path.
  */
 export async function createThreadWithTitle(opts: {
   workspaceId?: string | null;
+  /** May be empty when `title` is given. */
   firstQuery: string;
+  /** The thread's title, in place of one generated from `firstQuery`. */
+  title?: string;
   platform?: string | null;
   /** Lets title generation resolve relative dates ("today") on the user's
    *  wall clock; the server reads UTC without it. */
   timezone?: string;
   /** Left out, the thread stores no value and follows the owner's default. */
   subagentsAllowed?: boolean;
+  /** The thread's own effort and fast mode, picked before it existed. Left
+   *  out, the thread follows Settings. */
+  reasoningEffort?: string;
+  fastMode?: boolean;
   timeoutMs?: number;
 }): Promise<ThreadCreatedInfo> {
-  const { workspaceId, firstQuery, platform, timezone, subagentsAllowed, timeoutMs = 8000 } = opts;
+  const {
+    workspaceId, firstQuery, title, platform, timezone, subagentsAllowed, reasoningEffort, fastMode, timeoutMs = 8000,
+  } = opts;
 
   const body: Record<string, unknown> = { first_query: firstQuery };
+  if (title) body.title = title;
   if (workspaceId) body.workspace_id = workspaceId;
   if (platform) body.platform = platform;
   if (timezone) body.timezone = timezone;
   if (subagentsAllowed !== undefined) body.subagents_allowed = subagentsAllowed;
+  if (reasoningEffort !== undefined) body.reasoning_effort = reasoningEffort;
+  if (fastMode !== undefined) body.fast_mode = fastMode;
 
   const { data } = await api.post<ThreadCreatedInfo>('/api/v1/threads', body, { timeout: timeoutMs });
   return data;
@@ -62,12 +80,51 @@ export interface MarketWatchResponse {
 
 /**
  * Fetch the thread's current market-watch list (the tickers the agent is
- * live-stamping). Returns an empty `symbols` array when watch is off. Used to
- * seed the persistent watch chip on thread load and to refetch after a turn.
+ * live-stamping). Returns an empty `symbols` array when watch is off. Used
+ * to seed the persistent watch chip on thread load and to refetch after a
+ * turn.
  */
 export async function fetchMarketWatch(threadId: string): Promise<MarketWatchResponse> {
   if (!threadId) throw new Error('Thread ID is required');
   const { data } = await api.get<MarketWatchResponse>(`/api/v1/threads/${threadId}/market-watch`);
+  return data;
+}
+
+/** The thread's wakeups: pending ones, those that ended in the last day, and
+ *  price targets set before wakeups existed. */
+export async function fetchWakeups(threadId: string): Promise<WakeupsResponse> {
+  if (!threadId) throw new Error('Thread ID is required');
+  const { data } = await api.get<WakeupsResponse>(`/api/v1/threads/${threadId}/wakeups`);
+  return data;
+}
+
+/** Cancel the named wakeups, or every one with `'all'`. The answer carries each
+ *  outcome and the listing as it stands, so a `too_late` one shows where it is;
+ *  the listing is null when the server could not read it after the cancel. */
+export async function cancelWakeups(
+  threadId: string,
+  which: readonly string[] | 'all',
+): Promise<WakeupCancelResponse> {
+  if (!threadId) throw new Error('Thread ID is required');
+  const body = which === 'all' ? { all: true } : { wakeup_ids: which };
+  const { data } = await api.post<WakeupCancelResponse>(`/api/v1/threads/${threadId}/wakeups/cancel`, body);
+  return data;
+}
+
+/** The thread's background commands: those still running and those that
+ *  ended, newest first. */
+export async function fetchCommands(threadId: string): Promise<CommandsResponse> {
+  if (!threadId) throw new Error('Thread ID is required');
+  const { data } = await api.get<CommandsResponse>(`/api/v1/threads/${threadId}/commands`);
+  return data;
+}
+
+/** Stop a background command. A stopped command does not report back. */
+export async function stopCommand(threadId: string, commandId: string): Promise<CommandStopResponse> {
+  if (!threadId) throw new Error('Thread ID is required');
+  const { data } = await api.post<CommandStopResponse>(
+    `/api/v1/threads/${threadId}/commands/${encodeURIComponent(commandId)}/stop`,
+  );
   return data;
 }
 
@@ -127,10 +184,17 @@ export interface ThreadUpdates {
   /** Whether the agent may hand work to subagents on this thread. `null`
    *  returns it to following the user's default. */
   subagents_allowed?: boolean | null;
+  /** The thread's own reasoning effort, stored as sent. `null` returns it to
+   *  following Settings. */
+  reasoning_effort?: string | null;
+  /** The thread's own fast mode, stored as sent. `null` returns it to
+   *  following Settings. */
+  fast_mode?: boolean | null;
 }
 
 /**
- * Update user-editable thread fields (title, pin, archive, model, subagents) via PATCH.
+ * Update user-editable thread fields (title, pin, archive, model, subagents,
+ * effort, fast mode) via PATCH.
  * Only the keys present in `updates` are applied server-side.
  */
 export async function updateThread(threadId: string, updates: ThreadUpdates): Promise<Thread> {
@@ -179,11 +243,9 @@ export async function updateThreadSharing(threadId: string, body: Record<string,
 // The endpoint path `/summarize` and the `summarizeThread` function name are
 // preserved for REST contract compatibility.
 
-export async function summarizeThread(threadId: string, keepMessages: number = 5) {
+export async function summarizeThread(threadId: string) {
   if (!threadId) throw new Error('Thread ID is required');
-  const { data } = await api.post(`/api/v1/threads/${threadId}/summarize`, null, {
-    params: { keep_messages: keepMessages },
-  });
+  const { data } = await api.post(`/api/v1/threads/${threadId}/summarize`);
   return data;
 }
 

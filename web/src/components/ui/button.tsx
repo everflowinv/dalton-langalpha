@@ -33,7 +33,10 @@ function Button({ className, variant = "default", size = "default", ...props }: 
   return (
     <button
       className={cn(
-        "inline-flex items-center justify-center rounded-md text-sm font-medium transition-colors disabled:pointer-events-none disabled:opacity-50",
+        // Every variant but a link is a committing control, so it presses in
+        // (`press`, styles/animations.css); a link only underlines.
+        "inline-flex items-center justify-center rounded-md text-sm font-medium disabled:pointer-events-none disabled:opacity-50",
+        variant === "link" ? "transition-colors" : "press",
         variants[variant],
         sizes[size],
         className

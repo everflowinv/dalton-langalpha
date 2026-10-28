@@ -14,7 +14,10 @@ import { useShareLink } from '@/hooks/useShareLink';
 import { useWorkspaceId } from '../../contexts/WorkspaceContext';
 import { checkPreviewHealth } from '../../utils/api';
 import { shareLinkHref } from '../../utils/api/shareLinks';
+import { finite, text, type InlineCardProps } from './cardReaders';
 import '../messageList/TurnFileCards.css';
+import './turnFileTerm.css';
+import './termCardStyles.css';
 
 // Module-level deduplication: share a single in-flight health check per (workspaceId, port)
 const inflightChecks = new Map<string, Promise<{ reachable: boolean; checked_at: number }>>();
@@ -32,11 +35,6 @@ function deduplicatedHealthCheck(workspaceId: string, port: number) {
 
 type Health = 'checking' | 'live' | 'stopped' | 'offline';
 
-interface InlinePreviewCardProps {
-  artifact: Record<string, unknown> | null | undefined;
-  onClick?: () => void;
-}
-
 function StatusGlyph({ health }: { health: Health }): React.ReactElement {
   if (health === 'checking') {
     return <Loader size={12} style={{ color: 'var(--color-accent-primary)' }} />;
@@ -53,15 +51,15 @@ function StatusGlyph({ health }: { health: Health }): React.ReactElement {
  * workspace in context (a shared chat) the app cannot be reached, so the card
  * says it is private instead of checking forever.
  */
-export function InlinePreviewCard({ artifact, onClick }: InlinePreviewCardProps): React.ReactElement | null {
+export function InlinePreviewCard({ artifact, onClick }: InlineCardProps): React.ReactElement | null {
   const { t } = useTranslation();
   const workspaceId = useWorkspaceId();
   const [health, setHealth] = useState<Health>('checking');
   const [menuOpen, setMenuOpen] = useState(false);
   const checkingRef = useRef(false);
-  const port = artifact?.port as number | undefined;
+  const port = finite(artifact.port);
   // The page this card announced, which the link's own entry may have moved past.
-  const path = artifact?.path as string | undefined;
+  const path = text(artifact.path);
 
   // The private /a/ link is minted when the menu opens, not per card on mount:
   // a long chat can hold many of these, and only the menu uses the link.
@@ -86,16 +84,31 @@ export function InlinePreviewCard({ artifact, onClick }: InlinePreviewCardProps)
     }
   }, [workspaceId, port]);
 
-  // Health check on mount + every 2 minutes
+  // Checked on mount and every 2 minutes, but only while the page is visible:
+  // a live answer counts as use of the computer, so a tab left open in the
+  // background must not keep it from stopping when idle. Coming back checks
+  // at once if the last answer is older than one interval.
   useEffect(() => {
-    doHealthCheck();
-    const interval = setInterval(doHealthCheck, 2 * 60 * 1000);
-    return () => clearInterval(interval);
+    const intervalMs = 2 * 60 * 1000;
+    let lastCheck = 0;
+    const check = () => {
+      if (document.visibilityState !== 'visible') return;
+      lastCheck = Date.now();
+      doHealthCheck();
+    };
+    const onVisible = () => {
+      if (Date.now() - lastCheck >= intervalMs) check();
+    };
+    check();
+    const interval = setInterval(check, intervalMs);
+    document.addEventListener('visibilitychange', onVisible);
+    return () => {
+      clearInterval(interval);
+      document.removeEventListener('visibilitychange', onVisible);
+    };
   }, [doHealthCheck]);
 
-  if (!artifact) return null;
-
-  const title = (artifact.title as string) || (port ? t('filePanel.previewFrameTitle', { port }) : t('filePanel.previewTab'));
+  const title = text(artifact.title) || (port ? t('filePanel.previewFrameTitle', { port }) : t('filePanel.previewTab'));
   const thumb = (
     <span className="turn-file-thumb" aria-hidden="true">
       <span className="turn-file-sheet" />
@@ -108,7 +121,7 @@ export function InlinePreviewCard({ artifact, onClick }: InlinePreviewCardProps)
 
   if (!workspaceId) {
     return (
-      <div className="turn-file-card is-inline is-static">
+      <div className="turn-file-card is-inline is-static is-term">
         {thumb}
         <span className="flex min-w-0 flex-1 flex-col gap-0.5">
           <span className="turn-file-name">{title}</span>
@@ -124,11 +137,11 @@ export function InlinePreviewCard({ artifact, onClick }: InlinePreviewCardProps)
   // The menu closes on select, so the copy is confirmed by a toast rather
   // than by the item's own state.
   const copyLink = async () => {
-    if (link && await copy(link.code, path)) toast({ description: t('shareLink.copiedPrivate') });
+    if (link && await copy(link.code, path ?? '/')) toast({ description: t('shareLink.copiedPrivate') });
   };
 
   return (
-    <div className="turn-file-card is-inline">
+    <div className="turn-file-card is-inline is-term">
       {thumb}
       <button
         type="button"
@@ -144,13 +157,12 @@ export function InlinePreviewCard({ artifact, onClick }: InlinePreviewCardProps)
       </button>
       <span className="turn-file-actions">
         <span className="turn-file-open" aria-hidden="true">
-          <PanelRight className="h-3.5 w-3.5" />
           {t('chat.turnFiles.open')}
         </span>
         <DropdownMenu modal={false} onOpenChange={setMenuOpen}>
           <DropdownMenuTrigger asChild>
             <button type="button" className="turn-file-more" aria-label={t('chat.turnFiles.moreActions')}>
-              <ChevronDown className="h-3.5 w-3.5" />
+              <ChevronDown className="h-3 w-3" />
             </button>
           </DropdownMenuTrigger>
           <DropdownMenuContent align="end" sideOffset={4}>
@@ -160,7 +172,7 @@ export function InlinePreviewCard({ artifact, onClick }: InlinePreviewCardProps)
             </DropdownMenuItem>
             <DropdownMenuItem
               disabled={!link}
-              onSelect={() => link && window.open(shareLinkHref(link.code, path), '_blank', 'noopener,noreferrer')}
+              onSelect={() => link && window.open(shareLinkHref(link.code, path ?? '/'), '_blank', 'noopener,noreferrer')}
             >
               <ExternalLink className="h-3.5 w-3.5" />
               {t('filePanel.openInBrowser')}

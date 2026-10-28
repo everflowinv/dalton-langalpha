@@ -1,12 +1,9 @@
 import { Monitor } from 'lucide-react';
 import type React from 'react';
 import { useTranslation } from 'react-i18next';
+import { DESKTOP_DOWNLOAD_URL } from '@/config/supportLinks';
 import { canBeginMcpOAuth } from '@/lib/desktop';
 import { RowNote } from './RowNote';
-
-/** The page offers both desktop editions, the hosted one and the one that
- *  connects to a self-hosted server, so one link serves every build. */
-const DESKTOP_DOWNLOAD_URL = 'https://langalpha.ai/download';
 
 /**
  * Where to get the desktop app, beside a sentence saying a connection needs it.

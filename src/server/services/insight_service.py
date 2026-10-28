@@ -18,7 +18,7 @@ from datetime import datetime, timedelta
 from typing import Optional
 from zoneinfo import ZoneInfo
 
-from src.config.settings import get_config
+from src.config.settings import get_config, get_langsmith_metadata
 from src.server.database import market_insight as insight_db
 
 logger = logging.getLogger(__name__)
@@ -206,11 +206,19 @@ async def _llm_extract_fallback(raw_text: str, user_id: str | None) -> dict:
     return result.model_dump() if hasattr(result, "model_dump") else dict(result)
 
 
-async def _research(prompt: str, user_id: str | None = None) -> str:
+async def _research(
+    prompt: str,
+    user_id: str | None = None,
+    *,
+    insight_type: str,
+    requested_by: str | None = None,
+) -> str:
     """Run one research brief and return the last AI message's text.
 
     *user_id* resolves the model through the user's OAuth / BYOK chain, so a
     self-hosted deployment without a system key can still generate insights.
+    *requested_by* is the person who asked for the brief, None for a scheduled
+    one: a scheduled brief may run on a user's credentials without being theirs.
     """
     from langchain_core.messages import HumanMessage
 
@@ -247,9 +255,13 @@ async def _research(prompt: str, user_id: str | None = None) -> str:
     run_context = contextvars.copy_context()
     run_context.run(apply_fetch_override, config)
     # A research run has no step cap, so it names a tracer that does not hold
-    # its run tree, as a chat turn does.
+    # its run tree, as a chat turn does. Tagged so its spend and failures can
+    # be told apart from chat turns, which share the project.
+    metadata = get_langsmith_metadata(user_id=requested_by, workflow_type="market_insight")
+    metadata.update(origin="user" if requested_by else "system", insight_type=insight_type)
+    run_config = with_run_tracer({"metadata": metadata, "tags": ["workflow:insight"]})
     result = await asyncio.create_task(
-        graph.ainvoke(input_state, with_run_tracer({})), context=run_context,
+        graph.ainvoke(input_state, run_config), context=run_context,
     )
 
     # Extract text from the last AI message
@@ -449,7 +461,12 @@ class InsightService:
         start_time = time.monotonic()
         try:
             raw_text = await asyncio.wait_for(
-                _research(prompt + "\n\n" + _JSON_GUIDELINES, user_id=user_id),
+                _research(
+                    prompt + "\n\n" + _JSON_GUIDELINES,
+                    user_id=user_id,
+                    insight_type="personalized",
+                    requested_by=user_id,
+                ),
                 timeout=self._generation_timeout,
             )
             parsed = await self._extract_with_fallback(raw_text, user_id=user_id)
@@ -723,7 +740,9 @@ class InsightService:
 
         async def research_and_extract() -> dict:
             raw_text = await _research(
-                instruction + "\n\n" + _JSON_GUIDELINES, user_id=system_user_id
+                instruction + "\n\n" + _JSON_GUIDELINES,
+                user_id=system_user_id,
+                insight_type=job_type,
             )
             return await self._extract_with_fallback(raw_text, user_id=system_user_id)
 

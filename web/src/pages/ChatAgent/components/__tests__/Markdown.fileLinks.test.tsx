@@ -103,6 +103,47 @@ describe('Markdown links through a workspace folder', () => {
   });
 });
 
+/**
+ * A computer the user brought keeps its folders under a root of its own, and
+ * a workspace that moved keeps the roots it left. A folder link names no
+ * extension, so it is the rooted link only the folders can vouch for: read
+ * against the computer's root alone, it rendered as a web link that left the app.
+ */
+describe('Markdown folder links under a root of its own or one it moved off', () => {
+  const folders: ComputerFolders = {
+    rootDir: '/home/someone/langalpha',
+    otherRoots: ['/srv/old'],
+    dirName: 'Workspace',
+    previousDirNames: ['research-old'],
+    siblings: [],
+  };
+
+  function click(content: string) {
+    const onOpenFile = vi.fn();
+    const { container, unmount } = render(
+      <WorkspaceProvider workspaceId="ws-1" downloadFile={null} folders={folders}>
+        <Markdown variant="chat" content={content} onOpenFile={onOpenFile} />
+      </WorkspaceProvider>,
+    );
+    const link = container.querySelector('a')!;
+    const external = link.getAttribute('target') === '_blank';
+    fireEvent.click(link);
+    unmount();
+    return { external, opened: onOpenFile.mock.calls[0] };
+  }
+
+  it.each([
+    ['its own root', '/home/someone/langalpha/Workspace/reports/'],
+    ['a root it moved off', '/srv/old/Workspace/reports/'],
+    ['a root it moved off, as a file:// link', 'file:///srv/old/Workspace/reports/'],
+    ['a root it moved off, through a former folder', '/srv/old/research-old/reports/'],
+  ])('opens a folder under %s in the file panel', (_where, href) => {
+    const { external, opened } = click(`[reports](${href})`);
+    expect(external).toBe(false);
+    expect(opened).toEqual(['reports/', undefined, undefined, { rooted: true }]);
+  });
+});
+
 // The agent writes the app's own pages as absolute links, so a reply read in a
 // channel still works. In the app a new tab is a second copy of it that has
 // lost this tab's state; a skipped setup sent that tab to the setup wizard.

@@ -13,10 +13,10 @@
    * and the drag pickup/drop (scale + shadow lift on the inner frame,
    * applied via .react-draggable-dragging below). */
   transition:
-    border-color 180ms ease,
-    box-shadow 180ms cubic-bezier(0.22, 1, 0.36, 1),
-    background-color 180ms ease,
-    transform 180ms cubic-bezier(0.22, 1, 0.36, 1);
+    border-color var(--motion-quick) var(--ease-out),
+    box-shadow var(--motion-quick) var(--ease-out),
+    background-color var(--motion-quick) var(--ease-out),
+    transform var(--motion-quick) var(--ease-out);
 }
 
 .widget-frame--edit {
@@ -65,7 +65,7 @@
   width: 20px;
   height: 20px;
   border-radius: 4px;
-  transition: background-color 0.12s ease;
+  transition: background-color var(--motion-quick) var(--ease-out);
 }
 
 .widget-frame__drag:hover {
@@ -113,7 +113,7 @@
   background: transparent;
   border: none;
   cursor: pointer;
-  transition: background-color 0.12s ease, color 0.12s ease;
+  transition: background-color var(--motion-quick) var(--ease-out), color var(--motion-quick) var(--ease-out);
 }
 
 .widget-frame__icon-btn:hover {
@@ -178,7 +178,7 @@
   overflow: auto;
   padding: 0;
   /* Smooth padding fade when toggling edit mode (fit widgets go 0 → 12px). */
-  transition: padding 180ms ease;
+  transition: padding var(--motion-quick) var(--ease-out);
 }
 
 .widget-frame--edit .widget-frame__body {
@@ -227,7 +227,7 @@
  * shadow) so it reads as a quiet header glyph rather than a boxed CTA. */
 .widget-frame__add-btn--view {
   opacity: 0;
-  transition: opacity 120ms ease, background-color 120ms ease, color 120ms ease;
+  transition: opacity var(--motion-quick) var(--ease-out), background-color var(--motion-quick) var(--ease-out), color var(--motion-quick) var(--ease-out);
 }
 
 .widget-frame:hover .widget-frame__add-btn--view,
@@ -288,13 +288,13 @@
 }
 
 .react-grid-item {
-  /* ease-out-quart: starts fast, decelerates gracefully into the slot after
-   * a drop/resize. Feels more natural than plain `ease`, especially when
-   * neighbors reflow around a repositioned cell. */
+  /* The house ease-out: starts fast, decelerates gracefully into the slot
+   * after a drop/resize, which reads more naturally than a symmetric curve
+   * when neighbors reflow around a repositioned cell. */
   transition:
-    transform 200ms cubic-bezier(0.22, 1, 0.36, 1),
-    width 200ms cubic-bezier(0.22, 1, 0.36, 1),
-    height 200ms cubic-bezier(0.22, 1, 0.36, 1);
+    transform var(--motion-fold) var(--ease-out),
+    width var(--motion-fold) var(--ease-out),
+    height var(--motion-fold) var(--ease-out);
 }
 
 /* fit-to-content cells: drop the height transition. The cell is driven by
@@ -304,8 +304,8 @@
  * and the content's own animation. */
 .react-grid-item:has(.widget-frame--fit) {
   transition:
-    transform 200ms cubic-bezier(0.22, 1, 0.36, 1),
-    width 200ms cubic-bezier(0.22, 1, 0.36, 1);
+    transform var(--motion-fold) var(--ease-out),
+    width var(--motion-fold) var(--ease-out);
 }
 
 .react-grid-item.react-grid-placeholder {
@@ -349,7 +349,7 @@
 
 .react-resizable-handle {
   opacity: 0;
-  transition: opacity 0.15s ease;
+  transition: opacity var(--motion-quick) var(--ease-out);
 }
 
 .widget-grid--edit .react-resizable-handle {

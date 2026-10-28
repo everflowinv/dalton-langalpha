@@ -114,6 +114,21 @@ def _cap_full_page(text: str, trace: Trace) -> str:
     return text[:_MAX_FULL_PAGE_CHARS] + "\n\n[... truncated: page exceeded ~100K tokens ...]"
 
 
+def _cap_input_html(html: str, trace: Trace) -> str:
+    # DALTON-HOOK(heavy-compute-isolation): truncate the INPUT before any
+    # parser sees it. A cap applied only to the converted output let a huge
+    # page drive unbounded parse cost first (trafilatura and the full-page
+    # converter both walk the whole DOM); 400K source chars bound that work
+    # while staying far above any real article body.
+    if len(html) <= _MAX_FULL_PAGE_CHARS:
+        return html
+    trace(
+        f"input HTML {len(html)} chars exceeds cap — truncating to "
+        f"{_MAX_FULL_PAGE_CHARS} before parsing"
+    )
+    return html[:_MAX_FULL_PAGE_CHARS]
+
+
 def to_markdown(html: str, *, trace: Trace = _silent) -> str:
     """Convert fetched HTML to markdown for the LLM.
 
@@ -124,6 +139,7 @@ def to_markdown(html: str, *, trace: Trace = _silent) -> str:
     trafilatura returns an index/listing stub or drops most of the page's financial
     figures. A stdlib text extractor is the last resort.
     """
+    html = _cap_input_html(html, trace)
     extracted = _try_trafilatura(html, trace)
     full = _try_full_page(html, trace)
 

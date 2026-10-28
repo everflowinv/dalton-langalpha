@@ -1,8 +1,7 @@
 import { useEffect, useState } from 'react';
-import { Trash2, MessageSquareText, FileText, Code2 } from 'lucide-react';
+import { Trash2, SlidersHorizontal, FileText, Code2 } from 'lucide-react';
 import { useNavigate } from 'react-router';
 import { clearPreferences } from '@/pages/Dashboard/utils/api';
-import { useUser } from '@/hooks/useUser';
 import { usePreferences } from '@/hooks/usePreferences';
 import { useUpdatePreferences } from '@/hooks/useUpdatePreferences';
 import { useQueryClient } from '@tanstack/react-query';
@@ -11,9 +10,10 @@ import { useTranslation } from 'react-i18next';
 import { useToast } from '@/components/ui/use-toast';
 import { ToggleSwitch } from '@/components/ui/switch';
 import { readSubagentsDefault, subagentsDefaultPatch } from '@/lib/subagentsDefault';
-import { resolveChatWorkspace } from '@/hooks/useHomeWorkspace';
 import ConfirmDialog from '@/pages/Dashboard/components/ConfirmDialog';
-import { useOnboarding, useStartOnboarding } from '@/pages/Onboarding';
+import { useOnboarding } from '@/pages/Onboarding';
+import { welcomeUrl } from '@/pages/Onboarding/welcome/paths';
+import { useWelcomeOffer } from '@/pages/Onboarding/welcome/useWelcomeOffer';
 import type { Preferences } from './types';
 import { AutoApproveSettings } from './AutoApproveSettings';
 // DALTON-HOOK(hide-trading): remove TradingPermissionSection from PreferencesTab
@@ -25,15 +25,12 @@ import { AutoApproveSettings } from './AutoApproveSettings';
 export function PreferencesTab() {
   const navigate = useNavigate();
   const { toast } = useToast();
-  const { user: authUser } = useUser();
+  const welcomeOffer = useWelcomeOffer();
   const { preferences: prefsData } = usePreferences();
   const updatePrefsMutation = useUpdatePreferences();
   const queryClient = useQueryClient();
   const { t } = useTranslation();
   const { replayGuides, resetOnboarding } = useOnboarding();
-  // Both conversations run on the Chief of Staff, the agent that keeps the
-  // profile; without it neither is offered.
-  const onboarding = useStartOnboarding();
 
   const [preferences, setPreferences] = useState<Preferences | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -80,31 +77,15 @@ export function PreferencesTab() {
     }
   };
 
-  const handleModifyPreferences = async () => {
-    try {
-      const workspaceId = await resolveChatWorkspace(queryClient, 'all');
-      navigate(`/chat/t/__default__`, {
-        state: {
-          workspaceId,
-          isModifyingPreferences: true,
-        },
-      });
-    } catch (err) {
-      console.error('Error navigating to modify preferences:', err);
-      toast({
-        variant: 'destructive',
-        title: t('common.error'),
-        description: t('dashboard.failedPrefUpdate'),
-      });
-    }
-  };
-
   const handleResetConfirm = async () => {
     setIsResetting(true);
     try {
       await clearPreferences();
       setPreferences(null);
       queryClient.invalidateQueries({ queryKey: queryKeys.user.preferences() });
+      // The reset also marks onboarding incomplete, and the welcome offer, the
+      // dashboard banner and the checklist read that off the user row.
+      queryClient.invalidateQueries({ queryKey: queryKeys.user.me() });
       // Feature overrides live in preferences too — refresh effective flags
       // so gated surfaces (Watch pill, Experiments toggles) update at once.
       queryClient.invalidateQueries({ queryKey: queryKeys.features.all });
@@ -143,7 +124,7 @@ export function PreferencesTab() {
   return (
     <>
     <div className="space-y-4">
-      {authUser?.onboarding_completed !== true && (
+      {welcomeOffer && (
         <div
           className="rounded-lg p-3 flex items-center justify-between gap-3"
           style={{
@@ -161,14 +142,14 @@ export function PreferencesTab() {
           </div>
           <button
             type="button"
-            onClick={() => onboarding.start()}
+            onClick={() => welcomeOffer.open()}
             className="shrink-0 flex items-center gap-1.5 px-3 py-1.5 rounded-md text-sm font-medium transition-opacity hover:opacity-90"
             style={{
               backgroundColor: 'var(--color-btn-primary-bg)',
               color: 'var(--color-btn-primary-text)',
             }}
           >
-            {t('settings.startOnboarding')}
+            <span>{welcomeOffer.label}</span>
           </button>
         </div>
       )}
@@ -191,7 +172,11 @@ export function PreferencesTab() {
                       {key.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase())}:
                     </span>
                     <span style={{ color: 'var(--color-text-primary)', wordBreak: 'break-word' }}>
-                      {typeof value === 'object' ? JSON.stringify(value) : String(value)}
+                      {Array.isArray(value)
+                        ? value.join(', ')
+                        : typeof value === 'object'
+                          ? JSON.stringify(value)
+                          : String(value)}
                     </span>
                   </div>
                 ))}
@@ -336,19 +321,18 @@ export function PreferencesTab() {
         >
           <Trash2 className="h-4 w-4" /> {t('settings.resetPreferences')}
         </button>
-        <div className="flex items-center gap-3">
-          <button
-            type="button"
-            onClick={handleModifyPreferences}
-            className="flex items-center gap-2 px-3 py-1.5 rounded-md text-sm font-medium transition-opacity hover:opacity-90"
-            style={{
-              backgroundColor: 'var(--color-btn-primary-bg)',
-              color: 'var(--color-btn-primary-text)',
-            }}
-          >
-            <MessageSquareText className="h-4 w-4" /> {t('settings.modifyWithAgent')}
-          </button>
-        </div>
+        <button
+          type="button"
+          onClick={() => navigate(welcomeUrl({ edit: true }))}
+          className="flex items-center gap-2 px-3 py-1.5 rounded-md text-sm font-medium transition-opacity hover:opacity-90"
+          style={{
+            backgroundColor: 'var(--color-btn-primary-bg)',
+            color: 'var(--color-btn-primary-text)',
+          }}
+          data-testid="settings-edit-profile"
+        >
+          <SlidersHorizontal className="h-4 w-4" /> {t('onboarding.welcome.edit')}
+        </button>
       </div>
     </div>
 

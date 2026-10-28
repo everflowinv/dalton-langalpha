@@ -32,12 +32,13 @@ from src.server.database.runs.outbox import (
     land_fork_steers,
     lift_fork_steers,
     list_returned_steers,
-    release_deferred_report_backs,
+    release_deferred_notifications,
     settle_run_steers,
     steer_ordering_key,
 )
 from src.server.contracts.status import TERMINAL_STATUSES
 from src.server.database.provenance import MAIN_PROVENANCE_LANE
+from src.server.database.runs.hook_jobs import is_unchanged_quiet
 from src.server.utils.pg_sanitize import SafeJson, normalize_uuid
 
 logger = logging.getLogger(__name__)
@@ -145,10 +146,11 @@ class NewestCheckpoint:
 # The row a finalize hands back: the terminal status plus what the post-CAS
 # effects read (outbox jobs, the transcript export). Never the archived event
 # stream an older row holds: it runs to tens of MB, and decoding it holds the
-# event loop.
+# event loop. The start and the settle the CAS stamps time the run for the
+# report it owes.
 _FINALIZE_ROW_COLUMNS = """
     conversation_response_id, conversation_thread_id, turn_index, run_seq,
-    status, interrupt_reason, metadata
+    status, interrupt_reason, metadata, created_at, usage_settled_at
 """
 
 
@@ -384,7 +386,48 @@ async def start_run(
             async with conn.transaction():
                 from src.server.database.workspace import lock_run_workspace
 
-                await lock_run_workspace(conn, thread_id)
+                # DALTON-HOOK(colleague-dispatch): pass turn user, origin channel, wakeup notice ids, and tail-turn probe to lock_run_workspace
+                _meta = metadata if isinstance(metadata, dict) else {}
+                _q_meta = (
+                    query.metadata
+                    if query is not None and isinstance(query.metadata, dict)
+                    else {}
+                )
+                _report_source = _meta.get("report_source") or _q_meta.get(
+                    "report_source"
+                )
+                _query_type = _meta.get("query_type") or (
+                    query.query_type if query is not None else None
+                )
+                _has_explicit_internal = (
+                    "is_internal_dispatch" in _meta
+                    or "is_internal" in _meta
+                    or "is_dispatch" in _meta
+                )
+                _is_internal_dispatch = (
+                    bool(
+                        _meta.get("is_internal_dispatch")
+                        or _meta.get("is_internal")
+                        or _meta.get("is_dispatch")
+                    )
+                    if _has_explicit_internal
+                    else bool(_query_type == "system" and _report_source)
+                )
+                locked_tail_turn = await lock_run_workspace(
+                    conn,
+                    thread_id,
+                    turn_user_id=user_id,
+                    origin_channel=_meta.get("origin_channel"),
+                    is_tail_turn=bool(_meta.get("tail_turn_no_new_work")),
+                    wakeup_notice_ids=_meta.get("wakeup_notice_ids"),
+                    query_type=_query_type,
+                    report_source=_report_source,
+                    retry_of_run_id=retry_of_run_id or _meta.get("retry_of_run_id"),
+                    is_internal_dispatch=_is_internal_dispatch,
+                    run_metadata=_meta if isinstance(metadata, dict) else None,
+                )
+                if locked_tail_turn and not isinstance(metadata, dict):
+                    metadata = {**(metadata or {}), "tail_turn_no_new_work": True}
 
                 # Fast-path dedup probe. The unique index below is the
                 # race-safe backstop; this just avoids burning a turn_index
@@ -610,6 +653,36 @@ class _AlreadyTerminal(Exception):
     """Internal control flow: guarded UPDATE matched zero rows."""
 
 
+async def _keep_seen_over_quiet(
+    conn, thread_id: str, run_seq: Optional[int]
+) -> Optional[int]:
+    """Carry the thread's seen pointer over a quiet check that changed nothing,
+    and return where it now stands, or None when it stayed.
+
+    Every settled run past the pointer marks the thread unseen, so without
+    this each quiet check of a series would badge it. Only a thread the user
+    had seen up to this run is carried: one with unseen turns stays unseen.
+    """
+    if run_seq is None:
+        return None
+    async with conn.cursor() as cur:
+        await cur.execute(
+            """
+            UPDATE conversation_threads
+            SET last_seen_run_seq = GREATEST(COALESCE(last_seen_run_seq, 0), %(seq)s)
+            WHERE conversation_thread_id = %(thread)s
+              AND COALESCE(last_seen_run_seq, 0) >= (
+                  SELECT COALESCE(MAX(run_seq), 0) FROM conversation_responses
+                  WHERE conversation_thread_id = %(thread)s AND run_seq < %(seq)s
+              )
+            RETURNING last_seen_run_seq
+            """,
+            {"seq": run_seq, "thread": thread_id},
+        )
+        row = await cur.fetchone()
+    return row[0] if row else None
+
+
 async def finalize_run(
     *,
     run_id: str,
@@ -658,6 +731,7 @@ async def finalize_run(
         replay_facts["error_frame"] = record.error_frame
     if outcome.images:
         replay_facts["images"] = outcome.images
+    run_metadata = dict(outcome.metadata or {})
     # A checkpoint the run did not write was there before START. For a fork
     # whose run died before its first step, that is the abandoned branch's
     # tip, under the rows START truncated to the fork, so the pointer stays
@@ -712,7 +786,7 @@ async def finalize_run(
                             status,
                             outcome.interrupt_reason,
                             status,
-                            SafeJson(outcome.metadata or {}),
+                            SafeJson(run_metadata),
                             outcome.warnings or [],
                             outcome.errors or [],
                             outcome.execution_time,
@@ -751,6 +825,12 @@ async def finalize_run(
                         f"thread projection update failed for thread={thread_id}"
                     )
 
+                seen_run_seq = None
+                if final_status == "completed" and is_unchanged_quiet(run_meta):
+                    seen_run_seq = await _keep_seen_over_quiet(
+                        conn, thread_id, run_row["run_seq"]
+                    )
+
                 await qr_db._sync_provenance_for_response(
                     conn,
                     conversation_response_id=run_id,
@@ -769,31 +849,33 @@ async def finalize_run(
                 # START-stamped metadata, selected on the CAS-ADOPTED status
                 # (durable cancel intent can flip error->cancelled). No caller
                 # can attach, override, or forget them.
-                jobs = build_finalize_jobs_from_run_row(run_row)(final_status)
+                jobs = build_finalize_jobs_from_run_row(
+                    run_row, last_seen_run_seq=seen_run_seq
+                )(final_status)
                 if jobs:
                     await enqueue_hooks(
                         conn, run_id=run_id, thread_id=thread_id, jobs=jobs
                     )
 
-                # Deferred report-backs (a task's, an analyst's) wait for
-                # exactly this event: a dead-turn finalize (completed, error,
-                # or cancelled) proves no pending HITL checkpoint can collide
-                # with their synthetic POST, and no live turn is left to take
-                # them in as a steer. Interrupted keeps them parked: the
-                # checkpoint is live and a POST would collide with it, and
-                # the turn that resumes it takes them in as a steer. An
-                # interrupted turn that later errors or cancels releases
-                # here, so a parked job can never be stranded. Same
-                # transaction as the terminal CAS, so release and successor
-                # hooks commit together.
+                # Deferred report-backs (a task's, an analyst's) and market
+                # target alerts wait for exactly this event: a dead-turn
+                # finalize (completed, error, or cancelled) proves no pending
+                # HITL checkpoint can collide with their synthetic POST, and
+                # no live turn is left to take them in as a steer.
+                # Interrupted keeps them parked: the checkpoint is live and a
+                # POST would collide with it, and the turn that resumes it
+                # takes them in as a steer. An interrupted turn that later
+                # errors or cancels releases here, so a parked job can never
+                # be stranded. Same transaction as the terminal CAS, so
+                # release and successor hooks commit together.
                 if final_status in ("completed", "error", "cancelled"):
-                    released = await release_deferred_report_backs(
+                    released = await release_deferred_notifications(
                         conn, thread_id
                     )
                     if released:
                         logger.info(
                             f"[turn_lifecycle] released {released} deferred "
-                            f"report-back job(s) for thread={thread_id}"
+                            f"notification job(s) for thread={thread_id}"
                         )
 
                 # The thread's steers settle with the run they were sent to,
@@ -1102,7 +1184,10 @@ async def computer_has_active_run(computer_id: str) -> bool:
 
 
 async def get_latest_attempt(
-    thread_id: str, *, before_turn: Optional[int] = None
+    thread_id: str,
+    *,
+    before_turn: Optional[int] = None,
+    wait_for_finalize: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """The thread's most recent attempt row — /retry's validation target.
 
@@ -1113,12 +1198,17 @@ async def get_latest_attempt(
     ``before_turn`` narrows the search to attempts of earlier turns: a fork
     from turn N discards N and everything after it, so its predecessor is the
     latest attempt that will survive, not the latest attempt there is.
+
+    ``wait_for_finalize`` reads the row ``FOR SHARE``, which waits out a
+    finalize in flight: its terminal CAS holds the row until it commits, so
+    a run whose finalize has already run its release pass never reads live.
     """
     clauses = ["conversation_thread_id = %s"]
     params: list[Any] = [thread_id]
     if before_turn is not None:
         clauses.append("turn_index < %s")
         params.append(before_turn)
+    lock = "FOR SHARE" if wait_for_finalize else ""
     async with pool.get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
@@ -1127,6 +1217,7 @@ async def get_latest_attempt(
                 WHERE {" AND ".join(clauses)}
                 ORDER BY run_seq DESC
                 LIMIT 1
+                {lock}
                 """,
                 tuple(params),
             )
@@ -1219,6 +1310,23 @@ async def heal_stale_thread_projections() -> int:
             return cur.rowcount
 
 
+# What a liveness read says of a run, and the joins that keep its reads (a
+# thread's latest run here, a run by id in ``handoff_liveness``) to runs the
+# caller owns.
+_LIVENESS_RUN_COLUMNS = """
+    cr.conversation_response_id, cr.conversation_thread_id,
+    cr.status, cr.cancel_requested_at,
+    -- What run_completed_at reads to say when it settled.
+    cr.created_at, cr.usage_settled_at, cr.execution_time
+"""
+_OWNED_RUNS_FROM = """
+    FROM conversation_responses cr
+    JOIN conversation_threads ct
+        ON ct.conversation_thread_id = cr.conversation_thread_id
+    JOIN workspaces w ON w.workspace_id = ct.workspace_id
+"""
+
+
 async def get_latest_attempts_for_threads(
     thread_ids: List[str], user_id: str
 ) -> Dict[str, Dict[str, Any]]:
@@ -1235,12 +1343,10 @@ async def get_latest_attempts_for_threads(
     async with pool.get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
-                """
+                f"""
                 SELECT DISTINCT ON (cr.conversation_thread_id)
-                    cr.conversation_thread_id, cr.conversation_response_id,
-                    cr.status, cr.cancel_requested_at,
+                    {_LIVENESS_RUN_COLUMNS},
                     cr.interrupt_reason, cr.run_seq,
-                    cr.created_at AS run_started_at,
                     -- A run settled before usage_settled_at existed falls
                     -- back to its start plus measured duration, as replay's
                     -- run_completed_at does.
@@ -1253,10 +1359,7 @@ async def get_latest_attempts_for_threads(
                     ) AS last_activity_at,
                     NULLIF(ct.title, '') AS title,
                     w.name AS workspace_name
-                FROM conversation_responses cr
-                JOIN conversation_threads ct
-                    ON ct.conversation_thread_id = cr.conversation_thread_id
-                JOIN workspaces w ON w.workspace_id = ct.workspace_id
+                {_OWNED_RUNS_FROM}
                 WHERE cr.conversation_thread_id = ANY(%s)
                   AND w.user_id = %s
                 ORDER BY cr.conversation_thread_id, cr.run_seq DESC
@@ -1265,6 +1368,53 @@ async def get_latest_attempts_for_threads(
             )
             rows = await cur.fetchall()
             return {str(r["conversation_thread_id"]): dict(r) for r in rows}
+
+
+# How far back a report's run is followed. A chain longer than this names its
+# newest legs only, which leaves the hand-off without its report link, not the
+# report undelivered.
+_CONTINUED_RUNS_LIMIT = 50
+
+
+async def get_continued_runs(thread_id: str, run_id: str) -> List[str]:
+    """``run_id`` and the runs it continued on ``thread_id``, oldest first.
+
+    A run that ends interrupted waits on the user and reports nothing; the
+    next attempt on the thread, a resume or a message past the interrupt,
+    carries its work on and reports for it, as ``carried_pair`` has it carry
+    a summary's pair. So a report on the last leg answers every leg back to
+    the first one that did not follow an interrupt, which is the run a
+    hand-off named. Empty when ``run_id`` is not a run of ``thread_id``.
+    """
+    thread, run = normalize_uuid(thread_id), normalize_uuid(run_id)
+    if thread is None or run is None:
+        return []
+    async with pool.get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                SELECT conversation_response_id, status
+                FROM conversation_responses
+                WHERE conversation_thread_id = %s
+                  AND run_seq <= (
+                      SELECT run_seq FROM conversation_responses
+                      WHERE conversation_response_id = %s
+                        AND conversation_thread_id = %s
+                  )
+                ORDER BY run_seq DESC
+                LIMIT %s
+                """,
+                (thread, run, thread, _CONTINUED_RUNS_LIMIT),
+            )
+            rows = await cur.fetchall()
+    # The first row is the run itself; each earlier one joins while it ended
+    # interrupted.
+    chain = [str(r["conversation_response_id"]) for r in rows[:1]]
+    for row in rows[1:]:
+        if row["status"] != "interrupted":
+            break
+        chain.append(str(row["conversation_response_id"]))
+    return chain[::-1]
 
 
 async def get_run_statuses(run_ids: List[str]) -> Dict[str, str]:

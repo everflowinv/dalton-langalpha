@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 import logging
 
 
+from ._shared import _mark_failure
 from .currency import fmt_count, fmt_money, fmt_price
 from .display import (
     _symbol_currency,
@@ -114,6 +115,7 @@ async def fetch_stock_screener(
             api_params["limit"] = limit
 
         if financial is None:
+            _mark_failure("not_configured")
             timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
             return (
                 f"## Stock Screener\n**Retrieved:** {timestamp}\n\nNo financial data source configured.",
@@ -215,6 +217,7 @@ async def fetch_stock_screener(
 
     except Exception as e:
         logger.error(f"Error in stock screener: {e}")
+        _mark_failure(e)
         timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         error_content = f"## Stock Screener\n**Retrieved:** {timestamp}\n**Status:** Error\n\nError screening stocks: {str(e)}"
         return error_content, {"type": "stock_screener", "results": [], "filters": {}, "count": 0}

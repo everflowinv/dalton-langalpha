@@ -11,7 +11,6 @@ from src.server.services.computer_manager import ComputerManager, SessionMetadat
 
 def _manager(meta: dict) -> MagicMock:
     manager = MagicMock(spec=ComputerManager)
-    manager.idle_timeout = 900
     manager.cleanup_interval = 60
     manager._machines = {}
     for computer_id, session_meta in meta.items():
@@ -43,7 +42,6 @@ async def test_reports_the_managers_live_sessions():
         stats = await get_sessions("user-1")
 
     assert stats["active_sessions"] == 1
-    assert stats["idle_timeout"] == 900
     assert stats["cleanup_interval"] == 60
     assert stats["workspaces"] == [
         {

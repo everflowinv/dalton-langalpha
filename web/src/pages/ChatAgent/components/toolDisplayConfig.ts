@@ -3,7 +3,8 @@ import {
   TrendingUp, Building2, BarChart3, PieChart, Search, Globe,
   FilePlus, FileText, FilePen, FolderSearch, SquareChevronRight, Wrench,
   Newspaper, Brain, User, FileBarChart, Clock, ClipboardList, Zap, Settings, Terminal,
-  Sparkles, BookText, BookMarked, BookPlus, PenLine, Eye, Plug, Send, Contact,
+  Sparkles, BookText, BookMarked, BookPlus, PenLine, Eye, Plug, Send, Contact, AlarmClock, Activity,
+  Layers, ArrowUpDown,
 } from 'lucide-react';
 import {
   classifyAgentPath, topicFromMemoryKey, type AgentPathInfo, type UserDataEntity,
@@ -12,9 +13,8 @@ import { directToolDisplayName, parseDirectToolName, summarizeDirectToolArgs } f
 import { INTERVAL_LABEL } from '@/lib/bars';
 import { LARGE_TOOL_RESULTS_PREFIX } from './filePanel/fileMeta';
 import { messagingAppName, platformOf } from './messaging/messageDelivery';
-
-/** Translation function signature compatible with i18next's t() */
-type TFn = (key: string, opts?: Record<string, unknown>) => string;
+import { quietArg, wakeupArgListed } from '../session/wakeupArgs';
+import type { TFn } from '@/lib/elapsed';
 
 interface ToolDisplayEntry {
   displayName: string;
@@ -66,8 +66,12 @@ export const TOOL_DISPLAY_CONFIG: Record<string, ToolDisplayEntry> = {
   get_market_indices:       { displayName: 'Market Indices',       i18nKey: 'marketIndices',       icon: BarChart3 },
   get_sector_performance:   { displayName: 'Sector Performance',   i18nKey: 'sectorPerformance',   icon: PieChart },
   screen_stocks:            { displayName: 'Stock Screener',       i18nKey: 'stockScreener',       icon: Search },
+  get_options_chain:        { displayName: 'Options Chain',        i18nKey: 'optionsChain',        icon: Layers },
+  get_market_movers:        { displayName: 'Market Movers',        i18nKey: 'marketMovers',        icon: ArrowUpDown },
   // Market watch (live price injection) — one tool, action="watch"/"unwatch"
   watch_market:             { displayName: 'Watch Market',         i18nKey: 'watchMarket',         icon: Eye },
+  // The agent's own follow-ups: set, cancel or list them, or end a check quietly
+  schedule_wakeup:          { displayName: 'Wakeups',              i18nKey: 'scheduleWakeup',      icon: AlarmClock },
   // SEC
   get_sec_filing:           { displayName: 'SEC Filing',           i18nKey: 'secFiling',           icon: FileBarChart },
   // Web search / news
@@ -98,6 +102,9 @@ export const TOOL_DISPLAY_CONFIG: Record<string, ToolDisplayEntry> = {
   think_tool:               { displayName: 'Thinking',             i18nKey: 'thinking',            icon: Brain },
   // Background subagent management
   TaskOutput:               { displayName: 'Task Output',          i18nKey: 'taskOutput',          icon: ClipboardList },
+  // What will report back to the thread; it replaced BashOutput, whose calls
+  // in older threads keep the generic row they always had.
+  ThreadStatus:             { displayName: 'Thread Status',        i18nKey: 'threadStatus',        icon: Activity },
   // Automations
   check_automations:        { displayName: 'Automations',          i18nKey: 'automations',         icon: Clock },
   create_automation:        { displayName: 'Create Automation',    i18nKey: 'createAutomation',    icon: Zap },
@@ -119,21 +126,30 @@ const FILE_READ_TOOLS = new Set(['Read']);
 const FILE_PATH_TOOLS = new Set([...FILE_WRITE_TOOLS, ...FILE_READ_TOOLS]);
 
 /** Classifies the file_path arg for Read/Write/Edit. Returns null for all other tools. */
-function classifyFromArgs(toolName: string, args: ToolCallArgs | undefined): AgentPathInfo | null {
+function classifyFromArgs(toolName: string, args: ToolCallArgs | undefined, root?: string | null): AgentPathInfo | null {
   if (!args) return null;
   if (!FILE_PATH_TOOLS.has(toolName)) return null;
   const fp = (args.file_path || args.filePath) as string | undefined;
   if (!fp) return null;
-  return classifyAgentPath(fp);
+  return classifyAgentPath(fp, root);
+}
+
+/**
+ * What a title reads beyond the call's own args: the result's artifact, which
+ * carries a direct tool's vendor names, and the computer root its paths start with.
+ */
+export interface ToolTitleContext {
+  artifact?: unknown;
+  root?: string | null;
 }
 
 export function getDisplayName(
   rawToolName: string,
   t?: TFn,
   args?: ToolCallArgs,
-  artifact?: unknown,
+  { artifact, root }: ToolTitleContext = {},
 ): string {
-  const info = classifyFromArgs(rawToolName, args);
+  const info = classifyFromArgs(rawToolName, args, root);
   if (info) {
     if (info.kind === 'skill') {
       return t ? t('toolArtifact.tool.skill') : 'Skill';
@@ -171,8 +187,8 @@ export function isTaskTool(toolName: string | undefined): boolean {
   return toolName === 'Task' || toolName === 'task';
 }
 
-export function getToolIcon(rawToolName: string, args?: ToolCallArgs): LucideIcon {
-  const info = classifyFromArgs(rawToolName, args);
+export function getToolIcon(rawToolName: string, args?: ToolCallArgs, root?: string | null): LucideIcon {
+  const info = classifyFromArgs(rawToolName, args, root);
   if (info) {
     if (info.kind === 'skill') return Sparkles;
     if (info.kind === 'memory') return BookMarked;
@@ -190,13 +206,13 @@ export function getToolIcon(rawToolName: string, args?: ToolCallArgs): LucideIco
   return TOOL_DISPLAY_CONFIG[rawToolName]?.icon || Wrench;
 }
 
-export function getInProgressText(rawToolName: string, toolCall: ToolCall | undefined, t?: TFn): string {
+export function getInProgressText(rawToolName: string, toolCall: ToolCall | undefined, t?: TFn, root?: string | null): string {
   const args = toolCall?.args;
   const tr = t ? (key: string, opts?: Record<string, unknown>) => t(`toolArtifact.inProgress.${key}`, opts) : null;
 
   // Path-aware variants for store-backed paths. These short-circuit the
   // generic Read/Write/Edit branches below.
-  const info = classifyFromArgs(rawToolName, args);
+  const info = classifyFromArgs(rawToolName, args, root);
   if (info) {
     if (info.kind === 'skill' && rawToolName === 'Read') {
       return info.name
@@ -298,10 +314,30 @@ export function getInProgressText(rawToolName: string, toolCall: ToolCall | unde
       return tr?.('fetchingSectorData') ?? 'fetching sector data...';
     case 'screen_stocks':
       return tr?.('screeningStocks') ?? 'screening stocks...';
-    case 'watch_market':
-      return args?.action === 'unwatch'
-        ? (tr?.('unwatchingMarket') ?? 'stopping market watch...')
-        : (tr?.('watchingMarket') ?? 'starting market watch...');
+    case 'get_options_chain':
+      return args?.underlying
+        ? (tr?.('fetchingSymbolOptions', { symbol: args.underlying }) ?? `fetching ${args.underlying} options...`)
+        : (tr?.('fetchingOptions') ?? 'fetching options...');
+    case 'get_market_movers':
+      if (args?.direction === 'losers') return tr?.('fetchingLosers') ?? 'fetching top losers...';
+      return tr?.('fetchingGainers') ?? 'fetching top gainers...';
+    case 'watch_market': {
+      if (args?.action === 'unwatch') return tr?.('unwatchingMarket') ?? 'stopping market watch...';
+      if (args?.action === 'cancel') return tr?.('cancellingPriceTargets') ?? 'cancelling price targets...';
+      // Targets stand apart from the watch, so a call that sets only targets
+      // starts no watch, and one with neither only reads the state.
+      const has = (key: string) => { const v = args?.[key]; return Array.isArray(v) && v.length > 0; };
+      if (has('symbols')) return tr?.('watchingMarket') ?? 'starting market watch...';
+      if (has('targets')) return tr?.('settingPriceTargets') ?? 'setting price targets...';
+      return tr?.('checkingMarketWatch') ?? 'checking market watch...';
+    }
+    case 'schedule_wakeup': {
+      const tw = (key: string, fallback: string) => (t ? t(`chat.wakeups.${key}`) : fallback);
+      if (quietArg(args)) return tw('endingQuietly', 'ending the check...');
+      if (wakeupArgListed(args, 'triggers')) return tw('settingWakeups', 'setting wakeups...');
+      if (wakeupArgListed(args, 'cancel')) return tw('cancellingWakeups', 'cancelling wakeups...');
+      return tw('checkingWakeups', 'checking wakeups...');
+    }
     case 'get_sec_filing':
       return args?.symbol
         ? (tr?.('fetchingSymbolFiling', { symbol: args.symbol }) ?? `fetching ${args.symbol} filing...`)
@@ -365,6 +401,8 @@ export function getInProgressText(rawToolName: string, toolCall: ToolCall | unde
         : (tr?.('fetchingTaskOutput') ?? 'fetching task output...');
     case 'check_automations':
       return tr?.('checkingAutomations') ?? 'checking automations...';
+    case 'ThreadStatus':
+      return tr?.('checkingThreadStatus') ?? 'checking what is running...';
     case 'create_automation':
       return args?.name
         ? (tr?.('creatingName', { name: args.name }) ?? `creating ${args.name}...`)
@@ -396,12 +434,12 @@ export function getInProgressText(rawToolName: string, toolCall: ToolCall | unde
  * doesn't need localization today, but the param keeps call sites symmetric
  * and reserves space for future translated variants.
  */
-export function getCompletedSummary(toolName: string, toolCall: ToolCall | undefined, _t?: TFn): string | null {
+export function getCompletedSummary(toolName: string, toolCall: ToolCall | undefined, _t?: TFn, root?: string | null): string | null {
   const args = toolCall?.args;
   if (!args) return null;
   // Path-aware summaries: emit just the meaningful object (skill name, topic,
   // memo slug). The verb is carried by getDisplayName / row label.
-  const info = classifyFromArgs(toolName, args);
+  const info = classifyFromArgs(toolName, args, root);
   if (info) {
     if (info.kind === 'skill') return info.name || null;
     if (info.kind === 'memory') {
@@ -458,15 +496,15 @@ export function getCompletedSummary(toolName: string, toolCall: ToolCall | undef
  * noun; for generic tools we fall back to the historic
  * `${displayName} ${progressText}` concat.
  */
-export function getActiveLabel(toolName: string, toolCall: ToolCall | undefined, t?: TFn): string {
+export function getActiveLabel(toolName: string, toolCall: ToolCall | undefined, t?: TFn, root?: string | null): string {
   const args = toolCall?.args;
-  const info = classifyFromArgs(toolName, args);
+  const info = classifyFromArgs(toolName, args, root);
   if (info && info.kind !== 'file') {
     // getInProgressText already produces the full phrase for path-aware paths.
-    return getInProgressText(toolName, toolCall, t);
+    return getInProgressText(toolName, toolCall, t, root);
   }
-  const dn = getDisplayName(toolName, t, args);
-  const pt = getInProgressText(toolName, toolCall, t);
+  const dn = getDisplayName(toolName, t, args, { root });
+  const pt = getInProgressText(toolName, toolCall, t, root);
   return pt ? `${dn} ${pt}` : dn;
 }
 
@@ -483,10 +521,10 @@ export function getCompletedRowTitle(
   toolName: string,
   toolCall: ToolCall | undefined,
   t?: TFn,
-  artifact?: unknown,
+  context: ToolTitleContext = {},
 ): string {
   const args = toolCall?.args;
-  const info = classifyFromArgs(toolName, args);
+  const info = classifyFromArgs(toolName, args, context.root);
   if (info) {
     if (info.kind === 'skill' && toolName === 'Read') {
       return t ? t('toolArtifact.completed.activatedSkill') : 'Activated skill';
@@ -526,7 +564,7 @@ export function getCompletedRowTitle(
       return t ? t(`toolArtifact.completed.updated_${entity}`) : `Updated ${entity}`;
     }
   }
-  return getDisplayName(toolName, t, args, artifact);
+  return getDisplayName(toolName, t, args, context);
 }
 
 /**
@@ -556,9 +594,9 @@ export type ToolCategory =
   | 'fileEdit'    // Write/Edit/Save on a non-store path
   | 'generic';    // anything else (TaskOutput, MCP tools without artifacts, ...)
 
-export function categorizeTool(toolName: string, toolCall: ToolCall | undefined): ToolCategory {
+export function categorizeTool(toolName: string, toolCall: ToolCall | undefined, root?: string | null): ToolCategory {
   const args = toolCall?.args;
-  const info = classifyFromArgs(toolName, args);
+  const info = classifyFromArgs(toolName, args, root);
   if (info) {
     if (info.kind === 'skill') return 'skill';
     if (info.kind === 'memory') {

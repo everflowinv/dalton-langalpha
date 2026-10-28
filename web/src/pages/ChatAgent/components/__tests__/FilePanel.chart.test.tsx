@@ -181,7 +181,7 @@ describe('FilePanel chart tabs', () => {
     userLocalStorage.setItem(lastChartStorageKey('ws'), 'MSFT');
     renderWithProviders(panel());
 
-    fireEvent.click(screen.getByText('Open a chart'));
+    fireEvent.click(screen.getByRole('button', { name: 'Chart' }));
 
     const chart = await screen.findByTestId('chart-surface');
     expect(chart.dataset.symbol).toBe('MSFT');
@@ -191,7 +191,7 @@ describe('FilePanel chart tabs', () => {
 
   it('opens on a broad index before any symbol has been looked at', async () => {
     renderWithProviders(panel());
-    fireEvent.click(screen.getByText('Open a chart'));
+    fireEvent.click(screen.getByRole('button', { name: 'Chart' }));
     expect((await screen.findByTestId('chart-surface')).dataset.symbol).toBe('SPY');
   });
 
@@ -267,7 +267,8 @@ describe('FilePanel chart tabs', () => {
 
   it('offers no chart on a read-only panel', () => {
     renderWithProviders(panel({ readOnly: true }));
-    expect(screen.queryByText('Open a chart')).toBeNull();
+    expect(document.querySelector('.file-panel-tree')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'Chart' })).toBeNull();
   });
 
   it('remembers the interval the toolbar moved to, so the tab comes back there', async () => {

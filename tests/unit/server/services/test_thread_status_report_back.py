@@ -458,6 +458,7 @@ def _task_slice(**over) -> dict:
         "report_back_run_id": None,
         "recent_report_back_run_ids": [],
         "active_tasks": [],
+        "owed_report_kinds": [],
         **over,
     }
 
@@ -474,7 +475,7 @@ async def test_a_thread_is_pending_on_an_analyst_hand_off():
         _no_open_jobs(),
         patch(
             "src.server.services.report_back.subagent.read_task_report_back_status",
-            AsyncMock(return_value=_task_slice(active_tasks=["task-1"])),
+            AsyncMock(return_value=_task_slice(active_tasks=["task-1"], owed_report_kinds=["command"])),
         ),
         patch(
             "src.server.database.runs.lifecycle.get_run",
@@ -488,6 +489,8 @@ async def test_a_thread_is_pending_on_an_analyst_hand_off():
     assert resp["report_back_run_id"] == "rb-1"
     assert resp["active_tasks"] == ["task-1"]
     assert resp["owed_threads"] == [_label("analyst-1")]
+    # Whose reports are owed, so the tray names the Analyst, not the command.
+    assert resp["owed_report_kinds"] == ["analyst", "command"]
 
 
 @pytest.mark.asyncio
@@ -510,6 +513,7 @@ async def test_a_thread_lists_both_registries_drained_runs_in_thread_order():
         resp = await status.read_report_back_slice("cos-1", OWNER)
 
     assert resp["pending_report_back"] is False
+    assert resp["owed_report_kinds"] == []
     assert resp["recent_report_back_run_ids"] == ["hand-off-2", "task-1", "hand-off-1"]
 
 

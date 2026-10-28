@@ -27,6 +27,45 @@ html {
   input, select, textarea { font-size: max(16px, 1rem) !important; }
 }
 
+/* ---------- Motion ----------
+   `lib/motion.ts` for CSS, the same numbers under the same names (DESIGN.md
+   § Motion). A stylesheet reaches for these and never writes a duration or a
+   curve of its own; `styles/__tests__/motionTokens.test.ts` fails on one.
+
+   The curves are Tailwind theme variables, so they double as utilities
+   (`ease-out`, `ease-reveal`, `ease-collapse`). Tailwind's own `ease-out`
+   (0, 0, .2, 1) is a different curve under the same name, and this replaces
+   it rather than leaving two. The durations become `duration-quick` and its
+   siblings. The two defaults put every bare `transition-*` class on the quick
+   duration and the house curve, where Tailwind would put 150ms on the
+   Material curve. `static` emits them all whether or not a class uses
+   them, since plain stylesheets read them too. */
+@theme static {
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-reveal: cubic-bezier(0.33, 1, 0.68, 1);
+  --ease-collapse: cubic-bezier(0.45, 0, 0.2, 1);
+  --transition-duration-press: var(--motion-press);
+  --transition-duration-quick: var(--motion-quick);
+  --transition-duration-fold: var(--motion-fold);
+  --transition-duration-enter: var(--motion-enter);
+  --transition-duration-exit: var(--motion-exit);
+  --default-transition-duration: var(--motion-quick);
+  --default-transition-timing-function: var(--ease-out);
+}
+
+:root {
+  --motion-press: 100ms;
+  --motion-quick: 160ms;
+  --motion-fold: 240ms;
+  --motion-enter: 280ms;
+  --motion-exit: 140ms;
+  --motion-reveal: 360ms;
+  /* `lib/motion.ts` STAGGER: the gap between items of a batch arriving. */
+  --motion-stagger: 40ms;
+  /* `lib/motion.ts` PRESS_SCALE: how far a committing button presses in. */
+  --press-scale: 0.97;
+}
+
 /* ---------- Semantic color tokens (hex/rgba for inline use) ---------- */
 :root {
   /* Font roles: Sora is the app's voice (chrome, nav, controls); Geist is
@@ -106,6 +145,22 @@ html {
   --color-border-elevated: #34363A;
   --color-border-subtle: #26282B;
   --color-border-input: #34363A;
+  /* The edge of a chosen option card. The borders above are hairlines that
+     vanish on bg-elevated, the dialog fill; this one has to read on every
+     fill, so it is a step up from all of them. Neutral: a selection never
+     takes the accent. */
+  --color-border-strong: rgba(230, 230, 228, 0.32);
+
+  /* Data cards in the transcript (charts/termCard.css): an unfilled box held
+     by its edge, the rules inside it a step quieter. Light is cool and
+     neutral against the warm page, so a number reads as data, not as
+     chrome; the cards are the only cool surface. */
+  --color-term-edge: #3A3C40;
+  --color-term-edge-hover: #5C5F65;
+  --color-term-rule: #2E3033;
+  --color-term-text: #E6E6E4;
+  --color-term-text-secondary: #9B9FA6;
+  --color-term-text-tertiary: rgba(230, 230, 228, 0.62);
 
   --color-text-primary: #E6E6E4;
   --color-text-secondary: #9B9FA6;
@@ -179,6 +234,29 @@ html {
 
   /* Dot-grid retired from work surfaces — kept barely-visible for empty states. */
   --color-dot-grid: rgba(255, 255, 255, 0.05);
+
+  /* Machine drawings (Computers dialog, machineArt/). An illustration carries
+     its own shading (DESIGN.md § Illustrations): lit from the upper left, a
+     top and four side shades, hairlines in three weights, a soft contact
+     shadow. Glass stays near black in both themes, as a screen does. */
+  --color-art-ground: #191919;
+  --color-art-top: #2A2A2A;
+  --color-art-s3: #252525;
+  --color-art-s2: #212121;
+  --color-art-s1: #1D1D1D;
+  --color-art-s0: #191919;
+  --color-art-line-hi: #D4D4D4;
+  --color-art-line-mid: #707074;
+  --color-art-line-lo: #48484C;
+  --color-art-line-faint: #333336;
+  --color-art-dot: rgba(230, 230, 230, 0.3);
+  --color-art-mesh: rgba(230, 230, 230, 0.75);
+  --color-art-port: #0D0D0E;
+  --color-art-glass: #121214;
+  --color-art-halo: rgba(0, 0, 0, 0.8);
+  --color-art-glare: rgba(255, 255, 255, 0.035);
+  --color-art-term-ink: #C9C8C4;
+  --color-art-term-prompt: #7FBF8E;
 
   /* Identity tiles (Plugins rows): a name hashes to one of these eight muted
      tints, so every server/skill/plugin keeps a recognizable mark across
@@ -269,11 +347,12 @@ html {
   /* Warm paper ground so white cards read as raised surfaces instead of
      border-only outlines on the same white. */
   --color-bg-canvas: #F5F4F1;
-  /* Chat artifact cards: warm paper fill (inverse of the dashboard pairing —
-     there white cards sit on tinted canvas; here tinted cards sit on the
-     white chat page). The lightweight-charts canvases inside those cards now
-     read this token (MarketDataCharts CANVAS_SOURCES) instead of mirroring
-     it, so they cannot seam. */
+  /* Filled surfaces in the chat (task cards, the subagent bar, the chart
+     annotation chip): warm paper fill, the inverse of the dashboard pairing
+     (there white cards sit on tinted canvas; here tinted cards sit on the
+     white chat page). The data cards are unfilled frames, and the detail
+     panel's chart canvases draw on a transparent ground, so neither reads
+     this token. */
   --color-bg-tool-card: #F5F4F1;
   --color-bg-card-hover: #FAFAF8;
   --color-bg-elevated: #F7F7F6;
@@ -294,6 +373,14 @@ html {
   --color-border-elevated: #E3E3E1;
   --color-border-subtle: #EFEFEE;
   --color-border-input: #E3E3E1;
+  --color-border-strong: rgba(31, 31, 30, 0.3);
+
+  --color-term-edge: #CDD2D9;
+  --color-term-edge-hover: #9AA1AC;
+  --color-term-rule: #E3E6EA;
+  --color-term-text: #15181D;
+  --color-term-text-secondary: #5B6370;
+  --color-term-text-tertiary: #8A919C;
 
   --color-text-primary: #1F1F1E;
   --color-text-secondary: #73726E;
@@ -356,6 +443,22 @@ html {
   --color-status-modified-glow: rgba(180, 83, 9, 0.15);
 
   --color-dot-grid: rgba(31, 31, 30, 0.05);
+
+  --color-art-ground: #FCFCFB;
+  --color-art-top: #FFFFFF;
+  --color-art-s3: #F4F4F1;
+  --color-art-s2: #EDEDEA;
+  --color-art-s1: #E5E5E2;
+  --color-art-s0: #DCDCD9;
+  --color-art-line-hi: #26262A;
+  --color-art-line-mid: #8A8A8F;
+  --color-art-line-lo: #B4B4B8;
+  --color-art-line-faint: #D4D4D6;
+  --color-art-dot: rgba(58, 58, 62, 0.3);
+  --color-art-mesh: rgba(58, 58, 62, 0.75);
+  --color-art-port: #2B2B2E;
+  --color-art-glass: #121214;
+  --color-art-halo: rgba(138, 138, 128, 0.3);
 
   /* Identity tiles — same hues as dark, tuned for the white page: slightly
      denser fills, darker monograms. */

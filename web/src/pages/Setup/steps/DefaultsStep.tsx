@@ -1,9 +1,11 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useId } from 'react';
 import { useNavigate } from 'react-router';
 import { motion, AnimatePresence } from '@/lib/framer';
 import { ChevronRight, Info } from 'lucide-react';
 import { cn } from '@/lib/utils';
-import { Button } from '@/components/ui/button';
+import { WizardStepHeader } from '@/components/ui/wizard';
+import { TWEEN } from '@/lib/motion';
+import { SetupFooter } from '../SetupFooter';
 import { Loader } from '@/components/ui/loader';
 import { ModelTierConfig } from '@/components/model/ModelTierConfig';
 import { ModelSelector } from '@/components/model/ModelSelector';
@@ -27,6 +29,7 @@ export default function DefaultsStep() {
   const updatePreferences = useUpdatePreferences();
   const { t } = useTranslation();
   const copy = useModelSlotCopy();
+  const headingId = useId();
 
   // ---------------------------------------------------------------------------
   // Selection state — seed from existing preferences if available
@@ -116,7 +119,7 @@ export default function DefaultsStep() {
   if (isLoading) {
     return (
       <div className="flex items-center justify-center py-20">
-        <Loader size={20} className="text-(--color-text-tertiary)" />
+        <Loader size={20} className="text-(--color-text-tertiary)" label={t('common.loading')} />
       </div>
     );
   }
@@ -126,29 +129,17 @@ export default function DefaultsStep() {
   // Either way, `models` is the correct set to display.
 
   return (
-    <div className="flex flex-col gap-4 sm:gap-6">
-      {/* Section heading */}
-      <div className="flex flex-col gap-1">
-        <h2
-          className="font-semibold"
-          style={{ fontSize: '1.125rem', color: 'var(--color-text-primary)' }}
-        >
-          {t('setup.chooseYourModels')}
-        </h2>
-        <p
-          className="text-sm"
-          style={{ color: 'var(--color-text-secondary)' }}
-        >
-          {copy.chooseDesc}
-        </p>
-      </div>
-
+    <div>
+      <WizardStepHeader titleId={headingId} title={t('setup.chooseYourModels')} helper={copy.chooseDesc} />
+      <div className="flex flex-col gap-4 sm:gap-6">
       {/* Model access reminder */}
       <div
         className="flex items-start gap-2.5 rounded-lg px-3.5 py-3"
+        // A neutral panel with the accent on its icon alone: amber annotates,
+        // it does not wash or ring (DESIGN.md, accent discipline).
         style={{
-          background: 'var(--color-accent-soft)',
-          border: '1px solid var(--color-accent-primary)',
+          background: 'var(--color-bg-card)',
+          border: '1px solid var(--color-border-muted)',
         }}
       >
         <Info
@@ -187,19 +178,20 @@ export default function DefaultsStep() {
           aria-expanded={advancedOpen}
         >
           <ChevronRight
-            className={cn('h-3 w-3 transition-transform duration-200', advancedOpen && 'rotate-90')}
+            className={cn('h-3 w-3 transition-transform', advancedOpen && 'rotate-90')}
           />
           {t('settings.modelTuning.advanced')}
         </button>
 
         <AnimatePresence initial={false}>
           {advancedOpen && (
+            // Opacity and a short lift, not height: the fold opens at once and
+            // fades in, so nothing below it is animated through a layout pass.
             <motion.div
-              initial={{ height: 0, opacity: 0 }}
-              animate={{ height: 'auto', opacity: 1 }}
-              exit={{ height: 0, opacity: 0 }}
-              transition={{ duration: 0.2, ease: 'easeInOut' }}
-              className="overflow-hidden"
+              initial={{ opacity: 0, y: -4 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, transition: TWEEN.exit }}
+              transition={TWEEN.quick}
             >
               <div className="flex flex-col pt-4" style={{ gap: '24px' }}>
                 <ModelSelector
@@ -236,34 +228,21 @@ export default function DefaultsStep() {
 
       {/* Error */}
       {error && (
-        <p className="text-sm" style={{ color: 'var(--color-loss)' }}>
+        <p role="alert" className="text-sm" style={{ color: 'var(--color-loss)' }}>
           {error}
         </p>
       )}
-
-      {/* Navigation buttons */}
-      <div className="flex items-center justify-between pt-2">
-        <Button variant="outline" onClick={handleBack}>
-          {t('setup.back')}
-        </Button>
-        <Button
-          variant="default"
-          disabled={saving || !canContinue}
-          onClick={handleNext}
-          className="min-w-[120px]"
-        >
-          {saving ? (
-            <>
-              <span aria-hidden="true" className="mr-1.5 shrink-0">
-                <Loader size={16} className="text-current" />
-              </span>
-              {t('setup.saving')}
-            </>
-          ) : (
-            t('setup.continue')
-          )}
-        </Button>
       </div>
+
+      <SetupFooter
+        back={{ label: t('setup.back'), onClick: handleBack }}
+        primary={{
+          label: saving ? t('setup.saving') : t('setup.continue'),
+          onClick: handleNext,
+          disabled: !canContinue,
+          busy: saving,
+        }}
+      />
     </div>
   );
 }

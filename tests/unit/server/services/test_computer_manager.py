@@ -16,9 +16,10 @@ from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 
-from ptc_agent.config.core import FilesystemConfig
+from ptc_agent.config.core import DaytonaConfig, FilesystemConfig
 from ptc_agent.core.sandbox.runtime import RuntimeState, SandboxTransientError
 from src.server.database.workspace_folders import WorkspaceFolderMoving
+from src.server.services.computer_errors import ProviderNotOffered, UnknownResourceTier
 from src.server.services.computer_manager import (
     ComputerBinding,
     ComputerManager,
@@ -30,14 +31,15 @@ from tests.computer_manager_patch import cm_patch
 
 _LIFECYCLE = "src.server.services.computer_manager._lifecycle"
 _MACHINES = "src.server.services.computer_manager._machines"
+_RETIREMENT = "src.server.services.computer_manager._retirement"
 _PROVISIONING = "src.server.services.computer_manager._provisioning"
 _FOLDERS = "src.server.services.computer_manager._folders"
 _MACHINE_BACKUP = "src.server.services.computer_manager._machine_backup"
 _SESSIONS = "src.server.services.computer_manager._sessions"
 _WORKSPACE_MANAGER = "src.server.services.workspace_manager"
 
-# The six methods WP3's router codes against. Frozen: the router resolves them
-# by name on whatever ComputerManager.get_instance() hands back.
+# The methods the router codes against. Frozen: the router resolves them by
+# name on whatever ComputerManager.get_instance() hands back.
 COMPUTER_SURFACE = (
     "get_session_for_computer",
     "start_computer",
@@ -45,12 +47,32 @@ COMPUTER_SURFACE = (
     "archive_computer",
     "set_computer_spec",
     "set_computer_always_on",
+    "remove_computer",
 )
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+_KINDS = ("daytona", "docker", "e2b", "ssh")
+
+
+def _fake_sandbox(provider, **settings):
+    """A SandboxConfig stand-in offering every kind, each kind's settings
+    under its own name as the real one keeps them."""
+    sandbox = SimpleNamespace(provider=provider, platform_secrets={}, **settings)
+
+    def settings_for(kind):
+        found = getattr(sandbox, kind, None) if kind in _KINDS else None
+        if found is None:
+            raise ValueError(f"Unknown sandbox provider: {kind!r}")
+        return found
+
+    sandbox.settings_for = settings_for
+    sandbox.creatable_providers = lambda: (provider, *_KINDS)
+    return sandbox
 
 
 def _make_config(provider="daytona", working_directory="/home/workspace"):
@@ -60,13 +82,15 @@ def _make_config(provider="daytona", working_directory="/home/workspace"):
     strings rather than mock attributes.
     """
     config = MagicMock()
-    config.sandbox = SimpleNamespace(provider=provider)
+    config.sandbox = _fake_sandbox(provider)
     config.filesystem = SimpleNamespace(working_directory=working_directory)
     config.to_core_config.return_value = SimpleNamespace(
-        sandbox=SimpleNamespace(
-            provider=provider,
-            daytona=SimpleNamespace(api_key="test-key"),
-            platform_secrets={},
+        sandbox=_fake_sandbox(
+            provider,
+            daytona=SimpleNamespace(
+                api_key="test-key",
+                resource_tiers=DaytonaConfig().resource_tiers,
+            ),
         ),
         filesystem=FilesystemConfig(working_directory=working_directory),
     )
@@ -216,12 +240,12 @@ class _Base:
     def setup_method(self):
         ComputerManager.reset_instance()
         self._retirement_marker = patch(
-            f"{_MACHINES}.mark_computer_retirement_pending",
+            f"{_RETIREMENT}.mark_computer_retirement_pending",
             AsyncMock(return_value=True),
         )
-        self._retirement_marker.start()
+        self.mark_retirement_pending = self._retirement_marker.start()
         self._retirement_clear = patch(
-            f"{_MACHINES}.clear_computer_retirement_pending",
+            f"{_RETIREMENT}.clear_computer_retirement_pending",
             AsyncMock(return_value=True),
         )
         self.clear_retirement_pending = self._retirement_clear.start()
@@ -278,6 +302,15 @@ class TestMintingAComputer(_Base):
     """``create_computer_for_user`` writes the row; ``ensure_primary_computer``
     is what every new project goes through, and mints at most one per user."""
 
+    @pytest.fixture(autouse=True)
+    def _users_computers(self):
+        """An unnamed machine reads the user's others to number its name."""
+        with patch(
+            f"{_MACHINES}.get_computers_for_user", AsyncMock(return_value=[])
+        ) as listed:
+            self.users_computers = listed
+            yield
+
     @pytest.mark.asyncio
     @patch("src.server.services.computer_manager._machines.create_computer")
     async def test_the_row_takes_the_deployments_kind_and_root(self, mock_create):
@@ -298,6 +331,9 @@ class TestMintingAComputer(_Base):
             status="stopped",
             resource_tier="performance",
             root_dir="/home/workspace",
+            provider_config=None,
+            config=None,
+            files_backup=True,
         )
 
     @pytest.mark.asyncio
@@ -313,6 +349,124 @@ class TestMintingAComputer(_Base):
 
         assert mock_create.await_args.kwargs["status"] == "stopped"
         assert mock_create.await_args.kwargs["resource_tier"] == "standard"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "kind, name",
+        [
+            ("e2b", "Cloud computer"),
+            ("docker", "Local computer"),
+            ("ssh", "SSH computer"),
+        ],
+    )
+    @patch("src.server.services.computer_manager._machines.create_computer")
+    async def test_a_chosen_kind_takes_the_row_and_its_default_name(
+        self, mock_create, kind, name
+    ):
+        manager = _make_manager()
+        mock_create.return_value = _make_computer(kind=kind, status="stopped")
+
+        await manager.create_computer_for_user("user-1", kind=kind)
+
+        assert mock_create.await_args.kwargs["kind"] == kind
+        assert mock_create.await_args.kwargs["name"] == name
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("kind, primary", [("e2b", True), ("ssh", False)])
+    @patch("src.server.services.computer_manager._machines.create_computer")
+    async def test_only_a_machine_the_server_can_rebuild_becomes_primary(
+        self, mock_create, kind, primary
+    ):
+        """A primary is never removed and Home lands on it, so an owner's
+        machine as primary would hold Home there after it is lost."""
+        manager = _make_manager()
+        mock_create.return_value = _make_computer(kind=kind, status="stopped")
+
+        await manager.create_computer_for_user("user-1", kind=kind, is_primary=True)
+
+        assert mock_create.await_args.kwargs["is_primary"] is primary
+
+    @pytest.mark.asyncio
+    @patch("src.server.services.computer_manager._machines.create_computer")
+    async def test_an_unnamed_machine_is_numbered_past_the_users_others(
+        self, mock_create
+    ):
+        """Daytona and E2B share one default, so a second cloud machine would
+        otherwise read the same as the first in every picker."""
+        manager = _make_manager()
+        mock_create.return_value = _make_computer(status="stopped")
+        self.users_computers.return_value = [
+            {"name": "cloud computer"},
+            {"name": "Cloud computer 2"},
+            {"name": "Research"},
+        ]
+
+        await manager.create_computer_for_user("user-1", kind="e2b")
+
+        assert mock_create.await_args.kwargs["name"] == "Cloud computer 3"
+        self.users_computers.assert_awaited_once_with("user-1")
+
+    @pytest.mark.asyncio
+    @patch("src.server.services.computer_manager._machines.create_computer")
+    async def test_a_named_machine_reads_no_other(self, mock_create):
+        manager = _make_manager()
+        mock_create.return_value = _make_computer(status="stopped")
+        self.users_computers.return_value = [{"name": "Research"}]
+
+        await manager.create_computer_for_user("user-1", name="Research")
+
+        assert mock_create.await_args.kwargs["name"] == "Research"
+        self.users_computers.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @patch("src.server.services.computer_manager._machines.create_computer")
+    async def test_a_kind_the_deployment_does_not_offer_writes_no_row(
+        self, mock_create
+    ):
+        manager = _make_manager()
+        manager.config.sandbox.creatable_providers = lambda: ("daytona",)
+
+        with pytest.raises(ProviderNotOffered):
+            await manager.create_computer_for_user("user-1", kind="e2b")
+
+        mock_create.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @patch("src.server.services.computer_manager._machines.create_computer")
+    async def test_the_tier_is_checked_against_the_chosen_kinds_presets(
+        self, mock_create
+    ):
+        """Each provider declares its own presets, so a name real on the
+        default can be missing on the kind asked for."""
+        manager = _make_manager()
+        manager.config.to_core_config.return_value.sandbox.e2b = SimpleNamespace(
+            resource_tiers={"standard": SimpleNamespace(cpu=1, memory=1, disk=3)}
+        )
+        mock_create.return_value = _make_computer(status="stopped")
+
+        with pytest.raises(UnknownResourceTier):
+            await manager.create_computer_for_user(
+                "user-1", kind="e2b", resource_tier="max"
+            )
+        await manager.create_computer_for_user("user-1", resource_tier="max")
+
+        mock_create.assert_awaited_once()
+        assert mock_create.await_args.kwargs["kind"] == "daytona"
+
+    @pytest.mark.asyncio
+    @patch("src.server.services.computer_manager._machines.create_computer")
+    @patch("src.server.services.computer_manager._machines.get_primary_computer")
+    async def test_a_minted_primary_stays_on_the_deployments_kind(
+        self, mock_primary, mock_create
+    ):
+        manager = ComputerManager.get_instance(config=_make_config(provider="docker"))
+        mock_primary.return_value = None
+        mock_create.return_value = _make_computer(kind="docker", status="stopped")
+
+        await manager.ensure_primary_computer("user-1")
+
+        assert mock_create.await_args.kwargs["kind"] == "docker"
+        assert mock_create.await_args.kwargs["name"] == "Local computer"
 
     @pytest.mark.asyncio
     @patch("src.server.services.computer_manager._machines.create_computer")
@@ -970,9 +1124,9 @@ class TestTombstone(_Base):
         return manager, workspace or _make_workspace()
 
     @pytest.mark.asyncio
-    @patch(f"{_MACHINES}.update_computer_status")
-    @patch(f"{_MACHINES}.get_computer")
-    @patch(f"{_MACHINES}.get_live_workspace_ids_for_computer")
+    @patch(f"{_RETIREMENT}.update_computer_status")
+    @patch(f"{_RETIREMENT}.get_computer")
+    @patch(f"{_RETIREMENT}.get_live_workspace_ids_for_computer")
     async def test_the_last_project_leaving_retires_the_computer(
         self, mock_live, mock_get, mock_status
     ):
@@ -1001,9 +1155,9 @@ class TestTombstone(_Base):
         manager._remove_workspace_folder.assert_not_awaited()
 
     @pytest.mark.asyncio
-    @patch(f"{_MACHINES}.update_computer_status")
-    @patch(f"{_MACHINES}.get_computer")
-    @patch(f"{_MACHINES}.get_live_workspace_ids_for_computer")
+    @patch(f"{_RETIREMENT}.update_computer_status")
+    @patch(f"{_RETIREMENT}.get_computer")
+    @patch(f"{_RETIREMENT}.get_live_workspace_ids_for_computer")
     async def test_a_lost_retirement_claim_never_touches_the_provider(
         self, mock_live, mock_get, mock_status
     ):
@@ -1021,9 +1175,9 @@ class TestTombstone(_Base):
         )
 
     @pytest.mark.asyncio
-    @patch(f"{_MACHINES}.update_computer_status")
-    @patch(f"{_MACHINES}.get_computer")
-    @patch(f"{_MACHINES}.get_live_workspace_ids_for_computer")
+    @patch(f"{_RETIREMENT}.update_computer_status")
+    @patch(f"{_RETIREMENT}.get_computer")
+    @patch(f"{_RETIREMENT}.get_live_workspace_ids_for_computer")
     async def test_a_computer_with_a_live_project_is_left_alone(
         self, mock_live, mock_get, mock_status
     ):
@@ -1044,9 +1198,31 @@ class TestTombstone(_Base):
         self.clear_retirement_pending.assert_awaited_once_with("comp-1")
 
     @pytest.mark.asyncio
-    @patch(f"{_MACHINES}.update_computer_status")
-    @patch(f"{_MACHINES}.get_computer")
-    @patch(f"{_MACHINES}.get_live_workspace_ids_for_computer")
+    @patch(f"{_RETIREMENT}.update_computer_status")
+    @patch(f"{_RETIREMENT}.get_computer")
+    @patch(f"{_RETIREMENT}.get_live_workspace_ids_for_computer")
+    async def test_a_folder_its_owner_kept_is_not_removed(
+        self, mock_live, mock_get, mock_status
+    ):
+        """The machine stays either way; the folder goes only when asked."""
+        manager, workspace = self._retiring_manager()
+        mock_live.return_value = []
+        computer = _make_computer(kind="ssh", is_primary=False, status="running")
+        mock_get.return_value = computer
+
+        retired = await manager._retire_machine_if_empty(
+            "comp-1", "ws-a", workspace, keep_folder=True
+        )
+
+        assert retired is False
+        manager._teardown_machine.assert_not_awaited()
+        mock_status.assert_not_awaited()
+        manager._remove_workspace_folder.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @patch(f"{_RETIREMENT}.update_computer_status")
+    @patch(f"{_RETIREMENT}.get_computer")
+    @patch(f"{_RETIREMENT}.get_live_workspace_ids_for_computer")
     async def test_an_empty_primary_is_kept(self, mock_live, mock_get, mock_status):
         """Instant create hands the next project this machine, so it survives
         empty rather than costing the user a fresh sandbox and its disk."""
@@ -1062,9 +1238,32 @@ class TestTombstone(_Base):
         self.clear_retirement_pending.assert_awaited_once_with("comp-1")
 
     @pytest.mark.asyncio
-    @patch(f"{_MACHINES}.update_computer_status")
-    @patch(f"{_MACHINES}.get_computer")
-    @patch(f"{_MACHINES}.get_live_workspace_ids_for_computer")
+    @patch(f"{_RETIREMENT}.update_computer_status")
+    @patch(f"{_RETIREMENT}.get_computer")
+    @patch(f"{_RETIREMENT}.get_live_workspace_ids_for_computer")
+    async def test_a_machine_the_user_brought_outlives_its_last_project(
+        self, mock_live, mock_get, mock_status
+    ):
+        """Retiring it would drop its pinned host key and make the owner add it again."""
+        manager, workspace = self._retiring_manager()
+        mock_live.return_value = []
+        computer = _make_computer(kind="ssh", is_primary=False, status="running")
+        mock_get.return_value = computer
+
+        retired = await manager._retire_machine_if_empty("comp-1", "ws-a", workspace)
+
+        assert retired is False
+        manager._teardown_machine.assert_not_awaited()
+        mock_status.assert_not_awaited()
+        manager._remove_workspace_folder.assert_awaited_once_with(
+            "ws-a", workspace, computer
+        )
+        self.clear_retirement_pending.assert_awaited_once_with("comp-1")
+
+    @pytest.mark.asyncio
+    @patch(f"{_RETIREMENT}.update_computer_status")
+    @patch(f"{_RETIREMENT}.get_computer")
+    @patch(f"{_RETIREMENT}.get_live_workspace_ids_for_computer")
     async def test_a_machine_already_retired_is_not_retired_twice(
         self, mock_live, mock_get, mock_status
     ):
@@ -1081,9 +1280,9 @@ class TestTombstone(_Base):
         mock_status.assert_not_awaited()
 
     @pytest.mark.asyncio
-    @patch(f"{_MACHINES}.update_computer_status")
-    @patch(f"{_MACHINES}.get_computer")
-    @patch(f"{_MACHINES}.get_live_workspace_ids_for_computer")
+    @patch(f"{_RETIREMENT}.update_computer_status")
+    @patch(f"{_RETIREMENT}.get_computer")
+    @patch(f"{_RETIREMENT}.get_live_workspace_ids_for_computer")
     async def test_emptiness_is_not_decided_without_the_key(
         self, mock_live, mock_get, mock_status
     ):
@@ -1101,15 +1300,17 @@ class TestTombstone(_Base):
         manager._remove_workspace_folder.assert_awaited_once()
 
     @pytest.mark.asyncio
-    @patch(f"{_MACHINES}.update_computer_status")
-    @patch(f"{_MACHINES}.get_computer")
-    @patch(f"{_MACHINES}.get_live_workspace_ids_for_computer")
-    @patch(f"{_MACHINES}.get_retirement_pending_computers")
+    @patch(f"{_RETIREMENT}.update_computer_status")
+    @patch(f"{_RETIREMENT}.get_computer")
+    @patch(f"{_RETIREMENT}.get_live_workspace_ids_for_computer")
+    @patch(f"{_RETIREMENT}.get_retirement_pending_computers")
     async def test_cleanup_retries_a_retirement_that_lost_its_delete_lock(
         self, mock_pending, mock_live, mock_get, mock_status
     ):
         manager, _ = self._retiring_manager()
-        computer = _make_computer(is_primary=False, status="running")
+        computer = _make_computer(
+            is_primary=False, status="running", config={"retire_when_empty": True}
+        )
         mock_pending.return_value = [computer]
         mock_get.return_value = computer
         mock_live.return_value = []
@@ -1127,8 +1328,8 @@ class TestTombstone(_Base):
         ]
 
     @pytest.mark.asyncio
-    @patch(f"{_MACHINES}.mark_computer_retirement_pending")
-    @patch(f"{_MACHINES}.get_retirement_pending_computers")
+    @patch(f"{_RETIREMENT}.defer_computer_retirement")
+    @patch(f"{_RETIREMENT}.get_retirement_pending_computers")
     async def test_cleanup_defers_contended_candidates_behind_newer_work(
         self, mock_pending, mock_defer
     ):
@@ -1147,10 +1348,10 @@ class TestTombstone(_Base):
         ]
 
     @pytest.mark.asyncio
-    @patch(f"{_MACHINES}.update_computer_status")
-    @patch(f"{_MACHINES}.get_computer")
-    @patch(f"{_MACHINES}.get_live_workspace_ids_for_computer")
-    @patch(f"{_MACHINES}.get_retirement_pending_computers")
+    @patch(f"{_RETIREMENT}.update_computer_status")
+    @patch(f"{_RETIREMENT}.get_computer")
+    @patch(f"{_RETIREMENT}.get_live_workspace_ids_for_computer")
+    @patch(f"{_RETIREMENT}.get_retirement_pending_computers")
     async def test_cleanup_clears_a_timed_out_marker_from_a_shared_machine(
         self, mock_pending, mock_live, mock_get, mock_status
     ):
@@ -1169,6 +1370,388 @@ class TestTombstone(_Base):
         self.clear_retirement_pending.assert_awaited_once_with("comp-1")
         manager._teardown_machine.assert_not_awaited()
         mock_status.assert_not_awaited()
+
+
+class TestRemovingAComputer(_Base):
+    """The owner's remove takes the decision the last workspace leaving takes.
+
+    Only an empty computer other than the primary goes, and only from a settled
+    state, so a remove never takes a workspace, a start or a spec change down
+    with it. Every refusal names a code the client words.
+    """
+
+    @staticmethod
+    def _removing_manager(*, locked=True):
+        manager = _make_manager()
+        manager._teardown_machine = AsyncMock()
+        manager._machine_decision_lock = _decision_lock(locked)
+        return manager
+
+    @staticmethod
+    def _spare(**overrides):
+        fields = {
+            "is_primary": False,
+            "status": "stopped",
+            "provider_ref": "sandbox-abc",
+        }
+        return _make_computer(**{**fields, **overrides})
+
+    @staticmethod
+    async def _refused(manager, code):
+        from src.server.services.computer_errors import ComputerRemovalRefused
+
+        with pytest.raises(ComputerRemovalRefused) as refused:
+            await manager.remove_computer("comp-1")
+        assert refused.value.code == code
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", ["stopped", "running", "error"])
+    @patch(f"{_RETIREMENT}.update_computer_status")
+    @patch(f"{_RETIREMENT}.get_computer")
+    @patch(f"{_RETIREMENT}.get_live_workspace_ids_for_computer")
+    @patch(f"{_RETIREMENT}.mark_computer_retirement_pending")
+    async def test_an_empty_settled_computer_is_torn_down_and_tombstoned(
+        self, mock_mark, mock_live, mock_get, mock_status, status
+    ):
+        manager = self._removing_manager()
+        manager._machine("comp-1")
+        computer = self._spare(status=status)
+        mock_get.return_value = computer
+        mock_live.return_value = []
+        mock_status.side_effect = [
+            {**computer, "status": "stopping"},
+            {**computer, "status": "deleted"},
+        ]
+
+        await manager.remove_computer("comp-1")
+
+        # Marked before the decision, so a create or start reading the row
+        # from here on refuses it.
+        mock_mark.assert_awaited_once_with("comp-1")
+        (binding,) = manager._teardown_machine.await_args.args
+        assert (binding.workspace_id, binding.computer_id, binding.provider_ref) == (
+            "",
+            "comp-1",
+            "sandbox-abc",
+        )
+        assert [item.args for item in mock_status.await_args_list] == [
+            ("comp-1", "stopping"),
+            ("comp-1", "deleted"),
+        ]
+        assert [item.kwargs for item in mock_status.await_args_list] == [
+            {"expected": status},
+            {"expected": "stopping"},
+        ]
+        self.clear_retirement_pending.assert_not_awaited()
+        assert manager._machine_if_known("comp-1") is None
+
+    @pytest.mark.asyncio
+    @patch(f"{_PROVISIONING}.SessionManager.cleanup_session")
+    @patch(f"{_RETIREMENT}.update_computer_status")
+    @patch(f"{_RETIREMENT}.get_computer")
+    @patch(f"{_RETIREMENT}.get_live_workspace_ids_for_computer")
+    async def test_a_computer_that_never_got_a_sandbox_is_only_tombstoned(
+        self, mock_live, mock_get, mock_status, mock_cleanup
+    ):
+        """The real teardown runs, and with no sandbox named it asks no provider."""
+        manager = _make_manager()
+        manager._machine_decision_lock = _decision_lock(True)
+        manager._revoke_livefs = AsyncMock()
+        manager._retire_session = AsyncMock()
+        manager._detached_sandbox_teardown = AsyncMock()
+        computer = self._spare(provider_ref=None)
+        mock_get.return_value = computer
+        mock_live.return_value = []
+        mock_status.side_effect = [
+            {**computer, "status": "stopping"},
+            {**computer, "status": "deleted"},
+        ]
+
+        await manager.remove_computer("comp-1")
+
+        manager._detached_sandbox_teardown.assert_not_awaited()
+        manager._retire_session.assert_not_awaited()
+        assert [item.args[1] for item in mock_status.await_args_list] == [
+            "stopping",
+            "deleted",
+        ]
+
+    @pytest.mark.asyncio
+    @patch(f"{_RETIREMENT}.update_computer_status")
+    @patch(f"{_RETIREMENT}.get_computer")
+    @patch(f"{_RETIREMENT}.get_live_workspace_ids_for_computer")
+    @patch(f"{_RETIREMENT}.mark_computer_retirement_pending")
+    async def test_the_primary_is_refused_before_anything_is_marked(
+        self, mock_mark, mock_live, mock_get, mock_status
+    ):
+        """Asked ahead of the workspaces: a user told to empty it first would
+        empty it for nothing."""
+        manager = self._removing_manager()
+        mock_get.return_value = self._spare(is_primary=True)
+        mock_live.return_value = ["ws-a"]
+
+        await self._refused(manager, "primary")
+
+        mock_mark.assert_not_awaited()
+        mock_live.assert_not_awaited()
+        mock_status.assert_not_awaited()
+        manager._teardown_machine.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @patch(f"{_RETIREMENT}.update_computer_status")
+    @patch(f"{_RETIREMENT}.get_computer")
+    @patch(f"{_RETIREMENT}.get_live_workspace_ids_for_computer")
+    @patch(f"{_RETIREMENT}.mark_computer_retirement_pending")
+    async def test_a_computer_with_workspaces_is_refused_before_anything_is_marked(
+        self, mock_mark, mock_live, mock_get, mock_status
+    ):
+        manager = self._removing_manager()
+        mock_get.return_value = self._spare()
+        mock_live.return_value = ["ws-a"]
+
+        await self._refused(manager, "has_workspaces")
+
+        mock_mark.assert_not_awaited()
+        mock_status.assert_not_awaited()
+        manager._teardown_machine.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            pytest.param({"status": "creating", "provider_ref": None}, id="preparing"),
+            pytest.param({"status": "starting"}, id="starting"),
+            pytest.param({"status": "stopping"}, id="stopping"),
+            pytest.param(
+                {
+                    "status": "running",
+                    "spec_change": {
+                        "target_tier": "performance",
+                        "from_tier": "standard",
+                        "state": "in_progress",
+                        "started_at": "2026-10-17T00:00:00+00:00",
+                    },
+                    "spec_change_stale": False,
+                },
+                id="spec-change",
+            ),
+        ],
+    )
+    @patch(f"{_RETIREMENT}.update_computer_status")
+    @patch(f"{_RETIREMENT}.get_computer")
+    @patch(f"{_RETIREMENT}.get_live_workspace_ids_for_computer")
+    @patch(f"{_RETIREMENT}.mark_computer_retirement_pending")
+    async def test_a_computer_mid_transition_is_busy(
+        self, mock_mark, mock_live, mock_get, mock_status, overrides
+    ):
+        manager = self._removing_manager()
+        mock_get.return_value = self._spare(**overrides)
+        mock_live.return_value = []
+
+        # A build on this worker holds the machine lock throughout; the
+        # refusal must not wait for it.
+        async with manager._acquire_machine_lock("comp-1"):
+            await asyncio.wait_for(self._refused(manager, "busy"), timeout=1)
+
+        mock_mark.assert_not_awaited()
+        mock_status.assert_not_awaited()
+        manager._teardown_machine.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @patch(f"{_RETIREMENT}.update_computer_status")
+    @patch(f"{_RETIREMENT}.get_computer")
+    @patch(f"{_RETIREMENT}.get_live_workspace_ids_for_computer")
+    async def test_a_stale_spec_change_does_not_hold_the_computer(self, mock_live, mock_get, mock_status):
+        """Its worker is gone, so it reads as interrupted and owns nothing."""
+        manager = self._removing_manager()
+        computer = self._spare(
+            spec_change={
+                "target_tier": "performance",
+                "from_tier": "standard",
+                "state": "in_progress",
+                "started_at": "2026-10-17T00:00:00+00:00",
+            },
+            spec_change_stale=True,
+        )
+        mock_get.return_value = computer
+        mock_live.return_value = []
+        mock_status.side_effect = [
+            {**computer, "status": "stopping"},
+            {**computer, "status": "deleted"},
+        ]
+
+        await manager.remove_computer("comp-1")
+
+        manager._teardown_machine.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    @patch(f"{_RETIREMENT}.update_computer_status")
+    @patch(f"{_RETIREMENT}.get_computer")
+    @patch(f"{_RETIREMENT}.get_live_workspace_ids_for_computer")
+    @patch(f"{_RETIREMENT}.mark_computer_retirement_pending")
+    async def test_a_workspace_landing_before_the_marker_keeps_the_computer(
+        self, mock_mark, mock_live, mock_get, mock_status
+    ):
+        """The create committed ahead of the marker, so the read under the key
+        counts it; the marker comes off with the refusal."""
+        manager = self._removing_manager()
+        mock_get.return_value = self._spare()
+        mock_live.side_effect = [[], ["ws-new"]]
+
+        await self._refused(manager, "has_workspaces")
+
+        mock_mark.assert_awaited_once_with("comp-1")
+        self.clear_retirement_pending.assert_awaited_once_with("comp-1")
+        mock_status.assert_not_awaited()
+        manager._teardown_machine.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @patch(f"{_RETIREMENT}.update_computer_status")
+    @patch(f"{_RETIREMENT}.get_computer")
+    @patch(f"{_RETIREMENT}.get_live_workspace_ids_for_computer")
+    async def test_a_start_claimed_before_the_key_is_left_to_finish(
+        self, mock_live, mock_get, mock_status
+    ):
+        """A claim from 'starting' would pull the sandbox from under the start;
+        the marker this remove wrote comes off, so the start's computer stays usable."""
+        manager = self._removing_manager()
+        mock_get.side_effect = [self._spare(), self._spare(status="starting")]
+        mock_live.return_value = []
+
+        await self._refused(manager, "busy")
+
+        self.clear_retirement_pending.assert_awaited_once_with("comp-1")
+        mock_status.assert_not_awaited()
+        manager._teardown_machine.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @patch(f"{_RETIREMENT}.update_computer_status")
+    @patch(f"{_RETIREMENT}.get_computer")
+    @patch(f"{_RETIREMENT}.get_live_workspace_ids_for_computer")
+    async def test_a_marker_another_delete_left_stays_for_the_sweep(
+        self, mock_live, mock_get, mock_status
+    ):
+        marked = {"config": {"retire_when_empty": True}}
+        manager = self._removing_manager()
+        self.mark_retirement_pending.return_value = False
+        mock_get.side_effect = [
+            self._spare(**marked),
+            self._spare(status="stopping", **marked),
+        ]
+        mock_live.return_value = []
+
+        await self._refused(manager, "busy")
+
+        self.clear_retirement_pending.assert_not_awaited()
+        mock_status.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @patch(f"{_MACHINES}.get_computer")
+    @patch(f"{_RETIREMENT}.update_computer_status")
+    @patch(f"{_RETIREMENT}.get_computer")
+    @patch(f"{_RETIREMENT}.get_live_workspace_ids_for_computer")
+    async def test_a_contended_key_is_busy_and_the_computer_still_starts(
+        self, mock_live, mock_get, mock_status, mock_start_get
+    ):
+        """The regression: a remove refused for a key held past the wait left
+        its marker, so the computer refused every start and the sweep retired
+        it after its owner was told it stays. The marker goes on only under
+        the key, so a refusal without it leaves nothing behind."""
+        row = self._spare()
+
+        async def mark(_computer_id):
+            row["config"] = {"retire_when_empty": True}
+            return True
+
+        self.mark_retirement_pending.side_effect = mark
+        manager = self._removing_manager(locked=False)
+        mock_get.side_effect = lambda *_a, **_k: dict(row)
+        mock_start_get.side_effect = lambda *_a, **_k: dict(row)
+        mock_live.return_value = []
+        manager._claim_start_with_capacity = AsyncMock(return_value=None)
+
+        await self._refused(manager, "busy")
+
+        assert not (row.get("config") or {}).get("retire_when_empty")
+        mock_status.assert_not_awaited()
+        manager._teardown_machine.assert_not_awaited()
+        # Another start owning the claim is the only reason it does not start.
+        assert await manager._start_machine("comp-1") is None
+        manager._claim_start_with_capacity.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    @patch(f"{_RETIREMENT}.update_computer_status")
+    @patch(f"{_RETIREMENT}.get_computer")
+    @patch(f"{_RETIREMENT}.get_live_workspace_ids_for_computer")
+    async def test_a_lost_claim_is_busy_and_never_reaches_the_provider(
+        self, mock_live, mock_get, mock_status
+    ):
+        manager = self._removing_manager()
+        mock_get.return_value = self._spare()
+        mock_live.return_value = []
+        mock_status.return_value = None
+
+        await self._refused(manager, "busy")
+
+        mock_status.assert_awaited_once_with("comp-1", "stopping", expected="stopped")
+        manager._teardown_machine.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @patch(f"{_RETIREMENT}.update_computer_status")
+    @patch(f"{_RETIREMENT}.get_computer")
+    @patch(f"{_RETIREMENT}.get_live_workspace_ids_for_computer")
+    async def test_a_computer_retired_meanwhile_is_not_found(
+        self, mock_live, mock_get, mock_status
+    ):
+        """The loser of two removes on two workers: the winner's tombstone is
+        what it reads under the key."""
+        manager = self._removing_manager()
+        mock_get.side_effect = [self._spare(), None]
+        mock_live.return_value = []
+
+        with pytest.raises(ValueError, match="not found"):
+            await manager.remove_computer("comp-1")
+
+        mock_status.assert_not_awaited()
+        manager._teardown_machine.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @patch(f"{_RETIREMENT}.update_computer_status")
+    @patch(f"{_RETIREMENT}.get_computer")
+    @patch(f"{_RETIREMENT}.get_live_workspace_ids_for_computer")
+    async def test_two_removes_retire_the_computer_once(self, mock_live, mock_get, mock_status):
+        manager = self._removing_manager()
+        computer = self._spare()
+        mock_get.side_effect = lambda *a, **k: (
+            computer if mock_status.await_count == 0 else None
+        )
+        mock_live.return_value = []
+        mock_status.side_effect = [
+            {**computer, "status": "stopping"},
+            {**computer, "status": "deleted"},
+        ]
+
+        results = await asyncio.gather(
+            manager.remove_computer("comp-1"),
+            manager.remove_computer("comp-1"),
+            return_exceptions=True,
+        )
+
+        assert results[0] is None
+        assert isinstance(results[1], ValueError)
+        assert manager._teardown_machine.await_count == 1
+
+    @pytest.mark.asyncio
+    @patch(f"{_RETIREMENT}.get_computer")
+    @patch(f"{_RETIREMENT}.mark_computer_retirement_pending")
+    async def test_a_missing_computer_is_not_found(self, mock_mark, mock_get):
+        manager = self._removing_manager()
+        mock_get.return_value = None
+
+        with pytest.raises(ValueError, match="not found"):
+            await manager.remove_computer("comp-1")
+
+        mock_mark.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
@@ -1353,6 +1936,44 @@ class TestTearingDownAMachine(_Base):
         manager._detached_sandbox_teardown.assert_not_awaited()
 
     @pytest.mark.asyncio
+    @patch(f"{_PROVISIONING}.SessionManager.get_cached_session")
+    @patch(f"{_PROVISIONING}.SessionManager.cleanup_session")
+    async def test_the_handle_deletes_its_sandbox_though_a_reconnect_failed_on_it(
+        self, mock_cleanup, mock_cached
+    ):
+        """Cleanup keeps a sandbox no reconnect completed on, so one that failed
+        during an outage left the removed machine's sandbox running."""
+        manager = self._tearing_manager(
+            provider_ref="sandbox-abc", session_sandbox_id="sandbox-abc"
+        )
+        cached = manager._machine("comp-1").session
+        mock_cached.return_value = cached
+        order = []
+        cached.sandbox.release_for_removal.side_effect = lambda: order.append("release")
+        mock_cleanup.side_effect = lambda _: order.append("cleanup")
+
+        await manager._teardown_machine(_make_binding(provider_ref="sandbox-abc"))
+
+        assert order == ["release", "cleanup"]
+
+    @pytest.mark.asyncio
+    @patch(f"{_PROVISIONING}.SessionManager.get_cached_session")
+    @patch(f"{_PROVISIONING}.SessionManager.cleanup_session")
+    async def test_a_cached_handle_on_another_sandbox_keeps_its_keep(
+        self, mock_cleanup, mock_cached
+    ):
+        manager = self._tearing_manager(
+            provider_ref="sandbox-abc", session_sandbox_id="sandbox-abc"
+        )
+        replacement = _make_session()
+        replacement.sandbox.sandbox_id = "sandbox-replacement"
+        mock_cached.return_value = replacement
+
+        await manager._teardown_machine(_make_binding(provider_ref="sandbox-abc"))
+
+        replacement.sandbox.release_for_removal.assert_not_called()
+
+    @pytest.mark.asyncio
     @patch(f"{_PROVISIONING}.SessionManager.cleanup_session")
     async def test_a_handle_on_another_sandbox_is_evicted_intact(self, mock_cleanup):
         """Cleaning it up would delete a sandbox this machine never named."""
@@ -1399,6 +2020,20 @@ class TestTearingDownAMachine(_Base):
         manager._detached_sandbox_teardown.assert_awaited_once_with(
             "sandbox-own", delete=True, binding=ANY
         )
+
+    @pytest.mark.asyncio
+    @patch("src.server.services.preview_capabilities.revoke", new_callable=AsyncMock)
+    @patch(f"{_PROVISIONING}.SessionManager.cleanup_session")
+    async def test_its_previews_end_with_it(self, mock_cleanup, mock_revoke):
+        """The regression: only the owner's remove revoked them, so a machine
+        the sweep retired kept serving preview links until they expired."""
+        manager = self._tearing_manager(
+            provider_ref="sandbox-own", session_sandbox_id=None
+        )
+
+        await manager._teardown_machine(_make_binding(provider_ref="sandbox-own"))
+
+        mock_revoke.assert_awaited_once_with("sandbox-own")
 
 
 class TestStoppingASandboxTheProviderAlreadyStopped(_Base):
@@ -1481,7 +2116,9 @@ class TestProviderAddressing(_Base):
         ):
             manager._provider_for(binding)
 
-        mock_build.assert_called_once_with("daytona", ANY, working_dir="/home/other")
+        mock_build.assert_called_once_with(
+            "daytona", ANY, working_dir="/home/other", platform_secrets=ANY
+        )
         mock_create.assert_not_called()
 
     def test_an_unbound_workspace_uses_the_deployment_provider(self):
@@ -1723,6 +2360,36 @@ class TestComputerSurface(_Base):
             await asyncio.wait_for(renewed.wait(), timeout=1)
 
         mock_touch.assert_awaited_with("comp-1")
+
+
+class TestHomeJoinsThePrimary(_Base):
+    """Home's first bind takes only a computer still primary when it locks it."""
+
+    @pytest.mark.asyncio
+    async def test_a_bind_that_lost_to_a_flip_binds_to_the_new_primary(self):
+        manager = ComputerManager.get_instance(config=_make_config())
+        bound = _make_computer("comp-new", status="stopped")
+        manager.ensure_primary_computer = AsyncMock(
+            side_effect=[_make_computer("comp-old"), _make_computer("comp-new")]
+        )
+        manager._place_on_computer = AsyncMock(side_effect=[None, {"status": "stopped"}])
+        with (
+            patch(
+                f"{_MACHINES}.get_computer_for_workspace",
+                AsyncMock(side_effect=[None, None, bound]),
+            ),
+            patch(
+                f"{_MACHINES}.db_get_workspace",
+                AsyncMock(return_value={"dir_name": None, "computer_id": None}),
+            ),
+            patch(f"{_MACHINES}.publish_workspace_binding_change", AsyncMock()) as published,
+        ):
+            assert await manager.ensure_home_bound("user-1") is bound
+
+        placed = manager._place_on_computer.await_args_list
+        assert [c.args[1]["computer_id"] for c in placed] == ["comp-old", "comp-new"]
+        assert all(c.kwargs["primary_only"] for c in placed)
+        published.assert_awaited_once_with(ANY, "stopped", "comp-new")
 
 
 class TestPickForUser(_Base):
@@ -2190,16 +2857,15 @@ def _make_real_config(provider="daytona", working_directory="/home/workspace"):
     from ptc_agent.config.core import DaytonaConfig, DockerConfig
 
     config = MagicMock()
-    config.sandbox = SimpleNamespace(provider=provider)
+    config.sandbox = _fake_sandbox(provider)
     config.filesystem = SimpleNamespace(working_directory=working_directory)
 
     def _core_config():
         return SimpleNamespace(
-            sandbox=SimpleNamespace(
-                provider=provider,
+            sandbox=_fake_sandbox(
+                provider,
                 daytona=DaytonaConfig(api_key="test-key"),
                 docker=DockerConfig(),
-                platform_secrets={},
             ),
             filesystem=FilesystemConfig(working_directory=working_directory),
         )
@@ -2221,9 +2887,7 @@ class TestProviderPerRow(_Base):
         config.sandbox.daytona = config.to_core_config().sandbox.daytona
         manager = WorkspaceManager.get_instance(config=config)
         binding = _make_binding(provider_config={"auto_stop_interval": 600})
-        runtime = SimpleNamespace(
-            capabilities={"autostop"}, set_autostop_interval=AsyncMock()
-        )
+        runtime = SimpleNamespace(autostops=True, set_autostop_interval=AsyncMock())
 
         @asynccontextmanager
         async def detached(sandbox_id, *, binding):
@@ -2274,6 +2938,23 @@ class TestProviderPerRow(_Base):
 
         with pytest.raises(ValueError, match="unknown settings: nonesuch"):
             manager._provider_settings("daytona", {"nonesuch": 1})
+
+    def test_an_ssh_row_names_its_target_and_nothing_the_deployment_decides(self):
+        # A row is written per computer; the trust switch is the operator's.
+        from ptc_agent.config.core import SSHConfig
+
+        config = _make_real_config()
+        config.to_core_config.side_effect = lambda: SimpleNamespace(
+            sandbox=_fake_sandbox("daytona", ssh=SSHConfig())
+        )
+        manager = WorkspaceManager.get_instance(config=config)
+
+        with pytest.raises(ValueError, match="unknown settings: trusted_host"):
+            manager._provider_settings(
+                "ssh", {"host": "m.example.com", "trusted_host": True}
+            )
+        settings = manager._provider_settings("ssh", {"host": "m.example.com"})
+        assert settings.host == "m.example.com" and not settings.trusted_host
 
     def test_a_machine_on_another_kind_builds_that_kinds_provider(self):
         manager = WorkspaceManager.get_instance(config=_make_real_config())
@@ -2441,6 +3122,24 @@ class TestTheStampAFolderCarries(_Base):
             )
 
         assert write.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_a_rebuilt_sandbox_gets_the_owners_data_token(self):
+        """A spec change or platform-secret rotation rebuilds the sandbox with
+        no turn to follow, and the old token went with the old sandbox."""
+        manager = _make_manager()
+        session = _make_session()
+        manager._keep_data_token = AsyncMock()
+
+        with (
+            self._recovering(manager, session),
+            patch.object(manager, "_write_sandbox_stamp", AsyncMock()),
+        ):
+            await manager._recover_sandbox(_make_binding("ws-a"), None, None)
+
+        manager._keep_data_token.assert_awaited_once_with(
+            _make_binding("ws-a").computer_id, "user-1", session.sandbox
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -2804,6 +3503,155 @@ class TestWarmSkillChange(_Base):
 
 
 # ---------------------------------------------------------------------------
+# A start that attached its own project
+# ---------------------------------------------------------------------------
+
+
+class TestAStartAttachesItsOwnProject(_Base):
+    """A start that synced, restored and reconciled its project has done the
+    attach's work, so the attach in the same acquisition runs no second pass.
+
+    The record stands only on a pass that completed after the restore: one
+    that failed, could not link, or ran before the restore finished leaves the
+    attach to run its own.
+    """
+
+    KEY = ("ws-a", "sandbox-abc")
+
+    @staticmethod
+    async def _start(manager, session, *, stats, synced=True, restored=True):
+        @asynccontextmanager
+        async def held(_workspace_id):
+            yield "alpha-1a2b"
+
+        @asynccontextmanager
+        async def heartbeat(_computer_id):
+            yield
+
+        session.sandbox.ensure_sandbox_ready = AsyncMock()
+        reconcile = AsyncMock(return_value=stats)
+        patches = (
+            ("_computer_start_heartbeat", heartbeat),
+            ("_apply_session_platform_secret", AsyncMock()),
+            ("_apply_session_mcp", AsyncMock(return_value=None)),
+            ("_freeze_tool_view", MagicMock()),
+            ("_sync_sandbox_assets", AsyncMock(return_value=object() if synced else None)),
+            ("_maybe_restore_files", AsyncMock(return_value=restored)),
+            ("_held_workspace_folder", held),
+            ("_record_sync", MagicMock()),
+        )
+        with ExitStack() as stack:
+            for name, new in patches:
+                stack.enter_context(patch.object(manager, name, new=new))
+            stack.enter_context(
+                patch(
+                    "src.server.services.computer_manager._mcp.reconcile_workspace_skills",
+                    reconcile,
+                )
+            )
+            await manager._complete_phase2_sync(
+                _make_binding("ws-a"),
+                session,
+                workspace_user_id="user-1",
+                needs_sync=True,
+                needs_deferred_sync=True,
+                phase2_owner=True,
+                phase2_event=None,
+                mark=lambda _phase: None,
+            )
+        return reconcile
+
+    @staticmethod
+    async def _attach(manager, session):
+        reconcile = AsyncMock(return_value=True)
+        restore = AsyncMock(return_value=True)
+        patches = (
+            ("_ensure_workspace_dirs", AsyncMock()),
+            ("_maybe_restore_files", restore),
+            ("_load_livefs", AsyncMock()),
+            ("_ensure_project_tool_overlay", AsyncMock(return_value=True)),
+            ("_livefs_owed", MagicMock(return_value=False)),
+            ("_reconcile_skills", reconcile),
+        )
+        with ExitStack() as stack:
+            for name, new in patches:
+                stack.enter_context(patch.object(manager, name, new=new))
+            await manager._ensure_project_attached(
+                _make_binding("ws-a"), session, user_id="user-1"
+            )
+        return reconcile, restore
+
+    @pytest.mark.asyncio
+    async def test_the_attach_after_a_completed_start_runs_no_second_pass(self):
+        from src.server.services.user_skills.reconcile import ReconcileStats
+
+        manager = _make_manager()
+        session = _make_session()
+
+        start_pass = await self._start(manager, session, stats=ReconcileStats())
+        attach_pass, restore = await self._attach(manager, session)
+
+        start_pass.assert_awaited_once()
+        assert self.KEY in manager._projects_attached
+        attach_pass.assert_not_awaited()
+        restore.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "outcome", ["link_failed", "restore_incomplete", "no_pass", "sync_failed"]
+    )
+    async def test_an_unfinished_start_leaves_the_attach_its_own_pass(self, outcome):
+        from src.server.services.user_skills.reconcile import ReconcileStats
+
+        stats = {
+            "link_failed": ReconcileStats(link_failed=True),
+            "restore_incomplete": ReconcileStats(restore_incomplete=True),
+            "no_pass": None,
+            "sync_failed": ReconcileStats(),
+        }[outcome]
+        manager = _make_manager()
+        session = _make_session()
+
+        await self._start(
+            manager, session, stats=stats, synced=outcome != "sync_failed"
+        )
+        assert self.KEY not in manager._projects_attached
+        attach_pass, _ = await self._attach(manager, session)
+
+        attach_pass.assert_awaited_once()
+        assert attach_pass.await_args.kwargs["source"] == "attach_project"
+
+    @pytest.mark.asyncio
+    async def test_a_start_never_withdraws_an_attachment_it_did_not_record(self):
+        from src.server.services.user_skills.reconcile import ReconcileStats
+
+        manager = _make_manager()
+        session = _make_session()
+        manager._projects_attached[self.KEY] = None
+
+        await self._start(manager, session, stats=ReconcileStats(link_failed=True))
+
+        assert self.KEY in manager._projects_attached
+
+    @pytest.mark.asyncio
+    async def test_a_restore_check_that_failed_withdraws_the_key_a_stop_left(self):
+        """A stop on this sandbox leaves the project attached; trusting that
+        key after the start's check failed would skip the restore that queues
+        its bring-up, so the attach that follows runs it instead."""
+        from src.server.services.user_skills.reconcile import ReconcileStats
+
+        manager = _make_manager()
+        session = _make_session()
+        manager._projects_attached[self.KEY] = None
+
+        await self._start(manager, session, stats=ReconcileStats(), restored=False)
+
+        assert self.KEY not in manager._projects_attached
+        _, restore = await self._attach(manager, session)
+        restore.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
 # Folders on a shared machine
 # ---------------------------------------------------------------------------
 
@@ -3139,6 +3987,73 @@ class TestStartAnswersToEntitlement(_Base):
         assert policy.threshold == timedelta(minutes=60)
 
     @pytest.mark.asyncio
+    @patch("src.server.services.platform_secret_rollout.certify_platform_secrets")
+    @patch(f"{_MACHINES}.update_computer_activity")
+    @patch(f"{_MACHINES}.try_bind_computer_provider_ref")
+    @patch(f"{_MACHINES}.SessionManager")
+    async def test_a_bare_start_writes_the_owners_data_token_once_bound(
+        self, mock_sm, mock_bind, mock_activity, mock_certify
+    ):
+        # An always-on app reads market data with no acquire to write a token,
+        # and the save fence only takes a sandbox the row is bound to.
+        manager = self._manager(tier="standard")
+        session = self._session()
+        mock_sm.get_session.return_value = session
+        order: list[str] = []
+        mock_bind.side_effect = lambda *a, **k: (
+            order.append("bind") or {"computer_id": "comp-1"}
+        )
+        mock_certify.return_value = 3
+        manager._keep_data_token = AsyncMock(
+            side_effect=lambda *a: order.append("token")
+        )
+        computer = _make_computer(status="starting", provider_ref=None)
+
+        with patch(f"{_MACHINES}.get_computer", AsyncMock(return_value=computer)):
+            await manager._build_machine_session(
+                computer, user_id=None, on_state_observed=None
+            )
+
+        manager._keep_data_token.assert_awaited_once_with(
+            "comp-1", "user-1", session.sandbox
+        )
+        assert order == ["bind", "token"]
+
+    @pytest.mark.asyncio
+    @patch(f"{_MACHINES}.update_computer_activity")
+    @patch(f"{_MACHINES}.update_computer_status")
+    @patch(f"{_MACHINES}.SessionManager")
+    async def test_a_reconnect_replaces_the_revoked_data_token_first(
+        self, mock_sm, mock_status, mock_activity
+    ):
+        # A resumed sandbox runs its processes again from the reconnect on,
+        # and its file still holds the token the stop revoked.
+        manager = self._manager(tier="standard")
+        session = self._session()
+        mock_sm.get_session.return_value = session
+        mock_status.return_value = {"computer_id": "comp-1", "status": "running"}
+        order: list[str] = []
+        session.initialize.side_effect = lambda **_k: order.append("reconnect")
+        manager._sync_machine_assets = AsyncMock(
+            side_effect=lambda *_a, **_k: order.append("sync")
+        )
+        manager._keep_data_token = AsyncMock(
+            side_effect=lambda *_a: order.append("token")
+        )
+        computer = _make_computer(status="starting", provider_ref="sandbox-abc")
+
+        with patch(f"{_MACHINES}.get_computer", AsyncMock(return_value=computer)):
+            await manager._build_machine_session(
+                computer, user_id=None, on_state_observed=None
+            )
+
+        manager._keep_data_token.assert_awaited_once_with(
+            "comp-1", "user-1", session.sandbox
+        )
+        assert order == ["reconnect", "token", "sync"]
+
+
+    @pytest.mark.asyncio
     @patch(f"{_MACHINES}.SessionManager")
     async def test_a_lapsed_tier_does_not_replace_an_undeleted_sandbox(
         self, mock_sm
@@ -3241,6 +4156,104 @@ class TestStartAnswersToEntitlement(_Base):
 
         manager._destroy_sandbox.assert_not_awaited()
         manager._apply_autostop_for_always_on.assert_awaited_once()
+
+
+class TestAFailedStartRevokesWhatItWrote(_Base):
+    """A start writes the token before it can still fail, into a sandbox the
+    unwind leaves running. Landing the row at stopped revokes it, as a stop
+    does; an unwind whose CAS misses leaves another start's token alone."""
+
+    @staticmethod
+    def _lazy(manager):
+        manager._machine_if_known = MagicMock(
+            return_value=SimpleNamespace(pending_lazy_sync=True)
+        )
+        return manager._revert_unpromoted_lazy_start(
+            _make_binding(computer_id="comp-1")
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("target", "unwind"),
+        [
+            (
+                f"{_MACHINES}.update_computer_status",
+                lambda m: m._revert_machine_start("comp-1"),
+            ),
+            (
+                f"{_LIFECYCLE}.update_computer_status",
+                lambda m: m._release_lost_lazy_start("comp-1", "sandbox-abc"),
+            ),
+            (f"{_LIFECYCLE}.update_workspace_status", _lazy),
+        ],
+        ids=["machine-start", "lost-lazy-start", "lazy-phase-2"],
+    )
+    @pytest.mark.parametrize("landed", [True, False], ids=["landed", "missed"])
+    async def test_only_an_unwind_that_lands_stopped_revokes(
+        self, target, unwind, landed
+    ):
+        manager = _make_manager()
+        manager._revoke_data_token = AsyncMock()
+
+        with patch(target, AsyncMock(return_value={"status": "stopped"} if landed else None)):
+            await unwind(manager)
+
+        if landed:
+            manager._revoke_data_token.assert_awaited_once_with("comp-1")
+        else:
+            manager._revoke_data_token.assert_not_awaited()
+
+
+class TestALazyStartKeepsWhyBeforeItReverts(_Base):
+    """The revert publishes stopped, and a client reads the row on that frame,
+    so the failure is on the row before the status write, not after it."""
+
+    @staticmethod
+    def _lazy(manager, failure):
+        manager._machine_if_known = MagicMock(
+            return_value=SimpleNamespace(pending_lazy_sync=True)
+        )
+        return manager._revert_unpromoted_lazy_start(
+            _make_binding(computer_id="comp-1"), failure=failure
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("target", "unwind"),
+        [
+            (
+                f"{_LIFECYCLE}.update_computer_status",
+                lambda m, f: m._release_lost_lazy_start(
+                    "comp-1", "sandbox-abc", failure=f, kind="ssh"
+                ),
+            ),
+            (f"{_LIFECYCLE}.update_workspace_status", _lazy),
+        ],
+        ids=["lost-lazy-start", "lazy-phase-2"],
+    )
+    async def test_the_failure_is_recorded_before_the_stopped_write(
+        self, target, unwind
+    ):
+        manager = _make_manager()
+        manager._revoke_data_token = AsyncMock()
+        order: list[str] = []
+        failure = RuntimeError("boom")
+
+        async def _record(computer_id, exc, *, kind):
+            assert (computer_id, exc) == ("comp-1", failure)
+            order.append("record")
+
+        async def _status(*_a, **_k):
+            order.append("stopped")
+            return {"status": "stopped"}
+
+        with (
+            patch(f"{_LIFECYCLE}.record_start_failure", AsyncMock(side_effect=_record)),
+            patch(target, AsyncMock(side_effect=_status)),
+        ):
+            await unwind(manager, failure)
+
+        assert order == ["record", "stopped"]
 
 
 class TestFreshBuildSettlesEachRestoreAfterTheBind(_Base):
@@ -3599,6 +4612,61 @@ async def test_capacity_admission_holds_user_lock_through_committed_claim(denied
 
 
 @pytest.mark.asyncio
+async def test_an_owners_machine_claims_its_start_outside_the_plan_cap():
+    """The computer cap counts the machines the deployment provides; one its
+    owner brings starts however many of those are running."""
+    manager = _make_manager()
+    capacity = MagicMock(side_effect=AssertionError("capacity lock taken"))
+    limit = AsyncMock(side_effect=AssertionError("limit read"))
+    with (
+        patch("src.server.dependencies.usage_limits.platform_gating_active", return_value=True),
+        patch("src.server.dependencies.usage_limits.enforce_computer_limit", limit),
+        patch(f"{_MACHINES}.computer_capacity_lock", capacity),
+        patch(
+            f"{_MACHINES}.get_computer",
+            AsyncMock(return_value=_make_computer(status="stopped", kind="ssh")),
+        ),
+        patch(
+            f"{_MACHINES}.try_claim_computer_for_start",
+            AsyncMock(return_value={"status": "starting"}),
+        ) as claimed,
+    ):
+        assert await manager._claim_start_with_capacity(
+            "comp-1", from_status="stopped"
+        ) == {"status": "starting"}
+
+    claimed.assert_awaited_once_with("comp-1", from_status="stopped")
+    capacity.assert_not_called()
+    limit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_machine_asset_sync_matches_the_sandbox_signature():
+    """The start tests stub _sync_machine_assets whole, so none held its call
+    to the sandbox's real signature: an argument the sandbox dropped failed
+    every bare start, always-on start and resize with a TypeError."""
+    from unittest.mock import create_autospec
+
+    from ptc_agent.core.sandbox.ptc_sandbox import PTCSandbox
+
+    manager = _make_manager()
+    sandbox = create_autospec(PTCSandbox, instance=True)
+    manager._root_owner_folder = AsyncMock(return_value="proj")
+    manager._stamp_layout_version = AsyncMock()
+    with (
+        patch(f"{_MACHINES}.sandbox_skill_sync_params", AsyncMock(return_value={})),
+        patch(
+            f"{_MACHINES}.get_workspace_dir_names_for_computer",
+            AsyncMock(return_value=("proj",)),
+        ),
+    ):
+        await manager._sync_machine_assets(
+            "comp-1", "user-1", sandbox, reusing_sandbox=True
+        )
+    sandbox.sync_sandbox_assets.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_stopped_replacement_does_not_delete_after_incomplete_backup():
     manager = _make_manager()
     binding = _make_binding(provider_ref="original")
@@ -3618,6 +4686,108 @@ async def test_stopped_replacement_does_not_delete_after_incomplete_backup():
     session.stop.assert_awaited_once()
     assert manager._backup_machine_files_to_db.await_args.kwargs["strict"] is True
     status.assert_awaited_once_with(binding.computer_id, "stopped", expected="starting")
+
+
+@pytest.mark.asyncio
+async def test_a_replacement_for_platform_secrets_backs_up_strictly_with_no_spec_claim():
+    """No spec change runs, so there is no claim to prove; the backup still gates teardown."""
+    manager = _make_manager()
+    binding = _make_binding(provider_ref="original")
+    session = object()
+    manager._assert_machine_is_replaceable = AsyncMock(return_value=session)
+    manager._refuse_if_turn_active = AsyncMock()
+    manager._backup_machine_files_to_db = AsyncMock()
+    manager._assert_spec_claim_owned = AsyncMock()
+    manager._clear_session = AsyncMock()
+    manager._destroy_sandbox = AsyncMock()
+    manager._recover_sandbox = AsyncMock()
+    with (
+        patch("src.server.services.computer_manager._spec.try_claim_computer_for_start", AsyncMock(return_value={"status": "starting"})),
+        patch("src.server.services.computer_manager._spec.update_computer_status", AsyncMock()),
+        patch("src.server.services.computer_manager._spec.clear_computer_disk", AsyncMock()),
+    ):
+        await manager._replace_running_sandbox(
+            binding, "original", tier="standard", claim_id=None,
+            disk_guard=None, user_id="user-1", workspace_id=None,
+        )
+    manager._assert_spec_claim_owned.assert_not_awaited()
+    backup = manager._backup_machine_files_to_db.await_args.kwargs
+    assert backup["strict"] is True and backup["expected_sandbox_id"] == "original"
+    manager._destroy_sandbox.assert_awaited_once()
+    manager._recover_sandbox.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("row", "replaced"),
+    [
+        ({"status": "running", "provider_ref": "original"}, True),
+        ({"status": "stopped", "provider_ref": "original"}, False),
+        ({"status": "running", "provider_ref": "newer"}, False),
+    ],
+)
+async def test_a_platform_secret_rebuild_acts_only_on_the_sandbox_it_was_asked_about(
+    row, replaced
+):
+    manager = _make_manager()
+    manager._replace_running_sandbox = AsyncMock()
+    with (
+        patch(
+            "src.server.services.computer_manager._spec.get_computer",
+            AsyncMock(return_value=_make_computer(**row)),
+        ),
+        patch(
+            "src.server.services.computer_manager._spec.get_live_workspace_ids_for_computer",
+            AsyncMock(return_value=["ws-1"]),
+        ),
+    ):
+        assert await manager.replace_sandbox_for_platform_secrets("comp-1", "original") is replaced
+    if replaced:
+        kwargs = manager._replace_running_sandbox.await_args.kwargs
+        assert kwargs["claim_id"] is None and kwargs["workspace_id"] is None
+    else:
+        manager._replace_running_sandbox.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("live_after_claim", "busy", "dropped"),
+    [([], False, True), (["ws-late"], False, False), ([], True, False)],
+)
+async def test_an_empty_machine_drops_its_sandbox_for_the_next_start_to_rebuild(
+    live_after_claim, busy, dropped
+):
+    """The rebuild is workspace-addressed, so an empty machine used to fail it on
+    every sweep pass and keep the stale env; it stops without its sandbox instead,
+    unless a workspace or work arrived under the stop claim."""
+    manager = _make_manager()
+    manager._replace_running_sandbox = AsyncMock()
+    manager._claim_machine_for_stop = AsyncMock(return_value={"status": "stopping"})
+    manager._machine_has_active_tasks = AsyncMock(return_value=busy)
+    manager._clear_session = AsyncMock()
+    manager._destroy_sandbox = AsyncMock()
+    manager._settle_machine_stop = AsyncMock()
+    clear_disk = AsyncMock()
+    with (
+        patch(
+            "src.server.services.computer_manager._spec.get_computer",
+            AsyncMock(return_value=_make_computer(status="running", provider_ref="original")),
+        ),
+        patch(
+            "src.server.services.computer_manager._spec.get_live_workspace_ids_for_computer",
+            AsyncMock(side_effect=[[], live_after_claim]),
+        ),
+        patch("src.server.services.computer_manager._spec.clear_computer_disk", clear_disk),
+    ):
+        assert await manager.replace_sandbox_for_platform_secrets("comp-1", "original") is dropped
+    manager._replace_running_sandbox.assert_not_awaited()
+    if dropped:
+        assert manager._destroy_sandbox.await_args.args == ("original",)
+        clear_disk.assert_awaited_once()
+        manager._settle_machine_stop.assert_awaited_once_with("comp-1", "stopped")
+    else:
+        manager._destroy_sandbox.assert_not_awaited()
+        manager._settle_machine_stop.assert_awaited_once_with("comp-1", "running")
 
 
 @pytest.mark.asyncio
@@ -3774,3 +4944,23 @@ async def test_legacy_adoption_preserves_provider_and_root_stamp():
     lookup.assert_awaited_once_with("docker", "container-id")
     assert create.await_args.kwargs["kind"] == "docker"
     assert create.await_args.kwargs["root_dir"] == "/old/root"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind, always_on", [("daytona", True), ("e2b", False)])
+async def test_legacy_adoption_carries_always_on_only_to_a_kind_that_holds_it(
+    kind, always_on
+):
+    manager = _make_manager()
+    source = {
+        "user_id": "user-1", "status": "stopped", "sandbox_id": "sandbox-id",
+        "is_always_on": True, "config": {"sandbox_provider": kind},
+    }
+    with (
+        patch(f"{_MACHINES}.get_computer_by_provider_ref", AsyncMock(return_value=None)),
+        patch(f"{_MACHINES}.create_computer", AsyncMock(return_value=_make_computer(origin_workspace_id="source"))) as create,
+        patch(f"{_MACHINES}.bind_workspace_to_computer", AsyncMock(return_value={"dir_name": "source-folder"})),
+        patch(f"{_MACHINES}.get_workspace_dir_names_for_computer", AsyncMock(return_value=())),
+    ):
+        await manager._adopt_workspace_onto_computer("source", workspace=source)
+    assert create.await_args.kwargs["is_always_on"] is always_on

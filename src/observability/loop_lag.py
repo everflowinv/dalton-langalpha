@@ -111,8 +111,11 @@ class EventLoopLagMonitor:
         if task is not None:
             await cancel_and_join(task)
 
-    # DALTON-HOOK(loop-stall-stack): capture event-loop thread stack once per
-    # stall (>5s without heartbeat) with a 60s cooldown, truncated to 40 frames.
+    # DALTON-HOOK(loop-stall-stack): capture every thread's stack once per
+    # stall (>5s without heartbeat) with a 60s cooldown, truncated to 40 frames
+    # per thread, each labelled with its thread name, plus the in-flight heavy
+    # compute tasks. The loop thread alone could never say which worker was
+    # holding the GIL through the stall.
     def _watchdog_loop(self) -> None:
         while not self._watchdog_stop.is_set():
             threshold_s = (
@@ -149,27 +152,54 @@ class EventLoopLagMonitor:
 
             self._sampled_heartbeat_seq = hb_seq
             self._last_stall_sample_at = now
-            tid = self._loop_thread_id
-            frame = sys._current_frames().get(tid) if tid is not None else None
-            try:
-                if frame is not None:
-                    extracted = traceback.extract_stack(frame, limit=_STALL_MAX_FRAMES)
-                    stack_text = "".join(traceback.format_list(extracted)).rstrip()
-                else:
-                    stack_text = "<no frame found for event loop thread>"
-            finally:
-                # Immediately drop the frame reference so finished request frames
-                # and their local objects are not retained until the next stall.
-                frame = None
+            stacks = self._snapshot_thread_stacks()
             logger.warning(
                 "[loop-lag] event loop heartbeat stalled %.2f s "
-                "(threshold %.2f s, thread_id=%s) — call stack (max %d frames):\n%s",
+                "(threshold %.2f s) — all thread stacks (max %d frames each):\n%s",
                 elapsed_s,
                 threshold_s,
-                tid,
                 _STALL_MAX_FRAMES,
-                stack_text,
+                stacks,
             )
+
+    def _snapshot_thread_stacks(self) -> str:  # DALTON-HOOK(loop-stall-stack)
+        """One stack per live thread, named, plus the in-flight heavy tasks.
+
+        Frames are dropped as soon as they are formatted so finished request
+        locals are not retained until the next stall.
+        """
+        names = {t.ident: t.name for t in threading.enumerate()}
+        loop_tid = self._loop_thread_id
+        parts: list[str] = []
+        try:
+            frames = sys._current_frames()
+            for tid, frame in frames.items():
+                try:
+                    extracted = traceback.extract_stack(frame, limit=_STALL_MAX_FRAMES)
+                    stack_text = "".join(traceback.format_list(extracted)).rstrip()
+                finally:
+                    frame = None
+                label = names.get(tid) or f"thread-{tid}"
+                if tid == loop_tid:
+                    label = f"{label} (event loop)"
+                parts.append(f"--- {label} [tid={tid}] ---\n{stack_text}")
+            if not parts:
+                parts.append("<no frames found for any thread>")
+        except Exception:
+            parts.append("<thread stack snapshot failed>")
+        try:
+            from src.observability.heavy_tasks import running_tasks
+
+            running = running_tasks()
+            if running:
+                lines = [
+                    f"  {t.name} on {t.thread_name} for {time.monotonic() - t.started_monotonic:.1f}s"
+                    for t in running
+                ]
+                parts.append("heavy compute in flight:\n" + "\n".join(lines))
+        except Exception:
+            pass
+        return "\n".join(parts)
 
     async def _run(self) -> None:
         from src.observability.metrics import event_loop_lag_ms

@@ -44,7 +44,7 @@
   border-radius: 6px;
   color: var(--color-text-secondary);
   cursor: pointer;
-  transition: background 0.15s, color 0.15s;
+  transition: background var(--motion-quick) var(--ease-out), color var(--motion-quick) var(--ease-out);
 }
 
 .company-overview-close:hover {

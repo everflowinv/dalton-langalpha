@@ -14,6 +14,7 @@ export interface MessageActionSources {
   onDownloadFile: Action<'onDownloadFile'>;
   downloadKeyFor: Action<'downloadKeyFor'>;
   onRevealFiles: Action<'onRevealFiles'>;
+  onRevealMessage: Action<'onRevealMessage'>;
   onOpenSources: Action<'onOpenSources'>;
   onToolCallDetailClick: Action<'onToolCallDetailClick'>;
   onOpenChart: Action<'onOpenChart'>;
@@ -65,6 +66,7 @@ export function useMessageActionBundles(src: MessageActionSources): {
   const stableDownloadFile = useStableHandler(src.onDownloadFile);
   const stableDownloadKeyFor = useStableHandler(src.downloadKeyFor);
   const stableRevealFiles = useStableHandler(src.onRevealFiles);
+  const stableRevealMessage = useStableHandler(src.onRevealMessage);
   const stableOpenSources = useStableHandler(src.onOpenSources);
   const stableToolCallDetail = useStableHandler(src.onToolCallDetailClick);
   const stableOpenChart = useStableHandler(src.onOpenChart);
@@ -89,9 +91,6 @@ export function useMessageActionBundles(src: MessageActionSources): {
     src.onRegenerate(id, src.chatInputRef.current?.getModelOptions?.()));
   const stableRetry = useStableHandler(() => src.onRetry(src.chatInputRef.current?.getModelOptions?.()));
   const editDrafts = src.editDrafts;
-  const stableReportWithAgent = useStableHandler((instruction: string) => {
-    src.onSendMessage(`/self-improve ${instruction}`);
-  });
   // Feedback handlers close over the stored ratings, so their raw identity
   // churns on every load/submit; wrap them or a single thumbs click would
   // re-render the whole transcript through the context value.
@@ -110,6 +109,7 @@ export function useMessageActionBundles(src: MessageActionSources): {
           onDownloadFile: stableDownloadFile,
           downloadKeyFor: stableDownloadKeyFor,
           onRevealFiles: stableRevealFiles,
+          onRevealMessage: stableRevealMessage,
           onOpenSources: stableOpenSources,
           onToolCallDetailClick: stableToolCallDetail,
           onOpenChart: stableOpenChart,
@@ -121,6 +121,7 @@ export function useMessageActionBundles(src: MessageActionSources): {
           onDownloadFile: stableDownloadFile,
           downloadKeyFor: stableDownloadKeyFor,
           onRevealFiles: stableRevealFiles,
+          onRevealMessage: stableRevealMessage,
           onOpenSources: stableOpenSources,
           onToolCallDetailClick: stableToolCallDetail,
           onOpenChart: stableOpenChart,
@@ -145,18 +146,17 @@ export function useMessageActionBundles(src: MessageActionSources): {
           editDrafts,
           onThumbUp: stableThumbUp,
           onThumbDown: stableThumbDown,
-          onReportWithAgent: stableReportWithAgent,
           onWidgetSendPrompt: stableSendMessage,
         }
   ), [
     readOnly,
-    stableOpenFile, stableDownloadFile, stableDownloadKeyFor, stableRevealFiles, stableOpenSources, stableToolCallDetail,
+    stableOpenFile, stableDownloadFile, stableDownloadKeyFor, stableRevealFiles, stableRevealMessage, stableOpenSources, stableToolCallDetail,
     stableOpenChart, stableOpenSubagentTask, stableOpenDispatcher, stableAnswerQuestion, stableSkipQuestion, stableApproveCreateWorkspace,
     stableRejectCreateWorkspace, stableApproveStartQuestion, stableRejectStartQuestion,
     stableApprovePTCAgent, stableRejectPTCAgent, stableApproveSecretaryAction,
     stableRejectSecretaryAction, stableResumeCreditPause, stableApproveToolCall, stableRejectToolCall,
     stableEditMessage, stableRegenerate, stableRetry, editDrafts,
-    stableThumbUp, stableThumbDown, stableReportWithAgent, stableSendMessage,
+    stableThumbUp, stableThumbDown, stableSendMessage,
   ]);
 
   // The subagent transcript is a DIFFERENT surface: its cards belong to a task,

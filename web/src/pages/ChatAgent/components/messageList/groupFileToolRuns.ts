@@ -45,7 +45,7 @@ function failed(item: ActivityItem): boolean {
 
 function ordinarySettledFile(item: ActivityItem): boolean {
   if (item.type !== 'tool_call' || item._liveState !== 'completed' || !filePathOf(item)) return false;
-  const category = categorizeTool(item.toolName, item.toolCall);
+  const category = categorizeTool(item.toolName, item.toolCall, item.root);
   return GROUPABLE_FILE_TOOLS.has(item.toolName) && (category === 'fileRead' || category === 'fileEdit');
 }
 

@@ -292,17 +292,25 @@ class TestGinlixMarketIntelSource:
 
     @pytest.mark.asyncio
     async def test_get_movers_gainers(self, source, mock_client):
-        mock_client.get_movers.return_value = [{"ticker": "NVDA"}]
+        # The vendor row has no price field: the last trade is the price its
+        # change was measured at.
+        mock_client.get_movers.return_value = [{
+            "ticker": "NVDA", "change": 1.5, "change_percent": 50.0,
+            "day": {"close": 4.4, "volume": 1200.0}, "last_trade": {"price": 4.5},
+        }]
         result = await source.get_movers("gainers")
         mock_client.get_movers.assert_awaited_once_with("gainers", user_id=None)
-        assert result == [{"ticker": "NVDA"}]
+        assert result == [{"symbol": "NVDA", "price": 4.5, "change": 1.5,
+                           "change_percent": 50.0, "volume": 1200.0}]
 
     @pytest.mark.asyncio
     async def test_get_movers_losers(self, source, mock_client):
-        mock_client.get_movers.return_value = [{"ticker": "INTC"}]
+        # With no last trade, the day bar's close stands in.
+        mock_client.get_movers.return_value = [{"ticker": "INTC", "day": {"close": 2.5}}]
         result = await source.get_movers("losers")
         mock_client.get_movers.assert_awaited_once_with("losers", user_id=None)
-        assert result == [{"ticker": "INTC"}]
+        assert result == [{"symbol": "INTC", "price": 2.5, "change": None,
+                           "change_percent": None, "volume": None}]
 
     @pytest.mark.asyncio
     async def test_close_is_noop(self, source):

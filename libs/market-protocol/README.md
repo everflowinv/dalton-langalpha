@@ -14,9 +14,9 @@ named.
   families, and per-instrument overrides seeded from `instruments.yaml`, which
   ships inside the package. `to_canonical` parses display, legacy and common
   vendor spellings (`600519.SS`, `^GSPC`, `I:SPX`, `EURUSD=X`) and raises
-  `ValueError` on input that cannot be a symbol, including path and URL
-  delimiters. Real spellings still carry `&`, `=` and `:`, so a symbol is
-  percent-encoded like any other value on its way into a URL. Rendering
+  `InvalidSymbol`, a `ValueError`, on input that cannot be a symbol, including
+  path and URL delimiters. Real spellings still carry `&`, `=` and `:`, so a
+  symbol is percent-encoded like any other value on its way into a URL. Rendering
   covers the display and legacy API spellings plus the suffix spelling FMP and
   yfinance resolve (`vendor_symbol`); any other vendor's request format
   belongs to that vendor's adapter.

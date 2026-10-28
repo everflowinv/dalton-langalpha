@@ -137,7 +137,8 @@ test.describe('Workspace Gallery', () => {
     await page.goto('/chat');
     await page.getByPlaceholder('Search workspaces...').fill('Needle');
 
-    await expect(page.getByText('Needle Research', { exact: true })).toBeVisible({
+    // Scoped to the card: the sidebar tree lists the same name.
+    await expect(workspaceCard(page, 'Needle Research')).toBeVisible({
       timeout: 10000,
     });
   });
@@ -663,10 +664,10 @@ test.describe('Chat View -- SSE Streaming', () => {
     await expect(page.getByText('report.pdf')).toBeVisible({ timeout: 10000 });
     await expect(page.getByText('analysis.py')).toBeVisible();
     await expect(page.getByText('chart.png')).toBeVisible();
-    await expect(page.getByRole('button', { name: 'Show file tree' })).toHaveCount(0);
+    await expect(page.getByRole('button', { name: 'Toggle file tree' })).toHaveCount(0);
   });
 
-  test('a narrow file panel opens with the tree closed and lists files on request', async ({ page }) => {
+  test('a narrow file panel opens on the full file tree', async ({ page }) => {
     await page.setViewportSize({ width: 1280, height: 720 });
     await mockAPI(page, {
       ...chatViewOverrides(),
@@ -678,13 +679,63 @@ test.describe('Chat View -- SSE Streaming', () => {
     await page.waitForSelector('textarea', { timeout: 10000 });
     await page.locator('button[title="Workspace Files"]').click();
 
-    const showTree = page.getByRole('button', { name: 'Show file tree' });
-    await expect(showTree).toBeVisible({ timeout: 10000 });
-    await expect(page.getByText('report.pdf')).toHaveCount(0);
-    await showTree.click();
-    await expect(page.getByText('report.pdf')).toBeVisible();
+    // An empty tab lays the tree across the whole panel at any width, so
+    // there is no tree toggle to press until a file takes the body.
+    await expect(page.getByText('report.pdf')).toBeVisible({ timeout: 10000 });
     await expect(page.getByText('analysis.py')).toBeVisible();
     await expect(page.getByText('chart.png')).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Toggle file tree' })).toHaveCount(0);
+  });
+
+  test('a right click on the new tab button picks what the tab opens on', async ({ page }) => {
+    await page.setViewportSize({ width: 1280, height: 720 });
+    await mockAPI(page, {
+      ...chatViewOverrides(),
+      'GET /workspaces/a0000001-0000-4000-8000-000000000001/files': { files: ['report.pdf', 'analysis.py'] },
+      'GET /workspaces/a0000001-0000-4000-8000-000000000001/files/read': {
+        workspace_id: 'a0000001-0000-4000-8000-000000000001', path: 'analysis.py', content: 'print(1)', mime: 'text/x-python', truncated: false,
+      },
+    });
+    await configureEmptyReplay();
+
+    await page.goto('/chat/t/b0000001-0000-4000-8000-000000000001');
+    await page.waitForSelector('textarea', { timeout: 10000 });
+    await page.locator('button[title="Workspace Files"]').click();
+    await page.getByRole('treeitem', { name: 'analysis.py' }).dispatchEvent('click');
+    await expect(page.locator('[role="tab"]', { hasText: 'analysis.py' })).toHaveAttribute('aria-selected', 'true');
+
+    await page.getByRole('button', { name: 'New tab' }).click({ button: 'right' });
+    const menu = page.getByRole('menu');
+    await expect(menu.getByRole('menuitem')).toHaveText(['Files', 'Chart']);
+    await menu.getByRole('menuitem', { name: 'Files' }).click();
+
+    await expect(page.locator('[role="tab"]')).toHaveCount(2);
+    await expect(page.getByRole('treeitem', { name: 'report.pdf' })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Toggle file tree' })).toHaveCount(0);
+  });
+
+  test('a keyboard open waits on the loading strip for as long as the panel takes', async ({ page }) => {
+    await mockAPI(page, {
+      ...chatViewOverrides(),
+      'GET /workspaces/a0000001-0000-4000-8000-000000000001/files': { files: ['report.pdf'] },
+    });
+    await configureEmptyReplay();
+    // Holds the panel's code back until the test lets it through.
+    let release;
+    const held = new Promise((resolve) => { release = resolve; });
+    await page.route(/\/components\/FilePanel\.tsx(\?|$)/, async (route) => { await held; await route.continue(); });
+
+    await page.goto('/chat/t/b0000001-0000-4000-8000-000000000001');
+    await page.waitForSelector('textarea', { timeout: 10000 });
+    await page.locator('[data-panel-toggle="header"]').focus();
+    await page.keyboard.press('Enter');
+    await expect(page.locator('[data-panel-toggle-stand-in]')).toBeFocused();
+    // Longer than the hand-off waits for a toggle that is not drawn at all.
+    await page.waitForTimeout(2500);
+    release();
+
+    await expect(page.getByText('report.pdf')).toBeVisible({ timeout: 10000 });
+    await expect(page.locator('[data-panel-toggle="panel"]:not([data-panel-toggle-stand-in])')).toBeFocused();
   });
 
   test('workspace starting shows warm-up indicator', async ({ page }) => {

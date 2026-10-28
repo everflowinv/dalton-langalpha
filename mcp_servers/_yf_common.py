@@ -7,6 +7,7 @@ pandas, and market_protocol.
 from __future__ import annotations
 
 import math
+from datetime import tzinfo
 from typing import Optional
 
 import pandas as pd
@@ -19,6 +20,55 @@ from market_protocol import (
     to_display,
     vendor_symbol,
 )
+
+
+class _CookieCacheWithA3:
+    """yfinance's cookie cache, less an entry without the ``A3`` cookie.
+
+    yfinance reads the cached cookie's ``A3`` without checking it is there, so
+    one saved without it fails every request in every later process with
+    ``KeyError: 'A3'``; a sandbox keeps its home, so that is every yfinance
+    tool in the workspace for good. Such an entry reads as a miss and is
+    deleted, which also clears it for code that imports yfinance itself. The
+    cache stays: yfinance refetches the cookie on every request without it.
+    """
+
+    checks_a3 = True
+
+    def __init__(self, inner):
+        self._inner = inner
+
+    def lookup(self, strategy):
+        entry = self._inner.lookup(strategy)
+        try:
+            next(iter(entry["cookie"].values()))["/"]["A3"]
+        except (TypeError, KeyError, StopIteration, AttributeError):
+            if entry is not None:
+                self._inner.store(strategy, None)  # a None store deletes the row
+            return None
+        return entry
+
+    def store(self, strategy, cookie):
+        self._inner.store(strategy, cookie)
+
+    # DALTON-HOOK(yfinance-cache): pass every other attribute (the ``db``
+    # handle among them) through to the wrapped cache, mirroring the host
+    # side's guard in src/data_client/yfinance/yahoo.py.
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+def guard_cookie_cache() -> None:
+    try:
+        from yfinance import cache
+        current = cache.get_cookie_cache()
+        if not getattr(current, "checks_a3", False):
+            cache._CookieCacheManager._Cookie_cache = _CookieCacheWithA3(current)
+    except (ImportError, AttributeError):
+        pass  # a release that moved the cache; the load it guards moved with it
+
+
+guard_cookie_cache()
 
 
 def yfinance_symbol(ref: InstrumentRef) -> str:
@@ -84,7 +134,7 @@ def serialize_records(df: pd.DataFrame) -> list[dict]:
 
 
 def clean_value(obj):
-    """Recursively normalize datetimes and missing values (NaT/NaN/inf) for JSON."""
+    """Recursively normalize datetimes, time zones and missing values (NaT/NaN/inf) for JSON."""
     if isinstance(obj, dict):
         return {k: clean_value(v) for k, v in obj.items()}
     if isinstance(obj, list):
@@ -99,4 +149,7 @@ def clean_value(obj):
         return None
     if hasattr(obj, "isoformat"):
         return format_datetime(obj)
+    if isinstance(obj, tzinfo):
+        # Yahoo's market status carries one (``tz``); its name is what JSON can hold.
+        return str(obj)
     return obj

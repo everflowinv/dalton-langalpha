@@ -13,6 +13,12 @@ from typing import TYPE_CHECKING, Any, Optional
 
 from ptc_agent.core.paths import WorkspaceLayout
 from src.server.database.computer import DEFAULT_ROOT_DIR, get_computer_for_workspace
+# DALTON-HOOK(bringup-owner-check): the placement row the per-step owner
+# check reads, before any restore, prune or transcript sync.
+from src.server.database.workspace import (
+    get_live_workspace_ids_for_computer,
+    get_workspace_placement,
+)
 from src.server.database.workspace_file import WorkspaceSyncBusy
 from src.server.database.workspace_folders import WorkspaceFolderMoving
 from src.server.services import transcripts
@@ -20,6 +26,7 @@ from src.server.services.computer_manager import _thread_dirs
 from src.server.services.livefs import cache
 from src.server.services.persistence import restore
 from src.server.services.persistence.file import FilePersistenceService
+from src.server.services.persistence.transfer import DEFERRED_MARKER
 from src.server.services.workspace_layout import held_workspace_layout
 
 if TYPE_CHECKING:
@@ -147,11 +154,13 @@ class BringUp:
 
     def __init__(
         self,
+        computer_id: str,
         sandbox: Any,
         sandbox_id: Optional[str],
         root: str,
         forget: Callable[[str], None],
     ) -> None:
+        self.computer_id = computer_id  # DALTON-HOOK(bringup-owner-check)
         self.sandbox = sandbox
         self.sandbox_id = sandbox_id
         self.root = root
@@ -197,6 +206,17 @@ class BringUp:
                     pass
                 continue
             workspace_id, step = min(ready, key=lambda item: item[1])
+            # DALTON-HOOK(bringup-owner-check): fast path only — a restart's
+            # queue can outlive the binding its workspaces were queued under,
+            # and dropping one that already left here saves it the stamp and
+            # folder reads of a pass that would end in the gate below. The
+            # check that actually guards the writes runs inside the folder
+            # hold each step's work already needs (``_restore`` / ``_sync``);
+            # both posts are the same judgment, ``_placement_is_ours``.
+            if not await self._placement_is_ours(workspace_id):
+                self.pending.pop(workspace_id, None)
+                self._forget(workspace_id)
+                continue
             if step.restored:
                 synced = await self._sync(workspace_id)
                 self.pending.pop(workspace_id, None)
@@ -207,6 +227,42 @@ class BringUp:
             else:
                 await self._restore(workspace_id, step)
 
+    # DALTON-HOOK(bringup-owner-check): a restart's queue can outlive the
+    # binding its workspaces were queued under — one moved to another computer
+    # while the queue worked through the rest, and a move from a backup leaves
+    # the folder behind under its name, so no folder-level signal names it.
+    # The placement row (deleted filtered, current computer_id) is the
+    # commit's truth. Callers that write take the folder hold first and read
+    # it inside (a move's set-aside takes the same hold, so it cannot land
+    # between this check and the writes it gates); the run() fast path reads
+    # it without the hold only to drop work early. Dropped is not failed: the
+    # workspace's next acquisition on whichever computer holds it now queues
+    # the work where it belongs, and the dropped attach key lets it.
+    async def _placement_is_ours(self, workspace_id: str) -> bool:
+        """Whether the workspace still lives on this job's computer, read
+        fresh from the database; False also when the read itself fails, since
+        the safe side of not knowing is to write nothing."""
+        try:
+            placement = await get_workspace_placement(workspace_id)
+        except Exception as e:  # noqa: BLE001 - no answer means no writes here
+            logger.warning(
+                f"Bring-up of workspace {workspace_id} on computer "
+                f"{self.computer_id} skipped: its placement could not be read "
+                f"({type(e).__name__}: {e})"
+            )
+            return False
+        where = placement.get("computer_id") if placement else None
+        if where is not None:
+            where = str(where)
+        if where != self.computer_id:
+            logger.info(
+                f"Bring-up of workspace {workspace_id} dropped: it no longer "
+                f"lives on computer {self.computer_id} (now "
+                f"{'unbound' if where is None and placement else where or 'deleted'})"
+            )
+            return False
+        return True
+
     async def _unchanged(self, workspace_id: str) -> bool:
         stamp = await _read_stamp(workspace_id)
         if stamp is None or stamp.split("|", 1)[0] != self.sandbox_id:
@@ -215,7 +271,21 @@ class BringUp:
             live = await _thread_prefixes(workspace_id)
         except Exception:  # noqa: BLE001 - the pass reads them again and reports
             return False
-        return stamp == _stamp(self.sandbox_id, live)
+        if stamp != _stamp(self.sandbox_id, live):
+            return False
+        # A machine keeps its id when only the folder goes (its owner's own, or
+        # a folder lost on a sandbox never rebuilt), so the stamp outlives the
+        # files: a folder laid again since lacks the marker the pass writes.
+        try:
+            async with held_workspace_layout(workspace_id, self.root) as layout:
+                if layout is None:
+                    return False
+                marker = await self.sandbox.adownload_file_bytes(
+                    layout.join(DEFERRED_MARKER)
+                )
+        except Exception:  # noqa: BLE001 - the pass looks again and reports
+            return False
+        return marker is not None
 
     async def _restore(self, workspace_id: str, step: _Step) -> None:
         done = False
@@ -228,6 +298,14 @@ class BringUp:
             async with held_workspace_layout(workspace_id, self.root) as layout:
                 if layout is None:
                     raise WorkspaceFolderMoving(workspace_id)
+                # DALTON-HOOK(bringup-owner-check): the ownership check rides
+                # inside the hold that fences this pass's writes, so a move
+                # that commits while the step waited on the stamp, the threads
+                # or this very hold is caught here, before the first exec.
+                if not await self._placement_is_ours(workspace_id):
+                    self.pending.pop(workspace_id, None)
+                    self._forget(workspace_id)
+                    return
                 listing, inventory = await _inventory(self.sandbox.runtime, layout)
                 kept, pruned = await _thread_dirs.prune_dead_thread_dirs(
                     self.sandbox.runtime, layout, workspace_id, listing=listing
@@ -283,9 +361,26 @@ class BringUp:
 
     async def _sync(self, workspace_id: str) -> bool:
         """Whether no thread was left behind. Only its own turn end exports a
-        thread again, so one nobody reopens waits on the next sync."""
+        thread again, so one nobody reopens waits on the next sync.
+
+        The export itself is server-side, but the step is this machine's duty
+        under this binding, so the folder hold pins the workspace's folder —
+        the same hold a move's set-aside takes — across the ownership check
+        and the export: a workspace that left while its restore ran or this
+        step waited is dropped here (False), and the caller forgets its
+        attach key as any dropped step's does."""
         try:
-            outcome = await transcripts.sync_workspace(workspace_id)
+            async with held_workspace_layout(workspace_id, self.root):
+                # DALTON-HOOK(bringup-owner-check)
+                if not await self._placement_is_ours(workspace_id):
+                    return False
+                outcome = await transcripts.sync_workspace(workspace_id)
+        except WorkspaceFolderMoving:
+            logger.info(
+                f"Transcript sync for workspace {workspace_id} found no "
+                f"settled folder; its next acquisition queues it again"
+            )
+            return False
         except Exception as e:
             logger.warning(f"Transcript sync failed for workspace {workspace_id}: {e}")
             return False
@@ -319,11 +414,12 @@ class BringUpMixin:
         if job is None or job.sandbox_id != sandbox_id:
             if job is not None:
                 job.cancel()
-            job = machine.bring_up = BringUp(
+            job = machine.bring_up = BringUp(  # DALTON-HOOK(bringup-owner-check)
+                computer_id,
                 sandbox,
                 sandbox_id,
                 root or DEFAULT_ROOT_DIR,
-                lambda ws: self._projects_attached.discard((ws, sandbox_id)),
+                lambda ws: self._projects_attached.pop((ws, sandbox_id), None),
             )
 
             async def _run(job: BringUp) -> None:
@@ -335,6 +431,101 @@ class BringUpMixin:
 
             job.task = asyncio.create_task(_run(job))
         job.add(workspace_id, urgent=urgent)
+
+    def _on_session_attached(
+        self,
+        computer_id: str,
+        session: Any,
+        *,
+        resumed: bool,
+        opened: Optional[str] = None,
+    ) -> None:
+        """What a worker owes a machine once it holds a session on it.
+
+        A sandbox brought back with its processes (a provider's pause, an
+        E2B deadline) may still run jobs whose commands are over, so those
+        are ended without holding up the attach. ``resumed``: the machine
+        started again on the sandbox it stopped on, whose disk still holds
+        the threads deleted or gone idle meanwhile, and no worker's attach
+        will look again (projects stay attached across a stop on the same
+        sandbox), so every project's sync is queued too, but ``opened``'s,
+        which its own start queued. A lazy restart has no runtime yet when
+        it attaches, so its Phase 2 queues them."""
+        if resumed:
+            self._queue_reconnect_syncs_soon(
+                computer_id, session.sandbox, opened=opened
+            )
+        self.end_stale_jobs_soon(computer_id, session.sandbox)
+
+    def _queue_reconnect_syncs_soon(
+        self, computer_id: str, sandbox: Any, *, opened: Optional[str] = None
+    ) -> None:
+        """``_queue_reconnect_syncs`` in a task of its own. The start is up by
+        now, and a cancel landing in the listing would unwind it."""
+        task = asyncio.create_task(
+            self._queue_reconnect_syncs(computer_id, sandbox, opened=opened)
+        )
+        self._prune_tasks.add(task)
+        task.add_done_callback(self._prune_tasks.discard)
+
+    async def _queue_reconnect_syncs(
+        self, computer_id: str, sandbox: Any, *, opened: Optional[str] = None
+    ) -> None:
+        """Queue every project on a resumed sandbox but ``opened``; the restore
+        step finds nothing deferred on a warm disk, so each costs only its
+        sync. The start is up by now, so a failed listing does not fail it:
+        this worker forgets what it attached to the sandbox instead, and each
+        project's next acquisition here attaches again and queues its own."""
+        try:
+            workspace_ids = await get_live_workspace_ids_for_computer(computer_id)
+        except Exception as e:  # noqa: BLE001
+            sandbox_id = str(sandbox.sandbox_id) if sandbox.sandbox_id else None
+            self._projects_attached = {
+                key: epoch
+                for key, epoch in self._projects_attached.items()
+                if key[1] != sandbox_id or key[0] == opened
+            }
+            logger.warning(
+                f"Could not list the workspaces on computer {computer_id} to "
+                f"sync them after its start; each attaches again here on its "
+                f"next open: {e}"
+            )
+            return
+        cached = self._cached_session(computer_id)
+        if cached is None or cached.sandbox is not sandbox:
+            # Replaced while the listing ran: queued on this sandbox, they
+            # would cancel the replacement's own bring-up (_queue_bring_up).
+            return
+        for workspace_id in workspace_ids:
+            if workspace_id != opened:
+                self._queue_bring_up(
+                    computer_id, workspace_id, sandbox, sandbox.working_dir, urgent=False
+                )
+
+    def end_stale_jobs_soon(self, computer_id: str, sandbox: Any) -> None:
+        """End the jobs a machine this worker just connected to holds that
+        nothing follows (``commands.reconcile``), without holding up the
+        connect. A failure leaves them to the next connect."""
+        from src.server.services.commands.reconcile import end_stale_jobs
+
+        async def _run() -> None:
+            try:
+                # A lazy reconnect is still starting the sandbox.
+                await sandbox.wait_ready()
+                runtime = sandbox.runtime
+                if runtime is None:
+                    return
+                root = sandbox.working_dir or DEFAULT_ROOT_DIR
+                await end_stale_jobs(computer_id, runtime, root)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    f"Could not end stale jobs on computer {computer_id}: "
+                    f"{type(e).__name__}: {e}"
+                )
+
+        task = asyncio.create_task(_run())
+        self._prune_tasks.add(task)
+        task.add_done_callback(self._prune_tasks.discard)
 
     def prune_thread_dirs_soon(self, workspace_id: str) -> None:
         """``prune_thread_dirs_if_running`` without holding up the thread
@@ -377,7 +568,7 @@ class BringUpMixin:
             if not sandbox_id:
                 return
             async with (
-                self._computer_runtime(computer, str(sandbox_id)) as runtime,
+                self.computer_runtime(computer, str(sandbox_id)) as runtime,
                 held_workspace_layout(
                     workspace_id, computer.get("root_dir") or DEFAULT_ROOT_DIR
                 ) as layout,

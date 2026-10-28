@@ -261,7 +261,7 @@ Docker（colima，数据盘在 EveSSD）
 
 - **模型回退原因日志与事件透传**（`src/ptc_agent/agent/middleware/model_resilience.py`，钩子 `fallback-reason-log`）：主模型调用失败触发 fallback 时，记录 `WARNING` 日志（含源模型、目标模型、HTTP 状态码、异常类型及脱敏截断后的错误文本），并将 `error_type` 透传至流式 fallback 事件（`src/server/services/runs/sse_producer.py`、`src/server/services/history/projector.py`）。
 - **无客户端槽位降级检查范围**（`demote_clientless` in `src/server/services/llm/subagents.py`、`src/server/services/llm/config.py`）：仅检查当前轮次角色在主槽位上的模型固定配置，Home 不再对仅限 analyst 的固定配置告警，后台槽位调用不再产生告警。
-- **Anthropic 系统消息位置兼容**（`src/llms/operator_channel.py` 的 `_placeable` 与 `_as_reminder_turn`，回移植上游 #596，钩子 `upstream-backport-596`）：当上一轮在模型回复前被中断、导致运行时上下文 `system` 条目紧邻下一条 `user` 消息（违反 Anthropic Messages API 要求 `system` 必须位于 `assistant` 消息之前或数组末尾的规则）时，无法按 `system` 角色放置的条目自动包装为 `user` 轮内的 `<system-reminder>` 块发送，其余条目保持 `system` 角色，使已中断线程在下一轮自动恢复而不再返回 HTTP 400 触发模型回退。
+- **Anthropic 系统消息位置兼容**（`src/llms/operator_channel.py` 的 `_placeable` 与 `_as_reminder_turn`，B3 起随上游 #596 内置，原 `upstream-backport-596` 回移植已删除）：当上一轮在模型回复前被中断、导致运行时上下文 `system` 条目紧邻下一条 `user` 消息（违反 Anthropic Messages API 要求 `system` 必须位于 `assistant` 消息之前或数组末尾的规则）时，无法按 `system` 角色放置的条目自动包装为 `user` 轮内的 `<system-reminder>` 块发送，其余条目保持 `system` 角色，使已中断线程在下一轮自动恢复而不再返回 HTTP 400 触发模型回退。
 
 ## 9. 数据接入
 

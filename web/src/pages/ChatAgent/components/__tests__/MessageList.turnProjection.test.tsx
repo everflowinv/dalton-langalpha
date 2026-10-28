@@ -246,6 +246,34 @@ describe('MessageList — a reply replay could not load', () => {
   });
 });
 
+describe('MessageList — a turn that opened hidden', () => {
+  // Its words rode its send's context, which the checkpoint a regenerate
+  // replays does not hold, so no bubble of it offers one.
+  it('offers no Regenerate on its reply, nor on the tail a steer split off it', () => {
+    const messages: Msg[] = [
+      assistant('a0', { turnIndex: 0, hiddenOpener: true }),
+      userMsg('u-steer', { turnIndex: 0, steeringDelivered: true }),
+      assistant('a0-cont', { turnIndex: 0, isSteering: true }),
+      userMsg('u1', { turnIndex: 1 }),
+      assistant('a1', { turnIndex: 1 }),
+    ];
+    const { container } = renderList(messages, { onRegenerate: vi.fn() });
+
+    expect(regenerateBtn(container, 'a0')).toBeNull();
+    expect(regenerateBtn(container, 'a0-cont')).toBeNull();
+    // The turns after it are ordinary ones.
+    expect(regenerateBtn(container, 'a1')).not.toBeNull();
+  });
+
+  it('keeps the Retry of its failed reply', () => {
+    const messages: Msg[] = [emptyAssistant('a0', { turnIndex: 0, hiddenOpener: true, error: true })];
+    const { container } = renderList(messages, { onRegenerate: vi.fn(), onRetry: vi.fn() });
+
+    expect(regenerateBtn(container, 'a0')).toBeNull();
+    expect(bubble(container, 'a0')?.querySelector('[title="chat.actions.retry"]')).not.toBeNull();
+  });
+});
+
 describe('MessageList — regenerate lands on the last visible bubble', () => {
   it('keeps regenerate on the previous visible bubble when the steering continuation settled empty', () => {
     const onRegenerate = vi.fn();

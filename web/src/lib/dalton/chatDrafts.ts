@@ -266,6 +266,22 @@ export interface UseComposerDraftOptions {
 
 export interface PendingSendHandle {
   finalizeSend: (succeeded: boolean) => void;
+  /**
+   * Settle this send as accepted before its promise resolves: the server has
+   * taken it (a run_id arrived, a steer was accepted, the send was queued, a
+   * duplicate was adopted, …), so its draft is safe to clear even though the
+   * stream may run on for a long time — a reload mid-stream must not restore
+   * an already-sent message into the composer. A later finalizeSend on the
+   * same handle is a no-op.
+   */
+  acceptSend: () => void;
+}
+
+interface InFlightSendState {
+  draftKey?: string;
+  userId: string;
+  sentText: string;
+  settled: boolean;
 }
 
 export function settleSendResult(
@@ -279,21 +295,17 @@ export function settleSendResult(
     pending.finalizeSend(false);
     return;
   }
-  if (result === false) {
-    pending.finalizeSend(false);
-    return;
-  }
   if (
     result &&
     typeof (result as Promise<void | boolean>).then === 'function'
   ) {
     (result as Promise<void | boolean>).then(
-      (resolved) => pending.finalizeSend(resolved !== false),
+      (resolved) => pending.finalizeSend(resolved === true),
       () => pending.finalizeSend(false),
     );
     return;
   }
-  pending.finalizeSend(true);
+  pending.finalizeSend(result === true);
 }
 
 export interface UseComposerDraftResult {
@@ -302,7 +314,7 @@ export interface UseComposerDraftResult {
   clearCurrentDraft: () => void;
   beginSend: () => PendingSendHandle;
   submitWithDraft: (
-    invoke: () => void | boolean | Promise<void | boolean>,
+    invoke: (onAccepted: () => void) => void | boolean | Promise<void | boolean>,
   ) => void;
 }
 
@@ -331,6 +343,10 @@ export function useComposerDraft({
   const dirtyRef = useRef<boolean>(false);
   const writtenSinceMountOrSendRef = useRef<boolean>(false);
   const hasSentOnKeyRef = useRef<boolean>(false);
+  const inFlightSendRef = useRef<InFlightSendState | null>(null);
+  // The latest send per (user, key). Kept after that send settles, so an older send on
+  // the same key that completes later still knows it was superseded.
+  const latestSendByKeyRef = useRef(new Map<string, InFlightSendState>());
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const activeDraftKeyRef = useRef<string | undefined>(draftKey);
   const activeUserIdRef = useRef<string>(userId);
@@ -438,13 +454,21 @@ export function useComposerDraft({
       timerRef.current = null;
     }
     const sentText = latestMessageRef.current;
-    const sendDraftKey = activeDraftKeyRef.current;
-    const sendUserId = activeUserIdRef.current;
+    const inFlight: InFlightSendState = {
+      draftKey: activeDraftKeyRef.current,
+      userId: activeUserIdRef.current,
+      sentText,
+      settled: false,
+    };
+    inFlightSendRef.current = inFlight;
+    if (inFlight.draftKey) {
+      latestSendByKeyRef.current.set(`${inFlight.userId ?? ''}|${inFlight.draftKey}`, inFlight);
+    }
 
     // Ensure the draft is persisted in localStorage while awaiting send completion,
     // and clear the input box programmatically without deleting the stored draft.
-    if (dirtyRef.current && sendDraftKey && sentText.trim()) {
-      save(sendDraftKey, sentText, sendUserId);
+    if (inFlight.draftKey && sentText.trim()) {
+      save(inFlight.draftKey, sentText, inFlight.userId);
     }
     dirtyRef.current = false;
     writtenSinceMountOrSendRef.current = false;
@@ -452,55 +476,103 @@ export function useComposerDraft({
     latestMessageRef.current = '';
     setMessageState('');
 
-    let settled = false;
-    return {
-      finalizeSend(succeeded: boolean) {
-        if (settled) return;
-        settled = true;
-        if (succeeded) {
-          const isSameKey = activeDraftKeyRef.current === sendDraftKey;
-          const hasFollowUp =
-            isSameKey &&
-            (writtenSinceMountOrSendRef.current ||
-              Boolean(latestMessageRef.current.trim()));
-          if (!hasFollowUp && sendDraftKey) {
-            clearStorageEntry(sendDraftKey, sendUserId);
-          }
-          return;
+    const settleSuccess = () => {
+      const sendDraftKey = inFlight.draftKey;
+      const sendUserId = inFlight.userId;
+      const isSameKey = activeDraftKeyRef.current === sendDraftKey;
+      const hasFollowUp =
+        isSameKey &&
+        (writtenSinceMountOrSendRef.current ||
+          Boolean(latestMessageRef.current.trim()));
+      if (!hasFollowUp && sendDraftKey) {
+        clearStorageEntry(sendDraftKey, sendUserId);
+      }
+    };
+
+    const settle = (succeeded: boolean) => {
+      if (inFlight.settled) return;
+      inFlight.settled = true;
+      // A newer send on this key may have superseded this one while it was in
+      // flight (a steer sent mid-stream, say): the key's stored draft and the
+      // input are that send's now — this settle touches neither, or the first
+      // send's completion would delete or restore the second send's draft.
+      // Supersession is per key: a newer send on another key (the market panel's key moves
+      // from its workspace form to the new thread's once the thread exists) does not own
+      // this send's stored draft, so this send still settles its own key.
+      const latestOnKey = inFlight.draftKey
+        ? latestSendByKeyRef.current.get(`${inFlight.userId ?? ''}|${inFlight.draftKey}`)
+        : undefined;
+      if (latestOnKey && latestOnKey !== inFlight) return;
+      if (inFlightSendRef.current === inFlight) inFlightSendRef.current = null;
+
+      if (succeeded) {
+        settleSuccess();
+        return;
+      }
+      const sendDraftKey = inFlight.draftKey;
+      const sendUserId = inFlight.userId;
+      if (!sendDraftKey) {
+        return;
+      }
+      // Send failed: keep the draft in localStorage and put the original text back.
+      if (activeDraftKeyRef.current === sendDraftKey) {
+        hasSentOnKeyRef.current = false;
+        if (timerRef.current !== null) {
+          clearTimeout(timerRef.current);
+          timerRef.current = null;
         }
-        // Send failed: keep the draft in localStorage and put the original text back.
-        if (activeDraftKeyRef.current === sendDraftKey) {
-          hasSentOnKeyRef.current = false;
-          if (timerRef.current !== null) {
-            clearTimeout(timerRef.current);
-            timerRef.current = null;
-          }
-          const currentTyped = latestMessageRef.current.trim();
-          const restoredText = sentText
-            ? currentTyped
+        const trimmedSent = sentText.trim();
+        const currentTyped = latestMessageRef.current.trim();
+        const alreadyRestored =
+          Boolean(trimmedSent) &&
+          (currentTyped === trimmedSent ||
+            currentTyped.startsWith(`${trimmedSent}\n\n`) ||
+            currentTyped.endsWith(`\n\n${trimmedSent}`));
+        const restoredText = sentText
+          ? alreadyRestored
+            ? latestMessageRef.current
+            : currentTyped
               ? `${sentText}\n\n${latestMessageRef.current}`
               : sentText
-            : latestMessageRef.current;
-          if (sendDraftKey && restoredText.trim()) {
-            save(sendDraftKey, restoredText, sendUserId);
-          }
-          if (restoredText) {
-            latestMessageRef.current = restoredText;
-            dirtyRef.current = false;
-            writtenSinceMountOrSendRef.current = true;
-            setMessageState(restoredText);
-          }
-        } else if (sendDraftKey && sentText.trim()) {
-          save(sendDraftKey, sentText, sendUserId);
+          : latestMessageRef.current;
+        if (restoredText.trim()) {
+          save(sendDraftKey, restoredText, sendUserId);
         }
+        if (restoredText) {
+          latestMessageRef.current = restoredText;
+          dirtyRef.current = false;
+          writtenSinceMountOrSendRef.current = true;
+          setMessageState(restoredText);
+        }
+      } else if (sentText.trim()) {
+        save(sendDraftKey, sentText, sendUserId);
+      }
+    };
+
+    return {
+      finalizeSend(succeeded: boolean) {
+        settle(succeeded);
+      },
+      acceptSend() {
+        settle(true);
       },
     };
   }, []);
 
   const submitWithDraft = useCallback(
-    (invoke: () => void | boolean | Promise<void | boolean>) => {
+    (invoke: (onAccepted: () => void) => void | boolean | Promise<void | boolean>) => {
       const pending = beginSend();
-      settleSendResult(pending, invoke);
+      // The send path reports acceptance early (a run started, a steer was
+      // taken, the send was queued) by calling onAccepted; the promise's
+      // resolved value is the fallback for a send that never reported either.
+      let result: void | boolean | Promise<void | boolean>;
+      try {
+        result = invoke(pending.acceptSend);
+      } catch {
+        pending.finalizeSend(false);
+        return;
+      }
+      settleSendResult(pending, () => result);
     },
     [beginSend],
   );
@@ -531,6 +603,50 @@ export function useComposerDraft({
         isNewWorkspaceDraftKey(prev.draftKey) &&
         isThreadDraftKey(draftKey)
       ) {
+        const inFlight = inFlightSendRef.current;
+        const sendStillInFlight =
+          inFlight !== null &&
+          !inFlight.settled &&
+          inFlight.draftKey === prev.draftKey;
+        if (sendStillInFlight && inFlight) {
+          clearStorageEntry(prev.draftKey, prev.userId);
+          inFlight.draftKey = draftKey;
+          inFlight.userId = userId;
+          // The send now owns its new key's generation (it migrated with it).
+          latestSendByKeyRef.current.set(`${userId ?? ''}|${draftKey}`, inFlight);
+          const followUpText = writtenSinceMountOrSendRef.current
+            ? latestMessageRef.current
+            : '';
+          hasSentOnKeyRef.current = false;
+          hadPrefillRef.current = Boolean(prefillMessageRef.current);
+          onDraftKeySwitchRef.current?.();
+          if (followUpText && followUpText.trim()) {
+            save(draftKey, followUpText, userId);
+            latestMessageRef.current = followUpText;
+            dirtyRef.current = false;
+            writtenSinceMountOrSendRef.current = true;
+            setMessageState(followUpText);
+          } else {
+            if (inFlight.sentText.trim()) {
+              save(draftKey, inFlight.sentText, userId);
+            }
+            latestMessageRef.current = '';
+            dirtyRef.current = false;
+            writtenSinceMountOrSendRef.current = false;
+            setMessageState('');
+          }
+          return () => {
+            if (timerRef.current !== null) {
+              clearTimeout(timerRef.current);
+              timerRef.current = null;
+            }
+            if (dirtyRef.current && draftKey) {
+              save(draftKey, latestMessageRef.current, userId);
+              dirtyRef.current = false;
+            }
+          };
+        }
+
         const continuationText = writtenSinceMountOrSendRef.current
           ? latestMessageRef.current || load(prev.draftKey, prev.userId)
           : load(prev.draftKey, prev.userId);

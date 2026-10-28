@@ -17,7 +17,7 @@ const h = vi.hoisted(() => ({
   updateWorkspaceSharing: vi.fn<
     (
       wsId: string,
-      payload: { cos_access: 'rw' | 'ro' | 'hidden'; web_access: 'rw' | 'ro' | 'hidden' },
+      payload: { cos_access?: 'rw' | 'ro' | 'hidden'; web_access: 'rw' | 'ro' | 'hidden' },
     ) => Promise<WorkspaceSharingResponse>
   >(),
 }));
@@ -29,7 +29,7 @@ vi.mock('../../../utils/api/workspaces', async (importOriginal) => {
     fetchWorkspaceSharing: (wsId: string) => h.fetchWorkspaceSharing(wsId),
     updateWorkspaceSharing: (
       wsId: string,
-      payload: { cos_access: 'rw' | 'ro' | 'hidden'; web_access: 'rw' | 'ro' | 'hidden' },
+      payload: { cos_access?: 'rw' | 'ro' | 'hidden'; web_access: 'rw' | 'ro' | 'hidden' },
     ) => h.updateWorkspaceSharing(wsId, payload),
   };
 });
@@ -40,6 +40,7 @@ const STABLE_OWN_SHARING: WorkspaceSharingResponse = {
   web_access: 'hidden',
   is_home: false,
   can_edit: true,
+  colleague_dispatch_enabled: true,
   updated_by: 'u-chao',
   updated_at: '2026-04-20T12:00:00Z',
 };
@@ -50,6 +51,7 @@ const STABLE_COLLEAGUE_SHARING: WorkspaceSharingResponse = {
   web_access: 'ro',
   is_home: false,
   can_edit: false,
+  colleague_dispatch_enabled: true,
   updated_by: 'u-richard',
   updated_at: '2026-04-20T12:00:00Z',
 };
@@ -142,7 +144,7 @@ describe('WorkspaceSharingModal', () => {
     renderWithProviders(<WorkspaceSharingModal workspaceId={WS_OWN} />, { queryClient });
 
     fireEvent.click(await screen.findByTestId('workspace-sharing-button'));
-    fireEvent.click(screen.getByTestId('sharing-cos-rw'));
+    fireEvent.click(screen.getByTestId('sharing-web-rw'));
     fireEvent.click(screen.getByTestId('sharing-save-btn'));
     await waitFor(() => expect(h.updateWorkspaceSharing).toHaveBeenCalled());
     await waitFor(() => expect(screen.getByTestId('sharing-cancel-btn')).toBeDisabled());
@@ -159,11 +161,11 @@ describe('WorkspaceSharingModal', () => {
     if (closeBtn) fireEvent.click(closeBtn);
     expect(screen.getByRole('dialog')).toBeInTheDocument();
 
-    resolveSave({ ...STABLE_OWN_SHARING, cos_access: 'rw' });
+    resolveSave({ ...STABLE_OWN_SHARING, web_access: 'rw' });
     await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
   });
 
-  it('loads initial access levels, saves updated cos_access and web_access, updates cache, and closes', async () => {
+  it('loads initial access levels, shows settings hint and rw trust warning, saves updated web_access, updates cache, and closes', async () => {
     const { default: i18n } = await import('@/i18n');
     await i18n.changeLanguage('zh-CN');
     onTestFinished(async () => {
@@ -172,8 +174,7 @@ describe('WorkspaceSharingModal', () => {
 
     const updatedSharing: WorkspaceSharingResponse = {
       ...STABLE_OWN_SHARING,
-      cos_access: 'rw',
-      web_access: 'ro',
+      web_access: 'rw',
       updated_at: '2026-04-20T12:05:00Z',
     };
     h.updateWorkspaceSharing.mockResolvedValueOnce(updatedSharing);
@@ -192,28 +193,78 @@ describe('WorkspaceSharingModal', () => {
     expect(h.fetchWorkspaceSharing).toHaveBeenCalledWith(WS_OWN);
     fireEvent.click(trigger);
 
-    const cosRw = screen.getByTestId('sharing-cos-rw') as HTMLInputElement;
-    const cosRo = screen.getByTestId('sharing-cos-ro') as HTMLInputElement;
+    expect(screen.queryByTestId('sharing-cos-fieldset')).toBeNull();
+    expect(screen.getByTestId('sharing-cos-settings-hint')).toHaveTextContent(
+      '其他人的研究总监访问权限已在「设置」中按账户统一管理',
+    );
+    expect(screen.queryByTestId('sharing-web-rw-warning')).toBeNull();
+
+    const webRw = screen.getByTestId('sharing-web-rw') as HTMLInputElement;
     const webRo = screen.getByTestId('sharing-web-ro') as HTMLInputElement;
     const webHidden = screen.getByTestId('sharing-web-hidden') as HTMLInputElement;
 
-    expect(cosRo.checked).toBe(true);
     expect(webHidden.checked).toBe(true);
+    expect(webRo.checked).toBe(false);
 
-    fireEvent.click(cosRw);
-    fireEvent.click(webRo);
+    fireEvent.click(webRw);
+    expect(webRw.checked).toBe(true);
+    expect(screen.getByTestId('sharing-web-rw-warning')).toHaveTextContent(
+      '同事在这里提问会在你的计算机上运行，等于信任这台计算机',
+    );
     fireEvent.click(screen.getByTestId('sharing-save-btn'));
 
     await waitFor(() => {
       expect(h.updateWorkspaceSharing).toHaveBeenCalledWith(WS_OWN, {
-        cos_access: 'rw',
-        web_access: 'ro',
+        web_access: 'rw',
       });
     });
     expect(queryClient.getQueryData(queryKeys.dalton.sharing(WS_OWN))).toEqual(updatedSharing);
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: queryKeys.workspaces.team() });
     await waitFor(() => {
       expect(screen.queryByRole('dialog')).toBeNull();
+    });
+  });
+
+  it('keeps workspace-level cos_access radio fieldset when colleague_dispatch_enabled is false', async () => {
+    const legacySharing: WorkspaceSharingResponse = {
+      ...STABLE_OWN_SHARING,
+      cos_access: 'ro',
+      web_access: 'hidden',
+      colleague_dispatch_enabled: false,
+    };
+    const updatedLegacySharing: WorkspaceSharingResponse = {
+      ...legacySharing,
+      cos_access: 'hidden',
+      web_access: 'ro',
+    };
+    h.fetchWorkspaceSharing.mockResolvedValueOnce(legacySharing);
+    h.updateWorkspaceSharing.mockResolvedValueOnce(updatedLegacySharing);
+
+    const queryClient = createTestQueryClient();
+    renderWithProviders(<WorkspaceSharingModal workspaceId={WS_OWN} />, {
+      queryClient,
+    });
+
+    const trigger = await screen.findByTestId('workspace-sharing-button');
+    fireEvent.click(trigger);
+
+    expect(screen.queryByTestId('sharing-cos-settings-hint')).toBeNull();
+    expect(screen.getByTestId('sharing-cos-fieldset')).toBeInTheDocument();
+
+    const cosRo = screen.getByTestId('sharing-cos-ro') as HTMLInputElement;
+    const cosHidden = screen.getByTestId('sharing-cos-hidden') as HTMLInputElement;
+    const webRo = screen.getByTestId('sharing-web-ro') as HTMLInputElement;
+
+    expect(cosRo.checked).toBe(true);
+    fireEvent.click(cosHidden);
+    fireEvent.click(webRo);
+    fireEvent.click(screen.getByTestId('sharing-save-btn'));
+
+    await waitFor(() => {
+      expect(h.updateWorkspaceSharing).toHaveBeenCalledWith(WS_OWN, {
+        cos_access: 'hidden',
+        web_access: 'ro',
+      });
     });
   });
 
@@ -236,9 +287,8 @@ describe('WorkspaceSharingModal', () => {
     });
 
     fireEvent.click(screen.getByTestId('workspace-sharing-button'));
-    expect(screen.getByTestId('sharing-cos-fieldset')).toBeDisabled();
+    expect(screen.queryByTestId('sharing-cos-fieldset')).toBeNull();
     expect(screen.getByTestId('sharing-web-fieldset')).toBeDisabled();
-    expect(screen.getByTestId('sharing-cos-rw')).toBeDisabled();
     expect(screen.getByTestId('sharing-web-rw')).toBeDisabled();
     expect(screen.getByTestId('sharing-save-btn')).toBeDisabled();
 

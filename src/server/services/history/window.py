@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 from langchain_core.messages import AnyMessage
@@ -107,46 +107,55 @@ async def _head(
     return out[:need] if len(out) >= need else None
 
 
-async def _read_head(
-    thread_id: str, tip: str | None, head: Window, *, extract: bool
+async def _read(
+    thread_id: str, tip: str | None, count: int, *, extract: bool
 ) -> list[AnyMessage] | None:
-    """``head``'s messages on the branch ending at ``tip``, read as ``_head``
-    reads them, or None when that branch's turns do not start with exactly
-    them."""
-    if not head.messages:
-        return []
+    """The first ``count`` messages of the branch ending at ``tip``, read as
+    ``_head`` reads them."""
     anchors = await _anchors(thread_id, tip)
-    messages = await _head(thread_id, anchors or [], head.messages, extract=extract)
-    if messages is not None and await asyncio.to_thread(head.holds, messages):
-        return messages
+    return await _head(thread_id, anchors or [], count, extract=extract)
+
+
+def _missed(thread_id: str, tip: str | None, count: int, *, extract: bool) -> None:
     # Only a read back is owed the messages; a check that misses leaves the
     # thread untrimmed, as it was.
     logger.log(
         logging.WARNING if extract else logging.INFO,
-        "window: %s's turns at %s do not start with its %d trimmed messages",
+        "window: %s's turns at %s do not start with the %d messages it trims",
         thread_id,
         tip,
-        head.messages,
+        count,
     )
-    return None
 
 
-async def runs_held(thread_id: str, head: Window) -> bool:
-    """Whether the stored slices of the committed branch's turns, read in
-    order, start with exactly ``head``'s messages: every slice up to there is
-    one replay would serve, and together they hash to its digest.
+async def runs_held(
+    thread_id: str, window: Window, trimmed: Sequence[AnyMessage]
+) -> Window | None:
+    """``window`` with ``trimmed`` trimmed after it, when the stored slices
+    of the committed branch's turns, read in order, start with exactly the
+    messages of both: every slice up to there is one replay would serve, and
+    together they hash to its digest. None when they do not. A window hashed
+    under an older digest comes back rehashed from them, the messages it adds
+    checked in full (``Window.extend_held``).
 
     One indexed read settles the common miss (a thread not yet backfilled
     holds no slices); only a thread that may be covered pays for the branch
     walk, which reads checkpoint metadata, never state, and then for decoding
     the slices a trim would leave as those messages' only copy.
     """
-    if not head.messages:
-        return True
     if not await slices_db.has_turn_slices(thread_id, slices.SLICE_KEY):
-        return False
+        return None
     tip = await get_thread_checkpoint_id(thread_id)
-    return bool(tip) and await _read_head(thread_id, tip, head, extract=False) is not None
+    if not tip:
+        return None
+    count = window.messages + len(trimmed)
+    held = await _read(thread_id, tip, count, extract=False)
+    head = None
+    if held is not None:
+        head = await asyncio.to_thread(window.extend_held, trimmed, held)
+    if head is None:
+        _missed(thread_id, tip, count, extract=False)
+    return head
 
 
 async def earlier_runs(
@@ -157,4 +166,10 @@ async def earlier_runs(
     slices, and from the checkpoints for a turn whose slice replay would not
     serve. None when that branch's turns do not start with exactly them.
     """
-    return await _read_head(thread_id, tip, head, extract=True)
+    if not head.messages:
+        return []
+    messages = await _read(thread_id, tip, head.messages, extract=True)
+    if messages is not None and await asyncio.to_thread(head.holds, messages):
+        return messages
+    _missed(thread_id, tip, head.messages, extract=True)
+    return None

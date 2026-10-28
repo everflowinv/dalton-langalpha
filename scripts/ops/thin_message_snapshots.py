@@ -4,9 +4,9 @@
 ``messages`` blob is stored at the checkpoint's channel version, the load reads
 it directly: a snapshot, or the full list a checkpoint written before
 DeltaChannel stored at every step. Otherwise the load walks parent checkpoints
-to the nearest one whose ``channel_values`` flags a snapshot and replays the
-``messages`` writes in between. Every blob holds the whole list, so on a long
-thread blobs are most of its checkpoint bytes.
+to the nearest one that stores either and replays the ``messages`` writes in
+between. Every blob holds the whole list, so on a long thread blobs are most
+of its checkpoint bytes.
 
 This script deletes most of them. Every checkpoint, write and parent link
 stays, so branches, forks and edits are untouched; only where loads start
@@ -21,19 +21,16 @@ their replay moves. Kept, per thread:
   replays;
 - every blob whose loads a replay from the next one up would not reproduce
   byte for byte. Writes stored before DeltaChannel replay with id-less human
-  inputs, and parallel tool results replay in a different order than they were
-  applied, so this keeps more than spacing alone would.
+  inputs, and releases before langgraph 1.2.16 replayed parallel tool results
+  out of the order they were applied, which the snapshots taken after them
+  kept; so this keeps more than spacing alone would.
 
-A kept pre-DeltaChannel list is flagged as a snapshot, which it already loads
-as, so walks stop at it instead of replaying from the root. A load that
-already walks past such lists to the root today keeps its value: the topmost
-checkpoint of each such walk is first seeded with what it loads now.
+A kept pre-DeltaChannel list is also flagged as a snapshot, which it already
+loads as. That changes no load on the verified releases; the releases before
+them stopped walks only at a flag, so walked past such a list to the root.
 
-``--keep all`` drops nothing and does only that: every stored pre-DeltaChannel
-list is flagged and every walk that crossed one seeded. Run it on every thread
-before the snapshot cadence is lengthened, or a migrated thread's first delta
-turn replays the id-less writes from its root and freezes that list into
-state. Nothing gets slower, so it does not wait on stored lines.
+``--keep all`` drops nothing and only flags every stored pre-DeltaChannel
+list. No load changes, so it does not wait on stored lines.
 
 A thread is thinned only while its history no longer reads old states:
 every turn on its branch streams from a stored slice and lines under the
@@ -120,9 +117,8 @@ WHERE thread_id = %s AND checkpoint_ns = '' AND channel = 'messages' AND version
 """
 
 _WRITES_SQL = """
-SELECT checkpoint_id, task_id, idx, type, blob FROM checkpoint_writes
+SELECT checkpoint_id, task_path, task_id, idx, type, blob FROM checkpoint_writes
 WHERE thread_id = %s AND checkpoint_ns = '' AND channel = 'messages'
-ORDER BY checkpoint_id, task_id, idx
 """
 
 _WRITE_COUNTS_SQL = """
@@ -195,16 +191,6 @@ WHERE thread_id = %s AND checkpoint_ns = '' AND channel = 'messages' AND version
 RETURNING length(blob)
 """
 
-# Same row shape as the saver's own snapshot put. Only an empty placeholder may
-# be replaced; a version with a stored value never gets a seed.
-_SEED_SQL = """
-INSERT INTO checkpoint_blobs (thread_id, checkpoint_ns, channel, version, type, blob)
-VALUES (%s, '', 'messages', %s, %s, %s)
-ON CONFLICT (thread_id, checkpoint_ns, channel, version) DO UPDATE
-    SET type = EXCLUDED.type, blob = EXCLUDED.blob
-    WHERE checkpoint_blobs.type = 'empty' OR checkpoint_blobs.blob IS NULL
-"""
-
 
 # --------------------------------------------------------------------------
 # One thread
@@ -231,17 +217,11 @@ class Report:
     dropped: int = 0
     dropped_bytes: int = 0
     promoted: int = 0
-    seeded: int = 0
-    seed_bytes: int = 0
     kept: Counter[str] = field(default_factory=Counter)
     walk_before: tuple[int, int] = (0, 0)
     walk_after: tuple[int, int] = (0, 0)
     longer: list[str] = field(default_factory=list)
     anchors_match: bool | None = None
-
-    @property
-    def reclaimed(self) -> int:
-        return self.dropped_bytes - self.seed_bytes
 
 
 @dataclass(frozen=True)
@@ -376,8 +356,6 @@ async def _plan(
     report.dropped = len(plan.drop)
     report.dropped_bytes = sum(u.size for u in plan.drop)
     report.promoted = len(plan.promote)
-    report.seeded = len(plan.seeds)
-    report.seed_bytes = sum(s.size for s in plan.seeds)
     if not plan.changes:
         return Rewrite(report)
     counts = await _write_counts(conn, thread_id)
@@ -403,13 +381,21 @@ async def _plan(
 
 
 async def _read_writes(conn: psycopg.AsyncConnection, thread_id: str, serde: Any) -> Writes:
-    """Each checkpoint's ``messages`` writes as the saver replays them:
-    ordered by task id, then index."""
-    writes: Writes = defaultdict(list)
+    """Each checkpoint's ``messages`` writes in the order the saver replays
+    them. Sorted here, as the saver sorts them, since SQL collation may order
+    the task paths differently."""
+    from langgraph.checkpoint.base import writes_sort_key
+
+    rows: dict[str, list[tuple[tuple[str, str, int], str, Any]]] = defaultdict(list)
     async with conn.cursor() as cur:
         await cur.execute(_WRITES_SQL, (thread_id,))
-        async for cid, task_id, _idx, tag, blob in cur:
-            writes[cid].append((task_id, MESSAGES, serde.loads_typed((tag, bytes(blob)))))
+        async for cid, task_path, task_id, idx, tag, blob in cur:
+            value = serde.loads_typed((tag, bytes(blob)))
+            rows[cid].append((writes_sort_key(task_path, task_id, idx), task_id, value))
+    writes: Writes = {}
+    for cid, items in rows.items():
+        items.sort(key=lambda item: item[0])
+        writes[cid] = [(task_id, MESSAGES, value) for _, task_id, value in items]
     return writes
 
 
@@ -435,8 +421,6 @@ def _verification_set(
     changed: set[str] = set(plan.flags)
     for unit in [*plan.drop, *plan.promote]:
         changed.update(unit.loaders)
-    for seed in plan.seeds:
-        changed.update(tree.by_version[seed.version])
     checks = set(changed)
     for cid in changed:
         checks.update(tree.children.get(cid, ()))
@@ -452,13 +436,9 @@ def _verification_set(
 
 
 async def _write(conn: psycopg.AsyncConnection, thread_id: str, tree: Tree, plan: Plan) -> int:
-    """Store the seeds, flag what stays, unflag and delete what goes. Returns
-    the bytes deleted; raises ``Skip`` when a row is no longer what was read."""
+    """Flag what stays, unflag and delete what goes. Returns the bytes
+    deleted; raises ``Skip`` when a row is no longer what was read."""
     async with conn.cursor() as cur:
-        for seed in plan.seeds:
-            await cur.execute(_SEED_SQL, (thread_id, seed.version, *seed.typed))
-            if cur.rowcount != 1:
-                raise Skip("a stored messages blob appeared at a seed's version")
         for cid in plan.flags:
             node = tree.nodes[cid]
             await cur.execute(_FLAG_SQL, (thread_id, cid, node.xmin, node.version))
@@ -494,11 +474,9 @@ def _report(out: Result[Report]) -> None:
         logger.info("thread=%s", out.thread_id)
     else:
         logger.info(
-            "thread=%s checkpoints=%d blobs=%d (%s) dropped=%d (%s) flagged_kept=%d "
-            "seeded=%d (%s) reclaimed=%s kept=%s",
+            "thread=%s checkpoints=%d blobs=%d (%s) dropped=%d (%s) flagged_kept=%d kept=%s",
             out.thread_id, report.checkpoints, report.blobs, _mb(report.blob_bytes),
-            report.dropped, _mb(report.dropped_bytes), report.promoted, report.seeded,
-            _mb(report.seed_bytes), _mb(report.reclaimed), dict(report.kept) or "{}",
+            report.dropped, _mb(report.dropped_bytes), report.promoted, dict(report.kept) or "{}",
         )
         if out.status is not Status.NOTHING:
             logger.info(
@@ -614,7 +592,6 @@ async def run(args: argparse.Namespace, conninfo: str) -> int:
                     Status.PLANNED, Status.REHEARSED, Status.WRITTEN
                 ):
                     totals["dropped_bytes"] += out.report.dropped_bytes
-                    totals["seed_bytes"] += out.report.seed_bytes
                     totals["threads"] += 1
                 failed = failed or out.failed
     finally:
@@ -622,10 +599,8 @@ async def run(args: argparse.Namespace, conninfo: str) -> int:
             await app_pool.close()
 
     logger.info(
-        "done mode=%s threads=%d dropped=%s seeded=%s reclaimed=%s %s",
-        mode.value, totals["threads"], _mb(totals["dropped_bytes"]),
-        _mb(totals["seed_bytes"]), _mb(totals["dropped_bytes"] - totals["seed_bytes"]),
-        dict(statuses) or "",
+        "done mode=%s threads=%d dropped=%s %s",
+        mode.value, totals["threads"], _mb(totals["dropped_bytes"]), dict(statuses) or "",
     )
     return 1 if failed else 0
 

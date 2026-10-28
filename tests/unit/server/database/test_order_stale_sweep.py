@@ -2,7 +2,8 @@
 
 An attempt whose action names an event no tool lists is left out of the sweep
 itself rather than read and left unresolved: the read has nowhere to look, so
-picking the row would only stamp it and ask the same empty question next pass.
+picking the row would only stamp it and ask the same empty question every poll
+interval for good.
 """
 
 from __future__ import annotations
@@ -50,7 +51,10 @@ async def test_an_attempt_whose_event_no_tool_lists_is_never_picked():
         "src.server.database.order_reconciliation.get_db_connection", _connection
     ):
         rows = await list_stale_attempts(
-            submitting_grace_seconds=120, open_after_seconds=60, limit=50
+            submitting_grace_seconds=120,
+            open_after_seconds=60,
+            resweep_after_seconds=48,
+            limit=50,
         )
 
     # A string id, which is what the pass carries through to the write.
@@ -63,7 +67,44 @@ async def test_an_attempt_whose_event_no_tool_lists_is_never_picked():
     # A row that recorded no action is not one of them.
     assert "COALESCE(action, '')" in conn.sql
     assert conn.params[1:] == (120.0, ["submitted", "pending_confirm", "working",
-                                       "partially_filled", "unknown"], 60.0, 50)
+                                       "partially_filled", "unknown"], 60.0, 48.0, 50)
+
+
+@pytest.mark.asyncio
+async def test_a_row_read_within_the_poll_interval_is_not_taken_again():
+    """Gated on the last read, not the last write.
+
+    A read that settles nothing writes only ``swept_at``, so a gate on
+    ``updated_at`` alone never closed on such a row and every pass of every
+    worker read it again.
+    """
+    conn = _Conn()
+
+    @asynccontextmanager
+    async def _connection():
+        yield conn
+
+    with patch(
+        "src.server.database.order_reconciliation.get_db_connection", _connection
+    ):
+        await list_stale_attempts(
+            submitting_grace_seconds=120,
+            open_after_seconds=45,
+            resweep_after_seconds=36,
+            limit=50,
+        )
+
+    gate = (
+        "AND ( swept_at IS NULL "
+        "OR swept_at < NOW() - make_interval(secs => %s) )"
+    )
+    assert gate in conn.sql
+    # After both populations rather than inside one, so the unanswered calls
+    # are held to it too.
+    assert conn.sql.index("status = ANY(%s)") < conn.sql.index(gate)
+    # Its own value, in the slot just ahead of the limit, and not the open
+    # rows' window after a write, which keeps the full interval.
+    assert conn.params[-3:] == (45.0, 36.0, 50)
 
 
 @pytest.mark.asyncio
@@ -112,7 +153,10 @@ async def test_an_undispatched_row_is_left_to_the_undispatched_sweep():
         "src.server.database.order_reconciliation.get_db_connection", _connection
     ):
         await list_stale_attempts(
-            submitting_grace_seconds=90, open_after_seconds=60, limit=50
+            submitting_grace_seconds=90,
+            open_after_seconds=60,
+            resweep_after_seconds=48,
+            limit=50,
         )
 
     assert "status = 'submitting' AND dispatched_at IS NOT NULL" in conn.sql

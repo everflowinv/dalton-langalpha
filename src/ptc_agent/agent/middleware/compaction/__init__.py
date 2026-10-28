@@ -35,6 +35,12 @@ from ptc_agent.agent.middleware.compaction.offloading import (
     aoffload_base64_content,
     record_offloads,
 )
+from ptc_agent.agent.middleware.compaction.between_turns import (
+    Compact,
+    HandOff,
+    NoCompaction,
+    ask_between_turns,
+)
 from ptc_agent.agent.middleware.compaction.compact import (
     Compaction,
     Summarizer,
@@ -43,7 +49,11 @@ from ptc_agent.agent.middleware.compaction.compact import (
 )
 
 __all__ = [
+    "Compact",
     "Compaction",
+    "HandOff",
+    "NoCompaction",
+    "ask_between_turns",
     "CompactionMiddleware",
     "CompactionEvent",
     "CompactionState",

@@ -135,6 +135,7 @@ export function projectSubagentHistory(
           handleTaskSteeringAccepted({
             taskId,
             content: event.content as string,
+            steered: eventType === 'subagent_followup_injected',
             refs: tempRefs,
             updateSubagentCard: historyUpdateSubagentCard,
           });
@@ -147,6 +148,7 @@ export function projectSubagentHistory(
             taskId,
             content: event.content as string,
             entries: event.entries as DeliveredInstruction[] | undefined,
+            steered: true,
             refs: tempRefs,
             updateSubagentCard: historyUpdateSubagentCard,
           });
@@ -164,6 +166,7 @@ export function projectSubagentHistory(
             taskId,
             content: event.content as string,
             entries: [{ content: event.content as string, sender: 'agent' }],
+            steered: false,
             refs: tempRefs,
             updateSubagentCard: historyUpdateSubagentCard,
           });

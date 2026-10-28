@@ -23,7 +23,8 @@ from src.llms import LLM, format_llm_content, make_api_call, maybe_disable_strea
 from src.tools.web.inhouse.sitemap import get_sitemap_summary
 from src.tools.decorators import log_io
 from src.tools.web.router import FetchRouter
-from src.observability import stamp_run
+from src.observability import stamp_run, stamp_tool_provider
+from src.tools.web.providers._shared import empty_content_error, mark_web_outcome
 from src.tools.web.types import (
     FetchAttempt,
     FetchRequest,
@@ -156,6 +157,10 @@ class FetchService:
                         cache.set(_cache_key(r.url), r.markdown, ttl=CACHE_TTL)
                         for r in results.values()
                         if r.ok and r.markdown and r.source == "live"
+                        # DALTON-HOOK(heavy-compute-isolation): a PDF parse
+                        # timeout is not content; caching its notice would
+                        # replay it as a short page that reads as empty.
+                        and not r.parse_timeout
                     )
                 )
 
@@ -226,6 +231,16 @@ def _compose_native_output(result: FetchResult) -> str:
     return "\n\n".join(parts)
 
 
+def _short_exc(e: BaseException) -> str:  # DALTON-HOOK(oauth-refresh-direct): marker wording
+    """One-line reason for the 未能抽取 marker. ``asyncio.wait_for`` timeouts
+    (TimeoutError) carry an EMPTY message — ``str(e).splitlines()[0]`` would
+    IndexError and lose the page a second time; fall back to the type name."""
+    text = str(e).strip()
+    if not text:
+        return type(e).__name__
+    return text.splitlines()[0][:120]
+
+
 async def _extract_with_llm(
     markdown: str,
     prompt: str,
@@ -278,16 +293,22 @@ async def _extract_with_llm(
     # EXCEPT for Codex whose proxy rejects stream=false outright.
     maybe_disable_streaming(llm)
 
-    # Apply timeout for extraction
-    result = await asyncio.wait_for(
-        make_api_call(
-            llm=llm,
-            system_prompt=EXTRACTION_SYSTEM_PROMPT,
-            user_prompt=user_prompt,
-            disable_tracing=True,
-        ),
-        timeout=EXTRACTION_TIMEOUT,
-    )
+    async def _call(extraction_llm: Any) -> Any:
+        return await asyncio.wait_for(
+            make_api_call(
+                llm=extraction_llm,
+                system_prompt=EXTRACTION_SYSTEM_PROMPT,
+                user_prompt=user_prompt,
+            ),
+            timeout=EXTRACTION_TIMEOUT,
+        )
+
+    # DALTON-HOOK(oauth-refresh-direct): this call bypasses the resilience
+    # middleware, so a mid-turn OAuth 401 must be refreshed here; a rebuilt
+    # client needs the streaming flag applied again (mutation, not copy).
+    from src.dalton.llm.oauth_refresh import call_with_oauth_refresh
+
+    result = await call_with_oauth_refresh(llm, _call, prepare=maybe_disable_streaming)
 
     # Normalize content: extract text only, discard reasoning
     formatted = format_llm_content(result)
@@ -368,6 +389,12 @@ async def web_fetch(
             if result.error is not None:
                 kind = result.error.type.value
                 artifact["error"] = kind
+                # A failed URL's error came from the last provider to try it;
+                # the response names a provider only when one succeeded.
+                mark_web_outcome(
+                    result.error,
+                    response.attempts[-1].provider if response.attempts else None,
+                )
                 return _with_sitemap_suggestions(
                     f"[{kind}] Failed to fetch {url}: {result.error.message}",
                     await _sitemap(),
@@ -381,9 +408,18 @@ async def web_fetch(
             if result.excerpts or result.summary:
                 return _compose_native_output(result), artifact
 
+            # DALTON-HOOK(heavy-compute-isolation): a PDF parse terminated at
+            # its budget reports THROUGH the markdown — wording far shorter
+            # than the empty-page gate below, which would relabel it "empty".
+            # Recognized before that gate, verbatim, with its own error kind.
+            if result.parse_timeout:
+                artifact["error"] = "pdf_parse_timeout"
+                return result.markdown or "PDF 解析超时：解析被终止。", artifact
+
             markdown = result.markdown
             if not markdown or len(markdown.strip()) < 50:
                 artifact["error"] = "empty"
+                mark_web_outcome(empty_content_error())
                 sitemap_summary = await _sitemap()
                 if sitemap_summary:
                     return _with_sitemap_suggestions(
@@ -394,8 +430,18 @@ async def web_fetch(
                     artifact,
                 )
 
-            # Extract with LLM (with sitemap context)
-            extracted = await _extract_with_llm(markdown, prompt, model, await _sitemap())
+            # Extract with LLM (with sitemap context). DALTON-HOOK(oauth-refresh-direct):
+            # the page is already fetched — an extraction failure (auth, timeout)
+            # must not throw it away; return it with a clear marker instead.
+            try:
+                extracted = await _extract_with_llm(markdown, prompt, model, await _sitemap())
+            except Exception as e:
+                logger.warning(f"LLM extraction failed for {url}: {repr(e)}; returning raw page")
+                artifact["error"] = "extraction_failed"
+                return (
+                    f"未能抽取（{_short_exc(e)}）。以下是未抽取的网页正文：\n\n{markdown}",
+                    artifact,
+                )
             return extracted, artifact
         finally:
             if sitemap_task is not None and not sitemap_task.done():
@@ -407,6 +453,7 @@ async def web_fetch(
         logger.error(f"Failed to process {url}. Error: {repr(e)}")
         short_error = str(e).split('\n')[0][:100]
         artifact["error"] = "exception"
+        mark_web_outcome(e)
         return f"Failed to process {url}: {short_error}", artifact
 
 
@@ -430,6 +477,7 @@ async def _web_fetch_tool_impl(
         fetch_source=artifact.get("source"),
         fetch_error=artifact.get("error"),
     )
+    stamp_tool_provider(provider)
     return content, artifact
 
 

@@ -1,8 +1,13 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { render, screen, cleanup } from '@testing-library/react';
 import { MemoryRouter } from 'react-router';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import enUS from '@/locales/en-US.json';
 import zhCN from '@/locales/zh-CN.json';
+
+// DALTON-HOOK(brand-name): AppSidebar now mounts upstream's Getting Started gate, which needs
+// the onboarding provider these brand/search harnesses do not mount.
+vi.mock('@/pages/Onboarding/GettingStartedGate', () => ({ default: () => null, GettingStartedGate: () => null }));
 
 vi.mock('@/contexts/ThemeContext', () => ({
   useTheme: () => ({ theme: 'dark', preference: 'dark', setTheme: vi.fn(), toggleTheme: vi.fn() }),
@@ -107,11 +112,14 @@ describe('brand configuration (VITE_BRAND_NAME & VITE_BRAND_MARK)', () => {
 
     const { default: AppSidebar } = await import('@/components/Sidebar/AppSidebar');
     const { ShareTopBar } = await import('@/pages/SharedChat/ShareTopBar');
-    const { default: SetupWizard } = await import('@/pages/Setup/SetupWizard');
+    // The setup flow's wordmark now lives in the shared WizardTopBar (SetupWizard
+    // itself needs routes and a query client, which these brand checks don't).
+    const { WizardTopBar } = await import('@/components/ui/wizard');
     const { default: ShareUnavailable } = await import('@/pages/SharedChat/ShareUnavailable');
     const { default: LoginPage } = await import('@/pages/Login/LoginPage');
 
     const { container } = render(
+      <QueryClientProvider client={new QueryClient()}>
       <MemoryRouter>
         <AppSidebar
           collapsed={false}
@@ -120,10 +128,11 @@ describe('brand configuration (VITE_BRAND_NAME & VITE_BRAND_MARK)', () => {
           onWidthChange={() => {}}
         />
         <ShareTopBar name="report.html" />
-        <SetupWizard />
+        <WizardTopBar />
         <ShareUnavailable />
         <LoginPage />
-      </MemoryRouter>,
+      </MemoryRouter>
+      </QueryClientProvider>,
     );
 
     expect(container.querySelector('.sidebar-wordmark')?.textContent).toBe('LangAlpha');
@@ -133,10 +142,12 @@ describe('brand configuration (VITE_BRAND_NAME & VITE_BRAND_MARK)', () => {
     expect(sidebarImg).toBeTruthy();
     expect(sidebarImg?.getAttribute('alt')).toBe('');
 
+    // ShareUnavailable keeps its alt-text logo; the wizard top bar shows the
+    // wordmark as text beside a decorative (alt="") logo.
     const langAlphaImgs = screen.getAllByAltText('LangAlpha') as HTMLImageElement[];
-    expect(langAlphaImgs).toHaveLength(2);
-    expect(langAlphaImgs[0].classList.contains('h-7')).toBe(true);
-    expect(langAlphaImgs[1].classList.contains('h-8')).toBe(true);
+    expect(langAlphaImgs).toHaveLength(1);
+    expect(langAlphaImgs[0].classList.contains('h-8')).toBe(true);
+    expect(container.querySelector('.wizard-topbar')?.textContent).toContain('LangAlpha');
 
     const loginSvg = container.querySelector('svg.login-page__logo-icon');
     expect(loginSvg?.getAttribute('viewBox')).toBe('0 0 60 60');
@@ -150,10 +161,13 @@ describe('brand configuration (VITE_BRAND_NAME & VITE_BRAND_MARK)', () => {
 
     const { default: AppSidebar } = await import('@/components/Sidebar/AppSidebar');
     const { ShareTopBar } = await import('@/pages/SharedChat/ShareTopBar');
-    const { default: SetupWizard } = await import('@/pages/Setup/SetupWizard');
+    // The setup flow's wordmark now lives in the shared WizardTopBar (SetupWizard
+    // itself needs routes and a query client, which these brand checks don't).
+    const { WizardTopBar } = await import('@/components/ui/wizard');
     const { default: ShareUnavailable } = await import('@/pages/SharedChat/ShareUnavailable');
 
     const { container } = render(
+      <QueryClientProvider client={new QueryClient()}>
       <MemoryRouter>
         <AppSidebar
           collapsed={false}
@@ -162,50 +176,52 @@ describe('brand configuration (VITE_BRAND_NAME & VITE_BRAND_MARK)', () => {
           onWidthChange={() => {}}
         />
         <ShareTopBar name="report.html" />
-        <SetupWizard />
+        <WizardTopBar />
         <ShareUnavailable />
-      </MemoryRouter>,
+      </MemoryRouter>
+      </QueryClientProvider>,
     );
 
     expect(container.querySelector('.sidebar-wordmark')?.textContent).toBe('Everflow');
     expect(container.querySelector('.share-topbar-brand')?.textContent).toBe('Everflow');
-    expect(screen.getAllByText('Everflow')).toHaveLength(2);
+    // ShareUnavailable, and the wizard top bar's wordmark beside the sidebar/top-bar brands.
+    expect(screen.getAllByText('Everflow')).toHaveLength(3);
+    expect(container.querySelector('.wizard-topbar')?.textContent).toContain('Everflow');
     expect(container.querySelector('.sidebar-brand svg')?.getAttribute('viewBox')).toBe('0 0 56 56');
     expect(screen.queryByAltText('LangAlpha')).toBeNull();
   });
 
-  it('switches Legal and PrivacyPolicy home navigation links while keeping legal body text unchanged', async () => {
+  it('switches the Legal home navigation link while keeping legal body text unchanged', async () => {
+    // The in-app PrivacyPolicy page is gone (upstream moved the policy to an
+    // external VITE_PRIVACY_URL link rendered inside Legal), so only Legal's
+    // own back link is branded here.
     vi.stubEnv('VITE_BRAND_NAME', '');
     vi.resetModules();
 
     const { default: LegalDefault } = await import('@/pages/Legal/Legal');
-    const { default: PrivacyDefault } = await import('@/pages/Legal/PrivacyPolicy');
 
     const { unmount } = render(
       <MemoryRouter>
         <LegalDefault />
-        <PrivacyDefault />
       </MemoryRouter>,
     );
-    expect(screen.getAllByText('← Back to LangAlpha')).toHaveLength(3);
+    expect(screen.getAllByText('← Back to LangAlpha')).toHaveLength(1);
     unmount();
 
     vi.stubEnv('VITE_BRAND_NAME', 'Everflow');
     vi.resetModules();
 
     const { default: LegalEverflow } = await import('@/pages/Legal/Legal');
-    const { default: PrivacyEverflow } = await import('@/pages/Legal/PrivacyPolicy');
 
     const { container } = render(
       <MemoryRouter>
         <LegalEverflow />
-        <PrivacyEverflow />
       </MemoryRouter>,
     );
-    expect(screen.getAllByText('← Back to Everflow')).toHaveLength(3);
+    expect(screen.getAllByText('← Back to Everflow')).toHaveLength(1);
     expect(container.textContent).toContain('hosted LangAlpha service');
     expect(container.textContent).toContain('langalpha repository');
-    expect(container.textContent).toContain('ginlix.ai');
+    expect(container.innerHTML).toContain('github.com/ginlix/langalpha');
   });
 
   it('interpolates {{brand}} in en-US and zh-CN locale strings when unset and when VITE_BRAND_NAME=Everflow', async () => {

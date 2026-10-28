@@ -43,6 +43,7 @@ from src.server.services.llm.thread_model import (
 )
 from src.server.services.llm.user_models import model_preference_of
 from src.server.services.onboarding import maybe_complete_onboarding
+from src.server.models.profile_vocabulary import STRUCTURED_PREFERENCES, check_profile
 from src.server.models.user import (
     UserBase,
     UserPreferencesResponse,
@@ -224,6 +225,8 @@ async def get_current_user(
 
     Set ``refresh_tier=true`` to bust the cached platform tier (e.g. after
     invitation redemption). Access tier and plan display name are cached 5 min.
+    While the platform is unreachable they are its last answer, and 503 when
+    it has given none.
     """
     result = await get_user_with_preferences(user_id)
 
@@ -237,13 +240,13 @@ async def get_current_user(
     # costs more than one platform-service round-trip per user per 5 minutes.
     from src.server.dependencies.usage_limits import (
         _fetch_platform_membership,
-        platform_membership_cache_key,
+        quota_service_unavailable,
     )
-    if refresh_tier:
-        from src.utils.cache.redis_cache import get_cache_client
-        cache = get_cache_client()
-        await cache.delete(platform_membership_cache_key(user_id))
-    membership = await _fetch_platform_membership(user_id)
+    membership = await _fetch_platform_membership(user_id, refresh=refresh_tier)
+    if membership is None:
+        # Any tier written here is one the web acts on, and -1 sends the user
+        # to the setup wizard. A 503 leaves a client on what it already holds.
+        raise quota_service_unavailable()
     user_response.access_tier = int(membership.get("access_tier", -1))
     user_response.plan_display_name = membership.get("plan_display_name")
 
@@ -479,6 +482,45 @@ def _validate_custom_models(custom_models: list, custom_providers: list | None =
             )
 
 
+async def _refuse_custom_model_endpoints(custom_models: list, stored: list | None = None) -> None:
+    """Refuse, in platform mode, a custom model whose parameters point its
+    client somewhere the server must not dial, or route it another way.
+
+    Only an entry that is new, or whose routing differs from the ``stored``
+    entry of its name, is checked. A save carries the whole list, so one entry
+    saved before the policy, or whose host has stopped resolving, would
+    otherwise block every later change. Such an entry is still refused, or
+    held, where its client is built.
+    """
+    from src.server.services.llm import egress
+
+    if not egress.enforced():
+        return
+    saved = {
+        cm.get("name"): egress.routing_params(cm.get("parameters"))
+        for cm in stored or []
+        if isinstance(cm, dict)
+    }
+    to_check: list[tuple[int, str]] = []
+    for idx, cm in enumerate(custom_models):
+        params = cm.get("parameters")
+        if cm.get("name") in saved and saved[cm.get("name")] == egress.routing_params(params):
+            continue
+        for key in (*egress.connection_params(params), *egress.vertex_params(params)):
+            raise HTTPException(
+                status_code=400,
+                detail=f"custom_models[{idx}]: parameters.{key} cannot be set. Remove it.",
+            )
+        to_check.extend((idx, url) for url in egress.parameter_urls(params))
+    reasons = await egress.save_refusals(url for _, url in to_check)
+    for idx, url in to_check:
+        if reasons[url]:
+            raise HTTPException(
+                status_code=400,
+                detail=f"custom_models[{idx}]: the base URL in parameters cannot be used: {reasons[url]}",
+            )
+
+
 def _validate_custom_providers(custom_providers: list) -> None:
     """Validate custom_providers list before persisting."""
     if not isinstance(custom_providers, list):
@@ -516,8 +558,6 @@ def _validate_custom_providers(custom_providers: list) -> None:
         if ura is not None and not isinstance(ura, bool):
             raise HTTPException(status_code=400, detail=f"custom_providers[{idx}]: use_response_api must be a boolean")
 
-
-_VALID_OUTPUT_FORMATS = {"markdown", "html"}
 
 # The keys that moved out of ``other_preference``. Read on input only, to
 # re-route a stale client's write; drop with the resolver's legacy read.
@@ -668,18 +708,12 @@ def _validate_subagents_default(other_pref: dict) -> None:
         )
 
 
-def _validate_agent_preference(agent_pref: dict) -> None:
-    """Validate agent_preference before persisting. Raises HTTPException 400 on invalid data."""
-    # output_format may be absent or None (delete/default); else must be a
-    # known format. Not a Literal on the model so None survives the JSONB merge
-    # as a key deletion rather than being stripped at parse time.
-    if "output_format" in agent_pref:
-        of = agent_pref["output_format"]
-        if of is not None and (not isinstance(of, str) or of not in _VALID_OUTPUT_FORMATS):
-            raise HTTPException(
-                status_code=400,
-                detail=f"output_format must be one of {sorted(_VALID_OUTPUT_FORMATS)}",
-            )
+def _sets_structured_key(patches: dict[str, dict | None]) -> bool:
+    return any(
+        (patch or {}).get(key) is not None
+        for column, patch in patches.items()
+        for key in STRUCTURED_PREFERENCES[column]
+    )
 
 
 @router.put("/users/me/preferences", response_model=UserPreferencesUpdateResponse)
@@ -717,8 +751,16 @@ async def update_preferences(
         if legacy:
             model_pref = {**legacy, **(model_pref or {})}
 
+    profile = {
+        "risk_preference": risk_pref,
+        "investment_preference": investment_pref,
+        "agent_preference": agent_pref,
+    }
+    sets_structured = _sets_structured_key(profile)
+
+    stored = await db_get_user_preferences(user_id) if model_pref else None
+
     if model_pref:
-        stored = await db_get_user_preferences(user_id)
         stored_model_pref = (stored or {}).get("model_preference") or {}
         effective = _effective_model_preference(stored_model_pref, model_pref)
 
@@ -734,6 +776,11 @@ async def update_preferences(
             _validate_custom_models(
                 effective.get("custom_models") or [],
                 effective.get("custom_providers") or [],
+            )
+
+        if model_pref.get("custom_models"):
+            await _refuse_custom_model_endpoints(
+                model_pref["custom_models"], stored_model_pref.get("custom_models")
             )
 
         _validate_model_tuning(model_pref, effective)
@@ -791,10 +838,6 @@ async def update_preferences(
     if other_pref:
         _validate_subagents_default(other_pref)
 
-    # Validate agent_preference (output_format shape). None = key deletion.
-    if agent_pref:
-        _validate_agent_preference(agent_pref)
-
     # Only a write naming a default key can move threads off the old default.
     changes_default = bool(model_pref) and any(
         key in model_pref for key in DEFAULT_MODEL_KEYS
@@ -806,7 +849,34 @@ async def update_preferences(
     threads_reassigned = 0
     try:
         async with get_db_connection() as conn, conn.transaction():
-            before = await db_lock_user_preferences(user_id, conn=conn) if changes_default else None
+            # One read under the lock serves the default move and the profile
+            # check. A structured key is checked against the row the write
+            # replaces as well as its vocabulary, because a value the row
+            # already holds passes whatever it is. That exemption only holds
+            # against the row read here: a read before the lock can be
+            # overtaken by another write, and the old value would then be
+            # written back over a newer valid one.
+            locked = (
+                await db_lock_user_preferences(user_id, conn=conn)
+                if changes_default or sets_structured
+                else None
+            )
+            before = locked if changes_default else None
+            if sets_structured:
+                # Every value outside its vocabulary, in any column, in one
+                # 422, so a form can mark them all at once. Raising here rolls
+                # the transaction back with nothing written.
+                profile, problems = check_profile(profile, locked)
+                if problems:
+                    raise HTTPException(
+                        status_code=422,
+                        detail="; ".join(f"{path}: {message}" for path, message in problems),
+                    )
+                risk_pref, investment_pref, agent_pref = (
+                    profile["risk_preference"],
+                    profile["investment_preference"],
+                    profile["agent_preference"],
+                )
             preferences = await upsert_user_preferences(
                 user_id=user_id,
                 risk_preference=risk_pref,

@@ -41,7 +41,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -87,6 +87,16 @@ TIME_UP_ROW_KIND = "turn_time_up"
 #: Row kind that takes back a time-up ask once a later run of the thread is on
 #: a new clock, which ``update_row.md.j2`` hardcodes the same way.
 TIME_UP_WITHDRAWN_ROW_KIND = "turn_time_up_withdrawn"
+
+#: Row kind of the user's cancel of wakeups the agent set
+#: (``middleware/wakeups.py``), which ``update_row.md.j2`` hardcodes the same
+#: way.
+WAKEUP_CANCELLED_ROW_KIND = "wakeup_cancelled"
+
+#: Rows that speak for no block, so a rebuild neither folds them in nor
+#: retires them, but a summary carries them: nobody states them again, and
+#: the user's cancel of a wakeup holds whatever the blocks say.
+NOTICE_ROW_KINDS = frozenset({WAKEUP_CANCELLED_ROW_KIND})
 
 #: Rows that are no change under the baseline: their writers state them again
 #: once a compaction takes them from view (the notes reminder before the next
@@ -159,6 +169,15 @@ def _run_clock() -> tuple[datetime, timedelta, timedelta] | None:
         configurable = get_config().get("configurable") or {}
     except RuntimeError:  # outside a runnable context
         return None
+    return run_clock(configurable)
+
+
+def run_clock(
+    configurable: Mapping[str, Any] | None,
+) -> tuple[datetime, timedelta, timedelta] | None:
+    """``_run_clock`` read off a config's ``configurable``, for a caller that
+    holds the config rather than running inside it."""
+    configurable = configurable or {}
     end = configurable.get(TURN_DEADLINE_KEY)
     if not isinstance(end, int | float):
         return None

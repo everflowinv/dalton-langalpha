@@ -6,7 +6,6 @@ from typing import Any
 
 import structlog
 from daytona import (
-    CodeRunParams,
     DaytonaNotFoundError,
     FileUpload,
     SessionExecuteRequest,
@@ -14,8 +13,6 @@ from daytona import (
 
 from ptc_agent.core.paths import DEFAULT_SANDBOX_ROOT
 from ptc_agent.core.sandbox.runtime import (
-    Artifact,
-    CodeRunResult,
     ExecResult,
     PreviewInfo,
     RuntimeState,
@@ -98,6 +95,10 @@ class DaytonaRuntime(SandboxRuntime):
         return urlparse(url).hostname
 
     @property
+    def image_prebuilt(self) -> bool:
+        return self.snapshot_name is not None
+
+    @property
     def working_dir(self) -> str:
         """Return cached working dir, or Daytona default if not yet fetched."""
         return self._working_dir or self._default_working_dir
@@ -150,6 +151,8 @@ class DaytonaRuntime(SandboxRuntime):
     async def delete(self) -> None:
         await self._sandbox.delete()
 
+    updates_env = True
+
     async def update_env(
         self, env: dict[str, str], *, unset: Sequence[str] = ()
     ) -> None:
@@ -169,18 +172,10 @@ class DaytonaRuntime(SandboxRuntime):
 
     # -- Execution --
 
-    async def exec(self, command: str, timeout: int = 60) -> ExecResult:
-        return await self._exec(command, timeout)
-
-    async def exec_as_root(
-        self, command: str, timeout: int = 60, env: dict[str, str] | None = None
+    async def exec(
+        self, command: str, timeout: int = 60, *, env: dict[str, str] | None = None
     ) -> ExecResult:
-        # Commands here already run as root.
-        return await self._exec(command, timeout, env)
-
-    async def _exec(
-        self, command: str, timeout: int, env: dict[str, str] | None = None
-    ) -> ExecResult:
+        # Commands here already run as root, so exec_as_root keeps the default.
         result = await self._sandbox.process.exec(command, env=env, timeout=timeout)
         # SDK exec returns an object with .result (combined stdout+stderr)
         # and .exit_code. There is no separate stderr field.
@@ -193,66 +188,6 @@ class DaytonaRuntime(SandboxRuntime):
             stdout = str(result) if result else ""
         exit_code = getattr(result, "exit_code", 0)
         return ExecResult(stdout=stdout, stderr="", exit_code=exit_code)
-
-    async def code_run(
-        self,
-        code: str,
-        env: dict[str, str] | None = None,
-        timeout: int = 300,
-    ) -> CodeRunResult:
-        params = CodeRunParams(env=env or {})
-        result = await self._sandbox.process.code_run(
-            code, params=params, timeout=timeout
-        )
-
-        # Parse stdout
-        if hasattr(result, "result"):
-            stdout = result.result or ""
-        elif hasattr(result, "stdout"):
-            stdout = result.stdout or ""
-        else:
-            stdout = ""
-
-        # Parse stderr
-        if hasattr(result, "stderr"):
-            stderr = result.stderr or ""
-        elif hasattr(result, "artifacts") and hasattr(result.artifacts, "stderr"):
-            stderr = result.artifacts.stderr or ""
-        else:
-            stderr = ""
-
-        exit_code = getattr(result, "exit_code", None)
-        if exit_code is None:
-            exit_code = 0
-
-        # Parse chart artifacts
-        artifacts: list[Artifact] = []
-        if (
-            hasattr(result, "artifacts")
-            and result.artifacts
-            and hasattr(result.artifacts, "charts")
-            and result.artifacts.charts
-        ):
-            for chart in result.artifacts.charts:
-                chart_type = (
-                    chart.type.value
-                    if hasattr(chart.type, "value")
-                    else str(chart.type)
-                )
-                artifacts.append(
-                    Artifact(
-                        type=chart_type,
-                        data=chart.png if hasattr(chart, "png") else "",
-                        name=chart.title if hasattr(chart, "title") else None,
-                    )
-                )
-
-        return CodeRunResult(
-            stdout=stdout,
-            stderr=stderr,
-            exit_code=exit_code,
-            artifacts=artifacts,
-        )
 
     # -- File I/O --
 
@@ -292,25 +227,11 @@ class DaytonaRuntime(SandboxRuntime):
     async def create_session(self, session_id: str) -> None:
         await self._sandbox.process.create_session(session_id)
 
-    async def session_execute(
-        self,
-        session_id: str,
-        command: str,
-        *,
-        run_async: bool = False,
-        timeout: int | None = None,
-    ) -> SessionCommandResult:
-        req = SessionExecuteRequest(command=command, run_async=run_async)
-        result = await self._sandbox.process.execute_session_command(
-            session_id, req, timeout=timeout
-        )
+    async def session_execute(self, session_id: str, command: str) -> str:
+        req = SessionExecuteRequest(command=command, run_async=True)
+        result = await self._sandbox.process.execute_session_command(session_id, req)
         self._remember_command(session_id, result.cmd_id)
-        return SessionCommandResult(
-            cmd_id=result.cmd_id,
-            exit_code=result.exit_code,
-            stdout=result.stdout or "",
-            stderr=result.stderr or "",
-        )
+        return result.cmd_id
 
     async def session_command_logs(
         self, session_id: str, command_id: str
@@ -417,21 +338,12 @@ class DaytonaRuntime(SandboxRuntime):
 
     # -- Capabilities & metadata --
 
-    @property
-    def capabilities(self) -> set[str]:
-        return {
-            "exec",
-            "code_run",
-            "file_io",
-            "archive",
-            "snapshot",
-            "preview_url",
-            "sessions",
-            "autostop",
-        }
+    archives = True
 
     async def archive(self) -> None:
         await self._sandbox.archive()
+
+    autostops = True
 
     async def set_autostop_interval(self, minutes: int) -> None:
         """Set the idle auto-stop interval in minutes (0 disables auto-stop)."""

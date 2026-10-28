@@ -4,7 +4,7 @@
  * pastes keep the native textarea behavior.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { render, fireEvent, screen } from '@testing-library/react';
+import { render, fireEvent, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import ChatInput from '../chat-input';
@@ -82,13 +82,14 @@ describe('ChatInput — paste pill', () => {
     expect(sent).toContain('line 40 of the pasted document');
   });
 
-  it('removing the pill drops the staged text without touching the draft', () => {
+  it('removing the pill drops the staged text without touching the draft', async () => {
     const onSend = vi.fn();
     const textarea = renderInput(onSend);
     fireEvent.change(textarea, { target: { value: 'summarize @ noon' } });
     paste(textarea, LONG_TEXT);
     fireEvent.click(screen.getByTitle('Remove'));
-    expect(screen.queryByText(/Pasted text ·/)).toBeNull();
+    // The pill fades out before it unmounts.
+    await waitFor(() => expect(screen.queryByText(/Pasted text ·/)).toBeNull());
     // A pathless pill must not run the @path scrub — the draft (including the
     // standalone "@") stays exactly as typed.
     expect(textarea.value).toBe('summarize @ noon');

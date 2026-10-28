@@ -639,7 +639,7 @@ test.describe('Portfolio CRUD', () => {
 // ---------------------------------------------------------------------------
 
 test.describe('Personalization', () => {
-  test('personalization banner appears when onboarding incomplete', async ({ page }) => {
+  test('the welcome banner appears until an investing profile is saved', async ({ page }) => {
     // Do NOT suppress personalization for this test -- override beforeEach
     await page.addInitScript(() => {
       localStorage.removeItem('langalpha-onboarding-ignored-at');
@@ -659,21 +659,19 @@ test.describe('Personalization', () => {
 
     await page.goto('/dashboard');
 
-    // Personalization banner should appear
-    await expect(
-      page.locator('text=Personalize your experience'),
-    ).toBeVisible();
+    // The banner offering the welcome flow should appear
+    const banner = page.getByTestId('welcome-banner');
+    await expect(banner.getByText('Set up your investing profile')).toBeVisible();
+    await expect(banner.getByRole('button', { name: 'Set up' })).toBeVisible();
 
     // Dismiss button present (X icon with aria-label)
-    const dismissBtn = page.getByRole('button', { name: 'Close' });
+    const dismissBtn = banner.getByRole('button', { name: 'Close' });
     await expect(dismissBtn).toBeVisible();
 
     // Click dismiss to close the banner
     await dismissBtn.click();
 
     // Banner should disappear
-    await expect(
-      page.locator('text=Personalize your experience'),
-    ).not.toBeVisible();
+    await expect(banner).not.toBeVisible();
   });
 });

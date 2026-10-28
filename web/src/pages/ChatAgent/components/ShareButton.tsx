@@ -3,8 +3,11 @@ import { Share2, Copy, Check, Link2, Lock, FileText } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
 import { toast } from '@/components/ui/use-toast';
+import { copyText } from '@/lib/clipboard';
+import { cn } from '@/lib/utils';
 import { shortMonthDay } from '@/lib/format';
 import { useCopyShareLink } from '@/hooks/useCopyShareLink';
+import { useIsMobile } from '@/hooks/useIsMobile';
 import { useLocale } from '@/hooks/useLocale';
 import { useSharedLinks, useShareLinkMutations } from '@/hooks/useShareLink';
 import { getThreadShareStatus, updateThreadSharing } from '../utils/api';
@@ -100,6 +103,7 @@ function SharedInWorkspace({ workspaceId }: { workspaceId: string }) {
  */
 export default function ShareButton({ threadId, initialIsShared = false, workspaceId = null }: ShareButtonProps) {
   const { t } = useTranslation();
+  const isMobile = useIsMobile();
   const [open, setOpen] = useState(false);
   const [loading, setLoading] = useState(false);
   const [shareState, setShareState] = useState<ThreadShareStatus | null>(null);
@@ -162,7 +166,7 @@ export default function ShareButton({ threadId, initialIsShared = false, workspa
   const handleCopy = useCallback(() => {
     if (!shareState?.share_url) return;
     const fullUrl = `${window.location.origin}${shareState.share_url}`;
-    navigator.clipboard.writeText(fullUrl).then(() => {
+    copyText(fullUrl).then(() => {
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
     });
@@ -176,9 +180,11 @@ export default function ShareButton({ threadId, initialIsShared = false, workspa
   return (
     <Popover open={open} onOpenChange={setOpen}>
       <PopoverTrigger asChild>
+        {/* Sized as the files toggle beside it is: the panel's own button
+            size on desktop, a touch target on mobile. */}
         <button
           type="button"
-          className="p-2 rounded-md transition-colors"
+          className={cn('transition-colors', isMobile ? 'p-2 rounded-md' : 'p-1.5 rounded-[4px]')}
           style={{
             color: isShared ? 'var(--color-accent-primary)' : 'var(--color-text-primary)',
             backgroundColor: open ? 'var(--color-border-muted)' : undefined,
@@ -187,7 +193,7 @@ export default function ShareButton({ threadId, initialIsShared = false, workspa
           onMouseEnter={(e) => { if (!open) e.currentTarget.style.backgroundColor = 'var(--color-border-muted)'; }}
           onMouseLeave={(e) => { if (!open) e.currentTarget.style.backgroundColor = ''; }}
         >
-          <Share2 className="h-5 w-5" />
+          <Share2 className={isMobile ? 'h-5 w-5' : 'h-4 w-4'} />
         </button>
       </PopoverTrigger>
 
@@ -222,14 +228,14 @@ export default function ShareButton({ threadId, initialIsShared = false, workspa
               <button
                 onClick={() => handleToggleShare(!isShared)}
                 disabled={updating}
-                className="relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200"
+                className="relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors"
                 style={{
                   backgroundColor: isShared ? 'var(--color-accent-primary)' : 'var(--color-border-muted)',
                   opacity: updating ? 0.6 : 1,
                 }}
               >
                 <span
-                  className="pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow-sm ring-0 transition duration-200"
+                  className="pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow-sm ring-0 transition"
                   style={{ transform: isShared ? 'translateX(16px)' : 'translateX(0)' }}
                 />
               </button>

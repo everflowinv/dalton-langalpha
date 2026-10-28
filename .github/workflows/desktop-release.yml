@@ -112,8 +112,19 @@ jobs:
           VERSION: ${{ inputs.version }}
         run: pnpm version "$VERSION" --no-git-tag-version --allow-same-version
 
+      # Remote control's helper, which scripts/build.mjs puts inside the Mac app
+      # and electron-builder signs with it. DESKTOP_REQUIRE_HELPER below makes
+      # its absence fail the build rather than ship the app without it.
+      - name: Build the remote control helper
+        if: runner.os == 'macOS'
+        working-directory: helper
+        run: |
+          rustup toolchain install
+          scripts/build-macos.sh
+
       - name: Build
         env:
+          DESKTOP_REQUIRE_HELPER: ${{ runner.os == 'macOS' && '1' || '' }}
           # electron-builder picks these up automatically. Absent, it produces an
           # unsigned build and says so, which is the current state.
           CSC_LINK: ${{ secrets.MAC_CSC_LINK }}

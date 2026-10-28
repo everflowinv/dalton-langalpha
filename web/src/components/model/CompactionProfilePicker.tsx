@@ -10,8 +10,8 @@ import type {
 /**
  * The account-wide compaction preset, as cards carrying their real numbers.
  *
- * Bundles token_threshold and keep_messages. The numbers are the only way to
- * tell the presets apart, so they are printed rather than described.
+ * Each sets the context size that triggers a summary. The number is the only
+ * way to tell the presets apart, so it is printed rather than described.
  */
 export function CompactionProfilePicker({
   value,
@@ -90,7 +90,6 @@ export function CompactionProfilePicker({
               >
                 {t("settings.compactionProfilePreset", {
                   tokens: Math.round(preset.token_threshold / 1000),
-                  keep: preset.keep_messages,
                 })}
               </span>
             </button>

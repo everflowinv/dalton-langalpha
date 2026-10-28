@@ -20,6 +20,38 @@ from src.tools.web.inhouse.extractors.twitter import TwitterExtractor, _parse_tw
 from src.tools.web.inhouse.extractors.youtube import YouTubeExtractor, _parse_video_id
 
 
+# DALTON-HOOK(heavy-compute-isolation) test seam: the PDF parse runs in a
+# killable subprocess; unit tests double run_in_heavy_subprocess inline and
+# dispatch on the parse function it was handed, with the runner's real error
+# semantics (child exceptions arrive as HeavyComputeError).
+def _pdf_runner_double(primary=None, primary_error=None, fallback=None, fallback_error=None, timeout=False):
+    from unittest.mock import create_autospec
+    from src.dalton.heavy_compute import (
+        HeavyComputeError,
+        HeavyComputeTimeout,
+        run_in_heavy_subprocess,
+    )
+    from mcp_servers._pdf_parse import pdfplumber_extract, pypdf_extract
+
+    async def _fake(fn, /, *args, timeout_s=None, deadline=None, label="", **kwargs):
+        if timeout:
+            raise HeavyComputeTimeout(label or "pdf", timeout_s or 0.0)
+        error = None
+        if fn is pdfplumber_extract:
+            result, error = primary, primary_error
+        elif fn is pypdf_extract:
+            result, error = fallback, fallback_error
+        else:
+            raise AssertionError(f"unexpected fn {fn!r}")
+        if error is not None:
+            raise HeavyComputeError(
+                label or "pdf", type(error).__name__, str(error), ""
+            ) from error
+        return result if result is not None else ""
+
+    return create_autospec(run_in_heavy_subprocess, side_effect=_fake)
+
+
 # ---------------------------------------------------------------------------
 # PDF extractor — URL pattern matching
 # ---------------------------------------------------------------------------
@@ -270,8 +302,9 @@ class TestPdfExtract:
 
         with patch.object(
             self.extractor._client, "stream", side_effect=lambda *a, **kw: _async_cm(mock_response)
-        ), patch.object(
-            PdfExtractor, "_pdfplumber_extract", return_value="Page 1 text content"
+        ), patch(  # DALTON-HOOK(heavy-compute-isolation): parse runs in a killable subprocess
+            "src.tools.web.inhouse.extractors.pdf.run_in_heavy_subprocess",
+            _pdf_runner_double(primary="Page 1 text content"),
         ):
             result = await self.extractor.extract("https://example.com/report.pdf")
 
@@ -346,10 +379,11 @@ class TestPdfExtract:
 
         with patch.object(
             self.extractor._client, "stream", side_effect=lambda *a, **kw: _async_cm(mock_response)
-        ), patch.object(
-            PdfExtractor, "_pdfplumber_extract", side_effect=RuntimeError("corrupt PDF")
-        ), patch.object(
-            PdfExtractor, "_pypdf_extract", return_value="Fallback text"
+        ), patch(  # DALTON-HOOK(heavy-compute-isolation)
+            "src.tools.web.inhouse.extractors.pdf.run_in_heavy_subprocess",
+            _pdf_runner_double(
+                primary_error=RuntimeError("corrupt PDF"), fallback="Fallback text"
+            ),
         ):
             result = await self.extractor.extract("https://example.com/report.pdf")
 
@@ -376,14 +410,41 @@ class TestPdfExtract:
 
         with patch.object(
             self.extractor._client, "stream", side_effect=lambda *a, **kw: _async_cm(mock_response)
-        ), patch.object(
-            PdfExtractor, "_pdfplumber_extract", side_effect=RuntimeError("parse error")
-        ), patch.object(
-            PdfExtractor, "_pypdf_extract", side_effect=RuntimeError("fallback error")
+        ), patch(  # DALTON-HOOK(heavy-compute-isolation)
+            "src.tools.web.inhouse.extractors.pdf.run_in_heavy_subprocess",
+            _pdf_runner_double(
+                primary_error=RuntimeError("parse error"),
+                fallback_error=RuntimeError("fallback error"),
+            ),
         ):
             result = await self.extractor.extract("https://example.com/report.pdf")
 
         assert result is None
+
+    @pytest.mark.asyncio
+    async def test_both_parsers_killed_at_budget_report_failure(self):
+        """Both parses terminated at the deadline: _extract_text says so via
+        PdfParseTimeout, and extract_bytes answers with the timeout wording —
+        never the scanned-PDF guess, and extract() (not None) keeps the bytes
+        away from the plain-web crawler."""
+        from src.tools.web.inhouse.extractors.pdf import (
+            PdfParseTimeout,
+            _PDF_PARSE_TIMEOUT_MESSAGE,
+        )
+
+        with patch(  # DALTON-HOOK(heavy-compute-isolation)
+            "src.tools.web.inhouse.extractors.pdf.run_in_heavy_subprocess",
+            _pdf_runner_double(timeout=True),
+        ):
+            with pytest.raises(PdfParseTimeout):
+                await PdfExtractor()._extract_text(b"%PDF-pathological")
+
+            out = await PdfExtractor().extract_bytes(
+                b"%PDF-pathological", url="https://example.com/huge.pdf"
+            )
+        assert isinstance(out, CrawlOutput)
+        assert out.markdown == _PDF_PARSE_TIMEOUT_MESSAGE
+        assert "扫描件" not in out.markdown
 
     @pytest.mark.asyncio
     async def test_network_error(self):

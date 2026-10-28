@@ -260,10 +260,11 @@ async def discover_user_mcp_schemas(
 
 
 # Runs the discovery CLI as the leader of a session of its own, so everything
-# the server's command spawned (npx's node, uvx's python) shares one process
-# group that is stopped as a whole once the listing is in or the budget is
-# spent. A server that keeps running after its stdin closes would otherwise
-# outlive the check. Its last line says how the client ended, which is all a
+# the server's command spawned (npx's node, uvx's python) stays in that session
+# and is stopped as a whole once the listing is in or the budget is spent. A
+# server that keeps running after its stdin closes would otherwise outlive the
+# check. The session, not the process group: the client gives each server a
+# group of its own. Its last line says how the client ended, which is all a
 # missing result file cannot.
 _CHECK_LEADER = """\
 import os, signal, subprocess, sys, time
@@ -276,12 +277,30 @@ try:
     rc = str(child.wait(timeout=budget))
 except subprocess.TimeoutExpired:
     rc = "timeout"
-for sig in (signal.SIGTERM, signal.SIGKILL):
+def members():
     try:
-        os.killpg(child.pid, sig)
+        pids = [int(p) for p in os.listdir("/proc") if p.isdigit()]
     except OSError:
-        break
-    time.sleep(0.5)
+        ps = subprocess.run(["ps", "-A", "-o", "pid="], capture_output=True, text=True)
+        pids = [int(p) for p in ps.stdout.split()]
+    found = []
+    for pid in pids:
+        try:
+            if pid != child.pid and os.getsid(pid) == child.pid:
+                found.append(pid)
+        except OSError:
+            pass
+    return found
+for sig in (signal.SIGTERM, signal.SIGKILL):
+    child.send_signal(sig)
+    found = members()
+    for pid in found:
+        try:
+            os.kill(pid, sig)
+        except OSError:
+            pass
+    if found or child.poll() is None:
+        time.sleep(0.5)
 child.wait()
 print("MCP_CHECK_RC=" + rc, flush=True)
 """
@@ -332,7 +351,7 @@ async def check_user_mcp_server(
     assert sandbox.runtime is not None
     work_dir = sandbox._work_dir
     layout = SandboxLayout(work_dir)
-    stem = f"{SandboxLayout.INTERNAL_DIR}/.mcp_check_{uuid.uuid4().hex}"
+    stem = f"{SandboxLayout.MCP_CHECK_PREFIX}{uuid.uuid4().hex}"
     vault_rel = f"{stem}.vault.json"
     client_path = layout.join(f"{stem}.py")
     vault_path = layout.join(vault_rel)
@@ -424,7 +443,9 @@ async def _remove_check_files(sandbox: "PTCSandbox", paths: tuple[str, ...]) -> 
         logger.warning("MCP command check cleanup failed", error=str(e))
 
 
-async def _start_internal_mcp_servers(sandbox: "PTCSandbox") -> bool | None:
+async def _start_internal_mcp_servers(
+    sandbox: "PTCSandbox", *, replace: bool = False
+) -> bool | None:
     """Start the computer's MCP supervisor, if it is not already listening.
 
     One daemon per computer owns every sandbox-side MCP server process, so a
@@ -440,6 +461,10 @@ async def _start_internal_mcp_servers(sandbox: "PTCSandbox") -> bool | None:
     Answers whether the file mount answered at its path (None: the exec
     failed). A reconnect runs this exec anyway, and a mount gone with a boot
     or a dead daemon meets no command that would say so.
+
+    ``replace`` first retires a running daemon, for a computer whose env
+    changed under it: the daemon and its servers keep the env they started
+    with.
     """
     assert sandbox.runtime is not None
     work_dir = sandbox._work_dir
@@ -448,13 +473,19 @@ async def _start_internal_mcp_servers(sandbox: "PTCSandbox") -> bool | None:
     log_path = f"{work_dir}/{supervisor_protocol.LOG_REL_PATH}"
     src_root = layout.internal_src
     quoted_socket = shlex.quote(socket_path)
+    # A machine that never mounts has no mount to lose, so it is not asked.
+    probe = sandbox.mounts_livefs
+    pythonpath = f"PYTHONPATH={shlex.quote(src_root)}"
+    daemon = f"python3 -m {supervisor_protocol.PACKAGE_NAME} {shlex.quote(work_dir)}"
+    to_log = f">> {shlex.quote(log_path)} 2>&1"
     command = (
-        f"{livefs_mount.PROBE} ; "
-        f"mkdir -p {shlex.quote(posixpath.dirname(socket_path))} && "
+        (f"{livefs_mount.PROBE} ; " if probe else "")
+        + f"mkdir -p {shlex.quote(posixpath.dirname(socket_path))} && "
         f"cd {shlex.quote(src_root)} && "
-        f"{{ PYTHONPATH={shlex.quote(src_root)} "
-        f"nohup python3 -m {supervisor_protocol.PACKAGE_NAME} "
-        f"{shlex.quote(work_dir)} >> {shlex.quote(log_path)} 2>&1 < /dev/null & }} ; "
+        # A daemon that would not retire leaves this start the loser of the
+        # lock, which is no worse than not replacing it.
+        + (f"{{ {pythonpath} {daemon} --retire {to_log} || true ; }} && " if replace else "")
+        + f"{{ {pythonpath} nohup {daemon} {to_log} < /dev/null & }} ; "
         # Poll rather than sleep a fixed amount: a warm start binds in
         # milliseconds and only a genuinely failing one pays the full wait.
         f"for _ in $(seq 30); do [ -S {quoted_socket} ] && break; sleep 0.1; done; "
@@ -472,7 +503,9 @@ async def _start_internal_mcp_servers(sandbox: "PTCSandbox") -> bool | None:
     except Exception as e:  # noqa: BLE001 - the client's fallback covers this
         logger.warning("MCP supervisor start failed", error=str(e))
         return None
-    mount_answers = livefs_mount.answered(getattr(result, "stdout", None))
+    mount_answers = (
+        livefs_mount.answered(getattr(result, "stdout", None)) if probe else None
+    )
     exit_code = getattr(result, "exit_code", 0)
     if exit_code:
         logger.warning(
@@ -585,62 +618,45 @@ async def _filter_local_packages(
     return remaining
 
 
-def _detect_missing_imports(sandbox: "PTCSandbox", stderr: str) -> list[str]:
-    """Extract missing module names from the executed script's own traceback.
+def missing_import(raised: str | None) -> str | None:
+    """The base package of the module a code run failed to import, read
+    from its own ``RAISED_FILE`` record; None when it names none.
 
-        Args:
-            stderr: Standard error output from code execution
+    Whatever comes out of here is handed to `uv pip install` in the sandbox.
+    The record holds only the ``name`` the import machinery set on the run's
+    own ``ModuleNotFoundError`` (the shipped sitecustomize writes nothing
+    else), so no text the run printed or an exception carried (a third-party
+    MCP server's error message, a fetched page) can name a package: that
+    would be a dependency-confusion install whose sdist build runs code. The
+    name must still be a whole dotted module path, so nothing but one
+    reaches the shell.
+    """
+    name = (raised or "").strip()
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.]*", name):
+        return None
+    package = name.split(".")[0]
+    logger.info("Detected missing imports", packages=[package])
+    return package
 
-        Returns:
-            List of missing package names (base package only, e.g., 'foo' from 'foo.bar')
-        """
-    import re
 
-    # Whatever comes out of here is handed to `uv pip install` in the sandbox,
-    # so the input is trusted as narrowly as possible against two attacks:
-    #
-    # 1. Shell injection — the capture is a real dotted module path, never
-    #    "anything between the quotes". A name with a space or ``;`` fails to
-    #    match at all (and could never name an installable package anyway).
-    # 2. Dependency confusion — a third-party MCP server spawned during the run
-    #    shares this stderr stream and could inject a fake
-    #    "ModuleNotFoundError: No module named 'evil'" to make us install an
-    #    attacker-registered package (whose sdist build runs code). So only the
-    #    executed script's OWN unhandled exception is trusted: the FINAL
-    #    traceback block of stderr, and only when it carries a genuine frame
-    #    line. A server's mid-stream text, or a preceding block, is ignored.
-    marker = "Traceback (most recent call last):"
-    start = stderr.rfind(marker)
-    if start == -1:
-        return []
-    final_tb = stderr[start:]
-    if '\n  File "' not in final_tb:
-        # No real frame → not a Python interpreter traceback; don't trust it.
-        return []
+#: Import names whose PyPI package is spelled differently, so an auto-install
+#: of the bare name either fails (`pip install fitz` ships the wrong wheel or
+#: nothing usable) or grabs a squatter package. Applied *after* the local
+#: module filter, so a workspace's own `fitz.py` still wins and is never
+#: pip-installed over. -- DALTON-HOOK(sandbox-pip-system)
+IMPORT_NAME_TO_PACKAGE: dict[str, str] = {
+    "fitz": "pymupdf",
+    "cv2": "opencv-python-headless",
+    "PIL": "pillow",
+    "yaml": "pyyaml",
+    "sklearn": "scikit-learn",
+    "bs4": "beautifulsoup4",
+}
 
-    patterns = [
-        r"ModuleNotFoundError: No module named ['\"]([A-Za-z_][A-Za-z0-9_.]*)['\"]",
-        r"ImportError: No module named ['\"]([A-Za-z_][A-Za-z0-9_.]*)['\"]",
-    ]
 
-    matches = []
-    for pattern in patterns:
-        matches.extend(re.findall(pattern, final_tb))
-
-    # Handle submodule imports (e.g., "foo.bar" -> "foo")
-    # DALTON-HOOK(sandbox-pip-system): also deduplicate and filter known workspace/layout folder names
-    known_local = _known_local_names(sandbox) if sandbox is not None else set()
-    base_packages = [
-        pkg for pkg in {m.split(".")[0] for m in matches} if pkg not in known_local
-    ]
-
-    if base_packages:
-        logger.info(
-            "Detected missing imports",
-            packages=base_packages,
-        )
-
-    return base_packages
+def pip_package_for_import(name: str) -> str:
+    """The PyPI package to install for an import *name* that survived the local filter."""
+    return IMPORT_NAME_TO_PACKAGE.get(name, name)
 
 
 async def _install_package(sandbox: "PTCSandbox", package: str) -> bool:
@@ -659,7 +675,7 @@ async def _install_package(sandbox: "PTCSandbox", package: str) -> bool:
             sandbox.runtime.exec,
             # Quoted at the sink as well as filtered at the parser: this is the
             # only place a caller-supplied name becomes shell text, so it should
-            # be safe for callers that don't come through _detect_missing_imports.
+            # be safe for callers that don't come through missing_import.
             # DALTON-HOOK(sandbox-pip-system): pass --system to uv pip install.
             f"uv pip install --system -q {shlex.quote(package)}",
             retry_policy=RetryPolicy.SAFE,

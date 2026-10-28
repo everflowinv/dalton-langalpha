@@ -2,15 +2,14 @@
 
 A workflow run driver dispatches children with ``owner_task_id`` set to the
 run task's id. Those children are billed and awaited by the driver, so they
-must NOT surface to the main turn: no completion notification, not waited by
-``wait_for_all``, and hidden from the aggregate ``TaskOutput()`` view. The run
-task itself (``subagent_type="workflow"``, ``owner_task_id is None``) stays fully
-visible on every one of those surfaces.
+must NOT surface to the main turn: no completion notification, and not waited
+by ``wait_for_all``. The run task itself (``subagent_type="workflow"``,
+``owner_task_id is None``) stays fully visible on both of those surfaces.
 
 Covers:
 - ``BackgroundSubagentOrchestrator.check_and_get_notification`` owner fence.
 - ``BackgroundTaskRegistry.wait_for_all`` owner fence.
-- ``create_task_output_tool`` all-tasks view owner fence (+ drill-in escape).
+- ``create_task_output_tool`` drill-in on an owned child by its id.
 """
 
 from __future__ import annotations
@@ -214,41 +213,14 @@ class TestWaitForAllOwnerFence:
 
 
 # ---------------------------------------------------------------------------
-# 3. TaskOutput all-tasks view — owner fence
+# 3. TaskOutput drill-in on a workflow's own child
 # ---------------------------------------------------------------------------
 
 
-class TestTaskOutputAllTasksOwnerFence:
-    @pytest.mark.asyncio
-    async def test_all_tasks_view_hides_owned_shows_run(self):
-        registry = BackgroundTaskRegistry()
-        run = await _register_completed(
-            registry,
-            tool_call_id="wfrun-1",
-            subagent_type="workflow",
-            result={"success": True, "result": "RUN_SUMMARY"},
-        )
-        owned = await _register_completed(
-            registry,
-            tool_call_id="child-1",
-            owner_task_id=run.task_id,
-            result={"success": True, "result": "CHILD_OUTPUT"},
-        )
-        tool = _make_output_tool(registry)
-
-        output, _ = await tool.coroutine(task_id=None)
-
-        assert run.display_id in output
-        assert "RUN_SUMMARY" in output
-        assert owned.display_id not in output
-        assert "CHILD_OUTPUT" not in output
-        # Aggregate view counts only the non-owned run task.
-        assert "1 total" in output
-
+class TestTaskOutputOwnedChild:
     @pytest.mark.asyncio
     async def test_owned_child_still_addressable_by_task_id(self):
-        """The aggregate view hides owned children, but the drill-in escape
-        hatch (TaskOutput(task_id=...)) still resolves them individually."""
+        """A workflow's own child is still read by its id."""
         registry = BackgroundTaskRegistry()
         run = await _register_completed(
             registry,
@@ -266,19 +238,3 @@ class TestTaskOutputAllTasksOwnerFence:
         output, _ = await tool.coroutine(task_id=owned.task_id)
         assert owned.display_id in output
         assert "CHILD_OUTPUT" in output
-
-    @pytest.mark.asyncio
-    async def test_all_tasks_view_empty_when_only_owned_children(self):
-        """With only owned children registered, the aggregate view reports
-        nothing assigned — the driver owns them, the turn sees none."""
-        registry = BackgroundTaskRegistry()
-        await _register_completed(
-            registry, tool_call_id="child-1", owner_task_id="wf-1"
-        )
-        await _register_completed(
-            registry, tool_call_id="child-2", owner_task_id="wf-1"
-        )
-        tool = _make_output_tool(registry)
-
-        output, _ = await tool.coroutine(task_id=None)
-        assert output == "No background tasks have been assigned yet."

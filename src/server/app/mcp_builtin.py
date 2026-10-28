@@ -123,9 +123,9 @@ async def get_builtin_server_tools(name: str, user_id: CurrentUserId) -> dict:
     user and is already in memory here.
 
     ``connected`` is the field that keeps this honest. A server whose startup
-    connect failed is dropped from the registry and never retried, because the
-    snapshot is frozen for the life of the process, so this worker has no
-    answer for it while its siblings answer normally. Reporting that as an
+    connect failed is dropped from the registry, and only a remote one is
+    retried, in the background, so until it reconnects this worker has no
+    answer for it while its siblings may answer normally. Reporting that as an
     empty tool list would state as fact something only this process believes;
     the caller is told the difference and says so.
     """

@@ -16,9 +16,11 @@
  *     quiet way to ship a build that can never update itself.
  */
 import { spawn, spawnSync } from 'node:child_process'
-import { existsSync, lstatSync, readdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs'
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { helperProblem, macHelperConfigLines } from './helper-bundle.mjs'
+import { HELPER_BINARY, launchAgentPlist } from './launch-agent.mjs'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const root = path.join(here, '..')
@@ -228,6 +230,39 @@ if (!outputDir.includes(edition)) {
 }
 const dist = path.resolve(root, outputDir)
 console.log(`[build] output: ${path.relative(root, dist)}`)
+
+// Remote control of this Mac. The helper is a Rust binary built outside this
+// directory, by helper/scripts/build-macos.sh, and a mac build without it is
+// still a whole app: one that reports remote control as unsupported. So its
+// absence is a notice rather than a failure, except where DESKTOP_REQUIRE_HELPER
+// says this is a build that ships it, which is the release pipeline's job to say.
+// Only a Mac packages a Mac, so the platform is the whole gate, as it is for
+// notarization; another target ignores the `mac:` block this fills.
+//
+// The label is the agent's launchd label and its plist's stem. launchd keeps one
+// job per label, so it follows the bundle id and the two editions never share one.
+if (process.platform === 'darwin') {
+  const helperLabel = `${identity.appId}.helper`
+  const source = path.resolve(root, '..', 'helper', 'target', 'universal-apple-darwin', 'release', HELPER_BINARY)
+  const problem = helperProblem(source)
+  if (problem && env('DESKTOP_REQUIRE_HELPER') === '1') {
+    console.error(`[build] DESKTOP_REQUIRE_HELPER is set, but ${problem}`)
+    process.exit(1)
+  }
+  if (problem) {
+    console.warn(`[build] NOTICE: this build leaves remote control out: ${problem}.`)
+    console.warn('[build] Build the helper with helper/scripts/build-macos.sh, or set DESKTOP_REQUIRE_HELPER=1 to make this an error.')
+  } else {
+    // In this edition's own output tree, which is already ignored and already
+    // per edition, so it is never a file to commit or one the other edition reads.
+    const plist = path.join(dist, 'launch-agent', `${helperLabel}.plist`)
+    mkdirSync(path.dirname(plist), { recursive: true })
+    writeFileSync(plist, launchAgentPlist({ label: helperLabel, productName: identity.productName }))
+    const signer = path.join(here, 'sign-mac.mjs')
+    replace(/^mac:\r?$/m, () => macHelperConfigLines({ label: helperLabel, source, plist, signer }).join('\n'), 'mac:')
+    console.log(`[build] remote control: ${path.relative(root, source)} as ${helperLabel}`)
+  }
+}
 
 writeFileSync(RESOLVED, config)
 args.push('--config', path.basename(RESOLVED))

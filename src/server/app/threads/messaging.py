@@ -27,9 +27,15 @@ from src.server.database.conversation import (
     lookup_thread_by_external_id,
     get_replay_thread_data,
 )
+from src.server.contracts.run_times import run_completed_at
+from src.server.contracts.status import to_public
+from src.server.contracts.turn_kinds import ANNOUNCED_KEYS
 from src.server.database.pool import DATABASE_UNAVAILABLE
 from src.server.services.report_back.handoff.keys import ORIGIN_THREAD_META
-from src.server.dependencies.usage_limits import ChatRateLimited
+from src.server.dependencies.usage_limits import (
+    ChatRateLimited,
+    quota_service_unavailable,
+)
 
 from src.observability import (
     observe_background_chat_turn,
@@ -231,14 +237,14 @@ def _is_service_request(raw_request: Request | None) -> bool:
 
 
 # Fields only the server's own requests set. A user's copy would post a system
-# message, label their message as a report-back, forge a report-back watch's
-# cleanup, or settle a parked steer as its own turn; ``surface_rules`` is a
-# channel gateway's, whose text rides the operator role on providers with a
-# native channel.
+# message, label their message as a report-back or a wakeup (whose turn may end
+# without a reply), forge a report-back watch's cleanup, or settle a parked
+# steer as its own turn; ``surface_rules`` is a channel gateway's, whose text
+# rides the operator role on providers with a native channel.
 _SERVER_ONLY_FIELDS = (
     "query_type",
+    *ANNOUNCED_KEYS,
     "report_back_ptc_thread_id",
-    "report_source",
     ORIGIN_THREAD_META,
     "origin_dispatch_gen",
     "automation_delivery",
@@ -406,8 +412,13 @@ async def _handle_send_message(
 
         # 403 guard: require BYOK, OAuth, or platform access (tier >= 0).
         # All flags are pre-checked by enforce_chat_limit — no DB calls here.
+        # A tier nobody could read is an outage, not a missing provider: telling
+        # a paying user to set one up sends them to the setup wizard for it.
         from src.config.settings import HOST_MODE
-        if HOST_MODE == "platform" and not auth.is_byok and not auth.has_oauth and auth.access_tier < 0:
+        needs_plan = HOST_MODE == "platform" and not auth.is_byok and not auth.has_oauth
+        if needs_plan and auth.access_tier is None:
+            raise quota_service_unavailable()
+        if needs_plan and auth.access_tier < 0:
             raise HTTPException(
                 status_code=403,
                 detail={
@@ -446,22 +457,40 @@ async def _handle_send_message(
         # gives the workspace when the request names none, and the thread's model.
         thread_meta = await get_thread_auth_meta(thread_id) if thread_id else None
         owner_id = thread_meta["user_id"] if thread_meta else None
+        workspace_owner_id_meta = (
+            thread_meta.get("workspace_owner_id") if thread_meta else None
+        )
         if owner_id is not None and owner_id != user_id:
             # --- DALTON-HOOK(workspace-sharing-settings): begin ---
-            from src.dalton.settings import is_dalton_supabase_auth_enabled
+            # DALTON-HOOK(colleague-dispatch): enforce thread write access and colleague_dispatch feature flag.
+            from src.dalton.settings import (
+                is_colleague_dispatch_enabled,
+                is_dalton_supabase_auth_enabled,
+            )
 
             if is_dalton_supabase_auth_enabled():
                 from src.dalton.sharing import require_thread_access
 
+                if not is_colleague_dispatch_enabled():
+                    await require_thread_access(
+                        thread_id,
+                        user_id,
+                        channel="web",
+                        need="read",
+                        owner_id=str(owner_id),
+                        workspace_owner_id=workspace_owner_id_meta,
+                        workspace_id=thread_meta.get("workspace_id"),
+                    )
+                    raise HTTPException(status_code=403, detail="该功能尚未开放")
                 await require_thread_access(
                     thread_id,
                     user_id,
                     channel="web",
-                    need="read",
+                    need="write",
                     owner_id=str(owner_id),
+                    workspace_owner_id=workspace_owner_id_meta,
                     workspace_id=thread_meta.get("workspace_id"),
                 )
-                raise HTTPException(status_code=403, detail="该功能下一期开放")
             # --- DALTON-HOOK(workspace-sharing-settings): end ---
             raise HTTPException(status_code=403, detail="Forbidden")
 
@@ -472,9 +501,16 @@ async def _handle_send_message(
         # the branch tip it was read off for START to hold it to.
         request = await _settle_against_branch(thread_id, request, user_id)
 
-        # Resolve workspace_id from thread if not provided
-        if not workspace_id and thread_meta:
-            workspace_id = str(thread_meta["workspace_id"])
+        # Resolve workspace_id from thread if not provided; reject mismatched workspace_id on existing thread
+        # DALTON-HOOK(colleague-dispatch): enforce thread_meta["workspace_id"] as ground truth on existing threads
+        if thread_meta and thread_meta.get("workspace_id"):
+            thread_ws_id = str(thread_meta["workspace_id"])
+            if workspace_id and str(workspace_id) != thread_ws_id:
+                raise HTTPException(
+                    status_code=400,
+                    detail="workspace_id does not match thread's workspace",
+                )
+            workspace_id = thread_ws_id
             logger.debug(
                 f"[CHAT] Resolved workspace_id={workspace_id} from thread_id={thread_id}"
             )
@@ -486,12 +522,66 @@ async def _handle_send_message(
                 detail="PTC Agent not initialized. Check server startup logs.",
             )
 
+        # DALTON-HOOK(colleague-dispatch): resolve origin channel & server-verified tail turn for colleague threads.
+        is_existing_colleague_thread = bool(
+            thread_meta
+            and workspace_owner_id_meta
+            and str(workspace_owner_id_meta) != str(user_id)
+        )
+        origin_channel = "web"
+        is_tail_turn = False
         # A turn naming Home's id, or any turn on a thread in Home, runs in
         # Home. The workspace guard comes first: it pairs with the thread
         # guard above. Home is bound once the admission gates below pass.
-        workspace = await requested_workspace(user_id, workspace_id)
+        # DALTON-HOOK(colleague-dispatch): map ColleagueAccessRevokedError to 403 and cancel interrupted HITL workflow
+        from src.dalton.sharing import (
+            ColleagueAccessRevokedError,
+            extract_wakeup_notice_ids,
+            resolve_colleague_turn_admission,
+        )
+
+        try:
+            workspace, origin_channel, is_tail_turn = (
+                await resolve_colleague_turn_admission(
+                    user_id=user_id,
+                    workspace_id=workspace_id,
+                    thread_id=thread_id,
+                    request=request,
+                    thread_meta=thread_meta,
+                    is_existing_colleague_thread=is_existing_colleague_thread,
+                    is_internal=is_internal,
+                    is_dispatch=is_dispatch,
+                    requested_workspace_fn=requested_workspace,
+                )
+            )
+        except ColleagueAccessRevokedError as e:
+            if request.hitl_response and thread_id:
+                try:
+                    from src.server.services.cancel_dispatch import cancel_workflow
+
+                    await cancel_workflow(thread_id)
+                except Exception:
+                    logger.debug(
+                        "Failed to cancel interrupted thread after access revocation",
+                        exc_info=True,
+                    )
+            raise HTTPException(
+                status_code=403,
+                detail={"code": e.code, "message": e.message},
+            ) from e
         route = turn_route(user_id, workspace)
         workspace_id = route.workspace_id
+        # DALTON-HOOK(colleague-dispatch): determine workspace owner ws_owner_id and is_colleague_turn
+        ws_owner_id = (
+            str(workspace.get("user_id"))
+            if workspace is not None and workspace.get("user_id")
+            else (
+                str(workspace_owner_id_meta)
+                if workspace_owner_id_meta
+                else user_id
+            )
+        )
+        is_colleague_turn = ws_owner_id != str(user_id)
 
         # Extract user input
         user_input = ""
@@ -513,7 +603,7 @@ async def _handle_send_message(
 
         # Resolve LLM config eagerly — credit check must happen before SSE stream starts
         from src.server.services.llm import thread_model
-        from src.server.services.llm.config import resolve_llm_config
+        from src.server.services.thread_agent import thread_resolver
         from src.server.dependencies.usage_limits import enforce_credit_limit
         from ptc_agent.config.agent import CredentialSource
 
@@ -528,19 +618,18 @@ async def _handle_send_message(
             else None
         )
 
-        async def resolve(model: str | None):
-            return await resolve_llm_config(
-                setup.agent_config,
-                user_id,
-                model,
-                is_byok,
-                reasoning_effort=getattr(request, "reasoning_effort", None),
-                fast_mode=getattr(request, "fast_mode", None),
-                thread_id=thread_id,
-                enabled_subagents=request.subagents_enabled,
-                workspace_id=workspace_id,
-                role=route.role,
-            )
+        # Likewise a turn naming no effort or fast mode runs the thread's own
+        # (``thread_resolver`` says when the row decides).
+        resolve = thread_resolver(
+            user_id,
+            thread_id,
+            route,
+            thread=thread_meta,
+            is_byok=is_byok,
+            reasoning_effort=getattr(request, "reasoning_effort", None),
+            fast_mode=getattr(request, "fast_mode", None),
+            enabled_subagents=request.subagents_enabled,
+        )
 
         # A report-back or a channel message has nobody at a client to
         # reconnect an account, and a refusal would drop it. A person's send
@@ -568,8 +657,9 @@ async def _handle_send_message(
         is_byok = config.credential_source in (CredentialSource.OAUTH, CredentialSource.BYOK)
 
         # Credit check: always ask, whoever's key this is. Which pools apply to
-        # an own-key turn is the quota service's call, not ours.
-        await enforce_credit_limit(user_id, byok=is_byok)
+        # an own-key turn is the quota service's call, not ours, and so is what
+        # the surface the turn came from means for it.
+        await enforce_credit_limit(user_id, byok=is_byok, surface=request.platform)
 
         # I6: Redis down at START = 503 before any durable row. Ordered after
         # the auth/authz/credit gates (their statuses are more meaningful and
@@ -594,6 +684,29 @@ async def _handle_send_message(
         "Content-Location": f"/api/v1/threads/{thread_id}/messages/stream?run_id={run_id}",
     }
 
+    # DALTON-HOOK(colleague-dispatch): pass origin_channel, tail_turn_no_new_work, and workspace_owner_id into run metadata & configurable.
+    run_meta: dict[str, object] = {}
+    if request.report_back_ptc_thread_id:
+        run_meta["report_back_ptc_thread_id"] = request.report_back_ptc_thread_id
+        run_meta["origin_dispatch_gen"] = request.origin_dispatch_gen
+    if is_colleague_turn:
+        run_meta["origin_channel"] = origin_channel
+        # Retries carry their notices too: START decides from the ledger
+        # whether the retry is a resumable continuation or new work.
+        wakeup_notice_ids = extract_wakeup_notice_ids(request)
+        if wakeup_notice_ids:
+            run_meta["wakeup_notice_ids"] = wakeup_notice_ids
+        if is_tail_turn:
+            run_meta["tail_turn_no_new_work"] = True
+
+    extra_cfg = _automation_configurable(request)
+    if is_colleague_turn:
+        extra_cfg = dict(extra_cfg or {})
+        extra_cfg["workspace_owner_id"] = ws_owner_id
+        extra_cfg["origin_channel"] = origin_channel
+        if is_tail_turn:
+            extra_cfg["tail_turn_no_new_work"] = True
+
     gen = astream_ptc_workflow(
         request=request,
         thread_id=thread_id,
@@ -604,18 +717,13 @@ async def _handle_send_message(
         is_byok=is_byok,
         config=config,
         dispatched=is_dispatch,
+        from_server=is_internal,
         named_model=named_model,
         # A report-back summary owes its pair's watch clear, so its finalize
         # must see the pair.
-        run_metadata=(
-            {
-                "report_back_ptc_thread_id": request.report_back_ptc_thread_id,
-                "origin_dispatch_gen": request.origin_dispatch_gen,
-            }
-            if request.report_back_ptc_thread_id
-            else None
-        ),
-        extra_configurable=_automation_configurable(request),
+        # DALTON-HOOK(colleague-dispatch): forward colleague turn run_metadata and extra_configurable
+        run_metadata=run_meta or None,
+        extra_configurable=extra_cfg,
     )
 
     if not is_dispatch:
@@ -663,10 +771,12 @@ async def _prime_dispatch(
     Every exit that does not hand ``gen`` to that drain releases ``scope``'s
     slot.
     """
+    # DALTON-HOOK(colleague-dispatch): convert ColleagueAccessRevokedError into 403 JSON response
+    from src.dalton.sharing import ColleagueAccessRevokedError
     from src.server.database.runs.lifecycle import DuplicateRequestError
     from src.server.handlers.chat.request_prep import (
         DISPATCH_STARTED_MARKER,
-        DISPATCH_STEERED_MARKER,
+        HandOffSteered,
     )
     from src.server.services.report_back.handoff import pointer, reserve
 
@@ -685,7 +795,9 @@ async def _prime_dispatch(
     # a report-back summary carries its pair's generation for the claim above.
     gated_gen = request.origin_dispatch_gen if not rb_ptc else None
 
-    async def steered(target_run_id: str) -> JSONResponse:
+    async def steered(
+        target_run_id: str, steer_id: str | None = None
+    ) -> JSONResponse:
         # The hand-off went into a running turn as a steer: this request's
         # run never starts, so its pre-START stamp goes. The generation stays
         # admitted on the ledger, where the steer stamped the running run.
@@ -696,12 +808,17 @@ async def _prime_dispatch(
             f"[PTC_DISPATCH] Hand-off steered into running run {target_run_id} "
             f"on thread {thread_id}"
         )
-        return JSONResponse({
+        body = {
             "status": "steered",
             "thread_id": thread_id,
             "run_id": target_run_id,
             "workspace_id": workspace_id,
-        })
+        }
+        if steer_id:
+            # A run that ends before reading the steer leaves it to a later
+            # run, which only the steer's row names.
+            body["steer_id"] = steer_id
+        return JSONResponse(body)
 
     async with pointer.claim(
         rb_cache, thread_id, rb_ptc, run_id,
@@ -807,6 +924,15 @@ async def _prime_dispatch(
             if gated_gen:
                 await reserve.retract_dispatch_gen(thread_id, gated_gen, run_id)
             raise
+        # DALTON-HOOK(colleague-dispatch): map ColleagueAccessRevokedError to 403 non-retriable instead of 503.
+        except ColleagueAccessRevokedError as e:
+            await scope.release_slot()
+            if gated_gen:
+                await reserve.retract_dispatch_gen(thread_id, gated_gen, run_id)
+            raise HTTPException(
+                status_code=403,
+                detail={"code": e.code, "message": e.message},
+            ) from e
         except Exception as e:
             await scope.release_slot()
             if gated_gen:
@@ -815,9 +941,9 @@ async def _prime_dispatch(
                 status_code=503,
                 detail=f"Dispatch could not start durably: {e}",
             )
-        if isinstance(first, str) and first.startswith(DISPATCH_STEERED_MARKER):
+        if isinstance(first, HandOffSteered):
             await gen.aclose()
-            return await steered(first[len(DISPATCH_STEERED_MARKER):])
+            return await steered(first.run_id, first.steer_id)
         if first != DISPATCH_STARTED_MARKER:
             await gen.aclose()
             await scope.release_slot()
@@ -982,12 +1108,14 @@ async def replay_thread_messages(
         if is_dalton_supabase_auth_enabled():
             from src.dalton.sharing import require_thread_access
 
+            # DALTON-HOOK(colleague-dispatch): pass both thread owner_id and workspace_owner_id to require_thread_access.
             await require_thread_access(
                 thread_id,
                 x_user_id,
                 channel="web",
                 need="read",
                 owner_id=rows.owner_id,
+                workspace_owner_id=rows.workspace_owner_id,
                 workspace_id=rows.thread.get("workspace_id"),
             )
             is_non_owner_reader = rows.owner_id != x_user_id
@@ -1128,10 +1256,12 @@ async def get_thread_status(
     if is_dalton_supabase_auth_enabled():
         from src.dalton.sharing import require_thread_reader
 
+        # DALTON-HOOK(colleague-dispatch): pass workspace_owner_id to require_thread_reader.
         await require_thread_reader(
             thread_id,
             x_user_id,
             owner_id=meta["user_id"],
+            workspace_owner_id=meta.get("workspace_owner_id"),
             workspace_id=meta.get("workspace_id"),
         )
         is_non_owner_reader = meta["user_id"] != x_user_id
@@ -1202,19 +1332,58 @@ async def get_thread_status(
     return status
 
 
-# Upper bound on ids per liveness request — one MGET stays cheap. Ids past the
-# cap are dropped for that request and stay unresolved on the client (there is
-# no per-card fallback); >100 concurrently-unresolved cards would need the
-# frontend to chunk requests.
+# Upper bound on ids of each kind (threads, runs, steers) per liveness request,
+# so one request stays one bounded query per kind. Ids past the cap are dropped
+# for that request; the client sends at most this many of each kind per request
+# and splits larger sets across requests.
 _MAX_LIVENESS_IDS = 100
+
+
+def _run_view(row: dict) -> dict:
+    """A run's public status and times, the same for a thread's latest run
+    and for a run read by id. The finish is null while the run is live; a
+    client tells a live run by the status, not by these times."""
+    return {
+        "status": to_public(
+            row["status"], cancel_requested_at=row.get("cancel_requested_at")
+        ),
+        "run_started_at": row["created_at"],
+        "run_finished_at": run_completed_at(row),
+    }
+
+
+def _liveness_ids(raw: str, kind: str, user_id: str) -> list[str]:
+    """A comma-separated id list, deduped in order and capped."""
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for part in raw.split(","):
+        item = part.strip()
+        if item and item not in seen:
+            seen.add(item)
+            deduped.append(item)
+    if len(deduped) > _MAX_LIVENESS_IDS:
+        logger.warning(
+            f"[LIVENESS] {len(deduped)} {kind} requested by {user_id}; capping at "
+            f"{_MAX_LIVENESS_IDS} (remainder unresolved this request)"
+        )
+        deduped = deduped[:_MAX_LIVENESS_IDS]
+    return deduped
 
 
 @router.get("/dispatches/liveness")
 async def get_dispatches_liveness(
     x_user_id: CurrentUserId,
     ids: str = Query(
-        ...,
+        "",
         description="Comma-separated thread ids to read liveness for (one MGET).",
+    ),
+    runs: str = Query(
+        "",
+        description="Comma-separated run ids to read on their own, beside the threads.",
+    ),
+    steers: str = Query(
+        "",
+        description="Comma-separated steer ids to resolve to the run that took each.",
     ),
 ):
     """Batched, client-keyed dispatch liveness — N cards in one round-trip.
@@ -1226,45 +1395,55 @@ async def get_dispatches_liveness(
     crosscheck is obsolete — the recovery scanner converges orphaned
     in_progress rows. Threads with no attempt row yet (a dispatch still
     pre-START) are silently omitted so the card keeps polling as 'starting'.
+
+    ``runs`` reads named runs the same way: a hand-off is one run, and once
+    it is over the thread's latest attempt describes whatever the thread did
+    since. Unowned or unknown runs are omitted.
+
+    ``steers`` follows a hand-off steered into a running turn to the run
+    that took it in, which is a later run when that turn ended before
+    reading it. Each says ``taken``, with that run's id, whose view joins
+    ``runs`` if it was not asked for; ``queued`` until a run takes it; or
+    ``dropped`` if it settled with none. A steer the running turn holds for
+    its next model call is taken, and goes back to queued if that turn ends
+    without reading it. A steer is known only while its outbox row lives,
+    which is purged 7 days after it settles (``RETENTION_SECONDS``); after
+    that it is omitted, as unowned and unknown ones are, and the client
+    falls back to the run it was steered into. A reported hand-off keeps its
+    link through its report's ``steer_ids``.
     """
-    seen: set[str] = set()
-    deduped: list[str] = []
-    for raw in ids.split(","):
-        tid = raw.strip()
-        if tid and tid not in seen:
-            seen.add(tid)
-            deduped.append(tid)
+    thread_ids = _liveness_ids(ids, "ids", x_user_id)
+    run_ids = _liveness_ids(runs, "runs", x_user_id)
+    steer_ids = _liveness_ids(steers, "steers", x_user_id)
 
-    if len(deduped) > _MAX_LIVENESS_IDS:
-        logger.warning(
-            f"[LIVENESS] {len(deduped)} ids requested by {x_user_id}; capping at "
-            f"{_MAX_LIVENESS_IDS} (remainder unresolved this request)"
-        )
-        deduped = deduped[:_MAX_LIVENESS_IDS]
+    if not thread_ids and not run_ids and not steer_ids:
+        return {"liveness": [], "runs": [], "steers": []}
 
-    if not deduped:
-        return {"liveness": []}
-
+    from src.server.database.runs import handoff_liveness
     from src.server.database.runs import lifecycle as tl_db
-    from src.server.contracts.status import to_public
 
-    rows = await tl_db.get_latest_attempts_for_threads(deduped, x_user_id)
+    async def _read(fetch, wanted: list[str]) -> dict:
+        return await fetch(wanted, x_user_id) if wanted else {}
+
+    # Independent reads, each on its own pooled connection.
+    rows, run_rows, steer_rows = await asyncio.gather(
+        _read(tl_db.get_latest_attempts_for_threads, thread_ids),
+        _read(handoff_liveness.get_owned_runs, run_ids),
+        _read(handoff_liveness.get_owned_steers, steer_ids),
+    )
 
     liveness = []
     for tid, row in rows.items():
-        status = to_public(
-            row["status"], cancel_requested_at=row.get("cancel_requested_at")
-        )
-        live = status in ("running", "stopping")
+        # The thread's latest run, live or settled: a card opened mid-run
+        # times it from its start, and a settled one says how long it took.
+        view = _run_view(row)
+        live = view["status"] in ("running", "stopping")
         liveness.append(
             {
                 "thread_id": tid,
-                "status": status,
+                **view,
                 "run_id": str(row["conversation_response_id"]) if live else None,
                 "can_reconnect": live,
-                # A card opened mid-run times the run from here, not from
-                # when the card mounted.
-                "run_started_at": row["run_started_at"] if live else None,
                 # When the thread's latest turn started or settled, whoever
                 # sent it: how long the thread has been quiet.
                 "last_activity_at": row["last_activity_at"],
@@ -1276,7 +1455,32 @@ async def get_dispatches_liveness(
             }
         )
 
-    return {"liveness": liveness}
+    # A taken steer's run is read in the same query, so a view following the
+    # steer finds that run here without asking for it again.
+    runs_by_id = dict(run_rows)
+    for steer in steer_rows.values():
+        if steer["run"] is not None:
+            runs_by_id.setdefault(steer["run_id"], steer["run"])
+    pinned = [
+        {
+            "run_id": rid,
+            "thread_id": str(row["conversation_thread_id"]),
+            **_run_view(row),
+        }
+        for rid, row in runs_by_id.items()
+    ]
+
+    resolved = [
+        {
+            "steer_id": sid,
+            "thread_id": steer["thread_id"],
+            "state": steer["state"],
+            "run_id": steer["run_id"],
+        }
+        for sid, steer in steer_rows.items()
+    ]
+
+    return {"liveness": liveness, "runs": pinned, "steers": resolved}
 
 
 @router.post("/{thread_id}/cancel", status_code=200)
@@ -1300,11 +1504,10 @@ async def cancel_thread(
 async def summarize_thread(
     thread_id: str,
     x_user_id: CurrentUserId,
-    keep_messages: int = Query(
-        default=5, ge=1, le=20, description="Number of recent messages to preserve"
-    ),
 ):
-    """Manually trigger context compaction for a thread.
+    """Manually trigger context compaction for a thread, keeping the tail
+    automatic compaction keeps. A ``keep_messages`` count older clients send
+    is ignored.
 
     Endpoint path ``/summarize`` and function name preserved for REST contract
     compatibility — clients may call the older URL.
@@ -1312,7 +1515,7 @@ async def summarize_thread(
     await auth_api.require_thread_owner(thread_id, x_user_id)
     from src.server.handlers.thread_maintenance import trigger_compaction
 
-    return await trigger_compaction(thread_id, keep_messages, user_id=x_user_id)
+    return await trigger_compaction(thread_id, user_id=x_user_id)
 
 
 @router.post("/{thread_id}/offload", status_code=200)
@@ -1368,6 +1571,7 @@ async def retry_thread(
     from src.server.services.runs.pending_input import (
         input_rerun_request,
         read_pending_input,
+        retried_wake_fields,
     )
 
     scope = RunScope(user_id=auth.user_id, burst_slot_id=auth.burst_slot_id)
@@ -1456,6 +1660,7 @@ async def retry_thread(
                 llm_model=(body.llm_model if body else None),
                 reasoning_effort=(body.reasoning_effort if body else None),
                 fast_mode=(body.fast_mode if body else None),
+                **await retried_wake_fields(thread_id, latest["turn_index"]),
             )
     except BaseException:
         # ChatRateLimited acquired a burst slot at the dependency; every

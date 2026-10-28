@@ -763,6 +763,27 @@ async def dalton_complete(
             raise_on_error=raise_on_error,
         )
 
+    # A5: a deadline already past means nothing new can be sent. The journal
+    # above still replayed a finished answer; here, with nothing cached, return
+    # WITHOUT claiming or recording a failure — the 87-batch audit incident had
+    # every past-deadline call claim its journal row and write
+    # DeadlineBeforeSendError into it, painting three healthy models as broken.
+    if deadline is not None and time.monotonic() >= deadline:
+        return _finish(
+            DaltonCompleteResult(
+                ok=False,
+                status="failed",
+                model=effective_model,
+                provider=provider,
+                billing_type=billing_type,
+                invocation_id=inv_id,
+                attempt=1,
+                error_kind="deadline",
+                error="截止时间已到，未发送请求（journal 中无缓存结果）",
+            ),
+            raise_on_error=raise_on_error,
+        )
+
     if action == "indeterminate":
         return _finish(
             DaltonCompleteResult(

@@ -99,12 +99,6 @@ class TestCompactionProfileIsPerModel:
         small = await _resolve(two_profiles, request_model=SMALL)
         assert big.compaction.token_threshold != small.compaction.token_threshold
 
-    @pytest.mark.asyncio
-    async def test_whole_preset_is_applied_not_only_the_threshold(self, two_profiles):
-        config = await _resolve(two_profiles, request_model=BIG)
-        preset = COMPACTION_PROFILES["aggressive"]
-        assert config.compaction.keep_messages == preset["keep_messages"]
-
 
 class TestProfileIsKeyedOnTheModelThatRuns:
     @pytest.mark.asyncio

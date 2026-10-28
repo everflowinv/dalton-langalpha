@@ -13,6 +13,7 @@ from __future__ import annotations
 import errno
 import hashlib
 import http.server
+import itertools
 import json
 import os
 import shutil
@@ -26,7 +27,15 @@ import pytest
 
 # The sandbox runs this package as ``livefs``; its siblings are relative
 # imports, so the host path loads the same code.
-from ptc_agent.core.sandbox.livefs_runtime import boot, daemon, lifecycle, ops, remote, views
+from ptc_agent.core.sandbox.livefs_runtime import (
+    boot,
+    daemon,
+    lifecycle,
+    links,
+    ops,
+    remote,
+    views,
+)
 from ptc_agent.core.sandbox.livefs_runtime.protocol import (
     CALL_ENV,
     CONFIG_ENV,
@@ -35,6 +44,7 @@ from ptc_agent.core.sandbox.livefs_runtime.protocol import (
     MountError,
     etag_version,
 )
+from tests.unit.restored_overlay import archive, refuse_here
 
 NOTES = "user/memory/notes.md"
 PREFS = "user/profile/prefs.json"
@@ -530,6 +540,99 @@ def test_anything_already_at_a_link_path_is_set_aside_under_a_free_name(box):
     assert os.readlink(memory) == f"{box.mount}/workspaces/a/memory"
 
 
+def test_a_folder_a_restored_sandbox_cannot_rename_is_copied_aside(box, monkeypatch):
+    """Restored from its archive, the sandbox refuses to rename the folder
+    (EXDEV), so it is copied beside the link and deleted where it is."""
+    memory = box.root / "research" / ".agents" / "memory"
+    (memory / "topics").mkdir(parents=True)
+    (memory / "notes.md").write_text("kept")
+    (memory / "topics" / "a.md").write_text("also kept")
+    # The agent's own, under the name an earlier build copied through.
+    (memory.parent / "memory.local.copying").mkdir()
+    (memory.parent / "memory.local.copying" / "mine.md").write_text("mine")
+    refuse_here(monkeypatch, archive(box.root))
+
+    answer = _link(box, ("workspaces/a/memory", "research/.agents/memory"))
+
+    assert answer["ok"]
+    assert answer["set_aside"] == {str(memory): f"{memory}.local"}
+    assert (memory.parent / "memory.local" / "notes.md").read_text() == "kept"
+    assert (memory.parent / "memory.local" / "topics" / "a.md").read_text() == "also kept"
+    assert (memory.parent / "memory.local.copying" / "mine.md").read_text() == "mine"
+    assert not [p for p in memory.parent.iterdir() if p.name.startswith(".memory.local")]
+    assert os.readlink(memory) == f"{box.mount}/workspaces/a/memory"
+
+
+def test_a_read_only_folder_in_one_a_restored_sandbox_cannot_rename_is_deleted(box, monkeypatch):
+    """A folder inside the agent made read-only refuses the delete after the
+    copy until it is opened up; left there, every later link copied it again."""
+    memory = box.root / "research" / ".agents" / "memory"
+    (memory / "topics").mkdir(parents=True)
+    (memory / "topics" / "a.md").write_text("kept")
+    (memory / "topics").chmod(0o500)
+    refuse_here(monkeypatch, archive(box.root))
+
+    answer = _link(box, ("workspaces/a/memory", "research/.agents/memory"))
+
+    assert answer["ok"]
+    assert (memory.parent / "memory.local" / "topics" / "a.md").read_text() == "kept"
+    assert sorted(p.name for p in memory.parent.iterdir()) == ["memory", "memory.local"]
+    assert os.readlink(memory) == f"{box.mount}/workspaces/a/memory"
+
+
+def test_a_named_pipe_in_one_a_restored_sandbox_cannot_rename_is_made_anew(box, monkeypatch):
+    """copytree refuses a pipe, which failed the copy and the link on every
+    pass; the copy makes it anew, as the folder script's does."""
+    memory = box.root / "research" / ".agents" / "memory"
+    memory.mkdir(parents=True)
+    (memory / "notes.md").write_text("kept")
+    os.mkfifo(memory / "feed")
+    # More than the umask lets mkfifo make.
+    (memory / "feed").chmod(0o666)
+    refuse_here(monkeypatch, archive(box.root))
+
+    answer = _link(box, ("workspaces/a/memory", "research/.agents/memory"))
+
+    assert answer["ok"]
+    assert (memory.parent / "memory.local" / "notes.md").read_text() == "kept"
+    feed = os.lstat(memory.parent / "memory.local" / "feed")
+    assert stat.S_ISFIFO(feed.st_mode) and stat.S_IMODE(feed.st_mode) == 0o666
+    assert os.readlink(memory) == f"{box.mount}/workspaces/a/memory"
+
+
+def test_a_file_with_two_names_in_one_a_restored_sandbox_cannot_rename_stays_one(
+    box, monkeypatch
+):
+    """A rename keeps the two names one file; a copy of each would take its
+    size twice and let an edit through one name miss the other."""
+    memory = box.root / "research" / ".agents" / "memory"
+    memory.mkdir(parents=True)
+    (memory / "notes.md").write_text("kept")
+    os.link(memory / "notes.md", memory / "again.md")
+    refuse_here(monkeypatch, archive(box.root))
+
+    answer = _link(box, ("workspaces/a/memory", "research/.agents/memory"))
+
+    assert answer["ok"]
+    aside = memory.parent / "memory.local"
+    notes, again = (aside / "notes.md").lstat(), (aside / "again.md").lstat()
+    assert (notes.st_ino, notes.st_nlink) == (again.st_ino, 2)
+    assert (aside / "again.md").read_text() == "kept"
+
+
+def test_a_copy_a_killed_pass_left_goes_before_the_next(box, monkeypatch):
+    memory = box.root / "research" / ".agents" / "memory"
+    memory.mkdir(parents=True)
+    (memory / "notes.md").write_text("kept")
+    (memory.parent / ".memory.local.copying-ab12cd_9" / "half").mkdir(parents=True)
+    refuse_here(monkeypatch, archive(box.root))
+
+    answer = _link(box, ("workspaces/a/memory", "research/.agents/memory"))
+
+    assert answer["ok"]
+    assert sorted(p.name for p in memory.parent.iterdir()) == ["memory", "memory.local"]
+
+
 def test_an_empty_directory_at_a_link_path_is_replaced_not_set_aside(box):
     memory = box.root / "research" / ".agents" / "memory"
     memory.mkdir(parents=True)
@@ -541,6 +644,291 @@ def test_an_empty_directory_at_a_link_path_is_replaced_not_set_aside(box):
     assert not os.path.lexists(f"{memory}.local")
 
 
+def test_a_folder_copied_aside_whose_delete_fails_is_not_copied_again(box, monkeypatch):
+    """The link is retried every few minutes. Copied again on each, what the
+    delete cannot remove would take its size again every time."""
+    memory = box.root / "research" / ".agents" / "memory"
+    memory.mkdir(parents=True)
+    (memory / "notes.md").write_text("kept")
+    refuse_here(monkeypatch, archive(box.root))
+    remove, refuse = links.tree_runtime.remove_tree, [True]
+
+    def stuck(top, deadline=None):
+        if refuse[0] and top == str(memory):
+            raise PermissionError(errno.EACCES, "Permission denied", top)
+        return remove(top, deadline)
+
+    monkeypatch.setattr(links.tree_runtime, "remove_tree", stuck)
+    for _ in range(2):
+        assert not _link(box, ("workspaces/a/memory", "research/.agents/memory"))["ok"]
+    assert sorted(p.name for p in memory.parent.iterdir()) == ["memory", "memory.local"]
+
+    refuse[0] = False
+    answer = _link(box, ("workspaces/a/memory", "research/.agents/memory"))
+
+    assert answer["set_aside"] == {str(memory): f"{memory}.local"}
+    assert (memory.parent / "memory.local" / "notes.md").read_text() == "kept"
+    assert os.readlink(memory) == f"{box.mount}/workspaces/a/memory"
+    assert json.loads((box.private / "state.json").read_text())["copied"] == {}
+
+
+@pytest.mark.parametrize("written_since", [False, True])
+def test_a_failed_delete_looks_inside_a_folder_shut_to_its_owner(box, monkeypatch, written_since):
+    """Whether the copy holds the folder is asked inside one its owner made
+    unreadable, as the copy and the delete both go inside it: unasked, a file
+    written there since would be deleted, and taken for one, a folder holding
+    nothing new would be copied aside again."""
+    memory = box.root / "research" / ".agents" / "memory"
+    locked = memory / "locked"
+    locked.mkdir(parents=True)
+    (locked / "secret.md").write_text("shut")
+    locked.chmod(0)
+    refuse_here(monkeypatch, archive(box.root))
+    remove, refuse = links.tree_runtime.remove_tree, [True]
+
+    def stuck(top, deadline=None):
+        if refuse[0] and top == str(memory):
+            raise PermissionError(errno.EACCES, "Permission denied", top)
+        return remove(top, deadline)
+
+    monkeypatch.setattr(links.tree_runtime, "remove_tree", stuck)
+    assert not _link(box, ("workspaces/a/memory", "research/.agents/memory"))["ok"]
+    if written_since:
+        locked.chmod(0o700)
+        (locked / "since.md").write_text("written since")
+        locked.chmod(0)
+    refuse[0] = False
+
+    answer = _link(box, ("workspaces/a/memory", "research/.agents/memory"))
+
+    aside = memory.parent / ("memory.local.1" if written_since else "memory.local")
+    assert answer["set_aside"] == {str(memory): str(aside)}
+    assert os.readlink(memory) == f"{box.mount}/workspaces/a/memory"
+    assert stat.S_IMODE((aside / "locked").lstat().st_mode) == 0
+    for copy in memory.parent.glob("memory.local*/locked"):
+        copy.chmod(0o700)
+    assert (aside / "locked" / "secret.md").read_text() == "shut"
+    if written_since:
+        assert (aside / "locked" / "since.md").read_text() == "written since"
+
+
+def test_what_is_written_to_a_folder_whose_delete_failed_is_set_aside_not_deleted(
+    box, monkeypatch
+):
+    """The link stays out until the delete is done, so the folder at its path
+    stays in use. The copy no longer holds what was written there since, which
+    the next link sets aside anew rather than deleting."""
+    memory = box.root / "research" / ".agents" / "memory"
+    memory.mkdir(parents=True)
+    (memory / "notes.md").write_text("kept")
+    refuse_here(monkeypatch, archive(box.root))
+    remove, refuse = links.tree_runtime.remove_tree, [True]
+
+    def stuck(top, deadline=None):
+        if refuse[0] and top == str(memory):
+            raise PermissionError(errno.EACCES, "Permission denied", top)
+        return remove(top, deadline)
+
+    monkeypatch.setattr(links.tree_runtime, "remove_tree", stuck)
+    assert not _link(box, ("workspaces/a/memory", "research/.agents/memory"))["ok"]
+    (memory / "since.md").write_text("written since")
+    refuse[0] = False
+
+    answer = _link(box, ("workspaces/a/memory", "research/.agents/memory"))
+
+    assert answer["set_aside"] == {str(memory): f"{memory}.local.1"}
+    assert (memory.parent / "memory.local.1" / "since.md").read_text() == "written since"
+    assert (memory.parent / "memory.local" / "notes.md").read_text() == "kept"
+    assert os.readlink(memory) == f"{box.mount}/workspaces/a/memory"
+    assert json.loads((box.private / "state.json").read_text())["copied"] == {}
+
+
+@pytest.mark.parametrize("change", ["folder made", "mode changed"])
+def test_a_folder_changed_where_the_delete_failed_is_set_aside_not_deleted(
+    box, monkeypatch, change
+):
+    """A folder made there since the copy, or one whose mode changed, is as
+    much what was written there as a file is, and the copy holds neither."""
+    memory = box.root / "research" / ".agents" / "memory"
+    (memory / "topics").mkdir(parents=True)
+    (memory / "topics" / "a.md").write_text("kept")
+    (memory / "topics").chmod(0o755)
+    refuse_here(monkeypatch, archive(box.root))
+    remove, refuse = links.tree_runtime.remove_tree, [True]
+
+    def stuck(top, deadline=None):
+        if refuse[0] and top == str(memory):
+            raise PermissionError(errno.EACCES, "Permission denied", top)
+        return remove(top, deadline)
+
+    monkeypatch.setattr(links.tree_runtime, "remove_tree", stuck)
+    assert not _link(box, ("workspaces/a/memory", "research/.agents/memory"))["ok"]
+    if change == "folder made":
+        (memory / "drafts").mkdir()
+    else:
+        (memory / "topics").chmod(0o700)
+    refuse[0] = False
+
+    answer = _link(box, ("workspaces/a/memory", "research/.agents/memory"))
+
+    aside = memory.parent / "memory.local.1"
+    assert answer["set_aside"] == {str(memory): str(aside)}
+    if change == "folder made":
+        assert (aside / "drafts").is_dir()
+    else:
+        assert stat.S_IMODE((aside / "topics").lstat().st_mode) == 0o700
+    assert (memory.parent / "memory.local" / "topics" / "a.md").read_text() == "kept"
+    assert os.readlink(memory) == f"{box.mount}/workspaces/a/memory"
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root enters a folder shut to its owner as it is")
+def test_a_delete_cut_short_in_a_folder_shut_to_its_owner_is_not_copied_again(
+    box, monkeypatch
+):
+    """The delete lets its owner into such a folder, and cut short there it
+    stays so: taken for a change to the folder, that would copy it aside
+    again on every link."""
+    memory = box.root / "research" / ".agents" / "memory"
+    locked = memory / "locked"
+    locked.mkdir(parents=True)
+    (locked / "secret.md").write_text("shut")
+    locked.chmod(0)
+    refuse_here(monkeypatch, archive(box.root))
+    unlink, refuse = os.unlink, [True]
+
+    def stuck(name, *args, **kwargs):
+        if refuse[0] and name == "secret.md":
+            raise PermissionError(errno.EACCES, "Permission denied", name)
+        return unlink(name, *args, **kwargs)
+
+    monkeypatch.setattr(links.tree_runtime.os, "unlink", stuck)
+    assert not _link(box, ("workspaces/a/memory", "research/.agents/memory"))["ok"]
+    assert stat.S_IMODE(locked.lstat().st_mode) == 0o700
+    refuse[0] = False
+
+    answer = _link(box, ("workspaces/a/memory", "research/.agents/memory"))
+
+    assert answer["set_aside"] == {str(memory): f"{memory}.local"}
+    assert sorted(p.name for p in memory.parent.iterdir()) == ["memory", "memory.local"]
+    aside = memory.parent / "memory.local" / "locked"
+    assert stat.S_IMODE(aside.lstat().st_mode) == 0
+    aside.chmod(0o700)
+    assert (aside / "secret.md").read_text() == "shut"
+
+
+def test_a_copy_aside_whose_delete_is_killed_is_not_copied_again(box, monkeypatch):
+    """Killed partway through the delete after the copy, the next link finds
+    the copy recorded and finishes the delete, rather than copying what is
+    left into another folder beside it."""
+    memory = box.root / "research" / ".agents" / "memory"
+    memory.mkdir(parents=True)
+    (memory / "notes.md").write_text("kept")
+    refuse_here(monkeypatch, archive(box.root))
+    remove = links.tree_runtime.remove_tree
+
+    def killed(top, deadline=None):
+        if top == str(memory):
+            raise SystemExit("killed")
+        return remove(top, deadline)
+
+    monkeypatch.setattr(links.tree_runtime, "remove_tree", killed)
+    with pytest.raises(SystemExit):
+        _link(box, ("workspaces/a/memory", "research/.agents/memory"))
+    monkeypatch.setattr(links.tree_runtime, "remove_tree", remove)
+
+    answer = _link(box, ("workspaces/a/memory", "research/.agents/memory"))
+
+    assert answer["set_aside"] == {str(memory): f"{memory}.local"}
+    assert sorted(p.name for p in memory.parent.iterdir()) == ["memory", "memory.local"]
+    assert (memory.parent / "memory.local" / "notes.md").read_text() == "kept"
+    assert json.loads((box.private / "state.json").read_text())["copied"] == {}
+
+
+def test_a_copy_aside_whose_delete_is_killed_is_finished_once_its_link_is_dropped(
+    box, monkeypatch
+):
+    """No link comes to the path again to finish the delete, so the pass that
+    drops it does, and keeps the record until it has: else the folder half
+    deleted would stay beside its whole copy for good."""
+    memory = box.root / "research" / ".agents" / "memory"
+    memory.mkdir(parents=True)
+    (memory / "notes.md").write_text("kept")
+    refuse_here(monkeypatch, archive(box.root))
+    remove = links.tree_runtime.remove_tree
+
+    def failing(error):
+        def remove_tree(top, deadline=None):
+            if top == str(memory):
+                raise error
+            return remove(top, deadline)
+
+        return remove_tree
+
+    monkeypatch.setattr(links.tree_runtime, "remove_tree", failing(SystemExit("killed")))
+    with pytest.raises(SystemExit):
+        _link(box, ("workspaces/a/memory", "research/.agents/memory"))
+    monkeypatch.setattr(
+        links.tree_runtime, "remove_tree", failing(PermissionError(13, "denied"))
+    )
+    assert _link(box)["ok"]
+    assert str(memory) in json.loads((box.private / "state.json").read_text())["copied"]
+    monkeypatch.setattr(links.tree_runtime, "remove_tree", remove)
+
+    assert _link(box)["ok"]
+
+    assert sorted(p.name for p in memory.parent.iterdir()) == ["memory.local"]
+    assert (memory.parent / "memory.local" / "notes.md").read_text() == "kept"
+    assert json.loads((box.private / "state.json").read_text())["copied"] == {}
+
+
+def test_a_file_written_where_a_copy_aside_already_passed_is_in_it(box, monkeypatch):
+    """A process at work in the folder can write where the copy has been, and
+    the folder is deleted once its copy is whole."""
+    memory = box.root / "research" / ".agents" / "memory"
+    (memory / "topic").mkdir(parents=True)
+    (memory / "topic" / "notes.md").write_text("kept")
+    refuse_here(monkeypatch, archive(box.root))
+    sync_entry, made = links.tree_runtime._sync_entry, []
+
+    def write_behind(entry, target, deadline, linked):
+        # The top folder's listing is done before any folder below it.
+        if os.path.dirname(entry.path) != str(memory) and not made:
+            made.append((memory / "late.md").write_text("late"))
+        return sync_entry(entry, target, deadline, linked)
+
+    monkeypatch.setattr(links.tree_runtime, "_sync_entry", write_behind)
+    answer = _link(box, ("workspaces/a/memory", "research/.agents/memory"))
+
+    assert answer["set_aside"] == {str(memory): f"{memory}.local"}
+    assert (memory.parent / "memory.local" / "late.md").read_text() == "late"
+    assert (memory.parent / "memory.local" / "topic" / "notes.md").read_text() == "kept"
+
+
+def test_a_folder_still_changing_as_it_is_copied_aside_waits_for_the_next_link(
+    box, monkeypatch
+):
+    memory = box.root / "research" / ".agents" / "memory"
+    memory.mkdir(parents=True)
+    (memory / "notes.md").write_text("kept")
+    refuse_here(monkeypatch, archive(box.root))
+    sync_entry, writes = links.tree_runtime._sync_entry, itertools.count()
+
+    def busy(entry, target, deadline, linked):
+        (memory / f"log-{next(writes)}.txt").write_text("more")
+        return sync_entry(entry, target, deadline, linked)
+
+    monkeypatch.setattr(links.tree_runtime, "_sync_entry", busy)
+    assert not _link(box, ("workspaces/a/memory", "research/.agents/memory"))["ok"]
+    assert sorted(p.name for p in memory.parent.iterdir()) == ["memory"]
+    assert (memory / "notes.md").read_text() == "kept"
+
+    monkeypatch.setattr(links.tree_runtime, "_sync_entry", sync_entry)
+    answer = _link(box, ("workspaces/a/memory", "research/.agents/memory"))
+
+    assert answer["set_aside"] == {str(memory): f"{memory}.local"}
+    assert len(list((memory.parent / "memory.local").iterdir())) == next(writes) + 1
+
+
 def test_root_lays_the_links_as_the_folders_owner(box, monkeypatch):
     """Root following a symlink the user planted could write anywhere."""
     calls, made = [], []
@@ -550,7 +938,9 @@ def test_root_lays_the_links_as_the_folders_owner(box, monkeypatch):
     monkeypatch.setattr(daemon.os, "setgroups", lambda g: calls.append(("groups", g)))
     monkeypatch.setattr(daemon.os, "setegid", lambda g: calls.append(("egid", g)))
     monkeypatch.setattr(daemon.os, "seteuid", lambda u: calls.append(("euid", u)))
-    monkeypatch.setattr(daemon, "link", lambda value, target: made.append(list(calls)))
+    monkeypatch.setattr(
+        daemon, "link", lambda value, target, copied, keep: made.append(list(calls))
+    )
     owner = box.root.stat()
 
     _link(box, ("user", ".agents/user"))

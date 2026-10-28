@@ -29,13 +29,23 @@ export interface SenderMetadata {
  */
 export function reportRowProvenance(source?: ReportSource): MessageProvenance | null {
   switch (source?.kind) {
-    case 'analyst':
+    case 'analyst': {
+      const runIds = source.run_ids ?? [];
       return {
         kind: 'analyst_report',
         threadId: source.thread_id,
         workspaceId: source.workspace_id ?? null,
         workspaceName: source.workspace_name ?? null,
+        // Left out, not undefined, when an older report has none.
+        ...(source.outcome !== undefined ? { outcome: source.outcome } : {}),
+        ...(runIds.length > 0 ? { runIds } : {}),
+        // Kept when empty: a report that lists none says it answers no
+        // steered hand-off, which one whose steers are unknown cannot.
+        ...(source.steer_ids ? { steerIds: source.steer_ids } : {}),
+        // DALTON-HOOK(handoff-keep-on-resumable): carry interim resumable flag
+        ...(source.resumable ? { resumable: true } : {}),
       };
+    }
     case 'task':
       return {
         kind: 'task_report',
@@ -43,6 +53,16 @@ export function reportRowProvenance(source?: ReportSource): MessageProvenance | 
         displayId: source.display_id,
         description: source.description ?? null,
         failed: source.failed,
+        ...(source.subagent_type ? { subagentType: source.subagent_type } : {}),
+      };
+    case 'command_report':
+      return {
+        kind: 'command_report',
+        tool: source.tool,
+        description: source.description ?? null,
+        status: source.status,
+        failureReason: source.failure_reason ?? null,
+        toolCallId: source.tool_call_id ?? null,
       };
     default:
       return null;

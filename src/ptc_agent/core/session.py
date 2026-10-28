@@ -164,9 +164,6 @@ class Session:
     async def initialize(
         self,
         sandbox_id: str | None = None,
-        sandbox_tokens: dict | None = None,
-        user_id: str | None = None,
-        workspace_id: str | None = None,
         on_state_observed: Callable[[str], None] | None = None,
         tier: str | None = None,
         auto_stop_minutes: int | None = None,
@@ -176,9 +173,6 @@ class Session:
 
         Args:
             sandbox_id: Optional existing sandbox ID to reconnect to instead of creating new
-            sandbox_tokens: Optional scoped OAuth2 tokens for sandbox ginlix-data access
-            user_id: User ID for token tracking in manifest.
-            workspace_id: Workspace ID for token tracking in manifest.
             on_state_observed: Optional sync callback invoked with the initial
                 sandbox state string when reconnecting (ignored on new-sandbox
                 path since state doesn't exist yet). See PTCSandbox.reconnect.
@@ -256,7 +250,7 @@ class Session:
             )
 
             try:
-                snapshot_name, _ = await asyncio.gather(
+                await asyncio.gather(
                     self.sandbox.setup_sandbox_workspace(
                         tier=tier,
                         auto_stop_minutes=auto_stop_minutes,
@@ -277,12 +271,7 @@ class Session:
 
             self.sandbox.mcp_registry = self.mcp_registry
 
-            await self.sandbox.setup_tools_and_mcp(
-                snapshot_name,
-                tokens=sandbox_tokens,
-                user_id=user_id,
-                workspace_id=workspace_id,
-            )
+            await self.sandbox.setup_tools_and_mcp()
 
         self._initialized = True
 
@@ -362,6 +351,20 @@ class Session:
             await self.initialize()
 
         return self.sandbox
+
+    def refresh_builtin_registry(self) -> MCPRegistry | None:
+        """Follow the global snapshot a background reconnect has replaced.
+
+        Called when a composite is about to be rebuilt, so the rebuild picks up
+        a healed built-in server along with the asset sync that follows it.
+        Between rebuilds the session keeps the snapshot its sandbox's wrappers
+        came from. An owned registry is never replaced.
+        """
+        if not self._owns_mcp_registry and self._builtin_mcp_registry is not None:
+            current = get_global_registry()
+            if current is not None:
+                self._builtin_mcp_registry = current
+        return self._builtin_mcp_registry
 
     async def cleanup(self) -> None:
         """Clean up session resources."""

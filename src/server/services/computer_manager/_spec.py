@@ -17,6 +17,7 @@ from typing import Any, AsyncIterator, Dict, Mapping, Optional
 
 from fastapi import HTTPException
 
+from ptc_agent.core.sandbox.providers import provider_class
 from ptc_agent.core.sandbox.runtime import SandboxGoneError
 from ptc_agent.core.session import Session, SessionManager
 
@@ -45,6 +46,8 @@ from src.server.services.computer_errors import (
     DiskTooSmallError,
     MachineBusyError,
     SpecChangeLostError,
+    SpecNotChangeable,
+    UnknownResourceTier,
 )
 from src.server.services.computer_manager._types import ComputerBinding
 from src.server.services.persistence.transfer import PULL_MAX_INFLIGHT_BYTES
@@ -89,8 +92,19 @@ def _spec_refusal(
     ``claim_id`` is the re-check's own claim, whose record says whether it
     took over a dead change.
     """
+    if not provider_class(computer["kind"]).recreatable:
+        # A tier change is a rebuild, and this machine is never rebuilt.
+        if tier == (computer.get("resource_tier") or "standard"):
+            return True
+        raise SpecNotChangeable(
+            "This computer runs on a machine you manage, so its size is set "
+            "on that machine rather than here."
+        )
     if tier not in tiers:
-        raise ValueError(f"Unknown resource tier: {tier}")
+        # Each provider offers its own sizes, so one may lack a tier another has.
+        raise UnknownResourceTier(
+            f"This computer's provider does not offer the {tier!r} spec"
+        )
     record = computer.get("spec_change") or {}
     took_over = (
         claim_id is not None
@@ -193,8 +207,7 @@ class ComputerSpecMixin:
 
     def _resource_tiers(self, computer: Mapping[str, Any]) -> Mapping[str, Any]:
         return self._provider_settings(
-            computer.get("kind") or self.config.sandbox.provider,
-            computer.get("provider_config"),
+            computer["kind"], computer.get("provider_config")
         ).resource_tiers
 
     async def _refuse_if_turn_active(
@@ -294,7 +307,8 @@ class ComputerSpecMixin:
         backed-up files won't fit the smaller disk is refused before teardown.
 
         Raises:
-            ValueError: Computer not found or ``tier`` is unknown.
+            ValueError: Computer not found.
+            UnknownResourceTier: The computer's provider has no ``tier``.
             ComputerBusyError: Another spec change or operation holds the machine.
             DiskTooSmallError: Downgrade refused, files exceed the target disk.
             MachineBusyError: A turn is running on the machine.
@@ -503,6 +517,42 @@ class ComputerSpecMixin:
             logger.info(
                 f"Computer {computer_id} has no sandbox; persisted tier {tier!r} only"
             )
+        elif (
+            status == ComputerStatus.RUNNING
+            and not workspace_id
+            and not await get_live_workspace_ids_for_computer(computer_id)
+        ):
+            # No workspace on it: nothing to back up or restore, and the
+            # rebuild is workspace-addressed. Its sandbox goes, and a start
+            # builds one at the new tier, here under the change's locks: one
+            # after them could find the running slot this machine held taken,
+            # and a failure there would reach no one. It replaces a running
+            # machine, so the start takes no new slot.
+            await self._assert_spec_claim_owned(computer_id, claim_id)
+            if not await self._drop_empty_machine_sandbox(computer, sandbox_id):
+                raise ComputerBusyError(
+                    "This computer changed while preparing the spec change; retry"
+                )
+            current = await get_computer(computer_id)
+            if current is None or (current.get("config") or {}).get("retire_when_empty"):
+                # Gone, or its last workspace went while the change held the
+                # machine: a start would build a sandbox only to retire it.
+                return
+            claimed = await try_claim_computer_for_start(
+                computer_id, from_status=ComputerStatus.STOPPED
+            )
+            if claimed is None:
+                current = await get_computer(computer_id)
+                if current is not None and current.get("status") in (
+                    ComputerStatus.STARTING,
+                    ComputerStatus.RUNNING,
+                ):
+                    # Another start took it, at the tier persisted above.
+                    return
+                raise ComputerBusyError(
+                    "This computer changed while preparing the spec change; retry"
+                )
+            await self._build_started_machine(claimed, user_id=user_id)
         elif status == ComputerStatus.RUNNING:
             await self._replace_running_sandbox(
                 binding,
@@ -622,7 +672,10 @@ class ComputerSpecMixin:
                 await session.stop()
             if not gone:
                 await self._assert_spec_claim_owned(computer_id, claim_id)
+                # Daytona's metric history goes with the sandbox.
+                await self._fold_usage_before_delete(computer_id)
                 await self._destroy_sandbox(sandbox_id, binding=binding)
+                await self._end_replaced_usage_run(computer_id, sandbox_id)
             # The ref still names this sandbox, so its reading would pass for
             # the machine's at the new tier until the next start measures.
             await clear_computer_disk(computer_id, sandbox_id=sandbox_id)
@@ -694,12 +747,16 @@ class ComputerSpecMixin:
         locked_sandbox_id: str,
         *,
         tier: str,
-        claim_id: str,
+        claim_id: str | None,
         disk_guard: int | None,
         user_id: str | None,
         workspace_id: str | None,
     ) -> None:
-        """Swap a live machine's sandbox for one built at the persisted tier."""
+        """Swap a live machine's sandbox for one built at the persisted tier.
+
+        ``claim_id`` is the spec change's own claim; a replacement that is not a
+        spec change passes None and holds the machine's advisory key instead.
+        """
         computer_id = binding.computer_id
         # Resolved here and not with the machine binding: the other branches
         # need no project, and a folder read that fails must not stop a machine
@@ -745,12 +802,16 @@ class ComputerSpecMixin:
                 # leaves the live sandbox as it was.
                 await self._assert_machine_disk_fits(computer_id, disk_guard)
 
-            await self._assert_spec_claim_owned(computer_id, claim_id)
+            if claim_id is not None:
+                await self._assert_spec_claim_owned(computer_id, claim_id)
             # Teardown starts: the files are backed up and the old sandbox is
             # no longer something to hand back, so a failure from here leaves
             # the row stopped and the next start rebuilds (claim -> restart ->
             # SandboxGone -> recover). 'error' would be terminal.
             claim.release_to = ComputerStatus.STOPPED
+            # Before the session's cleanup below, which deletes the sandbox and
+            # Daytona's metric history with it.
+            await self._fold_usage_before_delete(computer_id)
             # Force-evict the SessionManager entry: cleanup_session skips its
             # own pop when session.cleanup() raised, so the recover below must
             # not return the stale broken session.
@@ -761,11 +822,89 @@ class ComputerSpecMixin:
             # once the old one is confirmed gone, so the two never run, and
             # bill, side by side.
             await self._destroy_sandbox(locked_sandbox_id, binding=binding)
+            # The new sandbox binds only after its restore, none of which is
+            # the old one's.
+            await self._end_replaced_usage_run(computer_id, locked_sandbox_id)
             # A recover that fails leaves the ref on the destroyed sandbox.
             await clear_computer_disk(computer_id, sandbox_id=locked_sandbox_id)
             await self._recover_sandbox(
                 binding, user_id, self._core_config_for(binding)
             )
+
+    async def replace_sandbox_for_platform_secrets(
+        self, computer_id: str, sandbox_id: str
+    ) -> bool:
+        """Rebuild a running machine whose sandbox env holds a platform credential.
+
+        Its provider sets env only at create (E2B), so no restart clears it.
+        The sandbox goes the way a spec change takes it: a strict backup, then
+        a new one restored from it, created with markers in place of the value.
+        The caller holds the machine's advisory key, which keeps spec changes
+        and the stuck-start reaper off it. A machine with no workspace is
+        stopped without its sandbox instead. False when the machine has since
+        stopped or moved to another sandbox, and nothing was done.
+
+        Raises:
+            MachineBusyError: A turn is running on the machine.
+        """
+        async with self._observed_lock(computer_id, "computer.platform_secret"):
+            computer = await get_computer(computer_id)
+            if (
+                not computer
+                or computer.get("status") != ComputerStatus.RUNNING
+                or computer.get("provider_ref") != sandbox_id
+            ):
+                return False
+            if not provider_class(computer["kind"]).recreatable:
+                # Its provider takes no platform credential, and its machine
+                # is never the server's to rebuild or empty.
+                return False
+            if not await get_live_workspace_ids_for_computer(computer_id):
+                return await self._drop_empty_machine_sandbox(computer, sandbox_id)
+            await self._replace_running_sandbox(
+                self._binding_from_computer("", computer),
+                sandbox_id,
+                tier=computer.get("resource_tier") or "standard",
+                claim_id=None,
+                disk_guard=None,
+                user_id=str(computer["user_id"]),
+                workspace_id=None,
+            )
+            return True
+
+    async def _drop_empty_machine_sandbox(
+        self, computer: Dict[str, Any], sandbox_id: str
+    ) -> bool:
+        """Destroy an empty machine's sandbox, for its next start to build anew.
+
+        The rebuild is workspace-addressed, and a machine with no workspace has
+        nothing to back up or restore: the start path builds a new sandbox when
+        the one the row names is gone. Re-checked under the stop claim, since a
+        placement does not take the machine's advisory key. False when the
+        machine left 'running', gained a workspace or work, and nothing was done.
+        """
+        computer_id = str(computer["computer_id"])
+        if await self._claim_machine_for_stop(computer_id) is None:
+            return False
+        settled = ComputerStatus.RUNNING
+        try:
+            if await get_live_workspace_ids_for_computer(
+                computer_id
+            ) or await self._machine_has_active_tasks(computer_id):
+                return False
+            # Before the session's cleanup, which deletes the sandbox.
+            await self._fold_usage_before_delete(computer_id)
+            self._cancel_mcp_discovery(computer_id)
+            await self._clear_session(computer_id)
+            SessionManager.remove_session(computer_id)
+            await self._destroy_sandbox(
+                sandbox_id, binding=self._binding_from_computer("", computer)
+            )
+            await clear_computer_disk(computer_id, sandbox_id=sandbox_id)
+            settled = ComputerStatus.STOPPED
+            return True
+        finally:
+            await self._settle_machine_stop(computer_id, settled)
 
     async def _destroy_sandbox(
         self, sandbox_id: str, *, binding: Any = None, timeout: float = 60.0
@@ -781,6 +920,14 @@ class ComputerSpecMixin:
         replacement beside a sandbox still billed. A sandbox already gone
         returns normally. ``binding`` points it at the machine's own backend.
         """
+        from src.server.services.preview_capabilities import revoke
+
+        if binding is not None and not binding.provider.recreatable:
+            # Every caller builds a replacement after this, which a machine its
+            # owner brought never gets; their own checks keep it from here.
+            raise RuntimeError("This computer's machine is never replaced")
+        # First, so no proxied preview outlives the sandbox it opens.
+        await revoke(sandbox_id)
         provider = self._provider_for(binding)
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout

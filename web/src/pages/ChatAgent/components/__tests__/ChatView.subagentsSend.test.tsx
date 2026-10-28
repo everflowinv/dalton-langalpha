@@ -27,7 +27,7 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock('@/lib/framer', async () => (await import('./chatViewHarness')).framerMock());
 vi.mock('react-i18next', () => ({
-  useTranslation: () => ({ t: (key: string) => key }),
+  useTranslation: () => ({ t: (key: string) => key, i18n: { language: 'en-US', resolvedLanguage: 'en-US' } }),
 }));
 vi.mock('@/lib/supabase', () => ({ supabase: null }));
 vi.mock('@/hooks/useUser', () => ({ useUser: () => ({ user: null }) }));
@@ -284,5 +284,50 @@ describe("ChatView: a draft from Subagents' Create with the agent", () => {
     expect(mocks.setValue).toHaveBeenCalledTimes(1);
     expect(mocks.setValue).toHaveBeenCalledWith('Set up a subagent that ');
     expect(chatState.handleSendMessage).not.toHaveBeenCalled();
+  });
+
+  function mountDraftView(isActive: boolean) {
+    mocks.getWorkspace.mockResolvedValue({ workspace_id: WORKSPACE_ID, name: 'Home', status: 'running', is_home: true });
+    chatState.threadId = '__default__';
+    let state = null as Record<string, unknown> | null;
+    let navigate!: NavigateFunction;
+    const Probe = () => {
+      state = useLocation().state as Record<string, unknown> | null;
+      navigate = useNavigate();
+      return null;
+    };
+    render(
+      <QueryClientProvider client={createTestQueryClient()}>
+        <MemoryRouter initialEntries={['/chat']}>
+          <Probe />
+          <ChatView workspaceId={WORKSPACE_ID} threadId="__default__" onBack={vi.fn()} workspaceName="Harness WS" isActive={isActive} />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    const open = (draftMessage: string) =>
+      act(() => { void navigate('/chat/t/__default__', { state: { workspaceId: WORKSPACE_ID, draftMessage } }); });
+    return { open, state: () => state };
+  }
+
+  it('takes each later draft into the same kept view, as a second starter question does', async () => {
+    const { open, state } = mountDraftView(true);
+
+    open('What moved in my watchlist today, and why?');
+    await waitFor(() => expect(mocks.setValue).toHaveBeenCalledWith('What moved in my watchlist today, and why?'));
+    await waitFor(() => expect(state()?.draftMessage).toBeUndefined());
+    open('Set up a workspace to track semiconductor breadth');
+
+    await waitFor(() => expect(mocks.setValue).toHaveBeenLastCalledWith('Set up a workspace to track semiconductor breadth'));
+    expect(mocks.setValue).toHaveBeenCalledTimes(2);
+  });
+
+  it('leaves the draft to the view on screen when this one is kept hidden', async () => {
+    const { open, state } = mountDraftView(false);
+
+    open('What moved in my watchlist today, and why?');
+    await new Promise((r) => setTimeout(r, 50));
+
+    expect(mocks.setValue).not.toHaveBeenCalled();
+    expect(state()?.draftMessage).toBe('What moved in my watchlist today, and why?');
   });
 });

@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple, Optional
 
 
 from ptc_agent.agent.limits import UNBOUNDED_RECURSION_LIMIT
+from ptc_agent.agent.middleware.provenance.command_trace import REPORT_COMMAND_KEY
 from ptc_agent.agent.middleware.runtime_context import TurnContext, parse_surface
 from src.config.settings import (
     get_langsmith_metadata,
@@ -27,11 +28,16 @@ from src.config.settings import (
     get_locale_config,
 )
 from src.observability.langsmith_tracer import with_run_tracer
+from src.server.contracts.turn_kinds import (
+    ANNOUNCED_KEYS,
+    NOTIFICATION_QUERY_TYPES,
+    WAKE_QUERY_TYPE,
+)
 from src.server.database import conversation as qr_db
 from src.server.database.conversation.threads_write import remember_thread_llm_model
 from src.server.services.llm.thread_model import NamedModel
 from src.server.database.runs import lifecycle as tl_db
-from src.server.models.chat import summarize_hitl_response_map
+from src.server.models.chat import CommandReport, summarize_hitl_response_map
 from src.server.utils.skill_context import (
     detect_slash_commands,
     parse_skill_contexts,
@@ -58,10 +64,16 @@ logger = logging.getLogger("src.server.handlers.chat_handler")
 # stream.
 DISPATCH_STARTED_MARKER = "__dispatch_run_started__"
 
-# Yielded instead, followed by the live run's id, when a dispatched hand-off
-# met a running turn and was accepted into it as a steer: no run of its own
-# starts, and the primer answers with the run that takes it in.
-DISPATCH_STEERED_MARKER = "__dispatch_run_steered__:"
+
+@dataclass(frozen=True)
+class HandOffSteered:
+    """Yielded instead when a dispatched hand-off met a running turn and went
+    into it as a steer: no run of its own starts, and the primer answers with
+    ``run_id``, the run it was sent into, and ``steer_id``, the steer's row,
+    which names a later run that takes it in if that one ends first."""
+
+    run_id: str
+    steer_id: str
 
 
 # ---------------------------------------------------------------------------
@@ -263,18 +275,21 @@ def provenance_metadata(request: ChatRequest) -> dict[str, Any]:
     raw surface string, the client deciding which values it labels, and the
     request's own rather than :func:`turn_surface`'s, which gives a
     report-back the thread's channel although nobody sent it from there; and
-    ``report_source`` names what a report-back turn announces, since that
-    turn's own message is model-facing and hidden.
+    the ``ANNOUNCED_KEYS`` name what a notification turn announces, since its
+    own message is model-facing and hidden: ``report_source`` a report-back's
+    report, ``market_target`` and ``wakeup`` a wake's notices.
     """
     metadata: dict[str, Any] = {}
     if request.origin:
         metadata["origin"] = request.origin.model_dump(exclude_none=True)
     if request.platform:
         metadata["platform"] = request.platform
-    if request.report_source:
-        metadata["report_source"] = request.report_source.model_dump(
-            exclude_none=True
-        )
+    for key in ANNOUNCED_KEYS:
+        value = getattr(request, key)
+        if value and not isinstance(value, dict):
+            value = value.model_dump(exclude_none=True)
+        if value:
+            metadata[key] = value
     return metadata
 
 
@@ -448,6 +463,10 @@ async def ensure_thread(
     workspace_id: str,
     user_id: str,
     initial_query: str = "",
+    # DALTON-HOOK(colleague-dispatch): workspace owner and origin channel for colleague thread metadata.
+    workspace_owner_id: str | None = None,
+    origin_channel: str = "web",
+    is_colleague_turn: bool = False,
 ) -> PriorThread:
     """Ensure a thread record exists in the database, optionally with external linkage.
 
@@ -473,6 +492,19 @@ async def ensure_thread(
     if request.origin:
         ensure_kwargs["metadata"] = {
             "origin": request.origin.model_dump(exclude_none=True)
+        }
+    # DALTON-HOOK(colleague-dispatch): attach dispatched_by when creating a thread in a colleague's workspace.
+    if is_colleague_turn or (
+        workspace_owner_id and str(workspace_owner_id) != str(user_id)
+    ):
+        from src.dalton.sharing import build_dispatched_by_meta
+
+        disp_channel = "cos" if origin_channel == "cos" else "web"
+        ensure_kwargs["metadata"] = {
+            **(ensure_kwargs.get("metadata") or {}),
+            "dispatched_by": await build_dispatched_by_meta(
+                user_id, channel=disp_channel
+            ),
         }
     # Applied only if this send creates the thread; PATCH owns it after.
     if request.subagents_allowed is not None:
@@ -553,14 +585,16 @@ def build_turn_context(
 
 
 def is_notification_turn(request: ChatRequest) -> bool:
-    """Whether this server posted the turn itself to report finished background work.
+    """Whether this server posted the turn itself, to report finished background
+    work, a market target's notice or a wakeup that fired.
 
-    A report-back arrives as a system query with no surface of its own. Nobody
-    sent it, so it speaks where the thread's last turn did rather than naming a
-    surface. ``query_type`` is stripped from every request that is not the
-    server's own (``threads/messaging.py``), so a client cannot claim one.
+    A report-back arrives as a system query with no surface of its own, and a
+    wake as a ``market_target`` or ``wakeup`` query. Nobody sent any of them,
+    so it speaks where the thread's last turn did rather than naming a surface.
+    ``query_type`` is stripped from every request that is not the server's own
+    (``threads/messaging.py``), so a client cannot claim one.
     """
-    return request.query_type == "system" and not request.platform
+    return request.query_type in NOTIFICATION_QUERY_TYPES and not request.platform
 
 
 def turn_surface(request: ChatRequest, prior: PriorThread) -> Optional[str]:
@@ -800,6 +834,28 @@ async def turn_start_checkpoint_id(
     return await turn_base_checkpoint_id(checkpointer, thread_id)
 
 
+def _origin_metadata(request: ChatRequest, *, from_server: bool) -> dict[str, str]:
+    """Who sent the turn, so a trace can be split by what drove it.
+
+    Read per request rather than off the thread: an automation's thread takes
+    turns from a person too, and only the request says which this one is. A
+    turn the server posts itself (a report-back or a wake) carries no origin
+    either, so its query type, which no client can set, keeps it from reading
+    as the user's. Any client may name an origin, so only the server's own is
+    believed: a person's turn labelled an automation's would drop out of the
+    user traffic and pin its failures on an automation.
+    """
+    if request.query_type in NOTIFICATION_QUERY_TYPES:
+        return {"origin": "system", "query_type": request.query_type}
+    origin = request.origin
+    if origin is None or not from_server:
+        return {"origin": "user"}
+    fields = {"origin": origin.type}
+    if origin.type == "automation" and origin.id:
+        fields["automation_id"] = origin.id
+    return fields
+
+
 def build_graph_config(
     thread_id: str,
     user_id: str,
@@ -815,6 +871,7 @@ def build_graph_config(
     turn_index: int | None = None,
     surface: str | None = None,
     base_checkpoint_id: str | None = None,
+    from_server: bool = False,
 ) -> dict:
     """Build the LangGraph ``config`` dict for a PTC turn.
 
@@ -828,7 +885,8 @@ def build_graph_config(
     ``configurable`` as ``run_id`` and ``platform``, which is where a tool
     reads which run and which conversation it is acting in.
     ``base_checkpoint_id`` is where a turn that names no checkpoint starts
-    (``turn_start_checkpoint_id``).
+    (``turn_start_checkpoint_id``). ``from_server`` says the server sent the
+    request, so the trace believes the origin it names.
     """
     langsmith_tags = get_langsmith_tags(locale=request.locale)
     langsmith_metadata = get_langsmith_metadata(
@@ -845,6 +903,7 @@ def build_graph_config(
         langsmith_metadata["run_id"] = run_id
     if turn_index is not None:
         langsmith_metadata["turn_index"] = turn_index
+    langsmith_metadata.update(_origin_metadata(request, from_server=from_server))
 
     configurable: dict = {
         "thread_id": thread_id,
@@ -853,7 +912,16 @@ def build_graph_config(
         "timezone": timezone_str,
         "run_id": run_id,
         "platform": surface,
+        # Only a turn a wakeup started may end without a reply. The type is
+        # server-only, so no client can claim it.
+        "wake_turn": request.query_type == WAKE_QUERY_TYPE,
     }
+    # A command's report-back turn names the command, so the call that reads
+    # its notice brings the command's data sources with it. Its own field
+    # (``report_source``) is server-only; the trace stays on the command's row.
+    report = request.report_source
+    if isinstance(report, CommandReport):
+        configurable[REPORT_COMMAND_KEY] = report.command_id
     if extra_configurable:
         configurable.update(extra_configurable)
     if skill_contexts:

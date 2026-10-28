@@ -366,6 +366,55 @@ describe('FileHeaderActions', () => {
     expect(screen.getByRole('dialog')).toHaveTextContent('share results/report.html');
   });
 
+  it('switches an HTML file between its page and its source', () => {
+    const onToggleHtmlSource = vi.fn();
+    const html = { selectedFile: 'results/report.html', fileMime: 'text/html', onToggleHtmlSource };
+    const { rerender } = render(<FileHeaderActions {...defaultProps} {...html} />);
+    fireEvent.click(screen.getByRole('button', { name: 'filePanel.viewSource' }));
+    expect(onToggleHtmlSource).toHaveBeenCalledTimes(1);
+
+    rerender(<FileHeaderActions {...defaultProps} {...html} htmlSource />);
+    expect(screen.getByRole('button', { name: 'filePanel.viewPreview' })).toBeInTheDocument();
+  });
+
+  it('offers no source switch for a file that is not HTML', () => {
+    render(<FileHeaderActions {...defaultProps} onToggleHtmlSource={vi.fn()} />);
+    expect(screen.queryByRole('button', { name: 'filePanel.viewSource' })).not.toBeInTheDocument();
+  });
+
+  // The grant URL is the panel's to load and expires; a tab opened on it
+  // would break hours later, so the owner gets the file's own /a/ page.
+  it("opens the owner's HTML file at its share page in a new tab", () => {
+    const open = vi.spyOn(window, 'open').mockImplementation(() => null);
+    render(<FileHeaderActions {...defaultProps} selectedFile="results/report.html" fileMime="text/html" />);
+    fireEvent.click(screen.getByRole('button', { name: 'filePanel.openInNewTab' }));
+    expect(open).toHaveBeenCalledWith(
+      `${window.location.origin}/a/abc123abc123`,
+      '_blank',
+      'noopener,noreferrer',
+    );
+    open.mockRestore();
+  });
+
+  it("opens a shared HTML file under the share's own prefix", () => {
+    const open = vi.spyOn(window, 'open').mockImplementation(() => null);
+    render(
+      <FileHeaderActions
+        {...defaultProps}
+        selectedFile="results/report.html"
+        fileMime="text/html"
+        servePrefix="/api/v1/public/shared/tok-1/files/serve/"
+      />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'filePanel.openInNewTab' }));
+    expect(open).toHaveBeenCalledWith(
+      '/api/v1/public/shared/tok-1/files/serve/results/report.html',
+      '_blank',
+      'noopener,noreferrer',
+    );
+    open.mockRestore();
+  });
+
   it('renders only Download for binary file', () => {
     render(
       <FileHeaderActions

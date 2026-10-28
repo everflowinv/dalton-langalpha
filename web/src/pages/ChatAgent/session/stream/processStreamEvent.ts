@@ -12,7 +12,7 @@ import { noteLiveRun } from '../latestRun';
 import type { StructuredError } from '@/utils/rateLimitError';
 import { applyAnnotationArtifact } from '@/pages/MarketView/stores/chartAnnotationStore';
 import type { AssistantMessage, ChatMessage } from '@/types/chat';
-import { CREDIT_STOP_ERROR_TYPE, isDeliveredReport } from '@/types/sse';
+import { CREDIT_STOP_ERROR_TYPE, isDeliveredNotice, isDeliveredReport, isDeliveredSteer } from '@/types/sse';
 import { setStoredThreadId } from '../../hooks/utils/threadStorage';
 import { createAssistantMessage, updateMessage } from '../../hooks/utils/messageHelpers';
 import { turnOf } from '../../components/messageList/turnProjection';
@@ -43,13 +43,26 @@ import {
 } from '../subagents/liveEventHandlers';
 import { getOrCreateTaskRefs, type UpdateSubagentCard } from '../streamRefs';
 import { handleMarketWatchUpdate, type MarketWatchState } from '../marketWatchEvents';
+import { SCHEDULE_WAKEUP, wakeTurnOpener, withLiveWakeRow } from '../wakeupEvents';
 import type {
   SSEEvent, StreamProcessorRefs, ModelStatus,
 } from '../types';
-import { dispatchResultFields, setCardFields, settleProposalFromResult } from '../interrupts/buckets';
+import { setCardFields, settleProposalFromResult } from '../interrupts/buckets';
 import { projectLiveInterrupt } from '../interrupts/fromLiveEvent';
 import type { StreamRuntime } from '../runtime';
 import { preapprovedReportBack } from '../../utils/preapprovedCards';
+import { dispatchResultFields } from '../../utils/dispatchResult';
+
+type RefreshOnResult = 'refreshMarketWatch' | 'refreshWakeups' | 'refreshCommands';
+
+/** The tools whose result is when the chip and the Status panel re-read what
+ *  the call changed, rather than at turn end. */
+const REFRESH_ON_RESULT = new Map<string, RefreshOnResult>([
+  ['watch_market', 'refreshMarketWatch'],
+  [SCHEDULE_WAKEUP, 'refreshWakeups'],
+  // A status read can stop a command.
+  ['ThreadStatus', 'refreshCommands'],
+]);
 
 export interface StreamRouterDeps {
   /** Fold a model-fallback event into the fallback banner state. */
@@ -60,11 +73,20 @@ export interface StreamRouterDeps {
   releaseStreamOwnership: () => void;
   attachSubagentMux: (tid: string, processEvent: (event: SSEEvent) => void, snapshotAtMs?: number) => void;
   setMarketWatch: React.Dispatch<React.SetStateAction<MarketWatchState | null>>;
+  /** Re-read the thread's watched symbols, after the agent changed them. */
+  refreshMarketWatch: () => void;
+  /** Re-read the thread's wakeups, after one fired or the agent set or
+   * cancelled some. */
+  refreshWakeups: () => void;
+  /** Re-read the thread's background commands, after one moved to the
+   * background, was stopped, or reported its end. */
+  refreshCommands: () => void;
   /** Re-read the workspace row, whose folder a run's sandbox acquisition may
    * have moved; null with no workspace. */
   refreshWorkspaceFolder: (() => void) | null;
-  /** Watch this thread for a hand-off's report-back. */
-  armReportBack: () => void;
+  /** Watch this thread for a hand-off's report-back; `owed` as the watch's
+   *  arm takes it (null arms without touching the tip). */
+  armReportBack: (owed?: boolean | null) => void;
   /** Re-read the user's workspaces after an agent changed one. */
   refreshWorkspaces: () => void;
   /** Hears the turn the server admitted the run to, before the run's bubbles
@@ -137,6 +159,9 @@ export const createStreamEventProcessor = (rt: StreamRuntime, deps: StreamRouter
   // This ensures the tool-call index is populated before tool_call_result.
   const pendingTaskToolCallIds: string[] = [];
 
+  // Those calls still to answer, by call id.
+  const pendingRefreshCalls = new Map<string, RefreshOnResult>();
+
   // Append a notification segment to a task card's latest assistant message
   // (transcript notice inside the subagent detail view). No-ops before the
   // task has an assistant message — status still surfaces via chan_close.
@@ -203,6 +228,20 @@ export const createStreamEventProcessor = (rt: StreamRuntime, deps: StreamRouter
           const { run_id: runId, report_source: source, turn_index: turn } = event;
           const beforeId = rt.currentMessageRef.current;
           rt.setMessages((prev) => withLiveReportRow(prev, runId, source, beforeId, turn));
+          // The command it reports on has ended, which its tool card shows.
+          if (source.kind === 'command_report') deps.refreshCommands();
+        } else {
+          // A wake, attached live, draws its opener row from this frame,
+          // keyed on the turn as replay keys it, so a later load replaces it
+          // rather than drawing a second.
+          const row = typeof event.turn_index === 'number' ? wakeTurnOpener(event.turn_index, event, new Date()) : null;
+          if (row) {
+            const beforeId = rt.currentMessageRef.current;
+            rt.setMessages((prev) => withLiveWakeRow(prev, row, beforeId));
+            // The wake moved its wakeup on the server, which the chip and the
+            // Status panel would otherwise show armed.
+            deps.refreshWakeups();
+          }
         }
       }
       // The turn admission gave the run, which a view that missed turns added
@@ -277,10 +316,21 @@ export const createStreamEventProcessor = (rt: StreamRuntime, deps: StreamRouter
       return;
     }
 
+    // turn_held: this send waits on a thread mutation (compact, offload, a
+    // model-switch handoff). `released` ends the wait; the stream's end clears
+    // it too, so an error frame in between cannot leave the line up.
+    if (eventType === 'turn_held') {
+      rt.setTurnHeld(event.status === 'held' ? String(event.reason ?? '') : null);
+      return;
+    }
+
     // (b) Live market-watch stamp — keep the persistent watch chip current
     // mid-turn. Swallowed here so it never leaks into the message stream.
     if (eventType === 'market_watch_update') {
-      handleMarketWatchUpdate({ event, setMarketWatch: deps.setMarketWatch });
+      handleMarketWatchUpdate({
+        event,
+        setMarketWatch: deps.setMarketWatch,
+      });
       return;
     }
 
@@ -303,11 +353,18 @@ export const createStreamEventProcessor = (rt: StreamRuntime, deps: StreamRouter
     if (eventType === 'steering_delivered' && !isSubagent) {
       const oldAssistantId = assistantMessageId;
       const entries = steeringDeliveredEntries(event);
-      // A delivery of reports alone leaves the user's own steer, and the
-      // boundary its acceptance set, for the delivery that takes it. Read
-      // here, not in the rollback updater, which React may run after the
-      // take has nulled both.
-      const effectiveSteeringAtOrder = entries.some((e) => !isDeliveredReport(e)) ? takeSteeringBoundary() : null;
+      // A delivery of reports or price alerts alone leaves the user's own
+      // steer, and the boundary its acceptance set, for the delivery that
+      // takes it. Read here, not in the rollback updater, which React may run
+      // after the take has nulled both.
+      const effectiveSteeringAtOrder = entries.some(isDeliveredSteer) ? takeSteeringBoundary() : null;
+      // A delivered alert or wakeup moved its wakeup on the server, which the
+      // chip and the Status panel show.
+      if (entries.some(isDeliveredNotice)) deps.refreshWakeups();
+      // A command's report taken into the turn: the command has ended.
+      if (entries.some((entry) => isDeliveredReport(entry) && entry.report_source.kind === 'command_report')) {
+        deps.refreshCommands();
+      }
 
       // 1. Roll back old assistant message to the snapshot taken at steering_accepted
       //    time, removing any content that leaked due to stream-mode multiplexing.
@@ -394,8 +451,8 @@ export const createStreamEventProcessor = (rt: StreamRuntime, deps: StreamRouter
       // The bubble being steered: every bubble this creates joins its turn,
       // read from the projection because a report-back's bubble has no stamp.
       const steeredId = assistantMessageId;
-      // 2. Mark delivered the steers it names and draw the rest, reports
-      //    ahead of the user's words.
+      // 2. Mark delivered the steers it names and draw the rest, reports and
+      //    price alerts ahead of the user's words.
       let clearedErrors: unknown[] = [];
       let settledKeys: string[] = [];
       rt.setMessages((prev) => {
@@ -584,6 +641,7 @@ export const createStreamEventProcessor = (rt: StreamRuntime, deps: StreamRouter
             content: event.content as string,
             finishReason: event.finish_reason,
             elapsedMs: typeof event.elapsed_ms === 'number' ? event.elapsed_ms : undefined,
+            atMs: typeof event._atMs === 'number' ? event._atMs : undefined,
             refs,
             updateSubagentCard: queueCardForHandlers,
           });
@@ -600,6 +658,7 @@ export const createStreamEventProcessor = (rt: StreamRuntime, deps: StreamRouter
             taskId,
             assistantMessageId: subagentAssistantMessageId,
             toolCalls: (event.tool_calls || []) as unknown as Record<string, unknown>[],
+            atMs: typeof event._atMs === 'number' ? event._atMs : undefined,
             refs,
             updateSubagentCard: rt.updateSubagentCard,
           });
@@ -653,6 +712,7 @@ export const createStreamEventProcessor = (rt: StreamRuntime, deps: StreamRouter
               taskId,
               content: event.content as string,
               entries: event.entries as DeliveredInstruction[] | undefined,
+              steered: true,
               refs,
               updateSubagentCard: rt.updateSubagentCard,
             });
@@ -667,6 +727,7 @@ export const createStreamEventProcessor = (rt: StreamRuntime, deps: StreamRouter
               taskId,
               content: event.content as string,
               entries: [{ content: event.content as string, sender: 'agent' }],
+              steered: false,
               refs,
               updateSubagentCard: rt.updateSubagentCard,
             });
@@ -796,6 +857,13 @@ export const createStreamEventProcessor = (rt: StreamRuntime, deps: StreamRouter
         ? { message: errorMessage as string, kind: 'notice' }
         : readStreamFailure(event, errorMessage as string);
 
+      // DALTON-HOOK(colleague-dispatch): terminal non-retryable error when workspace owner revokes colleague access
+      if (event.code === 'colleague_access_revoked') {
+        failureShown = true;
+        rt.setMessageError(rt.t('dalton.sharing.revokedThreadReadonlyHint'));
+        settleFailedBubble({ assistantMessageId, refs, setMessages: setMessagesForHandlers, internal: true });
+        return;
+      }
       // A server older than this view frames its time limit, then the same
       // stop again as an internal error: the card already says it, and a
       // banner on top would report one failure twice.
@@ -808,7 +876,8 @@ export const createStreamEventProcessor = (rt: StreamRuntime, deps: StreamRouter
         // may leave state. One that produced something shows as a failed turn
         // with it; an empty one (the reconnect cleanup's test: no segments, no
         // content) settles without `error`, which the render-time orphan skip
-        // hides, as it does the 429 path's.
+        // hides, as it does the 429 path's, unless it is a hidden opener's
+        // (settleFailedBubble).
         // The headline alone, as a reload shows it: the frame's text is the
         // server's raw exception and stays on the wire for other readers.
         rt.setMessageError({ message: '', kind: 'internal' });
@@ -999,6 +1068,8 @@ export const createStreamEventProcessor = (rt: StreamRuntime, deps: StreamRouter
           if ((tc.name === 'task' || tc.name === 'Task') && tc.id && !tc.args?.task_id) {
             pendingTaskToolCallIds.push(tc.id);
           }
+          const refresh = REFRESH_ON_RESULT.get(tc.name);
+          if (refresh && tc.id) pendingRefreshCalls.set(tc.id, refresh);
         }
       }
     } else if (eventType === 'tool_call_result') {
@@ -1007,10 +1078,8 @@ export const createStreamEventProcessor = (rt: StreamRuntime, deps: StreamRouter
       // Settle a card the history replay left pending, from the result of the
       // run that answered it.
       const unresolvedList = refs.unresolvedHistoryInterruptRef?.current;
-      if (unresolvedList && typeof event.content === 'string') {
-        settleProposalFromResult(
-          unresolvedList, event.tool_call_id as string | undefined, event.content, rt.setMessages,
-        );
+      if (unresolvedList) {
+        settleProposalFromResult(unresolvedList, event.tool_call_id as string | undefined, event, rt.setMessages);
       }
 
       const toolCallId = event.tool_call_id as string;
@@ -1019,6 +1088,14 @@ export const createStreamEventProcessor = (rt: StreamRuntime, deps: StreamRouter
       if (event.artifact?.task_id && toolCallId) {
         const agentId = `task:${event.artifact.task_id}`;
         rt.subagentHistory.toolCalls.set(toolCallId, agentId);
+      }
+      // A call that moved its command to the background, or started one
+      // there, names it on its artifact. Its end can start a turn of its own,
+      // which the report-back watch attaches in place, so the watch is armed
+      // too; it owes nothing the tray names, since the command's row is there.
+      if (event.artifact?.command_id) {
+        deps.refreshCommands();
+        deps.armReportBack(null);
       }
 
       handleToolCallResult({
@@ -1045,6 +1122,12 @@ export const createStreamEventProcessor = (rt: StreamRuntime, deps: StreamRouter
 
       if (isWorkspaceChangingToolSuccess(event.content)) deps.refreshWorkspaces();
 
+      const refresh = toolCallId ? pendingRefreshCalls.get(toolCallId) : undefined;
+      if (refresh) {
+        pendingRefreshCalls.delete(toolCallId);
+        deps[refresh]();
+      }
+
       // Detect navigate_to_workspace action from start_question tool result
       if (rt.onWorkspaceCreated && typeof event.content === 'string') {
         try {
@@ -1064,7 +1147,7 @@ export const createStreamEventProcessor = (rt: StreamRuntime, deps: StreamRouter
         const backfillPid = toolCallId ? rt.pendingPTCBackfillRef.current.get(toolCallId) : undefined;
         if (backfillPid) {
           rt.pendingPTCBackfillRef.current.delete(toolCallId);
-          const fields = dispatchResultFields(event.content);
+          const fields = dispatchResultFields(event);
           rt.setMessages((prev) => setCardFields(prev, 'ptcAgentProposals', backfillPid, fields));
         }
       }

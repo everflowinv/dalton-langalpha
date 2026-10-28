@@ -9,6 +9,10 @@ from datetime import datetime, timezone
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Dict, Mapping, Optional, Set, Tuple
 
+from ptc_agent.core.mcp_composite import builtin_registry_of
+from ptc_agent.core.mcp_registry import get_global_registry
+from ptc_agent.core.sandbox.providers import provider_class
+from ptc_agent.core.sandbox.runtime import SandboxProvider
 from ptc_agent.core.session import Session
 from src.server.services.livefs.tracker import MountTracker
 
@@ -56,6 +60,21 @@ class WorkspaceNotOnComputer(ValueError):
         )
 
 
+class WorkspaceNotFound(ValueError):
+    """The workspace is deleted, or is not on the computer the caller named.
+
+    A ValueError, as a route answers any not found, and a type of its own so
+    a caller that expects another request to have deleted it can tell that
+    from every other refusal a delete raises as a ValueError."""
+
+    def __init__(self, workspace_id: str, *, computer_id: Optional[str] = None):
+        self.workspace_id = workspace_id
+        super().__init__(
+            f"Workspace {workspace_id} not found"
+            + (f" on computer {computer_id}" if computer_id else "")
+        )
+
+
 @dataclass(frozen=True)
 class ComputerBinding:
     """Which machine a project is on, and how to reach that machine's backend.
@@ -67,22 +86,66 @@ class ComputerBinding:
     acquisition resolves the binding it hands out. None on a workspace binding
     means only that this read did not answer for the folder, so the layout
     resolves it from the row; a caller that builds a workspace binding out of a
-    machine row has to supply it."""
+    machine row has to supply it. files_epoch names the last arrival of the
+    project's files on this machine, a move or a settled restore offer, None if
+    none has come. files_backup is the machine's switch for routine backups,
+    off only where its owner chose."""
 
     workspace_id: str
     computer_id: str
+    kind: str
     dir_name: Optional[str] = None
-    kind: Optional[str] = None
     root_dir: Optional[str] = None
     provider_ref: Optional[str] = None
     resource_tier: Optional[str] = None
     is_always_on: bool = False
     provider_config: Optional[Dict[str, Any]] = None
+    files_epoch: Optional[str] = None
+    files_backup: bool = True
 
     @property
-    def provider_identity(self) -> Tuple[Optional[str], str]:
+    def provider_identity(self) -> Tuple[str, str]:
         """Row-level provider overrides distinguish backends of the same kind."""
         return (self.kind, json.dumps(self.provider_config or {}, sort_keys=True))
+
+    @property
+    def provider(self) -> type[SandboxProvider]:
+        """The machine's provider class, for the facts its kind fixes; an
+        unknown kind raises, since nothing can reach such a machine."""
+        return provider_class(self.kind)
+
+
+@dataclass(frozen=True)
+class MachineTarget:
+    """The root and target a computer's row names now, read from Postgres by
+    the request that asks for a cached session.
+
+    An ssh computer keeps its provider_ref through a reinstall or reconnect
+    another worker ran, so a sandbox id cannot fence a session built before
+    either, and no channel tells this worker it happened."""
+
+    kind: Optional[str]
+    root_dir: Optional[str] = None
+    provider_config: Optional[Dict[str, Any]] = None
+
+    @classmethod
+    def of_computer(cls, computer: Mapping[str, Any] | None) -> "MachineTarget":
+        computer = computer or {}
+        return cls(
+            kind=computer.get("kind"),
+            root_dir=computer.get("root_dir"),
+            provider_config=computer.get("provider_config") or None,
+        )
+
+    @classmethod
+    def of_workspace(cls, workspace: Mapping[str, Any] | None) -> "MachineTarget":
+        """From a workspace row that joined its computer as ``computer_*``."""
+        workspace = workspace or {}
+        return cls(
+            kind=workspace.get("computer_kind"),
+            root_dir=workspace.get("computer_root_dir"),
+            provider_config=workspace.get("computer_provider_config") or None,
+        )
 
 
 @dataclass(frozen=True)
@@ -125,6 +188,15 @@ class WorkspaceToolView:
             ),
             trading_rule=getattr(session, "trading_rule", None),
         )
+
+    def builtins_superseded(self) -> bool:
+        """Whether a reconnected built-in server has replaced the snapshot this
+        view was built on, so its tools, its prompt summary and the wrappers
+        synced from it all still lack that server until the view is rebuilt."""
+        if self.mcp_registry is None or self.session._owns_mcp_registry:
+            return False
+        current = get_global_registry()
+        return current is not None and builtin_registry_of(self.mcp_registry) is not current
 
     @classmethod
     def builtin_only(cls, workspace_id: str, session: Session) -> "WorkspaceToolView":

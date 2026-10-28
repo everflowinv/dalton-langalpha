@@ -89,7 +89,7 @@ describe('ScopeControl with Home', () => {
     );
     const checks = screen.getAllByRole('menuitemcheckbox');
     expect(checks.map((el) => el.textContent)).toEqual(['Research', 'Home']);
-    // The house that name goes with, not the stack that reads as All workspaces.
+    // The house that name goes with, not the Chief of Staff's bot.
     expect(checks[1].querySelector('svg.lucide-house')).not.toBeNull();
     expect(checks.map((el) => el.getAttribute('aria-checked'))).toEqual(['true', 'false']);
     // Home is never a move destination.

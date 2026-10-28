@@ -15,7 +15,9 @@ async def claimed_grants(seed_user, patched_get_db_connection, test_db_pool):
     from src.server.database.workspace import create_workspace_on_computer
 
     owner = seed_user['user_id']
-    computer = await create_computer(owner, kind='daytona', is_primary=True)
+    computer = await create_computer(
+        owner, kind='daytona', name='Cloud computer', is_primary=True
+    )
     cid = str(computer['computer_id'])
     first = await create_workspace_on_computer(owner, 'first', cid)
     second = await create_workspace_on_computer(owner, 'second', cid)

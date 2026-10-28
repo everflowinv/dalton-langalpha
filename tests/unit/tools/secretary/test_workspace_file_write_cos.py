@@ -83,8 +83,7 @@ def _install(
         for d in (existing_subdirs or [])
     ]
 
-    import src.server.app.workspace_files._shared as shared_mod
-    import src.server.app.workspace_files.crud as crud_mod
+    import src.server.services.workspace_files as workspace_files_service
 
     contained_calls: list[tuple[str, str]] = []
 
@@ -92,13 +91,17 @@ def _install(
         contained_calls.append((path, work_dir))
         return f"{work_dir.rstrip('/')}/{path.lstrip('/')}"
 
-    monkeypatch.setattr(crud_mod, "_contained_target", _contained_target)
+    monkeypatch.setattr(
+        workspace_files_service, "contained_target", _contained_target
+    )
 
     @asynccontextmanager
     async def _acquire(workspace_id: str, user_id: str):
         yield sandbox, ws_row
 
-    monkeypatch.setattr(shared_mod, "_acquire_sandbox_to_change", _acquire)
+    monkeypatch.setattr(
+        workspace_files_service, "acquire_sandbox_to_change", _acquire
+    )
     sandbox._contained_calls = contained_calls  # type: ignore[attr-defined]
     return sandbox
 

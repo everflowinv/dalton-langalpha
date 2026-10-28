@@ -21,6 +21,7 @@ from src.server.contracts.status import PUBLIC_STATUSES
 from src.server.models.automation import FailureReason
 from src.tools.secretary import activity
 from src.tools.secretary.activity import render_activity
+from src.tools.secretary.utils import ComputerPlacement
 
 HOME = "home-0001"
 HOME_COMPUTER = "computer-home"
@@ -40,7 +41,7 @@ def _render(**rows) -> str:
         runs=[],
         holdings=[],
         home_id=HOME,
-        home_computer_id=HOME_COMPUTER,
+        placement=ComputerPlacement(home_computer_id=HOME_COMPUTER),
         zone=NY,
         today=TODAY,
     )
@@ -158,6 +159,74 @@ def test_a_workspace_on_another_computer_names_no_folder():
     )
     assert text.splitlines()[1] == (
         "- Semis: Chip makers (last active 2026-10-05, workspace_id `ws-semis`)"
+    )
+
+
+def test_with_two_computers_every_workspace_names_its_computer():
+    """A user with one computer reads no computer at all (the tests above);
+    with two, each line says which, beside the folder Home can read."""
+    text = _render(
+        workspaces=[
+            WORKSPACES[0],
+            {**WORKSPACES[0], "workspace_id": "ws-far", "name": "Far", "computer_id": "computer-other"},
+        ],
+        workspace_total=2,
+        placement=ComputerPlacement(
+            home_computer_id=HOME_COMPUTER,
+            names={HOME_COMPUTER: "Cloud computer", "computer-other": "Big box"},
+        ),
+    )
+    lines = text.splitlines()
+    assert lines[1] == (
+        '- Semis: Chip makers (last active 2026-10-05, computer "Cloud computer", '
+        "folder `semis`, workspace_id `ws-semis`)"
+    )
+    assert lines[2] == (
+        '- Far: Chip makers (last active 2026-10-05, computer "Big box", '
+        "workspace_id `ws-far`)"
+    )
+
+
+def test_a_computer_of_the_users_own_says_so_only_where_it_is_named():
+    """With one computer, Home's own block says whose it is."""
+    mac = {
+        "computer_id": "computer-mac",
+        "name": "Studio Mac",
+        "is_home": False,
+        "kind": "ssh",
+        "provider_config": {"helper": True, "os": "Darwin"},
+    }
+    hosted = {
+        "computer_id": HOME_COMPUTER,
+        "name": "Cloud computer",
+        "is_home": True,
+        "kind": "daytona",
+        "provider_config": {},
+    }
+    on_mac = {**WORKSPACES[0], "workspace_id": "ws-mac", "computer_id": "computer-mac"}
+
+    two = _render(
+        workspaces=[WORKSPACES[0], on_mac],
+        workspace_total=2,
+        placement=ComputerPlacement.from_rows([hosted, mac]),
+    ).splitlines()
+    assert two[1] == (
+        '- Semis: Chip makers (last active 2026-10-05, computer "Cloud computer", '
+        "folder `semis`, workspace_id `ws-semis`)"
+    )
+    assert two[2] == (
+        '- Semis: Chip makers (last active 2026-10-05, computer "Studio Mac", '
+        "the user's own Mac, workspace_id `ws-mac`)"
+    )
+
+    one = _render(
+        workspaces=[on_mac],
+        workspace_total=1,
+        placement=ComputerPlacement.from_rows([{**mac, "is_home": True}]),
+    ).splitlines()
+    assert one[1] == (
+        "- Semis: Chip makers (last active 2026-10-05, folder `semis`, "
+        "workspace_id `ws-mac`)"
     )
 
 
@@ -341,7 +410,9 @@ async def _read(timezone_name: str = "UTC", **reads) -> str | None:
         "get_recent_threads_for_user": AsyncMock(return_value=[]),
         "list_settled_since": AsyncMock(return_value=[]),
         "get_user_portfolio": AsyncMock(return_value=[]),
-        "get_workspace": AsyncMock(return_value={"computer_id": HOME_COMPUTER}),
+        "read_computer_placement": AsyncMock(
+            return_value=ComputerPlacement(home_computer_id=HOME_COMPUTER)
+        ),
         **reads,
     }
     with ExitStack() as stack:

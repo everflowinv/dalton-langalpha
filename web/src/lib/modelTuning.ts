@@ -1,11 +1,11 @@
 /**
- * Names and orders for the four settings a model profile can override.
+ * Names and orders for the settings a model profile can override.
  *
  * The composer menu and the Settings matrix both render these, and a level that
  * reads "High" in one place and "high" in the other looks like two different
  * settings — so the vocabulary lives here rather than beside either surface.
  */
-import type { CompactionProfileName } from '@/hooks/useAllModels';
+import type { CompactionProfileName, NativeCompactionKind } from '@/hooks/useAllModels';
 
 export const EFFORT_LABELS: Record<string, string> = {
   none: 'chat.modelSelector.effortNone',
@@ -67,7 +67,11 @@ export const COMPACTION_PROFILE_ORDER: CompactionProfileName[] = [
   'aggressive',
   'moderate',
   'extended',
+  'economy',
   'relaxed',
+  'spacious',
+  'expansive',
+  'maximal',
 ];
 
 export const GUIDANCE_LEVELS = ['lean', 'detailed'] as const;
@@ -91,7 +95,7 @@ export function isGuidanceLevel(value: unknown): value is GuidanceLevel {
 }
 
 /**
- * The four settings a user may set per account or per model.
+ * The settings a user may set per account or per model.
  *
  * The typed twin of `Tuning` in `src/llms/preferences.py`. `null` is the wire
  * value that deletes an override, so every field admits it.
@@ -101,6 +105,7 @@ export interface ModelProfile {
   compaction_profile?: CompactionProfileName | null;
   reasoning_effort?: string | null;
   fast_mode?: boolean | null;
+  native_compaction?: boolean | null;
 }
 
 export type TuningField = keyof ModelProfile;
@@ -111,6 +116,7 @@ export const TUNING_FIELDS: readonly TuningField[] = [
   'compaction_profile',
   'reasoning_effort',
   'fast_mode',
+  'native_compaction',
 ];
 
 /** What the server runs when neither the account nor the model declares a
@@ -132,6 +138,9 @@ export interface InheritedTuning {
   compaction_profile: string | null;
   reasoning_effort: string | null;
   fast_mode: boolean;
+  /** Null where the model's provider cannot compact for it, so there is
+   *  nothing to choose. */
+  native_compaction: boolean | null;
 }
 
 export interface EffectiveTuning {
@@ -194,6 +203,7 @@ export function resolveTuning(
     reasoning_effort_default?: string;
     prompt_guidance?: string;
     compaction_profile?: string;
+    native_compaction?: NativeCompactionKind | null;
   } | null,
   pinnedGuidance?: string | null,
 ): EffectiveTuning {
@@ -213,11 +223,15 @@ export function resolveTuning(
       ? resolveEffort(accountEffort, efforts)
       : meta?.reasoning_effort_default ?? null,
     fast_mode: account.fast_mode ?? false,
+    // Mirrors `apply_compaction`: on wherever it is offered, until someone
+    // turns it off.
+    native_compaction: meta?.native_compaction ? account.native_compaction ?? true : null,
   };
   const guidance = resolveTuningField(account, profile, 'prompt_guidance');
   const compaction = resolveTuningField(account, profile, 'compaction_profile');
   const effort = text(resolveTuningField(account, profile, 'reasoning_effort'));
   const fast = resolveTuningField(account, profile, 'fast_mode');
+  const native = resolveTuningField(account, profile, 'native_compaction');
   return {
     profile,
     efforts,
@@ -227,6 +241,8 @@ export function resolveTuning(
       compaction_profile: compaction || inherited.compaction_profile,
       reasoning_effort: effort ?? inherited.reasoning_effort,
       fast_mode: fast ?? inherited.fast_mode,
+      native_compaction:
+        inherited.native_compaction === null ? null : native ?? inherited.native_compaction,
     },
   };
 }

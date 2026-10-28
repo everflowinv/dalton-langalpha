@@ -1,51 +1,27 @@
-import { useEffect, useId, useRef, useState } from 'react';
+import { useEffect, useId, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useLocation } from 'react-router';
-import { AlertTriangle } from 'lucide-react';
-import { AnimatePresence } from '@/lib/framer';
+import { TradingLevelAgreedOn, TradingLevelName } from '@/components/trading/TradingLevelText';
 import { RadioChoice } from '@/components/ui/choice';
-import { useToast } from '@/components/ui/use-toast';
-import { useTradingPermission, useUpdateTradingPermission } from '@/hooks/useTradingPermission';
-import { useLocale } from '@/hooks/useLocale';
-import { mediumDate } from '@/lib/format';
-import {
-  DEFAULT_TRADING_LEVEL,
-  TRADING_AGREEMENT_VERSION,
-  TRADING_LEVELS,
-  TRADING_LEVEL_INFO,
-  TRADING_PERMISSION_ANCHOR,
-  skipsApproval,
-} from '@/lib/tradingPermission';
+import { useTradingPermissionChoice } from '@/hooks/useTradingPermissionChoice';
+import { TRADING_LEVELS, TRADING_LEVEL_INFO, TRADING_PERMISSION_ANCHOR } from '@/lib/tradingPermission';
 import { cn } from '@/lib/utils';
-import type { AgreementLevel, TradingLevel } from '@/types/api';
-import { TradingAgreementDialog } from './TradingAgreementDialog';
-
-function formatAgreedAt(ts: string | null, locale: string): string | null {
-  if (!ts) return null;
-  const d = new Date(ts);
-  return Number.isNaN(d.getTime()) ? null : mediumDate(d, locale);
-}
+import type { TradingLevel } from '@/types/api';
 
 /**
  * The user's trading permission: how far the agent may go with orders at their
- * brokerages. The two levels that ask save on the click; the two that let
- * orders through save only once the agreement is accepted, so nothing here
- * ever shows a level the server has not taken.
+ * brokerages. What a pick does, and the agreement behind the two levels that
+ * skip approval, is `useTradingPermissionChoice`'s; this draws it for Settings.
  */
 export function TradingPermissionSection() {
   const { t } = useTranslation();
-  const { toast } = useToast();
-  const locale = useLocale();
   const { hash } = useLocation();
   const headingId = useId();
   const descId = useId();
   const groupName = useId();
   const sectionRef = useRef<HTMLElement>(null);
-  const permission = useTradingPermission();
-  const update = useUpdateTradingPermission();
-  const [agreeing, setAgreeing] = useState<AgreementLevel | null>(null);
-  const data = permission.data;
-  const loaded = data !== undefined;
+  const { permission, shown, pendingLevel, agreedDate, select, dialog } = useTradingPermissionChoice();
+  const loaded = permission.data !== undefined;
 
   // A deep link lands on the section once it has its height. Before that the
   // cards are not drawn, and a scroll to a short page stops short of it.
@@ -53,42 +29,6 @@ export function TradingPermissionSection() {
     if (!loaded || hash !== `#${TRADING_PERMISSION_ANCHOR}`) return;
     sectionRef.current?.scrollIntoView?.({ block: 'start' });
   }, [loaded, hash]);
-
-  const saveFailed = () => {
-    toast({
-      variant: 'destructive',
-      title: t('common.error'),
-      description: t('settings.tradingPermission.saveFailed'),
-    });
-  };
-
-  // A pick made while a save is in flight is dropped rather than queued. The
-  // inputs stay enabled through it: disabling the one that holds focus would
-  // throw a keyboard user's focus back to the page on every arrow key.
-  const select = (level: TradingLevel) => {
-    if (!data || level === data.level || update.isPending) return;
-    if (skipsApproval(level)) setAgreeing(level);
-    else void update.mutateAsync({ level }).catch(saveFailed);
-  };
-
-  // The version sent is the one of the text the dialog showed, never the
-  // server's: echoing the server's would accept whatever it moved to since
-  // this bundle loaded. A failure leaves the dialog open for the retry.
-  const agree = (level: AgreementLevel) => {
-    void update
-      .mutateAsync({ level, agreement_version: TRADING_AGREEMENT_VERSION })
-      .then(() => setAgreeing(null), saveFailed);
-  };
-
-  // A level that saves on the click shows as chosen while it is on its way,
-  // and goes back if the server refuses it. One behind the agreement is shown
-  // by its dialog instead.
-  const pendingLevel =
-    update.isPending && update.variables && !skipsApproval(update.variables.level)
-      ? update.variables.level
-      : null;
-  const shown = pendingLevel ?? data?.level;
-  const agreedDate = formatAgreedAt(data?.agreed_at ?? null, locale);
 
   return (
     <section
@@ -141,25 +81,14 @@ export function TradingPermissionSection() {
               name={groupName}
               level={level}
               checked={shown === level}
-              agreedDate={shown === level && skipsApproval(level) ? agreedDate : null}
+              agreedDate={agreedDate}
               onSelect={select}
             />
           ))}
         </div>
       )}
 
-      <AnimatePresence>
-        {agreeing && (
-          <TradingAgreementDialog
-            key={agreeing}
-            level={agreeing}
-            pending={update.isPending}
-            outdated={data !== undefined && data.agreement_version !== TRADING_AGREEMENT_VERSION}
-            onAgree={() => agree(agreeing)}
-            onCancel={() => setAgreeing(null)}
-          />
-        )}
-      </AnimatePresence>
+      {dialog}
     </section>
   );
 }
@@ -174,7 +103,8 @@ function LevelCard({
   name: string;
   level: TradingLevel;
   checked: boolean;
-  /** Set on the chosen card of a level that needed the agreement. */
+  /** When the current agreement was accepted; drawn only on the chosen card
+   *  of a level that needed it. */
   agreedDate: string | null;
   onSelect: (level: TradingLevel) => void;
 }) {
@@ -201,32 +131,17 @@ function LevelCard({
       style={{ border: `1px solid ${checked ? 'var(--color-text-primary)' : 'var(--color-border-muted)'}` }}
     >
       <span className="min-w-0 flex-1">
-        <span className="flex flex-wrap items-center gap-x-2 gap-y-1">
-          <span
-            id={labelId}
-            className="inline-flex items-center gap-1.5 text-[0.8125rem] font-medium"
-            style={{ color: info.warning ? 'var(--color-warning)' : 'var(--color-text-primary)' }}
-          >
-            {info.warning && <AlertTriangle className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />}
-            {t(info.labelKey)}
-          </span>
-          {level === DEFAULT_TRADING_LEVEL && (
-            <span
-              className="rounded-full px-1.5 text-[0.625rem] font-medium leading-4"
-              style={{ border: '1px solid var(--color-border-muted)', color: 'var(--color-text-tertiary)' }}
-            >
-              {t('settings.tradingPermission.defaultTag')}
-            </span>
-          )}
-        </span>
+        {/* No glyph per level here, so the warning is drawn on the name. */}
+        <TradingLevelName level={level} id={labelId} flagWarning className="text-[0.8125rem] font-medium" />
         <span id={descId} className="mt-0.5 block text-xs leading-relaxed" style={{ color: 'var(--color-text-tertiary)' }}>
           {t(info.descriptionKey)}
         </span>
-        {agreedDate && (
-          <span className="mt-1.5 block text-[0.6875rem]" style={{ color: 'var(--color-text-quaternary)' }}>
-            {t('settings.tradingPermission.agreedOn', { date: agreedDate })}
-          </span>
-        )}
+        <TradingLevelAgreedOn
+          level={level}
+          chosen={checked}
+          agreedDate={agreedDate}
+          className="text-(--color-text-quaternary)"
+        />
       </span>
     </RadioChoice>
   );

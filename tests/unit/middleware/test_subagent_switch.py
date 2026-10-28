@@ -229,6 +229,7 @@ class TestTheGate:
         assert isinstance(result, ToolMessage)
         assert result.status == "error"
         assert result.content == SUBAGENTS_REFUSAL
+        assert result.artifact == {"launch": "subagents_off"}
         assert result.name == request_.tool_call["name"]
         assert result.tool_call_id == request_.tool_call["id"]
 

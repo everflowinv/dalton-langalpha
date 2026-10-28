@@ -16,6 +16,7 @@ from unittest.mock import patch
 
 import pytest
 
+from ptc_agent.agent.middleware.runtime_context.profile import render_user_profile
 from ptc_agent.agent.prompts import (
     guidance_template_vars,
     init_loader,
@@ -224,10 +225,9 @@ class TestBucketIsInvisibleToThePrompt:
     more (see ``test_user_profile_cache_key``), and this pins why."""
 
     def test_model_preference_never_reaches_the_model(self):
-        loader = init_loader()
-        rendered = loader.render(
-            "components/user_profile.md.j2",
-            user_profile={
+        init_loader()
+        rendered = render_user_profile(
+            {
                 "model_preference": {"prompt_guidance": "lean"},
                 "agent_preference": {"proactive_questions": "auto"},
             },

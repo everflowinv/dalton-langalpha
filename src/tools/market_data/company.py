@@ -43,7 +43,7 @@ from src.data_client.freshness import FreshnessLabel
 from src.data_client.ginlix_data.directory import display_names
 from market_protocol import AssetClass, InstrumentRef
 
-from ._shared import _fmp_request, _get_user_id, _safe_result
+from ._shared import _fmp_request, _get_user_id, _mark_failure, _mark_no_data, _safe_result
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +96,14 @@ def _margin(stmt: Dict, ratio_key: str, numerator_key: str) -> Optional[float]:
     if revenue and numerator is not None:
         return numerator / revenue
     return None
+
+
+def _diluted_eps(stmt: Dict) -> Optional[float]:
+    # FMP's stable statements spell it ``epsDiluted``, as CN rows do; yfinance
+    # rows, and CN rows from a ginlix-data that predates the stable spellings,
+    # keep the v3 ``epsdiluted``.
+    value = stmt.get("epsDiluted")
+    return value if value is not None else stmt.get("epsdiluted")
 
 
 def _first(rows: Any) -> Optional[Dict[str, Any]]:
@@ -387,7 +395,7 @@ def _company_artifact(inp: CompanyInputs) -> Dict[str, Any]:
                 "grossProfit": stmt.get("grossProfit"),
                 "operatingIncome": stmt.get("operatingIncome"),
                 "ebitda": stmt.get("ebitda"),
-                "epsDiluted": stmt.get("epsdiluted"),
+                "epsDiluted": _diluted_eps(stmt),
                 "grossMargin": _margin(stmt, "grossProfitRatio", "grossProfit"),
                 "operatingMargin": _margin(stmt, "operatingIncomeRatio", "operatingIncome"),
                 "netMargin": _margin(stmt, "netIncomeRatio", "netIncome"),
@@ -990,14 +998,19 @@ async def fetch_company_overview(
         ref, symbol = resolve_listing(symbol, AssetClass.EQUITY)
         if ref is not None and ref.asset_class is AssetClass.INDEX:
             artifact = await fetch_index_overview(symbol, ref, user_id=_get_user_id(config))
+            # A year range from daily bars with no level is not an overview.
+            if (artifact.get("quote") or {}).get("price") is None:
+                _mark_no_data()
             return index_overview_text(artifact, _symbol_currency(ref)), artifact
         if provider.financial is None:
+            _mark_failure("not_configured")
             content = _error_text(symbol, "No financial data source configured")
             return content, {"type": "company_overview", "symbol": symbol}
         inputs = await _gather_company(
             provider, symbol, ref, user_id=_get_user_id(config), extended=True
         )
         if inputs is None:
+            _mark_no_data()
             content = _error_text(symbol, f"No data found for symbol {symbol}")
             return content, {"type": "company_overview", "symbol": symbol}
         result = _company_text(inputs)
@@ -1006,5 +1019,6 @@ async def fetch_company_overview(
 
     except Exception as e:
         logger.error(f"Error retrieving company overview for {symbol}: {e}")
+        _mark_failure(e)
         content = _error_text(symbol, f"Error retrieving company overview: {str(e)}")
         return content, {"type": "company_overview", "symbol": symbol, "error": str(e)}

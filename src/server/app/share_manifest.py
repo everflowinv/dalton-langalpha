@@ -28,22 +28,21 @@ from urllib.parse import unquote
 
 from ptc_agent.core.sandbox.runtime import SandboxTransientError
 from src.server.app.share_access import ShareScope, shared_path_visible
-from src.server.app.workspace_files._containment import (
+from src.server.app.workspace_files._shared import _to_client_path, owner_work_dir
+from src.server.app.workspace_files.serve import _db_fallback_bytes, warm_sandbox_bytes
+from src.server.models.workspace import served_from_mirror
+from src.server.services.persistence.file import FilePersistenceService
+from src.server.services.workspace_file_containment import (
     contained_absolute_path,
     contained_relative_path,
     contained_sandbox_paths,
     FileTooLargeToServe,
     is_within,
 )
-from src.server.app.workspace_files._shared import (
-    _acquire_sandbox_to_change,
-    _to_client_path,
-    owner_work_dir,
+from src.server.services.workspace_files import (
+    acquire_sandbox_to_change,
     previous_dir_names_of,
 )
-from src.server.app.workspace_files.serve import _db_fallback_bytes, warm_sandbox_bytes
-from src.server.models.workspace import served_from_mirror
-from src.server.services.persistence.file import FilePersistenceService
 
 logger = logging.getLogger(__name__)
 
@@ -345,7 +344,7 @@ async def _reader_for(
         yield _MirrorReader(workspace), work_dir, previous_dir_names_of(workspace)
         return
     workspace_id = str(workspace["workspace_id"])
-    async with _acquire_sandbox_to_change(workspace_id, user_id) as (sandbox, held):
+    async with acquire_sandbox_to_change(workspace_id, user_id) as (sandbox, held):
         work_dir = owner_work_dir(held)
         yield (
             _SandboxReader(sandbox, work_dir, ShareScope(workspace_id, "")),

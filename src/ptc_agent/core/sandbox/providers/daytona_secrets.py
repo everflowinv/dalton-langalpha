@@ -1,14 +1,13 @@
 """Daytona organization-Secret reconciliation, split from the provider proper."""
 
-import asyncio
-from collections.abc import Awaitable, Callable, Iterator, Sequence
+from collections.abc import Iterator
 from typing import Any
 
 import structlog
 from daytona import CreateSecretParams, UpdateSecretParams
 
 from ptc_agent.core.sandbox.platform_secrets import (
-    PlatformSecretConfigurationError,
+    PlatformSecretReconciler,
     PlatformSecretReconciliationError,
     ReconciledPlatformSecret,
     ResolvedPlatformSecret,
@@ -119,24 +118,18 @@ def is_transient_daytona_error(exc: Exception) -> bool:
     return any(marker in message for marker in transient_markers)
 
 
-class DaytonaSecretReconciler:
+class DaytonaSecretReconciler(PlatformSecretReconciler):
     """Creates or updates organization-scoped Daytona Secrets idempotently."""
+
+    label = "Daytona"
+    key_error_statuses = frozenset({403})
+    key_error_message = (
+        "Daytona API key is missing the manage:secrets permission required "
+        "for platform Secret reconciliation"
+    )
 
     def __init__(self, client: Any) -> None:
         self._client = client
-
-    async def reconcile(
-        self, secrets: Sequence[ResolvedPlatformSecret]
-    ) -> tuple[ReconciledPlatformSecret, ...]:
-        reconciled: list[ReconciledPlatformSecret] = []
-        for secret in secrets:
-            reconciled.append(
-                await self._call_with_retry(
-                    secret.name,
-                    lambda secret=secret: self._reconcile_one(secret),
-                )
-            )
-        return tuple(reconciled)
 
     async def _reconcile_one(
         self, secret: ResolvedPlatformSecret
@@ -159,7 +152,7 @@ class DaytonaSecretReconciler:
                 )
                 return self._reconciled_secret(secret, created_secret)
             except Exception as exc:
-                status = self._exception_status(exc)
+                status = self._status(exc)
                 if status not in (None, 409):
                     raise
                 # A 409 means another worker won the create. A status-less
@@ -218,55 +211,15 @@ class DaytonaSecretReconciler:
             if cursor is None:
                 return None
 
-    async def _call_with_retry(
-        self,
-        secret_name: str,
-        operation: Callable[[], Awaitable[Any]],
-    ) -> Any:
-        """Retry 429/5xx and status-less transient failures without logging bodies."""
-
-        delay_s = 0.25
-        for attempt in range(1, 4):
-            try:
-                return await operation()
-            except Exception as exc:
-                status = self._exception_status(exc)
-                retryable = (
-                    status == 429
-                    or (status is not None and 500 <= status <= 599)
-                    # Transport failures (connection reset, timeout, closed
-                    # client) carry no status; classify them by message so a
-                    # first-boot network blip doesn't hard-fail reconciliation.
-                    or (status is None and is_transient_daytona_error(exc))
-                )
-                logger.warning(
-                    "Daytona platform Secret reconciliation failed",
-                    secret_name=secret_name,
-                    attempt=attempt,
-                    status=status,
-                    error_type=type(exc).__name__,
-                    retrying=retryable and attempt < 3,
-                )
-                if not retryable or attempt == 3:
-                    if status == 403:
-                        # Operator misconfiguration, not provider availability:
-                        # must fail boot loudly, never fall back to a previous
-                        # rollout identity.
-                        raise PlatformSecretConfigurationError(
-                            "Daytona API key is missing the manage:secrets "
-                            "permission required for platform Secret reconciliation"
-                        ) from None
-                    status_text = str(status) if status is not None else "unknown"
-                    raise PlatformSecretReconciliationError(
-                        "Failed to reconcile Daytona platform Secret "
-                        f"{secret_name!r} (status={status_text}, "
-                        f"error_type={type(exc).__name__})"
-                    ) from None
-                await asyncio.sleep(delay_s)
-                delay_s *= 2
-
-    @staticmethod
-    def _exception_status(exc: Exception) -> int | None:
-        """Extract an HTTP status through SDK wrapper exception chains."""
-
+    def _status(self, exc: Exception) -> int | None:
         return daytona_error_status(exc)
+
+    def _retryable(self, exc: Exception, status: int | None) -> bool:
+        return (
+            status == 429
+            or (status is not None and 500 <= status <= 599)
+            # Transport failures (connection reset, timeout, closed client)
+            # carry no status; classify them by message so a first-boot
+            # network blip doesn't hard-fail reconciliation.
+            or (status is None and is_transient_daytona_error(exc))
+        )

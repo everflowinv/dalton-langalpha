@@ -235,6 +235,7 @@ class FakeStore:
             scope=scope or self.row.scope,
             token_generation=expected_generation + 1,
             status=ConnectionStatus.CONNECTED,
+            last_refresh_at=datetime.now(timezone.utc),
         )
         return True
 
@@ -466,6 +467,45 @@ class TestHotPath:
         self, store, db, token_endpoint
     ):
         store.row = _row(expires_in=lifecycle.REFRESH_MARGIN_SECONDS - 30)
+
+        await ensure_fresh_access_token(CONNECTION_ID)
+
+        assert db.lock_attempts == [LOCK_KEY]
+
+    @pytest.mark.asyncio
+    async def test_a_five_minute_token_refreshed_seconds_ago_takes_no_lock(
+        self, store, db, token_endpoint
+    ):
+        # IBKR issues five-minute tokens. Against the fixed 10-minute margin
+        # every fresh one was already due, so every relayed call refreshed and
+        # rotated the refresh token.
+        now = datetime.now(timezone.utc)
+        store.row = _row(expires_in=290, last_refresh_at=now - timedelta(seconds=10))
+
+        token = await ensure_fresh_access_token(CONNECTION_ID)
+
+        assert token.access_token == "access-old"
+        assert db.lock_attempts == []
+        assert token_endpoint.calls == []
+
+    @pytest.mark.asyncio
+    async def test_a_five_minute_token_past_half_its_life_takes_the_lock(
+        self, store, db, token_endpoint
+    ):
+        now = datetime.now(timezone.utc)
+        store.row = _row(expires_in=140, last_refresh_at=now - timedelta(seconds=160))
+
+        await ensure_fresh_access_token(CONNECTION_ID)
+
+        assert db.lock_attempts == [LOCK_KEY]
+
+    @pytest.mark.asyncio
+    async def test_an_unknown_lifetime_falls_back_to_the_fixed_margin(
+        self, store, db, token_endpoint
+    ):
+        # A connect does not stamp last_refresh_at, so the lifetime is unknown
+        # until the first refresh: the same short token is due under the ceiling.
+        store.row = _row(expires_in=290, last_refresh_at=None)
 
         await ensure_fresh_access_token(CONNECTION_ID)
 
@@ -783,6 +823,29 @@ class TestWinner:
 
         token = await ensure_fresh_access_token(CONNECTION_ID)
 
+        assert token.access_token == "access-newer"
+        assert token_endpoint.calls == []
+        assert store.commits == []
+        assert db.unlocks == [LOCK_KEY]
+
+    @pytest.mark.asyncio
+    async def test_the_re_read_judges_a_fresh_short_token_by_its_lifetime(
+        self, store, db, token_endpoint
+    ):
+        """The entry gate and the re-check must agree, or a rival's fresh
+        five-minute token is refreshed again the moment it lands."""
+        now = datetime.now(timezone.utc)
+        store.row = _row(
+            expires_in=120, generation=3, last_refresh_at=now - timedelta(seconds=180)
+        )
+        store.script[2] = _row(
+            expires_in=300, generation=4, access_token="access-newer",
+            last_refresh_at=now,
+        )
+
+        token = await ensure_fresh_access_token(CONNECTION_ID)
+
+        assert db.lock_attempts == [LOCK_KEY]
         assert token.access_token == "access-newer"
         assert token_endpoint.calls == []
         assert store.commits == []

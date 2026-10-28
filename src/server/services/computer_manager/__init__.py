@@ -10,6 +10,7 @@ their own.
 
 from src.server.services.computer_manager._types import (
     ComputerBinding,
+    MachineTarget,
     SessionMetadata,
 )
 from src.server.services.computer_manager.manager import ComputerManager
@@ -17,5 +18,6 @@ from src.server.services.computer_manager.manager import ComputerManager
 __all__ = [
     "ComputerBinding",
     "ComputerManager",
+    "MachineTarget",
     "SessionMetadata",
 ]

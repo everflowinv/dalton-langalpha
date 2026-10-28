@@ -1,10 +1,9 @@
-import { useState, useCallback, useEffect } from 'react';
+import { useState, useCallback, useEffect, useId } from 'react';
 import { useNavigate } from 'react-router';
 import { useQueryClient } from '@tanstack/react-query';
-import { Check } from 'lucide-react';
-import { Button } from '@/components/ui/button';
 import { Loader } from '@/components/ui/loader';
 import { Input } from '@/components/ui/input';
+import { WizardStepHeader } from '@/components/ui/wizard';
 import { ApiKeyInput } from '@/components/model/ApiKeyInput';
 import { useUpdateApiKeys } from '@/hooks/useApiKeys';
 import { usePreferences } from '@/hooks/usePreferences';
@@ -16,15 +15,32 @@ import { useTranslation } from 'react-i18next';
 import { mergeCustomModelsForSlug } from '../mergeCustomModelsForSlug';
 import type { CustomModelEntry } from '@/components/model/types';
 import type { CustomProviderEntry } from '@/lib/modelPreferences';
-import { API_FORMATS, useModalityState, type LocationState, type ParentModel } from './shared';
+import {
+  API_FORMATS,
+  ModalityChips,
+  ModelCheckRow,
+  useModalityState,
+  useProviderConnected,
+  type LocationState,
+  type ParentModel,
+} from './shared';
+import { SetupFooter } from '../../SetupFooter';
 
 export function CustomProviderConnect({ state }: { state: LocationState }) {
   const navigate = useNavigate();
+  const connected = useProviderConnected();
   const queryClient = useQueryClient();
   const updateApiKeys = useUpdateApiKeys();
   const { preferences } = usePreferences();
   const updatePreferences = useUpdatePreferences();
   const { t } = useTranslation();
+  const headingId = useId();
+  const nameId = useId();
+  const formatLabelId = useId();
+  const baseUrlId = useId();
+  const apiKeyId = useId();
+  const modelNameId = useId();
+  const importLabelId = useId();
 
   const method = state.method ?? 'api_key';
   const isCustom = state.isCustom ?? false;
@@ -198,9 +214,7 @@ export function CustomProviderConnect({ state }: { state: LocationState }) {
         queryClient.invalidateQueries({ queryKey: queryKeys.models.all }),
       ]);
 
-      navigate('/setup/models', {
-        state: { method, provider: slug, displayName: customName.trim(), brandKey: slug },
-      });
+      connected({ method, provider: slug, displayName: customName.trim(), brandKey: slug });
     } catch (e: unknown) {
       const err = e as { response?: { data?: { detail?: string | Array<{ msg?: string }> } }; message?: string };
       const detail = err?.response?.data?.detail;
@@ -208,34 +222,25 @@ export function CustomProviderConnect({ state }: { state: LocationState }) {
         ? detail
         : Array.isArray(detail) ? detail.map((d) => d.msg).filter(Boolean).join('; ') : null;
       setError(msg || err?.message || t('setup.errorSaveProvider'));
-    } finally {
       setSaving(false);
     }
-  }, [customName, customFormat, customBaseUrl, customApiKey, customModelName, customModelId, preferences, updatePreferences, updateApiKeys, queryClient, navigate, method, t, manualModalities, buildModalitiesArray, parentModels, selectedParentModelNames]);
+  }, [customName, customFormat, customBaseUrl, customApiKey, customModelName, customModelId, preferences, updatePreferences, updateApiKeys, queryClient, connected, method, t, manualModalities, buildModalitiesArray, parentModels, selectedParentModelNames]);
 
     return (
-      <div className="flex flex-col gap-4 sm:gap-6">
-        <div className="flex flex-col gap-1">
-          <h2
-            className="font-semibold"
-            style={{ fontSize: '1.125rem', color: 'var(--color-text-primary)' }}
-          >
-            {t('setup.addCustomProvider')}
-          </h2>
-          <p
-            className="text-sm"
-            style={{ color: 'var(--color-text-secondary)' }}
-          >
-            {t('setup.addCustomProviderDesc')}
-          </p>
-        </div>
-
+      <div>
+        <WizardStepHeader
+          titleId={headingId}
+          title={t('setup.addCustomProvider')}
+          helper={t('setup.addCustomProviderDesc')}
+        />
+        <div className="flex flex-col gap-4 sm:gap-6">
         {/* Provider name */}
         <div className="flex flex-col gap-1.5">
-          <label className="text-sm font-medium" style={{ color: 'var(--color-text-primary)' }}>
+          <label htmlFor={nameId} className="text-sm font-medium" style={{ color: 'var(--color-text-primary)' }}>
             {t('setup.providerNameLabel')}
           </label>
           <Input
+            id={nameId}
             value={customName}
             onChange={(e) => setCustomName(e.target.value)}
             placeholder={t('setup.providerNamePlaceholder')}
@@ -245,23 +250,24 @@ export function CustomProviderConnect({ state }: { state: LocationState }) {
 
         {/* API format */}
         <div className="flex flex-col gap-1.5">
-          <label className="text-sm font-medium" style={{ color: 'var(--color-text-primary)' }}>
+          <label id={formatLabelId} className="text-sm font-medium" style={{ color: 'var(--color-text-primary)' }}>
             {t('setup.apiFormatLabel')}
           </label>
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+          <div role="group" aria-labelledby={formatLabelId} className="grid grid-cols-1 sm:grid-cols-2 gap-2">
             {API_FORMATS.map((fmt) => (
               <button
                 key={fmt.value}
                 type="button"
+                aria-pressed={customFormat === fmt.value}
                 onClick={() => setCustomFormat(fmt.value)}
                 className="rounded-lg px-3 py-2.5 text-left text-xs font-medium transition-colors"
                 style={{
                   border: customFormat === fmt.value
-                    ? '2px solid var(--color-accent-primary)'
+                    ? '1px solid var(--color-text-primary)'
                     : '1px solid var(--color-border-default)',
-                  background: customFormat === fmt.value ? 'var(--color-accent-soft)' : undefined,
+                  background: customFormat === fmt.value ? 'var(--color-bg-tag)' : undefined,
                   color: 'var(--color-text-primary)',
-                  padding: customFormat === fmt.value ? '9px 11px' : '10px 12px',
+                  padding: '10px 12px',
                 }}
               >
                 {t(fmt.labelKey)}
@@ -272,10 +278,11 @@ export function CustomProviderConnect({ state }: { state: LocationState }) {
 
         {/* Base URL */}
         <div className="flex flex-col gap-1.5">
-          <label className="text-sm font-medium" style={{ color: 'var(--color-text-primary)' }}>
+          <label htmlFor={baseUrlId} className="text-sm font-medium" style={{ color: 'var(--color-text-primary)' }}>
             {t('setup.baseUrlLabel')}
           </label>
           <Input
+            id={baseUrlId}
             type="url"
             value={customBaseUrl}
             onChange={(e) => setCustomBaseUrl(e.target.value)}
@@ -286,10 +293,11 @@ export function CustomProviderConnect({ state }: { state: LocationState }) {
 
         {/* API key */}
         <div className="flex flex-col gap-1.5">
-          <label className="text-sm font-medium" style={{ color: 'var(--color-text-primary)' }}>
+          <label htmlFor={apiKeyId} className="text-sm font-medium" style={{ color: 'var(--color-text-primary)' }}>
             {t('setup.apiKeyLabel')}
           </label>
           <ApiKeyInput
+            id={apiKeyId}
             provider="custom"
             value={customApiKey}
             onChange={setCustomApiKey}
@@ -304,11 +312,12 @@ export function CustomProviderConnect({ state }: { state: LocationState }) {
             border: '1px solid var(--color-border-default)',
           }}
         >
-          <label className="text-sm font-medium" style={{ color: 'var(--color-text-primary)' }}>
+          <label htmlFor={modelNameId} className="text-sm font-medium" style={{ color: 'var(--color-text-primary)' }}>
             {t('setup.modelLabel')}
           </label>
           <div className="flex flex-col gap-2">
             <Input
+              id={modelNameId}
               value={customModelName}
               onChange={(e) => {
                 setCustomModelName(e.target.value);
@@ -328,35 +337,7 @@ export function CustomProviderConnect({ state }: { state: LocationState }) {
           <p className="text-[0.6875rem]" style={{ color: 'var(--color-text-tertiary)' }}>
             {t('setup.modelIdHint')}
           </p>
-          <div className="flex items-center gap-1.5 pt-1">
-            <span className="text-[0.625rem] uppercase tracking-wider" style={{ color: 'var(--color-text-tertiary)' }}>
-              {t('setup.capabilities', { defaultValue: 'Capabilities' })}:
-            </span>
-            <span
-              className="inline-flex items-center rounded-full px-2 py-0.5 text-[0.625rem] font-medium"
-              style={{ background: 'var(--color-accent-soft)', color: 'var(--color-accent-primary)', opacity: 0.6 }}
-            >
-              Text
-            </span>
-            {(['image', 'pdf'] as const).map((mod) => {
-              const active = manualModalities.has(mod);
-              return (
-                <button
-                  key={mod}
-                  type="button"
-                  onClick={() => toggleManualModality(mod)}
-                  className="inline-flex items-center rounded-full px-2 py-0.5 text-[0.625rem] font-medium transition-colors"
-                  style={{
-                    background: active ? 'var(--color-accent-soft)' : 'transparent',
-                    color: active ? 'var(--color-accent-primary)' : 'var(--color-text-tertiary)',
-                    border: `1px solid ${active ? 'var(--color-accent-primary)' : 'var(--color-border-default)'}`,
-                  }}
-                >
-                  {mod === 'image' ? 'Image' : 'PDF'}
-                </button>
-              );
-            })}
-          </div>
+          <ModalityChips active={manualModalities} onToggle={toggleManualModality} className="pt-1" />
         </div>
 
         {/* Import parent models — auto-selected; users uncheck what they don't want. */}
@@ -369,7 +350,7 @@ export function CustomProviderConnect({ state }: { state: LocationState }) {
             }}
           >
             <div className="flex items-center justify-between gap-2">
-              <label className="text-sm font-medium" style={{ color: 'var(--color-text-primary)' }}>
+              <label id={importLabelId} className="text-sm font-medium" style={{ color: 'var(--color-text-primary)' }}>
                 {t('setup.importParentModels', { defaultValue: 'Also add these models' })}
               </label>
               {parentModels.length > 0 && (
@@ -377,8 +358,7 @@ export function CustomProviderConnect({ state }: { state: LocationState }) {
                   <button
                     type="button"
                     onClick={selectAllParentModels}
-                    className="text-[0.6875rem] font-medium transition-colors"
-                    style={{ color: 'var(--color-accent-primary)' }}
+                    className="text-[0.6875rem] font-medium transition-colors text-(--color-text-primary) underline underline-offset-2 hover:opacity-80"
                   >
                     {t('setup.selectAll', { defaultValue: 'All' })}
                   </button>
@@ -410,76 +390,40 @@ export function CustomProviderConnect({ state }: { state: LocationState }) {
               </div>
             )}
             {!parentModelsLoading && parentModels.length > 0 && (
-              <div className="flex flex-col gap-1 max-h-[240px] overflow-y-auto">
-                {parentModels.map((pm) => {
-                  const checked = selectedParentModelNames.has(pm.name);
-                  return (
-                    <button
-                      key={pm.name}
-                      type="button"
-                      onClick={() => toggleParentModel(pm.name)}
-                      className="flex items-center gap-3 rounded-md px-3 py-2 text-left transition-colors"
-                      style={{
-                        background: checked ? 'var(--color-accent-soft)' : 'transparent',
-                        border: checked
-                          ? '1px solid var(--color-accent-primary)'
-                          : '1px solid var(--color-border-default)',
-                      }}
-                    >
-                      <div
-                        className="shrink-0 h-4 w-4 rounded border flex items-center justify-center"
-                        style={{
-                          borderColor: checked ? 'var(--color-accent-primary)' : 'var(--color-border-default)',
-                          background: checked ? 'var(--color-accent-primary)' : 'transparent',
-                        }}
-                      >
-                        {checked && <Check className="h-3 w-3" style={{ color: '#fff' }} />}
-                      </div>
-                      <span className="text-sm font-mono" style={{ color: 'var(--color-text-primary)' }}>
-                        {pm.display_name || pm.name}
-                      </span>
-                    </button>
-                  );
-                })}
+              <div role="group" aria-labelledby={importLabelId} className="flex flex-col gap-1 max-h-[240px] overflow-y-auto">
+                {parentModels.map((pm) => (
+                  <ModelCheckRow
+                    key={pm.name}
+                    checked={selectedParentModelNames.has(pm.name)}
+                    onToggle={() => toggleParentModel(pm.name)}
+                    label={pm.display_name || pm.name}
+                  />
+                ))}
               </div>
             )}
           </div>
         )}
 
         {error && (
-          <p className="text-sm" style={{ color: 'var(--color-loss)' }}>
+          <p role="alert" className="text-sm" style={{ color: 'var(--color-loss)' }}>
             {error}
           </p>
         )}
+        </div>
 
-        <div className="flex items-center justify-between pt-2">
-          <Button variant="outline" onClick={handleBack}>
-            {t('setup.back')}
-          </Button>
-          <Button
-            variant="default"
-            disabled={
-              saving
-              || !customName.trim()
+        <SetupFooter
+          back={{ label: t('setup.back'), onClick: handleBack }}
+          primary={{
+            label: saving ? t('setup.saving') : t('setup.continue'),
+            onClick: handleCustomSave,
+            disabled:
+              !customName.trim()
               || !customBaseUrl.trim()
               || !customApiKey.trim()
-              || (!customModelName.trim() && selectedParentModelNames.size === 0)
-            }
-            onClick={handleCustomSave}
-            className="min-w-[120px]"
-          >
-            {saving ? (
-              <>
-                <span aria-hidden="true" className="mr-1.5 shrink-0">
-                  <Loader size={16} className="text-current" />
-                </span>
-                {t('setup.saving')}
-              </>
-            ) : (
-              t('setup.continue')
-            )}
-          </Button>
-        </div>
+              || (!customModelName.trim() && selectedParentModelNames.size === 0),
+            busy: saving,
+          }}
+        />
       </div>
     );
 }

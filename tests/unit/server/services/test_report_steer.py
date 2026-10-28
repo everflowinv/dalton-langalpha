@@ -42,7 +42,7 @@ def _report(n: int) -> SteeredReport:
     return SteeredReport(
         job_id=f"job-{n}",
         content=f"report {n}",
-        report_source={"kind": "task", "task_id": str(n)},
+        shown={"report_source": {"kind": "task", "task_id": str(n)}},
     )
 
 
@@ -232,12 +232,14 @@ async def test_a_held_report_whose_thread_cannot_be_read_again_is_given_back():
 
 @pytest.mark.asyncio
 async def test_confirm_closes_the_runs_held_reports_and_never_raises():
+    # No alert among them: nothing to stamp ahead of the close.
+    no_alerts = patch(f"{_OUTBOX}.held_notice_jobs", new=AsyncMock(return_value=[]))
     confirm = AsyncMock(return_value=["job-1"])
-    with patch(f"{_OUTBOX}.confirm_jobs", new=confirm):
+    with no_alerts, patch(f"{_OUTBOX}.confirm_jobs", new=confirm):
         await steer.SteeredReportInbox().confirm("run-A", ["job-1"])
     confirm.assert_awaited_once_with(["job-1"], owner=("run", "run-A"))
 
-    with patch(
+    with no_alerts, patch(
         f"{_OUTBOX}.confirm_jobs",
         new=AsyncMock(side_effect=RuntimeError("db down")),
     ):
@@ -283,7 +285,11 @@ async def test_task_offer_closes_a_report_its_stopped_turn_covered():
         "parent_run_id": "run-P",
         "finalized_at": _STOPPED_AT - timedelta(seconds=30),
     }
-    parent = {"status": "cancelled", "cancel_requested_at": _STOPPED_AT}
+    parent = {
+        "status": "cancelled",
+        "cancel_requested_at": _STOPPED_AT,
+        "metadata": {"cancelled_by_user": True},
+    }
     with (
         patch(_SR, new=AsyncMock(return_value=run_row)),
         patch(_TL, new=AsyncMock(return_value=parent)) as get_run,
@@ -317,13 +323,13 @@ async def test_task_offer_steers_an_owed_report():
     # DALTON-HOOK(i18n): task_report_message includes system-language notice
     assert offer.content == (
         "<system>\n"
-        "Background subagent Task-abc123 (research) finished while you were "
+        "Background subagent Task-abc123 (research) completed while you were "
         "working.\n"
         "Task description: look things up\n"
         "This notice is from the system, not the user. Keep writing to the user in the language of their request.\n"
         "</system>"
     )
-    assert offer.report_source["kind"] == "task"
+    assert offer.shown["report_source"]["kind"] == "task"
 
 
 def test_task_report_message_includes_language_notice_and_preserves_fields():
@@ -340,7 +346,7 @@ def test_task_report_message_includes_language_notice_and_preserves_fields():
     msg_posted = task_report_message(report, "dalton-evidence", steered=False)
     assert msg_posted == (
         "<system>\n"
-        "Background subagent Task-abc123 (dalton-evidence) finished.\n"
+        "Background subagent Task-abc123 (dalton-evidence) completed.\n"
         "Task description: collect Cloud segment revenue\n"
         "This notice is from the system, not the user. Keep writing to the user in the language of their request.\n"
         "</system>"
@@ -348,7 +354,7 @@ def test_task_report_message_includes_language_notice_and_preserves_fields():
 
     msg_steered = task_report_message(report, "dalton-evidence", steered=True)
     assert (
-        "Background subagent Task-abc123 (dalton-evidence) finished while you were working.\n"
+        "Background subagent Task-abc123 (dalton-evidence) completed while you were working.\n"
         in msg_steered
     )
     assert "Task description: collect Cloud segment revenue\n" in msg_steered
@@ -409,7 +415,62 @@ async def test_analyst_offer_steers_an_owed_report():
         "This notice is from the system, not the user. Keep writing to the user in the language of their request.\n"
         "</system>"
     )
-    assert offer.report_source == {"kind": "analyst", "thread_id": "ptc-1"}
+    assert offer.shown["report_source"] == {
+        "kind": "analyst",
+        "thread_id": "ptc-1",
+        "outcome": "completed",
+    }
+
+
+@pytest.mark.asyncio
+async def test_analyst_offer_labels_the_run_it_reports():
+    """A steered report labels its row as its own turn would: how the
+    reported run ended, the runs it continued, and the hand-offs they took
+    in as steers."""
+    job = _analyst_job(
+        run_id="run-1",
+        payload={
+            "ptc_thread_id": "ptc-1",
+            "final_status": "error",
+        },
+    )
+    with (
+        patch(_CACHE, return_value=_analyst_cache(_origin())),
+        # DALTON-HOOK(handoff-keep-on-resumable): the resumable verdict reads
+        # the run row; this error is an ordinary one, not a worker-lost.
+        patch(
+            "src.server.services.report_back.handoff.executor."
+            "is_resumable_analyst_failure",
+            new=AsyncMock(return_value=False),
+        ),
+        patch(
+            "src.server.database.runs.lifecycle.get_latest_attempt",
+            new=AsyncMock(return_value={"conversation_response_id": "run-1"}),
+        ),
+        patch(
+            "src.server.database.runs.lifecycle.get_continued_runs",
+            new=AsyncMock(return_value=["run-0", "run-1"]),
+        ),
+        patch(
+            f"{_OUTBOX}.list_taken_hand_offs",
+            # Taken in by one of the runs the report names, on its thread.
+            new=AsyncMock(
+                side_effect=lambda thread, runs: (
+                    ["steer-1"] if (thread, runs) == ("ptc-1", ["run-0", "run-1"])
+                    else []
+                )
+            ),
+        ),
+    ):
+        offer = await steer._analyst_offer(job, "t-1")
+
+    assert offer.shown["report_source"] == {
+        "kind": "analyst",
+        "thread_id": "ptc-1",
+        "outcome": "error",
+        "run_ids": ["run-0", "run-1"],
+        "steer_ids": ["steer-1"],
+    }
 
 
 @pytest.mark.asyncio
@@ -504,15 +565,16 @@ async def test_analyst_offer_carries_where_the_work_was_asked_for_inline():
 async def test_analyst_report_message_includes_language_notice():
     from src.server.services.report_back.handoff import executor
 
+    owed = executor.OwedAnalystReport(
+        origin={"ptc_workspace_id": "ws-googl"},
+        dispatcher_thread_id="home-1",
+        ptc_thread_id="ptc-99",
+        final_status="completed",
+    )
     with patch.object(
         executor, "_workspace_name", autospec=True, return_value="GOOGL"
     ):
-        msg, source = await executor.report_message(
-            "ptc-99",
-            {"ptc_workspace_id": "ws-googl"},
-            "completed",
-            steered=False,
-        )
+        msg, source = await executor.report_message(owed, steered=False)
     assert msg == (
         "<system>\n"
         'The analysis you dispatched (thread ptc-99 in the "GOOGL" workspace) has completed.\n'

@@ -17,6 +17,7 @@ from fastapi import HTTPException
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool, tool
 
+from ptc_agent.core.sandbox.jobs import Failed, Running
 from src.dalton.access_tiers import get_user_tier
 from src.dalton.auth import (
     resolve_caller_home_workspace_id,
@@ -54,6 +55,19 @@ EXTERNAL_WIKI_INGEST_FORBIDDEN_MESSAGE = (
 )
 
 TargetTypeLiteral = Literal["company", "sector"]
+
+
+def _turn_admitted_workspace(config: RunnableConfig | None, workspace_id: str) -> bool:
+    """Whether ``workspace_id`` is the workspace this turn was admitted into.
+
+    DALTON-HOOK(colleague-dispatch): a colleague's turn in someone else's
+    workspace was already admitted (owner settings, channel, revocation) at
+    START; the strict owner check below would refuse it. Anything else keeps
+    the strict check.
+    """
+    cfg = (config or {}).get("configurable") or {}
+    admitted = str(cfg.get("turn_admitted_workspace_id") or "").strip()
+    return bool(admitted) and admitted == str(workspace_id or "").strip()
 
 
 def _extract_user_email_from_config(config: RunnableConfig | None) -> str:
@@ -107,12 +121,14 @@ async def check_and_increment_wiki_ingest_rate_limit(
     *,
     limit: int = WIKI_INGEST_RATE_LIMIT_PER_HOUR,
     window_s: int = WIKI_INGEST_RATE_WINDOW_S,
+    scope: str = "wiki_ingest",
 ) -> tuple[bool, int]:
     """Atomically increment per-user hourly write counter in Redis via a single Lua `EVAL`.
 
     Fails closed (`(False, -1)`) when Redis is unavailable, disabled, or errors out.
+    `scope` keeps the counters apart per library (D1: wiki vs sales notes).
     """
-    key = f"dalton:wiki_ingest:rate:{user_id}"
+    key = f"dalton:{scope}:rate:{user_id}"
     try:
         cache = get_cache_client()
     except Exception as exc:
@@ -146,6 +162,7 @@ def _validate_and_normalize_workspace_file_path(
     file_path: str,
     *,
     workspace_dir: str | None,
+    allowed_extensions: frozenset[str] = WIKI_INGEST_ALLOWED_EXTENSIONS,
 ) -> tuple[str | None, str | None, str | None]:
     """Validate `file_path` and `workspace_dir` against shell metacharacters and traversal.
 
@@ -192,14 +209,21 @@ def _validate_and_normalize_workspace_file_path(
         return None, None, "file_path cannot reference hidden or mounted system paths (.agents)."
 
     ext = Path(rel_parts[-1]).suffix.lower()
-    if ext not in WIKI_INGEST_ALLOWED_EXTENSIONS:
+    if ext not in allowed_extensions:
         return (
             None,
             None,
-            f"Unsupported file extension '{ext}'. Allowed: {', '.join(sorted(WIKI_INGEST_ALLOWED_EXTENSIONS))}",
+            f"Unsupported file extension '{ext}'. Allowed: {', '.join(sorted(allowed_extensions))}",
         )
 
     return ws_root, rel_path, None
+
+
+#: How long a metadata-inspection code job may run before the gate fails
+#: closed. The check itself (`stat`/`realpath`) is subsecond; the budget only
+#: has to cover the sandbox python's startup and imports, so a cold container
+#: gets seconds, not minutes.
+_METADATA_JOB_WAIT_S: float = 20.0
 
 
 async def _exec_sandbox_argv(
@@ -210,8 +234,12 @@ async def _exec_sandbox_argv(
 ) -> tuple[int, str]:
     """Execute `argv` (`stat` or `realpath`) in the sandbox as an argument list without a shell.
 
-    Never interpolates any argument into a shell command string. Raises `RuntimeError`
-    if execution fails or is unsupported so callers always fail closed.
+    Never interpolates any argument into a shell command string: the argv rides
+    base64-encoded into a Python one-shot the sandbox runs as a code job.
+    Raises `RuntimeError` if execution fails, is unsupported, or outlives its
+    wait — this is a synchronous fail-closed gate, so a check that cannot
+    complete must never read as passed, and a job that outlives the wait is
+    stopped rather than left dangling.
     """
     if not isinstance(argv, list) or not argv:
         raise RuntimeError("argv must be a non-empty list")
@@ -221,46 +249,56 @@ async def _exec_sandbox_argv(
         if not isinstance(arg, str) or "\x00" in arg or _FORBIDDEN_PATH_CHARS_RE.search(arg):
             raise RuntimeError("Invalid argument in argv list")
 
-    aexec_argv_fn = getattr(backend, "aexec_argv", None)
-    if callable(aexec_argv_fn):
-        res = await aexec_argv_fn(list(argv), timeout=timeout)
-        exit_code = getattr(res, "exit_code", None)
-        output = getattr(res, "output", None)
-        if not isinstance(exit_code, int) or isinstance(exit_code, bool) or not isinstance(output, str):
-            raise RuntimeError("Backend aexec_argv returned invalid response")
-        return exit_code, output
+    start_code_job_fn = getattr(backend, "start_code_job", None)
+    if not callable(start_code_job_fn):
+        raise RuntimeError("Filesystem backend does not support code jobs")
 
-    aexecute_code_fn = getattr(backend, "aexecute_code", None)
-    if callable(aexecute_code_fn):
-        argv_b64 = base64.b64encode(json.dumps(list(argv)).encode("utf-8")).decode("ascii")
-        code = (
-            "import base64, json, subprocess, sys\n"
-            f"argv = json.loads(base64.b64decode('{argv_b64}').decode('utf-8'))\n"
-            "proc = subprocess.run(argv, shell=False, check=False, capture_output=True, text=True)\n"
-            "print(json.dumps({'exit_code': proc.returncode, 'stdout': proc.stdout, 'stderr': proc.stderr}))\n"
+    argv_b64 = base64.b64encode(json.dumps(list(argv)).encode("utf-8")).decode("ascii")
+    code = (
+        "import base64, json, subprocess, sys\n"
+        f"argv = json.loads(base64.b64decode('{argv_b64}').decode('utf-8'))\n"
+        "proc = subprocess.run(argv, shell=False, check=False, capture_output=True, text=True)\n"
+        "print(json.dumps({'exit_code': proc.returncode, 'stdout': proc.stdout, 'stderr': proc.stderr}))\n"
+    )
+    outcome = await start_code_job_fn(code, wait_s=_METADATA_JOB_WAIT_S)
+    if isinstance(outcome, Running):
+        try:
+            await backend.stop_job(outcome.handle.ref, discard=True)
+        except Exception:
+            logger.warning(
+                "Could not stop metadata inspection job %s",
+                outcome.handle.ref.command_id,
+                exc_info=True,
+            )
+        raise RuntimeError("Sandbox metadata inspection outlived its wait")
+    if isinstance(outcome, Failed):
+        raise RuntimeError(f"Sandbox metadata inspection failed: {outcome.message}")
+    if outcome.exit_code != 0:
+        # The one-shot python itself failed (startup, import): its own exit
+        # code, never the payload's, since none was printed.
+        raise RuntimeError(
+            f"Sandbox metadata inspection job failed (exit={outcome.exit_code})"
         )
-        exec_res = await aexecute_code_fn(code)
-        if getattr(exec_res, "success", None) is not True:
-            raise RuntimeError("Sandbox aexecute_code metadata inspection failed")
-        stdout_raw = getattr(exec_res, "stdout", None)
-        if not isinstance(stdout_raw, str) or not stdout_raw.strip():
-            raise RuntimeError("Sandbox aexecute_code returned empty stdout")
-        last_line = stdout_raw.strip().splitlines()[-1]
-        parsed = json.loads(last_line)
-        if not isinstance(parsed, dict):
-            raise RuntimeError("Sandbox aexecute_code returned non-dict payload")
-        exit_code = parsed.get("exit_code")
-        stdout_str = parsed.get("stdout")
-        if not isinstance(exit_code, int) or isinstance(exit_code, bool) or not isinstance(stdout_str, str):
-            raise RuntimeError("Sandbox aexecute_code returned malformed result")
-        return exit_code, stdout_str
 
-    raise RuntimeError("Filesystem backend does not support non-shell argv execution")
+    stdout_raw = outcome.output
+    if not isinstance(stdout_raw, str) or not stdout_raw.strip():
+        raise RuntimeError("Sandbox code job returned empty stdout")
+    last_line = stdout_raw.strip().splitlines()[-1]
+    parsed = json.loads(last_line)
+    if not isinstance(parsed, dict):
+        raise RuntimeError("Sandbox code job returned non-dict payload")
+    exit_code = parsed.get("exit_code")
+    stdout_str = parsed.get("stdout")
+    if not isinstance(exit_code, int) or isinstance(exit_code, bool) or not isinstance(stdout_str, str):
+        raise RuntimeError("Sandbox code job returned malformed result")
+    return exit_code, stdout_str
 
 
 async def _read_workspace_file_safely(
     backend: Any,
     file_path: str,
+    *,
+    allowed_extensions: frozenset[str] = WIKI_INGEST_ALLOWED_EXTENSIONS,
 ) -> tuple[str | None, bytes | None, str | None]:
     """Validate `file_path` in the sandbox without a shell, reject symlinks at every level,
     confirm `realpath` stays inside the caller's workspace root, and read from the resolved realpath.
@@ -279,7 +317,7 @@ async def _read_workspace_file_safely(
         ws_dir = ws_dir_attr.strip()
 
     ws_root, rel_path, path_err = _validate_and_normalize_workspace_file_path(
-        file_path, workspace_dir=ws_dir
+        file_path, workspace_dir=ws_dir, allowed_extensions=allowed_extensions
     )
     if path_err is not None or ws_root is None or rel_path is None:
         return None, None, path_err or "Invalid file_path."
@@ -300,7 +338,7 @@ async def _read_workspace_file_safely(
             timeout=10,
         )
     except Exception as exc:
-        return None, None, f"Metadata stat check failed: {type(exc).__name__}"
+        return None, None, f"Metadata stat check failed: {type(exc).__name__}: {exc}"
 
     if stat_code != 0 or not stat_out.strip():
         return None, None, f"Metadata stat check failed for '{rel_path}' (exit={stat_code})."
@@ -331,7 +369,7 @@ async def _read_workspace_file_safely(
             timeout=10,
         )
     except Exception as exc:
-        return None, None, f"Metadata realpath check failed: {type(exc).__name__}"
+        return None, None, f"Metadata realpath check failed: {type(exc).__name__}: {exc}"
 
     if rp_code != 0 or not rp_out.strip():
         return None, None, f"Metadata realpath check failed for '{rel_path}' (exit={rp_code})."
@@ -510,7 +548,8 @@ def build_ingest_company_wiki_tool(
             return "ERROR: user_id and workspace_id are required in RunnableConfig."
 
         try:
-            await verify_workspace_access(workspace_id, user_id)
+            if not _turn_admitted_workspace(config, workspace_id):
+                await verify_workspace_access(workspace_id, user_id)
         except HTTPException as exc:
             return f"ERROR: {exc.detail}"
         except Exception as exc:

@@ -6,17 +6,25 @@ import { Popover, PopoverClose, PopoverContent, PopoverTrigger } from '@/compone
 import PulseDot from '@/components/ui/pulse-dot';
 import { useLocale } from '@/hooks/useLocale';
 import { mediumTime } from '@/lib/format';
+import { useNow } from '@/hooks/useNow';
 import { DURATION } from '@/lib/motion';
 import { cn } from '@/lib/utils';
-import { DispatchStatusGlyph, DispatchStatusIndicator, LiveSpinner } from '../dispatchStatusUi';
+import { DispatchStatusGlyph, DispatchStatusIndicator } from '../dispatchStatusUi';
+import { RunGlyph } from '../messageList/runCard';
 import type { PTCDispatchStatus } from '../../hooks/usePTCDispatchStatus';
 import { useOpenDispatchedThread, type DispatcherContext } from '../../hooks/useOpenDispatchedThread';
+import type { CommandRun } from '@/types/commands';
+import type { WakeupList } from '@/types/wakeups';
 import type { MarketWatchState } from '../../session/marketWatchEvents';
 import { isTerminalStatus, sidebarAgentRowLabel, type SubagentTerminalStatus } from '../../session/subagents/subagentStatus';
+import { chipLabel } from '../wakeupLabels';
 import type { RosterTask } from './delegatedWork';
 import type { RosterAnalyst } from './useAnalystRoster';
 import { SHAPE_RUN, SHAPE_STAGGER, liquidRunMs, type TrayFoldPhase } from './useTrayFold';
 import { trayChipCount, trayWorking, type TrayContents, type TrayTasks } from './useTrayContents';
+import { WakeupListRows } from '../wakeups/WakeupList';
+import { CommandListRows } from '../commands/CommandListRows';
+import { TRAY_ROW } from './trayRow';
 
 // Solid, not a translucent tint: the transcript scrolls under the tray. The
 // liquid and the dock are the chips' own fill, so a chip, its shape and the
@@ -28,7 +36,6 @@ const CHIP_BUTTON = cn(
   'cursor-pointer outline-hidden transition-colors hover:bg-(--color-bg-elevated) hover:text-(--color-text-secondary) focus-visible:ring-2 focus-visible:ring-ring',
   'data-[state=open]:bg-(--color-bg-elevated) data-[state=open]:text-(--color-text-primary)',
 );
-const ROW = 'flex w-full cursor-pointer items-center gap-2.5 rounded-md px-2.5 py-2 text-left outline-hidden transition-colors hover:bg-(--color-bg-hover) focus-visible:bg-(--color-bg-hover)';
 
 interface ComposerTrayProps {
   contents: TrayContents;
@@ -42,12 +49,17 @@ interface ComposerTrayProps {
   onOpenTask: (agentId: string) => void;
   /** Opens the market watch's live prices. */
   onOpenWatch: () => void;
+  /** Opens a background command's tool card, by the call it started from. */
+  onOpenCommand: (toolCallId: string) => void;
+  /** The thread the wakeups chip cancels in. */
+  threadId: string | null;
 }
 
 /**
  * The tray's chips, above the composer. Each chip that names more than one
  * thing opens a list whose rows jump to it; a chip that names one jumps
- * straight there. The tray stays while a turn runs: what it lists outlives the
+ * straight there, unless its list is where a control lives (a wakeup's
+ * Cancel, a command's Stop). The tray stays while a turn runs: what it lists outlives the
  * turn, and work handed off stays a few turns after it went quiet.
  *
  * While the reader is up in the history the chips fold into the composer, and
@@ -56,7 +68,7 @@ interface ComposerTrayProps {
  * back out the same way.
  */
 export function ComposerTray({
-  contents, phase, trayRef, dockRef, from, onOpenTask, onOpenWatch,
+  contents, phase, trayRef, dockRef, from, onOpenTask, onOpenWatch, onOpenCommand, threadId,
 }: ComposerTrayProps) {
   const chipsRef = useRef<HTMLDivElement>(null);
   const [run, setRun] = useState<LiquidRun | null>(null);
@@ -71,7 +83,7 @@ export function ComposerTray({
   }, [liquid, phase, trayRef, dockRef]);
 
   if (phase === 'folded') return null;
-  const { watch, tasks, analysts, reportBackLabel } = contents;
+  const { watch, wakeups, commands, tasks, analysts, reportBackLabel } = contents;
   // Unfolding, the chips are back in full as the last shape lands, when the
   // liquid under them goes.
   const unfoldFadeDelay = liquidRunMs(trayChipCount(contents)) / 1000 - DURATION.quick;
@@ -94,6 +106,8 @@ export function ComposerTray({
           : { duration: DURATION.exit }}
       >
         {watch && <WatchChip watch={watch} onOpen={onOpenWatch} />}
+        {wakeups && <WakeupsChip list={wakeups} threadId={threadId} />}
+        {commands && <CommandsChip rows={commands} onOpen={onOpenCommand} />}
         {tasks && <TasksChip {...tasks} onOpen={onOpenTask} />}
         {analysts && <AnalystsChip threads={analysts} from={from} />}
         {reportBackLabel && <StatusChip label={reportBackLabel} />}
@@ -264,11 +278,11 @@ export function TrayDock({ ref, phase, contents, onOpen }: TrayDockProps) {
       <span
         className={cn(
           'inline-flex items-center gap-1.5',
-          folded ? 'opacity-100 transition-opacity duration-150 motion-reduce:transition-none' : 'opacity-0',
+          folded ? 'opacity-100 transition-opacity duration-quick motion-reduce:transition-none' : 'opacity-0',
         )}
       >
         {contents.watch && <PulseDot />}
-        {working && <LiveSpinner />}
+        {working && <RunGlyph kind="live" />}
         <ChevronUp aria-hidden="true" className="h-3 w-3 shrink-0" />
       </span>
     </button>
@@ -289,10 +303,31 @@ function WatchChip({ watch, onOpen }: { watch: MarketWatchState; onOpen: () => v
   return (
     <button type="button" className={CHIP_BUTTON} title={title} aria-label={t('chat.marketWatch.chipAction')} onClick={onOpen}>
       <PulseDot />
-      <span role="status" aria-live="polite">
+      <span role="status" aria-live="polite" className="tabular-nums">
         {t('chat.marketWatch.watching', { symbols: watch.symbols.join(', ') })}
       </span>
     </button>
+  );
+}
+
+/**
+ * The wakeups the agent set in this thread: how many are pending and when the
+ * next fires, opening a list where each can be cancelled. Not a status line,
+ * so no live region: it changes when the agent sets or a wakeup fires.
+ */
+function WakeupsChip({ list, threadId }: { list: WakeupList; threadId: string | null }) {
+  const { t } = useTranslation();
+  const locale = useLocale();
+  const now = useNow();
+  return (
+    <ListChip
+      label={chipLabel(list.items, t, locale, now, list.userTimezone)}
+      heading={t('chat.wakeups.panelTitle')}
+      title={t('chat.wakeups.chipTitle')}
+      working={false}
+    >
+      <WakeupListRows threadId={threadId} wakeups={list.items} now={now} userTimezone={list.userTimezone} />
+    </ListChip>
   );
 }
 
@@ -306,7 +341,7 @@ export function ReconnectingChip() {
   // The gap is a translate: the stack's sibling gap zeroes a bottom margin.
   return (
     <div className={cn(CHIP, 'absolute bottom-full left-4 -translate-y-2')} role="status" aria-live="polite">
-      <LiveSpinner />
+      <RunGlyph kind="live" />
       {t('chat.reconnecting', 'Reconnecting…')}
     </div>
   );
@@ -315,7 +350,7 @@ export function ReconnectingChip() {
 function StatusChip({ label }: { label: string }) {
   return (
     <div className={CHIP} role="status" aria-live="polite">
-      <LiveSpinner />
+      <RunGlyph kind="live" />
       <span className="truncate">{label}</span>
     </div>
   );
@@ -323,16 +358,17 @@ function StatusChip({ label }: { label: string }) {
 
 /**
  * A chip that opens a list, whose rows close it as they open what they name.
- * It mounts only while it stands for more than one thing, so the open state
- * goes with it: a list that shrinks to one while open does not spring back
- * open when a second arrives. It spins while any of them is working.
+ * A chip whose lone row would only jump somewhere mounts it only while it
+ * stands for more than one thing, so the open state goes with it: a list
+ * that shrinks to one while open does not spring back open when a second
+ * arrives. It spins while any of them is working.
  */
-function ListChip({ label, heading, working, children }: { label: string; heading: string; working: boolean; children: ReactNode }) {
+function ListChip({ label, heading, title, working, children }: { label: string; heading: string; title?: string; working: boolean; children: ReactNode }) {
   return (
     <Popover>
       <PopoverTrigger asChild>
-        <button type="button" className={cn(CHIP_BUTTON, 'group')}>
-          {working && <LiveSpinner />}
+        <button type="button" className={cn(CHIP_BUTTON, 'group')} title={title}>
+          {working && <RunGlyph kind="live" />}
           <span>{label}</span>
           <ChevronUp aria-hidden="true" className="h-3 w-3 shrink-0 transition-transform group-data-[state=open]:rotate-180" />
         </button>
@@ -390,7 +426,7 @@ function TasksChip({ rows, unnamedRunning, onOpen }: TrayTasks & { onOpen: (agen
         return (
           <li key={row.id}>
             <PopoverClose asChild>
-              <button type="button" className={ROW} onClick={() => onOpen(row.id)}>
+              <button type="button" className={TRAY_ROW} onClick={() => onOpen(row.id)}>
                 <span className="flex w-3.5 shrink-0 justify-center">
                   <TaskGlyph row={row} />
                 </span>
@@ -412,6 +448,17 @@ function TasksChip({ rows, unnamedRunning, onOpen }: TrayTasks & { onOpen: (agen
   );
 }
 
+/** The commands still running in the background, as a list even for one,
+ *  since the Stop lives there. */
+function CommandsChip({ rows, onOpen }: { rows: CommandRun[]; onOpen: (toolCallId: string) => void }) {
+  const { t } = useTranslation();
+  return (
+    <ListChip label={t('chat.commands.chip', { count: rows.length })} heading={t('chat.tray.commandsHeading')} working>
+      <CommandListRows rows={rows} onOpen={onOpen} />
+    </ListChip>
+  );
+}
+
 function AnalystsChip({ threads, from }: { threads: RosterAnalyst[]; from: DispatcherContext | null }) {
   const { t } = useTranslation();
   const openDispatchedThread = useOpenDispatchedThread(from);
@@ -425,7 +472,7 @@ function AnalystsChip({ threads, from }: { threads: RosterAnalyst[]; from: Dispa
       : (name ?? t('agents.tray.analysts', { count: 1 }));
     return (
       <button type="button" className={CHIP_BUTTON} title={thread.title ?? undefined} onClick={() => openThread(thread)}>
-        {thread.running ? <LiveSpinner /> : thread.status && <DispatchStatusGlyph status={thread.status} />}
+        {thread.running ? <RunGlyph kind="live" /> : thread.status && <DispatchStatusGlyph status={thread.status} />}
         <span className="max-w-64 truncate">{label}</span>
         <ArrowUpRight aria-hidden="true" className="h-3 w-3 shrink-0" />
       </button>
@@ -453,7 +500,7 @@ function AnalystRow({ thread, onOpen }: { thread: RosterAnalyst; onOpen: () => v
   const title = thread.title || t('nav.untitledThread');
   return (
     <PopoverClose asChild>
-      <button type="button" className={ROW} onClick={onOpen}>
+      <button type="button" className={TRAY_ROW} onClick={onOpen}>
         <span
           aria-hidden="true"
           className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md"

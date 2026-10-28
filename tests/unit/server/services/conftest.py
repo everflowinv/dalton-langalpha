@@ -46,6 +46,57 @@ def _folder_hold_is_free():
 
 
 @pytest.fixture(autouse=True)
+def _no_workspace_moving():
+    """Acquiring a session and deleting a workspace both refuse one that is
+    moving, and a delete one with a live run, before it ends its commands:
+    row reads these pool-less tests cannot make. A test of a refusal patches
+    it inside this one."""
+    with patch(
+        "src.server.services.workspace_manager.workspace_is_moving",
+        AsyncMock(return_value=False),
+    ) as moving, patch(
+        "src.server.services.workspace_manager.workspace_has_active_work",
+        AsyncMock(return_value=False),
+    ):
+        yield moving
+
+
+@pytest.fixture(autouse=True)
+def _no_published_reports():
+    """DALTON-HOOK(workspace-delete-guard): every delete path asks the
+    publications table; a row read these pool-less tests cannot make. A test
+    of the refusal patches it inside this one."""
+    with patch(
+        "src.server.services.workspace_manager._has_published_reports",
+        AsyncMock(return_value=False),
+    ) as published:
+        yield published
+
+
+@pytest.fixture(autouse=True)
+def _no_backup_stamp():
+    """Every backup stamps the time once it completes: a row write these
+    pool-less tests cannot make."""
+    with patch(
+        "src.server.services.persistence.backup.mark_files_backed_up",
+        AsyncMock(),
+    ):
+        yield
+
+
+@pytest.fixture(autouse=True)
+def _no_workspaces_to_resync():
+    """A restart on the sandbox the machine stopped on queues every workspace
+    on it for its bring-up, listed by a row read these pool-less tests cannot
+    make. A test of that queue patches it inside this one."""
+    with patch(
+        "src.server.services.computer_manager._bringup.get_live_workspace_ids_for_computer",
+        AsyncMock(return_value=[]),
+    ) as live:
+        yield live
+
+
+@pytest.fixture(autouse=True)
 def _folder_allocation_is_free():
     """An adoption picks its folder under a transaction-scoped advisory lock
     these pool-less tests cannot take; the reads and the bind under it are patched."""

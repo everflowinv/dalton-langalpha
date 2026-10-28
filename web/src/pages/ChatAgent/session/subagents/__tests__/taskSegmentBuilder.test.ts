@@ -235,6 +235,15 @@ describe('applyLaunchReply', () => {
     expect(record).toMatchObject({ status: 'error', launchFailed: true, result: REFUSED });
   });
 
+  it('keeps a refusal the user can be told about in their own words', () => {
+    const record = applyLaunchReply(spawn(), {
+      content: REFUSED,
+      status: 'error',
+      artifact: { launch: 'subagents_off' },
+    });
+    expect(record).toMatchObject({ status: 'error', launchFailed: true, launchRefusal: 'subagents_off' });
+  });
+
   it('leaves a launch that started to its own settle', () => {
     const record = applyLaunchReply(spawn(), { content: 'Task-A1b2C3 started in the background.' });
     expect(record.status).toBe('running');

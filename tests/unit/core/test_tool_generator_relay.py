@@ -142,9 +142,11 @@ class TestRelayBoundEmission:
         # Each tools/call send is budgeted above the relay's 55s wall.
         assert "_HTTP_CALL_BUDGET = 65.0" in code
         # DALTON-HOOK(mcp-call-timeout): the send budget is per-server config
-        # (call_timeout_s, defaulting to _HTTP_CALL_BUDGET), so the client is
-        # constructed from the config field, not the raw constant.
-        assert "httpx.Client(timeout=cfg.call_timeout_s)" in code
+        # (call_timeout_s, defaulting to _HTTP_CALL_BUDGET): the per-exchange
+        # client and the per-send deadline (which also bounds data-token
+        # resends on the pooled client) both come from the config field.
+        assert "_client_for(cfg, cfg.call_timeout_s)" in code
+        assert "deadline = time.monotonic() + cfg.call_timeout_s" in code
 
     def test_builtin_only_config_has_no_relay_binding(self):
         # The runtime module always ships the relay/vault helpers (static
@@ -160,6 +162,28 @@ class TestRelayBoundEmission:
         assert "source" not in entry
         assert "env" not in entry
         assert entry["untrusted"] is False
+
+
+class TestDataTokenEmission:
+    def test_builtin_http_entry_carries_auth_and_never_its_headers(self):
+        gen = ToolFunctionGenerator()
+        server = MCPServerConfig(
+            name="data_srv",
+            transport="http",
+            url="https://data.example/mcp",
+            auth="data_token",
+            headers={"Authorization": "Bearer ${HOST_DISCOVERY_TOKEN}"},
+        )
+        entry = gen.generate_client_config([server])["servers"]["data_srv"]
+        # The headers are the host's discovery credential; the sandbox
+        # presents its own token instead.
+        assert entry == {
+            "transport": "http",
+            "untrusted": False,
+            "url": "https://data.example/mcp",
+            "auth": "data_token",
+        }
+        assert "HOST_DISCOVERY_TOKEN" not in gen.generate_mcp_client_code([server])
 
 
 class TestRelayResolution:

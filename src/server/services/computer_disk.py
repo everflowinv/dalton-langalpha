@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Mapping, Optional
 
 from src.server.models.computer import ComputerDisk, DiskLevel, WorkspaceStorage
 
+_KIB = 1024
 _MB = 1024 * 1024
 
 # Free space under which each level starts. Tuned by hand; see the level table
@@ -119,17 +120,22 @@ class DiskReading:
 
 
 def parse_df(stdout: str) -> Optional[DiskReading]:
-    """Parse ``df -B1 --output=size,used,avail``: a header, then three integers."""
+    """Parse ``df -Pk``: a header, then filesystem, size, used, available
+    (KiB), capacity and mount point."""
     for line in stdout.strip().splitlines()[1:]:
         parts = line.split()
-        if len(parts) >= 3 and all(p.isdigit() for p in parts[:3]):
-            total, used, free = (int(p) for p in parts[:3])
-            return DiskReading(total_bytes=total, used_bytes=used, free_bytes=free)
+        # A filesystem name or mount point may hold spaces, so the numbers are
+        # the three that the capacity column follows.
+        for i in range(len(parts) - 3):
+            numbers = parts[i : i + 3]
+            if all(p.isdigit() for p in numbers) and parts[i + 3].endswith("%"):
+                total, used, free = (int(p) * _KIB for p in numbers)
+                return DiskReading(total_bytes=total, used_bytes=used, free_bytes=free)
     return None
 
 
 def parse_du(stdout: str, root_dir: str) -> Dict[str, int]:
-    """Parse ``du -s -B1`` of each top-level folder into folder name -> bytes."""
+    """Parse ``du -sk`` of each top-level folder into folder name -> bytes."""
     prefix = root_dir.rstrip("/") + "/"
     sizes: Dict[str, int] = {}
     for line in stdout.strip().splitlines():
@@ -138,30 +144,35 @@ def parse_du(stdout: str, root_dir: str) -> Dict[str, int]:
             continue
         name = path[len(prefix):].strip("/")
         if name and "/" not in name:
-            sizes[name] = int(size.strip())
+            sizes[name] = int(size.strip()) * _KIB
     return sizes
 
 
 def disk_command(root_dir: str, *, breakdown: bool) -> tuple[str, int]:
     """One shell command for the reading, and the exec timeout it needs."""
     root = shlex.quote(root_dir.rstrip("/") or "/")
-    df = f"df -B1 --output=size,used,avail {root}"
+    # KiB and POSIX columns, which BSD df (a macOS machine) reads as GNU does.
+    df = f"df -Pk {root}"
     if not breakdown:
         return df, _DF_TIMEOUT
     # Real directories only, on the root's filesystem: an agent's symlink to
     # / would otherwise make every breakdown walk the whole machine. The du
     # gets its own deadline inside the exec, so a slow walk still returns the
-    # df line ahead of it instead of losing both to the exec timeout.
+    # df line ahead of it instead of losing both to the exec timeout. macOS
+    # has no timeout(1), so perl's alarm stands in for it there.
     # Allocated blocks, not apparent size: that is what df counts as used, so
     # a sparse or preallocated file cannot push the folders past it and zero
-    # out 'other'. One du for every folder counts a hard link only once. -B1
-    # stands alone: clustered, -B takes the rest as its size and du fails.
-    du = (
-        f"find {root} -mindepth 1 -maxdepth 1 -type d"
-        f" -exec timeout {_DU_TIMEOUT - 2} du -sx -B1 {{}} +"
+    # out 'other'. One du for every folder counts a hard link only once.
+    deadline = _DU_TIMEOUT - 2
+    bound = (
+        f"if command -v timeout >/dev/null 2>&1; then set -- timeout {deadline}; "
+        "elif command -v perl >/dev/null 2>&1; then "
+        f"set -- perl -e 'alarm shift; exec @ARGV' {deadline}; "
+        "else set --; fi"
     )
+    du = f'find {root} -mindepth 1 -maxdepth 1 -type d -exec "$@" du -skx {{}} +'
     return (
-        f"{df}; echo {_SPLIT}; {du} 2>/dev/null || true",
+        f"{df}; echo {_SPLIT}; {bound}; {du} 2>/dev/null || true",
         _DF_TIMEOUT + _DU_TIMEOUT,
     )
 

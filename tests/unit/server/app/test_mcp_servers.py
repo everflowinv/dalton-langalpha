@@ -22,6 +22,7 @@ from src.server.app.mcp_servers import _derive_status
 from src.server.database.account_disables import AccountDisables
 from src.server.database.mcp_servers import MAX_CATALOG_SERVERS_PER_USER
 from src.server.models.mcp_server import McpServerInput
+from src.server.services.computer_manager import MachineTarget
 from src.server.services.mcp_catalog import CatalogEdit, detach_warning
 from src.server.services.mcp_config import Origin
 from src.server.services.plugins.bundled import ComponentOwners
@@ -328,7 +329,9 @@ async def test_list_surfaces_applied_config_version(client):
     # Fenced on the row's binding: a version from a session holding a superseded
     # sandbox is not something this worker can vouch for.
     wm.get_applied_mcp_config_version.assert_called_once_with(
-        ws["workspace_id"], expected_sandbox_id="sb-1"
+        ws["workspace_id"],
+        expected_sandbox_id="sb-1",
+        target=MachineTarget.of_workspace(ws),
     )
 
 
@@ -347,7 +350,9 @@ def test_live_sandbox_declines_a_superseded_handle():
     ):
         assert _get_live_sandbox(ws["workspace_id"], ws) is None
     wm.get_session_if_ready.assert_called_once_with(
-        ws["workspace_id"], expected_sandbox_id="sb-replaced"
+        ws["workspace_id"],
+        expected_sandbox_id="sb-replaced",
+        target=MachineTarget.of_workspace(ws),
     )
 
 

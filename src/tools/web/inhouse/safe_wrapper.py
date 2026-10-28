@@ -79,9 +79,14 @@ class CrawlResult:
     title: Optional[str] = None
     error: Optional[str] = None
     # Passthrough of CrawlOutput.failure_kind for failures classified by the
-    # crawler, plus wrapper-level kinds (circuit_open, queue_full, cancelled,
-    # crawl_error) for failures classified at this layer.
+    # crawler, plus wrapper-level kinds (host_circuit_open, circuit_open,
+    # queue_full, cancelled, crawl_error) for failures classified at this layer.
+    # The two breakers report apart: one host's is that host's doing, the
+    # infra one is ours.
     error_type: Optional[str] = None
+    # DALTON-HOOK(heavy-compute-isolation): True when the markdown is a
+    # terminated-parse wording rather than page content.
+    parse_timeout: Optional[bool] = None
 
 
 _VALID_BACKENDS = frozenset({"scrapling", "router"})
@@ -354,7 +359,7 @@ class SafeCrawlerWrapper:
                     return CrawlResult(
                         success=False,
                         error=f"Crawler temporarily unavailable for {netloc} (host breaker open)",
-                        error_type="circuit_open",
+                        error_type="host_circuit_open",
                     )
             await self._infra_breaker.check_state()
             if self._infra_breaker.is_open():
@@ -503,6 +508,9 @@ class SafeCrawlerWrapper:
             success=True,
             markdown=output.markdown,
             title=output.title,
+            # DALTON-HOOK(heavy-compute-isolation): terminated-parse marker rides
+            # a success so the timeout wording survives the provider chain.
+            parse_timeout=output.parse_timeout,
         )
 
     async def _classify_exception(

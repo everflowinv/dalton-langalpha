@@ -87,6 +87,7 @@ vi.mock('@/hooks/useAllModels', () => ({
     metadata: {},
     modelAccessMap: {},
     systemDefaults: h.systemDefaults,
+    offPlanModels: new Set(),
     // Stable Set ref — the stale-model cleanup effect keys on its identity.
     validModelNames: h.validModelNames,
     rawModels: h.rawModels,

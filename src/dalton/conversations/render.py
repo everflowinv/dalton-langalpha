@@ -254,19 +254,23 @@ async def remove_conversation_file_from_backend(
             f"Cannot remove conversation digest {rel_path}: no filesystem backend for workspace_id={workspace_id}"
         )
 
-    if hasattr(eff_backend, "aexecute_bash"):
+    # DALTON-HOOK(conversation-archive): `aexecute` is the retained synchronous
+    # exec surface; `rm -f` deletes the digest file. The old `awrite_text("")`
+    # fallback emptied the file while its row was deleted — a stale empty file
+    # is worse than a failed delete, so no backend means an error.
+    if hasattr(eff_backend, "aexecute"):
         target_path = rel_path
         if hasattr(eff_backend, "normalize_path"):
             norm = eff_backend.normalize_path(rel_path)
             if isinstance(norm, str) and norm:
                 target_path = norm
-        res = await eff_backend.aexecute_bash(f"rm -f {shlex.quote(target_path)}")
-        if isinstance(res, dict) and int(res.get("exit_code") or 0) != 0:
+        res = await eff_backend.aexecute(f"rm -f {shlex.quote(target_path)}")
+        if int(getattr(res, "exit_code", 1) or 0) != 0:
             raise RuntimeError(f"Backend rm -f failed for {rel_path}")
-    elif hasattr(eff_backend, "awrite_text"):
-        wrote = await eff_backend.awrite_text(rel_path, "")
-        if wrote is False:
-            raise RuntimeError(f"Backend awrite_text failed while clearing {rel_path}")
+    else:
+        raise RuntimeError(
+            f"Backend cannot delete conversation digest {rel_path}: no synchronous exec"
+        )
 
     if workspace_id:
         await delete_file_rows(str(workspace_id), [rel_path], conn=conn)

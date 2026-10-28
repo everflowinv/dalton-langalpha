@@ -12,7 +12,12 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
 from ptc_agent.core.sandbox.migration import LayoutMigrationError
-from ptc_agent.core.sandbox.runtime import SandboxGoneError, SandboxTransientError
+from ptc_agent.core.sandbox.providers.ssh_errors import connect_failure
+from ptc_agent.core.sandbox.runtime import (
+    RuntimeState,
+    SandboxGoneError,
+    SandboxTransientError,
+)
 from ptc_agent.core.session import Session
 
 from src.server.services.runs.executor import LocalRunExecutor
@@ -46,6 +51,7 @@ from src.server.database.workspace import (
 from src.server.models.computer import CLAIMABLE_FOR_START, ComputerStatus
 from src.server.services.computer_manager._providers import host_outage_of
 from src.server.services.computer_manager._types import ComputerBinding
+from src.server.services.computer_start_failure import record_start_failure
 from src.server.services.path_lock_coordination import (
     STOP_HEARTBEAT_UNAVAILABLE_RECOVERY_S,
     computer_stop_heartbeat,
@@ -58,6 +64,10 @@ from src.server.services.workspace_status_pubsub import (
 
 
 logger = logging.getLogger(__name__)
+
+# How long a stop waits for an owner's machine to say how it is: one connect
+# with its timeout, then one short command.
+_OWNER_MACHINE_PROBE_S = 20
 
 
 class _MachineLeftRunning(Exception):
@@ -137,6 +147,8 @@ class SessionLifecycleMixin:
         on_state_observed: Callable[[str], None] | None = None,
         skills_signature: str | None = None,
         _attempt: int = 0,
+        # DALTON-HOOK(acquire-retry-bound): stop-waits counted apart from attempts
+        _stop_waits: int = 0,
     ) -> Session:
         """Sizing and always-on belong to create/restart, not post-start checks.
 
@@ -220,6 +232,9 @@ class SessionLifecycleMixin:
                         or needs_deferred_sync
                         or skills_stale
                         or superseded_resolve
+                        # The rebuild must go with an asset sync, which this
+                        # cooldown path skips.
+                        or workspace_view.builtins_superseded()
                     )
                     if not needs_sync:
                         # JWT age is an in-memory check unless near expiry, about once per 1.5h.
@@ -328,24 +343,26 @@ class SessionLifecycleMixin:
                     phase2_owner = True
 
         if pending_stop_wait:
-            return await self._await_stop_and_retry(
+            return await self._await_stop_and_retry(  # DALTON-HOOK(acquire-retry-bound)
                 binding,
                 user_id=user_id,
                 workspace_user_id=workspace_user_id,
                 on_state_observed=on_state_observed,
                 attempt=_attempt,
+                stop_waits=_stop_waits,
             )
 
         # Wait outside the lock so a 60-300s restore cannot block other operations.
         if pending_start_wait:
             # Attach/retry applies sizing and always-on at create/restart; no extra check.
-            attached = await self._await_in_flight_start(
+            attached = await self._await_in_flight_start(  # DALTON-HOOK(acquire-retry-bound)
                 binding,
                 user_id=user_id,
                 workspace_user_id=workspace_user_id,
                 on_state_observed=on_state_observed,
                 mark=_mark,
                 attempt=_attempt,
+                stop_waits=_stop_waits,
             )
             return attached
 
@@ -396,13 +413,36 @@ class SessionLifecycleMixin:
         workspace_user_id: str | None,
         on_state_observed: Callable[[str], None] | None,
         attempt: int,
+        stop_waits: int = 0,
     ) -> Session:
         """Let a stop finish, then acquire again from whatever state it left.
 
         Runs with no lock held, so the retry is a plain re-entry into
         acquisition instead of the hand-built session the in-lock version had
-        to assemble for a corrected row."""
+        to assemble for a corrected row.
+
+        DALTON-HOOK(acquire-retry-bound): the bound is on STOP-WAITS, counted
+        separately from ``attempt`` (A3 review): a start-failure retry bumps
+        ``attempt`` without ever having waited on a stop, and under the old
+        shared counter that innocent retry made the FIRST real stop-wait error
+        out. The second stop-wait errors out WHATEVER the computer's state is —
+        the retry used to recurse unconditionally when the re-entry landed in a
+        stop wait again (workspace row `running`, machine `stopped`, attach CAS
+        failing, forever). The CAS itself stays: it is what keeps a stop claimed
+        on another worker from being stomped. The machine's actual state rides
+        the error so the drill report says what was inconsistent."""
         workspace_id = binding.workspace_id
+        if stop_waits > 0:
+            computer = await get_computer(binding.computer_id)
+            state = (
+                str(computer["status"]) if computer is not None else "deleted"
+            )
+            raise RuntimeError(
+                f"Workspace {workspace_id} and computer {binding.computer_id} "
+                f"state are inconsistent (computer={state}) after a stop "
+                "settled and was retried once; please retry, or stop and "
+                "start the computer"
+            )
         logger.info(f"Workspace {workspace_id} is stopping, waiting for it to finish")
         settled = False
         for _ in range(20):
@@ -420,25 +460,12 @@ class SessionLifecycleMixin:
         if not settled:
             await self._correct_stuck_stopping(binding)
 
-        if attempt > 0:
-            # One retry only: a machine that is still stopping after a
-            # correction is a state to report, not to spin on.
-            computer = await get_computer(binding.computer_id)
-            if computer is None:
-                raise RuntimeError(
-                    f"Computer {binding.computer_id} was deleted while "
-                    f"workspace {workspace_id} waited for its stop"
-                )
-            if computer["status"] == ComputerStatus.STOPPING:
-                raise RuntimeError(
-                    f"Workspace {workspace_id} is still stopping after a recovery "
-                    "attempt. Please wait and try again."
-                )
-        return await self._acquire_session(
+        return await self._acquire_session(  # DALTON-HOOK(acquire-retry-bound)
             workspace_id,
             user_id=user_id or workspace_user_id,
             on_state_observed=on_state_observed,
             _attempt=attempt + 1,
+            _stop_waits=stop_waits + 1,
         )
 
     async def _correct_stuck_stopping(self, binding: ComputerBinding) -> None:
@@ -483,25 +510,86 @@ class SessionLifecycleMixin:
             )
             return await get_computer(computer_id)
 
-    async def _reconcile_provider_stop(self, binding: ComputerBinding) -> None:
-        """Keep a failed stop retryable without guessing whether the provider stopped."""
+    async def _owner_machine_state(
+        self, binding: ComputerBinding
+    ) -> RuntimeState | None:
+        """The state a machine its owner brought reports; None when it does not
+        answer or refuses the connection.
+
+        Such a machine is often away for longer than a stop should wait (a
+        laptop asleep, a VPS powered down), and the stop cannot reach what
+        still runs there anyway. The next start finds the machine as it was
+        left and carries on from there, so the stop settles without it.
+        """
+        provider = self._provider_for(binding)
+        try:
+            async with asyncio.timeout(_OWNER_MACHINE_PROBE_S):
+                runtime = await provider.get(binding.provider_ref)
+                return await runtime.get_state()
+        except TimeoutError:
+            return None
+        except Exception as e:
+            # A connection lost mid-read is as unanswered as one never made.
+            if provider.is_host_unavailable(e) or provider.is_transient_error(e):
+                return None
+            # A refused login (the key line removed, a reinstall that changed
+            # the host key) reaches the machine no better. Left 'stopping', the
+            # row would refuse the start that shows the owner why, and the
+            # remove that is their way out.
+            refused = connect_failure(e)
+            if refused is not None:
+                logger.warning(
+                    "Computer %s's machine refused the stop (%s): %s",
+                    binding.computer_id,
+                    refused.code,
+                    refused,
+                )
+                return None
+            raise
+        finally:
+            await provider.close()
+
+    async def _settle_unanswered_stop(self, computer_id: str) -> None:
+        logger.warning(
+            f"Computer {computer_id} is on its owner's machine, which the stop "
+            "could not reach; settling its stop without it"
+        )
+        session = self._cached_session(computer_id)
+        if session is not None:
+            await self._retire_session(
+                computer_id, session, reason="the stop could not reach its machine"
+            )
+        await self._settle_machine_stop(computer_id, ComputerStatus.STOPPED)
+
+    async def _reconcile_provider_stop(self, binding: ComputerBinding) -> bool:
+        """Keep a failed stop retryable without guessing whether the provider stopped.
+
+        True when the machine is its owner's and could not be reached, which
+        settles the stop rather than leaving it to be retried.
+        """
         computer_id = binding.computer_id
         sandbox_id = binding.provider_ref
         if not sandbox_id:
             # Nothing to probe: the stop had no sandbox to take down, so the
             # row is settled to 'stopped' and a start rebuilds from scratch.
             await self._settle_machine_stop(computer_id, ComputerStatus.STOPPED)
-            return
-        try:
-            async with self._detached_runtime(sandbox_id, binding=binding) as runtime:
-                actual_state = await runtime.get_state()
-        except SandboxGoneError as e:
-            logger.warning(
-                f"Sandbox {sandbox_id} is gone for computer {computer_id} during "
-                f"stopping-state recovery ({e}); settling the row to 'stopped'"
-            )
-            await self._settle_machine_stop(computer_id, ComputerStatus.STOPPED)
-            return
+            return False
+        if not binding.provider.recreatable:
+            actual_state = await self._owner_machine_state(binding)
+            if actual_state is None:
+                await self._settle_unanswered_stop(computer_id)
+                return True
+        else:
+            try:
+                async with self._detached_runtime(sandbox_id, binding=binding) as runtime:
+                    actual_state = await runtime.get_state()
+            except SandboxGoneError as e:
+                logger.warning(
+                    f"Sandbox {sandbox_id} is gone for computer {computer_id} during "
+                    f"stopping-state recovery ({e}); settling the row to 'stopped'"
+                )
+                await self._settle_machine_stop(computer_id, ComputerStatus.STOPPED)
+                return False
 
         state = actual_state.value
         logger.warning(
@@ -526,6 +614,7 @@ class SessionLifecycleMixin:
                 f"Workspace {binding.workspace_id} sandbox is in transient "
                 f"state {state!r}. Please wait and try again."
             )
+        return False
 
     async def _await_in_flight_start(
         self,
@@ -536,6 +625,7 @@ class SessionLifecycleMixin:
         on_state_observed: Callable[[str], None] | None,
         mark: Callable[[str], None],
         attempt: int,
+        stop_waits: int = 0,  # DALTON-HOOK(acquire-retry-bound): rides from acquisition
     ) -> Session:
         """Wait outside the machine lock so archived restores cannot block other ops."""
         workspace_id = binding.workspace_id
@@ -550,12 +640,16 @@ class SessionLifecycleMixin:
                         binding, ws_done, workspace_user_id, on_state_observed, mark
                     )
             except _MachineLeftRunning:
+                # The stop-wait count rides along (acquire-retry-bound): a
+                # start-failure retry above may have bumped `attempt`, but its
+                # FIRST genuine stop-wait still waits, as before.
                 return await self._await_stop_and_retry(
                     binding,
                     user_id=user_id,
                     workspace_user_id=workspace_user_id,
                     on_state_observed=on_state_observed,
                     attempt=attempt,
+                    stop_waits=stop_waits,
                 )
             return session
         if wait_status == "stopped" and attempt == 0:
@@ -564,11 +658,12 @@ class SessionLifecycleMixin:
                 f"Workspace {workspace_id} reverted to 'stopped' "
                 "(prior owner failed); retrying start"
             )
-            return await self._acquire_session(
+            return await self._acquire_session(  # DALTON-HOOK(acquire-retry-bound)
                 workspace_id,
                 user_id=user_id,
                 on_state_observed=on_state_observed,
                 _attempt=attempt + 1,
+                _stop_waits=stop_waits,
             )
         raise RuntimeError(
             f"Workspace {workspace_id} ended start in unexpected "
@@ -715,22 +810,13 @@ class SessionLifecycleMixin:
                     logger.debug(
                         f"Completing deferred sync for lazy-init workspace {workspace_id}"
                     )
-                    await self._sync_sandbox_assets(
+                    await self._sync_restore_and_reconcile(
                         binding,
                         workspace_user_id,
-                        session.sandbox,
-                        reusing_sandbox=True,
-                    )
-                    mark("asset_sync")
-                    await self._maybe_restore_files(binding, session.sandbox)
-                    mark("file_restore")
-                    await self._reconcile_skills(
-                        binding.workspace_id,
-                        workspace_user_id,
-                        session.sandbox,
+                        session,
                         source="lazy_phase2",
+                        mark=mark,
                     )
-                    mark("skill_reconcile")
                     # Defer interval writes until ready to avoid racing archived startup.
                     # An auto-stop hiccup must not revert an otherwise healthy start.
                     # Re-read the machine rather than the binding frozen at turn
@@ -747,6 +833,10 @@ class SessionLifecycleMixin:
                         )
                         await update_workspace_activity(workspace_id)
                         machine.pending_lazy_sync = False
+                        # After the promotion, so the start is usable first.
+                        self._queue_reconnect_syncs_soon(
+                            computer_id, session.sandbox, opened=workspace_id
+                        )
                 elif mcp_changed or (
                     skills_signature is not None
                     and session.skills_signature != skills_signature
@@ -821,11 +911,14 @@ class SessionLifecycleMixin:
                             self._core_config_for(binding),
                             outage_since=host_outage_of(e),
                         )
-                except BaseException:
+                except BaseException as recovery_error:
                     if was_unpromoted_lazy:
                         release = asyncio.create_task(
                             self._release_lost_lazy_start(
-                                computer_id, claimed_sandbox_id
+                                computer_id,
+                                claimed_sandbox_id,
+                                failure=recovery_error,
+                                kind=binding.kind,
                             )
                         )
                         try:
@@ -833,8 +926,8 @@ class SessionLifecycleMixin:
                         except asyncio.CancelledError:
                             pass
                     raise
-            except LayoutMigrationError:
-                await self._revert_unpromoted_lazy_start(binding)
+            except LayoutMigrationError as e:
+                await self._revert_unpromoted_lazy_start(binding, failure=e)
                 raise
             except SandboxTransientError as e:
                 # Failed initialization needs eviction; post-init transients leave a healthy
@@ -847,7 +940,7 @@ class SessionLifecycleMixin:
                     # Revert before cleanup drops pending_lazy_sync, or reversion becomes a
                     # no-op. Guard identity here and across cleanup awaits so a concurrent
                     # replacement survives.
-                    await self._revert_unpromoted_lazy_start(binding)
+                    await self._revert_unpromoted_lazy_start(binding, failure=e)
                     if self._cached_session(computer_id) is session:
                         await self._clear_session(computer_id, evict_session=session)
                     raise
@@ -857,7 +950,7 @@ class SessionLifecycleMixin:
                 )
                 # Capture before reverting, the revert clears pending_lazy_sync.
                 was_unpromoted_lazy = machine.pending_lazy_sync
-                await self._revert_unpromoted_lazy_start(binding)
+                await self._revert_unpromoted_lazy_start(binding, failure=e)
                 if was_unpromoted_lazy:
                     # Returning a healthy sandbox after reverting its row to stopped lets
                     # another worker claim and spawn a duplicate; force clean reacquisition.
@@ -879,7 +972,7 @@ class SessionLifecycleMixin:
                 logger.warning(f"Phase 2 sync failed for workspace {workspace_id}: {e}")
                 # Capture before reverting, the revert clears pending_lazy_sync.
                 was_unpromoted_lazy = machine.pending_lazy_sync
-                await self._revert_unpromoted_lazy_start(binding)
+                await self._revert_unpromoted_lazy_start(binding, failure=e)
                 if was_unpromoted_lazy:
                     # Never return a half-synced sandbox whose row was reverted to stopped;
                     # raise so the caller reclaims cleanly.
@@ -907,33 +1000,55 @@ class SessionLifecycleMixin:
         if machine is not None and machine.phase2_event is phase2_event:
             machine.phase2_event = None
 
-    async def _revert_unpromoted_lazy_start(self, binding: ComputerBinding) -> None:
+    async def _revert_unpromoted_lazy_start(
+        self, binding: ComputerBinding, *, failure: BaseException | None = None
+    ) -> None:
         """Release failed lazy-start claims so other workers can retry immediately.
 
         Waiters otherwise spend start_wait_timeout on a stranded starting row.
-        pending_lazy_sync restricts reversion to unpromoted lazy starts."""
+        pending_lazy_sync restricts reversion to unpromoted lazy starts, and
+        only such a start records *failure* as the machine's: first, while the
+        row is still this start's, so a client reading it on the stopped frame
+        finds the reason."""
         machine = self._machine_if_known(binding.computer_id)
         if machine is None or not machine.pending_lazy_sync:
             return
         machine.pending_lazy_sync = False
         workspace_id = binding.workspace_id
+        if failure is not None:
+            await record_start_failure(binding.computer_id, failure, kind=binding.kind)
         try:
-            await update_workspace_status(workspace_id=workspace_id, status="stopped")
+            reverted = await update_workspace_status(
+                workspace_id=workspace_id, status="stopped"
+            )
         except Exception:
             # Do not mask the sync failure; a failed revert leaves waiters to time out.
             logger.exception(
                 "Failed to revert workspace %s to 'stopped' after Phase 2 failure",
                 workspace_id,
             )
+            return
+        if reverted is not None:
+            # The sync wrote a token beside it into a sandbox left running.
+            await self._revoke_data_token(binding.computer_id)
 
     async def _release_lost_lazy_start(
-        self, computer_id: str, sandbox_id: str | None
+        self,
+        computer_id: str,
+        sandbox_id: str | None,
+        *,
+        failure: BaseException | None = None,
+        kind: str = "",
     ) -> None:
         """Only while the row is still this start's. A recovery on another
         worker may have bound its own sandbox meanwhile, and that start's
-        status is not this one's to revert."""
+        status is not this one's to revert. *failure* is recorded first, so a
+        client reading the row on the stopped frame finds the reason; a
+        recovery that won clears it as it reaches running."""
+        if failure is not None and not isinstance(failure, asyncio.CancelledError):
+            await record_start_failure(computer_id, failure, kind=kind)
         try:
-            await update_computer_status(
+            released = await update_computer_status(
                 computer_id,
                 ComputerStatus.STOPPED,
                 expected="starting",
@@ -947,6 +1062,9 @@ class SessionLifecycleMixin:
                 "recovery failed",
                 computer_id,
             )
+            return
+        if released is not None:
+            await self._revoke_data_token(computer_id)
 
     async def _publish_workspace_running_with_current_always_on(
         self,
@@ -1045,7 +1163,22 @@ class SessionLifecycleMixin:
             workspace = {**workspace, "sandbox_id": sandbox_id}
 
         # A computer CAS can win while its shadow fails and the loser deletes its
-        # sandbox. Conflicting refs require recreation, not a guessed reconnect.
+        # sandbox. Conflicting refs require recreation, not a guessed reconnect,
+        # except on a machine that is never replaced: there the computer's ref
+        # is the machine, and the workspace's copy is only behind.
+        if (
+            binding.provider_ref is not None
+            and binding.provider_ref != sandbox_id
+            and not binding.provider.recreatable
+        ):
+            logger.warning(
+                f"Computer/workspace binding is split for {workspace_id} "
+                f"(computer={binding.provider_ref}, workspace={sandbox_id}); "
+                "reconnecting to the computer's machine",
+                extra={"workspace_id": workspace_id},
+            )
+            sandbox_id = binding.provider_ref
+            workspace = {**workspace, "sandbox_id": sandbox_id}
         if binding.provider_ref is not None and binding.provider_ref != sandbox_id:
             logger.warning(
                 f"Computer/workspace binding is split for {workspace_id} "
@@ -1126,7 +1259,7 @@ class SessionLifecycleMixin:
 
                 # Resync above enables certification; certify before any row names this sandbox.
                 secret_version = await certify_platform_secrets(
-                    core_config, runtime=session.sandbox.runtime
+                    core_config, runtime=session.sandbox.runtime, kind=binding.kind
                 )
                 bound = await self._bind_machine_identity(
                     binding,
@@ -1209,6 +1342,7 @@ class SessionLifecycleMixin:
                     self._drop_session(computer_id)
                 raise
             did_init = True
+            self._on_session_attached(computer_id, session, resumed=False)
 
         self._put_session(computer_id, session, workspace_id=workspace_id)
         return session, did_init
@@ -1254,17 +1388,23 @@ class SessionLifecycleMixin:
                 lazy_init=True,
                 on_state_observed=_observe_and_broadcast,
             )
-        except (Exception, asyncio.CancelledError):
+        except (Exception, asyncio.CancelledError) as e:
             # Do not mask the start error if revert fails; waiters still have the 300s timeout.
             # CancelledError included: a dropped SSE client mid-provision must
             # not leave the claim standing for every sibling on the machine.
-            try:
-                await asyncio.shield(
-                    update_workspace_status(
-                        workspace_id=workspace_id,
-                        status="stopped",
+            # The failure goes on the row first, so the stopped frame finds
+            # it, and both under one shield, so a cancel cannot skip the revert.
+            async def _settle(error: BaseException) -> None:
+                if not isinstance(error, asyncio.CancelledError):
+                    await record_start_failure(
+                        claimed_computer_id, error, kind=binding.kind
                     )
+                await update_workspace_status(
+                    workspace_id=workspace_id, status="stopped"
                 )
+
+            try:
+                await asyncio.shield(_settle(e))
             except Exception:
                 logger.exception(
                     f"Failed to revert workspace {workspace_id} status after start error"
@@ -1442,14 +1582,9 @@ class SessionLifecycleMixin:
                 )
 
             if not lazy_init:
-                await self._sync_sandbox_assets(
-                    binding, user_id, session.sandbox, reusing_sandbox=True
+                await self._sync_restore_and_reconcile(
+                    binding, user_id, session, source="restart"
                 )
-                if session.sandbox:
-                    await self._maybe_restore_files(binding, session.sandbox)
-                    await self._reconcile_skills(
-                        binding.workspace_id, user_id, session.sandbox, source="restart"
-                    )
                 self._record_sync(computer_id, workspace_id)
 
                 migrated = await self._maybe_migrate_sandbox(
@@ -1482,6 +1617,11 @@ class SessionLifecycleMixin:
                 # Refresh activity so idle cleanup cannot act on a stale timestamp.
                 await update_workspace_activity(workspace_id)
                 logger.info(f"Workspace {workspace_id} restarted successfully")
+            # A lazy start has no runtime yet to queue the siblings' syncs on;
+            # its Phase 2 queues them once it promotes the start.
+            self._on_session_attached(
+                computer_id, session, resumed=not lazy_init, opened=workspace_id
+            )
             # Lazy timing covers initiation, not background readiness; still record it
             # to keep lazy starts represented in the latency histogram.
             safe_record(
@@ -1502,6 +1642,7 @@ class SessionLifecycleMixin:
         *,
         workspace_id: str | None = None,
         unchanged_since: datetime | None = None,
+        reason: str | None = None,
     ) -> Dict[str, Any]:
         """Stop the machine, which takes every project on it down with it.
 
@@ -1510,7 +1651,7 @@ class SessionLifecycleMixin:
         only names the project that asked, for the mirror and the logs.
         unchanged_since is the idle sweep's read of the row: a machine opened
         after that read has been stamped, and is no longer the idle one the
-        sweep judged."""
+        sweep judged. reason is why, for the usage run the stop ends."""
         async with self._observed_lock(computer_id, "computer.stop"):
             # Stopping one project removes every sibling's sandbox; gate across
             # the machine.
@@ -1526,7 +1667,7 @@ class SessionLifecycleMixin:
             # where the claim answers "nothing to stop", so the idle reaper hit
             # its 3-strike backoff on a machine that needed no work.
             claimed = await self._claim_machine_for_stop(
-                computer_id, unchanged_since=unchanged_since
+                computer_id, unchanged_since=unchanged_since, reason=reason
             )
             if claimed is None:
                 return await self._stop_result(computer_id, workspace_id)
@@ -1554,18 +1695,31 @@ class SessionLifecycleMixin:
     ) -> Dict[str, Any]:
         computer_id = binding.computer_id
         try:
-            backup_started = time.monotonic()
-            folder_count = await self._backup_machine_files_to_db(
-                computer_id,
-                workspace_id=workspace_id,
-                expected_sandbox_id=durable_sandbox_id,
-            )
-            logger.info(
-                "Computer %s stop backup mirrored %d folder(s) in %.0fms",
-                computer_id,
-                int(folder_count or 0),
-                (time.monotonic() - backup_started) * 1000,
-            )
+            # Before the backup, which would wait out its timeout on every
+            # folder of a machine that is not there.
+            if (
+                durable_sandbox_id
+                and not binding.provider.recreatable
+                and await self._owner_machine_state(binding) is None
+            ):
+                await self._settle_unanswered_stop(computer_id)
+                return await self._stop_result(computer_id, workspace_id)
+
+            # A machine its owner chose not to back up keeps its last backup.
+            if binding.files_backup:
+                backup_started = time.monotonic()
+                folder_count = await self._backup_machine_files_to_db(
+                    computer_id,
+                    workspace_id=workspace_id,
+                    expected_sandbox_id=durable_sandbox_id,
+                    routine=True,
+                )
+                logger.info(
+                    "Computer %s stop backup mirrored %d folder(s) in %.0fms",
+                    computer_id,
+                    int(folder_count or 0),
+                    (time.monotonic() - backup_started) * 1000,
+                )
 
             # The last chance to read the disk before it is unreachable, so the
             # stopped machine still shows how full it is.
@@ -1626,7 +1780,8 @@ class SessionLifecycleMixin:
         except Exception as e:
             logger.error(f"Error stopping computer {computer_id}: {e}")
             try:
-                await self._reconcile_provider_stop(binding)
+                if await self._reconcile_provider_stop(binding):
+                    return await self._stop_result(computer_id, workspace_id)
             except Exception:
                 # Leave the durable stopping claim for the existing recovery
                 # path once this owner releases its heartbeat.
@@ -1670,11 +1825,8 @@ class SessionLifecycleMixin:
             async with computer_stop_heartbeat(computer_id):
                 try:
                     async with self._detached_runtime(sandbox_id, binding=binding) as runtime:
-                        if "archive" not in runtime.capabilities:
-                            raise RuntimeError(
-                                f"Provider does not support archiving "
-                                f"(capabilities: {runtime.capabilities})"
-                            )
+                        if not runtime.archives:
+                            raise RuntimeError("Provider does not support archiving")
                         await runtime.archive()
                     await self._settle_machine_stop(computer_id, ComputerStatus.STOPPED)
                 except Exception:

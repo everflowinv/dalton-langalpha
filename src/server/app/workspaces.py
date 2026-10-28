@@ -12,12 +12,16 @@ Endpoints:
 - GET /api/v1/workspaces/{workspace_id} - Get workspace details
 - PUT /api/v1/workspaces/{workspace_id} - Update workspace
 - POST /api/v1/workspaces/{workspace_id}/start - Start stopped workspace
+- POST /api/v1/workspaces/{workspace_id}/move - Move to another computer
+- GET /api/v1/workspaces/{workspace_id}/move - Latest move and its outcome
+- POST /api/v1/workspaces/{workspace_id}/move/cancel - Cancel a move
 - DELETE /api/v1/workspaces/{workspace_id} - Delete workspace
 """
 
+import asyncio
 import contextlib
 import logging
-from typing import Literal
+from typing import Literal, Optional
 
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import Response, StreamingResponse
@@ -25,10 +29,12 @@ from fastapi.responses import Response, StreamingResponse
 from src.server.services.persistence.sync_result import BackupIncomplete
 from src.server.utils.api import CurrentUserId, require_workspace_owner
 from src.server.dependencies.usage_limits import (
+    COMPUTER_COUNT_QUOTA,
     DISPLAYED_ENTITLEMENTS,
+    get_capacity_status,
     get_entitlement_statuses,
 )
-from src.server.app.background_starts import schedule_start
+from src.server.services.background_starts import schedule_start
 from src.server.app.status_stream import (
     SSE_HEADERS,
     sse_status_event,
@@ -41,6 +47,10 @@ from src.server.database.workspace_names import (
     WorkspaceNameTaken,
 )
 from src.server.database.home_workspace import is_home_row, is_unbound
+from src.server.database.workspace_move import (
+    cancel_workspace_move as db_cancel_workspace_move,
+    get_latest_workspace_move,
+)
 from src.server.database.workspace import (
     get_workspace as db_get_workspace,
     get_workspaces_for_user,
@@ -49,6 +59,7 @@ from src.server.database.workspace import (
     batch_update_sort_order,
 )
 from src.server.models.workspace import (
+    FilesRestoreChoice,
     WorkspaceActionResponse,
     WorkspaceAlwaysOnRequest,
     WorkspaceCreate,
@@ -60,8 +71,17 @@ from src.server.models.workspace import (
     WorkspaceUpdate,
 )
 from src.server.models.computer import CLAIMABLE_FOR_START
+from src.server.models.workspace_move import WorkspaceMoveOut, WorkspaceMoveRequest
+from src.server.app.computers import accept_workspace_move
+from src.server.services.workspace_move import move_error_detail, move_from_row
+from src.server.services.computer_errors import (
+    ComputerNotFoundError,
+    ComputerPreparingError,
+    UnknownResourceTier,
+)
+from ptc_agent.core.sandbox.providers.ssh_errors import connect_failure
 from ptc_agent.core.sandbox.runtime import SandboxGoneError, SandboxTransientError
-from src.server.utils.error_sanitization import sandbox_unreachable_detail
+from src.server.utils.error_sanitization import sandbox_failure_http
 from src.server.models.workspace_refresh import WorkspaceRefreshResponse
 from src.server.services.turn_runtime import ensure_home
 from src.server.services.workspace_manager import WorkspaceManager
@@ -102,16 +122,21 @@ async def _workspace_action_errors(action: str, workspace_id: str):
         yield
     except HTTPException:
         raise
-    except (SandboxGoneError, SandboxTransientError):
+    except (SandboxGoneError, SandboxTransientError) as e:
         # Before the RuntimeError arm, which these subclass. An unreachable
         # sandbox is not a bad request: letting it fall through answered 400
         # with the provider's raw text, which both loses the 503 the file panel
         # keys on and ships request URLs and SDK bodies to the client. Re-raise
-        # for the app-level handler that owns the wording and the sanitizing.
+        # for the app-level handler that owns the wording and the sanitizing,
+        # except an owner's SSH machine, which answers as its computer's start.
+        if connect_failure(e) is not None:
+            raise sandbox_failure_http(e) from None
         raise
     except (WorkspaceNameTaken, WorkspaceNameInvalid) as e:
         # Before the ValueError arm: an unusable name is not a missing workspace.
         raise _name_error(e) from None
+    except UnknownResourceTier as e:
+        raise HTTPException(status_code=400, detail=str(e)) from None
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except BackupIncomplete as e:
@@ -119,6 +144,8 @@ async def _workspace_action_errors(action: str, workspace_id: str):
         logger.warning(f"Refused to {action}: {e}")
         raise HTTPException(status_code=400, detail=e.user_message) from None
     except RuntimeError as e:
+        if connect_failure(e) is not None:
+            raise sandbox_failure_http(e) from None
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.exception(f"Error {action} workspace {workspace_id}: {e}")
@@ -150,6 +177,8 @@ def _workspace_to_response(workspace: dict) -> WorkspaceResponse:
         computer_id=str(computer_id) if computer_id else None,
         dir_name=workspace.get("dir_name"),
         previous_dir_names=list(workspace.get("previous_dir_names") or ()),
+        root_dir=workspace.get("computer_root_dir") or None,
+        previous_root_dirs=list(workspace.get("previous_root_dirs") or ()),
         status=workspace["status"],
         is_home=is_home_row(workspace),
         created_at=workspace["created_at"],
@@ -162,6 +191,11 @@ def _workspace_to_response(workspace: dict) -> WorkspaceResponse:
         resource_tier=workspace.get("resource_tier", "standard"),
         is_always_on=workspace.get("is_always_on", False),
         files_restore_incomplete=bool(workspace.get("files_restore_incomplete")),
+        files_restore_offered_at=workspace.get("files_restore_offered_at"),
+        files_backed_up_at=workspace.get("files_backed_up_at"),
+        # DALTON-HOOK(colleague-dispatch): pass caller's effective_web_access and colleague_dispatch_enabled.
+        effective_web_access=workspace.get("effective_web_access"),
+        colleague_dispatch_enabled=workspace.get("colleague_dispatch_enabled"),
     )
 
 
@@ -176,7 +210,9 @@ async def create_workspace(
     Returns as soon as the row is written: the workspace is bound to the
     user's computer and owns a folder on it, and the machine itself is brought
     up by the first turn (or an explicit start), so nothing here waits on a
-    sandbox. A user with no computer yet gets one.
+    sandbox. A user with no computer yet gets one. ``computer_id`` picks one
+    of the caller's computers instead of their primary; any other id answers
+    404, whoever owns it.
 
     Adding a folder is not capacity-checked. Allocating the first computer
     enforces the same machine limit as explicit computer creation.
@@ -195,6 +231,7 @@ async def create_workspace(
             name=request.name,
             description=request.description,
             config=request.config,
+            computer_id=str(request.computer_id) if request.computer_id else None,
         )
 
         logger.info(
@@ -206,6 +243,12 @@ async def create_workspace(
         raise
     except (WorkspaceNameTaken, WorkspaceNameInvalid) as e:
         raise _name_error(e) from None
+    except ComputerNotFoundError:
+        raise HTTPException(status_code=404, detail="Computer not found") from None
+    except ComputerPreparingError as e:
+        raise HTTPException(
+            status_code=409, detail={"code": "computer_preparing", "message": str(e)}
+        ) from None
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
@@ -300,17 +343,22 @@ async def list_workspaces(
 # Declared before the `/{workspace_id}` routes so `/quota` isn't captured as an id.
 @router.get("/quota", response_model=WorkspaceQuotaResponse)
 async def get_workspace_quota(x_user_id: CurrentUserId):
-    """Per-capability count quotas for the change-spec / always-on UI.
+    """Per-capability count quotas for the spec pickers, always-on and New computer.
 
     Platform mode only — every field is null in OSS mode, so the UI just omits the
     remaining-count hint. Fails open: a capability the platform can't report comes
     back null rather than erroring the whole call.
     """
-    statuses = await get_entitlement_statuses(x_user_id, DISPLAYED_ENTITLEMENTS)
+    statuses, computers = await asyncio.gather(
+        get_entitlement_statuses(x_user_id, DISPLAYED_ENTITLEMENTS),
+        get_capacity_status(x_user_id, COMPUTER_COUNT_QUOTA),
+    )
     return WorkspaceQuotaResponse(
         performance=statuses["performance"],
         max=statuses["max"],
+        xlarge=statuses["xlarge"],
         always_on=statuses["always_on"],
+        computers=computers,
     )
 
 
@@ -337,13 +385,19 @@ async def workspace_status_events(workspace_id: str, x_user_id: CurrentUserId):
     )
 
     def _frame(
-        status: str, sandbox_state: str | None = None, error: str | None = None
+        status: str,
+        sandbox_state: str | None = None,
+        error: str | None = None,
+        stage: str | None = None,
+        start_failure: dict | None = None,
     ) -> str:
         return sse_status_event(
             {"workspace_id": workspace_id, "computer_id": computer_id},
             status,
             sandbox_state,
             error,
+            stage,
+            start_failure,
         )
 
     async def _read_status() -> str | None:
@@ -386,18 +440,78 @@ async def get_workspace(workspace_id: str, x_user_id: CurrentUserId):
     try:
         workspace = await db_get_workspace(workspace_id)
         # --- DALTON-HOOK(workspace-sharing-settings): begin ---
-        from src.dalton.settings import is_dalton_supabase_auth_enabled
+        # DALTON-HOOK(colleague-dispatch): compute effective_web_access and support thread_only fallback on hidden workspace.
+        from src.dalton.settings import (
+            is_colleague_dispatch_enabled,
+            is_dalton_supabase_auth_enabled,
+        )
 
         if is_dalton_supabase_auth_enabled():
-            from src.dalton.sharing import require_workspace_access
-
-            workspace = await require_workspace_access(
-                workspace, x_user_id, channel="web", need="read"
+            from src.dalton.sharing import (
+                get_workspace_sharing,
+                require_workspace_access,
             )
-            if workspace.get("user_id") != x_user_id:
-                workspace = {**workspace, "sandbox_id": None, "computer_id": None}
+            from src.server.database.conversation import (
+                user_has_threads_in_workspace,
+            )
+
+            try:
+                workspace = await require_workspace_access(
+                    workspace, x_user_id, channel="web", need="read"
+                )
+                if str(workspace.get("user_id")) == str(x_user_id):
+                    workspace = {
+                        **workspace,
+                        "effective_web_access": "owner",
+                        "colleague_dispatch_enabled": is_colleague_dispatch_enabled(),
+                    }
+                else:
+                    sh = await get_workspace_sharing(str(workspace["workspace_id"]))
+                    eff = str(sh.get("web_access") or "ro")
+                    if eff not in ("ro", "rw"):
+                        eff = "ro"
+                    workspace = {
+                        **workspace,
+                        "sandbox_id": None,
+                        "computer_id": None,
+                        "effective_web_access": eff,
+                        "colleague_dispatch_enabled": is_colleague_dispatch_enabled(),
+                    }
+            except HTTPException as exc:
+                if exc.status_code == 404 and is_colleague_dispatch_enabled():
+                    if workspace is None:
+                        workspace = await db_get_workspace(
+                            workspace_id, include_deleted=True
+                        )
+                    if (
+                        workspace is not None
+                        and str(workspace.get("user_id") or "") != str(x_user_id)
+                        and await user_has_threads_in_workspace(workspace_id, x_user_id)
+                    ):
+                        workspace = {
+                            **workspace,
+                            "description": None,
+                            "config": None,
+                            "sandbox_id": None,
+                            "computer_id": None,
+                            "dir_name": None,
+                            "previous_dir_names": [],
+                            "computer_root_dir": None,
+                            "previous_root_dirs": [],
+                            "effective_web_access": "thread_only",
+                            "colleague_dispatch_enabled": True,
+                        }
+                    else:
+                        raise
+                else:
+                    raise
         else:
             require_workspace_owner(workspace, user_id=x_user_id)
+            workspace = {
+                **workspace,
+                "effective_web_access": "owner",
+                "colleague_dispatch_enabled": False,
+            }
         # --- DALTON-HOOK(workspace-sharing-settings): end ---
 
         return _workspace_to_response(workspace)
@@ -658,10 +772,10 @@ async def set_workspace_spec(
     x_user_id: CurrentUserId,
 ):
     """
-    Change a workspace's sandbox spec tier (standard, performance, max).
+    Change a workspace's sandbox spec tier (standard, performance, max, xlarge).
 
     Gated by the platform entitlement layer (403 if the tier is not on the
-    user's plan, 429 if the per-tier count quota is exhausted); both are
+    user's plan, 429 if the plan's slot for a larger spec is taken); both are
     no-ops in OSS mode. Re-applying the workspace's current tier skips the
     count check. Sizing lives in per-tier snapshots, so a tier change recreates
     the sandbox (files persisted to the DB and restored) rather than resizing.
@@ -780,6 +894,90 @@ async def duplicate_workspace(
         return _workspace_to_response(new_workspace)
 
 
+@router.post(
+    "/{workspace_id}/move", response_model=WorkspaceMoveOut, status_code=202
+)
+async def move_workspace(
+    workspace_id: str,
+    request: WorkspaceMoveRequest,
+    x_user_id: CurrentUserId,
+):
+    """Accept a move to another of the owner's computers and run it after answering.
+
+    Copying a folder outlasts a request, so the refusals a client can act on
+    are answered here as a 409 ``{code, message}`` and the outcome is read
+    back from ``GET /{workspace_id}/move``. Home moves only by making its
+    computer primary. ``from_backup`` is for a machine its owner brought that
+    is gone, typically offered after a move failed ``source_unavailable``.
+    """
+    workspace = await db_get_workspace(workspace_id)
+    require_workspace_owner(workspace, user_id=x_user_id)
+    return await accept_workspace_move(
+        x_user_id,
+        workspace_id,
+        request.computer_id,
+        from_backup=request.from_backup,
+    )
+
+
+@router.post("/{workspace_id}/files/restore-choice", response_model=WorkspaceResponse)
+async def choose_files_restore(
+    workspace_id: str,
+    request: FilesRestoreChoice,
+    x_user_id: CurrentUserId,
+):
+    """Restore the folder gone from its owner's machine, or keep it as it is.
+
+    Answers once the files are back or the folder is taken as it is, which
+    brings the machine up, and a 409 when no restore waits on a choice: the
+    folder came back, or another tab chose.
+    """
+    workspace = await db_get_workspace(workspace_id)
+    require_workspace_owner(workspace, user_id=x_user_id)
+    try:
+        settled = await WorkspaceManager.get_instance().settle_files_restore_offer(
+            workspace_id, user_id=x_user_id, restore=request.restore
+        )
+    except Exception as e:
+        logger.warning(f"Restore choice for workspace {workspace_id} failed: {e}")
+        raise sandbox_failure_http(e) from None
+    if not settled:
+        raise HTTPException(
+            status_code=409,
+            detail="No restore is waiting on a choice for this workspace.",
+        )
+    return _workspace_to_response(await db_get_workspace(workspace_id) or workspace)
+
+
+@router.get("/{workspace_id}/move", response_model=Optional[WorkspaceMoveOut])
+async def get_workspace_move(workspace_id: str, x_user_id: CurrentUserId):
+    """The workspace's latest move, null when it has never moved."""
+    workspace = await db_get_workspace(workspace_id)
+    require_workspace_owner(workspace, user_id=x_user_id)
+    return move_from_row(await get_latest_workspace_move(workspace_id))
+
+
+@router.post("/{workspace_id}/move/cancel", response_model=WorkspaceMoveOut)
+async def cancel_workspace_move(workspace_id: str, x_user_id: CurrentUserId):
+    """Cancel a move before it sets the folder aside; an ended move answers as it ended.
+
+    Past that point the move finishes or puts the folder back on its own, so
+    a cancel then is a 409 ``not_cancellable``.
+    """
+    workspace = await db_get_workspace(workspace_id)
+    require_workspace_owner(workspace, user_id=x_user_id)
+    cancelled = await db_cancel_workspace_move(workspace_id, x_user_id)
+    if cancelled is not None:
+        logger.info(f"Cancelled move {cancelled['move_id']} of workspace {workspace_id}")
+        return move_from_row(cancelled)
+    latest = move_from_row(await get_latest_workspace_move(workspace_id))
+    if latest is None:
+        raise HTTPException(status_code=404, detail=move_error_detail("not_found"))
+    if latest.phase in ("done", "failed", "cancelled"):
+        return latest
+    raise HTTPException(status_code=409, detail=move_error_detail("not_cancellable"))
+
+
 @router.post("/{workspace_id}/refresh", response_model=WorkspaceRefreshResponse)
 async def refresh_workspace(
     workspace_id: str,
@@ -805,10 +1003,10 @@ async def refresh_workspace(
         # rather than spelling a fourth variant of this 503 here.
         raise
     except Exception as e:
-        # Everything else still answers 503, but never with the raw text: this
-        # is the same call _acquire_sandbox makes, and its exceptions quote
-        # provider URLs and sandbox ids.
-        raise HTTPException(status_code=503, detail=sandbox_unreachable_detail(e))
+        # Everything else answers as acquire_sandbox does, never with the raw
+        # text: this is the same call, and its exceptions quote provider URLs
+        # and sandbox ids.
+        raise sandbox_failure_http(e) from None
 
     sandbox = getattr(session, "sandbox", None)
     if sandbox is None:
@@ -851,16 +1049,28 @@ async def refresh_workspace(
 
 
 @router.delete("/{workspace_id}", status_code=204)
-async def delete_workspace(workspace_id: str, x_user_id: CurrentUserId):
+async def delete_workspace(
+    workspace_id: str,
+    x_user_id: CurrentUserId,
+    delete_files: bool = Query(
+        False,
+        description=(
+            "Also delete the workspace's folder from a machine the user brought. "
+            "Without it that folder stays; on every other computer it is always deleted."
+        ),
+    ),
+):
     """
     Delete a workspace and its project data.
 
-    This permanently deletes the workspace and its folder. The computer and
-    sibling workspaces remain available.
+    This deletes the workspace and its folder, except on a machine the user
+    brought, where the folder stays unless ``delete_files`` is set. The
+    computer and sibling workspaces remain available.
 
     Args:
         workspace_id: Workspace UUID
         x_user_id: Authenticated user ID
+        delete_files: Also delete the folder from the user's own machine
     """
     try:
         workspace = await db_get_workspace(workspace_id)
@@ -878,18 +1088,7 @@ async def delete_workspace(workspace_id: str, x_user_id: CurrentUserId):
             )
 
         manager = WorkspaceManager.get_instance()
-        await manager.delete_workspace(workspace_id)
-
-        # Invalidate existence cache
-        from src.server.database.conversation import ws_exists_key
-        from src.utils.cache.redis_cache import get_cache_client
-
-        cache = get_cache_client()
-        if cache.enabled and cache.client:
-            try:
-                await cache.client.delete(ws_exists_key(workspace_id))
-            except Exception:
-                pass
+        await manager.delete_workspace(workspace_id, delete_files=delete_files)
 
         logger.info(f"Deleted workspace {workspace_id}")
         # Return 204 No Content

@@ -19,6 +19,7 @@ from src.server.contracts.status import (
     classify_interrupts,
     is_user_stop,
 )
+from src.server.database.runs.hook_jobs import WAKEUP_QUIET_META
 from src.server.database.runs.lifecycle import ProducerRecord, RunOutcome
 from src.server.services.runs.stream_errors import (
     failure_kind_metadata,
@@ -169,6 +170,11 @@ async def assemble_finalize_artifacts(
     # nothing to relay.
     if interrupt_reason == INTERRUPT_REASON_CREDIT_PAUSE:
         persist_metadata["credit_pause_message"] = pause_message
+    # A wake turn the agent ended quietly, which the settle keeps the thread
+    # seen over when it changed nothing.
+    quiet = getattr(handler, "quiet", None)
+    if quiet is not None:
+        persist_metadata[WAKEUP_QUIET_META] = {"changed": quiet["changed"]}
     # Steering inputs archive on the owning response (v4 identity model:
     # steering = no run, no turn), from the steer rows this run confirmed
     # delivered.

@@ -1,46 +1,36 @@
-import { Plus, Server } from 'lucide-react';
+import { Plus } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
+
+import { cn } from '@/lib/utils';
 
 interface GalleryActionsProps {
   onNewWorkspace: () => void;
-  onOpenComputers: () => void;
-  /** Fill the row, the primary action taking the larger share (the mobile header). */
+  /** Fill the row (the narrow header). */
   stacked?: boolean;
 }
 
 /**
- * The gallery's two header actions. One component because the desktop header
- * and the mobile one show the same pair, and a copy of a button group is how
- * they drift apart.
+ * The gallery's header action. One component because the desktop header and
+ * the mobile one show the same button, and a copy is how they drift apart.
+ * The computers are reached from the toolbar's computer control, not here.
  */
-export function GalleryActions({ onNewWorkspace, onOpenComputers, stacked = false }: GalleryActionsProps) {
+export function GalleryActions({ onNewWorkspace, stacked = false }: GalleryActionsProps) {
   const { t } = useTranslation();
-  const fill = stacked ? ' flex-1 justify-center' : '';
   return (
-    <div className={stacked ? 'flex w-full items-center gap-2' : 'flex items-center gap-2'}>
-      <button
-        onClick={onOpenComputers}
-        className={`flex items-center gap-1.5 px-3 py-2 h-9 rounded-lg border transition-all hover:bg-foreground/5 active:scale-[0.985]${fill}`}
-        style={{
-          borderColor: 'var(--color-border-muted)',
-          color: 'var(--color-text-secondary)',
-        }}
-      >
-        <Server className="h-4 w-4" />
-        <span className="text-sm font-medium">{t('computer.computers', 'Computers')}</span>
-      </button>
-      <button
-        onClick={onNewWorkspace}
-        className={`flex items-center gap-1.5 px-4 py-2 h-9 rounded-lg transition-all hover:opacity-90 active:scale-[0.985]${stacked ? ' flex-[1.4] justify-center' : ''}`}
-        style={{
-          backgroundColor: 'var(--color-btn-primary-bg)',
-          color: 'var(--color-btn-primary-text)',
-        }}
-      >
-        <Plus className="h-4 w-4" />
-        <span className="text-sm font-medium">{t('workspace.newWorkspace')}</span>
-      </button>
-    </div>
+    <button
+      onClick={onNewWorkspace}
+      className={cn(
+        'flex items-center gap-1.5 py-2 h-9 rounded-lg press hover:opacity-90',
+        stacked ? 'w-full min-w-0 justify-center px-3' : 'px-4',
+      )}
+      style={{
+        backgroundColor: 'var(--color-btn-primary-bg)',
+        color: 'var(--color-btn-primary-text)',
+      }}
+    >
+      <Plus className="h-4 w-4 shrink-0" />
+      <span className="truncate whitespace-nowrap text-sm font-medium">{t('workspace.newWorkspace')}</span>
+    </button>
   );
 }
 

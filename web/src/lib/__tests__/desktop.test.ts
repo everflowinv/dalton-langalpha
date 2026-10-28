@@ -12,13 +12,24 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 const bridge = { version: '0.1.3', platform: 'darwin' } as Record<string, unknown>;
 vi.stubGlobal('window', Object.assign(globalThis.window, { langalphaDesktop: bridge }));
 
-const { beginMcpOAuth, bindMcpOAuth, cancelMcpOAuth, canBeginMcpOAuth } =
-  await import('../desktop');
+const {
+  beginMcpOAuth,
+  bindMcpOAuth,
+  cancelMcpOAuth,
+  canBeginMcpOAuth,
+  canRemoteControl,
+  disableRemoteControl,
+  enableRemoteControl,
+  getRemoteControl,
+} = await import('../desktop');
 
 afterEach(() => {
   delete bridge.beginMcpOAuth;
   delete bridge.bindMcpOAuth;
   delete bridge.cancelMcpOAuth;
+  delete bridge.getRemoteControl;
+  delete bridge.enableRemoteControl;
+  delete bridge.disableRemoteControl;
 });
 
 describe('canBeginMcpOAuth', () => {
@@ -117,5 +128,54 @@ describe('binding and standing down a flow', () => {
   it('bindMcpOAuth answers true only when the shell confirms it', async () => {
     bridge.bindMcpOAuth = vi.fn().mockResolvedValue(true);
     await expect(bindMcpOAuth('f-1', 'st-1')).resolves.toBe(true);
+  });
+});
+
+describe('remote control', () => {
+  const status = {
+    supported: true, service: 'on', helper: 'connected', paired: true, fingerprint: 'SHA256:k', account: 'alex',
+  };
+
+  // A switch the shell could not turn back off is not offered at all.
+  it('is offered only with all three methods', () => {
+    bridge.getRemoteControl = vi.fn();
+    bridge.enableRemoteControl = vi.fn();
+    expect(canRemoteControl()).toBe(false);
+    bridge.disableRemoteControl = vi.fn();
+    expect(canRemoteControl()).toBe(true);
+  });
+
+  // The shell answers null to a page it does not count as the app's.
+  const WITHOUT_AN_ANSWER = [
+    ['no method at all', undefined],
+    ['a channel that throws', vi.fn().mockRejectedValue(new Error('no handler'))],
+    ['a shell that answers null', vi.fn().mockResolvedValue(null)],
+  ] as const;
+
+  it.each(WITHOUT_AN_ANSWER)('reads and turns off as null on %s', async (_label, impl) => {
+    if (impl) {
+      bridge.getRemoteControl = impl;
+      bridge.disableRemoteControl = impl;
+    }
+    await expect(getRemoteControl()).resolves.toBeNull();
+    await expect(disableRemoteControl()).resolves.toBeNull();
+  });
+
+  it("hands back the shell's answer as it is", async () => {
+    const refused = { ok: false, error: 'needs_approval', status };
+    bridge.getRemoteControl = vi.fn().mockResolvedValue(status);
+    bridge.enableRemoteControl = vi.fn().mockResolvedValue(refused);
+    await expect(getRemoteControl()).resolves.toEqual(status);
+    await expect(enableRemoteControl('https://app.example.test/pair.sh')).resolves.toEqual(refused);
+    expect(bridge.enableRemoteControl).toHaveBeenCalledWith('https://app.example.test/pair.sh');
+  });
+
+  // Turning on is the one call whose failure the user has to see, so it
+  // fails as an answer the setup words, never as a rejection.
+  it.each(WITHOUT_AN_ANSWER)('fails turning on as unavailable on %s', async (_label, impl) => {
+    if (impl) bridge.enableRemoteControl = impl;
+    await expect(enableRemoteControl('https://app.example.test/pair.sh')).resolves.toEqual({
+      ok: false, error: 'unavailable', status: null,
+    });
   });
 });

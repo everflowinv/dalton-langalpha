@@ -7,10 +7,15 @@
  * implementation now owns the refetch-then-unfreeze sequence; surfaces attach
  * their own presentation side effects through `onAfterPin`.
  */
-import type { QueryClient } from '@tanstack/react-query';
+import type { QueryClient, QueryKey } from '@tanstack/react-query';
+import { forgetSharedWorkspaceThreads } from '@/lib/navThreadsStore';
 import { queryKeys } from '@/lib/queryKeys';
+import { scrollMemory } from '@/lib/scrollMemory';
+import { clearAllMarketThreadsForWorkspace } from '../../MarketView/utils/threadPersistence';
+import { forgetNavPanelExpansion } from '../components/navExpansionStore';
 import { updateWorkspace } from '../utils/api';
-import { resetWorkspaceOrderFreeze } from './useNavigationData';
+import { forgetStableNavOrder, resetWorkspaceOrderFreeze } from './useNavigationData';
+import { removeStoredThreadId } from './utils/threadStorage';
 
 // Shape of a cached workspace-list query entry (queryKeys.workspaces.lists()).
 interface CachedWorkspaceList {
@@ -62,6 +67,109 @@ export function patchCachedWorkspace(
     });
   });
   return previous;
+}
+
+/**
+ * Take a deleted workspace out of every cached list, totals included, so no
+ * surface (gallery, sidebar, drawer) offers it while the refetch is in
+ * flight: a list read page by page can take a while to land.
+ */
+export function removeCachedWorkspace(queryClient: QueryClient, wsId: string): void {
+  queryClient.setQueriesData<CachedWorkspaceList | undefined>(
+    { queryKey: queryKeys.workspaces.lists() },
+    (prev) => {
+      if (!prev?.workspaces?.some((ws) => ws.workspace_id === wsId)) return prev;
+      return {
+        ...prev,
+        workspaces: prev.workspaces.filter((ws) => ws.workspace_id !== wsId),
+        ...(typeof prev.total === 'number' ? { total: Math.max(0, prev.total - 1) } : {}),
+      };
+    },
+  );
+}
+
+/**
+ * Everything this tab keeps about a workspace that is now deleted: stored
+ * thread pointers (chat and market), remembered tree expansion, frozen nav
+ * orders, the shared thread lists, scroll positions, and its row in every
+ * cached list, so nothing re-expands or 404s a dead workspace while the
+ * refetch the caller starts is in flight.
+ */
+export function forgetDeletedWorkspace(queryClient: QueryClient, wsId: string): void {
+  removeStoredThreadId(wsId);
+  clearAllMarketThreadsForWorkspace(wsId);
+  forgetNavPanelExpansion(wsId);
+  forgetStableNavOrder(wsId);
+  forgetSharedWorkspaceThreads(wsId);
+  scrollMemory.forget(`threads:${wsId}:active`);
+  scrollMemory.forget(`threads:${wsId}:archived`);
+  removeCachedWorkspace(queryClient, wsId);
+}
+
+/** A cached list read in the custom order (the gallery's under Custom, the sidebar's). */
+const isCustomOrderList = (key: QueryKey) => {
+  const params = key[2];
+  return !!params && typeof params === 'object' && (params as { sortBy?: unknown }).sortBy === 'custom';
+};
+
+/** `rows` put in `rank`'s order, each carrying its new slot. Rows `rank` lacks keep their place at the end. */
+function applyRank<T extends { workspace_id: string }>(rows: readonly T[], rank: Map<string, number>): T[] {
+  const at = (ws: T) => rank.get(ws.workspace_id) ?? Number.MAX_SAFE_INTEGER;
+  return rows
+    .map((ws, i) => ({ ws, i }))
+    .sort((a, b) => at(a.ws) - at(b.ws) || a.i - b.i)
+    .map(({ ws }) => (rank.has(ws.workspace_id) ? { ...ws, sort_order: rank.get(ws.workspace_id) } : ws));
+}
+
+/**
+ * Show a new custom order at once in every cached list in that order, the
+ * gallery's and the sidebar's both, each row carrying its new `sort_order`,
+ * so a reorder made in either view reads the same in the other before the
+ * save lands. A read of those lists in flight is cancelled first, since it
+ * would land the old order over the new one (a cancel puts back the list it
+ * started from). Returns the snapshot `unrankCachedWorkspaces` takes back.
+ */
+export function rankCachedWorkspaces(
+  queryClient: QueryClient,
+  items: ReadonlyArray<{ workspace_id: string; sort_order: number }>,
+): WorkspaceQueriesSnapshot {
+  const rank = new Map(items.map((it) => [it.workspace_id, it.sort_order]));
+  const custom = { queryKey: queryKeys.workspaces.lists(), predicate: (q: { queryKey: QueryKey }) => isCustomOrderList(q.queryKey) };
+  void queryClient.cancelQueries(custom);
+  const previous = queryClient.getQueriesData(custom);
+  for (const [key, data] of previous) {
+    const d = data as CachedWorkspaceList | undefined;
+    if (!d?.workspaces) continue;
+    queryClient.setQueryData(key as readonly unknown[], { ...d, workspaces: applyRank(d.workspaces, rank) });
+  }
+  return previous;
+}
+
+/**
+ * Take back a rankCachedWorkspaces: each list's rows return to the order and
+ * `sort_order`s the snapshot holds, on the rows the list holds now. Restoring
+ * the snapshot whole would also undo a delete, create or rename that landed
+ * while the save was in flight. Rows the snapshot lacks keep their place at
+ * the end.
+ */
+export function unrankCachedWorkspaces(queryClient: QueryClient, previous: WorkspaceQueriesSnapshot): void {
+  for (const [key, data] of previous) {
+    const before = (data as CachedWorkspaceList | undefined)?.workspaces;
+    if (!before) continue;
+    const slot = new Map(before.map((ws, i) => [ws.workspace_id, { i, sort_order: ws.sort_order }]));
+    const at = (ws: { workspace_id: string }) => slot.get(ws.workspace_id)?.i ?? Number.MAX_SAFE_INTEGER;
+    queryClient.setQueryData<CachedWorkspaceList | undefined>(key as readonly unknown[], (now) => {
+      if (!now?.workspaces) return now;
+      const workspaces = now.workspaces
+        .map((ws, i) => ({ ws, i }))
+        .sort((a, b) => at(a.ws) - at(b.ws) || a.i - b.i)
+        .map(({ ws }) => {
+          const was = slot.get(ws.workspace_id);
+          return was ? { ...ws, sort_order: was.sort_order } : ws;
+        });
+      return { ...now, workspaces };
+    });
+  }
 }
 
 /** Restore a snapshot captured by patchCachedWorkspace. */

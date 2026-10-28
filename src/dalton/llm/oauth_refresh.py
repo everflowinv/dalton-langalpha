@@ -123,3 +123,32 @@ def _carry_prompt_cache_key(failed: Any, fresh: Any) -> Any:
     if not key or fresh_mk.get("prompt_cache_key") == key:
         return fresh
     return fresh.model_copy(update={"model_kwargs": {**fresh_mk, "prompt_cache_key": key}})
+
+
+async def call_with_oauth_refresh(client: Any, fn: Any, *, prepare: Any = None) -> Any:
+    """``await fn(client)``, rebuilt once on a 401 before giving up (A4).
+
+    The resilience middleware already refreshes mid-turn for the calls that go
+    through it; the subsidiary clients called directly (WebFetch extraction,
+    compaction's fallback summary, server-side ``LLMService.complete``) sat
+    outside that net, so a turn that outlived its token failed whole features
+    until the next turn. ``fn`` receives the client to call with and may be
+    re-invoked on the rebuilt one; ``prepare`` mutates the fresh client the way
+    the caller had mutated the original (e.g. disabling streaming) before
+    ``fn`` sees it. A second 401 — or a client with no OAuth spec, or no fresh
+    token to be had — re-raises the last error unchanged: the caller falls back
+    exactly as before this wrapper existed.
+    """
+    from src.llms.error_classification import extract_status_code
+
+    try:
+        return await fn(client)
+    except Exception as exc:
+        if extract_status_code(exc) != 401:
+            raise
+        fresh = await rebuild_oauth_client(client)
+        if fresh is None:
+            raise
+        if prepare is not None:
+            prepare(fresh)
+        return await fn(fresh)

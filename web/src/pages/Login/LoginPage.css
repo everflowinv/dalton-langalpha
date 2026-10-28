@@ -120,7 +120,7 @@
   background: var(--login-opaque-muted);
   border: 1px solid var(--color-border-muted);
   color: var(--color-text-primary);
-  transition: border-color 0.2s ease, background-color 0.2s ease, box-shadow 0.2s ease;
+  transition: border-color var(--motion-quick) var(--ease-out), background-color var(--motion-quick) var(--ease-out), box-shadow var(--motion-quick) var(--ease-out);
 }
 
 .login-page__input::placeholder {
@@ -177,7 +177,7 @@
   background: var(--color-text-primary);
   color: var(--color-bg-page);
   cursor: pointer;
-  transition: background-color 0.2s ease, border-color 0.2s ease, transform 0.15s ease;
+  transition: background-color var(--motion-quick) var(--ease-out), border-color var(--motion-quick) var(--ease-out), transform var(--motion-quick) var(--ease-out);
 }
 
 /* Ember on hover, but only for pointers that can hover: on touch screens
@@ -307,7 +307,7 @@
   font-weight: 400;
   color: var(--color-text-tertiary);
   cursor: pointer;
-  transition: color 0.2s ease;
+  transition: color var(--motion-quick) var(--ease-out);
 }
 
 .login-page__forgot:hover {
@@ -327,7 +327,7 @@
   background: var(--login-opaque-muted);
   color: var(--color-text-primary);
   cursor: pointer;
-  transition: background-color 0.2s ease, border-color 0.2s ease;
+  transition: background-color var(--motion-quick) var(--ease-out), border-color var(--motion-quick) var(--ease-out);
 }
 
 .login-page__resend-btn:disabled {
@@ -343,7 +343,7 @@
   font-size: 0.8125rem;
   color: var(--color-text-secondary);
   cursor: pointer;
-  transition: color 0.2s ease;
+  transition: color var(--motion-quick) var(--ease-out);
 }
 
 .login-page__back:hover {
@@ -389,7 +389,7 @@
   border: none;
   color: var(--color-text-tertiary);
   cursor: pointer;
-  transition: color 0.2s ease;
+  transition: color var(--motion-quick) var(--ease-out);
 }
 
 .login-page__password-toggle:hover {
@@ -416,7 +416,7 @@
   width: 0;
   border-radius: inherit;
   background: var(--login-ember);
-  transition: width 0.25s ease, background-color 0.25s ease;
+  transition: width var(--motion-fold) var(--ease-out), background-color var(--motion-fold) var(--ease-out);
 }
 
 .login-page__strength[data-score='0'] .login-page__strength-fill {
@@ -460,7 +460,7 @@
   gap: 0.375rem;
   font-size: 0.75rem;
   color: var(--color-text-secondary);
-  transition: color 0.2s ease;
+  transition: color var(--motion-quick) var(--ease-out);
 }
 
 .login-page__req-mark {
@@ -474,7 +474,7 @@
   font-size: 0.5625rem;
   line-height: 1;
   color: transparent;
-  transition: color 0.2s ease, border-color 0.2s ease;
+  transition: color var(--motion-quick) var(--ease-out), border-color var(--motion-quick) var(--ease-out);
 }
 
 .login-page__req[data-met] {
@@ -711,7 +711,7 @@
   background: var(--login-opaque-muted);
   color: var(--color-text-primary);
   cursor: pointer;
-  transition: background-color 0.2s ease, border-color 0.2s ease, transform 0.15s ease;
+  transition: background-color var(--motion-quick) var(--ease-out), border-color var(--motion-quick) var(--ease-out), transform var(--motion-quick) var(--ease-out);
 }
 
 .login-page__method-btn:hover:not(:disabled) {
@@ -771,7 +771,7 @@
   text-decoration: underline;
   text-underline-offset: 2px;
   cursor: pointer;
-  transition: color 0.2s ease;
+  transition: color var(--motion-quick) var(--ease-out);
 }
 
 .login-page__switch-link:hover {

@@ -4,6 +4,7 @@ import { AlertCircle, ArrowUpRight, EyeOff, Pause, Pencil, Play, Trash2, Zap } f
 import { HeaderButton, ListSkeleton } from '@/components/mcp/McpPrimitives';
 import { useLocale } from '@/hooks/useLocale';
 import { useNow } from '@/hooks/useNow';
+import { scrollMotion } from '@/lib/reducedMotion';
 import { cn } from '@/lib/utils';
 import type { Automation, AutomationExecution, DeliveryAttempt } from '@/types/automation';
 import type { ErrorLinkSpec } from '@/utils/rateLimitError';
@@ -102,7 +103,7 @@ export default function AutomationInspector({
   useEffect(() => {
     if (openedOnMount.current === runId) return;
     openedOnMount.current = runId;
-    reportRef.current?.scrollIntoView?.({ block: 'nearest', behavior: 'smooth' });
+    reportRef.current?.scrollIntoView?.({ block: 'nearest', behavior: scrollMotion() });
   }, [runId]);
 
   const kicker = [t(ui.labelKey), place.label(a, workspaceName)];

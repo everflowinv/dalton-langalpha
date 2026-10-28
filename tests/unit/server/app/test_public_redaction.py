@@ -36,7 +36,7 @@ _FILE_SVC = "src.server.app.share_files.FilePersistenceService.get_file_content"
 # Path normalization moved behind the containment helpers, which the share
 # routes now call instead of normalizing themselves; this is the same
 # function, patched where those helpers reach it.
-_NORM_PATH = "src.server.app.workspace_files._containment._normalize_requested_path"
+_NORM_PATH = "src.server.services.workspace_file_containment.normalize_requested_path"
 _GET_REDACTOR = "src.server.app.share_files.get_redactor"
 _SHARE_VAULT = "src.server.app.share_files.get_vault_secrets_for_redaction"
 

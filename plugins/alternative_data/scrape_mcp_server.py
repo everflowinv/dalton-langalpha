@@ -64,6 +64,19 @@ _BROWSER_GRACE_S = 15.0
 _FAST_GRACE_S = 5.0
 _MAX_CONTENT_CHARS = 400_000
 _MAX_DETAIL_CHARS = 300
+# How the launcher a user's own machine has in place of Playwright's Chromium
+# (``_ssh_bootstrap.NO_OWN_BROWSER``) reports that the machine has no browser
+# of its own. Only that machine runs the launcher, so only its words are
+# reworded: Playwright's own "Executable doesn't exist" also comes from a
+# hosted sandbox, where the user's computer is not involved, and reaches the
+# agent as Playwright gave it.
+_NO_BROWSER = "No Chrome, Chromium, Edge or Brave is installed on this machine"
+_NO_BROWSER_DETAIL = (
+    "this computer has no browser installed, so browser and stealth modes are "
+    "unavailable here; use mode='fast' or web_fetch instead. Installing a "
+    "browser downloads about 500 MB onto the user's own computer, so ask the "
+    "user first"
+)
 
 # Per interpreter, not per call — and not process-wide across executions. A
 # semaphore built inside the handler would bound only its own batch, but each
@@ -237,6 +250,8 @@ async def _scrape_one(
                 "fetch_failed", f"timed out after {fetch_bound_s:.0f}s", url=url
             )
         except Exception as e:  # noqa: BLE001 - per-URL failures become error dicts
+            if _NO_BROWSER in str(e):
+                return _error("fetch_failed", _NO_BROWSER_DETAIL, url=url)
             return _error("fetch_failed", f"{type(e).__name__}: {e}", url=url)
 
     # Extraction is as failure-prone as the fetch — trafilatura and

@@ -22,10 +22,13 @@ class _FakeModel:
 
 
 class _FakeRequest:
+    # DALTON-HOOK(oauth-dispatch): B4's resilience chain reads model_settings
+    # (compaction-request detection); a plain send carries none.
     def __init__(self, model, messages=None, state=None):
         self.model = model
         self.messages = messages if messages is not None else []
         self.state = state if state is not None else {"messages": []}
+        self.model_settings = {}
 
     def override(self, *, model=None, messages=None):
         return _FakeRequest(
@@ -346,3 +349,181 @@ async def test_subagent_narrowed_cache_key_survives_rebuild(monkeypatch):
     assert sub.model_kwargs["prompt_cache_key"] == "thread-1:research"
     fresh = await oauth_refresh.rebuild_oauth_client(sub)
     assert fresh.model_kwargs["prompt_cache_key"] == "thread-1:research"
+
+
+@pytest.mark.asyncio
+async def test_429_falls_back_with_sanitized_warning_on_main_and_subagent(
+    events, resolver, monkeypatch
+):
+    """P0-5: 429 falls back immediately without OAuth refresh; fallback log and UI event sanitize secrets and carry error_type on both main agent and subagent."""
+    import ptc_agent.agent.middleware.model_resilience as mr_mod
+
+    warn_calls: list[tuple[tuple, dict]] = []
+
+    def _capture_warn(*args, **kwargs):
+        warn_calls.append((args, kwargs))
+
+    monkeypatch.setattr(
+        mr_mod.logger,
+        "warning",
+        create_autospec(mr_mod.logger.warning, side_effect=_capture_warn),
+    )
+
+    def _rate_limit():
+        exc = Exception(
+            "Error code: 429 - rate_limit_error with Authorization: Bearer sk-ant-secret1234567890abcdef"
+        )
+        exc.status_code = 429
+        return exc
+
+    primary = _oauth_model("claude-opus-5-5-oauth", "t0")
+    fallback = _FakeModel("muse-wonder-1.0-oauth")
+    mw = ModelResilienceMiddleware(
+        primary_name="claude-opus-5-5-oauth",
+        primary_client=primary,
+        fallbacks=[("muse-wonder-1.0-oauth", fallback)],
+        max_retries=0,
+        initial_delay=0.0,
+        jitter=False,
+    )
+
+    # 1. Main agent 429 -> falls back without OAuth refresh
+    seen_main = []
+
+    async def handler_main(req):
+        seen_main.append(req.model.model)
+        if req.model.model == "claude-opus-5-5-oauth":
+            raise _rate_limit()
+        return "ok-main"
+
+    assert await mw.awrap_model_call(_FakeRequest(primary), handler_main) == "ok-main"
+    assert seen_main == ["claude-opus-5-5-oauth", "muse-wonder-1.0-oauth"]
+    resolver.assert_not_awaited()
+    assert len(warn_calls) == 1
+    _, warn_kw = warn_calls[0]
+    assert warn_kw["from_model"] == "claude-opus-5-5-oauth"
+    assert warn_kw["to_model"] == "muse-wonder-1.0-oauth"
+    assert warn_kw["status_code"] == 429
+    assert warn_kw["error_type"] == "Exception"
+    assert "sk-ant-secret1234567890abcdef" not in warn_kw["error"]
+    fb_events = [e for e in events if e.get("name") == "model_fallback"]
+    assert len(fb_events) == 1
+    assert fb_events[0]["props"]["error_type"] == "Exception"
+    assert "sk-ant-secret1234567890abcdef" not in fb_events[0]["props"]["error"]
+
+    # 2. Subagent 429 -> falls back and logs sanitized warning
+    warn_calls.clear()
+    events.clear()
+    sub = _oauth_model("grok-4.7-oauth", "t0")
+    seen_sub = []
+
+    async def handler_sub(req):
+        seen_sub.append(req.model.model)
+        if req.model.model == "grok-4.7-oauth":
+            raise _rate_limit()
+        return "ok-sub"
+
+    assert await mw.awrap_model_call(_FakeRequest(sub), handler_sub) == "ok-sub"
+    assert seen_sub == ["grok-4.7-oauth", "muse-wonder-1.0-oauth"]
+    assert len(warn_calls) == 1
+    assert warn_calls[0][1]["from_model"] == "grok-4.7-oauth"
+    assert warn_calls[0][1]["to_model"] == "muse-wonder-1.0-oauth"
+    assert "sk-ant-secret1234567890abcdef" not in warn_calls[0][1]["error"]
+
+
+@pytest.mark.asyncio
+async def test_ordinary_400_vs_real_context_overflow_fallback_and_compaction_handoff(
+    events,
+):
+    """P0-5: Ordinary 400 is not treated as context overflow (falls back normally);
+    real context overflow only tries strictly larger context-window fallbacks and then
+    hands up to CompactionMiddleware on both main agent and subagent."""
+    primary = _FakeModel("claude-opus-5-5-oauth")
+    primary.profile = {"max_input_tokens": 200_000}
+    sub = _FakeModel("grok-4.7-oauth")
+    sub.profile = {"max_input_tokens": 200_000}
+    fb_same = _FakeModel("same-window-fallback")
+    fb_same.profile = {"max_input_tokens": 200_000}
+    fb_larger = _FakeModel("larger-window-fallback")
+    fb_larger.profile = {"max_input_tokens": 1_000_000}
+
+    # 1. Ordinary 400 -> NOT treated as overflow; same-window fallback is tried and succeeds
+    mw_ordinary = ModelResilienceMiddleware(
+        primary_name="claude-opus-5-5-oauth",
+        primary_client=primary,
+        fallbacks=[("same-window-fallback", fb_same)],
+        initial_delay=0.0,
+        jitter=False,
+        compacts_overflow=True,
+    )
+    seen_ord = []
+
+    async def handler_ordinary_400(req):
+        seen_ord.append(req.model.model)
+        if req.model is primary:
+            exc = Exception(
+                "Error code: 400 - {'type': 'error', 'error': {'type': 'invalid_request_error', "
+                "'message': 'messages.1.content: invalid tool_use_id format'}}"
+            )
+            exc.status_code = 400
+            raise exc
+        return "ok-ordinary-400"
+
+    assert (
+        await mw_ordinary.awrap_model_call(_FakeRequest(primary), handler_ordinary_400)
+        == "ok-ordinary-400"
+    )
+    assert seen_ord == ["claude-opus-5-5-oauth", "same-window-fallback"]
+
+    # 2. Real context overflow -> skips same-window fallback, tries larger-window fallback
+    mw_overflow = ModelResilienceMiddleware(
+        primary_name="claude-opus-5-5-oauth",
+        primary_client=primary,
+        fallbacks=[
+            ("same-window-fallback", fb_same),
+            ("larger-window-fallback", fb_larger),
+        ],
+        initial_delay=0.0,
+        jitter=False,
+        compacts_overflow=True,
+    )
+
+    def _overflow_exc():
+        exc = Exception(
+            "Error code: 400 - {'type': 'error', 'error': {'type': 'invalid_request_error', "
+            "'message': 'prompt is too long: 210000 tokens > 200000 maximum'}}"
+        )
+        exc.status_code = 400
+        return exc
+
+    seen_ovf = []
+
+    async def handler_overflow_to_larger(req):
+        seen_ovf.append(req.model.model)
+        if req.model.model != "larger-window-fallback":
+            raise _overflow_exc()
+        return "ok-larger"
+
+    assert (
+        await mw_overflow.awrap_model_call(_FakeRequest(primary), handler_overflow_to_larger)
+        == "ok-larger"
+    )
+    assert seen_ovf == ["claude-opus-5-5-oauth", "larger-window-fallback"]
+
+    # Subagent real overflow also skips same-window fallback and uses larger-window fallback
+    seen_sub_ovf = []
+    assert (
+        await mw_overflow.awrap_model_call(_FakeRequest(sub), handler_overflow_to_larger)
+        != ""
+    )
+    # Verify same-window-fallback was skipped for subagent too
+    assert seen_ovf[-2:] == ["grok-4.7-oauth", "larger-window-fallback"]
+
+    # 3. Real context overflow when larger fallback also overflows -> raises overflow up to CompactionMiddleware
+    async def handler_all_overflow(req):
+        seen_sub_ovf.append(req.model.model)
+        raise _overflow_exc()
+
+    with pytest.raises(Exception, match="prompt is too long"):
+        await mw_overflow.awrap_model_call(_FakeRequest(primary), handler_all_overflow)
+    assert seen_sub_ovf == ["claude-opus-5-5-oauth", "larger-window-fallback"]

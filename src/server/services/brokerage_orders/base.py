@@ -207,6 +207,19 @@ class OrderAdapter(ABC):
         """
         return None
 
+    def absent_status(self, action: str | None) -> AttemptStatus | None:
+        """The state an open attempt reaches by leaving a complete listing, or None.
+
+        None keeps it open, which is right wherever a list keeps an order after
+        it ends: one missing from it is unexplained, and settling it would state
+        an outcome nobody reported. A vendor whose list carries only what is
+        still pending drops an attempt when it ends there, sent on, deleted or
+        expired, without saying which, and names here the state that records
+        that much. ``action`` is the attempt's own, since a vendor can list one
+        action's orders this way and not another's.
+        """
+        return None
+
     @abstractmethod
     def match_key(self, order: BrokerOrder | None) -> MatchKey | None:
         """The field map of an order we sent, comparable with a listed one.

@@ -1,22 +1,26 @@
 """Model-availability error responses + stale-preference scrubbing.
 
-When a selected model can't be served — a custom model with no usable key, or a
-saved preference whose model has vanished from the manifest — the chat handler
-needs to fail loudly with a CTA banner rather than silently downgrade. This
-module owns those user-facing 400s and the pref-scrub that backs the
-``model_removed`` case. A missing model saved for a role (the Background
-model on a primary turn, compaction, fetch, a fallback) is not a refusal: the turn reads the prefs as if
-the slot were unset, and nothing is deleted. ``resolve_llm_config`` invokes
-them; they are not part of the resolution engine itself.
+When a selected model can't be served — a custom model with no usable key, a
+saved preference whose model has vanished from the manifest, or a model the
+user's plan does not cover on the platform's key — the chat handler needs to
+fail loudly with a CTA banner rather than silently downgrade. This module owns
+those user-facing 400s and the pref-scrub that backs the ``model_removed``
+case. A missing model saved for a role (the Background model on a primary
+turn, compaction, fetch, a fallback), or any saved model the plan does not
+cover, is not a refusal: the turn reads the prefs as if the slot were unset,
+and nothing is deleted.
+``resolve_llm_config`` invokes them; they are not part of the resolution
+engine itself.
 """
 
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from typing import NoReturn
 
 from . import user_models
+from .capabilities import TierPermits
 
 # Same hard-coded logger name request_prep uses — existing log routing keys off it.
 logger = logging.getLogger("src.server.handlers.chat_handler")
@@ -149,6 +153,141 @@ def drop_dead_models(
             live["fallback_models"] = kept
 
     return live, dropped
+
+
+async def model_on_plan(
+    user_id: str,
+    model: str,
+    *,
+    model_pref: dict,
+    permits: TierPermits,
+    is_byok: bool,
+    byok_cache: dict[str, dict | None],
+) -> bool:
+    """Whether the user may run ``model``, in the model list's order.
+
+    A provider the user holds a key or a subscription for is never gated by
+    plan, so a free-plan user who pins a model to their own key keeps it. A
+    model with no tier is one no plan includes, which the list offers only to
+    such a user.
+    """
+    from src.server.dependencies.usage_limits import platform_gating_active
+
+    if not platform_gating_active():
+        return True
+    from src.llms.llm import LLM as LLMFactory
+
+    from .clients import _resolve_custom_model_byok, _walk_byok_candidates
+
+    mc = LLMFactory.get_model_config()
+    source, entry = await user_models.classify_model(user_id, model, _pref_cache=model_pref)
+    if source == user_models.ModelSource.CUSTOM:
+        # Runs on the user's own key. With none, a role left without a
+        # client is built by this name from the manifest, on the platform's
+        # key, so a custom model under a built-in's name is judged as that one.
+        shadowed = mc.get_model_config(model)
+        if shadowed is None:
+            return True
+        if is_byok:
+            key, _, _ = await _resolve_custom_model_byok(
+                user_id, model, entry, mc, _pref_cache=model_pref, _byok_cache=byok_cache,
+            )
+            if key:
+                return True
+        tier = shadowed.get("tier")
+        return isinstance(tier, int) and await permits(tier)
+    if source != user_models.ModelSource.SYSTEM:
+        return True
+    tier = entry.get("tier")
+    if isinstance(tier, int) and await permits(tier):
+        return True
+
+    provider = entry.get("provider")
+    if not provider:
+        return False
+    if mc.get_provider_info(provider).get("access_type") == "oauth":
+        # Served on the user's subscription or not at all; with none, building
+        # its client refuses the turn or leaves the role without one.
+        return True
+    if not is_byok:
+        return False
+    found, _ = await _walk_byok_candidates(user_id, provider, mc, _byok_cache=byok_cache)
+    return found is not None
+
+
+async def drop_off_plan_models(
+    user_id: str,
+    model_pref: dict,
+    *,
+    permits: TierPermits,
+    is_byok: bool,
+    byok_cache: dict[str, dict | None],
+    exempt: Mapping[str, frozenset[str]] | None = None,
+) -> tuple[dict, list[tuple[str, str]]]:
+    """``model_pref`` as if every saved model ``model_on_plan`` refuses had never
+    been saved, plus ``[(key, name), ...]`` dropped.
+
+    A downgrade leaves the paid models it covered in the user's slots, where
+    they would keep running on the platform's key. A saved model reads as
+    unset, as a dead one does; a model the turn names is refused instead,
+    before this runs. Nothing is deleted, since the plan may come back.
+    ``exempt`` names, per key (``fallback_models`` included), the
+    deployment's own models that key may hold: the operator's call.
+    """
+    exempt = exempt or {}
+    fallback = model_pref.get("fallback_models")
+    fallback = fallback if isinstance(fallback, list) else []
+    saved = [
+        *((key, model_pref.get(key)) for key in _MODEL_PREF_KEYS),
+        *(("fallback_models", m) for m in fallback),
+    ]
+
+    # Nothing validates these on write, and the slot a turn runs is left to
+    # this check by the dead-model filter, so only a string is ever hashed.
+    def judged(key: str, value: object) -> bool:
+        return isinstance(value, str) and bool(value) and value not in exempt.get(key, ())
+
+    off = {
+        name
+        for name in {value for key, value in saved if judged(key, value)}
+        if not await model_on_plan(
+            user_id, name, model_pref=model_pref, permits=permits,
+            is_byok=is_byok, byok_cache=byok_cache,
+        )
+    }
+    if not off:
+        return model_pref, []
+
+    def is_off(key: str, value: object) -> bool:
+        return judged(key, value) and value in off
+
+    view = dict(model_pref)
+    dropped: list[tuple[str, str]] = []
+    for key in _MODEL_PREF_KEYS:
+        if is_off(key, view.get(key)):
+            dropped.append((key, view.pop(key)))
+    if any(is_off("fallback_models", m) for m in fallback):
+        view["fallback_models"] = [m for m in fallback if not is_off("fallback_models", m)]
+        dropped.extend(("fallback_models", m) for m in fallback if is_off("fallback_models", m))
+    return view, dropped
+
+
+def raise_model_not_on_plan(model_name: str) -> NoReturn:
+    """Raise the 400 for a model the user chose that would run on the
+    platform's key above their plan."""
+    from fastapi import HTTPException
+
+    raise HTTPException(
+        status_code=400,
+        detail={
+            "message": (
+                f"Model '{model_name}' is not included in your plan. Pick another "
+                "model, or add your own API key for it in Settings."
+            ),
+            "type": "model_not_on_plan",
+            "link": {"url": "/settings?tab=model", "label": "Open Settings"},
+        },
+    )
 
 
 async def cleanup_stale_model_preferences(user_id: str) -> list[tuple[str, str]]:

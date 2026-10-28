@@ -150,6 +150,39 @@ interface ModelOptions {
    * thread carries none: the row's PATCH is its only writer.
    */
   subagentsAllowed?: boolean;
+  /**
+   * The effort and fast mode the thread this send creates keeps as its own
+   * (`useThreadTuning`), apart from `reasoningEffort`/`fastMode`, which are
+   * this turn's. A send on a live thread carries none, for the same reason.
+   */
+  reasoningEffortOverride?: string;
+  fastModeOverride?: boolean;
+}
+
+/** What a fresh send takes beyond the model options an edit or regenerate does. */
+interface SendOptions extends ModelOptions {
+  /**
+   * The send opens its turn with no message of its own: the model reads only
+   * its additionalContext, and the reply is the first bubble the turn shows.
+   * A reload draws none for it either, since its stored query is empty.
+   */
+  hiddenOpener?: boolean;
+  /** The title of the thread this send creates, in place of one generated
+   *  from its message. A send on a live thread leaves the title alone. */
+  threadTitle?: string;
+  /**
+   * DALTON-HOOK(composer-drafts): called once, as early as the server has
+   * taken this send — the first metadata carrying a run_id, a steer accepted
+   * or merged into the running turn, an adopted duplicate, a reconnect to
+   * the already-started stream, or an auto-retry scheduled. The composer's
+   * draft settles as sent here, so a reload mid-stream never restores an
+   * already-sent message into the input. The send's returned boolean stays
+   * the fallback for a send that never reports either way. A send parked
+   * for compaction is not taken: it accepts — and its promise settles —
+   * only once the flushed send goes out, or settles false when a stop
+   * drops it.
+   */
+  onAccepted?: () => void;
 }
 
 /** Offload batch ref state. */
@@ -290,7 +323,7 @@ interface PairState {
 
 export type {
   SetMessages, TokenUsage, PendingInterrupt,
-  SSEEvent, ModelOptions, OffloadBatch, ContextWindowCallbacks,
+  SSEEvent, ModelOptions, SendOptions, OffloadBatch, ContextWindowCallbacks,
   SubagentHistoryEntry, TaskRefs, HistoryInterruptInfo, SubagentHistoryData,
   StreamProcessorRefs, PairState,
 };

@@ -14,6 +14,7 @@ import { useTranslation } from 'react-i18next';
 import {
   ChevronRight, Folder, FolderOpen, Pin,
   X, ChevronsDown, MoreHorizontal, SquarePen, Archive,
+  type LucideIcon,
 } from 'lucide-react';
 import { DropdownMenu, DropdownMenuContent, DropdownMenuTrigger } from '../../../components/ui/dropdown-menu';
 import { HoverCard, HoverCardContent, HoverCardTrigger } from '../../../components/ui/hover-card';
@@ -33,6 +34,9 @@ import { WorkspaceMenuItems } from './workspaceActions';
 import type { WorkspaceActions } from './workspaceActions';
 import { clampWorkspaceName } from '../utils/workspaceName';
 import { useNavTree, type DragGate } from './navTreeKit';
+import { computerIdentity } from './ComputerBadge';
+import { FolderCommand, FolderTerminal } from './computerFolderIcons';
+import { useComputer } from '../hooks/useComputers';
 
 export interface ThreadEntry {
   thread_id: string;
@@ -51,22 +55,55 @@ export interface ThreadsData {
   total?: number;
 }
 
+interface RowMachine {
+  icon: LucideIcon;
+  title: string;
+}
+
+/**
+ * The machine a workspace row lives on, when the row should say so: a Mac or
+ * another machine reached over SSH, which is there only while that machine is
+ * on and holds the files itself. Still a folder, with the machine's mark in
+ * it: ⌘ for a Mac, >_ for SSH. A hosted sandbox is where workspaces live by
+ * default, so it keeps the plain folder.
+ */
+function useRowMachine(ws: NavWorkspace): RowMachine | null {
+  const { t } = useTranslation();
+  const id = typeof ws.computer_id === 'string' && !isHomeWorkspace(ws) ? ws.computer_id : null;
+  const { data: computer } = useComputer(id);
+  if (!computer) return null;
+  const identity = computerIdentity(t, computer, false);
+  if (identity.kind === 'hosted') return null;
+  return {
+    icon: identity.kind === 'ssh' ? FolderTerminal : FolderCommand,
+    title: t('nav.onComputer', { name: computer.name, kind: identity.label }),
+  };
+}
+
 /** The workspace row's leading glyph. Shared with the drag chip so a lifted
- *  section keeps the icon it had in the tree. */
-function workspaceGlyph(ws: NavWorkspace, expanded: boolean) {
+ *  section keeps the icon it had in the tree. A pin outranks the machine: it
+ *  says why the row sits on top, and the machine stays in the tooltip. */
+function workspaceGlyph(ws: NavWorkspace, expanded: boolean, machine: RowMachine | null) {
   const style = { color: 'var(--color-text-tertiary)' };
   const className = 'h-4 w-4 shrink-0';
   if (isHomeWorkspace(ws)) return <HomeRowIcon className={className} style={style} />;
-  if (ws.is_pinned) return <Pin className={className} style={style} />;
-  return expanded ? <FolderOpen className={className} style={style} /> : <Folder className={className} style={style} />;
+  const glyph = ws.is_pinned
+    ? <Pin className={className} style={style} />
+    : machine
+      ? <machine.icon className={className} style={style} />
+      : expanded ? <FolderOpen className={className} style={style} /> : <Folder className={className} style={style} />;
+  // The tooltip is for a pointer; the hidden text says it to a screen reader.
+  return machine ? (
+    <span className="flex shrink-0" title={machine.title}>
+      {glyph}
+      <span className="sr-only">{machine.title}</span>
+    </span>
+  ) : glyph;
 }
 
 // The disclosure chevron turns a quarter when its row opens. A CSS transition,
 // so a remount renders at the resting angle and only a toggle turns it.
-const CHEVRON_CLASS = 'h-4 w-4 transition-transform duration-150 ease-[ease-out] motion-reduce:transition-none';
-
-// Row action buttons dip while pressed.
-const PRESS_CLASS = 'transition-transform duration-150 active:scale-[0.85] motion-reduce:transition-none';
+const CHEVRON_CLASS = 'h-4 w-4 transition-transform duration-fold';
 
 // Its own component so useTitleFade can run per row (hooks can't live in a map
 // callback). Fades softly when a live title rewrite lands (auto-title,
@@ -179,9 +216,6 @@ export function AgentRow({ agent, isSelected, isMobile, onSelectAgent, onRemoveA
   const { t } = useTranslation();
   const isMainAgent = agent.isMainAgent;
   const status = agent.status;
-  // Narrow agent-running flag; named distinctly from the panel's isActive
-  // prop (panel visibility) to avoid shadowing.
-  const isAgentActive = status === 'active';
 
   const rowLabel = sidebarAgentRowLabel(agent);
 
@@ -190,7 +224,7 @@ export function AgentRow({ agent, isSelected, isMobile, onSelectAgent, onRemoveA
       data-testid="agent-row"
       data-nav-key={`agent:${agent.id}`}
       data-agent-role={isMainAgent ? 'main' : 'sub'}
-      className={`nav-panel-agent-row group ${isAgentActive && !isMainAgent ? 'nav-panel-agent-pulse' : ''}${isSelected ? ' is-selected' : ''}`}
+      className={`nav-panel-agent-row group${isSelected ? ' is-selected' : ''}`}
       style={{ backgroundColor: isSelected ? 'var(--color-border-muted)' : undefined }}
       onClick={() => onSelectAgent(agent.id)}
     >
@@ -317,7 +351,7 @@ function ThreadTreeRowImpl({
             {isPinned && !isMobile && (
               <Pin
                 aria-hidden
-                className="h-3 w-3 ml-auto shrink-0 transition-opacity duration-150 group-hover:opacity-0"
+                className="h-3 w-3 ml-auto shrink-0 transition-opacity group-hover:opacity-0"
                 fill="currentColor"
                 style={{ color: 'var(--color-text-quaternary)' }}
               />
@@ -329,7 +363,7 @@ function ThreadTreeRowImpl({
                     type="button"
                     data-nav-key={`thread:${tid}:pin`}
                     onClick={(e) => { e.stopPropagation(); onPinThread(wsId, tid, !isPinned); }}
-                    className={`flex items-center justify-center p-0.5 rounded bg-transparent border-none cursor-pointer hover:bg-(--color-bg-hover) ${PRESS_CLASS}`}
+                    className="flex items-center justify-center p-0.5 rounded bg-transparent border-none cursor-pointer hover:bg-(--color-bg-hover) press"
                     title={isPinned ? t('nav.unpinThread') : t('nav.pinThread')}
                     aria-label={isPinned ? t('nav.unpinThread') : t('nav.pinThread')}
                   >
@@ -347,7 +381,7 @@ function ThreadTreeRowImpl({
                     type="button"
                     data-nav-key={`thread:${tid}:archive`}
                     onClick={(e) => { e.stopPropagation(); onArchiveThread(wsId, tid); }}
-                    className={`flex items-center justify-center p-0.5 rounded bg-transparent border-none cursor-pointer hover:bg-(--color-bg-hover) ${PRESS_CLASS}`}
+                    className="flex items-center justify-center p-0.5 rounded bg-transparent border-none cursor-pointer hover:bg-(--color-bg-hover) press"
                     title={t('nav.archiveThread')}
                     aria-label={t('nav.archiveThread')}
                   >
@@ -392,7 +426,7 @@ export interface WorkspaceTreeRowProps {
   expandedThreadIds: Set<string>;
   agents?: SidebarAgentRow[];
   activeAgentId?: string | null;
-  /** The shared change-spec / always-on / duplicate / delete flows. */
+  /** The shared duplicate / move / delete flows. */
   wsActions: Omit<WorkspaceActions, 'dialogs'>;
   rename: {
     active: boolean;
@@ -447,6 +481,7 @@ function WorkspaceTreeRowImpl({
   const wsId = ws.workspace_id;
   const isHome = isHomeWorkspace(ws);
   const isPinned = Boolean(ws.is_pinned);
+  const machine = useRowMachine(ws);
   const threads = threadsData?.threads || [];
   // Row-order signature for the thread rows' glide: rows re-measure only when
   // membership or order actually changes, not on every panel render.
@@ -475,7 +510,7 @@ function WorkspaceTreeRowImpl({
           onClick={handleRowClick}
           {...(isRenaming ? {} : dragHandleProps)}
         >
-          {workspaceGlyph(ws, isExpanded)}
+          {workspaceGlyph(ws, isExpanded, machine)}
           {isRenaming ? (
             <input
               data-nav-key="rename"
@@ -553,6 +588,7 @@ function WorkspaceTreeRowImpl({
                             onTogglePin={onPinWorkspace ? () => onPinWorkspace(wsId, !isPinned) : undefined}
                             onRename={rename.enabled ? () => rename.onStart(wsId, ws.name || '') : undefined}
                             onDuplicate={wsActions.openDuplicate}
+                            onMove={wsActions.openMove}
                             onDelete={wsActions.openDelete}
                           />
                         </DropdownMenuContent>
@@ -631,10 +667,11 @@ function WorkspaceTreeRowImpl({
 export function WorkspaceDragChip({ ws, expanded }: { ws: NavWorkspace; expanded: boolean }) {
   const { t } = useTranslation();
   const label = useWorkspaceLabel();
+  const machine = useRowMachine(ws);
   return (
     <div className="nav-panel nav-panel-drag-chip">
       <div className="nav-panel-row" style={{ paddingLeft: 10 }}>
-        {workspaceGlyph(ws, expanded)}
+        {workspaceGlyph(ws, expanded, machine)}
         <span className="text-sm font-medium truncate" style={{ color: 'var(--color-text-primary)' }}>
           {label(ws) || t('nav.workspaceFallback')}
         </span>

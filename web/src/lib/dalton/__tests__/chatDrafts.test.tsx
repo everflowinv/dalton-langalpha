@@ -15,6 +15,7 @@ import {
   load,
   pruneExpired,
   save,
+  settleSendResult,
 } from '../chatDrafts';
 
 const mockGetHomeWorkspace = vi.fn().mockResolvedValue({ workspace_id: 'ws-home' });
@@ -53,7 +54,7 @@ function renderComposer(
   options: { userId?: string; queryClient?: QueryClient } = {},
 ) {
   const queryClient = options.queryClient ?? createQueryClient(options.userId);
-  const onSend = props.onSend ?? vi.fn<ChatInputProps['onSend']>();
+  const onSend = props.onSend ?? vi.fn<ChatInputProps['onSend']>().mockReturnValue(true);
 
   const utils = render(
     <QueryClientProvider client={queryClient}>
@@ -196,7 +197,7 @@ describe('chatDrafts storage module & ChatInput composer drafts', () => {
   });
 
   it('clears the stored draft on successful send, when emptied by user, and does not migrate sent text from ws:<id>:new to thread:<id>', () => {
-    const onSend = vi.fn<ChatInputProps['onSend']>();
+    const onSend = vi.fn<ChatInputProps['onSend']>().mockReturnValue(true);
     const view = renderComposer({ draftKey: 'ws:ws-1:new', onSend }, { userId: 'u-1' });
 
     fireEvent.change(view.getTextarea(), {
@@ -232,7 +233,7 @@ describe('chatDrafts storage module & ChatInput composer drafts', () => {
   });
 
   it('migrates post-send continuation text from ws:<id>:new to thread:<id> and deletes the old key', () => {
-    const onSend = vi.fn<ChatInputProps['onSend']>();
+    const onSend = vi.fn<ChatInputProps['onSend']>().mockReturnValue(true);
     const view = renderComposer({ draftKey: 'ws:ws-1:new', onSend }, { userId: 'u-1' });
 
     // Send initial message to start the new conversation
@@ -312,6 +313,249 @@ describe('chatDrafts storage module & ChatInput composer drafts', () => {
     });
     expect(load('market:main', 'u-1')).toBe('question that rejects on send');
     view3.unmount();
+
+    // 4. onSend returns undefined (missing return in wrapper) -> treated as failure, draft preserved
+    const onSendUndefined = vi.fn<ChatInputProps['onSend']>().mockReturnValue(undefined);
+    const view4 = renderComposer({ draftKey: 'thread:t-undef', onSend: onSendUndefined }, { userId: 'u-1' });
+    fireEvent.change(view4.getTextarea(), {
+      target: { value: 'draft when wrapper omits return', selectionStart: 31 },
+    });
+    fireEvent.click(screen.getByLabelText('Send message'));
+
+    expect(onSendUndefined).toHaveBeenCalledTimes(1);
+    expect(view4.getTextarea().value).toBe('draft when wrapper omits return');
+    expect(load('thread:t-undef', 'u-1')).toBe('draft when wrapper omits return');
+    view4.unmount();
+  });
+
+  it('preserves thread composer draft on budget rejection (402/429) or network failure, and clears it only on successful send', async () => {
+    // Simulate ChatView's handleSendWithAttachments -> stableSendMessage -> handleSendMessage chain
+    let nextOutcome: 'budget_402' | 'rate_429' | 'network_err' | 'ok' = 'budget_402';
+    const simulatedThreadSend = vi.fn(async (): Promise<boolean> => {
+      try {
+        if (nextOutcome === 'budget_402') {
+          throw Object.assign(new Error('Monthly token budget exceeded'), {
+            status: 402,
+            errorInfo: { code: 'budget_exceeded', message: 'Monthly token budget exceeded' },
+          });
+        }
+        if (nextOutcome === 'rate_429') {
+          throw Object.assign(new Error('Rate limit exceeded'), {
+            status: 429,
+            rateLimitInfo: { code: 'rate_limited' },
+          });
+        }
+        if (nextOutcome === 'network_err') {
+          throw new TypeError('Failed to fetch');
+        }
+        return true;
+      } catch {
+        // Mirrors useChatMessages.ts catch branch returning false on 402/429/network failure
+        return false;
+      }
+    });
+
+    const handleSendWithAttachments: ChatInputProps['onSend'] = () => simulatedThreadSend();
+    const view = renderComposer(
+      { draftKey: 'thread:t-budget', onSend: handleSendWithAttachments },
+      { userId: 'u-1' },
+    );
+
+    fireEvent.change(view.getTextarea(), {
+      target: { value: 'deep dive on NVDA Q4 gross margin drivers', selectionStart: 41 },
+    });
+
+    // 1. Budget admission rejection (HTTP 402) -> draft preserved in input and localStorage
+    fireEvent.click(screen.getByLabelText('Send message'));
+    await waitFor(() => {
+      expect(view.getTextarea().value).toBe('deep dive on NVDA Q4 gross margin drivers');
+    });
+    expect(load('thread:t-budget', 'u-1')).toBe('deep dive on NVDA Q4 gross margin drivers');
+
+    // 2. Rate-limit / quota rejection (HTTP 429) -> draft still preserved
+    nextOutcome = 'rate_429';
+    fireEvent.click(screen.getByLabelText('Send message'));
+    await waitFor(() => {
+      expect(view.getTextarea().value).toBe('deep dive on NVDA Q4 gross margin drivers');
+    });
+    expect(load('thread:t-budget', 'u-1')).toBe('deep dive on NVDA Q4 gross margin drivers');
+
+    // 3. Network failure -> draft still preserved
+    nextOutcome = 'network_err';
+    fireEvent.click(screen.getByLabelText('Send message'));
+    await waitFor(() => {
+      expect(view.getTextarea().value).toBe('deep dive on NVDA Q4 gross margin drivers');
+    });
+    expect(load('thread:t-budget', 'u-1')).toBe('deep dive on NVDA Q4 gross margin drivers');
+
+    // 4. Subsequent send succeeds -> input stays cleared and stored draft is removed
+    nextOutcome = 'ok';
+    fireEvent.click(screen.getByLabelText('Send message'));
+    await waitFor(() => {
+      expect(load('thread:t-budget', 'u-1')).toBe('');
+    });
+    expect(view.getTextarea().value).toBe('');
+    view.unmount();
+  });
+
+  it('settleSendResult only treats explicit true (sync or resolved) as success', async () => {
+    const outcomes: boolean[] = [];
+    const makePending = () => ({
+      acceptSend: () => {},
+      finalizeSend: (ok: boolean) => outcomes.push(ok),
+    });
+
+    settleSendResult(makePending(), () => true);
+    settleSendResult(makePending(), () => false);
+    settleSendResult(makePending(), () => undefined);
+    settleSendResult(makePending(), () => Promise.resolve(true));
+    settleSendResult(makePending(), () => Promise.resolve(false));
+    settleSendResult(makePending(), () => Promise.resolve(undefined));
+    settleSendResult(makePending(), () => Promise.reject(new Error('boom')));
+
+    await waitFor(() => {
+      expect(outcomes).toHaveLength(7);
+    });
+    expect(outcomes).toEqual([true, false, false, true, false, false, false]);
+  });
+
+  it('a superseded send settles without touching the newer send\'s stored draft or input', async () => {
+    // A streams forever (its promise never settles by itself); B is a steer
+    // sent mid-stream on the same draft key. A completing afterwards — in
+    // success or failure — must not delete or restore over B.
+    const resolvers: Array<(v: boolean) => void> = [];
+    const onSend = vi.fn<ChatInputProps['onSend']>().mockImplementation(
+      () => new Promise<boolean>((resolve) => { resolvers.push(resolve); }),
+    );
+    const view = renderComposer({ draftKey: 'thread:supersede', onSend }, { userId: 'u-1' });
+
+    // Send A
+    fireEvent.change(view.getTextarea(), { target: { value: 'first message', selectionStart: 13 } });
+    fireEvent.click(screen.getByLabelText('Send message'));
+    expect(view.getTextarea().value).toBe('');
+    expect(load('thread:supersede', 'u-1')).toBe('first message');
+
+    // Send B while A is still streaming
+    fireEvent.change(view.getTextarea(), { target: { value: 'second steer', selectionStart: 11 } });
+    fireEvent.click(screen.getByLabelText('Send message'));
+    expect(load('thread:supersede', 'u-1')).toBe('second steer');
+
+    // A's turn completes — before the fix this deleted B's stored draft.
+    await act(async () => {
+      resolvers[0](true);
+    });
+    expect(load('thread:supersede', 'u-1')).toBe('second steer');
+
+    // B's turn completes — its own settle clears its own draft.
+    await act(async () => {
+      resolvers[1](true);
+    });
+    expect(load('thread:supersede', 'u-1')).toBe('');
+    expect(view.getTextarea().value).toBe('');
+    view.unmount();
+
+    // The failure twin: A' superseded and failed must not restore A's text
+    // into an input that B' owns, and must not overwrite B' in storage.
+    const resolvers2: Array<(v: boolean) => void> = [];
+    const onSend2 = vi.fn<ChatInputProps['onSend']>().mockImplementation(
+      () => new Promise<boolean>((resolve) => { resolvers2.push(resolve); }),
+    );
+    const view2 = renderComposer({ draftKey: 'thread:supersede2', onSend: onSend2 }, { userId: 'u-1' });
+    fireEvent.change(view2.getTextarea(), { target: { value: 'first again', selectionStart: 11 } });
+    fireEvent.click(screen.getByLabelText('Send message'));
+    fireEvent.change(view2.getTextarea(), { target: { value: 'steer again', selectionStart: 10 } });
+    fireEvent.click(screen.getByLabelText('Send message'));
+    await act(async () => {
+      resolvers2[0](false);
+    });
+    expect(view2.getTextarea().value).toBe('');
+    expect(load('thread:supersede2', 'u-1')).toBe('steer again');
+    view2.unmount();
+  });
+
+  it('an older send stays superseded after the newer send on its key has already settled', async () => {
+    const resolvers: Array<(v: boolean) => void> = [];
+    const onSend = vi.fn<ChatInputProps['onSend']>().mockImplementation(
+      () => new Promise<boolean>((resolve) => { resolvers.push(resolve); }),
+    );
+    const view = renderComposer({ draftKey: 'thread:gen', onSend }, { userId: 'u-1' });
+    fireEvent.change(view.getTextarea(), { target: { value: 'older A', selectionStart: 7 } });
+    fireEvent.click(screen.getByLabelText('Send message'));
+    fireEvent.change(view.getTextarea(), { target: { value: 'newer B', selectionStart: 7 } });
+    fireEvent.click(screen.getByLabelText('Send message'));
+
+    // B fails first: its draft comes back.
+    await act(async () => {
+      resolvers[1](false);
+    });
+    expect(load('thread:gen', 'u-1')).toBe('newer B');
+
+    // A then succeeds: it was superseded by B, so B's restored draft stays.
+    await act(async () => {
+      resolvers[0](true);
+    });
+    expect(load('thread:gen', 'u-1')).toBe('newer B');
+    expect(view.getTextarea().value).toBe('newer B');
+    view.unmount();
+  });
+
+  it('a send superseded only by a send on another key still clears its own key', async () => {
+    // The market panel's key moves from its workspace form to the new thread's
+    // once the thread exists; a send on the new key must not strand the first.
+    const resolvers: Array<(v: boolean) => void> = [];
+    const onSend = vi.fn<ChatInputProps['onSend']>().mockImplementation(
+      () => new Promise<boolean>((resolve) => { resolvers.push(resolve); }),
+    );
+    const view = renderComposer({ draftKey: 'market:panel:ws-1:NVDA', onSend }, { userId: 'u-1' });
+    fireEvent.change(view.getTextarea(), { target: { value: 'first on old key', selectionStart: 16 } });
+    fireEvent.click(screen.getByLabelText('Send message'));
+    expect(load('market:panel:ws-1:NVDA', 'u-1')).toBe('first on old key');
+
+    view.rerenderComposer({ draftKey: 'market:panel:th-9', onSend });
+    fireEvent.change(view.getTextarea(), { target: { value: 'second on new key', selectionStart: 17 } });
+    fireEvent.click(screen.getByLabelText('Send message'));
+
+    await act(async () => {
+      resolvers[0](true);
+    });
+    expect(load('market:panel:ws-1:NVDA', 'u-1')).toBe('');
+    expect(load('market:panel:th-9', 'u-1')).toBe('second on new key');
+    view.unmount();
+  });
+
+  it('acceptSend settles the draft as sent before the stream ends, and a later failure does not restore it', async () => {
+    // The wiring useChatMessages provides: onAccepted fires when the server
+    // takes the send (run_id metadata), long before the stream promise
+    // resolves. The draft must be gone by then, so a reload mid-stream never
+    // restores a sent message; the eventual return value is only a fallback.
+    let resolveStream!: (v: boolean) => void;
+    const seenAccepted: Array<boolean | undefined> = [];
+    const onSend = vi.fn<ChatInputProps['onSend']>().mockImplementation(
+      (_m, _a, _s, opts) => {
+        seenAccepted.push(typeof opts.onAccepted === 'function');
+        opts.onAccepted?.();
+        return new Promise<boolean>((resolve) => { resolveStream = resolve; });
+      },
+    );
+    const view = renderComposer({ draftKey: 'thread:accept', onSend }, { userId: 'u-1' });
+
+    fireEvent.change(view.getTextarea(), { target: { value: 'long running analysis', selectionStart: 21 } });
+    fireEvent.click(screen.getByLabelText('Send message'));
+
+    // The stream is still running (promise pending), but acceptance already
+    // settled the send: storage cleared, input cleared.
+    expect(seenAccepted).toEqual([true]);
+    expect(load('thread:accept', 'u-1')).toBe('');
+    expect(view.getTextarea().value).toBe('');
+
+    // The stream later reports failure (e.g. a post-acceptance transport
+    // error surfaced as false): acceptance already settled — nothing comes back.
+    await act(async () => {
+      resolveStream(false);
+    });
+    expect(load('thread:accept', 'u-1')).toBe('');
+    expect(view.getTextarea().value).toBe('');
+    view.unmount();
   });
 
   it('preserves follow-up text typed while awaiting a send that later fails across unmount and remount', async () => {

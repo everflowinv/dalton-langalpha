@@ -20,7 +20,6 @@ from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.graph import START, StateGraph
 
-import src.server.utils.checkpointer  # noqa: F401  (installs the walk guard)
 from ptc_agent.agent.state import DeltaAgentState
 from scripts.utils import backfill_turn_slices as backfill
 from src.server.services.history import slices

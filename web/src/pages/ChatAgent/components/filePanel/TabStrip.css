@@ -11,13 +11,27 @@
   display: flex;
   align-items: center;
   gap: 2px;
-  flex: 1;
+  flex: 0 1 auto;
   min-width: 0;
   overflow-x: auto;
   scrollbar-width: none;
 }
 .file-panel-tabs::-webkit-scrollbar {
   display: none;
+}
+/* An end with tabs past it fades out rather than cutting a pill in half.
+   32px is TAB_ROW_FADE in TabStrip.tsx, which keeps the active tab clear of it. */
+.file-panel-tabs[data-more-end] {
+  -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 32px), transparent);
+  mask-image: linear-gradient(to right, #000 calc(100% - 32px), transparent);
+}
+.file-panel-tabs[data-more-start] {
+  -webkit-mask-image: linear-gradient(to left, #000 calc(100% - 32px), transparent);
+  mask-image: linear-gradient(to left, #000 calc(100% - 32px), transparent);
+}
+.file-panel-tabs[data-more-start][data-more-end] {
+  -webkit-mask-image: linear-gradient(to right, transparent, #000 32px, #000 calc(100% - 32px), transparent);
+  mask-image: linear-gradient(to right, transparent, #000 32px, #000 calc(100% - 32px), transparent);
 }
 .file-panel-tab {
   display: inline-flex;
@@ -34,7 +48,7 @@
   font-size: 0.75rem;
   cursor: pointer;
   user-select: none;
-  transition: background-color 0.15s, color 0.15s;
+  transition: background-color var(--motion-quick) var(--ease-out), color var(--motion-quick) var(--ease-out);
 }
 .file-panel-tab:hover {
   background-color: var(--color-bg-hover);
@@ -115,7 +129,7 @@
   color: var(--color-text-tertiary);
   cursor: pointer;
   opacity: 0;
-  transition: opacity 0.15s, background-color 0.15s;
+  transition: opacity var(--motion-quick) var(--ease-out), background-color var(--motion-quick) var(--ease-out);
 }
 /* The X is a hover affordance, not a badge: the active pill stays as quiet as
    the rest until the pointer is on it. Its room is reserved either way, so
@@ -134,6 +148,7 @@
   align-items: center;
   gap: 2px;
   flex-shrink: 0;
+  margin-left: auto;
 }
 
 /* ====== Mobile responsive ====== */

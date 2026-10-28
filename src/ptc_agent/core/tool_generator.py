@@ -62,8 +62,9 @@ _WRAPPER_CODEGEN_MAJOR = "5"
 # trace small (per call still capped at RESULT_BODY_MAX_BYTES; this bounds
 # their sum to ~4 MiB). It is NOT a host-memory security bound: MCP_TRACE_FILE
 # is visible to agent code, which can append to the JSONL directly and bypass
-# this counter. The hard host-side bound on what _collect_mcp_trace reads lives
-# in ptc_sandbox (it sizes the file and skips one far past any legit trace).
+# this counter. The hard host-side bound on what a job's trace read takes
+# lives in sandbox/jobs/protocol.py (``_TRACE_READ_MAX``: the read sizes the
+# file and skips one far past any legit trace).
 RESULT_BODY_TRACE_BUDGET_BYTES = 4 * 1024 * 1024
 
 
@@ -75,6 +76,27 @@ def _safe_func_name(name: str) -> str:
     in :func:`mcp_sanitize.sanitize_tool_set`).
     """
     return sanitize_tool_name(name) or "_invalid_tool"
+
+
+def _redact_managed_tokens(values: list[str]) -> list[str]:
+    """DALTON-HOOK(bridge-admin-token): replace each management token's value
+    (``DALTON_BRIDGE_ADMIN_TOKEN`` / ``INTERNAL_SERVICE_TOKEN``) with ``***``.
+
+    The plugins loader expands ``${...}`` refs into plaintext on the server
+    objects this module reads, so anything logged off them — before the
+    sandbox-bound output is sanitized — must be redacted here.
+    """
+    from src.dalton.settings import managed_secret_token_values
+
+    tokens = managed_secret_token_values()
+    if not tokens:
+        return values
+    out = []
+    for v in values:
+        for token in tokens:
+            v = v.replace(token, "***")
+        out.append(v)
+    return out
 
 
 @dataclass(frozen=True)
@@ -700,6 +722,10 @@ except ImportError:
             if untrusted:
                 entry["headers"] = dict(server.headers or {})
                 entry["discovery_uses_secrets"] = discovery_should_use_secrets(server)
+            elif server.auth:
+                # A built-in's headers are host credentials for discovery and
+                # never ship; the client brings the sandbox's own token instead.
+                entry["auth"] = server.auth
             if server.call_timeout_s:  # DALTON-HOOK(mcp-call-timeout)
                 entry["call_timeout_s"] = float(server.call_timeout_s)
             return entry
@@ -716,11 +742,15 @@ except ImportError:
         ):
             filename = Path(args[2]).name
             args = ["run", "python", f"{layout.mcp_servers}/{filename}"]
+            # DALTON-HOOK(bridge-admin-token): the plugins loader expands ${...}
+            # refs into plaintext, so raw server.args would put a management
+            # token in the debug log before the entry is ever sanitized.
+            logged_args = _redact_managed_tokens([str(a) for a in (server.args or ())])
             logger.debug(
                 "Transformed MCP server command for sandbox",
                 server=server.name,
-                original_args=server.args,
-                sandbox_args=args,
+                original_args=logged_args,
+                sandbox_args=_redact_managed_tokens(list(args)),
             )
         entry = {
             "transport": "stdio",
@@ -853,7 +883,8 @@ _EMISSION_PROBE_TOOL_2 = MCPToolInfo(
 )
 
 # Third probe axis: the config/epilogue emission. One server per config
-# branch: builtin uv-stdio (path rewrite + env_keys), untrusted user http
+# branch: builtin uv-stdio (path rewrite + env_keys), builtin http on the
+# sandbox's data token (auth kept, headers dropped), untrusted user http
 # (headers + secret-mode hint), OAuth relay-bound. Hash-relevant only; never
 # uploaded.
 _EMISSION_PROBE_SERVERS = [
@@ -863,6 +894,13 @@ _EMISSION_PROBE_SERVERS = [
         command="uv",
         args=["run", "python", "mcp_servers/probe_server.py"],
         env={"PROBE_API_KEY": "${PROBE_API_KEY}"},
+    ),
+    MCPServerConfig(
+        name="probe_data",
+        transport="http",
+        url="https://probe.example/data",
+        auth="data_token",
+        headers={"X-Probe-Discovery": "host-only"},
     ),
     MCPServerConfig(
         name="probe_user",

@@ -494,3 +494,70 @@ async def test_patch_model_empty_name_is_422():
 
     assert resp.status_code == 422
     update.assert_not_awaited()
+
+
+HAND_OFF = "src.server.handlers.thread_maintenance.hand_off_on_switch"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("before", "after"),
+    [("m-a", "m-b"), (None, "m-b"), ("m-a", None)],
+    ids=["to-another", "off-the-default", "to-the-default"],
+)
+@pytest.mark.parametrize("handed_off", [True, False])
+async def test_patch_model_says_whether_the_summary_is_handed_off(before, after, handed_off):
+    """A switch asks whether the model it leaves writes out a summary only its
+    provider can read, naming that model (None for the account default)."""
+    app = _title_app()
+    with (
+        patch(f"{AUTH_MOD}.require_thread_owner", new=AsyncMock()),
+        patch(f"{THREADS_MOD}.require_selectable_model", new=AsyncMock()),
+        patch(
+            f"{THREADS_MOD}.get_thread_auth_meta",
+            new=AsyncMock(return_value={"llm_model": before, "workspace_id": "ws-1"}),
+        ),
+        patch(
+            f"{THREADS_MOD}.update_thread_fields",
+            new=AsyncMock(return_value=_thread_row(llm_model=after)),
+        ) as update,
+        patch(HAND_OFF, new=AsyncMock(return_value=handed_off)) as hand_off,
+    ):
+        resp = await _patch(app, {"llm_model": after})
+
+    assert resp.status_code == 200
+    assert resp.json()["summary_handoff"] is handed_off
+    update.assert_awaited_once_with("t-1", llm_model=after)
+    hand_off.assert_awaited_once_with("t-1", USER, before)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("body", "row"),
+    [
+        ({"llm_model": "m-a"}, {"llm_model": "m-a"}),
+        ({"title": "Renamed"}, {"title": "Renamed"}),
+    ],
+    ids=["same-model", "another-field"],
+)
+async def test_patch_without_a_switch_asks_for_no_hand_off(body, row):
+    app = _title_app()
+    with (
+        patch(f"{AUTH_MOD}.require_thread_owner", new=AsyncMock()),
+        patch(f"{THREADS_MOD}.require_selectable_model", new=AsyncMock()),
+        patch(
+            f"{THREADS_MOD}.get_thread_auth_meta",
+            new=AsyncMock(return_value={"llm_model": "m-a", "workspace_id": "ws-1"}),
+        ),
+        patch(
+            f"{THREADS_MOD}.update_thread_fields",
+            new=AsyncMock(return_value=_thread_row(**row)),
+        ),
+        patch(f"{THREADS_MOD}.publish_thread_title", new=AsyncMock()),
+        patch(HAND_OFF, new=AsyncMock(return_value=True)) as hand_off,
+    ):
+        resp = await _patch(app, body)
+
+    assert resp.status_code == 200
+    assert resp.json()["summary_handoff"] is None
+    hand_off.assert_not_awaited()

@@ -23,7 +23,6 @@ from ptc_agent.agent.main_state import MainAgentState
 # DALTON-HOOK(dalton-patch-tool-calls): dangling calls are reported as possibly run, not cancelled.
 from src.dalton.middleware.patch_tool_calls import DaltonPatchToolCallsMiddleware
 # DALTON-HOOK(attachment-native-cap): cap cross-turn inline attachment payload per model request.
-from src.dalton.middleware.attachments import DaltonAttachmentBudgetMiddleware
 from langchain_anthropic.middleware import AnthropicPromptCachingMiddleware
 
 from ptc_agent.agent.middleware import (
@@ -57,6 +56,7 @@ from ptc_agent.agent.middleware.background_subagent import (
     SubagentEventCaptureMiddleware,
     SubagentToolResultCaptureMiddleware,
 )
+from ptc_agent.agent.transcript.classify import MARKET_ALERT_SENDER, WAKEUP_SENDER
 from ptc_agent.agent.middleware.compaction.notes import (
     NotesDueMiddleware,
     NotesOffMiddleware,
@@ -75,6 +75,12 @@ from ptc_agent.agent.middleware.subagent_switch import (
     SubagentSwitchMiddleware,
     SubagentSwitchReader,
     subagents_window_carry,
+)
+from ptc_agent.agent.middleware.wakeups import (
+    CancelNotices,
+    WakeupCancelNoticeMiddleware,
+    WakeupQuietGuardMiddleware,
+    wakeup_cancels_window_carry,
 )
 from ptc_agent.agent.context_stack import build_context_middleware
 from ptc_agent.agent.roles import AgentRole
@@ -95,6 +101,8 @@ from ptc_agent.agent.middleware.runtime_context import (
     TurnContext,
     TurnContextMiddleware,
 )
+from ptc_agent.agent.middleware.runtime_context.epoch import Workspace
+from ptc_agent.agent.middleware.runtime_context.profile import ProfileSwitches
 from ptc_agent.agent.middleware.background_subagent.registry import (
     BackgroundTaskRegistry,
 )
@@ -113,7 +121,6 @@ from ptc_agent.agent.prompts import (
 )
 from ptc_agent.agent.subagents.assembly import compile_subagents, task_middleware
 from ptc_agent.agent.tools import (
-    create_bash_output_tool,
     create_execute_bash_tool,
     create_execute_code_tool,
     create_filesystem_tools,
@@ -138,10 +145,13 @@ from src.tools.market_data.tool import (
 from src.tools.market_watch import watch_market
 from src.tools.chart_annotation import CHART_ANNOTATION_TOOLS
 from src.tools.messaging import build_messaging_tools, messaging_enabled
+from src.tools.wakeups.tool import build_schedule_wakeup_tool
+from src.tools.thread_status.tool import build_thread_status_tool
 from ptc_agent.config import AgentConfig
 from ptc_agent.core.mcp_registry import MCPRegistry
 from ptc_agent.core.sandbox import PTCSandbox
 from ptc_agent.core.sandbox.livefs_mount import CallContext
+from ptc_agent.agent.tools.command_handoff import HandOff
 
 from ptc_agent.agent.turn import build_model_resilience_middleware, turn_model
 
@@ -184,6 +194,7 @@ class PTCAgent:
         workspace: WorkspaceLayout | None = None,
         legacy_layout: bool = False,
         files_mounted: bool = False,
+        history_files: bool = False,
         chart_annotation_enabled: bool = True,
         role: AgentRole = "analyst",
         channels_enabled: bool = False,
@@ -196,7 +207,9 @@ class PTCAgent:
         lives in one workspace, so a thread still reuses its own prefix.
         ``channels_enabled`` adds the chat-app section; it follows the
         deployment's messaging service and the turn having a user, neither of
-        which moves between a thread's turns.
+        which moves between a thread's turns. ``history_files`` says the file
+        tools read past threads with no mount, which follows the computer's
+        kind, so it does not move between them either.
         """
         loader = get_loader()
         return loader.get_system_prompt(
@@ -220,6 +233,7 @@ class PTCAgent:
             scratchpad_enabled=scratchpad_enabled,
             direct_tool_summary=direct_tool_summary,
             files_mounted=files_mounted,
+            history_files=history_files,
             chart_annotation_enabled=chart_annotation_enabled,
             role=role,
             channels_enabled=channels_enabled,
@@ -244,8 +258,7 @@ class PTCAgent:
         namespace_owner: Any | None = None,
         user_profile: dict | None = None,
         thread_id: str | None = None,
-        workspace_name: str | None = None,
-        workspace_description: str | None = None,
+        workspace: Workspace | None = None,
         on_agent_md_write: Any | None = None,
         store: Any | None = None,
         on_signed_url: Any | None = None,
@@ -265,6 +278,10 @@ class PTCAgent:
         harness_blocks: Mapping[str, str | None] | None = None,
         subagent_switch: SubagentSwitchReader | None = None,
         window_coverage: WindowCoverage | None = None,
+        cancel_notices: CancelNotices | None = None,
+        # DALTON-HOOK(colleague-dispatch): workspace owner identity and tail-turn tool trimming
+        workspace_owner_id: str | None = None,
+        tail_turn_no_new_work: bool = False,
     ) -> Any:
         """Create a deepagent with PTC pattern capabilities.
 
@@ -310,6 +327,9 @@ class PTCAgent:
                 runs the main agent's window would trim from its checkpoint
                 (see ``compaction.window``). None for a build with no server
                 behind it, which never trims.
+            cancel_notices: The user's cancels of wakeups on this thread,
+                read before every call. None for a build with no thread row
+                to read, which tells the agent of none.
 
         Returns:
             Configured BackgroundSubagentOrchestrator wrapping the deepagent.
@@ -323,6 +343,13 @@ class PTCAgent:
 
         # Compute short thread ID for thread-scoped storage
         short_thread_id = thread_id[:8] if thread_id else ""
+        # A wakeup belongs to a thread, so a build outside one has none.
+        # DALTON-HOOK(colleague-dispatch): tail turns after access revocation do not bind schedule_wakeup
+        wakeups_on = (
+            bool(thread_id)
+            and self.config.feature_enabled("wakeups")
+            and not tail_turn_no_new_work
+        )
 
         preview_owner = project.workspace_id if project else None
         backend = SandboxBackend(
@@ -366,21 +393,52 @@ class PTCAgent:
             thread_id=thread_id,
             timezone=turn_context.tool_timezone if turn_context else None,
         )
+        # Past threads the file tools read in process, on a machine no file
+        # mount ever serves; where one may, its links show them instead.
+        history = None if sandbox.mounts_livefs else sandbox.history
+        history_routes = history.routes(backend) if history is not None else []
         filesystem_backend, baseline_store_sources = build_filesystem_backend(
             backend=backend,
             gates=gates,
             store=store,
             user_id=user_id,
             workspace_id=workspace_id_for_memory,
+            # DALTON-HOOK(colleague-dispatch): store routes belong to workspace owner
+            **(
+                {"workspace_owner_id": workspace_owner_id}
+                if workspace_owner_id is not None
+                else {}
+            ),
             layout=workspace_layout,
             call=call_context,
+            history_routes=history_routes,
         )
 
         # The folders only the file tools reach, which Bash and code refuse.
         file_tools_only = (SandboxLayout.CHANNELS_DIR,) if gates.channels else ()
 
+        # The main agent's Bash and ExecuteCode hand a command still running at
+        # their wait to the thread, which needs a thread, a user and a
+        # workspace to record it under; without them a call waits until its
+        # command ends, as a subagent's does.
+        # DALTON-HOOK(colleague-dispatch): tail turns after access revocation disable background command hand-off
+        hand_off = (
+            HandOff(
+                thread_id=thread_id,
+                user_id=str(user_id),
+                workspace_id=workspace_id_for_memory,
+                wakeups=wakeups_on,
+            )
+            if thread_id
+            and user_id
+            and workspace_id_for_memory
+            and not tail_turn_no_new_work
+            else None
+        )
+
         # Create the execute_code tool for MCP invocation. The builders are
-        # kept for a subagent limited to some servers, which gets its own.
+        # kept for the subagents, which get their own: theirs wait until a run
+        # ends, and one limited to some servers gets a copy of its own.
         code_tool = partial(
             create_execute_code_tool,
             backend,
@@ -390,18 +448,23 @@ class PTCAgent:
             call_context=call_context,
             file_tools_only=file_tools_only,
         )
-        execute_code_tool = code_tool()
+        execute_code_tool = code_tool(hand_off=hand_off)
 
         # Create the Bash tool for shell command execution
         shell_tool = partial(
             create_execute_bash_tool,
             backend,
             thread_id=short_thread_id,
+            session=session,
             call_context=call_context,
             file_tools_only=file_tools_only,
         )
-        bash_tool = shell_tool()
-        bash_output_tool = create_bash_output_tool(backend, call_context=call_context)
+        bash_tool = shell_tool(hand_off=hand_off)
+        # A subagent already runs in the background, so its calls wait for
+        # their commands instead of handing them off: nothing reports back to
+        # a subagent that may have finished.
+        sub_code_tool = code_tool()
+        sub_bash_tool = shell_tool()
 
         # Create the preview URL tool for sandbox service previews
         workspace_id = project.workspace_id if project else ""
@@ -410,8 +473,10 @@ class PTCAgent:
         # Create the show widget tool for inline HTML visualizations
         show_widget_tool = create_show_widget_tool(backend)
 
-        # Start with base tools
-        tools: list[Any] = [execute_code_tool, bash_tool, bash_output_tool, preview_url_tool, show_widget_tool]
+        # The tools the main agent and its subagents share. Each binds its own
+        # ExecuteCode and Bash ahead of them: the main agent's hand off, a
+        # subagent's wait (sub_code_tool, sub_bash_tool).
+        shared_tools: list[Any] = [preview_url_tool, show_widget_tool]
 
         # Opt-in while the tool is on its way out: a default build binds no
         # todo tool, so neither the main agent nor a subagent that lists the
@@ -419,7 +484,7 @@ class PTCAgent:
         todo_tools: list[Any] = (
             [TodoWrite] if self.config.feature_enabled("todo_write") else []
         )
-        tools.extend(todo_tools)
+        shared_tools.extend(todo_tools)
 
         # Create custom filesystem tools (override deepagents middleware tools).
         # `filesystem_backend` is the composite when a store is wired; otherwise
@@ -439,7 +504,7 @@ class PTCAgent:
             edit_file,  # overrides middleware edit_file
             *search_tools,
         ]
-        tools.extend(filesystem_tools)
+        shared_tools.extend(filesystem_tools)
         # A subagent's own Read, Write and Edit, over a view whose memory
         # refuses writes. Glob and Grep never write, so they are shared.
         subagent_files = subagent_backend(filesystem_backend, workspace_layout)
@@ -459,15 +524,15 @@ class PTCAgent:
         web_search_tool = search_tool(
             provider=self.config.search_api, depth=self.config.search_depth
         )
-        tools.append(web_search_tool)
-        tools.append(web_fetch_tool)
+        shared_tools.append(web_search_tool)
+        shared_tools.append(web_fetch_tool)
         # DALTON-HOOK(x-search-openclaw)
         x_search_tools: list[Any] = []
         if str(self.config.search_api or "").strip().lower() == "openclaw":
             from src.dalton.web_search.x_search import build_x_search_tool
 
             x_search_tool = build_x_search_tool()
-            tools.append(x_search_tool)
+            shared_tools.append(x_search_tool)
             x_search_tools.append(x_search_tool)
 
         # Site-crawl tools (PTC-only): experimental opt-in feature, further
@@ -476,7 +541,7 @@ class PTCAgent:
         crawl_tools: list[Any] = []
         if self.config.feature_enabled("site_crawl"):
             crawl_tools = create_crawl_tools(filesystem_backend)
-            tools.extend(crawl_tools)
+            shared_tools.extend(crawl_tools)
 
         finance_tools = [
             get_sec_filing,  # SEC filing extraction (10-K, 10-Q, 8-K)
@@ -489,7 +554,7 @@ class PTCAgent:
         ]
         if self.config.feature_enabled("market_watch"):
             finance_tools.append(watch_market)  # Market watch start/stop (live price injection)
-        tools.extend(finance_tools)
+        shared_tools.extend(finance_tools)
 
         # --- Build shared middleware (for both main agent and subagents) ---
         shared_middleware: list[Any] = []
@@ -531,14 +596,18 @@ class PTCAgent:
         # Shared placement gives subagents provenance coverage too. The leak
         # detector's redactor scrubs secrets from snippets the content-only scan
         # never sees (provenance fingerprints the raw result/artifact).
-        shared_middleware.append(ProvenanceMiddleware(redactor=leak_detection.redact))
+        shared_middleware.append(
+            ProvenanceMiddleware(
+                redactor=leak_detection.redact, sandbox_root=sandbox.working_dir
+            )
+        )
         if todo_tools:
             shared_middleware.append(TodoWriteMiddleware())
 
+        # The computer's own skills folder: the sync delivers to it under the
+        # live root, which a root the deployment default does not name moves.
         skill_sources = (
-            [f"{self.config.skills.sandbox_skills_base}/"]
-            if self.config.skills.enabled
-            else []
+            [f"{sandbox.layout.skills}/"] if self.config.skills.enabled else []
         )
 
         known_skills: dict[str, Any] = {}
@@ -583,9 +652,7 @@ class PTCAgent:
             backend=backend,
             sources=skill_sources,
             known_skills=known_skills,
-            skill_dirs=[
-                d for d, _ in self.config.skills.local_skill_dirs_with_sandbox()
-            ],
+            skill_dirs=self.config.skills.local_skill_dirs(),
             disabled_skills=self.config.disabled_skills,
         )
         skill_loader_middleware = skills_middleware(
@@ -614,7 +681,13 @@ class PTCAgent:
             )
         )
 
-        # Right after steering, so a steer and a flip sent together reach the
+        # The user's cancels of wakeups the agent set, after the steers that
+        # reached this call. Whether or not wakeups are on, so the row saying
+        # they were turned off arrives.
+        if cancel_notices is not None:
+            main_only_middleware.append(WakeupCancelNoticeMiddleware(cancel_notices))
+
+        # After steering, so a steer and a flip sent together reach the
         # model in that order, with the operator-role row last. Its tool hook
         # wraps BackgroundSubagentMiddleware (the one Task interceptor) and the
         # tool node (RunWorkflow), so a refused launch starts nothing; the
@@ -630,15 +703,16 @@ class PTCAgent:
 
         # Recursion gate: no subagents compiled, none advertised in the
         # prompt ("No sub-agents configured."), no Task tool below.
+        # DALTON-HOOK(colleague-dispatch): tail turns after access revocation withhold Task/RunWorkflow while keeping TaskOutput
         subagents: list[dict[str, Any]] = []
-        if not disable_subagents:
+        if not disable_subagents and not tail_turn_no_new_work:
             subagents = compile_subagents(
                 self.config,
                 role,
                 sandbox=sandbox,
                 mcp_registry=mcp_registry,
-                execute_code=execute_code_tool,
-                bash=bash_tool,
+                execute_code=sub_code_tool,
+                bash=sub_bash_tool,
                 filesystem=subagent_filesystem_tools,
                 web=[web_search_tool, web_fetch_tool, *x_search_tools],  # DALTON-HOOK(x-search-openclaw)
                 finance=finance_tools,
@@ -689,18 +763,22 @@ class PTCAgent:
         background_middleware = BackgroundSubagentMiddleware(
             timeout=background_timeout,
             subagent_types=frozenset(spec["name"] for spec in subagents),
-            enabled=not disable_subagents,
+            # DALTON-HOOK(colleague-dispatch): disable background subagent spawning on tail turns
+            enabled=not disable_subagents and not tail_turn_no_new_work,
             registry=_bg_registry,
             checkpointer=checkpointer,
             namespace_owner=namespace_owner,
+            subagent_models=self.config.subagent_models,
         )
         main_only_middleware.append(background_middleware)
         if not disable_subagents:
-            tools.extend(background_middleware.tools)
+            shared_tools.extend(background_middleware.tools)
 
         ask_user_middleware = AskUserMiddleware()
         main_only_middleware.append(ask_user_middleware)
-        tools.extend(ask_user_middleware.tools)
+        shared_tools.extend(ask_user_middleware.tools)
+
+        tools: list[Any] = [execute_code_tool, bash_tool, *shared_tools]
 
         if role == "chief_of_staff":
             from src.tools.secretary.approvals import StandingApprovalMiddleware
@@ -745,7 +823,12 @@ class PTCAgent:
         # Read once: the baseline freezes this value per epoch, and the
         # prompt is sent with the frozen one (FrozenPromptMiddleware).
         files_mounted = sandbox.livefs is not None
-        system_prompt = render_prompt(files_mounted=files_mounted)
+        # By the machine's kind, not by whether its past threads loaded, so
+        # the prompt cannot flip between a thread's turns.
+        history_files = not sandbox.mounts_livefs
+        system_prompt = render_prompt(
+            files_mounted=files_mounted, history_files=history_files
+        )
 
         logger.debug(
             "Creating agent with custom middleware stack",
@@ -755,28 +838,6 @@ class PTCAgent:
         )
 
         # --- Build final middleware stacks ---
-        compaction = CompactionMiddleware.for_agent(
-            self.config, backend=backend, workspace_id=workspace_id_for_memory
-        )
-        # The main agent is asked to update its scratchpad notes before each
-        # summary, and its summaries name them; a subagent's do not. Without
-        # the scratchpad, rows asked while it was on stay out of the calls.
-        main_compaction, notes_rows = compaction, None
-        if scratchpad is None:
-            notes_rows = NotesOffMiddleware()
-        elif compaction is not None:
-            main_compaction = compaction.with_scratchpad_notes(scratchpad.notes_dir)
-            notes_rows = NotesDueMiddleware(scratchpad, main_compaction)
-        # Each carry writes a field ``MainAgentState`` declares, so a build
-        # without the carry's reader (a notification turn has no switch)
-        # trims too.
-        if main_compaction and window_coverage and thread_id:
-            main_compaction = main_compaction.with_window(
-                window_coverage, [notes_window_carry(thread_id), subagents_window_carry]
-            )
-
-        model_resilience = [build_model_resilience_middleware(self.config, turn)]
-
         # The strip goes inside model_resilience so it judges the post-fallback
         # model: a vision primary falling back to a text-only candidate would
         # otherwise replay image/PDF blocks and earn the 400 the fallback exists
@@ -791,10 +852,41 @@ class PTCAgent:
         # a config with no llm gets a strip that removes everything rather than
         # no strip at all, which is the safe direction: without it the read half
         # would keep attaching blocks that nothing removes.
-        multimodal_strip = MultimodalStripMiddleware(
-            model_name=self.config.llm.name if self.config.llm else None,
-            custom_modalities=self.config.input_modalities,
+        multimodal_strip = MultimodalStripMiddleware.for_config(self.config)
+        # Compaction counts only the attachments the strip leaves a model, as
+        # it judges them, and a PDF page at what that model's vendor charges,
+        # so a target that reads none, or pays little, is not summarized early.
+        compaction = CompactionMiddleware.for_agent(
+            self.config,
+            backend=backend,
+            workspace_id=workspace_id_for_memory,
+            receives=multimodal_strip.receives,
+            page_tokens=multimodal_strip.pdf_page_tokens,
         )
+        # The main agent is asked to update its scratchpad notes before each
+        # summary, and its summaries name them; a subagent's do not. Without
+        # the scratchpad, rows asked while it was on stay out of the calls.
+        main_compaction, notes_rows = compaction, None
+        if scratchpad is None:
+            notes_rows = NotesOffMiddleware()
+        elif compaction is not None:
+            main_compaction = compaction.with_scratchpad_notes(scratchpad.notes_dir)
+            notes_rows = NotesDueMiddleware(scratchpad, main_compaction, turn.client)
+        # Each carry writes a field ``MainAgentState`` declares, so a build
+        # without the carry's reader (a notification turn has no switch)
+        # trims too.
+        if main_compaction and window_coverage and thread_id:
+            main_compaction = main_compaction.with_window(
+                window_coverage,
+                [
+                    notes_window_carry(thread_id),
+                    subagents_window_carry,
+                    wakeup_cancels_window_carry,
+                ],
+            )
+
+        model_resilience = [build_model_resilience_middleware(self.config, turn)]
+
         multimodal_read = MultimodalMiddleware(sandbox=sandbox)
 
         # Placed before (outer to) model_resilience so sandbox images are
@@ -846,7 +938,6 @@ class PTCAgent:
                 OpenAIPromptCachingMiddleware(),
                 EmptyToolCallRetryMiddleware(),
                 DaltonPatchToolCallsMiddleware(),  # DALTON-HOOK(dalton-patch-tool-calls)
-                DaltonAttachmentBudgetMiddleware(),  # DALTON-HOOK(attachment-native-cap)
                 # Innermost: carries the turn's rows in the shape this model
                 # accepts and pins the tail breakpoint on the last block.
                 TailEnvelopeMiddleware(
@@ -878,11 +969,10 @@ class PTCAgent:
             turn_context=turn_context,
             user_profile=user_profile,
             session=session,
-            workspace_name=workspace_name,
-            workspace_description=workspace_description,
+            workspace=workspace,
             sources=baseline_store_sources,
             files_mounted=files_mounted,
-            channels_enabled=gates.channels,
+            switches=ProfileSwitches(channels=gates.channels, wakeups=wakeups_on),
             blocks={
                 "mcp_servers": lambda _state: tool_summary,
                 "skills": lambda state: skill_loader_middleware.build_manifest(state)
@@ -910,16 +1000,17 @@ class PTCAgent:
         # provider of the Task tool, so skipping it (plus the TaskOutput extend
         # above) makes a notification turn structurally unable to spawn
         # subagents, and RunWorkflow drops with it below.
+        # DALTON-HOOK(colleague-dispatch): withhold Task/RunWorkflow on tail turns while keeping TaskOutput
         subagent_task_middleware = (
             task_middleware(
                 subagents,
                 model=turn.client,
-                tools=tools,
+                tools=[sub_code_tool, sub_bash_tool, *shared_tools],
                 middleware=subagent_middleware,
                 registry=background_middleware.registry,
                 checkpointer=checkpointer,
             )
-            if not disable_subagents
+            if not disable_subagents and not tail_turn_no_new_work
             else None
         )
 
@@ -962,6 +1053,24 @@ class PTCAgent:
         # subagent snapshot: a subagent reports to its parent, never to a person.
         tools.extend(build_messaging_tools(role))
 
+        # The agent's own follow-ups on this thread, main agent only and
+        # added after the subagent snapshot: a wakeup comes back to the
+        # thread, and a subagent has no thread of its own to come back to.
+        if wakeups_on:
+            tools.append(build_schedule_wakeup_tool())
+
+        # What will report back to the thread, main agent only for the same
+        # reason: a subagent's own commands wait, and its result covers them.
+        if thread_id:
+            tools.append(
+                build_thread_status_tool(
+                    thread_id=thread_id,
+                    user_id=str(user_id) if user_id else None,
+                    analysts=role == "chief_of_staff",
+                    registry=_bg_registry,
+                )
+            )
+
         # Main agent middleware (includes SubAgentMiddleware + main_only)
         # Ordering matters for prompt caching:
         #   - AnthropicPromptCachingMiddleware (cache_control) and
@@ -997,7 +1106,9 @@ class PTCAgent:
                 # below appends to.
                 FrozenPromptMiddleware(
                     files_mounted=files_mounted,
-                    render=lambda mounted: render_prompt(files_mounted=mounted),
+                    render=lambda mounted: render_prompt(
+                        files_mounted=mounted, history_files=history_files
+                    ),
                 ),
                 # Outside every tool wrapper below, so a call refused in the
                 # last minutes of the turn reaches none of them: not the Task
@@ -1008,6 +1119,10 @@ class PTCAgent:
                     backend=backend, eviction_dir=eviction_dir
                 ),
                 subagent_task_middleware,
+                # Ends a quiet wake turn before the credit gate, steering and
+                # the context rows run, so a call that never happens takes in
+                # nothing and writes nothing. Only with the tool that sets it.
+                WakeupQuietGuardMiddleware() if wakeups_on else None,
                 *shared_middleware,
                 skill_loader_middleware,
                 *main_only_middleware,
@@ -1030,10 +1145,15 @@ class PTCAgent:
                 ),
                 EmptyToolCallRetryMiddleware(),
                 DaltonPatchToolCallsMiddleware(),  # DALTON-HOOK(dalton-patch-tool-calls)
-                DaltonAttachmentBudgetMiddleware(),  # DALTON-HOOK(attachment-native-cap)
                 context.turn,
                 # DALTON-HOOK(knowledge-reconcile-mw): reconcile direct edits and pending knowledge files before baseline reads agent.md (PK.5).
-                DaltonReconcileMiddleware(workspace_id=workspace_id_for_memory, backend=filesystem_backend, user_id=user_id),
+                # DALTON-HOOK(colleague-dispatch): pass storage_owner_id so reconcile uses workspace owner for storage
+                DaltonReconcileMiddleware(
+                    workspace_id=workspace_id_for_memory,
+                    backend=filesystem_backend,
+                    user_id=user_id,
+                    storage_owner_id=workspace_owner_id or user_id,
+                ),
                 context.baseline,
                 notes_rows,
                 context.tail,
@@ -1072,4 +1192,12 @@ class PTCAgent:
             agent=agent,
             middleware=background_middleware,
             auto_wait=self.config.background_auto_wait,
+            alert_senders=frozenset(
+                sender
+                for sender, on in (
+                    (MARKET_ALERT_SENDER, self.config.feature_enabled("market_watch")),
+                    (WAKEUP_SENDER, wakeups_on),
+                )
+                if on
+            ),
         )

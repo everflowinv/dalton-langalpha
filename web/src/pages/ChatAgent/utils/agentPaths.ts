@@ -67,9 +67,9 @@ function userDataEntity(norm: string): UserDataEntity | undefined {
  * Used by the chat timeline to suppress the agent's "Read schema doc" calls:
  * they're not user-actionable.
  */
-export function isUserDataReadmePath(rawPath: string): boolean {
+export function isUserDataReadmePath(rawPath: string, root?: string | null): boolean {
   if (!rawPath) return false;
-  return USER_DATA_README_PATHS.has(workspaceRelativePath(rawPath));
+  return USER_DATA_README_PATHS.has(workspaceRelativePath(rawPath, root));
 }
 
 /**
@@ -77,9 +77,9 @@ export function isUserDataReadmePath(rawPath: string): boolean {
  * prefix the agent emits. The README beside them and anything nested are not
  * one.
  */
-export function isSubagentFilePath(rawPath: string): boolean {
+export function isSubagentFilePath(rawPath: string, root?: string | null): boolean {
   if (!rawPath) return false;
-  const norm = workspaceRelativePath(rawPath);
+  const norm = workspaceRelativePath(rawPath, root);
   const name = norm.startsWith(`${USER_AGENTS_DIR}/`) ? norm.slice(USER_AGENTS_DIR.length + 1) : '';
   return SUBAGENT_FILE_NAME.test(name);
 }
@@ -94,8 +94,9 @@ export function isAgentNotesPath(
   parts: AgentPathParts,
   workspaceDirName?: string | null,
   previousDirNames?: readonly string[] | null,
+  otherRoots?: readonly string[] | null,
 ): boolean {
-  return !parts.directory && workspaceScopedPath(parts, workspaceDirName, previousDirNames) === AGENT_MD_FILE;
+  return !parts.directory && workspaceScopedPath(parts, workspaceDirName, previousDirNames, otherRoots) === AGENT_MD_FILE;
 }
 
 /**
@@ -105,7 +106,9 @@ export function isAgentNotesPath(
  * `../<folder>/x` is `x`. Any other relative path already reads from the
  * folder, so `alpha/x.md` stays a nested file. Without the folder names this
  * is the canonical path, which reads a bare sandbox-root path the way the
- * layout before workspace folders did.
+ * layout before workspace folders did. Under another computer's root
+ * (`ComputerFolders.otherRoots`) only a path through the folder is this
+ * workspace's: the rest of that machine is not on this one.
  *
  * The folder matches as the server's file routes match it: the current one
  * exactly, since another spelling is another directory on a case-sensitive
@@ -118,22 +121,37 @@ export function workspaceScopedPath(
   parts: AgentPathParts,
   dirName?: string | null,
   previousDirNames?: readonly string[] | null,
+  otherRoots?: readonly string[] | null,
 ): string {
   const { path } = parts;
-  let rest: string;
+  const inside = (rest: string): string | null => {
+    const first = rest.split('/', 1)[0];
+    const inFolder = (!!dirName && first === dirName)
+      || (!!first && (previousDirNames ?? []).some((name) => !!name && foldFolderName(name) === foldFolderName(first)));
+    return inFolder ? rest.slice(first.length + 1) : null;
+  };
+  // A root the sandbox did not claim survives parsing (`/tmp/x`): no folder
+  // there, unless it is a root the folder sat under before a move. Every root
+  // it starts under is tried, since one can sit inside another, the longest
+  // first, as the relay reads them: under `/srv` and `/srv/old`,
+  // `/srv/old/<folder>/x` is `x` before it is `<folder>/x` in a folder `old`.
+  const underOtherRoot = (rooted: string): string | null => {
+    const under = (otherRoots ?? []).filter((root) => rooted.startsWith(`${root}/`));
+    for (const root of under.sort((a, b) => b.length - a.length)) {
+      const scoped = inside(rooted.slice(root.length + 1));
+      if (scoped !== null) return scoped;
+    }
+    return null;
+  };
   if (parts.absolute) {
-    // A root the sandbox did not claim survives parsing (`/tmp/x`): no folder there.
-    if (path.startsWith('/')) return path;
-    rest = path;
-  } else {
-    // A `__wsref__` path climbs out of that workspace's folder, not this one's.
-    if (parts.workspaceId || !path.startsWith('../')) return path;
-    rest = path.slice(3);
+    if (path.startsWith('/')) return underOtherRoot(path) ?? path;
+    // The root it was read under can hold one the folder sat under before:
+    // moved from `~/langalpha` to `~`, the old path reads `langalpha/<folder>/x`.
+    return inside(path) ?? (parts.root ? underOtherRoot(`${parts.root}/${path}`) : null) ?? path;
   }
-  const first = rest.split('/', 1)[0];
-  const inFolder = (!!dirName && first === dirName)
-    || (!!first && (previousDirNames ?? []).some((name) => !!name && foldFolderName(name) === foldFolderName(first)));
-  return inFolder ? rest.slice(first.length + 1) : path;
+  // A `__wsref__` path climbs out of that workspace's folder, not this one's.
+  if (parts.workspaceId || !path.startsWith('../')) return path;
+  return inside(path.slice(3)) ?? path;
 }
 
 /**
@@ -153,6 +171,21 @@ export interface SiblingWorkspace {
 
 /** The viewed workspace's own folders and the other workspaces on its computer. */
 export interface ComputerFolders {
+  /**
+   * The computer's root, where its workspace folders sit. A computer whose
+   * user cannot create the stock root keeps them under one of its own, and
+   * the agent spells that one out in an absolute path like any other.
+   */
+  rootDir?: string | null;
+  /**
+   * The roots the workspace's folder may have sat under before a move, slash-led
+   * and sorted, stock ones and its own left out: the user's other computers'
+   * and the ones the workspace recorded leaving. A workspace moves between
+   * computers with its folder, so an absolute path an older turn wrote under a
+   * root it has since left still names it, and the computer that root belonged
+   * to may be gone from the list.
+   */
+  otherRoots?: readonly string[];
   dirName?: string | null;
   previousDirNames?: readonly string[] | null;
   siblings: readonly SiblingWorkspace[];
@@ -164,6 +197,9 @@ export interface WorkspaceFolderRow {
   computer_id?: string | null;
   dir_name?: string | null;
   previous_dir_names?: readonly string[] | null;
+  /** The root of its computer, when the row was read with it. */
+  root_dir?: string | null;
+  previous_root_dirs?: readonly string[] | null;
   status?: string | null;
 }
 
@@ -171,11 +207,20 @@ export interface WorkspaceFolderRow {
  * The viewed workspace's folders and the other live workspaces on its
  * computer, or null until its row is known. A workspace on no computer has
  * no siblings, a deleted workspace's folder went with it, and a row with no
- * folder yet is not one a path can name.
+ * folder yet is not one a path can name. `computerRoots` are the roots of
+ * every computer the user has, its own included.
+ *
+ * The root the row was read with goes first, `rootDir` (the computer list's)
+ * after: the row gates the folders, so its root is there the moment they are,
+ * while the list loads later and a tool title read against no root flashes
+ * from one wording to another. Only the viewed row's former roots are read: a
+ * root another workspace left names that workspace's folder, not this one's.
  */
 export function computerFolders(
   viewed: WorkspaceFolderRow | null | undefined,
   rows: readonly WorkspaceFolderRow[] | null | undefined,
+  rootDir?: string | null,
+  computerRoots?: readonly (string | null | undefined)[] | null,
 ): ComputerFolders | null {
   if (!viewed) return null;
   const computerId = viewed.computer_id;
@@ -185,7 +230,22 @@ export function computerFolders(
     if (row.status === 'deleted' || !row.dir_name) continue;
     siblings.push({ workspaceId: row.workspace_id, dirName: row.dir_name, previousDirNames: row.previous_dir_names });
   }
-  return { dirName: viewed.dir_name, previousDirNames: viewed.previous_dir_names, siblings };
+  // A stock root reads the same as none, so it is left out rather than giving
+  // every cache keyed on the root a second entry for the same paths. The
+  // others are sorted so the list reordering by activity is no change.
+  const root = viewed.root_dir || rootDir;
+  const own = ownRoot(root);
+  const otherRoots = [...new Set([...(computerRoots ?? []), ...(viewed.previous_root_dirs ?? [])].map(ownRoot))]
+    .filter((other) => other && other !== own)
+    .sort()
+    .map((other) => `/${other}`);
+  return {
+    ...(own ? { rootDir: root } : {}),
+    ...(otherRoots.length ? { otherRoots } : {}),
+    dirName: viewed.dir_name,
+    previousDirNames: viewed.previous_dir_names,
+    siblings,
+  };
 }
 
 /** A reference that names a sibling's folder: that workspace, and the path inside it. */
@@ -246,10 +306,55 @@ export function siblingWorkspacePath(
 // The sandbox roots the agent sometimes emits, bare or `file:///`-wrapped (see
 // normalizeFileRefs.ts), from the generated layout. The trailing slash is
 // optional so a bare root collapses to '' instead of surviving as `home/workspace`.
-const SANDBOX_ROOTS_ALTERNATION = SANDBOX_ROOT_PREFIXES
-  .map((root) => root.replace(/\/$/, '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+const escapeRe = (v: string) => v.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+export const SANDBOX_ROOTS_ALTERNATION = SANDBOX_ROOT_PREFIXES
+  .map((root) => escapeRe(root.replace(/\/$/, '')))
   .join('|');
 const SANDBOX_ROOT_RE = new RegExp(`^/?(?:${SANDBOX_ROOTS_ALTERNATION})(?:/|$)`);
+
+/** The computer's own root without its slashes, or '' for none or a stock one. */
+function ownRoot(root: string | null | undefined): string {
+  const own = root?.replace(/^\/+|\/+$/g, '') ?? '';
+  return (SANDBOX_ROOT_PREFIXES as readonly string[]).includes(`${own}/`) ? '' : own;
+}
+
+const OWN_ROOTS = new Map<string, { alternation: string; re: RegExp }>();
+
+/**
+ * The computer's own root, compiled once per root: a page sees one root per
+ * computer, and every path read under it would otherwise build the same
+ * expression again.
+ */
+function ownRootPatterns(own: string): { alternation: string; re: RegExp } {
+  let hit = OWN_ROOTS.get(own);
+  if (!hit) {
+    // A markdown destination is tested before it is decoded, so a root with
+    // characters that travel percent-encoded has to match in that spelling too.
+    const encoded = own.split('/').map(encodeURIComponent).join('/');
+    const alternation = encoded === own ? escapeRe(own) : `${escapeRe(own)}|${escapeRe(encoded)}`;
+    // Only the stock roots may drop the leading slash: with a one-segment root
+    // like `/data`, a relative `data/x.csv` would otherwise read as rooted.
+    const re = new RegExp(`^(?:/(?:${alternation})|/?(?:${SANDBOX_ROOTS_ALTERNATION}))(?:/|$)`);
+    hit = { alternation, re };
+    OWN_ROOTS.set(own, hit);
+  }
+  return hit;
+}
+
+/**
+ * The computer's own root as a regex alternation, in both spellings a
+ * reference can hold it in, or '' when the stock roots are all it has.
+ */
+export function ownRootAlternation(root: string | null | undefined): string {
+  const own = ownRoot(root);
+  return own ? ownRootPatterns(own).alternation : '';
+}
+
+/** The stock roots, plus the computer's own when it is not one of them. */
+function sandboxRootRe(root: string | null | undefined): RegExp {
+  const own = ownRoot(root);
+  return own ? ownRootPatterns(own).re : SANDBOX_ROOT_RE;
+}
 const FILE_PROTO_RE = /^file:\/\/(?=\/)/;
 const WSREF_PREFIX = '__wsref__/';
 
@@ -271,13 +376,17 @@ export interface AgentPathParts {
   absolute: boolean;
   /** The reference ended in `/`, so it named a directory. */
   directory: boolean;
+  /** The sandbox root taken off `path`, slash-led, when one was. */
+  root?: string;
 }
 
 /**
  * The shared reading of a reference. `url` says the input is a markdown
  * destination rather than a path, which decides one rule: see `parseAgentHref`.
+ * `root` is the computer's own root (`ComputerFolders.rootDir`), read as a
+ * sandbox root alongside the stock ones.
  */
-function takeApart(raw: string, url = false): AgentPathParts {
+function takeApart(raw: string, url = false, root?: string | null): AgentPathParts {
   let p = raw.trim().replace(FILE_PROTO_RE, '');
   let workspaceId: string | undefined;
 
@@ -300,9 +409,10 @@ function takeApart(raw: string, url = false): AgentPathParts {
   if (url) p = p.replace(/[?#].*$/, '');
 
   const rooted = p.startsWith('/');
-  const sandbox = SANDBOX_ROOT_RE.test(p);
+  const taken = sandboxRootRe(root).exec(p)?.[0];
+  const sandbox = taken !== undefined;
   const directory = p.endsWith('/');
-  if (sandbox) p = p.replace(SANDBOX_ROOT_RE, '');
+  if (sandbox) p = p.slice(taken.length);
 
   const segments: string[] = [];
   for (const seg of p.split('/')) {
@@ -326,17 +436,21 @@ function takeApart(raw: string, url = false): AgentPathParts {
     path: (rooted && !sandbox ? '/' : '') + joined + (directory && joined ? '/' : ''),
     absolute: rooted || sandbox,
     directory,
+    ...(sandbox ? { root: `/${taken.replace(/^\/+|\/+$/g, '')}` } : {}),
   };
 }
 
-/** A path a tool reported, or one already canonical. Idempotent. */
-export function parseAgentPath(raw: string): AgentPathParts {
-  return takeApart(raw);
+/**
+ * A path a tool reported, or one already canonical. Idempotent. `root` is the
+ * computer's own root, when the caller knows which computer the path is on.
+ */
+export function parseAgentPath(raw: string, root?: string | null): AgentPathParts {
+  return takeApart(raw, false, root);
 }
 
 /** @see parseAgentPath */
-export function normalizeAgentPath(raw: string): string {
-  return takeApart(raw).path;
+export function normalizeAgentPath(raw: string, root?: string | null): string {
+  return takeApart(raw, false, root).path;
 }
 
 /**
@@ -349,10 +463,14 @@ export function normalizeAgentPath(raw: string): string {
  * encoded exactly once by the HTTP layer, or the API client re-encodes the leading `%`
  * to `%25` and the backend's single `unquote` looks for a literal `%XX` name.
  */
-export function parseAgentHref(raw: string): AgentPathParts {
-  const parts = takeApart(raw, true);
+export function parseAgentHref(raw: string, root?: string | null): AgentPathParts {
+  const parts = takeApart(raw, true, root);
   try {
-    return { ...parts, path: decodeURIComponent(parts.path) };
+    return {
+      ...parts,
+      path: decodeURIComponent(parts.path),
+      ...(parts.root ? { root: decodeURIComponent(parts.root) } : {}),
+    };
   } catch {
     // A lone `%` is a literal here, not a broken escape.
     return parts;
@@ -360,8 +478,8 @@ export function parseAgentHref(raw: string): AgentPathParts {
 }
 
 /** @see parseAgentHref */
-export function normalizeAgentHref(raw: string): string {
-  return parseAgentHref(raw).path;
+export function normalizeAgentHref(raw: string, root?: string | null): string {
+  return parseAgentHref(raw, root).path;
 }
 
 export type AgentPathKind = 'memory' | 'memo' | 'user-data' | 'skill' | 'file';
@@ -423,18 +541,18 @@ export type AgentPathInfo =
  * shown in the UI reads the same way it routes when clicked. The bare sandbox
  * root collapses to an empty string; the caller picks a label for that case.
  */
-export function workspaceRelativePath(rawPath: string): string {
-  return takeApart(rawPath).path.replace(/^\/+/, '');
+export function workspaceRelativePath(rawPath: string, root?: string | null): string {
+  return takeApart(rawPath, false, root).path.replace(/^\/+/, '');
 }
 
 /** A path through the selected workspace's folder with the folder folded off (`workspaceScopedPath`); any other path as it came. */
 function selectedWorkspacePath(
   rawPath: string,
-  dirName?: string | null,
-  previousDirNames?: readonly string[] | null,
+  folders: ComputerFolders | null | undefined,
 ): string {
-  const parts = takeApart(rawPath, true);
-  const scoped = workspaceScopedPath(parts, dirName, previousDirNames);
+  const { dirName, previousDirNames, rootDir, otherRoots } = folders ?? {};
+  const parts = takeApart(rawPath, true, rootDir);
+  const scoped = workspaceScopedPath(parts, dirName, previousDirNames, otherRoots);
   if (scoped === parts.path) return rawPath;
   return scoped || (parts.directory ? './' : '');
 }
@@ -454,7 +572,7 @@ const WORKSPACE_MEMORY_DIRS = [MEMORY_WORKSPACE_DIR, LEGACY_MEMORY_WORKSPACE_DIR
  * and the extracted `<wsid>` is attached as `crossWorkspaceId` so callers can
  * propagate the workspace context to MemoryPanel/MemoPanel/FilePanel.
  */
-export function classifyAgentPath(rawPath: string): AgentPathInfo {
+export function classifyAgentPath(rawPath: string, root?: string | null): AgentPathInfo {
   if (!rawPath) return { kind: 'file', rawPath };
 
   // `takeApart` peels the `__wsref__/<wsid>/` qualifier, so classification sees
@@ -462,7 +580,7 @@ export function classifyAgentPath(rawPath: string): AgentPathInfo {
   // through untouched, so display layers still show the full link; `kind:
   // 'file'` carries no id because Files-tab routing pipes it through
   // `computeAgentArtifactRouting`'s own `targetWorkspaceId` argument instead.
-  const { workspaceId: crossWorkspaceId, path } = takeApart(rawPath, true);
+  const { workspaceId: crossWorkspaceId, path } = takeApart(rawPath, true, root);
   const norm = path.replace(/^\/+/, '');
 
   if (norm.startsWith(`${MEMORY_USER_DIR}/`)) {
@@ -573,10 +691,11 @@ export function computeAgentArtifactRouting(
   targetWorkspaceId?: string,
   folders?: ComputerFolders | null,
 ): AgentArtifactRouting {
-  const sibling = targetWorkspaceId ? null : siblingWorkspacePath(takeApart(rawPath), folders);
+  const root = folders?.rootDir;
+  const sibling = targetWorkspaceId ? null : siblingWorkspacePath(takeApart(rawPath, false, root), folders);
   if (sibling) return computeAgentArtifactRouting(sibling.path, sibling.workspaceId);
-  const routedPath = selectedWorkspacePath(rawPath, folders?.dirName, folders?.previousDirNames);
-  const info = classifyAgentPath(routedPath);
+  const routedPath = selectedWorkspacePath(rawPath, folders);
+  const info = classifyAgentPath(routedPath, root);
   // Caller-supplied wsid wins; otherwise fall back to the wsid extracted from
   // a `__wsref__/...` marker in the path itself.
   const embeddedWsid = info.kind === 'file' ? undefined : info.crossWorkspaceId;
@@ -642,7 +761,7 @@ export function computeAgentArtifactRouting(
     };
   }
   // skill / file → Files tab; pass-through workspace id for cross-workspace links.
-  const parts = takeApart(routedPath, true);
+  const parts = takeApart(routedPath, true, root);
   if (parts.directory) {
     return {
       ...base,

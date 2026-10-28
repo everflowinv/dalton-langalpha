@@ -207,6 +207,34 @@ class TestBuildGraphConfig:
         config = self._build(extra_configurable={"custom_flag": True})
         assert config["configurable"]["custom_flag"] is True
 
+    def test_a_command_report_back_names_its_command(self):
+        """The call that reads the notice brings the command's data sources,
+        read off its row by this id; the trace itself never rides the body."""
+        from ptc_agent.agent.middleware.provenance.command_trace import (
+            REPORT_COMMAND_KEY,
+        )
+        from src.server.models.chat import CommandReport, TaskReport
+
+        command = CommandReport(
+            kind="command_report",
+            command_id="bg-0123456789ab",
+            tool="ExecuteCode",
+            status="completed",
+        )
+        task = TaskReport(kind="task", task_id="t-1", display_id="Task-abc123")
+
+        def _config(report):
+            return self._build(
+                request=MagicMock(
+                    locale="en-US", checkpoint_id=None, platform=None,
+                    report_source=report,
+                )
+            )["configurable"]
+
+        assert _config(command)[REPORT_COMMAND_KEY] == "bg-0123456789ab"
+        assert REPORT_COMMAND_KEY not in _config(task)
+        assert REPORT_COMMAND_KEY not in _config(None)
+
     def test_graph_metadata_stays_turn_identity(self):
         """A subagent inherits this dict wholesale while running its own model at
         its own effort, so anything the LLM owns is asserted for calls it was
@@ -244,6 +272,60 @@ class TestBuildGraphConfig:
             "is_byok",
         ):
             assert llm_owned not in metadata
+
+    @pytest.mark.parametrize(
+        ("origin", "expected"),
+        [
+            (None, {"origin": "user"}),
+            (
+                {"type": "automation", "id": "auto-1", "name": "Morning brief"},
+                {"origin": "automation", "automation_id": "auto-1"},
+            ),
+            ({"type": "agent", "id": "t-0", "agent": "chief_of_staff"}, {"origin": "agent"}),
+            ({"type": "system"}, {"origin": "system"}),
+        ],
+    )
+    def test_root_run_says_what_drove_the_turn(self, origin, expected):
+        from src.server.models.chat import ThreadOrigin
+
+        request = MagicMock(
+            locale=None,
+            checkpoint_id=None,
+            platform=None,
+            origin=ThreadOrigin(**origin) if origin else None,
+            query_type=None,
+        )
+        metadata = self._build(request=request, from_server=True)["metadata"]
+        assert {k: v for k, v in metadata.items() if k != "k"} == expected
+
+    @pytest.mark.parametrize(
+        "origin",
+        [{"type": "automation", "id": "auto-1"}, {"type": "agent", "agent": "chief_of_staff"}],
+    )
+    def test_an_origin_a_client_names_is_not_believed(self, origin):
+        """Any client may send one; only the server's own labels the trace."""
+        from src.server.models.chat import ThreadOrigin
+
+        request = MagicMock(
+            locale=None,
+            checkpoint_id=None,
+            platform=None,
+            origin=ThreadOrigin(**origin),
+            query_type=None,
+        )
+        metadata = self._build(request=request)["metadata"]
+        assert {k: v for k, v in metadata.items() if k != "k"} == {"origin": "user"}
+
+    @pytest.mark.parametrize("query_type", ["system", "market_target", "wakeup"])
+    def test_a_turn_the_server_posted_is_not_the_users(self, query_type):
+        request = MagicMock(
+            locale=None, checkpoint_id=None, platform=None, origin=None, query_type=query_type
+        )
+        metadata = self._build(request=request)["metadata"]
+        assert {k: v for k, v in metadata.items() if k != "k"} == {
+            "origin": "system",
+            "query_type": query_type,
+        }
 
     def test_timezone_in_configurable(self):
         config = self._build(timezone_str="UTC")

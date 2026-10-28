@@ -27,6 +27,7 @@ import { formatBytes, formatTimestamp } from '@/lib/format';
 import { useLocale } from '@/hooks/useLocale';
 import { AnimatedTabs } from '@/components/ui/animated-tabs';
 import { workspaceRelativePath } from '@/pages/ChatAgent/utils/agentPaths';
+import { useWorkspaceFolders } from '@/pages/ChatAgent/contexts/WorkspaceContext';
 import { isTaskAgentId } from '@/pages/ChatAgent/utils/agentId';
 import { Favicon } from './Favicon';
 import { ResearchDocSource } from './dalton/ResearchDocSource'; // DALTON-HOOK(provenance-type)
@@ -330,13 +331,13 @@ function distinctByContent(
 
 /** The display title for a row/record: title, then identifier, then a localized
  *  fallback. */
-function recordTitle(t: TFunction, record: ProvenanceRecord): string {
+function recordTitle(t: TFunction, record: ProvenanceRecord, root?: string | null): string {
   // File-ish sources carry an absolute sandbox path (e.g. /home/workspace/x.md)
   // as their identifier and no title. Show it workspace-relative — the same
   // normalization the path router uses when the row is clicked — while the DB
   // keeps the full path.
   if (FILE_SOURCE_TYPES.has(record.source_type) && !record.title && record.identifier) {
-    const rel = workspaceRelativePath(record.identifier);
+    const rel = workspaceRelativePath(record.identifier, root);
     return rel || t('chat.sources.workspaceRoot');
   }
   return record.title || record.identifier || t('chat.sources.unknownSource');
@@ -557,12 +558,13 @@ function SourceRow({
   onOpenRecord: (record: ProvenanceRecord) => void;
 }): React.ReactElement {
   const { t } = useTranslation();
+  const root = useWorkspaceFolders()?.rootDir;
   const { record, records } = row;
   const isWebSearch = record.source_type === 'web_search';
   const isWebFetch = record.source_type === 'web_fetch';
   // List decks dedup by URL; entity decks dedup by content hash (see distinctByContent).
   const distinct = distinctByContent(records, isWebSearch || isWebFetch);
-  const title = recordTitle(t, record);
+  const title = recordTitle(t, record, root);
 
   if (record.source_type === 'research_doc') { // DALTON-HOOK(provenance-type)
     return <ResearchDocSource record={record} records={records} onOpenRecord={onOpenRecord} />;
@@ -661,6 +663,7 @@ function SourceDeck({
   onOpenRecord: (record: ProvenanceRecord) => void;
 }): React.ReactElement {
   const { t } = useTranslation();
+  const root = useWorkspaceFolders()?.rootDir;
   // A "list" deck (query/domain) labels each card by its own page; an entity
   // deck shares the front label across cards and subtitles by data-kind.
   const isEntity = variant === 'entity';
@@ -705,9 +708,9 @@ function SourceDeck({
         // domain is already on the front).
         const cardTitle =
           variant === 'query'
-            ? recordTitle(t, r)
+            ? recordTitle(t, r, root)
             : variant === 'domain'
-              ? urlPath(r.identifier) || recordTitle(t, r)
+              ? urlPath(r.identifier) || recordTitle(t, r, root)
               : frontLabel;
         // Per-card subtitle (fanned): entity → full args / data-kind; query →
         // the result's domain; domain → the args (minus the redundant `url`), so
@@ -818,10 +821,11 @@ function SourceDetailDialog({
   onOpenFile?: (path: string, workspaceId?: string) => void;
 }): React.ReactElement {
   const { t } = useTranslation();
+  const root = useWorkspaceFolders()?.rootDir;
   const open = record !== null;
   const isUrl = record ? URL_SOURCE_TYPES.has(record.source_type) : false;
   const isFile = record ? FILE_SOURCE_TYPES.has(record.source_type) : false;
-  const title = record ? recordTitle(t, record) : '';
+  const title = record ? recordTitle(t, record, root) : '';
   const typeLabel = record
     ? t(`chat.sources.groups.${record.source_type}`, { defaultValue: humanizeType(record.source_type) })
     : '';

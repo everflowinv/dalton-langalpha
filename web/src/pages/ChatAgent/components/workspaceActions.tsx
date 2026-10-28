@@ -1,23 +1,28 @@
-import React, { useMemo, useState } from 'react';
+import React, { Suspense, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router';
 import { useTranslation } from 'react-i18next';
 import { useQueryClient } from '@tanstack/react-query';
-import { Pin, Pencil, Copy, Trash2 } from 'lucide-react';
+import { Pin, Pencil, Copy, FolderOutput, Trash2 } from 'lucide-react';
 import { DropdownMenuItem, DropdownMenuSeparator } from '@/components/ui/dropdown-menu';
 import { toast } from '@/components/ui/use-toast';
 import { queryKeys } from '@/lib/queryKeys';
+import type { Computer } from '@/types/api';
 import { deleteWorkspace, duplicateWorkspace } from '../utils/api';
+import { apiErrorDetail } from '../utils/api/errors'; // DALTON-HOOK(workspace-delete-guard)
 import { entitlementErrorMessage } from '../utils/entitlementErrors';
 import { workspaceNameErrorMessage } from '../utils/workspaceName';
-import { invalidateNewWorkspace, invalidateWorkspaceMembership } from '../hooks/workspaceRowActions';
-import { forgetStableNavOrder } from '../hooks/useNavigationData';
-import { forgetSharedWorkspaceThreads } from '@/lib/navThreadsStore';
-import { removeStoredThreadId } from '../hooks/utils/threadStorage';
-import { clearAllMarketThreadsForWorkspace } from '../../MarketView/utils/threadPersistence';
-import { forgetNavPanelExpansion } from './navExpansionStore';
-import { scrollMemory } from '@/lib/scrollMemory';
-import DeleteConfirmModal from './DeleteConfirmModal';
+import { forgetDeletedWorkspace, invalidateNewWorkspace, invalidateWorkspaceMembership } from '../hooks/workspaceRowActions';
+import { useComputers } from '../hooks/useComputers';
+import { liveComputers, takesWorkspaces } from '../utils/computerStatus';
+import { providerKeepsFilesOnRemove } from './providerUi';
+import { lazyWithMotion } from '@/lib/lazyWithMotion';
+import DeleteConfirmModal, { type OwnMachineFolder } from './DeleteConfirmModal';
 import DuplicateWorkspaceDialog from './DuplicateWorkspaceDialog';
+import { WorkspaceMoveOutcomes } from './WorkspaceMoveOutcomes';
+
+// Lazy: the sidebar mounts these actions on every page, and the dialog brings
+// framer, which stays off the first load.
+const MoveWorkspaceDialog = lazyWithMotion(() => import('./MoveWorkspaceDialog'));
 
 /** Minimal workspace shape the menu + actions need — both the gallery's richer
  *  record and the nav tree's loose entry satisfy it. */
@@ -26,6 +31,9 @@ export interface MenuWorkspace {
   name?: string;
   status?: string;
   is_pinned?: boolean;
+  is_home?: boolean;
+  computer_id?: string | null;
+  dir_name?: string | null;
   [key: string]: unknown;
 }
 
@@ -34,6 +42,8 @@ interface WorkspaceMenuItemsProps<W extends MenuWorkspace> {
   onTogglePin?: (workspace: W) => void;
   onRename?: (workspace: W) => void;
   onDuplicate: (workspace: W) => void;
+  /** Absent where moving isn't offered; shown only when there is somewhere to move to. */
+  onMove?: (workspace: W) => void;
   onDelete: (workspace: W) => void;
 }
 
@@ -48,9 +58,20 @@ export function WorkspaceMenuItems<W extends MenuWorkspace>({
   onTogglePin,
   onRename,
   onDuplicate,
+  onMove,
   onDelete,
 }: WorkspaceMenuItemsProps<W>) {
   const { t } = useTranslation();
+  // Read from the list the fan-out already holds. The menu mounts only while
+  // open, so a page without that list fetches it on the first open alone.
+  const { data: computerData } = useComputers({ enabled: !!onMove });
+  // Home moves only with the primary, and a row with no computer has no
+  // folder to move. Two machines that take workspaces always leave one that
+  // is not this workspace's.
+  const canMove =
+    !workspace.is_home
+    && !!workspace.computer_id
+    && liveComputers(computerData?.computers).filter(takesWorkspaces).length >= 2;
 
   return (
     <>
@@ -71,6 +92,12 @@ export function WorkspaceMenuItems<W extends MenuWorkspace>({
         <Copy className="h-4 w-4" />
         {t('workspace.duplicate', 'Duplicate')}
       </DropdownMenuItem>
+      {onMove && canMove && (
+        <DropdownMenuItem onSelect={() => onMove(workspace)}>
+          <FolderOutput className="h-4 w-4" />
+          {t('workspace.move.menu', 'Move to computer…')}
+        </DropdownMenuItem>
+      )}
       <DropdownMenuSeparator />
       <DropdownMenuItem variant="destructive" onSelect={() => onDelete(workspace)}>
         <Trash2 className="h-4 w-4" />
@@ -80,8 +107,21 @@ export function WorkspaceMenuItems<W extends MenuWorkspace>({
   );
 }
 
+/** Where a workspace's files are on a machine the user brought; null on every other computer. */
+function ownMachineFolder(
+  workspace: MenuWorkspace | null,
+  computers: readonly Computer[] | undefined,
+): OwnMachineFolder | null {
+  const computer = workspace?.computer_id
+    ? computers?.find((c) => c.computer_id === workspace.computer_id)
+    : undefined;
+  if (!computer || !workspace?.dir_name || !providerKeepsFilesOnRemove(computer.kind)) return null;
+  return { folder: `${computer.root_dir.replace(/\/+$/, '')}/${workspace.dir_name}`, computer: computer.name };
+}
+
 export interface WorkspaceActions {
   openDuplicate: (workspace: MenuWorkspace) => void;
+  openMove: (workspace: MenuWorkspace) => void;
   openDelete: (workspace: MenuWorkspace) => void;
   /** Render once at the host's root — the confirm/config dialogs. */
   dialogs: React.ReactNode;
@@ -92,22 +132,19 @@ export type WorkspaceMutationOp = 'duplicate';
 
 export interface UseWorkspaceActionsOptions {
   currentWorkspaceId?: string | null;
-  /** After a successful CRUD flow. The gallery re-snaps to page 0 on 'duplicate' (the copy lands at the top). */
+  /** After a successful CRUD flow. The gallery scrolls to its top on 'duplicate' (the copy lands there). */
   onAfterMutate?: (op: WorkspaceMutationOp) => void;
-  /** After a successful delete, with the removed id — a paginated host may need to step back a page. */
-  onAfterDelete?: (wsId: string) => void;
 }
 
 /**
- * Self-contained duplicate / delete actions with their dialogs. The canonical implementation for every host (gallery card,
+ * Self-contained duplicate / move / delete actions with their dialogs. The canonical implementation for every host (gallery card,
  * sidebar tree, mobile drawer): same mutations, entitlement mapping, toasts,
  * and delete cleanup; deleting the currently-open workspace navigates back to
- * the gallery. Host-specific presentation lands in the two callbacks.
+ * the gallery. Host-specific presentation lands in the callback.
  */
 export function useWorkspaceActions({
   currentWorkspaceId,
   onAfterMutate,
-  onAfterDelete,
 }: UseWorkspaceActionsOptions): WorkspaceActions {
   const { t } = useTranslation();
   const navigate = useNavigate();
@@ -115,9 +152,21 @@ export function useWorkspaceActions({
 
   const [duplicateTarget, setDuplicateTarget] = useState<MenuWorkspace | null>(null);
   const [duplicateBusy, setDuplicateBusy] = useState(false);
+  const [moveTarget, setMoveTarget] = useState<MenuWorkspace | null>(null);
+  // Latched once opened, so closing animates out rather than unmounting.
+  const [moveNeeded, setMoveNeeded] = useState(false);
+  if (moveTarget && !moveNeeded) setMoveNeeded(true);
   const [deleteTarget, setDeleteTarget] = useState<MenuWorkspace | null>(null);
   const [deleteBusy, setDeleteBusy] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [deleteFiles, setDeleteFiles] = useState(false);
+  // The list is usually cached already; the dialog only reads it. Until it
+  // answers, the dialog waits: it would word a machine the user brought as a
+  // hosted one, whose folder goes, and send the delete that keeps it. A list
+  // that fails to load gets the general warning.
+  const computerList = useComputers({ enabled: !!deleteTarget?.computer_id });
+  const deleteOwnMachine = ownMachineFolder(deleteTarget, computerList.data?.computers);
+  const deleteWaiting = !!deleteTarget?.computer_id && computerList.isPending;
 
   const handleDuplicateConfirm = async () => {
     if (!duplicateTarget || duplicateBusy) return;
@@ -147,30 +196,30 @@ export function useWorkspaceActions({
     setDeleteBusy(true);
     setDeleteError(null);
     try {
-      await deleteWorkspace(wsId);
-      // Same cleanup set as the gallery's delete: stored thread pointers
-      // (chat + market), remembered tree expansion, frozen nav orders, and the
-      // shared thread lists — so nothing re-expands or 404s a dead workspace.
-      removeStoredThreadId(wsId);
-      clearAllMarketThreadsForWorkspace(wsId);
-      forgetNavPanelExpansion(wsId);
-      forgetStableNavOrder(wsId);
-      forgetSharedWorkspaceThreads(wsId);
-      scrollMemory.forget(`threads:${wsId}:active`);
-      scrollMemory.forget(`threads:${wsId}:archived`);
+      // Only a choice the dialog offered: elsewhere the server deletes the folder anyway.
+      await deleteWorkspace(wsId, { deleteFiles: !!deleteOwnMachine && deleteFiles });
+      // Gone from every list now; the refetch then confirms it.
+      forgetDeletedWorkspace(queryClient, wsId);
       invalidateWorkspaceMembership(queryClient);
       // The breakdown drops a deleted project's folder; only an open one refetches.
       if (typeof deleteTarget.computer_id === 'string') {
         void queryClient.invalidateQueries({ queryKey: queryKeys.computers.storage(deleteTarget.computer_id) });
       }
-      onAfterDelete?.(wsId);
       if (currentWorkspaceId === wsId) {
         navigate('/chat');
       }
       setDeleteTarget(null);
     } catch (err) {
       console.error('Error deleting workspace:', err);
-      setDeleteError(err instanceof Error && err.message ? err.message : t('workspace.failedDeleteWorkspace'));
+      // DALTON-HOOK(workspace-delete-guard): the delete route answers a 409
+      // refusal (published reports, active work, a move) with a string detail,
+      // while ApiError leaves err.message as the generic status line.
+      const detail = apiErrorDetail(err);
+      setDeleteError(
+        typeof detail === 'string' && detail
+          ? detail
+          : t('workspace.failedDeleteWorkspace'),
+      );
     } finally {
       setDeleteBusy(false);
     }
@@ -184,13 +233,24 @@ export function useWorkspaceActions({
         onConfirm={() => void handleDuplicateConfirm()}
         busy={duplicateBusy}
       />
+      {moveNeeded && (
+        <Suspense fallback={null}>
+          <MoveWorkspaceDialog target={moveTarget} onClose={() => setMoveTarget(null)} />
+        </Suspense>
+      )}
+      {/* Every host carries it, so an ending is told wherever the user is;
+          each one is handed out once however many are mounted. */}
+      <WorkspaceMoveOutcomes />
       <DeleteConfirmModal
-        isOpen={!!deleteTarget}
+        isOpen={!!deleteTarget && !deleteWaiting}
         workspaceName={deleteTarget?.name || ''}
         onConfirm={() => void handleConfirmDelete()}
         onCancel={() => { setDeleteTarget(null); setDeleteError(null); }}
         isDeleting={deleteBusy}
         error={deleteError}
+        ownMachine={deleteOwnMachine}
+        deleteFiles={deleteFiles}
+        onDeleteFilesChange={setDeleteFiles}
       />
     </>
   );
@@ -199,7 +259,8 @@ export function useWorkspaceActions({
   // one stable set.
   const actions = useMemo<Omit<WorkspaceActions, 'dialogs'>>(() => ({
     openDuplicate: setDuplicateTarget,
-    openDelete: (ws) => { setDeleteTarget(ws); setDeleteError(null); },
+    openMove: setMoveTarget,
+    openDelete: (ws) => { setDeleteTarget(ws); setDeleteError(null); setDeleteFiles(false); },
   }), []);
 
   return { ...actions, dialogs };

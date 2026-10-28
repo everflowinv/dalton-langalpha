@@ -22,6 +22,7 @@ from src.server.database.pool import get_db_connection
 from src.server.services.brokerage_orders import AttemptStatus, OrderOutcome
 from src.server.services.brokerage_orders.models import (
     CREATING_ACTIONS,
+    OPEN_STATUSES,
     TERMINAL_STATUSES,
 )
 from src.server.services.tool_binding import inputs_from_row, order_policy
@@ -644,6 +645,31 @@ async def latest_attempt_for_vendor_order(
             )
             row = await cur.fetchone()
     return None if row is None else str(row[0])
+
+
+async def find_open_thread_order(
+    thread_id: str, vendor_order_id: str
+) -> dict[str, Any] | None:
+    """The open order this thread placed or staged under ``vendor_order_id``,
+    the latest if the id was used twice: what an order wakeup watches."""
+    async with get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                f"""
+                SELECT {_COLUMNS} FROM order_attempts
+                 WHERE thread_id = %s AND vendor_order_id = %s
+                   AND action = ANY(%s) AND status = ANY(%s)
+                 ORDER BY created_at DESC
+                 LIMIT 1
+                """,
+                (
+                    thread_id,
+                    vendor_order_id,
+                    [str(a) for a in CREATING_ACTIONS],
+                    [str(s) for s in OPEN_STATUSES],
+                ),
+            )
+            return row_as_json(await cur.fetchone())
 
 
 def decode_cursor(cursor: str | None) -> tuple[datetime, str] | None:

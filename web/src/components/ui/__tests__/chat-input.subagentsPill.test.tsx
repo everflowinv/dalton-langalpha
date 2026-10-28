@@ -6,10 +6,11 @@
  * would never mean anything; folded, it links to the Subagents pane under it.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { createRef } from 'react';
 import { fireEvent, render, renderHook, screen } from '@testing-library/react';
 import { MemoryRouter } from 'react-router';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import ChatInput, { type ChatInputProps } from '../chat-input';
+import ChatInput, { type ChatInputHandle, type ChatInputProps } from '../chat-input';
 import { useToolbarItems } from '../chat-input.toolbar';
 import { DropdownMenu, DropdownMenuContent, DropdownMenuTrigger } from '../dropdown-menu';
 import { ChatInputRegistry, ContextBus } from '@/lib/contextBus';
@@ -31,7 +32,7 @@ vi.mock('../use-toast', () => ({
   toast: vi.fn(),
 }));
 
-function renderInput(props: Partial<ChatInputProps>) {
+function renderInput(props: Partial<ChatInputProps> & { ref?: React.Ref<ChatInputHandle> }) {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={queryClient}>
@@ -106,6 +107,20 @@ describe('ChatInput: the Subagents pill', () => {
     expect(pill()).toHaveAttribute('aria-pressed', 'false');
     sendText('flipped');
     expect(onSend.mock.calls[1][3]).toMatchObject({ subagentsAllowed: false });
+  });
+
+  it("hands its own pick to a start that reads the composer's options, and a host's none", () => {
+    // Welcome's Start with nothing written reads the options rather than sending.
+    const own = createRef<ChatInputHandle>();
+    const { unmount } = renderInput({ ref: own });
+    expect(own.current!.getModelOptions().subagentsAllowed).toBeUndefined();
+    fireEvent.click(pill()!);
+    expect(own.current!.getModelOptions()).toMatchObject({ subagentsAllowed: false });
+    unmount();
+
+    const hosted = createRef<ChatInputHandle>();
+    renderInput({ ref: hosted, subagentsAllowed: false, onToggleSubagents: vi.fn() });
+    expect(hosted.current!.getModelOptions().subagentsAllowed).toBeUndefined();
   });
 
   it('names what it shows while the default is unread, which a stored default may contradict', () => {

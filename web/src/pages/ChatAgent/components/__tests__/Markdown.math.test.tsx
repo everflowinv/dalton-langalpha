@@ -59,4 +59,40 @@ describe('Markdown math', () => {
     expect(host.querySelector('.katex')).toBeNull();
     expect(host.textContent).toContain('$100');
   });
+
+  // remark-math pairs any two dollars, so two cashtags in one paragraph would
+  // set the words between them as a formula.
+  it('keeps a dollar before a ticker as text, next to math in the same paragraph', () => {
+    const host = render('$AAPL and $MSFT guided flat, $BRK.B is no peer, $AAPL/$MSFT trades at $68.3B, and the drift is $x^2$ or $\\alpha$.');
+
+    const tex = [...host.querySelectorAll('annotation[encoding="application/x-tex"]')].map((a) => a.textContent);
+    expect(tex).toEqual(['x^2', '\\alpha']);
+    expect(host.textContent).toContain('$AAPL and $MSFT guided flat, $BRK.B is no peer, $AAPL/$MSFT trades at $68.3B');
+  });
+
+  // The dollar after `(` opens a formula of its own, so it does not close
+  // the ticker's, and the two dollars after it pair.
+  it('keeps a ticker dollar as text before math opened in parentheses or quotes', () => {
+    const host = render('Compare $AAPL with ($x$), and $NVDA with "$y$".');
+
+    const tex = [...host.querySelectorAll('annotation[encoding="application/x-tex"]')].map((a) => a.textContent);
+    expect(tex).toEqual(['x', 'y']);
+    expect(host.textContent).toContain('Compare $AAPL with (');
+    expect(host.textContent).toContain('and $NVDA with "');
+  });
+
+  it('keeps a dollar standing for the unit as text, and math in parentheses', () => {
+    const host = render('Brent averaged 85 $/bbl vs 80 $/bbl, in millions ($), with variance ($\\sigma^2$) flat.');
+
+    const tex = [...host.querySelectorAll('annotation[encoding="application/x-tex"]')].map((a) => a.textContent);
+    expect(tex).toEqual(['\\sigma^2']);
+    expect(host.textContent).toContain('85 $/bbl vs 80 $/bbl, in millions ($)');
+  });
+
+  it('reads capitals a dollar closes as math', () => {
+    const host = render('With $N = 5$ draws, $X$, $P(A)$ and $X_t$ hold.');
+
+    const tex = [...host.querySelectorAll('annotation[encoding="application/x-tex"]')].map((a) => a.textContent);
+    expect(tex).toEqual(['N = 5', 'X', 'P(A)', 'X_t']);
+  });
 });

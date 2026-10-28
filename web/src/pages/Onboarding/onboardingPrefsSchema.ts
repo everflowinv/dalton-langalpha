@@ -33,6 +33,7 @@ const OnboardingPrefsSchema = z.object({
   gettingStartedDismissedAt: epochOrNull,
   lastSeenReleaseVersion: z.catch(z.nullable(z.string().check(z.minLength(1))), null),
   firstRunAt: epochOrNull,
+  welcomeSkippedAt: epochOrNull,
 });
 
 export function emptyOnboardingPrefs(): OnboardingPrefs {
@@ -43,6 +44,7 @@ export function emptyOnboardingPrefs(): OnboardingPrefs {
     gettingStartedDismissedAt: null,
     lastSeenReleaseVersion: null,
     firstRunAt: null,
+    welcomeSkippedAt: null,
   };
 }
 

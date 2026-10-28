@@ -1,4 +1,4 @@
-import React, { Suspense } from 'react';
+import { Suspense, useEffect } from 'react';
 import { Routes, Route, Navigate, useLocation } from 'react-router';
 import PageLoading from '@/components/PageLoading/PageLoading';
 import { useIsMobile } from '@/hooks/useIsMobile';
@@ -6,7 +6,7 @@ import { useSyncUserLocale } from '@/hooks/useSyncUserLocale';
 import { ContextOverflowPill } from '@/components/ui/ContextOverflowPill';
 import NetworkBanner from '@/components/NetworkBanner/NetworkBanner';
 import { StaleBuildBoundary } from '@/components/StaleBuildBoundary';
-import { lazyWithMotion } from '@/lib/lazyWithMotion';
+import { lazyWithMotion, preloadableLazy } from '@/lib/lazyWithMotion';
 import type { AppSection } from '@/lib/appRoutes';
 
 // Chunk thunks shared by the lazy components and preloadRouteChunk — import()
@@ -19,7 +19,9 @@ const routeChunks = {
   market: () => import('../../pages/MarketView/MarketView'),
   news: () => import('../../pages/Detail/NewsDetailPage'),
   automations: () => import('../../pages/Automations/Automations'),
-  orders: () => import('../../pages/Orders/Orders'),
+  // DALTON-HOOK(hide-trading): the Orders page is not built; an /orders warm
+  // takes the dashboard chunk, the same one the catch-all redirect lands on.
+  orders: () => import('../../pages/Dashboard/DashboardRouter'),
   plugins: () => import('../../pages/Plugins/Plugins'),
   settings: () => import('../../pages/Settings/Settings'),
   // Alias so preloading /connectors (the legacy path) warms the right chunk.
@@ -30,25 +32,78 @@ const Dashboard = lazyWithMotion(routeChunks.dashboard);
 const ChatAgent = lazyWithMotion(routeChunks.chat);
 const MarketView = lazyWithMotion(routeChunks.market);
 // Animates nothing, so it skips the framer download (see lib/lazyWithMotion).
-const NewsDetailPage = React.lazy(routeChunks.news);
+const NewsDetailPage = preloadableLazy(routeChunks.news);
 const Automations = lazyWithMotion(routeChunks.automations);
 // DALTON-HOOK(hide-trading): do not mount Orders page
 const Plugins = lazyWithMotion(routeChunks.plugins);
 const Settings = lazyWithMotion(routeChunks.settings);
+
+// What a preload warms for each section: the page itself, not only its chunk,
+// so a page warmed ahead renders on its first mount rather than behind the
+// pane's spinner (see lib/lazyWithMotion).
+const routePreloads = {
+  dashboard: Dashboard.preload,
+  chat: ChatAgent.preload,
+  market: MarketView.preload,
+  news: NewsDetailPage.preload,
+  automations: Automations.preload,
+  // DALTON-HOOK(hide-trading): the Orders page is not mounted; /orders warms the dashboard.
+  orders: Dashboard.preload,
+  plugins: Plugins.preload,
+  settings: Settings.preload,
+  connectors: Plugins.preload,
+} satisfies Record<AppSection, () => Promise<unknown>>;
 
 /** Start downloading the chunk for `pathname` without rendering it, so the
  * shell can warm the target route while the /users/me gate is still
  * resolving instead of serializing the two network legs. Unknown segments
  * warm the dashboard chunk (the catch-all redirect's target). */
 export function preloadRouteChunk(pathname: string): void {
-  const chunkFor: Record<string, () => Promise<unknown>> = routeChunks;
+  const chunkFor: Record<string, () => Promise<unknown>> = routePreloads;
   const segment = pathname.split('/')[1] || 'dashboard';
   // Swallowed on purpose, but it must be caught: a deploy deletes the previous
   // build's chunks, so this rejects routinely for a stale tab, and an unhandled
   // rejection is noise that hides real ones. The failure still surfaces — Vite
   // fires vite:preloadError (index.html reports it), and React.lazy retries the
   // same import at mount, where StaleBuildBoundary catches it.
-  void (chunkFor[segment] ?? routeChunks.dashboard)().catch(() => {});
+  void (chunkFor[segment] ?? routePreloads.dashboard)().catch(() => {});
+}
+
+// Warmed in the order the rail lists them, the likeliest next stops first.
+// DALTON-HOOK(hide-trading): no 'orders' — its warm is the dashboard's, already first.
+const WARM_ORDER = ['dashboard', 'chat', 'market', 'automations', 'plugins', 'settings', 'news'] as const satisfies readonly AppSection[];
+const WARM_IDLE_TIMEOUT_MS = 2000;
+
+/** Warms every section's chunk once the shell is idle, one at a time so none
+ * competes with what the page in view is still loading. A section's first
+ * visit then renders at once: its keyed Suspense mounts fresh, with nothing of
+ * its own to hold, so a chunk still in flight showed the pane's loader. */
+function useWarmSections(): void {
+  useEffect(() => {
+    let cancelled = false;
+    let cancelWait = () => {};
+    const whenIdle = (run: () => void) => {
+      if (typeof window.requestIdleCallback === 'function') {
+        const id = window.requestIdleCallback(run, { timeout: WARM_IDLE_TIMEOUT_MS });
+        cancelWait = () => window.cancelIdleCallback(id);
+      } else {
+        const id = window.setTimeout(run, WARM_IDLE_TIMEOUT_MS);
+        cancelWait = () => window.clearTimeout(id);
+      }
+    };
+    const warm = (i: number) => {
+      if (cancelled || i >= WARM_ORDER.length) return;
+      // A failed warm is the mount's to retry (see preloadRouteChunk).
+      void routePreloads[WARM_ORDER[i]]()
+        .catch(() => {})
+        .then(() => whenIdle(() => warm(i + 1)));
+    };
+    whenIdle(() => warm(0));
+    return () => {
+      cancelled = true;
+      cancelWait();
+    };
+  }, []);
 }
 
 /** Permanent alias for the pre-rename Connectors page. Keeps search + hash:
@@ -64,6 +119,7 @@ function Main() {
   const location = useLocation();
   const isMobile = useIsMobile();
   useSyncUserLocale();
+  useWarmSections();
   // Key by top-level path segment so /chat sub-routes share a key (no re-animation)
   const pageKey = location.pathname.split('/')[1] || 'dashboard';
 
@@ -128,10 +184,11 @@ function Main() {
   return (
     <div className="main">
       <NetworkBanner />
-      {/* Keyed on the section so a new one mounts fresh and fades in. */}
+      {/* Keyed on the section so a new one mounts fresh. It swaps in at once:
+          the page under it draws in its final frame, and a fade over that
+          only delays it. */}
       <div
         key={pageKey}
-        className="route-fade-in"
         // `minHeight: 0` is what lets flex actually shrink this when the
         // banner takes part of the column. A flex item defaults to
         // `min-height: auto`, so without it a tall route (the dashboard grid)

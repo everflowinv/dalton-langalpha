@@ -80,6 +80,7 @@ EXPECTED_ABSOLUTE = {
     "system": "/home/workspace/.system",
     "system_code": "/home/workspace/.system/code",
     "system_trace": "/home/workspace/.system/trace",
+    "system_jobs": "/home/workspace/.system/jobs",
     "internal": "/home/workspace/_internal",
     "internal_src": "/home/workspace/_internal/src",
     "packs": "/home/workspace/_internal/packs",
@@ -115,6 +116,7 @@ EXPECTED_RELATIVE = {
     "SYSTEM_DIR": ".system",
     "SYSTEM_CODE_DIR": ".system/code",
     "SYSTEM_TRACE_DIR": ".system/trace",
+    "SYSTEM_JOBS_DIR": ".system/jobs",
     "INTERNAL_DIR": "_internal",
     "INTERNAL_SRC_DIR": "_internal/src",
     "PACKS_DIR": "_internal/packs",
@@ -123,6 +125,8 @@ EXPECTED_RELATIVE = {
     "MCP_TOKENS_FILE": "_internal/.mcp_tokens.json",
     "EGRESS_RELAY_FILE": "_internal/.egress_relay.json",
     "VAULT_SECRETS_FILE": "_internal/.vault_secrets.json",
+    "MCP_CHECK_PREFIX": "_internal/.mcp_check_",
+    "LEFTOVERS_DIR": "_internal/leftovers",
 }
 
 # The workspace tier, relative to the workspace folder rather than the root.
@@ -196,6 +200,7 @@ class TestDefaultLayout:
             "setup_dirs",
             "allowed_directories",
             "denied_directories",
+            "credential_files",
         }
 
     def test_the_wrapper_tiers_live_under_internal(self):
@@ -1091,11 +1096,6 @@ class TestConfigLiterals:
         assert fs.denied_directories == layout.denied_directories
         assert DockerConfig().working_dir == layout.root
 
-    def test_skills_config_default(self):
-        from ptc_agent.config.agent import SkillsConfig
-
-        assert SkillsConfig().sandbox_skills_base == SandboxLayout.default().skills
-
 
 class TestGeneratedFrontendModule:
     def test_committed_file_matches_the_emitter(self):
@@ -1154,3 +1154,12 @@ class TestGeneratedFrontendModule:
         # break the runtime's dict lookups with no other signal.
         constants = SandboxLayout.default().as_constants()
         assert json.loads(json.dumps(constants)) == constants
+
+
+def test_computer_roots_leads_with_the_own_root_and_dedupes_the_stock_ones():
+    from ptc_agent.core.paths import SANDBOX_ROOTS, computer_roots
+
+    stock = tuple(sorted(SANDBOX_ROOTS, key=len, reverse=True))
+    assert computer_roots(None) == computer_roots("/") == computer_roots("") == stock
+    assert computer_roots("/Users/a/langalpha/") == ("/Users/a/langalpha", *stock)
+    assert computer_roots(stock[-1] + "/") == (stock[-1], *stock[:-1])

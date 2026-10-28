@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 
+from ..mcp_composite import builtin_registry_of
 from ..mcp_sanitize import is_untrusted_server, sanitize_tool_name
 from ..paths import SandboxLayout, WorkspaceLayout
 from ..project_context import ProjectContext
@@ -165,12 +166,15 @@ CLAIM = ARGS["claim"]
 ROOT = ARGS["root"]
 DIR_NAME = ARGS["dirName"]
 SERVERS = ARGS["servers"]
+# Servers the syncing worker could not reach, so their absence from SERVERS
+# says nothing about this workspace.
+HELD = set(ARGS.get("held") or ())
 UNION_TOOLS = ARGS["unionTools"]
 UNION_DOCS = ARGS["unionDocs"]
 WS_TOOLS = ARGS["wsTools"]
 WS_DOCS = ARGS["wsDocs"]
-WS_KEEP = set(ARGS["wsKeep"])
-WS_DOCS_KEEP = set(ARGS.get("wsDocsKeep") or SERVERS)
+WS_KEEP = set(ARGS["wsKeep"]) | {name + ".py" for name in HELD}
+WS_DOCS_KEEP = set(ARGS.get("wsDocsKeep") or SERVERS) | HELD
 WS_CONFIG_PATH = ARGS["wsConfigPath"]
 WS_CONFIG = ARGS["wsConfig"]
 EXPECTED_DOCS = ARGS["expectedDocs"]
@@ -258,7 +262,9 @@ def merge_ledger(ledger):
     retracted = dead_claims(dirs) | {CLAIM}
     claims = {}
     for name, holders in old_claims.items():
-        kept = sorted(set(holders) - retracted)
+        # A held server keeps this workspace's claim, and so the wrapper and
+        # entry a worker that reached it installed.
+        kept = sorted(set(holders) - (retracted - {CLAIM} if name in HELD else retracted))
         if kept:
             claims[name] = kept
     for name in SERVERS:
@@ -278,6 +284,7 @@ def merge_ledger(ledger):
         "untrusted",
         "relay_bound",
         "credential_files",
+        "auth",
         "call_timeout_s",  # DALTON-HOOK(mcp-call-timeout)
     )
     old_executable = {
@@ -403,6 +410,18 @@ def sweep_overlay():
     return gone
 
 
+def held_view():
+    """What this workspace's config already enables among the held servers."""
+    try:
+        with open(WS_CONFIG_PATH, encoding="utf-8") as fh:
+            servers = json.load(fh).get("servers")
+    except (OSError, ValueError, AttributeError):
+        return {}
+    if not isinstance(servers, dict):
+        return {}
+    return {name: servers[name] for name in HELD if name in servers}
+
+
 def link_overlay():
     """Point this workspace's tool package at the union's wrappers and docs."""
     if WS_DOCS:
@@ -422,6 +441,7 @@ handle = acquire_flock()
 try:
     ledger, orphaned = merge_ledger(read_ledger())
     config = dict(WS_CONFIG)
+    config["servers"] = {**held_view(), **(config.get("servers") or {})}
     config["computer_config_version"] = ledger["config_version"]
     write_json(WS_CONFIG_PATH, config)
     pruned = prune_union(orphaned)
@@ -500,6 +520,16 @@ async def install_tool_modules(
         for name, entry in (my_config.get("servers") or {}).items()
         if name in tools_by_server
     }
+    # A built-in server this worker never reached is missing from its registry,
+    # not from the workspace, and a worker that did reach it may have installed
+    # it; the reconcile leaves whatever the sandbox holds for it.
+    unreached = (
+        getattr(builtin_registry_of(sandbox.mcp_registry), "failed_builtin_remote", None)
+        or {}
+    )
+    held = sorted(
+        s.name for s in enabled_servers if s.name in unreached and s.name not in tools_by_server
+    )
     uploads.append(
         (
             sandbox.tool_generator.compose_mcp_client_code(my_config).encode("utf-8"),
@@ -551,6 +581,7 @@ async def install_tool_modules(
         "root": layout.root,
         "dirName": project.dir_name or "",
         "servers": my_entries,
+        "held": held,
         "unionTools": layout.tools,
         "unionDocs": layout.tools_docs,
         "wsTools": workspace.tools,

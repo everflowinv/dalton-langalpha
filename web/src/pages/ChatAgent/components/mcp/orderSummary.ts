@@ -40,7 +40,7 @@ export const ORDER_ACTION_KEY: Record<OrderAction, string> = {
   cancel_exercise: 'toolArtifact.directTool.orderAction.cancelExercise',
 };
 
-const FIELD_KEY = {
+const ORDER_FIELD_KEY = {
   quantity: 'toolArtifact.directTool.orderField.quantity',
   notional: 'toolArtifact.directTool.orderField.notional',
   stopPrice: 'toolArtifact.directTool.orderField.stopPrice',
@@ -66,7 +66,7 @@ export const ORDER_REF_KEY = 'toolArtifact.directTool.orderTicket.order';
  *  rest) are bare `orders.*` keys, which the tree-wide sweep already reads. */
 export const ORDER_SUMMARY_KEYS: readonly string[] = [
   ...Object.values(ORDER_ACTION_KEY),
-  ...Object.values(FIELD_KEY),
+  ...Object.values(ORDER_FIELD_KEY),
   ...Object.values(ORDER_TOTAL_KEY),
   ORDER_REF_KEY,
 ];
@@ -99,6 +99,9 @@ export interface OrderTicketView {
    *  instrument to name: then it is the subject of the headline. Beside an
    *  instrument it leads the meta line instead. */
   targetRef: string | null;
+  /** What kind of order, for a surface that names it beside the price
+   *  rather than in a column of its own. */
+  orderType: OrderType | null;
   meta: OrderPart[];
   figures: OrderPart[];
 }
@@ -163,26 +166,25 @@ export function orderTicket(
   );
   // Both when both were sent: which one the vendor goes by is its rule, and
   // a card that drew one would be asking about an order of the other size.
-  if (qty) figures.push({ field: 'qty', labelKey: FIELD_KEY.quantity, value: opts.hidden ? HIDDEN : qty });
-  if (notional) figures.push({ field: 'notional', labelKey: FIELD_KEY.notional, value: notional });
+  if (qty) figures.push({ field: 'qty', labelKey: ORDER_FIELD_KEY.quantity, value: opts.hidden ? HIDDEN : qty });
+  if (notional) figures.push({ field: 'notional', labelKey: ORDER_FIELD_KEY.notional, value: notional });
   const stop = orderAmount(text(order.stop_price), orderCurrency(order), shown);
   const limit = orderAmount(text(order.limit_price), orderCurrency(order), shown);
   // The type sits ahead of the prices unless they already say it. With no
   // price to read it is the price: "Market" where the limit column would be,
   // rather than a blank a reader takes for a market order.
   if (type && !typeShownByPrices(type, { stop: !!stop, limit: !!limit })) {
-    figures.push({ ...word('order_type', ORDER_TYPE_KEY, type), labelKey: FIELD_KEY.orderType });
+    figures.push({ ...word('order_type', ORDER_TYPE_KEY, type), labelKey: ORDER_FIELD_KEY.orderType });
   }
-  if (stop) figures.push({ field: 'stop_price', labelKey: FIELD_KEY.stopPrice, value: stop });
+  if (stop) figures.push({ field: 'stop_price', labelKey: ORDER_FIELD_KEY.stopPrice, value: stop });
   if (limit) {
     // A price on a type that takes no limit is not one: moomoo wants a price
     // on a market order and ignores it.
-    const limitPriced = !type || LIMIT_BOUND_TYPES.has(type);
-    figures.push({
-      field: 'limit_price',
-      labelKey: limitPriced ? FIELD_KEY.limitPrice : FIELD_KEY.price,
-      value: limit,
-    });
+    figures.push(
+      !type || LIMIT_BOUND_TYPES.has(type)
+        ? { field: 'limit_price', labelKey: ORDER_FIELD_KEY.limitPrice, value: limit }
+        : { field: 'price', labelKey: ORDER_FIELD_KEY.price, value: limit },
+    );
   }
   const total = orderTotal(order, opts.fill);
   if (total) {
@@ -208,12 +210,13 @@ export function orderTicket(
   }
   if (order.session) meta.push(word('session', ORDER_SESSION_KEY, order.session));
   const note = text(order.note);
-  if (note) meta.push({ field: 'note', labelKey: FIELD_KEY.note, value: note });
+  if (note) meta.push({ field: 'note', labelKey: ORDER_FIELD_KEY.note, value: note });
 
   return {
     side: order.side ? word('side', ORDER_SIDE_KEY, order.side) : null,
     instrument,
     targetRef: instrument ? null : ref,
+    orderType: type,
     meta,
     figures,
   };

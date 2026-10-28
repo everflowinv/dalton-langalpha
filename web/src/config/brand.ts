@@ -15,6 +15,12 @@ export const BRAND_MARK: BrandMarkKind =
     : 'langalpha';
 
 /**
+ * Whether this is a Dalton build. Gates the product decisions the roadmap
+ * keeps on Dalton's side of the fork (the onboarding entry among them).
+ */
+export const isDaltonBuild: boolean = BRAND_MARK === 'everflow';
+
+/**
  * Resolved favicon path for the active brand mark and theme.
  */
 export function faviconHref(theme: 'light' | 'dark'): string {

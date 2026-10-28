@@ -159,3 +159,86 @@ async def test_an_unknown_run_reports_none(launched_run):
         await replay_facts.append_lane_images(thread_id, str(uuid.uuid4()), "k1", images)
         is False
     )
+
+
+async def test_a_runs_model_is_recorded_at_admission_and_outlives_its_settle(
+    seed_workspace, patched_get_db_connection
+):
+    """Admission writes the model with the row; the settle CAS, a lost one
+    and a later fact all leave it. The card stamp reads it per run, scoped to
+    its thread, and the latest-run reader the status route uses has it too."""
+    from src.server.database import replay_facts
+    from src.server.database.conversation import create_thread
+    from src.server.database.runs import subagent_runs
+    from src.server.database.runs.lifecycle import start_run
+
+    thread_id = str(uuid.uuid4())
+    await create_thread(
+        conversation_thread_id=thread_id,
+        workspace_id=str(seed_workspace["workspace_id"]),
+        current_status="in_progress",
+        msg_type="ptc",
+    )
+    response_id = str(uuid.uuid4())
+    await start_run(
+        run_id=response_id,
+        thread_id=thread_id,
+        request_key=str(uuid.uuid4()),
+        turn_index=1,
+        metadata={"msg_type": "ptc", "user_id": seed_workspace["user_id"]},
+    )
+    model = {"id": "glm-5.3-cn", "provider": "z-ai-cn"}
+    task_run_id = str(uuid.uuid4())
+    born = await subagent_runs.start_task_run(
+        task_run_id=task_run_id,
+        thread_id=thread_id,
+        task_id="k1",
+        cause="init",
+        parent_run_id=response_id,
+        model=model,
+    )
+    assert born["replay_facts"] == {"model": model}
+
+    won = await subagent_runs.finalize_task_run_idempotent(
+        task_run_id=task_run_id, status="completed"
+    )
+    lost = await subagent_runs.finalize_task_run_idempotent(
+        task_run_id=task_run_id, status="error"
+    )
+    assert won["applied"] is True and lost["applied"] is False
+    returned = {"content": "c", "input_id": "in-1", "reason": "run_ended"}
+    await replay_facts.append_returned_steering(task_run_id, [returned])
+
+    assert (await subagent_runs.get_task_run(task_run_id))["replay_facts"] == {
+        "model": model,
+        "steering_returned": [returned],
+    }
+    row = (await subagent_runs.get_task_run_telemetry(thread_id, [task_run_id]))[
+        task_run_id
+    ]
+    assert row["task_id"] == "k1"
+    assert row["model"] == model
+    assert row["finalized_at"] == won["run"]["finalized_at"]
+    latest = await subagent_runs.get_latest_run_details(thread_id, ["k1"])
+    assert latest["k1"]["model"] == model
+
+    # One malformed id cannot fail the batch, and another thread's id reads
+    # no run of this one.
+    mixed = await subagent_runs.get_task_run_telemetry(
+        thread_id, ["not-a-uuid", task_run_id]
+    )
+    assert list(mixed) == [task_run_id]
+    assert await subagent_runs.get_task_run_telemetry(
+        str(uuid.uuid4()), [task_run_id]
+    ) == {}
+
+
+async def test_a_run_on_its_launchers_model_records_none(launched_run):
+    from src.server.database.runs import subagent_runs
+
+    thread_id, _, task_run_id = launched_run
+    row = (await subagent_runs.get_task_run_telemetry(thread_id, [task_run_id]))[
+        task_run_id
+    ]
+    assert row["model"] is None
+    assert (await subagent_runs.get_task_run(task_run_id))["replay_facts"] is None

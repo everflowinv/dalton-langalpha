@@ -42,6 +42,8 @@ export interface FileViewerProps {
   loading: boolean;
   error: FileError | null;
   onRetry: () => void;
+  /** A large PDF lost a slice, to a change in the file or a failed read, named by the path it was drawn for. Left out, the viewer fails instead. */
+  onFileChanged?: (path: string) => void;
   /** Offered where the viewer failed; a toast reports its own failure. */
   onDownloadInFallback?: () => void;
   onDownload?: () => void;
@@ -55,6 +57,8 @@ export interface FileViewerProps {
   // no reference to land, no editor and no workspace to link into.
   focus?: FileViewerFocus;
   onPageCount?: (pages: number) => void;
+  /** An HTML file's markup rather than its page, switched from the panel header. */
+  htmlSource?: boolean;
 
   isEditing?: boolean;
   editContent?: string | null;
@@ -85,6 +89,8 @@ export function FileViewer(props: FileViewerProps): React.ReactElement {
   const { t } = useTranslation();
   const { theme } = useTheme();
   const [lightboxOpen, setLightboxOpen] = useState(false);
+  // Bumped by Retry on a large PDF that failed, so its viewer starts over.
+  const [pdfAttempt, setPdfAttempt] = useState(0);
   const ext = getFileExtension(path);
   const fileName = path.split('/').pop() || path;
 
@@ -136,9 +142,23 @@ export function FileViewer(props: FileViewerProps): React.ReactElement {
         <DocumentErrorBoundary
           // A newer copy of the same file keeps the reader's place; another
           // file starts over, and a failed one does not fail the next.
-          key={path}
-          fallback={<DocumentErrorFallback onDownload={props.onDownloadInFallback} downloadState={props.downloadState} />}>
-          <PdfViewer data={body.buffer!} focusPage={focus.focusPage} focusSeq={focus.seq} onPageCount={props.onPageCount} />
+          key={`${path}#${pdfAttempt}`}
+          fallback={
+            <DocumentErrorFallback
+              // A large PDF fails on a slice it could not read, which a fresh
+              // viewer reads again; whole bytes that failed would fail again.
+              onRetry={body.ranged ? () => setPdfAttempt((n) => n + 1) : undefined}
+              onDownload={props.onDownloadInFallback}
+              downloadState={props.downloadState}
+            />
+          }>
+          <PdfViewer
+            data={body.ranged ?? body.buffer!}
+            onFileChanged={props.onFileChanged && (() => props.onFileChanged!(path))}
+            focusPage={focus.focusPage}
+            focusSeq={focus.seq}
+            onPageCount={props.onPageCount}
+          />
         </DocumentErrorBoundary>
       </Suspense>
     );
@@ -187,9 +207,9 @@ export function FileViewer(props: FileViewerProps): React.ReactElement {
             servePrefix={props.servePrefix}
             anchor={focus.htmlAnchor}
             anchorSeq={focus.seq}
-            onTriggerDownload={props.onDownloadInFallback}
             // DALTON-HOOK(team-sharing): forward teamReadOnly to HtmlViewer
             teamReadOnly={props.teamReadOnly}
+            source={props.htmlSource}
           />
         </DocumentErrorBoundary>
       </Suspense>

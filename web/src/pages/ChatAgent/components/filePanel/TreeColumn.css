@@ -6,7 +6,7 @@
      a status dot without wrapping, which is what buys the tighter padding. */
   padding: 5px 10px;
   cursor: pointer;
-  transition: background-color 0.15s;
+  transition: background-color var(--motion-quick) var(--ease-out);
 }
 .file-panel-item:hover,
 .file-panel-item-context-active {
@@ -30,7 +30,7 @@
   background-color: var(--color-border-muted);
   opacity: 0;
   pointer-events: none;
-  transition: opacity 0.15s ease;
+  transition: opacity var(--motion-quick) var(--ease-out);
 }
 .file-tree-root:hover .file-tree-indent-guide {
   opacity: 1;
@@ -74,7 +74,7 @@
   background: transparent;
   color: var(--color-text-tertiary);
   cursor: pointer;
-  transition: all 0.15s;
+  transition: all var(--motion-quick) var(--ease-out);
   white-space: nowrap;
 }
 .file-panel-chip:hover {
@@ -116,7 +116,7 @@
   font-size: 0.75rem;
   color: var(--color-text-tertiary);
   cursor: pointer;
-  transition: background-color 0.1s;
+  transition: background-color var(--motion-quick) var(--ease-out);
 }
 .file-panel-sort-item:hover {
   background-color: var(--color-border-muted);
@@ -134,7 +134,7 @@
   padding: 6px 16px;
   cursor: pointer;
   user-select: none;
-  transition: background-color 0.15s;
+  transition: background-color var(--motion-quick) var(--ease-out);
 }
 .file-panel-dir-header:hover {
   background-color: var(--color-border-muted);
@@ -158,9 +158,9 @@
   background: var(--color-loss-soft);
   color: var(--color-loss);
   cursor: pointer;
-  transition: all 0.15s;
+  transition: all var(--motion-quick) var(--ease-out);
   white-space: nowrap;
-  animation: confirm-pulse 0.3s ease-out;
+  animation: confirm-pulse var(--motion-enter) var(--ease-out);
 }
 .file-panel-delete-confirm-btn:hover:not(:disabled) {
   background: var(--color-loss-soft);
@@ -191,7 +191,7 @@
   height: 6px;
   border-radius: 50%;
   flex-shrink: 0;
-  transition: all 0.2s ease;
+  transition: all var(--motion-quick) var(--ease-out);
 }
 .file-panel-backup-dot.backed-up {
   background-color: var(--color-profit-muted);
@@ -214,26 +214,31 @@
   background-color: var(--color-bg-page);
 }
 /* Under a narrow panel the column would starve the viewer, so it floats over
-   it instead of beside it. */
+   it instead of beside it. Its edge is the column's hairline, not a shadow:
+   the scrim already sets it apart, and a blur would smear over the strip. */
 .file-panel-tree.is-overlay {
   position: absolute;
   top: 0;
   right: 0;
   bottom: 0;
   z-index: 30;
-  box-shadow: -8px 0 24px var(--color-bg-overlay-strong);
 }
-/* The column folds on width, so its content keeps the full width and is
-   clipped rather than reflowed mid-animation. */
+/* On the empty tab the listing is the tab and fills the body, so there is no
+   viewer for the line to part it from. */
+.file-panel-tree.is-full { border-left: none; }
+/* The column folds on width, so its content never goes below the column's
+   width and is clipped rather than reflowed mid-fold. Wider than that, as on
+   the empty tab, it follows the column. */
 .file-panel-tree { overflow: hidden; }
 .file-panel-tree-inner {
   display: flex;
   flex-direction: column;
-  width: 260px;
+  width: 100%;
+  min-width: 260px;
   flex: 1;
   min-height: 0;
 }
-.file-panel-tree.is-overlay .file-panel-tree-inner { width: 100%; }
+.file-panel-tree.is-overlay .file-panel-tree-inner { min-width: 0; }
 .file-panel-tree-scrim {
   position: absolute;
   inset: 0;
@@ -262,9 +267,9 @@
 }
 
 /* ====== Pinned stores ======
-   Memory and memo, pinned above the listing as rows of it, with a hairline
-   under the group: they open a tab the way a file does, but they are not in
-   the tree and a search of it must not read as having hidden them. */
+   Memory, memo and a chart, pinned above the listing as rows of it, with a
+   hairline under the group: they open a tab the way a file does, but they are
+   not in the tree and a search of it must not read as having hidden them. */
 .file-panel-store-group {
   flex-shrink: 0;
   padding: 2px 0 4px;

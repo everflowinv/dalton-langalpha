@@ -37,7 +37,6 @@ from ptc_agent.config.agent import (
 from ptc_agent.config.core import (
     CoreConfig,
     create_default_security_config,
-    default_sandbox_skills_base,
 )
 from ptc_agent.config.utils import (
     configure_structlog,
@@ -344,10 +343,6 @@ def load_from_dict(
     skills_config = SkillsConfig(
         enabled=skills_data.get("enabled", True),
         user_skills_dir=skills_data.get("user_skills_dir", "~/.ptc-agent/skills"),
-        sandbox_skills_base=skills_data.get(
-            "sandbox_skills_base",
-            default_sandbox_skills_base(filesystem_config.working_directory),
-        ),
     )
 
     # Load Compaction configuration (optional section)
@@ -402,15 +397,21 @@ llm:
   # fallback:                   # Optional: fallback models when primary fails
   #   - "fallback-model"
 
-# Daytona Sandbox
-# ---------------
-daytona:
-  base_url: "https://app.daytona.io/api"
-  # api_key: set DAYTONA_API_KEY in environment or .env file
-  python_version: "3.12"
-  auto_stop_interval: 3600  # 1 hour
-  auto_archive_interval: 604800  # 7 days
-  auto_delete_interval: 7776000  # 90 days
+# Sandbox
+# -------
+sandbox:
+  provider: "daytona"  # daytona, e2b or docker; SANDBOX_PROVIDER overrides it
+  daytona:
+    base_url: "https://app.daytona.io/api"
+    # api_key: set DAYTONA_API_KEY in environment or .env file
+    python_version: "3.12"
+    auto_stop_interval: 3600  # 1 hour
+    auto_archive_interval: 604800  # 7 days
+    auto_delete_interval: 7776000  # 90 days
+  # e2b:  # with provider: "e2b"
+  #   # api_key: set E2B_API_KEY in environment or .env file
+  #   auto_stop_interval: 3600  # idle seconds before a sandbox pauses
+  #   max_timeout: 3600  # plan's longest continuous run (86400 on Pro)
 
 # MCP Servers (optional)
 # ----------------------

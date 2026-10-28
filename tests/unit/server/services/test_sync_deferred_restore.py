@@ -126,7 +126,7 @@ async def _sync(manifest: _Manifest, entries: list[dict]):
         patch.object(backup, "get_workspace_total_size", new=AsyncMock(return_value=0)),
         patch.object(backup, "set_files_scan_mark", new=AsyncMock()) as mark,
     ):
-        result = await backup.sync_to_db(WS, SimpleNamespace(sandbox_id="sb-1"), layout=LAYOUT)
+        result = await backup.sync_to_db(WS, SimpleNamespace(sandbox_id="sb-1", recreatable=True), layout=LAYOUT)
     inline.assert_not_awaited()
     return result, mark
 

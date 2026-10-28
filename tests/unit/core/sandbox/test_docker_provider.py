@@ -4,7 +4,7 @@ Covers:
 - DockerRuntime state mapping (_DOCKER_STATE_MAP)
 - DockerRuntime exec: mock container.exec(), verify ExecResult
 - DockerRuntime lifecycle: start/stop/delete delegate to container methods
-- DockerRuntime capabilities: no "archive", no "snapshot"
+- DockerRuntime abilities: no archive, env update or auto-stop
 - DockerRuntime archive: raises NotImplementedError
 - DockerRuntime tar upload/download: mock container.put_archive/get_archive
 - DockerRuntime bind upload/download: use tmp_path for real filesystem
@@ -24,13 +24,13 @@ import os
 import shlex
 import subprocess
 import tarfile
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from ptc_agent.config.core import (
-    RESOURCE_TIER_CEILING,
     DockerConfig,
     ResourceTier,
 )
@@ -204,12 +204,9 @@ class TestDockerRuntimeProperties:
         assert result == "/home/workspace"
 
     def test_capabilities_no_archive(self, runtime):
-        caps = runtime.capabilities
-        assert "exec" in caps
-        assert "code_run" in caps
-        assert "file_io" in caps
-        assert "archive" not in caps
-        assert "snapshot" not in caps
+        assert not runtime.archives
+        assert not runtime.updates_env
+        assert not runtime.autostops
 
     @pytest.mark.asyncio
     async def test_archive_raises_not_implemented(self, runtime):
@@ -469,6 +466,24 @@ class TestDockerRuntimeTarUpload:
         # One lookup for the runtime's whole life, not one per upload.
         cmds = [" ".join(c.kwargs["cmd"]) for c in container.exec.call_args_list]
         assert sum("id -u" in c for c in cmds) == 1
+
+    @pytest.mark.asyncio
+    async def test_uploads_carry_the_upload_time(self, runtime, container):
+        """Extraction applies each entry's mtime, and ``TarInfo`` defaults it to 0.
+
+        At the epoch, a same-size rewrite keeps the (mtime, size) stamp the
+        sandbox detects changes by, so a rotated secret or a re-uploaded file
+        reads as unchanged. The PAX record keeps the sub-second part, which is
+        what separates two rewrites within one second."""
+        before = time.time()
+        await runtime.upload_file(b"x", "/home/workspace/a.txt")
+        await runtime.upload_files([(b"y", "/home/workspace/b.txt")])
+        after = time.time()
+        for call in container.put_archive.call_args_list:
+            with tarfile.open(fileobj=io.BytesIO(call[0][1]), mode="r") as tar:
+                for m in tar.getmembers():
+                    assert "mtime" in m.pax_headers
+                    assert before <= m.mtime <= after
 
     @pytest.mark.asyncio
     async def test_an_unreadable_uid_falls_back_to_root(self, runtime, container):
@@ -1163,29 +1178,18 @@ class TestDockerRuntimeSessions:
 
     @pytest.mark.asyncio
     async def test_session_execute_async(self, runtime):
-        """session_execute with run_async=True returns None exit_code."""
+        """session_execute starts the command in the background and returns its id."""
         runtime._container.exec = AsyncMock(
             return_value=_make_exec_mock(output="99999\n")
         )
-        result = await runtime.session_execute("preview-8080", "python -m http.server 8080", run_async=True)
-        assert result.exit_code is None
-        assert result.cmd_id  # non-empty
+        cmd_id = await runtime.session_execute("preview-8080", "python -m http.server 8080")
+        assert cmd_id  # non-empty
         # Verify base64 encoding is in the exec command
         call_args = runtime._container.exec.call_args
         cmd = call_args[1].get("cmd", call_args[0][0] if call_args[0] else None)
         cmd_str = cmd[-1] if isinstance(cmd, list) else str(cmd)
         assert "base64" in cmd_str
-        assert "nohup setsid" in cmd_str
-
-    @pytest.mark.asyncio
-    async def test_session_execute_sync(self, runtime):
-        """session_execute with run_async=False returns actual exit code."""
-        runtime._container.exec = AsyncMock(
-            return_value=_make_exec_mock(output="hello\n", exit_code=0)
-        )
-        result = await runtime.session_execute("preview-8080", "echo hello", run_async=False)
-        assert result.exit_code == 0
-        assert result.stdout == "hello\n"
+        assert "L=setsid" in cmd_str and "nohup $L bash" in cmd_str
 
     @pytest.mark.asyncio
     async def test_session_command_logs_finished(self, runtime):
@@ -1217,21 +1221,6 @@ class TestDockerRuntimeSessions:
         """session_command_logs rejects invalid command IDs."""
         with pytest.raises(ValueError, match="Invalid command_id"):
             await runtime.session_command_logs("preview-8080", "../etc/passwd")
-
-    @pytest.mark.asyncio
-    async def test_delete_session(self, runtime):
-        """delete_session kills process groups and removes directory."""
-        runtime._container.exec = AsyncMock(
-            return_value=_make_exec_mock(exit_code=0)
-        )
-        await runtime.delete_session("preview-8080")
-        call_args = runtime._container.exec.call_args
-        cmd = call_args[1].get("cmd", call_args[0][0] if call_args[0] else None)
-        cmd_str = cmd[-1] if isinstance(cmd, list) else str(cmd)
-        # Kills entire process group (negative PID) and the process itself
-        assert "kill -- -$pid" in cmd_str
-        assert "kill $pid" in cmd_str
-        assert "rm -rf" in cmd_str
 
     @pytest.mark.asyncio
     async def test_delete_missing_session_raises_not_found(self, runtime):
@@ -1285,7 +1274,7 @@ class TestDockerRuntimeSessions:
 
         runtime.exec = local_exec
         await runtime.create_session("bg-0123456789ab")
-        await runtime.session_execute("bg-0123456789ab", f"touch {ran}", run_async=True)
+        await runtime.session_execute("bg-0123456789ab", f"touch {ran}")
         for _ in range(100):
             if launched.exists():
                 break
@@ -1314,10 +1303,11 @@ class TestDockerRuntimeSessions:
             await runtime.session_command_logs("../evil", "abc12345")
 
 
-def _stat_line(pid: int, start: int) -> str:
-    """A /proc/<pid>/stat line whose start time (field 22) is ``start``,
-    behind a command name with the spaces and parens one may hold."""
-    return f"{pid} (a) b (c) S {' '.join(['0'] * 18)} {start} 0 0\n"
+def _stat_line(pid: int, start: int, pgrp: int = 0) -> str:
+    """A /proc/<pid>/stat line whose start time (field 22) is ``start`` and
+    group (field 5) ``pgrp``, behind a command name with the spaces and parens
+    one may hold."""
+    return f"{pid} (a) b (c) S 0 {pgrp} {' '.join(['0'] * 16)} {start} 0 0\n"
 
 
 class TestDockerSessionsAcrossRestartsAndPidReuse:
@@ -1346,6 +1336,14 @@ class TestDockerSessionsAcrossRestartsAndPidReuse:
             (proc / str(pid)).mkdir(exist_ok=True)
             (proc / str(pid) / "stat").write_text(_stat_line(pid, start))
 
+        def add_member(pgrp: int, environ: bytes) -> None:
+            """A process in group ``pgrp`` with ``environ``, under a pid no
+            test records."""
+            member = proc / "424242"
+            member.mkdir()
+            (member / "stat").write_text(_stat_line(424242, 400, pgrp=pgrp))
+            (member / "environ").write_bytes(environ)
+
         def record(run: int, pid: int, start: int) -> None:
             """A command whose wrapper wrote no exit code."""
             session = sessions / f"run-{run}" / self.SID
@@ -1358,7 +1356,12 @@ class TestDockerSessionsAcrossRestartsAndPidReuse:
         runtime.exec = local_exec
         victim = subprocess.Popen(["sleep", "30"], start_new_session=True)
         yield SimpleNamespace(
-            runtime=runtime, sessions=sessions, set_start=set_start, record=record, victim=victim
+            runtime=runtime,
+            sessions=sessions,
+            set_start=set_start,
+            add_member=add_member,
+            record=record,
+            victim=victim,
         )
         victim.kill()
         victim.wait()
@@ -1416,35 +1419,34 @@ class TestDockerSessionsAcrossRestartsAndPidReuse:
 
     @pytest.mark.asyncio
     async def test_a_finished_commands_leftovers_go_with_its_session(self, machine):
-        """With the wrapper gone and its pid not reused, a group by that id
-        holds what the command left running."""
+        """With the wrapper gone, a group by its id whose member carries the
+        command's mark holds what the command left running."""
         runtime, victim = machine.runtime, machine.victim
         machine.set_start(1, 200)
         machine.record(200, victim.pid, 300)
+        machine.add_member(
+            victim.pid, f"PATH=/bin\0LANGALPHA_EXEC={victim.pid}-300\0".encode()
+        )
 
         await runtime.delete_session(self.SID)
         assert victim.wait(timeout=5) is not None
 
-
-# ---------------------------------------------------------------------------
-# DockerRuntime — updated capabilities
-# ---------------------------------------------------------------------------
-
-
-class TestDockerRuntimeUpdatedCapabilities:
-    def test_capabilities_include_preview_and_sessions(self):
-        container = _make_mock_container()
-        runtime = DockerRuntime(
-            container,
-            runtime_id="docker-test",
-            working_dir="/home/workspace",
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("mark", ["", "LANGALPHA_EXEC={pid}-299\0"])
+    async def test_a_group_that_took_a_finished_commands_id_is_not_signalled(
+        self, machine, mark
+    ):
+        """Once the command's group emptied, its id could go to someone else's:
+        a group by that id carrying no mark, or another command's, is not its."""
+        runtime, victim = machine.runtime, machine.victim
+        machine.set_start(1, 200)
+        machine.record(200, victim.pid, 300)
+        machine.add_member(
+            victim.pid, f"PATH=/bin\0{mark.format(pid=victim.pid)}".encode()
         )
-        caps = runtime.capabilities
-        assert "preview_url" in caps
-        assert "sessions" in caps
-        assert "exec" in caps
-        assert "code_run" in caps
-        assert "file_io" in caps
+
+        await runtime.delete_session(self.SID)
+        assert victim.poll() is None
 
 
 # ---------------------------------------------------------------------------
@@ -1755,7 +1757,7 @@ class TestDockerProviderResourceTiers:
 
         host_config = _created_host_config(client)
         assert host_config["Memory"] == 8 * _GIB
-        assert host_config["NanoCpus"] == 4_000_000_000
+        assert host_config["NanoCpus"] == 2_000_000_000
 
     @pytest.mark.asyncio
     async def test_performance_tier_sizes_from_the_preset(self):
@@ -1827,14 +1829,15 @@ class TestDockerProviderResourceTiers:
         assert host_config["NanoCpus"] == 3_000_000_000
 
     @pytest.mark.asyncio
-    async def test_tier_above_the_ceiling_is_clamped(self):
+    async def test_a_tier_larger_than_other_providers_build_is_honoured(self):
+        """The host is Docker's only ceiling, and the daemon refuses past it."""
         provider = DockerProvider(
             DockerConfig(
                 memory_limit="1g",
                 cpu_count=1.0,
                 resource_tiers={
                     "standard": ResourceTier(cpu=1, memory=1, disk=3),
-                    "huge": ResourceTier(cpu=64, memory=256, disk=999),
+                    "huge": ResourceTier(cpu=16, memory=32, disk=100),
                 },
             ),
             working_dir="/home/workspace",
@@ -1845,8 +1848,8 @@ class TestDockerProviderResourceTiers:
         await provider.create(tier="huge")
 
         host_config = _created_host_config(client)
-        assert host_config["NanoCpus"] == RESOURCE_TIER_CEILING["cpu"] * 1_000_000_000
-        assert host_config["Memory"] == RESOURCE_TIER_CEILING["memory"] * _GIB
+        assert host_config["NanoCpus"] == 16 * 1_000_000_000
+        assert host_config["Memory"] == 32 * _GIB
 
 
 class TestDockerProviderTierDisk:
@@ -1953,7 +1956,7 @@ class TestDockerProviderTierFailsLoudly:
         client, container = _make_tier_client(
             applied_host_config={
                 "Memory": 8 * _GIB,
-                "CpuQuota": 400_000,
+                "CpuQuota": 200_000,
                 "CpuPeriod": 100_000,
             }
         )
@@ -1992,9 +1995,9 @@ class TestDockerProviderThreadPools:
         await provider.create(tier="max")
 
         env = _created_env(client)
-        assert env["OMP_NUM_THREADS"] == "4"
-        assert env["OPENBLAS_NUM_THREADS"] == "4"
-        assert env["MKL_NUM_THREADS"] == "4"
+        assert env["OMP_NUM_THREADS"] == "2"
+        assert env["OPENBLAS_NUM_THREADS"] == "2"
+        assert env["MKL_NUM_THREADS"] == "2"
 
     @pytest.mark.asyncio
     async def test_thread_pools_follow_the_applied_size_not_the_preset(self):
@@ -2045,19 +2048,19 @@ class TestReconnectResourceRepair:
     @pytest.mark.parametrize("quota", [False, True])
     async def test_repairs_only_smaller_limits_and_rechecks(self, quota):
         host = {"Memory": 2 * 1024**3, "MemorySwap": 4 * 1024**3}
-        host.update({"CpuQuota": 200000, "CpuPeriod": 100000} if quota else {"NanoCpus": 2_000_000_000})
+        host.update({"CpuQuota": 100000, "CpuPeriod": 100000} if quota else {"NanoCpus": 1_000_000_000})
         container = SimpleNamespace(show=AsyncMock(side_effect=[
             {"Id": "existing", "HostConfig": host},
-            {"HostConfig": {"NanoCpus": 4_000_000_000, "Memory": 8 * 1024**3}},
+            {"HostConfig": {"NanoCpus": 2_000_000_000, "Memory": 8 * 1024**3}},
         ]), delete=AsyncMock())
-        provider = DockerProvider(DockerConfig())
+        provider = DockerProvider(DockerConfig(cpu_count=1.0))
         client = SimpleNamespace(_query_json=AsyncMock())
         provider._client = client
         runtime = SimpleNamespace(_container=container, id="existing")
         await provider.prepare_reconnect(runtime, tier="max")
         changes = client._query_json.await_args.kwargs["data"]
         assert changes == {
-            ("CpuQuota" if quota else "NanoCpus"): (400000 if quota else 4_000_000_000),
+            ("CpuQuota" if quota else "NanoCpus"): (200000 if quota else 2_000_000_000),
             "Memory": 8 * 1024**3, "MemorySwap": 8 * 1024**3,
         }
         assert container.show.await_count == 2

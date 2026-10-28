@@ -87,6 +87,10 @@ class SchemaOnlyRegistry:
         return True
 
     @property
+    def builtin_registry(self) -> "MCPRegistry":
+        return self._builtin_registry
+
+    @property
     def connectors(self) -> dict[str, "MCPServerConnector"]:
         """Built-in connectors ONLY — user servers have no host connector, ever.
 
@@ -150,3 +154,10 @@ def build_composite_registry(
     return SchemaOnlyRegistry(
         builtin_registry, user_servers, tool_schemas, disabled_builtin_names
     )
+
+
+def builtin_registry_of(registry: Any) -> Any:
+    """The built-in snapshot ``registry`` was built on (itself when no composite)."""
+    if isinstance(registry, SchemaOnlyRegistry):
+        return registry.builtin_registry
+    return registry

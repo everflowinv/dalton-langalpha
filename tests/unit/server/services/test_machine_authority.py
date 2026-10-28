@@ -26,6 +26,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from ptc_agent.config.core import FilesystemConfig
+from ptc_agent.core.sandbox.providers.ssh_errors import SSHConnectError
+from ptc_agent.core.sandbox.runtime import RuntimeState, SandboxTransientError
 from src.server.services.computer_manager import ComputerBinding, ComputerManager
 from src.server.services.workspace_manager import WorkspaceManager
 from tests.computer_manager_patch import cm_patch
@@ -66,6 +68,7 @@ def _workspace(workspace_id, *, computer_id=COMPUTER_ID, status="running"):
 def _computer(*, shadowed, status="running", provider_ref="sandbox-abc"):
     return {
         "computer_id": COMPUTER_ID,
+        "kind": "daytona",
         "status": status,
         "provider_ref": provider_ref,
         "shadowed_workspace_ids": shadowed,
@@ -557,6 +560,129 @@ class TestStopOwnershipFence(_Base):
         manager._settle_machine_stop.assert_awaited_once_with(COMPUTER_ID, "running")
 
 
+def _ssh_binding(workspace_id="ws-1"):
+    return ComputerBinding(
+        workspace_id=workspace_id,
+        computer_id=COMPUTER_ID,
+        kind="ssh",
+        root_dir="/home/user/langalpha",
+        provider_ref="ssh-abc",
+    )
+
+
+def _owner_provider(*, state=None, error=None, host_unavailable=False):
+    """A provider whose machine answers with a state or fails with an error."""
+    runtime = SimpleNamespace(
+        get_state=AsyncMock(return_value=state, side_effect=error)
+    )
+    return SimpleNamespace(
+        get=AsyncMock(return_value=runtime),
+        close=AsyncMock(),
+        is_host_unavailable=lambda e: host_unavailable,
+        is_transient_error=lambda e: isinstance(e, SandboxTransientError),
+    )
+
+
+class TestStopOnAMachineItsOwnerBrought(_Base):
+    """A laptop asleep or a VPS powered down cannot answer a stop, and the next
+    start finds the machine as it was left, so the stop settles without it
+    instead of staying retryable forever. A machine that refuses the login is
+    no more reachable, and a row left stopping would refuse both the start that
+    shows the owner why and the remove that is their way out."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "error,host_unavailable",
+        [
+            (OSError("no route to host"), True),
+            (SandboxTransientError("Lost the connection"), False),
+            (SSHConnectError("host_key_mismatch", "The host key changed."), False),
+            (SSHConnectError("auth_failed", "The machine refused the key."), False),
+        ],
+        ids=["unreachable", "connection-lost", "host-key-changed", "key-refused"],
+    )
+    async def test_an_unanswering_machine_settles_the_stop_as_stopped(
+        self, error, host_unavailable
+    ):
+        manager = self._manager()
+        manager._settle_machine_stop = AsyncMock()
+        manager._provider_for = MagicMock(
+            return_value=_owner_provider(
+                error=error, host_unavailable=host_unavailable
+            )
+        )
+        session = MagicMock()
+        manager._machine(COMPUTER_ID).session = session
+        manager._retire_session = AsyncMock()
+
+        assert await manager._reconcile_provider_stop(_ssh_binding()) is True
+
+        manager._settle_machine_stop.assert_awaited_once_with(COMPUTER_ID, "stopped")
+        manager._retire_session.assert_awaited_once()
+        assert manager._retire_session.await_args.args[:2] == (COMPUTER_ID, session)
+
+    @pytest.mark.asyncio
+    async def test_a_machine_still_running_settles_running_and_stays_retryable(self):
+        manager = self._manager()
+        manager._settle_machine_stop = AsyncMock()
+        manager._provider_for = MagicMock(
+            return_value=_owner_provider(state=RuntimeState.RUNNING)
+        )
+
+        with patch(f"{_LIFECYCLE}.update_computer_activity", AsyncMock()):
+            assert await manager._reconcile_provider_stop(_ssh_binding()) is False
+
+        manager._settle_machine_stop.assert_awaited_once_with(COMPUTER_ID, "running")
+
+    @pytest.mark.asyncio
+    async def test_a_failure_that_is_not_the_machines_absence_is_not_swallowed(self):
+        manager = self._manager()
+        manager._provider_for = MagicMock(
+            return_value=_owner_provider(error=ValueError("bug"))
+        )
+
+        with pytest.raises(ValueError):
+            await manager._owner_machine_state(_ssh_binding())
+
+    @pytest.mark.asyncio
+    async def test_a_stop_skips_the_backup_of_a_machine_that_does_not_answer(self):
+        manager = self._manager()
+        manager._owner_machine_state = AsyncMock(return_value=None)
+        manager._backup_machine_files_to_db = AsyncMock(return_value=2)
+        manager._settle_machine_stop = AsyncMock()
+        manager._stop_result = AsyncMock(return_value={"status": "stopped"})
+
+        result = await manager._finish_claimed_stop(
+            _ssh_binding(), workspace_id="ws-1", durable_sandbox_id="ssh-abc"
+        )
+
+        assert result == {"status": "stopped"}
+        manager._backup_machine_files_to_db.assert_not_awaited()
+        manager._settle_machine_stop.assert_awaited_once_with(COMPUTER_ID, "stopped")
+
+    @pytest.mark.asyncio
+    async def test_a_recreatable_kind_keeps_reading_state_through_a_detached_runtime(
+        self,
+    ):
+        manager = self._manager()
+        manager._settle_machine_stop = AsyncMock()
+        manager._owner_machine_state = AsyncMock()
+        runtime = SimpleNamespace(
+            get_state=AsyncMock(return_value=RuntimeState.STOPPED)
+        )
+
+        @asynccontextmanager
+        async def _runtime(*_args, **_kwargs):
+            yield runtime
+
+        manager._detached_runtime = _runtime
+
+        assert await manager._reconcile_provider_stop(_binding("ws-1")) is False
+
+        manager._owner_machine_state.assert_not_awaited()
+        manager._settle_machine_stop.assert_awaited_once_with(COMPUTER_ID, "stopped")
+
+
 class TestStopMirrorsEveryProjectOnTheMachine(_Base):
     """A stop is asked of one project and ends the runtime for every one of them.
 
@@ -709,7 +835,7 @@ class TestArchiveClaim(_Base):
         manager._machine_has_active_tasks = AsyncMock(return_value=False)
         row = _computer(shadowed=[], status="stopped")
         status = AsyncMock(return_value={**row, "status": "stopping"} if wins else None)
-        runtime = SimpleNamespace(capabilities={"archive"}, archive=AsyncMock())
+        runtime = SimpleNamespace(archives=True, archive=AsyncMock())
 
         @asynccontextmanager
         async def detached(*_args, **_kwargs):
@@ -742,7 +868,7 @@ class TestArchiveClaim(_Base):
         manager._reconcile_provider_stop = AsyncMock(side_effect=RuntimeError("unreachable"))
         manager._settle_machine_stop = AsyncMock()
         runtime = SimpleNamespace(
-            capabilities={"archive"}, archive=AsyncMock(side_effect=RuntimeError("archive failed"))
+            archives=True, archive=AsyncMock(side_effect=RuntimeError("archive failed"))
         )
 
         @asynccontextmanager

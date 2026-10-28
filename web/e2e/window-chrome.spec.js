@@ -50,13 +50,12 @@ const SHELL_BRIDGE = { version: '0.0.0-e2e', platform: 'darwin', windowChrome: '
 // different properties; a route added to one list and not the other would
 // quietly keep half its coverage.
 //
-// The two legal documents are here even though the shell no longer opens either
-// one (every link to them carries a target, so it reaches the system browser
-// instead). They stay because the reason they were exposed is the general one:
-// a route of prose has nothing in the `no-drag` list, so the strip covers its
-// top line. If one is ever linked back into the app window, this is what still
-// measures what that costs.
-const CHROMELESS_ROUTES = ['/setup/method', '/privacy', '/legal', '/s/no-such-token'];
+// The legal page is here even though the shell no longer opens it (every link
+// to it carries a target, so it reaches the system browser instead). It stays
+// because the reason it was exposed is the general one: a route of prose has
+// nothing in the `no-drag` list, so the strip covers its top line. If it is ever
+// linked back into the app window, this is what still measures what that costs.
+const CHROMELESS_ROUTES = ['/setup/method', '/legal', '/s/no-such-token'];
 
 // Any valid v4 UUID; nothing has to exist behind it for the thread gallery to
 // render its back-button row, which is the bar this suite measures.

@@ -11,7 +11,7 @@ import {
   EarningsSurpriseChart,
   CashFlowChart,
   RevenueBreakdownChart,
-} from '../../ChatAgent/components/charts/MarketDataCharts';
+} from '../../ChatAgent/components/charts/CompanyCharts';
 import { formatMoney } from '@/lib/bars';
 import { compactNumberFixed2, fixed2, signedFixed2 } from '@/lib/format';
 import { deriveOverviewQuote, type CompanyOverviewArtifact } from '@/lib/quotes/overview';

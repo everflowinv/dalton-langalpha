@@ -2,7 +2,7 @@
 
 Intercepts a Read of an image/PDF path or URL, fetches the bytes, and hands back
 the tool result carrying them as content blocks, so the attachment stays bound to
-the call that produced it.
+the call that produced it. A PDF is attached a window of pages at a time.
 
 Whether the model about to be called can still read those blocks is a separate
 question answered on every later turn, in ``multimodal_strip``.
@@ -16,16 +16,22 @@ import asyncio
 import base64
 import io
 import logging
-from collections.abc import Awaitable, Callable
+import weakref
+from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
 import httpx
 from langchain.agents.middleware import AgentMiddleware
 from langchain_core.messages import ToolMessage
-from PIL import Image
 
+from ptc_agent.agent.middleware.file_operations.image_fit import (
+    UnreadableImage,
+    UnsupportedImageFormat,
+    identify_image,
+)
 from ptc_agent.agent.tools.file_ops import is_memo_text_path
+from ptc_agent.core.sandbox.files import FileOverCap
 from src.tools.web.inhouse.guard import BlockedAddressError, GuardedAsyncTransport
 
 logger = logging.getLogger(__name__)
@@ -39,27 +45,34 @@ DOCUMENT_EXTENSIONS = frozenset({".pdf"})
 # Combined visual extensions
 VISUAL_EXTENSIONS = IMAGE_EXTENSIONS | DOCUMENT_EXTENSIONS
 
-# PIL reports a format name; providers speak MIME. A format outside this map is
-# one no provider accepts, so it is refused rather than given a near-miss guess.
-_PIL_FORMAT_TO_MIME = {
-    "PNG": "image/png",
-    "JPEG": "image/jpeg",
-    "GIF": "image/gif",
-    "WEBP": "image/webp",
-}
-
-# The widest per-request page ceiling any provider we ship publishes (Gemini's).
-# Deliberately not the tightest: injection cannot know which model will consume
-# the block — the middleware instance is shared with every subagent — so a cap
-# picked for the strictest target would refuse documents the actual target
-# accepts. What each target can really take is enforced on the read side, where
-# the model is known; this bound only rejects what nobody would accept.
-MAX_PDF_PAGES = 1000
+# The most pages one Read attaches, and how many it attaches unasked. A
+# provider reads each page as its text and an image of it, a few thousand
+# tokens, so a whole report could fill the context window in one Read, and
+# every later call would carry it. A window bounds what a Read costs whatever
+# the document's length, and stays under every target's page ceiling, which
+# the read side still checks.
+PDF_PAGE_WINDOW = 20
 
 
 class _UnusableContent(Exception):
     """Why bytes can't be injected. The text reaches the agent, so it reads as a
     predicate ("not a readable PDF") that slots into the caller's message."""
+
+
+class _TooLarge(Exception):
+    """Content over a byte cap, which the refusal names."""
+
+    def __init__(self, limit: int) -> None:
+        super().__init__(limit)
+        self.limit = limit
+
+
+class _PastTheEnd(Exception):
+    """A page window that starts after the PDF's last page."""
+
+    def __init__(self, total: int) -> None:
+        super().__init__(total)
+        self.total = total
 
 
 def _detect_mime_type(content: bytes) -> tuple[str, int | None]:
@@ -82,21 +95,117 @@ def _detect_mime_type(content: bytes) -> tuple[str, int | None]:
             pages = len(pypdf.PdfReader(io.BytesIO(content)).pages)
         except Exception:
             raise _UnusableContent("not a readable PDF") from None
-        if pages > MAX_PDF_PAGES:
-            raise _UnusableContent(
-                f"a {pages}-page PDF, over the {MAX_PDF_PAGES}-page limit"
-            )
         return "application/pdf", pages
 
     try:
-        img = Image.open(io.BytesIO(content))
-        img.verify()
-    except Exception:
+        return identify_image(content), None
+    except UnsupportedImageFormat as exc:
+        raise _UnusableContent(str(exc)) from None
+    except UnreadableImage:
         raise _UnusableContent("not a readable image or PDF") from None
-    mime_type = _PIL_FORMAT_TO_MIME.get(img.format or "")
-    if mime_type is None:
-        raise _UnusableContent(f"in {img.format} format, which no provider accepts")
-    return mime_type, None
+
+
+def _page_window(offset: Any, limit: Any) -> tuple[int, int]:
+    """(pages to skip, pages to attach) from Read's ``offset`` and ``limit``.
+
+    The model sizes ``limit`` in lines unless it means pages, so anything past
+    the window, or no usable number at all, is the window.
+    """
+
+    def _int(value: Any) -> int | None:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    skip = max(_int(offset) or 0, 0)
+    count = _int(limit)
+    if count is None or not 0 < count <= PDF_PAGE_WINDOW:
+        count = PDF_PAGE_WINDOW
+    return skip, count
+
+
+def _pdf_window(content: bytes, reader: Any, skip: int, count: int) -> bytes:
+    """The PDF made of ``count`` pages after the first ``skip``, as its own
+    document. The bytes as they are when the window is all of it, so a short
+    PDF reaches the provider exactly as it was written."""
+    if skip == 0 and count >= len(reader.pages):
+        return content
+    import pypdf
+
+    try:
+        writer = pypdf.PdfWriter()
+        for page in reader.pages[skip : skip + count]:
+            writer.add_page(page)
+        out = io.BytesIO()
+        writer.write(out)
+    except Exception:
+        raise _UnusableContent("not a readable PDF") from None
+    return out.getvalue()
+
+
+def _prepare(
+    content: bytes, skip: int, count: int, source: str, max_bytes: int
+) -> tuple[bytes, str, int | None, str | None]:
+    """(bytes to attach, MIME type, pages attached, marker), the marker None
+    unless pages remain after the window.
+
+    A PDF window over ``max_bytes`` is halved until it fits rather than
+    refused: the marker gives the offset after the pages actually attached, so
+    a shorter window loses nothing, where a refusal would leave a document of
+    large scanned pages unreadable at the default window.
+    """
+    mime_type, total = _detect_mime_type(content)
+    if not total:
+        # An image, or a PDF whose page tree reads as empty, which a provider
+        # may still read: no window to cut, so it goes whole under the cap a
+        # window has, its page count unknown.
+        if len(content) > max_bytes:
+            raise _TooLarge(max_bytes)
+        return content, mime_type, None, None
+    if skip >= total:
+        raise _PastTheEnd(total)
+    import pypdf
+
+    try:
+        reader = pypdf.PdfReader(io.BytesIO(content))
+    except Exception:
+        raise _UnusableContent("not a readable PDF") from None
+    count = min(count, total - skip)
+    window = _pdf_window(content, reader, skip, count)
+    while len(window) > max_bytes:
+        if count == 1:
+            raise _TooLarge(max_bytes)
+        count //= 2
+        window = _pdf_window(content, reader, skip, count)
+    last = skip + count
+    marker = None
+    if last < total:
+        # 1-based for the model, and the next offset is the pages read so far.
+        pages = f"Page {last}" if count == 1 else f"Pages {skip + 1}-{last}"
+        marker = (
+            f"[{pages} of {total}. Read(file_path='{source}', "
+            f"offset={last}) for the next pages.]"
+        )
+    return window, mime_type, count, marker
+
+
+#: Reads loading an attachment at once on one event loop. A PDF source may be
+#: 64 MiB, held with a copy of it and the window cut from it, so a parallel
+#: batch of Reads is bounded here, from the fetch until the window is attached.
+#: The sandbox's own download slots cover neither a URL nor the cutting.
+_LOADS_AT_ONCE = 4
+_loads: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _load_slot() -> asyncio.Semaphore:
+    loop = asyncio.get_running_loop()
+    slot = _loads.get(loop)
+    if slot is None:
+        slot = _loads[loop] = asyncio.Semaphore(_LOADS_AT_ONCE)
+    return slot
 
 
 def _is_visual_request(file_path: str) -> bool:
@@ -125,15 +234,17 @@ def build_content_blocks(
     source: str,
     mime_type: str,
     pages: int | None = None,
+    marker: str | None = None,
 ) -> list[dict[str, Any]]:
     """Content blocks for verified bytes, labelled and ready to ride on a result.
 
     ``pages`` is stamped on the PDF block for the read-side ceiling check. Every
     provider converter drops keys it doesn't recognise, so it stays a local
-    annotation and never reaches the wire.
+    annotation and never reaches the wire. ``marker`` joins the PDF's label,
+    keeping the one-text-plus-attachment shape every route was probed against.
 
     ``mime_type`` comes from ``_detect_mime_type``, which admits PDFs and the
-    four image formats in ``_PIL_FORMAT_TO_MIME`` and nothing else.
+    four image formats ``identify_image`` accepts and nothing else.
     """
     if mime_type == "application/pdf":
         # LangChain's file block, which converts to Anthropic's document format.
@@ -146,7 +257,8 @@ def build_content_blocks(
         }
         if pages is not None:
             block["pages"] = pages
-        return [{"type": "text", "text": f"[Viewing PDF: {filename}]"}, block]
+        label = f"[Viewing PDF: {filename}]" + (f"\n{marker}" if marker else "")
+        return [{"type": "text", "text": label}, block]
 
     return [
         {"type": "text", "text": "[Viewing image]"},
@@ -206,6 +318,12 @@ class MultimodalMiddleware(AgentMiddleware):
     # rather than brick the thread.
     MAX_CONTENT_BYTES = 5 * 1024 * 1024
 
+    # A PDF is fetched whole but attached a window at a time, and only the
+    # window reaches the checkpoint, so MAX_CONTENT_BYTES bounds the window and
+    # this bounds the source: what a model-chosen file may cost the backend to
+    # hold and parse.
+    MAX_PDF_SOURCE_BYTES = 64 * 1024 * 1024
+
     def __init__(self, *, sandbox: Any) -> None:
         """
         Args:
@@ -225,9 +343,11 @@ class MultimodalMiddleware(AgentMiddleware):
             return await handler(request)
 
         tool_call_id = tool_call.get("id", "unknown")
-        file_path = tool_call.get("args", {}).get("file_path", "")
+        args = tool_call.get("args", {})
+        file_path = args.get("file_path", "")
         if not _is_visual_request(file_path):
             return await handler(request)
+        window = _page_window(args.get("offset"), args.get("limit"))
 
         # Injected unconditionally, without asking whether the model can view it.
         # This middleware is a single instance shared with every subagent, so the
@@ -244,24 +364,43 @@ class MultimodalMiddleware(AgentMiddleware):
         if isinstance(result.content, str) and result.content.startswith("ERROR:"):
             return result
 
-        if file_path.startswith(("http://", "https://")):
-            return await self._handle_url_content(file_path, result, tool_call_id)
-        return await self._handle_sandbox_content(file_path, result, tool_call_id)
+        async with _load_slot():
+            if file_path.startswith(("http://", "https://")):
+                return await self._handle_url_content(file_path, result, tool_call_id, window)
+            return await self._handle_sandbox_content(file_path, result, tool_call_id, window)
 
-    def _too_large(self, source: str, tool_call_id: str) -> ToolMessage:
+    def _too_large(self, source: str, tool_call_id: str, limit: int) -> ToolMessage:
         """Refuse an oversized block with a bare error result.
 
         The point of refusing is that nothing oversized reaches the checkpoint,
         so the refusal carries no content blocks at all.
         """
-        limit_mb = self.MAX_CONTENT_BYTES // (1024 * 1024)
-        logger.warning(
-            f"[MULTIMODAL] Content exceeds {self.MAX_CONTENT_BYTES} bytes, refusing: {source}"
-        )
+        limit_mb = limit // (1024 * 1024)
+        logger.warning(f"[MULTIMODAL] Content exceeds {limit} bytes, refusing: {source}")
         return _error(
             tool_call_id,
             f"Content is larger than the {limit_mb}MB limit and was not loaded: {source}",
         )
+
+    def _cap_for(self, head: bytes) -> int:
+        """The byte cap for a body that starts with ``head``.
+
+        The cap follows the bytes, the way the content is typed: a URL need not
+        end in .pdf, and a sandbox name is only as accurate as its writer.
+        Checked as the bytes arrive, since a Content-Length header or a file
+        size is only a claim until they do.
+        """
+        return self.MAX_PDF_SOURCE_BYTES if head.startswith(b"%PDF") else self.MAX_CONTENT_BYTES
+
+    async def _read_capped(self, chunks: AsyncIterator[bytes]) -> bytes:
+        """The whole body, raising `_TooLarge` as soon as it passes the cap."""
+        buffer = bytearray()
+        async for chunk in chunks:
+            buffer.extend(chunk)
+            cap = self._cap_for(buffer)
+            if len(buffer) > cap:
+                raise _TooLarge(cap)
+        return bytes(buffer)
 
     async def _attach_bytes(
         self,
@@ -269,8 +408,10 @@ class MultimodalMiddleware(AgentMiddleware):
         source: str,
         tool_result: ToolMessage,
         tool_call_id: str,
+        window: tuple[int, int] = (0, PDF_PAGE_WINDOW),
     ) -> ToolMessage:
-        """Type, verify and encode fetched bytes onto the tool result.
+        """Type, verify and encode fetched bytes onto the tool result, a PDF
+        cut to the ``window`` of pages (skip, count) asked for.
 
         Typed from the bytes rather than the name: a signed or redirected URL can
         end without an extension, and a sandbox extension is only as accurate as
@@ -278,13 +419,24 @@ class MultimodalMiddleware(AgentMiddleware):
         before any provider sees it.
         """
         try:
-            # Off-loop: pypdf walks the xref of up to MAX_CONTENT_BYTES of
+            # Off-loop: pypdf walks the xref of up to MAX_PDF_SOURCE_BYTES of
             # model-chosen content, which is milliseconds on a real document
-            # but ~100ms on one padded with junk after %%EOF.
-            mime_type, pages = await asyncio.to_thread(_detect_mime_type, content_bytes)
+            # but ~100ms on one padded with junk after %%EOF, and copies the
+            # window's pages out, again for each halving.
+            content_bytes, mime_type, pages, marker = await asyncio.to_thread(
+                _prepare, content_bytes, *window, source, self.MAX_CONTENT_BYTES
+            )
+        except _TooLarge as exc:
+            return self._too_large(source, tool_call_id, exc.limit)
         except _UnusableContent as exc:
             logger.warning(f"[MULTIMODAL] Refusing content ({exc}): {source}")
             return _error(tool_call_id, f"Content is {exc}: {source}")
+        except _PastTheEnd as exc:
+            return _error(
+                tool_call_id,
+                f"offset={window[0]} is past the last page of this {exc.total}-page "
+                f"PDF: {source}",
+            )
 
         b64_string = base64.b64encode(content_bytes).decode("utf-8")
         logger.info(
@@ -292,7 +444,7 @@ class MultimodalMiddleware(AgentMiddleware):
             f"({len(content_bytes)} bytes, {mime_type})"
         )
         return attach_to_tool_result(
-            tool_result, build_content_blocks(b64_string, source, mime_type, pages)
+            tool_result, build_content_blocks(b64_string, source, mime_type, pages, marker)
         )
 
     async def _handle_url_content(
@@ -300,6 +452,7 @@ class MultimodalMiddleware(AgentMiddleware):
         url: str,
         tool_result: ToolMessage,
         tool_call_id: str,
+        window: tuple[int, int] = (0, PDF_PAGE_WINDOW),
     ) -> ToolMessage:
         """Download a URL and attach its bytes, or answer with why it could not."""
         try:
@@ -322,21 +475,18 @@ class MultimodalMiddleware(AgentMiddleware):
                             f"Could not download content (HTTP {response.status_code}): {url}",
                         )
 
-                    buffer = bytearray()
-                    async for chunk in response.aiter_bytes():
-                        buffer.extend(chunk)
-                        if len(buffer) > self.MAX_CONTENT_BYTES:
-                            return self._too_large(url, tool_call_id)
-                    content_bytes = bytes(buffer)
+                    content_bytes = await self._read_capped(response.aiter_bytes())
 
             if not content_bytes:
                 logger.warning(f"[MULTIMODAL] Empty content from URL: {url}")
                 return _error(tool_call_id, f"Empty content from URL: {url}")
 
             return await self._attach_bytes(
-                content_bytes, url, tool_result, tool_call_id
+                content_bytes, url, tool_result, tool_call_id, window
             )
 
+        except _TooLarge as exc:
+            return self._too_large(url, tool_call_id, exc.limit)
         except httpx.TimeoutException:
             logger.warning(f"[MULTIMODAL] Timeout downloading content: {url}")
             return _error(tool_call_id, f"Timeout downloading content: {url}")
@@ -359,28 +509,28 @@ class MultimodalMiddleware(AgentMiddleware):
         file_path: str,
         tool_result: ToolMessage,
         tool_call_id: str,
+        window: tuple[int, int] = (0, PDF_PAGE_WINDOW),
     ) -> ToolMessage:
         """Fetch a sandbox file's bytes and attach them, or answer with why not."""
         try:
             # The Read tool reaches the sandbox through SandboxBackend, which
             # normalizes first; this middleware holds the sandbox itself, whose
-            # adownload_file_bytes does not. Without this, a virtual path the
-            # tool resolved fine ("/work/task/charts/c.png") misses here and
-            # replaces the tool's success with a not-found error.
-            file_bytes = await self.sandbox.adownload_file_bytes(
-                self.sandbox.normalize_path(file_path)
+            # download does not. Without this, a virtual path the tool resolved
+            # fine ("/work/task/charts/c.png") misses here and replaces the
+            # tool's success with a not-found error.
+            file_bytes = await self.sandbox.adownload_file_bytes_capped(
+                self.sandbox.normalize_path(file_path), self._cap_for
             )
             if not file_bytes:
                 logger.warning(f"[MULTIMODAL] Failed to download file: {file_path}")
                 return _error(tool_call_id, f"Could not read file: {file_path}")
 
-            if len(file_bytes) > self.MAX_CONTENT_BYTES:
-                return self._too_large(file_path, tool_call_id)
-
             return await self._attach_bytes(
-                file_bytes, file_path, tool_result, tool_call_id
+                file_bytes, file_path, tool_result, tool_call_id, window
             )
 
+        except (_TooLarge, FileOverCap) as exc:
+            return self._too_large(file_path, tool_call_id, exc.limit)
         except (OSError, ValueError) as e:
             logger.warning(f"[MULTIMODAL] Error loading sandbox file {file_path}: {e}")
             return _error(tool_call_id, f"Failed to load file: {e}")

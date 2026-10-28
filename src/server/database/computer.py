@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional, Sequence
 from psycopg.rows import dict_row
 from psycopg.types.json import Json
 
+from src.server.database.home_workspace import get_home_workspace_id
 from src.server.database.pool import get_db_connection
 from src.server.database.sql_fences import (
     COMPUTER_COLS as _COMPUTER_COLS,
@@ -39,15 +40,6 @@ __all__ = [
 ]
 
 logger = logging.getLogger(__name__)
-
-# A user reads the name before anything else about the machine, so it says
-# where the machine runs: Daytona is the hosted default, Docker is theirs.
-COMPUTER_NAMES_BY_KIND = {"daytona": "Cloud computer", "docker": "Local computer"}
-
-
-def default_computer_name(kind: str) -> str:
-    return COMPUTER_NAMES_BY_KIND.get(kind, COMPUTER_NAMES_BY_KIND["daytona"])
-
 
 DEFAULT_ROOT_DIR = "/home/workspace"
 
@@ -108,6 +100,24 @@ def computer_advisory_key(computer_id: str) -> int:
     return advisory_key("C", computer_id)
 
 
+async def get_live_computer_kinds(*, conn=None) -> Dict[str, int]:
+    """Count the computers not deleted, per provider kind.
+
+    A kind stays served for as long as computers of it exist, so a provider
+    switch keeps the old kind's Secrets current with no config to remember.
+    """
+    async with _computer_cursor(conn) as cur:
+        await cur.execute(
+            """
+            SELECT kind, count(*) AS computers
+            FROM computers
+            WHERE status <> 'deleted'
+            GROUP BY kind
+            """
+        )
+        return {str(r["kind"]): int(r["computers"]) for r in await cur.fetchall()}
+
+
 def bind_provider_ref_statement(
     *,
     authority: str,
@@ -119,9 +129,10 @@ def bind_provider_ref_statement(
 
     IS NOT DISTINCT FROM fences the previous ref; lifecycle fencing prevents a
     racing bind from reviving a stopped machine. A bind is a sandbox that
-    started, so it ends any host outage the row was timing. A rebuild a host
-    outage authorized also fences on that outage still running: the old
-    sandbox resuming meanwhile ends it, and then the old one is kept.
+    started, so it ends any host outage the row was timing and clears the
+    last start's failure. A rebuild a host outage authorized also fences on
+    that outage still running: the old sandbox resuming meanwhile ends it,
+    and then the old one is kept.
     """
     always_on_guard = (
         "\n                  AND c.is_always_on = %(expected_always_on)s"
@@ -139,7 +150,8 @@ def bind_provider_ref_statement(
             "status = 'running',\n"
             "                    provider_ref = %(provider_ref)s,\n"
             "                    platform_secret_version = %(platform_secret_version)s,\n"
-            "                    host_unavailable_since = NULL"
+            "                    host_unavailable_since = NULL,\n"
+            "                    start_failure = NULL"
         ),
         "workspace_set": (
             "status = 'running',\n"
@@ -193,8 +205,12 @@ async def get_computer_for_workspace(
 
     The join already has the project's row, so ``dir_name`` rides along: the
     binding needs the folder as often as it needs the machine, and a second
-    query for it is a second answer that can disagree with this one. None is
-    normal for an unbound Home and backfill shared-sandbox tie-break losers.
+    query for it is a second answer that can disagree with this one, and so
+    does ``files_epoch``, which says which arrival of the files a worker's
+    record of the folder is for, and ``previous_root_dirs`` and
+    ``previous_dir_names``, which a fold of the workspace's older paths reads
+    beside the machine's own root and folder. None is normal for an unbound
+    Home and backfill shared-sandbox tie-break losers.
     """
     workspace_id = normalize_uuid(workspace_id)
     if workspace_id is None:
@@ -203,7 +219,8 @@ async def get_computer_for_workspace(
     async with _computer_cursor(conn) as cur:
         await cur.execute(
             f"""
-            SELECT {computer_cols("c")}, w.dir_name
+            SELECT {computer_cols("c")}, w.dir_name, w.files_epoch, w.previous_root_dirs,
+                w.previous_dir_names
             FROM computers c
             JOIN workspaces w ON w.computer_id = c.computer_id
             WHERE w.workspace_id = %s AND c.{FENCE_NOT_DELETED}
@@ -285,6 +302,46 @@ async def get_computers_for_user(
         return [dict(r) for r in await cur.fetchall()]
 
 
+async def count_live_computers_of_kind(
+    user_id: str, kind: str, *, conn=None
+) -> int:
+    async with _computer_cursor(conn) as cur:
+        await cur.execute(
+            f"""
+            SELECT count(*) AS computers
+            FROM computers
+            WHERE user_id = %s AND kind = %s AND {FENCE_NOT_DELETED}
+            """,
+            (user_id, kind),
+        )
+        row = await cur.fetchone()
+        return int(row["computers"]) if row else 0
+
+
+async def get_computer_names_and_home(
+    user_id: str,
+    *,
+    conn=None,
+) -> List[Dict[str, Any]]:
+    """The user's live computers by id and name, each flagged when the user's
+    Home is on it: the names and the Home binding from one snapshot. The kind
+    and provider config say which is a machine of the user's own."""
+    async with _computer_cursor(conn) as cur:
+        await cur.execute(
+            f"""
+            SELECT c.computer_id, c.name, c.kind, c.provider_config,
+                   c.computer_id IS NOT DISTINCT FROM (
+                       SELECT h.computer_id FROM workspaces h
+                       WHERE h.workspace_id = %(home_id)s AND h.{FENCE_NOT_DELETED}
+                   ) AS is_home
+            FROM computers c
+            WHERE c.user_id = %(user_id)s AND c.{FENCE_NOT_DELETED}
+            """,
+            {"user_id": user_id, "home_id": get_home_workspace_id(user_id)},
+        )
+        return [dict(r) for r in await cur.fetchall()]
+
+
 async def get_primary_computer(
     user_id: str,
     *,
@@ -352,7 +409,11 @@ async def mark_computer_retirement_pending(
     *,
     conn=None,
 ) -> bool:
-    """Durably ask cleanup to finish retiring this machine once it is empty."""
+    """Durably ask cleanup to finish retiring this machine once it is empty.
+
+    True only when this call set the marker, so a request that takes back its
+    own marker can tell it from one another delete left owed.
+    """
     async with _computer_cursor(conn) as cur:
         await cur.execute(
             f"""
@@ -365,6 +426,34 @@ async def mark_computer_retirement_pending(
                 updated_at = NOW()
             WHERE computer_id = %s
               AND {FENCE_NOT_DELETED}
+              AND NOT COALESCE(config, '{{}}'::jsonb)
+                    @> '{{"retire_when_empty": true}}'::jsonb
+            """,
+            (computer_id,),
+        )
+        return cur.rowcount > 0
+
+
+async def defer_computer_retirement(
+    computer_id: str,
+    *,
+    conn=None,
+) -> bool:
+    """Move a pending retirement behind newer ones in the sweep's order.
+
+    Only while it is still pending: a marker taken off since the sweep read it
+    was settled by whoever took it off, and putting it back would retire a
+    computer its owner was told stays.
+    """
+    async with _computer_cursor(conn) as cur:
+        await cur.execute(
+            f"""
+            UPDATE computers
+            SET updated_at = NOW()
+            WHERE computer_id = %s
+              AND {FENCE_NOT_DELETED}
+              AND COALESCE(config, '{{}}'::jsonb)
+                    @> '{{"retire_when_empty": true}}'::jsonb
             """,
             (computer_id,),
         )
@@ -394,11 +483,67 @@ async def clear_computer_retirement_pending(
         return cur.rowcount > 0
 
 
+async def record_machine_facts(
+    computer_id: str, shown: Dict[str, Any], *, conn=None
+) -> bool:
+    """Keep what a machine said of itself as it started, for its details.
+
+    Display data only, written over the last reading: a system updates, and
+    nothing else reads it, so it neither bumps ``updated_at`` nor fences on
+    anything but the row still being there.
+    """
+    async with _computer_cursor(conn) as cur:
+        await cur.execute(
+            f"""
+            UPDATE computers
+            SET config = COALESCE(config, '{{}}'::jsonb) || %s::jsonb
+            WHERE computer_id = %s
+              AND {FENCE_NOT_DELETED}
+            """,
+            (Json(shown), computer_id),
+        )
+        return cur.rowcount > 0
+
+
+async def record_computer_start_failure(
+    computer_id: str, failure: Dict[str, Any], *, conn=None
+) -> bool:
+    """Keep why a start failed, stamped on the database clock.
+
+    Not on a running row: a start that won on another worker has already
+    cleared it, and a failure of this one's is no longer the machine's
+    state. Leaves ``updated_at`` alone, since the start fences on it.
+    """
+    async with _computer_cursor(conn) as cur:
+        await cur.execute(
+            f"""
+            UPDATE computers
+            SET start_failure = %s::jsonb || jsonb_build_object('at', NOW())
+            WHERE computer_id = %s
+              AND {FENCE_NOT_DELETED}
+              AND status <> 'running'
+            """,
+            (Json(failure), computer_id),
+        )
+        return cur.rowcount > 0
+
+
+async def clear_computer_start_failure(computer_id: str, *, conn=None) -> bool:
+    """Forget the last failed start, for a repair accepted to try again."""
+    async with _computer_cursor(conn) as cur:
+        await cur.execute(
+            "UPDATE computers SET start_failure = NULL"
+            " WHERE computer_id = %s AND start_failure IS NOT NULL",
+            (computer_id,),
+        )
+        return cur.rowcount > 0
+
+
 async def create_computer(
     user_id: str,
     *,
     kind: str = "daytona",
-    name: Optional[str] = None,
+    name: str,
     is_primary: bool = False,
     status: str = "creating",
     resource_tier: str = "standard",
@@ -410,6 +555,7 @@ async def create_computer(
     is_always_on: bool = False,
     platform_secret_version: int = 0,
     origin_workspace_id: Optional[str] = None,
+    files_backup: bool = True,
     conn=None,
 ) -> Dict[str, Any]:
     """A lost primary-index race retries as non-primary because another primary now exists.
@@ -419,8 +565,6 @@ async def create_computer(
     unprovisioned and gets its ref from try_bind_computer_provider_ref."""
     from psycopg.errors import UniqueViolation
 
-    name = name or default_computer_name(kind)
-
     async def _insert(want_primary: bool) -> Dict[str, Any]:
         async with _computer_cursor(conn) as cur:
             await cur.execute(
@@ -429,7 +573,7 @@ async def create_computer(
                     computer_id, user_id, kind, name, is_primary, status,
                     resource_tier, root_dir, provider_config, config,
                     provider_ref, is_always_on, platform_secret_version,
-                    origin_workspace_id
+                    origin_workspace_id, files_backup
                 )
                 VALUES (
                     COALESCE(%s::uuid, gen_random_uuid()), %s, %s, %s,
@@ -438,7 +582,7 @@ async def create_computer(
                         WHERE user_id = %s AND is_primary AND {FENCE_NOT_DELETED}
                     ),
                     %s, %s, %s, %s, %s,
-                    %s, %s, %s, %s::uuid
+                    %s, %s, %s, %s::uuid, %s
                 )
                 RETURNING {_COMPUTER_COLS}
                 """,
@@ -458,6 +602,7 @@ async def create_computer(
                     is_always_on,
                     platform_secret_version,
                     origin_workspace_id,
+                    files_backup,
                 ),
             )
             return dict(await cur.fetchone())
@@ -487,6 +632,9 @@ async def create_computer(
         f"Created computer {row['computer_id']} (kind={kind}, "
         f"primary={row['is_primary']}) for user {user_id}"
     )
+    if row.get("status") == "running":
+        # Only an adopted sandbox is born running.
+        await _note_usage(row, "running", conn=conn)
     return row
 
 
@@ -499,6 +647,7 @@ async def update_computer_status(
     updated_before=None,
     expected_provider_ref: Optional[str] = None,
     require_provider_ref: bool = False,
+    run_end_reason: Optional[str] = None,
     conn=None,
 ) -> Optional[Dict[str, Any]]:
     """Only try_bind_computer_provider_ref may change the durable machine binding.
@@ -507,6 +656,8 @@ async def update_computer_status(
     project or attach a machine-less workspace. A tombstone also surrenders the
     primary flag: every probe fences on the tombstone, so a deleted row holding
     it would wedge ensure_primary_computer against the partial unique index.
+    run_end_reason is why the machine's usage run is ending, for a cause the
+    status does not say (an idle stop).
     """
     if status not in COMPUTER_STATUSES:
         raise ValueError(f"Not a computer status: {status!r}")
@@ -527,10 +678,13 @@ async def update_computer_status(
         )
     stopped_clause = ", stopped_at = NOW()" if status == "stopped" else ""
     primary_clause = ", is_primary = FALSE" if status == "deleted" else ""
-    # Running is a start that succeeded, which ends any host outage; a revert
-    # to stopped after a refused start keeps the clock going.
+    # Running is a start that succeeded, which ends any host outage and the
+    # last start's failure; a revert to stopped after a refused start keeps
+    # the clock going and the failure shown.
     running_clause = (
-        ", host_unavailable_since = NULL" if status == "running" else ""
+        ", host_unavailable_since = NULL, start_failure = NULL"
+        if status == "running"
+        else ""
     )
 
     params: Dict[str, Any] = {
@@ -562,6 +716,7 @@ async def update_computer_status(
     if row is None:
         return None
     await _publish_shadowed(row, status)
+    await _note_usage(row, status, conn=conn, reason=run_end_reason)
     return dict(row)
 
 
@@ -617,6 +772,7 @@ async def try_claim_computer_for_start(
         return None
     logger.debug(f"Claimed computer {computer_id} for start (was {from_status})")
     await _publish_shadowed(row, "starting")
+    await _note_usage(row, "starting", conn=conn)
     return dict(row)
 
 
@@ -657,6 +813,7 @@ async def try_bind_computer_provider_ref(
     if row is None:
         return None
     await _publish_shadowed(row, "running")
+    await _note_usage(row, "running")
     return dict(row)
 
 
@@ -769,6 +926,23 @@ async def set_computer_always_on(
     conn=None,
 ) -> Optional[Dict[str, Any]]:
     return await _set_computer_scalar(computer_id, "is_always_on", enabled, conn=conn)
+
+
+async def set_computer_files_backup(
+    computer_id: str, enabled: bool, *, conn=None
+) -> Optional[Dict[str, Any]]:
+    """No workspace shadow, unlike the scalars below: no platform count reads it."""
+    async with _computer_cursor(conn) as cur:
+        await cur.execute(
+            f"""
+            UPDATE computers SET files_backup = %s, updated_at = NOW()
+            WHERE computer_id = %s AND {FENCE_NOT_DELETED}
+            RETURNING {_COMPUTER_COLS}
+            """,
+            (enabled, normalize_uuid(computer_id)),
+        )
+        row = await cur.fetchone()
+    return dict(row) if row else None
 
 
 async def _set_computer_scalar(
@@ -1119,6 +1293,20 @@ async def stamp_computer_mcp_config_version(
     stamped = int(row["mcp_config_version"] or 0)
     logger.info(f"Computer {computer_id} MCP config version stamped: {stamped}")
     return stamped
+
+
+async def _note_usage(
+    row: Dict[str, Any], status: str, *, conn=None, reason: Optional[str] = None
+) -> None:
+    """Open or close the machine's usage run for a status it was written to.
+
+    After the publish: nothing a waiter does on waking reads the ledger, and
+    a caller cancelled during the hook has still told the other workers.
+    Never raises (``note_computer_status``).
+    """
+    from src.server.services.computer_usage.transitions import note_computer_status
+
+    await note_computer_status(row, status, conn=conn, reason=reason)
 
 
 async def _publish_shadowed(row: Dict[str, Any], status: str) -> None:

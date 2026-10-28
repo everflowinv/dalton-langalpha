@@ -1,3 +1,4 @@
+import { isRangedFile, type RangedFile } from '@/lib/rangedFile';
 import { getFileExtension, DOWNLOAD_ONLY_EXTENSIONS } from './fileMeta';
 
 /**
@@ -42,6 +43,8 @@ export interface FileBody {
   mime: string | null;
   content: string | null;
   buffer: ArrayBuffer | null;
+  /** A large PDF opened from its first slice, in place of `buffer`. */
+  ranged?: RangedFile;
   /** The read stopped short of the end, so a line past it may still exist. */
   truncated: boolean;
 }
@@ -51,6 +54,8 @@ export interface BodyReaders {
   readFile: (workspaceId: string, path: string) => Promise<{ content?: string; mime?: string; truncated?: boolean }>;
   readFileFull: (workspaceId: string, path: string) => Promise<{ content?: string }>;
   downloadFileAsArrayBuffer: (workspaceId: string, path: string) => Promise<ArrayBuffer>;
+  /** Left out, a PDF downloads whole. */
+  openRanged?: (workspaceId: string, path: string) => Promise<ArrayBuffer | RangedFile>;
 }
 
 const EMPTY: Omit<FileBody, 'mode' | 'mime'> = { content: null, buffer: null, truncated: false };
@@ -69,6 +74,13 @@ export async function readFileBody(
       return { mode, mime: 'image', content: null, buffer, truncated: false };
     }
     case 'buffer': {
+      if (getFileExtension(path) === 'pdf' && readers.openRanged) {
+        // pdf.js reads a PDF by range, so a large one opens from its first slice.
+        const opened = await readers.openRanged(workspaceId, path);
+        return isRangedFile(opened)
+          ? { mode, mime: 'pdf', content: null, buffer: null, ranged: opened, truncated: false }
+          : { mode, mime: 'pdf', content: null, buffer: opened, truncated: false };
+      }
       const buffer = await readers.downloadFileAsArrayBuffer(workspaceId, path);
       return { mode, mime: getFileExtension(path) === 'pdf' ? 'pdf' : 'excel', content: null, buffer, truncated: false };
     }

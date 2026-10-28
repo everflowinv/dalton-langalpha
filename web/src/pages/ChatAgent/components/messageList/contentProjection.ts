@@ -1,5 +1,7 @@
 import { registerAuthReset } from '@/lib/authResets';
-import { buildRenderBlocks, groupSegments, type RenderBlock } from './buildRenderBlocks';
+import type { PendingToolCallChunk } from '@/types/chat';
+import { buildRenderBlocks, groupSegments, HIDDEN_TOOL_CALL_NAMES, type RenderBlock } from './buildRenderBlocks';
+import { preparingCallsOf, samePreparing } from './pendingToolCalls';
 import type { ActivityItem, PreparingToolCallData } from './activityTypes';
 import { EMPTY_OBJ, type ContentSegmentRecord, type FoldState, type MessageRecord, type ToolCallProcessRecord } from './types';
 import type { ProjectedMessage } from './turnProjection';
@@ -8,11 +10,13 @@ export interface ContentInput {
   segments: ContentSegmentRecord[];
   reasoningProcesses: Record<string, Record<string, unknown>>;
   toolCallProcesses: Record<string, ToolCallProcessRecord>;
-  pendingToolCallChunks?: Record<string, Record<string, unknown>>;
+  pendingToolCallChunks?: Record<string, PendingToolCallChunk>;
   isStreaming?: boolean;
   isSubagentView?: boolean;
   /** See `buildRenderBlocks`; the current time when omitted. */
   now?: number;
+  /** The computer's own root, read as a sandbox root by the path checks. */
+  root?: string | null;
 }
 
 type FoldRole = 'retain' | 'text' | 'process';
@@ -55,10 +59,7 @@ const RETAINED_ARTIFACTS = new Set(['preview_url', 'chart_annotation', 'order_re
 function foldRole(block: RenderBlock): FoldRole {
   if (block.type === 'text') return 'text';
   if (RETAINED_TYPES.has(block.type)) return 'retain';
-  if (block.type === 'compact_artifact') {
-    const artifact = (block.proc.toolCallResult as { artifact?: { type?: string } } | undefined)?.artifact;
-    if (RETAINED_ARTIFACTS.has(artifact?.type as string)) return 'retain';
-  }
+  if (block.type === 'compact_artifact' && block.card && RETAINED_ARTIFACTS.has(block.card.type)) return 'retain';
   return 'process';
 }
 
@@ -91,6 +92,11 @@ function shareBlock(next: RenderBlock, old: RenderBlock | undefined): RenderBloc
   if (next.type === 'text' && old.type === 'text') {
     return sameFields(next.segment, old.segment) ? old : next;
   }
+  if (next.type === 'compact_artifact' && old.type === 'compact_artifact') {
+    // Its artifact and card are read off the call, and the card is a new
+    // object on every build.
+    return next.proc === old.proc && next.toolCallId === old.toolCallId ? old : next;
+  }
   return sameFields(next, old) ? old : next;
 }
 
@@ -111,7 +117,7 @@ function shareProjection(next: ContentProjection, prev: ContentProjection | unde
     return shared;
   });
   const preparingToolCall = next.preparingToolCall && prev.preparingToolCall
-    && sameFields(next.preparingToolCall, prev.preparingToolCall) ? prev.preparingToolCall : next.preparingToolCall;
+    && samePreparing(next.preparingToolCall, prev.preparingToolCall) ? prev.preparingToolCall : next.preparingToolCall;
   if (unchanged && preparingToolCall === prev.preparingToolCall && next.nextExpiry === prev.nextExpiry
     && next.hasPinnedLive === prev.hasPinnedLive && next.pinnedSettledAt === prev.pinnedSettledAt) return prev;
   return { ...next, blocks: unchanged ? prev.blocks : blocks, preparingToolCall };
@@ -122,12 +128,9 @@ function shareProjection(next: ContentProjection, prev: ContentProjection | unde
  * earlier projection of the same message, lends it every part that did not
  * change (see `shareProjection`). */
 export function projectContent(input: ContentInput, prev?: ContentProjection): ContentProjection {
-  const chunks = Object.values(input.pendingToolCallChunks ?? EMPTY_OBJ);
-  const name = chunks.find((chunk) => typeof chunk.toolName === 'string')?.toolName;
-  const preparingToolCall = chunks.length ? {
-    toolName: typeof name === 'string' ? name : undefined,
-    argsLength: chunks.reduce((sum, chunk) => sum + (typeof chunk.argsLength === 'number' ? chunk.argsLength : 0), 0),
-  } : null;
+  // A hidden tool is dropped here too, or it would show as preparing until
+  // it landed and vanished.
+  const preparingToolCall = preparingCallsOf(input.pendingToolCallChunks, input.toolCallProcesses, HIDDEN_TOOL_CALL_NAMES);
   const { blocks, nextExpiry, pinnedLive, pinnedSettledAt } = buildRenderBlocks(groupSegments(input.segments), {
     ...input, preparing: preparingToolCall !== null,
   });
@@ -167,6 +170,7 @@ interface CacheEntry {
   tools: unknown;
   pending: unknown;
   streaming: boolean;
+  root: string | null | undefined;
   projection: ContentProjection;
 }
 
@@ -181,9 +185,10 @@ const latestById = new Map<string, ContentProjection>();
 const LATEST_MAX = 32;
 registerAuthReset(() => latestById.clear());
 
-export function projectMessageContent(message: MessageRecord, isSubagentView = false): ContentProjection {
+export function projectMessageContent(message: MessageRecord, isSubagentView = false, root?: string | null): ContentProjection {
   const hit = cache.get(message);
   if (hit && hit.subagent === isSubagentView
+    && hit.root === root
     && hit.segments === message.contentSegments
     && hit.reasoning === message.reasoningProcesses
     && hit.tools === message.toolCallProcesses
@@ -201,6 +206,7 @@ export function projectMessageContent(message: MessageRecord, isSubagentView = f
     pendingToolCallChunks: (message.pendingToolCallChunks ?? EMPTY_OBJ) as ContentInput['pendingToolCallChunks'],
     isStreaming: message.isStreaming === true,
     isSubagentView,
+    root,
   }, prev);
   if (id) {
     latestById.delete(id);
@@ -214,6 +220,7 @@ export function projectMessageContent(message: MessageRecord, isSubagentView = f
     tools: message.toolCallProcesses,
     pending: message.pendingToolCallChunks,
     streaming: message.isStreaming === true,
+    root,
     projection,
   });
   return projection;
@@ -238,21 +245,22 @@ export function projectMessageContent(message: MessageRecord, isSubagentView = f
  * its content projection / provenanceRecords / error / stopped / isStreaming.
  * A future assistant field that renders OUTSIDE those (e.g. assistant-side
  * attachments) must be added to this guard or its bubbles will be hidden.
- * `isSubagentView` only keys the projection cache the bubble itself reads.
+ * `isSubagentView` and `root` only key the projection cache the bubble itself
+ * reads, so they must be the ones the bubble passes or each render rebuilds it.
  */
-export function isOrphanAssistantMessage(message: MessageRecord, isSubagentView = false): boolean {
+export function isOrphanAssistantMessage(message: MessageRecord, isSubagentView = false, root?: string | null): boolean {
   if (message.role !== 'assistant') return false;
   if (message.isStreaming) return false;
   const provenance = message.provenanceRecords as Record<string, unknown> | undefined;
   if (provenance && Object.keys(provenance).length > 0) return false;
   if (message.error || message.stopped) return false;
-  const projection = projectMessageContent(message, isSubagentView);
+  const projection = projectMessageContent(message, isSubagentView, root);
   return projection.textCount === 0 && projection.blocks.every((block) => block.type === 'text');
 }
 
 /** Drop bubbles the list must not paint (see `isOrphanAssistantMessage`). */
-export function visibleProjection(projected: ProjectedMessage[], isSubagentView = false): ProjectedMessage[] {
-  return projected.filter((p) => !isOrphanAssistantMessage(p.message, isSubagentView));
+export function visibleProjection(projected: ProjectedMessage[], isSubagentView = false, root?: string | null): ProjectedMessage[] {
+  return projected.filter((p) => !isOrphanAssistantMessage(p.message, isSubagentView, root));
 }
 
 /**

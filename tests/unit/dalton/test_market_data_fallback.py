@@ -104,23 +104,34 @@ async def test_an_empty_yfinance_answer_falls_back_to_fmp(method, args):
 
 
 @pytest.mark.asyncio
-async def test_fmp_empty_or_failed_returns_yfinances_original_empty_result():
+async def test_fmp_unavailable_after_empty_yfinance_raises_with_the_reason():
+    # B2: an FMP outage or exhausted quota after yfinance answered nothing
+    # has no answer left — yfinance's [] must not stand in as "no such data".
     fmp, yf, source = _sources()
     yf.get_realtime_quote.return_value = []
     fmp.get_realtime_quote.return_value = []
     assert await source.get_realtime_quote("AAPL") == []
 
     fmp.get_realtime_quote.side_effect = FMPRequestError("upstream down")
+    with pytest.raises(FMPRequestError, match="upstream down"):
+        await source.get_realtime_quote("AAPL")
+
+    # A request-level FMP refusal (4xx) is not an outage: yfinance's answer
+    # still stands.
+    fmp.get_realtime_quote.side_effect = FMPRequestError("not found", status_code=404)
     assert await source.get_realtime_quote("AAPL") == []
 
 
 @pytest.mark.asyncio
-async def test_fmp_quota_marker_returns_the_empty_yfinance_result():
+async def test_fmp_quota_marker_raises_after_empty_yfinance():
+    # B2: quota exhausted + empty yfinance surfaces the quota failure, not
+    # an empty list read as "no data".
     fmp, yf, source = _sources()
     yf.get_realtime_quote.return_value = []
     fmp.get_realtime_quote.side_effect = FmpQuotaExhausted(RESET)
 
-    assert await source.get_realtime_quote("AAPL") == []
+    with pytest.raises(FmpQuotaExhausted):
+        await source.get_realtime_quote("AAPL")
 
 
 @pytest.mark.asyncio

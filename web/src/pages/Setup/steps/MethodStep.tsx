@@ -1,8 +1,11 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useId } from 'react';
 import { useNavigate } from 'react-router';
 import { useTranslation } from 'react-i18next';
 import { Ticket, Link2, Code2, Key, Monitor, CheckCircle2, ChevronDown, ChevronUp } from 'lucide-react';
 import { Button } from '@/components/ui/button';
+import { OptionCard, OptionGroup } from '@/components/ui/option-card';
+import { WizardStepHeader } from '@/components/ui/wizard';
+import { SetupFooter } from '../SetupFooter';
 import { Loader } from '@/components/ui/loader';
 import { Input } from '@/components/ui/input';
 import { api } from '@/api/client';
@@ -73,12 +76,10 @@ const METHODS = ALL_METHODS.filter((m) => {
 
 function ConfiguredBanner({
   providers,
-  onSkip,
   onRemove,
   canDisconnect = true, // DALTON-HOOK(team-credentials): PM-only disconnect/remove guard
 }: {
   providers: ConfiguredProvider[];
-  onSkip: () => void;
   onRemove: (provider: ConfiguredProvider) => void;
   canDisconnect?: boolean;
 }) {
@@ -91,8 +92,8 @@ function ConfiguredBanner({
     <div
       className="rounded-lg overflow-hidden"
       style={{
-        background: 'var(--color-bg-surface)',
-        border: '1px solid var(--color-border-default)',
+        background: 'var(--color-bg-card)',
+        border: '1px solid var(--color-border-muted)',
       }}
     >
       {/* Header row */}
@@ -100,6 +101,7 @@ function ConfiguredBanner({
         <button
           type="button"
           onClick={() => setExpanded((v) => !v)}
+          aria-expanded={expanded}
           className="flex items-center gap-1.5 text-left"
         >
           <CheckCircle2 className="h-4 w-4 shrink-0" style={{ color: 'var(--color-success)' }} />
@@ -111,22 +113,19 @@ function ConfiguredBanner({
             : <ChevronDown className="h-3.5 w-3.5" style={{ color: 'var(--color-text-tertiary)' }} />
           }
         </button>
-        <Button variant="outline" size="sm" onClick={onSkip} className="shrink-0 ml-3">
-          {t('setup.nextStep')}
-        </Button>
       </div>
 
       {/* Expandable provider list */}
       {expanded && (
         <div
           className="flex flex-col gap-0"
-          style={{ borderTop: '1px solid var(--color-border-default)' }}
+          style={{ borderTop: '1px solid var(--color-border-muted)' }}
         >
           {providers.map((p) => (
             <div
               key={p.provider}
               className="flex items-center justify-between px-4 py-2.5"
-              style={{ borderBottom: '1px solid var(--color-border-default)' }}
+              style={{ borderBottom: '1px solid var(--color-border-muted)' }}
             >
               <div className="flex items-center gap-2 min-w-0">
                 <span className="text-sm truncate" style={{ color: 'var(--color-text-primary)' }}>
@@ -187,6 +186,7 @@ export default function MethodStep() {
   const { metadata } = useAllModels();
 
   const [selected, setSelected] = useState<AccessType | null>(null);
+  const headingId = useId();
 
   // Invitation code state
   const [showInvitation, setShowInvitation] = useState(false);
@@ -330,7 +330,13 @@ export default function MethodStep() {
   }, [invitationCode, queryClient, navigate, t]);
 
   return (
-    <div className="flex flex-col gap-4 sm:gap-6">
+    <div>
+      <WizardStepHeader
+        titleId={headingId}
+        title={canSkip ? t('setup.addAnotherProviderHeading') : t('setup.methodTitle')}
+        helper={canSkip ? t('setup.addMoreProviders') : t('setup.methodSubtitle')}
+      />
+      <div className="flex flex-col gap-4 sm:gap-6">
       {/* DALTON-HOOK(team-credentials): team-shared credentials hint */}
       {isDaltonAuth && isTeamShared && (
         <p className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
@@ -341,101 +347,44 @@ export default function MethodStep() {
       {hasConfigured && (
         <ConfiguredBanner
           providers={configuredProviders}
-          onSkip={handleSkipToDefaults}
           onRemove={handleRemoveProvider}
           canDisconnect={allowDisconnect}
         />
       )}
 
-      {/* Invitation-redeemed skip banner (when no other providers configured) */}
+      {/* Invitation-redeemed note (when no other providers configured); the
+          way on from it is the footer's skip */}
       {!userLoading && hasPlatformAccess && !hasConfigured && (
         <div
-          className="flex items-center justify-between gap-3 rounded-lg p-4"
+          className="flex items-center gap-2 rounded-lg p-4"
           style={{
-            background: 'var(--color-bg-surface)',
-            border: '1px solid var(--color-border-default)',
+            background: 'var(--color-bg-card)',
+            border: '1px solid var(--color-border-muted)',
           }}
         >
-          <div className="flex items-center gap-2">
-            <CheckCircle2 className="h-4 w-4 shrink-0" style={{ color: 'var(--color-profit)' }} />
-            <span className="text-sm" style={{ color: 'var(--color-text-primary)' }}>
-              {t('setup.invitationRedeemed')}
-            </span>
-          </div>
-          <Button variant="outline" size="sm" onClick={handleSkipToDefaults} className="shrink-0 ml-3">
-            {t('setup.nextStep')}
-          </Button>
+          <CheckCircle2 className="h-4 w-4 shrink-0" style={{ color: 'var(--color-success)' }} />
+          <span className="text-sm" style={{ color: 'var(--color-text-primary)' }}>
+            {t('setup.invitationRedeemed')}
+          </span>
         </div>
       )}
 
-      {/* Section heading */}
-      <div className="flex flex-col gap-1">
-        <h2
-          className="font-semibold"
-          style={{ fontSize: '1.125rem', color: 'var(--color-text-primary)' }}
-        >
-          {canSkip ? t('setup.addAnotherProviderHeading') : t('setup.methodTitle')}
-        </h2>
-        <p
-          className="text-sm"
-          style={{ color: 'var(--color-text-secondary)' }}
-        >
-          {canSkip
-            ? t('setup.addMoreProviders')
-            : t('setup.methodSubtitle')}
-        </p>
-      </div>
-
-      {/* Method cards */}
-      <div className="flex flex-col gap-3" role="radiogroup" aria-label="Connection method">
+      {/* Method cards: the welcome flow's choice cards, so the two halves of
+          onboarding pick the same way */}
+      <OptionGroup<AccessType> value={selected} onChange={setSelected} labelledBy={headingId}>
         {METHODS.map((method) => {
           const Icon = method.icon;
-          const isSelected = selected === method.id;
           return (
-            <button
+            <OptionCard<AccessType>
               key={method.id}
-              type="button"
-              role="radio"
-              aria-checked={isSelected}
-              onClick={() => setSelected(method.id)}
-              className="flex items-start gap-4 rounded-lg p-4 text-left transition-colors cursor-pointer"
-              style={{
-                border: isSelected
-                  ? '2px solid var(--color-accent-primary)'
-                  : '1px solid var(--color-border-default)',
-                background: isSelected ? 'var(--color-accent-soft)' : undefined,
-                padding: isSelected ? 15 : 16,
-              }}
-            >
-              <div
-                className="flex items-center justify-center w-10 h-10 rounded-lg shrink-0 mt-0.5"
-                style={{
-                  background: isSelected
-                    ? 'var(--color-accent-primary)'
-                    : 'var(--color-bg-surface)',
-                  color: isSelected ? '#fff' : 'var(--color-text-secondary)',
-                }}
-              >
-                <Icon className="h-5 w-5" />
-              </div>
-              <div className="flex flex-col gap-0.5">
-                <span
-                  className="text-sm font-medium"
-                  style={{ color: 'var(--color-text-primary)' }}
-                >
-                  {t(method.titleKey)}
-                </span>
-                <span
-                  className="text-xs"
-                  style={{ color: 'var(--color-text-secondary)' }}
-                >
-                  {t(method.descKey)}
-                </span>
-              </div>
-            </button>
+              value={method.id}
+              icon={<Icon className="h-4 w-4" />}
+              title={t(method.titleKey)}
+              description={t(method.descKey)}
+            />
           );
         })}
-      </div>
+      </OptionGroup>
 
       {/* Invitation code section — hide only when user already has platform access */}
       {(userLoading || !hasPlatformAccess) && (
@@ -444,8 +393,7 @@ export default function MethodStep() {
             <button
               type="button"
               onClick={() => setShowInvitation(true)}
-              className="inline-flex items-center gap-1.5 text-sm font-medium transition-colors self-start"
-              style={{ color: 'var(--color-accent-primary)' }}
+              className="inline-flex items-center gap-1.5 text-sm font-medium transition-colors self-start text-(--color-text-secondary) hover:text-(--color-text-primary)"
             >
               <Ticket className="h-4 w-4" />
               {t('setup.invitationCodeLink')}
@@ -454,8 +402,8 @@ export default function MethodStep() {
             <div
               className="flex flex-col gap-3 rounded-lg p-4"
               style={{
-                background: 'var(--color-bg-surface)',
-                border: '1px solid var(--color-border-default)',
+                background: 'var(--color-bg-card)',
+                border: '1px solid var(--color-border-muted)',
               }}
             >
               <label
@@ -515,17 +463,12 @@ export default function MethodStep() {
         </>
       )}
 
-      {/* Next button */}
-      <div className="flex justify-end pt-2">
-        <Button
-          variant="default"
-          disabled={!selected}
-          onClick={handleNext}
-          className="min-w-[120px]"
-        >
-          {t('setup.next')}
-        </Button>
       </div>
+
+      <SetupFooter
+        skip={canSkip ? { label: t('setup.skipToModels'), onClick: handleSkipToDefaults } : null}
+        primary={{ label: t('setup.continue'), onClick: handleNext, disabled: !selected }}
+      />
     </div>
   );
 }

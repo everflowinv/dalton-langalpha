@@ -15,6 +15,7 @@ import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 
 from ptc_agent.config.agent import AgentConfig, LLMConfig
+from src.llms.preferences import COMPACTION_PROFILE_NAMES
 from ptc_agent.config.core import DaytonaConfig, FilesystemConfig, LoggingConfig, MCPConfig, SandboxConfig, SecurityConfig
 from tests.conftest import create_test_app
 
@@ -125,13 +126,14 @@ class TestListModelsResponse:
         assert defaults["fetch_model"] == "claude-haiku-4-5"
         assert defaults["fallback_models"] == ["gpt-4o"]
         # Profile catalog exposed separately from system_defaults
+        baseline = body["task_cost_baseline"]
+        assert baseline is None or set(baseline) == {"model", "effort"}
         profiles = body["compaction_profiles"]
-        assert set(profiles.keys()) == {"aggressive", "moderate", "extended", "relaxed"}
+        assert list(profiles) == list(COMPACTION_PROFILE_NAMES)
         for preset in profiles.values():
-            assert set(preset) == {"token_threshold", "keep_messages"}
-        # Thresholds should be strictly increasing from aggressive to relaxed
-        order = ["aggressive", "moderate", "extended", "relaxed"]
-        thresholds = [profiles[name]["token_threshold"] for name in order]
+            assert set(preset) == {"token_threshold"}
+        # Thresholds strictly increase in the order the settings pages draw them
+        thresholds = [profiles[name]["token_threshold"] for name in COMPACTION_PROFILE_NAMES]
         assert thresholds == sorted(thresholds)
         assert len(set(thresholds)) == len(thresholds)
 
@@ -216,3 +218,41 @@ class TestListModelsResponse:
         assert "gpt-4o" in metadata
         assert "access_type" in metadata["gpt-4o"]
         assert metadata["gpt-4o"]["access_type"] == "api_key"
+
+    @pytest.mark.asyncio
+    async def test_model_metadata_names_native_compaction(self, client):
+        """The settings page offers provider compaction only for a
+        model that carries this, and names that provider's trade-off."""
+        mock_models = {"anthropic": [{"name": "claude-opus-5-5", "model_id": "claude-opus-5-5"}]}
+        with (
+            patch("src.llms.llm.get_configured_llm_models", return_value=mock_models),
+            patch("src.server.app.setup.agent_config", _mock_agent_config()),
+        ):
+            resp = await client.get("/api/v1/models")
+
+        metadata = resp.json()["model_metadata"]
+        kinds = {
+            name: entry["native_compaction"]
+            for name, entry in metadata.items()
+            if "native_compaction" in entry
+        }
+        assert kinds["claude-opus-5-5"] == "anthropic"
+        assert kinds["gpt-6-astra"] == "openai"
+        # The subscription twins serve it as their key routes do.
+        # DALTON-HOOK(native-compaction-lines): claude-oauth keeps native compaction off (product decision 6)
+        assert metadata["claude-opus-5-5-oauth"]["provider"] == "claude-oauth"
+        assert kinds.get("claude-opus-5-5-oauth") is None
+        assert kinds["gpt-6-luna-oauth"] == "openai"
+
+
+def test_key_candidates_name_where_a_turn_looks_for_each_providers_key():
+    """The client reads these to tell which saved models the user's keys
+    serve: a coding-plan key is looked for beside its brand's, but its vendor
+    issues it apart, so it serves the brand's models only with a base URL."""
+    from src.server.app.api_keys import _build_key_candidates
+
+    _build_key_candidates.cache_clear()
+    moonshot = _build_key_candidates()["moonshot"]
+
+    assert moonshot["slugs"] == ["moonshot", "moonshot-coding"]
+    assert moonshot["shared"] == ["moonshot"]

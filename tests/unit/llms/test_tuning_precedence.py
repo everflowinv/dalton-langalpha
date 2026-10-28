@@ -67,7 +67,10 @@ def test_resolve_tuning_agrees_with_the_single_field_resolver():
         "compaction_profile": "moderate",
         "reasoning_effort": "low",
         "fast_mode": True,
-        "profiles": {MODEL: {"reasoning_effort": "high", "fast_mode": False}},
+        "native_compaction": False,
+        "profiles": {
+            MODEL: {"reasoning_effort": "high", "fast_mode": False, "native_compaction": True}
+        },
     }
     tuning = resolve_tuning(model_pref, MODEL)
 
@@ -76,6 +79,7 @@ def test_resolve_tuning_agrees_with_the_single_field_resolver():
         compaction_profile="moderate",
         reasoning_effort="high",
         fast_mode=False,
+        native_compaction=True,
     )
     for field in TUNING_FIELDS:
         assert getattr(tuning, field) == resolve_tuning_field(model_pref, MODEL, field)

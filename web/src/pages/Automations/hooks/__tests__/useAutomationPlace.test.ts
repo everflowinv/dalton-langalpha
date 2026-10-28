@@ -11,10 +11,10 @@ import { useAutomationPlace } from '../useAutomationPlace';
 const place = () => renderHookWithProviders(() => useAutomationPlace()).result.current;
 
 describe('useAutomationPlace', () => {
-  it('reads a row naming Home as All workspaces', () => {
+  it('reads a row naming Home as Chief of Staff', () => {
     const { label, runsInHome } = place();
-    expect(label({ workspace_id: 'home-1' })).toBe('All workspaces');
-    expect(label({ workspace_id: 'home-1' }, 'Home')).toBe('All workspaces');
+    expect(label({ workspace_id: 'home-1' })).toBe('Chief of Staff');
+    expect(label({ workspace_id: 'home-1' }, 'Home')).toBe('Chief of Staff');
     expect(runsInHome({ workspace_id: 'home-1' })).toBe(true);
   });
 

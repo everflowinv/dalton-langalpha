@@ -116,7 +116,6 @@ class TestSkillsLockLifecycle:
                 "skills": SkillsConfig(
                     enabled=True,
                     user_skills_dir=tmpdir,
-                    sandbox_skills_base=skills_base,
                 ),
             })()
 
@@ -124,7 +123,7 @@ class TestSkillsLockLifecycle:
 
             # Upload skills + write lock
             merged_lock, collisions = await sb._upload_skills(
-                [(tmpdir, skills_base)],
+                [tmpdir],
                 manifest=skills_mod,
                 existing_lock=None,
             )
@@ -182,7 +181,7 @@ class TestSkillsLockLifecycle:
 
             skills_mod = await sb._compute_skills_module([tmpdir])
             merged_lock, collisions = await sb._upload_skills(
-                [(tmpdir, skills_base)],
+                [tmpdir],
                 manifest=skills_mod,
                 existing_lock=existing_lock,
             )
@@ -226,7 +225,7 @@ class TestPruneProtection:
 
         # Prune with empty local_skill_names (all platform skills removed)
         await sb._prune_remote_skills(
-            skills_base, local_skill_names=set(), existing_lock=existing_lock
+            local_skill_names=set(), existing_lock=existing_lock
         )
 
         # Verify user skill dir still exists
@@ -256,7 +255,7 @@ class TestPruneProtection:
         }
 
         await sb._prune_remote_skills(
-            skills_base, local_skill_names=set(), existing_lock=existing_lock
+            local_skill_names=set(), existing_lock=existing_lock
         )
 
         # Verify stale dir was removed

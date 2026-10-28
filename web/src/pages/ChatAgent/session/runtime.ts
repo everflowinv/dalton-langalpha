@@ -151,6 +151,7 @@ export interface StreamRuntime {
   setFallbackSuggestion: React.Dispatch<React.SetStateAction<FallbackSuggestion | null>>;
   setThreadId: React.Dispatch<React.SetStateAction<string>>;
   setWorkspaceStarting: React.Dispatch<React.SetStateAction<false | 'starting' | 'archived'>>;
+  setTurnHeld: React.Dispatch<React.SetStateAction<string | null>>;
   // stable containers, ref-current reads — owned by this lane (per-turn cursors)
   contentOrderCounterRef: Ref<number>;
   currentReasoningIdRef: Ref<string | null>;
@@ -192,6 +193,7 @@ export interface RecoveryRuntime {
   setIsReconnecting: React.Dispatch<React.SetStateAction<boolean>>;
   setMessageError: React.Dispatch<React.SetStateAction<string | StructuredError | null>>;
   setWorkspaceStarting: React.Dispatch<React.SetStateAction<false | 'starting' | 'archived'>>;
+  setTurnHeld: React.Dispatch<React.SetStateAction<string | null>>;
   setIsCompacting: (value: string | false) => void;
   setHasActiveSubagents: React.Dispatch<React.SetStateAction<boolean>>;
   setReloadTrigger: React.Dispatch<React.SetStateAction<number>>;

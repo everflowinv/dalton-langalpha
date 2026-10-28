@@ -52,7 +52,13 @@ def turn_route(user_id: str, workspace: Optional[Dict[str, Any]]) -> TurnRoute:
 
 
 async def requested_workspace(
-    user_id: str, workspace_id: Optional[str]
+    user_id: str,
+    workspace_id: Optional[str],
+    *,
+    # DALTON-HOOK(colleague-dispatch): channel, tail-turn bypass, and existing-thread revocation error mapping.
+    channel: str = "web",
+    is_tail_turn: bool = False,
+    is_existing_colleague_thread: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """The workspace a client's turn names, once it is the caller's.
 
@@ -80,16 +86,39 @@ async def requested_workspace(
     if workspace is None and is_home_id(user_id, workspace_id):
         return None
     # --- DALTON-HOOK(workspace-sharing-settings): begin ---
-    if workspace is not None and str(workspace.get("user_id")) != str(user_id):
-        from src.dalton.settings import is_dalton_supabase_auth_enabled
+    # DALTON-HOOK(colleague-dispatch): allow colleague web thread creation/messaging when colleague_dispatch is enabled.
+    if (
+        workspace is not None
+        and workspace.get("user_id")
+        and str(workspace.get("user_id")) != str(user_id)
+    ):
+        from src.dalton.settings import (
+            is_colleague_dispatch_enabled,
+            is_dalton_supabase_auth_enabled,
+        )
 
         if is_dalton_supabase_auth_enabled():
-            from src.dalton.sharing import require_workspace_access
-
-            await require_workspace_access(
-                workspace, user_id, channel="web", need="read", workspace=workspace
+            from src.dalton.sharing import (
+                ColleagueAccessRevokedError,
+                require_workspace_access,
             )
-            raise HTTPException(status_code=403, detail="该功能下一期开放")
+
+            if not is_colleague_dispatch_enabled():
+                await require_workspace_access(
+                    workspace, user_id, channel=channel, need="read", workspace=workspace
+                )
+                raise HTTPException(status_code=403, detail="该功能尚未开放")
+            if is_tail_turn:
+                return workspace
+            try:
+                await require_workspace_access(
+                    workspace, user_id, channel=channel, need="write", workspace=workspace
+                )
+            except HTTPException as exc:
+                if is_existing_colleague_thread and exc.status_code in (403, 404):
+                    raise ColleagueAccessRevokedError() from exc
+                raise
+            return workspace
     # --- DALTON-HOOK(workspace-sharing-settings): end ---
     # A fresh thread id must not run inside another user's workspace. The
     # report-back dispatch sets X-User-Id to the owner, so it passes.

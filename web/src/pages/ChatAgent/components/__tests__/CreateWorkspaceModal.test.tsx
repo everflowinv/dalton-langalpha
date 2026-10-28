@@ -6,20 +6,27 @@
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { Mock } from 'vitest';
-import { render, screen, waitFor } from '@testing-library/react';
+import { act, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 
+import { renderWithProviders } from '@/test/utils';
+import { queryKeys } from '@/lib/queryKeys';
+
 vi.mock('../../utils/api', () => ({
+  getComputers: vi.fn(),
+  getComputerProviders: vi.fn(),
   uploadWorkspaceFile: vi.fn(),
   startWorkspace: vi.fn(),
   formatApiErrorDetail: (err: unknown) =>
     (err as { message?: string })?.message ?? 'Request failed',
 }));
 
-import { startWorkspace, uploadWorkspaceFile } from '../../utils/api';
+import { getComputerProviders, getComputers, startWorkspace, uploadWorkspaceFile } from '../../utils/api';
 import CreateWorkspaceModal from '../CreateWorkspaceModal';
 
 const mockUpload = uploadWorkspaceFile as Mock;
+const mockGetComputers = getComputers as Mock;
+const mockProviders = getComputerProviders as Mock;
 
 // POST /api/v1/workspaces, captured verbatim.
 const LIVE_CREATED = {
@@ -38,13 +45,37 @@ const LIVE_CREATED = {
   is_always_on: false,
 };
 
+const PRIMARY_ID = LIVE_CREATED.computer_id;
+const SECOND_ID = '3b788b47-352e-4cfb-94f0-920b599ea227';
+
+function machine(computer_id: string, name: string, extra: Record<string, unknown> = {}) {
+  return {
+    computer_id,
+    user_id: LIVE_CREATED.user_id,
+    kind: 'daytona',
+    name,
+    status: 'running',
+    resource_tier: 'standard',
+    is_always_on: false,
+    is_primary: false,
+    workspace_count: 1,
+    root_dir: '/home/workspace',
+    ...extra,
+  };
+}
+
+const PRIMARY = machine(PRIMARY_ID, 'Alpha Research', { is_primary: true });
+const SECOND = machine(SECOND_ID, 'Second machine', { status: 'stopped' });
+
 beforeEach(() => {
   vi.clearAllMocks();
   vi.mocked(startWorkspace).mockResolvedValue({ workspace_id: LIVE_CREATED.workspace_id, status: 'running' });
+  mockGetComputers.mockResolvedValue({ computers: [PRIMARY], total: 1 });
+  mockProviders.mockResolvedValue({ providers: [{ kind: 'daytona', is_default: true, allowed: null }] });
 });
 
 function setup(onCreate: Mock, onComplete = vi.fn(), onClose = vi.fn()) {
-  render(
+  const { queryClient } = renderWithProviders(
     <CreateWorkspaceModal
       isOpen
       onClose={onClose}
@@ -52,8 +83,12 @@ function setup(onCreate: Mock, onComplete = vi.fn(), onClose = vi.fn()) {
       onComplete={onComplete}
     />,
   );
-  return { onComplete, onClose };
+  return { onComplete, onClose, queryClient };
 }
+
+// A computer whose first sandbox is still being built.
+const PREPARING_PRIMARY = { ...PRIMARY, status: 'starting', provider_ref: null };
+const NOTICE = "Alpha Research is being prepared. You can create a workspace on it once it's ready.";
 
 describe('CreateWorkspaceModal', () => {
   it('opens the workspace straight away, with no provisioning screen', async () => {
@@ -70,6 +105,59 @@ describe('CreateWorkspaceModal', () => {
     // No progress phase at all: nothing was provisioned and nothing uploaded.
     expect(screen.queryByText(/uploading files/i)).not.toBeInTheDocument();
     expect(screen.queryByText(/^ready$/i)).not.toBeInTheDocument();
+  });
+
+  it.each([
+    ['one computer', [PRIMARY]],
+    ['one live computer beside a deleted one', [PRIMARY, { ...SECOND, status: 'deleted' }]],
+  ])('offers no computer choice with %s, and names none', async (_case, computers) => {
+    const user = userEvent.setup();
+    mockGetComputers.mockResolvedValue({ computers, total: computers.length });
+    const onCreate = vi.fn().mockResolvedValue(LIVE_CREATED);
+    setup(onCreate);
+
+    await waitFor(() => expect(mockGetComputers).toHaveBeenCalled());
+    await user.type(screen.getByPlaceholderText(/name/i), 'Only machine');
+    expect(screen.queryByRole('combobox', { name: 'Computer' })).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: /^create$/i }));
+
+    await waitFor(() => expect(onCreate).toHaveBeenCalledWith({ name: 'Only machine', description: '' }));
+  });
+
+  it('lets the user put the workspace on another computer, starting from the primary', async () => {
+    const user = userEvent.setup();
+    mockGetComputers.mockResolvedValue({ computers: [SECOND, PRIMARY], total: 2 });
+    const onCreate = vi.fn().mockResolvedValue({ ...LIVE_CREATED, computer_id: SECOND_ID });
+    setup(onCreate);
+
+    const choice = await screen.findByRole('combobox', { name: 'Computer' });
+    expect(choice).toHaveValue(PRIMARY_ID);
+    expect(screen.getByRole('option', { name: 'Alpha Research (Primary)' })).toBeInTheDocument();
+
+    await user.selectOptions(choice, SECOND_ID);
+    await user.type(screen.getByPlaceholderText(/name/i), 'On the second');
+    await user.click(screen.getByRole('button', { name: /^create$/i }));
+
+    await waitFor(() =>
+      expect(onCreate).toHaveBeenCalledWith({ name: 'On the second', description: '', computerId: SECOND_ID }),
+    );
+  });
+
+  it('names what each computer runs on once the providers differ', async () => {
+    mockGetComputers.mockResolvedValue({
+      computers: [PRIMARY, machine(SECOND_ID, 'Second machine', { kind: 'e2b' })],
+      total: 2,
+    });
+    mockProviders.mockResolvedValue({
+      providers: [
+        { kind: 'daytona', is_default: true, allowed: null },
+        { kind: 'e2b', is_default: false, allowed: true },
+      ],
+    });
+    setup(vi.fn());
+
+    expect(await screen.findByRole('option', { name: 'Alpha Research · Daytona (Primary)' })).toBeInTheDocument();
+    expect(screen.getByRole('option', { name: 'Second machine · E2B' })).toBeInTheDocument();
   });
 
   it('has no resource-tier picker: the tier belongs to the machine', async () => {
@@ -222,4 +310,95 @@ it('blocks backdrop, close and cancel while creation is pending', async () => {
   finish(LIVE_CREATED);
   await waitFor(() => expect(onComplete).toHaveBeenCalledWith(LIVE_CREATED));
   expect(onClose).toHaveBeenCalledOnce();
+});
+
+describe('CreateWorkspaceModal, a computer still being prepared', () => {
+  it('holds the form while the only computer is prepared, and lets go once it is ready', async () => {
+    const user = userEvent.setup();
+    mockGetComputers.mockResolvedValue({ computers: [PREPARING_PRIMARY], total: 1 });
+    const onCreate = vi.fn().mockResolvedValue(LIVE_CREATED);
+    const { queryClient } = setup(onCreate);
+
+    await user.type(screen.getByPlaceholderText(/name/i), 'Too early');
+    expect(await screen.findByText(NOTICE)).toBeInTheDocument();
+    const create = screen.getByRole('button', { name: /^create$/i });
+    expect(create).toBeDisabled();
+
+    // What the status fan-out writes when the stream says running.
+    act(() => {
+      queryClient.setQueryData(queryKeys.computers.lists(), {
+        computers: [{ ...PREPARING_PRIMARY, status: 'running' }],
+        total: 1,
+      });
+    });
+    await waitFor(() => expect(screen.queryByText(NOTICE)).not.toBeInTheDocument());
+    expect(create).toBeEnabled();
+    await user.click(create);
+    await waitFor(() => expect(onCreate).toHaveBeenCalledWith({ name: 'Too early', description: '' }));
+  });
+
+  it('offers a computer being prepared as a choice it cannot take', async () => {
+    const user = userEvent.setup();
+    mockGetComputers.mockResolvedValue({ computers: [PREPARING_PRIMARY, SECOND], total: 2 });
+    const onCreate = vi.fn().mockResolvedValue({ ...LIVE_CREATED, computer_id: SECOND_ID });
+    setup(onCreate);
+
+    const choice = await screen.findByRole('combobox', { name: 'Computer' });
+    expect(screen.getByRole('option', { name: 'Alpha Research (Primary, Preparing)' })).toBeDisabled();
+    // The primary is still where it starts, so the hold shows until another is picked.
+    expect(screen.getByText(NOTICE)).toBeInTheDocument();
+
+    await user.selectOptions(choice, SECOND_ID);
+    expect(screen.queryByText(NOTICE)).not.toBeInTheDocument();
+    await user.type(screen.getByPlaceholderText(/name/i), 'On the second');
+    await user.click(screen.getByRole('button', { name: /^create$/i }));
+    await waitFor(() =>
+      expect(onCreate).toHaveBeenCalledWith({ name: 'On the second', description: '', computerId: SECOND_ID }),
+    );
+  });
+
+  it('suffixes a non-primary computer being prepared', async () => {
+    mockGetComputers.mockResolvedValue({
+      computers: [PRIMARY, { ...SECOND, status: 'creating', provider_ref: null }],
+      total: 2,
+    });
+    setup(vi.fn());
+    await screen.findByRole('combobox', { name: 'Computer' });
+    expect(screen.getByRole('option', { name: 'Second machine (Preparing)' })).toBeDisabled();
+    expect(screen.queryByRole('status')).not.toBeInTheDocument();
+  });
+
+  it('holds nothing for a user with no computer yet, whose first workspace makes one', async () => {
+    const user = userEvent.setup();
+    mockGetComputers.mockResolvedValue({ computers: [], total: 0 });
+    const onCreate = vi.fn().mockResolvedValue(LIVE_CREATED);
+    setup(onCreate);
+
+    await waitFor(() => expect(mockGetComputers).toHaveBeenCalled());
+    await user.type(screen.getByPlaceholderText(/name/i), 'First');
+    expect(screen.queryByRole('status')).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: /^create$/i }));
+    await waitFor(() => expect(onCreate).toHaveBeenCalled());
+  });
+
+  it("words the server's refusal for a computer the list had not yet seen being prepared", async () => {
+    const user = userEvent.setup();
+    const onCreate = vi.fn().mockRejectedValue(
+      Object.assign(new Error('Request failed with status code 409'), {
+        response: {
+          status: 409,
+          data: { detail: { code: 'computer_preparing', message: 'Computer is still being prepared' } },
+        },
+      }),
+    );
+    setup(onCreate);
+
+    await user.type(screen.getByPlaceholderText(/name/i), 'Raced');
+    await user.click(screen.getByRole('button', { name: /^create$/i }));
+
+    expect(
+      await screen.findByText("This computer is still being prepared. Try again once it's ready."),
+    ).toBeInTheDocument();
+    expect(screen.queryByText('Computer is still being prepared')).not.toBeInTheDocument();
+  });
 });

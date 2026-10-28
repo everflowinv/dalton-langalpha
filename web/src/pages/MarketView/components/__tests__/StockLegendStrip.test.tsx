@@ -249,7 +249,7 @@ describe('MarketSidebarPanel extended-hours rows', () => {
 
     const { container: primContainer, unmount: unmountPrim } = render(
       <MemoryRouter>
-        <WatchlistRowItem item={wsRow} index={0} marketStatus={afterHoursStatus} />
+        <WatchlistRowItem item={wsRow} marketStatus={afterHoursStatus} />
       </MemoryRouter>,
     );
     expect(primContainer).toHaveTextContent('$319.50 +0.70%');
@@ -291,7 +291,7 @@ describe('MarketSidebarPanel extended-hours rows', () => {
 
     const { container: primBack, unmount: unmountPrimBack } = render(
       <MemoryRouter>
-        <WatchlistRowItem item={backToCloseRow} index={0} marketStatus={afterHoursStatus} />
+        <WatchlistRowItem item={backToCloseRow} marketStatus={afterHoursStatus} />
       </MemoryRouter>,
     );
     expect(primBack).toHaveTextContent('$317.28 +0.00%');
@@ -358,7 +358,7 @@ describe('MarketSidebarPanel extended-hours rows', () => {
 
     const { container: regPrimEl, unmount: unmountRegPrim } = render(
       <MemoryRouter>
-        <WatchlistRowItem item={halfRow} index={0} marketStatus={openStatus} />
+        <WatchlistRowItem item={halfRow} marketStatus={openStatus} />
       </MemoryRouter>,
     );
     expect(regPrimEl).toHaveTextContent('-$0.13');
@@ -397,7 +397,7 @@ describe('MarketSidebarPanel extended-hours rows', () => {
     // 2. WatchlistRowItem (_holdingsPrimitives)
     const { container: primEl, unmount: unmountPrim } = render(
       <MemoryRouter>
-        <WatchlistRowItem item={halfRow} index={0} marketStatus={afterHoursStatus} />
+        <WatchlistRowItem item={halfRow} marketStatus={afterHoursStatus} />
       </MemoryRouter>,
     );
     expect(primEl).toHaveTextContent('$99.88');

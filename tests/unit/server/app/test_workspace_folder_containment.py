@@ -40,7 +40,7 @@ from src.server.app.share_files import (
     read_shared_file,
     serve_shared_file,
 )
-from src.server.app.workspace_files._containment import contained_sandbox_path
+from src.server.services.workspace_file_containment import contained_sandbox_path
 from src.server.app.workspace_files.crud import (
     delete_workspace_files,
     download_workspace_file,
@@ -78,7 +78,7 @@ _SHARE_VAULT = "src.server.app.share_files.get_vault_secrets_for_redaction"
 
 _CRUD_DBWS = "src.server.app.workspace_files.crud.db_get_workspace"
 _CRUD_OWNER = "src.server.app.workspace_files.crud.require_workspace_owner"
-_CRUD_ACQUIRE_TO_CHANGE = "src.server.app.workspace_files.crud._acquire_sandbox_to_change"
+_CRUD_ACQUIRE_TO_CHANGE = "src.server.app.workspace_files.crud.acquire_sandbox_to_change"
 _CRUD_WD = "src.server.app.workspace_files.crud.owner_work_dir"
 _CRUD_VAULT = "src.server.app.workspace_files.crud.get_vault_secrets_for_redaction"
 _CRUD_LINK = "src.server.app.workspace_files.crud.live_download_link"
@@ -86,11 +86,12 @@ _CRUD_SCAN = "src.server.app.workspace_files.crud.FilePersistenceService.list_sa
 _SYNC_META = "src.server.database.workspace_file.get_file_metadata_for_sync"
 _TOTAL_SIZE = "src.server.database.workspace_file.get_workspace_total_size"
 
-# What the held acquisition and an owner route's guard read through, and the
-# row a URL-only route re-reads after a live read.
-_SHARED_DBWS = "src.server.app.workspace_files._shared.db_get_workspace"
-_SHARED_WSMGR = "src.server.app.workspace_files._shared.WorkspaceManager"
-_SHARED_HOLD = "src.server.app.workspace_files._shared.workspace_folder_in_use"
+# What the held acquisition and an owner route's guard read through.
+_FILES_DBWS = "src.server.services.workspace_files.db_get_workspace"
+_FILES_WSMGR = "src.server.services.workspace_files.WorkspaceManager"
+_FILES_HOLD = "src.server.services.workspace_files.workspace_folder_in_use"
+# The row a URL-only route re-reads after a live read.
+_RECHECK_DBWS = "src.server.app.workspace_files._shared.db_get_workspace"
 _SHARE_FP_TREE = "src.server.app.share_files.FilePersistenceService.get_file_tree"
 
 
@@ -477,7 +478,7 @@ def _acquired(sandbox, workspace):
 async def test_read_denies_every_reach_for_the_sibling(computer, requested) -> None:
     with (
         patch(_CRUD_DBWS, AsyncMock(return_value=_workspace())),
-        patch(_SHARED_DBWS, AsyncMock(return_value=_workspace())),
+        patch(_FILES_DBWS, AsyncMock(return_value=_workspace())),
         patch(_CRUD_OWNER, MagicMock()),
         patch(_CRUD_WD, return_value=computer.work_dir),
         patch(_CRUD_ACQUIRE_TO_CHANGE, _acquired(computer.sandbox, _workspace())),
@@ -496,7 +497,7 @@ async def test_download_denies_every_reach_for_the_sibling(computer, requested) 
     request.headers = {}
     with (
         patch(_CRUD_DBWS, AsyncMock(return_value=_workspace())),
-        patch(_SHARED_DBWS, AsyncMock(return_value=_workspace())),
+        patch(_FILES_DBWS, AsyncMock(return_value=_workspace())),
         patch(_CRUD_OWNER, MagicMock()),
         patch(_CRUD_WD, return_value=computer.work_dir),
         patch(_CRUD_ACQUIRE_TO_CHANGE, _acquired(computer.sandbox, _workspace())),
@@ -513,7 +514,7 @@ async def test_download_denies_every_reach_for_the_sibling(computer, requested) 
 async def test_listing_never_leaves_the_workspace_folder(computer, requested) -> None:
     with (
         patch(_CRUD_DBWS, AsyncMock(return_value=_workspace())),
-        patch(_SHARED_DBWS, AsyncMock(return_value=_workspace())),
+        patch(_FILES_DBWS, AsyncMock(return_value=_workspace())),
         patch(_CRUD_OWNER, MagicMock()),
         patch(_CRUD_WD, return_value=computer.work_dir),
         patch(_CRUD_ACQUIRE_TO_CHANGE, _acquired(computer.sandbox, _workspace())),
@@ -536,7 +537,7 @@ async def test_write_never_lands_outside_the_workspace_folder(
 ) -> None:
     with (
         patch(_CRUD_DBWS, AsyncMock(return_value=_workspace())),
-        patch(_SHARED_DBWS, AsyncMock(return_value=_workspace())),
+        patch(_FILES_DBWS, AsyncMock(return_value=_workspace())),
         patch(_CRUD_OWNER, MagicMock()),
         patch(_CRUD_WD, return_value=computer.work_dir),
         patch(_CRUD_ACQUIRE_TO_CHANGE, _acquired(computer.sandbox, _workspace())),
@@ -555,7 +556,7 @@ async def test_write_to_the_shared_scratch_folds_into_the_workspace(computer) ->
     """A leading slash is the client's virtual spelling, so ``/tmp/x`` is A's own."""
     with (
         patch(_CRUD_DBWS, AsyncMock(return_value=_workspace())),
-        patch(_SHARED_DBWS, AsyncMock(return_value=_workspace())),
+        patch(_FILES_DBWS, AsyncMock(return_value=_workspace())),
         patch(_CRUD_OWNER, MagicMock()),
         patch(_CRUD_WD, return_value=computer.work_dir),
         patch(_CRUD_ACQUIRE_TO_CHANGE, _acquired(computer.sandbox, _workspace())),
@@ -576,7 +577,7 @@ async def test_delete_never_names_a_path_outside_the_workspace_folder(
 ) -> None:
     with (
         patch(_CRUD_DBWS, AsyncMock(return_value=_workspace())),
-        patch(_SHARED_DBWS, AsyncMock(return_value=_workspace())),
+        patch(_FILES_DBWS, AsyncMock(return_value=_workspace())),
         patch(_CRUD_OWNER, MagicMock()),
         patch(_CRUD_WD, return_value=computer.work_dir),
         patch(_CRUD_ACQUIRE_TO_CHANGE, _acquired(computer.sandbox, _workspace())),
@@ -598,7 +599,7 @@ async def test_delete_unlinks_a_symlink_instead_of_its_target(computer) -> None:
     link.symlink_to("report.html")
     with (
         patch(_CRUD_DBWS, AsyncMock(return_value=_workspace())),
-        patch(_SHARED_DBWS, AsyncMock(return_value=_workspace())),
+        patch(_FILES_DBWS, AsyncMock(return_value=_workspace())),
         patch(_CRUD_OWNER, MagicMock()),
         patch(_CRUD_WD, return_value=computer.work_dir),
         patch(_CRUD_ACQUIRE_TO_CHANGE, _acquired(computer.sandbox, _workspace())),
@@ -629,7 +630,7 @@ async def test_listing_after_a_rename_reads_the_folder_the_acquisition_settled(
     before, after = _renamed(computer)
     with (
         patch(_CRUD_DBWS, AsyncMock(return_value=before)),
-        patch(_SHARED_DBWS, AsyncMock(return_value=before)),
+        patch(_FILES_DBWS, AsyncMock(return_value=before)),
         patch(_CRUD_OWNER, MagicMock()),
         patch(_CRUD_ACQUIRE_TO_CHANGE, _acquired(computer.sandbox, after)),
     ):
@@ -647,7 +648,7 @@ async def test_write_after_a_rename_does_not_recreate_the_former_folder(
     before, after = _renamed(computer)
     with (
         patch(_CRUD_DBWS, AsyncMock(return_value=before)),
-        patch(_SHARED_DBWS, AsyncMock(return_value=before)),
+        patch(_FILES_DBWS, AsyncMock(return_value=before)),
         patch(_CRUD_OWNER, MagicMock()),
         patch(_CRUD_ACQUIRE_TO_CHANGE, _acquired(computer.sandbox, after)),
     ):
@@ -668,7 +669,7 @@ async def test_the_workspace_serves_its_own_files(computer) -> None:
     with (
         patch(_SERVE_DBWS, AsyncMock(return_value=_workspace())),
         patch(_SERVE_WD, return_value=computer.work_dir),
-        patch(_SHARED_DBWS, AsyncMock(return_value=_workspace())),
+        patch(_RECHECK_DBWS, AsyncMock(return_value=_workspace())),
         patch(_SERVE_WSMGR) as mgr,
         patch(_SERVE_VAULT, AsyncMock(return_value=[])),
         patch(_SERVE_FP) as fp,
@@ -789,9 +790,9 @@ async def test_live_reads_hold_the_folder_until_the_read_ends(computer, route) -
     call, answered_for_a = LIVE_READS[route]
     with (
         patch(_CRUD_DBWS, AsyncMock(return_value=before)),
-        patch(_SHARED_WSMGR, manager),
-        patch(_SHARED_HOLD, hold),
-        patch(_SHARED_DBWS, row),
+        patch(_FILES_WSMGR, manager),
+        patch(_FILES_HOLD, hold),
+        patch(_FILES_DBWS, row),
         patch(_CRUD_VAULT, AsyncMock(return_value=[])),
         patch(_CRUD_LINK, export),
         patch(_CRUD_SCAN, scan),
@@ -832,7 +833,7 @@ async def test_a_shared_read_that_raced_a_folder_move_is_not_served(
     with (
         patch(_SHARE_THREAD, AsyncMock(return_value=_shared_thread())),
         patch(_SHARE_DBWS, AsyncMock(return_value=before)),
-        patch(_SHARED_DBWS, recheck),
+        patch(_RECHECK_DBWS, recheck),
         patch(_SERVE_WSMGR) as mgr,
         patch(_SHARE_VAULT, AsyncMock(return_value=[])),
         patch(_SERVE_VAULT, AsyncMock(return_value=[])),
@@ -853,7 +854,7 @@ async def test_a_shared_listing_that_raced_a_folder_move_answers_from_the_manife
     with (
         patch(_SHARE_THREAD, AsyncMock(return_value=_shared_thread())),
         patch(_SHARE_DBWS, AsyncMock(return_value=before)),
-        patch(_SHARED_DBWS, AsyncMock(return_value=after)),
+        patch(_RECHECK_DBWS, AsyncMock(return_value=after)),
         patch(_SERVE_WSMGR) as mgr,
         patch(_SHARE_FP_TREE, AsyncMock(return_value=[{"path": "work/report.html"}])),
     ):

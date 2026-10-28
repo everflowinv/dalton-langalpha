@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import uuid
+from dataclasses import replace
 
 from src.server.database.workspace_folders import (
     TOMBSTONES_PER_PASS,
@@ -130,6 +131,16 @@ def test_a_staged_row_whose_target_is_held_goes_back_to_its_old_folder():
     assert moves(plan) == {A: ("Research", "Research")}
 
 
+def test_a_staged_row_with_no_room_to_copy_out_waits_while_its_backoff_lasts():
+    """Staged across an archive, it leaves staging only by a copy: moved on
+    every acquisition, it would copy until the disk filled, then delete, on
+    whichever target the last pass tried."""
+    staged = FolderRow(A, "Macro", moving_path(A), False, ("Research",), blocked="Macro")
+    assert not plan_folder_moves([staged])
+    assert not plan_folder_moves([replace(staged, blocked="Research")])
+    assert moves(plan_folder_moves([replace(staged, blocked=None)])) == {A: ("Research", "Macro")}
+
+
 def test_a_staged_row_falls_back_to_a_placeholder_when_its_old_folder_is_landed_on():
     """Its old folder is another mover's target this pass: going back there
     would put two workspaces in one folder."""
@@ -196,6 +207,37 @@ def test_top_level_tombstones_are_cleared_first_and_leftovers_are_not():
     plan = plan_folder_moves(rows)
     assert [t.workspace_id for t in plan.tombstones] == [A]
     assert moves(plan) == {C: ("Research-1a2b", "Research")}
+
+
+def test_a_folder_its_owner_kept_stays_until_its_name_is_wanted():
+    """Kept on the owner's machine, it is theirs: no pass touches it, nor runs
+    for it, while no live row targets its name."""
+    kept = replace(row(A, "Research", "Research", deleted=True), kept=True)
+    plan = plan_folder_moves([kept, row(B, "Macro", "Macro")])
+    assert not plan
+    assert plan.deferred == (A,)
+
+
+def test_a_kept_folder_left_past_the_cap_holds_its_name():
+    """Landing on one the pass leaves would push it aside unrecorded."""
+    n = TOMBSTONES_PER_PASS + 5
+    rows = [
+        replace(row(f"{i:08d}-0000-4000-8000-00000000000d", f"N{i}", f"N{i}", deleted=True), kept=True)
+        for i in range(n)
+    ]
+    rows += [row(f"{i:08d}-0000-4000-8000-00000000000a", f"N{i}", f"N{i}-{i:04x}") for i in range(n)]
+    plan = plan_folder_moves(rows)
+    assert len(plan.tombstones) == TOMBSTONES_PER_PASS
+    assert {m.target for m in plan.moves} == {t.dir_name for t in plan.tombstones}
+
+
+def test_a_kept_folder_whose_name_a_new_workspace_wants_is_set_aside():
+    """The new workspace lands on the name; the kept folder goes under
+    leftovers, where the settle records it and nothing removes it."""
+    kept = replace(row(A, "Research", "Research", deleted=True), kept=True)
+    plan = plan_folder_moves([kept, row(B, "Research", "Research-1a2b")])
+    assert [t.workspace_id for t in plan.tombstones] == [A]
+    assert moves(plan) == {B: ("Research-1a2b", "Research")}
 
 
 def test_a_tombstone_does_not_hold_a_live_row_back():

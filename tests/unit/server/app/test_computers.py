@@ -13,6 +13,7 @@ import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 
+from src.server.services.computer_errors import ProviderNotOffered, UnknownResourceTier
 from tests.conftest import create_test_app
 
 USER = "test-user-123"
@@ -33,6 +34,20 @@ def workspace_alias_quota_gate_off():
         ),
     ):
         yield
+
+
+@pytest.fixture(autouse=True)
+def sandbox_config():
+    """The deployment's sandbox settings, which the manager mocks here lack.
+
+    Daytona by default with nothing else offered; a test that offers a kind
+    sets ``offered_providers`` on what this yields.
+    """
+    from ptc_agent.config.core import SandboxConfig
+
+    config = SandboxConfig()
+    with patch("src.server.app.computers._sandbox_config", return_value=config):
+        yield config
 
 
 @pytest_asyncio.fixture
@@ -103,11 +118,26 @@ def entitled():
         yield gate
 
 
+@pytest.fixture
+def prepares():
+    """A create hands the row to a background start; the start path has its own tests.
+
+    Yields the stand-in, which answers with the status the claim leaves.
+    """
+    with patch(
+        "src.server.app.computers._schedule_claimed_start",
+        AsyncMock(return_value="starting"),
+    ) as schedule:
+        yield schedule
+
+
 @pytest.mark.asyncio
-async def test_create_computer_returns_the_new_machine(client, computer, entitled):
+async def test_create_computer_returns_the_new_machine(
+    client, computer, entitled, prepares
+):
     manager = MagicMock()
     manager.create_computer_for_user = AsyncMock(
-        return_value={**computer, "status": "stopped", "provider_ref": None}
+        return_value={**computer, "status": "creating", "provider_ref": None}
     )
     with patch("src.server.app.computers._computer_manager", return_value=manager):
         resp = await client.post(
@@ -118,17 +148,20 @@ async def test_create_computer_returns_the_new_machine(client, computer, entitle
     assert resp.status_code == 201
     body = resp.json()
     assert body["computer_id"] == COMPUTER_ID
-    # Nothing is provisioned here, so the machine costs nothing until it runs.
-    assert body["status"] == "stopped"
+    # The sandbox is being built in the background, so the row answers as
+    # starting with no sandbox yet; the client follows its events.
+    assert body["status"] == "starting"
     assert body["provider_ref"] is None
     kwargs = manager.create_computer_for_user.call_args.kwargs
     assert kwargs["name"] == "Research box"
     assert kwargs["resource_tier"] == "performance"
+    assert kwargs["prepare"] is True
+    prepares.assert_awaited_once_with(COMPUTER_ID)
 
 
 @pytest.mark.asyncio
 async def test_the_first_computer_is_primary_and_the_second_is_not(
-    client, computer, entitled
+    client, computer, entitled, prepares
 ):
     """Without this the first machine a user names is never their primary, and
     their first project then mints a second "My computer" beside it. The route
@@ -136,7 +169,16 @@ async def test_the_first_computer_is_primary_and_the_second_is_not(
     """
     primaries: set[str] = set()
 
-    async def _create(user_id, *, name=None, resource_tier=None, is_primary=False):
+    async def _create(
+        user_id,
+        *,
+        kind=None,
+        name=None,
+        resource_tier=None,
+        is_primary=False,
+        prepare=False,
+        files_backup=True,
+    ):
         # Mirrors the insert's `%s AND NOT EXISTS (... is_primary ...)`, which
         # test_computer_db locks as SQL.
         won = bool(is_primary) and user_id not in primaries
@@ -157,7 +199,7 @@ async def test_the_first_computer_is_primary_and_the_second_is_not(
 
 @pytest.mark.asyncio
 async def test_create_computer_defaults_to_the_standard_tier(
-    client, computer, entitled
+    client, computer, entitled, prepares
 ):
     manager = MagicMock()
     manager.create_computer_for_user = AsyncMock(return_value=computer)
@@ -191,9 +233,20 @@ async def test_create_serializes_the_tier_check_with_the_insert(
         )
     )
     gate = AsyncMock(side_effect=lambda *_args, **_kwargs: events.append(("gate", USER)))
+    held = AsyncMock(side_effect=lambda *_args, **_kwargs: events.append(("held", USER)))
+    limit = AsyncMock(
+        side_effect=lambda *_args, **_kwargs: events.append(("limit", USER))
+    )
+    schedule = AsyncMock(
+        side_effect=lambda *_args, **_kwargs: events.append(("prepare", USER))
+        or "starting"
+    )
     with (
         patch("src.server.app.computers._computer_manager", return_value=manager),
         patch("src.server.app.computers.assert_spec_allowed", gate),
+        patch("src.server.app.computers.enforce_computer_count", held),
+        patch("src.server.app.computers.enforce_computer_limit", limit),
+        patch("src.server.app.computers._schedule_claimed_start", schedule),
         patch("src.server.app.computers.platform_gating_active", return_value=True),
         patch("src.server.app.computers.computer_capacity_lock", quota_lock),
     ):
@@ -202,55 +255,74 @@ async def test_create_serializes_the_tier_check_with_the_insert(
         )
 
     assert response.status_code == 201
+    # The new row holds a running slot from its insert, so the limit is read
+    # under the same lock; the start claims that slot after the lock is gone.
+    # The held count goes first, so a user at the cap is not sent to step
+    # down a size only to be refused for the cap.
     assert events == [
         ("lock", USER),
+        ("held", USER),
         ("gate", USER),
+        ("limit", USER),
         ("insert", USER),
         ("unlock", USER),
+        ("prepare", USER),
     ]
 
 
 @pytest.mark.asyncio
-async def test_create_computer_defers_active_capacity_to_start():
-    from src.server.app.computers import router
+async def test_a_capped_user_is_refused_before_the_row_is_written(
+    client, entitled, prepares
+):
+    """Preparing takes a running slot, so the platform's refusal reaches the
+    form with its own message, and no row is left behind to clean up."""
+    from fastapi import HTTPException
 
-    app = create_test_app(router)
-    post = next(
-        r
-        for r in app.routes
-        if getattr(r, "path", None) == "/api/v1/computers" and "POST" in r.methods
+    manager = MagicMock()
+    manager.create_computer_for_user = AsyncMock()
+    capped = AsyncMock(
+        side_effect=HTTPException(
+            status_code=429, detail={"message": "Limit reached", "remaining": 0}
+        )
     )
-    assert "enforce_computer_limit" not in {
-        d.call.__name__ for d in post.dependant.dependencies
-    }
+    with (
+        patch("src.server.app.computers._computer_manager", return_value=manager),
+        patch("src.server.app.computers.enforce_computer_limit", capped),
+    ):
+        resp = await client.post("/api/v1/computers", json={})
+
+    assert resp.status_code == 429
+    assert resp.json()["detail"]["message"] == "Limit reached"
+    manager.create_computer_for_user.assert_not_awaited()
+    prepares.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_a_capped_user_can_prepare_a_stopped_computer(computer):
+async def test_a_user_holding_their_cap_is_refused_before_the_row_is_written(
+    client, entitled, prepares
+):
+    """A stopped computer still counts toward the plan's cap, so stopping one
+    does not make room for another."""
     from fastapi import HTTPException
 
-    from src.server.app.computers import router
-    from src.server.dependencies.usage_limits import enforce_computer_limit
-
-    app = create_test_app(router)
-
-    def _capped():
-        raise HTTPException(status_code=429, detail={"error": "limit_exceeded"})
-
-    app.dependency_overrides[enforce_computer_limit] = _capped
-
     manager = MagicMock()
-    manager.create_computer_for_user = AsyncMock(
-        return_value={**computer, "status": "stopped", "provider_ref": None}
+    manager.create_computer_for_user = AsyncMock()
+    held = AsyncMock(
+        side_effect=HTTPException(
+            status_code=429, detail={"message": "Limit reached", "remaining": 0}
+        )
     )
-    with patch("src.server.app.computers._computer_manager", return_value=manager):
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
-        ) as capped_client:
-            resp = await capped_client.post("/api/v1/computers", json={})
+    with (
+        patch("src.server.app.computers._computer_manager", return_value=manager),
+        patch("src.server.app.computers.enforce_computer_count", held),
+        patch("src.server.app.computers.enforce_computer_limit", AsyncMock()),
+    ):
+        resp = await client.post("/api/v1/computers", json={})
 
-    assert resp.status_code == 201
-    manager.create_computer_for_user.assert_awaited_once()
+    assert resp.status_code == 429
+    held.assert_awaited_once()
+    manager.create_computer_for_user.assert_not_awaited()
+    prepares.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -279,6 +351,613 @@ async def test_an_unentitled_tier_is_refused_before_the_row_is_written(client):
 async def test_an_unknown_tier_is_rejected_by_the_model(client):
     resp = await client.post("/api/v1/computers", json={"resource_tier": "huge"})
     assert resp.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# Provider choice: a computer is created on one of the offered kinds, for good
+# ---------------------------------------------------------------------------
+
+
+def _creating_manager(computer):
+    manager = MagicMock()
+    manager.create_computer_for_user = AsyncMock(
+        return_value={**computer, "status": "stopped", "provider_ref": None}
+    )
+    return manager
+
+
+@pytest.mark.asyncio
+async def test_a_create_without_a_kind_lands_on_the_deployment_default(
+    client, computer, entitled, prepares
+):
+    manager = _creating_manager(computer)
+    with patch("src.server.app.computers._computer_manager", return_value=manager):
+        resp = await client.post("/api/v1/computers", json={})
+
+    assert resp.status_code == 201
+    assert manager.create_computer_for_user.call_args.kwargs["kind"] == "daytona"
+
+
+@pytest.mark.asyncio
+async def test_an_offered_kind_reaches_the_manager(
+    client, computer, entitled, sandbox_config, prepares
+):
+    sandbox_config.offered_providers = ("e2b",)
+    manager = _creating_manager({**computer, "kind": "e2b"})
+    with patch("src.server.app.computers._computer_manager", return_value=manager):
+        resp = await client.post("/api/v1/computers", json={"kind": "e2b"})
+
+    assert resp.status_code == 201
+    assert resp.json()["kind"] == "e2b"
+    assert manager.create_computer_for_user.call_args.kwargs["kind"] == "e2b"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "refusal",
+    [
+        ProviderNotOffered("Provider not offered"),
+        UnknownResourceTier("Unknown resource tier"),
+    ],
+)
+async def test_a_create_the_manager_refuses_is_the_clients_error(
+    client, computer, entitled, sandbox_config, refusal
+):
+    """Both are ValueErrors, which this router otherwise answers as a
+    computer that is not there."""
+    sandbox_config.offered_providers = ("e2b",)
+    manager = _creating_manager(computer)
+    manager.create_computer_for_user.side_effect = refusal
+    with patch("src.server.app.computers._computer_manager", return_value=manager):
+        resp = await client.post(
+            "/api/v1/computers", json={"kind": "e2b", "resource_tier": "max"}
+        )
+
+    assert resp.status_code == 400
+    assert resp.json()["detail"] == str(refusal)
+
+
+@pytest.mark.asyncio
+async def test_an_unentitled_kind_is_refused_before_the_row_is_written(
+    client, computer, entitled, sandbox_config
+):
+    from fastapi import HTTPException
+
+    sandbox_config.offered_providers = ("e2b",)
+    manager = _creating_manager(computer)
+    gate = AsyncMock(
+        side_effect=HTTPException(403, detail="Requires scope: workspace:provider:e2b")
+    )
+    with (
+        patch("src.server.app.computers._computer_manager", return_value=manager),
+        patch("src.server.app.computers.assert_provider_allowed", gate),
+    ):
+        resp = await client.post("/api/v1/computers", json={"kind": "e2b"})
+
+    assert resp.status_code == 403
+    gate.assert_awaited_once_with(USER, "e2b", default_kind="daytona")
+    entitled.assert_not_awaited()
+    manager.create_computer_for_user.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_kind_is_rejected_by_the_model(client):
+    resp = await client.post("/api/v1/computers", json={"kind": "memory"})
+    assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_providers_lists_only_the_default_when_nothing_is_offered(client):
+    with patch("src.server.app.computers.get_computer") as get_computer:
+        resp = await client.get("/api/v1/computers/providers")
+
+    assert resp.status_code == 200
+    assert resp.json()["providers"] == [
+        {"kind": "daytona", "is_default": True, "allowed": True, "tiers": ANY}
+    ]
+    # Not read as a computer id by GET /{computer_id}.
+    get_computer.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_providers_lists_the_default_first_with_what_the_caller_may_pick(
+    client, sandbox_config
+):
+    sandbox_config.provider = "e2b"
+    sandbox_config.offered_providers = ("daytona", "docker")
+    allowances = AsyncMock(
+        return_value={"e2b": True, "daytona": False, "docker": None}
+    )
+    with patch("src.server.app.computers.get_provider_allowances", allowances):
+        resp = await client.get("/api/v1/computers/providers")
+
+    assert resp.status_code == 200
+    assert [
+        {k: v for k, v in p.items() if k != "tiers"} for p in resp.json()["providers"]
+    ] == [
+        {"kind": "e2b", "is_default": True, "allowed": True},
+        {"kind": "daytona", "is_default": False, "allowed": False},
+        {"kind": "docker", "is_default": False, "allowed": None},
+    ]
+    allowances.assert_awaited_once_with(
+        USER, ("e2b", "daytona", "docker"), default_kind="e2b"
+    )
+
+
+@pytest.mark.asyncio
+async def test_providers_reads_an_ungated_offer_as_unknown_in_oss_mode(
+    client, sandbox_config
+):
+    sandbox_config.offered_providers = ("e2b",)
+    resp = await client.get("/api/v1/computers/providers")
+
+    assert resp.json()["providers"][1] == {
+        "kind": "e2b",
+        "is_default": False,
+        "allowed": None,
+        "tiers": ANY,
+    }
+
+
+@pytest.mark.asyncio
+async def test_providers_list_each_ones_sizes_from_its_config(client, sandbox_config):
+    """The pickers render specs from here, so Extra Large shows only on E2B."""
+    sandbox_config.offered_providers = ("e2b", "ssh")
+    resp = await client.get("/api/v1/computers/providers")
+
+    tiers = {p["kind"]: p["tiers"] for p in resp.json()["providers"]}
+    assert tiers["daytona"] == [
+        {"tier": "standard", "cpu": 1, "memory_gib": 2, "disk_gib": 5},
+        {"tier": "performance", "cpu": 2, "memory_gib": 4, "disk_gib": 10},
+        {"tier": "max", "cpu": 2, "memory_gib": 8, "disk_gib": 10},
+    ]
+    assert tiers["e2b"][-1] == {
+        "tier": "xlarge", "cpu": 4, "memory_gib": 8, "disk_gib": 20
+    }
+    assert [t["tier"] for t in tiers["e2b"]] == [
+        "standard", "performance", "max", "xlarge"
+    ]
+    # Its owner sizes the machine.
+    assert tiers["ssh"] == []
+
+
+@pytest.mark.asyncio
+async def test_extra_large_on_daytona_is_refused_before_the_plan_gate(client):
+    """A plan without xlarge would otherwise be offered an upgrade for a size
+    Daytona never builds."""
+    manager = MagicMock()
+    manager.create_computer_for_user = AsyncMock()
+    spec_gate = AsyncMock()
+    with (
+        patch("src.server.app.computers._computer_manager", return_value=manager),
+        patch("src.server.app.computers.assert_spec_allowed", spec_gate),
+    ):
+        resp = await client.post(
+            "/api/v1/computers", json={"kind": "daytona", "resource_tier": "xlarge"}
+        )
+
+    assert resp.status_code == 400
+    assert "does not offer the 'xlarge' spec" in resp.json()["detail"]
+    spec_gate.assert_not_awaited()
+    manager.create_computer_for_user.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_extra_large_on_e2b_is_gated_then_created(
+    client, sandbox_config, entitled, prepares, sample_computer_dict
+):
+    sandbox_config.offered_providers = ("e2b",)
+    manager = MagicMock()
+    manager.create_computer_for_user = AsyncMock(
+        return_value=sample_computer_dict(
+            computer_id=COMPUTER_ID, kind="e2b", resource_tier="xlarge"
+        )
+    )
+    with (
+        patch("src.server.app.computers._computer_manager", return_value=manager),
+        patch("src.server.app.computers.assert_provider_allowed", AsyncMock()),
+        patch("src.server.app.computers.enforce_computer_count", AsyncMock()),
+        patch("src.server.app.computers.enforce_computer_limit", AsyncMock()),
+    ):
+        resp = await client.post(
+            "/api/v1/computers", json={"kind": "e2b", "resource_tier": "xlarge"}
+        )
+
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["resource_tier"] == "xlarge"
+    entitled.assert_awaited_once_with(USER, "xlarge")
+    assert manager.create_computer_for_user.await_args.kwargs["resource_tier"] == "xlarge"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enabled", [True, False])
+async def test_providers_say_whether_an_ssh_machine_may_connect_out(client, enabled):
+    with patch("src.server.app.computers.tunnels_enabled", return_value=enabled):
+        resp = await client.get("/api/v1/computers/providers")
+
+    assert resp.json()["tunnels"] is enabled
+
+
+_HOST_KEY = (
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl"
+)
+_SSH_CREATE = {
+    "kind": "ssh",
+    "ssh": {
+        "host": "203.0.113.10",
+        "port": 22,
+        "username": "dev",
+        "host_key": _HOST_KEY,
+        "root_dir": "/home/dev/langalpha",
+    },
+}
+_SSH = "src.server.services.ssh_computers"
+
+
+@pytest.fixture(autouse=True)
+def ssh_computers_held():
+    """How many live ssh computers the caller has, which the cap counts."""
+    with patch(
+        f"{_SSH}.count_live_computers_of_kind", AsyncMock(return_value=0)
+    ) as count:
+        yield count
+
+
+def _found(**overrides):
+    """What a probe of the machine in ``_SSH_CREATE`` finds."""
+    from ptc_agent.core.sandbox.providers.ssh import SSHProbe
+
+    fields = {
+        "host_key": _HOST_KEY,
+        "fingerprint": "SHA256:x",
+        "os": "Linux",
+        "arch": "x86_64",
+        "distro": "ubuntu",
+        "home": "/home/dev",
+        "shell": "/bin/bash",
+        "is_root": False,
+        "has_sudo": False,
+        "disk_free_bytes": None,
+        "supported": True,
+    }
+    return SSHProbe(**{**fields, **overrides})
+
+
+@pytest.mark.asyncio
+async def test_an_ssh_create_where_ssh_is_not_offered_dials_nothing(
+    client, computer, entitled
+):
+    """The probe connects to the address in the request, which a server that
+    does not offer the kind has no business doing for anyone."""
+    manager = _creating_manager(computer)
+    dial = AsyncMock()
+    with (
+        patch("src.server.app.computers._computer_manager", return_value=manager),
+        patch(f"{_SSH}.probe", dial),
+        patch(f"{_SSH}.has_client_key", AsyncMock(return_value=True)),
+    ):
+        resp = await client.post("/api/v1/computers", json=_SSH_CREATE)
+
+    assert resp.status_code == 400
+    dial.assert_not_awaited()
+    manager.create_computer_for_user.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_folder_taken_while_the_probe_ran_is_refused_under_the_lock(
+    client, computer, entitled, sandbox_config, prepares
+):
+    """The probe is too slow to hold the lock, so the folder is checked again
+    under it: two creates for one folder both pass the first check."""
+    import contextlib
+
+    sandbox_config.offered_providers = ("ssh",)
+    manager = _creating_manager({**computer, "kind": "ssh"})
+    sibling = {
+        "kind": "ssh",
+        "name": "first",
+        "root_dir": "/home/dev/langalpha",
+        "provider_config": {"host": "203.0.113.10", "port": 22, "host_key": _HOST_KEY},
+    }
+    held = []
+    live = iter([[], [sibling]])
+
+    async def _computers(user_id, *, include_deleted=False):
+        return [] if include_deleted else next(live)
+
+    @contextlib.asynccontextmanager
+    async def _lock(user_id):
+        held.append(user_id)
+        yield
+
+    with (
+        patch("src.server.app.computers._computer_manager", return_value=manager),
+        patch(f"{_SSH}.has_client_key", AsyncMock(return_value=True)),
+        patch(f"{_SSH}.client_key", AsyncMock(return_value="private key")),
+        patch(f"{_SSH}.probe", AsyncMock(return_value=_found())),
+        patch(f"{_SSH}.get_computers_for_user", _computers),
+        patch("src.server.app.computers.computer_capacity_lock", _lock),
+    ):
+        resp = await client.post("/api/v1/computers", json=_SSH_CREATE)
+
+    assert resp.status_code == 409
+    assert '"first"' in resp.json()["detail"]
+    # Taken with platform gating off too.
+    assert held == [USER]
+    manager.create_computer_for_user.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_an_ssh_create_without_a_folder_works_in_langalpha_in_the_home(
+    client, computer, entitled, sandbox_config, prepares
+):
+    """Never the deployment's root: that sits beside the homes and needs sudo."""
+    import contextlib
+
+    @contextlib.asynccontextmanager
+    async def _lock(user_id):
+        yield
+
+    sandbox_config.offered_providers = ("ssh",)
+    manager = _creating_manager({**computer, "kind": "ssh"})
+    probe = AsyncMock(return_value=_found())
+    body = {**_SSH_CREATE, "ssh": {**_SSH_CREATE["ssh"], "root_dir": None}}
+    with (
+        patch("src.server.app.computers._computer_manager", return_value=manager),
+        patch(f"{_SSH}.has_client_key", AsyncMock(return_value=True)),
+        patch(f"{_SSH}.client_key", AsyncMock(return_value="private key")),
+        patch(f"{_SSH}.probe", probe),
+        patch(f"{_SSH}.get_computers_for_user", AsyncMock(return_value=[])),
+        patch("src.server.app.computers.computer_capacity_lock", _lock),
+        patch("src.server.app.computers.enforce_computer_limit", AsyncMock()),
+    ):
+        resp = await client.post("/api/v1/computers", json=body)
+
+    assert resp.status_code == 201, resp.text
+    # The folder is checked on the machine before the row exists.
+    assert probe.await_args.kwargs["root_dir"] == "/home/dev/langalpha"
+    kwargs = manager.create_computer_for_user.await_args.kwargs
+    assert kwargs["root_dir"] == "/home/dev/langalpha"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("helper", "os"), [(True, "Darwin"), (False, "Linux")])
+async def test_an_ssh_computer_keeps_the_helper_and_system_its_probe_found(
+    client, computer, entitled, sandbox_config, prepares, helper, os
+):
+    """Only the probe can say so: the request never carries them."""
+    import contextlib
+
+    @contextlib.asynccontextmanager
+    async def _lock(user_id):
+        yield
+
+    sandbox_config.offered_providers = ("ssh",)
+    manager = _creating_manager({**computer, "kind": "ssh"})
+    body = {**_SSH_CREATE, "ssh": {**_SSH_CREATE["ssh"], "helper": not helper}}
+    with (
+        patch("src.server.app.computers._computer_manager", return_value=manager),
+        patch(f"{_SSH}.has_client_key", AsyncMock(return_value=True)),
+        patch(f"{_SSH}.client_key", AsyncMock(return_value="private key")),
+        patch(f"{_SSH}.probe", AsyncMock(return_value=_found(helper=helper, os=os))),
+        patch(f"{_SSH}.get_computers_for_user", AsyncMock(return_value=[])),
+        patch("src.server.app.computers.computer_capacity_lock", _lock),
+        patch("src.server.app.computers.enforce_computer_limit", AsyncMock()),
+    ):
+        resp = await client.post("/api/v1/computers", json=body)
+
+    assert resp.status_code == 201, resp.text
+    kwargs = manager.create_computer_for_user.await_args.kwargs
+    assert kwargs["provider_config"]["helper"] is helper
+    assert kwargs["provider_config"]["os"] == os
+
+
+@pytest.mark.asyncio
+async def test_an_ssh_computer_is_created_outside_the_plan_caps_and_may_skip_backups(
+    client, computer, sandbox_config, prepares
+):
+    """Its owner brings and pays for the machine, so neither the computer cap
+    nor the tier gate counts it, and only such a machine may start with its
+    file backups off."""
+    import contextlib
+
+    from fastapi import HTTPException
+
+    @contextlib.asynccontextmanager
+    async def _lock(user_id):
+        yield
+
+    sandbox_config.offered_providers = ("ssh",)
+    manager = _creating_manager({**computer, "kind": "ssh", "files_backup": False})
+    capped = AsyncMock(side_effect=HTTPException(429, detail="Limit reached"))
+    tier = AsyncMock(side_effect=HTTPException(403, detail="Requires scope"))
+    with (
+        patch("src.server.app.computers._computer_manager", return_value=manager),
+        patch(f"{_SSH}.has_client_key", AsyncMock(return_value=True)),
+        patch(f"{_SSH}.client_key", AsyncMock(return_value="private key")),
+        patch(f"{_SSH}.probe", AsyncMock(return_value=_found())),
+        patch(f"{_SSH}.get_computers_for_user", AsyncMock(return_value=[])),
+        patch("src.server.app.computers.computer_capacity_lock", _lock),
+        patch("src.server.app.computers.enforce_computer_limit", capped),
+        patch("src.server.app.computers.assert_spec_allowed", tier),
+    ):
+        resp = await client.post(
+            "/api/v1/computers", json={**_SSH_CREATE, "files_backup": False}
+        )
+
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["files_backup"] is False
+    assert manager.create_computer_for_user.await_args.kwargs["files_backup"] is False
+    capped.assert_not_awaited()
+    tier.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_an_ssh_create_at_the_limit_is_refused_before_dialing(
+    client, computer, entitled, sandbox_config, ssh_computers_held
+):
+    sandbox_config.offered_providers = ("ssh",)
+    sandbox_config.ssh.max_computers_per_user = 2
+    ssh_computers_held.return_value = 2
+    manager = _creating_manager({**computer, "kind": "ssh"})
+    dial = AsyncMock()
+    with (
+        patch("src.server.app.computers._computer_manager", return_value=manager),
+        patch(f"{_SSH}.probe", dial),
+    ):
+        resp = await client.post("/api/v1/computers", json=_SSH_CREATE)
+
+    assert resp.status_code == 409
+    assert resp.json()["detail"] == {
+        "code": "ssh_computer_limit",
+        "message": "You can have up to 2 SSH computers. Remove one to add another.",
+        "limit": 2,
+    }
+    ssh_computers_held.assert_awaited_once_with(USER, "ssh")
+    dial.assert_not_awaited()
+    manager.create_computer_for_user.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_two_creates_for_the_last_ssh_computer_add_one(
+    client, computer, entitled, sandbox_config, prepares, ssh_computers_held
+):
+    """Both pass the count made before their probes; the count again under
+    the lock, which the insert holds too, refuses the second."""
+    import asyncio
+    import contextlib
+
+    sandbox_config.offered_providers = ("ssh",)
+    sandbox_config.ssh.max_computers_per_user = 3
+    held = [{"kind": "ssh"}, {"kind": "ssh"}]
+    ssh_computers_held.side_effect = lambda *_args: len(held)
+    lock = asyncio.Lock()
+
+    @contextlib.asynccontextmanager
+    async def _lock(user_id):
+        async with lock:
+            yield
+
+    async def _insert(*_args, **kwargs):
+        await asyncio.sleep(0)
+        held.append({"kind": "ssh"})
+        return {**computer, "kind": "ssh", "status": "stopped", "provider_ref": None}
+
+    async def _probe(*_args, **_kwargs):
+        # Both creates are past the first count before either inserts.
+        await asyncio.sleep(0.01)
+        return _found()
+
+    manager = MagicMock()
+    manager.create_computer_for_user = AsyncMock(side_effect=_insert)
+    with (
+        patch("src.server.app.computers._computer_manager", return_value=manager),
+        patch(f"{_SSH}.has_client_key", AsyncMock(return_value=True)),
+        patch(f"{_SSH}.client_key", AsyncMock(return_value="private key")),
+        patch(f"{_SSH}.probe", _probe),
+        patch(f"{_SSH}.get_computers_for_user", AsyncMock(return_value=[])),
+        patch("src.server.app.computers.computer_capacity_lock", _lock),
+    ):
+        answers = await asyncio.gather(
+            client.post("/api/v1/computers", json=_SSH_CREATE),
+            client.post(
+                "/api/v1/computers",
+                json={
+                    **_SSH_CREATE,
+                    "ssh": {**_SSH_CREATE["ssh"], "root_dir": "/home/dev/other"},
+                },
+            ),
+        )
+
+    assert sorted(a.status_code for a in answers) == [201, 409]
+    refused = next(a for a in answers if a.status_code == 409)
+    assert refused.json()["detail"]["code"] == "ssh_computer_limit"
+    assert manager.create_computer_for_user.await_count == 1
+    assert len(held) == 3
+
+
+@pytest.mark.asyncio
+async def test_no_limit_counts_nothing(
+    client, computer, entitled, sandbox_config, prepares, ssh_computers_held
+):
+    import contextlib
+
+    @contextlib.asynccontextmanager
+    async def _lock(user_id):
+        yield
+
+    sandbox_config.offered_providers = ("ssh",)
+    sandbox_config.ssh.max_computers_per_user = 0
+    manager = _creating_manager({**computer, "kind": "ssh"})
+    with (
+        patch("src.server.app.computers._computer_manager", return_value=manager),
+        patch(f"{_SSH}.has_client_key", AsyncMock(return_value=True)),
+        patch(f"{_SSH}.client_key", AsyncMock(return_value="private key")),
+        patch(f"{_SSH}.probe", AsyncMock(return_value=_found())),
+        patch(f"{_SSH}.get_computers_for_user", AsyncMock(return_value=[])),
+        patch("src.server.app.computers.computer_capacity_lock", _lock),
+    ):
+        resp = await client.post("/api/v1/computers", json=_SSH_CREATE)
+
+    assert resp.status_code == 201, resp.text
+    ssh_computers_held.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_computer_the_server_rebuilds_is_never_created_without_backups(
+    client, computer, entitled, prepares
+):
+    """Its folders are laid again from the backup whenever it is rebuilt.
+    Refused before the row is written, so no such machine exists to go
+    without one."""
+    manager = _creating_manager(computer)
+    with patch("src.server.app.computers._computer_manager", return_value=manager):
+        resp = await client.post("/api/v1/computers", json={"files_backup": False})
+
+    assert resp.status_code == 422
+    assert resp.json()["detail"] == (
+        "File backup can only be turned off on a computer you brought yourself."
+    )
+    manager.create_computer_for_user.assert_not_awaited()
+    prepares.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["computer", "workspace"])
+@pytest.mark.parametrize("wrapped", [False, True])
+@pytest.mark.parametrize(
+    ("code", "status"), [("auth_failed", 422), ("unreachable", 503)]
+)
+async def test_an_ssh_failure_answers_alike_however_it_was_wrapped(
+    route, wrapped, code, status
+):
+    """A reconnect wraps what it cannot place as transient, and a foreground
+    start must not answer 503 where a background one reports the refusal,
+    nor a workspace's start other than its computer's."""
+    from fastapi import HTTPException
+
+    from ptc_agent.core.sandbox.providers.ssh_errors import SSHConnectError
+    from ptc_agent.core.sandbox.runtime import SandboxTransientError
+    from src.server.app.computers import _computer_action_errors
+    from src.server.app.workspaces import _workspace_action_errors
+
+    errors = (
+        _computer_action_errors("start", COMPUTER_ID)
+        if route == "computer"
+        else _workspace_action_errors("start", WORKSPACE_ID)
+    )
+    cause = SSHConnectError(code, "dev@203.0.113.10 did not accept our key.")
+
+    with pytest.raises(HTTPException) as caught:
+        async with errors:
+            if not wrapped:
+                raise cause
+            try:
+                raise cause
+            except SSHConnectError as e:
+                raise SandboxTransientError(f"Could not reach sandbox x: {e}") from e
+
+    assert caught.value.status_code == status
 
 
 # ---------------------------------------------------------------------------
@@ -1026,6 +1705,246 @@ async def test_stop_forbidden_for_another_user(
     mock_computer_manager.stop_computer.assert_not_awaited()
 
 
+# ---------------------------------------------------------------------------
+# Remove: an empty computer other than the primary, sandbox and all
+# ---------------------------------------------------------------------------
+
+
+def _removing(row, manager):
+    return (
+        patch("src.server.app.computers.get_computer", AsyncMock(return_value=row)),
+        patch("src.server.app.computers._computer_manager", return_value=manager),
+    )
+
+
+@pytest.mark.asyncio
+async def test_remove_of_a_hosted_computer_has_no_key_to_report(
+    client, computer, mock_computer_manager
+):
+    leave = AsyncMock()
+    get_row, get_manager = _removing(computer, mock_computer_manager)
+    with get_row, get_manager, patch("src.server.app.computers.leave_machine", leave):
+        resp = await client.delete(f"/api/v1/computers/{COMPUTER_ID}")
+
+    assert resp.status_code == 200
+    assert resp.json() == {"key": None, "files": None, "workspaces_deleted": []}
+    # Naming none, the computer must be empty: nothing on it is deleted.
+    mock_computer_manager.remove_computer_with_workspaces.assert_awaited_once_with(
+        COMPUTER_ID, [], delete_files=False
+    )
+    leave.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_remove_naming_workspaces_deletes_those_first(
+    client, computer, mock_computer_manager
+):
+    # One named but moved off meanwhile is skipped, and the client must not
+    # forget it: the answer names only the ones that went.
+    mock_computer_manager.remove_computer_with_workspaces.return_value = ["ws-a"]
+    get_row, get_manager = _removing(computer, mock_computer_manager)
+    with get_row, get_manager:
+        resp = await client.request(
+            "DELETE",
+            f"/api/v1/computers/{COMPUTER_ID}",
+            json={"delete_workspaces": ["ws-a", "ws-b"]},
+        )
+
+    assert resp.status_code == 200
+    assert resp.json()["workspaces_deleted"] == ["ws-a"]
+    mock_computer_manager.remove_computer_with_workspaces.assert_awaited_once_with(
+        COMPUTER_ID, ["ws-a", "ws-b"], delete_files=False
+    )
+
+
+@pytest.mark.asyncio
+async def test_remove_joins_the_workspaces_an_older_client_names_in_the_query(
+    client, computer, mock_computer_manager
+):
+    get_row, get_manager = _removing(computer, mock_computer_manager)
+    with get_row, get_manager:
+        resp = await client.request(
+            "DELETE",
+            f"/api/v1/computers/{COMPUTER_ID}",
+            params=[("delete_workspaces", "ws-a"), ("delete_workspaces", "ws-b")],
+            json={"delete_workspaces": ["ws-b", "ws-c"]},
+        )
+
+    assert resp.status_code == 200
+    mock_computer_manager.remove_computer_with_workspaces.assert_awaited_once_with(
+        COMPUTER_ID, ["ws-a", "ws-b", "ws-c"], delete_files=False
+    )
+
+
+def _ssh_row(computer, *, tunnel=""):
+    return {
+        **computer,
+        "kind": "ssh",
+        "provider_config": {
+            "host": "203.0.113.10",
+            "port": 22,
+            "username": "dev",
+            "host_key": _HOST_KEY,
+            "key_owner": USER,
+            "tunnel": tunnel,
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_remove_asked_to_delete_files_passes_it_on_and_reports_them(
+    client, computer, mock_computer_manager
+):
+    from src.server.models.computer import ComputerFilesRemoval
+    from src.server.services.ssh_removal import MachineLeft
+
+    files = ComputerFilesRemoval(outcome="deleted", runtime_kept=True)
+    leave = AsyncMock(return_value=MachineLeft(key=None, tunnel_released=False, files=files))
+    get_row, get_manager = _removing(_ssh_row(computer), mock_computer_manager)
+    with get_row, get_manager, patch("src.server.app.computers.leave_machine", leave):
+        resp = await client.delete(
+            f"/api/v1/computers/{COMPUTER_ID}",
+            params=[("delete_workspaces", "ws-a"), ("delete_files", "true")],
+        )
+
+    assert resp.status_code == 200
+    assert resp.json()["files"] == files.model_dump()
+    mock_computer_manager.remove_computer_with_workspaces.assert_awaited_once_with(
+        COMPUTER_ID, ["ws-a"], delete_files=True
+    )
+    assert leave.await_args.kwargs["delete_files"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("query", "remove_key"), [("", True), ("?remove_key=false", False)]
+)
+async def test_remove_of_an_ssh_computer_reports_its_key_after_the_delete(
+    client, computer, mock_computer_manager, query, remove_key
+):
+    from src.server.models.computer import ComputerKeyRemoval
+    from src.server.services.ssh_removal import MachineLeft
+
+    events = []
+    mock_computer_manager.remove_computer_with_workspaces.side_effect = (
+        lambda *_, **__: events.append("delete") or []
+    )
+    key = ComputerKeyRemoval(
+        outcome="removed", fingerprint="SHA256:abc/def+", comment="langalpha"
+    )
+
+    async def _leave(user_id, row, *, settings, remove_key, delete_files):
+        events.append(("leave", user_id, row["computer_id"], remove_key, delete_files))
+        return MachineLeft(key=key if remove_key else None, tunnel_released=False)
+
+    row = _ssh_row(computer)
+    get_row, get_manager = _removing(row, mock_computer_manager)
+    with get_row, get_manager, patch("src.server.app.computers.leave_machine", _leave):
+        resp = await client.delete(f"/api/v1/computers/{COMPUTER_ID}{query}")
+
+    assert resp.status_code == 200
+    assert resp.json()["key"] == (key.model_dump() if remove_key else None)
+    assert events == ["delete", ("leave", USER, COMPUTER_ID, remove_key, False)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("released", [True, False])
+async def test_a_tunnel_not_released_on_the_deletes_connection_is_released_later(
+    client, computer, mock_computer_manager, released
+):
+    from src.server.services.ssh_removal import MachineLeft
+
+    schedule = MagicMock()
+    leave = AsyncMock(return_value=MachineLeft(key=None, tunnel_released=released))
+    row = _ssh_row(computer, tunnel="t-1")
+    get_row, get_manager = _removing(row, mock_computer_manager)
+    with (
+        get_row,
+        get_manager,
+        patch("src.server.app.computers.leave_machine", leave),
+        patch("src.server.app.computers.schedule_start", schedule),
+    ):
+        resp = await client.delete(f"/api/v1/computers/{COMPUTER_ID}")
+
+    assert resp.status_code == 200
+    assert schedule.called is not released
+    if not released:
+        assert schedule.call_args.args[0] == f"tunnel-release:{COMPUTER_ID}"
+
+
+@pytest.mark.asyncio
+async def test_remove_of_an_unknown_computer_is_404(client, mock_computer_manager):
+    get_row, get_manager = _removing(None, mock_computer_manager)
+    with get_row, get_manager:
+        resp = await client.delete(f"/api/v1/computers/{COMPUTER_ID}")
+
+    assert resp.status_code == 404
+    mock_computer_manager.remove_computer_with_workspaces.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_remove_is_forbidden_for_another_user(
+    client, sample_computer_dict, mock_computer_manager
+):
+    foreign = sample_computer_dict(computer_id=COMPUTER_ID, user_id=OTHER_USER)
+    get_row, get_manager = _removing(foreign, mock_computer_manager)
+    with get_row, get_manager:
+        resp = await client.delete(f"/api/v1/computers/{COMPUTER_ID}")
+
+    assert resp.status_code == 403
+    mock_computer_manager.remove_computer_with_workspaces.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("code", ["primary", "has_workspaces", "busy"])
+async def test_a_refused_remove_is_409_with_the_code_the_client_words(
+    client, computer, mock_computer_manager, code
+):
+    from src.server.services.computer_errors import ComputerRemovalRefused
+
+    refusal = ComputerRemovalRefused(code)
+    mock_computer_manager.remove_computer_with_workspaces.side_effect = refusal
+    get_row, get_manager = _removing(computer, mock_computer_manager)
+    with get_row, get_manager:
+        resp = await client.delete(f"/api/v1/computers/{COMPUTER_ID}")
+
+    assert resp.status_code == 409
+    assert resp.json()["detail"] == {"code": code, "message": str(refusal)}
+    assert str(refusal)
+
+
+@pytest.mark.asyncio
+async def test_a_remove_refused_partway_names_the_workspaces_already_deleted(
+    client, computer, mock_computer_manager
+):
+    from src.server.services.computer_errors import ComputerRemovalRefused
+
+    mock_computer_manager.remove_computer_with_workspaces.side_effect = (
+        ComputerRemovalRefused("has_workspaces", deleted=["ws-a"])
+    )
+    get_row, get_manager = _removing(computer, mock_computer_manager)
+    with get_row, get_manager:
+        resp = await client.delete(f"/api/v1/computers/{COMPUTER_ID}")
+
+    assert resp.status_code == 409
+    assert resp.json()["detail"]["workspaces_deleted"] == ["ws-a"]
+
+
+@pytest.mark.asyncio
+async def test_a_computer_retired_under_the_remove_is_404(
+    client, computer, mock_computer_manager
+):
+    """Another remove, or the last workspace leaving, retired it first."""
+    mock_computer_manager.remove_computer_with_workspaces.side_effect = ValueError(
+        f"Computer {COMPUTER_ID} not found"
+    )
+    get_row, get_manager = _removing(computer, mock_computer_manager)
+    with get_row, get_manager:
+        resp = await client.delete(f"/api/v1/computers/{COMPUTER_ID}")
+
+    assert resp.status_code == 404
+
+
 @pytest.mark.asyncio
 async def test_a_missing_runtime_is_503_not_a_silent_success(
     client, sample_computer_dict
@@ -1173,6 +2092,36 @@ def _assert_refusal(resp, code):
     assert detail["code"] == code
     assert isinstance(detail["message"], str) and detail["message"]
     assert detail["files"] == []
+
+
+@pytest.mark.asyncio
+async def test_set_spec_to_a_size_the_provider_lacks_is_a_400_before_the_gate(
+    client, computer, mock_computer_manager
+):
+    """Extra Large on a Daytona computer: refused as a bad request, never
+    offered as an upgrade."""
+    mock_computer_manager.precheck_computer_spec = AsyncMock(
+        side_effect=UnknownResourceTier(
+            "This computer's provider does not offer the 'xlarge' spec"
+        )
+    )
+    mock_computer_manager.claim_computer_spec = AsyncMock()
+    gate = AsyncMock()
+    get_row, get_manager = _spec_client_patches(computer, mock_computer_manager)
+    with (
+        get_row,
+        get_manager,
+        patch("src.server.app.computers.platform_gating_active", return_value=True),
+        patch("src.server.app.computers.assert_spec_allowed", gate),
+    ):
+        resp = await client.post(
+            f"/api/v1/computers/{COMPUTER_ID}/spec", json={"tier": "xlarge"}
+        )
+
+    assert resp.status_code == 400
+    assert "xlarge" in resp.json()["detail"]
+    gate.assert_not_awaited()
+    mock_computer_manager.claim_computer_spec.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1425,6 +2374,59 @@ async def test_re_enabling_an_always_on_computer_skips_the_gate(
 
 
 # ---------------------------------------------------------------------------
+# File backup: the owner of a machine they brought may turn it off
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("kind", "enabled"), [("ssh", False), ("daytona", True)], ids=["ssh-off", "hosted-on"]
+)
+async def test_the_file_backup_switch_answers_with_the_machine(
+    client, sample_computer_dict, kind, enabled
+):
+    """Nothing on the machine changes, so the write is the whole answer."""
+    before = sample_computer_dict(computer_id=COMPUTER_ID, kind=kind)
+    write = AsyncMock(return_value={**before, "files_backup": enabled})
+    with (
+        patch("src.server.app.computers.get_computer", AsyncMock(return_value=before)),
+        patch("src.server.app.computers.set_computer_files_backup", write),
+        patch(
+            "src.server.app.computers.count_live_workspaces_by_computer",
+            AsyncMock(return_value={COMPUTER_ID: 2}),
+        ),
+    ):
+        resp = await client.post(
+            f"/api/v1/computers/{COMPUTER_ID}/files-backup", json={"enabled": enabled}
+        )
+
+    assert resp.status_code == 200
+    assert resp.json()["files_backup"] is enabled
+    assert resp.json()["workspace_count"] == 2
+    write.assert_awaited_once_with(COMPUTER_ID, enabled)
+
+
+@pytest.mark.asyncio
+async def test_file_backup_stays_on_for_a_machine_the_server_rebuilds(client, computer):
+    """A rebuild lays its folders again from the backup, which off would leave
+    stale."""
+    write = AsyncMock()
+    with (
+        patch("src.server.app.computers.get_computer", AsyncMock(return_value=computer)),
+        patch("src.server.app.computers.set_computer_files_backup", write),
+    ):
+        resp = await client.post(
+            f"/api/v1/computers/{COMPUTER_ID}/files-backup", json={"enabled": False}
+        )
+
+    assert resp.status_code == 409
+    assert resp.json()["detail"] == (
+        "File backup can only be turned off on a computer you brought yourself."
+    )
+    write.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
 # Aliases: /api/v1/workspaces/{id}/... resolves to the computer
 # ---------------------------------------------------------------------------
 
@@ -1608,7 +2610,7 @@ async def _drain_start_tasks():
     """Await whatever schedule_computer_start left running."""
     import asyncio
 
-    from src.server.app import background_starts
+    from src.server.services import background_starts
 
     await asyncio.gather(
         *list(background_starts._start_tasks.values()), return_exceptions=True
@@ -1690,7 +2692,8 @@ async def test_a_drained_start_publishes_nothing(mock_computer_manager):
     coming down with the worker, so its subscribers are told nothing."""
     import asyncio
 
-    from src.server.app import background_starts, computers
+    from src.server.app import computers
+    from src.server.services import background_starts
 
     started = asyncio.Event()
 
@@ -1725,7 +2728,8 @@ async def test_drain_cancels_in_flight_starts(mock_computer_manager):
     it can leave the row wedged in 'starting'."""
     import asyncio
 
-    from src.server.app import background_starts, computers
+    from src.server.app import computers
+    from src.server.services import background_starts
 
     started = asyncio.Event()
 
@@ -1752,7 +2756,8 @@ async def test_a_second_lazy_start_joins_the_one_in_flight(mock_computer_manager
     once it has settled does a new schedule start the machine again."""
     import asyncio
 
-    from src.server.app import background_starts, computers
+    from src.server.app import computers
+    from src.server.services import background_starts
 
     started = asyncio.Event()
     release = asyncio.Event()
@@ -1798,3 +2803,150 @@ async def test_lazy_start_preserves_capacity_denial(client, sample_computer_dict
     assert response.status_code == 429
     assert response.json()["detail"] == "capacity exhausted"
     update.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Make primary: the flip lands now, or Home moves first and the flip with it
+# ---------------------------------------------------------------------------
+
+
+def _home_move(**overrides):
+    from datetime import datetime, timezone
+
+    from src.server.database.home_workspace import get_home_workspace_id
+
+    row = {
+        "move_id": "44444444-4444-4444-8444-444444444444",
+        "workspace_id": get_home_workspace_id(USER),
+        "source_computer_id": "55555555-5555-4555-8555-555555555555",
+        "target_computer_id": COMPUTER_ID,
+        "make_primary": True,
+        "phase": "preparing",
+        "error": None,
+        "stale": False,
+        "created_at": datetime.now(timezone.utc),
+        "committed_at": None,
+        "finished_at": None,
+    }
+    row.update(overrides)
+    return row
+
+
+@pytest.fixture
+def make_primary_patches(computer, mock_computer_manager):
+    """The owner's computer, the flip, the Home claim and the background runner."""
+    from types import SimpleNamespace
+
+    mock_computer_manager.run_accepted_move = AsyncMock()
+    with (
+        patch("src.server.app.computers.get_computer", AsyncMock(return_value=computer)),
+        patch(
+            "src.server.app.computers._computer_manager",
+            return_value=mock_computer_manager,
+        ),
+        patch(
+            "src.server.app.computers.set_primary_computer", AsyncMock(return_value=True)
+        ) as flip,
+        patch(
+            "src.server.app.computers.claim_workspace_move",
+            AsyncMock(return_value=_home_move()),
+        ) as claim,
+        patch("src.server.app.computers.schedule_start", MagicMock()) as schedule,
+    ):
+        yield SimpleNamespace(
+            flip=flip, claim=claim, schedule=schedule, manager=mock_computer_manager
+        )
+
+
+@pytest.mark.asyncio
+async def test_make_primary_flips_now_when_home_need_not_move(
+    client, make_primary_patches
+):
+    resp = await client.post(f"/api/v1/computers/{COMPUTER_ID}/make-primary")
+
+    assert resp.status_code == 200
+    assert resp.json() == {"computer_id": COMPUTER_ID, "is_primary": True, "move": None}
+    make_primary_patches.flip.assert_awaited_once_with(USER, COMPUTER_ID)
+    make_primary_patches.claim.assert_not_awaited()
+    make_primary_patches.schedule.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_make_primary_moves_home_first_and_answers_202_with_the_move(
+    client, make_primary_patches
+):
+    """Home lives on the primary, so a flip that would leave it behind becomes
+    Home's move, which commits the flip; the client reads both from the move."""
+    from src.server.database.home_workspace import get_home_workspace_id
+
+    make_primary_patches.flip.return_value = False
+    move = make_primary_patches.claim.return_value
+
+    resp = await client.post(f"/api/v1/computers/{COMPUTER_ID}/make-primary")
+
+    assert resp.status_code == 202
+    body = resp.json()
+    assert body["computer_id"] == COMPUTER_ID
+    assert body["is_primary"] is False
+    assert body["move"]["move_id"] == move["move_id"]
+    assert body["move"]["workspace_id"] == get_home_workspace_id(USER)
+    assert body["move"]["target_computer_id"] == COMPUTER_ID
+    assert body["move"]["make_primary"] is True
+    assert body["move"]["phase"] == "preparing"
+    make_primary_patches.claim.assert_awaited_once_with(
+        user_id=USER,
+        workspace_id=get_home_workspace_id(USER),
+        target_computer_id=COMPUTER_ID,
+        make_primary=True,
+        from_backup=False,
+    )
+    make_primary_patches.schedule.assert_called_once()
+    key, start = make_primary_patches.schedule.call_args.args
+    assert key == f"workspace-move:{move['move_id']}"
+    await start()
+    make_primary_patches.manager.run_accepted_move.assert_awaited_once_with(move)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("step", "code", "status"),
+    [
+        ("flip", "move_in_progress", 409),
+        ("flip", "target_unavailable", 409),
+        ("flip", "not_found", 404),
+        ("claim", "not_movable", 409),
+        ("claim", "turn_active", 409),
+        ("claim", "move_in_progress", 409),
+    ],
+)
+async def test_make_primary_refusals_answer_in_the_move_outcome_shape(
+    client, make_primary_patches, step, code, status
+):
+    from src.server.database.workspace_move import MoveRefused
+
+    make_primary_patches.flip.return_value = False
+    getattr(make_primary_patches, step).side_effect = MoveRefused(code)
+
+    resp = await client.post(f"/api/v1/computers/{COMPUTER_ID}/make-primary")
+
+    assert resp.status_code == status
+    detail = resp.json()["detail"]
+    assert detail["code"] == code
+    assert isinstance(detail["message"], str) and detail["message"]
+    assert detail["files"] == []
+    make_primary_patches.schedule.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_make_primary_is_refused_on_another_users_computer(
+    client, make_primary_patches, sample_computer_dict
+):
+    with patch(
+        "src.server.app.computers.get_computer",
+        AsyncMock(return_value=sample_computer_dict(computer_id=COMPUTER_ID, user_id=OTHER_USER)),
+    ):
+        resp = await client.post(f"/api/v1/computers/{COMPUTER_ID}/make-primary")
+
+    assert resp.status_code == 403
+    make_primary_patches.flip.assert_not_awaited()
+    make_primary_patches.claim.assert_not_awaited()

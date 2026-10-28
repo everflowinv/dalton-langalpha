@@ -9,9 +9,9 @@ import { useTranslation } from 'react-i18next';
 import { useLocale } from '@/hooks/useLocale';
 import { formatBytes } from '@/lib/format';
 import { cn } from '@/lib/utils';
-import type { ComputerDisk, ComputerDiskLevel, ResourceTier } from '@/types/api';
+import type { ComputerDisk, ComputerDiskLevel, ResourceTier, WorkspaceQuota } from '@/types/api';
 
-import { TIER_ORDER } from './tierUi';
+import { isTierBlocked, tierCapacity, type TierOffer } from './tierUi';
 
 type Translate = ReturnType<typeof useTranslation>['t'];
 
@@ -46,10 +46,33 @@ export function diskLevelColor(level: ComputerDiskLevel | null | undefined): str
   }
 }
 
-/** The tier one step up, or null on the top tier. */
-export function nextTier(tier: ResourceTier): ResourceTier | null {
-  const index = TIER_ORDER.indexOf(tier);
-  return index >= 0 && index < TIER_ORDER.length - 1 ? TIER_ORDER[index + 1] : null;
+/**
+ * The offered sizes with more disk than `tier`, smallest first. Medium and
+ * Large share a disk, so the next size up is not always one. Without the
+ * provider's specs (an older server) the next size up stands in.
+ */
+export function largerDiskTiers(tier: ResourceTier, offer: TierOffer): ResourceTier[] {
+  const diskOf = (id: ResourceTier) => offer.specs.find((s) => s.tier === id)?.disk_gib;
+  const current = diskOf(tier);
+  if (current === undefined) {
+    const index = offer.tiers.indexOf(tier);
+    return index >= 0 && index < offer.tiers.length - 1 ? [offer.tiers[index + 1]] : [];
+  }
+  return offer.tiers.filter((id) => (diskOf(id) ?? 0) > current);
+}
+
+/**
+ * The size a low disk points to: the smallest with more disk that the plan
+ * allows. Null when the provider runs none or the plan allows none. For a
+ * computer already bigger than Small, pass the quota through
+ * `quotaForSpecChange`, or the slot it holds reads as taken.
+ */
+export function diskUpgradeTier(
+  tier: ResourceTier,
+  offer: TierOffer,
+  quota: WorkspaceQuota | null | undefined,
+): ResourceTier | null {
+  return largerDiskTiers(tier, offer).find((id) => !isTierBlocked(tierCapacity(quota, id))) ?? null;
 }
 
 export function diskUsageLabel(t: Translate, disk: ComputerDisk, locale: string): string {
@@ -82,9 +105,20 @@ export function DiskBar({ disk, className }: DiskBarProps) {
       aria-valuetext={diskUsageLabel(t, disk, locale)}
     >
       <div
-        className="h-full rounded-full transition-[width] duration-300"
+        className="h-full rounded-full transition-[width] duration-fold"
         style={{ width: `${Math.round(ratio * 1000) / 10}%`, backgroundColor: diskLevelColor(disk.level) }}
       />
     </div>
+  );
+}
+
+/** The usage in words, in its level's colour once it is low; says so while unmeasured. */
+export function DiskUsageText({ disk }: { disk: ComputerDisk | null }) {
+  const { t } = useTranslation();
+  const locale = useLocale();
+  return (
+    <span style={disk && disk.level !== 'healthy' ? { color: diskLevelColor(disk.level) } : undefined}>
+      {disk ? diskUsageLabel(t, disk, locale) : t('computer.disk.unknown', 'Storage not measured yet')}
+    </span>
   );
 }

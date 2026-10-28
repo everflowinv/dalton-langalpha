@@ -1,7 +1,8 @@
 import React, { useState, useMemo } from 'react';
 import { TrendingUp, Clock, Briefcase, Eye, Search, X } from 'lucide-react';
-import { motion, AnimatePresence } from '@/lib/framer';
 import { useTranslation } from 'react-i18next';
+import { SwapCell } from '@/components/ui/crossfade';
+import { useLastHeight } from '@/lib/lastShape';
 import { useIsMobile } from '@/hooks/useIsMobile';
 import { useNow } from '@/hooks/useNow';
 import { useLocale } from '@/hooks/useLocale';
@@ -32,12 +33,10 @@ const DATE_RANGE_KEYS: NewsDateRange[] = ['all', '1h', '6h', '24h', '7d'];
 
 interface NewsRowProps {
   item: NewsItem;
-  idx: number;
   onNewsClick?: (id: string | number, articleUrl?: string | null) => void;
-  skipAnimation?: boolean;
 }
 
-function NewsRow({ item, idx, onNewsClick, skipAnimation }: NewsRowProps) {
+function NewsRow({ item, onNewsClick }: NewsRowProps) {
   const locale = useLocale();
   const now = useNow();
   const time = relativeTime(item.publishedAt, locale, now);
@@ -48,16 +47,8 @@ function NewsRow({ item, idx, onNewsClick, skipAnimation }: NewsRowProps) {
       : 'var(--color-text-secondary)';
   const tickers = (item.tickers?.length ?? 0) > 0 ? item.tickers! : null;
 
-  const Wrapper = skipAnimation ? 'div' : motion.div;
-  const motionProps = skipAnimation ? {} : {
-    initial: { opacity: 0, y: 10 },
-    animate: { opacity: 1, y: 0 },
-    transition: { delay: Math.min(idx, 10) * 0.05 },
-  };
-
   return (
-    <Wrapper
-      {...motionProps}
+    <div
       onClick={() => item.id != null && onNewsClick?.(item.id, item.articleUrl)}
       className="group flex items-center gap-3 sm:gap-4 px-2 py-2.5 sm:p-3 rounded-lg sm:rounded-xl border border-transparent transition-all cursor-pointer"
       style={{ backgroundColor: 'transparent' }}
@@ -76,7 +67,7 @@ function NewsRow({ item, idx, onNewsClick, skipAnimation }: NewsRowProps) {
           <img
             src={item.image}
             alt=""
-            className="h-full w-full object-cover transition-transform duration-500 group-hover:scale-110"
+            className="h-full w-full object-cover"
             onError={(e) => { (e.target as HTMLImageElement).style.display = 'none'; }}
           />
         </div>
@@ -143,7 +134,7 @@ function NewsRow({ item, idx, onNewsClick, skipAnimation }: NewsRowProps) {
           </div>
         )}
       </div>
-    </Wrapper>
+    </div>
   );
 }
 
@@ -243,6 +234,9 @@ function NewsFeedCard({
   const { items, loading } = dataMap[activeTab];
 
   const hasFilters = tickerFilter.trim() !== '' || dateRange !== 'all';
+  // Each tab's list height last time here, so its skeleton holds that room.
+  // Not under a filter, which a visit does not open with.
+  const { ref: listRef, height: lastListHeight } = useLastHeight(`dashboard:news.height.${activeTab}`, !hasFilters);
 
   const filteredItems = useMemo(() => {
     let result = items;
@@ -315,7 +309,7 @@ function NewsFeedCard({
               backgroundColor: 'var(--color-bg-input, var(--color-bg-tag))',
               borderColor: 'var(--color-border-muted)',
               width: tickerFilter ? 160 : 130,
-              transition: 'width 0.2s',
+              transition: 'width var(--motion-quick) var(--ease-out)',
             }}
           >
             <Search size={12} style={{ color: 'var(--color-text-secondary)', flexShrink: 0 }} />
@@ -370,27 +364,32 @@ function NewsFeedCard({
         </div>
       </div>
 
-      {/* Tab content */}
-      <AnimatePresence mode="wait">
-        <motion.div
-          key={activeTab}
-          initial={{ opacity: 0, y: 8 }}
-          animate={{ opacity: 1, y: 0 }}
-          exit={{ opacity: 0, y: -8 }}
-          transition={{ duration: 0.2 }}
-          className="flex flex-col gap-1"
-        >
-          {loading ? (
+      {/* Tab content. A tab change dissolves in one grid cell: the old list
+          leaves as the new one arrives, never through an empty card. A tab the
+          reader picks rises; the skeleton giving way to its rows crossfades. */}
+      <SwapCell
+        as="div"
+        className="items-start"
+        riseKey={activeTab}
+        swapKey={`${activeTab}:${loading ? 'loading' : 'ready'}`}
+        layerClassName="flex flex-col gap-1"
+      >
+        {loading ? (
+          <div className="flex flex-col gap-1 overflow-hidden" style={{ height: lastListHeight ?? undefined }}>
             <SkeletonRows />
-          ) : filteredItems.length === 0 ? (
-            <EmptyState tab={activeTab} hasFilters={hasFilters} />
-          ) : (
-            filteredItems.map((item, idx) => (
-              <NewsRow key={item.id || idx} item={item} idx={idx} onNewsClick={onNewsClick} skipAnimation={isMobile} />
-            ))
-          )}
-        </motion.div>
-      </AnimatePresence>
+          </div>
+        ) : (
+          <div ref={listRef} className="flex flex-col gap-1">
+            {filteredItems.length === 0 ? (
+              <EmptyState tab={activeTab} hasFilters={hasFilters} />
+            ) : (
+              filteredItems.map((item, idx) => (
+                <NewsRow key={item.id || idx} item={item} onNewsClick={onNewsClick} />
+              ))
+            )}
+          </div>
+        )}
+      </SwapCell>
     </div>
   );
 }

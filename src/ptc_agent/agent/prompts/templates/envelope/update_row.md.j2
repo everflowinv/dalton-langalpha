@@ -70,6 +70,11 @@
    anchor, already prose with its own stamp, so a header would only label the
    clock with a second copy of the time.
 
+   A `wakeup_cancelled` row (`turn.WAKEUP_CANCELLED_ROW_KIND`) says the user
+   cancelled wakeups the agent set, or turned wakeups off. It renders bare
+   too: its text is already the whole notice, and it compares nothing with a
+   frozen block.
+
    A `subagents_switched` row (`turn.SUBAGENTS_ROW_KIND`) says the
    user flipped the thread's subagent switch, which `provenance.allowed`
    carries; its text is empty and every word is here. It names no tool, since
@@ -82,7 +87,7 @@
    State only, so it renders the same at both guidance levels. The standing
    rules for reading a row are static prose in the system prefix. #}
 {% if update %}
-{% if update.kind == "turn_opened" %}
+{% if update.kind in ("turn_opened", "wakeup_cancelled") %}
 {{ update.text }}
 {% elif update.kind == "subagents_switched" %}
 {% if update.provenance.get("allowed") is false %}
@@ -130,9 +135,9 @@ The earlier time limit no longer applies
 
 This turn has a new time limit, so the note above about it running out is withdrawn, and your tools run again.
 {% elif update.kind == "workspace_changed" %}
-The workspace was renamed or redescribed after the copy in <workspace> was frozen
+The workspace changed after the copy in <workspace> was frozen
 
-Each line below gives the current value and what the frozen block still says. Trust these values over the block until it is rebuilt. A later workspace row supersedes this one.
+The lines below say what is true now. Where the frozen block says otherwise, trust these until it is rebuilt. A later workspace row supersedes this one.
 
 {{ update.text }}
 {% elif harness %}

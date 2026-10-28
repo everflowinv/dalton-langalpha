@@ -462,6 +462,48 @@ def test_stale_daemon_drains_inflight_and_refuses_new_calls(start_supervisor, tm
     _wait_until(harness.supervisor._stop.is_set)
 
 
+def test_a_retired_daemon_finishes_inflight_and_frees_its_computer(start_supervisor):
+    # For a computer whose env changed: the call it took still answers, and
+    # retire() returns only once the lock is free for the replacement.
+    import fcntl
+
+    backend = FakeBackend({"alpha"})
+    backend.gate = threading.Event()
+    harness = start_supervisor(backend, drain_timeout_s=5.0)
+    socket_path = harness.supervisor.socket_path
+    lock_path = socket_path + ".lock"
+    lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    fcntl.flock(lock_fd, fcntl.LOCK_EX)  # as main() holds it while serving
+    active = harness.connect()
+    active.send(_call(1, "alpha"))
+    assert backend.entered.acquire(timeout=READ_TIMEOUT_S)
+
+    results: list[int] = []
+    retiring = threading.Thread(
+        target=lambda: results.append(d.retire(socket_path, lock_path))
+    )
+    retiring.start()
+    _wait_until(harness.supervisor._draining.is_set)
+
+    assert harness.connect().exchange(_call(2, "alpha"))[0]["code"] == "draining"
+    backend.gate.set()
+    assert active.frames()[-1]["type"] == p.TYPE_REPLY
+    _wait_until(harness.supervisor._stop.is_set)
+    assert retiring.is_alive()
+    os.close(lock_fd)  # the daemon's process exits
+    retiring.join(READ_TIMEOUT_S)
+    assert results == [0]
+
+
+def test_retiring_with_no_daemon_listening_is_done_at_once():
+    directory = tempfile.mkdtemp(prefix="mcpsup-")
+    try:
+        path = os.path.join(directory, "s.sock")
+        assert d.retire(path, path + ".lock") == 0
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
+
+
 def test_absent_config_file_refuses_until_repaired(start_supervisor, tmp_path):
     harness = start_supervisor(FakeBackend({"alpha"}))
     missing = str(tmp_path / "never-written.json")

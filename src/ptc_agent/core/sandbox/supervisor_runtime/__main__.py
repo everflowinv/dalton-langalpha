@@ -1,4 +1,4 @@
-"""``python3 -m supervisor <computer_root>``."""
+"""``python3 -m supervisor <computer_root> [--retire]``."""
 
 import sys
 

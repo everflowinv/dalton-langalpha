@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useLayoutEffect, useState } from 'react';
 import { AlertTriangle } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import Markdown from './Markdown';
@@ -15,7 +15,9 @@ interface TextMessageContentProps {
   isStreaming: boolean;
   onOpenFile?: OpenFileHandler;
   /** Whether everything that has arrived is on screen. The typewriter trails
-   *  the stream, so what follows this block can wait for it to catch up. */
+   *  the stream, so what follows this block can wait for it to catch up.
+   *  Called from a layout effect, so a reader deciding in a layout effect of
+   *  its own (a turn settling, see `ProseTyping`) has this commit's answer. */
   onRevealed?: (done: boolean) => void;
 }
 
@@ -50,7 +52,7 @@ function TextMessageContent({ content, isStreaming, onOpenFile, onRevealed }: Te
   // against the released prefix called a held-back paragraph "shown" and let an
   // activity block overtake the prose it belongs under.
   const revealed = !content || displayText === text;
-  useEffect(() => { onRevealed?.(revealed); }, [onRevealed, revealed]);
+  useLayoutEffect(() => { onRevealed?.(revealed); }, [onRevealed, revealed]);
 
   if (!content) {
     return null;

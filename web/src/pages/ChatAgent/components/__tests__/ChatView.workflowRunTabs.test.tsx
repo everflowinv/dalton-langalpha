@@ -16,6 +16,8 @@ import { renderWithProviders } from '@/test/utils';
 
 vi.mock('@/lib/framer', async () => {
   const ReactActual = await vi.importActual<typeof import('react')>('react');
+  // The real curve: the transcript's scroll engine lands on it.
+  const { cubicBezier } = await vi.importActual<typeof import('@/lib/framer')>('@/lib/framer');
   const FRAMER_ONLY_PROPS = new Set([
     'initial', 'animate', 'exit', 'transition', 'variants',
     'whileHover', 'whileTap', 'whileInView', 'layout', 'layoutId',
@@ -51,11 +53,12 @@ vi.mock('@/lib/framer', async () => {
     useTransform: () => ({ get: () => 0, set: () => {}, on: () => () => {} }),
     useSpring: (v: unknown) => ({ get: () => v, set: () => {}, on: () => () => {} }),
     useReducedMotion: () => false,
+    cubicBezier,
   };
 });
 
 vi.mock('react-i18next', () => ({
-  useTranslation: () => ({ t: (key: string) => key }),
+  useTranslation: () => ({ t: (key: string) => key, i18n: { language: 'en-US', resolvedLanguage: 'en-US' } }),
 }));
 
 vi.mock('@/lib/supabase', () => ({ supabase: null }));
@@ -92,6 +95,7 @@ vi.mock('../../hooks/useChatMessages', async (importOriginal) => ({
     awaitingReportBack: false,
     reportBackOwed: false,
     workspaceStarting: false,
+    turnHeld: null,
     isCompacting: false,
     setIsCompacting: vi.fn(),
     queuedSend: null,

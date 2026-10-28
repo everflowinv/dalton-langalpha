@@ -192,6 +192,9 @@ class PreferenceFile(_ProfileFile[Preferences, dict[str, Any], PreferenceChanges
         return io.parse_preferences(content)
 
     def plan(self, call: CallContext, parsed: dict[str, Any], rows: Preferences) -> Plan[PreferenceChanges]:
+        # Checked here rather than in ``parse``: a structured value the row
+        # already holds passes, so the check needs the row the save locked.
+        parsed = io.check_preferences(parsed, rows)
         # A rewrite with identical content opens no write.
         if io.preferences_equal(rows, parsed):
             return Plan(None)

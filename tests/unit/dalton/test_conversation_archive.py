@@ -53,6 +53,7 @@ else:
 
 from psycopg import AsyncConnection, AsyncCursor, AsyncTransaction
 from psycopg_pool import AsyncConnectionPool
+from deepagents.backends.protocol import ExecuteResponse
 from ptc_agent.agent.backends.sandbox import SandboxBackend
 from scripts.dalton import conversation_archive as archive_cli
 from scripts.dalton import researchdata_bridge as bridge_mod
@@ -1428,10 +1429,10 @@ async def test_render_per_company_and_home_topics_and_backfill_429_backoff(
 
     nvda_backend = create_autospec(SandboxBackend, instance=True)
     nvda_backend.awrite_text.side_effect = _write_nvda
-    nvda_backend.aexecute_bash.return_value = {"exit_code": 0, "stdout": "", "stderr": ""}
+    nvda_backend.aexecute.return_value = ExecuteResponse(output="", exit_code=0, truncated=False)
     home_backend = create_autospec(SandboxBackend, instance=True)
     home_backend.awrite_text.side_effect = _write_home
-    home_backend.aexecute_bash.return_value = {"exit_code": 0, "stdout": "", "stderr": ""}
+    home_backend.aexecute.return_value = ExecuteResponse(output="", exit_code=0, truncated=False)
 
     mock_bulk_upsert = create_autospec(render_mod.bulk_upsert_files, return_value=1)
     mock_delete_rows = create_autospec(render_mod.delete_file_rows, return_value=1)
@@ -1561,7 +1562,7 @@ async def test_render_per_company_and_home_topics_and_backfill_429_backoff(
 
     crwv_backend = create_autospec(SandboxBackend, instance=True)
     crwv_backend.awrite_text.side_effect = _write_crwv
-    crwv_backend.aexecute_bash.return_value = {"exit_code": 0, "stdout": "", "stderr": ""}
+    crwv_backend.aexecute.return_value = ExecuteResponse(output="", exit_code=0, truncated=False)
     mock_delete_rows.reset_mock()
 
     card_with_prev_home = {
@@ -1621,7 +1622,7 @@ async def test_render_per_company_and_home_topics_and_backfill_429_backoff(
     # workspace mapping changes to a new workspace (`ws-nvda-old` -> `ws-nvda`) or disappears
     mock_delete_rows.reset_mock()
     old_ws_backend = create_autospec(SandboxBackend, instance=True)
-    old_ws_backend.aexecute_bash.return_value = {"exit_code": 0, "stdout": "", "stderr": ""}
+    old_ws_backend.aexecute.return_value = ExecuteResponse(output="", exit_code=0, truncated=False)
     card_from_old_ws = {
         **sample_cards[0],
         "rendered_locations": [

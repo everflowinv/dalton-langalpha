@@ -38,6 +38,7 @@ from langgraph.store.memory import InMemoryStore
 
 from ptc_agent.agent.backends import workflow_namespace
 from ptc_agent.agent.backends.automations import AutomationsBackend
+from ptc_agent.agent.backends.results import GrepAnswer
 from ptc_agent.agent.backends.sandbox import SandboxBackend
 from ptc_agent.agent.backends.search_match import (
     GLOB_EXCLUDED_DIRS,
@@ -912,7 +913,6 @@ class TestGlobInsideARoute:
             ("*/*.md", ["notes/q3.md"]),
             ("notes/*", ["notes/q3.md"]),
             ("n*", []),
-            # DALTON-HOOK(glob-brace-expansion): *.{md,json} expands to *.md and *.json (which agent_glob_pattern turns into **/*.md and **/*.json)
             ("*.{md,json}", ["memory.md", "notes/q3.md"]),
         ],
     )
@@ -1809,6 +1809,14 @@ GLOB_PATTERNS = (
     "{root}/.agents/user/*/*.md",
     "{folder}/.agents/memory/*.md",
     "{root}/.agents/user/memory/vendor/*",
+    "{sub,user}/*.md",
+    "{*.md,sub/*.json}",
+    "**/{a,c}.json",
+    "{a,b{,s}}.json",
+    ".agents/{memory,user/profile}/*",
+    "{.agents/user/memory,sub}/*.json",
+    "{{root}/.agents/user/memory/*.md,*.json}",
+    "[{]a,b}*",
 )
 
 
@@ -2043,97 +2051,122 @@ class TestGrepFilterMatchesRgOnDisk:
         assert differences == {}
 
 
-# DALTON-HOOK(glob-brace-expansion): verify brace expansion across DiskGlob and sandbox find
-@pytest.mark.asyncio
-async def test_glob_brace_expansion_nested_and_commas(tmp_path):
-    import os
-    from ptc_agent.agent.backends.search_match import DiskGlob
-    from ptc_agent.core.sandbox.glob_runtime import expand_braces, find
+class TestARouteSearchedOnlyInside:
+    """A route marked ``searched_only_inside`` is searched when ``path`` is
+    at or inside its root and from nowhere above, as rg follows the mount's
+    link to such files only when it is given that link."""
 
-    assert expand_braces("**/{debate,thesis,drivers,agenda}.json") == [
-        "**/debate.json",
-        "**/thesis.json",
-        "**/drivers.json",
-        "**/agenda.json",
-    ]
-    assert expand_braces("data/{a,{b,c},}.json") == [
-        "data/a.json",
-        "data/b.json",
-        "data/c.json",
-        "data/.json",
-    ]
-    assert expand_braces("data/{[a,b],c}.json") == [
-        "data/[a,b].json",
-        "data/c.json",
-    ]
+    ROOT_PREFIX = f"{FOLDER}/.agents/history/"
+    HIT = f"{ROOT_PREFIX}abcd1234/turn-0001.jsonl"
 
-    data_dir = tmp_path / "data"
-    data_dir.mkdir()
-    names = ["debate.json", "thesis.json", "drivers.json", "agenda.json", "company.json"]
-    for idx, name in enumerate(names, start=1):
-        p = data_dir / name
-        p.write_text("{}")
-        ts = 1_700_000_000 + idx * 10
-        os.utime(p, (ts, ts))
+    @pytest.fixture
+    def history(self, files):
+        route = SimpleNamespace(
+            root_prefix=self.ROOT_PREFIX,
+            refuses_writes=True,
+            searched_only_inside=True,
+            agrep_rich=AsyncMock(return_value=[self.HIT]),
+        )
+        files._routes.insert(0, route)
+        return route
 
-    found = find(
-        "**/{debate,thesis,drivers,agenda,thesis,*s}.json",
-        str(tmp_path),
-        [],
-        {},
-        "/mnt/livefs",
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("path", "glob"),
+        [(".", None), (FOLDER, None), (".agents", None), (ROOT, "**/.agents/**")],
     )
-    assert found == [
-        str(data_dir / "agenda.json"),
-        str(data_dir / "drivers.json"),
-        str(data_dir / "thesis.json"),
-        str(data_dir / "debate.json"),
-    ]
+    async def test_a_grep_from_above_does_not_search_it(self, files, history, path, glob):
+        await _grep(files, "ZEPH", path, glob=glob)
 
-    dg = DiskGlob("**/{debate,thesis,drivers,agenda}.json", "/workspace")
-    assert dg.finds("/workspace/data/drivers.json") is True
-    assert dg.finds("/workspace/data/company.json") is False
+        history.agrep_rich.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("path", [".agents/history", ".agents/history/abcd1234"])
+    async def test_a_path_inside_it_searches_it(self, files, history, path):
+        found = await _grep(files, "ZEPH", path)
+
+        history.agrep_rich.assert_awaited()
+        assert found == [self.HIT]
 
 
-# DALTON-HOOK(glob-brace-expansion): parametrized parity test between sandbox aglob_files and DiskGlob
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "pattern",
-    [
-        "{*.json,notes/*.json}",
-        "{thesis.schema.json,unused/path.json}",
-        "**/{debate,thesis}.json",
-        "*.{md,json}",
-        "data/{a,b}.json",
-    ],
-)
-async def test_glob_sandbox_and_diskglob_parity(tmp_path, pattern):
-    from ptc_agent.agent.backends.search_match import DiskGlob, agent_glob_pattern
-    from ptc_agent.core.sandbox.glob_runtime import find
+class TestARouteThatTakesTheWalk:
+    """A route that ``takes_walk`` is told the page's end and the walk's
+    verdict on its files, so it fetches no more than the page needs, and the
+    notes it answers with reach the Grep's output."""
 
-    files = [
-        tmp_path / "root.json",
-        tmp_path / "readme.md",
-        tmp_path / "thesis.schema.json",
-        tmp_path / "notes" / "n1.json",
-        tmp_path / "notes" / "n2.md",
-        tmp_path / "sub" / "thesis.schema.json",
-        tmp_path / "data" / "debate.json",
-        tmp_path / "data" / "thesis.json",
-        tmp_path / "data" / "a.json",
-        tmp_path / "data" / "b.json",
-        tmp_path / "data" / "c.json",
-    ]
-    for f in files:
-        f.parent.mkdir(parents=True, exist_ok=True)
-        f.write_text("{}")
+    ROOT_PREFIX = f"{FOLDER}/.agents/history/"
+    HIT = f"{ROOT_PREFIX}abcd1234/turn-0001.jsonl"
 
-    sandbox_found = set(
-        find(agent_glob_pattern(pattern), str(tmp_path), [], {}, "/mnt/livefs")
+    @pytest.fixture
+    def history(self, files):
+        route = SimpleNamespace(
+            root_prefix=self.ROOT_PREFIX,
+            refuses_writes=True,
+            searched_only_inside=True,
+            takes_walk=True,
+            agrep_rich=AsyncMock(return_value=GrepAnswer([self.HIT], ["[stopped short]"])),
+        )
+        files._routes.insert(0, route)
+        return route
+
+    @pytest.mark.asyncio
+    async def test_it_is_told_the_pages_end_and_the_filters_verdict(self, files, history):
+        await _grep(files, "ZEPH", ".agents/history", glob="turn-*", head_limit=2, offset=3)
+
+        told = history.agrep_rich.await_args.kwargs
+        assert told["head_limit"] == 5
+        assert told["searches"](self.HIT)
+        assert not told["searches"](f"{self.ROOT_PREFIX}abcd1234/manifest.json")
+
+    @pytest.mark.asyncio
+    async def test_its_notes_follow_the_matches(self, files, history):
+        printed = await create_grep_tool(files).ainvoke(
+            {"pattern": "ZEPH", "path": ".agents/history"}
+        )
+
+        assert printed.endswith("abcd1234/turn-0001.jsonl\n\n[stopped short]")
+
+
+class TestARouteThatRefusesThePattern:
+    """A route searches with RE2, which refuses some syntax rg runs, such as
+    ``(?x)``. Its files went unsearched, which no matches would hide, so the
+    Grep says so once for each route, at the path it prints, and rg's own
+    matches stand."""
+
+    REFUSED = (
+        "[Grep did not search {path}: its files are searched with RE2, which "
+        "refuses this pattern (invalid perl operator: (?x). Grep that path "
+        "again without that syntax to search them.]"
     )
-    dg = DiskGlob(pattern, str(tmp_path))
-    diskglob_found = {str(f) for f in files if dg.finds(str(f))}
 
-    assert sandbox_found == diskglob_found
+    @pytest.mark.asyncio
+    async def test_a_grep_inside_it_says_it_did_not_search_it(self, files):
+        # The profile is read at each of its files, and is named once.
+        printed = await create_grep_tool(files).ainvoke(
+            {"pattern": "(?x) ZEPH", "path": ".agents/user/profile"}
+        )
 
+        assert printed == (
+            "No matches found for pattern '(?x) ZEPH' in '.agents/user/profile'\n\n"
+            + self.REFUSED.format(path="/.agents/user/profile")
+        )
 
+    @pytest.mark.asyncio
+    async def test_a_grep_from_above_keeps_rgs_matches_and_names_each_route(
+        self, files, sandbox
+    ):
+        on_disk = f"{ROOT}/.agents/user/notes.md"
+        sandbox.agrep_rich.return_value = [on_disk]
+        below = [
+            route.root_prefix.rstrip("/")
+            for route in files._routes
+            if route.root_prefix.startswith(f"{ROOT}/.agents/user/")
+        ]
+
+        found = await _grep(files, "(?x) ZEPH", ".agents/user")
+
+        assert found == [on_disk]
+        assert len(below) > 1
+        assert sorted(found.notes) == sorted(
+            self.REFUSED.format(path=path[len(ROOT) :]) for path in below
+        )

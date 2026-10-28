@@ -30,14 +30,23 @@ interface ChoiceProps {
   children: ReactNode;
 }
 
+// `relative` keeps the hidden input inside its row. Placed against a farther
+// box, focusing it scrolls that box: inside a dialog, the whole panel.
 function rowClassName(disabled: boolean | undefined, className: string | undefined): string {
-  return cn('rings-within flex', disabled ? 'cursor-not-allowed opacity-50' : 'cursor-pointer', className);
+  return cn('rings-within relative flex', disabled ? 'cursor-not-allowed opacity-50' : 'cursor-pointer', className);
 }
+
+/** The ring grows with the text beside it, as the checkbox's box does. */
+const RADIO_SIZE = {
+  sm: { ring: 'h-3.5 w-3.5', dot: 'h-1.5 w-1.5' },
+  md: { ring: 'h-4 w-4', dot: 'h-2 w-2' },
+} as const;
 
 export function RadioChoice<V extends string>({
   name,
   value,
   onSelect,
+  size = 'sm',
   checked,
   disabled,
   autoFocus,
@@ -51,7 +60,9 @@ export function RadioChoice<V extends string>({
   name: string;
   value: V;
   onSelect: (value: V) => void;
+  size?: keyof typeof RADIO_SIZE;
 }) {
+  const dims = RADIO_SIZE[size];
   return (
     <label className={rowClassName(disabled, className)} style={style}>
       <input
@@ -68,10 +79,10 @@ export function RadioChoice<V extends string>({
       />
       <span
         aria-hidden="true"
-        className={cn('flex h-3.5 w-3.5 shrink-0 items-center justify-center rounded-full border', markClassName)}
+        className={cn('flex shrink-0 items-center justify-center rounded-full border', dims.ring, markClassName)}
         style={{ borderColor: checked ? 'var(--color-btn-primary-bg)' : 'var(--color-text-quaternary)' }}
       >
-        {checked && <span className="h-1.5 w-1.5 rounded-full" style={{ backgroundColor: 'var(--color-btn-primary-bg)' }} />}
+        {checked && <span className={cn('rounded-full', dims.dot)} style={{ backgroundColor: 'var(--color-btn-primary-bg)' }} />}
       </span>
       {children}
     </label>

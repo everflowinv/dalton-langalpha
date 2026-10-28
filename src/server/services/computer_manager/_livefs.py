@@ -85,6 +85,10 @@ class LivefsMixin:
         daemon answered a serve, mounted or not, and ``workspace_id``'s
         folder (None: any) is not seen linked. A command in that workspace
         waits for it while the mount serves (``Handle.ready``)."""
+        if not sandbox.mounts_livefs:
+            # Links into a mount that never runs would only dangle, and laying
+            # them takes root the machine need not grant.
+            return
         self._machine(str(computer_id)).livefs.link_soon(
             sandbox, workspace_id, self._livefs_link(computer_id, user_id, sandbox)
         )
@@ -115,6 +119,10 @@ class LivefsMixin:
         changes and the tracker goes on with what this worker saw."""
         from src.server.services.livefs import mount as livefs
 
+        if not sandbox.mounts_livefs:
+            sandbox.livefs = None
+            await self._load_history(computer_id, sandbox)
+            return
         view = await livefs.view(
             sandbox,
             computer_id=str(computer_id),
@@ -127,6 +135,28 @@ class LivefsMixin:
             sandbox.livefs = None
         elif serving and user_id and getattr(sandbox, "livefs", None) is None:
             sandbox.livefs = self._livefs_handle(computer_id, user_id, sandbox)
+
+    async def _load_history(self, computer_id: Any, sandbox: Any) -> None:
+        """Past threads for the file tools on a machine the mount never
+        serves, over the folders it holds now. Unread, the tools go on with
+        the folders the last turn saw, or with the thread index alone: the
+        prompt says the transcripts are there for as long as the machine's
+        kind does, so a turn never goes without them."""
+        from src.server.services.livefs.history_files import (
+            ComputerHistory,
+            computer_history,
+        )
+
+        try:
+            sandbox.history = await computer_history(str(computer_id))
+        except Exception:
+            logger.warning(
+                "transcripts for the file tools not loaded on computer %s",
+                computer_id,
+                exc_info=True,
+            )
+            if sandbox.history is None:
+                sandbox.history = ComputerHistory(str(computer_id), ())
 
     def _livefs_owed(self, computer_id: Any, workspace_id: str, sandbox: Any) -> bool:
         """Whether a turn in ``workspace_id`` has anything to ask of the

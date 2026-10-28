@@ -29,7 +29,6 @@ import fnmatch
 import functools
 import hashlib
 import json
-import re
 from collections.abc import AsyncIterator, Iterator, Mapping
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, Literal, NamedTuple
@@ -37,7 +36,7 @@ from typing import Any, ClassVar, Literal, NamedTuple
 import psycopg
 import structlog
 
-from ptc_agent.agent.backends.langgraph_store import ReadOnlyStoreError, grep_texts, lock_for_namespace
+from ptc_agent.agent.backends.langgraph_store import ReadOnlyStoreError, compile_grep, grep_texts, lock_for_namespace
 from ptc_agent.agent.backends.read_window import shows_whole_file
 from ptc_agent.agent.backends.results import EditTextResult, WriteTextResult
 from ptc_agent.agent.backends.sandbox import SandboxBackend
@@ -921,11 +920,7 @@ class DbJsonRoute:
         if not whole and only is None:
             return []
 
-        flags = re.IGNORECASE if case_insensitive else 0
-        try:
-            compiled = re.compile(pattern, flags=flags)
-        except re.error:
-            return []
+        compiled = compile_grep(pattern, case_insensitive)
 
         def searched(filename: str) -> bool:
             if only is not None and filename != only:

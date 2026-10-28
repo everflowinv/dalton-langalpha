@@ -106,16 +106,16 @@ function NavigationPanel({
   const rootRef = useRef<HTMLDivElement>(null);
   const navTree = useNavTreeKit(rootRef);
   const { TreeRoot } = navTree.kit;
-  // Duplicate / delete are self-contained (mutations + dialogs) so every host
-  // (sidebar tree, mobile drawer) gets the same menu as the gallery card
-  // without extra wiring.
+  // Duplicate / move / delete are self-contained (mutations + dialogs) so
+  // every host (sidebar tree, mobile drawer) gets the same menu as the
+  // gallery card without extra wiring.
   const wsActions = useWorkspaceActions({ currentWorkspaceId });
   // The rows get the handlers without the dialogs node, which is new JSX on
   // every render and would defeat their memo.
-  const { openDuplicate, openDelete } = wsActions;
+  const { openDuplicate, openMove, openDelete } = wsActions;
   const rowActions = useMemo(
-    () => ({ openDuplicate, openDelete }),
-    [openDuplicate, openDelete],
+    () => ({ openDuplicate, openMove, openDelete }),
+    [openDuplicate, openMove, openDelete],
   );
   // Same reasoning for the thread archive confirm: this panel is the one tree
   // both hosts render, so gating here covers the sidebar and the mobile drawer

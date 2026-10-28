@@ -6,8 +6,10 @@ from typing import Any, Protocol, runtime_checkable
 
 from ptc_agent.agent.agent import AgentRole, PTCAgent
 from ptc_agent.agent.middleware.runtime_context import TurnContext
+from ptc_agent.agent.middleware.runtime_context.epoch import Workspace
 from ptc_agent.agent.middleware.compaction.window import WindowCoverage
 from ptc_agent.agent.middleware.subagent_switch import SubagentSwitchReader
+from ptc_agent.agent.middleware.wakeups import CancelNotices
 from ptc_agent.config import AgentConfig
 from ptc_agent.core.project_context import ProjectContext
 from ptc_agent.core.session import Session
@@ -92,31 +94,49 @@ async def _read_harness_blocks(
 
 async def _read_workspace_naming(
     workspace_id: str, role: AgentRole = "analyst"
-) -> tuple[str | None, str | None]:
-    """The workspace's name and description for the prompt's `<workspace>` block.
+) -> Workspace | None:
+    """The workspace's name, description and computer for the `<workspace>` block.
 
     Read once here rather than inside the model call, so the values are bound
     when the turn's agent is built and the model never sees the name change
-    under it mid-answer. The baseline freezes the pair per epoch; a rename
+    under it mid-answer. The baseline freezes them per epoch; a rename
     reaches the model as a `workspace_changed` row on the next turn. A read
     that fails answers None, not an empty name: the baseline must not file a
     row saying the workspace lost its name. The Chief of Staff's Home is named
     for its folder, not for the row it is stored in.
     """
     if not workspace_id:
-        return None, None
+        return None
+    try:
+        from src.server.database.workspace import get_workspace_naming
+
+        row = await get_workspace_naming(workspace_id) or {}
+    except Exception as e:
+        logger.warning(f"Failed to read the name of workspace {workspace_id}: {e}")
+        return None
+    from src.tools.secretary.utils import computer_label, computer_machine
+
+    computer = computer_label(row.get("computer_name"), row.get("computers") or 0) or ""
+    # Whose machine it is matters with one computer too: it is where the work runs.
+    machine = computer_machine(row.get("computer_kind"), row.get("provider_config"))
+    root = (row.get("root_dir") or "") if machine else ""
     if role == "chief_of_staff":
         from src.server.database.workspace_names import HOME_FOLDER
 
-        return HOME_FOLDER, _HOME_DESCRIPTION
-    try:
-        from src.server.database.workspace import get_workspace_name_and_description
-
-        row = await get_workspace_name_and_description(workspace_id) or {}
-        return (row.get("name") or "").strip(), (row.get("description") or "").strip()
-    except Exception as e:
-        logger.warning(f"Failed to read the name of workspace {workspace_id}: {e}")
-        return None, None
+        return Workspace(
+            name=HOME_FOLDER,
+            description=_HOME_DESCRIPTION,
+            computer=computer,
+            machine=machine,
+            root=root,
+        )
+    return Workspace(
+        name=(row.get("name") or "").strip(),
+        description=(row.get("description") or "").strip(),
+        computer=computer,
+        machine=machine,
+        root=root,
+    )
 
 
 async def build_ptc_graph(
@@ -145,7 +165,7 @@ async def build_ptc_graph(
             f"Failed to initialize session for conversation {conversation_id}"
         )
 
-    ptc_agent, user_data_counts, (workspace_name, workspace_description) = await asyncio.gather(
+    ptc_agent, user_data_counts, workspace = await asyncio.gather(
         asyncio.to_thread(PTCAgent, config),
         fetch_user_data_counts(user_id),
         _read_workspace_naming(conversation_id),
@@ -163,8 +183,7 @@ async def build_ptc_graph(
         background_registry=background_registry,
         # session gives workspace-tier memory a real namespace.
         session=session,
-        workspace_name=workspace_name,
-        workspace_description=workspace_description,
+        workspace=workspace,
         store=store,
         on_signed_url=on_signed_url,
         user_id=user_id,
@@ -201,6 +220,10 @@ async def build_ptc_graph_with_session(
     role: AgentRole = "analyst",
     subagent_switch: SubagentSwitchReader | None = None,
     window_coverage: WindowCoverage | None = None,
+    cancel_notices: CancelNotices | None = None,
+    # DALTON-HOOK(colleague-dispatch): workspace owner identity and tail-turn tool trimming
+    workspace_owner_id: str | None = None,
+    tail_turn_no_new_work: bool = False,
 ) -> Any:
     """Build a BackgroundSubagentOrchestrator from a pre-acquired session (WorkspaceManager path).
 
@@ -219,7 +242,8 @@ async def build_ptc_graph_with_session(
     ``subagent_switch`` reads the thread's subagent switch on every call; a
     build without one leaves subagents as built. ``window_coverage`` lets the
     main agent trim its checkpoint to its window (see ``compaction.window``);
-    a build without one never trims.
+    a build without one never trims. ``cancel_notices`` tells the agent of
+    the user's cancels of its wakeups; a build without one tells it of none.
     """
     mcp_registry = (
         tool_view.mcp_registry if tool_view is not None else session.mcp_registry
@@ -243,7 +267,7 @@ async def build_ptc_graph_with_session(
     (
         user_data_counts,
         ptc_agent,
-        (workspace_name, workspace_description),
+        workspace,
         harness_blocks,
     ) = await asyncio.gather(
         fetch_user_data_counts(user_id),
@@ -252,13 +276,24 @@ async def build_ptc_graph_with_session(
         _read_harness_blocks(user_id, workspace_id, thread_id, turn_context, role),
     )
 
-    if workspace_id and user_id:
+    # DALTON-HOOK(colleague-dispatch): merge workspace owner B's and caller A's vault secrets for leak detection
+    eff_owner_id = workspace_owner_id or user_id
+    if workspace_id and eff_owner_id:
         from src.server.database.user_vault_secrets import get_user_secrets_decrypted
 
         # Leak detection redacts the owner's whole vault, read fresh: every
         # workspace can read every secret, and the sandbox's cached copy is
         # process-local, so a rotation handled by another worker leaves it stale.
-        vault_secrets = await get_user_secrets_decrypted(user_id)
+        vault_secrets = dict(await get_user_secrets_decrypted(eff_owner_id) or {})
+        if user_id and str(user_id) != str(eff_owner_id):
+            caller_secrets = await get_user_secrets_decrypted(user_id) or {}
+            for k, v in caller_secrets.items():
+                if not v:
+                    continue
+                if k in vault_secrets and vault_secrets[k] != v:
+                    vault_secrets[f"{k}#caller"] = v
+                else:
+                    vault_secrets.setdefault(k, v)
     else:
         vault_secrets = dict(getattr(session.sandbox, "vault_secrets", None) or {})
     # DALTON-HOOK(data-map): warm per-turn data map from Postgres daily cache (falls back to static unprobed map)
@@ -288,8 +323,7 @@ async def build_ptc_graph_with_session(
         user_profile=user_profile,
         session=session,
         thread_id=thread_id,
-        workspace_name=workspace_name,
-        workspace_description=workspace_description,
+        workspace=workspace,
         on_agent_md_write=session.note_agent_md_write,
         store=store,
         on_signed_url=on_signed_url,
@@ -309,6 +343,18 @@ async def build_ptc_graph_with_session(
         harness_blocks=harness_blocks,
         subagent_switch=subagent_switch,
         window_coverage=window_coverage,
+        cancel_notices=cancel_notices,
+        # DALTON-HOOK(colleague-dispatch): pass workspace_owner_id and tail_turn_no_new_work
+        **(
+            {"workspace_owner_id": workspace_owner_id}
+            if workspace_owner_id is not None
+            else {}
+        ),
+        **(
+            {"tail_turn_no_new_work": tail_turn_no_new_work}
+            if tail_turn_no_new_work
+            else {}
+        ),
     )
 
     logger.debug(

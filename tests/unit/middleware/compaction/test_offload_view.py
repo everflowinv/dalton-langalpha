@@ -27,6 +27,7 @@ from ptc_agent.agent.middleware.compaction.types import OffloadSettings
 from ptc_agent.agent.transcript import TranscriptTarget, Window
 from ptc_agent.agent.transcript.pointer import TranscriptTurns
 from ptc_agent.config.agent import CompactionConfig
+from ptc_agent.core.sandbox.livefs_mount import TranscriptReach
 
 THREAD = "abcd1234-0000-0000-0000-000000000000"
 TURN_FILE = ".agents/transcripts/abcd1234/turn-0001.jsonl"
@@ -66,7 +67,11 @@ def _sandbox(saves: bool = True, linked: bool = True):
     async def settled_livefs(workspace_id=None):
         return mount if linked else None
 
-    return SimpleNamespace(livefs=mount, settled_livefs=settled_livefs)
+    return SimpleNamespace(
+        livefs=mount,
+        transcripts=TranscriptReach(mount, shell=True),
+        settled_livefs=settled_livefs,
+    )
 
 
 def _writes(messages: list) -> dict[str, str]:
@@ -101,7 +106,7 @@ def _middleware(
         # The default counter downloads its encoding on first use.
         Summarizer(GenericFakeChatModel(messages=iter([])), limit=100_000, counter=len),
         token_threshold=token_threshold,
-        keep_messages=5,
+        keep_tokens=5,
         offload=offload,
         backend=backend,
     )
@@ -221,7 +226,7 @@ async def test_recorded_cuts_show_whole_while_no_mount_serves(in_thread):
     # Ids recorded before this thread's args were kept in a transcript, or
     # before its mount went away, would name a file no command can read.
     sandbox = _sandbox()
-    sandbox.livefs = None
+    sandbox.livefs = sandbox.transcripts = None
     state = _state(_history(14), None, _offloaded_tool_call_ids={"w0", "w1"})
     seen: list[dict] = []
 
@@ -308,3 +313,13 @@ def test_recorded_offloads_count_each_id_once_in_the_totals():
     assert update["_offloaded_tool_call_ids"] == {"a", "b"}
     assert update["_offloaded_args_total"] == 5
     assert update["_offloaded_reads_total"] == 1
+
+
+def test_a_cut_arg_points_through_the_file_tools_where_bash_cannot_see_it():
+    msgs = _history(1)
+    turns = TranscriptTurns.of(TranscriptTarget(THREAD), msgs, window=Window())
+    out = {m.id: m for m in apply_recorded_offloads(msgs, {"w0"}, set(), 200, turns, shell=False)}
+
+    cut = out["a0"].tool_calls[0]["args"]["content"]
+    assert TURN_FILE in cut and "Grep that file for w0" in cut and "limit=1" in cut
+    assert "jq" not in cut

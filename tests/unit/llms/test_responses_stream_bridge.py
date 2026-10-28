@@ -489,6 +489,17 @@ class TestArgumentsSentOnlyInDone:
         sent_back = [b["arguments"] for b in message.content if b.get("type") == "function_call"]
         assert sent_back == [arguments for _, arguments in self.PARALLEL]
 
+    def test_a_done_reporting_a_later_output_index_lands_on_its_own_call(self):
+        # The API can report a later output_index on an item's ``.done`` than on
+        # its ``added``, and langchain-openai 1.7 pins the item to the first.
+        # Replayed at the ``.done``'s own index, the arguments open a block of
+        # their own and the call keeps {}.
+        added, done, item_done = _function_call(0, *self.PARALLEL[0], streamed=False)
+        done = done.model_copy(update={"output_index": 2})
+        item_done = item_done.model_copy(update={"output_index": 2})
+        llm, _ = _client(ChatCodexOpenAI, [added, done, item_done])
+        assert _tool_calls(_drain(llm)) == self.EXPECTED[:1]
+
     def test_other_clients_are_left_to_upstream(self):
         llm, _ = _client(ChatOpenAI, self._events(streamed=False))
         assert _tool_calls(_drain(llm)) == [(name, {}) for name, _ in self.EXPECTED]

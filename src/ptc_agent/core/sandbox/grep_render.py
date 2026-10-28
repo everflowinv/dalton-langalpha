@@ -50,8 +50,11 @@ def _rg_data(field: dict[str, Any]) -> bytes:
     return base64.b64decode(field.get("bytes", ""))
 
 
-def _cut_grep_line(line: bytes, spans: list[tuple[int, int]]) -> str:
-    """A long line cut to windows around its first matches."""
+def cut_grep_line(
+    line: bytes, spans: list[tuple[int, int]], *, total: int | None = None
+) -> str:
+    """A long line cut to windows around its first matches; ``total`` counts
+    the matches when ``spans`` holds only the first ones."""
     text = line.decode(errors="replace")
     if len(text) <= GREP_LINE_CHARS:
         return text
@@ -70,7 +73,8 @@ def _cut_grep_line(line: bytes, spans: list[tuple[int, int]]) -> str:
         body = "…" + body
     if windows[-1][1] < len(line):
         body += "…"
-    total = len(spans)
+    if total is None:
+        total = len(spans)
     if total == 1:
         which = "its match"
     elif total <= _GREP_WINDOWS_PER_LINE:
@@ -99,7 +103,7 @@ def render_grep_json(
         except ValueError:
             event = None
         if not isinstance(event, dict):
-            errors.append(_cut_grep_line(raw.encode(), []))
+            errors.append(cut_grep_line(raw.encode(), []))
             continue
         if event.get("type") in ("match", "context"):
             events.append((event["type"] == "match", event["data"]))
@@ -130,7 +134,7 @@ def render_grep_json(
             prefix = f"{path}{sep}" if named else ""
             if line_numbers:
                 prefix += f"{number}{sep}"
-            lines.append(GrepLine(prefix + _cut_grep_line(line, own), path, named))
+            lines.append(GrepLine(prefix + cut_grep_line(line, own), path, named))
             begin = end + 1
             last = (path, number)
     return lines + errors

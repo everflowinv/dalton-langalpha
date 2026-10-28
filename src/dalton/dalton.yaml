@@ -5,6 +5,9 @@ timezone: "Asia/Shanghai"
 credentials:
   sharing: team
 
+colleague_dispatch:
+  enabled: false
+
 network:
   # The host proxy runs in fake-IP mode: inside the backend container DNS answers
   # every public host with an address in 198.18.0.0/15 (benchmarking space, which

@@ -81,7 +81,7 @@ def _content_key(message: ToolMessage) -> str:
         return repr(content)
 
 
-def _rounds(messages: Iterable[Any]) -> Iterator[tuple[AIMessage, list[ToolMessage]]]:
+def tool_rounds(messages: Iterable[Any]) -> Iterator[tuple[AIMessage, list[ToolMessage]]]:
     """The turn's latest rounds, newest first: each AIMessage with the results after it.
 
     Only the tail since the last message that is neither the model's nor a
@@ -122,7 +122,7 @@ def repeat_streak(messages: Iterable[Any], key: str) -> int:
     """
     streak = 0
     result: str | None = None
-    for message, results in _rounds(messages):
+    for message, results in tool_rounds(messages):
         for tool_message in reversed(results):
             call = _call_for(message, tool_message.tool_call_id)
             if call is None or _call_key(call.get("name", ""), call.get("args")) != key:
@@ -148,7 +148,7 @@ def poll_streak(messages: Iterable[Any]) -> tuple[int, list[dict[str, Any]]]:
     """
     rounds = 0
     reads: list[dict[str, Any]] = []
-    for message, results in _rounds(messages):
+    for message, results in tool_rounds(messages):
         counted = False
         for tool_message in results:
             if is_refusal(tool_message):
@@ -169,7 +169,7 @@ END_LIMIT = 3
 def refused_streak(messages: Iterable[Any]) -> int:
     """How many of the latest rounds, back to back, had every call refused."""
     rounds = 0
-    for _, results in _rounds(messages):
+    for _, results in tool_rounds(messages):
         if not results or not all(is_refusal(result) for result in results):
             return rounds
         rounds += 1

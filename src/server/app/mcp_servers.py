@@ -50,6 +50,7 @@ from src.server.database.user_vault_secrets import (
 )
 from src.server.database.workspace import get_workspace as db_get_workspace
 from src.server.services.brokerages import brokerage_names
+from src.server.services.computer_manager import MachineTarget
 from src.server.services.mcp_apply import (
     schedule_proactive_apply,
     schedule_session_mcp_refresh,
@@ -308,7 +309,9 @@ async def list_servers(workspace_id: str, user_id: CurrentUserId) -> EffectiveSe
     applied_version: int | None = None
     try:
         applied_version = WorkspaceManager.get_instance().get_applied_mcp_config_version(
-            workspace_id, expected_sandbox_id=workspace.get("sandbox_id")
+            workspace_id,
+            expected_sandbox_id=workspace.get("sandbox_id"),
+            target=MachineTarget.of_workspace(workspace),
         )
     except Exception:
         logger.debug("[mcp] applied version lookup failed for %s", workspace_id)
@@ -716,7 +719,9 @@ def _get_live_sandbox(workspace_id: str, workspace: dict) -> Any | None:
         return None
     try:
         session = WorkspaceManager.get_instance().get_session_if_ready(
-            workspace_id, expected_sandbox_id=workspace.get("sandbox_id")
+            workspace_id,
+            expected_sandbox_id=workspace.get("sandbox_id"),
+            target=MachineTarget.of_workspace(workspace),
         )
         return session.sandbox if session else None
     except Exception:

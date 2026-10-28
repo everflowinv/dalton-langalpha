@@ -43,6 +43,9 @@ vi.mock('@/hooks/useAllModels', () => ({
     metadata: { 'model-default': { reasoning_efforts: ['low', 'high'], reasoning_effort_default: 'high' } },
     isLoading: mocks.modelsLoading,
     systemDefaults: mocks.systemDefaults,
+    offPlanModels: new Set(),
+    platform: { model_tier: 0, byok_providers: [], oauth_providers: [] },
+    rawApiResponse: {},
   }),
 }));
 

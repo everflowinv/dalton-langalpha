@@ -17,6 +17,9 @@ import { useOnboardingPrefs } from '../useOnboardingPrefs';
 import { emptyOnboardingPrefs } from '../onboardingPrefsSchema';
 import type { OnboardingPrefs } from '../types';
 
+/** The writer callback that settles a write. */
+type Settle = 'onSuccess' | 'onError';
+
 /** Run the functional updater the hook handed to the writer against `cur`. */
 function applyUpdater(callIndex: number, cur: OnboardingPrefs): OnboardingPrefs | null {
   const arg = mockWrite.mock.calls[callIndex][0];
@@ -43,6 +46,7 @@ describe('useOnboardingPrefs', () => {
       result.current.replayGuides();
       result.current.setLastSeenReleaseVersion('2026.6');
       result.current.ensureFirstRun('2026.6');
+      result.current.markWelcomeSkipped();
       result.current.resetAll();
     });
     expect(mockWrite).not.toHaveBeenCalled();
@@ -83,7 +87,7 @@ describe('useOnboardingPrefs', () => {
     expect(mockWrite).toHaveBeenCalledTimes(1);
 
     // Another task is unaffected.
-    act(() => result.current.markTaskDone('stocks'));
+    act(() => void result.current.markTaskDone('stocks'));
     expect(mockWrite).toHaveBeenCalledTimes(2);
 
     // A reset un-stamps every task, so its attempt starts over.
@@ -96,17 +100,17 @@ describe('useOnboardingPrefs', () => {
 
   it('markTaskDone tries again after another tab lands a write, never on its own', () => {
     const { result } = renderHook(() => useOnboardingPrefs());
-    act(() => result.current.markTaskDone('dashboard'));
-    act(() => result.current.markTaskDone('dashboard'));
+    act(() => void result.current.markTaskDone('dashboard'));
+    act(() => void result.current.markTaskDone('dashboard'));
     expect(mockWrite).toHaveBeenCalledTimes(1);
 
     // Another tab reset the guides: its write bumps the remote count, and the
     // task this tab already gave up on is unstamped again on the server.
     mockRemoteUpdateGen.current += 1;
-    act(() => result.current.markTaskDone('dashboard'));
+    act(() => void result.current.markTaskDone('dashboard'));
     expect(mockWrite).toHaveBeenCalledTimes(2);
     // Still one attempt per remote update, not a loop.
-    act(() => result.current.markTaskDone('dashboard'));
+    act(() => void result.current.markTaskDone('dashboard'));
     expect(mockWrite).toHaveBeenCalledTimes(2);
   });
 
@@ -116,17 +120,43 @@ describe('useOnboardingPrefs', () => {
     // fills the cache; the visit effect runs again and must still stamp.
     mockWrite.mockReturnValueOnce(false);
     const { result } = renderHook(() => useOnboardingPrefs());
-    act(() => result.current.markTaskDone('dashboard'));
-    act(() => result.current.markTaskDone('dashboard'));
+    act(() => void result.current.markTaskDone('dashboard'));
+    act(() => void result.current.markTaskDone('dashboard'));
     expect(mockWrite).toHaveBeenCalledTimes(2);
     // Accepted the second time: from here it is once per session.
-    act(() => result.current.markTaskDone('dashboard'));
+    act(() => void result.current.markTaskDone('dashboard'));
     expect(mockWrite).toHaveBeenCalledTimes(2);
+  });
+
+  // A caller about to leave the page waits on the stamp, so every path has to
+  // settle, and a write it sent has to land or fail first.
+  it.each<[string, { loading?: boolean; tried?: boolean; refused?: boolean; settle?: Settle }]>([
+    ['while prefs load, with nothing sent', { loading: true }],
+    ['for a task tried this session', { tried: true }],
+    ['when the writer refuses the write', { refused: true }],
+    ['once the write lands', { settle: 'onSuccess' }],
+    ['once the write fails', { settle: 'onError' }],
+  ])('markTaskDone resolves %s', async (_path, { loading = false, tried, refused, settle }) => {
+    const flush = () => new Promise((r) => setTimeout(r, 0));
+    mockLoading = loading;
+    const { result } = renderHook(() => useOnboardingPrefs());
+    if (tried) act(() => void result.current.markTaskDone('market'));
+    if (refused) mockWrite.mockReturnValueOnce(false);
+    let resolved = false;
+    act(() => void result.current.markTaskDone('market').then(() => (resolved = true)));
+    await flush();
+    if (settle) {
+      expect(resolved).toBe(false);
+      const opts = mockWrite.mock.calls.at(-1)![1] as Record<Settle, (err?: unknown) => void>;
+      opts[settle](new Error('PUT failed'));
+      await flush();
+    }
+    expect(resolved).toBe(true);
   });
 
   it('markTaskDone stamps once and aborts when already done', () => {
     const { result } = renderHook(() => useOnboardingPrefs());
-    act(() => result.current.markTaskDone('firstChat'));
+    act(() => void result.current.markTaskDone('firstChat'));
     const fresh = applyUpdater(0, emptyOnboardingPrefs());
     expect(fresh?.gettingStartedDoneAt.firstChat).toEqual(expect.any(Number));
     expect(
@@ -144,7 +174,7 @@ describe('useOnboardingPrefs', () => {
     ).toBeNull();
   });
 
-  it('replayGuides clears the mirror, seen intros, and the card dismissal — keeps the rest', () => {
+  it('replayGuides clears the mirror, seen intros, and the list dismissal — keeps the rest', () => {
     const { result } = renderHook(() => useOnboardingPrefs());
     act(() => result.current.replayGuides());
     // the writer owns the per-user mirror; replay asks it to clear first
@@ -181,6 +211,15 @@ describe('useOnboardingPrefs', () => {
 
     // already stamped → abort
     expect(applyUpdater(0, { ...emptyOnboardingPrefs(), firstRunAt: 1 })).toBeNull();
+  });
+
+  it('markWelcomeSkipped stamps once and keeps the rest of the state', () => {
+    const { result } = renderHook(() => useOnboardingPrefs());
+    act(() => result.current.markWelcomeSkipped());
+    const next = applyUpdater(0, { ...emptyOnboardingPrefs(), firstRunAt: 3 });
+    expect(next).toEqual({ ...emptyOnboardingPrefs(), firstRunAt: 3, welcomeSkippedAt: expect.any(Number) });
+    // already skipped → abort, so the first skip's time stands
+    expect(applyUpdater(0, { ...emptyOnboardingPrefs(), welcomeSkippedAt: 1 })).toBeNull();
   });
 
   it('setLastSeenReleaseVersion overwrites onto the freshest state', () => {

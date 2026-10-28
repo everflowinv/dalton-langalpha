@@ -167,9 +167,10 @@ def test_error_workspaces_backfill_as_recoverable_stopped_computers(migration):
     )
 
 
-def test_a_shared_sandbox_id_keeps_the_most_recently_active_row(migration):
+def test_a_shared_sandbox_id_keeps_the_most_recently_active_row(monkeypatch, migration):
     """DISTINCT ON plus that ORDER BY is the whole tie-break; losing it would
     make the insert fail on the unique index instead of choosing a winner."""
+    monkeypatch.setenv("SANDBOX_PROVIDER", "daytona")
     sql = _upgrade_sql(migration)
     assert "SELECT DISTINCT ON (COALESCE(config->>'sandbox_provider', 'daytona'), sandbox_id)" in sql
     assert (
@@ -256,6 +257,8 @@ def test_live_table_indexes_do_not_block_rolling_deploy_writers(migration):
     ("sandbox: {}", "", "present", "daytona"),
     ("daytona: {}", "", "", "daytona"),
     ("sandbox: {provider: '${TEST_PROVIDER}'}", "", "", "docker"),
+    ("sandbox: {provider: e2b}", "", "", "docker"),
+    ("sandbox: {provider: e2b}", "", "present", "daytona"),
 ])
 def test_backfill_provider_matches_config(monkeypatch, migration, tmp_path,
                                          yaml_text, override, api_key, expected):

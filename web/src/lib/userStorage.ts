@@ -1,3 +1,4 @@
+import { useSyncExternalStore } from 'react';
 import { isPlatformMode } from '../config/hostMode';
 import { isDaltonAuth } from '../config/daltonAuth'; // DALTON-HOOK(dalton-auth): scope storage per user when Dalton auth is enabled
 import { LOCAL_USER_ID, hasAuthEnv } from '../config/localUser';
@@ -23,6 +24,7 @@ export interface UserStorage {
 }
 
 let platformUser: string | null = null;
+const userListeners = new Set<() => void>();
 
 /**
  * The signed-in platform user, set by `authToken` whenever its session changes
@@ -30,7 +32,14 @@ let platformUser: string | null = null;
  * without pulling in the auth client.
  */
 export function setStorageUser(userId: string | null): void {
+  if (userId === platformUser) return;
   platformUser = userId;
+  userListeners.forEach((listener) => listener());
+}
+
+function subscribeStorageUser(listener: () => void): () => void {
+  userListeners.add(listener);
+  return () => userListeners.delete(listener);
 }
 
 /**
@@ -40,6 +49,15 @@ export function setStorageUser(userId: string | null): void {
 function currentUser(): string | null {
   // DALTON-HOOK(dalton-auth): scope storage by signed-in user when Dalton auth is enabled
   return (isPlatformMode || isDaltonAuth) && hasAuthEnv ? platformUser : LOCAL_USER_ID;
+}
+
+/**
+ * The user whose keys reads and writes reach now, for a hook that keeps a read
+ * across renders: an account switch in place, with no sign-out between, leaves
+ * the page mounted, so the hook must read again when this changes.
+ */
+export function useStorageUser(): string | null {
+  return useSyncExternalStore(subscribeStorageUser, currentUser);
 }
 
 function scoped(userId: string, key: string): string {

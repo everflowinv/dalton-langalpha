@@ -3,6 +3,7 @@ Tests for usage_limits dependency — service-to-service auth headers,
 credit limit enforcement (platform + BYOK paths), and burst guard.
 """
 
+from contextlib import contextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -351,14 +352,20 @@ def _unreachable_service(mock_client):
     stack.enter_context(patch(f"{MODULE}.HOST_MODE", "platform"))
     stack.enter_context(patch(f"{MODULE}.AUTH_SERVICE_URL", "http://localhost:8003"))
     stack.enter_context(patch(f"{MODULE}.get_http_client", return_value=mock_client))
-    stack.enter_context(patch(f"{MODULE}._VALIDATE_RETRY_BACKOFF", 0))
+    stack.enter_context(patch(f"{MODULE}._VALIDATE_RETRY_DELAYS", (0,) * _retries()))
     stack.enter_context(patch("os.getenv", return_value="token"))
     return stack
 
 
+def _retries():
+    from src.server.dependencies.usage_limits import _VALIDATE_RETRY_DELAYS
+
+    return len(_VALIDATE_RETRY_DELAYS)
+
+
 @pytest.mark.asyncio
-async def test_transport_failure_is_retried_once_for_strict_callers():
-    """The quota service restarts in place, so the first failure means little."""
+async def test_transport_failure_is_retried_for_strict_callers():
+    """The quota service restarts in place, so the first failures mean little."""
     mock_client = AsyncMock()
     mock_client.post = AsyncMock(side_effect=httpx.ConnectError("connection refused"))
 
@@ -371,7 +378,7 @@ async def test_transport_failure_is_retried_once_for_strict_callers():
         with pytest.raises(QuotaServiceUnavailable):
             await _call_validate_for_user("user-1", strict=True)
 
-    assert mock_client.post.await_count == 2
+    assert mock_client.post.await_count == 1 + _retries()
 
 
 @pytest.mark.asyncio
@@ -463,7 +470,7 @@ async def test_an_unreadable_200_is_no_verdict_and_still_retried():
         with pytest.raises(QuotaServiceUnavailable):
             await _call_validate_for_user("user-1", strict=True)
 
-    assert mock_client.post.await_count == 2
+    assert mock_client.post.await_count == 1 + _retries()
 
 
 @pytest.mark.asyncio
@@ -477,6 +484,91 @@ async def test_an_unreadable_200_still_fails_open_for_everyone_else():
         from src.server.dependencies.usage_limits import _call_validate_for_user
 
         assert await _call_validate_for_user("user-1") is None
+
+
+def _restarting_service(refused_for: float, *, attempt_takes: float = 0.0):
+    """A quota service that refuses connections for ``refused_for`` seconds of a
+    fake clock, then answers. The real retry schedule runs against that clock."""
+    from contextlib import ExitStack
+
+    clock = [0.0]
+
+    async def sleep(seconds):
+        clock[0] += seconds
+
+    async def post(*_args, **_kwargs):
+        started = clock[0]
+        clock[0] += attempt_takes
+        if started < refused_for:
+            raise httpx.ConnectError("connection refused")
+        return httpx.Response(200, json={"valid": True, "allowed": True})
+
+    mock_client = AsyncMock()
+    mock_client.post = AsyncMock(side_effect=post)
+    stack = ExitStack()
+    stack.enter_context(patch(f"{MODULE}.HOST_MODE", "platform"))
+    stack.enter_context(patch(f"{MODULE}.AUTH_SERVICE_URL", "http://localhost:8003"))
+    stack.enter_context(patch(f"{MODULE}.get_http_client", return_value=mock_client))
+    stack.enter_context(patch("os.getenv", return_value="token"))
+    stack.enter_context(patch("asyncio.sleep", new=AsyncMock(side_effect=sleep)))
+    stack.enter_context(patch(f"{MODULE}.time.monotonic", side_effect=lambda: clock[0]))
+    return stack, mock_client, clock
+
+
+@pytest.mark.asyncio
+async def test_strict_callers_wait_out_an_in_place_restart():
+    """A deploy refuses connections for about five seconds; a check that lands
+    in that gap gets its verdict once the service is back, not a 503."""
+    stack, mock_client, clock = _restarting_service(refused_for=5.0)
+    with stack:
+        from src.server.dependencies.usage_limits import _call_validate_for_user
+
+        assert await _call_validate_for_user("user-1", strict=True) == {
+            "valid": True, "allowed": True,
+        }
+
+    assert clock[0] >= 5.0
+    assert mock_client.post.await_count > 2
+
+
+@pytest.mark.asyncio
+async def test_strict_callers_give_up_within_the_window():
+    """An outage that outlasts the window is real: the wait ends and the caller
+    hears there was no verdict, rather than holding the turn indefinitely."""
+    stack, _mock_client, clock = _restarting_service(refused_for=float("inf"))
+    with stack:
+        from src.server.dependencies.usage_limits import (
+            _VALIDATE_RETRY_WINDOW,
+            QuotaServiceUnavailable,
+            _call_validate_for_user,
+        )
+
+        with pytest.raises(QuotaServiceUnavailable):
+            await _call_validate_for_user("user-1", strict=True)
+
+    assert clock[0] <= _VALIDATE_RETRY_WINDOW
+
+
+@pytest.mark.asyncio
+async def test_slow_attempts_do_not_stretch_the_window():
+    """The window is time, not a count: when each attempt hangs before it fails,
+    no wait starts that would end past the window, so only the attempt already
+    under way runs over it."""
+    stack, mock_client, clock = _restarting_service(
+        refused_for=float("inf"), attempt_takes=3.0
+    )
+    with stack:
+        from src.server.dependencies.usage_limits import (
+            _VALIDATE_RETRY_WINDOW,
+            QuotaServiceUnavailable,
+            _call_validate_for_user,
+        )
+
+        with pytest.raises(QuotaServiceUnavailable):
+            await _call_validate_for_user("user-1", strict=True)
+
+    assert clock[0] <= _VALIDATE_RETRY_WINDOW + 3.0
+    assert mock_client.post.await_count < 1 + _retries()
 
 
 # ===================================================================
@@ -507,6 +599,14 @@ class TestCreditGateFailsClosed:
         assert exc_info.value.detail["type"] == "service_unavailable"
         # Not 429: nothing says this user is over anything.
         assert exc_info.value.headers["Retry-After"] == "15"
+
+    @pytest.mark.asyncio
+    async def test_a_restart_gap_does_not_block_the_turn(self):
+        stack, _mock_client, _clock = _restarting_service(refused_for=5.0)
+        with stack:
+            from src.server.dependencies.usage_limits import enforce_credit_limit
+
+            await enforce_credit_limit("user-1", byok=False)
 
     @pytest.mark.asyncio
     async def test_an_unreadable_200_blocks_the_turn_as_a_503(self):
@@ -725,6 +825,65 @@ class TestEnforceCreditLimitByok:
             await enforce_credit_limit("user-1", byok=False)
 
 
+class TestEnforceCreditLimitSurface:
+    """Where the turn came from is relayed, never interpreted.
+
+    The auth service may apply its own policy to a surface; langalpha sends
+    the request's ``platform`` as it came and relays whatever verdict returns.
+    """
+
+    @staticmethod
+    async def _gate(response: httpx.Response, **kwargs):
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=response)
+        with _unreachable_service(mock_client):
+            from src.server.dependencies.usage_limits import enforce_credit_limit
+
+            await enforce_credit_limit("user-1", **kwargs)
+        return mock_client.post.await_args.kwargs["json"]
+
+    @pytest.mark.asyncio
+    async def test_a_named_surface_is_in_the_outgoing_body(self):
+        allowed = httpx.Response(200, json={"quota": {"allowed": True}})
+
+        body = await self._gate(allowed, byok=False, surface="slack")
+
+        assert body == {"check_quota": "chat", "surface": "slack"}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("surface", [None, ""])
+    async def test_no_surface_leaves_the_key_out(self, surface):
+        """Absent, not null: a body without the key is the one every turn sent
+        before, so a service that has not learned the key reads it the same."""
+        allowed = httpx.Response(200, json={"quota": {"allowed": True}})
+
+        body = await self._gate(allowed, byok=True, surface=surface)
+
+        assert body == {"check_quota": "chat", "byok": True}
+
+    @pytest.mark.asyncio
+    async def test_a_denial_of_an_unfamiliar_type_is_relayed_as_sent(self):
+        denied = httpx.Response(
+            200,
+            json={
+                "quota": {
+                    "allowed": False,
+                    "limit_type": "surface_not_included",
+                    "message": "Text from the auth service.",
+                    "retry_after": 60,
+                }
+            },
+        )
+
+        with pytest.raises(HTTPException) as exc_info:
+            await self._gate(denied, byok=False, surface="telegram")
+
+        assert exc_info.value.status_code == 429
+        assert exc_info.value.detail["type"] == "surface_not_included"
+        assert exc_info.value.detail["message"] == "Text from the auth service."
+        assert exc_info.value.headers["Retry-After"] == "60"
+
+
 # ===================================================================
 # get_capacity_status (read-only count-quota status for the UI)
 # ===================================================================
@@ -897,6 +1056,19 @@ class TestExtractCapacityAliases:
 
     def test_absent_counts_stay_none(self):
         assert self._extract()({"allowed": True}) == (None, None)
+
+    def test_null_names_fall_through_to_the_counted_ones(self):
+        """The platform sends every quota field, the unused ones as null; a
+        computer quota carries its counts under the workspace names only."""
+        assert self._extract()(
+            {
+                "allowed": True,
+                "capacity_used": None,
+                "capacity_limit": None,
+                "active_workspaces": 1,
+                "workspace_limit": 2,
+            }
+        ) == (1, 2)
 
 
 # ===================================================================
@@ -1107,8 +1279,73 @@ class TestEnforceCapacity:
 # ===================================================================
 # assert_spec_allowed — hybrid spec gate (scope 403 + count 429).
 # standard is never gated; the count check is skipped when already at
-# the target tier (no new slot consumed).
+# the target tier (no new slot consumed), and a move between larger
+# tiers hands back the slot the computer already holds.
 # ===================================================================
+
+
+class TestEnforceComputerCount:
+    """The create-only cap on computers held, stopped ones included."""
+
+    @pytest.mark.asyncio
+    async def test_asks_the_held_count_and_relays_a_full_cap(self):
+        from fastapi import HTTPException
+
+        quota_response = {
+            "quota": {
+                "allowed": False,
+                "limit_type": "workspace_limit",
+                "message": "Limit reached",
+                "active_workspaces": 2,
+                "workspace_limit": 2,
+            }
+        }
+        validate = AsyncMock(return_value=quota_response)
+        with (
+            patch(f"{MODULE}.HOST_MODE", "platform"),
+            patch(f"{MODULE}.AUTH_SERVICE_URL", "http://localhost:8003"),
+            patch(f"{MODULE}._call_validate_for_user", validate),
+        ):
+            from src.server.dependencies.usage_limits import enforce_computer_count
+
+            with pytest.raises(HTTPException) as exc:
+                await enforce_computer_count("user-1")
+
+        validate.assert_awaited_once_with("user-1", check_quota="computer_count")
+        assert exc.value.status_code == 429
+        assert exc.value.detail["current"] == 2
+        assert exc.value.detail["limit"] == 2
+
+    @pytest.mark.asyncio
+    async def test_fails_open_on_a_platform_that_predates_it(self):
+        """An older platform answers 422, which reads as no result: the create
+        falls back on the running-computer limit it also asks."""
+        with (
+            patch(f"{MODULE}.HOST_MODE", "platform"),
+            patch(f"{MODULE}.AUTH_SERVICE_URL", "http://localhost:8003"),
+            patch(
+                f"{MODULE}._call_validate_for_user",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+        ):
+            from src.server.dependencies.usage_limits import enforce_computer_count
+
+            assert await enforce_computer_count("user-1") is None
+
+    @pytest.mark.asyncio
+    async def test_running_limit_still_asks_the_running_count(self):
+        validate = AsyncMock(return_value={"quota": {"allowed": True}})
+        with (
+            patch(f"{MODULE}.HOST_MODE", "platform"),
+            patch(f"{MODULE}.AUTH_SERVICE_URL", "http://localhost:8003"),
+            patch(f"{MODULE}._call_validate_for_user", validate),
+        ):
+            from src.server.dependencies.usage_limits import enforce_computer_limit
+
+            assert await enforce_computer_limit("user-1") == "user-1"
+
+        validate.assert_awaited_once_with("user-1", check_quota="workspace")
 
 
 class TestAssertSpecAllowed:
@@ -1162,7 +1399,9 @@ class TestAssertSpecAllowed:
             from src.server.dependencies.usage_limits import assert_spec_allowed
 
             await assert_spec_allowed("user-1", "performance", current_tier="standard")
-            mock_cap.assert_awaited_once_with("user-1", "spec_performance")
+            mock_cap.assert_awaited_once_with(
+                "user-1", "spec_performance", returning_slot=False
+            )
 
     @pytest.mark.asyncio
     async def test_already_at_tier_skips_count(self):
@@ -1183,8 +1422,9 @@ class TestAssertSpecAllowed:
             mock_cap.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_downgrade_skips_count(self):
-        """max → performance is a downgrade: scope checked, no new slot counted."""
+    async def test_a_step_down_into_a_metered_tier_counts_with_its_slot_returned(self):
+        """max → performance still counts, with the slot the Large holds handed
+        back: the platform counts it among the computers the quota covers."""
         with (
             patch(f"{MODULE}.HOST_MODE", "platform"),
             patch(f"{MODULE}.AUTH_SERVICE_URL", "http://localhost:8003"),
@@ -1198,7 +1438,9 @@ class TestAssertSpecAllowed:
             from src.server.dependencies.usage_limits import assert_spec_allowed
 
             await assert_spec_allowed("user-1", "performance", current_tier="max")
-            mock_cap.assert_not_awaited()
+            mock_cap.assert_awaited_once_with(
+                "user-1", "spec_performance", returning_slot=True
+            )
 
     @pytest.mark.asyncio
     async def test_max_checks_max_scope_and_count(self):
@@ -1216,7 +1458,194 @@ class TestAssertSpecAllowed:
             from src.server.dependencies.usage_limits import assert_spec_allowed
 
             await assert_spec_allowed("user-1", "max", current_tier="standard")
-            mock_cap.assert_awaited_once_with("user-1", "spec_max")
+            mock_cap.assert_awaited_once_with("user-1", "spec_max", returning_slot=False)
+
+    @pytest.mark.asyncio
+    async def test_xlarge_without_its_scope_raises_403(self):
+        """Every other spec scope held is no grant of Extra Large: an absent
+        entry would leave the tier ungated."""
+        with (
+            patch(f"{MODULE}.HOST_MODE", "platform"),
+            patch(f"{MODULE}.AUTH_SERVICE_URL", "http://localhost:8003"),
+            patch(
+                f"{MODULE}._get_user_scopes",
+                new_callable=AsyncMock,
+                return_value=["workspace:spec:performance", "workspace:spec:max"],
+            ),
+            patch(f"{MODULE}.enforce_capacity", new_callable=AsyncMock) as mock_cap,
+        ):
+            from src.server.dependencies.usage_limits import assert_spec_allowed
+
+            with pytest.raises(HTTPException) as exc:
+                await assert_spec_allowed("user-1", "xlarge", current_tier="max")
+
+            assert exc.value.status_code == 403
+            mock_cap.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_xlarge_at_its_count_raises_429(self):
+        """Small to Extra Large takes a new slot, so the platform's count decides."""
+        with (
+            patch(f"{MODULE}.HOST_MODE", "platform"),
+            patch(f"{MODULE}.AUTH_SERVICE_URL", "http://localhost:8003"),
+            patch(
+                f"{MODULE}._get_user_scopes",
+                new_callable=AsyncMock,
+                return_value=["workspace:spec:xlarge"],
+            ),
+            patch(
+                f"{MODULE}._call_validate_for_user",
+                new_callable=AsyncMock,
+                return_value={
+                    "quota": {
+                        "allowed": False,
+                        "limit_type": "xlarge_limit",
+                        "message": "Extra Large limit reached",
+                        "capacity_used": 1,
+                        "capacity_limit": 1,
+                    }
+                },
+            ) as validate,
+        ):
+            from src.server.dependencies.usage_limits import assert_spec_allowed
+
+            with pytest.raises(HTTPException) as exc:
+                await assert_spec_allowed("user-1", "xlarge", current_tier="standard")
+
+        validate.assert_awaited_once_with("user-1", check_quota="spec_xlarge")
+        assert exc.value.status_code == 429
+        assert exc.value.detail["type"] == "xlarge_limit"
+        assert (exc.value.detail["current"], exc.value.detail["limit"]) == (1, 1)
+
+    @pytest.mark.asyncio
+    async def test_a_step_down_from_xlarge_counts_the_target_tier(self):
+        with (
+            patch(f"{MODULE}.HOST_MODE", "platform"),
+            patch(f"{MODULE}.AUTH_SERVICE_URL", "http://localhost:8003"),
+            patch(
+                f"{MODULE}._get_user_scopes",
+                new_callable=AsyncMock,
+                return_value=["workspace:spec:max"],
+            ),
+            patch(f"{MODULE}.enforce_capacity", new_callable=AsyncMock) as mock_cap,
+        ):
+            from src.server.dependencies.usage_limits import assert_spec_allowed
+
+            await assert_spec_allowed("user-1", "max", current_tier="xlarge")
+            mock_cap.assert_awaited_once_with("user-1", "spec_max", returning_slot=True)
+
+    @staticmethod
+    @contextmanager
+    def _platform(scope: str, quota: dict | None):
+        """A platform granting ``scope`` and answering every count with ``quota``.
+        Yields the scope and validate mocks."""
+        with (
+            patch(f"{MODULE}.HOST_MODE", "platform"),
+            patch(f"{MODULE}.AUTH_SERVICE_URL", "http://localhost:8003"),
+            patch(
+                f"{MODULE}._get_user_scopes", new_callable=AsyncMock, return_value=[scope]
+            ) as scopes,
+            patch(
+                f"{MODULE}._call_validate_for_user",
+                new_callable=AsyncMock,
+                return_value=None if quota is None else {"quota": quota},
+            ) as validate,
+        ):
+            yield scopes, validate
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("tier", "quota_name"),
+        [("performance", "spec_performance"), ("xlarge", "spec_xlarge")],
+    )
+    async def test_a_large_moves_in_the_slot_it_holds(self, tier, quota_name):
+        """Holding one Large on a plan with one larger slot: the platform
+        reports the slot used, and a move down or up reuses it."""
+        quota = {
+            "allowed": False,
+            "limit_type": f"{tier}_limit",
+            "capacity_used": 1,
+            "capacity_limit": 1,
+        }
+        with self._platform(f"workspace:spec:{tier}", quota) as (_, v):
+            from src.server.dependencies.usage_limits import assert_spec_allowed
+
+            await assert_spec_allowed("user-1", tier, current_tier="max")
+
+        v.assert_awaited_once_with("user-1", check_quota=quota_name)
+
+    @pytest.mark.asyncio
+    async def test_a_held_slot_does_not_cover_a_second_larger_computer(self):
+        """Two held at a limit of one (a plan changed under them): handing one
+        back still leaves the slot full."""
+        quota = {
+            "allowed": False,
+            "limit_type": "max_limit",
+            "message": "Large limit reached",
+            "capacity_used": 2,
+            "capacity_limit": 1,
+        }
+        with self._platform("workspace:spec:max", quota):
+            from src.server.dependencies.usage_limits import assert_spec_allowed
+
+            with pytest.raises(HTTPException) as exc:
+                await assert_spec_allowed("user-1", "max", current_tier="performance")
+
+        assert exc.value.status_code == 429
+        assert exc.value.detail["type"] == "max_limit"
+        assert exc.value.detail["message"] == "Large limit reached"
+        assert (exc.value.detail["current"], exc.value.detail["limit"]) == (2, 1)
+
+    @pytest.mark.asyncio
+    async def test_a_held_slot_is_no_grant_of_a_size_the_plan_leaves_out(self):
+        """A limit of 0 is the plan leaving the size out, whatever is held."""
+        quota = {
+            "allowed": False,
+            "limit_type": "xlarge_limit",
+            "capacity_used": 1,
+            "capacity_limit": 0,
+        }
+        with self._platform("workspace:spec:xlarge", quota):
+            from src.server.dependencies.usage_limits import assert_spec_allowed
+
+            with pytest.raises(HTTPException) as exc:
+                await assert_spec_allowed("user-1", "xlarge", current_tier="max")
+
+        assert exc.value.status_code == 429
+        assert exc.value.detail["type"] == "xlarge_limit"
+
+    @pytest.mark.asyncio
+    async def test_an_unlimited_plan_moves_between_larger_sizes(self):
+        quota = {"allowed": True, "capacity_used": 4, "capacity_limit": -1}
+        with self._platform("workspace:spec:xlarge", quota):
+            from src.server.dependencies.usage_limits import assert_spec_allowed
+
+            await assert_spec_allowed("user-1", "xlarge", current_tier="performance")
+
+    @pytest.mark.asyncio
+    async def test_a_held_slot_without_counts_takes_the_platforms_answer(self):
+        """No counts to hand a slot back from: the platform's own flag stands,
+        and a missing quota object stays fail-open."""
+        with self._platform(
+            "workspace:spec:max", {"allowed": False, "limit_type": "max_limit"}
+        ):
+            from src.server.dependencies.usage_limits import assert_spec_allowed
+
+            with pytest.raises(HTTPException):
+                await assert_spec_allowed("user-1", "max", current_tier="performance")
+
+        with self._platform("workspace:spec:max", None):
+            await assert_spec_allowed("user-1", "max", current_tier="performance")
+
+    @pytest.mark.asyncio
+    async def test_a_move_to_standard_never_asks(self):
+        with self._platform("workspace:spec:max", {}) as (scopes, v):
+            from src.server.dependencies.usage_limits import assert_spec_allowed
+
+            await assert_spec_allowed("user-1", "standard", current_tier="max")
+
+        scopes.assert_not_awaited()
+        v.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_oss_mode_is_noop(self):
@@ -1276,7 +1705,7 @@ class TestAssertAlwaysOnAllowed:
             from src.server.dependencies.usage_limits import assert_always_on_allowed
 
             await assert_always_on_allowed("user-1")
-            mock_cap.assert_awaited_once_with("user-1", "always_on")
+            mock_cap.assert_awaited_once_with("user-1", "always_on", returning_slot=False)
 
     @pytest.mark.asyncio
     async def test_oss_mode_is_noop(self):
@@ -1358,6 +1787,121 @@ class TestRequireWorkspaceScope:
             from src.server.dependencies.usage_limits import require_workspace_scope
 
             await require_workspace_scope("user-1", "workspace:always_on")  # no raise
+
+
+# ===================================================================
+# Provider gate: a computer on a non-default sandbox provider needs
+# workspace:provider:<kind>; the deployment default is never gated.
+# ===================================================================
+
+
+def _platform_scopes(scopes):
+    """Patches for platform mode with the given cached scope answer."""
+    return (
+        patch(f"{MODULE}.HOST_MODE", "platform"),
+        patch(f"{MODULE}.AUTH_SERVICE_URL", "http://localhost:8003"),
+        patch(f"{MODULE}._get_user_scopes", new_callable=AsyncMock, return_value=scopes),
+    )
+
+
+class TestAssertProviderAllowed:
+    @pytest.mark.asyncio
+    async def test_the_default_kind_is_never_gated(self):
+        mode, url, scopes = _platform_scopes([])
+        with mode, url, scopes as mock_scopes:
+            from src.server.dependencies.usage_limits import assert_provider_allowed
+
+            await assert_provider_allowed("user-1", "daytona", default_kind="daytona")
+            mock_scopes.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_oss_mode_is_noop(self):
+        with (
+            patch(f"{MODULE}.HOST_MODE", "oss"),
+            patch(f"{MODULE}._get_user_scopes", new_callable=AsyncMock) as mock_scopes,
+        ):
+            from src.server.dependencies.usage_limits import assert_provider_allowed
+
+            await assert_provider_allowed("user-1", "e2b", default_kind="daytona")
+            mock_scopes.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_missing_scope_raises_403(self):
+        mode, url, scopes = _platform_scopes(["workspace:spec:max"])
+        with mode, url, scopes:
+            from src.server.dependencies.usage_limits import assert_provider_allowed
+
+            with pytest.raises(HTTPException) as exc:
+                await assert_provider_allowed("user-1", "e2b", default_kind="daytona")
+        assert exc.value.status_code == 403
+        assert exc.value.detail == "Requires scope: workspace:provider:e2b"
+
+    @pytest.mark.asyncio
+    async def test_scope_present_allows(self):
+        mode, url, scopes = _platform_scopes(["workspace:provider:e2b"])
+        with mode, url, scopes:
+            from src.server.dependencies.usage_limits import assert_provider_allowed
+
+            await assert_provider_allowed("user-1", "e2b", default_kind="daytona")
+
+    @pytest.mark.asyncio
+    async def test_unknown_scopes_fail_open(self):
+        mode, url, scopes = _platform_scopes(None)
+        with mode, url, scopes:
+            from src.server.dependencies.usage_limits import assert_provider_allowed
+
+            await assert_provider_allowed("user-1", "e2b", default_kind="daytona")
+
+
+class TestGetProviderAllowances:
+    @pytest.mark.asyncio
+    async def test_oss_mode_reads_the_default_as_allowed_and_others_as_ungated(self):
+        with (
+            patch(f"{MODULE}.HOST_MODE", "oss"),
+            patch(f"{MODULE}._get_user_scopes", new_callable=AsyncMock) as mock_scopes,
+        ):
+            from src.server.dependencies.usage_limits import get_provider_allowances
+
+            allowed = await get_provider_allowances(
+                "user-1", ("daytona", "e2b"), default_kind="daytona"
+            )
+        assert allowed == {"daytona": True, "e2b": None}
+        mock_scopes.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_reads_each_kind_from_the_scopes_once(self):
+        mode, url, scopes = _platform_scopes(["workspace:provider:docker"])
+        with mode, url, scopes as mock_scopes:
+            from src.server.dependencies.usage_limits import get_provider_allowances
+
+            allowed = await get_provider_allowances(
+                "user-1", ("daytona", "e2b", "docker"), default_kind="daytona"
+            )
+        assert allowed == {"daytona": True, "e2b": False, "docker": True}
+        mock_scopes.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_unknown_scopes_read_as_unknown(self):
+        mode, url, scopes = _platform_scopes(None)
+        with mode, url, scopes:
+            from src.server.dependencies.usage_limits import get_provider_allowances
+
+            allowed = await get_provider_allowances(
+                "user-1", ("daytona", "e2b"), default_kind="daytona"
+            )
+        assert allowed == {"daytona": True, "e2b": None}
+
+    @pytest.mark.asyncio
+    async def test_only_the_default_asks_the_platform_nothing(self):
+        mode, url, scopes = _platform_scopes([])
+        with mode, url, scopes as mock_scopes:
+            from src.server.dependencies.usage_limits import get_provider_allowances
+
+            allowed = await get_provider_allowances(
+                "user-1", ("daytona",), default_kind="daytona"
+            )
+        assert allowed == {"daytona": True}
+        mock_scopes.assert_not_awaited()
 
 
 # ===================================================================
@@ -1644,6 +2188,21 @@ class TestSpecEntitlementLost:
             from src.server.dependencies.usage_limits import spec_entitlement_lost
 
             assert await spec_entitlement_lost("user-1", "performance") is False
+
+    @pytest.mark.asyncio
+    async def test_xlarge_is_reclaimed_when_its_scope_is_gone(self):
+        with (
+            patch(f"{MODULE}.HOST_MODE", "platform"),
+            patch(f"{MODULE}.AUTH_SERVICE_URL", "http://localhost:8003"),
+            patch(
+                f"{MODULE}._call_validate_for_user",
+                new_callable=AsyncMock,
+                return_value={"scopes": ["workspace:spec:max"]},
+            ),
+        ):
+            from src.server.dependencies.usage_limits import spec_entitlement_lost
+
+            assert await spec_entitlement_lost("user-1", "xlarge") is True
 
     @pytest.mark.asyncio
     async def test_standard_and_unknown_tiers_never_reclaimed(self):

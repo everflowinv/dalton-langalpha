@@ -240,12 +240,13 @@ class TestFlattenProviders:
                 f"{model_name} (z-ai) should not have requires_own_key"
             )
 
-        # moonshot-coding models should NOT have requires_own_key (inherits moonshot env_key)
+        # moonshot-coding models need their own key too: a Kimi coding-plan key
+        # is a separate credential, read from its own env_key
         mc_models = {k: v for k, v in metadata.items() if v.get("provider") == "moonshot-coding"}
         assert mc_models, "Expected at least one moonshot-coding model in manifest"
         for model_name, entry in mc_models.items():
-            assert "requires_own_key" not in entry, (
-                f"{model_name} (moonshot-coding) should not have requires_own_key"
+            assert entry.get("requires_own_key") == "true", (
+                f"{model_name} (moonshot-coding) should have requires_own_key='true'"
             )
 
     def test_get_display_name_prefers_own_over_parent(self):

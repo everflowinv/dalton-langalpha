@@ -11,11 +11,7 @@ export function detailPanelWidth(toolCallProcess: ToolCallProcessRecord | null):
   if (!toolCallProcess) return UNSIZED_DETAIL_WIDTH;
   const toolName = toolCallProcess.toolName || '';
   const artifactType = toolCallProcess.toolCallResult?.artifact?.type;
-  if (artifactType === 'sec_filing') return DEFAULT_PANEL_WIDTH;
-  if (toolName === 'Read') return DEFAULT_PANEL_WIDTH;
+  if (artifactType === 'sec_filing' || toolName === 'Read') return DEFAULT_PANEL_WIDTH;
   if (isTaskTool(toolName)) return 750;
-  if (artifactType === 'stock_prices' || artifactType === 'market_indices' || artifactType === 'sector_performance') return 650;
-  if (toolName === 'WebSearch' || toolName === 'web_search') return 650;
-  if (artifactType === 'company_overview' || artifactType === 'automations') return 480;
-  return 650;
+  return artifactType === 'company_overview' || artifactType === 'automations' ? 480 : 650;
 }

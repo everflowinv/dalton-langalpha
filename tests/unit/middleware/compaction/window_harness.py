@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
@@ -53,6 +53,7 @@ from ptc_agent.agent.middleware.subagent_switch import (
 )
 from ptc_agent.agent.transcript import TranscriptTarget, Window, build_directory, load_manifest
 from ptc_agent.agent.transcript.render import split_runs
+from ptc_agent.core.sandbox.livefs_mount import TranscriptReach
 
 THREAD = "abcd1234-5678-4000-8000-00000000c0de"
 WORKSPACE = "/home/workspace"
@@ -187,6 +188,7 @@ def _backend(store: TranscriptStore) -> Any:
 
     return SimpleNamespace(
         livefs=store,
+        transcripts=TranscriptReach(store, shell=True),
         settled_livefs=settled_livefs,
         aglob=aglob,
         normalize_path=lambda path: path,
@@ -232,7 +234,7 @@ def _script(turn: int, rounds: int, *, notes: bool = False, label: str = "") -> 
     return out
 
 
-Coverage = Callable[[Window], Any]
+Coverage = Callable[[Window, Sequence[AnyMessage]], Any]
 
 
 @dataclass
@@ -277,7 +279,7 @@ def build_graph(
     compaction = CompactionMiddleware(
         Summarizer(run.summary_model, limit=10**9, counter=len),
         token_threshold=THRESHOLD,
-        keep_messages=KEEP,
+        keep_tokens=KEEP,
         offload=OffloadSettings(keep_messages=KEEP, max_length=200, idle_seconds=0.0),
         backend=_backend(run.store),
         workspace_id="ws-1",
@@ -285,21 +287,22 @@ def build_graph(
     scratchpad = ThreadScratchpad(
         folder=f"{WORKSPACE}/.agents/scratchpad/", notes_dir=NOTES_DIR, notes_subdir=NOTES_SUBDIR
     )
-    notes_rows = NotesDueMiddleware(scratchpad, compaction)
+    notes_rows = NotesDueMiddleware(scratchpad, compaction, run.model)
     if window:
 
-        async def coverage(head: Window) -> bool:
-            # Not checked against the head, so a test that breaks the window
-            # still sees it trim; the answer it should have had is kept.
+        async def coverage(
+            before: Window, trimmed: Sequence[AnyMessage]
+        ) -> Window | None:
+            # The answer is not checked against the thread, so a test that
+            # breaks the window still sees it trim; the one it should have
+            # had is kept.
             whole = whole_threads(run)[-1] if run.exports else []
+            head = before.extend(trimmed)
+            held = before.extend_held(trimmed, whole[: head.messages])
             run.asked.append(
-                (
-                    head.runs,
-                    head.holds(whole[: head.messages]),
-                    len(run.summary_model.requests),
-                )
+                (head.runs, held is not None, len(run.summary_model.requests))
             )
-            return covered
+            return head if covered else None
 
         compaction = compaction.with_window(
             coverage, [notes_window_carry(THREAD), subagents_window_carry]

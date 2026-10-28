@@ -4,13 +4,15 @@ Tests for DaytonaRuntime and DaytonaProvider with mocked Daytona SDK.
 Covers:
 - DaytonaRuntime delegates all operations to the SDK sandbox object
 - DaytonaRuntime maps SDK state strings to RuntimeState enum
-- DaytonaRuntime exposes correct capabilities and metadata
+- DaytonaRuntime exposes correct abilities and metadata
 - DaytonaProvider.create() returns DaytonaRuntime
 - DaytonaProvider.get() returns DaytonaRuntime
 - DaytonaProvider.close() delegates to client
 - DaytonaProvider.is_transient_error() classifies errors correctly
 """
 
+from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -18,7 +20,6 @@ import pytest
 from ptc_agent.config.core import DaytonaConfig
 from ptc_agent.core.sandbox._defaults import SANDBOX_IMAGE_ENV, sandbox_thread_env
 from ptc_agent.core.sandbox.runtime import (
-    CodeRunResult,
     ExecResult,
     RuntimeState,
     SandboxGoneError,
@@ -40,9 +41,6 @@ class TestDaytonaRuntime:
         sandbox.state = "started"
         sandbox.process.exec = AsyncMock(
             return_value=MagicMock(output="hello", exit_code=0)
-        )
-        sandbox.process.code_run = AsyncMock(
-            return_value=MagicMock(output="42", exit_code=0, artifacts=[])
         )
         sandbox.fs.upload_file = AsyncMock()
         sandbox.fs.upload_files = AsyncMock()
@@ -70,13 +68,6 @@ class TestDaytonaRuntime:
         result = await runtime.exec("echo hello")
         mock_sdk_sandbox.process.exec.assert_called_once()
         assert isinstance(result, ExecResult)
-        assert result.exit_code == 0
-
-    @pytest.mark.asyncio
-    async def test_code_run_delegates(self, runtime, mock_sdk_sandbox):
-        result = await runtime.code_run("print(42)")
-        mock_sdk_sandbox.process.code_run.assert_called_once()
-        assert isinstance(result, CodeRunResult)
         assert result.exit_code == 0
 
     @pytest.mark.asyncio
@@ -211,12 +202,9 @@ class TestDaytonaRuntime:
         assert runtime.working_dir == "/home/workspace"
 
     def test_capabilities_includes_archive_and_snapshot(self, runtime):
-        caps = runtime.capabilities
-        assert "exec" in caps
-        assert "code_run" in caps
-        assert "file_io" in caps
-        assert "archive" in caps
-        assert "snapshot" in caps
+        assert runtime.archives
+        assert runtime.updates_env
+        assert runtime.autostops
 
     @pytest.mark.asyncio
     async def test_get_metadata(self, runtime):
@@ -238,7 +226,7 @@ class TestDaytonaRuntime:
         process.get_session_command_logs = AsyncMock(
             side_effect=[MagicMock(stdout="partial", stderr=""), MagicMock(stdout="all", stderr="")]
         )
-        await runtime.session_execute("bg-0123456789ab", "job", run_async=True)
+        await runtime.session_execute("bg-0123456789ab", "job")
 
         result = await runtime.session_logs("bg-0123456789ab")
 
@@ -260,7 +248,7 @@ class TestDaytonaRuntime:
             return MagicMock(stdout=command_id, stderr="")
 
         process.get_session_command_logs = AsyncMock(side_effect=logs)
-        await runtime.session_execute("bg-0123456789ab", "job", run_async=True)
+        await runtime.session_execute("bg-0123456789ab", "job")
 
         result = await runtime.session_logs("bg-0123456789ab")
 
@@ -372,7 +360,7 @@ class TestDaytonaProvider:
 
         baseline = provider._get_snapshot_hash([], resources=res)
         with patch(
-            "ptc_agent.core.sandbox.providers.daytona.SANDBOX_IMAGE_ENV",
+            "ptc_agent.core.sandbox.providers._image_recipe.SANDBOX_IMAGE_ENV",
             {**SANDBOX_IMAGE_ENV, "NEW_VAR": "/somewhere"},
         ):
             with_added = provider._get_snapshot_hash([], resources=res)
@@ -451,6 +439,82 @@ class TestDaytonaProvider:
         assert name_small != name_big
         assert name_small.startswith("ptc-base-performance-")
 
+    @pytest.mark.asyncio
+    async def test_prebuilt_snapshot_name_is_the_one_create_looks_for(self):
+        """scripts/daytona_snapshots.py builds what ``snapshot_name`` says; a
+        sandbox only starts from it if create asks for the same name."""
+        from ptc_agent.core.sandbox.providers.daytona import DaytonaProvider
+
+        provider = DaytonaProvider.__new__(DaytonaProvider)
+        provider._working_dir = "/home/workspace"
+        provider._config = DaytonaConfig(api_key="test-key", snapshot_name="la")
+        client = AsyncMock()
+        client.snapshot.list = AsyncMock(return_value=MagicMock(items=[]))
+        provider._client = client
+
+        for tier in provider._config.resource_tiers:
+            _, resources = provider._resolve_tier(tier)
+            asked = await provider._ensure_snapshot(
+                ["pkg"], tier=tier, resources=resources
+            )
+            assert asked == provider.snapshot_name(["pkg"], tier=tier)
+            assert asked.startswith(f"la-{tier}-")
+
+    @staticmethod
+    def _snapshot_provider(client):
+        from ptc_agent.core.sandbox.providers.daytona import DaytonaProvider
+
+        provider = DaytonaProvider.__new__(DaytonaProvider)
+        provider._working_dir = "/home/workspace"
+        provider._config = DaytonaConfig(api_key="test-key")
+        provider._client = client
+        return provider
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("listed", ["pending", "pulling", "building", "snapshotting"])
+    async def test_a_build_under_way_is_waited_on_not_duplicated(self, listed, monkeypatch):
+        """Another worker's first create, or the prebuild, holds the name in any
+        of these on its way to active, and a sandbox started before then fails."""
+        monkeypatch.setattr("asyncio.sleep", AsyncMock())
+        client = AsyncMock()
+        provider = self._snapshot_provider(client)
+        choice, resources = provider._resolve_tier(None)
+        name = provider.snapshot_name(["pkg"])
+        client.snapshot.list = AsyncMock(
+            return_value=MagicMock(items=[SimpleNamespace(name=name, state=listed)])
+        )
+        client.snapshot.get = AsyncMock(
+            side_effect=[SimpleNamespace(state=listed), SimpleNamespace(state="active")]
+        )
+
+        got = await provider._ensure_snapshot(["pkg"], tier=choice.name, resources=resources)
+
+        assert got == name
+        assert client.snapshot.get.await_count == 2
+        client.snapshot.create.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("settles", "usable"), [("active", True), ("build_failed", False)])
+    async def test_a_name_another_build_took_is_used_only_once_active(
+        self, settles, usable, monkeypatch
+    ):
+        monkeypatch.setattr("asyncio.sleep", AsyncMock())
+        client = AsyncMock()
+        provider = self._snapshot_provider(client)
+        choice, resources = provider._resolve_tier(None)
+        name = provider.snapshot_name(["pkg"])
+        client.snapshot.list = AsyncMock(return_value=MagicMock(items=[]))
+        client.snapshot.create = AsyncMock(
+            side_effect=RuntimeError(f"Snapshot with name {name} already exists")
+        )
+        client.snapshot.get = AsyncMock(
+            side_effect=[SimpleNamespace(state="pending"), SimpleNamespace(state=settles)]
+        )
+
+        got = await provider._ensure_snapshot(["pkg"], tier=choice.name, resources=resources)
+
+        assert got == (name if usable else None)
+
     @patch("ptc_agent.core.sandbox.providers.daytona.AsyncDaytona")
     @pytest.mark.asyncio
     async def test_create_default_tier_resolves_configured_resources(
@@ -461,7 +525,7 @@ class TestDaytonaProvider:
         from ptc_agent.core.sandbox.providers.daytona import DaytonaProvider
 
         provider = DaytonaProvider.__new__(DaytonaProvider)
-        provider._config = DaytonaConfig(api_key="test-key")  # standard 1/1/3
+        provider._config = DaytonaConfig(api_key="test-key")  # standard 1/2/5
         provider._working_dir = "/home/workspace"
         provider._client = mock_daytona_client
 
@@ -472,8 +536,8 @@ class TestDaytonaProvider:
         kwargs = mock_ensure.call_args.kwargs
         assert kwargs["tier"] == "standard"
         assert kwargs["resources"].cpu == 1
-        assert kwargs["resources"].memory == 1
-        assert kwargs["resources"].disk == 3
+        assert kwargs["resources"].memory == 2
+        assert kwargs["resources"].disk == 5
 
     @patch("ptc_agent.core.sandbox.providers.daytona.AsyncDaytona")
     @pytest.mark.asyncio
@@ -604,3 +668,186 @@ class TestDaytonaProvider:
         assert provider.is_transient_error(
             Exception("RemoteDisconnected: peer closed")
         )
+
+
+# ---------------------------------------------------------------------------
+# DaytonaProvider.metrics_since
+# ---------------------------------------------------------------------------
+
+_T0 = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
+
+
+def _bucket(ts: datetime, **fields) -> SimpleNamespace:
+    """An SDK ``SandboxMetrics``: what Daytona did not report is 0."""
+    values = {
+        "cpu_count": 2,
+        "cpu_used_pct": 12.5,
+        "disk_total": 10 * 2**30,
+        "disk_used": 2**30,
+        "mem_total": 4 * 2**30,
+        "mem_used": 2**29,
+        "mem_cache": 2**28,
+    }
+    return SimpleNamespace(timestamp=ts, **{**values, **fields})
+
+
+def _metrics_provider(buckets):
+    from ptc_agent.core.sandbox.providers.daytona import DaytonaProvider
+
+    provider = DaytonaProvider.__new__(DaytonaProvider)
+    sdk_sandbox = MagicMock()
+    sdk_sandbox.get_metrics = AsyncMock(return_value=buckets)
+    sdk_sandbox.start = AsyncMock()
+    provider._client = MagicMock()
+    provider._client.get = AsyncMock(return_value=sdk_sandbox)
+    return provider, sdk_sandbox
+
+
+class TestDaytonaMetricsSince:
+    def test_reports_metrics(self):
+        from ptc_agent.core.sandbox.providers.daytona import DaytonaProvider
+
+        assert DaytonaProvider.reports_metrics is True
+
+    @pytest.mark.asyncio
+    async def test_maps_fields_and_reads_without_starting(self):
+        provider, sdk_sandbox = _metrics_provider([_bucket(_T0 + timedelta(minutes=1))])
+        until = _T0 + timedelta(hours=1)
+
+        [sample] = await provider.metrics_since("sbx", _T0, until=until)
+
+        provider._client.get.assert_awaited_once_with("sbx")
+        sdk_sandbox.start.assert_not_awaited()
+        sdk_sandbox.get_metrics.assert_awaited_once_with(_T0, until)
+        assert sample.timestamp == _T0 + timedelta(minutes=1)
+        assert sample.cpu_used_pct == 12.5
+        assert sample.cpu_count == 2
+        assert sample.mem_used_bytes == 2**29
+        assert sample.mem_cache_bytes == 2**28
+        assert sample.mem_total_bytes == 4 * 2**30
+        assert sample.disk_used_bytes == 2**30
+        assert sample.disk_total_bytes == 10 * 2**30
+
+    @pytest.mark.asyncio
+    async def test_without_until_the_window_ends_now(self):
+        provider, sdk_sandbox = _metrics_provider([])
+
+        await provider.metrics_since("sbx", _T0)
+
+        end = sdk_sandbox.get_metrics.await_args.args[1]
+        assert end.tzinfo is not None
+        assert abs(datetime.now(UTC) - end) < timedelta(seconds=5)
+
+    @pytest.mark.asyncio
+    async def test_unreported_sizes_are_none_and_idle_cpu_is_a_reading(self):
+        provider, _ = _metrics_provider(
+            [
+                _bucket(
+                    _T0 + timedelta(minutes=1),
+                    cpu_count=0,
+                    cpu_used_pct=0.0,
+                    disk_total=0,
+                    disk_used=0,
+                    mem_total=0,
+                )
+            ]
+        )
+
+        [sample] = await provider.metrics_since("sbx", _T0)
+
+        assert sample.cpu_used_pct == 0.0
+        assert sample.cpu_count is None
+        assert sample.mem_total_bytes is None
+        assert sample.disk_total_bytes is None
+        assert sample.disk_used_bytes is None
+
+    @pytest.mark.asyncio
+    async def test_window_is_strict_after_since_and_up_to_until(self):
+        until = _T0 + timedelta(minutes=10)
+        provider, _ = _metrics_provider(
+            [
+                _bucket(_T0),
+                _bucket(_T0 + timedelta(minutes=5)),
+                _bucket(until),
+                _bucket(until + timedelta(seconds=1)),
+            ]
+        )
+
+        samples = await provider.metrics_since("sbx", _T0, until=until)
+
+        assert [s.timestamp for s in samples] == [_T0 + timedelta(minutes=5), until]
+
+    @pytest.mark.asyncio
+    async def test_samples_are_oldest_first_and_utc(self):
+        naive = datetime(2026, 1, 1, 12, 5)
+        provider, _ = _metrics_provider(
+            [
+                _bucket(_T0 + timedelta(minutes=9)),
+                _bucket(naive),
+                _bucket(_T0 + timedelta(minutes=7)),
+            ]
+        )
+
+        samples = await provider.metrics_since("sbx", _T0)
+
+        assert [s.timestamp for s in samples] == [
+            _T0 + timedelta(minutes=5),
+            _T0 + timedelta(minutes=7),
+            _T0 + timedelta(minutes=9),
+        ]
+        assert all(s.timestamp.utcoffset() == timedelta(0) for s in samples)
+
+    @pytest.mark.asyncio
+    async def test_sdk_errors_propagate(self):
+        provider, sdk_sandbox = _metrics_provider([])
+        sdk_sandbox.get_metrics.side_effect = RuntimeError("telemetry down")
+
+        with pytest.raises(RuntimeError, match="telemetry down"):
+            await provider.metrics_since("sbx", _T0)
+
+        provider._client.get.side_effect = RuntimeError("lookup failed")
+        with pytest.raises(RuntimeError, match="lookup failed"):
+            await provider.metrics_since("sbx", _T0)
+
+    @pytest.mark.asyncio
+    async def test_a_429_on_the_cause_is_a_rate_limited_error(self):
+        from daytona import DaytonaError
+
+        from ptc_agent.core.sandbox.runtime import SandboxRateLimitedError
+
+        provider, sdk_sandbox = _metrics_provider([])
+        cause = RuntimeError("too many requests")
+        cause.status = 429  # type: ignore[attr-defined]
+        error = DaytonaError("Failed to get sandbox metrics\nrate limited")
+        error.__cause__ = cause
+        sdk_sandbox.get_metrics.side_effect = error
+
+        with pytest.raises(SandboxRateLimitedError, match="Failed to get sandbox metrics"):
+            await provider.metrics_since("sbx", _T0)
+
+    @pytest.mark.asyncio
+    async def test_any_other_status_propagates_unchanged(self):
+        from daytona import DaytonaError
+
+        from ptc_agent.core.sandbox.runtime import SandboxRateLimitedError
+
+        provider, sdk_sandbox = _metrics_provider([])
+        error = DaytonaError("not found", status_code=404)
+        sdk_sandbox.get_metrics.side_effect = error
+
+        with pytest.raises(DaytonaError) as raised:
+            await provider.metrics_since("sbx", _T0)
+
+        assert raised.value is error
+        assert not isinstance(raised.value, SandboxRateLimitedError)
+
+    @pytest.mark.asyncio
+    async def test_memory_in_use_is_not_adjusted_by_the_cache(self):
+        provider, _ = _metrics_provider(
+            [_bucket(_T0 + timedelta(minutes=1), mem_used=2**29, mem_cache=2**28)]
+        )
+
+        [sample] = await provider.metrics_since("sbx", _T0)
+
+        assert sample.mem_used_bytes == 2**29
+        assert sample.mem_cache_bytes == 2**28

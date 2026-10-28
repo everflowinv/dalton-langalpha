@@ -34,6 +34,9 @@ vi.mock('@/lib/framer', async () => {
     AnimatePresence: ({ children }: { children?: React.ReactNode }) =>
       ReactActual.createElement(ReactActual.Fragment, null, children),
     animate: () => ({ stop: () => {} }),
+    useMotionValue: (v: number) => ({ get: () => v, set: () => {}, jump: () => {}, getVelocity: () => 0, on: () => () => {} }),
+    useIsPresent: () => true,
+    PresenceContext: ReactActual.createContext(null),
   };
 });
 

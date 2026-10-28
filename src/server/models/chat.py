@@ -12,6 +12,7 @@ from typing import Annotated, Any, Dict, List, Literal, Mapping, Optional, Union
 from pydantic import AfterValidator, BaseModel, Field, field_validator
 
 from src.server.models.additional_context import AdditionalContext
+from src.server.models.command import FailureReason
 
 from src.llms.reasoning import ReasoningLevel
 
@@ -36,8 +37,8 @@ RequestKey = Annotated[str, AfterValidator(_uuid_text)]
 #   2. langgraph's ``ensure_message_ids`` must STAMP it at ``put_writes`` (role in
 #      langgraph's ``_MESSAGE_ROLES``). An accepted-but-unstamped role persists
 #      id-less; the hard-stop checkpoint flush / offload write the full list back
-#      via ``aupdate_state`` (which does NOT re-run ``ensure_message_ids``), and the
-#      non-minting reducer can't dedup an id-less message, so it DUPLICATES.
+#      via ``aupdate_state``, and the non-minting reducer can't dedup an id-less
+#      message against that copy, so it DUPLICATES.
 #
 # ``developer`` clears bar 1 (``convert_to_messages`` maps it to SystemMessage) but
 # FAILS bar 2 (not in langgraph's ``_MESSAGE_ROLES``), so it is excluded — clients
@@ -53,6 +54,19 @@ _VALID_MESSAGE_ROLES = frozenset(
 # =============================================================================
 
 
+class HITLOverrides(BaseModel):
+    """What the user changed on a proposal before approving it.
+
+    A field the user left alone stays None, which the tool reads as no
+    change: it keeps what it proposed.
+    """
+
+    report_back: Optional[bool] = Field(
+        default=None,
+        description="A hand-off's report-back, as the approval card's switch left it",
+    )
+
+
 class HITLDecision(BaseModel):
     """Decision for a single HITL action request."""
 
@@ -62,6 +76,10 @@ class HITLDecision(BaseModel):
     message: Optional[str] = Field(
         None,
         description="Feedback message, typically used when rejecting to explain why or request changes",
+    )
+    overrides: Optional[HITLOverrides] = Field(
+        default=None,
+        description="Changes the user made to the proposal before approving it",
     )
 
 
@@ -284,22 +302,68 @@ class ThreadOrigin(BaseModel):
 
 
 class AnalystReport(BaseModel):
-    """A dispatched analyst's thread reporting back, and its workspace."""
+    """A dispatched analyst's thread reporting back, and its workspace.
+
+    ``outcome`` says how the reported run ended. ``run_ids`` names that run
+    and the interrupted runs it continued, oldest first, so a hand-off finds
+    its report by the run its result named even when an approval split the
+    work across runs. ``steer_ids`` names the hand-offs those runs took in as
+    steers, oldest first, since one steered into a run that ended before
+    reading it is reported on by the later run that did. A list, empty or
+    not, is final; absent means unknown: a report stored before it was kept,
+    or one whose read of its steers failed. ``resumable`` marks an interim
+    worker-lost report whose run will resume and report again. Rows stored
+    before these were kept have none of them.
+    """
 
     kind: Literal["analyst"]
     thread_id: str
     workspace_id: Optional[str] = None
     workspace_name: Optional[str] = None
+    # DALTON-HOOK(colleague-dispatch): colleague workspace owner display name
+    workspace_owner: Optional[str] = None
+    outcome: Optional[Literal["completed", "error", "cancelled"]] = None
+    run_ids: Optional[List[str]] = None
+    steer_ids: Optional[List[str]] = None
+    # DALTON-HOOK(handoff-keep-on-resumable): mark interim resumable-interruption reports
+    resumable: Optional[bool] = None
 
 
 class TaskReport(BaseModel):
-    """A background subagent task in this thread, finished or failed."""
+    """A background subagent task in this thread, finished or failed.
+
+    ``subagent_type`` picks the role's glyph for the report's row. Reports
+    enqueued before it was kept have none.
+    """
 
     kind: Literal["task"]
     task_id: str
     display_id: str
     description: Optional[str] = None
     failed: bool = False
+    subagent_type: Optional[str] = None
+
+
+class CommandReport(BaseModel):
+    """A background command (Bash) or code run (ExecuteCode) in this thread
+    that ended on its own, completed or failed, or that the user stopped (no
+    other stop reports).
+
+    ``tool_call_id`` is the call that started it, whose card the caption
+    opens. ``failure_reason`` says why a failed one failed: ``exit`` (a
+    non-zero exit), ``lost`` (its computer stopped under it), ``vanished``
+    (no exit recorded while its computer ran) or ``after_turn_limit``
+    (stopped an hour after its turn ended, which the caption calls stopped
+    early).
+    """
+
+    kind: Literal["command_report"]
+    command_id: str
+    tool: Literal["Bash", "ExecuteCode"]
+    description: Optional[str] = None
+    status: Literal["completed", "failed", "stopped"]
+    failure_reason: Optional[FailureReason] = None
+    tool_call_id: Optional[str] = None
 
 
 # What a report-back turn announces, kept on its query row for display only.
@@ -307,7 +371,9 @@ class TaskReport(BaseModel):
 # shows a labelled row built from this instead. Only the server's own
 # report-back requests keep it: any other request has it dropped once parsed,
 # so a malformed one is still refused there.
-ReportSource = Annotated[AnalystReport | TaskReport, Field(discriminator="kind")]
+ReportSource = Annotated[
+    AnalystReport | TaskReport | CommandReport, Field(discriminator="kind")
+]
 
 
 class ChatRequest(BaseModel):
@@ -455,12 +521,16 @@ class ChatRequest(BaseModel):
     # into a 422 the caller cannot act on.
     reasoning_effort: Optional[ReasoningLevel] = Field(
         default=None,
-        description="Override reasoning effort for this request.",
+        description="Reasoning effort for this turn only. Omitted, the turn "
+        "runs the thread's own (PATCH /threads/{id}), else the user's "
+        "Settings. Never stored on the thread.",
     )
 
     fast_mode: Optional[bool] = Field(
         default=None,
-        description="When True, enables priority service tier for faster responses (Codex OAuth models only)",
+        description="When True, enables priority service tier for faster "
+        "responses (Codex OAuth models only), for this turn only. Omitted, the "
+        "turn runs the thread's own, else the user's Settings.",
     )
 
     # Internal: query type override (e.g., "system" for report-back invocations)
@@ -540,6 +610,23 @@ class ChatRequest(BaseModel):
     steer_job_id: Optional[str] = Field(
         default=None,
         description="The steer job this turn carries. Internal use only.",
+    )
+
+    # Internal: the price-target notice a market_target wake turn delivers,
+    # kept on the turn's query metadata so a replay can tell which target
+    # the turn is about without reading the alert text.
+    market_target: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Market target notice this wake turn delivers. "
+        "Internal use only.",
+    )
+
+    # Server-set: the notices a wakeup's wake turn delivers ({"v": 1, "notices":
+    # [...]}), kept on the turn's query metadata as ``market_target`` is, so
+    # history can name what fired without reading the model-facing block.
+    wakeup: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Wakeup notices this wake turn delivers. Server use only.",
     )
 
     # Server-stamped: the burst-guard ZSET member held by this request's

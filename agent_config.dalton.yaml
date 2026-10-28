@@ -20,6 +20,13 @@ llm:
 
 sandbox:
   provider: "docker"
+  # Product decision 2 (roadmap §6): SSH computers, the SSH gateway and user
+  # SSH keys stay closed in Dalton — code merged, entry off. `offered_providers`
+  # is the one switch both the create API (`kind not in creatable_providers()`
+  # → 400) and the provider picker (`GET /computers/providers`) read; with it
+  # empty only Docker exists. The gateway itself runs only where
+  # SSH_GATEWAY_ADDRESS is set, which Dalton does not set.
+  offered_providers: []
   docker:
     memory_limit: "3g"
     cpu_count: 2.0

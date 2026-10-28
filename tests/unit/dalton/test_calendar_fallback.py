@@ -775,8 +775,10 @@ async def test_sector_dateless_fallback_failure_shows_no_data(monkeypatch):
 
     content, artifact = await market_overview.fetch_sector_performance(date=None)
 
-    assert "No sector performance data available" in content
+    # B2: the exhausted quota is named, not swallowed as an empty table.
+    assert "额度已用完" in content
     assert artifact["sectors"] == []
+    assert artifact["error"] == "fmp_quota_exhausted"
 
 
 @pytest.mark.asyncio
@@ -790,8 +792,11 @@ async def test_sector_dated_failure_stays_fmp_only(monkeypatch):
         target_date="2026-10-23"
     )
     yf_cls.return_value.get_sector_performance.assert_not_awaited()
-    assert "No sector performance data available" in content
+    # B2: a dated request reports the quota, never yfinance's today snapshot.
+    assert "额度已用完" in content
+    assert "2026-10-23" in content
     assert artifact["sectors"] == []
+    assert artifact["error"] == "fmp_quota_exhausted"
 
 
 @pytest.mark.asyncio

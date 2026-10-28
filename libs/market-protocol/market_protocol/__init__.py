@@ -25,6 +25,7 @@ from .models import (
 from .series import build_series, served_display_decimals, served_display_unit
 from .symbology import (
     CARET_INDEX_REGIONS,
+    InvalidSymbol,
     display_decimals_for,
     display_spelling,
     exchange_code,
@@ -37,6 +38,7 @@ from .symbology import (
     to_canonical,
     to_display,
     to_legacy_api,
+    to_major_units,
     vendor_spelling,
     vendor_symbol,
     venue_suffixes,
@@ -50,6 +52,7 @@ __all__ = [
     "FeedScope",
     "Gap",
     "InstrumentRef",
+    "InvalidSymbol",
     "MarketPhase",
     "OhlcvBar",
     "Quote",
@@ -73,6 +76,7 @@ __all__ = [
     "to_canonical",
     "to_display",
     "to_legacy_api",
+    "to_major_units",
     "vendor_spelling",
     "vendor_symbol",
     "venue_suffixes",

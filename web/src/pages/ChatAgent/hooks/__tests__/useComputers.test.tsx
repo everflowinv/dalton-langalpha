@@ -15,8 +15,10 @@ import { QueryClient } from '@tanstack/react-query';
 import { act, waitFor } from '@testing-library/react';
 
 import { renderHookWithProviders } from '@/test/utils';
+import { runAuthResets } from '@/lib/authResets';
 import { queryKeys } from '@/lib/queryKeys';
 import type { Workspace } from '@/types/api';
+import type { StatusFrame } from '../../utils/api/statusStream';
 
 vi.mock('../../utils/api', () => ({
   getComputers: vi.fn(),
@@ -25,9 +27,11 @@ vi.mock('../../utils/api', () => ({
 }));
 
 import { getComputers, streamComputerEvents, streamWorkspaceEvents } from '../../utils/api';
-import { useComputerStatusFanout } from '../useComputers';
+import { removeComputerRow, useComputerStatusFanout } from '../useComputers';
+import { usePrepareStage } from '../computerPreparation';
 
 const mockGetComputers = getComputers as Mock;
+type ComputerOnFrame = (frame: StatusFrame) => void;
 const mockStreamComputer = streamComputerEvents as Mock;
 const mockStreamWorkspace = streamWorkspaceEvents as Mock;
 
@@ -75,6 +79,7 @@ function mount(workspaces: Workspace[] = WORKSPACES) {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  runAuthResets();
   mockStreamComputer.mockImplementation(async () => {});
   mockStreamWorkspace.mockImplementation(async () => {});
 });
@@ -90,16 +95,16 @@ describe('useComputerStatusFanout', () => {
 
   it('fans one transition out to every workspace on the machine', async () => {
     mockGetComputers.mockResolvedValue(computer('stopping'));
-    let emit: ((status: string) => void) | null = null;
-    mockStreamComputer.mockImplementation(async (_id: string, onStatus: (s: string) => void) => {
-      emit = onStatus;
+    let emit: ComputerOnFrame | null = null;
+    mockStreamComputer.mockImplementation(async (_id: string, onFrame: ComputerOnFrame) => {
+      emit = onFrame;
       await new Promise(() => {}); // stay open, like a live stream
     });
 
     const { queryClient } = mount();
 
     await waitFor(() => expect(emit).not.toBeNull());
-    emit!('stopped');
+    emit!({ status: 'stopped' });
 
     const list = queryClient.getQueryData<{ workspaces: Workspace[] }>(LIST_KEY);
     expect(list?.workspaces.map((w) => w.status)).toEqual([
@@ -113,11 +118,29 @@ describe('useComputerStatusFanout', () => {
     expect(computers?.computers[0].status).toBe('stopped');
   });
 
-  it.each(['stopped', 'creating'])('holds no stream open for a %s machine awaiting start', async (status) => {
-    mockGetComputers.mockResolvedValue(computer(status));
+  it('holds no stream open for a stopped machine awaiting start', async () => {
+    mockGetComputers.mockResolvedValue(computer('stopped'));
     mount();
     await waitFor(() => expect(mockGetComputers).toHaveBeenCalled());
     expect(mockStreamComputer).not.toHaveBeenCalled();
+  });
+
+  it('watches a creating machine, whose preparation runs without anyone acting', async () => {
+    mockGetComputers.mockResolvedValue(computer('creating'));
+    mount([]);
+    await waitFor(() => expect(mockStreamComputer).toHaveBeenCalledTimes(1));
+    expect(mockStreamComputer.mock.calls[0][0]).toBe(COMPUTER_ID);
+  });
+
+  it("holds a new sandbox's build stage from the stream", async () => {
+    mockGetComputers.mockResolvedValue(computer('starting'));
+    mockStreamComputer.mockImplementation(async (_id: string, onFrame: ComputerOnFrame) => {
+      onFrame({ status: 'starting', stage: 'tools' });
+      await new Promise(() => {});
+    });
+    mount([]);
+    const { result } = renderHookWithProviders(() => usePrepareStage(COMPUTER_ID));
+    await waitFor(() => expect(result.current).toBe('tools'));
   });
 
   it('holds no stream open for a machine that is already running', async () => {
@@ -258,8 +281,8 @@ describe('useComputerStatusFanout', () => {
 
   it('does not reconcile when the close followed a terminal status', async () => {
     mockGetComputers.mockResolvedValue(computer('starting'));
-    mockStreamComputer.mockImplementation(async (_id: string, onStatus: (s: string) => void) => {
-      onStatus('running');
+    mockStreamComputer.mockImplementation(async (_id: string, onFrame: ComputerOnFrame) => {
+      onFrame({ status: 'running' });
     });
     const { queryClient } = mount();
     const invalidate = vi.spyOn(queryClient, 'invalidateQueries');
@@ -277,6 +300,59 @@ describe('useComputerStatusFanout', () => {
     expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.computers.storage(COMPUTER_ID) });
   });
 
+  // The server settles a failed start back to stopped and keeps why on the
+  // row before it sends the frame, so the row is read again rather than
+  // left without its reason until some later read: 'error' from a start
+  // route, 'stopped' from a start a chat turn made, which reverts its claim.
+  it.each(['error', 'stopped'])('reads the row back after a failed start ending %s, which brings its persisted failure', async (frameStatus) => {
+    mockGetComputers.mockResolvedValue(computer('starting'));
+    mockStreamComputer.mockImplementation(async (_id: string, onFrame: ComputerOnFrame) => {
+      mockGetComputers.mockResolvedValue({
+        ...computer('stopped'),
+        computers: [{
+          ...computer('stopped').computers[0],
+          start_failure: { code: 'root_dir', message: 'The folder cannot be used.', owner: null, remedy: 'reinstall', at: '2026-10-25T16:40:00Z' },
+        }],
+      });
+      onFrame(frameStatus === 'error' ? { status: 'error', error: 'The folder cannot be used.' } : { status: 'stopped' });
+      // Held open past the render the frame causes, which tears the watch down.
+      await new Promise(() => {});
+    });
+    const { queryClient } = mount();
+    const invalidate = vi.spyOn(queryClient, 'invalidateQueries');
+
+    await waitFor(() => expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.computers.lists() }));
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.workspaces.lists() });
+    await waitFor(() => {
+      const row = queryClient.getQueryData<{ computers: Array<{ status: string; start_failure?: { remedy: string } }> }>(
+        queryKeys.computers.lists(),
+      )?.computers[0];
+      expect(row?.status).toBe('stopped');
+      expect(row?.start_failure?.remedy).toBe('reinstall');
+    });
+  });
+
+  it('keeps the failure the frame brought when the re-read fails', async () => {
+    mockGetComputers.mockResolvedValue(computer('starting'));
+    mockStreamComputer.mockImplementation(async (_id: string, onFrame: ComputerOnFrame) => {
+      mockGetComputers.mockRejectedValue(new Error('offline'));
+      onFrame({
+        status: 'error',
+        error: 'The folder is held.',
+        start_failure: { code: 'folder_marked', message: 'The folder is held.', owner: 'other-1', remedy: 'reinstall', at: '2026-10-26T04:00:00Z' },
+      });
+      await new Promise(() => {});
+    });
+    const { queryClient } = mount();
+
+    await waitFor(() => {
+      const row = queryClient.getQueryData<{ computers: Array<{ start_failure?: { remedy: string } | null }> }>(
+        queryKeys.computers.lists(),
+      )?.computers[0];
+      expect(row?.start_failure?.remedy).toBe('reinstall');
+    });
+  });
+
   it('aborts its streams on unmount', async () => {
     mockGetComputers.mockResolvedValue(computer('starting'));
     let signal: AbortSignal | null = null;
@@ -290,5 +366,22 @@ describe('useComputerStatusFanout', () => {
     expect(signal!.aborted).toBe(false);
     unmount();
     expect(signal!.aborted).toBe(true);
+  });
+});
+
+describe('removeComputerRow', () => {
+  it('takes the machine off the cached list and counts it out, ahead of the refetch', () => {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { gcTime: Infinity } } });
+    const key = queryKeys.computers.lists();
+    const [kept] = computer('running').computers;
+    queryClient.setQueryData(key, { computers: [kept, { ...kept, computer_id: 'second', is_primary: false }], total: 2 });
+
+    removeComputerRow(queryClient, 'second');
+    expect(queryClient.getQueryData(key)).toEqual({ computers: [kept], total: 1 });
+
+    // A machine the list no longer holds leaves it as it is.
+    const before = queryClient.getQueryData(key);
+    removeComputerRow(queryClient, 'second');
+    expect(queryClient.getQueryData(key)).toBe(before);
   });
 });

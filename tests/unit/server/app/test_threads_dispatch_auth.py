@@ -407,6 +407,45 @@ async def test_dispatch_retransmit_race_adopts_existing_run(monkeypatch):
     stubs.gate.retract.assert_not_awaited()
 
 
+def _steering_gen(**kwargs):
+    """A dispatched generator whose hand-off went into a running turn."""
+
+    async def _gen():
+        from src.server.handlers.chat.request_prep import HandOffSteered
+
+        yield HandOffSteered("run-live", "job-1")
+
+    return _gen()
+
+
+@pytest.mark.asyncio
+async def test_a_steered_hand_off_names_the_run_and_its_steer(monkeypatch):
+    monkeypatch.setattr("src.config.settings.HOST_MODE", "platform")
+    monkeypatch.setenv("INTERNAL_SERVICE_TOKEN", TOKEN)
+
+    with _stub_workflow() as stubs, patch(
+        "src.server.handlers.chat.astream_ptc_workflow", new=_steering_gen
+    ):
+        resp = await _post(
+            _app(),
+            body={
+                **_BODY,
+                "origin_home_thread_id": "cos-1",
+                "origin_dispatch_gen": "g-1",
+            },
+            headers={"X-Dispatch": "background", "X-Service-Token": TOKEN},
+        )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert (body["status"], body["run_id"], body["steer_id"]) == (
+        "steered",
+        "run-live",
+        "job-1",
+    )
+    stubs.consume.assert_not_called()
+
+
 @pytest.mark.asyncio
 async def test_no_dispatch_header_foreground_unchanged(monkeypatch):
     """Without X-Dispatch nothing changes: plain foreground SSE."""

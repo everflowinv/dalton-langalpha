@@ -144,6 +144,8 @@ async def test_run_subagent_graph_config_invariants():
         "__pregel_stream": object(),
         "__pregel_send": object(),
         "__pregel_task_id": "parent-task",
+        "__pregel_resuming": True,
+        "__pregel_replay_state": object(),
         "user_id": "user-9",
         "run_name": "keep-me",
     }
@@ -177,6 +179,9 @@ async def test_run_subagent_graph_config_invariants():
     # writes checkpoints into the thread's root namespace).
     assert "__pregel_scratchpad" not in conf
     assert "__pregel_stream" not in conf
+    # The launcher's resume flag would skip the child's prompt.
+    assert "__pregel_resuming" not in conf
+    assert "__pregel_replay_state" not in conf
     assert conf["__pregel_task_id"] == "parent-task"
     assert conf["__pregel_send"] is base["__pregel_send"]
     # Recursion limit + metadata mirror the parent's with_config.

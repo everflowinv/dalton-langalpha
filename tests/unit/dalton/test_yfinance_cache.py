@@ -18,8 +18,11 @@ def _touch_all_three_caches(tag: str) -> dict[str, str]:
     assert tz.lookup(f"SYM_{tag}") == "America/New_York"
 
     cookie = yf_cache.get_cookie_cache()
-    cookie.store(f"strat_{tag}", {"tag": tag})
-    assert cookie.lookup(f"strat_{tag}")["cookie"] == {"tag": tag}
+    # A cookie shaped as yfinance's own: the A3 guard (upstream 982b0a5cd)
+    # reads one without the A3 path as a miss and deletes it, so the fork
+    # test's sentinel has to be a valid entry.
+    cookie.store(f"strat_{tag}", {"cache_key": {"/": {"A3": f"a3-{tag}"}}})
+    assert cookie.lookup(f"strat_{tag}")["cookie"]["cache_key"]["/"]["A3"] == f"a3-{tag}"
 
     isin = yf_cache.get_isin_cache()
     isin.store(f"ISIN_{tag}", f"SYM_{tag}")
@@ -69,6 +72,32 @@ def test_fork_rebuilds_all_three_caches_onto_child_databases():
         assert child_info[key] != parent_info[key]
         assert os.path.basename(os.path.dirname(child_info[key])) == child_info["pid"]
     assert yf_cache.get_tz_cache().lookup("SYM_child") is None
+
+
+def _child_cookie_guard(conn):
+    try:
+        conn.send(bool(getattr(yf_cache.get_cookie_cache(), "checks_a3", False)))
+    finally:
+        conn.close()
+
+
+def test_fork_keeps_the_a3_cookie_guard():
+    """The fork reset drops the cookie cache; the child must get the A3 guard back."""
+    import src.data_client.yfinance.yahoo  # noqa: F401  (installs the guard in the parent)
+
+    assert getattr(yf_cache.get_cookie_cache(), "checks_a3", False)
+    ctx = mp.get_context("fork")
+    recv_conn, send_conn = ctx.Pipe(duplex=False)
+    proc = ctx.Process(target=_child_cookie_guard, args=(send_conn,))
+    proc.start()
+    send_conn.close()
+    try:
+        guarded_in_child = recv_conn.recv()
+    finally:
+        recv_conn.close()
+        proc.join(timeout=10)
+    assert proc.exitcode == 0
+    assert guarded_in_child is True
 
 
 def test_cleanup_stale_cache_dirs_removes_only_exited_pid_dirs(tmp_path, monkeypatch):

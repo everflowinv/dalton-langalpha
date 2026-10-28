@@ -63,6 +63,13 @@ SUBAGENT_STOP_GRACE_S = 60.0
 # does: LangGraph awaits its cancelled node tasks with no bound.
 SUBAGENT_CLOSE_TIMEOUT_S = 30.0
 
+# The launching run's resume and replay flags, which LangGraph hands every task
+# of that run. A subagent takes both from its own input: inherited from a turn
+# that answered an interrupt, ``__pregel_resuming`` skips the prompt of a
+# follow-up to a task that already has state, and from a retried turn,
+# ``__pregel_replay_state`` loads the task's state from before the retry point.
+PARENT_RUN_STATE_KEYS = frozenset({"__pregel_resuming", "__pregel_replay_state"})
+
 
 
 
@@ -715,7 +722,11 @@ def _create_task_tool(
         # callbacks are kept out by detaching, as on the async path.
         raw_parent_config = get_config()
         parent_config = {k: v for k, v in raw_parent_config.items() if k != "callbacks"}
-        parent_configurable = parent_config.get("configurable", {})
+        parent_configurable = {
+            k: v
+            for k, v in parent_config.get("configurable", {}).items()
+            if k not in PARENT_RUN_STATE_KEYS
+        }
 
         if checkpointer:
             # Get task_id from BackgroundTask via ContextVar
@@ -817,7 +828,11 @@ def _create_task_tool(
         parent_config: dict[str, Any] = {
             k: v for k, v in raw_parent_config.items() if k != "callbacks"
         }
-        parent_configurable: dict[str, Any] = parent_config.get("configurable", {})
+        parent_configurable: dict[str, Any] = {
+            k: v
+            for k, v in parent_config.get("configurable", {}).items()
+            if k not in PARENT_RUN_STATE_KEYS
+        }
 
         def _compose_callbacks() -> list[Any]:
             bg_tracker = current_background_token_tracker.get(None)

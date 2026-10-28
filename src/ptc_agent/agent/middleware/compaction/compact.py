@@ -10,11 +10,12 @@ idle pass does.
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 from langchain_core.messages import AnyMessage
 
@@ -23,6 +24,7 @@ from langchain.chat_models import BaseChatModel
 from src.config.settings import get_compaction_timeout
 from src.llms import LLM, create_llm
 from src.llms.model_spec import summary_reasoning_effort
+from src.llms.provider_compaction import readable_text
 
 from ptc_agent.agent.state import ensure_message_ids
 from ptc_agent.agent.middleware.compaction.types import (
@@ -35,6 +37,8 @@ from ptc_agent.agent.middleware.compaction.summary_request import (
     build_summary_request,
 )
 from ptc_agent.agent.middleware.compaction.summarize import (
+    FIRST_SHARE,
+    PROVIDER_LEAD,
     Progress,
     Summary,
     awrite_summary,
@@ -42,15 +46,24 @@ from ptc_agent.agent.middleware.compaction.summarize import (
     preparer,
     server_summary,
 )
+from ptc_agent.agent.middleware.compaction.measure import (
+    estimate_for,
+    keep_cutoff,
+    keep_tokens_for,
+)
 from ptc_agent.agent.middleware.compaction.utils import (
     build_compaction_event,
     build_summary_message,
     compacted_skills,
     count_tokens_tiktoken,
-    find_group_safe_cutoff,
     get_effective_messages,
     partition_at_cutoff,
+    read_ahead,
     summarized_span,
+    target_cost,
+)
+from ptc_agent.agent.middleware.file_operations.multimodal_strip import (
+    MultimodalStripMiddleware,
 )
 from ptc_agent.agent.middleware.compaction.model import resolve_compaction_client
 from ptc_agent.agent.middleware.compaction.notes import anotes_pointer
@@ -59,6 +72,7 @@ from ptc_agent.agent.middleware.compaction.offloading import (
     aoffload_base64_content,
     offload_view,
     recorded_offloads,
+    removed_attachments,
     select_offloads,
     tool_call_ids,
 )
@@ -67,6 +81,7 @@ from ptc_agent.config.agent import CredentialSource
 from ptc_agent.agent.transcript.pointer import (
     TranscriptTurns,
     aexport_transcript,
+    shell_reads_transcripts,
     summary_span,
     transcript_target,
 )
@@ -81,6 +96,24 @@ logger = logging.getLogger(__name__)
 #: that crossed it, however large its last tool result, usually reaches it
 #: whole.
 _SUMMARY_HEADROOM = 50_000
+
+#: The refusal of a /compact whose view is no longer than what a summary keeps.
+NOTHING_TO_COMPACT = "Nothing to compact yet: the conversation fits in what compaction keeps."
+
+
+class NativeAnswer(NamedTuple):
+    """What a provider's own compaction answered with (see
+    ``src.llms.provider_compaction.native_answer``), and the route that
+    wrote it."""
+
+    answer: dict[str, Any]
+    origin: str | None
+
+
+#: The agent's own model summarizing the messages it is given, from its own
+#: request: its provider's compaction, or the summary it writes as text.
+#: Raises when it writes no summary.
+Own = Callable[[list[AnyMessage]], Awaitable[NativeAnswer | str]]
 
 
 @dataclass(frozen=True)
@@ -103,16 +136,19 @@ class Compaction:
         """The state update that installs it over ``state``.
 
         Summarized calls never reach the model again, so their recorded
-        offload ids are dropped. The cached token counts measured the view
+        offload ids are dropped, and so are the summarized messages whose
+        attachments were removed. The cached token counts measured the view
         before it: left in place, the next call would read them as still over
         the threshold and compact again at once.
         """
         live = tool_call_ids(self.preserved)
         args, reads = recorded_offloads(state)
+        kept = {msg.id for msg in self.preserved}
         return {
             "_summarization_event": self.event,
             "_offloaded_tool_call_ids": args & live,
             "_offloaded_read_result_ids": reads & live,
+            "_removed_attachment_ids": removed_attachments(state) & kept,
             "_cached_input_tokens": 0,
             "_cached_output_tokens": 0,
         }
@@ -164,11 +200,13 @@ class Summarizer:
         notes_dir: str | None = None,
         window: Window,
         progress: Progress | None = None,
+        own: Own | None = None,
     ) -> Compaction:
         """Summarize ``view`` before ``cutoff``, ``messages`` being the
-        agent's checkpoint list (what ``window`` trimmed of it aside), from
-        this model, then the next one (see ``_next``), then the server (see
-        ``summarize``).
+        agent's checkpoint list (what ``window`` trimmed of it aside), by
+        ``own`` when given (the agent's own model, from its own request),
+        else from this model, then the next one (see ``_next``), then the
+        server (see ``summarize``).
 
         The transcript is saved first: the summary cites its turn files and
         ends pointing at it only if that save lands and ``workspace_id``'s
@@ -200,20 +238,26 @@ class Summarizer:
         # the listing never holds the compaction past it, and it is dropped
         # with a summary that fails.
         listing = asyncio.create_task(anotes_pointer(backend, notes_dir, remaining))
+        server = functools.partial(
+            server_summary,
+            to_summarize,
+            preserved,
+            raw_messages=messages,
+            turns=turns,
+            window=window,
+        )
         try:
-            summary = await awrite_summary(
+            # The agent's model gets the summary model's share, leaving the
+            # summarizer a real call when it writes none.
+            summary = await _own_summary(own, to_summarize, server, remaining * FIRST_SHARE)
+            remaining = budget - (time.monotonic() - started)
+            summary = summary or await awrite_summary(
                 model=self.model,
                 fallback=self._next(fallback),
                 prepare=preparer(
                     to_summarize, limit=self.limit, counter=self.counter, render=render
                 ),
-                server=lambda: server_summary(
-                    to_summarize,
-                    preserved,
-                    raw_messages=messages,
-                    turns=turns,
-                    window=window,
-                ),
+                server=server,
                 budget=remaining,
                 progress=progress,
             )
@@ -242,6 +286,36 @@ class Summarizer:
         if self.fallback is not None and not is_other_model(agent_model, self.fallback):
             return self.fallback
         return agent_model
+
+
+async def _own_summary(
+    own: Own | None,
+    to_summarize: list[AnyMessage],
+    server: Callable[..., Summary],
+    budget: float,
+) -> Summary | None:
+    """``own``'s summary within ``budget``, or None for the summarizer to
+    write one: only a cancellation escapes, as in ``awrite_summary``. An
+    answer only its provider can read takes ``server``'s digest as its text."""
+    if own is None:
+        return None
+    try:
+        async with asyncio.timeout(budget):
+            written = await own(to_summarize)
+    except Exception as e:
+        logger.warning("[Compaction] own model's summary failed (%s: %s)", type(e).__name__, e)
+        return None
+    if isinstance(written, str):
+        return Summary(written, "self", to_summarize)
+    text = readable_text(written.answer)
+    if text is not None:
+        covered = to_summarize
+    else:
+        digest = server(lead=PROVIDER_LEAD)
+        text, covered = digest.text, digest.covered
+    return Summary(
+        text, "provider", covered, native=written.answer, origin=written.origin
+    )
 
 
 def build_summary_event(
@@ -278,6 +352,8 @@ def build_summary_event(
         skills=compacted_skills(to_summarize, preserved, user_skills),
         source=summary.source,
         notes=notes,
+        native=summary.native,
+        origin=summary.origin,
     )
     return build_compaction_event(
         raw_messages=raw_messages,
@@ -293,13 +369,12 @@ async def compact_messages(
     config: AgentConfig,
     *,
     thread_id: str,
-    keep_messages: int = 5,
     backend: SandboxBackend | None = None,
     workspace_id: str | None = None,
     notes_dir: str | None = None,
 ) -> Compaction:
-    """Manual /compact: summarize all but the last ``keep_messages`` of the
-    view, ``messages`` being the thread's checkpoint list and ``state`` its
+    """Manual /compact: summarize all but the tail automatic compaction
+    keeps of the view, ``messages`` being the thread's checkpoint list and ``state`` its
     values. The user's main model is tried when the summary model fails.
     ``notes_dir`` is the thread's scratchpad notes folder when the
     scratchpad feature is on.
@@ -314,29 +389,39 @@ async def compact_messages(
         raise ValueError("No messages to compact")
     ensure_message_ids(messages)
     transcript = transcript_target(backend, thread_id)
-    view = offload_view(
+    view = await offload_view(
         messages,
         state,
         max_length=config.compaction.truncate_args_max_length,
         transcript=transcript,
+        shell=shell_reads_transcripts(backend),
     )
-    if len(view) <= keep_messages:
-        raise ValueError(
-            f"Not enough messages to compact. Have {len(view)}, "
-            f"need more than {keep_messages} to preserve."
-        )
-    cutoff = find_group_safe_cutoff(view, len(view) - keep_messages)
+    summarizer = Summarizer.for_agent(config)
+    main = _main_client(config)
+    settings = config.compaction
+    # The cutoff counts attachments, on the server's loop, as the strip the
+    # agent runs judges them for its model, as the automatic path does.
+    await read_ahead(view)
+    strip = MultimodalStripMiddleware.for_config(config)
+    cost = target_cost(strip.receives(main), strip.pdf_page_tokens(main))
+    cutoff = keep_cutoff(
+        view,
+        tokens=keep_tokens_for(
+            main, settings.keep_tokens, settings.claude_keep_tokens, settings.token_threshold
+        ),
+        estimate=estimate_for(main, summarizer.counter, cost),
+    )
     if cutoff <= 0:
-        raise ValueError("Cannot determine valid cutoff point for compaction")
+        raise ValueError(NOTHING_TO_COMPACT)
 
-    return await Summarizer.for_agent(config).compact(
+    return await summarizer.compact(
         messages,
         view,
         cutoff,
         backend=backend,
         workspace_id=workspace_id,
         transcript=transcript,
-        fallback=_main_client(config),
+        fallback=main,
         thread_id=thread_id,
         notes_dir=notes_dir,
         window=Window.of(state),
@@ -353,7 +438,7 @@ def _summary_fallback(config: AgentConfig) -> BaseChatModel | None:
     except for a user on their own key or subscription, whose summary never
     moves to a platform key."""
     client = config.client_for_role("compaction_fallback")
-    names = (config.llm.fallback if config.llm else None) or []
+    names = config.llm.fallbacks_for(config.llm.compaction_name) if config.llm else []
     if client is not None or not names or config.credential_source in (
         CredentialSource.OAUTH,
         CredentialSource.BYOK,

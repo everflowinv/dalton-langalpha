@@ -25,6 +25,8 @@ ROW_KEYS = {
     "status",
     "interrupt_reason",
     "metadata",
+    "created_at",
+    "usage_settled_at",
 }
 
 CHUNK = {"event": "message_chunk", "data": {"agent": "ptc", "content": "m"}}

@@ -33,7 +33,7 @@
   background: var(--color-border-muted);
   border: 1px solid var(--color-border-muted);
   cursor: pointer;
-  transition: all 0.15s;
+  transition: all var(--motion-quick) var(--ease-out);
   line-height: 1.4;
 }
 
@@ -224,7 +224,7 @@
   border-radius: 6px;
   background: var(--color-sheet-paper);
   box-shadow: 0 0 0 1px var(--color-border-muted);
-  transition: box-shadow 0.15s;
+  transition: box-shadow var(--motion-quick) var(--ease-out);
 }
 
 .pdf-thumb-paper canvas {

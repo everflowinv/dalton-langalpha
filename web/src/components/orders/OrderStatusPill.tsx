@@ -7,6 +7,7 @@ import {
   CheckCircle2,
   CircleDot,
   Clock,
+  CornerUpRight,
   HelpCircle,
   MinusCircle,
   Send,
@@ -24,9 +25,9 @@ import { orderStatusLabel, orderStatusShortLabel } from './status';
  * the other would read as two different orders.
  */
 
-type StatusTone = 'muted' | 'warning' | 'profit' | 'loss';
+export type OrderStatusTone = 'muted' | 'warning' | 'profit' | 'loss';
 
-const TONE: Record<StatusTone, { color: string; bg: string }> = {
+const TONE: Record<OrderStatusTone, { color: string; bg: string }> = {
   muted: { color: 'var(--color-text-tertiary)', bg: 'var(--color-bg-tag)' },
   warning: { color: 'var(--color-warning)', bg: 'var(--color-warning-soft)' },
   profit: { color: 'var(--color-profit)', bg: 'var(--color-profit-soft)' },
@@ -34,7 +35,7 @@ const TONE: Record<StatusTone, { color: string; bg: string }> = {
 };
 
 interface StatusMeta {
-  tone: StatusTone;
+  tone: OrderStatusTone;
   icon: React.ComponentType<{ className?: string }>;
 }
 
@@ -61,6 +62,7 @@ const STATUS_META: Record<OrderStatus, StatusMeta> = {
   filled: { tone: 'profit', icon: CheckCircle2 },
   cancelled: { tone: 'muted', icon: MinusCircle },
   rejected_by_vendor: { tone: 'loss', icon: AlertCircle },
+  handed_off: { tone: 'muted', icon: CornerUpRight },
   failed: { tone: 'loss', icon: AlertCircle },
   unknown: { tone: 'muted', icon: HelpCircle },
 };
@@ -87,6 +89,18 @@ const RECEIPT_STATUS_META: Partial<Record<OrderStatus, Partial<StatusMeta>>> = {
   unknown: { tone: 'warning' },
 };
 
+/**
+ * The tone a status wears on a surface, for a card that draws the verdict in
+ * its own type rather than as this pill.
+ */
+export function orderStatusTone(
+  status: OrderStatus,
+  surface: 'ledger' | 'receipt' | 'detail' = 'ledger',
+): OrderStatusTone {
+  const base = STATUS_META[status] ?? STATUS_META.unknown;
+  return (surface === 'receipt' && RECEIPT_STATUS_META[status]?.tone) || base.tone;
+}
+
 export function OrderStatusPill({
   status,
   mode,
@@ -103,19 +117,20 @@ export function OrderStatusPill({
   surface?: 'ledger' | 'receipt' | 'detail';
 }): React.ReactElement {
   const { t } = useTranslation();
-  const base = STATUS_META[status] ?? STATUS_META.unknown;
-  const meta =
-    surface === 'receipt' ? { ...base, ...(RECEIPT_STATUS_META[status] ?? {}) } : base;
+  const icon =
+    (surface === 'receipt' && RECEIPT_STATUS_META[status]?.icon) ||
+    (STATUS_META[status] ?? STATUS_META.unknown).icon;
+  const tone = TONE[orderStatusTone(status, surface)];
   const { key, params } = orderStatusLabel(status, mode, vendorLabel);
   const sentence = t(key, params);
   const short = surface === 'ledger';
   return (
     <StatusPill
-      icon={meta.icon}
+      icon={icon}
       label={short ? t(orderStatusShortLabel(status, mode)) : sentence}
       title={short ? sentence : undefined}
-      color={TONE[meta.tone].color}
-      bg={TONE[meta.tone].bg}
+      color={tone.color}
+      bg={tone.bg}
       testid={`order-status-${status}`}
     />
   );

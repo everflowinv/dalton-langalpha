@@ -46,14 +46,16 @@ describe('MessageDeliveryCard', () => {
   });
 
   it('wears a different colour for every verdict short of sent', () => {
+    // The tone names the ink (termCard.css): success for a clean send, the
+    // danger ink for a failed one, never the P&L loss red.
     const colours = (['sent', 'partial', 'failed', 'unknown'] as const).map((status) => {
       const { unmount } = render(<MessageDeliveryCard artifact={artifact({ status })} toolArgs={ARGS} />);
-      const colour = screen.getByTestId(`delivery-status-${status}`).style.color;
+      const colour = screen.getByTestId(`delivery-status-${status}`).dataset.tone;
       unmount();
       return colour;
     });
-    expect(colours[0]).toBe('var(--color-success)');
-    expect(colours[2]).toBe('var(--color-icon-danger)');
+    expect(colours[0]).toBe('success');
+    expect(colours[2]).toBe('danger');
     expect(new Set([colours[0], colours[1], colours[2]]).size).toBe(3);
     expect(colours[3]).not.toBe(colours[0]);
   });

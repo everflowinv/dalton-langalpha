@@ -590,7 +590,18 @@ async def test_execute_tells_the_summary_how_the_run_ended(payload, told):
     _seed_dispatched(cache, "cos-1", ["ptc-1"])
     h = _ExecHarness(cache, run_statuses=("completed",))
     await h.run(_job("ptc-1", **payload))
-    assert h.post.await_args.kwargs["final_status"] == told
+    assert h.post.await_args.args[1].final_status == told
+
+
+@pytest.mark.asyncio
+async def test_execute_reports_the_run_its_job_names():
+    """The run rides the job the finalize enqueued, so the report reads no
+    row to find it."""
+    cache = _FakeCache()
+    _seed_dispatched(cache, "cos-1", ["ptc-1"])
+    h = _ExecHarness(cache, run_statuses=("completed",))
+    await h.run(_job("ptc-1"))
+    assert h.post.await_args.args[1].run_id == "ptc-run-1"
 
 
 @pytest.mark.asyncio

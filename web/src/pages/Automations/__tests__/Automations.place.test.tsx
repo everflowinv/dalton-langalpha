@@ -48,7 +48,7 @@ afterEach(() => {
 
 const label = (key: string, opts?: Record<string, unknown>) => i18n.t(key, opts);
 
-/** A row that runs in All workspaces, which names Home's id. */
+/** A row that runs in the Chief of Staff, which names Home's id. */
 const IN_HOME: Automation = {
   automation_id: 'auto-1',
   user_id: 'user-1',
@@ -95,13 +95,13 @@ async function startFrom(templateKey: string) {
 const created = () => vi.mocked(api.createAutomation).mock.calls[0][0] as AutomationPayload;
 
 describe('where an automation runs', () => {
-  it("opens a row naming Home's id as All workspaces and saves that id, with no agent mode", async () => {
+  it("opens a row naming Home's id as the Chief of Staff and saves that id, with no agent mode", async () => {
     renderAt('/automations?id=auto-1', [IN_HOME]);
     const pane = (await screen.findByRole('heading', { level: 2, name: IN_HOME.name })).closest('article')!;
-    expect(within(pane).getByText(new RegExp(label('agents.allWorkspaces')))).toBeInTheDocument();
+    expect(within(pane).getByText(new RegExp(label('agents.chiefOfStaff')))).toBeInTheDocument();
 
     fireEvent.click(within(pane).getByRole('button', { name: label('automation.edit') }));
-    expect(await screen.findByText(new RegExp(`^${label('agents.allWorkspaces')} · `))).toBeInTheDocument();
+    expect(await screen.findByText(new RegExp(`^${label('agents.chiefOfStaff')} · `))).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: label('automation.saveChanges') }));
 
     await waitFor(() => expect(api.updateAutomation).toHaveBeenCalled());
@@ -111,7 +111,7 @@ describe('where an automation runs', () => {
     expect(payload).not.toHaveProperty('agent_mode');
   });
 
-  it("creates a blank automation in All workspaces with Home's id", async () => {
+  it("creates a blank automation in the Chief of Staff with Home's id", async () => {
     await startFrom('automation.blankAutomation');
     fireEvent.click(screen.getByRole('button', { name: label('common.create') }));
 
@@ -129,7 +129,7 @@ describe('where an automation runs', () => {
     expect(api.createAutomation).not.toHaveBeenCalled();
     fireEvent.click(trigger);
     const listbox = await screen.findByRole('listbox');
-    expect(within(listbox).getAllByRole('option').map((o) => o.textContent)).toEqual([label('agents.allWorkspaces'), 'Research']);
+    expect(within(listbox).getAllByRole('option').map((o) => o.textContent)).toEqual([label('agents.chiefOfStaff'), 'Research']);
     fireEvent.click(within(listbox).getByRole('option', { name: 'Research' }));
     fireEvent.click(screen.getByRole('button', { name: label('common.create') }));
 
@@ -157,7 +157,7 @@ describe("while Home's request is out", () => {
     holdHome();
     await startFrom('automation.blankAutomation');
     fireEvent.click(screen.getByRole('button', { name: new RegExp(label('automation.moreOptions')) }));
-    fireEvent.click(screen.getByRole('button', { name: new RegExp(label('agents.allWorkspaces')) }));
+    fireEvent.click(screen.getByRole('button', { name: new RegExp(label('agents.chiefOfStaff')) }));
     fireEvent.click(within(await screen.findByRole('listbox')).getByRole('option', { name: 'Research' }));
     fireEvent.click(screen.getByRole('button', { name: label('common.create') }));
 
@@ -165,7 +165,7 @@ describe("while Home's request is out", () => {
     expect(created().workspace_id).toBe('ws-1');
   });
 
-  it('opens an edit once Home answers, reading a row in Home as All workspaces, unchanged', async () => {
+  it('opens an edit once Home answers, reading a row in Home as the Chief of Staff, unchanged', async () => {
     const answer = holdHome();
     renderAt('/automations?id=auto-1', [IN_HOME]);
     const pane = (await screen.findByRole('heading', { level: 2, name: IN_HOME.name })).closest('article')!;
@@ -174,7 +174,7 @@ describe("while Home's request is out", () => {
 
     await answer();
     await screen.findByRole('button', { name: label('automation.saveChanges') });
-    expect(screen.getByText(new RegExp(`^${label('agents.allWorkspaces')} · `))).toBeInTheDocument();
+    expect(screen.getByText(new RegExp(`^${label('agents.chiefOfStaff')} · `))).toBeInTheDocument();
     leave();
     expect(screen.queryByText(label('automation.discardDraftTitle'))).not.toBeInTheDocument();
     await waitFor(() => expect(screen.queryByRole('button', { name: label('automation.saveChanges') })).not.toBeInTheDocument());

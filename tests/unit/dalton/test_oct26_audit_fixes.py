@@ -142,7 +142,7 @@ async def test_workflow_failure_messages_mandate_run_workflow_resume_only_when_r
         error=lost_msg,
         result={"success": False, "error": lost_msg},
     )
-    settled = await _settled_text(registry, resumable_task, listed=False)
+    settled = await _settled_text(registry, resumable_task)
     assert "RunWorkflow(workflow=<same workflow>, resume='s_rL_A')" in settled
     assert "do NOT manually re-dispatch Task subagents" in settled
 
@@ -171,9 +171,7 @@ async def test_workflow_failure_messages_mandate_run_workflow_resume_only_when_r
         error=non_resumable_err,
         result={"success": False, "error": non_resumable_err},
     )
-    settled_non_resumable = await _settled_text(
-        registry, non_resumable_task, listed=False
-    )
+    settled_non_resumable = await _settled_text(registry, non_resumable_task)
     assert "resume='x_bad1'" not in settled_non_resumable
 
     missing_non_resumable = await _compose_missing_reply(
@@ -570,20 +568,21 @@ async def test_sandbox_pip_install_uses_system_and_skips_local_workspace_dirs(
 
     sandbox._runtime_call.side_effect = _runtime_call
 
-    # 1. _detect_missing_imports immediately drops the workspace dir_name ('ai_strategy_lp')
-    tb = (
-        "Traceback (most recent call last):\n"
-        '  File "/home/workspace/ai_strategy_lp/run.py", line 1, in <module>\n'
-        "    import ai_strategy_lp\n"
-        "ModuleNotFoundError: No module named 'ai_strategy_lp'\n"
-        "ModuleNotFoundError: No module named 'local_helper'\n"
-        "ModuleNotFoundError: No module named 'scipy'\n"
+    # 1. missing_import reads only the RAISED_FILE record's own name, takes its
+    # base package, and nothing a run printed can name one: a forged
+    # "ModuleNotFoundError" line (or any text with shell metacharacters) fails
+    # the dotted-path match, so no dependency-confusion install can fire.
+    assert mcp_setup.missing_import("scipy.stats") == "scipy"
+    assert mcp_setup.missing_import("ai_strategy_lp") == "ai_strategy_lp"
+    assert mcp_setup.missing_import(None) is None
+    assert (
+        mcp_setup.missing_import("ModuleNotFoundError: No module named 'evil'")
+        is None
     )
-    detected = mcp_setup._detect_missing_imports(sandbox, tb)
-    assert "ai_strategy_lp" not in detected
-    assert set(detected) == {"local_helper", "scipy"}
 
-    # 2. _filter_local_packages drops 'local_helper' discovered on disk in the workspace
+    # 2. The retry loop's Dalton filter drops the workspace dir_name
+    # ('ai_strategy_lp') by known name and 'local_helper' by the on-disk probe.
+    detected = ["ai_strategy_lp", "local_helper", "scipy"]
     filtered = await mcp_setup._filter_local_packages(sandbox, detected)
     assert filtered == ["scipy"]
 
@@ -636,6 +635,84 @@ async def test_sandbox_pip_install_uses_system_and_skips_local_workspace_dirs(
     sandbox.execute_bash_command.assert_awaited_once_with(
         "uv pip install --system openpyxl", timeout=120
     )
+
+    # 5. execution.start_code_job (P0-11 hook site): a code run that ended on a
+    # missing import installs it and runs again — unless the name is a local
+    # workspace folder, or the local probe could not say, in which case nothing
+    # is installed and the failed outcome is returned as it stands.
+    from ptc_agent.core.sandbox import execution as sandbox_execution
+    from ptc_agent.core.sandbox.jobs import Ended, JobHandle, JobRef
+
+    def _code_run(raised: str | None, *, exit_code: int) -> Ended:
+        """One ended code run as the retry loop reads it: the module its own
+        unhandled exception failed to import sits in ``raised``, apart from the
+        output."""
+        ref = JobRef(
+            command_id="bg-000000000001",
+            state_dir="/root/.system/jobs/bg-000000000001",
+            log_path=(
+                "/home/workspace/ai_strategy_lp/.agents/threads/t1/"
+                "commands/bg-000000000001.log"
+            ),
+            trace_path="/root/.system/trace/bg-000000000001.jsonl",
+            log_relpath=".agents/threads/t1/commands/bg-000000000001.log",
+        )
+        handle = JobHandle(ref=ref, started_at=datetime.now(timezone.utc), kind="code")
+        return Ended(handle=handle, exit_code=exit_code, output="", raised=raised)
+
+    # The install goes through the double's _install_package into the real
+    # mcp_setup one, so the --system wording in `commands` is what ran, not a
+    # mock's record of the call.
+    async def _real_install(package: str) -> bool:
+        return await mcp_setup._install_package(sandbox, package)
+
+    sandbox._install_package.side_effect = _real_install
+    run_code = create_autospec(sandbox_execution._run_code)
+    monkeypatch.setattr(sandbox_execution, "_run_code", run_code)
+
+    # 5a. Local folder 'ai_strategy_lp': filtered out -> no uv pip install, no retry
+    commands.clear()
+    run_code.reset_mock()
+    run_code.side_effect = [_code_run("ai_strategy_lp", exit_code=1)]
+    out_local = await sandbox_execution.start_code_job(
+        sandbox, "import ai_strategy_lp", wait_s=5.0
+    )
+    assert isinstance(out_local, Ended) and out_local.exit_code == 1
+    assert run_code.await_count == 1
+    sandbox._install_package.assert_not_awaited()
+    assert not any("uv pip install" in c for c in commands)
+
+    # 5b. Genuine package 'scipy': installed with --system and rerun once
+    commands.clear()
+    run_code.reset_mock()
+    sandbox._install_package.reset_mock()
+    run_code.side_effect = [
+        _code_run("scipy", exit_code=1),
+        _code_run(None, exit_code=0),
+    ]
+    out_scipy = await sandbox_execution.start_code_job(
+        sandbox, "import scipy.stats", wait_s=5.0
+    )
+    assert isinstance(out_scipy, Ended) and out_scipy.exit_code == 0
+    assert run_code.await_count == 2
+    sandbox._install_package.assert_awaited_once_with("scipy")
+    assert "uv pip install --system -q scipy" in commands
+
+    # 5c. The local probe failing: no install, no retry, the outcome stands
+    commands.clear()
+    run_code.reset_mock()
+    sandbox._install_package.reset_mock()
+    sandbox._runtime_call.side_effect = _probe_nonzero
+    run_code.side_effect = [_code_run("scipy", exit_code=1)]
+    out_probe = await sandbox_execution.start_code_job(
+        sandbox, "import scipy", wait_s=5.0
+    )
+    assert isinstance(out_probe, Ended) and out_probe.exit_code == 1
+    assert run_code.await_count == 1
+    sandbox._install_package.assert_not_awaited()
+    assert not any("uv pip install" in c for c in commands)
+
+    sandbox._runtime_call.side_effect = _runtime_call
 
 
 # ---------------------------------------------------------------------------
@@ -804,3 +881,211 @@ def test_subagent_prompt_includes_workspace_absolute_root_across_all_three_paths
         assert "`/home/workspace/DASH`" in prompt
         assert "`/home/workspace/DASH/.agents/skills/<skill_name>/SKILL.md`" in prompt
         assert "never invent host paths such as `/Users/...`" in prompt
+
+
+# ---------------------------------------------------------------------------
+# B7 Round 2 Item 1: Concurrent delete vs publish mutual exclusion on workspace row
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_db_delete_workspace_rechecks_published_reports_under_row_lock_and_refuses() -> None:
+    """If a report is published before db_delete_workspace acquires FOR UPDATE on the workspace row, the in-transaction check sees it and aborts deletion without marking status='deleted'."""
+    executed_sqls: list[str] = []
+
+    async def _execute(sql: str, params: Any = None) -> None:
+        executed_sqls.append(sql)
+
+    fetch_rows = iter(
+        [
+            {"user_id": "user-1"},
+            None,  # lock_user_egress_state (advisory xact lock does not fetch)
+            {"workspace_id": "ws-1", "computer_id": "comp-1"},
+            {"busy": False},
+            {"moving": False},
+            {"has_pub": True},
+        ]
+    )
+
+    async def _fetchone() -> dict[str, Any] | None:
+        last_sql = executed_sqls[-1] if executed_sqls else ""
+        if "SELECT user_id FROM workspaces" in last_sql:
+            return {"user_id": "user-1"}
+        if "FOR UPDATE" in last_sql:
+            return {"workspace_id": "ws-1", "computer_id": "comp-1"}
+        if "AS busy" in last_sql:
+            return {"busy": False}
+        if "AS moving" in last_sql:
+            return {"moving": False}
+        if "FROM dalton_publications" in last_sql:
+            return {"has_pub": True}
+        return next(fetch_rows, None)
+
+    fake_cur = create_autospec(AsyncCursor, instance=True)
+    fake_cur.execute.side_effect = _execute
+    fake_cur.fetchone.side_effect = _fetchone
+    fake_cur.__aenter__.return_value = fake_cur
+    fake_cur.__aexit__.return_value = None
+
+    @asynccontextmanager
+    async def _fake_tx():
+        yield None
+
+    fake_conn = create_autospec(AsyncConnection, instance=True)
+    fake_conn.cursor.return_value = fake_cur
+    fake_conn.transaction.side_effect = _fake_tx
+
+    with pytest.raises(
+        ws_db.WorkspaceHasPublishedReportsError,
+        match=ws_db.PUBLISHED_REPORTS_DELETE_REFUSAL,
+    ):
+        await ws_db.delete_workspace(
+            "ws-1", conn=fake_conn, bound_to="comp-1", keep_folder=False
+        )
+
+    for_update_idx = next(
+        i for i, q in enumerate(executed_sqls) if "FROM workspaces" in q and "FOR UPDATE" in q
+    )
+    pub_check_idx = next(
+        i for i, q in enumerate(executed_sqls) if "FROM dalton_publications" in q
+    )
+    assert for_update_idx < pub_check_idx
+    assert not any("UPDATE workspaces" in q for q in executed_sqls)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_status", ["deleted", "archiving"])
+async def test_insert_publication_and_run_publish_reject_deleted_or_archiving_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+    bad_status: str,
+) -> None:
+    """insert_publication locks the workspace row FOR SHARE and refuses when status is deleted or archiving; run_publish transitions the request to rejected and returns an explicit error."""
+    from src.dalton.database import knowledge as db_knowledge
+    from src.dalton.database import publications as db_publications
+    from src.dalton.publish import files as publish_files
+    from src.dalton.publish import service as publish_svc
+
+    executed_sqls: list[str] = []
+
+    async def _execute(sql: str, params: Any = None) -> None:
+        executed_sqls.append(sql)
+
+    async def _fetchone() -> dict[str, Any] | None:
+        last_sql = executed_sqls[-1] if executed_sqls else ""
+        if "FROM workspaces" in last_sql and "FOR SHARE" in last_sql:
+            return {"workspace_id": "ws-1", "status": bad_status}
+        return None
+
+    fake_cur = create_autospec(AsyncCursor, instance=True)
+    fake_cur.execute.side_effect = _execute
+    fake_cur.fetchone.side_effect = _fetchone
+    fake_cur.__aenter__.return_value = fake_cur
+    fake_cur.__aexit__.return_value = None
+
+    @asynccontextmanager
+    async def _fake_tx():
+        yield None
+
+    fake_conn = create_autospec(AsyncConnection, instance=True)
+    fake_conn.cursor.return_value = fake_cur
+    fake_conn.transaction.side_effect = _fake_tx
+
+    @asynccontextmanager
+    async def _fake_get_db_conn():
+        yield fake_conn
+
+    monkeypatch.setattr(
+        db_publications,
+        "get_db_connection",
+        create_autospec(db_publications.get_db_connection, side_effect=_fake_get_db_conn),
+    )
+
+    with pytest.raises(
+        db_publications.WorkspaceUnavailableForPublishError,
+        match=bad_status,
+    ):
+        await db_publications.insert_publication(
+            publish_request_id="req-1",
+            user_id="user-1",
+            workspace_id="ws-1",
+            ticker="NVDA",
+            kind="event_note",
+            title="NVDA Note",
+            published_date="2026-10-27",
+            files=[{"path": "published/2026-10-27-nvda.md"}],
+            file_blobs=[],
+            bundle_sha256="a" * 64,
+            sources=[],
+            audit_summary={},
+            reviewer={},
+            approver_user_id="user-1",
+            approved_at=datetime.now(timezone.utc),
+        )
+
+    assert any("FROM workspaces" in q and "FOR SHARE" in q for q in executed_sqls)
+    assert not any("INSERT INTO dalton_publications" in q for q in executed_sqls)
+
+    # Also verify run_publish surfaces the rejection cleanly and marks the request rejected
+    class _BackendProto:
+        async def aread_text(self, path: str) -> str | None: ...
+        async def awrite_text(self, path: str, content: str) -> None: ...
+
+    fake_backend = create_autospec(_BackendProto, instance=True)
+    draft_md = "# NVDA Note\n\nQualitative summary."
+    fake_backend.aread_text.side_effect = (
+        lambda path: draft_md if path == "drafts/nvda.md" else None
+    )
+
+    bundle_sha = publish_files.compute_bundle_sha256(draft_md.encode("utf-8"), [])
+    monkeypatch.setattr(
+        publish_svc,
+        "verify_workspace_access",
+        create_autospec(publish_svc.verify_workspace_access, return_value={"workspace_id": "ws-1"}),
+    )
+    monkeypatch.setattr(
+        db_publications,
+        "resolve_thread_author_model",
+        create_autospec(db_publications.resolve_thread_author_model, return_value="claude-opus-5-5-oauth"),
+    )
+    monkeypatch.setattr(
+        db_knowledge,
+        "list_all_latest_for_workspace",
+        create_autospec(db_knowledge.list_all_latest_for_workspace, return_value={}),
+    )
+    monkeypatch.setattr(
+        db_publications,
+        "get_request",
+        create_autospec(
+            db_publications.get_request,
+            return_value={
+                "publish_request_id": "req-1",
+                "workspace_id": "ws-1",
+                "user_id": "user-1",
+                "status": "publishing",
+                "bundle_sha256": bundle_sha,
+                "audit": {"figures": 0, "matched": 0, "verified": 0, "contradicted": 0, "unverified": 0, "uncertain": 0, "exempt": 0, "matches": []},
+                "review": {"model": "gemini-3.1-pro", "family": "google", "verdict": "pass"},
+            },
+        ),
+    )
+    mock_transition = create_autospec(db_publications.transition, return_value=None)
+    monkeypatch.setattr(db_publications, "transition", mock_transition)
+
+    res = await publish_svc.run_publish(
+        user_id="user-1",
+        workspace_id="ws-1",
+        thread_id="th-1",
+        tool_call_id="tc-1",
+        draft_path="drafts/nvda.md",
+        title="NVDA Note",
+        kind="event_note",
+        slug="nvda-note",
+        request_id="req-1",
+        backend=fake_backend,
+    )
+    assert res["ok"] is False
+    assert res["status"] == "rejected"
+    assert bad_status in res["message"]
+    mock_transition.assert_awaited_once()
+    assert mock_transition.await_args.args[:3] == ("req-1", ("publishing",), "rejected")
+

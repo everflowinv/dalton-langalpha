@@ -150,7 +150,7 @@ export function projectLiveInterrupt(
           [proposalId]: {
             workspace_id: proposalData.workspace_id,
             workspace_name: proposalData.workspace_name,
-            question: proposalData.question,
+            question: proposalData.question ?? '',
             report_back: proposalData.report_back ?? true,
             interruptId: event.interrupt_id,
             // Persist tool_call_id ON the proposal so the clicked card

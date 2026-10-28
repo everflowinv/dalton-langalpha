@@ -8,8 +8,11 @@ members read only, and only docs whose wiki space is on the
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
+import re
+from pathlib import Path
 from typing import Any, Optional
 
 from langchain_core.runnables import RunnableConfig
@@ -30,6 +33,12 @@ UNAUTHENTICATED_MESSAGE = "feishu 工具需要登录用户的会话（RunnableCo
 
 MAX_READ_CHARS = 50000
 DEFAULT_READ_CHARS = 20000
+
+# C2: markdown image references in document order — each becomes a docx image
+# block whose bytes the caller must supply for local paths (the bridge reads
+# http(s) links itself).
+_MARKDOWN_IMAGE_RE = re.compile(r"!\[[^\]\n]*\]\(\s*([^)\s]+)(?:\s+\"[^\"]*\")?\s*\)")
+_FEISHU_IMAGE_MAX_BYTES = 10 * 1024 * 1024
 
 
 def _dump(payload: dict[str, Any]) -> str:
@@ -60,7 +69,8 @@ async def _bridge(route: str, body: dict[str, Any]) -> dict[str, Any] | str:
     from `doc/append`, whose wording follows the bridge's `outcome`: a rejected
     append left the original doc unchanged, while an unknown one (network error,
     unparseable response) may already be written and must be checked in the doc
-    before any retry; every other error maps to a generic payload as before.
+    before any retry; every other error maps to a generic payload as before,
+    keeping the bridge's own `message` when it sent one.
     """
     try:
         return await post_bridge_feishu(route, body)
@@ -91,11 +101,102 @@ async def _bridge(route: str, body: dict[str, Any]) -> dict[str, Any] | str:
             if detail:
                 err_payload["detail"] = detail
             return _dump(err_payload)
-        return _error_payload(describe_feishu_error(exc.error_code), error=exc.error_code)
+        if exc.error_code == "image_bind_failed":
+            return _dump(
+                {
+                    "ok": False,
+                    "error": "image_bind_failed",
+                    "message": str(exc.payload.get("message") or "图片没有绑定成功，请查看文档或重试。"),
+                    "document_id": str(exc.payload.get("document_id") or ""),
+                    "images": exc.payload.get("images") or {},
+                    **({"url": exc.payload["url"]} if exc.payload.get("url") else {}),
+                }
+            )
+        bridge_message = str(exc.payload.get("message") or "").strip()
+        described = describe_feishu_error(exc.error_code)
+        return _error_payload(
+            bridge_message or described,
+            error=exc.error_code,
+            **({"detail": str(exc.payload.get("detail") or "")} if exc.payload.get("detail") else {}),
+        )
+
+
+async def _collect_markdown_image_files(
+    markdown: str, filesystem_backend: Any
+) -> tuple[dict[str, Any], str | None]:
+    """Local markdown images as ``{ref: {filename, content_b64}}`` for the bridge (C2).
+
+    http(s) references are skipped — the bridge fetches those itself under its
+    SSRF check — while a workspace path can only be read here, where the
+    sandbox filesystem lives. Any unreadable or oversized local image fails
+    the whole call up front: a doc that silently drops its images is the bug
+    this flow exists to close.
+    """
+    files: dict[str, Any] = {}
+    for match in _MARKDOWN_IMAGE_RE.finditer(markdown or ""):
+        ref = match.group(1).strip()
+        if not ref or ref.startswith(("http://", "https://", "data:")):
+            continue
+        if ref in files:
+            continue
+        if filesystem_backend is None:
+            return {}, f"本地图片 {ref} 无法读取：当前没有可用的文件系统后端。"
+        from src.dalton.tools.wiki_tools import _read_workspace_file_safely
+
+        fname, fbytes, ferr = await _read_workspace_file_safely(
+            filesystem_backend,
+            ref,
+            allowed_extensions=frozenset({".png", ".jpg", ".jpeg", ".webp", ".gif"}),
+        )
+        if ferr is not None or fname is None or fbytes is None:
+            return {}, f"本地图片 {ref} 读取失败：{ferr or '未知错误'}"
+        if len(fbytes) > _FEISHU_IMAGE_MAX_BYTES:
+            return {}, f"本地图片 {ref} 超过 10 MB 上限（{len(fbytes)} bytes）。"
+        if Path(fname).suffix.lower() not in (".png", ".jpg", ".jpeg", ".webp", ".gif"):
+            return {}, f"本地图片 {ref} 不是可上传的图片格式。"
+        files[ref] = {
+            "filename": fname,
+            "content_b64": base64.b64encode(fbytes).decode("ascii"),
+        }
+    return files, None
 
 
 def _bridge_failed(res: Any) -> bool:
     return isinstance(res, str) or not isinstance(res, dict) or res.get("ok") is not True
+
+
+def _image_bind_failed_payload(res: dict[str, Any]) -> str:
+    """Keep the created doc's id/url and every image's failure reason (C2).
+
+    A 200 body with ``ok:false`` / ``image_bind_failed`` means the doc (or the
+    append) landed and only the images failed — the model must know where the
+    doc is and which images to fix, so nothing is collapsed into a generic
+    error here.
+    """
+    images = res.get("images") if isinstance(res.get("images"), dict) else {}
+    failed = [
+        {
+            "ref": f.get("ref"),
+            "block_id": f.get("block_id"),
+            "reason": f.get("reason"),
+        }
+        for f in (images.get("failed") or [])
+        if isinstance(f, dict)
+    ]
+    payload: dict[str, Any] = {
+        "ok": False,
+        "error": "image_bind_failed",
+        "message": str(res.get("message") or "图片没有绑定成功，请查看文档或重试。"),
+        "document_id": str(res.get("document_id") or ""),
+        "images": {
+            "total": images.get("total"),
+            "bound": images.get("bound"),
+            "failed": failed,
+        },
+    }
+    if res.get("url"):
+        payload["url"] = str(res["url"])
+    return _dump(payload)
 
 
 async def _external_read_allowed(token: str) -> tuple[str | None, dict[str, Any]]:
@@ -149,8 +250,14 @@ def _grant_email_for(email: str) -> str:
     return email
 
 
-def create_feishu_tools() -> list[BaseTool]:
-    """Build `[feishu_read, feishu_list_wiki, feishu_create_doc, feishu_append]` for both roles."""
+def create_feishu_tools(filesystem_backend: Any = None) -> list[BaseTool]:
+    """Build `[feishu_read, feishu_list_wiki, feishu_create_doc, feishu_append,
+    feishu_grant_access]` for both roles.
+
+    ``filesystem_backend`` (optional) reads a workspace's local image files so
+    a created doc's markdown images carry real bytes (C2); without it, docs
+    with local-path images are refused rather than silently emptied.
+    """
 
     @tool("feishu_read")
     async def _feishu_read(
@@ -292,7 +399,12 @@ def create_feishu_tools() -> list[BaseTool]:
         tier = await get_user_tier(user_id)
         if tier == "external":
             return _error_payload(EXTERNAL_READ_ONLY_MESSAGE, error="external_write_forbidden")
+        image_files, image_err = await _collect_markdown_image_files(markdown, filesystem_backend)
+        if image_err is not None:
+            return _error_payload(image_err, error="image_read_failed")
         body: dict[str, Any] = {"title": title, "markdown": markdown}
+        if image_files:
+            body["image_files"] = image_files
         if space_id:
             body["space_id"] = space_id
         if parent_node_token:
@@ -305,6 +417,8 @@ def create_feishu_tools() -> list[BaseTool]:
         res = await _bridge("doc/create", body)
         if _bridge_failed(res):
             if isinstance(res, dict):
+                if str(res.get("error") or "") == "image_bind_failed":
+                    return _image_bind_failed_payload(res)
                 return _error_payload(describe_feishu_error(str(res.get("error") or "bridge_error")), error=str(res.get("error") or "bridge_error"))
             return res
         payload = {"ok": True, "tier": tier, **{k: v for k, v in res.items() if k != "ok"}}
@@ -335,14 +449,61 @@ def create_feishu_tools() -> list[BaseTool]:
         tier = await get_user_tier(user_id)
         if tier == "external":
             return _error_payload(EXTERNAL_READ_ONLY_MESSAGE, error="external_write_forbidden")
-        res = await _bridge("doc/append", {"token": token, "markdown": markdown})
+        image_files, image_err = await _collect_markdown_image_files(markdown, filesystem_backend)
+        if image_err is not None:
+            return _error_payload(image_err, error="image_read_failed")
+        append_body: dict[str, Any] = {"token": token, "markdown": markdown}
+        if image_files:
+            append_body["image_files"] = image_files
+        res = await _bridge("doc/append", append_body)
         if _bridge_failed(res):
             if isinstance(res, dict):
+                if str(res.get("error") or "") == "image_bind_failed":
+                    return _image_bind_failed_payload(res)
                 return _error_payload(describe_feishu_error(str(res.get("error") or "bridge_error")), error=str(res.get("error") or "bridge_error"))
             return res
         return _dump({"ok": True, "tier": tier, **{k: v for k, v in res.items() if k != "ok"}})
 
-    return [_feishu_read, _feishu_list_wiki, _feishu_create_doc, _feishu_append]
+    @tool("feishu_grant_access")
+    async def _feishu_grant_access(
+        token: str,
+        *,
+        config: RunnableConfig,
+    ) -> str:
+        """Re-grant the caller full access to a doc Dalton created, only when the user asks to fix sharing on a doc they cannot edit (admin and internal members only).
+        Use it when a doc was created but the automatic share failed (its warning said so), or the user reports they cannot edit a doc.
+        It grants only the caller themself — the email comes from their Dalton account, and only docs the bridge itself created can be re-granted.
+
+        Args:
+            token: Feishu document URL (`.../docx/<id>` or `.../wiki/<id>`) or the raw document/wiki token of the doc that was created through Dalton.
+
+        Returns:
+            JSON with the granted email, the doc `url`, and the member spelling used; a failure carries Feishu's own code/msg.
+        """
+        user_id, err = await _require_authenticated_user(config)
+        if err is not None:
+            return err
+        tier = await get_user_tier(user_id)
+        if tier == "external":
+            return _error_payload(EXTERNAL_READ_ONLY_MESSAGE, error="external_write_forbidden")
+        # Self-service only: the grant targets the caller's own account email
+        # (the same source doc/create's automatic share uses), never an
+        # arbitrary address the model was handed.
+        grant_email = _grant_email_for(await _caller_email(user_id))
+        if not grant_email:
+            return _error_payload(
+                "当前用户没有可授权的邮箱（账户记录缺少邮箱，或为邀请注册的合成地址）。",
+                error="no_grant_email",
+            )
+        res = await _bridge("doc/grant", {"token": token, "email": grant_email})
+        if _bridge_failed(res):
+            if isinstance(res, dict):
+                message = str(res.get("message") or describe_feishu_error(str(res.get("error") or "bridge_error")))
+                return _error_payload(message, error=str(res.get("error") or "bridge_error"))
+            return res
+        return _dump({"ok": True, "tier": tier, **{k: v for k, v in res.items() if k != "ok"}})
+
+    return [_feishu_read, _feishu_list_wiki, _feishu_create_doc, _feishu_append, _feishu_grant_access]
 
 
 _DEFAULT_TOOLS = create_feishu_tools()
@@ -350,3 +511,4 @@ feishu_read = _DEFAULT_TOOLS[0]
 feishu_list_wiki = _DEFAULT_TOOLS[1]
 feishu_create_doc = _DEFAULT_TOOLS[2]
 feishu_append = _DEFAULT_TOOLS[3]
+feishu_grant_access = _DEFAULT_TOOLS[4]

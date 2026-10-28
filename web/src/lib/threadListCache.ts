@@ -69,19 +69,23 @@ export function patchThreadTitle(
     queryKeys.threads.detail(threadId),
     (old: Thread | undefined) => (old ? apply(old) : old),
   );
-  // The hand-off cards' liveness reads, bare rows with no updated_at. A card
-  // stops reading once its run settles, so a title written after that reaches
-  // it only from here. Unchanged entries return undefined, which skips the
-  // write: returning the same rows would count as a fresh read and restart the
-  // cards' poll timers. A cleared title is stored as null, as the server reads it.
-  queryClient.setQueriesData<{ thread_id: string; title?: string | null }[]>(
+  // The hand-off cards' and the roster's liveness reads, rows with no
+  // updated_at. A card stops reading once its run settles, so a title written
+  // after that reaches it only from here. Unchanged entries return undefined,
+  // which skips the write: returning the same rows would count as a fresh read
+  // and restart the cards' poll timers. A cleared title is stored as null, as
+  // the server reads it.
+  queryClient.setQueriesData<{ liveness: LivenessRow[] }>(
     { queryKey: queryKeys.threads.dispatchLivenessAll() },
-    (rows) =>
-      rows?.some((r) => r.thread_id === threadId)
-        ? rows.map((r) => (r.thread_id === threadId ? { ...r, title: title || null } : r))
-        : undefined,
+    (data) => {
+      if (!data?.liveness.some((r) => r.thread_id === threadId)) return undefined;
+      const liveness = data.liveness.map((r) => (r.thread_id === threadId ? { ...r, title: title || null } : r));
+      return { ...data, liveness };
+    },
   );
 }
+
+type LivenessRow = { thread_id: string; title?: string | null };
 
 /**
  * Stamp a seen cursor onto every cached row of the thread; rows are re-seeded

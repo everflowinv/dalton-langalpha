@@ -362,11 +362,30 @@ def test_scan_reports_its_start_time_boot_and_clock_offset(tmp_path):
     assert out["clock_offset_ns"] == OFFSET
 
 
-def test_boot_id_is_none_without_proc(monkeypatch):
+def _no_proc(*a, **kw):
+    raise FileNotFoundError("/proc/sys/kernel/random/boot_id")
+
+
+def test_boot_id_is_none_without_proc_or_sysctl(monkeypatch):
     monkeypatch.undo()
 
-    def _no_proc(*a, **kw):
-        raise FileNotFoundError("/proc/sys/kernel/random/boot_id")
+    def _no_sysctl(*a, **kw):
+        raise FileNotFoundError("sysctl")
 
     monkeypatch.setattr("builtins.open", _no_proc)
+    monkeypatch.setattr(rt.subprocess, "run", _no_sysctl)
     assert rt._boot_id() is None
+
+
+def test_boot_id_falls_back_to_the_macos_boot_session(monkeypatch):
+    monkeypatch.undo()
+    asked = []
+
+    def _sysctl(argv, **kw):
+        asked.append(argv)
+        return rt.subprocess.CompletedProcess(argv, 0, stdout="8663-macos\n")
+
+    monkeypatch.setattr("builtins.open", _no_proc)
+    monkeypatch.setattr(rt.subprocess, "run", _sysctl)
+    assert rt._boot_id() == "8663-macos"
+    assert asked == [["sysctl", "-n", "kern.bootsessionuuid"]]

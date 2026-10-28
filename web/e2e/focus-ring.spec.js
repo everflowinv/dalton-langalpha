@@ -18,6 +18,7 @@
  */
 import { test, expect, mockAPI } from './fixtures.js';
 import { edgeOn, keyboardFocus, outlineOn, tabTo, unpainted } from './helpers/focusPaint.js';
+import { sampleWorkspace } from './helpers/mockResponses.js';
 
 // The account button in the sidebar footer, chosen because it is a plain
 // DropdownMenu over the shared ui/ wrapper -- whatever is true here is true of
@@ -33,6 +34,19 @@ const EMPTY = { x: 760, y: 300 };
 // and the settings select each failed to appear within it. So a wait for a
 // page after navigating gets the budget the other specs give a first paint.
 const FIRST_PAINT = { timeout: 15_000 };
+
+// The Workspaces search box shows only once there is a workspace to search,
+// and the default account holds Home alone. So the gallery opens on one.
+async function openGallery(page) {
+  await page.route((url) => url.pathname.replace('/api/v1', '') === '/workspaces', (route) => {
+    if (route.request().method() !== 'GET') return route.fallback();
+    const includeHome = new URL(route.request().url()).searchParams.get('include_home') === 'true';
+    const home = { workspace_id: 'ws-home', name: 'Home', status: 'unbound', is_home: true, config: {} };
+    const workspaces = includeHome ? [home, sampleWorkspace()] : [sampleWorkspace()];
+    return route.fulfill({ json: { workspaces, total: workspaces.length, limit: 100, offset: 0 } });
+  });
+  await page.goto('/chat');
+}
 
 /** Is a focus indicator actually painted on the element that holds focus? */
 async function ringed(page) {
@@ -242,7 +256,7 @@ const CLICKED = [
     field: 'the Workspaces search box',
     sel: WORKSPACE_SEARCH,
     rings: WORKSPACE_PILL,
-    open: (page) => page.goto('/chat'),
+    open: openGallery,
   },
   {
     // The shared primitive is the other half of the app's text fields: it drew
@@ -303,7 +317,7 @@ test.describe('a borderless field inside a box that owns the edge', () => {
       field: 'the Workspaces search box',
       sel: WORKSPACE_SEARCH,
       box: WORKSPACE_PILL,
-      open: (page) => page.goto('/chat'),
+      open: openGallery,
     },
   ];
 
@@ -405,7 +419,7 @@ test.describe('a field whose container is the indicator', () => {
   const PILL = WORKSPACE_PILL;
 
   test.beforeEach(async ({ page }) => {
-    await page.goto('/chat');
+    await openGallery(page);
     await expect(page.getByPlaceholder('Search workspaces...')).toBeVisible(FIRST_PAINT);
   });
 

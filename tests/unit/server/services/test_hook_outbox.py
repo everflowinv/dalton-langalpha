@@ -876,6 +876,26 @@ class TestDrainerExecute:
         closed.assert_not_awaited()
         error.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_a_market_alert_out_of_attempts_is_held_not_dead_lettered(self):
+        """The nack holds an alert at the ceiling for its thread's next turn;
+        the drainer logs it as settled, never as a dead letter."""
+        from src.server.database.runs import outbox as outbox_db
+
+        drainer = HookOutboxDrainer()
+        job = {**_job(hook_type="market_target"), "attempts": hook_outbox.MAX_ATTEMPTS}
+        with patch.dict(
+            hook_outbox._EXECUTORS,
+            {"market_target": AsyncMock(side_effect=RuntimeError("boom"))},
+        ), patch.object(
+            outbox_db, "nack_outbox_job", AsyncMock(return_value="exhausted")
+        ), patch.object(hook_outbox.logger, "error") as error, patch.object(
+            drainer, "_close_followup", AsyncMock()
+        ) as closed:
+            await drainer._execute(job)
+        closed.assert_not_awaited()
+        error.assert_not_called()
+
     def test_the_steer_executor_registers_its_exhaust_followup(self):
         from src.server.services.report_back import steer_executor
 
@@ -2491,5 +2511,336 @@ class TestHandoffKeepOnResumable:
             watch_key("cos-home"), set()
         )
 
+    # DALTON-HOOK(handoff-keep-on-resumable): verify AnalystReport.resumable on
+    # interim vs terminal reports and _reported_runs extension across resumable error runs
+    @pytest.mark.asyncio
+    async def test_report_source_resumable_flag_and_continued_run_chain(self):
+        from unittest.mock import create_autospec
+
+        from src.dalton.database import runs as dalton_runs_db
+        from src.server.database.runs import lifecycle as tl_db
+        from src.server.database.runs import outbox as outbox_db
+        from src.server.services.report_back.handoff import executor
+
+        runs_by_id = {
+            "ptc-run-init": {
+                "conversation_response_id": "ptc-run-init",
+                "status": "interrupted",
+                "errors": [],
+            },
+            "ptc-run-0": {
+                "conversation_response_id": "ptc-run-0",
+                "status": "error",
+                "errors": [
+                    "worker_lost: no live executor holds this run's writer fence"
+                ],
+            },
+            "ptc-run-ordinary-err": {
+                "conversation_response_id": "ptc-run-ordinary-err",
+                "status": "error",
+                "errors": ["Model rate limit exceeded"],
+            },
+            "ptc-run-1": {
+                "conversation_response_id": "ptc-run-1",
+                "status": "interrupted",
+                "errors": [],
+                # The /retry of the worker-lost run.
+                "retry_of_run_id": "ptc-run-0",
+            },
+            "ptc-run-2": {
+                "conversation_response_id": "ptc-run-2",
+                "status": "completed",
+                "errors": [],
+            },
+        }
+        predecessor_map: dict[str, dict | None] = {
+            "ptc-run-2": runs_by_id["ptc-run-1"],
+            "ptc-run-1": runs_by_id["ptc-run-0"],
+            "ptc-run-0": runs_by_id["ptc-run-init"],
+            "ptc-run-init": None,
+            "ptc-run-ordinary-err": None,
+        }
+
+        async def _fake_get_run(run_id: str):
+            return dict(runs_by_id[run_id]) if run_id in runs_by_id else None
+
+        async def _fake_continued(thread_id: str, run_id: str):
+            if run_id == "ptc-run-2":
+                return ["ptc-run-1", "ptc-run-2"]
+            return [run_id]
+
+        async def _fake_prev(thread_id: str, run_id: str):
+            row = predecessor_map.get(run_id)
+            return dict(row) if row else None
+
+        # DALTON-HOOK(handoff-keep-on-resumable): autospec test doubles
+        get_run_mock = create_autospec(tl_db.get_run, side_effect=_fake_get_run)
+        continued_mock = create_autospec(
+            tl_db.get_continued_runs, side_effect=_fake_continued
+        )
+        prev_mock = create_autospec(
+            dalton_runs_db.get_previous_run_on_thread, side_effect=_fake_prev
+        )
+        taken_mock = create_autospec(
+            outbox_db.list_taken_hand_offs, return_value=[]
+        )
+        ws_name_mock = create_autospec(
+            executor._workspace_name, return_value="DASH"
+        )
+
+        def _make_owed(final_status: str, run_id: str) -> executor.OwedAnalystReport:
+            return executor.OwedAnalystReport(
+                origin={"ptc_workspace_id": "ws-dash"},
+                dispatcher_thread_id="cos-home",
+                ptc_thread_id="ptc-dash",
+                final_status=final_status,
+                run_id=run_id,
+            )
+
+        with (
+            patch.object(tl_db, "get_run", get_run_mock),
+            patch.object(tl_db, "get_continued_runs", continued_mock),
+            patch.object(
+                dalton_runs_db, "get_previous_run_on_thread", prev_mock
+            ),
+            patch.object(outbox_db, "list_taken_hand_offs", taken_mock),
+            patch.object(executor, "_workspace_name", ws_name_mock),
+        ):
+            # 1) Interim resumable failure: resumable is True
+            _, interim_src = await executor.report_message(
+                _make_owed("error", "ptc-run-0")
+            )
+            assert interim_src.resumable is True
+            assert interim_src.model_dump(exclude_none=True)["resumable"] is True
+            assert interim_src.run_ids == ["ptc-run-init", "ptc-run-0"]
+
+            # 2) Non-resumable error: resumable is None
+            _, ordinary_err_src = await executor.report_message(
+                _make_owed("error", "ptc-run-ordinary-err")
+            )
+            assert ordinary_err_src.resumable is None
+            assert "resumable" not in ordinary_err_src.model_dump(
+                exclude_none=True
+            )
+            assert ordinary_err_src.run_ids == ["ptc-run-ordinary-err"]
+
+            # 3) Final completed report after resumable error: resumable is None,
+            # and run_ids chains back through ptc-run-0 and ptc-run-init
+            _, final_src = await executor.report_message(
+                _make_owed("completed", "ptc-run-2")
+            )
+            assert final_src.resumable is None
+            assert "resumable" not in final_src.model_dump(exclude_none=True)
+            assert final_src.run_ids == [
+                "ptc-run-init",
+                "ptc-run-0",
+                "ptc-run-1",
+                "ptc-run-2",
+            ]
+
+            # 4) Preceding run is an ordinary (non-resumable) error: not chained
+            predecessor_map["ptc-run-1"] = runs_by_id["ptc-run-ordinary-err"]
+            _, after_ordinary_err_src = await executor.report_message(
+                _make_owed("completed", "ptc-run-2")
+            )
+            assert after_ordinary_err_src.run_ids == ["ptc-run-1", "ptc-run-2"]
+
+            # 5) A fresh turn after a resumable failure (not its /retry) answers
+            # its own hand-off: the failed run is not chained
+            predecessor_map["ptc-run-1"] = runs_by_id["ptc-run-0"]
+            runs_by_id["ptc-run-1"].pop("retry_of_run_id")
+            _, fresh_turn_src = await executor.report_message(
+                _make_owed("completed", "ptc-run-2")
+            )
+            assert fresh_turn_src.run_ids == ["ptc-run-1", "ptc-run-2"]
+
+            # 6) DB failure when reading preceding run: falls back to upstream chain
+            prev_mock.side_effect = RuntimeError("db down")
+            _, fallback_src = await executor.report_message(
+                _make_owed("completed", "ptc-run-2")
+            )
+            assert fallback_src.run_ids == ["ptc-run-1", "ptc-run-2"]
 
 
+
+class TestDrainerQuotas:
+    @pytest.mark.asyncio
+    async def test_a_burst_on_an_idle_drainer_stays_inside_its_quota(self):
+        """The burst a quota exists for arrives while nothing is in flight, so
+        the first claim must not be able to fill every slot with one type."""
+        import asyncio
+
+        from src.server.database.runs import outbox as outbox_db
+
+        due = [_job(hook_type="market_target") for _ in range(12)]
+        due += [_job(hook_type="steer") for _ in range(4)]
+
+        async def claim(limit, *, excluded_hook_types=None, **_):
+            skip = set(excluded_hook_types or [])
+            picked = [j for j in due if j["hook_type"] not in skip][:limit]
+            for job in picked:
+                due.remove(job)
+            return picked
+
+        drainer = HookOutboxDrainer()
+        hold = asyncio.Event()
+
+        async def execute(job):
+            await hold.wait()
+
+        async def stop_waiting():
+            drainer._stopping.set()
+
+        with patch.object(
+            outbox_db, "park_exhausted_jobs", AsyncMock(return_value=[])
+        ), patch.object(
+            outbox_db, "revive_dead_cleanup_jobs", AsyncMock(return_value=[])
+        ), patch.object(
+            outbox_db, "revive_dead_alerts", AsyncMock(return_value=[])
+        ), patch.object(
+            outbox_db, "close_unowed_waiting_alerts", AsyncMock(return_value=[])
+        ), patch.object(
+            outbox_db, "purge_terminal_jobs", AsyncMock(return_value=0)
+        ), patch.object(
+            outbox_db, "claim_outbox_jobs", side_effect=claim
+        ), patch.object(drainer, "_execute", side_effect=execute), patch.object(
+            drainer, "_wait_for_nudge", side_effect=stop_waiting
+        ):
+            await drainer._loop()
+            running = list(drainer._inflight.values())
+            hold.set()
+            await asyncio.gather(*drainer._inflight)
+
+        assert running.count("market_target") == hook_outbox.MARKET_TARGET_INFLIGHT_QUOTA
+        assert running.count("steer") == 4
+
+
+class TestAlertSweeps:
+    """Market-target alerts: an older build's dead ones made due again,
+    untakeable ones closed, each on its own drainer clock rather than every
+    pass."""
+
+    @staticmethod
+    def _sweeps(**overrides):
+        from src.server.database.runs import outbox as outbox_db
+
+        mocks = {
+            "park_exhausted_jobs": AsyncMock(return_value=[]),
+            "revive_dead_cleanup_jobs": AsyncMock(return_value=[]),
+            "revive_dead_alerts": AsyncMock(return_value=[]),
+            "close_unowed_waiting_alerts": AsyncMock(return_value=[]),
+            "purge_terminal_jobs": AsyncMock(return_value=0),
+            "claim_outbox_jobs": AsyncMock(return_value=[]),
+            **overrides,
+        }
+        return mocks, [patch.object(outbox_db, name, m) for name, m in mocks.items()]
+
+    @staticmethod
+    async def _passes(drainer, n: int):
+        left = [n]
+
+        async def wait():
+            left[0] -= 1
+            if left[0] <= 0:
+                drainer._stopping.set()
+
+        with patch.object(drainer, "_wait_for_nudge", side_effect=wait):
+            await drainer._loop()
+
+    @pytest.mark.asyncio
+    async def test_both_sweeps_run_once_per_interval(self):
+        import contextlib
+
+        drainer = HookOutboxDrainer()
+        mocks, patches = self._sweeps(
+            revive_dead_alerts=AsyncMock(
+                return_value=[{"hook_outbox_id": "a-1", "ordering_key": "k"}]
+            ),
+            close_unowed_waiting_alerts=AsyncMock(
+                return_value=[{"hook_outbox_id": "a-2", "ordering_key": "k"}]
+            ),
+        )
+        with contextlib.ExitStack() as stack:
+            for p in patches:
+                stack.enter_context(p)
+            warning = stack.enter_context(patch.object(hook_outbox.logger, "warning"))
+            await self._passes(drainer, 3)
+        assert mocks["park_exhausted_jobs"].await_count == 3
+        mocks["revive_dead_alerts"].assert_awaited_once()
+        mocks["close_unowed_waiting_alerts"].assert_awaited_once()
+        assert any("a-1" in str(c.args[0]) for c in warning.call_args_list)
+
+    @pytest.mark.asyncio
+    async def test_the_close_runs_on_a_shorter_clock_than_the_revive(self):
+        """A dead alert must stay dead ten minutes before it qualifies, so
+        the revive runs every ten minutes; the close keeps its minute."""
+        import contextlib
+
+        drainer = HookOutboxDrainer()
+        mocks, patches = self._sweeps()
+        passes = [0]
+
+        async def wait():
+            passes[0] += 1
+            if passes[0] == 1:
+                # A minute on: the close is due again, the revive is not.
+                drainer._next_alert_close = 0.0
+            else:
+                drainer._stopping.set()
+
+        with contextlib.ExitStack() as stack:
+            for p in patches:
+                stack.enter_context(p)
+            stack.enter_context(patch.object(drainer, "_wait_for_nudge", side_effect=wait))
+            await drainer._loop()
+        assert mocks["close_unowed_waiting_alerts"].await_count == 2
+        mocks["revive_dead_alerts"].assert_awaited_once()
+        assert hook_outbox.ALERT_CLOSE_INTERVAL == 60.0
+        assert hook_outbox.ALERT_REVIVE_INTERVAL == 600.0
+        assert drainer._next_alert_revive - drainer._next_alert_close == pytest.approx(
+            hook_outbox.ALERT_REVIVE_INTERVAL - hook_outbox.ALERT_CLOSE_INTERVAL, abs=5
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_failed_revive_does_not_skip_the_close(self):
+        import contextlib
+
+        drainer = HookOutboxDrainer()
+        mocks, patches = self._sweeps(
+            revive_dead_alerts=AsyncMock(side_effect=RuntimeError("db down"))
+        )
+        with contextlib.ExitStack() as stack:
+            for p in patches:
+                stack.enter_context(p)
+            error = stack.enter_context(patch.object(hook_outbox.logger, "error"))
+            await self._passes(drainer, 1)
+        mocks["close_unowed_waiting_alerts"].assert_awaited_once()
+        error.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_an_alert_the_park_sweep_holds_is_not_dead_lettered(self):
+        import contextlib
+
+        drainer = HookOutboxDrainer()
+        held = {
+            "hook_outbox_id": "a-1",
+            "hook_type": "market_target",
+            "status": "pending",
+            "attempts": hook_outbox.MAX_ATTEMPTS,
+            "payload": {"exhausted": True},
+        }
+        _, patches = self._sweeps(park_exhausted_jobs=AsyncMock(return_value=[held]))
+        with contextlib.ExitStack() as stack:
+            for p in patches:
+                stack.enter_context(p)
+            error = stack.enter_context(patch.object(hook_outbox.logger, "error"))
+            exhausted = stack.enter_context(
+                patch.object(drainer, "_exhausted", AsyncMock())
+            )
+            closed = stack.enter_context(
+                patch.object(drainer, "_close_followup", AsyncMock())
+            )
+            await self._passes(drainer, 1)
+        exhausted.assert_awaited_once_with(held)
+        closed.assert_not_awaited()
+        error.assert_not_called()

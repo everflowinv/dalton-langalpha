@@ -2,14 +2,16 @@
 
 It is the one piece that renames user files, so each case runs the actual
 script in a subprocess over a temporary root rather than asserting on its
-text: the moves land, the tool ledger follows them, and nothing is ever
-deleted, only moved aside under ``_internal``.
+text: the moves land, the tool ledger follows them, and nothing is deleted
+but a deleted workspace's folder that a rename could not move aside under
+``_internal``.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -17,9 +19,11 @@ from pathlib import Path
 import pytest
 
 from src.server.services.computer_manager._folders import _SCRIPT, _SCRIPT_LIMIT_S
+from tests.unit.restored_overlay import archive, pinned, prefix
 
 LEFTOVERS = "_internal/leftovers"
 MOVING = "_internal/moving"
+MARKER = ".file_sync_marker"
 
 
 def _args(
@@ -28,6 +32,7 @@ def _args(
     moves=(),
     tombstones=(),
     deferred=(),
+    copying=(),
     ledger: dict | None = None,
     prune: bool = True,
 ) -> Path:
@@ -48,6 +53,8 @@ def _args(
         "moves": moves,
         "tombstones": tombstones,
         "deferred": list(deferred),
+        "copying": list(copying),
+        "marker": MARKER,
         "prune": prune,
     }
     args_path = root.parent / "folders_args.json"
@@ -55,11 +62,11 @@ def _args(
     return args_path
 
 
-def _run(root: Path, **plan) -> dict:
+def _run(root: Path, *, before: str = "", limit: int = _SCRIPT_LIMIT_S, **plan) -> dict:
     args_path = _args(root, **plan)
     done = subprocess.run(
-        [sys.executable, "-c", _SCRIPT, str(args_path), str(_SCRIPT_LIMIT_S)],
-        capture_output=True, text=True, check=True, timeout=_SCRIPT_LIMIT_S + 15,
+        [sys.executable, "-c", before + _SCRIPT, str(args_path), str(limit)],
+        capture_output=True, text=True, check=True, timeout=limit + 15,
     )
     assert not args_path.exists()
     return json.loads(done.stdout.strip().splitlines()[-1])
@@ -120,6 +127,141 @@ def test_a_deleted_workspace_is_moved_aside_before_its_name_is_reused(root):
     assert _owner(root, "Research") == "A"
 
 
+def _hard_to_copy(root: Path, name: str, marker: str) -> None:
+    """A folder holding what a copy has to carry over: a nested dir, a
+    symlink, a read-only file, and a folder its owner made read-only."""
+    _folder(root, name, marker)
+    top = root / name
+    (top / "pkg" / "lib").mkdir(parents=True)
+    (top / "pkg" / "lib" / "a.bin").write_bytes(os.urandom(5000))
+    (top / "alias").symlink_to("pkg")
+    (top / "ro.txt").write_text("ro")
+    (top / "ro.txt").chmod(0o444)
+    (top / "frozen").mkdir()
+    (top / "frozen" / "keep.txt").write_text("kept")
+    (top / "frozen").chmod(0o555)
+
+
+def _tree(top: Path) -> dict:
+    """Each entry under ``top`` by its kind and mode, a file by its bytes and
+    mtime, a link by its target."""
+    out = {}
+    for dirpath, dirnames, filenames in os.walk(top):
+        for name in dirnames + filenames:
+            entry = Path(dirpath, name)
+            st = entry.lstat()
+            if stat.S_ISLNK(st.st_mode):
+                body = os.readlink(entry)
+            elif stat.S_ISREG(st.st_mode):
+                body = (entry.read_bytes(), st.st_mtime_ns)
+            else:
+                body = None
+            out[str(entry.relative_to(top))] = (stat.S_IFMT(st.st_mode), stat.S_IMODE(st.st_mode), body)
+    return out
+
+
+# A Daytona sandbox restored from its archive refuses to rename any folder it
+# held then (EXDEV), which failed every rename, delete and move on it.
+
+
+def test_on_a_restored_disk_a_rename_copies_the_folder_into_place(root):
+    _hard_to_copy(root, "Research", "A")
+    want = _tree(root / "Research")
+    report = _run(
+        root,
+        before=prefix(archive(root)),
+        moves=[{"id": "A", "source": "Research", "target": "Macro"}],
+        copying=["A"],
+        ledger={"dirs": {"A": "Research"}},
+    )
+    assert report["moves"] == {"A": "Macro"}
+    assert report["errors"] == []
+    assert _tree(root / "Macro") == want
+    assert not (root / "Research").exists()
+    assert os.listdir(root / MOVING / "copies") == []
+    ledger = json.loads((root / "_internal" / "ledger.json").read_text())
+    assert ledger["dirs"] == {"A": "Macro"}
+
+
+def test_on_a_restored_disk_a_deleted_workspace_is_deleted_where_it_is(root):
+    _hard_to_copy(root, "Research", "dead")
+    _folder(root, "Research-1a2b", "A")
+    report = _run(
+        root,
+        before=prefix(archive(root)),
+        tombstones=[{"id": "D", "dir": "Research", "stuck": "delete"}],
+        moves=[{"id": "A", "source": "Research-1a2b", "target": "Research"}],
+        copying=["A"],
+    )
+    assert report["errors"] == []
+    assert report["tombstones"] == {"D": None}
+    assert report["deleted"] == ["D"]
+    assert not (root / LEFTOVERS / "D").exists()
+    assert _owner(root, "Research") == "A"
+
+
+def test_on_a_restored_disk_a_moved_workspace_is_copied_under_leftovers(root):
+    _hard_to_copy(root, "Research", "moved")
+    want = _tree(root / "Research")
+    report = _run(
+        root,
+        before=prefix(archive(root)),
+        tombstones=[{"id": "move-1", "dir": "Research", "stuck": "copy"}],
+        prune=False,
+    )
+    assert report["tombstones"] == {"move-1": f"{LEFTOVERS}/move-1"}
+    assert _tree(root / LEFTOVERS / "move-1") == want
+    assert not (root / "Research").exists()
+
+
+def test_a_rename_with_no_room_for_its_copy_keeps_the_old_folder(root):
+    _hard_to_copy(root, "Research", "A")
+    report = _run(
+        root,
+        before=prefix(archive(root), full=True),
+        moves=[{"id": "A", "source": "Research", "target": "Macro"}],
+        copying=["A"],
+    )
+    assert report["moves"] == {"A": "Research"}
+    assert list(report["blocked"]) == ["A"]
+    assert report["errors"] == []
+    assert _owner(root, "Research") == "A"
+    assert not (root / "Macro").exists()
+    assert not (root / MOVING / "copies" / "A").exists()
+
+
+def test_a_moved_workspace_with_no_room_for_its_copy_is_left_for_the_host(root):
+    _hard_to_copy(root, "Research", "moved")
+    report = _run(
+        root,
+        before=prefix(archive(root), full=True),
+        tombstones=[{"id": "move-1", "dir": "Research", "stuck": "copy"}],
+        prune=False,
+    )
+    assert list(report["blocked"]) == ["move-1"]
+    assert "move-1" not in report["tombstones"]
+    assert _owner(root, "Research") == "moved"
+
+
+def test_a_copy_the_deadline_cuts_short_lands_on_a_later_pass(root):
+    _hard_to_copy(root, "Research", "A")
+    want = _tree(root / "Research")
+    restored = archive(root)
+    plan = {"moves": [{"id": "A", "source": "Research", "target": "Macro"}], "copying": ["A"]}
+    # A limit that leaves no time past the landings: the copy stops at once.
+    first = _run(root, before=prefix(restored), limit=10, **plan)
+    assert first["moves"] == {"A": "Research"}
+    assert first["errors"] == []
+    assert [p for p in first["progress"] if "copying Research" in p]
+    assert (root / MOVING / "copies" / "A").is_dir()
+
+    second = _run(root, before=prefix(restored), **plan)
+
+    assert second["moves"] == {"A": "Macro"}
+    assert _tree(root / "Macro") == want
+    assert not (root / "Research").exists()
+
+
 def test_an_unowned_folder_on_the_target_is_kept_aside_not_merged(root):
     _folder(root, "Macro", "stray")
     _folder(root, "Research", "A")
@@ -130,9 +272,365 @@ def test_an_unowned_folder_on_the_target_is_kept_aside_not_merged(root):
     assert _owner(root, "Macro") == "A"
 
 
+def test_on_a_restored_disk_an_unowned_folder_is_copied_aside(root):
+    _hard_to_copy(root, "Macro", "stray")
+    want = _tree(root / "Macro")
+    _folder(root, "Research", "A")
+    report = _run(
+        root,
+        before=prefix(archive(root)),
+        moves=[{"id": "A", "source": "Research", "target": "Macro"}],
+        copying=["A"],
+    )
+    [(folder, away)] = report["evicted"]
+    assert folder == "Macro" and away.startswith(f"{LEFTOVERS}/Macro-")
+    assert _tree(root / away) == want
+    assert _owner(root, "Macro") == "A"
+
+
+def _late_once_copied_aside() -> str:
+    """Source, after ``prefix``, that runs the clock past every deadline once
+    a copy aside is renamed into place, so the delete after it stops at once."""
+    return (
+        "import time as _time\n"
+        "_rename_then, _now, _late = _os.rename, _time.time, []\n"
+        "def _renamed(src, dst, *, src_dir_fd=None, dst_dir_fd=None):\n"
+        "    _rename_then(src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)\n"
+        "    if str(src).endswith('.copying'):\n"
+        "        _late.append(dst)\n"
+        "_os.rename = _renamed\n"
+        "_time.time = lambda: _now() + (3600 if _late else 0)\n"
+    )
+
+
+def test_an_unowned_folder_copied_aside_whose_delete_is_cut_short_is_not_blocked(root):
+    """Copied whole, it is reported where it went, and the row goes back
+    under its old name until the next pass, rather than taking the backoff a
+    copy with no room gets."""
+    _hard_to_copy(root, "Macro", "stray")
+    want = _tree(root / "Macro")
+    restored = archive(root)
+    _folder(root, "Research", "A")
+    plan = {"id": "A", "source": "Research", "target": "Macro"}
+
+    first = _run(
+        root, before=prefix(restored) + _late_once_copied_aside(), moves=[plan], copying=["A"]
+    )
+
+    [(folder, away)] = first["evicted"]
+    assert folder == "Macro" and _tree(root / away) == want
+    assert first["blocked"] == {}
+    assert [p for p in first["progress"] if "deleting Macro where it is" in p]
+    assert first["moves"] == {"A": "Research"}
+    assert _owner(root, "Research") == "A"
+
+    second = _run(root, before=prefix(restored), moves=[plan], copying=["A"])
+
+    assert second["moves"] == {"A": "Macro"}
+    assert _owner(root, "Macro") == "A"
+    assert _tree(root / away) == want
+    # The delete went on where it stopped, with no second copy of what it left.
+    assert os.listdir(root / LEFTOVERS) == [os.path.basename(away)]
+
+
+def _late_after_copying(files: int) -> str:
+    """Source, after ``prefix``, that runs the clock past every deadline once
+    a copy aside has copied ``files`` files, so it stops partway."""
+    return (
+        "import stat as _stat, time as _time\n"
+        "_utime_then, _now, _stamped = _os.utime, _time.time, []\n"
+        "def _utime(path, *args, **kwargs):\n"
+        "    _utime_then(path, *args, **kwargs)\n"
+        "    if '.copying/' in str(path) and _stat.S_ISREG(_os.lstat(path).st_mode):\n"
+        "        _stamped.append(path)\n"
+        "_os.utime = _utime\n"
+        f"_time.time = lambda: _now() + (3600 if len(_stamped) >= {files} else 0)\n"
+    )
+
+
+def _copied_so_far(root: Path) -> dict:
+    """Each file a copy aside cut short has made, by its inode."""
+    [partial] = [p for p in (root / LEFTOVERS).iterdir() if p.name.endswith(".copying")]
+    return {
+        str(p.relative_to(partial)): p.lstat().st_ino
+        for p in partial.rglob("*")
+        if p.is_file() and not p.is_symlink()
+    }
+
+
+def _fills_after(checks: int) -> str:
+    """Source, after ``prefix``, that fills the disk once a copy has checked
+    for room ``checks`` times, and runs the clock past every deadline then,
+    so deleting what the copy wrote is cut short."""
+    return (
+        "import time as _time\n"
+        "_statvfs_then, _now, _checks = _os.statvfs, _time.time, []\n"
+        "def _filling(path):\n"
+        "    st = _statvfs_then(path)\n"
+        "    _checks.append(path)\n"
+        f"    if len(_checks) <= {checks}:\n"
+        "        return st\n"
+        "    return _os.statvfs_result((st.f_bsize, st.f_frsize, st.f_blocks, 0, 0,\n"
+        "        st.f_files, st.f_ffree, st.f_favail, st.f_flag, st.f_namemax))\n"
+        "_os.statvfs = _filling\n"
+        f"_time.time = lambda: _now() + (3600 if len(_checks) > {checks} else 0)\n"
+    )
+
+
+def _journaled(root: Path) -> dict:
+    return json.loads((root / MOVING / "landed.json").read_text())
+
+
+def test_a_copy_with_no_room_is_deleted_before_its_row_is_blocked(root):
+    """A blocked row runs no pass until its block ends, so the disk the copy
+    took would stay taken all that time. A pass the delete outlasts leaves the
+    row unblocked, and the next deletes the rest rather than copying on."""
+    _hard_to_copy(root, "Research", "A")
+    restored = archive(root)
+    plan = {"moves": [{"id": "A", "source": "Research", "target": "Macro"}], "copying": ["A"]}
+
+    first = _run(root, before=prefix(restored) + _fills_after(2), **plan)
+
+    assert first["moves"] == {"A": "Research"}
+    assert first["blocked"] == {}
+    assert [p for p in first["progress"] if "no room to copy Research, deleting" in p]
+    assert (root / MOVING / "copies" / "A").is_dir()
+
+    second = _run(root, before=prefix(restored), **plan)
+
+    assert second["moves"] == {"A": "Research"}
+    assert list(second["blocked"]) == ["A"]
+    assert not (root / MOVING / "copies" / "A").exists()
+    assert not (root / "Macro").exists()
+    assert "n:A" not in _journaled(root)
+    assert _owner(root, "Research") == "A"
+
+
+def test_a_copy_aside_with_no_room_is_deleted_before_its_row_is_blocked(root):
+    _hard_to_copy(root, "Macro", "stray")
+    restored = archive(root)
+    _folder(root, "Research", "A")
+    plan = {"moves": [{"id": "A", "source": "Research", "target": "Macro"}], "copying": ["A"]}
+
+    # The copy's folder, then two of the files and the link at its top.
+    first = _run(root, before=prefix(restored) + _fills_after(3), **plan)
+
+    assert first["moves"] == {"A": "Research"}
+    assert first["blocked"] == {}
+    assert 0 < len(_copied_so_far(root)) < 4
+
+    second = _run(root, before=prefix(restored), **plan)
+
+    assert second["moves"] == {"A": "Research"}
+    assert list(second["blocked"]) == ["A"]
+    assert os.listdir(root / LEFTOVERS) == []
+    assert not [k for k in _journaled(root) if k in ("n:A", "e:Macro")]
+    assert (_owner(root, "Research"), _owner(root, "Macro")) == ("A", "stray")
+
+
+def test_a_copy_aside_the_deadline_cuts_short_goes_on_from_there(root):
+    """The row goes back under its old name with no backoff, and the next
+    pass copies only what the first did not, then lands."""
+    _hard_to_copy(root, "Macro", "stray")
+    want = _tree(root / "Macro")
+    restored = archive(root)
+    _folder(root, "Research", "A")
+    plan = {"id": "A", "source": "Research", "target": "Macro"}
+
+    first = _run(
+        root, before=prefix(restored) + _late_after_copying(2), moves=[plan], copying=["A"]
+    )
+
+    assert first["moves"] == {"A": "Research"}
+    assert first["blocked"] == {}
+    assert first["evicted"] == []
+    assert [p for p in first["progress"] if "copying Macro aside" in p]
+    assert (_owner(root, "Research"), _owner(root, "Macro")) == ("A", "stray")
+    copied = _copied_so_far(root)
+    assert len(copied) == 2
+
+    second = _run(root, before=prefix(restored), moves=[plan], copying=["A"])
+
+    assert second["moves"] == {"A": "Macro"}
+    [(folder, away)] = second["evicted"]
+    assert folder == "Macro" and _tree(root / away) == want
+    assert _owner(root, "Macro") == "A"
+    assert os.listdir(root / LEFTOVERS) == [os.path.basename(away)]
+    # The files the first pass copied are the very ones the copy holds.
+    assert {rel: (root / away / rel).lstat().st_ino for rel in copied} == copied
+
+
+def test_a_copy_aside_cut_short_is_kept_only_while_its_row_still_has_to_move(root):
+    _hard_to_copy(root, "Macro", "stray")
+    restored = archive(root)
+    _folder(root, "Research", "A")
+    plan = {"id": "A", "source": "Research", "target": "Macro"}
+    _run(root, before=prefix(restored) + _late_after_copying(2), moves=[plan], copying=["A"])
+    copied = _copied_so_far(root)
+
+    # A pass that leaves the row, busy, where it is.
+    _run(root, before=prefix(restored), copying=["A"])
+    assert _copied_so_far(root) == copied
+
+    # Renamed back, it no longer moves at all.
+    _run(root, before=prefix(restored), copying=[])
+    assert os.listdir(root / LEFTOVERS) == []
+    journal = json.loads((root / MOVING / "landed.json").read_text())
+    assert "e:Macro" not in journal
+    assert _owner(root, "Macro") == "stray"
+
+
+def test_a_copy_aside_cut_short_goes_once_its_row_is_renamed_elsewhere(root):
+    """Renamed again, the row clears only its new target: the old one's part
+    copy goes in the same pass, before the move it would crowd."""
+    _hard_to_copy(root, "Macro", "stray")
+    restored = archive(root)
+    _folder(root, "Research", "A")
+    plan = {"id": "A", "source": "Research", "target": "Macro"}
+    _run(root, before=prefix(restored) + _late_after_copying(2), moves=[plan], copying=["A"])
+    assert len(_copied_so_far(root)) == 2
+
+    report = _run(
+        root,
+        before=prefix(restored),
+        moves=[{"id": "A", "source": "Research", "target": "Equities"}],
+        copying=["A"],
+    )
+
+    assert report["moves"] == {"A": "Equities"}
+    assert _owner(root, "Equities") == "A"
+    assert os.listdir(root / LEFTOVERS) == []
+    assert "e:Macro" not in _journaled(root)
+    assert _owner(root, "Macro") == "stray"
+
+
+def test_an_unowned_folder_whose_delete_fails_after_its_copy_is_not_copied_again(root):
+    """The delete stops on a dir something holds: the row goes back under its
+    old name, rather than stay in staging, where it takes no turns, for as
+    long as the error lasts, and the next pass deletes what is left rather
+    than copying it into a second folder."""
+    _hard_to_copy(root, "Macro", "stray")
+    (root / "Macro" / "pinned").mkdir()
+    restored = archive(root)
+    _folder(root, "Research", "A")
+    plan = {"id": "A", "source": "Research", "target": "Macro"}
+
+    first = _run(root, before=prefix(restored) + pinned("pinned"), moves=[plan], copying=["A"])
+
+    [(_, away)] = first["evicted"]
+    assert first["moves"] == {"A": "Research"}
+    assert [e for e in first["errors"] if "land A" in e]
+    assert _owner(root, "Research") == "A"
+    assert (root / "Macro").exists()
+
+    second = _run(root, before=prefix(restored), moves=[plan], copying=["A"])
+
+    assert second["moves"] == {"A": "Macro"}
+    assert _owner(root, "Macro") == "A"
+    assert os.listdir(root / LEFTOVERS) == [os.path.basename(away)]
+
+
+def test_a_row_whose_target_cannot_be_cleared_goes_back_to_its_folder(root):
+    """An unowned restored folder on the target with no room to copy it
+    aside: the row goes back under its old name, not left in staging where it
+    takes no turns, and the target is blocked so the next pass does not try
+    the same copy."""
+    _folder(root, "Macro", "stray")
+    restored = archive(root)
+    _folder(root, "Research", "A")
+    report = _run(
+        root,
+        before=prefix(restored, full=True),
+        moves=[{"id": "A", "source": "Research", "target": "Macro"}],
+        copying=["A"],
+    )
+    assert report["moves"] == {"A": "Research"}
+    assert list(report["blocked"]) == ["A"]
+    assert (_owner(root, "Research"), _owner(root, "Macro")) == ("A", "stray")
+    assert not (root / MOVING / "A").exists()
+
+
+def test_a_row_staged_across_an_archive_lands_by_copy(root):
+    """Its staging folder went into the restored layer with everything else,
+    so it cannot be renamed onto the target either."""
+    _hard_to_copy(root, f"{MOVING}/A", "A")
+    want = _tree(root / MOVING / "A")
+    report = _run(
+        root,
+        before=prefix(archive(root)),
+        moves=[{
+            "id": "A", "source": "Research", "target": "Macro",
+            "staged": True, "landings": ["Macro"],
+        }],
+        copying=["A"],
+    )
+    assert report["moves"] == {"A": "Macro"}
+    assert report["errors"] == []
+    assert _tree(root / "Macro") == want
+    assert not (root / MOVING / "A").exists()
+
+
+def test_a_row_copied_onto_its_target_stays_there_while_staging_takes_passes_to_go(root):
+    """Landed by a copy, with its staging still to delete over two passes:
+    the entry naming the target is the one record of where the content went,
+    so the pass that finishes the delete lands the row there rather than
+    taking its folder for an unowned one."""
+    _hard_to_copy(root, f"{MOVING}/A", "A")
+    (root / MOVING / "A" / "pinned").mkdir()
+    want = _tree(root / MOVING / "A")
+    restored = archive(root)
+    plan = {
+        "id": "A", "source": "Research", "target": "Macro",
+        "staged": True, "landings": ["Macro"],
+    }
+    for _ in range(2):
+        report = _run(root, before=prefix(restored) + pinned("pinned"), moves=[plan], copying=["A"])
+        assert report["moves"] == {"A": f"{MOVING}/A"}
+
+    last = _run(root, before=prefix(restored), moves=[plan], copying=["A"])
+
+    assert last["moves"] == {"A": "Macro"}
+    assert last["evicted"] == []
+    assert _tree(root / "Macro") == want
+    assert not (root / MOVING / "A").exists()
+
+
+def test_a_delete_cut_short_after_the_copy_loses_the_sync_marker_first(root):
+    """Content in staging and the old folder part deleted: the marker goes
+    first, so what is left reads as a folder that lost files. The row stays
+    staged, and the next pass finishes the delete and lands it."""
+    _hard_to_copy(root, "Research", "A")
+    (root / "Research" / MARKER).write_text("synced")
+    (root / "Research" / "pinned").mkdir()
+    want = _tree(root / "Research")
+    restored = archive(root)
+    plan = {"target": "Macro", "source": "Research", "id": "A"}
+
+    # Past the copy's commit, the delete in place stops on one dir.
+    first = _run(root, before=prefix(restored) + pinned("pinned"), moves=[plan], copying=["A"])
+
+    assert first["moves"] == {"A": f"{MOVING}/A"}
+    assert [e for e in first["errors"] if "deleting Research where it is" in e]
+    assert (root / "Research").exists()
+    assert not (root / "Research" / MARKER).exists()
+    assert _tree(root / MOVING / "A") == want
+
+    second = _run(
+        root,
+        before=prefix(restored),
+        moves=[{**plan, "staged": True, "landings": ["Macro"]}],
+        copying=["A"],
+    )
+
+    assert second["moves"] == {"A": "Macro"}
+    assert not (root / "Research").exists()
+    assert _tree(root / "Macro") == want
+
+
 def test_a_move_never_lands_on_a_deleted_workspace_it_could_not_clear(root):
     """The tombstone's row still points at the folder, so its cleanup would
-    remove whatever landed there: the mover stays staged instead."""
+    remove whatever landed there: the mover stays where it is instead, not
+    staged, where it would take no turns until the folder clears."""
     _folder(root, "Research", "dead")
     _folder(root, "Research-1a2b", "A")
     # A file where the leftovers folder should be makes the tombstone's move fail.
@@ -144,9 +642,10 @@ def test_a_move_never_lands_on_a_deleted_workspace_it_could_not_clear(root):
         moves=[{"id": "A", "source": "Research-1a2b", "target": "Research"}],
     )
     assert "D" not in report["tombstones"]
-    assert report["moves"] == {"A": f"{MOVING}/A"}
+    assert report["moves"] == {"A": "Research-1a2b"}
     assert _owner(root, "Research") == "dead"
-    assert _owner(root, f"{MOVING}/A") == "A"
+    assert _owner(root, "Research-1a2b") == "A"
+    assert not (root / MOVING / "A").exists()
 
 
 def test_a_move_interrupted_after_staging_finishes_from_staging(root):
@@ -378,6 +877,57 @@ def _journal(root: Path, entries: dict) -> None:
     (root / MOVING / "landed.json").write_text(json.dumps(entries))
 
 
+def test_a_copy_committed_before_an_archive_still_finishes_its_delete(root):
+    """The archive gave the copy a new inode, so the journal knows the commit
+    ran by the copy being gone from where it was built: what is left of the
+    old folder goes, rather than staying under its name for the next
+    workspace called so."""
+    _hard_to_copy(root, f"{MOVING}/W", "W")
+    want = _tree(root / MOVING / "W")
+    _folder(root, "Research", "left")
+    _journal(root, {"c:W": ["Research", 1, f"{MOVING}/W"]})
+    report = _run(
+        root,
+        before=prefix(archive(root)),
+        moves=[{
+            "id": "W", "source": "Research", "target": "Macro",
+            "staged": True, "landings": ["Macro"],
+        }],
+        copying=["W"],
+    )
+    assert report["moves"] == {"W": "Macro"}
+    assert report["errors"] == []
+    assert not (root / "Research").exists()
+    assert _tree(root / "Macro") == want
+
+
+def test_a_copy_whose_commit_is_journaled_is_kept_by_the_prune(root):
+    """Still where it was built, it says the commit never ran: pruned, the
+    folder under the journal's name would read as the copy, and its source
+    be deleted."""
+    _folder(root, "Research", "moved")
+    _folder(root, f"{MOVING}/copies/move-1", "moved")
+    _journal(root, {"c:move-1": ["Research", 1, f"{LEFTOVERS}/move-1"]})
+    _run(root, moves=[], copying=[])
+    assert (root / MOVING / "copies" / "move-1").is_dir()
+    assert _owner(root, "Research") == "moved"
+
+
+def test_a_copy_entry_naming_no_folder_is_ignored(root):
+    """A staged row with no source has None among its folders, so an entry
+    naming none passed for its own, and its delete failed every pass."""
+    _folder(root, f"{MOVING}/W", "W")
+    _folder(root, "Macro", "other")
+    _journal(root, {"c:W": [None, 1, "Macro"]})
+    report = _run(root, moves=[{
+        "id": "W", "source": None, "target": "Research",
+        "staged": True, "landings": ["Research"],
+    }])
+    assert [e for e in report["errors"] if e.startswith("journal c:W: ignored")]
+    assert report["moves"] == {"W": "Research"}
+    assert (_owner(root, "Research"), _owner(root, "Macro")) == ("W", "other")
+
+
 def test_a_journal_entry_naming_another_rows_folder_is_ignored(root):
     """Code in the sandbox can write the journal. Followed, an entry naming a
     sibling's folder moves the sibling into this row, and the report still
@@ -474,13 +1024,14 @@ def _run_locked_out(root: Path, **plan) -> dict:
 
     args_path = _args(root, **plan)
     (root / "_internal").mkdir(parents=True, exist_ok=True)
+    # Each wait between tries passes a minute.
     later = (
         "import time\n"
-        "_now, _calls = time.time, []\n"
-        "def _later():\n"
-        "    _calls.append(None)\n"
-        "    return _now() + (60 if len(_calls) > 1 else 0)\n"
-        "time.time = _later\n"
+        "_now, _skew = time.time, [0]\n"
+        "def _sleep(_s):\n"
+        "    _skew[0] += 60\n"
+        "time.time = lambda: _now() + _skew[0]\n"
+        "time.sleep = _sleep\n"
     )
     with open(root / "_internal" / "ledger.lock", "a+") as ledger_lock:
         fcntl.flock(ledger_lock, fcntl.LOCK_EX)
@@ -512,16 +1063,17 @@ def _run_failing_rename(root: Path, src: str, dst: str, **plan) -> dict:
 def test_a_staged_row_that_cannot_stage_again_keeps_its_old_folder(root):
     """A pass staged both rows in the database and never reached the disk, so
     A's content is still in its old folder, which B is renamed to. Left
-    unheld, B would set A's content aside as unowned and take the folder."""
+    unheld, B would set A's content aside as unowned and take the folder; it
+    stays in its own instead."""
     _folder(root, "X", "A")
     _folder(root, "W", "B")
     report = _run_failing_rename(root, "X", f"{MOVING}/A", moves=[
         {"id": "A", "source": "X", "target": "Z", "staged": True, "landings": ["Z"]},
         {"id": "B", "source": "W", "target": "X", "staged": True, "landings": ["X"]},
     ])
-    assert report["moves"] == {"A": "X", "B": f"{MOVING}/B"}
+    assert report["moves"] == {"A": "X", "B": "W"}
     assert report["evicted"] == []
-    assert _owner(root, "X") == "A"
+    assert (_owner(root, "X"), _owner(root, "W")) == ("A", "B")
 
 
 def test_a_landing_outlives_a_later_pass_that_planned_elsewhere_and_moved_nothing(root):
@@ -541,23 +1093,22 @@ def test_a_landing_outlives_a_later_pass_that_planned_elsewhere_and_moved_nothin
 
 
 def test_a_landing_taken_back_to_staging_leaves_the_journal(root):
-    """A's unrecorded landing, on its old folder while its name was held, goes
+    """A's unrecorded landing, on its old folder while its name was taken, goes
     back to staging; A cannot land this pass, and B, renamed to A's old name,
     lands on the folder A left. Neither records. An entry still naming it
     would claim B's content for A."""
     _folder(root, "Research", "A")
     _journal(root, {"A": "Research"})
-    _folder(root, "Macro", "dead")
+    _folder(root, "Macro", "unowned")
     _folder(root, "Notes", "B")
-    # The deleted workspace on A's name cannot clear, so A cannot land there.
+    # The unowned folder on A's name cannot be set aside, so A cannot land there.
     (root / LEFTOVERS).write_text("")
-    tombstones = [{"id": "D", "dir": "Macro"}]
     a = {"id": "A", "source": "Research", "target": "Macro", "staged": True}
     b = {"id": "B", "source": "Notes", "target": "Research"}
-    blocked = _run(root, tombstones=tombstones, moves=[{**a, "landings": ["Research"]}, b])
+    blocked = _run(root, moves=[{**a, "landings": ["Research"]}, b])
     assert blocked["moves"] == {"A": f"{MOVING}/A", "B": "Research"}
     (root / LEFTOVERS).unlink()
-    report = _run(root, tombstones=tombstones, moves=[
+    report = _run(root, moves=[
         {**a, "landings": ["Research", "Macro"]},
         {**b, "staged": True, "landings": ["Research"]},
     ])
@@ -689,6 +1240,7 @@ async def test_clearing_a_deleted_workspace_runs_the_real_script(root, monkeypat
     monkeypatch.setattr(_folders, "retarget_folder_cleanup", retarget)
     monkeypatch.setattr(_folders, "get_workspace_dir_name", AsyncMock(return_value="Research"))
     monkeypatch.setattr(_folders, "computer_run_in_progress", AsyncMock(return_value=False))
+    monkeypatch.setattr(_folders, "computer_command_running", AsyncMock(return_value=False))
     monkeypatch.setattr(_folders, "hold_workspace_folder", AsyncMock(return_value=True))
     _folder(root, "Research", "dead")
     moved = await _folders.FolderSettleMixin._clear_tombstone_folder(
@@ -715,6 +1267,7 @@ async def test_a_deleted_workspace_a_file_change_holds_is_not_cleared_yet(root, 
     monkeypatch.setattr(_folders, "workspace_folders_lock", lock)
     monkeypatch.setattr(_folders, "get_workspace_dir_name", AsyncMock(return_value="Research"))
     monkeypatch.setattr(_folders, "computer_run_in_progress", AsyncMock(return_value=False))
+    monkeypatch.setattr(_folders, "computer_command_running", AsyncMock(return_value=False))
     monkeypatch.setattr(_folders, "hold_workspace_folder", AsyncMock(return_value=False))
     _folder(root, "Research", "dead")
     runtime = _SubprocessRuntime()
@@ -727,9 +1280,11 @@ async def test_a_deleted_workspace_a_file_change_holds_is_not_cleared_yet(root, 
 
 
 @pytest.mark.asyncio
-async def test_a_deleted_workspace_is_not_cleared_while_a_sibling_runs(root, monkeypatch):
-    """A sibling's code may still write ../Research; moving it now would let
-    that write recreate the name for the next workspace to take it."""
+@pytest.mark.parametrize("busy", ["computer_run_in_progress", "computer_command_running"])
+async def test_a_deleted_workspace_is_not_cleared_while_a_sibling_runs(root, monkeypatch, busy):
+    """A sibling's code may still write ../Research, from a run or a command
+    handed off past its turn; moving it now would let that write recreate the
+    name for the next workspace to take it."""
     from contextlib import asynccontextmanager
     from unittest.mock import AsyncMock
 
@@ -742,7 +1297,9 @@ async def test_a_deleted_workspace_is_not_cleared_while_a_sibling_runs(root, mon
     hold = AsyncMock(return_value=True)
     monkeypatch.setattr(_folders, "workspace_folders_lock", lock)
     monkeypatch.setattr(_folders, "get_workspace_dir_name", AsyncMock(return_value="Research"))
-    monkeypatch.setattr(_folders, "computer_run_in_progress", AsyncMock(return_value=True))
+    monkeypatch.setattr(_folders, "computer_run_in_progress", AsyncMock(return_value=False))
+    monkeypatch.setattr(_folders, "computer_command_running", AsyncMock(return_value=False))
+    monkeypatch.setattr(_folders, busy, AsyncMock(return_value=True))
     monkeypatch.setattr(_folders, "hold_workspace_folder", hold)
     _folder(root, "Research", "dead")
     runtime = _SubprocessRuntime()
@@ -804,7 +1361,8 @@ async def test_a_plan_longer_than_one_shell_argument_still_runs(root):
         runtime, str(root), moves=[], tombstones=tombstones, prune=True
     )
     assert report["tombstones"] == {t["id"]: None for t in tombstones}
-    assert max(map(len, runtime.commands)) < 32 * 1024
+    # The script itself, compressed and base64'd, is about 19 KiB; the plan adds nothing.
+    assert max(map(len, runtime.commands)) < 64 * 1024
     assert list((root / "_internal").glob(".folders_args.*")) == []
 
 
@@ -888,6 +1446,83 @@ async def test_a_settle_sends_the_script_every_field_it_reads(root, monkeypatch)
         "moves": {"A": "Macro", "B": "Notes"}, "tombstones": {"D": f"{LEFTOVERS}/D"},
     }
     assert (_owner(root, "Macro"), _owner(root, "Notes")) == ("A", "B")
+
+
+@pytest.mark.asyncio
+async def test_a_folder_its_owner_kept_is_set_aside_only_for_its_names_new_owner(
+    root, monkeypatch
+):
+    """Deleted on the owner's machine without asking for the files to go, a
+    folder stays where it is, and goes under leftovers, whole, only when a new
+    workspace takes its name. No pass deletes it, even where a rename fails."""
+    from contextlib import asynccontextmanager
+    from unittest.mock import AsyncMock
+
+    from src.server.database.workspace_folders import (
+        FOLDER_LAYOUT_VERSION, FolderRow, plan_folder_moves,
+    )
+    from src.server.services.computer_manager import _folders
+
+    rows = [
+        FolderRow("K", "Research", "Research", True, kept=True),
+        FolderRow("L", "Old", "Old", True, kept=True),
+        FolderRow("A", "Research", "Research-1a2b", False),
+    ]
+
+    @asynccontextmanager
+    async def lock(_computer_id):
+        yield object()
+
+    sent = []
+    real_run = _folders._run_folder_script
+
+    async def run(*args, **kwargs):
+        sent.append(kwargs)
+        return await real_run(*args, **kwargs)
+
+    record = AsyncMock(return_value={"A"})
+    monkeypatch.setattr(_folders, "read_folder_rows", AsyncMock(return_value=(FOLDER_LAYOUT_VERSION, rows)))
+    monkeypatch.setattr(_folders, "busy_workspace_ids", AsyncMock(return_value=set()))
+    monkeypatch.setattr(_folders, "workspace_folders_lock", lock)
+    monkeypatch.setattr(_folders, "stage_folder_moves", AsyncMock(return_value=plan_folder_moves(rows)))
+    monkeypatch.setattr(_folders, "record_folder_landings", record)
+    monkeypatch.setattr(_folders, "_run_folder_script", run)
+    _hard_to_copy(root, "Research", "kept")
+    want = _tree(root / "Research")
+    _folder(root, "Old", "also kept")
+    _folder(root, "Research-1a2b", "A")
+
+    assert await _folders.FolderSettleMixin._settle_folders(
+        None, "c", _SubprocessRuntime(), root=str(root)
+    )
+    [payload] = sent
+    assert [(t["id"], t["stuck"]) for t in payload["tombstones"]] == [("K", "copy")]
+    assert record.await_args.kwargs == {
+        "moves": {"A": "Research"}, "tombstones": {"K": f"{LEFTOVERS}/K"},
+    }
+    assert _owner(root, "Research") == "A"
+    assert _tree(root / LEFTOVERS / "K") == want
+    assert _owner(root, "Old") == "also kept"
+
+
+def test_on_a_restored_disk_a_kept_folder_is_copied_aside_not_deleted(root):
+    """A failed rename deletes an ordinary deleted workspace's folder where it
+    is; one its owner kept is copied under leftovers instead."""
+    _hard_to_copy(root, "Research", "kept")
+    want = _tree(root / "Research")
+    _folder(root, "Research-1a2b", "A")
+    report = _run(
+        root,
+        before=prefix(archive(root)),
+        tombstones=[{"id": "K", "dir": "Research", "stuck": "copy"}],
+        moves=[{"id": "A", "source": "Research-1a2b", "target": "Research"}],
+        copying=["A"],
+    )
+    assert report["errors"] == []
+    assert report["tombstones"] == {"K": f"{LEFTOVERS}/K"}
+    assert "K" not in report.get("deleted", [])
+    assert _tree(root / LEFTOVERS / "K") == want
+    assert _owner(root, "Research") == "A"
 
 
 @pytest.mark.asyncio

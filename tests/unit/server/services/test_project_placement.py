@@ -84,13 +84,15 @@ async def test_the_binding_read_returns_the_previous_names():
 
 @pytest.mark.asyncio
 async def test_the_turn_project_carries_the_previous_names(monkeypatch):
-    from src.server.handlers.chat import ptc_run
+    from src.server.services import workspace_layout
 
     placement = placement_from_binding(WS, _binding(), root=ROOT)
     monkeypatch.setattr(
-        ptc_run, "resolve_project_placement", AsyncMock(return_value=placement)
+        workspace_layout,
+        "resolve_project_placement",
+        AsyncMock(return_value=placement),
     )
     session = SimpleNamespace(sandbox=SimpleNamespace(working_dir=ROOT))
-    project = await ptc_run._resolve_project(session, WS)
+    project = await workspace_layout.resolve_project_context(session, WS)
     assert project.previous_dir_names == ("Old Name", "Older")
     assert project.sibling_dir_names == ("Beta",)

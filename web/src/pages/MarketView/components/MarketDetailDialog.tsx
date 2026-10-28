@@ -5,6 +5,7 @@ import ToolCallDetailView, { type ToolCallProcessRecord } from '../../ChatAgent/
 import PreviewViewer from '../../ChatAgent/components/viewers/PreviewViewer';
 import type { PreviewData } from '../../ChatAgent/hooks/utils/types';
 import { getDisplayName, getToolIcon, isTaskTool } from '../../ChatAgent/components/toolDisplayConfig';
+import { useWorkspaceFolders } from '../../ChatAgent/contexts/WorkspaceContext';
 import { Zap } from 'lucide-react';
 
 /**
@@ -25,6 +26,7 @@ interface MarketDetailDialogProps {
 
 export default function MarketDetailDialog({ payload, onClose, getToolCallProcess }: MarketDetailDialogProps): React.ReactElement {
   const { t } = useTranslation();
+  const root = useWorkspaceFolders()?.rootDir;
 
   const open = payload !== null;
   const toolCallProcess = payload?.type === 'toolcall'
@@ -35,10 +37,10 @@ export default function MarketDetailDialog({ payload, onClose, getToolCallProces
   if (toolCallProcess) {
     const proc = toolCallProcess;
     const toolName = proc.toolName || '';
-    const IconComponent = getToolIcon(toolName, proc.toolCall?.args);
+    const IconComponent = getToolIcon(toolName, proc.toolCall?.args, root);
     const displayName = isTaskTool(toolName)
       ? t('toolArtifact.subagentTask')
-      : getDisplayName(toolName, t, proc.toolCall?.args);
+      : getDisplayName(toolName, t, proc.toolCall?.args, { root });
     title = (
       <span className="flex items-center gap-2">
         <IconComponent className="h-4 w-4 shrink-0" style={{ color: 'var(--color-accent-primary)' }} />
@@ -111,6 +113,8 @@ export default function MarketDetailDialog({ payload, onClose, getToolCallProces
               url={payload.preview.url}
               port={payload.preview.port}
               title={payload.preview.title}
+              path={payload.preview.path}
+              workspaceId={payload.preview.workspaceId}
               loading={payload.preview.loading}
               error={payload.preview.error}
               reloadToken={payload.preview.reloadToken}

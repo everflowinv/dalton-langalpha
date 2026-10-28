@@ -25,15 +25,20 @@ from typing import Any
 from langchain_core.messages import AnyMessage
 from langgraph.types import Overwrite
 
-from ptc_agent.agent.middleware.compaction.offloading import recorded_offloads, tool_call_ids
+from ptc_agent.agent.middleware.compaction.offloading import (
+    recorded_offloads,
+    removed_attachments,
+    tool_call_ids,
+)
 from ptc_agent.agent.middleware.compaction.utils import resolve_cutoff_index
 from ptc_agent.agent.state import ensure_message_ids
 from ptc_agent.agent.transcript.classify import is_run_boundary_message
 from ptc_agent.agent.transcript.identity import Window
 
-#: Whether stored turn slices, read in branch order, start with exactly the
-#: messages this window trims.
-WindowCoverage = Callable[[Window], Awaitable[bool]]
+#: The window with the given messages trimmed after it, when stored turn
+#: slices, read in branch order, start with exactly its messages and then
+#: those; None when they do not.
+WindowCoverage = Callable[[Window, Sequence[AnyMessage]], Awaitable[Window | None]]
 
 #: The state update that keeps what a reader counting over the whole list
 #: would have read in the trimmed messages, ``(trimmed, state) -> update``.
@@ -73,13 +78,12 @@ def trim(
     head: Window,
 ) -> dict[str, Any]:
     """The update trimming ``state``'s messages before ``cut``, ``head``
-    being ``Window.of(state).extend(messages[:cut])``, the one the server
-    was asked about.
+    being the window the server answered for them (``WindowCoverage``).
 
-    The recorded offloads shrink to the calls still in the list, as a
-    compaction drops the ones it summarized. Ids are stamped on the kept
-    messages here, since an ``Overwrite`` skips the stamping a write through
-    the reducer gets.
+    The recorded offloads and removed attachments shrink to what is still in
+    the list, as a compaction drops the ones it summarized. Ids are stamped on the kept
+    messages here because langgraph 1.2.11 left an ``Overwrite``'s messages
+    unstamped; later releases stamp them too.
     """
     messages = state["messages"]
     trimmed, kept = messages[:cut], ensure_message_ids(list(messages[cut:]))
@@ -90,6 +94,9 @@ def trim(
         update["_offloaded_tool_call_ids"] = args & live
     if reads - live:
         update["_offloaded_read_result_ids"] = reads & live
+    removed = removed_attachments(state)
+    if removed - {msg.id for msg in kept}:
+        update["_removed_attachment_ids"] = removed & {msg.id for msg in kept}
     for carry in carries:
         update.update(carry(trimmed, state))
     return update

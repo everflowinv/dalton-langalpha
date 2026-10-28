@@ -61,9 +61,59 @@ describe('reportRowProvenance', () => {
       .toEqual({ kind: 'analyst_report', threadId: 'th-ws', workspaceId: null, workspaceName: null });
   });
 
+  it('carries how the analyst\'s run ended, and which runs it answers', () => {
+    expect(reportRowProvenance({
+      kind: 'analyst', thread_id: 'th-ws', workspace_id: 'ws-1', workspace_name: 'Semis',
+      outcome: 'cancelled', run_ids: ['run-1', 'run-1b'],
+    })).toEqual({
+      kind: 'analyst_report', threadId: 'th-ws', workspaceId: 'ws-1', workspaceName: 'Semis',
+      outcome: 'cancelled', runIds: ['run-1', 'run-1b'],
+    });
+  });
+
+  it('leaves the outcome and runs out on a report that has none', () => {
+    // Rows stored before they were kept.
+    const row = reportRowProvenance({ kind: 'analyst', thread_id: 'th-ws' });
+    expect(row).not.toHaveProperty('outcome');
+    expect(row).not.toHaveProperty('runIds');
+    expect(row).not.toHaveProperty('steerIds');
+  });
+
+  it('keeps the steers a report took in, even none, which an older report cannot say', () => {
+    expect(reportRowProvenance({ kind: 'analyst', thread_id: 'th-ws', run_ids: ['run-2'], steer_ids: ['steer-1'] }))
+      .toMatchObject({ runIds: ['run-2'], steerIds: ['steer-1'] });
+    expect(reportRowProvenance({ kind: 'analyst', thread_id: 'th-ws', run_ids: ['run-1'], steer_ids: [] }))
+      .toMatchObject({ steerIds: [] });
+  });
+
   it('names the task, and whether it failed', () => {
     expect(reportRowProvenance({ kind: 'task', task_id: 'k7Xm2p', display_id: 'Task-k7Xm2p', description: 'Pull filings', failed: true }))
       .toEqual({ kind: 'task_report', taskId: 'k7Xm2p', displayId: 'Task-k7Xm2p', description: 'Pull filings', failed: true });
+  });
+
+  it('carries the subagent\'s role, when the report has it', () => {
+    expect(reportRowProvenance({
+      kind: 'task', task_id: 'k7Xm2p', display_id: 'Task-k7Xm2p', failed: false, subagent_type: 'research',
+    })).toEqual({
+      kind: 'task_report', taskId: 'k7Xm2p', displayId: 'Task-k7Xm2p', description: null, failed: false,
+      subagentType: 'research',
+    });
+  });
+
+  it('names a background command by what the agent said it does, and how it ended', () => {
+    expect(reportRowProvenance({
+      kind: 'command_report', command_id: 'bg-3f9a1c2e7d10', tool: 'Bash', description: 'Run 10-year backtest',
+      status: 'completed', tool_call_id: 'call_1',
+    })).toEqual({
+      kind: 'command_report', tool: 'Bash', description: 'Run 10-year backtest',
+      status: 'completed', failureReason: null, toolCallId: 'call_1',
+    });
+    expect(reportRowProvenance({
+      kind: 'command_report', command_id: 'bg-77c0e41a9b2e', tool: 'ExecuteCode', status: 'failed', failure_reason: 'after_turn_limit',
+    })).toEqual({
+      kind: 'command_report', tool: 'ExecuteCode', description: null,
+      status: 'failed', failureReason: 'after_turn_limit', toolCallId: null,
+    });
   });
 
   it('keeps a report-back without a source hidden', () => {

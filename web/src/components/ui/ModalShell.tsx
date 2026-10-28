@@ -5,7 +5,7 @@ import { X } from 'lucide-react';
 import { useBackdropDismiss, useDialogA11y } from '@/hooks/useDialogA11y';
 import { useIsMobile } from '@/hooks/useIsMobile';
 import { useSwipeToDismiss } from '@/hooks/useSwipeToDismiss';
-import { DURATION, EASE_OUT } from '@/lib/motion';
+import { DURATION, TWEEN } from '@/lib/motion';
 import { cn } from '@/lib/utils';
 
 /**
@@ -20,6 +20,10 @@ import { cn } from '@/lib/utils';
  * squashes mid-motion. The panel measures its content and follows it; until
  * the first measurement it is `auto`, which is also what a test renderer
  * with no layout sees.
+ *
+ * A shell opened over another shows one panel at a time: the one underneath
+ * is `covered` and steps out of view, the one on top is `stacked` and leaves
+ * the dimming to it, so the page behind is dimmed once rather than twice.
  */
 
 const WIDTH = {
@@ -83,8 +87,11 @@ export function ModalShell({
   dismissable = true,
   closeDisabled = false,
   width = 'standard',
-  zIndex = 1010,
+  zIndex,
   density = 'form',
+  covered = false,
+  stacked = false,
+  fixedHeight,
   footer,
   children,
 }: {
@@ -102,9 +109,32 @@ export function ModalShell({
   /** The close control is shown but inert, for a save in flight. */
   closeDisabled?: boolean;
   width?: keyof typeof WIDTH;
+  /** Defaults to the shell layer, one step higher when `stacked`, so a shell
+   *  opened over another sits on top of it without saying so. */
   zIndex?: number;
   /** How roomy the panel sits: a form, or a detail overlay's reading rhythm. */
   density?: keyof typeof DENSITY;
+  /**
+   * Another shell is open over this one. The panel fades out and goes inert
+   * but stays mounted, so its state and scroll position are there when it
+   * comes back; its backdrop stays, as the only dimming on the page.
+   */
+  covered?: boolean;
+  /**
+   * Opened over a shell that is `covered`. The backdrop still takes the click
+   * outside, but paints nothing, since the shell underneath already dims.
+   */
+  stacked?: boolean;
+  /**
+   * Hold the panel at this many pixels, the viewport permitting, whatever the
+   * body holds. For a form whose body changes shape at the user's pick: the
+   * panel and the controls above the change stay put, and a longer body
+   * scrolls rather than growing the panel. A prop rather than the caller
+   * sizing its own children, since the body's padding and scroll are the
+   * shell's: a caller's fixed box would scroll inside that padding, a second
+   * scroller in the first.
+   */
+  fixedHeight?: number;
   /** Pinned under the scroll body; lay the buttons out yourself. */
   footer?: React.ReactNode;
   children: React.ReactNode;
@@ -116,6 +146,7 @@ export function ModalShell({
   const reducedMotion = useReducedMotion();
   const isMobile = useIsMobile();
   const space = DENSITY[density];
+  const layer = zIndex ?? (stacked ? 1020 : 1010);
   useScrollLock();
 
   // The panel follows the measured height of its content.
@@ -134,7 +165,7 @@ export function ModalShell({
         return;
       }
       if (height.get() === next) return;
-      animate(height, next, reducedMotion ? { duration: 0 } : { duration: DURATION.fold, ease: EASE_OUT });
+      animate(height, next, reducedMotion ? { duration: 0 } : TWEEN.fold);
     });
     ro.observe(el);
     return () => ro.disconnect();
@@ -162,11 +193,17 @@ export function ModalShell({
     : isMobile
       ? { initial: { opacity: 0, y: 32 }, animate: { opacity: 1, y: 0 }, exit: { opacity: 0, y: 24 } }
       : { initial: { opacity: 0, y: 12, scale: 0.98 }, animate: { opacity: 1, y: 0, scale: 1 }, exit: { opacity: 0, y: 6, scale: 0.98 } };
+  // Stepping back, not leaving: no travel, and as quick as an exit so the
+  // panel coming in over it is the one the eye follows.
+  const coveredMotion = {
+    ...(reducedMotion || isMobile ? { opacity: 0 } : { opacity: 0, scale: 0.98 }),
+    transition: { duration: DURATION.exit },
+  };
 
   return (
     <motion.div
       className={cn('fixed inset-0 flex justify-center', isMobile ? 'items-end' : 'items-center p-4')}
-      style={{ backgroundColor: 'var(--color-bg-overlay-strong)', zIndex }}
+      style={{ backgroundColor: stacked ? 'transparent' : 'var(--color-bg-overlay-strong)', zIndex: layer }}
       initial={{ opacity: 0 }}
       animate={{ opacity: 1 }}
       exit={{ opacity: 0, transition: { duration: DURATION.exit } }}
@@ -179,8 +216,11 @@ export function ModalShell({
         aria-modal="true"
         aria-labelledby={labelId}
         tabIndex={-1}
+        inert={covered}
+        // Clipped, not hidden: an overflow-hidden box can still be scrolled
+        // by focus, which would slide the header out of a pinned panel.
         className={cn(
-          'relative w-full flex flex-col overflow-hidden',
+          'relative w-full flex flex-col overflow-clip',
           WIDTH[width],
           isMobile ? 'rounded-t-3xl' : 'rounded-lg',
         )}
@@ -191,13 +231,19 @@ export function ModalShell({
           height,
         }}
         {...panelMotion}
+        animate={covered ? coveredMotion : panelMotion.animate}
         exit={{ ...panelMotion.exit, transition: { duration: DURATION.exit } }}
-        transition={{ duration: DURATION.enter, ease: EASE_OUT }}
+        transition={TWEEN.enter}
       >
         <div
           ref={measuredRef}
           className="flex flex-col"
-          style={{ maxHeight: isMobile ? '90dvh' : '85vh' }}
+          style={{
+            maxHeight: isMobile ? '90dvh' : '85vh',
+            // Not shrunk to the panel, whose height is read off this box:
+            // as a flex item it would settle wherever the panel was.
+            ...(fixedHeight ? { height: fixedHeight, flexShrink: 0 } : {}),
+          }}
         >
           {isMobile && (
             <div

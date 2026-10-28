@@ -11,6 +11,7 @@ import {
   startComputer, stopComputer,
 } from '../utils/api';
 import { patchComputerStatusInCaches, useComputers } from '../hooks/useComputers';
+import { isComputerPreparing } from '../utils/computerStatus';
 import { denialMessage } from '../utils/denialMessage';
 import { ListEmpty, ListSkeleton } from '@/components/mcp/McpPrimitives';
 import { McpTab } from './mcp/McpTab';
@@ -182,6 +183,7 @@ export function SandboxSettingsContent({ workspaceId }: { workspaceId: string })
               onRefresh={loadStats}
               computerName={computer?.name ?? null}
               recoverableCreating={computer?.status === 'creating'}
+              preparing={isComputerPreparing(computer)}
               dirName={workspace?.dir_name ?? null}
             />
           )}

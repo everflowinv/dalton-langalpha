@@ -39,6 +39,7 @@ import { PaneLabelPrimitive } from '../utils/paneLabelPrimitive';
 import { selectToolbarTier, type ToolbarTier } from '../utils/toolbarTiers';
 import { useTheme } from '@/contexts/ThemeContext';
 import { Loader } from '@/components/ui/loader';
+import { TextShimmer } from '@/components/ui/text-shimmer';
 import { CrosshairTooltipLayer, type CrosshairTooltipState } from './CrosshairTooltip';
 import { createValueStore, type ValueStore } from '@/lib/valueStore';
 import TradingViewWidget from './TradingViewWidget';
@@ -2408,7 +2409,13 @@ const MarketChart = React.memo(function MarketChart({
           </div>
           {loading && (
             <div className="chart-loading">
-              <div className="chart-loading-shimmer">{t('marketView.chart.loadingData')}</div>
+              <TextShimmer
+                as="div"
+                className="font-medium [--base-color:var(--Labels-Secondary)] [--base-gradient-color:var(--color-text-primary)]"
+                duration={1.5}
+              >
+                {t('marketView.chart.loadingData')}
+              </TextShimmer>
             </div>
           )}
           {error && (

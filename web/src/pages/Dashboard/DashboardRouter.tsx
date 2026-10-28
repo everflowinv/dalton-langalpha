@@ -1,4 +1,4 @@
-import { useCallback } from 'react';
+import { use, useCallback } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { useIsMobile } from '@/hooks/useIsMobile';
 import { usePreferences } from '@/hooks/usePreferences';
@@ -10,9 +10,23 @@ import { useDashboardPrefsWriter } from './widgets/framework/dashboardPrefsWrite
 import { migrateDashboardPrefs } from './widgets/framework/migrations';
 import { getPreset } from './widgets/presets';
 import { DASHBOARD_PREFS_VERSION, type DashboardPrefs } from './widgets/types';
+import { getPreferences } from './utils/api';
 
 // Side-effect: ensure widget registry is populated before any preset factory runs.
 import './widgets/index';
+
+// A settled-either-way twin per in-flight read, so every render that suspends
+// on one read hands `use` the same thenable, and a failed read ends the wait
+// (the page then falls back to Classic as before) instead of throwing.
+const settledReads = new WeakMap<Promise<unknown>, Promise<void>>();
+function settledOf(read: Promise<unknown>): Promise<void> {
+  let settled = settledReads.get(read);
+  if (!settled) {
+    settled = read.then(() => undefined, () => undefined);
+    settledReads.set(read, settled);
+  }
+  return settled;
+}
 
 /**
  * Thin dispatcher between the untouched Classic Dashboard and the new Custom widget dashboard.
@@ -20,6 +34,9 @@ import './widgets/index';
  * Rules:
  * - Mobile (`<md`) ALWAYS renders Classic. The toggle is hidden.
  * - On desktop, prefs.dashboard.mode decides. Absent/legacy prefs → Classic (zero-regression).
+ * - Until the prefs are read, the page suspends, so the route's loader stays
+ *   up. Guessing Classic meanwhile drew a whole Classic page, data and all,
+ *   that a custom dashboard then replaced.
  */
 export default function DashboardRouter() {
   const isMobile = useIsMobile();
@@ -73,6 +90,17 @@ export default function DashboardRouter() {
 
   // Mobile: Classic always. Toggle is not surfaced.
   if (isMobile) return <Dashboard />;
+
+  // Not after a failed read: an observer still shows a failed read as loading,
+  // so waiting again would start another read, fail, and wait again for good.
+  // The page renders instead, and its own read retries once as it mounts.
+  const key = queryKeys.user.preferences();
+  if (isLoading && queryClient.getQueryState(key)?.status !== 'error') {
+    // Starts the read when no reader has yet; joins the one in flight otherwise.
+    void queryClient.prefetchQuery({ queryKey: key, queryFn: getPreferences, retry: false });
+    const read = queryClient.getQueryCache().find({ queryKey: key })?.promise;
+    if (read) use(settledOf(read));
+  }
 
   if (mode === 'custom') return <DashboardCustom mode={mode} onModeChange={onModeChange} />;
 

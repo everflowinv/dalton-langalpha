@@ -14,19 +14,21 @@ from .display import resolve_ref, venue_local_time
 from .quote_format import build_live_stamp, current_price, print_time, quote_freshness
 from .utils import finite_or_none
 from src.data_client import get_financial_data_provider, get_market_data_provider
+from src.data_client.fmp.fmp_client import FmpQuotaExhausted  # DALTON-HOOK(market-data-fallback)
 from src.data_client.freshness import measure_daily
 from src.data_client.instrument_clock import clock_for
-from src.data_client.market_data_provider import snapshot_key
+from src.data_client.market_data_provider import MarketNotCovered, snapshot_key
 from src.data_client.normalize import change_from
 from market_protocol import (
     CARET_INDEX_REGIONS,
     AssetClass,
+    InvalidSymbol,
     is_family_index,
     to_canonical,
     to_legacy_api,
 )
 
-from ._shared import _get_user_id, _normalize_market_bars
+from ._shared import _get_user_id, _mark_failure, _mark_no_data, _normalize_market_bars
 from .prices import _calculate_price_statistics
 
 logger = logging.getLogger(__name__)
@@ -227,6 +229,32 @@ async def fetch_sector_performance(
                     else:
                         content = header + _format_sectors_as_table(results)
                     return content, _build_sector_artifact(results)
+            except FmpQuotaExhausted:
+                # DALTON-HOOK(market-data-fallback): the dated answer is
+                # FMP-only — yfinance serves today's ETF snapshot and must not
+                # stand in for a target date — so say the quota is gone
+                # instead of returning an empty table that reads as "no data".
+                logger.warning(
+                    "Sector performance unavailable: FMP daily quota exhausted"
+                )
+                if date is None:
+                    results = await _yfinance_sector_snapshot()
+                    if results:
+                        return (
+                            header + _format_sectors_as_table(results),
+                            _build_sector_artifact(results),
+                        )
+                quota_note = (
+                    "FMP 当日额度已用完，带日期的板块数据暂不可用；"
+                    "无日期的当日板块表现可稍后重试。"
+                    if date is None
+                    else "FMP 当日额度已用完，带日期的板块数据暂不可用。"
+                )
+                return f"{header}**Status:** 数据暂不可用\n\n{quota_note}", {
+                    "type": "sector_performance",
+                    "sectors": [],
+                    "error": "fmp_quota_exhausted",
+                }
             except Exception:
                 logger.exception("Sector performance provider call failed")
                 # DALTON-HOOK(market-data-fallback): only a dateless request
@@ -418,10 +446,10 @@ async def _fetch_index_day_snapshot(
             freshness = (
                 measure_daily(symbol, raw, is_index=True, source=source) if open_ended(symbol) else None
             )
-            return symbol, _normalize_market_bars(raw, symbol), source, freshness
+            return symbol, _normalize_market_bars(raw, symbol), source, freshness, None
         except Exception as e:
             logger.warning(f"Error fetching data for index {symbol}: {e}")
-            return symbol, None, None, None
+            return symbol, None, None, None, e
 
     results = await asyncio.gather(*[fetch_single(sym) for sym in basket])
 
@@ -429,7 +457,7 @@ async def _fetch_index_day_snapshot(
     rows: List[str] = []
     missing: List[str] = []
     snapshot_date: Optional[str] = None
-    for symbol, bars, source, freshness in results:
+    for symbol, bars, source, freshness, _ in results:
         bars = list(bars or [])
         row_tier = None
         forming = None
@@ -481,6 +509,18 @@ async def _fetch_index_day_snapshot(
         rows.append(_format_index_day_row(symbol, latest))
 
     if not artifact_indices:
+        # Each index's error is caught so the rest of the basket still shows,
+        # which leaves none to mark the run when every one of them failed. The
+        # worst marks it: a source failing, then an uncovered market, then a
+        # malformed symbol.
+        errors = [e for *_, e in results if e is not None]
+        if errors:
+            _mark_failure(min(
+                errors,
+                key=lambda e: (isinstance(e, InvalidSymbol), isinstance(e, MarketNotCovered)),
+            ))
+        else:
+            _mark_no_data()
         return (
             "No index data available for the requested date.",
             {"type": "market_indices", "indices": {}},
@@ -607,6 +647,7 @@ async def fetch_market_overview(
         return "\n\n".join(parts), artifact
     except Exception as e:
         logger.error(f"Error building market overview for region {region}: {e}")
+        _mark_failure(e)
         return (
             f"## Market Overview — {region.upper()}\n"
             f"**Status:** Error\n\n"

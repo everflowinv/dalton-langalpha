@@ -18,8 +18,33 @@ function buildMenu({
   onForward,
   onHome,
   onOpenInBrowser,
+  remoteControl = null,
+  onPauseRemoteControl,
+  onResumeRemoteControl,
 }) {
   const isMac = process.platform === 'darwin'
+
+  // The kill switch for remote control, present only while this Mac is paired
+  // (`remoteControl` is `menuView` from remoteControl.js). It lives here rather
+  // than only in the app because the helper outlives the app's windows, and a
+  // signed-out or unreachable app must still leave a way to stop it. The status
+  // line is a disabled item, so it is rebuilt rather than relabelled: Electron
+  // does not carry a label change to a menu macOS already shows.
+  const remoteItems = remoteControl
+    ? [
+      { type: 'separator' },
+      {
+        label: 'Remote Control',
+        submenu: [
+          { label: remoteControl.line, enabled: false },
+          { type: 'separator' },
+          remoteControl.paused
+            ? { label: 'Resume Remote Control', click: () => onResumeRemoteControl() }
+            : { label: 'Pause Remote Control', click: () => onPauseRemoteControl() },
+        ],
+      },
+    ]
+    : []
 
   // The two app-level commands, shared by the macOS app menu and the File menu
   // every other platform gets instead.
@@ -38,6 +63,7 @@ function buildMenu({
     submenu: [
       { role: 'about' },
       ...appItems,
+      ...remoteItems,
       { type: 'separator' },
       { role: 'services' },
       { type: 'separator' },

@@ -66,7 +66,7 @@ export function useHomeWorkspaceId(): string | undefined {
   return useQuery(homeWorkspaceQuery(queryClient)).data?.workspace_id;
 }
 
-/** Home's glyph: the stack that reads as All workspaces. */
+/** Home's glyph, the Chief of Staff's stack: it answers across every workspace. */
 export function HomeRowIcon(props: LucideProps) {
   return createElement(Layers, props);
 }

@@ -36,6 +36,7 @@ from src.server.database.workspace_folders import (
     leftovers_path,
     moving_path,
     read_folder_rows,
+    record_folder_blocked,
     record_folder_landings,
     release_former_folder,
     stage_folder_moves,
@@ -613,6 +614,29 @@ async def test_a_config_replace_never_touches_the_settles_landings(seed_user, te
     assert (await _row(test_db_pool, c))["config"] == {"theme": "dark"}
 
 
+async def test_a_rename_ends_the_backoff_a_full_disk_left(seed_user, test_db_pool):
+    """Even one back to the name it had no room for, which is asked for again."""
+    user_id = seed_user["user_id"]
+    computer_id = await _computer(user_id, test_db_pool)
+    a = str((await workspaces.create_workspace_on_computer(user_id, "Research", computer_id))["workspace_id"])
+    await workspaces.update_workspace(a, name="Macro")
+    async with workspace_folders_lock(computer_id) as conn:
+        await record_folder_blocked(conn, computer_id, blocked={a: "Macro"})
+
+    async def planned():
+        async with workspace_folders_lock(computer_id) as conn:
+            plan = await stage_folder_moves(conn, computer_id, ignore_busy=True)
+        return [(m.source, m.target) for m in plan.moves]
+
+    await workspaces.update_workspace(a, name="Macro", description="notes")
+    assert await planned() == []
+
+    await workspaces.update_workspace(a, name="Notes", config={"theme": "dark"})
+    assert (await _row(test_db_pool, a))["config"] == {"theme": "dark"}
+    await workspaces.update_workspace(a, name="Macro")
+    assert await planned() == [("Research", "Macro")]
+
+
 async def test_a_row_given_a_folder_by_a_bind_is_no_longer_mid_move(seed_user, test_db_pool):
     user_id = seed_user["user_id"]
     computer_id = await _computer(user_id, test_db_pool)
@@ -668,7 +692,7 @@ async def test_a_backup_keeps_its_folder_until_the_scan_ends(seed_user, test_db_
     await workspaces.update_workspace(a, name="Final")
     scans = []
 
-    async def scan(_workspace_id, _sandbox, *, layout, conn=None):
+    async def scan(_workspace_id, _sandbox, *, layout, routine=False, conn=None):
         async with workspace_folders_lock(computer_id) as conn:
             plan = await stage_folder_moves(conn, computer_id, ignore_busy=True)
         scans.append((layout.dir_name, [m.workspace_id for m in plan.moves]))
@@ -702,7 +726,7 @@ async def test_a_strict_backup_refuses_a_folder_left_mid_move(seed_user, test_db
     sync.assert_not_awaited()
 
 
-async def _lands_every_move(_runtime, _root, *, moves, tombstones, prune, deferred=()):
+async def _lands_every_move(_runtime, _root, *, moves, tombstones, prune, deferred=(), copying=()):
     """The move script's report when every folder reaches its target."""
     return {"moves": {m["id"]: m["target"] for m in moves}, "tombstones": {}}
 
@@ -773,7 +797,7 @@ async def test_an_asset_sync_keeps_its_folder_until_the_overlay_is_written(seed_
         syncs.append((kwargs["project"].dir_name, [m.workspace_id for m in plan.moves]))
         return SimpleNamespace(layout_version=FOLDER_LAYOUT_VERSION)
 
-    sandbox = SimpleNamespace(sync_sandbox_assets=sync, vault_secrets={})
+    sandbox = SimpleNamespace(sync_sandbox_assets=sync, vault_secrets={}, mounts_livefs=True)
     with (
         patch(_SKILL_PARAMS, AsyncMock(return_value={})),
         patch.object(manager, "_vault_snapshot", AsyncMock(return_value=(None, {}, ""))),
@@ -855,6 +879,7 @@ async def test_concurrent_cold_attach_fits_the_pool(
             runtime=None,
             sandbox_id=f"sb-{workspace_id}",
             vault_secrets={},
+            mounts_livefs=True,
             _ensure_workspace_dirs=ensure_dirs,
             # A restore marker is there, so the check only reconciles the flag.
             adownload_file_bytes=AsyncMock(return_value=b"restored"),
@@ -875,7 +900,7 @@ async def test_concurrent_cold_attach_fits_the_pool(
         patch.object(manager, "_reconcile_skills", link_pass),
         patch.object(manager, "_apply_session_mcp", AsyncMock()),
         patch.object(manager, "_workspace_tool_view", MagicMock(return_value=object())),
-        patch.object(manager, "_mint_sandbox_tokens", AsyncMock(return_value={})),
+        patch.object(manager, "_keep_data_token", AsyncMock()),
         patch.object(manager, "_vault_snapshot", AsyncMock(return_value=(None, {}, ""))),
     ):
         async with _pool_of(test_db_uri, patched_get_db_connection, max_size=1, timeout=3):
@@ -890,7 +915,7 @@ async def test_concurrent_cold_attach_fits_the_pool(
     assert got == [sessions[workspace_id] for workspace_id in ids]
     assert sorted(synced) == ["Macro", "Research"]
     assert link_pass.await_count == len(ids)
-    assert manager._projects_attached == {(w, f"sb-{w}") for w in ids}
+    assert manager._projects_attached.keys() == {(w, f"sb-{w}") for w in ids}
 
 
 async def test_concurrent_cold_restores_fit_the_pool(
@@ -926,6 +951,8 @@ async def test_concurrent_cold_restores_fit_the_pool(
             runtime=None,
             sandbox_id=None,
             vault_secrets={},
+            mounts_livefs=True,
+            recreatable=True,
             _ensure_workspace_dirs=AsyncMock(),
             # No restore marker: the sandbox was recreated empty.
             adownload_file_bytes=AsyncMock(return_value=None),
@@ -948,7 +975,7 @@ async def test_concurrent_cold_restores_fit_the_pool(
         ),
         patch.object(manager, "_apply_session_mcp", AsyncMock()),
         patch.object(manager, "_workspace_tool_view", MagicMock(return_value=object())),
-        patch.object(manager, "_mint_sandbox_tokens", AsyncMock(return_value={})),
+        patch.object(manager, "_keep_data_token", AsyncMock()),
         patch.object(manager, "_vault_snapshot", AsyncMock(return_value=(None, {}, ""))),
     ):
         async with _pool_of(

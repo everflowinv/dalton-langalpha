@@ -1,11 +1,13 @@
 import { chartInstanceKey, planChartAnnotationCards } from '../chartAnnotationGrouping';
-import { INLINE_ARTIFACT_TOOLS, isInlineArtifactReady } from '../charts/InlineArtifactCards';
+import { INLINE_ARTIFACT_MAP, INLINE_ARTIFACT_TOOLS, isInlineArtifactReady } from '../charts/InlineArtifactCards';
+import { isPillArtifactType } from '../charts/pillArtifacts';
 import { normalizeSubagentText } from './normalizeSubagentText';
 import { isUserDataReadmePath } from '../../utils/agentPaths';
 import { MIN_LIVE_EXPOSURE_MS } from './liveZoneTiming';
 import { inChunkOrder } from '../../session/stream/textChunks';
 import { preapprovedCardOf, type PreapprovedCard } from '../../utils/preapprovedCards';
 import { isPlanTool, readPastPlan, type PastPlanOutcome } from './pastPlan';
+import type { PTCAgentProposalState } from '@/types/chat';
 import type { ContentSegmentRecord, ToolCallProcessRecord } from './types';
 import type { ActivityItem, ToolActivityItem, LiveState, ToolCallData, ToolCallResultData } from './activityTypes';
 
@@ -31,6 +33,28 @@ export interface CompactArtifactRenderBlock {
   key: string;
   toolCallId: string;
   proc: ToolCallProcessRecord;
+  /** The call's artifact, which its card draws. */
+  artifact: Record<string, unknown>;
+  /** Null for an artifact let through by its tool's name that no card of
+   *  this build draws: the block draws nothing. */
+  card: ArtifactCard | null;
+}
+
+/** The card a compact artifact is drawn as, decided once where its block is built. */
+export interface ArtifactCard {
+  /** Its entry in `INLINE_ARTIFACT_MAP`. */
+  type: string;
+  /** `pill`: a one-line pill, in a wrapping row with the pills beside it.
+   *  `call`: its call's own card on a line of its own, which takes the call's
+   *  row over as the call lands (CardArrivals).
+   *  `chart`: a chart annotation's card, which every draw on the chart feeds. */
+  kind: 'pill' | 'call' | 'chart';
+}
+
+function cardOf(artifact: Record<string, unknown>): ArtifactCard | null {
+  const { type } = artifact;
+  if (typeof type !== 'string' || !INLINE_ARTIFACT_MAP[type]) return null;
+  return { type, kind: isPillArtifactType(type) ? 'pill' : type === 'chart_annotation' ? 'chart' : 'call' };
 }
 export interface SubagentTaskRenderBlock {
   type: 'subagent_task';
@@ -61,7 +85,7 @@ export interface PTCAgentRenderBlock {
   segment: ContentSegmentRecord;
   /** Set for a hand-off made without asking; otherwise the card is the
    *  proposal under `segment.proposalId`. */
-  proposal?: Record<string, unknown>;
+  proposal?: PTCAgentProposalState;
 }
 export interface SecretaryActionRenderBlock {
   type: 'delete_workspace' | 'stop_workspace' | 'delete_thread';
@@ -140,7 +164,13 @@ export function groupSegments(segments: ContentSegmentRecord[]): ContentSegmentR
     return groups;
 }
 
-function toolActivity(proc: ToolCallProcessRecord, id: string, state: LiveState, extra: Partial<ToolActivityItem> = {}): ToolActivityItem {
+function toolActivity(
+  proc: ToolCallProcessRecord,
+  id: string,
+  state: LiveState,
+  root: string | null | undefined,
+  extra: Partial<ToolActivityItem> = {},
+): ToolActivityItem {
   return {
     ...proc,
     type: 'tool_call', id, toolCallId: id,
@@ -150,6 +180,7 @@ function toolActivity(proc: ToolCallProcessRecord, id: string, state: LiveState,
     isComplete: proc.isComplete === true,
     isFailed: proc.isFailed === true,
     _liveState: state,
+    root,
     ...extra,
   };
 }
@@ -166,6 +197,7 @@ export function buildRenderBlocks(
     isSubagentView,
     preparing,
     now = Date.now(),
+    root,
   }: {
     reasoningProcesses: Record<string, Record<string, unknown>>;
     toolCallProcesses: Record<string, ToolCallProcessRecord>;
@@ -179,6 +211,8 @@ export function buildRenderBlocks(
     /** The clock live exposure is measured against. A component passes its
      *  own, so a timer that advances it is visibly an input of the build. */
     now?: number;
+    /** The computer's own root, so a README read under it is still hidden. */
+    root?: string | null;
   },
 ): { blocks: RenderBlock[]; nextExpiry: number | null; pinnedLive: boolean; pinnedSettledAt: number | null } {
     // A hidden secretary call the user approved in advance has no proposal
@@ -208,7 +242,7 @@ export function buildRenderBlocks(
             return card !== null;
           }
           const path = args?.file_path || args?.filePath || args?.path || args?.filename;
-          if (toolName === 'Read' && typeof path === 'string' && isUserDataReadmePath(path)) return false;
+          if (toolName === 'Read' && typeof path === 'string' && isUserDataReadmePath(path, root)) return false;
           return true;
         }
         return false;
@@ -295,8 +329,9 @@ export function buildRenderBlocks(
           const card = preapproved.get(seg.toolCallId!);
           if (card) {
             flushActivity();
-            const key = `${card.type === 'ptc_agent' ? 'ptc-agent' : 'workspace'}-${seg.toolCallId}`;
-            blocks.push({ type: card.type, key, segment: seg, proposal: card.proposal });
+            blocks.push(card.type === 'ptc_agent'
+              ? { type: 'ptc_agent', key: `ptc-agent-${seg.toolCallId}`, segment: seg, proposal: card.proposal }
+              : { type: 'create_workspace', key: `workspace-${seg.toolCallId}`, segment: seg, proposal: card.proposal });
             continue;
           }
 
@@ -312,8 +347,8 @@ export function buildRenderBlocks(
           const createdAt = proc._createdAt as number | undefined;
           const age = createdAt ? now - createdAt : Infinity;
 
-          const artifactResult = (proc.toolCallResult as Record<string, unknown> | undefined)?.artifact as Record<string, unknown> | undefined;
-          const isArtifactReady = isInlineArtifactReady(proc.toolName as string, artifactResult);
+          const artifactResult = proc.toolCallResult?.artifact;
+          const isArtifactReady = isInlineArtifactReady(proc.toolName, artifactResult);
 
           const isAlwaysLive = ALWAYS_LIVE_TOOLS.has(proc.toolName as string);
 
@@ -333,7 +368,7 @@ export function buildRenderBlocks(
           }
 
           if ((proc.isInProgress as boolean) && (isAlwaysLive || (isStreaming && age < MAX_IN_PROGRESS_MS))) {
-            pendingItems.push(toolActivity(proc, seg.toolCallId!, 'active'));
+            pendingItems.push(toolActivity(proc, seg.toolCallId!, 'active', root));
             if (isAlwaysLive) pinnedLive = true;
             if (!isAlwaysLive) {
               const expiry = createdAt! + MAX_IN_PROGRESS_MS;
@@ -341,29 +376,33 @@ export function buildRenderBlocks(
                 computedNextExpiry = expiry;
               }
             }
-          } else if (isArtifactReady) {
-            const isChartAnnotation = (artifactResult as Record<string, unknown>).type === 'chart_annotation';
+          } else if (artifactResult && isArtifactReady) {
+            const isChartAnnotation = artifactResult.type === 'chart_annotation';
             const plan = isChartAnnotation
-              ? chartCardPlan.get(chartInstanceKey(artifactResult as Record<string, unknown>))
+              ? chartCardPlan.get(chartInstanceKey(artifactResult))
               : undefined;
             if (isChartAnnotation && plan && plan.anchorCallId !== seg.toolCallId) {
               // A later draw on a chart whose card is already pinned at its first
               // draw: render as an ordinary completed row (its content shows in
               // the pinned card above). `_annotationStep` stops ActivityBlock
               // (see its partition guard) from re-promoting it into a card.
-              pendingItems.push(toolActivity(proc, seg.toolCallId!, 'completed', { _annotationStep: true }));
+              pendingItems.push(toolActivity(proc, seg.toolCallId!, 'completed', root, { _annotationStep: true }));
             } else if (isChartAnnotation && plan) {
               // The anchor (first) draw: pin the card here but feed it the
               // freshest cumulative artifact so it grows in place. Key is the
               // chart instance, not the tool-call id, so the element persists
               // across draws (no remount).
-              const freshestProc = (toolCallProcesses[plan.freshestCallId] as typeof proc) ?? proc;
+              const freshestProc = toolCallProcesses[plan.freshestCallId] ?? proc;
+              // The plan picked the freshest draw for its artifact.
+              const artifact = freshestProc.toolCallResult?.artifact ?? artifactResult;
               flushActivity();
               blocks.push({
                 type: 'compact_artifact',
-                key: `chart-${chartInstanceKey(artifactResult as Record<string, unknown>)}`,
+                key: `chart-${chartInstanceKey(artifactResult)}`,
                 toolCallId: plan.freshestCallId,
                 proc: freshestProc,
+                artifact,
+                card: cardOf(artifact),
               });
             } else {
               flushActivity();
@@ -372,16 +411,18 @@ export function buildRenderBlocks(
                 key: `compact-${seg.toolCallId}`,
                 toolCallId: seg.toolCallId!,
                 proc,
+                artifact: artifactResult,
+                card: cardOf(artifactResult),
               });
             }
           } else if (!streamEnded && age < MIN_LIVE_EXPOSURE_MS && !INLINE_ARTIFACT_TOOLS.has(proc.toolName as string)) {
-            pendingItems.push(toolActivity(proc, seg.toolCallId!, proc.isFailed ? 'failed' : 'completing', { _recentlyCompleted: true }));
+            pendingItems.push(toolActivity(proc, seg.toolCallId!, proc.isFailed ? 'failed' : 'completing', root, { _recentlyCompleted: true }));
             const expiry = createdAt! + MIN_LIVE_EXPOSURE_MS;
             if (computedNextExpiry === null || expiry < computedNextExpiry) {
               computedNextExpiry = expiry;
             }
           } else {
-            pendingItems.push(toolActivity(proc, seg.toolCallId!, 'completed'));
+            pendingItems.push(toolActivity(proc, seg.toolCallId!, 'completed', root));
           }
         } else if (seg.type === 'subagent_task') {
           flushActivity();

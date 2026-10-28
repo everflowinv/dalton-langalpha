@@ -50,12 +50,12 @@ def _steer(job_id: str, content: str, sender: str = "user", **kw) -> SteeredRepo
 _R1 = SteeredReport(
     job_id="job-1",
     content="REPORT ONE",
-    report_source={"kind": "task", "task_id": "a"},
+    shown={"report_source": {"kind": "task", "task_id": "a"}},
 )
 _R2 = SteeredReport(
     job_id="job-2",
     content="REPORT TWO",
-    report_source={"kind": "task", "task_id": "b"},
+    shown={"report_source": {"kind": "task", "task_id": "b"}},
 )
 
 
@@ -154,8 +154,8 @@ async def test_reports_alone_inject_one_message_without_user_header():
     # count is the user's messages, which a chat gateway retires from its queue.
     assert delivered["count"] == 0
     assert [(m["content"], m["report_source"]) for m in delivered["messages"]] == [
-        ("", _R1.report_source),
-        ("", _R2.report_source),
+        ("", _R1.shown["report_source"]),
+        ("", _R2.shown["report_source"]),
     ]
     inbox.take.assert_awaited_once_with("t-1", "run-A", kinds=("report", "steer"))
     # The run holds them until the model call that reads them confirms them.
@@ -182,7 +182,7 @@ async def test_reports_come_before_steering():
     delivered = msg.additional_kwargs["steering_delivered"]
     assert delivered["count"] == 1
     report, user = delivered["messages"]
-    assert report["report_source"] == _R1.report_source
+    assert report["report_source"] == _R1.shown["report_source"]
     assert user["content"] == "do it differently"
     assert msg.additional_kwargs["held_jobs"]["job_ids"] == ["job-1", "s1"]
 

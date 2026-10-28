@@ -19,15 +19,24 @@ from urllib.parse import urlparse
 from langchain_core.tools import tool
 
 from src.config.tool_settings import get_crawl_provider
-from src.observability import stamp_run
+from src.observability import TOOL_PROVIDER, stamp_run, stamp_tool_provider
 from src.tools.decorators import create_logged_tool, get_tool_tracker
+from src.tools.web.providers._shared import mark_web_outcome
 from src.tools.web.manifest import (
     CAPABILITY_CRAWL,
     CAPABILITY_MAP,
     get_capability,
     get_web_provider_spec,
 )
-from src.tools.web.types import CrawlPage, CrawlRequest, CrawlState, MapRequest, WebToolError
+from src.tools.web.types import (
+    CrawlPage,
+    CrawlRequest,
+    CrawlState,
+    MapRequest,
+    WebError,
+    WebErrorType,
+    WebToolError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -178,6 +187,7 @@ def create_crawl_tools(filesystem_backend: Any) -> List[Any]:
         you already dumped.
         """
         stamp_run(crawl_provider=provider)
+        stamp_tool_provider(provider)
         limit_ = max(1, min(int(limit), _MAX_CRAWL_PAGES))
         base_dir = (output_dir or _DEFAULT_OUTPUT_DIR).rstrip("/")
         dest_dir = f"{base_dir}/{_host_dirname(url)}"
@@ -194,6 +204,9 @@ def create_crawl_tools(filesystem_backend: Any) -> List[Any]:
         try:
             job = await adapter.start_crawl(req, dict(level.native_params))
         except WebToolError as e:
+            # Starting only queues the job; its one read of the site (robots.txt)
+            # is capped far below our timeout, so a timeout here is the provider's.
+            mark_web_outcome(e, provider_side=e.error.type is WebErrorType.TIMEOUT)
             return f"Crawl failed to start: {e}", {"type": "site_crawl", "url": url, "error": str(e)}
 
         index_entries: List[Dict[str, Any]] = []
@@ -215,6 +228,9 @@ def create_crawl_tools(filesystem_backend: Any) -> List[Any]:
                 except WebToolError as e:
                     poll_failures += 1
                     if poll_failures >= _MAX_POLL_FAILURES:
+                        # The status endpoint never touches the site, so a
+                        # failing poll is the provider's whatever its kind.
+                        mark_web_outcome(e, provider_side=True)
                         await adapter.cancel_crawl(job.id)
                         state = CrawlState.CANCELLED
                         note = f"Aborted after repeated status failures: {e}"
@@ -246,11 +262,24 @@ def create_crawl_tools(filesystem_backend: Any) -> List[Any]:
                     state = status.state
                     if status.error:
                         note = str(status.error)
+                    # This loop never polls a job it cancelled, so a cancelled
+                    # one was stopped on the provider's side, as a failed one is.
+                    if state is not CrawlState.COMPLETED:
+                        mark_web_outcome(
+                            status.error
+                            or WebError(
+                                type=WebErrorType.PROVIDER_ERROR,
+                                message=f"Crawl job {state.value}",
+                            )
+                        )
                     break
                 if loop.time() >= deadline:
                     await adapter.cancel_crawl(job.id)
                     state = CrawlState.CANCELLED
                     note = f"Stopped at the {int(_CRAWL_TIMEOUT)}s crawl time cap"
+                    # A site too big or slow to crawl in time, as a slow page
+                    # is for WebFetch.
+                    mark_web_outcome(WebError(type=WebErrorType.TIMEOUT, message=note))
                     break
         except asyncio.CancelledError:
             # Turn was cancelled — don't leave the provider job running.
@@ -261,6 +290,7 @@ def create_crawl_tools(filesystem_backend: Any) -> List[Any]:
             # cancel the paid remote job rather than leak it, and return what we
             # dumped so far instead of raising an unhandled tool exception.
             logger.error("WebCrawl %s aborted: %r", job.id, e)
+            mark_web_outcome(e, provider_side=True)
             await adapter.cancel_crawl(job.id)
             state = CrawlState.CANCELLED
             note = f"Aborted: {str(e)[:200]}"
@@ -309,6 +339,7 @@ def create_crawl_tools(filesystem_backend: Any) -> List[Any]:
         try:
             links = await adapter.map_site(MapRequest(url=url, query=query, limit=limit_), {})
         except WebToolError as e:
+            mark_web_outcome(e)
             return f"Site map failed: {e}", {"type": "site_map", "url": url, "error": str(e)}
 
         if not links:
@@ -334,7 +365,7 @@ def create_crawl_tools(filesystem_backend: Any) -> List[Any]:
                 web_map,
                 name="WebMap",
                 tracking_name=map_key,
-                run_metadata={"map_provider": provider},
+                run_metadata={"map_provider": provider, TOOL_PROVIDER: provider},
             )
         )
     else:

@@ -11,14 +11,16 @@ from typing import Any
 
 from ptc_agent.core.project_context import ProjectContext
 
-from src.llms.llm import get_input_modalities
+from src.llms.llm import get_image_types, get_input_modalities, image_route
 from src.server.models.chat import ChatRequest
 from src.server.utils.multimodal_context import (
     build_file_reminder,
     build_unsupported_reminder,
     filter_multimodal_by_capability,
+    find_unreadable_images,
     inject_multimodal_context,
     parse_multimodal_contexts,
+    pdf_page_counts,
     upload_to_sandbox,
 )
 
@@ -48,8 +50,9 @@ async def attach_request_files(
     """Upload the turn's attachments and describe them to the PTC agent.
 
     All attachments are uploaded to sandbox (when available) so the agent always
-    has file access. Model-supported modalities also get native content blocks
-    merged into the user message.
+    has file access. Images the model accepts also go in as native content
+    blocks; a PDF it accepts goes in as a note with its page count once it is
+    saved, and inline only when it is not.
     """
     multimodal_contexts = parse_multimodal_contexts(request.additional_context)
     if not multimodal_contexts or request.hitl_response:
@@ -65,18 +68,78 @@ async def attach_request_files(
             f"[PTC_CHAT] Uploaded {len(multimodal_contexts)} attachment(s) to sandbox"
         )
 
-    # 2. Filter by model capability for native content blocks
+    # 2. Filter by model capability for native content blocks. An image the
+    # turn's route can't be given takes the file-only route on every model.
     modalities = _modalities(effective_model, config)
-    supported, unsupported, file_only = filter_multimodal_by_capability(
-        multimodal_contexts, modalities
+    client = getattr(config, "llm_client", None)
+    route = image_route(
+        getattr(client, "metadata", None) or {"manifest_model": effective_model}
     )
-    # DALTON-HOOK(attachment-native-cap): an image or PDF above what a provider
-    # takes inline rides the sandbox path instead; inlined, it stays in the
-    # thread's history and fails every later turn on the request size.
-    from src.dalton.attachments import decoded_size, reading_path_text, split_oversized
+    supported, unsupported, file_only = filter_multimodal_by_capability(
+        multimodal_contexts,
+        modalities,
+        unreadable=await find_unreadable_images(
+            multimodal_contexts, get_image_types(route)
+        ),
+    )
+    # DALTON-HOOK(attachment-native-cap): an unsaved PDF over the inline
+    # ceiling is not inlined at all — a whole PDF in the checkpoint re-sends
+    # on every later turn and a provider refuses an over-size request as a
+    # plain 400 nothing recovers from. It rides the file-only route's
+    # save-failure note instead, which sends the user back to the file panel
+    # (that route has no such limit of its own). The size is the payload's
+    # decoded bytes, padding excluded, so a PDF exactly at the ceiling inlines.
+    from src.server.utils.multimodal_context import (
+        INLINE_UNSAVED_PDF_MAX_BYTES,
+        data_url_decoded_size,
+    )
 
-    supported, oversized = split_oversized(supported)
-    file_only = file_only + oversized
+    def _saved(idx: int) -> bool:
+        return bool(file_paths and idx < len(file_paths) and file_paths[idx])
+
+    oversized_unsaved: list = []
+    for idx, ctx in enumerate(multimodal_contexts):
+        if ctx not in supported:
+            continue
+        data = ctx.data if hasattr(ctx, "data") else ctx.get("data", "")
+        if (
+            data.startswith("data:application/pdf")
+            and not _saved(idx)
+            and data_url_decoded_size(data) > INLINE_UNSAVED_PDF_MAX_BYTES
+        ):
+            oversized_unsaved.append(ctx)
+    if oversized_unsaved:
+        supported = [ctx for ctx in supported if ctx not in oversized_unsaved]
+        file_only = file_only + oversized_unsaved
+    # Helper to build per-file path notes
+    def _file_note(ctx, idx, *, inline: bool = False):
+        # DALTON-HOOK(attachment-native-cap): an attachment that failed to
+        # save gets an explicit note — never a bare filename the model would
+        # ignore. Inline ones keep their block and say the copy is what is
+        # missing; the rest cannot be read here at all.
+        desc = ctx.description or "file"
+        data = ctx.data
+        mime = data.split(":")[1].split(";")[0] if ":" in data else "unknown"
+        fpath = file_paths[idx] if file_paths and idx < len(file_paths) else None
+        if not fpath:
+            if inline:
+                return (
+                    f"The user attached a file ({desc}, {mime}). It is shown "
+                    "inline above, but saving it to the workspace failed, so "
+                    "it cannot be processed with Python or read here later. "
+                    "Tell the user to upload it again from the file panel if "
+                    "the file itself is needed."
+                )
+            return (
+                f"The user attached a file ({desc}, {mime}), but saving it "
+                "to the workspace failed, so it cannot be read here. Tell the "
+                "user to upload it again from the file panel."
+            )
+        return (
+            f"The user attached a file ({desc}, {mime}). "
+            f"It has been saved to {fpath}. "
+            f"Use Python to process it."
+        )
 
     # 3. Inject supported as native content blocks (merged into user message)
     if supported:
@@ -86,44 +149,32 @@ async def attach_request_files(
             if ctx in supported
         ] if file_paths else None
         messages = inject_multimodal_context(
-            messages, supported, file_paths=supported_paths
+            messages,
+            supported,
+            file_paths=supported_paths,
+            pdf_pages=await pdf_page_counts(supported),
         )
         logger.info(
             f"[PTC_CHAT] Multimodal context injected: "
             f"{len(supported)} supported attachment(s)"
         )
-
-    # Helper to build per-file path notes
-    # DALTON-HOOK(attachment-native-cap): oversized or unsaved attachments get
-    # an explicit note — never a bare filename the model would ignore.
-    def _file_note(ctx, idx, *, oversized_ctx: bool = False):
-        desc = ctx.description or "file"
-        data = ctx.data
-        mime = data.split(":")[1].split(";")[0] if ":" in data else "unknown"
-        fpath = file_paths[idx] if file_paths and idx < len(file_paths) else None
-        if not fpath:
-            # Never just a bare filename: the model must say so and point the
-            # user at the file panel, not silently drop the attachment.
-            if oversized_ctx:
-                why = "It exceeds the size that can be viewed inline"
-            else:
-                why = "This model cannot view it natively"
-            return (
-                f"The user attached a file ({desc}, {mime}). {why}, and saving it "
-                "to the workspace failed, so it cannot be read here. Tell the "
-                "user to upload it again from the file panel."
-            )
-        note = f"The user attached a file ({desc}, {mime}). It has been saved to {fpath}."
-        if oversized_ctx:
-            # DALTON-HOOK(attachment-native-cap): one shared wording with the
-            # attachment-budget eviction pointer, so the two surfaces cannot
-            # disagree on how to read a file over Read's size limit.
-            kind = "pdf" if mime == "application/pdf" else "image"
-            return note + " " + reading_path_text(kind, decoded_size(data), lang="en")
-        return note + " Use Python to process it."
+        # DALTON-HOOK(attachment-native-cap): an inline block is its own copy,
+        # but a file the model will want to process (Python, a later Read)
+        # still needs a workspace copy: an attachment that failed to save
+        # keeps its block and gets the reupload note beside it, the same note
+        # the file-only route gives — never silence about the missing copy.
+        unsaved_inline = [
+            (i, ctx)
+            for i, ctx in enumerate(multimodal_contexts)
+            if ctx in supported and not _saved(i)
+        ]
+        if unsaved_inline:
+            notes = [
+                _file_note(ctx, i, inline=True) for i, ctx in unsaved_inline
+            ]
+            _append_to_last_user_message(messages, build_file_reminder(notes))
 
     # 4. Unsupported image/PDF: "cannot view" warning + file paths
-    # DALTON-HOOK(attachment-native-cap): the explicit-note contract above.
     if unsupported:
         notes = [
             _file_note(ctx, i)
@@ -132,11 +183,10 @@ async def attach_request_files(
         ]
         _append_to_last_user_message(messages, build_unsupported_reminder(notes))
 
-    # 5. File-only (xlsx, csv, etc.) + oversized image/PDF: path notes only
-    # DALTON-HOOK(attachment-native-cap): oversized ones get their reading path.
+    # 5. File-only (xlsx, csv, etc.): path notes only, no "cannot view"
     if file_only:
         notes = [
-            _file_note(ctx, i, oversized_ctx=ctx in oversized)
+            _file_note(ctx, i)
             for i, ctx in enumerate(multimodal_contexts)
             if ctx in file_only
         ]

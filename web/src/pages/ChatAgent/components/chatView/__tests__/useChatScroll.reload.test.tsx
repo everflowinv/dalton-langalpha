@@ -52,12 +52,14 @@ function Harness({ isLoadingHistory, bubbles = [], failed = false }: { isLoading
 
 const viewport = () => document.querySelector<HTMLElement>('[data-radix-scroll-area-viewport]')!;
 
-/** Clamped the way a browser clamps, so a request past the end lands on it. */
+/** Clamped the way a browser clamps, so a request past the end lands on it,
+ *  and announced only if the view moved, as a browser announces it. */
 function scrollTo(top: number) {
   const v = viewport();
+  const from = v.scrollTop;
   const clamped = Math.max(0, Math.min(top, contentH - VIEW_H));
   Object.defineProperty(v, 'scrollTop', { value: clamped, writable: true, configurable: true });
-  v.dispatchEvent(new Event('scroll'));
+  if (clamped !== from) v.dispatchEvent(new Event('scroll'));
 }
 
 /** A reader's own scroll: the wheel takes control, then the view moves. */
@@ -171,6 +173,22 @@ describe('a reload of the thread on screen', () => {
     act(() => { grow(2400); });
 
     expect(viewport().scrollTop).toBe(1600);
+  });
+
+  // The list holds what it drew through the load (MessageList), so the
+  // reader can read on while it runs, and the reload lands where they went.
+  it('keeps where the reader scrolled the held transcript during the reload', async () => {
+    layout = { ...laidOut };
+    const { rerender } = render(<Harness isLoadingHistory={false} bubbles={TURNS} />);
+    await act(async () => { vi.advanceTimersByTime(50); });
+    act(() => { userScrollTo(1200); });
+
+    rerender(<Harness isLoadingHistory bubbles={TURNS} />);
+    act(() => { userScrollTo(150); });
+    rerender(<Harness isLoadingHistory={false} bubbles={TURNS} />);
+    await act(async () => { vi.advanceTimersByTime(50); });
+
+    expect(viewport().scrollTop).toBe(150);
   });
 
   it('keeps a reader on their turn through a failed replay, for the retry that lands', async () => {

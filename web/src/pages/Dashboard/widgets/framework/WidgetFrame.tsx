@@ -153,7 +153,25 @@ export function WidgetFrame({
       reportFitHeight(total);
     };
 
+    // The hold lifting need not change the content's size, so while one is
+    // up the subtree is watched for it. Only then: a fit widget that streams
+    // (the conversation) would otherwise measure on every commit.
+    let holdWatch: MutationObserver | null = null;
+
     const report = () => {
+      // A placeholder (a skeleton marked `data-fit-hold`) says nothing about
+      // the loaded content's height: the cell keeps its saved height, which is
+      // the content's from last time, rather than shrinking to the skeleton
+      // and growing back when the data lands, moving every cell below twice.
+      if (inner.querySelector('[data-fit-hold]')) {
+        if (!holdWatch) {
+          holdWatch = new MutationObserver(report);
+          holdWatch.observe(inner, { subtree: true, childList: true, attributeFilter: ['data-fit-hold'] });
+        }
+        return;
+      }
+      holdWatch?.disconnect();
+      holdWatch = null;
       const total = measure();
       if (total === lastReported) return;
       pending = total;
@@ -175,6 +193,7 @@ export function WidgetFrame({
     ro.observe(inner);
     return () => {
       ro.disconnect();
+      holdWatch?.disconnect();
       if (debounceTimer !== null) window.clearTimeout(debounceTimer);
     };
   }, [definition, editMode]);

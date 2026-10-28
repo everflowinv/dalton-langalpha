@@ -10,7 +10,7 @@ import { cn } from '@/lib/utils';
 import { lastInputWasPointer } from '@/lib/inputModality';
 import type { Workspace } from './chat-input.types';
 
-/** The key the All workspaces row answers with. No workspace id collides with it. */
+/** The key the Chief of Staff row answers with. No workspace id collides with it. */
 export const ALL_WORKSPACES_KEY = '__all__';
 
 // Search appears once the list outgrows the panel and starts to scroll; a short
@@ -18,7 +18,7 @@ export const ALL_WORKSPACES_KEY = '__all__';
 const SEARCH_FROM = 8;
 
 /**
- * Where a composer send goes: All workspaces or one workspace.
+ * Where a composer send goes: the Chief of Staff (Home) or one workspace.
  * A menu rather than a listbox because a pick always closes it, the current
  * row included, and single selection still announces which row is current.
  */
@@ -161,12 +161,12 @@ export function WorkspacePicker({
               </p>
             )}
           >
-            <MenuSection id="all" aria-label={t('agents.allWorkspaces')} className={SECTION}>
+            <MenuSection id="all" aria-label={t('agents.chiefOfStaff')} className={SECTION}>
               <Row
                 id={ALL_WORKSPACES_KEY}
                 icon={Layers}
-                label={t('agents.allWorkspaces')}
-                hint={t('agents.allWorkspacesHint')}
+                label={t('agents.chiefOfStaff')}
+                hint={t('agents.chiefOfStaffHint')}
               />
             </MenuSection>
             {workspaces.length > 0 && (

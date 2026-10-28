@@ -28,8 +28,9 @@ from src.data_client.ginlix_data.directory import display_names
 from src.utils.market_hours import interval_seconds  # DALTON-HOOK(stock-move-upgrade)
 from market_protocol import AssetClass, PriceTreatment, market_of  # DALTON-HOOK(stock-move-upgrade)
 from market_protocol.calendars import get_calendar  # DALTON-HOOK(stock-move-upgrade)
+from src.observability import stamp_tool_provider
 
-from ._shared import _get_user_id, _normalize_market_bars
+from ._shared import _get_user_id, _mark_failure, _mark_no_data, _normalize_market_bars
 
 logger = logging.getLogger(__name__)
 
@@ -518,8 +519,10 @@ async def fetch_daily_prices(
                 )
                 results = _normalize_market_bars(raw_bars, symbol)
 
+        stamp_tool_provider(daily_source)
         if not results:
             logger.warning(f"No price data found for {symbol}")
+            _mark_no_data()
             timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
             content = f"""## Stock Price Data: {symbol}
 **Retrieved:** {timestamp}
@@ -724,6 +727,7 @@ No price data available for the specified period."""
 
     except Exception as e:
         logger.error(f"Error retrieving daily prices for {symbol}: {e}")
+        _mark_failure(e)
         timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         content = f"""## Stock Price Data: {symbol}
 **Retrieved:** {timestamp}

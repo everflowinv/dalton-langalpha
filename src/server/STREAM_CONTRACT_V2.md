@@ -52,12 +52,16 @@ No cross-lane total order is promised. The promised causal chain per task run:
 
 1. The parent's Task tool call exists (main lane).
 2. `lane_open{task_run_id, task_id, cause, launch_tool_call_id?, description,
-   subagent_type}` becomes visible — it carries enough to create the card, because the
+   subagent_type, model?}` becomes visible. It carries enough to create the card, because the
    Task result artifact may legitimately trail early task output. `launch_tool_call_id`
-   is nullable (a HITL continuation has no fresh Task call).
+   is nullable (a HITL continuation has no fresh Task call). `model` (`{id, provider}`)
+   is present only when the run uses a model other than its launcher's; it is the same
+   value admission writes to the row's `replay_facts.model`, which replay stamps on the
+   task artifact and `/tasks/{id}/status` returns.
 3. Task content begins.
 4. The terminal CAS commits (ledger).
-5. Cursor-bearing `run_end{outcome}` is appended.
+5. Cursor-bearing `run_end{outcome, finished?}` is appended. A task run's writer adds
+   `finished` (its CAS's finalized_at, epoch ms); a main-lane `run_end` has none.
 
 A mux or client must not render task frames before their anchor (2) is delivered or
 present in the snapshot.
@@ -141,7 +145,11 @@ sampled transactionally, the snapshot algorithm is a revalidation loop:
   backlog the client presents as already rendered; the ones after arrived live), and
   `chan_close{chan, reason}` when it releases one. `chan_close{reason: terminal, outcome}` carries the ledger
   row's outcome — it is how a channel closes from row truth when the worker died
-  between the terminal CAS and the `run_end` append. Other reasons:
+  between the terminal CAS and the `run_end` append. On a task lane the row-truth close
+  also carries `finished` (the row's finalized_at, epoch ms), which the missing
+  `run_end` would have; a main-lane close never does, since `conversation_responses`
+  has no finalized_at. A channel its `run_end` closed gets `finished` from that frame,
+  which the mux forwards ahead of the close. Other reasons:
   `resync_required` (cursor gap / aged-out stream) and `transport_error`.
 - Client item identity is `(lane, run_id, item_id)` — never a positional index. Delivery
   is at-least-once: consumers keep a per-run applied-seq high-water mark; no semantic

@@ -1,14 +1,16 @@
-import { useMemo } from 'react';
+import { useId, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router';
 import { CheckCircle2 } from 'lucide-react';
-import { Button } from '@/components/ui/button';
+import { WizardStepHeader } from '@/components/ui/wizard';
+import { SetupFooter } from '../SetupFooter';
 import { usePreferences } from '@/hooks/usePreferences';
 import { useApiKeys } from '@/hooks/useApiKeys';
 import type { ByokProvider } from '@/components/model/types';
 import { useTranslation } from 'react-i18next';
 import { modelPrefs } from '@/lib/modelPreferences';
 import { useModelSlotCopy } from '@/components/model/useModelSlotCopy';
-import { useStartOnboarding } from '@/pages/Onboarding';
+import { useWelcomeOffer } from '@/pages/Onboarding/welcome/useWelcomeOffer';
+import { readSetupReturn, returnFromSetup } from '@/lib/setupReturn';
 
 // ---------------------------------------------------------------------------
 // DoneStep — confirmation screen
@@ -20,7 +22,18 @@ export default function DoneStep() {
   const { apiKeys } = useApiKeys();
   const { t } = useTranslation();
   const copy = useModelSlotCopy();
-  const onboarding = useStartOnboarding();
+  const welcomeOffer = useWelcomeOffer();
+  const headingId = useId();
+  // A connection sends the user back the moment it works, so a return that
+  // reaches this screen came another way (an invitation code, or skipping
+  // ahead past the providers already connected). It still wins over the
+  // dashboard. This screen doesn't know which provider, so it names none.
+  const [hasReturn] = useState(() => readSetupReturn() !== null);
+
+  const handlePrimary = () => {
+    if (hasReturn && returnFromSetup()) return;
+    navigate('/dashboard', { replace: true });
+  };
 
   // ---------------------------------------------------------------------------
   // Derive summary data
@@ -51,26 +64,14 @@ export default function DoneStep() {
   // ---------------------------------------------------------------------------
 
   return (
-    <div className="flex flex-col items-center gap-8 py-4">
+    <div>
       {/* Success icon */}
-      <div className="flex flex-col items-center gap-3">
-        <CheckCircle2
-          className="h-12 w-12"
-          style={{ color: 'var(--color-success)' }}
-        />
-        <h2
-          className="font-semibold text-center"
-          style={{ fontSize: '1.25rem', color: 'var(--color-text-primary)' }}
-        >
-          {t('setup.doneTitle')}
-        </h2>
-        <p
-          className="text-sm text-center max-w-md"
-          style={{ color: 'var(--color-text-secondary)' }}
-        >
-          {t('setup.doneSummary')}
-        </p>
-      </div>
+      <CheckCircle2
+        aria-hidden="true"
+        className="mb-4 h-12 w-12"
+        style={{ color: 'var(--color-success)' }}
+      />
+      <WizardStepHeader titleId={headingId} title={t('setup.doneTitle')} helper={t('setup.doneSummary')} />
 
       {/* Summary card */}
       <div
@@ -87,26 +88,19 @@ export default function DoneStep() {
         </div>
       </div>
 
-      {/* Actions */}
-      <div className="flex flex-col items-center gap-3 w-full">
-        <Button
-          variant="default"
-          className="w-full"
-          onClick={() => navigate('/dashboard', { replace: true })}
-        >
-          {t('setup.goToDashboard')}
-        </Button>
-        {/* Over the dashboard: the wizard sits outside the app shell, which
-            is where the connect sheet lives. */}
-        <button
-          type="button"
-          className="text-sm font-medium transition-colors"
-          style={{ color: 'var(--color-accent-primary)' }}
-          onClick={() => onboarding.start({ at: '/dashboard', replace: true })}
-        >
-          {t('setup.personalizeLink')}
-        </button>
-      </div>
+      <SetupFooter
+        // Not offered on the way back to a return: the welcome flow ends in
+        // the app, so the setup that sent the user here would never resume.
+        skip={
+          welcomeOffer && !hasReturn
+            ? { label: t('setup.personalizeLink'), onClick: () => welcomeOffer.open({ replace: true }) }
+            : null
+        }
+        primary={{
+          label: hasReturn ? t('setup.continue') : t('setup.goToDashboard'),
+          onClick: handlePrimary,
+        }}
+      />
     </div>
   );
 }

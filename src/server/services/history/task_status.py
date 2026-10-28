@@ -13,9 +13,13 @@ projection cache, so a liveness snapshot is never frozen into cached items.
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
+from src.server.contracts.run_times import epoch_ms
 from src.server.utils.error_sanitization import sanitize_error_text
+
+if TYPE_CHECKING:
+    from ptc_agent.config.agent import SubagentModel
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +48,37 @@ def _artifact_task_id(data: Any) -> str | None:
     return str(task_id) if task_id else None
 
 
+def _artifact_run_id(data: Any) -> str | None:
+    run_id = (data.get("payload") or {}).get("task_run_id")
+    return str(run_id) if run_id else None
+
+
+def _model(row: dict[str, Any]) -> SubagentModel | None:
+    """The row's recorded model, or None for one that ran its launcher's."""
+    model = row.get("model")
+    if isinstance(model, dict) and model.get("id") and model.get("provider"):
+        return {"id": str(model["id"]), "provider": str(model["provider"])}
+    return None
+
+
+def _telemetry(row: dict[str, Any]) -> dict[str, Any]:
+    """A run's bounds and model, from its ledger row: no finish while it
+    runs, no model when it ran its launcher's."""
+    return {
+        "started_ms": epoch_ms(row.get("started_at")),
+        "finished_ms": epoch_ms(row.get("finalized_at")),
+        "model": _model(row),
+    }
+
+
+def run_telemetry(
+    detail: dict[str, Any], run_id: str | None = None
+) -> dict[str, Any] | None:
+    """``run_id``'s bounds and model, or the task's latest run's when it
+    names none; None for a run the ledger reads did not file."""
+    return (detail.get("runs") or {}).get(run_id or detail.get("latest_run_id"))
+
+
 def collect_task_ids(items: list[dict]) -> list[str]:
     """Unique task ids from task artifacts in replay-shaped ``{event, data}`` items."""
     seen: dict[str, None] = {}
@@ -55,11 +90,24 @@ def collect_task_ids(items: list[dict]) -> list[str]:
     return list(seen)
 
 
+def collect_run_ids(items: list[dict]) -> list[str]:
+    """Unique runs the task artifacts in ``items`` launched."""
+    seen: dict[str, None] = {}
+    for item in items:
+        data = item.get("data") if isinstance(item, dict) else None
+        if _artifact_task_id(data):
+            run_id = _artifact_run_id(data)
+            if run_id:
+                seen.setdefault(run_id)
+    return list(seen)
+
+
 async def resolve_task_details(
-    thread_id: str, task_ids: list[str]
+    thread_id: str, task_ids: list[str], *, run_ids: list[str] = ()
 ) -> dict[str, dict[str, Any]]:
     """Map each task id to ``{"status", "error", "error_type"}``, plus
-    ``"last_activity_ms"`` when the ledger knows it.
+    ``"last_activity_ms"``, ``"latest_run_id"`` and ``"runs"`` when the
+    ledger knows them.
 
     ``status`` is ``running`` / ``completed`` / ``cancelled`` / ``error``;
     ``error`` is the ledger failure message, present for any terminal that
@@ -68,7 +116,11 @@ async def resolve_task_details(
     it to tell a stop it can offer a remedy for from one it can only report.
     ``last_activity_ms`` is when the latest run last started, finished or
     delivered its result, which is how long the task has been quiet.
-    The run ledger is the authority
+    ``runs`` maps the latest run, and each of ``run_ids`` the ledger holds,
+    to its own ``{"started_ms", "finished_ms", "model"}`` (read them with
+    :func:`run_telemetry`): a task card replays the run its launch started,
+    which a resume may since have displaced as the latest. The run ledger is
+    the authority
     (M4): the latest run row's status maps straight to the client vocabulary —
     a dead worker's in_progress row reads "running" only until the recovery
     scanner finalizes it. Tasks without a ledgered run (pre-ledger launches,
@@ -114,16 +166,45 @@ async def resolve_task_details(
                 # Not sanitized: unlike the message beside it, this is a closed
                 # vocabulary this codebase writes, never quoted upstream text.
                 "error_type": row.get("error_type") if carries_reason else None,
+                "latest_run_id": row["latest_run_id"],
+                "runs": {row["latest_run_id"]: _telemetry(row)},
             }
-            last_activity = row.get("last_activity_at")
+            last_activity = epoch_ms(row.get("last_activity_at"))
             if last_activity is not None:
-                details[task_id]["last_activity_ms"] = last_activity.timestamp() * 1000
+                details[task_id]["last_activity_ms"] = last_activity
+    # Most launches are their task's latest run, filed above; only a run a
+    # resume displaced needs reading on its own, and only into a task the
+    # ledger holds.
+    filed = {rid for d in details.values() for rid in d["runs"]}
+    displaced = [rid for rid in dict.fromkeys(run_ids) if rid not in filed]
+    if displaced and details:
+        await _resolve_run_telemetry(thread_id, details, displaced)
     if legacy_ids:
         for task_id, status in (
             await _resolve_legacy_statuses(thread_id, legacy_ids)
         ).items():
             details[task_id] = {"status": status, "error": None, "error_type": None}
     return details
+
+
+async def _resolve_run_telemetry(
+    thread_id: str, details: dict[str, dict[str, Any]], run_ids: list[str]
+) -> None:
+    """File each displaced run's own times and model under its task's
+    ``runs``. Best-effort: a failed read files nothing, so a card that names
+    such a run gets none of them (``stamp_task_artifact_data`` never lends it
+    the task's latest run's); only a card naming no run takes the latest's."""
+    from src.server.database.runs import subagent_runs as sr_db
+
+    try:
+        rows = await sr_db.get_task_run_telemetry(thread_id, list(run_ids))
+    except Exception:
+        logger.warning("[REPLAY] run telemetry read failed", exc_info=True)
+        return
+    for run_id, row in rows.items():
+        detail = details.get(row["task_id"])
+        if detail is not None:
+            detail["runs"][run_id] = _telemetry(row)
 
 
 async def _resolve_legacy_statuses(
@@ -166,12 +247,23 @@ def stamp_task_artifact_data(
     never mutates: stored/cached event dicts are shared objects.
     ``status_only`` restricts the stamp to the whitelisted status value —
     public replay must never ship failure text unauthenticated, and the type
-    travels with the message it classifies."""
+    travels with the message it classifies.
+
+    Every replay, a shared one included, also gets the bounds of the run this
+    artifact launched (``started_ms``, ``finished_ms`` once it settled) and
+    its ``model`` when that was not its launcher's, which say nothing the
+    transcript beside them does not. An artifact that names no run (a launch
+    from before the ledger) takes its task's latest run's; one naming a run
+    the read missed gets none rather than another run's."""
     task_id = _artifact_task_id(data)
     if not task_id or task_id not in details:
         return data
     detail = details[task_id]
     payload = {**(data.get("payload") or {}), "status": detail["status"]}
+    run = run_telemetry(detail, _artifact_run_id(data)) or {}
+    for key in ("started_ms", "finished_ms", "model"):
+        if run.get(key) is not None:
+            payload[key] = run[key]
     if not status_only:
         if detail.get("error"):
             payload["error"] = detail["error"]
@@ -189,7 +281,9 @@ async def stamp_replay_task_status(
     by positional replacement. Best-effort: a failure leaves the items
     unstamped (the client's live reconciliation still applies)."""
     try:
-        details = await resolve_task_details(thread_id, collect_task_ids(items))
+        details = await resolve_task_details(
+            thread_id, collect_task_ids(items), run_ids=collect_run_ids(items)
+        )
         if not details:
             return
         for i, item in enumerate(items):

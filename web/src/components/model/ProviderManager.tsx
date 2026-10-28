@@ -2,6 +2,7 @@ import { useCallback, useMemo } from "react"
 import { motion, AnimatePresence } from "@/lib/framer"
 import { Plus, X } from "lucide-react"
 import { cn } from "@/lib/utils"
+import { TWEEN } from "@/lib/motion"
 import { ProviderCard } from "./ProviderCard"
 import { ApiKeyInput, type TestResult } from "./ApiKeyInput"
 import type { ByokProvider } from "./types"
@@ -161,7 +162,7 @@ export function ProviderManager({
             initial={{ height: 0, opacity: 0 }}
             animate={{ height: "auto", opacity: 1 }}
             exit={{ height: 0, opacity: 0 }}
-            transition={{ duration: 0.2, ease: "easeInOut" }}
+            transition={TWEEN.fold}
             className="overflow-hidden -mx-1"
           >
             <div className="pt-1 pb-2 px-1">

@@ -13,7 +13,8 @@ workspace id, never the computer id, and answers from what it returns.
 import asyncio
 import uuid
 from datetime import datetime, timezone
-from unittest.mock import ANY, AsyncMock, patch
+from types import SimpleNamespace
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
@@ -200,6 +201,93 @@ async def test_creating_a_project_is_not_capacity_checked():
 
 
 @pytest.mark.asyncio
+async def test_create_without_a_computer_asks_for_none(client):
+    with patch("src.server.app.workspaces.WorkspaceManager") as MockWM:
+        mock_manager = AsyncMock()
+        mock_manager.create_workspace = AsyncMock(return_value=_ws())
+        MockWM.get_instance.return_value = mock_manager
+
+        resp = await client.post("/api/v1/workspaces", json={"name": "W"})
+
+    assert resp.status_code == 201
+    assert mock_manager.create_workspace.call_args.kwargs["computer_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_create_on_a_chosen_computer_passes_it_to_the_manager(client):
+    computer_id = str(uuid.uuid4())
+    with patch("src.server.app.workspaces.WorkspaceManager") as MockWM:
+        mock_manager = AsyncMock()
+        mock_manager.create_workspace = AsyncMock(
+            return_value=_ws(computer_id=computer_id)
+        )
+        MockWM.get_instance.return_value = mock_manager
+
+        resp = await client.post(
+            "/api/v1/workspaces", json={"name": "W", "computer_id": computer_id}
+        )
+
+    assert resp.status_code == 201
+    assert resp.json()["computer_id"] == computer_id
+    assert mock_manager.create_workspace.call_args.kwargs["computer_id"] == computer_id
+
+
+@pytest.mark.asyncio
+async def test_create_on_a_computer_the_caller_cannot_use_is_404(client):
+    """Another user's computer answers like a missing one, so an id probe
+    learns nothing."""
+    from src.server.services.computer_errors import ComputerNotFoundError
+
+    with patch("src.server.app.workspaces.WorkspaceManager") as MockWM:
+        mock_manager = AsyncMock()
+        mock_manager.create_workspace = AsyncMock(
+            side_effect=ComputerNotFoundError("Computer not found")
+        )
+        MockWM.get_instance.return_value = mock_manager
+
+        resp = await client.post(
+            "/api/v1/workspaces",
+            json={"name": "W", "computer_id": str(uuid.uuid4())},
+        )
+
+    assert resp.status_code == 404
+    assert resp.json()["detail"] == "Computer not found"
+
+
+@pytest.mark.asyncio
+async def test_create_on_a_computer_still_being_prepared_is_a_coded_409(client):
+    """Coded like the other 409s, so a client tells it apart without reading
+    the English sentence."""
+    from src.server.services.computer_errors import ComputerPreparingError
+
+    with patch("src.server.app.workspaces.WorkspaceManager") as MockWM:
+        mock_manager = AsyncMock()
+        mock_manager.create_workspace = AsyncMock(
+            side_effect=ComputerPreparingError("This computer is still being prepared.")
+        )
+        MockWM.get_instance.return_value = mock_manager
+
+        resp = await client.post(
+            "/api/v1/workspaces",
+            json={"name": "W", "computer_id": str(uuid.uuid4())},
+        )
+
+    assert resp.status_code == 409
+    assert resp.json()["detail"] == {
+        "code": "computer_preparing",
+        "message": "This computer is still being prepared.",
+    }
+
+
+@pytest.mark.asyncio
+async def test_create_on_a_malformed_computer_id_is_rejected_by_the_model(client):
+    resp = await client.post(
+        "/api/v1/workspaces", json={"name": "W", "computer_id": "not-a-uuid"}
+    )
+    assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
 async def test_create_workspace_value_error_returns_400(client):
     with patch(
         "src.server.app.workspaces.WorkspaceManager"
@@ -378,12 +466,14 @@ async def test_list_workspaces_invalid_sort_by(client):
 _ALL_SCOPES = [
     "workspace:spec:performance",
     "workspace:spec:max",
+    "workspace:spec:xlarge",
     "workspace:always_on",
 ]
 
 
 def _quota_platform(scopes, capacity):
     """Patch the platform reads behind /quota: the scope list and the count quotas."""
+    counts = AsyncMock(side_effect=lambda _uid, quota: capacity[quota])
     return (
         patch(
             "src.server.dependencies.usage_limits.platform_gating_active",
@@ -393,56 +483,61 @@ def _quota_platform(scopes, capacity):
             "src.server.dependencies.usage_limits._get_user_scopes",
             new=AsyncMock(return_value=scopes),
         ),
-        patch(
-            "src.server.dependencies.usage_limits.get_capacity_status",
-            new=AsyncMock(side_effect=lambda _uid, quota: capacity[quota]),
-        ),
+        patch("src.server.dependencies.usage_limits.get_capacity_status", new=counts),
+        patch("src.server.app.workspaces.get_capacity_status", new=counts),
     )
 
 
 _CAPACITY = {
     "spec_performance": {"used": 1, "limit": 3},
     "spec_max": {"used": 0, "limit": 2},
+    "spec_xlarge": {"used": 1, "limit": 1},
     "always_on": {"used": 2, "limit": -1},
+    "computer_count": {"used": 2, "limit": 2},
 }
 
 
 @pytest.mark.asyncio
 async def test_get_workspace_quota_platform(client):
     """Platform mode surfaces per-tier {used, limit}; /quota is not shadowed by /{id}."""
-    gating, scopes, capacity = _quota_platform(_ALL_SCOPES, _CAPACITY)
-    with gating, scopes, capacity:
+    gating, scopes, capacity, counts = _quota_platform(_ALL_SCOPES, _CAPACITY)
+    with gating, scopes, capacity, counts:
         resp = await client.get("/api/v1/workspaces/quota")
 
     assert resp.status_code == 200
     assert resp.json() == {
         "performance": {"used": 1, "limit": 3},
         "max": {"used": 0, "limit": 2},
+        "xlarge": {"used": 1, "limit": 1},
         "always_on": {"used": 2, "limit": -1},
+        "computers": {"used": 2, "limit": 2},
     }
 
 
 @pytest.mark.asyncio
 async def test_get_workspace_quota_missing_scope_reads_not_on_plan(client):
     """A count limit the plan's scopes do not grant must not advertise an upgrade the gate refuses."""
-    gating, scopes, capacity = _quota_platform(
+    gating, scopes, capacity, counts = _quota_platform(
         ["workspace:spec:performance"], _CAPACITY
     )
-    with gating, scopes, capacity:
+    with gating, scopes, capacity, counts:
         resp = await client.get("/api/v1/workspaces/quota")
 
     assert resp.json() == {
         "performance": {"used": 1, "limit": 3},
         "max": {"used": 0, "limit": 0},
+        "xlarge": {"used": 0, "limit": 0},
         "always_on": {"used": 0, "limit": 0},
+        # Held computers need no scope, so a plan's scopes never zero them.
+        "computers": {"used": 2, "limit": 2},
     }
 
 
 @pytest.mark.asyncio
 async def test_get_workspace_quota_unknown_scopes_fail_open(client):
     """No scope list from the platform is unknown, not denial: the counts pass through."""
-    gating, scopes, capacity = _quota_platform(None, _CAPACITY)
-    with gating, scopes, capacity:
+    gating, scopes, capacity, counts = _quota_platform(None, _CAPACITY)
+    with gating, scopes, capacity, counts:
         resp = await client.get("/api/v1/workspaces/quota")
 
     assert resp.json()["max"] == {"used": 0, "limit": 2}
@@ -458,7 +553,13 @@ async def test_get_workspace_quota_oss_all_null(client):
         resp = await client.get("/api/v1/workspaces/quota")
 
     assert resp.status_code == 200
-    assert resp.json() == {"performance": None, "max": None, "always_on": None}
+    assert resp.json() == {
+        "performance": None,
+        "max": None,
+        "xlarge": None,
+        "always_on": None,
+        "computers": None,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -511,6 +612,40 @@ async def test_an_incomplete_restore_is_reported_on_the_detail_and_the_list(clie
     assert [w["files_restore_incomplete"] for w in listed.json()["workspaces"]] == [
         True,
         False,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_the_roots_its_paths_start_under_ride_on_the_detail_and_the_list(client):
+    """The agent spells a file under its computer's root, and a turn from before
+    a move under the root of the computer it left. The web reads a workspace's
+    links from its row, seeded from the cached list, so both carry them."""
+    moved = _ws(
+        computer_root_dir="/home/someone/langalpha",
+        previous_root_dirs=["/srv/old", "/home/other/langalpha"],
+    )
+    never = _ws(name="Never moved", computer_root_dir="/home/workspace")
+
+    with patch(
+        "src.server.app.workspaces.db_get_workspace",
+        new_callable=AsyncMock,
+        return_value=moved,
+    ):
+        detail = (await client.get(f"/api/v1/workspaces/{moved['workspace_id']}")).json()
+
+    assert detail["root_dir"] == "/home/someone/langalpha"
+    assert detail["previous_root_dirs"] == ["/srv/old", "/home/other/langalpha"]
+
+    with patch(
+        "src.server.app.workspaces.get_workspaces_for_user",
+        new_callable=AsyncMock,
+        return_value=([moved, never], 2),
+    ):
+        listed = (await client.get("/api/v1/workspaces")).json()["workspaces"]
+
+    assert [(w["root_dir"], w["previous_root_dirs"]) for w in listed] == [
+        ("/home/someone/langalpha", ["/srv/old", "/home/other/langalpha"]),
+        ("/home/workspace", []),
     ]
 
 
@@ -993,7 +1128,8 @@ async def test_drain_start_tasks_cancels_in_flight_warms():
     """A warm scheduled through the workspace route is cancelled and awaited by
     the shared drain, so a task cancelled mid-Phase-2 can revert its row
     instead of being torn down with the loop."""
-    from src.server.app import background_starts, workspaces as ws_mod
+    from src.server.app import workspaces as ws_mod
+    from src.server.services import background_starts
 
     started = asyncio.Event()
 
@@ -1696,7 +1832,12 @@ async def test_archive_workspace_forbidden(client):
 
 
 @pytest.mark.asyncio
-async def test_delete_workspace_success(client):
+@pytest.mark.parametrize(
+    "query, delete_files",
+    [("", False), ("?delete_files=true", True), ("?delete_files=false", False)],
+)
+async def test_delete_workspace_success(client, query, delete_files):
+    """Only a request that asks deletes the folder on the owner's machine."""
     ws = _ws(status="stopped")
     with (
         patch(
@@ -1705,17 +1846,55 @@ async def test_delete_workspace_success(client):
             return_value=ws,
         ),
         patch("src.server.app.workspaces.WorkspaceManager") as MockWM,
+        # DALTON-HOOK(workspace-delete-guard): the route asks the publications
+        # table before deleting; this workspace holds none.
+        patch(
+            "src.dalton.database.publications.has_published_reports",
+            autospec=True,
+            return_value=False,
+        ),
     ):
         mock_manager = AsyncMock()
         mock_manager.delete_workspace = AsyncMock()
         MockWM.get_instance.return_value = mock_manager
 
         resp = await client.delete(
-            f"/api/v1/workspaces/{ws['workspace_id']}"
+            f"/api/v1/workspaces/{ws['workspace_id']}{query}"
         )
 
     assert resp.status_code == 204
-    mock_manager.delete_workspace.assert_awaited_once_with(ws["workspace_id"])
+    mock_manager.delete_workspace.assert_awaited_once_with(
+        ws["workspace_id"], delete_files=delete_files
+    )
+
+
+@pytest.mark.asyncio
+async def test_delete_workspace_with_published_reports_is_refused(client):
+    """DALTON-HOOK(workspace-delete-guard): a workspace holding immutable
+    published reports is not deletable — the guard answers 409 and the
+    manager is never reached."""
+    ws = _ws(status="stopped")
+    with (
+        patch(
+            "src.server.app.workspaces.db_get_workspace",
+            new_callable=AsyncMock,
+            return_value=ws,
+        ),
+        patch("src.server.app.workspaces.WorkspaceManager") as MockWM,
+        patch(
+            "src.dalton.database.publications.has_published_reports",
+            autospec=True,
+            return_value=True,
+        ),
+    ):
+        mock_manager = AsyncMock()
+        MockWM.get_instance.return_value = mock_manager
+
+        resp = await client.delete(f"/api/v1/workspaces/{ws['workspace_id']}")
+
+    assert resp.status_code == 409
+    assert "已发布研报" in resp.json()["detail"]
+    mock_manager.delete_workspace.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1779,3 +1958,435 @@ async def test_implicit_computer_capacity_denial_preserves_429(client):
         response = await client.post('/api/v1/workspaces', json={'name': 'first'})
     assert response.status_code == 429
     assert response.json()['detail']['limit'] == 0
+
+
+# ---------------------------------------------------------------------------
+# Moving a workspace to another computer: accept, read back, cancel
+# ---------------------------------------------------------------------------
+
+TARGET_ID = "33333333-3333-4333-8333-333333333333"
+
+
+def _move(workspace_id, **overrides):
+    """A ``workspace_moves`` row as every read of it returns it."""
+    row = {
+        "move_id": str(uuid.uuid4()),
+        "workspace_id": workspace_id,
+        "source_computer_id": COMPUTER_ID,
+        "target_computer_id": TARGET_ID,
+        "make_primary": False,
+        "phase": "preparing",
+        "error": None,
+        "stale": False,
+        "created_at": NOW,
+        "committed_at": None,
+        "finished_at": None,
+    }
+    row.update(overrides)
+    return row
+
+
+def _assert_move_refusal(resp, code, status=409):
+    assert resp.status_code == status
+    detail = resp.json()["detail"]
+    assert detail["code"] == code
+    assert isinstance(detail["message"], str) and detail["message"]
+    assert detail["files"] == []
+
+
+@pytest.fixture
+def move_runner():
+    """The background runner an accepted move is handed to."""
+    manager = MagicMock()
+    manager.run_accepted_move = AsyncMock()
+    with (
+        patch("src.server.app.computers._computer_manager", return_value=manager),
+        patch("src.server.app.computers.schedule_start", MagicMock()) as schedule,
+    ):
+        yield SimpleNamespace(manager=manager, schedule=schedule)
+
+
+@pytest.mark.asyncio
+async def test_a_move_is_accepted_with_202_and_run_after_answering(client, move_runner):
+    ws = _ws()
+    move = _move(ws["workspace_id"])
+    with (
+        patch(
+            "src.server.app.workspaces.db_get_workspace",
+            new_callable=AsyncMock,
+            return_value=ws,
+        ),
+        patch(
+            "src.server.app.computers.claim_workspace_move",
+            AsyncMock(return_value=move),
+        ) as claim,
+    ):
+        resp = await client.post(
+            f"/api/v1/workspaces/{ws['workspace_id']}/move",
+            json={"computer_id": TARGET_ID},
+        )
+
+    assert resp.status_code == 202
+    body = resp.json()
+    assert body["move_id"] == move["move_id"]
+    assert body["workspace_id"] == ws["workspace_id"]
+    assert body["source_computer_id"] == COMPUTER_ID
+    assert body["target_computer_id"] == TARGET_ID
+    assert body["make_primary"] is False
+    assert body["phase"] == "preparing"
+    assert body["error"] is None
+    claim.assert_awaited_once_with(
+        user_id="test-user-123",
+        workspace_id=ws["workspace_id"],
+        target_computer_id=TARGET_ID,
+        make_primary=False,
+        from_backup=False,
+    )
+    move_runner.schedule.assert_called_once()
+    key, start = move_runner.schedule.call_args.args
+    assert key == f"workspace-move:{move['move_id']}"
+    await start()
+    move_runner.manager.run_accepted_move.assert_awaited_once_with(move)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("code", "status"),
+    [
+        ("not_found", 404),
+        ("not_movable", 409),
+        ("same_computer", 409),
+        ("target_unavailable", 409),
+        ("turn_active", 409),
+        ("move_in_progress", 409),
+        ("no_backup", 409),
+    ],
+)
+async def test_a_refused_move_answers_in_the_shape_its_failure_is_read_in(
+    client, move_runner, code, status
+):
+    from src.server.database.workspace_move import MoveRefused
+
+    ws = _ws()
+    with (
+        patch(
+            "src.server.app.workspaces.db_get_workspace",
+            new_callable=AsyncMock,
+            return_value=ws,
+        ),
+        patch(
+            "src.server.app.computers.claim_workspace_move",
+            AsyncMock(side_effect=MoveRefused(code)),
+        ),
+    ):
+        resp = await client.post(
+            f"/api/v1/workspaces/{ws['workspace_id']}/move",
+            json={"computer_id": TARGET_ID},
+        )
+
+    _assert_move_refusal(resp, code, status)
+    move_runner.schedule.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_another_users_workspace_is_not_moved(client, move_runner):
+    ws = _ws(user_id="other-user")
+    with (
+        patch(
+            "src.server.app.workspaces.db_get_workspace",
+            new_callable=AsyncMock,
+            return_value=ws,
+        ),
+        patch("src.server.app.computers.claim_workspace_move", AsyncMock()) as claim,
+    ):
+        resp = await client.post(
+            f"/api/v1/workspaces/{ws['workspace_id']}/move",
+            json={"computer_id": TARGET_ID},
+        )
+
+    assert resp.status_code == 403
+    claim.assert_not_awaited()
+    move_runner.schedule.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_a_move_from_the_backup_reaches_the_claim(client, move_runner):
+    """The claim is where a move that leaves its folder behind is refused, so
+    the flag must arrive there rather than stop at the route."""
+    ws = _ws()
+    with (
+        patch(
+            "src.server.app.workspaces.db_get_workspace",
+            new_callable=AsyncMock,
+            return_value=ws,
+        ),
+        patch(
+            "src.server.app.computers.claim_workspace_move",
+            AsyncMock(return_value=_move(ws["workspace_id"], from_backup=True)),
+        ) as claim,
+    ):
+        resp = await client.post(
+            f"/api/v1/workspaces/{ws['workspace_id']}/move",
+            json={"computer_id": TARGET_ID, "from_backup": True},
+        )
+
+    assert resp.status_code == 202
+    assert resp.json()["from_backup"] is True
+    assert claim.await_args.kwargs["from_backup"] is True
+
+
+# ---------------------------------------------------------------------------
+# Restore choice: the owner answers a restore offer
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("restore", [True, False])
+async def test_a_restore_choice_answers_with_the_workspace_as_it_now_reads(client, restore):
+    """The offer clears in the row the choice settled, so the answer is a
+    fresh read, not the row read before it."""
+    ws = _ws(files_restore_offered_at=NOW)
+    manager = MagicMock()
+    manager.settle_files_restore_offer = AsyncMock(return_value=True)
+    with (
+        patch(
+            "src.server.app.workspaces.db_get_workspace",
+            new_callable=AsyncMock,
+            side_effect=[ws, {**ws, "files_restore_offered_at": None}],
+        ),
+        patch("src.server.app.workspaces.WorkspaceManager.get_instance", return_value=manager),
+    ):
+        resp = await client.post(
+            f"/api/v1/workspaces/{ws['workspace_id']}/files/restore-choice",
+            json={"restore": restore},
+        )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["files_restore_offered_at"] is None
+    manager.settle_files_restore_offer.assert_awaited_once_with(
+        ws["workspace_id"], user_id="test-user-123", restore=restore
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_restore_choice_with_none_waiting_is_a_conflict(client):
+    """The folder came back or another tab chose; the client then reads the
+    workspace again rather than showing a choice that took."""
+    ws = _ws()
+    manager = MagicMock()
+    manager.settle_files_restore_offer = AsyncMock(return_value=False)
+    with (
+        patch(
+            "src.server.app.workspaces.db_get_workspace",
+            new_callable=AsyncMock,
+            return_value=ws,
+        ),
+        patch("src.server.app.workspaces.WorkspaceManager.get_instance", return_value=manager),
+    ):
+        resp = await client.post(
+            f"/api/v1/workspaces/{ws['workspace_id']}/files/restore-choice",
+            json={"restore": True},
+        )
+
+    assert resp.status_code == 409
+    assert resp.json()["detail"] == "No restore is waiting on a choice for this workspace."
+
+
+@pytest.mark.asyncio
+async def test_another_users_restore_offer_is_not_answered(client):
+    ws = _ws(user_id="other-user", files_restore_offered_at=NOW)
+    manager = MagicMock()
+    manager.settle_files_restore_offer = AsyncMock()
+    with (
+        patch(
+            "src.server.app.workspaces.db_get_workspace",
+            new_callable=AsyncMock,
+            return_value=ws,
+        ),
+        patch("src.server.app.workspaces.WorkspaceManager.get_instance", return_value=manager),
+    ):
+        resp = await client.post(
+            f"/api/v1/workspaces/{ws['workspace_id']}/files/restore-choice",
+            json={"restore": False},
+        )
+
+    assert resp.status_code == 403
+    manager.settle_files_restore_offer.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_move_without_the_computer_runtime_answers_503(client):
+    """As every computer action does, rather than as a server error."""
+    from src.server.app.computers import ComputerRuntimeUnavailable
+
+    ws = _ws()
+    with (
+        patch(
+            "src.server.app.workspaces.db_get_workspace",
+            new_callable=AsyncMock,
+            return_value=ws,
+        ),
+        patch(
+            "src.server.app.computers._computer_manager",
+            side_effect=ComputerRuntimeUnavailable("no provider stack"),
+        ),
+        patch("src.server.app.computers.claim_workspace_move", AsyncMock()) as claim,
+    ):
+        resp = await client.post(
+            f"/api/v1/workspaces/{ws['workspace_id']}/move",
+            json={"computer_id": TARGET_ID},
+        )
+
+    assert resp.status_code == 503
+    claim.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_reading_the_move_answers_the_latest_one(client):
+    ws = _ws()
+    move = _move(ws["workspace_id"], phase="done", finished_at=NOW)
+    with (
+        patch(
+            "src.server.app.workspaces.db_get_workspace",
+            new_callable=AsyncMock,
+            return_value=ws,
+        ),
+        patch(
+            "src.server.app.workspaces.get_latest_workspace_move",
+            AsyncMock(return_value=move),
+        ) as latest,
+    ):
+        resp = await client.get(f"/api/v1/workspaces/{ws['workspace_id']}/move")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert (body["move_id"], body["phase"], body["error"]) == (move["move_id"], "done", None)
+    latest.assert_awaited_once_with(ws["workspace_id"])
+
+
+@pytest.mark.asyncio
+async def test_reading_the_move_of_a_workspace_never_moved_is_null(client):
+    ws = _ws()
+    with (
+        patch(
+            "src.server.app.workspaces.db_get_workspace",
+            new_callable=AsyncMock,
+            return_value=ws,
+        ),
+        patch(
+            "src.server.app.workspaces.get_latest_workspace_move",
+            AsyncMock(return_value=None),
+        ),
+    ):
+        resp = await client.get(f"/api/v1/workspaces/{ws['workspace_id']}/move")
+
+    assert resp.status_code == 200
+    assert resp.json() is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("row", "phase"),
+    [
+        # A runner lost before staging changed nothing: the next claim or
+        # sweep would end it, so a reader is told now.
+        ({"phase": "backing_up", "stale": True}, "failed"),
+        # Past staging recovery finishes it, so it is still in progress.
+        ({"phase": "staged", "stale": True}, "staged"),
+        # The sweep records only the code.
+        ({"phase": "failed", "error": {"code": "interrupted"}}, "failed"),
+    ],
+    ids=["stale-early", "stale-staged", "code-only"],
+)
+async def test_a_move_reads_in_the_shape_a_client_switches_on(client, row, phase):
+    ws = _ws()
+    with (
+        patch(
+            "src.server.app.workspaces.db_get_workspace",
+            new_callable=AsyncMock,
+            return_value=ws,
+        ),
+        patch(
+            "src.server.app.workspaces.get_latest_workspace_move",
+            AsyncMock(return_value=_move(ws["workspace_id"], **row)),
+        ),
+    ):
+        resp = await client.get(f"/api/v1/workspaces/{ws['workspace_id']}/move")
+
+    body = resp.json()
+    assert body["phase"] == phase
+    if phase == "failed":
+        assert body["error"]["code"] == "interrupted"
+        assert isinstance(body["error"]["message"], str) and body["error"]["message"]
+        assert body["error"]["files"] == []
+    else:
+        assert body["error"] is None
+
+
+def _cancel_patches(ws, *, cancelled=None, latest=None):
+    return (
+        patch(
+            "src.server.app.workspaces.db_get_workspace",
+            new_callable=AsyncMock,
+            return_value=ws,
+        ),
+        patch(
+            "src.server.app.workspaces.db_cancel_workspace_move",
+            AsyncMock(return_value=cancelled),
+        ),
+        patch(
+            "src.server.app.workspaces.get_latest_workspace_move",
+            AsyncMock(return_value=latest),
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_cancelling_a_move_that_has_not_set_its_folder_aside(client):
+    ws = _ws()
+    move = _move(ws["workspace_id"], phase="cancelled", finished_at=NOW)
+    read, cancel, latest = _cancel_patches(ws, cancelled=move)
+    with read, cancel as cancelled, latest as latest_read:
+        resp = await client.post(f"/api/v1/workspaces/{ws['workspace_id']}/move/cancel")
+
+    assert resp.status_code == 200
+    assert (resp.json()["move_id"], resp.json()["phase"]) == (move["move_id"], "cancelled")
+    cancelled.assert_awaited_once_with(ws["workspace_id"], "test-user-123")
+    latest_read.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cancelling_with_no_move_is_not_found(client):
+    ws = _ws()
+    read, cancel, latest = _cancel_patches(ws)
+    with read, cancel, latest:
+        resp = await client.post(f"/api/v1/workspaces/{ws['workspace_id']}/move/cancel")
+
+    _assert_move_refusal(resp, "not_found", 404)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["done", "failed", "cancelled"])
+async def test_cancelling_a_move_that_ended_answers_as_it_ended(client, phase):
+    """A retried cancel, or one racing the move's end, is not an error."""
+    ws = _ws()
+    move = _move(ws["workspace_id"], phase=phase, finished_at=NOW)
+    read, cancel, latest = _cancel_patches(ws, latest=move)
+    with read, cancel, latest:
+        resp = await client.post(f"/api/v1/workspaces/{ws['workspace_id']}/move/cancel")
+
+    assert resp.status_code == 200
+    assert (resp.json()["move_id"], resp.json()["phase"]) == (move["move_id"], phase)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["staged", "committed"])
+async def test_a_move_past_setting_its_folder_aside_is_not_cancellable(client, phase):
+    ws = _ws()
+    read, cancel, latest = _cancel_patches(
+        ws, latest=_move(ws["workspace_id"], phase=phase)
+    )
+    with read, cancel, latest:
+        resp = await client.post(f"/api/v1/workspaces/{ws['workspace_id']}/move/cancel")
+
+    _assert_move_refusal(resp, "not_cancellable")

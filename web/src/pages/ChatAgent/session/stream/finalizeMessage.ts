@@ -1,4 +1,5 @@
 import type { StructuredError } from '@/utils/rateLimitError';
+import { withoutPending } from './toolCallChunks';
 
 type MessageEnd = 'completed' | 'stopped' | 'failed' | 'paused' | 'disconnected';
 
@@ -11,7 +12,7 @@ export function finalizeAssistantMessage<T extends object>(
 ): T & { isStreaming: false; completionObservedAt?: number } {
   const previous = 'completionObservedAt' in message ? message.completionObservedAt : undefined;
   const terminal = end === 'completed' || end === 'stopped' || end === 'failed';
-  return {
+  return withoutPending({
     ...message,
     isStreaming: false,
     completionObservedAt: terminal
@@ -19,7 +20,7 @@ export function finalizeAssistantMessage<T extends object>(
       : undefined,
     ...(end === 'stopped' ? { stopped: true } : {}),
     ...(end === 'failed' ? { error: true } : {}),
-  };
+  });
 }
 
 /** Settles a turn that failed. Whatever it streamed stays its reply, and the

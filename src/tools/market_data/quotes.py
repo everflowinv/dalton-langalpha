@@ -19,13 +19,15 @@ from .quote_format import (
     stamp_quote,
 )
 from src.data_client import get_financial_data_provider, get_market_data_provider
+from src.data_client.base import MoverRow
 from src.data_client.freshness import is_live
 from src.data_client.ginlix_data.directory import fill_quote_names
 from src.data_client.market_data_provider import snapshot_key
 from src.data_client.ginlix_data.pagination import paginate_cursor
+from src.observability import stamp_tool_provider
 from market_protocol import AssetClass, display_spelling
 
-from ._shared import _get_user_id
+from ._shared import _get_user_id, _mark_failure, _mark_no_data
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +60,7 @@ async def fetch_options_chain(
         ref, underlying = resolve_listing(underlying)
         cur = _symbol_currency(ref)
         if provider.intel is None:
+            _mark_failure("not_configured")
             return (
                 "Options chain data is not available"
                 " (no MarketIntelSource configured).",
@@ -103,7 +106,8 @@ async def fetch_options_chain(
             except Exception:
                 logger.debug("Failed to fetch options snapshots", exc_info=True)
 
-        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        retrieved_at = datetime.now(timezone.utc)
+        timestamp = retrieved_at.strftime("%Y-%m-%d %H:%M UTC")
         lines: List[str] = []
         header = f"## Options Chain: {underlying} ({len(results)} contracts)"
         if market_status:
@@ -114,21 +118,25 @@ async def fetch_options_chain(
             lines.append(f"**Type:** {contract_type.upper()}")
         lines.append("")
 
-        if not results:
+        # Each contract carries its snapshot's session (close, change,
+        # volume), which the table below and the card both print.
+        contracts = [
+            {**c, "session": snapshot_map.get(c.get("ticker"), {}).get("session") or None}
+            for c in results
+        ]
+        if not contracts:
             lines.append("No contracts found matching the given criteria.")
         else:
             lines.append("| Ticker | Type | Strike | Expiry | Close | Chg% | Volume |")
             lines.append("|--------|------|--------|--------|-------|------|--------|")
-            for c in results:
+            for c in contracts:
                 ticker = c.get("ticker", "N/A")
                 ctype = c.get("contract_type", "N/A")
                 strike = c.get("strike_price")
                 strike_str = fmt_price(strike, cur)
                 expiry = c.get("expiration_date", "N/A")
 
-                # Merge snapshot session data
-                snap = snapshot_map.get(ticker, {})
-                session = snap.get("session", {})
+                session = c["session"] or {}
                 close_val = session.get("close")
                 close_str = fmt_price(close_val, cur) if close_val is not None else "—"
                 chg_pct = session.get("change_percent")
@@ -144,13 +152,18 @@ async def fetch_options_chain(
         content = "\n".join(lines)
         artifact = {
             "type": "options_chain",
-            "results": results,
+            "results": contracts,
             "underlying": underlying,
+            "contract_type": contract_type,
+            "market_status": market_status,
+            "currency": cur.currency,
+            "as_of_ts": int(retrieved_at.timestamp() * 1000),
         }
         return content, artifact
 
     except Exception as e:
         logger.error(f"Error fetching options chain for {underlying}: {e}")
+        _mark_failure(e)
         timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         err = (
             f"## Options Chain: {underlying}\n"
@@ -164,6 +177,28 @@ async def fetch_options_chain(
 
 
 
+def _movers_error(message: str) -> Tuple[str, Dict[str, Any]]:
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    err = (
+        f"## Market Movers\n"
+        f"**Retrieved:** {timestamp}\n"
+        f"**Status:** Error\n\nError: {message}"
+    )
+    return err, {
+        "type": "market_movers", "results": [],
+        "error": message,
+    }
+
+
+class MoverCardRow(MoverRow):
+    """A mover as the text and the card read it. The name and the currency are
+    the tool's to add: the source names no mover, and a price is in its
+    listing's currency."""
+
+    name: Optional[str]
+    currency: Optional[str]
+
+
 async def fetch_market_movers(
     direction: str = "gainers",
     config: Optional[RunnableConfig] = None,
@@ -173,38 +208,51 @@ async def fetch_market_movers(
     Returns:
         Tuple of (markdown content, artifact dict)
     """
+    # The agent's mistake, so refused here unmarked: the data API would answer
+    # it with a 422 that alarms as our failure and shows the model its URL.
+    if direction not in ("gainers", "losers"):
+        return _movers_error(
+            f"direction must be 'gainers' or 'losers', got {direction!r}"
+        )
     try:
         provider = await get_financial_data_provider()
         user_id = _get_user_id(config)
         if provider.intel is None:
+            _mark_failure("not_configured")
             return (
                 "Market movers data is not available"
                 " (no MarketIntelSource configured).",
                 {"type": "market_movers", "results": []},
             )
 
-        results = await provider.intel.get_movers(direction, user_id=user_id)
+        movers = await provider.intel.get_movers(direction, user_id=user_id)
+        refs = [resolve_ref(m["symbol"]) for m in movers]
+        rows: List[MoverCardRow] = [
+            {**m, "name": None, "currency": ref.price_currency if ref is not None else None}
+            for m, ref in zip(movers, refs)
+        ]
+        await fill_quote_names(rows)
 
-        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        retrieved_at = datetime.now(timezone.utc)
+        timestamp = retrieved_at.strftime("%Y-%m-%d %H:%M UTC")
         label = "Gainers" if direction == "gainers" else "Losers"
         lines: List[str] = []
-        lines.append(f"## Market {label} ({len(results)} stocks)")
+        lines.append(f"## Market {label} ({len(rows)} stocks)")
         lines.append(f"**Retrieved:** {timestamp}")
         lines.append("")
 
-        if not results:
+        if not rows:
             lines.append(f"No {direction} data available.")
         else:
             lines.append("| # | Symbol | Name | Price | Change% |")
             lines.append("|---|--------|------|-------|---------|")
-            for i, stock in enumerate(results, 1):
-                sym = stock.get("ticker", stock.get("symbol", "N/A"))
-                name = stock.get("name", "N/A")
+            for i, (row, ref) in enumerate(zip(rows, refs), 1):
+                sym = row["symbol"]
+                name = row["name"] or "N/A"
                 if len(name) > 30:
                     name = name[:27] + "..."
-                price = stock.get("price", stock.get("close"))
-                price_str = fmt_price(price, _symbol_currency(resolve_ref(sym)))
-                change_pct = stock.get("change_percent", stock.get("todaysChangePerc"))
+                price_str = fmt_price(row["price"], _symbol_currency(ref))
+                change_pct = row["change_percent"]
                 if change_pct is not None:
                     change_str = f"{change_pct:+.2f}%"
                 else:
@@ -212,21 +260,18 @@ async def fetch_market_movers(
                 lines.append(f"| {i} | {sym} | {name} | {price_str} | {change_str} |")
 
         content = "\n".join(lines)
-        artifact = {"type": "market_movers", "direction": direction, "results": results}
+        artifact = {
+            "type": "market_movers",
+            "direction": direction,
+            "results": rows,
+            "as_of_ts": int(retrieved_at.timestamp() * 1000),
+        }
         return content, artifact
 
     except Exception as e:
         logger.error(f"Error fetching market movers ({direction}): {e}")
-        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-        err = (
-            f"## Market Movers\n"
-            f"**Retrieved:** {timestamp}\n"
-            f"**Status:** Error\n\nError: {e}"
-        )
-        return err, {
-            "type": "market_movers", "results": [],
-            "error": str(e),
-        }
+        _mark_failure(e)
+        return _movers_error(str(e))
 
 
 async def fetch_quote(
@@ -301,6 +346,7 @@ async def fetch_quote(
         # The card names each row as the REST routes do; a daily row has none.
         await fill_quote_names(snaps)
         if not snaps:
+            _mark_no_data()
             return f"No quote data available for {', '.join(syms)}.", empty
         # Stamp each row with what it actually is: the declared tier, the
         # measured freshness, and a venue-local clock at the PRINT time when the
@@ -331,6 +377,11 @@ async def fetch_quote(
                 snap["currency"] = ref.price_currency
             all_realtime = all_realtime and is_live(snap["freshness"])
         content = format_quote_block(snaps, at=retrieved_at)
+        # A batch can be split across the chain: one stable name for the set.
+        sources = {snap.get("source") for snap in snaps}
+        stamp_tool_provider(
+            ",".join(sorted(s for s in sources if isinstance(s, str) and s)) or None
+        )
         # Diff on the RESOLVED spelling the provider actually saw (an alias like
         # "SPX" is requested as "GSPC"), but report under the caller's input
         # label, matched as the provider chain matches its rows.
@@ -353,4 +404,5 @@ async def fetch_quote(
         }
     except Exception as e:
         logger.error(f"Error fetching quotes for {syms}: {e}")
+        _mark_failure(e)
         return f"Error fetching quotes: {e}", empty

@@ -9,6 +9,7 @@ from contextlib import AsyncExitStack
 from dataclasses import replace
 from typing import Any, Dict
 
+from ptc_agent.core.sandbox.providers import provider_class
 from ptc_agent.core.session import Session
 
 from src.server.database.computer import (
@@ -61,9 +62,7 @@ class WorkspaceEntitlementsMixin:
         if not await spec_entitlement_lost(user_id, tier):
             return tier
         computer_id = binding.computer_id
-        settings = self._provider_settings(
-            binding.kind or self.config.sandbox.provider, binding.provider_config
-        )
+        settings = self._provider_settings(binding.kind, binding.provider_config)
         standard = settings.resource_tiers.get("standard")
         if standard is None:
             logger.warning("No standard tier for computer %s; keeping %s", computer_id, tier)
@@ -109,7 +108,8 @@ class WorkspaceEntitlementsMixin:
         """
         from src.server.dependencies.usage_limits import always_on_entitlement_lost
 
-        if not binding.is_always_on or not user_id:
+        # An unmetered machine is the user's own: no plan grants or limits it.
+        if not binding.is_always_on or not user_id or not binding.provider.metered:
             return binding.is_always_on
         if not await always_on_entitlement_lost(user_id):
             return True
@@ -155,6 +155,8 @@ class WorkspaceEntitlementsMixin:
         fresh = replace(fresh, resource_tier=entitled_tier)
         sandbox_id = fresh.provider_ref
         if sandbox_id:
+            # Daytona's metric history goes with the sandbox.
+            await self._fold_usage_before_delete(computer_id)
             try:
                 await self._destroy_sandbox(sandbox_id, binding=fresh)
             except Exception as e:
@@ -163,6 +165,7 @@ class WorkspaceEntitlementsMixin:
                     f"for computer {computer_id}; replacement aborted: {e}"
                 )
                 raise
+            await self._end_replaced_usage_run(computer_id, sandbox_id)
         if self._cached_session(computer_id) is session:
             await self._clear_session(computer_id, evict_session=session)
         # _clear_session clears pending_lazy_sync; re-arm it so a recovery
@@ -188,20 +191,17 @@ class WorkspaceEntitlementsMixin:
         Interval 0 (never auto-stop) when enabled, else the configured default.
         Reuses ``runtime`` when the caller already holds a connected one (the
         reconnect path) to avoid a throwaway provider and an extra round trip.
-        No-ops if the runtime lacks the ``autostop`` capability.
+        No-ops on a runtime that does not auto-stop.
         """
         settings = (
             self._provider_settings(binding.kind, binding.provider_config)
-            if binding is not None and binding.kind
-            else self.config.sandbox.daytona
+            if binding is not None
+            else self.config.sandbox.settings_for(self.config.sandbox.provider)
         )
-        interval = getattr(
-            settings, "auto_stop_interval", self.config.sandbox.daytona.auto_stop_interval
-        )
-        minutes = 0 if enabled else interval // 60
+        minutes = 0 if enabled else settings.auto_stop_interval // 60
 
         if runtime is not None:
-            if "autostop" in runtime.capabilities:
+            if runtime.autostops:
                 await runtime.set_autostop_interval(minutes)
             return
 
@@ -210,7 +210,7 @@ class WorkspaceEntitlementsMixin:
         # sandbox that may not live there, which is the whole reason a computer
         # carries provider_kind and provider_config.
         async with self._detached_runtime(sandbox_id, binding=binding) as detached:
-            if "autostop" in detached.capabilities:
+            if detached.autostops:
                 await detached.set_autostop_interval(minutes)
 
     async def set_workspace_always_on(
@@ -250,12 +250,21 @@ class WorkspaceEntitlementsMixin:
                 if not computer:
                     raise ValueError(f"Computer {computer_id} not found")
                 owner_id = str(computer["user_id"])
+                if enabled and not computer.get("is_always_on"):
+                    if not provider_class(computer["kind"]).holds_always_on:
+                        raise RuntimeError(
+                            "Always-on isn't available for this computer's provider"
+                        )
                 from src.server.dependencies.usage_limits import (
                     assert_always_on_allowed,
                     platform_gating_active,
                 )
 
-                if enabled and platform_gating_active():
+                if (
+                    enabled
+                    and platform_gating_active()
+                    and provider_class(computer["kind"]).metered
+                ):
                     await stack.enter_async_context(computer_capacity_lock(owner_id))
                     computer = await get_computer(computer_id)
                     if not computer:
@@ -393,7 +402,16 @@ class WorkspaceEntitlementsMixin:
 
         exempt: set[str] = set()
 
-        always_on_rows = [c for c in running_computers if c.get("is_always_on")]
+        always_on_rows = []
+        for c in running_computers:
+            if not c.get("is_always_on"):
+                continue
+            # An unmetered machine is the user's own, so no plan can lapse it
+            # and there is nothing to probe.
+            if not provider_class(c["kind"]).metered:
+                exempt.add(str(c["computer_id"]))
+                continue
+            always_on_rows.append(c)
         # One platform validate per distinct owner, bounded-concurrent so a
         # large always-on fleet doesn't serialize the reaper cycle on RTTs.
         semaphore = asyncio.Semaphore(5)

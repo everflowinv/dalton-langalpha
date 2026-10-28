@@ -30,7 +30,7 @@ async def machine(seed_user, patched_get_db_connection):
 
     owner = seed_user["user_id"]
     computer = await create_computer(
-        owner, kind="daytona", is_primary=True, status="running"
+        owner, kind="daytona", name="Cloud computer", is_primary=True, status="running"
     )
     cid = str(computer["computer_id"])
     first = await create_workspace_on_computer(owner, "first", cid)
@@ -104,9 +104,11 @@ async def test_a_move_takes_the_links_on_the_computer_it_left(machine):
     from src.server.database.workspace import bind_workspace_to_computer
 
     other = str(
-        (await create_computer(machine.owner, kind="daytona", status="running"))[
-            "computer_id"
-        ]
+        (
+            await create_computer(
+                machine.owner, kind="daytona", name="Second", status="running"
+            )
+        )["computer_id"]
     )
     await save_links(machine.cid, SANDBOX, frozenset({None, machine.first}), LAYOUT)
     await save_links(other, "sb-other", frozenset({None}), LAYOUT)

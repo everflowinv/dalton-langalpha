@@ -25,6 +25,8 @@ FEISHU_ROUTES = frozenset(
         "wiki/node",
         "doc/create",
         "doc/append",
+        # C1: re-grant only, scoped to docs the bridge itself created.
+        "doc/grant",
     }
 )
 

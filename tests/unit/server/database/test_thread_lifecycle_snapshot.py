@@ -17,7 +17,6 @@ from src.server.contracts.status import (
     TERMINAL_STATUSES,
     to_public,
 )
-from src.server.database.conversation import threads_read
 from src.server.database.conversation.threads_read import (
     _LIFECYCLE_SNAPSHOT_SQL,
     get_thread_lifecycle_rows,

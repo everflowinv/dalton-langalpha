@@ -1,25 +1,30 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useId } from 'react';
 import { useNavigate } from 'react-router';
 import { useQueryClient } from '@tanstack/react-query';
-import { Button } from '@/components/ui/button';
-import { Loader } from '@/components/ui/loader';
 import { Input } from '@/components/ui/input';
+import { WizardStepHeader } from '@/components/ui/wizard';
 import { ApiKeyInput, type TestResult } from '@/components/model/ApiKeyInput';
+import { SetupFooter } from '../../SetupFooter';
 import { useUpdateApiKeys } from '@/hooks/useApiKeys';
 import { queryKeys } from '@/lib/queryKeys';
 import { useTranslation } from 'react-i18next';
-import { getApiFormatKey, testApiKey, type LocationState } from './shared';
+import { getApiFormatKey, testApiKey, useProviderConnected, type LocationState } from './shared';
 // DALTON-HOOK(team-credentials): team-shared credentials hint
 import { isDaltonAuth } from '@/config/daltonAuth';
 import { TEAM_SHARED_CREDENTIALS_HINT, useTeamCredentials } from '@/hooks/useTeamCredentials'; // DALTON-HOOK(team-credentials)
 
 export function ApiKeyConnect({ state }: { state: LocationState }) {
   const navigate = useNavigate();
+  const connected = useProviderConnected();
   const queryClient = useQueryClient();
   const updateApiKeys = useUpdateApiKeys();
   const { t } = useTranslation();
   // DALTON-HOOK(team-credentials): team-shared credentials status
   const { isShared: isTeamShared } = useTeamCredentials();
+  const headingId = useId();
+  const regionLabelId = useId();
+  const baseUrlId = useId();
+  const apiKeyId = useId();
 
   const method = state.method ?? 'api_key';
   const provider = state.provider ?? '';
@@ -105,7 +110,9 @@ export function ApiKeyConnect({ state }: { state: LocationState }) {
       ]);
 
       if (dynamicModels) {
-        // Dynamic providers (LM Studio, vLLM, Ollama) — go to model discovery
+        // Dynamic providers (LM Studio, vLLM, Ollama) — go to model discovery.
+        // A local server has no models until some are picked from it, so its
+        // return waits for that step.
         navigate('/setup/connect', {
           state: {
             method,
@@ -117,71 +124,65 @@ export function ApiKeyConnect({ state }: { state: LocationState }) {
           },
         });
       } else {
-        navigate('/setup/models', {
-          state: { method, provider: saveProvider, displayName, brandKey },
-        });
+        connected({ method, provider: saveProvider, displayName, brandKey });
       }
     } catch (e: unknown) {
       const err = e as { response?: { data?: { detail?: string } }; message?: string };
       const detail = err?.response?.data?.detail;
       setError(typeof detail === 'string' ? detail : err?.message ?? t('setup.errorSaveKey'));
-    } finally {
       setSaving(false);
     }
-  }, [apiKey, baseUrl, dynamicModels, effectiveProvider, provider, updateApiKeys, queryClient, navigate, method, displayName, brandKey, t]);
+  }, [apiKey, baseUrl, dynamicModels, effectiveProvider, provider, updateApiKeys, queryClient, navigate, connected, method, displayName, brandKey, t]);
 
   const handleBack = useCallback(() => {
     navigate('/setup/provider', { state: { method } });
   }, [navigate, method]);
 
   return (
-    <div className="flex flex-col gap-4 sm:gap-6">
-      <div className="flex flex-col gap-1">
-        <h2
-          className="font-semibold"
-          style={{ fontSize: '1.125rem', color: 'var(--color-text-primary)' }}
-        >
-          {t('setup.connectTitle', { provider: displayName })}
-        </h2>
-        <p
-          className="text-sm"
-          style={{ color: 'var(--color-text-secondary)' }}
-        >
-          {dynamicModels
+    <div>
+      <WizardStepHeader
+        titleId={headingId}
+        title={t('setup.connectTitle', { provider: displayName })}
+        helper={
+          dynamicModels
             ? t('setup.localServerDesc')
             : method === 'coding_plan'
               ? t('setup.codingPlanDesc')
-              : t('setup.apiKeyInputDesc')}
+              : t('setup.apiKeyInputDesc')
+        }
+      />
+      {/* DALTON-HOOK(team-credentials): team-shared credentials hint */}
+      {isDaltonAuth && isTeamShared && (
+        <p className="text-xs mt-1" style={{ color: 'var(--color-text-tertiary)' }}>
+          {TEAM_SHARED_CREDENTIALS_HINT}
         </p>
-        {/* DALTON-HOOK(team-credentials): team-shared credentials hint */}
-        {isDaltonAuth && isTeamShared && (
-          <p className="text-xs mt-1" style={{ color: 'var(--color-text-tertiary)' }}>
-            {TEAM_SHARED_CREDENTIALS_HINT}
-          </p>
-        )}
-      </div>
-
+      )}
+      <div className="flex flex-col gap-4 sm:gap-6">
       {/* Region toggle — shown when provider has region variants */}
       {regionVariants && regionVariants.length > 0 && (
         <div className="flex items-center gap-2">
           <span
+            id={regionLabelId}
             className="text-xs font-medium"
             style={{ color: 'var(--color-text-tertiary)' }}
           >
             {t('setup.regionLabel')}
           </span>
           <div
-            className="inline-flex rounded-md overflow-hidden"
+            role="group"
+            aria-labelledby={regionLabelId}
+            className="inline-flex rounded-md overflow-hidden clips-focus-ring"
             style={{ border: '1px solid var(--color-border-default)' }}
           >
             {/* Default region option */}
             <button
               type="button"
+              aria-pressed={!selectedRegion}
               onClick={() => handleRegionChange(null)}
               className="px-3 py-1 text-xs font-medium transition-colors"
               style={{
-                background: !selectedRegion ? 'var(--color-accent-primary)' : 'var(--color-bg-surface)',
-                color: !selectedRegion ? '#fff' : 'var(--color-text-secondary)',
+                background: !selectedRegion ? 'var(--color-btn-primary-bg)' : 'var(--color-bg-surface)',
+                color: !selectedRegion ? 'var(--color-btn-primary-text)' : 'var(--color-text-secondary)',
               }}
             >
               {(defaultRegion === 'cn' ? t('setup.regionChina') : defaultRegion === 'sg' ? t('setup.regionSingapore') : t('setup.regionInternational'))}
@@ -190,11 +191,12 @@ export function ApiKeyConnect({ state }: { state: LocationState }) {
               <button
                 key={rv.provider}
                 type="button"
+                aria-pressed={selectedRegion === rv.region}
                 onClick={() => handleRegionChange(rv.region)}
                 className="px-3 py-1 text-xs font-medium transition-colors"
                 style={{
-                  background: selectedRegion === rv.region ? 'var(--color-accent-primary)' : 'var(--color-bg-surface)',
-                  color: selectedRegion === rv.region ? '#fff' : 'var(--color-text-secondary)',
+                  background: selectedRegion === rv.region ? 'var(--color-btn-primary-bg)' : 'var(--color-bg-surface)',
+                  color: selectedRegion === rv.region ? 'var(--color-btn-primary-text)' : 'var(--color-text-secondary)',
                   borderLeft: '1px solid var(--color-border-default)',
                 }}
               >
@@ -224,8 +226,8 @@ export function ApiKeyConnect({ state }: { state: LocationState }) {
           <span
             className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium"
             style={{
-              background: 'var(--color-accent-soft)',
-              color: 'var(--color-accent-primary)',
+              background: 'var(--color-bg-tag)',
+              color: 'var(--color-text-secondary)',
             }}
           >
             {t(effectiveApiFormatKey, { sdk: effectiveSdk })}
@@ -236,6 +238,7 @@ export function ApiKeyConnect({ state }: { state: LocationState }) {
         <div className="flex flex-col gap-1.5">
           <div className="flex items-center justify-between">
             <label
+              htmlFor={baseUrlId}
               className="text-xs font-medium"
               style={{ color: 'var(--color-text-tertiary)' }}
             >
@@ -245,14 +248,14 @@ export function ApiKeyConnect({ state }: { state: LocationState }) {
               <button
                 type="button"
                 onClick={() => setBaseUrl(effectiveBaseUrl)}
-                className="text-[0.6875rem]"
-                style={{ color: 'var(--color-accent-primary)' }}
+                className="text-[0.6875rem] text-(--color-text-primary) underline underline-offset-2 hover:opacity-80"
               >
                 {t('setup.resetToDefault')}
               </button>
             )}
           </div>
           <Input
+            id={baseUrlId}
             type="url"
             value={baseUrl}
             onChange={(e) => setBaseUrl(e.target.value)}
@@ -270,6 +273,7 @@ export function ApiKeyConnect({ state }: { state: LocationState }) {
       {/* API key input */}
       <div className="flex flex-col gap-3">
         <label
+          htmlFor={apiKeyId}
           className="block text-sm font-medium"
           style={{ color: 'var(--color-text-primary)' }}
         >
@@ -281,6 +285,7 @@ export function ApiKeyConnect({ state }: { state: LocationState }) {
           )}
         </label>
         <ApiKeyInput
+          id={apiKeyId}
           provider={provider}
           value={apiKey}
           onChange={setApiKey}
@@ -289,33 +294,21 @@ export function ApiKeyConnect({ state }: { state: LocationState }) {
       </div>
 
       {error && (
-        <p className="text-sm" style={{ color: 'var(--color-loss)' }}>
+        <p role="alert" className="text-sm" style={{ color: 'var(--color-loss)' }}>
           {error}
         </p>
       )}
-
-      <div className="flex items-center justify-between pt-2">
-        <Button variant="outline" onClick={handleBack}>
-          {t('setup.back')}
-        </Button>
-        <Button
-          variant="default"
-          disabled={saving || (!dynamicModels && !apiKey.trim()) || (dynamicModels && !baseUrl.trim())}
-          onClick={handleSaveAndNext}
-          className="min-w-[120px]"
-        >
-          {saving ? (
-            <>
-              <span aria-hidden="true" className="mr-1.5 shrink-0">
-                <Loader size={16} className="text-current" />
-              </span>
-              {t('setup.saving')}
-            </>
-          ) : (
-            t('setup.continue')
-          )}
-        </Button>
       </div>
+
+      <SetupFooter
+        back={{ label: t('setup.back'), onClick: handleBack }}
+        primary={{
+          label: saving ? t('setup.saving') : t('setup.continue'),
+          onClick: handleSaveAndNext,
+          disabled: (!dynamicModels && !apiKey.trim()) || (dynamicModels && !baseUrl.trim()),
+          busy: saving,
+        }}
+      />
     </div>
   );
 }

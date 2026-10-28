@@ -23,14 +23,18 @@ pytestmark = [pytest.mark.integration, pytest.mark.asyncio(loop_scope="session")
 def _reset_rollout_cache():
     """The per-process rollout cache must not leak identity between tests."""
 
-    from src.server.services import platform_secret_rollout
+    from src.server.services.platform_secret_rollout import (
+        reset_platform_secret_rollout_cache,
+    )
 
-    platform_secret_rollout._active_rollout_set = None
+    reset_platform_secret_rollout_cache()
     yield
-    platform_secret_rollout._active_rollout_set = None
+    reset_platform_secret_rollout_cache()
 
 
-def _identity(*, secret_id: str, placeholder: str) -> ReconciledPlatformSecret:
+def _identity(
+    *, secret_id: str, placeholder: str, egress_rule: str = ""
+) -> ReconciledPlatformSecret:
     definition = PlatformSecretDefinition(
         source_env_var="FMP_API_KEY",
         sandbox_env_var="FMP_API_KEY",
@@ -43,6 +47,7 @@ def _identity(*, secret_id: str, placeholder: str) -> ReconciledPlatformSecret:
         name=f"prod-{definition.name_suffix}",
         provider_secret_id=secret_id,
         placeholder=placeholder,
+        egress_rule=egress_rule,
     )
 
 
@@ -84,7 +89,7 @@ async def _seed_computer(seed_workspace) -> str:
     from src.server.database.computer import create_computer
     from src.server.database.workspace import bind_workspace_to_computer
 
-    computer = await create_computer(seed_workspace["user_id"])
+    computer = await create_computer(seed_workspace["user_id"], name="Cloud computer")
     computer_id = str(computer["computer_id"])
     assert await bind_workspace_to_computer(
         str(seed_workspace["workspace_id"]),
@@ -112,6 +117,8 @@ async def _register(*identities: ReconciledPlatformSecret, provider: str = "dayt
 
 class _VerifiedRuntime:
     """Emulates the in-sandbox hashing probe for the registered placeholder."""
+
+    updates_env = True
 
     def __init__(self, *placeholders: str):
         self._lines = "\n".join(
@@ -212,19 +219,170 @@ async def test_credential_rotation_without_identity_change_keeps_generation(
     )
 
 
-async def test_provider_change_is_an_identity_change(
+async def _computer_at(conn_factory, user_id, *, index, kind, version) -> None:
+    import uuid
+
+    async with conn_factory() as conn:
+        await conn.execute(
+            """INSERT INTO computers (computer_id, user_id, kind, provider_ref,
+                       status, platform_secret_version)
+               VALUES (%s, %s, %s, %s, 'running', %s)""",
+            (uuid.UUID(int=index), user_id, kind, f"{kind}-{index}", version),
+        )
+
+
+async def test_a_second_kind_registers_beside_the_first(
+    seed_user, patched_get_db_connection
+):
+    """A provider switch keeps the old kind's rows and generation, and the new
+    kind's generation is above every generation and version stamped so far."""
+    from src.server.services.platform_secret_rollout import (
+        get_platform_secret_rollouts,
+    )
+
+    daytona = await _register(
+        _identity(secret_id="secret-1", placeholder="dtn_secret_one")
+    )
+    await _computer_at(
+        patched_get_db_connection, seed_user["user_id"],
+        index=1, kind="daytona", version=daytona.generation,
+    )
+    # A version stamped by an earlier build, above every rollout generation.
+    await _computer_at(
+        patched_get_db_connection, seed_user["user_id"],
+        index=2, kind="e2b", version=daytona.generation + 40,
+    )
+    async with patched_get_db_connection() as conn:
+        await conn.execute(
+            "SELECT setval('platform_secret_generation_seq', %s)",
+            (daytona.generation + 40,),
+        )
+
+    e2b = await _register(
+        _identity(secret_id="e2b-1", placeholder="e2b_secret_fmp_api_key"),
+        provider="e2b",
+    )
+
+    assert e2b.provider == "e2b"
+    assert e2b.generation > daytona.generation + 40
+    assert await get_platform_secret_rollouts("daytona", fresh=True) == daytona
+    assert await get_platform_secret_rollouts("e2b", fresh=True) == e2b
+
+
+async def test_an_identity_change_on_one_kind_bumps_only_that_kind(
     seed_workspace, patched_get_db_connection
 ):
+    from src.server.services.platform_secret_rollout import (
+        get_platform_secret_rollouts,
+        register_platform_secret_rollouts,
+    )
+
+    fmp = _identity(secret_id="secret-1", placeholder="dtn_secret_one")
+    daytona = await _register(fmp)
+    e2b = await _register(
+        _identity(secret_id="e2b-1", placeholder="e2b_secret_fmp_api_key"),
+        provider="e2b",
+    )
+
+    rerouted = await _register(
+        _identity(
+            secret_id="e2b-1",
+            placeholder="e2b_secret_fmp_api_key",
+            egress_rule='{"header": "apikey"}',
+        ),
+        provider="e2b",
+    )
+    assert rerouted.generation > e2b.generation
+    assert await get_platform_secret_rollouts("daytona", fresh=True) == daytona
+
+    rotated = await register_platform_secret_rollouts(
+        [fmp], credential_values={"FMP_API_KEY": "rotated"}, provider="daytona"
+    )
+    assert rotated.generation == daytona.generation
+    assert await get_platform_secret_rollouts("e2b", fresh=True) == rerouted
+
+
+async def test_each_kind_lists_its_own_computers_behind(
+    seed_user, patched_get_db_connection
+):
+    """A computer is behind only when its version differs from its own kind's
+    generation, and a kind with no rows is never listed."""
+    import uuid
+
+    from src.server.services.platform_secret_rollout import (
+        get_all_platform_secret_rollouts,
+        list_workspaces_behind_platform_secret,
+    )
+
+    daytona = await _register(
+        _identity(secret_id="secret-1", placeholder="dtn_secret_one")
+    )
+    e2b = await _register(
+        _identity(secret_id="e2b-1", placeholder="e2b_secret_fmp_api_key"),
+        provider="e2b",
+    )
+    for index, kind, version in (
+        (1, "daytona", daytona.generation),  # current
+        (2, "daytona", e2b.generation),  # another kind's generation: behind
+        (3, "e2b", e2b.generation),  # current
+        (4, "e2b", daytona.generation),  # behind
+        (5, "e2b", 0),  # never certified: behind
+    ):
+        await _computer_at(
+            patched_get_db_connection, seed_user["user_id"],
+            index=index, kind=kind, version=version,
+        )
+
+    rollout_sets = await get_all_platform_secret_rollouts()
+    assert rollout_sets == {"daytona": daytona, "e2b": e2b}
+    rows = await list_workspaces_behind_platform_secret(rollout_sets, limit=10)
+    assert [(r["computer_id"], r["kind"]) for r in rows] == [
+        (uuid.UUID(int=2), "daytona"),
+        (uuid.UUID(int=4), "e2b"),
+        (uuid.UUID(int=5), "e2b"),
+    ]
+    only_daytona = await list_workspaces_behind_platform_secret(
+        {"daytona": daytona}, limit=10
+    )
+    assert [r["computer_id"] for r in only_daytona] == [uuid.UUID(int=2)]
+
+
+async def test_egress_rule_change_is_an_identity_change(
+    seed_workspace, patched_get_db_connection
+):
+    """On E2B the rule rides each sandbox, so a host or header edit re-pends them.
+
+    An empty rule is what a provider that keeps the routing registers, and it
+    has to match the column's default or the upgrade would re-pend that fleet.
+    """
+    routed = '{"header": "apikey", "hosts": ["financialmodelingprep.com"]}'
     first = await _register(
         _identity(secret_id="secret-1", placeholder="dtn_secret_one")
     )
-    second = await _register(
-        _identity(secret_id="secret-1", placeholder="dtn_secret_one"),
-        provider="microvm",
+    unchanged = await _register(
+        _identity(secret_id="secret-1", placeholder="dtn_secret_one", egress_rule="")
     )
+    assert unchanged.generation == first.generation
+    assert unchanged.rollouts[0].egress_rule_sha256 == ""
 
-    assert second.rollouts[0].provider == "microvm"
-    assert second.generation == first.generation + 1
+    with_rule = await _register(
+        _identity(
+            secret_id="secret-1", placeholder="dtn_secret_one", egress_rule=routed
+        )
+    )
+    assert with_rule.generation == first.generation + 1
+    assert with_rule.rollouts[0].egress_rule_sha256 == hashlib.sha256(
+        routed.encode()
+    ).hexdigest()
+
+    rerouted = await _register(
+        _identity(
+            secret_id="secret-1",
+            placeholder="dtn_secret_one",
+            egress_rule=routed.replace("apikey", "x-api-key"),
+        )
+    )
+    assert rerouted.generation == with_rule.generation + 1
 
 
 async def test_certification_attaches_a_verified_replacement(
@@ -244,7 +402,7 @@ async def test_certification_attaches_a_verified_replacement(
     with pytest.MonkeyPatch.context() as monkeypatch:
         monkeypatch.setattr("src.config.env.HOST_MODE", "platform")
         version = await certify_platform_secrets(
-            config, runtime=_VerifiedRuntime("dtn_secret_one")
+            config, runtime=_VerifiedRuntime("dtn_secret_one"), kind="daytona"
         )
 
     assert version == rollout_set.generation
@@ -278,7 +436,7 @@ async def test_certification_without_a_catalog_stamps_the_zero_sentinel(
     sandbox = type("Sandbox", (), {"provider": "daytona", "platform_secrets": ()})()
     config = type("Config", (), {"sandbox": sandbox})()
 
-    assert await certify_platform_secrets(config, runtime=None) == 0
+    assert await certify_platform_secrets(config, runtime=None, kind="daytona") == 0
 
 
 async def test_stamp_cas_is_fenced_on_the_sandbox_id(
@@ -408,14 +566,27 @@ async def test_bind_cas_refuses_to_resurrect_a_stopped_computer(
     assert identity["sandbox_id"] == "sb-old"
 
 
-async def test_missing_rollout_row_fails_readiness(patched_get_db_connection):
+async def test_a_kind_without_rows_fails_readiness_until_registered(
+    patched_get_db_connection, cleanup_tables
+):
+    """Absence is never memoized: a kind another worker registers later is
+    read on the next call."""
     from src.server.services.platform_secret_rollout import (
         PlatformSecretReadinessError,
         get_platform_secret_rollouts,
+        reset_platform_secret_rollout_cache,
     )
 
-    with pytest.raises(PlatformSecretReadinessError, match="not initialized"):
-        await get_platform_secret_rollouts()
+    await _register(_identity(secret_id="secret-1", placeholder="dtn_secret_one"))
+    with pytest.raises(PlatformSecretReadinessError, match="not initialized for e2b"):
+        await get_platform_secret_rollouts("e2b")
+
+    e2b = await _register(
+        _identity(secret_id="e2b-1", placeholder="e2b_secret_fmp_api_key"),
+        provider="e2b",
+    )
+    reset_platform_secret_rollout_cache()  # as on a worker that did not register
+    assert await get_platform_secret_rollouts("e2b") == e2b
 
 
 async def test_sweep_filters_unsupported_providers_before_batch_limit(
@@ -442,10 +613,65 @@ async def test_sweep_filters_unsupported_providers_before_batch_limit(
                        '{"auto_stop_interval":600}', '/custom')""",
             (uuid.UUID(int=27), seed_user["user_id"]),
         )
-    rows = await list_workspaces_behind_platform_secret(rollout, limit=1)
+    rows = await list_workspaces_behind_platform_secret({"daytona": rollout}, limit=1)
     assert len(rows) == 1
     assert rows[0]["computer_id"] == uuid.UUID(int=27)
     assert rows[0]["kind"] == "daytona"
     assert rows[0]["provider_ref"] == "daytona-ref"
     assert rows[0]["provider_config"] == {"auto_stop_interval": 600}
     assert rows[0]["root_dir"] == "/custom"
+
+
+async def test_sweep_lists_a_never_certified_fixed_env_computer(
+    seed_user, patched_get_db_connection,
+):
+    """It cannot be scrubbed, so the sweep certifies it or rebuilds it instead."""
+    import uuid
+
+    from src.server.services.platform_secret_rollout import (
+        list_workspaces_behind_platform_secret,
+    )
+
+    rollout = await _register(
+        _identity(secret_id="sweep-secret", placeholder="opaque"), provider="e2b"
+    )
+    async with patched_get_db_connection() as conn:
+        await conn.execute(
+            """INSERT INTO computers (computer_id, user_id, kind, provider_ref,
+                       status, platform_secret_version)
+               VALUES (%s, %s, 'e2b', 'e2b-1', 'running', 0)""",
+            (uuid.UUID(int=1), seed_user["user_id"]),
+        )
+    rows = await list_workspaces_behind_platform_secret({"e2b": rollout}, limit=10)
+    assert [(row["computer_id"], row["kind"]) for row in rows] == [
+        (uuid.UUID(int=1), "e2b")
+    ]
+
+
+async def test_sweep_pages_past_machines_that_never_converge(
+    seed_user, patched_get_db_connection,
+):
+    """A full batch of machines that fail every pass must not hide the rest."""
+    import uuid
+
+    from src.server.services.platform_secret_rollout import (
+        list_workspaces_behind_platform_secret,
+    )
+
+    certified = await _register(_identity(secret_id="page-secret", placeholder="p1"))
+    rollout = await _register(_identity(secret_id="page-secret", placeholder="p2"))
+    async with patched_get_db_connection() as conn:
+        for index in range(1, 4):
+            await conn.execute(
+                """INSERT INTO computers (computer_id, user_id, kind, provider_ref,
+                           status, platform_secret_version)
+                   VALUES (%s, %s, 'daytona', %s, 'running', %s)""",
+                (uuid.UUID(int=index), seed_user["user_id"], f"d-{index}",
+                 certified.generation),
+            )
+    first = await list_workspaces_behind_platform_secret({"daytona": rollout}, limit=2)
+    rest = await list_workspaces_behind_platform_secret(
+        {"daytona": rollout}, limit=2, after=first[-1]["computer_id"]
+    )
+    assert [r["computer_id"] for r in first] == [uuid.UUID(int=1), uuid.UUID(int=2)]
+    assert [r["computer_id"] for r in rest] == [uuid.UUID(int=3)]

@@ -82,9 +82,6 @@ another endpoint while keeping its provider key. Config can only turn a channel
   worse than a 400). An id the host's rule cannot place fails closed onto the
   user-message fallback.
 
-DALTON-HOOK(upstream-backport-596): this paragraph and the bridge's placement
-check are upstream 86ce2f02c, backported ahead of the next upstream sync.
-
 The Anthropic wire form also carries placement rules: a mid-conversation system
 message has to follow a user message (or an assistant message ending in
 server-tool use) and must be either the last entry in ``messages`` or be
@@ -107,11 +104,11 @@ import re
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from typing import Any, Literal
-from urllib.parse import urlparse
 
 from langchain_core.messages import SystemMessage
 from langchain_openai.chat_models.base import BaseChatOpenAI
 
+from src.llms.endpoints import OFFICIAL_ANTHROPIC_HOST, url_host
 from src.llms.reasoning_lineage import ROUTE_ENDPOINT_SEP
 
 logger = logging.getLogger(__name__)
@@ -128,7 +125,6 @@ OPERATOR_CHANNEL_KEY = "lc_operator_channel"
 #: something other than the envelope passes its own ``source``.
 RUNTIME_CONTEXT_SOURCE = "runtime_context"
 
-_ANTHROPIC_HOST = "api.anthropic.com"
 _OFFICIAL_OPENAI_HOST = "api.openai.com"
 
 #: The first Claude generation, as ``(major, minor)``, that accepts
@@ -270,16 +266,9 @@ def _off_declared_host(model: Any, entry: dict[str, Any]) -> bool:
         return False
     declared = entry.get("base_url")
     if declared:
-        return _host(str(declared)) != _host(str(resolved))
+        return url_host(str(declared)) != url_host(str(resolved))
     override = os.getenv("OPENAI_API_BASE") or os.getenv("OPENAI_BASE_URL")
-    return bool(override) and _host(override) == _host(str(resolved))
-
-
-def _host(url: str) -> str:
-    parsed = urlparse(url)
-    if parsed.hostname is None:
-        parsed = urlparse(f"//{url}")
-    return (parsed.hostname or "").lower()
+    return bool(override) and url_host(override) == url_host(str(resolved))
 
 
 def _provider_entry(provider: str) -> dict[str, Any] | None:
@@ -344,12 +333,7 @@ def _resolved_host(base_url: str | None) -> str:
     into the field before the client is built, so there is no env chain to
     re-walk here.
     """
-    if not base_url:
-        return _ANTHROPIC_HOST
-    parsed = urlparse(base_url)
-    if parsed.hostname is None:
-        parsed = urlparse(f"//{base_url}")
-    return (parsed.hostname or "").lower()
+    return url_host(base_url) if base_url else OFFICIAL_ANTHROPIC_HOST
 
 
 def _in_allowlist(model_id: Any, allowed: frozenset[str]) -> bool:
@@ -376,7 +360,7 @@ def _any_model(_model_id: Any) -> bool:
 #: A table rather than a chain of ifs because the split is per host: Anthropic
 #: serves the role on part of its own fleet, the compatible hosts on all of it.
 _ANTHROPIC_SYSTEM_HOSTS: dict[str, Callable[[Any], bool]] = {
-    _ANTHROPIC_HOST: _accepts_midturn_system,
+    OFFICIAL_ANTHROPIC_HOST: _accepts_midturn_system,
     **{host: _any_model for host in _ANTHROPIC_COMPATIBLE_HOSTS},
 }
 
@@ -443,25 +427,26 @@ def operator_request(shape: str | None) -> Iterator[None]:
         _in_operator_request.reset(token)
 
 
-def _splice_operator_entries(original: Callable[..., Any], messages: Any) -> Any:
+def _splice_operator_entries(
+    original: Callable[..., Any], messages: Any, *args: Any, **kwargs: Any
+) -> Any:
     """Format the runs between tagged messages and put each entry back in place.
 
-    The untouched original formats each run, so a message the caller did not
-    tag takes the exact path it took before, and a second untagged system
-    message is still the refusal it always was.
+    The untouched original formats each run, with the caller's own arguments,
+    so a message the caller did not tag takes the exact path it took before,
+    and a second untagged system message is still the refusal it always was.
     """
     msgs = list(messages)
     cuts = [i for i, m in enumerate(msgs) if i > 0 and is_operator_system_message(m)]
     if not cuts:
-        return original(msgs)
+        return original(msgs, *args, **kwargs)
 
-    # DALTON-HOOK(upstream-backport-596): upstream 86ce2f02c, placement rule for mid-turn system entries.
     system: Any = None
     formatted: list[dict[str, Any]] = []
     spliced: list[int] = []
     start = 0
     for cut in [*cuts, len(msgs)]:
-        run_system, run_formatted = original(msgs[start:cut])
+        run_system, run_formatted = original(msgs[start:cut], *args, **kwargs)
         if run_system is not None:
             if system is not None:
                 msg = "Received multiple non-consecutive system messages."
@@ -482,7 +467,6 @@ def _splice_operator_entries(original: Callable[..., Any], messages: Any) -> Any
     return system, formatted
 
 
-# DALTON-HOOK(upstream-backport-596): upstream 86ce2f02c.
 def _placeable(formatted: list[dict[str, Any]], index: int) -> bool:
     """Whether Anthropic accepts the system entry at *index* where it stands."""
     after_user = index > 0 and formatted[index - 1].get("role") == "user"
@@ -515,7 +499,9 @@ def _install_format_bridge() -> None:
     builder, with no client argument, so a subclass cannot reach it; the
     ContextVar is the only handle for telling a composed call from any other
     Anthropic call in the process. Outside the window the wrapper is one extra
-    call to the original.
+    call to the original. Every argument past the messages is passed through
+    untouched: langchain-anthropic 1.7 made ``model`` a required keyword, and
+    its private signature can grow again without notice.
     """
     global _bridge_installed
     try:
@@ -534,10 +520,10 @@ def _install_format_bridge() -> None:
     if getattr(original, "_operator_bridge", False):
         return
 
-    def _bridged(messages):
+    def _bridged(messages, *args, **kwargs):
         if not _in_operator_request.get():
-            return original(messages)
-        return _splice_operator_entries(original, messages)
+            return original(messages, *args, **kwargs)
+        return _splice_operator_entries(original, messages, *args, **kwargs)
 
     _bridged._operator_bridge = True
     chat_models._format_messages = _bridged

@@ -12,7 +12,7 @@
  */
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { CATCH_UP_CHARS, LIVE_TAIL_CHARS, TICK_MS } from '@/components/ui/animated-text';
-import { DURATION, EASE_REVEAL } from '@/lib/motion';
+import { cssEase, DURATION, EASE_REVEAL } from '@/lib/motion';
 import { isPageUnseen } from '@/lib/pageVisibility';
 import { prefersReducedMotion } from '@/lib/reducedMotion';
 
@@ -36,7 +36,7 @@ const FADE_KEYFRAMES: Keyframe[] = [{ opacity: 0 }, { opacity: 1 }];
 // Backwards fill: a fade anchored a few ms ahead of the frame clock must hold
 // its first keyframe until then, not show the word at full strength.
 const FADE_TIMING: KeyframeAnimationOptions = {
-  duration: FADE_MS, easing: `cubic-bezier(${EASE_REVEAL.join(', ')})`, fill: 'backwards',
+  duration: FADE_MS, easing: cssEase(EASE_REVEAL), fill: 'backwards',
 };
 /** How long after the stream ends its marks are dropped: past the last fade. */
 export const REVEAL_SETTLE_MS = FADE_MS + 100;

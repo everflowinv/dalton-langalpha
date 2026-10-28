@@ -33,7 +33,13 @@ vi.mock('@/lib/authToken', () => ({
 import { api } from '@/api/client';
 import {
   createComputer,
+  createSshPairing,
+  deleteComputer,
   getComputers,
+  probeSsh,
+  reconnectComputer,
+  reinstallComputer,
+  setComputerFilesBackup,
   startComputer,
   stopComputer,
   streamComputerEvents,
@@ -41,6 +47,7 @@ import {
 
 const mockGet = api.get as unknown as Mock;
 const mockPost = api.post as unknown as Mock;
+const mockDelete = api.delete as unknown as Mock;
 
 // GET /api/v1/computers, captured verbatim for user wp13-final-1789525377.
 const LIVE_LIST = {
@@ -100,14 +107,14 @@ describe('getComputers', () => {
 
 describe('createComputer', () => {
   it('posts the tier, which is the machine\'s property and not a workspace\'s', async () => {
-    // The live 201 body for {"name":"WP16 probe","resource_tier":"performance"}.
+    // The 201 body for {"name":"WP16 probe","resource_tier":"performance"}.
     mockPost.mockResolvedValueOnce({
       data: {
         computer_id: 'ebbab1a6-16fe-46d6-8ae9-08080cd7e084',
         user_id: 'wp13-final-1789525377',
         kind: 'daytona',
         name: 'WP16 probe',
-        status: 'stopped',
+        status: 'starting',
         resource_tier: 'performance',
         is_always_on: false,
         is_primary: false,
@@ -122,8 +129,10 @@ describe('createComputer', () => {
       { name: 'WP16 probe', resource_tier: 'performance' },
       expect.objectContaining({ timeout: expect.any(Number) }),
     );
-    // A computer is born stopped, so nothing in the UI may wait on 'creating'.
-    expect(computer.status).toBe('stopped');
+    // Its sandbox is built in the background from here, so the row comes back
+    // starting with none yet: the shape the UI reads as being prepared.
+    expect(computer.status).toBe('starting');
+    expect(computer.provider_ref).toBeNull();
     expect(computer.resource_tier).toBe('performance');
   });
 
@@ -131,6 +140,18 @@ describe('createComputer', () => {
     mockPost.mockResolvedValueOnce({ data: {} });
     await createComputer();
     expect(mockPost.mock.calls[0][1]).toEqual({ resource_tier: 'standard' });
+  });
+
+  it('carries the backup choice for a machine the user brings, off included', async () => {
+    mockPost.mockResolvedValueOnce({ data: {} });
+    const ssh = {
+      host: '198.51.100.7', port: 22, username: 'me',
+      host_key: 'ssh-ed25519 AAAAC3Nz', root_dir: '/home/me/langalpha',
+    };
+    await createComputer({ name: 'devbox', kind: 'ssh', ssh, files_backup: false });
+    expect(mockPost.mock.calls[0][1]).toEqual({
+      name: 'devbox', resource_tier: 'standard', kind: 'ssh', ssh, files_backup: false,
+    });
   });
 
   it('lets a 429 through with the interceptor-attached quota body intact', async () => {
@@ -149,6 +170,24 @@ describe('createComputer', () => {
       status: 429,
       rateLimitInfo: { message: 'You have reached the 3 workspace limit on the Starter plan.' },
     });
+  });
+});
+
+describe('setComputerFilesBackup', () => {
+  it('posts the switch to the computer route and answers the updated row', async () => {
+    mockPost.mockResolvedValueOnce({ data: { computer_id: 'c1', kind: 'ssh', files_backup: false } });
+    const row = await setComputerFilesBackup('c1', false);
+    expect(mockPost).toHaveBeenCalledWith(
+      '/api/v1/computers/c1/files-backup',
+      { enabled: false },
+      expect.objectContaining({ timeout: expect.any(Number) }),
+    );
+    expect(row.files_backup).toBe(false);
+  });
+
+  it('refuses an empty id rather than posting to a route with a hole in it', async () => {
+    await expect(setComputerFilesBackup('', true)).rejects.toThrow('Computer ID is required');
+    expect(mockPost).not.toHaveBeenCalled();
   });
 });
 
@@ -174,6 +213,43 @@ describe('start/stop', () => {
   it('refuses an empty id rather than posting to a route with a hole in it', async () => {
     await expect(startComputer('')).rejects.toThrow('Computer ID is required');
     expect(mockPost).not.toHaveBeenCalled();
+  });
+});
+
+describe('deleteComputer', () => {
+  it.each([true, false])('deletes the computer route with remove_key=%s and returns what happened to the key', async (removeKey) => {
+    const body = { key: { outcome: 'removed', used_by: null, fingerprint: 'SHA256:abc/def+', comment: 'langalpha' } };
+    mockDelete.mockResolvedValueOnce({ data: body, status: 200, headers: {} });
+    await expect(deleteComputer('c1', { removeKey })).resolves.toEqual(body);
+    expect(mockDelete.mock.calls[0][0]).toBe('/api/v1/computers/c1');
+    expect(String(mockDelete.mock.calls[0][1].params)).toBe(`remove_key=${removeKey}`);
+  });
+
+  it('names each workspace to delete in the body and the query, and waits out their backups', async () => {
+    const body = { key: null, workspaces_deleted: ['w1'] };
+    mockDelete.mockResolvedValueOnce({ data: body, status: 200, headers: {} });
+    await expect(
+      deleteComputer('c1', { removeKey: false, deleteWorkspaces: ['w1', 'w2'], deleteFiles: true }),
+    ).resolves.toEqual(body);
+    const opts = mockDelete.mock.calls[0][1];
+    // The query too, for a backend from before the body or a proxy that drops it.
+    expect(String(opts.params)).toBe('remove_key=false&delete_files=true&delete_workspaces=w1&delete_workspaces=w2');
+    expect(opts.data).toEqual({ delete_workspaces: ['w1', 'w2'] });
+    expect(opts.timeout).toBe(600000);
+  });
+
+  it('keeps a full computer\'s workspaces out of the query, which they would overflow', async () => {
+    mockDelete.mockResolvedValueOnce({ data: { key: null }, status: 200, headers: {} });
+    const ids = Array.from({ length: 31 }, (_, i) => `00000000-0000-0000-0000-${String(i).padStart(12, '0')}`);
+    await deleteComputer('c1', { removeKey: false, deleteWorkspaces: ids });
+    const opts = mockDelete.mock.calls[0][1];
+    expect(String(opts.params)).toBe('remove_key=false');
+    expect(opts.data).toEqual({ delete_workspaces: ids });
+  });
+
+  it('refuses an empty id rather than deleting a route with a hole in it', async () => {
+    await expect(deleteComputer('', { removeKey: true })).rejects.toThrow('Computer ID is required');
+    expect(mockDelete).not.toHaveBeenCalled();
   });
 });
 
@@ -204,9 +280,9 @@ describe('streamComputerEvents', () => {
     mockSSEResponse([
       'event: status\ndata: {"computer_id": "5319ad0e-7835-4ca6-9541-b7c2961a7bf6", "status": "running"}\n\n',
     ]);
-    const onStatus = vi.fn();
-    await streamComputerEvents('5319ad0e-7835-4ca6-9541-b7c2961a7bf6', onStatus, ctrl());
-    expect(onStatus).toHaveBeenCalledWith('running', undefined);
+    const onFrame = vi.fn();
+    await streamComputerEvents('5319ad0e-7835-4ca6-9541-b7c2961a7bf6', onFrame, ctrl());
+    expect(onFrame).toHaveBeenCalledWith(expect.objectContaining({ status: 'running' }));
   });
 
   it('hits the computer events route', async () => {
@@ -221,19 +297,40 @@ describe('streamComputerEvents', () => {
       'event: status\ndata: {"computer_id": "c1", "status": "stopped"}\n\n',
       ': ping\n\n',
     ]);
-    const onStatus = vi.fn();
-    await streamComputerEvents('c1', onStatus, ctrl());
-    expect(onStatus).toHaveBeenCalledTimes(1);
-    expect(onStatus).toHaveBeenCalledWith('stopped', undefined);
+    const onFrame = vi.fn();
+    await streamComputerEvents('c1', onFrame, ctrl());
+    expect(onFrame).toHaveBeenCalledTimes(1);
+    expect(onFrame).toHaveBeenCalledWith(expect.objectContaining({ status: 'stopped' }));
   });
 
   it('carries the sandbox_state refinement when the server sends one', async () => {
     mockSSEResponse([
       'event: status\ndata: {"computer_id": "c1", "status": "starting", "sandbox_state": "archived"}\n\n',
     ]);
-    const onStatus = vi.fn();
-    await streamComputerEvents('c1', onStatus, ctrl());
-    expect(onStatus).toHaveBeenCalledWith('starting', 'archived');
+    const onFrame = vi.fn();
+    await streamComputerEvents('c1', onFrame, ctrl());
+    expect(onFrame).toHaveBeenCalledWith(expect.objectContaining({ status: 'starting', sandbox_state: 'archived' }));
+  });
+
+  it("hands over a new sandbox's build stage and a failed start's reason", async () => {
+    mockSSEResponse([
+      'event: status\ndata: {"computer_id": "c1", "status": "starting", "stage": "tools"}\n\n',
+      'event: status\ndata: {"computer_id": "c1", "status": "error", "error": "Sandbox image build failed"}\n\n',
+    ]);
+    const onFrame = vi.fn();
+    await streamComputerEvents('c1', onFrame, ctrl());
+    expect(onFrame.mock.calls[0][0]).toMatchObject({ status: 'starting', stage: 'tools' });
+    expect(onFrame.mock.calls[1][0]).toMatchObject({ status: 'error', error: 'Sandbox image build failed' });
+  });
+
+  it('hands over the failure a failed start recorded, as the row keeps it', async () => {
+    const failure = { code: 'folder_marked', message: 'The folder is held.', owner: 'other-1', remedy: 'reinstall', at: '2026-10-26T04:00:00Z' };
+    mockSSEResponse([
+      `event: status\ndata: ${JSON.stringify({ computer_id: 'c1', status: 'error', error: 'The folder is held.', start_failure: failure })}\n\n`,
+    ]);
+    const onFrame = vi.fn();
+    await streamComputerEvents('c1', onFrame, ctrl());
+    expect(onFrame.mock.calls[0][0]).toMatchObject({ status: 'error', start_failure: failure });
   });
 
   it('stops at the server timeout event', async () => {
@@ -242,9 +339,9 @@ describe('streamComputerEvents', () => {
       'event: timeout\ndata: {}\n\n',
       'event: status\ndata: {"computer_id": "c1", "status": "running"}\n\n',
     ]);
-    const onStatus = vi.fn();
-    await streamComputerEvents('c1', onStatus, ctrl());
-    expect(onStatus).toHaveBeenCalledTimes(1);
+    const onFrame = vi.fn();
+    await streamComputerEvents('c1', onFrame, ctrl());
+    expect(onFrame).toHaveBeenCalledTimes(1);
   });
 
   it('resolves without throwing when the connection fails', async () => {
@@ -257,5 +354,54 @@ describe('streamComputerEvents', () => {
     global.fetch = fetchMock as unknown as typeof fetch;
     await streamComputerEvents('', vi.fn(), ctrl());
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('fixing a failed start', () => {
+  beforeEach(() => mockPost.mockClear());
+
+  it('asks a reinstall to take the folder back', async () => {
+    mockPost.mockResolvedValueOnce({ data: { computer_id: 'c1', status: 'starting' } });
+    const res = await reinstallComputer('c1', { folder: 'take_back' });
+    expect(mockPost).toHaveBeenCalledWith(
+      '/api/v1/computers/c1/reinstall',
+      { folder: 'take_back' },
+      expect.objectContaining({ timeout: expect.any(Number) }),
+    );
+    expect(res).toEqual({ computer_id: 'c1', status: 'starting' });
+  });
+
+  it('asks a reinstall for a new folder, as typed', async () => {
+    mockPost.mockResolvedValueOnce({ data: { computer_id: 'c1', status: 'starting' } });
+    await reinstallComputer('c1', { folder: 'new', root_dir: '~/langalpha-2' });
+    expect(mockPost.mock.calls[0][1]).toEqual({ folder: 'new', root_dir: '~/langalpha-2' });
+  });
+
+  it('sends a reconnect the target the pairing reached, under ssh', async () => {
+    mockPost.mockResolvedValueOnce({ data: { computer_id: 'c1', status: 'starting' } });
+    const ssh = { host: 'box', port: 22, username: 'dev', tunnel_id: 'tun-1', host_key: 'ssh-ed25519 AAAA' };
+    await reconnectComputer('c1', ssh);
+    expect(mockPost).toHaveBeenCalledWith(
+      '/api/v1/computers/c1/reconnect',
+      { ssh },
+      expect.objectContaining({ timeout: expect.any(Number) }),
+    );
+  });
+
+  it('mints a pairing for a computer with its id, and a new machine with no body', async () => {
+    mockPost.mockResolvedValue({ data: { token: 't' } });
+    await createSshPairing({ computerId: 'c1' });
+    expect(mockPost).toHaveBeenLastCalledWith('/api/v1/computers/ssh/pairings', { computer_id: 'c1' });
+    await createSshPairing();
+    expect(mockPost).toHaveBeenLastCalledWith('/api/v1/computers/ssh/pairings');
+  });
+
+  it('probes a machine reached again by hand with the computer it is for', async () => {
+    mockPost.mockResolvedValue({ data: {} });
+    const target = { host: 'box', port: 22, username: 'dev' };
+    await probeSsh(target, { computerId: 'c1' });
+    expect(mockPost.mock.calls.at(-1)?.[1]).toEqual({ ...target, computer_id: 'c1' });
+    await probeSsh(target);
+    expect(mockPost.mock.calls.at(-1)?.[1]).toEqual(target);
   });
 });

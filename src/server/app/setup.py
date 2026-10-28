@@ -42,7 +42,9 @@ from starlette.middleware.gzip import GZipMiddleware
 
 from ptc_agent.core.sandbox.livefs_runtime.protocol import PREFIX as LIVEFS_PREFIX
 from ptc_agent.core.sandbox.platform_secrets import PlatformSecretError
+from ptc_agent.core.sandbox.providers.ssh_errors import SSHConnectError
 from ptc_agent.core.sandbox.runtime import SandboxGoneError, SandboxTransientError
+from src.server.preview_proxy import install_preview_proxy
 from src.config.logging_config import configure_logging
 from src.config.settings import (
     get_allowed_origins,
@@ -53,8 +55,13 @@ from src.observability.private_query import drop_span_query
 from src.server.services.runs.executor import LocalRunExecutor
 from src.server.services.background_registry_store import BackgroundRegistryStore
 from src.server.utils.api import find_malformed_route_ids  # TEMP (malformed-id-diag)
+from src.server.services.preview_base import (
+    PreviewProxyConfigurationError,
+    check_preview_proxy_config,
+    preview_proxy_requirements,
+)
 from src.server.utils.error_sanitization import (
-    sandbox_unreachable_detail,
+    sandbox_failure_http,
     single_line,
 )
 
@@ -122,6 +129,19 @@ _REDIS_BACKGROUND_SINGLETONS: tuple[tuple[str, str], ...] = (
     # Refreshes expiring MCP OAuth connections ahead of the hot path; the
     # per-connection advisory try-lock dedups it across workers.
     ("McpOAuthRefreshSweeper", "src.server.services.mcp_oauth.sweep"),
+    # Keeps running sandboxes' market-data tokens fresh between turns; a
+    # claim on each computer's row in Postgres dedups it across workers.
+    ("DataTokenSweeper", "src.server.services.data_token_sweep"),
+    # Takes tunnels no computer uses off their machines; a claim on each
+    # tunnel's row in Postgres dedups it across workers.
+    ("TunnelSweeper", "src.server.services.ssh_tunnel_sweep"),
+    # Ends uploads their browser abandoned and takes over pulls whose worker
+    # died; a claim on each upload's row in Postgres dedups it across workers.
+    ("UploadSweeper", "src.server.services.workspace_upload_pull"),
+    # Follows handed-off background commands to their end and keeps their
+    # computers up while covered; claims on each command's row in Postgres
+    # dedup it across workers.
+    ("CommandWatcher", "src.server.services.commands.watcher"),
 )
 
 
@@ -323,6 +343,13 @@ async def lifespan(app: FastAPI):
         logger.info("Loading PTC Agent configuration...")
         agent_config = await load_from_files(context=ConfigContext.SDK)
 
+        from src.config.env import PUBLIC_APP_URL, SERVER_BASE_URL
+
+        check_preview_proxy_config(
+            proxy_required_by=preview_proxy_requirements(agent_config.sandbox),
+            app_urls=(SERVER_BASE_URL, PUBLIC_APP_URL, *get_allowed_origins()),
+        )
+
         from src.server.services.plugins.bundled import component_owners
 
         bundle_owners = component_owners()
@@ -333,20 +360,6 @@ async def lifespan(app: FastAPI):
 
         await reconcile_platform_secrets_at_boot(agent_config)
         logger.info("PTC Agent configuration loaded successfully")
-
-        # Platform-secret migration sweep: converges running sandboxes left
-        # behind the fleet generation (always-on sandboxes never re-init, so
-        # only this sweep ever scrubs them). Inert without an active catalog.
-        try:
-            from src.server.services.platform_secret_sweep import (
-                PlatformSecretSweeper,
-            )
-
-            PlatformSecretSweeper.get_instance().start(
-                agent_config.to_core_config()
-            )
-        except Exception as e:
-            logger.warning(f"Failed to start PlatformSecretSweeper: {e}")
 
         # Connect once, freeze, install as the process-global registry so every
         # Session borrows the same tool snapshot instead of spawning its own
@@ -361,7 +374,7 @@ async def lifespan(app: FastAPI):
         try:
             core_config = agent_config.to_core_config()
             mcp_registry = MCPRegistry(core_config)
-            await mcp_registry.connect_all()
+            await mcp_registry.connect_all(retry_builtin_remote=True)
             await mcp_registry.freeze()
             set_global_registry(mcp_registry)
             logger.info(
@@ -394,21 +407,41 @@ async def lifespan(app: FastAPI):
         llm_service = LLMService(agent_config=agent_config, logger=logger)
         logger.info("LLMService initialized")
 
-        # Initialize workspace manager
-        # Derive idle timeout from Daytona auto-stop so the server cleans up
-        # *before* Daytona kills the sandbox (10-min buffer, 5-min floor).
-        daytona_auto_stop = agent_config.daytona.auto_stop_interval  # seconds
-        server_idle_timeout = max(daytona_auto_stop - 600, 300)
-
+        # Initialize workspace manager. Its idle sweep times each computer by
+        # that computer's own provider settings.
         from src.server.services.workspace_manager import WorkspaceManager
 
         workspace_manager = WorkspaceManager.get_instance(
             config=agent_config,
-            idle_timeout=server_idle_timeout,
             cleanup_interval=300,  # 5 minutes
         )
         await workspace_manager.start_cleanup_task()
         logger.info("Workspace Manager initialized")
+
+        # An ssh computer logs in with its owner's key, which the provider
+        # reads through this loader; any worker may start one. A machine that
+        # connects out is reached through the gateway the second loader names.
+        from src.server.services.ssh_computers import install_client_key_loader
+        from src.server.services.ssh_tunnels import install_gateway_loader
+
+        install_client_key_loader()
+        install_gateway_loader()
+
+        # Platform-secret migration sweep: converges running sandboxes left
+        # behind the fleet generation (always-on sandboxes never re-init, so
+        # only this sweep ever scrubs them). Inert without an active catalog.
+        # Started after the Workspace Manager, which creates the
+        # ComputerManager its first pass needs.
+        try:
+            from src.server.services.platform_secret_sweep import (
+                PlatformSecretSweeper,
+            )
+
+            PlatformSecretSweeper.get_instance().start(
+                agent_config.to_core_config()
+            )
+        except Exception as e:
+            logger.warning(f"Failed to start PlatformSecretSweeper: {e}")
 
         # Initialize PTC Agent checkpointer for state persistence
         from src.server.utils.checkpointer import (
@@ -482,6 +515,10 @@ async def lifespan(app: FastAPI):
         # Required platform Secrets are a configuration gate. Hosted mode
         # must never continue into a plaintext fallback or partial startup.
         raise
+    except PreviewProxyConfigurationError:
+        # The same kind of gate: private computers with nowhere to serve
+        # their previews would hand out only dead links.
+        raise
     except Exception as e:
         logger.warning(f"Failed to initialize PTC Agent: {e}")
         logger.warning("PTC Agent endpoints may not work correctly")
@@ -510,16 +547,26 @@ async def lifespan(app: FastAPI):
     # that must crash the worker loudly — swallowed, it leaves the drainer
     # permanently off behind one WARN line (report-backs undelivered, burst
     # slots leaking).
+    from src.server.services.report_back import command as command_report
     from src.server.services.report_back import steer_executor, subagent
     from src.server.services.report_back.handoff import core as handoff_core
     from src.server.services import automation_settlement, thread_lifecycle_feed
+    from src.server.services.features import register_feature_off_hook
     from src.server.services.hook_outbox import HookOutboxDrainer
+    from src.server.services.market_targets import delivery as market_target_delivery
+    from src.server.services.wakeups import cancel as wakeups_cancel
+    from src.server.services.wakeups import delivery as wakeup_delivery
 
     handoff_core.register_outbox_executors()
     subagent.register_outbox_executors()
+    command_report.register_outbox_executors()
     steer_executor.register_outbox_executors()
     thread_lifecycle_feed.register_outbox_executors()
     automation_settlement.register_outbox_executors()
+    market_target_delivery.register_outbox_executors()
+    wakeup_delivery.register_wakeup_executors()
+    # Turning wakeups off ends what the agent set, on every thread.
+    register_feature_off_hook("wakeups", wakeups_cancel.setting_off)
     try:
         HookOutboxDrainer.get_instance().start()
         logger.info("HookOutboxDrainer started")
@@ -594,6 +641,16 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Failed to start PriceMonitorService: {e}")
         logger.warning("Price-triggered automations will not run")
+
+    # Start WakeupSweeper (fires agents' timed wakeups). Every worker runs
+    # one: its fires are guarded claims, so none doubles another's.
+    try:
+        from src.server.services.wakeups.sweep import WakeupSweeper
+
+        await WakeupSweeper.get_instance().start()
+        logger.info("WakeupSweeper started")
+    except Exception as e:
+        logger.warning(f"Failed to start WakeupSweeper: {e}")
 
     # Start MarketInsightService (schedule-based market news gathering)
     try:
@@ -697,6 +754,23 @@ async def lifespan(app: FastAPI):
             name="dalton-startup-data-source-health",
         )
 
+    # A built-in remote server still down after boot's retry budget is retried
+    # in the background, so this worker heals when it answers instead of
+    # serving without its tools until a restart. Last, so nothing above can
+    # fail startup with the task running.
+    from ptc_agent.core.mcp_registry import get_global_registry, reconnect_builtin_remote
+
+    mcp_reconnect: asyncio.Task[None] | None = None
+    booted_registry = get_global_registry()
+    if booted_registry is not None and booted_registry.failed_builtin_remote:
+        mcp_reconnect = asyncio.create_task(
+            reconnect_builtin_remote(), name="mcp-builtin-reconnect"
+        )
+        logger.info(
+            "Reconnecting built-in MCP servers in the background: %s",
+            ", ".join(sorted(booted_registry.failed_builtin_remote)),
+        )
+
     # Startup leaves ~700k import-time objects (pydantic schemas, routes,
     # module state) that never die, and every full collection re-walks them
     # while the loop is frozen. Freezing moves them out of the collector for
@@ -720,6 +794,11 @@ async def lifespan(app: FastAPI):
     if mark_warmup is not None:
         mark_warmup.cancel()
         await asyncio.gather(mark_warmup, return_exceptions=True)
+    # Before the registry is cleared below, which would end it anyway, so an
+    # attempt in flight closes its connection while the loop still runs.
+    if mcp_reconnect is not None:
+        mcp_reconnect.cancel()
+        await asyncio.gather(mcp_reconnect, return_exceptions=True)
     from src.server.services.brand_icons import stop_refreshes
 
     await stop_refreshes()
@@ -815,6 +894,13 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Error shutting down PriceMonitorService: {e}")
 
+    try:
+        from src.server.services.wakeups.sweep import WakeupSweeper
+
+        await WakeupSweeper.get_instance().stop()
+    except Exception as e:
+        logger.warning(f"Error shutting down WakeupSweeper: {e}")
+
     # 1. Shutdown AutomationScheduler
     try:
         from src.server.services.automation_scheduler import AutomationScheduler
@@ -840,13 +926,22 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Error cancelling background subagent tasks: {e}")
 
+    # 2.5. Close the preview proxy's upstream pool; its keep-alive renewals
+    # reach the Workspace Manager, so they go before it does.
+    preview_proxy = getattr(app.state, "preview_proxy", None)
+    if preview_proxy is not None:
+        try:
+            await preview_proxy.aclose()
+        except Exception as e:
+            logger.warning(f"Error closing the preview proxy: {e}")
+
     # 3. Shutdown Workspace Manager (stop cleanup task, clear cache)
     if workspace_manager is not None:
         try:
             # Drain in-flight warm tasks first so a task cancelled mid-Phase-2
             # reverts its 'starting' row to 'stopped' (CancelledError revert)
             # instead of being torn down abruptly and left wedged.
-            from src.server.app.background_starts import drain_start_tasks
+            from src.server.services.background_starts import drain_start_tasks
 
             await drain_start_tasks()
         except Exception as e:
@@ -1176,7 +1271,14 @@ app.add_middleware(
         "OPTIONS",
     ],  # Use the configured list of methods
     allow_headers=["*"],  # Now allow all headers, but can be restricted further
+    # A ranged file download is read by script, which sees only these past the
+    # safelisted few when the app is served from another origin.
+    expose_headers=["Content-Range", "Accept-Ranges", "ETag"],
 )
+
+# Previews of private sandboxes, picked out by Host before any middleware
+# above sees the request. Installed last, around the stack the tracing wraps.
+install_preview_proxy(app)
 
 
 # ============================================================================
@@ -1184,14 +1286,15 @@ app.add_middleware(
 # ============================================================================
 
 
-async def _sandbox_unreachable_handler(request: Request, exc: Exception) -> JSONResponse:
-    """Map an unreachable sandbox to 503 once, for every route.
+async def _sandbox_failure_handler(request: Request, exc: Exception) -> JSONResponse:
+    """Answer a sandbox failure once, for every route, as the computer routes do.
 
-    The detail wording is a wire contract, not a message: the file panel
-    categorizes the error by matching this string, so it must stay identical
-    across producers rather than being re-spelled per route. It is built by
-    ``sandbox_unreachable_detail`` because the raw exception carries provider
-    URLs and SDK response bodies that must not leave the server.
+    ``sandbox_failure_http`` decides, so one failure gets one status whichever
+    route met it: 422 with the owner's own sentence when their SSH machine
+    answered and refused, which a retry cannot fix, and 503 otherwise. The 503
+    detail is a wire contract, not a message: the file panel categorizes the
+    error by matching it, and it never quotes the raw exception, which carries
+    provider URLs and SDK response bodies that must not leave the server.
     """
     # The exception is the live carrier: it quotes provider response bodies, so
     # it can hold a newline and a forged entry. Starlette's path is already
@@ -1199,14 +1302,14 @@ async def _sandbox_unreachable_handler(request: Request, exc: Exception) -> JSON
     logger.warning(
         f"Sandbox unreachable for {single_line(request.url.path)}: {single_line(str(exc))}"
     )
-    return JSONResponse(
-        status_code=503,
-        content={"detail": sandbox_unreachable_detail(exc)},
-    )
+    answer = sandbox_failure_http(exc)
+    return JSONResponse(status_code=answer.status_code, content={"detail": answer.detail})
 
 
-app.add_exception_handler(SandboxGoneError, _sandbox_unreachable_handler)
-app.add_exception_handler(SandboxTransientError, _sandbox_unreachable_handler)
+app.add_exception_handler(SandboxGoneError, _sandbox_failure_handler)
+app.add_exception_handler(SandboxTransientError, _sandbox_failure_handler)
+# A refusal a caller let through unwrapped, which would otherwise answer 500.
+app.add_exception_handler(SSHConnectError, _sandbox_failure_handler)
 
 
 # ============================================================================
@@ -1217,6 +1320,7 @@ from src.server.app.threads import router as threads_router
 from src.server.app.sessions import router as sessions_router
 from src.server.app.utilities import health_router
 from src.server.app.computers import router as computers_router
+from src.server.app.computers_ssh import router as computers_ssh_router
 from src.server.app.workspaces import router as workspaces_router
 from src.server.app.workspace_files import router as workspace_files_router
 from src.server.app.workspace_files import wsfiles_router
@@ -1286,6 +1390,9 @@ else:
 app.include_router(threads_router)  # /api/v1/threads/* - Thread CRUD, messages, control
 app.include_router(sessions_router)  # /api/v1/sessions - Active session stats
 app.include_router(workspaces_router)  # /api/v1/workspaces/* - Workspace CRUD
+app.include_router(
+    computers_ssh_router
+)  # /api/v1/computers/ssh/* - Adding an SSH machine, ahead of /{computer_id}
 app.include_router(
     computers_router
 )  # /api/v1/computers/* - Computer lifecycle (the workspace routes alias these)

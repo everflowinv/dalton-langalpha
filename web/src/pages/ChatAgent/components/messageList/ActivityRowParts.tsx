@@ -1,7 +1,12 @@
-import React from 'react';
-import { motion } from '@/lib/framer';
+import React, { useContext } from 'react';
+import { AnimatePresence, motion } from '@/lib/framer';
 import { X as XIcon } from 'lucide-react';
 import { TextShimmer } from '@/components/ui/text-shimmer';
+import { Loader } from '@/components/ui/loader';
+import { DURATION, TWEEN } from '@/lib/motion';
+import { useMotionSafe } from '@/lib/reducedMotion';
+import { SwapCell } from '@/components/ui/crossfade';
+import { RunningGlyphContext } from './runningGlyph';
 
 export function RunningTitle({ label }: { label: string }): React.ReactElement {
   return (
@@ -18,10 +23,14 @@ export function RunningTitle({ label }: { label: string }): React.ReactElement {
 }
 
 export function RunningIcon({ running, children }: { running: boolean; children: React.ReactNode }): React.ReactElement {
+  // An opacity loop, which framer's reduced-motion setting does not reach.
+  const motionSafe = useMotionSafe();
+  const pulse = running && motionSafe;
   return (
     <motion.span
-      animate={running ? { opacity: [0.85, 1, 0.85] } : { opacity: 1 }}
-      transition={running ? { duration: 1.5, repeat: Infinity, ease: 'easeInOut' } : { duration: 0.2 }}
+      animate={pulse ? { opacity: [0.85, 1, 0.85] } : { opacity: 1 }}
+      // eslint-disable-next-line no-restricted-syntax -- the pulse's loop period, not a transition between states
+      transition={pulse ? { duration: 1.5, repeat: Infinity, ease: 'easeInOut' } : { duration: DURATION.quick }}
       style={{ display: 'inline-flex' }}
     >
       {children}
@@ -29,30 +38,44 @@ export function RunningIcon({ running, children }: { running: boolean; children:
   );
 }
 
-// Laid out like the `.titem-line` it sits in. It cannot be `display: contents`,
-// which would have spared restating that: an element with no box has nothing
-// for opacity to fade, so the settle would snap in.
-const SETTLED_LINE_STYLE = { display: 'flex', alignItems: 'inherit', gap: 'inherit', minWidth: 0 } as const;
+const GLYPH_CELL = 'h-5 place-items-center';
 
-/** The settled half of a row (pill, chevron) fading in where the shimmer was.
- *  A row that was never live mounts settled and skips the fade. */
-export function SettledLine({ wasRunning, children }: { wasRunning: boolean; children: React.ReactNode }): React.ReactElement {
+/** A row's icon cell: the tool icon, pulsing while the call runs (unless
+ *  `pulse` is off), or on the status line the loader glyph crossfading to the
+ *  icon as the step lands. */
+export function RowIcon({ running, pulse = true, children }: { running: boolean; pulse?: boolean; children: React.ReactNode }): React.ReactElement {
+  const glyph = useContext(RunningGlyphContext);
+  if (!glyph) return pulse ? <RunningIcon running={running}>{children}</RunningIcon> : <>{children}</>;
   return (
-    <motion.span
-      style={SETTLED_LINE_STYLE}
-      initial={wasRunning ? { opacity: 0 } : false}
-      animate={{ opacity: 1 }}
-      transition={{ duration: 0.2, ease: 'easeOut' }}
-    >
-      {children}
-    </motion.span>
+    <SwapCell swapKey={running ? 'running' : 'settled'} className={GLYPH_CELL} layerClassName="inline-flex">
+      {running
+        // The line's text names the step; the glyph's own "Loading" status
+        // would only repeat it on every frame.
+        ? <span aria-hidden className="inline-flex"><Loader size={14} className="text-(--color-accent-primary)" /></span>
+        : children}
+    </SwapCell>
   );
 }
 
-export function FailedIconBadge({ label }: { label: string }): React.ReactElement {
+const BADGE_IN = TWEEN.quick;
+
+/** The ✕ on a failed call's icon. It scales in when a row on screen fails,
+ *  never on a row that arrives failed. */
+export function FailedIconBadge({ failed, label }: { failed: boolean; label: string }): React.ReactElement {
   return (
-    <span className="nrow-badge" aria-label={label}>
-      <XIcon className="h-3 w-3" />
-    </span>
+    <AnimatePresence initial={false}>
+      {failed && (
+        <motion.span
+          key="failed"
+          className="nrow-badge"
+          aria-label={label}
+          initial={{ scale: 0.6, opacity: 0 }}
+          animate={{ scale: 1, opacity: 1 }}
+          transition={BADGE_IN}
+        >
+          <XIcon className="h-3 w-3" />
+        </motion.span>
+      )}
+    </AnimatePresence>
   );
 }

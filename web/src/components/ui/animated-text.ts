@@ -178,6 +178,7 @@ export function useAnimatedText(text: string, { enabled = false }: UseAnimatedTe
 
     controlsRef.current = animate(from, to, {
       duration,
+      // eslint-disable-next-line no-restricted-syntax -- the cursor runs at a constant pace across a chunk, which no curve names
       ease: 'linear',
       onUpdate(latest) {
         if (done || chain !== chainRef.current) return;

@@ -14,6 +14,12 @@ import re
 
 BLOB_KEY_PREFIX = "blobs/"
 
+# Where a browser's upload into a workspace is assembled before the sandbox
+# pulls it into the folder. Nothing outlives that pull here: the object is
+# deleted once the file is placed, and the next backup stores the file under
+# ``blobs/`` like any other.
+UPLOAD_KEY_PREFIX = "uploads/"
+
 # One blob backs files with different names and MIME types, so any per-file
 # content type would be write-order-dependent and wrong for some referrer.
 # Serving derives Content-Type from the file's extension instead.
@@ -54,6 +60,8 @@ _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 # the shape is checked here rather than assumed.
 _USER_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._@+-]{0,254}\Z")
 
+_UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z")
+
 
 class BlobError(Exception):
     """Base class for workspace file blob failures."""
@@ -74,6 +82,22 @@ def blob_key(user_id: str, sha256: str) -> str:
         msg = f"Refusing to build a blob key for a non-digest: {sha256!r}"
         raise BlobError(msg)
     return f"{BLOB_KEY_PREFIX}{user_id}/{sha256}"
+
+
+def upload_key(user_id: str, upload_id: str) -> str:
+    """Return the object key a workspace upload is assembled under.
+
+    Scoped per user, as :func:`blob_key` is, so the part URLs a browser holds
+    can only ever name its own user's objects. ``upload_id`` is the server's
+    own UUID, checked anyway because the key is built from it.
+    """
+    if not user_id or not _USER_ID_RE.match(user_id):
+        msg = f"Refusing to build an upload key for a malformed user id: {user_id!r}"
+        raise BlobError(msg)
+    if not _UUID_RE.match(upload_id or ""):
+        msg = f"Refusing to build an upload key for a non-UUID: {upload_id!r}"
+        raise BlobError(msg)
+    return f"{UPLOAD_KEY_PREFIX}{user_id}/{upload_id}"
 
 
 # --- registry SQL -------------------------------------------------------------

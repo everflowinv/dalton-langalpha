@@ -430,9 +430,7 @@ class TestWorkspaceDisablesStayOffTheSharedTier:
         db["bundle_owns"] = {"market": ["morning-note"]}
         db["ws_disabled"] = {"morning-note"}
 
-        params = await materialize.sandbox_skill_sync_params(
-            "u-1", "/home/workspace/.agents/skills", "ws-1"
-        )
+        params = await materialize.sandbox_skill_sync_params("u-1", "ws-1")
 
         assert "disabled_skills" not in params
 
@@ -441,9 +439,7 @@ class TestWorkspaceDisablesStayOffTheSharedTier:
         db["bundle_owns"] = {"market": ["morning-note"]}
         db["disabled_bundles"] = {"market"}
 
-        params = await materialize.sandbox_skill_sync_params(
-            "u-1", "/home/workspace/.agents/skills", "ws-1"
-        )
+        params = await materialize.sandbox_skill_sync_params("u-1", "ws-1")
 
         assert params["disabled_skills"] == frozenset({"morning-note"})
 
@@ -459,9 +455,7 @@ class TestWorkspaceDisablesStayOffTheSharedTier:
         db["ws_disabled"] = {"morning-note"}
 
         bundle = await materialize.load_user_skill_bundle("u-1", "ws-1")
-        params = await materialize.sandbox_skill_sync_params(
-            "u-1", "/home/workspace/.agents/skills", "ws-1"
-        )
+        params = await materialize.sandbox_skill_sync_params("u-1", "ws-1")
 
         assert bundle.account_disabled_builtins == frozenset({"morning-note"})
         assert bundle.workspace_disabled_builtins == frozenset({"morning-note"})

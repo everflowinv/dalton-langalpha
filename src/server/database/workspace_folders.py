@@ -23,6 +23,7 @@ from psycopg.errors import UniqueViolation
 from psycopg.rows import dict_row
 from psycopg.types.json import Json
 
+from ptc_agent.core.paths import SandboxLayout
 from src.server.database import pool
 from src.server.database.home_workspace import is_home_row
 from src.server.database.pool import get_db_connection
@@ -31,6 +32,7 @@ from src.server.database.session_lock import (
     await_settled,
     shared_lock_session,
 )
+from src.server.database.sql_fences import MOVE_SET_ASIDE_PHASES, workspace_move_fences
 from src.server.database.workspace_names import (
     HOME_FOLDER,
     WorkspaceNameInvalid,
@@ -44,7 +46,7 @@ MOVING_DIR = "_internal/moving"
 # One pass holds the folder lock, and the acquisition waiting on it, until it
 # ends; the rest of a long backlog clears on later acquisitions.
 TOMBSTONES_PER_PASS = 200
-LEFTOVERS_DIR = "_internal/leftovers"
+LEFTOVERS_DIR = SandboxLayout.LEFTOVERS_DIR
 PREVIOUS_DIR_NAMES_MAX = 8
 # The layout the folder-per-workspace split landed in; older machines keep
 # files at the root, where no folder of theirs can move.
@@ -168,6 +170,11 @@ class FolderRow:
     landings: tuple[str, ...] = ()
     # Home's folder is named for Home whatever its row is called.
     home: bool = False
+    # A target the last pass had no disk to copy this row's folder to, while
+    # its backoff lasts: each acquisition would copy and fail the same way.
+    blocked: Optional[str] = None
+    # A deleted workspace whose folder its owner kept on their machine.
+    kept: bool = False
 
     @property
     def folder_label(self) -> Optional[str]:
@@ -214,6 +221,9 @@ class FolderPlan:
     # Deleted workspaces whose folders this pass leaves: an earlier pass may
     # have moved one aside unrecorded, and only its journal entry says so.
     deferred: tuple[str, ...] = ()
+    # Rows still to move, here or on a later pass: a copy one began where a
+    # rename could not move its folder is kept for the pass that finishes it.
+    copying: tuple[str, ...] = ()
 
     def __bool__(self) -> bool:
         return bool(self.moves or self.tombstones)
@@ -226,7 +236,10 @@ def plan_folder_moves(rows: Iterable[FolderRow], busy: set[str] = frozenset()) -
     row holds, repeated until nothing changes: a row that stays keeps holding
     its folder, which can strand the next one. A staged row always moves, back
     to its old folder or to a placeholder when its target is held, because a
-    folder under ``_internal`` is one the agent cannot use.
+    folder under ``_internal`` is one the agent cannot use. The exception is
+    one the last pass had no room to copy out, while that backoff lasts:
+    staged across an archive, it leaves staging only by a copy, and every
+    acquisition on the computer would copy until the disk filled, then delete.
     """
     rows = list(rows)
     live = [r for r in rows if not r.deleted]
@@ -237,10 +250,12 @@ def plan_folder_moves(rows: Iterable[FolderRow], busy: set[str] = frozenset()) -
     # a row whose target folds alike waits where it is.
     for row in sorted(live, key=lambda r: not r.staged):
         target = row.target()
-        if row.staged or (
-            target is not None
+        if (row.staged and not row.blocked) or (
+            not row.staged
+            and target is not None
             and target != row.dir_name
             and row.workspace_id not in busy
+            and target != row.blocked
             # Two rows folding alike only happens across an old build's write.
             and fold(target) not in seen_targets
         ):
@@ -255,8 +270,15 @@ def plan_folder_moves(rows: Iterable[FolderRow], busy: set[str] = frozenset()) -
     # remembers its landing.
     staged_dead = [r for r in rows if r.deleted and r.staged]
     top_dead = [r for r in rows if r.deleted and is_top_level(r.dir_name)]
+    # A kept folder stays where its owner left it, until a live row needs the
+    # name; then it goes aside under leftovers, as the owner's still.
     clearable = sorted(
-        (r for r in top_dead if r.workspace_id not in busy),
+        (
+            r
+            for r in top_dead
+            if r.workspace_id not in busy
+            and (not r.kept or fold(r.dir_name) in seen_targets)
+        ),
         key=lambda r: fold(r.dir_name) not in seen_targets,
     )
     room = max(TOMBSTONES_PER_PASS - len(staged_dead), 0)
@@ -314,7 +336,12 @@ def plan_folder_moves(rows: Iterable[FolderRow], busy: set[str] = frozenset()) -
         moves.append(
             FolderMove(row.workspace_id, row.source, destination, row.staged, row.landings)
         )
-    return FolderPlan(tuple(moves), tuple(tombstones), tuple(r.workspace_id for r in left))
+    copying = tuple(
+        r.workspace_id for r in live if r.staged or r.target() not in (None, r.dir_name)
+    )
+    return FolderPlan(
+        tuple(moves), tuple(tombstones), tuple(r.workspace_id for r in left), copying
+    )
 
 
 def _row(record: Mapping[str, Any]) -> FolderRow:
@@ -329,6 +356,8 @@ def _row(record: Mapping[str, Any]) -> FolderRow:
         # Staging writes a fresh list, so any other row's is nothing a pass planned.
         landings=recorded_landings(record.get("landings")) if staged else (),
         home=is_home_row(record),
+        blocked=record.get("move_blocked"),
+        kept=bool(record.get("folder_kept")),
     )
 
 
@@ -342,10 +371,24 @@ _HOLDS_FOLDER = """
          OR COALESCE(w.config, '{}'::jsonb) @> '{"folder_cleanup_pending": true}')
 """
 
+# Epoch seconds by the database clock, which wrote them. Nested, as a guard
+# beside the cast in one condition would not keep the cast from running.
+_MOVE_BLOCKED = """
+    CASE WHEN jsonb_typeof(w.config->'folder_move_blocked'->'until') = 'number'
+         THEN CASE WHEN (w.config->'folder_move_blocked'->>'until')::numeric
+                        > extract(epoch FROM now())
+                   THEN w.config->'folder_move_blocked'->>'target' END
+    END AS move_blocked
+"""
+
+_FOLDER_KEPT = """
+    COALESCE(w.config, '{}'::jsonb) @> '{"folder_kept": true}' AS folder_kept
+"""
+
 _ROWS_SQL = f"""
     SELECT w.workspace_id, w.name, w.dir_name, w.status = 'deleted' AS deleted,
            w.previous_dir_names, w.config->'folder_landings' AS landings,
-           w.user_id, w.status
+           w.user_id, w.status, {_MOVE_BLOCKED}, {_FOLDER_KEPT}
     FROM workspaces w
     WHERE w.computer_id = %s AND {_HOLDS_FOLDER}
     ORDER BY w.created_at, w.workspace_id
@@ -369,6 +412,12 @@ _RUNNING_SQL = """
     LIMIT 1
 """
 
+_COMMAND_RUNNING_SQL = """
+    SELECT 1 FROM command_runs
+    WHERE computer_id = %(computer)s AND status = 'running'
+    LIMIT 1
+"""
+
 
 async def read_folder_rows(computer_id: str) -> tuple[Optional[int], list[FolderRow]]:
     """The computer's observed layout version and every row holding a folder on it."""
@@ -378,7 +427,7 @@ async def read_folder_rows(computer_id: str) -> tuple[Optional[int], list[Folder
             SELECT c.layout_version, w.workspace_id, w.name, w.dir_name,
                    w.status = 'deleted' AS deleted, w.previous_dir_names,
                    w.config->'folder_landings' AS landings,
-                   w.user_id, w.status
+                   w.user_id, w.status, {_MOVE_BLOCKED}, {_FOLDER_KEPT}
             FROM computers c
             LEFT JOIN workspaces w
               ON w.computer_id = c.computer_id AND {_HOLDS_FOLDER}
@@ -407,13 +456,34 @@ async def computer_run_in_progress(
     return await cur.fetchone() is not None
 
 
+async def computer_command_running(db, computer_id: str) -> bool:
+    """Whether a handed-off command still runs on the computer. Its code
+    reaches the folders there as a run's does, and it can outlive every turn."""
+    cur = await db.execute(_COMMAND_RUNNING_SQL, {"computer": computer_id})
+    return await cur.fetchone() is not None
+
+
 async def _busy(
     cur, computer_id: str, rows: Iterable[FolderRow], own_run_id: Optional[str]
 ) -> set[str]:
-    """Every row while any run on the computer is in progress, else none."""
-    if not await computer_run_in_progress(cur, computer_id, own_run_id=own_run_id):
+    """Every row while any run or command on the computer is in progress, else
+    any being moved off it, whose folder the move sets aside by the name it has now."""
+    rows = list(rows)
+    if await computer_run_in_progress(
+        cur, computer_id, own_run_id=own_run_id
+    ) or await computer_command_running(cur, computer_id):
+        return {r.workspace_id for r in rows}
+    if not rows:
         return set()
-    return {r.workspace_id for r in rows}
+    await cur.execute(
+        f"""
+        SELECT workspace_id FROM workspaces
+        WHERE workspace_id = ANY(%s::uuid[])
+          AND {workspace_move_fences("workspaces.workspace_id")}
+        """,
+        ([r.workspace_id for r in rows],),
+    )
+    return {str(row["workspace_id"]) for row in await cur.fetchall()}
 
 
 async def busy_workspace_ids(
@@ -551,9 +621,12 @@ async def workspace_folder_in_use(workspace_id: str):
     A settle moves only folders it can hold exclusively, so a change whose
     paths were read under this lands before the move or after it. Between the
     two, ``mkdir -p`` would recreate the folder the move left, and the file
-    would land where nothing reads it. Held on the process's shared lock
-    session rather than a pooled connection, so the work under it reads
-    through the pool freely, and a hold taken inside another stacks on it.
+    would land where nothing reads it. A move to another computer sets the
+    folder aside under this hold too, but the row names the folder it left
+    until the move ends, so from staging on the hold is refused. Held on the
+    process's shared lock session rather than a pooled connection, so the work
+    under it reads through the pool freely, and a hold taken inside another
+    stacks on it.
     """
     key = f"{_IN_USE_NS}:{workspace_id}"
     locks = shared_lock_session()
@@ -562,9 +635,21 @@ async def workspace_folder_in_use(workspace_id: str):
     except SharedLockBusy as e:
         raise WorkspaceFolderMoving(workspace_id) from e
     try:
+        if await _folder_set_aside(workspace_id):
+            raise WorkspaceFolderMoving(workspace_id)
         yield
     finally:
         await locks.release(conn, key)
+
+
+async def _folder_set_aside(workspace_id: str) -> bool:
+    async with get_db_connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(
+            "SELECT EXISTS (SELECT 1 FROM workspace_moves"
+            " WHERE workspace_id = %s AND phase = ANY(%s)) AS set_aside",
+            (workspace_id, list(MOVE_SET_ASIDE_PHASES)),
+        )
+        return bool((await cur.fetchone())["set_aside"])
 
 
 async def hold_workspace_folder(conn, workspace_id: str) -> bool:
@@ -716,14 +801,19 @@ async def record_folder_landings(
                     (workspace_id, computer_id),
                 )
             else:
+                # A kept folder is set aside for its owner, never queued for removal.
                 await cur.execute(
                     """
                     UPDATE workspaces
                     SET dir_name = %s,
-                        config = jsonb_set(
-                            COALESCE(config, '{}'::jsonb) #- '{folder_landings}',
-                            '{folder_cleanup_pending}', 'true'
-                        )
+                        config = CASE
+                            WHEN COALESCE(config, '{}'::jsonb) @> '{"folder_kept": true}'
+                            THEN config #- '{folder_landings}'
+                            ELSE jsonb_set(
+                                COALESCE(config, '{}'::jsonb) #- '{folder_landings}',
+                                '{folder_cleanup_pending}', 'true'
+                            )
+                        END
                     WHERE workspace_id = %s AND computer_id = %s AND status = 'deleted'
                     """,
                     (folder, workspace_id, computer_id),
@@ -737,7 +827,8 @@ async def record_folder_landings(
                         SET dir_name = %(folder)s::text,
                             previous_dir_names = array_remove(previous_dir_names, %(folder)s::text),
                             config = CASE WHEN %(landed)s
-                                THEN config #- '{folder_landings}' ELSE config END
+                                THEN config #- '{folder_landings}' #- '{folder_move_blocked}'
+                                ELSE config END
                         WHERE workspace_id = %(id)s AND computer_id = %(computer)s
                           AND dir_name = %(moving)s
                         """,
@@ -763,6 +854,42 @@ async def record_folder_landings(
                     f"before its move recorded"
                 )
     return landed
+
+
+FOLDER_MOVE_BACKOFF = "6 hours"
+
+
+async def record_folder_blocked(
+    conn, computer_id: str, *, blocked: Mapping[str, str]
+) -> None:
+    """Hold each row on its folder until the backoff ends or it is renamed again.
+
+    ``blocked`` maps a row to the target its folder had no room to be copied
+    to; only a target the pass planned for that row counts, since the report
+    comes from the sandbox.
+    """
+    async with conn.cursor() as cur:
+        for workspace_id, target in blocked.items():
+            await cur.execute(
+                """
+                UPDATE workspaces
+                SET config = jsonb_set(
+                    COALESCE(config, '{}'::jsonb), '{folder_move_blocked}',
+                    jsonb_build_object(
+                        'target', %(target)s::text,
+                        'until', extract(epoch FROM now() + %(backoff)s::interval)
+                    )
+                )
+                WHERE workspace_id = %(id)s AND computer_id = %(computer)s
+                  AND status <> 'deleted'
+                """,
+                {
+                    "target": target,
+                    "backoff": FOLDER_MOVE_BACKOFF,
+                    "id": workspace_id,
+                    "computer": computer_id,
+                },
+            )
 
 
 async def retarget_folder_cleanup(

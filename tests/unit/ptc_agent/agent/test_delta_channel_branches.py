@@ -3,7 +3,8 @@
 A regenerate replays a turn's input checkpoint, a retry the failed step's
 checkpoint, and an edit starts new input at an older one. Each reruns the
 tasks scheduled there, so ``messages`` must not also replay the writes those
-tasks made the first time (``ptc_agent.agent.delta_branch``). Inputs arrive as
+tasks made the first time, which langgraph (>=1.2.13) ensures by snapshotting
+the channel in the new branch's first checkpoint. Inputs arrive as
 the id-less dicts the chat path builds, the shape that left a regenerated
 turn's message stored twice.
 """

@@ -225,20 +225,20 @@ describe('analystCandidates', () => {
   it('skips a hand-off that never reached a thread', () => {
     const messages = [
       assistant(100, {
-        failed: { status: 'approved', dispatch_failed: true },
-        pending: { status: 'pending' },
+        failed: { status: 'approved', question: '', dispatch_failed: true },
+        pending: { status: 'pending', question: '' },
       }),
     ];
     expect(analystCandidates(messages, null)).toEqual([]);
   });
 
   it('keeps a failed hand-off that names its thread, where a run may yet turn up', () => {
-    const unknown = { status: 'approved', thread_id: 't2', dispatch_failed: true } as const;
+    const unknown = { status: 'approved', question: '', thread_id: 't2', dispatch_failed: true } as const;
     expect(analystCandidates([assistant(100, { p: unknown })], null)).toEqual([
       expect.objectContaining({ threadId: 't2', seenMs: 100, dispatchFailed: true }),
     ]);
     // A later hand-off to the same thread that went through clears it.
-    const retried = [assistant(100, { p: unknown }), assistant(200, { q: { status: 'approved', thread_id: 't2' } })];
+    const retried = [assistant(100, { p: unknown }), assistant(200, { q: { status: 'approved', question: '', thread_id: 't2' } })];
     expect(analystCandidates(retried, null)).toEqual([expect.objectContaining({ threadId: 't2', dispatchFailed: false })]);
   });
 });

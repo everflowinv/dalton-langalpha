@@ -26,8 +26,9 @@
   height: 100vh;
   height: 100svh;
   background: var(--color-bg-page);
-  /* Appear only after 150ms so fast chunk loads never flash the loader. */
-  animation: pl-appear 0.3s ease-out 0.15s backwards;
+  /* Appear only after 150ms so fast chunk loads never flash the loader.
+     motion-exempt: a debounce, not motion */
+  animation: pl-appear var(--motion-enter) var(--ease-out) 150ms backwards;
 }
 
 [data-theme='light'] .page-loading {
@@ -70,6 +71,7 @@
   height: 18cqh;
   overflow: hidden;
   transform: translateY(-18cqh);
+  /* motion-exempt: the scan's loop period, its own pace and not a UI duration */
   animation: pl-scan 5.6s linear infinite;
   -webkit-mask-image: linear-gradient(180deg, transparent, black 32% 68%, transparent);
   mask-image: linear-gradient(180deg, transparent, black 32% 68%, transparent);
@@ -79,6 +81,7 @@
   color: var(--pl-ember);
   opacity: 0.9;
   text-shadow: 0 0 10px var(--pl-glow);
+  /* motion-exempt: shares the scan's period exactly, or the lit text drifts off-register */
   animation: pl-scan-inner 5.6s linear infinite;
 }
 
@@ -174,10 +177,13 @@
   }
 }
 
-/* The readout holds its first byte; the label alone says the app is loading. */
+/* The readout holds its first byte; the label alone says the app is loading.
+   The appear delay is a debounce, not motion, so it outlasts the global rule
+   that cuts delays, and a fast chunk load still never flashes the loader. */
 @media (prefers-reduced-motion: reduce) {
   .page-loading {
-    animation: none;
+    /* motion-exempt: a debounce, not motion */
+    animation-delay: 150ms !important;
   }
   .page-loading__scan {
     display: none;

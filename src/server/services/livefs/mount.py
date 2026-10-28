@@ -339,6 +339,12 @@ async def serve(
     know of a daemon a command found dead.
     """
     computer_id = str(computer_id)
+    if sandbox is not None and not sandbox.mounts_livefs:
+        # Nothing is asked of the machine and no token is minted for it, and
+        # the tracker holds this answer for the sandbox's life.
+        return MountState(
+            False, reason="this machine does not mount", error=MountError.UNSUPPORTED
+        )
     if not _usable(sandbox, user_id):
         return _off(computer_id, "no sandbox or owner")
     base_url = effective_relay_base_url(provider)

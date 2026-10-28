@@ -23,6 +23,7 @@ import type { DashboardPrefs, WidgetInstance } from './widgets/types';
 import type { PresetId } from './widgets/presets';
 import './widgets/index';
 import { useScrollMemory } from '@/lib/scrollMemory';
+import { scrollMotion } from '@/lib/reducedMotion';
 import './Dashboard.css';
 
 interface DashboardCustomProps {
@@ -49,7 +50,7 @@ function CustomInner({ mode, onModeChange }: DashboardCustomProps) {
   } = ctx;
 
   const handleScrollToTop = useCallback(() => {
-    mainRef.current?.scrollTo({ top: 0, behavior: 'smooth' });
+    mainRef.current?.scrollTo({ top: 0, behavior: scrollMotion() });
   }, []);
 
   useEffect(() => {

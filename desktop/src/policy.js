@@ -31,7 +31,10 @@ const store = require('./store')
  * instead would need credentials it deliberately does not have.
  *
  * `reachedApp` is a shortcut past that round trip, not the decision: once this
- * install has landed on the app, later launches open it directly.
+ * install has landed on the app, later launches open it directly. A launch that
+ * finds the app signed out is sent back to platform sign-in by the app itself
+ * (`web/src/lib/hostedSignIn.ts`), so the shortcut never skips the funnel for a
+ * new account.
  */
 function entryUrl() {
   if (!config.isSaas) {

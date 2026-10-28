@@ -21,7 +21,7 @@ import type { WorkflowStatusResponse } from '../utils/api';
 import type { CancelOutcome, HeldSteer } from '../utils/cancelOutcome';
 // Imported from the dependency-free signal module (not `../utils/api`) so this
 // keeps decoding wire status even in the hook tests that fully mock `../utils/api`.
-import { shouldArmForStatus } from '../utils/reportBackSignal';
+import { reportOwedForStatus, shouldArmForStatus } from '../utils/reportBackSignal';
 import { useReportBackWatch } from './useReportBackWatch';
 import { useChatFeedback } from './useChatFeedback';
 import { toast } from '@/components/ui/use-toast';
@@ -31,7 +31,7 @@ import { getStoredThreadId, setStoredThreadId } from './utils/threadStorage';
 import { type SubagentTokenUsage, ZERO_USAGE } from '../utils/tokenUsage';
 import { computeSteeringBoundary } from '../session/stream/steeringRollback';
 import { isSteeringUserMessage, opensTurn } from '../components/messageList/messagePredicates';
-import { hasTurn, newestTurn, projectTurns, turnOf } from '../components/messageList/turnProjection';
+import { hasTurn, hiddenOpenerTurns, newestTurn, projectTurns, turnOf } from '../components/messageList/turnProjection';
 import { isSubagentEvent } from '../session/subagents/liveEventHandlers';
 import { bumpThreadNavOrder } from './useNavigationData';
 import { invalidateNewWorkspace } from './workspaceRowActions';
@@ -47,7 +47,10 @@ import { withServerTotals, withoutServerTotals } from './utils/contextWindowEven
 import { BUSY_REFUSAL_KEYS, createForkRefusalRecovery, forkRefusalMessage, isBusyCode, isRecoverableRetryRefusal, isStaleForkRefusal, type BusyCode, type ForkCut } from './utils/forkRefusal';
 import { createEditDraftStore, sameDraftMessage, type EditDraft } from './utils/editDrafts';
 import { settleStoppedBubble } from '../session/stream/stopBubble';
+import { withoutPending } from '../session/stream/toolCallChunks';
 import { useMarketWatch } from './useMarketWatch';
+import { invalidateThreadWakeups } from './useWakeups';
+import { invalidateThreadCommands } from './useCommands';
 import { refreshComputersAfterTurn } from './useComputers';
 // Chart-annotation live bridge: writes agent-drawn annotations into the
 // shared MarketView store so the desktop MarketView chat panel (which uses
@@ -58,7 +61,7 @@ import { refreshComputersAfterTurn } from './useComputers';
 // --- Module scope extracted to session/types + utils (W1) ---
 import type {
   TokenUsage, PendingInterrupt,
-  SSEEvent, ModelOptions, OffloadBatch, TaskRefs,
+  SSEEvent, ModelOptions, SendOptions, OffloadBatch, TaskRefs,
   HistoryInterruptInfo, StreamProcessorRefs,
   ModelStatus, FallbackSuggestion,
 } from '../session/types';
@@ -90,10 +93,31 @@ import { collectRenderedInterruptIds, finalizeTodoListProcessesInMessages } from
 export { finalizeTodoListProcessesInMessages, mapToolCallIdToAgentId } from './utils/messageFinalizers';
 
 /** A send the server started no run of. Its automatic resends carry it, so
- * the one that ends the chain can mark it never kept and give its turn back. */
+ * the one that ends the chain can mark it never kept and give its turn back.
+ * A hidden opener drew no message, so it has no user bubble to carry. */
 interface UnstartedSend {
-  userId: string;
+  userId: string | null;
   watermarkBefore: number | null;
+}
+
+/** Bubbles already on screen that a new message, and on a fork its reply,
+ * take over: a send parked during compaction or a refused steer going out
+ * again, or the ones an edit or regenerate draws in place of its cut while it
+ * reads the checkpoint it forks from. The new bubbles take their ids, so the
+ * list keeps them mounted and they do not play their entrance a second time.
+ * No user id when a fork draws none, and no reply for a send, whose reply
+ * opens a bubble of its own. */
+interface ShownBubbles {
+  userId?: string;
+  assistantId?: string;
+}
+
+/** A send going out again in place of one waiting on screen: a message parked
+ * during compaction, or a refused steer, which goes under the request key it
+ * was sent with. */
+interface Resend {
+  requestKey?: string;
+  shown?: ShownBubbles;
 }
 
 export function useChatMessages(
@@ -107,6 +131,7 @@ export function useChatMessages(
   clearSubagentCards: (() => void) | null = null,
   onWorkspaceCreated: ((info: { workspaceId: string; question: string }) => void) | null = null,
   platform: string | null = null,
+  readComposerOptions: (() => ModelOptions | undefined) | null = null,
 ) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
@@ -150,6 +175,9 @@ export function useChatMessages(
   // false | 'starting' (generic cold start) | 'archived' (slow ~90s restore from cold storage).
   // Widen this union when backend adds a new sandbox_state discriminator.
   const [workspaceStarting, setWorkspaceStarting] = useState<false | 'starting' | 'archived'>(false);
+  // Why this send waits on a thread mutation (the `turn_held` reason: 'compact',
+  // 'offload', 'handoff', or another/empty), null when it is not held.
+  const [turnHeld, setTurnHeld] = useState<string | null>(null);
   const [isCompacting, setIsCompactingState] = useState<string | false>(false);  // Context compaction in progress (summarize/offload)
   // About how many tokens the summary being written has written, null until
   // the server first says.
@@ -208,6 +236,13 @@ export function useChatMessages(
     // id of the optimistic shimmer bubble shown while parked, so it can be
     // removed on flush (before the real send re-adds it) or on stop.
     messageId: string;
+    // DALTON-HOOK(composer-drafts): the queueing send's composer linkage. A
+    // queued position is not acceptance — a stop can still drop the message —
+    // so the draft stays unsettled while parked: acceptance rides onAccepted
+    // into the flushed send, and settleQueued resolves the queueing call's
+    // deferred boolean (false on drop, the flushed send's outcome otherwise).
+    onAccepted?: () => void;
+    settleQueued: (sent: boolean) => void;
   } | null>(null);
   const [messageError, setMessageError] = useState<string | StructuredError | null>(null);
   // Steer text for the composer: the user's steers a stop took back from the
@@ -530,7 +565,10 @@ export function useChatMessages(
   // `arm` is identity-stable (facade over a latest-impl ref), so callbacks that
   // dispatch through it can dep on it without churning per render — the whole
   // reportBackWatch object would change identity on awaitingReportBack flips.
-  const { awaitingReportBack, reportBackOwed, owedThreads: reportBackOwedThreads, arm: armReportBackWatch } = reportBackWatch;
+  const {
+    awaitingReportBack, reportBackOwed, owedThreads: reportBackOwedThreads, owedKinds: reportBackOwedKinds,
+    arm: armReportBackWatch,
+  } = reportBackWatch;
 
   // Batch back-to-back offload events into a single notification
   const offloadBatchRef = useRef<OffloadBatch>({ args: 0, reads: 0, timer: null });
@@ -539,8 +577,23 @@ export function useChatMessages(
 
   // Market-watch chip lifecycle: seed on thread load/switch + refetch on turn
   // completion. Live mid-turn overwrites arrive via `market_watch_update` SSE
-  // events, which forward `setMarketWatch` (see processEvent below).
-  const { marketWatch, setMarketWatch } = useMarketWatch(threadId, isLoading, threadIdRef);
+  // events, which forward `setMarketWatch` (see processEvent below), and a
+  // delivered price alert refetches through `refreshMarketWatch`.
+  const { marketWatch, setMarketWatch, refreshMarketWatch } = useMarketWatch(threadId, isLoading, threadIdRef);
+  // The wakeups list is a query its readers own; the stream and a reload
+  // only say it may have moved. Every change a watched turn makes arrives as
+  // an event, so a turn's end needs no read of its own.
+  const refreshWakeups = useCallback(
+    () => invalidateThreadWakeups(queryClient, threadIdRef.current),
+    [queryClient, threadIdRef],
+  );
+  // The same for the thread's background commands: the stream says when one
+  // moved to the background or reported its end, and the listing polls while
+  // one runs, so a turn's end needs no read of its own either.
+  const refreshCommands = useCallback(
+    () => invalidateThreadCommands(queryClient, threadIdRef.current),
+    [queryClient, threadIdRef],
+  );
 
   // Track if this is a new conversation (for todo list card management)
   const isNewConversationRef = useRef(false);
@@ -582,6 +635,7 @@ export function useChatMessages(
   // publish applies the queued chunks first, like any write that is not one.
   const {
     store: subagentHistory, entries: subagentHistoryEntries, resolveSubagentIdToAgentId, getSubagentHistory, hydrateTaskTranscript,
+    getTaskRuns, putTaskRun,
   } = useSubagentHistory(liveMessages.flush, { t, threadId, subagentStateRefsRef });
   // An instruction the user sends a running subagent, bound to the
   // transcripts its stream writes.
@@ -672,6 +726,7 @@ export function useChatMessages(
     setPendingInterrupt,
     setThreadId,
     setWorkspaceStarting,
+    setTurnHeld,
     // ref containers (stable identity, ref-current reads)
     threadIdRef,
     isStreamingRef,
@@ -812,6 +867,11 @@ export function useChatMessages(
         // thread A's queued payload into thread B (and B doesn't inherit A's
         // stale compacting indicator).
         setQueuedSend(false);
+        // DALTON-HOOK(composer-drafts): the parked send dies with the thread it
+        // was queued on — settle it as failed so its draft is not left holding
+        // an unsettled promise (chatDrafts ignores it if a newer send on the
+        // key already owns the draft).
+        queuedSendRef.current?.settleQueued(false);
         queuedSendRef.current = null;
         // So do refused steers waiting to open its next turn, and those still
         // waiting on their answers. Their bubbles go with the messages above,
@@ -819,6 +879,8 @@ export function useChatMessages(
         notRunningGenRef.current += 1;
         for (const q of notRunningSendsRef.current.splice(0)) requestKeyRef.current.settle(q.requestKey);
         setIsCompacting(false);
+        // A send held on the thread we're leaving is no wait of B's.
+        setTurnHeld(null);
         // Reset refs
         contentOrderCounterRef.current = 0;
         currentReasoningIdRef.current = null;
@@ -1382,6 +1444,13 @@ export function useChatMessages(
       // eventual real load that supersedes it.
       if (loadOk) {
         historyLoadedKeyRef.current = loadKey;
+        // A reload catches up on turns this view missed, a wake among them,
+        // and the wakeups those turns fired or set; a first load is the
+        // list's own seed.
+        if (reloadAsked) {
+          refreshWakeups();
+          refreshCommands();
+        }
         const refused = refusalAfterReloadRef.current;
         refusalAfterReloadRef.current = null;
         // Only while a steer still holds it: one the replay delivered is gone.
@@ -1434,7 +1503,9 @@ export function useChatMessages(
         // reconcile ONLY when the thread isn't also active — poking would race
         // the reconnect branch's attach of status.run_id (double-attach); the
         // seeded id is picked up once that active stream ends.
-        reportBackWatch.arm(threadId, status.report_back_run_id, status.can_reconnect ? null : 'load', status.owed_threads);
+        reportBackWatch.arm(
+          threadId, status.report_back_run_id, status.can_reconnect ? null : 'load', status, reportOwedForStatus(status),
+        );
       }
 
       // The report-back watch attaches its runs on a wake, which can land
@@ -1590,6 +1661,12 @@ export function useChatMessages(
   useEffect(() => () => {
     sessionEpochRef.current += 1;
     historyWindow.reset();
+    // DALTON-HOOK(composer-drafts): a send still parked for compaction dies
+    // with the component — settle it as failed so the composer's stored draft
+    // is not left behind an unsettled promise (chatDrafts ignores the settle
+    // when a newer send on the key already owns the draft).
+    queuedSendRef.current?.settleQueued(false);
+    queuedSendRef.current = null;
   }, [historyWindow]);
 
   /**
@@ -1679,7 +1756,7 @@ export function useChatMessages(
           for (const [id, val] of Object.entries(tcp)) {
             tp[id] = val.isInProgress ? { ...val, isInProgress: false, isComplete: true } : val;
           }
-          msgs[i] = { ...msgs[i], isStreaming: false, stopped: true, pendingToolCallChunks: {}, toolCallProcesses: tp };
+          msgs[i] = { ...withoutPending(msgs[i]), isStreaming: false, stopped: true, toolCallProcesses: tp };
           break;
         }
       }
@@ -1694,11 +1771,16 @@ export function useChatMessages(
 
   // Forget a message parked during compaction (clear ref + chip + optimistic shimmer bubble).
   const dropQueuedSend = () => {
-    const queuedMsgId = queuedSendRef.current?.messageId;
+    const queued = queuedSendRef.current;
     queuedSendRef.current = null;
     setQueuedSend(false);
-    if (queuedMsgId) {
-      setMessages((prev) => prev.filter((m) => m.id !== queuedMsgId));
+    if (queued) {
+      setMessages((prev) => prev.filter((m) => m.id !== queued.messageId));
+      // DALTON-HOOK(composer-drafts): the parked message never reached the
+      // server — settle its send as failed so the composer draft returns to
+      // the input. chatDrafts ignores the settle when a newer send on the
+      // same key already owns the draft.
+      queued.settleQueued(false);
     }
   };
 
@@ -1744,6 +1826,7 @@ export function useChatMessages(
     // (isReconnecting is handled by the reconnect finally's ownership check: the
     // abort above unwinds the reader, whose finally still owns and clears it.)
     setWorkspaceStarting(false);
+    setTurnHeld(null);
     setIsCompacting(false);
     clearModelStatus();
     // Drop any message queued during compaction: the user just cancelled, so it
@@ -1918,6 +2001,15 @@ export function useChatMessages(
         answered: true,
       };
     }
+    // DALTON-HOOK(colleague-dispatch): map 403 colleague_access_revoked to non-retryable notice without "Configure providers" link
+    if (errorInfo?.code === 'colleague_access_revoked') {
+      void queryClient.invalidateQueries({ queryKey: queryKeys.workspaces.details() });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.workspaces.team() });
+      return {
+        banner: t('dalton.sharing.revokedThreadReadonlyHint'),
+        answered: true,
+      };
+    }
     if (errObj.status === 403) {
       return {
         banner: {
@@ -1947,13 +2039,21 @@ export function useChatMessages(
    * a send under the same request key once the view lets the ended turn go,
    * or back to the composer when the user stopped meanwhile.
    */
+  // DALTON-HOOK(composer-drafts): return explicit boolean send outcome so ChatInput preserves drafts on failure
   const handleSendSteering = async (
     message: string,
     additionalContext: Record<string, unknown>[] | null = null,
     attachmentMeta: Record<string, unknown>[] | null = null,
     modelOptions: ModelOptions = {},
-    resendKey: string | null = null,
-  ) => {
+    resend: Resend = {},
+    onAccepted?: () => void,
+  ): Promise<boolean> => {
+    let acceptedFired = false;
+    const notifyAccepted = () => {
+      if (acceptedFired) return;
+      acceptedFired = true;
+      onAccepted?.();
+    };
     const { widgetSnapshots, chartSelections } = modelOptions;
     // The refused-steer queue the steer belongs to, for a refusal to rejoin
     // it only if no thread switch has ended it since.
@@ -1966,9 +2066,9 @@ export function useChatMessages(
     // answer was lost reuses the key and dedups against the accepted copy.
     // Other steers can be waiting on their answers too, and each keeps its own
     // key for its own re-send.
-    const requestKey = resendKey ?? requestKeyRef.current.take(sendFingerprint(threadId, message), { alongside: true });
+    const requestKey = resend.requestKey ?? requestKeyRef.current.take(sendFingerprint(threadId, message), { alongside: true });
     const userMessage: ChatMessage = {
-      ...createUserMessage(message, steeredTurn, attachmentMeta as AttachmentMeta[] | null, widgetSnapshots ?? null, chartSelections ?? null),
+      ...createUserMessage(message, steeredTurn, { attachments: attachmentMeta as AttachmentMeta[] | null, widgetSnapshots, chartSelections, id: resend.shown?.userId }),
       steering: true,
       requestKey,
       ...(currentRunIdRef.current ? { steeredRunId: currentRunIdRef.current } : {}),
@@ -1990,7 +2090,9 @@ export function useChatMessages(
             // is the natural boundary in the Redis stream; fall back to the
             // local counter for tests/legacy flows without `_eventId`.
             steeringAtOrderRef.current = computeSteeringBoundary(event, contentOrderCounterRef.current);
-            // Update the user message to reflect steering status
+            // DALTON-HOOK(composer-drafts): the server took the steer — accepted
+            notifyAccepted();
+            // Update user message to reflect steering status
             setMessages((prev) =>
               updateMessage(prev,userMessage.id as string, (msg) => ({
                 ...msg,
@@ -2020,12 +2122,16 @@ export function useChatMessages(
           errorInfo: { code: frame.code, message: text },
         });
       }
+      // DALTON-HOOK(composer-drafts): report steering send outcome to composer draft lifecycle
+      return true;
     } catch (err: unknown) {
-      if ((err as Error)?.name === 'AbortError') return;
+      if ((err as Error)?.name === 'AbortError') return true;
       const code = (err as { errorInfo?: { code?: unknown } })?.errorInfo?.code;
       if ((err as { status?: number })?.status === 409 && code === 'not_running') {
         settleNotRunningSteer(userMessage.id as string, gen, message, additionalContext, attachmentMeta, modelOptions, requestKey, seq);
-        return;
+        // DALTON-HOOK(composer-drafts): the steer joined the refused queue — a queued position counts as accepted
+        notifyAccepted();
+        return true;
       }
       // A steer the user's stop overtook: the stop hands the turn's steers
       // back to the composer, and this one joins them.
@@ -2033,11 +2139,15 @@ export function useChatMessages(
         requestKeyRef.current.settle(requestKey);
         setMessages((prev) => prev.filter((m) => m.id !== userMessage.id));
         giveBackSteering(message);
-        return;
+        return true;
       }
-      if (wasStoppedRef.current) return;
+      if (wasStoppedRef.current) return true;
       console.error('Error sending steering:', err);
-      if (settleDuplicateSteer(err, userMessage.id as string, message, requestKey)) return;
+      if (settleDuplicateSteer(err, userMessage.id as string, message, requestKey)) {
+        // DALTON-HOOK(composer-drafts): the duplicate steer was already accepted server-side
+        notifyAccepted();
+        return true;
+      }
       // The server sends a refusal (a 4xx) before it queues a steer. It holds
       // the status line of a steer it takes until the stream's first frame,
       // so a failure in between reads as a 5xx or as no answer, and a
@@ -2045,7 +2155,11 @@ export function useChatMessages(
       // delivery marks the steers it names, so one that marked a refused
       // steer was another with its text.
       const refused = isClientError(err);
-      if (!refused && liveMessages.get().some((m) => m.id === userMessage.id && (m as { steeringDelivered?: boolean }).steeringDelivered)) return;
+      if (!refused && liveMessages.get().some((m) => m.id === userMessage.id && (m as { steeringDelivered?: boolean }).steeringDelivered)) {
+        // DALTON-HOOK(composer-drafts): the run delivered this steer after all — accepted
+        notifyAccepted();
+        return true;
+      }
       // Shown as a refused send's is. A steer has no reply to fail in its
       // place, so one the server gave no words for still says it was not
       // sent. A load clears the banner as it starts, so the refusal is
@@ -2069,6 +2183,8 @@ export function useChatMessages(
         }))
       );
       setMessageError(banner);
+      // DALTON-HOOK(composer-drafts): steering rejected or failed on network — preserve composer draft
+      return false;
     } finally {
       steersInFlightRef.current.delete(seq);
       if (notRunningSendsRef.current.length > 0) setNotRunningTick((n) => n + 1);
@@ -2131,16 +2247,16 @@ export function useChatMessages(
     additionalContext: Record<string, unknown>[] | null,
     attachmentMeta: Record<string, unknown>[] | null,
     modelOptions: ModelOptions,
+    shown?: ShownBubbles,
   ): void => {
     const requestKey = requestKeyRef.current.take(sendFingerprint(threadId, message), { alongside: true });
     const waiting: ChatMessage = {
-      ...createUserMessage(
-        message,
-        newestTurn(liveMessages.get()) ?? undefined,
-        attachmentMeta as AttachmentMeta[] | null,
-        modelOptions.widgetSnapshots ?? null,
-        modelOptions.chartSelections ?? null,
-      ),
+      ...createUserMessage(message, newestTurn(liveMessages.get()) ?? undefined, {
+        attachments: attachmentMeta as AttachmentMeta[] | null,
+        widgetSnapshots: modelOptions.widgetSnapshots,
+        chartSelections: modelOptions.chartSelections,
+        id: shown?.userId,
+      }),
       steering: true,
       requestKey,
     };
@@ -2164,13 +2280,14 @@ export function useChatMessages(
    * key in case a copy arrived.
    */
   const trackPlainSend = (send: {
-    userId: string;
+    /** Null for a hidden opener, whose reply is its only bubble. */
+    userId: string | null;
     assistantId: string;
     turnIndex: number;
     request: TurnRequest & { requestKey: string };
     watermarkBefore: number | null;
   }) => {
-    const ids = new Set([send.userId, send.assistantId]);
+    const ids = new Set(send.userId === null ? [send.assistantId] : [send.userId, send.assistantId]);
     let started = false;
     let refused = false;
     return {
@@ -2206,15 +2323,44 @@ export function useChatMessages(
     };
   };
 
-  const handleSendMessage = async (message: string, additionalContext: Record<string, unknown>[] | null = null, attachmentMeta: Record<string, unknown>[] | null = null, { model, reasoningEffort, fastMode, widgetSnapshots, chartSelections, subagentsAllowed }: ModelOptions = {}, resendKey: string | null = null) => {
+  /**
+   * Gives a hidden opener's reply, from the moment it opens, a Retry that
+   * brings the turn's context again. Its words ride that context alone, which
+   * no row keeps, and no message of it is on screen to send again: a run that
+   * failed before its graph took the input reruns it, which the server
+   * refuses without the context (`resend_required`). A recovery the stream
+   * names, or a refusal of the send, holds its own Retry in this one's place.
+   */
+  const holdHiddenOpenerRetry = (bubbleId: string, additionalContext: Record<string, unknown>[] | null) => {
+    if (!additionalContext) return;
+    heldRetriesRef.current.set(bubbleId, { bubbleId, request: retryRequest(null, additionalContext), cut: null });
+  };
+
+  // DALTON-HOOK(composer-drafts): return explicit boolean send outcome so ChatInput preserves drafts on failure
+  const handleSendMessage = async (message: string, additionalContext: Record<string, unknown>[] | null = null, attachmentMeta: Record<string, unknown>[] | null = null, { model, reasoningEffort, fastMode, widgetSnapshots, chartSelections, subagentsAllowed, reasoningEffortOverride, fastModeOverride, hiddenOpener = false, threadTitle, onAccepted }: SendOptions = {}, resend: Resend = {}): Promise<boolean> => {
     const hasContent = message.trim() || (additionalContext && additionalContext.length > 0);
     if (!workspaceId || !hasContent) {
-      return;
+      return false;
     }
+
+    // DALTON-HOOK(composer-drafts): acceptance fires once, at the first sign
+    // the server took this send — the composer clears its stored draft there,
+    // while the return value below stays the fallback for sends that never
+    // report either way.
+    let acceptedFired = false;
+    const notifyAccepted = () => {
+      if (acceptedFired) return;
+      acceptedFired = true;
+      onAccepted?.();
+    };
 
     // Chat activity bumps the thread to the top of the nav panel's list
     // (clicking around never reorders; new threads surface via the new-id rule).
     bumpThreadNavOrder(workspaceId, threadIdRef.current);
+
+    // The three branches below park or steer a send in a chat that is busy. A
+    // hidden opener only ever opens a new chat, which is never busy, so they
+    // carry neither of its options.
 
     // If the agent is compacting its context, hold this message and auto-send
     // it once compaction finishes (mirrors the backend admission gate, which
@@ -2229,15 +2375,32 @@ export function useChatMessages(
       // message) so the user sees what will send. Only the latest queued
       // message is held, so replace any earlier optimistic bubble.
       const prevQueuedId = queuedSendRef.current?.messageId;
+      // DALTON-HOOK(composer-drafts): the earlier park is dropped by this
+      // replacement — settle it as failed so its draft returns to the composer
+      // (a widget send takes the queue without touching the composer, so the
+      // displaced text belongs back in the input). A second composer send
+      // already owns the draft key, and chatDrafts' supersession guard
+      // ignores the settle there.
+      queuedSendRef.current?.settleQueued(false);
       // A placeholder: the send it becomes adds a bubble of its own.
-      const queuedMsg = createUserMessage(
-        message,
-        undefined,
-        attachmentMeta as AttachmentMeta[] | null,
-        widgetSnapshots ?? null,
-        chartSelections ?? null,
-      );
+      const queuedMsg = createUserMessage(message, undefined, {
+        attachments: attachmentMeta as AttachmentMeta[] | null,
+        widgetSnapshots,
+        chartSelections,
+      });
       const queuedMessage: ChatMessage = { ...queuedMsg, queued: true };
+      // DALTON-HOOK(composer-drafts): a queued position is not acceptance — a
+      // stop can still drop the message, and the draft must come back with it.
+      // The composer caller (the one that passed onAccepted) receives a promise
+      // that settles only on the flushed send's outcome or on drop; callers
+      // without onAccepted keep the immediate boolean this branch has always
+      // returned.
+      let resolveQueued: (sent: boolean) => void = () => {};
+      const outcome = onAccepted
+        ? new Promise<boolean>((resolve) => {
+            resolveQueued = resolve;
+          })
+        : null;
       // The subagents setting stays behind: compaction only runs on a thread
       // that exists, whose row a flip made since has already PATCHed, and the
       // value captured now would store over that flip when the send flushes.
@@ -2247,39 +2410,45 @@ export function useChatMessages(
         attachmentMeta,
         modelOptions: { model, reasoningEffort, fastMode, widgetSnapshots, chartSelections },
         messageId: queuedMessage.id as string,
+        onAccepted,
+        settleQueued: resolveQueued,
       };
       setMessages((prev) => {
         const base = prevQueuedId ? prev.filter((m) => m.id !== prevQueuedId) : prev;
         return appendMessage(base, queuedMessage);
       });
       setQueuedSend(message.trim() || '…');
-      return;
+      // DALTON-HOOK(composer-drafts): no acceptance here — see the promise above
+      return outcome ?? true;
     }
 
     // The resend of a refused steer is the queue's own; anything else waits behind it.
-    if (resendKey === null && notRunningSendsRef.current.length > 0) {
-      queueBehindRefused(message, additionalContext, attachmentMeta, { model, reasoningEffort, fastMode, widgetSnapshots, chartSelections, subagentsAllowed });
-      return;
+    if (resend.requestKey === undefined && notRunningSendsRef.current.length > 0) {
+      queueBehindRefused(message, additionalContext, attachmentMeta, { model, reasoningEffort, fastMode, widgetSnapshots, chartSelections, subagentsAllowed, reasoningEffortOverride, fastModeOverride }, resend.shown);
+      // DALTON-HOOK(composer-drafts): a queued position counts as accepted; the draft settles sent
+      notifyAccepted();
+      return true;
     }
 
     // If agent is already streaming, send as steering message
     if (isLoading) {
-      return handleSendSteering(message, additionalContext, attachmentMeta, { model, reasoningEffort, fastMode, widgetSnapshots, chartSelections, subagentsAllowed }, resendKey);
+      return handleSendSteering(message, additionalContext, attachmentMeta, { model, reasoningEffort, fastMode, widgetSnapshots, chartSelections, subagentsAllowed, reasoningEffortOverride, fastModeOverride }, resend, notifyAccepted);
     }
 
     // Store model options so HITL resume can forward them
     lastModelOptionsRef.current = { model: model || null, reasoningEffort: reasoningEffort || null, fastMode: fastMode ?? null };
 
-    // Create and add user message
+    // Create and add user message. A hidden opener has none, and its reply is
+    // the first bubble of its turn: the replay knows that reply by the flag
+    // it carries, since the empty query it stores draws no row to match.
     const turnIndex = newestKnownTurn() + 1;
-    const userMessage = createUserMessage(
-      message,
-      turnIndex,
-      attachmentMeta as AttachmentMeta[] | null,
-      widgetSnapshots ?? null,
-      chartSelections ?? null,
-    );
-    recentlySentTrackerRef.current.track(message.trim(), userMessage.timestamp, userMessage.id);
+    const userMessage = hiddenOpener ? null : createUserMessage(message, turnIndex, {
+      attachments: attachmentMeta as AttachmentMeta[] | null,
+      widgetSnapshots,
+      chartSelections,
+      id: resend.shown?.userId,
+    });
+    if (userMessage) recentlySentTrackerRef.current.track(message.trim(), userMessage.timestamp, userMessage.id);
 
     // Check if this is a new conversation
     // Only consider it a new conversation if:
@@ -2297,14 +2466,16 @@ export function useChatMessages(
     }
 
     // Add user message after history messages
-    setMessages((prev) => {
-      const newMessages = appendMessage(prev,userMessage);
-      // Update new messages start index if this is the first new message
-      if (newMessagesStartIndexRef.current === prev.length) {
-        newMessagesStartIndexRef.current = newMessages.length;
-      }
-      return newMessages;
-    });
+    if (userMessage) {
+      setMessages((prev) => {
+        const newMessages = appendMessage(prev,userMessage);
+        // Update new messages start index if this is the first new message
+        if (newMessagesStartIndexRef.current === prev.length) {
+          newMessagesStartIndexRef.current = newMessages.length;
+        }
+        return newMessages;
+      });
+    }
 
     setIsLoading(true);
     setMessageError(null);
@@ -2337,7 +2508,10 @@ export function useChatMessages(
     const abortController = new AbortController();
     mainStreamAbortRef.current = abortController;
 
-    const assistantMessage = createAssistantMessage(assistantMessageId, turnIndex);
+    const assistantMessage: AssistantMessage = {
+      ...createAssistantMessage(assistantMessageId, turnIndex),
+      ...(hiddenOpener ? { hiddenOpener: true } : {}),
+    };
 
     // Add assistant message after history messages
     setMessages((prev) => {
@@ -2352,9 +2526,12 @@ export function useChatMessages(
       threadId,
       workspaceId,
       message,
+      title: threadTitle,
       platform,
       timezone: userTimezone,
       subagentsAllowed,
+      reasoningEffortOverride,
+      fastModeOverride,
       queryClient,
       threadIdRef,
       setThreadId,
@@ -2363,23 +2540,32 @@ export function useChatMessages(
     });
     // Stopped during the pre-create round-trip: stopWorkflow already finalized
     // the UI — starting the run now would resurrect it.
-    if (created.aborted) return;
+    // DALTON-HOOK(composer-drafts): return explicit boolean send outcome across stream and error branches
+    if (created.aborted) {
+      // The user's stop, not a refusal: their message is already in the
+      // transcript, so the draft settles sent — restoring the text would show
+      // it in the input and the record at once. The boolean stays false for
+      // callers that read it as "a turn ran".
+      notifyAccepted();
+      return false;
+    }
     const effectiveThreadId = created.threadId;
 
     // One request_key per logical send, reused if this exact send is
     // retransmitted after a lost response (fingerprint match) — see
     // createRequestKeyTracker. A steer that found no turn running goes out
     // under the key it was sent with.
-    const requestKey = resendKey ?? requestKeyRef.current.take(sendFingerprint(effectiveThreadId, message));
+    const requestKey = resend.requestKey ?? requestKeyRef.current.take(sendFingerprint(effectiveThreadId, message));
     let wasDisconnected = false;
     const wasInterruptedRef = { current: false };
     const admission = trackPlainSend({
-      userId: userMessage.id as string,
+      userId: userMessage?.id ?? null,
       assistantId: assistantMessageId,
       turnIndex,
       request: { ...sendRequest(message, additionalContext, subagentsAllowed), requestKey },
       watermarkBefore,
     });
+    if (hiddenOpener) holdHiddenOpenerRetry(assistantMessageId, additionalContext);
     try {
       // Prepare refs for event handlers — use persistent subagent state
       const refs = buildStreamRefs({ isNewConversation: isNewConversationRef.current });
@@ -2388,6 +2574,17 @@ export function useChatMessages(
       const processStreamFrame = createStreamEventProcessor(runtime, streamRouterDeps, assistantMessageId, refs, getTaskIdFromEvent, wasInterruptedRef);
       const processEvent = (event: SSEEvent) => {
         admission.observe(event);
+        // DALTON-HOOK(composer-drafts): the send is accepted once the server has started its
+        // run — the main agent's metadata frame (or a recoverable failure naming the run), the
+        // same signals `admission` counts as started. The Content-Location run_id is only a
+        // pre-minted id sent before admission runs, so it must not settle the draft.
+        if (
+          !isSubagentEvent(event)
+          && (event.event === 'metadata'
+            || ((event.event === 'error' || event.event === 'retry') && event.recovery && typeof event.run_id === 'string'))
+        ) {
+          notifyAccepted();
+        }
         processStreamFrame(event);
       };
 
@@ -2427,7 +2624,8 @@ export function useChatMessages(
           backgroundReconnectRef.current = false;
           attemptReconnectAfterDisconnect(currentMessageRef.current || assistantMessageId);
         }
-        return;
+        // DALTON-HOOK(composer-drafts): report accepted send outcome to composer draft lifecycle
+        return true;
       }
 
       // Checked before the disconnect: the server drops the connection right
@@ -2435,14 +2633,22 @@ export function useChatMessages(
       // is nothing to reconnect to. A scheduled resend owns finalization.
       if (refs.retryNotice && settleRetry(refs.retryNotice, currentMessageRef.current || assistantMessageId, 0, { model, reasoningEffort, fastMode }, sendRequest(message, additionalContext, subagentsAllowed), null, admission.unstarted())) {
         wasDisconnected = true;
-        return;
+        // DALTON-HOOK(composer-drafts): scheduled retry owns the send — the server took it, the draft settles sent
+        notifyAccepted();
+        return true;
       }
 
       if (result?.disconnected && !refs.retryNotice) {
         console.log('[Send] Stream disconnected, attempting reconnect');
         wasDisconnected = true;
         attemptReconnectAfterDisconnect(assistantMessageId);
-        return;
+        // DALTON-HOOK(composer-drafts): this send resolves true (upstream's reconnect owns it), so
+        // settle the draft and the market panel's chart context together as sent. Accepted
+        // residual: a drop between the response headers and the first frame, followed by a
+        // pre-START refusal, loses this one draft — restoring it instead would risk a duplicate
+        // send whenever the run did start.
+        notifyAccepted();
+        return true;
       }
 
       // Mark message as complete (use live ref in case steering_delivered switched it)
@@ -2453,17 +2659,29 @@ export function useChatMessages(
         );
         // A send the server never started left nothing to replay, so its
         // bubbles have to outlive a reload and take no turn.
-        if (admission.refused() || refs.retryNotice?.recovery === 'resend') admission.unadmit();
-        else markTranscriptPersisted();
+        // DALTON-HOOK(composer-drafts): unstarted refusal preserves draft; accepted turn clears draft
+        if (admission.refused() || refs.retryNotice?.recovery === 'resend') {
+          admission.unadmit();
+          return false;
+        }
+        markTranscriptPersisted();
+        return true;
       }
     } catch (err: unknown) {
           // An aborted stream (user hit stop) is intentional, not a failure.
           // streamFetch normally swallows AbortError and returns { aborted },
           // but guard here too so a stop never surfaces an error banner.
+          // DALTON-HOOK(composer-drafts): user stop / duplicate adoption counts as accepted send
           if ((err as Error)?.name === 'AbortError' || wasStoppedRef.current) {
-            return;
+            return true;
           }
-          if (settleSteeredSend(err, { userId: userMessage.id as string, assistantId: assistantMessageId, turnIndex, watermarkBefore, requestKey })) return;
+          // A copy steered into another turn needs a turn running, which a
+          // hidden opener's new chat has none of.
+          if (userMessage && settleSteeredSend(err, { userId: userMessage.id, assistantId: assistantMessageId, turnIndex, watermarkBefore, requestKey })) {
+            // DALTON-HOOK(composer-drafts): the steer merged into the running turn — accepted
+            notifyAccepted();
+            return true;
+          }
           // 409 duplicate_request: an earlier copy of this send was already
           // accepted (its response was lost) — adopt that run instead of
           // erroring; the reconnect owns finalization from here.
@@ -2472,13 +2690,18 @@ export function useChatMessages(
             || adoptDuplicateRun(err, assistantMessageId, requestKey)
           ) {
             wasDisconnected = true;
-            return;
+            // DALTON-HOOK(composer-drafts): the adopted duplicate was already accepted server-side
+            notifyAccepted();
+            return true;
           }
           admission.unadmit();
           if ((err as Record<string, unknown>).status !== 429) console.error('Error sending message:', err);
           const { banner, answered } = refusalBanner(err);
           if (banner !== null) setMessageError(banner);
-          if (answered) {
+          // A hidden opener keeps its reply either way: the user has no
+          // message on screen to send again, so the failed reply is the one
+          // place the turn's Retry can live, beside the banner's reason.
+          if (answered && userMessage) {
             // When a banner with a CTA renders, drop the optimistic assistant
             // bubble so the transcript stays clean, as the `internal` SSE
             // error does. A content-less "Failed to send message" bubble
@@ -2490,6 +2713,8 @@ export function useChatMessages(
                 failAssistantMessage(msg, { message: 'Failed to send message. Please try again.' }))
             );
           }
+          // DALTON-HOOK(composer-drafts): budget admission rejection (402/429) or network error preserves draft
+          return false;
         } finally {
           // Skip cleanup on a user stop — stopWorkflow owns the teardown and a
           // second cleanup here would re-toggle loading/subagent state. Also
@@ -2532,13 +2757,19 @@ export function useChatMessages(
     if (!queued) return;
     queuedSendRef.current = null;
     setQueuedSend(false);
-    const { message, additionalContext, attachmentMeta, modelOptions, messageId } = queued;
+    const { message, additionalContext, attachmentMeta, modelOptions, messageId, onAccepted: queuedAccepted, settleQueued } = queued;
     // Drop the optimistic shimmer bubble; the send path re-adds the real one
-    // (steering shimmer if a turn is still running, else a normal user bubble).
+    // (steering shimmer if a turn is still running, else a normal user bubble)
+    // in its place, in the same batch.
     if (messageId) {
       setMessages((prev) => prev.filter((m) => m.id !== messageId));
     }
-    void handleSendMessage(message, additionalContext, attachmentMeta, modelOptions);
+    // DALTON-HOOK(composer-drafts): the flushed send inherits the parked
+    // send's acceptance callback and settles its deferred outcome, so the
+    // draft clears only on real acceptance (a metadata frame carrying a
+    // run_id and the like) and comes back when the flushed send is refused.
+    void handleSendMessage(message, additionalContext, attachmentMeta, { ...modelOptions, onAccepted: queuedAccepted }, { shown: { userId: messageId } })
+      .then(settleQueued);
     // Fires on isCompacting transitions. The send handler is captured from
     // the render where isCompacting went false — that render is the correct
     // moment to decide steer-vs-fresh. Handlers are omitted from
@@ -2564,8 +2795,9 @@ export function useChatMessages(
       if (seq < next.seq && gen === next.gen) return;
     }
     queue.shift();
+    // The send's bubble takes the waiting one's place, in the same batch.
     setMessages((prev) => prev.filter((m) => m.id !== next.steerId));
-    void handleSendMessage(next.message, next.additionalContext, next.attachmentMeta, next.modelOptions, next.requestKey);
+    void handleSendMessage(next.message, next.additionalContext, next.attachmentMeta, next.modelOptions, { requestKey: next.requestKey, shown: { userId: next.steerId } });
     // Fires when the view goes idle, a steer is answered or the workspace
     // arrives. The send handler is captured from that render, which is the
     // one that saw the view idle.
@@ -2641,7 +2873,10 @@ export function useChatMessages(
       `hitl|${threadId}|${JSON.stringify(hitlResponse)}`,
     );
     let wasDisconnected = false;
-    const { model, reasoningEffort, fastMode } = lastModelOptionsRef.current;
+    // An answer runs what the composer shows now: the model, effort and speed
+    // are the thread's own picks, which may have changed since the send that
+    // asked. With no composer mounted, the last send's.
+    const { model, reasoningEffort, fastMode } = readComposerOptions?.() ?? lastModelOptionsRef.current;
     try {
       const result = await sendHitlResponse(hitlResponse, workspaceId, threadId, {
         onEvent: processEvent,
@@ -2870,9 +3105,10 @@ export function useChatMessages(
    * at a turn the transcript already shows, a send included, so its user
    * bubble stays as it is; `spent` counts the automatic resends before it,
    * and `send` is the send they resend while the server has kept none of it.
-   * `cut` is what a fork's refusal gives back.
+   * `cut` is what a fork's refusal gives back, and `shown` the bubbles the
+   * caller already drew in its place.
    */
-  const streamFromCheckpoint = useStableHandler(async (request: TurnRequest, truncateIndex: number, snapshot: readonly ChatMessage[], modelOptions: ModelOptions = {}, rerun: { spent: number; send?: UnstartedSend | null } | null = null, cut: ForkCut | null = null) => {
+  const streamFromCheckpoint = useStableHandler(async (request: TurnRequest, truncateIndex: number, snapshot: readonly ChatMessage[], modelOptions: ModelOptions = {}, { rerun, cut, shown }: { rerun?: { spent: number; send?: UnstartedSend | null }; cut?: ForkCut | null; shown?: ShownBubbles } = {}) => {
     const { message, checkpointId, forkFromTurn, retryOf } = request;
     const viaRetryEndpoint = retryOf !== null;
     // Callers check the slot is free: an edit or regenerate already holds it
@@ -2895,7 +3131,7 @@ export function useChatMessages(
     acquireStreamOwnership(threadId);
 
     // Truncate messages and add new user message (if editing) + assistant placeholder
-    const assistantMessageId = `assistant-${Date.now()}`;
+    const assistantMessageId = shown?.assistantId ?? `assistant-${Date.now()}`;
     // Edit/regenerate opens a fresh backend run.
     beginRun();
     // A fork truncates persisted turns > forkFromTurn server-side; pin the
@@ -2920,8 +3156,18 @@ export function useChatMessages(
       ?? (plainSend && (replaced !== undefined || !rerun) ? newestKnownTurn() + 1 : null)
       ?? newestTurn(snapshot)
       ?? newestKnownTurn() + 1;
-    const assistantMessage = createAssistantMessage(assistantMessageId, turnIndex);
-    const userMessage = message && !rerun ? createUserMessage(message, turnIndex) : null;
+    // Another attempt at a hidden opener's turn, a resend or a Retry, draws its
+    // reply as the opener did, with no message above it, flagged so a replay
+    // can still find it and the turn still offers no Regenerate. Its Retry
+    // brings the context again, as the opener's did.
+    const rerunsHidden = forkFromTurn === null && (replaced?.message as Partial<AssistantMessage> | undefined)?.hiddenOpener === true;
+    const reopensHidden = plainSend && rerunsHidden;
+    const assistantMessage: AssistantMessage = {
+      ...createAssistantMessage(assistantMessageId, turnIndex),
+      ...(rerunsHidden ? { hiddenOpener: true } : {}),
+    };
+    if (rerunsHidden) holdHiddenOpenerRetry(assistantMessageId, request.additionalContext);
+    const userMessage = message && !rerun ? createUserMessage(message, turnIndex, { id: shown?.userId }) : null;
     // Another attempt at a send the server never stored keeps its message,
     // which takes the send's turn as it goes again.
     const before = snapshot[truncateIndex - 1];
@@ -2929,10 +3175,14 @@ export function useChatMessages(
     const resentUserId = resent?.userId
       ?? (rerun && plainSend && replaced?.turnIndex === null && before?.role === 'user' && before.unadmitted ? before.id : null);
     const sendUserId = userMessage?.id ?? resentUserId;
+    // Another attempt at a hidden opener is a send still, with no message of
+    // it on screen: the opener never drew one, and its reply is the bubble
+    // the server's verdict on it settles.
+    const opensSend = sendUserId !== null || reopensHidden;
     // A resend's send already counted its turn, so the count goes back to
     // where it stood before the send.
     const watermarkBefore = resent ? resent.watermarkBefore : lastRenderedTurnIndexRef.current;
-    if (sendUserId !== null && turnIndex > (watermarkBefore ?? -1)) lastRenderedTurnIndexRef.current = turnIndex;
+    if (opensSend && turnIndex > (watermarkBefore ?? -1)) lastRenderedTurnIndexRef.current = turnIndex;
 
     if (userMessage) {
       recentlySentTrackerRef.current.track(message!.trim(), userMessage.timestamp, userMessage.id);
@@ -3006,7 +3256,7 @@ export function useChatMessages(
       if (viaRetryEndpoint) return isRecoverableRetryRefusal(source) && forkRefusal.recover(source, { kind: 'retry', transcript: snapshot, draft: null, asked });
       return isStaleForkRefusal(source) && forkRefusal.recover(source, { kind: 'regenerate', transcript: snapshot, draft: null });
     };
-    const admission = sendUserId === null ? null : trackPlainSend({
+    const admission = !opensSend ? null : trackPlainSend({
       userId: sendUserId,
       assistantId: assistantMessageId,
       turnIndex,
@@ -3162,7 +3412,7 @@ export function useChatMessages(
         request,
         failedRunId: currentRunIdRef.current,
         resend: (next, truncateIndex, snapshot, nextSpent) => {
-          void streamFromCheckpoint(next, truncateIndex, snapshot, modelOptions, { spent: nextSpent, send }, cut);
+          void streamFromCheckpoint(next, truncateIndex, snapshot, modelOptions, { rerun: { spent: nextSpent, send }, cut });
         },
         holdRetry: (held) => {
           if (held) heldRetriesRef.current.set(held.bubbleId, { ...held, cut });
@@ -3194,6 +3444,7 @@ export function useChatMessages(
     cut: ForkCut,
     turnsData: ThreadTurns,
     modelOptions: ModelOptions,
+    shown: ShownBubbles,
   ) => {
     const turn = turnsData.turns.find((entry) => entry.turn_index >= turnIndex);
     if (!turn) {
@@ -3205,7 +3456,7 @@ export function useChatMessages(
       abandonForkPreflight(cut, 'Failed to process request');
       return;
     }
-    await streamFromCheckpoint(forkRequest(text, turn.edit_checkpoint_id, turnIndex), msgIndex, cut.transcript, modelOptions, null, cut);
+    await streamFromCheckpoint(forkRequest(text, turn.edit_checkpoint_id, turnIndex), msgIndex, cut.transcript, modelOptions, { cut, shown });
   };
 
   /**
@@ -3265,10 +3516,12 @@ export function useChatMessages(
     setIsLoading(true);
     setMessageError(null);
     setFallbackSuggestion(null);
+    const edited = createUserMessage(newContent, turnIndex);
+    const assistantId = `assistant-${Date.now()}`;
     setMessages((prev) => [
       ...prev.slice(0, msgIndex),
-      createUserMessage(newContent, turnIndex),
-      createAssistantMessage(`assistant-pending-${Date.now()}`, turnIndex),
+      edited,
+      createAssistantMessage(assistantId, turnIndex),
     ]);
 
     const turnsData = await getTurnCheckpoints();
@@ -3276,7 +3529,7 @@ export function useChatMessages(
       abandonForkPreflight(cut, 'Failed to process request');
       return;
     }
-    await streamEdit(newContent, turnIndex, msgIndex, cut, turnsData, modelOptions);
+    await streamEdit(newContent, turnIndex, msgIndex, cut, turnsData, modelOptions, { userId: edited.id, assistantId });
   // The slot helpers reach only refs and threadId.
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [liveMessages, threadId, getTurnCheckpoints, streamFromCheckpoint, setMessages]);
@@ -3297,6 +3550,11 @@ export function useChatMessages(
     // A reply the server never stored has no turn to run again; its Retry
     // sends its message.
     if (turnIndex === null) return;
+    // Nor does a turn that opened hidden: its words rode its send's context,
+    // which neither its stored row nor the input checkpoint a regenerate
+    // replays holds, so the rerun would answer an empty turn. The list offers
+    // it no Regenerate; this guards every other caller.
+    if (hiddenOpenerTurns(projected).has(turnIndex)) return;
 
     // A turn can render as several bubbles (a steered turn's pre-steering half
     // and continuations, the halves of a stream a reconnect resumed) but has
@@ -3323,9 +3581,10 @@ export function useChatMessages(
     setIsLoading(true);
     setMessageError(null);
     setFallbackSuggestion(null);
+    const assistantId = `assistant-${Date.now()}`;
     setMessages((prev) => [
       ...prev.slice(0, truncateIndex),
-      createAssistantMessage(`assistant-pending-${Date.now()}`, turnIndex),
+      createAssistantMessage(assistantId, turnIndex),
     ]);
 
     const turnsData = await getTurnCheckpoints();
@@ -3340,7 +3599,7 @@ export function useChatMessages(
     const turn = turnsData.turns.find((entry) => entry.turn_index === turnIndex);
     if (turn) {
       // Truncate at the turn's first assistant bubble (keep everything before it, including user msg)
-      await streamFromCheckpoint(forkRequest(null, turn.regenerate_checkpoint_id, turnIndex), truncateIndex, transcript, modelOptions, null, cut);
+      await streamFromCheckpoint(forkRequest(null, turn.regenerate_checkpoint_id, turnIndex), truncateIndex, transcript, modelOptions, { cut, shown: { assistantId } });
       return;
     }
     if (!userMessage) {
@@ -3352,7 +3611,7 @@ export function useChatMessages(
     const held = heldRetriesRef.current.get(messageId);
     if (held) {
       heldRetriesRef.current.delete(messageId);
-      await streamFromCheckpoint(held.request, truncateIndex, transcript, modelOptions, { spent: 0 }, held.cut);
+      await streamFromCheckpoint(held.request, truncateIndex, transcript, modelOptions, { rerun: { spent: 0 }, cut: held.cut, shown: { assistantId } });
       return;
     }
     // Otherwise only its text is known here, which is the whole of it only
@@ -3361,8 +3620,9 @@ export function useChatMessages(
       abandonForkPreflight(cut, 'Failed to process request');
       return;
     }
-    // The message goes again in its own place, as an edit that keeps its text.
-    await streamEdit(userMessage.content, turnIndex, userIndex, cut, turnsData, modelOptions);
+    // The message goes again in its own place, as an edit that keeps its text,
+    // and its bubble, still on screen, keeps its id.
+    await streamEdit(userMessage.content, turnIndex, userIndex, cut, turnsData, modelOptions, { userId: userMessage.id, assistantId });
   // Same as handleEditMessage: the slot helpers reach only refs and threadId.
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [liveMessages, threadId, getTurnCheckpoints, streamFromCheckpoint, setMessages]);
@@ -3387,7 +3647,7 @@ export function useChatMessages(
     if (bubbleId) heldRetriesRef.current.delete(bubbleId);
     // A held fork resend carries the fork it stands for, which a refusal of
     // it puts back.
-    await streamFromCheckpoint(request, truncateIndex, transcript, modelOptions, { spent: 0 }, held && request === held.request ? held.cut : null);
+    await streamFromCheckpoint(request, truncateIndex, transcript, modelOptions, { rerun: { spent: 0 }, cut: held && request === held.request ? held.cut : null });
   }, [liveMessages, streamFromCheckpoint]);
 
   // A PTC run's sandbox acquisition settles every folder on its computer, which
@@ -3408,8 +3668,11 @@ export function useChatMessages(
     releaseStreamOwnership,
     attachSubagentMux,
     setMarketWatch,
+    refreshMarketWatch,
+    refreshWakeups,
+    refreshCommands,
     refreshWorkspaceFolder,
-    armReportBack: () => armReportBackWatch(threadIdRef.current, null, null),
+    armReportBack: (owed) => armReportBackWatch(threadIdRef.current, null, null, undefined, owed),
     refreshWorkspaces: () => invalidateNewWorkspace(queryClient),
     // A turn other than the one this view counted for the run's bubble means
     // turns were added where the view never saw them. The stream stamps the
@@ -3452,7 +3715,9 @@ export function useChatMessages(
     awaitingReportBack,
     reportBackOwed,
     reportBackOwedThreads,
+    reportBackOwedKinds,
     workspaceStarting,
+    turnHeld,
     isCompacting,
     setIsCompacting,
     compactionTokens,
@@ -3492,6 +3757,8 @@ export function useChatMessages(
     feedbackByTurn,
     resolveSubagentIdToAgentId,
     getSubagentHistory,
+    getTaskRuns,
+    putTaskRun,
     subagentHistoryEntries,
     hydrateTaskTranscript,
     sendSubagentInstruction,

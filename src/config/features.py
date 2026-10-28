@@ -60,6 +60,24 @@ class FeatureSpec:
 
 
 FEATURES: dict[str, FeatureSpec] = {
+    "wakeups": FeatureSpec(
+        key="wakeups",
+        label="Wakeups",
+        description=(
+            "Lets the agent pick a thread back up by itself to carry on a task: "
+            "at a time, every few minutes, when a price moves, or when an order "
+            "it placed fills. Pending wakeups show in the chat tray and the "
+            "Status panel, where you can cancel any of them."
+        ),
+        enabled=True,
+        gate=FeatureGate.OPT_OUT,
+        tradeoffs=(
+            "A wakeup that fires while the thread is idle starts a turn by "
+            "itself, which costs as much as any turn; checking every 5 minutes "
+            "can take up to 24 turns over two hours. Turning this off cancels "
+            "every pending wakeup."
+        ),
+    ),
     "market_watch": FeatureSpec(
         key="market_watch",
         label="Market watch",
@@ -126,6 +144,25 @@ FEATURES: dict[str, FeatureSpec] = {
             "notes. The scratchpad and its notes are deleted when you archive "
             "the thread, so keep anything you want to last in the workspace's "
             "own files."
+        ),
+    ),
+    "provider_compaction": FeatureSpec(
+        key="provider_compaction",
+        label="Provider compaction",
+        description=(
+            "When a long thread is compacted, Claude and OpenAI models "
+            "summarize it with their provider's own compaction rather than "
+            "ours, which keeps more of what they knew: Claude keeps its "
+            "reasoning in the turns it keeps. To turn it off for one model "
+            "only, use Per-model settings on the Model tab."
+        ),
+        enabled=True,
+        gate=FeatureGate.OPT_OUT,
+        tradeoffs=(
+            "OpenAI's summary is encrypted, so only OpenAI models can read it "
+            "and the compaction card shows a plain record of the conversation "
+            "instead. Switch such a thread to another provider's model and it "
+            "gets that record, which leaves out the earlier tool results."
         ),
     ),
     "a_share_pack": FeatureSpec(

@@ -137,6 +137,42 @@ export const fixed2 = createFormatter({ minimumFractionDigits: 2, maximumFractio
 export const signedFixed2 = createFormatter({ minimumFractionDigits: 2, maximumFractionDigits: 2, useGrouping: false, signDisplay: 'exceptZero' });
 export const compactNumberFixed2 = createFormatter({ notation: 'compact', minimumFractionDigits: 2, maximumFractionDigits: 2 });
 
+// Calendar days, as a market's daily bar is dated: a `YYYY-MM-DD` with no
+// clock. Read at UTC midnight and printed in UTC, so no reader's offset moves
+// the day.
+const calendarDayRange = perLocale((locale) => new Intl.DateTimeFormat(locale, {
+  year: 'numeric', month: 'short', day: 'numeric', timeZone: 'UTC',
+}));
+export const calendarMonthDay = createDateFormatter({ month: 'short', day: 'numeric', timeZone: 'UTC' });
+
+/** `YYYY-MM-DD` as a UTC Date, or null for anything else. */
+export function parseCalendarDay(day: string): Date | null {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(day);
+  return m ? new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]))) : null;
+}
+
+/** "Oct 23", for a day whose year is said elsewhere; a string that is not a
+ *  calendar day prints as it came. */
+export function formatCalendarMonthDay(day: string, locale: string): string {
+  const date = parseCalendarDay(day);
+  return date ? calendarMonthDay(date, locale) : day;
+}
+
+/** "Oct 23, 2026"; a string that is not a calendar day prints as it came. */
+export function formatCalendarDay(day: string, locale: string): string {
+  const date = parseCalendarDay(day);
+  return date ? calendarDayRange(locale).format(date) : day;
+}
+
+/** "Oct 5 – 23, 2026": the locale decides what the two ends share. */
+export function formatCalendarDayRange(from: string, to: string, locale: string): string {
+  const a = parseCalendarDay(from);
+  const b = parseCalendarDay(to);
+  if (!a || !b) return [from, to].filter(Boolean).join(' – ');
+  // Older engines throw on a reversed range rather than printing it.
+  return a <= b ? calendarDayRange(locale).formatRange(a, b) : calendarDayRange(locale).formatRange(b, a);
+}
+
 const byteAmount = createFormatter({ maximumFractionDigits: 1 });
 const BYTE_UNITS = ['B', 'KB', 'MB', 'GB', 'TB'] as const;
 
@@ -205,4 +241,28 @@ export function relativeTime(
     return (isCount ? counts : phrases).format(n, unit);
   }
   return counts.format(0, 'second');
+}
+
+const weekdayClockTime = createDateFormatter({ weekday: 'long', hour: 'numeric', minute: '2-digit' });
+const monthDayClockTime = createDateFormatter({ month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+const fullMonthDayClockTime = createDateFormatter({ year: 'numeric', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+export const fullDateTime = createDateFormatter({ dateStyle: 'full', timeStyle: 'long' });
+
+function localDayStart(ms: number): number {
+  const d = new Date(ms);
+  d.setHours(0, 0, 0, 0);
+  return d.getTime();
+}
+
+/** A chat message's time against `now`: the clock alone today ("8:43 PM"),
+ *  the weekday within the week ("Tuesday 2:28 PM"), the date before that
+ *  ("Oct 14, 2:28 PM"), with the year only when it isn't this one. */
+export function chatTime(ms: number, locale: string, now: number): string {
+  // Rounded: a day across a DST change is 23 or 25 hours.
+  const days = Math.round((localDayStart(now) - localDayStart(ms)) / 86_400_000);
+  if (days === 0) return clockTime(ms, locale);
+  if (days > 0 && days < 7) return weekdayClockTime(ms, locale);
+  return new Date(ms).getFullYear() === new Date(now).getFullYear()
+    ? monthDayClockTime(ms, locale)
+    : fullMonthDayClockTime(ms, locale);
 }

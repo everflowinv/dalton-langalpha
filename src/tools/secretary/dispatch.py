@@ -78,12 +78,17 @@ async def _confirm_dispatch_admission(
 
 
 def _unknown_dispatch_command(
-    error: str, thread_id: str, workspace_id: str | None, tool_call_id: str
+    error: str,
+    thread_id: str,
+    workspace_id: str | None,
+    tool_call_id: str,
+    handed_to: dict | None = None,
 ) -> Command:
     """Ambiguous dispatch outcome: the reservation is retained and the run may
     already be live on ``thread_id`` — surface that id so the model checks
     agent_output before re-dispatching (a blind retry would occupy a second
-    cap slot and can produce a duplicate report-back)."""
+    cap slot and can produce a duplicate report-back). ``handed_to`` is what
+    a pre-approved hand-off's card is drawn from."""
     return Command(
         update={
             "messages": [
@@ -93,6 +98,7 @@ def _unknown_dispatch_command(
                             "success": False,
                             "error": error,
                             "outcome": "unknown_retained",
+                            **(handed_to or {}),
                             "thread_id": thread_id,
                             "workspace_id": workspace_id,
                             "note": (
@@ -110,7 +116,9 @@ def _unknown_dispatch_command(
     )
 
 
-async def _owned_workspace(workspace_id: str, user_id: str) -> dict | None:
+async def _owned_workspace(
+    workspace_id: str, user_id: str, *, is_continuation: bool = False
+) -> dict | None:
     """The workspace row when ``user_id`` owns it (or has CoS access), else None.
 
     Ownership-scoped so the hand-off card can't surface another user's
@@ -129,6 +137,7 @@ async def _owned_workspace(workspace_id: str, user_id: str) -> dict | None:
     if str(ws.get("user_id")) == user_id:
         return ws
     # --- DALTON-HOOK(workspace-sharing-settings): begin ---
+    # DALTON-HOOK(colleague-dispatch): preserve colleague workspace info on continuation so revoked access is rejected.
     from fastapi import HTTPException
     from src.dalton.settings import is_dalton_supabase_auth_enabled
 
@@ -144,6 +153,8 @@ async def _owned_workspace(workspace_id: str, user_id: str) -> dict | None:
                 "_colleague_cos_access": checked.get("_caller_cos_access", "ro"),
             }
         except HTTPException:
+            if is_continuation:
+                return {**ws, "_colleague_cos_access": "hidden"}
             return None
     # --- DALTON-HOOK(workspace-sharing-settings): end ---
     return None
@@ -207,7 +218,10 @@ async def dispatch(
         # Ownership lives on workspaces.user_id (conversation_threads has no
         # user_id column), so verify via the JOIN helper rather than reading
         # a user_id off the thread row, which is always None.
-        if err := await verify_thread_owner(thread_id, user_id, tool_call_id):
+        # DALTON-HOOK(colleague-dispatch): only thread creator (owner_only=True) can continue dispatching to thread_id.
+        if err := await verify_thread_owner(
+            thread_id, user_id, tool_call_id, owner_only=True
+        ):
             return err
         thread = await get_thread_by_id(thread_id)
         workspace_id = str(thread["workspace_id"])
@@ -216,7 +230,9 @@ async def dispatch(
         # the dispatcher's own id gets past the check below. One that is
         # no UUID matches no row, which the owner check refuses.
         workspace_id = normalize_uuid(workspace_id) or workspace_id
-    workspace = await _owned_workspace(workspace_id, user_id)
+    workspace = await _owned_workspace(
+        workspace_id, user_id, is_continuation=is_continuation
+    )
     workspace_name = workspace.get("name") if workspace else None
 
     # Any Home row, not only the dispatcher's: a turn there is never a
@@ -236,17 +252,36 @@ async def dispatch(
     if workspace is None and not is_continuation:
         return error_command("workspace not found", tool_call_id)
     # --- DALTON-HOOK(workspace-sharing-settings): begin ---
-    if workspace is not None and str(workspace.get("user_id")) != str(user_id):
+    # DALTON-HOOK(colleague-dispatch): check cos write access and colleague_dispatch feature flag, and pre-create thread with dispatched_by metadata.
+    is_colleague_ws = workspace is not None and str(workspace.get("user_id")) != str(
+        user_id
+    )
+    if is_colleague_ws:
         colleague_access = workspace.get("_colleague_cos_access") or "ro"
         if colleague_access != "rw":
             return error_command(
                 "Workspace is read-only for colleagues (cos_access=ro); cannot delegate to analyst.",
                 tool_call_id,
             )
-        return error_command(
-            "该功能下一期开放：向同事工作区派发任务将在下一期开放。",
-            tool_call_id,
-        )
+        from src.dalton.settings import is_colleague_dispatch_enabled
+
+        if not is_colleague_dispatch_enabled():
+            return error_command(
+                "该功能尚未开放（该功能下一期开放）：向同事工作区派发任务将在下一期开放。",
+                tool_call_id,
+            )
+        from fastapi import HTTPException
+        from src.dalton.sharing import require_workspace_access
+
+        try:
+            await require_workspace_access(
+                workspace, user_id, channel="cos", need="write", workspace=workspace
+            )
+        except HTTPException:
+            return error_command(
+                "Workspace is read-only for colleagues (cos_access=ro); cannot delegate to analyst.",
+                tool_call_id,
+            )
     # --- DALTON-HOOK(workspace-sharing-settings): end ---
 
     if not preapproved:
@@ -265,15 +300,51 @@ async def dispatch(
         if not approved:
             return decline_routing_command("the hand-off", response, tool_call_id)
 
-        # Apply user overrides from HITL decision (e.g. toggling report_back)
-        decisions = response.get("decisions", [])
-        if decisions:
-            overrides = decisions[0].get("overrides", {})
-            if "report_back" in overrides:
-                report_back = overrides["report_back"]
+        # The card's report-back switch, when the user moved it. A resume
+        # that names no overrides keeps what the call asked for.
+        overrides = (response.get("decisions") or [{}])[0].get("overrides")
+        if isinstance(overrides, dict) and isinstance(
+            overrides.get("report_back"), bool
+        ):
+            report_back = overrides["report_back"]
+
+    # A hand-off approved in advance has no card but the one its result
+    # draws, so a failure from here on still says where it was going. A new
+    # thread's id is left out: no thread has it unless the run starts.
+    handed_to: dict = {}
+    if preapproved:
+        handed_to = {
+            "preapproved": True,
+            "workspace_id": workspace_id,
+            "workspace_name": workspace_name,
+        }
+        if is_continuation:
+            handed_to["thread_id"] = thread_id
 
     if not is_continuation:
         thread_id = str(uuid.uuid4())
+        # DALTON-HOOK(colleague-dispatch): pre-create colleague thread with creator user_id and dispatched_by(channel="cos").
+        if is_colleague_ws:
+            from src.dalton.sharing import build_dispatched_by_meta
+            from src.server.database.conversation import create_thread
+
+            dispatched_by = await build_dispatched_by_meta(user_id, channel="cos")
+            origin_meta: dict = {
+                "origin": {
+                    "type": "agent",
+                    "id": configurable.get("thread_id"),
+                    "agent": "chief_of_staff",
+                },
+                "dispatched_by": dispatched_by,
+            }
+            await create_thread(
+                conversation_thread_id=thread_id,
+                workspace_id=workspace_id,
+                current_status="in_progress",
+                title=question[:255] if question else None,
+                metadata=origin_meta,
+                user_id=user_id,
+            )
 
     # reserve() takes a cap slot + records the PTC origin, rolling back on any
     # non-committed exit; a no-op when dispatcher_thread_id is None (report_back off).
@@ -303,7 +374,12 @@ async def dispatch(
         requested_from=requested_from.of_turn(configurable, question),
     ) as slot:
 
-        def dispatched(run_id: str | None = None, *, steered: bool = False) -> Command:
+        def dispatched(
+            run_id: str | None = None,
+            *,
+            steered: bool = False,
+            steer_id: str | None = None,
+        ) -> Command:
             # The card for a pre-approved hand-off is drawn from this result,
             # since no approval request carried the workspace's name.
             result = {
@@ -326,11 +402,15 @@ async def dispatch(
                 result["run_id"] = run_id
             if preapproved:
                 result["preapproved"] = True
-            return success_command(result, tool_call_id)
+            # The steer's row names the run that takes the hand-off in if
+            # ``run_id`` ends before reading it. The view reads it from the
+            # artifact, which the model never sees.
+            artifact = {"steer_id": steer_id} if steer_id else None
+            return success_command(result, tool_call_id, artifact=artifact)
 
         # Cap rejection or a fail-closed origin write — abort (reserve rolls back).
         if slot.error is not None:
-            return error_command(slot.error, tool_call_id)
+            return error_command(slot.error, tool_call_id, **handed_to)
         # ``rejected``: a definitive non-scheduling proof was observed — a
         # cancellation landing while the response and session close must then
         # NOT commit. ``ambiguous_error``: delivery unproven either way;
@@ -339,6 +419,7 @@ async def dispatch(
         ambiguous_error: str | None = None
         run_id: str | None = None
         steered = False
+        steer_id: str | None = None
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.post(
@@ -385,8 +466,12 @@ async def dispatch(
                             # compacting, or reporting to another Home thread.
                             # Say so, or the model reports a failure and
                             # retries into the same 409.
-                            return error_command(_THREAD_BUSY, tool_call_id)
-                        return error_command("dispatch_failed", tool_call_id)
+                            return error_command(
+                                _THREAD_BUSY, tool_call_id, **handed_to
+                            )
+                        return error_command(
+                            "dispatch_failed", tool_call_id, **handed_to
+                        )
                     if resp.status != 200:
                         # Not the endpoint's reply (it answers exactly 200;
                         # redirects are disabled): some other hop spoke —
@@ -419,6 +504,7 @@ async def dispatch(
                         else:
                             run_id = body.get("run_id")
                             steered = body.get("status") == "steered"
+                            steer_id = body.get("steer_id") if steered else None
         except asyncio.CancelledError:
             # Cancellation mid-exchange (the dispatching turn cancelled, worker
             # shutdown) is as ambiguous as a lost response: the endpoint may
@@ -432,7 +518,7 @@ async def dispatch(
             # The request provably never reached the endpoint, so rolling the
             # reservation back is safe.
             logger.error(f"PTC dispatch connection failed: {e}")
-            return error_command("dispatch_failed", tool_call_id)
+            return error_command("dispatch_failed", tool_call_id, **handed_to)
         except (aiohttp.ClientError, ValueError) as e:
             logger.error(f"PTC dispatch HTTP error: {e}")
             ambiguous_error = "dispatch_failed"
@@ -467,7 +553,7 @@ async def dispatch(
                 # retain without probing.
                 slot.commit()
                 return _unknown_dispatch_command(
-                    ambiguous_error, thread_id, workspace_id, tool_call_id
+                    ambiguous_error, thread_id, workspace_id, tool_call_id, handed_to
                 )
             try:
                 confirmed = await _confirm_dispatch_admission(
@@ -482,8 +568,8 @@ async def dispatch(
                 # The lost reply was a real acceptance of THIS request.
                 return dispatched()
             return _unknown_dispatch_command(
-                ambiguous_error, thread_id, workspace_id, tool_call_id
+                ambiguous_error, thread_id, workspace_id, tool_call_id, handed_to
             )
 
         slot.commit()
-        return dispatched(run_id, steered=steered)
+        return dispatched(run_id, steered=steered, steer_id=steer_id)

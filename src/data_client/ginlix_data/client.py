@@ -321,7 +321,14 @@ class GinlixDataClient(GinlixDataV2Routes):
         )
         resp.raise_for_status()
         body = resp.json()
-        return body.get("results", [])
+        # The route answers under ``tickers``, as the vendor's movers endpoint
+        # does, not under the ``results`` the other snapshot routes use. A body
+        # without it is a broken contract, not a quiet market: defaulting to an
+        # empty list is how reading the wrong key went unnoticed.
+        tickers = body.get("tickers") if isinstance(body, dict) else None
+        if not isinstance(tickers, list):
+            raise ValueError("movers response has no tickers list")
+        return tickers
 
     async def _v2_get(
         self, path: str, params: dict[str, Any] | None = None, *, user_id: str | None = None

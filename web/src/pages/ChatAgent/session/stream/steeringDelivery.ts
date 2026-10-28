@@ -4,8 +4,12 @@
  * the live stream and history replay draw an entry as the same row, and the
  * live fold is pinned without a stream.
  */
-import type { ChatMessage, UserMessage } from '@/types/chat';
-import { isDeliveredReport, type DeliveredSteer, type SteeringDeliveredEntry } from '@/types/sse';
+import type { ChatMessage, NotificationMessage, UserMessage } from '@/types/chat';
+import {
+  isDeliveredNotice, isDeliveredReport, isDeliveredSteer,
+  type DeliveredReport, type DeliveredSteer, type SteeringDeliveredEntry,
+} from '@/types/sse';
+import { deliveredNoticeRow } from '../wakeupEvents';
 import { reportRow, senderProvenance } from '../provenance';
 
 /** A delivery's entries, typed once where the loose event shapes are read. */
@@ -16,18 +20,36 @@ export function steeringDeliveredEntries(event: { messages?: readonly unknown[] 
 /** Which kind of row an id is minted for: each id scheme names it. */
 export type DeliveredRowKind = 'report' | 'user';
 
+/** A row a delivery draws: a steer's words or a report's caption, or a price
+ *  alert's or a wakeup's row. */
+export type DeliveredRow = UserMessage | NotificationMessage;
+
 /**
- * The row an entry is drawn as: a report's caption, or the steer's words
- * labelled with the agent that sent them or the chat app they came from.
- * Delivered steering, so it opens no turn and offers no edit. Null for an
- * entry with neither, which is what a share leaves of a report.
+ * The row an entry is drawn as: a report's caption, a price alert's or a
+ * wakeup's row, or the steer's words labelled with the agent that sent them
+ * or the chat app they came from. Delivered steering, so it opens no turn and
+ * offers no edit. Null for an entry with neither, which is what a share
+ * leaves of a report. An alert's or a wakeup's id is its notice's, not
+ * minted: the server delivers a notice once, so the live stream and every
+ * replay draw it under one id.
  */
+export function deliveredEntryRow(
+  entry: DeliveredSteer | DeliveredReport,
+  rowId: (kind: DeliveredRowKind) => string,
+  turnIndex: number | undefined,
+): UserMessage | null;
 export function deliveredEntryRow(
   entry: SteeringDeliveredEntry,
   rowId: (kind: DeliveredRowKind) => string,
   turnIndex: number | undefined,
-): UserMessage | null {
+): DeliveredRow | null;
+export function deliveredEntryRow(
+  entry: SteeringDeliveredEntry,
+  rowId: (kind: DeliveredRowKind) => string,
+  turnIndex: number | undefined,
+): DeliveredRow | null {
   const timestamp = entry.timestamp ? new Date(entry.timestamp * 1000) : new Date();
+  if (isDeliveredNotice(entry)) return deliveredNoticeRow(entry, timestamp);
   if (isDeliveredReport(entry)) {
     return reportRow(entry.report_source, {
       id: rowId('report'),
@@ -160,10 +182,12 @@ export interface SteeringDelivery {
  * Folds a live delivery into the transcript. A steer of this view's it names
  * gets no copy; the rest, which this view never held (sent elsewhere) or lost
  * on a reconnect, go after what it delivers, above any steer still waiting in
- * the turn, which the model has yet to read. Reports go ahead of the user's
- * words, as the model reads them: before the first steer this delivers, else
- * before the first still waiting in the turn (sent after the run took its
- * queue, and replay draws the report above it too), else at the end.
+ * the turn, which the model has yet to read. Reports, alerts and wakeups go
+ * ahead of the user's words, as the model reads them: before the first steer
+ * this delivers, else before the first still waiting in the turn (sent after
+ * the run took its queue, and replay draws the report above it too), else at
+ * the end. An alert or a wakeup already on screen is not drawn again: its id
+ * is its notice's, so a stream re-delivering what a replay drew finds it.
  */
 export function foldSteeringDelivery(
   prev: ChatMessage[],
@@ -171,7 +195,7 @@ export function foldSteeringDelivery(
   turnIndex: number | undefined,
   rowId: (kind: DeliveredRowKind) => string,
 ): SteeringDelivery {
-  const steers = entries.filter((e): e is DeliveredSteer => !isDeliveredReport(e));
+  const steers = entries.filter(isDeliveredSteer);
   const { messages, claimed, dropped, unclaimed } = claimDeliveredSteers(prev, steers, turnIndex);
   const errorOf = (m: ChatMessage) => (m as { queueError?: unknown }).queueError;
   const clearedErrors = [...claimed.map((c) => c.prior), ...dropped].map(errorOf)
@@ -180,10 +204,10 @@ export function foldSteeringDelivery(
     .filter((key): key is string => !!key);
   const rows = (list: readonly SteeringDeliveredEntry[]) => list
     .map((e) => deliveredEntryRow(e, rowId, turnIndex))
-    .filter((m): m is UserMessage => m !== null);
-  const reports = rows(entries.filter(isDeliveredReport));
+    .filter((m): m is DeliveredRow => m !== null && !messages.some((shown) => shown.id === m.id));
+  const ahead = rows(entries.filter((e) => !isDeliveredSteer(e)));
   const added = rows(unclaimed);
-  if (reports.length === 0 && added.length === 0) return { messages, clearedErrors, settledKeys };
+  if (ahead.length === 0 && added.length === 0) return { messages, clearedErrors, settledKeys };
   const waiting = firstWaitingSteer(messages, turnIndex);
   // A steer claimed from under an earlier turn stays where it was drawn, so
   // it places nothing.
@@ -193,7 +217,7 @@ export function foldSteeringDelivery(
   const at = inTurn.length > 0 ? Math.min(...inTurn) : waiting === -1 ? messages.length : waiting;
   const end = waiting === -1 ? messages.length : Math.max(waiting, at);
   return {
-    messages: [...messages.slice(0, at), ...reports, ...messages.slice(at, end), ...added, ...messages.slice(end)],
+    messages: [...messages.slice(0, at), ...ahead, ...messages.slice(at, end), ...added, ...messages.slice(end)],
     clearedErrors,
     settledKeys,
   };

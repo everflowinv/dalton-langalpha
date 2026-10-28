@@ -153,7 +153,8 @@ export async function loadOlderHistoryPage(
     // A copy: a re-raise the newer pages already carded stays a re-raise, and
     // a discarded page must not mark ids it never put on screen.
     renderedInterruptIdsRef: { current: renderedInterruptIds },
-    // Task ids by tool call, which are the same whichever page reads them.
+    // Task ids by tool call and each run's facts, which are the same whichever
+    // page reads them, so a page's runs are filed as it replays.
     subagentHistory: rt.subagentHistory,
     offloadBatchRef: { current: { args: 0, reads: 0, timer: null } },
   };

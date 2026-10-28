@@ -17,18 +17,23 @@ import { MessageContentSegments } from '../MessageContentSegments';
 import { SubagentTelemetryContext } from '../../SubagentTelemetryContext';
 import type { SubagentTelemetry } from '../../../session/subagents/resolveSubagentTelemetry';
 
-// Every telemetry read, in order. A notice reads once per render, so with no
-// task cards on screen this is a render count of the notices.
+// Every telemetry read, in order. The notices read once per render, and the
+// run rows that also read are stubbed below, so this is a render count of the
+// notices.
 const telemetryReads: string[] = [];
 vi.mock('../../SubagentTelemetryContext', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../SubagentTelemetryContext')>();
   return {
     ...actual,
-    useSubagentTelemetry: (id: string | undefined) => {
-      telemetryReads.push(String(id));
-      return actual.useSubagentTelemetry(id);
+    useSubagentTelemetries: (ids: readonly string[]) => {
+      telemetryReads.push(...ids);
+      return actual.useSubagentTelemetries(ids);
     },
   };
+});
+vi.mock('../SubagentRun', () => {
+  const SubagentRun = () => <div data-testid="subagent-run" />;
+  return { SubagentRun, default: SubagentRun };
 });
 
 type SegmentsProps = React.ComponentProps<typeof MessageContentSegments>;
@@ -62,11 +67,13 @@ function renderWith(telemetry: Partial<SubagentTelemetry> | undefined) {
   return render(
     <MemoryRouter>
       <SubagentTelemetryContext.Provider
-        value={() =>
-          telemetry
-            ? { toolCalls: 13, tokenUsage: { input: 0, output: 0, total: 0 }, ...telemetry }
-            : undefined
-        }
+        value={{
+          resolve: () =>
+            telemetry
+              ? { toolCalls: 13, tokenUsage: { input: 0, output: 0, total: 0 }, ...telemetry }
+              : undefined,
+          followsRuns: true,
+        }}
       >
         <MessageContentSegments {...props} />
       </SubagentTelemetryContext.Provider>
@@ -79,7 +86,7 @@ const CREDIT_STOP = {
   stopReasonType: 'credit_stop',
 };
 
-describe('MessageContentSegments — credit-stop notice placement', () => {
+describe('MessageContentSegments: credit-stop notice placement', () => {
   it('renders the notice after the closing prose, not beside the task card', () => {
     const { container } = renderWith(CREDIT_STOP);
     const notice = screen.getByTestId('subagent-credit-stop-notice');
@@ -102,19 +109,18 @@ describe('MessageContentSegments — credit-stop notice placement', () => {
   });
 });
 
-describe('MessageContentSegments — credit-stop notice while prose streams', () => {
+describe('MessageContentSegments: credit-stop notice while prose streams', () => {
   // Renders, not the work inside one: compiled, the notice caches its links on
   // the reason, so a count of that work stays flat with the memo removed.
   it('does not re-render the notices for a chunk of prose', () => {
     const telemetry = { toolCalls: 13, tokenUsage: { input: 0, output: 0, total: 0 }, ...CREDIT_STOP };
-    const resolve = (): SubagentTelemetry => telemetry;
+    const source = { resolve: (): SubagentTelemetry => telemetry, followsRuns: true };
     const at = (text: string) => (
       <MemoryRouter>
-        <SubagentTelemetryContext.Provider value={resolve}>
+        <SubagentTelemetryContext.Provider value={source}>
           <MessageContentSegments
             {...props}
             isStreaming
-            // No task records, so the cards render nothing and read nothing.
             subagentTasks={{}}
             segments={[
               { type: 'subagent_task', order: 0, subagentId: 'tc-1' },
@@ -135,6 +141,7 @@ describe('MessageContentSegments — credit-stop notice while prose streams', ()
       rerender(at(text));
     }
     expect(telemetryReads).toHaveLength(0);
-    expect(screen.getAllByTestId('subagent-credit-stop-notice')).toHaveLength(2);
+    // Both tasks stopped under one denial, which is one notice.
+    expect(screen.getAllByTestId('subagent-credit-stop-notice')).toHaveLength(1);
   });
 });

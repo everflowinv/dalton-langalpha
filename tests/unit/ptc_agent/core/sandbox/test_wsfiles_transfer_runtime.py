@@ -40,6 +40,8 @@ class _Bucket(ThreadingHTTPServer):
         self.objects: dict[str, bytes] = {}
         self.fail_500: set[str] = set()
         self.redirects: set[str] = set()
+        # Path -> how many more GETs end halfway, the length still declared whole.
+        self.cut: dict[str, int] = {}
         self.hits: dict[str, int] = {}
 
 
@@ -98,6 +100,11 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
+        if self.server.cut.get(self.path, 0) > 0:
+            self.server.cut[self.path] -= 1
+            self.wfile.write(body[: len(body) // 2])
+            self.close_connection = True
+            return
         self.wfile.write(body)
 
 
@@ -255,6 +262,20 @@ def test_scan_prior_reuse_vs_rehash(tmp_path):
     out = _scan(tmp_path, prior=wrong_size)
     assert out["reused"] == 0 and out["hashed"] == 1
 
+
+def test_an_mtime_of_zero_never_reuses_a_digest(tmp_path):
+    """A same-size rewrite at the epoch keeps (size, 0), so only the bytes can tell.
+
+    Docker uploads landed at 0 before they were stamped, and an archive can
+    unpack at 0; a row recorded then would otherwise be trusted for good."""
+    p = _write(tmp_path, "f.bin", b"new")
+    os.utime(p, ns=(0, 0))
+    stale = {"f.bin": [3, 0, _sha(b"old")]}
+    out = _scan(tmp_path, prior=stale)
+    assert out["reused"] == 0 and out["hashed"] == 1
+    assert out["entries"][0]["sha256"] == _sha(b"new")
+    one = rt.hash_one({"root": str(tmp_path), "path": "f.bin", "prior": stale["f.bin"]})
+    assert one["sha256"] == _sha(b"new")
 
 
 def test_scan_without_hashing_reads_no_file(tmp_path, monkeypatch):
@@ -623,6 +644,19 @@ def test_pull_ok_applies_mode_and_mtime(tmp_path, bucket):
 
 
 @pytest.mark.enable_socket
+@pytest.mark.parametrize("in_place", [False, True])
+def test_pull_keeps_its_own_time_for_a_recorded_mtime_of_zero(tmp_path, bucket, in_place):
+    # Stamping the 0 back, or leaving a file already at 0 where it holds the
+    # bytes, would leave it rehashed on every later scan.
+    if in_place:
+        os.utime(_write(tmp_path, "epoch.bin", b"restored"), ns=(0, 0))
+    item = _file_item(bucket, "epoch.bin", b"restored", mtime_ns=0)
+    out = rt.pull({"root": str(tmp_path), "timeout_s": 10, "items": [item]})
+    assert out["results"]["epoch.bin"]["status"] == "ok"
+    assert os.stat(tmp_path / "epoch.bin").st_mtime_ns // 1000 != 0
+
+
+@pytest.mark.enable_socket
 def test_pull_onto_the_same_bytes_fetches_nothing(tmp_path, bucket):
     data = os.urandom(64 * 1024)
     _write(tmp_path, "kept.bin", data)
@@ -647,6 +681,26 @@ def test_pull_mismatch_leaves_no_file(tmp_path, bucket):
     out = rt.pull({"root": str(tmp_path), "items": [item]})
     assert out["results"]["a.bin"]["status"] == "mismatch"
     assert not (tmp_path / "a.bin").exists()
+    assert not [p for p in os.listdir(tmp_path) if p.startswith(".wsfiles-")]
+
+
+@pytest.mark.enable_socket
+@pytest.mark.parametrize(
+    "cuts, status, hits", [(1, "ok", 2), (3, "unreachable", 3)], ids=["once", "every-time"]
+)
+def test_pull_retries_a_body_the_store_cut_short(tmp_path, bucket, cuts, status, hits):
+    """A body that ends before its Content-Length is a transfer that broke,
+    not other bytes: it is fetched again, and never reported a mismatch."""
+    data = os.urandom(1000)
+    item = _file_item(bucket, "a.bin", data, sha256=None)
+    bucket.cut[f"/{_sha(data)}"] = cuts
+    out = rt.pull({"root": str(tmp_path), "items": [item]})
+    assert out["results"]["a.bin"]["status"] == status
+    assert bucket.hits[f"/{_sha(data)}"] == hits
+    if status == "ok":
+        assert (tmp_path / "a.bin").read_bytes() == data
+    else:
+        assert not (tmp_path / "a.bin").exists()
     assert not [p for p in os.listdir(tmp_path) if p.startswith(".wsfiles-")]
 
 

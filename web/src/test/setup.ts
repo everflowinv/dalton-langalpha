@@ -2,13 +2,18 @@
 import i18n, { initI18n } from '@/i18n';
 import enUS from '@/locales/en-US.json';
 import zhCN from '@/locales/zh-CN.json';
+import enUSIntros from '@/locales/intros/en-US.json';
+import zhCNIntros from '@/locales/intros/zh-CN.json';
 import { installBrowserTraps } from './browserTraps';
 import { installJsdomShims } from './jsdomShims';
 
 // The app's i18n config with both catalogs handed over up front, so `t()`
 // returns real strings and a language switch lands before the next line. The
 // app loads catalogs on demand, which would make every switch in a test async.
-const catalogs = { 'en-US': { translation: enUS }, 'zh-CN': { translation: zhCN } };
+const catalogs = {
+  'en-US': { translation: enUS, intros: enUSIntros },
+  'zh-CN': { translation: zhCN, intros: zhCNIntros },
+};
 
 // One setup file for both environments: a test file that declares
 // `// @vitest-environment node` has no `window`, and gets the traps instead of

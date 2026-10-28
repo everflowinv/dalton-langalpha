@@ -1,7 +1,7 @@
 import { render, screen } from '@testing-library/react';
 import { describe, expect, it } from 'vitest';
 
-import { InlineCompanyOverviewCard } from '../InlineArtifactCards';
+import { InlineCompanyOverviewCard } from '../InlineCompanyOverviewCard';
 
 // Neutral placeholder names and fabricated numbers; `^GSPC` is a public
 // benchmark spelling.
@@ -33,19 +33,23 @@ describe('InlineCompanyOverviewCard', () => {
     render(<InlineCompanyOverviewCard artifact={INDEX_OVERVIEW} />);
 
     expect(screen.getByText('5,812.34')).toBeInTheDocument();
-    expect(screen.getByText('+12.30 (+0.21%)')).toBeInTheDocument();
-    expect(screen.getByText('4,950.20 - 5,880.75')).toBeInTheDocument();
+    expect(screen.getByText('+12.30')).toBeInTheDocument();
+    expect(screen.getByText('0.21%').closest('.term-chg')).toHaveAttribute('data-dir', 'up');
+    // The 52-week range, its bounds either side of the strip.
+    expect(screen.getByText('4,950.20')).toBeInTheDocument();
+    expect(screen.getByText('5,880.75')).toBeInTheDocument();
     expect(screen.queryAllByText(/\$/)).toHaveLength(0);
   });
 
-  it('leads with the local name, the English one beside it, then the ticker', () => {
+  it('leads with the local name, then the ticker and the English name beside it', () => {
     render(<InlineCompanyOverviewCard artifact={EQUITY_OVERVIEW} />);
 
     expect(screen.getByText('甲公司')).toBeInTheDocument();
-    expect(screen.getByText('Acme Holdings')).toBeInTheDocument();
-    expect(screen.getByText('ACME.HK')).toBeInTheDocument();
+    // The ticker comes first in the sub-title, so it is the last to give way.
+    expect(screen.getByText('ACME.HK').nextElementSibling).toHaveTextContent('Acme Holdings');
     expect(screen.getByText('HK$436.60')).toBeInTheDocument();
-    expect(screen.getByText('-HK$3.40 (-0.77%)')).toBeInTheDocument();
+    expect(screen.getByText('-HK$3.40')).toBeInTheDocument();
+    expect(screen.getByText('0.77%').closest('.term-chg')).toHaveAttribute('data-dir', 'down');
   });
 
   it('prints an unnamed listing\'s ticker once', () => {

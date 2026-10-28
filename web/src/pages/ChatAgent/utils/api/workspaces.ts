@@ -2,7 +2,15 @@
  * Workspace management endpoints.
  */
 import { api } from '@/api/client';
-import type { Workspace, WorkspaceQuota, WorkspacesResponse } from '@/types/api';
+import type {
+  Workspace,
+  WorkspaceCreate,
+  WorkspaceMove,
+  WorkspaceMoveError,
+  WorkspaceQuota,
+  WorkspacesResponse,
+} from '@/types/api';
+import { apiErrorObject, apiErrorStatus } from './errors';
 import { streamStatusEvents } from './statusStream';
 
 // The shared API client sets no global timeout. Workspace-management ops
@@ -13,6 +21,10 @@ const WORKSPACE_MUTATION_TIMEOUT_MS = 120000;
 
 const WORKSPACE_QUERY_TIMEOUT_MS = 15000;
 
+// A restore copies a whole workspace back onto a machine over SSH, which can
+// outlast any other workspace call.
+const FILES_RESTORE_TIMEOUT_MS = 600000;
+
 export async function getWorkspaces(limit: number = 20, offset: number = 0, sortBy: string = 'custom', includeHome: boolean = false): Promise<WorkspacesResponse> {
   const { data } = await api.get<WorkspacesResponse>('/api/v1/workspaces', {
     params: { limit, offset, sort_by: sortBy, ...(includeHome ? { include_home: true } : {}) },
@@ -20,16 +32,28 @@ export async function getWorkspaces(limit: number = 20, offset: number = 0, sort
   return data;
 }
 
-export async function createWorkspace(name: string, description: string = '', config: Record<string, unknown> = {}): Promise<Workspace> {
-  const { data } = await api.post<Workspace>('/api/v1/workspaces', { name, description, config });
+/** `computerId` puts the folder on that computer; without it the server uses the primary. */
+export async function createWorkspace(
+  name: string,
+  description: string = '',
+  config: Record<string, unknown> = {},
+  computerId?: string | null,
+): Promise<Workspace> {
+  const body: WorkspaceCreate = { name, description, config, ...(computerId ? { computer_id: computerId } : {}) };
+  const { data } = await api.post<Workspace>('/api/v1/workspaces', body);
   return data;
 }
 
-export async function deleteWorkspace(workspaceId: string) {
+/**
+ * `deleteFiles` also deletes the folder from a machine the user brought, where
+ * the server otherwise leaves it. Every other computer's folder goes regardless.
+ */
+export async function deleteWorkspace(workspaceId: string, { deleteFiles = false }: { deleteFiles?: boolean } = {}) {
   if (!workspaceId) throw new Error('Workspace ID is required');
   const id = String(workspaceId).trim();
   if (!id) throw new Error('Workspace ID cannot be empty');
-  await api.delete(`/api/v1/workspaces/${id}`);
+  const url = `/api/v1/workspaces/${id}`;
+  await (deleteFiles ? api.delete(url, { params: { delete_files: true } }) : api.delete(url));
 }
 
 export async function getWorkspace(workspaceId: string): Promise<Workspace> {
@@ -39,7 +63,7 @@ export async function getWorkspace(workspaceId: string): Promise<Workspace> {
 }
 
 /**
- * Get or create the user's Home, the workspace All workspaces runs in.
+ * Get or create the user's Home, the workspace the Chief of Staff runs in.
  * Idempotent, so safe to call on every app load.
  */
 export async function getHomeWorkspace(): Promise<Workspace> {
@@ -79,6 +103,86 @@ export async function duplicateWorkspace(workspaceId: string) {
   const { data } = await api.post(`/api/v1/workspaces/${workspaceId}/duplicate`, null, {
     timeout: WORKSPACE_MUTATION_TIMEOUT_MS,
   });
+  return data;
+}
+
+/**
+ * Move a workspace to another of the user's computers. The server answers 202
+ * once the move is accepted and runs it afterwards, so its progress and
+ * outcome are read back with `getWorkspaceMove`. A refusal is a 409 (a 404
+ * when the workspace is gone) carrying a `WorkspaceMoveError`; see
+ * `moveRefusal`. Home is refused here: it moves only with the primary.
+ *
+ * `fromBackup` restores the workspace onto the target from its backup instead
+ * of copying it off its computer, which is never contacted: the way off a
+ * machine the user brought that is gone for good. Refused with `no_backup`
+ * when there is no backup to restore from.
+ */
+export async function moveWorkspace(
+  workspaceId: string,
+  computerId: string,
+  options: { fromBackup?: boolean } = {},
+): Promise<WorkspaceMove> {
+  if (!workspaceId) throw new Error('Workspace ID is required');
+  const { data } = await api.post<WorkspaceMove>(
+    `/api/v1/workspaces/${workspaceId}/move`,
+    { computer_id: computerId, ...(options.fromBackup ? { from_backup: true } : {}) },
+    { timeout: WORKSPACE_MUTATION_TIMEOUT_MS },
+  );
+  return data;
+}
+
+/** The workspace's latest move, running or ended; null when it has never moved. */
+export async function getWorkspaceMove(workspaceId: string): Promise<WorkspaceMove | null> {
+  if (!workspaceId) throw new Error('Workspace ID is required');
+  const { data } = await api.get<WorkspaceMove | null>(`/api/v1/workspaces/${workspaceId}/move`, {
+    timeout: WORKSPACE_QUERY_TIMEOUT_MS,
+  });
+  return data ?? null;
+}
+
+/**
+ * Cancel a move while it is still copying. Answers the move as `cancelled`, or
+ * as it ended if it already had. Past copying it is refused with a 409
+ * (`not_cancellable`): the move then finishes or puts the folder back on its own.
+ */
+export async function cancelWorkspaceMove(workspaceId: string): Promise<WorkspaceMove> {
+  if (!workspaceId) throw new Error('Workspace ID is required');
+  const { data } = await api.post<WorkspaceMove>(`/api/v1/workspaces/${workspaceId}/move/cancel`, null, {
+    timeout: WORKSPACE_MUTATION_TIMEOUT_MS,
+  });
+  return data;
+}
+
+/**
+ * The coded refusal a move request got (and make-primary, which answers in
+ * the same shape), or null for any other failure. Its `message` is the
+ * server's sentence for the user.
+ */
+export function moveRefusal(err: unknown): WorkspaceMoveError | null {
+  const status = apiErrorStatus(err);
+  if (status !== 409 && status !== 404) return null;
+  const detail = apiErrorObject(err);
+  return detail && typeof detail.code === 'string' && typeof detail.message === 'string' && detail.message
+    ? (detail as unknown as WorkspaceMoveError)
+    : null;
+}
+
+/**
+ * Answer a restore offer (`files_restore_offered_at`): copy the backup back
+ * into the folder, or keep the folder empty and let the backup follow it as it
+ * is now. Restoring brings the machine up and copies every file back, so the
+ * bound is the long one. Answers the workspace with the offer cleared; a 409
+ * means no offer stands (already answered), and a machine that cannot be
+ * reached is a 503 in the sandbox-failure shape.
+ */
+export async function chooseFilesRestore(workspaceId: string, restore: boolean): Promise<Workspace> {
+  if (!workspaceId) throw new Error('Workspace ID is required');
+  const { data } = await api.post<Workspace>(
+    `/api/v1/workspaces/${workspaceId}/files/restore-choice`,
+    { restore },
+    { timeout: FILES_RESTORE_TIMEOUT_MS },
+  );
   return data;
 }
 
@@ -207,6 +311,7 @@ export interface WorkspaceSharingResponse {
   web_access: WorkspaceAccessLevel;
   is_home?: boolean;
   can_edit: boolean;
+  colleague_dispatch_enabled?: boolean;
   /** True when the workspace owner is an external member: sharing settings do
    *  not apply (admin read-only), so the UI shows a notice instead of options. */
   owner_external?: boolean;
@@ -225,7 +330,7 @@ export async function fetchWorkspaceSharing(
 
 export async function updateWorkspaceSharing(
   workspaceId: string,
-  payload: { cos_access: WorkspaceAccessLevel; web_access: WorkspaceAccessLevel },
+  payload: { cos_access?: WorkspaceAccessLevel; web_access: WorkspaceAccessLevel },
 ): Promise<WorkspaceSharingResponse> {
   const { data } = await api.put<WorkspaceSharingResponse>(
     `/api/v1/dalton/workspaces/${encodeURIComponent(workspaceId)}/sharing`,
@@ -235,3 +340,28 @@ export async function updateWorkspaceSharing(
 }
 
 // --- Threads ---
+
+// DALTON-HOOK(wiki-ingest): workspace auto-ingest switch (D1)
+// `workspaces.config.dalton_auto_ingest`: with it on, confirmed material this
+// workspace receives files itself into sales notes or the wiki with a one-line
+// receipt instead of the two-step preview. Config replaces whole, so the flag
+// rides a read-modify-write.
+
+export const AUTO_INGEST_CONFIG_KEY = 'dalton_auto_ingest';
+
+export async function fetchAutoIngest(workspaceId: string): Promise<boolean> {
+  const ws = await getWorkspace(workspaceId);
+  return ws?.config?.[AUTO_INGEST_CONFIG_KEY] === true;
+}
+
+export async function updateAutoIngest(workspaceId: string, enabled: boolean): Promise<boolean> {
+  const ws = await getWorkspace(workspaceId);
+  const config: Record<string, unknown> = { ...(ws?.config ?? {}) };
+  if (enabled) {
+    config[AUTO_INGEST_CONFIG_KEY] = true;
+  } else {
+    delete config[AUTO_INGEST_CONFIG_KEY];
+  }
+  await updateWorkspace(workspaceId, { config });
+  return enabled;
+}

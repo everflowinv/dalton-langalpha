@@ -167,13 +167,22 @@ def create_knowledge_tools(filesystem_backend: Any = None) -> list[BaseTool]:
     reconciled_workspaces: set[str] = set()
 
     async def _maybe_reconcile(
-        workspace_id: str, user_id: str, backend: Any
+        workspace_id: str,
+        user_id: str,
+        backend: Any,
+        *,
+        skip_access_check: bool = False,
     ) -> None:
         if backend is None or workspace_id in reconciled_workspaces:
             return
         reconciled_workspaces.add(workspace_id)
         try:
-            await apply_pending(workspace_id, backend, user_id=user_id)
+            await apply_pending(
+                workspace_id,
+                backend,
+                user_id=user_id,
+                skip_access_check=skip_access_check,
+            )
         except Exception as e:
             logger.debug("apply_pending skipped for %s: %s", workspace_id, e)
 
@@ -201,20 +210,29 @@ def create_knowledge_tools(filesystem_backend: Any = None) -> list[BaseTool]:
         Returns: the new version and the rendered file (or dry-run preview/diff), or the list of problems to fix.
         """
         user_id, cfg_workspace_id, thread_id, run_id = _extract_run_identity(config)
+        cfg = (config or {}).get("configurable") or {}
+        admitted_ws_id = str(cfg.get("turn_admitted_workspace_id") or "")
         target_ws_id = (str(workspace_id).strip() if workspace_id else "") or (
             cfg_workspace_id or ""
         )
         if not user_id or not target_ws_id or target_ws_id.lower() == "home":
             return "ERROR: user_id and workspace_id are required in RunnableConfig."
 
-        await verify_workspace_access(
-            target_ws_id, user_id, need="write", channel="cos"
-        )
+        # When writing to the turn's already-admitted workspace, skip redundant
+        # inner access checks so a mid-turn revocation does not break an in-flight
+        # turn; cross-workspace writes (e.g. from Home) still check channel="cos".
+        already_admitted = bool(admitted_ws_id and target_ws_id == admitted_ws_id)
+        if not already_admitted:
+            await verify_workspace_access(
+                target_ws_id, user_id, need="write", channel="cos"
+            )
         eff_backend = (
             filesystem_backend if target_ws_id == cfg_workspace_id else None
         )
         if not dry_run:
-            await _maybe_reconcile(target_ws_id, user_id, eff_backend)
+            await _maybe_reconcile(
+                target_ws_id, user_id, eff_backend, skip_access_check=True
+            )
         res = await apply_update(
             user_id=user_id,
             workspace_id=target_ws_id,
@@ -229,6 +247,7 @@ def create_knowledge_tools(filesystem_backend: Any = None) -> list[BaseTool]:
             run_id=run_id,
             tool_call_id=tool_call_id or None,
             dry_run=dry_run,
+            skip_access_check=True,
         )
         msg = str(res["message"])
         if dry_run:
@@ -272,15 +291,19 @@ def create_knowledge_tools(filesystem_backend: Any = None) -> list[BaseTool]:
         Returns: the verdict id and the agenda version it updated; agenda 更新失败时返回 verdict_saved/agenda_saved 与补救调用。
         """
         user_id, cfg_workspace_id, thread_id, run_id = _extract_run_identity(config)
+        cfg = (config or {}).get("configurable") or {}
+        admitted_ws_id = str(cfg.get("turn_admitted_workspace_id") or "")
         target_ws_id = (str(workspace_id).strip() if workspace_id else "") or (
             cfg_workspace_id or ""
         )
         if not user_id or not target_ws_id or target_ws_id.lower() == "home":
             return "ERROR: user_id and workspace_id are required in RunnableConfig."
 
-        await verify_workspace_access(
-            target_ws_id, user_id, need="write", channel="cos"
-        )
+        already_admitted = bool(admitted_ws_id and target_ws_id == admitted_ws_id)
+        if not already_admitted:
+            await verify_workspace_access(
+                target_ws_id, user_id, need="write", channel="cos"
+            )
         refs = extract_verdict_signal_refs(verdict)
         if refs:
             from src.dalton.database import watch as watch_db
@@ -290,7 +313,9 @@ def create_knowledge_tools(filesystem_backend: Any = None) -> list[BaseTool]:
         eff_backend = (
             filesystem_backend if target_ws_id == cfg_workspace_id else None
         )
-        await _maybe_reconcile(target_ws_id, user_id, eff_backend)
+        await _maybe_reconcile(
+            target_ws_id, user_id, eff_backend, skip_access_check=True
+        )
         origin_type, auto_exec_id = await _resolve_thread_origin(thread_id)
         res = await append_verdict(
             user_id=user_id,
@@ -303,6 +328,7 @@ def create_knowledge_tools(filesystem_backend: Any = None) -> list[BaseTool]:
             tool_call_id=tool_call_id or None,
             origin_type=origin_type,
             automation_execution_id=auto_exec_id,
+            skip_access_check=True,
         )
         if res.get("ok"):
             await resolve_verdict_signals(

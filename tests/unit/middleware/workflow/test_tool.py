@@ -11,7 +11,10 @@ from ptc_agent.agent.middleware.background_subagent.registry import (
 )
 from ptc_agent.agent.middleware.background_subagent.spawn import (
     NamespaceUnfenced,
+    RunLedgerUnavailable,
+    SpawnSetupError,
     SpawnStoppedError,
+    TaskRunRefused,
 )
 from ptc_agent.agent.middleware.background_subagent.workflow import tool as tool_module
 from ptc_agent.agent.middleware.background_subagent.workflow.engine import (
@@ -785,6 +788,151 @@ async def test_a_refused_admission_names_its_reason_and_drops_the_entry() -> Non
     assert message.status == "error"
     assert await dispatcher.registry.get_all_tasks() == []
     assert CapturingDriver.specs == []
+
+
+class _UnreachableBackend(FakeBackend):
+    async def aread_text(self, path: str) -> str:
+        raise ConnectionError("sandbox gone")
+
+
+class _DownStore:
+    async def aget(self, *_: Any) -> Any:
+        raise RuntimeError("store down")
+
+
+def _ledgered(ledger: FakeRunLedger) -> FakeDispatcher:
+    dispatcher = FakeDispatcher()
+    dispatcher.registry.run_ledger = ledger
+    dispatcher.middleware.checkpointer = object()
+    return dispatcher
+
+
+def _admission_raising(refusal: Exception) -> FakeDispatcher:
+    dispatcher = FakeDispatcher()
+
+    async def _refuse(task: Any, **kwargs: Any) -> str:
+        raise refusal
+
+    dispatcher.middleware.admit_task_run = _refuse
+    return dispatcher
+
+
+_TWO_RUNS = [{"task_id": "task_aaa111"}, {"task_id": "task_bbb222"}]
+
+
+@pytest.mark.parametrize(
+    ("make_tool", "args", "marked"),
+    [
+        pytest.param(
+            lambda: _make_tool(FakeBackend()),
+            {"script": "x", "workflow": "alpha"},
+            [],
+            id="two-sources",
+        ),
+        pytest.param(
+            lambda: _make_tool(FakeBackend(), prebuilt=FakePrebuilt({})),
+            {"workflow": "missing"},
+            [],
+            id="unknown-workflow",
+        ),
+        pytest.param(
+            lambda: _make_tool(FakeBackend({"work/empty.js": ""})),
+            {"script_path": "work/empty.js"},
+            [],
+            id="empty-script-path",
+        ),
+        pytest.param(
+            lambda: _make_tool(FakeBackend(), dispatcher=_ledgered(FakeRunLedger(rows=_TWO_RUNS))),
+            {"script": _script()},
+            [],
+            id="cap-reached",
+        ),
+        pytest.param(
+            lambda: _make_tool(
+                FakeBackend(),
+                dispatcher=_admission_raising(TaskRunRefused("slot taken")),
+            ),
+            {"script": _script()},
+            [],
+            id="ledger-rejected-admission",
+        ),
+        pytest.param(
+            lambda: _make_tool(_UnreachableBackend()),
+            {"script_path": "work/run.js"},
+            ["script_read_failed"],
+            id="script-path-read-failed",
+        ),
+        pytest.param(
+            lambda: _make_tool(FakeBackend(), store=_DownStore()),
+            {"workflow": "named"},
+            ["workflow_store_unavailable"],
+            id="store-down",
+        ),
+        pytest.param(
+            lambda: _make_tool(
+                FakeBackend(),
+                dispatcher=_ledgered(FakeRunLedger(error=RuntimeError("db down"))),
+            ),
+            {"script": _script()},
+            ["run_ledger_unavailable"],
+            id="ledger-unreadable",
+        ),
+        pytest.param(
+            lambda: _make_tool(
+                FakeBackend(),
+                dispatcher=_admission_raising(NamespaceUnfenced("could not be fenced")),
+            ),
+            {"script": _script()},
+            ["namespace_unfenced"],
+            id="fence-down",
+        ),
+        pytest.param(
+            lambda: _make_tool(
+                FakeBackend(),
+                dispatcher=_admission_raising(
+                    RunLedgerUnavailable("its run could not be recorded. Try again")
+                ),
+            ),
+            {"script": _script()},
+            ["run_ledger_unavailable"],
+            id="ledger-down-at-admission",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_only_our_infrastructure_failing_marks_the_run_failed(
+    monkeypatch: pytest.MonkeyPatch, make_tool: Any, args: dict[str, Any], marked: list[str]
+) -> None:
+    """Every refusal reads as an error to the model, but most are the agent's
+    own to correct; only the ones where our side did not answer count against
+    the tool's error rate."""
+    marks: list[str] = []
+    monkeypatch.setattr(
+        tool_module, "mark_tool_failed", lambda error_class, *_: marks.append(error_class)
+    )
+
+    reply = await make_tool().coroutine(**args)
+
+    assert _reads_as_a_launch_failure(getattr(reply, "content", reply))
+    assert marks == marked
+
+
+@pytest.mark.asyncio
+async def test_a_writer_that_cannot_spawn_marks_the_run_failed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _cannot_spawn(*_: Any, **__: Any) -> None:
+        raise SpawnSetupError("setup raised")
+
+    monkeypatch.setattr(tool_module, "spawn_task_writer", _cannot_spawn)
+    marks: list[str] = []
+    monkeypatch.setattr(
+        tool_module, "mark_tool_failed", lambda error_class, *_: marks.append(error_class)
+    )
+
+    await _make_tool(FakeBackend()).coroutine(script=_script())
+
+    assert marks == ["SpawnSetupError"]
 
 
 @pytest.mark.parametrize(

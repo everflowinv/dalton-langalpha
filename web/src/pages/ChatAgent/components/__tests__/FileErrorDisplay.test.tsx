@@ -69,4 +69,11 @@ describe('FileErrorDisplay', () => {
     expect(screen.getByText('filePanel.error.accessDenied')).toBeInTheDocument();
     expect(screen.getByText('filePanel.error.accessDeniedHint')).toBeInTheDocument();
   });
+
+  it('says the server\'s sentence in place of the hint', () => {
+    render(<FileErrorDisplay error={{ category: 'unknown', message: 'The machine did not accept our key.' }} />);
+    expect(screen.getByText('filePanel.error.unknown')).toBeInTheDocument();
+    expect(screen.getByText('The machine did not accept our key.')).toBeInTheDocument();
+    expect(screen.queryByText('filePanel.error.unknownHint')).not.toBeInTheDocument();
+  });
 });

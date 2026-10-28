@@ -1,4 +1,4 @@
-import React, { memo, useState } from 'react';
+import React, { memo } from 'react';
 import { Wrench } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
@@ -7,16 +7,11 @@ import { ToolIcon } from '../ToolIcon';
 import { completedToolTitle, completedToolSummary, liveToolLabel } from './activitySummary';
 import { filePathOf } from './groupFileToolRuns';
 import { classifyAgentPath } from '../../utils/agentPaths';
-import { RunningTitle, RunningIcon, SettledLine, FailedIconBadge } from './ActivityRowParts';
-import type { ToolActivityItem, PreparingToolCallData } from './activityTypes';
-
-/** Remembers that a row ran, so its settled line knows to fade in. State set
- *  during render, not a ref, so the compiler sees the memory as an input. */
-function useWasRunning(running: boolean): boolean {
-  const [ran, setRan] = useState(running);
-  if (running && !ran) setRan(true);
-  return ran || running;
-}
+import { RunningTitle, RowIcon, FailedIconBadge } from './ActivityRowParts';
+import { SwapCell } from '@/components/ui/crossfade';
+import type { ToolActivityItem, PreparingCall } from './activityTypes';
+import { ToolCallCommandState } from '../commands/CommandState';
+import { isCommandTool } from '../commands/commandWords';
 
 const RUNNING_VERB_KEY: Record<string, string> = { Read: 'read', Edit: 'edit', Write: 'write' };
 
@@ -27,7 +22,7 @@ const RUNNING_VERB_KEY: Record<string, string> = { Read: 'read', Edit: 'edit', W
 function runningLine(item: ToolActivityItem, t: (key: string) => string): { verb: string; pill: string | null } {
   const verbKey = RUNNING_VERB_KEY[item.toolName || ''];
   const filePath = verbKey ? filePathOf(item) : null;
-  if (verbKey && filePath && classifyAgentPath(filePath).kind === 'file') {
+  if (verbKey && filePath && classifyAgentPath(filePath, item.root).kind === 'file') {
     return { verb: t(`toolArtifact.running.${verbKey}`), pill: completedToolSummary(item, t) || filePath.split('/').pop() || null };
   }
   return { verb: liveToolLabel(item, t), pill: null };
@@ -48,7 +43,7 @@ export function RunningLine({ item, onOpenPill }: { item: ToolActivityItem; onOp
   );
 }
 
-export function PreparingTimelineRow({ tc }: { tc: PreparingToolCallData }): React.ReactElement {
+export function PreparingTimelineRow({ tc }: { tc: PreparingCall }): React.ReactElement {
   const { t } = useTranslation();
   const toolName = tc.toolName || '';
   const displayName = toolName ? getDisplayName(toolName, t) : t('toolArtifact.toolCall');
@@ -58,7 +53,7 @@ export function PreparingTimelineRow({ tc }: { tc: PreparingToolCallData }): Rea
   return (
     <div className="titem">
       <div className="titem-icon">
-        <RunningIcon running><IconComponent className="h-4 w-4" /></RunningIcon>
+        <RowIcon running><IconComponent className="h-4 w-4" /></RowIcon>
       </div>
       <div className="titem-body">
         <div className="titem-line">
@@ -80,7 +75,6 @@ interface ToolCallRowProps {
 
 export const ToolCallRow = memo(function ToolCallRow({ item, onClick, running = false }: ToolCallRowProps): React.ReactElement {
   const { t } = useTranslation();
-  const wasRunning = useWasRunning(running);
   const toolName = item.toolName || '';
   const args = item.toolCall?.args;
   const artifact = item.toolCallResult?.artifact;
@@ -90,7 +84,7 @@ export const ToolCallRow = memo(function ToolCallRow({ item, onClick, running = 
   const failedLabel = t('toolArtifact.a11y.toolCallFailed');
 
   // Decide the destination tab label for the pill tooltip.
-  const cat = categorizeTool(toolName, item.toolCall);
+  const cat = categorizeTool(toolName, item.toolCall, item.root);
   const isMemory = cat === 'memoryRead' || cat === 'memoryWrite';
   const tabLabel = isMemory
     ? t('filePanel.tabs.memory')
@@ -118,17 +112,19 @@ export const ToolCallRow = memo(function ToolCallRow({ item, onClick, running = 
   return (
     <div className={`titem${isFailed ? ' failed' : ''}${running ? ' running' : ''}`}>
       <div className="titem-icon" title={isFailed ? failedLabel : undefined}>
-        <RunningIcon running={running}>
+        <RowIcon running={running}>
           <ToolIcon toolName={toolName} args={args} artifact={artifact} className="h-4 w-4" style={{ color: 'var(--Labels-Secondary)' }} />
-        </RunningIcon>
-        {isFailed && <FailedIconBadge label={failedLabel} />}
+        </RowIcon>
+        <FailedIconBadge failed={isFailed} label={failedLabel} />
       </div>
       <div className="titem-body">
-        <div className="titem-line">
+        {/* The settle crossfades in place: the running verb out, the past
+            tense and its pill in, in one cell, so the row holds still. */}
+        <SwapCell swapKey={running ? 'running' : 'settled'} layerClassName="titem-line">
           {running ? (
             <RunningLine item={item} onOpenPill={onClick} />
           ) : (
-            <SettledLine wasRunning={wasRunning}>
+            <>
               {titleNode}
               {summary && (
                 <span className="titem-pill-wrap">
@@ -142,9 +138,12 @@ export const ToolCallRow = memo(function ToolCallRow({ item, onClick, running = 
                   </button>
                 </span>
               )}
-            </SettledLine>
+              {/* A call that moved to the background returned before its
+                  command ended; the row follows the command from there. */}
+              {isCommandTool(toolName) && <ToolCallCommandState toolCallId={item.toolCallId} />}
+            </>
           )}
-        </div>
+        </SwapCell>
       </div>
     </div>
   );

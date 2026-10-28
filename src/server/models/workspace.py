@@ -57,6 +57,13 @@ class WorkspaceCreate(BaseModel):
         None,
         description="Optional configuration settings",
     )
+    computer_id: Optional[uuid.UUID] = Field(
+        None,
+        description=(
+            "One of the caller's computers to create the workspace on; their "
+            "primary computer when absent"
+        ),
+    )
 
 
 class WorkspaceUpdate(BaseModel):
@@ -86,7 +93,7 @@ class WorkspaceUpdate(BaseModel):
 class WorkspaceSpecRequest(BaseModel):
     """Request model for changing a workspace's sandbox spec tier."""
 
-    tier: Literal["standard", "performance", "max"] = Field(
+    tier: Literal["standard", "performance", "max", "xlarge"] = Field(
         description="Target sandbox spec preset",
     )
 
@@ -113,7 +120,15 @@ class WorkspaceQuotaResponse(BaseModel):
 
     performance: Optional[WorkspaceCapacity] = None
     max: Optional[WorkspaceCapacity] = None
+    xlarge: Optional[WorkspaceCapacity] = None
     always_on: Optional[WorkspaceCapacity] = None
+    computers: Optional[WorkspaceCapacity] = Field(
+        None,
+        description=(
+            "Computers the user holds against the plan's cap, stopped ones "
+            "included; a machine its owner brings is never counted"
+        ),
+    )
 
 
 class WorkspaceResponse(BaseModel):
@@ -148,6 +163,22 @@ class WorkspaceResponse(BaseModel):
             "under one of them still means this workspace's folder"
         ),
     )
+    root_dir: Optional[str] = Field(
+        None,
+        description=(
+            "The root of the computer this workspace is on, where its folder "
+            "sits and where the agent's absolute paths start; given on the "
+            "detail and the list, null on the answer to a change"
+        ),
+    )
+    previous_root_dirs: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Roots of the computers this workspace moved off, newest first; "
+            "a path under one of them through its folder still means this "
+            "workspace's folder"
+        ),
+    )
     status: str = Field(
         description=(
             "Workspace status: creating, starting, running, stopping, stopped, "
@@ -178,7 +209,10 @@ class WorkspaceResponse(BaseModel):
     sort_order: int = Field(0, description="Manual sort order within pin group")
     resource_tier: str = Field(
         "standard",
-        description="Sandbox spec preset: standard, performance, max",
+        description=(
+            "Sandbox spec preset: standard (Small), performance (Medium), "
+            "max (Large), xlarge (Extra Large)"
+        ),
     )
     is_always_on: bool = Field(
         False,
@@ -191,8 +225,37 @@ class WorkspaceResponse(BaseModel):
             "records may be absent from its folder"
         ),
     )
+    files_restore_offered_at: Optional[datetime] = Field(
+        None,
+        description=(
+            "When the folder was found gone from its owner's machine while a "
+            "backup holds it. Set, the restore waits on the owner's choice "
+            "(POST files/restore-choice) and no backup of it runs"
+        ),
+    )
+    files_backed_up_at: Optional[datetime] = Field(
+        None, description="When the last complete backup of the folder ran"
+    )
+    # DALTON-HOOK(colleague-dispatch): caller's effective web access ('owner' | 'ro' | 'rw' | 'thread_only') and master switch.
+    effective_web_access: Optional[str] = Field(
+        None,
+        description="Effective web access for the requesting user: owner, ro, rw, or thread_only",
+    )
+    colleague_dispatch_enabled: Optional[bool] = Field(
+        None,
+        description="Whether colleague workspace task dispatch and chat messaging are enabled",
+    )
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class FilesRestoreChoice(BaseModel):
+    restore: bool = Field(
+        description=(
+            "True lays the backup back into the folder; False keeps the folder "
+            "as it is, and the backup then follows it"
+        )
+    )
 
 
 class WorkspaceReorderItem(BaseModel):

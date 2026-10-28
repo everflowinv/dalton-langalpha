@@ -3,7 +3,7 @@ import React, { useId, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
-import { Share2 } from 'lucide-react';
+import { AlertTriangle, Share2 } from 'lucide-react';
 import { ModalShell } from '@/components/ui/ModalShell';
 import { queryKeys } from '@/lib/queryKeys';
 import {
@@ -54,7 +54,7 @@ export function useUpdateWorkspaceSharing(workspaceId: string) {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (payload: {
-      cos_access: WorkspaceAccessLevel;
+      cos_access?: WorkspaceAccessLevel;
       web_access: WorkspaceAccessLevel;
     }) => updateWorkspaceSharing(workspaceId, payload),
     onSuccess: (updated) => {
@@ -88,6 +88,7 @@ export function WorkspaceSharingModal({
 
   const cosAccess: WorkspaceAccessLevel = data?.cos_access ?? 'ro';
   const webAccess: WorkspaceAccessLevel = data?.web_access ?? 'hidden';
+  const dispatchEnabled = data?.colleague_dispatch_enabled === true;
   // External-owned workspaces ignore sharing settings entirely (admins see them
   // read-only), so the modal explains that instead of offering options.
   const ownerExternal = data?.owner_external === true;
@@ -107,7 +108,9 @@ export function WorkspaceSharingModal({
   const handleSave = () => {
     if (!canEdit || mutation.isPending) return;
     mutation.mutate(
-      { cos_access: draftCos, web_access: draftWeb },
+      dispatchEnabled
+        ? { web_access: draftWeb }
+        : { cos_access: draftCos, web_access: draftWeb },
       {
         onSuccess: () => {
           setOpen(false);
@@ -200,39 +203,49 @@ export function WorkspaceSharingModal({
                 </p>
               ) : (
                 <>
-                  <fieldset
-                    className="flex flex-col gap-2"
-                    disabled={!canEdit || mutation.isPending}
-                    data-testid="sharing-cos-fieldset"
-                  >
-                    <legend
-                      className="text-xs font-medium mb-1"
+                  {dispatchEnabled ? (
+                    <p
+                      className="text-xs"
                       style={{ color: 'var(--color-text-secondary)' }}
+                      data-testid="sharing-cos-settings-hint"
                     >
-                      {t('dalton.sharing.cosLabel', '别人的 Chief of Staff')}
-                    </legend>
-                    <div className="flex items-center gap-4">
-                      {ACCESS_OPTIONS.map((opt) => (
-                        <label
-                          key={`cos-${opt.value}`}
-                          className={`inline-flex items-center gap-1.5 text-xs ${
-                            canEdit ? 'cursor-pointer' : 'cursor-not-allowed opacity-60'
-                          }`}
-                        >
-                          <input
-                            type="radio"
-                            name="cos_access"
-                            value={opt.value}
-                            checked={draftCos === opt.value}
-                            disabled={!canEdit || mutation.isPending}
-                            onChange={() => setDraftCos(opt.value)}
-                            data-testid={`sharing-cos-${opt.value}`}
-                          />
-                          <span>{t(opt.labelKey, opt.labelZh)}</span>
-                        </label>
-                      ))}
-                    </div>
-                  </fieldset>
+                      {t('dalton.sharing.cosManagedInSettingsHint')}
+                    </p>
+                  ) : (
+                    <fieldset
+                      className="flex flex-col gap-2"
+                      disabled={!canEdit || mutation.isPending}
+                      data-testid="sharing-cos-fieldset"
+                    >
+                      <legend
+                        className="text-xs font-medium mb-1"
+                        style={{ color: 'var(--color-text-secondary)' }}
+                      >
+                        {t('dalton.sharing.cosLabel', '别人的研究总监')}
+                      </legend>
+                      <div className="flex items-center gap-4">
+                        {ACCESS_OPTIONS.map((opt) => (
+                          <label
+                            key={`cos-${opt.value}`}
+                            className={`inline-flex items-center gap-1.5 text-xs ${
+                              canEdit ? 'cursor-pointer' : 'cursor-not-allowed opacity-60'
+                            }`}
+                          >
+                            <input
+                              type="radio"
+                              name="cos_access"
+                              value={opt.value}
+                              checked={draftCos === opt.value}
+                              disabled={!canEdit || mutation.isPending}
+                              onChange={() => setDraftCos(opt.value)}
+                              data-testid={`sharing-cos-${opt.value}`}
+                            />
+                            <span>{t(opt.labelKey, opt.labelZh)}</span>
+                          </label>
+                        ))}
+                      </div>
+                    </fieldset>
+                  )}
 
                   <fieldset
                     className="flex flex-col gap-2"
@@ -267,6 +280,32 @@ export function WorkspaceSharingModal({
                       ))}
                     </div>
                   </fieldset>
+
+                  {draftWeb === 'rw' && (
+                    <div
+                      data-testid="sharing-web-rw-warning"
+                      className="flex flex-col gap-1.5 rounded-md border px-3 py-2.5 text-xs"
+                      style={{
+                        borderColor: 'var(--color-warning, #f59e0b)',
+                        backgroundColor: 'rgba(245, 158, 11, 0.08)',
+                        color: 'var(--color-text-secondary)',
+                      }}
+                    >
+                      <div className="flex items-start gap-2 font-medium">
+                        <AlertTriangle
+                          className="h-4 w-4 shrink-0 mt-0.5"
+                          style={{ color: 'var(--color-warning, #f59e0b)' }}
+                        />
+                        <span>{t('dalton.sharing.webRwWarningTitle')}</span>
+                      </div>
+                      <p className="text-xs opacity-90 pl-6">
+                        {t('dalton.sharing.webDescRw')}
+                      </p>
+                      <p className="text-xs whitespace-pre-line pl-6">
+                        {t('dalton.sharing.webRwWarningBody')}
+                      </p>
+                    </div>
+                  )}
                 </>
               )}
 

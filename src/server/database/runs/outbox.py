@@ -7,8 +7,20 @@ lease reclaim as crash recovery, effect-before-ack retry safety).
 """
 
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    List,
+    Mapping,
+    NamedTuple,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+)
 
 from psycopg.rows import dict_row
 
@@ -24,6 +36,16 @@ from src.server.database.runs.hook_jobs import (  # noqa: F401
     build_finalize_jobs,
     build_finalize_jobs_from_run_row,
 )
+from src.server.database.market_targets import MARKET_TARGET_OWED_SQL
+from src.server.database.runs.command_runs import COMMAND_OWED_SQL
+from src.server.database.runs.command_runs import HOOK_TYPE as COMMAND_REPORT_HOOK
+from src.server.database.runs.command_runs import NOTICE_HOOK_TYPE as COMMAND_NOTICE_HOOK
+from src.server.database.runs.command_runs import (
+    notice_ordering_key as command_notice_key,
+)
+from src.server.database.market_targets import ordering_key as market_target_key
+from src.server.database.wakeups.contract import WAKEUP_OWED_SQL
+from src.server.database.wakeups.contract import ordering_key as wakeup_key
 from src.server.utils.pg_sanitize import SafeJson
 
 # Advisory-lock class (int32) for per-ordering-key claim serialization.
@@ -33,12 +55,15 @@ _OKEY_LOCK_CLASS = 0x484F4F4B  # 'HOOK'
 
 
 async def enqueue_hooks(
-    conn, *, run_id: str, thread_id: str, jobs: List[HookJob]
+    conn, *, run_id: Optional[str] = None, thread_id: str, jobs: List[HookJob]
 ) -> None:
-    """Write outbox rows on the caller's (finalize) transaction.
+    """Write outbox rows on the caller's transaction: a run's finalize, or a
+    transition with no run that makes a notice due (a wakeup's fire).
 
     ON CONFLICT DO NOTHING on idempotency_key: re-finalizing after a lost
-    race never double-registers an effect.
+    race never double-registers an effect. Each row is dated by the clock,
+    not by the transaction, so jobs one transaction writes on a key run in
+    the order written.
     """
     async with conn.cursor() as cur:
         for job in jobs:
@@ -46,9 +71,9 @@ async def enqueue_hooks(
                 """
                 INSERT INTO hook_outbox (
                     run_id, conversation_thread_id, hook_type,
-                    payload, ordering_key, idempotency_key
+                    payload, ordering_key, idempotency_key, created_at
                 )
-                VALUES (%s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, clock_timestamp())
                 ON CONFLICT (idempotency_key) DO NOTHING
                 """,
                 (
@@ -127,6 +152,77 @@ _STEER_SAFETY_NET_SQL = """(
 )"""
 
 
+def _sql_list(values: Tuple[str, ...]) -> str:
+    return "(" + ", ".join(f"'{v}'" for v in values) + ")"
+
+
+class _Alert(NamedTuple):
+    #: Whether the notice of the job ``o`` is still owed, as its executor
+    #: decides it.
+    owed_sql: str
+    #: The key a thread's notices of this type run in order under.
+    ordering_key: Callable[[str], str]
+    #: Whether a wake turn delivers it when no live turn takes it in. One
+    #: that does not is never due: a turn's ending only drops a hold on it.
+    wakes: bool = True
+
+
+# The notices a thread is owed by its own watchers, each a job a live turn
+# takes in as a report: a price target's (``market_target``, draining) and a
+# wakeup's, which a wake turn delivers otherwise, and a background command's
+# held for the thread's next turn (``command_notice``), which waits for one,
+# since a turn of its own would start the computer again. Held for the
+# thread's next turn rather than dead-lettered at the attempts ceiling.
+# Every statement on alerts reads its types and their owed predicates from
+# here.
+_ALERTS: Dict[str, _Alert] = {
+    "market_target": _Alert(MARKET_TARGET_OWED_SQL, market_target_key),
+    "wakeup": _Alert(WAKEUP_OWED_SQL, wakeup_key),
+    COMMAND_NOTICE_HOOK: _Alert(COMMAND_OWED_SQL, command_notice_key, wakes=False),
+}
+ALERT_HOOK_TYPES = tuple(_ALERTS)
+_ALERT_TYPES_SQL = _sql_list(ALERT_HOOK_TYPES)
+_SILENT_ALERT_TYPES_SQL = _sql_list(tuple(t for t, a in _ALERTS.items() if not a.wakes))
+
+
+def alert_ordering_keys(thread_id: str) -> List[str]:
+    """The keys a thread's alerts run under, one per type."""
+    return [alert.ordering_key(str(thread_id)) for alert in _ALERTS.values()]
+
+
+def waiting_alert_sql(a: str) -> str:
+    """An alert its executor gave up waking the thread for
+    (``_exhaust_alerts``), parked until the thread's next turn takes it in or
+    a turn's ending makes it due. ``a`` is the hook_outbox alias."""
+    return (
+        f"({a}.hook_type IN {_ALERT_TYPES_SQL} AND {a}.status = 'pending'"
+        f" AND {a}.next_retry_at = 'infinity'::timestamptz"
+        f" AND {a}.payload ? 'exhausted')"
+    )
+
+
+def _owed_sql(owed: Dict[str, str]) -> str:
+    """Whether the notice of the job ``o`` is still owed, by its type's own
+    predicate; a type with none is not."""
+    return (
+        "(CASE o.hook_type\n"
+        + "".join(f"    WHEN '{t}' THEN {sql}\n" for t, sql in owed.items())
+        + "    ELSE false\nEND)"
+    )
+
+
+_ALERT_OWED_SQL = _owed_sql({t: a.owed_sql for t, a in _ALERTS.items()})
+
+# The dead jobs ``revive_dead_alerts`` makes due again while still owed: the
+# alerts that wake a thread, and a command's report, which a build that
+# predates commands knows no executor for.
+_REVIVED_OWED = {t: a.owed_sql for t, a in _ALERTS.items() if a.wakes} | {
+    COMMAND_REPORT_HOOK: COMMAND_OWED_SQL
+}
+_REVIVED_TYPES_SQL = _sql_list(tuple(_REVIVED_OWED))
+_REVIVED_OWED_SQL = _owed_sql(_REVIVED_OWED)
+
+
 async def claim_outbox_jobs(
     limit: int = 10,
     lease_seconds: int = 60,
@@ -175,6 +271,10 @@ async def claim_outbox_jobs(
     ``next_retry_at`` (``_STEER_DUE_SQL``). A parked one is also due once its
     owner is over and nothing will take it in (``_STEER_SAFETY_NET_SQL``), so
     its release does not hang on any one finalize path running to the end.
+
+    A waiting alert (``waiting_alert_sql``) blocks nothing behind it: it is
+    not claimable, and a later notice's wake is the turn that would take it
+    in.
     """
     excluded = list(excluded_hook_types or [])
     async with pool.get_db_connection() as conn:
@@ -204,7 +304,8 @@ async def claim_outbox_jobs(
                             (p.status = 'claimed'
                              AND p.lease_expires_at > NOW())
                             OR (
-                              (p.status = 'pending'
+                              ((p.status = 'pending'
+                                AND NOT {waiting_alert_sql("p")})
                                OR (p.status = 'claimed'
                                    AND p.lease_expires_at <= NOW()))
                               AND (p.created_at, p.hook_outbox_id)
@@ -259,7 +360,8 @@ async def claim_outbox_jobs(
                                     (p.status = 'claimed'
                                      AND p.lease_expires_at > NOW())
                                     OR (
-                                      (p.status = 'pending'
+                                      ((p.status = 'pending'
+                                        AND NOT {waiting_alert_sql("p")})
                                        OR (p.status = 'claimed'
                                            AND p.lease_expires_at <= NOW()))
                                       AND (p.created_at, p.hook_outbox_id)
@@ -354,18 +456,24 @@ async def park_exhausted_jobs(*, max_attempts: int = 5) -> List[Dict[str, Any]]:
     normally parks dead) is reclaimable forever; the claim ceiling alone
     would instead leave it claimed-expired forever, wedging its ordering
     chain. Dead report_backs get their watch_clear compensation in the
-    same atomic statement. A steer is settled instead (``_exhaust_steers``),
-    in the same transaction. Returns the parked rows, a steer's with the
-    status it was settled to (done, or pending for the user's).
+    same atomic statement. A steer is settled instead (``_exhaust_steers``)
+    and an alert held for its thread's next turn (``_exhaust_alerts``), in
+    the same transaction. Returns the parked rows,
+    a steer's or an alert's with the status it was settled to (done, or
+    pending).
     """
+    expired_at_ceiling = (
+        "o.status = 'claimed' AND o.lease_expires_at <= NOW()"
+        " AND o.attempts >= %(max)s"
+    )
     async with pool.get_db_connection() as conn:
         async with conn.transaction():
             async with conn.cursor(row_factory=dict_row) as cur:
                 steers = await _exhaust_steers(
-                    cur,
-                    "o.status = 'claimed' AND o.lease_expires_at <= NOW()"
-                    " AND o.attempts >= %(max)s",
-                    {"max": max_attempts},
+                    cur, expired_at_ceiling, {"max": max_attempts}
+                )
+                alerts = await _exhaust_alerts(
+                    cur, expired_at_ceiling, {"max": max_attempts}
                 )
                 await cur.execute(
                     f"""
@@ -374,7 +482,7 @@ async def park_exhausted_jobs(*, max_attempts: int = 5) -> List[Dict[str, Any]]:
                         SET status = 'dead', lease_expires_at = NULL,
                             completed_at = NOW()
                         WHERE status = 'claimed'
-                          AND hook_type <> 'steer'
+                          AND hook_type NOT IN {_sql_list(("steer", *ALERT_HOOK_TYPES))}
                           AND lease_expires_at <= NOW()
                           AND attempts >= %s
                         RETURNING *
@@ -385,7 +493,7 @@ async def park_exhausted_jobs(*, max_attempts: int = 5) -> List[Dict[str, Any]]:
                     (max_attempts,),
                 )
                 rows = await cur.fetchall()
-                return [dict(r) for r in rows] + steers
+                return [dict(r) for r in rows] + steers + alerts
 
 
 async def revive_dead_cleanup_jobs(
@@ -427,6 +535,215 @@ async def revive_dead_cleanup_jobs(
             )
             rows = await cur.fetchall()
             return [dict(r) for r in rows]
+
+
+# Every column but next_retry_at, which psycopg cannot load as 'infinity'.
+_PARKED_RETURNING_SQL = """o.hook_outbox_id, o.run_id, o.conversation_thread_id,
+    o.hook_type, o.payload, o.ordering_key, o.idempotency_key, o.status,
+    o.attempts, o.created_at, o.completed_at"""
+
+
+async def _exhaust_alerts(
+    cur, where: str, params: Dict[str, Any]
+) -> List[Dict[str, Any]]:
+    """Hold the alerts matching ``where`` for their thread's next turn, in
+    the caller's transaction, instead of letting them go dead.
+
+    Parked pending, so a live turn takes the notice in as a report owed to
+    the thread, and a turn's ending makes it due for its executor to look
+    again. ``exhausted`` stays for good: it keeps the parked row from
+    blocking its chain, lets the closing sweep close it once its notice is
+    no longer owed, and tells its executor that one more refusal holds it
+    again rather than starting a fresh round of retries, so each further
+    claim waits on another turn's ending. Leaves ``attempts`` alone, the
+    fence token: a pending row has no claim ceiling, and every way back from
+    claimed at the ceiling holds it here again. A wakeup's riders
+    (``wakeups/riders.py``) are held with it in the same statement, since
+    the turn that refused the head would refuse them too; each keeps the
+    head it rode (``rode``), whose wake may yet turn out admitted. The head
+    is locked before its riders, and they in id order, as the wakeups
+    contract orders every lock on a wake's jobs. Needs a ``dict_row``
+    cursor; returns the rows as held."""
+    await cur.execute(
+        f"""
+        WITH held AS (
+            UPDATE hook_outbox o
+            SET status = 'pending',
+                lease_expires_at = NULL,
+                next_retry_at = 'infinity'::timestamptz,
+                payload = (o.payload - 'steered_run_id' - 'due_at' - 'riders')
+                    || jsonb_build_object('exhausted', true)
+            WHERE o.hook_type IN {_ALERT_TYPES_SQL} AND {where}
+            RETURNING {_PARKED_RETURNING_SQL}
+        ),
+        riders AS (
+            UPDATE hook_outbox r
+            SET next_retry_at = 'infinity'::timestamptz,
+                payload = (r.payload - 'rides' - 'steered_run_id' - 'due_at')
+                    || jsonb_build_object(
+                        'exhausted', true, 'rode', r.payload->>'rides')
+            WHERE r.hook_outbox_id IN (
+                SELECT x.hook_outbox_id FROM hook_outbox x
+                WHERE x.hook_type = 'wakeup' AND x.status = 'pending'
+                  -- A rider is on its head's chain. Read through that, so
+                  -- the park sweep, which runs this with nothing held on
+                  -- nearly every pass, scans no other thread's jobs.
+                  AND x.ordering_key IN (
+                      SELECT h.ordering_key FROM held h
+                      WHERE h.hook_type = 'wakeup')
+                  AND x.payload->>'rides' IN (
+                      SELECT h.hook_outbox_id::text FROM held h
+                      WHERE h.hook_type = 'wakeup')
+                ORDER BY x.hook_outbox_id
+                FOR UPDATE
+            )
+        )
+        SELECT * FROM held
+        """,
+        params,
+    )
+    return [dict(r) for r in await cur.fetchall()]
+
+
+async def exhaust_alert(job_id: str, *, attempts: int) -> bool:
+    """Hold a claimed alert whose wake was refused for its thread's next
+    turn (``_exhaust_alerts``), fenced to the caller's lease. False when the
+    fence was lost: another owner has the job."""
+    async with pool.get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            held = await _exhaust_alerts(
+                cur,
+                "o.hook_outbox_id = %(job_id)s::uuid AND o.status = 'claimed'"
+                " AND o.attempts = %(attempts)s",
+                {"job_id": job_id, "attempts": attempts},
+            )
+            return bool(held)
+
+
+# How many times ``revive_dead_alerts`` brought the alert ``o`` back. Read
+# only as a number, so a value of any other type cannot fail the statement.
+_ALERT_REVIVALS_SQL = """(CASE WHEN jsonb_typeof(o.payload->'revived') = 'number'
+    THEN (o.payload->>'revived')::int ELSE 0 END)"""
+
+
+async def revive_dead_alerts(
+    *, cooldown_seconds: int = 600, window_seconds: int = 86400, max_revivals: int = 2
+) -> List[Dict[str, Any]]:
+    """Make a dead alert, or a dead command report, whose notice is still
+    owed due again.
+
+    This build holds an alert rather than dead-lettering it, but a build
+    that predates the hold, or one that knows no such job type, kills it at
+    the attempts ceiling: across a blue/green cutover the old color's
+    drainer nacks a job it cannot run until it dies, and this build never
+    tried its wake. Revived due, its executor here tries one, and a refusal
+    holds it as any other (at once when its attempts are past the ceiling).
+    Only a row dead for ``cooldown_seconds`` comes back, so an old color
+    still draining is less likely to kill it again, and ``revived`` counts
+    revivals up to ``max_revivals``, so one it keeps killing stays dead. Only
+    rows that died within ``window_seconds`` are read, which keeps the scan
+    on the terminal-age index. ``attempts`` is kept, the fence token. A
+    single guarded UPDATE, so every worker may run it at once: a second one
+    waiting on the row finds it no longer dead."""
+    async with pool.get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                f"""
+                UPDATE hook_outbox o
+                SET status = 'pending',
+                    lease_expires_at = NULL,
+                    completed_at = NULL,
+                    next_retry_at = NOW(),
+                    payload = (o.payload - 'steered_run_id' - 'due_at')
+                        || jsonb_build_object('revived', {_ALERT_REVIVALS_SQL} + 1)
+                WHERE o.status = 'dead'
+                  AND o.hook_type IN {_REVIVED_TYPES_SQL}
+                  AND COALESCE(o.completed_at, o.created_at)
+                      <= NOW() - make_interval(secs => %(cooldown)s::float)
+                  AND COALESCE(o.completed_at, o.created_at)
+                      > NOW() - make_interval(secs => %(window)s::float)
+                  AND {_ALERT_REVIVALS_SQL} < %(max)s
+                  AND {_REVIVED_OWED_SQL}
+                RETURNING o.hook_outbox_id, o.conversation_thread_id,
+                          o.ordering_key, o.payload
+                """,
+                {
+                    "cooldown": cooldown_seconds,
+                    "window": window_seconds,
+                    "max": max_revivals,
+                },
+            )
+            return [dict(r) for r in await cur.fetchall()]
+
+
+# No turn will come on the thread of the job ``o``: it is archived, or its
+# workspace was deleted.
+NO_TURN_SQL = """EXISTS (
+    SELECT 1 FROM conversation_threads c
+    LEFT JOIN workspaces w ON w.workspace_id = c.workspace_id
+    WHERE c.conversation_thread_id = o.conversation_thread_id
+      AND (c.archived_at IS NOT NULL OR w.status = 'deleted')
+)"""
+
+
+# How long a command's notice waits for its thread's next turn.
+COMMAND_NOTICE_TTL_DAYS = 7
+
+
+async def close_unowed_waiting_alerts() -> List[Dict[str, Any]]:
+    """Close the alerts no turn will take in: a waiting one whose notice is
+    no longer owed (a reminder whose target fired, expired or was cancelled
+    since), and any pending one on a thread that is archived or whose
+    workspace was deleted, held or merely parked. That includes a command's
+    notice held for such a thread's next turn: no executor ever claims one,
+    so nothing else would. So is one a week old, for a thread nobody came
+    back to: a pending row costs every claim's scan, and a command that old
+    no longer bears on the thread's next turn.
+
+    Closed as their executor would drop them, without waiting on a turn the
+    thread may never get. A wakeup's notice still owed there is made due
+    instead: its executor ends the wakeup before dropping it, which archive
+    and workspace delete only try once, and closing it here would leave the
+    wakeup open with its fire lost. One a turn holds is left to that turn's
+    confirm or ending. A deleted thread takes its rows with it, and an owner
+    who turned the feature off is read at the turn or the claim that would
+    show the notice. Guarded UPDATEs, so every worker may run them at once;
+    the row lock orders each against a turn's hold and a claim."""
+    async with pool.get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                f"""
+                UPDATE hook_outbox h SET next_retry_at = NOW()
+                WHERE h.hook_outbox_id IN (
+                    SELECT o.hook_outbox_id FROM hook_outbox o
+                    WHERE o.hook_type = 'wakeup' AND o.status = 'pending'
+                      AND o.next_retry_at = 'infinity'::timestamptz
+                      AND NOT (o.payload ? 'steered_run_id')
+                      AND {NO_TURN_SQL} AND {WAKEUP_OWED_SQL}
+                    ORDER BY (o.payload ? 'rides'), o.hook_outbox_id
+                    FOR UPDATE SKIP LOCKED
+                )
+                """
+            )
+            await cur.execute(
+                f"""
+                UPDATE hook_outbox o
+                SET status = 'done', completed_at = NOW(), next_retry_at = NULL
+                WHERE o.hook_type IN {_ALERT_TYPES_SQL}
+                  AND o.status = 'pending'
+                  AND NOT (o.payload ? 'steered_run_id')
+                  AND (
+                    ({waiting_alert_sql("o")} AND NOT {_ALERT_OWED_SQL})
+                    OR ({NO_TURN_SQL}
+                        AND (o.hook_type <> 'wakeup' OR NOT {_ALERT_OWED_SQL}))
+                    OR (o.hook_type = '{COMMAND_NOTICE_HOOK}'
+                        AND o.created_at < NOW() - make_interval(days => {COMMAND_NOTICE_TTL_DAYS}))
+                  )
+                RETURNING o.hook_outbox_id, o.conversation_thread_id,
+                          o.ordering_key, o.payload
+                """
+            )
+            return [dict(r) for r in await cur.fetchall()]
 
 
 async def purge_terminal_jobs(
@@ -504,14 +821,16 @@ async def nack_outbox_job(
     reclaiming owner's live lease (a fence-lost nack also never
     compensates a live job). A report_back going dead gets its watch_clear
     compensation in the same atomic statement; a steer at the ceiling is
-    settled instead (``_exhaust_steers``). Returns the new status
-    (``'exhausted'`` for that steer), or None if the fence was lost."""
+    settled instead (``_exhaust_steers``), and an alert held
+    for its thread's next turn (``_exhaust_alerts``). Returns the new status
+    (``'exhausted'`` for either), or None if the fence was lost."""
     async with pool.get_db_connection() as conn:
         async with conn.transaction():
             async with conn.cursor(row_factory=dict_row) as cur:
-                if await _exhaust_steers(
-                    cur, _AT_CEILING_SQL, _fence_params(job_id, attempts, max_attempts)
-                ):
+                fence = _fence_params(job_id, attempts, max_attempts)
+                if await _exhaust_steers(cur, _AT_CEILING_SQL, fence):
+                    return "exhausted"
+                if await _exhaust_alerts(cur, _AT_CEILING_SQL, fence):
                     return "exhausted"
                 await cur.execute(
                     f"""
@@ -617,9 +936,20 @@ async def extend_job_lease(job_id: str, lease_seconds: int, *, attempts: int) ->
                 return cur.rowcount > 0
 
 
+@dataclass(frozen=True)
+class FencedJob:
+    """A job ``fenced_job_guard`` holds: its row as fenced, and the cursor of
+    the transaction holding it, for statements that must commit under the
+    same fence."""
+
+    row: Dict[str, Any]
+    cur: Any
+
+
 @asynccontextmanager
 async def fenced_job_guard(job_id: str, attempts: int, *, lease_seconds: int = 60):
-    """Key-lock + row-lock fence for an external teardown: yields ownership.
+    """Key-lock + row-lock fence for an external teardown: yields the job
+    (``FencedJob``) while owned.
 
     Holds BOTH the per-key advisory xact lock (no sibling claim on the
     ordering key can even be gated while a teardown is in flight — the
@@ -630,17 +960,18 @@ async def fenced_job_guard(job_id: str, attempts: int, *, lease_seconds: int = 6
     a sibling claim may already have been admitted on the strength of that
     expiry. On owned exit the lease is renewed with fresh runway so the
     park sweep waiting on the row lock can't dead-letter a job its owner
-    is still executing. Yields False (fence lost) when not owned; the
+    is still executing. Yields None (fence lost) when not owned; the
     caller must do NO teardown.
     """
     async with pool.get_db_connection() as conn:
         async with conn.transaction():
             async with conn.cursor(row_factory=dict_row) as cur:
-                owned = False
+                owned: Optional[FencedJob] = None
                 if await _lock_job_ordering_key(cur, job_id):
                     await cur.execute(
                         """
-                        SELECT 1 FROM hook_outbox
+                        SELECT hook_outbox_id, hook_type, payload, ordering_key
+                        FROM hook_outbox
                         WHERE hook_outbox_id = %s AND status = 'claimed'
                           AND attempts = %s
                           AND lease_expires_at > clock_timestamp()
@@ -648,7 +979,9 @@ async def fenced_job_guard(job_id: str, attempts: int, *, lease_seconds: int = 6
                         """,
                         (job_id, attempts),
                     )
-                    owned = (await cur.fetchone()) is not None
+                    row = await cur.fetchone()
+                    if row is not None:
+                        owned = FencedJob(dict(row), cur)
                 yield owned
                 if owned:
                     await cur.execute(
@@ -664,7 +997,7 @@ async def fenced_job_guard(job_id: str, attempts: int, *, lease_seconds: int = 6
 
 async def enqueue_compensation_job(
     *,
-    run_id: str,
+    run_id: Optional[str],
     thread_id: str,
     hook_type: str,
     payload: Dict[str, Any],
@@ -676,7 +1009,7 @@ async def enqueue_compensation_job(
     """Insert a single follow-up job.
 
     ``defer=True`` inserts the row with ``next_retry_at='infinity'`` — durable
-    but never claimable until ``release_deferred_report_backs`` flips it due
+    but never claimable until ``release_deferred_notifications`` flips it due
     (interrupted-root task report-backs wait for the thread's next completed
     finalize). ON CONFLICT DO NOTHING: a retried caller never double-registers.
     ``conn`` joins the caller's transaction — how a job commits atomically
@@ -699,7 +1032,7 @@ async def enqueue_compensation_job(
 
 async def _insert_compensation_job(
     cur,
-    run_id: str,
+    run_id: Optional[str],
     thread_id: str,
     hook_type: str,
     payload: Dict[str, Any],
@@ -733,32 +1066,41 @@ async def _insert_compensation_job(
     )
 
 
-async def release_deferred_report_backs(conn, thread_id: str) -> int:
-    """Flip the deferred (``next_retry_at='infinity'``) report-backs owed to a
-    thread due.
+async def release_deferred_notifications(conn, thread_id: str) -> int:
+    """Flip the deferred (``next_retry_at='infinity'``) report-backs and
+    alerts owed to a thread due.
 
-    A task report-back is the thread's own row; an analyst's report-back
-    (``report_back``) belongs to the analyst's thread and is keyed on the
-    thread it reports to, so each is matched by its own column. Runs on the
+    A task report-back and an alert are the thread's own rows; an analyst's
+    report-back (``report_back``) belongs to the analyst's thread and is keyed
+    on the thread it reports to, so each is matched by its own column. Runs on the
     caller's connection so the release commits atomically with the finalize
     that makes posting safe again (a completed run means no pending HITL
     checkpoint to collide with). A turn's hold goes with the park, so the
     next live turn may take a released report in without waiting on its
-    executor.
+    executor. An alert waiting on the thread's next turn (``_exhaust_alerts``)
+    that the ending turn did not take in is released too and keeps
+    ``exhausted``: its executor wakes the thread if it now can, and holds it
+    again if not, so each further try waits on another turn's ending. An
+    alert that never wakes the thread (``_Alert.wakes``) is never made due:
+    only a hold the ending turn left on it is dropped, so the turn after
+    takes it in.
     """
     async with conn.cursor() as cur:
         await cur.execute(
-            """
-            UPDATE hook_outbox
-            SET next_retry_at = NOW(),
-                payload = payload - 'steered_run_id'
-            WHERE status = 'pending'
-              AND next_retry_at = 'infinity'::timestamptz
+            f"""
+            UPDATE hook_outbox o
+            SET next_retry_at = CASE WHEN o.hook_type IN {_SILENT_ALERT_TYPES_SQL}
+                                     THEN o.next_retry_at ELSE NOW() END,
+                payload = o.payload - 'steered_run_id'
+            WHERE o.status = 'pending'
+              AND o.next_retry_at = 'infinity'::timestamptz
               AND (
-                (hook_type = 'task_report_back'
-                 AND conversation_thread_id = %s)
-                OR (hook_type = 'report_back' AND ordering_key = %s)
+                (o.hook_type IN {_sql_list(("task_report_back", COMMAND_REPORT_HOOK, *ALERT_HOOK_TYPES))}
+                 AND o.conversation_thread_id = %s)
+                OR (o.hook_type = 'report_back' AND o.ordering_key = %s)
               )
+              AND (o.hook_type NOT IN {_SILENT_ALERT_TYPES_SQL}
+                   OR o.payload ? 'steered_run_id')
             """,
             (thread_id, str(thread_id)),
         )
@@ -778,7 +1120,9 @@ async def defer_claimed_job(
     (a dead report_back with its watch_clear compensation), since a pending
     row below the ceiling blocks its ordering chain and an unclaimable-forever
     deferred row would wedge every later notification on the thread. A steer
-    at the ceiling is settled instead (``_exhaust_steers``). Returns the new
+    at the ceiling is settled instead (``_exhaust_steers``), and an
+    alert held for its thread's next turn (``_exhaust_alerts``),
+    which blocks no chain. Returns the new
     status ('pending', 'dead' or 'exhausted'), or None if the fence was lost;
     the caller stops either way and its fenced ack no-ops. A turn's hold on
     the job is dropped: a job its executor holds was never confirmed, so the
@@ -787,9 +1131,10 @@ async def defer_claimed_job(
     async with pool.get_db_connection() as conn:
         async with conn.transaction():
             async with conn.cursor(row_factory=dict_row) as cur:
-                if await _exhaust_steers(
-                    cur, _AT_CEILING_SQL, _fence_params(job_id, attempts, max_attempts)
-                ):
+                fence = _fence_params(job_id, attempts, max_attempts)
+                if await _exhaust_steers(cur, _AT_CEILING_SQL, fence):
+                    return "exhausted"
+                if await _exhaust_alerts(cur, _AT_CEILING_SQL, fence):
                     return "exhausted"
                 await cur.execute(
                     f"""
@@ -824,10 +1169,10 @@ async def defer_claimed_job(
 
 
 async def list_open_notification_jobs(
-    thread_id: str, hook_type: str, *, limit: int = 20
+    thread_id: str, hook_type: str | Sequence[str], *, limit: int = 20
 ) -> List[Dict[str, Any]]:
-    """Open (pending, backing off included, or claimed) jobs of one type for a
-    thread, oldest first.
+    """Open (pending, backing off included, or claimed) jobs of a type, or of
+    any of several, on a thread's chain, oldest first.
 
     The read-model behind a watcher thread's ``pending_report_back`` when the
     outbox rows ARE the pending-registry: a job stays open from enqueue
@@ -840,61 +1185,159 @@ async def list_open_notification_jobs(
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
                 """
-                SELECT hook_outbox_id, payload, status
+                SELECT hook_outbox_id, hook_type, payload, status
                 FROM hook_outbox
                 WHERE ordering_key = %s
-                  AND hook_type = %s
+                  AND hook_type = ANY(%s::varchar[])
                   AND status IN ('pending', 'claimed')
                   AND (next_retry_at IS NULL
                        OR next_retry_at != 'infinity'::timestamptz)
                 ORDER BY created_at, hook_outbox_id
                 LIMIT %s
                 """,
-                (thread_id, hook_type, limit),
+                (thread_id, _hook_types(hook_type), limit),
             )
             return [dict(row) for row in await cur.fetchall()]
 
 
-# The report-back types a live turn may take in. Every report statement names
-# them, so none can touch a steer row, which shares the hold's lifecycle keys.
-_REPORT_TYPES_SQL = "hook_type IN ('task_report_back', 'report_back')"
+# The report-back types a live turn may take in, the alerts among them. Every
+# report statement names them, so none can touch a steer row, which shares
+# the hold's lifecycle keys.
+_REPORT_TYPES_SQL = (
+    "hook_type IN "
+    + _sql_list(
+        ("task_report_back", "report_back", COMMAND_REPORT_HOOK, *ALERT_HOOK_TYPES)
+    )
+)
+# The report-backs on a thread's own chain.
+_THREAD_REPORT_TYPES_SQL = _sql_list(
+    ("task_report_back", "report_back", COMMAND_REPORT_HOOK)
+)
+
+
+def _hook_types(hook_type: str | Sequence[str]) -> List[str]:
+    return [hook_type] if isinstance(hook_type, str) else list(hook_type)
 
 # A report-back a live turn may take in: pending in any form (due, backing
-# off, parked), not dispatched (it has its turn) and not held (stamped
-# ``steered_run_id``: already in a turn's messages). A claimed job belongs to
-# its executor, whose POST may already be in flight.
+# off, parked), not dispatched (it has its turn), not held (stamped
+# ``steered_run_id``: already in a turn's messages) and not riding a wake
+# turn (``rides``: the head's POST carries it). A claimed job belongs to its
+# executor, whose POST may already be in flight.
 _STEERABLE_REPORT_SQL = (
     f"(status = 'pending' AND {_REPORT_TYPES_SQL}"
     " AND NOT (payload ? 'dispatched_run_id')"
-    " AND NOT (payload ? 'steered_run_id'))"
+    " AND NOT (payload ? 'steered_run_id')"
+    " AND NOT (payload ? 'rides'))"
 )
 
 
 async def list_steerable_report_jobs(
     thread_id: str, *, limit: int = 10
 ) -> List[Dict[str, Any]]:
-    """Report-backs owed to a thread that no executor or turn holds, oldest
-    first."""
+    """Report-backs and alerts owed to a thread that no executor or turn
+    holds, oldest first."""
     async with pool.get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
                 f"""
                 SELECT hook_outbox_id, hook_type, run_id, payload, created_at
                 FROM hook_outbox
-                WHERE ordering_key = %s
-                  AND hook_type IN ('task_report_back', 'report_back')
+                WHERE ((ordering_key = %s
+                        AND hook_type IN {_THREAD_REPORT_TYPES_SQL})
+                       OR (ordering_key = ANY(%s)
+                           AND hook_type IN {_ALERT_TYPES_SQL}))
                   AND {_STEERABLE_REPORT_SQL}
                 ORDER BY created_at, hook_outbox_id
                 LIMIT %s
                 """,
-                (str(thread_id), limit),
+                (str(thread_id), alert_ordering_keys(thread_id), limit),
             )
             return [dict(row) for row in await cur.fetchall()]
 
 
+async def steerable_alert_senders(
+    thread_id: str, senders: Mapping[str, str]
+) -> Set[str]:
+    """Which of ``senders``, each naming the alert type it stands for, have
+    a notice waiting for the thread's live turn to take in; a run waiting on
+    its background tasks asks this between polls.
+
+    Only a parked one counts: nothing makes it claimable while the turn
+    lives, so the trigger this answer injects finds it at the next model
+    call. A due one may be claimed by the drainer before that call, leaving
+    the trigger with no alert; its executor parks it behind the live turn,
+    and a later poll counts it."""
+    types = sorted({t for t in senders.values() if t in _ALERTS})
+    if not types:
+        return set()
+    async with pool.get_db_connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                f"""
+                SELECT DISTINCT hook_type FROM hook_outbox
+                WHERE ordering_key = ANY(%s) AND hook_type = ANY(%s)
+                  AND {_STEERABLE_REPORT_SQL}
+                  AND next_retry_at = 'infinity'::timestamptz
+                """,
+                ([_ALERTS[t].ordering_key(str(thread_id)) for t in types], types),
+            )
+            found = {r[0] for r in await cur.fetchall()}
+    return {sender for sender, t in senders.items() if t in found}
+
+
+async def held_notice_jobs(job_ids: List[str], run_id: str) -> List[Dict[str, Any]]:
+    """The report jobs among ``job_ids`` that ``run_id`` holds for its live
+    turn, oldest first, for the confirm to stamp each notice whose delivery
+    is stamped on a row of its own before it closes them."""
+    if not job_ids:
+        return []
+    async with pool.get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                f"""
+                SELECT hook_outbox_id, hook_type, payload, created_at
+                FROM hook_outbox
+                WHERE hook_outbox_id = ANY(%s::uuid[])
+                  AND {_REPORT_TYPES_SQL} AND status = 'pending'
+                  AND payload->>'steered_run_id' = %s::text
+                ORDER BY created_at, hook_outbox_id
+                """,
+                ([str(i) for i in job_ids], run_id),
+            )
+            return [dict(r) for r in await cur.fetchall()]
+
+
+async def close_unowed_held_alerts(job_ids: List[str], run_id: str) -> List[str]:
+    """Close the alert jobs ``run_id`` just held whose notice stopped being
+    owed between the offer's read and the hold; returns the ids closed.
+
+    The turn must not show what that already settled: a delivery elsewhere,
+    a target that moved on, or a cancel that ends a wakeup outright (a
+    forced one, such as archive). A wakeup cancel that commits before a hold
+    closes the job, which the hold then misses, and one after finds it held
+    and too late."""
+    if not job_ids:
+        return []
+    async with pool.get_db_connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                f"""
+                UPDATE hook_outbox o
+                SET status = 'done', completed_at = NOW(), next_retry_at = NULL
+                WHERE o.hook_outbox_id = ANY(%s::uuid[])
+                  AND o.hook_type IN {_ALERT_TYPES_SQL} AND o.status = 'pending'
+                  AND o.payload->>'steered_run_id' = %s::text
+                  AND NOT {_ALERT_OWED_SQL}
+                RETURNING o.hook_outbox_id
+                """,
+                ([str(i) for i in job_ids], run_id),
+            )
+            return [str(r[0]) for r in await cur.fetchall()]
+
+
 async def hold_steered_report_jobs(job_ids: List[str], *, run_id: str) -> List[str]:
-    """Park report-backs a live turn is taking in as a steer, stamped with
-    its run; returns the ids won.
+    """Park report-backs and alerts a live turn is taking in as a steer,
+    stamped with its run; returns the ids won.
 
     The same ``pending`` gate the drainer's claim takes, so a job is either
     steered or claimed, never both. Held, not closed: until the message
@@ -1018,12 +1461,13 @@ async def _close_report_jobs(
 
 async def get_recent_notification_run_ids(
     thread_id: str,
-    hook_type: str,
+    hook_type: str | Sequence[str],
     *,
     window_seconds: int = 900,
     limit: int = 10,
 ) -> List[str]:
-    """Dispatched run ids of recently DONE jobs of one type, newest first.
+    """Dispatched run ids of recently DONE jobs of a type, or of any of
+    several, newest first.
 
     The durable recents ledger behind wake-miss recovery: once a job closes,
     the slice reads idle and only this list can still name the notification
@@ -1037,14 +1481,14 @@ async def get_recent_notification_run_ids(
                 SELECT payload->>'dispatched_run_id'
                 FROM hook_outbox
                 WHERE ordering_key = %s
-                  AND hook_type = %s
+                  AND hook_type = ANY(%s::varchar[])
                   AND status = 'done'
                   AND payload->>'dispatched_run_id' IS NOT NULL
                   AND completed_at > NOW() - make_interval(secs => %s)
                 ORDER BY completed_at DESC
                 LIMIT %s
                 """,
-                (thread_id, hook_type, window_seconds, limit),
+                (thread_id, _hook_types(hook_type), window_seconds, limit),
             )
             return [str(r[0]) for r in await cur.fetchall()]
 
@@ -1157,6 +1601,20 @@ _STEER_HELD_SQL = """({a}.payload ? 'steered_run_id' AND (
           AND hs.status = 'in_progress'
     )
 ))"""
+
+# The run that took a steer in, as text, else NULL: the turn it became
+# (``claim_steer_for_turn``, or its executor's ``finish_claimed_steer``), the
+# run that read it (``confirm_jobs``), or a running turn holding it for its
+# next model call. A hold counts as taken, but a release or its run's ending
+# without reading it hands the steer back, so taken can turn queued again.
+_STEER_TAKER_SQL = (
+    "(CASE WHEN {a}.payload->>'outcome' = 'turn'"
+    " THEN {a}.payload->>'dispatched_run_id'"
+    " WHEN {a}.payload->>'outcome' = 'delivered'"
+    " THEN {a}.payload->>'steered_run_id'"
+    " WHEN " + _LIVE_STEER_SQL + " AND " + _STEER_HELD_SQL
+    + " THEN {a}.payload->>'steered_run_id' END)"
+)
 
 # What a live agent may take in: live, held by no live agent, not yet the input
 # of a turn of its own. A claimed row is taken from its executor (whose fenced
@@ -1951,6 +2409,11 @@ _THREAD_STEERS_SQL = (
 # from a surface langalpha draws, which also carries a ``platform``.
 _IS_PLATFORM_SQL = "COALESCE((o.payload->>'chat_app')::boolean, false)"
 _IS_USER_SQL = "COALESCE(o.payload->>'sender', 'user') = 'user'"
+# A hand-off: an agent's steer to the thread.
+_HAND_OFF_STEER_SQL = (
+    "(o.hook_type = 'steer' AND " + _steer_sql(_TARGET_SQL) + " = 'thread'"
+    " AND NOT " + _IS_USER_SQL + ")"
+)
 # A user's steer that a stop answered without (``keep_unanswered_steers``).
 _KEPT_BY_STOP_SQL = (
     "COALESCE(o.payload->>'kept_by_stop' = %(run_id)s::text, false)"
@@ -2234,8 +2697,8 @@ async def list_held_jobs(
     thread_id: str, *, owner: Tuple[str, str], task_id: Optional[str] = None
 ) -> List[str]:
     """Ids of the rows ``owner`` still holds on the thread: steers, and for a
-    run the report-backs it took in as steers. Its ending reads them against
-    its checkpoint (``report_back.steer.confirm_checkpointed_holds``)."""
+    run the report-backs and alerts it took in as steers. Its ending reads
+    them against its checkpoint (``report_back.steer.confirm_checkpointed_holds``)."""
     kind, owner_id = owner
     if kind == "task":
         where = f"o.ordering_key = %(okey)s AND {_steer_sql(_LIVE_STEER_SQL)}"
@@ -2245,7 +2708,9 @@ async def list_held_jobs(
     else:
         where = (
             f"((o.ordering_key = %(okey)s AND {_steer_sql(_LIVE_STEER_SQL)})"
-            f" OR (o.ordering_key = %(thread)s AND o.{_REPORT_TYPES_SQL}))"
+            f" OR (o.ordering_key = %(thread)s AND o.{_REPORT_TYPES_SQL})"
+            " OR (o.ordering_key = ANY(%(alerts)s)"
+            f" AND o.hook_type IN {_ALERT_TYPES_SQL}))"
         )
         okey = steer_ordering_key(thread_id)
     async with pool.get_db_connection() as conn:
@@ -2258,7 +2723,12 @@ async def list_held_jobs(
                   AND o.payload->>'steered_run_id' = %(owner)s::text
                 ORDER BY o.created_at, o.hook_outbox_id
                 """,
-                {"okey": okey, "thread": str(thread_id), "owner": owner_id},
+                {
+                    "okey": okey,
+                    "thread": str(thread_id),
+                    "alerts": alert_ordering_keys(thread_id),
+                    "owner": owner_id,
+                },
             )
             return [str(r[0]) for r in await cur.fetchall()]
 
@@ -2360,6 +2830,26 @@ async def list_pending_steers(thread_id: str) -> List[Dict[str, Any]]:
                 {"okey": steer_ordering_key(thread_id)},
             )
             return [_returned_entry(dict(r)) for r in await cur.fetchall()]
+
+
+async def list_taken_hand_offs(thread_id: str, run_ids: List[str]) -> List[str]:
+    """Ids of the hand-offs on the thread that one of ``run_ids`` took in
+    (``_STEER_TAKER_SQL``), oldest first."""
+    if not run_ids:
+        return []
+    async with pool.get_db_connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                f"""
+                SELECT o.hook_outbox_id FROM hook_outbox o
+                WHERE o.ordering_key = %(okey)s
+                  AND {_HAND_OFF_STEER_SQL}
+                  AND {_steer_sql(_STEER_TAKER_SQL)} = ANY(%(runs)s::text[])
+                ORDER BY o.created_at, o.hook_outbox_id
+                """,
+                {"okey": steer_ordering_key(thread_id), "runs": list(run_ids)},
+            )
+            return [str(r[0]) for r in await cur.fetchall()]
 
 
 # ---------------------------------------------------------------------------

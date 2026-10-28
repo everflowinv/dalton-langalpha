@@ -22,6 +22,7 @@ from ptc_agent.agent.middleware.compaction.compact import Summarizer
 from ptc_agent.agent.middleware.compaction.middleware import CompactionMiddleware
 from ptc_agent.agent.middleware.compaction.types import CONTEXT_SUMMARY_PREFIX
 from ptc_agent.agent.transcript import TranscriptTarget, pointer
+from ptc_agent.core.sandbox.livefs_mount import TranscriptReach
 
 TRANSCRIPT = TranscriptTarget("abcd1234-0000-0000-0000-000000000000")
 
@@ -46,7 +47,12 @@ def _backend(outcome, linked: bool):
         asked.append(workspace_id)
         return mount if linked else None
 
-    return SimpleNamespace(livefs=mount, settled_livefs=settled_livefs, asked=asked)
+    return SimpleNamespace(
+        livefs=mount,
+        transcripts=TranscriptReach(mount, shell=True),
+        settled_livefs=settled_livefs,
+        asked=asked,
+    )
 
 
 def _middleware(monkeypatch, backend) -> CompactionMiddleware:
@@ -57,7 +63,8 @@ def _middleware(monkeypatch, backend) -> CompactionMiddleware:
             counter=len,
         ),
         token_threshold=6,
-        keep_messages=2,
+        keep_tokens=2,
+        self_summary=False,
         backend=backend,
         workspace_id="ws-1",
     )
@@ -133,3 +140,80 @@ async def test_a_compaction_timeout_under_the_save_limit_bounds_the_save(monkeyp
     result = await asyncio.wait_for(mw.awrap_model_call(_request(mw), handler), timeout=5)
 
     assert result.command.update["_summarization_event"]["file_path"] is None
+
+
+class _History:
+    def __init__(self, outcome=True, folders=("ws-1",)):
+        self.outcome = outcome
+        self.folders = folders
+        self.saved: list = []
+
+    def serves(self, workspace_id):
+        return workspace_id in self.folders
+
+    async def save_transcript(self, target, messages, *, window):
+        if self.outcome == "raises":
+            raise ConnectionError("store down")
+        self.saved.append((target, messages, window))
+        return self.outcome
+
+
+def _history_backend(history):
+    reach = None if history is None else TranscriptReach(history, shell=False)
+    return SimpleNamespace(livefs=None, transcripts=reach)
+
+
+class TestWithoutAMount:
+    """A computer the mount never serves has its transcripts read from the
+    rows, so a save that landed is a pointer the file tools reach."""
+
+    def test_a_history_handle_gives_a_target(self):
+        target = pointer.transcript_target(_history_backend(_History()), "abcd1234-0000")
+
+        assert target is not None and target.directory
+
+    def test_neither_mount_nor_history_gives_none(self):
+        assert pointer.transcript_target(_history_backend(None), "abcd1234-0000") is None
+
+    @pytest.mark.asyncio
+    async def test_a_save_goes_through_history_and_returns_the_target(self):
+        history = _History(True)
+
+        got = await pointer.aexport_transcript(
+            _history_backend(history), TRANSCRIPT, ["m"], workspace_id="ws-1", window="w"
+        )
+
+        assert got is TRANSCRIPT
+        assert history.saved == [(TRANSCRIPT, ["m"], "w")]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("outcome", [False, "raises"])
+    async def test_a_save_that_fails_gives_none(self, outcome):
+        got = await pointer.aexport_transcript(
+            _history_backend(_History(outcome)),
+            TRANSCRIPT,
+            ["m"],
+            workspace_id="ws-1",
+            window="w",
+        )
+
+        assert got is None
+
+    @pytest.mark.asyncio
+    async def test_a_history_without_the_folder_gives_none(self):
+        # Its folders could not be read, so no route serves the directory.
+        history = _History(True, folders=())
+
+        got = await pointer.aexport_transcript(
+            _history_backend(history), TRANSCRIPT, ["m"], workspace_id="ws-1", window="w"
+        )
+
+        assert got is None
+
+    @pytest.mark.asyncio
+    async def test_neither_mount_nor_history_exports_nothing(self):
+        got = await pointer.aexport_transcript(
+            _history_backend(None), TRANSCRIPT, ["m"], workspace_id="ws-1", window="w"
+        )
+
+        assert got is None

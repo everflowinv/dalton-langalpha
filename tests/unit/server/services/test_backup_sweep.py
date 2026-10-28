@@ -56,6 +56,7 @@ class _Manager(MachineBackupMixin):
                 computer_id=COMPUTER,
                 root_dir=ROOT,
                 provider_ref=DURABLE_REF,
+                files_backup=True,
             )
         )
         self.backup_project_files = AsyncMock(return_value=True)
@@ -134,6 +135,9 @@ async def test_only_changed_projects_are_synced_fenced_by_the_machine():
         assert call.kwargs["expected_sandbox_id"] == DURABLE_REF
         # The folder the plan resolved is reused, not read again.
         assert call.kwargs["layout"].workspace == f"{ROOT}/{call.args[0]}-dir"
+        # Each project's pass reads the switch again, as the owner may turn
+        # backups off while the sweep is under way.
+        assert call.kwargs["routine"] is True
 
 
 @pytest.mark.asyncio
@@ -230,6 +234,25 @@ async def test_a_failed_plan_or_sweep_mirrors_the_turns_project_only(marks, swee
     call = mgr.backup_project_files.await_args
     assert call.kwargs["session"] is session
     assert call.kwargs["expected_sandbox_id"] == DURABLE_REF
+
+
+@pytest.mark.asyncio
+async def test_a_machine_whose_owner_turned_backups_off_is_neither_swept_nor_mirrored():
+    """Off keeps the last backup as it was, which a pass after the turn would
+    overwrite with the folder as it is now."""
+    mgr = _Manager("w2")
+    mgr.resolve_binding.return_value.files_backup = False
+    marks = AsyncMock(return_value=[_row("w1"), _row("w2")])
+    sweeper = AsyncMock(return_value=_verdict(changed=["w1", "w2"]))
+    with (
+        patch.object(_machine_backup, "get_scan_marks_for_computer", new=marks),
+        patch.object(_machine_backup, "sweep_projects", new=sweeper),
+    ):
+        await mgr.backup_changed_projects("w2", session=_session())
+
+    assert _synced(mgr) == []
+    marks.assert_not_awaited()
+    sweeper.assert_not_awaited()
 
 
 # --- both paths derive the rules the same way -----------------------------

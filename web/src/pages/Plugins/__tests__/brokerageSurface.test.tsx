@@ -417,6 +417,27 @@ describe('the brokerages tab', () => {
       expect(pendingMarkers()).toEqual([{ server: 'ibkr', from: '/plugins' }]);
     });
 
+    // The toast is the one place the shell's hand-off is said, and it said the
+    // server's id ("ibkr") where every other line on the surface names the
+    // broker.
+    it('names the broker when the desktop app takes the sign-in to the browser', async () => {
+      shell = {
+        beginMcpOAuth: async () => ({
+          redirectUri: 'http://127.0.0.1:8790/mcp/callback',
+          flowId: 'flow-1',
+        }),
+      };
+      await renderTab();
+      connectThrough('ibkr');
+      await waitFor(() => expect(assign).toHaveBeenCalledTimes(1));
+      await waitFor(() =>
+        expect(toastSpy).toHaveBeenCalledWith({
+          title: 'Sign-in opened in your browser',
+          description: 'Finish signing in to "Interactive Brokers" there. Nothing is saved until you do.',
+        }),
+      );
+    });
+
     // In the desktop app the vendor's page is in the system browser and this
     // page stays, so the page going is a reload with the flow still live. Read
     // as backed out of, it said the sign-in was not finished, and spent the
@@ -1023,7 +1044,7 @@ describe('the brokerages tab', () => {
     it('warns that an exclusive connection takes the account slot', async () => {
       await renderTab();
       expect(
-        screen.getByText('Disconnects any other AI app linked to your Interactive Brokers account'),
+        screen.getByText('Disconnects other AI apps linked to this account'),
       ).toBeInTheDocument();
     });
 
@@ -1033,7 +1054,7 @@ describe('the brokerages tab', () => {
       ];
       await renderTab();
       expect(
-        screen.queryByText('Disconnects any other AI app linked to your Interactive Brokers account'),
+        screen.queryByText('Disconnects other AI apps linked to this account'),
       ).toBeNull();
     });
 
@@ -1078,7 +1099,7 @@ describe('the brokerages tab', () => {
 
       // The exclusive-connection warning costs the user something; "needs the
       // desktop app" does not. They sat at the same tertiary grey.
-      const consequence = screen.getByText('Disconnects any other AI app linked to your Interactive Brokers account');
+      const consequence = screen.getByText('Disconnects other AI apps linked to this account');
       const capability = screen.getByText('Needs the desktop app');
       expect(consequence).toHaveStyle({ color: 'var(--color-warning)' });
       expect(capability).toHaveStyle({ color: 'var(--color-text-tertiary)' });
@@ -1096,7 +1117,7 @@ describe('the brokerages tab', () => {
 
       expect(container.querySelector('img[src*="/brokerages/ibkr/icon"]')).toBeNull();
       expect(
-        screen.queryByText('Disconnects any other AI app linked to your Interactive Brokers account'),
+        screen.queryByText('Disconnects other AI apps linked to this account'),
       ).toBeNull();
       // The one beside it is untouched, so this is de-branding and not a
       // build with the art switched off.

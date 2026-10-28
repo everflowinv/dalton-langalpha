@@ -18,6 +18,7 @@ import pytest
 
 from ptc_agent.agent.backends.read_window import DEFAULT_READ_LINES, MAX_READ_CHARS
 from ptc_agent.agent.tools.file_ops import create_filesystem_tools
+from ptc_agent.core.sandbox.runtime import SandboxGoneError, SandboxTransientError
 
 
 def _make_backend(*, content: str | None, supports_validate: bool = True) -> Any:
@@ -289,3 +290,98 @@ class TestReadToolPassthroughs:
         result = await read.ainvoke({"file_path": "/tmp/missing.txt"})
 
         assert result.startswith("ERROR: File not found")
+
+
+class TestReadToolTranscripts:
+    """A transcript line is one event, so a window cuts each long field and a
+    single-line Read is how the agent gets the event whole."""
+
+    SEGMENT = "/home/workspace/Home/.agents/transcripts/abcd1234/turn-0001.jsonl"
+    LONG = "w" * 5_000
+
+    def _line(self) -> str:
+        import json
+
+        return json.dumps({"role": "tool", "text": self.LONG})
+
+    @pytest.mark.asyncio
+    async def test_a_window_cuts_a_long_field_and_names_the_offset(self):
+        read = _get_read_tool(_make_backend(content=self._line() + "\n"))
+
+        result = await read.ainvoke({"file_path": self.SEGMENT, "offset": 4})
+
+        assert self.LONG not in result
+        assert "[cut: 5,000 chars" in result
+        assert "Read(offset=4, limit=1)" in result
+
+    @pytest.mark.asyncio
+    async def test_one_line_comes_whole(self):
+        read = _get_read_tool(_make_backend(content=self._line() + "\n"))
+
+        result = await read.ainvoke({"file_path": self.SEGMENT, "offset": 4, "limit": 1})
+
+        assert self.LONG in result
+        assert "[cut:" not in result
+
+    @pytest.mark.asyncio
+    async def test_the_same_content_elsewhere_is_not_cut(self):
+        read = _get_read_tool(_make_backend(content=self._line() + "\n"))
+
+        result = await read.ainvoke({"file_path": "/home/workspace/Home/notes.jsonl"})
+
+        assert self.LONG in result
+
+
+class TestReadSandboxOutcome:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("raised", "outcome", "error_class"),
+        [
+            pytest.param(SandboxGoneError("gone"), "error", "SandboxGoneError", id="gone"),
+            pytest.param(
+                SandboxTransientError("unreachable"),
+                "error",
+                "SandboxTransientError",
+                id="unreachable",
+            ),
+            # What else the catch-all sees is the request refused, such as
+            # a read-only path.
+            pytest.param(PermissionError("read-only"), "ok", None, id="refused"),
+        ],
+    )
+    async def test_only_the_sandbox_failing_marks_the_run(
+        self, traced_tool, raised, outcome, error_class
+    ):
+        backend = _make_backend(content=None)
+        backend.aread_range = AsyncMock(side_effect=raised)
+
+        content, metadata = await traced_tool(
+            _get_read_tool(backend), {"file_path": "notes.md"}
+        )
+
+        assert content.startswith("ERROR")
+        assert metadata["tool_outcome"] == outcome
+        assert metadata.get("error_class") == error_class
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("file_path", "channel", "provider"),
+        [
+            ("notes.md", "docker", "docker"),
+            ("../.agents/threads.jsonl", "fuse", "docker"),
+            ("/memory/notes.md", "server", None),
+        ],
+        ids=["sandbox", "file-mount", "store-mount"],
+    )
+    async def test_a_call_names_its_channel_and_the_provider_of_a_sandbox_it_reaches(
+        self, traced_tool, file_path, channel, provider
+    ):
+        channels = {"notes.md": "docker", "../.agents/threads.jsonl": "fuse"}
+        backend = _make_backend(content="hello")
+        backend.provider = "docker"
+        backend.channel_for = lambda p: channels.get(p, "server")
+
+        _content, metadata = await traced_tool(_get_read_tool(backend), {"file_path": file_path})
+
+        assert metadata.get("tool_channel") == channel
+        assert metadata.get("tool_provider") == provider

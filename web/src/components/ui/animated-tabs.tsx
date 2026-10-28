@@ -2,6 +2,7 @@
 
 import { useEffect, useRef } from "react";
 import { motion } from "@/lib/framer";
+import { SPRING_INDICATOR } from "@/lib/motion";
 
 interface Tab {
   id: string;
@@ -14,8 +15,6 @@ interface AnimatedTabsProps {
   onChange: (tabId: string) => void;
   layoutId?: string;
 }
-
-const springTransition = { type: "spring", bounce: 0.2, duration: 0.6 } as const;
 
 export function AnimatedTabs({
   tabs,
@@ -62,7 +61,7 @@ export function AnimatedTabs({
                   // so a hairline edge keeps the pill legible on both themes.
                   boxShadow: 'inset 0 0 0 1px var(--color-border-default)',
                 }}
-                transition={valueChanged ? springTransition : { duration: 0 }}
+                transition={valueChanged ? SPRING_INDICATOR : { duration: 0 }}
               />
             )}
             <span className="relative z-10">{tab.label}</span>

@@ -3,9 +3,11 @@ import { useTranslation } from 'react-i18next';
 import type { PDFDocumentProxy } from 'pdfjs-dist';
 import { PanelLeft } from 'lucide-react';
 import { useStableHandler } from '@/hooks/useStableHandler';
+import { isRangedFile, markStale, type RangedFile } from '@/lib/rangedFile';
 import { Document, Page, pdfjs } from 'react-pdf';
 import PdfRail, { type RailTab } from './pdf/PdfRail';
 import { type PageSize, sizeOf, withMeasured } from './pdf/pageSize';
+import { rangeTransport } from './pdf/rangeTransport';
 import { useReleasePages } from './pdf/useReleasePages';
 import 'react-pdf/dist/Page/AnnotationLayer.css';
 import 'react-pdf/dist/Page/TextLayer.css';
@@ -27,6 +29,12 @@ const DOCUMENT_OPTIONS = {
   standardFontDataUrl: `${PDFJS_DATA_URL}standard_fonts/`,
   iccUrl: `${PDFJS_DATA_URL}iccs/`,
 };
+// A file opened from its first slice. pdf.js fetches only the ranges the pages
+// it draws need, so pages are measured as they render. Its default chunk stays:
+// opening reads every page dict of a flat page tree, and a larger chunk turns
+// each small dict into that much of the file, while one object larger than a
+// chunk still arrives in one request.
+const RANGED_OPTIONS = { ...DOCUMENT_OPTIONS, disableAutoFetch: true, disableStream: true };
 
 // Scales relative to the PDF's own size (1 = one point per CSS pixel). Chrome's
 // presets, stopped at 3: every page in the render window holds a canvas, and a
@@ -139,14 +147,19 @@ function nextZoom(scale: number, direction: 1 | -1): number | null {
 }
 
 interface PdfViewerProps {
-  data: ArrayBuffer | Uint8Array;
+  data: ArrayBuffer | Uint8Array | RangedFile;
+  /**
+   * A ranged file lost a slice, to a change in the file or a failed read, so
+   * it has to be read again, into a new `data`. Left out, that is a failure.
+   */
+  onFileChanged?: () => void;
   /** Page a reference pointed at; `focusSeq` changes on each visit so a repeat click returns to it. */
   focusPage?: number | null;
   focusSeq?: number | null;
   onPageCount?: (count: number) => void;
 }
 
-export default function PdfViewer({ data, focusPage = null, focusSeq = null, onPageCount }: PdfViewerProps) {
+export default function PdfViewer({ data, onFileChanged, focusPage = null, focusSeq = null, onPageCount }: PdfViewerProps) {
   const { t } = useTranslation();
   const [pageSizes, setPageSizes] = useState<PageSize[] | null>(null);
   const [zoom, setZoom] = useState<Zoom>('fit');
@@ -174,6 +187,16 @@ export default function PdfViewer({ data, focusPage = null, focusSeq = null, onP
   // short to reach the top leaves another page under the middle.
   const pinned = useRef<{ page: number; y: number } | null>(null);
   const loadingDoc = useRef<PDFDocumentProxy | null>(null);
+  // The slice whose failure asked for a re-read, and the file it failed on,
+  // whose other slices failing must not ask again. It stands until a newer
+  // file reads those bytes. Any other read cannot clear it: after a reload
+  // pdf.js reads the trailer first, which succeeds while a slice that fails
+  // every time would reload over and over. A failure before then is the error.
+  const reread = useRef<{ file: RangedFile; begin: number; end: number } | null>(null);
+  // pdf.js aborts a closed document's reads only once its worker confirms the
+  // close, so a slice can still fail after the viewer is gone, and must not
+  // reload whichever file the panel shows by then.
+  const live = useRef(false);
   const handledSeq = useRef<number | null>(null);
   // A relayout made while the panel was hidden, to apply once it shows.
   const restorePending = useRef(false);
@@ -381,13 +404,45 @@ export default function PdfViewer({ data, focusPage = null, focusSeq = null, onP
   const zoomOutTo = scale === null ? null : nextZoom(scale, -1);
   const zoomInTo = scale === null ? null : nextZoom(scale, 1);
 
+  // pdf.js never asks again for a slice that failed, so its document would
+  // wait on it for good. Whatever the failure, the file reloads once, from its
+  // first slice; if that request fails too, the panel shows its error, with
+  // Retry. A failure on the reloaded file before it has read the bytes that
+  // were lost shows the error here instead. A slice of a file since replaced,
+  // being read again, or left by a closed viewer fails with nobody waiting on it.
+  const onRangeFail = useStableHandler((source: RangedFile, failure: unknown, begin: number, end: number) => {
+    if (!live.current || source !== data || source === reread.current?.file) return;
+    if (onFileChanged && reread.current === null) {
+      // So the re-read replaces it even when it finds the same version.
+      markStale(source);
+      reread.current = { file: source, begin, end };
+      onFileChanged();
+      return;
+    }
+    setError(failure instanceof Error ? failure : new Error(String(failure)));
+  });
+  const onRangeRead = useStableHandler((source: RangedFile, begin: number, end: number) => {
+    const lost = reread.current;
+    if (source === data && lost && source !== lost.file && begin < lost.end && end > lost.begin) {
+      reread.current = null;
+    }
+  });
+
   // A new `file` object is a new document to react-pdf, so a render that rebuilt
   // it would reload the PDF and reset the page.
   const fileData = useMemo(() => {
     if (!data) return null;
+    if (isRangedFile(data)) {
+      return {
+        range: rangeTransport(data, {
+          onRead: (begin, end) => onRangeRead(data, begin, end),
+          onFail: (failure, begin, end) => onRangeFail(data, failure, begin, end),
+        }),
+      };
+    }
     const bytes = data instanceof ArrayBuffer ? new Uint8Array(data) : data;
     return { data: bytes };
-  }, [data]);
+  }, [data, onRangeFail, onRangeRead]);
 
   // A document stops being current as soon as its bytes are replaced, not once
   // the next one loads: react-pdf destroys it first, and the requests it still
@@ -395,6 +450,13 @@ export default function PdfViewer({ data, focusPage = null, focusSeq = null, onP
   useEffect(() => {
     loadingDoc.current = null;
   }, [fileData]);
+
+  useEffect(() => {
+    live.current = true;
+    return () => {
+      live.current = false;
+    };
+  }, []);
 
   // Bubble errors to the error boundary via render-phase throw
   if (error) throw error;
@@ -549,7 +611,7 @@ export default function PdfViewer({ data, focusPage = null, focusSeq = null, onP
             suspense={false}
             className="pdf-pages"
             file={fileData}
-            options={DOCUMENT_OPTIONS}
+            options={isRangedFile(data) ? RANGED_OPTIONS : DOCUMENT_OPTIONS}
             onLoadSuccess={onDocumentLoadSuccess}
             onLoadError={(err: Error) => setError(err)}
             onItemClick={({ pageNumber }) => scrollToPage(pageNumber - 1)}

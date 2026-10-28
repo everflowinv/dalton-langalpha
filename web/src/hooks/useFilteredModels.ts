@@ -1,6 +1,7 @@
 import type { ProviderModelsData } from '@/components/model/types';
 import type { ConfiguredProvider } from './useConfiguredProviders';
 import type { PlatformModelsResponse } from '@/types/platform';
+import type { NativeCompactionKind } from './useAllModels';
 import { getModelAccess } from './usePlatformModels';
 
 /**
@@ -32,6 +33,9 @@ export interface ModelMetadataEntry {
   /** Compaction preset the model resolves to on its own — its declaration, else
    * the band its context window falls in. Absent = the deployment default. */
   compaction_profile?: string;
+  /** Whose compaction the model takes, on by default. Absent or null = its
+   * provider cannot compact for it. */
+  native_compaction?: NativeCompactionKind | null;
 }
 
 /** Key for the (group, name) pair in customPairs — '::' can't collide with any provider or model name. */
@@ -143,16 +147,20 @@ export function buildConfiguredSet(
  * the platform service may not reflect recent connections (OAuth tokens
  * live in the local DB). Merging ensures the tier filter recognizes
  * locally-configured providers.
+ *
+ * A stored key counts only while `byokEnabled`: with the switch off the
+ * server runs no turn on it, so its models fall back to what the plan covers.
  */
 export function augmentPlatformWithLocal(
   platform: PlatformModelsResponse,
   configuredProviders: ConfiguredProvider[],
+  byokEnabled: boolean,
 ): PlatformModelsResponse {
   const localByok: string[] = [];
   const localOAuth: string[] = [];
   for (const p of configuredProviders) {
-    const bucket = p.access_type === 'oauth' ? localOAuth : localByok;
-    bucket.push(p.provider);
+    if (p.access_type === 'oauth') localOAuth.push(p.provider);
+    else if (byokEnabled) localByok.push(p.provider);
     // No brand_key promotion. A configured variant (e.g. moonshot-coding)
     // does not imply the parent brand (moonshot) is accessible — their keys
     // and endpoints are distinct. Promoting the brand would show models the
@@ -335,7 +343,13 @@ export function buildVisibleModels(
     // typed, while the built-in's display_name names the manifest's model,
     // which this entry may not route to.
     const ladder = declaredLadder(cm);
-    const { display_name: _shadowedLabel, ...declared } = metadata[cm.name];
+    // Provider compaction does not carry over either: it rides on the
+    // manifest's own request settings, which a custom entry never inherits.
+    const {
+      display_name: _shadowedLabel,
+      native_compaction: _shadowedNative,
+      ...declared
+    } = metadata[cm.name];
     metadata[cm.name] = {
       ...declared,
       ...('efforts' in ladder ? { reasoning_efforts: ladder.efforts } : {}),

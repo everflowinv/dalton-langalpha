@@ -361,15 +361,13 @@ class TestSkillsConfig:
         assert cfg.enabled is True
         assert cfg.user_skills_dir == "~/.ptc-agent/skills"
 
-    def test_local_skill_dirs_with_sandbox(self):
+    def test_local_skill_dirs(self):
         # Bundles are patched away for this package (see conftest), so what is
         # left is the operator's own directory and nothing else.
         cfg = SkillsConfig()
-        dirs = cfg.local_skill_dirs_with_sandbox()
+        dirs = cfg.local_skill_dirs()
         assert len(dirs) == 1
-        user_dir, user_sandbox = dirs[0]
-        assert "ptc-agent/skills" in user_dir
-        assert user_sandbox == "/home/workspace/.agents/skills"
+        assert "ptc-agent/skills" in dirs[0]
 
     def test_the_sources_do_not_depend_on_the_working_directory(
         self, monkeypatch, tmp_path
@@ -378,9 +376,9 @@ class TestSkillsConfig:
         # resolves against cwd any more; a server started from anywhere has to
         # see the same set.
         cfg = SkillsConfig()
-        before = cfg.local_skill_dirs_with_sandbox()
+        before = cfg.local_skill_dirs()
         monkeypatch.chdir(tmp_path)
-        assert cfg.local_skill_dirs_with_sandbox() == before
+        assert cfg.local_skill_dirs() == before
 
 
 # ---------------------------------------------------------------------------
@@ -411,7 +409,7 @@ class TestCompactionConfig:
         cfg = CompactionConfig()
         assert cfg.enabled is True
         assert cfg.token_threshold == 120000
-        assert cfg.keep_messages == 5
+        assert cfg.keep_tokens == 20_000
         assert cfg.truncate_args_idle_minutes == 90
         assert cfg.truncate_args_keep_messages == 20
         assert cfg.truncate_args_max_length == 2000
@@ -420,12 +418,12 @@ class TestCompactionConfig:
         cfg = CompactionConfig(
             enabled=False,
             token_threshold=80000,
-            keep_messages=3,
+            keep_tokens=3,
             truncate_args_idle_minutes=None,
         )
         assert cfg.enabled is False
         assert cfg.token_threshold == 80000
-        assert cfg.keep_messages == 3
+        assert cfg.keep_tokens == 3
         assert cfg.truncate_args_idle_minutes is None
 
 

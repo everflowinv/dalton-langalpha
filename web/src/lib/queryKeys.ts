@@ -52,6 +52,13 @@ export const queryKeys = {
     // DALTON-HOOK(team-sharing): team workspaces grouped by colleague
     team:   () => [...queryKeys.workspaces.all, 'team'],
   },
+  // A workspace's latest move to another computer, polled while it runs. Its
+  // own root, not under `workspaces`: the read that sees a move end refreshes
+  // every workspace query, which would cancel that read before it lands.
+  workspaceMoves: {
+    all:       ['workspaceMoves'],
+    workspace: (wsId: string) => [...queryKeys.workspaceMoves.all, wsId],
+  },
   // The signed prefix the owner's report iframes load under, one per workspace
   // because the grant covers the whole workspace and nothing narrower. Its own
   // root, not under `workspaces`: every workspace invalidation would re-mint
@@ -88,6 +95,26 @@ export const queryKeys = {
     // The per-folder breakdown is a separate, expensive reading (a `du` on
     // the machine), not a projection of the row, so it keys apart from it.
     storage: (computerId: string) => [...queryKeys.computers.all, 'storage', computerId],
+    // What a new machine can run on, per user: the plan decides `allowed`.
+    providers: () => [...queryKeys.computers.all, 'providers'],
+    sshKey: () => [...queryKeys.computers.all, 'ssh-key'],
+  },
+  // A pairing is minted by a POST and then polled; the mint is cached so a
+  // render never mints twice, and each token's status keys apart from it.
+  // Not under `computers`: it is no machine yet, and refreshing the machines
+  // must never mint a new command under the one the user is running.
+  sshPairings: {
+    all:    ['ssh-pairings'],
+    // One per computer it reconnects, and one for a new machine, so a create
+    // and a reconnect never show each other's command.
+    mint:   (computerId?: string | null) => [...queryKeys.sshPairings.all, 'mint', computerId ?? 'new'],
+    status: (token: string) => [...queryKeys.sshPairings.all, 'status', token],
+  },
+  // Read from the desktop shell, not the server: what this Mac's own helper
+  // says, so it is not under `computers`, whose refreshes go to the server.
+  desktop: {
+    all:           ['desktop'],
+    remoteControl: () => [...queryKeys.desktop.all, 'remote-control'],
   },
   threads: {
     all:         ['threads'],
@@ -105,11 +132,20 @@ export const queryKeys = {
     recentAll:   () => [...queryKeys.threads.all, 'recent'],
     recent:      (limit: number) => [...queryKeys.threads.recentAll(), limit],
     status:      (threadId: string) => [...queryKeys.threads.all, 'status', threadId],
-    // Batched dispatch-liveness read for a turn's PTC cards. The base key
-    // targets every id-set variant for invalidation; the concrete key is stable
-    // on the SORTED id set so registration order never churns the cache entry.
+    // The wakeups the agent set in the thread, and its price targets from
+    // before them. Under the prefix, so a feed reconnect's resync re-reads it.
+    wakeups:     (threadId: string) => [...queryKeys.threads.all, 'wakeups', threadId],
+    // The commands that outlasted their tool's wait and ran on in the
+    // background. Under the prefix for the same reason as the wakeups.
+    commands:    (threadId: string) => [...queryKeys.threads.all, 'commands', threadId],
+    // Batched dispatch-liveness read for a turn's PTC cards: their threads,
+    // the hand-offs' own runs, and the steers of those steered into a run
+    // already going. The base key targets every id-set variant for
+    // invalidation; the concrete key is stable on the SORTED id sets so
+    // registration order never churns the cache entry.
     dispatchLivenessAll: () => [...queryKeys.threads.all, 'dispatch-liveness'],
-    dispatchLiveness: (ids: string[]) => [...queryKeys.threads.dispatchLivenessAll(), [...ids].sort()],
+    dispatchLiveness: ({ threads, runs, steers }: { threads: readonly string[]; runs: readonly string[]; steers: readonly string[] }) =>
+      [...queryKeys.threads.dispatchLivenessAll(), { threads: [...threads].sort(), runs: [...runs].sort(), steers: [...steers].sort() }],
     // The same read keyed on the threads' run states as well, so a run that
     // starts or settles is a fresh read of how long each has been quiet.
     dispatchActivity: (ids: string[], revision: string) =>
@@ -117,6 +153,9 @@ export const queryKeys = {
   },
   workspaceFiles: {
     all:  ['workspaceFiles'],
+    // Every listing and body of one workspace, for a change that rewrites
+    // its whole folder (a restore from its backup).
+    workspace: (wsId: string) => [...queryKeys.workspaceFiles.all, wsId],
     byWs: (wsId: string, opts?: Record<string, unknown>) => [...queryKeys.workspaceFiles.all, wsId, opts],
     // One file's bytes. `mode` rides in the key because the same path answers
     // in a different shape per reader — paginated text, full source, an
@@ -261,6 +300,11 @@ export const queryKeys = {
     all:    ['quote'],
     detail: (symbol: string) => [...queryKeys.quote.all, symbol],
   },
+  insights: {
+    all:         ['insights'],
+    // Today's market-wide brief, as markdown for the agent.
+    marketBrief: () => [...queryKeys.insights.all, 'market-brief'],
+  },
   // DALTON-HOOK(query-keys): Dalton OpenClaw sync, native-model sync, budget, and coverage board query keys
   dalton: {
     all:             ['dalton'],
@@ -280,6 +324,8 @@ export const queryKeys = {
     systemJobs:      () => [...queryKeys.dalton.all, 'system-jobs'],
     // DALTON-HOOK(workspace-sharing-settings): per-workspace sharing settings query key
     sharing:         (workspaceId: string) => [...queryKeys.dalton.all, 'sharing', workspaceId],
+    // DALTON-HOOK(colleague-dispatch): user-level Chief of Staff sharing settings query key
+    userSharing:     () => [...queryKeys.dalton.all, 'sharing', 'user-settings'],
     // DALTON-HOOK(user-coverage): Dashboard earnings calendar query key scoped by tab ('mine' | 'market') and user
     earningsCalendar: (
       scope: 'mine' | 'market',

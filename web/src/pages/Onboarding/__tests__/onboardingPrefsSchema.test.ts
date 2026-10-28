@@ -21,6 +21,7 @@ describe('migrateOnboardingPrefs', () => {
       gettingStartedDismissedAt: 9,
       lastSeenReleaseVersion: 123, // wrong type → null
       firstRunAt: 42,
+      welcomeSkippedAt: 'yesterday', // wrong type → null
       foo: 'ignored',
     });
 
@@ -30,7 +31,13 @@ describe('migrateOnboardingPrefs', () => {
     expect(result.gettingStartedDismissedAt).toBe(9);
     expect(result.lastSeenReleaseVersion).toBeNull();
     expect(result.firstRunAt).toBe(42);
+    expect(result.welcomeSkippedAt).toBeNull();
     expect(result).not.toHaveProperty('foo');
+  });
+
+  it('keeps a welcome skip, and reads a blob from before it as never skipped', () => {
+    expect(migrateOnboardingPrefs({ welcomeSkippedAt: 77 }).welcomeSkippedAt).toBe(77);
+    expect(migrateOnboardingPrefs({ firstRunAt: 1 }).welcomeSkippedAt).toBeNull();
   });
 
   it('coerces a negative dismissal timestamp to null', () => {

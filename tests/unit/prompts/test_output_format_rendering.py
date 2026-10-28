@@ -3,12 +3,14 @@
 Renders ``components/user_profile.md.j2`` and asserts the HTML-steering block
 appears iff ``main_agent_steering`` (the main agent's copy; a subagent's
 leaves it out) and ``agent_preference.output_format == "html"``, and never
-double-renders the ``output_format`` key in the generic preference loop.
+double-renders the ``output_format`` key in the generic preference loop
+unless its value is outside the vocabulary.
 """
 
 import pytest
 
-from ptc_agent.agent.prompts import get_loader, reset_loader
+from ptc_agent.agent.middleware.runtime_context.profile import render_user_profile
+from ptc_agent.agent.prompts import reset_loader
 
 HTML_BLOCK_MARKER = "Output Format: Styled HTML"
 SKILL_REFS = (".agents/skills/html-report/SKILL.md", ".agents/skills/ui-design/SKILL.md")
@@ -21,16 +23,10 @@ def _render(agent_preference, main_agent_steering=True):
     for a subagent's prompt. Defaults to True so the main agent is the baseline.
     """
     reset_loader()
-    loader = get_loader()
     profile = {"name": "Demo", "timezone": "UTC", "locale": "en-US"}
     if agent_preference is not None:
         profile["agent_preference"] = agent_preference
-    return loader.render(
-        "components/user_profile.md.j2",
-        user_profile=profile,
-        user_data_counts=None,
-        main_agent_steering=main_agent_steering,
-    )
+    return render_user_profile(profile, main_agent_steering=main_agent_steering)
 
 
 @pytest.fixture(autouse=True)
@@ -87,7 +83,7 @@ class TestHtmlSteeringBlock:
 
 
 class TestGenericLoop:
-    """output_format is excluded from the generic key/value loop."""
+    """output_format in its vocabulary is excluded from the generic key/value loop."""
 
     def test_output_format_not_double_rendered(self):
         out = _render({"output_format": "html", "proactive_questions": "sometimes"})
@@ -115,3 +111,17 @@ class TestGenericLoop:
         for line in prefs_section.splitlines():
             assert line.strip() != "-"
             assert line.strip() != "- **"
+
+    def test_no_lead_line_over_an_empty_list(self):
+        # With nothing for the loop to print, its lead-in goes too; and a
+        # subagent, which gets no HTML block, gets no section at all.
+        assert "You MUST follow" not in _render({"output_format": "html"})
+        out = _render({"output_format": "html"}, main_agent_steering=False)
+        assert "## Agent Preferences" not in out
+
+    def test_a_format_outside_the_vocabulary_prints_like_any_other_key(self):
+        """Only a value that selects a section is kept off the list: anything
+        else is the user's own words and reaches the model as they wrote it."""
+        out = _render({"output_format": "pdf"})
+        assert HTML_BLOCK_MARKER not in out
+        assert "- **output_format**: pdf" in out

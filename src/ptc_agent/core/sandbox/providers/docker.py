@@ -15,21 +15,18 @@ import asyncio
 import base64
 import io
 import os
-import re
 import shlex
 import tarfile
+import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from typing import Any
 
 import structlog
 
-from ptc_agent.config.core import DockerConfig
+from ptc_agent.config.core import DockerConfig, PlatformSecretDefinition
 from ptc_agent.core.sandbox._defaults import sandbox_thread_env
-from ptc_agent.core.sandbox.providers._chart_capture import (
-    build_code_wrapper,
-    extract_artifacts,
-)
+from ptc_agent.core.sandbox.providers._exec_sessions import ExecSessionRuntime
 from ptc_agent.core.sandbox.providers._tiers import (
     TierSizing,
     applied_cpus,
@@ -37,17 +34,13 @@ from ptc_agent.core.sandbox.providers._tiers import (
     resolve_tier,
 )
 from ptc_agent.core.sandbox.runtime import (
-    CodeRunResult,
     ExecResult,
     PreviewInfo,
     RuntimeState,
     SandboxProvider,
     SandboxGoneError,
     SandboxFailureKind,
-    SandboxRuntime,
     SandboxTransientError,
-    SessionCommandResult,
-    SessionState,
     STREAM_CHUNK_BYTES,
 )
 
@@ -68,54 +61,8 @@ _DOCKER_STATE_MAP: dict[str, RuntimeState] = {
 
 
 # ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-
-_SESSION_ID_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
-
-# Every session script starts with this. Session state sits on the container's
-# disk, which outlives a stop, while the processes it names do not.
-#
-# ``R`` is the current run's directory, named by the start time of the
-# container's PID 1, which every start replaces. A stop ends every process in
-# the container, so a restart begins with no sessions, as on Daytona.
-#
-# ``st`` prints a pid's start time in clock ticks since boot: field 22 of its
-# stat, counted after the command name, which may hold spaces. A process later
-# given the same pid starts later, so a command's .pid holds its wrapper's pid
-# and start time, and ``live`` checks that the wrapper is still the process
-# behind that pid before the command reads as running or is signalled.
-_SESSIONS_ROOT = "/tmp/.sessions"
-_SESSION_SH = (
-    'st() { local s; { read -r s < "/proc/$1/stat"; } 2>/dev/null || return 1; '
-    's=${s##*) }; set -- $s; echo "${20}"; }; '
-    'live() { local p t; { read -r p t < "$1"; } 2>/dev/null; '
-    'case $p in ""|*[!0-9]*) return 1;; esac; '
-    '[ -n "$t" ] && [ "$(st "$p")" = "$t" ]; }; '
-    f"R={_SESSIONS_ROOT}/run-$(st 1); "
-)
-# The code a shell reports for a SIGKILL, which is how a wrapper ends without
-# writing its exit code (the OOM killer, or a kill -9).
-_KILLED_EXIT = 137
-
-
-# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
-def _status_sh(name: str) -> str:
-    """Shell that sets ``e`` to command ``name``'s exit code, empty while it runs.
-
-    Liveness is read before the exit code because the wrapper writes the code
-    before it ends: one still missing after the wrapper was seen gone is never
-    coming. A command with no .pid yet is still launching.
-    """
-    return (
-        f"a=1; [ ! -e {name}.pid ] || live {name}.pid || a=0; "
-        f"e=$(cat {name}.exit 2>/dev/null); "
-        f"[ -n \"$e\" ] || [ $a = 1 ] || e={_KILLED_EXIT}; "
-    )
 
 
 def _parse_proxy_port_range(range_str: str) -> list[int]:
@@ -164,7 +111,7 @@ async def _remove_quietly(container: Any, name: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-class DockerRuntime(SandboxRuntime):
+class DockerRuntime(ExecSessionRuntime):
     """Runtime that wraps a single Docker container."""
 
     def __init__(
@@ -231,8 +178,10 @@ class DockerRuntime(SandboxRuntime):
 
     # -- Execution --
 
-    async def exec(self, command: str, timeout: int = 60) -> ExecResult:
-        return await self._exec(command, timeout)
+    async def exec(
+        self, command: str, timeout: int = 60, *, env: dict[str, str] | None = None
+    ) -> ExecResult:
+        return await self._exec(command, timeout, env=env)
 
     async def exec_as_root(
         self, command: str, timeout: int = 60, env: dict[str, str] | None = None
@@ -280,84 +229,6 @@ class DockerRuntime(SandboxRuntime):
                 raise SandboxTransientError(str(e)) from e
             return ExecResult(stdout="", stderr=str(e), exit_code=-1)
 
-    async def code_run(
-        self,
-        code: str,
-        env: dict[str, str] | None = None,
-        timeout: int = 300,
-    ) -> CodeRunResult:
-        wrapper = build_code_wrapper(code)
-        encoded = base64.b64encode(wrapper.encode("utf-8")).decode("ascii")
-
-        script_name = f"_exec_{uuid.uuid4().hex[:8]}.py"
-        script_path = f"{self._working_dir}/{script_name}"
-
-        # Write script via exec (avoids tar overhead for a single small file)
-        write_cmd = (
-            f"python3 -I -c \"import base64,sys; "
-            f"sys.stdout.buffer.write(base64.b64decode('{encoded}'))\" "
-            f"> {shlex.quote(script_path)}"
-        )
-        write_result = await self.exec(write_cmd, timeout=15)
-        if write_result.exit_code != 0:
-            return CodeRunResult(
-                stdout="",
-                stderr=f"Failed to write script: {write_result.stderr or write_result.stdout}",
-                exit_code=write_result.exit_code,
-                artifacts=[],
-            )
-
-        # Build environment exports
-        env_prefix = ""
-        if env:
-            exports = " ".join(f"{k}={_shell_escape(v)}" for k, v in env.items())
-            env_prefix = f"export {exports} && "
-
-        stderr_path = f"{self._working_dir}/_stderr_{uuid.uuid4().hex[:8]}.txt"
-        run_cmd = (
-            f"{env_prefix}python3 {shlex.quote(script_path)} "
-            f"2>{shlex.quote(stderr_path)}"
-        )
-
-        # Run the code. We parse combined stdout for artifacts. The turn's
-        # own directory is reached by the shipped ``sitecustomize.py``, which
-        # reads ``PTC_TURN_CWD`` out of ``env`` above; the script and its
-        # stderr file are runtime scratch and stay where the container puts
-        # them.
-        exec_result = await self.exec(run_cmd, timeout=timeout)
-
-        # Extract chart artifacts from stdout markers
-        artifacts, clean_stdout = extract_artifacts(exec_result.stdout)
-
-        # Read stderr from temp file only on failure (avoids extra exec round-trip
-        # on the happy path — the consumer only needs stderr for auto-install detection)
-        stderr = ""
-        if exec_result.exit_code != 0:
-            try:
-                cat_result = await self.exec(
-                    f"cat {shlex.quote(stderr_path)} 2>/dev/null", timeout=5
-                )
-                if cat_result.exit_code == 0:
-                    stderr = cat_result.stdout
-            except Exception:
-                pass
-
-        # Cleanup temp files (best-effort)
-        try:
-            await self.exec(
-                f"rm -f {shlex.quote(script_path)} {shlex.quote(stderr_path)}",
-                timeout=5,
-            )
-        except Exception:
-            pass
-
-        return CodeRunResult(
-            stdout=clean_stdout,
-            stderr=stderr,
-            exit_code=exec_result.exit_code,
-            artifacts=artifacts,
-        )
-
     # -- File I/O --
 
     async def upload_file(self, content: bytes, dest_path: str) -> None:
@@ -394,20 +265,8 @@ class DockerRuntime(SandboxRuntime):
             )
             await self.exec(mkdir_cmd, timeout=30)
 
-        # Build one tar archive with full absolute paths.
-        buf = io.BytesIO()
         uid, gid = await self._owner_ids()
-        with tarfile.open(fileobj=buf, mode="w") as tar:
-            for data, dest_path in prepared:
-                tar_name = dest_path.lstrip("/")
-                info = tarfile.TarInfo(name=tar_name)
-                info.size = len(data)
-                info.mode = 0o644
-                info.uid, info.gid = uid, gid
-                tar.addfile(info, io.BytesIO(data))
-        buf.seek(0)
-
-        await self._container.put_archive("/", buf.read())
+        await self._container.put_archive("/", _upload_tar(prepared, uid, gid))
 
     async def download_file(self, path: str) -> bytes:
         if self._dev_mode and self._host_work_dir:
@@ -578,194 +437,7 @@ class DockerRuntime(SandboxRuntime):
             cls._server_side_host = "http://localhost"
         return cls._server_side_host
 
-    # -- Sessions --
-
-    async def create_session(self, session_id: str) -> None:
-        if not _SESSION_ID_RE.match(session_id):
-            raise ValueError(f"Invalid session_id: {session_id!r}")
-        # Exit 3 marks an existing session. An earlier run's directory names
-        # nothing that is still running, so it goes.
-        result = await self.exec(
-            f"{_SESSION_SH}[ -e $R/{session_id} ] && exit 3; "
-            f"mkdir -p $R/{session_id} || exit 1; "
-            f"for d in {_SESSIONS_ROOT}/run-*; do [ $d = $R ] || rm -rf $d; done; true",
-            timeout=10,
-        )
-        if result.exit_code == 3:
-            raise RuntimeError(f"Session already exists: {session_id}")
-        if result.exit_code != 0:
-            detail = (result.stderr or result.stdout).strip()
-            raise RuntimeError(
-                f"Could not create session {session_id} (exit {result.exit_code}): {detail}"
-            )
-
-    async def session_execute(
-        self,
-        session_id: str,
-        command: str,
-        *,
-        run_async: bool = False,
-        timeout: int = 60,
-    ) -> SessionCommandResult:
-        if not _SESSION_ID_RE.match(session_id):
-            raise ValueError(f"Invalid session_id: {session_id!r}")
-        cmd_id = uuid.uuid4().hex[:8]
-
-        if run_async:
-            encoded = base64.b64encode(command.encode()).decode("ascii")
-            # Use setsid to create a new process group so delete_session
-            # can kill the entire tree (not just the wrapper). The command
-            # runs in a subshell so its own `exit` still reaches the .exit
-            # write, and with no arguments, so the session directory the
-            # wrapper takes as $1 stays out of its view.
-            # The wrapper is bash, so field 22 of its stat is its start time.
-            # Its .pid is written aside and renamed in, so no reader sees half
-            # of it. A stop can land before then: delete_session moves the
-            # session aside before reading PIDs, so the rename fails and a
-            # command the stop missed never runs.
-            wrapped = (
-                f"{_SESSION_SH}D=$R/{session_id}; "
-                "nohup setsid bash -c '"
-                f"echo \"$$ $(cut -d\" \" -f22 /proc/$$/stat 2>/dev/null)\" > $1/{cmd_id}.new "
-                f"&& mv $1/{cmd_id}.new $1/{cmd_id}.pid || exit; "
-                f"( set --; eval \"$(echo {encoded} | base64 -d)\" ); "
-                f"echo $? > $1/{cmd_id}.exit"
-                f"' bash $D > $D/{cmd_id}.stdout 2> $D/{cmd_id}.stderr &"
-            )
-            await self.exec(wrapped, timeout=10)
-            return SessionCommandResult(cmd_id=cmd_id, exit_code=None, stdout="", stderr="")
-
-        result = await self.exec(command, timeout=timeout)
-        return SessionCommandResult(
-            cmd_id=cmd_id,
-            exit_code=result.exit_code,
-            stdout=result.stdout,
-            stderr=result.stderr,
-        )
-
-    async def session_command_logs(
-        self, session_id: str, command_id: str
-    ) -> SessionCommandResult:
-        if not _SESSION_ID_RE.match(session_id):
-            raise ValueError(f"Invalid session_id: {session_id!r}")
-        if not _SESSION_ID_RE.match(command_id):
-            raise ValueError(f"Invalid command_id: {command_id!r}")
-        # Single exec round-trip: emit all three files separated by a null
-        # byte. The exit code is read first, so a finished status never pairs
-        # with output read before the last of it was written. Exit 3 marks a
-        # missing session.
-        _SEP = "\\x00"
-        result = await self.exec(
-            f"{_SESSION_SH}cd $R/{session_id} 2>/dev/null || exit 3; "
-            f"{_status_sh(command_id)}"
-            f"cat {command_id}.stdout 2>/dev/null; "
-            f"printf '{_SEP}'; "
-            f"cat {command_id}.stderr 2>/dev/null; "
-            f"printf '{_SEP}%s' \"$e\"",
-            timeout=5,
-        )
-        if result.exit_code == 3:
-            raise FileNotFoundError(f"No session {session_id}")
-        parts = result.stdout.split("\x00", 2)
-        stdout = parts[0] if len(parts) > 0 else ""
-        stderr = parts[1] if len(parts) > 1 else ""
-        exit_str = parts[2].strip() if len(parts) > 2 else ""
-        exit_code = int(exit_str) if exit_str.isdigit() else None
-        return SessionCommandResult(
-            cmd_id=command_id,
-            exit_code=exit_code,
-            stdout=stdout,
-            stderr=stderr,
-        )
-
-    async def session_logs(self, session_id: str) -> SessionCommandResult | None:
-        if not _SESSION_ID_RE.match(session_id):
-            raise ValueError(f"Invalid session_id: {session_id!r}")
-        _SEP = "\\x00"
-        latest = _status_sh('"$id"')
-        # Exit 3 marks a missing session; the newest .pid names its command.
-        # Its exit code is read before its output, as in session_command_logs.
-        result = await self.exec(
-            f"{_SESSION_SH}cd $R/{session_id} 2>/dev/null || exit 3; "
-            "id=$(ls -t -- *.pid 2>/dev/null | head -1); id=${id%.pid}; "
-            f"{latest}"
-            f"printf '%s{_SEP}' \"$id\"; "
-            f"cat \"$id.stdout\" 2>/dev/null; printf '{_SEP}'; "
-            f"cat \"$id.stderr\" 2>/dev/null; printf '{_SEP}%s' \"$e\"; true",
-            timeout=5,
-        )
-        if result.exit_code == 3:
-            return None
-        parts = result.stdout.split("\x00", 3) + ["", "", "", ""]
-        exit_str = parts[3].strip()
-        return SessionCommandResult(
-            cmd_id=parts[0],
-            exit_code=int(exit_str) if exit_str.isdigit() else None,
-            stdout=parts[1],
-            stderr=parts[2],
-        )
-
-    async def list_sessions(self) -> list[SessionState]:
-        # A session runs while one of its commands has a live wrapper and no
-        # .exit, or while it has no .pid at all: a launch is about to use it,
-        # so eviction leaves it alone.
-        result = await self.exec(
-            f"{_SESSION_SH}cd $R 2>/dev/null || exit 0; "
-            "for d in */; do [ -d \"$d\" ] || continue; n=0; r=0; "
-            "for p in \"$d\"*.pid; do [ -e \"$p\" ] || continue; n=1; "
-            "live \"$p\" && [ ! -e \"${p%.pid}.exit\" ] && r=1; done; "
-            "[ $n = 0 ] && r=1; "
-            "echo \"${d%/} $r\"; done",
-            timeout=10,
-        )
-        states = []
-        for line in result.stdout.splitlines():
-            name, _, running = line.rpartition(" ")
-            if name:
-                states.append(SessionState(session_id=name, running=running == "1"))
-        return states
-
-    async def delete_session(self, session_id: str) -> None:
-        if not _SESSION_ID_RE.match(session_id):
-            raise ValueError(f"Invalid session_id: {session_id!r}")
-        # One rename takes the session away before its PIDs are read, so a
-        # launch that has not written its .pid yet finds it gone and never
-        # runs (session_execute). Hidden, so list_sessions skips it. Exit 3
-        # marks a missing session.
-        #
-        # Kill the entire process group (negative PID) so child processes
-        # spawned by the session command are also terminated. A group's id is
-        # not handed out again while the group has a member, so with the
-        # wrapper gone, a group by that id is, short of a full wrap of the pid
-        # space, what the command left behind. A pid that names another
-        # process now is not this command's to signal.
-        result = await self.exec(
-            f"{_SESSION_SH}D=$R/{session_id}; X=$R/.{session_id}.$$; "
-            "mv $D $X || { [ -e $D ] || exit 3; exit 1; }; "
-            "for f in $X/*.pid; do "
-            "  { read -r pid start < \"$f\"; } 2>/dev/null; "
-            "  case $pid in \"\"|*[!0-9]*) continue;; esac; "
-            "  now=$(st $pid); "
-            "  if [ \"$now\" = \"$start\" ]; then kill -- -$pid; kill $pid; "
-            "  elif [ -z \"$now\" ]; then kill -- -$pid; fi; "
-            "done 2>/dev/null; rm -rf $X",
-            timeout=10,
-        )
-        if result.exit_code == 3:
-            raise FileNotFoundError(f"No session {session_id}")
-        # A timeout or a failed exec comes back as -1, and the command may
-        # still be running, so only 0 is a stop.
-        if result.exit_code != 0:
-            detail = (result.stderr or result.stdout).strip()
-            raise RuntimeError(
-                f"Could not delete session {session_id} (exit {result.exit_code}): {detail}"
-            )
-
     # -- Capabilities & metadata --
-
-    @property
-    def capabilities(self) -> set[str]:
-        return {"exec", "code_run", "file_io", "preview_url", "sessions"}
 
     async def archive(self) -> None:
         raise NotImplementedError("Docker provider does not support archive")
@@ -829,17 +501,9 @@ class DockerRuntime(SandboxRuntime):
             await self.exec(f"mkdir -p {shlex.quote(parent)}", timeout=10)
 
         uid, gid = await self._owner_ids()
-        buf = io.BytesIO()
-        tar_name = dest_path.lstrip("/")
-        with tarfile.open(fileobj=buf, mode="w") as tar:
-            info = tarfile.TarInfo(name=tar_name)
-            info.size = len(content)
-            info.mode = 0o644
-            info.uid, info.gid = uid, gid
-            tar.addfile(info, io.BytesIO(content))
-        buf.seek(0)
-
-        await self._container.put_archive("/", buf.read())
+        await self._container.put_archive(
+            "/", _upload_tar([(content, dest_path)], uid, gid)
+        )
 
     async def _exec_download(self, path: str) -> bytes:
         """Download a file via exec + base64 (avoids Docker archive API issues)."""
@@ -885,7 +549,23 @@ class DockerRuntime(SandboxRuntime):
 class DockerProvider(SandboxProvider):
     """Provider that manages sandboxes as Docker containers."""
 
-    def __init__(self, config: DockerConfig, working_dir: str | None = None) -> None:
+    label = "Docker"
+    runs_remote = False
+    default_computer_name = "Local computer"
+
+    @classmethod
+    def reports_own_disk(cls, settings: Any) -> bool:
+        # Without a storage quota a container's disk is the host's.
+        return bool(settings.storage_quota_enabled)
+
+    def __init__(
+        self,
+        config: DockerConfig,
+        working_dir: str | None = None,
+        *,
+        # A container holds no platform Secrets, so the catalog is not needed.
+        platform_secrets: Sequence[PlatformSecretDefinition] = (),
+    ) -> None:
         self._config = config
         # filesystem.working_directory is the single source of truth;
         # fall back to DockerConfig.working_dir only if not provided.
@@ -1358,6 +1038,27 @@ def _read_source(source: bytes | str) -> bytes:
         with open(source, "rb") as f:
             return f.read()
     return source
+
+
+def _upload_tar(entries: Sequence[tuple[bytes, str]], uid: int, gid: int) -> bytes:
+    """A ``put_archive`` tar of ``(content, absolute path)`` stamped with now.
+
+    Extraction applies each entry's mtime, which ``TarInfo`` leaves at 0, so
+    every upload landed at the epoch and a same-size rewrite changed neither
+    half of the ``(mtime, size)`` stamp the sandbox detects changes by. A float
+    mtime is written as a PAX record, which keeps its sub-second part.
+    """
+    now = time.time()
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w", format=tarfile.PAX_FORMAT) as tar:
+        for data, dest_path in entries:
+            info = tarfile.TarInfo(name=dest_path.lstrip("/"))
+            info.size = len(data)
+            info.mode = 0o644
+            info.uid, info.gid = uid, gid
+            info.mtime = now
+            tar.addfile(info, io.BytesIO(data))
+    return buf.getvalue()
 
 
 def _shell_escape(value: str) -> str:

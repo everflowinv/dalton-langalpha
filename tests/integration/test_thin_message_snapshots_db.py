@@ -20,7 +20,6 @@ from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.graph import START, StateGraph
 from langgraph.graph.message import add_messages
 
-import src.server.utils.checkpointer  # noqa: F401  (installs the walk guard)
 from ptc_agent.agent.state import DeltaAgentState, messages_delta_reducer
 from scripts.ops import thin_message_snapshots as thinning
 from scripts.ops._delta_loads import (
@@ -137,11 +136,11 @@ async def test_thinning_keeps_every_load_the_same(test_db_pool, test_db_uri, see
     out = await thinning.thin_thread(test_db_uri, thread_id, tip, Mode.APPLY, _EVERYTHING)
 
     assert out.status is Status.WRITTEN, (out.status, out.reason)
-    assert out.report.dropped > 0 and out.report.reclaimed > 0
+    assert out.report.dropped > 0 and out.report.dropped_bytes > 0
     assert len(out.checks) == len(before) and all(c.match for c in out.checks)
     assert out.report.anchors_match and out.committed_match
     _, blobs_after = await _rows(test_db_uri, thread_id)
-    assert len(blobs_after) == len(blobs_before) - out.report.dropped + out.report.seeded
+    assert len(blobs_after) == len(blobs_before) - out.report.dropped
     after = await _loads(test_db_uri, thread_id)
     assert {c: d for c, (d, _) in after.items()} == {c: d for c, (d, _) in before.items()}
     assert after[tip][1] <= before[tip][1]
@@ -177,7 +176,7 @@ async def test_a_fork_tip_keeps_the_snapshot_it_loads(test_db_pool, test_db_uri,
     async with await psycopg.AsyncConnection.connect(test_db_uri, autocommit=True) as conn:
         tree, sizes = await read_tree(conn, thread_id)
     flags = {c for c, n in tree.nodes.items() if n.flagged}
-    seed, _ = tree.walk(fork_tip, flags)
+    seed, _ = tree.walk(fork_tip, set(sizes), flags)
     fork_version = (
         tree.nodes[fork_tip].version
         if tree.nodes[fork_tip].version in sizes
@@ -303,9 +302,7 @@ async def _keep_all(test_db_uri: str, thread_id: str, tip: str, mode: Mode = Mod
     return await thinning.thin_thread(test_db_uri, thread_id, tip, mode, _KEEP_ALL)
 
 
-async def test_keep_all_flags_the_lists_of_a_thread_that_has_not_crossed(
-    test_db_pool, test_db_uri, seed_workspace
-):
+async def test_keep_all_flags_every_stored_list(test_db_pool, test_db_uri, seed_workspace):
     thread_id, ends = await _migrated(test_db_pool, test_db_uri, seed_workspace, pre_delta=3, delta=0)
     before = await _loads(test_db_uri, thread_id)
     _, blobs_before = await _rows(test_db_uri, thread_id)
@@ -314,7 +311,7 @@ async def test_keep_all_flags_the_lists_of_a_thread_that_has_not_crossed(
 
     assert out.status is Status.WRITTEN, (out.status, out.reason)
     report = out.report
-    assert (report.dropped, report.seeded, report.promoted) == (0, 0, report.blobs)
+    assert (report.dropped, report.promoted) == (0, report.blobs)
     assert all(c.match for c in out.checks) and out.committed_match
     assert set(ends) <= await _flagged(test_db_uri, thread_id)
     assert await _loads(test_db_uri, thread_id) == before
@@ -322,11 +319,16 @@ async def test_keep_all_flags_the_lists_of_a_thread_that_has_not_crossed(
     assert not await _listed_for_keep_all(test_db_uri, thread_id)
 
 
-async def test_after_keep_all_the_first_delta_turn_continues_the_stored_list(
-    test_db_pool, test_db_uri, seed_workspace
+@pytest.mark.parametrize("flagged", [False, True], ids=["stored", "flagged"])
+async def test_the_first_delta_turn_continues_the_stored_list(
+    test_db_pool, test_db_uri, seed_workspace, flagged
 ):
+    """A walk stops at a stored list whether or not it is flagged, so a
+    migrated thread's first delta turn never replays the old writes from the
+    root, the assumption the scripts' plans rest on."""
     thread_id, ends = await _migrated(test_db_pool, test_db_uri, seed_workspace, pre_delta=3, delta=0)
-    await _keep_all(test_db_uri, thread_id, ends[-1])
+    if flagged:
+        await _keep_all(test_db_uri, thread_id, ends[-1])
     stored, _ = await _load(test_db_uri, thread_id, ends[-1])
 
     tip = await _turns(AsyncPostgresSaver(test_db_pool), thread_id, 1, start=3, delta=DeltaAgentState)
@@ -336,11 +338,13 @@ async def test_after_keep_all_the_first_delta_turn_continues_the_stored_list(
     assert walk.seed and walk.writes == 2  # seeded at the list: the input and the reply
 
 
-async def test_after_keep_all_a_branch_forked_at_an_older_list_continues_it(
-    test_db_pool, test_db_uri, seed_workspace
+@pytest.mark.parametrize("flagged", [False, True], ids=["stored", "flagged"])
+async def test_a_branch_forked_at_an_older_list_continues_it(
+    test_db_pool, test_db_uri, seed_workspace, flagged
 ):
-    thread_id, ends = await _migrated(test_db_pool, test_db_uri, seed_workspace, pre_delta=3, delta=0)
-    await _keep_all(test_db_uri, thread_id, ends[-1])
+    thread_id, ends = await _migrated(test_db_pool, test_db_uri, seed_workspace, pre_delta=2, delta=1)
+    if flagged:
+        await _keep_all(test_db_uri, thread_id, ends[-1])
     stored, _ = await _load(test_db_uri, thread_id, ends[0])
 
     tip = await _turns(
@@ -352,46 +356,7 @@ async def test_after_keep_all_a_branch_forked_at_an_older_list_continues_it(
     assert walk.seed and walk.writes == 2
 
 
-async def test_keep_all_seeds_a_crossed_thread_with_the_value_it_loads_today(
-    test_db_pool, test_db_uri, seed_workspace
-):
-    thread_id, ends = await _migrated(test_db_pool, test_db_uri, seed_workspace, pre_delta=2, delta=1)
-    before = await _loads(test_db_uri, thread_id)
-
-    out = await _keep_all(test_db_uri, thread_id, ends[-1])
-
-    assert out.status is Status.WRITTEN, (out.status, out.reason)
-    assert (out.report.dropped, out.report.seeded) == (0, 1)
-    assert all(c.match for c in out.checks) and out.committed_match
-    tip = out.committed
-    assert tip is not None and tip.before.pages and not tip.before.seed  # walked to the root
-    assert tip.after is not None and tip.after.chain < tip.before.chain
-    assert {c: d for c, (d, _) in (await _loads(test_db_uri, thread_id)).items()} == {
-        c: d for c, (d, _) in before.items()
-    }
-
-
-async def test_keep_all_flags_the_lists_a_crossed_walk_passed_over(
-    test_db_pool, test_db_uri, seed_workspace
-):
-    """A list a delta walk passes over is flagged too, or a branch off it
-    would replay the old writes from the root."""
-    thread_id, ends = await _migrated(test_db_pool, test_db_uri, seed_workspace, pre_delta=2, delta=1)
-
-    out = await _keep_all(test_db_uri, thread_id, ends[-1])
-
-    assert out.status is Status.WRITTEN, (out.status, out.reason)
-    assert ends[0] in await _flagged(test_db_uri, thread_id)
-    stored, _ = await _load(test_db_uri, thread_id, ends[0])
-    tip = await _turns(
-        AsyncPostgresSaver(test_db_pool), thread_id, 1, start=100, at=ends[0], delta=DeltaAgentState
-    )
-    after, walk = await _load(test_db_uri, thread_id, tip)
-    assert _continues(stored, after)
-    assert walk.seed and walk.writes == 2
-
-
-@pytest.mark.parametrize(("pre_delta", "delta"), [(3, 0), (2, 1)], ids=["not crossed", "crossed"])
+@pytest.mark.parametrize(("pre_delta", "delta"), [(3, 0), (2, 1)], ids=["lists", "then delta"])
 async def test_keep_all_dry_run_and_rehearsal_leave_the_thread_as_it_was(
     test_db_pool, test_db_uri, seed_workspace, pre_delta, delta
 ):
@@ -409,7 +374,7 @@ async def test_keep_all_dry_run_and_rehearsal_leave_the_thread_as_it_was(
     assert await _listed_for_keep_all(test_db_uri, thread_id)
 
 
-@pytest.mark.parametrize(("pre_delta", "delta"), [(3, 0), (2, 1)], ids=["not crossed", "crossed"])
+@pytest.mark.parametrize(("pre_delta", "delta"), [(3, 0), (2, 1)], ids=["lists", "then delta"])
 async def test_keep_all_rerun_is_a_no_op(test_db_pool, test_db_uri, seed_workspace, pre_delta, delta):
     thread_id, ends = await _migrated(
         test_db_pool, test_db_uri, seed_workspace, pre_delta=pre_delta, delta=delta
@@ -444,33 +409,6 @@ async def test_keep_all_skips_a_checkpoint_that_changes_before_the_write(
 
     assert (out.status, out.reason) == (Status.SKIPPED, "a checkpoint changed concurrently")
     assert await _rows(test_db_uri, thread_id) == rows
-
-
-async def test_keep_all_never_seeds_over_a_stored_list(test_db_pool, test_db_uri, seed_workspace):
-    """A list stored where a crossing walk would be seeded is flagged as one."""
-    thread_id, ends = await _migrated(test_db_pool, test_db_uri, seed_workspace, pre_delta=1, delta=1)
-    async with await psycopg.AsyncConnection.connect(test_db_uri, autocommit=True) as conn:
-        tree, sizes = await read_tree(conn, thread_id)
-        first_delta = next(
-            c for c in tree.order if tree.nodes[c].version and tree.nodes[c].version not in sizes
-        )
-        await conn.execute(
-            "INSERT INTO checkpoint_blobs (thread_id, checkpoint_ns, channel, version, type, blob)"
-            " VALUES (%s, '', 'messages', %s, 'msgpack', '\\x90'::bytea)",
-            (thread_id, tree.nodes[first_delta].version),
-        )
-    before = await _loads(test_db_uri, thread_id)
-    _, blobs = await _rows(test_db_uri, thread_id)
-
-    out = await _keep_all(test_db_uri, thread_id, ends[-1])
-
-    assert out.status is Status.WRITTEN, (out.status, out.reason)
-    assert first_delta in await _flagged(test_db_uri, thread_id)
-    _, blobs_after = await _rows(test_db_uri, thread_id)
-    assert set(blobs) <= set(blobs_after) and len(blobs_after) == len(blobs) + out.report.seeded
-    assert {c: d for c, (d, _) in (await _loads(test_db_uri, thread_id)).items()} == {
-        c: d for c, (d, _) in before.items()
-    }
 
 
 async def test_keep_all_leaves_a_thread_written_after_deltachannel(

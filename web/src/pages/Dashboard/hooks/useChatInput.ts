@@ -30,9 +30,11 @@ interface SlashCommand {
 interface SendOptions {
   model?: string | null;
   reasoningEffort?: string | null;
-  fastMode?: boolean;
+  fastMode?: boolean | null;
   widgetSnapshots?: WidgetContextSnapshot[];
   subagentsAllowed?: boolean;
+  reasoningEffortOverride?: string;
+  fastModeOverride?: boolean;
 }
 
 const EMPTY_WORKSPACES: Workspace[] = [];
@@ -44,7 +46,7 @@ const MAX_LOCATION_STATE_BYTES = 5 * 1024 * 1024; // ~5MB structured-clone safet
  * the send handler. The message and the Subagents pick are owned by ChatInput
  * and passed through via handleSend.
  *
- * The scope is All workspaces (the user's Home) or the selected workspace,
+ * The scope is the Chief of Staff (the user's Home) or the selected workspace,
  * both on the full agent. `composing` is the host's report that the user is
  * writing a message, which warms a picked workspace's computer.
  */
@@ -55,7 +57,7 @@ export function useChatInput({ composing = false }: { composing?: boolean } = {}
   const { toast } = useToast();
   const { t } = useTranslation();
   const queryClient = useQueryClient();
-  // Nothing picked yet means All workspaces, which needs no workspace to exist.
+  // Nothing picked yet means the Chief of Staff, which needs no workspace to exist.
   const [scope, setScope] = useState<ComposerScope>('all');
 
   // Fetch workspaces for the workspace selector. The 100-limit matches the other
@@ -72,7 +74,7 @@ export function useChatInput({ composing = false }: { composing?: boolean } = {}
   }, [workspaces, selectedWorkspaceId]);
 
   // Start a picked workspace's computer while the user is still typing, so the
-  // send lands on a running one. All workspaces needs nothing here: the click
+  // send lands on a running one. The Chief of Staff needs nothing here: the click
   // or key that focused the composer has already warmed Home (WarmHome). Once
   // per workspace per composing spell: stopping forgets what was warmed, and
   // picking another meanwhile warms that one.
@@ -90,7 +92,7 @@ export function useChatInput({ composing = false }: { composing?: boolean } = {}
 
   /**
    * Navigates to the ChatAgent workspace with the composed message payload:
-   * Home for All workspaces, else the selected workspace.
+   * Home for the Chief of Staff, else the selected workspace.
    */
   const handleSend = async (
     message: string,
@@ -99,12 +101,12 @@ export function useChatInput({ composing = false }: { composing?: boolean } = {}
     // dropped here — they apply only inside an active chat session, not on
     // the dashboard handoff.
     _slashCommands: SlashCommand[] = [],
-    { model, reasoningEffort, widgetSnapshots, subagentsAllowed }: SendOptions = {},
-    // DALTON-HOOK(composer-drafts): return false when workspace resolution or handoff fails
-  ): Promise<void | boolean> => {
+    { model, reasoningEffort, fastMode, widgetSnapshots, subagentsAllowed, reasoningEffortOverride, fastModeOverride }: SendOptions = {},
+    // DALTON-HOOK(composer-drafts): return explicit boolean send outcome so ChatInput preserves draft on failure
+  ): Promise<boolean> => {
     const hasContent = message.trim() || (attachments && attachments.length > 0) || (widgetSnapshots && widgetSnapshots.length > 0);
     if (!hasContent || isLoading) {
-      return;
+      return false;
     }
 
     setIsLoading(true);
@@ -165,6 +167,11 @@ export function useChatInput({ composing = false }: { composing?: boolean } = {}
           ...(attachmentMeta ? { attachmentMeta } : {}),
           ...(model ? { model } : {}),
           ...(reasoningEffort ? { reasoningEffort } : {}),
+          ...(typeof fastMode === 'boolean' ? { fastMode } : {}),
+          // The composer's own effort and fast-mode picks, which the thread
+          // this send starts keeps as its own.
+          ...(reasoningEffortOverride !== undefined ? { reasoningEffortOverride } : {}),
+          ...(fastModeOverride !== undefined ? { fastModeOverride } : {}),
           ...(stateWidgetSnapshots ? { widgetSnapshots: stateWidgetSnapshots } : {}),
         },
       });
@@ -174,6 +181,8 @@ export function useChatInput({ composing = false }: { composing?: boolean } = {}
       if (widgetSnapshots && widgetSnapshots.length > 0) {
         ContextBus.clear();
       }
+      // DALTON-HOOK(composer-drafts): signal successful handoff so ChatInput clears the draft
+      return true;
     } catch (error) {
       console.error('Error with workspace:', error);
       toast({

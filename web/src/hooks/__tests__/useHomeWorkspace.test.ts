@@ -57,7 +57,7 @@ describe('useHomeWorkspaceId', () => {
 });
 
 describe('resolveChatWorkspace', () => {
-  it('opens All workspaces in Home through the shared query, read once', async () => {
+  it('opens the Chief of Staff in Home through the shared query, read once', async () => {
     const queryClient = clientWithCatalog();
     expect(await resolveChatWorkspace(queryClient, 'all')).toBe('home-1');
     expect(await resolveChatWorkspace(queryClient, 'all', 'ws-1')).toBe('home-1');

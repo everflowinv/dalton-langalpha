@@ -1,9 +1,14 @@
 /* eslint-disable react-refresh/only-export-components -- mixed helper/component module shared by the ConnectStep branch components */
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useId } from 'react';
+import { useNavigate } from 'react-router';
 import { Shield, Copy, Check } from 'lucide-react';
 import type { TestResult } from '@/components/model/ApiKeyInput';
 import { api } from '@/api/client';
+import { CheckboxChoice } from '@/components/ui/choice';
+import { copyText } from '@/lib/clipboard';
 import type { AccessType, RegionVariant } from '@/components/model/types';
+import { returnFromSetup } from '@/lib/setupReturn';
+import { cn } from '@/lib/utils';
 import { useTranslation } from 'react-i18next';
 
 export interface LocationState {
@@ -19,6 +24,26 @@ export interface LocationState {
   regionVariants?: RegionVariant[] | null;
   defaultRegion?: string | null;
   dynamicModels?: boolean;
+}
+
+/**
+ * Where a step goes once a provider is connected: back to the page that sent
+ * the user into setup, naming the provider by the key it was saved under, or
+ * on to the model step for it. Called after the save and the cache refresh, so
+ * the page returned to reads the new connection.
+ *
+ * Either way the step is left (the model step unmounts it, the return leaves
+ * the app), so a caller keeps its busy state on success and clears it only on
+ * failure: the button can't send twice while the page goes.
+ */
+export function useProviderConnected() {
+  const navigate = useNavigate();
+  return useCallback(
+    (state: LocationState & { provider: string }) => {
+      if (!returnFromSetup(state.provider)) navigate('/setup/models', { state });
+    },
+    [navigate],
+  );
 }
 
 /** API format options for custom provider setup */
@@ -85,7 +110,7 @@ export function ProcessStep({ number, title, description }: { number: number; ti
     <div className="flex gap-3 items-start">
       <div
         className="shrink-0 h-6 w-6 rounded-full flex items-center justify-center text-xs font-bold"
-        style={{ backgroundColor: 'var(--color-accent-soft)', color: 'var(--color-accent-primary)' }}
+        style={{ backgroundColor: 'var(--color-bg-tag)', color: 'var(--color-text-secondary)' }}
       >
         {number}
       </div>
@@ -142,11 +167,11 @@ export function CopyButton({ text }: { text: string }) {
 
   const handleCopy = useCallback(async () => {
     try {
-      await navigator.clipboard.writeText(text);
+      await copyText(text);
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
     } catch {
-      // Fallback
+      // The browser refused the copy; the button just doesn't confirm.
     }
   }, [text]);
 
@@ -176,9 +201,9 @@ export function CopyButton({ text }: { text: string }) {
   );
 }
 
-/** Input modality selection shared by the custom-provider and
- *  existing-custom flows — per-model for discovered models, a single
- *  set for manual entry. */
+/** Input modality selection shared by the custom-provider, existing-custom
+ *  and model-pick flows — per-model for discovered models, a single set for
+ *  manual entry. */
 export function useModalityState() {
   // Input modality state — per-model for discovered, single for manual entry
   const [modelModalities, setModelModalities] = useState<Map<string, Set<string>>>(new Map());
@@ -205,11 +230,107 @@ export function useModalityState() {
     });
   };
 
+  const clearManualModalities = useCallback(() => setManualModalities(new Set()), []);
+
   const buildModalitiesArray = useCallback((modSet: Set<string>): string[] | undefined => {
     if (modSet.size === 0) return undefined;
     const arr = ['text', ...Array.from(modSet).filter(m => m !== 'text')];
     return arr;
   }, []);
 
-  return { modelModalities, manualModalities, toggleDiscoveredModality, toggleManualModality, buildModalitiesArray };
+  return {
+    modelModalities,
+    manualModalities,
+    toggleDiscoveredModality,
+    toggleManualModality,
+    clearManualModalities,
+    buildModalitiesArray,
+  };
+}
+
+/** The input modalities a model can be marked with beyond text, which every
+ *  model reads and so shows as a fixed tag. */
+const EXTRA_MODALITIES = ['image', 'pdf'] as const;
+
+/**
+ * The "Capabilities:" row under a model: the fixed text tag, then a pressed
+ * toggle for each extra modality in `active`. `className` places the row (its
+ * padding or indent where it sits).
+ */
+export function ModalityChips({
+  active,
+  onToggle,
+  className,
+}: {
+  active: ReadonlySet<string>;
+  onToggle: (modality: string) => void;
+  className?: string;
+}) {
+  const { t } = useTranslation();
+  const labelId = useId();
+  return (
+    <div role="group" aria-labelledby={labelId} className={cn('flex flex-wrap items-center gap-1.5', className)}>
+      <span
+        id={labelId}
+        className="text-[0.625rem] uppercase tracking-wider"
+        style={{ color: 'var(--color-text-tertiary)' }}
+      >
+        {t('setup.capabilities', { defaultValue: 'Capabilities' })}:
+      </span>
+      <span
+        className="inline-flex items-center rounded-full px-2 py-0.5 text-[0.625rem] font-medium"
+        style={{ background: 'var(--color-bg-tag)', color: 'var(--color-text-secondary)' }}
+      >
+        {t('setup.modalityText')}
+      </span>
+      {EXTRA_MODALITIES.map((mod) => {
+        const on = active.has(mod);
+        return (
+          <button
+            key={mod}
+            type="button"
+            aria-pressed={on}
+            onClick={() => onToggle(mod)}
+            className="inline-flex items-center rounded-full px-2 py-0.5 text-[0.625rem] font-medium transition-colors"
+            style={{
+              background: on ? 'var(--color-bg-tag)' : 'transparent',
+              color: on ? 'var(--color-text-primary)' : 'var(--color-text-tertiary)',
+              border: `1px solid ${on ? 'var(--color-text-primary)' : 'var(--color-border-default)'}`,
+            }}
+          >
+            <span>{mod === 'image' ? t('setup.modalityImage') : t('setup.modalityPdf')}</span>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+/** A model to pick from a list, by its name or id: a checkbox row, tinted and
+ *  outlined once picked. */
+export function ModelCheckRow({
+  checked,
+  onToggle,
+  label,
+}: {
+  checked: boolean;
+  onToggle: () => void;
+  label: string;
+}) {
+  return (
+    <CheckboxChoice
+      size="md"
+      checked={checked}
+      onCheckedChange={onToggle}
+      className="items-center gap-3 rounded-md px-3 py-2 transition-colors"
+      style={{
+        background: checked ? 'var(--color-bg-tag)' : 'transparent',
+        border: `1px solid ${checked ? 'var(--color-text-primary)' : 'var(--color-border-default)'}`,
+      }}
+    >
+      <span className="text-sm font-mono" style={{ color: 'var(--color-text-primary)' }}>
+        {label}
+      </span>
+    </CheckboxChoice>
+  );
 }

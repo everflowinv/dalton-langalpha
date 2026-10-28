@@ -2,6 +2,9 @@ import React, { useState, useCallback } from 'react';
 import { useNavigate } from 'react-router';
 import { LineChart, Line, YAxis, Tooltip } from 'recharts';
 import { motion, AnimatePresence, type PanInfo } from '@/lib/framer';
+import { SPRING_DRAG } from '@/lib/motion';
+import { SwapCell } from '@/components/ui/crossfade';
+import { SkeletonBar } from '@/components/ui/skeleton';
 import { useIsMobile } from '@/hooks/useIsMobile';
 import { useTranslation } from 'react-i18next';
 import { useLocale } from '@/hooks/useLocale';
@@ -19,7 +22,6 @@ interface SparklineDataPoint {
 
 interface IndexCardProps {
   index: IndexData;
-  delay: number;
 }
 
 interface IndexMovementCardProps {
@@ -169,16 +171,14 @@ function IndexCardContent({ index }: { index: IndexData }) {
   );
 }
 
-/* ── Desktop card with staggered entrance animation ── */
+/* ── Desktop card. It has no entrance of its own: the grid it sits in crossfades
+   in from the skeleton, so the five cards settle as one. ── */
 
-function IndexCard({ index, delay }: IndexCardProps) {
+function IndexCard({ index }: IndexCardProps) {
   const navigate = useNavigate();
 
   return (
-    <motion.div
-      initial={{ opacity: 0, y: 20 }}
-      animate={{ opacity: 1, y: 0 }}
-      transition={{ duration: 0.4, delay: delay * 0.1 }}
+    <div
       className="overflow-hidden rounded-2xl border transition-colors group flex flex-col cursor-pointer"
       style={{
         borderColor: 'var(--color-border-muted)',
@@ -189,7 +189,7 @@ function IndexCard({ index, delay }: IndexCardProps) {
       onMouseLeave={(e) => (e.currentTarget.style.borderColor = 'var(--color-border-muted)')}
     >
       <IndexCardContent index={index} />
-    </motion.div>
+    </div>
   );
 }
 
@@ -295,7 +295,7 @@ function IndexStackWidget({ indices }: { indices: IndexData[] }) {
             initial="enter"
             animate="center"
             exit="exit"
-            transition={{ type: 'spring', stiffness: 350, damping: 32, mass: 0.8 }}
+            transition={SPRING_DRAG}
             drag="x"
             dragConstraints={{ left: 0, right: 0 }}
             dragElastic={0.12}
@@ -320,7 +320,7 @@ function IndexStackWidget({ indices }: { indices: IndexData[] }) {
             key={i}
             onClick={() => goTo(i)}
             aria-label={t('dashboard.widgets.marketsOverview.showIndex', { name: indices[i]?.name })}
-            className="rounded-full transition-all duration-200"
+            className="rounded-full transition-all"
             style={{
               width: i === current ? 18 : 6,
               height: 6,
@@ -339,12 +339,14 @@ function IndexStackWidget({ indices }: { indices: IndexData[] }) {
 /* ── Skeleton loader (single card on mobile, grid on desktop) ── */
 
 function IndexSkeleton({ count }: { count: number }) {
+  // The card's own text elements with bars in them, so each line keeps the
+  // height its text will have and the cards do not grow when the quotes land.
   return (
     <>
       {Array.from({ length: count }).map((_, i) => (
         <div
           key={i}
-          className="flex flex-col rounded-2xl animate-pulse border"
+          className="flex flex-col rounded-2xl border"
           style={{
             backgroundColor: 'var(--color-bg-card)',
             borderColor: 'var(--color-border-muted)',
@@ -352,31 +354,27 @@ function IndexSkeleton({ count }: { count: number }) {
         >
           <div className="@container p-4 pb-0">
             <div className={INDEX_HEADER_ROW}>
-              <div>
-                <div
-                  className="h-4 rounded mb-1"
-                  style={{ backgroundColor: 'var(--color-border-default)', width: 80 }}
-                />
-                <div
-                  className="h-3 rounded"
-                  style={{ backgroundColor: 'var(--color-border-default)', width: 40 }}
-                />
+              <div className="min-w-0">
+                <h3 className="text-base font-bold tracking-tight">
+                  <SkeletonBar style={{ width: 80 }} />
+                </h3>
+                <div className="text-xs mt-0.5">
+                  <SkeletonBar style={{ width: 40 }} />
+                </div>
               </div>
-              <div className={cn(INDEX_HEADER_QUOTE, 'flex flex-col items-start @min-[14rem]:items-end')}>
-                <div
-                  className="h-5 rounded mb-1"
-                  style={{ backgroundColor: 'var(--color-border-default)', width: 80 }}
-                />
-                <div
-                  className="h-3 rounded"
-                  style={{ backgroundColor: 'var(--color-border-default)', width: 60 }}
-                />
+              <div className={INDEX_HEADER_QUOTE}>
+                <div className="text-lg font-bold tracking-tight dashboard-mono">
+                  <SkeletonBar style={{ width: 80 }} />
+                </div>
+                <div className="text-xs dashboard-mono">
+                  <SkeletonBar style={{ width: 60 }} />
+                </div>
               </div>
             </div>
           </div>
           <div className="mt-2 px-1 pb-2" style={{ height: 100 }}>
             <div
-              className="w-full h-full rounded"
+              className="w-full h-full rounded animate-pulse"
               style={{ backgroundColor: 'var(--color-border-default)', opacity: 0.3 }}
             />
           </div>
@@ -406,8 +404,11 @@ function IndexMovementCard({
   }
 
   return (
-    <div
-      className={cn(
+    <SwapCell
+      as="div"
+      className="items-start"
+      swapKey={loading ? 'loading' : 'ready'}
+      layerClassName={cn(
         'grid gap-4',
         singleRow ? 'grid-flow-col auto-cols-fr' : 'grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5',
       )}
@@ -415,11 +416,9 @@ function IndexMovementCard({
       {loading ? (
         <IndexSkeleton count={5} />
       ) : (
-        indices.map((index, i) => (
-          <IndexCard key={index.symbol} index={index} delay={i} />
-        ))
+        indices.map((index) => <IndexCard key={index.symbol} index={index} />)
       )}
-    </div>
+    </SwapCell>
   );
 }
 

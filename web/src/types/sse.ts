@@ -8,6 +8,8 @@ import type {
   OrderSummary,
 } from './orders';
 import type { ReportSource, ThreadOrigin } from './api';
+import type { MarketTargetNotice } from '@/pages/ChatAgent/session/wakeupEvents';
+import type { WakeNotice } from './wakeups';
 
 /**
  * `error_type` on a task's terminal frame when the credit gate stopped it,
@@ -57,6 +59,11 @@ export interface MetadataEvent extends BaseSSEEvent {
   /** The turn admission gave the run, the value replay names it by. Absent
    *  from a backend that predates it, where the view counts the turn itself. */
   turn_index?: number;
+  // A wake turn's frame also names what woke it, as the turn's query row
+  // keeps it, for the opener row a live attach draws, since no query row
+  // comes with the stream: `wakeup` with its notices, or `market_target` for
+  // a price target set before wakeups. Untrusted, and read only through
+  // `wakeTurnOpener`, so not typed here.
 }
 
 export interface ReasoningSignalEvent extends BaseSSEEvent {
@@ -260,6 +267,8 @@ export interface DeliveredSteer {
   /** The agent that sent it (the Chief of Staff, Flash); absent when the user did. */
   origin?: ThreadOrigin;
   report_source?: never;
+  market_alert?: never;
+  wakeup?: never;
 }
 
 /** A finished task's or analyst's report the run took in, which carries no
@@ -270,14 +279,54 @@ export interface DeliveredReport {
   /** Epoch seconds. */
   timestamp?: number;
   report_source: ReportSource;
+  market_alert?: never;
+  wakeup?: never;
 }
 
-/** One entry of a delivery. The server lists its reports ahead of the
- *  user's steers, the order the model reads them. */
-export type SteeringDeliveredEntry = DeliveredSteer | DeliveredReport;
+/** A price alert on one of the thread's targets that the run took in: one
+ *  notice, as a wake turn's metadata lists them, and no words of the user's. */
+export interface DeliveredMarketAlert {
+  content: '';
+  /** Epoch seconds. */
+  timestamp?: number;
+  market_alert: MarketTargetNotice;
+  report_source?: never;
+  wakeup?: never;
+}
+
+/** A wakeup's notice that the run took in: one per entry, after the reports
+ *  and alerts and ahead of the user's steers. */
+export interface DeliveredWakeup {
+  content: '';
+  /** Epoch seconds. */
+  timestamp?: number;
+  wakeup: WakeNotice;
+  report_source?: never;
+  market_alert?: never;
+}
+
+/** One entry of a delivery. The server lists its reports, alerts and
+ *  wakeups ahead of the user's steers, the order the model reads them. */
+export type SteeringDeliveredEntry = DeliveredSteer | DeliveredReport | DeliveredMarketAlert | DeliveredWakeup;
 
 export function isDeliveredReport(entry: SteeringDeliveredEntry): entry is DeliveredReport {
   return entry.report_source !== undefined;
+}
+
+/** A wakeup's notice, or a price target's from before wakeups. */
+export type DeliveredNotice = DeliveredMarketAlert | DeliveredWakeup;
+
+/** A notice the run took in, which moved its wakeup on the server and draws
+ *  its row under the notice's own id. */
+export function isDeliveredNotice(entry: SteeringDeliveredEntry): entry is DeliveredNotice {
+  return entry.market_alert !== undefined || entry.wakeup !== undefined;
+}
+
+/** A steer, the user's or an agent's, as against a report or a notice: the
+ *  only entry that claims a steer this view queued, and the only one that
+ *  spends the boundary an acceptance set. */
+export function isDeliveredSteer(entry: SteeringDeliveredEntry): entry is DeliveredSteer {
+  return !isDeliveredReport(entry) && !isDeliveredNotice(entry);
 }
 
 export interface SteeringDeliveredEvent extends BaseSSEEvent {

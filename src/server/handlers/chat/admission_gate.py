@@ -25,6 +25,7 @@ from src.server.services.runs.admission import (
 )
 
 if TYPE_CHECKING:
+    from src.server.handlers.chat.request_prep import HandOffSteered
     from src.server.models.chat import ChatRequest
     from src.server.services.runs.executor import LocalRunExecutor
 
@@ -50,6 +51,8 @@ ADMISSION_CONFLICT_CODES = {
     "not_retryable",
     # A START posted for a parked steer that a running turn read first.
     "steer_taken",
+    # START refused because the workspace is moving to another computer.
+    "workspace_moving",
 }
 
 
@@ -78,6 +81,14 @@ def admission_conflict_detail(state: str) -> dict:
         return {
             "code": "not_running",
             "message": "No turn is running to steer. Resubmit as a new message.",
+        }
+    if state == "workspace_moving":
+        return {
+            "code": "workspace_moving",
+            "message": (
+                "This workspace is moving to another computer. "
+                "Try again when the move finishes."
+            ),
         }
     return {
         "code": "running",
@@ -182,15 +193,16 @@ async def wait_or_steer(
     workspace_id: str | None = None,
     steer_job_id: str | None = None,
     agent: AgentSteer | None = None,
-) -> tuple[bool, str | None]:
+) -> tuple[bool, str | HandOffSteered | None]:
     """Admit a new turn, steer the running one, or 409.
 
     The single admission decision for both the foreground and dispatched
     paths. Returns ``(ready, steering_event)``: ``ready=True`` → start a new
     workflow; ``ready=False`` with a non-None ``steering_event`` → yield that
-    SSE string and return. A non-admissible state raises HTTP 409 whose detail
-    carries a structured ``admission_conflict_detail`` code (surfaced as an SSE
-    ``error`` event once the stream has started).
+    (an SSE string, or a hand-off's ``HandOffSteered``) and return. A
+    non-admissible state raises HTTP 409 whose detail carries a structured
+    ``admission_conflict_detail`` code (surfaced as an SSE ``error`` event
+    once the stream has started).
 
     A steer is a ``hook_outbox`` row on the thread, admitted only while the
     run it names is in_progress with no stop requested, in the same
@@ -211,9 +223,9 @@ async def wait_or_steer(
     ``steer_job_id`` is the parked steer a server-posted turn carries, whose
     own row is not a copy of it. ``agent`` is a Chief of Staff hand-off:
     accepted, it stamps the run with its report-back origin and answers with
-    ``DISPATCH_STEERED_MARKER`` and the run's id for the dispatch primer,
-    which has no SSE reader; a run that reports to another Home thread is a
-    409.
+    ``HandOffSteered``, naming the run and the steer, for the dispatch
+    primer, which has no SSE reader, as does a copy of it that finds its
+    steer still one; a run that reports to another Home thread is a 409.
 
     Admission states (see ``LocalRunExecutor.wait_for_admission``):
     - ``"fresh"``     → start a new turn ``(True, None)``; with ``steer_only``,
@@ -274,11 +286,9 @@ async def wait_or_steer(
             origin_stamp=agent.origin_stamp if agent else None,
         )
         if result["state"] == "accepted" and agent is not None:
-            from src.server.handlers.chat.request_prep import (
-                DISPATCH_STEERED_MARKER,
-            )
+            from src.server.handlers.chat.request_prep import HandOffSteered
 
-            return False, DISPATCH_STEERED_MARKER + active_run_id
+            return False, HandOffSteered(active_run_id, result["job_id"])
         if result["state"] == "accepted":
             event_data = json.dumps(
                 {
@@ -290,11 +300,19 @@ async def wait_or_steer(
             return False, f"event: steering_accepted\ndata: {event_data}\n\n"
         if result["state"] == "duplicate":
             # Another copy of this send steered between the recheck and here.
-            run_id, steered = steer_job_run_id(result["job"])
+            job = result["job"]
+            run_id, steered = steer_job_run_id(job)
             run = await tl_db.get_run(run_id) if run_id else None
             if run is None:
                 raise HTTPException(
                     status_code=409, detail=admission_conflict_detail("running")
+                )
+            if steered and agent is not None:
+                # The primer answers it as it answered the copy that steered.
+                from src.server.handlers.chat.request_prep import HandOffSteered
+
+                return False, HandOffSteered(
+                    str(run["conversation_response_id"]), str(job["id"])
                 )
             raise tl_db.DuplicateRequestError(run, steered=steered)
         if result["state"] != "not_running":

@@ -338,6 +338,29 @@ class TestOtherModelPreferences:
         assert config.llm.fallback == ["model-a", "model-b"]
 
     @pytest.mark.asyncio
+    async def test_the_fallback_chain_drops_repeats_but_keeps_the_turns_model(self, base_config):
+        from src.server.services.llm.config import resolve_llm_config
+
+        mock_mc = _mock_model_config(self.CATALOG)
+        with (
+            patch(
+                f"{USER_MODELS}.get_model_preference",
+                new_callable=AsyncMock,
+                return_value={
+                    "fallback_models": ["system-default-model", "model-a", "model-a", "model-b"]
+                },
+            ),
+            patch(f"{CLIENTS}.resolve_oauth_llm_client", new_callable=AsyncMock, return_value=None),
+            patch("src.llms.llm.LLM.get_model_config", return_value=mock_mc),
+            patch("src.llms.llm.create_llm", return_value=MagicMock()),
+        ):
+            config = await resolve_llm_config(base_config, "user-1", None, False)
+        # A subagent on another model may still fall back to the turn's; the
+        # resilience middleware drops it for the turn's own requests.
+        assert config.llm.fallback == ["system-default-model", "model-a", "model-b"]
+        assert config.fallback_llm_names == ["system-default-model", "model-a", "model-b"]
+
+    @pytest.mark.asyncio
     async def test_compaction_profile_aggressive_applies_preset(self, base_config):
         from src.server.services.llm.config import resolve_llm_config
         from ptc_agent.config.agent import COMPACTION_PROFILES
@@ -355,7 +378,6 @@ class TestOtherModelPreferences:
             config = await resolve_llm_config(base_config, "user-1", None, False)
         preset = COMPACTION_PROFILES["aggressive"]
         assert config.compaction.token_threshold == preset["token_threshold"]
-        assert config.compaction.keep_messages == preset["keep_messages"]
 
     @pytest.mark.asyncio
     async def test_compaction_profile_extended_applies_preset(self, base_config):
@@ -375,7 +397,6 @@ class TestOtherModelPreferences:
             config = await resolve_llm_config(base_config, "user-1", None, False)
         preset = COMPACTION_PROFILES["extended"]
         assert config.compaction.token_threshold == preset["token_threshold"]
-        assert config.compaction.keep_messages == preset["keep_messages"]
 
     @pytest.mark.asyncio
     async def test_compaction_profile_relaxed_applies_preset(self, base_config):
@@ -396,7 +417,6 @@ class TestOtherModelPreferences:
             config = await resolve_llm_config(base_config, "user-1", None, False)
         preset = COMPACTION_PROFILES["relaxed"]
         assert config.compaction.token_threshold == preset["token_threshold"]
-        assert config.compaction.keep_messages == preset["keep_messages"]
 
     @pytest.mark.asyncio
     async def test_compaction_profile_invalid_falls_through_to_yaml(self, base_config):
@@ -417,7 +437,7 @@ class TestOtherModelPreferences:
             ):
                 config = await resolve_llm_config(base_config, "user-1", None, False)
             assert config.compaction.token_threshold == baseline.token_threshold
-            assert config.compaction.keep_messages == baseline.keep_messages
+            assert config.compaction.keep_tokens == baseline.keep_tokens
 
 
 # ---------------------------------------------------------------------------
@@ -1790,14 +1810,14 @@ class TestStaleModelPreference:
             {
                 "preferred_model": "gpt-4o",
                 "fetch_model": ["not", "a", "name"],
-                "fallback_models": [{"name": "x"}, "gpt-4o"],
+                "fallback_models": [{"name": "x"}, "system-background-model"],
                 "custom_providers": ["not-a-dict"],
             },
             "primary",
         )
 
         assert config.llm.fetch_name == "gpt-4o"
-        assert config.llm.fallback == ["gpt-4o"]
+        assert config.llm.fallback == ["system-background-model"]
 
     @pytest.mark.asyncio
     async def test_a_background_turns_own_dead_model_is_refused_not_dropped(self, base_config):
@@ -1887,6 +1907,7 @@ class TestSearchProviderPreference:
         from src.server.services.llm.config import resolve_llm_config
 
         monkeypatch.setattr("src.config.settings.HOST_MODE", "platform")
+        monkeypatch.setattr("src.server.dependencies.usage_limits.platform_gating_active", lambda: True)
         monkeypatch.setattr("src.config.settings.SEARCH_PROVIDER_MIN_TIER", 1)
         tier_mock = AsyncMock(return_value=1)
         monkeypatch.setattr(
@@ -1916,6 +1937,7 @@ class TestSearchProviderPreference:
         from src.server.services.llm.config import resolve_llm_config
 
         monkeypatch.setattr("src.config.settings.HOST_MODE", "platform")
+        monkeypatch.setattr("src.server.dependencies.usage_limits.platform_gating_active", lambda: True)
         monkeypatch.setattr("src.config.settings.SEARCH_PROVIDER_MIN_TIER", 1)
         tier_mock = AsyncMock(return_value=0)
         monkeypatch.setattr(
@@ -1939,12 +1961,42 @@ class TestSearchProviderPreference:
         tier_mock.assert_awaited_once_with("user-1")
 
     @pytest.mark.asyncio
+    async def test_platform_mode_unknown_tier_ignores_provider(self, base_config, monkeypatch):
+        """No tier could be read (platform down, nothing on record): the turn
+        runs on the default provider rather than failing on the comparison."""
+        from src.server.services.llm.config import resolve_llm_config
+
+        monkeypatch.setattr("src.config.settings.HOST_MODE", "platform")
+        monkeypatch.setattr("src.server.dependencies.usage_limits.platform_gating_active", lambda: True)
+        monkeypatch.setattr("src.config.settings.SEARCH_PROVIDER_MIN_TIER", 1)
+        tier_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(
+            "src.server.dependencies.usage_limits._fetch_platform_tier", tier_mock
+        )
+
+        mock_mc = _mock_model_config()
+        with (
+            patch(
+                f"{USER_MODELS}.get_model_preference",
+                new_callable=AsyncMock,
+                return_value={"search_provider": "serper"},
+            ),
+            patch(f"{CLIENTS}.resolve_oauth_llm_client", new_callable=AsyncMock, return_value=None),
+            patch("src.llms.llm.LLM.get_model_config", return_value=mock_mc),
+        ):
+            config = await resolve_llm_config(base_config, "user-1", None, False)
+
+        assert config.search_api == "tavily"
+        tier_mock.assert_awaited_once_with("user-1")
+
+    @pytest.mark.asyncio
     async def test_unknown_provider_ignored_without_tier_check(self, base_config, monkeypatch):
         """An unknown engine string is rejected at the validity check, BEFORE the
         search tier gate — no tier fetch happens, and nothing raises."""
         from src.server.services.llm.config import resolve_llm_config
 
         monkeypatch.setattr("src.config.settings.HOST_MODE", "platform")
+        monkeypatch.setattr("src.server.dependencies.usage_limits.platform_gating_active", lambda: True)
         monkeypatch.setattr("src.config.settings.SEARCH_PROVIDER_MIN_TIER", 1)
         tier_mock = AsyncMock(return_value=2)
         monkeypatch.setattr(
@@ -1975,6 +2027,7 @@ class TestSearchProviderPreference:
         from src.server.services.llm.config import resolve_llm_config
 
         monkeypatch.setattr("src.config.settings.HOST_MODE", "platform")
+        monkeypatch.setattr("src.server.dependencies.usage_limits.platform_gating_active", lambda: True)
         monkeypatch.setattr("src.config.settings.SEARCH_PROVIDER_MIN_TIER", 1)
         tier_mock = AsyncMock(return_value=1)
         monkeypatch.setattr(
@@ -2009,6 +2062,7 @@ class TestSearchProviderPreference:
         from src.server.services.llm.config import resolve_llm_config
 
         monkeypatch.setattr("src.config.settings.HOST_MODE", "platform")
+        monkeypatch.setattr("src.server.dependencies.usage_limits.platform_gating_active", lambda: True)
         monkeypatch.setattr("src.config.settings.SEARCH_PROVIDER_MIN_TIER", 1)
         tier_mock = AsyncMock(return_value=-1)
         monkeypatch.setattr(
@@ -2037,6 +2091,7 @@ class TestSearchProviderPreference:
         from src.server.services.llm.config import resolve_llm_config
 
         monkeypatch.setattr("src.config.settings.HOST_MODE", "platform")
+        monkeypatch.setattr("src.server.dependencies.usage_limits.platform_gating_active", lambda: True)
         monkeypatch.setattr("src.config.settings.SEARCH_PROVIDER_MIN_TIER", 1)
         tier_mock = AsyncMock(return_value=2)
         monkeypatch.setattr(
@@ -2062,6 +2117,7 @@ class TestSearchProviderPreference:
         from src.server.services.llm.config import resolve_llm_config
 
         monkeypatch.setattr("src.config.settings.HOST_MODE", "platform")
+        monkeypatch.setattr("src.server.dependencies.usage_limits.platform_gating_active", lambda: True)
         monkeypatch.setattr("src.config.settings.SEARCH_PROVIDER_MIN_TIER", 1)
         tier_mock = AsyncMock(return_value=2)
         monkeypatch.setattr(
@@ -2127,6 +2183,7 @@ class TestSearchDepthPreference:
         from src.server.services.llm.config import resolve_llm_config
 
         monkeypatch.setattr("src.config.settings.HOST_MODE", "platform")
+        monkeypatch.setattr("src.server.dependencies.usage_limits.platform_gating_active", lambda: True)
         monkeypatch.setattr("src.config.settings.SEARCH_PROVIDER_MIN_TIER", 1)
         tier_mock = AsyncMock(return_value=1)
         monkeypatch.setattr(
@@ -2147,6 +2204,7 @@ class TestSearchDepthPreference:
         from src.server.services.llm.config import resolve_llm_config
 
         monkeypatch.setattr("src.config.settings.HOST_MODE", "platform")
+        monkeypatch.setattr("src.server.dependencies.usage_limits.platform_gating_active", lambda: True)
         monkeypatch.setattr("src.config.settings.SEARCH_PROVIDER_MIN_TIER", 1)
         tier_mock = AsyncMock(return_value=0)
         monkeypatch.setattr(
@@ -2170,6 +2228,7 @@ class TestSearchDepthPreference:
         from src.server.services.llm.config import resolve_llm_config
 
         monkeypatch.setattr("src.config.settings.HOST_MODE", "platform")
+        monkeypatch.setattr("src.server.dependencies.usage_limits.platform_gating_active", lambda: True)
         monkeypatch.setattr("src.config.settings.SEARCH_PROVIDER_MIN_TIER", 1)
         tier_mock = AsyncMock(return_value=2)
         monkeypatch.setattr(
@@ -2229,6 +2288,7 @@ class TestSearchDepthPreference:
         from src.server.services.llm.config import resolve_llm_config
 
         monkeypatch.setattr("src.config.settings.HOST_MODE", "platform")
+        monkeypatch.setattr("src.server.dependencies.usage_limits.platform_gating_active", lambda: True)
         monkeypatch.setattr("src.config.settings.SEARCH_PROVIDER_MIN_TIER", 1)
         tier_mock = AsyncMock(return_value=2)
         monkeypatch.setattr(
@@ -2253,6 +2313,7 @@ class TestSearchDepthPreference:
         from src.tools.web.manifest import LevelSpec
 
         monkeypatch.setattr("src.config.settings.HOST_MODE", "platform")
+        monkeypatch.setattr("src.server.dependencies.usage_limits.platform_gating_active", lambda: True)
         monkeypatch.setattr("src.config.settings.SEARCH_PROVIDER_MIN_TIER", 1)
         # Raise the bar for depth levels only; provider/crawl capabilities stay open.
         monkeypatch.setattr(
@@ -2277,6 +2338,7 @@ class TestSearchDepthPreference:
         from src.server.services.llm.config import resolve_llm_config
 
         monkeypatch.setattr("src.config.settings.HOST_MODE", "platform")
+        monkeypatch.setattr("src.server.dependencies.usage_limits.platform_gating_active", lambda: True)
         monkeypatch.setattr("src.config.settings.SEARCH_PROVIDER_MIN_TIER", 1)
         tier_mock = AsyncMock(return_value=2)
         monkeypatch.setattr(
@@ -2319,6 +2381,7 @@ class TestCrawlFeatureGate:
         from src.server.services.llm.config import resolve_llm_config
 
         monkeypatch.setattr("src.config.settings.HOST_MODE", host_mode)
+        monkeypatch.setattr("src.server.dependencies.usage_limits.platform_gating_active", lambda: host_mode == "platform")
         tier_mock = AsyncMock(return_value=tier)
         monkeypatch.setattr(
             "src.server.dependencies.usage_limits._fetch_platform_tier", tier_mock

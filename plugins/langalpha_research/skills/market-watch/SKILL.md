@@ -71,6 +71,12 @@ figure forward is the failure this feed exists to prevent. Where the earlier
 figure already went into a saved artifact, update the artifact and say what
 changed in the message that delivers it.
 
+## Alerts
+
+A watch shows prices only while you work. To come back to this thread when
+a price level or a % move hits, set a price trigger with `schedule_wakeup`;
+it needs no watch, because the server checks the price itself.
+
 ## Mechanics to know
 
 - Stamps only flow while the market session is open: expect no feed

@@ -32,3 +32,8 @@ web/**/*.test.*
 web/**/*.spec.*
 web/vitest.config.ts
 web/playwright.config.js
+
+# Dev-only design harnesses, served by `pnpm dev` and never bundled. They use
+# the test factories dropped above, so the image's `tsc -b` cannot resolve them.
+web/src/**/__preview__/
+web/*-preview.html

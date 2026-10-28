@@ -118,6 +118,86 @@ def test_leaves_non_workspace_links_alone(text):
     assert _qualify_file_paths(text, WID) == text
 
 
+def test_a_computer_root_of_its_own_strips_like_the_stock_one():
+    """A computer whose user cannot create the stock root keeps its workspaces
+    under another, and its analyst writes absolute links under that one."""
+    root = "/home/someone/langalpha"
+    text = f"[r]({root}/results/report.md) [s](file://{root}/notes.md)"
+    assert _qualify_file_paths(text, WID, root) == (
+        f"[r]({Q}/results/report.md) [s]({Q}/notes.md)"
+    )
+    # Without the root it is an absolute path outside every workspace.
+    assert _qualify_file_paths(text, WID) == text
+
+
+def test_a_root_the_workspace_moved_off_strips_with_its_folder():
+    """A turn from before a move links under the computer it ran on, which the
+    live computer list stops naming once that computer is removed."""
+    left = "/home/someone/langalpha"
+    text = (
+        f"[r]({left}/Research/results/report.md) [s](file://{left}/Old%20Name/notes.md)"
+    )
+    assert _qualify_file_paths(
+        text, WID, "/home/workspace", (left,), "Research", ("Old Name",)
+    ) == f"[r]({Q}/results/report.md) [s]({Q}/notes.md)"
+    # Unless the workspace recorded leaving it, that root is no workspace's.
+    assert _qualify_file_paths(text, WID, "/home/workspace", (), "Research") == text
+
+
+def test_another_folder_under_a_root_left_is_a_siblings():
+    """Qualified, a sibling's file would open this workspace's namesake."""
+    text = "[o](/srv/Other/report.md) [r](/srv/report.md)"
+    assert _qualify_file_paths(text, WID, "/other", ("/srv",), "Research") == text
+
+
+def test_a_root_left_inside_the_current_one_is_read_with_the_folder():
+    """Moved from ``~/langalpha`` to ``~``, the shorter root alone would leave
+    ``langalpha/`` in front of the folder."""
+    left = "/home/dev/langalpha"
+    text = f"[r]({left}/Research/report.md) [s](/home/dev/Research/notes.md)"
+    assert _qualify_file_paths(text, WID, "/home/dev", (left,), "Research") == (
+        f"[r]({Q}/report.md) [s]({Q}/notes.md)"
+    )
+    # A root the workspace left above a stock one does not take its paths.
+    assert _qualify_file_paths(
+        "[r](/home/workspace/Research/report.md)", WID, None, ("/home",), "Research"
+    ) == f"[r]({Q}/report.md)"
+
+
+def test_the_current_folder_goes_with_the_current_root():
+    """Kept, it reads as a subfolder of the workspace, which opens the file
+    only by its name, or not at all beside a namesake."""
+    text = "[r](/home/dev/Research/results/report.md)"
+    assert _qualify_file_paths(text, WID, "/home/dev", (), "Research") == (
+        f"[r]({Q}/results/report.md)"
+    )
+
+
+def test_the_current_folder_reads_as_itself_before_a_root_left():
+    """Folder ``old`` on ``/srv`` after a computer rooted at ``/srv/old``: the
+    path names a file in the folder now, as the file routes read it."""
+    text = "[r](/srv/old/Research/a.md)"
+    assert _qualify_file_paths(
+        text, WID, "/srv", ("/srv/old",), "old", ("Research",)
+    ) == f"[r]({Q}/Research/a.md)"
+
+
+def test_roots_left_inside_one_another_read_the_longer_first():
+    """Moved from ``/srv/old`` to ``/srv`` and on, neither root left is inside
+    the current one, and ``/srv`` would leave ``old/`` in front of the folder."""
+    text = "[r](/srv/old/Research/report.md) [s](/srv/Research/notes.md)"
+    assert _qualify_file_paths(
+        text, WID, "/other", ("/srv", "/srv/old"), "Research"
+    ) == f"[r]({Q}/report.md) [s]({Q}/notes.md)"
+
+
+def test_a_root_that_travels_encoded_strips_in_that_spelling_too():
+    """A link is a URL, so a root with a space reaches the relay as ``%20``."""
+    root = "/Users/someone/My Data"
+    text = "[r](file:///Users/someone/My%20Data/results/Q3%20deck.pptx)"
+    assert _qualify_file_paths(text, WID, root) == f"[r]({Q}/results/Q3%20deck.pptx)"
+
+
 @pytest.mark.parametrize(
     ("fence", "closer"),
     [("```", "```"), ("```", "````"), ("````", "````"), ("~~~", "~~~"), ("~~~", "~~~~")],

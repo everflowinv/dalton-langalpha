@@ -4,6 +4,7 @@ The tools themselves are in ``chief_of_staff``; a hand-off runs through
 ``dispatch``.
 """
 
+import asyncio
 import json
 import logging
 from typing import Any
@@ -57,35 +58,37 @@ async def workspaces_list(user_id: str, tool_call_id: str) -> Command:
     """List workspaces for the user.
 
     A row names its folder only when the workspace is on Home's computer, the
-    one whose folders the Chief of Staff reads.
+    one whose folders the Chief of Staff reads, and its computer, with whether
+    that is the user's own, only when the user has more than one.
     """
     try:
-        from src.server.database.home_workspace import get_home_workspace_id
-        from src.server.database.workspace import get_workspace, get_workspaces_for_user
+        from src.server.database.workspace import get_workspaces_for_user
+        from src.tools.secretary.utils import read_computer_placement
 
         # Every workspace, since one left off the list is one the agent tells
         # the user does not exist. Pinned, then most recently used: the one a
         # hand-off is for is far likelier to be recent than early in the
         # user's custom order.
-        workspaces, _ = await get_workspaces_for_user(
-            user_id=user_id, limit=None, sort_by="activity"
+        (workspaces, _), placement = await asyncio.gather(
+            get_workspaces_for_user(user_id=user_id, limit=None, sort_by="activity"),
+            read_computer_placement(user_id),
         )
-        from src.tools.secretary.activity import folder_on
-
-        home = await get_workspace(get_home_workspace_id(user_id))
-        computer_id = home.get("computer_id") if home else None
-        workspaces = [
-            {**ws, "dir_name": folder_on(ws, computer_id)} for ws in workspaces
-        ]
-        payload: dict[str, object] = {
-            "success": True,
-            "workspaces": [
-                {field: ws.get(field) for field in _LISTED_WORKSPACE_FIELDS}
-                for ws in workspaces
-            ],
-        }
+        rows = []
+        for ws in workspaces:
+            row = {field: ws.get(field) for field in _LISTED_WORKSPACE_FIELDS}
+            row["dir_name"] = placement.folder(ws)
+            if placement.names:
+                row["computer"] = placement.computer(ws)
+            if machine := placement.machine(ws):
+                row["machine"] = machine
+            rows.append(row)
+        payload: dict[str, object] = {"success": True, "workspaces": rows}
         # --- DALTON-HOOK(workspace-sharing-settings): begin ---
-        from src.dalton.settings import is_dalton_supabase_auth_enabled
+        # DALTON-HOOK(colleague-dispatch): adjust colleague_workspaces_note when colleague_dispatch is enabled.
+        from src.dalton.settings import (
+            is_colleague_dispatch_enabled,
+            is_dalton_supabase_auth_enabled,
+        )
 
         if is_dalton_supabase_auth_enabled():
             from src.dalton.sharing import list_colleague_cos_workspaces
@@ -93,16 +96,24 @@ async def workspaces_list(user_id: str, tool_call_id: str) -> Command:
             colleague_list = await list_colleague_cos_workspaces(user_id)
             payload["colleague_workspaces"] = colleague_list
             if colleague_list:
-                # Said here, where the model reads the list it is about to
-                # route by: promising a dispatch into one of these was the
-                # incident, and dispatch refuses them.
-                payload["colleague_workspaces_note"] = (
-                    "同事共享的工作区当前只能读取（list_files / read_file；rw 时可 "
-                    "write_file 写文件），delegate_to_analyst 不能向同事的工作区派发"
-                    "任务（会被拒绝）。要在同事工作区里做的事：用 manage_workspaces"
-                    '(action="create") 在用户自己名下新建工作区，再把任务派发给它的'
-                    "分析师。"
-                )
+                if is_colleague_dispatch_enabled():
+                    payload["colleague_workspaces_note"] = (
+                        "同事共享的工作区：access 为 rw 时可用 list_files / read_file / "
+                        "write_file，也可用 delegate_to_analyst 向该工作区的分析师派发任务；"
+                        "access 为 ro（read_only=true）时只能用 list_files / read_file 读取，"
+                        "不能向只读工作区派发任务。"
+                    )
+                else:
+                    # Said here, where the model reads the list it is about to
+                    # route by: promising a dispatch into one of these was the
+                    # incident, and dispatch refuses them.
+                    payload["colleague_workspaces_note"] = (
+                        "同事共享的工作区当前只能读取（list_files / read_file；rw 时可 "
+                        "write_file 写文件），delegate_to_analyst 不能向同事的工作区派发"
+                        "任务（会被拒绝）。要在同事工作区里做的事：用 manage_workspaces"
+                        '(action="create") 在用户自己名下新建工作区，再把任务派发给它的'
+                        "分析师。"
+                    )
         # --- DALTON-HOOK(workspace-sharing-settings): end ---
         content = json.dumps(payload, default=str)
     except Exception as e:
@@ -302,6 +313,7 @@ async def workspaces_create(
         WorkspaceNameInvalid,
         WorkspaceNameTaken,
     )
+    from src.server.services.computer_errors import ComputerPreparingError
 
     try:
         from src.server.services.workspace_manager import WorkspaceManager
@@ -344,6 +356,12 @@ async def workspaces_create(
         return error_command(f"{e} {hint}", tool_call_id)
     except WorkspaceNameInvalid as e:
         return error_command(str(e), tool_call_id)
+    except ComputerPreparingError:
+        return error_command(
+            "The user's computer is still being prepared, so no workspace can "
+            "be created on it yet. Tell the user to try again once it is ready.",
+            tool_call_id,
+        )
     except Exception as e:
         logger.error(f"Failed to create workspace: {e}")
         return error_command("failed to create workspace", tool_call_id)
@@ -552,11 +570,10 @@ async def threads_delete(
 
     try:
         from src.server.database.conversation.threads_read import get_thread_by_id
-        from src.server.database.conversation.threads_write import delete_thread
+        from src.server.services.commands.control import delete_thread_ending_commands
         from src.server.services.thread_mutation import (
             MutationConflict,
             MutationUnavailable,
-            ThreadMutationRunner,
         )
 
         # The row is gone after the delete, and the prune needs its workspace.
@@ -569,10 +586,7 @@ async def threads_delete(
         # unfenced delete here would cascade away a live run's ledger rows
         # out from under a writer on any worker.
         try:
-            async with ThreadMutationRunner.get_instance().exclusive(
-                thread_id, "delete"
-            ) as mutation:
-                await delete_thread(thread_id, conn=mutation.conn)
+            await delete_thread_ending_commands(thread_id)
         except MutationConflict as e:
             detail = e.detail if isinstance(e.detail, dict) else {}
             return error_command(
@@ -716,23 +730,27 @@ async def workspace_files_list_cos(
         return err
     try:
         from src.server.app.workspace_files._shared import (
-            _acquire_sandbox_to_change,
             _is_non_owner_blocked_path,
-            _normalize_requested_path,
             owner_work_dir,
-            previous_dir_names_of,
         )
         from src.server.app.workspace_files.crud import _live_listing
         from src.server.database.workspace import get_workspace
         from src.server.models.workspace import served_from_mirror
         from src.server.services.persistence.file import FilePersistenceService
+        from src.server.services.workspace_file_containment import (
+            normalize_requested_path,
+        )
+        from src.server.services.workspace_files import (
+            acquire_sandbox_to_change,
+            previous_dir_names_of,
+        )
 
         ws = await get_workspace(workspace_id)
         if not ws:
             return error_command("workspace not found", tool_call_id)
         work_dir = owner_work_dir(ws)
         previous_dirs = previous_dir_names_of(ws)
-        normalized_path = _normalize_requested_path(
+        normalized_path = normalize_requested_path(
             path or ".", work_dir, previous_dirs
         )
         if normalized_path and _is_non_owner_blocked_path(normalized_path):
@@ -757,7 +775,7 @@ async def workspace_files_list_cos(
             ]
         else:
             owner_id = str(ws.get("user_id") or user_id)
-            async with _acquire_sandbox_to_change(workspace_id, owner_id) as (
+            async with acquire_sandbox_to_change(workspace_id, owner_id) as (
                 sandbox,
                 live_ws,
             ):
@@ -796,20 +814,24 @@ async def workspace_file_read_cos(
     try:
         from fastapi import HTTPException
         from src.server.app.workspace_files._shared import (
-            _acquire_sandbox_to_change,
             _decode_file_text,
             _is_binary,
             _is_non_owner_blocked_path,
-            _normalize_requested_path,
             _to_client_path,
             http_file_text,
             owner_work_dir,
-            previous_dir_names_of,
         )
         from src.server.app.workspace_files.crud import _read_contained_target
         from src.server.database.workspace import get_workspace
         from src.server.models.workspace import served_from_mirror
         from src.server.services.persistence.file import FilePersistenceService
+        from src.server.services.workspace_file_containment import (
+            normalize_requested_path,
+        )
+        from src.server.services.workspace_files import (
+            acquire_sandbox_to_change,
+            previous_dir_names_of,
+        )
         from src.server.utils.secret_redactor import (
             get_redactor,
             get_vault_secrets_for_redaction,
@@ -820,7 +842,7 @@ async def workspace_file_read_cos(
             return error_command("workspace not found", tool_call_id)
         work_dir = owner_work_dir(ws)
         previous_dirs = previous_dir_names_of(ws)
-        normalized_path = _normalize_requested_path(path, work_dir, previous_dirs)
+        normalized_path = normalize_requested_path(path, work_dir, previous_dirs)
         if not normalized_path or _is_non_owner_blocked_path(normalized_path):
             return error_command("file not found", tool_call_id)
 
@@ -837,7 +859,7 @@ async def workspace_file_read_cos(
             text_content = await http_file_text(file_record, user_id=owner_id)
             out_path = normalized_path
         else:
-            async with _acquire_sandbox_to_change(workspace_id, owner_id) as (
+            async with acquire_sandbox_to_change(workspace_id, owner_id) as (
                 sandbox,
                 live_ws,
             ):
@@ -897,19 +919,21 @@ async def workspace_file_write_cos(
         return err
     try:
         from src.server.app.workspace_files._shared import (
-            _acquire_sandbox_to_change,
             _is_non_owner_blocked_path,
-            _normalize_requested_path,
             _to_client_path,
             owner_work_dir,
-            previous_dir_names_of,
         )
-        from src.server.app.workspace_files.crud import (
-            MAX_WRITE_BYTES,
-            _contained_target,
-        )
+        from src.server.app.workspace_files.crud import MAX_WRITE_BYTES
         from src.server.database.workspace import get_workspace
         from src.server.models.workspace import served_from_mirror
+        from src.server.services.workspace_file_containment import (
+            normalize_requested_path,
+        )
+        from src.server.services.workspace_files import (
+            acquire_sandbox_to_change,
+            contained_target,
+            previous_dir_names_of,
+        )
 
         ws = await get_workspace(workspace_id)
         if not ws:
@@ -921,7 +945,7 @@ async def workspace_file_write_cos(
             )
         work_dir = owner_work_dir(ws)
         previous_dirs = previous_dir_names_of(ws)
-        normalized_req_path = _normalize_requested_path(path, work_dir, previous_dirs)
+        normalized_req_path = normalize_requested_path(path, work_dir, previous_dirs)
         if _is_non_owner_blocked_path(normalized_req_path):
             return error_command(
                 "403 Forbidden: Cannot write system, hidden, or virtual files",
@@ -933,14 +957,14 @@ async def workspace_file_write_cos(
             return error_command("File content too large (max 10MB)", tool_call_id)
 
         owner_id = str(ws.get("user_id") or user_id)
-        async with _acquire_sandbox_to_change(workspace_id, owner_id) as (
+        async with acquire_sandbox_to_change(workspace_id, owner_id) as (
             sandbox,
             live_ws,
         ):
             work_dir = owner_work_dir(live_ws)
             previous_dirs = previous_dir_names_of(live_ws)
             # DALTON-HOOK(workspace-sharing-settings): keep CoS writes inside the named workspace
-            rel_path = _normalize_requested_path(path, work_dir, previous_dirs)
+            rel_path = normalize_requested_path(path, work_dir, previous_dirs)
             if _is_non_owner_blocked_path(rel_path):
                 return error_command(
                     "403 Forbidden: Cannot write system, hidden, or virtual files",
@@ -977,7 +1001,7 @@ async def workspace_file_write_cos(
                     "或把 workspace_id 换成那个工作区。",
                     tool_call_id,
                 )
-            normalized = await _contained_target(
+            normalized = await contained_target(
                 sandbox, rel_path, work_dir, previous_dirs
             )
             client_path = _to_client_path(sandbox, normalized, work_dir)

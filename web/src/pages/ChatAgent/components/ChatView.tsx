@@ -1,7 +1,7 @@
 import React, { Suspense, useEffect, useEffectEvent, useLayoutEffect, useRef, useState, useCallback, useMemo } from 'react';
 import { useLocation, useNavigate } from 'react-router';
 import { useTranslation } from 'react-i18next';
-import { ArrowLeft, FolderOpen, TextSelect, Menu } from 'lucide-react';
+import { ArrowLeft, PanelRight, TextSelect, Menu } from 'lucide-react';
 import { useIsMobile } from '@/hooks/useIsMobile';
 import { useStableHandler } from '@/hooks/useStableHandler';
 import { useLatestRef } from '@/hooks/useLatestRef';
@@ -10,6 +10,7 @@ import { usePreferences } from '@/hooks/usePreferences';
 import { readTurnEndScroll } from '@/lib/turnEndScroll';
 import {
   readStreamingMode,
+  readToolCallLayout,
   readTurnDisplay,
   TranscriptDisplayContext,
   type TranscriptDisplay,
@@ -18,9 +19,9 @@ import { useFeatureEnabled } from '@/hooks/useFeatures';
 import { isHomeWorkspace } from '@/lib/homeWorkspace';
 import { useQueryClient } from '@tanstack/react-query';
 import { queryKeys } from '@/lib/queryKeys';
+import { cn } from '@/lib/utils';
 import { invalidateSubagents } from '@/hooks/useSubagents';
-import { useLocale } from '@/hooks/useLocale';
-import { onboardingKickoff } from '@/pages/Onboarding/connect/kickoff';
+import { markHandoffReady } from '@/pages/Onboarding/welcome/handoff';
 import { cardDownloadKey, trackPending } from '../utils/downloadNotice';
 import { summarizeThread, offloadThread, cancelSubagentTask, triggerFileDownload, resolveWorkspaceFile } from '../utils/api';
 import { downloadTarget } from '../utils/fileRefResolver';
@@ -29,6 +30,7 @@ import { mergeWarmingDisplay } from '../utils/warmWorkspace';
 import { useChatMessages } from '../hooks/useChatMessages';
 import { useThreadModel } from '../hooks/useThreadModel';
 import { useThreadSubagents } from '../hooks/useThreadSubagents';
+import { useThreadTuning } from '../hooks/useThreadTuning';
 import { useForeignRunCatchUp } from '../hooks/useForeignRunCatchUp';
 import { useComputerFolders } from '../hooks/useComputerFolders';
 import { saveChatSession, getChatSession, clearChatSession } from '../hooks/utils/chatSessionRestore';
@@ -70,14 +72,18 @@ import SubagentStatusBar from './SubagentStatusBar';
 import TodoDrawer from './TodoDrawer';
 import { ComposerTray, ReconnectingChip, TrayDock } from './chatView/ComposerTray';
 import { useTrayContents } from './chatView/useTrayContents';
+import { useThreadCommands } from '../hooks/useCommands';
+import { ThreadCommandsContext } from './commands/threadCommandsContext';
 import { useTrayFold } from './chatView/useTrayFold';
 import { ErrorBanner } from '@/components/ui/error-banner';
 import { motion, AnimatePresence, type PanInfo } from '@/lib/framer';
+import { TWEEN } from '@/lib/motion';
 import { MobileBottomSheet } from '@/components/ui/mobile-bottom-sheet';
 
 
 
-const FilePanel = React.lazy(() => import('./FilePanel'));
+const loadFilePanel = () => import('./FilePanel');
+const FilePanel = React.lazy(loadFilePanel);
 const DetailPanel = React.lazy(() => import('./DetailPanel'));
 const PreviewViewer = React.lazy(() => import('./viewers/PreviewViewer'));
 
@@ -90,15 +96,19 @@ import { TranscriptStatus } from './chatView/TranscriptStatus';
 import { FallbackSuggestionPill } from './chatView/FallbackSuggestionPill';
 import { ThreadOffers } from './chatView/ThreadNotices';
 import { ChatDiskWarning } from './chatView/ChatDiskWarning';
+import { ChatRestoreOffer } from './chatView/ChatRestoreOffer';
 import { useToolCallAnnouncer } from './chatView/useToolCallAnnouncer';
 import { useNavPanel } from './chatView/useNavPanel';
 import { MobileNavDrawer } from './chatView/MobileNavDrawer';
 import { useChatScroll } from './chatView/useChatScroll';
+import { useStreamFollow } from './chatView/transcriptFollow';
 import { OlderHistoryRow } from './chatView/OlderHistoryRow';
 import { isTurnOpen, useTranscriptFollow } from './chatView/useTranscriptFollow';
 import { useSubagentTabs } from './chatView/useSubagentTabs';
 import { publishSidebarAgents, clearSidebarAgents } from './sidebarAgentsBridge';
 import { useRightPanel } from './chatView/useRightPanel';
+import { handOffToggleFocus } from './filePanel/panelToggleFocus';
+import { PanelLoadingStrip } from './filePanel/PanelLoadingStrip';
 import { usePanelFiles } from './chatView/usePanelFiles';
 import { usePanelChartSelections } from './chatView/usePanelChartSelections';
 import { SelectionChips } from '@/pages/MarketView/components/SelectionChips';
@@ -109,6 +119,8 @@ import {
   TeamReadOnlyComposer,
   useTeamReadOnly,
 } from './dalton/TeamSharing';
+import { isDaltonAuth } from '@/config/daltonAuth';
+import { useUser } from '@/hooks/useUser';
 // DALTON-HOOK(coverage-tracking): company workspace auto-tracking toggle in thread top bar
 import { WorkspaceTrackingToggle } from './dalton/WorkspaceTrackingToggle';
 // DALTON-HOOK(workspace-sharing-settings): per-workspace sharing settings modal in thread top bar
@@ -123,7 +135,6 @@ import { WorkspaceSharingModal } from './dalton/WorkspaceSharingModal';
 const TRANSCRIPT_BOTTOM_PAD = 'pb-[calc(var(--composer-h,0px)+0.5rem)] *:[--composer-h:initial]';
 function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName: initialWorkspaceName, isActive = true, onThreadResolved, warmingState = false }: ChatViewProps): React.ReactElement | null {
   const { t } = useTranslation();
-  const locale = useLocale();
   const isMobile = useIsMobile();
   const containerRef = useRef<HTMLDivElement>(null);
   const chatInputRef = useRef<ChatInputHandle>(null);
@@ -147,9 +158,11 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
   // workspaces that wrote them.
   const isHome = isHomeWorkspace(workspaceRecord);
   // Home is named for what it stands for.
-  const workspaceName = (isHome ? t('agents.allWorkspaces') : workspaceRecord?.name) || initialWorkspaceName || '';
+  const workspaceName = (isHome ? t('agents.chiefOfStaff') : workspaceRecord?.name) || initialWorkspaceName || '';
   // DALTON-HOOK(team-sharing): detect read-only colleague workspace/thread
   const teamReadOnly = useTeamReadOnly(workspaceId, workspaceRecord);
+  // DALTON-HOOK(colleague-dispatch): current user for thread ownership check
+  const { user: currentUser } = useUser({ enabled: Boolean(workspaceId) && isDaltonAuth });
 
   // The model a navigation's first message goes out with, captured at mount:
   // ChatAgent keeps up to five ChatViews rendered at once (display:none, not
@@ -157,11 +170,26 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
   // auto-send below clears the route state.
   const [navModel] = useState(() => (typeof state?.model === 'string' && state.model ? state.model : null));
   // The navigation bringing a new thread's first message, with the landing
-  // composer's Subagents pick. Read per navigation rather than frozen: a new
-  // chat's view stays cached while unsent, and the next one takes it up.
-  const subagentsLanding = isActive && threadId === '__default__' && state?.initialMessage
-    ? { key: location.key, allowed: typeof state.subagentsAllowed === 'boolean' ? state.subagentsAllowed : null }
+  // composer's Subagents, effort and fast-mode picks. Read per navigation
+  // rather than frozen: a new chat's view stays cached while unsent, and the
+  // next one takes it up.
+  const landingNav =
+    isActive && threadId === '__default__' && (state?.initialMessage || state?.hiddenOpener) ? state : null;
+  const subagentsLanding = landingNav
+    ? { key: location.key, allowed: typeof landingNav.subagentsAllowed === 'boolean' ? landingNav.subagentsAllowed : null }
     : null;
+  const tuningLanding = landingNav
+    ? {
+      key: location.key,
+      reasoningEffort: typeof landingNav.reasoningEffortOverride === 'string' ? landingNav.reasoningEffortOverride : null,
+      fastMode: typeof landingNav.fastModeOverride === 'boolean' ? landingNav.fastModeOverride : null,
+    }
+    : null;
+  // The thread the welcome flow opens, captured at mount for the same reason.
+  // The flow hands its conversation over as a view transition
+  // (welcome/handoff.ts), which lands on this view's parts and waits for it to
+  // draw the agent at work.
+  const [kickoffView] = useState(() => isActive && state?.handoff === true);
 
 
 
@@ -169,6 +197,9 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
   const [activeAgentId, setActiveAgentId] = useState(
     initialTaskId ? `task:${initialTaskId}` : 'main'
   );
+  // The turns the main list has drawn running. Kept here, one view per
+  // thread, since that list unmounts while a subagent tab is open.
+  const [mainRanHere] = useState(() => new Set<number>());
   // Show system files in FilePanel (.agents/, code/, tools/, etc.)
   const [showSystemFiles, setShowSystemFiles] = useState(
     () => localStorage.getItem('filePanel.showSystemFiles') === 'true'
@@ -246,6 +277,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
   const chatFolders = useComputerFolders(workspaceId);
   const otherPanelFolders = useComputerFolders(panelWorkspaceId === workspaceId ? null : panelWorkspaceId);
   const panelFolders = panelWorkspaceId === workspaceId ? chatFolders : otherPanelFolders;
+  const chatRootDir = chatFolders?.rootDir;
 
   // Set when the agent writes the user's profile (onboarding saves it there,
   // `user.json` included), and read at turn end.
@@ -259,7 +291,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     refreshOwnFiles();
     const filePath = fileArtifactPath(event?.payload as FileOperationArtifactPayload | undefined);
     if (!filePath) return;
-    const info = classifyAgentPath(filePath);
+    const info = classifyAgentPath(filePath, chatRootDir);
     // The agent writes its own memory, whichever workspace the panel shows.
     if (info.kind === 'memory') {
       if (info.tier === 'user') {
@@ -278,8 +310,8 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     }
     // The Subagents pane is a page away, so this only marks its list stale
     // for the way back.
-    if (isSubagentFilePath(filePath)) invalidateSubagents(queryClient);
-  }, [refreshOwnFiles, queryClient, workspaceId]);
+    if (isSubagentFilePath(filePath, chatRootDir)) invalidateSubagents(queryClient);
+  }, [refreshOwnFiles, queryClient, workspaceId, chatRootDir]);
 
   // Stable ref-based callback for opening preview URLs from SSE events.
   // Defined here so it can be passed to useChatMessages; assigned after
@@ -291,7 +323,8 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
 
   // Chat messages management - receives updateTodoListCard and updateSubagentCard from floating cards hook.
   // Send, edit, regenerate and retry come from useTranscriptFollow below.
-  const chat = useChatMessages(workspaceId, threadId, updateTodoListCard as (todoData: Record<string, unknown>) => void, updateSubagentCard, finalizePendingTodos, handleFileArtifact, handleOpenPreviewFromStream, clearSubagentCards, handleWorkspaceCreated, 'web');
+  const readComposerOptions = useCallback(() => chatInputRef.current?.getModelOptions?.(), []);
+  const chat = useChatMessages(workspaceId, threadId, updateTodoListCard as (todoData: Record<string, unknown>) => void, updateSubagentCard, finalizePendingTodos, handleFileArtifact, handleOpenPreviewFromStream, clearSubagentCards, handleWorkspaceCreated, 'web', readComposerOptions);
   const {
     messages,
     liveMessages,
@@ -300,7 +333,9 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     awaitingReportBack,
     reportBackOwed,
     reportBackOwedThreads,
+    reportBackOwedKinds,
     workspaceStarting,
+    turnHeld,
     isCompacting,
     setIsCompacting,
     compactionTokens,
@@ -347,6 +382,8 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     reconnectIfStaleRun,
     isOwnRun,
     getSubagentHistory,
+    getTaskRuns,
+    putTaskRun,
     subagentHistoryEntries,
     resolveSubagentIdToAgentId,
     hydrateTaskTranscript,
@@ -358,12 +395,43 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     isLoading,
     initialModel: navModel,
   });
-  const { pickModel: pickThreadModel } = threadModel;
+  const { pickModel: pickThreadModel, thread: threadRecord } = threadModel;
+  // DALTON-HOOK(colleague-dispatch): determine whether the active thread is read-only for the caller
+  const currentUserId = currentUser?.user_id ?? null;
+  const threadUserId = (threadRecord?.thread_user_id as string | null | undefined) ?? null;
+  const dispatchedBy =
+    (threadRecord?.dispatched_by as
+      | { user_id?: string; name?: string | null; channel?: string }
+      | null
+      | undefined) ?? null;
+  const isForeignThreadOwner = Boolean(
+    isDaltonAuth &&
+      ((threadUserId && currentUserId && threadUserId !== currentUserId) ||
+        (!threadUserId &&
+          dispatchedBy?.user_id &&
+          (!currentUserId || dispatchedBy.user_id !== currentUserId))),
+  );
+  const isOwnThreadInRwColleagueWs =
+    teamReadOnly.isColleague &&
+    teamReadOnly.colleagueDispatchEnabled &&
+    !teamReadOnly.isReadOnly &&
+    (threadId === '__default__' ||
+      Boolean(threadUserId && currentUserId && threadUserId === currentUserId));
+  const isThreadReadOnly =
+    isForeignThreadOwner || (teamReadOnly.isColleague && !isOwnThreadInRwColleagueWs);
+  const dispatchedByName = isForeignThreadOwner
+    ? dispatchedBy?.name || dispatchedBy?.user_id || teamReadOnly.ownerName || '同事'
+    : null;
   const threadSubagents = useThreadSubagents({
     threadId: currentThreadId,
     landing: subagentsLanding,
   });
   const { toSend: subagentsToSend } = threadSubagents;
+  const threadTuning = useThreadTuning({
+    threadId: currentThreadId,
+    landing: tuningLanding,
+  });
+  const { toSend: tuningToSend } = threadTuning;
 
   // Fallback-suggestion pill action: adopt the model that actually answered,
   // for this thread only. Making it the default is the banner's offer, which
@@ -435,21 +503,22 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
   });
   const {
     scrollAreaRef,
-    subagentScrollAreaRef,
+    transcriptFloorRef,
+    subagentScrollRoot,
+    subagentPane,
+    takeTabPlace,
     getScrollContainer,
-    withProgrammaticScroll,
     pinToBottom,
     saveScrollPosition,
     jumpPill,
-    scrollPositionsRef,
-    skipSubagentAutoScrollRef,
     activeAgentIdRef,
     isNearBottomRef,
-    isSubagentNearBottomRef,
     restoredForThreadRef,
     pinToMessage,
     revealFiles,
+    revealMessage,
     holdPlace,
+    toTop,
     entryRestored,
     pinTargetRef,
   } = scroll;
@@ -470,7 +539,11 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
   // flip in Settings reaches them together and neither re-renders on the other's
   // account.
   const transcriptDisplay = useMemo<TranscriptDisplay>(
-    () => ({ turnDisplay: readTurnDisplay(preferences), streamingMode: readStreamingMode(preferences) }),
+    () => ({
+      turnDisplay: readTurnDisplay(preferences),
+      streamingMode: readStreamingMode(preferences),
+      toolCallLayout: readToolCallLayout(preferences),
+    }),
     [preferences],
   );
 
@@ -495,14 +568,18 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     updateSubagentCard,
     sendSubagentInstruction,
     getSubagentHistory,
+    getTaskRuns,
+    putTaskRun,
     resolveSubagentIdToAgentId,
     hydrateTaskTranscript,
     saveScrollPosition,
-    scrollPositionsRef,
-    skipSubagentAutoScrollRef,
     activeAgentIdRef,
     resolvedThreadIdRef,
   });
+  const subagentTelemetry = useMemo(
+    () => ({ resolve: resolveSubagentTelemetry, followsRuns: true }),
+    [resolveSubagentTelemetry],
+  );
 
   // Whether the open subagent's turn is still running. A bubble's own
   // `isStreaming` goes false between two model calls of one agent loop, so a
@@ -513,6 +590,18 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
   const subagentTurnLive = activeAgent
     ? !isTerminalStatus(deriveSubagentStatus({ status: activeAgent.status, messages: activeAgent.messages }))
     : false;
+  // The subagent transcript's follow: the market panel's, gliding while that
+  // turn runs, and opening where the reader left the tab, or at its end. Its
+  // pane is gone once main is shown, though its state clears a commit later.
+  // A tab opened onto a transcript still being fetched loads until its first
+  // message, which can land long after the opening's hold has lapsed.
+  const subagentShown = activeAgentId === 'main' ? null : subagentPane;
+  const { toTop: subagentToTop } = useStreamFollow(subagentShown?.scroller ?? null, subagentShown?.content ?? null, {
+    live: subagentTurnLive,
+    loading: !!activeAgent && (activeAgent.messages?.length ?? 0) === 0,
+    view: activeAgentId,
+    openAt: () => takeTabPlace(activeAgentId),
+  });
 
   // Publish this view's subagent registry to the global AppSidebar while it is
   // the visible ChatView. Same thread key as the drawer's `currentThreadId`
@@ -579,6 +668,13 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
   // wrappers re-point post-commit; the callbacks only fire from user events,
   // which always run after commit, so they never see a stale function.
   const stableSendMessage = useStableHandler(handleSendMessage);
+  // A rerun carries what the composer shows, as a send does, so a pick whose
+  // save has not landed is not lost to the row the server would read.
+  const stableEditMessage = useStableHandler((id: string, content: string) =>
+    handleEditMessage(id, content, chatInputRef.current?.getModelOptions?.()));
+  const stableRegenerate = useStableHandler((id: string) =>
+    handleRegenerate(id, chatInputRef.current?.getModelOptions?.()));
+  const stableRetry = useStableHandler(() => handleRetry(chatInputRef.current?.getModelOptions?.()));
   const stableStopWorkflow = useStableHandler(stopWorkflow);
   const stableStopCompaction = useStableHandler(stopCompaction);
 
@@ -676,7 +772,8 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     }
 
     const additionalContext = contexts.length > 0 ? contexts : null;
-    stableSendMessage(
+    // DALTON-HOOK(composer-drafts): forward send result so ChatInput preserves the draft when sending fails
+    return stableSendMessage(
       picked?.outgoingMessage ?? message,
       additionalContext,
       attachmentMeta,
@@ -684,9 +781,10 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
         ...modelOptions,
         ...(picked ? { chartSelections: picked.snapshots } : {}),
         subagentsAllowed: subagentsToSend,
+        ...tuningToSend,
       },
     );
-  }, [marketWatchEnabled, stableSendMessage, takeChartSelections, subagentsToSend]);
+  }, [marketWatchEnabled, stableSendMessage, takeChartSelections, subagentsToSend, tuningToSend]);
 
   // Handle action-type slash commands (e.g. /compact, /compaction, /offload)
   const handleAction = useCallback((cmd: ActionCommand) => {
@@ -852,6 +950,8 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     rightPanelType,
     setRightPanelType,
     rightPanelWidth,
+    panelExpanded,
+    handleTogglePanelExpanded,
     previewData,
     panelWrapperRef,
     isDragging,
@@ -893,6 +993,16 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     readOnly: teamReadOnly.isColleague,
     isColleague: teamReadOnly.isColleague,
   });
+
+  // On desktop the header's files toggle gives way to the panel's own the
+  // moment it is pressed, so a panel still fetching its code would leave
+  // neither on screen. Fetched once the view settles, or as the pointer
+  // nears the toggle, it is there before the click.
+  useEffect(() => {
+    if (isMobile) return;
+    const timer = setTimeout(() => { void loadFilePanel(); }, 1500);
+    return () => clearTimeout(timer);
+  }, [isMobile]);
   // The file panel's props are one compiled scope, so this handler's per-chunk
   // identity would re-create every inline prop beside it and re-render the panel.
   const openSubagentTaskFromPanel = useStableHandler(handleOpenSubagentTask);
@@ -901,8 +1011,14 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
   // tray folds into the composer's toolbar, on the jump-to-latest pill's
   // signal and until the pill's glide to the end has landed. Clicking the
   // folded dock pours it back out where the reader is, until they scroll on.
+  // The thread's background commands, read once here for the tray and the
+  // tool cards, which watch this read in the cache.
+  const commands = useThreadCommands(panelThreadId, isActive);
   const trayContents = useTrayContents({
     marketWatch,
+    commands,
+    threadId: panelThreadId ?? null,
+    isActive,
     cards,
     taskHistory: subagentHistoryEntries,
     messages,
@@ -910,6 +1026,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     hasActiveSubagents,
     reportBackOwed,
     owedThreads: reportBackOwedThreads,
+    owedKinds: reportBackOwedKinds,
     isHome,
   });
   // A roster task the page only knows from history or its report has no card
@@ -993,6 +1110,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     onDownloadFile: handleDownloadFileFromChat,
     downloadKeyFor,
     onRevealFiles: revealFiles,
+    onRevealMessage: revealMessage,
     onOpenSources: handleOpenSourcesFromChat,
     onToolCallDetailClick: handleToolCallDetailClick,
     onOpenChart: handleOpenChart,
@@ -1014,14 +1132,15 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     onThumbUp: handleThumbUp,
     onThumbDown: handleThumbDown,
     onWidgetSendPrompt: stableSendMessage,
-    onEditMessage: handleEditMessage,
-    onRegenerate: handleRegenerate,
-    onRetry: handleRetry,
+    onEditMessage: stableEditMessage,
+    onRegenerate: stableRegenerate,
+    onRetry: stableRetry,
     editDrafts,
     onSendMessage: handleSendMessage,
     chatInputRef,
     // DALTON-HOOK(workspace-sharing-settings): withhold mutation/interactive callbacks for colleagues
-    readOnly: teamReadOnly.isColleague,
+    // DALTON-HOOK(colleague-dispatch): also withhold mutation/interactive callbacks on foreign-owned threads
+    readOnly: isThreadReadOnly,
   });
 
   // The dispatcher's deep-link context for PTC-agent proposal cards. Memoized:
@@ -1128,10 +1247,9 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
   const handleTopBarTap = useCallback((e: React.MouseEvent) => {
     if (!isMobile) return;
     if ((e.target as HTMLElement).closest('button, a')) return;
-    const ref = activeAgentId === 'main' ? scrollAreaRef : subagentScrollAreaRef;
-    const container = getScrollContainer(ref);
-    if (container) withProgrammaticScroll(() => container.scrollTo({ top: 0, behavior: 'smooth' }), 'smooth');
-  }, [isMobile, activeAgentId, getScrollContainer, withProgrammaticScroll, scrollAreaRef, subagentScrollAreaRef]);
+    if (activeAgentId === 'main') toTop();
+    else subagentToTop();
+  }, [isMobile, activeAgentId, toTop, subagentToTop]);
 
 
 
@@ -1161,56 +1279,22 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     }
   }, [currentThreadId, threadId, workspaceId, navigate, queryClient, isActive, onThreadResolved, activeAgentIdRef]);
 
-  // The opening turn of a profile conversation, worded in the language in
-  // force when it goes out. Revisiting preferences sends the message alone.
-  const sendProfileKickoff = useEffectEvent((kind: 'onboarding' | 'modify', brokerages: string[]) => {
-    if (kind === 'modify') {
-      handleSendMessage(t('onboarding.kickoff.modifyPreferences'));
-      return;
-    }
-    const { message, additionalContext } = onboardingKickoff(t, locale, brokerages);
-    handleSendMessage(message, additionalContext);
-  });
-
   // Auto-send initial message from navigation state (e.g., from Dashboard)
   useEffect(() => {
     // Hidden views must not send initial messages (R7 — all views share useLocation)
     if (!isActive) return;
-    // DALTON-HOOK(workspace-sharing-settings): never auto-send initialMessage or onboarding kickoff on colleague workspaces
-    if (teamReadOnly.isColleague) return;
+    // DALTON-HOOK(workspace-sharing-settings): never auto-send initialMessage or onboarding kickoff on read-only colleague workspaces
+    // DALTON-HOOK(colleague-dispatch): allow auto-send when colleague starts a new thread on a web_access === 'rw' workspace
+    if (isThreadReadOnly) return;
     // Only proceed if we have the required IDs
     if (!workspaceId || !threadId) {
       return;
     }
 
-    // Onboarding, from the connect sheet, and its revisit from Settings. The
-    // wording is built when the message goes out (sendProfileKickoff).
-    if (
-      (location.state?.isOnboarding || location.state?.isModifyingPreferences) &&
-      !initialMessageSentRef.current &&
-      !isLoading &&
-      !isLoadingHistory
-    ) {
-      initialMessageSentRef.current = true;
-      const kickoff = location.state.isOnboarding
-        ? {
-            kind: 'onboarding' as const,
-            // Router state survives a reload and is the user's to edit, so
-            // only names that are names reach the message.
-            brokerages: ((location.state as LocationState).onboardingBrokerages ?? []).filter(
-              (name: unknown): name is string => typeof name === 'string' && name !== '',
-            ),
-          }
-        : { kind: 'modify' as const, brokerages: [] };
-      // Clear navigation state to prevent re-sending on re-renders
-      navigate(location.pathname, { replace: true, state: {} });
-      // Small delay to ensure component is fully mounted
-      setTimeout(() => sendProfileKickoff(kickoff.kind, kickoff.brokerages), 100);
-      return;
-    }
-
-    // Handle regular message flow
-    if (location.state?.initialMessage && !initialMessageSentRef.current) {
+    // Handle regular message flow. The welcome flow's opening turn goes this
+    // way too, and when it asks the agent where to start it has no message of
+    // its own: a hidden opener, sent with an empty one.
+    if ((location.state?.initialMessage || location.state?.hiddenOpener) && !initialMessageSentRef.current) {
       // Merge state.skills (names) into additionalContext as skill entries,
       // so hidden skills preloaded upstream (e.g. chart-annotation from
       // MarketView) stay active on the PTC side.
@@ -1231,80 +1315,92 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
 
       // For new threads (__default__), send immediately without waiting for history
       // For existing threads, wait for history to finish loading
-      if (threadId === '__default__') {
-        // New thread - send immediately
-        initialMessageSentRef.current = true;
-        // Capture state values before clearing (navigate may update location ref)
-        const { initialMessage, additionalContext, attachmentMeta, model, reasoningEffort, widgetSnapshots, chartSelections, skills } = location.state;
-        const mergedContext = mergeSkills(additionalContext, skills);
-        // Clear navigation state to prevent re-sending on re-renders
-        navigate(location.pathname, { replace: true, state: {} });
-        // Small delay to ensure component is fully mounted
-        setTimeout(() => {
-          handleSendMessage(initialMessage, mergedContext, attachmentMeta || null, { model, reasoningEffort, widgetSnapshots, chartSelections, subagentsAllowed: subagentsToSend });
-        }, 100);
-      } else if (!isLoadingHistory && !isLoading) {
-        // Existing thread - wait for history to load, then send
-        // This ensures we don't send duplicate messages
-        initialMessageSentRef.current = true;
-        // Capture state values before clearing (navigate may update location ref)
-        const { initialMessage, additionalContext, attachmentMeta, model, reasoningEffort, widgetSnapshots, chartSelections, skills } = location.state;
-        const mergedContext = mergeSkills(additionalContext, skills);
-        // Clear navigation state to prevent re-sending on re-renders
-        navigate(location.pathname, { replace: true, state: {} });
-        // Small delay to ensure component is fully mounted
-        setTimeout(() => {
-          handleSendMessage(initialMessage, mergedContext, attachmentMeta || null, { model, reasoningEffort, widgetSnapshots, chartSelections, subagentsAllowed: subagentsToSend });
-        }, 100);
-      }
+      // This ensures we don't send duplicate messages
+      if (threadId !== '__default__' && (isLoadingHistory || isLoading)) return;
+      initialMessageSentRef.current = true;
+      // Capture state values before clearing (navigate may update location ref)
+      const {
+        initialMessage,
+        additionalContext,
+        attachmentMeta,
+        model,
+        reasoningEffort,
+        fastMode,
+        widgetSnapshots,
+        chartSelections,
+        skills,
+        hiddenOpener,
+        threadTitle,
+        handoff,
+      } = location.state;
+      const mergedContext = mergeSkills(additionalContext, skills);
+      // Clear navigation state to prevent re-sending on re-renders
+      navigate(location.pathname, { replace: true, state: {} });
+      const send = () => {
+        handleSendMessage(initialMessage ?? '', mergedContext, attachmentMeta || null, {
+          model,
+          reasoningEffort,
+          fastMode,
+          widgetSnapshots,
+          chartSelections,
+          subagentsAllowed: subagentsToSend,
+          ...tuningToSend,
+          hiddenOpener,
+          threadTitle,
+        });
+      };
+      // The welcome flow's hand-off is sent at once: the view is mounted by
+      // the time its effects run, and the hand-off into it holds the page
+      // still until the turn is drawn. Anything else waits a small delay to
+      // ensure the component is fully mounted.
+      if (handoff) send();
+      else setTimeout(send, 100);
     }
-  }, [location.state, workspaceId, threadId, isLoading, isLoadingHistory, handleSendMessage, navigate, location.pathname, isActive, subagentsToSend, teamReadOnly.isReadOnly]);
+  }, [location.state, workspaceId, threadId, isLoading, isLoadingHistory, handleSendMessage, navigate, location.pathname, isActive, subagentsToSend, tuningToSend, isThreadReadOnly]); // DALTON-HOOK(colleague-dispatch): never auto-send on read-only threads
+
+  // The welcome's thread is never an empty chat: until its opening turn goes
+  // out it draws nothing where the prompt to type would be. The route state
+  // carrying the turn is cleared as it goes, so one that could not go out
+  // leaves the prompt. Drawn, the turn tells the hand-off it can land.
+  const awaitingKickoff = kickoffView && messages.length === 0 && state?.handoff === true;
+  const kickoffShown = kickoffView && messages.length > 0;
+  useLayoutEffect(() => {
+    if (kickoffShown) markHandoffReady();
+  }, [kickoffShown]);
 
   // Re-seed the composer from navigation state when there's no
   // initialMessage (the auto-send branch above already consumes them inline).
   // Used by the ContextOverflowPill click handoff: dashboard → /chat with
   // queued widget cards but no auto-send. And by Plugins → Subagents' "Create
   // with the agent", which hands it a sentence to finish rather than send.
-  const composerReseedRef = useRef(false);
+  // And by the Chief of Staff's starter questions.
+  // Once per navigation, not once per view: an unsent __default__ view is
+  // kept while the user goes back to the gallery, and the next starter lands
+  // on the same one. Only the view on screen takes it, since every cached
+  // view reads the same location.
+  const reseededKeyRef = useRef<string | null>(null);
   useEffect(() => {
     // DALTON-HOOK(team-sharing): do not reseed composer in read-only mode
-    if (composerReseedRef.current || teamReadOnly.isReadOnly) return;
+    // DALTON-HOOK(colleague-dispatch): also skip reseeding on foreign-owned threads
+    if (isThreadReadOnly) return;
+    if (!isActive || reseededKeyRef.current === location.key) return;
     const navState = location.state as LocationState | null;
     const snaps = navState?.widgetSnapshots;
     const draft = navState?.draftMessage;
     if ((!snaps?.length && !draft) || navState?.initialMessage) return;
-    composerReseedRef.current = true;
+    reseededKeyRef.current = location.key;
     snaps?.forEach((s) => chatInputRef.current?.addWidgetSnapshot(s));
     if (draft) chatInputRef.current?.setValue(draft);
     navigate(location.pathname, { replace: true, state: { ...navState, widgetSnapshots: undefined, draftMessage: undefined } });
-  }, [location.state, location.pathname, navigate, teamReadOnly.isReadOnly]);
+  }, [isActive, location.key, location.state, location.pathname, navigate, isThreadReadOnly]); // DALTON-HOOK(colleague-dispatch): re-check when read-only changes
 
 
 
 
 
   // Screen-reader announcements for tool-call completions (polite live region).
-  const recentlyCompletedAnnouncement = useToolCallAnnouncer(messages);
+  const recentlyCompletedAnnouncement = useToolCallAnnouncer(messages, chatRootDir);
 
-  // Auto-scroll subagent view when active subagent's messages change
-  // Uses the same smart-scroll logic: only scroll if user is near the bottom
-  // Skipped when restoring a saved scroll position after tab switch
-  useEffect(() => {
-    if (skipSubagentAutoScrollRef.current) {
-      skipSubagentAutoScrollRef.current = false;
-      return;
-    }
-    if (!isSubagentNearBottomRef.current) return;
-    if (!activeAgent || !subagentScrollAreaRef.current) return;
-    const scrollContainer = subagentScrollAreaRef.current.querySelector('[data-radix-scroll-area-viewport]') ||
-                           subagentScrollAreaRef.current.querySelector('.overflow-auto') ||
-                           subagentScrollAreaRef.current;
-    if (scrollContainer) {
-      setTimeout(() => {
-        scrollContainer.scrollTo({ top: scrollContainer.scrollHeight, behavior: 'smooth' });
-      }, 0);
-    }
-  }, [activeAgent?.messages]);
 
   // When this view becomes active (thread switch or new thread):
   // 1. Inherit nav panel state from the shared signal so it stays open across switches
@@ -1372,6 +1468,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
         panel's own exits do. */}
     <RouteLeaveGuardContext value={leaveFiles}>
     <ShareLinkOpenerContext value={handleOpenShareLink}>
+    <ThreadCommandsContext value={panelThreadId ?? null}>
     {/* `h-full`, never `h-screen`: this fills the shell's content column, which
         is the viewport only when nothing else is in it. Pinning it to 100vh
         pushes it out of its own box the moment anything is (the offline
@@ -1381,7 +1478,8 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
         fade in Main.tsx already covers the transition. */}
     <div
       ref={containerRef}
-      className="flex w-full overflow-hidden h-full"
+      data-handoff-scope={kickoffView ? '' : undefined}
+      className="relative flex w-full overflow-hidden h-full"
       style={{
         backgroundColor: 'var(--color-bg-page)',
       }}
@@ -1391,14 +1489,17 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
       <div aria-live="polite" aria-atomic="false" className="sr-only">
         {recentlyCompletedAnnouncement}
       </div>
-      {/* Left Side: Topbar + Sidebar + Chat Window */}
-      <div className="flex flex-col flex-1 min-w-0">
+      {/* Left Side: Topbar + Sidebar + Chat Window. Inert under an expanded
+          panel, so focus and a screen reader stay on what is shown, and
+          isolated, so the chat's own raised layers (the jump-to-latest pill)
+          stay under it rather than stacking against it. */}
+      <div className={cn('flex flex-col flex-1 min-w-0', panelExpanded && 'isolate')} inert={panelExpanded}>
         {/* Top bar */}
         {/* `drag` makes this the window's drag band inside the desktop shell.
             It already spans the titlebar and is mostly empty, so the shell gets
             a full-width band at no layout cost; the buttons in it opt out
             through the global no-drag rule. */}
-        <div data-chrome="drag" className="flex items-center justify-between px-4 py-2 border-b min-w-0 shrink-0" style={{ borderColor: 'var(--color-border-muted)', cursor: isMobile ? 'pointer' : undefined }} onClick={handleTopBarTap}>
+        <div data-chrome="drag" data-handoff="header" className="flex items-center justify-between px-4 py-2 border-b min-w-0 shrink-0" style={{ borderColor: 'var(--color-border-muted)', cursor: isMobile ? 'pointer' : undefined }} onClick={handleTopBarTap}>
           <div className="flex items-center gap-4 min-w-0 shrink">
             <button
               onClick={() => {
@@ -1475,16 +1576,25 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
             {currentThreadId && currentThreadId !== '__default__' && !teamReadOnly.isColleague && (
               <ShareButton threadId={currentThreadId} initialIsShared={threadIsShared} workspaceId={workspaceId} />
             )}
-            <button
-              onClick={handleToggleFilePanel}
-              className="p-2 rounded-md transition-colors"
-              style={{ color: 'var(--color-text-primary)', backgroundColor: rightPanelType === 'file' ? 'var(--color-border-muted)' : undefined }}
-              title={t('chat.workspaceFiles')}
-              onMouseEnter={(e) => { if (rightPanelType !== 'file') e.currentTarget.style.backgroundColor = 'var(--color-border-muted)'; }}
-              onMouseLeave={(e) => { if (rightPanelType !== 'file') e.currentTarget.style.backgroundColor = ''; }}
-            >
-              <FolderOpen className="h-5 w-5" />
-            </button>
+            {/* On desktop the open panel carries this toggle in the same
+                corner, so it is sized and placed as the panel's own buttons
+                are and the icon does not move when the panel opens. */}
+            {(isMobile || rightPanelType !== 'file') && (
+              <button
+                type="button"
+                data-panel-toggle="header"
+                onClick={(event) => { handleToggleFilePanel(); if (!isMobile) handOffToggleFocus(event, 'panel'); }}
+                onPointerEnter={() => { void loadFilePanel(); }}
+                onFocus={() => { void loadFilePanel(); }}
+                aria-pressed={rightPanelType === 'file'}
+                className={cn('transition-colors hover:bg-(--color-border-muted)', isMobile ? 'p-2 rounded-md' : 'p-1.5 -mr-2 rounded-[4px]')}
+                style={{ color: 'var(--color-text-primary)' }}
+                title={t('chat.workspaceFiles')}
+                aria-label={t('chat.workspaceFiles')}
+              >
+                <PanelRight className={isMobile ? 'h-5 w-5' : 'h-4 w-4'} />
+              </button>
+            )}
           </div>
         </div>
 
@@ -1512,7 +1622,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                 history does, not per main-agent token, and only context
                 consumers re-render: MessageBubble / MessageContentSegments
                 stay React.memo'd. */}
-            <SubagentTelemetryContext value={resolveSubagentTelemetry}>
+            <SubagentTelemetryContext value={subagentTelemetry}>
             <WorkflowRunContext value={resolveWorkflowRun}>
             <TranscriptDisplayContext value={transcriptDisplay}>
             <div
@@ -1545,49 +1655,60 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
               })()}
               {activeAgentId === 'main' ? (
                 <ScrollArea ref={scrollAreaRef} className={`h-full w-full${!isMobile && !rightPanelType ? ' chat-scroll-hide-scrollbar' : ''}`}>
-                  <div className={`${isMobile ? 'px-3 pt-3' : 'px-6 pt-4'} ${TRANSCRIPT_BOTTOM_PAD} flex justify-center`}>
-                    <div className="w-full max-w-3xl overflow-x-hidden">
-                      <OlderHistoryRow
-                        getRoot={getMainScrollRoot}
-                        status={olderHistoryStatus}
-                        canLoad={isActive && entryRestored && olderHistoryStatus === 'idle'}
-                        onLoad={loadOlderPage}
-                      />
-                      <MessageActionsProvider actions={messageActions}>
-                        {/* Above the list's chunk boundary: one batched
-                            dispatch-liveness query for every PTC card in the
-                            list, which a streamed frame does not re-render. */}
-                        <DispatchStatusProvider>
-                          <LiveMessageList
-                            store={liveMessages}
-                            isLoading={isLoading}
-                            isLoadingHistory={isLoadingHistory}
-                            feedbackByTurn={feedbackByTurn}
-                            dispatcherContext={dispatcherContext}
-                            // DALTON-HOOK(workspace-sharing-settings): render message cards in read-only mode for colleagues while preserving file cards
-                            readOnly={teamReadOnly.isColleague}
-                            allowFiles={teamReadOnly.isColleague}
-                          />
-                        </DispatchStatusProvider>
-                      </MessageActionsProvider>
-                      <TranscriptStatus
-                        modelStatus={modelStatus}
-                        isLoading={isLoading}
-                        retired={threadModel.retired}
-                        workspaceStarting={displayWorkspaceStarting}
-                        isCompacting={isCompacting}
-                        compactionTokens={compactionTokens}
-                        queuedSend={queuedSend}
-                        threadId={feedThreadId}
-                        active={isActive}
-                      />
+                  {/* The floor a pinned send holds open under its reply
+                      (chatView/turnPin). Never a transition: the pin
+                      measures the floor it has just written, and a transition
+                      would hand it the old one for a frame and clamp an
+                      instant pin short. */}
+                  <div ref={transcriptFloorRef} data-transcript-floor="" className="transition-none">
+                    <div className={`${isMobile ? 'px-3 pt-3' : 'px-6 pt-4'} ${TRANSCRIPT_BOTTOM_PAD} flex justify-center`}>
+                      <div className="w-full max-w-3xl overflow-x-hidden">
+                        <OlderHistoryRow
+                          getRoot={getMainScrollRoot}
+                          status={olderHistoryStatus}
+                          canLoad={isActive && entryRestored && olderHistoryStatus === 'idle'}
+                          onLoad={loadOlderPage}
+                        />
+                        <MessageActionsProvider actions={messageActions}>
+                          {/* Above the list's chunk boundary: one batched
+                              dispatch-liveness query for every PTC card in the
+                              list, which a streamed frame does not re-render. */}
+                          <DispatchStatusProvider>
+                            <LiveMessageList
+                              store={liveMessages}
+                              isLoading={isLoading}
+                              isLoadingHistory={isLoadingHistory}
+                              starting={awaitingKickoff}
+                              feedbackByTurn={feedbackByTurn}
+                              dispatcherContext={dispatcherContext}
+                              ranHere={mainRanHere}
+                              // DALTON-HOOK(workspace-sharing-settings): render message cards in read-only mode for colleagues while preserving file cards
+                              // DALTON-HOOK(colleague-dispatch): also render message cards read-only on foreign-owned threads
+                              readOnly={isThreadReadOnly}
+                              allowFiles={isThreadReadOnly}
+                            />
+                          </DispatchStatusProvider>
+                        </MessageActionsProvider>
+                        <TranscriptStatus
+                          modelStatus={modelStatus}
+                          isLoading={isLoading}
+                          retired={threadModel.retired}
+                          workspaceStarting={displayWorkspaceStarting}
+                          turnHeld={turnHeld}
+                          isCompacting={isCompacting}
+                          compactionTokens={compactionTokens}
+                          queuedSend={queuedSend}
+                          threadId={feedThreadId}
+                          active={isActive}
+                        />
+                      </div>
                     </div>
                   </div>
                 </ScrollArea>
               ) : activeAgent && activeAgent.type === WORKFLOW_TASK_TYPE ? (
                 // Workflow run detail — a run has no transcript of its own;
                 // its progress console replaces the generic subagent layout.
-                <ScrollArea ref={subagentScrollAreaRef} className="h-full w-full">
+                <ScrollArea ref={subagentScrollRoot} className="h-full w-full">
                   <div className={`${isMobile ? 'px-3 pt-3' : 'px-6 pt-4'} ${TRANSCRIPT_BOTTOM_PAD} flex justify-center`}>
                     <div className="w-full max-w-3xl">
                       <WorkflowRunDetail
@@ -1599,7 +1720,8 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                         resolveChildTelemetry={resolveSubagentTelemetry}
                         onStop={
                           // DALTON-HOOK(workspace-sharing-settings): disable workflow/subagent stop for colleagues
-                          !teamReadOnly.isColleague && currentThreadId && currentThreadId !== '__default__'
+                          // DALTON-HOOK(colleague-dispatch): also disable stop on foreign-owned threads
+                          !isThreadReadOnly && currentThreadId && currentThreadId !== '__default__'
                             ? () => cancelSubagentTask(currentThreadId, taskIdFromAgentId(activeAgent.id) ?? activeAgent.id)
                             : undefined
                         }
@@ -1608,7 +1730,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                   </div>
                 </ScrollArea>
               ) : activeAgent ? (
-                <ScrollArea ref={subagentScrollAreaRef} className="h-full w-full">
+                <ScrollArea ref={subagentScrollRoot} className="h-full w-full">
                   <div className={`${isMobile ? 'px-3 pt-3' : 'px-6 pt-4'} ${TRANSCRIPT_BOTTOM_PAD} flex justify-center`}>
                     <div className="w-full max-w-3xl space-y-2.5">
                       {/* Task description as header */}
@@ -1646,8 +1768,9 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                                 isSubagentView={true}
                                 isLoading={subagentTurnLive}
                                 // DALTON-HOOK(workspace-sharing-settings): render subagent message cards in read-only mode for colleagues while preserving file cards
-                                readOnly={teamReadOnly.isColleague}
-                                allowFiles={teamReadOnly.isColleague}
+                                // DALTON-HOOK(colleague-dispatch): also render subagent message cards read-only on foreign-owned threads
+                                readOnly={isThreadReadOnly}
+                                allowFiles={isThreadReadOnly}
                               />
                             </DispatchStatusProvider>
                           </MessageActionsProvider>
@@ -1706,8 +1829,15 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                   reads it. */}
               <div className="w-full max-w-3xl sibling-space-y-3 relative pointer-events-auto [--composer-h:initial]">
                 {/* DALTON-HOOK(workspace-sharing-settings): replace writable composer with disabled colleague composer */}
-                {teamReadOnly.isColleague ? (
-                  <TeamReadOnlyComposer ownerName={teamReadOnly.ownerName} access={teamReadOnly.access} />
+                {/* DALTON-HOOK(colleague-dispatch): also show disabled composer on foreign-owned threads or revoked workspaces */}
+                {isThreadReadOnly ? (
+                  <TeamReadOnlyComposer
+                    ownerName={teamReadOnly.ownerName}
+                    access={teamReadOnly.access}
+                    colleagueDispatchEnabled={teamReadOnly.colleagueDispatchEnabled}
+                    dispatchedByName={dispatchedByName}
+                    revoked={teamReadOnly.isThreadOnly}
+                  />
                 ) : activeAgentId === 'main' ? (
                   <>
                     {/* Only rows with a surface of their own sit here: the
@@ -1725,11 +1855,20 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                         from={dispatcherContext}
                         onOpenTask={openTaskFromTray}
                         onOpenWatch={handleOpenStatusFromChat}
+                        onOpenCommand={handleToolCallDetailClick}
+                        threadId={panelThreadId ?? null}
                       />
                     )}
                     {/* A notice is not about the running turn, so it need not wait for it to end. */}
                     {messageError && (!isLoading || (typeof messageError === 'object' && messageError.kind === 'notice')) && (
                       <ErrorBanner error={messageError} />
+                    )}
+                    {workspaceRecord?.computer_id && (
+                      <ChatRestoreOffer
+                        workspaceId={workspaceId}
+                        computerId={workspaceRecord.computer_id}
+                        listed={!filesLoading}
+                      />
                     )}
                     {workspaceRecord?.computer_id && (
                       <ChatDiskWarning computerId={workspaceRecord.computer_id} />
@@ -1746,7 +1885,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                     {/* One row: the drawer is a tab tucked under the composer's top
                         edge, so no status row may come between them, and the
                         parent's sibling gap must not either. */}
-                    <div>
+                    <div data-handoff="composer">
                       <TodoDrawer
                         todoData={cards['todo-list-card']?.todoData ?? null}
                         historyLoading={isLoadingHistory}
@@ -1770,6 +1909,9 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                         threadModels={threadModels}
                         subagentsAllowed={threadSubagents.allowed}
                         onToggleSubagents={threadSubagents.setAllowed}
+                        tuning={threadTuning.tuning}
+                        onPickReasoningEffort={threadTuning.setReasoningEffort}
+                        onPickFastMode={threadTuning.setFastMode}
                         selectedWorkspaceId={workspaceId}
                         toolbarStatus={trayContents && (
                           <TrayDock ref={trayDockRef} phase={trayPhase} contents={trayContents} onOpen={peekTray} />
@@ -1825,6 +1967,8 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
               url={previewData?.url ?? ''}
               port={previewData?.port ?? 0}
               title={previewData?.title}
+              path={previewData?.path}
+              workspaceId={previewData?.workspaceId}
               loading={previewData?.loading}
               error={previewData?.error}
               onClose={handleClosePreview}
@@ -1846,7 +1990,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
             key="file"
             initial={{ x: '100%' }}
             animate={{ x: 0 }}
-            transition={{ duration: 0.25, ease: [0.22, 1, 0.36, 1] }}
+            transition={TWEEN.enter}
             // A chart pans with the same rightward swipe, so a chart tab closes by its button.
             drag={activeTabKind === 'chart' ? false : 'x'}
             dragConstraints={{ left: 0, right: 0 }}
@@ -1904,7 +2048,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
       ) : (
         <>
         {/* Resize divider — outside overflow-hidden panel so its wide hover zone isn't clipped */}
-        {rightPanelType && (
+        {rightPanelType && !panelExpanded && (
           <div
             className={`chat-split-divider${isDragging ? ' dragging' : ''}`}
             onMouseDown={handleDividerMouseDown}
@@ -1916,15 +2060,23 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
               ref={panelWrapperRef}
               initial={{ width: 0, opacity: 0 }}
               animate={{ width: rightPanelWidth, opacity: 1 }}
-              exit={{ width: 0, opacity: 0 }}
+              exit={{ width: 0, opacity: 0, transition: TWEEN.exit }}
               transition={(isDragging || dragJustEnded)
                 ? { duration: 0 }
-                : { duration: 0.25, ease: [0.22, 1, 0.36, 1] }
+                : TWEEN.fold
               }
               className="flex shrink-0 overflow-hidden"
             >
-              <div data-panel-inner className="shrink-0 h-full" style={{ width: rightPanelWidth }}>
-                <Suspense fallback={null}>
+              {/* Expanded, the panel lies over the whole view while the
+                  wrapper keeps its width in the row: the chat underneath
+                  keeps its layout and scroll, and the panel stays the same
+                  element, so a running app's iframe does not reload. */}
+              <div
+                data-panel-inner
+                className={panelExpanded ? 'absolute inset-0 z-10' : 'shrink-0 h-full'}
+                style={panelExpanded ? undefined : { width: rightPanelWidth }}
+              >
+                <Suspense fallback={rightPanelType === 'file' ? <PanelLoadingStrip onClose={() => { setRightPanelType(null); popPanelHistory(); }} /> : null}>
                   {rightPanelType === 'file' ? (
                     <WorkspaceProvider workspaceId={panelWorkspaceId} downloadFile={null} folders={panelFolders}>
                     <FilePanel
@@ -1932,6 +2084,9 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                       threadId={panelThreadId}
                       isActive={isActive}
                       onClose={() => { setRightPanelType(null); popPanelHistory(); }}
+                      expanded={panelExpanded}
+                      onToggleExpanded={handleTogglePanelExpanded}
+                      panelToggle
                       onLeaveGuardChange={handleFilesLeaveGuardChange}
                       onActiveTabKindChange={handleActiveTabKindChange}
                       target={panelTarget}
@@ -1969,6 +2124,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
       )}
 
     </div>
+    </ThreadCommandsContext>
     </ShareLinkOpenerContext>
     </RouteLeaveGuardContext>
     </WorkspaceProvider>

@@ -126,6 +126,22 @@ describe('FilePanel reference opens', () => {
     expect(api.resolveWorkspaceFile).toHaveBeenCalledWith('ws', ['report2.md'], ['report2.md']);
   });
 
+  // The stale path was only a guess the panel tried on the way to the file.
+  it('leaves no Back step onto a path that missed before the lookup found the file', async () => {
+    resolveMock().mockResolvedValue({ status: 'resolved', path: 'results/report2.md', matches: ['results/report2.md'] });
+    const panel = (target: { kind: 'file'; path: string; seq: number }) => (
+      <FilePanel workspaceId="ws" onClose={() => {}} files={['notes.md']} getRecentWritePaths={() => ['report2.md']} target={target} />
+    );
+    const { rerender } = renderWithProviders(panel({ kind: 'file', path: 'notes.md', seq: 1 }));
+    await screen.findByText('My private notes body.');
+    rerender(panel({ kind: 'file', path: 'report2.md', seq: 2 }));
+    await screen.findByText('report2.md', { selector: '.file-panel-tab-name' });
+    await waitFor(() => expect(api.readWorkspaceFile).toHaveBeenCalledWith('ws', 'results/report2.md'));
+
+    fireEvent.click(screen.getByRole('button', { name: 'Back' }));
+    expect(await screen.findByText('My private notes body.')).toBeTruthy();
+  });
+
   it('lets a file opened from the tree win over a reference still being looked up', async () => {
     let answer!: (r: { status: string; path?: string; matches: string[] }) => void;
     resolveMock().mockReturnValue(new Promise((resolve) => { answer = resolve; }));

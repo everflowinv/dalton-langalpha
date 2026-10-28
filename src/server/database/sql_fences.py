@@ -21,6 +21,17 @@ FENCE_NOT_DELETED = "status <> 'deleted'"
 # write must not reach it and overwrite the 'unbound' marker.
 FENCE_LIVE_WORKSPACE = "status NOT IN ('deleted', 'unbound')"
 
+# A computer whose retirement is being decided takes no workspace: the decision
+# reads it empty, and its tombstone would take a newcomer down with it. The
+# marker goes on before that read and the row lock orders the two, so a
+# workspace either lands first and is counted, or meets the marker here. A
+# primary is never retired, so the marker a workspace delete writes on one
+# before reading the flag refuses nothing.
+FENCE_TAKES_WORKSPACES = (
+    "(is_primary OR NOT COALESCE(config, '{}'::jsonb)"
+    " @> '{\"retire_when_empty\": true}'::jsonb)"
+)
+
 # A listing of the user's workspaces leaves Home out by its id, since bound it
 # reads its computer's status, and leaves out by status an unbound former Home
 # at another id, which an account merge leaves until the fold. The caller binds
@@ -53,6 +64,39 @@ def spec_change_stale(qualifier: str = "") -> str:
     )
 
 
+# A workspace being moved to another computer starts no turn until the move is
+# done. The runner stamps heartbeat_at every MOVE_HEARTBEAT_SECONDS; one gone
+# quiet for MOVE_STALE_SECONDS lost its worker. Before its folder was set
+# aside nothing had changed, so a stale move stops fencing at once; from then
+# on it fences until recovery finishes it, since the folder is not where the
+# row says.
+MOVE_ACTIVE_PHASES = ("preparing", "backing_up", "staged", "committed")
+MOVE_EARLY_PHASES = ("preparing", "backing_up")
+MOVE_SET_ASIDE_PHASES = ("staged", "committed")
+MOVE_HEARTBEAT_SECONDS = 30
+MOVE_STALE_SECONDS = 3 * 60
+
+
+def move_stale(qualifier: str = "") -> str:
+    """Whether a move row's runner has missed the stale window, on the database clock."""
+    return (
+        f"{qualifier}heartbeat_at"
+        f" < NOW() - make_interval(secs => {MOVE_STALE_SECONDS})"
+    )
+
+
+def workspace_move_fences(workspace_column: str) -> str:
+    """Whether a move fences the workspace that ``workspace_column`` names."""
+    active = ", ".join(f"'{p}'" for p in MOVE_ACTIVE_PHASES)
+    early = ", ".join(f"'{p}'" for p in MOVE_EARLY_PHASES)
+    return (
+        "EXISTS (SELECT 1 FROM workspace_moves m"
+        f" WHERE m.workspace_id = {workspace_column}"
+        f" AND m.phase IN ({active})"
+        f" AND NOT (m.phase IN ({early}) AND {move_stale('m.')}))"
+    )
+
+
 _COMPUTER_COLUMNS = (
     "computer_id", "user_id", "kind", "provider_ref", "name", "is_primary",
     "status", "resource_tier", "is_always_on", "platform_secret_version",
@@ -60,6 +104,7 @@ _COMPUTER_COLUMNS = (
     "provider_config", "artifacts", "last_activity_at", "stopped_at",
     "created_at", "updated_at", "config", "disk_total_bytes", "disk_used_bytes",
     "disk_free_bytes", "disk_measured_at", "disk_sandbox_ref", "spec_change",
+    "files_backup", "start_failure",
 )
 
 
@@ -112,6 +157,11 @@ def shadowed_write(
     both writers to take the row locks in the same order. Guards are whole
     ``AND ...`` clauses; fences are the module's predicates, applied under the
     alias so PostgreSQL rechecks them inside the UPDATE.
+
+    Only the computer's ``updated_at`` is stamped. A workspace's orders the
+    gallery, and a machine write reaching every folder on the computer would
+    give them all one timestamp; a caller recording the workspace's own use
+    stamps it in ``workspace_set``.
     """
     comp_fence = f"\n                  AND c.{computer_fence}" if computer_fence else ""
     ws_fence = f"\n                  AND w.{workspace_fence}" if workspace_fence else ""
@@ -127,8 +177,7 @@ def shadowed_write(
             ),
             shadow AS (
                 UPDATE workspaces w
-                SET {workspace_set},
-                    updated_at = {now}
+                SET {workspace_set}
                 FROM comp
                 WHERE w.computer_id = comp.computer_id{ws_fence}{workspace_guard}
                 RETURNING {workspace_returning}
@@ -155,8 +204,7 @@ def shadowed_write(
             ),
             shadow AS (
                 UPDATE workspaces w
-                SET {workspace_set},
-                    updated_at = {now}
+                SET {workspace_set}
                 FROM (SELECT count(*) AS mirrored FROM comp) m{join}
                 WHERE (
                         {scope}

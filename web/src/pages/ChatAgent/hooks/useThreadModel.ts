@@ -1,10 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
+import { toast } from '@/components/ui/use-toast';
 import { resolveComposerModel } from '@/components/ui/chat-input.models';
 import { useAllModels } from '@/hooks/useAllModels';
 import { useDefaultModel } from '@/hooks/useSlotDefaultModels';
 import { useSeededModel } from '@/hooks/useSeededModel';
+import { modelLabel } from '@/lib/modelLabel';
 import { queryKeys } from '@/lib/queryKeys';
 import { threadFieldMutationKey } from '@/lib/threadFieldMutations';
 import { userSessionStorage } from '@/lib/userStorage';
@@ -57,7 +59,7 @@ export function useThreadModel({
 }: UseThreadModelOptions) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
-  const { catalogModelNames } = useAllModels();
+  const { catalogModelNames, metadata } = useAllModels();
   const defaultModel = useDefaultModel();
   const liveThreadId = threadId && threadId !== '__default__' ? threadId : null;
 
@@ -111,6 +113,14 @@ export function useThreadModel({
       setModel((current) => (current === value ? before : current));
       setOffered(null);
     },
+    // A switch away from a model whose provider compacted the thread into a
+    // summary only it can read: that model writes it out for the new one
+    // first, which the next send waits for.
+    onSaved: (saved) => {
+      const to = saved.llm_model || defaultModel;
+      if (!saved.summary_handoff || !to) return;
+      toast({ description: t('chat.threadModel.handoff', { model: modelLabel(to, metadata) }) });
+    },
   });
 
   /** Resolves false only when this pick's own save failed. */
@@ -158,5 +168,6 @@ export function useThreadModel({
     ? { model: offered, defaultModel }
     : null;
 
-  return { model, retired, offer, pickModel, dismissOffer };
+  // DALTON-HOOK(colleague-dispatch): expose thread detail record so ChatView can inspect thread_user_id / dispatched_by
+  return { model, retired, offer, pickModel, dismissOffer, thread };
 }

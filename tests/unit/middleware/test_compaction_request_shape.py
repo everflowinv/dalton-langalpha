@@ -19,6 +19,8 @@ from ptc_agent.agent.middleware.compaction.summary_request import (
     _COMPACTION_USER_NUDGE,
     build_summary_request as _build_summary_request,
 )
+from ptc_agent.agent.middleware.compaction.utils import count_tokens_tiktoken
+from ptc_agent.core.sandbox.livefs_mount import TranscriptReach
 from src.llms import maybe_disable_streaming
 
 
@@ -75,6 +77,8 @@ def _config(main):
         filesystem=FilesystemConfig(),
     )
     cfg.llm_client = main
+    # Only the newest message is kept, so a few short ones leave some to compact.
+    cfg.compaction.keep_tokens = 0
     return cfg
 
 
@@ -291,7 +295,7 @@ async def test_compact_messages_calls_llm_with_system_message(monkeypatch):
     ]
 
     await compact_module.compact_messages(
-        messages, {}, _config(fake_llm), thread_id="thread-1", keep_messages=1
+        messages, {}, _config(fake_llm), thread_id="thread-1"
     )
 
     assert len(fake_llm.sent) == 1
@@ -332,8 +336,10 @@ async def test_chained_compaction_anchors_and_reconstructs_safely(monkeypatch):
     messages = [m for i in range(6) for m in _turn(i)]
 
     config = _config(fake_llm)
+    # Keep the last four messages, the newest turn and the result before it.
+    config.compaction.keep_tokens = sum(count_tokens_tiktoken([m]) for m in messages[-4:])
     first = await compact_module.compact_messages(
-        messages, {}, config, thread_id="thread-1", keep_messages=4
+        messages, {}, config, thread_id="thread-1"
     )
     event1 = first.event
     assert event1.get("anchor_message_id") is not None
@@ -344,7 +350,7 @@ async def test_chained_compaction_anchors_and_reconstructs_safely(monkeypatch):
     # one left.
     messages2 = messages + _turn(99)
     second = await compact_module.compact_messages(
-        messages2, first.update({}), config, thread_id="thread-1", keep_messages=4
+        messages2, first.update({}), config, thread_id="thread-1"
     )
     event2 = second.event
     anchor = event2.get("anchor_message_id")
@@ -374,7 +380,11 @@ async def test_compact_messages_summarizes_the_offload_view(monkeypatch):
 
     monkeypatch.setattr(compact_module, "aoffload_base64_content", _recording_offload)
     mount = SimpleNamespace(save_transcript=AsyncMock(return_value=True))
-    backend = SimpleNamespace(livefs=mount, settled_livefs=AsyncMock(return_value=mount))
+    backend = SimpleNamespace(
+        livefs=mount,
+        transcripts=TranscriptReach(mount, shell=True),
+        settled_livefs=AsyncMock(return_value=mount),
+    )
     messages = [
         HumanMessage(content="go", id="h1"),
         AIMessage(
@@ -391,7 +401,6 @@ async def test_compact_messages_summarizes_the_offload_view(monkeypatch):
         {"_offloaded_tool_call_ids": {"w1"}},
         _config(fake_llm),
         thread_id="abcd1234-0000",
-        keep_messages=1,
         backend=backend,
     )
 
@@ -420,7 +429,7 @@ class TestCompactMessagesNeverStoresAnError:
             HumanMessage(content="c", id="3"),
         ]
         return await compact_module.compact_messages(
-            messages, {}, _config(self.fake_llm), thread_id="thread-1", keep_messages=1
+            messages, {}, _config(self.fake_llm), thread_id="thread-1"
         )
 
     def _assert_server_summary(self, result):
@@ -516,7 +525,7 @@ class TestCompactWindowClose:
                 counter=lambda msgs: sum(len(str(m.content)) for m in msgs),
             ),
             token_threshold=100_000,
-            keep_messages=5,
+            keep_tokens=5,
         )
 
         async def _passthrough(backend, messages, **kwargs):
@@ -624,7 +633,7 @@ class TestSummaryFallback:
                 fallback=labelled(_summary_model("from the summarizer's fallback"), "turn-model"),
             ),
             token_threshold=100_000,
-            keep_messages=5,
+            keep_tokens=5,
         )
         monkeypatch.setattr(mw, "_emit_context_signal", lambda *a, **k: None)
         messages = [HumanMessage(content="hi", id="h")]
@@ -752,6 +761,115 @@ class TestServerSummaryAfterAnEarlierSummary:
         assert text.count(f"Then: {report}") == 2
         assert "Then: Also chart it." in text
         assert "sent a new message" not in text
+
+
+class TestServerSummaryLead:
+    """The digest's lead says why no model wrote it; beside a provider's own
+    compaction it says the real summary is one only that model can read."""
+
+    @staticmethod
+    def _raw():
+        from langchain_core.messages import AIMessage
+
+        return [
+            HumanMessage(content="first request", id="h1"),
+            AIMessage(content="first reply", id="a1"),
+            HumanMessage(content="second request", id="h2"),
+            AIMessage(content="second reply", id="a2"),
+        ]
+
+    def test_the_given_lead_opens_the_digest(self):
+        from ptc_agent.agent.middleware.compaction.summarize import PROVIDER_LEAD, server_summary
+        from ptc_agent.agent.transcript import Window
+
+        raw = self._raw()
+        default = server_summary(raw, [], raw_messages=raw, turns=None, window=Window()).text
+        text = server_summary(
+            raw, [], raw_messages=raw, turns=None, window=Window(), lead=PROVIDER_LEAD
+        ).text
+
+        assert text.startswith(PROVIDER_LEAD + "\n\n")
+        assert text.partition("\n\n")[2] == default.partition("\n\n")[2]
+        assert not default.startswith(PROVIDER_LEAD)
+
+    def test_an_opaque_earlier_summary_is_read_like_a_server_one(self):
+        """Its text is a digest too, so its lead is not repeated."""
+        from ptc_agent.agent.middleware.compaction.summarize import PROVIDER_LEAD, server_summary
+        from ptc_agent.agent.middleware.compaction.utils import build_summary_message
+        from ptc_agent.agent.transcript import Window
+
+        raw = self._raw()
+        earlier = build_summary_message(
+            f"{PROVIDER_LEAD}\n\n## Turn 1\nRequest: first request\nLast reply: first reply",
+            None,
+            source="provider",
+            native={"items": [{"type": "compaction", "encrypted_content": "opaque"}]},
+            origin="openai",
+        )
+
+        text = server_summary(
+            [earlier, raw[2], raw[3]],
+            [],
+            raw_messages=raw,
+            turns=None,
+            window=Window(),
+            lead=PROVIDER_LEAD,
+        ).text
+
+        assert text.count(PROVIDER_LEAD) == 1
+        assert "## Earlier summary\n## Turn 1\nRequest: first request" in text
+
+    def test_a_readable_provider_summary_keeps_its_opening(self):
+        """A Claude block's summary is the model's own, read from its start."""
+        from ptc_agent.agent.middleware.compaction.summarize import server_summary
+        from ptc_agent.agent.middleware.compaction.utils import build_summary_message
+        from ptc_agent.agent.transcript import Window
+
+        raw = self._raw()
+        earlier = build_summary_message(
+            "Goal: chart AAPL.\n\nProgress: data pulled.",
+            None,
+            source="provider",
+            native={"block": {"type": "compaction", "content": "x", "signature": "s"}},
+            origin="anthropic",
+        )
+
+        text = server_summary(
+            [earlier, raw[2], raw[3]], [], raw_messages=raw, turns=None, window=Window()
+        ).text
+
+        assert "## Earlier summary\nGoal: chart AAPL.\n\nProgress: data pulled." in text
+
+    def test_an_opaque_summary_its_model_wrote_out_keeps_its_opening(self):
+        """Handed off at a model switch, its text is the model's summary, no
+        longer a digest with a lead to drop."""
+        from ptc_agent.agent.middleware.compaction.summarize import PROVIDER_LEAD, server_summary
+        from ptc_agent.agent.middleware.compaction.utils import (
+            build_summary_message,
+            with_summary_text,
+        )
+        from ptc_agent.agent.transcript import Window
+
+        raw = self._raw()
+        opaque = build_summary_message(
+            f"{PROVIDER_LEAD}\n\n## Turn 1\nRequest: first request",
+            None,
+            source="provider",
+            native={"items": [{"type": "compaction", "encrypted_content": "opaque"}]},
+            origin="openai",
+        )
+        earlier = with_summary_text(opaque, "Goal: chart AAPL.\n\nProgress: data pulled.")
+
+        text = server_summary(
+            [earlier, raw[2], raw[3]],
+            [],
+            raw_messages=raw,
+            turns=None,
+            window=Window(),
+            lead=PROVIDER_LEAD,
+        ).text
+
+        assert "## Earlier summary\nGoal: chart AAPL.\n\nProgress: data pulled." in text
 
 
 class TestTrimForSummary:

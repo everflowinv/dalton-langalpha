@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from datetime import datetime
+from html import escape
 from typing import Any
 
 from ptc_agent.agent.middleware.runtime_context.changes import (
@@ -33,6 +34,7 @@ from ptc_agent.agent.middleware.runtime_context.profile import (
     profile_diff_lines,
 )
 from ptc_agent.agent.middleware.runtime_context.state import as_dict
+from ptc_agent.agent.roles import AgentRole
 
 # Rendered in a fixed order so the block is byte-identical for equal inputs.
 MEMORY_TIERS: tuple[str, ...] = ("user", "workspace")
@@ -49,10 +51,19 @@ MEMO_DISPLAY_CAP = 500
 
 @dataclass(frozen=True, slots=True)
 class Workspace:
-    """What the workspace was called when the epoch froze."""
+    """What the workspace was called, and the computer it was on, when the epoch froze.
+
+    The computer is empty for a user with one, and the machine (a
+    ``computer_machine`` token) and its folder there for a computer the
+    deployment hosts. None is in the state or the hash while empty, so an
+    epoch frozen before it was told reads the same.
+    """
 
     name: str = ""
     description: str = ""
+    computer: str = ""
+    machine: str = ""
+    root: str = ""
 
     @classmethod
     def from_state(cls, value: Any) -> Workspace:
@@ -60,13 +71,114 @@ class Workspace:
         return cls(
             name=str(data.get("name") or ""),
             description=str(data.get("description") or ""),
+            computer=str(data.get("computer") or ""),
+            machine=str(data.get("machine") or ""),
+            root=str(data.get("root") or ""),
         )
 
     def to_state(self) -> dict[str, Any]:
-        return {"name": self.name, "description": self.description}
+        state = {"name": self.name, "description": self.description}
+        if self.computer:
+            state["computer"] = self.computer
+        if self.machine:
+            state["machine"] = self.machine
+        if self.root:
+            state["root"] = self.root
+        return state
 
     def sha(self) -> str:
-        return sha256_text(f"{self.name}\n{self.description}")
+        text = f"{self.name}\n{self.description}"
+        if self.computer or self.machine:
+            text += f"\n{self.computer}"
+        if self.machine:
+            text += f"\n{self.machine}\n{self.root}"
+        return sha256_text(text)
+
+
+# Only to the analyst: the Chief of Staff's own prompt says what a workspace
+# on another computer means for it. Leans on the static prompt's sibling-folder
+# sentence rather than restating it.
+OTHER_COMPUTERS = (
+    "A workspace the user names that has no sibling folder is on another "
+    "computer, out of reach of your files. Say so, and that they can use it "
+    "from that workspace or ask their Chief of Staff."
+)
+
+# A computer that is the user's own machine, by its ``computer_machine`` token.
+# Their files and sign-ins sit beside LangAlpha's two folders there, which a
+# hosted computer never has, and a Mac's tools break GNU habits. The second
+# folder is where the machine's runtime is installed (``_ssh_bootstrap``).
+MACHINE_PHRASES = {
+    "personal_mac": "the user's own Mac, the one they work on",
+    "personal": "the user's own computer, the one they work on",
+    "own_mac": "a Mac of the user's own, reached over SSH",
+    "own": "a machine of the user's own, reached over SSH",
+}
+ANALYST_MACHINE = (
+    "This computer is {phrase}. Everything else on it is the user's: their "
+    "files, apps, settings and sign-ins. LangAlpha's part of it is `{root}`, "
+    "which holds this workspace and its siblings, and `~/.langalpha`, the "
+    "Python and tools your commands run with, where `pip install` puts "
+    "packages. Keep your work inside those two, and open or change anything "
+    "of the user's outside them, or act with their sign-ins (`git push`, "
+    "`gh`, cloud command line tools), only when the user asks you to."
+)
+HOME_MACHINE = (
+    "Home is on {phrase}. Everything else on it is the user's: their files, "
+    "apps, settings and sign-ins. LangAlpha's part of it is `{root}`, which "
+    "holds Home and the workspace folders, and `~/.langalpha`, the Python and "
+    "tools your commands run with, where `pip install` puts packages. Keep "
+    "your work inside those two, and open or change anything of the user's "
+    "outside them, or act with their sign-ins (`git push`, `gh`, cloud "
+    "command line tools), only when the user asks you to."
+)
+MAC_TOOLS = (
+    "It runs macOS, whose command line tools are not GNU's: `sed -i` needs "
+    "`''`, and `date -d`, `grep -P`, `stat -c`, `find -printf` and `timeout` "
+    "don't exist. Its bash may be version 3.2, without `declare -A` or `mapfile`."
+)
+# What a row says first when the workspace leaves a machine the frozen block
+# described; every phrase above ends in a clause the comma closes. Hosted
+# computers are all Linux, and "the cloud" would be wrong for a self-hosted
+# Docker one.
+MOVED = (
+    "{subject} moved from {old}, to {new}, so what <workspace> says about the "
+    "computer it left no longer applies."
+)
+HOSTED = "a Linux sandbox LangAlpha runs"
+
+
+def machine_lines(workspace: Workspace, role: AgentRole) -> list[str]:
+    """What the block says of the computer when it is the user's own machine."""
+    phrase = MACHINE_PHRASES.get(workspace.machine)
+    if phrase is None:
+        return []
+    template = HOME_MACHINE if role == "chief_of_staff" else ANALYST_MACHINE
+    lines = [template.format(phrase=phrase, root=escape(workspace.root, quote=False))]
+    if workspace.machine.endswith("_mac"):
+        lines.append(MAC_TOOLS)
+    return lines
+
+
+def moved_lines(frozen: Workspace, current: Workspace, role: AgentRole) -> list[str]:
+    """What a row says when the workspace is on another computer than the block says.
+
+    The move is named only off a machine the block described: an epoch frozen
+    before machines were told says nothing to take back, and its empty token
+    cannot tell a hosted computer from an SSH one.
+    """
+    if (current.machine, current.root) == (frozen.machine, frozen.root):
+        return []
+    lines: list[str] = []
+    if frozen.machine in MACHINE_PHRASES:
+        lines.append(
+            MOVED.format(
+                subject="Home" if role == "chief_of_staff" else "This workspace",
+                old=MACHINE_PHRASES[frozen.machine],
+                new="another computer" if current.machine else HOSTED,
+            )
+        )
+    return lines + machine_lines(current, role)
 
 
 def workspace_diff_lines(frozen: Workspace, current: Workspace) -> list[str]:
@@ -74,6 +186,7 @@ def workspace_diff_lines(frozen: Workspace, current: Workspace) -> list[str]:
     for label, was, now in (
         ("Name", frozen.name, current.name),
         ("Description", frozen.description, current.description),
+        ("Computer", frozen.computer, current.computer),
     ):
         if was == now:
             continue
@@ -364,6 +477,9 @@ class Observations:
     # Whether this turn's agent has the chat-app settings folder. None for a
     # build whose block says nothing about it.
     channels_enabled: bool | None = None
+    # The role this turn's agent runs in, for the rows whose wording differs
+    # by role.
+    role: AgentRole = "analyst"
 
 
 # ---------------------------------------------------------------------------
@@ -758,7 +874,7 @@ def _memo_row(epoch: BaselineEpoch, obs: Observations) -> DurableUpdate | None:
 def _workspace_row(
     epoch: BaselineEpoch, obs: Observations, last: str | None
 ) -> DurableUpdate | None:
-    """A row when the workspace was renamed or redescribed since last seen.
+    """A row when the name, description, computer or machine changed since last seen.
 
     The static prompt names <workspace> as the one authoritative place for the
     name, so a rename has to reach the model without the block, and the cache
@@ -769,9 +885,15 @@ def _workspace_row(
     if (last or frozen.sha()) == current_sha:
         return None
     if current_sha == frozen.sha():
-        text = "Name and description are back to what <workspace> says."
+        text = "The workspace is back to what <workspace> says."
     else:
-        text = "\n".join(workspace_diff_lines(frozen, obs.workspace))
+        lines = workspace_diff_lines(frozen, obs.workspace)
+        if obs.role != "chief_of_staff" and obs.workspace.computer and not frozen.computer:
+            # A block frozen with one computer never said what a workspace on
+            # another one means.
+            lines.append(OTHER_COMPUTERS)
+        lines.extend(moved_lines(frozen, obs.workspace, obs.role))
+        text = "\n".join(lines)
     return DurableUpdate(
         kind="workspace_changed",
         schema_version=UPDATE_SCHEMA_VERSION,

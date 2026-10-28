@@ -1,4 +1,5 @@
-import React, { createContext, useContext, useState, useMemo, useRef } from 'react';
+import React, { createContext, useContext, useEffect, useState, useMemo, useRef } from 'react';
+import { useTranslation } from 'react-i18next';
 import ReactMarkdown from 'react-markdown';
 import { useInRouterContext } from 'react-router';
 import remarkGfm from 'remark-gfm';
@@ -13,6 +14,7 @@ import { Copy, Check } from 'lucide-react';
 import { useTheme } from '@/contexts/ThemeContext';
 import { GuardedLink } from '@/components/GuardedLink';
 import { appRoutePath } from '@/lib/appRoutes';
+import { copyText } from '@/lib/clipboard';
 import WorkspaceImage from './WorkspaceImage';
 import { isFilePath, isImagePath, normalizeFilePath, parseSiblingHref, parseWsPath } from '../utils/filePaths';
 import { useWorkspaceFolders } from '../contexts/WorkspaceContext';
@@ -22,8 +24,10 @@ import { normalizeFileRefs } from '../utils/normalizeFileRefs';
 import { splitFileLocation, type OpenFileHandler } from '../utils/fileLocation';
 import { mapOutsideCode, mapOutsideMultilineCode } from '../utils/markdownSegments';
 import { splitMarkdownBlocks, scanStreamingBlock } from '../utils/markdownBlocks';
+import { repairStreamingTail } from '../utils/streamingTail';
 import { blockFreshKeys, rehypeFreshText, useRevealFade } from '../utils/revealFade';
 import CitationBubble from './CitationBubble';
+import { InPlaceSwap } from '@/components/ui/crossfade';
 
 // Sanitize schema: extends GitHub-style defaults to allow KaTeX output,
 // cite-bubble custom element, and MathML/SVG for accessibility.
@@ -72,6 +76,9 @@ interface CodeBlockProps {
 const CODE_STYLE: React.CSSProperties = { margin: 0, padding: '1rem', backgroundColor: 'transparent', fontSize: '0.875rem', lineHeight: '1.5' };
 const COMPACT_CODE_STYLE: React.CSSProperties = { ...CODE_STYLE, padding: '0.6rem', fontSize: '0.75rem' };
 
+/** How long a code block's Copy reads Copied before it turns back. */
+const CODE_COPIED_MS = 1500;
+
 // The highlighted line being typed (null between lines), handed past the
 // memoized highlighter of the lines above it into the same <code>. No value
 // while the fence is settled.
@@ -110,9 +117,14 @@ function Bare({ children }: { children?: React.ReactNode }): React.ReactElement 
 // can color differently until it is done, and the fence settles to one
 // highlighter over the whole code once it closes.
 const CodeBlock = React.memo(function CodeBlock({ language, code, compact = false, codeTheme, live = false }: CodeBlockProps): React.ReactElement {
+  const { t } = useTranslation();
   const { theme } = useTheme();
   const effectiveTheme = codeTheme ?? theme;
   const [copied, setCopied] = useState(false);
+  const copiedTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => () => {
+    if (copiedTimer.current) clearTimeout(copiedTimer.current);
+  }, []);
   const lang = language || 'text';
   const prismStyle = effectiveTheme === 'light' ? oneLight : oneDark;
   const cut = live ? code.lastIndexOf('\n') + 1 : code.length;
@@ -136,10 +148,14 @@ const CodeBlock = React.memo(function CodeBlock({ language, code, compact = fals
     ? <SyntaxHighlighter language={lang} style={prismStyle} PreTag={Bare} CodeTag={Bare} wrapLongLines>{typing}</SyntaxHighlighter>
     : null;
 
+  // Confirmed once the write lands (it rejects when the document has lost
+  // focus); a second copy restarts the one timer rather than racing it.
   const handleCopy = (): void => {
-    navigator.clipboard.writeText(code);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
+    copyText(code).then(() => {
+      setCopied(true);
+      if (copiedTimer.current) clearTimeout(copiedTimer.current);
+      copiedTimer.current = setTimeout(() => setCopied(false), CODE_COPIED_MS);
+    }).catch(() => {});
   };
 
   // When codeTheme is set, use explicit colors instead of CSS vars.
@@ -188,10 +204,17 @@ const CodeBlock = React.memo(function CodeBlock({ language, code, compact = fals
             <span className="text-xs font-mono" style={{ color: labelColor }}>
               {language || 'text'}
             </span>
+            {/* Both labels hold the one cell, so the button is as wide as the
+                wider of them in every language and the header never shifts. */}
             <button onClick={handleCopy}
-              className="flex items-center gap-1 text-xs hover:opacity-100 transition-opacity"
-              style={{ color: labelColor, background: 'none', border: 'none', cursor: 'pointer' }}>
-              {copied ? <><Check className="h-3 w-3" /> Copied</> : <><Copy className="h-3 w-3" /> Copy</>}
+              className="press text-xs text-(--color-text-tertiary) hover:text-(--color-text-secondary)"
+              style={{ background: 'none', border: 'none', cursor: 'pointer' }}>
+              <InPlaceSwap
+                swapped={copied}
+                className="justify-items-end"
+                from={<><Copy className="h-3 w-3" /> {t('common.copy')}</>}
+                to={<><Check className="h-3 w-3" /> {t('common.copied')}</>}
+              />
             </button>
           </div>
         )}
@@ -295,8 +318,12 @@ const chatUl = ({ node: _node, ...props }: MarkdownComponentProps) => (
 const chatOl = ({ node: _node, ...props }: MarkdownComponentProps) => (
   <ol className="list-decimal ml-6 my-2" style={{ color: 'var(--color-text-primary)' }} {...props} />
 );
+// A loose list wraps each item's text in a paragraph and a tight one does not,
+// so a list turning loose as its second item streams in would pad every item.
+// An item of one paragraph sits the same either way; one of several keeps the
+// paragraph spacing between them.
 const chatLi = ({ node: _node, ...props }: MarkdownComponentProps) => (
-  <li className="ps-[2px] wrap-break-word" style={{ color: 'var(--color-text-primary)' }} {...props} />
+  <li className="ps-[2px] wrap-break-word [&>p:only-of-type]:py-0" style={{ color: 'var(--color-text-primary)' }} {...props} />
 );
 const chatP = ({ node: _node, ...props }: MarkdownComponentProps) => (
   <p className="my-px py-[3px] whitespace-pre-wrap wrap-break-word first:mt-0 last:mb-0" style={{ color: 'var(--color-text-primary)' }} {...props} />
@@ -350,7 +377,7 @@ function MarkdownLink({ href, ...props }: MarkdownComponentProps) {
   return <a href={href} target="_blank" rel="noopener noreferrer" onClick={onClick} {...props} />;
 }
 const chatA = ({ node: _node, ...props }: MarkdownComponentProps) => (
-  <MarkdownLink className="underline hover:opacity-80 transition-opacity break-all" style={{ color: 'var(--color-accent-primary)' }} {...props} />
+  <MarkdownLink className="underline hover:opacity-80 transition-opacity [overflow-wrap:anywhere] [word-break:normal]" style={{ color: 'var(--color-accent-primary)' }} {...props} />
 );
 const chatHr = ({ node: _node, ...props }: MarkdownComponentProps) => (
   <hr className="my-4 border-0" style={{ borderTop: '1px solid var(--color-border-muted)' }} {...props} />
@@ -641,15 +668,43 @@ function stripFrontMatter(content: string): string {
   return rest.startsWith('\n') ? rest.slice(1) : rest.startsWith('\r\n') ? rest.slice(2) : rest;
 }
 
+// A cashtag: `$AAPL`, `$BRK.B`. Followed by a dollar, `^`, `_`, `{`, `(` or a
+// backslash, it is the start of a formula (`$X$`, `$P(A)$`, `$X_t$`) instead.
+const TICKER = String.raw`[A-Z]{1,5}(?:\.[A-Z]{1,2})?(?![\p{L}\p{N}$^_{(\\])`;
+const TICKER_DOLLAR_RE = new RegExp(String.raw`(?<![\\$])\$(?=${TICKER})`, 'gu');
+const OPENS_TICKER_RE = new RegExp(String.raw`^\$${TICKER}`, 'u');
+
 /**
- * Escape dollar signs used as currency (e.g. $129.82) so remark-math
- * does not treat them as inline-math delimiters.
- * Matches a lone $ followed by an optional sign and a digit.
- * Leaves $$ (display math) untouched via negative lookbehind/lookahead.
+ * Escape dollar signs used as currency ($129.82, $/bbl, in millions ($)) or in
+ * front of a ticker ($AAPL, $BRK.B) so remark-math does not treat them as
+ * inline-math delimiters. remark-math pairs any two dollars, so `$AAPL and
+ * $MSFT` would set "AAPL and " as a formula. $$ (display math) is left alone.
+ *
+ * Capitals after a dollar also start formulas (`$N = 5$`), so a ticker-shaped
+ * one stays math when the next dollar in its paragraph closes it: touching
+ * the text before it, not just after an opening bracket or quote (the dollar
+ * in `($x$)` opens a formula of its own), and not itself opening a ticker.
  */
 function escapeCurrencyDollars(content: string): string {
   if (!content || typeof content !== 'string') return content;
-  return content.replace(/(?<!\$)\$(?!\$)(?=[-+]?\d)/g, '\\$');
+  // A dollar standing for the unit (`85 $/bbl`, `($)`) opens nothing either;
+  // after a word it closes a formula, as in `($x$)`.
+  const currency = content
+    .replace(/(?<!\$)\$(?!\$)(?=[-+]?\d)/g, '\\$')
+    .replace(/(?<=^|[\s(])\$(?=[/)])/gm, '\\$');
+  return currency.replace(TICKER_DOLLAR_RE, (dollar, at: number) => (closesInlineMath(currency, at + 1) ? dollar : '\\$'));
+}
+
+// The next dollar is found first and only the text up to it searched for a
+// blank line, so a list with a cashtag on every row stays one pass.
+function closesInlineMath(content: string, from: number): boolean {
+  for (let i = content.indexOf('$', from); i >= 0; i = content.indexOf('$', i + 1)) {
+    if (content[i - 1] === '\\') continue;
+    if (content[i + 1] === '$') { i++; continue; }
+    if (/\n[ \t]*\n/.test(content.slice(from, i))) return false;
+    return !/[\s([{"“]/.test(content[i - 1]) && !OPENS_TICKER_RE.test(content.slice(i, i + 12));
+  }
+  return false;
 }
 
 /**
@@ -790,6 +845,8 @@ interface MarkdownProps {
 function Markdown({ content, variant = 'panel', className = '', style, onOpenFile, onAnchorLink, codeTheme, streaming = false }: MarkdownProps): React.ReactElement {
   const config = VARIANTS[variant];
   const folders = useWorkspaceFolders();
+  const rootDir = folders?.rootDir;
+  const otherRoots = folders?.otherRoots;
   // Every pass below rewrites prose before the markdown parser sees it, so each
   // one has to say how much of the string it may touch. Inside code, markdown
   // stops interpreting escapes and raw HTML — a rewrite that lands there is
@@ -797,7 +854,7 @@ function Markdown({ content, variant = 'panel', className = '', style, onOpenFil
   const processed = useMemo(() => {
     // Whole-string by design: front matter is anchored at the start, and
     // normalizeFileRefs deliberately unwraps backticks around file refs.
-    const base = normalizeFileRefs(stripFrontMatter(content));
+    const base = normalizeFileRefs(stripFrontMatter(content), rootDir, otherRoots);
     // Table repair is line-structural, so it reads whole lines and has to stay
     // out of the code spans that own one — fenced, or inline across a break.
     const tables = mapOutsideMultilineCode(base, fixMarkdownTables);
@@ -808,14 +865,22 @@ function Markdown({ content, variant = 'panel', className = '', style, onOpenFil
     // Line-structural again, and after the delimiter pass so `\[x\]` arrives
     // already spelled `$$x$$`.
     return mapOutsideMultilineCode(prose, blockOneLineDisplayMath);
-  }, [content]);
+  }, [content, rootDir, otherRoots]);
 
-  const blocks = useMemo(() => splitMarkdownBlocks(processed), [processed]);
+  const split = useMemo(() => splitMarkdownBlocks(processed), [processed]);
+  // The block still being written renders with its tail held to the shape it
+  // will settle in (utils/streamingTail): a lone `-` under a line is not a
+  // heading, a link being typed is not a run of brackets.
+  const tail = useMemo(() => (streaming ? repairStreamingTail(split[split.length - 1]) : null), [split, streaming]);
+  const blocks = useMemo(() => (tail ? [...split.slice(0, -1), tail.text] : split), [split, tail]);
+  // The repair keeps every character it shows at its offset in the source, so
+  // what it holds back is the end of the source, and fades in when it shows.
+  const shown = tail ? processed.length - split[split.length - 1].length + tail.shown : processed.length;
 
   // What each typewriter tick added fades in (utils/revealFade). Tracked in
   // the processed source, the text the parser positions its nodes in.
   const rootRef = useRef<HTMLDivElement>(null);
-  const marks = useRevealFade(rootRef, processed, streaming);
+  const marks = useRevealFade(rootRef, processed.slice(0, shown), streaming);
   const freshKeys = useMemo(() => blockFreshKeys(blocks, marks), [blocks, marks]);
 
   const components = useMemo(() => {
@@ -877,7 +942,7 @@ function Markdown({ content, variant = 'panel', className = '', style, onOpenFil
           >{children}</a>
         );
       }
-      if (isFilePath(href)) {
+      if (isFilePath(href, folders)) {
         // Image file linked as [name](path.png) -- render as embedded image.
         // The destination goes over raw: WorkspaceImage reads it the same way
         // this link does, and normalizing here would decode it twice.
@@ -894,7 +959,7 @@ function Markdown({ content, variant = 'panel', className = '', style, onOpenFil
           // and stripping the root alone would leave the folder as a
           // subdirectory. A relative one keeps its climb, which the handler
           // reads against the file it was written in.
-          const rooted = parseAgentPath(path).absolute;
+          const rooted = parseAgentPath(path, folders?.rootDir).absolute;
           return (
             <a
               className="underline hover:opacity-80 transition-opacity cursor-pointer"

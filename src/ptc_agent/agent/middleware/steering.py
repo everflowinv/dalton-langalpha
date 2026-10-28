@@ -2,9 +2,10 @@
 Steering Middleware.
 
 Before each LLM call, takes in what reached the thread while the agent works:
-messages steered into it (by the user or the Chief of Staff) and the
-reports owed to the thread by background work that finished meanwhile. All
-of it waits in the server's outbox, which hands it to the next model call
+messages steered into it (by the user or the Chief of Staff), the
+reports owed to the thread by background work that finished meanwhile, the
+alerts its market-watch targets raised, and the wakeups the agent set that
+fired. All of it waits in the server's outbox, which hands it to the next model call
 rather than to a turn of its own. Messages sent to a background task whose
 run ended before reading them resume that task instead.
 """
@@ -12,7 +13,7 @@ run ended before reading them resume that task instead.
 import logging
 import time
 import uuid
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol, TypedDict
 
@@ -53,15 +54,28 @@ _STEER_RESUMES = "steer_resumes"
 
 ALL_KINDS: tuple[str, ...] = ("report", "steer")
 
+#: The one block the contents of a group's reports, taken in together, read
+#: as: ``render_group(kind, contents)``.
+GroupRenderer = Callable[[str, list[str]], str]
+
+
 @dataclass(frozen=True)
 class SteeredReport:
-    """One outbox row a live turn takes in: a report owed to the thread, or
-    a steer (``kind="steer"``) sent into it."""
+    """One outbox row a live turn takes in: a report owed to the thread, a
+    market-watch target's alert or a wakeup's notice (reports the reader is
+    shown as rows of their own), or a steer (``kind="steer"``) sent into it.
+
+    A report of any other kind than ``report`` belongs to a group, whose
+    reports one call takes in read as a single block the inbox renders
+    (``ReportInbox.render_group``): a wakeup's ``content`` is its one line,
+    and the notices share one ``<wakeup>`` block. ``shown`` is the reader's
+    view of a report, the one key its ``steering_delivered`` entry carries
+    (``report_source``, ``market_alert`` or ``wakeup``)."""
 
     job_id: str
     content: str                    # what the model reads
-    report_source: dict[str, Any] = field(default_factory=dict)  # reader's view
     kind: str = "report"
+    shown: Mapping[str, Any] = field(default_factory=dict)
     sender: str | None = None
     platform: str | None = None
     request_key: str | None = None
@@ -99,6 +113,7 @@ class ReportInbox(Protocol):
     async def take(
         self, thread_id: str, run_id: str, *, kinds: Sequence[str] = ALL_KINDS
     ) -> list[SteeredReport]: ...
+    def render_group(self, kind: str, contents: list[str]) -> str: ...
     async def confirm(self, run_id: str, job_ids: list[str]) -> None: ...
     async def take_resumes(self, thread_id: str, run_id: str) -> list[TaskResume]: ...
     async def hand_off_resumes(
@@ -136,6 +151,26 @@ def checkpointed_holds(messages: Sequence[Any], owner_id: str) -> set[str]:
         if owner_id in (held.get("run_id"), held.get("task_run_id")):
             found.update(str(j) for j in held.get("job_ids") or [])
     return found
+
+
+def since_model_response(
+    messages: Sequence[Any], *, stop_at_resume: bool = False
+) -> list[Any]:
+    """The messages after the last model response, oldest first.
+
+    A ``Task(action="resume")`` call this middleware made (``_resume_call``)
+    is not a model response: what was injected before it is still unread.
+    ``stop_at_resume`` ends the window at one anyway."""
+    window: list[Any] = []
+    for message in reversed(messages or []):
+        if isinstance(message, AIMessage) and (
+            stop_at_resume
+            or (message.additional_kwargs or {}).get("lc_source") != "steering"
+        ):
+            break
+        window.append(message)
+    window.reverse()
+    return window
 
 
 class SteeringMiddleware(AgentMiddleware):
@@ -211,10 +246,12 @@ class SteeringMiddleware(AgentMiddleware):
     ) -> dict[str, Any]:
         if not taken:
             return {"messages": []}
-        message, delivered = _steering_message(taken, run_id, time.time())
+        message, delivered = _steering_message(
+            taken, run_id, time.time(), self.report_inbox.render_group
+        )
         logger.info(
             f"[Steering] Injecting {sum(t.kind == 'steer' for t in taken)} "
-            f"steer(s) and {sum(t.kind == 'report' for t in taken)} report(s) "
+            f"steer(s) and {sum(t.kind != 'steer' for t in taken)} report(s) "
             f"for thread_id={thread_id}"
         )
         _announce(runtime, thread_id, delivered)
@@ -323,14 +360,9 @@ class SteeringMiddleware(AgentMiddleware):
         call confirm again, which closes nothing twice."""
         if self.report_inbox is None:
             return
-        for message in reversed((state or {}).get("messages") or []):
+        # A resume call in the window holds no rows of its own.
+        for message in since_model_response((state or {}).get("messages") or []):
             kwargs = getattr(message, "additional_kwargs", None) or {}
-            if isinstance(message, AIMessage):
-                # A resume this middleware called is not a model response:
-                # what was injected before it is still unconfirmed.
-                if kwargs.get("lc_source") == "steering":
-                    continue
-                return
             held: _HeldJobs | None = kwargs.get(_HELD_JOBS) or kwargs.get(_LEGACY_HELD)
             if held and held.get("run_id") and held.get("job_ids"):
                 try:
@@ -422,23 +454,21 @@ def _opened_with(
     opened with ahead of its input, while the model has not answered it."""
     if not input_id or not run_id:
         return []
-    messages = list((state or {}).get("messages") or [])
-    for i in range(len(messages) - 1, -1, -1):
-        if isinstance(messages[i], AIMessage):
-            return []
-        if getattr(messages[i], "id", None) == input_id:
-            break
-    else:
+    # A resume call after the input ends the window too: the call ahead of
+    # it already showed them.
+    window = since_model_response(
+        (state or {}).get("messages") or [], stop_at_resume=True
+    )
+    ids = [getattr(m, "id", None) for m in window]
+    if input_id not in ids:
         return []
     opened: list[dict[str, Any]] = []
-    for message in reversed(messages[:i]):
-        if isinstance(message, AIMessage):
-            break
+    for message in window[: ids.index(input_id)]:
         kwargs = getattr(message, "additional_kwargs", None) or {}
         held = kwargs.get(_HELD_JOBS) or {}
         delivered = kwargs.get("steering_delivered")
         if held.get("run_id") == run_id and isinstance(delivered, dict):
-            opened.insert(0, delivered)
+            opened.append(delivered)
     return opened
 
 
@@ -454,7 +484,7 @@ def _announce(runtime: Runtime, thread_id: str, delivered: dict[str, Any]) -> No
 def steers_ahead_message(steers: list[SteeredReport], run_id: str) -> HumanMessage:
     """The message a fresh turn opens with ahead of its input: the steers
     sent before it started, held by ``run_id`` until its first model call
-    reads them."""
+    reads them. Steers only, so no group to render."""
     message, _ = _steering_message(steers, run_id, time.time())
     return message
 
@@ -466,6 +496,12 @@ def _delivered_origin(origin: dict[str, Any] | None) -> dict[str, Any] | None:
         return None
     shown = {k: origin[k] for k in ("type", "agent") if origin.get(k)}
     return shown or None
+
+
+def _report_entry(report: SteeredReport, now: float) -> dict[str, Any]:
+    """A taken report's ``steering_delivered`` entry: no text of its own, as
+    the reader is shown an alert's row or what a report reports on."""
+    return {"content": "", **report.shown, "timestamp": now}
 
 
 def _steer_entry(steer: SteeredReport) -> dict[str, Any]:
@@ -487,7 +523,10 @@ def _steer_entry(steer: SteeredReport) -> dict[str, Any]:
 
 
 def _steering_message(
-    taken: list[SteeredReport], run_id: str | None, now: float
+    taken: list[SteeredReport],
+    run_id: str | None,
+    now: float,
+    render_group: GroupRenderer | None = None,
 ) -> tuple[HumanMessage, dict[str, Any]]:
     """The message the model takes everything in through, and its
     ``steering_delivered`` payload.
@@ -496,17 +535,28 @@ def _steering_message(
     additional_kwargs, so checkpoint-sourced replay can re-emit
     steering_delivered without the stored SSE stream. A report's text is
     model-facing: the reader is shown what it reports on, as a report turn's
-    hidden message is.
+    hidden message is. Each group's reports read as one block, after the
+    other reports and before the steers.
     """
-    reports = [t for t in taken if t.kind != "steer"]
+    reports = [t for t in taken if t.kind == "report"]
+    groups: dict[str, list[SteeredReport]] = {}
+    for t in taken:
+        if t.kind not in ("report", "steer"):
+            groups.setdefault(t.kind, []).append(t)
     steers = [t for t in taken if t.kind == "steer"]
     said = "\n\n".join(report.content for report in reports)
+    if groups and render_group is None:
+        raise ValueError(f"no block to read {', '.join(groups)} reports in")
+    blocks = [
+        render_group(kind, [g.content for g in group])
+        for kind, group in groups.items()
+    ]
     sent = (
         steer_text(sender_runs((s.sender or "user", s.content) for s in steers))
         if steers
         else ""
     )
-    content = "\n\n".join(part for part in (said, sent) if part)
+    content = "\n\n".join(part for part in (said, *blocks, sent) if part)
 
     delivered = {
         # The user's messages only: a chat gateway retires this many of the
@@ -514,8 +564,8 @@ def _steering_message(
         # sender's.
         "count": sum((s.sender or "user") == "user" for s in steers),
         "messages": [
-            {"content": "", "report_source": report.report_source, "timestamp": now}
-            for report in reports
+            _report_entry(report, now)
+            for report in reports + [g for group in groups.values() for g in group]
         ]
         + [_steer_entry(steer) for steer in steers],
         "timestamp": now,

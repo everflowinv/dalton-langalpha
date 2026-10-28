@@ -24,7 +24,7 @@ function ToastViewport({
     <ToastPrimitives.Viewport
       {...aboveDialogs}
       className={cn(
-        "pointer-events-none fixed top-0 z-1050 flex max-h-screen w-full flex-col-reverse p-4 sm:bottom-[var(--toast-lift,0px)] sm:right-0 sm:top-auto sm:flex-col sm:transition-[bottom] sm:duration-200 motion-reduce:transition-none md:max-w-[420px]",
+        "pointer-events-none fixed top-0 z-1050 flex max-h-screen w-full flex-col-reverse p-4 sm:bottom-[var(--toast-lift,0px)] sm:right-0 sm:top-auto sm:flex-col sm:transition-[bottom] motion-reduce:transition-none md:max-w-[420px]",
         className
       )}
       {...props}

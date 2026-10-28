@@ -27,17 +27,19 @@ have.
 
 import logging
 from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import psycopg
 from psycopg.rows import dict_row
 
+from ptc_agent.config.agent import SubagentModel
 from src.server.database import pool
 from src.server.contracts.status import (
     REPORT_BACK_STATUSES,
     TERMINAL_STATUSES,
 )
-from src.server.utils.pg_sanitize import SafeJson
+from src.server.utils.pg_sanitize import SafeJson, normalize_uuid
 
 logger = logging.getLogger(__name__)
 
@@ -121,6 +123,7 @@ async def start_task_run(
     launch_tool_call_id: Optional[str] = None,
     predecessor_run_id: Optional[str] = None,
     start_checkpoint_id: Optional[str] = None,
+    model: Optional[SubagentModel] = None,
     conn=None,
 ) -> Dict[str, Any]:
     """The task-run START transaction: task upsert + in_progress run row +
@@ -129,6 +132,9 @@ async def start_task_run(
     Raises TaskRunSlotBusyError / DuplicateLaunchError /
     PredecessorClaimedError — each backed by a DB constraint, so two workers
     racing the same spawn cannot both win regardless of what they read.
+
+    ``model`` lands in ``replay_facts`` with the row, since the checkpoint
+    never records which model ran and the build that knew is gone by replay.
     """
     conflict: Optional[str] = None
 
@@ -137,7 +143,8 @@ async def start_task_run(
             async with conn.transaction():
                 from src.server.database.workspace import lock_run_workspace
 
-                await lock_run_workspace(conn, thread_id)
+                # DALTON-HOOK(colleague-dispatch): subagent belongs to an already-admitted parent run; skip colleague access re-check
+                await lock_run_workspace(conn, thread_id, check_colleague_access=False)
 
                 # Fast-path dedup probe for checkpoint re-execution; the
                 # partial unique index below is the race-safe backstop.
@@ -167,9 +174,9 @@ async def start_task_run(
                         INSERT INTO subagent_runs (
                             task_run_id, thread_id, task_id, parent_run_id,
                             launch_tool_call_id, predecessor_run_id, cause,
-                            start_checkpoint_id, user_id
+                            start_checkpoint_id, replay_facts, user_id
                         )
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s,
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s,
                             -- Denormalized owner for the in-flight spend
                             -- aggregate. Derived here rather than threaded
                             -- through the agent-side ledger port: the port's
@@ -191,6 +198,7 @@ async def start_task_run(
                             predecessor_run_id,
                             cause,
                             start_checkpoint_id,
+                            SafeJson({"model": model}) if model else None,
                             thread_id,
                         ),
                     )
@@ -798,8 +806,9 @@ async def get_task_run_statuses(task_run_ids: List[str]) -> Dict[str, str]:
 async def get_latest_run_details(
     thread_id: str, task_ids: List[str]
 ) -> Dict[str, Dict[str, Any]]:
-    """task_id -> {status, error, error_type, last_activity_at} for tasks that
-    HAVE a ledgered run.
+    """task_id -> {status, error, error_type, last_activity_at,
+    latest_run_id, started_at, finalized_at, model} for tasks that HAVE a
+    ledgered run.
 
     ``error`` is the human-readable ``failure->>'error'`` message, present for
     any terminal that settled with a failure payload; ``error_type`` is the
@@ -816,11 +825,15 @@ async def get_latest_run_details(
             await cur.execute(
                 """
                 SELECT t.task_id,
+                       t.latest_run_id,
                        r.status,
                        r.failure->>'error' AS error,
                        r.failure->>'error_type' AS error_type,
                        GREATEST(r.started_at, r.finalized_at, r.result_delivered_at)
-                           AS last_activity_at
+                           AS last_activity_at,
+                       r.started_at,
+                       r.finalized_at,
+                       r.replay_facts -> 'model' AS model
                 FROM subagent_tasks t
                 JOIN subagent_runs r ON r.task_run_id = t.latest_run_id
                 WHERE t.thread_id = %s AND t.task_id = ANY(%s)
@@ -834,6 +847,53 @@ async def get_latest_run_details(
                     "error": r["error"],
                     "error_type": r["error_type"],
                     "last_activity_at": r["last_activity_at"],
+                    "latest_run_id": str(r["latest_run_id"]),
+                    "started_at": r["started_at"],
+                    "finalized_at": r["finalized_at"],
+                    "model": r["model"],
+                }
+                for r in rows
+            }
+
+
+async def get_task_run_telemetry(
+    thread_id: str, task_run_ids: List[str]
+) -> Dict[str, Dict[str, Any]]:
+    """task_run_id -> {task_id, started_at, finalized_at, model} for the
+    thread's runs among the ids that HAVE a row.
+
+    The per-run counterpart of :func:`get_latest_run_details`: a task card
+    replays the run its own launch started, which a later resume has since
+    displaced as the task's latest. ``model`` is the one admission recorded
+    (``replay_facts.model``), None when the run used its launcher's. The ids
+    come off stored artifacts, so the read is scoped to the thread (a
+    payload must not reach another thread's run) and drops non-UUID ids
+    pre-bind so one malformed id can't 22P02 the batch.
+    """
+    normalized = [nid for nid in (normalize_uuid(r) for r in task_run_ids) if nid]
+    if not normalized:
+        return {}
+    async with pool.get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                SELECT task_run_id,
+                       task_id,
+                       started_at,
+                       finalized_at,
+                       replay_facts -> 'model' AS model
+                FROM subagent_runs
+                WHERE thread_id = %s AND task_run_id = ANY(%s)
+                """,
+                (thread_id, normalized),
+            )
+            rows = await cur.fetchall()
+            return {
+                str(r["task_run_id"]): {
+                    "task_id": str(r["task_id"]),
+                    "started_at": r["started_at"],
+                    "finalized_at": r["finalized_at"],
+                    "model": r["model"],
                 }
                 for r in rows
             }
@@ -907,6 +967,39 @@ async def list_thread_tasks(thread_ids: list[str]) -> List[Dict[str, Any]]:
                 (list(thread_ids),),
             )
             return [dict(row) for row in await cur.fetchall()]
+
+
+async def list_reporting_tasks(
+    thread_id: str, *, since: Optional[datetime] = None, task_id: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    """A thread's tasks, each with its latest run, oldest first: by
+    ``task_id`` that one task whatever drives it; otherwise those that report
+    back to the thread, still running or ended at or after ``since``.
+
+    A workflow's own children have no parent run (they report to their
+    driver, never to the thread), so a listing leaves them out."""
+    thread_id = normalize_uuid(thread_id)
+    if thread_id is None:
+        return []
+    async with pool.get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                SELECT t.task_id, t.description, t.subagent_type, r.task_run_id,
+                       r.status, r.started_at, r.finalized_at, r.result_delivered_at,
+                       r.failure->>'error_type' AS error_type
+                FROM subagent_tasks t
+                JOIN subagent_runs r ON r.task_run_id = t.latest_run_id
+                WHERE t.thread_id = %(thread)s
+                  AND (%(task)s::text IS NULL OR t.task_id = %(task)s::text)
+                  AND (%(task)s::text IS NOT NULL OR r.parent_run_id IS NOT NULL)
+                  AND (%(since)s::timestamptz IS NULL OR r.status = 'in_progress'
+                       OR COALESCE(r.finalized_at, r.started_at) >= %(since)s::timestamptz)
+                ORDER BY r.started_at
+                """,
+                {"thread": thread_id, "task": task_id, "since": since},
+            )
+            return [dict(r) for r in await cur.fetchall()]
 
 
 async def get_task(thread_id: str, task_id: str) -> Optional[Dict[str, Any]]:

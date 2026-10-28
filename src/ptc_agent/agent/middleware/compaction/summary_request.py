@@ -43,30 +43,10 @@ logger = logging.getLogger(__name__)
 
 _COMPACTION_USER_NUDGE = "Generate the summary now."
 
-# Summarization prompt. Instructions only: the conversation
-# history is delivered in a separate HumanMessage so the system channel stays
-# bounded and cacheable, and so BaseChatModel.format() doesn't try to interpret
-# message content as further format placeholders.
-DEFAULT_SUMMARY_PROMPT = """<role>
-Conversation Context Summarizer
-</role>
-
-<context>
-You're nearing your input token limit. The conversation history in the user
-message will be replaced with the context you extract. This is critical -
-ensure you capture all important information so you can continue the work
-without losing progress.
-
-The most recent messages are not in this history: they stay in context, word
-for word, right after your summary, so the work may have moved on from where
-this history ends. Describe unfinished work as where it stood at that point,
-not as still to do.
-</context>
-
-<objective>
+# What a summary holds, whoever writes it.
+_SUMMARY_BODY = """<objective>
 Extract the most important context to preserve continuity and prevent
-repeating completed work. Think deeply about what information is essential to
-achieving the user's overall goal.
+repeating completed work.
 </objective>
 
 <instructions>
@@ -110,6 +90,99 @@ Make sure you maintain the user original query and goal.
 Then organize naturally using markdown headers.
 Write as if briefing a colleague who needs to continue your work without repeating what's done.
 </output_format>"""
+
+# The transcript summarizer's prompt. Instructions only: the conversation
+# history is delivered in a separate HumanMessage so the system channel stays
+# bounded and cacheable, and so BaseChatModel.format() doesn't try to interpret
+# message content as further format placeholders.
+DEFAULT_SUMMARY_PROMPT = (
+    """<role>
+Conversation Context Summarizer
+</role>
+
+<context>
+You're nearing your input token limit. The conversation history in the user
+message will be replaced with the context you extract. This is critical -
+ensure you capture all important information so you can continue the work
+without losing progress.
+
+The most recent messages are not in this history: they stay in context, word
+for word, right after your summary, so the work may have moved on from where
+this history ends. Describe unfinished work as where it stood at that point,
+not as still to do.
+</context>
+
+"""
+    + _SUMMARY_BODY
+)
+
+# The prompt for the model that holds the conversation, which summarizes it in
+# place (a provider's own compaction): no role of its own, since it is still
+# the agent, and the history is the conversation above, not a user message.
+NATIVE_SUMMARY_PROMPT = (
+    """<context>
+You're nearing your context limit. Everything above will be replaced by the
+summary you write now, so capture all you need to continue the work without
+losing progress.
+
+The most recent messages are not above: they stay in context, word for word,
+right after your summary, so the work may have moved on from where this
+conversation ends. Describe unfinished work as where it stood at that point,
+not as still to do.
+</context>
+
+"""
+    + _SUMMARY_BODY
+)
+
+_SUMMARY_OPEN, _SUMMARY_END = "<summary>", "</summary>"
+
+# The prompt for the model that holds the conversation writing the summary as
+# text, sent as the last user message of its own request. Reading its own
+# reasoning, it takes steps it only planned for done; with its tools bound it
+# may call one instead; and some providers stop mid-word under a normal stop
+# reason, which the closing line is there to show.
+SELF_SUMMARY_PROMPT = NATIVE_SUMMARY_PROMPT + (
+    "\n\nCount as done only what a tool result above shows was done: a step you "
+    "planned in your reasoning that no tool carried out is not done, and a file "
+    "no tool wrote does not exist. Write the summary as text; do not call a tool."
+    f"\n\nEnd the summary with the line `{_SUMMARY_END}` on its own."
+)
+
+
+def finished_summary(text: str) -> str | None:
+    """The summary a model wrote to ``SELF_SUMMARY_PROMPT``, without its tags
+    or anything it said around them, or None when it did not reach the
+    closing line."""
+    body, closed, after = text.rpartition(_SUMMARY_END)
+    # A tag mid-line with text after it is quoted, by a summary cut off later.
+    if not closed or (after.strip() and body.rsplit("\n", 1)[-1].strip()):
+        return None
+    _, opened, inside = body.partition(_SUMMARY_OPEN)
+    return (inside if opened else body).strip() or None
+
+
+# The prompt for the model whose provider compacted the conversation into a
+# summary only that provider can read, when the user moves the thread to a
+# model of another provider. Sent as the last user message after that summary,
+# so the provider reads the summary itself, from its cache.
+HANDOFF_SUMMARY_PROMPT = (
+    """<context>
+This conversation is moving to a model from another provider, which cannot
+read the compacted summary above. Write it out in full for that model: what
+you write replaces the compacted summary for it, so capture all it needs to
+continue the work without losing progress. This request comes from the
+system, not the user, and is not part of the work: leave it out of what you
+write.
+
+The messages that came after the compacted summary stay in context, word for
+word, right after yours, so the work may have moved on from where it ends.
+Describe unfinished work as where it stood at that point, not as still to do.
+</context>
+
+"""
+    + _SUMMARY_BODY
+)
 
 # Appended only when the history carries transcript markers: without a
 # transcript there is no file to cite, and an instruction to cite one would

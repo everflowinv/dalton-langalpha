@@ -128,6 +128,24 @@ async def test_a_regenerated_system_turn_that_never_ran_stays_a_system_turn():
 
 
 @pytest.mark.asyncio
+async def test_a_market_target_wake_reruns_with_its_notice():
+    """Without it the rerun replays as a generic alert row."""
+    notice = {"target_id": "tg-1", "notice": "hit", "symbol": "AAPL"}
+    query = {
+        "content": "<market-alert>",
+        "type": "market_target",
+        "metadata": {"market_target": notice},
+    }
+    with patch(GET_QUERY, new=AsyncMock(return_value=query)):
+        request = await input_rerun_request(
+            "t-1", _failed_run(), PendingInput(None), workspace_id="ws-1", body=None
+        )
+
+    assert request.query_type == "market_target"
+    assert request.market_target == notice
+
+
+@pytest.mark.asyncio
 async def test_a_stored_report_that_no_longer_reads_is_dropped():
     query = {"content": "report back", "type": "system", "metadata": {"report_source": {"kind": "gone"}}}
     with patch(GET_QUERY, new=AsyncMock(return_value=query)):

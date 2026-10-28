@@ -15,12 +15,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from fastapi import HTTPException
 
+from ptc_agent.core.sandbox.glob_runtime import expand_braces
 from src.server.app.share_files import resolve_shared_file
-from src.server.app.workspace_files._containment import contained_relative_path
-from src.server.app.workspace_files._shared import (
-    _normalize_requested_path,
-    previous_dir_names_of,
-)
+from src.server.app.workspace_files._shared import previous_roots_of
 from src.server.app.workspace_files.crud import resolve_workspace_file
 from src.server.app.workspace_files.file_refs import (
     ResolveFileRefRequest,
@@ -30,6 +27,11 @@ from src.server.app.workspace_files.file_refs import (
     resolve_file_ref,
     visible_paths,
 )
+from src.server.services.workspace_file_containment import (
+    contained_relative_path,
+    normalize_requested_path,
+)
+from src.server.services.workspace_files import previous_dir_names_of
 
 WORK_DIR = "/home/workspace"
 
@@ -42,7 +44,7 @@ FOLDER_WORK_DIR = f"{WORK_DIR}/{DIR_NAME}"
 # The three the read, download, serve and resolve routes normalize with. They
 # answered one spelling three different ways before a single fold backed all
 # three, so the spelling cases run against each of them.
-_FOLDS = (clean_path, contained_relative_path, _normalize_requested_path)
+_FOLDS = (clean_path, contained_relative_path, normalize_requested_path)
 
 # The two that also decide: a fold on its own reports what a path says, and
 # these two are where a path that says something unservable is refused.
@@ -75,6 +77,12 @@ class TestCleaning:
         pattern = glob.removeprefix("**/")
         assert fnmatchcase("C#1 [draft]*.md", pattern)
         assert not fnmatchcase("C#1 d*.md", pattern)
+
+    @pytest.mark.parametrize("name", ["v{1,2}.md", "a\\,b.md", "q\\{a,b\\}.md"])
+    def test_name_glob_keeps_braces_and_escapes_literal(self, name):
+        glob = name_glob(name)
+        assert expand_braces(glob) == [glob]
+        assert fnmatchcase(name, glob.removeprefix("**/"))
 
     def test_hidden_files_show_only_when_the_reference_points_there(self):
         paths = ["results/a.md", "_internal/a.md", "work/__pycache__/a.md"]
@@ -149,7 +157,7 @@ class TestFoldingSpellings:
         workspace path on the routes that serve one, and nothing a file
         reference may name on the route that globs for it.
         """
-        assert _normalize_requested_path("/etc/passwd", FOLDER_WORK_DIR) == "etc/passwd"
+        assert normalize_requested_path("/etc/passwd", FOLDER_WORK_DIR) == "etc/passwd"
         assert contained_relative_path("/etc/passwd", FOLDER_WORK_DIR) == "etc/passwd"
         assert clean_path("/etc/passwd", FOLDER_WORK_DIR) is None
         # Only one slash is virtual; the rest stays absolute and is refused.
@@ -226,6 +234,38 @@ class TestPreviousFolderSpellings:
         assert previous_dir_names_of(None) == ()
 
 
+class TestPreviousRootSpellings:
+    """A turn from before a move spells the folder under the computer it left,
+    by whatever name the folder had then."""
+
+    @pytest.mark.parametrize(
+        "requested",
+        [
+            "/srv/old/Old Name/reports/q3.md",
+            "/srv/old/New Name/reports/q3.md",
+            "file:///srv/old/Old%20Name/reports/q3.md",
+        ],
+    )
+    def test_the_folder_under_a_root_left_behind_is_this_folder(self, requested):
+        folded = clean_path(
+            requested, RENAMED_WORK_DIR, PREVIOUS, previous_roots=("/srv/old",)
+        )
+        assert folded == "reports/q3.md"
+
+    def test_another_folder_under_a_root_left_behind_is_refused(self):
+        # A sibling's folder on the computer the workspace left.
+        requested = "/srv/old/Beta/secret.md"
+        assert clean_path(requested, RENAMED_WORK_DIR, PREVIOUS, previous_roots=("/srv/old",)) is None
+        assert clean_path("/srv/old/Old Name/../Beta/x.md", RENAMED_WORK_DIR, PREVIOUS, previous_roots=("/srv/old",)) is None
+
+    def test_the_more_specific_root_reads_first(self):
+        # In a folder named `old`, `/srv` would leave the former folder in front.
+        roots = previous_roots_of({"previous_root_dirs": ["/srv", "/srv/old/", ""]})
+        assert roots == ("/srv/old", "/srv")
+        folded = clean_path("/srv/old/Older/q3.md", f"{WORK_DIR}/old", ("Older",), previous_roots=roots)
+        assert folded == "q3.md"
+
+
 class TestResolve:
     def test_an_exact_candidate_wins(self):
         result = resolve_file_ref(["reports/model.py", "model.py"], ["model.py", "reports/model.py"])
@@ -298,7 +338,7 @@ class TestWorkspaceRoute:
         tree = [{"path": "results/q3/report.md"}, {"path": "results/summary.md"}, {"path": "_internal/report.md"}]
         with (
             patch(f"{CRUD}.FilePersistenceService.get_file_tree", new_callable=AsyncMock, return_value=tree),
-            patch(f"{CRUD}._acquire_sandbox_to_change") as acquire,
+            patch(f"{CRUD}.acquire_sandbox_to_change") as acquire,
         ):
             result = await resolve_workspace_file("ws-1", "user-1", _body("/home/workspace/report.md"))
         acquire.assert_not_called()
@@ -336,7 +376,7 @@ class TestWorkspaceRoute:
             f"{RENAMED_WORK_DIR}/report.md", f"{RENAMED_WORK_DIR}/New Name/report.md",
         ])
         with (
-            patch(f"{CRUD}._acquire_sandbox_to_change", _held(sandbox, after)),
+            patch(f"{CRUD}.acquire_sandbox_to_change", _held(sandbox, after)),
             patch(f"{CRUD}.owner_work_dir", side_effect=lambda ws: f"{WORK_DIR}/{ws['dir_name']}"),
             patch(f"{CRUD}.contained_sandbox_path", new_callable=AsyncMock, return_value=RENAMED_WORK_DIR),
         ):
@@ -350,7 +390,7 @@ class TestWorkspaceRoute:
         sandbox = MagicMock()
         sandbox.is_ready.return_value = False
         sandbox.aglob_files = AsyncMock()
-        with patch(f"{CRUD}._acquire_sandbox_to_change", _held(sandbox, _workspace("running"))):
+        with patch(f"{CRUD}.acquire_sandbox_to_change", _held(sandbox, _workspace("running"))):
             result = await resolve_workspace_file("ws-1", "user-1", _body("report.md"))
         assert result == {"status": "unavailable", "reason": "sandbox_starting", "matches": []}
         sandbox.aglob_files.assert_not_awaited()
@@ -363,7 +403,7 @@ class TestWorkspaceRoute:
             "/home/workspace/a/model.py", "/home/workspace/b/model.py", "/home/workspace/.git/x/model.py",
         ])
         with (
-            patch(f"{CRUD}._acquire_sandbox_to_change", _held(sandbox, _workspace("running"))),
+            patch(f"{CRUD}.acquire_sandbox_to_change", _held(sandbox, _workspace("running"))),
             patch(f"{CRUD}.contained_sandbox_path", new_callable=AsyncMock, return_value=WORK_DIR),
         ):
             result = await resolve_workspace_file("ws-1", "user-1", _body("model.py", writes=["b/model.py"]))
@@ -386,7 +426,7 @@ class TestWorkspaceRoute:
             "/home/workspace/other-zz99/results/model.py",
         ])
         with (
-            patch(f"{CRUD}._acquire_sandbox_to_change", _held(sandbox, _workspace("running"))),
+            patch(f"{CRUD}.acquire_sandbox_to_change", _held(sandbox, _workspace("running"))),
             patch(f"{CRUD}.owner_work_dir", return_value="/home/workspace/acme-ab12"),
             patch(f"{CRUD}.contained_sandbox_path", new_callable=AsyncMock, return_value="/home/workspace/acme-ab12"),
         ):
@@ -448,6 +488,39 @@ async def test_a_shared_thread_resolves_against_the_listing_it_browses():
         "status": "resolved", "path": "archive/report.md", "match": "recent_write",
         "matches": ["archive/report.md", "results/report.md"], "source": "database",
     }
+
+
+@pytest.mark.asyncio
+async def test_a_shared_thread_resolves_a_link_from_before_a_move():
+    """The share sends no former names, so the fold under a root left behind is the server's."""
+    target = SimpleNamespace(
+        workspace={
+            "workspace_id": "ws-1", "status": "stopped", "dir_name": "New Name",
+            "previous_dir_names": ["Old Name"], "previous_root_dirs": ["/srv/old"],
+        },
+        workspace_id="ws-1",
+        work_dir=RENAMED_WORK_DIR,
+    )
+    with (
+        patch(f"{SHARE}.resolve_shared_files", new_callable=AsyncMock, return_value=target),
+        patch(f"{SHARE}._visible_listing", new_callable=AsyncMock, return_value=(["results/report.md"], "database")),
+    ):
+        result = await resolve_shared_file("tok", _body("/srv/old/Old Name/results/report.md"))
+    assert result["status"] == "resolved"
+    assert result["path"] == "results/report.md"
+
+    # A write that turn made picks between namesakes, spelled as it was then.
+    listing = ["results/report.md", "archive/report.md"]
+    with (
+        patch(f"{SHARE}.resolve_shared_files", new_callable=AsyncMock, return_value=target),
+        patch(f"{SHARE}._visible_listing", new_callable=AsyncMock, return_value=(listing, "database")),
+    ):
+        result = await resolve_shared_file(
+            "tok", _body("report.md", writes=["/srv/old/Old Name/archive/report.md"])
+        )
+    assert (result["status"], result["path"], result["match"]) == (
+        "resolved", "archive/report.md", "recent_write",
+    )
 
 
 @pytest.mark.asyncio

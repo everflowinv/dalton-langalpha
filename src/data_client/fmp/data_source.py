@@ -7,7 +7,7 @@ FMP stamps bars with exchange-local wall-clock strings and no timezone;
 timestamps are localized per symbol (``symbol_timezone``) and bars are
 returned ascending. Quotes/prices for LSE symbols arrive in GBX (pence);
 both interfaces convert them to major units — the legacy bar/snapshot path
-via ``minor_unit_scale`` and the protocol path (:func:`normalize_series`)
+via ``minor_unit_places`` and the protocol path (:func:`normalize_series`)
 independently, so conversion is applied exactly once per path.
 """
 
@@ -20,7 +20,7 @@ from zoneinfo import ZoneInfo
 
 from src.data_client.normalize import (
     build_series,
-    minor_unit_scale,
+    minor_unit_places,
     scale_price,
     scale_snapshot_prices,
     symbol_timezone,
@@ -82,21 +82,21 @@ class FMPDataSource:
         return f"^{symbol}"
 
     @staticmethod
-    def _normalize(row: dict[str, Any], tz: ZoneInfo, scale: float) -> dict[str, Any]:
+    def _normalize(row: dict[str, Any], tz: ZoneInfo, places: int) -> dict[str, Any]:
         """Normalize a raw FMP bar to the standard OHLCV shape.
 
         FMP returns ``date`` as an exchange-local string
         (``"2024-01-15 09:30:00"`` or ``"2024-01-15"``) — localized with the
         symbol's exchange tz, NOT assumed ET. ``time`` is Unix ms to match
-        the envelope contract. ``scale`` is the minor-unit factor (0.01 for
-        GBX/pence venues, else 1.0); volume is a share count, never scaled.
+        the envelope contract. ``places`` is the minor-unit shift (2 for
+        GBX/pence venues, else 0); volume is a share count, never scaled.
         """
         return {
             "time": _parse_row_time(row, tz),
-            "open": scale_price(row.get("open", 0.0), scale),
-            "high": scale_price(row.get("high", 0.0), scale),
-            "low": scale_price(row.get("low", 0.0), scale),
-            "close": scale_price(row.get("close", 0.0), scale),
+            "open": scale_price(row.get("open", 0.0), places),
+            "high": scale_price(row.get("high", 0.0), places),
+            "low": scale_price(row.get("low", 0.0), places),
+            "close": scale_price(row.get("close", 0.0), places),
             "volume": int(row.get("volume") or 0),
         }
 
@@ -116,7 +116,7 @@ class FMPDataSource:
             )
         api_symbol = self._api_symbol(symbol, is_index)
         tz = symbol_timezone(symbol)
-        scale = minor_unit_scale(symbol)
+        places = minor_unit_places(symbol)
         async with FMPClient() as client:
             data = await client.get_intraday_chart(
                 symbol=api_symbol,
@@ -125,7 +125,7 @@ class FMPDataSource:
                 to_date=to_date,
                 **({"extended": True} if extended_hours else {}),  # DALTON-HOOK(stock-move-upgrade)
             )
-        bars = [self._normalize(bar, tz, scale) for bar in (data or [])]
+        bars = [self._normalize(bar, tz, places) for bar in (data or [])]
         bars.sort(key=lambda b: b["time"])
         return bars
 
@@ -139,14 +139,14 @@ class FMPDataSource:
     ) -> list[dict[str, Any]]:
         api_symbol = self._api_symbol(symbol, is_index)
         tz = symbol_timezone(symbol)
-        scale = minor_unit_scale(symbol)
+        places = minor_unit_places(symbol)
         async with FMPClient() as client:
             data = await client.get_stock_price(
                 symbol=api_symbol,
                 from_date=from_date,
                 to_date=to_date,
             )
-        bars = [self._normalize(bar, tz, scale) for bar in (data or [])]
+        bars = [self._normalize(bar, tz, places) for bar in (data or [])]
         bars.sort(key=lambda b: b["time"])
         return bars
 
@@ -203,7 +203,7 @@ class FMPDataSource:
         """Normalize an FMP quote response to the unified snapshot shape.
 
         Price-like fields are scaled to major units per the quote's own symbol
-        (GBX venues → ×0.01), so a mixed-market batch converts each row
+        (GBX venues → pounds), so a mixed-market batch converts each row
         correctly; change_percent is a ratio and volume a share count — both
         left untouched.
         """
@@ -229,7 +229,7 @@ class FMPDataSource:
             "as_of": _print_time_ms(q.get("timestamp")),
             "regular_only": True,
         }
-        return scale_snapshot_prices(snap, minor_unit_scale(symbol))
+        return scale_snapshot_prices(snap, minor_unit_places(symbol))
 
     async def close(self) -> None:
         pass  # FMPClient manages its own lifecycle per-request

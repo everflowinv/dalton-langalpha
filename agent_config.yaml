@@ -16,13 +16,20 @@ llm:
     - "glm-5.2"
 
 sandbox:
-  # Provider selection: "daytona" (cloud) or "docker" (local).
+  # Provider selection: "daytona" or "e2b" (cloud), or "docker" (local).
   # - daytona: Cloud-hosted sandboxes via Daytona API. Each workspace gets an isolated
   #   VM with auto-stop/archive/delete lifecycle. Snapshots are versioned by a hash of
   #   this config (working_dir, Python version, dependencies, apt packages).
+  # - e2b: Cloud-hosted sandboxes via E2B API. Stop pauses the sandbox (memory and disk
+  #   kept) and start resumes it in about a second. Each resource tier has its own
+  #   template, built from the same image recipe as the Daytona snapshot.
   # - docker: Local Docker containers using Dockerfile.sandbox. Useful for development.
   # Override at runtime with SANDBOX_PROVIDER env var.
   provider: "daytona"
+  # Other providers a user may pick when creating a computer; `provider` stays
+  # the default. Each needs its credentials, and a computer keeps its provider.
+  # "ssh" is offered only this way: it lets users add their own Linux or macOS machine.
+  # offered_providers: ["e2b", "ssh"]
 
   # Daytona cloud sandbox configuration
   daytona:
@@ -36,25 +43,81 @@ sandbox:
     # Hash will be automatically appended based on dependencies
     snapshot_enabled: true # Recommended: Enable snapshot-based sandbox creation
     snapshot_name: "langalpha" # Base name for snapshot (hash will be appended)
-    snapshot_auto_create: true # Automatically create snapshot if it doesn't exist
+    snapshot_auto_create: true # build a tier's snapshot on first use if missing (takes minutes); false requires `make daytona-snapshots`
 
-  # Platform-secret catalog — Daytona provider only (ignored under docker/memory).
-  # Each entry delivers a backend-owned API key into sandboxes as a managed
-  # Secret: the sandbox env var holds an opaque placeholder, and Daytona
-  # substitutes the real value into outbound HTTPS request *headers* for the
-  # allowlisted hosts only. Declared per deployment (not code); an entry is the
-  # opt-in and works in OSS mode too. Uncomment the FMP example to enable —
-  # boot then fail-closes unless DAYTONA_SECRET_NAMESPACE and the source env
-  # var are set.
+  # E2B cloud sandbox configuration. Needs E2B_API_KEY; archive is not
+  # supported on this provider.
+  e2b:
+    auto_stop_interval: 3600 # seconds idle before the sandbox pauses
+    max_timeout: 3600 # longest continuous run your plan allows (Hobby 3600, Pro 86400); caps every timeout
+    template_name: "langalpha" # prefix of the per-tier templates: <template_name>-<tier>-<hash>
+    template_auto_create: true # build a tier's template on first use if missing (takes minutes); false requires `make e2b-templates`
+    # false makes ports answer only the preview proxy (needs PREVIEW_PROXY_BASE_URL).
+    # A computer keeps the value it was created with, so turning this back on
+    # still needs the proxy until the computers created while it was off are gone.
+    public_traffic: true
+
+  # A machine the user brings, reached over SSH (offer it with
+  # offered_providers). Each user gets one client key, which they authorize on
+  # their machine; the host, login and pinned host key are set per computer
+  # when the user adds it, never here. Needs BYOK_ENCRYPTION_KEY, which keeps
+  # the client keys encrypted at rest, and PREVIEW_PROXY_BASE_URL, since a
+  # preview of a port on the machine is served through the preview proxy.
+  # The agent runs as the login user in a folder of its own, ~/langalpha unless
+  # the user picks another (filesystem.working_directory applies to hosted
+  # computers only), with a Python runtime it installs under ~/.langalpha on
+  # the first start. Nothing this deployment holds (MCP server keys, platform
+  # secrets) is sent to the machine, only the computer's own data token, so a
+  # built-in server that needs a vendor key works there when it is served over
+  # HTTP with `auth: data_token`, and not over stdio. Removing the computer
+  # takes those credentials off the machine; the folder stays the owner's.
+  ssh:
+    auto_stop_interval: 3600 # seconds idle before the computer's processes are stopped; the machine keeps running
+    allow_private_addresses: false # true lets users add machines at private, loopback or link-local addresses
+    # true sends SSH machines what any computer gets from this server: the
+    # built-in data servers' keys (FMP_API_KEY and the rest) and the GitHub
+    # bot token. Each machine's owner can read them, so turn it on only where
+    # every user may hold them, such as a deployment you alone use. Machines
+    # added earlier pick the change up at their next start. A deployment with
+    # a platform_secrets catalog refuses to boot with it on.
+    trusted_host: false
+    # SSH connections per user per hour to addresses the user names (a probe,
+    # a pairing, a create); starting a computer is not counted. 0 is no limit.
+    dials_per_hour: 60
+    # Addresses this server's SSH connections come from, as the machines see
+    # them (IPs or CIDR). Set, each machine's key line admits logins only from
+    # these and from the machine itself (its tunnel), and every start brings
+    # the line up to date. Empty admits any address. List a new address
+    # beside the old one until the machines have started once from it.
+    login_from: []
+    connect_timeout: 10 # seconds
+    keepalive_interval: 15 # seconds between keepalives on the pooled connection
+    keepalive_count_max: 3 # unanswered keepalives before the connection is dropped
+    bootstrap_timeout: 1800 # seconds the first start may spend installing the runtime
+    max_computers_per_user: 20 # SSH computers one user may have; 0 for no limit
+
+  # Platform-secret catalog: Daytona and E2B providers (ignored under
+  # docker/memory). Each entry delivers a backend-owned API key into sandboxes
+  # as a managed Secret: the sandbox env var holds an opaque placeholder, and
+  # the provider puts the real value into outbound HTTPS request *headers* for
+  # the allowlisted hosts only. Daytona substitutes the placeholder in any
+  # header; E2B sets the one `header` the entry names. Declared per deployment
+  # (not code); an entry is the opt-in and works in OSS mode too. Uncomment the
+  # FMP example to enable. Boot then fail-closes unless the provider's
+  # namespace (DAYTONA_SECRET_NAMESPACE or E2B_SECRET_NAMESPACE) and the source
+  # env var are set. With HOST_MODE=platform the catalog may be empty: a
+  # built-in server env var named like a credential (*_API_KEY, *_SECRET,
+  # *_TOKEN, ...) with no entry is withheld from sandboxes, never plaintext.
   # platform_secrets:
   #   - source_env_var: "FMP_API_KEY"        # read from the host .env
   #     sandbox_env_var: "FMP_API_KEY"       # placeholder-bearing var in the sandbox
-  #     name_suffix: "platform-fmp-api-key"  # Secret name = <DAYTONA_SECRET_NAMESPACE>-<suffix>
+  #     name_suffix: "platform-fmp-api-key"  # Secret name = <namespace>-<suffix>
   #     description: "Platform FMP API key"
   #     hosts: ["financialmodelingprep.com"] # egress substitution allowlist
+  #     header: "apikey"                     # header that carries the key; E2B requires it
 
   # Docker local sandbox configuration
-  # Ignored when provider is "daytona". Override with DOCKER_SANDBOX_* env vars.
+  # Ignored when provider is "daytona" or "e2b". Override with DOCKER_SANDBOX_* env vars.
   docker:
     image: "langalpha-sandbox:latest" # Build with: docker build -f Dockerfile.sandbox -t langalpha-sandbox:latest .
     memory_limit: "4g"
@@ -180,7 +243,13 @@ subagents:
 compaction:
   enabled: true # Enable/disable context compaction
   token_threshold: 120000 # Trigger full compaction when messages exceed this token count
-  keep_messages: 10 # Preserve last N messages after compaction
+  keep_tokens: 20000 # Newest history a summary keeps word for word, in the model's tokens
+  claude_keep_tokens: 32000 # The same for Claude, whose tokens hold about 1.6x less text
+  # A model whose provider does not compact the conversation writes its own
+  # summary from its cached request. The summary model reading the transcript
+  # is the fallback, and writes it instead when a separate compaction model is
+  # picked. false: always the transcript summarizer.
+  self_summary: true
   # Tier 1: when a turn starts this long after the model's last response
   # (the prompt cache is cold by then), hide large tool args and stale Read
   # results in older messages. null turns it off.

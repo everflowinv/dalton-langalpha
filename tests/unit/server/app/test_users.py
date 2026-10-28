@@ -133,10 +133,14 @@ async def test_create_user_duplicate_409(client):
 @pytest.mark.asyncio
 async def test_get_current_user(client):
     result = {"user": _user(), "preferences": _prefs()}
-    with patch(
-        f"{DB}.get_user_with_preferences",
-        new_callable=AsyncMock,
-        return_value=result,
+    # The profile, not the plan: an .env in platform mode would ask the platform.
+    with (
+        patch(
+            f"{DB}.get_user_with_preferences",
+            new_callable=AsyncMock,
+            return_value=result,
+        ),
+        patch("src.server.dependencies.usage_limits.HOST_MODE", "oss"),
     ):
         resp = await client.get("/api/v1/users/me")
 
@@ -149,10 +153,13 @@ async def test_get_current_user(client):
 @pytest.mark.asyncio
 async def test_get_current_user_no_preferences(client):
     result = {"user": _user(), "preferences": None}
-    with patch(
-        f"{DB}.get_user_with_preferences",
-        new_callable=AsyncMock,
-        return_value=result,
+    with (
+        patch(
+            f"{DB}.get_user_with_preferences",
+            new_callable=AsyncMock,
+            return_value=result,
+        ),
+        patch("src.server.dependencies.usage_limits.HOST_MODE", "oss"),
     ):
         resp = await client.get("/api/v1/users/me")
 
@@ -659,8 +666,9 @@ async def test_get_user_access_tier_no_access(client):
 
 
 @pytest.mark.asyncio
-async def test_get_user_access_tier_platform_unreachable(client):
-    """When platform is unreachable, access_tier defaults to -1 (fail-open)."""
+async def test_get_user_unknown_membership_is_503_not_no_access(client):
+    """The web sends a user whose tier reads -1 to the setup wizard, so a tier
+    nobody could read answers 503 with the credit gate's shape instead."""
     result = {"user": _user(), "preferences": _prefs()}
     with (
         patch(
@@ -671,14 +679,32 @@ async def test_get_user_access_tier_platform_unreachable(client):
         patch(
             "src.server.dependencies.usage_limits._fetch_platform_membership",
             new_callable=AsyncMock,
-            return_value={"access_tier": -1, "plan_display_name": None},
+            return_value=None,
         ),
     ):
         resp = await client.get("/api/v1/users/me")
 
+    assert resp.status_code == 503
+    assert resp.headers["Retry-After"] == "15"
+    assert resp.json()["detail"]["type"] == "service_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_get_user_refresh_tier_asks_past_the_cache(client):
+    result = {"user": _user(), "preferences": _prefs()}
+    fetch = AsyncMock(return_value={"access_tier": 1, "plan_display_name": "Plus"})
+    with (
+        patch(
+            f"{DB}.get_user_with_preferences",
+            new_callable=AsyncMock,
+            return_value=result,
+        ),
+        patch("src.server.dependencies.usage_limits._fetch_platform_membership", new=fetch),
+    ):
+        resp = await client.get("/api/v1/users/me?refresh_tier=true")
+
     assert resp.status_code == 200
-    assert resp.json()["user"]["access_tier"] == -1
-    assert resp.json()["user"]["plan_display_name"] is None
+    assert fetch.await_args.kwargs == {"refresh": True}
 
 
 # ---------------------------------------------------------------------------
@@ -686,11 +712,13 @@ async def test_get_user_access_tier_platform_unreachable(client):
 # ---------------------------------------------------------------------------
 
 
-def _mock_cache(cached_value=None):
-    """Return a mock cache that returns cached_value on get, no-ops on set."""
+def _mock_cache(cached_value=None, *, last_known=None, paused=None):
+    """A cache holding the 5-minute entry, the last-known membership and the
+    unreachable pause, in the order the membership read asks for them."""
     cache = AsyncMock()
-    cache.get = AsyncMock(return_value=cached_value)
+    cache.mget = AsyncMock(return_value=[cached_value, last_known, paused])
     cache.set = AsyncMock(return_value=True)
+    cache.set_many = AsyncMock(return_value=True)
     return cache
 
 
@@ -754,8 +782,12 @@ async def test_fetch_platform_tier_returns_tier():
 
     assert result == 0
 
-    # Verify result was cached
-    cache.set.assert_called_once()
+    (fresh_key, _, fresh_ttl), (known_key, _, known_ttl) = cache.set_many.await_args.args[0]
+    assert fresh_key == "platform_membership:user-123"
+    assert fresh_ttl == 300
+    assert known_key == "platform_membership:last_known:user-123"
+    assert known_ttl > fresh_ttl
+    cache.set.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -803,16 +835,16 @@ async def test_fetch_platform_membership_caches_tier_and_plan_display_name_toget
         result = await _fetch_platform_membership("user-123")
 
     assert result == {"access_tier": 2, "plan_display_name": "Premium"}
-    cache.set.assert_called_once()
     # The cached value carries both fields so a follow-up tier-only read is free.
-    cached_value = cache.set.call_args[0][1]
+    cached_value = cache.set_many.await_args.args[0][0][1]
     assert cached_value["access_tier"] == 2
     assert cached_value["plan_display_name"] == "Premium"
 
 
 @pytest.mark.asyncio
 async def test_fetch_platform_tier_platform_error():
-    """Returns -1 on non-200 response (fail-open)."""
+    """A 5xx is no answer: the tier is unknown, not -1, and nothing is cached
+    in the membership's place."""
     mock_response = httpx.Response(500, text="Internal Server Error")
     mock_client = AsyncMock()
     mock_client.post = AsyncMock(return_value=mock_response)
@@ -832,12 +864,16 @@ async def test_fetch_platform_tier_platform_error():
 
         result = await _fetch_platform_tier("user-123")
 
-    assert result == -1
+    assert result is None
+    cache.set_many.assert_not_awaited()
+    cache.set.assert_awaited_once_with(
+        "platform_membership:unreachable:user-123", True, ttl=15
+    )
 
 
 @pytest.mark.asyncio
 async def test_fetch_platform_tier_network_error():
-    """Returns -1 on network errors (fail-open)."""
+    """A refused connection is the platform restarting, not the user's plan."""
     mock_client = AsyncMock()
     mock_client.post = AsyncMock(side_effect=httpx.ConnectError("refused"))
     cache = _mock_cache(cached_value=None)
@@ -856,7 +892,180 @@ async def test_fetch_platform_tier_network_error():
 
         result = await _fetch_platform_tier("user-123")
 
-    assert result == -1
+    assert result is None
+    cache.set_many.assert_not_awaited()
+    cache.set.assert_awaited_once_with(
+        "platform_membership:unreachable:user-123", True, ttl=15
+    )
+
+
+def _platform(mock_client, cache):
+    from contextlib import ExitStack
+
+    stack = ExitStack()
+    stack.enter_context(patch(f"{LIMITS}.HOST_MODE", "platform"))
+    stack.enter_context(patch(f"{LIMITS}.AUTH_SERVICE_URL", "http://localhost:8003"))
+    stack.enter_context(patch(f"{LIMITS}.get_http_client", return_value=mock_client))
+    stack.enter_context(
+        patch("src.utils.cache.redis_cache.get_cache_client", return_value=cache)
+    )
+    stack.enter_context(patch("os.getenv", return_value="token"))
+    return stack
+
+
+PRO = {"access_tier": 2, "plan_display_name": "Pro"}
+
+
+@pytest.mark.asyncio
+async def test_unreachable_platform_stands_in_the_last_known_membership():
+    """The 5-minute entry running out mid-outage must not cost a paying user
+    their plan: the last answer the platform gave stands in."""
+    mock_client = AsyncMock()
+    mock_client.post = AsyncMock(side_effect=httpx.ConnectError("refused"))
+    cache = _mock_cache(None, last_known=PRO)
+
+    with _platform(mock_client, cache):
+        from src.server.dependencies.usage_limits import _fetch_platform_membership
+
+        assert await _fetch_platform_membership("user-123") == PRO
+
+    cache.set_many.assert_not_awaited()
+    cache.set.assert_awaited_once_with(
+        "platform_membership:unreachable:user-123", True, ttl=15
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_paused_user_is_not_asked_again():
+    """A down or hanging platform is asked once per user per pause, not on
+    every request, and the pause does not change what the user is told."""
+    mock_client = AsyncMock()
+    cache = _mock_cache(None, last_known=PRO, paused=True)
+
+    with _platform(mock_client, cache):
+        from src.server.dependencies.usage_limits import _fetch_platform_membership
+
+        assert await _fetch_platform_membership("user-123") == PRO
+
+    mock_client.post.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_a_paused_user_with_nothing_on_record_is_unknown():
+    mock_client = AsyncMock()
+    cache = _mock_cache(None, paused=True)
+
+    with _platform(mock_client, cache):
+        from src.server.dependencies.usage_limits import (
+            _fetch_platform_tier,
+            get_platform_access_tier,
+        )
+
+        assert await _fetch_platform_tier("user-123") is None
+        # Plan gates read unknown as no plan: a feature lost for the outage.
+        assert await get_platform_access_tier("user-123") is None
+
+    mock_client.post.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_refresh_asks_past_the_cache_and_the_pause():
+    """Redeeming an invitation has to show the new plan at once."""
+    mock_client = AsyncMock()
+    mock_client.post = AsyncMock(
+        return_value=httpx.Response(200, json={"valid": True, "access_tier": 3})
+    )
+    cache = _mock_cache(PRO, last_known=PRO, paused=True)
+
+    with _platform(mock_client, cache):
+        from src.server.dependencies.usage_limits import _fetch_platform_membership
+
+        result = await _fetch_platform_membership("user-123", refresh=True)
+
+    assert result["access_tier"] == 3
+    mock_client.post.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_a_failed_refresh_does_not_keep_the_plan_it_replaces():
+    """The 5-minute entry goes even when the ask fails, so once the pause runs
+    out the next request asks again rather than reading the old plan back."""
+    mock_client = AsyncMock()
+    mock_client.post = AsyncMock(side_effect=httpx.ConnectError("refused"))
+    cache = _mock_cache(PRO, last_known=PRO)
+
+    with _platform(mock_client, cache):
+        from src.server.dependencies.usage_limits import _fetch_platform_membership
+
+        assert await _fetch_platform_membership("user-123", refresh=True) == PRO
+
+    cache.delete.assert_awaited_once_with("platform_membership:user-123")
+
+
+@pytest.mark.asyncio
+async def test_a_refusal_asks_past_the_cache_and_leaves_it_in_place():
+    """A plan bought minutes ago must count, and the cached plan must stay for
+    the user's other reads while the ask is out, or each would ask too."""
+    mock_client = AsyncMock()
+    mock_client.post = AsyncMock(
+        return_value=httpx.Response(200, json={"valid": True, "access_tier": 3})
+    )
+    cache = _mock_cache(PRO, last_known=PRO)
+
+    with _platform(mock_client, cache):
+        from src.server.dependencies.usage_limits import _fetch_platform_tier
+
+        assert await _fetch_platform_tier("user-123", recheck=True) == 3
+
+    mock_client.post.assert_awaited_once()
+    cache.delete.assert_not_awaited()
+    cache.set_many.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_a_refusal_during_the_outage_pause_takes_the_last_known_plan():
+    """A client retrying a refused model must not reach a platform that has
+    just failed to answer: the pause holds for a refusal too."""
+    mock_client = AsyncMock()
+    cache = _mock_cache(PRO, last_known=PRO, paused=True)
+
+    with _platform(mock_client, cache):
+        from src.server.dependencies.usage_limits import _fetch_platform_tier
+
+        assert await _fetch_platform_tier("user-123", recheck=True) == 2
+
+    mock_client.post.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_an_entry_without_a_last_known_record_seeds_one():
+    """An older worker's entry carries no last-known record; without one, its
+    expiry during an outage would leave the user with no plan on record."""
+    mock_client = AsyncMock()
+    cache = _mock_cache(PRO)
+
+    with _platform(mock_client, cache):
+        from src.server.dependencies.usage_limits import _fetch_platform_membership
+
+        assert await _fetch_platform_membership("user-123") == PRO
+
+    cache.set.assert_awaited_once_with(
+        "platform_membership:last_known:user-123", PRO, ttl=30 * 24 * 3600
+    )
+    mock_client.post.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_a_cached_no_plan_seeds_nothing():
+    """An older worker caches -1 for a failed ask too, which is no answer."""
+    cache = _mock_cache({"access_tier": -1, "plan_display_name": None})
+
+    with _platform(AsyncMock(), cache):
+        from src.server.dependencies.usage_limits import _fetch_platform_membership
+
+        await _fetch_platform_membership("user-123")
+
+    cache.set.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -913,6 +1122,8 @@ async def _prefs_endpoint(stored_model_preference=None):
         {"prompt_guidance": "verbose"},
         {"compaction_profile": "enormous"},
         {"profiles": {"some-model": {"fast_mode": "yes"}}},
+        {"native_compaction": "on"},
+        {"profiles": {"some-model": {"native_compaction": "on"}}},
     ],
 )
 @pytest.mark.asyncio
@@ -1223,7 +1434,6 @@ async def test_a_non_boolean_subagents_default_is_rejected(client, value):
     upsert.assert_not_awaited()
 
 
-# ---------------------------------------------------------------------------
 # PUT /users/me/preferences: Dalton model_preference keys validation
 # DALTON-HOOK(settings-section): test Dalton model_preference validation with create_autospec
 # ---------------------------------------------------------------------------
@@ -1377,4 +1587,197 @@ async def test_dalton_stored_legacy_custom_value_does_not_block_unrelated_prefer
     upsert.assert_awaited_once()
 
 
+# PUT /users/me/preferences: the structured profile
+# ---------------------------------------------------------------------------
 
+
+@asynccontextmanager
+async def _profile_endpoint(stored=None, read_before_lock=None):
+    """The preferences PUT with ``stored`` as the row read under the profile
+    lock (the one the structured keys are checked against) and
+    ``read_before_lock`` as the earlier unlocked read, yielding the upsert,
+    the completion check, and the unlocked read."""
+    upsert = AsyncMock(return_value=_prefs())
+    read = AsyncMock(return_value=read_before_lock)
+    with (
+        patch(f"{DB}.db_get_user", new_callable=AsyncMock, return_value=_user()),
+        patch(f"{DB}.db_get_user_preferences", new=read),
+        patch(f"{DB}.db_lock_user_preferences", new_callable=AsyncMock, return_value=stored),
+        patch(f"{DB}.upsert_user_preferences", new=upsert),
+        patch(f"{DB}.maybe_complete_onboarding", new_callable=AsyncMock) as complete,
+    ):
+        yield upsert, complete, read
+
+
+@pytest.mark.asyncio
+async def test_the_profile_form_is_saved_in_its_stored_spelling_and_completes_onboarding(client):
+    """What is saved is what the check hands back, not what was sent. The
+    rules themselves are pinned in ``tests/unit/server/models/
+    test_structured_preferences.py``."""
+    async with _profile_endpoint() as (upsert, complete, _read):
+        resp = await client.put(
+            "/api/v1/users/me/preferences",
+            json={
+                "risk_preference": {"risk_level": "Moderate"},
+                "investment_preference": {"markets": ["us", "HK", "us"], "sectors": ["Real Estate"]},
+                "agent_preference": {"research_depth": "Light", "output_format": "HTML", "tone": "terse"},
+            },
+        )
+
+    assert resp.status_code == 200
+    assert upsert.await_args.kwargs["risk_preference"] == {"risk_level": "moderate"}
+    assert upsert.await_args.kwargs["investment_preference"] == {
+        "markets": ["us", "hk"],
+        "sectors": ["real_estate"],
+    }
+    assert upsert.await_args.kwargs["agent_preference"] == {
+        "research_depth": "light",
+        "output_format": "html",
+        "tone": "terse",
+    }
+    complete.assert_awaited_once_with("test-user-123")
+
+
+@pytest.mark.asyncio
+async def test_every_bad_value_is_named_in_one_422(client):
+    async with _profile_endpoint() as (upsert, complete, _read):
+        resp = await client.put(
+            "/api/v1/users/me/preferences",
+            json={
+                "risk_preference": {"risk_level": "yolo"},
+                "investment_preference": {"markets": ["uk"], "horizon": "decades"},
+                "agent_preference": {"proactivity": "always"},
+            },
+        )
+
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail.startswith("risk_preference.risk_level: ")
+    for path in (
+        "risk_preference.risk_level",
+        "investment_preference.markets[0]",
+        "investment_preference.horizon",
+        "agent_preference.proactivity",
+    ):
+        assert path in detail
+    upsert.assert_not_awaited()
+    complete.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_null_reaches_the_merge_as_a_deletion(client):
+    async with _profile_endpoint() as (upsert, _complete, _read):
+        resp = await client.put(
+            "/api/v1/users/me/preferences",
+            json={
+                "risk_preference": {"risk_level": None},
+                "investment_preference": {"markets": None, "sectors": None},
+                "agent_preference": {"deliverable": None, "proactivity": None},
+            },
+        )
+
+    assert resp.status_code == 200
+    assert upsert.await_args.kwargs["risk_preference"] == {"risk_level": None}
+    assert upsert.await_args.kwargs["investment_preference"] == {"markets": None, "sectors": None}
+    assert upsert.await_args.kwargs["agent_preference"] == {"deliverable": None, "proactivity": None}
+
+
+@pytest.mark.asyncio
+async def test_output_format_is_checked_with_the_structured_keys(client):
+    """Settings' switch sends ``html``, or null to go back to markdown; any
+    other value is a 422 like every structured key's."""
+    async with _profile_endpoint() as (upsert, _complete, _read):
+        resp = await client.put(
+            "/api/v1/users/me/preferences",
+            json={"agent_preference": {"research_depth": "thorough", "output_format": "pdf"}},
+        )
+
+    assert resp.status_code == 422
+    assert resp.json()["detail"].startswith("agent_preference.output_format: 'pdf' is not one of")
+    upsert.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_value_the_row_already_holds_passes_whatever_it_is(client):
+    """``horizon`` was free text before it had a vocabulary; a form that sends
+    the stored value back unchanged must not be refused for it."""
+    stored = {"investment_preference": {"horizon": "long_term", "sectors": ["Tech & AI"]}}
+    async with _profile_endpoint(stored) as (upsert, _complete, _read):
+        resp = await client.put(
+            "/api/v1/users/me/preferences",
+            json={
+                "investment_preference": {
+                    "horizon": "long_term",
+                    "sectors": ["Tech & AI"],
+                    "markets": ["us"],
+                }
+            },
+        )
+
+    assert resp.status_code == 200
+    assert upsert.await_args.kwargs["investment_preference"] == {
+        "horizon": "long_term",
+        "sectors": ["Tech & AI"],
+        "markets": ["us"],
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_value_the_row_held_only_before_the_lock_is_checked_again(client):
+    """Another write can replace the row between the unlocked read and the
+    lock. The unchanged-value exemption holds against the locked row only, so
+    the stale ``long_term`` must not be written back over a newer valid one."""
+    before_lock = {"investment_preference": {"horizon": "long_term"}}
+    under_lock = {"investment_preference": {"horizon": "years"}}
+    async with _profile_endpoint(under_lock, read_before_lock=before_lock) as (upsert, complete, _read):
+        resp = await client.put(
+            "/api/v1/users/me/preferences",
+            json={"investment_preference": {"horizon": "long_term"}},
+        )
+
+    assert resp.status_code == 422
+    assert resp.json()["detail"].startswith("investment_preference.horizon: ")
+    upsert.assert_not_awaited()
+    complete.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_free_text_keys_pass_untouched_without_a_read(client):
+    async with _profile_endpoint() as (upsert, _complete, read):
+        resp = await client.put(
+            "/api/v1/users/me/preferences",
+            json={
+                "risk_preference": {"risk_level": None, "risk_tolerance": "Whatever I like", "tolerance": 7},
+                "investment_preference": {"holding_period": "a few years"},
+                "agent_preference": {"output_format": None, "tone": "terse"},
+            },
+        )
+
+    assert resp.status_code == 200
+    assert upsert.await_args.kwargs["risk_preference"] == {
+        "risk_level": None,
+        "risk_tolerance": "Whatever I like",
+        "tolerance": 7,
+    }
+    assert upsert.await_args.kwargs["agent_preference"] == {"output_format": None, "tone": "terse"}
+    # A null sets no structured key, so there is nothing to check it against.
+    read.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_users_me_reports_when_the_account_was_created(client):
+    """The web's new-user rule reads it."""
+    created = datetime(2026, 10, 1, 12, 0, tzinfo=timezone.utc)
+    result = {"user": _user(created_at=created), "preferences": None}
+    with (
+        patch(f"{DB}.get_user_with_preferences", new_callable=AsyncMock, return_value=result),
+        patch(
+            "src.server.dependencies.usage_limits._fetch_platform_membership",
+            new_callable=AsyncMock,
+            return_value={},
+        ),
+    ):
+        resp = await client.get("/api/v1/users/me")
+
+    assert resp.status_code == 200
+    assert resp.json()["user"]["created_at"] == "2026-10-01T12:00:00Z"

@@ -4,13 +4,18 @@ One file of the ComputerManager split; see the package __init__."""
 
 import asyncio
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import datetime
 from typing import Any, Dict, Optional
 from uuid import uuid4
 
+from ptc_agent.core.sandbox.providers import (
+    PROVIDER_KINDS,
+    may_be_primary,
+    provider_class,
+)
 from ptc_agent.core.sandbox.runtime import SandboxGoneError, SandboxTransientError
 from ptc_agent.core.session import Session, SessionManager
 
@@ -18,16 +23,12 @@ from ptc_agent.core.session import Session, SessionManager
 from src.server.database.computer import (
     computer_advisory_key,
     computer_capacity_lock,
-    clear_computer_retirement_pending,
     create_computer,
-    default_computer_name,
-    get_retirement_pending_computers,
     get_computer,
     get_computer_by_provider_ref,
     get_computer_for_workspace,
     get_computers_for_user,
     get_primary_computer,
-    mark_computer_retirement_pending,
     try_bind_computer_provider_ref,
     try_claim_computer_for_start,
     touch_computer_starting,
@@ -45,8 +46,14 @@ from src.server.database.workspace import (
     WorkspaceDirNameTaken,
 )
 from src.server.models.computer import CLAIMABLE_FOR_START, ComputerStatus
+from src.server.services.computer_start_failure import record_start_failure
+from src.server.services.computer_errors import (
+    ProviderNotOffered,
+    UnknownResourceTier,
+)
 from src.server.services.user_skills import sandbox_skill_sync_params
 from src.server.services.workspace_status_pubsub import (
+    publish_computer_status_change,
     publish_workspace_binding_change,
 )
 
@@ -58,6 +65,31 @@ from src.server.services.computer_manager._types import (
 )
 
 logger = logging.getLogger(__name__)
+
+# A first Home bind that lost to a flip of the primary reads the new one; a
+# second flip in that window is the user's own, and the next turn retries.
+_HOME_BIND_ATTEMPTS = 3
+
+def default_computer_name(kind: str) -> str:
+    return provider_class(kind).default_computer_name
+
+
+def next_default_computer_name(
+    kind: str, taken: Iterable[Optional[str]], *, base: Optional[str] = None
+) -> str:
+    """The kind's default name, or ``base``, numbered past the names in ``taken``.
+
+    Two kinds share "Cloud computer", so a user's second machine would
+    otherwise read the same as their first in every picker.
+    """
+    base = base or default_computer_name(kind)
+    used = {name.casefold() for name in taken if name}
+    if base.casefold() not in used:
+        return base
+    number = 2
+    while f"{base} {number}".casefold() in used:
+        number += 1
+    return f"{base} {number}"
 
 
 class MachineLifecycleMixin:
@@ -93,19 +125,59 @@ class MachineLifecycleMixin:
         self,
         user_id: str,
         *,
+        kind: Optional[str] = None,
         name: Optional[str] = None,
         resource_tier: Optional[str] = None,
         is_primary: bool = False,
+        prepare: bool = False,
+        provider_config: Optional[Dict[str, Any]] = None,
+        config: Optional[Dict[str, Any]] = None,
+        root_dir: Optional[str] = None,
+        default_name: Optional[str] = None,
+        files_backup: bool = True,
     ) -> Dict[str, Any]:
-        """Creation stays stopped and unprovisioned so billing begins only on start."""
+        """Stopped and unprovisioned unless ``prepare``, so billing begins only on start.
+
+        ``prepare`` inserts it as ``creating`` for a start the caller schedules
+        at once. That status already holds a running slot, which the start then
+        claims without asking again, so the caller has checked the limit.
+        A machine keeps its provider for life, so ``kind`` (the deployment's
+        when None) is checked before the row exists. Without a
+        ``resource_tier`` it is created at "standard", which a provider that
+        lacks it resolves to its default size. ``provider_config`` holds the
+        machine's own settings over the kind's (an ssh computer's target), and
+        is validated here so a bad one never reaches a row; ``config`` is the
+        row's own facts, which no provider reads (an ssh Mac's model name);
+        ``default_name`` is what an unnamed machine is called before numbering.
+
+        Raises:
+            ProviderNotOffered: ``kind`` is not one a new computer may run on.
+            UnknownResourceTier: ``kind`` declares no ``resource_tier``.
+        """
+        kind = kind or self.config.sandbox.provider
+        if kind not in self.config.sandbox.creatable_providers():
+            raise ProviderNotOffered("Provider not offered")
+        if resource_tier is not None or provider_config:
+            settings = self._provider_settings(kind, provider_config)
+            if resource_tier is not None and resource_tier not in settings.resource_tiers:
+                raise UnknownResourceTier("Unknown resource tier")
+        if not name:
+            name = next_default_computer_name(
+                kind,
+                (c.get("name") for c in await get_computers_for_user(user_id)),
+                base=default_name,
+            )
         return await create_computer(
             user_id,
-            kind=self.config.sandbox.provider,
-            name=name or default_computer_name(self.config.sandbox.provider),
-            is_primary=is_primary,
-            status="stopped",
+            kind=kind,
+            name=name,
+            is_primary=is_primary and may_be_primary(kind),
+            status=ComputerStatus.CREATING if prepare else ComputerStatus.STOPPED,
             resource_tier=resource_tier or "standard",
-            root_dir=self.config.filesystem.working_directory,
+            root_dir=root_dir or self.config.filesystem.working_directory,
+            provider_config=provider_config,
+            config=config,
+            files_backup=files_backup,
         )
 
     async def ensure_primary_computer(
@@ -157,18 +229,25 @@ class MachineLifecycleMixin:
             return computer
         home = await db_get_workspace(home_id)
         if home is not None:
-            primary = await self.ensure_primary_computer(user_id)
-            bound = await self._place_on_computer(
-                home_id,
-                primary,
-                held_folder=home.get("dir_name"),
-                name=HOME_FOLDER,
-                expected_computer_id=home.get("computer_id"),
-            )
-            if bound is not None:
-                await publish_workspace_binding_change(
-                    home_id, str(bound["status"]), str(primary["computer_id"])
+            # The bind takes only a computer still primary, so a primary
+            # flipped since it was read sends this round again for the new one.
+            for _ in range(_HOME_BIND_ATTEMPTS):
+                primary = await self.ensure_primary_computer(user_id)
+                bound = await self._place_on_computer(
+                    home_id,
+                    primary,
+                    held_folder=home.get("dir_name"),
+                    name=HOME_FOLDER,
+                    expected_computer_id=home.get("computer_id"),
+                    primary_only=True,
                 )
+                if bound is not None:
+                    await publish_workspace_binding_change(
+                        home_id, str(bound["status"]), str(primary["computer_id"])
+                    )
+                    break
+                if await get_computer_for_workspace(home_id) is not None:
+                    break
         # A losing bind re-reads the winner's.
         computer = await get_computer_for_workspace(home_id)
         if computer is None:
@@ -183,6 +262,7 @@ class MachineLifecycleMixin:
         held_folder: Optional[str],
         name: Optional[str],
         expected_computer_id: Optional[str],
+        primary_only: bool = False,
     ) -> Optional[Dict[str, Any]]:
         """Bind a project to the folder it holds, else the first free spelling of ``name``.
 
@@ -208,6 +288,7 @@ class MachineLifecycleMixin:
                         computer_id,
                         expected_computer_id=expected_computer_id,
                         dir_name=dir_name,
+                        primary_only=primary_only,
                         conn=conn,
                     )
                 except WorkspaceDirNameTaken:
@@ -241,7 +322,7 @@ class MachineLifecycleMixin:
         kind = config.get("sandbox_provider")
         if kind is None:
             kind = self.config.sandbox.provider
-        if kind not in ("daytona", "docker"):
+        if kind not in PROVIDER_KINDS:
             raise ValueError(f"Unknown persisted sandbox provider: {kind!r}")
         root_dir = config.get("sandbox_working_dir") or self.config.filesystem.working_directory
         sandbox_id = workspace.get("sandbox_id")
@@ -278,11 +359,13 @@ class MachineLifecycleMixin:
                 else "stopped",
                 provider_ref=adopt_ref,
                 resource_tier=workspace.get("resource_tier") or "standard",
-                is_always_on=bool(workspace.get("is_always_on")),
+                # A kind that caps a sandbox's run cannot hold the flag.
+                is_always_on=bool(workspace.get("is_always_on"))
+                and provider_class(kind).holds_always_on,
                 platform_secret_version=int(
                     workspace.get("platform_secret_version") or 0
                 ),
-                is_primary=True,
+                is_primary=may_be_primary(kind),
                 root_dir=root_dir,
                 computer_id=candidate_id,
                 origin_workspace_id=workspace_id if adopt_ref else None,
@@ -386,137 +469,12 @@ class MachineLifecycleMixin:
                         f"lock on computer {computer_id}: {e}"
                     )
 
-    async def _retire_machine_if_empty(
-        self, computer_id: str, workspace_id: str, workspace: Dict[str, Any]
-    ) -> bool:
-        """Check emptiness under the machine advisory key after project tombstoning.
-
-        Otherwise concurrent last-project deletes could both see a sibling and
-        leave the machine alive. Keep empty primaries for future projects to reuse
-        their sandbox and disk; only final retirement tombstones the machine."""
-        # The project is already tombstoned. Record the remaining cleanup before
-        # attempting the contended lock so a process exit or timeout cannot turn
-        # this into an indefinitely billed empty machine. Explicitly created bare
-        # computers carry no marker and are not swept.
-        try:
-            await mark_computer_retirement_pending(computer_id)
-            async with self._machine_decision_lock(computer_id) as locked:
-                computer = await get_computer(computer_id)
-                if computer is None:
-                    logger.info(
-                        f"Computer {computer_id} is already retired; nothing "
-                        "left to tear down"
-                    )
-                    return False
-                if locked:
-                    if await self._machine_is_finished(computer_id, computer):
-                        claimed = await update_computer_status(
-                            computer_id,
-                            ComputerStatus.STOPPING,
-                            expected=computer["status"],
-                        )
-                        if claimed is None:
-                            return False
-                        await self._teardown_machine(
-                            self._binding_from_computer(workspace_id, claimed)
-                        )
-                        return (
-                            await update_computer_status(
-                                computer_id,
-                                ComputerStatus.DELETED,
-                                expected=ComputerStatus.STOPPING,
-                            )
-                            is not None
-                        )
-                    await clear_computer_retirement_pending(computer_id)
-                # The shared machine survives; remove only the departing project's folder.
-                await self._remove_workspace_folder(workspace_id, workspace, computer)
-                return False
-        except Exception as e:
-            # The project is already unlinked; do not fail its completed delete.
-            # Start paths can reconcile a machine left running behind its live row.
-            logger.warning(
-                f"Could not settle computer {computer_id} after deleting "
-                f"workspace {workspace_id}: {e}"
-            )
-            return False
-
-    async def reap_retirement_pending_computers(self) -> int:
-        """Settle every delete-time retirement decision that lost its lock."""
-        retired = 0
-        for candidate in await get_retirement_pending_computers(limit=1000):
-            computer_id = str(candidate["computer_id"])
-            settled = False
-            try:
-                async with self._machine_decision_lock(computer_id) as locked:
-                    if not locked:
-                        continue
-                    computer = await get_computer(computer_id)
-                    if computer is None:
-                        settled = True
-                        continue
-                    if not await self._machine_is_finished(computer_id, computer):
-                        await clear_computer_retirement_pending(computer_id)
-                        settled = True
-                        continue
-                    claimed = await update_computer_status(
-                        computer_id,
-                        ComputerStatus.STOPPING,
-                        expected=computer["status"],
-                    )
-                    if claimed is None:
-                        continue
-                    await self._teardown_machine(
-                        self._binding_from_computer("", claimed)
-                    )
-                    if await update_computer_status(
-                        computer_id,
-                        ComputerStatus.DELETED,
-                        expected=ComputerStatus.STOPPING,
-                    ) is not None:
-                        retired += 1
-                        settled = True
-            except Exception as e:
-                logger.warning(
-                    "Could not retire empty computer %s during cleanup: %s",
-                    computer_id,
-                    e,
-                )
-            finally:
-                if not settled:
-                    # Move a contended or failed candidate behind newer work.
-                    # Otherwise the same 1,000 rows can monopolize every sweep.
-                    try:
-                        await mark_computer_retirement_pending(computer_id)
-                    except Exception as e:
-                        logger.warning(
-                            "Could not defer empty computer %s after a failed "
-                            "retirement attempt: %s",
-                            computer_id,
-                            e,
-                        )
-        return retired
-
-    @staticmethod
-    async def _machine_is_finished(computer_id: str, computer: Dict[str, Any]) -> bool:
-        """The caller must hold the machine advisory key to serialize delete decisions."""
-        remaining = await get_live_workspace_ids_for_computer(computer_id)
-        if remaining:
-            logger.info(
-                f"Computer {computer_id} still carries {len(remaining)} "
-                "live workspace(s); leaving it in place"
-            )
-            return False
-        if computer.get("is_primary"):
-            logger.info(
-                f"Computer {computer_id} is the user's primary and is kept "
-                "with no project on it; the next one joins this machine"
-            )
-            return False
-        return True
-
     async def _claim_machine_for_stop(
-        self, computer_id: str, *, unchanged_since: datetime | None = None
+        self,
+        computer_id: str,
+        *,
+        unchanged_since: datetime | None = None,
+        reason: str | None = None,
     ) -> Optional[Dict[str, Any]]:
         """Whoever wins running -> stopping owns the teardown; losing is not an error.
 
@@ -544,6 +502,7 @@ class MachineLifecycleMixin:
             ComputerStatus.STOPPING,
             expected=ComputerStatus.RUNNING,
             updated_before=unchanged_since,
+            run_end_reason=reason,
         )
         if claimed is None:
             logger.info(
@@ -557,6 +516,7 @@ class MachineLifecycleMixin:
         if status == ComputerStatus.STOPPED:
             # While the row still reads 'stopping', so no start can have minted
             # a token this would end.
+            await self._revoke_data_token(computer_id)
             await self._revoke_livefs(computer_id)
         if (
             await update_computer_status(computer_id, status, expected="stopping")
@@ -609,6 +569,10 @@ class MachineLifecycleMixin:
             return None
         if self._session_sandbox_id(session) != computer.get("provider_ref"):
             return None
+        # A reinstall or reconnect another worker ran keeps the ref.
+        binding = self._binding_from_computer("", computer)
+        if self._machine_target_is_stale(binding, session) is not None:
+            return None
         return session
 
     async def _sync_machine_assets(
@@ -628,17 +592,14 @@ class MachineLifecycleMixin:
         if sandbox is None:
             return
         skill_dirs = (
-            self.config.skills.local_skill_dirs_with_sandbox()
+            self.config.skills.local_skill_dirs()
             if self.config.skills.enabled
             else None
         )
-        user_skill_params = await sandbox_skill_sync_params(
-            user_id, self.config.skills.sandbox_skills_base
-        )
+        user_skill_params = await sandbox_skill_sync_params(user_id)
         result = await sandbox.sync_sandbox_assets(
             skill_dirs=skill_dirs,
             reusing_sandbox=reusing_sandbox,
-            user_id=user_id,
             workspace_dir_names=await get_workspace_dir_names_for_computer(computer_id),
             root_owner_dir_name=await self._root_owner_folder(
                 computer_id, origin_workspace_id
@@ -669,7 +630,9 @@ class MachineLifecycleMixin:
         core_config = self._core_config_for(binding)
         previous_ref = binding.provider_ref
         reconnected = previous_ref is not None
-        tier_lapsed = reconnected and (computer.get("resource_tier") or tier) != tier
+        tier_lapsed = (
+            reconnected and (computer.get("resource_tier") or tier) != tier
+        )
 
         def _handle() -> Session:
             return SessionManager.get_session(
@@ -706,7 +669,9 @@ class MachineLifecycleMixin:
                     f"Computer {computer_id} lost its tier entitlement; "
                     f"replacing sandbox {previous_ref} at tier {tier!r}"
                 )
+                await self._fold_usage_before_delete(computer_id)
                 await self._destroy_sandbox(previous_ref, binding=binding)
+                await self._end_replaced_usage_run(computer_id, previous_ref)
                 reconnected = False
             if reconnected:
                 try:
@@ -723,9 +688,15 @@ class MachineLifecycleMixin:
                     await self._clear_session(computer_id, evict_session=session)
                     session = _handle()
                     reconnected = False
+                else:
+                    # Whatever runs on the sandbox reads market data from here
+                    # (a paused sandbox resumes with its processes), and its
+                    # file still holds the token the stop revoked. The row
+                    # already names this sandbox, so the save's fence holds.
+                    await self._keep_data_token(computer_id, user_id, session.sandbox)
             if not reconnected:
+                await self._publish_build_stage(computer_id, "sandbox")
                 await session.initialize(
-                    user_id=user_id,
                     tier=tier,
                     auto_stop_minutes=0 if always_on else None,
                 )
@@ -736,6 +707,8 @@ class MachineLifecycleMixin:
                 raise RuntimeError(
                     f"Computer {computer_id} came up without a sandbox identity"
                 )
+            if not reconnected:
+                await self._publish_build_stage(computer_id, "tools")
             # The machine comes up to run code, so its first turn finds the
             # mount serving rather than starting it on the turn's path.
             await self._livefs_beside(
@@ -753,6 +726,7 @@ class MachineLifecycleMixin:
 
             restored_projects: list[ComputerBinding] = []
             if not reconnected:
+                await self._publish_build_stage(computer_id, "finishing")
                 # Nothing is on this disk yet, so renamed projects restore
                 # straight into the folder their name gives them.
                 await self._settle_folders(
@@ -777,7 +751,7 @@ class MachineLifecycleMixin:
 
                 # Certify before binding so no row can name an uncertified sandbox.
                 secret_version = await certify_platform_secrets(
-                    core_config, runtime=runtime
+                    core_config, runtime=runtime, kind=binding.kind
                 )
 
             # A toggle can land while the provider is starting. Apply the
@@ -842,17 +816,19 @@ class MachineLifecycleMixin:
                         f"{project_binding.workspace_id} after binding: {e}"
                     )
             if reconnected:
-                # The disk outlived the stop, but it still holds the threads
-                # deleted or gone idle meanwhile, and no worker's attach will
-                # look again: projects stay attached across a stop on the
-                # same sandbox. The bring-up job reconciles each one.
-                await self._queue_reconnect_syncs(computer_id, session.sandbox)
+                self._on_session_attached(computer_id, session, resumed=True)
             self._record_sync(computer_id)
+            if not reconnected:
+                # What starts with the machine (an always-on app) reads market
+                # data before any acquire writes a token. A built sandbox takes
+                # one only now, as the save is fenced on the row naming it.
+                await self._keep_data_token(computer_id, user_id, session.sandbox)
             await update_computer_activity(computer_id)
             logger.info(
                 f"Computer {computer_id} is running on sandbox {sandbox_id} "
                 f"({'reconnected' if reconnected else 'built'})"
             )
+            self._read_machine_facts_soon(computer_id, binding.kind, runtime)
             return session
         except (Exception, asyncio.CancelledError):
             if reconnected:
@@ -864,24 +840,31 @@ class MachineLifecycleMixin:
                 await self._clear_session(computer_id, evict_session=session)
             raise
 
-    async def _queue_reconnect_syncs(self, computer_id: str, sandbox: Any) -> None:
-        """Queue every project on a resumed sandbox; the restore step finds
-        nothing deferred on a warm disk, so each costs only its sync."""
-        for workspace_id in await get_live_workspace_ids_for_computer(computer_id):
-            self._queue_bring_up(
-                computer_id, workspace_id, sandbox, sandbox.working_dir, urgent=False
-            )
+    @staticmethod
+    async def _publish_build_stage(computer_id: str, stage: str) -> None:
+        """Name the step a new sandbox is on, for the client's progress line.
+
+        A hint on the status channel, never persisted; the row stays starting.
+        """
+        await publish_computer_status_change(
+            computer_id, ComputerStatus.STARTING, extra={"stage": stage}
+        )
 
     async def _revert_machine_start(self, computer_id: str) -> None:
         """CAS only from starting so failure cannot stop a machine another worker moved."""
         try:
-            await update_computer_status(
+            reverted = await update_computer_status(
                 computer_id, ComputerStatus.STOPPED, expected="starting"
             )
         except Exception:
             logger.exception(
                 f"Failed to revert computer {computer_id} after a failed start"
             )
+            return
+        if reverted is not None:
+            # A reconnect writes the token before the start can still fail, and
+            # the resumed sandbox is left running: stopped revokes, as a stop does.
+            await self._revoke_data_token(computer_id)
 
     async def _claim_start_with_capacity(
         self, computer_id: str, *, from_status: str,
@@ -897,6 +880,8 @@ class MachineLifecycleMixin:
         computer = await get_computer(computer_id)
         if computer is None:
             return None
+        if not provider_class(computer["kind"]).metered:
+            return await try_claim_computer_for_start(computer_id, from_status=from_status)
         async with computer_capacity_lock(computer["user_id"]) as conn:
             current = await get_computer(computer_id, conn=conn)
             if current is None or current["status"] != from_status:
@@ -907,6 +892,30 @@ class MachineLifecycleMixin:
             return await try_claim_computer_for_start(
                 computer_id, from_status=from_status, conn=conn,
             )
+
+    def _read_machine_facts_soon(self, computer_id: str, kind: str, runtime: Any) -> None:
+        """Read what a machine the user brings says of itself (its system and
+        hardware) and keep it for its details. Off the start's path, since only
+        the Computers dialog reads it; a failure keeps the last reading."""
+        from ptc_agent.core.sandbox.providers.ssh import MACHINE_FACTS_SCRIPT, read_machine
+        from src.server.database.computer import record_machine_facts
+        from src.server.services.ssh_computers import SSH_KIND, machine_config
+
+        if kind != SSH_KIND:
+            return
+
+        async def read() -> None:
+            try:
+                result = await runtime.exec(MACHINE_FACTS_SCRIPT, timeout=30)
+                model, machine = read_machine(result.stdout or "")
+                if machine:
+                    await record_machine_facts(computer_id, machine_config(model, machine))
+            except Exception as e:  # noqa: BLE001 - display data, never worth a start
+                logger.info(f"Could not read the machine facts of computer {computer_id}: {e}")
+
+        task = asyncio.create_task(read())
+        self._facts_tasks.add(task)
+        task.add_done_callback(self._facts_tasks.discard)
 
     async def _start_machine(
         self,
@@ -957,19 +966,44 @@ class MachineLifecycleMixin:
                 )
                 return None
 
-            try:
-                if on_start_claimed is not None:
-                    on_start_claimed()
-                async with self._computer_start_heartbeat(computer_id):
-                    return await self._build_machine_session(
-                        computer, user_id=user_id, on_state_observed=on_state_observed
-                    )
-            except (Exception, asyncio.CancelledError):
-                # CancelledError is a BaseException: a client dropping mid
-                # provision would otherwise leave the machine at 'starting'
-                # for every project on it until the reaper runs.
-                await asyncio.shield(self._revert_machine_start(computer_id))
-                raise
+            return await self._build_started_machine(
+                computer,
+                user_id=user_id,
+                on_state_observed=on_state_observed,
+                on_start_claimed=on_start_claimed,
+            )
+
+    async def _build_started_machine(
+        self,
+        computer: Dict[str, Any],
+        *,
+        user_id: str | None = None,
+        on_state_observed: Callable[[str], None] | None = None,
+        on_start_claimed: Callable[[], None] | None = None,
+    ) -> Session:
+        """Bring up a machine its caller claimed for start, or is reconnecting
+        to, under the machine lock the caller holds; a failure puts it back."""
+        computer_id = str(computer["computer_id"])
+        try:
+            if on_start_claimed is not None:
+                on_start_claimed()
+            async with self._computer_start_heartbeat(computer_id):
+                return await self._build_machine_session(
+                    computer, user_id=user_id, on_state_observed=on_state_observed
+                )
+        except (Exception, asyncio.CancelledError) as e:
+            # Recorded first, while the row is still this start's, so a
+            # client reading it on the stopped frame finds the reason. A
+            # cancel is a shutdown or a dropped client, not the machine's.
+            if not isinstance(e, asyncio.CancelledError):
+                await asyncio.shield(
+                    record_start_failure(computer_id, e, kind=computer["kind"])
+                )
+            # CancelledError is a BaseException: a client dropping mid
+            # provision would otherwise leave the machine at 'starting'
+            # for every project on it until the reaper runs.
+            await asyncio.shield(self._revert_machine_start(computer_id))
+            raise
 
     async def pick_for_user(
         self, user_id: str, *, workspace_id: str | None = None

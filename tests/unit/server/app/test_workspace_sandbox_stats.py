@@ -215,7 +215,7 @@ async def _get_stats(
     session, sandbox = _sandbox_with_metadata(meta, side_effect=side_effect)
     with (
         patch(
-            "src.server.app.workspace_files._shared.db_get_workspace",
+            "src.server.services.workspace_files.db_get_workspace",
             AsyncMock(return_value=workspace),
         ),
         patch(
@@ -332,7 +332,7 @@ async def test_workspace_without_a_sandbox_still_reports_provider(client):
 
     with (
         patch(
-            "src.server.app.workspace_files._shared.db_get_workspace",
+            "src.server.services.workspace_files.db_get_workspace",
             AsyncMock(return_value=workspace),
         ),
         patch(
@@ -389,7 +389,7 @@ async def _get_offline_stats(
 
     with (
         patch(
-            "src.server.app.workspace_files._shared.db_get_workspace",
+            "src.server.services.workspace_files.db_get_workspace",
             AsyncMock(return_value=workspace),
         ),
         patch(
@@ -475,7 +475,7 @@ async def test_no_sandbox_id_reports_workspace_status(client):
     workspace = _ws(status="creating", sandbox_id=None)
 
     with patch(
-        "src.server.app.workspace_files._shared.db_get_workspace",
+        "src.server.services.workspace_files.db_get_workspace",
         AsyncMock(return_value=workspace),
     ):
         resp = await client.get(
@@ -501,7 +501,7 @@ async def test_another_users_workspace_is_forbidden(client, status):
 
     with (
         patch(
-            "src.server.app.workspace_files._shared.db_get_workspace",
+            "src.server.services.workspace_files.db_get_workspace",
             AsyncMock(return_value=workspace),
         ),
         patch(
@@ -519,7 +519,7 @@ async def test_another_users_workspace_is_forbidden(client, status):
 @pytest.mark.asyncio
 async def test_missing_workspace_is_not_found(client):
     with patch(
-        "src.server.app.workspace_files._shared.db_get_workspace",
+        "src.server.services.workspace_files.db_get_workspace",
         AsyncMock(return_value=None),
     ):
         resp = await client.get(f"/api/v1/workspaces/{uuid.uuid4()}/sandbox/stats")

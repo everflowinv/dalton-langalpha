@@ -82,10 +82,11 @@ function toAppUrl(raw, currentUrl) {
 // shell opens the same callback page on the console's origin in its own
 // window, where the console finishes it.
 //
-// The one link whose host and path are read at all, and they still do not
-// choose where it goes. The shape is matched whole, the origin is always the
-// configured console, and the path is rebuilt from a kind named in `RETURNS`
-// and a name that can only be lowercase letters, digits and hyphens.
+// One of the two links whose host and path are read at all (a console page,
+// below, is the other), and they still do not choose where it goes. The shape
+// is matched whole, the origin is always the configured console, and the path
+// is rebuilt from a kind named in `RETURNS` and a name that can only be
+// lowercase letters, digits and hyphens.
 // ---------------------------------------------------------------------------
 
 const RETURN_HOST = 'integrations'
@@ -113,47 +114,127 @@ function parseOurs(raw) {
 
 /** The kind and name of a link addressed to an integration return, or null for any other link. */
 function returnSegments(parsed) {
-  if (!parsed || parsed.host !== RETURN_HOST) return null
+  if (parsed.host !== RETURN_HOST) return null
   const match = RETURN_PATH.exec(parsed.pathname)
   return match && RETURNS.has(match[1]) ? { kind: match[1], name: match[2] } : null
 }
 
 /**
- * Is this link addressed to an integration login or install? Asked before
- * `toAppUrl`, because the answer decides the window as well as the URL, and
- * because such a link must never fall through to `/callback`: that route would
- * try to redeem it as a sign-in.
- */
-function isIntegrationReturn(raw) {
-  return returnSegments(parseOurs(raw)) !== null
-}
-
-/**
- * Turn `langalpha://integrations/<kind>/<name>/callback?…` into the console's
+ * `langalpha://integrations/<kind>/<name>/callback?…` as the console's
  * `/integrations/<kind>/<name>/callback` with the same answer, where the kind
  * is `login` or `install`.
  *
- * Null means the link goes nowhere: an edition with no console has no page to
- * finish it on, a name outside the pattern is not one the console mints, and a
- * repeated parameter is refused whole, for the reason oauth.js gives: whatever
- * reads it takes one value, and a real provider never sends two.
+ * Null means the link goes nowhere: a name outside the pattern is not one the
+ * console mints, and `carry` refuses the rest.
  */
-function toIntegrationUrl(raw) {
-  const parsed = parseOurs(raw)
-  const segments = returnSegments(parsed)
+function integrationUrl(parsed, { kind, name }) {
+  if (!RETURN_NAME.test(name)) return null
+  return carry(parsed, `/integrations/${kind}/${name}/callback`, RETURNS.get(kind))
+}
+
+// ---------------------------------------------------------------------------
+// A console page asked to be shown again, handed back from the browser.
+//
+// The console sometimes sends the user to a third party's page in the system
+// browser, and that page returns to the console in the browser, which does not
+// hold the app's session either. The console page it lands on hands its query
+// back through the scheme, and the shell loads the console page the link names
+// in its own window, where the session is.
+//
+// Held tighter than an integration return. The path is matched whole against
+// `CONSOLE_PAGES` and never read past that, the origin is always the configured
+// console, and every value carried is one short token, because one of them says
+// where the console goes next and a token cannot be read as a path or an
+// address.
+// ---------------------------------------------------------------------------
+
+const CONSOLE_HOST = 'console'
+// Each console page a link may name, and the only parameters carried to it.
+// The key is the page's path on the console, and a link names a page only by
+// matching a key whole, so nothing else the link spells reaches the path. Each
+// key is an absolute path, one leading slash, so the URL built on it stays on
+// the console's origin.
+const CONSOLE_PAGES = new Map([
+  // Where the console lands the user back from a third party's page: where to
+  // go next, how it went, and the third party's id for the session it ran.
+  ['/desktop/return', new Set(['to', 'outcome', 'session_id'])],
+])
+// Every value carried to a console page. No slash, dot, colon, `%` or space,
+// so a value can never be read as a path, a host or something still encoded.
+const CONSOLE_VALUE = /^[A-Za-z0-9_-]{1,255}$/
+
+/**
+ * `langalpha://console/<page>?…` as that page on the console's origin, where
+ * the page is a key of `CONSOLE_PAGES`.
+ *
+ * Null means the link goes nowhere: a host that only reads as the console (a
+ * port, another case) is not the console's, a path that is not exactly a known
+ * page is not one the console sends, and `carry` refuses the rest, including a
+ * carried value outside `CONSOLE_VALUE`.
+ */
+function consolePageUrl(parsed) {
+  if (parsed.host !== CONSOLE_HOST) return null
+  const carried = CONSOLE_PAGES.get(parsed.pathname)
+  if (carried === undefined) return null
+  return carry(parsed, parsed.pathname, carried, CONSOLE_VALUE)
+}
+
+// ---------------------------------------------------------------------------
+// What every link addressed to the console shares.
+// ---------------------------------------------------------------------------
+
+/**
+ * The link's query, carried onto `path` on the configured console: the
+ * parameters in `allowed` and nothing else, so one the page does not carry is
+ * dropped rather than refused.
+ *
+ * Null means the link goes nowhere: an edition with no console has no page to
+ * open it on, and a repeated parameter is refused whole, for the reason
+ * oauth.js gives: whatever reads it takes one value, and a real provider never
+ * sends two. With a `valuePattern`, so is a carried value outside it.
+ */
+function carry(parsed, path, allowed, valuePattern = null) {
   const platform = origins.platformOrigin()
-  if (!platform || segments === null || !RETURN_NAME.test(segments.name)) return null
+  if (!platform) return null
 
   const names = [...parsed.searchParams.keys()]
   if (names.length !== new Set(names).size) return null
 
-  const { kind, name } = segments
-  const carried = RETURNS.get(kind)
-  const target = new URL(`/integrations/${kind}/${name}/callback`, platform)
+  const target = new URL(path, platform)
   for (const [key, value] of parsed.searchParams) {
-    if (carried.has(key)) target.searchParams.set(key, value)
+    if (!allowed.has(key)) continue
+    if (valuePattern && !valuePattern.test(value)) return null
+    target.searchParams.set(key, value)
   }
   return target.toString()
+}
+
+/**
+ * Where a link addressed to the console goes. Asked before `toAppUrl`, because
+ * the answer decides the window as well as the URL, and because such a link
+ * must never fall through to `/callback`: that route would try to redeem it as
+ * a sign-in.
+ *
+ * Null for any other link, which goes on to `toAppUrl`. Otherwise
+ * `{ kind, url }`, where `url` is the console page to open, or null when the
+ * link is recognised and refused:
+ *
+ * - `integration`: a login or install handed back, `integrations` host, its
+ *   shape matched whole and asked first.
+ * - `console`: a console page asked to be shown again, which is any link under
+ *   the `console` host whatever its path, so a page this build does not know is
+ *   refused rather than redeemed. Recognised more loosely than it is accepted:
+ *   a port or another case still reads as the console here, and is then
+ *   refused. Every link that looks like one is either opened exactly or
+ *   dropped, never redeemed.
+ */
+function toConsole(raw) {
+  const parsed = parseOurs(raw)
+  if (parsed === null) return null
+  const segments = returnSegments(parsed)
+  if (segments !== null) return { kind: 'integration', url: integrationUrl(parsed, segments) }
+  if (parsed.hostname.toLowerCase() === CONSOLE_HOST) return { kind: 'console', url: consolePageUrl(parsed) }
+  return null
 }
 
 /**
@@ -192,4 +273,4 @@ function init() {
   accept(fromArgv(process.argv))
 }
 
-module.exports = { SCHEME, init, attach, toAppUrl, fromArgv, isIntegrationReturn, toIntegrationUrl }
+module.exports = { SCHEME, init, attach, toAppUrl, fromArgv, toConsole }

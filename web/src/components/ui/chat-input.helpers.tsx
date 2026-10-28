@@ -1,6 +1,8 @@
 import { Bot, HardDriveDownload, Shrink, Terminal } from 'lucide-react';
 import type { SlashCommand } from './chat-input.types';
 import type { ModelMetadataEntry } from '@/hooks/useFilteredModels';
+import { TWEEN } from '@/lib/motion';
+import type { MentionedFile } from './chat-input.types';
 
 /** Return the appropriate icon for a slash command. */
 export function getSlashCommandIcon(cmd: SlashCommand, className: string) {
@@ -8,6 +10,42 @@ export function getSlashCommandIcon(cmd: SlashCommand, className: string) {
   if (cmd.name === 'offload') return <HardDriveDownload className={className} />;
   if (cmd.type === 'action') return <Shrink className={className} />;
   return <Terminal className={className} />;
+}
+
+/* --- MOTION ---
+ * What the composer adds and takes away, as framer props on the motion
+ * tokens. Opacity and transform only: nothing here tweens a height or a
+ * width, so a row reflows once, when a chip arrives or after it has gone. */
+
+/** A chip or pill joining the draft, and leaving it. */
+export const CHIP_PRESENCE = {
+  initial: { opacity: 0, scale: 0.95 },
+  animate: { opacity: 1, scale: 1, transition: TWEEN.quick },
+  exit: { opacity: 0, scale: 0.95, transition: TWEEN.exit },
+};
+
+/** The slash and @mention menus. They open above the composer, so this is
+ *  `.pop-in[data-side='top']` (styles/animations.css) in framer, which keeps
+ *  the list a menu last showed on screen through its exit. */
+export const MENU_PRESENCE = {
+  initial: { opacity: 0, y: 8, scale: 0.95 },
+  animate: { opacity: 1, y: 0, scale: 1, transition: TWEEN.quick },
+  exit: { opacity: 0, scale: 0.95, transition: TWEEN.exit },
+};
+
+/**
+ * A stable key per pill. Removing a pill must not rename the ones after it,
+ * or each would leave and arrive again; two pills alike in every field the
+ * draft can tell apart are numbered in order.
+ */
+export function mentionPillKeys(files: MentionedFile[]): string[] {
+  const seen = new Map<string, number>();
+  return files.map((f) => {
+    const base = [f.path, f.label, f.locator, f.source, f.lineStart, f.lineEnd, f.snippet?.length].join('::');
+    const n = seen.get(base) ?? 0;
+    seen.set(base, n + 1);
+    return n ? `${base}::${n}` : base;
+  });
 }
 
 /* --- CONSTANTS --- */

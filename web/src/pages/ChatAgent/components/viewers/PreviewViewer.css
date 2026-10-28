@@ -66,12 +66,17 @@
   background: transparent;
   color: var(--color-text-tertiary);
   cursor: pointer;
-  transition: all 0.15s;
+  transition: all var(--motion-quick) var(--ease-out);
 }
 
-.preview-viewer-btn:hover {
+.preview-viewer-btn:hover:not(:disabled) {
   color: var(--color-text-primary);
   background: var(--color-border-muted);
+}
+
+.preview-viewer-btn:disabled {
+  opacity: 0.3;
+  cursor: not-allowed;
 }
 
 .preview-viewer-frame {

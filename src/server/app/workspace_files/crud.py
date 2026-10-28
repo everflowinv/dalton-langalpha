@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import logging
 import shlex
+import time
 from contextlib import AsyncExitStack
 from dataclasses import asdict
 from datetime import UTC, datetime
@@ -24,13 +25,14 @@ from ptc_agent.core.paths import logged_path
 from src.server.utils.uploads import read_capped
 from src.utils.storage import is_storage_enabled
 from src.server.utils.error_sanitization import (
-    sandbox_unreachable_detail,
+    sandbox_failure_http,
     single_line,
 )
 from src.server.utils.http_headers import content_disposition
 from fastapi.responses import Response, StreamingResponse
 
 from src.server.database.home_workspace import is_unbound
+from src.server.database.computer import get_computer
 from src.server.database.workspace import get_workspace as db_get_workspace
 from src.server.services.workspace_manager import WorkspaceManager
 from src.server.services.persistence.file import FilePersistenceService
@@ -54,15 +56,30 @@ from .file_refs import (
 )
 from src.server.models.workspace import served_from_mirror
 
-from ._containment import (
+from src.server.services.workspace_file_containment import (
+    UTF8_SNIFF_BYTES,
+    FileChangedWhileRead,
     FileTooLargeToServe,
     contained_absolute_path,
     contained_sandbox_paths,
     contained_listing_path,
     contained_sandbox_path,
     is_within,
+    normalize_requested_path,
     read_contained_sandbox_file,
+    read_contained_sandbox_range,
 )
+from src.server.services.workspace_files import (
+    HOME_NOT_ON_COMPUTER_REASON,
+    acquire_sandbox_to_change,
+    contained_target,
+    not_running_for_upload,
+    owned_workspace_on_computer,
+    owner_layout,
+    previous_dir_names_of,
+    record_fs_bytes,
+)
+
 from ._shared import (
     held_bytes_budget,
     streamed_download_budget,
@@ -72,30 +89,29 @@ from ._shared import (
     _is_utf8,
     MAX_UPLOAD_BYTES,
     _CACHEABLE_IMAGE_TYPES,
-    _acquire_sandbox_to_change,
     _decode_file_text,
-    owner_layout,
     owner_work_dir,
-    previous_dir_names_of,
+    previous_roots_of,
     _is_always_hidden_path,
     _is_binary,
-    HOME_NOT_ON_COMPUTER_REASON,
     _is_hidden_path,
     # DALTON-HOOK(workspace-sharing-settings): colleague path filter helper
     _is_non_owner_blocked_path,
-    owned_workspace_on_computer,
     _is_system_path,
-    _normalize_requested_path,
-    _record_fs_bytes,
     _requested_hidden_ok,
     _requested_system_ok,
     _to_client_path,
     _present_virtual_file,
     _virtual_file,
     _virtual_files_in_scope,
+    folder_unmoved,
+    http_file_byte_range,
     http_file_bytes,
     http_file_text,
+    may_be_utf8,
+    requested_byte_range,
 )
+from .serve import warm_sandbox
 
 logger = logging.getLogger(__name__)
 
@@ -105,26 +121,6 @@ _UNSAVED_LISTED = 100
 
 
 router = APIRouter(prefix="/api/v1/workspaces", tags=["Workspace Files"])
-
-
-async def _contained_target(
-    sandbox: Any, path: str, work_dir: str, previous_dirs: Sequence[str] = ()
-) -> str:
-    """The canonical absolute path a route may act on, or 404.
-
-    Two folds the sandbox handle cannot do for a route: the request path folds
-    into *this* workspace's folder rather than the computer root the handle
-    carries, and the result is canonicalised inside the sandbox so a symlink
-    into a sibling's folder is judged on where it lands. 404 rather than 403
-    throughout: a path that escapes is not told whether its target exists.
-    """
-    candidate = contained_absolute_path(path, work_dir, previous_dirs)
-    if candidate is None or not sandbox.validate_path(candidate):
-        raise HTTPException(status_code=404, detail="File not found")
-    canonical = await contained_sandbox_path(sandbox, candidate, work_dir=work_dir)
-    if canonical is None or not is_within(work_dir, canonical):
-        raise HTTPException(status_code=404, detail="File not found")
-    return canonical
 
 
 async def _read_contained_target(
@@ -210,7 +206,7 @@ async def list_workspace_files(
     if served_from_mirror(workspace.get("status")) and (is_non_owner_reader or not auto_start):
         file_tree = await FilePersistenceService.get_file_tree(workspace_id)
         # Filter by path prefix if specified
-        normalized_path = _normalize_requested_path(path, work_dir, previous_dirs)
+        normalized_path = normalize_requested_path(path, work_dir, previous_dirs)
         if normalized_path:
             file_tree = [
                 f
@@ -247,7 +243,7 @@ async def list_workspace_files(
         }
 
     sandbox_owner_id = str(workspace.get("user_id") or x_user_id)
-    async with _acquire_sandbox_to_change(workspace_id, sandbox_owner_id) as (sandbox, workspace):
+    async with acquire_sandbox_to_change(workspace_id, sandbox_owner_id) as (sandbox, workspace):
         # Fast path: return empty list if sandbox is still initializing and wait_for_sandbox=False
         # This allows CLI autocomplete to populate later without blocking startup
         if not wait_for_sandbox and not sandbox.is_ready():
@@ -344,7 +340,7 @@ async def _live_listing(
     # DALTON-HOOK(workspace-sharing-settings): omit owner virtual files for non-owners
     if is_non_owner:
         return files
-    requested_norm = _normalize_requested_path(path, work_dir, previous_dirs)
+    requested_norm = normalize_requested_path(path, work_dir, previous_dirs)
     return await _with_virtual_files(files, requested_norm, workspace["user_id"])
 
 
@@ -370,10 +366,16 @@ def _folded_refs(
     """The workspace's folder, and the reference and recent writes folded onto it."""
     work_dir = owner_work_dir(workspace)
     previous_dirs = previous_dir_names_of(workspace)
-    candidates = clean_candidates(body.candidates, work_dir, previous_dirs)
+    previous_roots = previous_roots_of(workspace)
+    candidates = clean_candidates(
+        body.candidates, work_dir, previous_dirs, previous_roots=previous_roots
+    )
     recent_writes = [
         p
-        for p in (clean_path(w, work_dir, previous_dirs) for w in body.recent_writes)
+        for p in (
+            clean_path(w, work_dir, previous_dirs, previous_roots=previous_roots)
+            for w in body.recent_writes
+        )
         if p
     ]
     return work_dir, candidates, recent_writes
@@ -441,7 +443,7 @@ async def resolve_workspace_file(
         source = "database"
     else:
         sandbox_owner_id = str(workspace.get("user_id") or x_user_id)
-        async with _acquire_sandbox_to_change(workspace_id, sandbox_owner_id) as (sandbox, workspace):
+        async with acquire_sandbox_to_change(workspace_id, sandbox_owner_id) as (sandbox, workspace):
             if not sandbox.is_ready():
                 return {
                     "status": "unavailable",
@@ -497,23 +499,8 @@ async def read_workspace_file(
     """Read a file from the workspace's sandbox, or from DB if stopped."""
 
     # --- DALTON-HOOK(workspace-sharing-settings): begin ---
-    from src.dalton.settings import is_dalton_supabase_auth_enabled
-
-    is_non_owner_reader = False
-    if is_dalton_supabase_auth_enabled():
-        from src.dalton.sharing import require_workspace_access
-
-        workspace = await require_workspace_access(
-            await db_get_workspace(workspace_id),
-            x_user_id,
-            channel="web",
-            need="read",
-        )
-        if is_unbound(workspace):
-            raise HTTPException(status_code=400, detail="Home is not on a computer yet")
-        is_non_owner_reader = workspace.get("user_id") != x_user_id
-    else:
-        workspace = await owned_workspace_on_computer(workspace_id, x_user_id)
+    workspace = await owned_workspace_on_computer(workspace_id, x_user_id, need="read")
+    is_non_owner_reader = workspace.get("user_id") != x_user_id
     # --- DALTON-HOOK(workspace-sharing-settings): end ---
 
     # Virtual DB-backed JSON files (user profile, automations) are served from
@@ -521,7 +508,7 @@ async def read_workspace_file(
     # running, stopped, or never started.
     work_dir = owner_work_dir(workspace)
     previous_dirs = previous_dir_names_of(workspace)
-    normalized_for_virtual = _normalize_requested_path(path, work_dir, previous_dirs)
+    normalized_for_virtual = normalize_requested_path(path, work_dir, previous_dirs)
     if is_non_owner_reader and normalized_for_virtual and _is_non_owner_blocked_path(normalized_for_virtual):
         raise HTTPException(status_code=404, detail="File not found")
     virtual = _virtual_file(normalized_for_virtual)
@@ -551,7 +538,7 @@ async def read_workspace_file(
 
     # DALTON-HOOK(workspace-sharing-settings): DB fallback only when stopped; running workspaces read live sandbox
     if served_from_mirror(workspace.get("status")):
-        normalized_path = _normalize_requested_path(path, work_dir, previous_dirs)
+        normalized_path = normalize_requested_path(path, work_dir, previous_dirs)
         if not normalized_path:
             raise HTTPException(status_code=400, detail="File path is required")
         if is_non_owner_reader and _is_non_owner_blocked_path(normalized_path):
@@ -598,7 +585,7 @@ async def read_workspace_file(
 
     # DALTON-HOOK(workspace-sharing-settings): acquire owner sandbox for live read and re-check canonical path
     sandbox_owner_id = str(workspace.get("user_id") or x_user_id)
-    async with _acquire_sandbox_to_change(workspace_id, sandbox_owner_id) as (sandbox, workspace):
+    async with acquire_sandbox_to_change(workspace_id, sandbox_owner_id) as (sandbox, workspace):
         work_dir = owner_work_dir(workspace)
         previous_dirs = previous_dir_names_of(workspace)
 
@@ -642,7 +629,7 @@ async def read_workspace_file(
 
     mime = resolve_content_type(client_path, default="text/plain")
 
-    _record_fs_bytes("read", len(raw_bytes))
+    record_fs_bytes("read", len(raw_bytes))
 
     return {
         "workspace_id": workspace_id,
@@ -690,7 +677,7 @@ async def write_workspace_file(
     # generic write endpoint cannot enforce safely.
     work_dir = owner_work_dir(workspace)
     previous_dirs = previous_dir_names_of(workspace)
-    normalized_req_path = _normalize_requested_path(path, work_dir, previous_dirs)
+    normalized_req_path = normalize_requested_path(path, work_dir, previous_dirs)
     virtual = _virtual_file(normalized_req_path)
     if virtual:
         raise HTTPException(status_code=400, detail=virtual.read_only)
@@ -702,11 +689,11 @@ async def write_workspace_file(
     if len(content_bytes) > MAX_WRITE_BYTES:
         raise HTTPException(status_code=413, detail="File content too large (max 10MB)")
 
-    async with _acquire_sandbox_to_change(workspace_id, sandbox_owner_id) as (sandbox, workspace):
+    async with acquire_sandbox_to_change(workspace_id, sandbox_owner_id) as (sandbox, workspace):
         work_dir = owner_work_dir(workspace)
         previous_dirs = previous_dir_names_of(workspace)
 
-        normalized = await _contained_target(sandbox, path, work_dir, previous_dirs)
+        normalized = await contained_target(sandbox, path, work_dir, previous_dirs)
         # DALTON-HOOK(workspace-sharing-settings): re-check resolved canonical target after symlink resolution
         resolved_client_path = _to_client_path(sandbox, normalized, work_dir)
         if is_non_owner and _is_non_owner_blocked_path(resolved_client_path):
@@ -745,7 +732,7 @@ async def write_workspace_file(
         except Exception:
             pass
 
-    _record_fs_bytes("write", len(content_bytes))
+    record_fs_bytes("write", len(content_bytes))
 
     return {
         "workspace_id": workspace_id,
@@ -758,6 +745,8 @@ async def write_workspace_file(
 _STREAM_SLOT_WAIT_S = 30
 # How long the sandbox has to produce a stream's first chunk.
 _STREAM_OPEN_TIMEOUT_S = 60
+# How often a large download counts as use of its computer while it streams.
+_STREAM_KEEP_ALIVE_S = 60
 
 
 class _StreamedDownload(StreamingResponse):
@@ -787,6 +776,29 @@ class _StreamedDownload(StreamingResponse):
 
 class _FileChangedWhileSending(Exception):
     """The file grew or shrank after its size went out as Content-Length."""
+
+
+async def _kept_alive(
+    body: AsyncIterator[bytes], workspace_id: str, sandbox: Any
+) -> AsyncIterator[bytes]:
+    """Yield ``body``, counting it as use of the computer about once a minute.
+
+    A download is no turn and, once open, makes no provider call, so neither
+    the idle sweep nor E2B's deadline would see it, and a long one could be
+    stopped mid-transfer.
+    """
+    due = 0.0
+    async for chunk in body:
+        now = time.monotonic()
+        if now >= due:
+            due = now + _STREAM_KEEP_ALIVE_S
+            try:
+                await WorkspaceManager.get_instance().keep_sandbox_alive(
+                    workspace_id, sandbox.sandbox_id, runtime=sandbox.runtime
+                )
+            except Exception as e:
+                logger.debug("Download did not count as activity: %s", e)
+        yield chunk
 
 
 async def _exactly(body: AsyncIterator[bytes], size: int) -> AsyncIterator[bytes]:
@@ -832,6 +844,208 @@ def _build_download_response(
     return Response(content=content, media_type=mime, headers=headers)
 
 
+# The most one ranged answer carries, so a range of any width holds a bounded
+# slice in memory and a client loops on a short answer. It also bounds a live
+# slice's exec output, so it must not pass EXEC_READ_MAX_BYTES, the most one
+# exec read may carry.
+RANGE_MAX_BYTES = 8 * 1024 * 1024
+
+
+def _range_length(first: int, last: int) -> int:
+    """The most a range is answered with; the file's end can cut it shorter."""
+    return min(last - first + 1, RANGE_MAX_BYTES)
+
+
+def _starts_as_text(head: bytes, size: int) -> bool:
+    """Whether a file whose first bytes are ``head`` might be text, which goes
+    whole so that it is redacted like any other text answer."""
+    return may_be_utf8(head, whole=len(head) >= size)
+
+
+def _range_response(
+    content: bytes,
+    first: int,
+    size: int,
+    etag: str,
+    filename: str,
+    mime: str,
+    disposition: str,
+) -> Response:
+    """A 206 carrying ``content`` from byte ``first`` of a binary file.
+
+    Unredacted, like a streamed download and the signed link: redaction needs
+    the whole body, so only a file whose type and first bytes already rule out
+    text takes a range, and its whole answer would not be redacted either.
+    """
+    return Response(
+        content=content,
+        status_code=206,
+        media_type=mime,
+        headers={
+            "Content-Range": f"bytes {first}-{first + len(content) - 1}/{size}",
+            "Accept-Ranges": "bytes",
+            "ETag": f'"{etag}"',
+            # The reader holds what it fetched. A slice the browser stored would
+            # only be revalidated against a route that answers every range anew.
+            # Each slice is held to the first's exact ETag; re-encoding weakens it.
+            "Cache-Control": "private, no-store, no-transform",
+            "Content-Disposition": content_disposition(
+                filename, disposition=disposition
+            ),
+        },
+    )
+
+
+def _unsatisfiable(size: int) -> HTTPException:
+    return HTTPException(
+        status_code=416,
+        detail="Requested range not satisfiable",
+        headers={"Content-Range": f"bytes */{size}"},
+    )
+
+
+async def _live_range_response(
+    sandbox: Any,
+    candidate: str,
+    work_dir: str,
+    byte_range: tuple[int, int],
+    disposition: str,
+) -> Response | None:
+    """A range of a live file, read in the exec that checks its containment.
+
+    None for a file that goes whole: one that may be text (a binary name linked
+    to a text file, or text under a binary type), and one the sandbox gave no
+    version for, whose size alone cannot tell two versions apart. A 416
+    carries no validator, so it is decided on the size alone.
+    """
+    first, last = byte_range
+    try:
+        sliced = await read_contained_sandbox_range(
+            sandbox,
+            candidate,
+            work_dir=work_dir,
+            offset=first,
+            length=_range_length(first, last),
+        )
+    except FileChangedWhileRead:
+        # The file panel tells this apart from an unreachable sandbox by code.
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "file_changed",
+                "message": "File changed while it was read",
+            },
+            headers={"Retry-After": "1"},
+        ) from None
+    if sliced is None:
+        raise HTTPException(status_code=404, detail="File not found")
+    client_path = _to_client_path(sandbox, sliced.canonical, work_dir)
+    if _is_always_hidden_path(client_path):
+        raise HTTPException(status_code=404, detail="File not found")
+    filename = client_path.split("/")[-1] if client_path else "download"
+    mime = resolve_content_type(filename)
+    if _is_text_content_type(mime):
+        return None
+    if sliced.content is None:
+        raise _unsatisfiable(sliced.size)
+    if sliced.version is None or _starts_as_text(sliced.head, sliced.size):
+        return None
+    record_fs_bytes("download", len(sliced.content))
+    return _range_response(
+        sliced.content,
+        first,
+        sliced.size,
+        f"{sliced.size}-{sliced.version}",
+        filename,
+        mime,
+        disposition,
+    )
+
+
+async def _warm_range_response(
+    workspace: dict[str, Any],
+    workspace_id: str,
+    candidate: str,
+    work_dir: str,
+    byte_range: tuple[int, int],
+    disposition: str,
+) -> tuple[bool, Response | None]:
+    """:func:`_live_range_response` through the session this worker already
+    holds, without a folder hold, as ``(settled, answer)``.
+
+    An acquisition per slice would hold the folder nearly the whole time a
+    reader scrolls, which keeps a rename's settle from ever moving it. So, like
+    the URL-only routes, the read goes unheld and its answer stands only if the
+    folder ``workspace`` names was still this workspace's afterwards. Without a
+    warm session, a sandbox that answers, or that folder, ``settled`` is False
+    and the request goes through the acquisition.
+    """
+    sandbox = warm_sandbox(workspace, workspace_id)
+    if sandbox is None or not sandbox.validate_path(candidate):
+        return False, None
+    try:
+        answer = await _live_range_response(
+            sandbox, candidate, work_dir, byte_range, disposition
+        )
+    except RuntimeError as e:
+        logger.info(
+            f"Warm ranged read failed for workspace {workspace_id}; "
+            f"acquiring instead: {single_line(str(e))}"
+        )
+        return False, None
+    except HTTPException as e:
+        # A workspace moving to another computer keeps its folder's name while
+        # the folder is set aside, so a file missing here may only be away for
+        # the move, which the acquisition answers as a 503 to retry.
+        if e.status_code != 404 and await folder_unmoved(
+            workspace_id, workspace.get("dir_name")
+        ):
+            raise
+        return False, None
+    if not await folder_unmoved(workspace_id, workspace.get("dir_name")):
+        return False, None
+    return True, answer
+
+
+async def _stored_range_response(
+    file_record: dict[str, Any],
+    byte_range: tuple[int, int],
+    filename: str,
+    mime: str,
+    disposition: str,
+    *,
+    user_id: str,
+) -> Response | None:
+    """A range of a mirrored file, reading only that slice and the file's
+    first bytes from storage.
+
+    None for a row that goes whole: one stored inline or without a digest to
+    version it, and one that may be text.
+    """
+    etag = file_record.get("content_hash") or file_record.get("blob_sha256")
+    if not etag:
+        return None
+    first, last = byte_range
+    length = _range_length(first, last)
+    if first == 0 and length >= UTF8_SNIFF_BYTES:
+        read = head_read = await http_file_byte_range(
+            file_record, 0, length, user_id=user_id
+        )
+    else:
+        head_read, read = await asyncio.gather(
+            http_file_byte_range(file_record, 0, UTF8_SNIFF_BYTES, user_id=user_id),
+            http_file_byte_range(file_record, first, length, user_id=user_id),
+        )
+    if read is None or head_read is None:
+        return None
+    content, size = read
+    if not content:
+        raise _unsatisfiable(size)
+    if _starts_as_text(head_read[0][:UTF8_SNIFF_BYTES], size):
+        return None
+    return _range_response(content, first, size, etag, filename, mime, disposition)
+
+
 @router.get("/{workspace_id}/files/download")
 async def download_workspace_file(
     workspace_id: str,
@@ -844,25 +1058,11 @@ async def download_workspace_file(
 ) -> Response:
     """Download raw bytes from the workspace's sandbox, or from DB if stopped."""
     disposition = "attachment" if attachment else "inline"
+    byte_range = requested_byte_range(request.headers)
 
     # --- DALTON-HOOK(workspace-sharing-settings): begin ---
-    from src.dalton.settings import is_dalton_supabase_auth_enabled
-
-    is_non_owner_reader = False
-    if is_dalton_supabase_auth_enabled():
-        from src.dalton.sharing import require_workspace_access
-
-        workspace = await require_workspace_access(
-            await db_get_workspace(workspace_id),
-            x_user_id,
-            channel="web",
-            need="read",
-        )
-        if is_unbound(workspace):
-            raise HTTPException(status_code=400, detail="Home is not on a computer yet")
-        is_non_owner_reader = workspace.get("user_id") != x_user_id
-    else:
-        workspace = await owned_workspace_on_computer(workspace_id, x_user_id)
+    workspace = await owned_workspace_on_computer(workspace_id, x_user_id, need="read")
+    is_non_owner_reader = workspace.get("user_id") != x_user_id
     # --- DALTON-HOOK(workspace-sharing-settings): end ---
 
     work_dir = owner_work_dir(workspace)
@@ -870,7 +1070,7 @@ async def download_workspace_file(
 
     # Virtual files come from the DB, as in /files/read: on the sandbox their
     # folder links out to the file mount, and the stored copy has no row for them.
-    virtual_path = _normalize_requested_path(path, work_dir, previous_dirs)
+    virtual_path = normalize_requested_path(path, work_dir, previous_dirs)
     if is_non_owner_reader and virtual_path and _is_non_owner_blocked_path(virtual_path):
         raise HTTPException(status_code=404, detail="File not found")
     virtual = _virtual_file(virtual_path)
@@ -885,21 +1085,29 @@ async def download_workspace_file(
 
     # DALTON-HOOK(workspace-sharing-settings): DB fallback only when stopped; running workspaces download from live sandbox
     if served_from_mirror(workspace.get("status")):
-        normalized_path = _normalize_requested_path(path, work_dir, previous_dirs)
+        normalized_path = normalize_requested_path(path, work_dir, previous_dirs)
         if not normalized_path:
             raise HTTPException(status_code=400, detail="File path is required")
         if is_non_owner_reader and _is_non_owner_blocked_path(normalized_path):
             raise HTTPException(status_code=404, detail="File not found")
 
-        # Parallel: fetch vault secrets + file content in one round-trip window
-        vault_secrets, file_record = await asyncio.gather(
-            get_vault_secrets_for_redaction(workspace["user_id"]),
-            FilePersistenceService.get_file_content(workspace_id, normalized_path),
-        )
+        if byte_range is None:
+            # Parallel: fetch vault secrets + file content in one round-trip window
+            vault_secrets, file_record = await asyncio.gather(
+                get_vault_secrets_for_redaction(workspace["user_id"]),
+                FilePersistenceService.get_file_content(workspace_id, normalized_path),
+            )
+        else:
+            # A ranged answer is never redacted, so the secrets wait for the
+            # row to say whether the range applies.
+            file_record = await FilePersistenceService.get_file_content(
+                workspace_id, normalized_path
+            )
         if not file_record:
             raise HTTPException(status_code=404, detail="File not found")
 
-        # DALTON-HOOK(team-sharing): reject binary file download for non-owner readers
+        # DALTON-HOOK(team-sharing): reject binary file download for non-owner
+        # readers before any Range answer, so ro colleagues never receive a 206
         if is_non_owner_reader and (
             file_record.get("is_binary") or _is_binary(normalized_path)
         ):
@@ -908,10 +1116,26 @@ async def download_workspace_file(
                 detail="Binary file download is not available in read-only mode",
             )
 
-        content = await http_file_bytes(file_record, user_id=workspace["user_id"])
-
         filename = file_record.get("file_name", "download")
         mime = file_record.get("mime_type") or "application/octet-stream"
+
+        # DALTON-HOOK(team-sharing): ro colleagues never take a stored Range
+        # answer; the whole-file rules below keep text redacted and reject binaries
+        if byte_range is not None:
+            if not is_non_owner_reader and not _is_text_content_type(mime):
+                ranged = await _stored_range_response(
+                    file_record,
+                    byte_range,
+                    filename,
+                    mime,
+                    disposition,
+                    user_id=workspace["user_id"],
+                )
+                if ranged is not None:
+                    return ranged
+            vault_secrets = await get_vault_secrets_for_redaction(workspace["user_id"])
+
+        content = await http_file_bytes(file_record, user_id=workspace["user_id"])
 
         if is_non_owner_reader and not (
             _is_text_content_type(mime) or _is_utf8(content)
@@ -928,12 +1152,29 @@ async def download_workspace_file(
 
     # DALTON-HOOK(workspace-sharing-settings): acquire owner sandbox for live download and re-check canonical path
     sandbox_owner_id = str(workspace.get("user_id") or x_user_id)
+    # DALTON-HOOK(team-sharing): ro colleagues never take a live Range answer;
+    # the checks inside the acquisition reject binary files with 403
+    if byte_range is not None and not is_non_owner_reader:
+        candidate = contained_absolute_path(path, work_dir, previous_dirs)
+        if candidate is not None and not _is_text_content_type(
+            resolve_content_type(candidate.rsplit("/", 1)[-1])
+        ):
+            settled, ranged = await _warm_range_response(
+                workspace, workspace_id, candidate, work_dir, byte_range, disposition
+            )
+            if ranged is not None:
+                return ranged
+            if settled:
+                # The file goes whole, which another ranged read would only
+                # find again.
+                byte_range = None
+
     async with AsyncExitStack() as folder:
         # A streamed file is read by path chunk after chunk, so its hold goes
         # with the response; a settle moving the folder between two chunks
         # would end the download.
         sandbox, workspace = await folder.enter_async_context(
-            _acquire_sandbox_to_change(workspace_id, sandbox_owner_id)
+            acquire_sandbox_to_change(workspace_id, sandbox_owner_id)
         )
         work_dir = owner_work_dir(workspace)
         previous_dirs = previous_dir_names_of(workspace)
@@ -941,6 +1182,19 @@ async def download_workspace_file(
         candidate = contained_absolute_path(path, work_dir, previous_dirs)
         if candidate is None or not sandbox.validate_path(candidate):
             raise HTTPException(status_code=404, detail="File not found")
+        # DALTON-HOOK(team-sharing): ro colleagues never take a live Range answer
+        if (
+            byte_range is not None
+            and not is_non_owner_reader
+            and not _is_text_content_type(
+                resolve_content_type(candidate.rsplit("/", 1)[-1])
+            )
+        ):
+            ranged = await _live_range_response(
+                sandbox, candidate, work_dir, byte_range, disposition
+            )
+            if ranged is not None:
+                return ranged
         try:
             resolved = await read_contained_sandbox_file(
                 sandbox, candidate, work_dir=work_dir
@@ -975,19 +1229,20 @@ async def download_workspace_file(
 
         if too_large is not None:
             return await _stream_large_file(
-                sandbox, too_large, filename, mime, disposition, folder=folder
+                workspace_id, sandbox, too_large, filename, mime, disposition, folder=folder
             )
 
         if _is_text_content_type(mime) or _is_utf8(content):
             vault_secrets = await get_vault_secrets_for_redaction(workspace["user_id"])
             content = get_redactor().redact_bytes(content, vault_secrets=vault_secrets)
 
-        _record_fs_bytes("download", len(content))
+        record_fs_bytes("download", len(content))
 
         return _build_download_response(content, filename, mime, request, disposition)
 
 
 async def _stream_large_file(
+    workspace_id: str,
     sandbox: Any,
     too_large: FileTooLargeToServe,
     filename: str,
@@ -1032,9 +1287,9 @@ async def _stream_large_file(
         if stream is None:
             raise HTTPException(status_code=404, detail="File not found")
         held.push_async_callback(stream.aclose)
-        _record_fs_bytes("download", too_large.size)
+        record_fs_bytes("download", too_large.size)
         return _StreamedDownload(
-            _exactly(stream, too_large.size),
+            _kept_alive(_exactly(stream, too_large.size), workspace_id, sandbox),
             held=held.pop_all(),
             media_type=mime,
             headers={
@@ -1061,23 +1316,9 @@ async def workspace_file_download_url(
     redacting would mean carrying the bytes through this process.
     """
     # --- DALTON-HOOK(workspace-sharing-settings): begin ---
-    from src.dalton.settings import is_dalton_supabase_auth_enabled
-
-    if is_dalton_supabase_auth_enabled():
-        from src.dalton.sharing import require_workspace_access
-
-        workspace = await require_workspace_access(
-            await db_get_workspace(workspace_id),
-            x_user_id,
-            channel="web",
-            need="read",
-        )
-        if is_unbound(workspace):
-            raise HTTPException(status_code=400, detail="Home is not on a computer yet")
-        if workspace.get("user_id") != x_user_id:
-            return {"url": None}
-    else:
-        workspace = await owned_workspace_on_computer(workspace_id, x_user_id)
+    workspace = await owned_workspace_on_computer(workspace_id, x_user_id, need="read")
+    if workspace.get("user_id") != x_user_id:
+        return {"url": None}
     # --- DALTON-HOOK(workspace-sharing-settings): end ---
 
     layout = owner_layout(workspace)
@@ -1086,11 +1327,11 @@ async def workspace_file_download_url(
 
     # A virtual file is rendered from its rows when downloaded, so there is no
     # stored object to link to.
-    if _virtual_file(_normalize_requested_path(path, work_dir, previous_dirs)):
+    if _virtual_file(normalize_requested_path(path, work_dir, previous_dirs)):
         return {"url": None}
 
     if served_from_mirror(workspace.get("status")):
-        normalized_path = _normalize_requested_path(path, work_dir, previous_dirs)
+        normalized_path = normalize_requested_path(path, work_dir, previous_dirs)
         if not normalized_path:
             raise HTTPException(status_code=400, detail="File path is required")
         if _is_always_hidden_path(normalized_path):
@@ -1098,12 +1339,12 @@ async def workspace_file_download_url(
         return {"url": await mirror_download_link(workspace, normalized_path)}
 
     # Held through the export too, which reads the file by path.
-    async with _acquire_sandbox_to_change(workspace_id, x_user_id) as (sandbox, workspace):
+    async with acquire_sandbox_to_change(workspace_id, x_user_id) as (sandbox, workspace):
         layout = owner_layout(workspace)
         work_dir = layout.workspace
         previous_dirs = previous_dir_names_of(workspace)
         try:
-            canonical = await _contained_target(sandbox, path, work_dir, previous_dirs)
+            canonical = await contained_target(sandbox, path, work_dir, previous_dirs)
         except HTTPException:
             # This check is the project folder's; reads also admit shared tiers
             # outside it. /files/download applies the read policy and refuses the
@@ -1139,12 +1380,9 @@ async def upload_workspace_file(
     # --- DALTON-HOOK(workspace-sharing-settings): end ---
 
     if served_from_mirror(workspace.get("status")):
-        raise HTTPException(
-            status_code=409,
-            detail=f"Cannot upload files — workspace is {workspace.get('status')}. Wait for it to be running.",
-        )
+        raise not_running_for_upload(workspace)
 
-    async with _acquire_sandbox_to_change(workspace_id, sandbox_owner_id) as (sandbox, workspace):
+    async with acquire_sandbox_to_change(workspace_id, sandbox_owner_id) as (sandbox, workspace):
         work_dir = owner_work_dir(workspace)
         previous_dirs = previous_dir_names_of(workspace)
 
@@ -1153,14 +1391,14 @@ async def upload_workspace_file(
             raise HTTPException(status_code=400, detail="Destination path is required")
         # The same refusal as write: an upload would land a sandbox file the
         # virtual route shadows, so it would read as saved and change nothing.
-        normalized_req_dest = _normalize_requested_path(dest, work_dir, previous_dirs)
+        normalized_req_dest = normalize_requested_path(dest, work_dir, previous_dirs)
         virtual = _virtual_file(normalized_req_dest)
         if virtual:
             raise HTTPException(status_code=400, detail=virtual.read_only)
         if is_non_owner and _is_non_owner_blocked_path(normalized_req_dest):
             raise HTTPException(status_code=403, detail="Cannot upload to system or hidden paths")
 
-        normalized = await _contained_target(sandbox, dest, work_dir, previous_dirs)
+        normalized = await contained_target(sandbox, dest, work_dir, previous_dirs)
         # DALTON-HOOK(workspace-sharing-settings): re-check resolved canonical target after symlink resolution
         resolved_client_path = _to_client_path(sandbox, normalized, work_dir)
         if is_non_owner and _is_non_owner_blocked_path(resolved_client_path):
@@ -1192,13 +1430,28 @@ async def upload_workspace_file(
         raise HTTPException(status_code=500, detail="Upload failed")
 
     client_path = _to_client_path(sandbox, normalized, work_dir)
-    _record_fs_bytes("upload", len(content))
+    record_fs_bytes("upload", len(content))
     return {
         "workspace_id": workspace_id,
         "path": client_path,
         "size": len(content),
         "filename": file.filename,
     }
+
+
+async def _computer_backs_up_files(workspace: dict[str, Any] | None) -> bool:
+    """The switch of the computer the workspace is on; on where it has none."""
+    computer_id = (workspace or {}).get("computer_id")
+    if not computer_id:
+        return True
+    computer = await get_computer(str(computer_id))
+    return (computer or {}).get("files_backup", True) is not False
+
+
+_RESTORE_OFFER_STANDS = (
+    "This workspace's folder is missing on its computer. Restore it "
+    "from the backup or keep it as it is first."
+)
 
 
 @router.post("/{workspace_id}/files/backup")
@@ -1215,25 +1468,31 @@ async def backup_workspace_files(
             status_code=409,
             detail=f"Cannot backup files — workspace is {workspace.get('status')}.",
         )
+    if workspace.get("files_restore_offered_at"):
+        raise HTTPException(status_code=409, detail=_RESTORE_OFFER_STANDS)
+    if not await _computer_backs_up_files(workspace):
+        raise HTTPException(
+            status_code=409, detail="File backup is off for this computer."
+        )
 
     # Held like a file change: a folder moved mid-scan reads as missing, and
     # the sync reports that as a clean pass.
-    async with _acquire_sandbox_to_change(workspace_id, x_user_id) as (sandbox, workspace):
+    async with acquire_sandbox_to_change(workspace_id, x_user_id) as (sandbox, workspace):
         try:
             result = await FilePersistenceService.sync_to_db(
                 workspace_id, sandbox, layout=owner_layout(workspace)
             )
         except RuntimeError as e:
-            # Same wording as every other producer: the file panel keys its error
-            # card off this string, so a fourth variant here would render a
+            # Same answer as every other producer: the file panel keys its error
+            # card off the 503's detail, so a fourth variant here would render a
             # different card for the same condition.
             logger.warning(
                 f"Sandbox unreachable syncing {workspace_id}: {single_line(str(e))}"
             )
-            raise HTTPException(
-                status_code=503,
-                detail=sandbox_unreachable_detail(e),
-            )
+            raise sandbox_failure_http(e) from None
+    if result.held:
+        # The pass found the folder gone and offered its restore instead.
+        raise HTTPException(status_code=409, detail=_RESTORE_OFFER_STANDS)
     return {
         "workspace_id": workspace_id,
         "synced": result.synced,
@@ -1265,6 +1524,13 @@ async def get_backup_status(
     workspace = await db_get_workspace(workspace_id)
     require_workspace_owner(workspace, user_id=x_user_id)
     restore_incomplete = bool((workspace or {}).get("files_restore_incomplete"))
+    # Ride along like the flag: off, nothing reported unsaved will be saved,
+    # and with an offer standing nothing is saved until the owner chooses.
+    choice = {
+        "files_restore_incomplete": restore_incomplete,
+        "files_backup": await _computer_backs_up_files(workspace),
+        "files_restore_offered_at": (workspace or {}).get("files_restore_offered_at"),
+    }
 
     empty = {
         "workspace_id": workspace_id,
@@ -1272,7 +1538,7 @@ async def get_backup_status(
         "modified": [],
         "untracked": [],
         "total_backed_up_size": 0,
-        "files_restore_incomplete": restore_incomplete,
+        **choice,
     }
 
     if is_unbound(workspace):
@@ -1300,13 +1566,13 @@ async def get_backup_status(
             "modified": [],
             "untracked": [],
             "total_backed_up_size": total_size,
-            "files_restore_incomplete": restore_incomplete,
+            **choice,
         }
 
     # Sandbox is running: compare sandbox files against DB. Not ready, folder
     # moving or a failed scan all return DB-only info.
     try:
-        async with _acquire_sandbox_to_change(workspace_id, x_user_id) as (sandbox, workspace):
+        async with acquire_sandbox_to_change(workspace_id, x_user_id) as (sandbox, workspace):
             sandbox_meta = await FilePersistenceService.list_sandbox_files(
                 sandbox, layout=owner_layout(workspace)
             )
@@ -1318,7 +1584,7 @@ async def get_backup_status(
             "modified": [],
             "untracked": [],
             "total_backed_up_size": total_size,
-            "files_restore_incomplete": restore_incomplete,
+            **choice,
         }
 
     backed_up: list[str] = []
@@ -1349,7 +1615,7 @@ async def get_backup_status(
         "modified": modified,
         "untracked": untracked,
         "total_backed_up_size": total_size,
-        "files_restore_incomplete": restore_incomplete,
+        **choice,
     }
 
 
@@ -1377,7 +1643,7 @@ async def delete_workspace_files(
             detail=f"Cannot delete files — workspace is {workspace.get('status')}. Wait for it to be running.",
         )
 
-    async with _acquire_sandbox_to_change(workspace_id, sandbox_owner_id) as (sandbox, workspace):
+    async with acquire_sandbox_to_change(workspace_id, sandbox_owner_id) as (sandbox, workspace):
         work_dir = owner_work_dir(workspace)
         previous_dirs = previous_dir_names_of(workspace)
 
@@ -1390,7 +1656,7 @@ async def delete_workspace_files(
         candidates: list[str] = []
         undeletable: dict[int, str] = {}
         for index, path in enumerate(body.paths):
-            req_norm = _normalize_requested_path(path, work_dir, previous_dirs)
+            req_norm = normalize_requested_path(path, work_dir, previous_dirs)
             if is_non_owner and _is_non_owner_blocked_path(req_norm):
                 raise HTTPException(
                     status_code=403, detail="Cannot delete system or hidden files"

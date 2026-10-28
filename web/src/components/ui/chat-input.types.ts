@@ -34,15 +34,32 @@ export interface SlashCommand {
   aliases?: string[];
 }
 
+/**
+ * A thread's own reasoning effort and fast mode, over what Settings gives its
+ * model. Null follows Settings; undefined is a thread whose row has not been
+ * read, which claims neither.
+ */
+export interface ThreadTuning {
+  reasoningEffort: string | null | undefined;
+  fastMode: boolean | null | undefined;
+}
+
 export interface ModelOptions {
   model: string | null;
+  /** This turn's level, as the composer shows it; null names none, and the
+   *  server runs the thread's own, else Settings. */
   reasoningEffort: string | null;
-  fastMode: boolean;
+  fastMode: boolean | null;
   /** Per-message market-watch toggle — stamps live prices for tracked tickers. */
   marketWatch?: boolean;
   /** The Subagents pick of a composer with no thread host, for the thread its
    *  PTC send starts; absent leaves the user's default to the server. */
   subagentsAllowed?: boolean;
+  /** The effort and fast-mode picks of a composer with no thread host, which
+   *  the thread its send starts keeps as its own; absent follows Settings.
+   *  `reasoningEffort`/`fastMode` stay the turn's level either way. */
+  reasoningEffortOverride?: string;
+  fastModeOverride?: boolean;
   /**
    * Widget context snapshots attached via the deck rail. Forwarded to the
    * backend as `additional_context` items of `type: "widget"`. Image-bearing
@@ -50,6 +67,15 @@ export interface ModelOptions {
    * see `widgetSnapshotsToContexts` in `pages/ChatAgent/utils/fileUpload.ts`.
    */
   widgetSnapshots?: WidgetContextSnapshot[];
+  /**
+   * DALTON-HOOK(composer-drafts): pass-through for the composer's draft
+   * lifecycle — the send path calls it once the server has taken the send
+   * (run started, steer accepted, queued, duplicate adopted), before the
+   * stream ends, so the stored draft settles sent without waiting for the
+   * stream. Send implementations that cannot report acceptance leave it
+   * uncalled and their return value settles the draft instead.
+   */
+  onAccepted?: () => void;
 }
 
 export interface ReadyAttachment {
@@ -60,7 +86,7 @@ export interface ReadyAttachment {
 }
 
 /**
- * Where a send goes: All workspaces, which the Chief of Staff answers in Home,
+ * Where a send goes: the Chief of Staff, which answers in Home,
  * or the selected workspace's analyst. Both run the full agent, so the scope
  * is a target, not a mode.
  */

@@ -6,10 +6,12 @@
 import { describe, it, expect, vi } from 'vitest';
 import { renderHook } from '@testing-library/react';
 import { useComputerFolders } from '../useComputerFolders';
+import { getCompletedRowTitle } from '../../components/toolDisplayConfig';
 
 const mocks = vi.hoisted(() => ({
   viewed: null as Record<string, unknown> | null,
   rows: [] as Record<string, unknown>[],
+  computers: [] as Record<string, unknown>[],
 }));
 
 vi.mock('@/hooks/useWorkspace', () => ({
@@ -18,6 +20,12 @@ vi.mock('@/hooks/useWorkspace', () => ({
 
 vi.mock('@/hooks/useAllWorkspaces', () => ({
   useAllWorkspaces: () => ({ data: { workspaces: mocks.rows } }),
+}));
+
+vi.mock('../useComputers', () => ({
+  useComputerRootDir: (computerId: string | null | undefined) =>
+    mocks.computers.find((c) => c.computer_id === computerId)?.root_dir,
+  useComputerRootDirs: () => mocks.computers.map((c) => c.root_dir),
 }));
 
 const viewed = (extra: Record<string, unknown> = {}) => ({
@@ -39,6 +47,40 @@ describe('useComputerFolders', () => {
     mocks.rows = [mocks.viewed, sibling({ status: 'stopped' })];
     rerender();
     expect(result.current).toBe(first);
+  });
+
+  it("carries the root of the workspace's own computer", () => {
+    // A computer whose user cannot create the stock root keeps its folders
+    // under one of its own, and the agent's absolute paths start there.
+    mocks.viewed = viewed();
+    mocks.rows = [mocks.viewed];
+    mocks.computers = [
+      { computer_id: 'c-0', root_dir: '/home/workspace' },
+      { computer_id: 'c-1', root_dir: '/home/someone/langalpha' },
+    ];
+    const { result } = renderHook(() => useComputerFolders('ws-1'));
+    expect(result.current?.rootDir).toBe('/home/someone/langalpha');
+    mocks.computers = [];
+  });
+
+  it('names a tool by its path before the computer list answers', () => {
+    // A tool title reads its path against the computer's root. Taken from the
+    // computer list alone, which is asked for only once the row is in, a
+    // memory read under a root of its own showed "Read" and then turned into
+    // "Read memory" as the list answered.
+    const ROOT = '/home/someone/langalpha';
+    const read = { args: { file_path: `${ROOT}/.agents/user/memory/notes.md` } };
+    mocks.viewed = viewed({ root_dir: ROOT });
+    mocks.rows = [mocks.viewed];
+    mocks.computers = [];
+    const { result, rerender } = renderHook(() =>
+      getCompletedRowTitle('Read', read, undefined, { root: useComputerFolders('ws-1')?.rootDir }));
+    const pending = result.current;
+
+    mocks.computers = [{ computer_id: 'c-1', root_dir: ROOT }];
+    rerender();
+    expect([pending, result.current]).toEqual(['Read memory', 'Read memory']);
+    mocks.computers = [];
   });
 
   it('changes when a folder does', () => {

@@ -1,13 +1,15 @@
 /* eslint-disable react-refresh/only-export-components -- a kit is an object of components, chosen at runtime */
 /**
- * The nav tree's interactive kit: framer-motion expand, collapse and thread
+ * The nav tree's interactive kit: measured expand and collapse, framer thread
  * glides, and dnd-kit workspace reordering. ./navTreeKit loads it after first
- * paint. Each piece renders the same elements as its static twin there, so
- * the swap changes behaviour and not pixels.
+ * paint. Each piece draws what its static twin there draws, so the swap
+ * changes behaviour and not pixels.
  */
 import type React from 'react';
 import { createPortal } from 'react-dom';
+import { Disclosure, PresenceFold } from '@/components/ui/Disclosure';
 import { AnimatePresence, MotionConfig, motion, type Transition } from '@/lib/framer';
+import { SPRING_INDICATOR, TWEEN } from '@/lib/motion';
 import {
   DndContext,
   DragOverlay,
@@ -20,7 +22,6 @@ import {
 import { SortableContext, useSortable, verticalListSortingStrategy } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
 import {
-  CLIP_STYLE,
   DRAG_ACTIVATION_DISTANCE,
   DRAG_HANDLE_ATTR,
   SECTION_STYLE,
@@ -34,7 +35,7 @@ const DND_MEASURING = { droppable: { strategy: MeasuringStrategy.Always } };
 // and an inline literal rebuilt the drag context on every render of the
 // panel, which re-rendered every sortable workspace row through it. The
 // activation distance keeps plain clicks toggling expand/collapse instead of
-// starting a drag (the gallery's reorder mode uses the same).
+// starting a drag (the gallery's cards use the same distance).
 const POINTER_SENSOR_OPTIONS = { activationConstraint: { distance: DRAG_ACTIVATION_DISTANCE } };
 
 function TreeRoot({ ids, onDragStart, onDragEnd, onDragCancel, clampOverlay, overlay, children }: TreeRootProps) {
@@ -107,24 +108,9 @@ function Section({ wsId, disabled, children }: SectionProps) {
   );
 }
 
-const COLLAPSE_TRANSITION: Transition = { duration: 0.2, ease: 'easeInOut' };
-
+// A workspace's thread block opens and shuts in the measured fold.
 function Collapse({ show, children }: { show: boolean; children: React.ReactNode }) {
-  return (
-    <AnimatePresence initial={false}>
-      {show && (
-        <motion.div
-          initial={{ height: 0, opacity: 0 }}
-          animate={{ height: 'auto', opacity: 1 }}
-          exit={{ height: 0, opacity: 0 }}
-          transition={COLLAPSE_TRANSITION}
-          style={CLIP_STYLE}
-        >
-          {children}
-        </motion.div>
-      )}
-    </AnimatePresence>
-  );
+  return <Disclosure open={show}>{children}</Disclosure>;
 }
 
 // initial={false} keeps the first paint of an expanded workspace static.
@@ -132,15 +118,11 @@ function ThreadList({ children }: { children: React.ReactNode }) {
   return <AnimatePresence initial={false}>{children}</AnimatePresence>;
 }
 
-const THREAD_ITEM_TRANSITION: Transition = {
-  layout: { duration: 0.22, ease: [0.22, 1, 0.36, 1] },
-  height: { duration: 0.18, ease: 'easeInOut' },
-  opacity: { duration: 0.15, ease: 'easeInOut' },
-};
+const THREAD_GLIDE: Transition = { layout: TWEEN.fold };
 
 // layout="position": pin/unpin repartitions and chat bumps glide to their new
-// slot instead of teleporting; enter/exit collapse covers archive +
-// unarchive/new rows.
+// slot instead of teleporting; archived rows fold out, and unarchived and new
+// ones fold in.
 function ThreadItem({ order, children }: { order: string; children: React.ReactNode }) {
   return (
     <motion.div
@@ -149,18 +131,12 @@ function ThreadItem({ order, children }: { order: string; children: React.ReactN
       // (getBoundingClientRect + projection walk); the id signature scopes
       // that to genuine reorders.
       layoutDependency={order}
-      initial={{ height: 0, opacity: 0 }}
-      animate={{ height: 'auto', opacity: 1 }}
-      exit={{ height: 0, opacity: 0 }}
-      transition={THREAD_ITEM_TRANSITION}
-      style={CLIP_STYLE}
+      transition={THREAD_GLIDE}
     >
-      {children}
+      <PresenceFold appear>{children}</PresenceFold>
     </motion.div>
   );
 }
-
-const PIN_POP: Transition = { type: 'spring', stiffness: 480, damping: 26 };
 
 // Keyed remount pops the glyph when pin state flips: click acknowledgment
 // before the row starts its glide.
@@ -171,7 +147,7 @@ function PinGlyph({ pinned, children }: { pinned: boolean; children: React.React
       className="flex"
       initial={{ scale: 0.6 }}
       animate={{ scale: 1 }}
-      transition={PIN_POP}
+      transition={SPRING_INDICATOR}
     >
       {children}
     </motion.span>

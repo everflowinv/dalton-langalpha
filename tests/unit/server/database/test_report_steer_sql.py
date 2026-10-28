@@ -70,11 +70,46 @@ async def test_an_empty_hold_or_close_touches_nothing(mock_db_connection, mock_c
 async def test_a_release_drops_the_hold_with_the_park(mock_db_connection, mock_cursor):
     """Held exactly when stamped: a released report is takeable by the next
     live turn at once, not after its executor's claim and defer."""
-    await outbox.release_deferred_report_backs(mock_db_connection, "t-1")
+    await outbox.release_deferred_notifications(mock_db_connection, "t-1")
 
     sql = _sql(mock_cursor)
-    assert "SET next_retry_at = NOW(), payload = payload - 'steered_run_id'" in sql
-    assert "next_retry_at = 'infinity'::timestamptz" in sql
+    assert (
+        "SET next_retry_at = CASE WHEN o.hook_type IN ('command_notice')"
+        " THEN o.next_retry_at ELSE NOW() END,"
+        " payload = o.payload - 'steered_run_id'"
+    ) in sql
+    assert "o.next_retry_at = 'infinity'::timestamptz" in sql
+
+
+@pytest.mark.asyncio
+async def test_a_release_never_makes_a_next_turn_command_notice_due(
+    mock_db_connection, mock_cursor
+):
+    """A command's notice held for the next turn has no executor that may post
+    it: a turn's ending drops only a hold it left on one, and touches no
+    other."""
+    await outbox.release_deferred_notifications(mock_db_connection, "t-1")
+
+    sql = _sql(mock_cursor)
+    assert "'command_report_back'" in sql and "'command_notice'" in sql
+    assert (
+        "AND (o.hook_type NOT IN ('command_notice') OR o.payload ? 'steered_run_id')"
+    ) in sql
+
+
+@pytest.mark.asyncio
+async def test_a_live_turn_lists_command_notices_on_both_their_keys(
+    mock_db_connection, mock_cursor
+):
+    """A command's notice due now sits on the thread's chain; one held for the
+    next turn on a key of its own, which no claim ever makes a head of."""
+    await outbox.list_steerable_report_jobs("t-1")
+
+    sql = _sql(mock_cursor)
+    assert "hook_type IN ('task_report_back', 'report_back', 'command_report_back')" in sql
+    assert "'command_notice'" in sql
+    thread, keys, _ = _params(mock_cursor)
+    assert thread == "t-1" and "command_notice:t-1" in keys
 
 
 @pytest.mark.asyncio

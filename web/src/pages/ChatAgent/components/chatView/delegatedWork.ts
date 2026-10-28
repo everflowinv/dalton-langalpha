@@ -13,6 +13,7 @@ import {
 import type { ReportBackOwedThread } from '../../utils/api';
 import { preapprovedCardOf } from '../../utils/preapprovedCards';
 import { taskIdFromAgentId } from '../../utils/agentId';
+import { isReportKind } from '../messageList/messagePredicates';
 
 /** Counted turns an item stays for after it was last active. */
 export const ROSTER_IDLE_TURNS = 5;
@@ -39,7 +40,7 @@ export function countedTurnStarts(messages: readonly ChatMessage[]): number[] {
     // A steer the server refused, left in place with its error.
     if ((m as { queueError?: unknown }).queueError) continue;
     const kind = m.provenance?.kind;
-    unanswered = kind === 'analyst_report' || kind === 'task_report' ? null : m.timestamp.getTime();
+    unanswered = isReportKind(kind) ? null : m.timestamp.getTime();
   }
   return starts;
 }
@@ -278,8 +279,7 @@ export function analystCandidates(
         title: str(card.proposal.question),
         seenMs: at,
         owed: false,
-        // Drawn only for a dispatch that succeeded.
-        dispatchFailed: false,
+        dispatchFailed: card.proposal.dispatch_failed === true,
       });
     }
   }

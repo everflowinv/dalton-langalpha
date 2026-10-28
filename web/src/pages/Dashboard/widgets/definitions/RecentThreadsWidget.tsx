@@ -85,7 +85,7 @@ function ThreadRow({
     <button
       type="button"
       onClick={onOpen}
-      className="group relative w-full text-left flex items-center gap-3 py-2 pr-2 pl-3 rounded-md transition-all duration-150"
+      className="group relative w-full text-left flex items-center gap-3 py-2 pr-2 pl-3 rounded-md transition-all"
       onMouseEnter={(e) => {
         e.currentTarget.style.backgroundColor = 'var(--color-bg-hover)';
         const dot = e.currentTarget.querySelector('[data-dot]') as HTMLElement | null;
@@ -114,7 +114,7 @@ function ThreadRow({
         <span
           data-dot
           aria-hidden
-          className="shrink-0 rounded-full transition-all duration-200"
+          className="shrink-0 rounded-full transition-all"
           style={{
             width: 3,
             height: 3,

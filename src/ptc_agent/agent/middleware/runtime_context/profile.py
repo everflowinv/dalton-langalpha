@@ -15,6 +15,7 @@ from typing import Any
 from ptc_agent.agent.middleware.runtime_context.changes import sha256_text
 from ptc_agent.agent.middleware.runtime_context.state import as_dict
 from ptc_agent.agent.middleware.runtime_context.templates import render_template
+from src.server.models.profile_vocabulary import prompt_preferences
 
 _PROFILE_LABELS = {
     "name": "Name",
@@ -24,9 +25,90 @@ _PROFILE_LABELS = {
     "prefs_set": "Preferences set",
 }
 
+#: The investment profile's structured keys, in the order the block lists them,
+#: each under the label its line and its row share.
+INVESTMENT_PROFILE_LABELS = {
+    "investor_type": "Investor type",
+    "experience": "Experience",
+    "help_with": "Wants help with",
+    "familiar_instruments": "Has traded",
+    "risk_level": "Risk level",
+    "horizon": "Holding horizon",
+    "markets": "Markets",
+    "asset_classes": "Wants to trade",
+    "approaches": "Analysis approaches",
+    "styles": "Investing styles",
+    "sectors": "Sectors",
+    "brokerages": "Brokerages",
+}
+
 #: The keys the turn runner adds from the binding plans that stamp this turn's
 #: order tools, not from the platform reads, so they answer when those do not.
 TRADING_KEYS = ("trading_permission", "trading_asks_on", "trading_settings_url")
+
+
+def line_text(value: Any) -> str | None:
+    """A profile value as the block prints it on its line, or None when the
+    key holds nothing (null, "", [] or {}) and has no line. A list reads
+    joined in words; false and 0 are values, and print."""
+    if not value and not isinstance(value, (int, float)):
+        return None
+    return ", ".join(map(str, value)) if isinstance(value, (list, tuple)) else str(value)
+
+
+def investment_lines(investment: Any) -> list[tuple[str, str]]:
+    """(label, text) for each investment-profile key that holds a value, in
+    the order the block lists them: the block's lines, and the fields its
+    change rows are named by."""
+    values = as_dict(investment)
+    return [
+        (label, text)
+        for key, label in INVESTMENT_PROFILE_LABELS.items()
+        if (text := line_text(values.get(key))) is not None
+    ]
+
+
+@dataclass(frozen=True, slots=True)
+class ProfileSwitches:
+    """What the build has that the profile block's steering points to: the
+    chat-app settings folder (``channels``, None for a build whose block says
+    nothing of it) and ``schedule_wakeup`` (``wakeups``)."""
+
+    channels: bool | None = None
+    wakeups: bool = False
+
+
+def render_user_profile(
+    user_profile: dict[str, Any],
+    user_data_counts: dict[str, Any] | None = None,
+    *,
+    main_agent_steering: bool,
+    switches: ProfileSwitches = ProfileSwitches(),
+    role: str = "analyst",
+) -> str:
+    """The ``components/user_profile.md.j2`` block for one profile.
+
+    The profile is shaped here, at render time, so the template only prints:
+    ``agent_preference`` splits into the keys printed as the user wrote them
+    and the structured keys whose value selects guidance, and the investment
+    profile into its labelled lines. A snapshot keeps the profile as it was
+    read, so an epoch frozen before any of this renders the same way.
+    """
+    printed, steering = prompt_preferences(as_dict(user_profile.get("agent_preference")))
+    return render_template(
+        "components/user_profile.md.j2",
+        user_profile=user_profile,
+        preference_lines=[
+            (key, text) for key, value in printed.items() if (text := line_text(value)) is not None
+        ],
+        agent_steering=steering,
+        investment_lines=investment_lines(user_profile.get("investment_profile")),
+        user_data_counts=user_data_counts,
+        main_agent_steering=main_agent_steering,
+        channels_enabled=bool(switches.channels),
+        wakeups_enabled=switches.wakeups,
+        role=role,
+    )
 
 
 def profile_read_answered(user_profile: dict[str, Any] | None) -> bool:
@@ -70,8 +152,8 @@ class ProfileSnapshot:
         """Label to rendered value, one entry per line the block shows.
 
         Watchlist counts are split so a row can say what moved in words, and
-        each agent preference is its own field so one changed key names only
-        itself.
+        each agent preference and investment-profile key is its own field so
+        one changed key names only itself.
         """
         rendered: dict[str, str] = {}
         profile = self.user_profile
@@ -82,7 +164,13 @@ class ProfileSnapshot:
         if self.preferred_market:
             rendered["Preferred market"] = self.preferred_market
         for key, value in sorted(as_dict(profile.get("agent_preference")).items()):
-            rendered[f"Preference {key}"] = str(value)
+            # Every key, the ones that select guidance among them: a move in
+            # one moves the block. A key holding nothing has no line there,
+            # so it is no field here either.
+            text = line_text(value)
+            if text is not None:
+                rendered[f"Preference {key}"] = text
+        rendered.update(investment_lines(profile.get("investment_profile")))
         if profile.get("trading_permission"):
             # The whole rule rather than the level's name: a row is all the
             # model gets until the block is rebuilt, and a name alone would

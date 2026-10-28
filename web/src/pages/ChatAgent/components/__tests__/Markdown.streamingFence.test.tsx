@@ -7,6 +7,8 @@ vi.mock('@/contexts/ThemeContext', () => ({
 
 import Markdown from '../Markdown';
 import { REVEAL_SETTLE_MS } from '../../utils/revealFade';
+import { splitMarkdownBlocks } from '../../utils/markdownBlocks';
+import { repairStreamingTail } from '../../utils/streamingTail';
 
 // A block keeps its tree while lines land in a fence still open at its end
 // (streamingLineKey), so the DOM a stream builds by growing one mounted block
@@ -50,6 +52,15 @@ function text(content: string, streaming: boolean): string {
   return out;
 }
 
+// What a streaming render shows: its last block with the tail repaired. These
+// docs pass through the prose rewrites unchanged, so the raw text splits as
+// the processed text does.
+function repaired(content: string): string {
+  const blocks = splitMarkdownBlocks(content);
+  blocks[blocks.length - 1] = repairStreamingTail(blocks[blocks.length - 1]).text;
+  return blocks.join('');
+}
+
 type AstGenerator = { highlight: (code: string, language: string) => unknown };
 const generator = (): AstGenerator => (PrismAsyncLight as unknown as { astGenerator: AstGenerator }).astGenerator;
 
@@ -87,7 +98,7 @@ describe('Markdown streaming through a fence', () => {
         const prefix = doc.slice(0, end);
         act(() => view.rerender(<Markdown variant="chat" content={prefix} onOpenFile={() => {}} streaming />));
         expect(markup(view.container), `at ${JSON.stringify(prefix)}`).toBe(html(prefix, true));
-        expect(view.container.textContent, `at ${JSON.stringify(prefix)}`).toBe(text(prefix, false));
+        expect(view.container.textContent, `at ${JSON.stringify(prefix)}`).toBe(text(repaired(prefix), false));
       }
       act(() => view.rerender(<Markdown variant="chat" content={doc} onOpenFile={() => {}} />));
       act(() => {

@@ -1,6 +1,8 @@
 import React, { useEffect, useState, useCallback, useRef } from 'react';
 import { Sparkles, ArrowRight, Newspaper, Clock, ChevronDown } from 'lucide-react';
-import { motion, AnimatePresence } from '@/lib/framer';
+import { Disclosure } from '@/components/ui/Disclosure';
+import { SwapCell } from '@/components/ui/crossfade';
+import { useLastHeight } from '@/lib/lastShape';
 import { Loader } from '@/components/ui/loader';
 import { useTranslation } from 'react-i18next';
 import TopicBadge from './TopicBadge';
@@ -139,6 +141,11 @@ function AIDailyBriefCard({ onReadFull, instanceId }: AIDailyBriefCardProps) {
   const [generating, setGenerating] = useState(false);
   const [generateError, setGenerateError] = useState<string | null>(null);
   const mountedRef = useRef(true);
+  // The loaded card's height, kept for the skeleton of the next visit: a brief
+  // reads much like yesterday's, so the skeleton holds about the room the card
+  // will take and what sits below does not move when it lands. Not while the
+  // earlier insights are open, which the next visit does not start with.
+  const { ref: readyRef, height: lastHeight } = useLastHeight(`dashboard:brief.height.${instanceId ?? 'classic'}`, !expanded);
 
   useEffect(() => {
     return () => { mountedRef.current = false; };
@@ -231,48 +238,56 @@ function AIDailyBriefCard({ onReadFull, instanceId }: AIDailyBriefCardProps) {
     }
   }, [generating, onReadFull, t]);
 
+  // Each state below is a layer of one cell, so the brief crossfades from its
+  // skeleton in place rather than cutting to a card that then rises in.
   if (loading) {
     return (
-      <div
-        className="relative rounded-3xl overflow-hidden border p-8"
-        style={{
-          borderColor: 'var(--color-border-default)',
-          background: 'var(--color-bg-card)',
-        }}
-      >
-        <div className="animate-pulse space-y-4">
-          <div className="flex items-center gap-2">
-            <div className="h-6 w-40 rounded-full" style={{ backgroundColor: 'var(--color-bg-hover)' }} />
-            <div className="h-4 w-16 rounded" style={{ backgroundColor: 'var(--color-bg-hover)' }} />
-          </div>
-          <div className="h-8 w-3/4 rounded" style={{ backgroundColor: 'var(--color-bg-hover)' }} />
-          <div className="h-4 w-full rounded" style={{ backgroundColor: 'var(--color-bg-hover)' }} />
-          <div className="h-4 w-2/3 rounded" style={{ backgroundColor: 'var(--color-bg-hover)' }} />
-          <div className="flex gap-3">
-            <div className="h-8 w-28 rounded-lg" style={{ backgroundColor: 'var(--color-bg-hover)' }} />
-            <div className="h-8 w-24 rounded-lg" style={{ backgroundColor: 'var(--color-bg-hover)' }} />
-            <div className="h-8 w-20 rounded-lg" style={{ backgroundColor: 'var(--color-bg-hover)' }} />
+      <SwapCell as="div" swapKey="loading">
+        <div
+          data-fit-hold
+          className="relative rounded-3xl overflow-hidden border p-8"
+          style={{
+            borderColor: 'var(--color-border-default)',
+            background: 'var(--color-bg-card)',
+            height: lastHeight ?? undefined,
+          }}
+        >
+          <div className="animate-pulse space-y-4">
+            <div className="flex items-center gap-2">
+              <div className="h-6 w-40 rounded-full" style={{ backgroundColor: 'var(--color-bg-hover)' }} />
+              <div className="h-4 w-16 rounded" style={{ backgroundColor: 'var(--color-bg-hover)' }} />
+            </div>
+            <div className="h-8 w-3/4 rounded" style={{ backgroundColor: 'var(--color-bg-hover)' }} />
+            <div className="h-4 w-full rounded" style={{ backgroundColor: 'var(--color-bg-hover)' }} />
+            <div className="h-4 w-2/3 rounded" style={{ backgroundColor: 'var(--color-bg-hover)' }} />
+            <div className="flex gap-3">
+              <div className="h-8 w-28 rounded-lg" style={{ backgroundColor: 'var(--color-bg-hover)' }} />
+              <div className="h-8 w-24 rounded-lg" style={{ backgroundColor: 'var(--color-bg-hover)' }} />
+              <div className="h-8 w-20 rounded-lg" style={{ backgroundColor: 'var(--color-bg-hover)' }} />
+            </div>
           </div>
         </div>
-      </div>
+      </SwapCell>
     );
   }
 
   if (!latest) {
     return (
-      <div
-        className="relative rounded-3xl overflow-hidden border p-8 flex items-center justify-center"
-        style={{
-          borderColor: 'var(--color-border-default)',
-          background: 'var(--color-bg-card)',
-          minHeight: 200,
-        }}
-      >
-        <div className="text-center">
-          <Newspaper size={40} className="mx-auto mb-3 opacity-30" style={{ color: 'var(--color-accent-primary)' }} />
-          <p style={{ color: 'var(--color-text-secondary)' }}>{t('dashboard.brief.generatingFirst')}</p>
+      <SwapCell as="div" swapKey="empty">
+        <div
+          className="relative rounded-3xl overflow-hidden border p-8 flex items-center justify-center"
+          style={{
+            borderColor: 'var(--color-border-default)',
+            background: 'var(--color-bg-card)',
+            minHeight: 200,
+          }}
+        >
+          <div className="text-center">
+            <Newspaper size={40} className="mx-auto mb-3 opacity-30" style={{ color: 'var(--color-accent-primary)' }} />
+            <p style={{ color: 'var(--color-text-secondary)' }}>{t('dashboard.brief.generatingFirst')}</p>
+          </div>
         </div>
-      </div>
+      </SwapCell>
     );
   }
 
@@ -282,149 +297,213 @@ function AIDailyBriefCard({ onReadFull, instanceId }: AIDailyBriefCardProps) {
   const isPersonalized = latest.type === 'personalized';
 
   return (
-    <div className="relative">
-      {/* Stacked card shadows (visible only when collapsed and there are older insights) */}
-      {!expanded && older.length > 0 && (
-        <>
-          <div
-            className="absolute left-3 right-3 bottom-0 h-full rounded-3xl border pointer-events-none"
-            style={{
-              borderColor: 'var(--color-border-muted)',
-              background: 'var(--color-bg-card)',
-              transform: 'translateY(8px) scale(0.98)',
-              opacity: 0.6,
-              zIndex: 0,
-            }}
-          />
-          {older.length > 1 && (
+    <SwapCell as="div" swapKey="ready">
+      <div ref={readyRef} className="relative">
+        {/* Stacked card shadows (visible only when collapsed and there are older insights) */}
+        {!expanded && older.length > 0 && (
+          <>
             <div
-              className="absolute left-6 right-6 bottom-0 h-full rounded-3xl border pointer-events-none"
+              className="absolute left-3 right-3 bottom-0 h-full rounded-3xl border pointer-events-none"
               style={{
                 borderColor: 'var(--color-border-muted)',
                 background: 'var(--color-bg-card)',
-                transform: 'translateY(16px) scale(0.96)',
-                opacity: 0.35,
-                zIndex: -1,
+                transform: 'translateY(8px) scale(0.98)',
+                opacity: 0.6,
+                zIndex: 0,
               }}
             />
-          )}
-        </>
-      )}
-
-      <motion.div
-        layout
-        initial={{ opacity: 0, y: 20 }}
-        animate={{ opacity: 1, y: 0 }}
-        transition={{ delay: 0.2 }}
-        className="relative group rounded-3xl overflow-hidden border"
-        style={{
-          borderColor: 'var(--color-border-default)',
-          background: 'var(--color-bg-card)',
-          cursor: older.length > 0 ? 'pointer' : 'default',
-          zIndex: 1,
-        }}
-        onClick={handleCardClick}
-      >
-        <div className="absolute top-0 right-0 p-6 opacity-20 group-hover:opacity-40 transition-opacity pointer-events-none hidden sm:block">
-          <Newspaper size={120} style={{ color: 'var(--color-text-tertiary)' }} />
-        </div>
-
-        <div className="relative z-10 p-4 sm:p-8 flex flex-col gap-8 items-start">
-          <div className="flex-1">
-            <div className="flex items-center gap-2 mb-4">
+            {older.length > 1 && (
               <div
-                className="px-3 py-1 rounded-full border flex items-center gap-2 text-xs font-semibold uppercase tracking-wider"
+                className="absolute left-6 right-6 bottom-0 h-full rounded-3xl border pointer-events-none"
                 style={{
-                  backgroundColor: 'var(--color-accent-soft)',
-                  borderColor: 'var(--color-accent-overlay)',
-                  color: 'var(--color-accent-light)',
+                  borderColor: 'var(--color-border-muted)',
+                  background: 'var(--color-bg-card)',
+                  transform: 'translateY(16px) scale(0.96)',
+                  opacity: 0.35,
+                  zIndex: -1,
                 }}
-              >
-                <Sparkles size={12} />
-                {isPersonalized ? t('dashboard.brief.personalizedBrief') : t('dashboard.brief.eyebrow')}
-              </div>
-              {isPersonalized && (
-                <span
-                  className="px-2 py-0.5 rounded-full text-[0.625rem] font-semibold uppercase tracking-wider"
+              />
+            )}
+          </>
+        )}
+
+        <div
+          className="relative group rounded-3xl overflow-hidden border"
+          style={{
+            borderColor: 'var(--color-border-default)',
+            background: 'var(--color-bg-card)',
+            cursor: older.length > 0 ? 'pointer' : 'default',
+            zIndex: 1,
+          }}
+          onClick={handleCardClick}
+        >
+          <div className="absolute top-0 right-0 p-6 opacity-20 group-hover:opacity-40 transition-opacity pointer-events-none hidden sm:block">
+            <Newspaper size={120} style={{ color: 'var(--color-text-tertiary)' }} />
+          </div>
+
+          <div className="relative z-10 p-4 sm:p-8 flex flex-col gap-8 items-start">
+            <div className="flex-1">
+              <div className="flex items-center gap-2 mb-4">
+                <div
+                  className="px-3 py-1 rounded-full border flex items-center gap-2 text-xs font-semibold uppercase tracking-wider"
                   style={{
-                    color: latestType.accent,
-                    backgroundColor: `color-mix(in srgb, ${latestType.accent} 15%, transparent)`,
+                    backgroundColor: 'var(--color-accent-soft)',
+                    borderColor: 'var(--color-accent-overlay)',
+                    color: 'var(--color-accent-light)',
                   }}
                 >
-                  {t('dashboard.brief.basedOnWatchlistPortfolio')}
-                </span>
-              )}
-              {updatedAgo && (
-                <span className="text-xs" style={{ color: 'var(--color-text-secondary)' }}>
-                  {t('dashboard.brief.updatedWhen', { when: updatedAgo })}
-                </span>
-              )}
+                  <Sparkles size={12} />
+                  {isPersonalized ? t('dashboard.brief.personalizedBrief') : t('dashboard.brief.eyebrow')}
+                </div>
+                {isPersonalized && (
+                  <span
+                    className="px-2 py-0.5 rounded-full text-[0.625rem] font-semibold uppercase tracking-wider"
+                    style={{
+                      color: latestType.accent,
+                      backgroundColor: `color-mix(in srgb, ${latestType.accent} 15%, transparent)`,
+                    }}
+                  >
+                    {t('dashboard.brief.basedOnWatchlistPortfolio')}
+                  </span>
+                )}
+                {updatedAgo && (
+                  <span className="text-xs" style={{ color: 'var(--color-text-secondary)' }}>
+                    {t('dashboard.brief.updatedWhen', { when: updatedAgo })}
+                  </span>
+                )}
+              </div>
+
+              <h2
+                className="text-xl sm:text-3xl font-bold mb-4 leading-tight"
+                style={{ color: 'var(--color-text-primary)' }}
+              >
+                {latest.headline}
+              </h2>
+
+              <p
+                className="mb-6 leading-relaxed line-clamp-3 sm:line-clamp-none"
+                style={{ color: 'var(--color-text-secondary)' }}
+              >
+                {latest.summary}
+              </p>
+
+              <MobileTopicRow topics={topics} />
+
+              {/* Mobile: full-width CTA + stack indicator */}
+              <div className="flex flex-col gap-2 mt-4 sm:hidden">
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onReadFull?.(latest.market_insight_id);
+                  }}
+                  className="group/btn flex items-center justify-center gap-1.5 w-full py-2.5 rounded-lg text-sm font-semibold transition-colors"
+                  style={{
+                    backgroundColor: 'var(--color-btn-primary-bg)',
+                    color: 'var(--color-btn-primary-text)',
+                  }}
+                >
+                  {t('dashboard.brief.readFullBrief')}
+                  <ArrowRight size={14} className="group-hover/btn:translate-x-1 transition-transform" />
+                </button>
+                <button
+                  onClick={handleGeneratePersonalized}
+                  disabled={generating}
+                  title={t('dashboard.brief.generateTooltip')}
+                  className="group/btn flex items-center justify-center gap-1.5 w-full py-2.5 rounded-lg text-sm font-semibold transition-colors border"
+                  style={{
+                    borderColor: 'var(--color-border-default)',
+                    color: 'var(--color-text-secondary)',
+                    opacity: generating ? 0.6 : 1,
+                  }}
+                >
+                  {generating ? (
+                    <span aria-hidden="true" className="shrink-0">
+                      <Loader size={14} className="text-current" />
+                    </span>
+                  ) : <Sparkles size={14} />}
+                  {generating ? t('dashboard.brief.generating') : t('dashboard.brief.generatePersonalized')}
+                </button>
+                {generateError && (
+                  <p className="text-xs mt-1" style={{ color: 'var(--color-loss, #ef4444)' }}>{generateError}</p>
+                )}
+                {older.length > 0 && (
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setExpanded((v) => !v);
+                    }}
+                    className="flex items-center justify-center gap-1.5 text-xs transition-colors"
+                    style={{ color: 'var(--color-text-tertiary)' }}
+                  >
+                    <Clock size={12} />
+                    {t('dashboard.brief.earlierCount', { count: older.length })}
+                    <ChevronDown
+                      size={14}
+                      className="transition-transform"
+                      style={{ transform: expanded ? 'rotate(180deg)' : 'rotate(0deg)' }}
+                    />
+                  </button>
+                )}
+              </div>
             </div>
 
-            <h2
-              className="text-xl sm:text-3xl font-bold mb-4 leading-tight"
-              style={{ color: 'var(--color-text-primary)' }}
-            >
-              {latest.headline}
-            </h2>
-
-            <p
-              className="mb-6 leading-relaxed line-clamp-3 sm:line-clamp-none"
-              style={{ color: 'var(--color-text-secondary)' }}
-            >
-              {latest.summary}
-            </p>
-
-            <MobileTopicRow topics={topics} />
-
-            {/* Mobile: full-width CTA + stack indicator */}
-            <div className="flex flex-col gap-2 mt-4 sm:hidden">
-              <button
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onReadFull?.(latest.market_insight_id);
-                }}
-                className="group/btn flex items-center justify-center gap-1.5 w-full py-2.5 rounded-lg text-sm font-semibold transition-colors"
-                style={{
-                  backgroundColor: 'var(--color-btn-primary-bg)',
-                  color: 'var(--color-btn-primary-text)',
-                }}
-              >
-                {t('dashboard.brief.readFullBrief')}
-                <ArrowRight size={14} className="group-hover/btn:translate-x-1 transition-transform" />
-              </button>
-              <button
-                onClick={handleGeneratePersonalized}
-                disabled={generating}
-                title={t('dashboard.brief.generateTooltip')}
-                className="group/btn flex items-center justify-center gap-1.5 w-full py-2.5 rounded-lg text-sm font-semibold transition-colors border"
-                style={{
-                  borderColor: 'var(--color-border-default)',
-                  color: 'var(--color-text-secondary)',
-                  opacity: generating ? 0.6 : 1,
-                }}
-              >
-                {generating ? (
-                  <span aria-hidden="true" className="shrink-0">
-                    <Loader size={14} className="text-current" />
-                  </span>
-                ) : <Sparkles size={14} />}
-                {generating ? t('dashboard.brief.generating') : t('dashboard.brief.generatePersonalized')}
-              </button>
+            {/* Desktop CTA + stack indicator */}
+            <div className="hidden sm:flex w-auto flex-col items-end justify-end gap-3 self-stretch">
+              <div className="flex gap-2">
+                <button
+                  onClick={handleGeneratePersonalized}
+                  disabled={generating}
+                  title={t('dashboard.brief.generateTooltip')}
+                  className="group/btn flex items-center gap-2 px-5 py-3 rounded-xl font-semibold transition-colors border"
+                  style={{
+                    borderColor: 'var(--color-border-default)',
+                    color: 'var(--color-text-secondary)',
+                    opacity: generating ? 0.6 : 1,
+                  }}
+                  onMouseEnter={(e) => { if (!generating) e.currentTarget.style.backgroundColor = 'var(--color-bg-hover)'; }}
+                  onMouseLeave={(e) => { e.currentTarget.style.backgroundColor = 'transparent'; }}
+                >
+                  {generating ? (
+                    <span aria-hidden="true" className="shrink-0">
+                      <Loader size={16} className="text-current" />
+                    </span>
+                  ) : <Sparkles size={16} />}
+                  {generating ? t('dashboard.brief.generating') : t('dashboard.brief.generatePersonalized')}
+                </button>
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onReadFull?.(latest.market_insight_id);
+                  }}
+                  className="group/btn flex items-center gap-2 px-6 py-3 rounded-xl font-semibold transition-colors shadow-lg"
+                  style={{
+                    backgroundColor: 'var(--color-btn-primary-bg)',
+                    color: 'var(--color-btn-primary-text)',
+                  }}
+                  onMouseEnter={(e) => (e.currentTarget.style.opacity = '0.9')}
+                  onMouseLeave={(e) => (e.currentTarget.style.opacity = '1')}
+                >
+                  {t('dashboard.brief.readFullBrief')}
+                  <ArrowRight size={16} className="group-hover/btn:translate-x-1 transition-transform" />
+                </button>
+              </div>
               {generateError && (
-                <p className="text-xs mt-1" style={{ color: 'var(--color-loss, #ef4444)' }}>{generateError}</p>
+                <p className="text-xs text-right" style={{ color: 'var(--color-loss, #ef4444)' }}>{generateError}</p>
               )}
+
               {older.length > 0 && (
                 <button
                   onClick={(e) => {
                     e.stopPropagation();
                     setExpanded((v) => !v);
                   }}
-                  className="flex items-center justify-center gap-1.5 text-xs transition-colors"
+                  className="flex items-center gap-1.5 text-xs transition-colors"
                   style={{ color: 'var(--color-text-tertiary)' }}
+                  onMouseEnter={(e) => (e.currentTarget.style.color = 'var(--color-text-secondary)')}
+                  onMouseLeave={(e) => (e.currentTarget.style.color = 'var(--color-text-tertiary)')}
                 >
                   <Clock size={12} />
-                  {t('dashboard.brief.earlierCount', { count: older.length })}
+                  {t('dashboard.brief.earlierToday', { count: older.length })}
                   <ChevronDown
                     size={14}
                     className="transition-transform"
@@ -435,159 +514,83 @@ function AIDailyBriefCard({ onReadFull, instanceId }: AIDailyBriefCardProps) {
             </div>
           </div>
 
-          {/* Desktop CTA + stack indicator */}
-          <div className="hidden sm:flex w-auto flex-col items-end justify-end gap-3 self-stretch">
-            <div className="flex gap-2">
-              <button
-                onClick={handleGeneratePersonalized}
-                disabled={generating}
-                title={t('dashboard.brief.generateTooltip')}
-                className="group/btn flex items-center gap-2 px-5 py-3 rounded-xl font-semibold transition-colors border"
-                style={{
-                  borderColor: 'var(--color-border-default)',
-                  color: 'var(--color-text-secondary)',
-                  opacity: generating ? 0.6 : 1,
-                }}
-                onMouseEnter={(e) => { if (!generating) e.currentTarget.style.backgroundColor = 'var(--color-bg-hover)'; }}
-                onMouseLeave={(e) => { e.currentTarget.style.backgroundColor = 'transparent'; }}
-              >
-                {generating ? (
-                  <span aria-hidden="true" className="shrink-0">
-                    <Loader size={16} className="text-current" />
-                  </span>
-                ) : <Sparkles size={16} />}
-                {generating ? t('dashboard.brief.generating') : t('dashboard.brief.generatePersonalized')}
-              </button>
-              <button
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onReadFull?.(latest.market_insight_id);
-                }}
-                className="group/btn flex items-center gap-2 px-6 py-3 rounded-xl font-semibold transition-colors shadow-lg"
-                style={{
-                  backgroundColor: 'var(--color-btn-primary-bg)',
-                  color: 'var(--color-btn-primary-text)',
-                }}
-                onMouseEnter={(e) => (e.currentTarget.style.opacity = '0.9')}
-                onMouseLeave={(e) => (e.currentTarget.style.opacity = '1')}
-              >
-                {t('dashboard.brief.readFullBrief')}
-                <ArrowRight size={16} className="group-hover/btn:translate-x-1 transition-transform" />
-              </button>
-            </div>
-            {generateError && (
-              <p className="text-xs text-right" style={{ color: 'var(--color-loss, #ef4444)' }}>{generateError}</p>
-            )}
+          {/* Expanded timeline — inside the main card */}
+          <Disclosure open={expanded && older.length > 0}>
+            <div
+              className="mx-8 mb-6 border-t pt-5"
+              style={{ borderColor: 'var(--color-border-muted)' }}
+            >
+              <div className="flex items-center gap-2 mb-4">
+                <span
+                  className="text-[0.625rem] font-semibold uppercase tracking-wider"
+                  style={{ color: 'var(--color-text-tertiary)' }}
+                >
+                  {t('dashboard.brief.earlierInsights')}
+                </span>
+              </div>
 
-            {older.length > 0 && (
-              <button
-                onClick={(e) => {
-                  e.stopPropagation();
-                  setExpanded((v) => !v);
-                }}
-                className="flex items-center gap-1.5 text-xs transition-colors"
-                style={{ color: 'var(--color-text-tertiary)' }}
-                onMouseEnter={(e) => (e.currentTarget.style.color = 'var(--color-text-secondary)')}
-                onMouseLeave={(e) => (e.currentTarget.style.color = 'var(--color-text-tertiary)')}
-              >
-                <Clock size={12} />
-                {t('dashboard.brief.earlierToday', { count: older.length })}
-                <ChevronDown
-                  size={14}
-                  className="transition-transform"
-                  style={{ transform: expanded ? 'rotate(180deg)' : 'rotate(0deg)' }}
-                />
-              </button>
-            )}
-          </div>
+              <div className="space-y-1">
+                {older.map((item) => {
+                  const cfg = TYPE_CONFIG[item.type] || TYPE_CONFIG.market_update;
+                  return (
+                    <div key={item.market_insight_id} className="row-attach-host relative">
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          onReadFull?.(item.market_insight_id);
+                        }}
+                        className="w-full flex items-center gap-4 px-4 py-3 rounded-xl text-left transition-colors group/item"
+                        style={{ color: 'var(--color-text-secondary)' }}
+                        onMouseEnter={(e) => (e.currentTarget.style.backgroundColor = 'var(--color-bg-hover)')}
+                        onMouseLeave={(e) => (e.currentTarget.style.backgroundColor = 'transparent')}
+                      >
+                        <span
+                          className="text-xs font-medium shrink-0 w-16 text-right tabular-nums"
+                          style={{ color: 'var(--color-text-tertiary)' }}
+                        >
+                          {formatTime(item.completed_at, locale)}
+                        </span>
+
+                        <span
+                          className="w-2 h-2 rounded-full shrink-0"
+                          style={{ backgroundColor: cfg.accent }}
+                        />
+
+                        <span
+                          className="text-[0.625rem] font-semibold uppercase tracking-wider shrink-0 px-2 py-0.5 rounded"
+                          style={{
+                            color: cfg.accent,
+                            backgroundColor: `color-mix(in srgb, ${cfg.accent} 15%, transparent)`,
+                          }}
+                        >
+                          {t(cfg.labelKey)}
+                        </span>
+
+                        <span
+                          className="text-sm truncate flex-1 group-hover/item:text-(--color-text-primary) transition-colors"
+                        >
+                          {item.headline}
+                        </span>
+                      </button>
+                      {instanceId && (
+                        <span className="absolute right-2 top-1/2 -translate-y-1/2 z-10">
+                          <RowAttachButton instanceId={instanceId} rowId={item.market_insight_id} />
+                        </span>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          </Disclosure>
         </div>
 
-        {/* Expanded timeline — inside the main card */}
-        <AnimatePresence>
-          {expanded && older.length > 0 && (
-            <motion.div
-              initial={{ height: 0, opacity: 0 }}
-              animate={{ height: 'auto', opacity: 1 }}
-              exit={{ height: 0, opacity: 0 }}
-              transition={{ duration: 0.3, ease: [0.4, 0, 0.2, 1] }}
-              className="overflow-hidden"
-            >
-              <div
-                className="mx-8 mb-6 border-t pt-5"
-                style={{ borderColor: 'var(--color-border-muted)' }}
-              >
-                <div className="flex items-center gap-2 mb-4">
-                  <span
-                    className="text-[0.625rem] font-semibold uppercase tracking-wider"
-                    style={{ color: 'var(--color-text-tertiary)' }}
-                  >
-                    {t('dashboard.brief.earlierInsights')}
-                  </span>
-                </div>
-
-                <div className="space-y-1">
-                  {older.map((item) => {
-                    const cfg = TYPE_CONFIG[item.type] || TYPE_CONFIG.market_update;
-                    return (
-                      <div key={item.market_insight_id} className="row-attach-host relative">
-                        <button
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            onReadFull?.(item.market_insight_id);
-                          }}
-                          className="w-full flex items-center gap-4 px-4 py-3 rounded-xl text-left transition-colors group/item"
-                          style={{ color: 'var(--color-text-secondary)' }}
-                          onMouseEnter={(e) => (e.currentTarget.style.backgroundColor = 'var(--color-bg-hover)')}
-                          onMouseLeave={(e) => (e.currentTarget.style.backgroundColor = 'transparent')}
-                        >
-                          <span
-                            className="text-xs font-medium shrink-0 w-16 text-right tabular-nums"
-                            style={{ color: 'var(--color-text-tertiary)' }}
-                          >
-                            {formatTime(item.completed_at, locale)}
-                          </span>
-
-                          <span
-                            className="w-2 h-2 rounded-full shrink-0"
-                            style={{ backgroundColor: cfg.accent }}
-                          />
-
-                          <span
-                            className="text-[0.625rem] font-semibold uppercase tracking-wider shrink-0 px-2 py-0.5 rounded"
-                            style={{
-                              color: cfg.accent,
-                              backgroundColor: `color-mix(in srgb, ${cfg.accent} 15%, transparent)`,
-                            }}
-                          >
-                            {t(cfg.labelKey)}
-                          </span>
-
-                          <span
-                            className="text-sm truncate flex-1 group-hover/item:text-(--color-text-primary) transition-colors"
-                          >
-                            {item.headline}
-                          </span>
-                        </button>
-                        {instanceId && (
-                          <span className="absolute right-2 top-1/2 -translate-y-1/2 z-10">
-                            <RowAttachButton instanceId={instanceId} rowId={item.market_insight_id} />
-                          </span>
-                        )}
-                      </div>
-                    );
-                  })}
-                </div>
-              </div>
-            </motion.div>
-          )}
-        </AnimatePresence>
-      </motion.div>
-
-      {/* Bottom padding for stacked shadow effect */}
-      {!expanded && older.length > 0 && (
-        <div style={{ height: older.length > 1 ? 16 : 8 }} />
-      )}
-    </div>
+        {/* Bottom padding for stacked shadow effect */}
+        {!expanded && older.length > 0 && (
+          <div style={{ height: older.length > 1 ? 16 : 8 }} />
+        )}
+      </div>
+    </SwapCell>
   );
 }
 

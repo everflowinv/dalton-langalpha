@@ -39,10 +39,14 @@ export function OrderActionLink({
   href,
   vendorLabel,
   status,
+  className,
 }: {
   href: string | null | undefined;
   vendorLabel: string;
   status: OrderStatus | null | undefined;
+  /** The surface's own look in place of the button's, for a card drawn in
+   *  its own type. */
+  className?: string;
 }) {
   const { t } = useTranslation();
   const safe = safeExternalHref(href);
@@ -54,11 +58,10 @@ export function OrderActionLink({
       rel="noopener noreferrer"
       onClick={(e) => e.stopPropagation()}
       data-testid="order-action-link"
-      className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-md font-medium transition-colors hover:brightness-110 whitespace-nowrap"
-      style={{
-        backgroundColor: 'var(--color-btn-primary-bg)',
-        color: 'var(--color-btn-primary-text)',
-      }}
+      className={
+        className ??
+        'inline-flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-md font-medium transition-colors hover:brightness-110 whitespace-nowrap bg-(--color-btn-primary-bg) text-(--color-btn-primary-text)'
+      }
     >
       {t('toolArtifact.directTool.orderReceipt.openAt', { vendor: vendorLabel })}
       <ExternalLink className="h-3 w-3" aria-hidden="true" />

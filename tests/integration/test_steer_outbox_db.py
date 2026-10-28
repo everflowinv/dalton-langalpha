@@ -864,6 +864,175 @@ async def test_stop_hand_off_names_the_turn_a_hand_off_became(thread):
 
 
 # ---------------------------------------------------------------------------
+# A hand-off followed to the run that took it in
+#
+# A hand-off steered into a running turn is taken by whichever run reads it
+# first. The card follows it there (``get_owned_steers``) and the report of
+# the run that took it names it (``list_taken_hand_offs``); both read the one
+# taker rule, so each transition is checked through both.
+# ---------------------------------------------------------------------------
+
+
+async def _cos_steer(thread, run_id: str, text: str = "size the market") -> str:
+    return await _accepted(
+        thread, run_id, text, sender="chief_of_staff", platform=None
+    )
+
+
+async def _followed(thread, steer_id: str):
+    """Where the card finds the steer: ``(state, run_id, run status)``, or
+    None when it is omitted."""
+    from src.server.database.runs.handoff_liveness import get_owned_steers
+
+    steer = (await get_owned_steers([steer_id], thread.user_id)).get(steer_id)
+    if steer is None:
+        return None
+    run = steer["run"]
+    assert steer["thread_id"] == thread.id
+    if run is None:
+        assert steer["run_id"] is None
+        return steer["state"], None, None
+    # The run's view is the one ``runs`` gives a run asked for by its id.
+    assert str(run["conversation_response_id"]) == steer["run_id"]
+    assert str(run["conversation_thread_id"]) == thread.id
+    return steer["state"], steer["run_id"], run["status"]
+
+
+async def _reported(thread, *run_ids: str) -> list:
+    from src.server.database.runs import outbox
+
+    return await outbox.list_taken_hand_offs(thread.id, list(run_ids))
+
+
+async def test_a_hand_off_is_queued_until_held_and_taken_once_read(thread):
+    from src.server.database.runs import outbox
+
+    sent_to = await _run(thread)
+    steer_id = await _cos_steer(thread, sent_to)
+
+    assert await _followed(thread, steer_id) == ("queued", None, None)
+    assert await _reported(thread, sent_to) == []
+
+    # Already in the running turn's messages, waiting for its next step.
+    assert await outbox.hold_jobs([steer_id], owner=("run", sent_to)) == [steer_id]
+    assert await _followed(thread, steer_id) == ("taken", sent_to, "in_progress")
+    assert await _reported(thread, sent_to) == [steer_id]
+
+    assert await outbox.confirm_jobs([steer_id], owner=("run", sent_to)) == [steer_id]
+    await _end(thread, sent_to)
+
+    assert await _followed(thread, steer_id) == ("taken", sent_to, "completed")
+    assert await _reported(thread, sent_to) == [steer_id]
+
+
+@pytest.mark.parametrize("given_back", ["released", "run-ended-unread"])
+async def test_a_hold_given_back_is_queued_again(thread, given_back):
+    from src.server.database.runs import outbox
+
+    sent_to = await _run(thread)
+    steer_id = await _cos_steer(thread, sent_to)
+    await outbox.hold_jobs([steer_id], owner=("run", sent_to))
+    assert (await _followed(thread, steer_id))[0] == "taken"
+
+    if given_back == "released":
+        assert await outbox.release_jobs([steer_id], owner=("run", sent_to)) == [
+            steer_id
+        ]
+    else:
+        await _end(thread, sent_to)
+
+    assert await _followed(thread, steer_id) == ("queued", None, None)
+    assert await _reported(thread, sent_to) == []
+
+
+async def test_a_hand_off_its_run_missed_is_taken_by_the_next_run_to_read_it(thread):
+    from src.server.database.runs import outbox
+
+    sent_to = await _run(thread)
+    steer_id = await _cos_steer(thread, sent_to)
+    await _end(thread, sent_to)
+    later = await _run(thread)
+
+    await outbox.hold_jobs([steer_id], owner=("run", later))
+    await outbox.confirm_jobs([steer_id], owner=("run", later))
+
+    assert await _followed(thread, steer_id) == ("taken", later, "in_progress")
+    assert await _reported(thread, later) == [steer_id]
+    assert await _reported(thread, sent_to) == []
+
+
+async def test_a_hand_off_its_run_missed_is_taken_by_the_turn_it_becomes(thread):
+    from src.server.database.runs import outbox
+    from src.server.database.runs.lifecycle import start_run
+
+    sent_to = await _run(thread)
+    steer_id = await _cos_steer(thread, sent_to)
+    await _end(thread, sent_to)
+    assert await _followed(thread, steer_id) == ("queued", None, None)
+    turn_id = str(uuid.uuid4())
+
+    async def _before_commit(conn):
+        assert await outbox.claim_steer_for_turn(conn, steer_id, turn_id)
+
+    await start_run(
+        run_id=turn_id,
+        thread_id=thread.id,
+        request_key=str(uuid.uuid4()),
+        metadata={"msg_type": "ptc", "user_id": thread.user_id},
+        before_commit=_before_commit,
+    )
+
+    assert await _followed(thread, steer_id) == ("taken", turn_id, "in_progress")
+    assert await _reported(thread, turn_id) == [steer_id]
+    assert await _reported(thread, sent_to) == []
+
+
+@pytest.mark.parametrize("ending", ["error", "user-stop", "agent-stop"])
+async def test_a_hand_off_no_run_took_is_dropped(thread, ending):
+    from src.server.database.runs.lifecycle import request_run_cancel
+
+    sent_to = await _run(thread)
+    steer_id = await _cos_steer(thread, sent_to)
+
+    if ending == "error":
+        await _end(thread, sent_to, "error")
+    else:
+        await request_run_cancel(
+            sent_to, thread_id=thread.id, by_user=ending == "user-stop"
+        )
+        await _end(thread, sent_to, "cancelled")
+
+    assert await _followed(thread, steer_id) == ("dropped", None, None)
+    assert await _reported(thread, sent_to) == []
+
+
+async def test_hand_offs_are_named_oldest_first_and_user_steers_never(thread):
+    from src.server.database.runs import outbox
+
+    run_id = await _run(thread)
+    first = await _cos_steer(thread, run_id, "first")
+    user = await _accepted(thread, run_id, "the user's own")
+    second = await _cos_steer(thread, run_id, "second")
+    jobs = [first, user, second]
+    assert sorted(await outbox.hold_jobs(jobs, owner=("run", run_id))) == sorted(jobs)
+    await outbox.confirm_jobs(jobs, owner=("run", run_id))
+
+    assert await _reported(thread, run_id) == [first, second]
+    assert await _followed(thread, user) is None
+
+
+async def test_a_card_follows_only_its_callers_hand_offs(thread):
+    from src.server.database.runs.handoff_liveness import get_owned_steers
+
+    run_id = await _run(thread)
+    steer_id = await _cos_steer(thread, run_id)
+
+    assert await get_owned_steers([steer_id], "someone-else") == {}
+    asked = [steer_id, "not-a-uuid", str(uuid.uuid4())]
+    assert set(await get_owned_steers(asked, thread.user_id)) == {steer_id}
+
+
+# ---------------------------------------------------------------------------
 # The claim safety net
 # ---------------------------------------------------------------------------
 

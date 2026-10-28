@@ -181,6 +181,8 @@ class _Box:
 class _Sandbox:
     """One worker's object for the shared sandbox."""
 
+    mounts_livefs = True
+
     def __init__(self, box: _Box, *, lost: bool = False) -> None:
         self.sandbox_id = SANDBOX
         self.layout = LAYOUT
@@ -539,8 +541,13 @@ async def test_a_scrub_restart_is_recorded_for_every_worker(rows):
 
     sweeper = PlatformSecretSweeper()
     idle = SimpleNamespace(has_active_tasks_for_computer=AsyncMock(return_value=False))
-    provider = SimpleNamespace(get=AsyncMock(return_value=SimpleNamespace(capabilities=set())))
-    behind = {"workspace_id": None, "platform_secret_version": 0, "is_always_on": False}
+    provider = SimpleNamespace(get=AsyncMock(return_value=SimpleNamespace(autostops=False)))
+    behind = {
+        "workspace_id": None,
+        "kind": "daytona",
+        "platform_secret_version": 0,
+        "is_always_on": False,
+    }
     with (
         patch(
             "ptc_agent.core.sandbox.platform_secrets.converge_sandbox_platform_secrets",
@@ -588,7 +595,9 @@ async def test_an_attach_whose_tool_overlay_fails_still_reads_the_rows(
     monkeypatch.setattr(worker, "_keep_livefs", keep)
 
     await worker._ensure_project_attached(
-        ComputerBinding(WS_A, COMPUTER), SimpleNamespace(sandbox=sandbox), user_id=USER
+        ComputerBinding(WS_A, COMPUTER, "docker"),
+        SimpleNamespace(sandbox=sandbox),
+        user_id=USER,
     )
 
     keep.assert_not_awaited()
@@ -615,7 +624,9 @@ async def test_an_attach_ending_early_takes_back_a_mount_the_rows_say_is_down(
     monkeypatch.setattr(worker, "_ensure_project_tool_overlay", AsyncMock(return_value=False))
 
     await worker._ensure_project_attached(
-        ComputerBinding(WS_A, COMPUTER), SimpleNamespace(sandbox=sandbox), user_id=USER
+        ComputerBinding(WS_A, COMPUTER, "docker"),
+        SimpleNamespace(sandbox=sandbox),
+        user_id=USER,
     )
 
     assert sandbox.livefs is None
@@ -724,6 +735,8 @@ async def test_a_reconnect_to_a_running_sandbox_reads_the_mount_off_its_one_exec
     mount; the supervisor start every reconnect runs says, at no exec more."""
 
     class _Provider:
+        converges_env = False
+
         async def get(self, sandbox_id, **kwargs):
             return _Running()
 
@@ -765,7 +778,10 @@ async def test_the_supervisor_start_asks_whether_the_mount_answers(stdout, answe
         return await func(*args)
 
     sandbox = SimpleNamespace(
-        runtime=SimpleNamespace(exec=exec_), _runtime_call=runtime_call, _work_dir=ROOT
+        runtime=SimpleNamespace(exec=exec_),
+        _runtime_call=runtime_call,
+        _work_dir=ROOT,
+        mounts_livefs=True,
     )
 
     assert await mcp_setup._start_internal_mcp_servers(sandbox) is answered

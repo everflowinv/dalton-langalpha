@@ -47,8 +47,8 @@ function makeAutomation(overrides: Partial<Automation> = {}): Automation {
   };
 }
 
-/** A blank form placed in All workspaces, so only what a test changes can
- *  fail it. Its saves name HOME, the id All workspaces resolves to. */
+/** A blank form placed in the Chief of Staff, so only what a test changes can
+ *  fail it. Its saves name HOME, the id the Chief of Staff resolves to. */
 const PLACED: FormState = { ...INITIAL_FORM, place: ALL_WORKSPACES };
 
 const priceForm = (overrides: Partial<FormState>): FormState => ({
@@ -187,7 +187,7 @@ describe('automationToFormState', () => {
     expect(form.max_failures).toBe(5);
   });
 
-  it('opens a workspace automation on its workspace, and one naming Home as All workspaces', () => {
+  it('opens a workspace automation on its workspace, and one naming Home as the Chief of Staff', () => {
     expect(automationToFormState(makeAutomation({ workspace_id: 'ws-1' }), 'UTC', HOME).place).toBe('ws-1');
     expect(automationToFormState(makeAutomation({ workspace_id: HOME }), 'UTC', HOME).place).toBe(ALL_WORKSPACES);
   });

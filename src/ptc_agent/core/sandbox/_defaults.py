@@ -6,14 +6,13 @@ NOTE: `Dockerfile.sandbox` (the Docker provider's image) hand-mirrors
 at build time. Keep both in sync when editing either.
 """
 
-SNAPSHOT_PYTHON_VERSION = "3.12"  # Intentionally pinned for stability/compatibility.
-SANDBOX_NODE_VERSION = "24.14.1"  # Pinned; mirrored in Dockerfile.sandbox.
+SANDBOX_NODE_VERSION = "24.22.0"  # Pinned; mirrored in Dockerfile.sandbox.
 
 # One version for both language ports of Playwright. The npm package and the
 # Python package resolve the browser revision from their own version number, so
 # leaving either unpinned lets them drift apart and bake two Chromium revisions
 # (plus two headless shells) into the image. scrapling[all] requires >= 1.62.0.
-SANDBOX_PLAYWRIGHT_VERSION = "1.63.0"
+SANDBOX_PLAYWRIGHT_VERSION = "1.64.0"
 
 # Thread cap for a snapshot built without resolved tier resources (an unknown
 # tier falls back to a platform-default-sized sandbox). One thread never
@@ -99,8 +98,9 @@ DEFAULT_DEPENDENCIES = [
     "ironcalc",
     "firecrawl-anydoc",
     "markitdown[docx,pptx,xlsx]",
-    # Web scraping
-    "scrapling[all]",
+    # Web scraping. 0.5 removed the Playwright browser tier that
+    # mcp_servers/_browser.py and the web-scraping skill drive.
+    "scrapling[all]==0.4.15",
     "html-to-markdown",
     "trafilatura",
     "youtube-transcript-api",

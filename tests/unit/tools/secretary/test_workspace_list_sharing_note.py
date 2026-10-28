@@ -50,19 +50,16 @@ def _install_list_seams(
 
     ws_db.get_workspaces_for_user.side_effect = _for_user
 
-    from src.server.database import home_workspace
+    # workspaces_list reads folder placement through the secretary utils
+    # helper (upstream B1); it never touches Home's workspace row itself.
+    from src.tools.secretary import utils as secretary_utils
 
+    placement = secretary_utils.ComputerPlacement.from_rows([])
     monkeypatch.setattr(
-        home_workspace,
-        "get_home_workspace_id",
-        create_autospec(home_workspace.get_home_workspace_id, return_value="ws-home"),
-    )
-    monkeypatch.setattr(
-        ws_db,
-        "get_workspace",
+        secretary_utils,
+        "read_computer_placement",
         create_autospec(
-            ws_db.get_workspace,
-            return_value={"workspace_id": "ws-home", "computer_id": "comp-1"},
+            secretary_utils.read_computer_placement, return_value=placement
         ),
     )
 

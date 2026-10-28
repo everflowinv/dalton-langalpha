@@ -465,8 +465,8 @@ describe('NavigationPanel — workspace drag-reorder affordances', () => {
     const sortable = screen.getByText('Workspace A').closest('[aria-roledescription="sortable"]');
     expect(sortable).not.toBeNull();
     // Home drags too; the pin-boundary guard keeps it inside the pinned
-    // block. It shows as All workspaces, not its stored name.
-    expect(screen.getByText('agents.allWorkspaces').closest('[aria-roledescription="sortable"]')).not.toBeNull();
+    // block. It shows as the Chief of Staff, not its stored name.
+    expect(screen.getByText('agents.chiefOfStaff').closest('[aria-roledescription="sortable"]')).not.toBeNull();
   });
 
   it('renders plain rows when no reorder handler is provided', () => {

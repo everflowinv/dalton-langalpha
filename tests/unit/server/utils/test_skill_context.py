@@ -51,6 +51,69 @@ def test_parse_filters_non_skill_items():
     assert [s.name for s in result] == ["research"]
 
 
+_PROPOSE_INSTRUCTION = (
+    "Onboarding kickoff. Action: propose. Brokerage: none. Brokerages used: "
+    "Fidelity, 华泰证券. Screenshots: 2. Market brief: attached. The investing "
+    "profile is already saved; do not ask for it again."
+)
+_BRIEF = (
+    "<market-brief>\n"
+    "# Chip stocks slide on new export curbs\n"
+    "Type: daily · Completed: 2026-10-19T13:30:00Z · Model: example\n\n"
+    "Semiconductors led the market lower.\n"
+    "</market-brief>"
+)
+_PNG = "data:image/png;base64,iVBORw0KGgo="
+
+# What the welcome flow sends when the user wrote no task: the onboarding
+# skill alone, the day's brief as a directive, and the screenshots as images.
+_KICKOFF = [
+    {"type": "skills", "name": "onboarding", "instruction": _PROPOSE_INSTRUCTION},
+    {"type": "directive", "content": _BRIEF},
+    {"type": "image", "data": _PNG, "description": "positions.png"},
+    {"type": "image", "data": _PNG, "description": "watchlist.png"},
+]
+
+
+def test_kickoff_parses_to_one_skill_beside_its_brief_and_images():
+    """Each parser takes only its own entries from the kickoff: one skill with
+    its instruction whole, the brief as a directive, the images as images."""
+    from src.server.models.chat import ChatRequest
+    from src.server.utils.directive_context import parse_directive_contexts
+    from src.server.utils.multimodal_context import parse_multimodal_contexts
+
+    request = ChatRequest(
+        messages=[{"role": "user", "content": "Bring in my holdings and suggest where to start."}],
+        additional_context=_KICKOFF,
+    )
+
+    assert [(s.name, s.instruction) for s in parse_skill_contexts(request.additional_context)] == [
+        ("onboarding", _PROPOSE_INSTRUCTION),
+    ]
+    assert [d.content for d in parse_directive_contexts(request.additional_context)] == [_BRIEF]
+    images = parse_multimodal_contexts(request.additional_context)
+    assert [(i.type, i.description) for i in images] == [
+        ("image", "positions.png"),
+        ("image", "watchlist.png"),
+    ]
+
+
+def test_kickoff_reaches_the_agent_config_whole():
+    """``prepare_skill_contexts`` is what rides ``configurable``: the one
+    entry arrives with its instruction, and the message is left alone since
+    no slash fallback runs."""
+    from src.server.handlers.chat.request_prep import prepare_skill_contexts
+    from src.server.models.chat import ChatRequest
+
+    messages = [{"role": "user", "content": "Suggest where to start."}]
+    request = ChatRequest(messages=messages, additional_context=_KICKOFF)
+
+    contexts = prepare_skill_contexts(messages, request)
+
+    assert contexts == [{"name": "onboarding", "instruction": _PROPOSE_INSTRUCTION}]
+    assert messages[0]["content"] == "Suggest where to start."
+
+
 # ---------------------------------------------------------------------------
 # detect_slash_commands
 # ---------------------------------------------------------------------------

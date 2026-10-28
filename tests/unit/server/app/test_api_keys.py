@@ -224,6 +224,141 @@ async def test_update_api_keys_base_url_validation(client):
     assert resp.status_code == 422
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "url", ["http://127.0.0.1:11434/v1", "http://localhost:1234/v1", "http://169.254.169.254/latest"]
+)
+async def test_platform_refuses_a_private_base_url_before_writing(client, monkeypatch, url):
+    monkeypatch.setattr("src.config.settings.HOST_MODE", "platform")
+    with (
+        patch(f"{DB}._get_custom_providers", new_callable=AsyncMock, return_value=[]),
+        patch(f"{DB}.set_byok_enabled", new_callable=AsyncMock) as toggle,
+        patch(f"{DB}.upsert_api_key", new_callable=AsyncMock) as upsert,
+    ):
+        resp = await client.put(
+            "/api/v1/users/me/api-keys",
+            json={
+                "byok_enabled": True,
+                "api_keys": {"openai": "sk-newkey1234567890"},
+                "base_urls": {"openai": url},
+            },
+        )
+
+    assert resp.status_code == 400
+    assert resp.json()["detail"] == (
+        "Base URL for openai cannot be used: it points to a private or reserved address. "
+        "Use a public URL."
+    )
+    toggle.assert_not_awaited()
+    upsert.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_oss_saves_a_local_base_url(client):
+    with (
+        patch(f"{DB}.upsert_api_key", new_callable=AsyncMock) as upsert,
+        patch(f"{DB}._get_custom_providers", new_callable=AsyncMock, return_value=[]),
+        patch(
+            f"{DB}.get_user_api_keys",
+            new_callable=AsyncMock,
+            return_value={"byok_enabled": True, "keys": {}, "base_urls": {}},
+        ),
+        patch(
+            "src.server.services.onboarding.maybe_complete_personalization",
+            new_callable=AsyncMock,
+            return_value=False,
+        ),
+    ):
+        resp = await client.put(
+            "/api/v1/users/me/api-keys",
+            json={
+                "api_keys": {"openai": "sk-newkey1234567890"},
+                "base_urls": {"openai": "http://localhost:1234/v1"},
+            },
+        )
+
+    assert resp.status_code == 200
+    upsert.assert_awaited_once_with(
+        "test-user-123", "openai", "sk-newkey1234567890", base_url="http://localhost:1234/v1"
+    )
+
+
+@pytest.mark.asyncio
+async def test_platform_key_test_refuses_a_private_base_url(client, monkeypatch):
+    monkeypatch.setattr("src.config.settings.HOST_MODE", "platform")
+    with (
+        patch(f"{DB}._get_custom_providers", new_callable=AsyncMock, return_value=[]),
+        patch(
+            "src.utils.cache.redis_cache.get_cache_client",
+            return_value=MagicMock(enabled=False),
+        ),
+        patch(f"{DB}._test_openai_key", new_callable=AsyncMock) as probe,
+    ):
+        resp = await client.post(
+            "/api/v1/keys/test",
+            json={"provider": "openai", "api_key": "sk-newkey1234567890", "base_url": "http://[::1]:8000/v1"},
+        )
+
+    assert resp.status_code == 400
+    assert "private or reserved address" in resp.json()["detail"]
+    probe.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_platform_refuses_an_unknown_provider_before_resolving_its_url(client, monkeypatch):
+    monkeypatch.setattr("src.config.settings.HOST_MODE", "platform")
+    with (
+        patch(f"{DB}._get_custom_providers", new_callable=AsyncMock, return_value=[]),
+        patch(
+            "src.server.services.llm.egress.endpoint_refusal", new_callable=AsyncMock
+        ) as check,
+        patch(f"{DB}.set_byok_enabled", new_callable=AsyncMock) as toggle,
+    ):
+        resp = await client.put(
+            "/api/v1/users/me/api-keys",
+            json={
+                "byok_enabled": True,
+                "base_urls": {
+                    "openai": "https://gateway.test/v1",
+                    "not-a-provider": "https://slow.test/v1",
+                },
+            },
+        )
+
+    assert resp.status_code == 400
+    assert resp.json()["detail"] == "Unsupported provider: not-a-provider."
+    check.assert_not_awaited()
+    toggle.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_platform_key_test_refused_at_connect_is_a_400(client, monkeypatch):
+    """The name is public when checked and loopback when dialed."""
+    import socket
+
+    monkeypatch.setattr("src.config.settings.HOST_MODE", "platform")
+    answers = iter(["93.184.215.14", "127.0.0.1"])
+
+    def getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (next(answers), port))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", getaddrinfo)
+    with (
+        patch(f"{DB}._get_custom_providers", new_callable=AsyncMock, return_value=[]),
+        patch(
+            "src.utils.cache.redis_cache.get_cache_client",
+            return_value=MagicMock(enabled=False),
+        ),
+    ):
+        resp = await client.post(
+            "/api/v1/keys/test",
+            json={"provider": "openai", "api_key": "sk-newkey1234567890", "base_url": "https://rebind.test/v1"},
+        )
+
+    assert resp.status_code == 400
+    assert "private or reserved address" in resp.json()["detail"]
+
+
 # ---------------------------------------------------------------------------
 # DELETE /api/v1/users/me/api-keys/{provider}
 # ---------------------------------------------------------------------------

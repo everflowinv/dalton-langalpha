@@ -9,7 +9,7 @@ Use src.config.loaders for file-based loading.
 import os
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, TypedDict
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -17,6 +17,7 @@ from ptc_agent.config.plugins import bundled_skill_dirs
 from ptc_agent.config.core import (
     CoreConfig,
     DaytonaConfig,
+    E2BConfig,
     FilesystemConfig,
     LoggingConfig,
     MCPConfig,
@@ -24,12 +25,20 @@ from ptc_agent.config.core import (
     SandboxConfig,
     SecurityConfig,
     create_default_security_config,
-    default_sandbox_skills_base,
-    validate_daytona_api_key,
+    detect_provider_kind,
+    validate_sandbox_api_keys,
 )
 
 if TYPE_CHECKING:
     from langchain_core.language_models import BaseChatModel
+
+
+class SubagentModel(TypedDict):
+    """The model a subagent runs when it is not its launcher's: the catalog
+    name and the provider serving it."""
+
+    id: str
+    provider: str
 
 
 class CredentialSource(StrEnum):
@@ -60,7 +69,14 @@ class CompactionConfig(BaseModel):
 
     enabled: bool = True
     token_threshold: int = 120000
-    keep_messages: int = 5
+    #: How much of the newest history a summary keeps word for word, in
+    #: tokens (see ``keep_cutoff``). The same for every preset: a larger tail
+    #: only brings the next summary sooner.
+    keep_tokens: int = 20_000
+    #: The same for a Claude model. Its tokenizer counts about 1.6 times
+    #: the others' for the same text, in every language measured, so this
+    #: keeps about the work ``keep_tokens`` keeps elsewhere.
+    claude_keep_tokens: int = 32_000
     truncate_args_idle_minutes: int | None = 90
     truncate_args_keep_messages: int = 20
     truncate_args_max_length: int = 2000
@@ -71,20 +87,35 @@ class CompactionConfig(BaseModel):
     #: window. Reported, never read: the knobs are the behavior.
     profile: str | None = None
 
+    #: Whether a model whose provider can compact the conversation itself does
+    #: (see ``src.llms.provider_compaction``): the user's ``native_compaction``
+    #: setting, set per turn by ``apply_compaction``. The ``provider_compaction``
+    #: feature gates it when the middleware is built.
+    native: bool = True
 
-# Named presets that bundle the two user-facing compaction knobs
-# (token_threshold, keep_messages). Applied at request time in
-# ``resolve_llm_config`` when the user selects a profile.
+    #: Whether a model whose provider does not compact the conversation
+    #: writes its own summary, from its cached request, with the transcript
+    #: summarizer as the fallback (see ``CompactionMiddleware._writes_own``).
+    self_summary: bool = True
+
+
+# Named presets for when a thread compacts (token_threshold). Applied at
+# request time in ``resolve_llm_config`` when the user selects a profile, and
+# listed here in ascending order, which the settings pages draw them in.
 #
-# Thresholds are chosen to leave healthy headroom under common model context
-# windows: 100k (<=200k models), 130k (200k models), 200k (400k/1M models),
-# 300k (1M models). The kept tail scales with the threshold so that relaxed
-# profiles also keep more recent history.
+# Thresholds leave headroom under common context windows: 100k-130k for 200k
+# models, 200k for 400k models, 300k-750k for 1M models. ``economy`` stops
+# short of 272k, past which OpenAI bills a whole request at long-context
+# rates.
 COMPACTION_PROFILES: dict[str, dict[str, int]] = {
-    "aggressive": {"token_threshold": 100000, "keep_messages": 5},
-    "moderate": {"token_threshold": 130000, "keep_messages": 8},
-    "extended": {"token_threshold": 200000, "keep_messages": 10},
-    "relaxed": {"token_threshold": 300000, "keep_messages": 15},
+    "aggressive": {"token_threshold": 100000},
+    "moderate": {"token_threshold": 130000},
+    "extended": {"token_threshold": 200000},
+    "economy": {"token_threshold": 250000},
+    "relaxed": {"token_threshold": 300000},
+    "spacious": {"token_threshold": 400000},
+    "expansive": {"token_threshold": 500000},
+    "maximal": {"token_threshold": 750000},
 }
 
 
@@ -123,10 +154,9 @@ class SkillsConfig(BaseModel):
     enabled: bool = True
     #: See ``DEFAULT_USER_SKILLS_DIR``.
     user_skills_dir: str = DEFAULT_USER_SKILLS_DIR
-    sandbox_skills_base: str = "/home/workspace/.agents/skills"  # Where skills live in sandbox
 
-    def local_skill_dirs_with_sandbox(self) -> list[tuple[str, str]]:
-        """Return ordered (local_dir, sandbox_dir) sources.
+    def local_skill_dirs(self) -> list[str]:
+        """Return the ordered host-side skill sources.
 
         Precedence is last-wins (later sources override earlier ones).
         Order: bundled skills < user skills.
@@ -136,12 +166,10 @@ class SkillsConfig(BaseModel):
         operator's from their home — so a server started from anywhere finds
         the same skills, which a directory relative to ``cwd`` could not
         promise once the shipped skills moved into the bundles that declare
-        them.
+        them. Where they land is the sandbox's to say: the folder sits under
+        each computer's own root, which no deployment-wide setting knows.
         """
-        return [
-            (str(d), self.sandbox_skills_base)
-            for d in host_skill_dirs(self.user_skills_dir)
-        ]
+        return [str(d) for d in host_skill_dirs(self.user_skills_dir)]
 
 
 class SubagentConfig(BaseModel):
@@ -266,6 +294,15 @@ class LLMConfig(BaseModel):
     def fetch_name(self) -> str | None:
         return self.fetch or self.background
 
+    def fallbacks_for(self, model: str | None) -> list[str]:
+        """``fallback`` as a chain behind ``model``: without ``model`` itself
+        and without repeats, in order.
+
+        Either one sends the request that just failed back to the model that
+        refused it, which costs a full attempt and can only fail the same way.
+        """
+        return list(dict.fromkeys(m for m in self.fallback or () if m and m != model))
+
 
 class AgentConfig(BaseModel):
     """Agent-specific configuration.
@@ -346,6 +383,12 @@ class AgentConfig(BaseModel):
     # Written alongside the clients above, because a role without a client of
     # its own still runs a model: by name, or by inheriting the main one.
     role_prompt_guidance: dict[str, str] = Field(default_factory=dict, exclude=True)
+    # Each subagent whose clients above run a model other than the turn's.
+    # Admission records it on the run, because nothing downstream of the
+    # build can still tell which model a run used.
+    subagent_models: dict[str, SubagentModel] = Field(
+        default_factory=dict, exclude=True
+    )
     # None permits standalone name resolution; [] means resolution rejected all candidates.
     fallback_llm_clients: list[Any] | None = Field(default=None, exclude=True)
     # Display names aligned index-for-index with ``fallback_llm_clients``
@@ -402,6 +445,10 @@ class AgentConfig(BaseModel):
             python_version: Python version in sandbox (default: "3.12")
             auto_stop_interval: Seconds before auto-stop (default: 3600)
 
+        Optional - E2B (used when no Daytona key is set):
+            E2B_API_KEY: Your E2B API key (https://e2b.dev/dashboard?tab=keys)
+            E2B_DOMAIN / E2B_API_URL / E2B_SANDBOX_URL: self-hosted E2B only
+
         Optional - MCP:
             mcp_servers: List[MCPServerConfig] for additional tools (default: [])
 
@@ -447,26 +494,24 @@ class AgentConfig(BaseModel):
         llm_config = LLMConfig(name="custom")
 
         # Resolve provider: explicit > env var > auto-detect from API key presence
-        resolved_provider = provider or os.getenv("SANDBOX_PROVIDER", "")
-        if not resolved_provider:
-            resolved_provider = (
-                "daytona"
-                if (daytona_api_key or os.getenv("DAYTONA_API_KEY"))
-                else "docker"
-            )
+        resolved_provider = (
+            provider
+            or os.getenv("SANDBOX_PROVIDER", "")
+            or detect_provider_kind(daytona_api_key or "")
+        )
 
         # Create Daytona config (required for daytona provider, defaults for others).
         # Defaults live on DaytonaConfig (src/ptc_agent/config/core.py) — the
         # single source of truth for Python-side values. agent_config.yaml is
         # the runtime SSoT and overrides these.
         if resolved_provider == "daytona":
-            api_key = daytona_api_key or os.getenv("DAYTONA_API_KEY", "")
+            _daytona_defaults = DaytonaConfig.from_section(None)
+            api_key = daytona_api_key or _daytona_defaults.api_key
             if not api_key:
                 raise ValueError("DAYTONA_API_KEY must be provided or set in environment")
-            _daytona_defaults = DaytonaConfig()
             daytona_config = DaytonaConfig(
                 api_key=api_key,
-                secret_namespace=os.getenv("DAYTONA_SECRET_NAMESPACE", ""),
+                secret_namespace=_daytona_defaults.secret_namespace,
                 base_url=daytona_base_url,
                 auto_stop_interval=kwargs.pop(
                     "auto_stop_interval", _daytona_defaults.auto_stop_interval
@@ -493,6 +538,10 @@ class AgentConfig(BaseModel):
         else:
             # Non-Daytona providers don't need Daytona config; use defaults
             daytona_config = DaytonaConfig()
+
+        e2b_config = E2BConfig.from_section(None)
+        if resolved_provider == "e2b":
+            e2b_config.require_api_key()
 
         # Create Security config with defaults
         security_defaults = create_default_security_config()
@@ -537,20 +586,16 @@ class AgentConfig(BaseModel):
             enable_path_validation=kwargs.pop("enable_path_validation", True),
         )
 
-        # Create Skills config (derive sandbox_skills_base from filesystem working_directory)
         skills_config = SkillsConfig(
             enabled=kwargs.pop("skills_enabled", True),
             user_skills_dir=kwargs.pop("user_skills_dir", "~/.ptc-agent/skills"),
-            sandbox_skills_base=kwargs.pop(
-                "sandbox_skills_base",
-                default_sandbox_skills_base(filesystem_config.working_directory),
-            ),
         )
 
         # Wrap in SandboxConfig with resolved provider
         sandbox_config = SandboxConfig(
             provider=resolved_provider,
             daytona=daytona_config,
+            e2b=e2b_config,
         )
 
         # Create the config
@@ -577,7 +622,7 @@ class AgentConfig(BaseModel):
     def validate_api_keys(self) -> None:
         """Validate that required API keys are present.
 
-        For configs created via create(), only checks DAYTONA_API_KEY since
+        For configs created via create(), only checks the sandbox provider key since
         the LLM client is passed directly with its own API key.
 
         For configs created via load_from_files(), LLM API key validation
@@ -586,8 +631,7 @@ class AgentConfig(BaseModel):
         Raises:
             ValueError: If required API keys are missing
         """
-        if self.sandbox.provider == "daytona":
-            validate_daytona_api_key(self.sandbox.daytona)
+        validate_sandbox_api_keys(self.sandbox)
 
     def get_llm_client(self) -> "BaseChatModel":
         """Return the LLM client instance.

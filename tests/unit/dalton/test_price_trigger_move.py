@@ -20,11 +20,14 @@ import src.data_client as data_client
 import src.server.database.pool as db_pool
 import src.server.services.price_monitor as price_monitor
 import src.utils.cache.redis_cache as redis_cache
+from src.dalton.autonomy import price_trigger
 from src.dalton.autonomy.price_trigger import (
     classify_dalton_price_move,
     is_dalton_price_move_automation,
     process_polled_snapshot,
     record_snapshot_reference,
+    refresh_dalton_reference_if_needed,
+    symbol_has_dalton_move,
 )
 from src.dalton.autonomy.schedule import build_company_watch_specs
 from src.data_client.market_data_provider import MarketDataProvider
@@ -357,15 +360,19 @@ class _Harness:
         self, *automations: dict[str, Any]
     ) -> PriceMonitorService:
         svc = PriceMonitorService()
-        sym_map: dict[str, list[dict[str, Any]]] = {}
-        mkt_map: dict[str, MarketType] = {}
+        # Upstream keys _symbol_automations by (symbol, market) listings and
+        # the poll loop reads the merged _listings set _resubscribe maintains.
+        sym_map: dict[tuple[str, MarketType], list[dict[str, Any]]] = {}
         for auto in automations:
             self.register_automation(auto)
             sym = str(auto["trigger_config"]["symbol"]).upper()
-            sym_map.setdefault(sym, []).append(auto)
-            mkt_map[sym] = MarketType.STOCK
+            market = MarketType(
+                str(auto["trigger_config"].get("market", "stock")).lower()
+            )
+            sym_map.setdefault((sym, market), []).append(auto)
         svc._symbol_automations = sym_map
-        svc._symbol_markets = mkt_map
+        svc._automation_listings = set(sym_map)
+        svc._listings = set(sym_map)
         return svc
 
 
@@ -434,8 +441,8 @@ async def test_friday_intraday_drop_triggers_once_and_does_not_retrigger_over_we
     )
     await svc._poll_snapshots(poll_stock=True, poll_index=False)
     assert harness.scheduler.dispatch.call_count == 1
-    assert svc._dalton_move_refs["NVDA"]["previous_close"] == 95.5
-    assert svc._dalton_move_refs["NVDA"]["trading_date"] == "2026-10-26"
+    assert svc._dalton_move_refs[("NVDA", MarketType.STOCK)]["previous_close"] == 95.5
+    assert svc._dalton_move_refs[("NVDA", MarketType.STOCK)]["trading_date"] == "2026-10-26"
 
 
 @pytest.mark.asyncio
@@ -642,7 +649,7 @@ async def test_stale_reference_price_and_failed_snapshot_validation_do_not_mark_
     svc = harness.make_service(auto)
 
     # Pre-seed _dalton_move_refs with Friday's validated reference (trading_date="2026-10-23")
-    svc._dalton_move_refs["NVDA"] = {
+    svc._dalton_move_refs[("NVDA", MarketType.STOCK)] = {
         "previous_close": 100.0,
         "day_open": 99.0,
         "trading_date": "2026-10-23",
@@ -669,13 +676,11 @@ async def test_stale_reference_price_and_failed_snapshot_validation_do_not_mark_
     }
     harness.set_snapshots([bad_snapshot])
     await svc._poll_snapshots(poll_stock=True, poll_index=False)
-    assert svc._dalton_move_refs.get("NVDA") is None
+    assert svc._dalton_move_refs.get(("NVDA", MarketType.STOCK)) is None
     assert harness.scheduler.dispatch.call_count == 0
 
-    await svc._evaluator.refresh_references(
-        ["NVDA"], symbol_markets={"NVDA": MarketType.STOCK}
-    )
-    assert svc._dalton_move_refs.get("NVDA") is None
+    await svc._evaluator.refresh_references([("NVDA", MarketType.STOCK)])
+    assert svc._dalton_move_refs.get(("NVDA", MarketType.STOCK)) is None
 
     # Subsequent WS tick on Monday with -6% price cannot evaluate because _dalton_move_refs has no valid entry
     await svc._on_message(
@@ -701,8 +706,8 @@ async def test_stale_reference_price_and_failed_snapshot_validation_do_not_mark_
         )
         == "2026-10-26"
     )
-    assert svc._dalton_move_refs["NVDA"]["previous_close"] == 98.0
-    assert svc._dalton_move_refs["NVDA"]["trading_date"] == "2026-10-26"
+    assert svc._dalton_move_refs[("NVDA", MarketType.STOCK)]["previous_close"] == 98.0
+    assert svc._dalton_move_refs[("NVDA", MarketType.STOCK)]["trading_date"] == "2026-10-26"
 
     record_snapshot_reference(
         svc,
@@ -711,8 +716,8 @@ async def test_stale_reference_price_and_failed_snapshot_validation_do_not_mark_
         MarketType.STOCK,
         mon_open,
     )
-    assert svc._dalton_move_refs["NVDA"]["previous_close"] == 98.0
-    assert svc._dalton_move_refs["NVDA"]["trading_date"] == "2026-10-26"
+    assert svc._dalton_move_refs[("NVDA", MarketType.STOCK)]["previous_close"] == 98.0
+    assert svc._dalton_move_refs[("NVDA", MarketType.STOCK)]["trading_date"] == "2026-10-26"
 
 
 @pytest.mark.asyncio
@@ -753,7 +758,7 @@ async def test_isolated_dalton_refs_mixed_symbol_interleaved_ws_tick_and_deleted
         ]
     )
     await svc_mixed._poll_snapshots(poll_stock=True, poll_index=False)
-    assert svc_mixed._evaluator._reference_prices["NVDA"] == {
+    assert svc_mixed._evaluator._reference_prices[("NVDA", MarketType.STOCK)] == {
         "previous_close": 100.0,
         "day_open": 99.0,
     }
@@ -824,7 +829,7 @@ async def test_isolated_dalton_refs_mixed_symbol_interleaved_ws_tick_and_deleted
         ]
     )
     await svc_mixed._poll_snapshots(poll_stock=True, poll_index=False)
-    assert svc_mixed._evaluator._reference_prices["NVDA"]["previous_close"] == 100.0
+    assert svc_mixed._evaluator._reference_prices[("NVDA", MarketType.STOCK)]["previous_close"] == 100.0
     assert len(harness.scheduler.dispatch.call_args_list) == 4
     assert (
         harness.scheduler.dispatch.call_args_list[-1].args[0]["automation_id"]
@@ -856,7 +861,7 @@ async def test_isolated_dalton_refs_mixed_symbol_interleaved_ws_tick_and_deleted
         automation_id: str, server_id: str
     ) -> str | None:
         # At this exact point, evaluator._reference_prices["NVDA"]["previous_close"] is 100.0
-        assert svc_mixed._evaluator._reference_prices["NVDA"]["previous_close"] == 100.0
+        assert svc_mixed._evaluator._reference_prices[("NVDA", MarketType.STOCK)]["previous_close"] == 100.0
         await svc_mixed._on_message(
             '{"ev":"AM"}',
             {"symbol": "NVDA", "close": 94.0, "time": _ms(mon_open)},
@@ -874,12 +879,12 @@ async def test_isolated_dalton_refs_mixed_symbol_interleaved_ws_tick_and_deleted
     assert "auto-nvda-dalton" not in dispatched_ids
 
     # 3. After deleting the Dalton move task from _symbol_automations, the symbol is handed back to upstream as-is
-    svc_mixed._symbol_automations["NVDA"] = [normal_nvda]
+    svc_mixed._symbol_automations[("NVDA", MarketType.STOCK)] = [normal_nvda]
     remaining_normal = await process_polled_snapshot(
-        svc_mixed, "NVDA", unvalidated_monday_snap, mon_open
+        svc_mixed, "NVDA", MarketType.STOCK, unvalidated_monday_snap, mon_open
     )
     assert remaining_normal == [normal_nvda]
-    assert "NVDA" not in svc_mixed._dalton_move_refs
+    assert ("NVDA", MarketType.STOCK) not in svc_mixed._dalton_move_refs
 
 
 @pytest.mark.asyncio
@@ -999,7 +1004,7 @@ async def test_load_automations_populates_symbol_automations_before_refresh_so_w
     svc = PriceMonitorService()
     await svc._load_automations()
 
-    assert svc._dalton_move_refs.get("NVDA") == {
+    assert svc._dalton_move_refs.get(("NVDA", MarketType.STOCK)) == {
         "previous_close": 100.0,
         "day_open": 99.5,
         "trading_date": "2026-10-23",
@@ -1015,3 +1020,131 @@ async def test_load_automations_populates_symbol_automations_before_refresh_so_w
         harness.scheduler.dispatch.call_args.args[0]["automation_id"]
         == "auto-nvda-load"
     )
+
+
+@pytest.mark.asyncio
+async def test_same_named_stock_and_index_references_are_keyed_independently(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """同名股票/指数同时被监控时，Dalton 参考价按 (symbol, market) listing 键互不影响：
+    一侧的刷新不会覆盖另一侧，一侧无 Dalton 自动化时也只清理自己的键。"""
+    fri_intraday = datetime(2026, 10, 23, 11, 0, tzinfo=ET)
+    harness = _Harness(monkeypatch, fri_intraday)
+    now = harness._now
+
+    dalton_hsi_stock = _make_dalton_move_automation("HSI", "down")
+    normal_hsi_index = _make_normal_price_automation(
+        symbol="HSI", condition_type="pct_change_below", value=2.0
+    )
+    normal_hsi_index["trigger_config"]["market"] = "index"
+    normal_hsi_index["_parsed_config"] = PriceTriggerConfig(
+        **normal_hsi_index["trigger_config"]
+    )
+    svc = harness.make_service(dalton_hsi_stock, normal_hsi_index)
+
+    # Session validation is stubbed per market: only snapshots of the market
+    # named in `valid_for` pass, so the test does not depend on two venues
+    # sharing regular hours.
+    extract_stub = create_autospec(price_trigger.extract_today_regular_snapshot)
+    extract_stub.side_effect = lambda sym, market, snap, at: (
+        ("2026-10-23", snap["price"], snap["previous_close"], snap["open"])
+        if market == snap["valid_for"]
+        else None
+    )
+    monkeypatch.setattr(price_trigger, "extract_today_regular_snapshot", extract_stub)
+
+    stock_snap = {"symbol": "HSI", "price": 96.0, "previous_close": 100.0, "open": 99.0, "valid_for": MarketType.STOCK}
+    index_snap = {"symbol": "HSI", "price": 19600.0, "previous_close": 20000.0, "open": 19900.0, "valid_for": MarketType.INDEX}
+
+    # The listing identity decides everything: only the stock listing carries
+    # a Dalton automation, so only it may hold a reference.
+    assert symbol_has_dalton_move(svc, "HSI", MarketType.STOCK) is True
+    assert symbol_has_dalton_move(svc, "HSI", MarketType.INDEX) is False
+
+    assert (
+        refresh_dalton_reference_if_needed(svc, "HSI", stock_snap, MarketType.STOCK, now)
+        == "2026-10-23"
+    )
+    # Pre-fix this overwrote the shared bare-symbol entry with 20000.0; now the
+    # index listing has no Dalton automation, so nothing is written at all.
+    assert (
+        refresh_dalton_reference_if_needed(svc, "HSI", index_snap, MarketType.INDEX, now)
+        is None
+    )
+    assert svc._dalton_move_refs[("HSI", MarketType.STOCK)]["previous_close"] == 100.0
+    assert ("HSI", MarketType.INDEX) not in svc._dalton_move_refs
+
+    # A poll on the index listing finds no Dalton automations and pops only the
+    # index listing's key; the stock reference survives untouched.
+    stale_index_snap = dict(index_snap, valid_for=None, price=0.0)
+    remaining = await process_polled_snapshot(
+        svc, "HSI", MarketType.INDEX, stale_index_snap, now
+    )
+    assert [a["automation_id"] for a in remaining] == ["auto-normal-1"]
+    assert svc._dalton_move_refs[("HSI", MarketType.STOCK)]["previous_close"] == 100.0
+
+    # Even when both listings carry a Dalton automation (a shape Dalton itself
+    # never creates — its stock-move tasks are always market=stock), the two
+    # references coexist instead of clobbering each other.
+    svc._symbol_automations[("HSI", MarketType.INDEX)] = [dalton_hsi_stock]
+    assert (
+        refresh_dalton_reference_if_needed(svc, "HSI", index_snap, MarketType.INDEX, now)
+        == "2026-10-23"
+    )
+    assert svc._dalton_move_refs[("HSI", MarketType.STOCK)]["previous_close"] == 100.0
+    assert svc._dalton_move_refs[("HSI", MarketType.INDEX)]["previous_close"] == 20000.0
+
+    # Reading for evaluation is per listing too: each market's config sees its
+    # own reference, never the other listing's.
+    def _config(market: MarketType) -> PriceTriggerConfig:
+        return PriceTriggerConfig(
+            symbol="HSI",
+            market=market,
+            conditions=[{"type": "pct_change_below", "value": 2.0, "reference": "previous_close"}],
+        )
+
+    refs_ok_stub = create_autospec(price_trigger.trading_session_date, return_value="2026-10-23")
+    monkeypatch.setattr(price_trigger, "trading_session_date", refs_ok_stub)
+    assert price_trigger.can_evaluate_automation(svc, dalton_hsi_stock, _config(MarketType.STOCK), now) is True
+    assert price_trigger.can_evaluate_automation(svc, dalton_hsi_stock, _config(MarketType.INDEX), now) is True
+    svc._dalton_move_refs.pop(("HSI", MarketType.INDEX), None)
+    assert price_trigger.can_evaluate_automation(svc, dalton_hsi_stock, _config(MarketType.STOCK), now) is True
+    assert price_trigger.can_evaluate_automation(svc, dalton_hsi_stock, _config(MarketType.INDEX), now) is False
+
+
+@pytest.mark.asyncio
+async def test_pure_dalton_listing_poll_still_evaluates_market_targets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """一个 listing 上只有 Dalton 异动任务时（process_polled_snapshot 返回 None），
+    轮询仍要评估同 listing 上的上游 market-watch 目标价，只跳过普通自动化段。"""
+    fri_intraday = datetime(2026, 10, 23, 11, 0, tzinfo=ET)
+    harness = _Harness(monkeypatch, fri_intraday)
+    auto = _make_dalton_move_automation("NVDA", "down")
+    svc = harness.make_service(auto)
+
+    harness.set_snapshots(
+        [
+            {
+                "symbol": "NVDA",
+                "price": 95.5,
+                "previous_close": 100.0,
+                "open": 99.0,
+                "as_of": _ms(fri_intraday),
+                "regular_as_of": _ms(fri_intraday),
+                "regular_trading_date": "2026-10-23",
+            }
+        ]
+    )
+
+    targets_spy = create_autospec(svc._evaluate_targets)
+    monkeypatch.setattr(svc, "_evaluate_targets", targets_spy)
+
+    await svc._poll_snapshots(poll_stock=True, poll_index=False)
+
+    # The Dalton listing is fully handled inside process_polled_snapshot, but a
+    # market-watch target on the same listing must still be evaluated.
+    assert targets_spy.await_count == 1
+    assert targets_spy.await_args.args[0] == ("NVDA", MarketType.STOCK)
+    assert targets_spy.await_args.args[1] == 95.5
+    assert targets_spy.await_args.args[2] == _ms(fri_intraday)

@@ -19,6 +19,7 @@ import {
   type SubagentDataLike,
   type SubagentHistoryLike,
 } from '../../session/subagents/resolveSubagentTelemetry';
+import { taskRunFromWire } from '../../session/subagents/taskRuns';
 import {
   resolveWorkflowRun as resolveWorkflowRunPure,
   type WorkflowRunState,
@@ -48,11 +49,11 @@ export function useSubagentTabs({
   updateSubagentCard,
   sendSubagentInstruction,
   getSubagentHistory,
+  getTaskRuns,
+  putTaskRun,
   resolveSubagentIdToAgentId,
   hydrateTaskTranscript,
   saveScrollPosition,
-  scrollPositionsRef,
-  skipSubagentAutoScrollRef,
   activeAgentIdRef,
   resolvedThreadIdRef,
 }: {
@@ -66,11 +67,11 @@ export function useSubagentTabs({
   updateSubagentCard: CardStateAPI['updateSubagentCard'];
   sendSubagentInstruction: ChatMessagesAPI['sendSubagentInstruction'];
   getSubagentHistory: ChatMessagesAPI['getSubagentHistory'];
+  getTaskRuns: ChatMessagesAPI['getTaskRuns'];
+  putTaskRun: ChatMessagesAPI['putTaskRun'];
   resolveSubagentIdToAgentId: ChatMessagesAPI['resolveSubagentIdToAgentId'];
   hydrateTaskTranscript: ChatMessagesAPI['hydrateTaskTranscript'];
   saveScrollPosition: () => void;
-  scrollPositionsRef: { current: Record<string, number> };
-  skipSubagentAutoScrollRef: { current: boolean };
   activeAgentIdRef: { current: string };
   resolvedThreadIdRef: { current: string };
 }) {
@@ -85,10 +86,6 @@ export function useSubagentTabs({
     if (newAgentId === activeAgentIdRef.current) return;
     const wasMain = activeAgentIdRef.current === 'main';
     saveScrollPosition();
-    // If destination has a saved position, skip auto-scroll so restore wins
-    if (scrollPositionsRef.current[newAgentId] != null) {
-      skipSubagentAutoScrollRef.current = true;
-    }
     setActiveAgentId(newAgentId);
 
     // Sync URL with active agent
@@ -104,7 +101,7 @@ export function useSubagentTabs({
       // browser back should return to the parent view just left.
       navigate(`/chat/t/${tid}/${taskSlug}`, { replace: !wasMain && !opts?.push, state: { workspaceId } });
     }
-  }, [saveScrollPosition, threadId, workspaceId, navigate, activeAgentIdRef, scrollPositionsRef, skipSubagentAutoScrollRef, resolvedThreadIdRef, setActiveAgentId]);
+  }, [saveScrollPosition, threadId, workspaceId, navigate, activeAgentIdRef, resolvedThreadIdRef, setActiveAgentId]);
 
   // Ensure new active agents are visible (remove from hidden list)
   useEffect(() => {
@@ -185,8 +182,10 @@ export function useSubagentTabs({
     const card = cards[`subagent-${resolveSubagentIdToAgentId(subagentId)}`];
     const sd = card?.subagentData as SubagentDataLike | undefined;
     const history = getSubagentHistory?.(subagentId) as SubagentHistoryLike | undefined;
-    return resolveSubagentTelemetryPure(sd, history);
-  }, [cards, resolveSubagentIdToAgentId, getSubagentHistory]);
+    // The segment's id is the Task call it stands for, which names the run
+    // its row draws when the task was resumed.
+    return resolveSubagentTelemetryPure(sd, history, getTaskRuns?.(subagentId) ?? [], subagentId);
+  }, [cards, resolveSubagentIdToAgentId, getSubagentHistory, getTaskRuns]);
 
   // Same closure shape for workflow-run progress: the inline WorkflowRunCard
   // subscribes at the leaf and reads the live card's reduced state, falling
@@ -356,6 +355,8 @@ export function useSubagentTabs({
       const s = normalizeWireStatus(res?.status);
       if (!isTerminalStatus(s)) return;
       const existing = cards[`subagent-${agentId}`]?.subagentData;
+      // The task's latest run, which the stream may never have opened here.
+      if (res.run_id) putTaskRun?.(res.run_id, { taskId: agentId, ...taskRunFromWire(res) });
       updateSubagentCard(agentId, {
         agentId,
         taskId: agentId,
@@ -372,7 +373,7 @@ export function useSubagentTabs({
       // Best-effort: a failed hydration leaves the card as-is (a full thread
       // reload still corrects it via replay stamping).
     }
-  }, [threadId, getSubagentHistory, cards, updateSubagentCard]);
+  }, [threadId, getSubagentHistory, cards, updateSubagentCard, putTaskRun]);
 
   // Lazy transcript hydration for tasks replay never projects as lanes
   // (workflow children have no Task-tool launch artifact in the main
@@ -454,12 +455,9 @@ export function useSubagentTabs({
     const urlAgentId = initialTaskId ? `task:${initialTaskId}` : 'main';
     if (urlAgentId !== activeAgentIdRef.current) {
       saveScrollPosition();
-      if (scrollPositionsRef.current[urlAgentId] != null) {
-        skipSubagentAutoScrollRef.current = true;
-      }
       setActiveAgentId(urlAgentId);
     }
-  }, [initialTaskId, saveScrollPosition, activeAgentIdRef, scrollPositionsRef, skipSubagentAutoScrollRef, setActiveAgentId]);
+  }, [initialTaskId, saveScrollPosition, activeAgentIdRef, setActiveAgentId]);
 
   // Refresh subagent card data on deep link / browser forward (guarded to run once per taskId)
   const lastRefreshedTaskRef = useRef<string | undefined>(undefined);

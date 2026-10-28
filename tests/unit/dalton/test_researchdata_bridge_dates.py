@@ -60,14 +60,15 @@ def test_an_unreadable_date_is_a_parameter_error(bad):
 
 
 def test_alphaengine_gets_its_date_window_as_a_pair():
-    import datetime as dt
-
     normalized, _, err = rb._normalize_and_validate_call_args(
         "research", {"route": "alphaengine", "query": "英伟达", "start": "2026-09"}
     )
     assert err is None
     assert normalized["start"] == "2026-09-01"
-    assert normalized["end"] == max(dt.date.today().isoformat(), "2026-09-01")
+    # The bridge's "today" is the later of this host's date and Shanghai's
+    # (the source's trading day); asserting plain date.today() fails the
+    # twelve hours a day Shanghai has rolled over and this host has not.
+    assert normalized["end"] == max(rb._bridge_today(), "2026-09-01")
 
     normalized, _, err = rb._normalize_and_validate_call_args(
         "research", {"route": "alphaengine", "query": "英伟达", "end": "2026-10-26"}

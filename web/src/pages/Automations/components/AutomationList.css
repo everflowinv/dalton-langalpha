@@ -43,7 +43,7 @@
   padding: 9px 8px;
   border-radius: 8px;
   text-align: left;
-  transition: background-color 0.14s cubic-bezier(0.16, 1, 0.3, 1);
+  transition: background-color var(--motion-quick) var(--ease-out);
 }
 
 /* Hover is a lighter fill than the selection, and rows keep a hairline apart,

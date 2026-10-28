@@ -1,7 +1,11 @@
 import copy
+import functools
+import inspect
+import logging
 import os
 import json
 import uuid
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Dict, Optional, Any
 from dotenv import load_dotenv
@@ -10,7 +14,7 @@ from langchain_core.language_models import BaseChatModel
 from langchain_deepseek import ChatDeepSeek
 from langchain_qwq import ChatQwen
 
-from .endpoints import is_official_openai_endpoint
+from .endpoints import anthropic_sdk_base_url, is_official_openai_endpoint
 from .model_spec import (
     ModelSpec,
     canonical_reasoning_efforts,
@@ -20,10 +24,14 @@ from .model_spec import (
 )
 from .preferences import compaction_profile_for
 from .pricing_utils import get_price_tier
+from .provider_compaction import native_compaction_kind
 from .reasoning import apply_reasoning_effort
 from .reasoning_lineage import ROUTE_ENDPOINT_SEP
+from .task_costs import task_cost
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 
 class MissingProviderKeyError(ValueError):
@@ -168,6 +176,30 @@ class ModelConfig:
         """
         return list(self._child_variants.get(provider, ()))
 
+    def shares_api_key(self, provider: str, other: str) -> bool:
+        """Whether a key issued for ``provider`` is also valid for ``other``.
+
+        A manifest family shares one key unless a variant declares
+        ``"own_api_key": true``: its vendor issues that variant's keys apart
+        from its parent's (a coding-plan key against the platform endpoint, or
+        one region's key against another's), so the other side rejects them.
+        Such a variant is the root of its own credential and its descendants
+        stay with it, which is why this walks up to the nearest declaring
+        ancestor rather than comparing the two flags.
+        """
+        return self._key_issuer(provider) == self._key_issuer(other)
+
+    def _key_issuer(self, provider: str) -> str:
+        seen: set[str] = set()
+        while provider not in seen:
+            seen.add(provider)
+            info = self._flat_providers.get(provider, {})
+            parent = info.get("parent_provider")
+            if info.get("own_api_key") is True or not parent:
+                return provider
+            provider = parent
+        return provider
+
     def get_display_name(self, provider: str) -> str:
         """Return display name, preferring own name then resolving through parent."""
         info = self.get_provider_info(provider)
@@ -232,11 +264,25 @@ class ModelConfig:
             profile = self.get_compaction_profile(model_name)
             if profile:
                 entry["compaction_profile"] = profile
+            # Whose compaction the model takes, so the settings offer the
+            # choice only where it does something and name that provider's
+            # trade-off. Absent means its provider cannot compact for it.
+            native = native_compaction_kind(model_info, provider_info)
+            if native:
+                entry["native_compaction"] = native
             # Cost tier (1-5) derived live from canonical providers.json pricing —
             # not stored in models.json, so it auto-syncs when prices change.
             price_tier = get_price_tier(model_info.get("model_id", model_name), provider)
             if price_tier is not None:
                 entry["price"] = price_tier
+            # What a typical benchmark task costs at each level the model
+            # offers, against a baseline model (see task_costs.py). Read by the
+            # manifest key alone: a variant on another route, such as an OAuth
+            # or regional key, is priced on its own terms, so it shows no figure
+            # rather than borrowing its parent's.
+            costs = task_cost(model_name, efforts)
+            if costs is not None:
+                entry["task_cost"] = costs
             # Mark variants that require their own API key (different env_key from parent).
             # e.g. z-ai-cn needs ZAI_CN_API_KEY, not ZAI_API_KEY.
             parent_provider = provider_info.get("parent_provider")
@@ -362,6 +408,75 @@ def _merged_default_headers(params: dict, *bases: dict | None) -> dict:
     merged.update(params.get("default_headers") or {})
     return merged
 
+# Constructor keys a model's ``parameters`` can use to move its endpoint: the
+# OpenAI family's ``base_url``/``openai_api_base``/``api_base``, Anthropic's
+# ``anthropic_api_url``, Gemini's ``client_options``. A custom model's
+# parameters are its user's, so each of these is a URL the user supplied.
+ENDPOINT_PARAM_KEYS = (
+    "base_url",
+    "openai_api_base",
+    "api_base",
+    "anthropic_api_url",
+    "client_options",
+)
+
+# Constructor keys that choose how a client connects: a proxy, an http client,
+# a prebuilt SDK client. A client held to an egress transport drops them, since
+# each would route around it, and ChatOpenAI refuses a proxy beside an http
+# client outright.
+CONNECTION_PARAM_KEYS = frozenset({
+    "openai_proxy",
+    "anthropic_proxy",
+    "client_args",
+    "http_client",
+    "http_async_client",
+    "client",
+    "async_client",
+    "root_client",
+    "root_async_client",
+})
+
+
+def param_levels(params: Mapping | None) -> list[tuple[str, Mapping]]:
+    """Each level of ``parameters`` a client constructor reads keys from, with
+    the prefix that names it in a message.
+
+    Every LangChain chat model the factory builds promotes a ``model_kwargs``
+    key that names one of its fields to that field (``_build_model_kwargs``),
+    so a key there routes the client as it would at the top. It promotes
+    once, and a ``model_kwargs`` inside it is refused, so there is no third.
+    """
+    if not isinstance(params, Mapping):
+        return []
+    levels: list[tuple[str, Mapping]] = [("", params)]
+    nested = params.get("model_kwargs")
+    if isinstance(nested, Mapping):
+        levels.append(("model_kwargs.", nested))
+    return levels
+
+
+def _drop_connection_params(params: dict, model: str) -> None:
+    """Drop the routing a held client cannot keep, at either level. A row saved
+    before these were refused at save time still carries them, and the call
+    runs without."""
+    dropped = sorted(key for key in CONNECTION_PARAM_KEYS if params.pop(key, None) is not None)
+    nested = params.get("model_kwargs")
+    if isinstance(nested, Mapping) and not CONNECTION_PARAM_KEYS.isdisjoint(nested):
+        dropped += sorted(
+            f"model_kwargs.{key}"
+            for key, value in nested.items()
+            if key in CONNECTION_PARAM_KEYS and value is not None
+        )
+        # A new mapping: the one in ``params`` is the model's own ``parameters``.
+        params["model_kwargs"] = {k: v for k, v in nested.items() if k not in CONNECTION_PARAM_KEYS}
+    if dropped:
+        logger.warning(
+            "Model %r is held to the egress transport; ignoring parameters %s",
+            model,
+            ", ".join(dropped),
+        )
+
+
 # Name regex for custom models: alphanumeric start, then alphanumeric/./_/-/:
 # Colon allowed for Ollama-style name:tag format (e.g. gemma4:31b)
 CUSTOM_MODEL_NAME_RE = r"^[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,62}$"
@@ -372,6 +487,10 @@ class LLM:
 
     # Class-level model config instance
     _model_config = None
+
+    # No hold unless a caller asks for one, including on an instance that was
+    # put together without ``__init__``.
+    egress_transport: Callable[[str], Any] | None = None
 
     @classmethod
     def get_model_config(cls) -> ModelConfig:
@@ -388,6 +507,8 @@ class LLM:
         api_key: str | None = None,
         base_url_override=_UNSET,
         reasoning_effort: str | None = None,
+        *,
+        egress_transport: Callable[[str], Any] | None = None,
         **override_params,
     ):
         """
@@ -400,8 +521,13 @@ class LLM:
             base_url_override: Override base URL. Use _UNSET (default) for no override,
                 None to clear to SDK default, or a string for a custom URL.
             reasoning_effort: Optional reasoning effort level ("low", "medium", "high").
+            egress_transport: Builds the transport every request of the client
+                is sent through, given its SDK family ("openai", "anthropic" or
+                "gemini"). None leaves each SDK its own; whether an endpoint
+                needs one is the caller's call, not the factory's.
             **override_params: Additional parameters to override defaults.
         """
+        self.egress_transport = egress_transport
         self.model_config = self.get_model_config()
         spec = (
             model
@@ -513,6 +639,8 @@ class LLM:
         base_url_override=_UNSET,
         cache_key: str | None = None,
         reasoning_effort: str | None = None,
+        *,
+        egress_transport: Callable[[str], Any] | None = None,
         **override_params,
     ):
         """
@@ -531,6 +659,7 @@ class LLM:
             reasoning_effort: Optional reasoning effort level, clamped against
                 the ladder the config declares, or the one it inherits from the
                 built-in whose name it took.
+            egress_transport: See :class:`LLM`.
             **override_params: Additional parameters to override defaults.
 
         Returns:
@@ -544,6 +673,7 @@ class LLM:
             api_key=api_key,
             base_url_override=base_url_override,
             reasoning_effort=reasoning_effort,
+            egress_transport=egress_transport,
             **override_params,
         )
         return instance.get_llm(cache_key=cache_key)
@@ -692,6 +822,75 @@ class LLM:
                 raise MissingProviderKeyError(f"{self.env_key} environment variable is not set")
         return "EMPTY"
 
+    def _hold_params_to_egress(self, params: dict, family: str) -> None:
+        """Send every request of the client ``params`` builds through the egress
+        transport. Applied last, so nothing in ``parameters`` can swap it out."""
+        if self.egress_transport is None:
+            return
+        _drop_connection_params(params, self.model)
+        transport = self.egress_transport(family)
+        # Redirects are not followed: no model API needs one, and a hop is one
+        # more connection for an endpoint to choose.
+        if family == "openai":
+            import openai
+
+            # Explicitly, or the field falls back to OPENAI_PROXY, which
+            # ChatOpenAI refuses beside a client of its own.
+            params["openai_proxy"] = None
+            params["http_client"] = openai.DefaultHttpxClient(
+                transport=transport, follow_redirects=False
+            )
+            params["http_async_client"] = openai.DefaultAsyncHttpxClient(
+                transport=transport, follow_redirects=False
+            )
+        elif family == "gemini":
+            # One mapping serves both of google-genai's clients, and a transport
+            # in it is also what turns off its aiohttp path, which no httpx
+            # transport would see.
+            params["client_args"] = {"transport": transport, "follow_redirects": False}
+        else:
+            raise ValueError(f"No egress hold for SDK family {family!r}")
+
+    def _hold_anthropic_to_egress(self, llm) -> None:
+        """Pre-seed ChatAnthropic's SDK clients with ones on the egress transport.
+
+        ChatAnthropic takes no http client: it builds each SDK client lazily in a
+        cached property from a default one. Seeding the cache is the one way in,
+        so a release that stops caching under these names is refused here rather
+        than left to dial on its own.
+        """
+        if self.egress_transport is None:
+            return
+        import anthropic
+
+        for name in ("_client", "_async_client"):
+            if not isinstance(inspect.getattr_static(type(llm), name, None), functools.cached_property):
+                raise TypeError(
+                    f"{type(llm).__name__}.{name} is not a cached property; "
+                    "the egress transport cannot be attached"
+                )
+        transport = self.egress_transport("anthropic")
+        client_params = llm._client_params
+        http_kwargs = {"timeout": client_params["timeout"]} if "timeout" in client_params else {}
+        # Not followed, as in ``_hold_params_to_egress``.
+        http_kwargs["follow_redirects"] = False
+        sync_client = anthropic.Client(
+            **client_params,
+            http_client=anthropic.DefaultHttpxClient(transport=transport, **http_kwargs),
+        )
+        async_client = anthropic.AsyncClient(
+            **client_params,
+            http_client=anthropic.DefaultAsyncHttpxClient(transport=transport, **http_kwargs),
+        )
+        if client_params.get("auth_token"):
+            # As ChatAnthropicOAuth does for its own clients: the SDK fills a
+            # None api_key from the environment, and a bearer client must not
+            # send that key alongside its token.
+            sync_client.api_key = None
+            async_client.api_key = None
+        llm.__dict__["_client"] = sync_client
+        llm.__dict__["_async_client"] = async_client
+
     def _resolve_base_url(self, param_name: str = "base_url") -> dict:
         """Resolve base URL with HOST_IP substitution. Returns dict to merge into params."""
         if not self.base_url:
@@ -758,6 +957,7 @@ class LLM:
             params.setdefault("http_async_client", broker_http_clients().async_client)
             params.setdefault("http_client", broker_http_clients().sync_client)
 
+        self._hold_params_to_egress(params, "openai")
         return params
 
     def _get_openai_llm(self, cache_key: str | None = None):
@@ -823,6 +1023,7 @@ class LLM:
             existing_mk = params.get("model_kwargs") or {}
             params["model_kwargs"] = {**existing_mk, "prompt_cache_key": cache_key}
 
+        self._hold_params_to_egress(params, "openai")
         return ChatCodexOpenAI(**params)
 
     def _get_deepseek_llm(self):
@@ -843,6 +1044,7 @@ class LLM:
         if self.extra_body:
             params["extra_body"] = self.extra_body
 
+        self._hold_params_to_egress(params, "openai")
         return ChatDeepSeek(**params)
 
     def _get_glm_llm(self):
@@ -865,6 +1067,7 @@ class LLM:
         if self.extra_body:
             params["extra_body"] = self.extra_body
 
+        self._hold_params_to_egress(params, "openai")
         return ChatZai(**params)
 
     def _get_qwq_llm(self):
@@ -885,6 +1088,7 @@ class LLM:
         if self.extra_body:
             params["extra_body"] = self.extra_body
 
+        self._hold_params_to_egress(params, "openai")
         return ChatQwen(**params)
 
     def _get_anthropic_llm(self):
@@ -913,6 +1117,12 @@ class LLM:
         filtered_params = {k: v for k, v in self.parameters.items() if k != "enable_caching"}
         params.update(filtered_params)
 
+        # After the parameters expansion, which can carry either alias. The
+        # stored URL is left as it is: it keys the route identity.
+        for url_key in ("base_url", "anthropic_api_url"):
+            if params.get(url_key):
+                params[url_key] = anthropic_sdk_base_url(params[url_key])
+
         # Merged after the parameters expansion so a parameters["default_headers"]
         # entry augments the provider-level headers instead of clobbering them.
         merged_headers = _merged_default_headers(params, self.default_headers)
@@ -924,11 +1134,14 @@ class LLM:
         if self.extra_body:
             params.setdefault("model_kwargs", {})["extra_body"] = self.extra_body
 
+        if self.egress_transport is not None:
+            _drop_connection_params(params, self.model)
+
         # OAuth tokens (sk-ant-oat*) need Authorization: Bearer, not X-Api-Key.
         # ChatAnthropicOAuth redirects api_key → auth_token on the underlying SDK client.
-        if is_oauth:
-            return ChatAnthropicOAuth(**params)
-        return ChatAnthropic(**params)
+        llm = ChatAnthropicOAuth(**params) if is_oauth else ChatAnthropic(**params)
+        self._hold_anthropic_to_egress(llm)
+        return llm
 
     def _get_gemini_llm(self):
         """Get Gemini LLM."""
@@ -951,6 +1164,7 @@ class LLM:
         if self.extra_body:
             params.setdefault("model_kwargs", {})["extra_body"] = self.extra_body
 
+        self._hold_params_to_egress(params, "gemini")
         return ChatGoogleGenerativeAI(**params)
 
 
@@ -1173,6 +1387,137 @@ def get_max_pdf_pages(model_name: str) -> int | None:
     if provider in ("openai", "codex-oauth"):
         return None
     return _ANTHROPIC_MAX_PDF_PAGES
+
+
+# What a request is charged for one PDF page, per vendor, where that was
+# measured to sit far from the 3,000 the context estimate uses otherwise
+# (``PDF_PAGE_TOKENS`` in the compaction utils). Measured on a 10-page window
+# of arXiv 2112.10752, an image-heavy paper: Gemini 520 a page, which reads a
+# page as its image, 560 being the most its default resolution charges; OpenAI
+# 3,230, close enough to the default that it keeps it.
+_PDF_PAGE_TOKENS = {"gemini": 560}
+
+
+def get_pdf_page_tokens(route: str) -> int | None:
+    """What ``route`` (from :func:`image_route`) charges for a PDF page, or
+    None where no measurement sets it apart from the default estimate."""
+    return _PDF_PAGE_TOKENS.get(route)
+
+
+# Published per-side pixel ceilings for an image in a request, per vendor: the
+# largest side, then (image count, tighter side) steps that apply from that
+# count on. Two tighten with the number of images in the request, which is why
+# the count is an argument: Anthropic's above 20, DeepSeek's from 15. OpenAI,
+# Gemini and DashScope document that they shrink an oversized image rather than
+# refuse it, hence no rule.
+_IMAGE_SIDE_RULES: dict[str, tuple[int, tuple[tuple[int, int], ...]]] = {
+    "anthropic": (8000, ((21, 2000),)),
+    "deepseek": (8192, ((15, 4096),)),
+    "z-ai": (6000, ()),
+}
+_UNBOUNDED_IMAGE_PROVIDERS = frozenset({"openai", "gemini", "dashscope"})
+
+# The vendors whose image rules are known. Any other route (an aggregator, a
+# local server) is judged by the vendor of the model it serves, if known.
+_IMAGE_FAMILIES = frozenset({
+    "anthropic", "openai", "gemini", "dashscope", "deepseek", "z-ai", "moonshot", "minimax",
+})
+
+
+def _provider_family(provider: str) -> str:
+    """The root of a provider's variant chain, so a regional or plan route
+    (``z-ai-cn-coding``, ``claude-oauth``) is judged as the vendor it serves."""
+    config = LLM.get_model_config()
+    seen = {provider}
+    while (parent := config.get_parent_provider(provider)) not in seen:
+        seen.add(parent)
+        provider = parent
+    return provider
+
+
+def _endpoint_family(endpoint: str) -> str | None:
+    """The vendor whose manifest endpoints share this URL's host, if exactly one."""
+    from urllib.parse import urlparse
+
+    host = urlparse(endpoint).hostname
+    if not host:
+        return None
+    families = {
+        _provider_family(name)
+        for name, info in LLM.get_model_config().flat_providers.items()
+        if isinstance(info.get("base_url"), str)
+        and urlparse(info["base_url"]).hostname == host
+    } & _IMAGE_FAMILIES
+    return next(iter(families)) if len(families) == 1 else None
+
+
+def image_route(client_metadata: dict[str, Any] | None) -> str:
+    """The vendor whose image rules a call through this client has to meet.
+
+    Read off the client's stamp rather than the manifest key: a user-defined
+    model has no manifest row, a platform route replaces the manifest provider
+    when the caller brings no key, and a BYOK base URL can point a provider's
+    slot at another vendor. The endpoint decides when it is a known vendor's,
+    then the provider the client was built for, then the manifest model's own.
+    Empty when none is known, which gets the strictest rules.
+    """
+    metadata = client_metadata or {}
+    route = metadata.get("provider_route")
+    if isinstance(route, str) and ROUTE_ENDPOINT_SEP in route:
+        family = _endpoint_family(route.split(ROUTE_ENDPOINT_SEP, 1)[1])
+        if family:
+            return family
+    model = metadata.get("manifest_model")
+    model_info = (
+        LLM.get_model_config().get_model_config(model) if isinstance(model, str) else None
+    ) or {}
+    for provider in (metadata.get("pricing_provider"), model_info.get("provider")):
+        if isinstance(provider, str) and provider:
+            family = _provider_family(provider)
+            if family in _IMAGE_FAMILIES:
+                return family
+    return ""
+
+
+# The image types a route takes as is, from each vendor's docs. Most list the
+# same four; Gemini and DashScope list more, and neither lists GIF.
+COMMON_IMAGE_TYPES = frozenset({"image/png", "image/jpeg", "image/gif", "image/webp"})
+_IMAGE_TYPES = {
+    "gemini": frozenset({"image/png", "image/jpeg", "image/webp", "image/heic", "image/heif"}),
+    "dashscope": frozenset({
+        "image/png", "image/jpeg", "image/webp", "image/bmp", "image/tiff", "image/heic",
+    }),
+}
+
+
+def get_image_types(route: str) -> frozenset[str]:
+    """MIME types ``route`` (from :func:`image_route`) takes as is."""
+    return _IMAGE_TYPES.get(route, COMMON_IMAGE_TYPES)
+
+
+def get_max_image_side(route: str, image_count: int) -> int | None:
+    """Largest side in pixels each image may have on ``route``, or None if unbounded.
+
+    ``route`` comes from :func:`image_route`. ``image_count`` is the number of
+    images in the request being sent, not in the one message carrying this
+    image. A route with no rule of its own gets the tightest of the known rules
+    at that count, for the reason ``get_max_pdf_pages`` gives: it may be any of
+    those vendors behind a gateway, and no one vendor's rule is the tightest
+    at every count.
+    """
+    if route in _UNBOUNDED_IMAGE_PROVIDERS:
+        return None
+    if route in _IMAGE_SIDE_RULES:
+        return _side_rule(route, image_count)
+    return min(_side_rule(vendor, image_count) for vendor in _IMAGE_SIDE_RULES)
+
+
+def _side_rule(vendor: str, image_count: int) -> int:
+    side, steps = _IMAGE_SIDE_RULES[vendor]
+    for from_count, tighter in steps:
+        if image_count >= from_count:
+            side = tighter
+    return side
 
 
 def should_enable_caching(model_name: str) -> bool:

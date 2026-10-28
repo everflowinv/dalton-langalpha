@@ -16,9 +16,9 @@ blob is a sentinel or `_DeltaSnapshot`, which reverting to `add_messages` (or
 downgrading langgraph below 1.2) cannot read — so keep the `langgraph`/
 `langgraph-checkpoint*` floors pinned at >=1.2 in pyproject.toml.
 
-Importing this module installs `delta_branch`'s backport, so a graph built on
-`DeltaAgentState` that runs from an older checkpoint, or from a state update
-written on one, stores each message once.
+A run from an older checkpoint, or from a state update written on one, stores
+each message once because langgraph (>=1.2.13) snapshots the channel in a new
+branch's first checkpoint; `test_delta_channel_branches.py` pins that.
 """
 
 from __future__ import annotations
@@ -40,14 +40,6 @@ from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from langgraph.graph.ui import AnyUIMessage, ui_message_reducer
 from typing_extensions import NotRequired, Required
 
-from ptc_agent.agent.delta_branch import (
-    snapshot_delta_channels_on_new_branch,
-    snapshot_delta_channels_on_update,
-)
-
-snapshot_delta_channels_on_new_branch()
-snapshot_delta_channels_on_update()
-
 # A full snapshot blob is written every N updates, bounding delta replay depth.
 # Storage per message written is about 1 + W/N for a list of W messages. At 250
 # a long thread stores a fifth of the snapshot bytes it did at 50 while a tip
@@ -62,13 +54,11 @@ MESSAGES_SNAPSHOT_FREQUENCY = 250
 def ensure_message_ids(messages: list[AnyMessage]) -> list[AnyMessage]:
     """Stamp a stable uuid on any id-less message, in place, and return the list.
 
-    langgraph's own ``ensure_message_ids`` runs only inside the normal Pregel
-    execution loop, NOT on the ``graph.aupdate_state`` path. Messages injected
-    via ``aupdate_state`` (orchestrator notifications, steering triggers)
-    therefore persist with ``id=None`` under ``messages_delta_reducer`` — which
-    appends id-less writes verbatim, so a later full-list re-write duplicates
-    them and the compaction id-anchor can never match them. Call this before any
-    ``aupdate_state`` that injects new messages.
+    langgraph stamps a write's messages only as it saves them (the loop's
+    ``put_writes``, and ``aupdate_state`` since 1.2.15), which is too late for a
+    caller that needs the ids first: compaction anchors its cut on them. The
+    ``aupdate_state`` injectors that call it predate the upstream stamp, which
+    now does the same.
     """
     for msg in messages:
         if getattr(msg, "id", None) is None:
@@ -85,12 +75,11 @@ def messages_delta_reducer(  # noqa: C901, PLR0912
     `REMOVE_ALL_MESSAGES`, and coerces raw dict/str/tuple input via
     `convert_to_messages`. IDs are NOT assigned here: langgraph's
     `ensure_message_ids` (>=1.2.2) stamps id-less writes before they are
-    persisted, so by replay time messages already carry stable ids; minting in
-    the reducer would re-roll a different uuid on every replay. id-less messages
-    are appended as-is (deterministic) — note this only holds on the normal
-    Pregel path; the `aupdate_state` path does NOT run `ensure_message_ids`, so
-    injectors there must pre-stamp via `ensure_message_ids` (above) or their
-    writes persist id-less and duplicate on re-write. Matches deepagents 0.6.11's
+    persisted (`aupdate_state` writes too, since 1.2.15), so by replay time
+    messages already carry stable ids; minting in the reducer would re-roll a
+    different uuid on every replay. id-less messages are appended as-is
+    (deterministic), and a full-list re-write duplicates them, since nothing
+    can match a message without an id. Matches deepagents 0.6.11's
     batch `_messages_delta_reducer` (the vendoring source), NOT `add_messages`
     (an unknown-id `RemoveMessage` is silently ignored; chunks are not converted).
     """

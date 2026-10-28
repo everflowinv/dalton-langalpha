@@ -325,7 +325,7 @@ class TestSave:
                     "slack:T1/C0456": {"workspace_id": RESEARCH, "workspace": "Research"},
                     # A workspace id is sent canonical.
                     "slack:T1/C0789": {"workspace_id": MACRO, "workspace": "Macro"},
-                    # All workspaces names none.
+                    # The Chief of Staff names none.
                     "slack:T1/C0999": {"workspace_id": None},
                 },
                 "automation_output": {RESEARCH: "slack:T1/C0123"},

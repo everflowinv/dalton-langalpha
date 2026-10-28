@@ -25,16 +25,17 @@ vi.mock('../use-toast', () => ({
 
 function renderInput() {
   const ref = createRef<ChatInputHandle>();
+  const onSend = vi.fn();
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   render(
     <QueryClientProvider client={queryClient}>
       <MemoryRouter>
-        <ChatInput ref={ref} onSend={vi.fn()} />
+        <ChatInput ref={ref} onSend={onSend} />
       </MemoryRouter>
     </QueryClientProvider>,
   );
   const box = screen.getAllByRole('textbox')[0] as HTMLTextAreaElement;
-  return { ref, box };
+  return { ref, box, onSend };
 }
 
 describe('ChatInput — giveBack', () => {
@@ -56,5 +57,22 @@ describe('ChatInput — giveBack', () => {
     act(() => ref.current!.giveBack('the edited question'));
     act(() => ref.current!.giveBack('the edited question'));
     expect(box.value).toBe('the edited question');
+  });
+
+  it('puts back the files a send took, ready to send again', () => {
+    // jsdom has no object URLs.
+    vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:positions');
+    vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {});
+    const { ref, box, onSend } = renderInput();
+    const file = new File(['x'], 'positions.png', { type: 'image/png' });
+    const sent = { file, dataUrl: 'data:image/png;base64,eA==', type: 'image/png', preview: null };
+    act(() => ref.current!.giveBack('', [sent]));
+    expect(box.value).toBe('');
+    expect(screen.getByAltText('positions.png')).toBeTruthy();
+    act(() => {
+      ref.current!.send();
+    });
+    expect(onSend).toHaveBeenCalledTimes(1);
+    expect(onSend.mock.calls[0][1]).toEqual([expect.objectContaining({ file, dataUrl: sent.dataUrl })]);
   });
 });

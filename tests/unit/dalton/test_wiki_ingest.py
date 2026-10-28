@@ -8,6 +8,7 @@ import hashlib
 import json
 import logging
 import sys
+from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -19,7 +20,7 @@ import redis.asyncio as aioredis
 from deepagents.backends.protocol import FileDownloadResponse
 
 from ptc_agent.agent.backends.sandbox import SandboxBackend
-from ptc_agent.core.sandbox import ExecutionResult
+from ptc_agent.core.sandbox.jobs import Ended, Failed, JobHandle, JobRef, Running
 from src.dalton.database import wiki_ingests as db_wiki_ingests
 from src.dalton.tools import build_dalton_tools
 from src.dalton.tools import wiki_tools
@@ -1102,17 +1103,29 @@ async def test_ingest_company_wiki_remote_sandbox_realpath_symlinks_shell_chars_
             config=cfg,
         )
         assert res.startswith("ERROR:"), f"Expected rejection for {bad_path!r}, got {res!r}"
-    backend.aexecute_code.assert_not_called()
+    backend.start_code_job.assert_not_called()
     mock_call_bridge.assert_not_called()
 
-    # 2. Metadata check command failure (`success=False` or non-zero exit_code or exception) -> fail closed (rejected)
-    backend.aexecute_code.return_value = ExecutionResult(
-        success=False,
-        stdout="",
-        stderr="sandbox error",
-        duration=0.01,
-        execution_id="exec-fail",
-        code_hash="hash-fail",
+    def _handle(cid: str = "bg-1") -> JobHandle:
+        return JobHandle(
+            JobRef(
+                command_id=cid,
+                state_dir=f"/.system/jobs/{cid}",
+                log_path=f"/tmp/{cid}.log",
+                trace_path=f"/tmp/{cid}.jsonl",
+                log_relpath=f"{cid}.log",
+            ),
+            datetime.now(tz=timezone.utc),
+        )
+
+    def _make_ended(exit_code: int, stdout_text: str, *, job_exit_code: int = 0) -> Ended:
+        output = json.dumps({"exit_code": exit_code, "stdout": stdout_text, "stderr": ""})
+        return Ended(_handle(), exit_code=job_exit_code, output=output)
+
+    # 2. Metadata check job failure (`Failed` outcome) -> fail closed (rejected)
+    backend.start_code_job.side_effect = None
+    backend.start_code_job.return_value = Failed(
+        _handle("bg-fail"), reason="transport", message="sandbox error"
     )
     res_cmd_fail = await tool_fn.ainvoke(
         {
@@ -1128,19 +1141,49 @@ async def test_ingest_company_wiki_remote_sandbox_realpath_symlinks_shell_chars_
     assert res_cmd_fail.startswith("ERROR:")
     backend.adownload_files.assert_not_called()
 
-    # 3. Symlink on intermediate directory or leaf file -> rejected
-    def _make_code_result(exit_code: int, stdout_text: str) -> ExecutionResult:
-        return ExecutionResult(
-            success=True,
-            stdout=json.dumps({"exit_code": exit_code, "stdout": stdout_text, "stderr": ""}),
-            stderr="",
-            duration=0.01,
-            execution_id="exec-1",
-            code_hash="hash-1",
-        )
+    # 2b. One-shot python itself exited non-zero (even with valid JSON stdout) -> fail closed
+    backend.start_code_job.return_value = _make_ended(
+        0, "directory\ndirectory\nregular file\n", job_exit_code=1
+    )
+    res_py_fail = await tool_fn.ainvoke(
+        {
+            "target_type": "company",
+            "target": "NVDA",
+            "content_type": "研究笔记",
+            "date": "2026-10-25",
+            "file_path": "notes/call.md",
+            "confirm": False,
+        },
+        config=cfg,
+    )
+    assert res_py_fail.startswith("ERROR:")
+    assert "Sandbox metadata inspection job failed (exit=1)" in res_py_fail
+    backend.adownload_files.assert_not_called()
 
-    backend.aexecute_code.side_effect = [
-        _make_code_result(0, "directory\nsymbolic link\nregular file\n"),
+    # 2c. Job outlived its wait (Running) -> stopped, never read as success,
+    # and no dangling job is left behind.
+    backend.start_code_job.side_effect = None
+    backend.start_code_job.return_value = Running(_handle("bg-stuck"))
+    res_stuck = await tool_fn.ainvoke(
+        {
+            "target_type": "company",
+            "target": "NVDA",
+            "content_type": "研究笔记",
+            "date": "2026-10-25",
+            "file_path": "notes/call.md",
+            "confirm": False,
+        },
+        config=cfg,
+    )
+    assert res_stuck.startswith("ERROR:")
+    backend.stop_job.assert_called_once()
+    _, stop_kwargs = backend.stop_job.call_args
+    assert stop_kwargs.get("discard") is True
+    backend.adownload_files.assert_not_called()
+
+    # 3. Symlink on intermediate directory or leaf file -> rejected
+    backend.start_code_job.side_effect = [
+        _make_ended(0, "directory\nsymbolic link\nregular file\n"),
     ]
     res_sym_dir = await tool_fn.ainvoke(
         {
@@ -1158,9 +1201,9 @@ async def test_ingest_company_wiki_remote_sandbox_realpath_symlinks_shell_chars_
     backend.adownload_files.assert_not_called()
 
     # 4. Realpath resolving to a sibling workspace (`/remote/.../workspaces/amd/notes/call.md`) -> rejected
-    backend.aexecute_code.side_effect = [
-        _make_code_result(0, "directory\ndirectory\nregular file\n"),
-        _make_code_result(
+    backend.start_code_job.side_effect = [
+        _make_ended(0, "directory\ndirectory\nregular file\n"),
+        _make_ended(
             0,
             f"{remote_ws_dir}\n/remote/nonexistent_host_path/workspaces/amd/notes/call.md\n",
         ),
@@ -1182,9 +1225,9 @@ async def test_ingest_company_wiki_remote_sandbox_realpath_symlinks_shell_chars_
 
     # 5. Valid remote sandbox file -> stat and realpath pass, and `adownload_files` is called with the resolved realpath
     expected_resolved = f"{remote_ws_dir}/notes/call.md"
-    backend.aexecute_code.side_effect = [
-        _make_code_result(0, "directory\ndirectory\nregular file\n"),
-        _make_code_result(0, f"{remote_ws_dir}\n{expected_resolved}\n"),
+    backend.start_code_job.side_effect = [
+        _make_ended(0, "directory\ndirectory\nregular file\n"),
+        _make_ended(0, f"{remote_ws_dir}\n{expected_resolved}\n"),
     ]
     backend.adownload_files.return_value = [
         FileDownloadResponse(path=expected_resolved, content=b"# Valid remote workspace note")

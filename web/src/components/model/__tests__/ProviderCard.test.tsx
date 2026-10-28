@@ -25,12 +25,12 @@ describe('ProviderCard', () => {
     expect(screen.getByText('A')).toBeInTheDocument();
   });
 
-  it('shows selected state (accent border) when selected=true', () => {
+  it('shows selected state (ink border) when selected=true', () => {
     render(<ProviderCard {...defaultProps} selected />);
 
     const card = screen.getByRole('radio');
     expect(card).toHaveAttribute('aria-checked', 'true');
-    expect(card.style.border).toContain('2px solid');
+    expect(card.style.border).toContain('var(--color-text-primary)');
   });
 
   it('fires onSelect callback on click', () => {

@@ -2,8 +2,8 @@
 
 The sandbox path hands the model a Python wrapper per MCP tool and lets it
 compose them in ``ExecuteCode``. The direct path binds the tool itself, with
-its vendor schema verbatim, so a call is one typed tool call the middleware
-sees and the UI can render. Both paths reach the vendor through the same
+its vendor schema (folded only where a provider refuses it, ``_flat_root``),
+so a call is one typed tool call the middleware sees and the UI can render. Both paths reach the vendor through the same
 egress grant and the same relay route: the host dials its own relay on
 loopback with a relay JWT, so policy, token attach and audit are one code
 path however the call arrived.
@@ -23,7 +23,7 @@ import json
 import logging
 import re
 import warnings
-from collections.abc import AsyncIterator, Awaitable, Sequence
+from collections.abc import AsyncIterator, Sequence
 from contextlib import AsyncExitStack, aclosing
 from dataclasses import dataclass, field
 from hashlib import sha1
@@ -34,9 +34,11 @@ from langchain_core.tools import BaseTool
 from ptc_agent.agent.middleware.direct_mcp import METADATA_KEY
 from ptc_agent.agent.middleware.order_governance import execution_token
 from src.config.env import EGRESS_RELAY_LOOPBACK_URL, EGRESS_RELAY_SECRET
+from src.observability.langsmith_run import TOOL_PROVIDER
 from src.server.database.mcp_oauth import SERVABLE, ConnectionStatus, get_connection
 from src.server.services.brokerage_capabilities import (
     denied_tools,
+    group_for_tool,
     order_tool,
     vendor_for_url,
 )
@@ -108,6 +110,14 @@ def direct_tool_name(server: str, tool: str) -> str:
 MAX_DIRECT_TOOLS = 64
 MAX_DIRECT_SCHEMA_CHARS = 120_000
 
+# The Anthropic API refuses a tool whose input schema combines at the root,
+# and langchain-anthropic drops one before the request, on every route that
+# speaks its format (DeepSeek, Kimi and MiniMax as well as Claude).
+_ROOT_COMBINATORS = ("anyOf", "oneOf", "allOf")
+# Deeper than real schemas nest. A vendor's chain of refs could otherwise
+# exhaust the stack in the budget check, which no one tool's failure guards.
+_MAX_FOLD_DEPTH = 32
+
 
 @dataclass
 class _Budget:
@@ -119,7 +129,15 @@ class _Budget:
     def take(self, tool: DirectTool) -> bool:
         if self.tools >= MAX_DIRECT_TOOLS:
             return False
-        size = len(json.dumps(tool.schema, ensure_ascii=False, default=str))
+        # Charged as sent: folding a root combination can copy a referenced
+        # definition beside the one it came from. A schema that cannot be
+        # folded could not be bound either, so it spends nothing.
+        try:
+            sent = {**tool.schema, "input_schema": _sent_input_schema(tool.schema)}
+        except Exception:
+            logger.warning("[DIRECT_MCP] %r: unreadable input schema", tool.name, exc_info=True)
+            return False
+        size = len(json.dumps(sent, ensure_ascii=False, default=str))
         if self.chars + size > MAX_DIRECT_SCHEMA_CHARS:
             return False
         self.tools += 1
@@ -385,9 +403,102 @@ class DirectMCPBinding:
                     yield event
 
 
+def _flat_root(schema: Mapping[str, Any]) -> dict[str, Any]:
+    """``schema`` with a root ``anyOf``/``oneOf``/``allOf`` folded into one
+    object: every branch's properties, required where every branch of a
+    choice requires them or any part of an ``allOf`` does.
+
+    The vendor still checks a call against its own schema, so the looser one
+    costs at most a refused call. A dropped tool would leave a brokerage whose
+    reads answer and whose orders are quietly not there.
+    """
+    if not any(key in schema for key in _ROOT_COMBINATORS):
+        return dict(schema)
+    return _folded(schema, schema, {}, 0)
+
+
+def _sent_input_schema(schema: Mapping[str, Any]) -> dict[str, Any]:
+    return _flat_root(schema.get("input_schema") or {"type": "object"})
+
+
+def _folded(
+    root: Mapping[str, Any], node: Mapping[str, Any], folded: dict[str, Any], depth: int
+) -> dict[str, Any]:
+    flat = {key: value for key, value in node.items() if key not in _ROOT_COMBINATORS}
+    properties = dict(flat.get("properties") or {})
+    required = list(flat.get("required") or ())
+    needed: set[str] = set()
+    for key in _ROOT_COMBINATORS:
+        branches = [_branch(root, b, folded, depth + 1) for b in node.get(key) or ()]
+        branches = [b for b in branches if isinstance(b, Mapping)]
+        offered: dict[str, list[Any]] = {}
+        for branch in branches:
+            for name, sub in (branch.get("properties") or {}).items():
+                subs = offered.setdefault(name, [])
+                if sub not in subs:
+                    subs.append(sub)
+        for name, subs in offered.items():
+            # A choice holds one branch, so each definition it gives stays on
+            # offer; every part of an allOf holds, so any one alone is looser.
+            one = subs[0] if key == "allOf" or len(subs) == 1 else {"anyOf": subs}
+            properties.setdefault(name, one)
+        sets = [set(branch.get("required") or ()) for branch in branches]
+        if key == "allOf":
+            needed.update(*sets)
+        elif sets:
+            needed |= set.intersection(*sets)
+    required += sorted(needed - set(required))
+    flat.update(type="object", properties=properties)
+    if required:
+        flat["required"] = required
+    else:
+        flat.pop("required", None)
+    return flat
+
+
+def _branch(root: Mapping[str, Any], item: Any, folded: dict[str, Any], depth: int) -> Any:
+    """``item`` as the object it stands for: a ref into ``root`` followed, its
+    sibling keys kept over the target's, and a combination of its own folded in.
+
+    ``folded`` holds each ref's result, so a definition reached from many
+    branches is folded once and one met again inside itself stays a bare ref:
+    the work follows the vendor's schema, not every path through it.
+    """
+    if not isinstance(item, Mapping) or depth > _MAX_FOLD_DEPTH:
+        return item
+    ref = item.get("$ref")
+    if isinstance(ref, str) and ref.startswith("#"):
+        if ref not in folded:
+            folded[ref] = None
+            target = _pointer(root, ref)
+            folded[ref] = _branch(root, target, folded, depth + 1) if isinstance(target, Mapping) else None
+        if folded[ref] is not None:
+            item = {**folded[ref], **{k: v for k, v in item.items() if k != "$ref"}}
+    if any(key in item for key in _ROOT_COMBINATORS):
+        return _folded(root, item, folded, depth)
+    return item
+
+
+def _pointer(root: Mapping[str, Any], ref: str) -> Any:
+    """What a local ref (``#/$defs/order``) names in ``root``, or None."""
+    target: Any = root
+    for part in ref[1:].split("/")[1:]:
+        part = part.replace("~1", "/").replace("~0", "~")
+        if isinstance(target, Mapping):
+            target = target.get(part)
+        elif isinstance(target, list) and part.isdigit() and int(part) < len(target):
+            target = target[int(part)]
+        else:
+            return None
+    return target
+
+
+# DALTON-HOOK(colleague-dispatch): dual identity (owner_user_id for relay JWT/connection, caller_user_id for trading gate)
 async def prepare_direct_mcp_tools(
     *,
-    user_id: str | None,
+    user_id: str | None = None,
+    owner_user_id: str | None = None,
+    caller_user_id: str | None = None,
     workspace_id: str,
     sandbox_id: str | None = None,
     computer_id: str | None = None,
@@ -395,8 +506,13 @@ async def prepare_direct_mcp_tools(
     by_server: Mapping[str, DirectServerTools],
 ) -> DirectMCPBinding:
     """Build the tools for one turn; nothing is dialled until ``drive``."""
-    binding = DirectMCPBinding(user_id=user_id)
-    if not by_server or not grants or not EGRESS_RELAY_SECRET or not user_id:
+    eff_owner_id = owner_user_id or user_id
+    eff_caller_id = caller_user_id or user_id or eff_owner_id
+    is_colleague_turn = bool(
+        eff_owner_id and eff_caller_id and str(eff_owner_id) != str(eff_caller_id)
+    )
+    binding = DirectMCPBinding(user_id=eff_owner_id)
+    if not by_server or not grants or not EGRESS_RELAY_SECRET or not eff_owner_id:
         return binding
 
     from mcp.types import Tool
@@ -407,7 +523,7 @@ async def prepare_direct_mcp_tools(
 
     minted = mint_relay_jwt(
         EGRESS_RELAY_SECRET,
-        user_id=user_id,
+        user_id=eff_owner_id,
         workspace_id=workspace_id,
         sandbox_id=sandbox_id,
         computer_id=computer_id,
@@ -426,7 +542,18 @@ async def prepare_direct_mcp_tools(
         non_order_tools = tuple(
             t
             for t in entry.tools
-            if t.resolved.order is None and not is_order_tool(entry.vendor, t.name)
+            if t.resolved.order is None
+            and not is_order_tool(entry.vendor, t.name)
+            and not (
+                is_colleague_turn
+                and (
+                    getattr(t.resolved, "capability_group", None) == "trading"
+                    or (
+                        (grp := group_for_tool(entry.vendor, t.name)) is not None
+                        and grp.key == "trading"
+                    )
+                )
+            )
         )
         if non_order_tools:
             grantable[name] = DirectServerTools(
@@ -472,7 +599,7 @@ async def prepare_direct_mcp_tools(
                 tool = Tool(
                     name=schema["name"],
                     description=schema.get("description"),
-                    input_schema=schema.get("input_schema") or {"type": "object"},
+                    input_schema=_sent_input_schema(schema),
                 )
                 # No I/O for a client that is not entered: the session opens
                 # in ``drive``.
@@ -507,6 +634,10 @@ async def prepare_direct_mcp_tools(
                     "sandboxed": direct.sandboxed,
                     "approval": direct.resolved.approval,
                 },
+                # What its trace runs are filed under. A server the user added
+                # is named by the user, and the digest posts to a shared
+                # channel, so it is filed as a kind rather than by that label.
+                TOOL_PROVIDER: entry.vendor or "custom_mcp",
             }
             binding.tools.append(lc_tool)
             bound += 1
@@ -521,33 +652,64 @@ async def prepare_direct_mcp_tools(
     return binding
 
 
+# DALTON-HOOK(colleague-dispatch): pass owner_user_id and caller_user_id through direct MCP tool binding
 async def direct_tools_for_turn(
-    binding: Awaitable[DirectMCPBinding],
+    session: "Session",
+    *,
+    user_id: str | None = None,
+    owner_user_id: str | None = None,
+    caller_user_id: str | None = None,
+    workspace_id: str,
+    view: "WorkspaceToolView | None" = None,
+) -> DirectMCPBinding:
+    """A turn's direct toolset, bound but not opened (the run opens it,
+    ``drive``).
+
+    A binder that fails costs the turn its direct tools and not the turn: the
+    rest of the toolset is still reachable through the sandbox.
+    """
+    eff_owner_id = owner_user_id or user_id
+    eff_caller_id = caller_user_id or user_id or eff_owner_id
+    try:
+        return await bind_direct_mcp_tools(
+            session,
+            user_id=eff_owner_id,
+            workspace_id=workspace_id,
+            view=view,
+            **(
+                {
+                    "owner_user_id": eff_owner_id,
+                    "caller_user_id": eff_caller_id,
+                }
+                if eff_owner_id and eff_caller_id and eff_owner_id != eff_caller_id
+                else {}
+            ),
+        )
+    except Exception:
+        logger.warning("[DIRECT_MCP] binding failed; running without", exc_info=True)
+        # DALTON-HOOK(colleague-dispatch): fallback DirectMCPBinding uses eff_owner_id
+        return DirectMCPBinding(user_id=eff_owner_id)
+
+
+def order_ledger_for_turn(
     *,
     user_id: str | None,
     workspace_id: str,
     thread_id: str,
     run_id: str,
     turn_index: int,
-) -> tuple[DirectMCPBinding, "OrderAttemptLedger | None"]:
-    """This turn's direct toolset, and the ledger its orders are written to.
+) -> "OrderAttemptLedger | None":
+    """The ledger a turn's orders are written to, None without a user.
 
-    A binder that fails costs the turn its direct tools and not the turn: the
-    rest of the toolset is still reachable through the sandbox. The ledger carries ids only, because every
-    transition it makes is a guarded statement against the row: the worker that
-    ends up holding the tool call is never assumed to be the one that proposed
-    it.
+    It carries ids only, because every transition it makes is a guarded
+    statement against the row: the worker that ends up holding the tool call
+    is never assumed to be the one that proposed it.
     """
     from src.server.services.egress.order_ledger import OrderAttemptLedger
 
-    try:
-        bound = await binding
-    except Exception:
-        logger.warning("[DIRECT_MCP] binding failed; running without", exc_info=True)
-        bound = DirectMCPBinding(user_id=user_id)
     if not user_id:
-        return bound, None
-    return bound, OrderAttemptLedger(
+        return None
+    return OrderAttemptLedger(
         user_id=user_id,
         workspace_id=workspace_id,
         thread_id=thread_id,
@@ -556,10 +718,13 @@ async def direct_tools_for_turn(
     )
 
 
+# DALTON-HOOK(colleague-dispatch): accept owner_user_id and caller_user_id in bind_direct_mcp_tools
 async def bind_direct_mcp_tools(
     session: "Session",
     *,
-    user_id: str | None,
+    user_id: str | None = None,
+    owner_user_id: str | None = None,
+    caller_user_id: str | None = None,
     workspace_id: str,
     view: "WorkspaceToolView | None" = None,
 ) -> DirectMCPBinding:
@@ -572,12 +737,17 @@ async def bind_direct_mcp_tools(
     that one. The same goes for the split: the session's copy is whichever
     sibling resolved last, so a turn reads the view frozen for its project.
     """
+    eff_owner_id = owner_user_id or user_id
+    eff_caller_id = caller_user_id or user_id or eff_owner_id
     by_server = view.direct_mcp_tools if view is not None else session.direct_mcp_tools
     egress = view.egress_binding if view is not None else session.egress_binding
     if not by_server or egress is None:
-        return DirectMCPBinding(user_id=user_id)
+        return DirectMCPBinding(user_id=eff_owner_id)
+    # DALTON-HOOK(colleague-dispatch): pass owner_user_id and caller_user_id to prepare_direct_mcp_tools
     return await prepare_direct_mcp_tools(
-        user_id=user_id,
+        user_id=eff_owner_id,
+        owner_user_id=eff_owner_id,
+        caller_user_id=eff_caller_id,
         workspace_id=workspace_id,
         # Absent, not "": the host path runs for a session whose sandbox is not
         # provisioned, and the validator refuses an empty identity claim.

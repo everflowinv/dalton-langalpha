@@ -573,7 +573,8 @@ describe('what the order ticket reads off the server', () => {
   it('names the type unless the prices already say it', () => {
     const fields = (order: Partial<OrderProposal>) =>
       orderTicket({ ...ORDER, ...order }, SHOWN).figures.map((part) => part.field);
-    expect(fields({ order_type: 'market' })).toEqual(['qty', 'order_type', 'limit_price']);
+    // A price on a type that takes no limit is not one: a field of its own.
+    expect(fields({ order_type: 'market' })).toEqual(['qty', 'order_type', 'price']);
     const market = orderTicket({ ...ORDER, order_type: 'market' }, SHOWN).figures;
     expect(market[1]).toMatchObject({ valueKey: 'orders.orderType.market' });
     // Not a limit, so not called one.
@@ -585,7 +586,7 @@ describe('what the order ticket reads off the server', () => {
       'qty',
       'order_type',
       'stop_price',
-      'limit_price',
+      'price',
     ]);
     expect(fields({ order_type: 'market_if_touched', limit_price: null, stop_price: '95' })).toEqual([
       'qty',

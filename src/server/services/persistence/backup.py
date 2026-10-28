@@ -22,10 +22,15 @@ from src.server.database.workspace_file import (
     get_file_metadata_for_sync,
     get_workspace_total_size,
     path_fits_manifest,
+    mark_files_backed_up,
     set_files_scan_mark,
     workspace_sync_lock,
 )
-from src.server.database.workspace import files_restore_incomplete, workspace_owner
+from src.server.database.workspace import (
+    computer_backs_up_files,
+    files_restore_incomplete,
+    workspace_owner,
+)
 from src.server.services.persistence._rows import (
     _blob_row,
     _content_matches,
@@ -39,6 +44,7 @@ from src.server.services.persistence.blobs import (
     _persist_inline,
     _persist_packed,
 )
+from src.server.services.persistence.restore import folder_waits_on_owner
 from src.server.services.persistence.sync_result import SyncResult, UnsavedFile
 from src.server.services.persistence.transfer import (
     scan_cap_bytes,
@@ -104,7 +110,7 @@ def _has_ancestor_in(path: str, names: set[str]) -> bool:
 
 
 async def sync_to_db(
-    workspace_id: str, sandbox: Any, *, layout: WorkspaceLayout
+    workspace_id: str, sandbox: Any, *, layout: WorkspaceLayout, routine: bool = False
 ) -> SyncResult:
     """
     Snapshot workspace files from the sandbox into the manifest.
@@ -124,11 +130,29 @@ async def sync_to_db(
     the older one's upsert land last and reinstate what the newer pass had
     already recorded.
 
+    ``routine`` is a backup the computer's switch governs (after a turn, at a
+    stop, before a delete). It reads the switch here, under the lock, rather
+    than where its pass was planned: a machine-wide pass runs for as long as
+    its projects take, and the owner may turn backups off meanwhile.
+
     Returns:
         What the pass saved, and every file it could not
     """
     try:
         async with workspace_sync_lock(workspace_id) as conn:
+            # Only an owner's machine can have its backups off.
+            if (
+                routine
+                and not sandbox.recreatable
+                and not await computer_backs_up_files(workspace_id, conn=conn)
+            ):
+                return SyncResult(backups_off=True)
+            # A folder gone from its owner's machine, or emptied, would be
+            # mirrored as deleted, pruning the files they may still ask back.
+            if not sandbox.recreatable and await folder_waits_on_owner(
+                workspace_id, sandbox, layout=layout, conn=conn
+            ):
+                return SyncResult(held=True)
             result = await _sync_locked(workspace_id, sandbox, conn, layout)
             # Last, under the same lock: a mark says everything changed before
             # it is saved, so it moves only once the writes above landed, the
@@ -137,6 +161,15 @@ async def sync_to_db(
             # and a mark would let the sweep skip that repeat. A file
             # unsaved for good (too large, path too long) does not hold it
             # back: rescanning cannot save it, and it is reported either way.
+            if result.pruned and not result.errors:
+                try:
+                    await mark_files_backed_up(workspace_id, conn=conn)
+                except Exception as e:
+                    # Only what the owner is shown before a restore.
+                    logger.warning(
+                        f"Could not record the backup time of workspace "
+                        f"{workspace_id}: {e}"
+                    )
             if result.scan_mark and result.pruned and not result.errors:
                 try:
                     await set_files_scan_mark(

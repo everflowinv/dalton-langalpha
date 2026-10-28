@@ -61,6 +61,8 @@ def projection_sources() -> list[Path]:
             _SRC / "server/database/provenance.py",
             _SRC / "server/services/runs/credit_usage.py",
             _SRC / "server/contracts/status.py",
+            _SRC / "server/contracts/run_times.py",
+            _SRC / "server/contracts/turn_kinds.py",
             _SRC / "llms/content_utils.py",
             _SRC / "llms/token_counter.py",
         ]

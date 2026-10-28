@@ -7,12 +7,15 @@ rule cannot live in the client once the payload has already left.
 
 from __future__ import annotations
 
+import json
 import re
 from typing import Any, Literal
 
 from ptc_agent.agent.middleware.direct_mcp import METADATA_KEY
 from ptc_agent.agent.middleware.order_governance import RECEIPT_KEY
+from src.server.contracts.turn_kinds import NOTIFICATION_QUERY_TYPES
 from src.tools.secretary.chief_of_staff import CHIEF_OF_STAFF_TOOLS
+from src.tools.wakeups.quiet import TOOL_NAME as WAKEUP_TOOL_NAME
 from src.utils.nested import without_keys
 
 # Five things a turn carries name the owner's brokerage account: the provenance
@@ -40,6 +43,13 @@ _PRIVATE_ARTIFACT_KEYS = (RECEIPT_KEY, "provenance")
 _PRIVATE_QUERY_METADATA_KEYS = frozenset(
     {"workspace_id", "order_decisions", "report_source"}
 )
+# A wakeup on an order names the order and, once it settles, the fill. A
+# share keeps each notice's label and kind, which name what fired, and drops
+# the order wherever the notice sits: a wake turn's query metadata and the
+# entry a running turn took it in by. The agent's own ``schedule_wakeup``
+# calls name the order too, by its id in the arguments and in the answer's
+# listing, so those go as an order call's do.
+_WAKEUP_ORDER_KEYS = frozenset({"order"})
 # Keys naming the owner's account wherever they sit in an event: no share
 # renders them, and none is the viewer's to read.
 _OWNER_ID_KEYS = frozenset({"workspace_id", "user_id"})
@@ -77,6 +87,7 @@ _USER_ID_PAIR_LAST = re.compile(r"(?:,\s*)?" + _USER_ID_PAIR)
 _ANSWER_RULES: dict[str, Literal["blank", "scrub_user_id"]] = {
     **dict.fromkeys(_SECRETARY_TOOL_NAMES, "blank"),
     **dict.fromkeys(_USER_DATA_TOOL_NAMES, "scrub_user_id"),
+    WAKEUP_TOOL_NAME: "blank",
 }
 
 
@@ -162,6 +173,26 @@ def _cleared_call_ids(events: list[dict[str, Any]]) -> set[tuple[str, str]]:
     return found
 
 
+def _wakeup_args(args: Any) -> Any:
+    """A ``schedule_wakeup`` call's arguments less the order each trigger names.
+
+    The triggers stay listed, as the view reads a call that sets one as a
+    change. A list sent as JSON text is read as the tool reads it, and one
+    that cannot be read keeps a single empty trigger in its place.
+    """
+    if not isinstance(args, dict) or "triggers" not in args:
+        return args
+    triggers = args["triggers"]
+    if isinstance(triggers, str):
+        try:
+            triggers = json.loads(triggers)
+        except ValueError:
+            triggers = None
+    if not isinstance(triggers, list):
+        return {**args, "triggers": [{}]}
+    return {**args, "triggers": without_keys(triggers, _WAKEUP_ORDER_KEYS)}
+
+
 def _without_user_id_pairs(text: str) -> str:
     """``text`` less every quoted ``user_id`` pair, with the comma it leaves."""
     return _USER_ID_PAIR_LAST.sub("", _USER_ID_PAIR_FIRST.sub("", text))
@@ -187,8 +218,9 @@ class ShareRedaction:
     def query(self, q: dict[str, Any]) -> tuple[Any, Any]:
         """A query row's text and metadata, less what a viewer must not read.
 
-        A system query's text is the agent's own prompt, never shown, and a
-        report-back names the dispatched thread and its workspace.
+        A notification turn's text is the agent's own prompt, never shown,
+        and a wake's names any order it fired on; a report-back's metadata
+        names the dispatched thread and its workspace.
         """
         metadata = q.get("metadata") or {}
         if isinstance(metadata, dict):
@@ -202,7 +234,13 @@ class ShareRedaction:
                 },
                 _OWNER_ID_KEYS,
             )
-        content = "" if q.get("type") == "system" else q.get("content")
+            if "wakeup" in metadata:
+                metadata["wakeup"] = without_keys(
+                    metadata["wakeup"], _WAKEUP_ORDER_KEYS
+                )
+        content = (
+            "" if q.get("type") in NOTIFICATION_QUERY_TYPES else q.get("content")
+        )
         return content, metadata
 
     def event(self, event_type: str, data: dict[str, Any]) -> dict[str, Any] | None:
@@ -223,6 +261,13 @@ class ShareRedaction:
             # A report a live turn took in names its source as a report
             # turn's query metadata does; a share keeps neither.
             data = without_keys(data, {"report_source"})
+            if isinstance(data.get("messages"), list):
+                data["messages"] = [
+                    {**m, "wakeup": without_keys(m["wakeup"], _WAKEUP_ORDER_KEYS)}
+                    if isinstance(m, dict) and "wakeup" in m
+                    else m
+                    for m in data["messages"]
+                ]
         if event_type in _ERROR_TEXT_EVENTS:
             data.pop("error", None)
         if event_type == "tool_calls":
@@ -253,6 +298,8 @@ class ShareRedaction:
                     call, data.get("id")
                 ):
                     call = {**call, "args": {}}
+                elif name == WAKEUP_TOOL_NAME:
+                    call = {**call, "args": _wakeup_args(call.get("args"))}
             shown.append(call)
         data["tool_calls"] = shown
 

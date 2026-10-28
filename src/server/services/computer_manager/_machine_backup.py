@@ -54,6 +54,7 @@ class MachineBackupMixin:
         expected_sandbox_id: Optional[str] = None,
         strict: bool = False,
         session: Optional[Session] = None,
+        routine: bool = False,
     ) -> int:
         """Mirror every project on the machine, ``workspace_id`` first.
 
@@ -80,6 +81,7 @@ class MachineBackupMixin:
             strict=strict,
             session=session,
             failures=failures,
+            routine=routine,
         )
 
     async def _mirror_projects(
@@ -92,6 +94,7 @@ class MachineBackupMixin:
         session: Optional[Session] = None,
         failures: Optional[list[str]] = None,
         layouts: Optional[dict[str, WorkspaceLayout]] = None,
+        routine: bool = False,
     ) -> int:
         """Mirror ``ordered`` in turn; returns how many were actually mirrored.
 
@@ -115,6 +118,7 @@ class MachineBackupMixin:
                     expected_sandbox_id=expected_sandbox_id,
                     session=session,
                     layout=layouts.get(ws_id),
+                    routine=routine,
                 ):
                     mirrored += 1
             except Exception as e:
@@ -154,6 +158,9 @@ class MachineBackupMixin:
         """
         started = time.monotonic()
         binding = await self.resolve_binding(workspace_id)
+        if not binding.files_backup:
+            # Its owner chose so; the last backup stays as it was.
+            return
         session = session or self._cached_session(binding.computer_id)
         ordered, layouts, sweep = [workspace_id], {}, None
         if getattr(session, "sandbox", None):
@@ -171,6 +178,7 @@ class MachineBackupMixin:
             expected_sandbox_id=binding.provider_ref,
             session=session,
             layouts=layouts,
+            routine=True,
         )
         if sweep is not None:
             logger.info(

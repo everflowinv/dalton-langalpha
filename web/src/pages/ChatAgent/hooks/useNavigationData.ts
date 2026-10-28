@@ -18,7 +18,7 @@ import {
 import type { ResourceTier, ThreadsResponse, Workspace, WorkspacesResponse } from '@/types/api';
 import { getWorkspaces, getWorkspaceThreads, reorderWorkspaces, updateThread } from '../utils/api';
 import { workspaceThreadsQuery } from '../utils/threadQueries';
-import { pinWorkspaceRow, renameWorkspaceRow } from './workspaceRowActions';
+import { pinWorkspaceRow, rankCachedWorkspaces, renameWorkspaceRow, unrankCachedWorkspaces } from './workspaceRowActions';
 import { useNavPrefs } from '../utils/navPrefs';
 import { denialMessage } from '../utils/denialMessage';
 
@@ -356,7 +356,7 @@ export function useNavigationData(currentWorkspaceId: string) {
   // Drag-reorder a workspace in the nav list. Optimistically rewrites the
   // frozen nav order, then persists sequential sort_order values so the
   // workspace gallery's 'custom' sort shows the same arrangement. Mirrors the
-  // gallery's reorder-mode rules: crossing the pinned/unpinned boundary is
+  // gallery grid's drag rules: crossing the pinned/unpinned boundary is
   // refused (the server sort would undo it — is_pinned DESC dominates
   // sort_order); Home counts as pinned and reorders within that block.
   const reorderWorkspace = useCallback(async (activeId: string, overId: string) => {
@@ -386,13 +386,19 @@ export function useNavigationData(currentWorkspaceId: string) {
       .map((id) => byId.get(id))
       .filter((ws): ws is NavWorkspace => !!ws)
       .map((ws, i) => ({ workspace_id: ws.workspace_id, sort_order: i }));
+    // Every cached list in the custom order takes the new order at once, the
+    // gallery's included, as a drop there does: a drag in the gallery before
+    // the save lands then moves from this order, not the one before it.
+    const previous = rankCachedWorkspaces(queryClient, items);
     try {
       await reorderWorkspaces(items);
       queryClient.invalidateQueries({ queryKey: queryKeys.workspaces.lists() });
     } catch (e) {
       console.warn('[useNavigationData] Failed to persist workspace order:', e);
+      unrankCachedWorkspaces(queryClient, previous);
       _frozenWorkspaceOrder = snapshot;
       bumpNavOrder();
+      queryClient.invalidateQueries({ queryKey: queryKeys.workspaces.lists() });
     }
   }, [allFetched, queryClient]);
 

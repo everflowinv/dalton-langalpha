@@ -12,6 +12,7 @@ tests/integration/dalton/
 tests/fixtures/dalton/
 tests/unit/mcp_servers/fixtures/dalton_sec/
 tests/unit/mcp_servers/test_dalton_sec_periods.py
+tests/unit/server/services/test_bringup_owner_check.py
 agent_config.dalton.yaml
 config.dalton.yaml
 docker-compose.dalton.yml
@@ -26,6 +27,7 @@ web/src/pages/Settings/utils/daltonOAuthApi.ts
 web/src/pages/Setup/steps/connectStep/dalton/
 web/src/pages/ChatAgent/components/dalton/
 web/src/pages/Dashboard/components/dalton/
+web/src/pages/Onboarding/dalton/
 web/.env.dalton
 web/public/everflow/
 web/src/config/brand.ts
@@ -38,9 +40,21 @@ web/src/config/__tests__/daltonAuth.test.ts
 web/src/components/Sidebar/__tests__/TeamSharing.test.tsx
 web/src/components/dalton/
 web/src/lib/dalton/
+web/src/pages/ChatAgent/hooks/__tests__/useChatMessages.sendAcceptance.test.ts
 tests/unit/tools/secretary/test_workspace_file_write_cos.py
 tests/unit/tools/secretary/test_workspace_list_sharing_note.py
 tests/unit/tools/secretary/test_workspaces_create_folder_ready.py
 tests/unit/tools/web/inhouse/test_fetch_binary_route.py
 tests/unit/mcp_servers/test_market_data_yf_fallback.py
 tests/unit/server/handlers/chat/test_attachments_notes.py
+tests/unit/server/handlers/chat/test_unreadable_image_upload.py
+tests/unit/server/handlers/conftest.py
+tests/unit/ptc_agent/middleware/test_image_byte_fit.py
+# A1: log-only registry of in-flight heavy compute, read by the loop watchdog.
+src/observability/heavy_tasks.py
+# A1: subprocess entry points for PDF text extraction (stdlib-only at import).
+mcp_servers/_pdf_parse.py
+# LaneA new tests living in upstream test directories.
+tests/unit/server/services/test_acquire_retry_bound.py
+tests/unit/mcp_servers/test_extract_input_cap.py
+tests/unit/ptc_agent/core/sandbox/test_import_name_package_map.py

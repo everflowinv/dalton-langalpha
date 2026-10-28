@@ -4,6 +4,7 @@ import {
   EMPTY_SUBAGENT_HISTORY, createSubagentHistoryStore, readSubagentHistory, resolveHistoryAgentId,
 } from './historyStore';
 import { hydrateTaskTranscript, type TaskTranscriptMeta } from './hydrateTaskTranscript';
+import { runsOfTask } from './taskRuns';
 
 /**
  * The subagent history bound to a view: the store the session lanes write and
@@ -24,7 +25,7 @@ export function useSubagentHistory(
     beforePublish();
     setView(next);
   }));
-  const { agentIdByToolCallId } = view;
+  const { agentIdByToolCallId, runs } = view;
 
   // A tool-call id (an inline card's segment) to the task id card operations use.
   const resolveSubagentIdToAgentId = useCallback(
@@ -35,6 +36,11 @@ export function useSubagentHistory(
     (subagentId: string) => readSubagentHistory(view, subagentId),
     [view],
   );
+  // The runs of the task an inline card (or a task id) stands for.
+  const getTaskRuns = useCallback(
+    (subagentId: string) => runsOfTask(runs, resolveHistoryAgentId(agentIdByToolCallId, subagentId)),
+    [runs, agentIdByToolCallId],
+  );
   // Resolves to the landed entry itself: a caller continuing after the await
   // holds getters from before the fetch, which cannot see it yet.
   const hydrate = useCallback(
@@ -43,5 +49,13 @@ export function useSubagentHistory(
     [t, store, subagentStateRefsRef, threadId],
   );
 
-  return { store, entries: view.entries, resolveSubagentIdToAgentId, getSubagentHistory, hydrateTaskTranscript: hydrate };
+  return {
+    store,
+    entries: view.entries,
+    resolveSubagentIdToAgentId,
+    getSubagentHistory,
+    getTaskRuns,
+    putTaskRun: store.runs.put,
+    hydrateTaskTranscript: hydrate,
+  };
 }

@@ -151,7 +151,7 @@ class _Union:
         assert {fn.name for fn in fns} == wanted
         # The script reads its inputs as module globals, filled from the args
         # file the host uploads beside the wrappers.
-        self._ns: dict = {"os": os, "ROOT": root}
+        self._ns: dict = {"os": os, "ROOT": root, "HELD": set()}
         exec(
             compile(ast.Module(body=fns, type_ignores=[]), "<tool_overlay>", "exec"),
             self._ns,
@@ -480,6 +480,7 @@ class _Computer:
         servers: list[MCPServerConfig],
         *,
         tool_version: str | None = None,
+        held: tuple[str, ...] = (),
     ) -> dict:
         ws = self.layout.for_workspace(project.dir_name)
         os.makedirs(ws.tools, exist_ok=True)
@@ -497,6 +498,7 @@ class _Computer:
             "root": self.root,
             "dirName": project.dir_name or "",
             "servers": cfg["servers"],
+            "held": list(held),
             "unionTools": self.layout.tools,
             "unionDocs": self.layout.tools_docs,
             "wsTools": ws.tools,
@@ -595,6 +597,48 @@ class TestWorkspacesShareOneUnion:
         assert set(computer.ledger()["servers"]) == {"sec"}
         assert not os.path.exists(f"{computer.layout.tools}/crm.py")
         assert os.path.exists(f"{computer.layout.tools}/sec.py")
+
+
+class TestAServerTheSyncingWorkerNeverReached:
+    """A worker whose boot connect to a built-in server failed has no tools for
+    it, while a sibling worker that reached it installed them for the agents it
+    serves. The unhealed worker's sync holds that server rather than withdraw
+    it, and holding adds nothing the sandbox did not already have."""
+
+    @staticmethod
+    def _enabled(computer, project) -> set[str]:
+        ws = computer.layout.for_workspace(project.dir_name)
+        with open(ws.mcp_client_config, encoding="utf-8") as fh:
+            return set(json.load(fh)["servers"])
+
+    def test_a_held_server_keeps_its_wrapper_claim_and_config(self, computer):
+        market = MCPServerConfig(name="market", transport="http", url="https://m/mcp")
+        crm = _user_server("crm", "https://c")
+        computer.sync(A, [market, crm])
+
+        computer.sync(A, [crm], held=("market",))
+
+        ws = computer.layout.for_workspace(A.dir_name)
+        assert os.path.exists(f"{ws.tools}/market.py")
+        assert os.path.exists(f"{ws.tools_docs}/market")
+        ledger = computer.ledger()
+        assert ledger["claims"]["market"] == [A.claim]
+        assert "market" in ledger["servers"]
+        assert self._enabled(computer, A) == {"crm", "market"}
+
+        # Not held, the same sync is the workspace dropping it.
+        computer.sync(A, [crm])
+        assert not os.path.lexists(f"{ws.tools}/market.py")
+        assert not os.path.exists(f"{computer.layout.tools}/market.py")
+        assert self._enabled(computer, A) == {"crm"}
+
+    def test_holding_installs_nothing(self, computer):
+        computer.sync(A, [_user_server("crm", "https://c")], held=("market",))
+
+        ws = computer.layout.for_workspace(A.dir_name)
+        assert not os.path.lexists(f"{ws.tools}/market.py")
+        assert "market" not in computer.ledger()["claims"]
+        assert self._enabled(computer, A) == {"crm"}
 
 
 class TestAnOlderUnionHeals:
@@ -729,6 +773,42 @@ class TestRuntimeReadsTheRootVault:
             stamped = [row[0] for row in runtime.secret_fingerprint()]
             assert computer.layout.vault_secrets in stamped
             assert stale_vault not in stamped
+        finally:
+            runtime._apply_config_dict({})
+
+    def test_the_data_token_file_is_stamped_only_for_a_server_naming_it(
+        self, computer
+    ):
+        """The server writes a fresh market-data token every half hour and
+        its reader picks it up itself; stamping the file for every server
+        would respawn each trusted one on every write."""
+        tokens = computer.layout.mcp_tokens
+        trusted = {"transport": "stdio", "untrusted": False, "command": "builtin"}
+        reader = {
+            "transport": "stdio",
+            "untrusted": True,
+            "command": "reader",
+            "env": {"DATA_TOKEN_FILE": tokens},
+        }
+        try:
+            runtime._apply_config_dict(
+                {
+                    "working_dir": computer.root,
+                    "fold_union": False,
+                    "servers": {"builtin": trusted},
+                }
+            )
+            assert tokens not in [row[0] for row in runtime.secret_fingerprint()]
+
+            runtime._apply_config_dict(
+                {
+                    "working_dir": computer.root,
+                    "fold_union": False,
+                    "servers": {"builtin": trusted, "reader": reader},
+                }
+            )
+            assert runtime.server_secret_dependencies("reader") == [tokens]
+            assert tokens in [row[0] for row in runtime.secret_fingerprint()]
         finally:
             runtime._apply_config_dict({})
 

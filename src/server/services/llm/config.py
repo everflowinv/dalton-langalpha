@@ -18,6 +18,7 @@ from ptc_agent.agent.subagents.merge import turn_roster
 from src.llms.preferences import (
     Tuning,
     compaction_profile_for,
+    custom_model,
     resolve_tuning,
 )
 from src.server.services.features import effective_flags_for_user
@@ -28,18 +29,22 @@ from .availability import (
     _MODEL_PREF_KEYS,
     cleanup_stale_model_preferences,
     drop_dead_models,
+    drop_off_plan_models,
+    model_on_plan,
     raise_byok_key_required,
+    raise_model_not_on_plan,
     raise_model_removed,
 )
 
 from . import logger
 
-from .capabilities import gate_capabilities
+from .capabilities import PlanTier, gate_capabilities
 from .clients import resolve_clients
 from .subagents import (
     demote_clientless,
     read_user_subagents,
     resolve_user_subagents,
+    subagent_models,
     subagent_roles,
 )
 from . import user_models
@@ -194,11 +199,65 @@ def select_model(
     user_fallback = model_pref.get("fallback_models")
     if user_fallback is not None:
         config.llm.fallback = user_fallback
+    # Repeats only: the turn's own model stays, since a subagent on another
+    # model may still fall back to it. The resilience middleware drops
+    # whichever model a request targets.
+    if config.llm.fallback:
+        config.llm.fallback = config.llm.fallbacks_for(None)
 
     return ModelSelection(
         effective_model=slot_model(config.llm, slot),
         model_field=model_field,
     )
+
+
+async def gate_models_by_plan(
+    base_config, user_id: str, model_pref: dict, request_model: str | None,
+    *, slot: str, permits: PlanTier, is_byok: bool,
+) -> dict:
+    """``model_pref`` once the plan has had its say on what runs on the
+    platform's key.
+
+    A model the turn names is refused when the plan does not cover it:
+    someone chose it, and running another would answer a question they did
+    not ask. Every saved model reads as unset instead
+    (``drop_off_plan_models``), the Default included, so a turn that names
+    none runs the deployment's, as the composer starts on it. The
+    deployment's defaults are the operator's call, as a subagent's own pin
+    is, and pass where they would run unasked: its main model anywhere, its
+    Background only in the Background slot and the roles that inherit it,
+    not as a primary turn's own model.
+    """
+    llm = base_config.llm
+    main = frozenset({llm.name}) if llm else frozenset()
+    background = main | {slot_model(llm, "background")} if llm else frozenset()
+    exempt = {key: background for key in _MODEL_PREF_KEYS}
+    exempt["preferred_model"] = exempt["fallback_models"] = main
+    named_exempt = background if slot == "background" else main
+    byok_cache: dict[str, dict | None] = {}
+
+    async def on_plan(name: str) -> bool:
+        return await model_on_plan(
+            user_id, name, model_pref=model_pref, permits=permits,
+            is_byok=is_byok, byok_cache=byok_cache,
+        )
+
+    if request_model and request_model not in named_exempt and not await on_plan(request_model):
+        await permits.refresh()
+        if not await on_plan(request_model):
+            if await permits.tier() is None:
+                from src.server.dependencies.usage_limits import quota_service_unavailable
+
+                raise quota_service_unavailable()
+            raise_model_not_on_plan(request_model)
+
+    view, dropped = await drop_off_plan_models(
+        user_id, model_pref, permits=permits, is_byok=is_byok,
+        byok_cache=byok_cache, exempt=exempt,
+    )
+    if dropped:
+        logger.info(f"[CHAT] Ignoring saved models off plan for user={user_id}: {dropped}")
+    return view
 
 
 async def load_user_context(
@@ -230,16 +289,36 @@ async def load_user_context(
     config.skill_command_overrides = dict(bundle.command_overrides)
 
 
-def apply_compaction(config, tuning: Tuning, entry: dict[str, Any] | None) -> None:
-    """Apply the named compaction preset (aggressive/moderate/extended/relaxed).
+#: The most of a model's window a compaction threshold may claim. The rest is
+#: the reply, the tool results that land before the next check, and the
+#: summary call itself, which reads past the threshold.
+_THRESHOLD_SHARE = (3, 4)
+
+
+def apply_compaction(
+    config, tuning: Tuning, entry: dict[str, Any] | None, *, custom: bool = False
+) -> None:
+    """Apply the named compaction preset, capped to what the model's window
+    can hold.
 
     The user's choice wins; failing that the model answers for itself, by
     declaration or by the band its context window falls in. Only a model that
     states no window keeps the YAML default, which is one number for every
     model and so is right for almost none of them.
+
+    An account-wide preset reaches every model, so a 750k preset chosen for a
+    1M model also lands on a 400k one, where it would never trigger and every
+    long turn would compact only after the provider refused it.
+
+    ``native`` is the user's per-model choice. A ``custom`` model never
+    compacts natively: the settings offer the choice only for manifest models,
+    so one of the user's own would compact with no switch to turn it off. The
+    ``provider_compaction`` feature, and whether the provider can compact for
+    this turn, are weighed when the middleware is built and called.
     """
     from ptc_agent.config.agent import COMPACTION_PROFILES
 
+    config.compaction.native = not custom and tuning.native_compaction is not False
     profile = tuning.compaction_profile
     if not isinstance(profile, str):
         profile = compaction_profile_for(entry)
@@ -249,6 +328,12 @@ def apply_compaction(config, tuning: Tuning, entry: dict[str, Any] | None) -> No
     for field, value in preset.items():
         setattr(config.compaction, field, value)
     config.compaction.profile = profile
+    context = (entry or {}).get("context")
+    if isinstance(context, int) and context > 0:
+        share, of = _THRESHOLD_SHARE
+        config.compaction.token_threshold = min(
+            config.compaction.token_threshold, context * share // of
+        )
 
 
 def apply_fetch_override(config) -> None:
@@ -346,13 +431,7 @@ async def resolve_llm_config(
     metadata): nobody would see the ``model_removed`` CTA, so its own saved
     model is read like a role and nothing is scrubbed.
     """
-    # The user's own subagents, for a build that compiles any. Their reads
-    # depend on nothing below, so they start now and the merge waits for them.
-    reads = (
-        asyncio.create_task(read_user_subagents(user_id, base_config.subagents))
-        if slot == "primary" and user_facing
-        else None
-    )
+    reads: asyncio.Task | None = None
     try:
         if is_byok is None:
             from src.server.database.api_keys import is_byok_active
@@ -375,6 +454,20 @@ async def resolve_llm_config(
         if dropped:
             logger.info(f"[CHAT] Ignoring saved models not in the manifest for user={user_id}: {dropped}")
 
+        # One tier read for every plan gate the turn runs.
+        permits = PlanTier(user_id)
+        model_pref = await gate_models_by_plan(
+            base_config, user_id, model_pref, request_model,
+            slot=slot, permits=permits, is_byok=is_byok,
+        )
+
+        # The user's own subagents, for a build that compiles any. Their reads
+        # depend on nothing below, so they start now and the merge waits for
+        # them; not before the plan check, whose refusal is routine and would
+        # cancel them inside their transaction.
+        if slot == "primary" and user_facing:
+            reads = asyncio.create_task(read_user_subagents(user_id, base_config.subagents))
+
         await load_user_context(config, user_id, workspace_id, model_pref)
         selection = select_model(config, model_pref, slot, request_model)
 
@@ -385,8 +478,13 @@ async def resolve_llm_config(
         # model and a 1M one.
         tuning = resolve_tuning(model_pref, selection.effective_model)
         config.prompt_guidance = user_models.guidance_for(model_pref, selection.effective_model)
-        apply_compaction(config, tuning, user_models.model_entry(model_pref, selection.effective_model))
-        permits = await gate_capabilities(config, user_id, model_pref)
+        apply_compaction(
+            config,
+            tuning,
+            user_models.model_entry(model_pref, selection.effective_model),
+            custom=custom_model(model_pref, selection.effective_model) is not None,
+        )
+        await gate_capabilities(config, user_id, model_pref, permits)
 
         # After the gate, whose tier check the merge reuses, and before the
         # clients, which read the merged definitions for their roles.
@@ -431,5 +529,9 @@ async def resolve_llm_config(
     # DALTON-HOOK(subagent-model-pin): only inspect subagents compiled for this
     # turn's role on the primary slot.
     demote_clientless(config, role=role, slot=slot)
+    if slot == "primary":
+        config.subagent_models = subagent_models(
+            config, model_pref, selection.effective_model, role=role,
+        )
 
     return config

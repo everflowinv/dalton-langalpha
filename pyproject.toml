@@ -17,7 +17,9 @@ dependencies = [
     "httpx[http2]>=0.28.1",
     # LangChain core packages (v1)
     "langchain[mcp]>=1.4.0",
-    "langchain-core>=1.6.0",
+    # >=1.6.11: src/observability/langsmith_tracer.py builds its tracer from
+    # tracers.context._get_tracer_kwargs, which replaced _get_tracer_project there.
+    "langchain-core>=1.6.11",
     "langchain-openai>=1.6.0",
     # Declared directly because src/llms/vendor/langchain_zai and libs/ptc-cli
     # import it; the 3.x floor is the HTTPX2 client migration.
@@ -32,12 +34,17 @@ dependencies = [
     # in pregel/_messages.py), which stamps id-less BaseMessage/dict/list writes
     # before persistence — the mechanism that keeps reconstruction deterministic
     # paired with the non-minting reducer in ptc_agent.agent.state.
-    # >=1.2.11 is the release ptc_agent.agent.delta_branch backports onto: it
-    # wraps loop and update_state internals in their 1.2.11 shape.
-    "langgraph>=1.2.11,<2",
+    # >=1.2.16 is the release verified without our old shims: 1.2.13 snapshots a
+    # new branch's delta channels (a run or update from an older checkpoint no
+    # longer replays the writes it dropped), and 1.2.15 stamps ids on
+    # update_state writes.
+    "langgraph>=1.2.16,<2",
     # ceiling mirrors langgraph<2 — the postgres saver serializes the same delta
     # blobs and moves in lockstep with core, so it can't cross a major on its own.
-    "langgraph-checkpoint-postgres>=3.1,<4",
+    # >=3.2.0: the history walk waits for a target past the first page
+    # (langchain-ai/langgraph#8556), and writes replay in the order they ran
+    # (writes_sort_key, from the langgraph-checkpoint>=4.3 it requires).
+    "langgraph-checkpoint-postgres>=3.2.0,<4",
     # Other dependencies
     "python-dotenv>=1.0.1",
     # Pinned: we import from scrapling.engines._browsers._controllers /
@@ -52,10 +59,13 @@ dependencies = [
     "pypdf>=4.0.0",
     "youtube-transcript-api>=1.0.0",
     "playwright",
-    "fastapi>=0.110.0",
+    "fastapi>=0.113.0",
     "anyio>=4.0.0",
     "uvicorn>=0.27.1",
-    "websockets>=12.0",
+    # The preview proxy subclasses the asyncio client to refuse redirects.
+    "websockets>=15.0",
+    # The public suffix list, for the preview base's separate-site check.
+    "tld>=0.13",
     "pandas>=2.2.3",
     "numpy>=1.24,<3.0",
     "json-repair>=0.7.0",
@@ -112,6 +122,14 @@ dependencies = [
     # Imported directly (empty Registry = the no-remote-refs discipline), not
     # just as jsonschema's transitive.
     "referencing>=0.30",
+    "e2b>=2.53.1,<3",
+    # SSH computers. 2.24.1 is the floor because the far end is a machine its
+    # owner controls: it bounds packet lengths and stops a server writing
+    # outside the paths an SFTP client asked for.
+    "asyncssh>=2.24.1,<3",
+    # Past threads are searched on the server with the agent's own pattern;
+    # RE2 matches in linear time, so no pattern can hold a worker's loop.
+    "google-re2>=1.1.20251105",
 ]
 
 [tool.uv.sources]
@@ -198,6 +216,8 @@ markers = [
     "yahoo: hits live Yahoo Finance, no secrets needed; run by yahoo-live.yml when yfinance code or its version changes, not by the general integration job",
     "provider_docker: tests requiring Docker daemon",
     "provider_daytona: tests requiring Daytona API key",
+    "provider_e2b: tests requiring E2B API key",
+    "provider_ssh: tests requiring an SSH machine (see tests/integration/sandbox/ssh_target)",
     "regression: locks live market-data API behavior against a running server + live providers — opt-in",
 ]
 addopts = "-m 'not integration and not slow and not regression'"

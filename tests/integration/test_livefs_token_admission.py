@@ -63,6 +63,7 @@ async def computer(seed_user, patched_get_db_connection, redis):
     row = await create_computer(
         seed_user["user_id"],
         kind="daytona",
+        name="Cloud computer",
         is_primary=True,
         status="running",
         computer_id=str(uuid.uuid4()),

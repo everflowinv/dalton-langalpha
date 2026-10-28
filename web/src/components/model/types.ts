@@ -40,6 +40,14 @@ export interface ProviderCatalogEntry {
   region_variants?: RegionVariant[];
 }
 
+/** Where the server looks for a provider's stored key, from `/api/v1/models`. */
+export interface KeyCandidates {
+  /** Every slug the lookup visits, in its order. */
+  slugs: string[];
+  /** Those whose key the vendor issues as one with the provider's. */
+  shared: string[];
+}
+
 export interface CustomModelEntry {
   name: string;
   model_id: string;

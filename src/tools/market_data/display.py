@@ -8,7 +8,7 @@ display formatting never fails on an unrecognized symbol.
 """
 
 from datetime import datetime, timezone
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 from zoneinfo import ZoneInfo
 
 from market_protocol import (
@@ -22,7 +22,7 @@ from market_protocol import (
 
 from src.data_client.instrument_clock import clock_for_ref
 
-from .currency import DisplaySpec
+from .currency import DisplaySpec, fmt_price
 
 
 def resolve_ref(
@@ -73,6 +73,19 @@ def _symbol_currency(ref: Optional[InstrumentRef]) -> DisplaySpec:
         )
     except Exception:
         return DisplaySpec(None, 2)
+
+
+def price_text(value: Optional[float], ref: Optional[InstrumentRef]) -> str:
+    """``$198.00`` or ``HK$318.20``: a price in its listing's currency, grouped."""
+    try:
+        return fmt_price(value, _symbol_currency(ref), group=True)
+    except Exception:
+        return f"{value:,.2f}" if value is not None else "N/A"
+
+
+def pct_text(value: Any) -> str:
+    """``3%`` or ``2.5%``: a percentage as it was given, never padded."""
+    return f"{float(value):g}%"
 
 
 # MIC (listing venue) -> human "Market:" label for report headers. US and any

@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 import pytz
+from market_protocol import InvalidSymbol
 
 from src.tools.market_data._shared import _normalize_market_bars
 from src.tools.market_data.company import _quote_heading, fetch_company_overview
@@ -444,6 +445,88 @@ class TestFetchDailyPrices:
         provider.get_daily_with_source.assert_called_once()
 
 
+class _RecordingClient:
+    """Stands in for the LangSmith client: records the runs it would update."""
+
+    def __init__(self) -> None:
+        self.updated: list[dict] = []
+
+    def create_run(self, **kwargs) -> None:
+        return None
+
+    def update_run(self, **kwargs) -> None:
+        self.updated.append(kwargs)
+
+    def flush(self) -> None:
+        return None
+
+
+class TestDailyPricesOutcome:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("symbol", "markets", "raised", "outcome", "error_class", "text"),
+        [
+            pytest.param(
+                "0700.HK", {"us"}, RuntimeError("upstream 503"),
+                "unavailable", "MarketNotCovered",
+                "No data source configured for market of 0700.HK",
+                id="market-not-covered",
+            ),
+            pytest.param(
+                "AAPL", {"all"}, InvalidSymbol("Symbol 'A B' contains ' '"),
+                "ok", None, "Symbol 'A B' contains ' '",
+                id="invalid-symbol",
+            ),
+            pytest.param(
+                "AAPL", {"all"}, RuntimeError("upstream 503"),
+                "error", "RuntimeError", "upstream 503",
+                id="source-failed",
+            ),
+            pytest.param(
+                "AAPL", {"all"}, None,
+                "unavailable", "no_data", "No price data available",
+                id="no-bars",
+            ),
+        ],
+    )
+    async def test_only_a_source_failing_is_an_error(
+        self, symbol, markets, raised, outcome, error_class, text
+    ):
+        """A market no source covers, a symbol nothing is spelled as, or a
+        range the symbol has no bars for is the agent's ask, not a source
+        failing, so it stays out of the tool's error rate; its text is
+        unchanged."""
+        from src.data_client.market_data_provider import (
+            MarketDataProvider,
+            ProviderEntry,
+        )
+        from src.observability.langsmith_tracer import NonRetainingTracer
+        from src.tools.market_data.tool import get_daily_prices
+
+        source = AsyncMock()
+        source.get_daily = AsyncMock(side_effect=raised, return_value=[])
+        provider = MarketDataProvider([ProviderEntry("ginlix", source, markets)])
+        client = _RecordingClient()
+
+        with patch(f"{_PRICES_MOD}.get_market_data_provider", return_value=provider):
+            msg = await get_daily_prices.ainvoke(
+                {
+                    "type": "tool_call",
+                    "name": "get_daily_prices",
+                    "args": {"symbol": symbol},
+                    "id": "tc-1",
+                },
+                {"callbacks": [NonRetainingTracer(project_name="proj", client=client)]},
+            )
+
+        assert text in msg.content
+        (update,) = [u for u in client.updated if u["run_type"] == "tool"]
+        metadata = update["extra"]["metadata"]
+        assert metadata["tool_outcome"] == outcome
+        assert metadata.get("error_class") == error_class
+        assert (update["error"] is not None) == (outcome == "error")
+
+
 class TestChartSeriesProvenance:
     @pytest.mark.asyncio
     async def test_daily_chart_artifact_names_source_and_freshness(self):
@@ -712,6 +795,23 @@ class TestFetchCompanyOverview:
         assert "analystRatings" in artifact
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("key", ["epsDiluted", "epsdiluted"])
+    async def test_diluted_eps_reads_the_stable_and_legacy_spellings(self, full_profile, key):
+        """FMP's stable statements spell it epsDiluted; Tushare-mapped and
+        yfinance rows keep epsdiluted."""
+        financial = _make_fake_financial_source(
+            profile_data=full_profile,
+            income_stmt=[{"date": "2025-06-30", "revenue": 94_000_000_000, key: 1.57}],
+        )
+        provider = _make_fake_financial_provider(financial=financial)
+        with (
+            patch(f"{_COMPANY_MOD}.get_financial_data_provider", return_value=provider),
+            patch(f"{_COMPANY_MOD}._fmp_request", return_value=[]),
+        ):
+            _, artifact = await fetch_company_overview("AAPL")
+        assert artifact["quarterlyFundamentals"][0]["epsDiluted"] == 1.57
+
+    @pytest.mark.asyncio
     async def test_cn_profile_prefers_chinese_name(self):
         """A tushare profile's nameLocal wins over the English companyName."""
         financial = _make_fake_financial_source(profile_data=[{
@@ -734,12 +834,15 @@ class TestFetchCompanyOverview:
         assert artifact["name"] == "甲公司"
 
     @pytest.mark.asyncio
-    async def test_cn_metrics_render_through_the_cn_source(self):
+    @pytest.mark.parametrize("stable", [False, True], ids=["legacy", "stable"])
+    async def test_cn_metrics_render_through_the_cn_source(self, stable):
         """ginlix-data's CN snapshot rows carry no TTM suffix; the cn source
-        renames them to FMP's keys, so the table fills from the same reads."""
+        renames them to FMP's keys, so the table fills from the same reads,
+        whether the rows use FMP's legacy spellings or its stable ones."""
         from src.data_client.financial_data_provider import MarketRoute, RoutedFinancialSource
         from src.data_client.ginlix_data.cn_financial import GinlixDataCnFinancialSource
 
+        pe, de = ("priceToEarningsRatio", "debtToEquityRatio") if stable else ("peRatio", "debtToEquity")
         rows = {
             "profile": [{
                 "symbol": "600001.XSHG",
@@ -749,23 +852,21 @@ class TestFetchCompanyOverview:
                 "industry": None,
                 "marketCap": 1_000_000_000_000,
                 "price": 42.0,
-                "exchangeShortName": "SSE",
+                "exchange": "SSE",
+                **({} if stable else {"exchangeShortName": "SSE"}),
             }],
             "key_metrics": [{
                 "symbol": "600001.XSHG",
-                "peRatio": 20.0,
-                "priceToBookRatio": 4.0,
                 "returnOnEquity": 0.25,
                 "returnOnAssets": 0.12,
-                "debtToEquity": 0.30,
             }],
             "financial_ratios": [{
                 "symbol": "600001.XSHG",
-                "peRatio": 20.0,
+                pe: 20.0,
                 "priceToBookRatio": 4.0,
                 "netProfitMargin": 0.40,
                 "operatingProfitMargin": 0.50,
-                "debtToEquity": 0.30,
+                de: 0.30,
                 "currentRatio": 3.0,
                 "quickRatio": 2.5,
             }],
@@ -795,6 +896,7 @@ class TestFetchCompanyOverview:
         assert "| Debt/Equity Ratio | 0.30 |" in content
         assert "| Current Ratio | 3.00 |" in content
         assert "| Quick Ratio | 2.50 |" in content
+        assert "**Market:** SSE" in content
         # A key present with a None value must not print the literal "None".
         assert "Sector: N/A | Industry: N/A" in content
 
@@ -1334,6 +1436,73 @@ class TestFetchMarketOverview:
         assert content.startswith("[Live: ^GSPC 6,120.50")
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("markets", "raised", "indices", "outcome", "error_class"),
+        [
+            pytest.param(
+                {"us"}, RuntimeError("upstream 503"), None,
+                "unavailable", "MarketNotCovered", id="market-not-covered",
+            ),
+            pytest.param(
+                {"all"}, RuntimeError("upstream 503"), None,
+                "error", "RuntimeError", id="source-failed",
+            ),
+            pytest.param(
+                {"all"}, InvalidSymbol("Symbol 'A B' contains ' '"), None,
+                "ok", None, id="invalid-symbol",
+            ),
+            pytest.param(
+                {"us"}, InvalidSymbol("Symbol 'A B' contains ' '"), ["A B", "^N225"],
+                "unavailable", "MarketNotCovered", id="malformed-then-uncovered",
+            ),
+            pytest.param(
+                {"all"}, None, None,
+                "unavailable", "no_data", id="no-bars",
+            ),
+        ],
+    )
+    async def test_no_index_coming_back_marks_why(
+        self, markets, raised, indices, outcome, error_class
+    ):
+        """Each index's error is caught to keep the rest of the basket, so with
+        none back the snapshot itself marks the run, by the same rule a single
+        symbol's fetch does, with the worst of its errors."""
+        from src.data_client.market_data_provider import (
+            MarketDataProvider,
+            ProviderEntry,
+        )
+        from src.observability.langsmith_tracer import NonRetainingTracer
+        from src.tools.market_data.tool import get_market_overview
+
+        source = AsyncMock()
+        source.get_daily = AsyncMock(side_effect=raised, return_value=[])
+        provider = MarketDataProvider([ProviderEntry("ginlix", source, markets)])
+        client = _RecordingClient()
+
+        with patch(f"{_MKT_MOD}.get_market_data_provider", return_value=provider):
+            msg = await get_market_overview.ainvoke(
+                {
+                    "type": "tool_call",
+                    "name": "get_market_overview",
+                    # A past day, so no live snapshot stands in for the bars.
+                    "args": {
+                        "region": "jp",
+                        "date": "2025-02-14",
+                        **({"indices": indices} if indices else {}),
+                    },
+                    "id": "tc-1",
+                },
+                {"callbacks": [NonRetainingTracer(project_name="proj", client=client)]},
+            )
+
+        assert "No index data available" in msg.content
+        (update,) = [u for u in client.updated if u["run_type"] == "tool"]
+        metadata = update["extra"]["metadata"]
+        assert metadata["tool_outcome"] == outcome
+        assert metadata.get("error_class") == error_class
+        assert (update["error"] is not None) == (outcome == "error")
+
+    @pytest.mark.asyncio
     async def test_historical_date_skips_live_stamp(self):
         provider = _no_snapshot_provider()
         with patch(f"{_MKT_MOD}._fetch_index_day_snapshot",
@@ -1748,6 +1917,31 @@ class TestFetchOptionsChain:
         assert first_call[1]["strike_price_gte"] == 150.0
 
     @pytest.mark.asyncio
+    async def test_artifact_keeps_each_contracts_session(self):
+        """The card prints close, change and volume, so the artifact keeps the
+        snapshot session the text table is built from."""
+        chain = {"results": [
+            {"ticker": "O:ZZZZ250117C00010000", "contract_type": "call", "strike_price": 10.0, "expiration_date": "2025-01-17"},
+            {"ticker": "O:ZZZZ250117C00011000", "contract_type": "call", "strike_price": 11.0, "expiration_date": "2025-01-17"},
+        ]}
+        intel = _make_fake_intel_source(options_chain=chain)
+        intel.get_options_snapshot = AsyncMock(return_value=[
+            {"ticker": "O:ZZZZ250117C00010000", "market_status": "closed",
+             "session": {"close": 1.25, "change_percent": 4.0, "volume": 30.0}},
+        ])
+        provider = _make_fake_financial_provider(intel=intel)
+
+        with patch(f"{_QUOTES_MOD}.get_financial_data_provider", return_value=provider):
+            _, artifact = await fetch_options_chain("ZZZZ", contract_type="call")
+
+        priced, unpriced = artifact["results"]
+        assert priced["session"] == {"close": 1.25, "change_percent": 4.0, "volume": 30.0}
+        assert unpriced["session"] is None
+        assert artifact["market_status"] == "closed"
+        assert artifact["contract_type"] == "call"
+        assert artifact["currency"] == "USD"
+
+    @pytest.mark.asyncio
     async def test_empty_results(self):
         intel = _make_fake_intel_source(options_chain={"results": []})
         provider = _make_fake_financial_provider(intel=intel)
@@ -1789,12 +1983,18 @@ class TestFetchOptionsChain:
 # fetch_market_movers
 # ---------------------------------------------------------------------------
 
+def _mover(symbol, *, price, change_percent):
+    """A mover as a MarketIntelSource hands it over."""
+    return {"symbol": symbol, "price": price, "change": None,
+            "change_percent": change_percent, "volume": None}
+
+
 class TestFetchMarketMovers:
     @pytest.mark.asyncio
     async def test_gainers(self):
         movers = [
-            {"ticker": "NVDA", "name": "NVIDIA Corp", "price": 950.0, "change_percent": 8.5},
-            {"ticker": "AMD", "name": "AMD Inc", "price": 180.0, "change_percent": 5.2},
+            _mover("NVDA", price=950.0, change_percent=8.5),
+            _mover("AMD", price=180.0, change_percent=5.2),
         ]
         intel = _make_fake_intel_source(movers=movers)
         provider = _make_fake_financial_provider(intel=intel)
@@ -1811,10 +2011,33 @@ class TestFetchMarketMovers:
         assert len(artifact["results"]) == 2
 
     @pytest.mark.asyncio
-    async def test_losers(self):
+    async def test_vendor_row_is_priced_at_its_last_trade(self):
+        """The vendor's row has no price or name field: the last trade is the
+        price its change was measured at, the day bar's close stands in."""
+        from src.data_client.ginlix_data.market_intel_source import GinlixMarketIntelSource
+
         movers = [
-            {"ticker": "INTC", "name": "Intel Corp", "price": 20.0, "change_percent": -6.3},
+            {"ticker": "ZZZZ", "change": 1.5, "change_percent": 50.0,
+             "day": {"close": 4.4, "volume": 1200.0}, "last_trade": {"price": 4.5}},
+            {"ticker": "YYYY", "change": 0.5, "change_percent": 25.0, "day": {"close": 2.5, "volume": 900.0}},
         ]
+        # The vendor row reaches the tool through the source that shapes it.
+        client = AsyncMock()
+        client.get_movers = AsyncMock(return_value=movers)
+        provider = _make_fake_financial_provider(intel=GinlixMarketIntelSource(client))
+
+        with patch(f"{_QUOTES_MOD}.get_financial_data_provider", return_value=provider):
+            content, artifact = await fetch_market_movers(direction="gainers")
+
+        assert "$4.50" in content and "$2.50" in content
+        first, second = artifact["results"]
+        assert first == {"symbol": "ZZZZ", "name": None, "price": 4.5, "change": 1.5,
+                         "change_percent": 50.0, "volume": 1200.0, "currency": "USD"}
+        assert second["price"] == 2.5
+
+    @pytest.mark.asyncio
+    async def test_losers(self):
+        movers = [_mover("INTC", price=20.0, change_percent=-6.3)]
         intel = _make_fake_intel_source(movers=movers)
         provider = _make_fake_financial_provider(intel=intel)
 
@@ -1844,6 +2067,37 @@ class TestFetchMarketMovers:
             content, artifact = await fetch_market_movers()
 
         assert "not available" in content
+
+    @pytest.mark.asyncio
+    async def test_an_unknown_direction_is_refused_unmarked(self):
+        """The data API 422s any other direction; asking it would read as our
+        failure, so the tool refuses first and the run stays ok."""
+        from src.observability.langsmith_tracer import NonRetainingTracer
+        from src.tools.market_data.tool import get_market_movers
+
+        intel = _make_fake_intel_source()
+        provider = _make_fake_financial_provider(intel=intel)
+        client = _RecordingClient()
+
+        with patch(f"{_QUOTES_MOD}.get_financial_data_provider", return_value=provider):
+            msg = await get_market_movers.ainvoke(
+                {
+                    "type": "tool_call",
+                    "name": "get_market_movers",
+                    "args": {"direction": "sideways"},
+                    "id": "tc-1",
+                },
+                {"callbacks": [NonRetainingTracer(project_name="proj", client=client)]},
+            )
+
+        assert "direction must be 'gainers' or 'losers', got 'sideways'" in msg.content
+        assert msg.artifact["error"] == (
+            "direction must be 'gainers' or 'losers', got 'sideways'"
+        )
+        intel.get_movers.assert_not_called()
+        (update,) = [u for u in client.updated if u["run_type"] == "tool"]
+        assert update["extra"]["metadata"]["tool_outcome"] == "ok"
+        assert update["error"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -2290,6 +2544,28 @@ class TestFetchQuote:
         assert not any("After-Hours Price" in ln for ln in closed_odd_lot)
 
     @pytest.mark.asyncio
+    async def test_no_row_for_any_symbol_is_unavailable(self):
+        """Nothing quoted for any symbol named is the instrument having
+        nothing, not a source failing, so the run is not errored."""
+        from src.observability.langsmith_tracer import NonRetainingTracer
+        from src.tools.market_data.tool import get_quote
+
+        provider = _make_fake_snapshot_provider([])
+        client = _RecordingClient()
+        with patch(f"{_QUOTES_MOD}.get_market_data_provider", return_value=provider), \
+                patch(f"{_DAILY_MOD}.daily_fallback_snapshot", new=AsyncMock(return_value=None)):
+            msg = await get_quote.ainvoke(
+                {"type": "tool_call", "name": "get_quote", "args": {"symbols": ["ZZZQ"]}, "id": "tc-1"},
+                {"callbacks": [NonRetainingTracer(project_name="proj", client=client)]},
+            )
+
+        assert "No quote data available for ZZZQ" in msg.content
+        (update,) = [u for u in client.updated if u["run_type"] == "tool"]
+        metadata = update["extra"]["metadata"]
+        assert (metadata["tool_outcome"], metadata["error_class"]) == ("unavailable", "no_data")
+        assert update["error"] is None
+
+    @pytest.mark.asyncio
     async def test_a_missing_listing_stays_missing_while_its_venue_trades(self):
         # During a session a last close would pass a quote outage off as live.
         snaps = [{"symbol": "600519.SH", "price": 1255.79, "change_percent": -0.22,
@@ -2662,3 +2938,45 @@ class TestIndexOverviewOutage:
 
         with self._down(), pytest.raises(RuntimeError, match="upstream 503"):
             await fetch_company_overview_data("^GSPC")
+
+
+_YEAR_OF_BARS = [{"date": "2026-01-02", "open": 1.0, "high": 2.0, "low": 0.5, "close": 1.5}]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("symbol", "bars"),
+    [("FAKE", []), ("^GSPC", []), ("^GSPC", _YEAR_OF_BARS)],
+    ids=["company", "index", "index-year-range-only"],
+)
+async def test_an_overview_with_nothing_behind_it_is_unavailable(symbol, bars):
+    """A company with no profile, or an index with no level (a year range
+    alone included), is the instrument having nothing, not a source failing,
+    so the run is not errored."""
+    from src.observability.langsmith_tracer import NonRetainingTracer
+    from src.tools.market_data.tool import get_company_overview
+
+    market = MagicMock()
+    market.get_snapshots = AsyncMock(return_value=[])
+    market.get_daily_with_source = AsyncMock(return_value=(bars, "ginlix-data", None))
+    provider = _make_fake_financial_provider(
+        financial=_make_fake_financial_source(profile_data=[])
+    )
+    client = _RecordingClient()
+    with (
+        patch(f"{_COMPANY_MOD}.get_financial_data_provider", return_value=provider),
+        patch(f"{_COMPANY_MOD}._fmp_request", return_value=[]),
+        patch(
+            "src.tools.market_data.index_overview.get_market_data_provider",
+            AsyncMock(return_value=market),
+        ),
+    ):
+        await get_company_overview.ainvoke(
+            {"type": "tool_call", "name": "get_company_overview", "args": {"symbol": symbol}, "id": "tc-1"},
+            {"callbacks": [NonRetainingTracer(project_name="proj", client=client)]},
+        )
+
+    (update,) = [u for u in client.updated if u["run_type"] == "tool"]
+    metadata = update["extra"]["metadata"]
+    assert (metadata["tool_outcome"], metadata["error_class"]) == ("unavailable", "no_data")
+    assert update["error"] is None

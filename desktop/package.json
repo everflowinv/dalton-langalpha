@@ -13,7 +13,7 @@
   "scripts": {
     "postinstall": "node -e \"require('electron')\"",
     "start": "node scripts/write-build-config.mjs && electron .",
-    "test": "node --test",
+    "test": "node --test --test-concurrency=1",
     "preview": "node scripts/preview.mjs",
     "icons": "node scripts/make-icons.mjs",
     "build": "node scripts/write-build-config.mjs && node scripts/make-icons.mjs && node scripts/build.mjs --dir",

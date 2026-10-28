@@ -28,6 +28,11 @@ class CrawlOutput:
     binary_mime: Optional[str] = None
     content_bytes: Optional[bytes] = None
     final_url: Optional[str] = None
+    # DALTON-HOOK(heavy-compute-isolation): a parse TERMINATED at its budget
+    # still carries its timeout wording as `markdown` — shorter than the
+    # empty-page threshold downstream, so this flag tells web_fetch to pass
+    # the wording through instead of "the page appears to be empty".
+    parse_timeout: Optional[bool] = None
 
 
 class CrawlerBackend(Protocol):

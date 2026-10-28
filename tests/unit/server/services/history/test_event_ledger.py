@@ -70,6 +70,7 @@ TABLE_SOURCED = {
 LIVE_ONLY = {
     "metadata",  # per-run header
     "workspace_status",  # sandbox bring-up progress
+    "turn_held",  # a send waiting behind a thread mutation, before admission
     "warning",
     "retry",  # recoverable-error notice, run restarts
     "steering_accepted",  # only on the steering POST's own stream; the

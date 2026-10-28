@@ -47,6 +47,9 @@ class TaskRunRefused(Exception):
     """
 
     settle_reason = "run admission rejected"
+    # The error class tracing records when the refusal is our infrastructure
+    # not answering; None when admission turned the run down on its merits.
+    failure: str | None = None
 
     def __init__(self, reason: str) -> None:
         super().__init__(reason)
@@ -57,6 +60,13 @@ class NamespaceUnfenced(TaskRunRefused):
     """Refused at the fence rather than the ledger: no row was ever born."""
 
     settle_reason = "namespace fence unavailable"
+    failure = "namespace_unfenced"
+
+
+class RunLedgerUnavailable(TaskRunRefused):
+    """The ledger did not answer, so the run could not be recorded."""
+
+    failure = "run_ledger_unavailable"
 
 
 class SpawnError(RuntimeError):

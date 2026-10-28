@@ -18,7 +18,7 @@ export interface AutomationTemplate {
   nameKey: string;
   descriptionKey: string;
   icon: LucideIcon;
-  /** Where its automation starts out running: All workspaces, or a
+  /** Where its automation starts out running: the Chief of Staff, or a
    *  workspace the reader picks, for work that builds on files kept in one. */
   runsIn: ComposerScope;
   defaults: Partial<FormState>;

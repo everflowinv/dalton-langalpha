@@ -1,19 +1,15 @@
 import type { ComponentType } from 'react';
 import {
   Blocks,
-  Bot,
-  ChartCandlestick,
-  Database,
-  FileText,
   KeyRound,
   ScrollText,
   Server,
-  Telescope,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { BrandMark } from '@/components/brand/BrandMark'; // DALTON-HOOK(brand-name)
 import { SubagentsRings } from '@/components/ui/subagents-rings';
 import { IdentityTile, TILE_SIZES, type TileSize } from './IdentityTile';
+import { SubagentGlyph } from './subagentGlyph';
 
 /**
  * What a thing with no logo of its own looks like: what kind of thing it is.
@@ -49,15 +45,6 @@ const KIND_GLYPH: Record<MarkKind, ComponentType<{ className?: string }>> = {
 
 export type MarkKind = 'plugin' | 'skill' | 'server' | 'secret' | 'subagent' | 'langalpha';
 
-/** The built-in roles; any other subagent draws the kind's rings. */
-const SUBAGENT_GLYPH: Record<string, ComponentType<{ className?: string }>> = {
-  'general-purpose': Bot,
-  research: Telescope,
-  'data-prep': Database,
-  'equity-analyst': ChartCandlestick,
-  'report-builder': FileText,
-};
-
 const GLYPH_SIZES: Record<TileSize, string> = {
   xs: 'h-3 w-3',
   sm: 'h-3.5 w-3.5',
@@ -90,10 +77,9 @@ export function KindTile({
   className?: string;
 }) {
   if (kind === 'subagent' && name) {
-    const Glyph = SUBAGENT_GLYPH[name] ?? SubagentsRings;
     return (
       <IdentityTile name={name} size={size} className={className}>
-        <Glyph className={GLYPH_SIZES[size]} />
+        <SubagentGlyph type={name} className={GLYPH_SIZES[size]} />
       </IdentityTile>
     );
   }

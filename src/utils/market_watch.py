@@ -26,7 +26,7 @@ def watch_key(thread_id: str) -> str:
     return f"market_watch:{thread_id}"
 
 
-def _clean(symbols: list[str] | str | None) -> list[str]:
+def clean_symbols(symbols: list[str] | str | None) -> list[str]:
     """Clean and normalize symbols. Coerce int to str, skip other types.
 
     Venue suffixes take our spelling, so ``600519.SS`` and ``600519.SH`` are
@@ -71,7 +71,7 @@ async def add_symbols(thread_id: str, symbols: list[str] | str) -> list[str] | N
     try:
         async with _mutate_lock:
             current = await get_watchlist(thread_id)
-            merged = _clean(current + _clean(symbols))[: get_market_watch_max_symbols()]
+            merged = clean_symbols(current + clean_symbols(symbols))[: get_market_watch_max_symbols()]
             await cache.set(watch_key(thread_id), merged, ttl=get_redis_ttl_market_watch())
         return merged
     except Exception:
@@ -97,8 +97,8 @@ async def remove_symbols(
                 return []
             # The stored list can predate a respelling (600519.SS), so it is
             # read in our spelling before it is compared.
-            drop = set(_clean(symbols))
-            remaining = [s for s in _clean(await get_watchlist(thread_id)) if s not in drop]
+            drop = set(clean_symbols(symbols))
+            remaining = [s for s in clean_symbols(await get_watchlist(thread_id)) if s not in drop]
             await cache.set(
                 watch_key(thread_id), remaining, ttl=get_redis_ttl_market_watch()
             )

@@ -14,9 +14,15 @@ from typing import Any, Callable, Dict, Optional
 from fastapi import APIRouter, HTTPException, Query, Response
 from fastapi.responses import StreamingResponse
 
+from ptc_agent.core.sandbox.providers import provider_class
+from ptc_agent.core.sandbox.providers.ssh_errors import (
+    SSHConnectError,
+    SSHFolderMarked,
+    connect_failure,
+)
 from ptc_agent.core.sandbox.runtime import SandboxGoneError, SandboxTransientError
 from src.server.services.persistence.sync_result import BackupIncomplete
-from src.server.app.background_starts import schedule_start
+from src.server.services.background_starts import schedule_start
 from src.server.app.status_stream import (
     SSE_HEADERS,
     sse_status_event,
@@ -28,14 +34,21 @@ from src.server.database.computer import (
     get_computers_for_user,
     observed_layout_version,
     rename_computer as db_rename_computer,
+    set_computer_files_backup,
     update_computer_status,
 )
+from src.server.database.home_workspace import get_home_workspace_id
 from src.server.database.workspace import (
     count_live_workspaces_by_computer,
     get_live_workspace_folders_for_computer,
 )
+from src.server.database.workspace_move import MoveRefused
 from src.server.dependencies.usage_limits import (
+    assert_provider_allowed,
     assert_spec_allowed,
+    enforce_computer_count,
+    enforce_computer_limit,
+    get_provider_allowances,
     platform_gating_active,
 )
 from src.server.models.computer import (
@@ -43,43 +56,92 @@ from src.server.models.computer import (
     ComputerActionResponse,
     ComputerAlwaysOnRequest,
     ComputerCreate,
+    ComputerFilesBackupRequest,
     ComputerListResponse,
+    ComputerProviderOption,
+    ComputerProvidersResponse,
+    ComputerReconnectRequest,
+    ComputerReinstallRequest,
+    ComputerTierSpec,
+    ComputerRemoveRequest,
+    ComputerRemoveResponse,
     ComputerRenameRequest,
     ComputerResponse,
     ComputerSessionResponse,
     ComputerSpecRequest,
     ComputerStorageResponse,
 )
+from src.server.models.workspace_move import MakePrimaryResponse, WorkspaceMoveOut
 from src.server.services.computer_disk import (
     STORAGE_BREAKDOWN_MAX_AGE_SECONDS,
     disk_from_row,
     storage_breakdown,
 )
+from src.server.services.computer_start_failure import (
+    record_start_failure,
+    start_failure_from_row,
+)
 from src.server.services.computer_errors import (
     ComputerBusyError,
+    ComputerRemovalRefused,
+    ComputerRepairRefused,
     MachineBusyError,
+    ProviderNotOffered,
+    UnknownResourceTier,
 )
 from src.server.services.spec_change import (
     SPEC_CHANGE_IN_PROGRESS,
     spec_change_from_row,
     spec_refusal,
 )
+from src.server.services.ssh_computers import (
+    SSH_KIND,
+    SSHComputerLimit,
+    SSHFolderTaken,
+    SSHKeyMissing,
+    SSHCreatePlan,
+    SSHUnavailable,
+    plan_create,
+    ssh_info,
+    tunnel_of,
+    tunnels_for,
+)
+from src.server.services.ssh_dial_budget import SSHDialBudgetExceeded
+from src.server.services.ssh_removal import leave_machine
+from src.server.services.ssh_tunnel_sweep import release_tunnel
+from src.server.services.ssh_tunnels import tunnels_enabled
+from src.server.services.workspace_move import (
+    claim_workspace_move,
+    move_error_detail,
+    move_from_row,
+    set_primary_computer,
+)
 from src.server.services.workspace_status_pubsub import (
     publish_computer_status_change,
     subscribe_to_computer_status,
 )
 from src.server.utils.api import CurrentUserId
-from src.server.utils.error_sanitization import sandbox_unreachable_detail
+from src.server.utils.error_sanitization import sandbox_failure_http
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1/computers", tags=["Computers"])
 
+# The server lays a hosted machine's folders again from the backup whenever it
+# rebuilds one, so only a machine its owner brought may go without.
+_FILES_BACKUP_REQUIRED = (
+    "File backup can only be turned off on a computer you brought yourself."
+)
+
 
 @contextlib.asynccontextmanager
-async def _computer_quota_decision(user_id: str):
-    """Serialize platform quota reads with the mutation that consumes the slot."""
-    if not platform_gating_active():
+async def _computer_quota_decision(user_id: str, *, always: bool = False):
+    """Serialize platform quota reads with the mutation that consumes the slot.
+
+    ``always`` takes the lock without platform gating too, for a create whose
+    own check must hold until its insert.
+    """
+    if not (always or platform_gating_active()):
         yield
         return
     async with computer_capacity_lock(user_id):
@@ -99,6 +161,11 @@ def _computer_manager() -> Any:
     return ComputerManager.get_instance()
 
 
+def _sandbox_config() -> Any:
+    """The deployment's sandbox settings, the same the manager builds computers from."""
+    return _computer_manager().config.sandbox
+
+
 @contextlib.asynccontextmanager
 async def _computer_action_errors(action: str, computer_id: str, *, spec: bool = False):
     """Let sandbox failures reach the app-level handler that owns their wording.
@@ -116,7 +183,12 @@ async def _computer_action_errors(action: str, computer_id: str, *, spec: bool =
         raise HTTPException(
             status_code=503, detail="Computer runtime is not available"
         ) from None
-    except (SandboxGoneError, SandboxTransientError):
+    except (SandboxGoneError, SandboxTransientError) as e:
+        # An owner's machine that refused is a refusal however the failure
+        # was wrapped on its way here, or one start path answers 503 and
+        # another 422 for the same machine.
+        if connect_failure(e) is not None:
+            raise sandbox_failure_http(e) from None
         raise
     except MachineBusyError as e:
         raise HTTPException(
@@ -124,6 +196,14 @@ async def _computer_action_errors(action: str, computer_id: str, *, spec: bool =
         ) from None
     except ComputerBusyError as e:
         raise HTTPException(status_code=409, detail=spec_refusal("busy", str(e))) from None
+    except ComputerRemovalRefused as e:
+        logger.warning("Refused to %s computer %s: %s", action, computer_id, e.code)
+        detail = {"code": e.code, "message": str(e)}
+        if e.deleted:
+            detail["workspaces_deleted"] = e.deleted
+        raise HTTPException(status_code=409, detail=detail) from None
+    except (ProviderNotOffered, UnknownResourceTier) as e:
+        raise HTTPException(status_code=400, detail=str(e)) from None
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except BackupIncomplete as e:
@@ -136,6 +216,8 @@ async def _computer_action_errors(action: str, computer_id: str, *, spec: bool =
             ) from None
         raise HTTPException(status_code=400, detail=e.user_message) from None
     except RuntimeError as e:
+        if connect_failure(e) is not None:
+            raise sandbox_failure_http(e) from None
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.exception(f"Error {action} computer {computer_id}: {e}")
@@ -149,6 +231,57 @@ def require_computer_owner(computer: Optional[dict], *, user_id: str) -> None:
         raise HTTPException(status_code=403, detail="Forbidden")
 
 
+@contextlib.contextmanager
+def move_refusals():
+    """A move that cannot start answers in the shape its failure would be read in."""
+    try:
+        yield
+    except MoveRefused as e:
+        status = 404 if e.code == "not_found" else 409
+        raise HTTPException(status_code=status, detail=move_error_detail(e.code)) from None
+
+
+async def accept_workspace_move(
+    user_id: str,
+    workspace_id: str,
+    computer_id: str,
+    *,
+    make_primary: bool = False,
+    from_backup: bool = False,
+) -> WorkspaceMoveOut:
+    """Claim a move and run it after answering; its outcome is read back from the row.
+
+    Keyed by the move: the claim already refuses a second one for the user,
+    and a move whose runner dies is finished by the sweep, not rerun here.
+    """
+    try:
+        manager = _computer_manager()
+    except ComputerRuntimeUnavailable as e:
+        logger.warning("Computer runtime unavailable for a move: %s", e)
+        raise HTTPException(
+            status_code=503, detail="Computer runtime is not available"
+        ) from None
+    with move_refusals():
+        move = await claim_workspace_move(
+            user_id=user_id,
+            workspace_id=workspace_id,
+            target_computer_id=computer_id,
+            make_primary=make_primary,
+            from_backup=from_backup,
+        )
+    schedule_start(
+        f"workspace-move:{move['move_id']}", lambda: manager.run_accepted_move(move)
+    )
+    logger.info(
+        "Accepted move %s of workspace %s to computer %s for user %s",
+        move["move_id"],
+        workspace_id,
+        computer_id,
+        user_id,
+    )
+    return move_from_row(move)  # type: ignore[return-value]
+
+
 def _spec_in_progress() -> HTTPException:
     return HTTPException(
         status_code=409,
@@ -157,17 +290,22 @@ def _spec_in_progress() -> HTTPException:
 
 
 def computer_to_response(
-    computer: Dict[str, Any], *, owner: bool = True, workspace_count: int = 0
+    computer: Dict[str, Any],
+    *,
+    owner: bool = True,
+    workspace_count: int = 0,
+    tunnels: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> ComputerResponse:
     """Withhold provider_ref from non-owners because it addresses a real billed machine."""
     return ComputerResponse(
         computer_id=str(computer["computer_id"]),
         user_id=computer["user_id"],
-        kind=computer.get("kind") or "daytona",
+        kind=computer["kind"],
         name=computer.get("name") or "",
         status=computer["status"],
         resource_tier=computer.get("resource_tier") or "standard",
         is_always_on=bool(computer.get("is_always_on")),
+        files_backup=computer.get("files_backup", True) is not False,
         is_primary=bool(computer.get("is_primary")),
         root_dir=computer.get("root_dir") or "",
         workspace_count=workspace_count,
@@ -180,6 +318,8 @@ def computer_to_response(
         config=computer.get("config"),
         disk=disk_from_row(computer),
         spec_change=spec_change_from_row(computer),
+        ssh=ssh_info(computer, tunnels),
+        start_failure=start_failure_from_row(computer),
     )
 
 
@@ -193,19 +333,32 @@ async def _report_start_failure(computer_id: str, exc: Exception) -> None:
     """A background start behind 202 must publish failure or subscribers wait until timeout.
 
     Settle any surviving claim before publishing so clients re-reading on error
-    see the settled row; the start's own revert normally owns this cleanup.
+    see the settled row; the start's own revert normally owns this cleanup. The
+    failure is on the row before the frame goes out, which carries it too: the
+    start records its own as it reverts, and a claim settled here is recorded
+    here.
     """
+    recorded = None
     try:
         row = await get_computer(computer_id)
         if row is not None and row.get("status") == "starting":
-            await update_computer_status(computer_id, "stopped", expected="starting")
+            settled = await update_computer_status(
+                computer_id, "stopped", expected="starting"
+            )
+            if settled is not None:
+                await record_start_failure(computer_id, exc, kind=settled["kind"])
+            row = await get_computer(computer_id)
+        failure = start_failure_from_row(row) if row is not None else None
+        if failure is not None:
+            recorded = failure.model_dump(mode="json")
     except Exception:
         logger.exception(
             "Could not settle computer %s after a failed start", computer_id
         )
-    await publish_computer_status_change(
-        computer_id, "error", extra={"error": sandbox_unreachable_detail(exc)}
-    )
+    extra: Dict[str, Any] = {"error": sandbox_failure_http(exc).detail}
+    if recorded is not None:
+        extra["start_failure"] = recorded
+    await publish_computer_status_change(computer_id, "error", extra=extra)
 
 
 async def _run_computer_start(
@@ -250,9 +403,7 @@ async def _schedule_claimed_start(computer_id: str) -> str:
                 except HTTPException:
                     raise
                 except Exception as exc:
-                    raise HTTPException(
-                        status_code=503, detail=sandbox_unreachable_detail(exc)
-                    ) from None
+                    raise sandbox_failure_http(exc) from None
             computer = await get_computer(computer_id)
             if computer is None:
                 raise ValueError(f"Computer {computer_id} not found")
@@ -268,27 +419,99 @@ async def create_computer(
     request: ComputerCreate,
     x_user_id: CurrentUserId,
 ):
-    """Prepare a stopped machine row; active capacity is checked when it starts.
+    """Create a computer and prepare its sandbox in the background.
 
-    Creating the row provisions nothing and incurs no machine cost until a project runs.
+    Building a sandbox takes long enough that whoever first used the computer
+    would wait through it, so it starts now and the client watches its events.
+    Preparing holds a running slot from the insert, so the limit is asked here.
     """
     async with _computer_action_errors("create", "new"):
-        async with _computer_quota_decision(x_user_id):
-            await assert_spec_allowed(x_user_id, request.resource_tier)
+        sandbox = _sandbox_config()
+        kind = request.kind or sandbox.provider
+        if kind not in sandbox.creatable_providers():
+            # The manager refuses it too, but an ssh create dials the machine
+            # it names first, which only a kind on offer may cause.
+            raise ProviderNotOffered("Provider not offered")
+        if request.resource_tier not in sandbox.settings_for(kind).resource_tiers:
+            # Ahead of the plan gate, which would offer an upgrade for a size
+            # this provider never builds (xlarge on Daytona).
+            raise UnknownResourceTier(
+                f"This provider does not offer the {request.resource_tier!r} spec"
+            )
+        await assert_provider_allowed(x_user_id, kind, default_kind=sandbox.provider)
+        plan: Optional[SSHCreatePlan] = None
+        if request.ssh is not None:
+            with _ssh_create_refusals():
+                plan = await plan_create(
+                    x_user_id, request.ssh, settings=sandbox.settings_for(SSH_KIND)
+                )
+        if not request.files_backup and provider_class(kind).recreatable:
+            raise HTTPException(
+                status_code=422,
+                detail=_FILES_BACKUP_REQUIRED,
+            )
+        async with _computer_quota_decision(x_user_id, always=plan is not None):
+            if plan is not None:
+                with _ssh_create_refusals():
+                    await plan.recheck(x_user_id)
+            if provider_class(kind).metered:
+                # The cap first: a user at it who asked for a size their plan
+                # refuses would step down only to be refused again.
+                await enforce_computer_count(x_user_id)
+                await assert_spec_allowed(x_user_id, request.resource_tier)
+                await enforce_computer_limit(x_user_id)
             computer = await _computer_manager().create_computer_for_user(
                 x_user_id,
+                kind=kind,
                 name=request.name,
                 resource_tier=request.resource_tier,
                 # The insert squashes this to FALSE when a live primary already
                 # exists, so it reads as "primary if they have none". Without it a
                 # user's first, named machine is not primary and their first project
-                # mints a second one.
+                # mints a second one. The manager declines it for a machine it
+                # cannot rebuild, such as an owner's SSH machine.
                 is_primary=True,
+                prepare=True,
+                files_backup=request.files_backup,
+                **(plan.create_kwargs() if plan is not None else {}),
             )
+        computer_id = str(computer["computer_id"])
+        status = await _schedule_claimed_start(computer_id)
         logger.info(
-            "Created computer %s for user %s", computer["computer_id"], x_user_id
+            "Created computer %s for user %s, preparing it (%s)",
+            computer_id, x_user_id, status,
         )
-        return computer_to_response(computer)
+        return computer_to_response(
+            {**computer, "status": status},
+            tunnels=await tunnels_for(x_user_id, [computer]),
+        )
+
+
+@contextlib.contextmanager
+def _ssh_create_refusals():
+    """An ssh create refused before its row exists, in a sentence the client shows as is.
+
+    A machine that did not answer is a 422 too, unlike a start's 503: there is
+    no computer yet to try again, only the dialog that named the machine.
+    """
+    try:
+        yield
+    except SSHComputerLimit as e:
+        raise HTTPException(status_code=409, detail=e.detail()) from None
+    except (SSHKeyMissing, SSHFolderTaken) as e:
+        raise HTTPException(status_code=409, detail=str(e)) from None
+    except SSHDialBudgetExceeded as e:
+        raise HTTPException(
+            status_code=429,
+            detail=str(e),
+            headers={"Retry-After": str(e.retry_after)},
+        ) from None
+    except SSHFolderMarked as e:
+        raise HTTPException(status_code=409, detail=e.detail()) from None
+    except SSHConnectError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from None
+    except SSHUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e)) from None
 
 
 @router.get("", response_model=ComputerListResponse)
@@ -299,15 +522,65 @@ async def list_computers(x_user_id: CurrentUserId):
     counts = await count_live_workspaces_by_computer(
         [str(row["computer_id"]) for row in rows]
     )
+    tunnels = await tunnels_for(x_user_id, rows)
     return ComputerListResponse(
         computers=[
             computer_to_response(
-                row, workspace_count=counts.get(str(row["computer_id"]), 0)
+                row,
+                workspace_count=counts.get(str(row["computer_id"]), 0),
+                tunnels=tunnels,
             )
             for row in rows
         ],
         total=len(rows),
     )
+
+
+# Registered ahead of /{computer_id}, which would otherwise read "providers" as an id.
+@router.get("/providers", response_model=ComputerProvidersResponse)
+async def list_computer_providers(x_user_id: CurrentUserId):
+    """The providers a new computer may be created on, and which the caller may pick."""
+    try:
+        sandbox = _sandbox_config()
+    except ComputerRuntimeUnavailable as e:
+        logger.warning("Computer runtime unavailable for providers: %s", e)
+        raise HTTPException(
+            status_code=503, detail="Computer runtime is not available"
+        ) from None
+    kinds = sandbox.creatable_providers()
+    allowed = await get_provider_allowances(
+        x_user_id, kinds, default_kind=sandbox.provider
+    )
+    return ComputerProvidersResponse(
+        providers=[
+            ComputerProviderOption(
+                kind=kind,
+                is_default=kind == sandbox.provider,
+                allowed=allowed[kind],
+                tiers=_tier_specs(sandbox, kind),
+            )
+            for kind in kinds
+        ],
+        tunnels=tunnels_enabled(),
+    )
+
+
+def _tier_specs(sandbox: Any, kind: str) -> list[ComputerTierSpec]:
+    """The sizes ``kind`` offers, from the settings its sandboxes are built from.
+
+    Empty for a machine its owner sizes, whose one tier is a placeholder.
+    """
+    if not provider_class(kind).recreatable:
+        return []
+    tiers = sandbox.settings_for(kind).resource_tiers
+    return [
+        ComputerTierSpec(
+            tier=name, cpu=preset.cpu, memory_gib=preset.memory, disk_gib=preset.disk
+        )
+        for name, preset in sorted(
+            tiers.items(), key=lambda item: (item[1].cpu, item[1].memory, item[1].disk)
+        )
+    ]
 
 
 async def _counted_response(computer: Dict[str, Any]) -> ComputerResponse:
@@ -316,10 +589,15 @@ async def _counted_response(computer: Dict[str, Any]) -> ComputerResponse:
     Every route that answers with a whole machine carries the count, including
     the ones that just changed it: a response is what the client replaces its
     row with, so one answering zero erases the number the card warns with.
+    Whether its tunnel is up rides along for the same reason.
     """
     computer_id = str(computer["computer_id"])
     counts = await count_live_workspaces_by_computer([computer_id])
-    return computer_to_response(computer, workspace_count=counts.get(computer_id, 0))
+    return computer_to_response(
+        computer,
+        workspace_count=counts.get(computer_id, 0),
+        tunnels=await tunnels_for(computer["user_id"], [computer]),
+    )
 
 
 @router.get("/{computer_id}", response_model=ComputerResponse)
@@ -338,6 +616,78 @@ async def rename_computer(
     if updated is None:
         raise HTTPException(status_code=404, detail="Computer not found")
     return await _counted_response(updated)
+
+
+@router.delete("/{computer_id}", response_model=ComputerRemoveResponse)
+async def remove_computer(
+    computer_id: str,
+    x_user_id: CurrentUserId,
+    remove_key: bool = Query(
+        True,
+        description=(
+            "On an ssh computer, take the key's line off its machine too, "
+            "unless another of the user's computers logs in through the same file"
+        ),
+    ),
+    delete_workspaces: list[str] = Query(
+        default=[],
+        description=(
+            "As the body's delete_workspaces, which this joins; kept for clients "
+            "that name them here"
+        ),
+    ),
+    delete_files: bool = Query(
+        False,
+        description=(
+            "On an ssh computer, also delete LangAlpha's files from its machine: "
+            "the folders of the workspaces deleted with it, its folders in the root, "
+            "and the runtime in ~/.langalpha when no other computer uses it"
+        ),
+    ),
+    body: Optional[ComputerRemoveRequest] = None,
+):
+    """Remove a computer and its sandbox for good.
+
+    Any but the primary, which is where new workspaces go. One with workspaces
+    is refused unless ``delete_workspaces`` names every one of them, the ones
+    the owner was shown, so a removal never takes a workspace they did not
+    see (one created meanwhile, in another tab). The body carries them, as
+    the query would overflow a request line limit on a full computer; the
+    query an older client names them in still counts. ``workspaces_deleted``
+    answers the ones that went, for the client to forget. Their folders, and
+    on an ssh computer anything else LangAlpha put on the machine, stay unless
+    ``delete_files`` says to delete them too. A refusal the
+    user can act on is a 409 whose ``code`` the client words. On an ssh computer,
+    ``key`` says what became of the key's line on its machine. The tunnel of
+    a machine left with no computer goes on the connection the delete ran
+    on, or without one in the background, where a machine that does not
+    answer holds up nobody.
+    """
+    named = list(dict.fromkeys([*delete_workspaces, *(body.delete_workspaces if body else ())]))
+    async with _computer_action_errors("remove", computer_id):
+        computer = await _owned_computer(computer_id, x_user_id)
+        deleted = await _computer_manager().remove_computer_with_workspaces(
+            computer_id, named, delete_files=delete_files
+        )
+        logger.info("Removed computer %s for user %s", computer_id, x_user_id)
+        if computer.get("kind") != SSH_KIND:
+            return ComputerRemoveResponse(workspaces_deleted=deleted)
+        settings = _sandbox_config().settings_for(SSH_KIND)
+        left = await leave_machine(
+            x_user_id,
+            computer,
+            settings=settings,
+            remove_key=remove_key,
+            delete_files=delete_files,
+        )
+        if tunnel_of(computer) and not left.tunnel_released:
+            schedule_start(
+                f"tunnel-release:{computer_id}",
+                lambda: release_tunnel(x_user_id, computer, settings=settings),
+            )
+    return ComputerRemoveResponse(
+        key=left.key, files=left.files, workspaces_deleted=deleted
+    )
 
 
 @router.get("/{computer_id}/storage", response_model=ComputerStorageResponse)
@@ -408,10 +758,19 @@ async def computer_status_events(computer_id: str, x_user_id: CurrentUserId):
     computer = await _owned_computer(computer_id, x_user_id)
 
     def _frame(
-        status: str, sandbox_state: str | None = None, error: str | None = None
+        status: str,
+        sandbox_state: str | None = None,
+        error: str | None = None,
+        stage: str | None = None,
+        start_failure: dict | None = None,
     ) -> str:
         return sse_status_event(
-            {"computer_id": computer_id}, status, sandbox_state, error
+            {"computer_id": computer_id},
+            status,
+            sandbox_state,
+            error,
+            stage,
+            start_failure,
         )
 
     async def _read_status() -> str | None:
@@ -579,6 +938,60 @@ async def set_computer_spec(
         return await _counted_response(claimed)
 
 
+@router.post("/{computer_id}/make-primary", response_model=MakePrimaryResponse)
+async def make_primary_computer(
+    computer_id: str,
+    response: Response,
+    x_user_id: CurrentUserId,
+):
+    """Make this the computer new workspaces and Home land on.
+
+    Home lives on the primary. With Home on no computer yet, or already on
+    this one, the flip lands now (200). Otherwise Home's files move first,
+    which outlasts a request: the move is accepted (202), the flip lands
+    when it commits, and both are read back from Home's move.
+    """
+    async with _computer_action_errors("make primary", computer_id):
+        await _owned_computer(computer_id, x_user_id)
+        with move_refusals():
+            flipped = await set_primary_computer(x_user_id, computer_id)
+        if flipped:
+            logger.info("Made computer %s primary for user %s", computer_id, x_user_id)
+            return MakePrimaryResponse(computer_id=computer_id, is_primary=True)
+        move = await accept_workspace_move(
+            x_user_id, get_home_workspace_id(x_user_id), computer_id, make_primary=True
+        )
+        response.status_code = 202
+        return MakePrimaryResponse(computer_id=computer_id, is_primary=False, move=move)
+
+
+@router.post("/{computer_id}/files-backup", response_model=ComputerResponse)
+async def set_computer_files_backup_route(
+    computer_id: str,
+    request: ComputerFilesBackupRequest,
+    x_user_id: CurrentUserId,
+):
+    """Turn routine backups of a machine owner's workspaces on or off.
+
+    Off keeps the last backup as it is: a project's backup already under way
+    finishes, and none starts once this answers, since each reads the switch
+    under its project's sync lock. On, the next turn's backup brings it up to
+    date. Nothing on the machine changes, so it answers at once.
+    """
+    async with _computer_action_errors("set file backup for", computer_id):
+        computer = await _owned_computer(computer_id, x_user_id)
+        if not request.enabled and provider_class(computer["kind"]).recreatable:
+            raise HTTPException(status_code=409, detail=_FILES_BACKUP_REQUIRED)
+        updated = await set_computer_files_backup(computer_id, request.enabled)
+        if updated is None:
+            raise HTTPException(status_code=404, detail="Computer not found")
+        logger.info(
+            f"Set computer {computer_id} file backup to {request.enabled} "
+            f"for user {x_user_id}"
+        )
+        return await _counted_response(updated)
+
+
 @router.post("/{computer_id}/always-on", response_model=ComputerResponse)
 async def set_computer_always_on(
     computer_id: str,
@@ -609,3 +1022,135 @@ async def set_computer_always_on(
             f"for user {x_user_id}"
         )
         return await _counted_response(updated)
+
+
+@contextlib.contextmanager
+def _repair_refusals():
+    """A reinstall or reconnect refused before it changed anything, as a detail
+    with the ``code`` the client words its copy from.
+
+    A machine that answered and refused is a 422, one that did not a 503, as
+    a start answers them; a folder another computer holds is a 409.
+    """
+    try:
+        yield
+    except ComputerRepairRefused as e:
+        raise HTTPException(status_code=e.status, detail=e.detail()) from None
+    except SSHDialBudgetExceeded as e:
+        raise HTTPException(
+            status_code=429,
+            detail={"code": e.code, "message": str(e), "retry_after": e.retry_after},
+            headers={"Retry-After": str(e.retry_after)},
+        ) from None
+    except SSHKeyMissing as e:
+        raise HTTPException(
+            status_code=409, detail={"code": "key_missing", "message": str(e)}
+        ) from None
+    except SSHUnavailable as e:
+        raise HTTPException(
+            status_code=503, detail={"code": "ssh_unavailable", "message": str(e)}
+        ) from None
+    except SSHFolderMarked as e:
+        raise HTTPException(status_code=409, detail=e.detail()) from None
+    except SSHConnectError as e:
+        if e.answered:
+            raise HTTPException(
+                status_code=422, detail={"code": e.code, "message": str(e)}
+            ) from None
+        raise HTTPException(
+            status_code=503, detail={"code": e.code, "message": e.for_owner}
+        ) from None
+
+
+async def _accepted_repair_start(computer_id: str, message: str) -> ComputerActionResponse:
+    """Start the repaired computer as a lazy start does, answering once its
+    claim is on the row."""
+    status = await _schedule_claimed_start(computer_id)
+    return ComputerActionResponse(computer_id=computer_id, status=status, message=message)
+
+
+@router.post(
+    "/{computer_id}/reinstall", response_model=ComputerActionResponse, status_code=202
+)
+async def reinstall_computer(
+    computer_id: str,
+    request: ComputerReinstallRequest,
+    x_user_id: CurrentUserId,
+):
+    """Give a stopped ssh computer a folder it may have, then start it.
+
+    For a start refused because the computer's folder is another computer's
+    (``start_failure.remedy`` ``reinstall``). ``take_back`` clears that other
+    computer, which ``take_over`` names as ``start_failure.owner`` did, from
+    the machine, as its removal would have, under this computer's own login; a
+    mark of any other computer refuses with 409 ``folder_marked`` and its
+    ``owner``, one of the caller's own live computers is never cleared (409
+    ``folder_owned``), and a folder no other computer marks just starts.
+    ``new`` moves this computer to ``root_dir``, which must be missing or empty
+    (422 ``root_dir``) and no other computer's (409 ``folder_marked`` with its
+    ``owner``, unless ``take_over`` names it, or ``folder_owned``); each
+    workspace's files are then restored there from its backup. Refused with 400
+    ``not_ssh``, 409 ``not_stopped``, ``spec_in_progress`` or ``busy``, and 503
+    when the machine does not answer. Accepted, the start is scheduled as a
+    lazy start is and its outcome lands on the row.
+    """
+    async with _computer_action_errors("reinstall", computer_id):
+        await _owned_computer(computer_id, x_user_id)
+        settings = _sandbox_config().settings_for(SSH_KIND)
+        with _repair_refusals():
+            await _computer_manager().reinstall_computer(
+                computer_id,
+                folder=request.folder,
+                root_dir=request.root_dir,
+                settings=settings,
+                take_over=request.take_over,
+            )
+        logger.info(
+            "Reinstalled computer %s (%s) for user %s",
+            computer_id,
+            request.folder,
+            x_user_id,
+        )
+        return await _accepted_repair_start(computer_id, "Computer reinstalled; starting")
+
+
+@router.post(
+    "/{computer_id}/reconnect", response_model=ComputerActionResponse, status_code=202
+)
+async def reconnect_computer(
+    computer_id: str,
+    request: ComputerReconnectRequest,
+    x_user_id: CurrentUserId,
+):
+    """Point a stopped ssh computer at its machine as a pairing reached it again, then start it.
+
+    For a start refused because the machine no longer answers as it was paired
+    (``start_failure.remedy`` ``reconnect``). ``ssh`` is the ready pairing's
+    target and its probe's host key; a pairing bound to this computer
+    (``POST /ssh/pairings`` with its ``computer_id``) suggests its folder. The
+    folder is checked as this computer's: its own mark passes, another computer's
+    refuses with 409 ``folder_marked`` and its ``owner``, which
+    ``ssh.take_over`` naming takes the folder from once the new target is
+    saved. A machine that is not the computer's (another host key, and neither
+    the computer's own folder in the login's home nor its mark) is refused with
+    409 ``different_machine`` unless ``ssh.move`` says the owner chose to move
+    it there, where each backed-up workspace is restored. A tunnel the computer
+    no longer names is taken off its machine afterwards. Refusals as for a
+    reinstall, 422 for a machine that refused, and 503 for one that did not
+    answer or a tunnel that is not the caller's.
+    """
+    async with _computer_action_errors("reconnect", computer_id):
+        await _owned_computer(computer_id, x_user_id)
+        settings = _sandbox_config().settings_for(SSH_KIND)
+        with _repair_refusals():
+            updated, before = await _computer_manager().reconnect_computer(
+                computer_id, request.ssh, settings=settings
+            )
+        left = tunnel_of(before)
+        if left and left != tunnel_of(updated):
+            schedule_start(
+                f"tunnel-release:{computer_id}:{left}",
+                lambda: release_tunnel(x_user_id, before, settings=settings),
+            )
+        logger.info("Reconnected computer %s for user %s", computer_id, x_user_id)
+        return await _accepted_repair_start(computer_id, "Computer reconnected; starting")

@@ -14,6 +14,7 @@ from ptc_agent.core.sandbox.runtime import (
     SandboxGoneError,
     SandboxHostLostError,
     SandboxRuntime,
+    SandboxTransientError,
 )
 
 from src.server.database.computer import (
@@ -99,12 +100,13 @@ class ProviderMixin:
 
         Providers hold config by reference; computers.provider_config lets machines
         on the same deployment use different settings for a provider kind."""
-        base = getattr(self.config.to_core_config().sandbox, kind, None)
-        if base is None:
-            raise ValueError(f"Unknown sandbox provider: {kind!r}")
+        base = self.config.to_core_config().sandbox.settings_for(kind)
         if not overrides:
             return base
-        unknown = sorted(set(overrides) - set(type(base).model_fields))
+        # A kind that names its computers' own fields (an ssh target) keeps
+        # the rest, its trust switch included, the deployment's alone.
+        settable = getattr(type(base), "TARGET_FIELDS", None) or type(base).model_fields
+        unknown = sorted(set(overrides) - set(settable))
         if unknown:
             raise ValueError(
                 f"provider_config for kind {kind!r} names unknown settings: "
@@ -118,14 +120,16 @@ class ProviderMixin:
         Unbound workspaces fall back to the deployment configuration."""
         from ptc_agent.core.sandbox.providers import build_provider, create_provider
 
-        if binding is None or not binding.kind:
-            return create_provider(self.config.to_core_config())
+        core_config = self.config.to_core_config()
+        if binding is None:
+            return create_provider(core_config)
         return build_provider(
             binding.kind,
             self._provider_settings(binding.kind, binding.provider_config),
             working_dir=(
                 binding.root_dir or self.config.filesystem.working_directory
             ),
+            platform_secrets=core_config.sandbox.platform_secrets,
         )
 
     def _host_unavailable_policy(
@@ -137,7 +141,7 @@ class ProviderMixin:
         is opened on."""
         sandbox = core_config.sandbox
         minutes = getattr(
-            getattr(sandbox, str(sandbox.provider), None),
+            sandbox.settings_for(sandbox.provider),
             "host_unavailable_rebuild_after_minutes",
             0,
         )
@@ -151,7 +155,7 @@ class ProviderMixin:
         """The caller must close this session-independent provider client."""
         return self._provider_for(await self.resolve_binding(workspace_id))
 
-    async def provider_kind_for_workspace(self, workspace_id: str) -> Optional[str]:
+    async def provider_kind_for_workspace(self, workspace_id: str) -> str:
         binding = await self.resolve_binding(workspace_id)
         return binding.kind
 
@@ -163,13 +167,12 @@ class ProviderMixin:
         core_config = self.config.to_core_config()
         if binding is None:
             return core_config
-        if binding.kind:
-            core_config.sandbox.provider = binding.kind
-            setattr(
-                core_config.sandbox,
-                binding.kind,
-                self._provider_settings(binding.kind, binding.provider_config),
-            )
+        core_config.sandbox.provider = binding.kind
+        setattr(
+            core_config.sandbox,
+            binding.kind,
+            self._provider_settings(binding.kind, binding.provider_config),
+        )
         root = binding.root_dir
         if root and root != core_config.filesystem.working_directory:
             from ptc_agent.config.core import FilesystemConfig
@@ -196,17 +199,75 @@ class ProviderMixin:
         finally:
             await provider.close()
 
+    async def keep_sandbox_alive(
+        self,
+        workspace_id: str,
+        sandbox_id: str,
+        *,
+        runtime: Optional[SandboxRuntime] = None,
+    ) -> bool:
+        """``keep_computer_alive`` for the computer a workspace is on. The row
+        is read, never adopted onto a computer, since this runs for traffic
+        rather than for anything the owner asked."""
+        from src.server.database.computer import get_computer_for_workspace
+
+        computer = await get_computer_for_workspace(workspace_id)
+        return await self.keep_computer_alive(computer, sandbox_id, runtime=runtime)
+
+    async def keep_computer_alive(
+        self,
+        computer: Optional[Dict[str, Any]],
+        sandbox_id: str,
+        *,
+        runtime: Optional[SandboxRuntime] = None,
+    ) -> bool:
+        """Count use neither the provider nor a turn shows (preview traffic, an
+        open preview's health poll, a background command) as activity. False
+        when the computer is not running this sandbox, which then stays as it
+        is.
+
+        Both clocks are pushed out: the provider's deadline, and the stamp the
+        idle sweep reads, which otherwise moves only for turns and would stop
+        a computer someone is using. Never resumes: the caller's *runtime*
+        when it holds one, else a detached one.
+        """
+        from src.server.database.computer import update_computer_activity
+
+        if (
+            computer is None
+            or computer.get("status") != ComputerStatus.RUNNING
+            or str(computer.get("provider_ref") or "") != sandbox_id
+        ):
+            return False
+        try:
+            if runtime is not None:
+                await runtime.note_activity()
+            else:
+                binding = self._binding_from_computer("", computer)
+                async with self._detached_runtime(
+                    sandbox_id, binding=binding
+                ) as detached:
+                    await detached.note_activity()
+        except SandboxTransientError:
+            # Paused since the row was read: it stays paused.
+            return False
+        await update_computer_activity(str(computer["computer_id"]))
+        return True
+
     def measures_disk(self, computer: Dict[str, Any]) -> bool:
-        """A local computer without a storage quota reports the host's disk, not its own."""
-        if computer.get("kind") != "docker":
-            return True
+        """Whether a reading of this computer's disk would describe the computer.
+
+        A local computer without a storage quota reports the host's disk."""
+        from ptc_agent.core.sandbox.providers import provider_class
+
+        kind = computer["kind"]
         try:
             settings = self._provider_settings(
-                "docker", computer.get("provider_config") or None
+                kind, computer.get("provider_config") or None
             )
         except ValueError:
             return False
-        return bool(getattr(settings, "storage_quota_enabled", False))
+        return provider_class(kind).reports_own_disk(settings)
 
     async def refresh_computer_disk(
         self,
@@ -263,7 +324,7 @@ class ProviderMixin:
             return row, None
 
     @asynccontextmanager
-    async def _computer_runtime(
+    async def computer_runtime(
         self, computer: Dict[str, Any], sandbox_id: str
     ) -> AsyncIterator[SandboxRuntime]:
         """This worker's session runtime when it holds that sandbox, else a detached one."""
@@ -279,7 +340,7 @@ class ProviderMixin:
     async def _measure_disk(
         self, computer: Dict[str, Any], sandbox_id: str, breakdown: bool
     ) -> tuple[Dict[str, Any], Dict[str, int]]:
-        async with self._computer_runtime(computer, sandbox_id) as runtime:
+        async with self.computer_runtime(computer, sandbox_id) as runtime:
             return await self._read_and_record_disk(
                 computer, runtime, breakdown, sandbox_id=sandbox_id
             )
@@ -372,13 +433,18 @@ class ProviderMixin:
 
         if isinstance(exc, SandboxGoneError):
             return True
-        key = (
-            binding.provider_identity
-            if binding is not None and binding.kind
-            else (None, "{}")
-        )
-        classifier = self._error_classifiers.get(key)
-        if classifier is None:
-            classifier = self._provider_for(binding if key[0] else None)
-            self._error_classifiers[key] = classifier
+        classifier = self._cached_provider(binding)
         return classifier.classify_error(exc) is SandboxFailureKind.SANDBOX_GONE
+
+    def _cached_provider(self, binding: Optional[ComputerBinding]):
+        """One provider per backend for this worker's life, closed at shutdown.
+
+        For calls that need no session and come often (error classification,
+        the usage sweep's metric reads), where a provider each would open an
+        SDK client each."""
+        key = binding.provider_identity if binding is not None else (None, "{}")
+        provider = self._error_classifiers.get(key)
+        if provider is None:
+            provider = self._provider_for(binding)
+            self._error_classifiers[key] = provider
+        return provider

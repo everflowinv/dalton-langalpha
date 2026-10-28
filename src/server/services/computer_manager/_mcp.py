@@ -4,13 +4,10 @@ One file of the ComputerManager split; see the package __init__."""
 
 import asyncio
 import logging
-import os
 import time
 from dataclasses import replace
 from types import MappingProxyType, SimpleNamespace
 from typing import TYPE_CHECKING, Any
-
-import httpx
 
 from ptc_agent.core.mcp_sanitize import is_untrusted_server
 from ptc_agent.core.project_context import ProjectContext
@@ -32,10 +29,12 @@ from src.server.database.session_lock import await_settled
 from src.server.database.workspace import (
     get_workspace as db_get_workspace,
     get_workspace_identity as db_get_workspace_identity,
+    workspace_is_moving,
 )
 from src.server.database.workspace_folders import WorkspaceFolderMoving
 from src.server.services.computer_manager._types import (
     ComputerBinding,
+    MachineTarget,
     WorkspaceToolView,
 )
 from src.server.services.user_skills.reconcile import reconcile_workspace_skills
@@ -112,11 +111,15 @@ class McpSecretsMixin:
         No busy guard or eviction is needed for this non-destructive work. Failures
         propagate, and slow-path acquisitions retry using the session generation."""
         from ptc_agent.core.sandbox.platform_secrets import (
+            PlatformSecretReplacementRequired,
             platform_secrets_active,
         )
 
         core_config = self.config.to_core_config()
-        if not platform_secrets_active(core_config):
+        # Each kind has its own rollout, so a computer kept from before a
+        # provider switch converges onto its own provider's Secrets.
+        kind = binding.kind
+        if not platform_secrets_active(core_config, kind=kind):
             return
         sandbox = session.sandbox
         runtime = getattr(sandbox, "runtime", None) if sandbox else None
@@ -127,14 +130,27 @@ class McpSecretsMixin:
             resync_computer_platform_secret,
         )
 
-        applied = await resync_computer_platform_secret(
-            core_config,
-            runtime,
-            computer_id=binding.computer_id,
-            sandbox_id=getattr(sandbox, "sandbox_id", None),
-            db_version=ws_version or 0,
-            applied_generation=session.platform_secret_version,
-        )
+        try:
+            applied = await resync_computer_platform_secret(
+                core_config,
+                runtime,
+                kind=kind,
+                computer_id=binding.computer_id,
+                sandbox_id=getattr(sandbox, "sandbox_id", None),
+                db_version=ws_version or 0,
+                applied_generation=session.platform_secret_version,
+            )
+        except PlatformSecretReplacementRequired:
+            # Rebuilding here would take the sandbox from under this turn and
+            # any sibling's, so it is served as it is, unstamped, until the
+            # sweep rebuilds it while idle. It holds nothing it did not hold
+            # before the catalog changed.
+            logger.warning(
+                "Computer %s needs a new sandbox for its platform secrets; "
+                "serving the current one until the sweep rebuilds it",
+                binding.computer_id,
+            )
+            return
         if applied is not None:
             session.platform_secret_version = applied
 
@@ -154,7 +170,9 @@ class McpSecretsMixin:
                 continue
             identity = await db_get_workspace_identity(workspace_id)
             session = self.get_session_if_ready(
-                workspace_id, expected_sandbox_id=(identity or {}).get("sandbox_id")
+                workspace_id,
+                expected_sandbox_id=(identity or {}).get("sandbox_id"),
+                target=MachineTarget.of_workspace(identity),
             )
             if session is not None:
                 sandboxes[computer_id] = session.sandbox
@@ -189,40 +207,32 @@ class McpSecretsMixin:
         return reached
 
     @staticmethod
-    async def _mint_sandbox_tokens(
-        user_id: str, workspace_id: str, computer_id: str | None = None
-    ) -> dict:
-        """Tokens belong to the machine because its sandbox serves all projects.
+    async def _keep_data_token(
+        computer_id: str, user_id: str | None, sandbox: Any
+    ) -> None:
+        """Write the machine's market-data token, which every project on it
+        shares, when the sandbox holds none with long enough left."""
+        from src.server.services import data_tokens
 
-        Keep workspace_id while the platform still requires it. Mint failures
-        degrade to FMP-only mode."""
-        auth_url = os.getenv("AUTH_SERVICE_URL", "")
-        service_token = os.getenv("INTERNAL_SERVICE_TOKEN", "")
-        ginlix_data_url = os.getenv("GINLIX_DATA_URL", "")
+        if sandbox is None:
+            return
 
-        if not ginlix_data_url or not auth_url or not service_token:
-            return {}
+        # Looked up only once a token is owed, inside keep()'s guard: every
+        # acquire calls this, and nothing on the token's path may fail one.
+        async def write(payload: dict[str, Any]) -> bool:
+            return await sandbox.upload_token_file(payload)
 
-        try:
-            async with httpx.AsyncClient() as client:
-                resp = await client.post(
-                    f"{auth_url}/api/auth/data-tokens",
-                    json={
-                        "user_id": user_id,
-                        "workspace_id": workspace_id,
-                        "computer_id": computer_id,
-                    },
-                    headers={"X-Service-Token": service_token},
-                    timeout=10,
-                )
-                resp.raise_for_status()
-                return resp.json()
-        except Exception as e:
-            logger.warning(
-                f"Failed to mint sandbox tokens, ginlix-data features disabled: {e}",
-                extra={"workspace_id": workspace_id},
-            )
-            return {}
+        await data_tokens.keep(
+            computer_id, user_id, getattr(sandbox, "sandbox_id", None), write
+        )
+
+    @staticmethod
+    async def _revoke_data_token(computer_id: Any) -> None:
+        """A machine leaving service loses market data at once, rather than
+        when the token it holds would have run out."""
+        from src.server.services import data_tokens
+
+        await data_tokens.revoke(computer_id)
 
     # Cache resolution on the session so create_agent performs no per-turn DB
     # resolution. Check mcp_config_version on the post-cooldown read; discovery
@@ -249,13 +259,15 @@ class McpSecretsMixin:
             prior = self._freeze_tool_view(binding.computer_id, workspace_id, session)
 
         # An unchanged workspace entry adds no resolution reads. Config versions
-        # are per workspace, so a sibling's matching number says nothing here.
+        # are per workspace, so a sibling's matching number says nothing here,
+        # and a built-in server reconnected since changes what one number means.
         if (
             prior is not None
             and prior.mcp_config_version is not None
             and ws_version is not None
             and prior.mcp_config_version == ws_version
             and prior.mcp_tool_summary is not None
+            and not prior.builtins_superseded()
         ):
             # The relay JWT ages independently of the config version.
             relay_session = SimpleNamespace(
@@ -395,8 +407,10 @@ class McpSecretsMixin:
         else:
             direct_mcp_tools = {}
 
-        # Rebuild from built-ins, never from an earlier composite.
-        builtin_registry = session._builtin_mcp_registry or session.mcp_registry
+        # Rebuild from built-ins, never from an earlier composite, and from the
+        # current snapshot of them: this rebuild and the asset sync after it are
+        # where a reconnected built-in server reaches the workspace.
+        builtin_registry = session.refresh_builtin_registry() or session.mcp_registry
         composite = build_composite_registry(
             builtin_registry,
             untrusted_servers,
@@ -581,14 +595,18 @@ class McpSecretsMixin:
         machine.discovery_tasks.clear()
 
     def get_applied_mcp_config_version(
-        self, workspace_id: str, *, expected_sandbox_id: str | None
+        self,
+        workspace_id: str,
+        *,
+        expected_sandbox_id: str | None,
+        target: MachineTarget,
     ) -> int | None:
         """Only report versions from a ready, identity-checked session.
 
         The UI treats this as applied state; a superseded session cannot vouch for
         what the live sandbox has loaded."""
         session = self.get_session_if_ready(
-            workspace_id, expected_sandbox_id=expected_sandbox_id
+            workspace_id, expected_sandbox_id=expected_sandbox_id, target=target
         )
         if session is None:
             return None
@@ -607,6 +625,7 @@ class McpSecretsMixin:
         sandbox: Any,
         *,
         source: str,
+        attach_key: tuple[str, str | None] | None = None,
     ) -> bool:
         """Reconcile after asset sync and restore so skills see the final disk state.
 
@@ -616,27 +635,38 @@ class McpSecretsMixin:
         folder hold, as the asset sync does, and not at all while it is
         staged: the pass's first script creates its skill directory, and a
         staging folder that exists is what the next settle lands in place of
-        the content still at the old name."""
+        the content still at the old name.
+
+        ``attach_key`` is an attachment the caller recorded on the strength of
+        this pass (see ``_claim_attached``); it is withdrawn unless a full pass
+        ran after the folder's restore, so the attach runs its own."""
+        stats = None
+        complete = False
         if not user_id or sandbox is None:
-            return True
-        try:
-            async with self._held_workspace_folder(workspace_id) as dir_name:
-                stats = await reconcile_workspace_skills(
-                    sandbox,
-                    user_id=user_id,
-                    workspace_id=workspace_id,
-                    source=source,
-                    # With no folder the service refuses the pass; an empty
-                    # one would name the computer root, whose prune reaches
-                    # every sibling.
-                    project=ProjectContext(workspace_id, dir_name) if dir_name else None,
-                )
-            return stats is not None and not stats.link_failed
-        except WorkspaceFolderMoving:
-            logger.info(f"[skill_sync] {source} pass for {workspace_id} waits for its folder to land")
-        except Exception as e:
-            logger.warning(f"[skill_sync] {source} pass for {workspace_id} skipped: {e}")
-        return False
+            complete = True
+        else:
+            try:
+                async with self._held_workspace_folder(workspace_id) as dir_name:
+                    stats = await reconcile_workspace_skills(
+                        sandbox,
+                        user_id=user_id,
+                        workspace_id=workspace_id,
+                        source=source,
+                        # With no folder the service refuses the pass; an empty
+                        # one would name the computer root, whose prune reaches
+                        # every sibling.
+                        project=ProjectContext(workspace_id, dir_name) if dir_name else None,
+                    )
+                complete = stats is not None and not stats.link_failed
+            except WorkspaceFolderMoving:
+                logger.info(f"[skill_sync] {source} pass for {workspace_id} waits for its folder to land")
+            except Exception as e:
+                logger.warning(f"[skill_sync] {source} pass for {workspace_id} skipped: {e}")
+        if attach_key is not None and not (
+            complete and stats is not None and not stats.restore_incomplete
+        ):
+            self._projects_attached.pop(attach_key, None)
+        return complete
 
     # Strong refs prevent task GC; never consult this set as state.
     _skill_reconcile_tasks: set[asyncio.Task] = set()
@@ -679,7 +709,9 @@ class McpSecretsMixin:
         if not ws or not ws.get("sandbox_id"):
             return
         session = self.get_session_if_ready(
-            workspace_id, expected_sandbox_id=str(ws["sandbox_id"])
+            workspace_id,
+            expected_sandbox_id=str(ws["sandbox_id"]),
+            target=MachineTarget.of_workspace(ws),
         )
         if session is None:
             return
@@ -701,6 +733,10 @@ class McpSecretsMixin:
                 str(computer["computer_id"]), workspace_id
             )
         try:
+            # An acquire would lay again the folder a move has set aside. This
+            # is the next-message fallback's to apply, wherever the move ends.
+            if await workspace_is_moving(workspace_id):
+                return
             await self._acquire_session(workspace_id, user_id=user_id)
         except Exception as e:
             logger.warning(

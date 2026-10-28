@@ -84,10 +84,29 @@ class TestMetadataFrameFirst:
         """A report-back's stream names its report up front: a client that
         attaches live gets no user message to draw the report's row from."""
         source = {"kind": "task", "task_id": "k3", "display_id": "Task-k3", "failed": False}
-        handler = RunSSEProducer(thread_id="t-1", run_id="r-abc", report_source=source)
+        handler = RunSSEProducer(
+            thread_id="t-1", run_id="r-abc", announced={"report_source": source}
+        )
         event_name, data = _parse_sse((await _collect_stream(handler))[0])
         assert event_name == "metadata"
         assert data == {"thread_id": "t-1", "run_id": "r-abc", "report_source": source}
+
+    @pytest.mark.asyncio
+    async def test_market_target_rides_the_metadata_frame(self):
+        """A target's wake names its notice up front: a client that attaches
+        live reads no query row to draw the alert's row from."""
+        notice = {"target_id": "tg-1", "notice": "hit", "symbol": "ACME", "kind": "above", "value": 205}
+        handler = RunSSEProducer(
+            thread_id="t-1", run_id="r-abc", turn_index=3, announced={"market_target": notice}
+        )
+        event_name, data = _parse_sse((await _collect_stream(handler))[0])
+        assert event_name == "metadata"
+        assert data == {
+            "thread_id": "t-1",
+            "run_id": "r-abc",
+            "turn_index": 3,
+            "market_target": notice,
+        }
 
     @pytest.mark.asyncio
     async def test_metadata_names_the_admitted_turn(self):

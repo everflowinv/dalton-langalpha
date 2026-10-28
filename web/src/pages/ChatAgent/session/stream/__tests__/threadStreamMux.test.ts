@@ -45,6 +45,7 @@ vi.mock('../../../utils/api', () => ({
 }));
 
 import { getThreadMux, peekThreadMux, type ThreadMuxSink } from '../threadStreamMux';
+import type { TaskRunFacts } from '../../subagents/taskRuns';
 
 const chanOpen = (rid: string, lane: string, mode = 'replay', started?: number) =>
   `event: chan_open\ndata: ${JSON.stringify({ chan: `run:${rid}`, lane, mode, ...(started != null ? { started } : {}) })}\n\n`;
@@ -452,5 +453,124 @@ describe('ThreadStreamMux (v2 contract client)', () => {
     expect(closures).toEqual([]);
     expect(c.signal.aborted).toBe(true);
     expect(peekThreadMux(tid)).toBeNull();
+  });
+});
+
+/**
+ * A run's facts reach the sink as the server wrote them, each under the run
+ * it describes: its ledger start at the open, the launch that started it and
+ * its model at `lane_open`, its finish from `run_end` or the terminal close.
+ * Each frame carries its capture time from the record, since a replayed
+ * backlog is all delivered at once.
+ */
+describe('ThreadStreamMux: run facts and frame times', () => {
+  const v2 = (rid: string, lane: string, entry: string, type: string, payload: Record<string, unknown>) =>
+    `id: run:${rid}#${entry}\nevent: ${type}\ndata: ${JSON.stringify({ run_id: rid, seq: entry, lane, type, payload })}\n\n`;
+
+  function factSink() {
+    const opened: string[] = [];
+    const closed: Array<[string, string | null]> = [];
+    const runs: Array<[string, string, TaskRunFacts]> = [];
+    const events: Array<Record<string, unknown>> = [];
+    const sink: ThreadMuxSink = {
+      onTaskEvent: (ev) => events.push(ev),
+      onTaskRunOpened: (taskId) => opened.push(taskId),
+      onTaskRun: (taskId, runId, facts) => runs.push([taskId, runId, facts]),
+      onTaskRunClosed: (taskId, outcome) => closed.push([taskId, outcome]),
+    };
+    return { sink, opened, closed, runs, events };
+  }
+
+  it('reports a run\'s ledger bounds and the launch that started it, under the run', async () => {
+    const { sink, opened, closed, runs, events } = factSink();
+    const mux = getThreadMux(freshThread());
+    mux.attach(sink);
+    const c = await connected(1);
+    c.push(chanOpen('r1', 'task:t1', 'replay', 1_000));
+    c.push(v2('r1', 'task:t1', '1-0', 'lane_open', { task_id: 't1', launch_tool_call_id: 'launch-1' }));
+    c.push(v2('r1', 'task:t1', '2-0', 'tool_calls', {
+      seq: 1, event: 'tool_calls', ts: 1.25, data: { agent: 'task:t1', tool_calls: [] },
+    }));
+    c.push(v2('r1', 'task:t1', '3-0', 'run_end', { outcome: 'completed', finished: 4_000 }));
+    c.push(chanClose('r1', 'terminal'));
+
+    expect(opened).toEqual(['t1']);
+    expect(events).toHaveLength(1);
+    expect(events[0]._atMs).toBe(1_250);
+    expect(runs).toEqual([
+      ['t1', 'r1', { startedAtMs: 1_000 }],
+      ['t1', 'r1', { launchToolCallId: 'launch-1' }],
+      ['t1', 'r1', { finishedAtMs: 4_000 }],
+    ]);
+    expect(closed).toEqual([['t1', 'completed']]);
+    mux.detach();
+  });
+
+  it('takes the finish from the row when the close comes without a run_end', async () => {
+    // The writer died between its terminal CAS and the run_end append.
+    const { sink, closed, runs } = factSink();
+    const mux = getThreadMux(freshThread());
+    mux.attach(sink);
+    const c = await connected(1);
+    c.push(chanOpen('r1', 'task:t1', 'replay', 1_000));
+    c.push(chanClose('r1', 'terminal', { outcome: 'error', finished: 2_500 }));
+    expect(runs.at(-1)).toEqual(['t1', 'r1', { finishedAtMs: 2_500 }]);
+    expect(closed).toEqual([['t1', 'error']]);
+    mux.detach();
+  });
+
+  it('reports a predecessor draining under an open successor as itself', async () => {
+    // The task's close speaks for its latest run; the predecessor's facts go
+    // under its own run id, so they cannot land on the successor.
+    const { sink, closed, runs } = factSink();
+    const mux = getThreadMux(freshThread());
+    mux.attach(sink);
+    const c = await connected(1);
+    c.push(chanOpen('rA', 'task:t1', 'drain', 1_000));
+    c.push(v2('rA', 'task:t1', '1-0', 'lane_open', { task_id: 't1', launch_tool_call_id: 'launch-1' }));
+    c.push(chanOpen('rB', 'task:t1', 'replay', 5_000));
+    c.push(v2('rB', 'task:t1', '1-0', 'lane_open', { task_id: 't1', launch_tool_call_id: 'launch-2' }));
+    c.push(chanClose('rA', 'terminal', { outcome: 'completed', finished: 3_000 }));
+
+    expect(runs).toEqual([
+      ['t1', 'rA', { startedAtMs: 1_000 }],
+      ['t1', 'rA', { launchToolCallId: 'launch-1' }],
+      ['t1', 'rB', { startedAtMs: 5_000 }],
+      ['t1', 'rB', { launchToolCallId: 'launch-2' }],
+      ['t1', 'rA', { finishedAtMs: 3_000 }],
+    ]);
+    expect(closed).toEqual([]);
+
+    c.push(chanClose('rB', 'terminal', { outcome: 'completed', finished: 8_000 }));
+    expect(runs.at(-1)).toEqual(['t1', 'rB', { finishedAtMs: 8_000 }]);
+    expect(closed).toEqual([['t1', 'completed']]);
+    mux.detach();
+  });
+
+  it('reports the model a run opened with before any of its content', async () => {
+    const glm = { id: 'glm-5.3-cn', provider: 'z-ai-cn' };
+    const { sink, runs, events } = factSink();
+    const mux = getThreadMux(freshThread());
+    mux.attach(sink);
+    const c = await connected(1);
+    c.push(chanOpen('r1', 'task:t1', 'replay', 1_000));
+    c.push(v2('r1', 'task:t1', '1-0', 'lane_open', {
+      task_id: 't1', launch_tool_call_id: 'launch-1', model: glm,
+    }));
+    expect(runs.at(-1)).toEqual(['t1', 'r1', { launchToolCallId: 'launch-1', model: glm }]);
+    expect(events).toHaveLength(0);
+    mux.detach();
+  });
+
+  it('reports no model for a run on its launcher\'s', async () => {
+    const { sink, runs } = factSink();
+    const mux = getThreadMux(freshThread());
+    mux.attach(sink);
+    const c = await connected(1);
+    c.push(chanOpen('r1', 'task:t1', 'replay', 1_000));
+    c.push(v2('r1', 'task:t1', '1-0', 'lane_open', { task_id: 't1', launch_tool_call_id: 'launch-1' }));
+    c.push(chanClose('r1', 'terminal', { outcome: 'completed', finished: 4_000 }));
+    expect(runs.some(([, , facts]) => 'model' in facts)).toBe(false);
+    mux.detach();
   });
 });

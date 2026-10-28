@@ -11,6 +11,7 @@
       "offlineMessage": "网络已断开。恢复连接前，数据可能不是最新的。"
     },
     "copy": "复制",
+    "copied": "已复制",
     "submit": "提交",
     "save": "保存",
     "saving": "保存中...",
@@ -30,6 +31,8 @@
     "back": "返回",
     "done": "完成",
     "failed": "失败",
+    "language": "语言",
+    "languageCurrent": "语言：{{language}}",
     "optional": "（可选）"
   },
   "auth": {
@@ -46,6 +49,7 @@
     "signupEmailExists": "该邮箱已注册。",
     "signupEmailExistsHint": "<1>直接登录</1>、<2>使用邮箱链接登录</2>，或<3>重置密码</3>。",
     "agreeToTerms": "继续即表示你同意我们的<1>服务条款</1>和<2>隐私政策</2>。",
+    "agreeToTermsOnly": "继续即表示你同意我们的<1>服务条款</1>。",
     "forgotPassword": "忘记密码？",
     "magicLinkCta": "使用邮箱链接登录",
     "continueWithEmail": "使用邮箱继续",
@@ -214,6 +218,7 @@
     "threadNeedsInput": "等待您的输入",
     "threadUnseen": "已完成，尚未查看",
     "untitledThread": "未命名",
+    "onComputer": "位于 {{name}} · {{kind}}",
     "noConversations": "暂无会话",
     "workspaceFallback": "工作区",
     "collapseAgents": "收起 Agent",
@@ -225,6 +230,11 @@
     "connected": "已连接",
     "manageProviders": "管理提供商",
     "fontSize": "字体大小",
+    "cardStyle": "卡片样式",
+    "cardStyleDesc": "对话中数据卡片及其详情面板的外观。",
+    "cardStyleTerminal": "终端",
+    "cardStyleBalanced": "均衡",
+    "cardStyleQuiet": "简洁",
     "userInfo": "用户信息",
     "preferences": "偏好设置",
     "model": "模型",
@@ -255,6 +265,10 @@
     "streamingModeDesc": "文字生成后即时显示，或每次显示一个完整段落。",
     "streamingModeToken": "连续显示",
     "streamingModeParagraph": "按段落",
+    "toolCallLayout": "工具调用",
+    "toolCallLayoutDesc": "每个步骤显示为一行，或试用新的状态行：只用一行显示当前步骤。",
+    "toolCallLayoutRows": "逐行",
+    "toolCallLayoutStatus": "状态行",
     "tradingPermission": {
       "title": "交易权限",
       "desc": "决定 Agent 如何处理你已连接券商的订单，模拟订单不受影响。你在对话中的要求可以进一步收紧这里的范围，但只有这项设置能让订单不经你批准就发出。",
@@ -295,7 +309,7 @@
     "logoutConfirmMsg": "确定要退出登录吗？",
     "timezone": "时区",
     "selectTimezone": "选择时区...",
-    "preferencesDesc": "偏好设置通过与 Agent 对话来管理。点击下方按钮进行更新。",
+    "preferencesDesc": "也可以在任意对话中让 Agent 修改这些设置。",
     "noPreferencesYet": "暂无偏好设置。点击下方按钮进行设置。",
     "riskTolerance": "风险偏好",
     "investmentStyle": "投资风格",
@@ -310,10 +324,8 @@
     "resetPreferences": "重置偏好",
     "resetConfirmMsg": "这将清除您所有的偏好设置：风险偏好、投资风格、Agent 设置、默认模型及其他模型设置（自定义模型与服务商、快速切换模型、按模型设置），以及仪表盘布局。已有对话会继续使用各自的模型。您可以随时在设置中或通过 Agent 重新设置。确定吗？",
     "resetting": "重置中...",
-    "modifyWithAgent": "通过 Agent 修改",
-    "completeProfile": "完善个人资料",
-    "completeProfileDesc": "通过简短对话设置您的股票、风险偏好和其他偏好。",
-    "startOnboarding": "开始设置",
+    "completeProfile": "设置投资画像",
+    "completeProfileDesc": "回答几个问题，让 Agent 更了解你的投资习惯，提供更适合你的研究。",
     "defaultModel": "默认模型",
     "defaultModelDesc": "用于工作区对话（代码执行、沙箱）。",
     "defaultModelChange": {
@@ -447,9 +459,14 @@
       "deep": "深度"
     },
     "compactionProfile": "压缩预设",
-    "compactionProfileDesc": "用于控制压缩触发与保留的预设组合。保持系统默认时，每个模型会自动匹配与其上下文窗口相称的预设。",
+    "compactionProfileDesc": "决定对话何时压缩。保持系统默认时，每个模型使用各自的预设：Claude 和 GPT 为 500k，其他模型按其上下文窗口匹配。",
     "compactionProfileUseDefault": "使用系统默认",
-    "compactionProfilePreset": "{{tokens}}k tokens · 保留 {{keep}} 条",
+    "nativeCompaction": "服务商压缩",
+    "nativeCompactionOn": "开启",
+    "nativeCompactionOff": "关闭",
+    "nativeCompactionAnthropicDesc": "压缩时由 Claude 自己总结对话，因此它在保留下来的轮次里仍能保留自己的推理过程。这份摘要可以直接阅读，切换到其他模型后，新模型读取的也是它。",
+    "nativeCompactionOpenAIDesc": "OpenAI 会把对话压缩成一份加密摘要，只有 OpenAI 的模型能读取，无论通过 API 还是 ChatGPT 登录。压缩卡片显示的是对话的简要记录，而不是摘要。若把这个对话切换到其他服务商的模型，它拿到的是这份记录而不是摘要，会丢失早先工具结果中的细节。",
+    "compactionProfilePreset": "{{tokens}}k tokens",
     "compactionProfiles": {
       "aggressive": {
         "label": "激进",
@@ -461,11 +478,27 @@
       },
       "extended": {
         "label": "扩展",
-        "description": "保留更多上下文。适合 400k–1M 上下文模型。"
+        "description": "保留更多上下文。适合 400k 上下文模型。"
+      },
+      "economy": {
+        "label": "经济",
+        "description": "控制在 272k 以内，超过后 OpenAI 会按长上下文价格计费整个请求。"
       },
       "relaxed": {
         "label": "宽松",
-        "description": "最大化上下文。适合 1M 上下文模型。"
+        "description": "在 1M 上下文模型上留出更多空间再压缩。"
+      },
+      "spacious": {
+        "label": "充裕",
+        "description": "适合在 1M 上下文模型上进行长时间会话。"
+      },
+      "expansive": {
+        "label": "广阔",
+        "description": "用到 1M 窗口的一半才压缩。线程越长，每次调用成本越高。"
+      },
+      "maximal": {
+        "label": "最大",
+        "description": "占用 1M 窗口的大部分。每次调用成本最高；仅适合 1M 上下文模型。"
       }
     },
     "modelTuning": {
@@ -540,6 +573,7 @@
     "xaiConnectTitle": "连接 xAI Grok（SuperGrok）"
   },
   "dashboard": {
+    "failedOnboarding": "设置失败，请重试。",
     "title": "{{brand}}",
     "searchPlaceholder": "搜索股票代码或公司名称...",
     "searching": "搜索中...",
@@ -549,12 +583,7 @@
     "prefIncompleteMsg": "您的偏好信息尚未完善。请完善偏好设置以获得最佳体验。",
     "ignoreFor24h": "24小时内忽略",
     "proceed": "继续",
-    "failedOnboarding": "设置失败，请重试。",
-    "failedPrefUpdate": "启动偏好更新失败，请重试。",
     "watchlist": "自选",
-    "personalizeTitle": "个性化您的体验",
-    "personalizeDesc": "与我们的 AI 助手交流，自定义您的关注列表、风险偏好和提醒",
-    "personalize": "个性化",
     "layoutToggle": {
       "groupAria": "仪表板布局",
       "classic": "经典",
@@ -1327,8 +1356,22 @@
     "sortBy": "排序",
     "activity": "活动时间",
     "custom": "自定义",
-    "reorder": "排列",
-    "dragToReorder": "拖拽排序",
+    "sortRecent": "最近",
+    "allComputers": "所有计算机",
+    "filterByComputer": "按计算机筛选",
+    "manageComputers": "管理计算机…",
+    "manageComputerMenu": "管理计算机…",
+    "newComputerMenu": "新建计算机…",
+    "customSortHint": "拖动卡片来排列",
+    "dragInstructions": "按空格键拿起工作区，用方向键移动，再按空格键放下，按 Esc 取消。",
+    "dragPickedUp": "已拿起 {{name}}。",
+    "dragOver": "{{name}} 位于 {{over}} 上方。",
+    "dragInPlace": "{{name}} 回到了原位。",
+    "dragDropped": "{{name}} 已放到 {{over}} 的位置。",
+    "dragNotMoved": "{{name}} 已放回原位。",
+    "dragCancelled": "已取消移动 {{name}}。",
+    "dragStillSaving": "{{name}} 未移动：上一次移动仍在保存。",
+    "reorderFailed": "无法保存新的排列顺序",
     "pinToTop": "置顶",
     "unpin": "取消置顶",
     "rename": "重命名",
@@ -1342,47 +1385,96 @@
     "copyNameTaken": "名为“{{name}}”的工作区刚刚被创建，请重试。",
     "folderMoving": "该工作区的文件夹正在移动，请稍后再重命名。",
     "changeSpec": "更改规格",
-    "quotaRemaining": "剩余 {{remaining}}/{{limit}}",
-    "quotaUnlimited": "无限制",
     "quotaNotOnPlan": "当前套餐不可用",
+    "quotaNoneLeft": "已用完",
     "quotaUsedUp": "已达套餐上限",
-    "alwaysOnEnable": "开启常驻",
-    "alwaysOnBadge": "常驻",
-    "alwaysOnBadgeTitle": "常驻：沙箱保持运行",
     "alwaysOnFailed": "无法更改常驻设置",
-    "alwaysOnEnableConfirm": "开启",
-    "tierBadgeTitle": "{{tier}} 沙箱规格",
     "tier": {
-      "standard": "标准",
-      "performance": "高性能",
-      "max": "旗舰"
+      "standard": "小型",
+      "performance": "中型",
+      "max": "大型",
+      "xlarge": "超大型"
     },
-    "tierSpec": {
-      "standard": "1 vCPU · 1 GB 内存 · 3 GB 磁盘",
-      "performance": "2 vCPU · 4 GB 内存 · 5 GB 磁盘",
-      "max": "4 vCPU · 8 GB 内存 · 10 GB 磁盘"
+    "tierFact": {
+      "cpu": "{{count}} vCPU",
+      "memory": "{{count}} GB 内存",
+      "disk": "{{count}} GB 磁盘"
     },
     "specUpdated": "计算机规格已更新",
     "duplicate": "复制",
     "duplicating": "正在复制…",
-    "duplicateConfirm": "创建“{{name}}”的副本？文件将一并复制；副本默认关闭常驻。",
+    "duplicateConfirm": "创建“{{name}}”的副本？文件将一并复制。",
     "duplicated": "工作区已复制",
     "duplicateFailed": "无法复制工作区",
+    "move": {
+      "menu": "迁移到其他计算机…",
+      "title": "迁移工作区",
+      "intro": "将 {{name}} 迁移到你的另一台计算机上，文件、对话和设置都会一起迁移过去。",
+      "notCopied": "已安装的依赖、缓存和 .git 历史不会复制，它们会在 {{source}} 上保留 7 天，之后删除。",
+      "notCopiedKept": "已安装的依赖、缓存和 .git 历史不会复制，它们会保留在 {{source}} 的 _internal/leftovers 中，不会被删除。",
+      "submit": "迁移",
+      "copying": "正在复制文件…",
+      "finishing": "即将完成…",
+      "progressHint": "可以关闭此窗口，迁移会继续进行。",
+      "cancel": "取消迁移",
+      "cancelFailed": "无法取消迁移，请重试。",
+      "done": "已迁移到 {{computer}}",
+      "failedTitle": "无法迁移 {{name}}",
+      "failed": "无法迁移此工作区，请重试。",
+      "fromBackup": {
+        "offer": "{{computer}} 没有响应，无法从它复制文件。如果它已无法恢复，你可以用{{time}}的备份在 {{target}} 上恢复此工作区。",
+        "offerUndated": "{{computer}} 没有响应，无法从它复制文件。如果它已无法恢复，你可以用备份在 {{target}} 上恢复此工作区。",
+        "button": "从备份恢复",
+        "confirm": "要用{{time}}的备份在 {{target}} 上恢复此工作区吗？",
+        "confirmUndated": "要用备份在 {{target}} 上恢复此工作区吗？",
+        "caveats": "该备份之后更改的文件不会包含在内。{{computer}} 上的文件夹会保留，在它恢复响应后移到 _internal/leftovers 中。",
+        "restoring": "正在从备份恢复文件…"
+      }
+    },
+    "restoreOffer": {
+      "missing": "{{computer}} 上找不到此工作区的文件夹。",
+      "missingUnnamed": "找不到此工作区的文件夹。",
+      "prompt": "要从{{time}}的备份恢复吗？",
+      "promptUndated": "要从备份恢复吗？",
+      "restore": "恢复文件",
+      "keepEmpty": "保持为空",
+      "restoring": "正在恢复文件…",
+      "keeping": "正在保留空文件夹…",
+      "keepEmptyTitle": "保持文件夹为空？",
+      "keepEmptyBody": "之后备份会以文件夹的当前状态为准，其中原有的文件将无法再恢复。",
+      "keepEmptyConfirm": "保持为空",
+      "failed": "无法恢复文件"
+    },
     "notOnPlan": "您的套餐不支持此功能，请升级后使用。",
     "tierLimitReached": "您的 {{tier}} 工作区数量已达上限。",
+    "computerPreparing": "这台计算机仍在准备中，请在准备就绪后重试。",
     "workspaceLimitReached": "您的工作区数量已达上限。",
     "options": "选项",
     "noWorkspacesFound": "未找到工作区",
     "welcomeTitle": "欢迎使用 {{brand}}",
     "welcomeDesc": "开始设置您的偏好或创建工作区。",
+    "noWorkspacesMatch": "没有与“{{query}}”匹配的工作区。",
+    "clearSearch": "清除搜索",
+    "emptyTitle": "还没有工作区",
+    "emptyDesc": "工作区把一个项目的对话、文件和计算机放在一起，并配有专属的分析师。研究总监可以帮你创建，也可以在这里新建。",
+    "cosRecent": "最近",
+    "cosTryAsking": "试着问问",
+    "cosAllThreads": "全部对话",
+    "cosStarter1": "这周我的分析师们都在做什么？",
+    "cosStarter2": "建一个工作区，跟踪半导体板块的广度",
+    "cosStarter3": "我的自选股今天有什么异动？为什么？",
     "createWorkspace": "创建工作区",
     "failedLoadWorkspaces": "加载工作区失败，请刷新页面。",
     "invalidWorkspace": "无效工作区，请重试。",
     "failedDeleteWorkspace": "删除工作区失败，请重试。",
+    "deleteOwnMachine": {
+      "cannotUndo": "工作区及其对话将被删除，此操作无法撤销。",
+      "filesStay": "它的文件位于 {{computer}} 上的 {{folder}} 中，会保留在那里。",
+      "alsoDeleteFiles": "同时从这台机器上删除 {{folder}}"
+    },
     "loadingWorkspaces": "加载工作区中...",
     "backToThreads": "返回对话列表",
     "updated": "更新于 {{time}}",
-    "recently": "刚刚",
     "createNewWorkspace": "创建新工作区",
     "workspaceName": "工作区名称",
     "enterWorkspaceName": "输入工作区名称",
@@ -1403,7 +1495,9 @@
     "filesUploaded": "已上传 {{count}} 个文件",
     "filesFailed": "· {{count}} 个失败",
     "openWorkspace": "打开工作区",
-    "fileTooLarge": "{{name}} 太大了（{{size}} MB），无法上传。"
+    "fileTooLarge": "{{name}} 太大了（{{size}} MB），无法上传。",
+    "cosWorksOn": "运行于",
+    "cosComputerHint": "{{name}}在你的默认计算机上工作，使用工作区旁的 Home 文件夹。将另一台计算机设为默认后，它会随之迁移。"
   },
   "computer": {
     "computers": "计算机",
@@ -1411,16 +1505,62 @@
     "loading": "正在加载计算机",
     "empty": "还没有计算机。创建第一个工作区时会自动建一台。",
     "nameLabel": "名称",
+    "nameFromMachine": "默认使用机器的名称",
     "namePlaceholderCloud": "云端计算机",
     "namePlaceholderLocal": "本地计算机",
     "tierLabel": "计算机规格",
+    "createDesc": "一台独立的计算机，有自己的文件。放在上面的工作区会随它一起启动和停止。",
+    "planLimitedProvider": "需要当前套餐不包含的提供商？",
+    "planLimitedBoth": "需要当前套餐不包含的提供商或规格？",
+    "capReached": "你的计算机数量已达套餐上限。请先移除一台，再添加新的。",
+    "capPlanLimited": "需要比当前套餐更多的计算机？",
+    "tierElsewhere": "{{tier}}可在 {{provider}} 上使用。",
+    "switchProvider": "切换到 {{provider}}",
+    "takeOverFolder": "接管此文件夹",
+    "takeOverFolderNote": "另一台计算机将不再使用它，其中的文件会保留。",
+    "computerLabel": "计算机",
+    "computerHint": "同一台计算机上的工作区共用它的磁盘，并会一起启动和停止。",
+    "nameWithSource": "{{name}} · {{source}}",
+    "primaryOption": "{{name}}（默认）",
+    "preparingOption": "{{name}}（准备中）",
+    "primaryPreparingOption": "{{name}}（默认，准备中）",
+    "provider": {
+      "label": "提供商",
+      "daytonaDesc": "基于容器的沙箱",
+      "e2bDesc": "微虚拟机（MicroVM）",
+      "dockerDesc": "在本机运行",
+      "sshDesc": "任何 Linux 服务器或 Mac",
+      "sshLabel": "你的机器 (SSH)",
+      "capReached": "已达上限"
+    },
+    "largerSlot": {
+      "open_other": "你的套餐可使用 {{count}} 台比{{small}}更大的计算机。",
+      "partly_other": "你的套餐可使用 {{count}} 台比{{small}}更大的计算机，还剩 {{remaining}} 台。",
+      "inUse_other": "你的套餐中比{{small}}更大的计算机名额已用完。"
+    },
     "newComputer": "新建计算机",
     "create": "创建计算机",
     "creating": "创建中...",
+    "add": "添加计算机",
+    "adding": "添加中...",
     "start": "启动",
     "stop": "停止",
     "primaryBadge": "默认",
     "primaryBadgeTitle": "新工作区会创建在这台计算机上",
+    "badge": {
+      "mac": "Mac",
+      "ssh": "SSH"
+    },
+    "makePrimary": {
+      "button": "设为默认",
+      "title": "将 {{name}} 设为默认？",
+      "body": "新工作区将创建在 {{name}} 上。",
+      "bodyHomeMoves": "新工作区将创建在 {{name}} 上，研究总监存放文件的 Home 也会一并迁移过去。",
+      "movingHome": "正在迁移 Home…",
+      "done": "{{name}} 已设为默认计算机",
+      "failedTitle": "无法将 {{name}} 设为默认",
+      "failed": "无法将这台计算机设为默认，请重试。"
+    },
     "workspaceCount_one": "{{count}} 个工作区",
     "workspaceCount_other": "{{count}} 个工作区",
     "stopComputer": "停止计算机",
@@ -1435,20 +1575,91 @@
     "statusError": "出错",
     "statusDeleted": "已删除",
     "statusUpdating": "更新中",
+    "statusPreparing": "准备中",
     "rename": "重命名计算机",
     "renameLabel": "计算机名称",
     "renameFailed": "无法重命名计算机",
+    "remove": "移除",
+    "removeTitle": "移除 {{name}}？",
+    "removeBody": "它的沙箱和磁盘上的所有内容都会被删除，此操作无法撤销。",
+    "removeBodyOwnMachine": "我们将停止使用这台机器，并移除在上面为它设置的内容。{{folder}} 中的文件会保留。",
+    "removeBodyOwnMachineDelete": "我们将停止使用这台机器，并删除 LangAlpha 放在上面的内容。",
+    "alsoDeleteFiles": "同时从这台机器上删除 LangAlpha 的文件",
+    "alsoDeleteFilesHint": "删除 {{folder}}（包括其中各工作区的文件夹），以及 ~/.langalpha 中约 3 GB 的运行环境（如果没有其他计算机在使用）。你自己放进 {{folder}} 的文件会保留。机器需要处于连接状态。",
+    "filesDeleted": "已从这台机器上删除它的文件。",
+    "filesRootKept": "{{folder}} 中有你自己的文件，因此保留。",
+    "filesRuntimeKept": "~/.langalpha 仍被其他计算机使用，因此保留。",
+    "filesUnreached": "无法连接这台机器，它的文件仍在原处。",
+    "filesFailed": "未能删完这台机器上的文件。",
+    "removeConfirm": "移除计算机",
+    "removeWithWorkspaces_one": "移除计算机和工作区",
+    "removeWithWorkspaces_other": "移除计算机和 {{count}} 个工作区",
+    "removeWorkspaces_one": "这个工作区会一并删除：",
+    "removeWorkspaces_other": "这 {{count}} 个工作区会一并删除：",
+    "removeWorkspacesMore_one": "还有 {{count}} 个",
+    "removeWorkspacesMore_other": "还有 {{count}} 个",
+    "removeWorkspacesAcknowledgeOne": "我了解 {{name}} 及其中的对话将被永久删除",
+    "removeWorkspacesAcknowledge_other": "我了解这 {{count}} 个工作区及其中的对话将被永久删除",
+    "removeWorkspacesLoading": "正在查找它上面的工作区…",
+    "removeWorkspacesFailed": "无法读取它上面的工作区。请关闭后重试。",
+    "removing": "移除中...",
+    "removeKey": "从 ~/.ssh/authorized_keys 中移除我们的密钥",
+    "keyRemoved": "我们的密钥也已从 ~/.ssh/authorized_keys 中移除。",
+    "keyKept": "我们的密钥仍保留在 ~/.ssh/authorized_keys 中，因为 {{computer}} 还在用它登录。",
+    "keySkipped": "我们无法安全地移除密钥，它仍可用于登录这台机器。",
+    "keyUnreached": "我们无法连接这台机器，密钥仍留在上面。",
+    "keyRemoveYourself": "如需自行移除，请在 ~/.ssh/authorized_keys 中删除以 {{comment}} 结尾的那一行，其指纹为 {{fingerprint}}。",
+    "removed": "已移除 {{name}}",
+    "removeFailed": "无法移除这台计算机，请重试。",
+    "removeBlocked": {
+      "specChange": "规格更改完成后即可移除。",
+      "starting": "启动完成后即可移除。",
+      "stopping": "停止后即可移除。"
+    },
+    "removeRefused": {
+      "primary": "默认计算机无法移除。",
+      "hasWorkspaces": "它上面有一个未列出的工作区。请查看列表后重试。",
+      "busy": "这台计算机正忙，请稍后再试。",
+      "published_reports": "这台计算机上有工作区含已发布研报，只能归档，不能删除。"
+    },
     "manageComputer": "管理 {{name}}",
     "alwaysOn": "常驻",
-    "alwaysOnConfirm": "让“{{name}}”全天候运行？它上面的所有工作区都会保持可用。计算机不再因闲置而关闭，并持续计费，直到你关闭常驻。",
-    "alwaysOnConfirmStopped": "立即启动“{{name}}”并全天候运行？它上面的所有工作区都会保持可用。计算机会立即启动，并持续计费，直到你关闭常驻。",
+    "filesBackup": {
+      "label": "备份文件",
+      "offTitle": "停止备份文件？",
+      "offBody": "{{name}} 上每个工作区的最后一次备份会保留，但不再更新。之后如果这台机器上的文件夹丢失，只能恢复到当时的状态。",
+      "offConfirm": "停止备份",
+      "failed": "无法更改文件备份设置"
+    },
+    "machine": {
+      "system": "系统",
+      "processor": "处理器",
+      "cores": "核心数",
+      "memory": "内存",
+      "folder": "文件夹",
+      "gb": "{{count}} GB"
+    },
+    "prepare": {
+      "sandbox": "正在创建沙箱",
+      "runtime": "正在安装运行环境",
+      "tools": "正在安装工具",
+      "finishing": "正在完成设置",
+      "step": "{{step}}（{{index}}/{{total}}）",
+      "hint": "设置这台计算机可能需要几分钟，准备就绪后即可在上面创建工作区。",
+      "blocksWorkspace": "{{name}} 正在准备中，准备就绪后即可在上面创建工作区。",
+      "readyTitle": "{{name}} 已准备就绪",
+      "readyDesc": "现在可以在上面创建工作区了。",
+      "failedTitle": "无法准备 {{name}}",
+      "retryHint": "再次启动即可重试。"
+    },
     "spec": {
       "title": "更改 {{name}} 的规格",
       "descRunning": "会先备份这台计算机上所有工作区的文件，再按新规格重建计算机并恢复文件。期间它上面的工作区会有几分钟不可用。",
       "descStopped": "会先备份这台计算机上所有工作区的文件。新规格在下次启动时生效，届时恢复文件。",
       "notKept": "已安装的软件包、缓存和正在运行的应用不会保留，Agent 会按需重新安装。",
-      "applying": "处理中",
+      "applying": "处理中...",
       "apply": "备份并更改规格",
+      "current": "当前",
       "turnActive": "Agent 正在这台计算机上工作。请等当前任务结束后再试。",
       "backupIncomplete": "未做任何更改。更改配置前会先备份所有文件，但下面这些文件无法备份。请移动或删除它们，或让 Agent 帮你清理，然后再试。",
       "backupIncompleteUnnamed": "未做任何更改。这台计算机的文件未能先完成备份，请稍后再试。",
@@ -1470,6 +1681,7 @@
     },
     "disk": {
       "label": "存储",
+      "percent": "磁盘 {{percent}}%",
       "usage": "已用 {{used}}，共 {{total}}，剩余 {{free}}",
       "unknown": "尚未测量存储",
       "breakdown": "按工作区",
@@ -1514,6 +1726,177 @@
       "refresh": "刷新状态",
       "archive": "归档",
       "sandboxId": "沙箱 ID："
+    },
+    "ssh": {
+      "filesBackup": "备份工作区文件",
+      "filesBackupHint": "在服务器上保留每个工作区文件的副本，文件夹丢失时可以恢复。版本控制和依赖文件夹不会备份。",
+      "previewLabel": "预览",
+      "previewNotice": "连接自己的机器是一项新功能，请谨慎使用。Agent 可以执行所连接账户能做的任何操作，建议为它单独创建一个账户，而不是使用你自己的账户。",
+      "pairIntro": "请在要添加的机器（Linux 或 macOS）上，以 Agent 要使用的用户身份运行这条命令：",
+      "pairIntroLocal": "请在运行 LangAlpha 的这台电脑的终端里，以 Agent 要使用的用户身份运行这条命令。要添加其他机器，请手动设置。",
+      "pairLoading": "正在获取命令...",
+      "viewScript": "查看脚本",
+      "waiting": "正在等待你的机器...",
+      "checking": "{{username}}@{{hostname}} 已报到，正在连接...",
+      "tunneling": "正在通过隧道连接 {{hostname}}。无法从互联网访问这台机器，所以改为由它主动连出。这需要几秒钟。",
+      "readyTunnel": "{{hostname}}，通过隧道",
+      "tunnelBadge": "隧道",
+      "tunnelOffline": "隧道已离线",
+      "pairFailedNext": "修复后重新运行命令，或自行输入地址：",
+      "pairRerun": "修复后重新运行命令。",
+      "pairOtherUser": "命令是以 {{username}} 身份运行的。如需换一个登录用户，请以该用户身份运行命令。",
+      "limitReached_one": "最多可以添加 {{count}} 台 SSH 计算机。请先移除一台，再添加新的。",
+      "limitReached_other": "最多可以添加 {{count}} 台 SSH 计算机。请先移除一台，再添加新的。",
+      "pairUnavailable": "此服务器不支持一行命令，请手动设置。",
+      "manualLink": "改为手动设置",
+      "pairingLink": "改用一行命令",
+      "addressLabel": "主机或 SSH 命令",
+      "addressHint": "如需其他端口，在末尾加上 :2222。",
+      "addressNoUser": "请带上用户名，例如 ubuntu@203.0.113.10。",
+      "addressInvalid": "请输入类似 ubuntu@203.0.113.10 的地址。",
+      "portInvalid": "请输入 1 到 65535 之间的端口。",
+      "connect": "连接",
+      "connecting": "正在连接...",
+      "keyStep": "我们的密钥还没有添加到 {{username}}@{{host}}。请在那台机器上以 {{username}} 身份运行以下命令，然后再次连接：",
+      "keyLoading": "正在获取密钥...",
+      "keyUnavailable": "此服务器无法保存 SSH 密钥，因此无法连接你的机器。",
+      "keyFailed": "无法获取密钥。请关闭此对话框后重试。",
+      "commandLabel": "命令",
+      "publicKeyLabel": "公钥",
+      "copyLabel": "复制{{what}}",
+      "keyManual": "或自行添加公钥",
+      "differentMachine": "换一台机器",
+      "diskFree": "可用 {{free}}",
+      "sudoRoot": "以 root 身份连接。",
+      "sudoYes": "可使用 sudo",
+      "sudoNo": "无法使用 sudo，部分工具可能无法安装。",
+      "folder": "文件夹",
+      "folderHint": "工作区在你机器上的存放位置。",
+      "folderShown": "工作区存放在 {{folder}}。",
+      "changeFolder": "更改",
+      "hostKey": "主机密钥 {{fingerprint}}",
+      "error": {
+        "authFailed": "这台机器没有接受我们为 {{username}} 提供的密钥。",
+        "authFailedRoot": "这台机器没有接受我们为 root 提供的密钥，很可能是因为它不允许 root 登录。请以 Agent 应使用的用户身份运行命令，或允许 root 使用密钥登录（PermitRootLogin prohibit-password）。",
+        "unreachable": "无法连接 {{address}}。该机器必须允许来自互联网的 SSH 连接。",
+        "unreachableMachine": "无法通过 SSH 连接你的机器。它必须允许来自互联网的 SSH 连接。",
+        "unreachableMac": "无法通过 SSH 连接你的 Mac。请在“系统设置 > 通用 > 共享”中打开“远程登录”，然后重新运行命令。",
+        "timeout": "连接超时。请检查 SSH 是否在运行，以及端口是否开放。",
+        "hostKeyMismatch": "在该地址响应的不是你的机器。",
+        "privateAddress": "这台机器位于私有网络，我们无法访问。请使用可从互联网访问的地址。",
+        "unsupported": "不支持此机器。",
+        "expired": "这条命令已过期，请运行新的命令。",
+        "rateLimited_other": "这个账号在过去一小时内尝试的 SSH 连接过多。请在 {{count}} 分钟后重试。",
+        "generic": "无法连接，请重试。"
+      }
+    },
+    "remoteControl": {
+      "cardTitle": "这台 Mac",
+      "cardDesc": "关闭 LangAlpha 后仍可工作",
+      "alreadyAdded": "已添加",
+      "title": "远程控制这台 Mac",
+      "intro": "LangAlpha 的 Agent 将以 {{account}} 的身份在这台 Mac 上工作，拥有这个账户的全部权限。",
+      "meansLabel": "这意味着",
+      "meansAccess": "它可以运行任何命令，在任何文件夹中读取或修改 {{account}} 有权访问的任何文件。它的工作会放在你选择的文件夹里，但这台 Mac 上没有任何机制把它限制在那里。",
+      "meansBackground": "关闭 LangAlpha 后它仍会继续工作。远程控制在后台运行，每次登录都会自动启动，直到你将它关闭。",
+      "meansCredentials": "它可以读取命令行工具为 {{account}} 保存的内容，例如 Git 和云服务的登录信息，也能访问你的家庭或办公网络。",
+      "meansAccount": "任何登录你的 LangAlpha 账号的人都可以指挥它。",
+      "stopLabel": "如何停止",
+      "stop": "你可以随时在 LangAlpha 菜单中暂停它，也可以在“系统设置 > 通用 > 登录项”中关闭。在 LangAlpha 中移除这台计算机会关闭远程控制，并从这台 Mac 上删除它的密钥。",
+      "folderPrompts": "macOS 可能会询问是否允许 LangAlpha 访问“文稿”“桌面”等文件夹。你可以拒绝：Agent 自己的文件夹不需要这项权限。",
+      "previewNotice": "远程控制仍处于预览阶段，我们正在加入更多安全保护。在此之前，Agent 拥有与你相同的访问权限，因此请只在可以接受这一点的 Mac 上开启。",
+      "acknowledge": "我了解 LangAlpha 的 Agent 能以 {{account}} 的身份在这台 Mac 上运行命令、修改文件。",
+      "turnOn": "开启远程控制",
+      "turningOn": "正在开启远程控制…",
+      "connecting": "正在连接这台 Mac…",
+      "needsApproval": "需要你在 macOS 中确认。请在“系统设置 > 通用 > 登录项”中允许 LangAlpha 在后台运行，然后点击“继续”。",
+      "continue": "继续",
+      "tryAgain": "重试",
+      "failed": "无法开启远程控制，请重试。",
+      "insecure": "远程控制要求服务器地址以 https 开头，这台 Mac 才能信任收到的配对信息。",
+      "thisMacBadge": "这台 Mac",
+      "provider": "远程控制",
+      "asAccount": "以 {{account}} 身份",
+      "notConnected": "未连接",
+      "paused": "远程控制已暂停，可在 LangAlpha 菜单中恢复。",
+      "removeTurnsOff": "这台 Mac 上的远程控制也会随之关闭。",
+      "cardTitlePc": "这台电脑",
+      "windowsSoon": "即将支持 Windows",
+      "needsApp": "需要桌面应用",
+      "needsAppHint": "要添加这台 Mac，请<download>下载桌面应用</download>，并在应用中打开此表单。",
+      "anotherMacHint": "要添加另一台 Mac，请在那台 Mac 上<download>下载桌面应用</download>，并在应用中打开此表单。"
+    },
+    "card": {
+      "spec": "配置",
+      "changeSpec": "更改",
+      "workspaces": "工作区",
+      "disk": "磁盘",
+      "position": "{{n}} / {{total}}",
+      "previous": "上一台计算机",
+      "next": "下一台计算机",
+      "newOwn": "云端计算机，或通过 SSH 连接你已有的机器。",
+      "newCloud": "再添一台云端计算机，让工作在单独的机器上进行。",
+      "add": "添加计算机",
+      "ownMachine": "自有机器",
+      "details": "详情",
+      "storage": "存储",
+      "previewPending": "连接后显示"
+    },
+    "startFailure": {
+      "lead": "无法启动。",
+      "reinstall": "重新安装…",
+      "reconnect": "重新连接…"
+    },
+    "restartRefused": {
+      "folderMarked": "该文件夹属于另一台计算机，可能来自另一个 LangAlpha 账户或服务器。",
+      "folderOwned": "你的另一台计算机正在使用该文件夹。移除那台计算机即可释放该文件夹。",
+      "notStopped": "这台计算机正在启动或运行中。请在它停止后重试。",
+      "specInProgress": "这台计算机正在更改配置。请在完成后重试。",
+      "unanswered": "该机器没有响应。请确认它已开机并已连接，然后重试。",
+      "reinstallFailed": "无法重新安装这台计算机，请重试。",
+      "reconnectFailed": "无法重新连接这台计算机，请重试。"
+    },
+    "reinstall": {
+      "title": "重新安装 {{name}}",
+      "desc": "选择这台计算机在其机器上使用的文件夹。设置完成后它会重新启动。",
+      "folderLabel": "文件夹",
+      "takeBack": "收回该文件夹",
+      "takeBackDesc": "继续使用 {{folder}}。如果另一台计算机正在使用它，那台计算机将无法再在这台机器上工作。文件夹中的文件会保留。",
+      "takeBackOwned": "继续使用 {{folder}}。另一台计算机正在使用它，可能来自另一个 LangAlpha 账户或服务器。那台计算机将无法再在这台机器上工作。文件夹中的文件会保留。",
+      "newFolder": "使用新文件夹",
+      "newFolderDesc": "在这台机器上的另一个文件夹中重新开始。旧文件夹保持原样。",
+      "newFolderLabel": "新文件夹",
+      "newFolderBackup": "工作区文件会从备份中恢复。",
+      "newFolderNoBackup": "这台计算机未开启备份，工作区文件会留在 {{folder}} 中。如有需要，请自行复制过去。",
+      "takeNew": "使用此文件夹",
+      "takeBackAgainNote": "收回后，那台计算机将无法再在其中工作。其中的文件会保留。",
+      "takeBackAgain": "从那台计算机收回",
+      "takeNewNote": "使用后，那台计算机将无法再在其中工作。其中的文件会保留。你也可以输入其他文件夹。",
+      "submit": "重新安装",
+      "submitting": "正在重新安装..."
+    },
+    "reconnect": {
+      "title": "重新连接 {{name}}",
+      "desc": "将这台计算机重新连接到它的机器。它的文件夹和工作区保持不变。",
+      "pairIntro": "以 {{username}} 身份在该机器上运行：",
+      "folderKept": "工作区仍保存在 {{folder}} 中。",
+      "onThatMac": "{{name}} 由其 Mac 上的 LangAlpha 应用连接。请在那台 Mac 上打开 LangAlpha，并在那里选择重新连接。",
+      "otherMac": "这台 Mac 已是 {{other}}。要重新连接 {{name}}，请在它所在的 Mac 上打开 LangAlpha，并在那里选择重新连接。",
+      "takeBackNote": "{{folder}} 是这台计算机的文件夹。收回后，另一台计算机将无法再在其中工作。其中的文件会保留。",
+      "submit": "重新连接",
+      "submitting": "正在重新连接...",
+      "moveToMac": "移到这台 Mac",
+      "moveToMachine": "移到这台机器",
+      "notThisMac": "这台 Mac 不是 {{name}} 原来所在的 Mac：它的文件夹和文件不在这里。工作区文件会从备份恢复；从未备份的内容仍留在原来的 Mac 上。",
+      "notThisMachine": "这不是 {{name}} 原来所在的机器：它的文件夹和文件不在这里。工作区文件会从备份恢复；从未备份的内容仍留在原来的机器上。",
+      "notThisMacNoBackup": "这台 Mac 不是 {{name}} 原来所在的 Mac：它的文件夹和文件不在这里。这台计算机未开启备份，工作区文件会留在原来的 Mac 上；之前备份过的工作区会提供恢复该备份的选项。",
+      "notThisMachineNoBackup": "这不是 {{name}} 原来所在的机器：它的文件夹和文件不在这里。这台计算机未开启备份，工作区文件会留在原来的机器上；之前备份过的工作区会提供恢复该备份的选项。",
+      "folderRestored": "工作区会从备份恢复到 {{folder}}。",
+      "moveDesc": "把这台计算机移到下面这台机器。确认后它会在那里启动。",
+      "keepBothMacNote": "如要两台都保留，可将这台 Mac 添加为一台独立的计算机，再在 {{name}} 原来所在的 Mac 上重新连接它。",
+      "keepBothNote": "如要两台都保留，可将这台机器添加为一台独立的计算机，再将 {{name}} 重新连接到原来的机器。",
+      "addThisMac": "将这台 Mac 添加为新计算机",
+      "addThisMachine": "将这台机器添加为新计算机"
     }
   },
   "thread": {
@@ -1611,6 +1994,8 @@
       "subagentsOn": "子 Agent 已开启",
       "subagentsOff": "子 Agent 已关闭",
       "subagentsFailed": "无法更改此对话的子 Agent 设置",
+      "effortFailed": "无法更改此对话的推理强度",
+      "fastModeFailed": "无法更改此对话的速度",
       "watch": "盯盘",
       "watchOn": "盯盘已开启",
       "watchOff": "盯盘已关闭",
@@ -1618,6 +2003,20 @@
       "manageSubagents": "管理子 Agent"
     },
     "moreTools": "更多工具",
+    "composer": {
+      "remove": "移除",
+      "attachFile": "添加附件",
+      "attachChart": "附加图表截图",
+      "captureChart": "截取图表",
+      "chartAlt": "图表",
+      "send": "发送消息",
+      "dropFiles": "拖放文件以上传",
+      "uploading": "上传中"
+    },
+    "mention": {
+      "noMatching": "无匹配文件",
+      "noFiles": "暂无可用文件"
+    },
     "widgetContext": {
       "inContext_one": "{{count}} 项上下文",
       "inContext_other": "{{count}} 项上下文",
@@ -1720,6 +2119,7 @@
       "pickFailed": "无法更改此对话的模型",
       "retired": "{{model}} 已不再可用，此对话现在使用 {{fallback}}。",
       "offer": "此对话使用 {{model}}，新对话默认使用 {{defaultModel}}。",
+      "handoff": "OpenAI 已将此对话的一部分压缩成只有其模型能读取的摘要。之前的模型正在为 {{model}} 把它写成文字，下一条消息可能要稍等片刻才会开始。",
       "makeDefault": "将 {{model}} 设为默认"
     },
     "backgroundTasksRunning": "后台任务仍在运行",
@@ -1730,18 +2130,42 @@
       "tasksRunning_one": "{{count}} 个任务 · {{running}} 个运行中",
       "tasksRunning_other": "{{count}} 个任务 · {{running}} 个运行中",
       "tasksHeading": "来自此对话",
+      "commandsHeading": "后台运行中",
       "show": "显示此对话的工作"
     },
+    "commands": {
+      "chip_one": "{{count}} 个命令运行中",
+      "chip_other": "{{count}} 个命令运行中",
+      "pickedUp_one": "运行结束后，Agent 会接着处理。",
+      "pickedUp_other": "每个运行结束后，Agent 都会接着处理。",
+      "inBackground": "后台运行 {{duration}}",
+      "completedIn": "已完成，用时 {{duration}}",
+      "failedAfter": "已失败，用时 {{duration}}",
+      "stoppedAfter": "已停止，用时 {{duration}}",
+      "stoppedEarlyAfter": "已提前停止，用时 {{duration}}",
+      "completed": "已完成",
+      "failed": "已失败",
+      "stopped": "已停止",
+      "stoppedEarly": "已提前停止",
+      "stopLabel": "停止{{name}}",
+      "stopFailed": "未能停止，请重试。"
+    },
     "provenance": {
-      "fromChiefOfStaff": "来自 CoS Agent",
+      "fromChiefOfStaff": "来自研究总监",
       "automation": "自动化",
       "automationNamed": "自动化 · {{name}}",
       "viaChannel": "来自 {{platform}}",
       "fromMainAgent": "来自主 Agent",
-      "reportFrom": "来自 {{name}} 的汇报",
-      "reportFromAnalyst": "来自分析师的汇报",
-      "taskFinished": "{{id}} 已完成",
-      "taskFailed": "{{id}} 已失败"
+      "steered": "引导消息",
+      "steeredHint": "由正在进行的运行读取",
+      "analyst": "{{name}} 的分析师",
+      "analystUnnamed": "分析师",
+      "reportedBack": "已汇报",
+      "couldntFinish": "未能完成",
+      "stopped": "已被停止",
+      "taskFinished": "已完成",
+      "taskFailed": "已失败",
+      "commandStoppedEarly": "已提前停止"
     },
     "taskCard": {
       "statusRunning": "运行中",
@@ -1762,15 +2186,26 @@
       "title": "额度已用尽"
     },
     "subagentCard": {
-      "titleFallback": "子 Agent 任务",
-      "viewDetails": "查看任务详情",
-      "openUpdated": "点击查看已更新的子 Agent",
-      "openResumed": "点击查看已恢复的子 Agent",
-      "openRunning": "点击查看运行中的子 Agent",
-      "openDetails": "点击查看子 Agent 详情",
-      "toolUnit_one": "次工具调用",
-      "toolUnit_other": "次工具调用",
-      "tokenUnit": "tokens"
+      "titleFallback": "子 Agent 任务"
+    },
+    "subagentRun": {
+      "starting": "正在启动",
+      "couldntStart": "未能启动",
+      "subagentsOff": "此对话已关闭子 Agent",
+      "openLabel": "打开子 Agent：{{title}}",
+      "count_one": "{{count}} 个子 Agent",
+      "count_other": "{{count}} 个子 Agent",
+      "tally": {
+        "working": "{{count}} 运行中",
+        "done": "{{count}} 已完成",
+        "failed": "{{count}} 失败",
+        "stopped": "{{count}} 已停止",
+        "updated": "{{count}} 已更新",
+        "resumed": "{{count}} 已恢复"
+      },
+      "finishedIn": "已完成，用时 {{duration}}",
+      "finished": "已完成",
+      "model": "模型：{{model}}"
     },
     "subagentBar": {
       "completedWithTools_one": "已完成（{{count}} 次工具调用）",
@@ -1815,25 +2250,38 @@
       "noProgress": "本次运行没有记录到进度。"
     },
     "ptcCard": {
-      "awaitingApproval": "等待批准",
-      "researchDeclined": "已拒绝研究",
+      "handOffTo": "交给<ws> {{name}} 的</ws>分析师",
+      "handOffToAnalyst": "交给分析师",
+      "waitingForYou": "等待你确认",
+      "briefMore": "阅读完整任务说明",
+      "briefLess": "收起",
       "reportBack": "完成后汇报摘要",
-      "approve": "批准",
+      "handOff": "交办",
       "decline": "拒绝",
+      "declined": "已拒绝交办",
       "statusWorking": "工作中",
       "statusStarting": "正在启动…",
       "statusNeedsInput": "需要输入",
       "statusCompleted": "已完成",
       "statusFailed": "已失败",
       "statusStopped": "已停止",
-      "hintProvisioning": "正在配置沙箱…",
-      "hintWorking": "正在后台运行",
-      "hintFailed": "运行未完成便已停止",
-      "hintNotStarted": "运行未能启动",
-      "hintStopped": "运行已停止",
-      "ctaOpenThread": "打开对话",
-      "ctaAnswerContinue": "回答并继续",
-      "ctaViewThread": "查看对话",
+      "needsAnswer": "等待你回答",
+      "answer": "回答",
+      "open": "打开",
+      "seeReport": "查看汇报",
+      "finished": "已完成",
+      "finishedAfter": "已完成，用时 {{duration}}",
+      "couldntFinish": "未能完成",
+      "stopped": "已停止",
+      "stoppedAfter": "已停止，用时 {{duration}}",
+      "couldntStart": "未能启动",
+      "groupTitle_other": "已交给 {{count}} 位分析师",
+      "summaryWorking": "{{count}} 位工作中",
+      "summaryNeedsAnswer_other": "{{count}} 位等待你回答",
+      "summaryFinished": "{{count}} 位已完成",
+      "summaryCouldntFinish": "{{count}} 位未能完成",
+      "summaryStopped": "{{count}} 位已停止",
+      "summaryCouldntStart": "{{count}} 位未能启动",
       "alwaysApprove": "始终允许",
       "alwaysApproveHint": "这次及以后交给分析师的任务都不再询问，可在设置中关闭。"
     },
@@ -1845,7 +2293,70 @@
       "panelTitle": "市场监控",
       "panelUpdated": "更新于 {{time}}",
       "panelWaiting": "Agent 工作时，实时价格将显示在这里。",
-      "panelEmpty": "当前没有正在监控的股票。"
+      "panelEmpty": "当前没有正在监控的股票。",
+      "pctFromClose": "较前收盘价 {{move}}",
+      "pctFromPrice": "较 {{price}} {{move}}",
+      "pctFromSet": "较设置时 {{move}}"
+    },
+    "marketAlert": {
+      "crossedAbove": "{{symbol}} 涨破 {{level}}",
+      "crossedBelow": "{{symbol}} 跌破 {{level}}",
+      "movedFromClose": "{{symbol}} 较前收盘价变动 {{move}}",
+      "movedFromSet": "{{symbol}} 较设置时变动 {{move}}",
+      "pricedAt": "{{time}} 报 {{price}}",
+      "at": "于 {{time}}",
+      "expiring": "{{symbol}} {{condition}} 的价格目标将于 {{time}} 到期",
+      "expiringSoon": "{{symbol}} {{condition}} 的价格目标即将到期",
+      "woke": "价格提醒唤醒了 Agent：{{alert}}",
+      "wokeGeneric": "价格提醒唤醒了 Agent",
+      "generic": "价格提醒"
+    },
+    "wakeups": {
+      "chip_one": "1 个唤醒 · {{time}}",
+      "chip_other": "{{count}} 个唤醒 · 下次 {{time}}",
+      "chipTitle": "Agent 在此对话中设置的唤醒，点开即可取消。",
+      "panelTitle": "唤醒",
+      "panelEmpty": "此对话暂无唤醒。",
+      "cancel": "取消",
+      "cancelAll": "全部取消",
+      "cancelling": "正在取消…",
+      "cancelLabel": "取消唤醒：{{label}}",
+      "cancelFailed": "无法取消此唤醒，请重试。",
+      "cancelTooLate": "已送达 Agent，可点击停止结束本轮。",
+      "rowTitle": "{{label}}",
+      "labelAt": "{{time}}",
+      "labelRepeat": "{{schedule}}",
+      "labelRepeatZone": "{{schedule}} · {{zone}}时间",
+      "labelOrder": "订单成交或结束 · {{order}}",
+      "stateNext": "下次 {{time}}",
+      "stateProgress": "已检查 {{done}}/{{total}} 次 · 下次 {{time}}",
+      "stateLapses": "等待中 · {{when}}失效",
+      "stateHeld": "已触发 · 本轮结束后送达",
+      "stateHeldUsage": "已触发 · 已达用量上限，将在你发送下一条消息时送达",
+      "stateFired": "已触发 · {{time}}",
+      "stateFinished": "已结束",
+      "stateLapsed": "已失效",
+      "stateExpired": "已过期",
+      "stateCancelled": "已取消",
+      "woke": "已唤醒 Agent：{{labels}}",
+      "wokeOrder": "订单更新唤醒了 Agent：{{label}}",
+      "arrived": "唤醒：{{label}}",
+      "check": "第 {{n}}/{{total}} 次检查",
+      "orderFilled": "{{order}} 已成交，均价 {{price}}",
+      "orderPartial": "{{order}} 部分成交 {{filled}}/{{qty}}",
+      "orderCancelled": "{{order}} 已取消",
+      "orderRejected": "{{order}} 被拒绝",
+      "quiet_one": "1 次检查 · 无新情况 · {{time}}",
+      "quiet_other": "{{count}} 次检查 · 无新情况 · 最近一次 {{time}}",
+      "quietEntry": "{{time}} · {{labels}} · {{status}}",
+      "chip_one_untimed": "1 个唤醒",
+      "chip_other_untimed": "{{count}} 个唤醒",
+      "settingWakeups": "设置唤醒中...",
+      "cancellingWakeups": "取消唤醒中...",
+      "checkingWakeups": "查看唤醒中...",
+      "endingQuietly": "结束检查中...",
+      "orderPartialCancelled": "{{order}} 部分成交 {{filled}}/{{qty}} 后取消",
+      "orderFailed": "{{order}} 失败"
     },
     "missingWorkspaceOrThread": "缺少工作区或对话信息",
     "accessDeniedTitle": "你没有权限查看此对话",
@@ -1883,6 +2394,10 @@
     "compacting": "正在压缩对话...",
     "compactingTokens": "已生成 {{value}} tokens",
     "offloading": "正在转存上下文...",
+    "turnHeld": {
+      "handoff": "正在等待上一个模型写出摘要...",
+      "other": "正在等待此对话上的当前操作完成..."
+    },
     "compactionStopped": "压缩已停止",
     "queuedSend": "消息已排队 — 压缩完成后将自动发送",
     "automationWaiting": "“{{name}}”已到运行时间，将在本轮结束后运行。",
@@ -1918,8 +2433,7 @@
       "sector-overviewDesc": "行业全景报告：市场规模、竞争格局、公司概览、估值背景",
       "competitive-analysisDesc": "竞争格局分析：市场定位、评分卡、护城河评估、份额趋势",
       "initiating-coverageDesc": "全面研究启动：公司研究、财务模型、估值、图表、30-50 页报告",
-      "chart-annotationDesc": "标注价格图表：价格线、趋势线、区间和事件标记，实时显示在 MarketView，或作为聊天中的图表卡片",
-      "report-issueDesc": "报告问题并提出改进建议以提升 Agent 能力"
+      "chart-annotationDesc": "标注价格图表：价格线、趋势线、区间和事件标记，实时显示在 MarketView，或作为聊天中的图表卡片"
     },
     "compactedNotification": "上下文已压缩 · {{from}} 条消息 → 摘要",
     "taskErrorNotification": "子任务运行失败",
@@ -1951,7 +2465,9 @@
       "speed": "速度",
       "speedStandard": "标准",
       "speedFast": "快速",
-      "speedFastHint": "消耗 2 倍积分，优先服务层级"
+      "speedFastHint": "消耗 2 倍积分，优先服务层级",
+      "select": "选择模型",
+      "fallbackName": "模型"
     },
     "voice": {
       "start": "开启语音输入",
@@ -2052,6 +2568,36 @@
       "alwaysApproveHint": "这次及以后创建工作区都不再询问，可在设置中关闭。",
       "duplicateExists": "已有相似的工作区：{{duplicate}}，可直接使用它，不必重复创建。",
       "duplicateUnknown": "无法确认是否已有同名或同 ticker 的工作区。"
+    },
+    "secretaryConfirm": {
+      "deleteWorkspace": {
+        "title": "删除工作区",
+        "approved": "工作区已删除",
+        "rejected": "已拒绝删除工作区"
+      },
+      "stopWorkspace": {
+        "title": "停止工作区",
+        "approved": "工作区已停止",
+        "rejected": "已拒绝停止工作区"
+      },
+      "deleteThread": {
+        "title": "删除对话",
+        "approved": "对话已删除",
+        "rejected": "已拒绝删除对话"
+      },
+      "workspaceLabel": "工作区：",
+      "threadLabel": "对话：",
+      "unknownId": "未知",
+      "confirm": "确认",
+      "decline": "拒绝"
+    },
+    "userQuestion": {
+      "answered": "已回答：{{answer}}",
+      "noAnswer": "（无回答）",
+      "skipped": "已跳过问题",
+      "custom": "自定义：",
+      "submitCount": "提交（{{n}}）",
+      "customPlaceholder": "或输入自定义回答..."
     }
   },
   "context": {
@@ -2150,13 +2696,13 @@
     "metaLines": "{{count}} 行",
     "metaPages": "{{count}} 页",
     "newTab": "新建标签页",
+    "back": "后退",
+    "forward": "前进",
     "noFilesYet": "暂无文件",
     "noTypeMatches": "没有 {{type}} 文件",
     "openFile": "打开文件",
-    "openFileHint": "从右侧的文件树中选择一个文件。",
-    "openFileHintUpload": "从右侧的文件树中选择一个文件，或将文件拖放到此处上传。",
-    "showFileTree": "显示文件树",
-    "dropToUploadHint": "或将文件拖放到此处上传。",
+    "files": "文件",
+    "dropToUploadHint": "将文件拖放到此处上传。",
     "openFiles": "已打开的标签页",
     "runningApps": "运行中的应用",
     "reloadApp": "重新加载应用",
@@ -2164,7 +2710,6 @@
     "previewFrameTitle": "端口 {{port}} 上的应用",
     "openInBrowser": "在浏览器中打开",
     "chartTab": "图表",
-    "openChart": "打开图表",
     "addChartToContext": "将图表添加到上下文",
     "openInMarketView": "在行情中心打开",
     "chartContextHint": "用户正在工作区面板中查看 {{symbol}} 的实时图表（{{timeframe}} K 线）。",
@@ -2183,10 +2728,15 @@
     "systemDirs": "系统",
     "systemDirsHint": "显示系统目录（.agents/、.system/、tools/ 等）",
     "toggleTree": "显示/隐藏文件树",
+    "expandPanel": "展开面板",
+    "collapsePanel": "显示对话",
     "uploadFile": "上传文件",
     "uploadingNth": "正在上传 第 {{current}} / 共 {{total}} 个：{{name}} — {{percent}}%",
     "uploadFailedSummary": "{{count}} 个文件上传失败：{{details}}",
+    "cancelUpload": "取消上传",
+    "uploadSendFailed": "文件未能发送。请检查网络连接后重试。",
     "backupFiles": "备份文件到数据库",
+    "backupOff": "此计算机已关闭文件备份。",
     "backupSummary": "已备份 {{count}} 个文件",
     "backupUnchanged": "，{{count}} 个未变更",
     "backupNotSaved": "{{count}} 个未保存",
@@ -2228,8 +2778,8 @@
     "exitFullscreen": "退出全屏",
     "downloadAsHtml": "下载为 HTML",
     "moreActions": "更多操作",
-    "htmlPreview": "预览",
-    "htmlSource": "源代码",
+    "viewSource": "查看源代码",
+    "viewPreview": "查看页面",
     "htmlPreviewFailed": "无法加载预览。",
     "pdfPrintHint": "按 Cmd/Ctrl-P 将页面保存为 PDF。",
     "pdfGenerating": "正在生成 PDF…",
@@ -2707,7 +3257,7 @@
     "profitMargins": "利润率",
     "epsActualVsEstimate": "EPS：实际 vs 预期",
     "cashFlowQuarterly": "现金流（季度）",
-    "openInMarketView": "在行情中心打开 ↗",
+    "openInMarketView": "在行情中心打开",
     "revenue": "营收",
     "netIncome": "净利润",
     "grossMargin": "毛利率",
@@ -2814,7 +3364,6 @@
     "resultSavedToFilesystem": "完整结果已保存至工作区文件系统。",
     "openFullResult": "打开完整结果",
     "preview": "预览",
-    "nSearchResults": "\"{{query}}\" 的 {{count}} 个结果",
     "untitled": "无标题",
     "nReasoning": "{{count}} 次推理",
     "thoughtFor": "思考了 {{duration}}",
@@ -2860,6 +3409,7 @@
       "executeCode": "执行代码",
       "thinking": "思考",
       "taskOutput": "任务输出",
+      "threadStatus": "对话状态",
       "automations": "自动化",
       "createAutomation": "创建自动化",
       "manageAutomation": "管理自动化",
@@ -2874,7 +3424,10 @@
       "preference": "偏好",
       "user": "账号",
       "sendMessage": "发送消息",
-      "messageTargets": "发送目标"
+      "messageTargets": "发送目标",
+      "scheduleWakeup": "唤醒",
+      "optionsChain": "期权链",
+      "marketMovers": "市场异动"
     },
     "completed": {
       "activatedSkill": "已激活技能",
@@ -2939,6 +3492,9 @@
       "screeningStocks": "筛选股票...",
       "watchingMarket": "开始行情监控...",
       "unwatchingMarket": "停止行情监控...",
+      "settingPriceTargets": "设置价格目标...",
+      "cancellingPriceTargets": "取消价格目标...",
+      "checkingMarketWatch": "查看行情监控...",
       "fetchingSymbolFiling": "获取 {{symbol}} 报告...",
       "fetchingFiling": "获取报告...",
       "searchingPattern": "搜索 '{{pattern}}'...",
@@ -2958,6 +3514,7 @@
       "waitingForSubagent": "等待子 Agent...",
       "fetchingTaskOutput": "获取任务输出...",
       "checkingAutomations": "检查自动化...",
+      "checkingThreadStatus": "查看运行中的工作...",
       "creatingName": "创建 {{name}}...",
       "creatingAutomation": "创建自动化...",
       "actionAutomation": "{{action}} 自动化...",
@@ -2967,7 +3524,11 @@
       "sendingTo": "发送到 {{app}}...",
       "sendingMessage": "发送消息...",
       "listingMessageTargets": "获取发送目标...",
-      "processing": "处理中..."
+      "processing": "处理中...",
+      "fetchingSymbolOptions": "获取 {{symbol}} 期权...",
+      "fetchingOptions": "获取期权...",
+      "fetchingGainers": "获取涨幅榜...",
+      "fetchingLosers": "获取跌幅榜..."
     },
     "preparing": {
       "writingCode": "编写代码{{size}}...",
@@ -2997,7 +3558,8 @@
       "search": "执行 {{count}} 次搜索",
       "fileRead": "读取 {{count}} 个文件",
       "fileEdit": "编辑 {{count}} 个文件",
-      "generic": "运行 {{count}} 个步骤"
+      "generic": "运行 {{count}} 个步骤",
+      "failed": "{{count}} 项失败"
     },
     "fileGroup": {
       "read": "读取 {{count}} 个文件",
@@ -3067,6 +3629,9 @@
         "partiallyFilled": "部分成交",
         "filled": "全部成交",
         "cancelled": "已撤单",
+        "handedOff": "已从券商的指令列表中移除，即已在券商处提交、删除或过期。券商不会告知是哪一种，可在账户订单中查看已提交的内容。",
+        "handedOffStaged": "已从 {{vendor}} 的指令列表中移除，即已在 {{vendor}} 提交、删除或过期。{{vendor}} 不会告知是哪一种，可在账户订单中查看已提交的内容。",
+        "handedOffStagedUnnamed": "已从券商的指令列表中移除，即已在券商处提交、删除或过期。券商不会告知是哪一种，可在账户订单中查看已提交的内容。",
         "rejectedByVendor": "券商拒绝了这笔订单",
         "failed": "未送达券商即失败",
         "unknown": "结果未知"
@@ -3084,6 +3649,7 @@
         "partiallyFilled": "部分成交",
         "filled": "已成交",
         "cancelled": "已撤单",
+        "handedOff": "已移交",
         "rejectedByVendor": "券商拒绝",
         "failed": "失败",
         "unknown": "未知"
@@ -3115,6 +3681,11 @@
       "orderReceipt": {
         "viewInOrders": "在订单页查看",
         "openAt": "在 {{vendor}} 中打开"
+      },
+      "orderTerm": {
+        "limit": "限价",
+        "avgFill": "成交均价",
+        "stop": "止损价"
       }
     },
     "messageDelivery": {
@@ -3135,61 +3706,140 @@
       "message": "消息",
       "files": "附件",
       "sentEarlier": "此前已发送"
+    },
+    "termHead": {
+      "sym": "代码",
+      "name": "名称",
+      "last": "最新",
+      "change": "涨跌",
+      "mktCap": "市值",
+      "dayRange": "日内区间",
+      "extended": "盘前盘后",
+      "filed": "提交日期",
+      "items": "事项",
+      "press": "新闻稿",
+      "asOf": "时间",
+      "filing": "报告",
+      "strike": "行权价",
+      "exp": "到期",
+      "type": "类型",
+      "vol": "成交量"
+    },
+    "annualReport": "年度报告",
+    "quarterlyReport": "季度报告",
+    "filedOn": "提交于 {{date}}",
+    "source": "来源",
+    "edgarLink": "EDGAR ↗",
+    "filingCount": "{{count}} 份",
+    "nDays": "{{count}} 天",
+    "pressReleaseShort": "有",
+    "nMoreResults": "还有 {{count}} 个结果",
+    "nTotalItems": "共 {{count}} 个",
+    "automationStatus": {
+      "active": "已启用",
+      "paused": "已暂停",
+      "failed": "失败",
+      "completed": "已完成",
+      "disabled": "已停用",
+      "created": "已创建",
+      "executing": "运行中"
+    },
+    "termRange": {
+      "day": "日内",
+      "week52": "52 周"
+    },
+    "quote": "报价",
+    "optionsChain": "期权链",
+    "options": "期权",
+    "optionType": {
+      "call": "看涨",
+      "put": "看跌"
+    },
+    "optionTypes": {
+      "call": "看涨期权",
+      "put": "看跌期权"
+    },
+    "expiresOn": "{{date}} 到期",
+    "expiration": "到期日",
+    "contract": "合约",
+    "change": "涨跌额",
+    "nMoreContracts": "还有 {{count}} 张",
+    "noOptionsData": "暂无期权数据",
+    "topGainers": "涨幅榜",
+    "topLosers": "跌幅榜",
+    "marketMovers": "市场异动",
+    "noMoversData": "暂无异动数据",
+    "optionsOfType": {
+      "call": "看涨期权",
+      "put": "看跌期权"
     }
   },
   "setup": {
     "capabilities": "能力",
     "importParentModels": "同时添加这些模型",
-    "importParentModelsDesc": "来自父级目录的模型，通过您的端点和密钥路由。取消勾选不需要的模型。",
+    "importParentModelsDesc": "来自父级目录的模型，通过你的端点和密钥路由。取消勾选不需要的模型。",
     "selectNone": "全不选",
     "fetchingModels": "正在获取模型…",
-    "selectModelsDesc": "选择您服务器上可用的模型。",
+    "selectModelsDesc": "选择你服务器上可用的模型。",
     "availableModels": "可用模型",
-    "noModelsFound": "未找到模型。请确认您的服务器正在运行且已加载模型。",
-    "brandedHeader": "配置您的 LLM 提供商",
-    "securityNote": "您的 API 密钥已加密且不会被共享",
-    "methodTitle": "您想如何连接？",
-    "methodSubtitle": "选择访问 AI 模型的方式。您可以稍后添加更多提供商。",
-    "methodOAuth": "使用您的 Claude / GPT 订阅",
-    "methodOAuthDesc": "通过 OAuth 连接，无需 API 密钥。",
+    "noModelsFound": "未找到模型。请确认你的服务器正在运行且已加载模型。",
+    "brandedHeader": "配置你的 LLM 提供商",
+    "securityNote": "你的 API 密钥已加密且不会被共享",
+    "methodTitle": "你想如何连接？",
+    "methodSubtitle": "选择访问 AI 模型的方式。你可以稍后添加更多提供商。",
+    "methodOAuth": "使用你的 Claude 或 ChatGPT 订阅",
+    "methodOAuthDesc": "登录你的账户即可，无需 API 密钥。",
     "methodCodingPlan": "我有编程计划",
     "methodCodingPlanDesc": "智谱 AI、MiniMax、通义千问、Moonshot 等。",
     "methodApiKey": "我有 API 密钥",
     "methodApiKeyDesc": "按使用量付费。",
     "methodLocal": "我在本地运行模型",
     "methodLocalDesc": "Ollama、LM Studio、vLLM 或其他本地推理服务器。",
-    "providerTitle": "选择您的提供商",
+    "providerTitle": "选择你的提供商",
     "connectTitle": "连接 {{provider}}",
     "connectWith": "连接 {{provider}}",
     "modelsTitle": "选择快速访问模型",
     "addAnotherProvider": "添加另一个提供商？",
-    "addAnotherDescription": "您可以连接多个提供商以获取更多模型选择。",
+    "addAnotherDescription": "你可以连接多个提供商以获取更多模型选择。",
     "continueToDefaults": "继续设置默认值",
-    "defaultsTitle": "设置您的默认模型",
-    "defaultsSubtitle": "选择驱动您研究的模型",
+    "defaultsTitle": "设置你的默认模型",
+    "defaultsSubtitle": "选择驱动你研究的模型",
     "doneTitle": "准备就绪！",
-    "doneSummary": "您的 AI 研究助手已配置完成，随时可用。",
+    "doneSummary": "你的 AI 研究助手已配置完成，随时可用。",
     "goToDashboard": "前往控制台",
-    "personalizeLink": "设置投资偏好",
+    "personalizeLink": "设置投资画像",
     "invitationCodeLink": "有邀请码？",
-    "invitationCodePlaceholder": "输入您的邀请码",
+    "invitationCodePlaceholder": "输入你的邀请码",
     "testButton": "测试",
     "testing": "测试中...",
     "testSuccess": "密钥有效！",
     "next": "下一步",
-    "back": "返回",
+    "back": "上一步",
     "saving": "保存中...",
     "continue": "继续",
-    "pasteKeyPlaceholder": "在此粘贴您的 API 密钥",
+    "pasteKeyPlaceholder": "在此粘贴你的 API 密钥",
     "baseUrlPlaceholder": "Base URL（可选）",
     "stepMethod": "方式",
     "stepProvider": "提供商",
     "stepModels": "模型",
     "stepReady": "完成",
+    "progressLabel": "设置进度",
     "exitSetup": "退出设置",
     "providersConnected": "已连接 {{count}} 个提供商",
     "providersConnected_one": "已连接 {{count}} 个提供商",
     "nextStep": "下一步",
+    "skipToModels": "直接选择模型",
+    "showKey": "显示 API 密钥",
+    "hideKey": "隐藏 API 密钥",
+    "keyAccepted": "密钥有效",
+    "modelsFound_other": "找到 {{count}} 个模型",
+    "testUnavailable": "此提供商不支持测试",
+    "testFailed": "测试请求失败",
+    "modalityText": "文本",
+    "modalityImage": "图片",
+    "modalityPdf": "PDF",
+    "errorAuthFailed": "授权失败，请重试。",
+    "errorFetchModels": "无法从提供商获取模型",
     "oauthBadge": "OAuth",
     "apiKeyBadge": "API 密钥",
     "codingPlanBadge": "Coding 计划",
@@ -3198,7 +3848,7 @@
     "removeProvider": "移除",
     "addAnotherProviderHeading": "添加其他提供商",
     "addMoreProviders": "连接其他提供商以获取更多模型选择。",
-    "invitationRedeemed": "邀请码已兑换。您可以配置模型或添加提供商。",
+    "invitationRedeemed": "邀请码已兑换。你可以配置模型或添加提供商。",
     "invitationCodeLabel": "邀请码",
     "redeeming": "兑换中...",
     "redeem": "兑换",
@@ -3206,12 +3856,12 @@
     "invitationErrorEmpty": "请输入邀请码。",
     "invitationErrorInvalid": "邀请码无效。",
     "invitationErrorExpired": "此邀请码已过期或已被完全使用。",
-    "invitationErrorRedeemed": "您已兑换过此邀请码。",
+    "invitationErrorRedeemed": "你已兑换过此邀请码。",
     "invitationErrorGeneric": "出了点问题，请重试。",
     "providerSubtitleOAuth": "选择要连接的订阅。",
-    "providerSubtitleCodingPlan": "选择您的编程计划提供商。",
-    "providerSubtitleApiKey": "选择您拥有 API 密钥的提供商。",
-    "providerSubtitleLocal": "选择您的本地推理服务器。",
+    "providerSubtitleCodingPlan": "选择你的编程计划提供商。",
+    "providerSubtitleApiKey": "选择你拥有 API 密钥的提供商。",
+    "providerSubtitleLocal": "选择你的本地推理服务器。",
     "noProviders": "此方式暂无可用提供商。",
     "localModels": "本地模型",
     "customProvider": "自定义提供商",
@@ -3225,13 +3875,13 @@
     "apiFormatGeneric": "{{sdk}} API",
     "apiFormatDefault": "API",
     "securityPrivacy": "安全与隐私",
-    "tokensEncrypted": "您的令牌已加密存储。我们仅在代您调用 API 时使用它们。",
-    "usageCountsClaude": "使用量将计入您的 Anthropic 订阅。您可以随时断开连接。",
-    "usageCountsOpenai": "使用量将计入您的 OpenAI 订阅。您可以随时断开连接。",
+    "tokensEncrypted": "你的令牌已加密存储。我们仅在代你调用 API 时使用它们。",
+    "usageCountsClaude": "使用量将计入你的 Anthropic 订阅。你可以随时断开连接。",
+    "usageCountsOpenai": "使用量将计入你的 OpenAI 订阅。你可以随时断开连接。",
     "copied": "已复制",
     "copy": "复制",
     "addModelTo": "为 {{provider}} 添加模型",
-    "addModelToDesc": "为您现有的自定义提供商添加模型。",
+    "addModelToDesc": "为你现有的自定义提供商添加模型。",
     "modelLabel": "模型",
     "modelDisplayNamePlaceholder": "显示名称（如 Llama 3.3 70B）",
     "modelIdPlaceholder": "模型 ID（如 meta-llama/Llama-3.3-70B）",
@@ -3244,8 +3894,8 @@
     "baseUrlLabel": "Base URL",
     "apiKeyLabel": "API 密钥",
     "customBaseUrlPlaceholder": "https://your-endpoint.com/v1",
-    "oauthCodexDesc": "使用设备码授权您的 ChatGPT 账户。",
-    "oauthClaudeDesc": "通过 OAuth 连接您的 Claude 订阅。",
+    "oauthCodexDesc": "使用设备码授权你的 ChatGPT 账户。",
+    "oauthClaudeDesc": "通过 OAuth 连接你的 Claude 订阅。",
     "oauthAntigravityDesc": "连接你的 Google Antigravity 订阅（Google One AI / Antigravity 套餐），使用其中的 Gemini、Claude 和 GPT-OSS 模型。",
     "antigravityStep1Title": "打开 Google 登录页",
     "antigravityStep1Desc": "点击下方按钮，会在新标签页打开 accounts.google.com。",
@@ -3274,7 +3924,7 @@
     "codexStep1Title": "打开 OpenAI 验证页面",
     "codexStep1Desc": "将打开新标签页跳转到 OpenAI 的设备授权页面。",
     "codexStep2Title": "输入设备码",
-    "codexStep2Desc": "我们会为您生成一个代码。复制并粘贴到 OpenAI 页面上，然后批准访问。",
+    "codexStep2Desc": "我们会为你生成一个代码。复制并粘贴到 OpenAI 页面上，然后批准访问。",
     "codexStep3Title": "返回此处",
     "codexStep3Desc": "授权通过后，我们会自动检测并完成连接。",
     "claudeStep1Title": "在 claude.ai 上授权",
@@ -3292,14 +3942,14 @@
     "waitingApproval": "等待 OpenAI 授权中...",
     "openVerificationAgain": "重新打开验证页面",
     "pasteAuthCode": "粘贴来自 claude.ai 的授权码",
-    "pasteAuthCodeHint": "授权后，您将在 Claude 页面看到一串代码。复制并粘贴到下方。",
+    "pasteAuthCodeHint": "授权后，你将在 Claude 页面看到一串代码。复制并粘贴到下方。",
     "pasteCodePlaceholder": "在此粘贴代码（如 abc123#state456）",
     "submitting": "提交中...",
     "submit": "提交",
     "openClaudeAgain": "重新打开 claude.ai",
-    "localServerDesc": "配置您的本地服务器 URL。API 密钥为可选项。",
-    "codingPlanDesc": "输入您的编程计划订阅的 API 密钥。",
-    "apiKeyInputDesc": "输入您的 API 密钥。您可以在提供商的控制台中找到。",
+    "localServerDesc": "配置你的本地服务器 URL。API 密钥为可选项。",
+    "codingPlanDesc": "输入你的编程计划订阅的 API 密钥。",
+    "apiKeyInputDesc": "输入你的 API 密钥。你可以在提供商的控制台中找到。",
     "regionLabel": "区域",
     "regionChina": "中国",
     "regionSingapore": "新加坡",
@@ -3323,7 +3973,7 @@
     "updateApiKey": "更新 API 密钥",
     "chooseModels": "选择要加入 {{provider}} 已配置模型列表的模型。",
     "chooseModelsGeneric": "选择要加入已配置模型列表的模型。",
-    "modelAccessReminder": "请确保您的 API 密钥或计划可以访问您选择的模型。不支持的模型将在运行时失败。",
+    "modelAccessReminder": "请确保你的 API 密钥或计划可以访问你选择的模型。不支持的模型将在运行时失败。",
     "deselectAll": "取消全选",
     "selectAll": "全选",
     "addModel": "添加模型",
@@ -3343,7 +3993,7 @@
     "removeModel": "移除 {{model}}",
     "addAnother": "+ 添加",
     "errorSaveModels": "保存模型选择失败。",
-    "chooseYourModels": "选择您的模型",
+    "chooseYourModels": "选择你的模型",
     "errorSavePrefs": "保存模型偏好失败。",
     "providerLabel": "提供商",
     "notSet": "未设置",
@@ -3545,88 +4195,46 @@
     "next": "继续",
     "done": "开始探索",
     "step": "第 {{n}} 步",
-    "intros": {
-      "chat": {
-        "steps": {
-          "workspace": {
-            "title": "认识工作区"
-          }
-        }
-      },
-      "thread": {
-        "steps": {
-          "filePanel": {
-            "title": "文件统一保存在文件面板",
-            "body": "Word 文档、Excel 模型、PDF、图表等 Agent 生成的文件都会保存在工作区中。点击顶部的文件夹图标，即可浏览、预览和下载。"
-          },
-          "memory": {
-            "title": "Agent 会记住你的偏好",
-            "body": "Agent 具备跨对话的长期记忆，可以保存你的偏好、惯例和值得复用的结论。对它说“记住这个”，相关内容便会长期保留。"
-          },
-          "memo": {
-            "title": "上传备忘录，补充分析资料",
-            "body": "可以将 PDF、笔记或表格上传为备忘录。Agent 会在需要时读取，把你的私有资料纳入分析上下文。"
-          }
-        }
-      },
-      "dashboard": {
-        "steps": {
-          "overview": {
-            "title": "行情总览",
-            "body": "自选股、投资组合、新闻与实时图表集中呈现，打开页面即可掌握市场概况。"
-          },
-          "customize": {
-            "title": "自定义布局",
-            "body": "切换到自定义模式后，可以添加、删除、调整和排列小组件，搭建符合自己需求的监控面板。"
-          },
-          "attach": {
-            "title": "将组件内容附加到对话",
-            "body": "看到值得深入分析的内容时，点击该行的回形针图标，即可将其作为上下文附加到对话，Agent 会基于这一内容继续分析。"
-          }
-        }
-      }
-    },
     "gettingStarted": {
       "title": "快速上手",
       "dismiss": "隐藏引导",
+      "progress": "已完成 {{done}}/{{total}}",
       "tasks": {
         "dashboard": {
           "title": "探索仪表盘",
-          "desc": "自选股、组合、新闻与实时组件一站集齐。"
+          "desc": "自选股、组合与新闻，在一个页面实时更新。"
         },
         "market": {
           "title": "查看实时行情",
-          "desc": "实时数据流驱动的行情图表。"
+          "desc": "任意标的的实时行情图表。"
         },
-        "stocks": {
-          "title": "告诉 Agent 你的自选股与持仓",
-          "desc": "与 Agent 简单聊聊你关注和持有的股票。"
-        },
-        "preferences": {
-          "title": "设置投资偏好",
-          "desc": "设定风险承受度、投资风格与回答方式。"
+        "profile": {
+          "title": "设置投资画像",
+          "desc": "风险、市场、风格，以及 Agent 怎么配合你。"
         },
         "createWorkspace": {
-          "title": "创建第一个工作区"
+          "title": "创建工作区"
         },
         "firstChat": {
           "title": "开始第一次分析",
-          "desc": "打开对话，询问任意股票、行业或财报。"
+          "desc": "询问任意股票、行业或财报。"
         },
         "models": {
-          "title": "查看模型配置",
-          "desc": "在设置的模型页选择默认模型并连接服务商。"
+          "title": "选择模型",
+          "desc": "设置默认模型，连接模型服务商。"
+        },
+        "desktopApp": {
+          "title": "下载桌面应用",
+          "desc": "在独立窗口中使用 LangAlpha；在 Mac 上还能把这台 Mac 用作计算机。"
+        },
+        "remoteControl": {
+          "title": "开启远程控制",
+          "desc": "让 Agent 在这台 Mac 上工作，关闭 LangAlpha 后仍可继续。"
         },
         "integrations": {
-          "title": "在其他平台使用 {{brand}}",
-          "desc": "通过平台集成，在 Slack、邮件等平台使用 {{brand}}。"
+          "title": "连接聊天应用",
+          "desc": "在 Slack、飞书、Telegram 等应用里和 {{brand}} 对话。"
         }
-      },
-      "interview": {
-        "title": "聊几句，让 Agent 更懂你",
-        "body": "即将打开一段对话，Agent 会简单了解你的持仓、自选股、风险承受度与投资偏好，让之后的回答更贴合你的情况。这些信息可在设置中修改，也可以直接让它更新。",
-        "cancel": "暂不",
-        "confirm": "开始对话"
       }
     },
     "announce": {
@@ -3648,20 +4256,283 @@
       "reset": "重置新手引导",
       "resetDone": "新手引导已重置，提示与指南将重新开始。"
     },
-    "connect": {
-      "title": "连接你的券商账户",
-      "description": "Chief of Staff Agent 会从中读取你的持仓和自选股，再问你几个关于所关注市场的问题。",
-      "continue": "继续",
-      "turnOn": "开启",
-      "skip": "不连接券商，直接继续",
-      "footnote": "下一步由你决定它可以对你的账户做什么。",
-      "waiting": "正在加载 {{brokerage}}…",
-      "failed": "无法连接 {{brokerage}}。请重试，或不连接直接继续。"
-    },
     "kickoff": {
-      "connected": "我已连接 {{brokerage}}，帮我设置个人资料吧。",
-      "noBrokerage": "帮我设置个人资料吧。",
-      "modifyPreferences": "我想查看并更新我的偏好设置。"
+      "threadTitle": "开始使用",
+      "noBrokerage": "我们来设置我的投资画像。",
+      "modifyPreferences": "我想回顾并更新我的偏好设置。"
+    },
+    "welcome": {
+      "progressLabel": "进度",
+      "skip": "跳过",
+      "cancel": "取消",
+      "continue": "继续",
+      "save": "保存",
+      "optional": "可选",
+      "saveFailed": "投资画像保存失败，请重试。",
+      "loadFailed": "投资画像加载失败。",
+      "entry": "设置投资画像",
+      "edit": "编辑投资画像",
+      "chat": {
+        "greeting": "你好，{{name}}。",
+        "greetingNoName": "你好。",
+        "intro": "我是你在 LangAlpha 的研究总监，帮你协调 AI 分析师、管理各个工作区。",
+        "introNext": "先问你几个问题，了解一下你的投资组合和投资习惯。",
+        "editIntro": "这是你的投资画像。修改任意一项后保存即可。",
+        "lead": {
+          "brokerage": "连接券商账户后，我就能结合你的实际持仓做研究。也可以先跳过，以后再连。",
+          "elsewhere": "你的账户开在哪些券商？选好后，再挑一种方式添加持仓。",
+          "experience": "下面哪一项最符合你的情况？这样我讲解时能把握好深浅。",
+          "risk": "你能接受多大的风险？我会按你的风险偏好，权衡潜在收益和亏损。",
+          "markets": "你主要投资哪些市场？研究时我会重点关注。",
+          "style": "你做投资决策时主要看什么？我会优先给你这类分析。",
+          "agent": "最后，你希望我通常怎么回答问题？是快速作答、看问题决定研究深度，还是每次都先充分研究？"
+        },
+        "composer": {
+          "waiting": "设置完成后，你就可以给我发消息了",
+          "start": "想先问什么，或有什么背景要补充，可以写在这里（选填）"
+        },
+        "edit": "修改回答",
+        "summary": {
+          "connected": "已连接 {{brokerage}}",
+          "screenshots_one": "{{count}} 张截图",
+          "screenshots_other": "{{count}} 张截图",
+          "search": "搜索添加持仓",
+          "skipped": "已跳过"
+        }
+      },
+      "banner": {
+        "title": "设置投资画像",
+        "desc": "回答几个问题，让 Agent 更了解你的投资习惯，提供更适合你的研究。",
+        "start": "去设置",
+        "resume": "继续设置"
+      },
+      "brokerage": {
+        "none": "暂时没有可连接的券商。",
+        "failed": "连接 {{brokerage}} 失败。请重试，或先跳过这一步。",
+        "desktopOnly": "{{brokerages}} 只能在桌面应用中连接。<download>下载桌面应用</download>",
+        "desktopOutdated": "更新桌面应用后才能连接券商。<download>下载最新版本</download>",
+        "permissionHelper": "选择 Agent 如何处理已连接的券商账户中的订单，之后也可以在设置中修改。",
+        "elsewhereTitle": "找不到你的券商？",
+        "elsewhereBody": "也可以用截图或搜索添加持仓。",
+        "elsewhereAction": "不连接，继续"
+      },
+      "elsewhere": {
+        "brokerages": {
+          "fidelity": "富达",
+          "schwab": "嘉信理财",
+          "vanguard": "先锋领航",
+          "etrade": "E*TRADE",
+          "robinhood": "Robinhood",
+          "ibkr": "盈透证券",
+          "webull": "微牛",
+          "moomoo": "moomoo",
+          "futu": "富途牛牛",
+          "tiger": "老虎证券",
+          "longbridge": "长桥证券",
+          "tastytrade": "tastytrade",
+          "other": "其他",
+          "none": "还没有账户"
+        },
+        "otherLabel": "券商名称",
+        "otherPlaceholder": "券商名称",
+        "connectable": "连接 {{brokerages}} 后，Agent 可以直接读取你的持仓。<connect>去连接</connect>",
+        "holdingsTitle": "添加持仓",
+        "methods": {
+          "screenshot": {
+            "title": "上传截图",
+            "desc": "截取券商 App 中的持仓和自选页面。Agent 会先和你确认要添加的内容。"
+          },
+          "search": {
+            "title": "搜索添加",
+            "desc": "按名称或代码逐个添加。"
+          }
+        }
+      },
+      "experience": {
+        "types": {
+          "individual": {
+            "title": "个人投资者",
+            "desc": "用自己的资金投资或交易。"
+          },
+          "professional": {
+            "title": "金融从业者",
+            "desc": "分析师、交易员、基金经理或投资顾问。"
+          },
+          "student": {
+            "title": "学生",
+            "desc": "正在学习市场知识。"
+          }
+        },
+        "yearsTitle": "你做投资或交易有多久了？",
+        "years": {
+          "under_1y": "不到 1 年",
+          "1_3y": "1–3 年",
+          "3_10y": "3–10 年",
+          "over_10y": "10 年以上"
+        },
+        "instrumentsTitle": "你对哪些投资品种感兴趣？"
+      },
+      "risk": {
+        "levels": {
+          "conservative": {
+            "title": "保守",
+            "desc": "优先保护本金，追求适度收益。"
+          },
+          "moderate": {
+            "title": "稳健",
+            "desc": "接受一定波动，追求资产长期增值。"
+          },
+          "growth": {
+            "title": "进取",
+            "desc": "承受较大波动，追求更高回报。"
+          },
+          "aggressive": {
+            "title": "激进",
+            "desc": "集中持仓，可接受大幅回撤。"
+          }
+        },
+        "horizonTitle": "你通常持仓多久？",
+        "horizons": {
+          "intraday": "日内",
+          "days": "几天到几周",
+          "months": "几个月",
+          "years": "数年"
+        }
+      },
+      "instruments": {
+        "stock": "股票",
+        "etf": "ETF",
+        "index": "指数",
+        "option": "期权",
+        "future": "期货",
+        "bond": "债券",
+        "fund": "基金",
+        "forex": "外汇",
+        "crypto": "加密货币",
+        "commodity": "大宗商品"
+      },
+      "markets": {
+        "names": {
+          "us": "美国",
+          "hk": "香港",
+          "cn": "A 股",
+          "jp": "日本",
+          "eu": "欧洲"
+        },
+        "helpTitle": "你希望我在哪些方面帮你？",
+        "help": {
+          "ideas": "发掘投资机会",
+          "research": "研究公司",
+          "portfolio": "跟踪我的持仓",
+          "news": "关注市场动态",
+          "trading": "制定交易计划",
+          "learning": "学习投资基础"
+        }
+      },
+      "style": {
+        "approaches": {
+          "fundamental": "基本面分析",
+          "macro": "宏观趋势",
+          "quantitative": "系统化策略与量化信号",
+          "technical": "技术分析",
+          "event_driven": "财报与事件"
+        },
+        "stylesTitle": "你偏向哪些投资风格？",
+        "styles": {
+          "growth": "成长",
+          "value": "价值",
+          "income": "股息收益",
+          "trading": "短线交易",
+          "index": "被动与指数投资"
+        },
+        "sectorsTitle": "你关注哪些行业？",
+        "sectors": {
+          "technology": "科技",
+          "semiconductors": "半导体",
+          "healthcare": "医疗健康",
+          "financials": "金融",
+          "energy": "能源",
+          "consumer": "消费",
+          "industrials": "工业",
+          "real_estate": "房地产",
+          "utilities": "公用事业",
+          "materials": "原材料"
+        }
+      },
+      "agent": {
+        "depth": {
+          "light": {
+            "title": "快速作答",
+            "desc": "快速查证后简要回答，只有在你要求时才深入研究。"
+          },
+          "adaptive": {
+            "title": "看问题而定",
+            "desc": "简单问题快速回答，需要深入时充分研究。"
+          },
+          "thorough": {
+            "title": "充分研究",
+            "desc": "每次回答前都核实数据和证据，耗时更长，消耗更多 credits。"
+          }
+        },
+        "deliverableTitle": "你通常希望回答以什么形式呈现？",
+        "deliverable": {
+          "text": {
+            "title": "文字回复",
+            "desc": "在对话中用文字回答，必要时配表格。"
+          },
+          "visual": {
+            "title": "图表和看板",
+            "desc": "在对话中通过交互式图表和看板探索数据。"
+          },
+          "report": {
+            "title": "完整报告",
+            "desc": "排版好的 HTML 报告，可分享或保存为 PDF，准备时间更长，消耗更多 credits。"
+          }
+        },
+        "proactivityTitle": "你希望我什么时候主动提供简报或提醒？",
+        "proactivity": {
+          "proactive": {
+            "title": "定期更新",
+            "desc": "不等你提问，主动提供简报、投资思路和持仓动态。"
+          },
+          "when_needed": {
+            "title": "重要变动时",
+            "desc": "只在需要你留意时提醒，比如持仓大幅波动。"
+          },
+          "on_request": {
+            "title": "仅在你要求时",
+            "desc": "不主动安排简报或提醒，你提出时再安排。"
+          }
+        }
+      },
+      "start": {
+        "submit": "开始",
+        "waiting": "正在加载 {{brokerage}}…",
+        "failed": "无法打开对话，请重试。"
+      },
+      "holdings": {
+        "ticker": "代码",
+        "quantity": "数量",
+        "remove": "移除 {{symbol}}",
+        "failed": "无法添加 {{symbol}}。",
+        "search": "按名称或代码搜索",
+        "noResults": "没有找到与“{{query}}”相关的结果",
+        "toHoldings": "加入持仓",
+        "toWatchlist": "加入自选",
+        "holdingsTitle": "持仓",
+        "watchlistTitle": "自选",
+        "watchlistRemove": "从自选中移除 {{symbol}}",
+        "watchlistFailed": "无法将 {{symbol}} 加入自选。"
+      },
+      "shots": {
+        "prompt": "添加持仓或自选列表的截图",
+        "hint": "拖入、粘贴或选择图片，最多 {{max}} 张",
+        "add": "添加截图",
+        "remove": "移除 {{name}}",
+        "tooMany": "最多只能添加 {{max}} 张截图，其余的已忽略。",
+        "notImage": "{{name}} 不是 PNG、JPEG、WebP 或 GIF 图片。",
+        "unreadable": "无法读取 {{name}}。"
+      }
     }
   },
   "mcp": {
@@ -4127,6 +4998,7 @@
       "open": "进行中",
       "filled": "已成交",
       "cancelled": "已撤单",
+      "handedOff": "已移交",
       "rejected": "已拒绝",
       "failed": "失败"
     }
@@ -4243,7 +5115,7 @@
         "neverAvailable": "始终不可用",
         "neverAvailableNote": "已刻意保留。无论授权什么都会被拒绝。"
       },
-      "exclusiveNote": "会断开你的 {{broker}} 账户已关联的其他 AI 应用",
+      "exclusiveNote": "会断开此账户已关联的其他 AI 应用",
       "exclusiveWarning": "该账户只允许连接一个 AI 平台，因此在此连接会取代当前已连接的那一个。",
       "grantedNone": "未授予任何操作",
       "intro": "连接之前不会向券商发送任何数据，每次连接前都会先询问 Agent 可以在其中做什么。",
@@ -5221,9 +6093,9 @@
       },
       "audience": {
         "analyst": "工作区分析师",
-        "chiefOfStaff": "Chief of Staff Agent（Home）",
+        "chiefOfStaff": "研究总监（Home）",
         "analystFact": "工作区分析师",
-        "chiefOfStaffFact": "CoS Agent"
+        "chiefOfStaffFact": "研究总监"
       },
       "source": {
         "custom": "你添加的",
@@ -5354,13 +6226,12 @@
     "common": "常用"
   },
   "agents": {
-    "allWorkspaces": "所有工作区",
-    "allWorkspacesHint": "Chief of Staff Agent 在这里回答，并把深度任务交给各工作区的分析师。",
+    "chiefOfStaffHint": "统筹所有工作区的分析师，把每项任务交给合适的那一位。",
     "home": "Home",
-    "chiefOfStaff": "CoS Agent",
+    "chiefOfStaff": "研究总监",
     "analyst": "分析师",
     "pickWhere": "选择 Agent 的工作范围",
-    "backToChiefOfStaff": "返回 CoS Agent",
+    "backToChiefOfStaff": "返回研究总监",
     "reportBackPending": "等待分析师汇报结果",
     "tray": {
       "waitingOn": "等待 {{name}}",
@@ -5371,10 +6242,10 @@
       "analystsHeading": "由此对话交办"
     },
     "inWorkspace": "在 {{workspace}} 中",
-    "workspaceRequired": "请选择一个工作区，或选择所有工作区。",
+    "workspaceRequired": "请选择研究总监或一个工作区。",
     "widgets": {
-      "allWorkspacesDesc": "随时提问，Chief of Staff Agent 会亲自处理或分派给分析师。",
-      "tagAllWorkspaces": "全部"
+      "chiefOfStaffDesc": "统筹所有工作区的分析师。在这里提问，它会把每项任务交给合适的分析师，并向你汇报。",
+      "tagChiefOfStaff": "Home"
     },
     "models": {
       "defaultModel": "默认模型",
@@ -5387,43 +6258,22 @@
       "fallbackModelsDesc": "当默认模型或后台模型不可用时，按顺序依次尝试。请只添加你有权访问的模型。未选择时不使用备用模型。",
       "chooseYourModelsDesc": "为对话选择一个模型，并为后台任务选择一个更经济的模型。之后可随时更改。",
       "explainerTitle": "两个模型",
-      "explainerDefaultBody": "运行所有对话：跨所有工作区的 Chief of Staff Agent，以及各工作区的分析师。",
+      "explainerDefaultBody": "运行所有对话：跨所有工作区的研究总监，以及各工作区的分析师。",
       "explainerBackgroundBody": "不运行任何对话，只处理对话周边的工作，因此更快、更便宜的模型通常就够用。",
       "defaultPlaceholder": "选择默认模型..."
     },
     "market": {
-      "missingThreadHint": "找不到对话？对话按工作区归属。请尝试所有工作区，或选择其他工作区。",
+      "missingThreadHint": "找不到对话？对话归属于研究总监或某个工作区。请试试研究总监，或选择其他工作区。",
       "workspaceDisabledReason": "在 /chat 中创建工作区后即可在其中工作",
-      "noWorkspaceToast": "请先创建工作区，或使用所有工作区。",
+      "noWorkspaceToast": "请先创建工作区，或直接问研究总监。",
       "setupFailed": "无法打开工作区，请重试。"
     },
     "tour": {
-      "modes": {
-        "title": "两种工作方式",
-        "body": "选择一个工作区，由该工作区的分析师在其中完成工作，使用该工作区的文件。选择所有工作区，则由 Chief of Staff Agent 接手：快速问题它亲自回答，深度任务交给合适的分析师。接下来分别介绍两者。"
-      },
-      "chiefOfStaff": {
-        "title": "所有工作区：你的 Chief of Staff Agent",
-        "body": "你只管提出需求。Chief of Staff Agent 会回答快速问题、创建和管理工作区、把深度任务交给各工作区的分析师并汇报结果，还会管理你的自动化。它的所有对话归入“所有工作区”卡片，它自己的文件存放在名为 Home 的文件夹中。"
-      },
-      "analyst": {
-        "title": "工作区：由分析师完成工作",
-        "body": "每个工作区都有一位专属分析师。同一工作区内的所有对话共享文件、数据与已有成果，分析可以持续积累。它能处理大规模数据，并行调度多个子 Agent，还能生成各类交付物：Excel 模型、Word 文档、PDF、仪表盘。"
-      },
-      "workspace": {
-        "body": "每一个工作区都是一个项目空间：围绕同一任务的对话都集中在这里，共享文件、数据和成果，与其他工作区相互独立。你的所有工作区和 Home 都位于同一台电脑上，你一开始输入它就会启动。"
-      },
-      "create": {
-        "title": "为正式任务创建专属工作区",
-        "body": "涉及数据处理或需要产出交付物的任务，建议为其创建工作区：点击“新建工作区”并按任务命名，或让 Chief of Staff Agent 替你创建。"
-      },
-      "createWorkspaceTask": "新建一个专属工作区，其分析师将在完整沙箱中执行正式分析任务。"
+      "createWorkspaceTask": "为一个项目单独开辟空间，配有专属分析师和文件。"
     },
     "intro": {
-      "chiefOfStaffRun": "CoS Agent",
       "handoff": "已交给分析师",
-      "taskHandoff": "任务已交给分析师",
-      "footer": "两种工作方式"
+      "taskHandoff": "任务已交给分析师"
     }
   },
   "dalton": {
@@ -5456,7 +6306,7 @@
       "unchangedCount": "{{count}} 个模型无变化",
       "inUseWarning": "注意：被移除或隐藏的模型当前正被角色配置使用",
       "editDefaultModel": "修改主模型",
-      "editSubagentModels": "修改子智能体模型",
+      "editSubagentModels": "修改子代理模型",
       "added": "新增模型",
       "removed": "移除 / 隐藏模型",
       "changed": "参数或价格变更",
@@ -5516,6 +6366,7 @@
     "publish": {
       "cardTitle": "正式研究报告发布审批（PM 终审）",
       "labelingIncompleteWarning": "标注未完成，口语数字和指标可能未核验",
+      "derivedMatchingIncompleteWarning": "派生匹配因超时未完成：部分本可由派生关系核实的数字仍显示为未核实",
       "failedBatchDetailItem": "第 {{batch}} 批（第 {{start}}–{{end}} 个数字）标注失败",
       "failedBatchColloquialItem": "第 {{batch}} 批（口语数字扫描）标注失败",
       "labelingCoverageLabel": "标注覆盖",
@@ -5559,14 +6410,32 @@
     },
     "sharing": {
       "title": "共享设置",
-      "cosLabel": "别人的 Chief of Staff",
+      "cosLabel": "别人的研究总监",
       "webLabel": "别人的网页界面",
       "levelRw": "可读写",
       "levelRo": "仅可读",
       "levelHidden": "不可见",
       "homeNote": "Home 工作区始终不对他人开放",
       "externalOwnerNote": "外部成员的工作区仅管理员可查看，不提供共享设置",
-      "nextPhaseNotice": "该功能下一期开放"
+      "nextPhaseNotice": "该功能下一期开放",
+      "cosUserToggleTitle": "其他人的研究总监",
+      "cosUserToggleLabel": "允许内部同事的研究总监访问我的工作区并派任务",
+      "cosUserToggleScopeHint": "作用于除 Home 外的全部工作区（内部成员默认开启；外部成员不可访问他人工作区，他人也不可向外部成员的工作区派任务或提问）。",
+      "cosUserToggleTrustNotice": "开启即代表信任内部同事在你的计算机上运行任务：\n• 整机读写：可读写你计算机上的所有工作区和 Home、个人记忆、个人资料与自动化。\n• 连接与外部影响：会使用你的数据连接、MCP 服务和密钥，数据会发送给同事所选的模型服务或外部端点，关联的外部账户可能被写入或产生费用。\n• 资源与配额：会消耗你的机器资源和第三方 API 配额（模型 Token 费用计入派发人每日预算）。\n• 对话可见与保留：同事发起的对话你可只读查看（有该工作区访问权限的成员亦可见）；若你删除工作区，派发人仍可只读查看其历史对话。\n• 撤销边界：关闭后新派发立即被拒，正在运行的任务会继续完成；撤销无法收回已读取的数据或清除已产生的影响。",
+      "cosManagedInSettingsHint": "其他人的研究总监访问权限已在「设置」中按账户统一管理。",
+      "webDescRw": "内部同事可在网页端浏览此工作区并新建对话提问",
+      "webRwWarningTitle": "同事在这里提问会在你的计算机上运行，等于信任这台计算机",
+      "webRwWarningBody": "开启网页读写后，内部同事在此发起的对话将在你的计算机上执行：\n• 整机与知识库读写：可读写这台计算机上的所有工作区和 Home、个人记忆与自动化，并写入本工作区的知识库（结论、议程、文件）。\n• 连接与外部影响：会使用你的数据连接和密钥，数据会发送给提问人所选的模型服务，关联的外部账户可能被写入或产生费用。\n• 资源与配额：会消耗你的机器资源和第三方 API 配额（模型费用计入提问人每日预算）。\n• 对话可见与保留：提问对话你与有工作区访问权限的成员可只读查看；若你删除工作区，提问人仍可只读查看其历史对话。\n• 撤销边界：改回只读或不可见后新提问立即被拒，正在运行的任务会继续完成；撤销无法收回已读取的数据或清除已产生的影响。",
+      "dispatchedByBadge": "由 {{name}} 派发",
+      "dispatchedThreadReadonlyHint": "由 {{name}} 派发 · 仅创建者可继续提问",
+      "revokedThreadReadonlyHint": "工作区所有者已收回写入权限 · 当前仅可只读查看历史对话"
+    },
+    "autoIngest": {
+      "on": "自动入库：开启",
+      "off": "自动入库：关闭",
+      "enabledHint": "开启后，工作区收到的资料按“谁在说”自动分流写入 sales notes 或 company-wiki，只回一条回执；疑似重复或分类拿不准时仍会询问。",
+      "disabledHint": "关闭时保持两步确认：先预览，用户同意后写入。",
+      "error": "切换失败，请重试"
     }
   }
 }

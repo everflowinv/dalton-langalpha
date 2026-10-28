@@ -40,7 +40,7 @@ def _layout(name: str):
 class _Manager(SessionCacheMixin, BringUpMixin):
     def __init__(self) -> None:
         self._machines = {}
-        self._projects_attached: set[tuple[str, str | None]] = set()
+        self._projects_attached: dict[tuple[str, str | None], str | None] = {}
 
 
 @pytest.fixture
@@ -74,6 +74,14 @@ def steps():
     live: dict[str, ThreadPrefixes] = {}
     #: What a delete or archive during a workspace's pass leaves its threads at.
     moved: dict[str, ThreadPrefixes] = {}
+    # DALTON-HOOK(bringup-owner-check): the placement each step's owner check
+    # reads; a workspace here but for another computer, or absent (deleted),
+    # has its step dropped before any restore, prune or sync.
+    placements: dict[str, dict | None] = {}
+
+    async def placement_of(workspace_id):
+        default = {"workspace_id": workspace_id, "computer_id": "computer-1"}
+        return placements.get(workspace_id, default)
 
     def kept_of(workspace_id):
         default = frozenset({f"live-{workspace_id}"})
@@ -107,6 +115,7 @@ def steps():
             live[workspace_id] = moved.pop(workspace_id)
         if workspace_id in short:
             return {"restored": 0, "errors": 1, "skipped": 0, "done": False}
+        getattr(sandbox, "marked", set()).add(layout.join(_bringup.DEFERRED_MARKER))
         return {"restored": 0, "errors": 0, "skipped": 0, "done": True}
 
     async def sync(workspace_id):
@@ -121,6 +130,7 @@ def steps():
         patch.object(_bringup, "held_workspace_layout", held),
         patch.object(_bringup, "_inventory", inventory_of),
         patch.object(_bringup, "_thread_prefixes", live_threads),
+        patch.object(_bringup, "get_workspace_placement", placement_of),  # DALTON-HOOK(bringup-owner-check)
         patch.object(_bringup.cache, "client", lambda: None),
         patch.object(_bringup, "_BUSY_PAUSE_S", 0.0),
         patch.object(_bringup._thread_dirs, "prune_dead_thread_dirs", prune),
@@ -133,6 +143,7 @@ def steps():
             folders=folders,
             live=live,
             moved=moved,
+            placements=placements,
             short=short,
             unpruned=unpruned,
             unsynced=unsynced,
@@ -160,11 +171,28 @@ class _Redis:
 
 @pytest.fixture
 def sandbox():
-    return SimpleNamespace(runtime=object(), sandbox_id="sandbox-1", working_dir=ROOT)
+    """``marked`` holds the deferred markers a finished pass wrote."""
+    marked: set[str] = set()
+
+    async def adownload_file_bytes(path):
+        return b"done" if path in marked else None
+
+    return SimpleNamespace(
+        runtime=object(),
+        sandbox_id="sandbox-1",
+        working_dir=ROOT,
+        marked=marked,
+        adownload_file_bytes=adownload_file_bytes,
+    )
 
 
 def _schedule(manager, sandbox, workspace_id: str, *, urgent: bool) -> None:
     manager._queue_bring_up("computer-1", workspace_id, sandbox, ROOT, urgent=urgent)
+
+
+def _holding(manager, sandbox) -> None:
+    """This worker's session on the computer is on ``sandbox``."""
+    manager._machine("computer-1").session = SimpleNamespace(sandbox=sandbox)
 
 
 async def _drain(manager) -> None:
@@ -300,7 +328,7 @@ async def test_a_dropped_session_takes_its_queued_work_with_it(
     """What was still queued loses its attach key, so the next acquisition on
     that sandbox queues it again."""
     machine = manager._machine("computer-1")
-    manager._projects_attached |= {("A", "sandbox-1"), ("B", "sandbox-1")}
+    manager._projects_attached |= dict.fromkeys([("A", "sandbox-1"), ("B", "sandbox-1")])
     for workspace_id in "AB":
         _schedule(manager, sandbox, workspace_id, urgent=False)
     job = machine.bring_up
@@ -344,20 +372,76 @@ async def test_a_resumed_sandbox_queues_every_workspace_for_its_sync(
     """A stop leaves each workspace attached to the same sandbox, so no later
     open looks again; the resume queues them itself, and a workspace whose
     folder is mid-move does not keep the others from theirs."""
-    from src.server.services.computer_manager import _machines
-    from src.server.services.computer_manager._machines import MachineLifecycleMixin
-
     steps.folders["B"] = None
+    _holding(manager, sandbox)
     with patch.object(
-        _machines,
+        _bringup,
         "get_live_workspace_ids_for_computer",
         AsyncMock(return_value=["A", "B", "C"]),
     ):
-        await MachineLifecycleMixin._queue_reconnect_syncs(
-            manager, "computer-1", sandbox
-        )
+        await BringUpMixin._queue_reconnect_syncs(manager, "computer-1", sandbox)
     await _drain(manager)
     assert _steps(steps.order) == ["restore:A", "restore:C", "sync:A", "sync:C"]
+
+
+async def test_a_restart_leaves_out_the_workspace_it_opened(steps, manager, sandbox):
+    """That workspace's own start queued it, urgent; queued again after its
+    pass ends, it would run the whole pass a second time."""
+    _holding(manager, sandbox)
+    with patch.object(
+        _bringup,
+        "get_live_workspace_ids_for_computer",
+        AsyncMock(return_value=["A", "B"]),
+    ):
+        await BringUpMixin._queue_reconnect_syncs(
+            manager, "computer-1", sandbox, opened="A"
+        )
+    await _drain(manager)
+    assert _steps(steps.order) == ["restore:B", "sync:B"]
+
+
+async def test_a_listing_that_fails_lets_each_workspace_attach_again_here(
+    manager, sandbox
+):
+    """The start is up by the time it lists, so the failure does not reach
+    it. A workspace this worker still holds attached to the sandbox would
+    skip its next attach, and with it the bring-up nothing else queues."""
+    manager._projects_attached = {
+        ("A", "sandbox-1"): "epoch",
+        ("B", "sandbox-1"): "epoch",
+        ("C", "sandbox-2"): "epoch",
+    }
+    with patch.object(
+        _bringup,
+        "get_live_workspace_ids_for_computer",
+        AsyncMock(side_effect=RuntimeError("pool closed")),
+    ):
+        await BringUpMixin._queue_reconnect_syncs(
+            manager, "computer-1", sandbox, opened="A"
+        )
+    assert manager._machine("computer-1").bring_up is None
+    assert manager._projects_attached == {
+        ("A", "sandbox-1"): "epoch",
+        ("C", "sandbox-2"): "epoch",
+    }
+
+
+async def test_a_sandbox_replaced_during_the_listing_gets_nothing_queued(
+    steps, manager, sandbox
+):
+    """Queued on the old sandbox, the listed workspaces would cancel the
+    replacement's own bring-up and run against a sandbox that is gone."""
+    replacement = SimpleNamespace(runtime=object(), sandbox_id="sandbox-2")
+    _schedule(manager, replacement, "C", urgent=False)
+    _holding(manager, replacement)
+    with patch.object(
+        _bringup,
+        "get_live_workspace_ids_for_computer",
+        AsyncMock(return_value=["A", "B"]),
+    ):
+        await BringUpMixin._queue_reconnect_syncs(manager, "computer-1", sandbox)
+    await _drain(manager)
+    assert _steps(steps.order) == ["restore:C", "sync:C"]
 
 
 async def test_each_restore_reads_the_folder_where_it_is_when_it_runs(
@@ -375,13 +459,13 @@ async def test_each_restore_reads_the_folder_where_it_is_when_it_runs(
 async def test_a_workspace_mid_move_is_left_to_its_next_acquisition(
     steps, manager, sandbox
 ):
-    manager._projects_attached |= {("A", "sandbox-1"), ("B", "sandbox-1")}
+    manager._projects_attached |= dict.fromkeys([("A", "sandbox-1"), ("B", "sandbox-1")])
     steps.folders["A"] = None
     _schedule(manager, sandbox, "A", urgent=True)
     _schedule(manager, sandbox, "B", urgent=False)
     await _drain(manager)
     assert _steps(steps.order) == ["restore:B", "sync:B"]
-    assert manager._projects_attached == {("B", "sandbox-1")}
+    assert manager._projects_attached.keys() == {("B", "sandbox-1")}
 
 
 async def test_a_busy_restore_pauses_without_holding_up_the_others(
@@ -415,7 +499,8 @@ async def test_a_finished_pass_is_skipped_until_its_threads_or_sandbox_change(
 ):
     """Only a thread's delete or archive leaves a dir to prune, and the marker
     ends the restore, so a reconnect or a second worker finding the same
-    sandbox and threads skips the probe and the restore; the sync still runs."""
+    sandbox and threads skips the probe and the restore; the sync still runs.
+    A folder laid again on the same machine lost the marker, and is not."""
     redis = _Redis()
     with patch.object(_bringup.cache, "client", lambda: redis):
         _schedule(manager, sandbox, "A", urgent=False)
@@ -426,21 +511,26 @@ async def test_a_finished_pass_is_skipped_until_its_threads_or_sandbox_change(
         await _drain(manager)
         assert steps.order[3:] == ["sync:A"]
 
-        # Archived: the thread stays, its scratchpad has to go.
-        steps.live["A"] = ThreadPrefixes(all=frozenset({"live-A"}), open=frozenset())
+        sandbox.marked.clear()
         _schedule(manager, sandbox, "A", urgent=False)
         await _drain(manager)
         assert steps.order[4:] == ["inventory:A", "restore:A", "sync:A"]
 
-        steps.live["A"] = ThreadPrefixes(all=frozenset(), open=frozenset())
+        # Archived: the thread stays, its scratchpad has to go.
+        steps.live["A"] = ThreadPrefixes(all=frozenset({"live-A"}), open=frozenset())
         _schedule(manager, sandbox, "A", urgent=False)
         await _drain(manager)
         assert steps.order[7:] == ["inventory:A", "restore:A", "sync:A"]
 
+        steps.live["A"] = ThreadPrefixes(all=frozenset(), open=frozenset())
+        _schedule(manager, sandbox, "A", urgent=False)
+        await _drain(manager)
+        assert steps.order[10:] == ["inventory:A", "restore:A", "sync:A"]
+
         replacement = SimpleNamespace(runtime=object(), sandbox_id="sandbox-2")
         _schedule(manager, replacement, "A", urgent=False)
         await _drain(manager)
-        assert steps.order[10:] == ["inventory:A", "restore:A", "sync:A"]
+        assert steps.order[13:] == ["inventory:A", "restore:A", "sync:A"]
 
 
 async def test_one_exec_lists_the_thread_dirs_and_probes_the_deferred_dir(tmp_path):
@@ -508,7 +598,7 @@ async def test_an_unfinished_restore_is_left_to_the_next_acquisition(
 ):
     """On a running machine no start comes to resume it, so the attach key
     goes once the sync ran; a finished one keeps its key."""
-    manager._projects_attached |= {("A", "sandbox-1"), ("B", "sandbox-1")}
+    manager._projects_attached |= dict.fromkeys([("A", "sandbox-1"), ("B", "sandbox-1")])
     if ending == "errors":
         steps.short.add("A")
     else:
@@ -517,7 +607,7 @@ async def test_an_unfinished_restore_is_left_to_the_next_acquisition(
     _schedule(manager, sandbox, "B", urgent=False)
     await _drain(manager)
     assert {"sync:A", "sync:B"} <= set(steps.order)
-    assert manager._projects_attached == {("B", "sandbox-1")}
+    assert manager._projects_attached.keys() == {("B", "sandbox-1")}
 
 
 async def test_an_acquisition_before_the_sync_does_not_keep_the_unfinished_key(
@@ -529,7 +619,7 @@ async def test_an_acquisition_before_the_sync_does_not_keep_the_unfinished_key(
     _schedule(manager, sandbox, "A", urgent=False)
     while "restore:A" not in steps.order:
         await asyncio.sleep(0)
-    manager._projects_attached.add(("A", "sandbox-1"))
+    manager._projects_attached[("A", "sandbox-1")] = None
     _schedule(manager, sandbox, "A", urgent=True)
     await _drain(manager)
     assert _steps(steps.order) == ["restore:A", "sync:A"]
@@ -542,13 +632,13 @@ async def test_a_sync_that_left_a_thread_behind_is_left_to_the_next_acquisition(
 ):
     """A thread nobody opens again has no turn end to export it, and on a
     running machine no start comes to sync it, so the attach key goes."""
-    manager._projects_attached |= {("A", "sandbox-1"), ("B", "sandbox-1")}
+    manager._projects_attached |= dict.fromkeys([("A", "sandbox-1"), ("B", "sandbox-1")])
     steps.unsynced["A"] = ending
     _schedule(manager, sandbox, "A", urgent=False)
     _schedule(manager, sandbox, "B", urgent=False)
     await _drain(manager)
     assert _steps(steps.order) == ["restore:A", "restore:B", "sync:A", "sync:B"]
-    assert manager._projects_attached == {("B", "sandbox-1")}
+    assert manager._projects_attached.keys() == {("B", "sandbox-1")}
 
 
 async def test_a_thread_delete_drops_the_stamp_even_on_a_stopped_machine(manager):

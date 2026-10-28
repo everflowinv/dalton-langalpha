@@ -757,3 +757,162 @@ describe('useFileTabs transcript tabs', () => {
     expect(activePath(result.current)).toBe('a.md');
   });
 });
+
+describe('useFileTabs history', () => {
+  const step = (result: { current: ReturnType<typeof useFileTabs> }, dir: 'back' | 'forward') =>
+    act(() => result.current.stepHistory(result.current.activeId, dir));
+  const can = (result: { current: ReturnType<typeof useFileTabs> }, dir: 'back' | 'forward') =>
+    result.current.historyTarget(result.current.activeId, dir) !== null;
+  /** Steps back until there is nowhere left, naming what each press showed. */
+  const backWalk = (result: { current: ReturnType<typeof useFileTabs> }) => {
+    const seen: string[] = [];
+    while (can(result, 'back')) {
+      step(result, 'back');
+      const tab = result.current.activeTab;
+      seen.push(tab.kind === 'chart' ? tab.symbol : tab.kind);
+    }
+    return seen;
+  };
+
+  it('steps a tab back through what the tree put in it, and forward again', () => {
+    const { result } = renderHook(() => useFileTabs('ws'));
+    act(() => result.current.openFile('a.md'));
+    act(() => result.current.openFile('b.md'));
+
+    step(result, 'back');
+    expect(paths(result.current.tabs)).toEqual(['a.md']);
+    step(result, 'back');
+    expect(result.current.activeTab.kind).toBe('empty');
+    expect(can(result, 'back')).toBe(false);
+
+    step(result, 'forward');
+    step(result, 'forward');
+    expect(paths(result.current.tabs)).toEqual(['b.md']);
+    expect(can(result, 'forward')).toBe(false);
+  });
+
+  it('keeps each tab to its own history, with switching tabs no step at all', () => {
+    const { result } = renderHook(() => useFileTabs('ws'));
+    act(() => result.current.openFile('a.md', { pin: true }));
+    act(() => result.current.openChart({ symbol: 'SPY' }));
+    act(() => result.current.activate(result.current.tabs[0].id));
+
+    // The pinned file filled the empty tab; the chart opened beside it.
+    expect(can(result, 'back')).toBe(true);
+    act(() => result.current.activate(result.current.tabs[1].id));
+    expect(can(result, 'back')).toBe(false);
+  });
+
+  it('drops what lay ahead once the tab goes somewhere new', () => {
+    const { result } = renderHook(() => useFileTabs('ws'));
+    act(() => result.current.openFile('a.md'));
+    act(() => result.current.openFile('b.md'));
+    step(result, 'back');
+    act(() => result.current.openFile('c.md'));
+
+    expect(can(result, 'forward')).toBe(false);
+    step(result, 'back');
+    expect(paths(result.current.tabs)).toEqual(['a.md']);
+  });
+
+  // The panel keeps an editor's draft per tab id, so a step must not hand the
+  // old file's draft to the new one.
+  it('brings the tab back under a new id', () => {
+    const { result } = renderHook(() => useFileTabs('ws'));
+    act(() => result.current.openFile('a.md'));
+    act(() => result.current.openFile('b.md'));
+    const before = result.current.activeId;
+    step(result, 'back');
+
+    expect(result.current.activeId).not.toBe(before);
+    expect(can(result, 'forward')).toBe(true);
+  });
+
+  it('passes over a step another tab now shows, rather than opening the file twice', () => {
+    const { result } = renderHook(() => useFileTabs('ws'));
+    act(() => result.current.openFile('a.md'));
+    act(() => result.current.openFile('b.md'));
+    act(() => result.current.openFile('a.md', { pin: true }));
+    act(() => result.current.activate(result.current.tabs.find((t) => t.kind === 'file' && t.path === 'b.md')!.id));
+
+    step(result, 'back');
+    expect(result.current.activeTab.kind).toBe('empty');
+    expect(paths(result.current.tabs).filter((p) => p === 'a.md')).toHaveLength(1);
+  });
+
+  it('counts a chart moved to another ticker as a step', () => {
+    const { result } = renderHook(() => useFileTabs('ws'));
+    act(() => result.current.openChart({ symbol: 'SPY' }));
+    act(() => result.current.retargetChart(result.current.activeId, 'AAPL'));
+
+    step(result, 'back');
+    expect(result.current.activeTab).toMatchObject({ kind: 'chart', symbol: 'SPY' });
+  });
+
+  it('remembers the ticker a step lands on for the next chart opened blind', () => {
+    const { result } = renderHook(() => useFileTabs('ws'));
+    act(() => result.current.openChart({ symbol: 'AMD' }));
+    act(() => result.current.retargetChart(result.current.activeId, 'NVDA'));
+    step(result, 'back');
+    expect(lastChartSymbol('ws')).toBe('AMD');
+  });
+
+  // The reader moved the tab, so where it had been is still theirs to go back to.
+  it('carries a chart tab\'s history into the tab it folds into', () => {
+    const { result } = renderHook(() => useFileTabs('ws'));
+    act(() => result.current.openChart({ symbol: 'MSFT' }));
+    act(() => result.current.newTab());
+    act(() => result.current.openChart({ symbol: 'SPY' }));
+    act(() => result.current.retargetChart(result.current.activeId, 'AAPL'));
+    act(() => result.current.retargetChart(result.current.activeId, 'MSFT'));
+
+    expect(result.current.tabs.filter((t) => t.kind === 'chart')).toHaveLength(1);
+    // Both tabs began on an empty tab, so the two journeys meet on that step,
+    // and it is taken once: every Back press changes what the tab shows.
+    expect(backWalk(result)).toEqual(['AAPL', 'SPY', 'empty']);
+  });
+
+  it('keeps the history of the tab a chart folds into', () => {
+    const { result } = renderHook(() => useFileTabs('ws'));
+    act(() => result.current.openChart({ symbol: 'TSLA' }));
+    act(() => result.current.retargetChart(result.current.activeId, 'MSFT'));
+    act(() => result.current.newTab());
+    act(() => result.current.openChart({ symbol: 'SPY' }));
+    act(() => result.current.retargetChart(result.current.activeId, 'MSFT'));
+
+    expect(backWalk(result)).toEqual(['SPY', 'empty', 'TSLA', 'empty']);
+  });
+
+  it('has no Back onto the file it shows once the step between two visits is deleted', () => {
+    const { result } = renderHook(() => useFileTabs('ws'));
+    act(() => result.current.openFile('a.md'));
+    act(() => result.current.openFile('b.md'));
+    act(() => result.current.openFile('a.md'));
+    act(() => result.current.forgetPaths(['b.md']));
+
+    expect(paths(result.current.tabs)).toEqual(['a.md']);
+    expect(backWalk(result)).toEqual(['empty']);
+  });
+
+  it('forgets the steps that name a deleted file', () => {
+    const { result } = renderHook(() => useFileTabs('ws'));
+    act(() => result.current.openFile('a.md'));
+    act(() => result.current.openFile('b.md'));
+    act(() => result.current.openFile('c.md'));
+    act(() => result.current.forgetPaths(['b.md']));
+
+    step(result, 'back');
+    expect(paths(result.current.tabs)).toEqual(['a.md']);
+  });
+
+  it('forgets a tab\'s history with the tab', () => {
+    const { result } = renderHook(() => useFileTabs('ws'));
+    act(() => result.current.openFile('a.md'));
+    act(() => result.current.openFile('b.md'));
+    const id = result.current.activeId;
+    act(() => result.current.newTab());
+    act(() => result.current.closeTab(id));
+
+    expect(result.current.historyTarget(id, 'back')).toBeNull();
+  });
+});

@@ -11,6 +11,7 @@ describe('parseShareLinkHref', () => {
   // opening the root after the link's entry moves.
   it('keeps an explicit root apart from no page', () => {
     expect(parseShareLinkHref(`${window.location.origin}/a/TnVftlXfU0nN?path=/`)).toEqual({ code: 'TnVftlXfU0nN', path: '' });
+    expect(parseShareLinkHref(shareLinkHref('TnVftlXfU0nN', '/'))).toEqual({ code: 'TnVftlXfU0nN', path: '' });
   });
 
   it('takes only an /a/ link on this origin', () => {

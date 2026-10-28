@@ -16,14 +16,15 @@ from typing import Annotated, Any
 
 from pydantic import BaseModel, Field, StringConstraints
 
+from src.server.services.workspace_file_containment import workspace_relative_path
+
 from ._shared import (
     _is_always_hidden_path,
     _is_hidden_path,
     _is_system_path,
-    workspace_relative_path,
 )
 
-_GLOB_SPECIAL_RE = re.compile(r"([*?\[])")
+_GLOB_SPECIAL_RE = re.compile(r"([*?\[{\\])")
 
 # A reference is a workspace path, and the longest a filesystem will hold is
 # well under this. The bound is on the item because the shared-thread route is
@@ -48,7 +49,11 @@ class ResolveFileRefRequest(BaseModel):
 
 
 def clean_path(
-    value: str, work_dir: str, previous_dir_names: Sequence[str] = ()
+    value: str,
+    work_dir: str,
+    previous_dir_names: Sequence[str] = (),
+    *,
+    previous_roots: Sequence[str] = (),
 ) -> str | None:
     """A workspace-relative path, or None for one that names no workspace file.
 
@@ -62,7 +67,9 @@ def clean_path(
     absolute after the fold is refused here rather than handed on to a glob
     that would search for it under the workspace anyway.
     """
-    path = workspace_relative_path(value, work_dir, previous_dir_names)
+    path = workspace_relative_path(
+        value, work_dir, previous_dir_names, previous_roots=previous_roots
+    )
     if not path or path.startswith("/") or ".." in path.split("/"):
         return None
     # A ``file:`` URL can spell a NUL percent-encoded, and the result of this
@@ -73,10 +80,17 @@ def clean_path(
 
 
 def clean_candidates(
-    raw: list[str], work_dir: str, previous_dir_names: Sequence[str] = ()
+    raw: list[str],
+    work_dir: str,
+    previous_dir_names: Sequence[str] = (),
+    *,
+    previous_roots: Sequence[str] = (),
 ) -> list[str]:
     """Distinct cleaned candidates that share the first one's file name."""
-    cleaned = (clean_path(v, work_dir, previous_dir_names) for v in raw)
+    cleaned = (
+        clean_path(v, work_dir, previous_dir_names, previous_roots=previous_roots)
+        for v in raw
+    )
     out = list(dict.fromkeys(p for p in cleaned if p))
     if not out:
         return out

@@ -18,13 +18,14 @@ from ptc_agent.agent.subagents.merge import (
     merge_subagents,
     narrow_to_request,
     plan_gated,
+    turn_roster,
 )
 from ptc_agent.agent.roles import AgentRole
-from ptc_agent.config.agent import SubagentsConfig
+from ptc_agent.config.agent import SubagentModel, SubagentsConfig
 from src.llms.preferences import resolve_tuning
 
 from . import logger, user_models
-from .availability import model_resolves
+from .availability import model_on_plan, model_resolves
 from .capabilities import TierPermits, gate_search
 from .clients import LLMRole
 
@@ -186,53 +187,6 @@ async def _demote_unservable(
     return replace(resolved, definitions=definitions)
 
 
-async def model_on_plan(
-    user_id: str,
-    model: str,
-    *,
-    model_pref: dict,
-    permits: TierPermits,
-    is_byok: bool,
-    byok_cache: dict[str, dict | None],
-) -> bool:
-    """Whether the user may run ``model``, in the model list's order.
-
-    A provider the user holds a key or a subscription for is never gated by
-    plan, so a free-plan user who pins a model to their own key keeps it. A
-    model with no tier is one no plan includes, which the list offers only to
-    such a user.
-    """
-    from src.config.settings import HOST_MODE
-
-    if HOST_MODE != "platform":
-        return True
-    source, entry = await user_models.classify_model(user_id, model, _pref_cache=model_pref)
-    if source != user_models.ModelSource.SYSTEM:
-        # A custom model runs on the user's own key or not at all, which the
-        # pass after the clients are built settles.
-        return True
-    tier = entry.get("tier")
-    if isinstance(tier, int) and await permits(tier):
-        return True
-
-    from src.llms.llm import LLM as LLMFactory
-
-    from .clients import _walk_byok_candidates
-
-    provider = entry.get("provider")
-    if not provider:
-        return False
-    mc = LLMFactory.get_model_config()
-    if mc.get_provider_info(provider).get("access_type") == "oauth":
-        # Served on the user's subscription or not at all; with none, the
-        # role gets no client and the pass after the clients demotes it.
-        return True
-    if not is_byok:
-        return False
-    found, _ = await _walk_byok_candidates(user_id, provider, mc, _byok_cache=byok_cache)
-    return found is not None
-
-
 def subagent_roles(
     roster: ResolvedSubagents, model_pref: dict, turn_model: str | None,
     *, role: AgentRole = "analyst",
@@ -300,3 +254,46 @@ def demote_clientless(
         changed = True
     if changed:
         config.subagents.resolved = replace(resolved, definitions=definitions)
+
+
+def subagent_models(
+    config: Any, model_pref: dict, turn_model: str, *, role: AgentRole = "analyst",
+) -> dict[str, SubagentModel]:
+    """Each subagent that runs a model other than the turn's, by name.
+
+    Read off the client the compiler will hand the subagent, not off its pin:
+    a pinned role with no key of its own runs a copy of the main client, and
+    an effort with no pin runs the turn's model at that effort. Two catalog
+    names for one API model (a model and its subscription twin) count as the
+    same, since the user picked that model either way.
+    """
+    main_id = _api_model_id(model_pref, turn_model)
+    models: dict[str, SubagentModel] = {}
+    for defn in turn_roster(config.subagents).for_role(role):
+        client = config.subsidiary_llm_clients.get(f"subagent:{defn.name}")
+        runs = (
+            (getattr(client, "metadata", None) or {}).get("manifest_model")
+            if client is not None
+            else defn.model
+        )
+        if not runs or _api_model_id(model_pref, runs) == main_id:
+            continue
+        provider = _serving_provider(model_pref, runs)
+        if provider:
+            models[defn.name] = {"id": runs, "provider": provider}
+    return models
+
+
+def _api_model_id(model_pref: dict, name: str) -> str:
+    entry = user_models.model_entry(model_pref, name) or {}
+    return entry.get("model_id") or name
+
+
+def _serving_provider(model_pref: dict, name: str) -> str | None:
+    """The catalog provider serving ``name``. A user's own provider is a
+    variant of a catalog one, which is the one with a mark to show."""
+    provider = (user_models.model_entry(model_pref, name) or {}).get("provider")
+    for custom in model_pref.get("custom_providers") or []:
+        if custom.get("name") == provider:
+            return custom.get("parent_provider") or provider
+    return provider

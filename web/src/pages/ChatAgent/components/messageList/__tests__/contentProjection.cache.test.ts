@@ -9,7 +9,7 @@
  * so nothing would ever retire it.
  */
 import { describe, it, expect } from 'vitest';
-import { projectMessageContent } from '../contentProjection';
+import { isOrphanAssistantMessage, projectMessageContent } from '../contentProjection';
 import type { MessageRecord } from '../types';
 import type { ActivityRenderBlock, TextRenderBlock } from '../buildRenderBlocks';
 
@@ -68,6 +68,30 @@ describe('projectMessageContent cache', () => {
     expect(liveState(projectMessageContent(message, true))).toBe('completing');
     message.isStreaming = false;
     expect(liveState(projectMessageContent(message, true))).toBe('completed');
+  });
+
+  it('judges an orphan on the root the bubble projects with', () => {
+    // The only call reads the profile README under a computer's own root, which
+    // the bubble hides; a check that projected without the root saw a row,
+    // painted an empty bubble, and flipped the cache entry on every render.
+    const root = '/home/someone/langalpha';
+    const message: MessageRecord = {
+      id: 'a-root',
+      role: 'assistant',
+      isStreaming: false,
+      contentSegments: [{ type: 'tool_call', toolCallId: 'tc1', order: 0 }],
+      reasoningProcesses: {},
+      toolCallProcesses: {
+        tc1: {
+          toolName: 'Read', toolCall: { args: { file_path: `${root}/.agents/user/profile/README.md` } },
+          isInProgress: false, isComplete: true, order: 0, _createdAt: Date.now(),
+        },
+      },
+    };
+    expect(isOrphanAssistantMessage(message, false, root)).toBe(true);
+    const checked = projectMessageContent(message, false, root);
+    expect(isOrphanAssistantMessage(message, false, root)).toBe(true);
+    expect(projectMessageContent(message, false, root)).toBe(checked);
   });
 });
 

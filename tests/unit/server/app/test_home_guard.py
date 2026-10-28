@@ -11,11 +11,11 @@ from httpx import ASGITransport, AsyncClient
 
 from src.server.app.share_links import router as share_links_router
 from src.server.app.workspace_files import router as files_router
-from src.server.app.workspace_files._shared import (
+from src.server.app.workspace_sandbox import router as sandbox_router
+from src.server.services.workspace_files import (
     HOME_NOT_ON_COMPUTER,
     owned_workspace_on_computer,
 )
-from src.server.app.workspace_sandbox import router as sandbox_router
 from tests.conftest import create_test_app
 
 pytestmark = pytest.mark.asyncio
@@ -23,7 +23,7 @@ pytestmark = pytest.mark.asyncio
 USER = "test-user-123"
 WS = "ws-home-guard"
 BASE = f"/api/v1/workspaces/{WS}"
-_READ = "src.server.app.workspace_files._shared.db_get_workspace"
+_READ = "src.server.services.workspace_files.db_get_workspace"
 
 
 def _row(**overrides) -> dict:
@@ -62,6 +62,7 @@ ROUTES = [
         "/files/upload",
         {"params": {"path": "a.txt"}, "files": {"file": ("a.txt", b"x", "text/plain")}},
     ),
+    ("POST", "/files/uploads", {"json": {"path": "a.bin", "size": 1}}),
     ("POST", "/files/backup", {}),
     ("DELETE", "/files", {"json": {"paths": ["a.txt"]}}),
     ("GET", "/sandbox/stats", {}),

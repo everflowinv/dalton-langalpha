@@ -77,8 +77,8 @@
   opacity: var(--tick-o, 0.22);
   background: var(--color-text-primary);
   transition:
-    width 180ms cubic-bezier(0.16, 1, 0.3, 1),
-    opacity 180ms ease;
+    width var(--motion-quick) var(--ease-out),
+    opacity var(--motion-quick) var(--ease-out);
 }
 
 /* Sized against the message area (an inline-size container) so a narrow
@@ -95,8 +95,8 @@
   box-shadow: var(--shadow-card);
   color: var(--color-text-primary);
   pointer-events: none;
-  animation: chat-minimap-card-enter 140ms cubic-bezier(0.16, 1, 0.3, 1) both;
-  transition: top 140ms cubic-bezier(0.16, 1, 0.3, 1);
+  animation: chat-minimap-card-enter var(--motion-quick) var(--ease-out) both;
+  transition: top var(--motion-quick) var(--ease-out);
 }
 
 .chat-minimap-card-prompt {

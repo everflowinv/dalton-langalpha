@@ -11,30 +11,32 @@ import ChatInput, { type ChatInputHandle } from '@/components/ui/chat-input';
 import type { ComposerScope } from '@/components/ui/chat-input.types';
 import { useStableHandler } from '@/hooks/useStableHandler';
 import { useWorkspace } from '@/hooks/useWorkspace';
+// DALTON-HOOK(team-sharing): gate the seen cursor on workspace ownership
+import { isDaltonAuth } from '@/config/daltonAuth';
 import { usePreferences } from '@/hooks/usePreferences';
 import { useLocale } from '@/hooks/useLocale';
 import { compactNumber } from '@/lib/format';
 import { readTurnEndScroll } from '@/lib/turnEndScroll';
 import { LiveMessageList } from '../../ChatAgent/components/MessageList';
 import { MessageActionsProvider, type MessageActions } from '../../ChatAgent/components/messageList/MessageActionsContext';
-import { SubagentTelemetryContext } from '../../ChatAgent/components/SubagentTelemetryContext';
+import { SubagentTelemetryContext, useHistoryTelemetry } from '../../ChatAgent/components/SubagentTelemetryContext';
 import { ChartSurfaceContext, type ChartSurface } from '../../ChatAgent/contexts/ChartSurfaceContext';
 import { WorkspaceProvider } from '../../ChatAgent/contexts/WorkspaceContext';
 import { computerFolders } from '../../ChatAgent/utils/agentPaths';
 import { useChatMessages } from '../../ChatAgent/hooks/useChatMessages';
+import { useComputerRootDir } from '../../ChatAgent/hooks/useComputers';
 import { useThreadModel } from '../../ChatAgent/hooks/useThreadModel';
 import { useThreadSubagents } from '../../ChatAgent/hooks/useThreadSubagents';
+import { useThreadTuning } from '../../ChatAgent/hooks/useThreadTuning';
 import { ThreadNotices } from '../../ChatAgent/components/chatView/ThreadNotices';
 import { DispatchStatusProvider } from '../../ChatAgent/hooks/usePTCDispatchStatus';
-import { useStreamFollow } from '../../ChatAgent/components/chatView/streamFollow';
+import { useStreamFollow } from '../../ChatAgent/components/chatView/transcriptFollow';
 import { useTranscriptFollow } from '../../ChatAgent/components/chatView/useTranscriptFollow';
+// DALTON-HOOK(team-sharing): read-only access check for the seen cursor
+import { useTeamReadOnly } from '../../ChatAgent/components/dalton/TeamSharing';
 import { useActiveThreadPublisher } from '@/lib/threadLifecycle/useActiveThreadPublisher';
 import { appendPathSuffix, getPreviewUrl, summarizeThread, offloadThread } from '../../ChatAgent/utils/api';
 import { attachmentsToContexts } from '../../ChatAgent/utils/fileUpload';
-import {
-  resolveSubagentTelemetry as resolveSubagentTelemetryPure,
-  type SubagentHistoryLike,
-} from '../../ChatAgent/session/subagents/resolveSubagentTelemetry';
 import type { SubagentInfo } from '../../ChatAgent/components/ToolCallDetailView';
 import { useToolCallLookup } from '../../ChatAgent/components/chatView/toolCallLookup';
 import type { PreviewData } from '../../ChatAgent/hooks/utils/types';
@@ -80,6 +82,7 @@ interface ModelOptionsLike {
   model?: string | null;
   reasoningEffort?: string | null;
   fastMode?: boolean | null;
+  onAccepted?: () => void; // DALTON-HOOK(composer-drafts): settles the composer draft on acceptance
 }
 
 interface AttachmentItem {
@@ -95,7 +98,7 @@ interface MarketChatPanelProps {
   interval: string;
   scope: ComposerScope;
   onScopeChange: (scope: ComposerScope) => void;
-  /** The workspace the chat runs in: Home under All workspaces, else the
+  /** The workspace the chat runs in: Home under the Chief of Staff, else the
    *  selected one. Null until it resolves. */
   activeWorkspaceId: string | null;
   workspaces: Workspace[];
@@ -154,7 +157,9 @@ function MarketChatScope(props: MarketChatPanelProps): React.ReactElement {
   // does Home's cached row, which can predate the turn that gave Home its folder.
   const { data: activeWorkspace } = useWorkspace(activeWorkspaceId);
   // No sibling list: this page opens no files, so a sibling's has nowhere to go.
-  const folders = useMemo(() => computerFolders(activeWorkspace, null), [activeWorkspace]);
+  // The computer's root is kept: the reply's absolute paths start with it.
+  const rootDir = useComputerRootDir(activeWorkspace?.computer_id);
+  const folders = useMemo(() => computerFolders(activeWorkspace, null, rootDir), [activeWorkspace, rootDir]);
 
   // Initial thread resolution. URL `?thread=` wins, then localStorage keyed by
   // (workspace, symbol), then a new chat. This state determines which thread
@@ -305,7 +310,10 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
   // Set when the user stops a running turn, so the input placeholder reflects it.
   const [wasStopped, setWasStopped] = useState(false);
 
-  const messagesContainerRef = useRef<HTMLDivElement | null>(null);
+  // The transcript's scroller and its content, as elements for its follow:
+  // the content mounts only once there is a transcript to show.
+  const [messagesContainer, setMessagesContainer] = useState<HTMLDivElement | null>(null);
+  const [transcript, setTranscript] = useState<HTMLDivElement | null>(null);
 
   // The user's confirmed chart selections (region / price level). Render a chip
   // per selection that still matches the live chart instance — selections drawn
@@ -318,7 +326,7 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
     [selections, liveSym, liveTf],
   );
 
-  // With no workspace to pick, the scope picker still offers All workspaces
+  // With no workspace to pick, the scope picker still offers the Chief of Staff
   // and says why the workspace list is empty.
   const emptyWorkspacesHint = workspaces.length === 0 ? t('agents.market.workspaceDisabledReason') : null;
 
@@ -343,7 +351,9 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
   // Open the served-HTML preview. The SSE artifact carries only a port, so —
   // like ChatView — open immediately in a loading state, then resolve the
   // authenticated signed URL and swap it in (otherwise the viewer is blank).
-  const handlePreview = useCallback((preview: PreviewData) => {
+  const handlePreview = useCallback((data: PreviewData) => {
+    // Named on the entry so the dialog's open button reaches the app's link.
+    const preview = { ...data, workspaceId: data.workspaceId ?? activeWorkspaceId ?? undefined };
     previewPortRef.current = preview.port;
     setDialogPayload({ type: 'preview', preview: { ...preview, loading: true } });
 
@@ -384,6 +394,7 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
       : 'market_view';
   }, [symbol]);
 
+  const readComposerOptions = useCallback(() => chatInputRef.current?.getModelOptions?.(), []);
   const chat = useChatMessages(
     activeWorkspaceId,
     initialThreadId,
@@ -395,6 +406,7 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
     null,                       // clearSubagentCards
     null,                       // onWorkspaceCreated
     platformValue,
+    readComposerOptions,
   );
 
   const {
@@ -407,6 +419,7 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
     threadModels,
     stopWorkflow,
     getSubagentHistory,
+    getTaskRuns,
     // HITL handlers: ask-user questions, workspace/PTC/secretary proposals,
     // credit pauses and tool approvals. Without these wired into MessageList the
     // cards render but their Accept/Decline buttons are dead.
@@ -447,19 +460,25 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
 
   // The market panel's thread is what the user is looking at — same active
   // contract as ChatAgent (no unseen dot for watched finishes, seen on open).
-  useActiveThreadPublisher(threadId);
+  // DALTON-HOOK(team-sharing): a read-only colleague must not mark a shared
+  // thread seen — the server refuses the write, and the dot would only come
+  // back on reload. Same gate as ChatAgent: the workspace row must be loaded
+  // and confirm the caller is not a read-only teammate.
+  const { data: activeWorkspace } = useWorkspace(activeWorkspaceId);
+  const teamReadOnly = useTeamReadOnly(activeWorkspaceId, activeWorkspace);
+  const canMarkSeen = !isDaltonAuth || Boolean(activeWorkspaceId && activeWorkspace && !teamReadOnly.isReadOnly);
+  useActiveThreadPublisher(threadId, { canMarkSeen });
 
-  // All workspaces runs the default model, as the full agent does in a workspace.
+  // The Chief of Staff runs the default model, as the full agent does in a workspace.
   const threadModel = useThreadModel({ threadId, isLoading });
   const threadSubagents = useThreadSubagents({ threadId });
   const { toSend: subagentsToSend } = threadSubagents;
+  const threadTuning = useThreadTuning({ threadId });
+  const { toSend: tuningToSend } = threadTuning;
 
-  // Subagent telemetry resolver — feeds ActivityBlock's live token counts.
-  // MarketView has no floating cards layer, so we resolve through history only.
-  const resolveSubagentTelemetry = useCallback((subagentId: string) => {
-    const history = getSubagentHistory?.(subagentId) as SubagentHistoryLike | undefined;
-    return resolveSubagentTelemetryPure(undefined, history);
-  }, [getSubagentHistory]);
+  // MarketView has no floating cards layer, so subagent rows resolve through
+  // history only, and a run launched since the page loaded shows no progress.
+  const subagentTelemetry = useHistoryTelemetry(getSubagentHistory, getTaskRuns);
 
   // Persist thread id per (workspace, symbol) + sync to URL once the workflow
   // assigns a real id.
@@ -476,15 +495,20 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
     queryClient.invalidateQueries({ queryKey: queryKeys.threads.byWorkspace(activeWorkspaceId) });
   }, [threadId, symbol, activeWorkspaceId, setSearchParams, queryClient]);
 
-  const transcriptRef = useRef<HTMLDivElement | null>(null);
   const showTranscript = messages.length > 0 || isLoading || isLoadingHistory;
-  const follow = useStreamFollow(messagesContainerRef, transcriptRef, showTranscript, isLoading || isLoadingHistory);
+  const follow = useStreamFollow(messagesContainer, transcript, { live: isLoading, loading: isLoadingHistory });
   const { handleSendMessage, handleEditMessage, handleRegenerate, handleRetry } = useTranscriptFollow(
     chat,
     follow,
-    () => messagesContainerRef.current,
+    () => messagesContainer,
     readTurnEndScroll(preferences),
   );
+
+  // DALTON-HOOK(composer-drafts): the screenshot as it is now, for a send settled later.
+  const chartImageRef = useRef(chartImage);
+  useEffect(() => {
+    chartImageRef.current = chartImage;
+  }, [chartImage]);
 
   // Send: shape attachments + chart screenshot like ChatAgent does.
   const handleSend = useCallback(
@@ -559,15 +583,31 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
       const additionalContext = contexts.length > 0 ? contexts : null;
       const attachmentMeta = metaItems.length > 0 ? metaItems : null;
 
-      handleSendMessage(outgoingMessage, additionalContext, attachmentMeta, {
+      // DALTON-HOOK(composer-drafts): forward send result so ChatInput preserves the draft when
+      // sending fails. The screenshot and confirmed selections ride this one send, so they are
+      // spent only once the server accepts it: a refused send (the budget gate, the network)
+      // leaves them on the chart to send again.
+      // Spend only what this send carried: a selection confirmed or a screenshot retaken while
+      // it waited for acceptance belongs to the next send.
+      const sentSelectionIds = chartSelectionStore.getConfirmedFor(sym, tf).map((sel) => sel.id);
+      const sentImage = chartImage;
+      const spendChartContext = () => {
+        if (sentImage && chartImageRef.current === sentImage) onClearChartImage();
+        for (const id of sentSelectionIds) chartSelectionStore.remove(id);
+      };
+      const sent = handleSendMessage(outgoingMessage, additionalContext, attachmentMeta, {
         ...modelOptions,
         ...(selectionSnapshots.length > 0 ? { chartSelections: selectionSnapshots } : {}),
         subagentsAllowed: subagentsToSend,
+        ...tuningToSend,
+        onAccepted: () => {
+          spendChartContext();
+          modelOptions?.onAccepted?.();
+        },
       });
-      onClearChartImage();
-      chartSelectionStore.clearAll();
+      return sent;
     },
-    [symbol, interval, chartImage, chartImageDesc, handleSendMessage, onClearChartImage, subagentsToSend],
+    [symbol, interval, chartImage, chartImageDesc, handleSendMessage, onClearChartImage, subagentsToSend, tuningToSend],
   );
 
   // Stop the running turn (the input's Stop button). Mirrors ChatView: the hook's
@@ -687,9 +727,6 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
   }, [returnedEdit, clearReturnedEdit]);
   const stableThumbUp = useStableHandler(handleThumbUp);
   const stableThumbDown = useStableHandler(handleThumbDown);
-  const stableReportWithAgent = useStableHandler((instruction: string) => {
-    handleSendMessage(`/self-improve ${instruction}`, null, null, {});
-  });
   const stableWidgetSendPrompt = useStableHandler((text: string) => {
     handleSendMessage(text, null, null, {});
   });
@@ -716,8 +753,8 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
     editDrafts,
     onThumbUp: stableThumbUp,
     onThumbDown: stableThumbDown,
-    onReportWithAgent: stableReportWithAgent,
     onWidgetSendPrompt: stableWidgetSendPrompt,
+    onRevealMessage: follow.reveal,
   }), [
     stableOpenSubagentTask, stableToolCallDetail,
     stableAnswerQuestion, stableSkipQuestion, stableApproveCreateWorkspace,
@@ -725,12 +762,12 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
     stableApprovePTCAgent, stableRejectPTCAgent, stableApproveSecretaryAction,
     stableRejectSecretaryAction, stableResumeCreditPause, stableApproveToolCall, stableRejectToolCall,
     stableEditMessage, stableRegenerate, stableRetry, editDrafts,
-    stableThumbUp, stableThumbDown, stableReportWithAgent, stableWidgetSendPrompt,
+    stableThumbUp, stableThumbDown, stableWidgetSendPrompt, follow.reveal,
   ]);
 
-  // In All workspaces, carry the source thread/workspace into a PTC-agent
+  // In the Chief of Staff, carry the source thread/workspace into a PTC-agent
   // proposal so its "open in chat" deep-link lands back here. Null in a
-  // workspace, since only All workspaces hands work off to the workspaces.
+  // workspace, since only the Chief of Staff hands work off to the workspaces.
   // Memoized: a fresh object per render would defeat the memoized bubbles downstream.
   const dispatcherContext = useMemo(
     () =>
@@ -767,7 +804,7 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
     fontSize: '0.75rem',
     fontWeight: 500,
     cursor: 'pointer',
-    transition: 'background 0.15s, border-color 0.15s, color 0.15s',
+    transition: 'background var(--motion-quick) var(--ease-out), border-color var(--motion-quick) var(--ease-out), color var(--motion-quick) var(--ease-out)',
   };
   const headerBtnHover = (e: React.MouseEvent<HTMLButtonElement>) => {
     e.currentTarget.style.background = 'var(--color-bg-hover)';
@@ -844,7 +881,7 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
 
       {/* Messages */}
       <div
-        ref={messagesContainerRef}
+        ref={setMessagesContainer}
         style={{ flex: 1, minHeight: 0, overflowY: 'auto', overflowX: 'hidden' }}
       >
         {!showTranscript ? (
@@ -860,9 +897,9 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
             )}
           </div>
         ) : (
-          <div ref={transcriptRef} style={{ padding: '16px 24px', maxWidth: '100%' }}>
+          <div ref={setTranscript} style={{ padding: '16px 24px', maxWidth: '100%' }}>
             <ChartSurfaceContext value={chartSurface}>
-              <SubagentTelemetryContext value={resolveSubagentTelemetry}>
+              <SubagentTelemetryContext value={subagentTelemetry}>
                 <MessageActionsProvider actions={messageActions}>
                   <DispatchStatusProvider>
                     <LiveMessageList
@@ -965,6 +1002,9 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
         onPickModel={threadModel.pickModel}
         subagentsAllowed={threadSubagents.allowed}
         onToggleSubagents={threadSubagents.setAllowed}
+        tuning={threadTuning.tuning}
+        onPickReasoningEffort={threadTuning.setReasoningEffort}
+        onPickFastMode={threadTuning.setFastMode}
         emptyWorkspacesHint={emptyWorkspacesHint}
         workspaces={workspaces}
         selectedWorkspaceId={selectedWorkspaceId}

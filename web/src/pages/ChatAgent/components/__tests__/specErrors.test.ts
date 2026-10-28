@@ -80,4 +80,15 @@ describe('specErrorFrom', () => {
   it('reads a plan refusal as entitlement copy', () => {
     expect(specErrorFrom(refused(403, 'Forbidden'), t, 'max').message).toBe(i18n.t('workspace.notOnPlan'));
   });
+
+  it('names the size whose count is spent when the platform gives no sentence', () => {
+    expect(specErrorFrom(refused(429, null), t, 'xlarge').message).toBe(
+      "You've reached your Extra Large workspace limit.",
+    );
+  });
+
+  it("relays the server's sentence for a size the provider does not run", () => {
+    const detail = 'E2B is the only provider that runs the xlarge tier.';
+    expect(specErrorFrom(refused(400, detail), t, 'xlarge').message).toBe(detail);
+  });
 });

@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { createFormatter, createDateFormatter, compactNumber, compactNumberFixed2, fixed2, formatBytes, formatList, formatTimestamp, relativeTime, signedFixed2 } from '@/lib/format';
+import { chatTime, createFormatter, createDateFormatter, compactNumber, compactNumberFixed2, fixed2, formatBytes, formatList, formatTimestamp, relativeTime, signedFixed2 } from '@/lib/format';
 
 describe('createFormatter', () => {
   it('formats numbers in the given locale', () => {
@@ -177,5 +177,23 @@ describe('formatList', () => {
   it('spaces a Chinese conjunction from the Latin names beside it, not the enumeration comma', () => {
     expect(formatList(['moomoo', 'Webull'], 'zh-CN')).toBe('moomoo 和 Webull');
     expect(formatList(['moomoo', 'Webull', 'IBKR'], 'zh-CN')).toBe('moomoo、Webull 和 IBKR');
+  });
+});
+
+describe('chatTime', () => {
+  // Wednesday, noon. Local dates, as the tiers are local days.
+  const now = new Date(2026, 9, 21, 12, 0).getTime();
+  const at = (...parts: [number, number, number, number, number]) => new Date(...parts).getTime();
+  // Some ICU builds put a narrow no-break space before the day period.
+  const plain = (text: string) => text.replace(/\s/g, ' ');
+
+  it.each([
+    ['the clock alone today', at(2026, 9, 21, 7, 5), '7:05 AM'],
+    ['the weekday within the week', at(2026, 9, 20, 14, 28), 'Tuesday 2:28 PM'],
+    ['the weekday six days back', at(2026, 9, 15, 9, 0), 'Thursday 9:00 AM'],
+    ['the date a week back', at(2026, 9, 14, 9, 0), 'Oct 14, 9:00 AM'],
+    ['the year for an earlier year', at(2025, 11, 31, 23, 59), 'Dec 31, 2025, 11:59 PM'],
+  ])('shows %s', (_, ms, label) => {
+    expect(plain(chatTime(ms, 'en-US', now))).toBe(label);
   });
 });

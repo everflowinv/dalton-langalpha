@@ -1,5 +1,5 @@
 /**
- * The dashboard composer sends to Home while its scope is All workspaces, the
+ * The dashboard composer sends to Home while its scope is the Chief of Staff, the
  * default, and to the picked workspace otherwise. Only the Home send carries
  * Home's route state, which is what names Home to the chat view before the
  * row loads.
@@ -34,7 +34,7 @@ afterEach(() => {
 const sentState = () => (navigate.mock.calls[0]?.[1] as { state: Record<string, unknown> }).state;
 
 describe('useChatInput', () => {
-  it('sends to Home under All workspaces', async () => {
+  it('sends to Home under the Chief of Staff', async () => {
     const { result } = renderHookWithProviders(() => useChatInput());
     expect(result.current.scope).toBe('all');
 

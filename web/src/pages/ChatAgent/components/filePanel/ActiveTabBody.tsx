@@ -26,6 +26,8 @@ interface ActiveTabBodyProps {
   onTargetMemoryHandled?: (seq?: number) => void;
   onTargetMemoHandled?: (seq?: number) => void;
   marketWatch: MarketWatchState | null;
+  threadId: string | null;
+  isActive: boolean;
   onOpenFile: OpenFileHandler | null;
   onOpenSubagentTask: ((info: SubagentInfo) => void) | null;
   transcript: TranscriptReader | null;
@@ -34,18 +36,15 @@ interface ActiveTabBodyProps {
   /** What the file viewer needs beyond the tab's own path: the bytes, the edit and focus state, and the handlers. */
   file: Omit<FileViewerProps, 'path' | 'workspaceId' | 'servePrefix' | 'onPageCount'>;
   onPageCount: (path: string, pages: number) => void;
-  /** The empty tab's offers, each null where the panel has none to make. */
+  /** Whether the empty tab invites a drop. */
   canUpload: boolean;
-  treeOpen: boolean;
-  onShowTree: (() => void) | null;
-  onOpenChart: (() => void) | null;
 }
 
 /** What fills the viewer slot for the active tab. Preview panes are rendered beside this, always mounted. */
 export function ActiveTabBody({
   activeTab, tabs, workspaceId, apiAdapter, target, onTargetMemoryHandled, onTargetMemoHandled, marketWatch,
-  onOpenFile, onOpenSubagentTask, transcript, onAddContext,
-  onOpenInMarketView, file, onPageCount, canUpload, treeOpen, onShowTree, onOpenChart,
+  threadId, isActive, onOpenFile, onOpenSubagentTask, transcript, onAddContext,
+  onOpenInMarketView, file, onPageCount, canUpload,
 }: ActiveTabBodyProps): React.ReactNode {
   switch (activeTab.kind) {
     case 'preview':
@@ -87,6 +86,8 @@ export function ActiveTabBody({
           onTargetMemoHandled={onTargetMemoHandled}
           onOpenFile={onOpenFile}
           marketWatch={marketWatch}
+          threadId={threadId}
+          isActive={isActive}
           // DALTON-HOOK(team-sharing): forward teamReadOnly to block personal MemoPanel in colleague mirror mode
           teamReadOnly={file.teamReadOnly}
         />
@@ -106,7 +107,7 @@ export function ActiveTabBody({
       );
     }
     case 'empty':
-      return <EmptyTab canUpload={canUpload} treeOpen={treeOpen} onShowTree={onShowTree} onOpenChart={onOpenChart} />;
+      return <EmptyTab canUpload={canUpload} />;
     default:
       return activeTab satisfies never;
   }

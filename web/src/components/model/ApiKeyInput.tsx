@@ -3,6 +3,7 @@ import { Eye, EyeOff, Check, X } from "lucide-react"
 import { Input } from "@/components/ui/input"
 import { Button } from "@/components/ui/button"
 import { Loader } from "@/components/ui/loader"
+import { useTranslation } from "react-i18next"
 
 export interface TestResult {
   success: boolean
@@ -25,6 +26,8 @@ export interface ApiKeyInputProps {
     apiKey: string,
   ) => Promise<TestResult>
   testDisabled?: boolean
+  /** For the key field, so a visible label outside can name it. */
+  id?: string
 }
 
 type TestState = "idle" | "loading" | "success" | "error"
@@ -39,7 +42,9 @@ export function ApiKeyInput({
   showBaseUrl = false,
   onTest,
   testDisabled = false,
+  id,
 }: ApiKeyInputProps) {
+  const { t } = useTranslation()
   const [visible, setVisible] = useState(false)
   const [touched, setTouched] = useState(false)
   const [testState, setTestState] = useState<TestState>("idle")
@@ -88,9 +93,9 @@ export function ApiKeyInput({
       }
     } catch {
       setTestState("error")
-      setTestResult({ success: false, error: "Test request failed" })
+      setTestResult({ success: false, error: t("setup.testFailed") })
     }
-  }, [onTest, testDisabled, value, provider])
+  }, [onTest, testDisabled, value, provider, t])
 
   return (
     <div className="flex flex-col gap-3 w-full">
@@ -98,11 +103,12 @@ export function ApiKeyInput({
       <div className="flex flex-col sm:flex-row gap-2 min-w-0">
         <div className="relative flex-1 min-w-0">
           <Input
+            id={id}
             type={visible ? "text" : "password"}
             value={value}
             onChange={(e) => onChange(e.target.value)}
             onBlur={handleBlur}
-            placeholder={maskedKey || "Paste your API key here"}
+            placeholder={maskedKey || t("setup.pasteKeyPlaceholder")}
             className="pr-12"
             style={
               hasError
@@ -122,7 +128,7 @@ export function ApiKeyInput({
             size="icon"
             className="absolute right-1 top-1/2 -translate-y-1/2 h-8 w-8"
             onClick={() => setVisible((v) => !v)}
-            aria-label={visible ? "Hide API key" : "Show API key"}
+            aria-label={visible ? t("setup.hideKey") : t("setup.showKey")}
             tabIndex={0}
           >
             {visible ? (
@@ -141,7 +147,7 @@ export function ApiKeyInput({
             size="sm"
             disabled={testDisabled || testState === "loading" || !value}
             onClick={handleTest}
-            title={testDisabled ? "Test not available for this provider" : undefined}
+            title={testDisabled ? t("setup.testUnavailable") : undefined}
             className="shrink-0 self-start sm:self-auto h-10"
           >
             {testState === "loading" && (
@@ -149,7 +155,7 @@ export function ApiKeyInput({
                 <span aria-hidden="true" className="mr-1.5 shrink-0">
                   <Loader size={14} className="text-current" />
                 </span>
-                Testing...
+                {t("setup.testing")}
               </>
             )}
             {testState === "success" && (
@@ -158,11 +164,10 @@ export function ApiKeyInput({
                   className="h-3.5 w-3.5 mr-1.5"
                   style={{ color: "var(--color-success)" }}
                 />
-                <span style={{ color: "var(--color-success)" }}>Key works!</span>
+                <span style={{ color: "var(--color-success)" }}>{t("setup.testSuccess")}</span>
               </>
             )}
-            {testState === "error" && "Test"}
-            {testState === "idle" && "Test"}
+            {(testState === "error" || testState === "idle") && t("setup.testButton")}
           </Button>
         )}
       </div>
@@ -175,7 +180,7 @@ export function ApiKeyInput({
           className="text-xs"
           style={{ color: "var(--color-loss)" }}
         >
-          Please enter an API key
+          {t("setup.errorNoApiKey")}
         </p>
       )}
 
@@ -184,8 +189,8 @@ export function ApiKeyInput({
         <p className="text-xs flex items-center gap-1" style={{ color: "var(--color-success)" }}>
           <span>
             {testResult.models_found != null && testResult.models_found > 0
-              ? `${testResult.models_found} model${testResult.models_found !== 1 ? 's' : ''} found`
-              : 'Key accepted'}
+              ? t("setup.modelsFound", { count: testResult.models_found })
+              : t("setup.keyAccepted")}
           </span>
           {testResult.latency_ms != null && (
             <>
@@ -208,7 +213,7 @@ export function ApiKeyInput({
           type="url"
           value={baseUrl ?? ""}
           onChange={(e) => onBaseUrlChange?.(e.target.value)}
-          placeholder="Base URL (optional)"
+          placeholder={t("setup.baseUrlPlaceholder")}
         />
       )}
     </div>
