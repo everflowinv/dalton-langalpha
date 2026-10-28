@@ -1,7 +1,8 @@
 /**
  * Thread CRUD, sharing and compaction endpoints.
  */
-import { api } from '@/api/client';
+import { api, type RequestConfig } from '@/api/client';
+import { authSessionCheck } from '@/lib/authResets';
 import type { Thread } from '@/types/api';
 import type { WakeupCancelResponse, WakeupsResponse } from '@/types/wakeups';
 import type { CommandStopResponse, CommandsResponse } from '@/types/commands';
@@ -197,20 +198,50 @@ export interface ThreadUpdates {
  * effort, fast mode) via PATCH.
  * Only the keys present in `updates` are applied server-side.
  */
-export async function updateThread(threadId: string, updates: ThreadUpdates): Promise<Thread> {
+export async function updateThread(threadId: string, updates: ThreadUpdates, config?: RequestConfig): Promise<Thread> {
   if (!threadId) throw new Error('Thread ID is required');
-  const { data } = await api.patch<Thread>(`/api/v1/threads/${threadId}`, updates);
+  const { data } = await api.patch<Thread>(`/api/v1/threads/${threadId}`, updates, config);
   return data;
 }
 
 /**
- * Update a thread's title
+ * A queue per thread: each write starts once the one before it settles, so a
+ * thread's writes reach the server in the order made, from whichever surface
+ * makes them, and an earlier one can never land last. A write still waiting
+ * when the user signs out is dropped rather than sent under the next session.
+ */
+function perThreadQueue() {
+  const tails = new Map<string, Promise<unknown>>();
+  return <T>(threadId: string, run: () => Promise<T>): Promise<T> => {
+    const sameSession = authSessionCheck();
+    const write = (tails.get(threadId) ?? Promise.resolve()).then(() => {
+      if (!sameSession()) throw new Error('Signed out before the write was sent');
+      return run();
+    });
+    const settled = write.catch(() => undefined);
+    tails.set(threadId, settled);
+    void settled.then(() => {
+      if (tails.get(threadId) === settled) tails.delete(threadId);
+    });
+    return write;
+  };
+}
+
+const titleWrites = perThreadQueue();
+const shareWrites = perThreadQueue();
+// A queued write that never answers would hold back every write behind it, so
+// each one gives up after this long and lets the next go.
+const QUEUED_WRITE_TIMEOUT_MS = 30_000;
+
+/**
+ * Update a thread's title, after any title write before it (the sidebar's
+ * field and the gallery's dialog both write it).
  * @param {string} threadId - The thread ID to update
  * @param {string} title - New thread title (max 255 chars, can be null to clear)
  * @returns {Promise<Object>} Updated thread object
  */
-export async function updateThreadTitle(threadId: string, title: string | null) {
-  return updateThread(threadId, { title });
+export function updateThreadTitle(threadId: string, title: string | null) {
+  return titleWrites(threadId, () => updateThread(threadId, { title }, { timeout: QUEUED_WRITE_TIMEOUT_MS }));
 }
 
 // --- Streaming (fetch + ReadableStream; the API client does not stream) ---
@@ -227,15 +258,18 @@ export async function getThreadShareStatus(threadId: string) {
 }
 
 /**
- * Update sharing settings for a thread
+ * Update sharing settings for a thread, after any sharing write before it
+ * (the chat header's panel and the sidebar's dialog both write them).
  * @param {string} threadId
  * @param {Object} body - { is_shared: bool, permissions?: { allow_files?: bool, allow_download?: bool } }
  * @returns {Promise<Object>} { is_shared, share_token, share_url, permissions }
  */
-export async function updateThreadSharing(threadId: string, body: Record<string, unknown>) {
-  if (!threadId) throw new Error('Thread ID is required');
-  const { data } = await api.post(`/api/v1/threads/${threadId}/share`, body);
-  return data;
+export function updateThreadSharing(threadId: string, body: Record<string, unknown>) {
+  if (!threadId) return Promise.reject(new Error('Thread ID is required'));
+  return shareWrites(threadId, async () => {
+    const { data } = await api.post(`/api/v1/threads/${threadId}/share`, body, { timeout: QUEUED_WRITE_TIMEOUT_MS });
+    return data;
+  });
 }
 
 // --- Compaction ---

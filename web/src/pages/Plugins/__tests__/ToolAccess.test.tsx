@@ -474,7 +474,7 @@ describe('the order gates under a trading permission', () => {
     expect(paper).toHaveAttribute('aria-checked', 'false');
     expect(paper).not.toBeDisabled();
     for (const link of screen.getAllByRole('link', { name: 'change your trading permission' })) {
-      expect(link).toHaveAttribute('href', '/settings?tab=preferences#trading-permission');
+      expect(link).toHaveAttribute('href', '/settings?tab=trading#trading-permission');
     }
   });
 

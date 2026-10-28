@@ -1622,7 +1622,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
             )}
             {/* DALTON-HOOK(workspace-sharing-settings): hide ShareButton for colleagues */}
             {/* DALTON-HOOK(colleague-dispatch): hide ShareButton on read-only foreign threads */}
-            {currentThreadId && currentThreadId !== '__default__' && !isThreadReadOnly && (
+            {currentThreadId && currentThreadId !== '__default__' && !isThreadReadOnly && !teamReadOnly.isColleague && (
               <ShareButton threadId={currentThreadId} initialIsShared={threadIsShared} workspaceId={workspaceId} />
             )}
             {/* On desktop the open panel carries this toggle in the same

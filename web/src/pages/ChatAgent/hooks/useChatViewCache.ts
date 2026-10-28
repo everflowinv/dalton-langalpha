@@ -96,5 +96,12 @@ export function useChatViewCache() {
   // top of its transcript.
   const mounted = useMemo(() => [...entries].sort((a, b) => a.instanceId - b.instanceId), [entries]);
 
-  return { entries, mounted, touch, updateKey };
+  // Drop the views of threads that no longer exist, but the one on screen,
+  // which its route still shows until it moves on.
+  const evict = useCallback((threadIds: ReadonlySet<string>, keepThreadId?: string) => {
+    const gone = (e: CacheEntry) => threadIds.has(e.threadId) && e.threadId !== keepThreadId;
+    setEntries(prev => (prev.some(gone) ? prev.filter(e => !gone(e)) : prev));
+  }, []);
+
+  return { entries, mounted, touch, updateKey, evict };
 }

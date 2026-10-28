@@ -108,7 +108,7 @@ function renderAccountTab() {
   });
   return render(
     <QueryClientProvider client={queryClient}>
-      <MemoryRouter initialEntries={['/settings?tab=userInfo']}>
+      <MemoryRouter initialEntries={['/settings?tab=appearance']}>
         <Settings />
       </MemoryRouter>
     </QueryClientProvider>,

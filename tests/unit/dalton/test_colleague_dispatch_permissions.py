@@ -2542,3 +2542,253 @@ async def test_delegate_to_analyst_cleans_up_precreated_colleague_thread_and_sur
     assert create_mock.await_count == 1
     created_tid = create_mock.await_args.kwargs["conversation_thread_id"]
     delete_mock.assert_awaited_once_with(created_tid)
+
+
+@pytest.mark.asyncio
+async def test_context_menu_backend_guards_across_four_identities(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify backend guards for sidebar context menu actions (rename, archive, delete, share,
+    workspace delete guard) across owner, dispatcher, bystander colleague, and external member."""
+    from src.dalton.database import publications as dalton_pubs
+    from src.server.app import workspaces as workspaces_app
+    from src.server.app.threads import crud as threads_crud
+    from src.server.app.threads import sharing as threads_sharing
+    from src.server.database import conversation as conv_pkg
+    from src.server.models.conversation import ThreadShareRequest, ThreadUpdateRequest
+
+    _setup_roles(
+        monkeypatch,
+        dispatch_enabled=True,
+        cos_sharing_by_owner={"u-internal-b": True},
+        web_sharing_by_ws={"ws-b": "rw"},
+    )
+
+    own_thread_id = "11111111-1111-4111-8111-111111111111"
+    dispatched_thread_id = "22222222-2222-4222-8222-222222222222"
+
+    meta_by_tid = {
+        own_thread_id: {
+            "workspace_id": "ws-b",
+            "user_id": "u-internal-b",
+            "owner_id": "u-internal-b",
+            "thread_user_id": "u-internal-b",
+            "workspace_owner_id": "u-internal-b",
+        },
+        dispatched_thread_id: {
+            "workspace_id": "ws-b",
+            "user_id": "u-internal-a",
+            "owner_id": "u-internal-a",
+            "thread_user_id": "u-internal-a",
+            "workspace_owner_id": "u-internal-b",
+        },
+    }
+    row_by_tid = {
+        own_thread_id: {
+            "conversation_thread_id": own_thread_id,
+            "workspace_id": "ws-b",
+            "user_id": "u-internal-b",
+            "thread_user_id": "u-internal-b",
+            "workspace_owner_id": "u-internal-b",
+            "thread_index": 0,
+            "current_status": "completed",
+            "title": "Owner Thread",
+            "is_shared": False,
+            "is_pinned": False,
+            "archived_at": None,
+            "subagents_allowed": True,
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "share_token": "tok-own",
+            "share_permissions": {},
+        },
+        dispatched_thread_id: {
+            "conversation_thread_id": dispatched_thread_id,
+            "workspace_id": "ws-b",
+            "user_id": "u-internal-a",
+            "thread_user_id": "u-internal-a",
+            "workspace_owner_id": "u-internal-b",
+            "thread_index": 1,
+            "current_status": "completed",
+            "title": "Dispatched Thread",
+            "is_shared": False,
+            "is_pinned": False,
+            "archived_at": None,
+            "subagents_allowed": True,
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "share_token": None,
+            "share_permissions": {},
+        },
+    }
+
+    async def _fake_owner_id(tid: str, *, conn: Any = None) -> str | None:
+        m = meta_by_tid.get(tid)
+        return m["user_id"] if m else None
+
+    async def _fake_auth_meta(tid: str, *, conn: Any = None) -> dict[str, Any] | None:
+        return meta_by_tid.get(tid)
+
+    async def _fake_thread_by_id(tid: str) -> dict[str, Any] | None:
+        return row_by_tid.get(tid)
+
+    monkeypatch.setattr(
+        conv_pkg,
+        "get_thread_owner_id",
+        create_autospec(conv_pkg.get_thread_owner_id, side_effect=_fake_owner_id),
+    )
+    monkeypatch.setattr(
+        conv_pkg,
+        "get_thread_auth_meta",
+        create_autospec(conv_pkg.get_thread_auth_meta, side_effect=_fake_auth_meta),
+    )
+    monkeypatch.setattr(
+        threads_sharing,
+        "get_thread_by_id",
+        create_autospec(threads_sharing.get_thread_by_id, side_effect=_fake_thread_by_id),
+    )
+    monkeypatch.setattr(
+        threads_sharing,
+        "update_thread_sharing",
+        create_autospec(
+            threads_sharing.update_thread_sharing,
+            return_value={
+                "is_shared": True,
+                "share_token": "tok-own",
+                "share_permissions": {},
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        threads_crud,
+        "update_thread_fields",
+        create_autospec(
+            threads_crud.update_thread_fields,
+            side_effect=lambda tid, **kw: {**row_by_tid[tid], **kw},
+        ),
+    )
+    monkeypatch.setattr(
+        threads_crud,
+        "publish_thread_title",
+        create_autospec(threads_crud.publish_thread_title),
+    )
+
+    # 1. Owner (u-internal-b) on own thread: rename & share succeed; on colleague-dispatched thread: 403
+    renamed_own = await threads_crud.update_thread_endpoint(
+        own_thread_id,
+        ThreadUpdateRequest(title="Renamed by owner"),
+        x_user_id="u-internal-b",
+    )
+    assert renamed_own.title == "Renamed by owner"
+
+    shared_own = await threads_sharing.update_thread_share(
+        own_thread_id,
+        ThreadShareRequest(is_shared=True),
+        x_user_id="u-internal-b",
+    )
+    assert shared_own.is_shared is True
+
+    for fn in (
+        lambda: threads_crud.update_thread_endpoint(
+            dispatched_thread_id,
+            ThreadUpdateRequest(title="Owner hijack"),
+            x_user_id="u-internal-b",
+        ),
+        lambda: threads_crud.delete_thread_endpoint(
+            dispatched_thread_id, x_user_id="u-internal-b"
+        ),
+        lambda: threads_sharing.update_thread_share(
+            dispatched_thread_id,
+            ThreadShareRequest(is_shared=True),
+            x_user_id="u-internal-b",
+        ),
+        lambda: threads_sharing.get_thread_share(
+            dispatched_thread_id, x_user_id="u-internal-b"
+        ),
+    ):
+        with pytest.raises(HTTPException) as exc_owner_on_dispatched:
+            await fn()
+        assert exc_owner_on_dispatched.value.status_code == 403
+
+    # 2. Dispatcher (u-internal-a) on own dispatched thread: rename succeeds, but public share is 403
+    renamed_disp = await threads_crud.update_thread_endpoint(
+        dispatched_thread_id,
+        ThreadUpdateRequest(title="Renamed by dispatcher"),
+        x_user_id="u-internal-a",
+    )
+    assert renamed_disp.title == "Renamed by dispatcher"
+
+    with pytest.raises(HTTPException) as exc_disp_share:
+        await threads_sharing.update_thread_share(
+            dispatched_thread_id,
+            ThreadShareRequest(is_shared=True),
+            x_user_id="u-internal-a",
+        )
+    assert exc_disp_share.value.status_code == 403
+
+    with pytest.raises(HTTPException) as exc_disp_get_share:
+        await threads_sharing.get_thread_share(
+            dispatched_thread_id, x_user_id="u-internal-a"
+        )
+    assert exc_disp_get_share.value.status_code == 403
+
+    # 3. Bystander colleague (u-admin) on either thread: rename, delete, share all 403
+    for tid in (own_thread_id, dispatched_thread_id):
+        with pytest.raises(HTTPException) as exc_bystander_upd:
+            await threads_crud.update_thread_endpoint(
+                tid, ThreadUpdateRequest(title="Bystander"), x_user_id="u-admin"
+            )
+        assert exc_bystander_upd.value.status_code == 403
+
+        with pytest.raises(HTTPException) as exc_bystander_del:
+            await threads_crud.delete_thread_endpoint(tid, x_user_id="u-admin")
+        assert exc_bystander_del.value.status_code == 403
+
+        with pytest.raises(HTTPException) as exc_bystander_share:
+            await threads_sharing.update_thread_share(
+                tid, ThreadShareRequest(is_shared=True), x_user_id="u-admin"
+            )
+        assert exc_bystander_share.value.status_code == 403
+
+    # 4. External member (u-external) on any foreign thread: strict 404 isolation
+    for tid in (own_thread_id, dispatched_thread_id):
+        with pytest.raises(HTTPException) as exc_ext_upd:
+            await threads_crud.update_thread_endpoint(
+                tid, ThreadUpdateRequest(title="External"), x_user_id="u-external"
+            )
+        assert exc_ext_upd.value.status_code == 404
+
+        with pytest.raises(HTTPException) as exc_ext_del:
+            await threads_crud.delete_thread_endpoint(tid, x_user_id="u-external")
+        assert exc_ext_del.value.status_code == 404
+
+        with pytest.raises(HTTPException) as exc_ext_share:
+            await threads_sharing.update_thread_share(
+                tid, ThreadShareRequest(is_shared=True), x_user_id="u-external"
+            )
+        assert exc_ext_share.value.status_code == 404
+
+    # 5. Published report workspace delete protection (409) preserved for owner
+    monkeypatch.setattr(
+        workspaces_app,
+        "db_get_workspace",
+        create_autospec(
+            workspaces_app.db_get_workspace,
+            return_value={
+                "workspace_id": "ws-b",
+                "user_id": "u-internal-b",
+                "name": "TSMC Workspace",
+                "is_home": False,
+                "status": "running",
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        dalton_pubs,
+        "has_published_reports",
+        create_autospec(dalton_pubs.has_published_reports, return_value=True),
+    )
+    with pytest.raises(HTTPException) as exc_pub_guard:
+        await workspaces_app.delete_workspace("ws-b", x_user_id="u-internal-b")
+    assert exc_pub_guard.value.status_code == 409
+    assert "已发布研报" in str(exc_pub_guard.value.detail)

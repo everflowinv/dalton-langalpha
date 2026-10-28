@@ -146,6 +146,9 @@ export const queryKeys = {
     recentAll:   () => [...queryKeys.threads.all, 'recent'],
     recent:      (limit: number) => [...queryKeys.threads.recentAll(), limit],
     status:      (threadId: string) => [...queryKeys.threads.all, 'status', threadId],
+    // The thread's public link: whether it is shared, its URL, what visitors
+    // may open. The chat header and every share panel read this one entry.
+    share:       (threadId: string) => [...queryKeys.threads.all, 'share', threadId],
     // The wakeups the agent set in the thread, and its price targets from
     // before them. Under the prefix, so a feed reconnect's resync re-reads it.
     wakeups:     (threadId: string) => [...queryKeys.threads.all, 'wakeups', threadId],

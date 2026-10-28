@@ -399,7 +399,7 @@ html.desktop-mac .sidebar-history {
 .sidebar-account-row-avatar {
   width: 28px;
   height: 28px;
-  border-radius: 999px;
+  border-radius: var(--radius);
   background: var(--color-accent-soft);
   color: var(--color-accent-light);
   display: flex;
@@ -528,7 +528,7 @@ html.desktop-mac .sidebar-history {
   position: relative;
   width: 32px;
   height: 32px;
-  border-radius: 999px;
+  border-radius: var(--radius);
   border: 1px solid transparent;
   background: var(--color-accent-soft);
   color: var(--color-accent-light);
@@ -536,7 +536,7 @@ html.desktop-mac .sidebar-history {
   align-items: center;
   justify-content: center;
   cursor: pointer;
-  overflow: visible;
+  overflow: hidden;
   padding: 0;
   transition: border-color var(--motion-quick) var(--ease-out), transform var(--motion-quick) var(--ease-out), box-shadow var(--motion-quick) var(--ease-out);
 }
@@ -558,7 +558,6 @@ html.desktop-mac .sidebar-history {
   width: 100%;
   height: 100%;
   object-fit: cover;
-  border-radius: 999px;
 }
 
 .sidebar-account-initials {

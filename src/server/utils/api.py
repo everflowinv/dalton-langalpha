@@ -292,6 +292,21 @@ async def require_thread_owner(thread_id: str, user_id: str, *, conn=None) -> No
     owner_id = await get_thread_owner_id(thread_id, conn=conn)
     if owner_id is None:
         raise HTTPException(status_code=404, detail="Thread not found")
+    # DALTON-HOOK(colleague-dispatch): external members never learn of foreign threads (404, not 403)
+    from src.dalton.settings import is_dalton_supabase_auth_enabled
+
+    if is_dalton_supabase_auth_enabled():
+        from src.dalton.sharing import get_user_tier
+
+        if await get_user_tier(user_id) == "external":
+            if owner_id != user_id:
+                raise HTTPException(status_code=404, detail="Thread not found")
+            from src.server.database.conversation import get_thread_auth_meta
+
+            meta = await get_thread_auth_meta(thread_id, conn=conn)
+            ws_owner = (meta or {}).get("workspace_owner_id")
+            if ws_owner and str(ws_owner) != str(user_id):
+                raise HTTPException(status_code=404, detail="Thread not found")
     if owner_id != user_id:
         raise HTTPException(status_code=403, detail="Forbidden")
 

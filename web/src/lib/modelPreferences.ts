@@ -11,7 +11,7 @@
 import * as z from 'zod/mini';
 import type { CustomModelEntry } from '@/components/model/types';
 import type { ModelProfile } from './modelTuning';
-import { modelList } from './favoriteModels';
+import { HIDDEN_KEY, STARRED_KEY, STARRED_ONLY_KEY, modelList } from './favoriteModels';
 
 export interface PreferencesLike {
   other_preference?: Record<string, unknown> | null;
@@ -245,6 +245,15 @@ export function splitPreferenceWrite(patch: PreferencePatch): {
     ...(Object.keys(model).length > 0 ? { model_preference: model } : {}),
     ...(Object.keys(other).length > 0 ? { other_preference: other } : {}),
   };
+}
+
+/** Whether a preferences write changes model configuration, as its variables
+ *  show: anything in the model column, or the quick-access lists that stayed
+ *  in `other_preference`. */
+export function isModelWrite(variables: unknown): boolean {
+  const patch = variables as PreferencesLike | null | undefined;
+  const other = patch?.other_preference ?? {};
+  return patch?.model_preference != null || [STARRED_KEY, HIDDEN_KEY, STARRED_ONLY_KEY].some((key) => key in other);
 }
 
 /** The models on the user's list. They stay in `other_preference` by design

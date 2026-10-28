@@ -117,6 +117,7 @@ vi.mock('@/hooks/useAllModels', () => ({
     // Stable Set ref — the stale-model cleanup effect keys on its identity.
     validModelNames: h.validModelNames,
     rawModels: h.rawModels,
+    catalogModelNames: new Set(Object.values(h.rawModels).flatMap((data) => data.models ?? [])),
     rawApiResponse: h.rawApiResponse,
     compactionProfiles: null,
     searchProviders: h.searchProviderCatalog,
@@ -130,8 +131,8 @@ vi.mock('@/components/ui/use-toast', () => ({
 }));
 
 // Debounced save. The model tab has no text input and writes on the change
-// event, but UserInfoTab (mounted by the same Settings shell) still debounces
-// its text fields.
+// event, but the Profile section (in the same Settings shell) still debounces
+// its name field.
 vi.mock('@/hooks/useDebouncedSave', () => ({
   useDebouncedSave: (saveFn: () => Promise<void>) => ({
     trigger: () => { setTimeout(() => { void saveFn(); }, 0); },
@@ -189,13 +190,13 @@ import Settings from '../Settings';
 // Helpers
 // ---------------------------------------------------------------------------
 
-function renderModelTab() {
+function renderSettings(tab: string) {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
   return render(
     <QueryClientProvider client={queryClient}>
-      <MemoryRouter initialEntries={['/settings?tab=model']}>
+      <MemoryRouter initialEntries={[`/settings?tab=${tab}`]}>
         <Settings />
       </MemoryRouter>
     </QueryClientProvider>,
@@ -204,7 +205,7 @@ function renderModelTab() {
 
 /** The search-provider select is the one with the "Web Search Provider" aria-label. */
 function getSearchProviderSelect() {
-  return screen.getByRole('combobox', { name: 'Web Search Provider' }) as HTMLSelectElement;
+  return screen.getByRole('combobox', { name: 'Web search provider' }) as HTMLSelectElement;
 }
 
 beforeEach(() => {
@@ -223,7 +224,8 @@ beforeEach(() => {
 });
 
 /** Build the stable user/preferences refs for the current scenario, then render. */
-function setupAndRenderModelTab() {
+/** The search controls live under Behavior; the model pickers under Models. */
+function setupAndRender(tab = 'agent') {
   h.user = {
     id: 'u-1',
     email: 'tester@example.com',
@@ -232,7 +234,7 @@ function setupAndRenderModelTab() {
     onboarding_completed: true,
   };
   h.preferences = { other_preference: h.otherPreference };
-  return renderModelTab();
+  return renderSettings(tab);
 }
 
 // ---------------------------------------------------------------------------
@@ -244,9 +246,9 @@ describe('Settings — Web Search Provider', () => {
     h.platformMode = false;
     h.accessTier = 0; // tier is irrelevant in OSS mode
 
-    setupAndRenderModelTab();
+    setupAndRender();
 
-    const select = await screen.findByRole('combobox', { name: 'Web Search Provider' });
+    const select = await screen.findByRole('combobox', { name: 'Web search provider' });
     expect(select).toBeEnabled();
 
     const options = Array.from(
@@ -263,9 +265,9 @@ describe('Settings — Web Search Provider', () => {
     h.platformMode = true;
     h.accessTier = 0;
 
-    setupAndRenderModelTab();
+    setupAndRender();
 
-    const select = await screen.findByRole('combobox', { name: 'Web Search Provider' });
+    const select = await screen.findByRole('combobox', { name: 'Web search provider' });
     expect(select).toBeDisabled();
     expect(
       screen.getByText('Some search providers are available on higher plans.'),
@@ -279,9 +281,9 @@ describe('Settings — Web Search Provider', () => {
     h.accessTier = 0;
     h.searchProviderCatalog = null;
 
-    setupAndRenderModelTab();
+    setupAndRender();
 
-    const select = await screen.findByRole('combobox', { name: 'Web Search Provider' });
+    const select = await screen.findByRole('combobox', { name: 'Web search provider' });
     expect(select).toBeDisabled();
     expect(
       screen.queryByText('Some search providers are available on higher plans.'),
@@ -292,9 +294,9 @@ describe('Settings — Web Search Provider', () => {
     h.platformMode = true;
     h.accessTier = 1;
 
-    setupAndRenderModelTab();
+    setupAndRender();
 
-    const select = await screen.findByRole('combobox', { name: 'Web Search Provider' });
+    const select = await screen.findByRole('combobox', { name: 'Web search provider' });
     expect(select).toBeEnabled();
     expect(
       screen.queryByText('Some search providers are available on higher plans.'),
@@ -311,9 +313,9 @@ describe('Settings — Web Search Provider', () => {
       serper: { ...h.fullCatalog.serper, min_tier: 2 },
     };
 
-    setupAndRenderModelTab();
+    setupAndRender();
 
-    const select = await screen.findByRole('combobox', { name: 'Web Search Provider' });
+    const select = await screen.findByRole('combobox', { name: 'Web search provider' });
     expect(select).toBeEnabled();
     expect(
       screen.getByText('Some search providers are available on higher plans.'),
@@ -325,7 +327,7 @@ describe('Settings — Web Search Provider', () => {
   it('loads the saved value from other_preference.search_provider', async () => {
     h.otherPreference = { search_provider: 'serper' };
 
-    setupAndRenderModelTab();
+    setupAndRender();
 
     await waitFor(() => {
       expect(getSearchProviderSelect().value).toBe('serper');
@@ -335,10 +337,10 @@ describe('Settings — Web Search Provider', () => {
   it('normalizes an unknown saved search_provider to Default', async () => {
     h.otherPreference = { search_provider: 'not-an-engine' };
 
-    setupAndRenderModelTab();
+    setupAndRender();
 
     // The load path validates against SEARCH_PROVIDERS and falls back to ''.
-    const select = await screen.findByRole('combobox', { name: 'Web Search Provider' });
+    const select = await screen.findByRole('combobox', { name: 'Web search provider' });
     await waitFor(() => {
       expect(select).toHaveValue('');
     });
@@ -347,17 +349,17 @@ describe('Settings — Web Search Provider', () => {
   it('changing the select saves search_provider through updatePreferences', async () => {
     h.platformMode = false;
 
-    setupAndRenderModelTab();
+    setupAndRender();
 
-    const select = await screen.findByRole('combobox', { name: 'Web Search Provider' });
+    const select = await screen.findByRole('combobox', { name: 'Web search provider' });
     await waitFor(() => expect(select).toHaveValue(''));
 
     fireEvent.change(select, { target: { value: 'serper' } });
 
     await waitFor(() => {
-      expect(h.mutate).toHaveBeenCalled();
+      expect(h.mutateAsync).toHaveBeenCalled();
     });
-    const payload = h.mutate.mock.calls.at(-1)![0] as {
+    const payload = h.mutateAsync.mock.calls.at(-1)![0] as {
       other_preference: Record<string, unknown>;
     };
     expect(payload.other_preference).toEqual({ search_provider: 'serper' });
@@ -372,12 +374,9 @@ describe('Settings — Web Search Provider', () => {
     h.accessTier = 0;
     h.otherPreference = { search_provider: 'serper', preferred_model: 'some-model' };
 
-    setupAndRenderModelTab();
+    setupAndRender('model');
 
-    const select = await screen.findByRole('combobox', { name: 'Web Search Provider' });
-    expect(select).toBeDisabled();
-
-    fireEvent.click(screen.getByText('stub-change-primary'));
+    fireEvent.click(await screen.findByText('stub-change-primary'));
 
     await waitFor(() => {
       expect(h.mutate).toHaveBeenCalled();
@@ -390,13 +389,13 @@ describe('Settings — Web Search Provider', () => {
 
 describe('Settings — Search Depth', () => {
   function getSearchDepthSelect() {
-    return screen.getByRole('combobox', { name: 'Search Depth' }) as HTMLSelectElement;
+    return screen.getByRole('combobox', { name: 'Search depth' }) as HTMLSelectElement;
   }
 
   it('renders the depth select for a multi-depth provider with the ordered manifest levels', async () => {
     h.otherPreference = { search_provider: 'tavily' };
 
-    setupAndRenderModelTab();
+    setupAndRender();
 
     const select = await waitFor(() => getSearchDepthSelect());
     const options = Array.from(select.querySelectorAll('option')).map(o => o.textContent);
@@ -406,13 +405,13 @@ describe('Settings — Search Depth', () => {
   it('hides the depth select for single-depth providers and when no provider is chosen', async () => {
     h.otherPreference = { search_provider: 'serper' };
 
-    setupAndRenderModelTab();
+    setupAndRender();
 
-    await screen.findByRole('combobox', { name: 'Web Search Provider' });
+    await screen.findByRole('combobox', { name: 'Web search provider' });
     await waitFor(() => {
       expect(getSearchProviderSelect().value).toBe('serper');
     });
-    expect(screen.queryByRole('combobox', { name: 'Search Depth' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('combobox', { name: 'Search depth' })).not.toBeInTheDocument();
   });
 
   it('platform mode: locks only the depth options above the user tier and shows the hint', async () => {
@@ -420,7 +419,7 @@ describe('Settings — Search Depth', () => {
     h.accessTier = 1; // matches the catalog: some depth levels require a higher tier
     h.otherPreference = { search_provider: 'tavily' };
 
-    setupAndRenderModelTab();
+    setupAndRender();
 
     const select = await waitFor(() => getSearchDepthSelect());
     expect(select).toBeEnabled();
@@ -437,7 +436,7 @@ describe('Settings — Search Depth', () => {
   it('loads the saved depth and normalizes a level the provider does not declare', async () => {
     h.otherPreference = { search_provider: 'tavily', search_depth: 'deep' };
 
-    setupAndRenderModelTab();
+    setupAndRender();
 
     await waitFor(() => {
       expect(getSearchDepthSelect().value).toBe('deep');
@@ -447,7 +446,7 @@ describe('Settings — Search Depth', () => {
   it('normalizes an unknown saved search_depth to Default', async () => {
     h.otherPreference = { search_provider: 'tavily', search_depth: 'warp9' };
 
-    setupAndRenderModelTab();
+    setupAndRender();
 
     const select = await waitFor(() => getSearchDepthSelect());
     await waitFor(() => {
@@ -458,7 +457,7 @@ describe('Settings — Search Depth', () => {
   it('changing the depth saves search_depth through updatePreferences', async () => {
     h.otherPreference = { search_provider: 'tavily' };
 
-    setupAndRenderModelTab();
+    setupAndRender();
 
     const select = await waitFor(() => getSearchDepthSelect());
     await waitFor(() => expect(select).toHaveValue(''));
@@ -466,9 +465,9 @@ describe('Settings — Search Depth', () => {
     fireEvent.change(select, { target: { value: 'deep' } });
 
     await waitFor(() => {
-      expect(h.mutate).toHaveBeenCalled();
+      expect(h.mutateAsync).toHaveBeenCalled();
     });
-    expect(h.mutate.mock.calls.at(-1)![0]).toEqual({
+    expect(h.mutateAsync.mock.calls.at(-1)![0]).toEqual({
       other_preference: { search_depth: 'deep' },
     });
   });
@@ -476,7 +475,7 @@ describe('Settings — Search Depth', () => {
   it('switching to a single-depth provider leaves the stored depth alone', async () => {
     h.otherPreference = { search_provider: 'tavily', search_depth: 'deep' };
 
-    setupAndRenderModelTab();
+    setupAndRender();
 
     const depthSelect = await waitFor(() => getSearchDepthSelect());
     await waitFor(() => expect(depthSelect).toHaveValue('deep'));
@@ -487,9 +486,9 @@ describe('Settings — Search Depth', () => {
     // user a value a switch back to tavily wants. (That the control itself goes
     // away is pinned above, off the stored provider.)
     await waitFor(() => {
-      expect(h.mutate).toHaveBeenCalled();
+      expect(h.mutateAsync).toHaveBeenCalled();
     });
-    expect(h.mutate.mock.calls.at(-1)![0]).toEqual({
+    expect(h.mutateAsync.mock.calls.at(-1)![0]).toEqual({
       other_preference: { search_provider: 'serper' },
     });
   });

@@ -4,6 +4,7 @@ import { useTranslation } from 'react-i18next';
 import { useQueryClient } from '@tanstack/react-query';
 import { Pin, Pencil, Copy, FolderOutput, Trash2 } from 'lucide-react';
 import { DropdownMenuItem, DropdownMenuSeparator } from '@/components/ui/dropdown-menu';
+import { ContextMenuItem, ContextMenuSeparator } from '@/components/ui/context-menu';
 import { toast } from '@/components/ui/use-toast';
 import { queryKeys } from '@/lib/queryKeys';
 import type { Computer } from '@/types/api';
@@ -37,8 +38,17 @@ export interface MenuWorkspace {
   [key: string]: unknown;
 }
 
+// The same items under either menu: the options button's dropdown or the
+// row's right-click menu. Radix ties an item to its own menu's context.
+const MENU_PARTS = {
+  dropdown: { Item: DropdownMenuItem, Separator: DropdownMenuSeparator },
+  context: { Item: ContextMenuItem, Separator: ContextMenuSeparator },
+} as const;
+
 interface WorkspaceMenuItemsProps<W extends MenuWorkspace> {
   workspace: W;
+  /** Which menu renders them. Defaults to a DropdownMenuContent. */
+  menu?: keyof typeof MENU_PARTS;
   onTogglePin?: (workspace: W) => void;
   onRename?: (workspace: W) => void;
   onDuplicate: (workspace: W) => void;
@@ -50,11 +60,12 @@ interface WorkspaceMenuItemsProps<W extends MenuWorkspace> {
 /**
  * The canonical workspace options menu — identical everywhere a workspace can
  * be managed (gallery card, sidebar tree, mobile drawer). Render inside a
- * DropdownMenuContent. Spec and always-on are the computer's, so they live in
+ * DropdownMenuContent, or a ContextMenuContent with `menu="context"`. Spec and always-on are the computer's, so they live in
  * the Computers dialog, not here.
  */
 export function WorkspaceMenuItems<W extends MenuWorkspace>({
   workspace,
+  menu = 'dropdown',
   onTogglePin,
   onRename,
   onDuplicate,
@@ -72,37 +83,38 @@ export function WorkspaceMenuItems<W extends MenuWorkspace>({
     !workspace.is_home
     && !!workspace.computer_id
     && liveComputers(computerData?.computers).filter(takesWorkspaces).length >= 2;
+  const { Item, Separator } = MENU_PARTS[menu];
 
   return (
     <>
       {onTogglePin && (
-        <DropdownMenuItem onSelect={() => onTogglePin(workspace)}>
+        <Item onSelect={() => onTogglePin(workspace)}>
           <Pin className="h-4 w-4" />
           {workspace.is_pinned ? t('workspace.unpin') : t('workspace.pinToTop')}
-        </DropdownMenuItem>
+        </Item>
       )}
       {onRename && (
-        <DropdownMenuItem onSelect={() => onRename(workspace)}>
+        <Item onSelect={() => onRename(workspace)}>
           <Pencil className="h-4 w-4" />
           {t('workspace.rename')}
-        </DropdownMenuItem>
+        </Item>
       )}
-      {(onTogglePin || onRename) && <DropdownMenuSeparator />}
-      <DropdownMenuItem onSelect={() => onDuplicate(workspace)}>
+      {(onTogglePin || onRename) && <Separator />}
+      <Item onSelect={() => onDuplicate(workspace)}>
         <Copy className="h-4 w-4" />
         {t('workspace.duplicate', 'Duplicate')}
-      </DropdownMenuItem>
+      </Item>
       {onMove && canMove && (
-        <DropdownMenuItem onSelect={() => onMove(workspace)}>
+        <Item onSelect={() => onMove(workspace)}>
           <FolderOutput className="h-4 w-4" />
           {t('workspace.move.menu', 'Move to computer…')}
-        </DropdownMenuItem>
+        </Item>
       )}
-      <DropdownMenuSeparator />
-      <DropdownMenuItem variant="destructive" onSelect={() => onDelete(workspace)}>
+      <Separator />
+      <Item variant="destructive" onSelect={() => onDelete(workspace)}>
         <Trash2 className="h-4 w-4" />
         {t('common.delete', 'Delete')}
-      </DropdownMenuItem>
+      </Item>
     </>
   );
 }

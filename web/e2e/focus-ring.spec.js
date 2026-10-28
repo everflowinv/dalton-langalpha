@@ -542,13 +542,13 @@ test.describe('a field left focused while the user is in another app', () => {
  * way.
  */
 test.describe('a native select', () => {
-  // The language field, the one native select on this tab. Named rather than
+  // The language field, the one native select on General. Named rather than
   // taken positionally so the helpers below stay strict: a selector matching
   // two controls should fail loudly, not silently pick one.
   const SELECT = 'select:has(option[value="zh-CN"])';
 
   test.beforeEach(async ({ page }) => {
-    await page.goto('/settings');
+    await page.goto('/settings?tab=general');
     await expect(page.locator(SELECT)).toBeVisible(FIRST_PAINT);
   });
 

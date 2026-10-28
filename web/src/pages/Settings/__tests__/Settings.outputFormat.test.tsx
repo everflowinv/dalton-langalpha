@@ -111,6 +111,7 @@ vi.mock('@/pages/Onboarding', () => ({
 
 // Import after mocks are registered.
 import Settings from '../Settings';
+import { readSection, searchableSettings, sectionShown } from '../sections';
 
 function renderPreferencesTab() {
   const queryClient = new QueryClient({
@@ -118,7 +119,7 @@ function renderPreferencesTab() {
   });
   return render(
     <QueryClientProvider client={queryClient}>
-      <MemoryRouter initialEntries={['/settings?tab=preferences']}>
+      <MemoryRouter initialEntries={['/settings?tab=agent']}>
         <Settings />
       </MemoryRouter>
     </QueryClientProvider>,
@@ -150,9 +151,8 @@ describe('Settings — Output format', () => {
 
     const defaultBtn = await screen.findByRole('button', { name: 'Default' });
     const htmlBtn = screen.getByRole('button', { name: 'HTML' });
-    // The active segment uses the accent color; the inactive one uses tertiary.
-    expect(defaultBtn).toHaveStyle({ color: 'var(--color-accent-primary)' });
-    expect(htmlBtn).toHaveStyle({ color: 'var(--color-text-tertiary)' });
+    expect(defaultBtn).toHaveAttribute('aria-pressed', 'true');
+    expect(htmlBtn).toHaveAttribute('aria-pressed', 'false');
   });
 
   it('reflects the saved html value as the active segment', async () => {
@@ -160,8 +160,8 @@ describe('Settings — Output format', () => {
 
     const defaultBtn = await screen.findByRole('button', { name: 'Default' });
     const htmlBtn = screen.getByRole('button', { name: 'HTML' });
-    expect(htmlBtn).toHaveStyle({ color: 'var(--color-accent-primary)' });
-    expect(defaultBtn).toHaveStyle({ color: 'var(--color-text-tertiary)' });
+    expect(htmlBtn).toHaveAttribute('aria-pressed', 'true');
+    expect(defaultBtn).toHaveAttribute('aria-pressed', 'false');
   });
 
   it('selecting HTML saves output_format: "html" through updatePreferences', async () => {
@@ -190,17 +190,14 @@ describe('Settings — Output format', () => {
     expect(payload.agent_preference.output_format).toBeNull();
   });
 
-  it('preserves other agent_preference keys when changing output format', async () => {
+  it('writes only output_format, leaving other agent_preference keys to the server merge', async () => {
     setupAndRender({ tone: 'concise' });
 
     const htmlBtn = await screen.findByRole('button', { name: 'HTML' });
     fireEvent.click(htmlBtn);
 
     await waitFor(() => expect(h.mutateAsync).toHaveBeenCalled());
-    const payload = h.mutateAsync.mock.calls.at(-1)![0] as {
-      agent_preference: Record<string, unknown>;
-    };
-    expect(payload.agent_preference).toMatchObject({ tone: 'concise', output_format: 'html' });
+    expect(h.mutateAsync.mock.calls.at(-1)![0]).toEqual({ agent_preference: { output_format: 'html' } });
   });
 
   it('does not duplicate output_format as a read-only row', async () => {
@@ -249,5 +246,49 @@ describe('Settings — Output format', () => {
     expect(screen.queryByText(/Early-access features still in development/i)).not.toBeInTheDocument();
     expect(await screen.findByDisplayValue('Tester')).toBeInTheDocument();
     unmount();
+  });
+
+  // DALTON-HOOK(hide-trading): trading and experiments stay closed in registry, search, and deep links
+  it('closes trading and experiments across registry, search, and deep links', () => {
+    expect(sectionShown('trading')).toBe(false);
+    expect(sectionShown('experiments')).toBe(false);
+
+    const searchableAnchors = searchableSettings(true).map((entry) => entry.anchor);
+    expect(searchableAnchors).not.toContain('trading-permission');
+    expect(searchableAnchors).not.toContain('experiments');
+
+    expect(
+      readSection(new URLSearchParams('tab=trading'), '#trading-permission'),
+    ).toBe('account');
+    expect(
+      readSection(new URLSearchParams('tab=experiments'), '#experiments'),
+    ).toBe('account');
+  });
+
+  // DALTON-HOOK(settings-section): legacy Settings deep links and Dalton Chinese search keywords
+  it('resolves legacy tab params and hashes to their new sections', () => {
+    expect(readSection(new URLSearchParams('tab=userInfo'), '')).toBe('account');
+    expect(readSection(new URLSearchParams('tab=models'), '')).toBe('model');
+    expect(readSection(new URLSearchParams('tab=dalton'), '')).toBe('model');
+    expect(readSection(new URLSearchParams('tab=preferences'), '#card-style')).toBe('appearance');
+    expect(readSection(new URLSearchParams('tab=preferences'), '#output-format')).toBe('agent');
+    expect(readSection(new URLSearchParams(), '#dalton-budget')).toBe('model');
+    expect(readSection(new URLSearchParams(), '#dalton-cos-sharing')).toBe('model');
+    expect(readSection(new URLSearchParams(), '#dalton-reviewer-models')).toBe('model');
+  });
+
+  it('finds Dalton settings in search by Chinese keywords ("预算", "审稿", "研究总监")', async () => {
+    setupAndRender({});
+
+    const searchInput = await screen.findByRole('combobox', { name: /Search settings/i });
+
+    fireEvent.change(searchInput, { target: { value: '预算' } });
+    expect(await screen.findByText('Daily budget & spending limits')).toBeInTheDocument();
+
+    fireEvent.change(searchInput, { target: { value: '审稿' } });
+    expect(await screen.findByText('Independent reviewer candidates')).toBeInTheDocument();
+
+    fireEvent.change(searchInput, { target: { value: '研究总监' } });
+    expect(await screen.findByText('Chief of Staff workspace sharing')).toBeInTheDocument();
   });
 });

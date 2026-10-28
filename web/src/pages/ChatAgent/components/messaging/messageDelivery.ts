@@ -53,6 +53,9 @@ const APP_NAMES = new Map([
   ['feishu', 'Feishu'],
 ]);
 
+/** Every app a message can go through, in the order the reader knows them. */
+export const MESSAGING_APPS: readonly string[] = [...APP_NAMES.keys()];
+
 /** The site whose favicon stands for each app. */
 const APP_DOMAINS = new Map([
   ['slack', 'slack.com'],

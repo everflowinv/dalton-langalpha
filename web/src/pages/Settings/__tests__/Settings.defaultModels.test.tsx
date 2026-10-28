@@ -94,6 +94,7 @@ vi.mock('@/hooks/useAllModels', () => ({
     // Stable Set ref — the stale-model cleanup effect keys on its identity.
     validModelNames: h.validModelNames,
     rawModels: h.rawModels,
+    catalogModelNames: new Set(Object.values(h.rawModels).flatMap((data) => data.models ?? [])),
     rawApiResponse: h.rawApiResponse,
     compactionProfiles: null,
     searchProviders: h.searchProviderCatalog,
@@ -108,8 +109,8 @@ vi.mock('@/components/ui/use-toast', () => ({
 }));
 
 // Debounced save. The model tab has no text input and writes on the change
-// event, but UserInfoTab (mounted by the same Settings shell) still debounces
-// its text fields.
+// event, but the Profile section (in the same Settings shell) still debounces
+// its name field.
 vi.mock('@/hooks/useDebouncedSave', () => ({
   useDebouncedSave: (saveFn: () => Promise<void>) => ({
     trigger: () => { setTimeout(() => { void saveFn(); }, 0); },

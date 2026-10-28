@@ -11,14 +11,24 @@ export function DaltonSection({ advanced = false }: { advanced?: boolean } = {})
   return (
     <div className="flex flex-col gap-3">
       <DaltonCosSharingCard />
-      <DaltonInvitesCard />
-      <FeishuReadScopesCard />
-      <ProviderStatusCard />
+      <div id="dalton-invites">
+        <DaltonInvitesCard />
+      </div>
+      <div id="dalton-feishu-scopes">
+        <FeishuReadScopesCard />
+      </div>
+      <div id="dalton-providers">
+        <ProviderStatusCard />
+      </div>
       <DaltonBudgetCard />
-      <DaltonNotifyTargetsCard />
-      <DaltonSystemJobsCard
-        scopes={advanced ? ['company', 'home', 'host', 'ops'] : ['company', 'home']}
-      />
+      <div id="dalton-notify-targets">
+        <DaltonNotifyTargetsCard />
+      </div>
+      <div id="dalton-system-jobs">
+        <DaltonSystemJobsCard
+          scopes={advanced ? ['company', 'home', 'host', 'ops'] : ['company', 'home']}
+        />
+      </div>
     </div>
   );
 }

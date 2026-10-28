@@ -46,6 +46,14 @@ async def update_thread_share(
     if not thread:
         raise HTTPException(status_code=404, detail="Thread not found")
 
+    # DALTON-HOOK(colleague-dispatch): public thread sharing requires owning both thread and workspace
+    from src.dalton.settings import is_dalton_supabase_auth_enabled
+
+    if is_dalton_supabase_auth_enabled():
+        ws_owner = thread.get("workspace_owner_id")
+        if ws_owner and str(ws_owner) != str(x_user_id):
+            raise HTTPException(status_code=403, detail="Forbidden")
+
     # Build update kwargs
     kwargs: dict = {"is_shared": request.is_shared}
 
@@ -92,6 +100,14 @@ async def get_thread_share(thread_id: str, x_user_id: CurrentUserId):
     thread = await get_thread_by_id(thread_id)
     if not thread:
         raise HTTPException(status_code=404, detail="Thread not found")
+
+    # DALTON-HOOK(colleague-dispatch): public thread sharing requires owning both thread and workspace
+    from src.dalton.settings import is_dalton_supabase_auth_enabled
+
+    if is_dalton_supabase_auth_enabled():
+        ws_owner = thread.get("workspace_owner_id")
+        if ws_owner and str(ws_owner) != str(x_user_id):
+            raise HTTPException(status_code=403, detail="Forbidden")
 
     share_token = thread.get("share_token")
     is_shared = thread.get("is_shared", False)

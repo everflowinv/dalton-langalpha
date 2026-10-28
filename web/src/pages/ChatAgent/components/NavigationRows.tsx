@@ -9,14 +9,25 @@
  * (./navTreeKit) finds its twin in the new tree by it, to carry focus and
  * animation clocks across. An element without one has no twin.
  */
-import React, { memo, useCallback } from 'react';
+import React, { memo, useCallback, useContext, useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
+import { QueryClientContext } from '@tanstack/react-query';
 import {
   ChevronRight, Folder, FolderOpen, Pin,
   X, ChevronsDown, MoreHorizontal, SquarePen, Archive,
+  ExternalLink, Pencil, Share2, Link2, Trash2,
   type LucideIcon,
 } from 'lucide-react';
 import { DropdownMenu, DropdownMenuContent, DropdownMenuTrigger } from '../../../components/ui/dropdown-menu';
+import {
+  ContextMenu, ContextMenuContent, ContextMenuItem, ContextMenuSeparator, ContextMenuTrigger,
+} from '../../../components/ui/context-menu';
+import { toast } from '@/components/ui/use-toast';
+import { copyText } from '@/lib/clipboard';
+import { isDesktopShell } from '@/lib/desktop';
+import { isImeComposing } from '@/lib/ime';
+// DALTON-HOOK(colleague-dispatch): read cached user and team workspace permissions for sidebar row gating
+import { queryKeys } from '@/lib/queryKeys';
 import { HoverCard, HoverCardContent, HoverCardTrigger } from '../../../components/ui/hover-card';
 import { mediumDate, relativeTime } from '@/lib/format';
 import { Loader } from '@/components/ui/loader';
@@ -27,6 +38,8 @@ import { useWorkspaceLabel } from '@/hooks/useWorkspaceLabel';
 import { HomeRowIcon } from '@/hooks/useHomeWorkspace';
 import { isHomeWorkspace } from '@/lib/homeWorkspace';
 import { useThreadFlags } from '@/lib/threadLifecycle/store';
+import type { User } from '@/types/api';
+import type { TeamWorkspacesResponse } from './dalton/TeamSharing';
 import { sidebarAgentRowLabel, type SidebarAgentRow } from '../session/subagents/subagentStatus';
 import { SubagentStatusIcon } from './taskStatusUi';
 import type { NavWorkspace } from '../hooks/useNavigationData';
@@ -109,11 +122,23 @@ const CHEVRON_CLASS = 'h-4 w-4 transition-transform duration-fold';
 // callback). Fades softly when a live title rewrite lands (auto-title,
 // rename); static on first paint. No native `title` attr — the metadata
 // hover card carries the full title (a browser tooltip would double up).
-function ThreadRowTitle({ tid, title, active }: { tid: string; title: string; active: boolean }) {
+/* The row's keyboard stop: Enter opens the thread, and Shift+F10 or the Menu
+   key opens the row's menu. The title takes it, not the row, so no control
+   sits inside a button (the row holds the pin, archive and agents buttons). */
+function ThreadRowTitle({ tid, title, active, onActivate }: {
+  tid: string; title: string; active: boolean; onActivate: () => void;
+}) {
   const fading = useTitleFade(title);
   return (
     <span
       data-nav-key={`thread:${tid}:title`}
+      role="button"
+      tabIndex={0}
+      onKeyDown={(e) => {
+        if (e.key !== 'Enter' && e.key !== ' ') return;
+        e.preventDefault();
+        onActivate();
+      }}
       className={`text-sm truncate${fading ? ' animate-fade-in' : ''}`}
       style={{ color: active ? 'var(--color-text-primary)' : 'var(--color-text-secondary)' }}
     >
@@ -266,8 +291,250 @@ export function AgentRow({ agent, isSelected, isMobile, onSelectAgent, onRemoveA
   );
 }
 
+// DALTON-HOOK(colleague-dispatch): resolve workspace & thread context-menu permissions across owner, dispatcher, bystander colleague, and external member
+export interface NavAccessContext {
+  currentUserId?: string | null;
+  callerTier?: 'admin' | 'internal' | 'external' | string | null;
+  colleagueDispatchEnabled?: boolean;
+  teamMembers?: Array<{
+    user_id: string;
+    workspaces: Array<{
+      workspace_id: string;
+      web_access?: string | null;
+      access?: string | null;
+    }>;
+  }>;
+}
+
+export interface NavWorkspacePermissions {
+  isColleagueWorkspace: boolean;
+  isIsolatedExternal: boolean;
+  canManageWorkspace: boolean;
+  canCreateThread: boolean;
+}
+
+export interface NavThreadPermissions {
+  isColleagueWorkspace: boolean;
+  isForeignThread: boolean;
+  isDispatcherOwnThread: boolean;
+  isIsolatedExternal: boolean;
+  canMutateThread: boolean;
+  canShareThread: boolean;
+  canCopyOrOpen: boolean;
+}
+
+export function resolveNavWorkspacePermissions(
+  ws: Partial<NavWorkspace> | null | undefined,
+  ctx?: NavAccessContext,
+): NavWorkspacePermissions {
+  if (!ws) {
+    return {
+      isColleagueWorkspace: false,
+      isIsolatedExternal: false,
+      canManageWorkspace: false,
+      canCreateThread: false,
+    };
+  }
+  const wsId = ws.workspace_id ?? '';
+  const wsOwnerId = ((ws as Record<string, unknown>).user_id as string | null | undefined) ?? null;
+  const currentUserId = ctx?.currentUserId ?? null;
+  const callerTier = ctx?.callerTier ?? null;
+  const effectiveAccess =
+    ((ws as Record<string, unknown>).effective_web_access as string | null | undefined) ?? null;
+
+  let matchedTeamWs: { workspace_id: string; web_access?: string | null; access?: string | null } | undefined;
+  for (const member of ctx?.teamMembers ?? []) {
+    if (currentUserId && member.user_id === currentUserId) continue;
+    const found = member.workspaces.find((item) => item.workspace_id === wsId);
+    if (found) {
+      matchedTeamWs = found;
+      break;
+    }
+  }
+
+  const isColleagueWorkspace = Boolean(
+    (effectiveAccess && effectiveAccess !== 'owner') ||
+      (wsOwnerId && currentUserId && wsOwnerId !== currentUserId) ||
+      matchedTeamWs,
+  );
+  const isIsolatedExternal = Boolean(callerTier === 'external' && isColleagueWorkspace);
+  if (isIsolatedExternal) {
+    return {
+      isColleagueWorkspace: true,
+      isIsolatedExternal: true,
+      canManageWorkspace: false,
+      canCreateThread: false,
+    };
+  }
+  if (isColleagueWorkspace) {
+    const rawAccess =
+      (effectiveAccess === 'rw' || effectiveAccess === 'ro' || effectiveAccess === 'thread_only'
+        ? effectiveAccess
+        : null) ??
+      matchedTeamWs?.web_access ??
+      matchedTeamWs?.access ??
+      'ro';
+    const dispatchEnabled = Boolean(
+      ((ws as Record<string, unknown>).colleague_dispatch_enabled as boolean | null | undefined) ??
+        ctx?.colleagueDispatchEnabled ??
+        false,
+    );
+    return {
+      isColleagueWorkspace: true,
+      isIsolatedExternal: false,
+      canManageWorkspace: false,
+      canCreateThread: Boolean(dispatchEnabled && rawAccess === 'rw'),
+    };
+  }
+  return {
+    isColleagueWorkspace: false,
+    isIsolatedExternal: false,
+    canManageWorkspace: !isHomeWorkspace(ws as NavWorkspace),
+    canCreateThread: true,
+  };
+}
+
+export function resolveNavThreadPermissions(
+  thread: ThreadEntry | null | undefined,
+  ws?: Partial<NavWorkspace> | null,
+  ctx?: NavAccessContext,
+): NavThreadPermissions {
+  const wsId = (ws?.workspace_id ?? (thread?.workspace_id as string | undefined) ?? '') as string;
+  const wsPerms = resolveNavWorkspacePermissions(ws ?? { workspace_id: wsId }, ctx);
+  const threadUserId =
+    ((thread?.thread_user_id as string | null | undefined) ??
+      (thread?.user_id as string | null | undefined) ??
+      null) ||
+    null;
+  const wsOwnerId =
+    ((thread?.workspace_owner_id as string | null | undefined) ??
+      ((ws as Record<string, unknown> | null | undefined)?.user_id as string | null | undefined) ??
+      null) ||
+    null;
+  const rawDispatchedBy = (thread?.dispatched_by ??
+    (thread?.metadata as Record<string, unknown> | undefined)?.dispatched_by) as
+    | { user_id?: string | null }
+    | null
+    | undefined;
+  const dispatchedByUserId = (rawDispatchedBy?.user_id ?? null) || null;
+  const effectiveThreadOwnerId = threadUserId || dispatchedByUserId || null;
+  const currentUserId = (ctx?.currentUserId ?? null) || null;
+  const callerTier = (ctx?.callerTier ?? null) || null;
+
+  const isColleagueWorkspace = Boolean(
+    wsPerms.isColleagueWorkspace || (wsOwnerId && currentUserId && wsOwnerId !== currentUserId),
+  );
+  const isForeignThread = Boolean(
+    (effectiveThreadOwnerId && currentUserId && effectiveThreadOwnerId !== currentUserId) ||
+      (dispatchedByUserId && (!currentUserId || dispatchedByUserId !== currentUserId)) ||
+      (!isColleagueWorkspace &&
+        effectiveThreadOwnerId &&
+        wsOwnerId &&
+        effectiveThreadOwnerId !== wsOwnerId),
+  );
+  const isIsolatedExternal = Boolean(
+    callerTier === 'external' &&
+      (isColleagueWorkspace ||
+        isForeignThread ||
+        (wsOwnerId && (!currentUserId || wsOwnerId !== currentUserId)) ||
+        (effectiveThreadOwnerId && (!currentUserId || effectiveThreadOwnerId !== currentUserId))),
+  );
+  if (isIsolatedExternal) {
+    return {
+      isColleagueWorkspace,
+      isForeignThread: true,
+      isDispatcherOwnThread: false,
+      isIsolatedExternal: true,
+      canMutateThread: false,
+      canShareThread: false,
+      canCopyOrOpen: false,
+    };
+  }
+  const effectiveAccess =
+    ((ws as Record<string, unknown> | null | undefined)?.effective_web_access as
+      | string
+      | null
+      | undefined) ?? null;
+  const isColleagueRo = effectiveAccess === 'ro' || effectiveAccess === 'thread_only';
+  const isDispatcherOwnThread = Boolean(
+    isColleagueWorkspace &&
+      !isColleagueRo &&
+      currentUserId &&
+      ((threadUserId && threadUserId === currentUserId) ||
+        (dispatchedByUserId && dispatchedByUserId === currentUserId)),
+  );
+  if (isColleagueWorkspace) {
+    if (isDispatcherOwnThread) {
+      return {
+        isColleagueWorkspace: true,
+        isForeignThread: false,
+        isDispatcherOwnThread: true,
+        isIsolatedExternal: false,
+        canMutateThread: true,
+        canShareThread: false,
+        canCopyOrOpen: true,
+      };
+    }
+    return {
+      isColleagueWorkspace: true,
+      isForeignThread: true,
+      isDispatcherOwnThread: false,
+      isIsolatedExternal: false,
+      canMutateThread: false,
+      canShareThread: false,
+      canCopyOrOpen: true,
+    };
+  }
+  if (isForeignThread) {
+    return {
+      isColleagueWorkspace: false,
+      isForeignThread: true,
+      isDispatcherOwnThread: false,
+      isIsolatedExternal: false,
+      canMutateThread: false,
+      canShareThread: false,
+      canCopyOrOpen: true,
+    };
+  }
+  return {
+    isColleagueWorkspace: false,
+    isForeignThread: false,
+    isDispatcherOwnThread: false,
+    isIsolatedExternal: false,
+    canMutateThread: true,
+    canShareThread: true,
+    canCopyOrOpen: true,
+  };
+}
+
+function useNavAccessContext(
+  currentUserIdProp?: string | null,
+  callerTierProp?: string | null,
+): NavAccessContext {
+  const queryClient = useContext(QueryClientContext);
+  const cachedUser = queryClient?.getQueryData<User | { user?: User }>(queryKeys.user.me());
+  const resolvedUser = (
+    cachedUser && typeof cachedUser === 'object' && 'user' in cachedUser
+      ? cachedUser.user
+      : cachedUser
+  ) as User | undefined;
+  const cachedTeam = queryClient?.getQueryData<TeamWorkspacesResponse>(
+    queryKeys.workspaces.team(),
+  );
+  return {
+    currentUserId:
+      currentUserIdProp !== undefined ? currentUserIdProp : (resolvedUser?.user_id ?? null),
+    callerTier:
+      callerTierProp !== undefined ? callerTierProp : (cachedTeam?.caller_tier ?? null),
+    colleagueDispatchEnabled: cachedTeam?.colleague_dispatch_enabled,
+    teamMembers: cachedTeam?.members,
+  };
+}
+
 export interface ThreadTreeRowProps {
   wsId: string;
+  // DALTON-HOOK(colleague-dispatch): pass workspace and caller identity into thread rows
+  ws?: NavWorkspace;
   thread: ThreadEntry;
   isCurrentThread: boolean;
   isExpanded: boolean;
@@ -275,125 +542,323 @@ export interface ThreadTreeRowProps {
   /** Subagent rows for the CURRENT thread only; absent on every other row. */
   agents?: SidebarAgentRow[];
   activeAgentId?: string | null;
+  // DALTON-HOOK(colleague-dispatch): pass caller identity and tier into WorkspaceTreeRow
+  currentUserId?: string | null;
+  callerTier?: string | null;
   onToggleThread: (threadId: string) => void;
   onNavigateThread: (wsId: string, threadId: string) => void;
   onSelectAgent: (agentId: string) => void;
   onRemoveAgent?: (agentId: string) => void;
   onPinThread?: (wsId: string, threadId: string, pinned: boolean) => void;
   onArchiveThread?: (wsId: string, threadId: string) => void;
+  onRenameThread?: (wsId: string, threadId: string, title: string, previousTitle: string) => void;
+  onShareThread?: (wsId: string, threadId: string) => void;
+  onDeleteThread?: (wsId: string, threadId: string, title: string) => void;
 }
 
+/** The thread's own address in the app, for a new tab or the clipboard. */
+function threadHref(threadId: string): string {
+  return new URL(`/chat/t/${threadId}`, window.location.origin).href;
+}
+
+interface ThreadRowMenuProps {
+  isPinned: boolean;
+  onCloseAutoFocus: (event: Event) => void;
+  /** Absent in the desktop app, which hands a new window of its own pages to the system browser. */
+  onOpenInNewTab?: () => void;
+  onCopyLink: () => void;
+  onTogglePin?: () => void;
+  onRename?: () => void;
+  onShare?: () => void;
+  onArchive?: () => void;
+  onDelete?: () => void;
+}
+
+// A thread row's right-click menu. Mounted only while open.
+function ThreadRowMenu({
+  isPinned, onCloseAutoFocus, onOpenInNewTab, onCopyLink, onTogglePin, onRename, onShare, onArchive, onDelete,
+}: ThreadRowMenuProps) {
+  const { t } = useTranslation();
+  return (
+    <ContextMenuContent className="min-w-44" onCloseAutoFocus={onCloseAutoFocus}>
+      {onOpenInNewTab && (
+        <ContextMenuItem onSelect={onOpenInNewTab}>
+          <ExternalLink className="h-4 w-4" />
+          {t('nav.openInNewTab')}
+        </ContextMenuItem>
+      )}
+      {onOpenInNewTab && (onTogglePin || onRename) && <ContextMenuSeparator />}
+      {onTogglePin && (
+        <ContextMenuItem onSelect={onTogglePin}>
+          <Pin className="h-4 w-4" />
+          {isPinned ? t('nav.unpinThread') : t('nav.pinToTop')}
+        </ContextMenuItem>
+      )}
+      {onRename && (
+        <ContextMenuItem onSelect={onRename}>
+          <Pencil className="h-4 w-4" />
+          {t('nav.renameThread')}
+        </ContextMenuItem>
+      )}
+      {(onOpenInNewTab || onTogglePin || onRename) && <ContextMenuSeparator />}
+      {onShare && (
+        <ContextMenuItem onSelect={onShare}>
+          <Share2 className="h-4 w-4" />
+          {t('nav.shareThread')}
+        </ContextMenuItem>
+      )}
+      <ContextMenuItem onSelect={onCopyLink}>
+        <Link2 className="h-4 w-4" />
+        {t('share.copyLink')}
+      </ContextMenuItem>
+      {(onArchive || onDelete) && <ContextMenuSeparator />}
+      {onArchive && (
+        <ContextMenuItem onSelect={onArchive}>
+          <Archive className="h-4 w-4" />
+          {t('nav.archiveThread')}
+        </ContextMenuItem>
+      )}
+      {onDelete && (
+        <ContextMenuItem variant="destructive" onSelect={onDelete}>
+          <Trash2 className="h-4 w-4" />
+          {t('common.delete')}
+        </ContextMenuItem>
+      )}
+    </ContextMenuContent>
+  );
+}
 
 function ThreadTreeRowImpl({
   wsId,
+  // DALTON-HOOK(colleague-dispatch): accept workspace and caller identity on ThreadTreeRowImpl
+  ws,
   thread,
   isCurrentThread,
   isExpanded,
   isMobile,
   agents,
   activeAgentId,
+  // DALTON-HOOK(colleague-dispatch): accept caller identity and tier on WorkspaceTreeRowImpl
+  currentUserId,
+  callerTier,
   onToggleThread,
   onNavigateThread,
   onSelectAgent,
   onRemoveAgent,
   onPinThread,
   onArchiveThread,
+  onRenameThread,
+  onShareThread,
+  onDeleteThread,
 }: ThreadTreeRowProps) {
   const { t } = useTranslation();
   const { kit } = useNavTree();
   const tid = thread.thread_id;
   const subagents = agents?.filter((a) => !a.isMainAgent) || [];
   const hasSubagents = isCurrentThread && subagents.length > 0;
-  const title = thread.title || thread.first_query_content?.slice(0, 40) || t('nav.untitledThread');
+  const seedTitle = thread.title || thread.first_query_content?.slice(0, 40) || '';
+  const title = seedTitle || t('nav.untitledThread');
   const isPinned = Boolean(thread.is_pinned);
+
+  // DALTON-HOOK(colleague-dispatch): gate thread row actions by owner / dispatcher / bystander colleague / external identity
+  const accessCtx = useNavAccessContext(currentUserId, callerTier);
+  const threadPerms = resolveNavThreadPermissions(thread, ws, accessCtx);
+  const effectivePinThread = threadPerms.canMutateThread ? onPinThread : undefined;
+  const effectiveArchiveThread = threadPerms.canMutateThread ? onArchiveThread : undefined;
+  const effectiveRenameThread = threadPerms.canMutateThread ? onRenameThread : undefined;
+  const effectiveShareThread = threadPerms.canShareThread ? onShareThread : undefined;
+  const effectiveDeleteThread = threadPerms.canMutateThread ? onDeleteThread : undefined;
+  const canOpenMenu = threadPerms.canCopyOrOpen && ! threadPerms.isIsolatedExternal;
+
+  // The metadata card is held shut while the right-click menu is up, so the
+  // two never stack; it opens again on the next hover.
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [cardOpen, setCardOpen] = useState(false);
+  const handleMenuOpenChange = useCallback((open: boolean) => {
+    setMenuOpen(open);
+    if (open) setCardOpen(false);
+  }, []);
+
+  // Inline rename, as the workspace row does it: the title becomes a field.
+  // The ref makes Enter and the blur that follows it commit once; the seed is
+  // what the field opened with, so leaving it untouched writes nothing.
+  // Rename starts only once the menu has gone: until then a pointer crossing
+  // its items moves focus into the menu, which would blur and close the field.
+  const [renaming, setRenaming] = useState(false);
+  const [draft, setDraft] = useState('');
+  const renameInputRef = useRef<HTMLInputElement>(null);
+  const renameSeedRef = useRef('');
+  const renameOpenRef = useRef(false);
+  const renameAfterMenuRef = useRef(false);
+  const startRename = () => {
+    renameSeedRef.current = seedTitle;
+    renameOpenRef.current = true;
+    setDraft(seedTitle);
+    setRenaming(true);
+  };
+  const endRename = (commit: boolean) => {
+    if (!renameOpenRef.current) return;
+    renameOpenRef.current = false;
+    setRenaming(false);
+    // The field's focus opened the card underneath, and a focused element
+    // that unmounts sends no blur to close it.
+    setCardOpen(false);
+    const next = draft.trim();
+    if (commit && next && next !== renameSeedRef.current) effectiveRenameThread?.(wsId, tid, next, thread.title || '');
+  };
+  const handleMenuCloseAutoFocus = (event: Event) => {
+    if (!renameAfterMenuRef.current) return;
+    renameAfterMenuRef.current = false;
+    event.preventDefault();
+    startRename();
+  };
+  useEffect(() => {
+    if (!renaming) return;
+    const raf = requestAnimationFrame(() => {
+      renameInputRef.current?.focus();
+      renameInputRef.current?.select();
+    });
+    return () => cancelAnimationFrame(raf);
+  }, [renaming]);
+
+  const activateRow = () => {
+    // DALTON-HOOK(colleague-dispatch): block row activation for isolated external callers
+    // A touch long-press opens the menu; the tap that ends it is not a navigation.
+    if (renaming || menuOpen || threadPerms.isIsolatedExternal) return;
+    if (isCurrentThread) {
+      // Toggle agents expand for current thread
+      if (hasSubagents) onToggleThread(tid);
+    } else {
+      onNavigateThread(wsId, tid);
+    }
+  };
+
+  const copyLink = () => {
+    copyText(threadHref(tid)).then(
+      () => toast({ title: t('nav.linkCopied') }),
+      () => toast({ variant: 'destructive', title: t('nav.copyLinkFailed') }),
+    );
+  };
 
   return (
     <>
       {/* Thread row */}
-      <HoverCard openDelay={500} closeDelay={100}>
-        <HoverCardTrigger asChild>
-          <div
-            className={`nav-panel-row group relative ${isCurrentThread ? 'nav-panel-row-active' : ''}`}
-            style={{ paddingLeft: 28 }}
-            onClick={() => {
-              if (isCurrentThread) {
-                // Toggle agents expand for current thread
-                if (hasSubagents) onToggleThread(tid);
-              } else {
-                onNavigateThread(wsId, tid);
-              }
-            }}
-          >
-            <ThreadRowGlyph tid={tid} isCurrentThread={isCurrentThread} />
-            <ThreadRowTitle tid={tid} title={title} active={isCurrentThread} />
-            {/* Expand-agents chevron — immediately right of the thread name,
-                mirroring the workspace row. Only on the current thread when it
-                has subagents. Hover-revealed (always shown on touch); rotates
-                90° when expanded. */}
-            {hasSubagents && (
-              <button
-                type="button"
-                data-nav-key={`thread:${tid}:agents`}
-                onClick={(e) => { e.stopPropagation(); onToggleThread(tid); }}
-                className={`shrink-0 flex items-center p-0 bg-transparent border-none cursor-pointer ${isMobile ? '' : 'opacity-0 group-hover:opacity-100 transition-opacity'}`}
-                aria-label={t(isExpanded ? 'nav.collapseAgents' : 'nav.expandAgents')}
+      <ContextMenu onOpenChange={handleMenuOpenChange}>
+        <HoverCard openDelay={500} closeDelay={100} open={cardOpen && !menuOpen && !renaming} onOpenChange={setCardOpen}>
+          <HoverCardTrigger asChild>
+            <ContextMenuTrigger asChild disabled={renaming || !canOpenMenu}>
+              <div
+                className={`nav-panel-row group relative ${isCurrentThread ? 'nav-panel-row-active' : ''}${menuOpen ? ' is-menu-open' : ''}`}
+                style={{ paddingLeft: 28 }}
+                onClick={activateRow}
               >
-                <ChevronRight
-                  className={`${CHEVRON_CLASS}${isExpanded ? ' rotate-90' : ''}`}
-                  style={{ color: 'var(--color-text-tertiary)' }}
-                />
-              </button>
-            )}
-            {/* Resting pinned marker — fades (never display-toggles, which
-                would reflow the title) while the hover overlay carries the
-                interactive pin (desktop; mobile shows the in-flow cluster,
-                whose Pin fill carries state). */}
-            {isPinned && !isMobile && (
-              <Pin
-                aria-hidden
-                className="h-3 w-3 ml-auto shrink-0 transition-opacity group-hover:opacity-0"
-                fill="currentColor"
-                style={{ color: 'var(--color-text-quaternary)' }}
-              />
-            )}
-            {(onPinThread || onArchiveThread) && (
-              <div className={isMobile ? 'flex items-center gap-0.5 ml-auto shrink-0' : 'nav-panel-row-actions'}>
-                {onPinThread && (
-                  <button
-                    type="button"
-                    data-nav-key={`thread:${tid}:pin`}
-                    onClick={(e) => { e.stopPropagation(); onPinThread(wsId, tid, !isPinned); }}
-                    className="flex items-center justify-center p-0.5 rounded bg-transparent border-none cursor-pointer hover:bg-(--color-bg-hover) press"
-                    title={isPinned ? t('nav.unpinThread') : t('nav.pinThread')}
-                    aria-label={isPinned ? t('nav.unpinThread') : t('nav.pinThread')}
-                  >
-                    <kit.PinGlyph pinned={isPinned}>
-                      <Pin
-                        className="h-3.5 w-3.5"
-                        fill={isPinned ? 'currentColor' : 'none'}
+                <ThreadRowGlyph tid={tid} isCurrentThread={isCurrentThread} />
+                {renaming ? (
+                  <input
+                    data-nav-key={`thread:${tid}:rename`}
+                    ref={renameInputRef}
+                    className="text-sm bg-transparent border-b flex-1 min-w-0"
+                    style={{ color: 'var(--color-text-primary)', borderColor: 'var(--color-border-muted)' }}
+                    value={draft}
+                    maxLength={255}
+                    onChange={(e) => setDraft(e.target.value)}
+                    onClick={(e) => e.stopPropagation()}
+                    onKeyDown={(e) => {
+                      if (isImeComposing(e)) return;
+                      if (e.key === 'Enter') { e.preventDefault(); endRename(true); }
+                      else if (e.key === 'Escape') { e.preventDefault(); endRename(false); }
+                    }}
+                    onBlur={() => endRename(true)}
+                    aria-label={t('nav.threadTitle')}
+                  />
+                ) : (<>
+                  <ThreadRowTitle tid={tid} title={title} active={isCurrentThread} onActivate={activateRow} />
+                  {/* Expand-agents chevron — immediately right of the thread name,
+                      mirroring the workspace row. Only on the current thread when it
+                      has subagents. Hover-revealed (always shown on touch); rotates
+                      90° when expanded. */}
+                  {hasSubagents && (
+                    <button
+                      type="button"
+                      data-nav-key={`thread:${tid}:agents`}
+                      onClick={(e) => { e.stopPropagation(); onToggleThread(tid); }}
+                      className={`shrink-0 flex items-center p-0 bg-transparent border-none cursor-pointer ${isMobile ? '' : 'opacity-0 group-hover:opacity-100 transition-opacity'}`}
+                      aria-label={t(isExpanded ? 'nav.collapseAgents' : 'nav.expandAgents')}
+                    >
+                      <ChevronRight
+                        className={`${CHEVRON_CLASS}${isExpanded ? ' rotate-90' : ''}`}
                         style={{ color: 'var(--color-text-tertiary)' }}
                       />
-                    </kit.PinGlyph>
-                  </button>
-                )}
-                {onArchiveThread && (
-                  <button
-                    type="button"
-                    data-nav-key={`thread:${tid}:archive`}
-                    onClick={(e) => { e.stopPropagation(); onArchiveThread(wsId, tid); }}
-                    className="flex items-center justify-center p-0.5 rounded bg-transparent border-none cursor-pointer hover:bg-(--color-bg-hover) press"
-                    title={t('nav.archiveThread')}
-                    aria-label={t('nav.archiveThread')}
-                  >
-                    <Archive className="h-3.5 w-3.5" style={{ color: 'var(--color-text-tertiary)' }} />
-                  </button>
-                )}
+                    </button>
+                  )}
+                  {/* Resting pinned marker — fades (never display-toggles, which
+                      would reflow the title) while the hover overlay carries the
+                      interactive pin (desktop; mobile shows the in-flow cluster,
+                      whose Pin fill carries state). */}
+                  {isPinned && !isMobile && (
+                    <Pin
+                      aria-hidden
+                      className="h-3 w-3 ml-auto shrink-0 transition-opacity group-hover:opacity-0"
+                      fill="currentColor"
+                      style={{ color: 'var(--color-text-quaternary)' }}
+                    />
+                  )}
+                  {/* DALTON-HOOK(colleague-dispatch): gate hover pin and archive buttons by thread permission */}
+                  {(effectivePinThread || effectiveArchiveThread) && (
+                    <div className={isMobile ? 'flex items-center gap-0.5 ml-auto shrink-0' : 'nav-panel-row-actions'}>
+                      {effectivePinThread && (
+                        <button
+                          type="button"
+                          data-nav-key={`thread:${tid}:pin`}
+                          onClick={(e) => { e.stopPropagation(); effectivePinThread(wsId, tid, !isPinned); }}
+                          className="flex items-center justify-center p-0.5 rounded bg-transparent border-none cursor-pointer hover:bg-(--color-bg-hover) press"
+                          title={isPinned ? t('nav.unpinThread') : t('nav.pinThread')}
+                          aria-label={isPinned ? t('nav.unpinThread') : t('nav.pinThread')}
+                        >
+                          <kit.PinGlyph pinned={isPinned}>
+                            <Pin
+                              className="h-3.5 w-3.5"
+                              fill={isPinned ? 'currentColor' : 'none'}
+                              style={{ color: 'var(--color-text-tertiary)' }}
+                            />
+                          </kit.PinGlyph>
+                        </button>
+                      )}
+                      {effectiveArchiveThread && (
+                        <button
+                          type="button"
+                          data-nav-key={`thread:${tid}:archive`}
+                          onClick={(e) => { e.stopPropagation(); effectiveArchiveThread(wsId, tid); }}
+                          className="flex items-center justify-center p-0.5 rounded bg-transparent border-none cursor-pointer hover:bg-(--color-bg-hover) press"
+                          title={t('nav.archiveThread')}
+                          aria-label={t('nav.archiveThread')}
+                        >
+                          <Archive className="h-3.5 w-3.5" style={{ color: 'var(--color-text-tertiary)' }} />
+                        </button>
+                      )}
+                    </div>
+                  )}
+                </>)}
               </div>
-            )}
-          </div>
-        </HoverCardTrigger>
-        <ThreadMetaCard thread={thread} title={title} t={t} />
-      </HoverCard>
+            </ContextMenuTrigger>
+          </HoverCardTrigger>
+          <ThreadMetaCard thread={thread} title={title} t={t} />
+        </HoverCard>
+        {/* DALTON-HOOK(colleague-dispatch): pass permission-filtered handlers to ThreadRowMenu */}
+        {canOpenMenu && (
+          <ThreadRowMenu
+            isPinned={isPinned}
+            onCloseAutoFocus={handleMenuCloseAutoFocus}
+            onOpenInNewTab={isDesktopShell() ? undefined : () => window.open(threadHref(tid), '_blank', 'noopener')}
+            onCopyLink={copyLink}
+            onTogglePin={effectivePinThread ? () => effectivePinThread(wsId, tid, !isPinned) : undefined}
+            onRename={effectiveRenameThread ? () => { renameAfterMenuRef.current = true; } : undefined}
+            onShare={effectiveShareThread ? () => effectiveShareThread(wsId, tid) : undefined}
+            onArchive={effectiveArchiveThread ? () => effectiveArchiveThread(wsId, tid) : undefined}
+            onDelete={effectiveDeleteThread ? () => effectiveDeleteThread(wsId, tid, title) : undefined}
+          />
+        )}
+      </ContextMenu>
 
       {/* Agent rows -- only when subagents exist, for current thread when expanded */}
       {hasSubagents && isExpanded && (
@@ -426,6 +891,9 @@ export interface WorkspaceTreeRowProps {
   expandedThreadIds: Set<string>;
   agents?: SidebarAgentRow[];
   activeAgentId?: string | null;
+  // DALTON-HOOK(colleague-dispatch): pass caller identity and tier into WorkspaceTreeRow
+  currentUserId?: string | null;
+  callerTier?: string | null;
   /** The shared duplicate / move / delete flows. */
   wsActions: Omit<WorkspaceActions, 'dialogs'>;
   rename: {
@@ -449,6 +917,9 @@ export interface WorkspaceTreeRowProps {
   onNewThread?: (wsId: string) => void;
   onPinThread?: (wsId: string, threadId: string, pinned: boolean) => void;
   onArchiveThread?: (wsId: string, threadId: string) => void;
+  onRenameThread?: (wsId: string, threadId: string, title: string, previousTitle: string) => void;
+  onShareThread?: (wsId: string, threadId: string) => void;
+  onDeleteThread?: (wsId: string, threadId: string, title: string) => void;
 }
 
 function WorkspaceTreeRowImpl({
@@ -462,6 +933,9 @@ function WorkspaceTreeRowImpl({
   expandedThreadIds,
   agents,
   activeAgentId,
+  // DALTON-HOOK(colleague-dispatch): accept caller identity and tier on WorkspaceTreeRowImpl
+  currentUserId,
+  callerTier,
   wsActions,
   rename,
   onToggleWorkspace,
@@ -474,6 +948,9 @@ function WorkspaceTreeRowImpl({
   onNewThread,
   onPinThread,
   onArchiveThread,
+  onRenameThread,
+  onShareThread,
+  onDeleteThread,
 }: WorkspaceTreeRowProps) {
   const { t } = useTranslation();
   const label = useWorkspaceLabel();
@@ -488,126 +965,164 @@ function WorkspaceTreeRowImpl({
   const threadOrderSignature = threads.map((th) => th.thread_id).join('|');
   const threadsLoading = threadsData?.loading || false;
   const isRenaming = rename.active;
-  // The options menu isn't offered on Home (shared, immutable), mirroring
-  // the gallery hiding its card menu there. New-thread stays available
-  // everywhere: Home composes threads too.
-  const showWsMenu = !isHome;
+  // DALTON-HOOK(colleague-dispatch): gate workspace row actions by ownership and caller tier
+  const accessCtx = useNavAccessContext(currentUserId, callerTier);
+  const wsPerms = resolveNavWorkspacePermissions(ws, accessCtx);
+  // The options menu isn't offered on Home (shared, immutable) or on a
+  // colleague's workspace, mirroring the gallery hiding its card menu there.
+  const showWsMenu = !isHome && wsPerms.canManageWorkspace;
+  const effectiveNewThread = wsPerms.canCreateThread ? onNewThread : undefined;
+  const effectiveDragDisabled: DragGate =
+    wsPerms.isColleagueWorkspace || wsPerms.isIsolatedExternal ? true : dragDisabled;
+  const [menuOpen, setMenuOpen] = useState(false);
+  // Rename starts once the menu has gone, as on the thread row: a pointer
+  // crossing a closing menu's items moves focus into it and ends the edit.
+  const renameAfterMenuRef = useRef(false);
+  const requestRename = rename.enabled ? () => { renameAfterMenuRef.current = true; } : undefined;
+  const handleMenuCloseAutoFocus = (event: Event) => {
+    if (!renameAfterMenuRef.current) return;
+    renameAfterMenuRef.current = false;
+    event.preventDefault();
+    rename.onStart(wsId, ws.name || '');
+  };
 
+  // A touch long-press opens the menu; the tap that ends it is not a toggle.
   const handleRowClick = useCallback(() => {
-    if (!isRenaming) onToggleWorkspace(wsId);
-  }, [isRenaming, onToggleWorkspace, wsId]);
+    if (!isRenaming && !menuOpen) onToggleWorkspace(wsId);
+  }, [isRenaming, menuOpen, onToggleWorkspace, wsId]);
 
+  // DALTON-HOOK(colleague-dispatch): disable drag-reorder on colleague workspaces
   return (
-    <kit.Section wsId={wsId} disabled={dragDisabled}>
+    <kit.Section wsId={wsId} disabled={effectiveDragDisabled}>
       {({ dragHandleProps, isDragging }) => (<>
         {/* Workspace row — doubles as the drag handle for reordering. While
             renaming, click-to-toggle and drag are suppressed so the inline
-            input owns the row. */}
-        <div
-          data-nav-key="header"
-          className="nav-panel-row group"
-          style={{ paddingLeft: 10, position: 'relative' }}
-          onClick={handleRowClick}
-          {...(isRenaming ? {} : dragHandleProps)}
-        >
-          {workspaceGlyph(ws, isExpanded, machine)}
-          {isRenaming ? (
-            <input
-              data-nav-key="rename"
-              ref={rename.inputRef}
-              className="text-sm font-medium bg-transparent border-b flex-1 min-w-0"
-              style={{ color: 'var(--color-text-primary)', borderColor: 'var(--color-border-muted)' }}
-              value={rename.value}
-              onChange={(e) => rename.onChange(clampWorkspaceName(e.target.value))}
-              onClick={(e) => e.stopPropagation()}
-              onPointerDown={(e) => e.stopPropagation()}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter') { e.preventDefault(); rename.onCommit(); }
-                else if (e.key === 'Escape') { e.preventDefault(); rename.onCancel(); }
-              }}
-              onBlur={rename.onCommit}
-              aria-label={t('workspace.rename')}
-            />
-          ) : (
-            <>
-              <span
-                className="text-sm font-medium truncate"
-                style={{ color: isCurrent ? 'var(--color-text-primary)' : 'var(--color-text-tertiary)' }}
-              >
-                {label(ws) || t('nav.workspaceFallback')}
-              </span>
-              {/* Chevron + row actions float over the name's tail on hover
-                  (as thread rows do), so the name keeps the full row width
-                  instead of truncating around controls that are not showing. */}
-              <div className={isMobile ? 'flex items-center gap-0.5 ml-auto shrink-0' : 'nav-panel-row-actions'}>
-                <span className="shrink-0 flex items-center">
-                  <ChevronRight
-                    className={`${CHEVRON_CLASS}${isExpanded ? ' rotate-90' : ''}`}
-                    style={{ color: 'var(--color-text-tertiary)' }}
-                  />
-                </span>
-                {/* Right-aligned row actions: new thread + options (pin / rename).
-                    Hover-revealed on desktop, always shown on touch. */}
-                {(onNewThread || showWsMenu) && (
-                  <div className="flex items-center gap-0.5 shrink-0">
-                    {onNewThread && (
-                      <button
-                        type="button"
-                        data-nav-key="new-thread"
-                        onPointerDown={(e) => e.stopPropagation()}
-                        onClick={(e) => { e.stopPropagation(); onNewThread(wsId); }}
-                        className="flex items-center justify-center p-0.5 rounded bg-transparent border-none cursor-pointer hover:bg-(--color-border-muted)"
-                        title={t('nav.newThread')}
-                        aria-label={t('nav.newThread')}
-                      >
-                        <SquarePen className="h-3.5 w-3.5" style={{ color: 'var(--color-text-tertiary)' }} />
-                      </button>
-                    )}
-                    {showWsMenu && (
-                      <DropdownMenu modal={false}>
-                        <DropdownMenuTrigger asChild>
+            input owns the row. A right-click opens the options menu. */}
+        <ContextMenu onOpenChange={setMenuOpen}>
+          <ContextMenuTrigger asChild disabled={!showWsMenu || isRenaming}>
+            <div
+              data-nav-key="header"
+              className={`nav-panel-row group${menuOpen ? ' is-menu-open' : ''}`}
+              style={{ paddingLeft: 10, position: 'relative' }}
+              onClick={handleRowClick}
+              {...(isRenaming ? {} : dragHandleProps)}
+            >
+              {workspaceGlyph(ws, isExpanded, machine)}
+              {isRenaming ? (
+                <input
+                  data-nav-key="rename"
+                  ref={rename.inputRef}
+                  className="text-sm font-medium bg-transparent border-b flex-1 min-w-0"
+                  style={{ color: 'var(--color-text-primary)', borderColor: 'var(--color-border-muted)' }}
+                  value={rename.value}
+                  onChange={(e) => rename.onChange(clampWorkspaceName(e.target.value))}
+                  onClick={(e) => e.stopPropagation()}
+                  onPointerDown={(e) => e.stopPropagation()}
+                  onKeyDown={(e) => {
+                    if (isImeComposing(e)) return;
+                    if (e.key === 'Enter') { e.preventDefault(); rename.onCommit(); }
+                    else if (e.key === 'Escape') { e.preventDefault(); rename.onCancel(); }
+                  }}
+                  onBlur={rename.onCommit}
+                  aria-label={t('workspace.rename')}
+                />
+              ) : (
+                <>
+                  <span
+                    className="text-sm font-medium truncate"
+                    style={{ color: isCurrent ? 'var(--color-text-primary)' : 'var(--color-text-tertiary)' }}
+                  >
+                    {label(ws) || t('nav.workspaceFallback')}
+                  </span>
+                  {/* Chevron + row actions float over the name's tail on hover
+                      (as thread rows do), so the name keeps the full row width
+                      instead of truncating around controls that are not showing. */}
+                  <div className={isMobile ? 'flex items-center gap-0.5 ml-auto shrink-0' : 'nav-panel-row-actions'}>
+                    <span className="shrink-0 flex items-center">
+                      <ChevronRight
+                        className={`${CHEVRON_CLASS}${isExpanded ? ' rotate-90' : ''}`}
+                        style={{ color: 'var(--color-text-tertiary)' }}
+                      />
+                    </span>
+                    {/* Right-aligned row actions: new thread + options (pin / rename).
+                        Hover-revealed on desktop, always shown on touch.
+                        DALTON-HOOK(colleague-dispatch): gate new-thread and workspace options menu */}
+                    {(effectiveNewThread || showWsMenu) && (
+                      <div className="flex items-center gap-0.5 shrink-0">
+                        {effectiveNewThread && (
                           <button
                             type="button"
-                            data-nav-key="options"
+                            data-nav-key="new-thread"
                             onPointerDown={(e) => e.stopPropagation()}
-                            onClick={(e) => e.stopPropagation()}
+                            onClick={(e) => { e.stopPropagation(); effectiveNewThread(wsId); }}
                             className="flex items-center justify-center p-0.5 rounded bg-transparent border-none cursor-pointer hover:bg-(--color-border-muted)"
-                            title={t('workspace.options')}
-                            aria-label={t('workspace.options')}
+                            title={t('nav.newThread')}
+                            aria-label={t('nav.newThread')}
                           >
-                            <MoreHorizontal className="h-3.5 w-3.5" style={{ color: 'var(--color-text-tertiary)' }} />
+                            <SquarePen className="h-3.5 w-3.5" style={{ color: 'var(--color-text-tertiary)' }} />
                           </button>
-                        </DropdownMenuTrigger>
-                        {/* Drops below the trigger, growing rightward past the
-                            sidebar edge into the content area (Codex-style).
-                            align=end would grow leftward over the tree since the
-                            trigger hugs the sidebar edge. */}
-                        <DropdownMenuContent align="start" sideOffset={4} onClick={(e) => e.stopPropagation()}>
-                          <WorkspaceMenuItems
-                            workspace={ws}
-                            onTogglePin={onPinWorkspace ? () => onPinWorkspace(wsId, !isPinned) : undefined}
-                            onRename={rename.enabled ? () => rename.onStart(wsId, ws.name || '') : undefined}
-                            onDuplicate={wsActions.openDuplicate}
-                            onMove={wsActions.openMove}
-                            onDelete={wsActions.openDelete}
-                          />
-                        </DropdownMenuContent>
-                      </DropdownMenu>
+                        )}
+                        {showWsMenu && (
+                          <DropdownMenu modal={false}>
+                            <DropdownMenuTrigger asChild>
+                              <button
+                                type="button"
+                                data-nav-key="options"
+                                onPointerDown={(e) => e.stopPropagation()}
+                                onClick={(e) => e.stopPropagation()}
+                                className="flex items-center justify-center p-0.5 rounded bg-transparent border-none cursor-pointer hover:bg-(--color-border-muted)"
+                                title={t('workspace.options')}
+                                aria-label={t('workspace.options')}
+                              >
+                                <MoreHorizontal className="h-3.5 w-3.5" style={{ color: 'var(--color-text-tertiary)' }} />
+                              </button>
+                            </DropdownMenuTrigger>
+                            {/* Drops below the trigger, growing rightward past the
+                                sidebar edge into the content area (Codex-style).
+                                align=end would grow leftward over the tree since the
+                                trigger hugs the sidebar edge. */}
+                            <DropdownMenuContent align="start" sideOffset={4} onClick={(e) => e.stopPropagation()}>
+                              <WorkspaceMenuItems
+                                workspace={ws}
+                                onTogglePin={onPinWorkspace ? () => onPinWorkspace(wsId, !isPinned) : undefined}
+                                onRename={rename.enabled ? () => rename.onStart(wsId, ws.name || '') : undefined}
+                                onDuplicate={wsActions.openDuplicate}
+                                onMove={wsActions.openMove}
+                                onDelete={wsActions.openDelete}
+                              />
+                            </DropdownMenuContent>
+                          </DropdownMenu>
+                        )}
+                      </div>
                     )}
                   </div>
-                )}
-              </div>
-              {threadsLoading && (
-                <Loader
+                  {/* DALTON-HOOK(colleague-dispatch): align loader with permission-gated workspace row actions */}
+                  {threadsLoading && (
+                    <Loader
                  
-                  size={14}
+                      size={14}
                  
-                  className={`shrink-0 text-(--color-text-tertiary) ${onNewThread || showWsMenu ? '' : 'ml-auto'}`}
-                />
+                      className={`shrink-0 text-(--color-text-tertiary) ${effectiveNewThread || showWsMenu ? '' : 'ml-auto'}`}
+                    />
+                  )}
+                </>
               )}
-            </>
+            </div>
+          </ContextMenuTrigger>
+          {showWsMenu && (
+            <ContextMenuContent onCloseAutoFocus={handleMenuCloseAutoFocus}>
+              <WorkspaceMenuItems
+                workspace={ws}
+                menu="context"
+                onTogglePin={onPinWorkspace ? () => onPinWorkspace(wsId, !isPinned) : undefined}
+                onRename={requestRename}
+                onDuplicate={wsActions.openDuplicate}
+                onMove={wsActions.openMove}
+                onDelete={wsActions.openDelete}
+              />
+            </ContextMenuContent>
           )}
-        </div>
+        </ContextMenu>
 
         {/* Threads under this workspace — animated expand/collapse. Hidden
             while this section is the one being dragged so the lifted item
@@ -625,20 +1140,27 @@ function WorkspaceTreeRowImpl({
           <kit.ThreadList>
             {threads.map((thread) => (
               <kit.ThreadItem key={thread.thread_id} order={threadOrderSignature}>
+                {/* DALTON-HOOK(colleague-dispatch): forward workspace and caller identity to ThreadTreeRow */}
                 <ThreadTreeRow
                   wsId={wsId}
+                  ws={ws}
                   thread={thread}
                   isCurrentThread={thread.thread_id === currentThreadId}
                   isExpanded={expandedThreadIds.has(thread.thread_id)}
                   isMobile={isMobile}
                   agents={thread.thread_id === currentThreadId ? agents : undefined}
                   activeAgentId={activeAgentId}
+                  currentUserId={accessCtx.currentUserId}
+                  callerTier={accessCtx.callerTier}
                   onToggleThread={onToggleThread}
                   onNavigateThread={onNavigateThread}
                   onSelectAgent={onSelectAgent}
                   onRemoveAgent={onRemoveAgent}
                   onPinThread={onPinThread}
                   onArchiveThread={onArchiveThread}
+                  onRenameThread={onRenameThread}
+                  onShareThread={onShareThread}
+                  onDeleteThread={onDeleteThread}
                 />
               </kit.ThreadItem>
             ))}

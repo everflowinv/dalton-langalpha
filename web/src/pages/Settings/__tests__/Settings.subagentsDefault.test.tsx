@@ -100,7 +100,7 @@ function renderPreferencesTab(otherPreference?: Record<string, unknown>) {
   });
   return render(
     <QueryClientProvider client={queryClient}>
-      <MemoryRouter initialEntries={['/settings?tab=preferences']}>
+      <MemoryRouter initialEntries={['/settings?tab=agent']}>
         <Settings />
       </MemoryRouter>
     </QueryClientProvider>,

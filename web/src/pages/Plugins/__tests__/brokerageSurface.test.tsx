@@ -925,7 +925,7 @@ describe('the brokerages tab', () => {
       expect(screen.getByText('Full autonomy')).toBeInTheDocument();
       expect(
         screen.getByRole('link', { name: 'Manage trading permission' }),
-      ).toHaveAttribute('href', '/settings?tab=preferences#trading-permission');
+      ).toHaveAttribute('href', '/settings?tab=trading#trading-permission');
     });
 
     it('links to the download beside the note, without opening the row', async () => {

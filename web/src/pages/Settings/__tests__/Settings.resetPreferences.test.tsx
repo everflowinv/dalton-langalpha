@@ -1,5 +1,5 @@
 /**
- * Resetting preferences on the Preferences tab also marks onboarding
+ * Resetting preferences on the Investing profile section also marks onboarding
  * incomplete on the server, so the user row the welcome offer reads must be
  * fetched again: the cached one still says the profile is saved.
  */
@@ -36,29 +36,17 @@ vi.mock('@/components/ui/use-toast', () => ({
   useToast: () => toastStub,
 }));
 
-vi.mock('@/pages/Onboarding', () => ({
-  useOnboarding: () => ({ replayGuides: vi.fn(), resetOnboarding: vi.fn() }),
-}));
-
-vi.mock('../panels/AutoApproveSettings', () => ({
-  AutoApproveSettings: () => null,
-}));
-
-vi.mock('../panels/TradingPermissionSection', () => ({
-  TradingPermissionSection: () => null,
-}));
-
 // Import after mocks are registered.
-import { PreferencesTab } from '../panels/PreferencesTab';
+import { InvestingProfilePanel } from '../panels/InvestingProfilePanel';
 
-function renderPreferencesTab() {
+function renderInvestingProfile() {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
   return render(
     <QueryClientProvider client={queryClient}>
       <MemoryRouter initialEntries={['/settings?tab=preferences']}>
-        <PreferencesTab />
+        <InvestingProfilePanel />
       </MemoryRouter>
     </QueryClientProvider>,
   );
@@ -81,14 +69,14 @@ beforeEach(() => {
 
 describe('Settings: resetting preferences', () => {
   it('offers the welcome flow again once the reset lands', async () => {
-    renderPreferencesTab();
+    renderInvestingProfile();
     // An account still loading counts as not done, so wait for the saved row.
     await waitFor(() => expect(screen.queryByText('Set up your investing profile')).not.toBeInTheDocument());
     expect(h.getCurrentUser).toHaveBeenCalledTimes(1);
 
-    fireEvent.click(screen.getByRole('button', { name: 'Reset Preferences' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Reset preferences' }));
     const dialog = await screen.findByRole('dialog');
-    fireEvent.click(within(dialog).getByRole('button', { name: 'Reset Preferences' }));
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Reset preferences' }));
 
     await waitFor(() => expect(h.clearPreferences).toHaveBeenCalledTimes(1));
     expect(await screen.findByText('Set up your investing profile')).toBeInTheDocument();
