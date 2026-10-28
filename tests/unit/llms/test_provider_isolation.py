@@ -121,7 +121,19 @@ def _native_claude(model: Any) -> bool:
 
 def _targets() -> list[str]:
     manifest = json.loads((Path(llm_module.__file__).parent / "manifest" / "models.json").read_text())
-    entries = [name for name in manifest if not _native_claude(_build(name))]
+    # DALTON-HOOK(llm-overlay): Dalton retires manifest keys it does not offer
+    # (the upstream grok-oauth line: grok-4.5/4.6/build-oauth). A retired key
+    # resolves to no client, so walking it like a live model fails at
+    # collection; every key the merged catalog still offers walks, Dalton's
+    # pinned replacement keys among them.
+    from src.llms.llm import ModelConfig
+
+    offered = set(ModelConfig().get_model_metadata() or {})
+    entries = [
+        name
+        for name in manifest
+        if name in offered and not _native_claude(_build(name))
+    ]
     return [*entries, *CUSTOM_ROUTES]
 
 

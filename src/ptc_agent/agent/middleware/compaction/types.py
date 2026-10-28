@@ -12,7 +12,8 @@ from typing_extensions import TypedDict
 
 from langchain.agents.middleware.types import PrivateStateAttr
 
-from ptc_agent.agent.middleware.thinking_binding import UnsentThinkingState
+# DALTON-HOOK(attachment-native-cap): ``_union`` shared with ``_removed_attachment_ids``.
+from ptc_agent.agent.middleware.thinking_binding import UnsentThinkingState, _union
 from ptc_agent.agent.transcript.identity import WindowState
 from ptc_agent.config.agent import CompactionConfig
 from ptc_agent.core.paths import AGENT_HISTORY_DIRS, SandboxLayout
@@ -109,7 +110,12 @@ class CompactionState(UnsentThinkingState):
     #: Messages whose attachments were taken out of the view to fit the
     #: context window, by message id. Re-applied on every call like the
     #: offloads, so what was sent once without them stays without them.
-    _removed_attachment_ids: Annotated[NotRequired[set[str]], PrivateStateAttr]
+    # DALTON-HOOK(attachment-native-cap): a union, like ``_unsent_thinking_ids``
+    # beside it — compaction's fit and the strip's image byte total can each
+    # write it in one model call. The compaction writers shrink it by value
+    # (``state & kept``, ``state & in-view``), and a same-step addition names a
+    # message in the view the shrink kept, so the union holds both semantics.
+    _removed_attachment_ids: Annotated[NotRequired[set[str]], PrivateStateAttr, _union]
     #: Notes rows a summary kept after the last answer in its tail, by message
     #: id. Past their summary they ask for what it paraphrased, so the call
     #: answering from it goes without them, and every later one does too

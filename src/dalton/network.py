@@ -67,17 +67,24 @@ async def doh_query(client: httpx.AsyncClient, resolver: str, host: str, rtype: 
     return [str(a["data"]) for a in body.get("Answer") or [] if a.get("type") == want]
 
 
-async def real_target_block_reason(host: str, is_blocked: Callable[[str], bool]) -> str | None:
-    """Why the host's real A/AAAA records forbid the request, or None to allow.
+async def real_target_block_reason(
+    host: str, is_blocked: Callable[[str], bool]
+) -> tuple[str | None, list[str] | None]:
+    """Why the host's real A/AAAA records forbid the request, with the records
+    that allowed it, or ``(reason, None)``.
 
     Every record any resolver returns is checked as it arrives, partial answers
     included, and one blocked address blocks the request whatever a later
     resolver says. Falling back only serves to get an answer at all: allowing
     takes one resolver answering both A and AAAA without error, with records.
+
+    On allow the winning resolver's complete record set is returned with it:
+    those are the only addresses the caller may connect to, since the fake-IP
+    resolver's answer says nothing about where a connection would land.
     """
     resolvers = get_fake_ip_real_resolvers()
     if not resolvers:
-        return _lookup_failed(host, "no network.fake_ip_real_resolver configured")
+        return _lookup_failed(host, "no network.fake_ip_real_resolver configured"), None
     errors: list[str] = []
     # The resolver client is deliberately unguarded: its own target is a fixed
     # configured URL, and routing it through the guard would recurse.
@@ -96,15 +103,18 @@ async def real_target_block_reason(host: str, is_blocked: Callable[[str], bool])
                     try:
                         blocked = is_blocked(ip)
                     except ValueError:
-                        return f"Blocked {host!r}: resolver returned an unparseable address {ip!r}"
+                        return f"Blocked {host!r}: resolver returned an unparseable address {ip!r}", None
                     if blocked:
-                        return f"Blocked private/reserved real address {ip} for host {host!r}"
+                        return f"Blocked private/reserved real address {ip} for host {host!r}", None
                 found.extend(records)
             if complete and found:
-                return None
+                return None, found
             if complete:
                 errors.append(f"{resolver}: no A/AAAA records")
-    return _lookup_failed(host, f"no resolver gave a complete answer ({'; '.join(errors)})")
+    return (
+        _lookup_failed(host, f"no resolver gave a complete answer ({'; '.join(errors)})"),
+        None,
+    )
 
 
 def _lookup_failed(host: str, detail: str) -> str:
@@ -114,17 +124,22 @@ def _lookup_failed(host: str, detail: str) -> str:
 
 async def fake_ip_block_reason(
     host: str, addresses: list[str], is_blocked: Callable[[str], bool]
-) -> str | None:
-    """Why a request whose DNS answer is a fake-IP must be refused, or None.
+) -> tuple[str | None, list[str] | None]:
+    """Why a request whose DNS answer is a fake-IP must be refused, with the
+    verified real addresses to connect to when it must not be; ``(None, None)``
+    when no fake-IP is present and ``(reason, None)`` on any refusal.
 
-    ``is_blocked`` is the guard's own test without the fake-IP exemption.
+    ``is_blocked`` is the guard's own test without the fake-IP exemption. The
+    caller must dial an address from the returned list — the fake-IP answer
+    itself is never a safe target, since whatever maps it back re-resolves the
+    hostname and could reach an address this check never saw.
     """
     if not any(is_fake_ip_exempt(ipaddress.ip_address(ip)) for ip in addresses):
-        return None
+        return None, None
     try:
         ipaddress.ip_address(host)
     except ValueError:
         pass
     else:
-        return f"Blocked fake-IP literal {host!r}: no hostname to check the real target of"
+        return f"Blocked fake-IP literal {host!r}: no hostname to check the real target of", None
     return await real_target_block_reason(host, is_blocked)

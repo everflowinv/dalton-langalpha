@@ -23,8 +23,38 @@ from src.llms.reasoning_payload import is_reasoning_block, strip_all_reasoning
 
 UNSENT_THINKING_KEY = "_unsent_thinking_ids"
 
+
+# DALTON-HOOK(attachment-native-cap): a ``set`` write from a summary or window
+# trim that also carries the ids it retired on ``.dropped``, so ``_union``
+# drops them while still unioning same-step additions in either order. Named
+# ``builtins.set`` so LangGraph's msgpack checkpointer encodes it as a plain
+# set without unregistered-type warnings.
+class _Shrunk(set[str]):
+    __module__ = "builtins"
+
+    def __init__(self, iterable: Iterable[str] = (), *, dropped: Iterable[str] = ()) -> None:
+        super().__init__(iterable)
+        self.dropped = frozenset(dropped)
+
+
+_Shrunk.__name__ = "set"
+_Shrunk.__qualname__ = "set"
+
+
+def shrink_ids(recorded: Iterable[str], kept: Collection[str]) -> set[str]:
+    held = set(recorded)
+    allowed = set(kept)
+    dropped = held - allowed
+    remaining = held & allowed
+    return _Shrunk(remaining, dropped=dropped) if dropped else remaining
+
+
 def _union(held: Iterable[str] | None, new: Iterable[str] | None) -> set[str]:
-    return set(held or ()) | set(new or ())
+    # DALTON-HOOK(attachment-native-cap): honors ``_Shrunk.dropped`` across
+    # same-step writes so summary/window cleanup survives the union.
+    dropped = getattr(held, "dropped", frozenset()) | getattr(new, "dropped", frozenset())
+    merged = (set(held or ()) | set(new or ())) - dropped
+    return _Shrunk(merged, dropped=dropped) if dropped else merged
 
 
 class UnsentThinkingState(AgentState):
