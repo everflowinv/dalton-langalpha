@@ -12,7 +12,9 @@
   flex-direction: row;
   box-sizing: border-box;
   overflow: hidden;
-  background-color: var(--color-bg-canvas);
+  /* The page ground, as on every page: the widgets are unfilled frames, so
+     there is no raised card for a tinted ground to set off. */
+  background-color: var(--color-bg-page);
 }
 
 /* A quieter thumb that stays put under the pointer; its shape is the
@@ -27,17 +29,6 @@
   font-family: var(--font-mono);
   font-variant-numeric: tabular-nums;
   font-feature-settings: "tnum";
-}
-
-/* === Glassmorphism card === */
-.dashboard-glass-card {
-  background: var(--color-bg-card);
-  backdrop-filter: blur(24px);
-  border: 1px solid var(--color-border-muted);
-  border-radius: 1.5rem;
-}
-.dashboard-glass-card:hover {
-  border-color: var(--color-border-default);
 }
 
 /* === Suggestion bubbles above chat input === */

@@ -45,6 +45,7 @@ from src.server.services.brokerage_orders.models import (
 )
 from src.server.services.brokerage_orders.moomoo import MoomooOrderAdapter
 from src.server.services.brokerage_orders.robinhood import RobinhoodOrderAdapter
+from src.server.services.brokerage_orders.webull import WebullOrderAdapter
 
 __all__ = [
     "OPEN_STATUSES",
@@ -77,6 +78,7 @@ __all__ = [
     "StatusReadError",
     "TimeInForce",
     "VendorOrder",
+    "WebullOrderAdapter",
     "adapter_for",
     "body_parts",
     "instrument_from_json",

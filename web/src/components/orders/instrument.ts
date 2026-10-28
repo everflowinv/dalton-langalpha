@@ -20,11 +20,14 @@ export function instrumentLabel(instrument: OrderInstrument | null | undefined):
         .filter(Boolean)
         .join(' ');
     }
-    case 'combo':
-      return (
+    case 'combo': {
+      const symbols = new Set(instrument.legs?.map((leg) => leg.symbol));
+      const [symbol] = symbols.size === 1 ? symbols : [];
+      const name =
         instrument.strategy ||
-        (instrument.legs?.length ? `${instrument.legs.length} legs` : '')
-      );
+        (instrument.legs?.length ? `${instrument.legs.length} legs` : '');
+      return [typeof symbol === 'string' ? symbol : '', name].filter(Boolean).join(' ');
+    }
     case 'future':
       return [instrument.symbol, instrument.contract_month, instrument.venue]
         .filter(Boolean)

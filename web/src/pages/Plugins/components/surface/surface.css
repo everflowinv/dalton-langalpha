@@ -337,7 +337,7 @@
 }
 
 /* Detail pages (DetailPage, under the page's DetailPageProvider) */
-.detail-page { min-width: 0; }
+.detail-page { min-width: 0; container-type: inline-size; }
 .detail-crumbs {
   display: flex;
   align-items: center;
@@ -504,8 +504,15 @@
 }
 /* Brokerages' lead, above the cards once the aside stacks below them. */
 .accounts-lead-stacked { display: none; }
+/* The aside stacks under the main column by the room the page itself has, not
+   the window's: the shell's own rails take a different share of it at each
+   width, and a window-keyed breakpoint left the main column about 150px wide
+   between 1024px and 1060px. 720px keeps the main column at 400px or more
+   beside the 280px aside. */
+@container (max-width: 719px) {
+  .detail-page-body { grid-template-columns: minmax(0, 1fr); gap: 32px; }
+}
 @media (max-width: 1023px) {
-  .detail-page-body,
   .accounts { grid-template-columns: minmax(0, 1fr); gap: 32px; }
   .accounts-lead-stacked {
     display: block;

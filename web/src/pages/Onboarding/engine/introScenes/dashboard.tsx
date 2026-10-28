@@ -1,18 +1,8 @@
-import {
-  CalendarDays,
-  Eye,
-  Grid2x2,
-  Layers,
-  LineChart,
-  Newspaper,
-  Plus,
-  RotateCcw,
-  Sparkles,
-  X,
-} from 'lucide-react';
+import { Layers, Plus, RotateCcw, X } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { useLocale } from '@/hooks/useLocale';
-import { grouped2, signedFixed2 } from '@/lib/format';
+import { formatMoney } from '@/lib/bars/currencyDisplay';
+import { grouped2 } from '@/lib/format';
 import { cn } from '@/lib/utils';
 import type { IntroVisualId } from '../../registry';
 import { CLOSE, Camera, REST, VIEW, shot, type Shot } from './camera';
@@ -21,7 +11,6 @@ import { Appear, pointAt, pointerScript, pressAt, signColor } from './kit';
 import type { IntroScene } from './types';
 import { attachScene } from './dashboardAttach';
 import {
-  INDICES,
   WATCH,
   Spark,
   DashTopbar,
@@ -34,24 +23,23 @@ import {
   Widget,
 } from './dashboardParts';
 import {
-  WatchRow,
+  BriefLede,
+  BriefWidget,
+  EarningsWidget,
+  IndexRow,
   NEWS,
   NewsRow,
+  NewsWidget,
   PageBody,
-  INSIGHT,
-  BriefEyebrow,
-  BriefHeadline,
-  BriefSummary,
-  TopicPill,
-  EARNINGS,
-  EarningsRow,
+  WatchWidget,
   GRID,
 } from './dashboardPage';
 
 /* Scenes for the dashboard intro: the live page, and customizing it, and
    from its own file (dashboardAttach.tsx) clipping a row into the chat. Each
-   part is drawn after its real counterpart under pages/Dashboard, in
-   miniature, with the app's own strings for its labels. A camera shows the
+   widget is its real counterpart under pages/Dashboard, drawn with the
+   dashboard's own card classes and scaled down, with the app's own strings
+   for its labels. A camera shows the
    page a part at a time, close enough to read, with an edge of the next
    part so the viewer can tell where on the page it is. */
 /* eslint-disable react-refresh/only-export-components -- scene module:
@@ -59,14 +47,15 @@ import {
 
 /* ── dashboard · step 1: the page, live ────────────────────────────────── */
 
-/** The page's size, and its brief card's center, in page px (measured off
-    it). */
-const GRID_PAGE = { width: PAGE_W, height: 343 };
-const BRIEF_MID = { x: 135, y: 137 };
+/** The page's size in page px, as the default card style lays it out (the
+    page takes its content's height; Quiet's titles inside the cards make it
+    taller), and the middle of the brief's column. */
+const GRID_PAGE = { width: PAGE_W, height: 304 };
+const BRIEF_X = 135;
 /** Between the watchlist's symbols and its prices: a view from the page's
     left edge that ends here sits a touch closer than REST and cuts none of
     the watchlist's figures. */
-const WATCH_NAMES_END = 308;
+const WATCH_NAMES_END = 306;
 
 /** A slow pan across the page: the index lines with the brief arriving
     under them, a short push in on the brief, out to the watchlist while its
@@ -74,12 +63,19 @@ const WATCH_NAMES_END = 308;
 const GRID_SHOTS: [Shot, ...Shot[]] = [
   // the index cards and the brief, out to the watchlist's symbols
   shot(0, 0, 0, VIEW.width / WATCH_NAMES_END),
-  // the brief, a little higher than its center so the index cards' changes
-  // stay in at the top
-  shot(2600, BRIEF_MID.x, BRIEF_MID.y - 8, CLOSE, 1000),
+  // the brief whole, the view's top on the index cards' so their figures
+  // stay in over it
+  shot(2600, BRIEF_X, PAD + VIEW.height / 2 / CLOSE, CLOSE, 1000),
   // the watchlist whole, the index cards over it
   shot(3800, PAGE_W, 0, REST, 1000),
-  shot(6400, PAGE_W / 2, GRID_PAGE.height / 2, VIEW.height / GRID_PAGE.height, 1000),
+  // the page whole, as wide as the view
+  shot(
+    6400,
+    PAGE_W / 2,
+    GRID_PAGE.height / 2,
+    Math.min(VIEW.width / PAGE_W, VIEW.height / GRID_PAGE.height),
+    1000
+  ),
 ];
 
 function DashboardGrid() {
@@ -92,52 +88,60 @@ function DashboardGrid() {
   );
 }
 
-/** The Mini Chart Grid the toolbar adds: a tile per symbol, its 30-day
-    line. It starts from the watchlist, topped up to twelve. */
+/** The Mini Chart Grid the toolbar adds: a tile per watchlist symbol, its
+    move and line over thirty days. */
 const MINI: { sym: string; v: number; series: number[] }[] = [
-  { sym: 'NVDA', v: 1.61, series: [21, 19, 20, 15, 13, 11, 7] },
-  { sym: 'AAPL', v: -0.08, series: [14, 15, 13, 15, 14, 16, 15] },
-  { sym: 'TSLA', v: 2.05, series: [23, 21, 17, 19, 14, 10, 8] },
-  { sym: 'MSFT', v: 0.34, series: [17, 16, 17, 15, 14, 15, 13] },
-  { sym: 'AMZN', v: 0.84, series: [22, 20, 21, 16, 17, 12, 9] },
-  { sym: 'GOOGL', v: -0.37, series: [12, 14, 11, 15, 17, 16, 20] },
-  { sym: 'META', v: 1.12, series: [24, 19, 21, 17, 13, 14, 8] },
-  { sym: 'AMD', v: -0.58, series: [10, 13, 12, 17, 15, 19, 21] },
-  { sym: 'AVGO', v: 1.94, series: [22, 18, 19, 14, 12, 10, 6] },
-  { sym: 'TSM', v: 1.27, series: [19, 20, 16, 15, 16, 12, 10] },
-  { sym: 'NFLX', v: -0.42, series: [11, 12, 15, 13, 16, 18, 19] },
-  { sym: 'JPM', v: 0.21, series: [16, 15, 16, 14, 15, 13, 14] },
+  { sym: 'NVDA', v: 8.42, series: [21, 19, 20, 15, 13, 11, 7] },
+  { sym: 'AAPL', v: -1.36, series: [14, 15, 13, 15, 14, 16, 17] },
+  { sym: 'TSLA', v: 11.05, series: [23, 21, 17, 19, 14, 10, 8] },
+  { sym: 'MSFT', v: 2.34, series: [17, 16, 17, 15, 14, 15, 13] },
+  { sym: 'AMZN', v: 4.81, series: [22, 20, 21, 16, 17, 12, 9] },
 ];
 
+/** The days a mini chart tile looks back. */
+const MINI_DAYS = 30;
+
+/** The mini chart grid's tiles (`MiniChartGridWidget`), three to a row as
+    the dashboard sets them: the symbol over its move, then its last price
+    and its line. Each enters in turn once the widget is added. */
 function MiniChartBody() {
   const locale = useLocale();
   return (
-    <div className="grid min-h-0 flex-1 grid-cols-6 grid-rows-2 gap-1">
-      {MINI.map(({ sym, v, series }, i) => (
-        <Appear
-          key={sym}
-          at={ADDED + 120 + i * 40}
-          reserve
-          className="flex min-w-0 flex-col justify-between gap-[3px] rounded-[4px] border p-1"
-          style={{ borderColor: 'var(--color-border-muted)' }}
-        >
-          <span className="flex items-center justify-between gap-0.5">
-            <span
-              className="text-[6px] font-bold leading-none"
-              style={{ color: 'var(--color-text-primary)' }}
-            >
-              {sym}
+    <div className="grid grid-cols-3 gap-2">
+      {MINI.map(({ sym, v, series }, i) => {
+        const color = signColor(v);
+        const quote = WATCH.find((w) => w.sym === sym);
+        // the watchlist's last price, as the grid's live quote overlays it
+        const last = quote ? quote.prev * (1 + quote.ticks[quote.ticks.length - 1].v / 100) : 0;
+        return (
+          <Appear
+            key={sym}
+            at={ADDED + 120 + i * 40}
+            reserve
+            className="rounded-lg border p-2"
+            style={{ background: 'var(--color-bg-card)', borderColor: 'var(--color-border-muted)' }}
+          >
+            <span className="flex items-center justify-between">
+              <span className="text-xs font-bold" style={{ color: 'var(--color-text-primary)' }}>
+                {sym}
+              </span>
+              <span className="font-mono text-[11px] tabular-nums" style={{ color }}>
+                {v >= 0 ? '+' : ''}
+                {grouped2(v, locale)}%
+              </span>
             </span>
-            <span
-              className="font-mono text-[5px] leading-none tabular-nums"
-              style={{ color: signColor(v) }}
-            >
-              {signedFixed2(v, locale)}%
+            <span className="mt-1 flex items-end justify-between">
+              <span
+                className="font-mono text-[11px] tabular-nums"
+                style={{ color: 'var(--color-text-secondary)' }}
+              >
+                {formatMoney(last, 'USD', locale)}
+              </span>
+              <Spark series={series} color={color} className="h-[33px] w-[110px]" />
             </span>
-          </span>
-          <Spark series={series} color={signColor(v)} stretch className="min-h-0 w-full flex-1" />
-        </Appear>
-      ))}
+          </Appear>
+        );
+      })}
     </div>
   );
 }
@@ -161,9 +165,10 @@ const CUSTOM_H = 360;
 const HEADER_H = 28;
 const GRID_TOP = HEADER_H + PAD;
 const FLOAT_ROOM = 50;
-/** The markets overview's row, then two rows of the same height, as the
-    default layout's columns fill the rest of the window. */
-const MARKETS_ROW = 50;
+/** The markets overview's row, its frame around the index cards, then two
+    rows of the same height, as the default layout's columns fill the rest
+    of the window. */
+const MARKETS_ROW = 86;
 const ROW = (CUSTOM_H - GRID_TOP - PAD - FLOAT_ROOM - MARKETS_ROW - 2 * GAP) / 2;
 const ROW_STEP = ROW + GAP;
 /** The right column's left edge: the left one takes eight of twelve. */
@@ -171,25 +176,23 @@ const RIGHT_X = PAD + ((PAGE_W - 2 * PAD - GAP) * 2) / 3 + GAP;
 const ROW2_TOP = GRID_TOP + MARKETS_ROW + GAP;
 const ROW3_TOP = ROW2_TOP + ROW_STEP;
 /** Pointer targets in page px, read off the layout: the header's
-    edit-layout pencil, the earnings widget's edit header, and the toolbar's add button. */
+    edit-layout pencil, the earnings widget's title in its edge, and the
+    toolbar's add button. */
 const EDIT = { x: 367, y: 13 };
 const GRAB = { x: RIGHT_X + 34, y: ROW3_TOP + 8 };
 const DROP = { x: GRAB.x - 4, y: GRAB.y - ROW_STEP + 5 };
 const ADD = { x: 132, y: CUSTOM_H - PAD - 11 };
-/** The added widget's row. The real grid puts a new widget at the foot of
-    the layout, full width, so the page grows by a row and the toolbar, which
-    floats at the window's foot, rides down with it as the window follows.
-    The row is as tall as lets the closing crop, from the second row's foot
-    to the page's, keep the page's full width in. */
-const MINI_ROW = 146;
+/** The added widget's row, as tall as its two rows of tiles. The real grid
+    puts a new widget at the foot of the layout, full width, so the page
+    grows by a row and the toolbar, which floats at the window's foot, rides
+    down with it as the window follows. */
+const MINI_ROW = 104;
 const GROW = GAP + MINI_ROW;
 const ADDED = CUSTOM.add + 120;
 const GROW_DUR = 500;
 const grown = (t: number) => (t >= ADDED ? GROW * ease(t, ADDED, GROW_DUR) : 0);
-/** The page once it has grown by the new row, and the second row's foot,
-    where the closing crop starts. */
+/** The page once it has grown by the new row. */
 const GROWN = { width: PAGE_W, height: CUSTOM_H + GROW };
-const ROW2_FOOT = ROW2_TOP + ROW;
 /** Past halfway, the watchlist gives up its slot. */
 const SWAP = (CUSTOM.carry + CUSTOM.drop) / 2;
 /** The pencil, the earnings widget's header grabbed and carried a row
@@ -208,8 +211,9 @@ const CUSTOM_POINTER = pointerScript(
 /** The page's top right under the header's pencil; a short push in on it,
     and back out down the right column as the earnings widget is
     carried up it; down to the toolbar's add button, and out to the page's
-    full width as the page grows by the new widget's row, so the widget is
-    whole with the toolbar under it. */
+    full width as the page grows by the new widget's row, from the second
+    row's top to the page's foot, so the widget is whole with the toolbar
+    under it. */
 const CUSTOM_SHOTS: [Shot, ...Shot[]] = [
   shot(0, PAGE_W, 0, REST),
   shot(1200, PAGE_W, 0, CLOSE, 800),
@@ -217,12 +221,13 @@ const CUSTOM_SHOTS: [Shot, ...Shot[]] = [
   shot(2500, PAGE_W, ROW2_TOP - GAP / 2 + VIEW.height / 2 / REST, REST, 1100),
   // the view's foot on the window's, the toolbar in
   shot(4600, PAGE_W, CUSTOM_H - VIEW.height / 2 / REST, REST, 600),
-  // from the second row's foot to the page's
+  // from the second row's top to the page's foot, no closer than the
+  // page's full width
   shot(
     ADDED + GROW_DUR + 130,
     PAGE_W / 2,
     GROWN.height,
-    VIEW.height / (GROWN.height - ROW2_FOOT),
+    Math.min(VIEW.width / PAGE_W, VIEW.height / (GROWN.height - ROW2_TOP)),
     700
   ),
 ];
@@ -268,61 +273,21 @@ function EditToolbar() {
   );
 }
 
-/** The markets overview in its edit frame: an index per tile, name over
-    price and change, as the widget's compact cards draw them. */
-function MarketsBody() {
-  const locale = useLocale();
-  return (
-    <div className="grid min-h-0 flex-1 grid-cols-5 gap-1">
-      {INDICES.map(({ name, prev, ticks }) => {
-        const v = ticks[ticks.length - 1].v;
-        return (
-          <span
-            key={name}
-            className="flex min-w-0 flex-col justify-center gap-[3px] rounded-[4px] border px-1"
-            style={{ borderColor: 'var(--color-border-muted)' }}
-          >
-            <span
-              className="truncate text-[6px] font-bold leading-none"
-              style={{ color: 'var(--color-text-primary)' }}
-            >
-              {name}
-            </span>
-            <span className="flex items-baseline justify-between gap-0.5">
-              <span
-                className="font-mono text-[6px] leading-none tabular-nums"
-                style={{ color: 'var(--color-text-primary)' }}
-              >
-                {grouped2(prev * (1 + v / 100), locale)}
-              </span>
-              <span
-                className="font-mono text-[5px] leading-none tabular-nums"
-                style={{ color: signColor(v) }}
-              >
-                {signedFixed2(v, locale)}%
-              </span>
-            </span>
-          </span>
-        );
-      })}
-    </div>
-  );
-}
-
 /** The default layout in edit mode, each widget in its frame: the markets
-    overview across the top, the brief over news on the left, the watchlist
-    over earnings on the right. */
+    overview across the top, its frame now drawn around the index cards, the
+    brief over news on the left, the watchlist over earnings on the right.
+    The cells are shorter than the widgets, so each shows its top. */
 function EditGrid() {
   const { t: tr } = useTranslation();
-  const newsHeader = tr('dashboard.widgets.newsFeed.header', {
-    label: tr('dashboard.widgets.newsFeed.tab_market'),
-  });
   const t = useSceneTime();
   const held = t >= CUSTOM.grab;
   const dropped = t >= CUSTOM.drop;
   const swapped = t >= SWAP;
   // the earnings widget rides with the pointer while held, then settles into
-  // its new slot from wherever the pointer let go
+  // its new slot from wherever the pointer let go; held, it is picked up the
+  // way the grid picks a widget up, a touch larger, with no shadow, since a
+  // card the style leaves unfilled would cast one around nothing. It carries
+  // the page's ground, so the rows it passes over do not read through it.
   const lift = ease(t, CUSTOM.grab, 160) * (1 - ease(t, CUSTOM.drop, 260));
   const settle = 1 - ease(t, CUSTOM.drop, 260);
   const p = pointAt(CUSTOM_POINTER.path, t);
@@ -335,33 +300,21 @@ function EditGrid() {
         style={{ gridTemplateRows: `${MARKETS_ROW}px ${ROW}px ${ROW}px` }}
       >
         <div style={{ gridColumn: '1 / 3', gridRow: 1 }}>
-          <Widget icon={LineChart} title={tr('dashboard.widgets.marketsOverview.title')} edit>
-            <MarketsBody />
+          <Widget title={tr('dashboard.widgets.marketsOverview.title')} edit className="h-full">
+            <IndexRow fill />
           </Widget>
         </div>
         <div style={{ gridColumn: 1, gridRow: 2 }}>
-          <Widget icon={Sparkles} title={tr('dashboard.widgets.insightBrief.title')} edit>
-            <BriefEyebrow />
-            <BriefHeadline className="line-clamp-2 shrink-0 text-[7px]" />
-            <BriefSummary className="line-clamp-2 shrink-0 text-[5px]" />
-            <span className="flex shrink-0 flex-wrap gap-[3px]">
-              {INSIGHT.topics.map((topic) => (
-                <TopicPill key={topic.text} {...topic} />
-              ))}
-            </span>
-          </Widget>
+          <BriefWidget edit className="h-full">
+            <BriefLede clamp />
+          </BriefWidget>
         </div>
         <div style={{ gridColumn: 1, gridRow: 3 }}>
-          <Widget
-            icon={Newspaper}
-            title={tr('dashboard.widgets.newsFeed.title')}
-            header={newsHeader}
-            edit
-          >
-            {NEWS.slice(0, 2).map((item) => (
+          <NewsWidget edit className="h-full">
+            {NEWS.slice(0, 3).map((item) => (
               <NewsRow key={item.title} item={item} />
             ))}
-          </Widget>
+          </NewsWidget>
         </div>
         {/* where the held widget will land, as the grid marks it */}
         {held && t < CUSTOM.drop + 260 && (
@@ -384,44 +337,20 @@ function EditGrid() {
               : undefined,
           }}
         >
-          <Widget
-            icon={Eye}
-            title={tr('dashboard.widgets.portfolioWatchlist.title')}
-            edit
-          >
-            {WATCH.slice(0, 3).map((row) => (
-              <WatchRow key={row.sym} row={row} />
-            ))}
-          </Widget>
+          <WatchWidget rows={3} edit className="h-full" />
         </div>
         {/* the earnings, carried */}
         <div
-          className="relative"
+          className="relative rounded-lg"
           style={{
             gridColumn: 2,
             gridRow: dropped ? 2 : 3,
             zIndex: held ? 2 : undefined,
+            background: lift > 0 ? 'var(--color-bg-page)' : undefined,
             transform: `translate(${dx}px, ${dy}px) scale(${1 + 0.015 * lift})`,
           }}
         >
-          <Widget
-            icon={CalendarDays}
-            title={tr('dashboard.widgets.earningsCalendar.title')}
-            edit
-            style={
-              lift > 0
-                ? {
-                    boxShadow: `0 10px 20px -8px rgba(0, 0, 0, ${(0.28 * lift).toFixed(3)}), 0 0 0 ${
-                      lift > 0.5 ? 1 : 0
-                    }px var(--color-accent-primary)`,
-                  }
-                : undefined
-            }
-          >
-            {EARNINGS.map((row) => (
-              <EarningsRow key={row.sym} row={row} />
-            ))}
-          </Widget>
+          <EarningsWidget edit className="h-full" />
         </div>
       </div>
       {/* the widget the toolbar adds, at the layout's foot, full width */}
@@ -429,9 +358,11 @@ function EditGrid() {
         <div className="shrink-0 overflow-hidden" style={{ height: grown(t) }}>
           <Appear at={ADDED} pop className="flex" style={{ paddingTop: GAP, height: GROW }}>
             <Widget
-              icon={Grid2x2}
-              title={tr('dashboard.widgets.miniChartGrid.title')}
-              header={tr('dashboard.widgets.miniChartGrid.header')}
+              title={tr('dashboard.widgets.miniChartGrid.header')}
+              meta={tr('dashboard.widgets.miniChartGrid.summary', {
+                count: MINI.length,
+                days: MINI_DAYS,
+              })}
               edit
               className="flex-1"
             >

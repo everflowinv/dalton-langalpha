@@ -16,6 +16,7 @@ from src.server.services.brokerage_orders import (
     AttemptStatus,
     BrokerOrder,
     ComboRef,
+    CryptoRef,
     EquityRef,
     FutureRef,
     ListingIncomplete,
@@ -207,8 +208,8 @@ PAPER_EMPTY_ORDER_LIST = {
 
 def test_adapter_for_knows_moomoo_and_not_an_unmodeled_vendor():
     assert MOOMOO is not None
-    # Webull publishes nothing that places an order, so it never gets one.
-    assert adapter_for("webull") is None
+    # A vendor we ship no order tools for has nothing to translate.
+    assert adapter_for("a_vendor_we_do_not_ship") is None
 
 
 def test_live_place_request():
@@ -1183,3 +1184,249 @@ def test_order_outcome_json_round_trip():
         ).to_json()
     )
     assert rejected.failure.code == "-5"
+
+
+# moomoo's crypto family answers in its crypto trading API's own envelope, and
+# that API publishes it: the bodies below are the documented examples, with
+# invented ids.
+CRYPTO_LIMIT_ARGS = {
+    "acc_id": "1234567",
+    "req_id": "1750000000000_a1b2c3d4e5f6g7h8",
+    "side": "BUY",
+    "symbol": "BTCUSD",
+    "ord_type": "LIMIT",
+    "qty": "0.01",
+    "price": "30000",
+    "time_in_force": "TIF_GTC",
+}
+
+CRYPTO_ORDER_ITEM = {
+    "order_id": "FTHC2989880641155745280T",
+    "version": 2,
+    "symbol_pair": {"symbol": "BTCUSD", "base": "BTC", "quote": "USD"},
+    "side": "BUY",
+    "order_qty": "0.01",
+    "price": "30000",
+    "order_amount": "300.00",
+    "cum_qty": "0.01",
+    "avg_px": "30000",
+    "fill_amount": "300.00",
+    "ord_type": "LIMIT",
+    "time_in_force": "TIF_GTC",
+    "create_time": 1750000000000000,
+    "update_time": 1750000100000000,
+    "ord_status": "FILLED",
+    "order_show_id": "SHOW-001",
+    "is_close": True,
+    "trigger_price": "",
+    "trigger_time": 0,
+    "cash_order_qty": "",
+}
+
+
+def test_crypto_limit_request():
+    order = MOOMOO.parse_request("crypto_account_create_order", CRYPTO_LIMIT_ARGS)
+
+    assert order.mode is OrderMode.LIVE
+    assert order.asset_class == "crypto"
+    assert order.instrument == CryptoRef(pair="BTCUSD")
+    assert order.side == "buy"
+    assert order.qty == Decimal("0.01")
+    assert order.notional is None
+    assert order.order_type == "limit"
+    assert order.limit_price == Decimal("30000")
+    assert order.time_in_force == "gtc"
+    assert order.currency is None
+    assert order.extras == {"req_id": "1750000000000_a1b2c3d4e5f6g7h8"}
+
+
+def test_a_cash_sized_crypto_order_keeps_words_we_lack_in_extras():
+    """IOC has no word in the vocabulary, so it stays as moomoo spelled it."""
+    order = MOOMOO.parse_request(
+        "crypto_account_create_order",
+        {
+            "acc_id": "1234567",
+            "req_id": "r-0000000000000002",
+            "side": "BUY",
+            "symbol": "ethusd",
+            "ord_type": "MARKET",
+            "cash_order_qty": "100",
+            "time_in_force": "TIF_IOC",
+        },
+    )
+
+    assert order.instrument == CryptoRef(pair="ETHUSD")
+    assert order.qty is None
+    assert order.notional == Money(amount=Decimal("100"))
+    assert order.order_type == "market"
+    assert order.time_in_force is None
+    assert order.extras == {"req_id": "r-0000000000000002", "time_in_force": "TIF_IOC"}
+
+
+@pytest.mark.parametrize(
+    "ord_type, order_type",
+    [
+        ("STOP_LOSS_LIMIT", "stop_limit"),
+        ("STOP_LOSS_MARKET", "stop"),
+        ("TAKE_PROFIT_LIMIT", "limit_if_touched"),
+        ("TAKE_PROFIT_MARKET", "market_if_touched"),
+    ],
+)
+def test_a_conditional_crypto_order_triggers_at_its_stop_price(ord_type, order_type):
+    order = MOOMOO.parse_request(
+        "crypto_account_create_order",
+        {
+            **CRYPTO_LIMIT_ARGS,
+            "side": "SELL",
+            "ord_type": ord_type,
+            "conditional_info": {"trigger_price": "28000"},
+        },
+    )
+
+    assert order.side == "sell"
+    assert order.order_type == order_type
+    assert order.stop_price == Decimal("28000")
+    assert "conditional_info" not in order.extras
+
+
+def test_crypto_modify_and_cancel_name_their_order():
+    modify = MOOMOO.parse_request(
+        "crypto_account_modify_order",
+        {
+            "acc_id": "1234567",
+            "orderId": "FTHC2989880641155745280T",
+            "req_id": "r-0000000000000003",
+            "qty": "0.02",
+            # moomoo's instruction for a conditional market order: send 0.
+            "price": "0",
+            "order_version": 1,
+            "conditional_info": {"trigger_price": "27500"},
+        },
+    )
+    cancel = MOOMOO.parse_request(
+        "crypto_account_cancel_order",
+        {"acc_id": "1234567", "orderId": "FTHC2989880641155745280T", "req_id": "r-4"},
+    )
+
+    assert modify.asset_class == cancel.asset_class == "crypto"
+    assert modify.target_ref == cancel.target_ref == "FTHC2989880641155745280T"
+    assert modify.qty == Decimal("0.02")
+    assert modify.limit_price is None
+    assert modify.stop_price == Decimal("27500")
+    assert modify.extras == {
+        "orderId": "FTHC2989880641155745280T",
+        "req_id": "r-0000000000000003",
+        "price": "0",
+        "order_version": 1,
+    }
+
+
+def test_a_crypto_command_answer_carries_an_id_and_no_state():
+    place = MOOMOO.parse_request("crypto_account_create_order", CRYPTO_LIMIT_ARGS)
+    placed = MOOMOO.parse_result(
+        "crypto_account_create_order",
+        '{"code":0,"msg":"success","data":{"order_id":"FTHC2989880641155745280T"}}',
+        tool_status="success",
+        request=place,
+    )
+    cancel = MOOMOO.parse_request(
+        "crypto_account_cancel_order",
+        {"acc_id": "1234567", "orderId": "FTHC2989880641155745280T", "req_id": "r-4"},
+    )
+    cancelled = MOOMOO.parse_result(
+        "crypto_account_cancel_order",
+        {"code": 0, "msg": "success", "data": {}},
+        tool_status="success",
+        request=cancel,
+    )
+
+    assert placed.status is AttemptStatus.SUBMITTED
+    assert placed.vendor_order_id == "FTHC2989880641155745280T"
+    assert cancelled.status is AttemptStatus.CANCELLED
+    assert cancelled.vendor_order_id == "FTHC2989880641155745280T"
+
+
+def test_a_crypto_rejection_names_moomoos_code_and_message():
+    outcome = MOOMOO.parse_result(
+        "crypto_account_create_order",
+        {
+            "code": 550000001,
+            "msg": "Invalid code. Please adjust and place the order again.",
+        },
+        tool_status="success",
+        request=MOOMOO.parse_request("crypto_account_create_order", CRYPTO_LIMIT_ARGS),
+    )
+
+    assert outcome.status is AttemptStatus.REJECTED_BY_VENDOR
+    assert outcome.failure.code == "550000001"
+    assert outcome.failure.message.startswith("Invalid code")
+
+
+def test_a_crypto_answer_with_no_envelope_settles_nothing():
+    cancel = MOOMOO.parse_request(
+        "crypto_account_cancel_order",
+        {"acc_id": "1234567", "orderId": "FTHC2989880641155745280T", "req_id": "r-4"},
+    )
+    for body in ("no data", {"msg": "success", "data": {}}):
+        outcome = MOOMOO.parse_result(
+            "crypto_account_cancel_order", body, tool_status="success", request=cancel
+        )
+        assert outcome.status is AttemptStatus.UNKNOWN
+        assert outcome.vendor_order_id == "FTHC2989880641155745280T"
+
+
+def test_a_crypto_order_settles_by_its_id():
+    """Its two lists split the book, so absence from either says nothing."""
+    order = MOOMOO.parse_request("crypto_account_create_order", CRYPTO_LIMIT_ARGS)
+    query = MOOMOO.status_query(order, vendor_order_id="FTHC2989880641155745280T")
+
+    assert query.tool == "crypto_account_order_detail"
+    assert query.args == {"acc_id": "1234567", "orderId": "FTHC2989880641155745280T"}
+    assert MOOMOO.status_query(order) is None
+
+    body = {"code": 0, "msg": "success", "data": {"orders": [CRYPTO_ORDER_ITEM]}}
+    (listed,) = MOOMOO.parse_status(query, body)
+    assert listed.vendor_order_id == "FTHC2989880641155745280T"
+    assert listed.outcome.status is AttemptStatus.FILLED
+    assert listed.outcome.raw_status == "FILLED"
+    assert listed.outcome.filled_qty == Decimal("0.01")
+    assert listed.outcome.avg_fill_price == Decimal("30000")
+    assert listed.placed_at == datetime.fromtimestamp(1750000000, tz=UTC)
+    assert MOOMOO.next_page(query, body) is None
+
+
+@pytest.mark.parametrize(
+    "ord_status, status",
+    [
+        ("PENDING_TRIGGER", AttemptStatus.WORKING),
+        ("PENDING_NEW", AttemptStatus.SUBMITTED),
+        ("NEW", AttemptStatus.WORKING),
+        ("PARTIAL_FILLED", AttemptStatus.PARTIALLY_FILLED),
+        ("CANCELED", AttemptStatus.CANCELLED),
+        ("CANCELLED_PART", AttemptStatus.CANCELLED),
+        ("EXPIRED", AttemptStatus.EXPIRED),
+        ("REJECTED", AttemptStatus.REJECTED_BY_VENDOR),
+        ("FAILED", AttemptStatus.REJECTED_BY_VENDOR),
+        ("SOMETHING_NEW", AttemptStatus.UNKNOWN),
+    ],
+)
+def test_crypto_order_states(ord_status, status):
+    query = MOOMOO.status_query(
+        MOOMOO.parse_request("crypto_account_create_order", CRYPTO_LIMIT_ARGS),
+        vendor_order_id="FTHC2989880641155745280T",
+    )
+    body = {"code": 0, "data": {"orders": [{**CRYPTO_ORDER_ITEM, "ord_status": ord_status}]}}
+
+    (listed,) = MOOMOO.parse_status(query, body)
+    assert listed.outcome.status is status
+
+
+def test_a_crypto_read_the_vendor_refused_is_not_an_empty_list():
+    query = MOOMOO.status_query(
+        MOOMOO.parse_request("crypto_account_create_order", CRYPTO_LIMIT_ARGS),
+        vendor_order_id="FTHC2989880641155745280T",
+    )
+    with pytest.raises(StatusReadError):
+        MOOMOO.parse_status(query, {"code": 1, "msg": "Error Message."})
+    with pytest.raises(StatusReadError):
+        MOOMOO.parse_status(query, {"code": 0, "msg": "success", "data": {}})

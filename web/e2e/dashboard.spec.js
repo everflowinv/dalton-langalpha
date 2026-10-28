@@ -124,20 +124,23 @@ test.describe('Market Indices & News', () => {
 
     await page.goto('/dashboard');
 
-    // Verify S&P 500 card renders with name, symbol, and price, giving the
-    // page's first paint the budget other specs give it
-    await expect(page.locator('h3', { hasText: 'S&P 500' })).toBeVisible({ timeout: 15000 });
-    await expect(page.getByText('^GSPC')).toBeVisible();
-    await expect(page.getByText('5,500.25')).toBeVisible();
+    const markets = widget(page, 'markets.overview');
+
+    // Verify S&P 500 card renders with symbol, name, and price, giving the
+    // page's first paint the budget other specs give it. Each index is a card
+    // whose title (its symbol) is the card's button, its name beside it.
+    await expect(markets.getByRole('button', { name: 'GSPC', exact: true })).toBeVisible({ timeout: 15000 });
+    await expect(markets.getByText('S&P 500', { exact: true })).toBeVisible();
+    await expect(markets.getByText('5,500.25')).toBeVisible();
 
     // Verify NASDAQ card
-    await expect(page.locator('h3', { hasText: 'NASDAQ' })).toBeVisible();
-    await expect(page.getByText('17,200.50')).toBeVisible();
+    await expect(markets.getByText('NASDAQ', { exact: true })).toBeVisible();
+    await expect(markets.getByText('17,200.50')).toBeVisible();
 
     // Verify all 5 index cards are present
-    await expect(page.locator('h3', { hasText: 'Dow Jones' })).toBeVisible();
-    await expect(page.locator('h3', { hasText: 'Russell 2000' })).toBeVisible();
-    await expect(page.locator('h3', { hasText: 'VIX' })).toBeVisible();
+    await expect(markets.getByText('Dow Jones', { exact: true })).toBeVisible();
+    await expect(markets.getByText('Russell 2000', { exact: true })).toBeVisible();
+    await expect(markets.getByRole('button', { name: 'VIX', exact: true })).toBeVisible();
   });
 
   test('news headlines render with tabs', async ({ page }) => {
@@ -158,13 +161,9 @@ test.describe('Market Indices & News', () => {
 
     const news = widget(page, 'news.feed');
 
-    // Headlines render in the default (Market) feed
-    await expect(
-      news.getByRole('heading', { name: 'Tech Stocks Surge' }),
-    ).toBeVisible();
-    await expect(
-      news.getByRole('heading', { name: 'Fed Holds Rates Steady' }),
-    ).toBeVisible();
+    // Headlines render in the default (Market) feed, one row a story
+    await expect(news.getByTitle('Tech Stocks Surge')).toBeVisible();
+    await expect(news.getByTitle('Fed Holds Rates Steady')).toBeVisible();
 
     // Source tabs are present
     for (const tab of ['Top', 'Market', 'Portfolio', 'Watchlist']) {
@@ -175,14 +174,13 @@ test.describe('Market Indices & News', () => {
 
     // Switching to the Portfolio tab with no holdings shows its empty state
     // in place of the market headlines
-    await news.getByRole('button', { name: 'Portfolio', exact: true }).click();
-    await expect(news.getByText('News · Portfolio')).toBeVisible();
+    const portfolioTab = news.getByRole('button', { name: 'Portfolio', exact: true });
+    await portfolioTab.click();
+    await expect(portfolioTab).toHaveAttribute('aria-pressed', 'true');
     await expect(
       news.getByText('Add to portfolio to see news'),
     ).toBeVisible();
-    await expect(
-      news.getByRole('heading', { name: 'Tech Stocks Surge' }),
-    ).toHaveCount(0);
+    await expect(news.getByTitle('Tech Stocks Surge')).toHaveCount(0);
   });
 
   test('clicking news opens detail modal', async ({ page }) => {
@@ -212,7 +210,7 @@ test.describe('Market Indices & News', () => {
     await page.goto('/dashboard');
 
     // Click the headline
-    await page.locator('h3[title="Earnings Beat Expectations"]').click();
+    await widget(page, 'news.feed').getByTitle('Earnings Beat Expectations').click();
 
     // Modal opens with article content
     await expect(
@@ -234,10 +232,11 @@ test.describe('Market Indices & News', () => {
     await page.goto('/dashboard');
 
     // Wait for the S&P 500 card to appear
-    await expect(page.locator('h3', { hasText: 'S&P 500' })).toBeVisible();
+    const spx = widget(page, 'markets.overview').getByText('S&P 500', { exact: true });
+    await expect(spx).toBeVisible();
 
-    // Click the S&P 500 card (the motion.div wrapping the card)
-    await page.locator('h3', { hasText: 'S&P 500' }).click();
+    // Click the S&P 500 card: the whole card answers, not only its title
+    await spx.click();
 
     // Should navigate to /market?symbol=^GSPC
     await page.waitForURL('**/market?symbol=*GSPC*');

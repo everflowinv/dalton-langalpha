@@ -27,6 +27,15 @@ export interface WidgetDefinition<C = unknown> {
    *  it via `t(titleKey)`. Use a `dashboard.widgets.<key>.title` shape so
    *  `keys.test.ts` picks it up automatically. */
   titleKey: string;
+  /** i18n key for the title set into the widget's card edge, where the
+   *  gallery's name is longer than a card label wants. Falls back to
+   *  `titleKey`. */
+  cardTitleKey?: string;
+  /** `bare`: the body draws its own cards (the index tiles), so outside edit
+   *  mode the frame draws no edge or title around them. `untitled`: the body
+   *  prints its own heading (an embed we cannot restyle), so outside edit
+   *  mode the edge stays and the title goes, rather than say it twice. */
+  frame?: 'card' | 'bare' | 'untitled';
   /** Optional i18n key for the widget's gallery blurb. Same shape rules. */
   descriptionKey?: string;
   category: WidgetCategory;

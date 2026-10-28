@@ -373,13 +373,16 @@ async def test_cancel_open_by_scope_closes_every_open_wakeup_in_it(thread, scope
 # --- the order backstop -----------------------------------------------------
 
 
-async def _attempt(db_conn, thread, *, status: str, filled: float | None) -> str:
+async def _attempt(
+    db_conn, thread, *, status: str, filled: float | None, unlisted: bool = False
+) -> str:
     cur = await db_conn.execute(
         """
         INSERT INTO order_attempts
             (user_id, thread_id, message_id, tool_call_id, vendor, status,
-             vendor_order_id, filled_qty, order_json)
-        VALUES (%s, %s, %s, %s, 'moomoo', %s, %s, %s, '{"qty": 100}'::jsonb)
+             vendor_order_id, filled_qty, order_json, unlisted_at)
+        VALUES (%s, %s, %s, %s, 'moomoo', %s, %s, %s, '{"qty": 100}'::jsonb,
+                CASE WHEN %s THEN NOW() END)
         RETURNING attempt_id::text AS id
         """,
         (
@@ -390,6 +393,7 @@ async def _attempt(db_conn, thread, *, status: str, filled: float | None) -> str
             status,
             "7712045",
             filled,
+            unlisted,
         ),
     )
     return (await cur.fetchone())["id"]
@@ -430,6 +434,35 @@ async def test_the_backstop_fires_a_wakeup_whose_order_filled_or_ended(thread, d
     assert await fire_order_wakeups(None) == []
     # And one notice each reached the thread.
     assert len(await _notices(db_conn, moved["wakeup_id"])) == 1
+
+
+@pytest.mark.parametrize(
+    "status, filled, unlisted, outcome",
+    [
+        ("expired", 0, False, "expired"),
+        ("expired", 40, False, "partial_expired"),
+        # A staged order the vendor's list reported confirmed has no unlisted
+        # stamp; one that only left the list keeps it.
+        ("handed_off", 0, False, "confirmed"),
+        ("handed_off", 0, True, "handed_off"),
+    ],
+)
+async def test_the_backstop_names_how_an_order_ended(
+    thread, db_conn, status, filled, unlisted, outcome
+):
+    from src.server.database.wakeups.fire import fire_order_wakeups
+
+    row = await _watch(
+        thread,
+        await _attempt(
+            db_conn, thread, status=status, filled=filled, unlisted=unlisted
+        ),
+        0,
+    )
+
+    fired = {str(r["wakeup_id"]): r for r in await fire_order_wakeups(None)}
+
+    assert fired[str(row["wakeup_id"])]["order_outcome"]["outcome"] == outcome
 
 
 async def test_a_fill_already_there_when_the_wakeup_was_set_does_not_fire_it(

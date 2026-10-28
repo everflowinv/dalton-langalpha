@@ -1,9 +1,8 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 
-vi.mock('react-i18next', () => ({
-  useTranslation: () => ({ t: (k: string, o?: { defaultValue?: string }) => o?.defaultValue ?? k }),
-}));
+// Real catalogs (test/setup.ts loads them): the window's words are localized,
+// and these assertions read the English ones.
 vi.mock('@/hooks/useIsMobile', () => ({ useIsMobile: () => false }));
 vi.mock('@/components/ui/use-toast', () => ({ useToast: () => ({ toast: vi.fn() }) }));
 
@@ -23,7 +22,7 @@ const IMAGELESS_ARTICLE = {
   sentiments: null,
 };
 
-// One ticker impact card, so the article has a nested overlay to open.
+// One ticker with a scored sentiment and its note.
 const SENTIMENT_ARTICLE = {
   ...IMAGELESS_ARTICLE,
   id: 'article-2',
@@ -113,19 +112,15 @@ describe('NewsDetailModal — imageless (TickerTick) article', () => {
     expect(await screen.findByText(/Article details not available/i)).toBeInTheDocument();
   });
 
-  it('lets Escape dismiss the sentiment card before the article behind it', async () => {
+  it('prints each ticker\'s note in full, and Escape closes the article', async () => {
     const onClose = vi.fn();
     getNewsArticle.mockResolvedValue(SENTIMENT_ARTICLE);
 
     render(<NewsDetailModal newsId="article-2" onClose={onClose} />);
-    fireEvent.click(await screen.findByText('AAPL'));
-    // The impact card and the overlay both print the reasoning, so two of it is
-    // what an open overlay looks like from here.
-    expect(screen.getAllByText(/Margins held/)).toHaveLength(2);
-
-    fireEvent.keyDown(window, { key: 'Escape' });
-    await waitFor(() => expect(screen.getAllByText(/Margins held/)).toHaveLength(1));
-    expect(onClose).not.toHaveBeenCalled();
+    await screen.findByText('AAPL');
+    // The impact table holds the whole note, so there is no card to open for
+    // the rest of it: the note is on the page once.
+    expect(screen.getAllByText(/Margins held/)).toHaveLength(1);
 
     fireEvent.keyDown(window, { key: 'Escape' });
     expect(onClose).toHaveBeenCalledTimes(1);

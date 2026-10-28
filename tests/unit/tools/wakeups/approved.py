@@ -124,6 +124,15 @@ BUILD_WAKE_LINES = {
     "order_partial_cancelled": "Your order ended partly filled: {order} (order {order_id}), {filled} "
     "of {qty} at an average {avg}, then was cancelled at {fire_time}.",
     "order_failed": "Your order ended unfilled: {order} (order {order_id}) failed: {reason}.",
+    "order_partial_expired": "Your order ended partly filled: {order} (order {order_id}), {filled} "
+    "of {qty} at an average {avg}, then expired at {fire_time}.",
+    "order_expired": "Your order ended unfilled: {order} (order {order_id}) expired at {fire_time}.",
+    "order_confirmed": "Your order was confirmed at the brokerage and sent there as a live "
+    "order: {order} (order {order_id}), at {fire_time}. Its fills show in the brokerage's own "
+    "orders.",
+    "order_handed_off": "Your staged order left the brokerage's instruction list: {order} (order "
+    "{order_id}) was sent, deleted or expired there by {fire_time}, and the brokerage does not "
+    "say which.",
     # Not in drafts.py's BUILD_WAKE_LINES, which only says in a comment that the
     # line drops "Last price" when no price is known; the wording is that line.
     "price_expiring_unpriced": "Your trigger on {symbol} ({phrase}) has not hit and lapses at "

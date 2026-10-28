@@ -229,7 +229,7 @@
     "title": "用户设置",
     "fontSize": "字体大小",
     "cardStyle": "卡片样式",
-    "cardStyleDesc": "对话中数据卡片及其详情面板的外观。",
+    "cardStyleDesc": "对话和看板中数据卡片及其详情面板的外观。",
     "cardStyleTerminal": "终端",
     "cardStyleBalanced": "均衡",
     "cardStyleQuiet": "简洁",
@@ -604,8 +604,6 @@
         "resetMessage": "这将用默认预设替换当前的小组件和布局。此操作无法撤销。",
         "resetConfirm": "重置布局",
         "deleteConfirm": "删除",
-        "settingsDialogTitle": "{{title}} 设置",
-        "editHoldingTitle": "编辑持仓 — {{symbol}}",
         "quantityLabel": "数量 *",
         "quantityPlaceholder": "例如：10.5",
         "averageCostLabel": "每股平均成本 *",
@@ -613,7 +611,8 @@
         "notesLabel": "备注",
         "notesPlaceholder": "可选",
         "cancel": "取消",
-        "save": "保存"
+        "save": "保存",
+        "editHolding": "编辑持仓"
       },
       "frame": {
         "drag": "拖拽以重新排列",
@@ -639,8 +638,6 @@
         "results": "结果",
         "resultCount_one": "{{count}} 个小组件匹配 \"{{search}}\"。",
         "resultCount_other": "{{count}} 个小组件匹配 \"{{search}}\"。",
-        "tip": "提示",
-        "tipBody": "点击小组件即可放入仪表板的下一个空位。",
         "totalCount": "共 {{count}} 个小组件",
         "noMatches": "没有匹配的小组件。",
         "hintAddSentence": "点击选择 · 双击或按 <enter/> 添加",
@@ -651,9 +648,6 @@
         "badgeSingleton": "单例",
         "badgeMulti": "多实例",
         "badgeTradingView": "TradingView",
-        "metaConfigurable": "可配置",
-        "metaNoSettings": "无设置",
-        "metaOnDashboard": "· 已在仪表板",
         "category": {
           "marketsLabel": "市场行情",
           "marketsBlurb": "实时报价、指数、图表与日历。",
@@ -665,7 +659,9 @@
           "agentBlurb": "从仪表板启动一次研究会话。",
           "workspaceLabel": "工作区",
           "workspaceBlurb": "进入往期对话或工作区。"
-        }
+        },
+        "tagSettings": "可设置",
+        "tagOnDashboard": "已在仪表板"
       },
       "presetsDialog": {
         "eyebrow": "仪表板布局",
@@ -784,7 +780,6 @@
         }
       },
       "holdings": {
-        "stock": "股票",
         "sharesHidden": "*** 股",
         "shares": "{{n}}股",
         "nav": "净资产价值",
@@ -792,7 +787,15 @@
         "showValues": "显示数值",
         "hideValues": "隐藏数值",
         "delete": "删除",
-        "edit": "编辑"
+        "edit": "编辑",
+        "colSymbol": "标的",
+        "colLast": "最新价",
+        "colChange": "涨跌",
+        "colShares": "数量",
+        "colValue": "市值",
+        "colPl": "盈亏",
+        "cost": "成本",
+        "totalPl": "总盈亏"
       },
       "tickerTape": {
         "title": "行情滚动条",
@@ -1028,7 +1031,8 @@
       },
       "insightBrief": {
         "title": "AI 每日简报",
-        "description": "自动生成的市场洞察，附\"阅读完整简报\"入口。"
+        "description": "自动生成的市场洞察，附\"阅读完整简报\"入口。",
+        "cardTitle": "每日简报"
       },
       "newsFeed": {
         "title": "新闻动态",
@@ -1037,7 +1041,6 @@
         "tab_market": "市场",
         "tab_portfolio": "持仓",
         "tab_watchlist": "自选",
-        "header": "新闻 · {{label}}",
         "range_all": "全部",
         "range_1h": "1小时",
         "range_6h": "6小时",
@@ -1051,7 +1054,8 @@
         "emptyFiltered": "无符合筛选条件的新闻",
         "emptyMarket": "暂无市场新闻",
         "emptyTop": "暂无热门新闻",
-        "emptyAddTo": "添加到{{label}}以查看新闻"
+        "emptyAddTo": "添加到{{label}}以查看新闻",
+        "cardTitle": "新闻"
       },
       "earningsCalendar": {
         "title": "财报日历",
@@ -1064,7 +1068,8 @@
         "bucket_nextWeek": "下周",
         "bucket_later": "更晚",
         "empty": "暂无即将公布的财报",
-        "emptyHint": "未来 {{days}} 天内暂无安排。"
+        "emptyHint": "未来 {{days}} 天内暂无安排。",
+        "estEps": "预期 {{value}}"
       },
       "watchlist": {
         "title": "自选股",
@@ -1083,10 +1088,9 @@
         "description": "持仓与自选合并展示，附自选 / 持仓切换。",
         "headerWatchlist": "自选股",
         "headerHoldings": "持仓",
-        "tabWatch": "自选",
-        "tabHoldings": "持仓",
         "addSymbol": "添加标的",
-        "addTransaction": "添加交易"
+        "addTransaction": "添加交易",
+        "cardTitle": "投资组合"
       },
       "miniChartGrid": {
         "title": "缩略走势图网格",
@@ -1178,8 +1182,6 @@
       }
     },
     "brief": {
-      "eyebrow": "AI 生成洞察",
-      "personalizedBrief": "个性化简报",
       "basedOnWatchlistPortfolio": "基于您的自选股与投资组合",
       "updatedWhen": "更新于 {{when}}",
       "generatingFirst": "正在生成首条洞察...",
@@ -1190,10 +1192,6 @@
       "earlierInsights": "更早的洞察",
       "earlierToday_one": "今日还有 {{count}} 条",
       "earlierToday_other": "今日还有 {{count}} 条",
-      "earlierCount_one": "更早 {{count}} 条",
-      "earlierCount_other": "更早 {{count}} 条",
-      "overflowMore_one": "+{{count}} 更多",
-      "overflowMore_other": "+{{count}} 更多",
       "typeLabel": {
         "preMarket": "盘前",
         "marketUpdate": "市场更新",
@@ -1211,8 +1209,12 @@
     "insightDetail": {
       "eyebrow": "AI 研究简报",
       "notFound": "未找到该洞察",
-      "allSources_one": "全部来源 ({{count}})",
-      "allSources_other": "全部来源 ({{count}})"
+      "allSources_one": "全部 {{count}} 个来源",
+      "allSources_other": "全部 {{count}} 个来源",
+      "stories": "要闻",
+      "sources": "来源",
+      "fewerSources": "收起来源",
+      "attachedBrief": "简报：{{title}}"
     },
     "addWatchlistDialog": {
       "titleSearch": "添加自选股",
@@ -1282,6 +1284,24 @@
       "timingAMC": "AMC",
       "stockCount_one": "{{count}} 只标的",
       "stockCount_other": "{{count}} 只标的"
+    },
+    "newsDetail": {
+      "title": "文章",
+      "close": "关闭",
+      "notAvailable": "暂无文章详情",
+      "notFound": "未找到文章",
+      "addToChat": "添加到对话",
+      "source": "来源",
+      "summary": "摘要",
+      "summaryMeta": "AI",
+      "tickerImpact": "标的影响",
+      "topics": "话题",
+      "attachedNews": "新闻：{{title}}",
+      "sentiment": {
+        "profit": "利好",
+        "loss": "利空",
+        "muted": "中性"
+      }
     }
   },
   "workspace": {
@@ -2295,7 +2315,11 @@
       "checkingWakeups": "查看唤醒中...",
       "endingQuietly": "结束检查中...",
       "orderPartialCancelled": "{{order}} 部分成交 {{filled}}/{{qty}} 后取消",
-      "orderFailed": "{{order}} 失败"
+      "orderFailed": "{{order}} 失败",
+      "orderPartialExpired": "{{order}} 部分成交 {{filled}}/{{qty}} 后过期",
+      "orderExpired": "{{order}} 已过期",
+      "orderConfirmed": "{{order}} 已在券商处确认",
+      "orderHandedOff": "{{order}} 已从券商指令列表移除"
     },
     "missingWorkspaceOrThread": "缺少工作区或对话信息",
     "accessDeniedTitle": "你没有权限查看此对话",
@@ -3569,9 +3593,14 @@
         "partiallyFilled": "部分成交",
         "filled": "全部成交",
         "cancelled": "已撤单",
+        "expired": "已在券商处过期",
         "handedOff": "已从券商的指令列表中移除，即已在券商处提交、删除或过期。券商不会告知是哪一种，可在账户订单中查看已提交的内容。",
         "handedOffStaged": "已从 {{vendor}} 的指令列表中移除，即已在 {{vendor}} 提交、删除或过期。{{vendor}} 不会告知是哪一种，可在账户订单中查看已提交的内容。",
         "handedOffStagedUnnamed": "已从券商的指令列表中移除，即已在券商处提交、删除或过期。券商不会告知是哪一种，可在账户订单中查看已提交的内容。",
+        "expiredStaged": "未在 {{vendor}} 确认，已过期",
+        "expiredStagedUnnamed": "未在券商处确认，已过期",
+        "handedOffConfirmedStaged": "已在 {{vendor}} 确认并作为订单提交，可在账户订单中查看成交情况。",
+        "handedOffConfirmedStagedUnnamed": "已在券商处确认并作为订单提交，可在账户订单中查看成交情况。",
         "rejectedByVendor": "券商拒绝了这笔订单",
         "failed": "未送达券商即失败",
         "unknown": "结果未知"
@@ -3589,13 +3618,16 @@
         "partiallyFilled": "部分成交",
         "filled": "已成交",
         "cancelled": "已撤单",
+        "expired": "已过期",
         "handedOff": "已移交",
+        "handedOffConfirmed": "已确认",
         "rejectedByVendor": "券商拒绝",
         "failed": "失败",
         "unknown": "未知"
       },
       "orderOutcome": {
         "orderId": "订单号",
+        "approvalId": "审批编号",
         "filled": "成交数量",
         "avgFillPrice": "成交均价",
         "fill": "成交",
@@ -4901,6 +4933,7 @@
       "account": "账户",
       "tool": "工具",
       "vendorOrderId": "券商订单号",
+      "approvalId": "审批编号",
       "attemptId": "记录编号",
       "parent": "替代",
       "parentCancel": "撤销",
@@ -4912,6 +4945,7 @@
       "open": "进行中",
       "filled": "已成交",
       "cancelled": "已撤单",
+      "expired": "已过期",
       "handedOff": "已移交",
       "rejected": "已拒绝",
       "failed": "失败"
@@ -4983,7 +5017,11 @@
         },
         "alerts": {
           "label": "价格提醒",
-          "desc": "读取你的价格提醒，并新建或删除。"
+          "desc": "读取你的价格提醒及已触发的记录，并可新建、修改或删除。"
+        },
+        "charts": {
+          "label": "已保存的图表",
+          "desc": "读取你保存的图表布局，并可修改其设置和图上的指标。"
         },
         "account": {
           "label": "账户与持仓",

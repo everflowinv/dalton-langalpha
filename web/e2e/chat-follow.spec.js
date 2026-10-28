@@ -227,7 +227,12 @@ test.describe('streaming follow', () => {
   test('lets a reader leave by a notch taken before the glide is seen', async ({ page }) => {
     // Measured from where the view was before the write, the notch would read
     // as a move down.
-    await interceptFollow(page, 1, 'vp.scrollTop = top - 12; window.__nudgedTop = vp.scrollTop;');
+    // A notch comes with its wheel event, as the reader's input would.
+    await interceptFollow(page, 1, `
+      vp.dispatchEvent(new WheelEvent('wheel', { deltaY: -12, bubbles: true }));
+      vp.scrollTop = top - 12;
+      window.__nudgedTop = vp.scrollTop;
+    `);
     await page.waitForTimeout(1000);
     const nudged = await page.evaluate(() => window.__nudgedTop);
     const after = await view(page);
@@ -291,18 +296,24 @@ test.describe('subagent follow', () => {
     // lines, and the view moves a little each frame rather than a line at once.
     await sampleFrames(page, (find) => {
       const vp = (window.__subagentScroller ??= new Function(`return ${find}`)());
-      return vp ? { gap: vp.scrollHeight - vp.scrollTop - vp.clientHeight, top: vp.scrollTop, overflow: vp.scrollHeight - vp.clientHeight } : {};
+      return vp ? { gap: vp.scrollHeight - vp.scrollTop - vp.clientHeight, top: vp.scrollTop, overflow: vp.scrollHeight - vp.clientHeight, frame: document.timeline.currentTime } : {};
     }, SUBAGENT_SCROLLER);
     await page.waitForFunction(() => window.__subagentScroller);
     await page.waitForTimeout(7000);
     const run = (await stopSampling(page)).filter((s) => s.top !== undefined);
     const steps = run.slice(1).map((s, i) => s.top - run[i].top).filter((step) => step !== 0);
+    // The sampler's frame runs before the glide's, so each step it reads was
+    // drawn over the frame before, timed on the frames' own clock as the glide
+    // times its motion.
+    const speeds = run.slice(2).map((s, i) => Math.abs(s.top - run[i + 1].top) / (run[i + 1].frame - run[i].frame));
     expect(run[run.length - 1].overflow).toBeGreaterThan(300);
     expect(steps.length).toBeGreaterThan(30);
     expect(Math.max(...run.map((s) => s.gap))).toBeLessThan(160);
-    // A few px a frame at this pace. A smooth scroll restarted on each message
-    // steps 18 px at a time over and over.
-    expect(Math.max(...steps.map(Math.abs))).toBeLessThan(12);
+    // A few px a frame at this pace, under 12 px a 60 Hz frame: on a runner
+    // short of CPU frames drop, and a frame that spans two moves as far as two.
+    // A smooth scroll restarted on each message steps 18 px a frame over and
+    // over.
+    expect(Math.max(...speeds)).toBeLessThan(12 / (1000 / 60));
     // The reply's end: the view lands on it.
     await expect.poll(() => page.evaluate((find) => {
       const vp = new Function(`return ${find}`)();

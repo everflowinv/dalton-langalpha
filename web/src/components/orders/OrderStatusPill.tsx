@@ -9,6 +9,7 @@ import {
   Clock,
   CornerUpRight,
   HelpCircle,
+  Hourglass,
   MinusCircle,
   Send,
   ShieldCheck,
@@ -16,7 +17,7 @@ import {
 } from 'lucide-react';
 import { StatusPill } from '@/components/mcp/McpPrimitives';
 import type { OrderMode, OrderStatus } from '@/types/orders';
-import { orderStatusLabel, orderStatusShortLabel } from './status';
+import { orderStatusLabel, orderStatusShortLabel, vendorNamedEnd } from './status';
 
 /**
  * What an order's state is called and what it looks like, for every surface
@@ -61,6 +62,7 @@ const STATUS_META: Record<OrderStatus, StatusMeta> = {
   partially_filled: { tone: 'muted', icon: CircleDot },
   filled: { tone: 'profit', icon: CheckCircle2 },
   cancelled: { tone: 'muted', icon: MinusCircle },
+  expired: { tone: 'muted', icon: Hourglass },
   rejected_by_vendor: { tone: 'loss', icon: AlertCircle },
   handed_off: { tone: 'muted', icon: CornerUpRight },
   failed: { tone: 'loss', icon: AlertCircle },
@@ -105,6 +107,7 @@ export function OrderStatusPill({
   status,
   mode,
   vendorLabel,
+  unlistedAt,
   surface = 'ledger',
 }: {
   status: OrderStatus;
@@ -112,6 +115,9 @@ export function OrderStatusPill({
    *  never reached a market, it is waiting in the broker's own client. */
   mode?: OrderMode | null;
   vendorLabel?: string | null;
+  /** The ledger's `unlisted_at`, which says whether the vendor named how a
+   *  handed-off order ended. Left out, the pill says we do not know. */
+  unlistedAt?: string | null;
   /** The ledger row wears the one-word verdict and carries the sentence as
    *  its tooltip; a receipt and the detail drawer have room for the sentence. */
   surface?: 'ledger' | 'receipt' | 'detail';
@@ -121,13 +127,14 @@ export function OrderStatusPill({
     (surface === 'receipt' && RECEIPT_STATUS_META[status]?.icon) ||
     (STATUS_META[status] ?? STATUS_META.unknown).icon;
   const tone = TONE[orderStatusTone(status, surface)];
-  const { key, params } = orderStatusLabel(status, mode, vendorLabel);
+  const named = vendorNamedEnd(unlistedAt);
+  const { key, params } = orderStatusLabel(status, mode, vendorLabel, named);
   const sentence = t(key, params);
   const short = surface === 'ledger';
   return (
     <StatusPill
       icon={icon}
-      label={short ? t(orderStatusShortLabel(status, mode)) : sentence}
+      label={short ? t(orderStatusShortLabel(status, mode, named)) : sentence}
       title={short ? sentence : undefined}
       color={tone.color}
       bg={tone.bg}

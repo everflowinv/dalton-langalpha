@@ -24,7 +24,9 @@ import { AT_BOTTOM_PX, NEAR_BOTTOM_PX, isNearBottom } from '../../utils/scrollHe
  * band. A move up that leaves the end no further away is layout's (a fold
  * clamping, the browser's scroll anchoring) and decides nothing; it is judged
  * as soon as layout makes it (`resized`), since by its scroll event the end may
- * have grown away. A reader's input stops a glide in the frame it arrives
+ * have grown away. One that growth landed with reads the same as a fold
+ * under it, so it is the reader's only after their input (`touched`).
+ * A reader's input stops a glide in the frame it arrives
  * (`stop`, on INTENT_EVENTS). With reduced motion, or on a page nobody is
  * watching, every move is instant, as the follow always was.
  */
@@ -54,6 +56,14 @@ export interface StreamFollow {
    *  long as one such move takes, a move up is theirs even when the end
    *  shrinks in with it, as it does while a row below folds. */
   pulled(): void;
+  /** The reader did something that can move the view (`movesView`). For as
+   *  long as one such move takes, a move up that growth landing with it leaves
+   *  ambiguous is theirs; without it, that move is layout's. */
+  touched(): void;
+  /** A pointer or touch went down on the scroller (`down`), or lifted. While
+   *  it is held, as on a scrollbar drag however slow, every move is the
+   *  reader's. */
+  pressed(down: boolean): void;
   /** A landing is under way: it owns the position until it ends. */
   readonly landing: boolean;
 }
@@ -112,6 +122,11 @@ export function createStreamFollow(c: HTMLElement, following: { current: boolean
   let writing = false;
   // When the reader last moved the view toward the start.
   let pulledAt = -Infinity;
+  // When the reader last did anything that can move the view.
+  let touchedAt = -Infinity;
+  let pressing = false;
+  // How tall the content was at the last known place.
+  let lastHeight = c.scrollHeight;
 
   // Takes where the view is as this engine's own: its scroll event, when it
   // comes, decides nothing.
@@ -119,6 +134,7 @@ export function createStreamFollow(c: HTMLElement, following: { current: boolean
     wrote = top;
     lastTop = top;
     lastGap = bottom() - top;
+    lastHeight = c.scrollHeight;
   };
   const write = (top: number) => {
     x = top;
@@ -134,10 +150,22 @@ export function createStreamFollow(c: HTMLElement, following: { current: boolean
   // anchoring holds the view as a row above it closes, and a clamp follows the
   // bottom in. The reader's own move up adds itself to the distance, which
   // growth below only adds to, but a row folding below takes it away again,
-  // so while the reader is moving up the move is theirs.
+  // so while the reader is moving up the move is theirs. A move down that
+  // leaves the end exactly as far is anchoring holding the view as a row above
+  // it grows; the reader's own move down takes itself off the distance.
+  // Growth that landed with a move up leaves the two readings the same: a
+  // fold of the move's size under growth at least as tall, or the reader's
+  // move under the growth less the fold. Only the reader's input tells them
+  // apart there, so with none the move is layout's. A move up with nothing
+  // grown (find in page, an anchor) still reads by the distance alone.
   const byLayout = (top: number, gap: number) => {
     const up = lastTop - top;
-    return up > 0 && gap - lastGap < up - 1 && performance.now() - pulledAt >= PULL_MS;
+    const now = performance.now();
+    const idle = !pressing && now - touchedAt >= PULL_MS;
+    if (up < 0) return Math.abs(gap - lastGap) < 1 && idle;
+    if (up <= 0 || pressing || now - pulledAt < PULL_MS) return false;
+    if (gap - lastGap < up - 1) return true;
+    return Math.abs(c.scrollHeight - lastHeight) >= 1 && idle;
   };
   const schedule = () => {
     if (!raf) raf = requestAnimationFrame(frame);
@@ -206,8 +234,13 @@ export function createStreamFollow(c: HTMLElement, following: { current: boolean
       const known = wrote !== null && Math.abs(top - wrote) < 1;
       const layout = byLayout(top, gap);
       const up = lastTop - top;
+      // How far from the end the move alone put the view. Growth that landed
+      // with it, as a line can between a clamp and its scroll event, is not
+      // the reader leaving.
+      const left = lastGap + up;
       lastTop = top;
       lastGap = gap;
+      lastHeight = c.scrollHeight;
       if (known) return false;
       // The view has left the last known place, so its scroll event has been
       // and gone: a reader who comes back to that position later is not it.
@@ -221,13 +254,24 @@ export function createStreamFollow(c: HTMLElement, following: { current: boolean
       // Read as the reader's, a fold closing above dropped a glide trailing
       // the end by more than AT_BOTTOM_PX.
       if (layout) return false;
+      if (up > 0) {
+        following.current = left <= AT_BOTTOM_PX;
+        return true;
+      }
       const metrics = { scrollTop: top, scrollHeight: c.scrollHeight, clientHeight: c.clientHeight };
-      following.current = isNearBottom(metrics, up > 0 ? AT_BOTTOM_PX : NEAR_BOTTOM_PX);
+      following.current = isNearBottom(metrics, NEAR_BOTTOM_PX);
       return true;
     },
     resized() {
       if (writing || c.clientHeight === 0) return;
       const top = c.scrollTop;
+      // Grown or shrunk with the view where it was: the new size is the
+      // baseline a later move is measured from, not growth landing with it.
+      if (Math.abs(top - lastTop) < 1) {
+        lastGap = bottom() - top;
+        lastHeight = c.scrollHeight;
+        return;
+      }
       if (!byLayout(top, bottom() - top)) return;
       // A glide carries on from here, at rest, as from any move not its own.
       x = top;
@@ -264,6 +308,12 @@ export function createStreamFollow(c: HTMLElement, following: { current: boolean
     pulled() {
       pulledAt = performance.now();
     },
+    touched() {
+      touchedAt = performance.now();
+    },
+    pressed(down) {
+      pressing = down;
+    },
     get landing() {
       return motion?.kind === 'land';
     },
@@ -289,8 +339,30 @@ export interface StreamFollowControls {
 // position alone, so one of these stops the glide before it writes again.
 export const INTENT_EVENTS = ['wheel', 'touchstart', 'pointerdown', 'keydown'] as const;
 
-// Keys that scroll toward the start.
+// What ends a pointer or touch held on the scroller (`pressed`).
+export const RELEASE_EVENTS = ['pointerup', 'pointercancel', 'touchend', 'touchcancel'] as const;
+
+// Keys that scroll toward the start, and every key that scrolls.
 const UP_KEYS = new Set(['ArrowUp', 'PageUp', 'Home']);
+const SCROLL_KEYS = new Set([...UP_KEYS, 'ArrowDown', 'PageDown', 'End', ' ']);
+
+// Where every key acts on the control rather than scrolling the view; a
+// button takes only Space, which presses it.
+const OWN_KEYS = 'input, textarea, select, [contenteditable=""], [contenteditable="true"]';
+
+/** Whether an INTENT_EVENTS event, as the scroller hears it, can move the view:
+ *  a wheel, a touch, a pointer on the scroller itself (its scrollbar) or its
+ *  middle button, or a key that scrolls and was not taken by the control it
+ *  was pressed on. A click on a row inside the transcript is not one. */
+export function movesView(e: Event): boolean {
+  if (e.defaultPrevented) return false;
+  if (e.type === 'pointerdown') return e.target === e.currentTarget || (e as PointerEvent).button === 1;
+  if (e.type !== 'keydown') return true;
+  const { key, target } = e as KeyboardEvent;
+  if (!SCROLL_KEYS.has(key)) return false;
+  if (!(target instanceof Element)) return true;
+  return !target.closest(OWN_KEYS) && !(key === ' ' && target.closest('button'));
+}
 
 /** Whether an INTENT_EVENTS event moves the view toward the start: a wheel up,
  *  or a key that scrolls up. A pointer or a touch does not say which way, and

@@ -1,6 +1,10 @@
 import { HIDDEN, orderAmount, orderCurrency } from '@/components/orders/format';
 import { instrumentLabel } from '@/components/orders/instrument';
-import { ORDER_STATUS_KEY, ORDER_STATUS_STAGED_KEYS } from '@/components/orders/status';
+import {
+  ORDER_STATUS_KEY,
+  ORDER_STATUS_STAGED_KEYS,
+  vendorNamedEnd,
+} from '@/components/orders/status';
 import { readValuesHidden } from '@/components/orders/valuesHidden';
 import { useLocale } from '@/hooks/useLocale';
 import { useOrder } from '@/hooks/useOrders';
@@ -65,6 +69,9 @@ export interface OrderOutcomeView {
   failure: { message: string | null; code: string | null } | null;
   fill: OrderPart[];
   orderId: string | null;
+  /** The id names an approval the order is waiting on, not an order: a
+   *  broker that asks the customer first has no order to name yet. */
+  orderIdIsApproval: boolean;
 }
 
 /**
@@ -135,13 +142,15 @@ export function orderOutcomeView(
   const message = text(outcome.failure?.message) ?? text(outcome.failure?.kind);
   const code = text(outcome.failure?.code);
   const orderId = text(outcome.vendor_order_id);
+  const shownId = orderId && orderId !== text(order?.target_ref) ? orderId : null;
   return {
     decisionMessage: text(outcome.decision_message),
     failure: message || code ? { message, code } : null,
     fill,
     // A cancel answers with the id of the order it cancelled, which the ticket
     // already names; saying it a second time reads as a second order.
-    orderId: orderId && orderId !== text(order?.target_ref) ? orderId : null,
+    orderId: shownId,
+    orderIdIsApproval: !!shownId && shownId === text(outcome.route?.approval_id),
   };
 }
 
@@ -193,6 +202,9 @@ export function overlayLedgerRow(
       // lists the order, and the artifact froze that failure before it did.
       failure: row.failure ?? null,
       completed_at: row.completed_at ?? outcome.completed_at ?? null,
+      // The row's own value even when null: null is the vendor having named
+      // the end, which the frozen receipt cannot know.
+      unlisted_at: row.unlisted_at !== undefined ? row.unlisted_at : outcome.unlisted_at,
     },
   };
 }
@@ -207,6 +219,8 @@ export interface OrderReceiptView {
   /** Already masked. */
   account: string | null;
   status: OrderStatus;
+  /** Whether the vendor said how a handed-off order ended: `vendorNamedEnd`. */
+  vendorNamedEnd: boolean;
   ticket: OrderTicketView | null;
   outcome: OrderOutcomeView;
   actionUrl: string | null;
@@ -245,6 +259,7 @@ export function useOrderReceipt(artifact: Record<string, unknown>): OrderReceipt
     mode: receipt.mode ?? order?.mode ?? null,
     account: account && maskAccountId(account),
     status: receipt.outcome.status,
+    vendorNamedEnd: vendorNamedEnd(receipt.outcome.unlisted_at),
     ticket: order ? orderTicket({ ...order, instrument }, { ...shown, fill: receipt.outcome }) : null,
     outcome: orderOutcomeView(receipt.outcome, order, shown),
     actionUrl: receipt.outcome.action_url ?? null,

@@ -31,6 +31,7 @@ from src.server.database.order_attempts import (
     find_attempt_id,
     get_attempt,
     insert_attempt,
+    latest_attempt_for_confirm_token,
     latest_attempt_for_vendor_order,
     refuse_attempt,
 )
@@ -39,6 +40,7 @@ from src.server.models.orders import (
     order_summary,
     receipt_from_attempt,
 )
+from src.server.services.brokerage_capabilities import OrderAction
 from src.server.services.brokerage_orders import (
     AttemptStatus,
     BrokerOrder,
@@ -120,7 +122,9 @@ class OrderAttemptLedger:
             status=(
                 AttemptStatus.PROPOSED if approval_required else AttemptStatus.APPROVED
             ),
-            parent_attempt_id=await self._parent_of(vendor, parsed),
+            parent_attempt_id=await self._parent_of(
+                vendor, parsed, order.get("action")
+            ),
         )
         attempt = attempt_row_to_response(row)
         return Proposed(
@@ -135,21 +139,31 @@ class OrderAttemptLedger:
             summary=order_summary(attempt),
         )
 
-    async def _parent_of(self, vendor: str, parsed: BrokerOrder | None) -> str | None:
+    async def _parent_of(
+        self, vendor: str, parsed: BrokerOrder | None, action: Any
+    ) -> str | None:
         """The attempt that placed the order this call acts on, if we placed it.
 
         A cancel, a replace or a confirm names a vendor order id; when that id
         belongs to one of this user's own attempts, the two rows are one
-        order's history and the ledger says so. Never fatal: an amend nobody
-        can link is still a valid attempt.
+        order's history and the ledger says so. A confirm may instead name the
+        confirmation a vendor asked for, which no order id carries: then the
+        parent is the attempt whose answer raised it, resolved to the call that
+        started the chain. Never fatal: an amend nobody can link is still a
+        valid attempt.
         """
         target = (parsed.target_ref or "").strip() if parsed else ""
         if not parsed or not target:
             return None
         try:
-            return await latest_attempt_for_vendor_order(
+            parent = await latest_attempt_for_vendor_order(
                 self._user_id, vendor, target, account_ref=parsed.account_ref
             )
+            if parent is None and action == OrderAction.CONFIRM:
+                parent = await latest_attempt_for_confirm_token(
+                    self._user_id, vendor, target, account_ref=parsed.account_ref
+                )
+            return parent
         except Exception:
             logger.warning(
                 "[ORDERS] %s: could not look up the attempt behind %s",

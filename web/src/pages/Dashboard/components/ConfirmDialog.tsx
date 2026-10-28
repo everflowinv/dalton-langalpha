@@ -2,6 +2,8 @@ import React from 'react';
 import { useTranslation } from 'react-i18next';
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from '../../../components/ui/dialog';
 import { lastInputWasPointer } from '@/lib/inputModality';
+import { cn } from '@/lib/utils';
+import './dashForms.css';
 
 interface ConfirmDialogProps {
   open: boolean;
@@ -12,12 +14,15 @@ interface ConfirmDialogProps {
   onOpenChange?: (open: boolean) => void;
   /** Open on the confirm button, so Enter confirms as a native confirm() does. */
   focusConfirm?: boolean;
+  /** `page` sets it on the page's ground, as the dashboard's windows are. Other
+   *  surfaces keep the elevated fill until the floating surfaces converge. */
+  surface?: 'elevated' | 'page';
 }
 
 /**
  * Reusable confirmation dialog. Uses color tokens only.
  */
-function ConfirmDialog({ open, title, message, confirmLabel, onConfirm, onOpenChange, focusConfirm = false }: ConfirmDialogProps) {
+function ConfirmDialog({ open, title, message, confirmLabel, onConfirm, onOpenChange, focusConfirm = false, surface = 'elevated' }: ConfirmDialogProps) {
   const { t } = useTranslation();
   const confirmRef = React.useRef<HTMLButtonElement>(null);
   // Radix hands focus back to a Dialog.Trigger, and this dialog opens from
@@ -31,8 +36,8 @@ function ConfirmDialog({ open, title, message, confirmLabel, onConfirm, onOpenCh
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent
-        className="sm:max-w-sm border"
-        style={{ backgroundColor: 'var(--color-bg-elevated)', borderColor: 'var(--color-border-elevated)' }}
+        className={cn('sm:max-w-sm border', surface === 'page' && 'dash-form')}
+        style={surface === 'page' ? undefined : { backgroundColor: 'var(--color-bg-elevated)', borderColor: 'var(--color-border-elevated)' }}
         onOpenAutoFocus={(e) => {
           returnFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
           if (!focusConfirm) return;

@@ -1,12 +1,12 @@
 {
-  "gpt-5.6-terra": {
+  "gpt-6.1-terra": {
     "prompt_guidance": "lean",
-    "model_id": "gpt-5.6-terra",
+    "model_id": "gpt-6.1-terra",
     "provider": "openai",
-    "display_name": "GPT-5.6 Terra",
+    "display_name": "GPT-6.1 Terra",
     "visible": true,
     "speed": 3,
-    "intelligence": 3,
+    "intelligence": 4,
     "context": 1050000,
     "compaction_profile": "expansive",
     "input_modalities": [
@@ -822,14 +822,37 @@
       "write": "parameters.reasoning.effort"
     }
   },
-  "kimi-k3": {
+  "kimi-k3.1-pro": {
     "prompt_guidance": "lean",
-    "model_id": "kimi-k3",
+    "model_id": "kimi-k3.1-pro",
     "provider": "moonshot",
-    "display_name": "Kimi K3",
+    "display_name": "Kimi K3.1 Pro",
     "visible": true,
-    "speed": 1,
-    "intelligence": 4,
+    "speed": 2,
+    "intelligence": 5,
+    "context": 1000000,
+    "input_modalities": [
+      "text",
+      "image"
+    ],
+    "reasoning": {
+      "efforts": [
+        "low",
+        "high",
+        "max"
+      ],
+      "default": "high",
+      "write": "parameters.output_config.effort"
+    }
+  },
+  "kimi-k3.1-pro-highspeed": {
+    "prompt_guidance": "lean",
+    "model_id": "kimi-k3.1-pro-highspeed",
+    "provider": "moonshot",
+    "display_name": "Kimi K3.1 Pro Highspeed",
+    "visible": true,
+    "speed": 4,
+    "intelligence": 5,
     "context": 1000000,
     "input_modalities": [
       "text",
@@ -904,14 +927,14 @@
       "write": "parameters.reasoning.effort"
     }
   },
-  "gpt-5.6-terra-oauth": {
+  "gpt-6.1-terra-oauth": {
     "prompt_guidance": "lean",
-    "model_id": "gpt-5.6-terra",
+    "model_id": "gpt-6.1-terra",
     "provider": "codex-oauth",
-    "display_name": "GPT-5.6 Terra (OAuth)",
+    "display_name": "GPT-6.1 Terra (OAuth)",
     "visible": true,
     "speed": 3,
-    "intelligence": 3,
+    "intelligence": 4,
     "context": 1050000,
     "compaction_profile": "expansive",
     "input_modalities": [

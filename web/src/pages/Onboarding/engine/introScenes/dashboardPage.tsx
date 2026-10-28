@@ -1,25 +1,31 @@
 import type { ReactNode } from 'react';
-import {
-  ArrowRight,
-  CalendarDays,
-  Clock,
-  Eye,
-  Newspaper,
-  Plus,
-  Sparkles,
-} from 'lucide-react';
+import { Paperclip } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { useLocale } from '@/hooks/useLocale';
-import { grouped2, relativeTime, shortMonthDay, signedFixed2 } from '@/lib/format';
+import { formatMoney } from '@/lib/bars/currencyDisplay';
+import { clockTime, grouped2, shortWeekday } from '@/lib/format';
 import { cn } from '@/lib/utils';
+import { FaviconImg } from '@/pages/ChatAgent/components/charts/FaviconImg';
+import { TermCard, TermChange, TermTag } from '@/pages/ChatAgent/components/charts/TermCard';
 import { PAST, ease, useSceneTime } from './clock';
-import { Appear, Region, rv, signColor } from './kit';
-import { changeAt, INDICES, WATCH, Spark, Widget } from './dashboardParts';
+import { Appear, rv, signColor } from './kit';
+import {
+  changeAt,
+  Chips,
+  INDICES,
+  Real,
+  SESSION,
+  TODAY,
+  WATCH,
+  Spark,
+  Widget,
+} from './dashboardParts';
 
 /* The dashboard page in its default arrangement (the Morning brief preset),
-   drawn in miniature: the markets overview, the brief and news on the left,
-   the watchlist and earnings on the right, each widget as its card draws it. Shared by the scenes that show the
-   page. Quotes, headlines and symbols are invented. */
+   drawn in miniature: the index cards across the top, the brief and news on
+   the left, the watchlist and earnings on the right, each widget the card
+   the dashboard draws, with its body's own classes. Shared by the scenes
+   that show the page. Quotes, headlines and symbols are invented. */
 /* eslint-disable react-refresh/only-export-components -- shared parts:
    scene components plus data and style helpers */
 
@@ -37,124 +43,88 @@ export const GRID = {
   length: 7600,
 };
 
-/* ── the page ──────────────────────────────────────────────────────────── */
+/** `mins` minutes before the page's time. */
+const minutesAgo = (mins: number) => new Date(TODAY.getTime() - mins * 60_000);
 
-/** One index card: name, price and change in mono, the day's line in the
-    change's color. `reach`/`slid` drive the line on the live page. */
-function IndexCard({
+/* ── the index cards ───────────────────────────────────────────────────── */
+
+/** The index card's line, at the height the dashboard draws it. */
+const SPARK_H = 32;
+
+/**
+ * One index as its small card (`IndexMovementCard`): the symbol in the
+ * edge with the name beside it, the price, the day's move with the session
+ * at the line's end, and the day's line in the move's color. The real card
+ * also prints the move in points; at the drawing's width it would wrap the
+ * line. `reach`/`slid` drive the line on the live page; `fill` stretches
+ * the line to a cell of fixed height, as in the edit frame.
+ */
+function IndexTile({
   index,
   live,
   reach,
   slid,
+  fill = false,
 }: {
   index: (typeof INDICES)[number];
   live: boolean;
   reach?: number;
   slid?: number;
+  fill?: boolean;
 }) {
   const locale = useLocale();
   const t = useSceneTime();
   const v = changeAt(index.ticks, t, live);
   return (
-    <Region className="flex min-w-0 flex-col gap-[3px] p-1.5">
-      <span
-        className="truncate text-[7px] font-bold leading-none"
-        style={{ color: 'var(--color-text-primary)' }}
-      >
-        {index.name}
-      </span>
-      <span
-        className="font-mono text-[8px] font-bold leading-none tabular-nums"
-        style={{ color: 'var(--color-text-primary)' }}
-      >
-        {grouped2(index.prev * (1 + v / 100), locale)}
-      </span>
-      <span
-        className={'font-mono text-[6px] leading-none tabular-nums transition-colors duration-quick'}
-        style={{ color: signColor(v) }}
-      >
-        {signedFixed2(v, locale)}%
-      </span>
-      <Spark
-        series={index.spark}
-        color={signColor(v)}
-        reach={reach}
-        slid={slid}
-        stretch
-        className="mt-[2px] h-3 w-full"
-      />
-    </Region>
+    <TermCard title={index.sym} sub={index.name} className={cn(fill && 'flex flex-col')}>
+      <div className="term-line">
+        <span className="term-big">{grouped2(index.prev * (1 + v / 100), locale)}</span>
+      </div>
+      <div className="term-line">
+        <TermChange value={v} />
+        <span className="term-push term-t3">{SESSION}</span>
+      </div>
+      <div className={cn('dash-spark', fill && 'min-h-0 flex-1')} style={fill ? undefined : { height: SPARK_H }}>
+        <Spark
+          series={index.spark}
+          color={signColor(v)}
+          reach={reach}
+          slid={slid}
+          stretch
+          className="block h-full w-full"
+        />
+      </div>
+    </TermCard>
   );
 }
 
-/** One watchlist row: symbol over its type, price over the day's move, and
-    the % change in its tinted pill. */
-export function WatchRow({ row, live = false }: { row: (typeof WATCH)[number]; live?: boolean }) {
-  const { t: tr } = useTranslation();
-  const locale = useLocale();
-  const t = useSceneTime();
-  const v = changeAt(row.ticks, t, live);
-  const c = signColor(v);
+/** The index cards side by side, a page-wide row. On the page they stand
+    alone (the markets widget draws no frame of its own); in the edit frame
+    they fill its body. */
+export function IndexRow({
+  live = false,
+  reach,
+  slid,
+  fill = false,
+}: {
+  live?: boolean;
+  reach?: (i: number) => number;
+  slid?: number;
+  fill?: boolean;
+}) {
   return (
-    <div className="flex items-center gap-1 px-1 py-[3px]">
-      <span className="flex min-w-0 flex-col gap-[2px]">
-        <span
-          className="text-[7px] font-bold leading-none"
-          style={{ color: 'var(--color-text-primary)' }}
-        >
-          {row.sym}
-        </span>
-        <span className="text-[5px] leading-none" style={{ color: 'var(--color-text-secondary)' }}>
-          {tr('dashboard.widgets.holdings.stock')}
-        </span>
-      </span>
-      <span className="ml-auto flex flex-col items-end gap-[2px]">
-        <span
-          className="font-mono text-[7px] font-medium leading-none tabular-nums"
-          style={{ color: 'var(--color-text-primary)' }}
-        >
-          {grouped2(row.prev * (1 + v / 100), locale)}
-        </span>
-        <span
-          className={
-            'font-mono text-[5px] font-medium leading-none tabular-nums transition-colors ' +
-            'duration-quick'
-          }
-          style={{ color: c }}
-        >
-          {signedFixed2((row.prev * v) / 100, locale)}
-        </span>
-      </span>
-      <span
-        className={
-          'min-w-[27px] rounded-[3px] px-[3px] py-[2px] text-center text-[6px] font-bold ' +
-          'leading-none tabular-nums transition-colors duration-quick'
-        }
-        style={{
-          background: signColor(v, true),
-          color: c,
-        }}
-      >
-        {signedFixed2(v, locale)}%
-      </span>
+    <div className={cn('grid grid-cols-5 gap-3', fill && 'h-full')}>
+      {INDICES.map((index, i) => (
+        <IndexTile
+          key={index.sym}
+          index={index}
+          live={live}
+          reach={reach?.(i)}
+          slid={slid}
+          fill={fill}
+        />
+      ))}
     </div>
-  );
-}
-
-/** The dashed button closing the watchlist. */
-export function AddSymbol() {
-  const { t } = useTranslation();
-  return (
-    <span
-      className={
-        'mt-1 flex items-center justify-center gap-[3px] rounded-[5px] border border-dashed ' +
-        'py-[5px] text-[6px] font-medium leading-none'
-      }
-      style={{ borderColor: 'var(--color-border-default)', color: 'var(--color-text-secondary)' }}
-    >
-      <Plus className="h-[7px] w-[7px]" />
-      {t('dashboard.widgets.portfolioWatchlist.addSymbol')}
-    </span>
   );
 }
 
@@ -174,444 +144,389 @@ export const INSIGHT = {
     { text: 'AI Capex', up: true },
     { text: 'Bond Yields', up: false },
   ],
-  /** How long ago it was written, in minutes. */
-  age: 23,
+  written: minutesAgo(23),
 };
 
-/** The brief's eyebrow chip (`AIDailyBriefCard`): sparkles and the label on
-    the accent's soft fill. */
-export function BriefEyebrow() {
+/** The brief widget's card: its kind beside the title, when it was written
+    at the edge's end. */
+export function BriefWidget({
+  edit,
+  delay,
+  className,
+  children,
+}: {
+  edit?: boolean;
+  delay?: number;
+  className?: string;
+  children: ReactNode;
+}) {
   const { t } = useTranslation();
+  const locale = useLocale();
   return (
-    <span
-      className={
-        'flex w-fit shrink-0 items-center gap-[3px] rounded-full border px-1 py-[2px] ' +
-        'text-[5px] font-semibold uppercase leading-none tracking-wider'
-      }
-      style={{
-        background: 'var(--color-accent-soft)',
-        borderColor: 'var(--color-accent-overlay)',
-        color: 'var(--color-accent-light)',
-      }}
+    <Widget
+      title={t('dashboard.widgets.insightBrief.cardTitle')}
+      sub={t('dashboard.brief.typeLabel.marketUpdate')}
+      meta={clockTime(INSIGHT.written, locale)}
+      edit={edit}
+      delay={delay}
+      className={className}
     >
-      <Sparkles className="h-[6px] w-[6px]" />
-      {t('dashboard.brief.eyebrow')}
-    </span>
+      <div className="widget-term">{children}</div>
+    </Widget>
   );
 }
 
-/** A topic under the brief (`TopicBadge`): its name on the soft fill of the
-    way it moved. */
-export function TopicPill({ text, up }: { text: string; up: boolean }) {
-  const soft = signColor(up, true);
+/** The brief's headline and summary (`AIDailyBriefCard`), in the text face.
+    `clamp` holds the summary to two lines, for a cell shorter than the
+    card. */
+export function BriefLede({ clamp = false }: { clamp?: boolean }) {
   return (
-    <span
-      className="rounded-[2px] border px-[3px] py-[2px] text-[5px] font-medium leading-none"
-      style={{
-        background: soft,
-        borderColor: soft,
-        color: signColor(up),
-      }}
-    >
-      #{text}
-    </span>
+    <>
+      <p className="dash-brief-lede">{INSIGHT.headline}</p>
+      <p className={cn('dash-brief-summary', clamp && 'line-clamp-2')}>{INSIGHT.summary}</p>
+    </>
   );
 }
 
-/** The brief's headline, at the card's display weight. Its leading goes
-    after the caller's classes: `cn` reads a text size there as setting the
-    line height too, and would drop a leading that came before it. */
-export function BriefHeadline({ className }: { className?: string }) {
+/** The brief's topics, each with the way it moved drawn beside it. */
+function BriefTopics() {
   return (
-    <span
-      className={cn('font-bold', className, 'leading-tight')}
-      style={{ color: 'var(--color-text-primary)' }}
-    >
-      {INSIGHT.headline}
-    </span>
-  );
-}
-
-/** The brief's summary, in the card's secondary text. Its leading goes
-    last, as the headline's does. */
-export function BriefSummary({ className }: { className?: string }) {
-  return (
-    <span
-      className={cn(className, 'leading-relaxed')}
-      style={{ color: 'var(--color-text-secondary)' }}
-    >
-      {INSIGHT.summary}
-    </span>
+    <div className="term-chips">
+      {INSIGHT.topics.map((topic) => (
+        <span key={topic.text} className="term-chip dash-topic">
+          <TermChange value={topic.up ? 1 : -1}>{''}</TermChange>
+          {topic.text}
+        </span>
+      ))}
+    </div>
   );
 }
 
 /**
- * The brief widget at rest (`AIDailyBriefCard`): the eyebrow and
- * when it was written, the headline, the summary, its topics, then the two
- * buttons at the foot, with the card's newspaper mark in the corner. On the
- * live page each part enters in turn from `at`, as the card's parts do,
- * into room the card holds for it, so the news under the card stays put.
+ * The brief at rest: the headline, the summary, its topics, then the
+ * brief's two ways on at the foot. On the live page each part enters in
+ * turn from `at`, as the card's parts do, into room the card holds for it,
+ * so the news under the card stays put.
  */
 function BriefCard({ at }: { at: number }) {
   const { t } = useTranslation();
-  const locale = useLocale();
-  const btn =
-    'flex items-center gap-[3px] rounded-[4px] px-1.5 py-[3px] text-[5px] ' +
-    'font-semibold leading-none';
   return (
-    <Region delay={0.22} className="relative flex min-w-0 flex-col gap-[5px] overflow-hidden p-2">
-      <Newspaper
-        className="pointer-events-none absolute right-1.5 top-1.5 h-7 w-7"
-        strokeWidth={1.5}
-        style={{ color: 'var(--color-text-tertiary)', opacity: 0.2 }}
-        aria-hidden
-      />
-      <span className="flex items-center gap-1">
-        <BriefEyebrow />
-        <span
-          className="truncate text-[5px] leading-none"
-          style={{ color: 'var(--color-text-secondary)' }}
-        >
-          {t('dashboard.brief.updatedWhen', {
-            when: relativeTime(-INSIGHT.age * 60_000, locale, 0),
-          })}
-        </span>
-      </span>
+    <BriefWidget delay={0.22} className="shrink-0">
       <Appear at={at} reserve>
-        <BriefHeadline className="block pr-7 text-[9px]" />
+        <p className="dash-brief-lede">{INSIGHT.headline}</p>
       </Appear>
       <Appear at={at + GRID.briefPer} reserve>
-        <BriefSummary className="block text-[6px]" />
+        <p className="dash-brief-summary">{INSIGHT.summary}</p>
       </Appear>
-      <Appear at={at + 2 * GRID.briefPer} reserve className="flex flex-wrap gap-[3px]">
-        {INSIGHT.topics.map((topic) => (
-          <TopicPill key={topic.text} {...topic} />
-        ))}
+      <Appear at={at + 2 * GRID.briefPer} reserve>
+        <BriefTopics />
       </Appear>
-      <Appear at={at + 3 * GRID.briefPer} reserve className="mt-auto flex justify-end gap-1">
-        <span
-          className={cn(btn, 'border')}
-          style={{
-            borderColor: 'var(--color-border-default)',
-            color: 'var(--color-text-secondary)',
-          }}
-        >
-          <Sparkles className="h-[6px] w-[6px]" />
-          {t('dashboard.brief.generatePersonalized')}
-        </span>
-        <span
-          className={btn}
-          style={{
-            background: 'var(--color-btn-primary-bg)',
-            color: 'var(--color-btn-primary-text)',
-          }}
-        >
-          {t('dashboard.brief.readFullBrief')}
-          <ArrowRight className="h-[6px] w-[6px]" />
-        </span>
+      <Appear at={at + 3 * GRID.briefPer} reserve>
+        <div className="term-line dash-brief-foot">
+          <span className="dash-link term-push">{t('dashboard.brief.generatePersonalized')}</span>
+          <span className="dash-link term-ink">
+            {t('dashboard.brief.readFullBrief')} <span aria-hidden>›</span>
+          </span>
+        </div>
       </Appear>
-    </Region>
+    </BriefWidget>
   );
 }
 
 /* ── news ──────────────────────────────────────────────────────────────── */
 
-/** The market feed. `thumb` is the story's picture, drawn as the chart
-    image market news usually runs with: its line and that line's color. */
+/** The market feed, newest first. `mins` is how long before the page's time
+    the story ran. */
 export const NEWS = [
   {
-    title: 'Chipmakers rally after earnings beat',
-    source: 'Benzinga',
-    hours: 2,
-    hot: true,
+    title: 'Chip stocks rally on NVDA beat',
+    source: 'Reuters',
+    mins: 12,
     tickers: ['NVDA', 'AVGO', 'TSM'],
-    thumb: { line: [16, 15, 13, 14, 10, 8, 5], color: '#3FB950' },
   },
-  {
-    title: 'Treasury yields slip ahead of jobs data',
-    source: 'Investing.com',
-    hours: 4,
-    hot: false,
-    tickers: [],
-    thumb: { line: [6, 7, 6, 9, 10, 12, 13], color: '#F85149' },
-  },
-  {
-    title: 'Oil steadies as supply worries ease',
-    source: 'MarketWatch',
-    hours: 5,
-    hot: false,
-    tickers: [],
-    thumb: { line: [12, 8, 11, 9, 10, 9, 10], color: '#E3B341' },
-  },
-  {
-    title: 'Small caps lag as rate bets shift',
-    source: 'Zacks',
-    hours: 6,
-    hot: false,
-    tickers: [],
-    thumb: { line: [8, 9, 8, 11, 10, 13, 14], color: '#F85149' },
-  },
-  {
-    title: 'Dollar firms ahead of central bank minutes',
-    source: "Barron's",
-    hours: 8,
-    hot: false,
-    tickers: [],
-    thumb: { line: [13, 12, 12, 10, 11, 9, 8], color: '#58A6FF' },
-  },
+  { title: 'Yields slip ahead of jobs data', source: 'Bloomberg', mins: 38, tickers: [] },
+  { title: 'Oil steadies on supply relief', source: 'WSJ', mins: 64, tickers: [] },
+  { title: 'Small caps lag on rate bets', source: 'CNBC', mins: 95, tickers: ['IWM'] },
+  { title: 'Dollar firms before Fed minutes', source: 'FT', mins: 140, tickers: [] },
 ];
 
-/** A story's picture: a market chart, as the feed's images usually are. A
-    picture keeps its own colors in either theme. */
-function NewsThumb({ thumb }: { thumb: (typeof NEWS)[number]['thumb'] }) {
-  const points = thumb.line.map((y, i) => `${2 + i * 3.33},${y}`).join(' ');
+/** The news widget's card, the Market tab picked; its rows are the
+    caller's. */
+export function NewsWidget({
+  edit,
+  delay,
+  className,
+  children,
+}: {
+  edit?: boolean;
+  delay?: number;
+  className?: string;
+  children: ReactNode;
+}) {
+  const { t } = useTranslation();
+  const tabs = (['tab_top', 'tab_market', 'tab_portfolio', 'tab_watchlist'] as const).map((key) =>
+    t(`dashboard.widgets.newsFeed.${key}`)
+  );
   return (
-    <svg viewBox="0 0 24 18" className="h-[18px] w-6 shrink-0 rounded-[3px]" aria-hidden>
-      <rect width="24" height="18" fill="#161B22" />
-      {[6, 12].map((y) => (
-        <line key={y} x1="0" x2="24" y1={y} y2={y} stroke="#2A313C" strokeWidth="0.5" />
-      ))}
-      <polyline
-        points={points}
-        fill="none"
-        stroke={thumb.color}
-        strokeWidth="1"
-        strokeLinejoin="round"
-        strokeLinecap="round"
-      />
-    </svg>
+    <Widget
+      title={t('dashboard.widgets.newsFeed.cardTitle')}
+      meta="24"
+      edit={edit}
+      delay={delay}
+      className={className}
+    >
+      <div className="widget-term dash-fill dash-news">
+        {/* the tabs alone: the feed's filters run on past them, and at the
+            drawing's width they would wrap onto a second line */}
+        <Chips labels={tabs} picked={1} />
+        <table className="term-table dash-table">
+          <tbody>{children}</tbody>
+        </table>
+      </div>
+    </Widget>
   );
 }
 
-/** A news row (`NewsFeedWidget`'s row): the story's picture, then the
-    sentiment dot, the source in the accent and how long ago, the headline,
-    and the tickers it names. */
+/**
+ * A story on one line (`NewsFeedWidget`'s row): when it ran, the headline,
+ * who ran it, and the first symbol it names. `hovered` fills the row as the
+ * pointer over it does; `clip` is the row's paperclip, which the scene
+ * shows itself, at the end of the headline's cell, as the real row does on
+ * hover.
+ */
 export function NewsRow({
   item,
   hovered = false,
-  children,
+  clip,
 }: {
   item: (typeof NEWS)[number];
   hovered?: boolean;
-  children?: ReactNode;
+  clip?: ReactNode;
 }) {
   const locale = useLocale();
+  // The row's fill, cell by cell, as the dashboard's hover draws it.
+  const cell = (edge?: 'first' | 'last') => ({
+    background: hovered ? 'var(--color-bg-hover)' : 'transparent',
+    borderRadius: edge === 'first' ? '4px 0 0 4px' : edge === 'last' ? '0 4px 4px 0' : undefined,
+  });
+  const fill = 'transition-colors duration-quick';
   return (
-    <div
-      className="relative flex items-start gap-1.5 rounded-[4px] px-1 py-1 transition-colors duration-quick"
-      style={{ background: hovered ? 'var(--color-bg-card-hover)' : 'transparent' }}
+    <tr>
+      <td className={cn('term-t3', fill)} style={cell('first')}>
+        {clockTime(minutesAgo(item.mins), locale)}
+      </td>
+      <td className={cn('term-fill dash-attach-cell', fill)} style={cell()}>
+        <span>{item.title}</span>
+        {clip}
+      </td>
+      <td className={cn('term-t3', fill)} style={cell()}>
+        <span className="dash-source">
+          <FaviconImg domain="" name={item.source} size={12} />
+          <span className="dash-source-name">{item.source}</span>
+        </span>
+      </td>
+      <td className={cn('term-code', fill)} style={cell('last')}>
+        {item.tickers[0] ?? ''}
+        {item.tickers.length > 1 && <span className="term-t3"> +{item.tickers.length - 1}</span>}
+      </td>
+    </tr>
+  );
+}
+
+/** A row's paperclip (`RowAttachButton`): shown while `shown`, in the
+    accent while the pointer is on it. */
+export function RowClip({ shown, on }: { shown: boolean; on: boolean }) {
+  return (
+    <span
+      className="row-attach"
+      style={{
+        opacity: shown ? 1 : 0,
+        background: on ? 'var(--color-accent-soft)' : 'transparent',
+        color: on ? 'var(--color-accent-primary)' : 'var(--color-text-tertiary)',
+      }}
     >
-      <NewsThumb thumb={item.thumb} />
-      <span className="flex min-w-0 flex-1 flex-col gap-[3px]">
-        <span className="flex items-center gap-[3px]">
-          <span
-            className="h-[3px] w-[3px] shrink-0 rounded-full"
-            style={{ background: item.hot ? 'var(--color-profit)' : 'var(--color-text-secondary)' }}
-          />
-          <span
-            className="truncate text-[4.5px] font-semibold uppercase leading-none tracking-wide"
-            style={{ color: 'var(--color-accent-light)' }}
-          >
-            {item.source}
-          </span>
-          <span
-            className="flex shrink-0 items-center gap-[2px] text-[5px] leading-none"
-            style={{ color: 'var(--color-text-tertiary)' }}
-          >
-            <Clock className="h-[5px] w-[5px]" />
-            {relativeTime(-item.hours * 3_600_000, locale, 0)}
-          </span>
-        </span>
-        <span
-          className="line-clamp-2 text-[7px] font-medium leading-[1.3]"
-          style={{ color: 'var(--color-text-primary)' }}
-        >
-          {item.title}
-        </span>
-        {item.tickers.length > 0 && (
-          <span className="flex gap-[2px]">
-            {item.tickers.map((sym) => (
-              <span
-                key={sym}
-                className="rounded-[2px] px-[3px] py-[1.5px] text-[4.5px] font-bold leading-none"
-                style={{
-                  background: 'var(--color-accent-soft)',
-                  color: 'var(--color-accent-light)',
-                }}
-              >
-                {sym}
-              </span>
+      <Paperclip className="h-3 w-3" />
+    </span>
+  );
+}
+
+/* ── the watchlist ─────────────────────────────────────────────────────── */
+
+/** The portfolio widget's card on its Watchlist tab (`PortfolioWatchlistWidget`):
+    the tabs, a table of the rows given, and the way to add one. */
+export function WatchWidget({
+  rows = WATCH.length,
+  live = false,
+  edit,
+  delay,
+  className,
+}: {
+  rows?: number;
+  live?: boolean;
+  edit?: boolean;
+  delay?: number;
+  className?: string;
+}) {
+  const { t } = useTranslation();
+  return (
+    <Widget
+      title={t('dashboard.widgets.portfolioWatchlist.cardTitle')}
+      meta={String(WATCH.length)}
+      edit={edit}
+      delay={delay}
+      className={className}
+    >
+      <div className="widget-term">
+        <Chips
+          labels={[
+            t('dashboard.widgets.portfolioWatchlist.headerWatchlist'),
+            t('dashboard.widgets.portfolioWatchlist.headerHoldings'),
+          ]}
+        />
+        <table className="term-table dash-table">
+          <thead>
+            <tr>
+              <th>{t('dashboard.widgets.holdings.colSymbol')}</th>
+              <th className="term-num">{t('dashboard.widgets.holdings.colLast')}</th>
+              <th className="term-num">{t('dashboard.widgets.holdings.colChange')}</th>
+            </tr>
+          </thead>
+          <tbody>
+            {WATCH.slice(0, rows).map((row) => (
+              <WatchRow key={row.sym} row={row} live={live} />
             ))}
-          </span>
-        )}
-      </span>
-      {children}
-    </div>
+          </tbody>
+        </table>
+        <div className="term-more">+ {t('dashboard.widgets.portfolioWatchlist.addSymbol')}</div>
+      </div>
+    </Widget>
+  );
+}
+
+/** One watchlist row (`WatchlistRowItem`): the symbol, the last price, and
+    the day's move. */
+function WatchRow({ row, live }: { row: (typeof WATCH)[number]; live: boolean }) {
+  const locale = useLocale();
+  const t = useSceneTime();
+  const v = changeAt(row.ticks, t, live);
+  return (
+    <tr>
+      <td className="term-fill term-code term-strong">{row.sym}</td>
+      <td className="term-num">{formatMoney(row.prev * (1 + v / 100), 'USD', locale)}</td>
+      <td className="term-num">
+        <TermChange value={v} />
+      </td>
+    </tr>
   );
 }
 
 /* ── earnings ──────────────────────────────────────────────────────────── */
 
-/** Who reports next, from the watchlist. */
+/** Who reports next, from the watchlist, all after the close. */
 export const EARNINGS = [
-  { sym: 'MSFT', name: 'Microsoft Corp.', date: new Date(2026, 9, 28) },
-  { sym: 'AMZN', name: 'Amazon.com Inc.', date: new Date(2026, 9, 30) },
+  { sym: 'MSFT', date: new Date(2026, 9, 28), eps: 3.66 },
+  { sym: 'AAPL', date: new Date(2026, 9, 29), eps: 1.76 },
+  { sym: 'AMZN', date: new Date(2026, 9, 29), eps: 1.57 },
 ];
 
-/** An upcoming report (`EarningsCalendarCard`'s row): the logo tile with the
-    symbol's first letters, symbol over company, and the date. */
-export function EarningsRow({ row }: { row: (typeof EARNINGS)[number] }) {
-  const locale = useLocale();
-  return (
-    <span className="flex items-center gap-1 px-0.5">
-      <span
-        className="flex h-3.5 w-3.5 shrink-0 items-center justify-center rounded-[3px] border"
-        style={{ background: 'var(--color-bg-tag)', borderColor: 'var(--color-border-muted)' }}
-      >
-        <span
-          className="text-[4.5px] font-bold leading-none"
-          style={{ color: 'var(--color-text-primary)' }}
-        >
-          {row.sym.slice(0, 2)}
-        </span>
-      </span>
-      <span className="flex min-w-0 flex-col gap-[2px]">
-        <span
-          className="text-[6px] font-bold leading-none"
-          style={{ color: 'var(--color-text-primary)' }}
-        >
-          {row.sym}
-        </span>
-        <span
-          className="truncate text-[5px] leading-none"
-          style={{ color: 'var(--color-text-secondary)' }}
-        >
-          {row.name}
-        </span>
-      </span>
-      <span
-        className="ml-auto shrink-0 text-[6px] font-medium leading-none"
-        style={{ color: 'var(--color-text-primary)' }}
-      >
-        {shortMonthDay(row.date, locale)}
-      </span>
-    </span>
-  );
-}
-
-/** The watchlist widget's Watch / Holdings switch, Watch on: uppercase
-    pills on a tinted track. */
-function WatchTabs() {
-  const { t } = useTranslation();
-  return (
-    <span className="flex rounded-full p-px" style={{ background: 'var(--color-bg-tag)' }}>
-      {(['tabWatch', 'tabHoldings'] as const).map((tab, i) => (
-        <span
-          key={tab}
-          className="rounded-full px-[2px] py-[2px] text-[4px] uppercase leading-none"
-          style={{
-            background: i === 0 ? 'var(--color-bg-card)' : 'transparent',
-            color: i === 0 ? 'var(--color-text-primary)' : 'var(--color-text-tertiary)',
-          }}
-        >
-          {t(`dashboard.widgets.portfolioWatchlist.${tab}`)}
-        </span>
-      ))}
-    </span>
-  );
-}
-
-/** The earnings widget's look-ahead window, as its header's right end shows
-    it at the default two weeks. */
+/** The earnings widget's look-ahead window, at its default two weeks. */
 const EARNINGS_DAYS = 14;
 
 /**
+ * The earnings widget's card (`EarningsCalendarWidget`): the count and the
+ * window at the edge's end, then a row per report, the day, the symbol, when
+ * in the session, and the estimate. The real row also names the company
+ * after the session; the drawing's column has no room left for it.
+ */
+export function EarningsWidget({
+  edit,
+  delay,
+  className,
+}: {
+  edit?: boolean;
+  delay?: number;
+  className?: string;
+}) {
+  const { t } = useTranslation();
+  const locale = useLocale();
+  return (
+    <Widget
+      title={t('dashboard.widgets.earningsCalendar.header')}
+      meta={
+        <>
+          <span>{EARNINGS.length}</span>
+          <span>{t('dashboard.widgets.earningsCalendar.windowLabel', { days: EARNINGS_DAYS })}</span>
+        </>
+      }
+      edit={edit}
+      delay={delay}
+      className={className}
+    >
+      <div className="widget-term">
+        <table className="term-table dash-table">
+          <tbody>
+            {EARNINGS.map((row) => (
+              <tr key={row.sym}>
+                <td className="term-t3">{shortWeekday(row.date, locale)}</td>
+                <td className="term-code term-strong">{row.sym}</td>
+                <td className="term-fill">
+                  <TermTag>AMC</TermTag>
+                </td>
+                <td className="term-num term-t2">
+                  {t('dashboard.widgets.earningsCalendar.estEps', {
+                    value: formatMoney(row.eps, 'USD', locale),
+                  })}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </Widget>
+  );
+}
+
+/* ── the page ──────────────────────────────────────────────────────────── */
+
+/**
  * The page under the header, as the default layout lays it out (Morning
- * brief preset): the markets overview across the top, then two columns that
- * stack independently, the brief over news in eight of the twelve columns and
- * the watchlist over earnings in the other four. Widgets at rest draw no frame
- * of their own, so each shows as its card. `live` plays the script (the brief
- * comes in part by part, the index lines trace in and keep taking points,
- * quotes tick); otherwise it sits on the finished frame.
+ * brief preset): the index cards across the top, then the brief over news in
+ * eight of the twelve columns and the watchlist over earnings in the other
+ * four, the lower widget of each column running on to the page's foot when
+ * the page has a height. `live` plays the script (the brief comes in part
+ * by part, the index lines trace in and keep taking points, quotes tick);
+ * otherwise it sits on the finished frame.
  */
 export function PageBody({ live = false }: { live?: boolean }) {
-  const { t: tr } = useTranslation();
   const now = useSceneTime();
   const t = live ? now : Number.POSITIVE_INFINITY;
   const slid = GRID.shifts.reduce((s, at) => s + ease(t, at, GRID.shiftDur), 0);
   return (
-    <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
-      <div className="intro-rv grid grid-cols-5 gap-1.5" style={rv(0.05)}>
-        {INDICES.map((index, i) => (
-          <IndexCard
-            key={index.name}
-            index={index}
+    <div className="flex min-h-0 flex-auto flex-col gap-1.5">
+      <div className="intro-rv shrink-0" style={rv(0.05)}>
+        <Real>
+          <IndexRow
             live={live}
-            reach={100 * ease(t, GRID.draw + i * 90, GRID.drawDur)}
+            reach={(i) => 100 * ease(t, GRID.draw + i * 90, GRID.drawDur)}
             slid={slid}
           />
-        ))}
+        </Real>
       </div>
-      <div className="mt-1.5 grid min-h-0 grid-cols-[2fr_1fr] items-start gap-1.5">
+      <div className="grid min-h-0 flex-auto grid-cols-[2fr_1fr] gap-1.5">
         {/* the brief, news under it */}
         <div className="flex min-w-0 flex-col gap-1.5">
           {/* the AI brief; on the live page its parts enter in turn */}
           <BriefCard at={live ? GRID.brief : PAST} />
-          <Widget
-            icon={Newspaper}
-            title={tr('dashboard.widgets.newsFeed.title')}
-            header={tr('dashboard.widgets.newsFeed.header', {
-              label: tr('dashboard.widgets.newsFeed.tab_market'),
-            })}
-            count="24"
-            delay={0.3}
-          >
-            {NEWS.slice(0, 3).map((item) => (
+          <NewsWidget delay={0.3} className="flex-auto">
+            {NEWS.slice(0, 4).map((item) => (
               <NewsRow key={item.title} item={item} />
             ))}
-          </Widget>
+          </NewsWidget>
         </div>
         {/* the watchlist, earnings under it */}
         <div className="flex min-w-0 flex-col gap-1.5">
-          <Widget
-            icon={Eye}
-            title={tr('dashboard.widgets.portfolioWatchlist.title')}
-            header={tr('dashboard.widgets.portfolioWatchlist.headerWatchlist')}
-            aside={<WatchTabs />}
-            delay={0.32}
-          >
-            <span className="flex flex-col">
-              {WATCH.map((row) => (
-                <WatchRow key={row.sym} row={row} live={live} />
-              ))}
-            </span>
-            <AddSymbol />
-          </Widget>
-          <Widget
-            icon={CalendarDays}
-            title={tr('dashboard.widgets.earningsCalendar.title')}
-            header={tr('dashboard.widgets.earningsCalendar.header')}
-            count={String(EARNINGS.length)}
-            aside={
-              <span
-                className="text-[4.5px] uppercase leading-none tracking-wider"
-                style={{ color: 'var(--color-text-tertiary)' }}
-              >
-                {tr('dashboard.widgets.earningsCalendar.windowLabel', { days: EARNINGS_DAYS })}
-              </span>
-            }
-            delay={0.4}
-          >
-            <span
-              className="px-0.5 text-[4.5px] font-bold uppercase leading-none tracking-wider"
-              style={{ color: 'var(--color-text-secondary)' }}
-            >
-              {tr('dashboard.widgets.earningsCalendar.bucket_nextWeek')}
-            </span>
-            {EARNINGS.map((row) => (
-              <EarningsRow key={row.sym} row={row} />
-            ))}
-          </Widget>
+          <WatchWidget live={live} delay={0.32} className="shrink-0" />
+          <EarningsWidget delay={0.4} className="flex-auto" />
         </div>
       </div>
     </div>

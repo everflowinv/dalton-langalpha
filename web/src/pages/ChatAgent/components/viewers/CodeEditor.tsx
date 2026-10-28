@@ -66,7 +66,9 @@ interface CodeEditorProps {
   originalValue?: string;
   editorRef?: React.MutableRefObject<editor.IStandaloneCodeEditor | null>;
   /** The Monaco model to edit. Given, the model outlives this editor, so undo
-   * history and view state survive a remount, and the caller disposes it. */
+   * history and view state survive a remount, and the caller disposes it.
+   * The model is then the draft: `value` only seeds it, and a later change to
+   * `value` does not reach it. */
   modelPath?: string;
   onUndoRedoChange?: (state: UndoRedoState) => void;
   onTextSelect?: (selection: TextSelection | null) => void;
@@ -76,6 +78,12 @@ export default function CodeEditor({ value, onChange, fileName, readOnly = false
   const language = getLanguageFromFileName(fileName);
   const theme = useTheme().theme === 'light' ? 'vs' : 'vs-dark';
   const showDiff = diffMode && originalValue != null;
+  // A kept model is the draft itself, so `value` only seeds it. The library
+  // writes a changed `value` over the model in a passive effect, which lands
+  // after any keystroke Monaco took since the render that read it, so handing
+  // the draft back as it rendered rolled those keystrokes off. The diff overlay
+  // types into the same model, which is how its edits reach this editor.
+  const seedOnly = modelPath != null;
 
   // Track DiffEditor listener disposables to prevent "TextModel got disposed" race
   const diffDisposablesRef = React.useRef<{ dispose(): void }[]>([]);
@@ -118,9 +126,10 @@ export default function CodeEditor({ value, onChange, fileName, readOnly = false
           height="100%"
           language={language}
           theme={theme}
-          value={value ?? ''}
+          defaultValue={value ?? ''}
+          value={seedOnly ? undefined : value ?? ''}
           path={modelPath}
-          keepCurrentModel={modelPath != null}
+          keepCurrentModel={seedOnly}
           saveViewState={false}
           beforeMount={rememberMonaco}
           onMount={(monacoEditor: editor.IStandaloneCodeEditor) => {
@@ -167,7 +176,8 @@ export default function CodeEditor({ value, onChange, fileName, readOnly = false
           options={{ ...EDITOR_OPTIONS, readOnly }}
         />
       </div>
-      {/* Diff overlay — edits here flow back to the normal editor via onChange → value prop */}
+      {/* Diff overlay — edits here reach the normal editor through the shared
+          model, or without one through onChange → value prop */}
       {showDiff && (
         <div style={{ position: 'absolute', inset: 0 }}>
           <DiffEditor
@@ -175,7 +185,9 @@ export default function CodeEditor({ value, onChange, fileName, readOnly = false
             language={language}
             theme={theme}
             original={originalValue}
-            modified={value ?? ''}
+            modified={seedOnly ? undefined : value ?? ''}
+            modifiedModelPath={modelPath}
+            keepCurrentModifiedModel={seedOnly}
             onMount={(diffEditor: editor.IStandaloneDiffEditor) => {
               // Dispose any stale listeners from a previous mount
               diffDisposablesRef.current.forEach((d) => d.dispose());

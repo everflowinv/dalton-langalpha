@@ -12,6 +12,7 @@ import pytest
 
 from src.llms import task_costs
 from src.llms.llm import ModelConfig
+from src.llms.pricing_utils import find_model_pricing
 from src.llms.task_costs import (
     ANY_EFFORT,
     parse_task_costs,
@@ -22,14 +23,17 @@ from src.llms.task_costs import (
 LADDER = ["low", "medium", "high", "xhigh", "max"]
 
 
-def _table(models: dict, baseline: tuple[str, str] = ("base", "medium")) -> dict:
-    return parse_task_costs(
-        {
-            "source": {"name": "test"},
-            "baseline": {"model": baseline[0], "effort": baseline[1]},
-            "models": {"base": {"medium": 0.5}, **models},
-        }
-    )
+def _table(
+    models: dict, baseline: tuple[str, str] = ("base", "medium"), bounds=None
+) -> dict:
+    data = {
+        "source": {"name": "test"},
+        "baseline": {"model": baseline[0], "effort": baseline[1]},
+        "models": {"base": {"medium": 0.5}, **models},
+    }
+    if bounds is not None:
+        data["bounds"] = bounds
+    return parse_task_costs(data)
 
 
 @pytest.fixture
@@ -121,6 +125,48 @@ class TestShaping:
         result = task_cost("m", ["low", "medium", "high", "max"], table)
         assert all(not result[e]["measured"] for e in ("low", "medium", "high"))
         assert result["max"] == {"value": 8.0, "measured": True}
+        assert caplog.text
+
+
+class TestBounds:
+    def test_a_bounded_model_carries_its_sources_figures_times_the_multiple(self):
+        table = _table(
+            {"m": {"low": 1.0, "max": 4.0}},
+            bounds={"fast": {"model": "m", "times": 2}},
+        )
+        assert task_cost("fast", ["low", "high", "max"], table) == {
+            "low": {"value": 4.0, "measured": False},
+            "high": {"value": 16.0, "measured": False},
+            "max": {"value": 16.0, "measured": False},
+        }
+
+    def test_a_measured_figure_wins_over_a_bound(self):
+        table = _table(
+            {"m": {"max": 4.0}, "fast": {"max": 5.0}},
+            bounds={"fast": {"model": "m", "times": 2}},
+        )
+        assert task_cost("fast", ["max"], table)["max"] == {"value": 10.0, "measured": True}
+
+    @pytest.mark.parametrize(
+        "bound",
+        [
+            {"model": "nowhere", "times": 2},
+            {"model": "chained", "times": 2},
+            {"model": "m", "times": 0},
+            {"model": "m"},
+            {"model": ["m"], "times": 2},
+            "m",
+        ],
+        ids=["unknown-model", "chain", "zero-multiple", "no-multiple", "model-not-a-name", "not-an-object"],
+    )
+    def test_an_unusable_bound_drops_only_itself(self, bound, caplog):
+        with caplog.at_level(logging.WARNING, logger=task_costs.__name__):
+            table = _table(
+                {"m": {"max": 4.0}},
+                bounds={"fast": bound, "chained": {"model": "m", "times": 2}},
+            )
+        assert task_cost("fast", ["max"], table) is None
+        assert task_cost("chained", ["max"], table)["max"]["value"] == 16.0
         assert caplog.text
 
 
@@ -234,11 +280,11 @@ class TestShippedFile:
             "measured": True,
         }
 
-    def test_an_unmeasured_level_carries_the_level_above(self, metadata):
+    def test_an_unmeasured_level_carries_the_level_above(self, metadata, shipped):
         checked = 0
         for key, entry in metadata.items():
             costs = entry.get("task_cost")
-            if not costs or ANY_EFFORT in costs:
+            if not costs or ANY_EFFORT in costs or key in shipped.get("bounds", {}):
                 continue
             ceiling = None
             for effort in reversed(entry["reasoning_efforts"]):
@@ -273,9 +319,36 @@ class TestShippedFile:
         but are not in it themselves, and must not borrow its figures."""
         for key, entry in metadata.items():
             if "task_cost" in entry:
-                assert key in shipped["models"], key
+                assert key in shipped["models"] or key in shipped.get("bounds", {}), key
 
     def test_every_key_in_the_file_is_a_visible_model(self, metadata, shipped):
         """A misspelled key would silently show nothing anywhere."""
-        missing = [k for k in shipped["models"] if k not in metadata]
+        keys = [*shipped["models"], *shipped.get("bounds", {})]
+        missing = [k for k in keys if k not in metadata]
         assert not missing, missing
+
+    def test_a_bounded_model_is_unmeasured_at_every_level(self, metadata, shipped):
+        for key in shipped.get("bounds", {}):
+            costs = metadata[key]["task_cost"]
+            assert costs and not any(c["measured"] for c in costs.values()), key
+
+    def test_every_bound_covers_each_rate_of_the_bounded_model(self, shipped):
+        """The multiple is what makes the figure an upper bound: no rate the
+        bounded model bills may exceed it times the measured model's rate, or
+        a repricing turns "at most" into an understatement."""
+        config = ModelConfig()
+
+        def rates(key):
+            info = config.get_model_config(key)
+            pricing = find_model_pricing(info["model_id"], provider=info["provider"])
+            assert pricing, key
+            assert "input_tiers" not in pricing and "output_tiers" not in pricing, (
+                f"{key}: a bound over tiered pricing needs a rule for each tier"
+            )
+            return {k: v for k, v in pricing.items() if isinstance(v, (int, float))}
+
+        for key, bound in shipped.get("bounds", {}).items():
+            mine, theirs = rates(key), rates(bound["model"])
+            for field, rate in mine.items():
+                assert field in theirs, (key, field)
+                assert rate <= bound["times"] * theirs[field], (key, field)

@@ -1,9 +1,10 @@
 import React, { useState, useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
-import { ArrowLeft, Search } from 'lucide-react';
+import { ArrowLeft } from 'lucide-react';
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '../../../components/ui/dialog';
 import { Input } from '../../../components/ui/input';
-import { ScrollArea } from '../../../components/ui/scroll-area';
+import { FormCard } from './FormCard';
+import { SymbolSearchCard } from './SymbolSearchCard';
 import type { StockSearchHit } from '@/lib/marketUtils';
 import { useSymbolSearch } from '@/hooks/useSymbolSearch';
 
@@ -123,7 +124,7 @@ function AddPortfolioHoldingDialog({
 
   return (
     <Dialog open={open} onOpenChange={(open) => !open && onClose?.()}>
-      <DialogContent className="sm:max-w-md border max-sm:min-h-[60dvh]" style={{ backgroundColor: 'var(--color-bg-elevated)', borderColor: 'var(--color-border-elevated)' }}>
+      <DialogContent className="dash-form sm:max-w-md max-sm:min-h-[60dvh]">
         {page === 1 ? (
           <>
             <DialogHeader className="text-left">
@@ -131,58 +132,19 @@ function AddPortfolioHoldingDialog({
                 {t('dashboard.addPortfolioDialog.titleSearch')}
               </DialogTitle>
             </DialogHeader>
-            <div className="pt-1">
-              <div className="relative">
-                <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 h-4 w-4" style={{ color: 'var(--color-text-secondary)' }} />
-                <Input
-                  placeholder={t('dashboard.addPortfolioDialog.searchPlaceholder')}
-                  value={searchQuery}
-                  onChange={(e) => setSearchQuery(e.target.value)}
-                  className="pl-10 border"
-                  style={{ backgroundColor: 'var(--color-bg-card)', borderColor: 'var(--color-border-default)', color: 'var(--color-text-primary)' }}
-                  autoFocus
-                />
-              </div>
-              <ScrollArea className="mt-3 max-h-[50dvh] sm:max-h-[400px]">
-                {searchLoading && searchResults.length === 0 ? (
-                  <div className="py-8 text-center text-sm" style={{ color: 'var(--color-text-secondary)' }}>
-                    {t('dashboard.addPortfolioDialog.searching')}
-                  </div>
-                ) : searchResults.length === 0 && searchQuery.trim().length >= 1 ? (
-                  <div className="py-8 text-center text-sm" style={{ color: 'var(--color-text-secondary)' }}>
-                    {t('dashboard.addPortfolioDialog.noResults')}
-                  </div>
-                ) : searchResults.length === 0 ? (
-                  <div className="py-8 text-center text-sm" style={{ color: 'var(--color-text-secondary)' }}>
-                    {t('dashboard.addPortfolioDialog.searchHint')}
-                  </div>
-                ) : (
-                  <div className="divide-y" style={{ borderColor: 'var(--color-border-muted)' }}>
-                    {searchResults.map((stock, index) => (
-                      <button
-                        key={`${stock.symbol}-${index}`}
-                        type="button"
-                        onClick={() => handleStockSelect(stock)}
-                        className="w-full text-left px-2 py-2.5 transition-colors flex items-center gap-3"
-                        style={{ color: 'var(--color-text-primary)' }}
-                        onMouseEnter={(e) => { e.currentTarget.style.backgroundColor = 'var(--color-bg-hover)'; }}
-                        onMouseLeave={(e) => { e.currentTarget.style.backgroundColor = 'transparent'; }}
-                      >
-                        <span
-                          className="shrink-0 w-12 text-center text-xs font-bold py-1 rounded"
-                          style={{ backgroundColor: 'var(--color-bg-surface, var(--color-bg-hover))', color: 'var(--color-text-primary)' }}
-                        >
-                          {stock.symbol}
-                        </span>
-                        <span className="text-sm truncate" style={{ color: 'var(--color-text-secondary)' }}>
-                          {stock.name}
-                        </span>
-                      </button>
-                    ))}
-                  </div>
-                )}
-              </ScrollArea>
-            </div>
+            <SymbolSearchCard
+              query={searchQuery}
+              onQueryChange={setSearchQuery}
+              hits={searchResults}
+              loading={searchLoading}
+              onSelect={handleStockSelect}
+              copy={{
+                searching: t('dashboard.addPortfolioDialog.searching'),
+                noResults: t('dashboard.addPortfolioDialog.noResults'),
+                searchHint: t('dashboard.addPortfolioDialog.searchHint'),
+                searchPlaceholder: t('dashboard.addPortfolioDialog.searchPlaceholder'),
+              }}
+            />
           </>
         ) : (
           <>
@@ -206,92 +168,61 @@ function AddPortfolioHoldingDialog({
             </DialogHeader>
             {selectedStock && (
               <div className="space-y-5">
-                {/* Stock info card */}
-                <div
-                  className="rounded-xl p-4 border"
-                  style={{ backgroundColor: 'var(--color-bg-card)', borderColor: 'var(--color-border-muted)' }}
-                >
-                  <div className="flex items-center gap-2">
-                    <span className="text-lg font-bold" style={{ color: 'var(--color-text-primary)' }}>
-                      {selectedStock.symbol}
-                    </span>
-                    {exchange && (
-                      <span
-                        className="text-[0.625rem] font-medium px-1.5 py-0.5 rounded"
-                        style={{ backgroundColor: 'var(--color-bg-surface, var(--color-bg-hover))', color: 'var(--color-text-secondary)' }}
-                      >
-                        {exchange}
+                <FormCard title={<span className="term-code">{selectedStock.symbol}</span>} sub={exchange}>
+                  {selectedStock.name && <div className="term-word dash-form-name">{selectedStock.name}</div>}
+
+                  <div className="grid grid-cols-2 gap-3">
+                    <label className="block">
+                      <span className="term-label dash-form-label">
+                        {t('dashboard.addPortfolioDialog.quantityLabel')} <span className="dash-form-required">*</span>
                       </span>
-                    )}
-                  </div>
-                  <div className="text-xs mt-1 truncate" style={{ color: 'var(--color-text-secondary)' }}>
-                    {selectedStock.name}
-                  </div>
-                </div>
-
-                {/* Quantity + Average Cost — side by side */}
-                <div className="grid grid-cols-2 gap-3">
-                  <div>
-                    <label className="block text-xs font-medium mb-1.5" style={{ color: 'var(--color-text-secondary)' }}>
-                      {t('dashboard.addPortfolioDialog.quantityLabel')} <span style={{ color: 'var(--color-loss)' }}>*</span>
+                      <Input
+                        type="number"
+                        min="0"
+                        step="any"
+                        placeholder={t('dashboard.addPortfolioDialog.quantityPlaceholder')}
+                        value={quantity}
+                        onChange={(e) => setQuantity(e.target.value)}
+                        className="dash-form-input dash-form-figure border"
+                      />
                     </label>
-                    <Input
-                      type="number"
-                      min="0"
-                      step="any"
-                      placeholder={t('dashboard.addPortfolioDialog.quantityPlaceholder')}
-                      value={quantity}
-                      onChange={(e) => setQuantity(e.target.value)}
-                      className="border"
-                      style={{ backgroundColor: 'var(--color-bg-card)', borderColor: 'var(--color-border-default)', color: 'var(--color-text-primary)' }}
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-xs font-medium mb-1.5" style={{ color: 'var(--color-text-secondary)' }}>
-                      {t('dashboard.addPortfolioDialog.averageCostLabel')} <span style={{ color: 'var(--color-loss)' }}>*</span>
+                    <label className="block">
+                      <span className="term-label dash-form-label">
+                        {t('dashboard.addPortfolioDialog.averageCostLabel')} <span className="dash-form-required">*</span>
+                      </span>
+                      <Input
+                        type="number"
+                        min="0"
+                        step="any"
+                        placeholder={t('dashboard.addPortfolioDialog.averageCostPlaceholder')}
+                        value={averageCost}
+                        onChange={(e) => setAverageCost(e.target.value)}
+                        className="dash-form-input dash-form-figure border"
+                      />
                     </label>
-                    <Input
-                      type="number"
-                      min="0"
-                      step="any"
-                      placeholder={t('dashboard.addPortfolioDialog.averageCostPlaceholder')}
-                      value={averageCost}
-                      onChange={(e) => setAverageCost(e.target.value)}
-                      className="border"
-                      style={{ backgroundColor: 'var(--color-bg-card)', borderColor: 'var(--color-border-default)', color: 'var(--color-text-primary)' }}
-                    />
                   </div>
-                </div>
 
-                {/* Account Name */}
-                <div>
-                  <label className="block text-xs font-medium mb-1.5" style={{ color: 'var(--color-text-secondary)' }}>
-                    {t('dashboard.addPortfolioDialog.accountNameLabel')}
+                  <label className="block">
+                    <span className="term-label dash-form-label">{t('dashboard.addPortfolioDialog.accountNameLabel')}</span>
+                    <Input
+                      placeholder={t('dashboard.addPortfolioDialog.accountNamePlaceholder')}
+                      value={accountName}
+                      onChange={(e) => setAccountName(e.target.value)}
+                      className="dash-form-input border"
+                    />
                   </label>
-                  <Input
-                    placeholder={t('dashboard.addPortfolioDialog.accountNamePlaceholder')}
-                    value={accountName}
-                    onChange={(e) => setAccountName(e.target.value)}
-                    className="border"
-                    style={{ backgroundColor: 'var(--color-bg-card)', borderColor: 'var(--color-border-default)', color: 'var(--color-text-primary)' }}
-                  />
-                </div>
 
-                {/* Notes Input */}
-                <div>
-                  <label className="block text-xs font-medium mb-1.5" style={{ color: 'var(--color-text-secondary)' }}>
-                    {t('dashboard.addPortfolioDialog.notesLabel')}
+                  <label className="block">
+                    <span className="term-label dash-form-label">{t('dashboard.addPortfolioDialog.notesLabel')}</span>
+                    <Input
+                      placeholder={t('dashboard.addPortfolioDialog.notesPlaceholder')}
+                      value={notes}
+                      onChange={(e) => setNotes(e.target.value)}
+                      className="dash-form-input border"
+                    />
                   </label>
-                  <Input
-                    placeholder={t('dashboard.addPortfolioDialog.notesPlaceholder')}
-                    value={notes}
-                    onChange={(e) => setNotes(e.target.value)}
-                    className="border"
-                    style={{ backgroundColor: 'var(--color-bg-card)', borderColor: 'var(--color-border-default)', color: 'var(--color-text-primary)' }}
-                  />
-                </div>
+                </FormCard>
 
-                {/* Add Button */}
                 <button
                   type="button"
                   onClick={handleAdd}

@@ -38,21 +38,30 @@ vi.mock('../../framework/DashboardDataContext', () => ({
 import '../../index'; // populate widget registry
 import { fetchStockData } from '@/lib/bars';
 import { getWidget } from '../../framework/WidgetRegistry';
+import { WidgetFrame } from '../../framework/WidgetFrame';
 
 const mockFetch = fetchStockData as unknown as ReturnType<typeof vi.fn>;
 
+// In its frame, since the widget says its symbol count in the frame's edge.
 function renderMiniChartGrid(config: { symbols: string[] }) {
   const def = getWidget('markets.miniChartGrid');
   if (!def) throw new Error('miniChartGrid not registered');
   const Component = def.component;
+  const instance = { id: 'mcg-1', type: 'markets.miniChartGrid', config };
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 0 } } });
   return render(
     <QueryClientProvider client={qc}>
       <MemoryRouter>
-        <Component
-          instance={{ id: 'mcg-1', type: 'markets.miniChartGrid', config }}
-          updateConfig={vi.fn()}
-        />
+        <WidgetFrame
+          definition={def}
+          instance={instance}
+          editMode={false}
+          onRemove={vi.fn()}
+          onDuplicate={vi.fn()}
+          onOpenSettings={vi.fn()}
+        >
+          <Component instance={instance} updateConfig={vi.fn()} />
+        </WidgetFrame>
       </MemoryRouter>
     </QueryClientProvider>,
   );
@@ -75,7 +84,7 @@ describe('MiniChartGridWidget', () => {
 
   it('renders the widget chrome with the configured symbol count', async () => {
     renderMiniChartGrid({ symbols: ['NVDA', 'AAPL', 'MSFT'] });
-    // Header summary line shows "{n} symbols · 30d" — assert n matches config.
+    // The card's edge says "{n} symbols · 30d"; assert n matches config.
     await waitFor(() => {
       expect(screen.getByText(/3\s+symbols/i)).toBeInTheDocument();
     });

@@ -4,6 +4,7 @@ import { HelpCircle, Check, SkipForward, Send } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { SPRING_INDICATOR, staggerDelay, TWEEN } from '@/lib/motion';
 import { Disclosure } from '@/components/ui/Disclosure';
+import { isImeComposing } from '@/lib/ime';
 import Markdown from './Markdown';
 import { ResolveSwap } from './decisionCardMotion';
 import { SettledStep } from './SettledStep';
@@ -243,7 +244,7 @@ function UserQuestionCard({ questionData, onAnswer, onSkip }: UserQuestionCardPr
   };
 
   const handleOtherKeyDown = (e: React.KeyboardEvent<HTMLInputElement>): void => {
-    if (e.key === 'Enter' && !e.shiftKey) {
+    if (e.key === 'Enter' && !e.shiftKey && !isImeComposing(e)) {
       e.preventDefault();
       handleSubmitOther();
     }

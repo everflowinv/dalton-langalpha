@@ -1,6 +1,7 @@
 /**
- * How the chat's data cards and their detail panels are drawn: Balanced, the
- * default, Quiet, or Terminal. Terminal is the cards' own stylesheets; the
+ * How the data cards, in chat and on the dashboard, and their detail panels
+ * are drawn: Quiet, the default and the nearest to the rest of the app,
+ * Balanced, or Terminal. Terminal is the cards' own stylesheets; the
  * other two take marks away from them (charts/termCardStyles.css). Per device,
  * like the theme and the font size, since it is a question of how this screen
  * reads.
@@ -24,7 +25,7 @@ const KEY = 'cardStyle';
 export function getCardStyle(): CardStyle {
   const stored = safeLocalStorage.getItem(KEY);
   // DALTON-HOOK(brand-name): Dalton builds default to 'terminal' (the pre-#617 card stylesheet).
-  const defaultStyle: CardStyle = isDaltonBuild ? 'terminal' : 'balanced';
+  const defaultStyle: CardStyle = isDaltonBuild ? 'terminal' : 'quiet';
   return CARD_STYLES.find((s) => s === stored) ?? defaultStyle;
 }
 

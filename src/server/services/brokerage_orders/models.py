@@ -52,6 +52,10 @@ class AttemptStatus(StrEnum):
     PARTIALLY_FILLED = "partially_filled"
     FILLED = "filled"
     CANCELLED = "cancelled"
+    # The vendor says the order or instruction lapsed on its own schedule, with
+    # nobody cancelling it: a time in force ran out, or a staged instruction
+    # was never confirmed in time. Only a vendor that names it reaches it.
+    EXPIRED = "expired"
     # A staged instruction the vendor stopped listing: a person sent it, deleted
     # it or let it expire in the vendor's own client, which does not say which.
     # Only a person there can trade one, so that is where its outcome is
@@ -83,6 +87,7 @@ TERMINAL_STATUSES: tuple[AttemptStatus, ...] = (
     AttemptStatus.REFUSED,
     AttemptStatus.FILLED,
     AttemptStatus.CANCELLED,
+    AttemptStatus.EXPIRED,
     AttemptStatus.HANDED_OFF,
     AttemptStatus.REJECTED_BY_VENDOR,
     AttemptStatus.FAILED,

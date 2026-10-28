@@ -60,13 +60,13 @@
       "xhigh": 2.308796,
       "max": 3.2575
     },
-    "gpt-5.6-terra": {
-      "none": 0.139724,
-      "low": 0.144462,
-      "medium": 0.183373,
-      "high": 0.337873,
-      "xhigh": 0.631791,
-      "max": 1.398724
+    "gpt-6.1-terra": {
+      "none": 0.1069,
+      "low": 0.0546,
+      "medium": 0.0953,
+      "high": 0.1343,
+      "xhigh": 0.1937,
+      "max": 0.4035
     },
     "deepseek-flash": {
       "none": 0.1467,
@@ -76,9 +76,8 @@
       "low": 0.852217,
       "max": 2.005638
     },
-    "kimi-k3": {
-      "low": 1.146306,
-      "max": 2.000132
+    "kimi-k3.1-pro": {
+      "max": 2.1145
     },
     "gemini-3.8-flash": {
       "medium": 0.931038,
@@ -98,6 +97,13 @@
     },
     "glm-5.3-flash": {
       "any": 0.283595
+    }
+  },
+  "bounds": {
+    "kimi-k3.1-pro-highspeed": {
+      "model": "kimi-k3.1-pro",
+      "times": 2.0,
+      "basis": "The same model served faster: input and output bill at 2x Kimi K3.1 Pro's rates, cache hits at the same rate."
     }
   }
 }

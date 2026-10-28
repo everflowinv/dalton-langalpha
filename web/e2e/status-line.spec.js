@@ -75,6 +75,12 @@ test.describe('status layout', () => {
     // the line keeps the failed step on screen with its badge.
     await expect(summary).toContainText('1 failed');
     await expect(line.locator('.nrow-badge')).toBeVisible();
+    // The frames judged below run to 2400ms past the line's first, timed from
+    // that frame rather than from when the polls above caught up.
+    await page.waitForFunction(() => {
+      const first = window.__samples.find((s) => s.lineTop !== null);
+      return !!first && window.__samples.at(-1).t > first.t + 2400;
+    });
     // The full list is one click away.
     await page.evaluate(() => { window.__opened = true; });
     await summary.click();
@@ -226,7 +232,12 @@ test.describe('status layout', () => {
     await sampleFrames(page, bandProbe);
     const line = page.locator('[data-testid="activity-live-zone"] [data-status-line]');
     await expect(line).toContainText('one.example.com', { timeout: 5000 });
-    await page.waitForTimeout(600);
+    // Timed from the line's first drawn frame, not from when the poll above
+    // noticed it, which can be any time up to a poll interval later.
+    await page.waitForFunction(() => {
+      const first = window.__samples.find((s) => s.lineTop !== null);
+      return !!first && window.__samples.at(-1).t > first.t + 1000;
+    });
     const samples = (await stopSampling(page)).filter((s) => s.bandTop !== null);
     expect(samples.some((s) => s.empty), 'an empty band was held over the thought').toBe(false);
     // The thought's row turns into the count where it sits.

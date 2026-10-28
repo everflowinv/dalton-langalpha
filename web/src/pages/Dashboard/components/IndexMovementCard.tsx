@@ -1,4 +1,4 @@
-import React, { useState, useCallback } from 'react';
+import { useState, useCallback } from 'react';
 import { useNavigate } from 'react-router';
 import { LineChart, Line, YAxis, Tooltip } from 'recharts';
 import { motion, AnimatePresence, type PanInfo } from '@/lib/framer';
@@ -11,6 +11,7 @@ import { useLocale } from '@/hooks/useLocale';
 import { useNow } from '@/hooks/useNow';
 import { grouped2 } from '@/lib/format';
 import { cn, utcMsToETDate } from '@/lib/utils';
+import { TermCard, TermChange } from '@/pages/ChatAgent/components/charts/TermCard';
 import type { IndexData } from '@/types/market';
 
 
@@ -30,7 +31,7 @@ interface IndexMovementCardProps {
   /**
    * When true, forces the mobile iOS-style swipeable stack rendering even on
    * desktop viewports. Used by the widget grid when the cell is too narrow to
-   * fit the 5-column tile layout comfortably.
+   * fit the tiles side by side.
    */
   forceMobile?: boolean;
   /** One row of equal cards whatever the viewport: the widget's cell is one
@@ -38,133 +39,84 @@ interface IndexMovementCardProps {
   singleRow?: boolean;
 }
 
-/* ── Shared card content (no animation wrapper) ── */
+const SPARK_HEIGHT = 32;
 
-// Side by side from 14rem of header width (a card of about 258px), where the
-// widest quote block still leaves room for the longest single word of a name.
-const INDEX_HEADER_ROW =
-  'flex flex-col gap-1 @min-[14rem]:flex-row @min-[14rem]:items-start @min-[14rem]:justify-between @min-[14rem]:gap-3';
-const INDEX_HEADER_QUOTE = 'shrink-0 @min-[14rem]:text-right';
+/** The session the figures belong to, M/D: the last trading day when the
+ *  market is closed or not yet open, else today in ET. ET, not the browser's
+ *  zone, so the fallback matches the ET-derived asOfDate on sibling cards for
+ *  users outside US timezones. Only a card on the fallback reads the clock,
+ *  so only it ticks. */
+function useSessionDate(index: IndexData): string {
+  const hasAsOfDate = /^\d{4}-\d{2}-\d{2}$/.test(index.asOfDate ?? '');
+  const now = useNow(60_000, !hasAsOfDate);
+  const iso = hasAsOfDate ? (index.asOfDate as string) : utcMsToETDate(now);
+  const [, mo, d] = iso.split('-');
+  return `${Number(mo)}/${Number(d)}`;
+}
 
-function IndexCardContent({ index }: { index: IndexData }) {
+/* ── One index as a small data card: the price, the day's move, its line ── */
+
+function IndexCardBody({ index, date }: { index: IndexData; date: string }) {
   const { t } = useTranslation();
   const locale = useLocale();
   const hasQuote = index.quoteAvailable !== false;
-  const pos = index.isPositive;
   const ch = Number(index.change);
   const pct = Number(index.changePercent);
-  const changeStr = grouped2(ch, locale);
-  const pctStr = '(' + (pos ? '+' : '') + grouped2(pct, locale) + '%)';
   const chartData: SparklineDataPoint[] = (index.sparklineData || []).map((pt, i) =>
     typeof pt === 'object' ? { ...pt, i } : { val: pt as unknown as number, i },
   );
-
-  // Show the date of the session the data belongs to (e.g. the last trading day
-  // when the market is closed/pre-open), falling back to today (ET) if unknown
-  // or malformed. ET — not browser-local — so the fallback matches the
-  // ET-derived asOfDate on sibling cards for users outside US timezones. Only
-  // a card on the fallback reads the clock, so only it ticks.
-  const hasAsOfDate = /^\d{4}-\d{2}-\d{2}$/.test(index.asOfDate ?? '');
-  const now = useNow(60_000, !hasAsOfDate);
-  const dateStr = (() => {
-    const iso = hasAsOfDate
-      ? (index.asOfDate as string)
-      : utcMsToETDate(now);
-    const [, mo, d] = iso.split('-');
-    return `${Number(mo)}/${Number(d)}`;
-  })();
+  const tone = hasQuote
+    ? index.isPositive ? 'var(--color-profit)' : 'var(--color-loss)'
+    : 'var(--color-term-text-tertiary)';
 
   return (
     <>
-      {/* Name, date and symbol beside the price and change, or above them on
-          a card too narrow to hold both sides of the row. */}
-      <div className="@container p-4 pb-0">
-        <div className={INDEX_HEADER_ROW}>
-          <div className="min-w-0">
-            <div className="flex flex-wrap items-baseline gap-x-2">
-              <h3
-                className="text-base font-bold tracking-tight"
-                style={{ color: 'var(--color-text-primary)' }}
-              >
-                {index.name}
-              </h3>
-              <span className="text-xs" style={{ color: 'var(--color-text-secondary)' }}>
-                {dateStr}
-              </span>
-            </div>
-            <div className="text-xs mt-0.5" style={{ color: 'var(--color-text-secondary)' }}>
-              ^{index.symbol}
-            </div>
-          </div>
-          <div className={INDEX_HEADER_QUOTE}>
-            <div
-              className="text-lg font-bold tracking-tight dashboard-mono"
-              style={{ color: 'var(--color-text-primary)' }}
-            >
-              {hasQuote ? grouped2(Number(index.price), locale) : 'N/A'}
-            </div>
-            <div
-              className="text-xs dashboard-mono"
-              style={{
-                color: hasQuote
-                  ? pos ? 'var(--color-profit)' : 'var(--color-loss)'
-                  : 'var(--color-text-secondary)',
-              }}
-            >
-              {hasQuote ? `${changeStr} ${pctStr}` : 'N/A'}
-            </div>
-          </div>
-        </div>
+      <div className="term-line">
+        <span className="term-big">{hasQuote ? grouped2(Number(index.price), locale) : 'N/A'}</span>
       </div>
-
-      {/* Sparkline chart */}
-      <div className="mt-2 px-1 pb-2" style={{ height: 100 }}>
+      <div className="term-line">
+        {hasQuote ? (
+          <>
+            <TermChange value={pct} />
+            <span className="term-t3">{(ch > 0 ? '+' : '') + grouped2(ch, locale)}</span>
+          </>
+        ) : (
+          <span className="term-t3">N/A</span>
+        )}
+        {/* The session the line is for, at the line's end: in the edge it
+            would take the room the index's name needs. */}
+        <span className="term-push term-t3">{date}</span>
+      </div>
+      <div className="dash-spark" style={{ height: SPARK_HEIGHT }}>
         {chartData.length > 1 ? (
-          <LineChart responsive width="100%" height={100} data={chartData}>
-            <Line
-              type="monotone"
-              dataKey="val"
-              stroke={
-                hasQuote
-                  ? pos ? 'var(--color-profit)' : 'var(--color-loss)'
-                  : 'var(--color-text-secondary)'
-              }
-              strokeWidth={1.5}
-              dot={false}
-              isAnimationActive={false}
-            />
+          <LineChart
+            responsive
+            width="100%"
+            height={SPARK_HEIGHT}
+            data={chartData}
+            margin={{ top: 2, right: 0, bottom: 2, left: 0 }}
+            // Not a tab stop of its own: the card's title is its button, and
+            // a focusable chart would swallow the card's click.
+            accessibilityLayer={false}
+          >
+            <Line type="monotone" dataKey="val" stroke={tone} strokeWidth={1.25} dot={false} isAnimationActive={false} />
             <Tooltip
               content={({ active, payload }) => {
                 if (!active || !payload?.[0]) return null;
                 const d = payload[0].payload;
                 return (
-                  <div
-                    className="rounded-lg px-2.5 py-1.5 text-xs shadow-lg border"
-                    style={{
-                      backgroundColor: 'var(--color-bg-card)',
-                      borderColor: 'var(--color-border-muted)',
-                      color: 'var(--color-text-primary)',
-                    }}
-                  >
-                    {d.time && (
-                      <div style={{ color: 'var(--color-text-secondary)' }}>{d.time}</div>
-                    )}
-                    <div className="font-semibold dashboard-mono">
-                      {grouped2(Number(d.val), locale)}
-                    </div>
+                  <div className="dash-spark-tip">
+                    {d.time && <div className="term-t3">{d.time}</div>}
+                    <div className="term-strong">{grouped2(Number(d.val), locale)}</div>
                   </div>
                 );
               }}
-              cursor={{ stroke: 'var(--color-border-default)', strokeWidth: 1 }}
+              cursor={{ stroke: 'var(--color-term-edge)', strokeWidth: 1 }}
             />
             <YAxis domain={['dataMin', 'dataMax']} hide />
           </LineChart>
         ) : (
-          <div className="w-full h-full flex items-center justify-center">
-            <span className="text-xs" style={{ color: 'var(--color-text-secondary)' }}>
-              {t('dashboard.widgets.marketsOverview.noChartData')}
-            </span>
-          </div>
+          <span className="term-t3">{t('dashboard.widgets.marketsOverview.noChartData')}</span>
         )}
       </div>
     </>
@@ -172,24 +124,20 @@ function IndexCardContent({ index }: { index: IndexData }) {
 }
 
 /* ── Desktop card. It has no entrance of its own: the grid it sits in crossfades
-   in from the skeleton, so the five cards settle as one. ── */
+   in from the skeleton, so the cards settle as one. ── */
 
 function IndexCard({ index }: IndexCardProps) {
   const navigate = useNavigate();
-
+  const date = useSessionDate(index);
   return (
-    <div
-      className="overflow-hidden rounded-2xl border transition-colors group flex flex-col cursor-pointer"
-      style={{
-        borderColor: 'var(--color-border-muted)',
-        backgroundColor: 'var(--color-bg-card)',
-      }}
+    <TermCard
+      title={index.symbol}
+      sub={index.name}
+      keep="title"
       onClick={() => navigate(`/market?symbol=^${index.symbol}`)}
-      onMouseEnter={(e) => (e.currentTarget.style.borderColor = 'var(--color-border-default)')}
-      onMouseLeave={(e) => (e.currentTarget.style.borderColor = 'var(--color-border-muted)')}
     >
-      <IndexCardContent index={index} />
-    </div>
+      <IndexCardBody index={index} date={date} />
+    </TermCard>
   );
 }
 
@@ -215,7 +163,6 @@ const swipeVariants = {
 
 function IndexStackWidget({ indices }: { indices: IndexData[] }) {
   const { t } = useTranslation();
-  const navigate = useNavigate();
   const [current, setCurrent] = useState(0);
   const [direction, setDirection] = useState(0);
 
@@ -254,39 +201,7 @@ function IndexStackWidget({ indices }: { indices: IndexData[] }) {
 
   return (
     <div>
-      {/* Card stack container */}
-      <div className="relative overflow-hidden rounded-2xl" style={{ touchAction: 'pan-y' }}>
-        {/* Stacked depth cards behind active card */}
-        {indices.length > 1 && (
-          <>
-            {current < indices.length - 2 && (
-              <div
-                className="absolute inset-x-3 bottom-0 rounded-2xl border"
-                style={{
-                  borderColor: 'var(--color-border-muted)',
-                  backgroundColor: 'var(--color-bg-card)',
-                  opacity: 0.25,
-                  height: 'calc(100% - 10px)',
-                  top: 10,
-                }}
-              />
-            )}
-            {current < indices.length - 1 && (
-              <div
-                className="absolute inset-x-1.5 bottom-0 rounded-2xl border"
-                style={{
-                  borderColor: 'var(--color-border-muted)',
-                  backgroundColor: 'var(--color-bg-card)',
-                  opacity: 0.45,
-                  height: 'calc(100% - 5px)',
-                  top: 5,
-                }}
-              />
-            )}
-          </>
-        )}
-
-        {/* Active card */}
+      <div className="relative overflow-hidden" style={{ touchAction: 'pan-y' }}>
         <AnimatePresence initial={false} custom={direction} mode="popLayout">
           <motion.div
             key={current}
@@ -300,21 +215,15 @@ function IndexStackWidget({ indices }: { indices: IndexData[] }) {
             dragConstraints={{ left: 0, right: 0 }}
             dragElastic={0.12}
             onDragEnd={handleDragEnd}
-            className="relative overflow-hidden rounded-2xl border cursor-pointer"
-            style={{
-              borderColor: 'var(--color-border-muted)',
-              backgroundColor: 'var(--color-bg-card)',
-              touchAction: 'pan-y',
-            }}
-            onClick={() => navigate(`/market?symbol=^${index.symbol}`)}
+            style={{ touchAction: 'pan-y' }}
           >
-            <IndexCardContent index={index} />
+            <IndexCard index={index} />
           </motion.div>
         </AnimatePresence>
       </div>
 
       {/* Dot indicators */}
-      <div className="flex justify-center items-center gap-1.5 mt-3">
+      <div className="flex justify-center items-center gap-1.5 mt-2">
         {indices.map((_, i) => (
           <button
             key={i}
@@ -326,8 +235,8 @@ function IndexStackWidget({ indices }: { indices: IndexData[] }) {
               height: 6,
               backgroundColor:
                 i === current
-                  ? 'var(--color-accent-primary)'
-                  : 'var(--color-border-default)',
+                  ? 'var(--color-term-text-secondary)'
+                  : 'var(--color-term-edge)',
             }}
           />
         ))}
@@ -339,46 +248,20 @@ function IndexStackWidget({ indices }: { indices: IndexData[] }) {
 /* ── Skeleton loader (single card on mobile, grid on desktop) ── */
 
 function IndexSkeleton({ count }: { count: number }) {
-  // The card's own text elements with bars in them, so each line keeps the
-  // height its text will have and the cards do not grow when the quotes land.
+  // The card's own lines with bars in them, so each keeps the height its text
+  // will have and the cards do not grow when the quotes land.
   return (
     <>
       {Array.from({ length: count }).map((_, i) => (
-        <div
-          key={i}
-          className="flex flex-col rounded-2xl border"
-          style={{
-            backgroundColor: 'var(--color-bg-card)',
-            borderColor: 'var(--color-border-muted)',
-          }}
-        >
-          <div className="@container p-4 pb-0">
-            <div className={INDEX_HEADER_ROW}>
-              <div className="min-w-0">
-                <h3 className="text-base font-bold tracking-tight">
-                  <SkeletonBar style={{ width: 80 }} />
-                </h3>
-                <div className="text-xs mt-0.5">
-                  <SkeletonBar style={{ width: 40 }} />
-                </div>
-              </div>
-              <div className={INDEX_HEADER_QUOTE}>
-                <div className="text-lg font-bold tracking-tight dashboard-mono">
-                  <SkeletonBar style={{ width: 80 }} />
-                </div>
-                <div className="text-xs dashboard-mono">
-                  <SkeletonBar style={{ width: 60 }} />
-                </div>
-              </div>
-            </div>
+        <TermCard key={i} title={<SkeletonBar style={{ width: 32 }} />}>
+          <div className="term-line">
+            <span className="term-big"><SkeletonBar style={{ width: 72 }} /></span>
           </div>
-          <div className="mt-2 px-1 pb-2" style={{ height: 100 }}>
-            <div
-              className="w-full h-full rounded animate-pulse"
-              style={{ backgroundColor: 'var(--color-border-default)', opacity: 0.3 }}
-            />
+          <div className="term-line">
+            <SkeletonBar style={{ width: 56 }} />
           </div>
-        </div>
+          <div className="dash-spark" style={{ height: SPARK_HEIGHT }} />
+        </TermCard>
       ))}
     </>
   );
@@ -409,7 +292,7 @@ function IndexMovementCard({
       className="items-start"
       swapKey={loading ? 'loading' : 'ready'}
       layerClassName={cn(
-        'grid gap-4',
+        'grid gap-3',
         singleRow ? 'grid-flow-col auto-cols-fr' : 'grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5',
       )}
     >

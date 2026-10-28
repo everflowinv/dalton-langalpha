@@ -19,6 +19,7 @@ from psycopg.rows import dict_row
 
 from src.server.database.mcp_servers import get_catalog_server
 from src.server.database.pool import get_db_connection
+from src.server.services.brokerage_capabilities import OrderAction
 from src.server.services.brokerage_orders import AttemptStatus, OrderOutcome
 from src.server.services.brokerage_orders.models import (
     CREATING_ACTIONS,
@@ -39,7 +40,7 @@ _COLUMNS = """
     decided_at,
     decision_message, executed_at, dispatched_at, completed_at, vendor_order_id, route,
     action_url, filled_qty, avg_fill_price, fees, parent_attempt_id,
-    result_sha256, failure, created_at, updated_at
+    result_sha256, failure, created_at, updated_at, unlisted_at
 """
 
 # What a decision means in the ledger's vocabulary.
@@ -47,6 +48,12 @@ _DECISIONS = {
     "approve": AttemptStatus.APPROVED,
     "reject": AttemptStatus.REJECTED_BY_USER,
 }
+
+# Where a pending confirmation's token is kept on the row: inside ``route``,
+# beside the other tokens a later call has to send back. The call that answers
+# the confirmation names that token and nothing else, so it is the one way from
+# the answer back to the attempt that was asked.
+CONFIRM_TOKEN_KEY = "confirm_token"
 
 # One page bound, here rather than at the router: the ceiling protects the
 # index this list is served from, so it belongs to the statement that uses it.
@@ -240,8 +247,22 @@ async def complete_attempt(
     The fill columns COALESCE rather than assign: a vendor that answers a
     placement with no fill yet must not blank a number some later read already
     put on the row.
+
+    A confirm that learns the order id also writes it onto the call that
+    started its chain, in the same statement. A placement held for a
+    confirmation can be answered with no id, since nothing reaches the market
+    until the confirm releases it, and that placement is the row the sweep
+    reads and an order wakeup finds. Written separately, a failure between the
+    two writes left the released order with no id to read it by and nothing to
+    retry the write. Only onto a row of the same user that holds no id, so a
+    second worker finishing the same tail changes nothing and an id the
+    placement's own answer named is never replaced; its status stays for the
+    read to settle.
     """
     failure = outcome.failure.to_json() if outcome.failure is not None else None
+    route = dict(outcome.route)
+    if outcome.confirm_token:
+        route[CONFIRM_TOKEN_KEY] = outcome.confirm_token
     # Only a terminal answer dates the attempt: a state the vendor can still
     # move, ``unknown`` included, would date the order to the answer we could
     # not read rather than to the one that settled it.
@@ -250,6 +271,7 @@ async def complete_attempt(
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
                 f"""
+                WITH settled AS (
                 UPDATE order_attempts
                    SET status = %s,
                        vendor_order_id = COALESCE(%s, vendor_order_id),
@@ -266,11 +288,23 @@ async def complete_attempt(
                        updated_at = NOW()
                  WHERE attempt_id = %s AND status = 'submitting'
                 RETURNING {_COLUMNS}
+                ), handed_up AS (
+                UPDATE order_attempts AS root
+                   SET vendor_order_id = settled.vendor_order_id,
+                       updated_at = NOW()
+                  FROM settled
+                 WHERE settled.action = '{OrderAction.CONFIRM}'
+                   AND root.attempt_id = settled.parent_attempt_id
+                   AND root.user_id = settled.user_id
+                   AND root.vendor_order_id IS NULL
+                   AND btrim(COALESCE(settled.vendor_order_id, '')) <> ''
+                )
+                SELECT {_COLUMNS} FROM settled
                 """,
                 (
                     str(outcome.status),
                     strip_pg_nul_str(outcome.vendor_order_id),
-                    SafeJson(dict(outcome.route)) if outcome.route else None,
+                    SafeJson(route) if route else None,
                     strip_pg_nul_str(outcome.action_url),
                     outcome.filled_qty,
                     outcome.avg_fill_price,
@@ -641,6 +675,49 @@ async def latest_attempt_for_vendor_order(
                     account_ref,
                     vendor_order_id,
                     [str(a) for a in CREATING_ACTIONS],
+                ),
+            )
+            row = await cur.fetchone()
+    return None if row is None else str(row[0])
+
+
+async def latest_attempt_for_confirm_token(
+    user_id: str, vendor: str, confirm_token: str, *, account_ref: str | None
+) -> str | None:
+    """The attempt a confirm answers, at the root of its chain, or None.
+
+    The newest of this user's rows whose answer raised ``confirm_token``,
+    whatever its action: a placement, a replace and a cancel can each be held
+    for a confirmation. A confirm can itself be answered with the next one, and
+    then the row found is that confirm; its parent is the call that started the
+    chain, and one step reaches it because every confirm is written already
+    linked to that root.
+    """
+    if not (confirm_token or "").strip() or not (vendor or "").strip():
+        return None
+    async with get_db_connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                SELECT CASE
+                         WHEN action = %s AND parent_attempt_id IS NOT NULL
+                         THEN parent_attempt_id
+                         ELSE attempt_id
+                       END
+                  FROM order_attempts
+                 WHERE user_id = %s AND vendor = %s
+                   AND account_ref IS NOT DISTINCT FROM %s
+                   AND route ->> %s = %s
+                 ORDER BY created_at DESC, attempt_id DESC
+                 LIMIT 1
+                """,
+                (
+                    str(OrderAction.CONFIRM),
+                    user_id,
+                    vendor,
+                    account_ref,
+                    CONFIRM_TOKEN_KEY,
+                    confirm_token,
                 ),
             )
             row = await cur.fetchone()

@@ -1,5 +1,6 @@
 import { useState, type KeyboardEvent } from 'react';
 import { useNavigate } from 'react-router';
+import { isImeComposing } from '@/lib/ime';
 
 interface UseThreadGalleryInputResult {
   message: string;
@@ -37,7 +38,7 @@ export function useThreadGalleryInput(workspaceId: string): UseThreadGalleryInpu
   };
 
   const handleKeyPress = (e: KeyboardEvent) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
+    if (e.key === 'Enter' && !e.shiftKey && !isImeComposing(e)) {
       e.preventDefault();
       handleSend();
     }

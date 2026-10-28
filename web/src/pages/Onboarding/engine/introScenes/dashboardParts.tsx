@@ -1,21 +1,30 @@
-import type { CSSProperties, ReactNode } from 'react';
+import { useState, type ReactNode } from 'react';
 import {
   GripVertical,
   HelpCircle,
   MoreVertical,
+  Paperclip,
   Pencil,
   Search,
-  type LucideIcon,
 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
+import { getCardStyle, type CardStyle } from '@/lib/cardStyle';
 import { cn } from '@/lib/utils';
-import { InputDock, Region } from './kit';
+// The dashboard's own card stylesheets, so the drawing's widgets are its
+// cards (TermCard brings the chat's two with it).
+import '@/pages/ChatAgent/components/charts/termCard.css';
+import '@/pages/ChatAgent/components/charts/termCardStyles.css';
+import '@/pages/Dashboard/widgets/framework/WidgetFrame.css';
+import '@/pages/Dashboard/components/RowAttachButton.css';
+import { InputDock, rv } from './kit';
 
 /* The dashboard intro's shared parts: invented quotes, sparklines, the page
-   and its header, the floating chat, and the widget frame. Each part is drawn
-   after its real counterpart under pages/Dashboard, in miniature, with the
-   app's own strings for its labels. The scenes show the page through a
-   camera, so it is drawn at its own size and the camera picks the crop. */
+   and its header, the floating chat, and the widget frame. The page's
+   chrome is drawn after its real counterpart under pages/Dashboard, in
+   miniature; the widgets are the real cards, with the dashboard's own
+   classes, scaled down (`Real`). Labels are the app's own strings. The
+   scenes show the page through a camera, so it is drawn at its own size and
+   the camera picks the crop. */
 /* eslint-disable react-refresh/only-export-components -- shared parts:
    scene components plus data and style helpers */
 
@@ -32,11 +41,27 @@ export function changeAt(ticks: Ticks, t: number, live: boolean): number {
   return ticks[i].v;
 }
 
-/** The index cards. Their ticks run on DashboardGrid's script; the final
-    signs are the static design's (up, up, down, up, down). Each `spark`
-    runs three points past the seven on screen (see `Spark`). */
-export const INDICES: { name: string; prev: number; ticks: Ticks; spark: number[] }[] = [
+/** The day the scenes are set on, a Monday, and the time on the page: the
+    news ran and the brief was written before it, the earnings are later in
+    the week. */
+export const TODAY = new Date(2026, 9, 26, 10, 30);
+
+/** The session the index figures are for, as the index cards print it. */
+export const SESSION = `${TODAY.getMonth() + 1}/${TODAY.getDate()}`;
+
+/** The index cards: the symbol in the card's edge, the name beside it. Their
+    ticks run on DashboardGrid's script; the final signs are the static
+    design's (up, up, down, up, down). Each `spark` runs three points past
+    the seven on screen (see `Spark`). */
+export const INDICES: {
+  sym: string;
+  name: string;
+  prev: number;
+  ticks: Ticks;
+  spark: number[];
+}[] = [
   {
+    sym: 'GSPC',
     name: 'S&P 500',
     prev: 5820.1,
     ticks: [
@@ -47,6 +72,7 @@ export const INDICES: { name: string; prev: number; ticks: Ticks; spark: number[
     spark: [20, 22, 19, 18, 16, 17, 13, 12, 9, 8],
   },
   {
+    sym: 'NDX',
     name: 'Nasdaq 100',
     prev: 20480.55,
     ticks: [
@@ -56,6 +82,7 @@ export const INDICES: { name: string; prev: number; ticks: Ticks; spark: number[
     spark: [24, 21, 22, 18, 17, 14, 15, 11, 9, 6],
   },
   {
+    sym: 'DJI',
     name: 'Dow Jones',
     prev: 42810.2,
     ticks: [
@@ -65,6 +92,7 @@ export const INDICES: { name: string; prev: number; ticks: Ticks; spark: number[
     spark: [14, 12, 15, 13, 16, 14, 15, 17, 15, 17],
   },
   {
+    sym: 'RUT',
     name: 'Russell 2000',
     prev: 2268.4,
     ticks: [
@@ -74,6 +102,7 @@ export const INDICES: { name: string; prev: number; ticks: Ticks; spark: number[
     spark: [16, 19, 18, 21, 20, 18, 17, 18, 15, 13],
   },
   {
+    sym: 'VIX',
     name: 'VIX',
     prev: 16.12,
     ticks: [
@@ -144,7 +173,7 @@ function sparkLine(series: number[], slid: number, reach: number) {
  * starts slid to its last seven; each point that arrives slides the window a
  * step left. `stretch` fills its box (the index cards, no end dot); otherwise
  * the box keeps the 10:3 viewBox and the line ends on a dot, as the mini
- * chart tiles draw it.
+ * chart tiles draw it. The stroke is the cards' own weight at any size.
  */
 export function Spark({
   series,
@@ -175,7 +204,7 @@ export function Spark({
             points={points}
             fill="none"
             stroke={color}
-            strokeWidth="1"
+            strokeWidth="1.25"
             vectorEffect="non-scaling-stroke"
             strokeLinejoin="round"
             strokeLinecap="round"
@@ -308,95 +337,125 @@ export function Composer({
   );
 }
 
+
 /* ── widgets ───────────────────────────────────────────────────────────── */
 
-/** Edit mode draws every widget in a dashed accent frame. */
-const EDIT_FRAME: CSSProperties = {
-  borderStyle: 'dashed',
-  borderColor: 'var(--color-accent-primary)',
-};
+/** Page px per px of the real dashboard. The widgets are drawn with the
+    dashboard's own card classes at the app's size and scaled down to the
+    page, so they follow the reader's card style and theme as the real ones
+    do. Just over half: about the real page's columns at the width they
+    have on a laptop, with its figures still readable through the camera. */
+const REAL_SCALE = 0.55;
 
 /**
- * A widget on the grid. At rest it is the widget's own card: icon,
- * eyebrow and count (and `aside` at the right end) over the body. In edit mode the frame takes over: a
- * dashed accent edge and a header with the drag grip, the title and the
- * widget menu.
+ * Its children at the real dashboard's size, scaled down to the page's.
+ * Zoom rather than a transform, so the box keeps its place in the page's
+ * layout; and divided by the app's text scale, since the cards set their
+ * type in rem and the page's geometry, which the camera and pointer are
+ * measured in, must not move with it.
+ */
+export function Real({ className, children }: { className?: string; children: ReactNode }) {
+  return (
+    <div
+      className={className}
+      style={{ zoom: `calc(${REAL_SCALE} / var(--app-font-scale, 1))` }}
+    >
+      {children}
+    </div>
+  );
+}
+
+/** How far a row under a widget's tabs sits from where the default card
+    style puts it, in page px: Quiet sets the title inside the card, over
+    the body, and Terminal's tabs are a line of text rather than pills.
+    Pointer targets on a row add it. */
+const ROW_SHIFT: Record<CardStyle, number> = { balanced: 0, terminal: -2, quiet: 9.5 };
+
+/** The reader's card style, read once: it is set in Settings, never while
+    an intro plays. */
+export function useRowShift(): number {
+  const [style] = useState(getCardStyle);
+  return ROW_SHIFT[style];
+}
+
+/**
+ * A widget on the grid, drawn as `WidgetFrame` draws it: the chat's data
+ * card, its title set into the top edge (inside it, in Quiet), the widget's
+ * `sub` beside the title and its `meta` at the edge's far end. In edit mode
+ * the edge goes dashed in the accent, the drag grip comes before the title
+ * and the widget's actions after it. The cell's size is the caller's: the
+ * card fills it, and a body taller than the cell is cut off, as a real cell
+ * scrolls it.
  */
 export function Widget({
-  icon: Icon,
   title,
-  header = title,
-  count,
-  aside,
+  sub,
+  meta,
   edit = false,
   delay,
   className,
-  style,
   children,
 }: {
-  icon: LucideIcon;
   title: string;
-  /** What the widget's own card calls itself, when that differs from the
-      title the edit frame shows. */
-  header?: string;
-  count?: string;
-  /** What the widget's own card shows at the header's right end (its tabs,
-      its window). */
-  aside?: ReactNode;
+  sub?: ReactNode;
+  meta?: ReactNode;
   edit?: boolean;
   delay?: number;
   className?: string;
-  style?: CSSProperties;
   children?: ReactNode;
 }) {
-  const label = (
-    <span
-      className="truncate text-[6px] font-semibold uppercase leading-none"
-      style={{ color: 'var(--color-text-secondary)', letterSpacing: edit ? '0.06em' : '0.14em' }}
-    >
-      {edit ? title : header}
-    </span>
-  );
   return (
-    <Region
-      delay={delay}
-      className={cn('flex h-full min-w-0 flex-col overflow-hidden', !edit && 'p-1.5', className)}
-      style={edit ? { ...EDIT_FRAME, ...style } : style}
+    <div
+      className={cn('flex min-h-0 min-w-0 flex-col', delay != null && 'intro-rv', className)}
+      style={delay != null ? rv(delay) : undefined}
     >
-      {edit ? (
-        <div
-          className="flex h-4 shrink-0 items-center gap-1 border-b px-1"
-          style={{ borderColor: 'var(--color-border-muted)' }}
-        >
-          <GripVertical
-            className="h-2.5 w-2.5 shrink-0"
-            style={{ color: 'var(--color-text-tertiary)' }}
-          />
-          {label}
-          <MoreVertical
-            className="ml-auto h-2.5 w-2.5 shrink-0"
-            style={{ color: 'var(--color-text-tertiary)' }}
-          />
+      <Real className="min-h-0 flex-1">
+        <div className={cn('widget-frame', edit && 'widget-frame--edit')}>
+          <section className="term-card widget-card">
+            <header className="term-card-head" data-keep="title">
+              {edit && (
+                <span className="widget-card__grip">
+                  <GripVertical size={12} />
+                </span>
+              )}
+              <span className="term-card-title">
+                <span className="term-bracket">[</span>
+                <span className="term-card-title-text">{title}</span>
+                <span className="term-bracket">]</span>
+              </span>
+              {sub != null && <span className="term-card-sub">{sub}</span>}
+              {edit && (
+                <span className="widget-card__actions">
+                  <span className="widget-card__icon-btn">
+                    <Paperclip size={12} />
+                  </span>
+                  <span className="widget-card__icon-btn">
+                    <MoreVertical size={12} />
+                  </span>
+                </span>
+              )}
+              {meta != null && <span className="term-card-meta">{meta}</span>}
+            </header>
+            <div className="widget-card__body" style={{ overflow: 'hidden' }}>
+              <div className="h-full">{children}</div>
+            </div>
+          </section>
         </div>
-      ) : (
-        <div
-          className="mb-1 flex shrink-0 items-center gap-1 border-b pb-1"
-          style={{ borderColor: 'var(--color-border-muted)' }}
-        >
-          <Icon className="h-2 w-2 shrink-0" style={{ color: 'var(--color-text-tertiary)' }} />
+      </Real>
+    </div>
+  );
+}
+
+/** A widget's tabs, as its chips: `[Watchlist] [Holdings]`, the first one
+    picked. */
+export function Chips({ labels, picked = 0 }: { labels: string[]; picked?: number }) {
+  return (
+    <div className="dash-chips">
+      {labels.map((label, i) => (
+        <span key={label} className="term-chip" aria-pressed={i === picked}>
           {label}
-          {count && (
-            <span
-              className="font-mono text-[8px] leading-none tabular-nums"
-              style={{ color: 'var(--color-text-primary)' }}
-            >
-              {count}
-            </span>
-          )}
-          {aside && <span className="ml-auto flex shrink-0 items-center">{aside}</span>}
-        </div>
-      )}
-      <div className={cn('flex min-h-0 flex-1 flex-col gap-1', edit && 'p-1.5')}>{children}</div>
-    </Region>
+        </span>
+      ))}
+    </div>
   );
 }

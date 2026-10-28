@@ -80,25 +80,41 @@ const readRun = () => {
  *  frames after it. */
 async function framesAround(page, act, ms = 900) {
   await sampleFrames(page, readRun);
+  // A frame drawn before the answer, so the first sample is where it was.
+  await page.waitForFunction(() => window.__samples.length > 0);
   await act();
   await page.waitForFunction((after) => (window.__samples.at(-1)?.t ?? 0) > after, ms);
   return (await stopSampling(page)).filter((f) => f.run);
 }
 
 /**
- * How the run's height travelled: every frame's step, the whole way, and the
- * largest single step. A card swapped for its row by a cut moves the whole
- * way in one frame; a glide moves a share of it in each of many.
+ * Every answer here shrinks the run, so it glides on EASE_COLLAPSE for
+ * DURATION.fold (src/lib/motion.ts): 240ms, at its steepest 2.86 times its
+ * average pace, so never more than this share of the way in a millisecond.
+ */
+const PEAK_PACE = 2.857 / 240;
+
+/**
+ * How the run's height travelled: the whole way, how many frames drew it
+ * between where it was and where it went, and the fastest it went, as a share
+ * of the way per millisecond. A card swapped for its row by a cut has no frame
+ * between; a glide is on its curve's clock, so a frame that comes late moves
+ * it further but never faster.
  */
 function travel(frames) {
   const heights = frames.map((f) => f.height);
   const steps = heights.slice(1).map((h, i) => h - heights[i]);
   const total = heights[0] - heights.at(-1);
-  const moving = steps.filter((s) => Math.abs(s) > 0.5);
+  // The probe reads in an animation frame callback of its own, which can run
+  // before the tween's and read the height it drew a frame earlier, so a step
+  // took the longer of its own interval and the one before. Sampling starts
+  // at 0, which bounds the first sample's.
+  const times = [0, ...frames.map((f) => f.t)];
+  const took = steps.map((_, i) => Math.max(times[i + 2] - times[i + 1], times[i + 1] - times[i]));
   return {
     total,
-    frames: moving.length,
-    largest: Math.max(0, ...moving.map(Math.abs)),
+    between: heights.filter((h) => Math.abs(h - heights[0]) > 0.5 && Math.abs(h - heights.at(-1)) > 0.5).length,
+    pace: Math.max(0, ...steps.map((s, i) => Math.abs(s / total) / took[i])),
     // Against the way it goes: a box that grew back after it shrank.
     back: Math.max(0, ...steps.map((s) => (total > 0 ? s : -s))),
     tops: frames.map((f) => f.top),
@@ -107,13 +123,16 @@ function travel(frames) {
 
 function expectOneGlide(frames, label) {
   const t = travel(frames);
-  console.log(`${label}: ${t.total.toFixed(1)}px over ${t.frames} frames, largest step ${t.largest.toFixed(1)}px, back ${t.back.toFixed(2)}px`);
+  console.log(`${label}: ${t.total.toFixed(1)}px with ${t.between} frames between, at most ${(t.pace / PEAK_PACE).toFixed(2)}x the curve's steepest pace, back ${t.back.toFixed(2)}px`);
   // Something moved, the whole way, in one direction.
   expect(Math.abs(t.total)).toBeGreaterThan(20);
   expect(t.back).toBeLessThan(0.5);
-  // Over many frames, none of which carries much of it.
-  expect(t.frames).toBeGreaterThanOrEqual(5);
-  expect(t.largest).toBeLessThan(Math.abs(t.total) * 0.45);
+  // Drawn on its way, and never faster than its curve. Paced per millisecond
+  // rather than per frame: a busy page draws fewer frames, each further along.
+  // The headroom is the tween reading its clock later in the frame than the
+  // probe stamps it.
+  expect(t.between).toBeGreaterThanOrEqual(1);
+  expect(t.pace).toBeLessThan(PEAK_PACE * 1.5);
   // The run itself holds its place; only its height moves.
   expect(Math.max(...t.tops) - Math.min(...t.tops)).toBeLessThan(0.5);
 }

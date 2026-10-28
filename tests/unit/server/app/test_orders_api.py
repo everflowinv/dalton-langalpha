@@ -253,6 +253,24 @@ async def test_detail_carries_the_failure_and_the_timeline(client):
     assert body["decided_at"] and body["executed_at"] and body["completed_at"]
 
 
+@pytest.mark.parametrize(
+    "unlisted_at", [None, "2026-10-26T01:00:00+00:00"], ids=["named", "unlisted"]
+)
+async def test_a_handed_off_attempt_says_whether_the_vendor_named_its_end(
+    client, unlisted_at
+):
+    """The client tells "confirmed at the broker" from "left its list" by this.
+
+    A null has to arrive as a null rather than go missing: it is the vendor
+    having said how the order ended, and an absent field reads as not knowing.
+    """
+    row = _row(status="handed_off", mode="staged", unlisted_at=unlisted_at)
+    with patch(_GET, new=AsyncMock(return_value=row)):
+        body = (await client.get(f"/api/v1/orders/{_ATTEMPT}")).json()
+    assert "unlisted_at" in body
+    assert (body["unlisted_at"] is None) is (unlisted_at is None)
+
+
 async def test_an_attempt_without_a_normalized_order_still_answers(client):
     """An exercise or a cancel has no order shape, and must not 500."""
     with patch(_GET, new=AsyncMock(return_value=_row(order_json=None))):

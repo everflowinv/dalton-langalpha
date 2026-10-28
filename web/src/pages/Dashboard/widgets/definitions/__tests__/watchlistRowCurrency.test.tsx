@@ -49,7 +49,11 @@ function row(over: Partial<WatchlistRow>): WatchlistRow {
 function renderRow(item: WatchlistRow) {
   return render(
     <MemoryRouter>
-      <WatchlistRowItem item={item} marketStatus={null} />
+      <table>
+        <tbody>
+          <WatchlistRowItem item={item} marketStatus={null} />
+        </tbody>
+      </table>
     </MemoryRouter>,
   );
 }
@@ -113,23 +117,29 @@ describe('WatchlistRowItem price', () => {
     );
     expect(cardEl).toHaveTextContent('$317.28');
     expect(cardEl).not.toHaveTextContent('$320.76');
-    expect(cardEl).toHaveTextContent('-$3.48');
+    expect(cardEl.querySelector('td[title="-$3.48"]')).not.toBeNull();
     expect(cardEl).toHaveTextContent('-1.08%');
-    expect(cardEl).toHaveTextContent('$318.10 +0.26%');
+    expect(cardEl).toHaveTextContent('$318.10');
+    expect(cardEl).toHaveTextContent('+0.26%');
     unmount();
     mockDashboardCtx.watchlist = { rows: [], loading: false };
     mockDashboardCtx.dashboard = { marketStatus: null };
 
     const { container } = render(
       <MemoryRouter>
-        <WatchlistRowItem item={watchlistItem} marketStatus={afterHoursStatus} />
+        <table>
+          <tbody>
+            <WatchlistRowItem item={watchlistItem} marketStatus={afterHoursStatus} />
+          </tbody>
+        </table>
       </MemoryRouter>,
     );
     expect(container).toHaveTextContent('$317.28');
     expect(container).not.toHaveTextContent('$320.76');
-    expect(container).toHaveTextContent('-$3.48');
+    expect(container.querySelector('td[title="-$3.48"]')).not.toBeNull();
     expect(container).toHaveTextContent('-1.08%');
-    expect(container).toHaveTextContent('$318.10 +0.26%');
+    expect(container).toHaveTextContent('$318.10');
+    expect(container).toHaveTextContent('+0.26%');
   });
 
   // DALTON-HOOK(extended-hours-quotes): Lock GOOG pre-market display on PortfolioWatchlistWidget and WatchlistRowItem.
@@ -172,22 +182,28 @@ describe('WatchlistRowItem price', () => {
       </MemoryRouter>,
     );
     expect(cardEl).toHaveTextContent('$320.76');
-    expect(cardEl).toHaveTextContent('-$3.46');
+    expect(cardEl.querySelector('td[title="-$3.46"]')).not.toBeNull();
     expect(cardEl).toHaveTextContent('-1.07%');
-    expect(cardEl).toHaveTextContent('$322.26 +0.47%');
+    expect(cardEl).toHaveTextContent('$322.26');
+    expect(cardEl).toHaveTextContent('+0.47%');
     unmount();
     mockDashboardCtx.watchlist = { rows: [], loading: false };
     mockDashboardCtx.dashboard = { marketStatus: null };
 
     const { container } = render(
       <MemoryRouter>
-        <WatchlistRowItem item={watchlistItem} marketStatus={preMarketStatus} />
+        <table>
+          <tbody>
+            <WatchlistRowItem item={watchlistItem} marketStatus={preMarketStatus} />
+          </tbody>
+        </table>
       </MemoryRouter>,
     );
     expect(container).toHaveTextContent('$320.76');
-    expect(container).toHaveTextContent('-$3.46');
+    expect(container.querySelector('td[title="-$3.46"]')).not.toBeNull();
     expect(container).toHaveTextContent('-1.07%');
-    expect(container).toHaveTextContent('$322.26 +0.47%');
+    expect(container).toHaveTextContent('$322.26');
+    expect(container).toHaveTextContent('+0.47%');
   });
 
   // DALTON-HOOK(extended-hours-quotes): Regular-session display unchanged.
@@ -220,7 +236,7 @@ describe('WatchlistRowItem price', () => {
 
     // DALTON-HOOK(extended-hours-quotes): Assert regular session widget values.
     expect(cardEl).toHaveTextContent('$317.28');
-    expect(cardEl).toHaveTextContent('-$3.48');
+    expect(cardEl.querySelector('td[title="-$3.48"]')).not.toBeNull();
     expect(cardEl).toHaveTextContent('-1.08%');
     expect(cardEl).not.toHaveTextContent('$318.10');
     unmount();
@@ -229,11 +245,15 @@ describe('WatchlistRowItem price', () => {
 
     const { container } = render(
       <MemoryRouter>
-        <WatchlistRowItem item={regularItem} marketStatus={openStatus} />
+        <table>
+          <tbody>
+            <WatchlistRowItem item={regularItem} marketStatus={openStatus} />
+          </tbody>
+        </table>
       </MemoryRouter>,
     );
     expect(container).toHaveTextContent('$317.28');
-    expect(container).toHaveTextContent('-$3.48');
+    expect(container.querySelector('td[title="-$3.48"]')).not.toBeNull();
     expect(container).toHaveTextContent('-1.08%');
     expect(container).not.toHaveTextContent('$318.10');
   });
@@ -262,17 +282,22 @@ describe('WatchlistRowItem price', () => {
 
     const { container } = render(
       <MemoryRouter>
-        <PortfolioRowItem
-          item={portfolioItem}
-         
-          marketStatus={preMarketStatus}
-          valuesHidden={false}
-        />
+        <table>
+          <tbody>
+            <PortfolioRowItem
+              item={portfolioItem}
+              marketStatus={preMarketStatus}
+              valuesHidden={false}
+            />
+          </tbody>
+        </table>
       </MemoryRouter>,
     );
-    expect(container).toHaveTextContent('$320.76');
+    expect(container).toHaveTextContent('$3,207.60');
+    expect(container.querySelector('td[title="$320.76"]')).not.toBeNull();
     expect(container).toHaveTextContent('+6.92%');
-    expect(container).toHaveTextContent('$322.26 +0.47%');
+    expect(container).toHaveTextContent('$322.26');
+    expect(container).toHaveTextContent('+0.47%');
   });
 
   // DALTON-HOOK(extended-hours-quotes): Lock agent watchlistQuoteRow, markdown, and WatchlistWidget row label across after-hours, pre-market, and regular sessions.

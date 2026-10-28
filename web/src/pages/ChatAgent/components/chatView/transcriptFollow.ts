@@ -1,7 +1,7 @@
 import { useCallback, useEffectEvent, useLayoutEffect, useRef } from 'react';
 import { NEAR_BOTTOM_PX, createSettleWindow, isNearBottom } from '../../utils/scrollHelpers';
 import { anchorTop, findMessageElement, revealTop, type AnchorPart } from '../../utils/scrollDom';
-import { INTENT_EVENTS, createStreamFollow, towardStart, type StreamFollow, type StreamFollowControls } from './streamFollow';
+import { INTENT_EVENTS, RELEASE_EVENTS, createStreamFollow, movesView, towardStart, type StreamFollow, type StreamFollowControls } from './streamFollow';
 
 /**
  * A place the view is held on through the settle window, re-applied as the
@@ -135,8 +135,15 @@ export function createTranscriptFollow({
       const own = createStreamFollow(el, following);
       c = el;
       engine = own;
+      // Wherever the pointer or touch lifts: a scrollbar drag ends off the
+      // scroller too, and a window that loses focus mid-drag hears no lift.
+      const release = () => own.pressed(false);
+      for (const type of RELEASE_EVENTS) window.addEventListener(type, release, { capture: true, passive: true });
+      window.addEventListener('blur', release);
       return () => {
         own.stop();
+        for (const type of RELEASE_EVENTS) window.removeEventListener(type, release, { capture: true });
+        window.removeEventListener('blur', release);
         if (engine !== own) return;
         engine = null;
         c = null;
@@ -159,6 +166,10 @@ export function createTranscriptFollow({
     },
     intent(e) {
       engine?.stop();
+      if (movesView(e)) {
+        engine?.touched();
+        if (e.type === 'pointerdown' || e.type === 'touchstart') engine?.pressed(true);
+      }
       if (towardStart(e)) engine?.pulled();
       follow.unpin();
       tailing = false;

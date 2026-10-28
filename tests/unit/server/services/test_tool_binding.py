@@ -288,18 +288,40 @@ def test_a_staged_instruction_is_direct_and_asks_by_default():
     that skips approval the row can say otherwise; nothing on the row moves the
     binding."""
     vendor, tool = STAGED_ORDER
-    plan = resolve_plan(vendor, group_keys_for(vendor), BindingInputs())
+    # The staged rung without the live one, so the switch below is the only
+    # one asking.
+    granted = [key for key in group_keys_for(vendor) if key != "trading"]
+    plan = resolve_plan(vendor, granted, BindingInputs())
     assert _answer(plan.by_tool[tool]) == ("direct", "policy", True)
     assert tool in _asks(plan) and tool in plan.sandbox_excluded
     off = resolve_plan(
         vendor,
-        group_keys_for(vendor),
+        granted,
         BindingInputs(
             order_approval={**UNTOUCHED, "staged": False}, trading=TradingPermission.PLAN_FIRST
         ),
     )
     assert _asks(off) == frozenset()
     assert off.direct == plan.direct
+
+
+def test_ibkr_live_orders_take_the_direct_path_and_ask_beside_its_staged_ones():
+    """Both IBKR rungs are real money, and each keeps its own switch."""
+    vendor = "ibkr"
+    live = {t for t, e in _ORDER_TOOLS[vendor].items() if e.mode is OrderMode.LIVE}
+    assert live == {"submit_order", "modify_order", "cancel_order", "answer_order_question"}
+    plan = resolve_plan(vendor, group_keys_for(vendor), BindingInputs())
+    for tool in live:
+        assert _answer(plan.by_tool[tool]) == ("direct", "policy", True), tool
+        assert tool in plan.sandbox_excluded
+    off = resolve_plan(
+        vendor,
+        group_keys_for(vendor),
+        BindingInputs(
+            order_approval={**UNTOUCHED, "live": False}, trading=TradingPermission.PLAN_FIRST
+        ),
+    )
+    assert _asks(off) == {STAGED_ORDER[1], "delete_order_instruction"}
 
 
 def test_an_untouched_row_asks_for_real_money_and_not_for_paper():
@@ -313,8 +335,8 @@ def test_an_untouched_row_asks_for_real_money_and_not_for_paper():
 def test_only_the_modes_a_vendor_has_are_offered():
     assert order_modes(MOOMOO) == (OrderMode.LIVE, OrderMode.PAPER)
     assert order_modes("robinhood") == (OrderMode.LIVE,)
-    assert order_modes("ibkr") == (OrderMode.STAGED,)
-    assert order_modes("webull") == ()
+    assert order_modes("ibkr") == (OrderMode.LIVE, OrderMode.STAGED)
+    assert order_modes("webull") == (OrderMode.STAGED,)
     assert order_modes(None) == ()
 
 
@@ -739,3 +761,74 @@ class TestOrderToolsAreNeverBound:
         )
         assert [t["name"] for t in sandbox_tools] == ["get_positions"]
         assert direct is None
+
+    @pytest.mark.asyncio
+    async def test_default_grants_and_colleague_turns_never_expose_b10_live_order_tools(self):
+        # DALTON-HOOK(hide-trading): default capability grants exclude live order tools,
+        # and new users, existing users, and colleague-dispatched turns cannot bind them
+        from unittest.mock import patch
+
+        from src.server.services.brokerage_capabilities import (
+            _CURATION,
+            _ORDER_TOOLS,
+            denied_tools,
+            effective_capabilities,
+            groups_for,
+        )
+        from src.server.services.egress.direct_tools import prepare_direct_mcp_tools
+        from src.server.services.mcp_tool_split import DirectServerTools, DirectTool
+
+        for vendor, groups_map in _CURATION.items():
+            live_trading_tools = frozenset(t.lower() for t in groups_map.get("trading", ()))
+            vendor_order_tools = frozenset(t.lower() for t in _ORDER_TOOLS.get(vendor, ()))
+
+            assert effective_capabilities(vendor, ()) == ()
+            unset_denied = denied_tools(vendor, ()) or frozenset()
+            assert live_trading_tools <= unset_denied
+            assert vendor_order_tools <= unset_denied
+
+            default_keys = [g.key for g in groups_for(vendor) if g.tone != "danger"]
+            assert "trading" not in default_keys
+            assert "trading" not in effective_capabilities(vendor, default_keys)
+            default_denied = denied_tools(vendor, default_keys) or frozenset()
+            assert live_trading_tools <= default_denied
+
+        inputs = BindingInputs(overrides={"get_positions": "direct"})
+        by_server = {
+            "ibkr": DirectServerTools(
+                vendor="ibkr",
+                tools=(
+                    DirectTool(
+                        schema={"name": "submit_order", "description": "submit", "input_schema": {}},
+                        resolved=resolve_tool("ibkr", "submit_order", inputs),
+                    ),
+                    DirectTool(
+                        schema={"name": "modify_order", "description": "modify", "input_schema": {}},
+                        resolved=resolve_tool("ibkr", "modify_order", inputs),
+                    ),
+                    DirectTool(
+                        schema={"name": "cancel_order", "description": "cancel", "input_schema": {}},
+                        resolved=resolve_tool("ibkr", "cancel_order", inputs),
+                    ),
+                    DirectTool(
+                        schema={"name": "answer_order_question", "description": "confirm", "input_schema": {}},
+                        resolved=resolve_tool("ibkr", "answer_order_question", inputs),
+                    ),
+                    DirectTool(
+                        schema={"name": "get_positions", "description": "positions", "input_schema": {}},
+                        resolved=resolve_tool("ibkr", "get_positions", inputs),
+                    ),
+                ),
+            )
+        }
+        with patch("src.server.services.egress.direct_tools.EGRESS_RELAY_SECRET", "test-secret-key-32-bytes-long-00"):
+            for owner_id, caller_id in (("u-new", "u-new"), ("u-owner", "u-colleague")):
+                binding = await prepare_direct_mcp_tools(
+                    user_id=owner_id,
+                    owner_user_id=owner_id,
+                    caller_user_id=caller_id,
+                    workspace_id="ws-1",
+                    grants={"ibkr": "grant-token"},
+                    by_server=by_server,
+                )
+                assert [t.name for t in binding.tools] == ["mcp__ibkr__get_positions"]

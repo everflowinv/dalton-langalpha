@@ -287,6 +287,14 @@ export function orderOutcomeLabel(order: WakeupOrder, t: TFunction, locale: stri
       return t('chat.wakeups.orderRejected', { order: name });
     case 'failed':
       return t('chat.wakeups.orderFailed', { order: name });
+    case 'partial_expired':
+      return t('chat.wakeups.orderPartialExpired', quantities);
+    case 'expired':
+      return t('chat.wakeups.orderExpired', { order: name });
+    case 'confirmed':
+      return t('chat.wakeups.orderConfirmed', { order: name });
+    case 'handed_off':
+      return t('chat.wakeups.orderHandedOff', { order: name });
     default:
       return null;
   }

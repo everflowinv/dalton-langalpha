@@ -44,6 +44,7 @@ export type OrderStatus =
   | 'partially_filled'
   | 'filled'
   | 'cancelled'
+  | 'expired'
   | 'rejected_by_vendor'
   | 'handed_off'
   | 'failed'
@@ -61,6 +62,7 @@ export const ORDER_STATUSES: readonly OrderStatus[] = [
   'partially_filled',
   'filled',
   'cancelled',
+  'expired',
   'rejected_by_vendor',
   'handed_off',
   'failed',

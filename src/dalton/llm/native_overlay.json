@@ -999,7 +999,7 @@
       "supports_reasoning_effort": false,
       "tool_calling": true
     },
-    "gpt-5.6-terra": {
+    "gpt-6.1-terra": {
       "family": "openai-gpt",
       "billing": "cash",
       "tool_calling": true
@@ -1154,7 +1154,12 @@
       "billing": "cash",
       "tool_calling": true
     },
-    "kimi-k3": {
+    "kimi-k3.1-pro": {
+      "family": "moonshot-kimi",
+      "billing": "cash",
+      "tool_calling": true
+    },
+    "kimi-k3.1-pro-highspeed": {
       "family": "moonshot-kimi",
       "billing": "cash",
       "tool_calling": true
@@ -1169,11 +1174,11 @@
       "billing": "subscription",
       "tool_calling": true
     },
-    "gpt-5.6-terra-oauth": {
+    "gpt-6.1-terra-oauth": {
       "family": "openai-gpt",
       "billing": "subscription",
       "tool_calling": true,
-      "notional_ref": "gpt-5.6-terra"
+      "notional_ref": "gpt-6.1-terra"
     },
     "gpt-6-astra-oauth": {
       "family": "openai-gpt",

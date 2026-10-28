@@ -50,7 +50,7 @@ URLS = {
 TRADES = {
     "moomoo": ("account", "trading", "paper_trading"),
     "robinhood": ("account", "trading"),
-    "ibkr": ("account", "staged_orders"),
+    "ibkr": ("account", "staged_orders", "trading"),
 }
 
 
@@ -130,6 +130,14 @@ def test_a_brokerage_whose_switch_asks_is_named_under_a_level_that_does_not():
     assert profile["trading_permission"] == "autonomous"
     assert profile["trading_asks_on"] == ["moomoo"]
     assert f"Orders through moomoo {STILL_ASKS}" in _section(profile)
+
+
+def test_an_ibkr_live_switch_that_asks_is_named_on_its_own():
+    """IBKR's live orders keep a switch apart from its staged ones, and the
+    rule names the brokerage when only the live one still asks."""
+    profile = _profile(_resolved(ibkr=_plan("ibkr", AUTONOMOUS, live=True)))
+    assert profile["trading_asks_on"] == ["ibkr"]
+    assert f"Orders through ibkr {STILL_ASKS}" in _section(profile)
 
 
 def test_nothing_is_named_when_every_brokerage_follows_the_level():

@@ -74,3 +74,16 @@ describe('ChatInput: send() on the handle', () => {
     expect(onSend).not.toHaveBeenCalled();
   });
 });
+
+describe('ChatInput: Enter under an IME', () => {
+  it('leaves the draft alone when Enter commits a composition', () => {
+    const { box, onSend } = renderInput();
+    fireEvent.change(box, { target: { value: '帮我看看 NVDA' } });
+    fireEvent.keyDown(box, { key: 'Enter', isComposing: true });
+    fireEvent.keyDown(box, { key: 'Enter', keyCode: 229 });
+    expect(onSend).not.toHaveBeenCalled();
+    expect(box.value).toBe('帮我看看 NVDA');
+    fireEvent.keyDown(box, { key: 'Enter' });
+    expect(onSend).toHaveBeenCalledTimes(1);
+  });
+});

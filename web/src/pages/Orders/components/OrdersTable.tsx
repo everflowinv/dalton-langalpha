@@ -76,10 +76,12 @@ function OrderRow({
   const sideKey = summary?.side ? ORDER_SIDE_KEY[summary.side] : undefined;
   const typeKey = summary?.order_type ? ORDER_TYPE_KEY[summary.order_type] : undefined;
   const orderType = typeKey ? t(typeKey) : (summary?.order_type ?? '');
+  const bare = !summary?.instrument && !summary?.side && !size && !price && !orderType;
 
   return (
     <tr
-      className="orders-row"
+      role="row"
+      className={bare ? 'orders-row orders-row-bare' : 'orders-row'}
       data-no-drag
       tabIndex={0}
       data-testid={`order-row-${order.attempt_id}`}
@@ -91,13 +93,13 @@ function OrderRow({
         }
       }}
     >
-      <td className="orders-cell orders-cell-time">
+      <td role="cell" className="orders-cell orders-cell-time">
         {formatOrderTime(order.created_at, locale) || NONE}
       </td>
-      <td className="orders-cell orders-cell-mode">
+      <td role="cell" className="orders-cell orders-cell-mode">
         <OrderModeBadge mode={order.mode} />
       </td>
-      <td className="orders-cell">
+      <td role="cell" className="orders-cell orders-cell-vendor">
         <div className="flex flex-col">
           <span>{order.vendor}</span>
           {order.account_ref && (
@@ -110,7 +112,7 @@ function OrderRow({
           )}
         </div>
       </td>
-      <td className="orders-cell">
+      <td role="cell" className="orders-cell orders-cell-action">
         <div className="flex flex-col">
           <span>{actionKey ? t(actionKey) : order.action || NONE}</span>
           {targetRef && (
@@ -118,14 +120,14 @@ function OrderRow({
           )}
         </div>
       </td>
-      <td className="orders-cell orders-cell-instrument">
+      <td role="cell" className="orders-cell orders-cell-instrument">
         {instrumentLabel(summary?.instrument) || NONE}
       </td>
-      <td className="orders-cell">
+      <td role="cell" className="orders-cell orders-cell-side">
         {sideKey ? t(sideKey) : summary?.side || NONE}
       </td>
-      <td className="orders-cell orders-num">{size || NONE}</td>
-      <td className="orders-cell orders-num">
+      <td role="cell" className="orders-cell orders-num orders-cell-size">{size || NONE}</td>
+      <td role="cell" className="orders-cell orders-num orders-cell-price">
         <div className="flex flex-col items-end">
           <span>
             {orderType || price ? [orderType, price].filter(Boolean).join(' ') : NONE}
@@ -140,11 +142,12 @@ function OrderRow({
           )}
         </div>
       </td>
-      <td className="orders-cell orders-cell-status">
+      <td role="cell" className="orders-cell orders-cell-status">
         <OrderStatusPill
           status={order.status}
           mode={order.mode}
           vendorLabel={vendorLabel}
+          unlistedAt={order.unlisted_at}
         />
       </td>
     </tr>
@@ -168,22 +171,22 @@ export function OrdersTable({
   const { t } = useTranslation();
   return (
     <div className="orders-table-scroll">
-      <table className="orders-table">
+      <table className="orders-table" role="table">
         <colgroup>
           {COLUMNS.map((col) => (
             <col key={col.key} style={{ width: col.width }} />
           ))}
         </colgroup>
-        <thead>
-          <tr>
+        <thead role="rowgroup">
+          <tr role="row">
             {COLUMNS.map((col) => (
-              <th key={col.key} className="orders-head">
+              <th key={col.key} className="orders-head" role="columnheader">
                 {t(col.key)}
               </th>
             ))}
           </tr>
         </thead>
-        <tbody>
+        <tbody role="rowgroup">
           {orders.map((order) => (
             <OrderRow
               key={order.attempt_id}

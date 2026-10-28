@@ -444,8 +444,8 @@ function ToolSectionBlock({
       ) : (
         <div className="flex flex-col gap-1">
           {section.tools.map((tool) => (
-            <div key={tool.name} className="flex items-start justify-between gap-2">
-              <div className="flex items-start gap-2 min-w-0">
+            <div key={tool.name} className="flex flex-wrap items-start justify-between gap-x-2 gap-y-1">
+              <div className="flex items-start gap-2 shrink-0 max-w-full">
                 {selection && (
                   <span className="pt-0.5 inline-flex">
                     <ToolRowCheckbox tool={tool} selection={selection} />
@@ -467,7 +467,7 @@ function ToolChip({ tool, dimmed }: { tool: McpToolSummary; dimmed: boolean }) {
   return (
     <span
       title={tool.description || undefined}
-      className="text-[0.625rem] px-1.5 py-0.5 rounded break-all"
+      className="text-[0.625rem] px-1.5 py-0.5 rounded break-all min-w-0"
       style={{
         color: dimmed ? 'var(--color-text-quaternary)' : 'var(--color-text-tertiary)',
         backgroundColor: 'var(--color-bg-tag)',

@@ -106,6 +106,11 @@ class OrderAttempt(BaseModel):
     parent_attempt_id: str | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
+    # When a complete vendor listing first lacked this order. An end the
+    # vendor named in its own listing clears it and an end founded on the
+    # order leaving the list keeps it, so on a handed-off attempt it says
+    # whether the vendor ever told us how the order ended.
+    unlisted_at: datetime | None = None
 
 
 class OrderAttemptList(BaseModel):
@@ -172,6 +177,7 @@ def attempt_row_to_response(row: dict[str, Any]) -> OrderAttempt:
         parent_attempt_id=_opt_str(row.get("parent_attempt_id")),
         created_at=row.get("created_at"),
         updated_at=row.get("updated_at"),
+        unlisted_at=row.get("unlisted_at"),
     )
 
 
@@ -236,6 +242,7 @@ def receipt_from_attempt(
                 "decision_message": attempt.decision_message,
                 "executed_at": _iso(attempt.executed_at),
                 "completed_at": _iso(attempt.completed_at),
+                "unlisted_at": _iso(attempt.unlisted_at),
             },
         },
     }

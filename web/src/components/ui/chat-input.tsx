@@ -15,6 +15,7 @@ import { useQuickAccessModels } from '@/hooks/useQuickAccessModels';
 import { useSeededModel } from '@/hooks/useSeededModel';
 import { ChatInputRegistry, ContextBus } from '@/lib/contextBus';
 import { AnimatePresence } from '@/lib/framer';
+import { isImeComposing } from '@/lib/ime';
 import { cn } from '@/lib/utils';
 import type { WidgetContextSnapshot } from '@/pages/Dashboard/widgets/framework/contextSnapshot';
 import './chat-input.css';
@@ -637,6 +638,8 @@ function ChatInput({
     if (isListening && (e.key.length === 1 || e.key === 'Backspace' || e.key === 'Delete')) {
       stopListening();
     }
+
+    if (isImeComposing(e)) return;
 
     // An open autocomplete owns the navigation keys (slash menu first — it
     // suppresses the mention menu while active).

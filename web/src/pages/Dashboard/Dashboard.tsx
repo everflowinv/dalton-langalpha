@@ -9,6 +9,7 @@ import InsightDetailModal from './components/InsightDetailModal';
 import AddWatchlistItemDialog from './components/AddWatchlistItemDialog';
 import AddPortfolioHoldingDialog from './components/AddPortfolioHoldingDialog';
 import ChatInputCard from './components/ChatInputCard';
+import { FormCard } from './components/FormCard';
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '../../components/ui/dialog';
 import { Input } from '../../components/ui/input';
 import { DashboardDataProvider, useDashboardContext } from './widgets/framework/DashboardDataContext';
@@ -238,6 +239,7 @@ function DashboardPage() {
 
       {/* Reset confirmation */}
       <ConfirmDialog
+        surface="page"
         open={resetConfirmOpen}
         title={t('dashboard.widgets.shell.resetTitle')}
         message={t('dashboard.widgets.shell.resetMessage')}
@@ -275,34 +277,28 @@ function DashboardPage() {
       {/* Widget settings */}
       {settingsInstance && SettingsComp && (
         <Dialog open={!!settingsFor} onOpenChange={(open) => !open && setSettingsFor(null)}>
-          <DialogContent
-            className="sm:max-w-md"
-            style={{
-              backgroundColor: 'var(--color-bg-elevated)',
-              borderColor: 'var(--color-border-elevated)',
-            }}
-          >
-            <DialogHeader>
-              <DialogTitle style={{ color: 'var(--color-text-primary)' }}>
-                {t('dashboard.widgets.shell.settingsDialogTitle', {
-                  title: settingsDef?.titleKey ? t(settingsDef.titleKey) : '',
-                })}
+          <DialogContent className="dash-form sm:max-w-md">
+            <DialogHeader className="text-left">
+              <DialogTitle className="title-font" style={{ color: 'var(--color-text-primary)' }}>
+                {settingsDef?.titleKey ? t(settingsDef.titleKey) : ''}
               </DialogTitle>
             </DialogHeader>
-            <SettingsComp
-              config={settingsInstance.config}
-              onChange={(patch: Partial<unknown>) => {
-                update((prev) => ({
-                  ...prev,
-                  widgets: prev.widgets.map((w) =>
-                    w.id === settingsInstance.id
-                      ? { ...w, config: { ...(w.config as object), ...(patch as object) } }
-                      : w
-                  ),
-                }));
-              }}
-              onClose={() => setSettingsFor(null)}
-            />
+            <FormCard title={t('dashboard.widgets.frame.settingsTitle')}>
+              <SettingsComp
+                config={settingsInstance.config}
+                onChange={(patch: Partial<unknown>) => {
+                  update((prev) => ({
+                    ...prev,
+                    widgets: prev.widgets.map((w) =>
+                      w.id === settingsInstance.id
+                        ? { ...w, config: { ...(w.config as object), ...(patch as object) } }
+                        : w
+                    ),
+                  }));
+                }}
+                onClose={() => setSettingsFor(null)}
+              />
+            </FormCard>
           </DialogContent>
         </Dialog>
       )}
@@ -318,6 +314,7 @@ function DashboardPage() {
         onClose={modals.closeInsight}
       />
       <ConfirmDialog
+        surface="page"
         open={modals.deleteConfirm.open}
         title={modals.deleteConfirm.title}
         message={modals.deleteConfirm.message}
@@ -328,80 +325,60 @@ function DashboardPage() {
 
       {/* Portfolio Edit Dialog */}
       <Dialog open={!!portfolio.editRow} onOpenChange={(open) => !open && portfolio.openEdit(null)}>
-        <DialogContent
-          className="sm:max-w-sm border"
-          style={{ backgroundColor: 'var(--color-bg-elevated)', borderColor: 'var(--color-border-elevated)' }}
-        >
-          <DialogHeader>
+        <DialogContent className="dash-form sm:max-w-sm">
+          <DialogHeader className="text-left">
             <DialogTitle className="title-font" style={{ color: 'var(--color-text-primary)' }}>
-              {t('dashboard.widgets.shell.editHoldingTitle', { symbol: portfolio.editRow?.symbol ?? '' })}
+              {t('dashboard.widgets.shell.editHolding')}
+              {/* The symbol is the card's title; the dialog's name says it too. */}
+              <span className="sr-only"> {portfolio.editRow?.symbol ?? ''}</span>
             </DialogTitle>
           </DialogHeader>
-          <div
-            className="grid gap-3 py-2"
-            onKeyDown={(e) => {
-              if (e.key === 'Enter') {
-                e.preventDefault();
-                portfolio.handleUpdate?.();
-              }
-            }}
-          >
-            <div>
-              <label className="text-xs block mb-1" style={{ color: 'var(--color-text-secondary)' }}>
-                {t('dashboard.widgets.shell.quantityLabel')}
+          <FormCard title={<span className="term-code">{portfolio.editRow?.symbol ?? ''}</span>}>
+            <div
+              className="grid gap-3"
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  e.preventDefault();
+                  portfolio.handleUpdate?.();
+                }
+              }}
+            >
+              <label className="block">
+                <span className="term-label dash-form-label">{t('dashboard.widgets.shell.quantityLabel')}</span>
+                <Input
+                  type="number"
+                  min="0"
+                  step="any"
+                  placeholder={t('dashboard.widgets.shell.quantityPlaceholder')}
+                  value={portfolio.editForm.quantity ?? ''}
+                  onChange={(e) => portfolio.setEditForm?.({ ...portfolio.editForm, quantity: e.target.value })}
+                  className="dash-form-input dash-form-figure border"
+                />
               </label>
-              <Input
-                type="number"
-                min="0"
-                step="any"
-                placeholder={t('dashboard.widgets.shell.quantityPlaceholder')}
-                value={portfolio.editForm.quantity ?? ''}
-                onChange={(e) => portfolio.setEditForm?.({ ...portfolio.editForm, quantity: e.target.value })}
-                className="border"
-                style={{
-                  backgroundColor: 'var(--color-bg-card)',
-                  borderColor: 'var(--color-border-default)',
-                  color: 'var(--color-text-primary)',
-                }}
-              />
-            </div>
-            <div>
-              <label className="text-xs block mb-1" style={{ color: 'var(--color-text-secondary)' }}>
-                {t('dashboard.widgets.shell.averageCostLabel')}
+              <label className="block">
+                <span className="term-label dash-form-label">{t('dashboard.widgets.shell.averageCostLabel')}</span>
+                <Input
+                  type="number"
+                  min="0"
+                  step="any"
+                  placeholder={t('dashboard.widgets.shell.averageCostPlaceholder')}
+                  value={portfolio.editForm.averageCost ?? ''}
+                  onChange={(e) => portfolio.setEditForm?.({ ...portfolio.editForm, averageCost: e.target.value })}
+                  className="dash-form-input dash-form-figure border"
+                />
               </label>
-              <Input
-                type="number"
-                min="0"
-                step="any"
-                placeholder={t('dashboard.widgets.shell.averageCostPlaceholder')}
-                value={portfolio.editForm.averageCost ?? ''}
-                onChange={(e) => portfolio.setEditForm?.({ ...portfolio.editForm, averageCost: e.target.value })}
-                className="border"
-                style={{
-                  backgroundColor: 'var(--color-bg-card)',
-                  borderColor: 'var(--color-border-default)',
-                  color: 'var(--color-text-primary)',
-                }}
-              />
-            </div>
-            <div>
-              <label className="text-xs block mb-1" style={{ color: 'var(--color-text-secondary)' }}>
-                {t('dashboard.widgets.shell.notesLabel')}
+              <label className="block">
+                <span className="term-label dash-form-label">{t('dashboard.widgets.shell.notesLabel')}</span>
+                <Input
+                  placeholder={t('dashboard.widgets.shell.notesPlaceholder')}
+                  value={portfolio.editForm.notes ?? ''}
+                  onChange={(e) => portfolio.setEditForm?.({ ...portfolio.editForm, notes: e.target.value })}
+                  className="dash-form-input border"
+                />
               </label>
-              <Input
-                placeholder={t('dashboard.widgets.shell.notesPlaceholder')}
-                value={portfolio.editForm.notes ?? ''}
-                onChange={(e) => portfolio.setEditForm?.({ ...portfolio.editForm, notes: e.target.value })}
-                className="border"
-                style={{
-                  backgroundColor: 'var(--color-bg-card)',
-                  borderColor: 'var(--color-border-default)',
-                  color: 'var(--color-text-primary)',
-                }}
-              />
             </div>
-          </div>
-          <div className="flex justify-end gap-2 pt-2">
+          </FormCard>
+          <div className="flex justify-end gap-2">
             <button
               type="button"
               onClick={() => portfolio.openEdit(null)}

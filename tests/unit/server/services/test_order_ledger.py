@@ -10,6 +10,7 @@ Account ids are invented; a fixture never carries a real one.
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
@@ -18,8 +19,9 @@ import pytest
 from langchain_core.messages import ToolMessage
 
 from ptc_agent.agent.middleware.order_governance import RECEIPT_KEY
+from src.server.database.order_attempts import CONFIRM_TOKEN_KEY
 from src.server.models.orders import attempt_row_to_response, receipt_from_attempt
-from src.server.services.brokerage_orders import OrderOutcome
+from src.server.services.brokerage_orders import BrokerOrder, OrderOutcome, adapter_for
 from src.server.services.brokerage_orders.models import TERMINAL_STATUSES
 from src.server.services.egress import order_ledger as module
 from src.server.services.egress.order_ledger import OrderAttemptLedger
@@ -461,3 +463,293 @@ async def test_a_placement_names_no_order_and_so_has_no_parent(monkeypatch):
     assert written["parent_attempt_id"] is None
     # A call is its message and its id together, never the provider's id alone.
     assert (written["message_id"], written["tool_call_id"]) == ("msg-3", "call-3")
+
+
+# -- a confirm, linked to the call that raised it ----------------------------
+
+
+class _ChainDb:
+    """``order_attempts`` in memory, with the statements a confirm chain rests on.
+
+    Each one mirrors its SQL: the creating-action filter on the id lookup, the
+    token kept in ``route`` and resolved to the chain's root, the guard on the
+    completing write, and the hand-up that writes only an empty id. The SQL
+    text itself is pinned in ``test_order_confirm_chain.py``.
+    """
+
+    def __init__(self) -> None:
+        self.rows: dict[str, dict[str, Any]] = {}
+
+    def install(self, monkeypatch) -> None:
+        for name in (
+            "insert_attempt",
+            "get_attempt",
+            "complete_attempt",
+            "latest_attempt_for_vendor_order",
+            "latest_attempt_for_confirm_token",
+        ):
+            monkeypatch.setattr(module, name, getattr(self, name))
+
+    async def insert_attempt(self, **kwargs: Any) -> dict[str, Any]:
+        attempt_id = f"00000000-0000-4000-8000-{len(self.rows) + 1:012d}"
+        row = {
+            **_row(vendor=kwargs["vendor"], tool=kwargs["tool"], args=kwargs["args"]),
+            "attempt_id": attempt_id,
+            "user_id": kwargs["user_id"],
+            "tool_call_id": kwargs["tool_call_id"],
+            "action": kwargs["action"],
+            "mode": kwargs["mode"],
+            "account_ref": kwargs["account_ref"],
+            "order_json": kwargs["order"],
+            "approval_required": kwargs["approval_required"],
+            "status": str(kwargs["status"]),
+            "parent_attempt_id": kwargs["parent_attempt_id"],
+            "created_at": len(self.rows),
+        }
+        self.rows[attempt_id] = row
+        return dict(row)
+
+    async def get_attempt(self, attempt_id: str) -> dict[str, Any] | None:
+        row = self.rows.get(attempt_id)
+        return dict(row) if row else None
+
+    async def complete_attempt(
+        self, attempt_id: str, outcome: OrderOutcome, result_sha256: str | None = None
+    ) -> dict[str, Any] | None:
+        row = self.rows[attempt_id]
+        if row["status"] != "submitting":
+            return None
+        route = dict(outcome.route)
+        if outcome.confirm_token:
+            route[CONFIRM_TOKEN_KEY] = outcome.confirm_token
+        row["status"] = str(outcome.status)
+        row["vendor_order_id"] = outcome.vendor_order_id or row["vendor_order_id"]
+        row["route"] = route or row["route"]
+        row["failure"] = outcome.failure.to_json() if outcome.failure else None
+        root = self.rows.get(row["parent_attempt_id"] or "")
+        if (
+            row["action"] == "confirm"
+            and root is not None
+            and root["user_id"] == row["user_id"]
+            and root["vendor_order_id"] is None
+            and (row["vendor_order_id"] or "").strip()
+        ):
+            root["vendor_order_id"] = row["vendor_order_id"]
+        return dict(row)
+
+    def _newest(self, user_id, vendor, account_ref, keep) -> dict[str, Any] | None:
+        found = [
+            r
+            for r in self.rows.values()
+            if (r["user_id"], r["vendor"], r["account_ref"]) == (user_id, vendor, account_ref)
+            and keep(r)
+        ]
+        return max(found, key=lambda r: r["created_at"]) if found else None
+
+    async def latest_attempt_for_vendor_order(
+        self, user_id, vendor, vendor_order_id, *, account_ref
+    ) -> str | None:
+        row = self._newest(
+            user_id,
+            vendor,
+            account_ref,
+            lambda r: r["vendor_order_id"] == vendor_order_id
+            and r["action"] in ("place", "stage"),
+        )
+        return row["attempt_id"] if row else None
+
+    async def latest_attempt_for_confirm_token(
+        self, user_id, vendor, confirm_token, *, account_ref
+    ) -> str | None:
+        row = self._newest(
+            user_id,
+            vendor,
+            account_ref,
+            lambda r: (r["route"] or {}).get(CONFIRM_TOKEN_KEY) == confirm_token,
+        )
+        if row is None:
+            return None
+        if row["action"] == "confirm" and row["parent_attempt_id"]:
+            return row["parent_attempt_id"]
+        return row["attempt_id"]
+
+
+async def _call(
+    db: _ChainDb,
+    ledger: OrderAttemptLedger,
+    vendor: str,
+    tool: str,
+    action: str,
+    args: dict[str, Any],
+    answer: Any,
+) -> dict[str, Any]:
+    """One order call proposed, executed and answered, as its turn runs it."""
+    stamp = {
+        "server": vendor,
+        "tool": tool,
+        "vendor": vendor,
+        "approval": False,
+        "order": {"action": action, "mode": "live"},
+    }
+    proposed = await ledger.propose(
+        f"msg-{len(db.rows)}", f"call-{len(db.rows)}", tool, stamp, args
+    )
+    # The consume, which only moves the row on.
+    db.rows[proposed.attempt_id]["status"] = "submitting"
+    await ledger.complete(
+        proposed.attempt_id,
+        ToolMessage(content=json.dumps(answer), tool_call_id="call"),
+    )
+    return db.rows[proposed.attempt_id]
+
+
+IBKR_SUBMIT = {
+    "contract_id_ex": "7712345",
+    "side": "BUY",
+    "order_type": "LIMIT",
+    "tif": "DAY",
+    "size": 1,
+    "limit_price": 1,
+}
+IBKR_ORDER_ID = "5001001"
+
+
+def _question(question_id: str) -> dict[str, Any]:
+    return {
+        "pending_question": {"question_id": question_id, "answers": ["Yes", "No"]},
+        "correlation_id": "c-8001",
+    }
+
+
+def _answer(question_id: str) -> dict[str, Any]:
+    return {"question_id": question_id, "value": "Yes", "correlation_id": "c-8001"}
+
+
+IBKR_RELEASED = {
+    "pending_question": None,
+    "correlation_id": "c-8001",
+    "order_id": IBKR_ORDER_ID,
+    "order_status": "NEW",
+}
+
+
+@pytest.fixture
+def chain(monkeypatch) -> tuple[_ChainDb, OrderAttemptLedger]:
+    db = _ChainDb()
+    db.install(monkeypatch)
+    return db, OrderAttemptLedger(user_id="u1", thread_id="t1")
+
+
+@pytest.mark.asyncio
+async def test_an_answer_is_written_against_the_submit_that_raised_its_question(chain):
+    """The answer names a question and no order, so the token is the only link."""
+    db, ledger = chain
+    submit = await _call(
+        db, ledger, "ibkr", "submit_order", "place", IBKR_SUBMIT, _question("q-1")
+    )
+    assert submit["status"] == "pending_confirm"
+    assert submit["route"][CONFIRM_TOKEN_KEY] == "q-1"
+
+    answer = await _call(
+        db, ledger, "ibkr", "answer_order_question", "confirm", _answer("q-1"),
+        IBKR_RELEASED,
+    )
+
+    assert answer["parent_attempt_id"] == submit["attempt_id"]
+
+
+@pytest.mark.asyncio
+async def test_a_chain_of_questions_parents_to_the_call_that_started_it(chain):
+    db, ledger = chain
+    submit = await _call(
+        db, ledger, "ibkr", "submit_order", "place", IBKR_SUBMIT, _question("q-1")
+    )
+    first = await _call(
+        db, ledger, "ibkr", "answer_order_question", "confirm", _answer("q-1"),
+        _question("q-2"),
+    )
+    second = await _call(
+        db, ledger, "ibkr", "answer_order_question", "confirm", _answer("q-2"),
+        IBKR_RELEASED,
+    )
+
+    # The second question was raised by the first answer, and still the chain
+    # reads as the submit's history rather than the answer's.
+    assert first["route"][CONFIRM_TOKEN_KEY] == "q-2"
+    assert first["parent_attempt_id"] == submit["attempt_id"]
+    assert second["parent_attempt_id"] == submit["attempt_id"]
+
+
+@pytest.mark.asyncio
+async def test_the_order_a_confirm_releases_lands_on_its_submit_for_the_read(chain):
+    """Only the answer learns the id; the submit is what the sweep reads."""
+    db, ledger = chain
+    submit = await _call(
+        db, ledger, "ibkr", "submit_order", "place", IBKR_SUBMIT, _question("q-1")
+    )
+    assert submit["vendor_order_id"] is None
+    await _call(
+        db, ledger, "ibkr", "answer_order_question", "confirm", _answer("q-1"),
+        IBKR_RELEASED,
+    )
+
+    assert submit["vendor_order_id"] == IBKR_ORDER_ID
+    # Its state is the read's to settle, not the hand-up's.
+    assert submit["status"] == "pending_confirm"
+    query = adapter_for("ibkr").status_query(
+        BrokerOrder.from_json(submit["order_json"]),
+        vendor_order_id=submit["vendor_order_id"],
+    )
+    assert query is not None
+    assert (query.tool, query.args) == ("get_order_status", {"order_id": IBKR_ORDER_ID})
+
+
+@pytest.mark.asyncio
+async def test_an_id_the_submit_already_holds_is_never_replaced(chain):
+    db, ledger = chain
+    submit = await _call(
+        db, ledger, "ibkr", "submit_order", "place", IBKR_SUBMIT,
+        {**_question("q-1"), "order_id": "5001000"},
+    )
+    await _call(
+        db, ledger, "ibkr", "answer_order_question", "confirm", _answer("q-1"),
+        IBKR_RELEASED,
+    )
+
+    assert submit["vendor_order_id"] == "5001000"
+
+
+@pytest.mark.asyncio
+async def test_a_moomoo_confirm_naming_its_confirmation_links_to_the_placement(chain):
+    """moomoo's ``confirm_id`` is not the order id, so the id lookup misses it."""
+    db, ledger = chain
+    place = await _call(
+        db, ledger, "moomoo", "trading_order_place", "place",
+        {"qty": "1", "code": "US.AAPL", "side": "BUY", "price": "100",
+         "acc_id": "1234567", "order_type": "LIMIT", "time_in_force": "DAY"},
+        {"s": "ok", "need_order_confirm": True, "confirm_id": "cfm-9",
+         "d": {"order_id": "7654321"}},
+    )
+    confirm = await _call(
+        db, ledger, "moomoo", "trading_order_confirm", "confirm",
+        {"acc_id": "1234567", "confirm_id": "cfm-9"},
+        {"s": "ok", "d": {"order_id": "7654321", "order_status": "SUBMITTED"}},
+    )
+
+    assert place["vendor_order_id"] == "7654321"
+    assert confirm["parent_attempt_id"] == place["attempt_id"]
+
+
+@pytest.mark.asyncio
+async def test_only_a_confirm_is_linked_by_a_confirmation_token(chain):
+    """A cancel names an order; one naming a question id names nothing we placed."""
+    db, ledger = chain
+    await _call(
+        db, ledger, "ibkr", "submit_order", "place", IBKR_SUBMIT, _question("q-1")
+    )
+    cancel = await _call(
+        db, ledger, "ibkr", "cancel_order", "cancel", {"order_id": "q-1"},
+        {"order_status": "CANCELLED"},
+    )
+
+    assert cancel["parent_attempt_id"] is None

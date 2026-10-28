@@ -237,7 +237,7 @@ case $llm in
         case $sub in
             b)
                 set_llm_field "name" "gpt-6.1-sol-oauth"
-                set_llm_field "background" "gpt-5.6-terra-oauth"
+                set_llm_field "background" "gpt-6.1-terra-oauth"
                 # compaction blank → the turn's model; fetch blank → the background model
                 set_llm_field "compaction" ""
                 set_llm_field "fetch" ""

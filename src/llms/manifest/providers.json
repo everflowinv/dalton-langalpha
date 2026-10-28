@@ -2,34 +2,34 @@
   "models": {
     "openai": [
       {
-        "id": "gpt-5.6-terra",
-        "name": "GPT-5.6 Terra",
+        "id": "gpt-6.1-terra",
+        "name": "GPT-6.1 Terra",
         "is_reasoning": true,
-        "description": "OpenAI's mid-tier GPT-5.6 reasoning model with tiered short/long-context pricing",
+        "description": "OpenAI's mid-tier GPT-6.1 reasoning model with tiered short/long-context pricing",
         "pricing": {
           "input_tiers": [
             {
               "max_tokens": 272000,
-              "rate": 2.0,
-              "cached_input": 0.2,
-              "cache_5m": 2.5
+              "rate": 1.0,
+              "cached_input": 0.05,
+              "cache_5m": 1.25
             },
             {
               "max_tokens": null,
-              "rate": 4.0,
-              "cached_input": 0.4,
-              "cache_5m": 5.0
+              "rate": 2.0,
+              "cached_input": 0.1,
+              "cache_5m": 2.5
             }
           ],
-          "cache_5m": 2.5,
+          "cache_5m": 1.25,
           "output_tiers": [
             {
               "max_tokens": 272000,
-              "rate": 12.0
+              "rate": 5.0
             },
             {
               "max_tokens": null,
-              "rate": 18.0
+              "rate": 7.5
             }
           ],
           "output_pricing_mode": "input_dependent",
@@ -144,6 +144,44 @@
             {
               "max_tokens": null,
               "rate": 0.75
+            }
+          ],
+          "output_pricing_mode": "input_dependent",
+          "input_pricing_mode": "input_dependent",
+          "unit": "per_1m_tokens"
+        },
+        "context_window": 1050000,
+        "max_output": 128000
+      },
+      {
+        "id": "gpt-5.6-terra",
+        "name": "GPT-5.6 Terra",
+        "is_reasoning": true,
+        "description": "Retired 2026-10-26, superseded by gpt-6.1-terra. Kept until the next retirement so a custom model on this id still bills.",
+        "pricing": {
+          "input_tiers": [
+            {
+              "max_tokens": 272000,
+              "rate": 2.0,
+              "cached_input": 0.2,
+              "cache_5m": 2.5
+            },
+            {
+              "max_tokens": null,
+              "rate": 4.0,
+              "cached_input": 0.4,
+              "cache_5m": 5.0
+            }
+          ],
+          "cache_5m": 2.5,
+          "output_tiers": [
+            {
+              "max_tokens": 272000,
+              "rate": 12.0
+            },
+            {
+              "max_tokens": null,
+              "rate": 18.0
             }
           ],
           "output_pricing_mode": "input_dependent",
@@ -824,56 +862,39 @@
         }
       }
     ],
-    "groq": [
-      {
-        "id": "openai/gpt-oss-20b",
-        "name": "GPT-OSS-20B (Groq)",
-        "is_reasoning": true,
-        "description": "Retired 2026-10-24, removed with no successor. Kept until the next retirement so a custom model on this id still bills.",
-        "context_window": 131072,
-        "max_output": 65536,
-        "pricing": {
-          "input": 0.075,
-          "cached_input": 0.0375,
-          "output": 0.3,
-          "unit": "per_1m_tokens"
-        }
-      },
-      {
-        "id": "openai/gpt-oss-120b",
-        "name": "GPT-OSS-120B (Groq)",
-        "is_reasoning": true,
-        "description": "Retired 2026-10-24, removed with no successor. Kept until the next retirement so a custom model on this id still bills.",
-        "context_window": 131072,
-        "max_output": 65536,
-        "pricing": {
-          "input": 0.15,
-          "cached_input": 0.075,
-          "output": 0.6,
-          "unit": "per_1m_tokens"
-        }
-      },
-      {
-        "id": "openai/gpt-oss-safeguard-20b",
-        "name": "GPT-OSS-Safeguard-20B (Groq)",
-        "is_reasoning": true,
-        "description": "Retired 2026-10-24, removed with no successor. Kept until the next retirement so a custom model on this id still bills.",
-        "context_window": 131072,
-        "max_output": 65536,
-        "pricing": {
-          "input": 0.075,
-          "cached_input": 0.037,
-          "output": 0.3,
-          "unit": "per_1m_tokens"
-        }
-      }
-    ],
+    "groq": [],
     "moonshot": [
+      {
+        "id": "kimi-k3.1-pro",
+        "name": "Kimi K3.1 Pro",
+        "is_reasoning": true,
+        "description": "Moonshot AI's flagship Kimi K3.1 multi-modal model with 1M-token context",
+        "context_window": 1000000,
+        "pricing": {
+          "input": 2.0,
+          "cached_input": 0.2,
+          "output": 10.0,
+          "unit": "per_1m_tokens"
+        }
+      },
+      {
+        "id": "kimi-k3.1-pro-highspeed",
+        "name": "Kimi K3.1 Pro Highspeed",
+        "is_reasoning": true,
+        "description": "High-speed variant of Kimi K3.1 Pro: the same model and 1M-token context at roughly 3x the speed",
+        "context_window": 1000000,
+        "pricing": {
+          "input": 4.0,
+          "cached_input": 0.2,
+          "output": 20.0,
+          "unit": "per_1m_tokens"
+        }
+      },
       {
         "id": "kimi-k3",
         "name": "Kimi K3",
         "is_reasoning": true,
-        "description": "Moonshot AI's flagship Kimi K3 multi-modal model with 1M-token context",
+        "description": "Retired 2026-10-26, superseded by kimi-k3.1-pro. Kept until the next retirement so a custom model on this id still bills.",
         "context_window": 1000000,
         "pricing": {
           "input": 3.0,
@@ -908,34 +929,6 @@
         "max_output": 40000,
         "pricing": {
           "input": 0.35,
-          "output": 0.75,
-          "unit": "per_1m_tokens"
-        }
-      },
-      {
-        "id": "gpt-oss-120b",
-        "name": "GPT-OSS-120B (Cerebras)",
-        "is_reasoning": true,
-        "description": "Retired 2026-10-24, removed with no successor. Kept until the next retirement so a custom model on this id still bills.",
-        "context_window": 131072,
-        "max_output": 41000,
-        "pricing": {
-          "input": 0.35,
-          "cached_input": 0.35,
-          "output": 0.75,
-          "unit": "per_1m_tokens"
-        }
-      },
-      {
-        "id": "gpt-oss-safeguard-20b",
-        "name": "GPT-OSS-Safeguard-20B (Cerebras)",
-        "is_reasoning": true,
-        "description": "Retired 2026-10-24, removed with no successor. Kept until the next retirement so a custom model on this id still bills.",
-        "context_window": 131072,
-        "max_output": 41000,
-        "pricing": {
-          "input": 0.35,
-          "cached_input": 0.35,
           "output": 0.75,
           "unit": "per_1m_tokens"
         }

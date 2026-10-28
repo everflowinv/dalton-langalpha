@@ -15,6 +15,25 @@ const catalogs = {
   'zh-CN': { translation: zhCN, intros: zhCNIntros },
 };
 
+// Node's BroadcastChannel reaches every worker thread in the process, so under
+// the vm pool a file hears whatever the files running beside it broadcast: one
+// file's dashboard saving invalidated another's preferences mid-test. Each file
+// gets its own namespace; channels within a file still talk to each other.
+if (typeof BroadcastChannel !== 'undefined') {
+  const NodeBroadcastChannel = BroadcastChannel;
+  const scope = globalThis.crypto.randomUUID();
+  globalThis.BroadcastChannel = class extends NodeBroadcastChannel {
+    readonly #name: string;
+    constructor(name: string) {
+      super(`${scope}:${name}`);
+      this.#name = name;
+    }
+    override get name() {
+      return this.#name;
+    }
+  };
+}
+
 // One setup file for both environments: a test file that declares
 // `// @vitest-environment node` has no `window`, and gets the traps instead of
 // the jsdom shims.

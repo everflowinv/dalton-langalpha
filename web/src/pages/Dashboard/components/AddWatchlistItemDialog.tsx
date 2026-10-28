@@ -1,10 +1,12 @@
 import React, { useState, useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
-import { ArrowLeft, Search } from 'lucide-react';
+import { ArrowLeft } from 'lucide-react';
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '../../../components/ui/dialog';
 import { Input } from '../../../components/ui/input';
-import { ScrollArea } from '../../../components/ui/scroll-area';
+import { TermKV } from '@/pages/ChatAgent/components/charts/TermCard';
 import { getStockPrices } from '../utils/api';
+import { FormCard } from './FormCard';
+import { SymbolSearchCard } from './SymbolSearchCard';
 import type { StockSearchHit } from '@/lib/marketUtils';
 import { useSymbolSearch } from '@/hooks/useSymbolSearch';
 import { useLocale } from '@/hooks/useLocale';
@@ -145,10 +147,17 @@ function AddWatchlistItemDialog({
   const cur = quoteCurrency(priceCurrency || selectedStock?.currency, selectedStock?.symbol);
 
   const exchange = selectedStock?.exchangeShortName || selectedStock?.stockExchange || '';
+  const priceCell = priceLoading ? (
+    <span className="term-t3">...</span>
+  ) : currentPrice !== null ? (
+    <span className="term-code term-strong">{formatMoney(currentPrice, cur, locale)}</span>
+  ) : (
+    <span className="term-t3">{t('dashboard.addWatchlistDialog.priceNA')}</span>
+  );
 
   return (
     <Dialog open={open} onOpenChange={(open) => !open && onClose?.()}>
-      <DialogContent className="sm:max-w-md border max-sm:min-h-[60dvh]" style={{ backgroundColor: 'var(--color-bg-elevated)', borderColor: 'var(--color-border-elevated)' }}>
+      <DialogContent className="dash-form sm:max-w-md max-sm:min-h-[60dvh]">
         {page === 1 ? (
           <>
             <DialogHeader className="text-left">
@@ -156,58 +165,19 @@ function AddWatchlistItemDialog({
                 {t('dashboard.addWatchlistDialog.titleSearch')}
               </DialogTitle>
             </DialogHeader>
-            <div className="pt-1">
-              <div className="relative">
-                <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 h-4 w-4" style={{ color: 'var(--color-text-secondary)' }} />
-                <Input
-                  placeholder={t('dashboard.addWatchlistDialog.searchPlaceholder')}
-                  value={searchQuery}
-                  onChange={(e) => setSearchQuery(e.target.value)}
-                  className="pl-10 border"
-                  style={{ backgroundColor: 'var(--color-bg-card)', borderColor: 'var(--color-border-default)', color: 'var(--color-text-primary)' }}
-                  autoFocus
-                />
-              </div>
-              <ScrollArea className="mt-3 max-h-[50dvh] sm:max-h-[400px]">
-                {searchLoading && searchResults.length === 0 ? (
-                  <div className="py-8 text-center text-sm" style={{ color: 'var(--color-text-secondary)' }}>
-                    {t('dashboard.addWatchlistDialog.searching')}
-                  </div>
-                ) : searchResults.length === 0 && searchQuery.trim().length >= 1 ? (
-                  <div className="py-8 text-center text-sm" style={{ color: 'var(--color-text-secondary)' }}>
-                    {t('dashboard.addWatchlistDialog.noResults')}
-                  </div>
-                ) : searchResults.length === 0 ? (
-                  <div className="py-8 text-center text-sm" style={{ color: 'var(--color-text-secondary)' }}>
-                    {t('dashboard.addWatchlistDialog.searchHint')}
-                  </div>
-                ) : (
-                  <div className="divide-y" style={{ borderColor: 'var(--color-border-muted)' }}>
-                    {searchResults.map((stock, index) => (
-                      <button
-                        key={`${stock.symbol}-${index}`}
-                        type="button"
-                        onClick={() => handleStockSelect(stock)}
-                        className="w-full text-left px-2 py-2.5 transition-colors flex items-center gap-3"
-                        style={{ color: 'var(--color-text-primary)' }}
-                        onMouseEnter={(e) => { e.currentTarget.style.backgroundColor = 'var(--color-bg-hover)'; }}
-                        onMouseLeave={(e) => { e.currentTarget.style.backgroundColor = 'transparent'; }}
-                      >
-                        <span
-                          className="shrink-0 w-12 text-center text-xs font-bold py-1 rounded"
-                          style={{ backgroundColor: 'var(--color-bg-surface, var(--color-bg-hover))', color: 'var(--color-text-primary)' }}
-                        >
-                          {stock.symbol}
-                        </span>
-                        <span className="text-sm truncate" style={{ color: 'var(--color-text-secondary)' }}>
-                          {stock.name}
-                        </span>
-                      </button>
-                    ))}
-                  </div>
-                )}
-              </ScrollArea>
-            </div>
+            <SymbolSearchCard
+              query={searchQuery}
+              onQueryChange={setSearchQuery}
+              hits={searchResults}
+              loading={searchLoading}
+              onSelect={handleStockSelect}
+              copy={{
+                searching: t('dashboard.addWatchlistDialog.searching'),
+                noResults: t('dashboard.addWatchlistDialog.noResults'),
+                searchHint: t('dashboard.addWatchlistDialog.searchHint'),
+                searchPlaceholder: t('dashboard.addWatchlistDialog.searchPlaceholder'),
+              }}
+            />
           </>
         ) : (
           <>
@@ -231,97 +201,49 @@ function AddWatchlistItemDialog({
             </DialogHeader>
             {selectedStock && (
               <div className="space-y-5">
-                {/* Stock info card */}
-                <div
-                  className="rounded-xl p-4 border"
-                  style={{ backgroundColor: 'var(--color-bg-card)', borderColor: 'var(--color-border-muted)' }}
-                >
-                  <div className="flex items-start justify-between gap-3">
-                    <div className="min-w-0">
-                      <div className="flex items-center gap-2">
-                        <span className="text-lg font-bold" style={{ color: 'var(--color-text-primary)' }}>
-                          {selectedStock.symbol}
-                        </span>
-                        {exchange && (
-                          <span
-                            className="text-[0.625rem] font-medium px-1.5 py-0.5 rounded"
-                            style={{ backgroundColor: 'var(--color-bg-surface, var(--color-bg-hover))', color: 'var(--color-text-secondary)' }}
-                          >
-                            {exchange}
-                          </span>
-                        )}
-                      </div>
-                      <div className="text-xs mt-1 truncate" style={{ color: 'var(--color-text-secondary)' }}>
-                        {selectedStock.name}
-                      </div>
-                    </div>
-                    <div className="text-right shrink-0">
-                      {priceLoading ? (
-                        <div className="text-sm" style={{ color: 'var(--color-text-secondary)' }}>...</div>
-                      ) : currentPrice !== null ? (
-                        <div className="text-lg font-bold tabular-nums" style={{ color: 'var(--color-text-primary)' }}>
-                          {formatMoney(currentPrice, cur, locale)}
-                        </div>
-                      ) : (
-                        <div className="text-sm" style={{ color: 'var(--color-text-secondary)' }}>{t('dashboard.addWatchlistDialog.priceNA')}</div>
-                      )}
-                      <div className="text-[0.625rem] mt-0.5" style={{ color: 'var(--color-text-tertiary)' }}>{t('dashboard.addWatchlistDialog.currentPrice')}</div>
-                    </div>
+                <FormCard title={<span className="term-code">{selectedStock.symbol}</span>} sub={exchange}>
+                  <div>
+                    {selectedStock.name && <div className="term-word dash-form-name">{selectedStock.name}</div>}
+                    <TermKV cols={1} pairs={[[t('dashboard.addWatchlistDialog.currentPrice'), priceCell]]} />
                   </div>
-                </div>
-
-                {/* Notes Input */}
-                <div>
-                  <label className="block text-xs font-medium mb-1.5" style={{ color: 'var(--color-text-secondary)' }}>
-                    {t('dashboard.addWatchlistDialog.notesLabel')}
+                  <label className="block">
+                    <span className="term-label dash-form-label">{t('dashboard.addWatchlistDialog.notesLabel')}</span>
+                    <Input
+                      placeholder={t('dashboard.addWatchlistDialog.notesPlaceholder')}
+                      value={notes}
+                      onChange={(e) => setNotes(e.target.value)}
+                      className="dash-form-input border"
+                    />
                   </label>
-                  <Input
-                    placeholder={t('dashboard.addWatchlistDialog.notesPlaceholder')}
-                    value={notes}
-                    onChange={(e) => setNotes(e.target.value)}
-                    className="border"
-                    style={{ backgroundColor: 'var(--color-bg-card)', borderColor: 'var(--color-border-default)', color: 'var(--color-text-primary)' }}
-                  />
-                </div>
+                </FormCard>
 
-                {/* Alert Settings */}
-                <div>
-                  <div className="text-xs font-medium mb-1.5" style={{ color: 'var(--color-text-secondary)' }}>
-                    {t('dashboard.addWatchlistDialog.priceAlertsLabel')}
-                  </div>
+                <FormCard title={t('dashboard.addWatchlistDialog.priceAlertsLabel')}>
                   <div className="grid grid-cols-2 gap-3">
-                    <div>
-                      <label className="block text-[0.6875rem] mb-1" style={{ color: 'var(--color-text-tertiary)' }}>
-                        {t('dashboard.addWatchlistDialog.priceAboveLabel')}
-                      </label>
+                    <label className="block">
+                      <span className="term-label dash-form-label">{t('dashboard.addWatchlistDialog.priceAboveLabel')}</span>
                       <Input
                         type="number"
                         step="0.01"
                         placeholder="200.00"
                         value={priceAbove}
                         onChange={(e) => setPriceAbove(e.target.value)}
-                        className="border"
-                        style={{ backgroundColor: 'var(--color-bg-card)', borderColor: 'var(--color-border-default)', color: 'var(--color-text-primary)' }}
+                        className="dash-form-input dash-form-figure border"
                       />
-                    </div>
-                    <div>
-                      <label className="block text-[0.6875rem] mb-1" style={{ color: 'var(--color-text-tertiary)' }}>
-                        {t('dashboard.addWatchlistDialog.priceBelowLabel')}
-                      </label>
+                    </label>
+                    <label className="block">
+                      <span className="term-label dash-form-label">{t('dashboard.addWatchlistDialog.priceBelowLabel')}</span>
                       <Input
                         type="number"
                         step="0.01"
                         placeholder="150.00"
                         value={priceBelow}
                         onChange={(e) => setPriceBelow(e.target.value)}
-                        className="border"
-                        style={{ backgroundColor: 'var(--color-bg-card)', borderColor: 'var(--color-border-default)', color: 'var(--color-text-primary)' }}
+                        className="dash-form-input dash-form-figure border"
                       />
-                    </div>
+                    </label>
                   </div>
-                </div>
+                </FormCard>
 
-                {/* Add Button */}
                 <button
                   type="button"
                   onClick={handleAdd}

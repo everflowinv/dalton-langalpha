@@ -122,10 +122,10 @@ beforeEach(() => {
 });
 
 describe('Settings: card style', () => {
-  it('starts on Balanced', async () => {
+  it('starts on Quiet', async () => {
     renderAccountTab();
     const row = await screen.findByRole('group', { name: 'Card style' });
-    expect(within(row).getByRole('button', { name: 'Balanced' })).toHaveAttribute('aria-pressed', 'true');
+    expect(within(row).getByRole('button', { name: 'Quiet' })).toHaveAttribute('aria-pressed', 'true');
   });
 
   it('restyles the page at once and keeps the choice on this device only', async () => {

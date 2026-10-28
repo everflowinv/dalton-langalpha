@@ -16,6 +16,7 @@ import { clearChatSession } from '@/pages/ChatAgent/hooks/utils/chatSessionResto
 import type { Thread, ThreadsResponse, Workspace } from '@/types/api';
 import { queryKeys } from '@/lib/queryKeys';
 import { registerWidget } from '../framework/WidgetRegistry';
+import { WidgetCardMeta } from '../framework/widgetCardSlots';
 import { useWidgetContextExport } from '../framework/contextSnapshot';
 import { serializeRowsToMarkdown, wrapWidgetContext } from '../framework/snapshotSerializers';
 import { RecentThreadsConfigSchema } from '../framework/configSchemas';
@@ -354,49 +355,21 @@ function RecentThreadsWidget({ instance }: WidgetRenderProps<RecentThreadsConfig
       : '/chat';
 
   return (
-    <div className="dashboard-glass-card p-5 flex flex-col h-full">
-      <div
-        className="flex items-baseline justify-between mb-3 pb-3 border-b"
-        style={{ borderColor: 'var(--color-border-muted)' }}
-      >
-        <div className="flex items-baseline gap-2.5 min-w-0">
-          <MessagesSquare
-            className="h-3.5 w-3.5 shrink-0 self-center"
-            style={{ color: 'var(--color-text-tertiary)' }}
-          />
-          <span
-            className="text-[0.625rem] font-semibold uppercase tracking-[0.14em]"
-            style={{ color: 'var(--color-text-secondary)' }}
-          >
-            {t('dashboard.widgets.recentThreads.header')}
-          </span>
-          <span
-            className="title-font text-lg leading-none dashboard-mono"
-            style={{ color: 'var(--color-text-primary)' }}
-          >
-            {threads.length}
-          </span>
-        </div>
+    <div className="flex flex-col h-full">
+      <WidgetCardMeta>
+        <span>{threads.length}</span>
         <button
           type="button"
           onClick={() => {
             if (viewAllTarget === '/chat') clearChatSession();
             navigate(viewAllTarget);
           }}
-          className="group flex items-center gap-1 text-[0.6875rem] uppercase tracking-wider transition-colors"
-          style={{ color: 'var(--color-text-tertiary)' }}
-          onMouseEnter={(e) => {
-            e.currentTarget.style.color = 'var(--color-text-primary)';
-          }}
-          onMouseLeave={(e) => {
-            e.currentTarget.style.color = 'var(--color-text-tertiary)';
-          }}
+          className="dash-link widget-drag-cancel"
         >
-          <span>{t('dashboard.widgets.recentThreads.viewAll')}</span>
-          <ArrowUpRight className="h-3 w-3 transition-transform group-hover:translate-x-0.5 group-hover:-translate-y-0.5" />
+          {t('dashboard.widgets.recentThreads.viewAll')}
+          <ArrowUpRight className="h-3 w-3" />
         </button>
-      </div>
-
+      </WidgetCardMeta>
       <div className="flex-1 min-h-0 overflow-y-auto -mx-1 px-1">
         {isLoading && threads.length === 0 ? (
           <div className="space-y-1.5 py-1">
@@ -449,6 +422,7 @@ function RecentThreadsWidget({ instance }: WidgetRenderProps<RecentThreadsConfig
 registerWidget<RecentThreadsConfig>({
   type: 'threads.recent',
   titleKey: 'dashboard.widgets.recentThreads.title',
+  cardTitleKey: 'dashboard.widgets.recentThreads.header',
   descriptionKey: 'dashboard.widgets.recentThreads.description',
   category: 'workspace',
   icon: MessagesSquare,

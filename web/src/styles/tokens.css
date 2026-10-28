@@ -98,7 +98,7 @@ html {
      | token        | surface                                                |
      |--------------|--------------------------------------------------------|
      | bg-page      | the app ground: chat page, settings, auth               |
-     | bg-canvas    | ground behind a card grid (dashboard); = page in dark   |
+     | bg-canvas    | ground behind filled cards (orders); = page in dark     |
      | bg-card      | a card/panel sitting on page or canvas                  |
      | bg-card-hover| hover fill of a clickable card row (solid twin of card) |
      | bg-tool-card | agent tool/artifact cards inside the transcript         |
@@ -348,11 +348,11 @@ html {
      border-only outlines on the same white. */
   --color-bg-canvas: #F5F4F1;
   /* Filled surfaces in the chat (task cards, the subagent bar, the chart
-     annotation chip): warm paper fill, the inverse of the dashboard pairing
-     (there white cards sit on tinted canvas; here tinted cards sit on the
-     white chat page). The data cards are unfilled frames, and the detail
-     panel's chart canvases draw on a transparent ground, so neither reads
-     this token. */
+     annotation chip): warm paper fill, the inverse of the canvas pairing
+     (on the orders page white cards sit on tinted canvas; here tinted cards
+     sit on the white chat page). The data cards are unfilled frames, and the
+     detail panel's chart canvases draw on a transparent ground, so neither
+     reads this token. */
   --color-bg-tool-card: #F5F4F1;
   --color-bg-card-hover: #FAFAF8;
   --color-bg-elevated: #F7F7F6;
