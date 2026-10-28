@@ -1054,6 +1054,17 @@ async def test_per_user_redis_discovery_cache_and_slow_down_preserves_deadline(
     fake_cache = create_autospec(RedisCacheClient(), instance=True)
     fake_cache.enabled = True
     fake_cache.client = fake_redis
+
+    # The poll's slow_down writeback is a compare-and-set on the value its
+    # read saw, keeping the key's TTL — wired here over the same store.
+    async def _swap(key: str, old_value: str, new_value: str) -> bool:
+        item = redis_store.get(str(key))
+        if item is None or item[0] != old_value:
+            return False
+        redis_store[str(key)] = (new_value, item[1])
+        return True
+
+    fake_cache.swap.side_effect = _swap
     monkeypatch.setattr(
         "src.utils.cache.redis_cache.get_cache_client",
         create_autospec(lambda: fake_cache, return_value=fake_cache),

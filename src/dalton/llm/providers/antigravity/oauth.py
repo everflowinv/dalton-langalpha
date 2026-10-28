@@ -208,15 +208,18 @@ def _flow_keys(user_id: str) -> tuple[str, str]:
     return f"oauth:antigravity:{holder}", f"oauth:antigravity:done:{holder}"
 
 
-async def _finalize_token_save(user_id: str, tokens: dict) -> dict:
-    """Store a finished sign-in, only while its login is still the pending one.
+async def _finalize_token_save(user_id: str, tokens: dict, expected_flow_raw: str) -> dict:
+    """Store a finished sign-in, only while THE SAME login is still pending.
 
-    The flow key is claimed (compare-and-delete) inside the connection lock
-    and the tokens written over that connection, so a disconnect that landed
-    while Google was answering leaves the flow key gone and this save aborts
-    instead of reviving the connection. The claim ends the login either way:
-    the provider already spent the authorization, so only a new one helps.
-    (DALTON-HOOK(team-credentials))
+    ``expected_flow_raw`` is the flow-key value the caller read before it
+    spent the authorization. The claim (compare-and-delete on exactly that
+    value) runs inside the connection lock and the tokens are written over
+    that connection, so: a disconnect that landed while Google was answering
+    leaves the key gone and this save aborts; a newer login that replaced the
+    flow keeps its own key, and this old authorization cannot claim it.
+    With no cache there is no verifiable flow, so nothing is stored — an
+    unverifiable save is exactly the revive-on-disconnect race
+    (DALTON-HOOK(team-credentials)).
     """
     from src.server.database.oauth_tokens import connection_change
     from src.utils.cache.redis_cache import get_cache_client
@@ -224,16 +227,21 @@ async def _finalize_token_save(user_id: str, tokens: dict) -> dict:
     claims = parse_id_token_claims(tokens.get("id_token", ""))
     cache = get_cache_client()
     flow_key, done_key = _flow_keys(user_id)
+    if not cache.enabled or not cache.client:
+        raise ValueError(
+            "The Antigravity sign-in cannot be verified without its pending-flow "
+            "store; start again with the cache available."
+        )
 
     async def _save(conn) -> bool:
-        if cache.enabled and cache.client:
-            raw = await cache.client.get(flow_key)
-            if not raw:
-                return False
-            if isinstance(raw, bytes):
-                raw = raw.decode("utf-8", "ignore")
-            if not await cache.claim(flow_key, raw):
-                return False
+        # Claim on the value THIS login read: gone (disconnected) or replaced
+        # (a newer login) both refuse, and the newer flow's key survives.
+        return await cache.claim(flow_key, expected_flow_raw)
+
+    async with connection_change(user_id, ANTIGRAVITY_PROVIDER) as conn:
+        claimed = await _save(conn)
+        if not claimed:
+            raise ValueError("The Antigravity sign-in was cancelled or replaced; start again.")
         await upsert_oauth_tokens(
             user_id=user_id,
             provider=ANTIGRAVITY_PROVIDER,
@@ -246,14 +254,7 @@ async def _finalize_token_save(user_id: str, tokens: dict) -> dict:
             + timedelta(seconds=tokens.get("expires_in", 3600)),
             conn=conn,
         )
-        return True
-
-    async with connection_change(user_id, ANTIGRAVITY_PROVIDER) as conn:
-        saved = await _save(conn)
-    if not saved:
-        raise ValueError("The Antigravity sign-in was cancelled or replaced; start again.")
-    if cache.enabled and cache.client:
-        await cache.client.set(done_key, "1", ex=600)
+    await cache.client.set(done_key, "1", ex=600)
     return claims
 
 
@@ -297,26 +298,29 @@ async def start_login(user_id: str) -> dict:
 
     asyncio.create_task(_serve_with_timeout())
 
+    from src.server.database.oauth_tokens import connection_change
     from src.utils.cache.redis_cache import get_cache_client
 
     cache = get_cache_client()
     if cache.enabled and cache.client:
         flow_key, done_key = _flow_keys(user_id)
-        # R6-9: clear any stale completion flag before starting a new flow
-        await cache.client.delete(done_key)
-        await cache.client.set(
-            flow_key,
-            json.dumps(
-                {
-                    "verifier": verifier,
-                    "state": state,
-                    "port": port,
-                    "redirect_uri": redirect_uri,
-                    "initiated_at": initiated_at,
-                }
-            ),
-            ex=_CALLBACK_TIMEOUT_S,
+        payload = json.dumps(
+            {
+                "verifier": verifier,
+                "state": state,
+                "port": port,
+                "redirect_uri": redirect_uri,
+                "initiated_at": initiated_at,
+            }
         )
+        # A new flow replaces the old one inside the connection lock, so it can
+        # never land between a save's claim and its write, and a disconnect
+        # queued behind this login sees the new flow, not a half-cleared one
+        # (DALTON-HOOK(team-credentials)). R6-9: the stale completion flag
+        # goes with the same step.
+        async with connection_change(user_id, ANTIGRAVITY_PROVIDER):
+            await cache.client.delete(done_key)
+            await cache.client.set(flow_key, payload, ex=_CALLBACK_TIMEOUT_S)
 
     return {
         "authorize_url": build_authorize_url(redirect_uri, state, challenge),
@@ -391,7 +395,10 @@ async def submit_callback_url(user_id: str, callback_input: str) -> dict:
         or f"http://localhost:{pending.get('port')}/callback"
     )
     tokens = await exchange_code(code, pending["verifier"], redirect_uri)
-    claims = await _finalize_token_save(user_id, tokens)
+    # The save must land only on this very flow: a disconnect or a newer login
+    # that replaced it while the exchange ran refuses below
+    # (DALTON-HOOK(team-credentials)).
+    claims = await _finalize_token_save(user_id, tokens, expected_flow_raw=raw)
     logger.info(f"[antigravity_oauth] Connected via callback paste for user_id={user_id}")
     return {
         "success": True,
@@ -454,9 +461,29 @@ async def _handle_google_callback(
             respond(400, "State mismatch", "Please restart the connection from LangAlpha.")
             return
 
+        # Bind this callback to the login that opened the listener, by the
+        # pending flow's own record, before spending the authorization: the
+        # key must still stand and carry THIS verifier/state, or this is an
+        # old listener answering after a disconnect / newer login
+        # (DALTON-HOOK(team-credentials)).
+        from src.utils.cache.redis_cache import get_cache_client
+
+        cache = get_cache_client()
+        flow_key, _done_key = _flow_keys(user_id)
+        flow_raw = await cache.client.get(flow_key) if cache.enabled and cache.client else None
+        if isinstance(flow_raw, bytes):
+            flow_raw = flow_raw.decode("utf-8", "ignore")
+        if not flow_raw:
+            respond(400, "Sign-in cancelled", "This sign-in was cancelled or replaced. Start again from LangAlpha.")
+            return
+        pending_flow = json.loads(flow_raw)
+        if pending_flow.get("verifier") != verifier or pending_flow.get("state") != state:
+            respond(400, "Sign-in replaced", "A newer sign-in is in progress. Start again from LangAlpha.")
+            return
+
         port = writer.get_extra_info("sockname")[1]
         tokens = await exchange_code(code, verifier, f"http://localhost:{port}/callback")
-        claims = await _finalize_token_save(user_id, tokens)
+        claims = await _finalize_token_save(user_id, tokens, expected_flow_raw=flow_raw)
 
         respond(
             200,
