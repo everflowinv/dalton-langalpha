@@ -31,6 +31,7 @@ from src.dalton.tools.knowledge_tools import _extract_run_identity
 from src.dalton.tools.wiki_tools import (
     WIKI_INGEST_RATE_LIMIT_PER_HOUR,
     _read_workspace_file_safely,
+    _turn_admitted_workspace,
     check_and_increment_wiki_ingest_rate_limit,
 )
 
@@ -381,7 +382,10 @@ async def _ingest_workspace_identity(
     if not workspace_id or workspace_id.strip().lower() == "home":
         return "", thread_id, "ERROR: user_id and workspace_id are required in RunnableConfig."
     try:
-        await verify_workspace_access(workspace_id, user_id)
+        # DALTON-HOOK(colleague-dispatch): the turn's admitted workspace passed
+        # START admission already; the ingest stays attributed to the caller.
+        if not _turn_admitted_workspace(config, workspace_id):
+            await verify_workspace_access(workspace_id, user_id)
     except HTTPException as exc:
         return "", thread_id, f"ERROR: {exc.detail}"
     except Exception as exc:

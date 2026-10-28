@@ -57,6 +57,19 @@ EXTERNAL_WIKI_INGEST_FORBIDDEN_MESSAGE = (
 TargetTypeLiteral = Literal["company", "sector"]
 
 
+def _turn_admitted_workspace(config: RunnableConfig | None, workspace_id: str) -> bool:
+    """Whether ``workspace_id`` is the workspace this turn was admitted into.
+
+    DALTON-HOOK(colleague-dispatch): a colleague's turn in someone else's
+    workspace was already admitted (owner settings, channel, revocation) at
+    START; the strict owner check below would refuse it. Anything else keeps
+    the strict check.
+    """
+    cfg = (config or {}).get("configurable") or {}
+    admitted = str(cfg.get("turn_admitted_workspace_id") or "").strip()
+    return bool(admitted) and admitted == str(workspace_id or "").strip()
+
+
 def _extract_user_email_from_config(config: RunnableConfig | None) -> str:
     if not isinstance(config, dict):
         return ""
@@ -535,7 +548,8 @@ def build_ingest_company_wiki_tool(
             return "ERROR: user_id and workspace_id are required in RunnableConfig."
 
         try:
-            await verify_workspace_access(workspace_id, user_id)
+            if not _turn_admitted_workspace(config, workspace_id):
+                await verify_workspace_access(workspace_id, user_id)
         except HTTPException as exc:
             return f"ERROR: {exc.detail}"
         except Exception as exc:
