@@ -13,18 +13,23 @@ but still inherits history full of blocks it may not be able to read.
 """
 
 from collections.abc import Callable, Collection
-from typing import Any
+from typing import Annotated, Any, Literal
 
-from langchain.agents.middleware import AgentMiddleware
+from langchain.agents.middleware import AgentMiddleware, AgentState
+from langchain.agents.middleware.types import ExtendedModelResponse, PrivateStateAttr
 from langchain_core.messages import AIMessage, ToolMessage
+from langgraph.types import Command
+from typing_extensions import NotRequired
 
 from ptc_agent.agent.middleware._message_utils import order_tool_results_first
 from ptc_agent.agent.middleware.file_operations.image_fit import fit_images, unsaved_upload_name
+from ptc_agent.agent.middleware.thinking_binding import checked_thinking_end
 from src.llms.attachment_payload import FILE_BLOCK_TYPES, IMAGE_BLOCK_TYPES, block_type
 from src.llms.llm import (
     get_image_types,
     get_input_modalities,
     get_max_image_side,
+    get_max_image_side_by_count,
     get_max_pdf_pages,
     get_pdf_page_tokens,
     image_route,
@@ -305,6 +310,40 @@ def remove_attachments(
     return result if modified else messages
 
 
+#: How a thread's images are fitted to Claude: ``"fixed"``, to the side every
+#: image count allows, or ``"count"``, to the side the request's image count
+#: allows, as before the fixed side shipped.
+IMAGE_SIDE_KEY = "image_side_rule"
+
+# TODO(2026-11-25): delete 30 days after this ships, once the threads written before it have aged out. "count" goes with it.
+ImageSideRule = Literal["fixed", "count"]
+
+
+class ImageSideState(AgentState):
+    image_side_rule: NotRequired[Annotated[ImageSideRule, PrivateStateAttr]]
+
+
+def _image_side_rule(request: Any, route: str) -> tuple[ImageSideRule, ImageSideRule | None]:
+    """The thread's rule, and the one to record when it has none yet.
+
+    Chosen once, on the thread's first call to Claude: a thread whose first
+    such call already has an image ahead of thinking was sent it by count, and
+    fitting it anew would invalidate that thinking, so it keeps the count.
+    """
+    stored = (getattr(request, "state", None) or {}).get(IMAGE_SIDE_KEY)
+    if stored or route != "anthropic":
+        return stored or "fixed", None
+    messages = request.messages or []
+    behind = any(
+        isinstance(block, dict) and block_type(block) in IMAGE_BLOCK_TYPES
+        for message in messages[: checked_thinking_end(messages)]
+        if isinstance(message.content, list)
+        for block in message.content
+    )
+    rule: ImageSideRule = "count" if behind else "fixed"
+    return rule, rule
+
+
 class MultimodalStripMiddleware(AgentMiddleware):
     """Remove attachment blocks the model about to be called cannot read.
 
@@ -312,6 +351,8 @@ class MultimodalStripMiddleware(AgentMiddleware):
     shared across the main and subagent stacks: the target is read off each
     request, so one instance serves every model in the graph.
     """
+
+    state_schema = ImageSideState
 
     def __init__(
         self,
@@ -406,12 +447,12 @@ class MultimodalStripMiddleware(AgentMiddleware):
         max_pdf_pages = get_max_pdf_pages(stamped) if stamped and has_pdf else None
 
         unreadable: frozenset[tuple[int, int]] = frozenset()
+        route = image_route(getattr(request.model, "metadata", None))
+        rule, update = _image_side_rule(request, route)
         if has_image:
-            route = image_route(getattr(request.model, "metadata", None))
+            side = get_max_image_side_by_count if rule == "count" else get_max_image_side
             messages, unreadable = await fit_images(
-                messages,
-                get_image_types(route),
-                lambda count: get_max_image_side(route, count),
+                messages, get_image_types(route), lambda count: side(route, count)
             )
         # Decided on the call where the target is known: a tool-time note judged
         # the configured model and froze that verdict into the transcript, which
@@ -429,8 +470,11 @@ class MultimodalStripMiddleware(AgentMiddleware):
             unreadable=unreadable,
         )
         if messages is not request.messages:
-            return await handler(request.override(messages=messages))
-        return await handler(request)
+            request = request.override(messages=messages)
+        response = await handler(request)
+        if update is None:
+            return response
+        return ExtendedModelResponse(model_response=response, command=Command(update={IMAGE_SIDE_KEY: update}))
 
 
 __all__ = [

@@ -15,7 +15,9 @@ import logging
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, NamedTuple
+from uuid import uuid4
 
 from langchain_core.messages import AnyMessage
 
@@ -24,17 +26,20 @@ from langchain.chat_models import BaseChatModel
 from src.config.settings import get_compaction_timeout
 from src.llms import LLM, create_llm
 from src.llms.model_spec import summary_reasoning_effort
-from src.llms.provider_compaction import readable_text
+from src.llms.provider_compaction import deferred_text, readable_text
 
 from ptc_agent.agent.state import ensure_message_ids
+from ptc_agent.agent.middleware.runtime_context.durable import build_update_message
+from ptc_agent.agent.middleware.runtime_context.restate import summary_note_row
 from ptc_agent.agent.middleware.compaction.types import (
     CompactionEvent,
     OffloadSettings,
     TokenCounter,
 )
 from ptc_agent.agent.middleware.compaction.summary_request import (
-    DEFAULT_SUMMARY_PROMPT,
     build_summary_request,
+    keeps_turns,
+    summary_prompt,
 )
 from ptc_agent.agent.middleware.compaction.summarize import (
     FIRST_SHARE,
@@ -66,7 +71,11 @@ from ptc_agent.agent.middleware.file_operations.multimodal_strip import (
     MultimodalStripMiddleware,
 )
 from ptc_agent.agent.middleware.compaction.model import resolve_compaction_client
-from ptc_agent.agent.middleware.compaction.notes import anotes_pointer
+from ptc_agent.agent.middleware.compaction.notes import (
+    anotes_pointer,
+    suppressed_notes_rows,
+    unanswered_rows,
+)
 from ptc_agent.agent.middleware.compaction.offloading import (
     Offloads,
     aoffload_base64_content,
@@ -75,6 +84,10 @@ from ptc_agent.agent.middleware.compaction.offloading import (
     removed_attachments,
     select_offloads,
     tool_call_ids,
+)
+from ptc_agent.agent.middleware.thinking_binding import (
+    thinking_after,
+    without_thinking,
 )
 from ptc_agent.agent.transcript import TranscriptTarget, Window
 from ptc_agent.config.agent import CredentialSource
@@ -113,7 +126,7 @@ class NativeAnswer(NamedTuple):
 #: The agent's own model summarizing the messages it is given, from its own
 #: request: its provider's compaction, or the summary it writes as text.
 #: Raises when it writes no summary.
-Own = Callable[[list[AnyMessage]], Awaitable[NativeAnswer | str]]
+Own = Callable[[list[AnyMessage], bool], Awaitable[NativeAnswer | str]]
 
 
 @dataclass(frozen=True)
@@ -130,14 +143,40 @@ class Compaction:
     @property
     def messages(self) -> list[AnyMessage]:
         """The view after it."""
-        return [self.event["summary_message"], *self.preserved]
+        return [self.event["summary_message"], *without_thinking(self.preserved, self.unsent)]
+
+    def note_row(self) -> AnyMessage | None:
+        """The row taking the summary's note to the call that answers from
+        it, after the turns it kept; None when the summary sends its note
+        itself or has none (see ``deferred_text``)."""
+        summary = self.event["summary_message"]
+        note = deferred_text(summary)
+        if note is None:
+            return None
+        row = build_update_message(summary_note_row(note, summary.id, datetime.now(tz=UTC)))
+        row.id = str(uuid4())
+        return row
+
+    @property
+    def unsent(self) -> set[str]:
+        """The kept answers whose thinking it invalidates: all of them, but
+        under the compaction block Claude wrote. A summary written on the
+        client is a new first message, which changes the prefix every kept
+        thinking block is checked against, so they go, as Anthropic's recipe
+        for a compaction done on the client says."""
+        if isinstance((self.summary.native or {}).get("block"), dict):
+            return set()
+        summary = self.event["summary_message"]
+        return thinking_after([summary, *self.preserved], {summary.id})
 
     def update(self, state: Mapping[str, Any]) -> dict[str, Any]:
         """The state update that installs it over ``state``.
 
         Summarized calls never reach the model again, so their recorded
         offload ids are dropped, and so are the summarized messages whose
-        attachments were removed. The cached token counts measured the view
+        attachments or thinking were taken out. The notes rows the tail keeps
+        after its last answer are recorded, since no later call is sent them
+        (``unanswered_rows``). The cached token counts measured the view
         before it: left in place, the next call would read them as still over
         the threshold and compact again at once.
         """
@@ -149,6 +188,9 @@ class Compaction:
             "_offloaded_tool_call_ids": args & live,
             "_offloaded_read_result_ids": reads & live,
             "_removed_attachment_ids": removed_attachments(state) & kept,
+            "_unsent_thinking_ids": self.unsent,
+            "_unanswered_notes_rows": suppressed_notes_rows(state, self.preserved)
+            | unanswered_rows(self.preserved),
             "_cached_input_tokens": 0,
             "_cached_output_tokens": 0,
         }
@@ -217,6 +259,7 @@ class Summarizer:
         ``progress`` hears how much of the summary has been written.
         """
         to_summarize, preserved = partition_at_cutoff(view, cutoff)
+        kept = keeps_turns(preserved)
         started = time.monotonic()
         budget = get_compaction_timeout()
         exported = await aexport_transcript(
@@ -231,7 +274,7 @@ class Summarizer:
 
         async def render(trimmed: list[AnyMessage]) -> list[AnyMessage]:
             trimmed = await aoffload_base64_content(backend, trimmed, thread_id=thread_id)
-            return build_summary_request(DEFAULT_SUMMARY_PROMPT, trimmed, turns)
+            return build_summary_request(summary_prompt("transcript", kept, notes=bool(notes_dir)), trimmed, turns)
 
         remaining = budget - (time.monotonic() - started)
         # The notes are listed beside the summary and within its budget, so
@@ -249,7 +292,7 @@ class Summarizer:
         try:
             # The agent's model gets the summary model's share, leaving the
             # summarizer a real call when it writes none.
-            summary = await _own_summary(own, to_summarize, server, remaining * FIRST_SHARE)
+            summary = await _own_summary(own, to_summarize, kept, server, remaining * FIRST_SHARE)
             remaining = budget - (time.monotonic() - started)
             summary = summary or await awrite_summary(
                 model=self.model,
@@ -291,17 +334,19 @@ class Summarizer:
 async def _own_summary(
     own: Own | None,
     to_summarize: list[AnyMessage],
+    kept: bool,
     server: Callable[..., Summary],
     budget: float,
 ) -> Summary | None:
     """``own``'s summary within ``budget``, or None for the summarizer to
-    write one: only a cancellation escapes, as in ``awrite_summary``. An
+    write one: only a cancellation escapes, as in ``awrite_summary``. ``kept``
+    says whether the summary leaves turns after it (``keeps_turns``). An
     answer only its provider can read takes ``server``'s digest as its text."""
     if own is None:
         return None
     try:
         async with asyncio.timeout(budget):
-            written = await own(to_summarize)
+            written = await own(to_summarize, kept)
     except Exception as e:
         logger.warning("[Compaction] own model's summary failed (%s: %s)", type(e).__name__, e)
         return None

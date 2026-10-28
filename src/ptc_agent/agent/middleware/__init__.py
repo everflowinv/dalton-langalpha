@@ -84,7 +84,7 @@ from .large_result_eviction import (
 # per-call row to the envelope.
 from .runtime_context import (
     BaselineContextMiddleware,
-    TailEnvelopeMiddleware,
+    RowCarrierMiddleware,
 )
 
 # Market watch middleware (live price injection for watched tickers)
@@ -172,7 +172,7 @@ __all__ = [
     "SubagentSteeringMiddleware",
     # Runtime context
     "BaselineContextMiddleware",
-    "TailEnvelopeMiddleware",
+    "RowCarrierMiddleware",
     # OpenAI prompt caching
     "SystemPromptCacheMiddleware",
     # Cross-provider reasoning sanitizer

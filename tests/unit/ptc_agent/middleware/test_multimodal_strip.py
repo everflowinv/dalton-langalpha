@@ -496,7 +496,8 @@ class TestAwrapModelCall:
             return "ok"
 
         request = _ModelCallRequest("claude-sonnet-5-5", self._image_history())
-        assert await MultimodalStripMiddleware().awrap_model_call(request, handler) == "ok"
+        response = await MultimodalStripMiddleware().awrap_model_call(request, handler)
+        assert getattr(response, "model_response", response) == "ok"
         assert seen["request"] is request, "vision target must not be cloned or stripped"
 
     @pytest.mark.asyncio
@@ -844,3 +845,85 @@ class TestPageStampStaysLocal:
         _, payload = _format_messages([message], model="claude-sonnet-4-6")
         document = [b for b in payload[0]["content"] if b["type"] == "document"][0]
         assert "unsaved" not in document and "unsaved" not in document["source"]
+
+
+class TestImageSideRule:
+    """A thread keeps the side its images were first sent at: one whose first
+    call already holds thinking was sent them by count, and fitting them to
+    the fixed 2000px side would invalidate that thinking."""
+
+    @staticmethod
+    def _history(*, thinking: bool) -> list:
+        png = io.BytesIO()
+        Image.new("RGB", (2400, 1200), "white").save(png, "PNG")
+        url = "data:image/png;base64," + base64.b64encode(png.getvalue()).decode()
+        answer = [{"type": "thinking", "thinking": "a chart", "signature": "sig"}] if thinking else []
+        return [
+            HumanMessage(content=[
+                {"type": "text", "text": "Look at this"},
+                {"type": "image_url", "image_url": {"url": url}},
+            ]),
+            AIMessage(
+                content=[*answer, {"type": "text", "text": "A chart."}],
+                response_metadata={"model_name": "claude-sonnet-5-5"},
+            ),
+            HumanMessage(content="And now?"),
+        ]
+
+    @staticmethod
+    async def _call(history: list, state: dict) -> tuple[int, object]:
+        seen = {}
+
+        async def handler(request):
+            seen["request"] = request
+            return "ok"
+
+        request = _ModelCallRequest("claude-sonnet-5-5", history)
+        request.state = state
+        response = await MultimodalStripMiddleware().awrap_model_call(request, handler)
+        image = next(
+            block
+            for block in seen["request"].messages[0].content
+            if isinstance(block, dict) and block.get("type") != "text"
+        )
+        url = image.get("image_url", {}).get("url") or image["source"]["data"]
+        data = base64.b64decode(url.split(",", 1)[-1])
+        return Image.open(io.BytesIO(data)).width, response
+
+    @pytest.mark.asyncio
+    async def test_a_thread_from_before_the_fixed_side_keeps_its_images_by_count(self):
+        width, response = await self._call(self._history(thinking=True), {})
+
+        assert width == 2400
+        assert response.command.update == {"image_side_rule": "count"}
+        assert await self._call(self._history(thinking=True), {"image_side_rule": "count"}) == (
+            2400,
+            "ok",
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_thread_with_thinking_and_no_image_behind_it_takes_the_fixed_side(self):
+        """Only an image sent ahead of thinking ties the thread to the count:
+        one arriving after it fits to the fixed side from its first call, so a
+        later image count never refits it."""
+        history = self._history(thinking=True)
+        history = [HumanMessage(content="Hi"), history[1], history[0]]
+
+        seen = {}
+
+        async def handler(request):
+            seen["request"] = request
+            return "ok"
+
+        request = _ModelCallRequest("claude-sonnet-5-5", history)
+        request.state = {}
+        response = await MultimodalStripMiddleware().awrap_model_call(request, handler)
+
+        assert response.command.update == {"image_side_rule": "fixed"}
+
+    @pytest.mark.asyncio
+    async def test_a_new_thread_fits_its_images_to_the_fixed_side(self):
+        width, response = await self._call(self._history(thinking=False), {})
+
+        assert width == 2000
+        assert response.command.update == {"image_side_rule": "fixed"}

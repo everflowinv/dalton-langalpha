@@ -14,13 +14,13 @@ import pytest
 from langchain_core.messages import ToolMessage
 from PIL import Image
 
-from ptc_agent.agent.middleware.file_operations import multimodal
 from ptc_agent.core.sandbox import files as sandbox_files
 from ptc_agent.agent.middleware.file_operations.multimodal import (
     MultimodalMiddleware,
     _is_visual_request,
     attach_to_tool_result,
 )
+from src.tools.web.inhouse import guard
 
 
 def _pdf_bytes(pages: int = 1) -> bytes:
@@ -158,7 +158,7 @@ class TestTheWriteSideNeverJudgesTheModel:
             )
 
         monkeypatch.setattr(
-            multimodal, "GuardedAsyncTransport", lambda: httpx.MockTransport(handler)
+            guard, "GuardedAsyncTransport", lambda: httpx.MockTransport(handler)
         )
         mw = MultimodalMiddleware(sandbox=_Sandbox(served))
         result = await mw.awrap_tool_call(self._read(file_path), self._handler)
@@ -180,7 +180,7 @@ class TestContentSizeCap:
             return httpx.Response(200, content=b"x" * 4096)
 
         monkeypatch.setattr(
-            multimodal, "GuardedAsyncTransport", lambda: httpx.MockTransport(handler)
+            guard, "GuardedAsyncTransport", lambda: httpx.MockTransport(handler)
         )
 
         result = await mw._handle_url_content(
@@ -231,7 +231,7 @@ class TestContentSizeCap:
                 )
 
         mw = MultimodalMiddleware(sandbox=_Sandbox())
-        monkeypatch.setattr(multimodal, "GuardedAsyncTransport", _Blocking)
+        monkeypatch.setattr(guard, "GuardedAsyncTransport", _Blocking)
 
         result = await mw._handle_url_content(
             "http://x.corp/a.png", _ack(), "call-1"
@@ -310,7 +310,7 @@ class TestContentIsTypedByItsBytes:
         it sent every one of them down the image path."""
         mw = MultimodalMiddleware(sandbox=_Sandbox())
         monkeypatch.setattr(
-            multimodal,
+            guard,
             "GuardedAsyncTransport",
             lambda: httpx.MockTransport(
                 lambda request: httpx.Response(200, content=_pdf_bytes())
@@ -333,7 +333,7 @@ class TestContentIsTypedByItsBytes:
         Image.new("RGB", (2, 2), "blue").save(buf, format="BMP")
         mw = MultimodalMiddleware(sandbox=_Sandbox())
         monkeypatch.setattr(
-            multimodal,
+            guard,
             "GuardedAsyncTransport",
             lambda: httpx.MockTransport(
                 lambda request: httpx.Response(200, content=buf.getvalue())
@@ -568,7 +568,7 @@ class TestPdfPageWindows:
     async def test_a_url_pdf_is_windowed_too(self, monkeypatch):
         url = "https://files.example.com/report.pdf"
         monkeypatch.setattr(
-            multimodal,
+            guard,
             "GuardedAsyncTransport",
             lambda: httpx.MockTransport(
                 lambda request: httpx.Response(200, content=_numbered_pdf(30))

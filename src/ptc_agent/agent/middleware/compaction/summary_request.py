@@ -10,13 +10,14 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Sequence
-from typing import cast
+from typing import Literal, cast
 
 from langchain_core.messages import (
     AIMessage,
     AnyMessage,
     HumanMessage,
     SystemMessage,
+    ToolMessage,
     get_buffer_string,
 )
 from langchain_core.messages.utils import trim_messages
@@ -79,6 +80,7 @@ Guidelines:
 - Omit categories that have no content
 - Be concise but comprehensive
 - Use natural prose or bullet points as appropriate
+- Record a reading from a live feed, such as a price or a market status, with the time it was taken, as its value at that time rather than the current one
 </instructions>
 
 <output_format>
@@ -91,12 +93,20 @@ Then organize naturally using markdown headers.
 Write as if briefing a colleague who needs to continue your work without repeating what's done.
 </output_format>"""
 
+def keeps_turns(preserved: Sequence[AnyMessage]) -> bool:
+    """Whether a summary leaves a turn word for word after it: an answer or a
+    tool result, not only the user's newest message, which a summary that
+    keeps nothing hands on as it is."""
+    return any(isinstance(m, (AIMessage, ToolMessage)) for m in preserved)
+
+
 # The transcript summarizer's prompt. Instructions only: the conversation
 # history is delivered in a separate HumanMessage so the system channel stays
 # bounded and cacheable, and so BaseChatModel.format() doesn't try to interpret
 # message content as further format placeholders.
-DEFAULT_SUMMARY_PROMPT = (
-    """<role>
+def _transcript_prompt(after: str) -> str:
+    return (
+        f"""<role>
 Conversation Context Summarizer
 </role>
 
@@ -106,52 +116,140 @@ message will be replaced with the context you extract. This is critical -
 ensure you capture all important information so you can continue the work
 without losing progress.
 
-The most recent messages are not in this history: they stay in context, word
-for word, right after your summary, so the work may have moved on from where
-this history ends. Describe unfinished work as where it stood at that point,
-not as still to do.
+{after}
 </context>
 
 """
-    + _SUMMARY_BODY
-)
+        + _SUMMARY_BODY
+    )
+
 
 # The prompt for the model that holds the conversation, which summarizes it in
 # place (a provider's own compaction): no role of its own, since it is still
 # the agent, and the history is the conversation above, not a user message.
-NATIVE_SUMMARY_PROMPT = (
-    """<context>
+def _native_prompt(after: str) -> str:
+    return (
+        f"""<context>
 You're nearing your context limit. Everything above will be replaced by the
 summary you write now, so capture all you need to continue the work without
 losing progress.
 
-The most recent messages are not above: they stay in context, word for word,
-right after your summary, so the work may have moved on from where this
-conversation ends. Describe unfinished work as where it stood at that point,
-not as still to do.
+{after}
 </context>
 
 """
-    + _SUMMARY_BODY
-)
+        + _SUMMARY_BODY
+    )
+
+
+# The prompt for the model whose provider compacted the conversation into a
+# summary only that provider can read, when the user moves the thread to a
+# model of another provider. Sent as the last user message after that summary,
+# so the provider reads the summary itself, from its cache.
+def _handoff_prompt(after: str) -> str:
+    return (
+        f"""<context>
+This conversation is moving to a model from another provider, which cannot
+read the compacted summary above. Write it out in full for that model: what
+you write replaces the compacted summary for it, so capture all it needs to
+continue the work without losing progress. This request comes from the
+system, not the user, and is not part of the work: leave it out of what you
+write.
+
+{after}
+</context>
+
+"""
+        + _SUMMARY_BODY
+    )
+
+
+_NO_TAIL_STATE = """What you write is the only record of where the work stands, so record its
+current state exactly: the last step completed, what was in progress and how
+far it got, any tool result or decision still pending, any question to the
+user still open, and the user's latest request in their own words."""
+
+
+_NO_TAIL_NOTES = """Your checkpoint notes are the one exception: where a note already records one
+of these details, cite it by the note's file name, and its section if the note
+has sections, instead of restating it. Then name the details to read back from
+each note before continuing."""
+
+
+def _family(prompt: Callable[[str], str], kept: str, no_tail: str) -> tuple[str, str, str]:
+    """A family's prompt for a summary that keeps turns after it, for one that
+    keeps none (``keeps_turns``), and for one that keeps none in a thread
+    with checkpoint notes, which keep some of that state already."""
+    state = f"{no_tail}\n{_NO_TAIL_STATE}"
+    return prompt(kept), prompt(state), prompt(f"{state}\n{_NO_TAIL_NOTES}")
+
 
 _SUMMARY_OPEN, _SUMMARY_END = "<summary>", "</summary>"
 
-# The prompt for the model that holds the conversation writing the summary as
-# text, sent as the last user message of its own request. Reading its own
-# reasoning, it takes steps it only planned for done; with its tools bound it
-# may call one instead; and some providers stop mid-word under a normal stop
-# reason, which the closing line is there to show.
-SELF_SUMMARY_PROMPT = NATIVE_SUMMARY_PROMPT + (
+# The rules added for the model that holds the conversation writing the
+# summary as text, sent as the last user message of its own request. Reading
+# its own reasoning, it takes steps it only planned for done; with its tools
+# bound it may call one instead; and some providers stop mid-word under a
+# normal stop reason, which the closing line is there to show.
+_SELF_SUMMARY_RULES = (
     "\n\nCount as done only what a tool result above shows was done: a step you "
     "planned in your reasoning that no tool carried out is not done, and a file "
     "no tool wrote does not exist. Write the summary as text; do not call a tool."
     f"\n\nEnd the summary with the line `{_SUMMARY_END}` on its own."
 )
 
+SummaryKind = Literal["transcript", "native", "self", "handoff"]
+
+_NATIVE = _family(
+    _native_prompt,
+    """The most recent messages are not above: they stay in context, word for word,
+right after your summary, so the work may have moved on from where this
+conversation ends. Describe unfinished work as where it stood at that point,
+not as still to do.""",
+    """Nothing above stays in context: the conversation goes on from your summary,
+so describe the work as it stands where this conversation ends.""",
+)
+
+_PROMPTS: dict[SummaryKind, tuple[str, str, str]] = {
+    "transcript": _family(
+        _transcript_prompt,
+        """The most recent messages are not in this history: they stay in context, word
+for word, right after your summary, so the work may have moved on from where
+this history ends. Describe unfinished work as where it stood at that point,
+not as still to do.""",
+        """Nothing after this history stays in context: the conversation goes on from
+your summary, so describe the work as it stands where this history ends.""",
+    ),
+    "native": _NATIVE,
+    "self": tuple(prompt + _SELF_SUMMARY_RULES for prompt in _NATIVE),
+    "handoff": _family(
+        _handoff_prompt,
+        """The messages that came after the compacted summary stay in context, word for
+word, right after yours, so the work may have moved on from where it ends.
+Describe unfinished work as where it stood at that point, not as still to do.""",
+        """Nothing came after the compacted summary, so the conversation goes on from
+what you write: describe the work as it stands where the summary ends.""",
+    ),
+}
+
+
+def summary_prompt(kind: SummaryKind, keeps: bool, notes: bool = False) -> str:
+    """The instructions for a summary written by ``kind``: the transcript
+    summarizer, the agent's provider compacting in place, the agent's model
+    writing it as text, or that model writing out a summary only its provider
+    can read. ``keeps`` says whether turns stay after it (``keeps_turns``), and
+    ``notes`` whether the thread keeps checkpoint notes (the scratchpad)."""
+    kept, no_tail, with_notes = _PROMPTS[kind]
+    if keeps:
+        return kept
+    return with_notes if notes else no_tail
+
+
+DEFAULT_SUMMARY_PROMPT = summary_prompt("transcript", True)
+
 
 def finished_summary(text: str) -> str | None:
-    """The summary a model wrote to ``SELF_SUMMARY_PROMPT``, without its tags
+    """The summary a model wrote to the self-summary prompt, without its tags
     or anything it said around them, or None when it did not reach the
     closing line."""
     body, closed, after = text.rpartition(_SUMMARY_END)
@@ -161,28 +259,6 @@ def finished_summary(text: str) -> str | None:
     _, opened, inside = body.partition(_SUMMARY_OPEN)
     return (inside if opened else body).strip() or None
 
-
-# The prompt for the model whose provider compacted the conversation into a
-# summary only that provider can read, when the user moves the thread to a
-# model of another provider. Sent as the last user message after that summary,
-# so the provider reads the summary itself, from its cache.
-HANDOFF_SUMMARY_PROMPT = (
-    """<context>
-This conversation is moving to a model from another provider, which cannot
-read the compacted summary above. Write it out in full for that model: what
-you write replaces the compacted summary for it, so capture all it needs to
-continue the work without losing progress. This request comes from the
-system, not the user, and is not part of the work: leave it out of what you
-write.
-
-The messages that came after the compacted summary stay in context, word for
-word, right after yours, so the work may have moved on from where it ends.
-Describe unfinished work as where it stood at that point, not as still to do.
-</context>
-
-"""
-    + _SUMMARY_BODY
-)
 
 # Appended only when the history carries transcript markers: without a
 # transcript there is no file to cite, and an instruction to cite one would

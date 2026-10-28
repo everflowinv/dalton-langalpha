@@ -28,7 +28,7 @@ from ptc_agent.agent.middleware.runtime_context import (
     ENVELOPE_CLOSE,
     ENVELOPE_OPEN,
     BaselineContextMiddleware,
-    TailEnvelopeMiddleware,
+    RowCarrierMiddleware,
     TurnContextMiddleware,
 )
 from ptc_agent.agent.middleware.runtime_context.changes import sha256_text
@@ -143,7 +143,7 @@ def _build_chain(captured: dict):
             AnthropicPromptCachingMiddleware(unsupported_model_behavior="ignore"),
             SystemPromptCacheMiddleware(),
             BaselineContextMiddleware(session=None, guidance="lean"),
-            TailEnvelopeMiddleware(now=NOW, guidance="lean"),
+            RowCarrierMiddleware(),
         ],
         capture,
     )

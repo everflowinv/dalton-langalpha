@@ -4,6 +4,7 @@ import inspect
 import logging
 import os
 import json
+import sys
 import uuid
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -1466,7 +1467,8 @@ def get_pdf_page_tokens(route: str) -> int | None:
 # count on. Two tighten with the number of images in the request, which is why
 # the count is an argument: Anthropic's above 20, DeepSeek's from 15. OpenAI,
 # Gemini and DashScope document that they shrink an oversized image rather than
-# refuse it, hence no rule.
+# refuse it, hence no rule. Anthropic's images are held to its tightest step
+# from the first, for the reason ``get_max_image_side`` gives.
 _IMAGE_SIDE_RULES: dict[str, tuple[int, tuple[tuple[int, int], ...]]] = {
     "anthropic": (8000, ((21, 2000),)),
     "deepseek": (8192, ((15, 4096),)),
@@ -1563,7 +1565,23 @@ def get_max_image_side(route: str, image_count: int) -> int | None:
     at that count, for the reason ``get_max_pdf_pages`` gives: it may be any of
     those vendors behind a gateway, and no one vendor's rule is the tightest
     at every count.
+
+    Anthropic gets its many-image side at every count: a thinking block it
+    signed stays valid only while every message before it is byte-identical,
+    and re-fitting the images already sent when a later one takes the request
+    past 20 would invalidate the thinking after the first of them. An image
+    larger than that side gives up the detail from its first call instead.
     """
+    if route == "anthropic":
+        return _side_rule(route, sys.maxsize)
+    return get_max_image_side_by_count(route, image_count)
+
+
+def get_max_image_side_by_count(route: str, image_count: int) -> int | None:
+    """:func:`get_max_image_side` with Anthropic held to its rule at
+    ``image_count`` too: the side a thread whose images were sent before the
+    fixed one shipped keeps fitting them to, since a new fit would invalidate
+    the thinking after them."""
     if route in _UNBOUNDED_IMAGE_PROVIDERS:
         return None
     if route in _IMAGE_SIDE_RULES:

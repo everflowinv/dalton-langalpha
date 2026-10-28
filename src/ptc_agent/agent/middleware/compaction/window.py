@@ -25,12 +25,17 @@ from typing import Any
 from langchain_core.messages import AnyMessage
 from langgraph.types import Overwrite
 
+from ptc_agent.agent.middleware.compaction.notes import unanswered_notes_rows
 from ptc_agent.agent.middleware.compaction.offloading import (
     recorded_offloads,
     removed_attachments,
     tool_call_ids,
 )
 from ptc_agent.agent.middleware.compaction.utils import resolve_cutoff_index
+from ptc_agent.agent.middleware.thinking_binding import (
+    UNSENT_THINKING_KEY,
+    unsent_thinking,
+)
 from ptc_agent.agent.state import ensure_message_ids
 from ptc_agent.agent.transcript.classify import is_run_boundary_message
 from ptc_agent.agent.transcript.identity import Window
@@ -80,8 +85,10 @@ def trim(
     """The update trimming ``state``'s messages before ``cut``, ``head``
     being the window the server answered for them (``WindowCoverage``).
 
-    The recorded offloads and removed attachments shrink to what is still in
-    the list, as a compaction drops the ones it summarized. Ids are stamped on the kept
+    The recorded offloads, removed attachments, unsent thinking and
+    unanswered notes rows shrink to what is still in the list, as a
+    compaction drops the ones it summarized; unsent thinking, which only
+    shrinks here, also keeps the summary in view. Ids are stamped on the kept
     messages here because langgraph 1.2.11 left an ``Overwrite``'s messages
     unstamped; later releases stamp them too.
     """
@@ -94,9 +101,18 @@ def trim(
         update["_offloaded_tool_call_ids"] = args & live
     if reads - live:
         update["_offloaded_read_result_ids"] = reads & live
-    removed = removed_attachments(state)
-    if removed - {msg.id for msg in kept}:
-        update["_removed_attachment_ids"] = removed & {msg.id for msg in kept}
+    ids = {msg.id for msg in kept}
+    for key, recorded in (
+        ("_removed_attachment_ids", removed_attachments(state)),
+        ("_unanswered_notes_rows", unanswered_notes_rows(state)),
+    ):
+        if recorded - ids:
+            update[key] = recorded & ids
+    summary = (state.get("_summarization_event") or {}).get("summary_message")
+    in_view = ids | {getattr(summary, "id", None)}
+    unsent = unsent_thinking(state)
+    if unsent - in_view:
+        update[UNSENT_THINKING_KEY] = Overwrite(unsent & in_view)
     for carry in carries:
         update.update(carry(trimmed, state))
     return update

@@ -1181,3 +1181,201 @@ class TestReasoningPayloadEscalation:
         with pytest.raises(Exception):
             await mw.awrap_model_call(_FakeRequest(client, self._history()), handler)
         assert len(calls) == 1
+
+
+class TestAStripIsKept:
+    """A stripped retry the primary answered stays stripped for the thread.
+
+    The answer's thinking is bound to the history it was sent with, so putting
+    the stripped reasoning back on a later request would edit that history.
+    """
+
+    THINKING = {"type": "thinking", "thinking": "", "signature": "sig-1"}
+
+    def _history(self):
+        from langchain_core.messages import AIMessage, HumanMessage
+
+        return [
+            HumanMessage("q", id="h-1"),
+            AIMessage(content=[self.THINKING, {"type": "text", "text": "a"}], id="a-1"),
+            HumanMessage("again", id="h-2"),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_the_answer_records_what_was_stripped(self, events):
+        from langchain.agents.middleware.types import ExtendedModelResponse
+
+        client = _FakeModel("primary-model")
+        mw = _make_middleware(client)
+        answer = ModelResponse(result=[AIMessage("ok", id="a-2")])
+        calls = []
+
+        async def handler(req):
+            calls.append(req)
+            if len(calls) == 1:
+                raise _status_error("messages.1.content.0: Invalid signature", status=400)
+            return answer
+
+        result = await mw.awrap_model_call(_FakeRequest(client, self._history()), handler)
+
+        assert isinstance(result, ExtendedModelResponse)
+        assert result.model_response is answer
+        assert result.command.update == {"_unsent_thinking_ids": {"a-1"}}
+
+    @pytest.mark.asyncio
+    async def test_a_later_request_sends_the_stripped_messages_stripped(self, events):
+        client = _FakeModel("primary-model")
+        mw = _make_middleware(client)
+        seen = []
+
+        async def handler(req):
+            seen.append([m.content for m in req.messages])
+            return ModelResponse(result=[AIMessage("ok")])
+
+        newer = AIMessage(content=[{**self.THINKING, "signature": "sig-2"}], id="a-2")
+        request = _FakeRequest(
+            client,
+            [*self._history(), newer],
+            state={"messages": [], "_unsent_thinking_ids": {"a-1"}},
+        )
+        result = await mw.awrap_model_call(request, handler)
+
+        assert isinstance(result, ModelResponse)
+        assert seen == [["q", [{"type": "text", "text": "a"}], "again", newer.content]]
+
+    @pytest.mark.asyncio
+    async def test_a_fallback_keeps_nothing(self, events):
+        primary = _FakeModel("primary-model")
+        backup = _FakeModel("backup-model")
+        mw = _make_middleware(primary, fallbacks=[("backup-model", backup)], max_retries=0)
+
+        async def handler(req):
+            if req.model is primary:
+                raise _status_error("overloaded", status=400)
+            if any(isinstance(m.content, list) and self.THINKING in m.content for m in req.messages):
+                raise _status_error("messages.1.content.0: Invalid signature", status=400)
+            return ModelResponse(result=[AIMessage("ok")])
+
+        result = await mw.awrap_model_call(_FakeRequest(primary, self._history()), handler)
+
+        assert isinstance(result, ModelResponse)
+        assert result.result[0].response_metadata[FALLBACK_KEY] == "backup-model"
+
+    @pytest.mark.asyncio
+    async def test_the_strip_is_logged_with_the_providers_text(self, events):
+        from structlog.testing import capture_logs
+
+        client = _FakeModel("primary-model")
+        mw = _make_middleware(client)
+        calls = []
+
+        async def handler(req):
+            calls.append(req)
+            if len(calls) == 1:
+                raise _status_error("messages.1.content.0: Invalid signature in thinking block", status=400)
+            return ModelResponse(result=[AIMessage("ok")])
+
+        with capture_logs() as logs:
+            await mw.awrap_model_call(_FakeRequest(client, self._history()), handler)
+
+        strips = [e for e in logs if e["event"].startswith("[ModelResilience] retrying without reasoning")]
+        assert len(strips) == 1
+        assert strips[0]["model"] == "primary-model"
+        assert strips[0]["error"] == "messages.1.content.0: Invalid signature in thinking block"
+        assert strips[0]["log_level"] == "warning"
+
+
+class TestDroppedThinkingReport:
+    """Every answer that says the provider dropped earlier thinking is logged
+    and stamped on its run, by reason, so a thread's count needs no state."""
+
+    @staticmethod
+    def _answer(entries):
+        return ModelResponse(
+            result=[AIMessage("ok", response_metadata={"input_transformations": entries})]
+        )
+
+    @pytest.mark.asyncio
+    async def test_drops_are_logged_and_stamped_by_reason(self, events, monkeypatch):
+        from structlog.testing import capture_logs
+
+        stamps = []
+        monkeypatch.setattr(
+            "ptc_agent.agent.middleware.model_resilience.stamp_run",
+            lambda **fields: stamps.append(fields),
+        )
+        client = _FakeModel("primary-model")
+        mw = _make_middleware(client)
+        entries = [
+            {"type": "thinking_dropped", "path": "messages.1.content.0", "reason": "prefix_binding_mismatch"},
+            {"type": "thinking_dropped", "path": "messages.3.content.0", "reason": "prefix_binding_mismatch"},
+            {"type": "thinking_dropped", "path": "messages.5.content.0", "reason": "model_binding_mismatch"},
+        ]
+
+        async def handler(req):
+            return self._answer(entries)
+
+        with capture_logs() as logs:
+            await mw.awrap_model_call(_FakeRequest(client), handler)
+
+        drops = [e for e in logs if "dropped" in e["event"]]
+        assert len(drops) == 1
+        assert drops[0]["log_level"] == "warning"
+        assert drops[0]["prefix_binding_mismatch"] == 2
+        assert drops[0]["model_binding_mismatch"] == 1
+        assert stamps == [{"thinking_dropped": {"prefix_binding_mismatch": 2, "model_binding_mismatch": 1}}]
+
+    @pytest.mark.asyncio
+    async def test_a_block_dropped_again_is_stamped_as_repeated(self, events, monkeypatch):
+        from structlog.testing import capture_logs
+
+        stamps = []
+        monkeypatch.setattr(
+            "ptc_agent.agent.middleware.model_resilience.stamp_run",
+            lambda **fields: stamps.append(fields),
+        )
+        client = _FakeModel("primary-model")
+        mw = _make_middleware(client)
+        entries = [{"type": "thinking_dropped", "path": "messages.1.content.0", "reason": "prefix_binding_mismatch"}]
+        earlier = self._answer(entries).result[0]
+
+        async def handler(req):
+            return self._answer(entries)
+
+        with capture_logs() as logs:
+            await mw.awrap_model_call(_FakeRequest(client, messages=[earlier]), handler)
+
+        assert [e["log_level"] for e in logs if "dropped" in e["event"]] == ["info"]
+        assert stamps == [{"thinking_dropped": {"repeated": 1}}]
+
+    @pytest.mark.asyncio
+    async def test_a_model_switch_alone_is_logged_as_info(self, events):
+        from structlog.testing import capture_logs
+
+        client = _FakeModel("primary-model")
+        mw = _make_middleware(client)
+        entries = [{"type": "thinking_dropped", "path": "messages.1.content.0", "reason": "model_binding_mismatch"}]
+
+        async def handler(req):
+            return self._answer(entries)
+
+        with capture_logs() as logs:
+            await mw.awrap_model_call(_FakeRequest(client), handler)
+
+        assert [e["log_level"] for e in logs if "dropped" in e["event"]] == ["info"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("entries", [[], None])
+    async def test_an_answer_with_nothing_dropped_says_nothing(self, entries, events):
+        from structlog.testing import capture_logs
+
+        client = _FakeModel("primary-model")
+        mw = _make_middleware(client)
+
+        async def handler(req):
+            return self._answer(entries)
+
+        with capture_logs() as logs:
+            await mw.awrap_model_call(_FakeRequest(client), handler)
+
+        assert not [e for e in logs if "dropped" in e["event"]]

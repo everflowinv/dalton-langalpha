@@ -14,10 +14,11 @@ downstream works from typed fields instead of guessing at a dict.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from html import escape
-from typing import Any
+from typing import Any, Literal
 
 from ptc_agent.agent.middleware.runtime_context.changes import (
     UPDATE_SCHEMA_VERSION,
@@ -32,6 +33,12 @@ from ptc_agent.agent.middleware.runtime_context.harness_blocks import (
 from ptc_agent.agent.middleware.runtime_context.profile import (
     ProfileSnapshot,
     profile_diff_lines,
+)
+from ptc_agent.agent.middleware.runtime_context.restate import (
+    restate,
+    restated_row,
+    row_block,
+    stated_sources,
 )
 from ptc_agent.agent.middleware.runtime_context.state import as_dict
 from ptc_agent.agent.roles import AgentRole
@@ -338,6 +345,12 @@ class BaselineEpoch:
     # way, since the block is cached per thread. None for a build that says
     # nothing of it or an epoch stored before the value was.
     channels_enabled: bool | None = None
+    # Whether the block names ``schedule_wakeup``. Held like the two above,
+    # since the block is the prefix of every thinking block after it; a flip
+    # is a rebuild where nothing binds the block, and is restated after the
+    # next summary where something does. None for an epoch stored before the
+    # value was.
+    wakeups_enabled: bool | None = None
     # False for the empty epoch of a thread's first turn, which is what tells
     # the first turn apart from an epoch that happens to carry no sources.
     stored: bool = False
@@ -363,6 +376,7 @@ class BaselineEpoch:
         seen = data.get("compaction_seen")
         mounted = data.get("files_mounted")
         channels = data.get("channels_enabled")
+        wakeups = data.get("wakeups_enabled")
         return cls(
             epoch=int(data.get("epoch") or 0),
             built_at=str(data.get("built_at") or ""),
@@ -383,6 +397,7 @@ class BaselineEpoch:
             ),
             files_mounted=mounted if isinstance(mounted, bool) else None,
             channels_enabled=channels if isinstance(channels, bool) else None,
+            wakeups_enabled=wakeups if isinstance(wakeups, bool) else None,
             stored=bool(data),
         )
 
@@ -409,6 +424,8 @@ class BaselineEpoch:
             state["files_mounted"] = self.files_mounted
         if self.channels_enabled is not None:
             state["channels_enabled"] = self.channels_enabled
+        if self.wakeups_enabled is not None:
+            state["wakeups_enabled"] = self.wakeups_enabled
         if self.cursor.profile is not None and self.cursor.profile != self.profile:
             # Left out when it is the frozen copy, which the hash then names.
             state["profile_seen"] = self.cursor.profile.to_state()
@@ -477,6 +494,20 @@ class Observations:
     # Whether this turn's agent has the chat-app settings folder. None for a
     # build whose block says nothing about it.
     channels_enabled: bool | None = None
+    # Whether this turn's agent has ``schedule_wakeup``. None for a build
+    # whose block says nothing about it.
+    wakeups_enabled: bool | None = None
+    # Whether Claude's thinking is in what the next call sends. Such a block
+    # stays valid only while the system prompt in front of it is sent as it
+    # was, so while one is in view the block is never rebuilt: what a rebuild
+    # would have said goes into rows instead.
+    thinking_bound: bool = False
+    # What the newest summary leaves for the turns after it to read, carried
+    # by the row filed once that summary is seen. None when it leaves nothing.
+    compaction_note: str | None = None
+    # Whether the call that answered from that summary was sent its note
+    # already, so the rows after it restate without it.
+    compaction_note_sent: bool = False
     # The role this turn's agent runs in, for the rows whose wording differs
     # by role.
     role: AgentRole = "analyst"
@@ -487,52 +518,35 @@ class Observations:
 # ---------------------------------------------------------------------------
 
 
+Plan = Literal["observe", "rebuild", "restate", "state_sources"]
+
+
 def advance_epoch(
-    epoch: BaselineEpoch, observations: Observations
+    epoch: BaselineEpoch,
+    observations: Observations,
+    render: Callable[[BaselineEpoch], dict[str, str]],
 ) -> tuple[BaselineEpoch | None, list[DurableUpdate]]:
     """The epoch this turn leaves behind, and the rows it owes the model.
 
-    One decision for all of it. Either the epoch is rebuilt, and no row is owed
-    because the block itself now says what the sources hold, or the block stands
-    and every source that moved since it was last observed files a row. Returns
-    ``(None, [])`` when nothing moved, which is the common case and writes no
-    state at all.
+    One decision for all of it (:func:`_plan`). Either the epoch is rebuilt,
+    and no row is owed because the block itself now says what the sources
+    hold, or the block stands and every source that moved since it was last
+    observed files a row. Returns ``(None, [])`` when nothing moved, which is
+    the common case and writes no state at all. ``render`` gives each section
+    of an epoch's block, which is how a row states a section whole where the
+    block stands with a rebuild due.
     """
-    reason = _rebuild_reason(epoch, observations)
-    if reason is not None:
-        rebuilt = _freeze(epoch, observations, reason)
-        # A rebuild that carried a source's old copy forward has not folded
-        # that source's rows in, so they stay the current word on it and the
-        # retiring row names them as the exception; every other row is
-        # retired now, whether or not the epoch is complete, since a source
-        # that stays unavailable would otherwise keep a row about a folded
-        # source in force for as long as the retries run. A file read that
-        # failed is retried by the incomplete epoch; a platform read that did
-        # not answer is measured again by the change detector next turn.
-        carried = _carried_row_kinds(observations)
-        folded = [kind for kind in observations.retained_rows if kind not in carried]
-        rows: list[DurableUpdate] = []
-        if folded:
-            still = sorted(
-                {kind for kind in observations.retained_rows if kind in carried}
-            )
-            rows.append(_rebuilt_row(observations.now, folded, still))
-        if not observations.profile_available:
-            # The rebuilt block states this turn's trading rule, but a profile
-            # row it leaves in force can still state the one before it.
-            profile_row, seen = _profile_step(rebuilt, observations)
-            if profile_row is not None and seen is not None:
-                rows.append(profile_row)
-                rebuilt = replace(
-                    rebuilt,
-                    cursor=ObservationCursor(
-                        observed={**rebuilt.cursor.observed, "profile": seen.sha()},
-                        drift_updates=rebuilt.cursor.drift_updates + 1,
-                        profile=seen,
-                    ),
-                )
-        return rebuilt, rows
+    plan, reason = _plan(epoch, observations)
+    if plan == "rebuild":
+        return _rebuild(epoch, observations, reason)
+    if plan == "restate":
+        return restate(epoch, _freeze(epoch, observations, reason), observations, render)
     rows, cursor = _observe(epoch, observations)
+    if plan == "state_sources":
+        rebuilt = _freeze(epoch, observations, reason)
+        stated, cursor = stated_sources(epoch, rebuilt, observations, cursor, render)
+        if stated is not None:
+            rows.append(stated)
     # An epoch stored before the cursor kept the profile has a hash that a row
     # since may have moved off the frozen copy. A read that answers says what
     # it names; kept, a later turn whose read does not answer can still
@@ -543,7 +557,7 @@ def advance_epoch(
         and cursor.profile is not None
     )
     adopted = {}
-    for name in ("files_mounted", "channels_enabled"):
+    for name in ("files_mounted", "channels_enabled", "wakeups_enabled"):
         value = getattr(observations, name)
         if getattr(epoch, name) is None and value is not None:
             adopted[name] = value
@@ -555,6 +569,69 @@ def advance_epoch(
     if not rows and not backfilled:
         return None, []
     return replace(epoch, cursor=cursor), rows
+
+
+def _plan(epoch: BaselineEpoch, obs: Observations) -> tuple[Plan, str | None]:
+    """How this turn advances the epoch, and the rebuild reason behind it.
+
+    ``observe`` files a row for each source that moved, and ``rebuild``
+    freezes a new block. A block Claude's thinking is bound to stands even
+    when a rebuild is due, since rebuilding it would invalidate every thinking
+    block after it, so what the rebuild would have said goes into rows
+    instead: ``restate`` after a summary, and otherwise ``state_sources``,
+    which observes as well.
+    """
+    reason = _rebuild_reason(epoch, obs)
+    if reason is None:
+        return "observe", None
+    if not (epoch.stored and obs.thinking_bound):
+        return "rebuild", reason
+    if _summarized(epoch, obs):
+        return "restate", reason
+    return "state_sources", reason
+
+
+def _rebuild(
+    epoch: BaselineEpoch, obs: Observations, reason: str
+) -> tuple[BaselineEpoch, list[DurableUpdate]]:
+    """The rebuilt epoch, and the rows that hand authority back to its block."""
+    rebuilt = _freeze(epoch, obs, reason)
+    # A rebuild that carried a source's old copy forward has not folded
+    # that source's rows in, so they stay the current word on it and the
+    # retiring row names them as the exception; every other row is
+    # retired now, whether or not the epoch is complete, since a source
+    # that stays unavailable would otherwise keep a row about a folded
+    # source in force for as long as the retries run. A file read that
+    # failed is retried by the incomplete epoch; a platform read that did
+    # not answer is measured again by the change detector next turn.
+    carried = _carried_row_kinds(obs)
+    folded = [kind for kind in obs.retained_rows if kind not in carried]
+    rows: list[DurableUpdate] = []
+    if folded:
+        still = sorted({kind for kind in obs.retained_rows if kind in carried})
+        rows.append(_rebuilt_row(obs.now, folded, still))
+    if not obs.profile_available:
+        # The rebuilt block states this turn's trading rule, but a profile
+        # row it leaves in force can still state the one before it.
+        profile_row, seen = _profile_step(rebuilt, obs)
+        if profile_row is not None and seen is not None:
+            rows.append(profile_row)
+            rebuilt = replace(
+                rebuilt,
+                cursor=ObservationCursor(
+                    observed={**rebuilt.cursor.observed, "profile": seen.sha()},
+                    drift_updates=rebuilt.cursor.drift_updates + 1,
+                    profile=seen,
+                ),
+            )
+    if _summarized(epoch, obs) and obs.compaction_note:
+        rows.insert(0, restated_row(obs, [], [], after_summary=True))
+    return rebuilt, rows
+
+
+def _summarized(epoch: BaselineEpoch, obs: Observations) -> bool:
+    """Whether a summary the epoch has not taken in is in view."""
+    return obs.compaction is not None and epoch.compaction_seen != obs.compaction
 
 
 def compaction_fingerprint(event: Any) -> str | None:
@@ -585,27 +662,6 @@ def _carried_row_kinds(obs: Observations) -> set[str]:
     return kinds
 
 
-#: The block a change row of each non-harness kind speaks for, as the retiring
-#: row names it. The harness kinds name their block from ``HARNESS_BLOCKS``.
-_ROW_BLOCKS: dict[str, str] = {
-    "agent_md_changed": "<agentmd>",
-    "memo_changed": "the memo count",
-    "profile_changed": "<user_profile> and <user_identity>",
-    "workspace_changed": "<workspace>",
-}
-
-
-def _row_block(kind: str) -> str:
-    # The two memory tiers are two blocks with one tag, and a rebuild can fold
-    # one while the other read fails, so the exception has to name the tier.
-    if kind.startswith("memory_changed:"):
-        return f"<memory> for the {kind.split(':', 1)[1]} tier"
-    harness = harness_block_for(kind)
-    if harness is not None:
-        return harness.label
-    return _ROW_BLOCKS.get(kind, kind)
-
-
 def _rebuilt_row(now: datetime, folded: list[str], still: list[str]) -> DurableUpdate:
     """The row that retires the change rows a rebuild folded in.
 
@@ -618,7 +674,7 @@ def _rebuilt_row(now: datetime, folded: list[str], still: list[str]) -> DurableU
     """
     provenance: dict[str, Any] = {"source": "harness"}
     if still:
-        provenance["still_in_force"] = sorted({_row_block(kind) for kind in still})
+        provenance["still_in_force"] = sorted({row_block(kind) for kind in still})
         # The kinds behind the labels, for the next rebuild's retained-row
         # scan: a compaction can take the change rows this row keeps in force
         # while keeping this row, and the exception has to outlive them.
@@ -648,13 +704,18 @@ def _rebuild_reason(epoch: BaselineEpoch, obs: Observations) -> str | None:
         # as the scratchpad, this one does not). The block would keep rendering
         # it and the change detector would never look at it again.
         return "source_removed"
-    if obs.compaction is not None and epoch.compaction_seen != obs.compaction:
+    if _summarized(epoch, obs):
         return "compaction"
     if (
         obs.rebuild_after_updates
         and epoch.cursor.drift_updates >= obs.rebuild_after_updates
     ):
         return "drift"
+    # TODO(2026-11-25): delete 30 days after this ships, once the threads written before it have aged out. None then means off.
+    if None not in (epoch.wakeups_enabled, obs.wakeups_enabled) and (
+        epoch.wakeups_enabled != obs.wakeups_enabled
+    ):
+        return "switches"
     return None
 
 
@@ -762,6 +823,7 @@ def _freeze(
         cursor=ObservationCursor(observed=observed, drift_updates=0, profile=seen),
         files_mounted=obs.files_mounted,
         channels_enabled=obs.channels_enabled,
+        wakeups_enabled=obs.wakeups_enabled,
         stored=True,
     )
 

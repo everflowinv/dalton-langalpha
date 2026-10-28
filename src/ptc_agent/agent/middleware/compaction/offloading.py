@@ -13,6 +13,11 @@ from langgraph.config import get_config
 
 from ptc_agent.core.paths import WorkspaceLayout
 from ptc_agent.agent.middleware.file_operations.multimodal_strip import remove_attachments
+from ptc_agent.agent.middleware.thinking_binding import (
+    checked_thinking_end,
+    unsent_thinking,
+    without_thinking,
+)
 from src.llms.attachment_payload import FILE_BLOCK_TYPES
 from ptc_agent.agent.middleware.compaction.types import OffloadSettings, TRUNCATABLE_TOOLS
 from ptc_agent.agent.middleware.compaction.utils import (
@@ -103,14 +108,23 @@ def select_offloads(
     effective: list[AnyMessage], settings: OffloadSettings, recorded: Offloads
 ) -> Offloads:
     """New (arg ids, read ids) to hide among the effective messages before
-    the newest ``settings.keep_messages``, leaving out those ``recorded``."""
+    the newest ``settings.keep_messages``, leaving out those ``recorded``.
+
+    Only after the last answer whose thinking is checked
+    (``checked_thinking_end``): a cut ahead of it would invalidate that
+    thinking for good, which no saving is worth. On a Claude thread with
+    thinking on that leaves nothing older than the newest messages to hide.
+    """
+    start = checked_thinking_end(effective)
     cutoff = len(effective) - settings.keep_messages
-    if cutoff <= 0:
+    if cutoff <= start:
         return set(), set()
     arg_ids, read_ids = recorded
+    after = effective[start:]
+    results = {msg.tool_call_id for msg in after if isinstance(msg, ToolMessage)}
     return (
-        oversized_arg_calls(effective, cutoff, settings.max_length) - arg_ids,
-        stale_read_ids(effective, cutoff) - read_ids,
+        oversized_arg_calls(after, cutoff - start, settings.max_length) - arg_ids,
+        (stale_read_ids(effective, cutoff) & results) - read_ids,
     )
 
 
@@ -154,7 +168,9 @@ async def offload_view(
     # A removed PDF's placeholder gives its page count, which a block with no
     # stamp is parsed for.
     await read_ahead(msg for msg in view if getattr(msg, "id", None) in removed)
-    return remove_attachments(view, removed, pages=pdf_pages)
+    return without_thinking(
+        remove_attachments(view, removed, pages=pdf_pages), unsent_thinking(state)
+    )
 
 
 def apply_recorded_offloads(

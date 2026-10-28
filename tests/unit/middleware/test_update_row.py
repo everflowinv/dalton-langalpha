@@ -151,9 +151,9 @@ class TestHarnessRows:
         assert _row("mcp_servers_changed", text="+- polygon", source="harness") == (
             "The MCP server list changed after the copy in <mcp-servers> was frozen\n"
             "\n"
-            "The text below compares it with the frozen copy in <mcp-servers>, which "
-            "stands until this thread compacts: where they differ, this row is the "
-            "current one. A later row for the same block supersedes it.\n"
+            "The text below compares it with the frozen copy in <mcp-servers>: where "
+            "they differ, this row is the current one. A later row for the same "
+            "block supersedes it.\n"
             "\n"
             "+- polygon"
         )

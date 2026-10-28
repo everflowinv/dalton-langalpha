@@ -24,6 +24,7 @@ from ptc_agent.agent.middleware.compaction.utils import (
     find_group_safe_cutoff,
 )
 from ptc_agent.agent.middleware.model_resilience import FALLBACK_KEY
+from ptc_agent.agent.middleware.runtime_context.carrier import spent_stamps
 
 
 @dataclass(frozen=True)
@@ -32,14 +33,17 @@ class Estimate:
     ``counter``, their attachments as the model is charged for them
     (``cost``, see ``attachment_tokens``). ``model`` names it
     (``model_label``), so a growth measured on another is not taken for its
-    count (``context_growth``)."""
+    count (``context_growth``). A market-watch stamp a later user message
+    followed counts nothing (``spent_stamps``)."""
 
     counter: TokenCounter
     cost: Callable[[Any], int] | None = None
     model: str | None = None
 
     def __call__(self, messages: Sequence[Any]) -> int:
-        return self.counter(messages) + attachment_tokens(messages, self.cost)
+        spent = spent_stamps(list(messages))
+        read = [m for m in messages if id(m) not in spent] if spent else messages
+        return self.counter(read) + attachment_tokens(read, self.cost)
 
 
 def is_claude(model: Any) -> bool:
@@ -232,8 +236,10 @@ def message_sizes(messages: Sequence[AnyMessage], estimate: Estimate) -> Iterato
     another model, until a call to this one measures it again.
     """
 
+    spent = spent_stamps(list(messages))
+
     def one(message: AnyMessage) -> int:
-        return estimate([message])
+        return 0 if id(message) in spent else estimate([message])
 
     answers = [i for i, m in enumerate(messages) if isinstance(m, AIMessage)]
     if not answers:

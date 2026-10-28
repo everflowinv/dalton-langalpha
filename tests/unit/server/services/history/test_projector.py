@@ -547,6 +547,26 @@ def test_orchestrator_message_is_hidden_and_opens_no_run():
     )
 
 
+def test_empty_call_retry_hint_is_hidden_and_opens_no_run():
+    """The hint a retry sends lands mid-turn, between a broken answer and the
+    retried one; read as input it would show as a user message and open a run."""
+    from ptc_agent.agent.transcript.classify import (
+        EMPTY_CALL_RETRY_SOURCE,
+        is_run_boundary_message,
+    )
+
+    hint = HumanMessage(
+        content="Your previous response had stop_reason=tool_use",
+        additional_kwargs={"lc_source": EMPTY_CALL_RETRY_SOURCE},
+        id="hint-1",
+    )
+    assert not is_run_boundary_message(hint)
+    assert _sse([hint], agent="task:abc123") == []
+    assert _sse([hint, AIMessage(content="ok", id="ai-1")]) == _sse(
+        [AIMessage(content="ok", id="ai-1")]
+    )
+
+
 def test_stamped_steering_message_projects_delivered():
     delivered = {
         "count": 1,

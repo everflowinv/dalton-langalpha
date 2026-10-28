@@ -1,29 +1,30 @@
-"""Market watch middleware: injects live prices for watched tickers.
+"""Market watch middleware: a live-price stamp for watched tickers on each model call.
 
-One `<market-watch>` block is contributed per model request as a row under
-``REQUEST_CALL_UPDATES`` on the request state (``awrap_model_call`` +
-``request.override``), and the tail envelope renders it. That key is
-request-only and never a state channel, so the stamp reaches the provider but
-never enters durable state and checkpoints, replay, and history stay clean. An in-memory throttle
-re-injects the cached block between refreshes so the model keeps a price view
-without a provider fetch every call, and a skip-when-already-quoted guard keeps
-the fetch off the hot path; any failure degrades to contributing nothing so the
-turn is never broken.
+Each stamp is a durable ``market_watch`` row, written before the model call it
+is sent with (``abefore_model``) and kept where it was written. A stamp that
+rode only the newest request and was gone on the next one would sit in front of
+the thinking the model produced after reading it, and a model that binds
+thinking to its prefix (Claude Fable 5.1 and the 5.5 models) would lose that
+reasoning on every later call. The model still reads only the newest stamp:
+the carrier sends every stamp as a turn-scoped system message where the API
+clears it once a later user message exists, and elsewhere sends only the
+stamps no user message has followed yet (``carrier.py``). An in-memory
+throttle re-stamps the cached block between refreshes so the model keeps a
+price view without a provider fetch every call, and a skip-when-already-quoted
+guard keeps the fetch off the call after a quote tool; any failure degrades to
+writing nothing so the turn is never broken.
 
-This middleware must sit OUTSIDE ``TailEnvelopeMiddleware``, which reads the
-request key it writes, and it owns no cache breakpoint of its own: the envelope
-carries the whole volatile tail and pins the breakpoint there.
+The row's text is the whole block the tail envelope used to render for the
+call, header and closing guidance included, rendered once here. It must come
+after every other row writer, so a turn's stamp follows its anchor.
 
-Every injection is also attested in the turn's provenance stream (one
-``market_data`` record per watched symbol). Provenance is recorded beside the
-turn, so it keeps what the model saw even though the stamp itself is never
-checkpointed.
+Every stamp is also attested in the turn's provenance stream (one
+``market_data`` record per watched symbol).
 """
 
 import inspect
 import logging
 import time
-from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
@@ -31,7 +32,7 @@ from uuid import uuid4
 from langchain_core.messages import HumanMessage, ToolMessage
 from langgraph.config import get_config
 
-from langchain.agents.middleware.types import AgentMiddleware, ModelRequest, ModelResponse
+from langchain.agents.middleware.types import AgentMiddleware
 
 from ptc_agent.agent.middleware.provenance.body_store import (
     drain_body_writes,
@@ -39,10 +40,12 @@ from ptc_agent.agent.middleware.provenance.body_store import (
     store_body,
 )
 from ptc_agent.agent.middleware.runtime_context import (
-    REQUEST_CALL_UPDATES,
     RUNTIME_UPDATE_SOURCE,
     DurableUpdate,
+    build_update_message,
+    render_stamp,
 )
+from ptc_agent.agent.middleware.runtime_context.turn import MARKET_WATCH_ROW_KIND
 from ptc_agent.agent.provenance.types import (
     ProvenanceSource,
     build_provenance_event,
@@ -62,7 +65,8 @@ _STAMP_OPEN = "<market-watch>"
 _STAMP_CLOSE = "</market-watch>"
 _STAMP_NOTE = "Automated live-price feed (not a user message)."
 # Bump when the block's shape changes: a row outlives the code that wrote it.
-_STAMP_SCHEMA_VERSION = 1
+# 2 is the first persisted shape, its text the whole rendered block.
+_STAMP_SCHEMA_VERSION = 2
 
 # Phases in which a watched price can move. A lunch break holds the morning
 # close and an index's extended hours hold the regular close, so a stamp then
@@ -154,75 +158,64 @@ def _batch_quotes_watched(
 
 
 class MarketWatchMiddleware(AgentMiddleware):
-    """Injects live prices for watched tickers; no-op when the watch list is empty.
+    """Writes a ``market_watch`` stamp row per model call; no-op without a watch list.
 
-    Contributes one `<market-watch>` row per model call via
-    ``request.override``; nothing is persisted. Any failure (Redis, provider,
-    formatting) degrades to contributing nothing; it must never break the turn.
+    Any failure (Redis, provider, formatting) degrades to writing nothing; it
+    must never break the turn.
+
+    Args:
+        min_interval_seconds: Least time between two provider fetches in one
+            turn. None reads the configured interval.
+        guidance: Resolved prompt guidance level the row is rendered at.
     """
 
-    def __init__(self, min_interval_seconds: int | None = None) -> None:
+    def __init__(
+        self,
+        min_interval_seconds: int | None = None,
+        *,
+        guidance: str,
+    ) -> None:
         self._min_interval = (
             min_interval_seconds
             if min_interval_seconds is not None
             else get_market_watch_min_interval()
         )
-        # awrap_model_call runs once per model call, sequentially — no lock needed.
+        self._guidance = guidance
+        # abefore_model runs once per model call, sequentially — no lock needed.
         self._last_injected_at: float | None = None
         self._last_prices: dict[str, float] = {}
         self._last_block: str | None = None
         # Watchlist the cached block was fetched for (uppercased): a throttled
-        # round only replays the block when the CURRENT list still matches it —
-        # a mid-window mutation refetches for the new list instead.
+        # round only re-stamps the block when the CURRENT list still matches
+        # it — a mid-window mutation refetches for the new list instead.
         self._last_symbols: set[str] = set()
         # Provenance for the last fetched block: (symbol, provider) per line
-        # plus the fetch time — replays attest the original access, not the
-        # replay clock.
+        # plus the fetch time — a re-stamp attests the original access, not
+        # the re-stamp clock.
         self._last_sources: list[tuple[str, str | None]] = []
         self._last_fetch_ts: str | None = None
         self._last_body_sha: str | None = None
         self._body_tasks: set = set()
 
-    async def awrap_model_call(
-        self,
-        request: ModelRequest,
-        handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
-    ) -> ModelResponse:
-        stamp = await self._stamp_for(request.messages, request.runtime)
-        if stamp is None:
-            return await handler(request)
-        # Request-scoped state, not a state update: the row is handed to the
-        # tail envelope for this one call and is never written back, which is
-        # what keeps the stamp out of checkpoints, replay, and history.
-        state = dict(getattr(request, "state", None) or {})
-        update = DurableUpdate(
-            kind="market_watch",
-            schema_version=_STAMP_SCHEMA_VERSION,
-            text=stamp,
-            provenance={
-                "source": RUNTIME_UPDATE_SOURCE,
-                "writer": "market_watch",
-                "symbols": sorted(self._last_symbols),
-                "fetched_at": self._last_fetch_ts,
-            },
-        )
-        state[REQUEST_CALL_UPDATES] = [
-            *(state.get(REQUEST_CALL_UPDATES) or []),
-            update.to_dict(),
-        ]
-        return await handler(request.override(state=state))
+    def before_model(self, state: Any, runtime: Any = None) -> dict[str, Any] | None:
+        # Sync fallback: the async agent won't call this but the protocol requires it.
+        return None
 
-    async def _stamp_for(
-        self, messages: list[Any] | None, runtime: Any
-    ) -> str | None:
-        """The `<market-watch>` block to inject for this call, or None to skip.
+    async def abefore_model(self, state: Any, runtime: Any = None) -> dict[str, Any] | None:
+        row = await self._row_for(state, runtime)
+        if row is None:
+            return None
+        return {"messages": [build_update_message(row)]}
+
+    async def _row_for(self, state: Any, runtime: Any) -> DurableUpdate | None:
+        """The row to write before this call, or None to write nothing.
 
         The tail-shape guard runs first (no I/O), then the watchlist read (one
         Redis GET). Past that, the venue gate and throttle are re-evaluated on the
-        CURRENT list every call: a venue close stops the replay and a mid-window
+        CURRENT list every call: a venue close stops the stamps and a mid-window
         watchlist mutation refetches — only an unchanged list is throttled away.
         """
-        messages = messages or []
+        messages = list(state.get("messages") or [])
         if not messages:
             return None
         tail = messages[-1]
@@ -242,25 +235,24 @@ class MarketWatchMiddleware(AgentMiddleware):
             return None
 
         # Outer net past the cheap guards: any failure (venue lookup, provider,
-        # formatting) degrades to injecting nothing — it must never break the
+        # formatting) degrades to writing nothing — it must never break the
         # turn. Inner `return None`s below are normal control flow.
         try:
             # Venue gate: stamp when ANY watched symbol's exchange is open. Pure
-            # CPU (symbol resolve + clock phase). Above the throttle so a
-            # mid-window venue close stops the cached replay.
+            # CPU (symbol resolve + clock phase).
             if not _any_venue_open(symbols):
                 return None
 
             # Skip-if-already-quoted: the model just fetched a spot price for a
-            # watched symbol, so don't fetch/inject a second one.
+            # watched symbol, so don't fetch/write a second one.
             batch = _trailing_tool_batch(messages) if isinstance(tail, ToolMessage) else []
             if batch and _batch_quotes_watched(messages, batch, symbols):
                 return None
 
-            # Throttle (no provider I/O): within the window re-inject the cached
+            # Throttle (no provider I/O): within the window re-stamp the cached
             # block so the model keeps a price view between refreshes — but only
             # while the watchlist is unchanged. A mid-window mutation falls
-            # through to a fresh fetch: replaying would resurface removed
+            # through to a fresh fetch: re-stamping would resurface removed
             # symbols, and going silent would blind the model to a just-watched
             # one for the rest of the window. Venue re-checked above.
             watched = {s.upper() for s in symbols}
@@ -270,9 +262,7 @@ class MarketWatchMiddleware(AgentMiddleware):
                 and self._last_block
                 and watched == self._last_symbols
             ):
-                stamp = self._wrap(self._last_block)
-                await self._emit_provenance(runtime, stamp)
-                return stamp
+                return await self._stamp(runtime, self._last_block)
 
             block = await self._fetch_block(symbols, configurable.get("user_id"))
             if block is None:
@@ -293,12 +283,30 @@ class MarketWatchMiddleware(AgentMiddleware):
                 )
             except Exception:
                 logger.debug("[MarketWatch] stream_writer unavailable, skipping SSE event")
-            stamp = self._wrap(block)
-            await self._emit_provenance(runtime, stamp)
-            return stamp
+            return await self._stamp(runtime, block)
         except Exception:
             logger.warning("[MarketWatch] injection failed", exc_info=True)
             return None
+
+    async def _stamp(self, runtime: Any, block: str) -> DurableUpdate | None:
+        """The row for *block*, rendered once, attested; None when it is over the cap."""
+        stamp = self._wrap(block)
+        text = render_stamp(stamp, self._guidance)
+        if not text:
+            return None
+        update = DurableUpdate(
+            kind=MARKET_WATCH_ROW_KIND,
+            schema_version=_STAMP_SCHEMA_VERSION,
+            text=text,
+            provenance={
+                "source": RUNTIME_UPDATE_SOURCE,
+                "writer": "market_watch",
+                "symbols": sorted(self._last_symbols),
+                "fetched_at": self._last_fetch_ts,
+            },
+        )
+        await self._emit_provenance(runtime, stamp)
+        return update
 
     async def _fetch_block(self, symbols: list[str], user_id: Any) -> str | None:
         """Fetch + format a quote block; None on failure/empty. Updates throttle state."""
@@ -331,12 +339,11 @@ class MarketWatchMiddleware(AgentMiddleware):
         return block
 
     async def _emit_provenance(self, runtime: Any, stamp: str) -> None:
-        """Attest the injected stamp in the turn's provenance stream.
+        """Attest a written stamp in the turn's provenance stream.
 
-        Fires on every injection — fresh fetch or throttled replay — so a turn's
-        provenance records exactly what the model saw, independent of the stamp
-        never being checkpointed. Persist-side dedup collapses same-content
-        replays within a turn; never raises.
+        Fires on every stamp — fresh fetch or throttled re-stamp — so a turn's
+        provenance records each block the model was sent. Persist-side dedup
+        collapses same-content re-stamps within a turn; never raises.
         """
         if not self._last_sources:
             return
@@ -368,7 +375,7 @@ class MarketWatchMiddleware(AgentMiddleware):
 
         Deliberately unredacted: the stamp is deterministic live-price text with
         no user data, so it needs none of ProvenanceMiddleware's redaction.
-        Scheduled off the model-call critical path; replays reference the
+        Scheduled off the model-call critical path; re-stamps reference the
         already-stored body through the sha.
         """
         if sha256 == self._last_body_sha:

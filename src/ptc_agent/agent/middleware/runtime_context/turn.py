@@ -88,6 +88,10 @@ TIME_UP_ROW_KIND = "turn_time_up"
 #: a new clock, which ``update_row.md.j2`` hardcodes the same way.
 TIME_UP_WITHDRAWN_ROW_KIND = "turn_time_up_withdrawn"
 
+#: Row kind of a live-price stamp (``middleware/market_watch.py``), which
+#: ``update_row.md.j2`` hardcodes the same way.
+MARKET_WATCH_ROW_KIND = "market_watch"
+
 #: Row kind of the user's cancel of wakeups the agent set
 #: (``middleware/wakeups.py``), which ``update_row.md.j2`` hardcodes the same
 #: way.
@@ -101,8 +105,8 @@ NOTICE_ROW_KINDS = frozenset({WAKEUP_CANCELLED_ROW_KIND})
 #: Rows that are no change under the baseline: their writers state them again
 #: once a compaction takes them from view (the notes reminder before the next
 #: summary, the check-in after the next run of tool calls, the time-up ask on
-#: the next call), so a rebuild does not count them and a summary does not
-#: carry them. The withdrawal of a time-up ask answers only that ask, which a
+#: the next call, the live prices on the next fetch), so a rebuild does not
+#: count them and a summary does not carry them. The withdrawal of a time-up ask answers only that ask, which a
 #: summary does not carry either, so it has nothing to answer once both are
 #: out of view.
 NON_CHANGE_ROW_KINDS = frozenset(
@@ -113,6 +117,7 @@ NON_CHANGE_ROW_KINDS = frozenset(
         NOTES_CHECK_IN_ROW_KIND,
         TIME_UP_ROW_KIND,
         TIME_UP_WITHDRAWN_ROW_KIND,
+        MARKET_WATCH_ROW_KIND,
     }
 )
 

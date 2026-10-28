@@ -363,6 +363,7 @@ async def _handle_send_message(
     — a forged value could chain a new attempt onto an arbitrary failed run.
     """
     from src.server.handlers.chat import astream_ptc_workflow
+    from src.server.handlers.chat.image_intake import inline_image_urls
     from src.server.handlers.chat.error_handling import end_after_failure_frame
     from src.server.services.turn_runtime import requested_workspace, turn_route
 
@@ -677,6 +678,8 @@ async def _handle_send_message(
         # the transport the run's first buffered event would kill it as
         # failed(transport_lost) anyway — refuse cheaply instead.
         await _assert_stream_transport_ready()
+
+        request = await inline_image_urls(request)
 
         await route.bind(user_id, workspace)
 

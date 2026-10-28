@@ -25,8 +25,11 @@ from ptc_agent.agent.middleware.compaction.compact import Summarizer
 from ptc_agent.agent.middleware.compaction.measure import Estimate
 from ptc_agent.agent.middleware.compaction.middleware import CompactionMiddleware
 from ptc_agent.agent.middleware.compaction.summary_request import (
-    SELF_SUMMARY_PROMPT,
     finished_summary,
+    keeps_turns,
+    _NO_TAIL_NOTES,
+    _NO_TAIL_STATE,
+    summary_prompt,
 )
 from ptc_agent.agent.middleware.compaction.utils import parse_summary_message, summary_source
 from src.llms.provider_compaction import COMPACTION_BETA
@@ -41,6 +44,9 @@ def _offline(monkeypatch):
 
     monkeypatch.setattr(compact_module, "aoffload_base64_content", _passthrough)
     monkeypatch.setattr(mw_module, "get_stream_writer", lambda: lambda payload: None)
+
+NOTES = "/workspace/.agents/scratchpad/thread01/note"
+
 
 
 def _model() -> MagicMock:
@@ -96,7 +102,11 @@ class _Handler:
 
 def _asks_summary(request: ModelRequest) -> bool:
     last = request.messages[-1] if request.messages else None
-    return isinstance(last, HumanMessage) and last.content == SELF_SUMMARY_PROMPT
+    return isinstance(last, HumanMessage) and last.content in (
+        summary_prompt("self", True),
+        summary_prompt("self", False),
+        summary_prompt("self", False, notes=True),
+    )
 
 
 async def _run(
@@ -106,20 +116,25 @@ async def _run(
     summary_model=None,
     self_summary: bool = True,
     native: bool = True,
+    history: list | None = None,
+    keep_tokens: int = 2,
+    notes_dir: str | None = None,
 ):
     model = model or _model()
     summary_model = summary_model or _summary_model()
     mw = CompactionMiddleware(
         Summarizer(summary_model, limit=100_000, counter=len),
         token_threshold=6,
-        keep_tokens=2,
+        keep_tokens=keep_tokens,
         native=native,
         self_summary=self_summary,
     )
+    if notes_dir:
+        mw = mw.with_scratchpad_notes(notes_dir)
     # A token a message for Claude too, so the kept part is the newest two.
     mw._estimate = lambda model: Estimate(len)
     handler = _Handler(reply or AIMessage(_FINISHED))
-    history = _history()
+    history = history or _history()
     state = {"messages": history}
     request = ModelRequest(
         model=model,
@@ -212,3 +227,57 @@ class TestFinishedSummary:
     )
     def test_closing_line(self, text, expected):
         assert finished_summary(text) == expected
+
+
+class TestWhatStaysAfterTheSummary:
+    """A summary is told whether turns stay word for word after it, by what its
+    cut keeps, whatever the reason the cut keeps nothing."""
+
+    def test_only_an_answer_or_a_tool_result_is_a_kept_turn(self):
+        from langchain_core.messages import ToolMessage
+
+        assert not keeps_turns([])
+        assert not keeps_turns([HumanMessage("the user's newest message")])
+        assert keeps_turns([HumanMessage("q"), AIMessage("r")])
+        assert keeps_turns([ToolMessage("result", tool_call_id="c1")])
+
+    @pytest.mark.parametrize("kind", ["transcript", "native", "self", "handoff"])
+    def test_a_thread_with_notes_is_asked_to_cite_them_only_when_no_turn_stays(self, kind):
+        assert summary_prompt(kind, True, notes=True) == summary_prompt(kind, True)
+        with_notes, without = summary_prompt(kind, False, notes=True), summary_prompt(kind, False)
+        assert "checkpoint notes" in with_notes and "checkpoint notes" not in without
+        assert with_notes == without.replace(_NO_TAIL_STATE, f"{_NO_TAIL_STATE}\n{_NO_TAIL_NOTES}")
+
+    @pytest.mark.parametrize(
+        ("history", "keep", "notes", "prompt"),
+        [
+            (_history(), 2, None, summary_prompt("self", True)),
+            (_history()[:-1], 1, None, summary_prompt("self", False)),
+            (_history(), 2, NOTES, summary_prompt("self", True)),
+            (_history()[:-1], 1, NOTES, summary_prompt("self", False, notes=True)),
+        ],
+        ids=["keeps turns", "keeps only the user's message", "keeps turns, notes on", "keeps nothing, notes on"],
+    )
+    @pytest.mark.asyncio
+    async def test_the_agents_own_summary(self, history, keep, notes, prompt):
+        run = await _run(history=history, keep_tokens=keep, notes_dir=notes)
+
+        (asked,) = run.asked
+        assert run.handler.requests[asked].messages[-1].content == prompt
+
+    @pytest.mark.parametrize(
+        ("history", "keep", "notes", "prompt"),
+        [
+            (_history(), 2, None, summary_prompt("transcript", True)),
+            (_history()[:-1], 1, None, summary_prompt("transcript", False)),
+            (_history(), 2, NOTES, summary_prompt("transcript", True)),
+            (_history()[:-1], 1, NOTES, summary_prompt("transcript", False, notes=True)),
+        ],
+        ids=["keeps turns", "keeps only the user's message", "keeps turns, notes on", "keeps nothing, notes on"],
+    )
+    @pytest.mark.asyncio
+    async def test_the_transcript_summary(self, history, keep, notes, prompt):
+        run = await _run(history=history, keep_tokens=keep, self_summary=False, notes_dir=notes)
+
+        (sent,) = run.summary_model.sent
+        assert sent[0].content.startswith(prompt)

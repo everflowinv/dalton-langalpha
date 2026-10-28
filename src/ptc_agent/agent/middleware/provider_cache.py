@@ -3,7 +3,7 @@
 The wire markers that key incremental prompt caching (Anthropic ``cache_control``;
 OpenAI explicit ``prompt_cache_breakpoint``) and the str-vs-list "tag the last
 text block" logic are needed by both ``SystemPromptCacheMiddleware`` (pins the
-static system prefix) and ``TailEnvelopeMiddleware`` (pins the runtime-context
+static system prefix) and ``RowCarrierMiddleware`` (pins the runtime-context
 envelope at the tail). Both live here so the provider gate and the tagging are
 written once.
 """

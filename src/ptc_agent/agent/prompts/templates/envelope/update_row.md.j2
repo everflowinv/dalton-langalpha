@@ -51,6 +51,16 @@
    agent has depends on its role and its build, and a list here would name
    one this reader never had.
 
+   A `baseline_restated` row states sections of the block whole where the
+   block stands but a delta against it cannot say what moved: a section the
+   frozen block has no copy of, one whose source this build no longer reads
+   (named in `provenance.gone`), and, after a summary, every section that no
+   longer matches its frozen copy, since the rows that said so may have gone
+   with the summarized turns. `provenance.after` says which (`source` or
+   `summary`). After a summary it also carries the summary's note
+   (`provenance.note`), which may be all it carries when the block was
+   rebuilt instead.
+
    A `notes_due` row (`turn.NOTES_DUE_ROW_KIND`) asks the agent, once before each
    summary, to checkpoint its scratchpad notes. Its text carries the
    numbers and the folder; the ask is here, so it reads the same on every row.
@@ -70,6 +80,10 @@
    anchor, already prose with its own stamp, so a header would only label the
    clock with a second copy of the time.
 
+   A `market_watch` row (`turn.MARKET_WATCH_ROW_KIND`) renders bare too: its
+   text is the whole live-price block, framing included, rendered once through
+   `envelope/updates.md.j2` when the stamp was written.
+
    A `wakeup_cancelled` row (`turn.WAKEUP_CANCELLED_ROW_KIND`) says the user
    cancelled wakeups the agent set, or turned wakeups off. It renders bare
    too: its text is already the whole notice, and it compares nothing with a
@@ -87,7 +101,7 @@
    State only, so it renders the same at both guidance levels. The standing
    rules for reading a row are static prose in the system prefix. #}
 {% if update %}
-{% if update.kind in ("turn_opened", "wakeup_cancelled") %}
+{% if update.kind in ("turn_opened", "wakeup_cancelled", "market_watch") %}
 {{ update.text }}
 {% elif update.kind == "subagents_switched" %}
 {% if update.provenance.get("allowed") is false %}
@@ -118,6 +132,35 @@ Each line below gives the current value and what the frozen blocks still say. Tr
 The frozen blocks were rebuilt at this turn
 
 Every change row above this one is folded into the blocks now, so the blocks are current, and an earlier row that says to trust it over a block no longer applies. {{ update.text }}{% if update.provenance.still_in_force %} The exception is a row about {{ update.provenance.still_in_force | join(", ") }}: that read did not answer at this rebuild, so such a row still applies over its block until a later row replaces it.{% endif %}
+{% elif update.kind == "baseline_restated" %}
+{% set gone = update.provenance.get("gone") or [] %}
+{% if update.provenance.get("after") == "summary" and update.provenance.get("note_sent") %}
+Rows from before the summary that said what changed in your system prompt may be gone with it, so this row restates every block there that no longer matches its frozen copy. Each block below is current as of this row and replaces its frozen copy and every earlier row about it. A block this row does not name still matches its frozen copy, unless a later row says otherwise. A later row for the same block supersedes this one.
+{% elif update.provenance.get("after") == "summary" %}
+The conversation before this point was summarized
+{% if update.provenance.get("note") %}
+
+{{ update.provenance.note }}
+{% endif %}
+{% if update.text or gone %}
+
+Rows from before the summary that said what changed in your system prompt may be gone with it, so this row restates every block there that no longer matches its frozen copy. Each block below is current as of this row and replaces its frozen copy and every earlier row about it. A block this row does not name still matches its frozen copy, unless a later row says otherwise. A later row for the same block supersedes this one.
+{% endif %}
+{% else %}
+Blocks of your system prompt changed in a way its frozen copies cannot show
+{% if update.text %}
+
+Each block below has no copy in your system prompt, so read it as part of the system prompt. It is current as of this row, and a later row for the same block supersedes it.
+{% endif %}
+{% endif %}
+{% if gone %}
+
+{{ gone | join(", ") }} in your system prompt no longer {{ "apply, so disregard them" if gone | length > 1 else "applies, so disregard it" }}.
+{% endif %}
+{% if update.text %}
+
+{{ update.text }}
+{% endif %}
 {% elif update.kind == "notes_due" %}
 This conversation will be summarized soon
 
@@ -143,7 +186,7 @@ The lines below say what is true now. Where the frozen block says otherwise, tru
 {% elif harness %}
 The {{ harness.subject }} changed after the copy in {{ harness.label }} was frozen
 
-The text below compares it with the frozen copy in {{ harness.label }}, which stands until this thread compacts: where they differ, this row is the current one. A later row for the same block supersedes it.
+The text below compares it with the frozen copy in {{ harness.label }}: where they differ, this row is the current one. A later row for the same block supersedes it.
 
 {{ update.text }}
 {% elif subject %}

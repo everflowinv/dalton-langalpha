@@ -28,13 +28,15 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any, Literal
 
-from langchain_core.messages import AIMessage, AnyMessage, HumanMessage
+from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, ToolMessage
 
 from src.llms.endpoints import (
     is_official_anthropic_endpoint,
     is_official_openai_endpoint,
     url_host,
 )
+from src.llms.anthropic_betas import client_betas
+from src.llms.operator_channel import tool_change_betas
 from src.llms.reasoning_lineage import ROUTE_ENDPOINT_SEP, lineage_for_route
 
 COMPACTION_BETA = "compact-2026-09-04"
@@ -51,8 +53,9 @@ _CODEX_HOST = "chatgpt.com"
 KEPT_USER_TOKENS = 64_000
 
 # The keys the API takes back. A streamed block also carries ``index``, and
-# an echo of any other key is a 400.
-_BLOCK_KEYS = ("type", "content", "signature")
+# an echo of any other key is a 400. ``tool_changes`` is under the signature,
+# so a block that recorded one is sent back with it.
+_BLOCK_KEYS = ("type", "content", "signature", "tool_changes")
 
 
 #: Whose compaction a client takes, which decides the request and the answer.
@@ -131,7 +134,7 @@ def native_kind(model: Any) -> NativeKind | None:
     if isinstance(model, ChatAnthropic):
         if not is_official_anthropic_endpoint(model.anthropic_api_url):
             return None
-        return "anthropic" if COMPACTION_BETA in _betas(model) else None
+        return "anthropic" if COMPACTION_BETA in client_betas(model) else None
     if not (isinstance(model, ChatOpenAI) and model.output_version == "responses/v1"):
         return None
     # Exactly these two: the DashScope subclass speaks the Responses API to a
@@ -143,16 +146,6 @@ def native_kind(model: Any) -> NativeKind | None:
     return None
 
 
-def _betas(model: Any) -> set[str]:
-    headers = getattr(model, "default_headers", None) or {}
-    header = next(
-        (v for k, v in headers.items() if k.lower() == "anthropic-beta"), ""
-    )
-    return {b.strip() for b in str(header).split(",") if b.strip()} | set(
-        getattr(model, "betas", None) or ()
-    )
-
-
 def compaction_settings(
     model: Any, settings: Mapping[str, Any], instructions: str
 ) -> dict[str, Any]:
@@ -161,7 +154,10 @@ def compaction_settings(
     ``extra_body`` is merged, not set: a call-time value replaces the one the
     client was built with whole, and that one can carry the thinking settings.
     OpenAI reads the marker as a ``compaction_trigger`` item (see
-    ``patches``), which takes no instructions.
+    ``patches``), which takes no instructions. Claude's also carries
+    :data:`INLINE_TOOLS_BETA`, so the block records the net effect of the tool
+    changes in the messages it summarizes (``tool_changes``), which would
+    otherwise stop applying once it replaces them.
     """
     built = {
         **((getattr(model, "model_kwargs", None) or {}).get("extra_body") or {}),
@@ -169,6 +165,8 @@ def compaction_settings(
     }
     extra = {**built, **(settings.get("extra_body") or {})}
     extra["compaction"] = {"type": "summarize", "instructions": instructions}
+    if native_kind(model) == "anthropic":
+        settings = {**settings, "betas": tool_change_betas(settings.get("betas"))}
     return {**settings, "extra_body": extra}
 
 
@@ -255,8 +253,43 @@ def _item_text(item: Mapping[str, Any]) -> str:
 def sidecar(answer: Mapping[str, Any], origin: str | None, text: str) -> dict[str, Any]:
     """What a summary message carries for :func:`adopt`: the provider's
     answer (see :func:`native_answer`), the route that wrote it, and ``text``,
-    sent after it."""
-    return {**answer, "origin": origin, "text": text}
+    sent after it (see :func:`carried_text`)."""
+    return {**answer, "origin": origin, "text": text, "alone": True}
+
+
+def carried_text(message: AnyMessage) -> str | None:
+    """The text a summary carrying a provider's answer has beside it (the
+    transcript pointer, the skills to reload, the notes pointer), or None.
+
+    OpenAI's items are sent with it after them. Claude's block is sent alone:
+    the turns it keeps must follow it with nothing between, or their thinking
+    is no longer valid, so this text is for a message after those turns.
+    """
+    text = (_carried(message) or {}).get("text")
+    return text if isinstance(text, str) and text else None
+
+
+def deferred_text(message: AnyMessage | None) -> str | None:
+    """The text a summary leaves for a message after the turns it kept, or None.
+
+    Only a summary carrying Claude's block sent alone has one: the kept turns
+    must follow the block with nothing between, so its text (the transcript,
+    skills and notes pointers) goes after them. Every other summary, one
+    written before the block went alone included, sends that text itself.
+    """
+    if not _sent_alone(_carried(message)):
+        return None
+    text = carried_text(message)
+    return text if text and text.strip() else None
+
+
+def _sent_alone(carried: Mapping[str, Any] | None) -> bool:
+    # TODO(2026-11-25): delete 30 days after this ships, once the threads written before it have aged out.
+    return (
+        carried is not None
+        and isinstance(carried.get("block"), dict)
+        and bool(carried.get("alone"))
+    )
 
 
 def is_opaque(message: AnyMessage) -> bool:
@@ -286,8 +319,9 @@ def adopt(
     lineage = _native_lineage(route)
     adopted: list[AnyMessage] = []
     changed = False
-    for message in messages:
-        native = _native(message, lineage, kind)
+    for i, message in enumerate(messages):
+        following = messages[i + 1] if i + 1 < len(messages) else None
+        native = _native(message, lineage, kind, before_user=isinstance(following, (HumanMessage, ToolMessage)))
         adopted.extend(native or (message,))
         changed = changed or native is not None
     return adopted if changed else None
@@ -304,7 +338,35 @@ def replays(message: AnyMessage, model: Any) -> bool:
     return _native(message, _native_lineage(route), kind) is not None
 
 
-def _native(message: AnyMessage, lineage: str, kind: NativeKind) -> list[AnyMessage] | None:
+def replayed_tool_changes(message: AnyMessage, model: Any) -> list[dict[str, Any]]:
+    """The net tool changes the API re-applies at ``message`` for ``model``.
+
+    A compaction block records the ``tool_addition`` / ``tool_removal`` blocks
+    of the turns it summarized in its ``tool_changes``, and the API applies
+    them again where the block is adopted. Empty when ``model`` is not sent
+    the block (see :func:`adopt`) or the block records none.
+    """
+    if not replays(message, model):
+        return []
+    block = (_carried(message) or {}).get("block")
+    changes = block.get("tool_changes") if isinstance(block, dict) else None
+    if not isinstance(changes, list):
+        return []
+    return [change for change in changes if isinstance(change, dict)]
+
+
+def _native(
+    message: AnyMessage, lineage: str, kind: NativeKind, *, before_user: bool = False
+) -> list[AnyMessage] | None:
+    """The provider's answer ``message`` carries, as ``kind`` is sent it.
+
+    Claude's block goes alone in its own turn: the summary's user turn where
+    the turns it kept open on an answer, an assistant turn before a user
+    message (``before_user``), as after a summary that kept none, where in a
+    user turn the new message would join it. A summary written before the
+    block went alone (no ``alone`` in its sidecar) is sent as it was then,
+    the block and its text, so the thinking after it stays valid.
+    """
     carried = _carried(message)
     if carried is None:
         return None
@@ -320,13 +382,15 @@ def _native(message: AnyMessage, lineage: str, kind: NativeKind) -> list[AnyMess
         or _native_lineage(origin) != lineage
     ):
         return None
-    text = carried.get("text")
-    text = text if isinstance(text, str) and text else None
+    text = carried_text(message)
     if kind == "anthropic" and isinstance(carried.get("block"), dict):
-        content: list[Any] = [dict(carried["block"])]
-        if text:
-            content.append({"type": "text", "text": text})
-        return [message.model_copy(update={"content": content})]
+        block: list[Any] = [dict(carried["block"])]
+        if not _sent_alone(carried):
+            tail = [{"type": "text", "text": text}] if text else []
+            return [message.model_copy(update={"content": [*block, *tail]})]
+        if before_user:
+            return [AIMessage(content=block, id=message.id, additional_kwargs=dict(message.additional_kwargs))]
+        return [message.model_copy(update={"content": block})]
     if kind == "openai" and isinstance(carried.get("items"), list):
         replayed = [_replayed(item) for item in carried["items"] if isinstance(item, dict)]
         return [*filter(None, replayed), *([HumanMessage(text)] if text else [])]

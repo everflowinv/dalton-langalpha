@@ -264,18 +264,22 @@ class OrderGovernanceMiddleware(AgentMiddleware):
                 last_ai, calls, "arrived in a message with no id, so it was not sent"
             )
 
+        # Canonicalized here, before anything reads the args, because the tool
+        # gets them as ``ToolArgumentParsingMiddleware`` parses them and the
+        # relay hashes what it produced. Hashing the model's raw form instead
+        # would refuse the approved call at the gate for a provider that
+        # stringifies a structured argument, having already spent the attempt.
+        # The same parse also settles what the approval card shows and what the
+        # row stores, so all four agree on one form. Parsed into copies: the
+        # message keeps the args as the model sent them, since every later
+        # request carries it and its thinking was produced behind that form.
+        calls = [
+            {**call, "args": parse_tool_args(call.get("args") or {}, call["name"])}
+            for call in calls
+        ]
         proposals: dict[str, Proposed] = {}
         for call in calls:
             stamp = self._stamps[call["name"]]
-            # Canonicalized here, before anything reads the args, because
-            # ``ToolArgumentParsingMiddleware`` rewrites them in place later and
-            # the relay hashes what it produced. Hashing the model's raw form
-            # instead would refuse the approved call at the gate for a provider
-            # that stringifies a structured argument, having already spent the
-            # attempt. The same parse also settles what the approval card shows
-            # and what the row stores, so all four agree on one form. Idempotent,
-            # so the middleware running it again downstream changes nothing.
-            call["args"] = parse_tool_args(call.get("args") or {}, call["name"])
             proposed = await self._ledger.propose(
                 last_ai.id, call["id"], call["name"], stamp, call["args"]
             )

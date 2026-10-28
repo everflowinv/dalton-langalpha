@@ -25,7 +25,7 @@ from langchain_core.messages import HumanMessage
 from ptc_agent.agent.middleware.runtime_context import (
     KNOWN_SURFACES,
     Surface,
-    TailEnvelopeMiddleware,
+    RowCarrierMiddleware,
     TurnContextMiddleware,
     is_known_surface,
     parse_surface,
@@ -61,7 +61,7 @@ async def _rendered_request(**kwargs) -> str:
         captured["messages"] = list(request.messages)
         return MagicMock()
 
-    await TailEnvelopeMiddleware(now=NOW, guidance="detailed").awrap_model_call(
+    await RowCarrierMiddleware().awrap_model_call(
         ModelRequest(
             model=MagicMock(spec=ChatAnthropic),
             messages=[HumanMessage(content="What moved today?"), *rows],

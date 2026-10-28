@@ -36,13 +36,23 @@ def test_shipped_config_lists_fake_ip_range():
 
 
 @pytest.mark.parametrize("ip", ["198.18.1.238", "198.18.4.174", "198.19.255.1"])
-def test_fake_ip_allowed_when_configured(configured, ip):
-    assert _ip_is_blocked(ip) is False
-
-
-@pytest.mark.parametrize("ip", ["198.18.1.238", "198.19.255.1"])
-def test_fake_ip_blocked_when_not_configured(unconfigured, ip):
+def test_fake_ip_strict_predicate_blocks_even_when_configured(configured, ip):
+    # The exemption is not in the strict predicate (upstream's judgment): a
+    # fake-IP is only ever allowed by the transport's real-target recheck, so
+    # no range trick can put it past the check the recheck itself relies on.
     assert _ip_is_blocked(ip) is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ip", ["198.18.1.238", "198.19.255.1"])
+async def test_fake_ip_blocked_when_not_configured(unconfigured, ip):
+    # No config exempts nothing: the strict upstream check applies unchanged,
+    # and the real-target recheck is never reached.
+    doh = _doh({})
+    with patch.object(dalton_network, "doh_query", doh):
+        with pytest.raises(BlockedAddressError, match="private/reserved"):
+            await GuardedAsyncTransport().handle_async_request(httpx.Request("GET", f"http://{ip}/"))
+    doh.assert_not_awaited()
 
 
 @pytest.mark.parametrize(
@@ -281,6 +291,52 @@ async def test_transport_blocks_loopback_when_configured(configured):
         await GuardedAsyncTransport().handle_async_request(
             httpx.Request("GET", "http://127.0.0.1:8000/health")
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "dns",
+    [
+        ["198.18.3.3", "10.1.2.3"],
+        ["10.1.2.3", "198.18.3.3"],
+        ["198.18.3.3", "::ffff:10.1.2.3"],
+    ],
+)
+async def test_private_answer_alongside_a_fake_ip_blocks(configured, resolvers, dns):
+    """A fake-IP defers only itself: a non-fake private answer in the same
+    response is blocked by the strict check, before any recheck runs."""
+    doh = _doh({(R1, "A"): ["8.8.8.8"]})
+    with patch("src.tools.web.inhouse.guard._resolve", autospec=True, return_value=dns), patch.object(
+        dalton_network, "doh_query", doh
+    ):
+        with pytest.raises(BlockedAddressError, match="private/reserved"):
+            await GuardedAsyncTransport().handle_async_request(
+                httpx.Request("GET", "http://mixed.example/")
+            )
+    doh.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_allowed_fake_ip_dials_the_fake_ip_pinned_to_the_hostname(configured, resolvers):
+    """Upstream pins the dial to the checked address; behind a fake-IP proxy
+    that address is the proxy's route to the real host, so the pinned dial
+    keeps the fake-IP in the netloc and the hostname in Host and SNI."""
+    doh = _doh({(R1, "A"): ["162.159.1.1"], (R1, "AAAA"): ["2606:4700::1"]})
+    sentinel = httpx.Response(200, content=b"ok")
+    with patch("src.tools.web.inhouse.guard._resolve", autospec=True, return_value=["198.18.1.238"]), patch.object(
+        dalton_network, "doh_query", doh
+    ), patch.object(
+        httpx.AsyncHTTPTransport, "handle_async_request", autospec=True, return_value=sentinel
+    ) as delegated:
+        resp = await GuardedAsyncTransport().handle_async_request(
+            httpx.Request("GET", "https://www.sec.gov/filing.pdf")
+        )
+    assert resp is sentinel
+    # autospec'd, so the call carries the transport instance as its first arg
+    _self, sent_request = delegated.await_args.args
+    assert str(sent_request.url) == "https://198.18.1.238/filing.pdf"
+    assert sent_request.headers["host"] == "www.sec.gov"
+    assert sent_request.extensions.get("sni_hostname") == "www.sec.gov"
 
 
 @pytest.mark.asyncio

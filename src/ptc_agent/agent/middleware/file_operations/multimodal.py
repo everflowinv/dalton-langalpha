@@ -17,7 +17,7 @@ import base64
 import io
 import logging
 import weakref
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
@@ -32,7 +32,13 @@ from ptc_agent.agent.middleware.file_operations.image_fit import (
 )
 from ptc_agent.agent.tools.file_ops import is_memo_text_path
 from ptc_agent.core.sandbox.files import FileOverCap
-from src.tools.web.inhouse.guard import BlockedAddressError, GuardedAsyncTransport
+from src.tools.web.inhouse.guard import (
+    BlockedAddressError,
+    OverCap,
+    UnexpectedEncoding,
+    UnexpectedStatus,
+    fetch_capped,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +58,15 @@ VISUAL_EXTENSIONS = IMAGE_EXTENSIONS | DOCUMENT_EXTENSIONS
 # the document's length, and stays under every target's page ceiling, which
 # the read side still checks.
 PDF_PAGE_WINDOW = 20
+
+# Raw bytes, deliberately below every provider's published ceiling: those are
+# quoted on the base64 string, which is 4/3 larger, so 5 MiB here is ~6.7 MiB
+# on the wire. Both fetch paths write the block into graph state via the tool
+# result, so an oversized block is not a one-turn error: it is checkpointed
+# and replayed on every later turn, and the modality strip cannot save a
+# target that legitimately has the image modality. Refuse before encoding
+# rather than brick the thread.
+MAX_CONTENT_BYTES = 5 * 1024 * 1024
 
 
 class _UnusableContent(Exception):
@@ -309,14 +324,7 @@ class MultimodalMiddleware(AgentMiddleware):
     # middleware into dead code rather than failing anywhere visible.
     TOOL_NAME = "Read"
 
-    # Raw bytes, deliberately below every provider's published ceiling: those are
-    # quoted on the base64 string, which is 4/3 larger, so 5 MiB here is ~6.7 MiB
-    # on the wire. Both fetch paths write the block into graph state via the tool
-    # result, so an oversized block is not a one-turn error: it is checkpointed
-    # and replayed on every later turn, and the modality strip cannot save a
-    # target that legitimately has the image modality. Refuse before encoding
-    # rather than brick the thread.
-    MAX_CONTENT_BYTES = 5 * 1024 * 1024
+    MAX_CONTENT_BYTES = MAX_CONTENT_BYTES
 
     # A PDF is fetched whole but attached a window at a time, and only the
     # window reaches the checkpoint, so MAX_CONTENT_BYTES bounds the window and
@@ -392,16 +400,6 @@ class MultimodalMiddleware(AgentMiddleware):
         """
         return self.MAX_PDF_SOURCE_BYTES if head.startswith(b"%PDF") else self.MAX_CONTENT_BYTES
 
-    async def _read_capped(self, chunks: AsyncIterator[bytes]) -> bytes:
-        """The whole body, raising `_TooLarge` as soon as it passes the cap."""
-        buffer = bytearray()
-        async for chunk in chunks:
-            buffer.extend(chunk)
-            cap = self._cap_for(buffer)
-            if len(buffer) > cap:
-                raise _TooLarge(cap)
-        return bytes(buffer)
-
     async def _attach_bytes(
         self,
         content_bytes: bytes,
@@ -458,24 +456,10 @@ class MultimodalMiddleware(AgentMiddleware):
         try:
             # The URL is model-chosen and this fetch runs in the backend process
             # — not the sandbox — so it inherits the backend's reach into the
-            # private network. GuardedAsyncTransport re-checks the resolved
-            # address on every hop, which is what keeps a public page from
-            # redirecting the fetch at 169.254.169.254.
-            async with httpx.AsyncClient(
-                transport=GuardedAsyncTransport(), timeout=30.0
-            ) as client:
-                async with client.stream("GET", url, follow_redirects=True) as response:
-                    if response.status_code != 200:
-                        logger.warning(
-                            f"[MULTIMODAL] Failed to download content: {url} "
-                            f"(status {response.status_code})"
-                        )
-                        return _error(
-                            tool_call_id,
-                            f"Could not download content (HTTP {response.status_code}): {url}",
-                        )
-
-                    content_bytes = await self._read_capped(response.aiter_bytes())
+            # private network. fetch_capped re-checks the resolved address on
+            # every hop, which is what keeps a public page from redirecting the
+            # fetch at 169.254.169.254.
+            content_bytes = await fetch_capped(url, self._cap_for)
 
             if not content_bytes:
                 logger.warning(f"[MULTIMODAL] Empty content from URL: {url}")
@@ -485,8 +469,22 @@ class MultimodalMiddleware(AgentMiddleware):
                 content_bytes, url, tool_result, tool_call_id, window
             )
 
-        except _TooLarge as exc:
+        except UnexpectedStatus as exc:
+            logger.warning(
+                f"[MULTIMODAL] Failed to download content: {url} "
+                f"(status {exc.status_code})"
+            )
+            return _error(
+                tool_call_id,
+                f"Could not download content (HTTP {exc.status_code}): {url}",
+            )
+        except OverCap as exc:
             return self._too_large(url, tool_call_id, exc.limit)
+        except UnexpectedEncoding as exc:
+            return _error(
+                tool_call_id,
+                f"Could not read content sent {exc.encoding}-compressed; only uncompressed content is read: {url}",
+            )
         except httpx.TimeoutException:
             logger.warning(f"[MULTIMODAL] Timeout downloading content: {url}")
             return _error(tool_call_id, f"Timeout downloading content: {url}")

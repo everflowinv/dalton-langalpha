@@ -31,11 +31,20 @@ from typing import TYPE_CHECKING, Any, NoReturn
 import structlog
 from langchain.agents.middleware.types import (
     AgentMiddleware,
+    ExtendedModelResponse,
     ModelCallResult,
     ModelRequest,
     ModelResponse,
 )
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, AnyMessage
+from langgraph.types import Command
+
+from ptc_agent.agent.middleware.thinking_binding import (
+    UNSENT_THINKING_KEY,
+    UnsentThinkingState,
+    unsent_thinking,
+    without_thinking,
+)
 
 from src.llms.error_classification import (
     extract_status_code,
@@ -44,8 +53,10 @@ from src.llms.error_classification import (
     is_retryable_error,
     is_stalled_stream,
 )
+from src.llms.input_transformations import INPUT_TRANSFORMATIONS, REPEATED, thinking_drops
 from src.llms.provider_compaction import is_compaction_request
 from src.llms.reasoning_payload import strip_all_reasoning
+from src.observability.langsmith_run import stamp_run
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -66,6 +77,12 @@ FALLBACK_KEY = "model_fallback"
 
 _as_sent: ContextVar[bool] = ContextVar("model_resilience_as_sent", default=False)
 
+#: Drop reasons that follow the thread rather than an edit of ours: a model
+#: switch, or a thread moved between accounts.
+_BY_DESIGN_DROPS = frozenset({"model_binding_mismatch", "organization_binding_mismatch"})
+
+_STRIP_ERROR_MAX_CHARS = 1000
+
 
 @contextmanager
 def as_sent() -> Iterator[None]:
@@ -85,6 +102,60 @@ def _last_message_id(request: ModelRequest) -> str | None:
     state = getattr(request, "state", None)
     messages = state.get("messages") if isinstance(state, dict) else None
     return getattr(messages[-1], "id", None) if messages else None
+
+
+def _thread_id() -> str | None:
+    try:
+        from langgraph.config import get_config
+
+        return (get_config().get("configurable") or {}).get("thread_id")
+    except Exception:
+        return None
+
+
+def _stripped_ids(sent: list[AnyMessage], stripped: list[AnyMessage]) -> list[str]:
+    """The ids of the messages in ``sent`` the strip changed or removed."""
+    kept = {id(message) for message in stripped}
+    return [m.id for m in sent if id(m) not in kept and getattr(m, "id", None)]
+
+
+def _keep_unsent(request: ModelRequest) -> ModelRequest:
+    """``request`` with the messages sent without their reasoning sent so
+    again, where no compaction view already did it."""
+    messages = without_thinking(request.messages, unsent_thinking(getattr(request, "state", None)))
+    return request if messages is request.messages else request.override(messages=messages)
+
+
+def _report_drops(response: ModelResponse, model: str, sent: list[AnyMessage]) -> None:
+    """Log and stamp the earlier thinking the API dropped before answering.
+
+    One line per answer with any, so a thread's count is a sum over its own
+    log lines and runs, whichever worker served each call. A block dropped
+    again because the request still sends it counts as ``repeated``, judged
+    against the newest answer in ``sent`` that carries the list, so the sum
+    counts each loss once.
+    """
+    earlier = next(
+        (
+            m
+            for m in reversed(sent)
+            if isinstance(m, AIMessage)
+            and INPUT_TRANSFORMATIONS in (getattr(m, "response_metadata", None) or {})
+        ),
+        None,
+    )
+    for message in getattr(response, "result", None) or ():
+        counts = thinking_drops(message, earlier)
+        if not counts:
+            continue
+        log = logger.info if set(counts) <= _BY_DESIGN_DROPS | {REPEATED} else logger.warning
+        log(
+            "[ModelResilience] earlier thinking dropped by the provider",
+            model=model,
+            thread_id=_thread_id(),
+            **counts,
+        )
+        stamp_run(thinking_dropped=counts)
 
 
 def _summarize_error(exc: BaseException) -> str:
@@ -205,6 +276,8 @@ class ModelResilienceMiddleware(AgentMiddleware):
     One instance is shared across the main and subagent stacks, so all loop
     state is call-local.
     """
+
+    state_schema = UnsentThinkingState
 
     def __init__(
         self,
@@ -531,8 +604,35 @@ class ModelResilienceMiddleware(AgentMiddleware):
         ):
             stripped = self._escalate_reasoning(req)
             if stripped is not None:
+                logger.warning(
+                    "[ModelResilience] retrying without reasoning after a 400",
+                    model=_model_display_name(req.model),
+                    thread_id=_thread_id(),
+                    error=(str(exc) or type(exc).__name__)[:_STRIP_ERROR_MAX_CHARS],
+                )
                 return status, _Recovery(request=stripped)
         return status, None
+
+    @staticmethod
+    def _answered(
+        response: ModelResponse,
+        name: str,
+        index: int,
+        request: ModelRequest,
+        stripped: list[str],
+    ) -> ModelCallResult:
+        """The answer, with the strip it took kept for the thread's later
+        requests (``UnsentThinkingState``). Only the request's own model
+        keeps one: a fallback refusing another model's reasoning says nothing
+        about what the primary reads."""
+        _report_drops(response, name, request.messages)
+        if index:
+            return _mark_fallback(response, name)
+        if not stripped:
+            return response
+        return ExtendedModelResponse(
+            model_response=response, command=Command(update={UNSENT_THINKING_KEY: set(stripped)})
+        )
 
     # ------------------------------------------------------------------
     # Hooks
@@ -544,6 +644,7 @@ class ModelResilienceMiddleware(AgentMiddleware):
     ) -> ModelCallResult:
         # Sync twin of awrap_model_call. Unused in production (the graph is
         # only driven async) — time.sleep here would stall an event loop.
+        request = _keep_unsent(request)
         candidates = self._candidates(request)
         records: list[_AttemptRecord] = []
         # The largest window that refused the request as too long (infinite
@@ -557,11 +658,12 @@ class ModelResilienceMiddleware(AgentMiddleware):
             req = request if client is None else request.override(model=client)
             attempts = 0
             escalated = False
+            stripped: list[str] = []
             while True:
                 attempts += 1
                 try:
                     response = handler(req)
-                    return _mark_fallback(response, name) if index else response
+                    return self._answered(response, name, index, request, stripped)
                 except Exception as exc:
                     status, recovery = self._decide(
                         exc, attempts, req, escalated=escalated
@@ -574,6 +676,7 @@ class ModelResilienceMiddleware(AgentMiddleware):
                         break
                     self._emit_retry(name, attempts, exc, status, recovery.delay)
                     if recovery.request is not None:
+                        stripped = _stripped_ids(req.messages, recovery.request.messages)
                         req, escalated = recovery.request, True
                     elif recovery.delay > 0:
                         time.sleep(recovery.delay)
@@ -596,6 +699,7 @@ class ModelResilienceMiddleware(AgentMiddleware):
         request: ModelRequest,
         handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
     ) -> ModelCallResult:
+        request = _keep_unsent(request)
         candidates = self._candidates(request)
         records: list[_AttemptRecord] = []
         # The largest window that refused the request as too long (infinite
@@ -617,11 +721,12 @@ class ModelResilienceMiddleware(AgentMiddleware):
             oauth_refreshed = False
             attempts = 0
             escalated = False
+            stripped: list[str] = []
             while True:
                 attempts += 1
                 try:
                     response = await handler(req)
-                    return _mark_fallback(response, name) if index else response
+                    return self._answered(response, name, index, request, stripped)
                 except Exception as exc:
                     if not oauth_refreshed and extract_status_code(exc) == 401:
                         oauth_refreshed = True
@@ -644,6 +749,7 @@ class ModelResilienceMiddleware(AgentMiddleware):
                         break
                     self._emit_retry(name, attempts, exc, status, recovery.delay)
                     if recovery.request is not None:
+                        stripped = _stripped_ids(req.messages, recovery.request.messages)
                         req, escalated = recovery.request, True
                     elif recovery.delay > 0:
                         await asyncio.sleep(recovery.delay)
