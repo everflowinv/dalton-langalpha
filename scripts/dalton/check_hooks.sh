@@ -66,6 +66,9 @@ ALLOWED_HOOKS=(
   "publish-card"
   "i18n"
   "brand-name"
+  # sync2: upstream 096 rewrites agent_preference in raw SQL without retiring
+  # the cached prefs/profile rows; Dalton bumps their cache-shape versions.
+  "prefs-cache-shape"
   # Dalton hides getting-started tasks it does not offer (the desktop app
   # download); the checklist count and progress ring follow DEPLOYED_TASKS.
   "onboarding-tasks"
