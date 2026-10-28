@@ -21,6 +21,9 @@ import csv
 import difflib
 import hashlib
 import hmac
+import http.client
+import io
+import ipaddress
 import json
 import logging
 import os
@@ -28,6 +31,7 @@ import plistlib
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -998,6 +1002,14 @@ class BridgeConfig:
                 os.path.expanduser("~/.cache/dalton/bridge-usage.json"),
             )
         )
+        # B5: per-call AlphaEngine usage ledger (JSONL, one line per call —
+        # search / read / fan-out leg), beside the bridge's other logs.
+        self.alphaengine_usage_file: Path = Path(
+            os.environ.get(
+                "DALTON_ALPHAENGINE_USAGE_FILE",
+                os.path.expanduser("~/Library/Logs/alphaengine_usage.jsonl"),
+            )
+        )
         self.archive_state_file: Path = Path(
             os.environ.get(
                 "DALTON_ARCHIVE_STATE_FILE",
@@ -1114,6 +1126,12 @@ class BridgeConfig:
         self.wiki_run_sh: Path | None = (
             Path(os.environ["DALTON_WIKI_RUN_SH"]).expanduser()
             if os.environ.get("DALTON_WIKI_RUN_SH", "").strip()
+            else None
+        )
+        # D1: market-digest's run.sh for sales-notes ingestion.
+        self.market_digest_run_sh: Path | None = (
+            Path(os.environ["DALTON_MARKET_DIGEST_RUN_SH"]).expanduser()
+            if os.environ.get("DALTON_MARKET_DIGEST_RUN_SH", "").strip()
             else None
         )
         default_wiki_audit = _SCRIPT_DIR.parents[1] / "var" / "dalton" / "wiki_ingest_audit.jsonl"
@@ -2020,7 +2038,7 @@ ROUTE_CONTRACT_SPECS: dict[str, dict[str, Any]] = {
             "ticker": "股票代码；会并入 query 检索词（上游不支持单独的 ticker 参数）",
             "start": "YYYY-MM-DD",
             "end": "YYYY-MM-DD",
-            "limit": "整数 1-40",
+            "limit": "整数 1-30（上游 search_library 的上限是 30，超出会被桥接层截到 30）",
             "params.keywords": "关键词列表 list[str]（传单个字符串时桥接层自动包成单元素列表）",
         },
         "return_shape": "{\"ok\": true, \"status\": \"ok\", \"data\": {\"structuredContent\": {\"data\": [...]}}, \"_sources\": [...]}",
@@ -3557,6 +3575,13 @@ def _classify_error_category_and_hint(
     # only on their own leg; split them from the other parameter-error signals
     # so a merged multi-source failure is not labeled by one leg's E_BAD_*.
     e_bad_signal = "e_bad_" in err_lower or err_code.startswith("e_bad_")
+    # The researchdata MCP server's own field validation (a limit past the
+    # upstream cap, a wrong type) is a caller mistake, not an outage — the
+    # upstream message names the field, so the hint carries it.
+    mcp_field_validation = (
+        "mcp_validation_invalid_field" in err_lower
+        or err_code.startswith("mcp_validation")
+    )
     other_param_signal = (
         status in ("invalid_arguments",)
         or err_code
@@ -3568,6 +3593,7 @@ def _classify_error_category_and_hint(
             "invalid_route",
             "missing_required_parameters",
         )
+        or mcp_field_validation
         or "参数" in err_text
         or "未知" in err_text
         or "alphaengine 文档" in err_lower
@@ -3643,6 +3669,22 @@ def _classify_error_category_and_hint(
                 "handoff route",
                 "permission denied",
                 "access denied",
+                # B4: AlphaEngine's Chinese refusals — "无查看权限或额度已达
+                # 上限" — carry none of the English tokens above, so they fell
+                # into 上游不可用 and invited pointless retries.
+                "无查看权限",
+                "没有查看权限",
+                "无权访问",
+                "权限不足",
+                "没有权限",
+                "额度已达上限",
+                "额度已用完",
+                "额度已耗尽",
+                "额度不足",
+                "配额已达上限",
+                "配额已用完",
+                "登录已过期",
+                "需要登录",
             )
         )
     ):
@@ -3657,7 +3699,12 @@ def _classify_error_category_and_hint(
         return category, existing_hint
 
     if category == "参数错误":
-        if route and accepted_params:
+        if mcp_field_validation:
+            hint = (
+                f"上游字段校验失败（{err_text[:200]}）；请核对报错指出的字段名与取值范围后重试"
+                f"（可调用 catalog(route='{route}') 查看该路由的参数契约）。"
+            )
+        elif route and accepted_params:
             hint = (
                 f"请核对路由 '{route}' 的参数名与格式（支持的操作: {accepted_ops}，接受的参数: {accepted_params}），"
                 f"或先调用 catalog(route='{route}') 查看完整参数契约与调用示例后重试。"
@@ -4884,7 +4931,8 @@ class ResearchDataBridge:
           and raises ValueError if `--ticker` (or `series`/`concept`/`item`/`document`/`form`/
           `dataset`/`as_of`/`vintage`) is passed; if `ticker` was provided on `all`, fold it into `query`.
         - `data_gateway.py` (`native_request`) maps `start` -> `start_date`, `end` -> `end_date`,
-          and `limit` -> `size` (clamped to `min(limit, 40)`).
+          and `limit` -> `size` (clamped to `min(limit, 30)`, the upstream
+          search_library maximum).
         - Local-library `params` keys (`sources`, `layer`, `media`, `search_mode`, `company`,
           `sector`, `tag`, `indexed_since`, `sender`, `no_decay`, `offset`, `max_chars`) are omitted;
           only Guidepoint-native optional keys (`keywords`, `recency_bias`) are forwarded if present.
@@ -4925,7 +4973,7 @@ class ResearchDataBridge:
 
         limit = arguments.get("limit")
         if isinstance(limit, int) and not isinstance(limit, bool) and limit > 0:
-            gp_args["limit"] = min(limit, 40)
+            gp_args["limit"] = min(limit, 30)
 
         if isinstance(raw_params, dict):
             gp_params: dict[str, Any] = {}
@@ -5639,6 +5687,69 @@ class ResearchDataBridge:
                 tmp_path.replace(self.cfg.usage_file)
             except Exception as exc:
                 logger.warning("Failed to record alphaengine usage: %s", type(exc).__name__)
+
+    # B5: the per-call AlphaEngine ledger. One JSONL line per served call —
+    # a direct route='alphaengine' call or the AlphaEngine leg of a
+    # route='all' fan-out — with the caller identity the request headers
+    # carried (empty when they carried none). The query itself never lands
+    # in the file: only a 12-hex sha256 prefix, enough to spot repeat
+    # searches without keeping the wording.
+    _ALPHAENGINE_USAGE_MAX_BYTES: int = 32 * 1024 * 1024
+
+    @staticmethod
+    def _alphaengine_usage_op(operation: str) -> str:
+        return {"search_library": "search", "get_document": "read"}.get(
+            str(operation or "").strip(), str(operation or "").strip() or "call"
+        )
+
+    async def _record_alphaengine_usage(
+        self,
+        *,
+        operation: str,
+        arguments: dict[str, Any] | None,
+        ok: bool,
+        error_category: str | None,
+        count: int,
+        caller: dict[str, str] | None,
+    ) -> None:
+        args = arguments if isinstance(arguments, dict) else {}
+        params = args.get("params") if isinstance(args.get("params"), dict) else {}
+        query = str(args.get("query") or "").strip()
+        doc_id = str(params.get("doc_id") or args.get("document") or "").strip()
+        entry = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "op": self._alphaengine_usage_op(operation),
+            "query_sha256_12": (
+                hashlib.sha256(query.encode("utf-8")).hexdigest()[:12] if query else ""
+            ),
+            "doc_id": doc_id,
+            "count": max(0, int(count)) if isinstance(count, int) else 0,
+            "ok": bool(ok),
+            "error_category": str(error_category or "").strip(),
+            "user": str((caller or {}).get("user") or ""),
+            "workspace": str((caller or {}).get("workspace") or ""),
+            "thread": str((caller or {}).get("thread") or ""),
+        }
+        async with self._usage_lock:
+            try:
+                usage_file = self.cfg.alphaengine_usage_file
+                usage_file.parent.mkdir(parents=True, exist_ok=True)
+                if usage_file.is_file() and (
+                    usage_file.stat().st_size >= self._ALPHAENGINE_USAGE_MAX_BYTES
+                ):
+                    rotated = usage_file.with_suffix(usage_file.suffix + ".1")
+                    try:
+                        rotated.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                    usage_file.replace(rotated)
+                with usage_file.open("a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            except Exception as exc:
+                logger.warning(
+                    "Failed to append alphaengine usage ledger entry: %s",
+                    type(exc).__name__,
+                )
 
     @staticmethod
     def _make_tool_result_response(
@@ -7185,8 +7296,18 @@ class ResearchDataBridge:
         return await asyncio.to_thread(self._build_market_regime_sync, arguments)
 
     async def handle_tools_call(
-        self, req_id: Any, params: dict[str, Any]
+        self,
+        req_id: Any,
+        params: dict[str, Any],
+        *,
+        caller_identity: dict[str, str] | None = None,
     ) -> dict[str, Any]:
+        """Serve one JSON-RPC ``tools/call``.
+
+        ``caller_identity`` is the ``X-Dalton-User/-Workspace/-Thread`` trio
+        the HTTP request carried (B5); it rides into the AlphaEngine usage
+        ledger, empty when the caller sent none.
+        """
         tool_name = str(params.get("name") or "").strip()
         raw_args = params.get("arguments")
         raw_arguments: dict[str, Any] = (
@@ -7345,7 +7466,25 @@ class ResearchDataBridge:
                     clamped_p["offset"] = 0
                 elif isinstance(off_raw, str):
                     clamped_p["offset"] = off_int
+            # Guidepoint's upstream search_library caps size at 30; a bigger
+            # value is an MCP_VALIDATION_INVALID_FIELD refusal, so the bridge
+            # clamps it the way the route='all' fan-out leg already does and
+            # reports the change beside the rest.
+            gp_size_raw = clamped_p.get("size")
+            gp_size_int = _parse_int_param(gp_size_raw)
+            if gp_size_int is not None and gp_size_int > 30:
+                params_clamped["params.size"] = [gp_size_raw, 30]
+                clamped_p["size"] = 30
             call_args["params"] = clamped_p
+
+        # The same ceiling on guidepoint's top-level `limit` (the fan-out leg
+        # clamps at min(limit, 30); a direct call must not fare worse).
+        if tool_name == "research" and route == "guidepoint":
+            gp_limit_raw = call_args.get("limit")
+            gp_limit_int = _parse_int_param(gp_limit_raw)
+            if gp_limit_int is not None and gp_limit_int > 30:
+                params_clamped["limit"] = [gp_limit_raw, 30]
+                call_args["limit"] = 30
 
         params_mapped_hint: str | None = None
         if tool_name == "research" and route in INTERNAL_LIBRARY_ROUTES:
@@ -7639,6 +7778,17 @@ class ResearchDataBridge:
                 _apply_error_and_empty_contract(
                     tool_name, route, operation, timeout_payload, norm_params_view
                 )
+                # B5: a timed-out AlphaEngine call was still a call — it lands
+                # in the ledger with its classified failure.
+                if route == "alphaengine":
+                    await self._record_alphaengine_usage(
+                        operation=operation or "search_library",
+                        arguments=arguments,
+                        ok=False,
+                        error_category=str(timeout_payload.get("error_category") or ""),
+                        count=0,
+                        caller=caller_identity,
+                    )
                 return {
                     "jsonrpc": "2.0",
                     "id": req_id,
@@ -7825,6 +7975,38 @@ class ResearchDataBridge:
                         if isinstance(sc, dict):
                             chars = int(sc.get("returned_chars") or len(str(sc.get("text") or "")))
                         await self._record_alphaengine_get_doc(chars)
+
+                    # B5: one ledger line per served AlphaEngine call — the
+                    # direct route and the route='all' fan-out leg each.
+                    if route == "alphaengine":
+                        results_for_count = payload.get("results")
+                        await self._record_alphaengine_usage(
+                            operation=operation or "search_library",
+                            arguments=arguments,
+                            ok=bool(payload.get("ok")),
+                            error_category=str(payload.get("error_category") or ""),
+                            count=(
+                                int(payload.get("result_count") or 0)
+                                if isinstance(payload.get("result_count"), int)
+                                else (len(results_for_count) if isinstance(results_for_count, list) else 0)
+                            ),
+                            caller=caller_identity,
+                        )
+                    if ae_outcome is not None and ae_args is not None:
+                        ae_ok = bool(ae_outcome.get("ok"))
+                        ae_reason = str(ae_outcome.get("reason") or "")
+                        await self._record_alphaengine_usage(
+                            operation=str(ae_args.get("operation") or "search_library"),
+                            arguments=ae_args,
+                            ok=ae_ok,
+                            error_category=(
+                                "" if ae_ok else _classify_error_category_and_hint(
+                                    "research", "alphaengine", "search_library", {"error": ae_reason}
+                                )[0]
+                            ),
+                            count=int(ae_outcome.get("count") or 0),
+                            caller=caller_identity,
+                        )
 
                     _apply_error_and_empty_contract(
                         tool_name, route, operation, payload, norm_params_view
@@ -9475,6 +9657,115 @@ class ResearchDataBridge:
             finally:
                 fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
 
+    # ------------------------------------------------------------------
+    # Created-doc registry (C1: the /feishu/doc/grant scope). Same storage
+    # discipline as the wiki idempotency store beside it — a JSON file in the
+    # bridge's state directory, written under an flock atomically.
+    # ------------------------------------------------------------------
+
+    def _feishu_doc_registry_file(self) -> Path:
+        """Return the path to the created-doc registry file."""
+        custom = getattr(self.cfg, "feishu_doc_registry_file", None)
+        if custom is not None:
+            return Path(custom)
+        return self.cfg.wiki_ingest_audit_file.with_name("feishu_doc_registry.json")
+
+    def _read_feishu_doc_registry(self) -> dict[str, dict[str, Any]]:
+        """Read `document_id -> record` from the created-doc registry; {} on any failure."""
+        reg_path = self._feishu_doc_registry_file()
+        if not reg_path.is_file():
+            return {}
+        try:
+            raw = json.loads(reg_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logger.error(
+                "Failed reading feishu doc registry %s: %s", reg_path, type(exc).__name__
+            )
+            return {}
+        if not isinstance(raw, dict):
+            return {}
+        return {str(k): v for k, v in raw.items() if isinstance(v, dict)}
+
+    def _register_feishu_created_doc(
+        self,
+        document_id: str,
+        *,
+        creator_email: str,
+        title: str = "",
+        space_id: str = "",
+        node_token: str = "",
+    ) -> None:
+        """Record a doc this bridge created, so `/feishu/doc/grant` can scope itself (C1).
+
+        The registry names the creating user's email — the same address the
+        create-time auto-grant used — and the grant endpoint accepts only it.
+        A failed write only logs: an unregistered doc then fails closed at
+        grant time, which is the safe direction.
+        """
+        import fcntl
+
+        reg_path = self._feishu_doc_registry_file()
+        try:
+            reg_path.parent.mkdir(parents=True, exist_ok=True)
+            lock_path = reg_path.with_suffix(".lock")
+            record = {
+                "creator_email": creator_email.strip().lower(),
+                "title": title,
+                "space_id": space_id,
+                "node_token": node_token,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }
+            with lock_path.open("a", encoding="utf-8") as lock_fh:
+                fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+                try:
+                    current: dict[str, Any] = {}
+                    if reg_path.exists():
+                        try:
+                            parsed = json.loads(reg_path.read_text(encoding="utf-8"))
+                            if isinstance(parsed, dict):
+                                current = {
+                                    str(k): v for k, v in parsed.items() if isinstance(v, dict)
+                                }
+                        except Exception as exc:
+                            logger.error(
+                                "Refusing to overwrite corrupted feishu doc registry %s: %s",
+                                reg_path,
+                                type(exc).__name__,
+                            )
+                            return
+                    current[document_id] = record
+                    tmp_fd, tmp_name = tempfile.mkstemp(
+                        prefix=".feishu_reg_",
+                        suffix=".tmp",
+                        dir=str(reg_path.parent),
+                    )
+                    os.close(tmp_fd)
+                    tmp_path = Path(tmp_name)
+                    try:
+                        os.chmod(tmp_path, 0o600)
+                        with open(tmp_path, "w", encoding="utf-8") as f:
+                            json.dump(current, f, ensure_ascii=False, indent=2)
+                            f.flush()
+                            os.fsync(f.fileno())
+                        os.replace(str(tmp_path), str(reg_path))
+                        dir_fd = os.open(str(reg_path.parent), os.O_RDONLY)
+                        try:
+                            os.fsync(dir_fd)
+                        finally:
+                            os.close(dir_fd)
+                    except BaseException:
+                        try:
+                            tmp_path.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+                        raise
+                finally:
+                    fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+        except Exception:
+            logger.warning(
+                "Failed registering created feishu doc %s", document_id, exc_info=True
+            )
+
     def _find_wiki_audit_by_request_id(self, request_id: str | None) -> dict[str, Any] | None:
         """Return a prior successful audit record for `request_id` if one exists."""
         if not request_id:
@@ -9587,8 +9878,13 @@ class ResearchDataBridge:
         target_file: Path,
         content_sha256: str,
         norm_text: str,
+        allow_similar: bool = False,
     ) -> dict[str, Any] | None:
-        """Check only the single target markdown file on disk for sha256 or text similarity match."""
+        """Check only the single target markdown file on disk for sha256 or text similarity match.
+
+        ``allow_similar`` (a confirmed "ingest anyway" answer) skips the
+        similarity verdict but never the exact-fingerprint one.
+        """
         if not target_file.is_file():
             return None
         rel_disk_path = (
@@ -9619,7 +9915,7 @@ class ResearchDataBridge:
                     "filepath": rel_disk_path,
                     "similarity": 1.0,
                 }
-            if norm_text:
+            if norm_text and not allow_similar:
                 sim = _compute_wiki_text_similarity(norm_text, existing_norm)
                 if sim >= WIKI_INGEST_SIMILARITY_THRESHOLD:
                     return {
@@ -9640,8 +9936,16 @@ class ResearchDataBridge:
         content_sha256: str,
         norm_text: str,
         wiki_cfg: dict[str, Any],
+        allow_similar: bool = False,
     ) -> dict[str, Any] | None:
-        """Check whether `content_sha256` or a highly similar same-(slug, date, type) doc already exists."""
+        """Check whether `content_sha256` or a highly similar same-(slug, date, type) doc already exists.
+
+        With ``allow_similar`` (the user answered a suspected-duplicate preview
+        with an explicit "ingest anyway"), the text-similarity verdicts are
+        skipped so a revision of an existing memo can land; the exact sha256
+        fingerprint check always runs — byte-identical content never writes a
+        second copy regardless of the flag.
+        """
         idemp_entries = list(self._read_wiki_idempotent_results().values())
         audit_entries = self._read_wiki_audit_entries()
         combined_entries = [*idemp_entries, *audit_entries]
@@ -9660,7 +9964,7 @@ class ResearchDataBridge:
                 }
 
         # 2. Text similarity against idempotency store and audit entries with same slug + date + content_type
-        if norm_text:
+        if norm_text and not allow_similar:
             for entry in combined_entries:
                 st = str(entry.get("status") or entry.get("result") or "").strip().lower()
                 if st not in ("ingested", "done", "ok", "added", "added_from_file"):
@@ -9713,6 +10017,7 @@ class ResearchDataBridge:
             target_file=target_file,
             content_sha256=content_sha256,
             norm_text=norm_text,
+            allow_similar=allow_similar,
         )
 
     def _build_wiki_subprocess_env(self) -> dict[str, str]:
@@ -9863,6 +10168,11 @@ class ResearchDataBridge:
                 "suspected_sell_side": True,
                 "error": f"卖方内容类型 '{raw_content_type.strip()}' 不进 company-wiki，请走 sales notes。",
                 "hint": "卖方观点（券商研报、sales color、分析师电话会）请走 sales notes，不进 wiki。",
+                "next_action": (
+                    "改用 ingest_sales_note（speaker='sell_side' 时 ingest_research 会自动路由）："
+                    "institution=机构名、title=标题、kind=研报|点评|卖方电话会|销售观点，"
+                    "content/file 与本次相同即可。"
+                ),
             }
 
         canonical_content_type = _ALLOWED_CONTENT_TYPE_MAP.get(
@@ -9920,6 +10230,10 @@ class ResearchDataBridge:
                     "suspected_sell_side": True,
                     "error": f"来源 '{source_clean}' 属于卖方渠道，请走 sales notes。",
                     "hint": "卖方观点（券商研报、sales color、分析师电话会）请走 sales notes，不进 wiki。",
+                    "next_action": (
+                        "改用 ingest_sales_note（speaker='sell_side' 时 ingest_research 会自动路由）："
+                        "institution 填该卖方机构名，content/file 与本次相同即可。"
+                    ),
                 }
 
         raw_source_url = body.get("source_url")
@@ -9974,6 +10288,11 @@ class ResearchDataBridge:
         )
 
         dry_run = bool(body.get("dry_run", False))
+        # A caller that already showed the user a suspected-duplicate preview
+        # and got an explicit "ingest anyway" answers with this flag: the
+        # similarity verdicts step aside (a same-content revision is the
+        # workflow), while the exact sha256 fingerprint check stays.
+        allow_similar = bool(body.get("allow_similar", False))
 
         # Validate mutually exclusive content vs file
         has_content = body.get("content") is not None
@@ -10152,6 +10471,12 @@ class ResearchDataBridge:
             if suspected_sell_side
             else None
         )
+        sell_side_next_action = (
+            "若确认是卖方观点，改用 ingest_sales_note（speaker='sell_side' 时 ingest_research 会自动路由）："
+            "institution=机构名、title=标题、kind=研报|点评|卖方电话会|销售观点，content/file 与本次相同。"
+            if suspected_sell_side
+            else None
+        )
 
         # Compute expected preview filename & relative filepath
         type_slug = canonical_content_type.replace(" ", "-")
@@ -10184,6 +10509,7 @@ class ResearchDataBridge:
                 "scan_note": scan_note,
                 "suspected_sell_side": suspected_sell_side,
                 "sell_side_warning": sell_side_warning,
+                "sell_side_next_action": sell_side_next_action,
                 "duplicate": False,
                 "audit_path": "var/dalton/wiki_ingest_audit.jsonl",
             }
@@ -10212,6 +10538,7 @@ class ResearchDataBridge:
                 "scan_note": scan_note,
                 "suspected_sell_side": suspected_sell_side,
                 "sell_side_warning": sell_side_warning,
+                "sell_side_next_action": sell_side_next_action,
                 "error": (
                     f"检测到重复文档 (duplicate: {dup_info.get('reason')})，已存在记录 "
                     f"{dup_info.get('filepath') or dup_info.get('doc_id') or ''}，拒绝重复入库。"
@@ -10267,6 +10594,7 @@ class ResearchDataBridge:
                 content_sha256=content_sha256,
                 norm_text=norm_text,
                 wiki_cfg=wiki_cfg,
+                allow_similar=allow_similar,
             )
             if dup_info is not None:
                 return _build_duplicate_response(dup_info)
@@ -10290,6 +10618,7 @@ class ResearchDataBridge:
                 "scan_note": scan_note,
                 "suspected_sell_side": suspected_sell_side,
                 "sell_side_warning": sell_side_warning,
+                "sell_side_next_action": sell_side_next_action,
                 "duplicate": False,
             }
 
@@ -10343,6 +10672,7 @@ class ResearchDataBridge:
                 content_sha256=content_sha256,
                 norm_text=norm_text,
                 wiki_cfg=wiki_cfg,
+                allow_similar=allow_similar,
             )
             if dup_info is not None:
                 return _build_duplicate_response(dup_info)
@@ -10536,6 +10866,7 @@ class ResearchDataBridge:
                 "related_sectors": cli_res.get("related_sectors") or [],
                 "suspected_sell_side": suspected_sell_side,
                 "sell_side_warning": sell_side_warning,
+                "sell_side_next_action": sell_side_next_action,
                 "duplicate": False,
                 "audit_path": "var/dalton/wiki_ingest_audit.jsonl",
             }
@@ -10552,6 +10883,413 @@ class ResearchDataBridge:
                 except OSError:
                     pass
             self._release_wiki_claim_locks(claim_fds)
+
+    # ------------------------------------------------------------------
+    # Sales-notes ingest (D1): OpenClaw market-digest `add-note`, host-side
+    # ------------------------------------------------------------------
+
+    _SALES_NOTES_KINDS = frozenset({"研报", "点评", "卖方电话会", "销售观点"})
+    _SALES_NOTES_AUDIT_REL = "var/dalton/sales_notes_ingest_audit.jsonl"
+
+    def _resolve_market_digest_run_sh(self) -> Path:
+        explicit = getattr(self.cfg, "market_digest_run_sh", None)
+        if isinstance(explicit, Path):
+            return explicit
+        return self.cfg.ocw_root / "skills" / "market-digest" / "run.sh"
+
+    def _sales_notes_audit_path(self) -> Path:
+        return self.cfg.ocw_root / self._SALES_NOTES_AUDIT_REL
+
+    def _append_sales_notes_audit_entry(self, entry: dict[str, Any]) -> None:
+        path = self._sales_notes_audit_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+    def _find_sales_notes_audit_by_request_id(self, request_id: str) -> dict[str, Any] | None:
+        path = self._sales_notes_audit_path()
+        if not path.is_file():
+            return None
+        try:
+            with path.open("r", encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        parsed = json.loads(line)
+                    except ValueError:
+                        continue
+                    if isinstance(parsed, dict) and parsed.get("request_id") == request_id:
+                        return parsed
+        except OSError:
+            return None
+        return None
+
+    async def handle_sales_notes_ingest(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        """Handle `POST /sales-notes/ingest` (admin token only): sell-side material into sales notes.
+
+        The host-side twin of `/wiki/ingest`, aimed at OpenClaw's
+        `market-digest/run.sh --json add-note`: the CLI and its credentials
+        never enter a sandbox. File types, size ceilings and the secret scan
+        are the wiki ingest's; dedup rides the CLI's own doc_key (a repeat of
+        the same body returns `duplicate`), with request-id replay on top.
+        """
+        institution = str(body.get("institution") or "").strip()
+        title = str(body.get("title") or "").strip()
+        if not institution:
+            return 400, {"ok": False, "status": "bad_request", "error_code": "missing_institution",
+                         "error": "institution 必填（卖方机构名，如 'Morgan Stanley'）"}
+        if not title:
+            return 400, {"ok": False, "status": "bad_request", "error_code": "missing_title",
+                         "error": "title 必填"}
+        try:
+            institution = _validate_clean_text(institution, field_name="institution", max_len=200)
+            title = _validate_clean_text(title, field_name="title", max_len=500)
+        except ValueError as exc:
+            return 400, {"ok": False, "status": "bad_request", "error_code": "invalid_text", "error": str(exc)}
+
+        analyst: str | None = None
+        raw_analyst = body.get("analyst")
+        if isinstance(raw_analyst, str) and raw_analyst.strip():
+            try:
+                analyst = _validate_clean_text(raw_analyst, field_name="analyst", max_len=200)
+            except ValueError as exc:
+                return 400, {"ok": False, "status": "bad_request", "error_code": "invalid_analyst", "error": str(exc)}
+
+        kind: str | None = None
+        raw_kind = body.get("kind")
+        if raw_kind is not None:
+            kind = str(raw_kind).strip()
+            if kind and kind not in self._SALES_NOTES_KINDS:
+                return 400, {
+                    "ok": False,
+                    "status": "bad_request",
+                    "error_code": "invalid_kind",
+                    "allowed_kinds": sorted(self._SALES_NOTES_KINDS),
+                    "error": f"kind 必须是 {sorted(self._SALES_NOTES_KINDS)} 之一或不传",
+                }
+
+        doc_date: str | None = None
+        raw_doc_date = body.get("doc_date")
+        if raw_doc_date is not None and str(raw_doc_date).strip():
+            doc_date = str(raw_doc_date).strip()
+            if not _YMD_RE.fullmatch(doc_date):
+                return 400, {"ok": False, "status": "bad_request", "error_code": "invalid_doc_date",
+                             "error": "doc_date 必须为 YYYY-MM-DD"}
+        received_date: str | None = None
+        raw_received = body.get("date")
+        if raw_received is not None and str(raw_received).strip():
+            received_date = str(raw_received).strip()
+            if not _YMD_RE.fullmatch(received_date):
+                return 400, {"ok": False, "status": "bad_request", "error_code": "invalid_date",
+                             "error": "date 必须为 YYYY-MM-DD"}
+
+        source_url: str | None = None
+        raw_source_url = body.get("source_url")
+        if raw_source_url is not None and str(raw_source_url).strip():
+            url_cand = str(raw_source_url).strip()
+            if (
+                len(url_cand) > 1000
+                or any(ord(ch) < 32 or ch.isspace() for ch in url_cand)
+                or not url_cand.startswith(("http://", "https://"))
+            ):
+                return 400, {"ok": False, "status": "bad_request", "error_code": "invalid_source_url",
+                             "error": "source_url 必须为有效的 http/https URL（<=1000 字符）"}
+            source_url = url_cand
+
+        tickers: list[str] = []
+        raw_tickers = body.get("tickers")
+        if raw_tickers is not None:
+            if not isinstance(raw_tickers, list):
+                return 400, {"ok": False, "status": "bad_request", "error_code": "invalid_tickers",
+                             "error": "tickers 必须为字符串列表"}
+            for t in raw_tickers[:10]:
+                t_clean = str(t or "").strip().upper()
+                if t_clean and len(t_clean) <= 16 and re.fullmatch(r"[A-Z0-9.\-^/=]+", t_clean):
+                    tickers.append(t_clean)
+            if not tickers and raw_tickers:
+                return 400, {"ok": False, "status": "bad_request", "error_code": "invalid_tickers",
+                             "error": "tickers 中的代码均不合法"}
+
+        raw_by = body.get("ingested_by")
+        if isinstance(raw_by, dict):
+            by_user_id = str(raw_by.get("user_id") or "").strip()
+            by_email = str(raw_by.get("email") or "").strip()
+        else:
+            by_user_id = str(raw_by or "").strip()
+            by_email = ""
+        if not by_user_id:
+            return 400, {"ok": False, "status": "bad_request", "error_code": "missing_ingested_by",
+                         "error": "ingested_by.user_id 必填"}
+        ingested_by_norm = {"user_id": by_user_id, "email": by_email}
+        raw_via = body.get("ingested_via")
+        ingested_via_norm = (
+            {
+                "workspace_id": str(raw_via.get("workspace_id") or "").strip(),
+                "thread_id": str(raw_via.get("thread_id") or "").strip(),
+            }
+            if isinstance(raw_via, dict)
+            else {"workspace_id": "", "thread_id": ""}
+        )
+
+        raw_req_id = body.get("request_id")
+        request_id: str | None = (
+            str(raw_req_id).strip() if isinstance(raw_req_id, str) and raw_req_id.strip() else None
+        )
+        dry_run = bool(body.get("dry_run", False))
+
+        has_content = body.get("content") is not None
+        has_file = body.get("file") is not None
+        if has_content == has_file:
+            return 400, {"ok": False, "status": "bad_request", "error_code": "content_or_file_required",
+                         "error": "content 与 file 必须二选一传入"}
+
+        content_text: str | None = None
+        file_bytes: bytes | None = None
+        upload_filename: str | None = None
+        scan_text = ""
+        content_sha256 = ""
+
+        if has_content:
+            raw_content = body.get("content")
+            if not isinstance(raw_content, str) or not raw_content.strip():
+                return 400, {"ok": False, "status": "empty_content", "error_code": "empty_content",
+                             "error": "content 不能为空"}
+            if len(raw_content) > WIKI_INGEST_MAX_TEXT_CHARS:
+                return 400, {"ok": False, "status": "payload_too_large", "error_code": "text_too_large",
+                             "max_chars": WIKI_INGEST_MAX_TEXT_CHARS,
+                             "error": f"文本长度 ({len(raw_content)}) 超过 {WIKI_INGEST_MAX_TEXT_CHARS} 字符上限"}
+            content_text = raw_content
+            scan_text = content_text
+            content_sha256 = hashlib.sha256(
+                _normalize_wiki_text_for_hash(content_text).encode("utf-8")
+            ).hexdigest()
+        else:
+            raw_file = body.get("file")
+            if not isinstance(raw_file, dict):
+                return 400, {"ok": False, "status": "bad_request", "error_code": "invalid_file_payload",
+                             "error": "file 必须为包含 filename 与文件字节的对象"}
+            raw_fname = str(raw_file.get("filename") or raw_file.get("name") or "").strip()
+            if not raw_fname or "/" in raw_fname or "\\" in raw_fname or ".." in raw_fname or raw_fname.startswith("."):
+                return 400, {"ok": False, "status": "bad_request", "error_code": "invalid_filename",
+                             "error": "file.filename 非法或为空"}
+            ext = Path(raw_fname).suffix.lower()
+            if ext not in WIKI_INGEST_ALLOWED_EXTENSIONS:
+                return 400, {"ok": False, "status": "invalid_extension", "error_code": "invalid_extension",
+                             "allowed_extensions": sorted(WIKI_INGEST_ALLOWED_EXTENSIONS),
+                             "error": f"不支持的文件扩展名 '{ext}'；仅允许: {', '.join(sorted(WIKI_INGEST_ALLOWED_EXTENSIONS))}"}
+            upload_filename = Path(raw_fname).name
+            decoded_bytes, decode_err = _extract_file_bytes(raw_file)
+            if decode_err is not None or decoded_bytes is None:
+                return 400, {"ok": False, "status": "bad_request", "error_code": "invalid_file_bytes",
+                             "error": decode_err or "无法解析文件字节"}
+            if len(decoded_bytes) == 0:
+                return 400, {"ok": False, "status": "empty_content", "error_code": "empty_file",
+                             "error": "文件内容不能为空"}
+            if len(decoded_bytes) > WIKI_INGEST_MAX_FILE_BYTES:
+                return 400, {"ok": False, "status": "payload_too_large", "error_code": "file_too_large",
+                             "max_bytes": WIKI_INGEST_MAX_FILE_BYTES,
+                             "error": f"文件大小 ({len(decoded_bytes)} bytes) 超过 20 MB 上限"}
+            file_bytes = decoded_bytes
+            if ext in (".md", ".txt"):
+                scan_text = file_bytes.decode("utf-8", errors="replace")
+                content_sha256 = hashlib.sha256(
+                    _normalize_wiki_text_for_hash(scan_text).encode("utf-8")
+                ).hexdigest()
+            else:
+                binary_scan, _extracted, _ok, _note = _inspect_binary_file_for_wiki(file_bytes, ext)
+                scan_text = binary_scan
+                content_sha256 = hashlib.sha256(file_bytes).hexdigest()
+
+        secret_kind = _detect_wiki_ingest_secret(scan_text, "", "", "")
+        if secret_kind is not None:
+            return 400, {"ok": False, "status": "secret_detected", "error_code": "secret_detected",
+                         "secret_kind": secret_kind,
+                         "error": "检测到疑似密钥或敏感凭证（API key / token / 私钥 PEM），拒绝入库。",
+                         "hint": "请先移除正文或文件中的密钥、Token 或私钥内容后再入库。"}
+
+        base_audit = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "request_id": request_id,
+            "ingested_by": ingested_by_norm,
+            "ingested_via": ingested_via_norm,
+            "institution": institution,
+            "title": title,
+            "kind": kind,
+            "doc_date": doc_date,
+            "sha256": content_sha256,
+        }
+
+        # request-id replay: the same confirmed request answers from its record
+        if not dry_run and request_id is not None:
+            prior = self._find_sales_notes_audit_by_request_id(request_id)
+            if prior is not None and prior.get("result") == "ok":
+                prior_out = dict(prior.get("cli_result") or {})
+                prior_out.update(
+                    {
+                        "ok": True,
+                        "status": "ingested",
+                        "idempotent_replay": True,
+                        "request_id": request_id,
+                        "audit_path": self._SALES_NOTES_AUDIT_REL,
+                    }
+                )
+                return 200, prior_out
+
+        run_sh = self._resolve_market_digest_run_sh()
+        env = self._build_wiki_subprocess_env()
+
+        cmd: list[str] = [str(run_sh), "--json", "add-note"]
+        cmd.extend(["--institution", institution])
+        cmd.extend(["--title", title])
+        if analyst:
+            cmd.extend(["--analyst", analyst])
+        if kind:
+            cmd.extend(["--kind", kind])
+        if doc_date:
+            cmd.extend(["--doc-date", doc_date])
+        if received_date:
+            cmd.extend(["--date", received_date])
+        if source_url:
+            cmd.extend(["--source-url", source_url])
+        if tickers:
+            cmd.extend(["--tickers", ",".join(tickers)])
+        if dry_run:
+            cmd.append("--dry-run")
+
+        self.cfg.wiki_ingest_temp_dir.mkdir(parents=True, exist_ok=True)
+        req_tmp_dir = Path(tempfile.mkdtemp(prefix="sales_note_", dir=str(self.cfg.wiki_ingest_temp_dir)))
+        os.chmod(req_tmp_dir, 0o700)
+        tmp_payload: Path | None = None
+        try:
+            if file_bytes is not None and upload_filename is not None:
+                tmp_payload = req_tmp_dir / upload_filename
+                fd = os.open(str(tmp_payload), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                try:
+                    os.write(fd, file_bytes)
+                finally:
+                    os.close(fd)
+                cmd.extend(["--file", str(tmp_payload)])
+            else:
+                assert content_text is not None
+                tmp_payload = req_tmp_dir / "content.md"
+                fd = os.open(str(tmp_payload), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                try:
+                    os.write(fd, content_text.encode("utf-8"))
+                finally:
+                    os.close(fd)
+                cmd.extend(["--content", f"@{tmp_payload}"])
+
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                cwd=str(self.cfg.ocw_root),
+                env=env,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                stdout_bytes, _stderr = await asyncio.wait_for(
+                    proc.communicate(), timeout=self.cfg.wiki_ingest_timeout_s
+                )
+            except asyncio.TimeoutError:
+                proc.kill()
+                await _reap_process(proc)
+                return 502, {"ok": False, "status": "timeout", "request_id": request_id,
+                             "error": f"add-note 超过 {self.cfg.wiki_ingest_timeout_s}s 未完成"}
+            cli_text = stdout_bytes.decode("utf-8", errors="replace").strip()
+            cli_payload: dict[str, Any] = {}
+            last_line = cli_text.splitlines()[-1].strip() if cli_text else ""
+            if last_line.startswith("{"):
+                try:
+                    parsed_cli = json.loads(last_line)
+                    if isinstance(parsed_cli, dict):
+                        cli_payload = parsed_cli
+                except ValueError:
+                    cli_payload = {}
+            if proc.returncode != 0 and not cli_payload:
+                return 502, {
+                    "ok": False,
+                    "status": "cli_error",
+                    "request_id": request_id,
+                    "exit_code": proc.returncode,
+                    "error": "market-digest add-note 运行失败（详见桥接日志）",
+                }
+
+            status = str(cli_payload.get("status") or cli_payload.get("result") or "").strip().lower()
+            is_duplicate = status == "duplicate" or cli_payload.get("duplicate") is True
+            outcome_ok = proc.returncode == 0 and not is_duplicate
+
+            if dry_run:
+                return 200, {
+                    "ok": True,
+                    "status": "dry_run",
+                    "dry_run": True,
+                    # Canonical duplicate verdict (D1/r3): derived here from the
+                    # CLI's own status/result/duplicate spelling, so callers
+                    # read one field instead of replaying this normalization.
+                    "duplicate": is_duplicate,
+                    "request_id": request_id,
+                    "institution": institution,
+                    "title": title,
+                    "kind": kind,
+                    "doc_date": doc_date,
+                    "tickers": tickers,
+                    "upload_filename": upload_filename,
+                    "size_bytes": len(file_bytes) if file_bytes is not None else len((content_text or "").encode("utf-8")),
+                    "char_count": len(content_text) if content_text is not None else None,
+                    "sha256": content_sha256,
+                    "cli_preview": cli_payload,
+                }
+
+            audit_entry = {
+                **base_audit,
+                "result": "ok" if outcome_ok else ("duplicate" if is_duplicate else "error"),
+                "status": status or ("ok" if outcome_ok else "error"),
+                "cli_result": cli_payload,
+            }
+            try:
+                self._append_sales_notes_audit_entry(audit_entry)
+            except Exception as exc:
+                logger.warning("Failed writing sales-notes audit entry: %s", type(exc).__name__)
+
+            if not outcome_ok and not is_duplicate:
+                return 502, {
+                    "ok": False,
+                    "status": "cli_error",
+                    "request_id": request_id,
+                    "error": str(cli_payload.get("error") or "market-digest add-note 运行失败"),
+                }
+
+            response = {
+                "ok": True,
+                "status": "duplicate" if is_duplicate else "ingested",
+                "dry_run": False,
+                "request_id": request_id,
+                "duplicate": is_duplicate,
+                "institution": institution,
+                "title": title,
+                "kind": kind,
+                "sha256": content_sha256,
+                "cli_result": cli_payload,
+                "audit_path": self._SALES_NOTES_AUDIT_REL,
+            }
+            doc_key = str(cli_payload.get("doc_key") or "")
+            if doc_key:
+                response["doc_key"] = doc_key
+                response["document_id"] = f"manual:{doc_key}" if not doc_key.startswith("manual:") else doc_key
+            return 200, response
+        finally:
+            if tmp_payload is not None:
+                try:
+                    tmp_payload.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            try:
+                shutil.rmtree(req_tmp_dir, ignore_errors=True)
+            except OSError:
+                pass
 
     # ------------------------------------------------------------------
     # Feishu doc read/write handlers (DALTON-HOOK(feishu-docs))
@@ -10722,6 +11460,17 @@ class ResearchDataBridge:
             if not document_id:
                 raise FeishuApiError("feishu_create_failed")
 
+            # C1: every doc this bridge creates goes into the registry with
+            # its creator, so /feishu/doc/grant stays scoped to Dalton's own
+            # docs and the user they were created for.
+            self._register_feishu_created_doc(
+                document_id,
+                creator_email=grant_email,
+                title=title,
+                space_id=space_id,
+                node_token=node_token,
+            )
+
             def _content_insert_failed(reason: str) -> dict[str, Any]:
                 url = feishu_doc_url(document_id, node_token)
                 return {
@@ -10737,7 +11486,9 @@ class ResearchDataBridge:
                 }
 
             try:
-                client.insert_descendants(document_id, document_id, block_ids, blocks, 0)
+                insert_resp = client.insert_descendants(
+                    document_id, document_id, block_ids, blocks, 0
+                )
             except FeishuApiError as exc:
                 sanitized_reason = _sanitize_feishu_response_preview(
                     f"{exc.error_code}: {str(exc)}",
@@ -10758,26 +11509,84 @@ class ResearchDataBridge:
             if node_token:
                 payload["node_token"] = node_token
 
+            # C2: convert left each markdown image as a placeholder block; the
+            # images are only real once their bytes are uploaded and bound to
+            # those blocks. A partial failure is reported per image — an
+            # all-failed bind never claims success.
+            image_files = body.get("image_files")
+            images_outcome = bind_docx_images(
+                client,
+                document_id,
+                markdown,
+                image_files if isinstance(image_files, dict) else {},
+                converted_blocks=blocks,
+                insert_response=insert_resp if isinstance(insert_resp, dict) else None,
+            )
+            if images_outcome["total"]:
+                payload["images"] = images_outcome
+                if images_outcome["failed"] and images_outcome["bound"] > 0:
+                    failed_refs = "; ".join(
+                        f"{f.get('ref') or f.get('block_id')}（{f.get('reason')}）"
+                        for f in images_outcome["failed"][:5]
+                    )
+                    payload["warning"] = (
+                        f"image_bind_partial: {images_outcome['bound']}/{images_outcome['total']} "
+                        f"张图片已写入，失败的图片：{failed_refs}"
+                    )
+
             warnings: list[str] = []
+            if payload.get("warning"):
+                warnings.append(payload["warning"])
             grant_chat_id = getattr(self.cfg, "feishu_default_grant_chat_id", "")
             if grant_chat_id:
                 try:
                     client.grant_chat_full_access(document_id, grant_chat_id)
                 except FeishuApiError as exc:
+                    sanitized = _sanitize_feishu_response_preview(
+                        f"{exc.error_code}: {str(exc)}",
+                        secrets=(client.app_secret, client._tenant_token),
+                        dynamic_ids=(document_id, node_token, space_id, parent_node_token, folder_token),
+                        limit=200,
+                    )
                     warnings.append(
                         f"grant_failed: document created, but sharing it with the team "
-                        f"group failed ({exc.error_code}); share it manually."
+                        f"group failed ({sanitized}); share it manually."
                     )
             if grant_email:
                 try:
-                    client.grant_full_access(document_id, grant_email)
+                    spelling = client.grant_full_access(document_id, grant_email)
                 except FeishuApiError as exc:
+                    # C1: keep Feishu's own code and msg (sanitized) so the
+                    # caller can tell an unmatched email from a missing app
+                    # scope instead of guessing at a bare error code.
+                    sanitized = _sanitize_feishu_response_preview(
+                        f"{exc.error_code}: {str(exc)}",
+                        secrets=(client.app_secret, client._tenant_token),
+                        dynamic_ids=(document_id, node_token, space_id, parent_node_token, folder_token),
+                        limit=200,
+                    )
                     warnings.append(
                         f"grant_failed: document created, but granting {grant_email} "
-                        f"full access failed ({exc.error_code}); share it manually."
+                        f"full access failed ({sanitized}); share it manually or "
+                        f"re-grant with feishu_grant_access."
                     )
+                else:
+                    payload["grant_member"] = spelling
             if warnings:
                 payload["warning"] = " ".join(warnings)
+            # C2: no image bound out of the images the markdown carried — the
+            # doc exists but its images are placeholders, which must not be
+            # reported as a success.
+            if images_outcome["total"] and images_outcome["bound"] == 0:
+                payload["ok"] = False
+                payload["error"] = "image_bind_failed"
+                payload["message"] = (
+                    "文档已创建，但全部图片都没有绑定成功（见 images.failed），"
+                    "请在文档中手动补图或重试。"
+                )
+                # The doc exists — its id and url must survive into the tool's
+                # answer so the model can point the user at it.
+                payload["url"] = feishu_doc_url(document_id, node_token)
             return payload
 
         code, result = await self._run_feishu(_create)
@@ -10785,6 +11594,89 @@ class ResearchDataBridge:
             # The document exists; failing loudly beats silently returning an
             # empty doc, and 502 (not 200) makes the tool surface the message.
             return 502, result
+        return code, result
+
+    async def handle_feishu_doc_grant(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        """Handle ``POST /feishu/doc/grant``: (re-)grant one user full access to a doc (C1).
+
+        Only does the grant — no create, no content write — so a user whose
+        automatic share failed at doc creation can be re-authorized against
+        the existing document. Scoped to docs this bridge created and to the
+        creating user's own email: anything else is refused with 403, so the
+        endpoint can never spread the app's reach onto someone else's doc or
+        grant an arbitrary address.
+        """
+        raw_token = body.get("token")
+        kind, token = parse_feishu_token(raw_token if isinstance(raw_token, str) else "")
+        if not token:
+            return 400, {"ok": False, "error": "invalid_token"}
+        email = str(body.get("email") or "").strip().lower()
+        if not email or "@" not in email:
+            return 400, {"ok": False, "error": "invalid_email"}
+
+        def _grant(client: FeishuClient) -> dict[str, Any]:
+            document_id, node = resolve_feishu_document(client, kind, token)
+            record = self._read_feishu_doc_registry().get(document_id)
+            if record is None:
+                return {
+                    "ok": False,
+                    "error": "grant_scope_denied",
+                    "document_id": document_id,
+                    "message": (
+                        "该文档不是通过 Dalton 创建的（未在创建登记中），"
+                        "不能通过本端点补授权；请在飞书客户端手动分享。"
+                    ),
+                }
+            creator = str(record.get("creator_email") or "").strip().lower()
+            if not creator:
+                return {
+                    "ok": False,
+                    "error": "grant_scope_denied",
+                    "document_id": document_id,
+                    "message": (
+                        "该文档创建时没有记录创建者邮箱，无法核验补授权对象；"
+                        "请在飞书客户端手动分享。"
+                    ),
+                }
+            if email != creator:
+                return {
+                    "ok": False,
+                    "error": "grant_scope_denied",
+                    "document_id": document_id,
+                    "message": "补授权邮箱与文档创建者不一致，只允许给创建者本人补授权。",
+                }
+            node_token = (
+                str(node.get("node_token") or "")
+                if isinstance(node, dict) and node.get("node_token")
+                else (token if kind == "wiki" else "")
+            )
+            spelling = client.grant_full_access(document_id, email)
+            return {
+                "ok": True,
+                "document_id": document_id,
+                "url": feishu_doc_url(document_id, node_token),
+                "granted": email,
+                "grant_member": spelling,
+            }
+
+        code, result = await self._run_feishu(_grant)
+        if isinstance(result, dict) and result.get("error") == "grant_scope_denied":
+            return 403, result
+        if code == 502 and isinstance(result, dict):
+            # _run_feishu truncates the detail to 200 chars and sanitizes
+            # nothing; redo both so Feishu's code/msg arrives clean.
+            detail = _sanitize_feishu_response_preview(
+                str(result.get("detail") or ""),
+                secrets=(),
+                dynamic_ids=(token,),
+                limit=200,
+            )
+            result = {
+                "ok": False,
+                "error": str(result.get("error") or "grant_failed"),
+                "detail": detail,
+                "message": f"授权失败（{detail}）；若是邮箱对不上账号，请改用该用户的飞书登录邮箱重试。",
+            }
         return code, result
 
     async def handle_feishu_doc_append(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
@@ -10811,7 +11703,9 @@ class ResearchDataBridge:
             )
             try:
                 index = client.root_children_count(document_id)
-                client.insert_descendants(document_id, document_id, block_ids, blocks, index)
+                insert_resp = client.insert_descendants(
+                    document_id, document_id, block_ids, blocks, index
+                )
             except FeishuApiError as exc:
                 url = feishu_doc_url(document_id, node_token)
                 reason = _sanitize_feishu_response_preview(
@@ -10839,11 +11733,42 @@ class ResearchDataBridge:
                     "document_id": document_id,
                     "url": url,
                 }
-            return {
+            # C2: the same bind flow as doc/create — appended images are
+            # placeholder blocks until their bytes are uploaded and bound.
+            image_files = body.get("image_files")
+            images_outcome = bind_docx_images(
+                client,
+                document_id,
+                markdown,
+                image_files if isinstance(image_files, dict) else {},
+                converted_blocks=blocks,
+                insert_response=insert_resp if isinstance(insert_resp, dict) else None,
+            )
+            payload = {
                 "ok": True,
                 "document_id": document_id,
                 "appended_blocks": len(block_ids),
             }
+            if images_outcome["total"]:
+                payload["images"] = images_outcome
+                if images_outcome["failed"] and images_outcome["bound"] > 0:
+                    failed_refs = "; ".join(
+                        f"{f.get('ref') or f.get('block_id')}（{f.get('reason')}）"
+                        for f in images_outcome["failed"][:5]
+                    )
+                    payload["warning"] = (
+                        f"image_bind_partial: {images_outcome['bound']}/{images_outcome['total']} "
+                        f"张图片已写入，失败的图片：{failed_refs}"
+                    )
+                if images_outcome["bound"] == 0:
+                    payload["ok"] = False
+                    payload["error"] = "image_bind_failed"
+                    payload["message"] = (
+                        "追加已写入，但全部图片都没有绑定成功（见 images.failed），"
+                        "请在文档中手动补图或重试。"
+                    )
+                    payload["url"] = feishu_doc_url(document_id, node_token)
+            return payload
 
         code, result = await self._run_feishu(_append)
         if result.get("error") == "content_insert_failed":
@@ -11227,9 +12152,403 @@ FEISHU_MAX_CONTENT_CHARS = 50000
 FEISHU_DEFAULT_CONTENT_CHARS = 20000
 FEISHU_PAGE_SIZE = 50
 FEISHU_MAX_PAGES = 20
+# C2: a markdown image bound into a docx image block — Feishu's upload cap is
+# 20 MB; the bridge's own ceiling stays below it, and the HTTP envelope for
+# the feishu routes is sized to carry one document's worth of inline images.
+FEISHU_IMAGE_MAX_BYTES = 10 * 1024 * 1024
+FEISHU_IMAGE_TOTAL_MAX_BYTES = 20 * 1024 * 1024
+FEISHU_DOC_IMAGE_BLOCK_TYPE = 27
+FEISHU_IMAGE_ALLOWED_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg", ".webp", ".gif"})
+# C2: the /feishu/doc/create|append bodies carry inline image bytes (base64),
+# so they need the wiki-ingest-sized envelope, not the 256 KiB MCP default.
+MAX_FEISHU_DOC_REQUEST_BYTES = 30 * 1024 * 1024
 
 # URL path segment -> doc kind (docs is the legacy docx path; both carry a docx token)
 _FEISHU_LINK_KINDS: dict[str, str] = {"wiki": "wiki", "docx": "docx", "docs": "docx"}
+
+# C2: markdown image references, in order of appearance — the Nth converted
+# image block binds to the Nth reference.
+_MARKDOWN_IMAGE_RE = re.compile(r"!\[[^\]\n]*\]\(\s*([^)\s]+)(?:\s+\"[^\"]*\")?\s*\)")
+
+
+def _markdown_image_refs(markdown: str, *, dedup: bool = True) -> list[str]:
+    refs: list[str] = []
+    for match in _MARKDOWN_IMAGE_RE.finditer(markdown or ""):
+        ref = match.group(1).strip()
+        if ref and (not dedup or ref not in refs):
+            refs.append(ref)
+    return refs
+
+
+def _feishu_image_ip_blocked(ip: str) -> bool:
+    """Whether *ip* is a private/loopback/link-local/reserved/unspecified/multicast address.
+
+    The rule is the backend SSRF guard's ``_ip_is_blocked``
+    (src/tools/web/inhouse/guard.py), restated here because the bridge is a
+    standalone host process and cannot import backend code.
+    """
+    addr = ipaddress.ip_address(ip)
+    return (
+        addr.is_private
+        or addr.is_loopback
+        or addr.is_link_local
+        or addr.is_reserved
+        or addr.is_unspecified
+        or addr.is_multicast
+    )
+
+
+def _feishu_image_url_block_reason(url: str) -> str | None:
+    """Why this URL may not be fetched host-side, or None if it may (C2).
+
+    Same semantics as the crawler's check, restated locally: the bridge is a
+    standalone host process and cannot import the sandbox-side copy. This is
+    the literal-address half — the fetch itself resolves hostnames and
+    re-checks every redirect hop (see `_feishu_image_fetch`).
+    """
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except ValueError as exc:
+        return f"unparseable URL ({exc})"
+    if parsed.scheme not in ("http", "https"):
+        return f"URL must be http(s), got scheme {parsed.scheme!r}"
+    hostname = parsed.hostname or ""
+    if hostname in ("", "localhost"):
+        return "access to localhost is not allowed"
+    try:
+        ipaddress.ip_address(hostname)
+    except ValueError:
+        return None  # a name, not a literal address — the fetch resolves it
+    if _feishu_image_ip_blocked(hostname):
+        return f"access to private/reserved address {hostname} is not allowed"
+    return None
+
+
+class _PinnedHTTPConnection(http.client.HTTPConnection):
+    """An HTTP connection whose TCP dial goes to one specific, SSRF-checked IP.
+
+    ``self.host`` keeps the URL's hostname, so the ``Host`` header is
+    unchanged; only the socket's target address is pinned. This closes the
+    rebinding window where the check resolves the name once and the client
+    resolves it again (C2/r3).
+    """
+
+    def __init__(self, host: str, port: int | None = None, *, pinned_ip: str,
+                 timeout: float = 30.0) -> None:
+        super().__init__(host, port, timeout=timeout)
+        self._pinned_ip = pinned_ip
+
+    def connect(self) -> None:
+        # stdlib connect with the dial aimed at the checked address instead of
+        # resolving `self.host` again.
+        self.sock = self._create_connection(
+            (self._pinned_ip, self.port), self.timeout, self.source_address
+        )
+        if self._tunnel_host:
+            self._tunnel()
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    """An HTTPS connection dialed to a checked IP with the TLS handshake kept
+    on the URL's hostname: SNI (``server_hostname``) and the certificate's
+    hostname validation both check the name the URL carried, not the pinned
+    address."""
+
+    def __init__(self, host: str, port: int | None = None, *, pinned_ip: str,
+                 timeout: float = 30.0) -> None:
+        super().__init__(host, port, timeout=timeout)
+        self._pinned_ip = pinned_ip
+
+    def connect(self) -> None:
+        self.sock = self._create_connection(
+            (self._pinned_ip, self.port), self.timeout, self.source_address
+        )
+        if self._tunnel_host:
+            self._tunnel()
+        self.sock = self._context.wrap_socket(self.sock, server_hostname=self.host)
+
+
+#: Manual redirect budget for one external image fetch (C2/SSRF).
+FEISHU_IMAGE_MAX_REDIRECTS = 3
+_FEISHU_IMAGE_REDIRECT_CODES = frozenset({301, 302, 303, 307, 308})
+_FEISHU_IMAGE_FETCH_TIMEOUT_S = 30.0
+
+
+def _feishu_image_open_connection(
+    parsed_url: urllib.parse.ParseResult, *, pinned_ip: str, timeout_s: float
+) -> http.client.HTTPConnection:
+    """The hop's http.client connection, dialed to *pinned_ip* (the address
+    the SSRF check approved) while Host/SNI/cert-hostname stay on the original
+    name. A seam the tests replace instead of the dialing logic itself."""
+    hostname = parsed_url.hostname or ""
+    port = parsed_url.port or (443 if parsed_url.scheme == "https" else 80)
+    conn_cls = _PinnedHTTPSConnection if parsed_url.scheme == "https" else _PinnedHTTPConnection
+    return conn_cls(hostname, port, pinned_ip=pinned_ip, timeout=timeout_s)
+
+
+def _feishu_image_fetch(url: str) -> tuple[bytes, str]:
+    """Download an external image under the SSRF checks; ``(bytes, final_url)``.
+
+    Every hop — the original URL and up to 3 redirects — must be http(s), its
+    host's DNS answers must hold no private/loopback/link-local/reserved
+    address, and the connection is pinned to the address that passed the
+    check: the socket never resolves the hostname again, so a rebinding answer
+    arriving between check and connect cannot aim the dial at an internal
+    address. Redirects are followed by hand (never automatically) so each hop
+    goes back through the same checks.
+    """
+    current = url
+    for _hop in range(FEISHU_IMAGE_MAX_REDIRECTS + 1):
+        reason = _feishu_image_url_block_reason(current)
+        if reason is not None:
+            raise FeishuApiError("image_url_blocked", reason)
+        try:
+            parsed = urllib.parse.urlparse(current)
+        except ValueError as exc:
+            raise FeishuApiError("image_url_blocked", f"unparseable URL ({exc})") from exc
+        hostname = parsed.hostname or ""
+        try:
+            addr_infos = socket.getaddrinfo(hostname, None)
+        except socket.gaierror as exc:
+            raise FeishuApiError(
+                "image_url_blocked", f"DNS resolution failed for {hostname!r} ({exc})"
+            ) from exc
+        blocked = sorted(
+            {info[4][0] for info in addr_infos if _feishu_image_ip_blocked(info[4][0])}
+        )
+        if blocked:
+            raise FeishuApiError(
+                "image_url_blocked",
+                f"host {hostname!r} resolves to private/reserved address {blocked[0]}",
+            )
+        request_target = parsed.path or "/"
+        if parsed.query:
+            request_target += f"?{parsed.query}"
+        conn = _feishu_image_open_connection(
+            parsed, pinned_ip=addr_infos[0][4][0], timeout_s=_FEISHU_IMAGE_FETCH_TIMEOUT_S
+        )
+        try:
+            conn.request(
+                "GET",
+                request_target,
+                headers={
+                    "User-Agent": "dalton-researchdata-bridge/1.0",
+                    "Accept": "*/*",
+                },
+            )
+            resp = conn.getresponse()
+            if resp.status in _FEISHU_IMAGE_REDIRECT_CODES:
+                location = resp.getheader("Location")
+                if location:
+                    if _hop == FEISHU_IMAGE_MAX_REDIRECTS:
+                        raise FeishuApiError(
+                            "image_url_blocked",
+                            f"more than {FEISHU_IMAGE_MAX_REDIRECTS} redirects fetching {url}",
+                        )
+                    current = urllib.parse.urljoin(current, location)
+                    continue
+            if not 200 <= resp.status < 300:
+                raise FeishuApiError("image_fetch_failed", f"HTTP {resp.status}")
+            data = resp.read(FEISHU_IMAGE_MAX_BYTES + 1)
+            return data, current
+        except FeishuApiError:
+            raise
+        except (http.client.HTTPException, OSError) as exc:
+            raise FeishuApiError(
+                "feishu_network_error", f"{type(exc).__name__}: {exc}"[:200]
+            ) from exc
+        finally:
+            conn.close()
+    raise FeishuApiError(
+        "image_url_blocked", f"more than {FEISHU_IMAGE_MAX_REDIRECTS} redirects fetching {url}"
+    )
+
+
+def _feishu_image_payload(
+    ref: str, image_files: dict[str, Any]
+) -> tuple[bytes, str]:
+    """``(bytes, filename)`` for one image reference (C2).
+
+    Workspace paths arrive pre-read from the caller as base64 (the sandbox's
+    files are not host paths); external links are fetched here under the
+    SSRF check and the size ceiling.
+    """
+    supplied = image_files.get(ref)
+    if isinstance(supplied, dict):
+        raw = supplied.get("content_b64")
+        if isinstance(raw, str) and raw.strip():
+            data = base64.b64decode(raw, validate=False)
+            filename = str(supplied.get("filename") or "image.png")
+            if len(data) > FEISHU_IMAGE_MAX_BYTES:
+                raise FeishuApiError("image_too_large", f"{len(data)} bytes")
+            return data, filename
+        raise FeishuApiError("image_payload_invalid", "content_b64 missing")
+    if ref.startswith(("http://", "https://")):
+        data, final_url = _feishu_image_fetch(ref)
+        if len(data) > FEISHU_IMAGE_MAX_BYTES:
+            raise FeishuApiError("image_too_large", f"{len(data)} bytes")
+        if not data:
+            raise FeishuApiError("image_empty")
+        path_name = urllib.parse.urlparse(final_url).path or "image"
+        filename = Path(path_name).name or "image"
+        if Path(filename).suffix.lower() not in FEISHU_IMAGE_ALLOWED_EXTENSIONS:
+            filename = filename + ".png" if "." not in filename else filename
+        return data, filename
+    raise FeishuApiError(
+        "image_unavailable",
+        "本地路径未随请求提供图片字节（调用方需读取工作区文件后以 image_files 传入）",
+    )
+
+
+def _feishu_image_block_bound(client: FeishuClient, document_id: str, block_id: str) -> bool:
+    """Whether the image block carries a bound media token (the verify half of C2)."""
+    try:
+        block = client.get_block(document_id, block_id)
+    except FeishuApiError:
+        return False
+    image = block.get("image") if isinstance(block.get("image"), dict) else {}
+    return bool(str(image.get("token") or ""))
+
+
+def _resolve_inserted_image_block_ids(
+    converted_blocks: list[dict[str, Any]] | None,
+    insert_response: dict[str, Any] | None,
+) -> list[str]:
+    """Resolve converted placeholder image blocks to actual document ``block_id``s
+    from the descendant-insert response (``block_id_relations`` or ``children``)."""
+    if not isinstance(insert_response, dict):
+        return []
+    relations = insert_response.get("block_id_relations")
+    if isinstance(relations, list) and converted_blocks:
+        rel_map = {
+            str(r.get("temporary_block_id") or ""): str(r.get("block_id") or "")
+            for r in relations
+            if isinstance(r, dict)
+            and str(r.get("temporary_block_id") or "")
+            and str(r.get("block_id") or "")
+        }
+        conv_img_ids = [
+            str(b.get("block_id") or "")
+            for b in converted_blocks
+            if isinstance(b, dict) and b.get("block_type") == FEISHU_DOC_IMAGE_BLOCK_TYPE
+        ]
+        if conv_img_ids and all(cid in rel_map for cid in conv_img_ids):
+            return [rel_map[cid] for cid in conv_img_ids]
+    children = insert_response.get("children")
+    if isinstance(children, list):
+        child_img_ids = [
+            str(b.get("block_id") or "")
+            for b in children
+            if isinstance(b, dict)
+            and b.get("block_type") == FEISHU_DOC_IMAGE_BLOCK_TYPE
+            and str(b.get("block_id") or "")
+        ]
+        if child_img_ids:
+            return child_img_ids
+    return []
+
+
+def bind_docx_images(
+    client: FeishuClient,
+    document_id: str,
+    markdown: str,
+    image_files: dict[str, Any],
+    *,
+    converted_blocks: list[dict[str, Any]] | None = None,
+    insert_response: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Upload and bind every markdown image the convert step left as a
+    placeholder block (C2). Returns ``{total, bound, failed}``; each failed
+    entry carries the reference, block id and a reason. Runs on the caller's
+    thread (the handlers already run inside ``asyncio.to_thread``).
+    """
+    all_refs = _markdown_image_refs(markdown, dedup=False)
+    unique_refs = _markdown_image_refs(markdown, dedup=True)
+    if not all_refs:
+        return {"total": 0, "bound": 0, "failed": []}
+
+    placeholder_ids = _resolve_inserted_image_block_ids(converted_blocks, insert_response)
+    if not placeholder_ids:
+        blocks = client.list_blocks(document_id)
+        placeholder_ids = [
+            str(b.get("block_id") or "")
+            for b in blocks
+            if b.get("block_type") == FEISHU_DOC_IMAGE_BLOCK_TYPE
+            and not str((b.get("image") or {}).get("token") or "")
+            and str(b.get("block_id") or "")
+        ]
+
+    if len(placeholder_ids) == len(all_refs):
+        refs = all_refs
+    elif len(placeholder_ids) == len(unique_refs):
+        refs = unique_refs
+    else:
+        return {
+            "total": len(all_refs),
+            "bound": 0,
+            "failed": [
+                {
+                    "ref": ref,
+                    "block_id": "",
+                    "reason": (
+                        f"文档中的占位图片块（{len(placeholder_ids)}）与 markdown 图片"
+                        f"（{len(all_refs)}）数量不一致，无法一一对应绑定"
+                    ),
+                }
+                for ref in all_refs
+            ],
+        }
+    bound = 0
+    failures: list[dict[str, str]] = []
+    for block_id, ref in zip(placeholder_ids, refs):
+        try:
+            data, filename = _feishu_image_payload(ref, image_files)
+            file_token = client.upload_docx_image(
+                document_id=document_id,
+                image_block_id=block_id,
+                filename=filename,
+                data=data,
+            )
+            if file_token:
+                try:
+                    client.replace_block_image(document_id, block_id, file_token)
+                except FeishuApiError:
+                    pass
+            if _feishu_image_block_bound(client, document_id, block_id):
+                bound += 1
+                continue
+            # The asset is up but the block did not take it; the document id
+            # is the other documented spelling of the docx_image upload point.
+            file_token_retry = client.upload_docx_image(
+                document_id=document_id,
+                image_block_id=document_id,
+                filename=filename,
+                data=data,
+            )
+            if file_token_retry:
+                try:
+                    client.replace_block_image(document_id, block_id, file_token_retry)
+                except FeishuApiError:
+                    pass
+            if _feishu_image_block_bound(client, document_id, block_id):
+                bound += 1
+                continue
+            failures.append(
+                {
+                    "ref": ref,
+                    "block_id": block_id,
+                    "reason": "素材已上传但图片块未绑定 token（回读校验失败）",
+                }
+            )
+        except FeishuApiError as exc:
+            failures.append(
+                {"ref": ref, "block_id": block_id, "reason": f"{exc.error_code}: {str(exc)[:120]}"}
+            )
+        except Exception as exc:
+            failures.append(
+                {"ref": ref, "block_id": block_id, "reason": f"{type(exc).__name__}: {exc}"[:160]}
+            )
+    return {"total": len(refs), "bound": bound, "failed": failures}
 
 
 class FeishuApiError(RuntimeError):
@@ -11460,7 +12779,8 @@ _FEISHU_STATIC_PATH_SEGMENTS: frozenset[str] = frozenset({
     "open-apis", "auth", "v1", "v2", "v3", "tenant_access_token", "internal",
     "docx", "documents", "blocks", "convert", "raw_content", "descendant",
     "children", "wiki", "spaces", "get_node", "nodes", "drive", "permissions",
-    "members", "files", "download", "im", "messages", "chats", "bitable",
+    "members", "files", "download", "medias", "upload_all", "contact", "users",
+    "batch_get_id", "im", "messages", "chats", "bitable",
     "apps", "tables", "records", "fields",
 })
 _FEISHU_AUTH_TOKEN_RE = re.compile(
@@ -11768,8 +13088,8 @@ class FeishuClient:
         children_ids: list[str],
         descendants: list[dict[str, Any]],
         index: int,
-    ) -> None:
-        self._request(
+    ) -> dict[str, Any]:
+        return self._request(
             "POST",
             f"/open-apis/docx/v1/documents/{document_id}/blocks/{block_id}/descendant",
             json_body={
@@ -11777,6 +13097,16 @@ class FeishuClient:
                 "descendants": [_sanitize_feishu_block(b) for b in descendants],
                 "index": index,
             },
+        )
+
+    def replace_block_image(
+        self, document_id: str, block_id: str, file_token: str
+    ) -> dict[str, Any]:
+        """Bind an uploaded media ``file_token`` onto a docx image block via ``PATCH``."""
+        return self._request(
+            "PATCH",
+            f"/open-apis/docx/v1/documents/{document_id}/blocks/{block_id}",
+            json_body={"replace_image": {"token": file_token}},
         )
 
     def root_children_count(self, document_id: str) -> int:
@@ -11795,6 +13125,128 @@ class FeishuClient:
             if not data.get("has_more") or not page_token:
                 break
         return total
+
+    def list_blocks(self, document_id: str) -> list[dict[str, Any]]:
+        """The document's full flat block list (id, block_type, image token …)."""
+        blocks: list[dict[str, Any]] = []
+        page_token: str | None = None
+        for _ in range(FEISHU_MAX_PAGES):
+            data = self._request(
+                "GET",
+                f"/open-apis/docx/v1/documents/{document_id}/blocks",
+                query={"page_size": FEISHU_PAGE_SIZE, "page_token": page_token},
+            )
+            items = data.get("items")
+            if isinstance(items, list):
+                blocks.extend(b for b in items if isinstance(b, dict))
+            page_token = data.get("page_token") or None
+            if not data.get("has_more") or not page_token:
+                break
+        return blocks
+
+    def get_block(self, document_id: str, block_id: str) -> dict[str, Any]:
+        data = self._request(
+            "GET", f"/open-apis/docx/v1/documents/{document_id}/blocks/{block_id}"
+        )
+        return data.get("block") if isinstance(data.get("block"), dict) else {}
+
+    def upload_docx_image(
+        self,
+        *,
+        document_id: str,
+        image_block_id: str,
+        filename: str,
+        data: bytes,
+    ) -> str:
+        """Upload image bytes as a docx image asset; returns the ``file_token``.
+
+        ``medias/upload_all`` with ``parent_type=docx_image``. The 素材概述
+        doc names the *image block's* id as the upload point for a docx
+        image; where an app's scope rejects that, the caller retries with
+        the document id — both spellings are tried by the binding flow, and
+        whichever the live API accepts is the one that matters.
+        """
+        if not data:
+            raise FeishuApiError("image_empty")
+        if len(data) > FEISHU_IMAGE_MAX_BYTES:
+            raise FeishuApiError("image_too_large", f"{len(data)} bytes")
+
+        boundary = f"----daltonbridge{uuid.uuid4().hex}"
+        fields: list[tuple[str, str]] = [
+            ("file_name", filename),
+            ("parent_type", "docx_image"),
+            ("parent_node", image_block_id),
+            # C2: the 素材上传 doc requires `extra` for docx_image uploads —
+            # the docx route token the asset belongs to.
+            ("extra", json.dumps({"drive_route_token": document_id})),
+            ("size", str(len(data))),
+        ]
+        body = io.BytesIO()
+        for name, value in fields:
+            body.write(
+                (
+                    f"--{boundary}\r\n"
+                    f'Content-Disposition: form-data; name="{name}"\r\n\r\n'
+                    f"{value}\r\n"
+                ).encode("utf-8")
+            )
+        body.write(
+            (
+                f"--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'
+                f"Content-Type: application/octet-stream\r\n\r\n"
+            ).encode("utf-8")
+        )
+        body.write(data)
+        body.write(f"\r\n--{boundary}--\r\n".encode("utf-8"))
+        payload_bytes = body.getvalue()
+
+        url = f"{FEISHU_API_BASE}/open-apis/drive/v1/medias/upload_all"
+        req = urllib.request.Request(
+            url,
+            data=payload_bytes,
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {self._tenant_access_token()}",
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+            },
+        )
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        raw = ""
+        status = 0
+        try:
+            with opener.open(req, timeout=self.timeout_s) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+                status = resp.status
+        except urllib.error.HTTPError as exc:
+            try:
+                raw = exc.read().decode("utf-8", errors="replace")
+            except Exception:
+                raw = ""
+            status = exc.code
+        except Exception as exc:
+            raise FeishuApiError("feishu_network_error", type(exc).__name__) from exc
+        try:
+            parsed = json.loads(raw) if raw.strip() else {}
+        except ValueError:
+            raise FeishuApiError(
+                "feishu_invalid_response",
+                self._invalid_response_detail(
+                    status, "multipart", "/open-apis/drive/v1/medias/upload_all", raw
+                ),
+            ) from None
+        if not isinstance(parsed, dict) or parsed.get("code") not in (0, None) or not (
+            200 <= status < 300
+        ):
+            raise FeishuApiError(
+                f"feishu_http_{status}" if not (200 <= status < 300) else "feishu_api_error",
+                f"code={parsed.get('code')} msg={str(parsed.get('msg') or '')[:200]}",
+            )
+        data_obj = parsed.get("data") if isinstance(parsed.get("data"), dict) else {}
+        file_token = str(data_obj.get("file_token") or "")
+        if not file_token:
+            raise FeishuApiError("image_upload_no_token")
+        return file_token
 
     # -- wiki --
 
@@ -11857,6 +13309,40 @@ class FeishuClient:
 
     # -- drive permissions --
 
+    def user_open_id_by_email(self, email: str) -> str:
+        """The Feishu ``open_id`` for *email*, via the directory's own
+        batch-get-id lookup; ``''`` when the app cannot look (no contact
+        scope) or the email matches no account.
+
+        The endpoint is ``POST /open-apis/contact/v3/users/batch_get_id``
+        with ``user_id_type=open_id`` and a JSON body ``{"emails": [...]}``;
+        the answer's ``data.user_list[]`` carries one entry per queried
+        address, ``{"email": ..., "user_id": <open_id>}`` — an unmatched
+        address comes back with an empty ``user_id``.
+
+        C1: an email grant 400s when the address is not a Feishu login
+        email, while an open_id grant names the account itself — so the id
+        lookup is the primary spelling and the email form only the
+        fallback.
+        """
+        data = self._request(
+            "POST",
+            "/open-apis/contact/v3/users/batch_get_id",
+            query={"user_id_type": "open_id"},
+            json_body={"emails": [email]},
+        )
+        user_list = data.get("user_list")
+        if isinstance(user_list, list):
+            for item in user_list:
+                if not isinstance(item, dict):
+                    continue
+                if str(item.get("email") or "").strip().lower() != email.strip().lower():
+                    continue
+                open_id = str(item.get("user_id") or "")
+                if open_id:
+                    return open_id
+        return ""
+
     def grant_chat_full_access(self, token: str, chat_id: str) -> None:
         self._request(
             "POST",
@@ -11869,7 +13355,32 @@ class FeishuClient:
             },
         )
 
-    def grant_full_access(self, token: str, email: str) -> None:
+    def grant_full_access(self, token: str, email: str) -> str:
+        """Grant *email* full access; returns the member spelling that worked.
+
+        Tries the account's ``open_id`` first (C1) and falls back to the raw
+        email; both failure paths raise, so the caller's warning carries the
+        code and msg of the spelling that was actually refused.
+        """
+        try:
+            open_id = self.user_open_id_by_email(email)
+        except FeishuApiError:
+            open_id = ""
+        if open_id:
+            try:
+                self._request(
+                    "POST",
+                    f"/open-apis/drive/v1/permissions/{token}/members",
+                    query={"type": "docx", "need_notification": "false"},
+                    json_body={
+                        "member_type": "openid",
+                        "member_id": open_id,
+                        "perm": "full_access",
+                    },
+                )
+                return f"openid:{open_id}"
+            except FeishuApiError:
+                pass  # the email spelling gets its own chance, and its own error
         self._request(
             "POST",
             f"/open-apis/drive/v1/permissions/{token}/members",
@@ -11880,6 +13391,7 @@ class FeishuClient:
                 "perm": "full_access",
             },
         )
+        return f"email:{email}"
 
 
 async def _send_http(
@@ -12000,8 +13512,13 @@ async def _handle_client(
         content_length = int(headers.get("content-length") or "0")
         if path == "/embed":
             max_bytes = bridge.cfg.embed_max_bytes
-        elif path == "/wiki/ingest":
+        elif path in ("/wiki/ingest", "/sales-notes/ingest"):
+            # D1: both ingest bodies carry a base64 file beside the metadata,
+            # so they share the wiki-ingest-sized envelope, not the MCP default.
             max_bytes = MAX_WIKI_INGEST_REQUEST_BYTES
+        elif path in ("/feishu/doc/create", "/feishu/doc/append"):
+            # C2: these bodies carry inline image bytes beside the markdown.
+            max_bytes = MAX_FEISHU_DOC_REQUEST_BYTES
         else:
             max_bytes = MAX_REQUEST_BYTES
         if content_length > max_bytes:
@@ -12015,7 +13532,12 @@ async def _handle_client(
 
         body_bytes = b""
         if content_length > 0:
-            read_timeout = 60.0 if path == "/wiki/ingest" else 15.0
+            read_timeout = (
+                60.0
+                if path
+                in ("/wiki/ingest", "/sales-notes/ingest", "/feishu/doc/create", "/feishu/doc/append")
+                else 15.0
+            )
             body_bytes = await asyncio.wait_for(
                 reader.readexactly(content_length), timeout=read_timeout
             )
@@ -12146,7 +13668,16 @@ async def _handle_client(
                 return
 
             if rpc_method == "tools/call":
-                reply = await bridge.handle_tools_call(req_id, rpc_params)
+                # B5: who the call runs for, as the sandbox's MCP client
+                # stamps it; missing headers record as empty identity.
+                caller_identity = {
+                    "user": headers.get("x-dalton-user", "").strip(),
+                    "workspace": headers.get("x-dalton-workspace", "").strip(),
+                    "thread": headers.get("x-dalton-thread", "").strip(),
+                }
+                reply = await bridge.handle_tools_call(
+                    req_id, rpc_params, caller_identity=caller_identity
+                )
                 await _send_http(writer, 200, "OK", reply)
                 return
 
@@ -12250,7 +13781,7 @@ async def _handle_client(
         if path == "/wiki/ingest":
             if method != "POST":
                 await _send_http(
-                    writer, 405, "Method Not Allowed", {"error": "Method Not Allowed"}
+                    writer, 405, "Method Not Allowed", {"ok": False, "error": "Method Not Allowed"}
                 )
                 return
             try:
@@ -12261,6 +13792,30 @@ async def _handle_client(
                 await _send_http(writer, 400, "Bad Request", {"ok": False, "error": "Parse error"})
                 return
             code, payload = await bridge.handle_wiki_ingest(ingest_body)
+            status_label = (
+                "OK"
+                if code == 200
+                else ("Bad Request" if code == 400 else "Bad Gateway")
+            )
+            await _send_http(writer, code, status_label, payload)
+            return
+
+        # Route 6b: POST /sales-notes/ingest (D1) — same admin gate, the
+        # sell-side twin of the wiki ingest above.
+        if path == "/sales-notes/ingest":
+            if method != "POST":
+                await _send_http(
+                    writer, 405, "Method Not Allowed", {"ok": False, "error": "Method Not Allowed"}
+                )
+                return
+            try:
+                sn_body = json.loads(body_bytes.decode("utf-8"))
+                if not isinstance(sn_body, dict):
+                    raise ValueError("Expected JSON object")
+            except Exception:
+                await _send_http(writer, 400, "Bad Request", {"ok": False, "error": "Parse error"})
+                return
+            code, payload = await bridge.handle_sales_notes_ingest(sn_body)
             status_label = (
                 "OK"
                 if code == 200
@@ -12291,6 +13846,8 @@ async def _handle_client(
                 "/feishu/wiki/node": bridge.handle_feishu_wiki_node,
                 "/feishu/doc/create": bridge.handle_feishu_doc_create,
                 "/feishu/doc/append": bridge.handle_feishu_doc_append,
+                # C1: re-grant only, for shares that failed at doc creation.
+                "/feishu/doc/grant": bridge.handle_feishu_doc_grant,
             }
             handler = feishu_routes.get(path)
             if handler is None:
@@ -12300,6 +13857,7 @@ async def _handle_client(
             status_label = {
                 200: "OK",
                 400: "Bad Request",
+                403: "Forbidden",
                 502: "Bad Gateway",
                 503: "Service Unavailable",
             }.get(code, "Bad Gateway")

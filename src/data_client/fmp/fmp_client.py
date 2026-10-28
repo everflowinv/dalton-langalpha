@@ -194,11 +194,13 @@ async def quota_marker_reset() -> Optional[datetime]:
         return next_quota_reset()
 
 
-async def trip_quota_marker(status: int, reset_epoch: Optional[float] = None) -> None:
-    """Write the shared marker with a TTL ending at the quota reset.
+async def trip_quota_marker(status: int, reset_epoch: Optional[float] = None) -> datetime:
+    """Write the shared marker with a TTL ending at the quota reset and return that reset.
 
     The marker covers every FMP request, not just the endpoint that tripped
     it, because the quota is one counter. *status* rides along for the log.
+    The reset is returned even when no store is reachable, so the caller can
+    raise :class:`FmpQuotaExhausted` with the same moment the marker names.
     """
     now = datetime.now(timezone.utc)
     reset = next_quota_reset(now)
@@ -210,7 +212,7 @@ async def trip_quota_marker(status: int, reset_epoch: Optional[float] = None) ->
             reset = from_header
     store = _quota_store()
     if store is None:
-        return
+        return reset
     try:
         await store.set(
             _QUOTA_KEY,
@@ -222,8 +224,9 @@ async def trip_quota_marker(status: int, reset_epoch: Optional[float] = None) ->
         logger.warning(
             "fmp.quota_exhausted | status=%s reset_at=%s", status, reset.isoformat()
         )
-    except Exception:  # noqa: BLE101 — fail open; the next 429 retries the trip
+    except Exception:  # noqa: BLE001 — fail open; the next 429 retries the trip
         logger.warning("fmp.quota_marker_failed", exc_info=True)
+    return reset
 
 
 def _limit_reached(data: Any) -> bool:
@@ -348,8 +351,12 @@ class FMPClient:
                 and response.status_code != 402
                 and _limit_reached(data)
             ):
-                await trip_quota_marker(429, _quota_reset_epoch(response))
-                raise FMPRequestError("FMP API limit reached", status_code=429)
+                # DALTON-HOOK(market-data-fallback): a "Limit Reach" body is
+                # the quota gone even at HTTP 200, so it raises the same
+                # FmpQuotaExhausted a marker hit or a 429 would — the
+                # quota-aware callers upstream only recognize that class.
+                reset_at = await trip_quota_marker(429, _quota_reset_epoch(response))
+                raise FmpQuotaExhausted(reset_at) from None
             response.raise_for_status()
             if data is None:
                 data = _own_symbol_rows(response.json())
@@ -367,11 +374,13 @@ class FMPClient:
             # Defense in depth: never stringify the httpx error. Its message
             # embeds the request URL; auth must never depend on URL hygiene.
             # DALTON-HOOK(market-data-fallback): a 429 exhausts the one
-            # shared quota, so it trips the marker for every worker; a 402
-            # may only mean this endpoint sits outside the plan, so it fails
-            # this call alone.
+            # shared quota, so it trips the marker for every worker and
+            # raises FmpQuotaExhausted so quota-aware callers recognize it;
+            # a 402 may only mean this endpoint sits outside the plan, so it
+            # fails this call alone as a plain FMPRequestError.
             if e.response.status_code == 429:
-                await trip_quota_marker(429, _quota_reset_epoch(e.response))
+                reset_at = await trip_quota_marker(429, _quota_reset_epoch(e.response))
+                raise FmpQuotaExhausted(reset_at) from e
             raise FMPRequestError(
                 f"FMP API request failed ({e.response.status_code})",
                 status_code=e.response.status_code,

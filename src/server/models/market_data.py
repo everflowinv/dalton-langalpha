@@ -271,6 +271,10 @@ class AnalystDataResponse(BaseModel):
     symbol: str = Field(..., description="Stock ticker symbol")
     priceTargets: Optional[PriceTargetSummary] = Field(None, description="Price target summary")
     grades: List[AnalystGrade] = Field(default_factory=list, description="Recent analyst grade changes")
+    # DALTON-HOOK(market-data-fallback): why `grades` is empty when it is —
+    # per-analyst records are FMP-only, so an exhausted quota or a failed call
+    # must not read as "no grades exist".
+    gradesNote: Optional[str] = Field(None, description="Why per-analyst grade records are missing, when they are")
 
 
 class SnapshotData(BaseModel):

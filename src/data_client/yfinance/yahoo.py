@@ -122,6 +122,47 @@ def regular_previous_close(fast_info) -> float | None:  # DALTON-HOOK(yfinance-p
     return None
 
 
+def validated_previous_close(  # DALTON-HOOK(yfinance-prev-close)
+    fast_info_prev: float | None,
+    daily_rows: list[tuple[str, float, float]] | None,
+    quote_date: str | None,
+) -> float | None:
+    """The previous close, only once recent daily bars confirm it (2525.HK 2026-10).
+
+    Yahoo froze 2525.HK's daily rows at 15.47 with zero volume for sessions it
+    never traded, and yfinance derived ``regularMarketPreviousClose`` from that
+    tail, so the quote showed a phoney −16.61% two sessions after the real
+    close had moved on. The previous close is the last bar strictly before the
+    quote's own trading date among *valid* rows — zero-volume rows are Yahoo's
+    fill, not a session. That value is cross-checked against the fast_info
+    number; a conflict means neither can be trusted, so both the previous close
+    and the change come back unknown rather than wrong. *daily_rows* None
+    marks a history that could not be fetched (transport failure or an empty
+    frame) — with no bars to check against, the fast_info number is exactly
+    the unverified tail that once read −16.61%, so the previous close and the
+    change come back unknown then too. An instrument whose whole window
+    carries no volume (indexes, FX) has no fill rows to skip, so the
+    date-adjacent bar is its previous session.
+    """
+    if daily_rows is None:
+        return None
+
+    rows_before = [r for r in daily_rows if not quote_date or r[0] < quote_date]
+    any_volume = any(v > 0 for _, _, v in daily_rows)
+    candidates = [r for r in rows_before if r[2] > 0] if any_volume else rows_before
+    if not candidates:
+        # Rows exist but every one before the quote is a frozen fill: there is
+        # no valid previous session to quote a change against.
+        return None
+    daily_prev = candidates[-1][1]
+
+    if fast_info_prev is None:
+        return daily_prev
+    if math.isclose(daily_prev, fast_info_prev, rel_tol=1e-3, abs_tol=1e-4):
+        return fast_info_prev
+    return None
+
+
 def yahoo_symbol_search(symbol: str, **kwargs) -> yf.Search:
     """A search keyed on a ticker; a free-text name query calls ``yf.Search`` as typed."""
     return yf.Search(yahoo_symbol(symbol), **kwargs)

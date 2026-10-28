@@ -108,12 +108,14 @@ async def check_and_increment_wiki_ingest_rate_limit(
     *,
     limit: int = WIKI_INGEST_RATE_LIMIT_PER_HOUR,
     window_s: int = WIKI_INGEST_RATE_WINDOW_S,
+    scope: str = "wiki_ingest",
 ) -> tuple[bool, int]:
     """Atomically increment per-user hourly write counter in Redis via a single Lua `EVAL`.
 
     Fails closed (`(False, -1)`) when Redis is unavailable, disabled, or errors out.
+    `scope` keeps the counters apart per library (D1: wiki vs sales notes).
     """
-    key = f"dalton:wiki_ingest:rate:{user_id}"
+    key = f"dalton:{scope}:rate:{user_id}"
     try:
         cache = get_cache_client()
     except Exception as exc:
@@ -147,6 +149,7 @@ def _validate_and_normalize_workspace_file_path(
     file_path: str,
     *,
     workspace_dir: str | None,
+    allowed_extensions: frozenset[str] = WIKI_INGEST_ALLOWED_EXTENSIONS,
 ) -> tuple[str | None, str | None, str | None]:
     """Validate `file_path` and `workspace_dir` against shell metacharacters and traversal.
 
@@ -193,11 +196,11 @@ def _validate_and_normalize_workspace_file_path(
         return None, None, "file_path cannot reference hidden or mounted system paths (.agents)."
 
     ext = Path(rel_parts[-1]).suffix.lower()
-    if ext not in WIKI_INGEST_ALLOWED_EXTENSIONS:
+    if ext not in allowed_extensions:
         return (
             None,
             None,
-            f"Unsupported file extension '{ext}'. Allowed: {', '.join(sorted(WIKI_INGEST_ALLOWED_EXTENSIONS))}",
+            f"Unsupported file extension '{ext}'. Allowed: {', '.join(sorted(allowed_extensions))}",
         )
 
     return ws_root, rel_path, None
@@ -281,6 +284,8 @@ async def _exec_sandbox_argv(
 async def _read_workspace_file_safely(
     backend: Any,
     file_path: str,
+    *,
+    allowed_extensions: frozenset[str] = WIKI_INGEST_ALLOWED_EXTENSIONS,
 ) -> tuple[str | None, bytes | None, str | None]:
     """Validate `file_path` in the sandbox without a shell, reject symlinks at every level,
     confirm `realpath` stays inside the caller's workspace root, and read from the resolved realpath.
@@ -299,7 +304,7 @@ async def _read_workspace_file_safely(
         ws_dir = ws_dir_attr.strip()
 
     ws_root, rel_path, path_err = _validate_and_normalize_workspace_file_path(
-        file_path, workspace_dir=ws_dir
+        file_path, workspace_dir=ws_dir, allowed_extensions=allowed_extensions
     )
     if path_err is not None or ws_root is None or rel_path is None:
         return None, None, path_err or "Invalid file_path."

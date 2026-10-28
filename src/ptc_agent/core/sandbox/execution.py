@@ -258,6 +258,7 @@ def _job_env(
     trace_path: str,
     call_id: str | None,
     allowed_servers: frozenset[str] | None,
+    thread_id: str | None = None,
 ) -> dict[str, str]:
     """The environment every job starts with: its MCP trace file and the
     workspace's client config, so a script that imports the MCP wrappers
@@ -272,6 +273,18 @@ def _job_env(
         env[_ALLOWED_SERVERS_ENV] = _allowed_servers_value(allowed_servers)
     if call_id:
         env[livefs_protocol.CALL_ENV] = call_id
+    # DALTON-HOOK(sandbox-caller-identity): the calling turn's identity (set
+    # around the code run, upstream of here) reaches the sandbox as plain env
+    # vars, so the MCP client can stamp them on its bridge requests. A
+    # deployment without the Dalton package binds nothing; the thread falls
+    # back to the job's own thread id when no richer binding is in scope.
+    try:
+        from src.dalton.sandbox_caller_identity import caller_env
+
+        env.update(caller_env())
+    except Exception:
+        pass
+    env.setdefault("DALTON_CALLER_THREAD", str(thread_id or "").strip())
     return env
 
 
@@ -435,7 +448,7 @@ async def start_bash_job(
     spec = _jobs.JobSpec(
         ref=ref,
         command=_eval_after_header(script_abs),
-        env=_job_env(sandbox, ref.trace_path, call_id, allowed_servers),
+        env=_job_env(sandbox, ref.trace_path, call_id, allowed_servers, thread_id),  # DALTON-HOOK(sandbox-caller-identity)
         pythonpath=":".join(sandbox.workspace().pythonpath(sandbox.layout)),
         files=((script_abs, ("\n".join(header) + "\n" + full_command + "\n").encode()),),
         dirs=(code_dir, log_dir),
@@ -563,6 +576,11 @@ async def start_code_job(
         # closed, so a name it could not check is never installed either.
         if package is not None:
             package = (await mcp_setup._filter_local_packages(sandbox, [package]) or [None])[0]
+        # The import name that survives the local filter maps to its PyPI
+        # spelling (`fitz` installs as `pymupdf`) — after the filter, so a
+        # workspace's own module of that name is never pip-installed over.
+        if package is not None:
+            package = mcp_setup.pip_package_for_import(package)
         if package is None:
             return outcome
         logger.info(
@@ -595,7 +613,7 @@ async def _run_code(
     code_dir, log_dir = _job_dirs(sandbox, thread_id, ref)
     code_abs = f"{code_dir}/{ref.command_id}.py"
     workspace = sandbox.workspace().workspace
-    env = _job_env(sandbox, ref.trace_path, call_id, allowed_servers)
+    env = _job_env(sandbox, ref.trace_path, call_id, allowed_servers, thread_id)  # DALTON-HOOK(sandbox-caller-identity)
     # A display-less backend for pyplot, chosen without importing matplotlib,
     # and the turn's folder for the shipped sitecustomize.
     env["MPLBACKEND"] = "Agg"

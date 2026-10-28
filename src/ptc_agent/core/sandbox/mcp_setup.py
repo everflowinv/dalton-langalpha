@@ -639,6 +639,26 @@ def missing_import(raised: str | None) -> str | None:
     return package
 
 
+#: Import names whose PyPI package is spelled differently, so an auto-install
+#: of the bare name either fails (`pip install fitz` ships the wrong wheel or
+#: nothing usable) or grabs a squatter package. Applied *after* the local
+#: module filter, so a workspace's own `fitz.py` still wins and is never
+#: pip-installed over. -- DALTON-HOOK(sandbox-pip-system)
+IMPORT_NAME_TO_PACKAGE: dict[str, str] = {
+    "fitz": "pymupdf",
+    "cv2": "opencv-python-headless",
+    "PIL": "pillow",
+    "yaml": "pyyaml",
+    "sklearn": "scikit-learn",
+    "bs4": "beautifulsoup4",
+}
+
+
+def pip_package_for_import(name: str) -> str:
+    """The PyPI package to install for an import *name* that survived the local filter."""
+    return IMPORT_NAME_TO_PACKAGE.get(name, name)
+
+
 async def _install_package(sandbox: "PTCSandbox", package: str) -> bool:
     """Install a Python package in the sandbox.
 

@@ -57,3 +57,4 @@ mcp_servers/_pdf_parse.py
 # LaneA new tests living in upstream test directories.
 tests/unit/server/services/test_acquire_retry_bound.py
 tests/unit/mcp_servers/test_extract_input_cap.py
+tests/unit/ptc_agent/core/sandbox/test_import_name_package_map.py

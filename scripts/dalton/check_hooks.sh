@@ -147,6 +147,11 @@ ALLOWED_HOOKS=(
   # to recurse forever on a running-workspace/stopped-machine split
   # (computer_manager/_lifecycle.py).
   "acquire-retry-bound"
+  # B5: the calling turn's identity (user/workspace/thread) rides a ContextVar
+  # into the sandbox job's env and from there onto the researchdata bridge's
+  # requests as X-Dalton-* headers (code_execution.py, execution.py,
+  # mcp_client_runtime.py; src/dalton/sandbox_caller_identity.py).
+  "sandbox-caller-identity"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)
@@ -176,11 +181,11 @@ is_allowed() {
   return 1
 }
 
-# Compute upstream merge-base (P0F.2: always compare against upstream/main merge-base or 8e0dce94)
+# Compute upstream merge-base (P0F.2: always compare against upstream/main merge-base or fc0465aab)
 if git rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then
   MERGE_BASE="$(git merge-base MERGE_HEAD upstream/main 2>/dev/null || git rev-parse MERGE_HEAD)"
 else
-  MERGE_BASE="$(git merge-base HEAD upstream/main 2>/dev/null || echo 8e0dce94)"
+  MERGE_BASE="$(git merge-base HEAD upstream/main 2>/dev/null || git merge-base HEAD fc0465aab 2>/dev/null || echo 8e0dce94)"
 fi
 if [[ "$STRICT" -eq 1 ]]; then
   BASE_REF="$MERGE_BASE"

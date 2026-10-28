@@ -142,6 +142,7 @@ async def test_missing_user_id_is_rejected_for_every_tool(monkeypatch: pytest.Mo
         "feishu_list_wiki": {},
         "feishu_create_doc": {"title": "T", "markdown": "x"},
         "feishu_append": {"token": "tok", "markdown": "x"},
+        "feishu_grant_access": {"token": "tok"},
     }
     for tool in ts:
         payload = _parse(await tool.ainvoke(args_by_tool[tool.name], config=_config(None)))

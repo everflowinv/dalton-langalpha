@@ -39,6 +39,7 @@ from src.server.services.cache.daily_cache_service import (
     DailyCacheService,
 )
 from src.data_client.normalize import series_lineage
+from src.data_client.fmp.fmp_client import FmpQuotaExhausted  # DALTON-HOOK(market-data-fallback)
 from src.server.services.cache.quote_cache_service import QuoteCacheService
 from src.data_client.freshness import measure_bars, measure_daily, measure_quote
 from market_protocol import (
@@ -631,24 +632,34 @@ async def get_analyst_data(
             raise HTTPException(status_code=503, detail="No financial data provider available")
 
         # Price targets: via provider (works for FMP and yfinance)
-        # Grades: FMP-only (per-analyst records); gracefully empty otherwise
-        async def _fetch_grades() -> list:
+        # Grades: FMP-only (per-analyst records); the note states why the list
+        # is empty rather than letting [] read as "no grades exist".
+        # DALTON-HOOK(market-data-fallback)
+        async def _fetch_grades() -> tuple[list, str | None]:
             try:
                 from src.data_client.fmp.fmp_client import FMPClient
                 fmp_client = FMPClient()
                 try:
-                    return await fmp_client.get_stock_grades(symbol_upper, limit=grade_limit)
+                    return await fmp_client.get_stock_grades(symbol_upper, limit=grade_limit), None
                 finally:
                     await fmp_client.close()
+            except FmpQuotaExhausted as exc:
+                logger.warning("Grade records unavailable for %s: FMP quota exhausted", symbol_upper)
+                return [], f"逐条评级记录暂不可用：FMP 当日额度已用完（{exc}）；一致预期价格目标仍来自 yfinance/FMP。"
             except Exception:
                 logger.warning("Failed to fetch grades for %s", symbol_upper, exc_info=True)
-                return []
+                return [], "逐条评级记录暂不可用（FMP 评级接口失败）；yfinance 只有一致预期计数，没有逐条评级。"
 
-        price_targets_raw, grades_raw = await asyncio.gather(
+        gather_raw = await asyncio.gather(
             provider.financial.get_analyst_price_targets(symbol_upper),
             _fetch_grades(),
             return_exceptions=True,
         )
+        price_targets_raw = gather_raw[0]
+        if isinstance(gather_raw[1], tuple):
+            grades_raw, grades_note = gather_raw[1]
+        else:
+            grades_raw, grades_note = [], None
 
         price_targets = None
         if isinstance(price_targets_raw, list) and len(price_targets_raw) > 0:
@@ -672,11 +683,15 @@ async def get_analyst_data(
                     newGrade=g.get("newGrade"),
                     action=g.get("action"),
                 ))
+        # DALTON-HOOK(market-data-fallback): state why the grade list is empty.
+        if not grades and grades_note is None:
+            grades_note = "没有取到逐条评级记录（FMP 返回为空）；yfinance 只有一致预期计数，没有逐条评级。"
 
         response = AnalystDataResponse(
             symbol=_requested(symbol),
             priceTargets=price_targets,
             grades=grades,
+            gradesNote=grades_note,
         )
         await cache.set(cache_key, response.model_dump(), ttl=900)
         return response

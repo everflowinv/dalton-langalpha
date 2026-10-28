@@ -14,6 +14,7 @@ from .display import resolve_ref, venue_local_time
 from .quote_format import build_live_stamp, current_price, print_time, quote_freshness
 from .utils import finite_or_none
 from src.data_client import get_financial_data_provider, get_market_data_provider
+from src.data_client.fmp.fmp_client import FmpQuotaExhausted  # DALTON-HOOK(market-data-fallback)
 from src.data_client.freshness import measure_daily
 from src.data_client.instrument_clock import clock_for
 from src.data_client.market_data_provider import MarketNotCovered, snapshot_key
@@ -228,6 +229,32 @@ async def fetch_sector_performance(
                     else:
                         content = header + _format_sectors_as_table(results)
                     return content, _build_sector_artifact(results)
+            except FmpQuotaExhausted:
+                # DALTON-HOOK(market-data-fallback): the dated answer is
+                # FMP-only — yfinance serves today's ETF snapshot and must not
+                # stand in for a target date — so say the quota is gone
+                # instead of returning an empty table that reads as "no data".
+                logger.warning(
+                    "Sector performance unavailable: FMP daily quota exhausted"
+                )
+                if date is None:
+                    results = await _yfinance_sector_snapshot()
+                    if results:
+                        return (
+                            header + _format_sectors_as_table(results),
+                            _build_sector_artifact(results),
+                        )
+                quota_note = (
+                    "FMP 当日额度已用完，带日期的板块数据暂不可用；"
+                    "无日期的当日板块表现可稍后重试。"
+                    if date is None
+                    else "FMP 当日额度已用完，带日期的板块数据暂不可用。"
+                )
+                return f"{header}**Status:** 数据暂不可用\n\n{quota_note}", {
+                    "type": "sector_performance",
+                    "sectors": [],
+                    "error": "fmp_quota_exhausted",
+                }
             except Exception:
                 logger.exception("Sector performance provider call failed")
                 # DALTON-HOOK(market-data-fallback): only a dateless request

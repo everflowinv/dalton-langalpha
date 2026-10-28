@@ -194,12 +194,17 @@ def create_execute_code_tool(
                 allowed_servers=allowed_servers,
             )
 
-        try:
-            return await command_handoff.run_command(
-                backend, call, launch, _result, hand_off=hand_off, slot=_slot
-            )
-        except Exception as e:
-            return _raised(e)
+        # DALTON-HOOK(sandbox-caller-identity): bind who this run is for (the
+        # tool call's config) so the job's env — composed under the launch
+        # below — can carry it to the sandbox and its MCP calls. Best effort:
+        # a deployment without the Dalton package runs unbound.
+        with _bound_caller_identity(call.config, thread_id):
+            try:
+                return await command_handoff.run_command(
+                    backend, call, launch, _result, hand_off=hand_off, slot=_slot
+                )
+            except Exception as e:
+                return _raised(e)
 
     async def _result(outcome: Ended | Failed) -> tuple[str, dict[str, Any]]:
         """An ended run's output, as the call returns it."""
@@ -239,3 +244,25 @@ def create_execute_code_tool(
         TOOL_CHANNEL: backend.channel,
     }
     return tool
+
+
+def _bound_caller_identity(config: Any, fallback_thread_id: str) -> Any:
+    """A context manager binding the call's caller identity, or a no-op.
+
+    DALTON-HOOK(sandbox-caller-identity): feeds
+    ``src.dalton.sandbox_caller_identity``; kept as a module helper so the
+    factory body stays untouched apart from the one ``with``.
+    """
+    try:
+        import contextlib
+
+        from src.dalton.sandbox_caller_identity import bound_caller
+
+        cfg = dict((config or {}).get("configurable") or {})
+        return bound_caller(
+            cfg.get("user_id"),
+            cfg.get("workspace_id"),
+            cfg.get("thread_id") or fallback_thread_id,
+        )
+    except Exception:
+        return contextlib.nullcontext()

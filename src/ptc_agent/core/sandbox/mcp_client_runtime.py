@@ -438,7 +438,20 @@ def _resolve_http(cfg, *, discovery=False):
             return os.environ.get(match.group(1), match.group(0))
 
         url = _re.sub(r"\$\{([^}]+)\}", _env_sub, cfg.url)
-        return url, (_bearer_headers() if cfg.data_token else {})
+        headers = dict(_bearer_headers()) if cfg.data_token else {}
+        # DALTON-HOOK(sandbox-caller-identity): the job's env names who the
+        # call runs for; a builtin http server (the researchdata bridge) gets
+        # them as request headers for its usage ledger. Values that could
+        # break HTTP framing are dropped, never trimmed into something else.
+        for _env_name, _header in (
+            ("DALTON_CALLER_USER", "X-Dalton-User"),
+            ("DALTON_CALLER_WORKSPACE", "X-Dalton-Workspace"),
+            ("DALTON_CALLER_THREAD", "X-Dalton-Thread"),
+        ):
+            _value = os.environ.get(_env_name, "").strip()
+            if _value and not any(_ch in _value for _ch in "\r\n\t "):
+                headers[_header] = _value
+        return url, headers
 
     names = list(cfg.headers)
     resolved = _resolve_all(

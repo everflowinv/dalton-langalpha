@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import time
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -21,8 +22,13 @@ from market_protocol.calendars import get_calendar, session_bounds
 from market_protocol.enums import AssetClass
 from src.utils.market_hours import interval_seconds
 
-# DALTON-HOOK(yfinance-prev-close)
-from .yahoo import regular_previous_close, yahoo_symbol, yahoo_ticker
+# DALTON-HOOK(yfinance-prev-close): fallback to 5d daily history when fast_info raises KeyError (e.g. 'currentTradingPeriod').
+from .yahoo import (
+    regular_previous_close,
+    validated_previous_close,
+    yahoo_symbol,
+    yahoo_ticker,
+)
 from src.dalton.extended_hours import enrich_yfinance_snapshot_extended_hours  # DALTON-HOOK(extended-hours-quotes)
 
 logger = logging.getLogger(__name__)
@@ -208,6 +214,73 @@ def _bar_date_str(idx: Any) -> str | None:
     return None
 
 
+def _recent_daily_rows(ticker: Any) -> list[tuple[str, float, float]] | None:  # DALTON-HOOK(yfinance-prev-close)
+    """A month of daily bars as ``(date, close, volume)``, ascending.
+
+    The frame the previous-close check runs against; ``None`` marks a fetch
+    that returned nothing readable, which the check reads as "no evidence",
+    not as "no valid session" (that verdict needs rows on the table). NaN
+    volume reads as 0 — an index bar carries no volume, and the checker's
+    window-level rule tells a fill row from a volume-less instrument.
+    """
+    try:
+        df = ticker.history(period="1mo", auto_adjust=False)
+    except Exception:
+        return None
+    if df is None or getattr(df, "empty", True):
+        return None
+    rows: list[tuple[str, float, float]] = []
+    for idx, row in df.iterrows():
+        date_str = _bar_date_str(idx)
+        try:
+            close = float(row["Close"])
+            volume = float(row["Volume"])
+        except (TypeError, ValueError, KeyError):
+            continue
+        if date_str is None or not math.isfinite(close) or close <= 0:
+            continue
+        if volume != volume:  # NaN != NaN
+            volume = 0.0
+        rows.append((date_str, close, volume))
+    return rows or None
+
+
+# DALTON-HOOK(yfinance-prev-close): a short-lived process-local memo of the
+# 1mo daily frame behind the previous-close check. Every snapshot pays one
+# extra history request for that check, so a watchlist or widget refresh
+# hitting the same symbols would double yfinance traffic without it. Pure
+# performance cache: keyed by (symbol, quote trading date), 10-minute TTL,
+# capped in size — a failed fetch is never memoized (an unverifiable quote
+# stays retryable), and a new trading date or expiry refetches.
+_DAILY_ROWS_CACHE_TTL_S = 600.0
+_DAILY_ROWS_CACHE_MAX = 256
+_daily_rows_cache: dict[tuple[str, str], tuple[float, list[tuple[str, float, float]]]] = {}
+
+
+def _clear_prev_close_daily_cache() -> None:
+    """Empty the previous-close daily-rows memo (tests isolate through this)."""
+    _daily_rows_cache.clear()
+
+
+def _recent_daily_rows_cached(
+    sym: str, quote_date: str | None, ticker: Any
+) -> list[tuple[str, float, float]] | None:
+    """`_recent_daily_rows` behind the (symbol, trading date) memo."""
+    now = time.monotonic()
+    key = (sym, quote_date or "")
+    hit = _daily_rows_cache.get(key)
+    if hit is not None and now - hit[0] < _DAILY_ROWS_CACHE_TTL_S:
+        return hit[1]
+    rows = _recent_daily_rows(ticker)
+    if rows is not None:
+        _daily_rows_cache[key] = (now, rows)
+        if len(_daily_rows_cache) > _DAILY_ROWS_CACHE_MAX:
+            stale = sorted(_daily_rows_cache.items(), key=lambda kv: kv[1][0])
+            for stale_key, _entry in stale[: _DAILY_ROWS_CACHE_MAX // 2]:
+                _daily_rows_cache.pop(stale_key, None)
+    return rows
+
+
 def _session_close_ms_for_bar(sym: str, bar_date: str | None) -> int | None:
     if not bar_date:
         return None
@@ -260,18 +333,35 @@ def _snapshot_from_history(sym: str, ticker: Any) -> dict[str, Any] | None:
     price = _finite(get_last("Close"))
     if price is None or price <= 0:
         return None
+    bar_date = _bar_date_str(last_idx)
+
+    def _row_volume(row: Any) -> float:
+        v = _finite(row.get("Volume") if hasattr(row, "get") else row["Volume"])
+        return v if v is not None else 0.0
+
+    # DALTON-HOOK(yfinance-prev-close): the previous session is the last row
+    # that actually traded (volume > 0) — a row Yahoo froze flat at zero
+    # volume is a fill, not a close. A window with no volume anywhere (an
+    # index) falls back to the date-adjacent row.
+    prev_rows = [r for _, r in rows[:-1]]
+    prev_candidates = (
+        [r for r in prev_rows if _row_volume(r) > 0]
+        if any(_row_volume(r) > 0 for _, r in rows)
+        else prev_rows
+    )
     prev: float | None = None
-    if len(rows) >= 2:
-        _, prev_row = rows[-2]
+    if prev_candidates:
+        prev_row = prev_candidates[-1]
         get_prev = prev_row.get if hasattr(prev_row, "get") else lambda k: prev_row[k]
         prev = _finite(get_prev("Close"))
-    change = price - prev if prev else 0.0
-    change_pct = (change / prev * 100) if prev else 0.0
+    # An unconfirmed previous close must not surface as a 0% day: the change
+    # stays unknown alongside it.
+    change = price - prev if prev is not None else None
+    change_pct = (change / prev * 100) if prev is not None else None
     open_ = _finite(get_last("Open"))
     high = _finite(get_last("High"))
     low = _finite(get_last("Low"))
     volume = _finite(get_last("Volume"))
-    bar_date = _bar_date_str(last_idx)
     as_of_ms = _session_close_ms_for_bar(sym, bar_date)
     if as_of_ms is None and hasattr(last_idx, "timestamp"):
         try:
@@ -287,10 +377,10 @@ def _snapshot_from_history(sym: str, ticker: Any) -> dict[str, Any] | None:
         "name": None,
         "price": round(price, 4),
         "regular_close": round(price, 4),
-        "change": round(change, 4),
-        "change_percent": round(change_pct, 4),
-        "regular_trading_change": round(change, 4),
-        "regular_trading_change_percent": round(change_pct, 4),
+        "change": round(change, 4) if change is not None else None,
+        "change_percent": round(change_pct, 4) if change_pct is not None else None,
+        "regular_trading_change": round(change, 4) if change is not None else None,
+        "regular_trading_change_percent": round(change_pct, 4) if change_pct is not None else None,
         "previous_close": round(prev, 4) if prev is not None else None,
         "open": round(open_, 4) if open_ is not None else None,
         "high": round(high, 4) if high is not None else None,
@@ -323,9 +413,33 @@ def _fetch_single_snapshot(sym: str) -> dict[str, Any] | None:
             price = _finite(raw_last)
             if price is None:
                 return None
-            prev = regular_previous_close(fi)  # DALTON-HOOK(yfinance-prev-close)
-            change = price - prev if prev else 0.0
-            change_pct = (change / prev * 100) if prev else 0.0
+            # DALTON-HOOK(yfinance-prev-close): validate the fast_info
+            # previous close against recent daily bars — its value rides the
+            # same one-year daily frame, whose zero-volume frozen tail once
+            # quoted a stale close two sessions old (2525.HK 2026-10).
+            raw_prev = regular_previous_close(fi)
+            as_of_ms = _print_time_ms(ticker)
+            quote_date = None
+            if as_of_ms is not None:
+                # The session date in the venue's own timezone: a UTC date is
+                # wrong wherever the session crosses UTC midnight (NZ, Pacific).
+                try:
+                    from src.data_client.normalize import symbol_timezone
+
+                    quote_tz = symbol_timezone(sym)
+                except Exception:
+                    quote_tz = timezone.utc
+                quote_date = _bar_date_str(
+                    datetime.fromtimestamp(as_of_ms / 1000.0).astimezone(quote_tz)
+                )
+            daily_rows = _recent_daily_rows_cached(sym, quote_date, ticker)
+            if daily_rows is not None and quote_date is None:
+                # No print time to place the quote: the latest session the
+                # bars cover is the best statement of which day the quote is.
+                quote_date = daily_rows[-1][0]
+            prev = validated_previous_close(raw_prev, daily_rows, quote_date)
+            change = price - prev if prev is not None else None  # DALTON-HOOK(yfinance-prev-close)
+            change_pct = (change / prev * 100) if prev is not None else None
             open_ = _finite(fi.get("open"))
             high = _finite(fi.get("dayHigh"))
             low = _finite(fi.get("dayLow"))
@@ -341,8 +455,8 @@ def _fetch_single_snapshot(sym: str) -> dict[str, Any] | None:
             "symbol": sym,
             "name": None,
             "price": round(price, 4),
-            "change": round(change, 4),
-            "change_percent": round(change_pct, 4),
+            "change": round(change, 4) if change is not None else None,
+            "change_percent": round(change_pct, 4) if change_pct is not None else None,
             "previous_close": round(prev, 4) if prev is not None else None,
             "open": round(open_, 4) if open_ is not None else None,
             "high": round(high, 4) if high is not None else None,
@@ -353,7 +467,7 @@ def _fetch_single_snapshot(sym: str) -> dict[str, Any] | None:
             "late_trading_change_percent": None,
             # regularMarketTime: the regular session's last print, which
             # stands through the extended hours that follow.
-            "as_of": _print_time_ms(ticker),
+            "as_of": as_of_ms,
             "regular_only": True,
         }
         return enrich_yfinance_snapshot_extended_hours(snap, sym, ticker)  # DALTON-HOOK(extended-hours-quotes)

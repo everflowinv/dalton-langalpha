@@ -150,6 +150,20 @@ class FallbackFinancialSource:
         try:
             fmp_result = await getattr(self._fmp, method)(*args, **kwargs)
         except Exception as fmp_exc:  # noqa: BLE101 — yfinance's empty answer survives
+            # DALTON-HOOK(market-data-fallback): FMP *unavailable* (quota
+            # gone, transport, 5xx) after yfinance answered nothing has no
+            # answer left to give — returning yfinance's [] would read as
+            # "no such data" — so the failure, with its reason, is the
+            # answer. A request-level FMP refusal (4xx) or an empty FMP
+            # result below still defers to yfinance's answer.
+            if fmp_cannot_answer(fmp_exc):
+                logger.warning(
+                    "financial_data.fallback | method=%s from=fmp error=%s after "
+                    "empty yfinance (raising: no answer left)",
+                    method,
+                    type(fmp_exc).__name__,
+                )
+                raise
             logger.warning(
                 "financial_data.fallback | method=%s from=fmp error=%s after "
                 "empty yfinance",

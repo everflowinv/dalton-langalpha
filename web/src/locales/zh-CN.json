@@ -6418,6 +6418,13 @@
       "homeNote": "Home 工作区始终不对他人开放",
       "externalOwnerNote": "外部成员的工作区仅管理员可查看，不提供共享设置",
       "nextPhaseNotice": "该功能下一期开放"
+    },
+    "autoIngest": {
+      "on": "自动入库：开启",
+      "off": "自动入库：关闭",
+      "enabledHint": "开启后，工作区收到的资料按“谁在说”自动分流写入 sales notes 或 company-wiki，只回一条回执；疑似重复或分类拿不准时仍会询问。",
+      "disabledHint": "关闭时保持两步确认：先预览，用户同意后写入。",
+      "error": "切换失败，请重试"
     }
   }
 }

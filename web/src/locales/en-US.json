@@ -6536,6 +6536,13 @@
       "homeNote": "Home workspace is never open to others",
       "externalOwnerNote": "External members' workspaces are visible to admins only; sharing settings do not apply",
       "nextPhaseNotice": "Available in the next phase"
+    },
+    "autoIngest": {
+      "on": "Auto-ingest: on",
+      "off": "Auto-ingest: off",
+      "enabledHint": "With it on, material this workspace receives is routed into sales notes or the company wiki by who is speaking, answered with a one-line receipt; suspected duplicates or an undecided classification still ask.",
+      "disabledHint": "With it off, ingests keep the two-step flow: preview first, write after the user confirms.",
+      "error": "Failed to toggle, try again"
     }
   }
 }

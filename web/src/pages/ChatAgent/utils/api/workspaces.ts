@@ -339,3 +339,28 @@ export async function updateWorkspaceSharing(
 }
 
 // --- Threads ---
+
+// DALTON-HOOK(wiki-ingest): workspace auto-ingest switch (D1)
+// `workspaces.config.dalton_auto_ingest`: with it on, confirmed material this
+// workspace receives files itself into sales notes or the wiki with a one-line
+// receipt instead of the two-step preview. Config replaces whole, so the flag
+// rides a read-modify-write.
+
+export const AUTO_INGEST_CONFIG_KEY = 'dalton_auto_ingest';
+
+export async function fetchAutoIngest(workspaceId: string): Promise<boolean> {
+  const ws = await getWorkspace(workspaceId);
+  return ws?.config?.[AUTO_INGEST_CONFIG_KEY] === true;
+}
+
+export async function updateAutoIngest(workspaceId: string, enabled: boolean): Promise<boolean> {
+  const ws = await getWorkspace(workspaceId);
+  const config: Record<string, unknown> = { ...(ws?.config ?? {}) };
+  if (enabled) {
+    config[AUTO_INGEST_CONFIG_KEY] = true;
+  } else {
+    delete config[AUTO_INGEST_CONFIG_KEY];
+  }
+  await updateWorkspace(workspaceId, { config });
+  return enabled;
+}

@@ -50,6 +50,8 @@ import {
 import { WorkspaceTrackingToggle } from './dalton/WorkspaceTrackingToggle';
 // DALTON-HOOK(workspace-sharing-settings): per-workspace sharing settings modal
 import { WorkspaceSharingModal } from './dalton/WorkspaceSharingModal';
+// DALTON-HOOK(wiki-ingest): workspace auto-ingest switch
+import { AutoIngestToggle } from './dalton/AutoIngestToggle';
 import { DURATION, EASE_OUT, TWEEN } from '@/lib/motion';
 
 /** Placeholder rows while the list is read: the first screen's worth. */
@@ -797,6 +799,7 @@ function ThreadGallery({ workspaceId, onBack, onThreadSelect }: ThreadGalleryPro
               </div>
               {/* DALTON-HOOK(coverage-tracking): company workspace auto-tracking toggle */}
               {/* DALTON-HOOK(workspace-sharing-settings): company workspace sharing settings modal */}
+              {/* DALTON-HOOK(wiki-ingest): workspace auto-ingest switch (workspaces.config) */}
               {!isHome && workspaceId && (
                 <div className="mt-3 flex flex-wrap items-center justify-center gap-2">
                   <WorkspaceTrackingToggle
@@ -804,6 +807,10 @@ function ThreadGallery({ workspaceId, onBack, onThreadSelect }: ThreadGalleryPro
                     readOnly={teamReadOnly.isColleague}
                   />
                   <WorkspaceSharingModal
+                    workspaceId={workspaceId}
+                    readOnly={teamReadOnly.isColleague}
+                  />
+                  <AutoIngestToggle
                     workspaceId={workspaceId}
                     readOnly={teamReadOnly.isColleague}
                   />
