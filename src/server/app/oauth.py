@@ -21,7 +21,8 @@ from pydantic import BaseModel
 
 from src.server.database.oauth_tokens import connection_change, delete_oauth_tokens, get_oauth_connection
 from src.server.models.oauth import OAuthStatus
-from src.server.services import claude_oauth, codex_oauth, grok_oauth
+# DALTON-HOOK(xai-oauth): grok_oauth stays out — its device flow is not offered below
+from src.server.services import claude_oauth, codex_oauth
 from src.server.services.oauth_health import connection_changed, store_tokens
 from src.server.services.oauth_protocol import (
     SLOW_DOWN_STEP,
@@ -128,9 +129,25 @@ def _subscription(key: str) -> str:
     return provider
 
 
+def _holder(user_id: str) -> str:
+    """The credential holder a pending sign-in belongs to.
+
+    DALTON-HOOK(team-credentials): one shared credential has one pending flow,
+    keyed by the holder, so a disconnect by any member clears the flow a
+    member's poll is waiting on — and a completed sign-in can never revive a
+    disconnected connection."""
+    from src.dalton.credentials import credential_user_id
+
+    return credential_user_id(user_id)
+
+
 # ─── Device code flow ────────────────────────────────────────────────────────
 
-_DEVICE_FLOWS = {"codex": codex_oauth.DEVICE_FLOW, "grok": grok_oauth.DEVICE_FLOW}
+# DALTON-HOOK(xai-oauth): upstream's grok-oauth (api.x.ai) device sign-in is
+# not offered — Dalton's Grok models are pinned to its own xai-oauth CLI-proxy
+# line, whose sign-in lives in src/dalton/app/oauth_native.py. The pinned
+# grok-4.7/4.3 keys are unaffected; this only refuses a sign-in nothing uses.
+_DEVICE_FLOWS = {"codex": codex_oauth.DEVICE_FLOW}
 
 
 def _device_flow(key: str) -> DeviceFlow:
@@ -217,7 +234,8 @@ async def _device_initiate(flow: DeviceFlow, user_id: str) -> dict:
         **device.state, "expires_at": expires_at, "interval": device.interval,
         "next_poll_at": 0, "flow_id": secrets.token_hex(8),
     }
-    await cache.client.set(f"{flow.redis_key}:{user_id}", json.dumps(state), ex=max(1, ttl))
+    # DALTON-HOOK(team-credentials): the pending flow is the holder's (see _holder).
+    await cache.client.set(f"{flow.redis_key}:{_holder(user_id)}", json.dumps(state), ex=max(1, ttl))
     logger.info(f"[oauth] {flow.provider} device code initiated for user_id={user_id}")
     return {
         "user_code": device.user_code,
@@ -230,7 +248,7 @@ async def _device_initiate(flow: DeviceFlow, user_id: str) -> dict:
 
 async def _device_poll(flow: DeviceFlow, user_id: str) -> dict:
     cache = _require_cache()
-    lock_key = f"{flow.redis_key}:poll:{user_id}"
+    lock_key = f"{flow.redis_key}:poll:{_holder(user_id)}"  # DALTON-HOOK(team-credentials)
     lock_token = secrets.token_hex(16)
     acquired = await cache.acquire_lock(lock_key, lock_token, _POLL_LOCK_TTL_MS)
     if acquired is False:
@@ -259,7 +277,7 @@ def _deadline(state: dict) -> datetime:
 
 
 async def _poll_once(cache, flow: DeviceFlow, user_id: str) -> dict:
-    key = f"{flow.redis_key}:{user_id}"
+    key = f"{flow.redis_key}:{_holder(user_id)}"  # DALTON-HOOK(team-credentials)
     raw = await cache.client.get(key)
     if not raw:
         return _poll_result("expired", code="no_pending_flow")
@@ -337,7 +355,8 @@ class ClaudeCallbackRequest(BaseModel):
 
 
 def _claude_key(user_id: str) -> str:
-    return f"oauth:claude:{user_id}"
+    # DALTON-HOOK(team-credentials): Claude's pending flow is the holder's too.
+    return f"oauth:claude:{_holder(user_id)}"
 
 
 def _no_claude_flow() -> OAuthRefusal:
@@ -472,7 +491,7 @@ async def oauth_status(key: str, user_id: CurrentUserId) -> OAuthStatus:
 
 def _pending_flow_key(key: str, user_id: str) -> str | None:
     if key in _DEVICE_FLOWS:
-        return f"{_DEVICE_FLOWS[key].redis_key}:{user_id}"
+        return f"{_DEVICE_FLOWS[key].redis_key}:{_holder(user_id)}"
     return _claude_key(user_id) if key == "claude" else None
 
 

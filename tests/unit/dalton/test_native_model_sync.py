@@ -2399,3 +2399,52 @@ async def test_user_preference_refs_include_dalton_role_models(monkeypatch):
 
     assert "user:u1:dalton_audit_model" in refs["gemini-4-argon-medium-oauth"]
     assert "user:u1:dalton_reviewer_models" in refs["grok-4.7-oauth"]
+
+
+# ---------------------------------------------------------------------------
+# The native check's credential door is the unified refresh protocol
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_resolve_provider_token_uses_unified_valid_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A connected line yields its access token through ``oauth_health.valid_token``
+    — the old per-provider ``get_valid_token`` refreshers are gone, and an
+    import of them must not silently degrade a connected line to
+    ``no_credentials``."""
+    from datetime import datetime, timedelta, timezone
+
+    import src.server.services.oauth_health as oauth_health_mod
+    from src.server.services.oauth_protocol import TokenSet
+
+    expires = datetime.now(timezone.utc) + timedelta(hours=1)
+    token = TokenSet(
+        access_token="native-check-token",
+        refresh_token="rt",
+        expires_at=expires,
+        account_id="acct-1",
+        plan_type="supergrok",
+    )
+    fake_valid = create_autospec(oauth_health_mod.valid_token, return_value=token)
+    monkeypatch.setattr(oauth_health_mod, "valid_token", fake_valid)
+
+    for provider in ("codex-oauth", "claude-oauth", "antigravity-oauth", "xai-oauth"):
+        resolved = await nc._resolve_provider_token(provider, "u-native")
+        assert resolved is not None, provider
+        assert resolved["access_token"] == "native-check-token"
+        fake_valid.assert_awaited_with("u-native", provider)
+
+    # A refusal (flagged connection / refresh unavailable) is no credential for
+    # this check — reported through the status page, not an import error.
+    from src.server.services.oauth_health import OAuthRefreshUnavailable, OAuthReauthRequired
+
+    fake_valid.side_effect = OAuthReauthRequired("xai-oauth", "invalid_grant")
+    assert await nc._resolve_provider_token("xai-oauth", "u-native") is None
+    fake_valid.side_effect = OAuthRefreshUnavailable("xai-oauth", "refresh_in_progress")
+    assert await nc._resolve_provider_token("xai-oauth", "u-native") is None
+    fake_valid.side_effect = None
+    fake_valid.return_value = None
+    assert await nc._resolve_provider_token("xai-oauth", "u-native") is None
+
+    # A provider nothing registered: no credential at all.
+    assert await nc._resolve_provider_token("not-a-line", "u-native") is None

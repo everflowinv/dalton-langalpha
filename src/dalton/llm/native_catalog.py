@@ -299,17 +299,36 @@ async def fetch_antigravity_models(
 
 
 async def _resolve_provider_token(provider: str, user_id: str) -> dict[str, Any] | None:
-    if provider == "claude-oauth":
-        from src.server.services.claude_oauth import get_valid_token
-    elif provider == "codex-oauth":
-        from src.server.services.codex_oauth import get_valid_token
-    elif provider == "antigravity-oauth":
-        from src.dalton.llm.providers.antigravity.oauth import get_valid_token
-    elif provider == "xai-oauth":
-        from src.dalton.llm.providers.xai_grok.oauth import get_valid_token
-    else:
+    """A usable access token for the provider, through the one unified refresh
+    protocol (``oauth_health.valid_token``).
+
+    The old per-provider ``get_valid_token`` refreshers were removed with the
+    upstream #623 rework; this door refreshes under the shared lock and saves
+    conditionally, for every registered subscription line alike.
+    """
+    from src.server.services.oauth_providers import SUBSCRIPTIONS
+
+    if provider not in SUBSCRIPTIONS:
         return None
-    return await get_valid_token(user_id)
+    from src.server.services.oauth_health import (
+        OAuthReauthRequired,
+        OAuthRefreshUnavailable,
+        valid_token,
+    )
+
+    try:
+        token = await valid_token(user_id, provider)
+    except (OAuthReauthRequired, OAuthRefreshUnavailable):
+        # A connection that cannot serve this check now is, for this check,
+        # no credential; the status page says which and why.
+        return None
+    if token is None or not token.access_token:
+        return None
+    return {
+        "access_token": token.access_token,
+        "account_id": token.account_id,
+        "plan_type": token.plan_type,
+    }
 
 
 def _provider_fetch_inputs(provider: str, token: dict[str, Any]) -> dict[str, Any]:

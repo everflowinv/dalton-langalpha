@@ -284,8 +284,10 @@ def apply_model_overlay(
     """Merge Dalton overlays (`native_overlay.json` → native-sync runtime overlay → `openclaw_overlay.json`) into `llm_config` and `manifest`.
 
     Never overwrites existing upstream model keys or provider_config groups; logs an error and skips on collision.
-    Afterwards the native-sync overlay's PM-retired keys are dropped (see
-    `_drop_retired_models`), so they stay hidden wherever they were defined.
+    Afterwards the native overlays' retired keys are dropped (see
+    `_drop_retired_models`), so they stay hidden wherever they were defined —
+    the checked-in overlay retires keys for good (upstream lines Dalton does
+    not offer), the runtime sync overlay retires PM-retired keys.
     """
     if path is None and _in_upstream_raw_manifest_test():
         return None
@@ -306,12 +308,12 @@ def apply_model_overlay(
         overlay = load_overlay_data(src_path)
         if overlay:
             _merge_single_overlay(overlay, name, llm_config, manifest)
-            if name == "native_sync":
-                retired_records = [
+            if name in ("native", "native_sync"):
+                retired_records.extend(
                     item
                     for item in overlay.get("retired") or []
                     if isinstance(item, dict)
-                ]
+                )
     if retired_records:
         _drop_retired_models(retired_records, llm_config, manifest)
     _enforce_pinned_overlay_routes(llm_config)

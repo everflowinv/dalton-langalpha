@@ -254,7 +254,9 @@ async def test_no_api_access_refuses_the_turn_without_a_reconnect():
         oauth_health, "valid_token", AsyncMock(side_effect=OAuthPlanNoApiAccess("grok-oauth")),
     ):
         with pytest.raises(HTTPException) as raised:
-            await resolve_oauth_llm_client("u1", "grok-4.5-oauth")
+            await resolve_oauth_llm_client(
+                "u1", "grok-4.5-oauth", custom_entry={"name": "grok-4.5-oauth", "provider": "grok-oauth"}
+            )
     exc = raised.value
     assert exc.status_code == 400
     assert exc.detail["type"] == "oauth_plan_no_api_access"
@@ -281,10 +283,13 @@ def test_a_403_is_the_plan_unless_it_refuses_the_token(status, body, stale):
     assert stale_token_refusal(status, body) is stale
 
 
-def _refused(status: int, error: str, model="grok-4.5-oauth"):  # DALTON-HOOK(llm-overlay): non-pinned grok model
+def _refused(status: int, error: str, model="grok-4.5-oauth"):  # DALTON-HOOK(llm-overlay): custom model on grok-oauth
     exc = RuntimeError("model call failed")
     exc.__model_resilience__ = {
         "model": model,
+        # What the middleware attaches for a primary on that subscription;
+        # the manifest no longer names a grok-oauth model in Dalton.
+        "provider": "grok-oauth",
         "attempted_models": [{"model": model, "status_code": status, "error": error}],
     }
     return exc
@@ -299,7 +304,9 @@ async def test_only_a_stale_token_403_expires_the_access_token(error, expected):
     expire = AsyncMock(return_value=True)
     with patch.object(oauth_health, "expire_oauth_access_token", expire):
         calls = oauth_health.failed_model_calls(_refused(403, error).__model_resilience__, None)
-        await oauth_health.note_token_refusals("u1", calls)
+        # The executor's provider_of names the subscription where the manifest
+        # cannot (a custom model on grok-oauth).
+        await oauth_health.note_token_refusals("u1", calls, lambda _model: "grok-oauth")
     if expected:
         expire.assert_awaited_once_with("u1", "grok-oauth")
     else:

@@ -557,7 +557,13 @@ def test_routes_keep_the_paths_the_client_calls():
         ("GET", "/api/v1/oauth/{key}/status"),
         ("DELETE", "/api/v1/oauth/{key}"),
     } <= paths
-    assert set(oauth_app._DEVICE_FLOWS) == {"codex", "grok"}
+    # DALTON-HOOK(xai-oauth): upstream's grok device sign-in (api.x.ai) is not
+    # offered in Dalton; its sign-in and inference ride the pinned xai-oauth
+    # line instead, so the grok key 404s at the device flow.
+    assert set(oauth_app._DEVICE_FLOWS) == {"codex"}
+    with pytest.raises(HTTPException) as refused:
+        oauth_app._device_flow("grok")
+    assert refused.value.status_code == 404
     assert {oauth_app._subscription(k) for k in ("codex", "claude", "grok")} == {
         "codex-oauth", "claude-oauth", "grok-oauth",
     }

@@ -6517,14 +6517,14 @@
       "failNext": "请获取新代码重新开始。",
       "failNextTransient": "稍等片刻再试即可。",
       "fail": {
-        "denied": "登录已在 OpenAI 页面被拒绝。",
+        "denied": "登录已在 Meta 页面被拒绝。",
         "expired": "代码在批准前已过期。",
         "no_pending_flow": "此次登录已结束或已被使用。",
         "redis_unavailable": "暂时无法连接账户。",
-        "device_flow_unavailable": "OpenAI 暂时不提供代码登录。",
-        "upstream_unavailable": "无法连接到 OpenAI。",
-        "device_poll_failed": "OpenAI 终止了此次登录。",
-        "exchange_failed": "OpenAI 未接受此次登录。",
+        "device_flow_unavailable": "Meta 暂时不提供代码登录。",
+        "upstream_unavailable": "无法连接到 Meta。",
+        "device_poll_failed": "Meta 终止了此次登录。",
+        "exchange_failed": "Meta 未接受此次登录。",
         "save_failed": "无法保存您的账户。",
         "unknown": "连接时出现问题。"
       }
@@ -6551,14 +6551,14 @@
       "failNext": "请获取新代码重新开始。",
       "failNextTransient": "稍等片刻再试即可。",
       "fail": {
-        "denied": "登录已在 OpenAI 页面被拒绝。",
+        "denied": "登录已在 xAI 页面被拒绝。",
         "expired": "代码在批准前已过期。",
         "no_pending_flow": "此次登录已结束或已被使用。",
         "redis_unavailable": "暂时无法连接账户。",
-        "device_flow_unavailable": "OpenAI 暂时不提供代码登录。",
-        "upstream_unavailable": "无法连接到 OpenAI。",
-        "device_poll_failed": "OpenAI 终止了此次登录。",
-        "exchange_failed": "OpenAI 未接受此次登录。",
+        "device_flow_unavailable": "xAI 暂时不提供代码登录。",
+        "upstream_unavailable": "无法连接到 xAI。",
+        "device_poll_failed": "xAI 终止了此次登录。",
+        "exchange_failed": "xAI 未接受此次登录。",
         "save_failed": "无法保存您的账户。",
         "unknown": "连接时出现问题。"
       }
