@@ -1,6 +1,6 @@
 import type { TFunction } from 'i18next';
 import { isDmAddress, messagingAppName, platformOf } from '@/pages/ChatAgent/components/messaging/messageDelivery';
-import { apiErrorDetail, apiErrorStatus } from '@/pages/ChatAgent/utils/api/errors';
+import { apiErrorDetail, apiErrorStatus } from '@/api/errors';
 import type { DeliveryAttempt, DeliveryDefault, DeliveryOptions } from '@/types/automation';
 import { mutationErrorMessage } from './errors';
 

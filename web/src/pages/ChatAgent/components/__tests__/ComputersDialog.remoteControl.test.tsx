@@ -32,7 +32,7 @@ vi.mock('@/config/hostMode', () => ({
 vi.mock('@/components/ui/use-toast', () => ({ toast: vi.fn() }));
 
 vi.mock('../../utils/api', async () => {
-  const errors = await vi.importActual<typeof import('../../utils/api/errors')>('../../utils/api/errors');
+  const errors = await vi.importActual<typeof import('@/api/errors')>('@/api/errors');
   return {
     getComputers: vi.fn(),
     getComputerProviders: vi.fn(),

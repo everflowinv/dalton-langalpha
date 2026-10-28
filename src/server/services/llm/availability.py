@@ -1,8 +1,9 @@
 """Model-availability error responses + stale-preference scrubbing.
 
 When a selected model can't be served — a custom model with no usable key, a
-saved preference whose model has vanished from the manifest, or a model the
-user's plan does not cover on the platform's key — the chat handler needs to
+saved preference whose model has vanished from the manifest, a model the
+user's plan does not cover on the platform's key, or a subscription whose
+sign-in cannot serve the turn — the chat handler needs to
 fail loudly with a CTA banner rather than silently downgrade. This module owns
 those user-facing 400s and the pref-scrub that backs the ``model_removed``
 case. A missing model saved for a role (the Background model on a primary
@@ -17,14 +18,31 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Iterable, Mapping
-from typing import NoReturn
+from typing import TYPE_CHECKING, NoReturn
 
 from . import user_models
 from .capabilities import TierPermits
 
+if TYPE_CHECKING:
+    from src.server.services.oauth_providers import SubscriptionProvider
+
 # Same hard-coded logger name request_prep uses — existing log routing keys off it.
 logger = logging.getLogger("src.server.handlers.chat_handler")
 
+
+
+def on_subscription(entry: Mapping | None) -> bool:
+    """Whether a custom model entry runs on one of the user's subscriptions.
+
+    "Show all" saves a model a subscription lists but the manifest does not
+    tune as a custom model on that subscription's provider. It is served by
+    the subscription's sign-in, like a built-in of that provider, so no API
+    key is needed for it. No custom provider can take a subscription's
+    name (``validate_custom_providers``), so the slug says which it is.
+    """
+    from src.server.services.oauth_providers import SUBSCRIPTIONS
+
+    return bool(entry) and entry.get("provider") in SUBSCRIPTIONS
 
 
 def raise_byok_key_required(model_name: str) -> None:
@@ -46,6 +64,66 @@ def raise_byok_key_required(model_name: str) -> None:
             ),
             "type": "byok_key_required",
             "link": {"url": "/settings?tab=model", "label": "Open Settings"},
+        },
+    )
+
+
+# A subscription that cannot serve the turn. Each names the account the way
+# the user signed in to it, and says whether reconnecting can help.
+
+def raise_oauth_reauth_required(
+    subscription: SubscriptionProvider, model_name: str | None, code: str | None
+) -> NoReturn:
+    """``model_name`` is None where no model has been resolved yet (the
+    no-provider gate), so the sentence names the account alone."""
+    from fastapi import HTTPException
+
+    use = f"use '{model_name}'" if model_name else "use its models"
+    raise HTTPException(
+        status_code=400,
+        detail={
+            "message": (
+                f"Your {subscription.account_name} sign-in has expired. Reconnect "
+                f"it to {use}."
+            ),
+            "type": "oauth_reauth_required",
+            "provider": subscription.id,
+            "reason": code,
+            "link": {"url": "/settings?tab=model", "label": "Reconnect"},
+        },
+    )
+
+
+def raise_oauth_plan_no_api_access(subscription: SubscriptionProvider) -> NoReturn:
+    """Not a sign-in problem, so no reconnect: a key is what works."""
+    from fastapi import HTTPException
+
+    raise HTTPException(
+        status_code=400,
+        detail={
+            "message": (
+                f"Your {subscription.account_name} plan doesn't include API access, "
+                "which LangAlpha needs. Use a SpaceXSI API key instead."
+            ),
+            "type": "oauth_plan_no_api_access",
+            "provider": subscription.id,
+            "link": {"url": "/settings?tab=model", "label": "Add an API key"},
+        },
+    )
+
+
+def raise_oauth_refresh_unavailable(subscription: SubscriptionProvider) -> NoReturn:
+    from fastapi import HTTPException
+
+    raise HTTPException(
+        status_code=503,
+        detail={
+            "message": (
+                f"Your {subscription.account_name} sign-in could not be renewed just "
+                "now. Try again in a moment."
+            ),
+            "type": "oauth_refresh_unavailable",
+            "provider": subscription.id,
         },
     )
 
@@ -177,11 +255,14 @@ async def model_on_plan(
         return True
     from src.llms.llm import LLM as LLMFactory
 
-    from .clients import _resolve_custom_model_byok, _walk_byok_candidates
+    from .clients import _resolve_custom_model_byok, walk_byok_candidates
 
     mc = LLMFactory.get_model_config()
     source, entry = await user_models.classify_model(user_id, model, _pref_cache=model_pref)
     if source == user_models.ModelSource.CUSTOM:
+        if on_subscription(entry):
+            # As a built-in of a subscription provider below.
+            return True
         # Runs on the user's own key. With none, a role left without a
         # client is built by this name from the manifest, on the platform's
         # key, so a custom model under a built-in's name is judged as that one.
@@ -211,7 +292,7 @@ async def model_on_plan(
         return True
     if not is_byok:
         return False
-    found, _ = await _walk_byok_candidates(user_id, provider, mc, _byok_cache=byok_cache)
+    found, _ = await walk_byok_candidates(user_id, provider, mc, _byok_cache=byok_cache)
     return found is not None
 
 

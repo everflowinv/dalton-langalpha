@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient, type UseQueryResult } from '@tanstack/react-query';
 import { queryKeys } from '@/lib/queryKeys';
 import { workspaceRelativePath } from '@/pages/ChatAgent/utils/agentPaths';
-import { retryUnlessClientError } from '@/pages/ChatAgent/utils/api/errors';
+import { retryUnlessClientError } from '@/api/errors';
 import {
   createShareLink,
   getShareLinkFiles,

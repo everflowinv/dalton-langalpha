@@ -20,7 +20,13 @@ from src.llms.model_spec import (
 from src.llms.preferences import resolve_tuning, resolve_turn_tuning
 
 from . import logger, user_models
-from .availability import raise_byok_key_required
+from .availability import (
+    raise_byok_key_required,
+    raise_oauth_plan_no_api_access,
+    raise_oauth_reauth_required,
+    raise_oauth_refresh_unavailable,
+)
+from .byok import byok_candidates, walk_byok_candidates
 from .user_models import ModelSource
 
 #: Providers that accept a request-time service tier. The rule had no owner:
@@ -77,149 +83,6 @@ def is_own_key_turn(config: Any) -> bool:
     )
 
 
-# ---------------------------------------------------------------------------
-# Finding the key. A stored BYOK key may sit under the model's own provider
-# slug, its manifest parent, or a sibling variant of that parent, as long as
-# the family's vendor issues them as one credential.
-# ---------------------------------------------------------------------------
-
-
-def _candidate_slugs(provider: str, mc) -> list[str]:
-    """Return [provider → parent → sibling variants] in BYOK priority order.
-
-    Shared by ``_walk_byok_candidates`` (key lookup) and STEP-0 prefetch so the
-    two can't drift. Excludes platform-only siblings (BYOK keys never live there).
-    Whether a key found here may serve the model is ``_key_fits``'s call, since
-    it depends on what was saved with the key.
-    """
-    # DALTON-HOOK(team-credentials): coding_plan variants only accept their own slug key
-    from src.dalton.llm.providers import is_isolated_coding_plan_provider
-    if is_isolated_coding_plan_provider(provider, mc):
-        return [provider]
-    parent = mc.get_parent_provider(provider)
-    candidates: list[str] = [provider]
-    # Nested variants (e.g. z-ai-cn-coding under z-ai-cn) parent to the
-    # provider itself, not the root — walk them before the parent's family.
-    for child in mc.get_child_variants(provider):
-        if child not in candidates:
-            candidates.append(child)
-    if parent and parent != provider:
-        candidates.append(parent)
-    root = parent if parent else provider
-    for sibling in mc.get_child_variants(root):
-        if sibling not in candidates:
-            candidates.append(sibling)
-    return candidates
-
-
-def _key_fits(provider: str, holder: str, byok_config: dict, mc) -> bool:
-    """Whether a key stored under ``holder`` may serve a model of ``provider``.
-
-    Not when the two are separate credentials (``own_api_key`` in the
-    manifest): the key would go to the model's endpoint, which never issued it
-    and rejects it. A base URL saved with the key lifts that, since it wins over
-    the model's endpoint, so the key goes where the user pointed it.
-    """
-    return bool(byok_config.get("base_url")) or mc.shares_api_key(provider, holder)
-
-
-async def _walk_byok_candidates(
-    user_id,
-    provider,
-    mc,
-    *,
-    _byok_cache=None,
-    any_credential: bool = False,
-):
-    """Walk [provider → parent → sibling variants] for a stored BYOK key.
-
-    Returns ``(byok_config, holding_slug)`` — the first candidate (in priority
-    order) that has a key ``_key_fits`` lets serve the model, or ``(None, None)``.
-    ``any_credential`` takes any key, for a walk that builds against the endpoint
-    of whichever slug held it. Honors a request-scoped
-    ``_byok_cache`` (``dict[str, dict | None] | None``): a slug mapping to a
-    dict is a confirmed key, a slug mapping to ``None`` is confirmed-absent, and
-    a slug absent from the cache is NOT prefetched — it MUST fall back to a
-    direct ``get_byok_configs_for_providers`` lookup so a cache miss is never a
-    silent false "no key". Direct-fetch results are written back into the cache.
-    """
-    from src.server.database.api_keys import get_byok_configs_for_providers
-
-    candidates = _candidate_slugs(provider, mc)
-
-    if _byok_cache is None:
-        # Back-compat path: no request-scoped cache, batch-fetch all candidates.
-        configs = await get_byok_configs_for_providers(user_id, candidates)
-    else:
-        # Tri-state cache: a slug absent from the cache was never prefetched, so
-        # it must be fetched directly — only a recorded ``None`` counts as a
-        # confirmed absence.
-        missing = [c for c in candidates if c not in _byok_cache]
-        if missing:
-            fetched = await get_byok_configs_for_providers(user_id, missing)
-            for slug in missing:
-                _byok_cache[slug] = fetched.get(slug)
-        configs = {c: _byok_cache.get(c) for c in candidates}
-
-    for candidate in candidates:  # keep the provider → parent → sibling priority
-        byok_config = configs.get(candidate)
-        if byok_config and (
-            any_credential or _key_fits(provider, candidate, byok_config, mc)
-        ):
-            return byok_config, candidate
-
-    return None, None
-
-
-# Parents with no dialect of their own. ``openai`` is the base shape a great
-# many services implement rather than a vendor whose behaviour you would want
-# copied, and a provider declaring ``sdk: "openai"`` is saying exactly that
-# about itself. A parent on this list is skipped by
-# ``_inherit_custom_provider_sdk`` below, so its OpenAI-specific request
-# shaping (``use_response_api``, ``prompt_cache_key``) stays opt-in.
-_OPENAI_SHAPED_SDKS = (None, "openai")
-
-
-def _inherit_custom_provider_sdk(custom_config, parent_provider, provider_def, mc):
-    """Make a custom provider inherit its manifest parent's SDK/headers (#221).
-
-    A user-defined custom provider slug isn't in the manifest, so
-    ``from_custom_config`` derives ``sdk`` from an empty ``provider_info`` and
-    defaults to ``"openai"`` — which 404s an Anthropic-shaped endpoint
-    (``/chat/completions`` vs ``/v1/messages``). Rewriting ``provider`` to the
-    manifest parent fixes the SDK and ``default_headers``.
-
-    Naming a parent is how a custom provider says what it is, so it gets that
-    parent's dialect: SDK, ``default_headers``, and the request shaping the
-    manifest entry declares. ``openai`` is the exception, because it is the base
-    shape a great many unrelated services implement rather than a vendor whose
-    behaviour a gateway means to copy. Declaring it says "my API is OpenAI
-    shaped", not "treat me as OpenAI", so its ``use_response_api`` and
-    ``prompt_cache_key`` stay opt-in and a gateway that only speaks
-    ``/chat/completions`` is left alone. Providers that declare ``sdk:
-    "openai"`` themselves (vLLM, Groq, DeepInfra, LM Studio) are saying the same
-    thing about themselves and are covered by the same entry.
-
-    A parent with its own SDK is a real dialect, so declaring it matches
-    everything. DashScope is the case that makes this concrete: it has its own
-    client because its raw reasoning is rescued by a bridge scoped to
-    ``ChatDashScope``, and a gateway left on a plain ``ChatOpenAI`` would stream
-    every Qwen turn with the thinking silently dropped.
-    """
-    updates: dict = {}
-    if mc.get_provider_info(parent_provider).get("sdk") not in _OPENAI_SHAPED_SDKS:
-        updates["provider"] = parent_provider
-    # Tri-state, not a truthiness check: ``users.py`` validates this field as a
-    # boolean and so accepts an explicit ``false``, which is a gateway saying it
-    # speaks only ``/chat/completions``. Collapsing that into "absent" hands it
-    # the parent's manifest default instead, and for a parent that defaults the
-    # Responses API on, every call would go to ``/responses`` and fail.
-    declared_response_api = provider_def.get("use_response_api")
-    if declared_response_api is not None:
-        updates["_use_response_api"] = bool(declared_response_api)
-    return {**custom_config, **updates} if updates else custom_config
-
-
 async def _resolve_custom_model_byok(
     user_id: str,
     model_name: str,
@@ -255,7 +118,7 @@ async def _resolve_custom_model_byok(
         if byok_config:
             parent = cp_by_name["parent_provider"]
             base_url = byok_config.get("base_url") or mc.get_provider_info(parent).get("base_url")
-            custom_config = _inherit_custom_provider_sdk(custom_config, parent, cp_by_name, mc)
+            custom_config = user_models.route_custom_entry(custom_config, cp_by_name, mc)
             return byok_config, base_url, custom_config
 
     # 2. Provider field is a custom sub-provider
@@ -265,14 +128,14 @@ async def _resolve_custom_model_byok(
         if byok_config:
             parent = cp_by_provider["parent_provider"]
             base_url = byok_config.get("base_url") or mc.get_provider_info(parent).get("base_url")
-            custom_config = _inherit_custom_provider_sdk(custom_config, parent, cp_by_provider, mc)
+            custom_config = user_models.route_custom_entry(custom_config, cp_by_provider, mc)
             return byok_config, base_url, custom_config
 
     # 3. System provider — walk [provider → parent → sibling variants] for a
     #    stored key. The sibling step covers the mirror case where a custom
     #    model is tagged with the parent slug but the user only configured a
     #    variant (e.g. coding-plan) so the key lives under the variant.
-    byok_config, holding = await _walk_byok_candidates(
+    byok_config, holding = await walk_byok_candidates(
         user_id, provider, mc, _byok_cache=_byok_cache, any_credential=True,
     )
     if byok_config:
@@ -359,7 +222,7 @@ async def resolve_byok_llm_client(
     ``classify_model`` is O(1) with ``_pref_cache`` populated, so callers
     don't need to pre-classify — pass the cache and this function does its
     own lookup. ``_byok_cache`` is a request-scoped tri-state cache threaded
-    into ``_walk_byok_candidates`` (see its contract). ``service_tier`` is
+    into ``walk_byok_candidates`` (see its contract). ``service_tier`` is
     forwarded only to providers ``supports_service_tier`` accepts.
     """
     if not is_byok:
@@ -432,7 +295,7 @@ async def resolve_byok_llm_client(
     # base_url to the MODEL'S OWN provider, never the candidate that merely
     # held the key.
     provider = config_entry["provider"]
-    byok_config, holding = await _walk_byok_candidates(
+    byok_config, holding = await walk_byok_candidates(
         user_id, provider, mc, _byok_cache=_byok_cache,
     )
     if not byok_config:
@@ -464,35 +327,48 @@ async def resolve_oauth_llm_client(
     reasoning_effort: str | None = None,
     service_tier: str | None = None,
     cache_key: str | None = None,
+    *,
+    custom_entry: dict | None = None,
 ):
-    """Resolve OAuth-connected LLM client. Independent of BYOK toggle."""
-    from src.llms.llm import LLM as LLMFactory, create_llm
+    """Resolve OAuth-connected LLM client. Independent of BYOK toggle.
+
+    ``custom_entry`` is the user's custom model of this name, which shadows the
+    manifest as everywhere else. One saved on a subscription provider (an
+    untuned model the subscription lists) runs on its token like a built-in.
+    """
+    from fastapi import HTTPException
+
+    from src.llms.llm import LLM as LLMFactory, create_llm, create_llm_from_custom
+    from src.server.services.oauth_health import (
+        OAuthPlanNoApiAccess,
+        OAuthReauthRequired,
+        OAuthRefreshUnavailable,
+        valid_token,
+    )
+    from src.server.services.oauth_providers import SUBSCRIPTIONS
 
     mc = LLMFactory.get_model_config()
-    model_info = mc.get_model_config(model_name)
+    model_info = custom_entry if custom_entry is not None else mc.get_model_config(model_name)
     if not model_info:
         return None
 
     provider = model_info["provider"]
-    provider_info = mc.get_provider_info(provider)
-    if provider_info.get("access_type") != "oauth":
+    subscription = SUBSCRIPTIONS.get(provider)
+    if subscription is None:
         return None
 
-    # Dispatch to the correct OAuth service by provider
-    # DALTON-HOOK(oauth-dispatch): token getters for Dalton-owned OAuth providers
-    from src.dalton.llm.providers import dalton_oauth_token_getter, is_dalton_oauth_provider
-    get_valid_token = dalton_oauth_token_getter(provider)
-    if get_valid_token is not None:
-        pass
-    elif provider == "claude-oauth":
-        from src.server.services.claude_oauth import get_valid_token
-    else:
-        from src.server.services.codex_oauth import get_valid_token
-
-    token_data = await get_valid_token(user_id)
-    if not token_data:
-        from fastapi import HTTPException
-
+    # DALTON-HOOK(oauth-dispatch): Dalton-owned OAuth lines ride the same
+    # valid_token door through their registry adapters (src/dalton/llm/
+    # subscriptions.py); no per-provider branch here.
+    try:
+        token = await valid_token(user_id, provider)
+    except OAuthReauthRequired as e:
+        raise_oauth_reauth_required(subscription, model_name, e.code)
+    except OAuthPlanNoApiAccess:
+        raise_oauth_plan_no_api_access(subscription)
+    except OAuthRefreshUnavailable:
+        raise_oauth_refresh_unavailable(subscription)
+    if token is None:
         raise HTTPException(
             status_code=400,
             detail={
@@ -506,10 +382,8 @@ async def resolve_oauth_llm_client(
     # clear message instead of an opaque upstream error. Unknown plan_type
     # fails open — the upstream backend remains the authority.
     allowed_plans = model_info.get("oauth_plans")
-    plan_type = (token_data.get("plan_type") or "").lower()
+    plan_type = (token.plan_type or "").lower()
     if allowed_plans and plan_type and plan_type not in {p.lower() for p in allowed_plans}:
-        from fastapi import HTTPException
-
         raise HTTPException(
             status_code=400,
             detail={
@@ -521,34 +395,52 @@ async def resolve_oauth_llm_client(
             },
         )
 
-    access_token = token_data["access_token"]
-    if not access_token or not isinstance(access_token, str):
-        logger.error(
-            f"[CHAT] OAuth token is empty or not a string for provider={provider}: type={type(access_token)}"
-        )
+    if not token.access_token:
+        logger.error(f"[CHAT] OAuth token is empty for provider={provider}")
         return None
 
-    # Provider-specific headers
-    headers = {}
-    if provider == "claude-oauth":
-        logger.debug(f"[CHAT] Resolved Claude OAuth client for model={model_name}")
-    elif is_dalton_oauth_provider(provider):  # DALTON-HOOK(oauth-dispatch): bearer rides api_key
-        logger.debug(f"[CHAT] Resolved {provider} OAuth client for model={model_name}")
-    else:
-        # Codex: set ChatGPT-Account-Id header
-        account_id = token_data.get("account_id", "")
-        logger.debug(f"[CHAT] Resolved Codex OAuth client for model={model_name}")
-        if account_id:
-            headers["ChatGPT-Account-Id"] = account_id
+    headers = subscription.request_headers(token)
+    logger.debug(f"[CHAT] Resolved {subscription.account_name} OAuth client for model={model_name}")
+    if custom_entry is not None:
+        from . import egress
 
-    client = create_llm(
-        model_name,
-        api_key=access_token,
-        default_headers=headers if headers else None,
-        reasoning_effort=reasoning_effort,
-        cache_key=cache_key,
-        **_tier_kwargs(service_tier, provider),
-    )
+        params = custom_entry.get("parameters") or {}
+        # The token is the user's sign-in, for the provider that issued it:
+        # parameters that move the endpoint would send it elsewhere.
+        if egress.routing_params(params):
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "message": (
+                        f"Model '{model_name}' runs on your {subscription.account_name} "
+                        "sign-in and cannot set its own endpoint. Remove it from its settings."
+                    ),
+                    "type": "oauth_custom_endpoint",
+                },
+            )
+        # A custom model's headers ride its parameters, over any it saved.
+        extra = (
+            {"default_headers": {**(params.get("default_headers") or {}), **headers}}
+            if headers else {}
+        )
+        client = create_llm_from_custom(
+            custom_entry,
+            api_key=token.access_token,
+            cache_key=cache_key,
+            reasoning_effort=reasoning_effort,
+            **_tier_kwargs(service_tier, provider),
+            **await _egress_kwargs(model_name, None, params),
+            **extra,
+        )
+    else:
+        client = create_llm(
+            model_name,
+            api_key=token.access_token,
+            default_headers=headers or None,
+            reasoning_effort=reasoning_effort,
+            cache_key=cache_key,
+            **_tier_kwargs(service_tier, provider),
+        )
     # DALTON-HOOK(oauth-dispatch): remember how the client was built, so a 401 mid-turn
     # (token outlived by a long turn) can rebuild it with a fresh token
     from src.dalton.llm.oauth_refresh import OAuthRebuildSpec, tag_oauth_client, token_digest
@@ -559,7 +451,7 @@ async def resolve_oauth_llm_client(
             user_id=user_id,
             model_name=model_name,
             provider=provider,
-            token_digest=token_digest(access_token),
+            token_digest=token_digest(token.access_token),
             reasoning_effort=reasoning_effort,
             service_tier=service_tier,
             cache_key=cache_key,
@@ -595,6 +487,7 @@ async def resolve_model_client(
     client = await resolve_oauth_llm_client(
         user_id, model_name, reasoning_effort,
         service_tier=service_tier, cache_key=cache_key,
+        custom_entry=entry if source == ModelSource.CUSTOM else None,
     )
     if client:
         return ResolvedClient(client, source, CredentialSource.OAUTH)
@@ -715,7 +608,7 @@ async def _prefetch_byok_cache(
     user_id: str, config, effective_model: str, model_pref: dict,
     roles: list[LLMRole],
 ) -> dict[str, dict | None]:
-    """Best-effort batch BYOK prefetch → tri-state cache for ``_walk_byok_candidates``.
+    """Best-effort batch BYOK prefetch → tri-state cache for ``walk_byok_candidates``.
 
     Gathers candidate provider slugs across the main model, every role model
     (compaction / fetch / subagent), and every fallback model, issues ONE
@@ -739,7 +632,7 @@ async def _prefetch_byok_cache(
             # "provider" slug; UNKNOWN carries nothing.
             prov = cfg.get("provider") if src_ != ModelSource.UNKNOWN else None
             if prov:
-                all_slugs.update(_candidate_slugs(prov, mc))
+                all_slugs.update(byok_candidates(prov, mc))
         if not all_slugs:
             return {}
         from src.server.database.api_keys import get_byok_configs_for_providers

@@ -13,7 +13,7 @@ import src.dalton.settings as settings_mod
 from src.dalton.llm.role_policy import explain_model_availability
 from src.server.database.oauth_tokens import (
     delete_oauth_tokens,
-    get_oauth_status,
+    get_oauth_connection,
     get_oauth_tokens,
     upsert_oauth_tokens,
 )
@@ -100,8 +100,8 @@ async def test_member_reads_holder_oauth_token_and_role_policy_marks_available(
         assert member_tok["account_id"] == "acct-holder-1"
         assert member_tok["email"] == "holder@everflow.ai"
 
-        member_status = await get_oauth_status(member_id, "codex-oauth")
-        assert member_status["connected"] is True
+        member_status = await get_oauth_connection(member_id, "codex-oauth")
+        assert member_status is not None
         assert member_status["email"] == "holder@everflow.ai"
 
         member_user_row = await get_user(member_id)

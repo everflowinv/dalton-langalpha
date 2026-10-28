@@ -85,7 +85,9 @@ async def turn_model(
 #: ``turn_model`` kept.
 _UNSERVABLE_REFUSALS = frozenset({
     "oauth_required",
+    "oauth_reauth_required",
     "oauth_plan_unsupported",
+    "oauth_plan_no_api_access",
     "model_not_on_plan",
     "byok_key_required",
     "model_unavailable",

@@ -1,29 +1,29 @@
 /* eslint-disable react-refresh/only-export-components -- mixed helper/component module shared by the ConnectStep branch components */
-import { useState, useCallback, useId } from 'react';
+import { useCallback } from 'react';
 import { useNavigate } from 'react-router';
-import { Shield, Copy, Check } from 'lucide-react';
-import type { TestResult } from '@/components/model/ApiKeyInput';
-import { api } from '@/api/client';
 import { CheckboxChoice } from '@/components/ui/choice';
-import { copyText } from '@/lib/clipboard';
-import type { AccessType, RegionVariant } from '@/components/model/types';
+import type { AccessType } from '@/components/model/types';
 import { returnFromSetup } from '@/lib/setupReturn';
-import { cn } from '@/lib/utils';
-import { useTranslation } from 'react-i18next';
 
+/**
+ * What the wizard's steps hand each other. A catalog provider is named by the
+ * key it saves under and nothing else: its plan, region, endpoint and format
+ * are looked up in the catalog where they are needed.
+ */
 export interface LocationState {
   method?: AccessType;
   provider?: string;
+  /** For the model step's heading. */
   displayName?: string;
+  /** The brand whose models the model step offers (a coding plan shares its provider's). */
   brandKey?: string;
-  sdk?: string | null;
-  defaultBaseUrl?: string | null;
-  useResponseApi?: boolean;
+  /** Defining a provider of the user's own. */
   isCustom?: boolean;
-  isExistingCustom?: boolean;
-  regionVariants?: RegionVariant[] | null;
-  defaultRegion?: string | null;
-  dynamicModels?: boolean;
+  /** The provider whose plans to open again, for Back to the provider step. */
+  group?: string;
+  /** Connected by this visit's connect step, so the model step starts on
+   *  every model it offers rather than on what is saved. */
+  justConnected?: boolean;
 }
 
 /**
@@ -43,266 +43,6 @@ export function useProviderConnected() {
       if (!returnFromSetup(state.provider)) navigate('/setup/models', { state });
     },
     [navigate],
-  );
-}
-
-/** API format options for custom provider setup */
-export const API_FORMATS = [
-  { value: 'openai-responses', labelKey: 'setup.apiFormatOpenaiResponses', parent: 'openai', useResponseApi: true },
-  { value: 'openai-completions', labelKey: 'setup.apiFormatOpenaiCompletions', parent: 'openai', useResponseApi: false },
-  { value: 'anthropic', labelKey: 'setup.apiFormatAnthropic', parent: 'anthropic', useResponseApi: false },
-  { value: 'gemini', labelKey: 'setup.apiFormatGemini', parent: 'gemini', useResponseApi: false },
-] as const;
-
-/** Shape returned by `/api/v1/providers/{parent}/visible-models` — the wizard
- *  renders these as checkboxes so the user can import a subset into their
- *  variant. */
-export interface ParentModel {
-  name: string;
-  model_id: string;
-  display_name: string;
-  input_modalities: string[];
-}
-
-/** Translation key for API format from sdk + use_response_api. */
-export function getApiFormatKey(sdk?: string | null, useResponseApi?: boolean): string {
-  switch (sdk) {
-    case 'anthropic':
-      return 'setup.apiFormatAnthropic';
-    case 'gemini':
-      return 'setup.apiFormatGemini';
-    case 'openai':
-    case 'dashscope':
-      return useResponseApi ? 'setup.apiFormatOpenaiResponses' : 'setup.apiFormatOpenaiCompletions';
-    case 'codex':
-      return 'setup.apiFormatCodex';
-    case 'deepseek':
-    case 'qwq':
-      return 'setup.apiFormatCompatible';
-    default:
-      return sdk ? 'setup.apiFormatGeneric' : 'setup.apiFormatDefault';
-  }
-}
-
-export async function testApiKey(
-  provider: string,
-  apiKey: string,
-  baseUrl?: string,
-): Promise<TestResult> {
-  try {
-    const { data } = await api.post('/api/v1/keys/test', {
-      provider,
-      api_key: apiKey,
-      base_url: baseUrl || undefined,
-    });
-    return data as TestResult;
-  } catch {
-    return { success: false, error: 'Test request failed' };
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Process step UI
-// ---------------------------------------------------------------------------
-
-export function ProcessStep({ number, title, description }: { number: number; title: string; description: string }) {
-  return (
-    <div className="flex gap-3 items-start">
-      <div
-        className="shrink-0 h-6 w-6 rounded-full flex items-center justify-center text-xs font-bold"
-        style={{ backgroundColor: 'var(--color-bg-tag)', color: 'var(--color-text-secondary)' }}
-      >
-        {number}
-      </div>
-      <div>
-        <p className="text-sm font-medium" style={{ color: 'var(--color-text-primary)' }}>{title}</p>
-        <p className="text-xs mt-0.5" style={{ color: 'var(--color-text-tertiary)' }}>{description}</p>
-      </div>
-    </div>
-  );
-}
-
-export function DisclaimerBox({ provider }: { provider: string }) {
-  const { t } = useTranslation();
-  const isClaude = provider === 'claude-oauth';
-  // DALTON-HOOK(native-oauth-ui): P0N.3 Antigravity disclaimer copy
-  const isAntigravity = provider === 'antigravity-oauth';
-  return (
-    <div
-      className="rounded-lg p-3"
-      style={{
-        backgroundColor: 'var(--color-bg-subtle)',
-        border: '1px solid var(--color-border-muted)',
-      }}
-    >
-      <div className="flex gap-2 items-start">
-        <Shield className="h-4 w-4 shrink-0 mt-0.5" style={{ color: 'var(--color-text-tertiary)' }} />
-        <div>
-          <p className="text-xs font-medium mb-1" style={{ color: 'var(--color-text-secondary)' }}>
-            {t('setup.securityPrivacy')}
-          </p>
-          <p className="text-[0.6875rem] leading-relaxed" style={{ color: 'var(--color-text-tertiary)' }}>
-            {t('setup.tokensEncrypted')}
-          </p>
-          <p className="text-[0.6875rem] leading-relaxed mt-1.5" style={{ color: 'var(--color-text-tertiary)' }}>
-            {isClaude
-              ? t('setup.usageCountsClaude')
-              : isAntigravity
-                ? t('setup.usageCountsAntigravity')
-                : t('setup.usageCountsOpenai')}
-          </p>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Copy button
-// ---------------------------------------------------------------------------
-
-export function CopyButton({ text }: { text: string }) {
-  const { t } = useTranslation();
-  const [copied, setCopied] = useState(false);
-
-  const handleCopy = useCallback(async () => {
-    try {
-      await copyText(text);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 2000);
-    } catch {
-      // The browser refused the copy; the button just doesn't confirm.
-    }
-  }, [text]);
-
-  return (
-    <button
-      type="button"
-      onClick={handleCopy}
-      className="inline-flex items-center gap-1 px-2 py-1 rounded text-xs font-medium transition-colors"
-      style={{
-        background: copied ? 'var(--color-success)' : 'var(--color-bg-surface)',
-        color: copied ? '#fff' : 'var(--color-text-secondary)',
-        border: copied ? 'none' : '1px solid var(--color-border-default)',
-      }}
-    >
-      {copied ? (
-        <>
-          <Check className="h-3 w-3" />
-          {t('setup.copied')}
-        </>
-      ) : (
-        <>
-          <Copy className="h-3 w-3" />
-          {t('setup.copy')}
-        </>
-      )}
-    </button>
-  );
-}
-
-/** Input modality selection shared by the custom-provider, existing-custom
- *  and model-pick flows — per-model for discovered models, a single set for
- *  manual entry. */
-export function useModalityState() {
-  // Input modality state — per-model for discovered, single for manual entry
-  const [modelModalities, setModelModalities] = useState<Map<string, Set<string>>>(new Map());
-  const [manualModalities, setManualModalities] = useState<Set<string>>(new Set());
-
-  const toggleDiscoveredModality = (modelId: string, modality: string) => {
-    setModelModalities(prev => {
-      const next = new Map(prev);
-      const current = next.get(modelId) ?? new Set<string>();
-      const updated = new Set(current);
-      if (updated.has(modality)) updated.delete(modality);
-      else updated.add(modality);
-      next.set(modelId, updated);
-      return next;
-    });
-  };
-
-  const toggleManualModality = (modality: string) => {
-    setManualModalities(prev => {
-      const next = new Set(prev);
-      if (next.has(modality)) next.delete(modality);
-      else next.add(modality);
-      return next;
-    });
-  };
-
-  const clearManualModalities = useCallback(() => setManualModalities(new Set()), []);
-
-  const buildModalitiesArray = useCallback((modSet: Set<string>): string[] | undefined => {
-    if (modSet.size === 0) return undefined;
-    const arr = ['text', ...Array.from(modSet).filter(m => m !== 'text')];
-    return arr;
-  }, []);
-
-  return {
-    modelModalities,
-    manualModalities,
-    toggleDiscoveredModality,
-    toggleManualModality,
-    clearManualModalities,
-    buildModalitiesArray,
-  };
-}
-
-/** The input modalities a model can be marked with beyond text, which every
- *  model reads and so shows as a fixed tag. */
-const EXTRA_MODALITIES = ['image', 'pdf'] as const;
-
-/**
- * The "Capabilities:" row under a model: the fixed text tag, then a pressed
- * toggle for each extra modality in `active`. `className` places the row (its
- * padding or indent where it sits).
- */
-export function ModalityChips({
-  active,
-  onToggle,
-  className,
-}: {
-  active: ReadonlySet<string>;
-  onToggle: (modality: string) => void;
-  className?: string;
-}) {
-  const { t } = useTranslation();
-  const labelId = useId();
-  return (
-    <div role="group" aria-labelledby={labelId} className={cn('flex flex-wrap items-center gap-1.5', className)}>
-      <span
-        id={labelId}
-        className="text-[0.625rem] uppercase tracking-wider"
-        style={{ color: 'var(--color-text-tertiary)' }}
-      >
-        {t('setup.capabilities', { defaultValue: 'Capabilities' })}:
-      </span>
-      <span
-        className="inline-flex items-center rounded-full px-2 py-0.5 text-[0.625rem] font-medium"
-        style={{ background: 'var(--color-bg-tag)', color: 'var(--color-text-secondary)' }}
-      >
-        {t('setup.modalityText')}
-      </span>
-      {EXTRA_MODALITIES.map((mod) => {
-        const on = active.has(mod);
-        return (
-          <button
-            key={mod}
-            type="button"
-            aria-pressed={on}
-            onClick={() => onToggle(mod)}
-            className="inline-flex items-center rounded-full px-2 py-0.5 text-[0.625rem] font-medium transition-colors"
-            style={{
-              background: on ? 'var(--color-bg-tag)' : 'transparent',
-              color: on ? 'var(--color-text-primary)' : 'var(--color-text-tertiary)',
-              border: `1px solid ${on ? 'var(--color-text-primary)' : 'var(--color-border-default)'}`,
-            }}
-          >
-            <span>{mod === 'image' ? t('setup.modalityImage') : t('setup.modalityPdf')}</span>
-          </button>
-        );
-      })}
-    </div>
   );
 }
 

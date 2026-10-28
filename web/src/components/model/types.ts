@@ -13,9 +13,11 @@ export interface ByokProvider {
   base_url: string | null;
   is_custom?: boolean;
   use_response_api?: boolean;
+  /** Stored for a provider the catalog no longer has: listed only to be removed. */
+  withdrawn?: boolean;
 }
 
-export type SdkType = 'openai' | 'anthropic' | 'gemini' | 'codex' | 'deepseek' | 'qwq' | 'dashscope';
+export type SdkType = 'openai' | 'anthropic' | 'gemini' | 'codex' | 'deepseek' | 'openrouter' | 'qwq' | 'dashscope';
 
 export interface RegionVariant {
   provider: string;
@@ -38,7 +40,14 @@ export interface ProviderCatalogEntry {
   use_response_api?: boolean;
   dynamic_models?: boolean;
   region_variants?: RegionVariant[];
+  /** The provider this entry is a plan or region of (the providers.json group). */
+  group?: string;
+  group_display_name?: string;
+  /** What kind of provider the group is; the key picker sorts by it. */
+  category?: ProviderCategory | null;
 }
+
+export type ProviderCategory = 'closed_source' | 'open_source' | 'inference';
 
 /** Where the server looks for a provider's stored key, from `/api/v1/models`. */
 export interface KeyCandidates {
@@ -48,6 +57,16 @@ export interface KeyCandidates {
   shared: string[];
 }
 
+/**
+ * Which reasoning levels a model takes, and where the chosen one is written
+ * (`reasoning_block` on the server). An empty `efforts` says it takes none.
+ */
+export interface ReasoningDeclaration {
+  efforts: string[];
+  default?: string;
+  write?: string;
+}
+
 export interface CustomModelEntry {
   name: string;
   model_id: string;
@@ -55,6 +74,9 @@ export interface CustomModelEntry {
   parameters?: Record<string, unknown>;
   extra_body?: Record<string, unknown>;
   input_modalities?: string[];
+  /** Context window in tokens, as the provider lists it; picks the compaction band. */
+  context?: number;
+  reasoning?: ReasoningDeclaration;
 }
 
 export interface CustomModelFormState {

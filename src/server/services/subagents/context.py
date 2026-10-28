@@ -91,8 +91,9 @@ class SubagentContext:
         from src.server.services.llm.clients import (
             _custom_provider_model,
             _resolve_custom_model_byok,
-            _walk_byok_candidates,
+            walk_byok_candidates,
         )
+        from src.server.services.oauth_providers import SUBSCRIPTIONS
 
         source, entry = await user_models.classify_model(
             self.user_id, name, _pref_cache=self.model_pref
@@ -104,7 +105,7 @@ class SubagentContext:
                     return True
                 if not self.is_byok:
                     return False
-                found, _ = await _walk_byok_candidates(
+                found, _ = await walk_byok_candidates(
                     self.user_id, provider, LLM.get_model_config(), _byok_cache=self._byok_cache
                 )
                 return found is not None
@@ -119,6 +120,10 @@ class SubagentContext:
             entry = await _custom_provider_model(self.user_id, name, _pref_cache=self.model_pref)
             if entry is None:
                 return True
+        if entry.get("provider") in SUBSCRIPTIONS:
+            # A model the subscription lists and the manifest doesn't runs on
+            # the sign-in, as the turn's OAuth client takes it, not on a key.
+            return entry["provider"] in self.oauth_accounts
         if not self.is_byok:
             return False
         found, _, _ = await _resolve_custom_model_byok(
@@ -330,20 +335,21 @@ async def _connectors(
 
 
 async def _oauth_accounts(user_id: str) -> dict[str, str]:
-    """The OAuth providers with an account connected, as the model list reads
-    them, and each one's plan."""
+    """The OAuth providers with a working account connected, as the model
+    list reads them, and each one's plan. One that needs signing in again
+    cannot serve a turn, so its models read as unavailable."""
     from src.llms.llm import LLM
-    from src.server.database.oauth_tokens import get_oauth_status
+    from src.server.database.oauth_tokens import get_oauth_connection
 
     providers = [
         name for name, info in LLM.get_model_config().flat_providers.items()
         if info.get("access_type") == "oauth"
     ]
-    statuses = await asyncio.gather(*(get_oauth_status(user_id, p) for p in providers))
+    rows = await asyncio.gather(*(get_oauth_connection(user_id, p) for p in providers))
     return {
-        p: (status.get("plan_type") or "").lower()
-        for p, status in zip(providers, statuses)
-        if status["connected"]
+        p: (row.get("plan_type") or "").lower()
+        for p, row in zip(providers, rows)
+        if row and not row.get("needs_reauth_at")
     }
 
 

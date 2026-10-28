@@ -24,7 +24,6 @@ import { WatchlistRowItem, PortfolioRowItem } from '../_holdingsPrimitives';
 import WatchlistWidget from '../WatchlistWidget';
 import PortfolioWidget, { rowToQuote } from '../PortfolioWidget';
 import PortfolioWatchlistWidget, { portfolioRowToQuote } from '../PortfolioWatchlistWidget';
-import PortfolioWatchlistCard from '../../../components/PortfolioWatchlistCard'; // DALTON-HOOK(extended-hours-quotes)
 import { QueryClient } from '@tanstack/react-query'; // DALTON-HOOK(extended-hours-quotes)
 import { queryKeys } from '@/lib/queryKeys';
 import { snapshotToStockPrice } from '@/lib/quotes/quoteAdapters';
@@ -100,23 +99,26 @@ describe('WatchlistRowItem price', () => {
     };
     const afterHoursStatus = { market: 'extended-hours', afterHours: true, earlyHours: false };
 
-    const { unmount } = render(
+    // DALTON-HOOK(extended-hours-quotes): Assert the widget's after-hours values
+    // (the old PortfolioWatchlistCard's rendering now lives in this widget).
+    mockDashboardCtx.watchlist = { rows: [watchlistItem], loading: false };
+    mockDashboardCtx.dashboard = { marketStatus: afterHoursStatus };
+    const { container: cardEl, unmount } = render(
       <MemoryRouter>
-        <PortfolioWatchlistCard
-          watchlistRows={[watchlistItem]}
-          marketStatus={afterHoursStatus}
+        <PortfolioWatchlistWidget
+          instance={{ id: 'pw-ah', type: 'personal.portfolioWatchlist', config: { defaultTab: 'watchlist' } }}
+          updateConfig={() => {}}
         />
       </MemoryRouter>,
     );
-
-    // DALTON-HOOK(extended-hours-quotes): Assert PortfolioWatchlistCard after-hours values.
-    const cardRow = screen.getByTestId('watchlist-row-GOOG');
-    expect(cardRow).toHaveTextContent('$317.28');
-    expect(cardRow).not.toHaveTextContent('$320.76');
-    expect(cardRow).toHaveTextContent('-$3.48');
-    expect(cardRow).toHaveTextContent('-1.08%');
-    expect(cardRow).toHaveTextContent('$318.10 +0.26%');
+    expect(cardEl).toHaveTextContent('$317.28');
+    expect(cardEl).not.toHaveTextContent('$320.76');
+    expect(cardEl).toHaveTextContent('-$3.48');
+    expect(cardEl).toHaveTextContent('-1.08%');
+    expect(cardEl).toHaveTextContent('$318.10 +0.26%');
     unmount();
+    mockDashboardCtx.watchlist = { rows: [], loading: false };
+    mockDashboardCtx.dashboard = { marketStatus: null };
 
     const { container } = render(
       <MemoryRouter>
@@ -130,7 +132,7 @@ describe('WatchlistRowItem price', () => {
     expect(container).toHaveTextContent('$318.10 +0.26%');
   });
 
-  // DALTON-HOOK(extended-hours-quotes): Lock GOOG pre-market display on PortfolioWatchlistCard and WatchlistRowItem.
+  // DALTON-HOOK(extended-hours-quotes): Lock GOOG pre-market display on PortfolioWatchlistWidget and WatchlistRowItem.
   it('renders GOOG pre-market card with previous close 320.76, change -3.46, badge -1.07%, and pre-market 322.26', () => {
     const googPreSnap = {
       symbol: 'GOOG',
@@ -158,22 +160,24 @@ describe('WatchlistRowItem price', () => {
     };
     const preMarketStatus = { market: 'extended-hours', afterHours: false, earlyHours: true };
 
-    // DALTON-HOOK(extended-hours-quotes): Assert PortfolioWatchlistCard pre-market values.
-    const { unmount } = render(
+    // DALTON-HOOK(extended-hours-quotes): Assert the widget's pre-market values.
+    mockDashboardCtx.watchlist = { rows: [watchlistItem], loading: false };
+    mockDashboardCtx.dashboard = { marketStatus: preMarketStatus };
+    const { container: cardEl, unmount } = render(
       <MemoryRouter>
-        <PortfolioWatchlistCard
-          watchlistRows={[watchlistItem]}
-          marketStatus={preMarketStatus}
+        <PortfolioWatchlistWidget
+          instance={{ id: 'pw-pre', type: 'personal.portfolioWatchlist', config: { defaultTab: 'watchlist' } }}
+          updateConfig={() => {}}
         />
       </MemoryRouter>,
     );
-
-    const cardRow = screen.getByTestId('watchlist-row-GOOG');
-    expect(cardRow).toHaveTextContent('$320.76');
-    expect(cardRow).toHaveTextContent('-$3.46');
-    expect(cardRow).toHaveTextContent('-1.07%');
-    expect(cardRow).toHaveTextContent('$322.26 +0.47%');
+    expect(cardEl).toHaveTextContent('$320.76');
+    expect(cardEl).toHaveTextContent('-$3.46');
+    expect(cardEl).toHaveTextContent('-1.07%');
+    expect(cardEl).toHaveTextContent('$322.26 +0.47%');
     unmount();
+    mockDashboardCtx.watchlist = { rows: [], loading: false };
+    mockDashboardCtx.dashboard = { marketStatus: null };
 
     const { container } = render(
       <MemoryRouter>
@@ -187,7 +191,7 @@ describe('WatchlistRowItem price', () => {
   });
 
   // DALTON-HOOK(extended-hours-quotes): Regular-session display unchanged.
-  it('keeps regular-session display unchanged on PortfolioWatchlistCard and WatchlistRowItem', () => {
+  it('keeps regular-session display unchanged on PortfolioWatchlistWidget and WatchlistRowItem', () => {
     const regularItem: WatchlistRow = row({
       symbol: 'GOOG',
       price: 317.28,
@@ -203,22 +207,25 @@ describe('WatchlistRowItem price', () => {
     });
     const openStatus = { market: 'open', afterHours: false, earlyHours: false };
 
-    const { unmount } = render(
+    mockDashboardCtx.watchlist = { rows: [regularItem], loading: false };
+    mockDashboardCtx.dashboard = { marketStatus: openStatus };
+    const { container: cardEl, unmount } = render(
       <MemoryRouter>
-        <PortfolioWatchlistCard
-          watchlistRows={[regularItem]}
-          marketStatus={openStatus}
+        <PortfolioWatchlistWidget
+          instance={{ id: 'pw-reg', type: 'personal.portfolioWatchlist', config: { defaultTab: 'watchlist' } }}
+          updateConfig={() => {}}
         />
       </MemoryRouter>,
     );
 
-    // DALTON-HOOK(extended-hours-quotes): Assert regular session card values.
-    const cardRow = screen.getByTestId('watchlist-row-GOOG');
-    expect(cardRow).toHaveTextContent('$317.28');
-    expect(cardRow).toHaveTextContent('-$3.48');
-    expect(cardRow).toHaveTextContent('-1.08%');
-    expect(cardRow).not.toHaveTextContent('$318.10');
+    // DALTON-HOOK(extended-hours-quotes): Assert regular session widget values.
+    expect(cardEl).toHaveTextContent('$317.28');
+    expect(cardEl).toHaveTextContent('-$3.48');
+    expect(cardEl).toHaveTextContent('-1.08%');
+    expect(cardEl).not.toHaveTextContent('$318.10');
     unmount();
+    mockDashboardCtx.watchlist = { rows: [], loading: false };
+    mockDashboardCtx.dashboard = { marketStatus: null };
 
     const { container } = render(
       <MemoryRouter>
@@ -548,19 +555,35 @@ describe('WatchlistRowItem price', () => {
       quoteAvailable: true,
     };
 
-    const { container: cardEl, unmount: unmountCard } = render(
+    mockDashboardCtx.watchlist = { rows: [missingRegCloseWatchlist], loading: false };
+    mockDashboardCtx.portfolio = { rows: [missingRegClosePortfolio], loading: false, hasRealHoldings: true };
+    mockDashboardCtx.dashboard = { marketStatus: afterHoursStatus };
+    const { container: cardWlEl, unmount: unmountCardWl } = render(
       <MemoryRouter>
-        <PortfolioWatchlistCard
-          watchlistRows={[missingRegCloseWatchlist]}
-          portfolioRows={[missingRegClosePortfolio]}
-          marketStatus={afterHoursStatus}
+        <PortfolioWatchlistWidget
+          instance={{ id: 'pw-nc-wl', type: 'personal.portfolioWatchlist', config: { defaultTab: 'watchlist' } }}
+          updateConfig={() => {}}
         />
       </MemoryRouter>,
     );
-    expect(cardEl).not.toHaveTextContent('$321.59');
-    expect(cardEl).not.toHaveTextContent('$0.00');
-    expect(cardEl).not.toHaveTextContent('+0.26%');
-    unmountCard();
+    expect(cardWlEl).not.toHaveTextContent('$321.59');
+    expect(cardWlEl).not.toHaveTextContent('$0.00');
+    expect(cardWlEl).not.toHaveTextContent('+0.26%');
+    unmountCardWl();
+    const { container: cardPfEl, unmount: unmountCardPf } = render(
+      <MemoryRouter>
+        <PortfolioWatchlistWidget
+          instance={{ id: 'pw-nc-pf', type: 'personal.portfolioWatchlist', config: { defaultTab: 'portfolio' } }}
+          updateConfig={() => {}}
+        />
+      </MemoryRouter>,
+    );
+    expect(cardPfEl).not.toHaveTextContent('$321.59');
+    expect(cardPfEl).not.toHaveTextContent('$0.00');
+    expect(cardPfEl).not.toHaveTextContent('+0.26%');
+    unmountCardPf();
+    mockDashboardCtx.watchlist = { rows: [], loading: false };
+    mockDashboardCtx.dashboard = { marketStatus: null };
 
     const { container: primWlEl, unmount: unmountPrimWl } = render(
       <MemoryRouter>

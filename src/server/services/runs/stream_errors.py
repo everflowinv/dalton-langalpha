@@ -5,6 +5,7 @@ import re
 from typing import Any, Dict, Optional
 
 from src.config import settings as app_settings
+from src.server.services.oauth_health import subscription_token_refusal
 from src.server.utils.error_sanitization import sanitize_error_text
 
 # Chat-stream failures fall into two buckets and the user-facing remedy is
@@ -42,6 +43,7 @@ _UPSTREAM_MODULE_PREFIXES: tuple[str, ...] = (
     "google.genai",
     "google.generativeai",
     "cohere",
+    "openrouter",
     "httpx",
     # Our own wrappers around a provider stream. They quote the provider and
     # are raised fresh rather than chained, so nothing below would match them.
@@ -51,6 +53,7 @@ _UPSTREAM_MODULE_PREFIXES: tuple[str, ...] = (
     "langchain_openai",
     "langchain_anthropic",
     "langchain_deepseek",
+    "langchain_openrouter",
     "langchain_qwq",
     "langchain_google_genai",
     "langchain_google_vertexai",
@@ -271,6 +274,15 @@ def error_event_data(
             # "try_another_model", so the list never empties.
             if not user_owns_credential(credential_source):
                 hints = [h for h in hints if h not in _CREDENTIAL_HINTS]
+            elif str(credential_source) == "oauth":
+                # A subscription has no key to check. When its token was
+                # refused (any 401, or xAI's stale-token 403, whose other
+                # 403s are the plan's) reconnecting renews the sign-in, and
+                # a stale token says nothing about the model's access.
+                stale = status == 403 and subscription_token_refusal(trace) is not None
+                hints = [h for h in hints if h != "api_key" and not (stale and h == "model_access")]
+                if status == 401 or stale:
+                    hints.insert(0, "reconnect_account")
             data["hints"] = hints
         if trace is not None:
             primary_model = trace.get("model")

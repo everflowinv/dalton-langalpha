@@ -16,6 +16,8 @@ const h = vi.hoisted(() => ({
   customModels: [] as Array<{ name: string; model_id: string; provider: string }>,
 }));
 
+// The providers' own lists are read through React Query; none is read here.
+vi.mock('../useProviderModels', () => ({ useMissingModels: () => ({ missingByProvider: new Map(), isLoading: false }) }));
 vi.mock('../useModels', () => ({
   useModels: () => ({
     models: {

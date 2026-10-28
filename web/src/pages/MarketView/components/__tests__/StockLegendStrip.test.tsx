@@ -23,6 +23,20 @@ const { mockWatchlistState, mockPortfolioState } = vi.hoisted(() => ({
     handleDelete: () => ({ open: false, title: '', message: '', onConfirm: null }),
   },
 }));
+// DALTON-HOOK(extended-hours-quotes): the old PortfolioWatchlistCard's display
+// lives in PortfolioWatchlistWidget now; its data context is mocked here.
+const { mockDashboardCtx } = vi.hoisted(() => ({
+  mockDashboardCtx: {
+    watchlist: { rows: [] as unknown[], loading: false },
+    watchlistHandlers: { onAdd: () => {}, onDelete: () => {} },
+    portfolio: { rows: [] as unknown[], loading: false, hasRealHoldings: true },
+    portfolioHandlers: { onAdd: () => {}, onEdit: () => {}, onDelete: () => {} },
+    dashboard: { marketStatus: null as Record<string, unknown> | null },
+  },
+}));
+vi.mock('../../../Dashboard/widgets/framework/DashboardDataContext', () => ({
+  useDashboardContext: () => mockDashboardCtx,
+}));
 vi.mock('../../../Dashboard/hooks/useWatchlistData', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../../Dashboard/hooks/useWatchlistData')>();
   return {
@@ -44,7 +58,7 @@ vi.mock('../../contexts/MarketDataWSContext', () => ({
 
 import { LegendStats } from '../StockLegendStrip';
 import MarketSidebarPanel from '../MarketSidebarPanel'; // DALTON-HOOK(extended-hours-quotes)
-import PortfolioWatchlistCard from '../../../Dashboard/components/PortfolioWatchlistCard';
+import PortfolioWatchlistWidget from '../../../Dashboard/widgets/definitions/PortfolioWatchlistWidget';
 import { WatchlistRowItem } from '../../../Dashboard/widgets/definitions/_holdingsPrimitives';
 import { serializeQuoteRowToMarkdown } from '../../../Dashboard/widgets/framework/snapshotSerializers';
 import { watchlistQuoteRow, type WatchlistRow } from '../../../Dashboard/hooks/useWatchlistData';
@@ -239,13 +253,23 @@ describe('MarketSidebarPanel extended-hours rows', () => {
     const afterHoursStatus = { market: 'extended-hours', afterHours: true, earlyHours: false };
     const wsRow = buildRow();
 
-    const { container: cardContainer, unmount: unmountCard } = render(
-      <MemoryRouter>
-        <PortfolioWatchlistCard watchlistRows={[wsRow]} marketStatus={afterHoursStatus} />
-      </MemoryRouter>,
-    );
+    mockDashboardCtx.watchlist = { rows: [wsRow], loading: false };
+    mockDashboardCtx.dashboard = { marketStatus: afterHoursStatus };
+    const { container: cardContainer, unmount: unmountCard } = (() => {
+      const r = render(
+        <MemoryRouter>
+          <PortfolioWatchlistWidget
+            instance={{ id: 'pw-sls-1', type: 'personal.portfolioWatchlist', config: { defaultTab: 'watchlist' } }}
+            updateConfig={() => {}}
+          />
+        </MemoryRouter>,
+      );
+      return r;
+    })();
     expect(cardContainer).toHaveTextContent('$319.50 +0.70%');
     unmountCard();
+    mockDashboardCtx.watchlist = { rows: [], loading: false };
+    mockDashboardCtx.dashboard = { marketStatus: null };
 
     const { container: primContainer, unmount: unmountPrim } = render(
       <MemoryRouter>
@@ -280,14 +304,21 @@ describe('MarketSidebarPanel extended-hours rows', () => {
     });
     const backToCloseRow = buildRow();
 
+    mockDashboardCtx.watchlist = { rows: [backToCloseRow], loading: false };
+    mockDashboardCtx.dashboard = { marketStatus: afterHoursStatus };
     const { container: cardBack, unmount: unmountCardBack } = render(
       <MemoryRouter>
-        <PortfolioWatchlistCard watchlistRows={[backToCloseRow]} marketStatus={afterHoursStatus} />
+        <PortfolioWatchlistWidget
+          instance={{ id: 'pw-sls-2', type: 'personal.portfolioWatchlist', config: { defaultTab: 'watchlist' } }}
+          updateConfig={() => {}}
+        />
       </MemoryRouter>,
     );
     expect(cardBack).toHaveTextContent('$317.28 +0.00%');
     expect(cardBack).not.toHaveTextContent('$318.10');
     unmountCardBack();
+    mockDashboardCtx.watchlist = { rows: [], loading: false };
+    mockDashboardCtx.dashboard = { marketStatus: null };
 
     const { container: primBack, unmount: unmountPrimBack } = render(
       <MemoryRouter>
@@ -347,14 +378,21 @@ describe('MarketSidebarPanel extended-hours rows', () => {
     };
 
     // Regular session: -0.125 and -0.125% from snapshotToStockPrice render as -$0.13 and -0.13% across all 4 surfaces
+    mockDashboardCtx.watchlist = { rows: [halfRow], loading: false };
+    mockDashboardCtx.dashboard = { marketStatus: openStatus };
     const { container: regCardEl, unmount: unmountRegCard } = render(
       <MemoryRouter>
-        <PortfolioWatchlistCard watchlistRows={[halfRow]} marketStatus={openStatus} />
+        <PortfolioWatchlistWidget
+          instance={{ id: 'pw-sls-3', type: 'personal.portfolioWatchlist', config: { defaultTab: 'watchlist' } }}
+          updateConfig={() => {}}
+        />
       </MemoryRouter>,
     );
     expect(regCardEl).toHaveTextContent('-$0.13');
     expect(regCardEl).toHaveTextContent('-0.13%');
     unmountRegCard();
+    mockDashboardCtx.watchlist = { rows: [], loading: false };
+    mockDashboardCtx.dashboard = { marketStatus: null };
 
     const { container: regPrimEl, unmount: unmountRegPrim } = render(
       <MemoryRouter>
@@ -383,9 +421,14 @@ describe('MarketSidebarPanel extended-hours rows', () => {
     expect(serializeQuoteRowToMarkdown(regExported)).toContain('-0.13 (-0.13%)');
 
     // After-hours session: main and extended-hours -0.125% both render as -0.13% across all 4 surfaces
+    mockDashboardCtx.watchlist = { rows: [halfRow], loading: false };
+    mockDashboardCtx.dashboard = { marketStatus: afterHoursStatus };
     const { container: cardEl, unmount: unmountCard } = render(
       <MemoryRouter>
-        <PortfolioWatchlistCard watchlistRows={[halfRow]} marketStatus={afterHoursStatus} />
+        <PortfolioWatchlistWidget
+          instance={{ id: 'pw-sls-4', type: 'personal.portfolioWatchlist', config: { defaultTab: 'watchlist' } }}
+          updateConfig={() => {}}
+        />
       </MemoryRouter>,
     );
     expect(cardEl).toHaveTextContent('$99.88');
@@ -393,6 +436,8 @@ describe('MarketSidebarPanel extended-hours rows', () => {
     expect(cardEl).toHaveTextContent('-0.13%');
     expect(cardEl).toHaveTextContent('$99.75 -0.13%');
     unmountCard();
+    mockDashboardCtx.watchlist = { rows: [], loading: false };
+    mockDashboardCtx.dashboard = { marketStatus: null };
 
     // 2. WatchlistRowItem (_holdingsPrimitives)
     const { container: primEl, unmount: unmountPrim } = render(

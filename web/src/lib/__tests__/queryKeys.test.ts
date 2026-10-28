@@ -31,12 +31,9 @@ describe('queryKeys', () => {
 
   // --- oauth ---
   describe('oauth', () => {
-    it('codex() extends the oauth base key', () => {
-      expect(queryKeys.oauth.codex()).toEqual(['oauth', 'codex']);
-    });
-
-    it('claude() extends the oauth base key', () => {
-      expect(queryKeys.oauth.claude()).toEqual(['oauth', 'claude']);
+    it('status(key) extends the oauth base key', () => {
+      expect(queryKeys.oauth.status('codex')).toEqual(['oauth', 'codex']);
+      expect(queryKeys.oauth.status('claude')).toEqual(['oauth', 'claude']);
     });
   });
 

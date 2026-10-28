@@ -108,10 +108,9 @@ describe('NewsDetailModal — imageless (TickerTick) article', () => {
   it('shows the empty state only when there is no fallback', async () => {
     getNewsArticle.mockRejectedValue(new Error('404'));
 
-    render(<NewsDetailModal newsId="x" onClose={vi.fn()} fallbackUrl="https://example.com/x" />);
+    render(<NewsDetailModal newsId="x" onClose={vi.fn()} />);
 
     expect(await screen.findByText(/Article details not available/i)).toBeInTheDocument();
-    expect(screen.getByText(/Open article/i)).toBeInTheDocument();
   });
 
   it('lets Escape dismiss the sentiment card before the article behind it', async () => {

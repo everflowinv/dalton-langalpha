@@ -518,7 +518,8 @@ test.describe('a field left focused while the user is in another app', () => {
     await page.keyboard.type('AAPL');
     await leaveWindowAndReturn(page);
 
-    await tabTo(page, ROW);
+    // The dashboard's widgets put every row's attach button in the tab order.
+    await tabTo(page, ROW, 120);
     expect(await outlineOn(page, ROW)).toMatchObject({ focused: true });
     const ring = await outlineOn(page, ROW);
     expect(ring.style === 'solid' || ring.shadow !== 'none').toBe(true);

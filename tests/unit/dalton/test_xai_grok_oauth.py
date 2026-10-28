@@ -750,20 +750,19 @@ async def test_budget_mapping_and_provider_status_row(monkeypatch: pytest.Monkey
     # provider_status row for xai-oauth calls get_valid_token first, then fetch_xai_billing
     expires_dt = datetime.now(timezone.utc) + timedelta(hours=1)
 
-    async def _fake_oauth_status(user_id: str, provider: str) -> dict[str, Any]:
+    async def _fake_oauth_connection(user_id: str, provider: str) -> dict[str, Any]:
         if provider == "xai-oauth":
             return {
-                "connected": True,
                 "email": "analyst@dalton.fund",
                 "plan_type": "supergrok",
                 "expires_at": expires_dt,
             }
-        return {"connected": False}
+        return None
 
     monkeypatch.setattr(
         oauth_tokens_db,
-        "get_oauth_status",
-        create_autospec(oauth_tokens_db.get_oauth_status, side_effect=_fake_oauth_status),
+        "get_oauth_connection",
+        create_autospec(oauth_tokens_db.get_oauth_connection, side_effect=_fake_oauth_connection),
     )
     mock_get_valid_token = create_autospec(
         xai_oauth_mod.get_valid_token,

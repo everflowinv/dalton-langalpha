@@ -47,14 +47,22 @@ from src.dalton.llm.providers.xai_grok.oauth import (
 )
 from src.server.database.oauth_tokens import (
     delete_oauth_tokens,
-    get_oauth_status,
+    get_oauth_connection,
     invalidate_oauth_active_cache,
 )
+from src.server.models.oauth import OAuthStatus
 from src.server.utils.api import CurrentUserId
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1/oauth", tags=["Dalton OAuth"])
+
+
+async def _dalton_oauth_status(user_id: str, provider: str) -> dict:
+    """The connection's status in the unified projection: ``state`` says
+    connected / needs_reauth / disconnected, so availability is judged by
+    state, never by the presence of a token row."""
+    return OAuthStatus.from_row(await get_oauth_connection(user_id, provider)).model_dump()
 
 
 class AntigravityCallbackRequest(BaseModel):
@@ -145,13 +153,19 @@ async def muse_device_poll(user_id: CurrentUserId):
 
 @router.get("/muse/status")
 async def muse_status(user_id: CurrentUserId):
-    """Return connection status (no token decryption — fast check)."""
-    st = await get_oauth_status(user_id, MUSE_PROVIDER) or {"connected": False}
-    if st.get("connected"):
-        if is_invalidated_muse_token(st) or not is_minted_muse_token(st):
+    """Return connection status in the unified projection (no token decryption).
+
+    A stored row the Muse line itself refuses — an invalidated key or a legacy
+    un-minted OAuth token — reports ``needs_reauth`` with ``reconnect_required``,
+    not a working connection."""
+    row = await get_oauth_connection(user_id, MUSE_PROVIDER)
+    st = OAuthStatus.from_row(row).model_dump()
+    if st.get("state") == "connected":
+        if row and (is_invalidated_muse_token(row) or not is_minted_muse_token(row)):
             return {
                 **st,
                 "connected": False,
+                "state": "needs_reauth",
                 "reconnect_required": True,
                 "message": "请重新连接 Muse",
             }
@@ -214,12 +228,12 @@ async def antigravity_poll(user_id: CurrentUserId):
     """Poll for loopback-callback completion."""
     try:
         if await antigravity_check_login_complete(user_id):
-            status = await get_oauth_status(user_id, ANTIGRAVITY_PROVIDER)
+            status = await get_oauth_connection(user_id, ANTIGRAVITY_PROVIDER)
             logger.info(f"[oauth] Antigravity connected for user_id={user_id}")
             return {
                 "success": True,
-                "email": status.get("email"),
-                "plan_type": status.get("plan_type"),
+                "email": (status or {}).get("email"),
+                "plan_type": (status or {}).get("plan_type"),
             }
         return {"pending": True}
     except Exception as e:
@@ -242,7 +256,7 @@ async def antigravity_callback(user_id: CurrentUserId, body: AntigravityCallback
 @router.get("/antigravity/status")
 async def antigravity_status(user_id: CurrentUserId):
     """Return connection status (no token decryption — fast check)."""
-    return await get_oauth_status(user_id, ANTIGRAVITY_PROVIDER)
+    return await _dalton_oauth_status(user_id, ANTIGRAVITY_PROVIDER)
 
 
 @router.delete("/antigravity")
@@ -391,7 +405,7 @@ async def xai_device_poll(user_id: CurrentUserId):
 @router.get("/xai/status")
 async def xai_status(user_id: CurrentUserId):
     """Return xAI connection status (no token decryption — fast check)."""
-    return await get_oauth_status(user_id, XAI_PROVIDER)
+    return await _dalton_oauth_status(user_id, XAI_PROVIDER)
 
 
 @router.delete("/xai")

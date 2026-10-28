@@ -1,4 +1,4 @@
-import { useMemo } from 'react';
+import { useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useQuery } from '@tanstack/react-query';
 import { useLocale } from '@/hooks/useLocale';
@@ -7,7 +7,13 @@ import { shortMonthDay, shortWeekday } from '@/lib/format';
 import { localDateStr } from '@/lib/utils';
 import { CalendarDays } from 'lucide-react';
 import { SwapCell } from '@/components/ui/crossfade';
-import { getEarningsCalendar } from '../../utils/api';
+import { getEarningsCalendar, type EarningsScope } from '../../utils/api';
+// DALTON-HOOK(user-coverage): per-user coverage earnings — scope tabs, user-isolated cache, badges, 90-day view
+import {
+  EarningsScopeTabs,
+  UserEarningsBadges,
+  useEarningsCalendarQuery,
+} from '../../components/dalton/UserEarningsCalendar';
 import { registerWidget } from '../framework/WidgetRegistry';
 import { useWidgetContextExport } from '../framework/contextSnapshot';
 import { serializeRowsToMarkdown, wrapWidgetContext } from '../framework/snapshotSerializers';
@@ -79,10 +85,14 @@ function EarningsRow({
   item,
   bucket,
   instanceId,
+  showDate = false,
 }: {
   item: EarningsEntry;
   bucket: BucketKey;
   instanceId: string;
+  /** The 90-day view: show the row's own date instead of the bucket label.
+   *  DALTON-HOOK(user-coverage) */
+  showDate?: boolean;
 }) {
   const { t } = useTranslation();
   const locale = useLocale();
@@ -90,11 +100,14 @@ function EarningsRow({
   // weekday/short-month string. Translate the today/tomorrow shortcuts so
   // they swap with locale; the others come from native Intl.DateTimeFormat.
   const raw = formatDateRight(item.date, bucket, locale);
-  const label = raw === 'Today'
-    ? t('dashboard.widgets.earningsCalendar.bucket_today')
-    : raw === 'Tomorrow'
-      ? t('dashboard.widgets.earningsCalendar.bucket_tomorrow')
-      : raw;
+  // DALTON-HOOK(user-coverage): the 90-day view swaps the bucket label for the date.
+  const label = showDate
+    ? shortMonthDay(toDate(item.date), locale)
+    : raw === 'Today'
+      ? t('dashboard.widgets.earningsCalendar.bucket_today')
+      : raw === 'Tomorrow'
+        ? t('dashboard.widgets.earningsCalendar.bucket_tomorrow')
+        : raw;
   return (
     <div
       className="row-attach-host group relative flex items-center gap-3 px-2 py-2 rounded-md border border-transparent transition-colors"
@@ -127,10 +140,12 @@ function EarningsRow({
           {item.symbol}
         </span>
         <span
-          className="text-[0.6563rem] truncate"
+          className="text-[0.6563rem] truncate flex items-center gap-1.5"
           style={{ color: 'var(--color-text-tertiary)' }}
         >
-          {item.companyName || item.symbol}
+          <span className="truncate">{item.companyName || item.symbol}</span>
+          {/* DALTON-HOOK(user-coverage): tier/status/timing badges on coverage rows */}
+          <UserEarningsBadges item={item} />
         </span>
       </div>
       <span
@@ -198,6 +213,10 @@ function BucketSection({
 function EarningsCalendarWidget({ instance }: WidgetRenderProps<EarningsConfig>) {
   const { t } = useTranslation();
   const windowDays = WINDOW_DAYS[instance.config.window ?? '2w'];
+  // DALTON-HOOK(user-coverage): "mine / market" scope tabs; "mine" is the default.
+  const [scope, setScope] = useState<EarningsScope>('mine');
+  // The 90-day flat view of the user's own coverage rows.
+  const [next90, setNext90] = useState(false);
 
   // Use local dates end-to-end: the `from`/`to` we send must match the same
   // day the user's clock is on, or the >= todayStr filter below will drop
@@ -208,7 +227,10 @@ function EarningsCalendarWidget({ instance }: WidgetRenderProps<EarningsConfig>)
   const todayStr = localDateStr(now);
   const toStr = localDateStr(now + windowDays * 86_400_000);
 
-  const { data: earnings = [], isLoading: loading } = useQuery<EarningsEntry[]>({
+  // Market scope keeps the window-based calendar query; "mine" reads the
+  // user's coverage calendar through its own user-isolated cache key
+  // (scope + user + window), so switching tabs never races another user's rows.
+  const market = useQuery<EarningsEntry[]>({
     queryKey: ['earnings-calendar', todayStr, toStr],
     queryFn: async () => {
       const result = await getEarningsCalendar({ from: todayStr, to: toStr });
@@ -218,6 +240,18 @@ function EarningsCalendarWidget({ instance }: WidgetRenderProps<EarningsConfig>)
     },
     staleTime: 5 * 60_000,
   });
+  const mine = useEarningsCalendarQuery('mine', now); // DALTON-HOOK(user-coverage)
+
+  const earnings = scope === 'mine' ? mine.data ?? [] : market.data ?? [];
+  const loading = scope === 'mine' ? mine.isLoading : market.isLoading;
+
+  const next90Items = useMemo(
+    () =>
+      (mine.data ?? [])
+        .filter((e) => e.date >= todayStr && e.date <= localDateStr(now + 90 * 86_400_000))
+        .sort((a, b) => a.date.localeCompare(b.date)),
+    [mine.data, todayStr, now]
+  );
 
   const upcoming = useMemo(
     () =>
@@ -241,6 +275,10 @@ function EarningsCalendarWidget({ instance }: WidgetRenderProps<EarningsConfig>)
     return buckets;
   }, [upcoming, now]);
 
+  // What the body lists: the 90-day flat view when toggled on "mine",
+  // otherwise the window buckets. (DALTON-HOOK(user-coverage))
+  const shownRows = next90 && scope === 'mine' ? next90Items : upcoming;
+
   useWidgetContextExport(instance.id, {
     full: () => {
       const sections: string[] = [];
@@ -258,9 +296,10 @@ function EarningsCalendarWidget({ instance }: WidgetRenderProps<EarningsConfig>)
       const body = sections.length
         ? sections.join('\n').trimEnd()
         : `_no upcoming earnings in next ${windowDays}d_`;
+      // DALTON-HOOK(user-coverage): the export names the scope it was read under.
       const text = wrapWidgetContext(
         'calendar.earnings',
-        { window_days: windowDays, count: upcoming.length, from: todayStr, to: toStr },
+        { window_days: windowDays, count: upcoming.length, from: todayStr, to: toStr, scope },
         body,
       );
       return {
@@ -270,7 +309,7 @@ function EarningsCalendarWidget({ instance }: WidgetRenderProps<EarningsConfig>)
         description: `next ${windowDays}d`,
         captured_at: new Date().toISOString(),
         text,
-        data: { window_days: windowDays, from: todayStr, to: toStr, counts, upcoming },
+        data: { window_days: windowDays, from: todayStr, to: toStr, scope, counts, upcoming },
       };
     },
     rows: (rowId: string) => {
@@ -318,15 +357,39 @@ function EarningsCalendarWidget({ instance }: WidgetRenderProps<EarningsConfig>)
             className="title-font text-lg leading-none dashboard-mono"
             style={{ color: 'var(--color-text-primary)' }}
           >
-            {upcoming.length}
+            {next90 && scope === 'mine' ? next90Items.length : upcoming.length}
           </span>
         </div>
-        <span
-          className="text-[0.625rem] uppercase tracking-wider shrink-0"
-          style={{ color: 'var(--color-text-tertiary)' }}
-        >
-          {t('dashboard.widgets.earningsCalendar.windowLabel', { days: windowDays })}
-        </span>
+        <div className="flex items-center gap-2 shrink-0">
+          {/* DALTON-HOOK(user-coverage): 90-day view of the user's coverage rows */}
+          {scope === 'mine' && (
+            <button
+              type="button"
+              onClick={() => setNext90((v) => !v)}
+              aria-pressed={next90}
+              className="text-[0.625rem] uppercase tracking-wider px-1.5 py-0.5 rounded transition-colors"
+              style={{
+                color: next90 ? 'var(--color-accent-primary)' : 'var(--color-text-tertiary)',
+                background: next90 ? 'var(--color-accent-soft)' : 'transparent',
+              }}
+            >
+              {t('dashboard.earningsCalendarCard.next90Days')}
+            </button>
+          )}
+          {!next90 && (
+            <span
+              className="text-[0.625rem] uppercase tracking-wider shrink-0"
+              style={{ color: 'var(--color-text-tertiary)' }}
+            >
+              {t('dashboard.widgets.earningsCalendar.windowLabel', { days: windowDays })}
+            </span>
+          )}
+        </div>
+      </div>
+
+      {/* DALTON-HOOK(user-coverage): scope tabs ("mine" / "all market") */}
+      <div className="mb-2">
+        <EarningsScopeTabs scope={scope} onScopeChange={(s) => { setScope(s); setNext90(false); }} />
       </div>
 
       <div className="flex-1 min-h-0 overflow-y-auto -mx-1 px-1">
@@ -334,10 +397,10 @@ function EarningsCalendarWidget({ instance }: WidgetRenderProps<EarningsConfig>)
             stands in the middle of the widget, so its layer takes the height. */}
         <SwapCell
           as="div"
-          className={!loading && upcoming.length === 0 ? 'h-full' : 'items-start'}
-          swapKey={loading && upcoming.length === 0 ? 'loading' : 'ready'}
+          className={!loading && shownRows.length === 0 ? 'h-full' : 'items-start'}
+          swapKey={loading && shownRows.length === 0 ? 'loading' : 'ready'}
         >
-          {loading && upcoming.length === 0 ? (
+          {loading && shownRows.length === 0 ? (
             <div className="space-y-1.5 py-1">
               {Array.from({ length: 5 }).map((_, i) => (
                 <div
@@ -350,7 +413,7 @@ function EarningsCalendarWidget({ instance }: WidgetRenderProps<EarningsConfig>)
                 />
               ))}
             </div>
-          ) : upcoming.length === 0 ? (
+          ) : shownRows.length === 0 ? (
             <div className="h-full flex flex-col items-center justify-center gap-3 py-6">
               <div
                 className="h-9 w-9 rounded-full flex items-center justify-center"
@@ -363,24 +426,45 @@ function EarningsCalendarWidget({ instance }: WidgetRenderProps<EarningsConfig>)
                   className="dashboard-mono text-sm mb-0.5"
                   style={{ color: 'var(--color-text-primary)' }}
                 >
-                  {t('dashboard.widgets.earningsCalendar.empty')}
+                  {/* DALTON-HOOK(user-coverage): per-scope empty copy — "mine" has
+                      no coverage rows, the market window simply has none. */}
+                  {scope === 'mine'
+                    ? t('dashboard.earningsCalendarCard.emptyData')
+                    : t('dashboard.widgets.earningsCalendar.empty')}
                 </div>
-                <div
-                  className="text-[0.6875rem]"
-                  style={{ color: 'var(--color-text-tertiary)' }}
-                >
-                  {t('dashboard.widgets.earningsCalendar.emptyHint', { days: windowDays })}
-                </div>
+                {scope !== 'mine' && (
+                  <div
+                    className="text-[0.6875rem]"
+                    style={{ color: 'var(--color-text-tertiary)' }}
+                  >
+                    {t('dashboard.widgets.earningsCalendar.emptyHint', { days: windowDays })}
+                  </div>
+                )}
               </div>
             </div>
           ) : (
-            <div className="flex flex-col gap-3">
-              <BucketSection label={t(BUCKET_KEY.today)} items={grouped.today} bucket="today" instanceId={instance.id} />
-              <BucketSection label={t(BUCKET_KEY.tomorrow)} items={grouped.tomorrow} bucket="tomorrow" instanceId={instance.id} />
-              <BucketSection label={t(BUCKET_KEY.week)} items={grouped.week} bucket="week" instanceId={instance.id} />
-              <BucketSection label={t(BUCKET_KEY.next)} items={grouped.next} bucket="next" instanceId={instance.id} />
-              <BucketSection label={t(BUCKET_KEY.later)} items={grouped.later} bucket="later" instanceId={instance.id} />
-            </div>
+            next90 && scope === 'mine' ? (
+              /* DALTON-HOOK(user-coverage): flat 90-day view, one dated row each */
+              <div className="flex flex-col">
+                {next90Items.map((item, i) => (
+                  <EarningsRow
+                    key={`${item.symbol}-${item.date}-${i}`}
+                    item={item}
+                    bucket="later"
+                    instanceId={instance.id}
+                    showDate
+                  />
+                ))}
+              </div>
+            ) : (
+              <div className="flex flex-col gap-3">
+                <BucketSection label={t(BUCKET_KEY.today)} items={grouped.today} bucket="today" instanceId={instance.id} />
+                <BucketSection label={t(BUCKET_KEY.tomorrow)} items={grouped.tomorrow} bucket="tomorrow" instanceId={instance.id} />
+                <BucketSection label={t(BUCKET_KEY.week)} items={grouped.week} bucket="week" instanceId={instance.id} />
+                <BucketSection label={t(BUCKET_KEY.next)} items={grouped.next} bucket="next" instanceId={instance.id} />
+                <BucketSection label={t(BUCKET_KEY.later)} items={grouped.later} bucket="later" instanceId={instance.id} />
+              </div>
+            )
           )}
         </SwapCell>
       </div>

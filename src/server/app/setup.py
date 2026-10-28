@@ -1312,6 +1312,7 @@ app.add_exception_handler(SandboxTransientError, _sandbox_failure_handler)
 app.add_exception_handler(SSHConnectError, _sandbox_failure_handler)
 
 
+
 # ============================================================================
 # Router Registration
 # ============================================================================
@@ -1341,7 +1342,7 @@ from src.server.app.sec_proxy import router as sec_proxy_router
 from src.server.app.api_keys import router as api_keys_router
 from src.server.app.automations import router as automations_router
 from src.server.app.insights import router as insights_router
-from src.server.app.oauth import router as oauth_router
+from src.server.app.oauth import OAuthRefusal, router as oauth_router
 from src.server.app.orders import router as orders_router
 from src.server.app.public import router as public_router
 from src.server.app.share_links import (
@@ -1436,6 +1437,19 @@ app.include_router(
 )  # /api/v1/automations/* - Scheduled automation triggers
 app.include_router(insights_router)  # /api/v1/insights/* - AI market insights
 app.include_router(oauth_router)  # /api/v1/oauth/* - OAuth provider connections (Codex)
+
+
+# OAuth refusals carry a structured ``error`` beside the plain ``detail``.
+async def _oauth_refusal_handler(request: Request, exc: OAuthRefusal) -> JSONResponse:
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail, "error": exc.error},
+        headers=exc.headers,
+    )
+
+
+app.add_exception_handler(OAuthRefusal, _oauth_refusal_handler)
+
 app.include_router(
     orders_router
 )  # /api/v1/orders/* - Order attempt ledger (read-only, user-scoped)

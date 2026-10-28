@@ -29,6 +29,10 @@ _MODEL_LITERAL_RE = re.compile(
 # Every entry here is a provider ID, a family/broker prefix pattern (ending with '-' or '-oauth'),
 # or an OAuth CLI User-Agent string — never a concrete model name.
 HARDCODED_LITERAL_ALLOWLIST: dict[tuple[str, str], str] = {
+    # The two Grok keys Dalton pins to its own xai-oauth line
+    # (PINNED_OVERLAY_MODEL_KEYS; upstream grew same-named entries on grok-oauth).
+    ("llm/overlay.py", "grok-4.7-oauth"): "Pinned overlay route key",
+    ("llm/overlay.py", "grok-4.3-oauth"): "Pinned overlay route key",
     # Provider IDs (OAuth and API providers)
     ("app/oauth.py", "antigravity-oauth"): "OAuth provider identifier in router table",
     ("app/oauth.py", "claude-oauth"): "OAuth provider identifier in router table",

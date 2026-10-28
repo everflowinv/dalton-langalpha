@@ -62,9 +62,7 @@ interface NewsFallback {
 interface NewsDetailModalProps {
   newsId: string | null;
   onClose: () => void;
-  /** Legacy (Classic dashboard): URL-only fallback for the empty state. */
-  fallbackUrl?: string | null;
-  /** Rich fallback from the clicked row — preferred. */
+  /** The clicked row, drawn while (or instead of) the article loads. */
   fallback?: NewsFallback | null;
 }
 
@@ -163,7 +161,6 @@ function NewsBody({
   article,
   loading,
   fetchFailed,
-  fallbackUrl,
   expandedSentiment,
   setExpandedSentiment,
   isMobile,
@@ -172,7 +169,6 @@ function NewsBody({
   article: Article | null;
   loading: boolean;
   fetchFailed?: boolean;
-  fallbackUrl?: string | null;
   expandedSentiment: number | null;
   setExpandedSentiment: React.Dispatch<React.SetStateAction<number | null>>;
   isMobile: boolean;
@@ -182,7 +178,6 @@ function NewsBody({
   const { t: trans } = useTranslation();
   const locale = useLocale();
   const sentimentBackdrop = useBackdropDismiss<HTMLDivElement>(() => setExpandedSentiment(null));
-  const safeFallbackUrl = safeHttpUrl(fallbackUrl);
   const safeArticleUrl = safeHttpUrl(article?.article_url);
   if (loading && !article) {
     return (
@@ -198,21 +193,6 @@ function NewsBody({
         <p style={{ color: 'var(--color-text-secondary)' }}>
           {fetchFailed ? 'Article details not available' : 'Article not found'}
         </p>
-        {fetchFailed && safeFallbackUrl && (
-          <a
-            href={safeFallbackUrl}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg text-sm font-medium transition-colors"
-            style={{
-              backgroundColor: 'var(--color-btn-primary-bg)',
-              color: 'var(--color-btn-primary-text)',
-            }}
-          >
-            Open article
-            <ExternalLink size={14} />
-          </a>
-        )}
       </div>
     );
   }
@@ -539,7 +519,7 @@ function NewsBody({
   );
 }
 
-function NewsDetailModal({ newsId, onClose, fallbackUrl, fallback }: NewsDetailModalProps) {
+function NewsDetailModal({ newsId, onClose, fallback }: NewsDetailModalProps) {
   const { t } = useTranslation();
   const { toast } = useToast();
   const [article, setArticle] = useState<Article | null>(null);
@@ -584,8 +564,8 @@ function NewsDetailModal({ newsId, onClose, fallbackUrl, fallback }: NewsDetailM
       return;
     }
 
-    // Optional enrichment: rows without an inlined body (or the Classic
-    // dashboard's URL-only path) still fetch the full article by id.
+    // Optional enrichment: rows without an inlined body still fetch the full
+    // article by id.
     setLoading(true);
     getNewsArticle(newsId)
       .then((data) => {
@@ -632,7 +612,6 @@ function NewsDetailModal({ newsId, onClose, fallbackUrl, fallback }: NewsDetailM
       article={article}
       loading={loading}
       fetchFailed={fetchFailed}
-      fallbackUrl={fallbackUrl}
       expandedSentiment={expandedSentiment}
       setExpandedSentiment={setExpandedSentiment}
       isMobile={isMobile}

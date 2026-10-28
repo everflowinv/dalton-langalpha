@@ -8,7 +8,7 @@ import { easeInOut, useSceneTime } from './clock';
 import { Typed, pointerScript } from './kit';
 import type { IntroScene } from './types';
 import { WATCH, DashPage, PAD, PAGE_W, Floating, Composer, Widget } from './dashboardParts';
-import { WatchRow, NEWS, NewsRow, AddSymbol } from './dashboardClassic';
+import { WatchRow, NEWS, NewsRow, AddSymbol } from './dashboardPage';
 
 /* The dashboard intro's last scene: clipping a row into the chat's context.
    Drawn after its real counterpart under pages/Dashboard (row paperclip,
@@ -194,7 +194,7 @@ function DashboardAttach() {
           </Widget>
           <Widget
             icon={Eye}
-            title={tr('dashboard.widgets.watchlist.header')}
+            title={tr('dashboard.widgets.portfolioWatchlist.headerWatchlist')}
             count="5"
             delay={0.24}
             className="flex-1"

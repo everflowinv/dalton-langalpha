@@ -382,152 +382,6 @@
       "write": "parameters.thinking_level"
     }
   },
-  "gpt-oss-120b": {
-    "model_id": "gpt-oss-120b",
-    "provider": "vllm",
-    "display_name": "gpt-oss-120b",
-    "input_modalities": [
-      "text"
-    ],
-    "reasoning": {
-      "efforts": [
-        "low",
-        "medium",
-        "high"
-      ],
-      "default": "low",
-      "write": "parameters.reasoning_effort"
-    }
-  },
-  "gpt-oss-20b": {
-    "model_id": "gpt-oss-20b",
-    "provider": "vllm",
-    "display_name": "gpt-oss-20b",
-    "input_modalities": [
-      "text"
-    ],
-    "reasoning": {
-      "efforts": [
-        "low",
-        "medium",
-        "high"
-      ],
-      "default": "low",
-      "write": "parameters.reasoning_effort"
-    }
-  },
-  "gpt-oss-20b-safe-groq": {
-    "model_id": "openai/gpt-oss-safeguard-20b",
-    "provider": "openrouter",
-    "display_name": "gpt-oss-20b Safe",
-    "parameters": {
-      "use_previous_response_id": false,
-      "extra_body": {
-        "provider": {
-          "order": [
-            "Groq"
-          ],
-          "allow_fallbacks": true
-        }
-      }
-    },
-    "input_modalities": [
-      "text"
-    ],
-    "reasoning": {
-      "efforts": [
-        "low",
-        "medium",
-        "high"
-      ],
-      "default": "low",
-      "write": "parameters.reasoning_effort"
-    }
-  },
-  "gpt-oss-20b-deepinfra": {
-    "model_id": "openai/gpt-oss-20b",
-    "provider": "deepinfra",
-    "display_name": "gpt-oss-20b",
-    "parameters": {
-      "use_previous_response_id": false,
-      "extra_body": {
-        "provider": {
-          "order": [
-            "DeepInfra"
-          ],
-          "allow_fallbacks": false
-        }
-      }
-    },
-    "input_modalities": [
-      "text"
-    ],
-    "reasoning": {
-      "efforts": [
-        "low",
-        "medium",
-        "high"
-      ],
-      "default": "low",
-      "write": "parameters.reasoning_effort"
-    }
-  },
-  "gpt-oss-safeguard-20b-deepinfra": {
-    "model_id": "openai/gpt-oss-safeguard-20b",
-    "provider": "deepinfra",
-    "display_name": "gpt-oss-safeguard-20b",
-    "parameters": {
-      "use_previous_response_id": false,
-      "extra_body": {
-        "provider": {
-          "order": [
-            "DeepInfra"
-          ],
-          "allow_fallbacks": false
-        }
-      }
-    },
-    "input_modalities": [
-      "text"
-    ],
-    "reasoning": {
-      "efforts": [
-        "low",
-        "medium",
-        "high"
-      ],
-      "default": "low",
-      "write": "parameters.reasoning_effort"
-    }
-  },
-  "gpt-oss-120b-groq": {
-    "model_id": "openai/gpt-oss-120b",
-    "provider": "openrouter",
-    "display_name": "gpt-oss-120b",
-    "parameters": {
-      "use_previous_response_id": false,
-      "extra_body": {
-        "provider": {
-          "order": [
-            "Groq"
-          ],
-          "allow_fallbacks": true
-        }
-      }
-    },
-    "input_modalities": [
-      "text"
-    ],
-    "reasoning": {
-      "efforts": [
-        "low",
-        "medium",
-        "high"
-      ],
-      "default": "low",
-      "write": "parameters.reasoning_effort"
-    }
-  },
   "deepseek-flash": {
     "model_id": "deepseek-flash",
     "provider": "deepseek",
@@ -1018,7 +872,10 @@
     "model_id": "gpt-5.3-codex-spark",
     "provider": "codex-oauth",
     "display_name": "GPT-5.3 Codex Spark (OAuth)",
-    "oauth_plans": ["pro", "prolite"],
+    "oauth_plans": [
+      "pro",
+      "prolite"
+    ],
     "visible": true,
     "speed": 5,
     "intelligence": 3,
@@ -1190,6 +1047,318 @@
       ],
       "default": "medium",
       "write": "parameters.reasoning.effort"
+    }
+  },
+  "grok-4.7": {
+    "model_id": "grok-4.7",
+    "provider": "xai",
+    "display_name": "Grok 4.7",
+    "visible": true,
+    "speed": 3,
+    "intelligence": 5,
+    "context": 500000,
+    "input_modalities": [
+      "text",
+      "image"
+    ],
+    "parameters": {
+      "reasoning": {
+        "summary": "auto"
+      },
+      "include": [
+        "reasoning.encrypted_content"
+      ],
+      "store": false
+    },
+    "reasoning": {
+      "efforts": [
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh"
+      ],
+      "default": "medium",
+      "write": "parameters.reasoning.effort"
+    }
+  },
+  "grok-4.6": {
+    "model_id": "grok-4.6",
+    "provider": "xai",
+    "display_name": "Grok 4.6",
+    "visible": true,
+    "speed": 3,
+    "intelligence": 4,
+    "context": 500000,
+    "input_modalities": [
+      "text",
+      "image"
+    ],
+    "parameters": {
+      "reasoning": {
+        "summary": "auto"
+      },
+      "include": [
+        "reasoning.encrypted_content"
+      ],
+      "store": false
+    },
+    "reasoning": {
+      "efforts": [
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh"
+      ],
+      "default": "medium",
+      "write": "parameters.reasoning.effort"
+    }
+  },
+  "grok-4.5": {
+    "model_id": "grok-4.5",
+    "provider": "xai",
+    "display_name": "Grok 4.5",
+    "visible": true,
+    "speed": 3,
+    "intelligence": 4,
+    "context": 500000,
+    "input_modalities": [
+      "text",
+      "image"
+    ],
+    "parameters": {
+      "reasoning": {
+        "summary": "auto"
+      },
+      "include": [
+        "reasoning.encrypted_content"
+      ],
+      "store": false
+    },
+    "reasoning": {
+      "efforts": [
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh"
+      ],
+      "default": "medium",
+      "write": "parameters.reasoning.effort"
+    }
+  },
+  "grok-4.3": {
+    "model_id": "grok-4.3",
+    "provider": "xai",
+    "display_name": "Grok 4.3",
+    "visible": true,
+    "speed": 4,
+    "intelligence": 3,
+    "context": 1000000,
+    "compaction_profile": "expansive",
+    "input_modalities": [
+      "text",
+      "image"
+    ],
+    "parameters": {
+      "reasoning": {
+        "summary": "auto"
+      },
+      "include": [
+        "reasoning.encrypted_content"
+      ],
+      "store": false
+    },
+    "reasoning": {
+      "efforts": [
+        "none",
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh"
+      ],
+      "default": "medium",
+      "write": "parameters.reasoning.effort"
+    }
+  },
+  "grok-build": {
+    "model_id": "grok-build-0.1",
+    "provider": "xai",
+    "display_name": "Grok Build",
+    "visible": true,
+    "speed": 5,
+    "intelligence": 3,
+    "context": 256000,
+    "input_modalities": [
+      "text",
+      "image"
+    ],
+    "parameters": {
+      "reasoning": {
+        "summary": "auto"
+      },
+      "include": [
+        "reasoning.encrypted_content"
+      ],
+      "store": false
+    }
+  },
+  "grok-4.7-oauth": {
+    "model_id": "grok-4.7",
+    "provider": "grok-oauth",
+    "display_name": "Grok 4.7 (OAuth)",
+    "visible": true,
+    "speed": 3,
+    "intelligence": 5,
+    "context": 500000,
+    "input_modalities": [
+      "text",
+      "image"
+    ],
+    "parameters": {
+      "reasoning": {
+        "summary": "auto"
+      },
+      "include": [
+        "reasoning.encrypted_content"
+      ],
+      "store": false
+    },
+    "reasoning": {
+      "efforts": [
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh"
+      ],
+      "default": "medium",
+      "write": "parameters.reasoning.effort"
+    }
+  },
+  "grok-4.6-oauth": {
+    "model_id": "grok-4.6",
+    "provider": "grok-oauth",
+    "display_name": "Grok 4.6 (OAuth)",
+    "visible": true,
+    "speed": 3,
+    "intelligence": 4,
+    "context": 500000,
+    "input_modalities": [
+      "text",
+      "image"
+    ],
+    "parameters": {
+      "reasoning": {
+        "summary": "auto"
+      },
+      "include": [
+        "reasoning.encrypted_content"
+      ],
+      "store": false
+    },
+    "reasoning": {
+      "efforts": [
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh"
+      ],
+      "default": "medium",
+      "write": "parameters.reasoning.effort"
+    }
+  },
+  "grok-4.5-oauth": {
+    "model_id": "grok-4.5",
+    "provider": "grok-oauth",
+    "display_name": "Grok 4.5 (OAuth)",
+    "visible": true,
+    "speed": 3,
+    "intelligence": 4,
+    "context": 500000,
+    "input_modalities": [
+      "text",
+      "image"
+    ],
+    "parameters": {
+      "reasoning": {
+        "summary": "auto"
+      },
+      "include": [
+        "reasoning.encrypted_content"
+      ],
+      "store": false
+    },
+    "reasoning": {
+      "efforts": [
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh"
+      ],
+      "default": "medium",
+      "write": "parameters.reasoning.effort"
+    }
+  },
+  "grok-4.3-oauth": {
+    "model_id": "grok-4.3",
+    "provider": "grok-oauth",
+    "display_name": "Grok 4.3 (OAuth)",
+    "visible": true,
+    "speed": 4,
+    "intelligence": 3,
+    "context": 1000000,
+    "compaction_profile": "expansive",
+    "input_modalities": [
+      "text",
+      "image"
+    ],
+    "parameters": {
+      "reasoning": {
+        "summary": "auto"
+      },
+      "include": [
+        "reasoning.encrypted_content"
+      ],
+      "store": false
+    },
+    "reasoning": {
+      "efforts": [
+        "none",
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh"
+      ],
+      "default": "medium",
+      "write": "parameters.reasoning.effort"
+    }
+  },
+  "grok-build-oauth": {
+    "model_id": "grok-build-0.1",
+    "provider": "grok-oauth",
+    "display_name": "Grok Build (OAuth)",
+    "visible": true,
+    "speed": 5,
+    "intelligence": 3,
+    "context": 256000,
+    "input_modalities": [
+      "text",
+      "image"
+    ],
+    "parameters": {
+      "reasoning": {
+        "summary": "auto"
+      },
+      "include": [
+        "reasoning.encrypted_content"
+      ],
+      "store": false
     }
   },
   "claude-fable-5-1-oauth": {

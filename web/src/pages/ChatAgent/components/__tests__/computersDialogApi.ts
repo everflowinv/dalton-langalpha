@@ -7,7 +7,7 @@ import { vi } from 'vitest';
  * Its own module, since the factory runs while the dialog's imports resolve.
  */
 export async function computersApi() {
-  const errors = await vi.importActual<typeof import('../../utils/api/errors')>('../../utils/api/errors');
+  const errors = await vi.importActual<typeof import('@/api/errors')>('@/api/errors');
   return {
     getComputers: vi.fn(),
     getComputerProviders: vi.fn(),

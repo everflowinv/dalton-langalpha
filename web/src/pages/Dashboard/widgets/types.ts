@@ -91,12 +91,11 @@ export interface RGLItem {
 export type BreakpointKey = 'lg' | 'md';
 
 export interface DashboardPrefs {
-  version: 1;
-  mode: 'classic' | 'custom';
+  version: 2;
   widgets: WidgetInstance[];
   layouts: Partial<Record<BreakpointKey, RGLItem[]>>;
   lastBreakpoint?: BreakpointKey;
   history?: Array<{ widgets: WidgetInstance[]; layouts: Partial<Record<BreakpointKey, RGLItem[]>> }>;
 }
 
-export const DASHBOARD_PREFS_VERSION = 1 as const;
+export const DASHBOARD_PREFS_VERSION = 2 as const;

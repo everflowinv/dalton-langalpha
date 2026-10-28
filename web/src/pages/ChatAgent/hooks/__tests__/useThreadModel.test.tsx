@@ -40,6 +40,8 @@ vi.mock('@/hooks/useSlotDefaultModels', () => ({
   useDefaultModel: () => mocks.defaultModel,
 }));
 
+// No sign-in has lapsed here; that hint has its own test.
+vi.mock('@/hooks/useLapsedSignIn', () => ({ useLapsedSignIn: () => () => null }));
 vi.mock('@/hooks/useAllModels', () => ({
   useAllModels: () => ({ catalogModelNames: mocks.catalogModelNames }),
 }));

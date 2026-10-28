@@ -22,7 +22,6 @@ import iconOpenrouter from '@/assets/providers/openrouter.svg';
 import iconZai from '@/assets/providers/z-ai.svg';
 import iconMinimax from '@/assets/providers/minimax.svg';
 import iconQwen from '@/assets/providers/qwen.svg';
-import iconDoubao from '@/assets/providers/doubao.svg';
 import iconKimi from '@/assets/providers/kimi.svg';
 import iconDeepseek from '@/assets/providers/deepseek.svg';
 import iconGroq from '@/assets/providers/groq.svg';
@@ -30,6 +29,7 @@ import iconCerebras from '@/assets/providers/cerebras.svg';
 import iconOllama from '@/assets/providers/ollama.svg';
 import iconLmStudio from '@/assets/providers/lmstudio.svg';
 import iconVllm from '@/assets/providers/vllm.svg';
+import iconXai from '@/assets/providers/xai.svg';
 
 export type BrandArt = {
   src: string;
@@ -48,7 +48,7 @@ export type BrandArt = {
  * since every surface here gives it a ground of its own (the subagent badge's
  * white disc, a provider card) and a square inside that reads as a blot at
  * badge size. A family's own mark stands in where its models are what people
- * know (Gemini, Qwen, Doubao, Kimi).
+ * know (Gemini, Qwen, Kimi).
  */
 const mark = (src: string, ink = false): BrandArt => ({ src, ink, bare: true });
 
@@ -58,8 +58,8 @@ const OPENROUTER = mark(iconOpenrouter, true);
 const ZAI = mark(iconZai, true);
 const MINIMAX = mark(iconMinimax);
 const QWEN = mark(iconQwen);
-const DOUBAO = mark(iconDoubao);
 const KIMI = mark(iconKimi, true);
+const XAI = mark(iconXai, true);
 
 /** Every manifest provider and its variants, which wear their parent's mark. */
 const LLM_PROVIDER_ART: Record<string, BrandArt> = {
@@ -67,12 +67,14 @@ const LLM_PROVIDER_ART: Record<string, BrandArt> = {
   'codex-oauth': OPENAI,
   anthropic: ANTHROPIC,
   'claude-oauth': ANTHROPIC,
-  // DALTON-HOOK(native-oauth-ui): P0N.3 Antigravity brand icon
+  // DALTON-HOOK(native-oauth-ui): P0N.3 Dalton provider brand icons. Muse has
+  // no icon asset and falls back to its initials; xai-oauth wears xAI's mark.
   'antigravity-oauth': mark(iconGemini),
+  'xai-oauth': XAI,
   gemini: mark(iconGemini),
+  xai: XAI,
+  'grok-oauth': XAI,
   openrouter: OPENROUTER,
-  // Served through an OpenRouter key, routed to DeepInfra.
-  deepinfra: OPENROUTER,
   'z-ai': ZAI,
   'z-ai-coding': ZAI,
   'z-ai-cn': ZAI,
@@ -81,8 +83,6 @@ const LLM_PROVIDER_ART: Record<string, BrandArt> = {
   'minimax-coding': MINIMAX,
   dashscope: QWEN,
   'dashscope-intl': QWEN,
-  volcengine: DOUBAO,
-  'doubao-coding': DOUBAO,
   moonshot: KIMI,
   'moonshot-coding': KIMI,
   deepseek: mark(iconDeepseek),

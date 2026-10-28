@@ -36,7 +36,7 @@ import {
   startComputer,
   stopComputer,
 } from '../utils/api';
-import { apiErrorObject, apiErrorReason } from '../utils/api/errors';
+import { apiErrorObject, apiErrorReason } from '@/api/errors';
 import { entitlementErrorMessage } from '../utils/entitlementErrors';
 import { releaseRemoteControl } from './useRemoteControl';
 import { tierLabel } from '../components/tierUi';

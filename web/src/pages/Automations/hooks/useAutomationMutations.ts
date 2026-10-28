@@ -4,7 +4,7 @@ import { toast } from '@/components/ui/use-toast';
 import { FAIL_FAST_OFFLINE } from '@/lib/network';
 import { queryKeys } from '@/lib/queryKeys';
 import type { AutomationPayload, AutomationUpdatePayload } from '@/types/automation';
-import { apiErrorStatus } from '@/pages/ChatAgent/utils/api/errors';
+import { apiErrorStatus } from '@/api/errors';
 import * as automationApi from '../utils/api';
 import { mutationErrorMessage } from '../utils/errors';
 

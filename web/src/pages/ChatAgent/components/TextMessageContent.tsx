@@ -8,7 +8,7 @@ import { useTranscriptDisplay } from '@/lib/transcriptDisplay';
 import { parseErrorMessage, type ParsedError } from '../utils/parseErrorMessage';
 import type { OpenFileHandler } from '../utils/fileLocation';
 import { UPSTREAM_HINT_I18N_KEY, type StructuredError } from '@/utils/rateLimitError';
-import { NoticeLine } from '@/components/ui/error-banner';
+import { ErrorLink, NoticeLine } from '@/components/ui/error-banner';
 
 interface TextMessageContentProps {
   content: string;
@@ -184,6 +184,16 @@ function StructuredErrorDisplay({ err }: StructuredErrorDisplayProps): React.Rea
         {err.message && (
           <div className="wrap-break-word" style={{ color: 'var(--color-text-tertiary)' }}>
             {err.message}
+          </div>
+        )}
+        {err.links && err.links.length > 0 && (
+          <div className="text-xs" style={{ color: 'var(--color-text-secondary)' }}>
+            {err.links.map((l, i) => (
+              <React.Fragment key={`${l.url}|${l.label}`}>
+                {i > 0 && <span aria-hidden="true"> · </span>}
+                <ErrorLink {...l} />
+              </React.Fragment>
+            ))}
           </div>
         )}
         {err.hints && err.hints.length > 0 && (

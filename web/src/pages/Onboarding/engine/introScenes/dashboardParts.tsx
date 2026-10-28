@@ -2,7 +2,6 @@ import type { CSSProperties, ReactNode } from 'react';
 import {
   GripVertical,
   HelpCircle,
-  LayoutGrid,
   MoreVertical,
   Pencil,
   Search,
@@ -191,47 +190,12 @@ export function Spark({
 
 /* ── page chrome ───────────────────────────────────────────────────────── */
 
-/** The Classic / Custom switch: a neutral segmented control, the active
-    side on the elevated fill. */
-function ModeToggle({ custom }: { custom: boolean }) {
-  const { t } = useTranslation();
-  const seg = (on: boolean): CSSProperties => ({
-    background: on ? 'var(--color-bg-elevated)' : 'transparent',
-    color: on ? 'var(--color-text-primary)' : 'var(--color-text-secondary)',
-    fontWeight: on ? 600 : 400,
-  });
-  const cls = 'flex items-center gap-[3px] rounded-[4px] px-1.5 py-[3px] text-[7px] leading-none';
-  return (
-    <span
-      className="flex items-center rounded-md border p-[1.5px]"
-      style={{ background: 'var(--color-bg-input)', borderColor: 'var(--color-border-muted)' }}
-    >
-      <span className={cn(cls, 'transition-colors duration-quick')} style={seg(!custom)}>
-        {t('dashboard.layoutToggle.classic')}
-      </span>
-      <span className={cn(cls, 'transition-colors duration-quick')} style={seg(custom)}>
-        <LayoutGrid className="h-[7px] w-[7px]" />
-        {t('dashboard.layoutToggle.custom')}
-      </span>
-    </span>
-  );
-}
-
 /**
- * The dashboard header: symbol search on the left, then the layout toggle,
- * the edit-layout pencil (Custom mode only; `pencil` keeps its slot so the
- * toggle holds still when it shows) and help. `edit` fills the pencil, as
- * edit mode does.
+ * The dashboard header: symbol search on the left, then the edit-layout
+ * pencil and help. `edit` fills the pencil, as edit mode does; `pressed` is
+ * its transform while a click holds it down.
  */
-export function DashTopbar({
-  custom = false,
-  pencil = false,
-  edit = false,
-}: {
-  custom?: boolean;
-  pencil?: boolean;
-  edit?: boolean;
-}) {
+export function DashTopbar({ edit = false, pressed }: { edit?: boolean; pressed?: string }) {
   const { t } = useTranslation();
   return (
     <>
@@ -257,22 +221,17 @@ export function DashTopbar({
         </span>
       </span>
       <span className="ml-auto flex items-center gap-1.5">
-        <ModeToggle custom={custom} />
-        {pencil && (
+        <span className="flex transition-transform duration-press" style={{ transform: pressed }}>
           <span
-            className={
-              'flex h-3.5 w-3.5 items-center justify-center rounded-[4px] transition-colors ' +
-              'duration-quick'
-            }
+            className="flex h-3.5 w-3.5 items-center justify-center rounded-[4px] transition-colors duration-quick"
             style={{
-              opacity: custom ? 1 : 0,
               background: edit ? 'var(--color-btn-primary-bg)' : 'transparent',
               color: edit ? 'var(--color-btn-primary-text)' : 'var(--color-text-secondary)',
             }}
           >
             <Pencil className="h-2 w-2" />
           </span>
-        )}
+        </span>
         <HelpCircle className="h-2.5 w-2.5" style={{ color: 'var(--color-text-secondary)' }} />
       </span>
     </>
@@ -349,7 +308,7 @@ export function Composer({
   );
 }
 
-/* ── custom widgets ────────────────────────────────────────────────────── */
+/* ── widgets ───────────────────────────────────────────────────────────── */
 
 /** Edit mode draws every widget in a dashed accent frame. */
 const EDIT_FRAME: CSSProperties = {
@@ -358,8 +317,8 @@ const EDIT_FRAME: CSSProperties = {
 };
 
 /**
- * A widget on the Custom grid. At rest it is the widget's own card: icon,
- * eyebrow and count over the body. In edit mode the frame takes over: a
+ * A widget on the grid. At rest it is the widget's own card: icon,
+ * eyebrow and count (and `aside` at the right end) over the body. In edit mode the frame takes over: a
  * dashed accent edge and a header with the drag grip, the title and the
  * widget menu.
  */
@@ -368,6 +327,7 @@ export function Widget({
   title,
   header = title,
   count,
+  aside,
   edit = false,
   delay,
   className,
@@ -380,6 +340,9 @@ export function Widget({
       title the edit frame shows. */
   header?: string;
   count?: string;
+  /** What the widget's own card shows at the header's right end (its tabs,
+      its window). */
+  aside?: ReactNode;
   edit?: boolean;
   delay?: number;
   className?: string;
@@ -430,6 +393,7 @@ export function Widget({
               {count}
             </span>
           )}
+          {aside && <span className="ml-auto flex shrink-0 items-center">{aside}</span>}
         </div>
       )}
       <div className={cn('flex min-h-0 flex-1 flex-col gap-1', edit && 'p-1.5')}>{children}</div>

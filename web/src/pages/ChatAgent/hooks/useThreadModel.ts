@@ -3,7 +3,9 @@ import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { toast } from '@/components/ui/use-toast';
 import { resolveComposerModel } from '@/components/ui/chat-input.models';
+import type { SubscriptionProvider } from '@/api/oauth';
 import { useAllModels } from '@/hooks/useAllModels';
+import { useLapsedSignIn } from '@/hooks/useLapsedSignIn';
 import { useDefaultModel } from '@/hooks/useSlotDefaultModels';
 import { useSeededModel } from '@/hooks/useSeededModel';
 import { modelLabel } from '@/lib/modelLabel';
@@ -21,6 +23,12 @@ const OFFER_DISMISSED_PREFIX = 'thread-model-offer-dismissed:';
 export interface RetiredModel {
   model: string;
   fallback: string;
+}
+
+/** The composer's model, on a subscription whose sign-in has to be renewed. */
+export interface LapsedSignIn {
+  model: string;
+  provider: SubscriptionProvider;
 }
 
 /** A pick the user may make the account default. */
@@ -61,6 +69,7 @@ export function useThreadModel({
   const queryClient = useQueryClient();
   const { catalogModelNames, metadata } = useAllModels();
   const defaultModel = useDefaultModel();
+  const lapsedOf = useLapsedSignIn();
   const liveThreadId = threadId && threadId !== '__default__' ? threadId : null;
 
   const { data: thread } = useQuery({
@@ -164,10 +173,12 @@ export function useThreadModel({
   const retired: RetiredModel | null = retiredName && defaultModel && retiredName !== defaultModel
     ? { model: retiredName, fallback: defaultModel }
     : null;
+  const lapsedProvider = lapsedOf(model);
+  const lapsed: LapsedSignIn | null = model && lapsedProvider ? { model, provider: lapsedProvider } : null;
   const offer: DefaultModelOffer | null = offered && offered === model && defaultModel && offered !== defaultModel
     ? { model: offered, defaultModel }
     : null;
 
   // DALTON-HOOK(colleague-dispatch): expose thread detail record so ChatView can inspect thread_user_id / dispatched_by
-  return { model, retired, offer, pickModel, dismissOffer, thread };
+  return { model, retired, lapsed, offer, pickModel, dismissOffer, thread };
 }

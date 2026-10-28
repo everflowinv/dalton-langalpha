@@ -1,7 +1,7 @@
 import { useQuery, type UseQueryResult } from '@tanstack/react-query';
 import { queryKeys } from '@/lib/queryKeys';
 import { GRANT_RENEW_MARGIN_MS, MIN_RENEW_INTERVAL_MS, msUntilRenewal } from '@/lib/expiry';
-import { isClientError, retryUnlessClientError } from '@/pages/ChatAgent/utils/api/errors';
+import { isClientError, retryUnlessClientError } from '@/api/errors';
 import { createFileGrant } from '@/pages/ChatAgent/utils/api/shareLinks';
 import type { FileGrant } from '@/types/api';
 

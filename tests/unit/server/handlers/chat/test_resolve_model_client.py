@@ -151,6 +151,20 @@ def test_a_provider_with_no_key_raises_the_missing_key_error(monkeypatch):
         llm._resolve_api_key()
 
 
+def test_an_empty_user_key_never_takes_the_deployments(monkeypatch):
+    # A saved row with no key but the user's base URL: the deployment's key
+    # would go to the user's server.
+    from src.llms.llm import LLM
+
+    llm = LLM.__new__(LLM)
+    llm.api_key_override = ""
+    llm.env_key = "EXAMPLE_PROVIDER_API_KEY"
+    llm.provider_info = {"access_type": "api_key"}
+    monkeypatch.setenv("EXAMPLE_PROVIDER_API_KEY", "deployment-secret")
+
+    assert llm._resolve_api_key() == "EMPTY"
+
+
 @pytest.mark.asyncio
 async def test_no_fallback_when_disabled():
     from src.server.services.llm.clients import resolve_model_client

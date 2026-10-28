@@ -19,6 +19,7 @@ from .model_spec import (
     ModelSpec,
     canonical_reasoning_efforts,
     clamp_reasoning_effort,
+    client_wire,
     default_reasoning_effort,
     reasoning_block,
 )
@@ -89,7 +90,10 @@ class ModelConfig:
         flat = {}
         for group_key, config in grouped.items():
             variants = config.get("variants")  # don't mutate manifest
-            shared = {k: v for k, v in config.items() if k != "variants"}
+            # ``group``: the key each provider sits under. A vendor's regions and
+            # plans are separate providers (``z-ai-cn-coding`` names ``z-ai-cn``
+            # as its parent), so a picker groups them by this instead.
+            shared = {**{k: v for k, v in config.items() if k != "variants"}, "group": group_key}
 
             if not variants:
                 flat[group_key] = shared
@@ -97,7 +101,11 @@ class ModelConfig:
 
             has_self_variant = group_key in variants
             for vkey, overrides in variants.items():
-                merged = {**shared, **overrides}
+                merged = {**shared, **overrides, "group": group_key}
+                # A list URL belongs to the base URL declared beside it, so a
+                # variant that moves its base (a coding endpoint) lists there.
+                if "base_url" in overrides and "models_url" not in overrides:
+                    merged.pop("models_url", None)
                 if vkey != group_key:
                     # setdefault: a variant may declare an explicit parent_provider
                     merged.setdefault("parent_provider", group_key)
@@ -109,6 +117,12 @@ class ModelConfig:
         # Post-flatten validation: every entry must have an sdk field
         # (platform variants are exempt — they inherit sdk at runtime from parent)
         for key, entry in flat.items():
+            models_url = entry.get("models_url")
+            if models_url is not None and not (
+                isinstance(models_url, str)
+                and models_url.startswith(("https://", "http://"))
+            ):
+                raise ValueError(f"Provider '{key}' models_url must be an http(s) URL")
             if entry.get("platform"):
                 continue
             if "sdk" not in entry:
@@ -137,8 +151,8 @@ class ModelConfig:
         """Get full model information from manifest by provider and model_id.
 
         Args:
-            provider: Provider name (e.g., 'openai', 'anthropic', 'volcengine')
-            model_id: Model ID (e.g., 'gpt-5', 'claude-opus-4', 'doubao-seed-1-6-250615')
+            provider: Provider name (e.g., 'openai', 'anthropic', 'xai')
+            model_id: Model ID (e.g., 'gpt-5', 'claude-opus-4', 'grok-4.7')
 
         Returns:
             Model info dictionary with pricing, parameters, etc., or None if not found
@@ -229,6 +243,10 @@ class ModelConfig:
             # be one of these for the model to be usable (absence = no gate).
             if "oauth_plans" in model_info:
                 entry["oauth_plans"] = model_info["oauth_plans"]
+            # The name the provider knows it by, where that is not the key: an
+            # entry the user saves for it under another connection sends this.
+            if model_info.get("model_id") and model_info["model_id"] != model_name:
+                entry["model_id"] = model_info["model_id"]
             # Optional editorial metadata for the model-detail flyout. Additive —
             # only surfaced for models that authored it in models.json; the
             # frontend renders only the rows that are present. `display_name` is
@@ -410,12 +428,14 @@ def _merged_default_headers(params: dict, *bases: dict | None) -> dict:
 
 # Constructor keys a model's ``parameters`` can use to move its endpoint: the
 # OpenAI family's ``base_url``/``openai_api_base``/``api_base``, Anthropic's
-# ``anthropic_api_url``, Gemini's ``client_options``. A custom model's
-# parameters are its user's, so each of these is a URL the user supplied.
+# ``anthropic_api_url``, Gemini's ``client_options``, OpenRouter's
+# ``openrouter_api_base``. A custom model's parameters are its user's, so each
+# of these is a URL the user supplied.
 ENDPOINT_PARAM_KEYS = (
     "base_url",
     "openai_api_base",
     "api_base",
+    "openrouter_api_base",
     "anthropic_api_url",
     "client_options",
 )
@@ -522,8 +542,8 @@ class LLM:
                 None to clear to SDK default, or a string for a custom URL.
             reasoning_effort: Optional reasoning effort level ("low", "medium", "high").
             egress_transport: Builds the transport every request of the client
-                is sent through, given its SDK family ("openai", "anthropic" or
-                "gemini"). None leaves each SDK its own; whether an endpoint
+                is sent through, given its SDK family ("openai", "anthropic",
+                "gemini" or "openrouter"). None leaves each SDK its own; whether an endpoint
                 needs one is the caller's call, not the factory's.
             **override_params: Additional parameters to override defaults.
         """
@@ -539,8 +559,9 @@ class LLM:
         self.model = spec.model_id  # Use model_id for API calls
         self.provider = spec.provider
 
-        # System serving: route through platform proxy when no BYOK key
-        if not api_key and spec.system_provider:
+        # System serving: route through platform proxy when no BYOK key. An
+        # empty key is still the user's (a keyless endpoint of theirs).
+        if api_key is None and spec.system_provider:
             self.provider = spec.system_provider
 
         # Deep copy: reasoning-effort overrides mutate nested dicts (e.g.
@@ -593,11 +614,17 @@ class LLM:
         # Store optional API key override (BYOK)
         self.api_key_override = api_key
 
-        # Get provider info from manifest (empty for a provider it does not list)
-        self.provider_info = self.model_config.get_provider_info(self.provider)
+        # Get provider info from manifest (empty for a provider it does not
+        # list, and for the user's own provider under a name it does list).
+        self.provider_info = (
+            {} if spec.own_provider else self.model_config.get_provider_info(self.provider)
+        )
 
-        # Extract provider configuration
-        self.sdk = self.provider_info.get("sdk") or spec.sdk_fallback
+        # Extract provider configuration. The SDK and Responses opt-in are read
+        # the way ``wire_api`` reads them, which decides a shadow's ladder.
+        self.sdk, self.use_response_api = client_wire(
+            self.provider_info, spec.use_response_api_override, spec.sdk_fallback
+        )
         self.env_key = self.provider_info.get("env_key")
         self.base_url = self.provider_info.get("base_url")
 
@@ -605,13 +632,16 @@ class LLM:
         if base_url_override is not _UNSET:
             self.base_url = base_url_override
 
-        # Store response API flags for OpenAI SDK
-        response_api = (
-            self.provider_info.get("use_response_api", False)
-            if spec.use_response_api_override is None
-            else spec.use_response_api_override
-        )
-        self.use_response_api = bool(response_api) and self.sdk in ("openai", "codex", "dashscope")
+        # A provider the manifest no longer lists (a custom model saved on a
+        # removed provider) has no endpoint of its own. Built anyway, the client
+        # would dial the fallback SDK's default host, sending the key to a
+        # vendor that never issued it.
+        if not self.provider_info and not self.base_url:
+            raise ValueError(
+                f"Provider '{self.provider}' of model '{spec.name}' is no longer "
+                "available. Pick another provider for it in Settings."
+            )
+
         self.use_previous_response_id = self.provider_info.get("use_previous_response_id", False) if self.sdk == "openai" else False
         # prompt_cache_key: opt-in for sdk="openai"; codex applies it always-on.
         self.prompt_cache_key_enabled = (
@@ -665,11 +695,8 @@ class LLM:
         Returns:
             A LangChain chat model instance.
         """
-        name = config.get("name")
         instance = cls(
-            ModelSpec.from_custom(
-                config, cls.get_model_config().get_model_config(name) if name else None
-            ),
+            ModelSpec.from_custom(config, cls.get_model_config()),
             api_key=api_key,
             base_url_override=base_url_override,
             reasoning_effort=reasoning_effort,
@@ -686,7 +713,7 @@ class LLM:
         - "oauth"    — user-provided OAuth token
         - "platform" — system key (platform pays, credits deducted)
         """
-        if self.api_key_override is not None and self.api_key_override != "":
+        if self.api_key_override is not None:
             if self.provider_info.get("access_type") == "oauth":
                 return "oauth"
             return "byok"
@@ -720,6 +747,8 @@ class LLM:
             client = self._get_dashscope_llm(cache_key=effective_cache_key)
         elif self.sdk == "deepseek":
             client = self._get_deepseek_llm()
+        elif self.sdk == "openrouter":
+            client = self._get_openrouter_llm()
         elif self.sdk == "glm":
             client = self._get_glm_llm()
         elif self.sdk == "qwq":
@@ -809,11 +838,12 @@ class LLM:
     def _resolve_api_key(self) -> str:
         """Resolve API key: BYOK override > env var > local fallback.
 
-        Empty-string overrides are accepted for local providers (LM Studio,
-        Ollama, vLLM, etc.) where no real key is required.
+        An empty override is a user's keyless endpoint (LM Studio, Ollama, vLLM)
+        and gets the placeholder, never the deployment's key: the user chose
+        where the request goes, so the env key would be sent to their server.
         """
-        if self.api_key_override is not None and self.api_key_override != "":
-            return self.api_key_override
+        if self.api_key_override is not None:
+            return self.api_key_override or "EMPTY"
         if self.env_key:
             key = os.getenv(self.env_key)
             if key:
@@ -848,6 +878,9 @@ class LLM:
             # in it is also what turns off its aiohttp path, which no httpx
             # transport would see.
             params["client_args"] = {"transport": transport, "follow_redirects": False}
+        elif family == "openrouter":
+            params["http_transports"] = (transport, transport)
+            params["follow_redirects"] = False
         else:
             raise ValueError(f"No egress hold for SDK family {family!r}")
 
@@ -972,7 +1005,7 @@ class LLM:
 
     def _get_codex_llm(self, cache_key: str | None = None):
         """Get Codex OAuth LLM (store=false, stateless)."""
-        from src.llms.extension import ChatCodexOpenAI
+        from src.llms.extension.codex import ChatCodexOpenAI, codex_identity_headers
 
         params = {
             "model": self.model,
@@ -990,14 +1023,12 @@ class LLM:
 
         params.update(self.parameters)
 
-        # The codex backend gates newer models (e.g. GPT-5.6 Luna) to first-party
-        # clients: without an originator naming a known client AND a User-Agent
-        # carrying the matching "<originator>/" prefix, it 404s "Model not found".
-        # Built after the parameters merge so a parameters["default_headers"]
-        # entry augments the mapping instead of clobbering it.
+        # First-party identity (see ``codex_identity_headers``). Built after the
+        # parameters merge so a parameters["default_headers"] entry augments the
+        # mapping instead of clobbering it.
         params["default_headers"] = _merged_default_headers(
             params,
-            {"originator": "codex_cli_rs", "User-Agent": "codex_cli_rs/0.46.0"},
+            codex_identity_headers(),
             self.default_headers,
         )
 
@@ -1046,6 +1077,32 @@ class LLM:
 
         self._hold_params_to_egress(params, "openai")
         return ChatDeepSeek(**params)
+
+    def _get_openrouter_llm(self):
+        """Get an OpenRouter LLM via the official ``ChatOpenRouter``."""
+        from src.llms.extension import ChatOpenRouterClient
+
+        params = {
+            "model": self.model,
+            "api_key": self._resolve_api_key(),
+            "streaming": True,
+            "stream_usage": True,
+            # The SDK retries 5xx and dropped connections for up to ~150s per
+            # unit; the resilience middleware owns everything past that.
+            "max_retries": 1,
+            "timeout": 600.0,
+            "stream_chunk_timeout": STREAM_CHUNK_TIMEOUT_S,
+        }
+        params.update(self._resolve_base_url("base_url"))
+        params.update(self.parameters)
+        params = ChatOpenRouterClient.factory_kwargs(params, self.extra_body, self.model)
+
+        merged_headers = _merged_default_headers(params, self.default_headers)
+        if merged_headers:
+            params["default_headers"] = merged_headers
+
+        self._hold_params_to_egress(params, "openrouter")
+        return ChatOpenRouterClient(**params)
 
     def _get_glm_llm(self):
         """Get GLM/bigmodel LLM via vendored langchain-zai ``ChatZai`` (reasoning round-trip)."""
@@ -1420,7 +1477,7 @@ _UNBOUNDED_IMAGE_PROVIDERS = frozenset({"openai", "gemini", "dashscope"})
 # The vendors whose image rules are known. Any other route (an aggregator, a
 # local server) is judged by the vendor of the model it serves, if known.
 _IMAGE_FAMILIES = frozenset({
-    "anthropic", "openai", "gemini", "dashscope", "deepseek", "z-ai", "moonshot", "minimax",
+    "anthropic", "openai", "gemini", "dashscope", "deepseek", "z-ai", "moonshot", "minimax", "xai",
 })
 
 
@@ -1487,6 +1544,8 @@ _IMAGE_TYPES = {
     "dashscope": frozenset({
         "image/png", "image/jpeg", "image/webp", "image/bmp", "image/tiff", "image/heic",
     }),
+    # xAI refuses GIF (OpenCode #53787).
+    "xai": frozenset({"image/png", "image/jpeg", "image/webp"}),
 }
 
 

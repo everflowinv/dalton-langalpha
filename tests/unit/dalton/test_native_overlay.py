@@ -9,7 +9,13 @@ from typing import Any
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
-from src.dalton.llm.overlay import NATIVE_OVERLAY_PATH, load_dalton_meta, load_overlay_data
+from src.dalton.llm.overlay import (
+    NATIVE_OVERLAY_PATH,
+    PINNED_OVERLAY_MODEL_KEYS,
+    apply_model_overlay,
+    load_dalton_meta,
+    load_overlay_data,
+)
 from src.dalton.llm.providers import (
     ProviderDisabledError,
     build_dalton_client,
@@ -37,13 +43,45 @@ def test_native_overlay_does_not_collide_with_upstream():
     assert native is not None
 
     native_models = native.get("models") or {}
-    assert len(native_models) == 28
+    assert len(native_models) == 26
     overlap = set(native_models) & set(upstream_models)
-    assert not overlap, f"Native overlay models collide with upstream: {overlap}"
+    # The Grok subscription keys are Dalton's pinned routes: upstream grew
+    # same-named entries on its own grok-oauth (api.x.ai) line, and the
+    # overlay intentionally overrides exactly those two (PINNED_OVERLAY_MODEL_KEYS).
+    assert overlap <= PINNED_OVERLAY_MODEL_KEYS, f"Native overlay models collide with upstream: {overlap}"
 
     native_prov_cfg = (native.get("providers") or {}).get("provider_config") or {}
     overlap_prov = set(native_prov_cfg) & set(upstream_providers.get("provider_config") or {})
     assert not overlap_prov, f"Native overlay provider_config collides with upstream: {overlap_prov}"
+
+
+def test_grok_oauth_keys_pinned_to_dalton_xai_line():
+    """grok-4.7-oauth / grok-4.3-oauth resolve to Dalton's xai-oauth + CLI
+    proxy with subscription billing, never to upstream's grok-oauth line."""
+    mc = ModelConfig()
+    for key in ("grok-4.7-oauth", "grok-4.3-oauth"):
+        entry = mc.get_model_config(key)
+        assert entry is not None, f"{key} missing from merged config"
+        assert entry.get("provider") == "xai-oauth", f"{key} provider={entry.get('provider')!r}"
+        assert entry.get("model_id") == key.replace("-oauth", "")
+
+    pinfo = mc.get_provider_info("xai-oauth")
+    assert pinfo.get("base_url") == "https://cli-chat-proxy.grok.com/v1"
+    assert pinfo.get("access_type") == "oauth"
+    assert pinfo.get("billing") == "subscription"
+
+
+def test_grok_pin_enforced_over_hostile_entries():
+    """Whatever else pre-seeds the merged config (an upstream same-named entry
+    or a hostile runtime overlay), the checked-in native overlay has the last
+    word on the pinned keys."""
+    llm_config: dict[str, Any] = {
+        "grok-4.7-oauth": {"provider": "grok-oauth", "model_id": "grok-4.7"},
+        "grok-4.3-oauth": {"provider": "grok-oauth", "model_id": "grok-4.3"},
+    }
+    apply_model_overlay(llm_config, {})
+    for key in PINNED_OVERLAY_MODEL_KEYS:
+        assert llm_config[key].get("provider") == "xai-oauth", f"{key} was repointed"
 
 
 def test_every_native_overlay_model_resolves_provider_and_pricing_or_notional():
@@ -753,7 +791,7 @@ async def test_muse_legacy_unminted_token_rejected_and_status_shows_usage_and_re
     import src.dalton.services.provider_status as ps_mod
     import src.server.database.oauth_tokens as oauth_db
 
-    real_get_oauth_status = oauth_db.get_oauth_status
+    real_get_oauth_connection = oauth_db.get_oauth_connection
     real_get_muse_cached_meta = muse_oauth_mod.get_muse_cached_meta
 
     # 1. Legacy token (saved at 05:38 without mint_api_key marker -> account_id == "")
@@ -787,10 +825,10 @@ async def test_muse_legacy_unminted_token_rejected_and_status_shows_usage_and_re
     # 2. Provider status page with legacy token -> configured=False and warning prompts "请重新连接 Muse"
     monkeypatch.setattr(
         oauth_db,
-        "get_oauth_status",
+        "get_oauth_connection",
         create_autospec(
-            real_get_oauth_status,
-            return_value={"connected": True, "account_id": "", "email": None, "plan_type": "muse"},
+            real_get_oauth_connection,
+            return_value={"account_id": "", "email": None, "plan_type": "muse"},
         ),
     )
     monkeypatch.setattr(
@@ -833,11 +871,10 @@ async def test_muse_legacy_unminted_token_rejected_and_status_shows_usage_and_re
     }
     monkeypatch.setattr(
         oauth_db,
-        "get_oauth_status",
+        "get_oauth_connection",
         create_autospec(
-            real_get_oauth_status,
+            real_get_oauth_connection,
             return_value={
-                "connected": True,
                 "account_id": muse_oauth_mod.MUSE_API_KEY_ACCOUNT_ID,
                 "email": "analyst@dalton.test",
                 "plan_type": "Pro",
@@ -1156,8 +1193,8 @@ async def test_glm_coding_plan_only_accepts_own_key(
     import src.server.database.api_keys as api_keys_mod
     import src.server.services.llm.user_models as user_models_mod
     from src.llms.llm import LLM, MissingProviderKeyError, create_llm
+    from src.server.services.llm.byok import byok_candidates
     from src.server.services.llm.clients import (
-        _candidate_slugs,
         resolve_byok_llm_client,
         resolve_model_client,
     )
@@ -1166,9 +1203,9 @@ async def test_glm_coding_plan_only_accepts_own_key(
     mc = LLM.get_model_config()
 
     # Candidate walk for coding_plan variant is strictly isolated to its own slug
-    assert _candidate_slugs("z-ai-cn-coding", mc) == ["z-ai-cn-coding"]
+    assert byok_candidates("z-ai-cn-coding", mc) == ["z-ai-cn-coding"]
     # Non-coding-plan parent still walks its family
-    assert "z-ai" in _candidate_slugs("z-ai-cn", mc)
+    assert "z-ai" in byok_candidates("z-ai-cn", mc)
 
     monkeypatch.setattr(
         user_models_mod,

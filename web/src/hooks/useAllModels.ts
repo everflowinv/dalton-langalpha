@@ -5,11 +5,14 @@ import { getModelAccess, usePlatformModels, useModelAccessMap } from './usePlatf
 import { buildVisibleModels, augmentPlatformWithLocal } from './useFilteredModels';
 import type { BuildVisibleModelsResult, ModelMetadataEntry } from './useFilteredModels';
 import { useConfiguredProviders } from './useConfiguredProviders';
-import type { ProviderModelsData, CustomModelEntry, KeyCandidates } from '@/components/model/types';
+import { useMissingModels } from './useProviderModels';
+import { isPlatformMode } from '@/config/hostMode';
+import type { ProviderModelsData, CustomModelEntry } from '@/components/model/types';
+import type { ModelsResponse } from '@/api/model';
 import type { PlatformModelsResponse, ModelAccess } from '@/types/platform';
 import { modelPrefs } from '@/lib/modelPreferences';
 
-interface SystemDefaults {
+export interface SystemDefaults {
   default_model?: string;
   background_model?: string;
   compaction_model?: string;
@@ -98,7 +101,7 @@ export interface UseAllModelsResult {
   /** Web-search provider catalog from the models API (name → tiers + depths). */
   searchProviders: SearchProviderCatalog | null;
   /** Raw models API response (for callers that need the full shape). */
-  rawApiResponse: Record<string, unknown> | null;
+  rawApiResponse: ModelsResponse | null;
   /** True while any upstream query is still loading. */
   isLoading: boolean;
 }
@@ -124,21 +127,15 @@ export function useAllModels(): UseAllModelsResult {
   }, [preferences]);
 
   /** Provider catalog for resolving SDK of custom models */
-  const providerCatalog = useMemo<Record<string, { sdk?: string; parent_provider?: string }>>(() => {
-    if (!modelsData) return {};
-    const raw = modelsData as Record<string, unknown>;
-    const catalog = (raw.provider_catalog ?? []) as Array<{ provider: string; sdk?: string }>;
+  const providerCatalog = useMemo<Record<string, { sdk?: string }>>(() => {
     const map: Record<string, { sdk?: string }> = {};
-    for (const entry of catalog) {
+    for (const entry of modelsData?.provider_catalog ?? []) {
       map[entry.provider] = entry;
     }
     // Also index custom providers from preferences
-    if (preferences) {
-      const customProviders = (modelPrefs(preferences).custom_providers ?? []) as Array<{ name: string; parent_provider?: string }>;
-      for (const cp of customProviders) {
-        if (!map[cp.name] && cp.parent_provider && map[cp.parent_provider]) {
-          map[cp.name] = { sdk: map[cp.parent_provider].sdk };
-        }
+    for (const cp of modelPrefs(preferences).custom_providers ?? []) {
+      if (!map[cp.name] && cp.parent_provider && map[cp.parent_provider]) {
+        map[cp.name] = { sdk: map[cp.parent_provider].sdk };
       }
     }
     return map;
@@ -151,26 +148,18 @@ export function useAllModels(): UseAllModelsResult {
     [rawPlatform, configuredProviders, byokEnabled],
   );
 
-  /** System defaults from the models API response */
-  const systemDefaults = useMemo<SystemDefaults | null>(() => {
-    if (!modelsData) return null;
-    const raw = modelsData as Record<string, unknown>;
-    return (raw.system_defaults as SystemDefaults) ?? null;
-  }, [modelsData]);
+  const systemDefaults = modelsData?.system_defaults ?? null;
+  const compactionProfiles = modelsData?.compaction_profiles ?? null;
+  const searchProviders = modelsData?.search_providers ?? null;
 
-  /** Compaction profile catalog from the models API */
-  const compactionProfiles = useMemo<CompactionProfileCatalog | null>(() => {
-    if (!modelsData) return null;
-    const raw = modelsData as Record<string, unknown>;
-    return (raw.compaction_profiles as CompactionProfileCatalog) ?? null;
-  }, [modelsData]);
-
-  /** Web-search provider catalog from the models API */
-  const searchProviders = useMemo<SearchProviderCatalog | null>(() => {
-    if (!modelsData) return null;
-    const raw = modelsData as Record<string, unknown>;
-    return (raw.search_providers as SearchProviderCatalog) ?? null;
-  }, [modelsData]);
+  // Each connected credential's own list, read to hide the manifest models it
+  // cannot run. A key the server would not use (BYOK off on a hosted account)
+  // and a local or user-defined provider have no list here.
+  const listedProviders = useMemo(() => configuredProviders
+    .filter((p) => !p.is_custom && p.access_type !== 'local')
+    .filter((p) => (p.access_type === 'oauth' ? p.state === 'connected' : !isPlatformMode || byokEnabled))
+    .map((p) => p.provider), [configuredProviders, byokEnabled]);
+  const { missingByProvider, isLoading: listsLoading } = useMissingModels(listedProviders);
 
   /** Run the full pipeline: normalize → merge custom → filter */
   const visible = useMemo<BuildVisibleModelsResult>(() => {
@@ -183,19 +172,18 @@ export function useAllModels(): UseAllModelsResult {
         customPairs: new Set(),
       };
     }
-    const raw = modelsData as Record<string, unknown>;
-    const rawApiModels = (raw.models ?? raw) as Record<string, Record<string, unknown>>;
-    const rawMetadata = (raw.model_metadata ?? {}) as Record<string, ModelMetadataEntry>;
-
+    // Read as the network sent it: a response without the map must still
+    // render, not crash every view that lists models.
     return buildVisibleModels(
-      rawApiModels,
-      rawMetadata,
+      modelsData.models ?? {},
+      modelsData.model_metadata ?? {},
       customModels,
       providerCatalog,
       platform,
       configuredProviders,
+      missingByProvider,
     );
-  }, [modelsData, customModels, providerCatalog, platform, configuredProviders]);
+  }, [modelsData, customModels, providerCatalog, platform, configuredProviders, missingByProvider]);
 
   const catalogModelNames = useMemo(() => {
     const names = new Set<string>();
@@ -243,8 +231,7 @@ export function useAllModels(): UseAllModelsResult {
   const offPlanModels = useMemo(() => {
     const out = new Set<string>();
     if (!platform || !modelsData) return out;
-    const raw = modelsData as Record<string, unknown>;
-    const candidates = (raw.key_candidates ?? {}) as Record<string, KeyCandidates>;
+    const candidates = modelsData.key_candidates ?? {};
     const keyed = new Set(platform.byok_providers);
     // Saved with a base URL, a key goes where the user pointed it, so it
     // serves whichever model it is found for.
@@ -263,7 +250,7 @@ export function useAllModels(): UseAllModelsResult {
         if (!ownKey(meta?.provider ?? group, false)) out.add(m);
       }
     }
-    const builtIns = (raw.model_metadata ?? {}) as Record<string, ModelMetadataEntry>;
+    const builtIns = modelsData.model_metadata ?? {};
     for (const cm of customModels) {
       const builtIn = builtIns[cm.name];
       if (!builtIn) continue;
@@ -287,7 +274,7 @@ export function useAllModels(): UseAllModelsResult {
     catalogModelNames,
     compactionProfiles,
     searchProviders,
-    rawApiResponse: modelsData ? (modelsData as Record<string, unknown>) : null,
-    isLoading: modelsLoading || prefsLoading || configuredLoading || platformLoading,
+    rawApiResponse: modelsData,
+    isLoading: modelsLoading || prefsLoading || configuredLoading || platformLoading || listsLoading,
   };
 }

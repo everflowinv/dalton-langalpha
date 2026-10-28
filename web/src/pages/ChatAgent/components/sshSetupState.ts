@@ -21,7 +21,7 @@ import {
   apiErrorObject,
   apiErrorStatus,
   apiValidationErrors,
-} from '../utils/api/errors';
+} from '@/api/errors';
 import {
   formatSshHostPort,
   pairingReady,

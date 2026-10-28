@@ -6,7 +6,7 @@
  * working without naming these.
  */
 import { api } from '@/api/client';
-import { apiErrorObject, apiErrorStatus } from './errors';
+import { apiErrorObject, apiErrorStatus } from '@/api/errors';
 import type {
   FileGrant,
   ShareLink,

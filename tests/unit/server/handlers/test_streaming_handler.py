@@ -181,11 +181,24 @@ class TestRunSSEProducerFormatting:
             "try_another_model",
         ]
 
-    @pytest.mark.parametrize("source", ["byok", "oauth"])
-    def test_user_owned_credential_keeps_its_hints(self, monkeypatch, source):
+    def test_user_owned_credential_keeps_its_hints(self, monkeypatch):
         monkeypatch.setattr("src.config.settings.HOST_MODE", "platform")
-        assert self._hints(self._upstream(401), credential_source=source) == [
+        assert self._hints(self._upstream(401), credential_source="byok") == [
             "api_key",
+            "model_access",
+            "try_another_model",
+        ]
+
+    @pytest.mark.parametrize("host_mode", ["platform", "oss"])
+    def test_subscription_401_asks_for_a_reconnect_not_a_key(self, monkeypatch, host_mode):
+        """A subscription has no key; its 401 is the sign-in, renewed by reconnecting."""
+        monkeypatch.setattr("src.config.settings.HOST_MODE", host_mode)
+        assert self._hints(self._upstream(401), credential_source="oauth") == [
+            "reconnect_account",
+            "model_access",
+            "try_another_model",
+        ]
+        assert self._hints(self._upstream(403), credential_source="oauth") == [
             "model_access",
             "try_another_model",
         ]

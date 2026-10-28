@@ -30,8 +30,8 @@ interface Insight {
 
 interface AIDailyBriefCardProps {
   onReadFull?: (marketInsightId: string) => void;
-  /** Widget instance id — when provided, per-row paperclip attach buttons render. */
-  instanceId?: string;
+  /** The widget instance: keys the row attach buttons and the remembered height. */
+  instanceId: string;
 }
 
 interface TypeConfigEntry {
@@ -145,7 +145,7 @@ function AIDailyBriefCard({ onReadFull, instanceId }: AIDailyBriefCardProps) {
   // reads much like yesterday's, so the skeleton holds about the room the card
   // will take and what sits below does not move when it lands. Not while the
   // earlier insights are open, which the next visit does not start with.
-  const { ref: readyRef, height: lastHeight } = useLastHeight(`dashboard:brief.height.${instanceId ?? 'classic'}`, !expanded);
+  const { ref: readyRef, height: lastHeight } = useLastHeight(`dashboard:brief.height.${instanceId}`, !expanded);
 
   useEffect(() => {
     return () => { mountedRef.current = false; };
@@ -572,11 +572,9 @@ function AIDailyBriefCard({ onReadFull, instanceId }: AIDailyBriefCardProps) {
                           {item.headline}
                         </span>
                       </button>
-                      {instanceId && (
-                        <span className="absolute right-2 top-1/2 -translate-y-1/2 z-10">
-                          <RowAttachButton instanceId={instanceId} rowId={item.market_insight_id} />
-                        </span>
-                      )}
+                      <span className="absolute right-2 top-1/2 -translate-y-1/2 z-10">
+                        <RowAttachButton instanceId={instanceId} rowId={item.market_insight_id} />
+                      </span>
                     </div>
                   );
                 })}

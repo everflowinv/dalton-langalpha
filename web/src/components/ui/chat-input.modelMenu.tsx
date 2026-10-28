@@ -154,16 +154,23 @@ function SettingOption({
 
 /** One model in a picker list. Unlike a setting option, choosing a model is a
  *  commitment rather than an adjustment, so the menu closes behind it. */
-function ModelOption({ model, metadata, selected, onPick }: {
+function ModelOption({ model, metadata, selected, hint, onPick }: {
   model: string;
   metadata?: ModelMetadata;
   selected: boolean;
+  /** Why a send on it would be refused, said beside its name. */
+  hint?: string;
   onPick: () => void;
 }) {
   return (
     <DropdownMenuItem variant="setting" onSelect={onPick} style={{ color: 'var(--color-text-primary)' }}>
-      <span>{getModelDisplayName(model, metadata)}</span>
-      {selected && <Check className="h-4 w-4 shrink-0" style={{ color: 'var(--color-accent-primary)' }} />}
+      <span className="min-w-0 truncate">{getModelDisplayName(model, metadata)}</span>
+      {(hint || selected) && (
+        <span className="ml-auto flex shrink-0 items-center gap-1.5">
+          {hint && <span className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>{hint}</span>}
+          {selected && <Check className="h-4 w-4 shrink-0" style={{ color: 'var(--color-accent-primary)' }} />}
+        </span>
+      )}
     </DropdownMenuItem>
   );
 }
@@ -188,6 +195,7 @@ export function ChatInputModelMenu({
   fastMode,
   onFastModeChange,
   isCodexModel,
+  needsSignIn,
   reasoningEfforts,
   dropdownDirection,
   container,
@@ -214,6 +222,8 @@ export function ChatInputModelMenu({
   fastMode: boolean | null;
   onFastModeChange: (fast: boolean) => void;
   isCodexModel: boolean;
+  /** Whether a model runs on a subscription whose sign-in has to be renewed. */
+  needsSignIn: (model: string) => boolean;
   /** Exactly the levels this model honors, weakest first. Empty renders no
    *  selector at all — a model with no reasoning control used to show the same
    *  row of buttons as every other, all emitting an identical request. */
@@ -234,11 +244,25 @@ export function ChatInputModelMenu({
   const [expanded, setExpanded] = useState<'effort' | 'speed' | null>(null);
 
   const effortLabel = effortLabelFor(t, reasoningEffort);
+  const hintFor = (m: string) => (needsSignIn(m) ? t('modelAccess.status.needsReauth') : undefined);
 
-  // Show if there's anything to pick (quick-access list or current selection),
-  // or if the user has stars to manage even when they all filter out (keeps
-  // the settings link reachable).
-  if (moreModelsItems.length === 0 && !hasStarredModels && !selectedModel) return null;
+  // Nothing to pick (no quick-access list, no stars, no current selection)
+  // means no model is set up yet: the trigger becomes the way to set one up,
+  // rather than leaving a composer with no hint of why it cannot send. While
+  // the list is still arriving it is not yet known to be empty.
+  if (moreModelsItems.length === 0 && !hasStarredModels && !selectedModel) {
+    if (disabled) return null;
+    return (
+      <button
+        className={`model-selector-trigger ${TRIGGER_CLASS} cursor-pointer transition-colors`}
+        onClick={(e) => { e.stopPropagation(); navigate('/settings?tab=model'); }}
+        type="button"
+        style={{ color: 'var(--color-text-secondary)' }}
+      >
+        {t('chat.modelSelector.setUpModel')}
+      </button>
+    );
+  }
 
   const primaryModels = derivePrimaryModels({ selectedModel, threadModels, validModelNames });
 
@@ -265,7 +289,7 @@ export function ChatInputModelMenu({
       >
         {/* Thread models */}
         {primaryModels.map((m) => (
-          <ModelOption key={m} model={m} metadata={metadata} selected={m === selectedModel} onPick={() => onSelectModel(m)} />
+          <ModelOption key={m} model={m} metadata={metadata} selected={m === selectedModel} hint={hintFor(m)} onPick={() => onSelectModel(m)} />
         ))}
         {(reasoningEfforts.length > 0 || isCodexModel) && (
           <DropdownMenuSeparator style={{ backgroundColor: 'var(--color-border-muted)' }} />
@@ -329,7 +353,7 @@ export function ChatInputModelMenu({
         >
           {moreModelsItems.length > 0 ? (
             moreModelsItems.map((m) => (
-              <ModelOption key={m} model={m} metadata={metadata} selected={m === selectedModel} onPick={() => onSelectModel(m)} />
+              <ModelOption key={m} model={m} metadata={metadata} selected={m === selectedModel} hint={hintFor(m)} onPick={() => onSelectModel(m)} />
             ))
           ) : (
             <DropdownMenuItem

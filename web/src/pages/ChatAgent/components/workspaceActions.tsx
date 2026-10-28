@@ -8,7 +8,7 @@ import { toast } from '@/components/ui/use-toast';
 import { queryKeys } from '@/lib/queryKeys';
 import type { Computer } from '@/types/api';
 import { deleteWorkspace, duplicateWorkspace } from '../utils/api';
-import { apiErrorDetail } from '../utils/api/errors'; // DALTON-HOOK(workspace-delete-guard)
+import { apiErrorDetail } from '@/api/errors'; // DALTON-HOOK(workspace-delete-guard)
 import { entitlementErrorMessage } from '../utils/entitlementErrors';
 import { workspaceNameErrorMessage } from '../utils/workspaceName';
 import { forgetDeletedWorkspace, invalidateNewWorkspace, invalidateWorkspaceMembership } from '../hooks/workspaceRowActions';

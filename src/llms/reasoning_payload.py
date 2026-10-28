@@ -19,9 +19,11 @@ from src.llms.provider_compaction import without_blocks
 # both the standardized v1 block and the raw OpenAI Responses reasoning item.
 REASONING_BLOCK_TYPES = frozenset({"thinking", "redacted_thinking", "reasoning"})
 
-# Reasoning carried outside ``content``. The vendored ``ChatZai`` re-injects
-# these into the outgoing payload, so clearing content alone is not enough.
-REASONING_KWARG_KEYS = ("reasoning_content", "reasoning")
+# Reasoning carried outside ``content``. The vendored ``ChatZai`` and
+# ``ChatOpenRouter`` re-inject these into the outgoing payload, so clearing
+# content alone is not enough; OpenRouter's ``reasoning_details`` carry the
+# upstream's signed or encrypted blocks.
+REASONING_KWARG_KEYS = ("reasoning_content", "reasoning", "reasoning_details")
 
 # Blocks whose ``id`` names the item on the server that issued it, not the call:
 # a Responses ``function_call`` pairs with its output by ``call_id``. Another

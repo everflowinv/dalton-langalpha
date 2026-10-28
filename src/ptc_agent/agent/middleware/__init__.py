@@ -97,9 +97,9 @@ from .steering import (
     SteeringMiddleware,
 )
 
-# OpenAI prompt-cache breakpoint middleware (GPT-5.6+ explicit caching)
-from .openai_prompt_caching import (
-    OpenAIPromptCachingMiddleware,
+# System-prompt cache breakpoint middleware (OpenAI GPT-5.6+, Claude over OpenRouter)
+from .system_prompt_caching import (
+    SystemPromptCacheMiddleware,
 )
 
 # Cross-provider reasoning sanitizer (origin + shape gates, origin stamping)
@@ -174,7 +174,7 @@ __all__ = [
     "BaselineContextMiddleware",
     "TailEnvelopeMiddleware",
     # OpenAI prompt caching
-    "OpenAIPromptCachingMiddleware",
+    "SystemPromptCacheMiddleware",
     # Cross-provider reasoning sanitizer
     "ReasoningCompatibilityMiddleware",
     # Stream heartbeat

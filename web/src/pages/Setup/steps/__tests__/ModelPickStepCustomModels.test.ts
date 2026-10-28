@@ -13,7 +13,7 @@
  * the full component (same pattern as MethodStep.test.tsx).
  */
 import { describe, it, expect } from 'vitest';
-import { slugifyModelName } from '../slugifyModelName';
+import { slugifyModelName } from '@/components/modelAccess/slugifyModelName';
 import { modelPrefs } from '@/lib/modelPreferences';
 
 interface CustomModelEntry {

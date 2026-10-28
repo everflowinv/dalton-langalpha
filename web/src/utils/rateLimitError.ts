@@ -23,7 +23,8 @@ export type UpstreamErrorHint =
   | 'api_key'
   | 'model_access'
   | 'provider_status'
-  | 'try_another_model';
+  | 'try_another_model'
+  | 'reconnect_account';
 
 /** The allowlist used to sanitize ``hints`` coming off the SSE wire. Any hint
  *  not in this set is dropped — protects renderers from rendering unknown
@@ -33,6 +34,7 @@ export const UPSTREAM_HINT_KEYS: readonly UpstreamErrorHint[] = [
   'model_access',
   'provider_status',
   'try_another_model',
+  'reconnect_account',
 ];
 
 /** i18n key lookup for each hint. Keep renderers in sync by importing this
@@ -42,6 +44,16 @@ export const UPSTREAM_HINT_I18N_KEY: Record<UpstreamErrorHint, string> = {
   model_access: 'chat.errorHintModelAccess',
   provider_status: 'chat.errorHintProviderStatus',
   try_another_model: 'chat.errorHintTryAnotherModel',
+  reconnect_account: 'chat.errorHintReconnectAccount',
+};
+
+/** Where a subscription whose sign-in lapsed is renewed. The server's refusal
+ *  of a turn carries the same link already worded; a failure mid-stream names
+ *  only the hint, so the client supplies the destination. */
+export const RECONNECT_ACCOUNT_LINK: ErrorLinkSpec = {
+  url: '/settings?tab=model',
+  label: 'Reconnect',
+  labelKey: 'chat.errorLinkReconnect',
 };
 
 export function isUpstreamHint(value: unknown): value is UpstreamErrorHint {

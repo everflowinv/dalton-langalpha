@@ -57,7 +57,7 @@ def lineage_for_route(route: str | None, config: ModelConfig | None = None) -> s
     # Declared on a provider *group* and inherited by its variants
     # (``_flatten_providers`` merges group fields into each), so declaring it on
     # a group whose variants are different upstreams — ``moonshot`` vs
-    # ``moonshot-coding``, ``volcengine`` vs ``doubao-coding`` — silently
+    # ``moonshot-coding``, ``minimax`` vs ``minimax-coding`` — silently
     # merges them. ``claude-oauth`` inherits ``anthropic`` correctly because
     # both reach api.anthropic.com; ``codex-oauth`` opts out with its own key.
     # ``test_reasoning_lineage`` locks the partition so a bad merge fails there.

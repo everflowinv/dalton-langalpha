@@ -261,12 +261,23 @@ async def test_same_token_even_after_expiry_gives_up(monkeypatch):
 @pytest.mark.asyncio
 async def test_resolver_tags_clients_without_the_token(monkeypatch):
     """The production resolver attaches the spec: provider and a digest, never the token."""
-    from src.server.services import claude_oauth
+    from datetime import datetime, timedelta, timezone
 
-    async def _token(user_id):
-        return {"access_token": "secret-access-token", "plan_type": None}
+    from src.server.services import oauth_health
+    from src.server.services.oauth_protocol import TokenSet
 
-    monkeypatch.setattr(claude_oauth, "get_valid_token", create_autospec(claude_oauth.get_valid_token, side_effect=_token))
+    async def _token(user_id, provider):
+        return TokenSet(
+            access_token="secret-access-token",
+            refresh_token="",
+            expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+        )
+
+    monkeypatch.setattr(
+        oauth_health,
+        "valid_token",
+        create_autospec(oauth_health.valid_token, side_effect=_token),
+    )
     client = await llm_clients.resolve_oauth_llm_client("u1", "claude-opus-5-5-oauth")
     spec = oauth_rebuild_spec(client)
     assert spec.provider == "claude-oauth" and spec.model_name == "claude-opus-5-5-oauth"

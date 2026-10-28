@@ -53,7 +53,7 @@ async def client():
                 "openai": {"display_name": "OpenAI", "access_type": "api_key", "brand_key": "openai"},
                 "anthropic": {"display_name": "Anthropic", "access_type": "api_key", "brand_key": "anthropic"},
             }),
-            patch(f"{DB}._build_provider_catalog", return_value=[]),
+            patch(f"{DB}.provider_catalog", return_value=[]),
         ):
             yield c
 
@@ -249,10 +249,10 @@ def test_key_candidates_name_where_a_turn_looks_for_each_providers_key():
     """The client reads these to tell which saved models the user's keys
     serve: a coding-plan key is looked for beside its brand's, but its vendor
     issues it apart, so it serves the brand's models only with a base URL."""
-    from src.server.app.api_keys import _build_key_candidates
+    from src.server.services.llm.provider_catalog import key_candidates
 
-    _build_key_candidates.cache_clear()
-    moonshot = _build_key_candidates()["moonshot"]
+    key_candidates.cache_clear()
+    moonshot = key_candidates()["moonshot"]
 
     assert moonshot["slugs"] == ["moonshot", "moonshot-coding"]
     assert moonshot["shared"] == ["moonshot"]

@@ -288,60 +288,183 @@
           "output": 20.0,
           "unit": "per_1m_tokens"
         }
-      },
+      }
+    ],
+    "xai": [
       {
-        "id": "gemini-3.7-flash",
-        "name": "Gemini 3.7 Flash",
+        "id": "grok-4.7",
+        "name": "Grok 4.7",
         "is_reasoning": true,
-        "description": "Retired 2026-10-17, superseded by Gemini 3.8 Flash. Kept until the next retirement so a custom model on this id still bills.",
-        "pricing": {
-          "input": 0.75,
-          "cached_input": 0.075,
-          "output": 3.75,
-          "cache_storage": 0.5,
-          "unit": "per_1m_tokens"
-        },
-        "scheduled_pricing": {
-          "effective_from": "2027-01-01",
-          "input": 1.5,
-          "cached_input": 0.15,
-          "output": 7.5,
-          "cache_storage": 1.0,
-          "unit": "per_1m_tokens"
-        }
-      },
-      {
-        "id": "gemini-3.1-pro-preview",
-        "name": "Gemini 3.1 Pro Preview",
-        "is_reasoning": true,
-        "description": "Retired 2026-10-17, superseded by Gemini 4 Argon. Kept until the next retirement so a custom model on this id still bills.",
+        "description": "SpaceXSI's flagship reasoning model; a request of 200k tokens or more bills at twice the rate",
         "pricing": {
           "input_tiers": [
             {
               "max_tokens": 200000,
               "rate": 2.0,
-              "cached_input": 0.2
+              "cached_input": 0.5
             },
             {
               "max_tokens": null,
               "rate": 4.0,
+              "cached_input": 1.0
+            }
+          ],
+          "output_tiers": [
+            {
+              "max_tokens": 200000,
+              "rate": 6.0
+            },
+            {
+              "max_tokens": null,
+              "rate": 12.0
+            }
+          ],
+          "output_pricing_mode": "input_dependent",
+          "input_pricing_mode": "input_dependent",
+          "unit": "per_1m_tokens"
+        },
+        "context_window": 500000,
+        "max_output": 500000
+      },
+      {
+        "id": "grok-4.6",
+        "name": "Grok 4.6",
+        "is_reasoning": true,
+        "description": "SpaceXSI reasoning model; a request of 200k tokens or more bills at twice the rate",
+        "pricing": {
+          "input_tiers": [
+            {
+              "max_tokens": 200000,
+              "rate": 2.0,
+              "cached_input": 0.5
+            },
+            {
+              "max_tokens": null,
+              "rate": 4.0,
+              "cached_input": 1.0
+            }
+          ],
+          "output_tiers": [
+            {
+              "max_tokens": 200000,
+              "rate": 6.0
+            },
+            {
+              "max_tokens": null,
+              "rate": 12.0
+            }
+          ],
+          "output_pricing_mode": "input_dependent",
+          "input_pricing_mode": "input_dependent",
+          "unit": "per_1m_tokens"
+        },
+        "context_window": 500000,
+        "max_output": 500000
+      },
+      {
+        "id": "grok-4.5",
+        "name": "Grok 4.5",
+        "is_reasoning": true,
+        "description": "SpaceXSI reasoning model; a request of 200k tokens or more bills at twice the rate",
+        "pricing": {
+          "input_tiers": [
+            {
+              "max_tokens": 200000,
+              "rate": 2.0,
+              "cached_input": 0.3
+            },
+            {
+              "max_tokens": null,
+              "rate": 4.0,
+              "cached_input": 0.6
+            }
+          ],
+          "output_tiers": [
+            {
+              "max_tokens": 200000,
+              "rate": 6.0
+            },
+            {
+              "max_tokens": null,
+              "rate": 12.0
+            }
+          ],
+          "output_pricing_mode": "input_dependent",
+          "input_pricing_mode": "input_dependent",
+          "unit": "per_1m_tokens"
+        },
+        "context_window": 500000,
+        "max_output": 500000
+      },
+      {
+        "id": "grok-4.3",
+        "name": "Grok 4.3",
+        "is_reasoning": true,
+        "description": "SpaceXSI's lower-cost 1M-context reasoning model; a request of 200k tokens or more bills at twice the rate",
+        "pricing": {
+          "input_tiers": [
+            {
+              "max_tokens": 200000,
+              "rate": 1.25,
+              "cached_input": 0.2
+            },
+            {
+              "max_tokens": null,
+              "rate": 2.5,
               "cached_input": 0.4
             }
           ],
           "output_tiers": [
             {
               "max_tokens": 200000,
-              "rate": 12.0
+              "rate": 2.5
             },
             {
               "max_tokens": null,
-              "rate": 18.0
+              "rate": 5.0
             }
           ],
           "output_pricing_mode": "input_dependent",
-          "cache_storage": 4.5,
+          "input_pricing_mode": "input_dependent",
           "unit": "per_1m_tokens"
-        }
+        },
+        "context_window": 1000000,
+        "max_output": 1000000
+      },
+      {
+        "id": "grok-build-0.1",
+        "name": "Grok Build",
+        "is_reasoning": true,
+        "description": "SpaceXSI's coding model; a request of 200k tokens or more bills at twice the rate",
+        "pricing": {
+          "input_tiers": [
+            {
+              "max_tokens": 200000,
+              "rate": 1.0,
+              "cached_input": 0.2
+            },
+            {
+              "max_tokens": null,
+              "rate": 2.0,
+              "cached_input": 0.4
+            }
+          ],
+          "output_tiers": [
+            {
+              "max_tokens": 200000,
+              "rate": 2.0
+            },
+            {
+              "max_tokens": null,
+              "rate": 4.0
+            }
+          ],
+          "output_pricing_mode": "input_dependent",
+          "input_pricing_mode": "input_dependent",
+          "unit": "per_1m_tokens"
+        },
+        "context_window": 256000,
+        "max_output": 256000
       }
     ],
     "lm-studio": [],
@@ -706,7 +829,7 @@
         "id": "openai/gpt-oss-20b",
         "name": "GPT-OSS-20B (Groq)",
         "is_reasoning": true,
-        "description": "OpenAI's open-source 20B MoE reasoning model hosted on Groq (~521 tps)",
+        "description": "Retired 2026-10-24, removed with no successor. Kept until the next retirement so a custom model on this id still bills.",
         "context_window": 131072,
         "max_output": 65536,
         "pricing": {
@@ -720,7 +843,7 @@
         "id": "openai/gpt-oss-120b",
         "name": "GPT-OSS-120B (Groq)",
         "is_reasoning": true,
-        "description": "OpenAI's open-source 120B MoE reasoning model hosted on Groq (~500 tps)",
+        "description": "Retired 2026-10-24, removed with no successor. Kept until the next retirement so a custom model on this id still bills.",
         "context_window": 131072,
         "max_output": 65536,
         "pricing": {
@@ -734,7 +857,7 @@
         "id": "openai/gpt-oss-safeguard-20b",
         "name": "GPT-OSS-Safeguard-20B (Groq)",
         "is_reasoning": true,
-        "description": "OpenAI's safety reasoning model built on gpt-oss-20b, hosted on Groq (~784 tps)",
+        "description": "Retired 2026-10-24, removed with no successor. Kept until the next retirement so a custom model on this id still bills.",
         "context_window": 131072,
         "max_output": 65536,
         "pricing": {
@@ -793,7 +916,7 @@
         "id": "gpt-oss-120b",
         "name": "GPT-OSS-120B (Cerebras)",
         "is_reasoning": true,
-        "description": "OpenAI's open-source 120B MoE reasoning model hosted on Cerebras (~353 tps)",
+        "description": "Retired 2026-10-24, removed with no successor. Kept until the next retirement so a custom model on this id still bills.",
         "context_window": 131072,
         "max_output": 41000,
         "pricing": {
@@ -807,7 +930,7 @@
         "id": "gpt-oss-safeguard-20b",
         "name": "GPT-OSS-Safeguard-20B (Cerebras)",
         "is_reasoning": true,
-        "description": "OpenAI's safety reasoning model built on gpt-oss-20b, hosted on Cerebras",
+        "description": "Retired 2026-10-24, removed with no successor. Kept until the next retirement so a custom model on this id still bills.",
         "context_window": 131072,
         "max_output": 41000,
         "pricing": {
@@ -829,11 +952,13 @@
       "use_response_api": true,
       "prompt_cache_key": true,
       "display_name": "OpenAI",
+      "category": "closed_source",
       "reasoning_compat_group": "openai",
       "variants": {
         "codex-oauth": {
           "sdk": "codex",
           "base_url": "https://chatgpt.com/backend-api/codex",
+          "client_version": "0.164.0",
           "env_key": null,
           "access_type": "oauth",
           "use_response_api": true,
@@ -850,6 +975,7 @@
       "access_type": "api_key",
       "byok_eligible": true,
       "display_name": "Anthropic",
+      "category": "closed_source",
       "reasoning_compat_group": "anthropic",
       "variants": {
         "claude-oauth": {
@@ -872,7 +998,27 @@
       "env_key": "GEMINI_API_KEY",
       "access_type": "api_key",
       "byok_eligible": true,
-      "display_name": "Gemini"
+      "display_name": "Gemini",
+      "category": "closed_source"
+    },
+    "xai": {
+      "sdk": "openai",
+      "base_url": "https://api.x.ai/v1",
+      "env_key": "XAI_API_KEY",
+      "access_type": "api_key",
+      "byok_eligible": true,
+      "use_response_api": true,
+      "prompt_cache_key": true,
+      "display_name": "SpaceXSI (Grok)",
+      "category": "closed_source",
+      "operator_channel": "developer",
+      "variants": {
+        "grok-oauth": {
+          "env_key": null,
+          "access_type": "oauth",
+          "display_name": "Grok"
+        }
+      }
     },
     "dashscope": {
       "operator_channel": "developer",
@@ -880,6 +1026,7 @@
       "access_type": "api_key",
       "region": "cn",
       "display_name": "DashScope (Qwen)",
+      "category": "open_source",
       "variants": {
         "dashscope": {
           "sdk": "dashscope",
@@ -903,30 +1050,14 @@
         }
       }
     },
-    "volcengine": {
-      "env_key": "VOLCENGINE_API_KEY",
-      "access_type": "api_key",
-      "region": "cn",
-      "display_name": "Doubao",
-      "variants": {
-        "volcengine": {
-          "sdk": "openai",
-          "base_url": "https://ark.cn-beijing.volces.com/api/v3",
-          "use_response_api": true
-        },
-        "doubao-coding": {
-          "sdk": "anthropic",
-          "base_url": "https://ark.cn-beijing.volces.com/api/coding",
-          "access_type": "coding_plan"
-        }
-      }
-    },
     "moonshot": {
       "sdk": "anthropic",
       "base_url": "https://api.moonshot.ai/anthropic",
+      "models_url": "https://api.moonshot.ai/v1/models",
       "env_key": "MOONSHOT_API_KEY",
       "access_type": "api_key",
       "display_name": "Moonshot (Kimi)",
+      "category": "open_source",
       "operator_channel": "system",
       "variants": {
         "moonshot-coding": {
@@ -945,6 +1076,7 @@
       "access_type": "api_key",
       "byok_eligible": true,
       "display_name": "Zhipu AI",
+      "category": "open_source",
       "variants": {
         "z-ai-cn": {
           "base_url": "https://open.bigmodel.cn/api/paas/v4/",
@@ -975,6 +1107,7 @@
       "access_type": "api_key",
       "byok_eligible": true,
       "display_name": "MiniMax",
+      "category": "open_source",
       "operator_channel": "system",
       "variants": {
         "minimax-coding": {
@@ -986,28 +1119,24 @@
       }
     },
     "openrouter": {
-      "sdk": "deepseek",
+      "sdk": "openrouter",
       "base_url": "https://openrouter.ai/api/v1",
       "env_key": "OPENROUTER_API_KEY",
       "access_type": "api_key",
       "byok_eligible": true,
       "display_name": "OpenRouter",
-      "variants": {
-        "deepinfra": {
-          "sdk": "openai",
-          "use_response_api": true,
-          "comment": "DeepInfra models accessed via OpenRouter with provider routing"
-        }
-      }
+      "category": "inference"
     },
     "deepseek": {
       "operator_channel": "system",
       "sdk": "anthropic",
       "base_url": "https://api.deepseek.com/anthropic",
+      "models_url": "https://api.deepseek.com/models",
       "env_key": "DEEPSEEK_API_KEY",
       "access_type": "api_key",
       "byok_eligible": true,
       "display_name": "DeepSeek",
+      "category": "open_source",
       "tool_turns_need_reasoning": true
     },
     "groq": {
@@ -1016,7 +1145,8 @@
       "env_key": "GROQ_API_KEY",
       "access_type": "api_key",
       "use_response_api": true,
-      "display_name": "Groq"
+      "display_name": "Groq",
+      "category": "inference"
     },
     "cerebras": {
       "sdk": "openai",
@@ -1024,7 +1154,8 @@
       "env_key": "CEREBRAS_API_KEY",
       "access_type": "api_key",
       "use_response_api": false,
-      "display_name": "Cerebras"
+      "display_name": "Cerebras",
+      "category": "inference"
     },
     "lm-studio": {
       "sdk": "openai",

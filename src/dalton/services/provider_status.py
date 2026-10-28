@@ -269,10 +269,13 @@ async def get_providers_status(*, user_id: str) -> dict[str, Any]:
 
         if is_oauth:
             try:
-                from src.server.database.oauth_tokens import get_oauth_status
+                # Unified projection: a connection is configured when its state
+                # says connected, not merely because a token row exists.
+                from src.server.services.oauth_health import connection_state
+                from src.server.database.oauth_tokens import get_oauth_connection
 
-                st = await get_oauth_status(user_id, prov) or {}
-                configured = bool(st.get("connected"))
+                st = (await get_oauth_connection(user_id, prov)) or {}
+                configured = connection_state(st) == "connected"
                 expires_at = st.get("expires_at")
                 seconds_left: int | None = None
                 expires_iso: str | None = None

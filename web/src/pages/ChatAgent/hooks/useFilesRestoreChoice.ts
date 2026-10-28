@@ -14,7 +14,7 @@ import { queryKeys } from '@/lib/queryKeys';
 import type { Workspace } from '@/types/api';
 
 import { chooseFilesRestore } from '../utils/api';
-import { apiErrorReason, apiErrorStatus } from '../utils/api/errors';
+import { apiErrorReason, apiErrorStatus } from '@/api/errors';
 
 export function filesRestoreChoiceKey(workspaceId: string) {
   return ['files-restore-choice', workspaceId] as const;

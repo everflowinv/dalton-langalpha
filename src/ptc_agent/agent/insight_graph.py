@@ -23,8 +23,8 @@ from ptc_agent.agent.middleware import (
     ToolErrorHandlingMiddleware,
     ToolResultNormalizationMiddleware,
 )
-from ptc_agent.agent.middleware.openai_prompt_caching import (
-    OpenAIPromptCachingMiddleware,
+from ptc_agent.agent.middleware.system_prompt_caching import (
+    SystemPromptCacheMiddleware,
 )
 from ptc_agent.agent.state import DeltaAgentState
 from ptc_agent.agent.turn import build_model_resilience_middleware, turn_model
@@ -102,7 +102,7 @@ def build_insight_graph(config: AgentConfig) -> Any:
             CompactionMiddleware.for_agent(config),
             build_model_resilience_middleware(config, turn),
             AnthropicPromptCachingMiddleware(unsupported_model_behavior="ignore"),
-            OpenAIPromptCachingMiddleware(),
+            SystemPromptCacheMiddleware(),
             EmptyToolCallRetryMiddleware(),
             DaltonPatchToolCallsMiddleware(),  # DALTON-HOOK(dalton-patch-tool-calls)
             # Inside model resilience, so it sanitizes against the model a

@@ -206,15 +206,15 @@ def test_credential_user_id_three_cases(
 
 
 # ---------------------------------------------------------------------------
-# 2. OAuth status & get_oauth_tokens return holder's tokens for team member
+# 2. OAuth connection & get_oauth_tokens return holder's tokens for team member
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_oauth_status_and_get_tokens_return_holder_for_member(
+async def test_oauth_connection_and_get_tokens_return_holder_for_member(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Member calling `get_oauth_status` and `get_oauth_tokens` reads the holder's row and cache key."""
+    """Member calling `get_oauth_connection` and `get_oauth_tokens` reads the holder's row and cache key."""
     _enable_team_sharing(monkeypatch)
     expires = datetime.now(timezone.utc) + timedelta(hours=2)
     fake_row = {
@@ -254,8 +254,10 @@ async def test_oauth_status_and_get_tokens_return_holder_for_member(
         create_autospec(lambda: fake_cache, return_value=fake_cache),
     )
 
-    status = await oauth_tokens_db.get_oauth_status(MEMBER_ID, "codex-oauth")
-    assert status["connected"] is True
+    from src.server.services.oauth_health import connection_state
+
+    status = await oauth_tokens_db.get_oauth_connection(MEMBER_ID, "codex-oauth")
+    assert connection_state(status) == "connected"
     assert status["email"] == "owner@everflow.ai"
     assert executed[0][1] == (HOLDER_ID, "codex-oauth")
 
@@ -266,13 +268,15 @@ async def test_oauth_status_and_get_tokens_return_holder_for_member(
 
     has_tok = await oauth_tokens_db.has_any_oauth_token(MEMBER_ID)
     assert has_tok is True
-    fake_redis_client.get.assert_called_once_with(f"oauth_active:{HOLDER_ID}")
+    fake_redis_client.get.assert_called_once_with(f"oauth_active:v2:{HOLDER_ID}")
     fake_redis_client.set.assert_called_once_with(
-        f"oauth_active:{HOLDER_ID}", b"1", ex=86400
+        f"oauth_active:v2:{HOLDER_ID}", b"1", ex=86400
     )
 
     await oauth_tokens_db.invalidate_oauth_active_cache(MEMBER_ID)
-    fake_redis_client.delete.assert_called_once_with(f"oauth_active:{HOLDER_ID}")
+    fake_redis_client.delete.assert_called_once_with(
+        f"oauth_active:v2:{HOLDER_ID}", f"oauth_active:{HOLDER_ID}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -309,7 +313,6 @@ async def test_oauth_refresh_lock_key_uses_holder_id_and_events_record_actor(
     }
 
     lock_keys: list[str] = []
-    awaited_users: list[tuple[str, str]] = []
 
     fake_cache = create_autospec(RedisCacheClient(), instance=True)
 
@@ -323,43 +326,40 @@ async def test_oauth_refresh_lock_key_uses_holder_id_and_events_record_actor(
         create_autospec(lambda: fake_cache, return_value=fake_cache),
     )
 
-    async def _await_refreshed(user_id: str, provider: str) -> dict[str, Any] | None:
-        awaited_users.append((user_id, provider))
-        return fresh_row
+    import src.server.services.oauth_health as oauth_health_mod
+    import src.server.services.oauth_refresh_wait as oauth_refresh_wait_mod
 
-    # 3a. Codex OAuth (lock contended -> awaits HOLDER_ID)
-    monkeypatch.setattr(
-        codex_oauth_mod,
-        "get_oauth_tokens",
-        create_autospec(codex_oauth_mod.get_oauth_tokens, return_value=expired_row),
-    )
-    monkeypatch.setattr(
-        codex_oauth_mod,
-        "await_refreshed_tokens",
-        create_autospec(codex_oauth_mod.await_refreshed_tokens, side_effect=_await_refreshed),
-    )
-    tok_res = await codex_oauth_mod.get_valid_token(MEMBER_ID)
+    def _patch_token_reads(first: dict[str, Any], second: dict[str, Any]) -> None:
+        # The unified protocol holds its own bindings of get_oauth_tokens
+        # (oauth_health for the first read, oauth_refresh_wait for the
+        # contended wait), so both are patched.
+        real_get_tokens = oauth_tokens_db.get_oauth_tokens
+        monkeypatch.setattr(
+            oauth_health_mod,
+            "get_oauth_tokens",
+            create_autospec(real_get_tokens, return_value=first),
+        )
+        monkeypatch.setattr(
+            oauth_refresh_wait_mod,
+            "get_oauth_tokens",
+            create_autospec(real_get_tokens, return_value=second),
+        )
+
+    # 3a. Codex OAuth via the unified refresh protocol (lock contended ->
+    # waits for the other holder of the HOLDER-keyed lock; the awaited read
+    # maps the member onto the holder's row inside get_oauth_tokens)
+    _patch_token_reads(expired_row, fresh_row)
+    tok_res = await oauth_health_mod.valid_token(MEMBER_ID, "codex-oauth")
     assert tok_res is not None
-    assert tok_res["access_token"] == "fresh-holder-token"
+    assert tok_res.access_token == "fresh-holder-token"
     assert lock_keys[-1] == f"oauth:refresh:{HOLDER_ID}:codex-oauth"
-    assert awaited_users[-1] == (HOLDER_ID, "codex-oauth")
 
-    # 3b. Claude OAuth (lock contended -> awaits HOLDER_ID)
-    monkeypatch.setattr(
-        claude_oauth_mod,
-        "get_oauth_tokens",
-        create_autospec(claude_oauth_mod.get_oauth_tokens, return_value=expired_row),
-    )
-    monkeypatch.setattr(
-        claude_oauth_mod,
-        "await_refreshed_tokens",
-        create_autospec(claude_oauth_mod.await_refreshed_tokens, side_effect=_await_refreshed),
-    )
-    claude_tok = await claude_oauth_mod.get_valid_token(MEMBER_ID)
+    # 3b. Claude OAuth (lock contended -> same HOLDER-keyed lock)
+    _patch_token_reads(expired_row, fresh_row)
+    claude_tok = await oauth_health_mod.valid_token(MEMBER_ID, "claude-oauth")
     assert claude_tok is not None
-    assert claude_tok["access_token"] == "fresh-holder-token"
+    assert claude_tok.access_token == "fresh-holder-token"
     assert lock_keys[-1] == f"oauth:refresh:{HOLDER_ID}:claude-oauth"
-    assert awaited_users[-1] == (HOLDER_ID, "claude-oauth")
 
     # 3c. Antigravity, Muse, Codex & Claude OAuth when lock is acquired:
     #     refresh passes caller `MEMBER_ID` to `upsert_oauth_tokens`, which writes `HOLDER_ID` to DB and logs actor=`MEMBER_ID` + credential=`HOLDER_ID`
@@ -461,26 +461,138 @@ async def test_oauth_refresh_lock_key_uses_holder_id_and_events_record_actor(
     assert f"upsert user_id={MEMBER_ID} credential_user_id={HOLDER_ID} provider=muse-oauth" in caplog.text
     assert muse_events == [(MEMBER_ID, "refresh_ok")]
 
-    # 3e. Claude OAuth when lock is acquired: DB write targets HOLDER_ID, DB log records MEMBER_ID as actor
-    monkeypatch.setattr(
-        claude_oauth_mod,
-        "refresh_tokens",
-        create_autospec(
-            claude_oauth_mod.refresh_tokens,
-            return_value={"access_token": "claude-new-tok", "refresh_token": "claude-new-ref", "expires_in": 3600},
+    # 3e. Claude OAuth when lock is acquired: the unified protocol refreshes on
+    # the holder's stored refresh token and saves over the holder's row.
+    from src.server.services.oauth_protocol import TokenSet
+
+    import src.server.services.oauth_providers as oauth_providers_mod
+    from dataclasses import replace as _dc_replace
+
+    fake_claude_refresh = create_autospec(
+        claude_oauth_mod.refresh_tokens,
+        return_value=TokenSet(
+            access_token="claude-new-tok",
+            refresh_token="claude-new-ref",
+            expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
         ),
     )
+    # The registry holds the refresh callable by reference, so the patched
+    # entry replaces the whole subscription record oauth_health reads.
     monkeypatch.setattr(
-        claude_oauth_mod,
-        "invalidate_oauth_active_cache",
-        create_autospec(claude_oauth_mod.invalidate_oauth_active_cache, return_value=None),
+        oauth_health_mod,
+        "SUBSCRIPTIONS",
+        {
+            **oauth_providers_mod.SUBSCRIPTIONS,
+            "claude-oauth": _dc_replace(
+                oauth_providers_mod.SUBSCRIPTIONS["claude-oauth"],
+                refresh=fake_claude_refresh,
+            ),
+        },
+    )
+    monkeypatch.setattr(
+        oauth_tokens_db,
+        "get_db_connection",
+        get_db_conn_refresh,
+    )
+    _real_get_tokens_3e = oauth_tokens_db.get_oauth_tokens
+    monkeypatch.setattr(
+        oauth_tokens_db,
+        "get_oauth_tokens",
+        create_autospec(_real_get_tokens_3e, return_value=expired_row),
+    )
+    monkeypatch.setattr(
+        oauth_health_mod,
+        "get_oauth_tokens",
+        create_autospec(_real_get_tokens_3e, return_value=expired_row),
     )
     caplog.clear()
-    claude_refreshed = await claude_oauth_mod.get_valid_token(MEMBER_ID)
+    claude_refreshed = await oauth_health_mod.valid_token(MEMBER_ID, "claude-oauth")
     assert claude_refreshed is not None
-    assert claude_refreshed["access_token"] == "claude-new-tok"
-    assert executed_refresh[-1][1][0] == HOLDER_ID
-    assert f"upsert user_id={MEMBER_ID} credential_user_id={HOLDER_ID} provider=claude-oauth" in caplog.text
+    assert claude_refreshed.access_token == "claude-new-tok"
+    assert lock_keys[-1] == f"oauth:refresh:{HOLDER_ID}:claude-oauth"
+    # replace_refreshed_tokens writes the HOLDER's row (mapping inside).
+    replace_sql, replace_params = executed_refresh[-1]
+    assert "UPDATE user_oauth_tokens" in replace_sql
+    assert replace_params[-4] == HOLDER_ID
+    assert replace_params[-3] == "claude-oauth"
+
+
+# ---------------------------------------------------------------------------
+# 3f. A refresh failure a non-holder triggers flags the HOLDER's row
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_member_triggered_refresh_failure_flags_holder_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When a member's turn triggers a refresh that fails for good, the
+    needs-reauth flag lands on the credential holder's row, not the member's."""
+    import src.server.services.oauth_health as oauth_health_mod
+
+    _enable_team_sharing(monkeypatch)
+    expires = datetime.now(timezone.utc) - timedelta(minutes=5)
+    expired_row = {
+        "access_token": "holder-access-tok",
+        "refresh_token": "holder-refresh-tok",
+        "account_id": "acct-holder",
+        "email": "owner@everflow.ai",
+        "plan_type": "pro",
+        "expires_at": expires,
+    }
+
+    fake_cache = create_autospec(RedisCacheClient(), instance=True)
+    fake_cache.acquire_lock.side_effect = None
+    fake_cache.acquire_lock.return_value = True
+    fake_cache.release_lock.return_value = None
+    fake_cache.enabled = True
+    fake_cache.client = create_autospec(aioredis.Redis, instance=True)
+    fake_cache.client.delete.return_value = 1
+    monkeypatch.setattr(
+        "src.utils.cache.redis_cache.get_cache_client",
+        create_autospec(lambda: fake_cache, return_value=fake_cache),
+    )
+
+    monkeypatch.setattr(
+        oauth_health_mod,
+        "get_oauth_tokens",
+        create_autospec(oauth_health_mod.get_oauth_tokens, return_value=expired_row),
+    )
+
+    import httpx
+
+    refused = httpx.Response(
+        401, request=httpx.Request("POST", "https://token.example"), json={"error": "invalid_grant"}
+    )
+    import src.server.services.oauth_providers as oauth_providers_mod
+    from dataclasses import replace as _dc_replace
+
+    fake_codex_refresh = create_autospec(
+        codex_oauth_mod.refresh_tokens,
+        side_effect=httpx.HTTPStatusError("401", request=refused.request, response=refused),
+    )
+    monkeypatch.setattr(
+        oauth_health_mod,
+        "SUBSCRIPTIONS",
+        {
+            **oauth_providers_mod.SUBSCRIPTIONS,
+            "codex-oauth": _dc_replace(
+                oauth_providers_mod.SUBSCRIPTIONS["codex-oauth"],
+                refresh=fake_codex_refresh,
+            ),
+        },
+    )
+
+    get_db_conn, _, executed = _make_autospec_db()
+    monkeypatch.setattr(oauth_tokens_db, "get_db_connection", get_db_conn)
+
+    with pytest.raises(oauth_health_mod.OAuthReauthRequired):
+        await oauth_health_mod.valid_token(MEMBER_ID, "codex-oauth")
+
+    flag_sql, flag_params = executed[-1]
+    assert "needs_reauth_at" in flag_sql
+    assert flag_params[1] == HOLDER_ID
+    assert flag_params[2] == "codex-oauth"
 
 
 # ---------------------------------------------------------------------------
@@ -615,8 +727,9 @@ async def test_non_pm_delete_and_disconnect_forbidden_while_pm_allowed(
     # - PUT /api-keys with None, empty string "", whitespace "   ", or None + base_url
     # - PUT /api-keys with byok_enabled=False
     for call in [
-        lambda: oauth_app.codex_disconnect(user_id=MEMBER_ID),
-        lambda: oauth_app.claude_disconnect(user_id=MEMBER_ID),
+        lambda: oauth_app.oauth_disconnect(key="codex", user_id=MEMBER_ID),
+        lambda: oauth_app.oauth_disconnect(key="claude", user_id=MEMBER_ID),
+        lambda: oauth_app.oauth_disconnect(key="grok", user_id=MEMBER_ID),
         lambda: oauth_native_app.muse_disconnect(user_id=MEMBER_ID),
         lambda: oauth_native_app.antigravity_disconnect(user_id=MEMBER_ID),
         lambda: oauth_native_app.xai_disconnect(user_id=MEMBER_ID),
@@ -766,14 +879,24 @@ async def test_non_pm_delete_and_disconnect_forbidden_while_pm_allowed(
     monkeypatch.setattr(
         oauth_app,
         "delete_oauth_tokens",
-        create_autospec(oauth_app.delete_oauth_tokens, return_value=True),
+        create_autospec(oauth_app.delete_oauth_tokens, return_value=None),
+    )
+
+    @asynccontextmanager
+    async def _null_connection_change(user_id: str, provider: str):
+        yield None
+
+    monkeypatch.setattr(
+        oauth_app,
+        "connection_change",
+        _null_connection_change,
     )
     monkeypatch.setattr(
         oauth_app,
-        "invalidate_oauth_active_cache",
-        create_autospec(oauth_app.invalidate_oauth_active_cache, return_value=None),
+        "connection_changed",
+        create_autospec(oauth_app.connection_changed, return_value=None),
     )
-    pm_disconnect = await oauth_app.codex_disconnect(user_id=SECOND_PM_ID)
+    pm_disconnect = await oauth_app.oauth_disconnect(key="codex", user_id=SECOND_PM_ID)
     assert pm_disconnect == {"success": True}
 
 

@@ -214,7 +214,7 @@ function ChartWidget({ instance, updateConfig }: WidgetRenderProps<ChartConfig>)
   const ctRef = useRef(ct);
   ctRef.current = ct;
 
-  // Shared WS provided at DashboardCustom level. When ginlix-data is disabled
+  // Shared WS provided by the Dashboard page. When ginlix-data is disabled
   // the hook returns an empty `prices` map and `subscribe` is a no-op.
   const { prices, subscribe, unsubscribe, ginlixDataEnabled } = useMarketDataWSContext();
 

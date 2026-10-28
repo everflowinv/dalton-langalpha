@@ -47,8 +47,8 @@ def accounts(monkeypatch) -> dict[str, str | None]:
     other read in memory."""
     connected: dict[str, str | None] = {}
 
-    async def status(user_id: str, provider: str) -> dict:
-        return {"connected": provider in connected, "plan_type": connected.get(provider)}
+    async def status(user_id: str, provider: str) -> dict | None:
+        return {"plan_type": connected[provider]} if provider in connected else None
 
     async def no_settings(_user_id):
         return {}
@@ -75,7 +75,7 @@ def accounts(monkeypatch) -> dict[str, str | None]:
         return dict(world.bases), tuple(world.offered)
 
     monkeypatch.setattr("src.config.settings.HOST_MODE", "oss")
-    monkeypatch.setattr("src.server.database.oauth_tokens.get_oauth_status", status)
+    monkeypatch.setattr("src.server.database.oauth_tokens.get_oauth_connection", status)
     monkeypatch.setattr("src.server.database.api_keys.is_byok_active", not_byok)
     monkeypatch.setattr("src.server.services.llm.user_models.get_model_preference", no_settings)
     monkeypatch.setattr("src.server.services.llm.capabilities.gate_capabilities", ungated)
@@ -94,6 +94,17 @@ async def test_an_oauth_pin_is_unavailable_until_its_account_is_connected(accoun
     if connected:
         accounts[provider] = None
     assert await _flagged(model) is not connected
+
+
+async def test_an_oauth_pin_on_an_account_needing_sign_in_is_unavailable(accounts, monkeypatch):
+    # valid_token refuses the account, so the turn runs the main model instead.
+    model, provider, _ = _oauth_model()
+
+    async def flagged(_user_id, p):
+        return {"plan_type": None, "needs_reauth_at": "2026-10-25T00:00:00Z"} if p == provider else None
+
+    monkeypatch.setattr("src.server.database.oauth_tokens.get_oauth_connection", flagged)
+    assert await _flagged(model) is True
 
 
 @pytest.mark.parametrize(("plan", "runs"), [("other-plan", False), (None, True), ("listed", True)])
@@ -159,6 +170,21 @@ async def test_a_custom_provider_pin_runs_only_on_its_own_key(
     monkeypatch.setattr("src.server.database.api_keys.get_byok_config_for_provider", config)
     monkeypatch.setattr("src.server.database.api_keys.get_byok_configs_for_providers", configs)
     assert await _flagged(slug) is not runs
+
+
+@pytest.mark.parametrize("connected", [False, True])
+async def test_a_custom_model_on_a_subscription_runs_on_its_account(accounts, monkeypatch, connected):
+    # A model the subscription lists but the manifest doesn't is saved as a
+    # custom entry, and the turn runs it on the sign-in, with no key and BYOK off.
+    _, provider, _ = _oauth_model()
+    if connected:
+        accounts[provider] = None
+
+    async def settings(_user_id):
+        return {"custom_models": [{"name": "untuned", "model_id": "untuned", "provider": provider}]}
+
+    monkeypatch.setattr("src.server.services.llm.user_models.get_model_preference", settings)
+    assert await _flagged("untuned") is not connected
 
 
 async def _flagged(model: str) -> bool:

@@ -8,7 +8,7 @@
  */
 import type { useTranslation } from 'react-i18next';
 
-import { apiErrorDetail } from './api/errors';
+import { apiErrorDetail } from '@/api/errors';
 
 type Translate = ReturnType<typeof useTranslation>['t'];
 

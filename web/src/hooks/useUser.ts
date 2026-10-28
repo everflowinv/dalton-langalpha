@@ -1,7 +1,7 @@
 import { useQuery } from '@tanstack/react-query';
 import { queryKeys } from '../lib/queryKeys';
 import { getCurrentUser } from '../pages/Dashboard/utils/api';
-import { apiErrorStatus } from '../pages/ChatAgent/utils/api/errors';
+import { apiErrorStatus } from '@/api/errors';
 import type { User } from '../types/api';
 
 /** A 503 says the plan cannot be read right now (the platform is restarting),

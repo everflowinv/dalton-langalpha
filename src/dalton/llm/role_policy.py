@@ -186,23 +186,27 @@ async def explain_model_availability(
     broker_enabled = is_broker_models_enabled()
     meta_map = load_dalton_meta()
 
-    # Query OAuth statuses for the 4 subscription providers
+    # Query OAuth connection states for the subscription providers. Availability
+    # follows the unified projection (state, not row presence): a flagged or
+    # unreadable connection is not connected.
     oauth_connected: dict[str, bool] = {}
     try:
-        from src.server.database.oauth_tokens import get_oauth_status
+        from src.server.services.oauth_health import connection_state
+        from src.server.database.oauth_tokens import get_oauth_connection
 
         for prov_key in _OAUTH_PROVIDER_TOKEN_KEYS:
             try:
-                st = await get_oauth_status(user_id, prov_key)
-                connected = bool(st and st.get("connected"))
+                row = await get_oauth_connection(user_id, prov_key)
+                connected = connection_state(row) == "connected"
                 if connected and prov_key == "muse-oauth":
                     from src.dalton.llm.providers.muse.oauth import (
                         is_invalidated_muse_token,
                         is_minted_muse_token,
                     )
 
-                    if is_invalidated_muse_token(st) or (
-                        isinstance(st, dict) and "account_id" in st and not is_minted_muse_token(st)
+                    if row and (
+                        is_invalidated_muse_token(row)
+                        or ("account_id" in row and not is_minted_muse_token(row))
                     ):
                         connected = False
                 oauth_connected[prov_key] = connected

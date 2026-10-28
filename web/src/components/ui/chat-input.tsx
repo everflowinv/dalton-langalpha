@@ -9,6 +9,7 @@ import { useEffectiveTuning, useModelProfileWriter } from '@/hooks/useModelProfi
 import { useFeatureEnabled } from '@/hooks/useFeatures';
 import { homeWorkspaceQuery } from '@/hooks/useHomeWorkspace';
 import { useAllModels } from '@/hooks/useAllModels';
+import { useLapsedSignIn } from '@/hooks/useLapsedSignIn';
 import { useIsMobile } from '@/hooks/useIsMobile';
 import { useQuickAccessModels } from '@/hooks/useQuickAccessModels';
 import { useSeededModel } from '@/hooks/useSeededModel';
@@ -210,6 +211,7 @@ function ChatInput({
   const { preferences, isLoaded: preferencesRead } = usePreferences();
   const marketWatchEnabled = useFeatureEnabled('market_watch');
   const { validModelNames, metadata: modelMetadata, isLoading: modelsLoading } = useAllModels();
+  const lapsedSignIn = useLapsedSignIn();
   const otherPref = (preferences as Record<string, Record<string, unknown>> | null)?.other_preference;
   // DALTON-HOOK(composer-drafts): persist unsent composer text in localStorage when draftKey is set
   const resetRichDraftRef = useRef<() => void>(() => {});
@@ -899,6 +901,7 @@ function ChatInput({
                 fastMode={resolvedFastMode}
                 onFastModeChange={handleFastModeChange}
                 isCodexModel={isCodexModel}
+                needsSignIn={(m) => lapsedSignIn(m) !== null}
                 reasoningEfforts={reasoningEfforts}
                 dropdownDirection={dropdownDirection}
                 container={chatContainer}

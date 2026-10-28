@@ -344,7 +344,7 @@ async def test_the_plan_check_exempts_a_model_the_user_brings_a_key_or_subscript
         patch("src.server.services.llm.user_models.classify_model",
               AsyncMock(return_value=classified)),
         patch("src.llms.llm.LLM.get_model_config", return_value=mc),
-        patch("src.server.services.llm.clients._walk_byok_candidates", walk),
+        patch("src.server.services.llm.clients.walk_byok_candidates", walk),
     ):
         allowed = await model_on_plan(
             USER, "m-1", model_pref={}, permits=_plan_one, is_byok=is_byok, byok_cache={},

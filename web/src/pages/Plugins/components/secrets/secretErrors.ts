@@ -4,7 +4,7 @@ import {
   apiErrorReason,
   apiErrorStatus,
   apiValidationErrors,
-} from '@/pages/ChatAgent/utils/api/errors';
+} from '@/api/errors';
 import type { FormError } from './secretDraft';
 
 /**

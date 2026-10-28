@@ -360,7 +360,8 @@ export function WizardExit({ label, onClick, testId }: { label: string; onClick:
 }
 
 interface WizardStepHeaderProps {
-  title: string;
+  /** Text, or text with a mark beside it (a provider's step). */
+  title: ReactNode;
   /** id for the title, so the step's control can be named by it. */
   titleId: string;
   /** One line under the question; inline content only, as it sits in a <p>. */

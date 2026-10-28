@@ -14,14 +14,14 @@ import type { AppSection } from '@/lib/appRoutes';
 // network fetch. Keyed by every section `APP_SECTIONS` names, so a link the
 // chat routes in place always has a page here.
 const routeChunks = {
-  dashboard: () => import('../../pages/Dashboard/DashboardRouter'),
+  dashboard: () => import('../../pages/Dashboard/Dashboard'),
   chat: () => import('../../pages/ChatAgent/ChatAgent'),
   market: () => import('../../pages/MarketView/MarketView'),
   news: () => import('../../pages/Detail/NewsDetailPage'),
   automations: () => import('../../pages/Automations/Automations'),
   // DALTON-HOOK(hide-trading): the Orders page is not built; an /orders warm
   // takes the dashboard chunk, the same one the catch-all redirect lands on.
-  orders: () => import('../../pages/Dashboard/DashboardRouter'),
+  orders: () => import('../../pages/Dashboard/Dashboard'),
   plugins: () => import('../../pages/Plugins/Plugins'),
   settings: () => import('../../pages/Settings/Settings'),
   // Alias so preloading /connectors (the legacy path) warms the right chunk.

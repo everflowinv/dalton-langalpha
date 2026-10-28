@@ -89,6 +89,15 @@ end
 return 0
 """
 
+# Compare-and-set, keeping the key's TTL.
+_SWAP_LUA = """
+if redis.call('get', KEYS[1]) == ARGV[1] then
+    redis.call('set', KEYS[1], ARGV[2], 'KEEPTTL')
+    return 1
+end
+return 0
+"""
+
 
 class RedisCacheClient:
     """
@@ -496,6 +505,17 @@ class RedisCacheClient:
         except Exception as e:
             self._log_error(f"Lock release error for {key}", e)
             self.stats["errors"] += 1
+
+    async def claim(self, key: str, value: str | bytes) -> bool:
+        """Delete ``key`` only while it still holds ``value``: True when this
+        caller took it. Raises when Redis cannot answer, since a caller acting
+        on a claim it never got would do the very thing the claim prevents."""
+        return bool(await self.client.eval(_RELEASE_LOCK_LUA, 1, key, value))
+
+    async def swap(self, key: str, old: str | bytes, new: str) -> bool:
+        """Replace ``key``'s value only while it still holds ``old``, keeping
+        its TTL: True when written."""
+        return bool(await self.client.eval(_SWAP_LUA, 1, key, old, new))
 
     async def exists(self, key: str) -> bool:
         """

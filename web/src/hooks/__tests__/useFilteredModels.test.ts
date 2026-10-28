@@ -6,6 +6,7 @@ import {
   buildConfiguredTypeMap,
   buildConfiguredSet,
   buildVisibleModels,
+  dropMissingModels,
 } from '../useFilteredModels';
 import type { ModelMetadataEntry } from '../useFilteredModels';
 import type { ConfiguredProvider } from '../useConfiguredProviders';
@@ -709,5 +710,65 @@ describe('oauth_plans gate', () => {
     } as unknown as PlatformModelsResponse;
     const result = buildVisibleModels(rawApiModels, rawMetadata, [], {}, platform, codexConnected('team'));
     expect(result.models.openai?.models).toEqual(['gpt-5.6-sol-oauth']);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// dropMissingModels — a connection's own list hides what it cannot run
+// ---------------------------------------------------------------------------
+
+describe('dropMissingModels', () => {
+  const metadata: Record<string, ModelMetadataEntry> = {
+    'gpt-a': { provider: 'codex-oauth', access_type: 'oauth' },
+    'gpt-spark': { provider: 'codex-oauth', access_type: 'oauth' },
+    'sonnet': { provider: 'anthropic', access_type: 'api_key' },
+    'mine': { provider: 'codex-oauth', is_custom_model: true },
+  };
+  const map = makeProviderMap({ 'codex-oauth': ['gpt-a', 'gpt-spark', 'mine'], anthropic: ['sonnet'] });
+
+  it('hides the missing models of a provider whose list was read', () => {
+    const out = dropMissingModels(map, metadata, new Map([['codex-oauth', new Set(['gpt-spark'])]]));
+    expect(out['codex-oauth'].models).toEqual(['gpt-a', 'mine']);
+    expect(out.anthropic.models).toEqual(['sonnet']);
+  });
+
+  it('changes nothing when no list was read (fail open)', () => {
+    expect(dropMissingModels(map, metadata, new Map())).toBe(map);
+  });
+
+  it("keeps a model the user added, and a group-scoped custom pair, whatever the list says", () => {
+    const missing = new Map([['codex-oauth', new Set(['mine', 'gpt-a'])]]);
+    const pairs = new Set(['codex-oauth::gpt-a']);
+    expect(dropMissingModels(map, metadata, missing, pairs)['codex-oauth'].models).toEqual(['gpt-a', 'gpt-spark', 'mine']);
+  });
+
+  it('runs inside buildVisibleModels, after the custom merge', () => {
+    const configured = [{ provider: 'codex-oauth', display_name: 'ChatGPT', access_type: 'oauth' as const }];
+    const result = buildVisibleModels(
+      { 'codex-oauth': { models: ['gpt-a', 'gpt-spark'] } },
+      metadata,
+      [],
+      {},
+      null,
+      configured,
+      new Map([['codex-oauth', new Set(['gpt-spark'])]]),
+    );
+    expect(result.models['codex-oauth'].models).toEqual(['gpt-a']);
+    // The pre-filter snapshot still carries it, for the screens that list the whole manifest.
+    expect(result.rawModels['codex-oauth'].models).toContain('gpt-spark');
+  });
+
+  it("drops a brand's model picked under a plan once the plan's own list stops serving it", () => {
+    // The pick is saved as an entry naming the plan, only so the plan's key
+    // runs it; it is the same model, so the plan's list still decides. One the
+    // user described under the same name, as another model, stays theirs.
+    const meta: Record<string, ModelMetadataEntry> = { 'glm-x': { provider: 'z-ai', model_id: 'glm-x' } };
+    const configured = [{ provider: 'z-ai-coding', display_name: 'GLM Coding', access_type: 'coding_plan' as const }];
+    const missing = new Map([['z-ai-coding', new Set(['glm-x'])]]);
+    const build = (model_id: string) => buildVisibleModels(
+      {}, meta, [{ name: 'glm-x', model_id, provider: 'z-ai-coding' }], {}, null, configured, missing,
+    );
+    expect(build('glm-x').models['z-ai-coding']?.models ?? []).toEqual([]);
+    expect(build('glm-x-house').models['z-ai-coding']?.models).toEqual(['glm-x']);
   });
 });

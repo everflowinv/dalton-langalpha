@@ -26,7 +26,7 @@ import { useReportBackWatch } from './useReportBackWatch';
 import { useChatFeedback } from './useChatFeedback';
 import { toast } from '@/components/ui/use-toast';
 import { buildRateLimitError, type ErrorLinkSpec, type StructuredError } from '@/utils/rateLimitError';
-import { isClientError } from '../utils/api/errors';
+import { isClientError } from '@/api/errors';
 import { getStoredThreadId, setStoredThreadId } from './utils/threadStorage';
 import { type SubagentTokenUsage, ZERO_USAGE } from '../utils/tokenUsage';
 import { computeSteeringBoundary } from '../session/stream/steeringRollback';
@@ -1984,6 +1984,14 @@ export function useChatMessages(
     // Build structured error with link when backend provides one
     // (byok_key_required, oauth_required, 403, ...).
     const errorInfo = errObj.errorInfo as Record<string, unknown> | undefined;
+    // The subscription's token could not be renewed just now, which the next
+    // try usually fixes: say so as a notice and leave the failed reply's Retry.
+    if (errorInfo?.type === 'oauth_refresh_unavailable') {
+      return {
+        banner: { message: (errorInfo.message as string) || (err as Error).message, kind: 'notice' },
+        answered: false,
+      };
+    }
     if (errorInfo?.link) {
       // Backend scrubbed stale model names from the user's saved
       // preferences — invalidate our cached copy so the selector and
@@ -1993,10 +2001,16 @@ export function useChatMessages(
       if (errorInfo.type === 'model_removed') {
         queryClient.invalidateQueries({ queryKey: queryKeys.user.preferences() });
       }
+      const link = errorInfo.link as ErrorLinkSpec;
       return {
         banner: {
           message: (errorInfo.message as string) || (err as Error).message || 'An error occurred.',
-          links: [errorInfo.link as ErrorLinkSpec],
+          // The server words the link in English; these we can translate.
+          links: [
+            errorInfo.type === 'oauth_reauth_required' ? { ...link, labelKey: 'chat.errorLinkReconnect' }
+              : errorInfo.type === 'oauth_plan_no_api_access' ? { ...link, labelKey: 'chat.errorLinkAddApiKey' }
+                : link,
+          ],
         },
         answered: true,
       };
@@ -2959,11 +2973,12 @@ export function useChatMessages(
       }
       if (recoverStaleAnswer(err)) return;
       // 429 and 503 are both the quota service answering rather than a failure
-      // to reach it, and it authors the copy the banner renders. Stacking a
+      // to reach it, and it authors the copy the banner renders, except a
+      // subscription's token refresh, which `refusalBanner` words. Stacking a
       // generic red bubble under that reads as a second, unrelated fault, so
       // the turn settles empty and MessageList hides it.
       const errObj = err as Record<string, unknown>;
-      if (errObj.status === 429 || errObj.status === 503) {
+      if (errObj.status === 429 || (errObj.status === 503 && (errObj.errorInfo as { type?: unknown } | undefined)?.type !== 'oauth_refresh_unavailable')) {
         // Only a 429 carries `rateLimitInfo`; the transport routes every other
         // structured detail into `errorInfo`. Reading just the first left a 503
         // with an empty object, which loses the outage copy and — because the

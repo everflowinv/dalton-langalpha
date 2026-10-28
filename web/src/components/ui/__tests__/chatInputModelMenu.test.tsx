@@ -65,6 +65,7 @@ function renderMenu(overrides: Record<string, unknown> = {}) {
     fastMode: false,
     onFastModeChange,
     isCodexModel: false,
+    needsSignIn: () => false,
     reasoningEfforts: ['none', 'low', 'medium', 'high'],
     dropdownDirection: 'up' as const,
     container: null,
@@ -193,6 +194,29 @@ describe('speed row', () => {
 
     fireEvent.click(option('Standard'));
     expect(onFastModeChange).toHaveBeenCalledWith(false);
+  });
+});
+
+describe('a model whose sign-in needs renewing', () => {
+  // Still pickable, since the user may reconnect at any moment, but named as
+  // needing sign-in before a send on it is refused.
+  it('says so beside its name and can still be picked', () => {
+    const onSelectModel = vi.fn();
+    renderMenu({
+      threadModels: ['gpt-x'],
+      validModelNames: new Set(['qwen3.6-flash', 'gpt-x']),
+      metadata: { 'gpt-x': { display_name: 'GPT X' }, 'qwen3.6-flash': { display_name: 'Qwen Flash' } },
+      needsSignIn: (m: string) => m === 'gpt-x',
+      onSelectModel,
+    });
+    const rowOf = (name: string) => screen.getAllByRole('menuitem').find((el) => within(el).queryByText(name))!;
+    const row = rowOf('GPT X');
+    expect(within(row).getByText('Needs sign-in')).toBeInTheDocument();
+    const other = rowOf('Qwen Flash');
+    expect(within(other).queryByText('Needs sign-in')).toBeNull();
+
+    fireEvent.click(row);
+    expect(onSelectModel).toHaveBeenCalledWith('gpt-x');
   });
 });
 

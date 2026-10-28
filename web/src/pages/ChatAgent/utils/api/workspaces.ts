@@ -10,7 +10,7 @@ import type {
   WorkspaceQuota,
   WorkspacesResponse,
 } from '@/types/api';
-import { apiErrorObject, apiErrorStatus } from './errors';
+import { apiErrorObject, apiErrorStatus } from '@/api/errors';
 import { streamStatusEvents } from './statusStream';
 
 // The shared API client sets no global timeout. Workspace-management ops

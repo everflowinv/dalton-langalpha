@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useMutationState } from '@tanstack/react-query';
-import { Search, Pin, Settings2 } from 'lucide-react';
-import { Link, useNavigate } from 'react-router';
+import { Search, Pin } from 'lucide-react';
+import { Link } from 'react-router';
 import { Select } from '@/components/ui/select';
 import { useSearchTierAllows } from '@/hooks/useSearchTierAllows';
 import { usePreferences } from '@/hooks/usePreferences';
@@ -17,7 +17,7 @@ import { useAllModels } from '@/hooks/useAllModels';
 import { useQuickAccessModels } from '@/hooks/useQuickAccessModels';
 import { modelLabel, modelMatches } from '@/lib/modelLabel';
 import { Trans, useTranslation } from 'react-i18next';
-import { ConnectedAccounts } from './ConnectedAccounts';
+import { ModelAccessSection } from './ModelAccessSection';
 // DALTON-HOOK(settings-section): import DaltonSection
 import { DaltonSection } from './dalton/DaltonSection';
 import { BACKGROUND_AUTO, backgroundDefaultChoice, modelPrefs, readDefaultModelScope, splitPreferenceWrite } from '@/lib/modelPreferences';
@@ -59,7 +59,6 @@ function SectionHeading({ children }: { children: React.ReactNode }) {
  * would only be a second copy that a failed write leaves disagreeing with the
  * settings a scheduled turn actually runs. */
 export function ModelTab() {
-  const navigate = useNavigate();
   const tierAllows = useSearchTierAllows();
   const { preferences: prefsData } = usePreferences();
   const { mutate } = useUpdatePreferences();
@@ -255,6 +254,12 @@ export function ModelTab() {
 
   return (
       <div className="space-y-6">
+        {/* Connections first: every pick below is among the models they reach. */}
+        <div className="flex flex-col gap-3">
+          <SectionHeading>{t('modelAccess.title')}</SectionHeading>
+          <ModelAccessSection />
+        </div>
+
         {/* Simple hides everything a first-time user has no reason to touch;
             Advanced adds per-model tuning, account defaults and routing. */}
         <div className="flex items-center justify-between gap-4">
@@ -355,7 +360,7 @@ export function ModelTab() {
                 className="inline-flex items-center px-2 py-1 rounded text-xs font-medium"
                 style={{
                   border: '1px dashed var(--color-border-default)',
-                  color: 'var(--color-accent-primary)',
+                  color: 'var(--color-text-secondary)',
                 }}
               >
                 + {t('settings.addModels', 'Add')}
@@ -410,8 +415,8 @@ export function ModelTab() {
                             onClick={() => (isStarred ? quickAccess.remove(m) : quickAccess.add(m))}
                             className="w-full flex items-center justify-between px-2 py-1.5 rounded-md text-xs transition-colors"
                             style={{
-                              color: isStarred ? 'var(--color-accent-light)' : 'var(--color-text-primary)',
-                              backgroundColor: isStarred ? 'var(--color-accent-soft)' : 'transparent',
+                              color: 'var(--color-text-primary)',
+                              backgroundColor: isStarred ? 'var(--color-bg-tag)' : 'transparent',
                             }}
                             onMouseEnter={(e) => { if (!isStarred) e.currentTarget.style.backgroundColor = 'var(--color-bg-elevated)'; }}
                             onMouseLeave={(e) => { if (!isStarred) e.currentTarget.style.backgroundColor = 'transparent'; }}
@@ -698,35 +703,6 @@ export function ModelTab() {
               )}
             </div>
           )}
-        </div>
-
-        {/* Providers & accounts */}
-        <div className="flex flex-col gap-3">
-          <SectionHeading>{t('settings.modelTuning.sectionProviders')}</SectionHeading>
-
-          <ConnectedAccounts />
-
-          <div
-            role="button"
-            tabIndex={0}
-            className="flex items-center justify-between gap-4 p-4 rounded-lg cursor-pointer transition-colors"
-            style={{
-              backgroundColor: 'var(--color-accent-soft)',
-              border: '1px solid var(--color-border-default)',
-            }}
-            onClick={() => navigate('/setup/method')}
-            onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); navigate('/setup/method'); } }}
-          >
-            <div className="flex flex-col gap-1 min-w-0">
-              <span className="text-sm font-medium" style={{ color: 'var(--color-text-primary)' }}>
-                {t('settings.manageProviders', 'Manage providers')}
-              </span>
-              <span className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
-                {t('settings.manageProvidersDesc')}
-              </span>
-            </div>
-            <Settings2 className="h-5 w-5 shrink-0" style={{ color: 'var(--color-accent-primary)' }} />
-          </div>
         </div>
 
         {/* DALTON-HOOK(settings-section): OpenClaw model sync & Dalton daily USD budget */}

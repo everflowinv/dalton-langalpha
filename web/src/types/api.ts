@@ -13,6 +13,8 @@ export interface User {
   locale?: string | null;
   has_api_key?: boolean;
   has_oauth_token?: boolean;
+  /** The deployment's own key runs its default model (self-hosted with keys in its config). */
+  deployment_serves?: boolean;
   access_tier?: number;
   plan_display_name?: string | null;
   /** Completed the personalization flow (i.e. configured a BYOK key). */

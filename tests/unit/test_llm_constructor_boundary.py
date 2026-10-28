@@ -92,9 +92,10 @@ ALLOWLIST: dict[tuple[str, str], int] = {
     # The resolution layer itself, the sanctioned constructor home. Entered
     # scan scope when 3.1 moved it from handlers/chat (never a scan root), and
     # split out of config.py once building a client stopped sharing a module
-    # with choosing a model. Same five calls, same justification.
+    # with choosing a model. Same five calls, same justification, plus a
+    # custom model a subscription serves, built on its sign-in.
     ("src/server/services/llm/clients.py", "create_llm"): 3,
-    ("src/server/services/llm/clients.py", "create_llm_from_custom"): 2,
+    ("src/server/services/llm/clients.py", "create_llm_from_custom"): 3,
     # user_id=None system path AND resolved-None platform fallback (two calls).
     ("src/server/services/llm/service.py", "create_llm"): 2,
 }

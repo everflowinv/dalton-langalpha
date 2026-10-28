@@ -100,6 +100,14 @@ class TestStripReasoning:
         )
         assert strip_reasoning(msg).additional_kwargs == {"keep": 1}
 
+    def test_openrouter_reasoning_details_are_stripped(self):
+        """ChatOpenRouter sends them back as the upstream's signed blocks."""
+        msg = AIMessage(
+            content=[TEXT],
+            additional_kwargs={"reasoning_details": [{"type": "reasoning.text", "signature": "s"}]},
+        )
+        assert strip_reasoning(msg).additional_kwargs == {}
+
 
 class TestStripAllReasoning:
     def test_drops_every_origin(self):

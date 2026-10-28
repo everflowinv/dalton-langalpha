@@ -308,6 +308,23 @@ const PRESET_FACTORIES: Record<PresetId, () => Pick<DashboardPrefs, 'widgets' | 
   'agent-desk': agentDeskPreset,
 };
 
+/**
+ * The layout of a user who has saved none: Morning brief, with fixed widget
+ * ids. It can be drawn many times before anything saves it, and the dashboard
+ * remembers a widget's last loaded shape by its id, so the ids must not change
+ * between loads.
+ */
+export function defaultLayout(): Pick<DashboardPrefs, 'widgets' | 'layouts' | 'version'> {
+  const preset = morningBriefPreset();
+  const ids = new Map(preset.widgets.map((w) => [w.id, `default-${w.type}`]));
+  const rename = (items: RGLItem[] | undefined) => items?.map((l) => ({ ...l, i: ids.get(l.i) ?? l.i }));
+  return {
+    ...preset,
+    widgets: preset.widgets.map((w) => ({ ...w, id: ids.get(w.id) ?? w.id })),
+    layouts: { lg: rename(preset.layouts.lg), md: rename(preset.layouts.md) },
+  };
+}
+
 export function getPreset(id: PresetId): Pick<DashboardPrefs, 'widgets' | 'layouts' | 'version'> {
   return PRESET_FACTORIES[id]();
 }

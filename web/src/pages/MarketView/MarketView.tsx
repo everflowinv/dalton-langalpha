@@ -645,7 +645,7 @@ function MarketViewInner() {
             onCollapse={() => setChatExpanded(false)}
             className="market-mobile-chat-float"
           >
-            {(threadModel.retired || threadModel.offer || subagents.offer !== null) && (
+            {(threadModel.retired || threadModel.lapsed || threadModel.offer || subagents.offer !== null) && (
               // A card of its own: the retired notice is transparent, and the
               // FAB floats over the chart.
               <div

@@ -5,7 +5,7 @@
  */
 import type { useTranslation } from 'react-i18next';
 
-import { apiErrorCoded } from './api/errors';
+import { apiErrorCoded } from '@/api/errors';
 
 type Translate = ReturnType<typeof useTranslation>['t'];
 

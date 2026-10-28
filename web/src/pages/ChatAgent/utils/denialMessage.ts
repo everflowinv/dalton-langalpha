@@ -10,7 +10,7 @@
 import type { useTranslation } from 'react-i18next';
 
 import { formatApiErrorDetail } from './api';
-import { apiErrorCoded } from './api/errors';
+import { apiErrorCoded } from '@/api/errors';
 import { workspaceNameErrorMessage } from './workspaceName';
 import { buildRateLimitError, type RateLimitErrorInfo } from '@/utils/rateLimitError';
 

@@ -170,14 +170,6 @@ vi.mock('@/pages/Dashboard/utils/api', () => ({
   clearPreferences: vi.fn(async () => ({})),
   uploadAvatar: vi.fn(async () => ({ avatar_url: '' })),
   getUserApiKeys: vi.fn(async () => ({ providers: [] })),
-  initiateCodexDevice: vi.fn(async () => ({})),
-  pollCodexDevice: vi.fn(async () => ({})),
-  getCodexOAuthStatus: vi.fn(async () => ({ connected: false })),
-  disconnectCodexOAuth: vi.fn(async () => ({})),
-  initiateClaudeOAuth: vi.fn(async () => ({})),
-  submitClaudeCallback: vi.fn(async () => ({})),
-  getClaudeOAuthStatus: vi.fn(async () => ({ connected: false })),
-  disconnectClaudeOAuth: vi.fn(async () => ({})),
 }));
 
 // Home, used by preference-modify navigation, never in these tests.

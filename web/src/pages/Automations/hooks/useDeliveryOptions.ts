@@ -1,6 +1,6 @@
 import { keepPreviousData, useQuery } from '@tanstack/react-query';
 import { queryKeys } from '@/lib/queryKeys';
-import { apiErrorStatus } from '@/pages/ChatAgent/utils/api/errors';
+import { apiErrorStatus } from '@/api/errors';
 import type { DeliveryOptions } from '@/types/automation';
 import { getDeliveryOptions } from '../utils/api';
 

@@ -1,4 +1,4 @@
-"""Tests for _walk_byok_candidates() and the system-branch coding-variant fix.
+"""Tests for walk_byok_candidates() and the system-branch coding-variant fix.
 
 A neutral placeholder model ``vendor-x-coding`` (anthropic-style coding
 endpoint) whose parent ``vendor-x`` is openai-style reproduces the SDK-trap:
@@ -113,7 +113,7 @@ async def test_key_under_sibling_resolves_with_own_parent_endpoint():
     the PARENT slug ``vendor-x`` whose key is stored ONLY under a sibling
     variant ``vendor-x-coding``. Resolves via the sibling, but base_url is
     pinned to the model's OWN provider (vendor-x), not the sibling's."""
-    from src.server.services.llm.clients import _walk_byok_candidates, resolve_byok_llm_client
+    from src.server.services.llm.clients import walk_byok_candidates, resolve_byok_llm_client
 
     mc = _mock_mc()
     # Sibling reachable from the parent.
@@ -133,7 +133,7 @@ async def test_key_under_sibling_resolves_with_own_parent_endpoint():
     ):
         # Direct helper: confirms provider → parent → sibling priority lands on
         # the sibling and reports it as the holder.
-        byok_config, holding = await _walk_byok_candidates("u", "vendor-x", mc)
+        byok_config, holding = await walk_byok_candidates("u", "vendor-x", mc)
         assert byok_config == sibling_cfg
         assert holding == "vendor-x-coding"
 
@@ -146,7 +146,7 @@ async def test_key_under_sibling_resolves_with_own_parent_endpoint():
 
 
 # ---------------------------------------------------------------------------
-# _walk_byok_candidates — cache tri-state contract
+# walk_byok_candidates — cache tri-state contract
 # ---------------------------------------------------------------------------
 
 
@@ -154,7 +154,7 @@ async def test_key_under_sibling_resolves_with_own_parent_endpoint():
 async def test_cache_miss_falls_back_to_direct_lookup():
     """A candidate slug absent from a provided _byok_cache still resolves via
     the direct-lookup fallback (a cache miss is never a false 'no key')."""
-    from src.server.services.llm.clients import _walk_byok_candidates
+    from src.server.services.llm.byok import walk_byok_candidates
 
     mc = _mock_mc()
     # Cache has the parent recorded-absent but NOT the variant slug.
@@ -163,7 +163,7 @@ async def test_cache_miss_falls_back_to_direct_lookup():
         return_value={"vendor-x-coding": {"api_key": "k", "base_url": None}},
     )
     with patch(f"{DB_KEYS}.get_byok_configs_for_providers", direct):
-        byok_config, holding = await _walk_byok_candidates(
+        byok_config, holding = await walk_byok_candidates(
             "u", "vendor-x-coding", mc, _byok_cache=cache,
         )
 
@@ -180,14 +180,14 @@ async def test_cache_miss_falls_back_to_direct_lookup():
 async def test_cache_none_value_treated_as_absent_without_requery():
     """A slug present with value None is a confirmed absence — no direct
     re-query for that slug."""
-    from src.server.services.llm.clients import _walk_byok_candidates
+    from src.server.services.llm.byok import walk_byok_candidates
 
     mc = _mock_mc()
     # Both candidates recorded-absent; parent holds nothing either.
     cache = {"vendor-x-coding": None, "vendor-x": None}
     direct = AsyncMock(return_value={})
     with patch(f"{DB_KEYS}.get_byok_configs_for_providers", direct):
-        byok_config, holding = await _walk_byok_candidates(
+        byok_config, holding = await walk_byok_candidates(
             "u", "vendor-x-coding", mc, _byok_cache=cache,
         )
 
@@ -198,14 +198,14 @@ async def test_cache_none_value_treated_as_absent_without_requery():
 
 
 # ---------------------------------------------------------------------------
-# Nested-variant discovery (_candidate_slugs)
+# Nested-variant discovery (byok_candidates)
 # ---------------------------------------------------------------------------
 
 
-def test_candidate_slugs_include_nested_child_variant():
+def testbyok_candidates_include_nested_child_variant():
     """A two-level variant (child of a non-root provider) is walked from its
     parent, before the root family."""
-    from src.server.services.llm.clients import _candidate_slugs
+    from src.server.services.llm.byok import byok_candidates
 
     providers = {
         "vendor-x": {},
@@ -219,14 +219,14 @@ def test_candidate_slugs_include_nested_child_variant():
         k for k, info in providers.items() if info.get("parent") == n
     ]
 
-    assert _candidate_slugs("vendor-x-cn", mc) == [
+    assert byok_candidates("vendor-x-cn", mc) == [
         "vendor-x-cn",
         "vendor-x-cn-coding",
         "vendor-x",
         "vendor-x-coding",
     ]
     # Root providers keep their original walk order
-    assert _candidate_slugs("vendor-x", mc) == [
+    assert byok_candidates("vendor-x", mc) == [
         "vendor-x",
         "vendor-x-coding",
         "vendor-x-cn",
@@ -270,9 +270,9 @@ GATEWAY_URL = "https://gateway.example/v1"
 
 def _key_walk(provider, mc):
     """The slugs whose key, saved without a base URL, may serve ``provider``."""
-    from src.server.services.llm.clients import _candidate_slugs, _key_fits
+    from src.server.services.llm.byok import byok_candidates, key_fits
 
-    return [c for c in _candidate_slugs(provider, mc) if _key_fits(provider, c, {}, mc)]
+    return [c for c in byok_candidates(provider, mc) if key_fits(provider, c, has_base_url=False, mc=mc)]
 
 
 def test_separate_credential_variant_is_walked_alone_in_both_directions():
@@ -413,7 +413,7 @@ async def test_prefetch_reads_what_the_walk_inspects():
         patch(f"{DB_KEYS}.get_byok_configs_for_providers", side_effect=fetch),
     ):
         cache = await clients._prefetch_byok_cache("u", config, "vendor-y", {}, [])
-        found = await clients._walk_byok_candidates("u", "vendor-y", mc, _byok_cache=cache)
+        found = await clients.walk_byok_candidates("u", "vendor-y", mc, _byok_cache=cache)
 
     assert [sorted(a) for a in asked] == [["vendor-y", "vendor-y-coding"]]
     assert cache == {"vendor-y": None, "vendor-y-coding": None}
@@ -436,12 +436,15 @@ def test_shipped_manifest_walks_separate_credential_providers_alone(provider):
     ("provider", "walk"),
     [
         ("z-ai", ["z-ai", "z-ai-cn", "z-ai-coding"]),
-        # DALTON-HOOK(team-credentials): coding_plan variants only accept their own slug key
+        # DALTON-HOOK(team-credentials): coding_plan variants only accept their
+        # own slug key — a deliberate Dalton difference from upstream's family
+        # walk (upstream expects ["z-ai-coding", "z-ai", "z-ai-cn"]).
         ("z-ai-coding", ["z-ai-coding"]),
         ("z-ai-cn-coding", ["z-ai-cn-coding"]),
         ("volcengine", ["volcengine", "doubao-coding"]),
         ("doubao-coding", ["doubao-coding"]),
-        ("openrouter", ["openrouter", "deepinfra"]),
+        # OpenRouter runs on its own client upstream-side since #623.
+        ("openrouter", ["openrouter"]),
     ],
 )
 def test_shipped_manifest_keeps_the_walk_where_the_vendor_shares_a_key(provider, walk):

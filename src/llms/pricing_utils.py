@@ -466,7 +466,12 @@ _MIX_EXPLICIT_CACHE = (0.00, 0.73, 0.23, 0.04)
 # Providers whose caching is keyed at explicit breakpoints, so a cache write is
 # a real line on the bill. Mirrors ``provider_cache.breakpoint_marker``, which
 # keys Anthropic reads that way unconditionally; OpenAI's opt-in models run in
-# implicit mode and are billed no differently from the rest.
+# implicit mode and are billed no differently from the rest. ``breakpoint_marker``
+# also tags a Claude model served over OpenRouter, which this set leaves out: a
+# model name resolves to its manifest provider, and the manifest carries no
+# openrouter-routed model on a platform card, so no call reaches this mix
+# through that route. The set stays literal because ``src/llms`` cannot import
+# from ``ptc_agent``.
 _EXPLICIT_CACHE_PROVIDERS = frozenset({"anthropic", "claude-oauth"})
 
 # What one call bills at, per 1M tokens, on the model carrying most of our

@@ -1,7 +1,7 @@
 import type { TFunction } from 'i18next';
 import { ApiError } from '@/api/client';
 import { formatBytes, integer } from '@/lib/format';
-import { apiErrorObject, apiErrorStatus, formatApiErrorDetail } from '@/pages/ChatAgent/utils/api/errors';
+import { apiErrorObject, apiErrorStatus, formatApiErrorDetail } from '@/api/errors';
 
 /**
  * Why a skill upload cannot go ahead, in terms a person can act on.

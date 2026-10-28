@@ -30,7 +30,7 @@ import { resetNavPrefs, setNavPrefs } from '../../utils/navPrefs';
 
 vi.mock('../../utils/api', async () => ({
   // A failed rename is told in a toast, which reads the error for real.
-  ...(await vi.importActual<typeof import('../../utils/api/errors')>('../../utils/api/errors')),
+  ...(await vi.importActual<typeof import('@/api/errors')>('@/api/errors')),
   getWorkspaces: vi.fn(),
   getWorkspaceThreads: vi.fn(),
   reorderWorkspaces: vi.fn(),

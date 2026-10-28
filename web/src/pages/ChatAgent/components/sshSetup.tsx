@@ -22,7 +22,7 @@ import { cn } from '@/lib/utils';
 import { useLocale } from '@/hooks/useLocale';
 import type { SshTarget } from '@/types/api';
 
-import { apiErrorStatus } from '../utils/api/errors';
+import { apiErrorStatus } from '@/api/errors';
 import { failureText, type SshFailure, type SshReadyStep, type SshSetupState } from './sshSetupState';
 import { formatSshReached, type SshReady } from './sshTarget';
 
