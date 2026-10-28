@@ -19,7 +19,6 @@ from src.dalton.llm.overlay import (
 from src.dalton.llm.providers import (
     ProviderDisabledError,
     build_dalton_client,
-    dalton_oauth_token_getter,
     ensure_provider_enabled,
     is_dalton_oauth_provider,
 )
@@ -69,6 +68,21 @@ def test_grok_oauth_keys_pinned_to_dalton_xai_line():
     assert pinfo.get("base_url") == "https://cli-chat-proxy.grok.com/v1"
     assert pinfo.get("access_type") == "oauth"
     assert pinfo.get("billing") == "subscription"
+
+
+def test_upstream_grok_oauth_models_hidden_in_dalton():
+    """Upstream's grok-oauth (api.x.ai) models are retired for Dalton via the
+    checked-in overlay: the three keys the manifest grew resolve to nothing,
+    while the two pinned keys keep riding the xai-oauth line."""
+    mc = ModelConfig()
+    for key in ("grok-4.5-oauth", "grok-4.6-oauth", "grok-build-oauth"):
+        assert mc.get_model_config(key) is None, f"{key} should be retired for Dalton"
+    # The pinned keys are untouched by the retirement.
+    for key in ("grok-4.7-oauth", "grok-4.3-oauth"):
+        entry = mc.get_model_config(key)
+        assert entry is not None and entry.get("provider") == "xai-oauth", key
+    # The cash xAI models upstream also carries stay (same provider, BYOK).
+    assert mc.get_model_config("grok-4.7") is not None
 
 
 def test_grok_pin_enforced_over_hostile_entries():
@@ -154,14 +168,17 @@ def test_build_antigravity_and_muse_clients_with_session_headers():
 
 
 def test_oauth_dispatch_helpers():
+    # The per-provider token getters are gone: every Dalton line serves through
+    # the unified refresh protocol behind the subscription registry.
+    from src.server.services.oauth_providers import SUBSCRIPTIONS
+
     assert is_dalton_oauth_provider("antigravity-oauth")
     assert is_dalton_oauth_provider("muse-oauth")
     assert is_dalton_oauth_provider("xai-oauth")
     assert not is_dalton_oauth_provider("codex-oauth")
-    assert dalton_oauth_token_getter("antigravity-oauth") is not None
-    assert dalton_oauth_token_getter("muse-oauth") is not None
-    assert dalton_oauth_token_getter("xai-oauth") is not None
-    assert dalton_oauth_token_getter("claude-oauth") is None
+    assert "antigravity-oauth" in SUBSCRIPTIONS
+    assert "muse-oauth" in SUBSCRIPTIONS
+    assert "xai-oauth" in SUBSCRIPTIONS
 
 
 def test_provider_kill_switch(monkeypatch):
@@ -521,6 +538,21 @@ async def test_muse_poll_mints_api_key_and_caches_metadata(monkeypatch: pytest.M
         "_record_provider_event_safe",
         create_autospec(muse_oauth_mod._record_provider_event_safe, return_value=None),
     )
+
+    # The poll now saves inside the unified connection lock; the lock is
+    # Postgres-side and stays out of this unit harness (the save itself is
+    # captured below).
+    from contextlib import asynccontextmanager
+
+    import src.server.database.oauth_tokens as oauth_tokens_db_mod
+
+    @asynccontextmanager
+    async def _null_connection_change(user_id, provider):
+        yield None
+
+    # The poll imports the lock inside the function, so the source module's
+    # binding is the one to replace.
+    monkeypatch.setattr(oauth_tokens_db_mod, "connection_change", _null_connection_change)
 
     redis_store: dict[str, tuple[str, int | None]] = {
         "oauth:muse:device:user-1": (json.dumps({"device_code": "dev_code_123"}), 600),

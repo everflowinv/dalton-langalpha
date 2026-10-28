@@ -21,6 +21,15 @@ _WAIT_SECONDS = 10.0
 _POLL_SECONDS = 0.5
 
 
+def wait_window(refresh_deadline_s: float) -> float:
+    """How long a waiter waits for the lock holder's refresh: as long as that
+    provider's whole refresh plus its save can take. The default window was
+    written for the common 25-second lease; a provider with long retries (the
+    xAI CLI path refreshes up to 120 s) would have its waiters give up while
+    the refresh is still honestly running (DALTON-HOOK(oauth-dispatch))."""
+    return max(_WAIT_SECONDS, refresh_deadline_s + REFRESH_SAVE_DEADLINE_S)
+
+
 def token_expiry(tokens: dict) -> datetime:
     expires_at = tokens["expires_at"]
     if expires_at.tzinfo is None:
@@ -28,7 +37,9 @@ def token_expiry(tokens: dict) -> datetime:
     return expires_at
 
 
-async def await_refreshed_tokens(user_id: str, provider: str) -> dict | None:
+async def await_refreshed_tokens(
+    user_id: str, provider: str, *, wait_seconds: float = _WAIT_SECONDS
+) -> dict | None:
     """The stored tokens once the refresh lands; None when it has not landed
     in time and the stored token has already expired. A row the refresh
     flagged as needing sign-in comes back at once, for the caller to refuse.
@@ -36,9 +47,13 @@ async def await_refreshed_tokens(user_id: str, provider: str) -> dict | None:
     The old token is handed out only while it still works: an expired one
     comes back from the provider as a 401, which reads the same as a key the
     user revoked, and an automation is switched off for that.
+
+    ``wait_seconds`` is the lock holder's whole window (``wait_window`` of its
+    ``refresh_deadline_s``); waiting the default while a long-retry provider
+    refreshes would report an outage that is only patience (DALTON-HOOK(oauth-dispatch)).
     """
     loop = asyncio.get_running_loop()
-    deadline = loop.time() + _WAIT_SECONDS
+    deadline = loop.time() + wait_seconds
     while True:
         await asyncio.sleep(_POLL_SECONDS)
         tokens = await get_oauth_tokens(user_id, provider)

@@ -19,14 +19,7 @@ import httpx
 
 from src.server.database.oauth_tokens import (
     get_oauth_tokens,
-    invalidate_oauth_active_cache,
     upsert_oauth_tokens,
-)
-from src.server.services.oauth_refresh_wait import (
-    REFRESH_BUFFER,
-    REFRESH_LOCK_TTL_MS,
-    await_refreshed_tokens,
-    token_expiry,
 )
 
 logger = logging.getLogger(__name__)
@@ -203,30 +196,64 @@ async def refresh_tokens(refresh_token: str) -> dict:
         }
 
 
-async def _finalize_token_save(user_id: str, tokens: dict) -> dict:
-    claims = parse_id_token_claims(tokens.get("id_token", ""))
-    await upsert_oauth_tokens(
-        user_id=user_id,
-        provider=ANTIGRAVITY_PROVIDER,
-        access_token=tokens["access_token"],
-        refresh_token=tokens["refresh_token"],
-        account_id=claims.get("sub") or "",
-        email=claims.get("email"),
-        plan_type="antigravity",
-        expires_at=datetime.now(timezone.utc)
-        + timedelta(seconds=tokens.get("expires_in", 3600)),
-    )
-    try:
-        await invalidate_oauth_active_cache(user_id)
-    except Exception:
-        pass
+def _flow_keys(user_id: str) -> tuple[str, str]:
+    """(flow_key, done_key) of the pending Antigravity login.
 
+    DALTON-HOOK(team-credentials): keyed by the credential holder, so any
+    member's disconnect clears the same pending flow a member's sign-in waits
+    on — one shared credential, one pending flow."""
+    from src.dalton.credentials import credential_user_id
+
+    holder = credential_user_id(user_id)
+    return f"oauth:antigravity:{holder}", f"oauth:antigravity:done:{holder}"
+
+
+async def _finalize_token_save(user_id: str, tokens: dict) -> dict:
+    """Store a finished sign-in, only while its login is still the pending one.
+
+    The flow key is claimed (compare-and-delete) inside the connection lock
+    and the tokens written over that connection, so a disconnect that landed
+    while Google was answering leaves the flow key gone and this save aborts
+    instead of reviving the connection. The claim ends the login either way:
+    the provider already spent the authorization, so only a new one helps.
+    (DALTON-HOOK(team-credentials))
+    """
+    from src.server.database.oauth_tokens import connection_change
     from src.utils.cache.redis_cache import get_cache_client
 
+    claims = parse_id_token_claims(tokens.get("id_token", ""))
     cache = get_cache_client()
+    flow_key, done_key = _flow_keys(user_id)
+
+    async def _save(conn) -> bool:
+        if cache.enabled and cache.client:
+            raw = await cache.client.get(flow_key)
+            if not raw:
+                return False
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8", "ignore")
+            if not await cache.claim(flow_key, raw):
+                return False
+        await upsert_oauth_tokens(
+            user_id=user_id,
+            provider=ANTIGRAVITY_PROVIDER,
+            access_token=tokens["access_token"],
+            refresh_token=tokens["refresh_token"],
+            account_id=claims.get("sub") or "",
+            email=claims.get("email"),
+            plan_type="antigravity",
+            expires_at=datetime.now(timezone.utc)
+            + timedelta(seconds=tokens.get("expires_in", 3600)),
+            conn=conn,
+        )
+        return True
+
+    async with connection_change(user_id, ANTIGRAVITY_PROVIDER) as conn:
+        saved = await _save(conn)
+    if not saved:
+        raise ValueError("The Antigravity sign-in was cancelled or replaced; start again.")
     if cache.enabled and cache.client:
-        await cache.client.set(f"oauth:antigravity:done:{user_id}", "1", ex=600)
-        await cache.client.delete(f"oauth:antigravity:{user_id}")
+        await cache.client.set(done_key, "1", ex=600)
     return claims
 
 
@@ -274,10 +301,11 @@ async def start_login(user_id: str) -> dict:
 
     cache = get_cache_client()
     if cache.enabled and cache.client:
+        flow_key, done_key = _flow_keys(user_id)
         # R6-9: clear any stale completion flag before starting a new flow
-        await cache.client.delete(f"oauth:antigravity:done:{user_id}")
+        await cache.client.delete(done_key)
         await cache.client.set(
-            f"oauth:antigravity:{user_id}",
+            flow_key,
             json.dumps(
                 {
                     "verifier": verifier,
@@ -343,7 +371,8 @@ async def submit_callback_url(user_id: str, callback_input: str) -> dict:
     if not cache.enabled or not cache.client:
         raise RuntimeError("Cache unavailable for OAuth callback verification.")
 
-    raw = await cache.client.get(f"oauth:antigravity:{user_id}")
+    flow_key, _done_key = _flow_keys(user_id)
+    raw = await cache.client.get(flow_key)
     if not raw:
         raise ValueError("No pending Antigravity authorization. Please initiate login again.")
     if isinstance(raw, bytes):
@@ -454,7 +483,8 @@ async def check_login_complete(user_id: str) -> bool:
 
     cache = get_cache_client()
     if cache.enabled and cache.client:
-        return bool(await cache.client.get(f"oauth:antigravity:done:{user_id}"))
+        _flow_key, done_key = _flow_keys(user_id)
+        return bool(await cache.client.get(done_key))
     # Redis unavailable: fall back to a DB lookup, comparing updated_at against initiated_at (R2-N5N6 #7).
     tokens = await get_oauth_tokens(user_id, ANTIGRAVITY_PROVIDER)
     if not tokens or not tokens.get("access_token"):
@@ -466,70 +496,3 @@ async def check_login_complete(user_id: str) -> bool:
         if upd < initiated_at:
             return False
     return True
-
-
-async def get_valid_token(user_id: str) -> dict | None:
-    """Get a valid access token, refreshing if needed."""
-    from src.dalton.credentials import credential_user_id  # DALTON-HOOK(team-credentials): key refresh lock & tokens by team credential holder
-    cred_user_id = credential_user_id(user_id)
-    tokens = await get_oauth_tokens(cred_user_id, ANTIGRAVITY_PROVIDER)
-    if not tokens:
-        return None
-
-    now = datetime.now(timezone.utc)
-
-    if token_expiry(tokens) > now + REFRESH_BUFFER:
-        return {"access_token": tokens["access_token"], "plan_type": tokens.get("plan_type")}
-
-    from src.utils.cache.redis_cache import get_cache_client
-
-    cache = get_cache_client()
-    lock_key = f"oauth:refresh:{cred_user_id}:{ANTIGRAVITY_PROVIDER}"
-    lock_token = secrets.token_hex(16)
-    acquired = await cache.acquire_lock(lock_key, lock_token, REFRESH_LOCK_TTL_MS)
-    if acquired is False:
-        tokens = await await_refreshed_tokens(cred_user_id, ANTIGRAVITY_PROVIDER)
-        if tokens:
-            return {"access_token": tokens["access_token"], "plan_type": tokens.get("plan_type")}
-        return None
-
-    try:
-        new = await refresh_tokens(tokens["refresh_token"])
-        new_expires = now + timedelta(seconds=new.get("expires_in", 3600))
-        claims = parse_id_token_claims(new.get("id_token", ""))
-
-        await upsert_oauth_tokens(
-            user_id=user_id,
-            provider=ANTIGRAVITY_PROVIDER,
-            access_token=new["access_token"],
-            refresh_token=new["refresh_token"] or tokens["refresh_token"],
-            account_id=tokens.get("account_id", ""),
-            email=claims.get("email") or tokens.get("email"),
-            plan_type=tokens.get("plan_type"),
-            expires_at=new_expires,
-        )
-
-        try:
-            await invalidate_oauth_active_cache(cred_user_id)
-        except Exception as exc:
-            logger.debug("[antigravity_oauth] invalidate_oauth_active_cache skipped: %s", type(exc).__name__)
-
-        await _record_provider_event_safe(
-            user_id,
-            "refresh_ok",
-            {"expires_in": int(new.get("expires_in", 3600))},
-        )
-        logger.debug(f"[antigravity_oauth] Refreshed tokens for user_id={user_id}")
-        return {"access_token": new["access_token"], "plan_type": tokens.get("plan_type")}
-    except Exception as e:
-        await _record_provider_event_safe(
-            user_id,
-            "refresh_fail",
-            {"error_type": type(e).__name__, "message": str(e)[:160]},
-        )
-        logger.error(f"[antigravity_oauth] Token refresh failed for user_id={user_id}: {type(e).__name__}")
-        return None
-    finally:
-        if acquired:
-            await cache.release_lock(lock_key, lock_token)
-

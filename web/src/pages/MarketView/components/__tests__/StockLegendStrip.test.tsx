@@ -266,17 +266,21 @@ describe('MarketSidebarPanel extended-hours rows', () => {
       );
       return r;
     })();
-    expect(cardContainer).toHaveTextContent('$319.50 +0.70%');
+    expect(cardContainer.querySelector('.dash-ext')?.textContent).toBe('AH$319.50+0.70%');
     unmountCard();
     mockDashboardCtx.watchlist = { rows: [], loading: false };
     mockDashboardCtx.dashboard = { marketStatus: null };
 
     const { container: primContainer, unmount: unmountPrim } = render(
       <MemoryRouter>
-        <WatchlistRowItem item={wsRow} marketStatus={afterHoursStatus} />
+        <table>
+          <tbody>
+            <WatchlistRowItem item={wsRow} marketStatus={afterHoursStatus} />
+          </tbody>
+        </table>
       </MemoryRouter>,
     );
-    expect(primContainer).toHaveTextContent('$319.50 +0.70%');
+    expect(primContainer.querySelector('.dash-ext')?.textContent).toBe('AH$319.50+0.70%');
     unmountPrim();
 
     mockWatchlistState.rows = [wsRow as unknown as Record<string, unknown>];
@@ -314,7 +318,7 @@ describe('MarketSidebarPanel extended-hours rows', () => {
         />
       </MemoryRouter>,
     );
-    expect(cardBack).toHaveTextContent('$317.28 +0.00%');
+    expect(cardBack.querySelector('.dash-ext')?.textContent).toBe('AH$317.28·0.00%');
     expect(cardBack).not.toHaveTextContent('$318.10');
     unmountCardBack();
     mockDashboardCtx.watchlist = { rows: [], loading: false };
@@ -322,10 +326,14 @@ describe('MarketSidebarPanel extended-hours rows', () => {
 
     const { container: primBack, unmount: unmountPrimBack } = render(
       <MemoryRouter>
-        <WatchlistRowItem item={backToCloseRow} marketStatus={afterHoursStatus} />
+        <table>
+          <tbody>
+            <WatchlistRowItem item={backToCloseRow} marketStatus={afterHoursStatus} />
+          </tbody>
+        </table>
       </MemoryRouter>,
     );
-    expect(primBack).toHaveTextContent('$317.28 +0.00%');
+    expect(primBack.querySelector('.dash-ext')?.textContent).toBe('AH$317.28·0.00%');
     expect(primBack).not.toHaveTextContent('$318.10');
     unmountPrimBack();
 
@@ -388,7 +396,7 @@ describe('MarketSidebarPanel extended-hours rows', () => {
         />
       </MemoryRouter>,
     );
-    expect(regCardEl).toHaveTextContent('-$0.13');
+    expect(regCardEl.querySelector('td[title="-$0.13"]')).not.toBeNull();
     expect(regCardEl).toHaveTextContent('-0.13%');
     unmountRegCard();
     mockDashboardCtx.watchlist = { rows: [], loading: false };
@@ -396,10 +404,14 @@ describe('MarketSidebarPanel extended-hours rows', () => {
 
     const { container: regPrimEl, unmount: unmountRegPrim } = render(
       <MemoryRouter>
-        <WatchlistRowItem item={halfRow} marketStatus={openStatus} />
+        <table>
+          <tbody>
+            <WatchlistRowItem item={halfRow} marketStatus={openStatus} />
+          </tbody>
+        </table>
       </MemoryRouter>,
     );
-    expect(regPrimEl).toHaveTextContent('-$0.13');
+    expect(regPrimEl.querySelector('td[title="-$0.13"]')).not.toBeNull();
     expect(regPrimEl).toHaveTextContent('-0.13%');
     unmountRegPrim();
 
@@ -432,9 +444,9 @@ describe('MarketSidebarPanel extended-hours rows', () => {
       </MemoryRouter>,
     );
     expect(cardEl).toHaveTextContent('$99.88');
-    expect(cardEl).toHaveTextContent('-$0.13');
+    expect(cardEl.querySelector('td[title="-$0.13"]')).not.toBeNull();
     expect(cardEl).toHaveTextContent('-0.13%');
-    expect(cardEl).toHaveTextContent('$99.75 -0.13%');
+    expect(cardEl.querySelector('.dash-ext')?.textContent).toBe('AH$99.75-0.13%');
     unmountCard();
     mockDashboardCtx.watchlist = { rows: [], loading: false };
     mockDashboardCtx.dashboard = { marketStatus: null };
@@ -442,13 +454,17 @@ describe('MarketSidebarPanel extended-hours rows', () => {
     // 2. WatchlistRowItem (_holdingsPrimitives)
     const { container: primEl, unmount: unmountPrim } = render(
       <MemoryRouter>
-        <WatchlistRowItem item={halfRow} marketStatus={afterHoursStatus} />
+        <table>
+          <tbody>
+            <WatchlistRowItem item={halfRow} marketStatus={afterHoursStatus} />
+          </tbody>
+        </table>
       </MemoryRouter>,
     );
     expect(primEl).toHaveTextContent('$99.88');
-    expect(primEl).toHaveTextContent('-$0.13');
+    expect(primEl.querySelector('td[title="-$0.13"]')).not.toBeNull();
     expect(primEl).toHaveTextContent('-0.13%');
-    expect(primEl).toHaveTextContent('$99.75 -0.13%');
+    expect(primEl.querySelector('.dash-ext')?.textContent).toBe('AH$99.75-0.13%');
     unmountPrim();
 
     // 3. MarketSidebarPanel

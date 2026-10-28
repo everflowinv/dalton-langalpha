@@ -6635,14 +6635,14 @@
       "failNext": "Ask for a new code and start again.",
       "failNextTransient": "Waiting a moment and trying again can work.",
       "fail": {
-        "denied": "The sign-in was declined on OpenAI's page.",
+        "denied": "The sign-in was declined on Meta's page.",
         "expired": "The code expired before it was approved.",
         "no_pending_flow": "This sign-in ended or was already used.",
         "redis_unavailable": "Connecting accounts isn't available right now.",
-        "device_flow_unavailable": "OpenAI isn't offering code sign-in right now.",
-        "upstream_unavailable": "OpenAI couldn't be reached.",
-        "device_poll_failed": "OpenAI ended this sign-in.",
-        "exchange_failed": "OpenAI didn't accept the sign-in.",
+        "device_flow_unavailable": "Meta isn't offering code sign-in right now.",
+        "upstream_unavailable": "Meta couldn't be reached.",
+        "device_poll_failed": "Meta ended this sign-in.",
+        "exchange_failed": "Meta didn't accept the sign-in.",
         "save_failed": "Your account couldn't be saved.",
         "unknown": "Something went wrong while connecting."
       }
@@ -6669,14 +6669,14 @@
       "failNext": "Ask for a new code and start again.",
       "failNextTransient": "Waiting a moment and trying again can work.",
       "fail": {
-        "denied": "The sign-in was declined on OpenAI's page.",
+        "denied": "The sign-in was declined on xAI's page.",
         "expired": "The code expired before it was approved.",
         "no_pending_flow": "This sign-in ended or was already used.",
         "redis_unavailable": "Connecting accounts isn't available right now.",
-        "device_flow_unavailable": "OpenAI isn't offering code sign-in right now.",
-        "upstream_unavailable": "OpenAI couldn't be reached.",
-        "device_poll_failed": "OpenAI ended this sign-in.",
-        "exchange_failed": "OpenAI didn't accept the sign-in.",
+        "device_flow_unavailable": "xAI isn't offering code sign-in right now.",
+        "upstream_unavailable": "xAI couldn't be reached.",
+        "device_poll_failed": "xAI ended this sign-in.",
+        "exchange_failed": "xAI didn't accept the sign-in.",
         "save_failed": "Your account couldn't be saved.",
         "unknown": "Something went wrong while connecting."
       }

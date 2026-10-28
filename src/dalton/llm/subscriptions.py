@@ -55,10 +55,14 @@ async def _xai_refresh(refresh_token: str) -> TokenSet:
     # CLI path; its pacing is set on the provider entry (``refresh_deadline_s``
     # / ``lock_ttl_ms``), and a challenge or timeout reads as transient, so a
     # slow or blocked refresh never flags the connection for good.
+    from dataclasses import replace
+
     from .providers.xai_grok.oauth import XAI_PLAN_TYPE, refresh_tokens
 
     fresh = _token_set_from_answer(await refresh_tokens(refresh_token))
-    fresh.plan_type = fresh.plan_type or XAI_PLAN_TYPE
+    # TokenSet is frozen; the CLI answer names no plan, the SuperGrok one stands.
+    if not fresh.plan_type:
+        fresh = replace(fresh, plan_type=XAI_PLAN_TYPE)
     return fresh
 
 

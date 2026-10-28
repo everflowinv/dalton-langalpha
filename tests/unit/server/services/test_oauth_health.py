@@ -564,3 +564,83 @@ async def test_a_custom_model_on_a_subscription_is_judged_by_its_clients_provide
     ):
         await LocalRunExecutor._note_credential_refusal(handler, "u1", None)
     expire.assert_awaited_once_with("u1", "codex-oauth")
+
+
+# --- A waiter waits out its provider's whole refresh window ---------------------
+
+
+def test_wait_window_covers_the_providers_whole_refresh():
+    """The default window was written for the common 25-second lease; a waiter
+    on a long-retry line (the xAI CLI path refreshes up to 120 s) must wait at
+    least as long as that refresh plus its save, or concurrent turns read an
+    outage that is only patience (DALTON-HOOK(oauth-dispatch))."""
+    from src.server.services.oauth_refresh_wait import (
+        REFRESH_SAVE_DEADLINE_S,
+        wait_window,
+    )
+
+    codex = SUBSCRIPTIONS["codex-oauth"]
+    assert codex.refresh_deadline_s == 25.0
+    assert wait_window(codex.refresh_deadline_s) == 25.0 + REFRESH_SAVE_DEADLINE_S
+    xai = SUBSCRIPTIONS["xai-oauth"]
+    assert xai.refresh_deadline_s == 120.0
+    assert wait_window(xai.refresh_deadline_s) == 120.0 + REFRESH_SAVE_DEADLINE_S
+    # Never shorter than the protocol's own default.
+    assert wait_window(1.0) == 10.0
+
+
+@pytest.mark.asyncio
+async def test_a_waiter_waits_as_long_as_asked(monkeypatch):
+    """``wait_seconds`` is the window: a refresh landing inside it is served,
+    one landing past it is reported as not landed (the old token is expired)."""
+    import src.server.services.oauth_refresh_wait as wait_mod
+
+    landed = {"n": 0}
+
+    async def _late_fresh(user_id, provider):
+        landed["n"] += 1
+        # Fresh tokens only from the third read (~1.0 s in at 0.5 s polls).
+        if landed["n"] < 3:
+            return _row(expires_in=timedelta(minutes=-1))
+        return _row(expires_in=timedelta(hours=1))
+
+    monkeypatch.setattr(wait_mod, "get_oauth_tokens", AsyncMock(side_effect=_late_fresh))
+    got = await wait_mod.await_refreshed_tokens("u1", "xai-oauth", wait_seconds=5.0)
+    assert got is not None and got["access_token"] == "at-1"
+
+    landed["n"] = 0
+    monkeypatch.setattr(
+        wait_mod,
+        "get_oauth_tokens",
+        AsyncMock(side_effect=_late_fresh),
+    )
+    missed = await wait_mod.await_refreshed_tokens("u1", "xai-oauth", wait_seconds=0.7)
+    assert missed is None
+
+
+@pytest.mark.asyncio
+async def test_valid_token_waits_the_providers_window(store):
+    """The contended path hands the waiter its provider's whole window, not the
+    one-size default."""
+    waited = {}
+
+    async def _spying_wait(user_id, provider, *, wait_seconds):
+        waited["wait_seconds"] = wait_seconds
+        return _row(expires_in=timedelta(hours=1))
+
+    # Ride the store fixture's own patch of await_refreshed_tokens; a second
+    # monkeypatch on the same attribute would clobber the fixture's restore.
+    store["wait"].side_effect = _spying_wait
+    xai = SUBSCRIPTIONS["xai-oauth"]
+    store["cache"].acquire_lock.return_value = False
+    store["get"].return_value = _row(expires_in=timedelta(minutes=-1))
+    codex = replace(SUBSCRIPTIONS["codex-oauth"], refresh=_dummy_refresh, refresh_deadline_s=xai.refresh_deadline_s)
+    with patch.object(oauth_health, "SUBSCRIPTIONS", {"codex-oauth": codex}):
+        assert (await valid_token("u1", "codex-oauth")).access_token == "at-1"
+    from src.server.services.oauth_refresh_wait import REFRESH_SAVE_DEADLINE_S
+
+    assert waited["wait_seconds"] == xai.refresh_deadline_s + REFRESH_SAVE_DEADLINE_S
+
+
+async def _dummy_refresh(_token):
+    raise AssertionError("the waiter path never refreshes")
