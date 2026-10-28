@@ -1229,5 +1229,19 @@
       "notional_ref": "glm-5.3-flash-cn",
       "tool_calling": true
     }
-  }
+  },
+  "retired": [
+    {
+      "key": "grok-4.5-oauth",
+      "reason": "upstream grok-oauth (api.x.ai) inference not offered; Grok rides the pinned xai-oauth line"
+    },
+    {
+      "key": "grok-4.6-oauth",
+      "reason": "upstream grok-oauth (api.x.ai) inference not offered; Grok rides the pinned xai-oauth line"
+    },
+    {
+      "key": "grok-build-oauth",
+      "reason": "upstream grok-oauth (api.x.ai) inference not offered; Grok rides the pinned xai-oauth line"
+    }
+  ]
 }

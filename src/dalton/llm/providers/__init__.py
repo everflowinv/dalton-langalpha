@@ -1,13 +1,18 @@
-"""Dalton-owned native LLM providers: SDK builders, OAuth token getters, kill switch (P0N.2, P0N.8)."""
+"""Dalton-owned native LLM providers: SDK builders, kill switch (P0N.2, P0N.8).
+
+The per-provider OAuth token getters are gone: every line (Antigravity, Muse,
+xAI) serves through the unified refresh protocol in
+``src/server/services/oauth_health.valid_token`` behind the subscription
+registry (DALTON-HOOK(oauth-dispatch)).
+"""
 
 from __future__ import annotations
 
-from typing import Any, Awaitable, Callable
+from typing import Any, Callable
 
 from src.dalton.settings import get_disabled_providers
 
 SdkBuilder = Callable[[Any, str | None], Any]
-TokenGetter = Callable[[str], Awaitable[dict | None]]
 
 DALTON_OAUTH_PROVIDERS: frozenset[str] = frozenset(
     {"antigravity-oauth", "muse-oauth", "xai-oauth"}
@@ -38,27 +43,10 @@ def _sdk_builders() -> dict[str, SdkBuilder]:
     }
 
 
-def _oauth_getters() -> dict[str, TokenGetter]:
-    from .antigravity.oauth import get_valid_token as ag_get_valid_token
-    from .muse.oauth import get_valid_token as muse_get_valid_token
-    from .xai_grok.oauth import get_valid_token as xai_get_valid_token
-
-    return {
-        "antigravity-oauth": ag_get_valid_token,
-        "muse-oauth": muse_get_valid_token,
-        "xai-oauth": xai_get_valid_token,
-    }
-
-
 def build_dalton_client(llm: Any, *, cache_key: str | None = None) -> Any | None:
     """Build a Dalton-owned native SDK client for ``llm.sdk``, or return None if unknown."""
     builder = _sdk_builders().get(getattr(llm, "sdk", ""))
     return builder(llm, cache_key) if builder else None
-
-
-def dalton_oauth_token_getter(provider: str) -> TokenGetter | None:
-    """Return the async token getter for a Dalton-owned OAuth provider, or None."""
-    return _oauth_getters().get(provider)
 
 
 def is_dalton_oauth_provider(provider: str) -> bool:

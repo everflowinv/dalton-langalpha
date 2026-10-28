@@ -46,10 +46,11 @@ from src.dalton.llm.providers.xai_grok.oauth import (
     save_xai_tokens,
 )
 from src.server.database.oauth_tokens import (
+    connection_change,
     delete_oauth_tokens,
     get_oauth_connection,
-    invalidate_oauth_active_cache,
 )
+from src.server.services.oauth_health import connection_changed
 from src.server.models.oauth import OAuthStatus
 from src.server.utils.api import CurrentUserId
 
@@ -67,6 +68,25 @@ async def _dalton_oauth_status(user_id: str, provider: str) -> dict:
 
 class AntigravityCallbackRequest(BaseModel):
     callback_input: str
+
+
+def _pending_key(user_id: str, kind: str) -> str:
+    """A pending sign-in's Redis key, by the credential holder.
+
+    DALTON-HOOK(team-credentials): one shared credential has one pending flow,
+    so a disconnect by any member clears the flow a member's poll is waiting
+    on, and a completed sign-in can never revive a disconnected connection.
+    """
+    from src.dalton.credentials import credential_user_id
+
+    return f"oauth:{kind}:device:{credential_user_id(user_id)}"
+
+
+async def _claim_pending(cache, key: str, raw) -> bool:
+    """Take the pending flow (compare-and-delete) so only its poller saves."""
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", "ignore")
+    return await cache.claim(key, raw)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -90,7 +110,7 @@ async def muse_device_initiate(user_id: CurrentUserId):
         raise HTTPException(status_code=502, detail="Failed to request device code from Meta")
 
     await cache.client.set(
-        f"oauth:muse:device:{user_id}",
+        _pending_key(user_id, "muse"),
         json.dumps({"device_code": device["device_code"]}),
         ex=max(60, device.get("expires_in", 600)),
     )
@@ -106,13 +126,15 @@ async def muse_device_initiate(user_id: CurrentUserId):
 @router.post("/muse/device/poll")
 async def muse_device_poll(user_id: CurrentUserId):
     """Poll for device authorization."""
+    from src.server.database.oauth_tokens import connection_change
     from src.utils.cache.redis_cache import get_cache_client
 
     cache = get_cache_client()
     if not cache.enabled or not cache.client:
         raise HTTPException(status_code=503, detail="Cache unavailable")
 
-    raw = await cache.client.get(f"oauth:muse:device:{user_id}")
+    key = _pending_key(user_id, "muse")
+    raw = await cache.client.get(key)
     if not raw:
         raise HTTPException(status_code=400, detail="No pending Muse authorization. Please initiate again.")
 
@@ -121,7 +143,7 @@ async def muse_device_poll(user_id: CurrentUserId):
     try:
         result = await muse_poll_device_authorization(device["device_code"], user_id=user_id)
     except ValueError as e:
-        await cache.client.delete(f"oauth:muse:device:{user_id}")
+        await cache.client.delete(key)
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.error(f"[oauth] Muse device poll error for user_id={user_id}: {type(e).__name__}")
@@ -131,10 +153,17 @@ async def muse_device_poll(user_id: CurrentUserId):
         return {"pending": True}
 
     try:
-        if not result.get("_saved"):
-            result = await muse_save_minted_credentials(user_id, result)
-
-        await cache.client.delete(f"oauth:muse:device:{user_id}")
+        # Claim the flow and store under the connection lock: a disconnect that
+        # landed while Meta was answering has cleared the key, and this save
+        # aborts instead of reviving the connection (DALTON-HOOK(team-credentials)).
+        async with connection_change(user_id, MUSE_PROVIDER) as conn:
+            if not await _claim_pending(cache, key, raw):
+                raise HTTPException(
+                    status_code=400,
+                    detail="The Muse sign-in was cancelled or replaced. Start again.",
+                )
+            if not result.get("_saved"):
+                result = await muse_save_minted_credentials(user_id, result, conn=conn)
 
         logger.info(f"[oauth] Muse connected for user_id={user_id}")
         return {
@@ -146,6 +175,8 @@ async def muse_device_poll(user_id: CurrentUserId):
     except ValueError as e:
         logger.error(f"[oauth] Muse API key mint/save failed for user_id={user_id}: {type(e).__name__}")
         raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"[oauth] Muse token storage failed for user_id={user_id}: {type(e).__name__}")
         raise HTTPException(status_code=400, detail=f"Token storage failed: {type(e).__name__}")
@@ -182,18 +213,24 @@ async def muse_status(user_id: CurrentUserId):
 
 @router.delete("/muse")
 async def muse_disconnect(user_id: CurrentUserId):
-    """Delete stored Muse OAuth tokens."""
+    """Delete the stored Muse connection and any sign-in still pending.
+
+    The write rides the unified ``connection_change`` lock and first clears the
+    pending flow — keyed by the credential holder, so this cancels every
+    member's pending sign-in too, and an approval arriving after the
+    disconnect cannot bring the connection back
+    (DALTON-HOOK(team-credentials))."""
     from src.dalton.credentials import credential_user_id, require_credential_admin
     from src.utils.cache.redis_cache import get_cache_client
 
     require_credential_admin(user_id)
-    await delete_oauth_tokens(user_id, MUSE_PROVIDER)
+    cache = get_cache_client()
+    async with connection_change(user_id, MUSE_PROVIDER) as conn:
+        if getattr(cache, "enabled", False) and getattr(cache, "client", None):
+            await cache.client.delete(_pending_key(user_id, "muse"))
+        await delete_oauth_tokens(user_id, MUSE_PROVIDER, conn=conn)
+    await connection_changed(user_id)
     try:
-        await invalidate_oauth_active_cache(user_id)
-    except Exception:
-        pass
-    try:
-        cache = get_cache_client()
         if getattr(cache, "enabled", False) and getattr(cache, "client", None):
             await cache.client.delete(f"oauth:muse:meta:{credential_user_id(user_id)}")
     except Exception:
@@ -261,14 +298,24 @@ async def antigravity_status(user_id: CurrentUserId):
 
 @router.delete("/antigravity")
 async def antigravity_disconnect(user_id: CurrentUserId):
-    """Delete stored Antigravity OAuth tokens."""
+    """Delete the stored Antigravity connection and any login still pending.
+
+    Same unified door as the others: the holder-keyed flow and completion
+    markers go first, inside the ``connection_change`` lock, so a loopback
+    callback or pasted URL landing after the disconnect cannot revive the
+    connection (DALTON-HOOK(team-credentials))."""
     from src.dalton.credentials import require_credential_admin
+    from src.dalton.llm.providers.antigravity.oauth import _flow_keys
+    from src.utils.cache.redis_cache import get_cache_client
+
     require_credential_admin(user_id)
-    await delete_oauth_tokens(user_id, ANTIGRAVITY_PROVIDER)
-    try:
-        await invalidate_oauth_active_cache(user_id)
-    except Exception:
-        pass
+    cache = get_cache_client()
+    async with connection_change(user_id, ANTIGRAVITY_PROVIDER) as conn:
+        if getattr(cache, "enabled", False) and getattr(cache, "client", None):
+            flow_key, done_key = _flow_keys(user_id)
+            await cache.client.delete(flow_key, done_key)
+        await delete_oauth_tokens(user_id, ANTIGRAVITY_PROVIDER, conn=conn)
+    await connection_changed(user_id)
     logger.info(f"[oauth] Antigravity disconnected for user_id={user_id}")
     return {"success": True}
 
@@ -298,7 +345,7 @@ async def xai_device_initiate(user_id: CurrentUserId):
     ttl = min(XAI_MAX_POLL_WAIT_SECONDS, max(60, int(device.get("expires_in") or XAI_MAX_POLL_WAIT_SECONDS)))
     expires_at_ts = int(datetime.now(timezone.utc).timestamp()) + ttl
     await cache.client.set(
-        f"oauth:xai:device:{user_id}",
+        _pending_key(user_id, "xai"),
         json.dumps(
             {
                 "device_code": device["device_code"],
@@ -322,13 +369,14 @@ async def xai_device_initiate(user_id: CurrentUserId):
 @router.post("/xai/device/poll")
 async def xai_device_poll(user_id: CurrentUserId):
     """Poll for xAI device authorization."""
+    from src.server.database.oauth_tokens import connection_change
     from src.utils.cache.redis_cache import get_cache_client
 
     cache = get_cache_client()
     if not cache.enabled or not cache.client:
         raise HTTPException(status_code=503, detail="Cache unavailable")
 
-    device_key = f"oauth:xai:device:{user_id}"
+    device_key = _pending_key(user_id, "xai")
     raw = await cache.client.get(device_key)
     if not raw:
         raise HTTPException(status_code=400, detail="No pending xAI authorization. Please initiate again.")
@@ -383,12 +431,16 @@ async def xai_device_poll(user_id: CurrentUserId):
         return {"pending": True, "interval": new_interval}
 
     try:
-        await save_xai_tokens(user_id, result)
-        try:
-            await invalidate_oauth_active_cache(user_id)
-        except Exception:
-            pass
-        await cache.client.delete(f"oauth:xai:device:{user_id}")
+        # Claim the flow and store under the connection lock: a disconnect that
+        # landed while xAI was answering has cleared the key, and this save
+        # aborts instead of reviving the connection (DALTON-HOOK(team-credentials)).
+        async with connection_change(user_id, XAI_PROVIDER) as conn:
+            if not await _claim_pending(cache, device_key, raw):
+                raise HTTPException(
+                    status_code=400,
+                    detail="The xAI sign-in was cancelled or replaced. Start again.",
+                )
+            await save_xai_tokens(user_id, result, conn=conn)
         logger.info(f"[oauth] xAI connected for user_id={user_id}")
         return {
             "success": True,
@@ -397,6 +449,8 @@ async def xai_device_poll(user_id: CurrentUserId):
             "display_name": result.get("displayName") or result.get("display_name"),
             "plan_type": XAI_PLAN_TYPE,
         }
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"[oauth] xAI token storage failed for user_id={user_id}: {type(e).__name__}")
         raise HTTPException(status_code=400, detail=f"Token storage failed: {type(e).__name__}")
@@ -410,13 +464,21 @@ async def xai_status(user_id: CurrentUserId):
 
 @router.delete("/xai")
 async def xai_disconnect(user_id: CurrentUserId):
-    """Delete stored xAI OAuth tokens."""
+    """Delete the stored xAI connection and any sign-in still pending.
+
+    Same unified door as the others: the holder-keyed pending device flow goes
+    first, inside the ``connection_change`` lock, so an approval arriving
+    after the disconnect cannot revive the connection
+    (DALTON-HOOK(team-credentials))."""
     from src.dalton.credentials import require_credential_admin
+    from src.utils.cache.redis_cache import get_cache_client
+
     require_credential_admin(user_id)
-    await delete_oauth_tokens(user_id, XAI_PROVIDER)
-    try:
-        await invalidate_oauth_active_cache(user_id)
-    except Exception:
-        pass
+    cache = get_cache_client()
+    async with connection_change(user_id, XAI_PROVIDER) as conn:
+        if getattr(cache, "enabled", False) and getattr(cache, "client", None):
+            await cache.client.delete(_pending_key(user_id, "xai"))
+        await delete_oauth_tokens(user_id, XAI_PROVIDER, conn=conn)
+    await connection_changed(user_id)
     logger.info(f"[oauth] xAI disconnected for user_id={user_id}")
     return {"success": True}

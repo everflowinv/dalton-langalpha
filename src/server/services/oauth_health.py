@@ -34,9 +34,10 @@ from src.server.services.oauth_protocol import (
     upstream_error_code,
 )
 from src.server.services.oauth_providers import SUBSCRIPTIONS
-from src.server.services.oauth_refresh_wait import (
+from src.server.services.oauth_refresh_wait import (  # DALTON-HOOK(oauth-dispatch): wait_window scales a waiter to its provider's pacing
     REFRESH_SAVE_DEADLINE_S,
     await_refreshed_tokens,
+    wait_window,
 )
 
 logger = logging.getLogger(__name__)
@@ -178,8 +179,13 @@ async def valid_token(user_id: str, provider: str) -> Optional[TokenSet]:
         # token still works, so none is spent until it no longer does.
         return held
     if acquired is False:
-        # Another request is refreshing: use what it stores.
-        waited = await await_refreshed_tokens(user_id, provider)
+        # Another request is refreshing: use what it stores. The wait covers
+        # that provider's whole refresh window, so a long-retry refresh (the
+        # xAI CLI path) is waited out, not reported as an outage
+        # (DALTON-HOOK(oauth-dispatch)).
+        waited = await await_refreshed_tokens(
+            user_id, provider, wait_seconds=wait_window(subscription.refresh_deadline_s)
+        )
         if waited and waited.get("needs_reauth_at"):
             raise OAuthReauthRequired(provider, waited.get("last_error_code"))
         if waited:

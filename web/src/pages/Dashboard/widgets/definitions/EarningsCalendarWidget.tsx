@@ -253,12 +253,16 @@ function EarningsCalendarWidget({ instance }: WidgetRenderProps<EarningsConfig>)
     [mine.data, todayStr, now]
   );
 
+  // DALTON-HOOK(user-coverage): the "mine" query fetches a 90-day window, so
+  // the window list needs its own upper bound — otherwise day-60 rows surface
+  // in the two-week widget and the exported range would disagree with the
+  // displayed rows. Only the 90-day view reads the whole fetched span.
   const upcoming = useMemo(
     () =>
       earnings
-        .filter((e) => e.date >= todayStr)
+        .filter((e) => e.date >= todayStr && e.date <= toStr)
         .sort((a, b) => a.date.localeCompare(b.date)),
-    [earnings, todayStr]
+    [earnings, todayStr, toStr]
   );
 
   const grouped = useMemo(() => {

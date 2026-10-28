@@ -455,6 +455,9 @@ async def resolve_oauth_llm_client(
             reasoning_effort=reasoning_effort,
             service_tier=service_tier,
             cache_key=cache_key,
+            # A custom model the manifest does not carry rebuilds only from
+            # its own saved entry, so the 401 path must keep it (DALTON-HOOK(oauth-dispatch)).
+            custom_entry=custom_entry,
         ),
     )
 
