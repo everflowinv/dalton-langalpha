@@ -486,8 +486,9 @@ describe('OnboardingProvider', () => {
     renderAt('/settings');
     expect(card()).toBe('visible');
     expect(screen.getByTestId('done').textContent).toBe('0');
+    // DALTON-HOOK(onboarding-tasks): Dalton hides the desktop-app download task.
     expect(screen.getByTestId('taskIds').textContent).toBe(
-      'dashboard,market,profile,createWorkspace,firstChat,models,desktopApp'
+      'dashboard,market,profile,createWorkspace,firstChat,models'
     );
   });
 
