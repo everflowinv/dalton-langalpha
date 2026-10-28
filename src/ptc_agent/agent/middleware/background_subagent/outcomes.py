@@ -63,12 +63,22 @@ class Outcome:
         )
 
     @classmethod
-    def torn_stream(cls) -> "Outcome":
+    def torn_stream(cls, recovery: str | None = None) -> "Outcome":
         """A handler that finished while its event stream was already lost.
-        An error rather than a stop: the run worked, the record of it did not."""
-        return cls(
-            status="error", error=_TORN_STREAM_MESSAGE, error_type=_TRANSPORT_LOST
+        An error rather than a stop: the run worked, the record of it did not.
+
+        ``recovery`` is the parent-facing note of what the work left behind —
+        its last written text and its transcript — appended to the one error
+        string every surface carries (in-memory result, ledger failure row,
+        TaskOutput), so a torn run's finished work is recoverable instead of
+        thrown away (DALTON-HOOK(subagent-spill-recovery)).
+        """
+        error = (
+            _TORN_STREAM_MESSAGE
+            if recovery is None
+            else f"{_TORN_STREAM_MESSAGE} {recovery}"
         )
+        return cls(status="error", error=error, error_type=_TRANSPORT_LOST)
 
     def as_failure(self) -> dict[str, Any]:
         """The ledger row's failure payload."""

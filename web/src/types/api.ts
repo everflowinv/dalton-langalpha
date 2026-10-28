@@ -713,6 +713,8 @@ export interface Thread {
   // DALTON-HOOK(colleague-dispatch): thread ownership & dispatcher metadata
   thread_user_id?: string | null;
   workspace_owner_id?: string | null;
+  unseen?: boolean;
+  is_read?: boolean;
   dispatched_by?: {
     user_id?: string;
     name?: string | null;

@@ -308,6 +308,47 @@ def sanitize_stderr_text(raw: str | bytes | None, *, max_len: int = 500) -> str:
     return text.strip()
 
 
+# D-r2: the failure log's excerpt carries upstream error bodies, and the PII
+# in them rides past the token patterns above — a URL's query values
+# (https://…?query=alice%40example.com&phone=13800138000) and the pairs after
+# a Cookie's first segment (the key-value pattern stops at ';' and space, so
+# `Cookie=session=abc123; sid=privateSession456` kept sid's value). Only this
+# log's redaction layers on top; every other sanitize_stderr_text caller
+# keeps its behavior.
+_FAILURE_LOG_URL_RE = re.compile(r"(?i)(?:https?|ftp)://[^\s\"'<>]+")
+# Any query pair left after that — a relative request path in a client
+# error ("Max retries exceeded with url: /search?query=…") or a scheme the
+# URL pattern missed — keeps its key and loses its value.
+_FAILURE_LOG_QUERY_PAIR_RE = re.compile(r"([?&][^\s=&#?\"'<>]+=)[^\s&#\"'<>]*")
+_FAILURE_LOG_COOKIE_RE = re.compile(r"(?i)(\b(?:set-)?cookie\b\s*[:=]\s*)[^\r\n]*")
+_FAILURE_LOG_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+# A mainland-China mobile number: 11 digits starting 13-9, never inside a
+# longer digit run (timestamps, order ids).
+_FAILURE_LOG_PHONE_RE = re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)")
+
+
+def _redact_url_query(url: str) -> str:
+    """A URL keeping its parameter names but no values, fragment cut too."""
+    head, sep, query = url.partition("?")
+    if not sep:
+        return url
+    names = [f"{part.split('=', 1)[0]}=…" for part in query.split("&") if part]
+    return f"{head}?{'&'.join(names)}" if names else f"{head}?"
+
+
+def _sanitize_failure_log_excerpt(raw: str) -> str:
+    """The failure log's error excerpt: `sanitize_stderr_text`'s token/secret
+    redaction plus the PII those patterns never caught — URL query values,
+    whole Cookie/Set-Cookie strings (to end of line), email addresses and
+    mainland-China phone numbers. Sanitized in full, then the first 300 chars."""
+    text = _FAILURE_LOG_URL_RE.sub(lambda m: _redact_url_query(m.group(0)), raw)
+    text = _FAILURE_LOG_QUERY_PAIR_RE.sub(lambda m: m.group(1) + "…", text)
+    text = _FAILURE_LOG_COOKIE_RE.sub(r"\1[REDACTED]", text)
+    text = _FAILURE_LOG_EMAIL_RE.sub("[REDACTED]", text)
+    text = _FAILURE_LOG_PHONE_RE.sub("[REDACTED]", text)
+    return sanitize_stderr_text(text, max_len=1_000_000)[:300]
+
+
 def _sanitize_metadata_tree(obj: Any, *, max_str_len: int = 300) -> Any:
     """Recursively sanitize strings and redact secret-keyed fields in metadata structures."""
     if obj is None or isinstance(obj, (int, float, bool)):
@@ -1794,9 +1835,10 @@ ROUTE_CONTRACT_SPECS: dict[str, dict[str, Any]] = {
     "cn-hk": {
         "tool": "finance",
         "category": "finance",
-        "operations": ["ask", "filings"],
+        "operations": ["ask", "filings", "quote"],
         "default_operation": "filings",
         "operation_aliases": {
+            "price": "quote",
             "list-filings": "filings",
             "list_filings": "filings",
             "list": "filings",
@@ -1809,17 +1851,21 @@ ROUTE_CONTRACT_SPECS: dict[str, dict[str, Any]] = {
         "required_params": {
             "filings": ["ticker", "start", "end"],
             "ask": ["query"],
+            "quote": ["ticker"],
         },
         "optional_params": ["operation", "ticker", "start", "end", "limit"],
         "param_formats": {
-            "ticker": "港股用 5 位数字 '00700'（勿写 '0700.HK'，桥接层自动转为 '00700'）；A 股用 6 位数字 '600519'/'300750'",
-            "start": "YYYY-MM-DD（filings 必填）",
-            "end": "YYYY-MM-DD（filings 必填）",
+            "ticker": "港股用 5 位数字 '00700'（勿写 '0700.HK'，桥接层自动转为 '00700'）；A 股用 6 位数字 '600519'/'300750'。filings / quote 用；ask 不单独接受 ticker（桥接层会并入 query）",
+            "start": "YYYY-MM-DD（filings 必填；ask 的日期写进 query）",
+            "end": "YYYY-MM-DD（filings 必填；ask 的日期写进 query）",
+            "query": "ask 用的自然语言问题，公司和日期写在问题里（如 '腾讯00700 2026Q2 游戏收入与毛利率'）；filings / quote 不接受",
+            "quote": "港 A 股当前报价的备用源（AkShare→腾讯→新浪），只接受 ticker、不接受历史日期；返回里保留实际数据源与备用原因。当前价优先用 get_quote，它取不到或明显过期时再用这里，并写明来源",
         },
         "return_shape": "{\"ok\": true, \"status\": \"ok\", \"ticker\": \"00700\", \"rows\"|\"data\": ..., \"_sources\": [...], \"normalized_params\": {...}}",
         "examples": [
             "finance(route=\"cn-hk\", operation=\"filings\", ticker=\"00700\", start=\"2026-01-01\", end=\"2026-10-23\", limit=10)",
-            "finance(route=\"cn-hk\", operation=\"ask\", ticker=\"00700\", query=\"2026Q2 游戏收入与毛利率\")",
+            "finance(route=\"cn-hk\", operation=\"ask\", query=\"腾讯00700 2026Q2 游戏收入与毛利率\")",
+            "finance(route=\"cn-hk\", operation=\"quote\", ticker=\"00700\")",
         ],
     },
     "fred": {
@@ -3115,6 +3161,43 @@ def _normalize_and_validate_call_args(
 
         # Validate required parameters aligned with upstream data_gateway.py
         eff_op = op_str or str(spec.get("default_operation") or "").strip()
+        if route == "cn-hk" and eff_op == "ask":
+            # researchdata 1.5 refuses ticker/start/end beside an `ask` (the
+            # question carries them); fold them into the question so older
+            # callers and examples keep working instead of failing upstream.
+            folded = [
+                str(normalized.pop(k) or "").strip() for k in ("ticker", "start", "end")
+                if k in normalized
+            ]
+            folded = [v for v in folded if v]
+            if folded:
+                base_q = str(normalized.get("query") or "").strip()
+                # Whole-token match: "00700" inside "300700" is another company.
+                extra = " ".join(v for v in folded if not _query_contains_ticker(base_q, v))
+                normalized["query"] = f"{extra} {base_q}".strip() if extra else base_q
+        cn_hk_refused: list[str] = []
+        if route == "cn-hk" and eff_op == "filings" and str(normalized.get("query") or "").strip():
+            cn_hk_refused = ["query"]
+        elif route == "cn-hk" and eff_op == "quote":
+            cn_hk_refused = [
+                k for k in ("query", "start", "end") if str(normalized.get(k) or "").strip()
+            ]
+        if cn_hk_refused:
+            return normalized, norm_view, {
+                "_declared_sources": [],
+                "_sources": [],
+                "ok": False,
+                "status": "invalid_arguments",
+                "error_code": "unsupported_parameters",
+                "error_category": "参数错误",
+                "unsupported_parameters": cn_hk_refused,
+                "error": (
+                    f"[参数错误] cn-hk operation='{eff_op}' 不接受 {cn_hk_refused}："
+                    "filings 用 ticker/start/end；quote 只用 ticker（当前报价，没有历史日期）；"
+                    "自然语言问题用 operation='ask'，公司和日期写进 query。"
+                ),
+                "normalized_params": norm_view,
+            }
         missing_req: list[str] = []
         if route == "fred":
             for req_k in ("series", "start", "end"):
@@ -3129,6 +3212,9 @@ def _normalize_and_validate_call_args(
                 for req_k in ("ticker", "start", "end"):
                     if not str(normalized.get(req_k) or "").strip():
                         missing_req.append(req_k)
+            elif eff_op == "quote":
+                if not str(normalized.get("ticker") or "").strip():
+                    missing_req.append("ticker")
             elif eff_op == "ask":
                 if not str(normalized.get("query") or "").strip():
                     missing_req.append("query")
@@ -3608,6 +3694,29 @@ def _classify_error_category_and_hint(
         or ("not allowed" in err_lower and status != "paid_source_not_allowed")
     )
     sec_no_match = _is_sec_object_not_found(route, payload)
+    # B5: AlphaEngine's "E_UPSTREAM_API: 数据不存在" is one document that does
+    # not exist while other documents in the same round read fine — the
+    # upstream answered, so it is a no-match, not an outage, and retrying the
+    # same document cannot help.
+    ae_doc_not_found = "数据不存在" in err_text and (
+        err_code == "e_upstream_api" or "e_upstream_api" in err_lower
+    )
+    # B5: "E_SOURCE_NOT_RESOLVED: 无法唯一匹配来源" is the caller's source
+    # name not matching exactly — a parameter mistake the upstream message
+    # itself says how to fix (list_filters), not an outage worth retrying
+    # as-is (a real task retried it 4 times for nothing).
+    source_name_unresolved = (
+        err_code == "e_source_not_resolved"
+        or "e_source_not_resolved" in err_lower
+        or "无法唯一匹配来源" in err_text
+    )
+    # B5: Xueqiu's comments API answers an expired login cookie with an
+    # HTTP 400 (not 401/403) whose wording matches none of the auth tokens
+    # below; five straight batch requests failed on it. Matched on the
+    # wording itself, never on "400" alone — most 400s are parameter errors.
+    xueqiu_login_expired = "雪球" in err_text and (
+        "用户未登录" in err_text or "cookie 缺失或已过期" in err_lower
+    )
 
     if existing_cat in ("参数错误", "上游不可用", "权限或额度", "没有匹配"):
         category = existing_cat
@@ -3615,7 +3724,9 @@ def _classify_error_category_and_hint(
         # An unknown concept/attachment/filing/item/accession found nothing;
         # the upstream answered, so neither "参数错误" nor "上游暂不可用，可重试" is the fix.
         category = "没有匹配"
-    elif other_param_signal or e_bad_signal:
+    elif ae_doc_not_found:
+        category = "没有匹配"
+    elif other_param_signal or e_bad_signal or source_name_unresolved:
         _succeeded, failed_legs = (
             _collect_multi_source_health(payload) if route == "all" else ([], [])
         )
@@ -3687,6 +3798,7 @@ def _classify_error_category_and_hint(
                 "需要登录",
             )
         )
+        or xueqiu_login_expired
     ):
         category = "权限或额度"
     elif status in ("empty", "no_match") and not payload.get("error"):
@@ -3699,7 +3811,12 @@ def _classify_error_category_and_hint(
         return category, existing_hint
 
     if category == "参数错误":
-        if mcp_field_validation:
+        if source_name_unresolved:
+            hint = (
+                "来源名无法唯一匹配；请先调用 list_filters(filter_type=sources) 获取准确的来源名，"
+                "再用准确名称重查。"
+            )
+        elif mcp_field_validation:
             hint = (
                 f"上游字段校验失败（{err_text[:200]}）；请核对报错指出的字段名与取值范围后重试"
                 f"（可调用 catalog(route='{route}') 查看该路由的参数契约）。"
@@ -3712,7 +3829,13 @@ def _classify_error_category_and_hint(
         else:
             hint = "请先调用 catalog() 查看目标路由支持的 operation 与参数列表，修正参数后重试。"
     elif category == "权限或额度":
-        if status == "paid_source_not_allowed":
+        if xueqiu_login_expired:
+            hint = (
+                "雪球登录态失效（Cookie 缺失或已过期）；停止继续请求雪球评论，"
+                "改用其他社区来源（employee / last30days / x-timeline），"
+                "并在报告中如实说明雪球评论因登录态失效未能获取。"
+            )
+        elif status == "paid_source_not_allowed":
             hint = "employee 的 indeed/glassdoor 属于付费源，请改用免费操作 operation='blind' 或 'summary'，或在确认授权时显式传 allow_paid=True。"
         elif status == "handoff_filtered":
             hint = "该路由在 LangAlpha 中已禁用；网页新闻请改用内置 WebSearch/WebFetch 工具，X 检索请改用 community(route='x-timeline', operation='search', ...)。"
@@ -3724,6 +3847,11 @@ def _classify_error_category_and_hint(
     elif category == "没有匹配":
         if sec_no_match:
             hint = "先用 search-concepts / list-filings / attachments 拿到可用的名称或 ID 再读，不要猜"
+        elif ae_doc_not_found:
+            hint = (
+                "该文档在上游不存在（E_UPSTREAM_API: 数据不存在，同一轮其他文档可正常读取）；"
+                "请核对文档 ID 或链接是否准确，不要对同一文档重复请求。"
+            )
         elif route == "transcript":
             hint = TRANSCRIPT_NO_MATCH_HINT
         elif tool_name == "community":
@@ -4400,6 +4528,8 @@ class ResearchDataBridge:
     def __init__(self, cfg: BridgeConfig) -> None:
         self.cfg = cfg
         self.sem = asyncio.Semaphore(cfg.max_inflight)
+        # Serializes formal company-wiki writes (see `handle_wiki_ingest`).
+        self._wiki_write_lock = asyncio.Lock()
         self.embed_sem = asyncio.Semaphore(cfg.embed_max_inflight)
         self.community_sems: dict[str, asyncio.Semaphore] = {
             r: asyncio.Semaphore(limit)
@@ -7812,6 +7942,11 @@ class ResearchDataBridge:
         result_obj = resp.get("result")
         status_str = "ok"
         declared_count = 0
+        # B5: a failure line carries the classified category and the head of
+        # the error message — the SEC list-filings cluster was first debugged
+        # against status-only lines, with the reason invisible.
+        error_category_str = "-"
+        error_excerpt_str = ""
 
         if isinstance(result_obj, dict) and isinstance(result_obj.get("content"), list):
             blocks = result_obj["content"]
@@ -8021,6 +8156,14 @@ class ResearchDataBridge:
                             )
                     status_str = str(payload.get("status") or ("ok" if payload.get("ok") else "error"))
                     result_obj["isError"] = not bool(payload.get("ok"))
+                    err_body = str(payload.get("error") or "").strip()
+                    if err_body:
+                        error_category_str = str(payload.get("error_category") or "").strip() or "-"
+                        # The failure-log excerpt's own redaction (D-r2): URL
+                        # query values, whole cookie strings, emails and phone
+                        # numbers ride past the token patterns, so this layer
+                        # strips them before the 300-char slice.
+                        error_excerpt_str = _sanitize_failure_log_excerpt(err_body)
 
                     # Place _declared_sources and _sources first so 64 KiB truncation preserves them
                     enriched = {
@@ -8036,14 +8179,23 @@ class ResearchDataBridge:
                     if isinstance(result_obj.get("structuredContent"), dict):
                         result_obj["structuredContent"] = dict(enriched)
 
+        # B5: failures append the category and the sanitized error excerpt;
+        # success lines keep their original shape.
+        error_log_suffix = ""
+        error_log_args: tuple[str, ...] = ()
+        if error_excerpt_str:
+            error_log_suffix = " error_category=%s error=%s"
+            error_log_args = (error_category_str, error_excerpt_str)
         logger.info(
-            "tools/call tool=%s route=%s op=%s status=%s declared_sources=%d elapsed_ms=%d",
+            "tools/call tool=%s route=%s op=%s status=%s declared_sources=%d elapsed_ms=%d"
+            + error_log_suffix,
             tool_name,
             route or "-",
             operation or "-",
             status_str,
             declared_count,
             elapsed_ms,
+            *error_log_args,
         )
         return resp
 
@@ -9416,6 +9568,220 @@ class ResearchDataBridge:
         subdir = "companies" if target_type == "company" else "sectors"
         return wiki_dir / subdir
 
+    # Dalton-owned alias store. OpenClaw's company-wiki config.json stays
+    # read-only for the bridge; aliases an internal member registers while
+    # ingesting live in this separate file and are merged after config.json
+    # (config.json wins), so neither system rewrites the other's file.
+    def _wiki_alias_file(self) -> Path:
+        custom = os.environ.get("DALTON_WIKI_ALIAS_FILE", "").strip()
+        if custom:
+            return Path(custom).expanduser()
+        return self.cfg.wiki_ingest_audit_file.with_name("wiki_aliases.json")
+
+    def _parse_wiki_alias_file_strict(self) -> dict[str, dict[str, dict[str, Any]]]:
+        """`{target_type: {alias_lower: record}}`; raises on I/O or format corruption."""
+        path = self._wiki_alias_file()
+        if not path.exists():
+            return {}
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            raise ValueError("Wiki alias store root must be a JSON object")
+        out: dict[str, dict[str, dict[str, Any]]] = {}
+        for ttype, entries in raw.items():
+            if ttype not in ("company", "sector") or not isinstance(entries, dict):
+                raise ValueError("Wiki alias store sections must be company/sector objects")
+            section: dict[str, dict[str, Any]] = {}
+            for key, rec in entries.items():
+                if not isinstance(rec, dict) or not isinstance(rec.get("slug"), str):
+                    raise ValueError("Wiki alias records must carry a slug")
+                section[str(key)] = rec
+            out[ttype] = section
+        return out
+
+    def _read_wiki_aliases(self, target_type: str) -> dict[str, str]:
+        """`alias_lower -> slug` from the Dalton alias store.
+
+        Raises `WikiAliasStoreError` when the store exists but cannot be read:
+        an empty map there would quietly file a registered alias under a new
+        directory of the same name.
+        """
+        try:
+            store = self._parse_wiki_alias_file_strict()
+        except Exception as exc:
+            logger.error("Failed reading wiki alias store: %s", type(exc).__name__)
+            raise WikiAliasStoreError(type(exc).__name__) from exc
+        return {
+            k: str(rec["slug"]).strip()
+            for k, rec in (store.get(target_type) or {}).items()
+            if str(rec.get("slug") or "").strip()
+        }
+
+    def _config_wiki_aliases(self, target_type: str, wiki_cfg: dict[str, Any]) -> dict[str, str]:
+        """`alias_lower -> slug` from OpenClaw config.json (nested per type, then flat)."""
+        alias_map: dict[str, str] = {}
+        raw_aliases = wiki_cfg.get("aliases")
+        if isinstance(raw_aliases, dict):
+            nested = raw_aliases.get(target_type)
+            if isinstance(nested, dict):
+                for k, v in nested.items():
+                    if isinstance(k, str) and isinstance(v, str) and k.strip() and v.strip():
+                        alias_map[k.strip().lower()] = v.strip()
+            for k, v in raw_aliases.items():
+                if isinstance(k, str) and isinstance(v, str) and k.strip() and v.strip():
+                    alias_map.setdefault(k.strip().lower(), v.strip())
+        return alias_map
+
+    def _plan_wiki_alias_additions(
+        self,
+        target_type: str,
+        resolved_slug: str,
+        raw_aliases: Any,
+        wiki_cfg: dict[str, Any],
+    ) -> tuple[list[str], list[str], dict[str, Any] | None]:
+        """Validate requested aliases for `resolved_slug`: `(to_add, already, error)`.
+
+        An alias that already names another company (a config/Dalton alias or
+        another directory) is a conflict and fails the whole request, so a
+        mistaken mapping never lands silently.
+        """
+        if raw_aliases is None:
+            return [], [], None
+        if not isinstance(raw_aliases, list) or len(raw_aliases) > _WIKI_ALIASES_MAX:
+            return [], [], {
+                "ok": False,
+                "status": "bad_request",
+                "error_code": "invalid_aliases",
+                "error": f"aliases 必须是字符串列表，最多 {_WIKI_ALIASES_MAX} 个。",
+            }
+        config_map = self._config_wiki_aliases(target_type, wiki_cfg)
+        try:
+            dalton_map = self._read_wiki_aliases(target_type)
+        except WikiAliasStoreError:
+            return [], [], dict(_WIKI_ALIAS_STORE_UNREADABLE)
+        base_dir = self._resolve_wiki_base_dir(target_type, wiki_cfg)
+        existing_dirs: dict[str, str] = {}
+        if base_dir.is_dir():
+            try:
+                existing_dirs = {d.name.lower(): d.name for d in base_dir.iterdir() if d.is_dir()}
+            except OSError:
+                existing_dirs = {}
+        to_add: list[str] = []
+        already: list[str] = []
+        seen: set[str] = set()
+        slug_lower = resolved_slug.lower()
+        for item in raw_aliases:
+            alias = item.strip() if isinstance(item, str) else ""
+            if not alias or len(alias) > 60 or not _WIKI_ALIAS_TEXT_RE.fullmatch(alias):
+                return [], [], {
+                    "ok": False,
+                    "status": "bad_request",
+                    "error_code": "invalid_alias",
+                    "alias": item if isinstance(item, str) else None,
+                    "error": "别名须为 1–60 个字符的公司名称或股票代码，不能含路径字符或控制字符。",
+                }
+            key = alias.lower()
+            if key in seen or key == slug_lower:
+                continue
+            seen.add(key)
+            mapped = config_map.get(key) or dalton_map.get(key) or existing_dirs.get(key)
+            if mapped is not None and mapped.lower() != slug_lower:
+                return [], [], {
+                    "ok": False,
+                    "status": "alias_conflict",
+                    "error_code": "alias_conflict",
+                    "alias": alias,
+                    "mapped_to": mapped,
+                    "target": resolved_slug,
+                    "error": f"别名 '{alias}' 已指向 '{mapped}'，不能再指向 '{resolved_slug}'。",
+                }
+            if mapped is not None:
+                already.append(alias)
+            else:
+                to_add.append(alias)
+        return to_add, already, None
+
+    def _save_wiki_aliases(
+        self,
+        target_type: str,
+        resolved_slug: str,
+        aliases: list[str],
+        added_by: Any,
+    ) -> list[str]:
+        """Persist `aliases -> resolved_slug` atomically under flock; returns those written.
+
+        Re-checks each alias inside the lock and skips one another writer
+        mapped elsewhere in the meantime. Refuses to overwrite a corrupted store.
+        """
+        import fcntl
+
+        if not aliases:
+            return []
+        path = self._wiki_alias_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = path.with_suffix(".lock")
+        written: list[str] = []
+        with lock_path.open("a", encoding="utf-8") as lock_fh:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+            try:
+                try:
+                    store = self._parse_wiki_alias_file_strict()
+                except Exception as exc:
+                    logger.error(
+                        "Refusing to overwrite corrupted wiki alias store %s: %s",
+                        path,
+                        type(exc).__name__,
+                    )
+                    return []
+                section = store.setdefault(target_type, {})
+                now_iso = datetime.now(timezone.utc).isoformat()
+                # A directory or config.json alias that appeared since the
+                # check (another writer created the company meanwhile) wins:
+                # the alias is skipped rather than shadowing that company.
+                # config.json is re-read here, not taken from the request:
+                # an admin may have mapped the name meanwhile.
+                fresh_cfg = self._load_company_wiki_config()
+                taken = {**self._config_wiki_aliases(target_type, fresh_cfg)}
+                base_dir = self._resolve_wiki_base_dir(target_type, fresh_cfg)
+                if base_dir.is_dir():
+                    for d in base_dir.iterdir():
+                        if d.is_dir():
+                            taken.setdefault(d.name.lower(), d.name)
+                for alias in aliases:
+                    key = alias.lower()
+                    other = taken.get(key)
+                    if other is not None and other.lower() != resolved_slug.lower():
+                        logger.warning("Wiki alias %r now names %r; skipped", alias, other)
+                        continue
+                    prior = section.get(key)
+                    if prior is not None:
+                        if str(prior.get("slug") or "").lower() == resolved_slug.lower():
+                            continue
+                        logger.warning("Wiki alias %r was mapped concurrently; skipped", alias)
+                        continue
+                    section[key] = {
+                        "alias": alias,
+                        "slug": resolved_slug,
+                        "added_by": added_by,
+                        "added_at": now_iso,
+                    }
+                    written.append(alias)
+                if not written:
+                    return []
+                tmp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+                with tmp_path.open("w", encoding="utf-8") as fh:
+                    json.dump(store, fh, ensure_ascii=False, indent=2, sort_keys=True)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                os.replace(tmp_path, path)
+                dir_fd = os.open(str(path.parent), os.O_RDONLY)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+            finally:
+                fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+        return written
+
     def _resolve_and_validate_wiki_slug(
         self, target_type: str, raw_target: str, wiki_cfg: dict[str, Any]
     ) -> tuple[str | None, bool, dict[str, Any] | None]:
@@ -9441,18 +9807,14 @@ class ResearchDataBridge:
                 "error": f"无效的 {target_type} 名称 '{cleaned}'：temp* 为保留目录名，禁止入库。",
             }
 
-        # 1. Check aliases in config.json (read-only)
-        alias_map: dict[str, str] = {}
-        raw_aliases = wiki_cfg.get("aliases")
-        if isinstance(raw_aliases, dict):
-            nested = raw_aliases.get(target_type)
-            if isinstance(nested, dict):
-                for k, v in nested.items():
-                    if isinstance(k, str) and isinstance(v, str) and k.strip() and v.strip():
-                        alias_map[k.strip().lower()] = v.strip()
-            for k, v in raw_aliases.items():
-                if isinstance(k, str) and isinstance(v, str) and k.strip() and v.strip():
-                    alias_map.setdefault(k.strip().lower(), v.strip())
+        # 1. Check aliases: config.json (read-only) first, then the Dalton alias store
+        alias_map = self._config_wiki_aliases(target_type, wiki_cfg)
+        try:
+            dalton_aliases = self._read_wiki_aliases(target_type)
+        except WikiAliasStoreError:
+            return None, False, dict(_WIKI_ALIAS_STORE_UNREADABLE)
+        for k, v in dalton_aliases.items():
+            alias_map.setdefault(k, v)
 
         base_dir = self._resolve_wiki_base_dir(target_type, wiki_cfg)
         existing_dirs: dict[str, str] = {}
@@ -9488,7 +9850,13 @@ class ResearchDataBridge:
             if cleaned == resolved_existing or pattern.fullmatch(cleaned):
                 return resolved_existing, True, None
 
-        # 3. Unmapped A-share / HK / Chinese names or numeric tickers -> do NOT auto-add alias
+        # 3. Unmapped A-share / HK / Chinese names or numeric tickers -> do NOT auto-add alias.
+        # The answer lists the existing directory names: the company is often
+        # already there under an English slug (东方雨虹 → YUHONG), and the
+        # caller can retry with it instead of waiting on an admin.
+        all_targets = sorted(existing_dirs.values())
+        existing_targets = all_targets[:_WIKI_EXISTING_TARGETS_MAX]
+        targets_truncated = len(all_targets) > len(existing_targets)
         if _WIKI_NEEDS_ALIAS_RE.search(cleaned) or not cleaned.isascii():
             return None, False, {
                 "ok": False,
@@ -9497,11 +9865,13 @@ class ResearchDataBridge:
                 "needs_alias": True,
                 "target": cleaned,
                 "target_type": target_type,
+                "existing_targets": existing_targets,
+                "existing_targets_truncated": targets_truncated,
                 "error": (
                     f"'{cleaned}' 未在 config.json 配置别名 (needs_alias)；"
-                    "A股/港股/中文名称不自动添加别名，请找管理员在 config.json aliases 中配置后再入库。"
+                    "A股/港股/中文名称不自动添加别名。"
                 ),
-                "hint": "请联系管理员在 OpenClaw company-wiki config.json 的 aliases 中添加映射。",
+                "hint": _WIKI_NEEDS_ALIAS_HINT,
             }
 
         if cleaned.isdigit():
@@ -9512,11 +9882,12 @@ class ResearchDataBridge:
                 "needs_alias": True,
                 "target": cleaned,
                 "target_type": target_type,
+                "existing_targets": existing_targets,
+                "existing_targets_truncated": targets_truncated,
                 "error": (
-                    f"纯数字 ticker '{cleaned}' 拒绝直接建目录 (needs_alias)；"
-                    "A股/港股数字代码请找管理员在 config.json aliases 中添加映射后再入库。"
+                    f"纯数字 ticker '{cleaned}' 拒绝直接建目录 (needs_alias)。"
                 ),
-                "hint": "纯数字 ticker 禁止直接作为目录名，请联系管理员添加别名映射。",
+                "hint": _WIKI_NEEDS_ALIAS_HINT,
             }
 
         # 4. Validate new slug regex
@@ -10131,7 +10502,38 @@ class ResearchDataBridge:
         return parsed
 
     async def handle_wiki_ingest(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
-        """Handle `POST /wiki/ingest` (admin token only) to validate, preview, or ingest into company-wiki."""
+        """Handle `POST /wiki/ingest` (admin token only) to validate, preview, or ingest into company-wiki.
+
+        Writes run one at a time (the bridge is one process): target
+        resolution, the alias check, the document write and the alias save
+        all see one state of directories and aliases, so a name can never be
+        registered for one company while another write creates it as a
+        directory. Previews do not wait. Wiki writes are rare and rate-limited.
+        """
+        if bool(body.get("dry_run", False)):
+            return await self._handle_wiki_ingest_unlocked(body)
+        # The wait is bounded: the backend gives the whole call a budget only a
+        # few seconds above the CLI's own timeout, so a write queued longer
+        # would be reported failed to the user and then land anyway. A busy
+        # answer writes nothing and the caller retries.
+        try:
+            await asyncio.wait_for(
+                self._wiki_write_lock.acquire(), timeout=WIKI_WRITE_QUEUE_WAIT_S
+            )
+        except TimeoutError:
+            return 503, {
+                "ok": False,
+                "status": "busy",
+                "error_code": "wiki_write_busy",
+                "retryable": True,
+                "error": "另一份资料正在写入 company-wiki，本次没有写入；请稍后重试（同一请求重试不会重复入库）。",
+            }
+        try:
+            return await self._handle_wiki_ingest_unlocked(body)
+        finally:
+            self._wiki_write_lock.release()
+
+    async def _handle_wiki_ingest_unlocked(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         target_type = str(body.get("target_type") or "").strip().lower()
         if target_type not in ("company", "sector"):
             return 400, {
@@ -10310,7 +10712,13 @@ class ResearchDataBridge:
             target_type, raw_target, wiki_cfg
         )
         if slug_err is not None or resolved_slug is None:
-            return 400, slug_err or {"ok": False, "status": "invalid_slug", "error": "Invalid target"}
+            status_code = 503 if (slug_err or {}).get("status") == "alias_store_unreadable" else 400
+            return status_code, slug_err or {"ok": False, "status": "invalid_slug", "error": "Invalid target"}
+        aliases_to_add, aliases_existing, alias_err = self._plan_wiki_alias_additions(
+            target_type, resolved_slug, body.get("aliases"), wiki_cfg
+        )
+        if alias_err is not None:
+            return _wiki_alias_error_status(alias_err), alias_err
 
         content_text: str | None = None
         file_bytes: bytes | None = None
@@ -10577,7 +10985,20 @@ class ResearchDataBridge:
                         "Failed backfilling wiki ingest audit entry on replay: %s",
                         type(exc).__name__,
                     )
-            return 200, _build_replay_response(prior_entry)
+            replay = _build_replay_response(prior_entry)
+            # A retry that brings aliases the first write lacked registers them
+            # now: the document is already filed under this slug.
+            if aliases_to_add and str(replay.get("target") or "").lower() == resolved_slug.lower():
+                added: list[str] = []
+                try:
+                    added = self._save_wiki_aliases(
+                        target_type, resolved_slug, aliases_to_add, ingested_by_norm
+                    )
+                except Exception as exc:
+                    logger.warning("Failed saving wiki aliases on replay: %s", type(exc).__name__)
+                replay["aliases_added"] = added
+                replay["aliases_not_added"] = [a for a in aliases_to_add if a not in added]
+            return 200, replay
 
         # Idempotent replay check by request_id (reads independent idempotency store first)
         if not dry_run and request_id is not None:
@@ -10620,6 +11041,8 @@ class ResearchDataBridge:
                 "sell_side_warning": sell_side_warning,
                 "sell_side_next_action": sell_side_next_action,
                 "duplicate": False,
+                "aliases_to_add": aliases_to_add,
+                "aliases_existing": aliases_existing,
             }
 
         # Built before any lock is taken: these touch the filesystem and can
@@ -10842,7 +11265,39 @@ class ResearchDataBridge:
                     type(exc).__name__,
                 )
 
+            # Aliases are registered only once the document is filed under the
+            # slug, so a failed write never leaves a mapping behind.
+            aliases_added: list[str] = []
+            if aliases_to_add:
+                try:
+                    aliases_added = self._save_wiki_aliases(
+                        target_type, resolved_slug, aliases_to_add, ingested_by_norm
+                    )
+                except Exception as exc:
+                    logger.warning("Failed saving wiki aliases: %s", type(exc).__name__)
+                if aliases_added:
+                    try:
+                        self._append_wiki_audit_entry(
+                            {
+                                "timestamp": datetime.now(timezone.utc).isoformat(),
+                                "request_id": None,
+                                "ingested_by": ingested_by_norm,
+                                "ingested_via": ingested_via_norm,
+                                "target_type": target_type,
+                                "target": resolved_slug,
+                                "result": "ok",
+                                "status": "aliases_added",
+                                "aliases": aliases_added,
+                            }
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "Failed writing wiki alias audit entry: %s", type(exc).__name__
+                        )
+
             return 200, {
+                "aliases_added": aliases_added,
+                "aliases_not_added": [a for a in aliases_to_add if a not in aliases_added],
                 "ok": True,
                 "status": "ingested",
                 "dry_run": False,
@@ -11792,6 +12247,37 @@ _SELL_SIDE_TYPE_RE = re.compile(
 )
 _SELL_SIDE_BODY_RE = re.compile(
     r"(?i)(?:证券研究报告|执业证书编号|SAC\s*执业|分析师电话会|sales\s+color|卖方研报|券商研报)"
+)
+_WIKI_EXISTING_TARGETS_MAX = 2000
+# Must stay below the backend's call budget minus the CLI timeout
+# (WIKI_INGEST_HTTP_TIMEOUT_S 190 s vs WIKI_INGEST_TIMEOUT_S).
+WIKI_WRITE_QUEUE_WAIT_S = 5.0
+
+
+def _wiki_alias_error_status(err: dict[str, Any]) -> int:
+    return {"alias_conflict": 409, "alias_store_unreadable": 503}.get(str(err.get("status")), 400)
+
+
+class WikiAliasStoreError(RuntimeError):
+    """The Dalton wiki alias store exists but cannot be read."""
+
+
+_WIKI_ALIAS_STORE_UNREADABLE: dict[str, Any] = {
+    "ok": False,
+    "status": "alias_store_unreadable",
+    "error_code": "alias_store_unreadable",
+    "error": "公司别名表（var/dalton/wiki_aliases.json）读取失败，为避免写错目录已暂停入库；请联系管理员修复该文件。",
+}
+_WIKI_ALIASES_MAX = 10
+# Company names and ticker forms (东方雨虹, 002271.SZ, SZ002271, Oriental Yuhong);
+# no path separators, quotes or control characters.
+_WIKI_ALIAS_TEXT_RE = re.compile(r"[\w\u4e00-\u9fff][\w\u4e00-\u9fff .&()（）·'-]*")
+_WIKI_NEEDS_ALIAS_HINT = (
+    "先在 existing_targets 里找这家公司已有的英文目录名（例如东方雨虹 → YUHONG），"
+    "确认是同一家公司后用它作为 target 重新入库；确实没有时，可用大写英文名新建目录"
+    "（^[A-Z][A-Z0-9-]{0,29}$，如 ORIENTAL-YUHONG），并在回执里告诉用户用了哪个目录名。"
+    "拿不准是不是同一家公司时先问用户。重新入库时把这次用的中文名或代码放进 aliases"
+    "（如 [\"002271.SZ\", \"东方雨虹\"]），以后就能直接用它们入库。"
 )
 _WIKI_NEEDS_ALIAS_RE = re.compile(
     r"(?i)(?:[\u4e00-\u9fff]|^(?:SH|SZ|BJ|HK)[.\-]?\d{4,6}$|^\d{4,6}\.(?:HK|SH|SZ|SS|BJ)$)"

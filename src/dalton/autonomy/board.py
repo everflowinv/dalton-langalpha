@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 
 from psycopg.rows import dict_row
 
+from src.dalton.autonomy.due import validation_is_due, workspace_market_timezone
 from src.dalton.budget.service import get_budget_today
 from src.dalton.coverage import get_user_coverage
 from src.dalton.settings import get_dalton_settings
@@ -276,11 +277,9 @@ async def build_coverage_board(
             agenda_content = (docs.get("agenda") or {}).get("content") or {}
             company_content = (docs.get("company") or {}).get("content") or {}
 
-            ticker = (
-                str(company_content.get("ticker") or thesis_content.get("ticker") or ws_name)
-                .strip()
-                .upper()
-            )
+            # 标的与交易所时区来自同一共享解析（与总监探针一致）：company 文档
+            # ticker（+exchange）→ 论点文档 ticker → 工作区名。
+            ticker, market_tz = workspace_market_timezone(company_content, thesis_content, ws_name)
             if not ticker:
                 continue
 
@@ -356,23 +355,21 @@ async def build_coverage_board(
                 due_raw = v.get("due") or v.get("target_date") or v.get("due_date")
                 if not due_raw:
                     continue
-                try:
-                    due_date = date.fromisoformat(str(due_raw)[:10])
-                    if due_date <= today:
-                        score = round(3.0 * 3.0 * staleness, 2)
-                        raw_candidates.append(
-                            {
-                                "workspace_id": ws_id,
-                                "ticker": ticker,
-                                "task": f"验证节点到期 {vid}：{v_what}",
-                                "kind": "validation_check",
-                                "score": score,
-                                "est_usd": DEFAULT_EST_COST_BY_KIND["validation_check"],
-                                "why": f"验证节点到期（{due_date.isoformat()}）· 距上次研究权重={staleness:.2f}",
-                            }
-                        )
-                except ValueError:
-                    continue
+                # 与议程探针同一到期口径：保留原始时刻/时区，缺时区按标的交易所
+                # 时区，不按本地（上海）日历日提前判到期。
+                if validation_is_due(due_raw, ticker, now_dt, tz=market_tz):
+                    score = round(3.0 * 3.0 * staleness, 2)
+                    raw_candidates.append(
+                        {
+                            "workspace_id": ws_id,
+                            "ticker": ticker,
+                            "task": f"验证节点到期 {vid}：{v_what}",
+                            "kind": "validation_check",
+                            "score": score,
+                            "est_usd": DEFAULT_EST_COST_BY_KIND["validation_check"],
+                            "why": f"验证节点到期（{str(due_raw)[:10]}）· 距上次研究权重={staleness:.2f}",
+                        }
+                    )
 
             catalysts = ((agenda_content.get("watch") or {}).get("events") or []) + (
                 agenda_content.get("catalysts") or []

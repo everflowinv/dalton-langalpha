@@ -62,7 +62,9 @@ Save your findings to async_frameworks/comparison.md""",
 
 ## Parallel Execution
 
-Launch up to {{ max_concurrent_task_units | default(3) }} independent tasks in a single response. You are notified as each one finishes.
+{# DALTON-HOOK(subagent-no-sleep-poll): background completions notify the agent;
+   waiting is done by ending the turn, never by sleeping or polling. #}
+Launch up to {{ max_concurrent_task_units | default(3) }} independent tasks in a single response. You are notified as each one finishes; with no independent work left, end your turn — do not sleep or poll while waiting for a background task.
 {% if guidance | default("detailed") == "detailed" %}
 
 ```

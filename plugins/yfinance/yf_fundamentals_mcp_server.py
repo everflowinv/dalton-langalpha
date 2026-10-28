@@ -58,6 +58,9 @@ _ERRORS = described(ERRORS, "Error envelopes for symbols omitted from data.")
 # ---------------------------------------------------------------------------
 
 
+# DALTON-HOOK(yfinance-null-missing): statement NaN/None serialize as JSON null,
+# never the string "N/A" or 0 — agent arithmetic on values (b / 1e6 etc.) must
+# fail loudly on missing data or guard on None, not silently break on a string.
 def _serialize_dataframe(df: pd.DataFrame) -> dict:
     """Statement DataFrame → {metric: {date: value}}; date keys newest first."""
     if df is None or df.empty:
@@ -67,7 +70,7 @@ def _serialize_dataframe(df: pd.DataFrame) -> dict:
         df.index = df.index.strftime("%Y-%m-%d")
     if isinstance(df.columns, pd.DatetimeIndex):
         df.columns = df.columns.strftime("%Y-%m-%d")
-    return json.loads(df.fillna("N/A").to_json(orient="index"))
+    return json.loads(df.to_json(orient="index"))
 
 
 # ---------------------------------------------------------------------------

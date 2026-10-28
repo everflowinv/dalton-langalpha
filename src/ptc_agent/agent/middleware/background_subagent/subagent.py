@@ -15,7 +15,7 @@ from langchain.agents.middleware.types import (
 )
 from langchain.tools import BaseTool, ToolRuntime
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage  # DALTON-HOOK(subagent-spill-recovery)
 from langchain_core.runnables import Runnable
 from langchain_core.runnables.config import var_child_runnable_config
 from langchain_core.tools import StructuredTool
@@ -47,6 +47,7 @@ from ptc_agent.agent.middleware.runtime_context.turn import (
     TURN_TIME_LIMIT_KEY,
 )
 from ptc_agent.agent.state import DeltaAgentState
+from src.llms.content_utils import extract_text_blocks  # DALTON-HOOK(subagent-spill-recovery)
 from src.llms.llm import narrow_prompt_cache_key
 from src.observability.langsmith_tracer import with_run_tracer
 from src.utils.concurrency import aclose_within
@@ -303,6 +304,30 @@ def _with_own_deadline(config: dict, limit: float | None = None) -> dict:
     return {**config, "configurable": configurable}
 
 
+def _last_written_text(state: dict | None) -> str | None:
+    """The last assistant text a run wrote out, from its latest state snapshot.
+
+    Read at the transport-lost abort only: the run's replay archive is torn,
+    but its last words say where the work got to, and the failure the parent
+    sees carries them (DALTON-HOOK(subagent-spill-recovery)). A message that
+    mixes thinking with text counts by its text blocks alone — the
+    whole-message typing marks it reasoning and would skip the run's actual
+    last words for an earlier message's, or for none.
+    """
+    if not isinstance(state, dict):
+        return None
+    messages = state.get("messages")
+    if not isinstance(messages, (list, tuple)):
+        return None
+    for msg in reversed(messages):
+        if not isinstance(msg, AIMessage):
+            continue
+        text = extract_text_blocks(msg.content)
+        if text and text.strip():
+            return text.strip()
+    return None
+
+
 @contextmanager
 def _detached_from_launcher() -> Iterator[None]:
     """Run the enclosed subagent as its own run, not a child of its launcher.
@@ -417,6 +442,18 @@ async def arun_subagent_streaming(
                     # archive — abort the graph instead of completing a run
                     # whose stream is torn.
                     if bg_task is not None and bg_task.redis_write_failed:
+                        # DALTON-HOOK(subagent-spill-recovery): the abort stays,
+                        # but it stops being blind — the kill log names why the
+                        # spill failed (the circuit's recorded reason), and the
+                        # last text the run wrote is stashed so the failure the
+                        # parent receives can carry it.
+                        bg_task.last_output_text = _last_written_text(last_state)
+                        logger.error(
+                            "subagent event spill failed; aborting run",
+                            tool_call_id=tool_call_id,
+                            task_id=bg_task.task_id,
+                            reason=bg_task.redis_write_failure_reason,
+                        )
                         raise TransportLostError(
                             "transport_lost: subagent event spill failed; "
                             "aborting so the run finalizes instead of "

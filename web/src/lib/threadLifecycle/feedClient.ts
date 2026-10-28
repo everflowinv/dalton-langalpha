@@ -370,7 +370,11 @@ function attachCacheSeeding(qc: QueryClient): void {
     const rows = Array.isArray(shaped?.pages)
       ? shaped.pages.flatMap((p) => p?.threads ?? [])
       : shaped?.threads;
-    if (Array.isArray(rows) && rows.length) seedFromListRows(rows);
+    // DALTON-HOOK(colleague-dispatch): pass current user id so non-creator colleague threads suppress unseen
+    const me = qc.getQueryData<{ user_id?: string }>(queryKeys.user.me());
+    if (Array.isArray(rows) && rows.length) {
+      seedFromListRows(rows, me?.user_id ?? null);
+    }
   };
   for (const [, data] of qc.getQueriesData({ queryKey: queryKeys.threads.all })) {
     seedFromData(data);

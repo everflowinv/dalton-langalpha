@@ -50,6 +50,9 @@ tests/unit/server/handlers/chat/test_attachments_notes.py
 tests/unit/server/handlers/chat/test_unreadable_image_upload.py
 tests/unit/server/handlers/conftest.py
 tests/unit/ptc_agent/middleware/test_image_byte_fit.py
+# B5/D5: transport_lost abort records its spill reason and the failure the
+# parent sees carries the run's last written text + transcript directory.
+tests/unit/middleware/test_subagent_spill_recovery.py
 # A1: log-only registry of in-flight heavy compute, read by the loop watchdog.
 src/observability/heavy_tasks.py
 # A1: subprocess entry points for PDF text extraction (stdlib-only at import).
@@ -59,3 +62,5 @@ tests/unit/server/services/test_acquire_retry_bound.py
 tests/unit/mcp_servers/test_extract_input_cap.py
 tests/unit/ptc_agent/core/sandbox/test_import_name_package_map.py
 web/src/pages/Onboarding/__tests__/deployedTasks.dalton.test.ts
+# Batch 5/F: yfinance fundamentals missing-value output contract (null, not "N/A").
+tests/unit/mcp_servers/test_yf_fundamentals_null.py

@@ -782,6 +782,50 @@ async def claim_resume(
         ) from error
 
 
+def workflow_run_script_snapshot(thread_id: str, task_id: str) -> str:
+    """The run's own ``workflow.js`` snapshot, workspace-relative.
+
+    Every launch snapshots the exact script it runs into the run directory,
+    so this file is the byte-exact source an inline run's resume must re-pass.
+    """
+    from ptc_agent.core.paths import WorkspaceLayout
+
+    return "/".join(
+        (
+            WorkspaceLayout.thread_subdir(str(thread_id)[:8], "workflows", task_id),
+            "workflow.js",
+        )
+    )
+
+
+def workflow_resume_call(task_id: str, thread_id: str | None = None) -> str:
+    """The RunWorkflow call that resumes an interrupted run, as one phrase.
+
+    A run is resumed with the SAME source it was launched with plus
+    ``resume`` — the journal verifies the script against the run's own
+    snapshot, so a named run re-passes its name and an inline run re-passes
+    the script verbatim. An inline script has no name to pass: the first
+    recovery attempt of an interrupted inline run once read
+    ``workflow=<name>`` here, answered ``Unknown workflow`` (the name is in
+    neither the saved nor the prebuilt lists), and lost the run. With a real
+    thread id the phrase also names the snapshot the script must come from
+    (anything else — None, a mock — simply omits it).
+    """
+    snapshot_note = ""
+    if isinstance(thread_id, str) and thread_id.strip():
+        snapshot_note = (
+            " — the run's exact script is snapshotted at "
+            f"`{workflow_run_script_snapshot(thread_id, task_id)}`, re-pass it verbatim"
+        )
+    return (
+        f"RunWorkflow(workflow=<same name>, params=<same as before>, "
+        f"resume='{task_id}') if it was launched by name, or "
+        f"RunWorkflow(script=<the same script verbatim>, params=<same as "
+        f"before>, resume='{task_id}') if it was launched with an inline "
+        f"script (an inline script has no workflow name to pass){snapshot_note}"
+    )
+
+
 async def worker_lost_failure(thread_id: str, task_id: str) -> dict[str, Any]:
     """The failure payload for a recovered worker_lost task run.
 
@@ -821,12 +865,13 @@ async def worker_lost_failure(thread_id: str, task_id: str) -> dict[str, Any]:
             "error": (
                 "worker_lost: no live executor holds this task's namespace "
                 "fence. The run was interrupted and is RESUMABLE — re-launch "
-                f"it with RunWorkflow(workflow=..., resume='{task_id}') to "
-                "replay completed dispatches from its journal. When continuing "
-                "(or when the user asks to continue / '继续'), you MUST call "
-                f"RunWorkflow(workflow=<same workflow>, resume='{task_id}') "
-                "and MUST NOT manually re-dispatch Task subagents (such as "
-                "data-prep or dalton-evidence)."
+                f"it with the SAME source it was started with plus resume='{task_id}' "
+                f"({workflow_resume_call(task_id, thread_id)}) to replay "
+                "completed dispatches from its journal. When continuing (or "
+                "when the user asks to continue / '继续'), you MUST call "
+                "RunWorkflow with that same source and MUST NOT manually "
+                "re-dispatch Task subagents (such as data-prep or "
+                "dalton-evidence)."
             )
         }
     return {

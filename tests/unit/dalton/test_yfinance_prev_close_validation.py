@@ -61,10 +61,22 @@ def test_agreeing_fast_info_value_is_kept():
     assert prev == 13.57
 
 
-def test_resumption_day_previous_close_skips_frozen_rows():
-    # On the resumed session itself, the previous *valid* session is 10/12.
+def test_resumption_day_previous_close_is_unknown():
+    """On the resumed session itself the previous close is unknown, not 10/12's.
+
+    2525.HK resumed 2026-10-26 after a multi-session suspension. Yahoo filled
+    the suspended sessions with flat zero-volume bars; the last bar that
+    actually traded (10/12, 15.47) matched fast_info's previous close, so the
+    pre-B5 code adopted it and quoted a phoney −12.28% day (the real move was
+    ~+8.6% — the exchange's resumption reference was not the pre-suspension
+    close). Zero-volume fills between the last traded bar and the quote date
+    mean sessions in between were never fetched, so no bar can stand as the
+    previous session's close. This assertion changed from `== 15.47` to `is
+    None` because the old one locked the wrong behavior, not to fit new code;
+    the normal-day and next-day cases above keep their original expectations.
+    """
     prev = validated_previous_close(15.47, _frozen_hk_rows(), "2026-10-26")
-    assert prev == 15.47
+    assert prev is None
 
 
 def test_missing_fast_info_prev_uses_daily_valid_row():
@@ -159,6 +171,48 @@ def test_fetch_single_snapshot_reports_unknown_on_frozen_conflict():
         snap = _fetch_single_snapshot("2525.HK")
     assert snap is not None
     assert snap["price"] == 12.90
+    assert snap["previous_close"] is None
+    assert snap["change"] is None
+    assert snap["change_percent"] is None
+
+
+def test_fetch_single_snapshot_resumption_day_reports_unknown():
+    # The production symptom (2026-10-26): the quote prints on the resumed
+    # session at 13.57 while fast_info's previous close still says the frozen
+    # 15.47, which the last traded bar (10/12) confirms — the snapshot must
+    # not publish that pair as a −12.28% day (the real move was ~+8.6%).
+    # 1793002099 = 2026-10-26 16:08:19 HKT, the resumed session's print time.
+    ticker = _stub_ticker(
+        _frozen_hk_rows(),
+        fast_info={
+            "lastPrice": 13.57,
+            "regularMarketPreviousClose": 15.47,
+            "open": 13.40,
+            "dayHigh": 13.55,
+            "dayLow": 12.80,
+            "lastVolume": 48_924_388,
+        },
+        regular_market_time=1793002099,
+    )
+    from src.dalton import extended_hours
+    from src.data_client.yfinance import data_source as yf_ds
+
+    with (
+        patch(
+            "src.data_client.yfinance.data_source.yahoo_ticker",
+            new=create_autospec(yf_ds.yahoo_ticker, return_value=ticker),
+        ),
+        patch(
+            "src.dalton.extended_hours.enrich_yfinance_snapshot_extended_hours",
+            new=create_autospec(
+                extended_hours.enrich_yfinance_snapshot_extended_hours,
+                side_effect=lambda snap, sym, tk: snap,
+            ),
+        ),
+    ):
+        snap = _fetch_single_snapshot("2525.HK")
+    assert snap is not None
+    assert snap["price"] == 13.57
     assert snap["previous_close"] is None
     assert snap["change"] is None
     assert snap["change_percent"] is None

@@ -143,6 +143,15 @@ def validated_previous_close(  # DALTON-HOOK(yfinance-prev-close)
     change come back unknown then too. An instrument whose whole window
     carries no volume (indexes, FX) has no fill rows to skip, so the
     date-adjacent bar is its previous session.
+
+    On the resumption day itself (2525.HK 2026-10-26) that is still not
+    enough: the last bar that traded (10/12) agreed with the fast_info number
+    yet quoted the day at −12.28% against a real ~+8.6% move, because the
+    exchange's resumption reference was not the pre-suspension close. Zero-
+    volume fills between the last bar that traded and the quote's own date
+    mean sessions in between were never fetched, so no bar can stand as the
+    previous session's close — the previous close and the change come back
+    unknown then too, not wrong.
     """
     if daily_rows is None:
         return None
@@ -154,7 +163,15 @@ def validated_previous_close(  # DALTON-HOOK(yfinance-prev-close)
         # Rows exist but every one before the quote is a frozen fill: there is
         # no valid previous session to quote a change against.
         return None
-    daily_prev = candidates[-1][1]
+    last_valid = candidates[-1]
+    if any_volume and any(r[2] <= 0 for r in rows_before if r[0] > last_valid[0]):
+        # Frozen fills sit between the last bar that traded and the quote's
+        # own date: the sessions in between were never fetched, so the last
+        # traded bar's close is not the previous session's close (2525.HK
+        # resumed 2026-10-26 quoting −12.28% on this path; the real move was
+        # ~+8.6%).
+        return None
+    daily_prev = last_valid[1]
 
     if fast_info_prev is None:
         return daily_prev

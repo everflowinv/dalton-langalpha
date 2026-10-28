@@ -82,7 +82,7 @@
     "validation": {"type": "object", "additionalProperties": false,
       "properties": {
         "id": {"type": "string", "pattern": "^V-\\d{3}$"},
-        "what": {"type": "string"}, "due": {"oneOf": [{"type": "null"}, {"$ref": "common#/$defs/isoDate"}]},
+        "what": {"type": "string"}, "due": {"anyOf": [{"type": "null"}, {"$ref": "common#/$defs/isoDate"}, {"type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}(:\\d{2}(\\.\\d{1,6})?)?(Z|[+-](?:0\\d|1[0-4]):[0-5]\\d)$"}], "description": "只知道日期写 YYYY-MM-DD（按交易所当地时间 18:00、收盘后才算到期）；知道具体时刻（如财报电话会）写带时区偏移的 ISO 时刻，到期按该时刻。anyOf 而非 oneOf：纯日期同时满足 isoDate 与时刻分支的形状，oneOf 会把它整个拒掉；`format: date-time` 因未注册 rfc3339-validator 不生效，真实解析在 validate.py 的写入校验里"},
         "note": {"type": ["string", "null"]},
         "source": {"type": "string"}, "expected": {"type": "string", "description": "我们预期看到什么；和阈值对得上"},
         "linked": {"$ref": "#/$defs/linked"},

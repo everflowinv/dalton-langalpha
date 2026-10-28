@@ -411,9 +411,7 @@ async def get_workspace_sharing_endpoint(
         if caller_tier == "external":
             raise HTTPException(status_code=404, detail="Workspace not found")
         owner_tier = await classify_owner_tier(owner_id)
-        if owner_tier == "unknown" or (
-            owner_tier == "external" and caller_tier != "admin"
-        ):
+        if owner_tier == "unknown":
             raise HTTPException(status_code=404, detail="Workspace not found")
         if owner_tier == "external" and is_home:
             raise HTTPException(status_code=404, detail="Workspace not found")
@@ -435,6 +433,41 @@ async def get_workspace_sharing_endpoint(
             "updated_at": None,
         }
 
+    effective_owner_tier = owner_tier
+    if (
+        effective_owner_tier is None
+        and is_dalton_supabase_auth_enabled()
+        and owner_id
+    ):
+        effective_owner_tier = await classify_owner_tier(owner_id)
+    owner_external = effective_owner_tier == "external"
+
+    if owner_external:
+        if owner_id != uid:
+            if ws.get("status") in ("unbound", "deleted"):
+                raise HTTPException(status_code=404, detail="Workspace not found")
+            await require_team_reader(owner_id)
+            sharing = await get_workspace_sharing(str(ws["workspace_id"]))
+            if sharing.get("web_access") == "hidden":
+                raise HTTPException(status_code=404, detail="Workspace not found")
+            return {
+                **sharing,
+                "cos_access": "hidden",
+                "is_home": False,
+                "can_edit": False,
+                "owner_external": True,
+                "colleague_dispatch_enabled": is_colleague_dispatch_enabled(),
+            }
+        sharing = await get_workspace_sharing(str(ws["workspace_id"]))
+        return {
+            **sharing,
+            "cos_access": "hidden",
+            "is_home": False,
+            "can_edit": True,
+            "owner_external": True,
+            "colleague_dispatch_enabled": is_colleague_dispatch_enabled(),
+        }
+
     can_edit = can_edit_workspace_sharing(ws, uid)
     if not can_edit:
         if is_dalton_supabase_auth_enabled():
@@ -451,25 +484,12 @@ async def get_workspace_sharing_endpoint(
                 detail="Not authorized to access this workspace",
             )
 
-    # External-owned workspaces have no effective sharing settings: visible to
-    # admins (read-only) and nobody else. Surface that to the settings UI and
-    # take the edit rights away even from the owner and the PM. The owner-self
-    # path skipped the isolation block, so classify once here.
-    effective_owner_tier = owner_tier
-    if (
-        effective_owner_tier is None
-        and is_dalton_supabase_auth_enabled()
-        and owner_id
-    ):
-        effective_owner_tier = await classify_owner_tier(owner_id)
-    owner_external = effective_owner_tier == "external"
-
     sharing = await get_workspace_sharing(str(ws["workspace_id"]))
     return {
         **sharing,
         "is_home": False,
-        "can_edit": can_edit and not owner_external,
-        "owner_external": owner_external,
+        "can_edit": can_edit,
+        "owner_external": False,
         "colleague_dispatch_enabled": is_colleague_dispatch_enabled(),
     }
 
@@ -489,6 +509,7 @@ async def update_workspace_sharing_endpoint(
     from src.dalton.sharing import (
         VALID_ACCESS_LEVELS,
         can_edit_workspace_sharing,
+        get_workspace_sharing,
         require_team_reader,
         upsert_workspace_sharing,
     )
@@ -521,9 +542,7 @@ async def update_workspace_sharing_endpoint(
         if caller_tier == "external":
             raise HTTPException(status_code=404, detail="Workspace not found")
         owner_tier = await classify_owner_tier(owner_id)
-        if owner_tier == "unknown" or (
-            owner_tier == "external" and caller_tier != "admin"
-        ):
+        if owner_tier == "unknown":
             raise HTTPException(status_code=404, detail="Workspace not found")
         if owner_tier == "external" and is_home:
             raise HTTPException(status_code=404, detail="Workspace not found")
@@ -539,15 +558,6 @@ async def update_workspace_sharing_endpoint(
             detail="Home workspace cannot be shared",
         )
 
-    if not can_edit_workspace_sharing(ws, uid):
-        raise HTTPException(
-            status_code=403,
-            detail="Only workspace owner or PM may modify sharing settings",
-        )
-
-    # Sharing settings never take effect on an external-owned workspace, so
-    # refuse to modify them (for the external owner and the PM alike). The
-    # owner-self path skipped the isolation block, so classify once here.
     effective_owner_tier = owner_tier
     if (
         effective_owner_tier is None
@@ -557,10 +567,29 @@ async def update_workspace_sharing_endpoint(
         from src.dalton.access_tiers import classify_owner_tier
 
         effective_owner_tier = await classify_owner_tier(owner_id)
-    if effective_owner_tier == "external":
+    owner_external = effective_owner_tier == "external"
+    if owner_external:
+        if owner_id != uid:
+            if ws.get("status") in ("unbound", "deleted"):
+                raise HTTPException(status_code=404, detail="Workspace not found")
+            await require_team_reader(owner_id)
+            sharing = await get_workspace_sharing(str(ws["workspace_id"]))
+            if sharing.get("web_access") == "hidden":
+                raise HTTPException(status_code=404, detail="Workspace not found")
+            raise HTTPException(
+                status_code=403,
+                detail="Only workspace owner may modify sharing settings",
+            )
+        if body.cos_access is not None:
+            raise HTTPException(
+                status_code=403,
+                detail="外部成员不能开启或修改研究总监访问权限",
+            )
+
+    if not can_edit_workspace_sharing(ws, uid):
         raise HTTPException(
             status_code=403,
-            detail="外部成员的工作区仅管理员可查看，不提供共享设置",
+            detail="Only workspace owner or PM may modify sharing settings",
         )
 
     if body.cos_access is None and body.web_access is None:
@@ -589,14 +618,16 @@ async def update_workspace_sharing_endpoint(
 
     saved = await upsert_workspace_sharing(
         str(ws["workspace_id"]),
-        cos_access=cos_val,
+        cos_access="hidden" if owner_external else cos_val,
         web_access=web_val,
         updated_by=uid,
     )
     return {
         **saved,
+        **({"cos_access": "hidden"} if owner_external else {}),
         "is_home": False,
         "can_edit": True,
+        "owner_external": owner_external,
         "colleague_dispatch_enabled": is_colleague_dispatch_enabled(),
     }
 

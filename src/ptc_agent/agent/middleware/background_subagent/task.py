@@ -181,6 +181,21 @@ class BackgroundTask:
     writes, and the run ends as ``error(transport_lost)`` rather than degrading
     to the in-memory tail — a gap in the replay archive is not recoverable."""
 
+    # DALTON-HOOK(subagent-spill-recovery): diagnostics and salvage for a torn
+    # event stream, both execution context on the writer's process only — the
+    # durable copy of the second one rides the ledger failure payload the
+    # settle path writes.
+    redis_write_failure_reason: str | None = None
+    """Why the spill circuit opened (``"ExceptionType: message"``), recorded
+    where it opens and logged again at the abort — the astream loop kills the
+    run on the flag alone, so without this the kill is invisible in logs."""
+
+    last_output_text: str | None = None
+    """The last text a run wrote before being aborted for the torn stream,
+    stashed from its latest state snapshot at the abort; the transport_lost
+    failure the parent sees carries it, so finished work is not lost with the
+    replay archive."""
+
     stream_quota: StreamQuota | None = field(default=None, repr=False)
     """This task's stream budget, made at its first spill. Unlike
     ``captured_event_bytes`` it follows the stream, not the round, like the

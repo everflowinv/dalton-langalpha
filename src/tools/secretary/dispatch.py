@@ -321,6 +321,7 @@ async def dispatch(
         if is_continuation:
             handed_to["thread_id"] = thread_id
 
+    precreated_colleague_thread = False
     if not is_continuation:
         thread_id = str(uuid.uuid4())
         # DALTON-HOOK(colleague-dispatch): pre-create colleague thread with creator user_id and dispatched_by(channel="cos").
@@ -345,6 +346,53 @@ async def dispatch(
                 metadata=origin_meta,
                 user_id=user_id,
             )
+            precreated_colleague_thread = True
+
+    # DALTON-HOOK(colleague-dispatch): clean up pre-created colleague thread and surface endpoint error detail when dispatch fails before scheduling a run.
+    async def _cleanup_precreated_thread() -> None:
+        if not precreated_colleague_thread:
+            return
+        from src.server.database.conversation import (
+            delete_thread,
+            update_thread_status,
+        )
+
+        try:
+            await delete_thread(thread_id)
+        except Exception as cleanup_exc:
+            logger.warning(
+                "Failed to delete pre-created colleague thread %s after dispatch failure (%s); marking failed",
+                thread_id,
+                cleanup_exc,
+            )
+            try:
+                await update_thread_status(thread_id, "failed")
+            except Exception:
+                pass
+
+    async def _extract_dispatch_error(resp) -> str:
+        try:
+            err_body = await resp.json()
+        except Exception:
+            return "dispatch_failed"
+        if not isinstance(err_body, dict):
+            return "dispatch_failed"
+        detail = err_body.get("detail")
+        if isinstance(detail, dict):
+            err_code = detail.get("type") or detail.get("code")
+            err_msg = detail.get("message") or detail.get("detail")
+            if err_code and err_msg:
+                return f"{err_code}: {err_msg}"
+            if err_msg:
+                return str(err_msg)
+            if err_code:
+                return str(err_code)
+        elif isinstance(detail, str) and detail.strip():
+            return detail.strip()
+        err_str = err_body.get("error")
+        if isinstance(err_str, str) and err_str.strip():
+            return err_str.strip()
+        return "dispatch_failed"
 
     # reserve() takes a cap slot + records the PTC origin, rolling back on any
     # non-committed exit; a no-op when dispatcher_thread_id is None (report_back off).
@@ -410,6 +458,8 @@ async def dispatch(
 
         # Cap rejection or a fail-closed origin write — abort (reserve rolls back).
         if slot.error is not None:
+            # DALTON-HOOK(colleague-dispatch): remove pre-created colleague thread on cap/reserve failure
+            await _cleanup_precreated_thread()
             return error_command(slot.error, tool_call_id, **handed_to)
         # ``rejected``: a definitive non-scheduling proof was observed — a
         # cancellation landing while the response and session close must then
@@ -460,6 +510,8 @@ async def dispatch(
                         # scheduling the run (every raise path precedes its
                         # create_task).
                         rejected = True
+                        # DALTON-HOOK(colleague-dispatch): remove pre-created colleague thread on >=400 rejection
+                        await _cleanup_precreated_thread()
                         if resp.status == 409:
                             # A running turn takes the hand-off as a steer, so
                             # a 409 means one it cannot ride: stopping,
@@ -469,8 +521,10 @@ async def dispatch(
                             return error_command(
                                 _THREAD_BUSY, tool_call_id, **handed_to
                             )
+                        # DALTON-HOOK(colleague-dispatch): propagate error detail (e.g. oauth_required) to Chief of Staff
+                        err_detail = await _extract_dispatch_error(resp)
                         return error_command(
-                            "dispatch_failed", tool_call_id, **handed_to
+                            err_detail, tool_call_id, **handed_to
                         )
                     if resp.status != 200:
                         # Not the endpoint's reply (it answers exactly 200;
@@ -518,6 +572,8 @@ async def dispatch(
             # The request provably never reached the endpoint, so rolling the
             # reservation back is safe.
             logger.error(f"PTC dispatch connection failed: {e}")
+            # DALTON-HOOK(colleague-dispatch): remove pre-created colleague thread on connection failure
+            await _cleanup_precreated_thread()
             return error_command("dispatch_failed", tool_call_id, **handed_to)
         except (aiohttp.ClientError, ValueError) as e:
             logger.error(f"PTC dispatch HTTP error: {e}")

@@ -7,6 +7,7 @@ import logging
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
+from src.dalton.autonomy.due import validation_is_due, workspace_market_timezone
 from src.dalton.autonomy.probes import ProbeSignal
 from src.dalton.settings import get_dalton_settings
 
@@ -34,14 +35,18 @@ def _count_agenda_actionable(
     *,
     now_dt: datetime,
     now_date: date,
+    doc_markets: Optional[list[tuple[str, ZoneInfo]]] = None,
 ) -> dict[str, int]:
     due_validations = 0
     actionable_questions = 0
     unconfirmed_earnings_14d = 0
 
-    for doc in agenda_docs:
+    for idx, doc in enumerate(agenda_docs):
         if not isinstance(doc, dict):
             continue
+        ticker, market_tz = (
+            doc_markets[idx] if doc_markets and idx < len(doc_markets) else ("", None)
+        )
         for v in (doc.get("next_validations") or []) + (doc.get("validation_queue") or []):
             if not isinstance(v, dict):
                 continue
@@ -50,11 +55,10 @@ def _count_agenda_actionable(
             raw_due = v.get("due") or v.get("target_date") or v.get("due_date")
             if not raw_due:
                 continue
-            try:
-                if date.fromisoformat(str(raw_due)[:10]) <= now_date:
-                    due_validations += 1
-            except ValueError:
-                continue
+            # 与议程探针、看板同一到期口径：保留原始时刻/时区，缺时区按标的
+            # 交易所时区（与看板同源的 company.ticker/exchange 解析）。
+            if validation_is_due(raw_due, ticker, now_dt, tz=market_tz):
+                due_validations += 1
 
         for q in doc.get("open_questions") or []:
             if not isinstance(q, dict):
@@ -185,31 +189,60 @@ async def _check_db_actionable_work(
                 if user_id is not None:
                     await cur.execute(
                         """
-                        SELECT DISTINCT ON (workspace_id) content
-                        FROM dalton_knowledge_versions
-                        WHERE doc_key = 'agenda' AND schema_valid = TRUE
-                          AND workspace_id IN (
-                              SELECT workspace_id FROM workspaces
-                              WHERE user_id = %s AND status <> 'deleted'
-                          )
-                        ORDER BY workspace_id, version_no DESC
+                        SELECT DISTINCT ON (dkv.workspace_id, dkv.doc_key)
+                               dkv.workspace_id, dkv.doc_key, dkv.content, ws.name AS ws_name
+                        FROM dalton_knowledge_versions dkv
+                        JOIN (
+                            SELECT workspace_id, name FROM workspaces
+                            WHERE user_id = %s AND status <> 'deleted'
+                        ) ws ON ws.workspace_id = dkv.workspace_id
+                        WHERE dkv.doc_key IN ('agenda', 'company', 'thesis')
+                          AND dkv.schema_valid = TRUE
+                        ORDER BY dkv.workspace_id, dkv.doc_key, dkv.version_no DESC
                         """,
                         (user_id,),
                     )
                 else:
                     await cur.execute(
                         """
-                        SELECT DISTINCT ON (workspace_id) content
-                        FROM dalton_knowledge_versions
-                        WHERE doc_key = 'agenda' AND schema_valid = TRUE
-                        ORDER BY workspace_id, version_no DESC
+                        SELECT DISTINCT ON (dkv.workspace_id, dkv.doc_key)
+                               dkv.workspace_id, dkv.doc_key, dkv.content, ws.name AS ws_name
+                        FROM dalton_knowledge_versions dkv
+                        JOIN (
+                            SELECT workspace_id, name FROM workspaces
+                            WHERE status <> 'deleted'
+                        ) ws ON ws.workspace_id = dkv.workspace_id
+                        WHERE dkv.doc_key IN ('agenda', 'company', 'thesis')
+                          AND dkv.schema_valid = TRUE
+                        ORDER BY dkv.workspace_id, dkv.doc_key, dkv.version_no DESC
                         """
                     )
                 agenda_rows = await cur.fetchall()
-                agenda_docs = [
-                    r["content"] for r in (agenda_rows or []) if isinstance(r.get("content"), dict)
-                ]
-                ag_counts = _count_agenda_actionable(agenda_docs, now_dt=now_dt, now_date=now_date)
+                # 按工作区分组：agenda 文档 + 同工作区的 company/thesis 内容一起
+                # 喂给共享解析，标的与交易所时区和看板同源（工作区名常是中文
+                # 公司名，直接拿它推断会把港股 / A 股当美股）。
+                ws_docs: dict[str, dict[str, Any]] = {}
+                for r in agenda_rows or []:
+                    ws_id = str(r.get("workspace_id") or "")
+                    entry = ws_docs.setdefault(
+                        ws_id, {"ws_name": str(r.get("ws_name") or ""), "agenda": None, "company": {}, "thesis": {}}
+                    )
+                    content = r.get("content") if isinstance(r.get("content"), dict) else {}
+                    doc_key = str(r.get("doc_key") or "")
+                    if doc_key in ("agenda", "company", "thesis"):
+                        entry[doc_key] = content
+                agenda_docs = []
+                doc_markets: list[tuple[str, ZoneInfo]] = []
+                for ws_id, entry in ws_docs.items():
+                    if not isinstance(entry["agenda"], dict):
+                        continue
+                    agenda_docs.append(entry["agenda"])
+                    doc_markets.append(
+                        workspace_market_timezone(entry["company"], entry["thesis"], entry["ws_name"])
+                    )
+                ag_counts = _count_agenda_actionable(
+                    agenda_docs, now_dt=now_dt, now_date=now_date, doc_markets=doc_markets
+                )
                 counts["due_validations"] = ag_counts["due_validations"]
                 counts["actionable_questions"] = ag_counts["actionable_questions"]
                 counts["unconfirmed_earnings_14d"] = ag_counts["unconfirmed_earnings_14d"]

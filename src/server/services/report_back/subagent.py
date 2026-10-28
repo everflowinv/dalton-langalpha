@@ -227,13 +227,18 @@ def task_report_message(
     *,
     steered: bool = False,
     failure_error: str | None = None,
+    thread_id: str | None = None,
 ) -> str:
     """The report's content, as its own turn or as a steer into a live one.
 
     Only the event. Reading the result is the Task description's to say and
     never passing a failure off as finished work the system prompt's, so the
     report does not restate either. It need not say the result is unseen
-    either: once TaskOutput serves a result, its report is dropped."""
+    either: once TaskOutput serves a result, its report is dropped.
+
+    ``thread_id`` names the thread the notification's resume hint points back
+    into (the run's script snapshot lives under it); it may be None on older
+    callers, and the hint then simply omits the snapshot path."""
     # Posted, it names no time: a report is posted whenever no live turn took
     # it in, which includes a task that settled after the turn's last model
     # call, so "after your previous turn ended" can be false.
@@ -246,16 +251,21 @@ def task_report_message(
     resume_hint = ""
     lost_worker = is_resumable_failure(failure_error)
     if report.failed and subagent_type == "workflow" and lost_worker:
+        # DALTON-HOOK(workflow-resume): the resume must re-pass the SAME
+        # source the run was launched with. An inline script has no workflow
+        # name — `workflow=<name>` answers Unknown workflow — so the hint
+        # names both forms and the run's own script snapshot.
+        from src.dalton.workflows.journal import workflow_resume_call
+
         resume_hint = (
             f"\nTask id: {report.task_id}. This workflow run was interrupted "
-            "by a lost worker and can be resumed: "
-            "RunWorkflow(workflow=<name>, params=<same as before>, "
-            f"resume='{report.task_id}') replays completed dispatches from "
-            "its journal. When continuing (or when the user asks to continue "
-            f"/ '继续'), you MUST call RunWorkflow(workflow=<same name>, "
-            f"params=<same as before>, resume='{report.task_id}') — do NOT "
-            "manually re-dispatch Task subagents (such as data-prep or "
-            "dalton-evidence)."
+            "by a lost worker and can be resumed by re-launching it with the "
+            f"SAME source it was started with plus resume='{report.task_id}': "
+            f"{workflow_resume_call(report.task_id, thread_id)} replays "
+            "completed dispatches from its journal. When continuing (or when "
+            "the user asks to continue / '继续'), you MUST make that resume "
+            f"call — do NOT manually re-dispatch Task subagents (such as "
+            "data-prep or dalton-evidence)."
         )
     # DALTON-HOOK(i18n): Prevent language drift after English subagent completion notices
     return (
@@ -270,7 +280,7 @@ def task_report_message(
 
 @dataclass(frozen=True)
 class OwedTaskReport:
-    """A task report still owed: what the reader is shown, the subagent type
+    """The report still owed: what the reader is shown, the subagent type
     the model is told about, the run's failure text, and the thread's owner
     and workspace a turn of its own posts as."""
 
@@ -284,6 +294,10 @@ class OwedTaskReport:
     workspace_id: Optional[str] = None
     #: Whether the payload names its task: a label would name nothing.
     labelled: bool = True
+    # DALTON-HOOK(workflow-resume): the thread the resume hint points back
+    # into (the interrupted run's script snapshot lives under it); read off
+    # the job, so nothing volatile rides the payload.
+    thread_id: Optional[str] = None
 
     @property
     def report_source(self) -> Optional[dict]:
@@ -298,6 +312,7 @@ class OwedTaskReport:
             self.subagent_type,
             steered=steered,
             failure_error=self.failure_error,
+            thread_id=self.thread_id,
         )
 
 
@@ -328,6 +343,7 @@ async def task_report_verdict(job: dict) -> OwedTaskReport | NotOwed:
     # the message can tell a resumable worker_lost workflow apart from an
     # ordinary failure.
     user_id, workspace_id = payload.get("user_id"), payload.get("workspace_id")
+    thread_id = job.get("conversation_thread_id") or payload.get("thread_id")
     return OwedTaskReport(
         task_report(payload),
         payload.get("subagent_type"),
@@ -335,6 +351,7 @@ async def task_report_verdict(job: dict) -> OwedTaskReport | NotOwed:
         user_id=str(user_id) if user_id else None,
         workspace_id=str(workspace_id) if workspace_id else None,
         labelled=bool(payload.get("task_id")),
+        thread_id=str(thread_id) if thread_id else None,
     )
 
 

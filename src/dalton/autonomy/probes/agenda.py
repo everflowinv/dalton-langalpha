@@ -7,6 +7,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
+from src.dalton.autonomy.due import validation_is_due
 from src.dalton.autonomy.probes import ProbeSignal
 from src.dalton.settings import get_dalton_settings
 
@@ -51,6 +52,8 @@ async def probe_agenda(
     """Inspect the company's ``agenda`` document for due watch.events, next_validations, open_questions, and wake_conditions."""
     tz = ZoneInfo(get_dalton_settings().autonomy.timezone)
     now_dt = now or datetime.now(tz)
+    if now_dt.tzinfo is None:
+        now_dt = now_dt.replace(tzinfo=tz)
     now_date = today or now_dt.date()
     doc = agenda_doc
     if doc is None and workspace_id:
@@ -98,7 +101,10 @@ async def probe_agenda(
                 )
             )
 
-    # 2. Next validations due <= today (schema field `next_validations`, plus legacy `validation_queue` fallback)
+    # 2. Next validations past their due moment (schema field `next_validations`, plus legacy
+    #    `validation_queue` fallback). Due-ness keeps the item's own moment and timezone — naive
+    #    values read in the ticker's exchange timezone — instead of the local (Shanghai) date:
+    #    a US item dated for an after-hours call must not fall due while its ET day is young.
     validations = list(doc.get("next_validations") or []) + list(doc.get("validation_queue") or [])
     seen_val_ids: set[str] = set()
     for val_item in validations:
@@ -106,8 +112,9 @@ async def probe_agenda(
             continue
         if val_item.get("status") not in (None, "pending", "watching", "open"):
             continue
-        due = _parse_date(val_item.get("due") or val_item.get("due_date") or val_item.get("target_date"))
-        if due and due <= now_date:
+        raw_due = val_item.get("due") or val_item.get("due_date") or val_item.get("target_date")
+        due = _parse_date(raw_due)
+        if validation_is_due(raw_due, ticker, now_dt):
             vid = str(val_item.get("id") or "V")
             if vid in seen_val_ids:
                 continue

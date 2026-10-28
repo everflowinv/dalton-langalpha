@@ -445,12 +445,17 @@ async def _handle_resume(
     # the row, not the spawn.
     # DALTON-HOOK(workflow-resume): workflow runs resume via RunWorkflow(..., resume=...), not Task(action="resume").
     if task.subagent_type == WORKFLOW_SUBAGENT_TYPE:
+        # Same-source resume: an inline script re-passes the script verbatim
+        # (its snapshot path named), a named workflow re-passes the name —
+        # an inline run answering `workflow=<name>` gets Unknown workflow.
+        from src.dalton.workflows.journal import workflow_resume_call
+
         return ToolMessage(
             content=(
                 f"Error: Task-{target_task_id} is a workflow run and cannot be "
                 f"resumed via Task(action='resume'). Use "
                 f'TaskOutput(task_id="{target_task_id}") for its result, or '
-                f'RunWorkflow(workflow=<same workflow>, resume="{target_task_id}", params=...) '
+                f"{workflow_resume_call(target_task_id, parent_thread_id)} "
                 f"to resume an interrupted workflow from its journal (do NOT manually "
                 f"re-dispatch individual Task subagents)."
             ),

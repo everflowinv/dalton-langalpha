@@ -29,7 +29,11 @@
   - 已有目录或已在 `config.json` 配置别名的公司可直接传入（美股直接用大写 ticker，如 `"NVDA"`、`"META"`）。
   - 新建公司目录必须匹配 `^[A-Z][A-Z0-9-]{0,29}$`（如 `"UNITREE"`）。
   - `temp*` 前缀保留禁用；**纯数字 ticker（如 `"00700"`、`"600519"`）直接拒绝**。
-  - **A 股 / 港股 / 中文新名称不自动加别名**：若 bridge 返回 `status: "needs_alias"`，告知用户联系管理员在 OpenClaw `company-wiki/config.json` 的 `aliases` 中添加映射后再入库。
+  - **A 股 / 港股 / 中文新名称不自动加别名**：bridge 返回 `status: "needs_alias"` 时，不要直接放弃：
+    1. 在返回的 `existing_targets`（已有的英文目录名）里找这家公司，例如东方雨虹（002271.SZ）→ `YUHONG`。确认是同一家公司后，用该目录名作为 `target` 重新入库。
+    2. 确实没有时，用大写英文名新建目录（匹配 `^[A-Z][A-Z0-9-]{0,29}$`，如 `ORIENTAL-YUHONG`）。
+    3. 重新入库时把原来用的中文名、股票代码放进 `aliases`（如 `["002271.SZ", "东方雨虹"]`）。写入成功后这些名称就登记为该目录的别名，以后直接用它们入库即可，不需要管理员。已指向别的公司的名称会被拒绝（`alias_conflict`），此时不要换个写法硬登记，告诉用户冲突的对象。
+    4. 拿不准是不是同一家公司时先问用户；回执里写明用了哪个目录名、登记了哪些别名（`aliases_added`）。
 - **行业（`sector`）**：
   - 已有或预定义行业（`us-semiconductor`、`china-consumer`、`china-internet`、`us-software`、`us-financials`、`us-megtech`、`macro`）或匹配 `^[a-z][a-z0-9-]{0,39}$` 的小写连字符标识（如 `"china-robotics"`）。
 

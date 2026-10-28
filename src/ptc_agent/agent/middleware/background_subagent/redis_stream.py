@@ -46,6 +46,41 @@ def run_stream_key(thread_id: str, task_run_id: str) -> str:
     return f"subagent:stream:{thread_id}:{task_run_id}"
 
 
+# DALTON-HOOK(subagent-spill-recovery): one place opens the spill circuit, so
+# every opening records why (exception type and message) on the task and in
+# the log — the astream loop kills the run on the flag alone, and a kill with
+# no reason is undebuggable (a 90-step run once died as bare transport_lost).
+def _open_spill_circuit(
+    task: "BackgroundTask",
+    *,
+    phase: str,
+    exc: BaseException | None = None,
+    reason: str | None = None,
+    **fields: Any,
+) -> None:
+    """Flip ``redis_write_failed`` and record why it flipped.
+
+    ``reason`` wins over ``exc`` for failures that are not an exception (a
+    quota breach, a timeout already accounted for by its own field).
+    """
+    detail = (
+        reason
+        if reason is not None
+        else (f"{type(exc).__name__}: {exc}" if exc is not None else "unknown")
+    )
+    task.redis_write_failed = True
+    task.redis_write_failure_reason = detail
+    logger.warning(
+        "subagent_event_spill_failed",
+        phase=phase,
+        tool_call_id=task.tool_call_id,
+        task_id=task.task_id,
+        error_type=type(exc).__name__ if exc is not None else None,
+        error=detail,
+        **fields,
+    )
+
+
 def legacy_task_events_key(thread_id: str, task_id: str) -> str:
     return f"subagent:events:{thread_id}:{task_id}"
 
@@ -269,14 +304,7 @@ async def spill_task_records(
 
         cache = get_cache_client()
     except Exception as exc:
-        task.redis_write_failed = True
-        logger.warning(
-            "subagent_event_spill_failed",
-            phase="cache_init",
-            tool_call_id=task.tool_call_id,
-            task_id=task.task_id,
-            error=str(exc),
-        )
+        _open_spill_circuit(task, phase="cache_init", exc=exc)  # DALTON-HOOK(subagent-spill-recovery)
         return
 
     if not getattr(cache, "enabled", False):
@@ -290,14 +318,7 @@ async def spill_task_records(
                 max_bytes=get_max_stream_bytes_per_run(),
             )
         except Exception as exc:
-            task.redis_write_failed = True
-            logger.warning(
-                "subagent_event_spill_failed",
-                phase="quota_settings",
-                tool_call_id=task.tool_call_id,
-                task_id=task.task_id,
-                error=str(exc),
-            )
+            _open_spill_circuit(task, phase="quota_settings", exc=exc)  # DALTON-HOOK(subagent-spill-recovery)
             return
 
     # Serialize spills per task. The registry-wide lock is released
@@ -345,15 +366,7 @@ async def _spill_one_locked(
     try:
         payload = json.dumps(record, ensure_ascii=False, default=str)
     except Exception as exc:
-        task.redis_write_failed = True
-        logger.warning(
-            "subagent_event_spill_failed",
-            phase="serialize",
-            tool_call_id=task.tool_call_id,
-            task_id=task.task_id,
-            seq=record.get("seq"),
-            error=str(exc),
-        )
+        _open_spill_circuit(task, phase="serialize", exc=exc, seq=record.get("seq"))  # DALTON-HOOK(subagent-spill-recovery)
         return
 
     # Pre-render the SSE wire format for the Stream so the live consumer
@@ -373,15 +386,7 @@ async def _spill_one_locked(
             f"data: {json.dumps(data, ensure_ascii=False, default=str)}\n\n"
         )
     except Exception as exc:
-        task.redis_write_failed = True
-        logger.warning(
-            "subagent_event_spill_failed",
-            phase="render_sse",
-            tool_call_id=task.tool_call_id,
-            task_id=task.task_id,
-            seq=record.get("seq"),
-            error=str(exc),
-        )
+        _open_spill_circuit(task, phase="render_sse", exc=exc, seq=record.get("seq"))  # DALTON-HOOK(subagent-spill-recovery)
         return
 
     # A record lands up to three times (the v1 wire frame and record, and the
@@ -399,12 +404,11 @@ async def _spill_one_locked(
         # here (instead of trimming FIFO) makes the abort loop + terminal
         # escalation finalize error(transport_lost), so a replay with a
         # silent hole is never served.
-        task.redis_write_failed = True
-        logger.warning(
-            "subagent_event_spill_failed",
+        _open_spill_circuit(  # DALTON-HOOK(subagent-spill-recovery)
+            task,
             phase="quota" if breach == "events" else "byte_quota",
-            tool_call_id=task.tool_call_id,
-            task_id=task.task_id,
+            reason=f"StreamQuota breach ({breach}): stream {stream_key} would pass "
+            f"{quota.max_events} events / {quota.max_bytes} bytes",
             seq=record.get("seq"),
             max_events=quota.max_events,
             stream_bytes=quota.bytes,
@@ -498,12 +502,14 @@ async def _spill_one_locked(
                             timeout_seconds=_SPILL_TIMEOUT_SECONDS,
                         )
                         continue
-                    task.redis_write_failed = True
-                    logger.warning(
-                        "subagent_event_spill_failed",
+                    _open_spill_circuit(  # DALTON-HOOK(subagent-spill-recovery)
+                        task,
                         phase="v2_pipeline",
-                        tool_call_id=task.tool_call_id,
-                        task_id=task.task_id,
+                        reason=(
+                            f"asyncio.TimeoutError: v2 xadd to {v2_key} did not "
+                            f"answer in {_SPILL_TIMEOUT_SECONDS}s (and the tail "
+                            f"seq check could not confirm it landed)"
+                        ),
                         task_run_id=task.task_run_id,
                         seq=record.get("seq"),
                     )
@@ -542,48 +548,39 @@ async def _spill_one_locked(
                                 error=str(exc),
                             )
                             continue
-                    task.redis_write_failed = True
-                    logger.warning(
-                        "subagent_event_spill_failed",
+                    _open_spill_circuit(  # DALTON-HOOK(subagent-spill-recovery)
+                        task,
                         phase="v2_pipeline",
-                        tool_call_id=task.tool_call_id,
-                        task_id=task.task_id,
+                        exc=exc,
                         task_run_id=task.task_run_id,
                         seq=record.get("seq"),
-                        error=str(exc),
                     )
                     break
         if not success:
-            task.redis_write_failed = True
-            logger.warning(
-                "subagent_event_spill_failed",
+            _open_spill_circuit(  # DALTON-HOOK(subagent-spill-recovery)
+                task,
                 phase="pipeline",
-                tool_call_id=task.tool_call_id,
-                task_id=task.task_id,
+                reason=(
+                    f"{type(append_exc).__name__}: {append_error}"
+                    if append_error is not None
+                    else "pipeline append failed"
+                ),
                 seq=record.get("seq"),
-                error=append_error,
             )
             return
     except asyncio.TimeoutError:
-        task.redis_write_failed = True
-        logger.warning(
-            "subagent_event_spill_failed",
+        _open_spill_circuit(  # DALTON-HOOK(subagent-spill-recovery)
+            task,
             phase="timeout",
-            tool_call_id=task.tool_call_id,
-            task_id=task.task_id,
+            reason=(
+                f"asyncio.TimeoutError: spill did not answer in "
+                f"{_SPILL_TIMEOUT_SECONDS}s"
+            ),
             seq=record.get("seq"),
             timeout_seconds=_SPILL_TIMEOUT_SECONDS,
         )
     except Exception as exc:
-        task.redis_write_failed = True
-        logger.warning(
-            "subagent_event_spill_failed",
-            phase="exception",
-            tool_call_id=task.tool_call_id,
-            task_id=task.task_id,
-            seq=record.get("seq"),
-            error=str(exc),
-        )
+        _open_spill_circuit(task, phase="exception", exc=exc, seq=record.get("seq"))  # DALTON-HOOK(subagent-spill-recovery)
 
 
 async def write_task_meta(thread_id: str, task: "BackgroundTask", status: str) -> None:

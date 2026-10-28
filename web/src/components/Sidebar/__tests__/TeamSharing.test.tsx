@@ -273,7 +273,13 @@ import HtmlViewer from '@/pages/ChatAgent/components/viewers/HtmlViewer';
 import ChatView from '@/pages/ChatAgent/components/ChatView';
 import ThreadCard from '@/pages/ChatAgent/components/ThreadCard';
 import { useActiveThreadPublisher } from '@/lib/threadLifecycle/useActiveThreadPublisher';
-import { applySnapshot, resetThreadLifecycle } from '@/lib/threadLifecycle/store';
+import {
+  applyFeedEvent,
+  applySnapshot,
+  resetThreadLifecycle,
+  seedFromListRows,
+  useThreadFlags,
+} from '@/lib/threadLifecycle/store';
 
 const STABLE_WORKSPACE_FILES = vi.hoisted(() => ({
   files: ['results/nvda_memo.md', 'data/revenue.csv'],
@@ -1328,7 +1334,7 @@ describe('Dalton Team Sharing', () => {
     expect(screen.queryByTestId('team-workspaces-section')).toBeNull();
   });
 
-  it('shows the admin-only notice instead of options for external-owned workspaces', async () => {
+  it('allows external owners to edit web_access while hiding cos sharing options', async () => {
     const { default: i18n } = await import('@/i18n');
     await i18n.changeLanguage('zh-CN');
     onTestFinished(async () => {
@@ -1337,13 +1343,27 @@ describe('Dalton Team Sharing', () => {
     const queryClient = createTestQueryClient();
     queryClient.setQueryData(queryKeys.dalton.sharing('ws-ext-1'), {
       workspace_id: 'ws-ext-1',
-      cos_access: 'ro',
-      web_access: 'ro',
+      cos_access: 'hidden',
+      web_access: 'hidden',
       is_home: false,
-      can_edit: false,
+      can_edit: true,
       owner_external: true,
+      colleague_dispatch_enabled: true,
       updated_by: 'u-ext',
       updated_at: '2026-10-26T12:00:00Z',
+    });
+    mockApiPut.mockResolvedValueOnce({
+      data: {
+        workspace_id: 'ws-ext-1',
+        cos_access: 'hidden',
+        web_access: 'ro',
+        is_home: false,
+        can_edit: true,
+        owner_external: true,
+        colleague_dispatch_enabled: true,
+        updated_by: 'u-ext',
+        updated_at: '2026-10-26T12:05:00Z',
+      },
     });
 
     renderWithProviders(<WorkspaceSharingModal workspaceId="ws-ext-1" />, {
@@ -1352,12 +1372,182 @@ describe('Dalton Team Sharing', () => {
 
     fireEvent.click(screen.getByTestId('workspace-sharing-button'));
 
-    expect(screen.getByTestId('sharing-external-owner-note')).toHaveTextContent(
-      '外部成员的工作区仅管理员可查看',
-    );
     expect(screen.queryByTestId('sharing-cos-fieldset')).toBeNull();
-    expect(screen.queryByTestId('sharing-web-fieldset')).toBeNull();
-    expect(screen.queryByTestId('sharing-save-btn')).toBeNull();
+    expect(screen.queryByTestId('sharing-cos-settings-hint')).toBeNull();
+    expect(screen.getByTestId('sharing-web-fieldset')).toBeInTheDocument();
+
+    const webRo = screen.getByTestId('sharing-web-ro') as HTMLInputElement;
+    fireEvent.click(webRo);
+    expect(webRo.checked).toBe(true);
+
+    fireEvent.click(screen.getByTestId('sharing-save-btn'));
+    await waitFor(() => {
+      expect(mockApiPut).toHaveBeenCalledWith(
+        '/api/v1/dalton/workspaces/ws-ext-1/sharing',
+        { web_access: 'ro' },
+      );
+    });
+  });
+
+  it('shows read-only composer when workspace owner views colleague thread from workspace thread list cache even before useUser resolves', async () => {
+    const { default: i18n } = await import('@/i18n');
+    await i18n.changeLanguage('zh-CN');
+    onTestFinished(async () => {
+      await i18n.changeLanguage('en-US');
+    });
+
+    // Keep user.me() unset to simulate initial render before /users/me resolves
+    mockApiGet.mockReturnValue(new Promise(() => {}));
+    const queryClient = createTestQueryClient();
+    queryClient.setQueryData(workspaceDetailQuery('ws-richard-1').queryKey, {
+      workspace_id: 'ws-richard-1',
+      user_id: 'u-richard',
+      name: 'NVDA Deep Dive',
+      status: 'running',
+      is_home: false,
+      effective_web_access: 'owner',
+    });
+    // Thread record only in workspace thread list cache (detail query not yet resolved)
+    queryClient.setQueryData(queryKeys.threads.page('ws-richard-1', 20), {
+      threads: [
+        {
+          thread_id: 'th-1',
+          workspace_id: 'ws-richard-1',
+          title: 'Colleague Question in My Workspace',
+          thread_user_id: 'u-chao',
+          workspace_owner_id: 'u-richard',
+          metadata: {
+            dispatched_by: {
+              user_id: 'u-chao',
+              name: 'Chao Yu',
+              channel: 'web',
+            },
+          },
+        },
+      ],
+      total: 1,
+    });
+
+    renderWithProviders(
+      <ChatView
+        workspaceId="ws-richard-1"
+        threadId="th-1"
+        onBack={vi.fn()}
+        workspaceName="NVDA Deep Dive"
+      />,
+      { queryClient },
+    );
+
+    const readonlyInput = screen.getByLabelText('只读模式输入框') as HTMLInputElement;
+    expect(readonlyInput.disabled).toBe(true);
+    expect(readonlyInput.placeholder).toContain('由 Chao Yu 派发 · 仅创建者可继续提问');
+  });
+
+  it('does not mark colleague thread as unseen in seedFromListRows when server returns unseen=false / is_read=true', () => {
+    resetThreadLifecycle();
+    seedFromListRows(
+      [
+        {
+          thread_id: 'th-colleague-completed',
+          workspace_id: 'ws-richard-1',
+          title: 'Colleague Thread',
+          thread_user_id: 'u-chao',
+          workspace_owner_id: 'u-richard',
+          run_status: 'completed',
+          latest_run_id: 'run-colleague-1',
+          latest_run_seq: 3,
+          last_seen_run_seq: 3,
+          unseen: false,
+          is_read: true,
+        },
+        {
+          thread_id: 'th-own-unseen',
+          workspace_id: 'ws-richard-1',
+          title: 'Own Unseen Thread',
+          thread_user_id: 'u-richard',
+          workspace_owner_id: 'u-richard',
+          run_status: 'completed',
+          latest_run_id: 'run-own-1',
+          latest_run_seq: 2,
+          last_seen_run_seq: 0,
+          unseen: true,
+          is_read: false,
+        },
+      ],
+      'u-richard',
+    );
+
+    const { result: colleagueFlags } = renderHookWithProviders(() =>
+      useThreadFlags('th-colleague-completed'),
+    );
+    expect(colleagueFlags.current.isUnseen).toBe(false);
+
+    const { result: ownFlags } = renderHookWithProviders(() =>
+      useThreadFlags('th-own-unseen'),
+    );
+    expect(ownFlags.current.isUnseen).toBe(true);
+  });
+
+  it('shows unseen orange dot when own running thread completes after list refresh, but not for colleague thread', () => {
+    resetThreadLifecycle();
+    seedFromListRows(
+      [
+        {
+          thread_id: 'th-own-running',
+          workspace_id: 'ws-richard-1',
+          title: 'Own Running Thread',
+          thread_user_id: 'u-richard',
+          workspace_owner_id: 'u-richard',
+          run_status: 'running',
+          latest_run_id: 'run-own-live',
+          latest_run_seq: 4,
+          last_seen_run_seq: 0,
+          unseen: false,
+          is_read: true,
+        },
+        {
+          thread_id: 'th-colleague-running',
+          workspace_id: 'ws-richard-1',
+          title: 'Colleague Running Thread',
+          thread_user_id: 'u-chao',
+          workspace_owner_id: 'u-richard',
+          run_status: 'running',
+          latest_run_id: 'run-colleague-live',
+          latest_run_seq: 4,
+          last_seen_run_seq: 0,
+          unseen: false,
+          is_read: true,
+        },
+      ],
+      'u-richard',
+    );
+
+    act(() => {
+      applyFeedEvent({
+        type: 'run_settled',
+        thread_id: 'th-own-running',
+        run_id: 'run-own-live',
+        run_seq: 4,
+        status: 'completed',
+      });
+      applyFeedEvent({
+        type: 'run_settled',
+        thread_id: 'th-colleague-running',
+        run_id: 'run-colleague-live',
+        run_seq: 4,
+        status: 'completed',
+      });
+    });
+
+    const { result: ownFlags } = renderHookWithProviders(() =>
+      useThreadFlags('th-own-running'),
+    );
+    expect(ownFlags.current.isUnseen).toBe(true);
+
+    const { result: colleagueFlags } = renderHookWithProviders(() =>
+      useThreadFlags('th-colleague-running'),
+    );
+    expect(colleagueFlags.current.isUnseen).toBe(false);
   });
 
   it('disables chat composer on web_access=rw colleague workspace when colleague_dispatch_enabled is false, and enables it when true', () => {

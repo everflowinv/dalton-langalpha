@@ -267,6 +267,9 @@ async def get_threads_for_user(
     sort_by: str = "updated_at",
     sort_order: str = "desc",
     platform_prefix: Optional[str] = None,
+    # DALTON-HOOK(colleague-dispatch): accept channel for Chief of Staff foreign-workspace filtering.
+    *,
+    channel: str = "web",
 ) -> Tuple[List[Dict[str, Any]], int]:
     """Get all threads for a user across all workspaces.
 
@@ -296,6 +299,24 @@ async def get_threads_for_user(
         extra_params.append(f"{_like_escape(platform_prefix)}%")
 
     try:
+        # DALTON-HOOK(colleague-dispatch): on Chief of Staff ('cos'), filter foreign workspaces in SQL before COUNT/LIMIT/OFFSET.
+        if channel == "cos":
+            from src.dalton.settings import is_dalton_supabase_auth_enabled
+
+            if is_dalton_supabase_auth_enabled():
+                from src.dalton.sharing import list_colleague_cos_workspaces
+
+                cos_items = await list_colleague_cos_workspaces(user_id)
+                cos_ws_ids = [
+                    str(item["workspace_id"])
+                    for item in cos_items
+                    if item.get("workspace_id")
+                ]
+                where_extra += (
+                    " AND (w.user_id = %s OR w.workspace_id = ANY(%s::uuid[]))"
+                )
+                extra_params.extend([user_id, cos_ws_ids])
+
         async with pool.get_db_connection() as conn:
             async with conn.cursor(row_factory=dict_row) as cur:
                 # DALTON-HOOK(colleague-dispatch): include threads created by user_id in colleague workspaces (even if soft-deleted by colleague).
@@ -365,6 +386,25 @@ async def get_recent_threads_for_user(
     runs before its title is written. Each row carries the latest attempt's
     ``latest_*`` columns for ``project_lifecycle``, read over the page alone.
     """
+    # DALTON-HOOK(colleague-dispatch): restrict Chief of Staff activity recent threads to own workspaces and CoS-accessible colleague workspaces in SQL.
+    cos_where_extra = ""
+    cos_extra_params: List[Any] = []
+    from src.dalton.settings import is_dalton_supabase_auth_enabled
+
+    if is_dalton_supabase_auth_enabled():
+        from src.dalton.sharing import list_colleague_cos_workspaces
+
+        cos_items = await list_colleague_cos_workspaces(user_id)
+        cos_ws_ids = [
+            str(item["workspace_id"])
+            for item in cos_items
+            if item.get("workspace_id")
+        ]
+        cos_where_extra = (
+            " AND (w.user_id = %s OR w.workspace_id = ANY(%s::uuid[]))"
+        )
+        cos_extra_params = [user_id, cos_ws_ids]
+
     async with pool.get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
             # DALTON-HOOK(colleague-dispatch): scope recent threads and labels by thread owner.
@@ -382,14 +422,14 @@ async def get_recent_threads_for_user(
                       AND t.archived_at IS NULL
                       AND t.conversation_thread_id IS DISTINCT FROM %s::uuid
                       AND (t.metadata->'origin'->>'type')
-                          IS DISTINCT FROM 'automation'
+                          IS DISTINCT FROM 'automation'{cos_where_extra}
                     ORDER BY t.updated_at DESC, t.conversation_thread_id DESC
                     LIMIT %s
                 ) t
                 {_LATEST_ATTEMPT_LATERAL}
                 ORDER BY t.updated_at DESC, t.conversation_thread_id DESC
                 """,
-                (user_id, exclude_thread_id, limit),
+                (user_id, exclude_thread_id, *cos_extra_params, limit),
             )
             return [dict(row) for row in await cur.fetchall()]
 
@@ -748,12 +788,17 @@ async def get_thread_by_id(conversation_thread_id: str) -> Optional[Dict[str, An
     try:
         async with pool.get_db_connection() as conn:
             async with conn.cursor(row_factory=dict_row) as cur:
+                # DALTON-HOOK(colleague-dispatch): join workspaces to include thread_user_id, workspace_owner_id, and dispatched_by
                 await cur.execute(
                     f"""
-                    SELECT {_sql._THREAD_COLUMNS},
-                           share_token, share_permissions, shared_at
-                    FROM conversation_threads
-                    WHERE conversation_thread_id = %s
+                    SELECT {_sql._THREAD_COLUMNS_T},
+                           COALESCE(t.user_id, w.user_id) AS thread_user_id,
+                           w.user_id AS workspace_owner_id,
+                           t.metadata->'dispatched_by' AS dispatched_by,
+                           t.share_token, t.share_permissions, t.shared_at
+                    FROM conversation_threads t
+                    LEFT JOIN workspaces w ON w.workspace_id = t.workspace_id
+                    WHERE t.conversation_thread_id = %s
                 """,
                     (conversation_thread_id,),
                 )

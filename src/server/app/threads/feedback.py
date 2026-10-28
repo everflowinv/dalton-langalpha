@@ -71,7 +71,17 @@ async def submit_feedback(
 async def get_feedback(thread_id: str, x_user_id: CurrentUserId):
     """Get all feedback for a thread by the current user."""
     try:
-        await auth_api.require_thread_owner(thread_id, x_user_id)
+        # DALTON-HOOK(colleague-dispatch): allow read access to thread feedback for authorized readers
+        from src.dalton.settings import is_dalton_supabase_auth_enabled
+
+        if is_dalton_supabase_auth_enabled():
+            from src.dalton.sharing import require_thread_access
+
+            await require_thread_access(
+                thread_id, x_user_id, channel="web", need="read"
+            )
+        else:
+            await auth_api.require_thread_owner(thread_id, x_user_id)
         rows = await get_feedback_for_thread(thread_id, x_user_id)
         return [
             FeedbackResponse(

@@ -63,8 +63,8 @@ catalog_routes:
   cn-hk:
     category: finance
     title: 港A股财务公告
-    rules: "operation=ask|filings"
-    description: "`filings` 覆盖 A 股和港股的法定公告（巨潮转载），港股约有 5% 的缺口，主要是仅英文版公告和股东大会投票结果，这类需要原文时，用 `web_search` 查 `site:hkexnews.hk`；港 A 股财务、估值、资金面（`ask`）。"
+    rules: "operation=ask|filings|quote"
+    description: "`filings` 覆盖 A 股和港股的法定公告（巨潮转载），港股约有 5% 的缺口，主要是仅英文版公告和股东大会投票结果，这类需要原文时，用 `web_search` 查 `site:hkexnews.hk`；港 A 股财务、估值、资金面（`ask`，公司和日期写进问题）；`quote` 仅作 `get_quote` 的备用报价。"
   fred:
     category: macro
     title: FRED宏观

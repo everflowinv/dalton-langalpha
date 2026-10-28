@@ -143,7 +143,16 @@ async def test_workflow_failure_messages_mandate_run_workflow_resume_only_when_r
         result={"success": False, "error": lost_msg},
     )
     settled = await _settled_text(registry, resumable_task)
-    assert "RunWorkflow(workflow=<same workflow>, resume='s_rL_A')" in settled
+    # B5/D6: the resume re-passes the SAME source the run was launched with —
+    # a name for a named run, the script verbatim for an inline one (an
+    # inline script has no workflow name; `workflow=<name>` answered Unknown
+    # workflow). The named form keeps its instruction; the inline form is
+    # asserted in test_bridge…/D6 tests with a real thread id.
+    assert (
+        "RunWorkflow(workflow=<same name>, params=<same as before>, resume='s_rL_A')"
+        in settled
+    )
+    assert "RunWorkflow(script=<the same script verbatim>" in settled
     assert "do NOT manually re-dispatch Task subagents" in settled
 
     missing = await _compose_missing_reply(
@@ -156,7 +165,10 @@ async def test_workflow_failure_messages_mandate_run_workflow_resume_only_when_r
             "failure": {"error": lost_msg},
         },
     )
-    assert "RunWorkflow(workflow=<same workflow>, resume='s_rL_A')" in missing
+    assert (
+        "RunWorkflow(workflow=<same name>, params=<same as before>, resume='s_rL_A')"
+        in missing
+    )
     assert "do NOT manually re-dispatch Task subagents" in missing
 
     # Non-resumable workflow failure must NOT prompt to call RunWorkflow(resume=...)
@@ -220,9 +232,10 @@ async def test_task_resume_on_workflow_redirects_to_run_workflow_resume() -> Non
         current_run_id="run-2",
     )
     assert (
-        'RunWorkflow(workflow=<same workflow>, resume="s_rL_A", params=...)'
+        "RunWorkflow(workflow=<same name>, params=<same as before>, resume='s_rL_A')"
         in str(msg.content)
     )
+    assert "RunWorkflow(script=<the same script verbatim>" in str(msg.content)
     assert "do NOT manually re-dispatch individual Task subagents" in str(msg.content)
 
 

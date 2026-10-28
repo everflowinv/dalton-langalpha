@@ -50,7 +50,7 @@ DEFAULT_SEC_FORMS = [
     "424B2",
     "424B5",
     "FWP",
-    "Form 4",
+    "4",
     "SC 13D",
     "SC 13G",
 ]
@@ -753,6 +753,15 @@ def _extract_route_items(data: Any) -> list[dict[str, Any]]:
     return []
 
 
+def _is_bridge_no_match(res: dict[str, Any], data: dict[str, Any]) -> bool:
+    """桥接已分类的"没有匹配"：error_category 标"没有匹配"，或 error 文本带
+    "[没有匹配]" 前缀（桥接 _apply_error_and_empty_contract 的两类标记之一）。
+    这是上游答了的空结果，不是取数失败；超时/权限/解析错误不在其中。"""
+    if str(data.get("error_category") or "").strip() == "没有匹配":
+        return True
+    return str(res.get("error") or "").lstrip().startswith("[没有匹配]")
+
+
 def _normalize_guidepoint_doc_id(r: dict[str, Any]) -> str | None:
     """将 Guidepoint 文档 ID 规范化为与 seen.json 一致的 `guidepoint:<id>`。"""
     raw = str(
@@ -905,13 +914,34 @@ def collect_internal_and_ae(
                 if re.match(r"^\d{4}-\d{2}-\d{2}$", date_prefix):
                     if date_prefix < since or date_prefix > until:
                         continue
-                internal_new[did] = {
-                    "route": "guidepoint",
-                    "title": r.get("transcript_name") or r.get("title") or r.get("headline"),
-                    "date": date_prefix or item_date or None,
-                    "from": r.get("original_source") or r.get("source") or "Guidepoint",
-                    "snippet": str(r.get("snippet") or r.get("summary") or "")[:600],
+                # 检索项是问答对（question/answer/context）：Guidepoint 只有问答检索、
+                # 没有全文读取，正文不随包保留就永久丢失。同一访谈的多条问答聚合在
+                # 同一访谈条目的 qa 列表，并保留每条的原始 id 与引用
+                # （search_library 的链接字段是 reference_url，来源声明读同一字段）。
+                entry = internal_new.get(did)
+                if entry is None:
+                    entry = internal_new[did] = {
+                        "route": "guidepoint",
+                        "title": r.get("transcript_name") or r.get("title") or r.get("headline"),
+                        "date": date_prefix or item_date or None,
+                        "from": r.get("original_source") or r.get("source") or "Guidepoint",
+                        "snippet": str(r.get("snippet") or r.get("summary") or "")[:600],
+                        "qa": [],
+                    }
+                qa_pair: dict[str, Any] = {
+                    k: r[k] for k in ("question", "answer", "context") if r.get(k) not in (None, "")
                 }
+                raw_id = str(r.get("id") or r.get("transcript_id") or r.get("document_id") or "").strip()
+                if raw_id:
+                    qa_pair["id"] = raw_id
+                citation = next(
+                    (r[k] for k in ("reference_url", "citation", "reference", "url") if r.get(k)),
+                    None,
+                )
+                if citation:
+                    qa_pair["citation"] = citation
+                if qa_pair:
+                    entry["qa"].append(qa_pair)
         else:
             internal_status[route] = {
                 "ok": ok,
@@ -982,14 +1012,24 @@ def collect_sec_filings(meta: dict[str, Any], since: str, seen: set[str]) -> dic
         tool_name, req_args = build_sec_filing_request(meta["ticker"], form, limit=5)
         res = call_bridge_jsonrpc(tool_name, req_args)
         data = res.get("data") if isinstance(res.get("data"), dict) else {}
-        rows = data.get("rows") or []
+        # 桥接响应把公告嵌在 data.rows（MCP 服务器 payload 层），res["data"]["rows"]
+        # 读不到——统一走 _extract_route_items 的递归提取，与内部来源同一解包。
+        rows = _extract_route_items(data)
         ok = bool(res.get("ok", False))
         err_msg = res.get("error") or data.get("error")
+        empty_reason = str(data.get("empty_reason") or "").strip() or None
+        if not ok and _is_bridge_no_match(res, data):
+            # 列表查询的"没有匹配"是成功的空结果（上游答了、无匹配），不是数据缺口；
+            # 真实的超时/权限/解析错误仍是 ok=false 并进 failed_sources。
+            ok = True
+            err_msg = None
+            empty_reason = empty_reason or "没有匹配"
         status.append({
             "form": form,
             "ok": ok,
             "count": len(rows),
             **({"error": err_msg} if err_msg else {}),
+            **({"empty_reason": empty_reason} if empty_reason else {}),
         })
         for r in rows:
             acc_raw = r.get("accession_no") or r.get("accession")
@@ -1090,6 +1130,16 @@ def render_packet_md(pk: dict[str, Any]) -> str:
             lines.append(f"- `{did}`｜{info.get('date')}｜{info.get('route')}｜{info.get('title')}｜{info.get('from') or ''}")
             if info.get("snippet"):
                 lines.append(f"  - 摘要：{info['snippet']}")
+            # Guidepoint 问答正文：没有全文读取可回溯，随包原样给出
+            for i, qa in enumerate(info.get("qa") or [], 1):
+                if qa.get("question"):
+                    lines.append(f"  - Q{i}：{qa['question']}")
+                if qa.get("answer"):
+                    lines.append(f"    A{i}：{qa['answer']}")
+                if qa.get("context"):
+                    lines.append(f"    （{qa['context']}）")
+                if qa.get("citation"):
+                    lines.append(f"    引用：{qa['citation']}")
     elif any(
         isinstance(int_status.get(r_name), dict) and not int_status[r_name].get("ok", False)
         for r_name in INTERNAL_ROUTES
