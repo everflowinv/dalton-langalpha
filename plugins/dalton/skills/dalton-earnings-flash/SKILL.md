@@ -36,7 +36,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 - **强制调取上一季财报新闻稿、公告或电话会**：提取**上一季报告的同比增速（prior-quarter YoY）**与**上一季发布的本季/全年官方指引**。**严禁拿本季环比（QoQ）冒充“上一季同比增速”**，也严禁凭卖方转述代替上次官方指引。
 
 ### Step 3：电话会全文与 Q&A 提炼
-- 调用 `researchdata.research(route="transcript", ticker=T, limit=2)` 定位本次财报电话会，并用 `researchdata.research(route="alphaengine", operation="get_document", params={"doc_id": ...})` 按 `offset` 分页读完全文。
+- 调用 `researchdata.research(route="transcript", ticker=T, limit=2)` 定位本次财报电话会（定位时必须核对每条候选的日期 `date`/`publish_time`、`kind`（区分官方业绩电话会 `company_call` 与券商回访 `broker_callback`）以及返回的 `coverage`：单次最多扫 10 页×50 条；若 `coverage.complete=false`，表示有界扫描未穷尽——零命中只能视为“本次有界检索未命中”而非无匹配，即使有候选也不能保证已拿到期间最新一场，需把 `coverage.continuation_params` 交给 `researchdata.research(route="alphaengine", operation="search_library", ...)` 续查或缩小 `start`/`end` 窗口，切勿把 `continuation_params` 传回 `transcript`），确认目标 `doc_id` 后用 `researchdata.research(route="alphaengine", operation="get_document", params={"doc_id": ..., "content_field": "auto", "offset": 0, "max_chars": 30000})` 按 `offset` / `next_offset` 分页读完全文（`doc_id` 必须保留完整字符串含 `_inst_` 后缀；`content_field` 仅接受 `"auto"|"original_text"|"content"|"digest"|"digest_cn"|"main_point"|"question_answer"` 各字段独立分页——若所选字段为空且返回 `warning` 与 `available_content_fields`，按映射改读有字符数的合法字段如 `original_text`、`digest` 或 `question_answer`，同一分页序列必须固定同一 `content_field` 按 `next_offset` 续读直到 `complete=true` 或 `next_offset` 为空，并核对 `content_sha256`）。
 - **`Q&A takeaways` 只从电话会 Q&A 部分提取**（提炼 5–10 个最有决策价值的管理层回答，每个话题 1–2 句，不把开场白塞进 Q&A）。
 - **逐级降级规则**：若触发时刻电话会全文尚未入库，依次退到公司 IR Webcast 回放、8-K 预备发言稿（Prepared Remarks），并在正文开头与 `Sources` 中如实写明“截至触发时刻电话会纪要尚未入库”。
 

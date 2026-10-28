@@ -26,6 +26,7 @@ import io
 import ipaddress
 import json
 import logging
+import math
 import os
 import plistlib
 import re
@@ -1247,13 +1248,13 @@ class BridgeConfig:
 
 RESEARCH_EVIDENCE_AND_ROUTE_GUIDE: str = (
     '各来源提供什么证据：事实 → filings（finance(route="sec")）；'
-    "解读 → alphaengine；一线 → guidepoint；管理层原话 → transcript；日常信息流 → sales-notes/tmtb/funda-ai；"
+    "解读/机构与个人会议 → alphaengine；一线 → guidepoint；管理层原话 → transcript；日常信息流 → sales-notes/tmtb/funda-ai；"
     "市场反应 → X/WebSearch。\n"
     "何时选用哪个路由（按研究情境，基于 catalog）：\n"
-    "- 卖方观点与研报 → alphaengine（先 search_library 再 get_document）；\n"
+    "- 卖方观点与研报、机构/个人会议、录制状态与词典 → alphaengine（先 search_library 再 get_document）；\n"
     "- 行业一线反馈 → guidepoint；\n"
     "- 管理层口径 → transcript（AlphaEngine 业绩会转写；无匹配时用 | 分隔中英文公司名重试或扩大 start/end）；\n"
-    "- 历史沉淀 → company-wiki（只读，params.company=TICKER）；\n"
+    "- 历史沉淀 → company-wiki（只读，params.company=TICKER）列目录用 list、search 须 query；\n"
     "- 交易台与买方预期 → sales-notes；\n"
     "- TMT 焦点 → tmtb；\n"
     "- 独立研究 → funda-ai；\n"
@@ -1270,7 +1271,7 @@ ERROR_HANDLING_CONTRACT_NOTE: str = (
 def build_researchdata_plugin_instruction() -> str:
     """Build the canonical `researchdata` server instruction for `plugins/dalton_data/plugin.json`.
 
-    Pagination range in `params`: `offset` (>= 0) and `max_chars` (1..30000; values > 30000 are clamped to 30000).
+    Pagination range in `params`: `offset` (>= 0) and `max_chars` (1..30000; SEC allows up to 500000).
     """
     return (
         "Fund-internal sources; call from execute_code only (no direct path). "
@@ -1279,10 +1280,16 @@ def build_researchdata_plugin_instruction() -> str:
         f"{RESEARCH_EVIDENCE_AND_ROUTE_GUIDE.replace(chr(10), ' ')} "
         'Finance: `finance(route="sec"|"estimates"|"cn-hk")`. '
         'Macro: `macro(route="fred"|"treasury"|"market-regime")`. '
-        "Read only ids that search returned (`wiki:`, `mail:`, `tmtb:`, `funda:`, `alphaengine` doc_id). "
-        "Page long text with params.offset/max_chars (offset >= 0, max_chars 1-30000). "
+        "Read only ids that search returned (`wiki:`, `mail:`, `tmtb:`, `funda:`, `alphaengine` opaque string doc_id including `_inst_` suffix). "
+        "Page long text with params.offset/max_chars (offset >= 0, max_chars 1-30000; SEC attachments/read-item allow up to 500000; get_document supports params.content_field with independent pagination per field). "
         "Leave `timeout` unset: the bridge sets per-route limits and long reads may take minutes. "
-        "AlphaEngine 检索可以放开，全文阅读（get_document）计配额，读最相关的几篇。"
+        'AlphaEngine 支持文档与机构/个人会议浏览与筛选（params.meeting_scope="institution"|"personal"，无关键词默认 sort="newest"，按公司检索请用关键词 query（公司名 + ticker）及必要时 search_in="title"）、'
+        "录制任务与状态查询（list_recording_tasks/get_recording_status/get_recording_task）、文档基础信息与附件列表（get_document_info/list_attachments）、"
+        "按字段读取正文（get_document 的 params.content_field）及词典查询（list_filters）；检索可以放开，全文阅读（get_document）计配额，读最相关的几篇。"
+        "Guidepoint 仅返回问答摘录（无全文接口、无 cursor 翻页；limit 省略默认 3，最大 30，不能由 30 条摘录推断已扫完全部访谈；"
+        "params.keywords 为 1–10 个非空字符串，多项 OR、词组内 AND，先筛访谈再排片段，不筛选时省略或传 null；"
+        "params.recency_bias 为 1–100 整数，偏好近期一般从 30 起，只调排序非日期窗口；start/end 按 UTC 日期硬过滤）。"
+        'transcript 单次最多扫 10 页×50 条，返回 coverage（complete=false 时将 continuation_params 交给 route="alphaengine", operation="search_library" 续查，不要传回 transcript）。'
         "Every result has `_sources` (identity, document_id, as_of, url) and `normalized_params`. "
         "Cite with identity, publisher and date. Expert calls: identity, not name. "
         "Guidepoint verbatim <=20 words. "
@@ -1329,19 +1336,24 @@ def _query_contains_ticker(query: str, ticker: str) -> bool:
 INTERNAL_LIBRARY_READ_OPERATIONS: frozenset[str] = frozenset({"read"})
 MAX_CHARS_FLOOR: int = 1
 MAX_CHARS_CEILING: int = 30000
+SEC_MAX_CHARS_CEILING: int = 500000
 TRANSCRIPT_QUERY_IGNORED_NOTE: str = (
     "transcript 的 query 只用来传公司名，主题检索请在拿到 doc_id 后读正文。"
 )
 TRANSCRIPT_NO_MATCH_HINT: str = (
-    "业绩会转写仅来自 AlphaEngine，当前无匹配记录；请换公司名（中英文用 | 分隔，如 query='腾讯|Tencent'）重试，或者扩大 start/end 时间范围。"
+    "业绩会转写仅来自 AlphaEngine（单次最多扫描 10 页 × 50 条）；若 coverage.complete=false 且带 coverage.continuation_params，"
+    "表示本次有界检索未扫完全量，请把 continuation_params 交给 research(route='alphaengine', operation='search_library', ...) 继续翻页；"
+    "若 complete=true 确定无匹配，请换公司名（中英文用 | 分隔，如 query='腾讯|Tencent'）重试，或者扩大 start/end 时间范围。"
 )
 TRANSCRIPT_CATALOG_RULE: str = (
-    "业绩会转写仅来自 AlphaEngine；ticker 必填，query 只用来传公司名补充（中英文用 | 分隔，勿传主题词），"
-    "主题检索请在拿到 doc_id 后读正文；没有匹配时，换公司名（中英文用 | 分隔）重试，或者扩大 start/end 时间范围。"
+    "业绩会转写仅来自 AlphaEngine（单次最多扫描 10 页 × 50 条 = 500 条）；ticker 必填，query 只用来传公司名补充（中英文用 | 分隔，勿传主题词），"
+    "主题检索请在拿到 doc_id 后读正文；返回含 coverage（complete、pages_scanned、records_scanned、warnings、continuation_params），"
+    "complete=false 时表示有界扫描未完（有候选时保留候选列表且 status=partial，零候选时仅表示本次有界检索未命中），续查参数 coverage.continuation_params 必须交给 research(route='alphaengine', operation='search_library', ...) 续查（切勿传回 transcript）；"
+    "确定无匹配（complete=true）时，换公司名（中英文用 | 分隔）重试，或者扩大 start/end 时间范围。"
 )
 INTERNAL_LIBRARY_PAGINATION_RULE: str = (
     "正文分页参数范围：params.offset >= 0，params.max_chars 为 1–30000（超出 30000 自动截断为 30000）；"
-    "读取用顶层 document 参数传带前缀 ID（wiki:/mail:/tmtb:/digest:/funda:），纯数字 ID 属 AlphaEngine 文档。"
+    "读取用顶层 document 参数传带前缀 ID（wiki:/mail:/tmtb:/digest:/funda:），不透明字符串 doc_id（含 _inst_ 后缀）或 alphaengine:<doc_id> 属 AlphaEngine 文档。"
 )
 
 _TRANSCRIPT_TOPIC_EN_RE = re.compile(
@@ -1738,6 +1750,135 @@ KNOWN_SCHEMA_TOP_LEVEL_KEYS: frozenset[str] = frozenset(
     }
 )
 
+_ALPHAENGINE_DOC_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,159}")
+_ALPHAENGINE_ALLOWED_CONTENT_FIELDS: tuple[str, ...] = (
+    "auto",
+    "original_text",
+    "content",
+    "digest",
+    "digest_cn",
+    "main_point",
+    "question_answer",
+)
+
+
+def _normalize_alphaengine_doc_id(raw_value: Any) -> str:
+    """Strip at most one explicit 'alphaengine:' prefix without stripping whitespace."""
+    text = "" if raw_value is None else str(raw_value)
+    if text.startswith("alphaengine:"):
+        text = text[len("alphaengine:") :]
+    return text
+
+
+def _is_valid_alphaengine_doc_id(doc_id: str) -> bool:
+    """Validate opaque AlphaEngine document IDs (preserving _inst_ suffix, rejecting path/encoding chars)."""
+    return bool(doc_id and _ALPHAENGINE_DOC_ID_RE.fullmatch(doc_id))
+
+
+ALPHAENGINE_OPERATION_NESTED_PARAMS: dict[str, list[str]] = {
+    "search_library": [
+        "query",
+        "date_from",
+        "date_to",
+        "source_names",
+        "source_ids",
+        "document_categories",
+        "document_codes",
+        "type_ids",
+        "markets",
+        "industry_names",
+        "meeting_scope",
+        "search_in",
+        "company_names",
+        "company_short_names",
+        "stock_group_ids",
+        "first_regions",
+        "second_regions",
+        "own_reservations_only",
+        "optional_only",
+        "sort",
+        "cursor",
+        "limit",
+        "include_snippets",
+    ],
+    "get_document": [
+        "doc_id",
+        "mode",
+        "offset",
+        "max_chars",
+        "content_field",
+    ],
+    "get_document_info": [
+        "doc_id",
+    ],
+    "list_attachments": [
+        "doc_id",
+    ],
+    "list_recording_tasks": [
+        "meeting_scope",
+        "page",
+        "limit",
+        "query",
+        "states",
+        "date_from",
+        "date_to",
+        "source_ids",
+        "industry_ids",
+        "own_reservations_only",
+        "optional_only",
+    ],
+    "get_recording_status": [
+        "meeting_scope",
+    ],
+    "get_recording_task": [
+        "meeting_scope",
+        "roadshow_id",
+        "wechat_group",
+    ],
+    "list_filters": [
+        "filter_type",
+        "query",
+        "document_code",
+        "group_id",
+        "limit",
+        "offset",
+    ],
+    "auth_status": [],
+}
+
+ALPHAENGINE_ACCEPTED_NESTED_PARAMS_UNION: list[str] = list(
+    dict.fromkeys(
+        k
+        for keys in ALPHAENGINE_OPERATION_NESTED_PARAMS.values()
+        for k in keys
+    )
+)
+
+SEC_OPERATION_NESTED_PARAMS: dict[str, list[str]] = {
+    "list-filings": [],
+    "attachments": ["accession", "document_type", "max_chars"],
+    "financials": ["statement"],
+    "ratios": [],
+    "facts": [],
+    "smart-facts": [],
+    "search-concepts": [],
+    "search-text": ["window", "max_matches"],
+    "read-item": ["max_chars"],
+    "eight-k": [],
+    "insider": [],
+}
+
+SEC_ACCEPTED_NESTED_PARAMS_UNION: list[str] = list(
+    dict.fromkeys(
+        k
+        for keys in SEC_OPERATION_NESTED_PARAMS.values()
+        for k in keys
+    )
+)
+
+SEC_VALID_STATEMENTS: frozenset[str] = frozenset({"all", "income", "balance", "cash"})
+_SEC_ACCESSION_RE = re.compile(r"\d{10}-\d{2}-\d{6}")
+
 ROUTE_CONTRACT_SPECS: dict[str, dict[str, Any]] = {
     "sec": {
         "tool": "finance",
@@ -1780,8 +1921,10 @@ ROUTE_CONTRACT_SPECS: dict[str, dict[str, Any]] = {
             "as_of",
             "form",
             "limit",
+            "params",
         ],
-        "accepted_nested_params": [],
+        "accepted_nested_params": SEC_ACCEPTED_NESTED_PARAMS_UNION,
+        "accepted_nested_params_by_operation": SEC_OPERATION_NESTED_PARAMS,
         "required_params": {
             "list-filings": ["ticker"],
             "financials": ["ticker"],
@@ -1795,19 +1938,27 @@ ROUTE_CONTRACT_SPECS: dict[str, dict[str, Any]] = {
             "eight-k": ["ticker"],
             "insider": ["ticker"],
         },
-        "optional_params": ["form", "document", "as_of", "limit"],
+        "optional_params": ["form", "document", "as_of", "limit", "params"],
         "param_formats": {
             "ticker": "美股代码（如 'META'、'NVDA'）",
             "query": "检索关键词（smart-facts / search-concepts / search-text 必填）",
             "as_of": "YYYY-MM-DD",
             "form": "10-K | 10-Q | 8-K | 20-F | 4",
-            "item": "SEC 章节号（如 '1A'、'7'、'2.02'）",
+            "item": "SEC 章节号（如 '1A'、'7'、'2.02'，仅 read-item）",
+            "document": "附件文件名（仅 attachments，与 params.document_type 互斥）",
+            "params.accession": "SEC 完整 accession 编号（10-2-6 数字，如 '0001326801-26-000010'，仅 attachments）",
+            "params.document_type": "附件类型（非空字符串，如 'EX-99.1'，仅 attachments，与顶层 document 互斥）",
+            "params.max_chars": "正文读取最大字符数（正整数 1–500000，仅 attachments / read-item）",
+            "params.statement": "财务报表筛选（'all' | 'income' | 'balance' | 'cash'，仅 financials）",
+            "params.window": "命中上下文窗口字符数（正整数 1–500000，仅 search-text）",
+            "params.max_matches": "最大返回命中条数（正整数 1–100，仅 search-text）",
         },
         "return_shape": "{\"ok\": true, \"status\": \"ok\", \"ticker\": \"META\", \"rows\"|\"data\": ..., \"_sources\": [...], \"normalized_params\": {...}}",
         "examples": [
-            "finance(route=\"sec\", operation=\"financials\", ticker=\"META\", form=\"10-K\", limit=5)",
+            "finance(route=\"sec\", operation=\"financials\", ticker=\"META\", form=\"10-K\", limit=5, params={\"statement\": \"income\"})",
             "finance(route=\"sec\", operation=\"smart-facts\", ticker=\"META\", query=\"revenue advertising\", limit=10)",
-            "finance(route=\"sec\", operation=\"read-item\", ticker=\"META\", form=\"10-K\", item=\"7\")",
+            "finance(route=\"sec\", operation=\"read-item\", ticker=\"META\", form=\"10-K\", item=\"7\", params={\"max_chars\": 100000})",
+            "finance(route=\"sec\", operation=\"attachments\", ticker=\"META\", form=\"8-K\", params={\"accession\": \"0001326801-26-000010\", \"document_type\": \"EX-99.1\", \"max_chars\": 100000})",
         ],
     },
     "estimates": {
@@ -1820,16 +1971,30 @@ ROUTE_CONTRACT_SPECS: dict[str, dict[str, Any]] = {
             "estimate": "consensus",
             "get": "consensus",
         },
-        "accepted_params": ["ticker", "limit"],
-        "accepted_nested_params": [],
+        "accepted_params": ["ticker", "limit", "params"],
+        "accepted_nested_params": ["shares_bn", "tax"],
         "required_params": {"consensus": ["ticker"]},
-        "optional_params": ["operation", "limit"],
+        "optional_params": ["operation", "limit", "params"],
         "param_formats": {
-            "ticker": "美股代码（如 'META'、'NVDA'）",
+            "ticker": "美股或港股代码（如 'META'、'NVDA'、'9999.HK'）",
+            "params.shares_bn": "摊薄股数（十亿股，有限正数 > 0，用于覆盖或补齐隐含模型股数）",
+            "params.tax": "有效税率（0 <= tax < 1 的有限数值，用于覆盖隐含模型默认税率）",
         },
-        "return_shape": "{\"ok\": true, \"status\": \"ok\", \"ticker\": \"META\", \"data\": {\"consensus\": ...}, \"_sources\": [...], \"normalized_params\": {...}}",
+        "return_shape": (
+            "{\"ok\": true, \"status\": \"ok\"|\"partial\"|\"error\", \"ticker\": \"META\", "
+            "\"data\": {\"ok\": bool, \"status\": \"ok\"|\"partial\"|\"error\", "
+            "\"field_status\": {\"earnings_estimate\": \"ok\"|\"empty\"|\"error\", \"revenue_estimate\": ..., "
+            "\"eps_trend\": ..., \"eps_revisions\": ..., \"growth_estimates\": ..., \"price_targets\": ..., "
+            "\"recommendations\": ..., \"price\": ..., \"implied_model\": ...}, "
+            "\"earnings_estimate\": {\"0q\": {\"avg\": ..., \"currency\": \"USD\"|\"CNY\"|...}, ...}, "
+            "\"revenue_estimate\": {\"0q\": {\"avg\": ..., \"currency\": \"USD\"|\"CNY\"|...}, ...}, "
+            "\"eps_trend\": {...}, \"eps_revisions\": {...}, \"price_targets\": {...}, "
+            "\"implied_model\": {\"available\": bool, \"currency\": str|null, \"warnings\": [...]}}, "
+            "\"_sources\": [...], \"normalized_params\": {...}}"
+        ),
         "examples": [
             "finance(route=\"estimates\", operation=\"consensus\", ticker=\"META\")",
+            "finance(route=\"estimates\", operation=\"consensus\", ticker=\"META\", params={\"shares_bn\": 2.55, \"tax\": 0.16})",
         ],
     },
     "cn-hk": {
@@ -2012,7 +2177,17 @@ ROUTE_CONTRACT_SPECS: dict[str, dict[str, Any]] = {
     "alphaengine": {
         "tool": "research",
         "category": "research",
-        "operations": ["search_library", "get_document", "auth_status", "list_filters"],
+        "operations": [
+            "search_library",
+            "get_document",
+            "get_document_info",
+            "list_attachments",
+            "list_recording_tasks",
+            "get_recording_status",
+            "get_recording_task",
+            "list_filters",
+            "auth_status",
+        ],
         "default_operation": "search_library",
         "operation_aliases": {
             "search": "search_library",
@@ -2020,43 +2195,125 @@ ROUTE_CONTRACT_SPECS: dict[str, dict[str, Any]] = {
             "read": "get_document",
             "read_document": "get_document",
             "get": "get_document",
+            "filters": "list_filters",
+            "status": "auth_status",
         },
         "accepted_params": ["query", "start", "end", "limit", "params", "document", "ticker"],
-        "accepted_nested_params": [
-            "doc_id",
-            "query",
-            "sort",
-            "limit",
-            "date_from",
-            "date_to",
-            "type_ids",
-            "source_names",
-            "companies",
-            "industries",
-            "include_snippets",
-            "page",
-            "pages",
-            "offset",
-            "max_chars",
-        ],
+        "accepted_nested_params": ALPHAENGINE_ACCEPTED_NESTED_PARAMS_UNION,
+        "accepted_nested_params_by_operation": ALPHAENGINE_OPERATION_NESTED_PARAMS,
         "required_params": {
-            "search_library": ["query"],
+            "search_library": [],
             "get_document": ["params.doc_id（或顶层 document）"],
+            "get_document_info": ["params.doc_id（或顶层 document）"],
+            "list_attachments": ["params.doc_id（或顶层 document）"],
+            "list_recording_tasks": ["params.date_from 与 params.date_to 若提供须成对（支持未来日期）"],
+            "get_recording_status": [],
+            "get_recording_task": ["params.roadshow_id（不可用 doc_id 代替）"],
+            "list_filters": [
+                "filter_type='companies' 时必填 params.query（须走 params.query）；"
+                "filter_type='watchlist_stocks' 时必填 params.group_id"
+            ],
             "auth_status": [],
-            "list_filters": [],
         },
-        "optional_params": ["start", "end", "limit", "params"],
+        "optional_params": ["query", "start", "end", "limit", "params", "document", "ticker"],
         "param_formats": {
-            "query": "检索关键词（公司代码如 'META' 直接拼入 query）",
+            "query": (
+                "检索关键词（search_library 非必填：有有效关键词时 sort 仅允许并默认 'relevance'；"
+                "无关键词浏览时 sort 默认 'newest'，亦允许显式 'relevance'；"
+                "list_filters 必须用 params.query，不可用顶层 query）"
+            ),
             "ticker": "股票代码；会并入 query 检索词（上游不支持单独的 ticker 参数）",
-            "start": "YYYY-MM-DD（传入 start 时需与 end 成对传入）",
+            "start": (
+                "YYYY-MM-DD（search_library 按 publish_time 筛选，须与 end 成对；"
+                "list_recording_tasks 支持未来日期，规范化进 params.date_from/date_to，必须成对提供）"
+            ),
             "end": "YYYY-MM-DD",
-            "params.doc_id": "纯数字字符串文档 ID（如 '99001122'；顶层传 document 时自动映射为 params.doc_id 并移除顶层 document）",
+            "limit": (
+                "单页条数：search_library 1-50（不传 limit 时网关默认只返回 3 条，建议显式传 limit，上限 50）；"
+                "list_recording_tasks 1-100（默认 20）；"
+                "list_filters 1-200（上限 200 须走 params.limit）"
+            ),
+            "params.doc_id": (
+                "不透明字符串文档 ID（如 '290001790954279_inst_134249' 或 '99001122'，保留 _inst_ 后缀；"
+                "支持剥除一次 'alphaengine:' 前缀；顶层传 document 时自动映射为 params.doc_id）"
+            ),
+            "params.meeting_scope": (
+                "'institution'（本机构录制会议）| 'personal'（个人会议）；"
+                "不可同次混查，且不可与非会议文档分类混用；"
+                "source_names 是资料来源（如券商），meeting_scope 与 institution_meeting_flag/personal_meeting_flag 才表示录制归属"
+            ),
+            "params.document_categories": (
+                "分类数组，可选值（与上游 CATEGORY_DEFS 严格一致）：'sell_side', 'sell_side_comment', 'sell_side_report', "
+                "'domestic_report', 'foreign_report', 'meeting_minutes', 'institution_meetings', 'personal_meetings', "
+                "'third_party_reports', 'expert_library', 'global_think_tank', 'announcement', 'news'；"
+                "注意 'institution_meetings' / 'personal_meetings' 与非会议分类（如卖方研报/点评）同用会触发 E_SCOPE_CONFLICT，必须拆成独立调用"
+            ),
+            "params.search_in": "'full_text'（默认）| 'title'（仅标题检索；可与 cursor 翻页同用，续页时须保持相同 search_in 与筛选条件）",
+            "params.company_names": (
+                "公司名称数组（旧参数名 companies 已废弃；依赖上游公司 / 地区标签，可能漏召回或错配，不建议作为主要筛选，按公司检索请用 query）"
+            ),
+            "params.company_short_names": (
+                "公司简称数组（依赖上游公司 / 地区标签，可能漏召回或错配，不建议作为主要筛选，按公司检索请用 query）"
+            ),
+            "params.industry_names": "行业名称数组（旧参数名 industries 已废弃；list_recording_tasks 用 industry_ids）",
+            "params.stock_group_ids": (
+                "自选分组 ID 数组（依赖上游公司 / 地区标签，可能漏召回或错配，不建议作为主要筛选）"
+            ),
+            "params.first_regions": (
+                "一级地区数组（依赖上游公司 / 地区标签，可能漏召回或错配，不建议作为主要筛选）"
+            ),
+            "params.second_regions": (
+                "二级地区数组（依赖上游公司 / 地区标签，可能漏召回或错配，不建议作为主要筛选）"
+            ),
+            "params.content_field": (
+                "get_document 正文字段选择：仅接受 'auto'（默认）| 'original_text'（原文/转录）| 'content'（正文）| "
+                "'digest'（摘要）| 'digest_cn'（中文摘要）| 'main_point'（要点）| 'question_answer'（问答）"
+                "（映射：摘要 → digest / digest_cn，要点 → main_point，问答 → question_answer，原文 / 转录 → original_text；"
+                "available_content_fields 中的 full_content / text / markdown 仅为长度信息，不能作为 content_field 请求）；"
+                "各字段独立分页（params.offset/max_chars），params.mode 为 'auto'|'public'|'private'"
+                "（不可与顶层 researchdata mode='fetch'|'plan' 混用）"
+            ),
+            "params.filter_type": (
+                "list_filters 词典类型：'categories'（无参默认）| 'upstream_categories' | 'document_types'（可配 document_code）| "
+                "'sources' | 'industries'（可配 document_code）| 'companies'（必填 params.query）| "
+                "'regions' | 'watchlist_groups' | 'watchlist_stocks'（必填 params.group_id；"
+                "注：companies / regions / watchlist_groups / watchlist_stocks 依赖上游公司 / 地区标签，可能漏召回或错配，不建议作为主要筛选）"
+            ),
+            "params.roadshow_id": "录制任务 ID（get_recording_task 必填，不可用 doc_id 代替）",
+            "pagination_rules": (
+                "三种分页机制互不通用：1) search_library 文档检索用 params.cursor（直到 has_more=false；"
+                "newest 保留上游顺序，rank_date 是入库排序时间而非会议开始时间，日期筛选按 publish_time）；"
+                "2) list_filters 词典用 params.offset / 返回 next_offset；"
+                "3) list_recording_tasks 录制任务用 params.page / 返回 next_page（以 has_more 为准）；"
+                "get_document 正文按 next_offset 续读，直到 complete=true 或 next_offset 为空（无 has_more）。"
+                "旧参数名 pages 已废弃；search_library 禁用 page。"
+            ),
         },
-        "return_shape": "{\"ok\": true, \"status\": \"ok\", \"data\": {\"structuredContent\": {\"results\": [...]}}, \"_sources\": [...]}",
+        "return_shape": (
+            "search_library: {\"ok\": true, \"data\": {\"structuredContent\": {\"results\": [{\"doc_id\": str, \"title\": str, "
+            "\"title_cn\": str, \"publish_time\": str, \"rank_date\": str, \"type_show_name\": str, "
+            "\"institution_meeting_flag\": int|bool, \"personal_meeting_flag\": int|bool, ...}], "
+            "\"cursor\": str|null, \"has_more\": bool, \"total_upstream\": int, \"filters\": {...}}}}; "
+            "get_document: {\"ok\": true, \"data\": {\"structuredContent\": {\"metadata\": {\"doc_id\": str, ...}, \"content_field\": str, "
+            "\"available_content_fields\": {\"<field>\": int}, \"warning\": str|null, \"content_chars\": int, "
+            "\"content_sha256\": str|null, \"offset\": int, \"returned_chars\": int, \"text\": str, "
+            "\"next_offset\": int|null, \"complete\": bool}}}（无顶层 doc_id，也无 has_more；按 next_offset 续读，直到 complete=true 或 next_offset 为空）; "
+            "get_document_info: {\"ok\": true, \"data\": {\"structuredContent\": {\"doc_id\": str, ...metadata, \"note\": str}}}; "
+            "list_attachments: {\"ok\": true, \"data\": {\"structuredContent\": {\"doc_id\": str, \"returned\": int, "
+            "\"attachments\": [{\"attachment_index\": int, ..., \"downloadable_document\": bool}], \"next_step\": str}}}; "
+            "list_recording_tasks: {\"ok\": true, \"data\": {\"structuredContent\": {\"meeting_scope\": str, \"total\": int, "
+            "\"page\": int, \"limit\": int, \"returned\": int, \"results\": [...], \"has_more\": bool, \"next_page\": int|null, "
+            "\"state_definitions\": {...}, \"note\": str}}}; "
+            "get_recording_status: {\"ok\": true, \"data\": {\"structuredContent\": {\"meeting_scope\": str, \"counts\": {...}, "
+            "\"preview\": [...], \"state_definitions\": {...}, \"note\": str}}}; "
+            "get_recording_task: {\"ok\": true, \"data\": {\"structuredContent\": {\"meeting_scope\": str, \"roadshow_id\": str, \"detail\": {...}}}}"
+        ),
         "examples": [
-            "research(route=\"alphaengine\", operation=\"search_library\", query=\"META AI capex\", start=\"2026-01-01\", end=\"2026-10-23\", limit=10)",
-            "research(route=\"alphaengine\", operation=\"get_document\", params={\"doc_id\": \"99001122\", \"offset\": 0, \"max_chars\": 30000})",
+            "research(route=\"alphaengine\", operation=\"search_library\", params={\"meeting_scope\": \"institution\", \"sort\": \"newest\", \"limit\": 5})",
+            "research(route=\"alphaengine\", operation=\"search_library\", query=\"宁德时代 300750\", start=\"2026-09-01\", end=\"2026-10-28\", limit=20, params={\"search_in\": \"title\", \"sort\": \"relevance\"})",
+            "research(route=\"alphaengine\", operation=\"list_filters\", params={\"filter_type\": \"document_types\", \"document_code\": \"summary\"})",
+            "research(route=\"alphaengine\", operation=\"get_document\", params={\"doc_id\": \"290001790954279_inst_134249\", \"content_field\": \"original_text\", \"offset\": 0, \"max_chars\": 30000})",
+            "research(route=\"alphaengine\", operation=\"list_recording_tasks\", params={\"meeting_scope\": \"institution\", \"page\": 1, \"limit\": 100})",
         ],
     },
     "guidepoint": {
@@ -2080,16 +2337,27 @@ ROUTE_CONTRACT_SPECS: dict[str, dict[str, Any]] = {
         "required_params": {"search_library": ["query"]},
         "optional_params": ["operation", "start", "end", "limit", "params"],
         "param_formats": {
-            "query": "专家访谈检索词（如 'Meta Reels advertising'）",
-            "ticker": "股票代码；会并入 query 检索词（上游不支持单独的 ticker 参数）",
-            "start": "YYYY-MM-DD",
-            "end": "YYYY-MM-DD",
-            "limit": "整数 1-30（上游 search_library 的上限是 30，超出会被桥接层截到 30）",
-            "params.keywords": "关键词列表 list[str]（传单个字符串时桥接层自动包成单元素列表）",
+            "query": "专家访谈检索词（1–1000 字符，英文研究问题优先，如 'Meta Reels advertising'）",
+            "ticker": "股票代码；会并入 query 检索词（上游不支持单独的 ticker 参数，合并后总长 <= 1000 字符）",
+            "start": "窗口起点 YYYY-MM-DD（按 UTC 日期硬过滤；或放入 params.start_date）",
+            "end": "窗口终点 YYYY-MM-DD（按 UTC 日期硬过滤；或放入 params.end_date）",
+            "limit": "整数 1-30（省略时默认 3，最大 30；超出 30 会被桥接层截到 30）",
+            "params.keywords": (
+                "访谈级关键词过滤（1–10 个非空字符串列表，单个非空字符串自动包成单元素列表；"
+                "多项之间 OR、单个词组内 AND，先筛访谈再排片段；不筛选时省略或传 null，空数组不转发，超过 10 项报错）"
+            ),
+            "params.recency_bias": (
+                "近期偏好权重（1–100 的整数，数字字符串自动转 int；偏好近期一般从 30 起；"
+                "只影响排序权重，不是日期过滤窗口；省略或传 null 表示不启用）"
+            ),
         },
-        "return_shape": "{\"ok\": true, \"status\": \"ok\", \"data\": {\"structuredContent\": {\"data\": [...]}}, \"_sources\": [...]}",
+        "return_shape": (
+            "{\"ok\": true, \"status\": \"ok\", \"data\": {\"structuredContent\": {\"data\": [...]}}, \"_sources\": [...]}"
+            "（仅返回问答摘录，无全文接口、无 cursor 翻页；不能由 30 条摘录推断已扫完全部访谈）"
+        ),
         "examples": [
             "research(route=\"guidepoint\", operation=\"search_library\", query=\"Meta advertising Reels\", start=\"2026-01-01\", end=\"2026-10-23\", limit=10)",
+            "research(route=\"guidepoint\", operation=\"search_library\", query=\"GPU data center rack demand\", start=\"2026-07-01\", end=\"2026-10-23\", limit=20, params={\"keywords\": [\"NVIDIA\", \"NVDA\"], \"recency_bias\": 30})",
         ],
     },
     "transcript": {
@@ -2113,7 +2381,14 @@ ROUTE_CONTRACT_SPECS: dict[str, dict[str, Any]] = {
             "start": "YYYY-MM-DD",
             "end": "YYYY-MM-DD",
         },
-        "return_shape": "{\"ok\": true, \"status\": \"ok\", \"data\": {\"transcripts\": [...]}, \"_sources\": [...]}（无匹配返回 ok: true, empty_reason: \"no_matching_transcripts\"）",
+        "return_shape": (
+            "{\"ok\": true, \"status\": \"ok\"|\"partial\"|\"empty\", \"data\": {\"source\": \"alphaengine\", "
+            "\"transcripts\": [{\"doc_id\": ..., \"title\": ..., \"publish_time\": ..., \"kind\": \"company_call\"|\"broker_callback\", \"company_name\": ...}], "
+            "\"coverage\": {\"complete\": bool, \"pages_scanned\": int, \"records_scanned\": int, \"warnings\": [...], \"continuation_params\": {...}}}, "
+            "\"_sources\": [...]}（单次最多扫描 10 页×50 条；complete=false 时有候选则保留候选且 status=\"partial\"，零候选则仅表示本次有界检索未命中，"
+            "续查参数 continuation_params 交给 route=\"alphaengine\", operation=\"search_library\"，不要传回 transcript；"
+            "complete=true 且无匹配返回 ok: true, empty_reason: \"no_matching_transcripts\"）"
+        ),
         "examples": [
             "research(route=\"transcript\", operation=\"transcript\", ticker=\"META\", start=\"2026-01-01\", end=\"2026-10-23\", limit=4)",
             "research(route=\"transcript\", operation=\"transcript\", ticker=\"00700\", query=\"腾讯|Tencent\", start=\"2026-01-01\", end=\"2026-10-23\", limit=4)",
@@ -2151,14 +2426,15 @@ ROUTE_CONTRACT_SPECS: dict[str, dict[str, Any]] = {
             "indexed_since",
         ],
         "required_params": {
-            "search": ["query 或 params.company"],
+            "search": ["query（或 ticker）"],
             "read": ["document"],
             "list": [],
-            "topic": ["query"],
+            "topic": ["query 或 params.tag"],
         },
         "optional_params": ["start", "end", "limit", "params"],
         "param_formats": {
-            "params.company": "股票代码（如 'META'、'0700.HK'、'300750.SZ'）",
+            "query": "检索关键词（search 必填，或传 ticker 折叠进 query；只列公司目录请用 operation='list', params={'company': 'TICKER'}）",
+            "params.company": "股票代码（如 'META'、'0700.HK'、'300750.SZ'；list 可仅传 params.company 列目录，search 仍须带 query）",
             "ticker": "股票代码；会并入 query 检索词（上游不支持单独的 ticker 参数）",
             "document": "'wiki:<id>'",
             "start": "YYYY-MM-DD",
@@ -2166,6 +2442,7 @@ ROUTE_CONTRACT_SPECS: dict[str, dict[str, Any]] = {
         },
         "return_shape": "{\"ok\": true, \"status\": \"ok\", \"results\": [...], \"result_count\": int, \"_sources\": [...]}",
         "examples": [
+            "research(route=\"company-wiki\", operation=\"list\", params={\"company\": \"META\"})",
             "research(route=\"company-wiki\", operation=\"search\", query=\"META advertising\", params={\"company\": \"META\"}, limit=10)",
             "research(route=\"company-wiki\", operation=\"read\", document=\"wiki:1632\", params={\"offset\": 0, \"max_chars\": 30000})",
         ],
@@ -2251,14 +2528,15 @@ ROUTE_CONTRACT_SPECS: dict[str, dict[str, Any]] = {
         },
         "optional_params": ["start", "end", "limit", "params"],
         "param_formats": {
+            "deprecation_note": "兼容旧名（已迁入内部库 document_v1 格式，可能返回 sales-notes 或 tmtb 记录），新调用请改用 sales-notes / tmtb / all",
             "ticker": "股票代码；会并入 query 检索词（上游不支持单独的 ticker 参数）",
-            "document": "'mail:<id>' 或 'digest:<date>'",
+            "document": "'mail:<id>'、'digest:<date>' 或 'tmtb:<id>'",
             "start": "YYYY-MM-DD",
             "end": "YYYY-MM-DD",
         },
-        "return_shape": "{\"ok\": true, \"status\": \"ok\", \"results\": [...], \"result_count\": int, \"_sources\": [...]}",
+        "return_shape": "{\"ok\": true, \"status\": \"ok\", \"results\": [...], \"result_count\": int, \"_sources\": [...]}（兼容旧名，已转为内部库 document_v1 格式，建议改用 sales-notes / tmtb / all）",
         "examples": [
-            "research(route=\"sales-mail\", operation=\"search\", query=\"META bogey\", start=\"2026-01-01\", end=\"2026-10-23\", limit=10)",
+            'research(route="sales-mail", operation="search", query="META bogey", start="2026-01-01", end="2026-10-23", limit=10)',
         ],
     },
     "tmtb": {
@@ -2706,6 +2984,8 @@ def _normalize_date_window(
     route: str,
     normalized: dict[str, Any],
     nested: dict[str, Any] | None = None,
+    *,
+    operation: str | None = None,
 ) -> dict[str, Any] | None:
     """Apply the shared date-window rules to a call in place; error payload or None.
 
@@ -2715,8 +2995,83 @@ def _normalize_date_window(
     rejects `start > end`): an `end` after today stops at today, a `start`
     after today has nothing to find, AlphaEngine gets its window closed to a
     pair, and a reversed window is refused.
+    `alphaengine` `list_recording_tasks` is exempt from historical-document
+    date rules: it accepts future dates, requires a paired `date_from`/`date_to`
+    when either is given, normalizes them into `params.date_from`/`params.date_to`,
+    and strips top-level `start`/`end` so `data_gateway.py` does not reject future dates.
     """
-    nested = nested or {}
+    nested = nested if nested is not None else {}
+    eff_op = (
+        str(operation or normalized.get("operation") or "").strip()
+        or str((ROUTE_CONTRACT_SPECS.get(route) or {}).get("default_operation") or "").strip()
+    )
+
+    if route == "alphaengine" and eff_op == "list_recording_tasks":
+        top_start = normalized.get("start")
+        top_end = normalized.get("end")
+        nested_from = nested.get("date_from") or nested.get("start") or nested.get("start_date")
+        nested_to = nested.get("date_to") or nested.get("end") or nested.get("end_date")
+        if top_start and nested_from and top_start != nested_from:
+            norm_view = _build_normalized_params_view(normalized)
+            return {
+                "_declared_sources": [],
+                "_sources": [],
+                "ok": False,
+                "status": "invalid_arguments",
+                "error_code": "parameter_conflict",
+                "error_category": "参数错误",
+                "error": f"[参数错误] 参数冲突：start={top_start!r} 与 params.date_from={nested_from!r} 不一致。",
+                "hint": "请统一使用 params.date_from 与 params.date_to 传入成对日期。",
+                "normalized_params": norm_view,
+            }
+        if top_end and nested_to and top_end != nested_to:
+            norm_view = _build_normalized_params_view(normalized)
+            return {
+                "_declared_sources": [],
+                "_sources": [],
+                "ok": False,
+                "status": "invalid_arguments",
+                "error_code": "parameter_conflict",
+                "error_category": "参数错误",
+                "error": f"[参数错误] 参数冲突：end={top_end!r} 与 params.date_to={nested_to!r} 不一致。",
+                "hint": "请统一使用 params.date_from 与 params.date_to 传入成对日期。",
+                "normalized_params": norm_view,
+            }
+        task_from = nested_from or top_start
+        task_to = nested_to or top_end
+        if (task_from is None) != (task_to is None):
+            norm_view = _build_normalized_params_view(normalized)
+            return {
+                "_declared_sources": [],
+                "_sources": [],
+                "ok": False,
+                "status": "invalid_arguments",
+                "error_code": "E_BAD_DATE_RANGE",
+                "error_category": "参数错误",
+                "error": (
+                    "[参数错误] E_BAD_DATE_RANGE: list_recording_tasks 的 date_from 和 date_to 必须成对提供"
+                    "（录制任务包含未来预约，不按历史文档规则自动补齐单边日期）。"
+                ),
+                "hint": "请同时提供成对的 params.date_from 与 params.date_to（YYYY-MM-DD），或都不传。",
+                "normalized_params": norm_view,
+            }
+        if task_from and task_to:
+            if task_from > task_to:
+                norm_view = _build_normalized_params_view(normalized)
+                err = _invalid_date_error("date_from", task_from, norm_view)
+                err["error"] = f"[参数错误] 开始日期 {task_from} 晚于结束日期 {task_to}。"
+                err["hint"] = "把 date_from 改成不晚于 date_to 的成对日期后重试。"
+                return err
+            p_out = dict(nested)
+            for alias_k in ("start", "start_date", "end", "end_date"):
+                p_out.pop(alias_k, None)
+            p_out["date_from"] = task_from
+            p_out["date_to"] = task_to
+            normalized["params"] = p_out
+        normalized.pop("start", None)
+        normalized.pop("end", None)
+        return None
+
     today = _bridge_today()
 
     if isinstance(normalized.get("end"), str) and normalized["end"] > today:
@@ -2764,6 +3119,105 @@ def _normalize_date_window(
         err["error"] = f"[参数错误] 开始日期 {win_start} 晚于结束日期 {win_end}。"
         err["hint"] = "把 start 改成不晚于 end 的日期后重试。"
         return err
+    return None
+
+
+def _normalize_guidepoint_params(
+    params_obj: dict[str, Any], norm_view: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Normalize and validate Guidepoint nested `params` (`keywords`, `recency_bias`) in place.
+
+    Returns an error payload dict on invalid values, or None when valid.
+    - `recency_bias`: `None` or empty/whitespace string is omitted; `int` or integer string in 1..100
+      is normalized to `int`; any non-integer or out-of-range value returns `[参数错误]`.
+    - `keywords`: `None`, empty list `[]`, or whitespace-only items are omitted; a bare non-empty string
+      is wrapped as `[s]`; a list of 1..10 non-empty strings is kept; >10 non-empty strings or non-string
+      items return `[参数错误]` (never silently truncated).
+    """
+    if "recency_bias" in params_obj:
+        rb_raw = params_obj.get("recency_bias")
+        if rb_raw is None or (isinstance(rb_raw, str) and not rb_raw.strip()):
+            params_obj.pop("recency_bias", None)
+        else:
+            rb_int = _parse_int_param(rb_raw)
+            if rb_int is None or not (1 <= rb_int <= 100):
+                return {
+                    "_declared_sources": [],
+                    "_sources": [],
+                    "ok": False,
+                    "status": "invalid_arguments",
+                    "error_code": "invalid_nested_param_value",
+                    "error_category": "参数错误",
+                    "error": (
+                        f"[参数错误] Guidepoint params.recency_bias={rb_raw!r} 无效："
+                        "recency_bias 须为 1–100 的整数或 null（不启用时请省略或传 null）。"
+                    ),
+                    "hint": "请将 params.recency_bias 改为 1–100 的整数（偏好近期一般从 30 起），或省略该参数。",
+                    "normalized_params": norm_view,
+                }
+            params_obj["recency_bias"] = rb_int
+
+    if "keywords" in params_obj:
+        kw_raw = params_obj.get("keywords")
+        if kw_raw is None:
+            params_obj.pop("keywords", None)
+        elif isinstance(kw_raw, str):
+            s = kw_raw.strip()
+            if not s:
+                params_obj.pop("keywords", None)
+            else:
+                params_obj["keywords"] = [s]
+        elif isinstance(kw_raw, list):
+            if not all(isinstance(item, str) for item in kw_raw):
+                return {
+                    "_declared_sources": [],
+                    "_sources": [],
+                    "ok": False,
+                    "status": "invalid_arguments",
+                    "error_code": "invalid_nested_param_value",
+                    "error_category": "参数错误",
+                    "error": (
+                        f"[参数错误] Guidepoint params.keywords={kw_raw!r} 无效："
+                        "Guidepoint keywords 须为 1–10 个非空字符串，不筛选时请省略或传 null。"
+                    ),
+                    "hint": "请确保 params.keywords 为字符串列表（1–10 个非空字符串），或省略该参数。",
+                    "normalized_params": norm_view,
+                }
+            cleaned_kw = [item.strip() for item in kw_raw if item.strip()]
+            if not cleaned_kw:
+                params_obj.pop("keywords", None)
+            elif len(cleaned_kw) > 10:
+                return {
+                    "_declared_sources": [],
+                    "_sources": [],
+                    "ok": False,
+                    "status": "invalid_arguments",
+                    "error_code": "invalid_nested_param_value",
+                    "error_category": "参数错误",
+                    "error": (
+                        f"[参数错误] Guidepoint keywords 须为 1–10 个非空字符串（当前传入了 {len(cleaned_kw)} 个），"
+                        "不筛选时请省略或传 null。"
+                    ),
+                    "hint": "请将 params.keywords 精简到 1–10 个非空字符串（不做静默截断）。",
+                    "normalized_params": norm_view,
+                }
+            else:
+                params_obj["keywords"] = cleaned_kw
+        else:
+            return {
+                "_declared_sources": [],
+                "_sources": [],
+                "ok": False,
+                "status": "invalid_arguments",
+                "error_code": "invalid_nested_param_value",
+                "error_category": "参数错误",
+                "error": (
+                    f"[参数错误] Guidepoint params.keywords={kw_raw!r} 无效："
+                    "Guidepoint keywords 须为 1–10 个非空字符串，不筛选时请省略或传 null。"
+                ),
+                "hint": "请将 params.keywords 传为 1–10 个非空字符串列表（或单个非空字符串），或省略该参数。",
+                "normalized_params": norm_view,
+            }
     return None
 
 
@@ -2825,6 +3279,14 @@ def _normalize_and_validate_call_args(
     elif route == "market-regime":
         for k in ("top_k", "n"):
             eff_alias[k] = "top"
+    elif route == "alphaengine":
+        # Do not silently alias top-level `page` to `pages` on alphaengine.
+        eff_alias.pop("page", None)
+    elif route == "sec":
+        # On SEC, top-level `document` is the attachment filename (--document)
+        # while `accession` is the filing accession number (`params.accession`).
+        eff_alias.pop("accession", None)
+        eff_alias.pop("accession_number", None)
 
     grouped: dict[str, list[tuple[str, Any]]] = {}
     none_keys: set[str] = set()
@@ -2881,6 +3343,7 @@ def _normalize_and_validate_call_args(
         elif op_str.lower() in op_aliases:
             op_str = op_aliases[op_str.lower()]
             normalized["operation"] = op_str
+    eff_op = op_str or str((spec or {}).get("default_operation") or "").strip()
 
     if isinstance(normalized.get("ticker"), str):
         normalized["ticker"] = _normalize_ticker_for_route(route, normalized["ticker"])
@@ -2926,10 +3389,12 @@ def _normalize_and_validate_call_args(
                     return normalized, norm_view, _invalid_date_error(date_k, raw_date, norm_view)
             normalized[date_k] = coerced
         params_obj = normalized.get("params")
+        is_ae_recording_tasks = route == "alphaengine" and eff_op == "list_recording_tasks"
         if isinstance(params_obj, dict):
             params_obj = dict(params_obj)
             # Guidepoint spells its nested window start_date/end_date; the
-            # same coercion and end truncation as the top-level start/end.
+            # same coercion and end truncation as the top-level start/end
+            # (except list_recording_tasks, which preserves future dates).
             for nested_k in ("start", "date_from", "start_date", "end", "date_to", "end_date"):
                 if params_obj.get(nested_k) is None:
                     continue
@@ -2938,18 +3403,22 @@ def _normalize_and_validate_call_args(
                 if coerced is None:
                     norm_view = _build_normalized_params_view(normalized, is_community=is_comm)
                     return normalized, norm_view, _invalid_date_error(f"params.{nested_k}", params_obj[nested_k], norm_view)
-                params_obj[nested_k] = min(coerced, _bridge_today()) if as_field == "end" else coerced
-            if (
-                route == "guidepoint"
-                and isinstance(params_obj.get("keywords"), str)
-                and params_obj["keywords"].strip()
-            ):
-                # Guidepoint's native API takes a list of keywords; a bare
-                # string is a 400 upstream.
-                params_obj["keywords"] = [params_obj["keywords"].strip()]
+                params_obj[nested_k] = (
+                    coerced
+                    if (is_ae_recording_tasks or as_field != "end")
+                    else min(coerced, _bridge_today())
+                )
+            if route in ("guidepoint", "all"):
+                gp_norm_view = _build_normalized_params_view(normalized, is_community=is_comm)
+                gp_param_err = _normalize_guidepoint_params(params_obj, gp_norm_view)
+                if gp_param_err is not None:
+                    return normalized, gp_norm_view, gp_param_err
             normalized["params"] = params_obj
         window_err = _normalize_date_window(
-            route, normalized, params_obj if isinstance(params_obj, dict) else None
+            route,
+            normalized,
+            params_obj if isinstance(params_obj, dict) else None,
+            operation=eff_op,
         )
         if window_err is not None:
             return normalized, window_err["normalized_params"], window_err
@@ -2959,32 +3428,46 @@ def _normalize_and_validate_call_args(
         p_dict = dict(normalized["params"])
         for group_label, group_keys in _NESTED_ALIAS_CONFLICT_GROUPS:
             present = [(k, p_dict[k]) for k in group_keys if k in p_dict and p_dict[k] is not None]
-            if len(present) > 1 and not all(
-                _values_equal_for_alias(v, present[0][1]) for _, v in present[1:]
-            ):
-                conflict_desc = ", ".join(f"params.{k}={v!r}" for k, v in present)
-                norm_view = _build_normalized_params_view(normalized, is_community=is_comm)
-                err = {
-                    "_declared_sources": [],
-                    "_sources": [],
-                    "ok": False,
-                    "status": "invalid_arguments",
-                    "error_code": "parameter_conflict",
-                    "error_category": "参数错误",
-                    "error": (
-                        f"[参数错误] 嵌套参数冲突：params 内同一语义参数 '{group_label}' 同时传入了不一致的值 ({conflict_desc})。"
-                    ),
-                    "hint": f"params 内存在别名冲突（{conflict_desc}）；请只保留一个标准字段后重试。",
-                    "normalized_params": norm_view,
-                }
-                return normalized, norm_view, err
+            if len(present) > 1:
+                if route == "alphaengine" and group_label == "document":
+                    first_doc = _normalize_alphaengine_doc_id(present[0][1])
+                    has_conflict = not all(
+                        _normalize_alphaengine_doc_id(v) == first_doc for _, v in present[1:]
+                    )
+                else:
+                    has_conflict = not all(
+                        _values_equal_for_alias(v, present[0][1]) for _, v in present[1:]
+                    )
+                if has_conflict:
+                    conflict_desc = ", ".join(f"params.{k}={v!r}" for k, v in present)
+                    norm_view = _build_normalized_params_view(normalized, is_community=is_comm)
+                    err = {
+                        "_declared_sources": [],
+                        "_sources": [],
+                        "ok": False,
+                        "status": "invalid_arguments",
+                        "error_code": "parameter_conflict",
+                        "error_category": "参数错误",
+                        "error": (
+                            f"[参数错误] 嵌套参数冲突：params 内同一语义参数 '{group_label}' 同时传入了不一致的值 ({conflict_desc})。"
+                        ),
+                        "hint": f"params 内存在别名冲突（{conflict_desc}）；请只保留一个标准字段后重试。",
+                        "normalized_params": norm_view,
+                    }
+                    return normalized, norm_view, err
 
         top_doc = normalized.get("document")
         if top_doc is not None and str(top_doc).strip():
-            top_doc_str = str(top_doc).strip()
+            top_doc_str = str(top_doc) if route == "alphaengine" else str(top_doc).strip()
             for doc_k in ("document", "doc_id", "id", "document_id", "doc", "file_id"):
                 if doc_k in p_dict and p_dict[doc_k] is not None and str(p_dict[doc_k]).strip():
-                    if not _values_equal_for_alias(str(p_dict[doc_k]).strip(), top_doc_str):
+                    nested_doc_str = str(p_dict[doc_k]) if route == "alphaengine" else str(p_dict[doc_k]).strip()
+                    same_doc = (
+                        _normalize_alphaengine_doc_id(nested_doc_str) == _normalize_alphaengine_doc_id(top_doc_str)
+                        if route == "alphaengine"
+                        else _values_equal_for_alias(nested_doc_str, top_doc_str)
+                    )
+                    if not same_doc:
                         conflict_desc = f"document={top_doc!r}, params.{doc_k}={p_dict[doc_k]!r}"
                         norm_view = _build_normalized_params_view(normalized, is_community=is_comm)
                         err = {
@@ -3006,16 +3489,18 @@ def _normalize_and_validate_call_args(
             for alias_doc_k in ("document", "id", "document_id", "doc", "file_id"):
                 if alias_doc_k in p_dict:
                     alias_val = p_dict.pop(alias_doc_k)
-                    if alias_val is not None and str(alias_val).strip() and not p_dict.get("doc_id"):
-                        p_dict["doc_id"] = str(alias_val).strip()
-            if top_doc is not None and str(top_doc).strip():
+                    if alias_val is not None and str(alias_val) != "" and not p_dict.get("doc_id"):
+                        p_dict["doc_id"] = str(alias_val)
+            if top_doc is not None and str(top_doc) != "":
                 if not p_dict.get("doc_id"):
-                    p_dict["doc_id"] = str(top_doc).strip()
+                    p_dict["doc_id"] = str(top_doc)
                 normalized.pop("document", None)
+            if p_dict.get("doc_id") is not None and str(p_dict.get("doc_id")) != "":
+                p_dict["doc_id"] = _normalize_alphaengine_doc_id(p_dict["doc_id"])
             normalized["params"] = p_dict
     elif route == "alphaengine" and normalized.get("document") is not None:
-        top_doc_str = str(normalized.pop("document")).strip()
-        if top_doc_str:
+        top_doc_str = _normalize_alphaengine_doc_id(normalized.pop("document"))
+        if top_doc_str != "":
             normalized["params"] = {"doc_id": top_doc_str}
 
     norm_view = _build_normalized_params_view(normalized, is_community=is_comm)
@@ -3081,6 +3566,12 @@ def _normalize_and_validate_call_args(
         valid_ops: list[str] = list(spec.get("operations") or [])
         accepted_top: list[str] = sorted({"route", "operation", *spec.get("accepted_params", [])})
         if op_str and valid_ops and op_str not in valid_ops:
+            extra_op_note = (
+                "（download_document 为独立原生工具，local_path 属宿主工作区路径、沙箱不可读，不通过桥接提供；"
+                "读取正文请用 get_document，查补充附件列表请用 list_attachments）"
+                if route == "alphaengine" and op_str == "download_document"
+                else ""
+            )
             err = {
                 "_declared_sources": [],
                 "_sources": [],
@@ -3091,11 +3582,11 @@ def _normalize_and_validate_call_args(
                 "accepted_operations": valid_ops,
                 "accepted_parameters": accepted_top,
                 "error": (
-                    f"[参数错误] 路由 '{route}' 不支持 operation='{op_str}'。"
+                    f"[参数错误] 路由 '{route}' 不支持 operation='{op_str}'{extra_op_note}。"
                     f"支持的操作: {valid_ops}；接受的参数: {accepted_top}。"
                 ),
                 "hint": (
-                    f"请将 operation 改为 {valid_ops} 之一（可调用 catalog(route='{route}') 查看完整参数说明与示例）。"
+                    f"请将 operation 改为 {valid_ops} 之一{extra_op_note}（可调用 catalog(route='{route}') 查看完整参数说明与示例）。"
                 ),
                 "normalized_params": norm_view,
             }
@@ -3106,6 +3597,22 @@ def _normalize_and_validate_call_args(
             k for k, v in normalized.items() if v is not None and k not in allowed_set
         )
         if unknown_top:
+            ae_top_replacements: list[str] = []
+            if route == "alphaengine":
+                if "companies" in unknown_top:
+                    ae_top_replacements.append("companies -> params.company_names")
+                if "industries" in unknown_top:
+                    ae_top_replacements.append("industries -> params.industry_names")
+                if "pages" in unknown_top or "page" in unknown_top:
+                    ae_top_replacements.append(
+                        "page/pages -> params.cursor（search_library 文档检索）或 params.page（list_recording_tasks）"
+                    )
+            elif route == "sec":
+                if "accession" in unknown_top or "accession_number" in unknown_top:
+                    ae_top_replacements.append(
+                        "accession -> params.accession（仅 operation='attachments'）"
+                    )
+            repl_suffix = f" 请改用新参数名：{'; '.join(ae_top_replacements)}。" if ae_top_replacements else ""
             err = {
                 "_declared_sources": [],
                 "_sources": [],
@@ -3115,20 +3622,33 @@ def _normalize_and_validate_call_args(
                 "error_category": "参数错误",
                 "accepted_parameters": accepted_top,
                 "error": (
-                    f"[参数错误] 路由 '{route}'（operation='{op_str or spec.get('default_operation', '')}'）"
-                    f"收到不认识的参数: {unknown_top}。该操作接受的参数: {accepted_top}。"
+                    f"[参数错误] 路由 '{route}'（operation='{eff_op}'）"
+                    f"收到不认识的参数: {unknown_top}。{repl_suffix}该操作接受的参数: {accepted_top}。"
                 ),
                 "hint": (
-                    f"请移除或修正未知参数 {unknown_top}，仅使用 {accepted_top} 中的参数"
+                    f"请移除或修正未知参数 {unknown_top}，{repl_suffix}仅使用 {accepted_top} 中的参数"
                     f"（不确定参数时先查 catalog(route='{route}')）。"
                 ),
                 "normalized_params": norm_view,
             }
             return normalized, norm_view, err
 
-        # Validate unknown nested keys inside `params`
+        # Validate unknown nested keys inside `params` (per-operation for alphaengine and sec)
         if isinstance(normalized.get("params"), dict) and "params" in allowed_set:
-            accepted_nested: list[str] = list(spec.get("accepted_nested_params") or [])
+            if route == "alphaengine":
+                accepted_nested = list(
+                    ALPHAENGINE_OPERATION_NESTED_PARAMS.get(
+                        eff_op, list(spec.get("accepted_nested_params") or [])
+                    )
+                )
+            elif route == "sec":
+                accepted_nested = list(
+                    SEC_OPERATION_NESTED_PARAMS.get(
+                        eff_op, list(spec.get("accepted_nested_params") or [])
+                    )
+                )
+            else:
+                accepted_nested = list(spec.get("accepted_nested_params") or [])
             allowed_nested_set = set(accepted_nested)
             if route in INTERNAL_LIBRARY_ROUTES:
                 allowed_nested_set |= {"document", "doc_id", "id", "document_id"}
@@ -3138,6 +3658,27 @@ def _normalize_and_validate_call_args(
                 if v is not None and k not in allowed_nested_set
             )
             if unknown_nested:
+                ae_nested_replacements: list[str] = []
+                if route == "alphaengine":
+                    if "companies" in unknown_nested:
+                        ae_nested_replacements.append("'companies' 已废弃，请改用 'company_names'")
+                    if "industries" in unknown_nested:
+                        ae_nested_replacements.append(
+                            "'industries' 已废弃，请改用 'industry_names'（list_recording_tasks 用 'industry_ids'）"
+                        )
+                    if "pages" in unknown_nested:
+                        ae_nested_replacements.append(
+                            "'pages' 已废弃，search_library 请改用 'cursor'（list_recording_tasks 用 'page'，list_filters 用 'offset'）"
+                        )
+                    if "page" in unknown_nested:
+                        ae_nested_replacements.append(
+                            f"operation='{eff_op}' 不支持 'page'，文档检索请改用 'cursor'（'page' 仅用于 list_recording_tasks）"
+                        )
+                    if "doc_id" in unknown_nested and eff_op == "get_recording_task":
+                        ae_nested_replacements.append(
+                            "get_recording_task 不接受 'doc_id'，请改用 'roadshow_id'"
+                        )
+                repl_text = f" 替代说明：{'; '.join(ae_nested_replacements)}。" if ae_nested_replacements else ""
                 err = {
                     "_declared_sources": [],
                     "_sources": [],
@@ -3148,18 +3689,18 @@ def _normalize_and_validate_call_args(
                     "accepted_parameters": accepted_top,
                     "accepted_nested_parameters": accepted_nested,
                     "error": (
-                        f"[参数错误] 路由 '{route}' 的 params 收到未知嵌套参数: {unknown_nested}。"
-                        f"params 接受的字段: {accepted_nested}。"
+                        f"[参数错误] 路由 '{route}'（operation='{eff_op}'）的 params 收到未知嵌套参数: {unknown_nested}。"
+                        f"{repl_text}该操作 params 接受的字段: {accepted_nested}。"
                     ),
                     "hint": (
-                        f"请从 params 中移除未知字段 {unknown_nested}，仅使用 {accepted_nested}"
-                        f"（不确定时先查 catalog(route='{route}')）。"
+                        f"请从 params 中移除或替换未知字段 {unknown_nested}。{repl_text}"
+                        f"仅使用 {accepted_nested}（不确定时先查 catalog(route='{route}')）。"
                     ),
                     "normalized_params": norm_view,
                 }
                 return normalized, norm_view, err
 
-        # Validate required parameters aligned with upstream data_gateway.py
+        # Validate required parameters and operation-specific rules aligned with upstream
         eff_op = op_str or str(spec.get("default_operation") or "").strip()
         if route == "cn-hk" and eff_op == "ask":
             # researchdata 1.5 refuses ticker/start/end beside an `ask` (the
@@ -3199,7 +3740,144 @@ def _normalize_and_validate_call_args(
                 "normalized_params": norm_view,
             }
         missing_req: list[str] = []
-        if route == "fred":
+        if route == "alphaengine":
+            p_cur = dict(normalized.get("params")) if isinstance(normalized.get("params"), dict) else {}
+            if eff_op not in ("search_library", "list_recording_tasks"):
+                bad_top_for_op = [
+                    k for k in ("query", "start", "end") if str(normalized.get(k) or "").strip()
+                ]
+                if bad_top_for_op:
+                    err = {
+                        "_declared_sources": [],
+                        "_sources": [],
+                        "ok": False,
+                        "status": "invalid_arguments",
+                        "error_code": "E_BAD_ARGS",
+                        "error_category": "参数错误",
+                        "error": (
+                            f"[参数错误] E_BAD_ARGS: alphaengine 的 operation='{eff_op}' 不接受顶层 {bad_top_for_op}，"
+                            "请将对应字段放入 params（例如 list_filters 必须使用 params.query）。"
+                        ),
+                        "hint": f"请移除顶层 {bad_top_for_op}，改用 params 内字段（如 params.query）后重试。",
+                        "normalized_params": norm_view,
+                    }
+                    return normalized, norm_view, err
+            else:
+                top_q = str(normalized.get("query") or "").strip()
+                nested_q = str(p_cur.get("query") or "").strip()
+                if top_q and nested_q and not _values_equal_for_alias(top_q, nested_q):
+                    err = {
+                        "_declared_sources": [],
+                        "_sources": [],
+                        "ok": False,
+                        "status": "invalid_arguments",
+                        "error_code": "parameter_conflict",
+                        "error_category": "参数错误",
+                        "error": f"[参数错误] 参数冲突：顶层 query={top_q!r} 与 params.query={nested_q!r} 不一致。",
+                        "hint": "请统一只传顶层 query 或 params.query 之一。",
+                        "normalized_params": norm_view,
+                    }
+                    return normalized, norm_view, err
+
+            if eff_op in ("get_document", "get_document_info", "list_attachments"):
+                raw_doc_id_val = p_cur.get("doc_id")
+                doc_id_val = "" if raw_doc_id_val is None else str(raw_doc_id_val)
+                if doc_id_val == "":
+                    missing_req.append("params.doc_id")
+                elif not _is_valid_alphaengine_doc_id(doc_id_val):
+                    err = {
+                        "_declared_sources": [],
+                        "_sources": [],
+                        "ok": False,
+                        "status": "invalid_arguments",
+                        "error_code": "invalid_doc_id",
+                        "error_category": "参数错误",
+                        "error": (
+                            f"[参数错误] params.doc_id={doc_id_val!r} 格式非法：AlphaEngine 文档 ID 是不透明字符串"
+                            "（仅允许字母、数字、下划线与连字符，如 '290001790954279_inst_134249'），拒绝路径、点号、百分号、空白或换行。"
+                        ),
+                        "hint": "请传入 search_library 返回的原始 doc_id（或单层 'alphaengine:<doc_id>'），不要包含 '/'、'.'、'%' 或首尾空白/换行。",
+                        "normalized_params": norm_view,
+                    }
+                    return normalized, norm_view, err
+                if eff_op == "get_document" and "content_field" in p_cur and p_cur["content_field"] is not None:
+                    cf_val = p_cur["content_field"]
+                    if not isinstance(cf_val, str) or cf_val not in _ALPHAENGINE_ALLOWED_CONTENT_FIELDS:
+                        allowed_cf_list = list(_ALPHAENGINE_ALLOWED_CONTENT_FIELDS)
+                        err = {
+                            "_declared_sources": [],
+                            "_sources": [],
+                            "ok": False,
+                            "status": "invalid_arguments",
+                            "error_code": "E_BAD_CONTENT_FIELD",
+                            "error_category": "参数错误",
+                            "accepted_content_fields": allowed_cf_list,
+                            "error": (
+                                f"[参数错误] E_BAD_CONTENT_FIELD: params.content_field={cf_val!r} 不合法；"
+                                f"仅支持 {allowed_cf_list}（默认 'auto'；映射：摘要 → 'digest'/'digest_cn'，"
+                                "要点 → 'main_point'，问答 → 'question_answer'，原文/转录 → 'original_text'；"
+                                "available_content_fields 中的 full_content/text/markdown 仅为长度信息，不能作为 content_field 请求）。"
+                            ),
+                            "hint": (
+                                f"请将 params.content_field 改为 {allowed_cf_list} 之一"
+                                "（摘要用 'digest'/'digest_cn'，要点用 'main_point'，问答用 'question_answer'，原文/转录用 'original_text'）。"
+                            ),
+                            "normalized_params": norm_view,
+                        }
+                        return normalized, norm_view, err
+            elif eff_op == "get_recording_task":
+                if not str(p_cur.get("roadshow_id") or "").strip():
+                    missing_req.append("params.roadshow_id")
+            elif eff_op == "list_filters":
+                ft_val = str(p_cur.get("filter_type") or "categories").strip()
+                if ft_val == "companies" and not str(p_cur.get("query") or "").strip():
+                    missing_req.append("params.query")
+                elif ft_val == "watchlist_stocks" and (
+                    p_cur.get("group_id") is None or str(p_cur.get("group_id")).strip() == ""
+                ):
+                    missing_req.append("params.group_id")
+            elif eff_op == "search_library":
+                effective_query = str(
+                    normalized.get("query") or p_cur.get("query") or ""
+                ).strip()
+                raw_sort = p_cur.get("sort")
+                if raw_sort is not None and str(raw_sort).strip() != "":
+                    sort_val = str(raw_sort).strip()
+                    if sort_val not in ("relevance", "newest"):
+                        err = {
+                            "_declared_sources": [],
+                            "_sources": [],
+                            "ok": False,
+                            "status": "invalid_arguments",
+                            "error_code": "E_BAD_SORT",
+                            "error_category": "参数错误",
+                            "error": f"[参数错误] params.sort={raw_sort!r} 非法，仅支持 'relevance' 或 'newest'。",
+                            "hint": "有关键词检索请传 sort='relevance'；无关键词浏览请传 sort='newest'（或 'relevance'）。",
+                            "normalized_params": norm_view,
+                        }
+                        return normalized, norm_view, err
+                    if effective_query and sort_val != "relevance":
+                        err = {
+                            "_declared_sources": [],
+                            "_sources": [],
+                            "ok": False,
+                            "status": "invalid_arguments",
+                            "error_code": "E_QUERY_SORT",
+                            "error_category": "参数错误",
+                            "error": (
+                                f"[参数错误] E_QUERY_SORT: 有有效关键词（query={effective_query!r}）时仅允许 sort='relevance'，"
+                                "不支持 sort='newest'；无关键词浏览才可使用 sort='newest'。"
+                            ),
+                            "hint": "请将 params.sort 改为 'relevance'（或省略 sort），或去掉 query/ticker 进行无关键词最新浏览。",
+                            "normalized_params": norm_view,
+                        }
+                        return normalized, norm_view, err
+                    p_cur["sort"] = sort_val
+                else:
+                    p_cur["sort"] = "relevance" if effective_query else "newest"
+                normalized["params"] = p_cur
+                norm_view = _build_normalized_params_view(normalized, is_community=is_comm)
+        elif route == "fred":
             for req_k in ("series", "start", "end"):
                 if not str(normalized.get(req_k) or "").strip():
                     missing_req.append(req_k)
@@ -3219,25 +3897,193 @@ def _normalize_and_validate_call_args(
                 if not str(normalized.get("query") or "").strip():
                     missing_req.append("query")
         elif route == "sec":
-            raw_op_orig = str(raw_args.get("operation") or "").strip().lower()
-            if raw_op_orig != "search" and not str(normalized.get("ticker") or "").strip():
-                missing_req.append("ticker")
-            if eff_op == "facts" and not str(normalized.get("concept") or "").strip():
-                missing_req.append("concept")
-            elif eff_op in ("smart-facts", "search-concepts", "search-text") and not str(
-                normalized.get("query") or ""
-            ).strip():
-                missing_req.append("query")
-            elif eff_op == "read-item" and not str(normalized.get("item") or "").strip():
-                missing_req.append("item")
+            sec_req_map = (spec or {}).get("required_params") or {}
+            for req_k in sec_req_map.get(eff_op, ["ticker"]):
+                if not str(normalized.get(req_k) or "").strip():
+                    missing_req.append(req_k)
+
+            sec_op_flags: dict[str, set[str]] = {
+                "query": {"smart-facts", "search-concepts", "search-text"},
+                "concept": {"facts"},
+                "item": {"read-item"},
+                "document": {"attachments"},
+            }
+            for flag_k, flag_ops in sec_op_flags.items():
+                if str(normalized.get(flag_k) or "").strip() and eff_op not in flag_ops:
+                    return normalized, norm_view, {
+                        "_declared_sources": [],
+                        "_sources": [],
+                        "ok": False,
+                        "status": "invalid_arguments",
+                        "error_code": "unsupported_parameters",
+                        "error_category": "参数错误",
+                        "unsupported_parameters": [flag_k],
+                        "error": (
+                            f"[参数错误] SEC {eff_op} 不接受 --{flag_k.replace('_', '-')}"
+                            f"（参数 '{flag_k}' 仅用于 {sorted(flag_ops)}）。"
+                        ),
+                        "hint": f"请从 SEC {eff_op} 调用中移除参数 '{flag_k}'，或切换为支持该参数的操作 {sorted(flag_ops)}。",
+                        "normalized_params": norm_view,
+                    }
+
+            p_sec = normalized.get("params")
+            if isinstance(p_sec, dict):
+                for sec_pk, sec_pv in sorted(p_sec.items()):
+                    if sec_pv is None:
+                        continue
+                    if sec_pk in ("max_chars", "window", "max_matches"):
+                        sec_lim = 100 if sec_pk == "max_matches" else SEC_MAX_CHARS_CEILING
+                        if type(sec_pv) is not int or not (1 <= sec_pv <= sec_lim):
+                            return normalized, norm_view, {
+                                "_declared_sources": [],
+                                "_sources": [],
+                                "ok": False,
+                                "status": "invalid_arguments",
+                                "error_code": "invalid_nested_param_value",
+                                "error_category": "参数错误",
+                                "error": (
+                                    f"[参数错误] SEC {sec_pk} 须为范围内的正整数（1–{sec_lim}，当前为 {sec_pv!r}）。"
+                                ),
+                                "hint": f"请将 params.{sec_pk} 设为 1–{sec_lim} 之间的正整数。",
+                                "normalized_params": norm_view,
+                            }
+                    elif sec_pk == "accession":
+                        if type(sec_pv) is not str or not _SEC_ACCESSION_RE.fullmatch(sec_pv):
+                            return normalized, norm_view, {
+                                "_declared_sources": [],
+                                "_sources": [],
+                                "ok": False,
+                                "status": "invalid_arguments",
+                                "error_code": "invalid_nested_param_value",
+                                "error_category": "参数错误",
+                                "error": (
+                                    f"[参数错误] SEC accession 须为 SEC 完整编号（10-2-6 数字，如 '0001326801-26-000010'，当前为 {sec_pv!r}）。"
+                                ),
+                                "hint": "请传入格式为 NNNNNNNNNN-NN-NNNNNN 的 SEC accession 编号。",
+                                "normalized_params": norm_view,
+                            }
+                    elif sec_pk == "document_type":
+                        if type(sec_pv) is not str or not sec_pv.strip():
+                            return normalized, norm_view, {
+                                "_declared_sources": [],
+                                "_sources": [],
+                                "ok": False,
+                                "status": "invalid_arguments",
+                                "error_code": "invalid_nested_param_value",
+                                "error_category": "参数错误",
+                                "error": f"[参数错误] SEC document_type 须为非空字符串（当前为 {sec_pv!r}）。",
+                                "hint": "请传入非空附件类型字符串（如 'EX-99.1'）。",
+                                "normalized_params": norm_view,
+                            }
+                    elif sec_pk == "statement":
+                        if type(sec_pv) is not str or sec_pv not in SEC_VALID_STATEMENTS:
+                            return normalized, norm_view, {
+                                "_declared_sources": [],
+                                "_sources": [],
+                                "ok": False,
+                                "status": "invalid_arguments",
+                                "error_code": "invalid_nested_param_value",
+                                "error_category": "参数错误",
+                                "error": f"[参数错误] SEC statement 须为 all|income|balance|cash（当前为 {sec_pv!r}）。",
+                                "hint": "请将 params.statement 设为 'all'、'income'、'balance' 或 'cash'。",
+                                "normalized_params": norm_view,
+                            }
+                if (
+                    str(normalized.get("document") or "").strip()
+                    and isinstance(p_sec.get("document_type"), str)
+                    and p_sec["document_type"].strip()
+                ):
+                    return normalized, norm_view, {
+                        "_declared_sources": [],
+                        "_sources": [],
+                        "ok": False,
+                        "status": "invalid_arguments",
+                        "error_code": "parameter_conflict",
+                        "error_category": "参数错误",
+                        "error": "[参数错误] SEC attachments 的 document 与 document_type 不能同时使用。",
+                        "hint": "请只传顶层 document（指定附件文件名）或 params.document_type（指定附件类型如 'EX-99.1'）之一。",
+                        "normalized_params": norm_view,
+                    }
         elif route == "estimates":
             if not str(normalized.get("ticker") or "").strip():
                 missing_req.append("ticker")
+            p_est = normalized.get("params")
+            if isinstance(p_est, dict):
+                if "shares_bn" in p_est and p_est["shares_bn"] is not None:
+                    sb_val = p_est["shares_bn"]
+                    if type(sb_val) not in (int, float) or not math.isfinite(sb_val) or sb_val <= 0:
+                        return normalized, norm_view, {
+                            "_declared_sources": [],
+                            "_sources": [],
+                            "ok": False,
+                            "status": "invalid_arguments",
+                            "error_code": "invalid_nested_param_value",
+                            "error_category": "参数错误",
+                            "error": (
+                                f"[参数错误] estimates params.shares_bn={sb_val!r} 无效："
+                                "shares_bn 须为正数（> 0 的有限数值，不接受布尔值）。"
+                            ),
+                            "hint": "请将 params.shares_bn 设为大于 0 的有限数值（十亿股）。",
+                            "normalized_params": norm_view,
+                        }
+                if "tax" in p_est and p_est["tax"] is not None:
+                    tax_val = p_est["tax"]
+                    if (
+                        type(tax_val) not in (int, float)
+                        or not math.isfinite(tax_val)
+                        or not (0 <= tax_val < 1)
+                    ):
+                        return normalized, norm_view, {
+                            "_declared_sources": [],
+                            "_sources": [],
+                            "ok": False,
+                            "status": "invalid_arguments",
+                            "error_code": "invalid_nested_param_value",
+                            "error_category": "参数错误",
+                            "error": (
+                                f"[参数错误] estimates params.tax={tax_val!r} 无效："
+                                "股数须为正数，税率须在 0–1 之间（0 <= tax < 1 的有限数值，不接受布尔值）。"
+                            ),
+                            "hint": "请将 params.tax 设为 0 <= tax < 1 的有限数值（如 0.16）。",
+                            "normalized_params": norm_view,
+                        }
         elif route == "transcript":
             if not str(normalized.get("ticker") or "").strip():
                 missing_req.append("ticker")
+        elif route == "guidepoint":
+            p_gp = normalized.get("params") if isinstance(normalized.get("params"), dict) else {}
+            eff_gp_q = str(normalized.get("query") or p_gp.get("query") or "").strip()
+            if not eff_gp_q:
+                missing_req.append("query")
+            elif len(eff_gp_q) > 1000:
+                return normalized, norm_view, {
+                    "_declared_sources": [],
+                    "_sources": [],
+                    "ok": False,
+                    "status": "invalid_arguments",
+                    "error_code": "invalid_param_value",
+                    "error_category": "参数错误",
+                    "error": (
+                        f"[参数错误] Guidepoint search_library 需要 1–1000 字符的 query"
+                        f"（合并 ticker 后当前长度为 {len(eff_gp_q)} 字符）。"
+                    ),
+                    "hint": "请将 query 精简到 1000 字符以内后重试。",
+                    "normalized_params": norm_view,
+                }
+        elif route == "company-wiki":
+            p_wiki = normalized.get("params") if isinstance(normalized.get("params"), dict) else {}
+            has_wiki_q = bool(str(normalized.get("query") or "").strip())
+            if (eff_op == "search" and not has_wiki_q) or (
+                eff_op == "topic" and not (has_wiki_q or str(p_wiki.get("tag") or "").strip())
+            ):
+                missing_req.append("query")
 
         if missing_req:
+            wiki_list_note = (
+                "（company-wiki 的 search 必须带 query；若只需按公司列目录，请改用 operation='list', params={'company': ...}）"
+                if route == "company-wiki" and eff_op == "search" and "query" in missing_req
+                else ""
+            )
             err = {
                 "_declared_sources": [],
                 "_sources": [],
@@ -3248,11 +4094,11 @@ def _normalize_and_validate_call_args(
                 "missing_parameters": missing_req,
                 "accepted_parameters": accepted_top,
                 "error": (
-                    f"[参数错误] 路由 '{route}'（operation='{eff_op}'）缺少必填参数: {missing_req}。"
+                    f"[参数错误] 路由 '{route}'（operation='{eff_op}'）缺少必填参数: {missing_req}{wiki_list_note}。"
                     f"该操作接受的参数: {accepted_top}。"
                 ),
                 "hint": (
-                    f"请补齐必填参数 {missing_req} 后重试（可调用 catalog(route='{route}') 查看完整参数格式与示例）。"
+                    f"请补齐必填参数 {missing_req}{wiki_list_note} 后重试（可调用 catalog(route='{route}') 查看完整参数格式与示例）。"
                 ),
                 "normalized_params": norm_view,
             }
@@ -3631,6 +4477,119 @@ def _reason_is_upstream_argument_error(reason: str) -> bool:
     return "e_bad_" in str(reason or "").strip().lower()
 
 
+_GATEWAY_VALIDATION_ERROR_SUBSTRINGS: tuple[str, ...] = (
+    # Literal fragments of the upstream gateway's own ValueError messages
+    # (rd/data_gateway.py, rd/research_library.py, rd/researchdata_mcp.py,
+    # Guidepoint 1.4.1), copied verbatim — f-string messages contribute their
+    # static parts only. Wording here must match upstream exactly; anything
+    # paraphrased never matches and falls through to "上游不可用".
+    "--as-of 只支持 SEC；FRED 用 --vintage，其他源未声明历史可见版本",
+    "--params-json 仅用于研究来源的只读参数",
+    "--vintage 只支持 FRED/ALFRED",
+    "Guidepoint keywords 须为 1–10 个非空字符串；无筛选时省略或传 null",
+    "Guidepoint recency_bias 须为 1–100 的整数或 null",
+    "Guidepoint search_library 的 size 须为 1–30 的整数（以实时 tools/list 为准）",
+    "Guidepoint search_library 需要 1–1000 字符的 query；keywords 不能替代 query",
+    "TMTB/FUNDA AI 只读原文缓存",
+    "accession 须为 SEC 完整编号 XXXXXXXXXX-XX-XXXXXX",
+    "cn-hk ask 的公司和日期请写入 query；结构化 ticker/start/end 用 filings，当前报价用 quote+ticker",
+    "cn-hk filings 不接受 query；使用 ticker/start/end",
+    "cn-hk quote 使用5位港股或6位A股代码",
+    "cn-hk quote 只接受 ticker；当前报价不接受历史日期",
+    "company 与 sector 只能选一个",
+    "document 与 document_type 不能同时使用",
+    "document/offset/max_chars 仅用于 read",
+    "estimates params 仅支持 shares_bn 和 tax",
+    "indexed_since 须为 YYYY-MM-DD 或 UTC ISO 时间",
+    "layer 须为 raw、digest 或 all",
+    "layer=all 需包含 sales-notes；其他来源只有原文层",
+    "limit 须在 1–100",
+    "limit 须在 1–100；timeout 须在 1–600 秒",
+    "media 须为 all、text 或 images",
+    "no_decay 须为布尔值",
+    "offset 超过已存正文长度",
+    "params 仅支持",
+    "params 须为对象",
+    "params-json 必须是 JSON 对象",
+    "params-json 须为对象",
+    "query 与 params-json.query 冲突",
+    "read 不接受日期筛选",
+    "read 只接受 document、offset、max_chars 和 all 的 sources",
+    "read 需要搜索返回的 document_id",
+    "search 需要 query",
+    "search_mode 须为 hybrid 或 keyword",
+    "sender 不能用于含 wiki 的联搜",
+    "sender 筛选仅用于原文层",
+    "shares_bn 须为正数，tax 须为 0≤税率<1",
+    "sources 仅支持 company-wiki、sales-notes、tmtb、funda-ai",
+    "sources 仅用于 all",
+    "start 不能晚于 end",
+    "statement 须为 all|income|balance|cash",
+    "topic 仅用于 company-wiki",
+    "topic 需要 tag 或 query",
+    "wiki 不支持 sender/layer",
+    "wiki 专用筛选需要 sources=[company-wiki]；跨库公司名用 query",
+    "wiki 需要 wiki:<id>",
+    "不在当前分类的可选值中",
+    "不支持 --",
+    "与 params-json.",
+    "主题检索须使用 sort=relevance",
+    "只支持 search/read/list/topic",
+    "只查摘要须用 sales-notes 或 sources=[sales-notes]；联搜附带摘要用 layer=all",
+    "图片读取不使用正文分页参数",
+    "存在未支持的参数",
+    "摘要仅属于 sales-notes",
+    "文档不属于选定 sources",
+    "文档属于 sales-notes",
+    "文档属于 tmtb，请使用对应来源",
+    "日期参数冲突",
+    "日期格式错误",
+    "未登记的只读操作",
+    "未知内部资料参数:",
+    "未知工具或参数格式错误",
+    "未知路由；先运行 catalog",
+    "起止日期倒置",
+    "邮件/TMTB 不支持 wiki 专用筛选；公司名放 query",
+    "需要 --",
+    "需要搜索返回的 mail:/tmtb:/digest: 文档 ID",
+    "非 search_library 操作的参数请通过 params-json 完整传入",
+    "须为范围内的正整数",
+    "须为非空字符串",
+    "；参数不会被静默忽略",
+)
+
+_GATEWAY_VALIDATION_ERROR_PATTERNS: tuple[re.Pattern[str], ...] = (
+    # rd/data_gateway.py _reject_extra_args: "{route_label} 不支持 --{flag}；参数不会被静默忽略"
+    re.compile(r"\S+\s+不支持\s+--[a-z0-9_-]+；参数不会被静默忽略"),
+    # rd/data_gateway.py _sec_params: "SEC {op} 不接受 {field}；参数不会被静默忽略"
+    re.compile(r"SEC\s+\S+\s+不接受\s+[a-z_]+；参数不会被静默忽略"),
+    # rd/data_gateway.py _sec_params: "SEC {op} params 仅支持 [...]"
+    re.compile(r"SEC\s+\S+\s+params\s+仅支持\s+\["),
+    # rd/data_gateway.py _merge_gateway_arg: "{name} 与 params-json.{field} 冲突"
+    re.compile(r"\S+\s+与\s+params-json\.\S+\s+冲突"),
+    # researchdata_mcp.py: "{rid} 不支持 {op}；可用：[...]"
+    re.compile(r"\S+\s+不支持\s+\S+；可用：\["),
+    # researchdata_mcp.py schema checks: "{key} 超出范围"
+    re.compile(r"\b(?:route|category|params|mode|operation|ticker|query|series|concept|item|document|form|dataset|start|end|as_of|vintage|limit|offset|max_chars|timeout)\s+超出范围"),
+    # researchdata_mcp.py: "{key} 类型错误" — STRING_FIELDS plus the integer and
+    # routing arguments it type-checks
+    re.compile(r"\b(?:route|category|params|mode|operation|ticker|query|series|concept|item|document|form|dataset|start|end|as_of|vintage|limit|offset|max_chars|timeout)\s+类型错误"),
+    # researchdata_mcp.py schema checks: "缺少 {key}"; data_gateway.py catalog: "分类必须为 [...]"
+    re.compile(r"缺少\s+(?:route|category|params|mode|operation|ticker|query|series|concept|item|document|form|dataset|start|end|as_of|vintage|limit|offset|max_chars|timeout)\b|分类必须为"),
+)
+
+
+def _is_known_gateway_validation_error(err_text: str) -> bool:
+    """Return True when `err_text` matches an exact upstream gateway/library validation ValueError."""
+    if not err_text:
+        return False
+    if any(sub in err_text for sub in _GATEWAY_VALIDATION_ERROR_SUBSTRINGS):
+        return True
+    if any(pat.search(err_text) for pat in _GATEWAY_VALIDATION_ERROR_PATTERNS):
+        return True
+    return False
+
+
 def _classify_error_category_and_hint(
     tool_name: str,
     route: str,
@@ -3661,6 +4620,31 @@ def _classify_error_category_and_hint(
     # only on their own leg; split them from the other parameter-error signals
     # so a merged multi-source failure is not labeled by one leg's E_BAD_*.
     e_bad_signal = "e_bad_" in err_lower or err_code.startswith("e_bad_")
+    ae_query_sort = err_code == "e_query_sort" or "e_query_sort" in err_lower
+    ae_scope_conflict = err_code == "e_scope_conflict" or "e_scope_conflict" in err_lower
+    ae_cursor_filter_mismatch = (
+        err_code == "e_cursor_filter_mismatch" or "e_cursor_filter_mismatch" in err_lower
+    )
+    ae_cursor_expired = err_code == "e_cursor_expired" or "e_cursor_expired" in err_lower
+    ae_upstream_pagination = (
+        err_code in ("e_upstream_cursor", "e_upstream_page")
+        or "e_upstream_cursor" in err_lower
+        or "e_upstream_page" in err_lower
+    )
+    ae_upstream_response = (
+        err_code in ("e_upstream_attachments", "e_upstream_response")
+        or "e_upstream_attachments" in err_lower
+        or "e_upstream_response" in err_lower
+    )
+    ae_desktop_token_expired = (
+        err_code == "e_desktop_token_expired" or "e_desktop_token_expired" in err_lower
+    )
+    ae_desktop_no_module_page = (
+        err_code == "e_desktop_no_module_page" or "e_desktop_no_module_page" in err_lower
+    )
+    ae_desktop_not_running = (
+        err_code == "e_desktop_not_running" or "e_desktop_not_running" in err_lower
+    )
     # The researchdata MCP server's own field validation (a limit past the
     # upstream cap, a wrong type) is a caller mistake, not an outage — the
     # upstream message names the field, so the hint carries it.
@@ -3668,6 +4652,7 @@ def _classify_error_category_and_hint(
         "mcp_validation_invalid_field" in err_lower
         or err_code.startswith("mcp_validation")
     )
+    gateway_validation = _is_known_gateway_validation_error(err_text)
     other_param_signal = (
         status in ("invalid_arguments",)
         or err_code
@@ -3678,8 +4663,17 @@ def _classify_error_category_and_hint(
             "invalid_operation",
             "invalid_route",
             "missing_required_parameters",
+            "invalid_doc_id",
+            "invalid_param_value",
+            "invalid_nested_param_value",
+            "unsupported_parameters",
         )
+        or ae_query_sort
+        or ae_scope_conflict
+        or ae_cursor_filter_mismatch
+        or ae_cursor_expired
         or mcp_field_validation
+        or gateway_validation
         or "参数" in err_text
         or "未知" in err_text
         or "alphaengine 文档" in err_lower
@@ -3717,42 +4711,9 @@ def _classify_error_category_and_hint(
     xueqiu_login_expired = "雪球" in err_text and (
         "用户未登录" in err_text or "cookie 缺失或已过期" in err_lower
     )
-
-    if existing_cat in ("参数错误", "上游不可用", "权限或额度", "没有匹配"):
-        category = existing_cat
-    elif sec_no_match:
-        # An unknown concept/attachment/filing/item/accession found nothing;
-        # the upstream answered, so neither "参数错误" nor "上游暂不可用，可重试" is the fix.
-        category = "没有匹配"
-    elif ae_doc_not_found:
-        category = "没有匹配"
-    elif other_param_signal or e_bad_signal or source_name_unresolved:
-        _succeeded, failed_legs = (
-            _collect_multi_source_health(payload) if route == "all" else ([], [])
-        )
-        if failed_legs:
-            # Classify each failed leg individually first: a mixed fan-out (one
-            # parameter-error leg and one timeout/outage leg, even when the
-            # parameter error says "E_BAD_ARGS: 参数...") is only a whole-call
-            # parameter error when every failed leg is a parameter error.
-            leg_cats = {
-                name: _classify_error_category_and_hint(
-                    tool_name,
-                    name if name in ROUTE_CONTRACT_SPECS else route,
-                    operation,
-                    {"error": reason},
-                )[0]
-                for name, reason in failed_legs
-            }
-            if all(cat == "参数错误" for cat in leg_cats.values()):
-                category = "参数错误"
-            else:
-                payload["leg_categories"] = leg_cats
-                category = "上游不可用"
-        else:
-            category = "参数错误"
-    elif (
-        status
+    auth_or_quota_signal = (
+        ae_desktop_token_expired
+        or status
         in (
             "paid_source_not_allowed",
             "handoff_filtered",
@@ -3762,7 +4723,14 @@ def _classify_error_category_and_hint(
             "quota_exceeded",
             "rate_limited",
         )
-        or err_code in ("paid_source_not_allowed", "handoff_filtered")
+        or err_code
+        in (
+            "paid_source_not_allowed",
+            "handoff_filtered",
+            "unauthorized",
+            "forbidden",
+            "auth_expired",
+        )
         or bool(re.search(r"\b(?:401|403|429)\b", err_lower))
         or any(
             tok in err_lower
@@ -3788,6 +4756,10 @@ def _classify_error_category_and_hint(
                 "无权访问",
                 "权限不足",
                 "没有权限",
+                "未授权",
+                "需要授权",
+                "授权已过期",
+                "授权失效",
                 "额度已达上限",
                 "额度已用完",
                 "额度已耗尽",
@@ -3795,12 +4767,50 @@ def _classify_error_category_and_hint(
                 "配额已达上限",
                 "配额已用完",
                 "登录已过期",
+                "登录失效",
+                "未登录",
                 "需要登录",
+                "请先登录",
             )
         )
         or xueqiu_login_expired
-    ):
+    )
+
+    _succeeded, failed_legs = (
+        _collect_multi_source_health(payload) if route == "all" else ([], [])
+    )
+
+    if existing_cat in ("参数错误", "上游不可用", "权限或额度", "没有匹配"):
+        category = existing_cat
+    elif route == "all" and failed_legs:
+        leg_cats = {
+            name: _classify_error_category_and_hint(
+                tool_name,
+                name if name in ROUTE_CONTRACT_SPECS else route,
+                operation,
+                {"error": reason},
+            )[0]
+            for name, reason in failed_legs
+        }
+        if len(set(leg_cats.values())) == 1:
+            category = next(iter(leg_cats.values()))
+        else:
+            payload["leg_categories"] = leg_cats
+            category = "上游不可用"
+    elif sec_no_match:
+        # An unknown concept/attachment/filing/item/accession found nothing;
+        # the upstream answered, so neither "参数错误" nor "上游暂不可用，可重试" is the fix.
+        category = "没有匹配"
+    elif ae_doc_not_found:
+        category = "没有匹配"
+    elif status != "invalid_arguments" and auth_or_quota_signal:
         category = "权限或额度"
+    elif other_param_signal or e_bad_signal or source_name_unresolved:
+        category = "参数错误"
+    elif auth_or_quota_signal:
+        category = "权限或额度"
+    elif ae_upstream_pagination or ae_upstream_response or ae_desktop_no_module_page or ae_desktop_not_running:
+        category = "上游不可用"
     elif status in ("empty", "no_match") and not payload.get("error"):
         category = "没有匹配"
     else:
@@ -3811,10 +4821,30 @@ def _classify_error_category_and_hint(
         return category, existing_hint
 
     if category == "参数错误":
-        if source_name_unresolved:
+        if ae_query_sort:
             hint = (
-                "来源名无法唯一匹配；请先调用 list_filters(filter_type=sources) 获取准确的来源名，"
-                "再用准确名称重查。"
+                "有关键词的主题检索必须使用 sort='relevance'；无关键词浏览才可使用 sort='newest'。"
+                "请将 params.sort 改为 'relevance'（或去掉关键词）后重试。"
+            )
+        elif ae_scope_conflict:
+            hint = (
+                "机构会议（meeting_scope='institution'）与个人会议（meeting_scope='personal'）必须分开查，"
+                "且不能与非会议文档类别混用；请拆分调用后重试。"
+            )
+        elif ae_cursor_filter_mismatch:
+            hint = (
+                "cursor 翻页时必须保持与上一页完全相同的 query 与筛选条件；"
+                "请恢复原筛选条件继续翻页，或去掉 cursor 从第一页重新起始。"
+            )
+        elif ae_cursor_expired:
+            hint = (
+                "游标（cursor）已失效或过期；请去掉 cursor 从第一页重新起始检索，"
+                "并按完整 doc_id 去重，禁止重复提交旧 cursor。"
+            )
+        elif source_name_unresolved:
+            hint = (
+                "来源名无法唯一匹配；请先调用 list_filters(filter_type=sources) 词典获取准确的来源名称，"
+                "或改传 source_ids 重查。"
             )
         elif mcp_field_validation:
             hint = (
@@ -3829,7 +4859,13 @@ def _classify_error_category_and_hint(
         else:
             hint = "请先调用 catalog() 查看目标路由支持的 operation 与参数列表，修正参数后重试。"
     elif category == "权限或额度":
-        if xueqiu_login_expired:
+        if ae_desktop_token_expired:
+            hint = (
+                "AlphaEngine Desktop 登录已失效，请在客户端内重新登录并刷新模块页；"
+                "当前请切换替代数据源（如内部库 company-wiki/sales-notes/tmtb 或 SEC 公告），"
+                "并在报告中如实写明该数据源因登录态失效未能取数，禁止写成“没有相关信息”。"
+            )
+        elif xueqiu_login_expired:
             hint = (
                 "雪球登录态失效（Cookie 缺失或已过期）；停止继续请求雪球评论，"
                 "改用其他社区来源（employee / last30days / x-timeline），"
@@ -3863,10 +4899,31 @@ def _classify_error_category_and_hint(
                 f"路由 '{route or tool_name}' 未检索到匹配记录；请放宽关键词 query、扩大时间范围 start/end 或换用其他路由重试。"
             )
     else:
-        hint = (
-            f"路由 '{route or tool_name}' 上游服务暂不可用或执行超时；可缩小查询范围重试一次或切换备用路由，"
-            "若仍失败必须在报告中如实披露该数据源取数失败，不得当成“没有数据”或“没有相关信息”。"
-        )
+        if ae_upstream_pagination:
+            hint = (
+                "AlphaEngine 上游分页异常（游标未推进或录制任务分页提前返回空页）；"
+                "请将该来源保持为失败/未完成状态，不得把已返回数据当作全量或无匹配数据，也不要用同一游标死循环重试。"
+            )
+        elif ae_upstream_response:
+            hint = (
+                "AlphaEngine 上游响应异常（附件列表或接口响应异常）；请保持该操作为失败状态，"
+                "稍后重试或切换其他数据源并在报告中如实说明，不得当成“没有数据”。"
+            )
+        elif ae_desktop_no_module_page:
+            hint = (
+                "AlphaEngine Desktop 已启动但未打开模块页；请在客户端内点开任意模块页（如纪要中心），不能一概提示重新登录；"
+                "当前可切换备用数据源并在报告中如实披露，不得当成“没有数据”或“没有相关信息”。"
+            )
+        elif ae_desktop_not_running:
+            hint = (
+                "AlphaEngine Desktop 未启动；请先启动 Desktop 并打开模块页；"
+                "当前可切换备用数据源并在报告中如实披露，不得当成“没有数据”或“没有相关信息”。"
+            )
+        else:
+            hint = (
+                f"路由 '{route or tool_name}' 上游服务暂不可用或执行超时；可缩小查询范围重试一次或切换备用路由，"
+                "若仍失败必须在报告中如实披露该数据源取数失败，不得当成“没有数据”或“没有相关信息”。"
+            )
     return category, hint
 
 
@@ -3886,6 +4943,8 @@ def _collect_multi_source_health(payload: dict[str, Any]) -> tuple[list[str], li
             seen.add(name)
             if isinstance(s_val, dict):
                 st = str(s_val.get("status") or s_val.get("state") or "").strip().lower()
+                if st == "skipped":
+                    continue
                 if s_val.get("ok") is False or s_val.get("isError") is True or bool(s_val.get("error")) or st in _FAILURE_SOURCE_STATES:
                     reason = str(s_val.get("error") or s_val.get("reason") or st or "failed").strip()
                     failed.append((name, reason))
@@ -3893,6 +4952,8 @@ def _collect_multi_source_health(payload: dict[str, Any]) -> tuple[list[str], li
                     succeeded.append(name)
             elif isinstance(s_val, str):
                 st = s_val.strip().lower()
+                if st == "skipped":
+                    continue
                 if st in _FAILURE_SOURCE_STATES:
                     failed.append((name, st))
                 elif st in ("ok", "empty", "no_match", "no_results"):
@@ -3904,6 +4965,8 @@ def _collect_multi_source_health(payload: dict[str, Any]) -> tuple[list[str], li
         sub_obj = payload.get(sub_key)
         if isinstance(sub_obj, dict):
             st = str(sub_obj.get("status") or "").strip().lower()
+            if st == "skipped":
+                continue
             if sub_obj.get("ok") is False or sub_obj.get("isError") is True or bool(sub_obj.get("error")) or st in _FAILURE_SOURCE_STATES:
                 reason = str(sub_obj.get("error") or sub_obj.get("reason") or st or "failed").strip()
                 failed.append((sub_key, reason))
@@ -3924,9 +4987,43 @@ def _has_disqualifying_error_signals(payload: dict[str, Any]) -> bool:
     return False
 
 
+def _extract_transcript_coverage(payload: dict[str, Any]) -> dict[str, Any] | None:
+    """Extract the `coverage` dict from a `transcript` payload (`payload.coverage` or `payload.data.coverage`)."""
+    cov = payload.get("coverage")
+    if isinstance(cov, dict):
+        return cov
+    data_val = payload.get("data")
+    if isinstance(data_val, dict):
+        d_cov = data_val.get("coverage")
+        if isinstance(d_cov, dict):
+            return d_cov
+        sc_val = data_val.get("structuredContent")
+        if isinstance(sc_val, dict) and isinstance(sc_val.get("coverage"), dict):
+            return sc_val["coverage"]
+    return None
+
+
+def _extract_transcript_candidates(payload: dict[str, Any]) -> list[Any]:
+    """Extract the candidate list from a `transcript` payload (`data.transcripts` / `transcripts` / `results`)."""
+    data_val = payload.get("data")
+    if isinstance(data_val, dict):
+        for k in ("transcripts", "results", "items"):
+            v = data_val.get(k)
+            if isinstance(v, list):
+                return v
+    for k in ("transcripts", "results", "items"):
+        v = payload.get(k)
+        if isinstance(v, list):
+            return v
+    return []
+
+
 def _is_transcript_no_match_payload(payload: dict[str, Any]) -> bool:
-    """Return True ONLY when a `transcript` response is a confirmed empty result (`ok: True`) or explicit `alphaengine_no_match`."""
+    """Return True ONLY when a `transcript` response is a confirmed empty result (`ok: True`) or explicit `alphaengine_no_match` with complete coverage."""
     if _has_disqualifying_error_signals(payload):
+        return False
+    cov = _extract_transcript_coverage(payload)
+    if isinstance(cov, dict) and cov.get("complete") is False:
         return False
     data_dict = payload.get("data") if isinstance(payload.get("data"), dict) else {}
     fb_obj = payload.get("fallback") if "fallback" in payload else data_dict.get("fallback")
@@ -3967,7 +5064,7 @@ def _is_transcript_no_match_payload(payload: dict[str, Any]) -> bool:
 def _is_empty_non_community_payload(
     tool_name: str, route: str, operation: str, payload: dict[str, Any]
 ) -> bool:
-    """Return True ONLY when a `finance`/`macro`/`research` payload succeeded with 0 records and no sub-source failures."""
+    """Return True ONLY when a `finance`/`macro`/`research` payload succeeded with 0 records, `has_more` is not True, `status` is not `partial`, and no sub-source failed."""
     if tool_name not in ("finance", "macro", "research"):
         return False
     if route == "market-regime":
@@ -3978,17 +5075,42 @@ def _is_empty_non_community_payload(
         return False
     if payload.get("ok") is not True:
         return False
-    if operation in ("read", "get_document", "auth_status", "list_filters"):
+    op_lower = (operation or "").strip().lower()
+    if op_lower in (
+        "read",
+        "get_document",
+        "read_document",
+        "get",
+        "get_document_info",
+        "list_attachments",
+        "get_recording_status",
+        "get_recording_task",
+        "auth_status",
+        "status",
+        "list_filters",
+        "filters",
+    ):
         return False
-    status = str(payload.get("status") or "").strip().lower()
-    if status in ("no_match", "empty"):
-        return True
     data_dict = payload.get("data") if isinstance(payload.get("data"), dict) else {}
     sc_dict = (
         source_identity._unwrap_mcp_proxy_payload(data_dict)
         if isinstance(data_dict, dict) and data_dict
         else {}
     )
+    ae_leg = payload.get("alphaengine") if isinstance(payload.get("alphaengine"), dict) else {}
+    for container in (payload, data_dict, sc_dict if isinstance(sc_dict, dict) else {}, ae_leg):
+        if not isinstance(container, dict):
+            continue
+        if container.get("has_more") is True:
+            return False
+        if str(container.get("status") or "").strip().lower() == "partial":
+            return False
+        cov = container.get("coverage")
+        if isinstance(cov, dict) and cov.get("complete") is False:
+            return False
+    status = str(payload.get("status") or "").strip().lower()
+    if status in ("no_match", "empty"):
+        return True
     for container in (payload, data_dict, sc_dict if isinstance(sc_dict, dict) else {}):
         if not isinstance(container, dict):
             continue
@@ -4086,6 +5208,60 @@ def _apply_error_and_empty_contract(
         payload["hint"] = hint
         return
 
+    # Bounded incomplete scan on `transcript` (`coverage.complete is False`) -> never `no_matching_transcripts`
+    if tool_name == "research" and route == "transcript":
+        tr_cov = _extract_transcript_coverage(payload)
+        if isinstance(tr_cov, dict) and tr_cov.get("complete") is False:
+            candidates = _extract_transcript_candidates(payload)
+            raw_records_sc = tr_cov.get("records_scanned")
+            records_sc = (
+                raw_records_sc
+                if isinstance(raw_records_sc, int) and not isinstance(raw_records_sc, bool)
+                else None
+            )
+            raw_pages_sc = tr_cov.get("pages_scanned")
+            pages_sc = (
+                raw_pages_sc
+                if isinstance(raw_pages_sc, int) and not isinstance(raw_pages_sc, bool)
+                else None
+            )
+            payload["ok"] = True
+            payload["status"] = "partial"
+            payload.pop("empty_reason", None)
+            payload["coverage"] = tr_cov
+            if isinstance(tr_cov.get("warnings"), list) and tr_cov["warnings"]:
+                payload.setdefault("warnings", list(tr_cov["warnings"]))
+            if len(candidates) > 0:
+                if isinstance(payload.get("data"), dict):
+                    payload["data"]["ok"] = True
+                    payload["data"]["coverage"] = tr_cov
+                scan_clause = f"（扫描了 {records_sc} 条）" if records_sc is not None else ""
+                payload["hint"] = (
+                    f"已找到 {len(candidates)} 篇候选，但检索未覆盖完整期间{scan_clause}，最新一场可能不在其中；"
+                    "可用 continuation 参数续查（请将 coverage.continuation_params 交给 research(route='alphaengine', operation='search_library', ...)，不要传回 transcript）。"
+                )
+            else:
+                payload.pop("fallback", None)
+                if isinstance(payload.get("data"), dict):
+                    payload["data"]["ok"] = True
+                    payload["data"].pop("fallback", None)
+                    payload["data"].setdefault("transcripts", [])
+                    payload["data"]["coverage"] = tr_cov
+                if pages_sc is not None and records_sc is not None:
+                    scan_desc = f"AlphaEngine 已扫描前 {pages_sc} 页 / {records_sc} 条，coverage.complete=false，"
+                elif records_sc is not None:
+                    scan_desc = f"AlphaEngine 已扫描 {records_sc} 条，coverage.complete=false，"
+                elif pages_sc is not None:
+                    scan_desc = f"AlphaEngine 已扫描前 {pages_sc} 页，coverage.complete=false，"
+                else:
+                    scan_desc = "coverage.complete=false，"
+                payload["hint"] = (
+                    f"本次有界检索未命中（{scan_desc}尚未扫完全量，不能据此判为无匹配）；"
+                    "请将 coverage.continuation_params 交给 research(route='alphaengine', operation='search_library', ...) 继续翻页检索（不要传回 transcript），"
+                    "或缩小 start/end 窗口、用 | 分隔中英文公司名重试。"
+                )
+            return
+
     # True no-match on non-community routes (`research`, `finance`, `macro`) -> `ok: True` + `empty_reason`
     if tool_name in ("finance", "macro", "research") and _is_empty_non_community_payload(
         tool_name, route, operation, payload
@@ -4111,6 +5287,68 @@ def _apply_error_and_empty_contract(
                     f"路由 '{route}' 查询成功但无匹配记录；可调整 query 关键词、扩大 start/end 时间范围或换路由重试。"
                 )
         return
+
+    # Non-empty / special operation shape handling on successful responses
+    if tool_name in ("finance", "macro", "research") and payload.get("ok") is True:
+        payload.pop("empty_reason", None)
+        data_dict = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+        sc_dict = (
+            source_identity._unwrap_mcp_proxy_payload(data_dict)
+            if isinstance(data_dict, dict) and data_dict
+            else {}
+        )
+        sc_obj = sc_dict if isinstance(sc_dict, dict) else {}
+        op_lower = (operation or "").strip().lower()
+
+        if any(
+            isinstance(c, dict) and str(c.get("status") or "").strip().lower() == "partial"
+            for c in (payload, data_dict, sc_obj)
+        ):
+            payload["status"] = "partial"
+            for partial_k in ("warnings", "coverage", "image_status", "field_status"):
+                for c in (data_dict, sc_obj):
+                    if isinstance(c, dict) and partial_k in c and c[partial_k] is not None and partial_k not in payload:
+                        payload[partial_k] = c[partial_k]
+
+        has_more_flag = any(
+            isinstance(c, dict) and c.get("has_more") is True
+            for c in (payload, data_dict, sc_obj)
+        )
+        results_list = next(
+            (
+                c.get("results")
+                for c in (sc_obj, data_dict, payload)
+                if isinstance(c, dict) and isinstance(c.get("results"), list)
+            ),
+            None,
+        )
+        if has_more_flag and isinstance(results_list, list) and len(results_list) == 0:
+            if str(payload.get("status") or "").strip().lower() in ("empty", "no_match", ""):
+                payload["status"] = "ok"
+            payload.setdefault(
+                "hint",
+                "当前页返回 results=[] 但 has_more=true（后续页仍有数据），请继续携带返回的 cursor（或 next_page）翻页，不得判为无匹配记录。",
+            )
+
+        if route == "alphaengine":
+            if op_lower in ("get_document", "read", "read_document", "get"):
+                for meta_k in (
+                    "content_field",
+                    "available_content_fields",
+                    "warning",
+                    "next_offset",
+                    "complete",
+                    "content_sha256",
+                ):
+                    if meta_k in sc_obj and sc_obj[meta_k] is not None and meta_k not in payload:
+                        payload[meta_k] = sc_obj[meta_k]
+            elif op_lower == "list_attachments":
+                atts = sc_obj.get("attachments")
+                if isinstance(atts, list) and len(atts) == 0:
+                    payload.setdefault(
+                        "note",
+                        "attachments=[] 仅表示没有补充附件，不表示文档不存在；读取正文请调用 get_document。",
+                    )
 
 _TICKER_RE = re.compile(r"^[A-Za-z0-9._\-]{1,32}$")
 _POST_ID_RE = re.compile(r"^[0-9]{1,32}$")
@@ -4511,7 +5749,8 @@ class ResearchDataBridge:
     """HTTP-to-stdio MCP bridge for OpenClaw `researchdata`.
 
     Normalizes `params.offset` (>= 0) and `params.max_chars` (1..30000), guides internal-library
-    document IDs vs numeric AlphaEngine IDs, and prevents topic queries from derailing `transcript`.
+    document IDs vs opaque string AlphaEngine IDs (including `_inst_` suffixes), and prevents
+    topic queries from derailing `transcript`.
     """
 
     CATALOG_DESCRIPTION_SUFFIX: str = CATALOG_DESCRIPTION_SUFFIX
@@ -4547,6 +5786,7 @@ class ResearchDataBridge:
         self._archive_proc: Any = None
         self._archive_watch_task: asyncio.Task[Any] | None = None
         self._archive_last_status: dict[str, Any] = {}
+        self._last_ae_fanout_limit_clamped: list[int] | None = None
         if not getattr(cfg, "admin_token", ""):
             logger.warning(
                 "DALTON_BRIDGE_ADMIN_TOKEN is not set (checked env and ~/.config/dalton/researchdata-bridge.env); "
@@ -4998,12 +6238,14 @@ class ResearchDataBridge:
         - `data_gateway.py` sets `accepted['alphaengine'] = {'query', 'start', 'end'}` and rejects
           `--ticker` (and `series`/`concept`/`item`/`document`/`form`/`dataset`/`as_of`/`vintage`)
           with ValueError; if `ticker` was provided on `all`, fold it into `query`.
-        - `data_gateway.py` and `config/data_sources.json` restrict `alphaengine` operations to
-          `['search_library', 'get_document', 'auth_status', 'list_filters']`, so `operation` is
-          mapped to `'search_library'`.
+        - `data_gateway.py` and `config/data_sources.json` route `alphaengine` search calls to
+          `operation='search_library'` (one of the 9 supported bridge operations:
+          `search_library`, `get_document`, `get_document_info`, `list_attachments`,
+          `list_recording_tasks`, `get_recording_status`, `get_recording_task`,
+          `list_filters`, `auth_status`).
         - `alphaengine-mcp/server.mjs` (`requireDatePair`) requires `start` (`date_from`) and `end`
           (`date_to`) as a pair; a lone `start` is closed to `end=_bridge_today()` by the
-          shared window rules (same helper as a direct call).
+          shared window rules (same helper as a direct call), and `limit` is capped at 50.
         - Local-library `params` keys (`sources`, `layer`, `search_mode`, etc.) are omitted because
           `search_library` sets `additionalProperties: false`.
         - Timeout is capped at `FANOUT_ALPHAENGINE_TIMEOUT_S` (60s).
@@ -5034,9 +6276,12 @@ class ResearchDataBridge:
         # gateway refused the resulting start > end window.
         ae_win_err = _normalize_date_window("alphaengine", ae_args)
 
+        self._last_ae_fanout_limit_clamped = None
         limit = arguments.get("limit")
         if isinstance(limit, int) and not isinstance(limit, bool) and limit > 0:
-            ae_args["limit"] = min(limit, 100)
+            if limit > 50:
+                self._last_ae_fanout_limit_clamped = [limit, 50]
+            ae_args["limit"] = min(limit, 50)
 
         ae_args["timeout"] = self._compute_fanout_timeout(
             arguments, FANOUT_ALPHAENGINE_TIMEOUT_S
@@ -5099,7 +6344,9 @@ class ResearchDataBridge:
             # checked); a lone end stays lone — Guidepoint, unlike AlphaEngine,
             # accepts half a window. The entry point already validated the
             # dates; the error, should one still arise, is returned, not dropped.
-            gp_win_err = _normalize_date_window("guidepoint", gp_args)
+            win_err_top = _normalize_date_window("guidepoint", gp_args)
+            if win_err_top is not None:
+                gp_win_err = gp_win_err or win_err_top
 
         limit = arguments.get("limit")
         if isinstance(limit, int) and not isinstance(limit, bool) and limit > 0:
@@ -5107,16 +6354,21 @@ class ResearchDataBridge:
 
         if isinstance(raw_params, dict):
             gp_params: dict[str, Any] = {}
-            raw_keywords = raw_params.get("keywords")
-            if isinstance(raw_keywords, list):
-                kw = [str(k).strip() for k in raw_keywords if str(k).strip()]
-                if kw:
-                    gp_params["keywords"] = kw
-            elif isinstance(raw_keywords, str) and raw_keywords.strip():
-                # Guidepoint's native API takes a list; a bare string is a 400.
-                gp_params["keywords"] = [raw_keywords.strip()]
-            if isinstance(raw_params.get("recency_bias"), str) and raw_params["recency_bias"].strip():
-                gp_params["recency_bias"] = raw_params["recency_bias"].strip()
+            gp_check_dict: dict[str, Any] = {}
+            if "keywords" in raw_params:
+                gp_check_dict["keywords"] = raw_params["keywords"]
+            if "recency_bias" in raw_params:
+                gp_check_dict["recency_bias"] = raw_params["recency_bias"]
+            if gp_check_dict:
+                norm_view = _build_normalized_params_view(arguments)
+                gp_param_err = _normalize_guidepoint_params(gp_check_dict, norm_view)
+                if gp_param_err is not None:
+                    gp_win_err = gp_win_err or gp_param_err
+                else:
+                    if "keywords" in gp_check_dict:
+                        gp_params["keywords"] = gp_check_dict["keywords"]
+                    if "recency_bias" in gp_check_dict:
+                        gp_params["recency_bias"] = gp_check_dict["recency_bias"]
             for nested_date_k, as_field in (("start_date", "start"), ("end_date", "end")):
                 raw_nd = raw_params.get(nested_date_k)
                 if raw_nd is not None and str(raw_nd).strip():
@@ -5285,6 +6537,7 @@ class ResearchDataBridge:
             if isinstance(inner, dict)
             else source_identity._unwrap_mcp_proxy_payload(ae_payload)
         )
+        meta_dict: dict[str, Any] = sc if isinstance(sc, dict) else {}
         raw_items = (
             sc.get("results")
             if isinstance(sc, dict) and isinstance(sc.get("results"), list)
@@ -5297,6 +6550,8 @@ class ResearchDataBridge:
                 if isinstance(top_sc, dict) and isinstance(top_sc.get("results"), list)
                 else []
             )
+            if isinstance(top_sc, dict):
+                meta_dict = top_sc
 
         ae_items: list[dict[str, Any]] = []
         for item in raw_items:
@@ -5323,20 +6578,43 @@ class ResearchDataBridge:
                 norm["published_at"] = norm["publish_time"]
             ae_items.append(norm)
 
-        return {
+        out_outcome: dict[str, Any] = {
             "ok": True,
             "status": "ok",
             "route": "alphaengine",
             "reason": None,
-            "count": len(ae_items),
+            "count": (
+                int(meta_dict.get("returned"))
+                if isinstance(meta_dict.get("returned"), int)
+                and not isinstance(meta_dict.get("returned"), bool)
+                else len(ae_items)
+            ),
             "results": ae_items,
             "raw_payload": ae_payload,
+            "cursor": meta_dict.get("cursor"),
+            "has_more": bool(meta_dict.get("has_more")) if "has_more" in meta_dict else False,
+            "total_upstream": meta_dict.get("total_upstream"),
+            "filters": dict(meta_dict["filters"]) if isinstance(meta_dict.get("filters"), dict) else {},
         }
+        if getattr(self, "_last_ae_fanout_limit_clamped", None):
+            out_outcome["limit_clamped"] = list(self._last_ae_fanout_limit_clamped)
+        return out_outcome
 
     async def _run_guidepoint_fanout(
         self, req_id: Any, gp_args: dict[str, Any], gp_budget_s: float
     ) -> dict[str, Any]:
         """Run the parallel `route='guidepoint'` search and normalize its result or failure state."""
+        gp_query_str = str(gp_args.get("query") or "")
+        if len(gp_query_str) > 1000:
+            return {
+                "ok": True,
+                "status": "skipped",
+                "route": "guidepoint",
+                "reason": "query 超过 Guidepoint 1000 字上限，本腿未执行",
+                "count": 0,
+                "results": [],
+                "raw_payload": None,
+            }
         gp_timeout = int(gp_args.get("timeout") or FANOUT_GUIDEPOINT_TIMEOUT_S)
         gp_rpc_req = {
             "jsonrpc": "2.0",
@@ -5547,6 +6825,41 @@ class ResearchDataBridge:
             else {"failed": False, "error": "", "status": ""}
         )
         ae_ok = bool(ae_outcome.get("ok")) and not bool(ae_raw_unwrapped["failed"])
+        ae_sc = (
+            source_identity._unwrap_mcp_proxy_payload(raw_ae_check)
+            if isinstance(raw_ae_check, dict)
+            else {}
+        )
+        if not isinstance(ae_sc, dict):
+            ae_sc = {}
+        ae_cursor = (
+            ae_outcome.get("cursor")
+            if "cursor" in ae_outcome
+            else ae_sc.get("cursor")
+        )
+        ae_has_more = (
+            bool(ae_outcome.get("has_more"))
+            if "has_more" in ae_outcome
+            else (bool(ae_sc.get("has_more")) if "has_more" in ae_sc else False)
+        )
+        ae_total_upstream = (
+            ae_outcome.get("total_upstream")
+            if "total_upstream" in ae_outcome
+            else ae_sc.get("total_upstream")
+        )
+        ae_filters = (
+            ae_outcome.get("filters")
+            if isinstance(ae_outcome.get("filters"), dict)
+            else (ae_sc.get("filters") if isinstance(ae_sc.get("filters"), dict) else {})
+        )
+        clamped_pair = ae_outcome.get("limit_clamped") or getattr(
+            self, "_last_ae_fanout_limit_clamped", None
+        )
+        next_page_hint = (
+            '翻取下一页请改用 research(route="alphaengine", operation="search_library", '
+            'query=..., start=..., end=..., params={"cursor": <payload.alphaengine.cursor>, ...})，'
+            "必须沿用同一 query、日期与筛选条件。"
+        )
         if ae_ok:
             ae_items = list(ae_outcome.get("results") or [])
             ae_section: dict[str, Any] = {
@@ -5555,7 +6868,18 @@ class ResearchDataBridge:
                 "route": "alphaengine",
                 "count": len(ae_items),
                 "results": ae_items,
+                "cursor": ae_cursor,
+                "has_more": ae_has_more,
+                "total_upstream": ae_total_upstream,
+                "filters": dict(ae_filters) if isinstance(ae_filters, dict) else {},
+                "next_page_hint": next_page_hint,
             }
+            if clamped_pair:
+                ae_section["limit_clamped"] = list(clamped_pair)
+                ae_section["note"] = (
+                    f"AlphaEngine search_library 单次上限为 50，已将 limit 从 {clamped_pair[0]} 截断为 50；"
+                    '如需更多结果请改用 research(route="alphaengine", operation="search_library") 并传 params.cursor 翻页。'
+                )
         else:
             st_cand = str(ae_outcome.get("status") or ae_raw_unwrapped.get("status") or "").strip().lower()
             st = st_cand if st_cand in _FAILURE_STATUSES else "failed"
@@ -5569,7 +6893,16 @@ class ResearchDataBridge:
                 "error": reason,
                 "count": 0,
                 "results": [],
+                "cursor": None,
+                "has_more": False,
+                "total_upstream": None,
+                "filters": {},
             }
+            if clamped_pair:
+                ae_section["limit_clamped"] = list(clamped_pair)
+                ae_section["note"] = (
+                    f"AlphaEngine search_library 单次上限为 50，已将 limit 从 {clamped_pair[0]} 截断为 50。"
+                )
 
         if not isinstance(payload.get("source_status"), dict):
             local_probe = {
@@ -5668,10 +7001,24 @@ class ResearchDataBridge:
             if isinstance(raw_gp_check, dict)
             else {"failed": False, "error": "", "status": ""}
         )
+        gp_status_raw = str(gp_outcome.get("status") or "").strip().lower()
         gp_ok = bool(gp_outcome.get("ok")) and not bool(gp_raw_unwrapped["failed"])
-        if gp_ok:
-            gp_items = list(gp_outcome.get("results") or [])
+        if gp_status_raw == "skipped":
+            reason = str(
+                gp_outcome.get("reason") or "query 超过 Guidepoint 1000 字上限，本腿未执行"
+            )
+            gp_items: list[dict[str, Any]] = []
             gp_section: dict[str, Any] = {
+                "ok": True,
+                "status": "skipped",
+                "route": "guidepoint",
+                "reason": reason,
+                "count": 0,
+                "results": [],
+            }
+        elif gp_ok:
+            gp_items = list(gp_outcome.get("results") or [])
+            gp_section = {
                 "ok": True,
                 "status": "ok",
                 "route": "guidepoint",
@@ -5828,9 +7175,87 @@ class ResearchDataBridge:
 
     @staticmethod
     def _alphaengine_usage_op(operation: str) -> str:
-        return {"search_library": "search", "get_document": "read"}.get(
-            str(operation or "").strip(), str(operation or "").strip() or "call"
+        op_clean = str(operation or "").strip()
+        return {
+            "search_library": "search",
+            "list_filters": "search",
+            "list_recording_tasks": "search",
+            "get_document_info": "meta",
+            "list_attachments": "meta",
+            "get_recording_status": "meta",
+            "get_recording_task": "meta",
+            "get_document": "read",
+            "auth_status": "status",
+        }.get(op_clean, op_clean or "call")
+
+    @staticmethod
+    def _extract_alphaengine_usage_count(
+        operation: str, payload: dict[str, Any]
+    ) -> int:
+        if not isinstance(payload, dict) or not bool(payload.get("ok")):
+            return 0
+        op_clean = str(operation or "search_library").strip()
+        inner = (
+            payload.get("data")
+            if isinstance(payload.get("data"), dict)
+            else payload
         )
+        sc = source_identity._unwrap_mcp_proxy_payload(inner)
+        if not isinstance(sc, dict):
+            sc = {}
+        if op_clean in ("search_library", "list_recording_tasks", ""):
+            ret_val = sc.get("returned")
+            if isinstance(ret_val, int) and not isinstance(ret_val, bool):
+                return max(0, ret_val)
+            if isinstance(sc.get("results"), list):
+                return len(sc["results"])
+            if isinstance(payload.get("result_count"), int) and not isinstance(payload.get("result_count"), bool):
+                return max(0, payload["result_count"])
+            if isinstance(payload.get("results"), list):
+                return len(payload["results"])
+            return 0
+        if op_clean == "list_attachments":
+            att_cnt = sc.get("attachment_count")
+            if isinstance(att_cnt, int) and not isinstance(att_cnt, bool):
+                return max(0, att_cnt)
+            if isinstance(sc.get("attachments"), list):
+                return len(sc["attachments"])
+            if isinstance(payload.get("attachments"), list):
+                return len(payload["attachments"])
+            return 0
+        if op_clean == "list_filters":
+            ret_val = sc.get("returned")
+            if isinstance(ret_val, int) and not isinstance(ret_val, bool):
+                return max(0, ret_val)
+            for list_key in (
+                "categories",
+                "document_types",
+                "companies",
+                "industries",
+                "sources",
+                "watchlist_groups",
+                "stocks",
+                "regions",
+                "items",
+                "results",
+            ):
+                if isinstance(sc.get(list_key), list):
+                    return len(sc[list_key])
+                if isinstance(payload.get(list_key), list):
+                    return len(payload[list_key])
+            cnt_val = sc.get("count")
+            if isinstance(cnt_val, int) and not isinstance(cnt_val, bool):
+                return max(0, cnt_val)
+            return 0
+        if op_clean in (
+            "get_document",
+            "get_document_info",
+            "get_recording_status",
+            "get_recording_task",
+            "auth_status",
+        ):
+            return 1
+        return 0
 
     async def _record_alphaengine_usage(
         self,
@@ -5844,11 +7269,22 @@ class ResearchDataBridge:
     ) -> None:
         args = arguments if isinstance(arguments, dict) else {}
         params = args.get("params") if isinstance(args.get("params"), dict) else {}
-        query = str(args.get("query") or "").strip()
-        doc_id = str(params.get("doc_id") or args.get("document") or "").strip()
-        entry = {
+        query = str(args.get("query") or params.get("query") or "").strip()
+        raw_doc_id = str(params.get("doc_id") or args.get("document") or "")
+        doc_id = _normalize_alphaengine_doc_id(raw_doc_id).strip() if raw_doc_id.strip() else ""
+        op_raw = str(operation or "").strip()
+        op_code = self._alphaengine_usage_op(op_raw)
+        op_category_zh = {
+            "search": "检索",
+            "meta": "元数据",
+            "read": "read",
+            "status": "状态",
+        }.get(op_code, op_code)
+        entry: dict[str, Any] = {
             "ts": datetime.now(timezone.utc).isoformat(),
-            "op": self._alphaengine_usage_op(operation),
+            "op": op_code,
+            "operation": op_raw or "search_library",
+            "op_category": op_category_zh,
             "query_sha256_12": (
                 hashlib.sha256(query.encode("utf-8")).hexdigest()[:12] if query else ""
             ),
@@ -5860,6 +7296,12 @@ class ResearchDataBridge:
             "workspace": str((caller or {}).get("workspace") or ""),
             "thread": str((caller or {}).get("thread") or ""),
         }
+        if op_code == "read" or op_raw == "get_document":
+            entry["content_field"] = str(params.get("content_field") or "auto").strip()
+            off_parsed = _parse_int_param(params.get("offset"))
+            entry["offset"] = max(0, int(off_parsed)) if off_parsed is not None else 0
+        if params.get("roadshow_id") is not None and str(params.get("roadshow_id")).strip():
+            entry["roadshow_id"] = str(params.get("roadshow_id")).strip()
         async with self._usage_lock:
             try:
                 usage_file = self.cfg.alphaengine_usage_file
@@ -7577,12 +9019,17 @@ class ResearchDataBridge:
         raw_params_obj = call_args.get("params")
         if isinstance(raw_params_obj, dict):
             clamped_p = dict(raw_params_obj)
+            mc_ceiling = (
+                SEC_MAX_CHARS_CEILING
+                if (tool_name == "finance" and route == "sec")
+                else MAX_CHARS_CEILING
+            )
             mc_raw = clamped_p.get("max_chars")
             mc_int = _parse_int_param(mc_raw)
             if mc_int is not None:
-                if mc_int > MAX_CHARS_CEILING:
-                    params_clamped["max_chars"] = [mc_raw, MAX_CHARS_CEILING]
-                    clamped_p["max_chars"] = MAX_CHARS_CEILING
+                if mc_int > mc_ceiling:
+                    params_clamped["max_chars"] = [mc_raw, mc_ceiling]
+                    clamped_p["max_chars"] = mc_ceiling
                 elif mc_int < MAX_CHARS_FLOOR:
                     params_clamped["max_chars"] = [mc_raw, MAX_CHARS_FLOOR]
                     clamped_p["max_chars"] = MAX_CHARS_FLOOR
@@ -7672,18 +9119,36 @@ class ResearchDataBridge:
                         )
 
             doc_candidate = str(call_args.get("document") or "").strip()
-            if doc_candidate and re.fullmatch(r"\d+", doc_candidate):
+            has_local_prefix = bool(
+                re.match(
+                    r"^(?:wiki|mail|tmtb|digest|funda|image):",
+                    doc_candidate,
+                    re.IGNORECASE,
+                )
+            )
+            has_ae_prefix = doc_candidate.lower().startswith("alphaengine:")
+            norm_ae_candidate = _normalize_alphaengine_doc_id(doc_candidate)
+            is_ae_doc_id = (
+                not has_local_prefix
+                and bool(norm_ae_candidate)
+                and _is_valid_alphaengine_doc_id(norm_ae_candidate)
+                and (
+                    has_ae_prefix
+                    or bool(re.fullmatch(r"\d+(?:_[A-Za-z0-9_-]+)?", norm_ae_candidate))
+                )
+            )
+            if is_ae_doc_id:
                 ae_hint = (
                     f'这是 AlphaEngine 文档，用 research(route="alphaengine", '
-                    f'operation="get_document", params={{"doc_id": "{doc_candidate}"}}) 读取'
+                    f'operation="get_document", params={{"doc_id": "{norm_ae_candidate}"}}) 读取'
                 )
                 err_payload = {
                     "_declared_sources": [],
                     "_sources": [],
                     "ok": False,
                     "status": "error",
-                    "document_id": doc_candidate,
-                    "doc_id": doc_candidate,
+                    "document_id": norm_ae_candidate,
+                    "doc_id": norm_ae_candidate,
                     "error": ae_hint,
                     "hint": ae_hint,
                 }
@@ -7720,6 +9185,21 @@ class ResearchDataBridge:
                 return self._make_tool_result_response(
                     req_id, fanout_win_err, is_error=True
                 )
+        if tool_name == "research" and route == "all" and isinstance(call_args.get("params"), dict):
+            # Guidepoint-only nested keys (`keywords`, `recency_bias`, `start_date`, `end_date`)
+            # are accepted on `route="all"` only for the Guidepoint fan-out leg; the local
+            # 4-library gateway rejects them on `route=all`, so strip them before building `rpc_req`.
+            gp_only_keys = ("keywords", "recency_bias", "start_date", "end_date")
+            if any(k in call_args["params"] for k in gp_only_keys):
+                local_all_params = {
+                    k: v
+                    for k, v in call_args["params"].items()
+                    if k not in gp_only_keys
+                }
+                if local_all_params:
+                    call_args["params"] = local_all_params
+                else:
+                    call_args.pop("params", None)
         ae_outcome: dict[str, Any] | None = None
         gp_outcome: dict[str, Any] | None = None
 
@@ -8050,11 +9530,21 @@ class ResearchDataBridge:
                             c_spec = ROUTE_CONTRACT_SPECS.get(rid)
                             if c_spec is not None:
                                 r_item.setdefault("tool", c_spec["tool"])
-                                if not r_item.get("operations"):
-                                    r_item["operations"] = list(c_spec["operations"])
+                                r_item["operations"] = list(c_spec["operations"])
                                 r_item["required_params"] = dict(c_spec["required_params"])
                                 r_item["optional_params"] = list(c_spec["optional_params"])
                                 r_item["accepted_params"] = list(c_spec["accepted_params"])
+                                if "accepted_nested_params" in c_spec:
+                                    r_item["accepted_nested_params"] = list(
+                                        c_spec["accepted_nested_params"]
+                                    )
+                                if "accepted_nested_params_by_operation" in c_spec:
+                                    r_item["accepted_nested_params_by_operation"] = {
+                                        k: list(v)
+                                        for k, v in c_spec[
+                                            "accepted_nested_params_by_operation"
+                                        ].items()
+                                    }
                                 r_item["param_formats"] = dict(c_spec["param_formats"])
                                 r_item["return_shape"] = c_spec["return_shape"]
                                 r_item["examples"] = list(c_spec["examples"])
@@ -8102,10 +9592,20 @@ class ResearchDataBridge:
                         )
                     declared_count = len(declared)
 
-                    # Track AlphaEngine get_document quota usage
-                    if route == "alphaengine" and operation == "get_document":
+                    _apply_error_and_empty_contract(
+                        tool_name, route, operation, payload, norm_params_view
+                    )
+
+                    # Track AlphaEngine get_document quota usage (only after unwrapping/status classification)
+                    if (
+                        route == "alphaengine"
+                        and operation == "get_document"
+                        and bool(payload.get("ok"))
+                    ):
                         inner = payload.get("data") if isinstance(payload.get("data"), dict) else payload
                         sc = inner.get("structuredContent") if isinstance(inner, dict) else None
+                        if not isinstance(sc, dict):
+                            sc = source_identity._unwrap_mcp_proxy_payload(payload)
                         chars = 0
                         if isinstance(sc, dict):
                             chars = int(sc.get("returned_chars") or len(str(sc.get("text") or "")))
@@ -8113,17 +9613,17 @@ class ResearchDataBridge:
 
                     # B5: one ledger line per served AlphaEngine call — the
                     # direct route and the route='all' fan-out leg each.
+                    # Unwrapping and error classification run first so ok,
+                    # error_category, and structuredContent count are accurate.
                     if route == "alphaengine":
-                        results_for_count = payload.get("results")
+                        eff_op_for_usage = operation or "search_library"
                         await self._record_alphaengine_usage(
-                            operation=operation or "search_library",
+                            operation=eff_op_for_usage,
                             arguments=arguments,
                             ok=bool(payload.get("ok")),
                             error_category=str(payload.get("error_category") or ""),
-                            count=(
-                                int(payload.get("result_count") or 0)
-                                if isinstance(payload.get("result_count"), int)
-                                else (len(results_for_count) if isinstance(results_for_count, list) else 0)
+                            count=self._extract_alphaengine_usage_count(
+                                eff_op_for_usage, payload
                             ),
                             caller=caller_identity,
                         )
@@ -8142,10 +9642,6 @@ class ResearchDataBridge:
                             count=int(ae_outcome.get("count") or 0),
                             caller=caller_identity,
                         )
-
-                    _apply_error_and_empty_contract(
-                        tool_name, route, operation, payload, norm_params_view
-                    )
                     if params_mapped_hint:
                         cur_hint = str(payload.get("hint") or "").strip()
                         if params_mapped_hint not in cur_hint:

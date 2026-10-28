@@ -368,8 +368,7 @@ def build_route_probe_spec(
             },
         )
     if rid == "transcript":
-        # Calls come once a quarter, so a 30-day window is often empty and the gateway's
-        # empty-match fallback (roic) answers 403; start with a full quarter.
+        # Calls come once a quarter, so a 30-day window is often empty; start with a full quarter.
         q_window = {"start": (today - timedelta(days=max(days, 120))).isoformat(), "end": today.isoformat()}
         return "research", {"route": "transcript", "ticker": "NVDA", "limit": limit, **q_window}
     if rid == "sales-notes":

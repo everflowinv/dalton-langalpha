@@ -215,6 +215,17 @@ def test_collect_six_internal_sources_and_sec_requests_match_bridge_route_contra
         probe_tool, probe_args = build_route_probe_spec(route_id, spec["tool"])
         assert_valid_bridge_call(probe_tool, probe_args)
 
+    # Positive check: document_categories is accepted on alphaengine search_library
+    assert_valid_bridge_call(
+        "research",
+        {
+            "route": "alphaengine",
+            "operation": "search_library",
+            "query": "Meta Platforms",
+            "params": {"sort": "relevance", "document_categories": ["sell_side_report"]},
+        },
+    )
+
     # Guard verification: invalid parameter names or nested params fail immediately
     with pytest.raises(AssertionError):
         assert_valid_bridge_call(
@@ -223,7 +234,7 @@ def test_collect_six_internal_sources_and_sec_requests_match_bridge_route_contra
                 "route": "alphaengine",
                 "operation": "search_library",
                 "query": "Meta Platforms",
-                "params": {"sort": "relevance", "document_categories": ["sell_side_report"]},
+                "params": {"sort": "relevance", "nonexistent_nested_param": ["sell_side_report"]},
             },
         )
 

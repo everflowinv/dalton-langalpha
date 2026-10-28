@@ -47,8 +47,8 @@ python3 .agents/skills/dalton-thesis-delta/scripts/collect.py collect \
 
 3. **快速短路分支（不读任何文档全文）**：
    - 检查 `collect.py` 返回的汇总 JSON 中的 `internal_status`、`failed_sources`、`all_sources_ok` 与 `short_circuit_eligible`：
-   - **任何来源 `ok: false` 都不能当成“没有新文档”**：当某个来源 `ok: false`（`all_sources_ok == false` 或 `failed_sources` 非空）时，**严禁走“所有来源 0 新增 → 短路结束”的分支**；在本轮结论（`verdict` 与 `commit --summary`）和汇报里必须如实写明“`<来源> 本轮取数失败（原因）`”，**绝不能写成“本轮无新文档”或“无新增”**。
-   - **短路判断要求所有来源都 `ok: true` 而且都是 `0` 新增**：仅当 `all_sources_ok == true`（所有来源 `ok: true`，`failed_sources` 为空）、`auto_flags` 为空，且新内部文档（`counts.internal` + `counts.alphaengine`）与新公告（`counts.sec`）均为 `0`（即 `short_circuit_eligible == true`）时：
+   - **任何来源 `ok: false` 或标记为“未完成”（`incomplete: true` / `completed: false` / `has_more: true` / `status: "partial"`，含 `company-wiki` 列表被截断或 `estimates` 一致预期失败/`partial`）都不能当成“没有新文档”**：当某个来源取数失败、列表被截断（如 `company-wiki` 提示有更多文档）、一致预期不全（`estimates` `error`/`partial`）或因翻满 5 页上限 / 预算中断而未扫完（`all_sources_ok == false` 或 `failed_sources` 非空）时，**严禁走“所有来源 0 新增 → 短路结束”的分支**；在本轮结论（`verdict` 与 `commit --summary`）和汇报里必须如实写明“`<来源> 本轮取数失败或未完成（原因）`”，**绝不能写成“本轮无新文档”或“无新增”**。
+   - **短路判断要求所有来源（含一致预期）都 `ok: true` 且完整扫完（无 `incomplete` / `partial`），而且都是 `0` 新增**：仅当 `all_sources_ok == true`（所有来源 `ok: true` 且 `incomplete != true`，`failed_sources` 为空）、`auto_flags` 为空，且新内部文档（`counts.internal` + `counts.alphaengine`）与新公告（`counts.sec`）均为 `0`（即 `short_circuit_eligible == true`）时：
      1. 直接执行提交：
         ```bash
         python3 .agents/skills/dalton-thesis-delta/scripts/collect.py commit \
@@ -65,8 +65,8 @@ python3 .agents/skills/dalton-thesis-delta/scripts/collect.py collect \
 当第 1 步未短路时：
 1. 按 `.agents/skills/dalton-knowledge/SKILL.md` 读序先读本工作区 `agent.md` 托管块、`thesis.md`、`debate.md`、`drivers.md`、`agenda.md` 及最近 `verdicts.md`。
 2. 读取 `research/tracker/<run_id>/packet.md` 及关联的新文档摘段/原文（若存在 `ok: false` 的来源，同步核实 `packet.md` / `internal_status` 中的失败原因并在本轮结论与汇报中如实写明“`<来源> 本轮取数失败（原因）`”）：
-   - 内部库新文档（`company-wiki`、`guidepoint`、`funda-ai`、`sales-notes`、`tmtb`）：先读摘段，必要时通过 PTC `researchdata.research(..., operation="read", document=...)` 读全文（**Guidepoint 例外：只有 `search_library` 问答检索，没有全文读取**——`read` / `get_document` 均不存在，不要调用；检索到的问答正文已在增量包该访谈条目的 `qa` 字段里，且检索到的问答不等于完整访谈）；
-   - AlphaEngine 新研报：先看摘要，挑带新数字（盈利预测修正、capex/费用、目标价/评级变化、核心 KPI 调查）的研报调用 `researchdata.research(route="alphaengine", operation="get_document", params={"doc_id": ...})` 读全文（每轮最多 3 篇；遇配额或未登录即停并记录状态）；
+   - 内部库新文档（`company-wiki`、`guidepoint`、`funda-ai`、`sales-notes`、`tmtb`）：先读摘段，必要时通过 PTC `researchdata.research(..., operation="read", document=...)` 读全文（**Guidepoint 例外：只有 `search_library` 问答检索，没有全文读取**——`read` / `get_document` 均不存在，不要调用；检索到的问答正文已在增量包该访谈条目的 `qa` 字段里，且检索到的问答不等于完整访谈；`internal_status["guidepoint"]` 标注 `scope: "摘录检索，非全量"`，当 Guidepoint 返回 0 条结果时只能表述为“本轮检索未命中”，不得写“Guidepoint 无新增”）；
+   - AlphaEngine 新研报与机构会议纪要：先看摘要，挑带新数字（盈利预测修正、capex/费用、目标价/评级变化、核心 KPI 调查）的文档调用 `researchdata.research(route="alphaengine", operation="get_document", params={"doc_id": ..., "content_field": "auto", "offset": 0, "max_chars": 30000})` 读全文（每轮最多 3 篇；`doc_id` 必须原样传入完整字符串如 `"290001790954279_inst_134249"`，不得转整数或截断 `_inst_` 后缀；`content_field` 仅接受 `"auto"|"original_text"|"content"|"digest"|"digest_cn"|"main_point"|"question_answer"` 七个值——映射：摘要 → `digest`/`digest_cn`，要点 → `main_point`，问答 → `question_answer`，原文/转录 → `original_text`；当所选字段为空但返回 `warning` 与 `available_content_fields` 时，改读有字符数的合法字段如 `original_text`、`digest` 或 `question_answer`，同一分页序列必须固定同一 `content_field` 并按 `next_offset` 续读直到 `complete=true` 或 `next_offset` 为空、核对 `content_sha256`；遇配额或未登录即停并记录状态）；
    - SEC / 港股与 A 股新公告：若当日 `dalton-filing-review` 或 `dalton-earnings-flash` 已经在 `verdicts.md` 写过同一份公告的结论，直接引用，不重复拆解；否则美股读取对应 SEC Item 或附件，港股与 A 股调用 `researchdata.finance(route="cn-hk", operation="filings", ticker=CODE_5_OR_6, start=..., end=..., limit=20)` 读取巨潮法定公告原文（港股未覆盖时用 `web_search` 查披露易 `site:hkexnews.hk` 原文链接），并可调用 `researchdata.finance(route="cn-hk", operation="ask", query=..., limit=20)` 辅助核查资金流、两融、回购或股东变动（平台财务表仅作初值，核心数字回公告核实）。
 3. 严格按 `.agents/skills/dalton-thesis-delta/references/materiality.md` 的十条标准判定本轮是否为**重要变化（`material=yes`）**：
    - **重要（任一命中即 `material=yes`）**：

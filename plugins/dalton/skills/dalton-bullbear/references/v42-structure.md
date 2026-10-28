@@ -152,7 +152,7 @@
 ## 3. 信源检索清单（主稿阶段必查）
 
 1. **内部库**：`researchdata.research` 查 `sales-notes`、`tmtb`、`funda-ai`、`company-wiki`（公司名、核心产品、capex/费用/指引）。Wiki 中的专家访谈与管理层交流已过合规，标明日期、专家身份（不写姓名）及可靠性后照常引用。
-2. **AlphaEngine**：先用 `researchdata.research(route="alphaengine", operation="list_filters")` 查各类别 `type_ids`，按外资深度报告、卖方点评、会议纪要分开调用 `researchdata.research(route="alphaengine", operation="search_library", query=..., start=..., end=..., params={"type_ids": [...], "sort": "relevance"})`；重要结论调 `operation="get_document"` 读正文。
+2. **AlphaEngine**：卖方研报与纪要可用 `params={"document_categories": ["foreign_report", "sell_side_report", "sell_side_comment", "meeting_minutes"], "sort": "relevance"}` 调用 `researchdata.research(route="alphaengine", operation="search_library", query=..., start=..., end=..., params=...)`，本机构会议必须拆成独立调用 `researchdata.research(route="alphaengine", operation="search_library", query=..., start=..., end=..., params={"meeting_scope": "institution", "sort": "relevance"})`（`institution_meetings` / `personal_meetings` 与非会议分类同用会触发 `E_SCOPE_CONFLICT`）；若需细粒度 `type_ids`，必须显式调用 `researchdata.research(route="alphaengine", operation="list_filters", params={"filter_type": "document_types", "document_code": "summary"})`（无参 `list_filters()` 只返回友好 `categories`，不返回 `type_ids`）；重要结论调 `operation="get_document"` 读正文（保留完整字符串 `doc_id` 含 `_inst_` 后缀）。
 3. **Guidepoint**：英文检索（`route="guidepoint", operation="search_library"`），原文引用 ≤20 个英文词并附出处。
 4. **一手披露**：`dalton_sec.list_filings` 与 `researchdata.finance(route="sec")` 读最新定期报告与电话会（`route="transcript"`）。
 5. **AI 收入与费用专项**：涉及 AI 商业化或 AI 提效时，按 `references/ai-revenue-rules.md` 执行。
