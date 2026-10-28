@@ -5,6 +5,7 @@ All test doubles use `unittest.mock.create_autospec` to preserve function and me
 
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
 import json
 from datetime import datetime, timedelta, timezone
@@ -1100,7 +1101,14 @@ def _fake_cache_with_store(store: _FakeRedisStore):
         cur = store.store.get(key)
         return cur == value and bool(await store.eval("del", 1, key, value))
 
+    async def _swap(key: str, old_value: str, new_value: str) -> bool:
+        if store.store.get(key) == old_value:
+            store.store[key] = new_value
+            return True
+        return False
+
     cache.claim.side_effect = _claim
+    cache.swap.side_effect = _swap
     return cache
 
 
@@ -1207,9 +1215,10 @@ async def test_antigravity_signin_cancelled_by_disconnect_does_not_revive(
     monkeypatch.setattr(oauth_tokens_db, "get_db_connection", get_db_conn)
 
     # A pending flow exists for the holder.
-    store.store[f"oauth:antigravity:{HOLDER_ID}"] = json.dumps(
+    late_flow_raw = json.dumps(
         {"verifier": "v", "state": "s", "port": 51121, "redirect_uri": "http://localhost:51121/callback"}
     )
+    store.store[f"oauth:antigravity:{HOLDER_ID}"] = late_flow_raw
 
     # The admin disconnects before the callback lands.
     await oauth_native_app.antigravity_disconnect(user_id=SECOND_PM_ID)
@@ -1218,15 +1227,25 @@ async def test_antigravity_signin_cancelled_by_disconnect_does_not_revive(
 
     fake_upsert = create_autospec(agy_oauth_mod.upsert_oauth_tokens, return_value=None)
     monkeypatch.setattr(agy_oauth_mod, "upsert_oauth_tokens", fake_upsert)
+    # The late callback carries the flow it acted on; the disconnect cleared it.
     with pytest.raises(ValueError):
-        await agy_oauth_mod._finalize_token_save(MEMBER_ID, {"access_token": "late-agy", "refresh_token": "late-ref", "id_token": "", "expires_in": 3600})
+        await agy_oauth_mod._finalize_token_save(
+            MEMBER_ID,
+            {"access_token": "late-agy", "refresh_token": "late-ref", "id_token": "", "expires_in": 3600},
+            expected_flow_raw=late_flow_raw,
+        )
     fake_upsert.assert_not_awaited()
 
     # And the reverse order: a save that already claimed the flow is not
     # clobbered by the disconnect — the disconnect deletes the row after.
     fake_upsert.reset_mock()
-    store.store[f"oauth:antigravity:{HOLDER_ID}"] = json.dumps({"verifier": "v2"})
-    await agy_oauth_mod._finalize_token_save(MEMBER_ID, {"access_token": "ok-agy", "refresh_token": "ok-ref", "id_token": "", "expires_in": 3600})
+    live_flow_raw = json.dumps({"verifier": "v2"})
+    store.store[f"oauth:antigravity:{HOLDER_ID}"] = live_flow_raw
+    await agy_oauth_mod._finalize_token_save(
+        MEMBER_ID,
+        {"access_token": "ok-agy", "refresh_token": "ok-ref", "id_token": "", "expires_in": 3600},
+        expected_flow_raw=live_flow_raw,
+    )
     fake_upsert.assert_awaited_once()
     assert fake_upsert.call_args.kwargs["provider"] == "antigravity-oauth"
     assert f"oauth:antigravity:done:{HOLDER_ID}" in store.store
@@ -1270,3 +1289,304 @@ async def test_upstream_pending_flows_keyed_by_holder(monkeypatch: pytest.Monkey
 
     # Claude's flow key is holder-keyed too.
     assert oauth_app_mod._claude_key(MEMBER_ID) == f"oauth:claude:{HOLDER_ID}"
+
+
+# ---------------------------------------------------------------------------
+# 8. In-flight races: the upstream answer arrives AFTER a disconnect (or a
+#    disconnect + newer sign-in) that landed while it was being waited on
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_muse_approval_in_flight_when_admin_disconnects_does_not_revive(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The real low-level poll runs to the point of returning credentials (the
+    mint call is what's held), while an admin disconnect lands mid-flight: the
+    minted key is never saved, and a newer sign-in's pending flow survives."""
+    import gzip
+    import httpx
+
+    _enable_team_sharing(monkeypatch)
+    store = _FakeRedisStore()
+    cache = _fake_cache_with_store(store)
+    monkeypatch.setattr(
+        "src.utils.cache.redis_cache.get_cache_client",
+        create_autospec(lambda: cache, return_value=cache),
+    )
+    get_db_conn, _, executed = _make_autospec_db()
+    monkeypatch.setattr(oauth_tokens_db, "get_db_connection", get_db_conn)
+
+    mint_release: asyncio.Future[httpx.Response] = asyncio.get_event_loop().create_future()
+    mint_body = gzip.compress(
+        json.dumps({"api_key": "late-minted-key", "base_url": "https://api.meta.ai/v1", "subs_tier_name": "Pro"}).encode()
+    )
+
+    async def _fake_post(self, url: str, *, data=None, json=None, headers=None, **kwargs):
+        if url == muse_oauth_mod.MUSE_TOKEN_URL:
+            return httpx.Response(200, json={"access_token": "transient-tok", "token_type": "Bearer"})
+        if url == muse_oauth_mod.MUSE_MINT_KEY_URL:
+            return await mint_release
+        raise AssertionError(f"unexpected url {url}")
+
+    monkeypatch.setattr(
+        httpx.AsyncClient,
+        "post",
+        create_autospec(httpx.AsyncClient.post, side_effect=_fake_post),
+    )
+    fake_save = create_autospec(muse_oauth_mod.save_minted_credentials)
+    monkeypatch.setattr(oauth_native_app, "muse_save_minted_credentials", fake_save)
+
+    device_codes = iter(["dc-old", "dc-new"])
+
+    async def _device_code():
+        code = next(device_codes)
+        return {"device_code": code, "user_code": f"UC-{code}", "verification_url": "https://auth.meta.com/device", "interval": 5, "expires_in": 600}
+
+    monkeypatch.setattr(
+        oauth_native_app,
+        "muse_request_device_code",
+        create_autospec(oauth_native_app.muse_request_device_code, side_effect=_device_code),
+    )
+    await oauth_native_app.muse_device_initiate(user_id=MEMBER_ID)
+    old_raw = store.store[f"oauth:muse:device:{HOLDER_ID}"]
+
+    poll_task = asyncio.ensure_future(oauth_native_app.muse_device_poll(user_id=MEMBER_ID))
+    await asyncio.sleep(0)  # let the poll reach the held mint call
+
+    # Mid-flight: the admin disconnects, then a newer sign-in starts.
+    await oauth_native_app.muse_disconnect(user_id=SECOND_PM_ID)
+    await oauth_native_app.muse_device_initiate(user_id=MEMBER_ID)
+    new_raw = store.store[f"oauth:muse:device:{HOLDER_ID}"]
+    assert new_raw != old_raw
+
+    # The approval lands.
+    mint_release.set_result(
+        httpx.Response(200, headers={"content-encoding": "gzip"}, content=mint_body)
+    )
+    with pytest.raises(HTTPException) as late:
+        await poll_task
+    assert late.value.status_code == 400
+    # The minted key was never stored, and the newer sign-in's flow survives.
+    fake_save.assert_not_awaited()
+    assert store.store[f"oauth:muse:device:{HOLDER_ID}"] == new_raw
+    assert not any(
+        "INSERT INTO user_oauth_tokens" in str(sql) for sql, _ in executed
+    )
+
+
+@pytest.mark.asyncio
+async def test_xai_slow_down_in_flight_does_not_resurrect_cleared_flow(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A slow_down answer held past a disconnect (or a newer sign-in) cannot
+    write the old pending payload back: the swap is conditional on the raw
+    value this poll read, so the cleared key stays cleared and a newer flow
+    stays intact."""
+    _enable_team_sharing(monkeypatch)
+    store = _FakeRedisStore()
+    cache = _fake_cache_with_store(store)
+    monkeypatch.setattr(
+        "src.utils.cache.redis_cache.get_cache_client",
+        create_autospec(lambda: cache, return_value=cache),
+    )
+    get_db_conn, _, executed = _make_autospec_db()
+    monkeypatch.setattr(oauth_tokens_db, "get_db_connection", get_db_conn)
+
+    device_codes = iter(["dc-old", "dc-new"])
+
+    async def _device_code(user_id=None):
+        code = next(device_codes)
+        return {"device_code": code, "user_code": f"UC-{code}", "verification_url": "https://auth.x.ai/device", "interval": 5, "expires_in": 600}
+
+    monkeypatch.setattr(
+        oauth_native_app,
+        "xai_request_device_code",
+        create_autospec(oauth_native_app.xai_request_device_code, side_effect=_device_code),
+    )
+    await oauth_native_app.xai_device_initiate(user_id=MEMBER_ID)
+    old_raw = store.store[f"oauth:xai:device:{HOLDER_ID}"]
+
+    poll_release: asyncio.Future[dict] = asyncio.get_event_loop().create_future()
+    real_poll = oauth_native_app.xai_poll_device_authorization
+
+    async def _held_poll(*args, **kwargs):
+        return await poll_release
+
+    monkeypatch.setattr(
+        oauth_native_app,
+        "xai_poll_device_authorization",
+        create_autospec(real_poll, side_effect=_held_poll),
+    )
+
+    poll_task = asyncio.ensure_future(oauth_native_app.xai_device_poll(user_id=MEMBER_ID))
+    await asyncio.sleep(0)
+
+    # Mid-flight: disconnect clears the flow; a newer sign-in starts.
+    await oauth_native_app.xai_disconnect(user_id=SECOND_PM_ID)
+    await oauth_native_app.xai_device_initiate(user_id=MEMBER_ID)
+    new_raw = store.store[f"oauth:xai:device:{HOLDER_ID}"]
+    assert new_raw != old_raw
+
+    # The slow_down answer arrives: the old poll must not touch the new flow.
+    poll_release.set_result({"pending": True, "interval": 9})
+    with pytest.raises(HTTPException) as late:
+        await poll_task
+    assert late.value.status_code == 400
+    assert "cancelled or replaced" in str(late.value.detail)
+    assert store.store[f"oauth:xai:device:{HOLDER_ID}"] == new_raw
+
+    # And with no newer sign-in, the cleared key stays cleared.
+    await store.delete(f"oauth:xai:device:{HOLDER_ID}")
+    store.store[f"oauth:xai:device:{HOLDER_ID}"] = old_raw
+    poll2_release: asyncio.Future[dict] = asyncio.get_event_loop().create_future()
+
+    async def _held_poll2(*args, **kwargs):
+        return await poll2_release
+
+    monkeypatch.setattr(
+        oauth_native_app,
+        "xai_poll_device_authorization",
+        create_autospec(real_poll, side_effect=_held_poll2),
+    )
+    poll2 = asyncio.ensure_future(oauth_native_app.xai_device_poll(user_id=MEMBER_ID))
+    await asyncio.sleep(0)
+    await store.delete(f"oauth:xai:device:{HOLDER_ID}")
+    poll2_release.set_result({"pending": True, "interval": 9})
+    with pytest.raises(HTTPException) as late2:
+        await poll2
+    assert late2.value.status_code == 400
+    assert f"oauth:xai:device:{HOLDER_ID}" not in store.store
+
+
+@pytest.mark.asyncio
+async def test_xai_approval_in_flight_when_admin_disconnects_does_not_revive(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    _enable_team_sharing(monkeypatch)
+    store = _FakeRedisStore()
+    cache = _fake_cache_with_store(store)
+    monkeypatch.setattr(
+        "src.utils.cache.redis_cache.get_cache_client",
+        create_autospec(lambda: cache, return_value=cache),
+    )
+    get_db_conn, _, executed = _make_autospec_db()
+    monkeypatch.setattr(oauth_tokens_db, "get_db_connection", get_db_conn)
+
+    import src.dalton.llm.providers.xai_grok.oauth as xai_oauth_mod
+
+    fake_xai_save = create_autospec(xai_oauth_mod.save_xai_tokens)
+    monkeypatch.setattr(oauth_native_app, "save_xai_tokens", fake_xai_save)
+
+    async def _device_code(user_id=None):
+        return {"device_code": "dc-old", "user_code": "UC-OLD", "verification_url": "https://auth.x.ai/device", "interval": 5, "expires_in": 600}
+
+    monkeypatch.setattr(
+        oauth_native_app,
+        "xai_request_device_code",
+        create_autospec(oauth_native_app.xai_request_device_code, side_effect=_device_code),
+    )
+    await oauth_native_app.xai_device_initiate(user_id=MEMBER_ID)
+    poll_release: asyncio.Future[dict] = asyncio.get_event_loop().create_future()
+    real_poll = oauth_native_app.xai_poll_device_authorization
+
+    async def _held_poll(*args, **kwargs):
+        return await poll_release
+
+    monkeypatch.setattr(
+        oauth_native_app,
+        "xai_poll_device_authorization",
+        create_autospec(real_poll, side_effect=_held_poll),
+    )
+
+    poll_task = asyncio.ensure_future(oauth_native_app.xai_device_poll(user_id=MEMBER_ID))
+    await asyncio.sleep(0)
+    await oauth_native_app.xai_disconnect(user_id=SECOND_PM_ID)
+
+    poll_release.set_result({"access_token": "late-tok", "refresh_token": "late-ref", "expires_in": 3600})
+    with pytest.raises(HTTPException) as late:
+        await poll_task
+    assert late.value.status_code == 400
+    fake_xai_save.assert_not_awaited()
+    assert not any("INSERT INTO user_oauth_tokens" in str(sql) for sql, _ in executed)
+
+
+@pytest.mark.asyncio
+async def test_antigravity_old_callback_after_disconnect_and_new_login(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A paste callback reads its flow, spends the authorization, and only then
+    finds a disconnect plus a newer login landed: the old authorization refuses
+    to save, the newer login's flow survives, and the stored row stays gone."""
+    _enable_team_sharing(monkeypatch)
+    store = _FakeRedisStore()
+    cache = _fake_cache_with_store(store)
+    monkeypatch.setattr(
+        "src.utils.cache.redis_cache.get_cache_client",
+        create_autospec(lambda: cache, return_value=cache),
+    )
+    get_db_conn, _, executed = _make_autospec_db()
+    monkeypatch.setattr(oauth_tokens_db, "get_db_connection", get_db_conn)
+
+    fake_upsert = create_autospec(agy_oauth_mod.upsert_oauth_tokens, return_value=None)
+    monkeypatch.setattr(agy_oauth_mod, "upsert_oauth_tokens", fake_upsert)
+
+    flow1 = json.dumps({"verifier": "v1", "state": "s1", "port": 51121, "redirect_uri": "http://localhost:51121/callback"})
+    store.store[f"oauth:antigravity:{HOLDER_ID}"] = flow1
+
+    exchange_release: asyncio.Future[dict] = asyncio.get_event_loop().create_future()
+
+    async def _held_exchange(code, verifier, redirect_uri):
+        return await exchange_release
+
+    monkeypatch.setattr(
+        agy_oauth_mod,
+        "exchange_code",
+        create_autospec(agy_oauth_mod.exchange_code, side_effect=_held_exchange),
+    )
+
+    paste_task = asyncio.ensure_future(
+        agy_oauth_mod.submit_callback_url(
+            MEMBER_ID,
+            "http://localhost:51121/callback?code=old-code&state=s1",
+        )
+    )
+    await asyncio.sleep(0)  # the paste has read flow1 and holds in the exchange
+
+    # Mid-flight: disconnect, then a newer login writes its own flow.
+    await oauth_native_app.antigravity_disconnect(user_id=SECOND_PM_ID)
+    flow2 = json.dumps({"verifier": "v2", "state": "s2", "port": 51122, "redirect_uri": "http://localhost:51122/callback"})
+    store.store[f"oauth:antigravity:{HOLDER_ID}"] = flow2
+
+    exchange_release.set_result({"access_token": "old-agy-tok", "refresh_token": "old-ref", "id_token": "", "expires_in": 3600})
+    with pytest.raises(ValueError):
+        await paste_task
+    fake_upsert.assert_not_awaited()
+    # The newer login's flow is untouched; no done marker for the old one.
+    assert store.store[f"oauth:antigravity:{HOLDER_ID}"] == flow2
+    assert f"oauth:antigravity:done:{HOLDER_ID}" not in store.store
+    assert not any("INSERT INTO user_oauth_tokens" in str(sql) for sql, _ in executed)
+
+
+@pytest.mark.asyncio
+async def test_antigravity_save_without_cache_refuses(monkeypatch: pytest.MonkeyPatch):
+    """No pending-flow store means no verifiable login: the save refuses with a
+    clear error instead of writing unconditionally."""
+    _enable_team_sharing(monkeypatch)
+    disabled = create_autospec(RedisCacheClient(), instance=True)
+    disabled.enabled = False
+    monkeypatch.setattr(
+        "src.utils.cache.redis_cache.get_cache_client",
+        create_autospec(lambda: disabled, return_value=disabled),
+    )
+    fake_upsert = create_autospec(agy_oauth_mod.upsert_oauth_tokens, return_value=None)
+    monkeypatch.setattr(agy_oauth_mod, "upsert_oauth_tokens", fake_upsert)
+
+    with pytest.raises(ValueError) as refused:
+        await agy_oauth_mod._finalize_token_save(
+            MEMBER_ID,
+            {"access_token": "t", "refresh_token": "r", "id_token": "", "expires_in": 3600},
+            expected_flow_raw="{}",
+        )
+    assert "cannot be verified" in str(refused.value)
+    fake_upsert.assert_not_awaited()

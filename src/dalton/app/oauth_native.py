@@ -141,9 +141,14 @@ async def muse_device_poll(user_id: CurrentUserId):
     device = json.loads(raw)
 
     try:
-        result = await muse_poll_device_authorization(device["device_code"], user_id=user_id)
+        # The low-level poll only mints and returns the key; every write happens
+        # below, inside the connection lock, so an approval that arrives while a
+        # disconnect is landing cannot revive the connection.
+        result = await muse_poll_device_authorization(device["device_code"])
     except ValueError as e:
-        await cache.client.delete(key)
+        # Take only our own flow's key: an unconditional delete here could drop
+        # a newer sign-in's pending flow (DALTON-HOOK(team-credentials)).
+        await _claim_pending(cache, key, raw)
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.error(f"[oauth] Muse device poll error for user_id={user_id}: {type(e).__name__}")
@@ -162,8 +167,7 @@ async def muse_device_poll(user_id: CurrentUserId):
                     status_code=400,
                     detail="The Muse sign-in was cancelled or replaced. Start again.",
                 )
-            if not result.get("_saved"):
-                result = await muse_save_minted_credentials(user_id, result, conn=conn)
+            result = await muse_save_minted_credentials(user_id, result, conn=conn)
 
         logger.info(f"[oauth] Muse connected for user_id={user_id}")
         return {
@@ -385,8 +389,19 @@ async def xai_device_poll(user_id: CurrentUserId):
     cur_interval = int(device.get("interval") or 5)
     now_ts = int(datetime.now(timezone.utc).timestamp())
     raw_expires_at = device.get("expires_at")
+
+    def _cancelled() -> HTTPException:
+        return HTTPException(
+            status_code=400,
+            detail="The xAI sign-in was cancelled or replaced. Start again.",
+        )
+
+    # Every cleanup below takes only OUR flow (compare-and-delete on the raw
+    # value this poll read): a disconnect may have cleared the key, or a newer
+    # sign-in replaced it, and an unconditional delete would drop the newer
+    # flow (DALTON-HOOK(team-credentials)).
     if isinstance(raw_expires_at, (int, float)) and int(raw_expires_at) <= now_ts:
-        await cache.client.delete(device_key)
+        await _claim_pending(cache, device_key, raw)
         raise HTTPException(status_code=400, detail="The xAI sign-in request expired before it was approved (expired_token).")
 
     try:
@@ -397,7 +412,7 @@ async def xai_device_poll(user_id: CurrentUserId):
             user_id=user_id,
         )
     except ValueError as e:
-        await cache.client.delete(device_key)
+        await _claim_pending(cache, device_key, raw)
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.error(f"[oauth] xAI device poll error for user_id={user_id}: {type(e).__name__}")
@@ -421,13 +436,17 @@ async def xai_device_poll(user_id: CurrentUserId):
             if remaining_ttl is None:
                 remaining_ttl = initial_ttl
             if remaining_ttl <= 0:
-                await cache.client.delete(device_key)
+                await _claim_pending(cache, device_key, raw)
                 raise HTTPException(status_code=400, detail="The xAI sign-in request expired before it was approved (expired_token).")
-            await cache.client.set(
-                device_key,
-                json.dumps(device),
-                ex=min(initial_ttl, remaining_ttl),
-            )
+            # Conditional write on the raw value this poll read: a disconnect
+            # that cleared the key while xAI was answering, or a newer sign-in
+            # that replaced it, leaves the swap refused — the slow_down backoff
+            # cannot resurrect a dead flow or clobber a live newer one. The
+            # swap is atomic against deletion, the same protection the
+            # connection lock gives the save below, without a DB transaction
+            # per poll (DALTON-HOOK(team-credentials)).
+            if not await cache.swap(device_key, raw, json.dumps(device)):
+                raise _cancelled()
         return {"pending": True, "interval": new_interval}
 
     try:
