@@ -71,6 +71,39 @@ def _html_to_markdown(html: str) -> str:
     return to_markdown(html, trace=logger.debug)
 
 
+# DALTON-HOOK(heavy-compute-isolation): whole-page HTML conversion runs in a
+# bounded, killable subprocess. The old to_thread kept the GIL inside this
+# process, and a pathological page (deep DOM, liveblog hub) then starved the
+# event loop for the whole conversion — the 85s/94s stall class. The input is
+# byte-capped before parsing inside to_markdown itself.
+_HTML_EXTRACT_TIMEOUT_S = 60.0
+
+
+async def _extract_markdown(url: str, html_body: str) -> str:
+    """HTML → markdown off-process, with an honest marker when it never comes back."""
+    from src.dalton.heavy_compute import (
+        HeavyComputeError,
+        HeavyComputeTimeout,
+        run_in_heavy_subprocess,
+    )
+
+    try:
+        return await run_in_heavy_subprocess(
+            to_markdown,
+            html_body,
+            timeout_s=_HTML_EXTRACT_TIMEOUT_S,
+            label=f"html-extract:{url[:120]}",
+        )
+    except HeavyComputeTimeout:
+        logger.warning(
+            f"HTML extraction terminated at {_HTML_EXTRACT_TIMEOUT_S:.0f}s budget for {url}"
+        )
+        return "[HTML 解析超时：正文转换被终止，原文过长或结构异常]"
+    except HeavyComputeError as e:
+        logger.warning(f"HTML extraction failed in subprocess for {url}: {e}")
+        return f"[HTML 解析失败：{str(e).splitlines()[0][:160]}]"
+
+
 def _needs_browser(html_body: str, status: int) -> bool:
     """Detect if HTTP-only fetch returned blocked/empty content needing browser tiers.
 
@@ -249,7 +282,7 @@ class ScraplingCrawler:
                 )
             if not _needs_browser(html_body, status):
                 title = _extract_title(page)
-                markdown = await asyncio.to_thread(_html_to_markdown, html_body)
+                markdown = await _extract_markdown(url, html_body)  # DALTON-HOOK(heavy-compute-isolation): off-process, killable at budget
                 logger.debug(f"Tier 1 (fast) succeeded for {url}")
                 return CrawlOutput(
                     title=title, html=html_body, markdown=markdown, status=status
@@ -300,7 +333,7 @@ class ScraplingCrawler:
                     logger.debug(f"Tier 2 binary payload ({mime}) for {url}")
                     return _binary_output(url, page, mime, raw, status)
                 title = _extract_title(page)
-                markdown = await asyncio.to_thread(_html_to_markdown, html_body)
+                markdown = await _extract_markdown(url, html_body)  # DALTON-HOOK(heavy-compute-isolation): off-process, killable at budget
                 logger.debug(f"Tier 2 (dynamic) succeeded for {url}")
                 return CrawlOutput(
                     title=title, html=html_body, markdown=markdown, status=status
@@ -329,7 +362,7 @@ class ScraplingCrawler:
                     logger.debug(f"Tier 3 binary payload ({mime}) for {url}")
                     return _binary_output(url, page, mime, raw, status)
                 title = _extract_title(page)
-                markdown = await asyncio.to_thread(_html_to_markdown, html_body)
+                markdown = await _extract_markdown(url, html_body)  # DALTON-HOOK(heavy-compute-isolation): off-process, killable at budget
                 logger.debug(f"Tier 3 (stealth) completed for {url} (status={status})")
                 return CrawlOutput(
                     title=title, html=html_body, markdown=markdown, status=status

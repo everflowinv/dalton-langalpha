@@ -189,6 +189,10 @@ class FetchResult:
     author: Optional[str] = None
     source: Literal["live", "cache"] = "live"
     error: Optional[WebError] = None
+    # DALTON-HOOK(heavy-compute-isolation): True when `markdown` is a
+    # terminated-parse wording (PDF budget kill), not page content — shorter
+    # than web_fetch's empty-page threshold, so the flag rides along.
+    parse_timeout: bool = False
 
     @property
     def ok(self) -> bool:

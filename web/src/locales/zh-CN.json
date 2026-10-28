@@ -6366,6 +6366,7 @@
     "publish": {
       "cardTitle": "正式研究报告发布审批（PM 终审）",
       "labelingIncompleteWarning": "标注未完成，口语数字和指标可能未核验",
+      "derivedMatchingIncompleteWarning": "派生匹配因超时未完成：部分本可由派生关系核实的数字仍显示为未核实",
       "failedBatchDetailItem": "第 {{batch}} 批（第 {{start}}–{{end}} 个数字）标注失败",
       "failedBatchColloquialItem": "第 {{batch}} 批（口语数字扫描）标注失败",
       "labelingCoverageLabel": "标注覆盖",

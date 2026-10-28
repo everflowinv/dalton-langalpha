@@ -110,11 +110,20 @@ class LLMService:
                     },
                 )
 
-        return await make_api_call(
-            llm,
-            system_prompt=system_prompt or "",
-            user_prompt=user_prompt,
-            response_schema=response_schema,
-            return_token_usage=return_token_usage,
-            disable_tracing=disable_tracing,
-        )
+        # DALTON-HOOK(oauth-refresh-direct): this is the server-side one-shot
+        # path (titles, extractions, probes via LLMService) — no resilience
+        # middleware here, so a mid-session OAuth 401 rebuilds the client once
+        # and retries the same call.
+        from src.dalton.llm.oauth_refresh import call_with_oauth_refresh
+
+        async def _call(client: Any) -> Any:
+            return await make_api_call(
+                client,
+                system_prompt=system_prompt or "",
+                user_prompt=user_prompt,
+                response_schema=response_schema,
+                return_token_usage=return_token_usage,
+                disable_tracing=disable_tracing,
+            )
+
+        return await call_with_oauth_refresh(llm, _call)

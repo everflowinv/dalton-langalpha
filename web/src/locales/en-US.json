@@ -6484,6 +6484,7 @@
     "publish": {
       "cardTitle": "Official Research Publication Approval (PM Final Review)",
       "labelingIncompleteWarning": "Figure labeling incomplete; colloquial figures and metric labels may not be fully verified",
+      "derivedMatchingIncompleteWarning": "Derived-figure matching was skipped after a timeout: some figures it could have verified still show as unverified",
       "failedBatchDetailItem": "Batch {{batch}} (figures {{start}}–{{end}}) labeling failed",
       "failedBatchColloquialItem": "Batch {{batch}} (colloquial figure scan) labeling failed",
       "labelingCoverageLabel": "Labeling Coverage",

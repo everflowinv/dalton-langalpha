@@ -56,6 +56,9 @@ interface LabelingInfo {
   failed_batches?: number;
   failed_batch_details?: FailedBatchDetail[];
   incidental_excluded?: number;
+  // DALTON-HOOK(heavy-compute-isolation): set when the audit's finalize phase
+  // was killed at its grace and the derived-matching pass was skipped.
+  derived_matching_incomplete?: boolean;
 }
 
 interface VerifiedByCounts {
@@ -120,6 +123,10 @@ export function PublishApprovalCard({
   const labelingIncomplete = Boolean(
     args?.labeling_incomplete ?? figSum?.labeling_incomplete ?? failedBatches > 0
   );
+  // DALTON-HOOK(heavy-compute-isolation): the audit's finalize phase killed
+  // at its grace skips the derived-matching pass; the PM must see why those
+  // figures read unverified.
+  const derivedMatchingIncomplete = Boolean(labeling?.derived_matching_incomplete);
   const hasLabelingCoverage =
     typeof labeling?.labeled === 'number' && typeof labeling?.total === 'number';
 
@@ -203,7 +210,7 @@ export function PublishApprovalCard({
       className="rounded-lg px-4 py-3 text-xs space-y-1.5"
       style={{ border: '1px solid var(--color-border-muted)', color: 'var(--color-text-secondary)' }}
     >
-      {labelingIncomplete && (
+      {(labelingIncomplete || derivedMatchingIncomplete) && (
         <div
           className="rounded px-3 py-1.5 text-[11px] font-medium space-y-1"
           style={{
@@ -213,10 +220,20 @@ export function PublishApprovalCard({
           }}
           data-testid="publish-labeling-incomplete-warning"
         >
-          <div>
-            {t('dalton.publish.labelingIncompleteWarning', '标注未完成，口语数字和指标可能未核验')}
-            {failedBatches > 0 ? `（失败批次：${failedBatches}）` : ''}
-          </div>
+          {labelingIncomplete && (
+            <div>
+              {t('dalton.publish.labelingIncompleteWarning', '标注未完成，口语数字和指标可能未核验')}
+              {failedBatches > 0 ? `（失败批次：${failedBatches}）` : ''}
+            </div>
+          )}
+          {derivedMatchingIncomplete && (
+            <div data-testid="publish-derived-incomplete-warning">
+              {t(
+                'dalton.publish.derivedMatchingIncompleteWarning',
+                '派生匹配因超时未完成：部分本可由派生关系核实的数字仍显示为未核实'
+              )}
+            </div>
+          )}
           {failedBatchDetails.length > 0 && (
             <div className="text-[10.5px] font-normal space-y-0.5" data-testid="publish-failed-batch-details">
               {failedBatchDetails.map((d, dIdx) => {

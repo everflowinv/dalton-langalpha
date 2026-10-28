@@ -351,23 +351,37 @@ async def assist_json(
             if _is_safe_to_fallback(c):
                 return True
             # Past the deadline nothing new can be sent, but a fallback may still have a
-            # journalled answer from an earlier run: let the chain look (replay only).
+            # journalled answer from an earlier run: let the chain look (replay only —
+            # dalton_complete returns without claiming once past its deadline).
             if own_chain and deadline is not None and time.monotonic() >= deadline:
                 return True
             return own_chain and _is_subscription(m) and _is_timeout_or_rate_limit(c)
+
+        def _past_deadline() -> bool:
+            return deadline is not None and time.monotonic() >= deadline
 
         if fb_list and _should_fall_back(comp, resolved_model):
             primary_model = resolved_model
             for fb_cand in fb_list:
                 if fb_cand == primary_model:
                     continue
-                logger.info(
-                    "[DaltonAssist] task=%s primary_model=%s failed (%s); switching to assist_fallback=%s",
-                    task,
-                    resolved_model,
-                    comp.error or comp.status,
-                    fb_cand,
-                )
+                if _past_deadline():
+                    # A5: a replay probe, not a model failure. Logging these as
+                    # "switching to fallback" made one over-budget audit print
+                    # three-model DeadlineBeforeSendError failures for a minute.
+                    logger.info(
+                        "[DaltonAssist] task=%s past deadline; probing journal cache only for fallback=%s",
+                        task,
+                        fb_cand,
+                    )
+                else:
+                    logger.info(
+                        "[DaltonAssist] task=%s primary_model=%s failed (%s); switching to assist_fallback=%s",
+                        task,
+                        resolved_model,
+                        comp.error or comp.status,
+                        fb_cand,
+                    )
                 comp_fb = await dalton_complete(
                     llm_service=llm_service,
                     user_id=user_id,

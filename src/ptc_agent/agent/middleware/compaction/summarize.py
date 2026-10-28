@@ -218,20 +218,30 @@ async def _attempt(
     """``model``'s reply, held to ``quiet_until`` until it begins writing,
     then past it to ``deadline`` for as long as its chunks keep coming."""
     loop = asyncio.get_running_loop()
-    response = None
-    writing = False
-    async with asyncio.timeout_at(quiet_until) as limit:
-        covered, request = await prepare(_room(model))
-        stream = model.astream(request, config={"tags": [TAG_NOSTREAM]})
-        async with aclosing(stream) as chunks:
-            async for chunk in chunks:
-                response = chunk if response is None else response + chunk
-                writing = written.add(chunk) or writing
-                if writing:
-                    limit.reschedule(max(quiet_until, min(deadline, loop.time() + _STALL_S)))
-    if response is None:
-        raise ValueError("no reply")
-    return covered, response
+
+    async def _stream_once(m: Any) -> tuple[list[AnyMessage], Any]:
+        response = None
+        writing = False
+        async with asyncio.timeout_at(quiet_until) as limit:
+            covered, request = await prepare(_room(m))
+            stream = m.astream(request, config={"tags": [TAG_NOSTREAM]})
+            async with aclosing(stream) as chunks:
+                async for chunk in chunks:
+                    response = chunk if response is None else response + chunk
+                    writing = written.add(chunk) or writing
+                    if writing:
+                        limit.reschedule(max(quiet_until, min(deadline, loop.time() + _STALL_S)))
+        if response is None:
+            raise ValueError("no reply")
+        return covered, response
+
+    # DALTON-HOOK(oauth-refresh-direct): this astream bypasses the resilience
+    # middleware, so a mid-turn OAuth 401 is refreshed and retried here. The
+    # import stays inside the function: ptc_agent must import on the sandbox
+    # side too, where src.dalton does not exist.
+    from src.dalton.llm.oauth_refresh import call_with_oauth_refresh
+
+    return await call_with_oauth_refresh(model, _stream_once)
 
 
 class _Written:

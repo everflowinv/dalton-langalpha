@@ -51,9 +51,30 @@ try:
 except ImportError:  # pragma: no cover
     assist_json = None  # type: ignore[assignment]
 
+from src.dalton.heavy_compute import (
+    HeavyComputeTimeout,
+    run_in_heavy_subprocess,
+)
+
 logger = logging.getLogger(__name__)
 
+class AuditBuildTimeout(RuntimeError):
+    """The result-assembly phase was killed at its grace budget (A5 review).
+
+    Distinct from a bare RuntimeError so the publish state machine can settle
+    its request into ``audit_failed`` with the Chinese message instead of
+    leaving the row stuck at ``auditing``."""
+
+
 _DEADLINE_GRACE_S = 5.0
+# The post-judging phases (derived re-run, candidate merge, result assembly) get
+# their own budget: they must finish even when judging consumed the audit's.
+_FINALIZE_GRACE_S = 120.0
+# The input-identity hash likewise gets a floor past the audit budget.
+_HASH_FLOOR_S = 60.0
+# A figure the audit never got to check: the wording reaches the PM-facing
+# .audit.md, so it says what happened and who decides.
+_MATCH_DEADLINE_HINT = "核验未完成（截止时间已到）— 交由 PM 决定"
 _EXEMPT_MARKERS_PROMPT = ", ".join(f"`{m}`" for m in EXEMPT_MARKERS)
 
 REASON_ZH: dict[str, str] = {
@@ -1095,6 +1116,106 @@ def _extract_model_file_sha256s(
     return out
 
 
+def _extract_task(
+    draft_markdown: str, facts_markdown: str | None
+) -> tuple[list[ExtractedFigure], dict[str, dict[str, Any]]]:
+    """Step A (and the facts ledger parse) as one subprocess payload.
+
+    Combined so the audit pays one child boot for both; both are pure regex
+    over untrusted-length text, the exact work that must not hold this
+    process's GIL.
+    """
+    extracted = extract_figures(draft_markdown)
+    facts_ledger = parse_facts_ledger(facts_markdown) if facts_markdown else {}
+    return extracted, facts_ledger
+
+
+def _match_and_collect_task(
+    extracted: list[ExtractedFigure],
+    *,
+    thesis_doc: dict[str, Any] | None,
+    models_doc: dict[str, Any] | None,
+    model_cells: dict[str, dict[str, Any]] | None,
+    provenance_records: dict[str, dict[str, Any]] | None,
+    facts_ledger: dict[str, dict[str, Any]] | None,
+    metric_aliases: dict[str, list[str]] | None,
+    evidence_ref_bodies: dict[str, str] | None,
+    draft_path: str,
+    match_deadline: float | None,
+    collect_candidates: bool,
+) -> tuple[
+    list[MatchOutcome],
+    dict[str, list[tuple[int, ExtractedFigure, list[dict[str, Any]]]]],
+    dict[int, list[dict[str, Any]]],
+]:
+    """Step C plus judge-candidate collection in one child.
+
+    One child because the two share the source parse cache — splitting them
+    would re-parse every source body for the candidate scan. The cache is
+    created here and handed to both phases, exactly as the pre-isolation code
+    did on one instance. ``match_deadline`` is an absolute ``time.monotonic()``
+    instant (monotonic is system-wide, so it is meaningful inside the child);
+    the match marks whatever it cannot reach as 核验未完成 and returns partial
+    results instead of running on.
+    """
+    source_cache = SourceParseCache()
+    outcomes = match_figures(
+        extracted,
+        thesis_doc=thesis_doc,
+        models_doc=models_doc,
+        model_cells=model_cells,
+        provenance_records=provenance_records,
+        facts_ledger=facts_ledger,
+        metric_aliases=metric_aliases,
+        source_cache=source_cache,
+        evidence_ref_bodies=evidence_ref_bodies,
+        draft_path=draft_path,
+        deadline=match_deadline,
+    )
+    if not collect_candidates:
+        return outcomes, {}, {}
+    pending_by_section, pending_cands_by_idx = _collect_judge_candidates(
+        outcomes,
+        thesis_doc=thesis_doc,
+        models_doc=models_doc,
+        model_cells=model_cells,
+        provenance_records=provenance_records,
+        facts_ledger=facts_ledger or {},
+        metric_aliases=metric_aliases,
+        source_cache=source_cache,
+        evidence_ref_bodies=evidence_ref_bodies,
+        draft_path=draft_path,
+        deadline=match_deadline,
+    )
+    return outcomes, pending_by_section, pending_cands_by_idx
+
+
+def _deadline_marked_outcomes(extracted: list[ExtractedFigure]) -> list[MatchOutcome]:
+    """Every figure marked 核验未完成 — the shape the audit ends with when the
+    matching child was killed at its budget and no partial result came back."""
+    outcomes: list[MatchOutcome] = []
+    for fig in extracted:
+        if fig.exempt:
+            outcomes.append(
+                MatchOutcome(figure=fig, matched=True, kind="exempt", ref=fig.exempt_reason)
+            )
+        elif fig.label_hint == "incidental":
+            outcomes.append(
+                MatchOutcome(figure=fig, matched=False, kind="incidental", reason="incidental")
+            )
+        else:
+            outcomes.append(
+                MatchOutcome(
+                    figure=fig,
+                    matched=False,
+                    reason="uncertain",
+                    hint=_MATCH_DEADLINE_HINT,
+                    lock_unverified=True,
+                )
+            )
+    return outcomes
+
+
 async def aaudit_draft(
     draft_markdown: str,
     *,
@@ -1112,8 +1233,16 @@ async def aaudit_draft(
     thread_id: str | None = None,
     previous_audit_md: str | None = None,
     prompt_version: str | None = None,
+    deadline: float | None = None,
 ) -> AuditResult:
-    """Async 4-step figure audit (P0H §1.2 / P0I §1): Step A extract -> Step B LLM label -> Step C match -> Step D LLM judge + anchor."""
+    """Async 4-step figure audit (P0H §1.2 / P0I §1): Step A extract -> Step B LLM label -> Step C match -> Step D LLM judge + anchor.
+
+    ``deadline`` (``time.monotonic()``) spans the WHOLE audit when the caller
+    has one (``run_check_draft`` starts it before even loading provenance, so
+    the source prep shares the budget); None builds it here from config. The
+    CPU phases run in killable subprocesses: a thread still holds the GIL, and
+    one long regex in a worker starved every request including ``/health``
+    until the watchdog restarted the backend mid-turn (A1)."""
     if not user_id or not str(user_id).strip():
         raise ValueError("user_id is required")
     user_id = str(user_id).strip()
@@ -1141,7 +1270,17 @@ async def aaudit_draft(
     if use_llm_judge and not (await resolve_dalton_audit_model(user_id)).strip():
         raise ValueError("数字核验未配置模型：请在 dalton.yaml 的 publish.audit_model 指定。")
     eff_model, _eff_fallbacks, eff_prompt_ver, cfg_sha = config_fp
-    inputs_sha = await asyncio.to_thread(
+    # One budget for the whole audit. A caller-supplied deadline (started by
+    # run_check_draft before provenance loading) wins — the budget then covers
+    # the prep phases too; None builds it here from config. Model calls past it
+    # send nothing new (journalled results still replay), so the run ends near
+    # the deadline however calls fail.
+    if deadline is None:
+        deadline = time.monotonic() + pub.audit_total_timeout_s
+    # The input hash gets its own floor, not just the audit's remainder: it
+    # identifies the result for every later cache reuse, and a prep phase that
+    # consumed the whole budget must not also strip the audit of its identity.
+    inputs_sha = await run_in_heavy_subprocess(
         compute_audit_inputs_sha256,
         draft_markdown=draft_markdown,
         facts_markdown=facts_markdown,
@@ -1151,17 +1290,25 @@ async def aaudit_draft(
         provenance_records=provenance_records,
         metric_aliases=metric_aliases,
         evidence_ref_bodies=evidence_ref_bodies,
+        timeout_s=max(
+            deadline - time.monotonic() if deadline is not None else 0.0,
+            _HASH_FLOOR_S,
+        ),
+        label="audit.inputs_sha",
     )
-    # One budget for the whole audit, from here on: extraction, labelling, matching and
-    # judging. Model calls past it send nothing new (journalled results still replay),
-    # so the run ends near the deadline however calls fail.
-    deadline = time.monotonic() + pub.audit_total_timeout_s
-    source_cache = SourceParseCache()
     draft_sha = hashlib.sha256(draft_markdown.encode("utf-8")).hexdigest()
-    # The pure CPU steps below run in a worker thread: on a long draft they take
-    # minutes, and on the event loop they starved every request, including /health,
-    # until the watchdog restarted the backend mid-turn.
-    extracted = await asyncio.to_thread(extract_figures, draft_markdown)
+    try:
+        extracted, facts_ledger = await run_in_heavy_subprocess(
+            _extract_task,
+            draft_markdown,
+            facts_markdown,
+            deadline=deadline,
+            label="audit.extract",
+        )
+    except HeavyComputeTimeout as e:
+        raise RuntimeError(
+            "数字提取超过审计总时限：请缩短报告后重试，或调大 publish.audit_total_timeout_s"
+        ) from e
     labeling_incomplete = False
     labeling_stats: dict[str, Any] = {}
 
@@ -1178,44 +1325,62 @@ async def aaudit_draft(
         )
         labeling_incomplete = not labeling_ok
 
-    facts_ledger = await asyncio.to_thread(parse_facts_ledger, facts_markdown) if facts_markdown else {}
-
-    # Step C: Deterministic footnote matching (Orders 0–3) & candidate collection
-    outcomes = await asyncio.to_thread(
-        match_figures,
-        extracted,
-        thesis_doc=thesis_doc,
-        models_doc=models_doc,
-        model_cells=model_cells,
-        provenance_records=provenance_records,
-        facts_ledger=facts_ledger,
-        metric_aliases=metric_aliases,
-        source_cache=source_cache,
-        evidence_ref_bodies=evidence_ref_bodies,
-        draft_path=draft_path,
-    )
+    # Step C: Deterministic footnote matching (Orders 0–3) & candidate collection,
+    # in one killable child (see _match_and_collect_task). The child checks the
+    # deadline per figure and returns partial results; the parent-side kill at
+    # deadline + grace is the safety net for a single regex that cannot check.
+    try:
+        outcomes, pending_by_section, pending_cands_by_idx = (
+            await run_in_heavy_subprocess(
+                _match_and_collect_task,
+                extracted,
+                thesis_doc=thesis_doc,
+                models_doc=models_doc,
+                model_cells=model_cells,
+                provenance_records=provenance_records,
+                facts_ledger=facts_ledger,
+                metric_aliases=metric_aliases,
+                evidence_ref_bodies=evidence_ref_bodies,
+                draft_path=draft_path,
+                match_deadline=deadline,
+                collect_candidates=use_llm_judge,
+                timeout_s=max(0.0, deadline - time.monotonic()) + _DEADLINE_GRACE_S,
+                label="audit.match",
+            )
+        )
+    except HeavyComputeTimeout:
+        logger.warning(
+            "Audit matching killed at its budget for %s; marking all figures "
+            "核验未完成",
+            draft_path or workspace_id,
+        )
+        outcomes = _deadline_marked_outcomes(extracted)
+        pending_by_section, pending_cands_by_idx = {}, {}
 
     # Step D: Section-batched concurrent LLM judge (`Semaphore(4)`, <=10 figs/batch) + code anchoring (P0I §1.5–§1.6)
+    # A5: candidates were collected inside the match child; past the deadline no
+    # judge batch is started at all — every call would fail before sending, so
+    # spinning up 87 batches only printed three-model failures for a minute.
     if use_llm_judge:
         sem = asyncio.Semaphore(pub.audit_concurrency)
-        pending_by_section, pending_cands_by_idx = await asyncio.to_thread(
-            _collect_judge_candidates,
-            outcomes,
-            thesis_doc=thesis_doc,
-            models_doc=models_doc,
-            model_cells=model_cells,
-            provenance_records=provenance_records,
-            facts_ledger=facts_ledger,
-            metric_aliases=metric_aliases,
-            source_cache=source_cache,
-            evidence_ref_bodies=evidence_ref_bodies,
-            draft_path=draft_path,
-        )
 
         section_batches: list[tuple[str, list[tuple[int, ExtractedFigure, list[dict[str, Any]]]]]] = []
         for sec_key, sec_items in pending_by_section.items():
             for offset in range(0, len(sec_items), 10):
                 section_batches.append((sec_key, sec_items[offset : offset + 10]))
+
+        if section_batches and time.monotonic() >= deadline:
+            logger.warning(
+                "Audit deadline reached before judging %d batches for %s; "
+                "marking their figures 核验未完成",
+                len(section_batches),
+                draft_path or workspace_id,
+            )
+            # A5: figures whose candidates were already collected but will
+            # never be judged get the same 核验未完成 mark as the ones the
+            # match phase could not reach — not a silent "not found".
+            mark_unjudged_incomplete(outcomes, set())
+            section_batches = []
 
         async def _judge_batch(
             sec_title: str,
@@ -1324,32 +1489,25 @@ async def aaudit_draft(
                                     candidates=out.candidates,
                                 )
 
-        # Re-run Order 5 so derived figures can use figures verified by Step D (P0I §1.2, L34)
-        outcomes = await asyncio.to_thread(apply_derived_figure_matching, outcomes)
+        # Re-run Order 5 + candidate merge + result assembly in one child
+        # (see _finalize_task): all three walk the full outcome list, and the
+        # assembly renders excerpts for every figure, so none of it belongs on
+        # this process's GIL either.
+        outcomes = await _finalize_outcomes(
+            outcomes,
+            pending_cands_by_idx=pending_cands_by_idx,
+            with_derived=True,
+            stats=labeling_stats,
+        )
+    else:
+        # Step C already ran Order 5 inside match_figures; judging never
+        # verified anything new, so only the child isolation applies here.
+        outcomes = await _finalize_outcomes(
+            outcomes, pending_cands_by_idx=None, with_derived=False
+        )
 
-        # Attach top 5 candidates to any remaining unverified/uncertain items (P0I §1.6)
-        for idx, cand_sources in pending_cands_by_idx.items():
-            out = outcomes[idx]
-            if out.matched or out.figure.exempt or out.figure.label_hint == "incidental":
-                continue
-            existing_keys = {(c.kind, c.id) for c in out.candidates}
-            merged_cands = list(out.candidates)
-            for c_dict in cand_sources[:5]:
-                mc = _candidate_dict_to_match_candidate(out.figure, c_dict)
-                if (mc.kind, mc.id) not in existing_keys:
-                    existing_keys.add((mc.kind, mc.id))
-                    merged_cands.append(mc)
-                if len(merged_cands) >= 5:
-                    break
-            outcomes[idx].candidates = merged_cands[:5]
-
-    built = await asyncio.to_thread(
-        _build_audit_result,
-        draft_sha,
-        extracted,
-        outcomes,
-        labeling_incomplete=labeling_incomplete,
-        labeling_stats=labeling_stats,
+    built = await _build_result_isolated(
+        draft_sha, extracted, outcomes, labeling_incomplete, labeling_stats
     )
     built.reused = False
     built.inputs_sha256 = inputs_sha
@@ -1366,6 +1524,135 @@ async def aaudit_draft(
     return built
 
 
+def _finalize_outcomes_task(
+    outcomes: list[MatchOutcome],
+    *,
+    pending_cands_by_idx: dict[int, list[dict[str, Any]]],
+    with_derived: bool,
+) -> list[MatchOutcome]:
+    """Order-5 derived matching plus the top-5 candidate merge, as one child payload."""
+    if with_derived:
+        # Re-run Order 5 so derived figures can use figures verified by Step D (P0I §1.2, L34)
+        outcomes = apply_derived_figure_matching(outcomes)
+    for idx, cand_sources in pending_cands_by_idx.items():
+        out = outcomes[idx]
+        if out.matched or out.figure.exempt or out.figure.label_hint == "incidental":
+            continue
+        existing_keys = {(c.kind, c.id) for c in out.candidates}
+        merged_cands = list(out.candidates)
+        for c_dict in cand_sources[:5]:
+            mc = _candidate_dict_to_match_candidate(out.figure, c_dict)
+            if (mc.kind, mc.id) not in existing_keys:
+                existing_keys.add((mc.kind, mc.id))
+                merged_cands.append(mc)
+            if len(merged_cands) >= 5:
+                break
+        outcomes[idx].candidates = merged_cands[:5]
+    return outcomes
+
+
+async def _finalize_outcomes(
+    outcomes: list[MatchOutcome],
+    *,
+    pending_cands_by_idx: dict[int, list[dict[str, Any]]] | None,
+    with_derived: bool,
+    stats: dict[str, Any] | None = None,
+) -> list[MatchOutcome]:
+    # Fresh budget, not the audit deadline: this runs AFTER judging, which may
+    # itself have consumed the budget, and the audit must still finish cleanly.
+    try:
+        return await run_in_heavy_subprocess(
+            _finalize_outcomes_task,
+            outcomes,
+            pending_cands_by_idx=pending_cands_by_idx or {},
+            with_derived=with_derived,
+            timeout_s=_FINALIZE_GRACE_S,
+            label="audit.finalize",
+        )
+    except HeavyComputeTimeout:
+        # Killed even past the grace: do NOT re-run the same computation
+        # in-thread — that re-imports the GIL stall the subprocess exists to
+        # prevent, with no deadline. The outcomes as judged are already usable
+        # as-is; skip the derived pass, say so on the PM-facing stats, and keep
+        # whatever merge was skipped too (candidates stay as collected).
+        logger.warning(
+            "Audit finalize exceeded its grace budget; using judged outcomes "
+            "without the derived-matching pass"
+        )
+        if stats is not None:
+            stats["derived_matching_incomplete"] = True
+        return outcomes
+
+
+async def _build_result_isolated(
+    draft_sha: str,
+    extracted: list[ExtractedFigure],
+    outcomes: list[MatchOutcome],
+    labeling_incomplete: bool,
+    labeling_stats: dict[str, Any],
+) -> AuditResult:
+    try:
+        return await run_in_heavy_subprocess(
+            _build_audit_result,
+            draft_sha,
+            extracted,
+            outcomes,
+            labeling_incomplete=labeling_incomplete,
+            labeling_stats=labeling_stats,
+            timeout_s=_FINALIZE_GRACE_S,
+            label="audit.build",
+        )
+    except HeavyComputeTimeout:
+        # No in-thread retry either: re-running the assembly would re-import
+        # the GIL stall. Fail the audit loudly instead of hanging or lying.
+        logger.error("Audit result build exceeded its grace budget")
+        raise AuditBuildTimeout(
+            "审计结果汇总超时，请重试（publish.audit_total_timeout_s 或机器负载可能需要调整）"
+        ) from None
+
+
+def _should_go_to_judge(fig: ExtractedFigure, out: MatchOutcome) -> bool:
+    """The collector's own filter: which outcomes Step D is meant to judge.
+
+    Split out so the deadline paths can mark exactly the figures that SHOULD
+    have been judged but never were — same rule, one definition."""
+    if (
+        fig.exempt
+        or out.matched
+        or out.lock_unverified
+        or fig.label_hint == "incidental"
+    ):
+        return False
+    if (
+        ((fig.footnote_target or fig.footnote_targets) and _RequiresModelCellOnly(fig))
+        or out.reason in CONTRADICTED_REASONS
+        or bool(fig.missing_citations)
+        or bool(fig.duplicate_citations)
+    ):
+        return False
+    return True
+
+
+def mark_unjudged_incomplete(
+    outcomes: list[MatchOutcome], judged_indices: set[int]
+) -> list[MatchOutcome]:
+    """Mark 核验未完成 every outcome that should have gone to Step D but did
+    not (deadline hit during collection or before batching), keeping its
+    collected candidates for the PM. Locked out of any later judging pass."""
+    for idx, out in enumerate(outcomes):
+        if idx in judged_indices or not _should_go_to_judge(out.figure, out):
+            continue
+        outcomes[idx] = MatchOutcome(
+            figure=out.figure,
+            matched=False,
+            reason="uncertain",
+            hint=_MATCH_DEADLINE_HINT,
+            candidates=out.candidates,
+            lock_unverified=True,
+        )
+    return outcomes
+
+
 def _collect_judge_candidates(
     outcomes: list[MatchOutcome],
     *,
@@ -1378,27 +1665,26 @@ def _collect_judge_candidates(
     source_cache: SourceParseCache | None = None,
     evidence_ref_bodies: dict[str, str] | None = None,
     draft_path: str = "",
+    deadline: float | None = None,
 ) -> tuple[
     dict[str, list[tuple[int, ExtractedFigure, list[dict[str, Any]]]]],
     dict[int, list[dict[str, Any]]],
 ]:
+    """Group the figures Step D should judge, with their candidate sources.
+
+    ``deadline`` stops the collection early: each candidate scan walks every
+    source body, so past the budget it returns what it has — and marks every
+    figure that should have been judged but was not reached 核验未完成, so the
+    audit says what happened instead of leaving them as plain unmatched."""
     pending_by_section: dict[str, list[tuple[int, ExtractedFigure, list[dict[str, Any]]]]] = {}
     pending_cands_by_idx: dict[int, list[dict[str, Any]]] = {}
+    deadline_hit = False
     for idx, out in enumerate(outcomes):
+        if deadline is not None and time.monotonic() >= deadline:
+            deadline_hit = True
+            break
         fig = out.figure
-        if (
-            fig.exempt
-            or out.matched
-            or out.lock_unverified
-            or fig.label_hint == "incidental"
-        ):
-            continue
-        if (
-            ((fig.footnote_target or fig.footnote_targets) and _RequiresModelCellOnly(fig))
-            or out.reason in CONTRADICTED_REASONS
-            or bool(fig.missing_citations)
-            or bool(fig.duplicate_citations)
-        ):
+        if not _should_go_to_judge(fig, out):
             continue
         cand_sources = retrieve_candidate_sources(
             fig,
@@ -1417,6 +1703,8 @@ def _collect_judge_candidates(
         pending_cands_by_idx[idx] = cand_sources
         sec_key = str(fig.location.get("section") or "")
         pending_by_section.setdefault(sec_key, []).append((idx, fig, cand_sources))
+    if deadline_hit:
+        mark_unjudged_incomplete(outcomes, set(pending_cands_by_idx))
     return pending_by_section, pending_cands_by_idx
 
 
@@ -1442,6 +1730,16 @@ def render_audit_md(audit: AuditResult, *, draft_path: str = "") -> str:
         lines.extend(
             [
                 f"> ⚠️ **{warn_msg}**",
+                "",
+            ]
+        )
+    # A5 review: a finalize killed at its grace skips the derived-matching
+    # pass; the PM reading this sidecar must see WHY those figures read
+    # unverified instead of trusting the count blindly.
+    if audit.labeling.get("derived_matching_incomplete"):
+        lines.extend(
+            [
+                "> ⚠️ **派生匹配因超时未完成：部分本可由派生关系核实的数字仍显示为未核实**",
                 "",
             ]
         )

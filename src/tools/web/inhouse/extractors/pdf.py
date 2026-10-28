@@ -1,17 +1,35 @@
 """PDF content extractor using pdfplumber with pypdf fallback."""
 
-import asyncio
 import logging
 import re
-from io import BytesIO
 from urllib.parse import unquote, urlparse
+
+from mcp_servers._pdf_parse import pdfplumber_extract, pypdf_extract  # DALTON-HOOK(heavy-compute-isolation)
 
 from ..backend import CrawlOutput
 from .base import ExtractorError, ContentExtractor, _validate_url, register_extractor
+from src.dalton.heavy_compute import HeavyComputeError, HeavyComputeTimeout, run_in_heavy_subprocess
 
 logger = logging.getLogger(__name__)
 
 _MAX_PDF_SIZE = 20 * 1024 * 1024  # 20 MB
+
+# Per-parser budget. The parse runs in a killable subprocess, so hitting it
+# actually stops the work instead of abandoning a thread that keeps burning CPU.
+_PDF_PARSE_TIMEOUT_S = 30
+
+# DALTON-HOOK(heavy-compute-isolation): wording for a TERMINATED parse,
+# distinct from "no text" (a scanned PDF) — see _PDF_PARSE_TIMEOUT_MESSAGE.
+# What the model sees when the parse was TERMINATED at its budget — distinct
+# from "no text" (a scanned PDF): the caller must not fall back to the HTML
+# crawler on these bytes, and must not claim it looked like a scan.
+_PDF_PARSE_TIMEOUT_MESSAGE = (
+    "PDF 解析超时：解析被终止，文件可能过大或结构复杂，未获得正文。"
+)
+
+
+class PdfParseTimeout(Exception):
+    """Both parsers were terminated at their budget; no text was produced."""
 
 
 @register_extractor
@@ -28,7 +46,19 @@ class PdfExtractor(ContentExtractor):
             return None
 
         # Extract text
-        text = await self._extract_text(content)
+        try:
+            text = await self._extract_text(content)
+        except PdfParseTimeout:
+            # A terminated parse is NOT "extractor did not handle it": the
+            # bytes are a PDF. Returning them to the content router would drop
+            # them into the plain-web crawler, so answer in place.
+            logger.warning(f"PDF parse terminated at budget for {url}")
+            return CrawlOutput(
+                title=self._title_from_url(url),
+                html="",
+                markdown=_PDF_PARSE_TIMEOUT_MESSAGE,
+                parse_timeout=True,  # DALTON-HOOK(heavy-compute-isolation)
+            )
         if text is None:
             return None
 
@@ -49,7 +79,15 @@ class PdfExtractor(ContentExtractor):
                     f"（{len(content)} 字节）；最终地址：{url}"
                 ),
             )
-        text = await self._extract_text(content)
+        try:
+            text = await self._extract_text(content)
+        except PdfParseTimeout:
+            return CrawlOutput(
+                title=self._title_from_url(url),
+                html="",
+                markdown=_PDF_PARSE_TIMEOUT_MESSAGE,
+                parse_timeout=True,  # DALTON-HOOK(heavy-compute-isolation)
+            )
         if text is None or not text.strip():
             return CrawlOutput(
                 title=self._title_from_url(url),
@@ -92,61 +130,43 @@ class PdfExtractor(ContentExtractor):
             raise ExtractorError(f"Failed to download PDF: {e}") from e
 
     async def _extract_text(self, content: bytes) -> str | None:
-        """Extract text via pdfplumber, falling back to pypdf."""
-        try:
-            text = await asyncio.wait_for(
-                asyncio.to_thread(self._pdfplumber_extract, content),
-                timeout=30,
-            )
-            if text and text.strip():
-                return text
-        except asyncio.TimeoutError:
-            logger.warning("pdfplumber extraction timed out (30s)")
-        except Exception as e:
-            logger.debug(f"pdfplumber failed: {e}, trying pypdf fallback")
+        """Extract text via pdfplumber, falling back to pypdf.
 
-        # Fallback: pypdf
-        try:
-            text = await asyncio.wait_for(
-                asyncio.to_thread(self._pypdf_extract, content),
-                timeout=30,
-            )
-            if text and text.strip():
-                return text
-        except asyncio.TimeoutError:
-            logger.warning("pypdf extraction timed out (30s)")
-        except Exception as e:
-            logger.debug(f"pypdf fallback also failed: {e}")
+        DALTON-HOOK(heavy-compute-isolation): each parse runs in a bounded
+        subprocess with a hard deadline. The old ``wait_for(to_thread(...))``
+        only stopped *waiting* — the orphaned thread kept its GIL-holding parse
+        alive, and the fallback parser then stacked a second one on top.
+        Raises :class:`PdfParseTimeout` when the parsers were killed at budget,
+        so callers can say THAT instead of guessing "scanned document".
+        """
+        timed_out = False
+        for parse, parser_name in (
+            (pdfplumber_extract, "pdfplumber"),
+            (pypdf_extract, "pypdf"),
+        ):
+            try:
+                text = await run_in_heavy_subprocess(
+                    parse,
+                    content,
+                    timeout_s=_PDF_PARSE_TIMEOUT_S,
+                    label=f"pdf-extract:{parser_name}",
+                )
+                if text and text.strip():
+                    return text
+            except HeavyComputeTimeout:
+                logger.warning(
+                    f"{parser_name} extraction terminated at {_PDF_PARSE_TIMEOUT_S}s budget"
+                )
+                timed_out = True
+            except HeavyComputeError as e:
+                logger.debug(f"{parser_name} parse failed, trying next parser: {e}")
 
+        if timed_out:
+            raise PdfParseTimeout(parser_name)
         return None
 
     @staticmethod
-    def _pdfplumber_extract(content: bytes) -> str:
-        import pdfplumber
-
-        pages: list[str] = []
-        with pdfplumber.open(BytesIO(content)) as pdf:
-            for i, page in enumerate(pdf.pages, 1):
-                text = page.extract_text() or ""
-                page.close()
-                if text.strip():
-                    pages.append(f"--- Page {i} ---\n\n{text}")
-        return "\n\n".join(pages)
-
-    @staticmethod
-    def _pypdf_extract(content: bytes) -> str:
-        import pypdf
-
-        reader = pypdf.PdfReader(BytesIO(content))
-        pages: list[str] = []
-        for i, page in enumerate(reader.pages, 1):
-            text = page.extract_text() or ""
-            if text.strip():
-                pages.append(f"--- Page {i} ---\n\n{text}")
-        return "\n\n".join(pages)
-
-    @staticmethod
-    def _title_from_url(url: str) -> str:
+    def _title_from_url(url: str) -> str:  # DALTON-HOOK(heavy-compute-isolation)
         path = urlparse(url).path
         filename = path.rsplit("/", 1)[-1] if "/" in path else path
         name = re.sub(r"\.pdf$", "", unquote(filename), flags=re.IGNORECASE)

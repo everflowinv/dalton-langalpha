@@ -299,4 +299,51 @@ describe('PublishApprovalCard', () => {
       screen.getByText('Official Research Publication Approval (PM Final Review)')
     ).toBeInTheDocument();
   });
+
+  // DALTON-HOOK(heavy-compute-isolation): a finalize killed at its grace skips
+  // the derived-matching pass; the card must say so even when labeling itself
+  // completed cleanly.
+  it('renders the derived-matching incomplete warning when labeling.derived_matching_incomplete is set', async () => {
+    await i18n.changeLanguage('zh-CN');
+
+    const state: ToolApprovalState = {
+      status: 'pending',
+      toolName: 'mcp__dalton-publish__publish_report',
+      server: 'dalton-publish',
+      tool: 'publish_report',
+      actionIndex: 0,
+      actionCount: 1,
+      args: {
+        request_id: 'req-derived1234567',
+        ticker: 'HSY',
+        title: 'HSY FY24 复盘',
+        kind: 'topic',
+        draft_path: 'drafts/hsy-fy24.md',
+        figure_summary: {
+          verified: 10,
+          contradicted: 0,
+          unverified: 4,
+          uncertain: 0,
+          exempt: 0,
+          labeling: {
+            total: 14,
+            labeled: 14,
+            batches: 2,
+            failed_batches: 0,
+            derived_matching_incomplete: true,
+          },
+        },
+      },
+    };
+
+    render(<PublishApprovalCard data={state} />);
+
+    expect(screen.getByTestId('publish-derived-incomplete-warning')).toHaveTextContent(
+      '派生匹配因超时未完成：部分本可由派生关系核实的数字仍显示为未核实'
+    );
+    // Labeling itself completed: the labeling-incomplete line stays absent.
+    expect(screen.getByTestId('publish-labeling-incomplete-warning')).not.toHaveTextContent(
+      '标注未完成'
+    );
+  });
 });

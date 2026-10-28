@@ -6,6 +6,7 @@ import dataclasses
 import io
 import posixpath
 import re
+import time
 import xml.etree.ElementTree as ET
 import zipfile
 from typing import Any
@@ -1882,10 +1883,17 @@ def match_figures(
     source_cache: SourceParseCache | None = None,
     evidence_ref_bodies: dict[str, str] | None = None,
     draft_path: str = "",
+    deadline: float | None = None,
 ) -> list[MatchOutcome]:
     """Step C: Match footnoted figures (Orders 0–3) and collect candidates for unfootnoted figures (P0I §1.2, L34, L36).
 
     Unfootnoted figures NEVER become `matched=True` here; Order 0b and Order 4 only produce candidates for Step D.
+
+    ``deadline`` (``time.monotonic()``) is checked once per figure: at the
+    budget every figure not yet reached is returned marked 核验未完成 and
+    locked out of Step D, so a big draft returns its partial results instead
+    of running on for hours (A5 — one audit ran 103 minutes past its budget
+    because nothing in this loop looked at the clock).
     """
     if source_cache is None:
         source_cache = SourceParseCache()
@@ -2399,6 +2407,21 @@ def match_figures(
         if fig.label_hint == "incidental":
             outcomes.append(
                 MatchOutcome(figure=fig, matched=False, kind="incidental", reason="incidental")
+            )
+            continue
+
+        # A5: the per-figure deadline check — one figure × every source body is
+        # where the unbounded work lives, so the budget is enforced here. Cheap
+        # classifications (exempt/incidental) above still get their real outcome.
+        if deadline is not None and time.monotonic() >= deadline:
+            outcomes.append(
+                MatchOutcome(
+                    figure=fig,
+                    matched=False,
+                    reason="uncertain",
+                    hint="核验未完成（截止时间已到）— 交由 PM 决定",
+                    lock_unverified=True,
+                )
             )
             continue
 

@@ -3613,9 +3613,13 @@ class TestSandboxRecovery:
 
     @pytest.mark.asyncio
     async def test_second_stop_wait_continues_when_the_stop_settles(self):
+        """DALTON-HOOK(acquire-retry-bound): A3 — the SECOND stop-wait raises
+        whatever the machine's state, instead of retrying again (the
+        running-workspace/stopped-machine drill recursed here forever). Counted
+        on ``stop_waits``, not ``attempt``: the first entry still settles and
+        retries; see test_acquire_retry_bound."""
         manager = self._make_manager()
-        session = _make_mock_session()
-        manager._acquire_session = AsyncMock(return_value=session)
+        manager._acquire_session = AsyncMock(return_value=_make_mock_session())
         stopped = _make_computer(status="stopped")
 
         with (
@@ -3624,24 +3628,20 @@ class TestSandboxRecovery:
                 f"{_LIFECYCLE}.get_computer",
                 new=AsyncMock(side_effect=[stopped, stopped]),
             ),
+            pytest.raises(RuntimeError, match="inconsistent"),
         ):
-            result = await manager._await_stop_and_retry(
+            await manager._await_stop_and_retry(
                 _binding("ws-a", stopped),
                 user_id="user-1",
                 workspace_user_id="user-1",
                 on_state_observed=None,
-                attempt=1,
+                attempt=1,  # e.g. bumped by the start-failure retry
+                stop_waits=1,  # one stop already waited: this one is the bound
             )
 
-        assert result is session
-        manager._acquire_session.assert_awaited_once_with(
-            "ws-a",
-            user_id="user-1",
-            on_state_observed=None,
-            _attempt=2,
-        )
+        manager._acquire_session.assert_not_awaited()
 
-    @pytest.mark.asyncio
+    @pytest.mark.asyncio  # DALTON-HOOK(acquire-retry-bound): next test resumes the suite
     @cm_patch("db_get_workspace")
     @cm_patch("SessionManager")
     @patch(f"{_LIFECYCLE}.update_workspace_status", new_callable=AsyncMock)

@@ -7,6 +7,7 @@ import copy
 import hashlib
 import logging
 import re
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -17,10 +18,15 @@ from langgraph.types import interrupt
 from src.dalton.auth import verify_workspace_access
 from src.dalton.database import knowledge as db_knowledge
 from src.dalton.database import publications as db_publications
+from src.dalton.heavy_compute import (
+    HeavyComputeTimeout,
+    run_in_heavy_subprocess,
+)
 from src.dalton.knowledge.paths import PUBLISHED_INDEX, RENDERED
 from src.dalton.knowledge.render import render_published_index_md
 from src.dalton.knowledge.service import apply_update
 from src.dalton.publish.audit import (
+    AuditBuildTimeout,
     aaudit_draft,
     resolve_audit_config_fingerprint,
     compute_audit_inputs_sha256,
@@ -508,8 +514,17 @@ async def _load_workspace_provenance(
     referenced_ids: set[str] | None = None,
     initial_limit: int = 300,
     max_limit: int = 1500,
+    deadline: float | None = None,
 ) -> dict[str, dict[str, Any]]:
-    """Load provenance records and inline bodies for threads in ``workspace_id`` using tiered + on-demand retrieval."""
+    """Load provenance records and inline bodies for threads in ``workspace_id`` using tiered + on-demand retrieval.
+
+    ``deadline`` (``time.monotonic()``) covers the source precheck too: the
+    figures × sources cross-match used to run straight on the event loop, with
+    no yield and no budget, which is a confirmed cause of the 60s+ stalls (A1).
+    A missing deadline defaults to the configured audit budget.
+    """
+    if deadline is None:
+        deadline = time.monotonic() + get_dalton_config().publish.audit_total_timeout_s
     out: dict[str, dict[str, Any]] = {}
 
     def _add_row(row: Any) -> None:
@@ -596,38 +611,54 @@ async def _load_workspace_provenance(
                         _add_row(row)
 
                 remaining_for_expand = max(0, max_limit - len(out))
-                if (
-                    remaining_for_expand > 0
-                    and max_limit > first_limit
-                    and bool(draft_text and draft_text.strip())
-                    and not _prov_hits_all_key_figures(
-                        draft_text, out, draft_path=draft_path
-                    )
+                if remaining_for_expand > 0 and max_limit > first_limit and bool(
+                    draft_text and draft_text.strip()
                 ):
-                    await cur.execute(
-                        """
-                        SELECT pr.provenance_record_id::text,
-                               pr.source_type,
-                               pr.identifier,
-                               pr.title,
-                               pr.detail,
-                               pr.provider,
-                               pr.result_sha256,
-                               pr.result_snippet,
-                               pb.body_inline
-                        FROM provenance_records pr
-                        JOIN conversation_threads ct
-                          ON ct.conversation_thread_id = pr.conversation_thread_id
-                        LEFT JOIN provenance_result_bodies pb
-                          ON pb.result_sha256 = pr.result_sha256
-                        WHERE ct.workspace_id = %s
-                        ORDER BY pr.emitted_at DESC NULLS LAST
-                        LIMIT %s OFFSET %s
-                        """,
-                        (workspace_id, remaining_for_expand, first_limit),
-                    )
-                    for row in await cur.fetchall():
-                        _add_row(row)
+                    # A1/A5: the precheck runs in a killable subprocess under the
+                    # audit-wide deadline. On a budget overrun, load the wider tier
+                    # anyway: the match phase re-checks against it under the same
+                    # deadline and marks what it cannot finish.
+                    try:
+                        hits = await run_in_heavy_subprocess(
+                            _prov_hits_all_key_figures,
+                            draft_text,
+                            out,
+                            draft_path=draft_path,
+                            deadline=deadline,
+                            label="publish.prov_precheck",
+                        )
+                    except HeavyComputeTimeout:
+                        logger.warning(
+                            "Provenance precheck for %s hit the audit deadline; "
+                            "loading the wider provenance tier regardless",
+                            workspace_id,
+                        )
+                        hits = False
+                    if not hits:
+                        await cur.execute(
+                            """
+                            SELECT pr.provenance_record_id::text,
+                                   pr.source_type,
+                                   pr.identifier,
+                                   pr.title,
+                                   pr.detail,
+                                   pr.provider,
+                                   pr.result_sha256,
+                                   pr.result_snippet,
+                                   pb.body_inline
+                            FROM provenance_records pr
+                            JOIN conversation_threads ct
+                              ON ct.conversation_thread_id = pr.conversation_thread_id
+                            LEFT JOIN provenance_result_bodies pb
+                              ON pb.result_sha256 = pr.result_sha256
+                            WHERE ct.workspace_id = %s
+                            ORDER BY pr.emitted_at DESC NULLS LAST
+                            LIMIT %s OFFSET %s
+                            """,
+                            (workspace_id, remaining_for_expand, first_limit),
+                        )
+                        for row in await cur.fetchall():
+                            _add_row(row)
     except Exception as e:
         logger.debug("Could not load provenance records for workspace %s: %s", workspace_id, e)
     return out
@@ -663,6 +694,12 @@ async def run_check_draft(
             "message": f"ERROR: Draft file not found at {draft_path}",
         }
 
+    # A5: one wall-clock budget for the whole check, starting HERE — before the
+    # provenance precheck and the reusable-audit hash, which previously ran
+    # before the deadline existed and so could burn unbounded CPU (and loop
+    # time) before the budgeted phases even began.
+    audit_deadline = time.monotonic() + get_dalton_config().publish.audit_total_timeout_s
+
     facts_text: str | None = None
     if facts_path:
         facts_text = await backend.aread_text(facts_path)
@@ -679,6 +716,7 @@ async def run_check_draft(
             draft_path=draft_path,
             draft_text=draft_text,
             referenced_ids=_extract_referenced_prov_ids(draft_text, facts_text),
+            deadline=audit_deadline,
         )
     if model_cells is None:
         model_cells = await _load_referenced_model_cells(
@@ -694,20 +732,34 @@ async def run_check_draft(
     )
     audit_path, annotated_path = _derive_sidecar_paths(draft_path)
     existing_audit_md = await _read_optional_text(backend, audit_path)
-    cached_audit = try_load_reusable_audit_from_md(
-        existing_audit_md,
-        draft_markdown=draft_text,
-        thesis_doc=thesis_doc,
-        models_doc=models_doc,
-        model_cells=model_cells,
-        provenance_records=provenance_records,
-        facts_markdown=facts_text,
-        evidence_ref_bodies=evidence_ref_bodies,
-        use_llm_judge=use_llm_judge,
-        config_fingerprint=await resolve_audit_config_fingerprint(
-            user_id, use_llm_judge=use_llm_judge
-        ),
-    )
+    # A5: the reusable-audit hash re-serialises every input (all provenance
+    # bodies included), so it rides the same deadline and subprocess as the
+    # phases it stands before. A budget overrun just means no cached reuse:
+    # the audit below runs under the same deadline and degrades the same way.
+    try:
+        cached_audit = await run_in_heavy_subprocess(
+            try_load_reusable_audit_from_md,
+            existing_audit_md,
+            draft_markdown=draft_text,
+            thesis_doc=thesis_doc,
+            models_doc=models_doc,
+            model_cells=model_cells,
+            provenance_records=provenance_records,
+            facts_markdown=facts_text,
+            evidence_ref_bodies=evidence_ref_bodies,
+            use_llm_judge=use_llm_judge,
+            config_fingerprint=await resolve_audit_config_fingerprint(
+                user_id, use_llm_judge=use_llm_judge
+            ),
+            deadline=audit_deadline,
+            label="publish.audit_cache_check",
+        )
+    except HeavyComputeTimeout:
+        logger.warning(
+            "Reusable-audit hash for %s hit the audit deadline; re-auditing",
+            draft_path,
+        )
+        cached_audit = None
     if cached_audit is not None:
         cached_audit.unrecalculated_model_warnings = unrecalc_warnings
         if unrecalc_warnings and any(
@@ -729,20 +781,26 @@ async def run_check_draft(
             "message": f"{warn_lead}{cached_audit.summary_line(audit_path)}",
         }
 
-    audit = await aaudit_draft(
-        draft_text,
-        thesis_doc=thesis_doc,
-        models_doc=models_doc,
-        model_cells=model_cells,
-        provenance_records=provenance_records,
-        facts_markdown=facts_text,
-        evidence_ref_bodies=evidence_ref_bodies,
-        draft_path=draft_path,
-        use_llm_judge=use_llm_judge,
-        user_id=user_id,
-        workspace_id=workspace_id,
-        thread_id=thread_id,
-    )
+    try:
+        audit = await aaudit_draft(
+            draft_text,
+            thesis_doc=thesis_doc,
+            models_doc=models_doc,
+            model_cells=model_cells,
+            provenance_records=provenance_records,
+            facts_markdown=facts_text,
+            evidence_ref_bodies=evidence_ref_bodies,
+            draft_path=draft_path,
+            use_llm_judge=use_llm_judge,
+            user_id=user_id,
+            workspace_id=workspace_id,
+            thread_id=thread_id,
+            deadline=audit_deadline,
+        )
+    except AuditBuildTimeout as e:
+        # The assembly phase died at its grace budget: no sidecars to write,
+        # the tool result itself reports the failure.
+        return {"ok": False, "message": str(e)}
     audit.unrecalculated_model_warnings = unrecalc_warnings
 
     audit_md = await asyncio.to_thread(render_audit_md, audit, draft_path=draft_path)
@@ -850,6 +908,10 @@ async def run_publish(
             "message": f"ERROR: Draft file not found at {draft_path}",
         }
     draft_bytes = draft_text.encode("utf-8")
+    # A5: the publish state machine re-audits through the same wall-clock budget
+    # as check_draft — its provenance precheck, reuse hash and audit phases all
+    # hang off this one deadline.
+    audit_deadline = time.monotonic() + get_dalton_config().publish.audit_total_timeout_s
 
     # Read attachments & compute bundle_sha256
     att_list: list[dict[str, Any]] = []
@@ -974,6 +1036,7 @@ async def run_publish(
             draft_path=draft_path,
             draft_text=draft_text,
             referenced_ids=_extract_referenced_prov_ids(draft_text, facts_text),
+            deadline=audit_deadline,
         )
         model_cells = await _load_referenced_model_cells(
             backend, draft_text, facts_text, models_doc
@@ -981,16 +1044,23 @@ async def run_publish(
         evidence_ref_bodies = await _load_evidence_ref_bodies(
             backend, thesis_doc, draft_path=draft_path
         )
-        current_inputs_sha = await asyncio.to_thread(
-            compute_audit_inputs_sha256,
-            draft_markdown=draft_text,
-            facts_markdown=facts_text,
-            thesis_doc=thesis_doc,
-            models_doc=models_doc,
-            model_cells=model_cells,
-            provenance_records=prov_records,
-            evidence_ref_bodies=evidence_ref_bodies,
-        )
+        try:
+            current_inputs_sha = await run_in_heavy_subprocess(
+                compute_audit_inputs_sha256,
+                draft_markdown=draft_text,
+                facts_markdown=facts_text,
+                thesis_doc=thesis_doc,
+                models_doc=models_doc,
+                model_cells=model_cells,
+                provenance_records=prov_records,
+                evidence_ref_bodies=evidence_ref_bodies,
+                deadline=audit_deadline,
+                label="publish.inputs_sha",
+            )
+        except HeavyComputeTimeout:
+            # Budget gone before the reuse hash: skip the reuse comparison; the
+            # re-audit below runs under the same deadline.
+            current_inputs_sha = ""
         _, _, _, current_cfg_sha = await resolve_audit_config_fingerprint(user_id, use_llm_judge=True)
         prev_audit = row.get("audit") if isinstance(row.get("audit"), dict) else {}
         prev_inputs_sha = str(prev_audit.get("inputs_sha256") or "")
@@ -1041,6 +1111,7 @@ async def run_publish(
                 draft_path=draft_path,
                 draft_text=draft_text,
                 referenced_ids=_extract_referenced_prov_ids(draft_text, facts_text),
+                deadline=audit_deadline,
             )
         if model_cells is None:
             model_cells = await _load_referenced_model_cells(
@@ -1052,35 +1123,59 @@ async def run_publish(
             )
         audit_path, annotated_path = _derive_sidecar_paths(draft_path)
         existing_audit_md = await _read_optional_text(backend, audit_path)
-        audit = try_load_reusable_audit_from_md(
-            existing_audit_md,
-            draft_markdown=draft_text,
-            thesis_doc=thesis_doc,
-            models_doc=models_doc,
-            model_cells=model_cells,
-            provenance_records=prov_records,
-            facts_markdown=facts_text,
-            evidence_ref_bodies=evidence_ref_bodies,
-            use_llm_judge=True,
-            config_fingerprint=await resolve_audit_config_fingerprint(
-                user_id, use_llm_judge=True
-            ),
-        )
-        if audit is None:
-            audit = await aaudit_draft(
-                draft_text,
+        try:
+            audit = await run_in_heavy_subprocess(
+                try_load_reusable_audit_from_md,
+                existing_audit_md,
+                draft_markdown=draft_text,
                 thesis_doc=thesis_doc,
                 models_doc=models_doc,
                 model_cells=model_cells,
                 provenance_records=prov_records,
                 facts_markdown=facts_text,
                 evidence_ref_bodies=evidence_ref_bodies,
-                draft_path=draft_path,
                 use_llm_judge=True,
-                user_id=user_id,
-                workspace_id=workspace_id,
-                thread_id=thread_id,
+                config_fingerprint=await resolve_audit_config_fingerprint(
+                    user_id, use_llm_judge=True
+                ),
+                deadline=audit_deadline,
+                label="publish.audit_cache_check",
             )
+        except HeavyComputeTimeout:
+            audit = None
+        if audit is None:
+            try:
+                audit = await aaudit_draft(
+                    draft_text,
+                    thesis_doc=thesis_doc,
+                    models_doc=models_doc,
+                    model_cells=model_cells,
+                    provenance_records=prov_records,
+                    facts_markdown=facts_text,
+                    evidence_ref_bodies=evidence_ref_bodies,
+                    draft_path=draft_path,
+                    use_llm_judge=True,
+                    user_id=user_id,
+                    workspace_id=workspace_id,
+                    thread_id=thread_id,
+                    deadline=audit_deadline,
+                )
+            except AuditBuildTimeout as e:
+                # A5 review: the request is already 'auditing'; without this
+                # settle the row would sit there forever. Same transition the
+                # not-passed audit takes, with the failure wording saved.
+                logger.error(
+                    "Audit build timed out for request %s: %s", req_id, e
+                )
+                await db_publications.transition(
+                    req_id, ("auditing",), "audit_failed", error=str(e)
+                )
+                return {
+                    "ok": False,
+                    "status": "audit_failed",
+                    "reused": False,
+                    "message": str(e),
+                }
             audit.unrecalculated_model_warnings = unrecalc_warnings
             await backend.awrite_text(
                 audit_path, await asyncio.to_thread(render_audit_md, audit, draft_path=draft_path)

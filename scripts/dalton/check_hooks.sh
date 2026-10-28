@@ -133,6 +133,20 @@ ALLOWED_HOOKS=(
   # disk yet, and creates it on the turn's Home computer when it can
   # (secretary/tools.py).
   "workspace-folder-ready"
+  # LaneA/A1: CPU-heavy compute (publish audit phases, whole-page HTML and PDF
+  # extraction, large-result provenance prep, incremental token counting) runs
+  # in bounded killable subprocesses or off the loop, instead of to_thread
+  # calls that still hold the GIL and starve the event loop.
+  "heavy-compute-isolation"
+  # LaneA/A4: direct calls on subsidiary OAuth clients (WebFetch extraction,
+  # compaction fallback summary, server-side LLMService) rebuild the client
+  # once on a mid-turn 401 instead of failing until the next turn.
+  "oauth-refresh-direct"
+  # LaneA/A3: acquiring a workspace errors on the second stop-and-retry entry
+  # whatever the computer's state, bounding the acquire/retry cycle that used
+  # to recurse forever on a running-workspace/stopped-machine split
+  # (computer_manager/_lifecycle.py).
+  "acquire-retry-bound"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

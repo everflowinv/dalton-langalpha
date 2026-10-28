@@ -84,6 +84,9 @@ class CrawlResult:
     # The two breakers report apart: one host's is that host's doing, the
     # infra one is ours.
     error_type: Optional[str] = None
+    # DALTON-HOOK(heavy-compute-isolation): True when the markdown is a
+    # terminated-parse wording rather than page content.
+    parse_timeout: Optional[bool] = None
 
 
 _VALID_BACKENDS = frozenset({"scrapling", "router"})
@@ -505,6 +508,9 @@ class SafeCrawlerWrapper:
             success=True,
             markdown=output.markdown,
             title=output.title,
+            # DALTON-HOOK(heavy-compute-isolation): terminated-parse marker rides
+            # a success so the timeout wording survives the provider chain.
+            parse_timeout=output.parse_timeout,
         )
 
     async def _classify_exception(

@@ -217,6 +217,31 @@ def _is_agent_infra_path(path: str, root: str | None = None) -> bool:
 # its notice (``awrap_model_call``).
 _MCP_TRACE_TOOLS = ("ExecuteCode", "Bash")
 
+# DALTON-HOOK(heavy-compute-isolation): the loop-time cost of extraction and
+# emit-prep scales with the untrusted input's size — a fetched page runs to
+# ~400K chars and an mcp_trace to 200 entries × 64 KiB bodies. Below this
+# volume every operation is µs–ms C work (json/scans/sha); at or above it the
+# batch moves to a thread so one huge result cannot add its parse to a stall.
+# Everything is bounded (trace entry caps, 64 KiB body clamp), so a process is
+# not warranted — only the hop off the loop.
+_LARGE_RESULT_CHARS = 128_000
+
+
+def _result_volume(result: Any) -> int:
+    """Cheap upper-bound proxy of the bytes extraction will walk: the content
+    string plus any mcp_trace bodies riding the artifact."""
+    content = getattr(result, "content", result)
+    total = len(content) if isinstance(content, str) else 0
+    artifact = getattr(result, "artifact", None)
+    if isinstance(artifact, dict):
+        trace = artifact.get("mcp_trace")
+        if isinstance(trace, list):
+            for entry in trace[:200]:
+                body = entry.get("result_body") if isinstance(entry, dict) else None
+                if isinstance(body, str):
+                    total += len(body)
+    return total
+
 # A ThreadStatus look that showed a command's end first drops its notice, so
 # the look brings the command's sources (``shown_commands``).
 _THREAD_STATUS = "ThreadStatus"
@@ -358,7 +383,15 @@ class ProvenanceMiddleware(AgentMiddleware):
                 return result
 
             try:
-                sources = list(extractor(request, result))
+                # DALTON-HOOK(heavy-compute-isolation): a large result (whole
+                # page, fat mcp_trace) extracts off the loop; small ones stay
+                # inline — this runs after every tool call.
+                if _result_volume(result) >= _LARGE_RESULT_CHARS:
+                    sources = await asyncio.to_thread(
+                        lambda: list(extractor(request, result))
+                    )
+                else:
+                    sources = list(extractor(request, result))
             finally:
                 # mcp_trace is provenance-only scaffolding carrying raw in-sandbox
                 # args + snippets. Strip it from the artifact (after extraction
@@ -442,11 +475,17 @@ class ProvenanceMiddleware(AgentMiddleware):
         if writer is None:
             return
 
+        # DALTON-HOOK(heavy-compute-isolation): the verify/redact/body build is
+        # proportional to the summed body bytes (redaction scans every body in
+        # full); a fat batch prepares on a thread, then emits in order on-loop.
+        body_chars = sum(len(s.result_body or "") for s in sources)
+        if body_chars >= _LARGE_RESULT_CHARS:
+            prepared = await asyncio.to_thread(self._prepare_sources, sources)
+        else:
+            prepared = self._prepare_sources(sources)
+
         body_batch: list[tuple] = []
-        for source in sources:
-            self._verify_source_sha(source)
-            source.result_snippet = self._redact_snippet(source.result_snippet)
-            source.title = self._redact_snippet(source.title)
+        for source, item in prepared:
             try:
                 writer(build_provenance_event(source))
             except Exception:
@@ -455,7 +494,6 @@ class ProvenanceMiddleware(AgentMiddleware):
                     label,
                     exc_info=True,
                 )
-            item = self._body_item(source)
             if item is not None:
                 body_batch.append(item)
         # One batched write per emit (best-effort, never on the SSE event):
@@ -466,6 +504,23 @@ class ProvenanceMiddleware(AgentMiddleware):
         # tool result or the next LLM step; the events above already went out.
         if body_batch:
             await schedule_body_write(self._body_flush_tasks, store_bodies(body_batch))
+
+    def _prepare_sources(
+        self, sources: list[ProvenanceSource]
+    ) -> list[tuple[ProvenanceSource, tuple | None]]:
+        """The CPU part of an emit: sha verification, snippet/title redaction,
+        and the store tuple — pure, no I/O, safe to run on a worker thread.
+
+        DALTON-HOOK(heavy-compute-isolation): split out of ``_emit`` so a fat
+        batch (summed bodies past the threshold) can prepare on a thread.
+        """
+        prepared: list[tuple[ProvenanceSource, tuple | None]] = []
+        for source in sources:
+            self._verify_source_sha(source)
+            source.result_snippet = self._redact_snippet(source.result_snippet)
+            source.title = self._redact_snippet(source.title)
+            prepared.append((source, self._body_item(source)))
+        return prepared
 
     def _redact_snippet(self, snippet: str | None) -> str | None:
         """Scrub secrets from a snippet; drop it if redaction itself fails."""

@@ -147,6 +147,8 @@ class SessionLifecycleMixin:
         on_state_observed: Callable[[str], None] | None = None,
         skills_signature: str | None = None,
         _attempt: int = 0,
+        # DALTON-HOOK(acquire-retry-bound): stop-waits counted apart from attempts
+        _stop_waits: int = 0,
     ) -> Session:
         """Sizing and always-on belong to create/restart, not post-start checks.
 
@@ -341,24 +343,26 @@ class SessionLifecycleMixin:
                     phase2_owner = True
 
         if pending_stop_wait:
-            return await self._await_stop_and_retry(
+            return await self._await_stop_and_retry(  # DALTON-HOOK(acquire-retry-bound)
                 binding,
                 user_id=user_id,
                 workspace_user_id=workspace_user_id,
                 on_state_observed=on_state_observed,
                 attempt=_attempt,
+                stop_waits=_stop_waits,
             )
 
         # Wait outside the lock so a 60-300s restore cannot block other operations.
         if pending_start_wait:
             # Attach/retry applies sizing and always-on at create/restart; no extra check.
-            attached = await self._await_in_flight_start(
+            attached = await self._await_in_flight_start(  # DALTON-HOOK(acquire-retry-bound)
                 binding,
                 user_id=user_id,
                 workspace_user_id=workspace_user_id,
                 on_state_observed=on_state_observed,
                 mark=_mark,
                 attempt=_attempt,
+                stop_waits=_stop_waits,
             )
             return attached
 
@@ -409,13 +413,36 @@ class SessionLifecycleMixin:
         workspace_user_id: str | None,
         on_state_observed: Callable[[str], None] | None,
         attempt: int,
+        stop_waits: int = 0,
     ) -> Session:
         """Let a stop finish, then acquire again from whatever state it left.
 
         Runs with no lock held, so the retry is a plain re-entry into
         acquisition instead of the hand-built session the in-lock version had
-        to assemble for a corrected row."""
+        to assemble for a corrected row.
+
+        DALTON-HOOK(acquire-retry-bound): the bound is on STOP-WAITS, counted
+        separately from ``attempt`` (A3 review): a start-failure retry bumps
+        ``attempt`` without ever having waited on a stop, and under the old
+        shared counter that innocent retry made the FIRST real stop-wait error
+        out. The second stop-wait errors out WHATEVER the computer's state is —
+        the retry used to recurse unconditionally when the re-entry landed in a
+        stop wait again (workspace row `running`, machine `stopped`, attach CAS
+        failing, forever). The CAS itself stays: it is what keeps a stop claimed
+        on another worker from being stomped. The machine's actual state rides
+        the error so the drill report says what was inconsistent."""
         workspace_id = binding.workspace_id
+        if stop_waits > 0:
+            computer = await get_computer(binding.computer_id)
+            state = (
+                str(computer["status"]) if computer is not None else "deleted"
+            )
+            raise RuntimeError(
+                f"Workspace {workspace_id} and computer {binding.computer_id} "
+                f"state are inconsistent (computer={state}) after a stop "
+                "settled and was retried once; please retry, or stop and "
+                "start the computer"
+            )
         logger.info(f"Workspace {workspace_id} is stopping, waiting for it to finish")
         settled = False
         for _ in range(20):
@@ -433,25 +460,12 @@ class SessionLifecycleMixin:
         if not settled:
             await self._correct_stuck_stopping(binding)
 
-        if attempt > 0:
-            # One retry only: a machine that is still stopping after a
-            # correction is a state to report, not to spin on.
-            computer = await get_computer(binding.computer_id)
-            if computer is None:
-                raise RuntimeError(
-                    f"Computer {binding.computer_id} was deleted while "
-                    f"workspace {workspace_id} waited for its stop"
-                )
-            if computer["status"] == ComputerStatus.STOPPING:
-                raise RuntimeError(
-                    f"Workspace {workspace_id} is still stopping after a recovery "
-                    "attempt. Please wait and try again."
-                )
-        return await self._acquire_session(
+        return await self._acquire_session(  # DALTON-HOOK(acquire-retry-bound)
             workspace_id,
             user_id=user_id or workspace_user_id,
             on_state_observed=on_state_observed,
             _attempt=attempt + 1,
+            _stop_waits=stop_waits + 1,
         )
 
     async def _correct_stuck_stopping(self, binding: ComputerBinding) -> None:
@@ -611,6 +625,7 @@ class SessionLifecycleMixin:
         on_state_observed: Callable[[str], None] | None,
         mark: Callable[[str], None],
         attempt: int,
+        stop_waits: int = 0,  # DALTON-HOOK(acquire-retry-bound): rides from acquisition
     ) -> Session:
         """Wait outside the machine lock so archived restores cannot block other ops."""
         workspace_id = binding.workspace_id
@@ -625,12 +640,16 @@ class SessionLifecycleMixin:
                         binding, ws_done, workspace_user_id, on_state_observed, mark
                     )
             except _MachineLeftRunning:
+                # The stop-wait count rides along (acquire-retry-bound): a
+                # start-failure retry above may have bumped `attempt`, but its
+                # FIRST genuine stop-wait still waits, as before.
                 return await self._await_stop_and_retry(
                     binding,
                     user_id=user_id,
                     workspace_user_id=workspace_user_id,
                     on_state_observed=on_state_observed,
                     attempt=attempt,
+                    stop_waits=stop_waits,
                 )
             return session
         if wait_status == "stopped" and attempt == 0:
@@ -639,11 +658,12 @@ class SessionLifecycleMixin:
                 f"Workspace {workspace_id} reverted to 'stopped' "
                 "(prior owner failed); retrying start"
             )
-            return await self._acquire_session(
+            return await self._acquire_session(  # DALTON-HOOK(acquire-retry-bound)
                 workspace_id,
                 user_id=user_id,
                 on_state_observed=on_state_observed,
                 _attempt=attempt + 1,
+                _stop_waits=stop_waits,
             )
         raise RuntimeError(
             f"Workspace {workspace_id} ended start in unexpected "

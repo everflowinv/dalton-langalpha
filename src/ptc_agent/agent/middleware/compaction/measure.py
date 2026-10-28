@@ -134,10 +134,37 @@ async def context_tokens(
     if answered is None:
         return ContextReading(measured, estimate)
     added = view[answered + 1 :]
-    since = estimate(added) if added else 0
+    # DALTON-HOOK(heavy-compute-isolation): the added part is counted on the
+    # loop because it is read before every call and is normally a handful of
+    # messages. A large result (a web page, a big Read) is where that turns
+    # into hundreds of milliseconds of tokenizing under the GIL — those alone
+    # move to a thread; the upstream whole-history count already runs there.
+    since = await _estimate_added(added, estimate) if added else 0
     return ContextReading(
         measured + since, estimate, view[answered], state["_cached_input_tokens"], since
     )
+
+
+# Below this many content characters the tokenize cost is single-digit
+# milliseconds; the thread hop would cost more than it saves.
+_ADDED_CHARS_THREAD_FLOOR = 24_000
+
+
+def _content_chars(messages: Sequence[AnyMessage]) -> int:
+    total = 0
+    for m in messages:
+        content = getattr(m, "content", m)
+        if isinstance(content, str):
+            total += len(content)
+        elif isinstance(content, list):
+            total += sum(len(str(part)) for part in content)
+    return total
+
+
+async def _estimate_added(added: Sequence[AnyMessage], estimate: Estimate) -> int:
+    if _content_chars(added) < _ADDED_CHARS_THREAD_FLOOR:
+        return estimate(added)
+    return await asyncio.to_thread(estimate, added)
 
 
 #: The ``response_metadata`` key holding what a call's context grew by since

@@ -97,10 +97,16 @@ async def test_watchdog_truncates_stack_to_40_frames(
     assert len(stall_warnings) == 1
     msg = stall_warnings[0].message
     assert "_blocking_culprit_function" in msg
-    file_frame_lines = [
-        line for line in msg.splitlines() if line.lstrip().startswith('File "')
+    # All-thread capture truncates EACH thread's stack to _STALL_MAX_FRAMES.
+    sections = msg.split("--- ")
+    per_thread_frames = [
+        [line for line in section.splitlines() if line.lstrip().startswith('File "')]
+        for section in sections[1:]
     ]
-    assert len(file_frame_lines) <= _STALL_MAX_FRAMES
+    assert per_thread_frames, "expected at least one labelled thread section"
+    for frames in per_thread_frames:
+        assert len(frames) <= _STALL_MAX_FRAMES
+    assert any("(event loop)" in section.splitlines()[0] for section in sections[1:])
 
 
 @pytest.mark.asyncio
@@ -158,4 +164,51 @@ async def test_watchdog_releases_frame_reference_so_blocked_locals_are_gc_collec
             gc.collect()
             assert ref() is None, "Watchdog must not retain frame references to local objects"
         finally:
+            await monitor.stop()
+
+
+@pytest.mark.asyncio
+async def test_watchdog_names_every_thread_and_lists_heavy_tasks(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The stall report carries all threads' stacks (named, loop thread
+    labelled) and the in-flight heavy compute, so a stall can be attributed."""
+    import threading
+
+    from src.observability.heavy_tasks import heavy_task
+
+    def _blocker(duration_s: float) -> None:
+        time.sleep(duration_s)
+
+    worker_name = "heavy-suspect-thread"
+
+    def _heavy_worker() -> None:
+        with heavy_task("publish.audit.match"):
+            time.sleep(0.3)
+
+    monitor = EventLoopLagMonitor(
+        stall_threshold_s=0.06,
+        stall_cooldown_s=60.0,
+        interval_s=0.02,
+    )
+    with caplog.at_level(logging.WARNING, logger="src.observability.loop_lag"):
+        monitor.start()
+        worker = threading.Thread(target=_heavy_worker, name=worker_name, daemon=True)
+        try:
+            await asyncio.sleep(0.03)
+            worker.start()
+            _blocker(0.22)
+            stall_warnings = [
+                r
+                for r in caplog.records
+                if r.levelno == logging.WARNING and "heartbeat stalled" in r.message
+            ]
+            assert len(stall_warnings) == 1
+            msg = stall_warnings[0].message
+            assert worker_name in msg, "worker thread must appear by name"
+            assert "(event loop)" in msg, "the loop thread must be labelled"
+            assert "heavy compute in flight" in msg
+            assert "publish.audit.match" in msg
+        finally:
+            worker.join(timeout=5.0)
             await monitor.stop()
