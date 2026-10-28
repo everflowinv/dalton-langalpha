@@ -118,10 +118,9 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 ### 第 4 步：卖方观点、专家访谈与内部研究库
 
 通过 PTC（在沙箱代码中调用 `researchdata`）：
-1. **AlphaEngine 卖方研报与点评**：
-   如需按文档类别过滤，先调用 `research(route="alphaengine", operation="list_filters")` 获取合法的 `type_ids`，再传入 `params={"type_ids": [...], "sort": "relevance"}`（`alphaengine` 不支持 `document_categories` 参数）：
+1. **AlphaEngine 卖方研报、点评与机构会议**：
+   卖方研报/点评/纪要可传 `params={"document_categories": ["sell_side_report", "sell_side_comment", "foreign_report", "meeting_minutes"], "sort": "relevance"}`，本机构录制会议必须拆成独立调用 `params={"meeting_scope": "institution", "sort": "relevance"}`（`institution_meetings` / `personal_meetings` 不能与卖方研报等非会议分类混在同一调用里，否则触发 `E_SCOPE_CONFLICT`）；若需细粒度 `type_ids`，必须显式调用 `research(route="alphaengine", operation="list_filters", params={"filter_type": "document_types", "document_code": "summary"})`（无参 `list_filters()` 仅返回友好 `categories`，不返回 `type_ids`）：
    ```python
-   filters = research(route="alphaengine", operation="list_filters")
    research(
        route="alphaengine",
        operation="search_library",
@@ -129,10 +128,25 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
        start=SEARCH_START,
        end=SEARCH_END,
        limit=20,
-       params={"type_ids": sell_side_type_ids, "sort": "relevance"},
+       params={
+           "document_categories": ["sell_side_report", "sell_side_comment", "foreign_report", "meeting_minutes"],
+           "sort": "relevance",
+       },
+   )
+   research(
+       route="alphaengine",
+       operation="search_library",
+       query=f"{COMPANY_NAME} {TICKER}",
+       start=SEARCH_START,
+       end=SEARCH_END,
+       limit=20,
+       params={
+           "meeting_scope": "institution",
+           "sort": "relevance",
+       },
    )
    ```
-   对解释本次异动最相关的研报调用 `research(route="alphaengine", operation="get_document", params={"doc_id": DOC_ID, "offset": 0, "max_chars": 30000})` 读取正文。
+   对解释本次异动最相关的研报或会议纪要调用 `research(route="alphaengine", operation="get_document", params={"doc_id": DOC_ID, "content_field": "auto", "offset": 0, "max_chars": 30000})` 读取正文（`DOC_ID` 原样保留完整字符串含 `_inst_` 后缀；`content_field` 仅接受 `"auto"|"original_text"|"content"|"digest"|"digest_cn"|"main_point"|"question_answer"`，若所选字段为空且返回 `available_content_fields`，改读 `original_text`、`digest` 或 `question_answer`，按 `next_offset` 续读直到 `complete=true` 或 `next_offset` 为空）。
 2. **卖方销售邮件与 TMTB**：
    同一时间窗口检索 `research(route="sales-notes", operation="search", query=f"{COMPANY_NAME} {TICKER}", start=SEARCH_START, end=SEARCH_END, limit=10)` 与 `research(route="tmtb", operation="search", query=f"{COMPANY_NAME} {TICKER}", start=SEARCH_START, end=SEARCH_END, limit=10)`，提取买方持仓、whisper、资金流或大行 desk 点评；**搜索命中后必须用 `research(route="tmtb"|"sales-notes", operation="read", document=...)`（如 `research(route="tmtb", operation="read", document=DOC_ID)` 或 `research(route="sales-notes", operation="read", document=DOC_ID)`）完整读取正文**，不得只凭标题或摘要下判断。
 3. **Guidepoint 专家访谈与一线反馈**：

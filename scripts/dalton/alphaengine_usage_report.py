@@ -31,7 +31,31 @@ DEFAULT_LEDGER = os.path.expanduser(
     os.environ.get("DALTON_ALPHAENGINE_USAGE_FILE", "~/Library/Logs/alphaengine_usage.jsonl")
 )
 
-_OPS = ("search", "read")
+_OPS = ("search", "read", "meta", "status")
+
+_OP_CATEGORY_MAP = {
+    "search": "search",
+    "search_library": "search",
+    "list_filters": "search",
+    "list_recording_tasks": "search",
+    "meta": "meta",
+    "get_document_info": "meta",
+    "list_attachments": "meta",
+    "get_recording_status": "meta",
+    "get_recording_task": "meta",
+    "read": "read",
+    "get_document": "read",
+    "status": "status",
+    "auth_status": "status",
+}
+_META_OPERATIONS = frozenset(
+    {
+        "get_document_info",
+        "list_attachments",
+        "get_recording_status",
+        "get_recording_task",
+    }
+)
 
 
 def _clean_identity(value: object) -> str:
@@ -68,7 +92,15 @@ def summarize(entries: list[dict]) -> dict:
 
     for entry in entries:
         day = str(entry.get("ts") or "")[:10] or "(无时间)"
-        op = str(entry.get("op") or "call")
+        raw_op_field = str(entry.get("op") or "").strip()
+        raw_operation = str(entry.get("operation") or "").strip()
+        if raw_operation in _META_OPERATIONS or raw_op_field in _META_OPERATIONS:
+            op = "meta"
+        else:
+            op = _OP_CATEGORY_MAP.get(
+                raw_op_field,
+                _OP_CATEGORY_MAP.get(raw_operation, raw_op_field or "call"),
+            )
         ok = bool(entry.get("ok"))
         user = _clean_identity(entry.get("user"))
         thread = _clean_identity(entry.get("thread"))
@@ -79,7 +111,7 @@ def summarize(entries: list[dict]) -> dict:
         by_user[user]["total"] += 1
         by_thread[thread][op] += 1
         by_thread[thread]["total"] += 1
-        if op == "read" and ok:
+        if op == "read" and raw_operation not in _META_OPERATIONS and ok:
             doc_id = str(entry.get("doc_id") or "").strip()
             if doc_id:
                 doc_reads[doc_id] += 1

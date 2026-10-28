@@ -28,6 +28,7 @@ TIER_BY_IDENTITY: dict[str, int | None] = {
     "internal_note": None,
     "derived": None,
     "street_estimate": None,
+    "unknown": None,
 }
 
 
@@ -152,6 +153,16 @@ def _map_library_item(item: dict[str, Any], default_route: str, fallback_as_of: 
     doc_id = str(item.get("document_id") or item.get("canonical_id") or "").strip()
     if not doc_id:
         return None
+    if src == "sales-mail" or not src:
+        lower_id = doc_id.lower()
+        if lower_id.startswith("tmtb:"):
+            src = "tmtb"
+        elif lower_id.startswith("wiki:"):
+            src = "company-wiki"
+        elif lower_id.startswith("funda:"):
+            src = "funda-ai"
+        else:
+            src = "sales-notes"
 
     date_str = str(item.get("published_at") or item.get("date") or fallback_as_of or "")[:19]
     title = str(item.get("title") or doc_id)
@@ -246,34 +257,167 @@ def _declare_research_library(route: str, inner: dict[str, Any], fallback_as_of:
     return out[:MAX_SOURCES_PER_CALL]
 
 
-def _declare_alphaengine(inner: dict[str, Any], fallback_as_of: str) -> list[dict[str, Any]]:
+_ALPHAENGINE_DOC_SOURCE_OPS: frozenset[str] = frozenset(
+    {
+        "",
+        "search_library",
+        "get_document",
+        "search",
+        "query",
+        "read",
+        "read_document",
+        "get",
+    }
+)
+_ALPHAENGINE_NON_DOC_OPS: frozenset[str] = frozenset(
+    {
+        "list_recording_tasks",
+        "get_recording_status",
+        "get_recording_task",
+        "get_document_info",
+        "list_attachments",
+        "list_filters",
+        "auth_status",
+    }
+)
+
+
+def _infer_alphaengine_identity(item: dict[str, Any]) -> str:
+    doc_code = str(item.get("document_code") or item.get("code") or "").strip()
+    type_id = str(item.get("type_id") or item.get("document_type_id") or "").strip()
+    type_full_id = str(item.get("type_full_id") or "").strip()
+    type_name = str(item.get("type_name") or item.get("document_type_name") or "").strip()
+    type_show_name = str(item.get("type_show_name") or "").strip()
+    type_full_name = str(item.get("type_full_name") or "").strip()
+    first_type_name = str(item.get("first_type_name") or "").strip()
+    type_blob = f"{type_name} {type_show_name} {type_full_name} {first_type_name}".strip()
+
+    if (
+        type_id == "IND_SECOND_5FA442AE"
+        or "IND_SECOND_5FA442AE" in type_full_id.split(":")
+        or doc_code in ("SimultaneousInterpretation", "companyAllAnnouncement", "announcement")
+        or any(
+            kw in type_blob
+            for kw in ("业绩说明会", "业绩电话会", "业绩会", "财报电话会", "公司公告", "公告")
+        )
+    ):
+        return "company"
+
+    if (
+        doc_code in ("expert_summary", "expert_library")
+        or "expert" in doc_code.lower()
+        or "expert" in type_id.lower()
+        or "专家" in type_blob
+        or "expert" in type_blob.lower()
+    ):
+        return "expert"
+
+    if doc_code == "news" or any(kw in type_blob for kw in ("资讯", "新闻", "快讯")):
+        return "news"
+
+    # Third-party reports and global think tanks are not sell-side broker reports;
+    # keep them as unknown since the tier taxonomy has no dedicated category for them.
+    if doc_code in (
+        "thirdReport",
+        "third_party_reports",
+        "globalThinkTank",
+        "global_think_tank",
+    ) or any(
+        kw in type_blob
+        for kw in ("第三方报告", "三方报告", "全球智库", "智库")
+    ):
+        return "unknown"
+
+    # Recording scope (institution/personal) or generic summary/meeting category
+    # alone does not prove sell-side identity; require an explicit sell-side code
+    # or a subtype that confirms a broker research report.
+    if doc_code in (
+        "comment",
+        "chinaReport",
+        "foreignReport",
+        "sell_side",
+        "sell_side_report",
+        "sell_side_comment",
+        "domestic_report",
+        "foreign_report",
+    ) or any(
+        kw in type_blob
+        for kw in (
+            "券商",
+            "卖方",
+            "研报",
+            "研究报告",
+            "买点卖点",
+            "外资报告",
+            "国内报告",
+            "深度报告",
+            "证券研究",
+        )
+    ):
+        return "broker_report"
+
+    return "unknown"
+
+
+def _declare_alphaengine(
+    inner: dict[str, Any], fallback_as_of: str, operation: str = ""
+) -> list[dict[str, Any]]:
     data = _unwrap_mcp_proxy_payload(inner)
+    if not isinstance(data, dict):
+        return []
+
+    eff_op = str(
+        operation or inner.get("operation") or data.get("operation") or ""
+    ).strip()
+    if eff_op in _ALPHAENGINE_NON_DOC_OPS or eff_op not in _ALPHAENGINE_DOC_SOURCE_OPS:
+        return []
+
+    # Defensive structural guards when operation was omitted: recording tasks,
+    # document metadata (get_document_info), attachments, filters, and auth_status
+    # are not research document sources.
+    if (
+        "record_status" in data
+        or ("attachments" in data and "text" not in data and "results" not in data)
+        or ("has_summary_content" in data and "text" not in data and "results" not in data)
+        or ("authenticated" in data and "results" not in data and "text" not in data)
+    ):
+        return []
+
     out: list[dict[str, Any]] = []
 
     def _from_item(item: dict[str, Any]) -> dict[str, Any] | None:
-        raw_id = str(item.get("doc_id") or item.get("id") or "").strip()
+        if "record_status" in item or ("roadshow_id" in item and "doc_id" not in item):
+            return None
+        raw_id = str(
+            item.get("doc_id") or item.get("document_id") or item.get("id") or ""
+        ).strip()
         if not raw_id:
             return None
         doc_id = raw_id if raw_id.startswith("alphaengine:") else f"alphaengine:{raw_id}"
-        type_id = str(item.get("type_id") or "")
-        identity = "company" if type_id == "IND_SECOND_5FA442AE" else "broker_report"
+        identity = _infer_alphaengine_identity(item)
         sources = item.get("sources")
         if isinstance(sources, list) and sources and sources[0]:
             pub = str(sources[0])
+        elif item.get("source_names") and isinstance(item.get("source_names"), list) and item["source_names"][0]:
+            pub = str(item["source_names"][0])
         elif item.get("publisher"):
             pub = str(item["publisher"])
         else:
             pub = "AlphaEngine"
-        pub_time = str(item.get("publish_time") or item.get("date") or fallback_as_of)[:19]
-        title = str(item.get("title") or doc_id)
+        raw_pub_time = str(
+            item.get("publish_time") or item.get("publish_date") or item.get("date") or ""
+        ).strip()[:19]
+        as_of_val = raw_pub_time[:10] if raw_pub_time else ""
+        as_of_basis_val = "publish_time" if as_of_val else "unknown"
+        title = str(item.get("title") or item.get("title_cn") or doc_id)
         return _make_entry(
             document_id=doc_id,
             route="alphaengine",
             identity=identity,
             publisher=pub,
             title=title,
-            as_of=pub_time[:10] if pub_time else fallback_as_of,
-            as_of_basis="publish_time",
+            as_of=as_of_val,
+            as_of_basis=as_of_basis_val,
             source_type="research_doc",
             url=None,
             private=True,
@@ -282,10 +426,12 @@ def _declare_alphaengine(inner: dict[str, Any], fallback_as_of: str) -> list[dic
 
     meta = data.get("metadata")
     if isinstance(meta, dict):
-        entry = _from_item(meta)
+        merged_meta = dict(data)
+        merged_meta.update(meta)
+        entry = _from_item(merged_meta)
         if entry:
             out.append(entry)
-    elif data.get("doc_id"):
+    elif data.get("doc_id") and ("text" in data or "content_field" in data or eff_op == "get_document"):
         entry = _from_item(data)
         if entry:
             out.append(entry)
@@ -1001,10 +1147,11 @@ def declare(tool: str, arguments: dict[str, Any] | None, payload: dict[str, Any]
     if tool == "catalog" or not route:
         return []
 
-    if route in ("company-wiki", "sales-notes", "tmtb", "funda-ai", "all"):
+    if route in ("company-wiki", "sales-notes", "tmtb", "funda-ai", "all", "sales-mail"):
         return _declare_research_library(route, inner, fallback_as_of)
     if route == "alphaengine":
-        return _declare_alphaengine(inner, fallback_as_of)
+        op_arg = str(args.get("operation") or args.get("action") or "").strip()
+        return _declare_alphaengine(inner, fallback_as_of, operation=op_arg)
     if route == "guidepoint":
         return _declare_guidepoint(inner, fallback_as_of)
     if route == "transcript":

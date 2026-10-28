@@ -55,7 +55,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 
 1. **先读现有知识层与基金 Wiki（只读）**：
    - 先读当前公司工作区的 `thesis.md`、`debate.md`、`drivers.md`、`management.md`、`lessons.md`；若涉及其他覆盖公司，跨目录读取 `../<TICKER>/thesis.md` 与 `drivers.md`。
-   - 用 `researchdata.research(route="company-wiki")`（或只读文件检索）查阅共享基金百科 `wiki/` 中已有的行业/技术/供应链条目（**wiki 默认只读，不自动写回 `wiki/`；只有用户明确要求入库〔"入库/存一下/加到 wiki"〕时，按入库流程用 `ingest_company_wiki`**）。
+   - 用 `researchdata.research(route="company-wiki", operation="search", query="<专题关键词>")` 或 `researchdata.research(route="company-wiki", operation="list", params={"company": "<TICKER>"})`（或只读文件检索）查阅共享基金百科 `wiki/` 中已有的行业/技术/供应链条目（**wiki 默认只读，不自动写回 `wiki/`；只有用户明确要求入库〔"入库/存一下/加到 wiki"〕时，按入库流程用 `ingest_company_wiki`**）。
 2. **拆解 3–6 个信息集群（Clusters）并写入 `research/<D>-topic-<slug>/plan.md`**：
    - 参考 [references/clusters-investment.md](references/clusters-investment.md)。
    - 为每个集群生成 **5–8 条中英文检索词**（含精确机构名、产品代号、供应链术语、时间限定词）。

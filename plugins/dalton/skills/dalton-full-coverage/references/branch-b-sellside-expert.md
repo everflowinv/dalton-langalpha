@@ -7,9 +7,12 @@
 ## 产出章节结构（B1–B7，按顺序撰写）
 
 ### B1. AlphaEngine 卖方研报与纪要精读
-1. **先查分类过滤器**：调用 `researchdata.research(route="alphaengine", operation="list_filters")` 获取当前有效的行业名与文档分类列表，再从返回结果里挑选所需的 `type_ids`。
-2. **按类别分次检索**：每次只查一个类别（外资深度报告、卖方点评、会议/调研纪要分开检索），调用 `researchdata.research(route="alphaengine", operation="search_library", query=..., start=..., end=..., params={"type_ids": [...], "sort": "relevance"})`（时间范围通过顶层 `start` 与 `end` 传入，默认覆盖过去 12 个月；`sort` 与 `type_ids` 放在 `params` 内）。
-3. **核心结论必须 `get_document` 读全文**：`search_library` 仅用于召回，严禁只看标题或 snippet 下结论。挑出 6–10 篇代表性多空研报与纪要读取正文。
+1. **按需分别查词典过滤器（切勿混用）**：
+   - 友好文档大类：`researchdata.research(route="alphaengine", operation="list_filters", params={"filter_type": "categories"})`（无参 `list_filters()` 仅返回 `categories`，可直接用于 `params.document_categories`）；
+   - 细粒度二级分类 `type_ids`：`researchdata.research(route="alphaengine", operation="list_filters", params={"filter_type": "document_types", "document_code": "summary"})`；
+   - 行业词典（用于文档搜索 `industry_names`，`industry_ids` 仅用于录制任务，均不是 `type_ids`）：`researchdata.research(route="alphaengine", operation="list_filters", params={"filter_type": "industries"})`。
+2. **按类别分次检索**：每次只查一个类别（外资深度报告 `foreign_report`、卖方研报与点评 `sell_side_report`/`sell_side_comment`、会议/调研纪要 `meeting_minutes`、本机构会议 `institution_meetings`、专家库 `expert_library` 分开检索，避免 `institution_meetings` 与非会议分类同用触发 `E_SCOPE_CONFLICT`），调用 `researchdata.research(route="alphaengine", operation="search_library", query=..., start=..., end=..., params={"document_categories": [...], "sort": "relevance"})`（或传 `type_ids`；时间范围通过顶层 `start` 与 `end` 传入，默认覆盖过去 12 个月；有关键词时 `sort` 必须为 `"relevance"`）。
+3. **核心结论必须 `get_document` 读全文**：`search_library` 仅用于召回，严禁只看标题或 snippet 下结论。专家库或机构会议材料可先调用 `operation="get_document_info"` 查看文档类型、页数与已读状态，再挑出 6–10 篇代表性多空研报与纪要调用 `operation="get_document"`（`content_field` 仅接受 `"auto"|"original_text"|"content"|"digest"|"digest_cn"|"main_point"|"question_answer"`，按 `next_offset` 续读直到 `complete=true` 或 `next_offset` 为空）读取正文；注意基础信息查询不能声称保证免费。
 4. **逐篇结构化记录**：机构名称、署名分析师、发布日期、标题、`doc_id`、核心论点与关键假设、评级与目标价（如有）。
 
 ### B2. 卖方一致预期地图与分歧点
@@ -19,7 +22,7 @@
 - **最近一次集体预期修正的触发事件**：卖方最近一次普遍上修或下修盈利预测是由哪次财报、指引或行业事件触发的。
 
 ### B3. 基金内部认知（四库联搜与 `company-wiki`）
-- 调用 `researchdata.research(route="all", operation="search", query="...", params={"layer": "all", "media": "all"})` 及 `route="company-wiki"`（查公司页 `params={"company": TICKER}` 与所属行业页）。
+- 调用 `researchdata.research(route="all", operation="search", query="...", params={"layer": "all", "media": "all"})` 及 `route="company-wiki"`（只列公司目录用 `operation="list", params={"company": TICKER}`；按主题/关键词检索用 `operation="search", query="...", params={"company": TICKER}`——`company-wiki` 的 `search` 必须带 `query`；若返回 `status="partial"` 或 `warnings` 提示列表有更多文档，需缩小筛选或提高合法 `limit`，不得将首批截断结果当成全部文档）。
 - 命中后调用 `operation="read"` 读取正文（多票日报如 TMTB、sales-notes 按 `next_offset` 翻页摘取本公司段落）。
 - **合规与去重纪律**：
   - 基金 `company-wiki` 里的专家访谈与管理层小范围交流已通过合规流程，照常使用，注明日期、专家身份（不写姓名）及后续验证情况；
@@ -27,7 +30,7 @@
   - 梳理基金内部过去一年对该公司的历史观点演进，作为判断“市场共识与我们自身认知如何变化”的锚点。
 
 ### B4. Guidepoint 专家访谈
-- 调用 `researchdata.research(route="guidepoint", operation="search_library", query="<英文研究问题>", params={"keywords": ["<TICKER>"]})`。
+- 调用 `researchdata.research(route="guidepoint", operation="search_library", query="<英文研究问题>", params={"keywords": ["<Company Name>", "<TICKER>"]})`（`query` 为 1–1000 字符的英文研究问题；`params.keywords` 放公司常用名与 ticker，1–10 个非空字符串，多项之间 OR、词组内部 AND，先筛访谈再按 `query` 排问答摘录；可按需加 `params.recency_bias=30` 偏好近期访谈；注意仅返回问答摘录、无全文接口、无 cursor 翻页）。
 - **英文构造检索词**，围绕以下五个一线维度检索：
   1. 客户真实采用率、续费与流失原因（Adoption & Churn）；
   2. 竞争对手赢单/输单真实反馈（Win/Loss Dynamics）；

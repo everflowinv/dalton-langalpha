@@ -58,7 +58,7 @@
 ## 8. 信源优先级与覆盖记录
 
 - 按以下优先级检索并在文末 `## 引用` 节列出 `[引用1]`…`[引用N]` 引用与信源覆盖说明（与正文 `[引用N]` 一一对应）：
-  1. **基金内部行业认知（第一优先）**：`researchdata.research(route="company-wiki")` 检索公司页与所属行业目录（`params={sector: ...}` 或行业关键词）；
+  1. **基金内部行业认知（第一优先）**：`researchdata.research(route="company-wiki", operation="list", params={"sector": "<SECTOR>"})` 列行业目录，或 `researchdata.research(route="company-wiki", operation="search", query="<行业关键词>")` 按关键词检索；
   2. **内部研究库与卖方行业深度**：`researchdata.research` 检索 `alphaengine`（行业深度报告 `foreign_report`）、`sales-notes`、`tmtb`、`funda-ai`；
   3. **Guidepoint 专家纪要**：用英文检索（`route="guidepoint", operation="search_library"`），了解行业竞争 win-loss、渠道真实返利与终端需求，原文直接引用 ≤20 个英文词并注明专家身份与日期；
   4. **官方统计、行业协会数据与公开检索（`web_search`）**。

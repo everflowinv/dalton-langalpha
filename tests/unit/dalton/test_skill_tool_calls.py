@@ -372,7 +372,50 @@ def _validate_researchdata_bridge_call(
                 lits = _extract_quoted_literals(kwarg_values.get(k, ""))
                 synth_args[k] = lits[0] if lits else ("2026-01-01" if k in ("start", "end", "since", "until") else "META")
             if nested_keys is not None:
-                synth_args["params"] = {k: "1" for k in nested_keys}
+                params_expr = kwarg_values.get("params", "")
+                synth_params: dict[str, Any] = {}
+                for k in nested_keys:
+                    m_kv = re.search(
+                        rf"""['"]{re.escape(k)}['"]\s*:\s*(['"])((?:\\.|(?!\1).)*)\1""",
+                        params_expr,
+                    )
+                    lit_val = m_kv.group(2) if m_kv else None
+                    if lit_val is not None and not (lit_val.startswith("<") and lit_val.endswith(">")):
+                        synth_params[k] = lit_val
+                    elif k == "sort":
+                        synth_params[k] = "relevance" if ("query" in synth_args or "query" in nested_keys) else "newest"
+                    elif k == "doc_id":
+                        synth_params[k] = "290001790954279_inst_134249"
+                    elif k == "roadshow_id":
+                        synth_params[k] = "134249"
+                    elif k == "filter_type":
+                        synth_params[k] = "document_types"
+                    elif k == "document_code":
+                        synth_params[k] = "summary"
+                    elif k == "content_field":
+                        synth_params[k] = "content"
+                    elif k == "meeting_scope":
+                        synth_params[k] = "institution"
+                    elif k == "search_in":
+                        synth_params[k] = "title"
+                    elif k in ("date_from", "date_to", "start_date", "end_date", "indexed_since"):
+                        synth_params[k] = "2026-01-01"
+                    elif k in ("offset", "page", "limit", "max_chars", "size"):
+                        synth_params[k] = 1
+                    else:
+                        synth_params[k] = "1"
+                synth_args["params"] = synth_params
+            if route == "alphaengine":
+                canon_op = (spec.get("operation_aliases") or {}).get(op, op) or "search_library"
+                if canon_op in ("get_document", "get_document_info", "list_attachments") and "document" not in synth_args:
+                    synth_args.setdefault("params", {}).setdefault("doc_id", "290001790954279_inst_134249")
+                elif canon_op == "get_recording_task":
+                    synth_args.setdefault("params", {}).setdefault("roadshow_id", "134249")
+                elif canon_op == "list_filters" and isinstance(synth_args.get("params"), dict):
+                    if synth_args["params"].get("filter_type") == "companies":
+                        synth_args["params"].setdefault("query", "META")
+                    elif synth_args["params"].get("filter_type") == "watchlist_stocks":
+                        synth_args["params"].setdefault("group_id", "1")
             # Populate route-level required fields when omitted in prose shorthand so
             # `_normalize_and_validate_call_args` reaches top-level, operation, and nested `params` checks.
             canon_present = {rb.PARAM_ALIAS_TABLE.get(k, k) for k in synth_args}
@@ -388,6 +431,8 @@ def _validate_researchdata_bridge_call(
             )
             for req_k in fill_keys:
                 if req_k in (spec.get("accepted_params") or []) and req_k not in canon_present:
+                    if route == "alphaengine":
+                        continue
                     synth_args[req_k] = "2026-01-01" if req_k in ("start", "end") else "META"
 
             _, _, bridge_err = rb._normalize_and_validate_call_args(tool_short, synth_args)
@@ -399,15 +444,6 @@ def _validate_researchdata_bridge_call(
                         name,
                         f"Bridge rejected call for route={route!r}, operation={op!r}: "
                         f"{bridge_err.get('error')} in {call['raw']}",
-                    )
-                )
-            elif op == "list_filters" and route == "alphaengine" and "params" in kwarg_values:
-                errors.append(
-                    (
-                        rel_path,
-                        line_no,
-                        name,
-                        f"alphaengine operation='list_filters' takes no params, got params={kwarg_values['params']} in {call['raw']}",
                     )
                 )
     return errors
@@ -646,13 +682,15 @@ def test_researchdata_schema_aliases_are_legal():
 def test_scanner_rejects_invalid_nested_bridge_params():
     registry = build_tool_signature_registry()
     sample = """
-    1. `researchdata.research(route="alphaengine", operation="list_filters", params={"filter_type": "document_types", "query": "专家"})`
+    1. `researchdata.research(route="alphaengine", operation="list_filters", params={"filter_type": "document_types", "document_code": "summary"})`
     2. `researchdata.research(route="guidepoint", operation="search_library", query="META", params={"bad_nested": 1})`
     3. `researchdata.research(route="alphaengine", operation="search_library", query="META", params={"type_ids": [1], "sort": "relevance"})`
+    4. `researchdata.research(route="alphaengine", operation="search_library", query="META", params={"companies": ["META"]})`
     """
     calls = extract_tool_calls_from_markdown(sample, registry)
     errors = validate_extracted_calls("synthetic/SKILL.md", calls, registry)
-    assert any(e[1] == 2 and "filter_type" in e[3] for e in errors)
+    assert not any(e[1] == 2 for e in errors)
     assert any(e[1] == 3 and "bad_nested" in e[3] for e in errors)
     assert not any(e[1] == 4 for e in errors)
+    assert any(e[1] == 5 and "companies" in e[3] for e in errors)
 

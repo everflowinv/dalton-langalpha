@@ -40,8 +40,8 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
      3. `"capex"` / `"费用"` / `"指引"` / `"预测"`
    - **Sales color 专项规则**：按公司名和代码分别搜，邮件按 `message_id`、研报按 `doc_id` 去重后用 `read` 读正文（多票日报按 `next_offset` 翻页摘出本公司段落）。按正文里的 sales/trading 身份声明归类，不按数据库分类（如 `Sector Specialist Commentary`、`TECH SKETCH` 可能归在 `foreign_report` 下）。
 
-4. **AlphaEngine 卖方研报检索**
-   - 中英文 query 各搜一次（`researchdata.research(route="alphaengine", operation="search_library", query=..., start=..., end=..., params={"sort": "relevance"})`；若按文档类别过滤，先调 `operation="list_filters"` 取 `type_ids` 一并放入 `params`；时间窗默认近 92 天）。
+4. **AlphaEngine 卖方研报与机构会议检索**
+   - 中英文 query 各搜一次（`researchdata.research(route="alphaengine", operation="search_library", query=..., start=..., end=..., params={"sort": "relevance"})`；若按文档类别过滤，可直接传 `params={"document_categories": [...], "sort": "relevance"}`，或显式调 `researchdata.research(route="alphaengine", operation="list_filters", params={"filter_type": "document_types", "document_code": "summary"})` 获取细粒度 `type_ids`——注意无参 `list_filters()` 只返回友好 `categories`，不会返回 `type_ids`；时间窗默认近 92 天）。
    - 挑 3–6 篇高相关报告调 `operation="get_document"` 读正文，优先外资行（MS、GS、UBS、JPM、Citi、BofA、Jefferies、Bernstein 等）的财报前瞻与预测调整报告。
    - 若涉及 AI 收入占比、大单 TCV/RPO 或 AI 降本提效，遵循 `references/ai-revenue-rules.md` 核对口径。
 

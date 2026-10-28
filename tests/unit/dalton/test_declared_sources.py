@@ -546,7 +546,7 @@ class TestResearchAllAlphaEngineAndGuidepointFanout:
                         "layer": "raw",
                         "sources": ["sales-notes"],
                         "keywords": ["LFP"],
-                        "recency_bias": "1y",
+                        "recency_bias": "30",
                     },
                     "document": "ignored-doc",
                 },
@@ -555,6 +555,9 @@ class TestResearchAllAlphaEngineAndGuidepointFanout:
 
         routes_called = [c["route"] for c in recorded_calls]
         assert sorted(routes_called) == ["all", "alphaengine", "guidepoint"]
+
+        all_call = next(c for c in recorded_calls if c["route"] == "all")
+        assert all_call["params"] == {"layer": "raw", "sources": ["sales-notes"]}
 
         ae_call = next(c for c in recorded_calls if c["route"] == "alphaengine")
         assert ae_call["operation"] == "search_library"
@@ -574,7 +577,7 @@ class TestResearchAllAlphaEngineAndGuidepointFanout:
         assert gp_call["end"] == "2026-04-17"
         assert gp_call["limit"] == 5
         assert gp_call["timeout"] == rb.FANOUT_GUIDEPOINT_TIMEOUT_S == 90
-        assert gp_call["params"] == {"keywords": ["LFP"], "recency_bias": "1y"}
+        assert gp_call["params"] == {"keywords": ["LFP"], "recency_bias": 30}
         assert "ticker" not in gp_call
         assert "document" not in gp_call
 
@@ -654,7 +657,7 @@ class TestResearchAllAlphaEngineAndGuidepointFanout:
             ("research", {"route": "all", "operation": "list"}),
             ("research", {"route": "all"}),
             ("research", {"route": "sales-notes", "operation": "search", "query": "CATL"}),
-            ("finance", {"route": "sec", "operation": "search", "query": "CATL"}),
+            ("finance", {"route": "sec", "operation": "search", "ticker": "META", "query": "CATL"}),
         ],
     )
     async def test_fanout_not_triggered_for_non_all_search(
