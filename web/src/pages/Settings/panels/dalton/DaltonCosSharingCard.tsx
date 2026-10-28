@@ -9,14 +9,17 @@ export interface DaltonSettingVisibilityContext {
   canInvite?: boolean;
   callerTier?: string | null;
   colleagueDispatchEnabled?: boolean;
-  cosSharingError?: boolean;
+  /** The sharing settings have arrived (cached data counts, even while a
+   *  background refresh fails); until then the card and its search entry
+   *  both stay hidden, so neither flashes for a user it is not for. */
+  cosSharingLoaded?: boolean;
 }
 
 export function canShowDaltonCosSharingCard(
   ctx?: DaltonSettingVisibilityContext | null,
 ): boolean {
   if (!ctx) return true;
-  if (ctx.cosSharingError) return false;
+  if (!ctx.cosSharingLoaded) return false;
   if (ctx.callerTier === 'external') return false;
   if (ctx.colleagueDispatchEnabled === false) return false;
   return true;
@@ -63,7 +66,7 @@ export function DaltonCosSharingCard(): React.ReactElement | null {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
 
-  const { data, isLoading, isError } = useUserCosSharingQuery();
+  const { data, isLoading } = useUserCosSharingQuery();
 
   const mutation = useMutation({
     mutationFn: (payload: { cos_rw_enabled: boolean }) => updateUserCosSharing(payload),
@@ -75,7 +78,7 @@ export function DaltonCosSharingCard(): React.ReactElement | null {
 
   if (
     !canShowDaltonCosSharingCard({
-      cosSharingError: isError,
+      cosSharingLoaded: data !== undefined,
       callerTier: data?.caller_tier,
       colleagueDispatchEnabled: data?.colleague_dispatch_enabled,
     })

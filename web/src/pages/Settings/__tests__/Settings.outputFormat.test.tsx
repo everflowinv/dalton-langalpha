@@ -294,7 +294,19 @@ describe('Settings — Output format', () => {
   });
 
   it('finds Dalton settings in search by Chinese keywords ("预算", "审稿", "研究总监")', async () => {
-    setupAndRender({});
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+    });
+    client.setQueryData(queryKeys.dalton.userSharing(), {
+      user_id: 'u-int',
+      cos_rw_enabled: true,
+      cos_access: 'rw',
+      can_edit: true,
+      caller_tier: 'internal',
+      colleague_dispatch_enabled: true,
+      updated_at: null,
+    });
+    setupAndRender({}, client);
 
     const searchInput = await screen.findByRole('combobox', { name: /Search settings/i });
 
@@ -375,5 +387,16 @@ describe('Settings — Output format', () => {
     fireEvent.change(intSearch, { target: { value: '研究总监' } });
     expect(await screen.findByText('Chief of Staff workspace sharing')).toBeInTheDocument();
     unmountInt();
+  });
+
+  // DALTON-HOOK(settings-section): until the sharing settings arrive, neither
+  // the card nor its search entry shows, so nothing flashes for a user it is not for
+  it('keeps Chief of Staff workspace sharing out of search until the sharing settings arrive', async () => {
+    setupAndRender({});
+    const search = await screen.findByRole('combobox', { name: /Search settings/i });
+
+    fireEvent.change(search, { target: { value: '研究总监' } });
+    expect(screen.queryByText('Chief of Staff workspace sharing')).not.toBeInTheDocument();
+    expect(screen.getByText('No settings match.')).toBeInTheDocument();
   });
 });

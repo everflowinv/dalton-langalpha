@@ -17,12 +17,12 @@ import { GROUPS, SECTIONS, searchableSettings, sectionShown, type Section, type 
 
 function useDaltonSettingsVisibility(): DaltonSettingVisibilityContext {
   const { canInvite } = useTeamCredentials();
-  const { data, isError } = useUserCosSharingQuery(isDaltonAuth);
+  const { data } = useUserCosSharingQuery(isDaltonAuth);
   return {
     canInvite,
     callerTier: data?.caller_tier ?? null,
     colleagueDispatchEnabled: data?.colleague_dispatch_enabled,
-    cosSharingError: Boolean(isError && !data),
+    cosSharingLoaded: data !== undefined,
   };
 }
 
