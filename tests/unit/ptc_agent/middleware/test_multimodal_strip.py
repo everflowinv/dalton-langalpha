@@ -6,6 +6,7 @@ the first place, is covered in ``test_multimodal_read``.
 
 import base64
 import io
+import os  # DALTON-HOOK(attachment-native-cap): byte-total tests' noise PNGs
 import types
 
 import pypdf
@@ -14,6 +15,7 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, Tool
 from PIL import Image
 
 from ptc_agent.agent.middleware._message_utils import order_tool_results_first
+# DALTON-HOOK(attachment-native-cap): byte-total tests replay the offload view.
 from ptc_agent.agent.middleware.file_operations.multimodal_strip import (
     _IF_NOT,
     PLACEHOLDER_GUIDANCE,
@@ -22,6 +24,7 @@ from ptc_agent.agent.middleware.file_operations.multimodal_strip import (
     remove_attachments,
     strip_unsupported_content_blocks,
 )
+from ptc_agent.agent.middleware.thinking_binding import without_thinking
 from src.llms.llm import LLM, get_input_modalities
 
 
@@ -454,18 +457,24 @@ class TestReceives:
 
 class _ModelCallRequest:
     """Minimal stand-in for the model-call request: a stamped client, a history,
-    and the ``override`` the middleware must go through to replace messages."""
+    and the ``override`` the middleware must go through to replace messages.
 
-    def __init__(self, manifest_model, messages, system_message=None):
+    DALTON-HOOK(attachment-native-cap): carries ``state`` for the byte-total
+    tests' recorded removals.
+    """
+
+    def __init__(self, manifest_model, messages, system_message=None, state=None):
         self.model = types.SimpleNamespace(metadata={"manifest_model": manifest_model})
         self.messages = messages
         self.system_message = system_message
+        self.state = state
 
     def override(self, **kwargs):
         clone = _ModelCallRequest.__new__(_ModelCallRequest)
         clone.model = self.model
         clone.messages = kwargs.get("messages", self.messages)
         clone.system_message = kwargs.get("system_message", self.system_message)
+        clone.state = kwargs.get("state", self.state)
         return clone
 
 
@@ -927,3 +936,149 @@ class TestImageSideRule:
 
         assert width == 2000
         assert response.command.update == {"image_side_rule": "fixed"}
+
+
+def _noise_png(width: int, height: int) -> bytes:
+    """A PNG random noise keeps near its raw size: many bytes for few pixels."""
+    img = Image.new("RGB", (width, height))
+    img.putdata(list(zip(os.urandom(width * height * 3)[0::3],
+                         os.urandom(width * height * 3)[0::3],
+                         os.urandom(width * height * 3)[0::3])))
+    buffer = io.BytesIO()
+    img.save(buffer, "PNG")
+    return buffer.getvalue()
+
+
+def _image_data_url(raw: bytes) -> str:
+    return "data:image/png;base64," + base64.b64encode(raw).decode("ascii")
+
+
+class TestByteTotalRecordsTheRemoval:
+    """The request's image byte total is the one fit outcome that moves between
+    calls — what fits changes as images arrive. DALTON-HOOK(attachment-native-cap):
+    the cut is joined to the context-window removal (``_removed_attachment_ids``
+    plus ``_unsent_thinking_ids``), so the first trimming request already sends
+    the bytes every later one reads, and no thinking stays sent behind a prefix
+    that changed."""
+
+    #: ~4.4 MB each, under the per-image ceiling and every pixel limit.
+    PER_IMAGE = 1240 * 1240 * 3
+
+    @staticmethod
+    def _images(n: int, prefix: str) -> list:
+        blocks = []
+        for k in range(n):
+            blocks.append({
+                "type": "text",
+                "text": f"[Attached image: {prefix}{k}.png (saved to work/uploads/{prefix}{k}.png)]",
+            })
+            blocks.append({
+                "type": "image_url",
+                "image_url": {"url": _image_data_url(_noise_png(1240, 1240))},
+            })
+        return blocks
+
+    @staticmethod
+    def _bound_answer(answer_id: str) -> AIMessage:
+        return AIMessage(
+            content=[
+                {"type": "thinking", "thinking": "reasoned", "signature": "sig"},
+                {"type": "text", "text": "Here is what the images show."},
+            ],
+            id=answer_id,
+            response_metadata={"reasoning_origin": "anthropic"},
+        )
+
+    @pytest.mark.asyncio
+    async def test_round_one_under_the_total_sends_the_images_and_the_thinking(self):
+        seen = {}
+
+        async def handler(request):
+            seen["request"] = request
+            return "ok"
+
+        history = [
+            HumanMessage(content=self._images(3, "chart"), id="m1"),
+            self._bound_answer("a1"),
+        ]
+        response = await MultimodalStripMiddleware().awrap_model_call(
+            _ModelCallRequest("claude-sonnet-5-5", history), handler
+        )
+
+        # Everything fits: three image blocks go out as they are, and the
+        # answer keeps its thinking. The only record is the thread's side rule.
+        assert seen["request"].messages[0] is history[0]
+        assert seen["request"].messages[1] is history[1]
+        assert getattr(response, "model_response", response) == "ok"
+        assert response.command.update == {"image_side_rule": "count"}
+
+    @pytest.mark.asyncio
+    async def test_the_second_rounds_overflow_records_the_removal_and_drops_the_thinking(self):
+        seen = {}
+
+        async def handler(request):
+            seen["request"] = request
+            return "ok"
+
+        history = [
+            HumanMessage(content=self._images(3, "chart"), id="m1"),
+            self._bound_answer("a1"),
+            HumanMessage(content=self._images(3, "fresh"), id="m2"),
+        ]
+        request = _ModelCallRequest("claude-sonnet-5-5", history, state={})
+        response = await MultimodalStripMiddleware().awrap_model_call(request, handler)
+
+        sent = seen["request"].messages
+        # The first round's message lost every attachment, to the context-window
+        # placeholder — the bytes the record replays on every later call — not
+        # to a byte-budget note only this request would carry.
+        m1_texts = [b for b in sent[0].content if b.get("type") == "text"]
+        assert not any(b.get("type") == "image_url" for b in sent[0].content)
+        assert any("was removed from the conversation" in b["text"] for b in m1_texts)
+        assert len(sent[0].content) == len(history[0].content)
+        # The answer after it went without its thinking: sending it behind the
+        # changed prefix would have the API drop or refuse exactly that
+        # thinking on every later call.
+        assert sent[1].content == [{"type": "text", "text": "Here is what the images show."}]
+        # The newest round rides untouched.
+        assert sent[2] is history[2]
+
+        update = response.command.update
+        assert update["_removed_attachment_ids"] == {"m1"}
+        assert update["_unsent_thinking_ids"] == {"a1"}
+
+    @pytest.mark.asyncio
+    async def test_a_later_call_reads_the_same_bytes_and_records_nothing_new(self):
+        """Once recorded, the offload view replays the removal before this
+        middleware runs; the same history must then render identically and
+        record nothing further."""
+        seen = {}
+
+        async def handler(request):
+            seen["request"] = request
+            return "ok"
+
+        history = [
+            HumanMessage(content=self._images(3, "chart"), id="m1"),
+            self._bound_answer("a1"),
+            HumanMessage(content=self._images(3, "fresh"), id="m2"),
+        ]
+        # What the offload view (offload_view, compaction) hands this middleware
+        # once the record exists.
+        replayed = without_thinking(
+            remove_attachments(history, {"m1"}), {"a1"}
+        )
+        state = {
+            "_removed_attachment_ids": {"m1"},
+            "_unsent_thinking_ids": {"a1"},
+            "image_side_rule": "count",
+        }
+        response = await MultimodalStripMiddleware().awrap_model_call(
+            _ModelCallRequest("claude-sonnet-5-5", replayed, state=state), handler
+        )
+
+        sent = seen["request"].messages
+        assert sent[0] is replayed[0]
+        assert sent[1] is replayed[1]
+        assert sent[2] is replayed[2]
+        assert response == "ok"

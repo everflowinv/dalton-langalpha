@@ -57,19 +57,23 @@ def _is_fake_ip(addr: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
         return False
 
 
-async def _fake_ip_block_reason(host: str, addresses: list[str]) -> str | None:
-    """Why a request whose DNS answer includes a fake-IP must be refused, or
-    None to allow. The real addresses behind the hostname are looked up
-    (DNS-over-HTTPS, past the fake-IP resolver) and each is checked with the
-    strict test; a failed lookup fails closed."""
+async def _fake_ip_recheck(
+    host: str, addresses: list[str]
+) -> tuple[str | None, list[str] | None]:
+    """Why a request whose DNS answer includes a fake-IP must be refused, with
+    the verified real addresses to dial when it must not be; ``(None, None)``
+    when no fake-IP is present and ``(reason, None)`` on any refusal. The real
+    addresses behind the hostname are looked up (DNS-over-HTTPS, past the
+    fake-IP resolver) and each is checked with the strict test; a failed
+    lookup fails closed."""
     if not any(_is_fake_ip(ipaddress.ip_address(ip)) for ip in addresses):
-        return None
+        return None, None
     try:
         from src.dalton.network import fake_ip_block_reason
 
         return await fake_ip_block_reason(host, addresses, _ip_is_blocked)
     except Exception as exc:  # noqa: BLE001 - fail closed
-        return f"Blocked {host!r}: fake-IP check failed ({type(exc).__name__})"
+        return f"Blocked {host!r}: fake-IP check failed ({type(exc).__name__})", None
 
 
 def _resolve(host: str) -> list[str]:
@@ -113,11 +117,20 @@ class GuardedAsyncTransport(httpx.AsyncHTTPTransport):
                     request=request,
                 )
         # DALTON-HOOK(fake-ip-allow): a fake-IP answer hides the real target the
-        # proxy will connect to; check the host's real addresses with the
+        # proxy would pick itself; check the host's real addresses with the
         # strict test, failing closed when that lookup cannot be done.
-        reason = await _fake_ip_block_reason(host, addresses)
+        reason, real = await _fake_ip_recheck(host, addresses)
         if reason:
             raise BlockedAddressError(reason, request=request)
+        # DALTON-HOOK(fake-ip-allow): the dial is pinned to the rechecked real
+        # addresses, never to the fake-IP answer: whatever maps a fake-IP back
+        # re-resolves the hostname, and that answer could name a private host
+        # the recheck never saw. Pinned the upstream way, the address the
+        # connection goes to — the dial with no proxy, the CONNECT authority
+        # through one — is one the strict test passed, while the Host header
+        # and the TLS name stay the hostname's, so the certificate is still
+        # checked against the name.
+        dial = real if real is not None else addresses
         # Dialed by the addresses just checked, in order, the next one only
         # when a connection fails, as a dial by hostname would: handed the
         # hostname, httpcore would resolve it again, and that answer could
@@ -126,7 +139,7 @@ class GuardedAsyncTransport(httpx.AsyncHTTPTransport):
         extensions = dict(request.extensions)
         if request.url.scheme == "https":
             extensions["sni_hostname"] = host
-        *earlier, last = dict.fromkeys(addresses)
+        *earlier, last = dict.fromkeys(dial)
         for ip in earlier:
             try:
                 return await super().handle_async_request(self._pinned(request, ip, extensions))

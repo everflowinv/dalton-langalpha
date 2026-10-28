@@ -22,8 +22,15 @@ from langgraph.types import Command
 from typing_extensions import NotRequired
 
 from ptc_agent.agent.middleware._message_utils import order_tool_results_first
+# DALTON-HOOK(attachment-native-cap): the byte-total cut's thinking handling.
 from ptc_agent.agent.middleware.file_operations.image_fit import fit_images, unsaved_upload_name
-from ptc_agent.agent.middleware.thinking_binding import checked_thinking_end
+from ptc_agent.agent.middleware.thinking_binding import (
+    UNSENT_THINKING_KEY,
+    checked_thinking_end,
+    thinking_after,
+    unsent_thinking,
+    without_thinking,
+)
 from src.llms.attachment_payload import FILE_BLOCK_TYPES, IMAGE_BLOCK_TYPES, block_type
 from src.llms.llm import (
     get_image_types,
@@ -436,7 +443,8 @@ class MultimodalStripMiddleware(AgentMiddleware):
     async def awrap_model_call(self, request, handler):
         # Runs for every target, not just modality-limited ones: the interleaving
         # only arises where injection succeeded, which is a model that can see it.
-        messages = order_tool_results_first(request.messages)
+        ordered = order_tool_results_first(request.messages)
+        messages = ordered
 
         stamped, modalities = self._resolve_target(request)
         has_image = "image" in modalities
@@ -447,13 +455,63 @@ class MultimodalStripMiddleware(AgentMiddleware):
         max_pdf_pages = get_max_pdf_pages(stamped) if stamped and has_pdf else None
 
         unreadable: frozenset[tuple[int, int]] = frozenset()
+        # DALTON-HOOK(attachment-native-cap): the ids of the messages whose
+        # images the request's byte total left out, to record the upstream way.
+        left_out: frozenset[str] = frozenset()
         route = image_route(getattr(request.model, "metadata", None))
         rule, update = _image_side_rule(request, route)
+        updates: dict[str, Any] = {}
         if has_image:
             side = get_max_image_side_by_count if rule == "count" else get_max_image_side
-            messages, unreadable = await fit_images(
-                messages, get_image_types(route), lambda count: side(route, count)
+
+            def fit(count: int) -> int | None:
+                return side(route, count)
+
+            messages, unreadable, left_out = await fit_images(
+                messages, get_image_types(route), fit
             )
+            # DALTON-HOOK(attachment-native-cap): the byte total's cut moves
+            # between calls — what fits changes as images arrive — so it is
+            # joined to the removal the context window uses rather than left a
+            # per-request rewrite: the message goes into
+            # ``_removed_attachment_ids`` and every answer after it into
+            # ``_unsent_thinking_ids``, and this request already sends the
+            # bytes every later one reads (the offload view re-applies the
+            # record before this middleware runs). Before, the first trimming
+            # request replaced the images with notes but kept sending the
+            # thinking behind them, whose prefix had just changed — the API
+            # dropped or refused exactly that thinking on every later call.
+            # The removal is applied to the pre-fit messages and they are
+            # fitted again, so this call's placeholders are the ones the
+            # record replays, not the byte note they would otherwise become.
+            state = getattr(request, "state", None) or {}
+            already = set(state.get("_removed_attachment_ids") or ())
+            recorded = already.copy()
+            unsent_all: set[str] = set()
+            # ``pdf_pages`` is imported here: ``compaction`` imports this module
+            # (offloading takes remove_attachments from it), so a module-level
+            # import would cycle.
+            from ptc_agent.agent.middleware.compaction.utils import pdf_pages
+
+            # The refit finds nothing new to leave out — removal only frees
+            # budget — so the second pass exits at once; the bound keeps a
+            # surprise from looping.
+            for _ in range(2):
+                newly = left_out - recorded
+                if not newly:
+                    break
+                unsent_all |= thinking_after(ordered, newly)
+                recorded |= newly
+                messages = without_thinking(
+                    remove_attachments(ordered, recorded, pages=pdf_pages), unsent_all
+                )
+                messages, unreadable, left_out = await fit_images(
+                    messages, get_image_types(route), fit
+                )
+            if recorded != already:
+                updates["_removed_attachment_ids"] = recorded
+            if unsent_all:
+                updates[UNSENT_THINKING_KEY] = unsent_thinking(state) | unsent_all
         # Decided on the call where the target is known: a tool-time note judged
         # the configured model and froze that verdict into the transcript, which
         # a subagent on its own model then inherited wrongly. The system prompt
@@ -472,9 +530,15 @@ class MultimodalStripMiddleware(AgentMiddleware):
         if messages is not request.messages:
             request = request.override(messages=messages)
         response = await handler(request)
-        if update is None:
-            return response
-        return ExtendedModelResponse(model_response=response, command=Command(update={IMAGE_SIDE_KEY: update}))
+        # DALTON-HOOK(attachment-native-cap): the side rule and the byte
+        # total's removal record ride one command.
+        if update is not None:
+            updates[IMAGE_SIDE_KEY] = update
+        if updates:
+            return ExtendedModelResponse(
+                model_response=response, command=Command(update=updates)
+            )
+        return response
 
 
 __all__ = [

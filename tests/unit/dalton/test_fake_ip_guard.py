@@ -317,10 +317,15 @@ async def test_private_answer_alongside_a_fake_ip_blocks(configured, resolvers, 
 
 
 @pytest.mark.asyncio
-async def test_allowed_fake_ip_dials_the_fake_ip_pinned_to_the_hostname(configured, resolvers):
-    """Upstream pins the dial to the checked address; behind a fake-IP proxy
-    that address is the proxy's route to the real host, so the pinned dial
-    keeps the fake-IP in the netloc and the hostname in Host and SNI."""
+async def test_an_allowed_fake_ip_dials_the_rechecked_real_ip_pinned_to_the_hostname(
+    configured, resolvers
+):
+    """The fake-IP answer is never the dial target: behind a fake-IP proxy
+    whatever maps it back re-resolves the hostname, and that answer could
+    name a private host the recheck never saw (an attack domain answering a
+    public record to DoH while the proxy resolves it internally). The dial is
+    pinned to the rechecked real address, with the hostname kept in Host and
+    SNI so the certificate is checked against the name."""
     doh = _doh({(R1, "A"): ["162.159.1.1"], (R1, "AAAA"): ["2606:4700::1"]})
     sentinel = httpx.Response(200, content=b"ok")
     with patch("src.tools.web.inhouse.guard._resolve", autospec=True, return_value=["198.18.1.238"]), patch.object(
@@ -334,9 +339,61 @@ async def test_allowed_fake_ip_dials_the_fake_ip_pinned_to_the_hostname(configur
     assert resp is sentinel
     # autospec'd, so the call carries the transport instance as its first arg
     _self, sent_request = delegated.await_args.args
-    assert str(sent_request.url) == "https://198.18.1.238/filing.pdf"
+    assert str(sent_request.url) == "https://162.159.1.1/filing.pdf"
+    assert "198.18." not in str(sent_request.url)
     assert sent_request.headers["host"] == "www.sec.gov"
     assert sent_request.extensions.get("sni_hostname") == "www.sec.gov"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("proxy", [None, "http://198.51.100.10:3128"])
+async def test_the_connection_target_is_the_rechecked_ip_not_the_fake_ip(
+    configured, resolvers, proxy
+):
+    """With a system proxy configured, httpcore tunnels with CONNECT to the
+    request URL's authority; pinned to the rechecked IP, the CONNECT target is
+    that IP, so the proxy cannot re-resolve the hostname elsewhere. Without a
+    proxy the dial goes to the same pinned address."""
+    doh = _doh({(R1, "A"): ["162.159.1.1"], (R1, "AAAA"): []})
+    sentinel = httpx.Response(200, content=b"ok")
+    kwargs = {"proxy": proxy} if proxy else {}
+    with patch("src.tools.web.inhouse.guard._resolve", autospec=True, return_value=["198.18.3.3"]), patch.object(
+        dalton_network, "doh_query", doh
+    ), patch.object(
+        httpx.AsyncHTTPTransport, "handle_async_request", autospec=True, return_value=sentinel
+    ) as delegated:
+        await GuardedAsyncTransport(**kwargs).handle_async_request(
+            httpx.Request("GET", "https://charts.example.com/a.png")
+        )
+    _self, sent_request = delegated.await_args.args
+    assert sent_request.url.host == "162.159.1.1"
+    assert sent_request.url.netloc.decode().startswith("162.159.1.1")
+    assert "198.18." not in str(sent_request.url)
+    assert sent_request.headers["host"] == "charts.example.com"
+    assert sent_request.extensions.get("sni_hostname") == "charts.example.com"
+
+
+@pytest.mark.asyncio
+async def test_failover_walks_only_the_rechecked_addresses(configured, resolvers):
+    """Several real records: each is tried in turn on a connection failure, and
+    the fake-IP answer is never one of them."""
+    doh = _doh({(R1, "A"): ["162.159.1.1", "162.159.1.2"], (R1, "AAAA"): []})
+    dialed: list[str] = []
+
+    async def connect(self, request):  # noqa: ANN001
+        dialed.append(request.url.host)
+        if len(dialed) == 1:
+            raise httpx.ConnectError("refused", request=request)
+        return httpx.Response(200, request=request)
+
+    with patch("src.tools.web.inhouse.guard._resolve", autospec=True, return_value=["198.18.3.3"]), patch.object(
+        dalton_network, "doh_query", doh
+    ), patch.object(httpx.AsyncHTTPTransport, "handle_async_request", connect):
+        response = await GuardedAsyncTransport().handle_async_request(
+            httpx.Request("GET", "https://www.sec.gov/a.png")
+        )
+    assert response.status_code == 200
+    assert dialed == ["162.159.1.1", "162.159.1.2"]
 
 
 @pytest.mark.asyncio

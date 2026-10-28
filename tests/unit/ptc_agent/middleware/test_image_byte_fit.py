@@ -82,7 +82,7 @@ class TestPerImageBytes:
         original = _image_block(raw)
         history = [HumanMessage(content=[{"type": "text", "text": "look"}, original])]
 
-        result, unreadable = await fit_images(
+        result, unreadable, _left_out = await fit_images(
             history, COMMON_IMAGE_TYPES, lambda count: 8000
         )
 
@@ -113,7 +113,7 @@ class TestPerImageBytes:
             )
         ]
 
-        result, unreadable = await fit_images(
+        result, unreadable, _left_out = await fit_images(
             history, COMMON_IMAGE_TYPES, lambda count: 8000
         )
 
@@ -156,7 +156,7 @@ class TestRequestTotal:
                 )
             )
 
-        result, unreadable = await fit_images(
+        result, unreadable, _left_out = await fit_images(
             history, COMMON_IMAGE_TYPES, lambda count: 8000
         )
 
