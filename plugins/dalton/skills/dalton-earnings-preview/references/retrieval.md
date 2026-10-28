@@ -109,7 +109,7 @@ researchdata.finance(route="estimates", ticker="<TICKER>")
 ### 各入口使用要点
 
 - **公司名与 Ticker 双查**：四个研究入口均须用“公司名（含常用中英文别名）”与“Ticker”分别检索，避免漏召回。
-- **AlphaEngine**：保持 `sort="relevance"`，时间范围放在 `start/end`；需要按来源或行业过滤时先调 `operation="list_filters"` 核实合法枚举。注意 `Sector Specialist Commentary`、`TECH SKETCH`、`Special Situations Daily` 等销售台评论可能归在研报分类下，必须读正文核对作者属于 sales/trading 还是 research analyst。
+- **AlphaEngine**：有关键词检索时保持 `sort="relevance"`（无关键词浏览时默认 `sort="newest"`），时间范围放在 `start/end`；需要按来源过滤（`source_names`/`source_ids`）时先调 `researchdata.research(route="alphaengine", operation="list_filters", params={"filter_type": "sources", "query": ...})` 核实合法机构名，按行业过滤（文档搜索用 `industry_names`，录制任务才用 `industry_ids`）时先调 `operation="list_filters", params={"filter_type": "industries"}`，按二级分类过滤（`type_ids`）时调 `operation="list_filters", params={"filter_type": "document_types", "document_code": ...}`（注意无参 `list_filters()` 仅返回友好 `categories`，切勿将其当作来源或行业词典）。注意 `Sector Specialist Commentary`、`TECH SKETCH`、`Special Situations Daily` 等销售台评论可能归在研报分类下，必须读正文核对作者属于 sales/trading 还是 research analyst。
 - **Sales Notes**：默认查原始邮件（排除 TMTB）；`layer="digest"` 仅作定位索引，引用前必须 `read` 回原始邮件 `mail:<ID>` 核实上下文与说话人身份。
 - **TMTB**：本地库代表已入库覆盖；若需补充最新几天的 TMTB，可在 AlphaEngine 中指定 `source_names: ["TMT Breakout"]` 补查，相同文档与本地缓存去重，不重复计票。非 TMT 行业公司若无覆盖如实标注即可，不强凑材料。
 - **FUNDA AI**：属于独立研究来源，观点署名 `FUNDA AI`，**不自动计为卖方一致预期、直接买方证言或公司一手披露**；若与 TMTB、sales 邮件或 AlphaEngine 引用同一份上游数据/研报，只算 **1 条来源链**。原邮件若仅含节选或通知，不得声称已读网页全文。
@@ -139,8 +139,9 @@ researchdata.finance(route="estimates", ticker="<TICKER>")
    - 调用 `researchdata.research(route=..., operation="read", document="image:<id>")` 获取原图及 `parent_document_id`，必须回读父文档确认发布日期、作者身份与上下文；
    - **所有来自图片表格的数字，必须查看原图逐项核对：正负号、小数点、单位（百万/十亿/bps/%）、期间标签（FY/CY、Q/YTD）**；
    - **严禁直接采信 `description_verified=false` 的自动识图文字描述作为数字证据**；若原图模糊或附件缺失，必须标注缺口，不得盲信文本摘要中的二手数字。
-3. **正文完整分页读取**：
-   - 正文 `read` / `get_document` 遇到截断或 `next_offset` 时，必须继续分页读取直至拿全核心章节与表格；仅看到标题或搜索摘要出现公司名，绝不等于已读过该机构的观点。
+3. **正文完整分页读取与 `content_field` 字段选择**：
+   - 正文 `read` / `get_document` 遇到截断或 `next_offset` 时，必须继续分页读取直至 `complete=true` 或 `next_offset` 为空（`get_document` 返回 `metadata.doc_id`、`complete`、`next_offset`，无顶层 `doc_id` 与 `has_more`）；仅看到标题或搜索摘要出现公司名，绝不等于已读过该机构的观点。
+   - AlphaEngine `get_document` 支持 `params={"doc_id": ..., "content_field": "auto"|"original_text"|"content"|"digest"|"digest_cn"|"main_point"|"question_answer", "offset": 0, "max_chars": 30000}` 按字段独立分页读取（`doc_id` 保留完整字符串含 `_inst_` 后缀；映射：摘要 → `digest`/`digest_cn`，要点 → `main_point`，问答 → `question_answer`，原文/转录 → `original_text`）：当所选字段为空并返回 `warning` 与 `available_content_fields`（字段→字符数映射）时，改传有字符数的合法 `content_field`（如 `original_text`、`digest` 或 `question_answer`）；同一分页序列必须固定同一 `content_field` 按 `next_offset` 续读直到 `complete=true` 或 `next_offset` 为空，并核对 `content_sha256` 一致。
 
 ---
 

@@ -19,7 +19,7 @@ catalog_routes:
     category: research
     title: 卖方研报
     rules: "search_library后get_document"
-    description: "卖方研报/纪要/目标价，查大行观点与分歧。"
+    description: "文档、机构/个人会议、录制状态、词典。"
   guidepoint:
     category: research
     title: 专家访谈
@@ -29,7 +29,7 @@ catalog_routes:
     category: research
     title: 业绩会转写
     rules: "all不含,须单调"
-    description: "财报电话会与回访全文，核对管理层原话、指引与Q&A。"
+    description: "财报电话会与回访，清单定位后另读正文，核对管理层原话、指引与Q&A。"
   company-wiki:
     category: research
     title: 公司资料库

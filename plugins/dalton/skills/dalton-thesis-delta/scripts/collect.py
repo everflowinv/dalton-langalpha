@@ -174,8 +174,92 @@ def resolve_company_meta(ticker: str, workspace_dir: Path) -> dict[str, Any]:
     return meta
 
 
+def _compute_consensus_status(cons: dict[str, Any]) -> dict[str, Any]:
+    """计算一致预期快照的原始 `currency`、`field_status`、`status`（ok|partial|error）与 `ok`。
+
+    核心前四项（earnings_estimate, revenue_estimate, eps_trend, eps_revisions）全空或全错时
+    `ok=False, status='error'`；核心项至少有一项 `ok`，但任一字段缺失/报错或 `implied_model`
+    有告警/错误（如非 USD 币种跳过美元隐含模型）时 `ok=True, status='partial'`。
+    """
+    core_fields = ("earnings_estimate", "revenue_estimate", "eps_trend", "eps_revisions")
+    base_fields = (*core_fields, "price_targets", "price")
+    extra_fields = tuple(
+        k for k in ("recommendations", "earnings_dates") if k in cons
+    )
+    all_fields = (*base_fields, *extra_fields)
+
+    existing_fs = cons.get("field_status") if isinstance(cons.get("field_status"), dict) else {}
+    field_status: dict[str, str] = {}
+    for k in all_fields:
+        if k in existing_fs and existing_fs[k] in ("ok", "empty", "error"):
+            field_status[k] = str(existing_fs[k])
+            continue
+        val = cons.get(k)
+        if isinstance(val, dict) and "error" in val:
+            field_status[k] = "error"
+        elif val:
+            field_status[k] = "ok"
+        else:
+            field_status[k] = "empty"
+    for k, v in existing_fs.items():
+        if k not in field_status and isinstance(v, str):
+            field_status[k] = v
+
+    raw_currency = cons.get("currency")
+    if not raw_currency:
+        currencies_found: list[str] = []
+        for tbl_name in ("earnings_estimate", "revenue_estimate"):
+            tbl = cons.get(tbl_name)
+            if isinstance(tbl, dict):
+                for row in tbl.values():
+                    if isinstance(row, dict) and row.get("currency"):
+                        c_str = str(row["currency"]).strip()
+                        if c_str and c_str not in currencies_found:
+                            currencies_found.append(c_str)
+        pt = cons.get("price_targets")
+        if not currencies_found and isinstance(pt, dict) and pt.get("currency"):
+            c_str = str(pt["currency"]).strip()
+            if c_str:
+                currencies_found.append(c_str)
+        if len(currencies_found) == 1:
+            raw_currency = currencies_found[0]
+        elif len(currencies_found) > 1:
+            raw_currency = "/".join(currencies_found)
+
+    top_err = _extract_non_empty_error(cons)
+    core_ok = any(field_status.get(k) == "ok" for k in core_fields) and not top_err
+    model = cons.get("implied_model") if isinstance(cons.get("implied_model"), dict) else {}
+    complete = (
+        core_ok
+        and all(v == "ok" for v in field_status.values())
+        and not model.get("error")
+        and not model.get("warnings")
+    )
+
+    explicit_status = str(cons.get("status") or "").strip().lower()
+    if cons.get("ok") is False or explicit_status == "error" or not core_ok:
+        ok = False
+        status = "error"
+    elif explicit_status in ("partial", "incomplete") or not complete:
+        ok = True
+        status = "partial"
+    else:
+        ok = True
+        status = "ok"
+
+    cons["currency"] = raw_currency
+    cons["field_status"] = field_status
+    cons["status"] = status
+    cons["ok"] = ok
+    if isinstance(cons.get("_meta"), dict):
+        cons["_meta"]["currency"] = raw_currency
+        cons["_meta"]["field_status"] = field_status
+        cons["_meta"]["status"] = status
+    return cons
+
+
 def fetch_consensus_snapshot(ticker: str, benchmark: str = "QQQ") -> dict[str, Any]:
-    """获取一致预期与价格位置快照（带 _meta 字段，符合 P0-D.6 规范）。"""
+    """获取一致预期与价格位置快照（带 _meta、原始 currency、field_status 与 status）。"""
     fetched_at = now_et().isoformat()
     out: dict[str, Any] = {
         "_meta": {
@@ -186,6 +270,7 @@ def fetch_consensus_snapshot(ticker: str, benchmark: str = "QQQ") -> dict[str, A
         "ticker": ticker,
         "fetched_at": fetched_at,
         "source": "Yahoo Finance via yfinance",
+        "currency": None,
         "earnings_estimate": {},
         "revenue_estimate": {},
         "eps_trend": {},
@@ -236,7 +321,7 @@ def fetch_consensus_snapshot(ticker: str, benchmark: str = "QQQ") -> dict[str, A
             out["price"] = {"error": str(e)[:200]}
     except Exception as e:
         out["error"] = str(e)[:300]
-    return out
+    return _compute_consensus_status(out)
 
 
 def compute_consensus_deltas(
@@ -277,14 +362,32 @@ def compute_consensus_deltas(
         prev_ee = prev.get("earnings_estimate") if isinstance(prev.get("earnings_estimate"), dict) else {}
         cur_re = cur.get("revenue_estimate") if isinstance(cur.get("revenue_estimate"), dict) else {}
         prev_re = prev.get("revenue_estimate") if isinstance(prev.get("revenue_estimate"), dict) else {}
+        top_cur_ccy = str(cur.get("currency") or "").strip().upper()
+        top_prev_ccy = str(prev.get("currency") or "").strip().upper()
         for per in ("0q", "+1q", "0y", "+1y"):
-            c_e = (cur_ee.get(per) or {}).get("avg") if isinstance(cur_ee.get(per), dict) else None
-            p_e = (prev_ee.get(per) or {}).get("avg") if isinstance(prev_ee.get(per), dict) else None
-            deltas[f"eps_{per}_vs_last_pct"] = pct_diff(c_e, p_e)
+            cur_e_row = cur_ee.get(per) if isinstance(cur_ee.get(per), dict) else {}
+            prev_e_row = prev_ee.get(per) if isinstance(prev_ee.get(per), dict) else {}
+            c_e_ccy = str(cur_e_row.get("currency") or top_cur_ccy).strip().upper()
+            p_e_ccy = str(prev_e_row.get("currency") or top_prev_ccy).strip().upper()
+            if c_e_ccy and p_e_ccy and c_e_ccy != p_e_ccy:
+                deltas[f"eps_{per}_vs_last_pct"] = None
+                deltas["currency_mismatch"] = True
+            else:
+                c_e = cur_e_row.get("avg")
+                p_e = prev_e_row.get("avg")
+                deltas[f"eps_{per}_vs_last_pct"] = pct_diff(c_e, p_e)
 
-            c_r = (cur_re.get(per) or {}).get("avg") if isinstance(cur_re.get(per), dict) else None
-            p_r = (prev_re.get(per) or {}).get("avg") if isinstance(prev_re.get(per), dict) else None
-            deltas[f"rev_{per}_vs_last_pct"] = pct_diff(c_r, p_r)
+            cur_r_row = cur_re.get(per) if isinstance(cur_re.get(per), dict) else {}
+            prev_r_row = prev_re.get(per) if isinstance(prev_re.get(per), dict) else {}
+            c_r_ccy = str(cur_r_row.get("currency") or top_cur_ccy).strip().upper()
+            p_r_ccy = str(prev_r_row.get("currency") or top_prev_ccy).strip().upper()
+            if c_r_ccy and p_r_ccy and c_r_ccy != p_r_ccy:
+                deltas[f"rev_{per}_vs_last_pct"] = None
+                deltas["currency_mismatch"] = True
+            else:
+                c_r = cur_r_row.get("avg")
+                p_r = prev_r_row.get("avg")
+                deltas[f"rev_{per}_vs_last_pct"] = pct_diff(c_r, p_r)
 
         cur_pt = (cur.get("price_targets") or {}).get("mean") if isinstance(cur.get("price_targets"), dict) else None
         prev_pt = (prev.get("price_targets") or {}).get("mean") if isinstance(prev.get("price_targets"), dict) else None
@@ -716,29 +819,106 @@ def build_sec_filing_request(ticker: str, form: str, limit: int = 5) -> tuple[st
     )
 
 
-def _extract_route_items(data: Any) -> list[dict[str, Any]]:
-    """从 bridge 响应（含 MCP 代理 structuredContent / data 嵌套层）提取条目列表。"""
-    if isinstance(data, list):
-        return [x for x in data if isinstance(x, dict)]
+MAX_CURSOR_PAGES = 5
+
+
+def _extract_route_page_info(data: Any) -> dict[str, Any]:
+    """从 bridge 响应（含 MCP 代理 structuredContent / data 嵌套层）提取分页元数据（cursor / has_more / total_upstream / returned）。"""
+    default_info: dict[str, Any] = {
+        "cursor": None,
+        "has_more": False,
+        "total_upstream": None,
+        "returned": None,
+    }
     if not isinstance(data, dict):
-        return []
+        return default_info
+
+    def _pick_from_dict(d: dict[str, Any]) -> dict[str, Any] | None:
+        if any(k in d for k in ("has_more", "cursor", "total_upstream", "returned", "results")):
+            raw_cur = d.get("cursor")
+            cur_str = str(raw_cur).strip() if raw_cur is not None and str(raw_cur).strip() else None
+            return {
+                "cursor": cur_str,
+                "has_more": bool(d.get("has_more")) if "has_more" in d else False,
+                "total_upstream": d.get("total_upstream"),
+                "returned": d.get("returned"),
+            }
+        return None
+
+    sc = data.get("structuredContent")
+    if isinstance(sc, dict):
+        picked = _pick_from_dict(sc)
+        if picked is not None:
+            return picked
+
+    inner = data.get("data")
+    if isinstance(inner, dict):
+        inner_sc = inner.get("structuredContent")
+        if isinstance(inner_sc, dict):
+            picked = _pick_from_dict(inner_sc)
+            if picked is not None:
+                return picked
+        content = inner.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and isinstance(block.get("text"), str):
+                    try:
+                        parsed = json.loads(block["text"])
+                        if isinstance(parsed, dict):
+                            nested_info = _extract_route_page_info(parsed)
+                            if (
+                                nested_info.get("has_more")
+                                or nested_info.get("cursor") is not None
+                                or nested_info.get("total_upstream") is not None
+                            ):
+                                return nested_info
+                    except Exception:
+                        continue
+        picked = _pick_from_dict(inner)
+        if picked is not None:
+            return picked
+
+    picked = _pick_from_dict(data)
+    return picked if picked is not None else default_info
+
+
+def _extract_route_items_with_page_info(
+    data: Any,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """同时返回条目列表与分页元数据 `(items, page_info)`。"""
+    return _extract_route_items(data), _extract_route_page_info(data)
+
+
+def _extract_route_items(
+    data: Any, *, include_page_info: bool = False
+) -> list[dict[str, Any]] | tuple[list[dict[str, Any]], dict[str, Any]]:
+    """从 bridge 响应（含 MCP 代理 structuredContent / data 嵌套层）提取条目列表；当 `include_page_info=True` 时同时返回分页元数据。"""
+    items: list[dict[str, Any]] = []
+    if isinstance(data, list):
+        items = [x for x in data if isinstance(x, dict)]
+        return (items, _extract_route_page_info(data)) if include_page_info else items
+    if not isinstance(data, dict):
+        return ([], _extract_route_page_info(data)) if include_page_info else []
     for key in ("results", "items", "documents", "rows"):
         val = data.get(key)
         if isinstance(val, list):
-            return [x for x in val if isinstance(x, dict)]
+            items = [x for x in val if isinstance(x, dict)]
+            return (items, _extract_route_page_info(data)) if include_page_info else items
     sc = data.get("structuredContent")
     if isinstance(sc, dict):
         for key in ("results", "data", "items", "documents"):
             val = sc.get(key)
             if isinstance(val, list):
-                return [x for x in val if isinstance(x, dict)]
+                items = [x for x in val if isinstance(x, dict)]
+                return (items, _extract_route_page_info(data)) if include_page_info else items
     inner = data.get("data")
     if isinstance(inner, list):
-        return [x for x in inner if isinstance(x, dict)]
+        items = [x for x in inner if isinstance(x, dict)]
+        return (items, _extract_route_page_info(data)) if include_page_info else items
     if isinstance(inner, dict):
-        items = _extract_route_items(inner)
-        if items:
-            return items
+        nested_items = _extract_route_items(inner)
+        if isinstance(nested_items, list) and nested_items:
+            return (nested_items, _extract_route_page_info(data)) if include_page_info else nested_items
         content = inner.get("content")
         if isinstance(content, list):
             for block in content:
@@ -746,11 +926,11 @@ def _extract_route_items(data: Any) -> list[dict[str, Any]]:
                     try:
                         parsed = json.loads(block["text"])
                         nested = _extract_route_items(parsed)
-                        if nested:
-                            return nested
+                        if isinstance(nested, list) and nested:
+                            return (nested, _extract_route_page_info(data)) if include_page_info else nested
                     except Exception:
                         continue
-    return []
+    return ([], _extract_route_page_info(data)) if include_page_info else []
 
 
 def _is_bridge_no_match(res: dict[str, Any], data: dict[str, Any]) -> bool:
@@ -760,6 +940,49 @@ def _is_bridge_no_match(res: dict[str, Any], data: dict[str, Any]) -> bool:
     if str(data.get("error_category") or "").strip() == "没有匹配":
         return True
     return str(res.get("error") or "").lstrip().startswith("[没有匹配]")
+
+
+def _extract_route_warnings_and_status(
+    res: dict[str, Any], data: dict[str, Any]
+) -> tuple[Any, list[str]]:
+    """从桥接响应（含 MCP 代理 structuredContent / data 嵌套层）提取真实 `status` 与 `warnings`。"""
+    status_val: Any = None
+    warnings: list[str] = []
+
+    def _visit(d: Any) -> None:
+        nonlocal status_val
+        if not isinstance(d, dict):
+            return
+        st = d.get("status")
+        if isinstance(st, str) and st.strip() and (
+            st.strip().lower() in ("partial", "incomplete", "error") or status_val is None
+        ):
+            status_val = st.strip()
+        raw_w = d.get("warnings")
+        if isinstance(raw_w, list):
+            for w in raw_w:
+                if w is not None and str(w).strip() and str(w).strip() not in warnings:
+                    warnings.append(str(w).strip())
+
+    _visit(res)
+    _visit(data)
+    if isinstance(data, dict):
+        _visit(data.get("structuredContent"))
+        inner = data.get("data")
+        if isinstance(inner, dict):
+            _visit(inner)
+            _visit(inner.get("structuredContent"))
+            content = inner.get("content")
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and isinstance(block.get("text"), str):
+                        try:
+                            parsed = json.loads(block["text"])
+                            if isinstance(parsed, dict):
+                                _visit(parsed)
+                        except Exception:
+                            continue
+    return status_val, warnings
 
 
 def _normalize_guidepoint_doc_id(r: dict[str, Any]) -> str | None:
@@ -787,27 +1010,56 @@ def _normalize_guidepoint_doc_id(r: dict[str, Any]) -> str | None:
     return f"guidepoint:{raw}"
 
 
+def _is_source_status_incomplete(st: dict[str, Any]) -> bool:
+    """判断单个来源的状态记录是否处于“未完成”（如翻满页上限仍有 has_more、翻页中断或显式标记 incomplete）。"""
+    if bool(st.get("incomplete")):
+        return True
+    if st.get("completed") is False:
+        return True
+    if bool(st.get("has_more")):
+        return True
+    st_val = str(st.get("status") or "").strip().lower()
+    return st_val in ("incomplete", "未完成", "partial")
+
+
 def summarize_source_failures(
     internal_data: dict[str, Any],
     ae_data: dict[str, Any] | None = None,
     sec_data: dict[str, Any] | None = None,
+    consensus_data: dict[str, Any] | None = None,
 ) -> list[dict[str, str]]:
-    """汇总所有 ok=False 的取数来源及原因，供短路门禁与 packet/汇总输出使用。"""
+    """汇总所有 ok=False 或未完成（incomplete / partial）的取数来源及原因，供短路门禁与 packet/汇总输出使用。"""
     failures: list[dict[str, str]] = []
     seen_sources: set[str] = set()
     int_status = (internal_data or {}).get("status") or {}
     if isinstance(int_status, dict):
         for route, st in int_status.items():
-            if isinstance(st, dict) and not st.get("ok", False):
-                reason = str(st.get("error") or st.get("status") or "unknown_error")
+            if not isinstance(st, dict):
+                continue
+            if not st.get("ok", False) or _is_source_status_incomplete(st):
+                reason = str(
+                    st.get("error")
+                    or st.get("incomplete_reason")
+                    or ("未完成" if _is_source_status_incomplete(st) else "")
+                    or st.get("status")
+                    or "unknown_error"
+                )
                 failures.append({"source": str(route), "error": reason})
                 seen_sources.add(str(route))
 
     ae_status = (ae_data or {}).get("status") or []
     if isinstance(ae_status, list) and "alphaengine" not in seen_sources:
         for st in ae_status:
-            if isinstance(st, dict) and not st.get("skipped") and not st.get("ok", False):
-                reason = str(st.get("error") or st.get("status") or "unknown_error")
+            if not isinstance(st, dict) or st.get("skipped"):
+                continue
+            if not st.get("ok", False) or _is_source_status_incomplete(st):
+                reason = str(
+                    st.get("error")
+                    or st.get("incomplete_reason")
+                    or ("未完成" if _is_source_status_incomplete(st) else "")
+                    or st.get("status")
+                    or "unknown_error"
+                )
                 failures.append({"source": "alphaengine", "error": reason})
                 seen_sources.add("alphaengine")
                 break
@@ -815,12 +1067,33 @@ def summarize_source_failures(
     sec_status = (sec_data or {}).get("status") or []
     if isinstance(sec_status, list):
         failed_forms = [
-            f"{st.get('form')}:{st.get('error') or st.get('status') or 'failed'}"
+            f"{st.get('form')}:{st.get('error') or st.get('incomplete_reason') or st.get('status') or 'failed'}"
             for st in sec_status
-            if isinstance(st, dict) and not st.get("ok", False)
+            if isinstance(st, dict) and (not st.get("ok", False) or _is_source_status_incomplete(st))
         ]
         if failed_forms:
             failures.append({"source": "sec", "error": "; ".join(failed_forms)})
+
+    if isinstance(consensus_data, dict):
+        cons_eval = _compute_consensus_status(dict(consensus_data))
+        cons_ok = bool(cons_eval.get("ok", False))
+        cons_status = str(cons_eval.get("status") or "").strip().lower()
+        if not cons_ok or cons_status in ("error", "partial", "incomplete"):
+            fs = cons_eval.get("field_status") if isinstance(cons_eval.get("field_status"), dict) else {}
+            non_ok_fields = [f"{k}={v}" for k, v in fs.items() if v != "ok"]
+            model = cons_eval.get("implied_model") if isinstance(cons_eval.get("implied_model"), dict) else {}
+            model_warns = model.get("warnings") if isinstance(model.get("warnings"), list) else []
+            detail_parts = []
+            if cons_eval.get("error"):
+                detail_parts.append(str(cons_eval["error"]))
+            if non_ok_fields:
+                detail_parts.append(f"field_status({', '.join(non_ok_fields)})")
+            if model.get("error"):
+                detail_parts.append(f"implied_model.error={model['error']}")
+            if model_warns:
+                detail_parts.append(f"implied_model.warnings={'; '.join(str(w) for w in model_warns)}")
+            detail_str = "; ".join(detail_parts) or cons_status or "incomplete"
+            failures.append({"source": "estimates", "error": f"{cons_status}: {detail_str}"})
 
     return failures
 
@@ -831,9 +1104,10 @@ def can_short_circuit(
     internal_data: dict[str, Any],
     ae_data: dict[str, Any],
     sec_data: dict[str, Any],
+    consensus_data: dict[str, Any] | None = None,
 ) -> bool:
-    """短路判断：要求所有来源都 ok:true，且 auto_flags 为空，且所有来源都是 0 新增。"""
-    if summarize_source_failures(internal_data, ae_data, sec_data):
+    """短路判断：要求所有来源（含一致预期）都 ok:true 且完整，auto_flags 为空，且所有来源都是 0 新增。"""
+    if summarize_source_failures(internal_data, ae_data, sec_data, consensus_data):
         return False
     if auto_flags:
         return False
@@ -867,13 +1141,33 @@ def collect_internal_and_ae(
         items = _extract_route_items(data)
         ok = bool(res.get("ok", False))
         err_msg = res.get("error") or data.get("error")
-        status_val = data.get("status") or res.get("status")
+        status_val, route_warnings = _extract_route_warnings_and_status(res, data)
 
         if route == "company-wiki":
+            wiki_truncated = bool(
+                ok
+                and (
+                    str(status_val or "").strip().lower() == "partial"
+                    or any(
+                        tok in w
+                        for w in route_warnings
+                        for tok in ("列表有更多文档", "更多文档", "缩小筛选", "提高 limit")
+                    )
+                )
+            )
+            wiki_incomplete_reason = (
+                f"未完成: company-wiki 列表被截断或覆盖不完整（{'; '.join(route_warnings) or 'status=partial'}）"
+                if wiki_truncated
+                else None
+            )
             internal_status[route] = {
                 "ok": ok,
+                "completed": bool(ok and not wiki_truncated),
+                "incomplete": wiki_truncated,
                 "listed": len(items),
-                "status": status_val,
+                "status": "incomplete" if wiki_truncated else status_val,
+                **({"warnings": route_warnings} if route_warnings else {}),
+                **({"incomplete_reason": wiki_incomplete_reason} if wiki_incomplete_reason else {}),
                 **({"error": err_msg} if err_msg else {}),
             }
             for r in items:
@@ -897,6 +1191,7 @@ def collect_internal_and_ae(
                 "ok": ok,
                 "returned": len(items),
                 "status": status_val,
+                "scope": "摘录检索，非全量",
                 **({"error": err_msg} if err_msg else {}),
             }
             for r in items:
@@ -965,26 +1260,104 @@ def collect_internal_and_ae(
         ae_status.append({"skipped": "--no-ae", "ok": True})
         internal_status["alphaengine"] = {"ok": True, "skipped": "--no-ae", "status": "skipped"}
     else:
-        tool_name, req_args = build_internal_route_request("alphaengine", meta, since, until)
-        res = call_bridge_jsonrpc(tool_name, req_args)
-        data = res.get("data") if isinstance(res.get("data"), dict) else {}
-        items = _extract_route_items(data)
-        ok = bool(res.get("ok", False))
-        err_msg = res.get("error") or data.get("error")
-        status_val = data.get("status") or res.get("status")
-        ae_status.append({
+        base_tool_name, base_req_args = build_internal_route_request("alphaengine", meta, since, until)
+        items: list[dict[str, Any]] = []
+        cursor: str | None = None
+        pages_fetched = 0
+        ok = True
+        err_msg: str | None = None
+        status_val: Any = "ok"
+        incomplete = False
+        incomplete_reason: str | None = None
+        last_has_more = False
+        total_upstream: Any = None
+
+        while pages_fetched < MAX_CURSOR_PAGES:
+            req_args = json.loads(json.dumps(base_req_args))
+            if cursor:
+                req_args.setdefault("params", {})["cursor"] = cursor
+            res = call_bridge_jsonrpc(base_tool_name, req_args)
+            pages_fetched += 1
+            data = res.get("data") if isinstance(res.get("data"), dict) else {}
+            page_items, page_info = _extract_route_items_with_page_info(data)
+            page_ok = bool(res.get("ok", False))
+            page_err = res.get("error") or data.get("error")
+            page_status = data.get("status") or res.get("status")
+            page_has_more = bool(page_info.get("has_more"))
+            page_cursor = page_info.get("cursor")
+            if page_info.get("total_upstream") is not None:
+                total_upstream = page_info.get("total_upstream")
+
+            if not page_ok and _is_bridge_no_match(res, data):
+                # 无匹配（或中间空页）视为上游已正常响应
+                page_ok = True
+                page_err = None
+                page_status = "empty" if not page_has_more else "ok"
+
+            if not page_ok:
+                ok = False
+                err_msg = str(page_err or page_status or "unknown_error")
+                status_val = page_status or "error"
+                if pages_fetched > 1 or last_has_more:
+                    incomplete = True
+                    incomplete_reason = f"未完成: 第 {pages_fetched} 页取数失败（{err_msg}）"
+                break
+
+            items.extend(page_items)
+            status_val = page_status or "ok"
+            last_has_more = page_has_more
+            cursor = page_cursor
+
+            if not page_has_more:
+                break
+
+            if not page_cursor:
+                incomplete = True
+                incomplete_reason = "未完成: 上游返回 has_more=true 但缺少下一页 cursor"
+                status_val = "incomplete"
+                break
+
+            if pages_fetched >= MAX_CURSOR_PAGES:
+                incomplete = True
+                incomplete_reason = (
+                    f"未完成: 已达单源翻页上限（{MAX_CURSOR_PAGES} 页）但 has_more 仍为 true"
+                )
+                status_val = "incomplete"
+                break
+
+        ae_status_entry: dict[str, Any] = {
             "query": meta["name"],
             "ok": ok,
+            "completed": bool(ok and not incomplete),
+            "incomplete": incomplete,
+            "pages": pages_fetched,
+            "has_more": last_has_more,
+            "cursor": cursor,
             "returned": len(items),
-            "status": status_val,
+            "status": "incomplete" if incomplete else status_val,
             "error": err_msg,
-        })
-        internal_status["alphaengine"] = {
-            "ok": ok,
-            "returned": len(items),
-            "status": status_val,
-            **({"error": err_msg} if err_msg else {}),
         }
+        if total_upstream is not None:
+            ae_status_entry["total_upstream"] = total_upstream
+        if incomplete_reason:
+            ae_status_entry["incomplete_reason"] = incomplete_reason
+        ae_status.append(ae_status_entry)
+
+        int_ae_entry: dict[str, Any] = {
+            "ok": ok,
+            "completed": bool(ok and not incomplete),
+            "incomplete": incomplete,
+            "pages": pages_fetched,
+            "has_more": last_has_more,
+            "cursor": cursor,
+            "returned": len(items),
+            "status": "incomplete" if incomplete else status_val,
+            **({"error": err_msg} if err_msg else {}),
+            **({"incomplete_reason": incomplete_reason} if incomplete_reason else {}),
+            **({"total_upstream": total_upstream} if total_upstream is not None else {}),
+        }
+        internal_status["alphaengine"] = int_ae_entry
+
         for r in items:
             doc_id = r.get("doc_id") or r.get("document_id") or r.get("id")
             if not doc_id:
@@ -994,9 +1367,14 @@ def collect_internal_and_ae(
                 continue
             ae_new[did] = {
                 "title": r.get("title"),
+                "title_cn": r.get("title_cn"),
                 "publish_time": r.get("publish_time") or r.get("date"),
+                "rank_date": r.get("rank_date"),
                 "sources": r.get("sources"),
                 "document_code": r.get("document_code"),
+                "type_show_name": r.get("type_show_name"),
+                "institution_meeting_flag": r.get("institution_meeting_flag"),
+                "personal_meeting_flag": r.get("personal_meeting_flag"),
                 "snippet": (r.get("snippet") or "")[:800],
             }
 
@@ -1103,10 +1481,12 @@ def render_packet_md(pk: dict[str, Any]) -> str:
         v_row = er.get(per) if isinstance(er.get(per), dict) else {}
         if not e_row and not r_row:
             continue
-        rev_bn = round(float(r_row["avg"]) / 1e9, 2) if r_row.get("avg") else None
+        rev_bn = round(float(r_row["avg"]) / 1e9, 2) if r_row.get("avg") is not None else None
+        rev_ccy = str(r_row.get("currency") or e_row.get("currency") or c.get("currency") or "").strip()
+        rev_unit = "十亿美元" if rev_ccy == "USD" else (f"十亿 {rev_ccy}" if rev_ccy else "十亿（币种未提供）")
         lines.append(
             f"- **{per}**：EPS 均值 {e_row.get('avg')}（区间 {e_row.get('low')} 至 {e_row.get('high')}，{e_row.get('numberOfAnalysts')} 家）｜"
-            f"收入均值 {rev_bn} 十亿美元｜"
+            f"收入均值 {rev_bn} {rev_unit}｜"
             f"EPS 7/30 天前：{t_row.get('7daysAgo')} / {t_row.get('30daysAgo')}｜"
             f"近 7 天上调 {v_row.get('upLast7days')} / 下调 {v_row.get('downLast7Days')}"
         )
@@ -1124,6 +1504,9 @@ def render_packet_md(pk: dict[str, Any]) -> str:
             st = int_status.get(r_name)
             if isinstance(st, dict) and not st.get("ok", False):
                 lines.append(f"- ⚠️ **{r_name} 本轮取数失败（{st.get('error') or st.get('status') or 'unknown_error'}）**")
+        gp_st = int_status.get("guidepoint")
+        if isinstance(gp_st, dict) and gp_st.get("ok", False) and gp_st.get("returned", 0) == 0:
+            lines.append("- **Guidepoint（摘录检索，非全量）**：本轮检索未命中")
     int_new = internal_obj.get("new") or {}
     if int_new:
         for did, info in int_new.items():
@@ -1259,13 +1642,14 @@ def cmd_collect(args: argparse.Namespace) -> int:
         sec_new_count=len(sec_data["new"]),
     )
 
-    failed_sources = summarize_source_failures(internal_data, ae_data, sec_data)
+    failed_sources = summarize_source_failures(internal_data, ae_data, sec_data, cons)
     all_sources_ok = len(failed_sources) == 0
     short_circuit_eligible = can_short_circuit(
         auto_flags=auto_flags,
         internal_data=internal_data,
         ae_data=ae_data,
         sec_data=sec_data,
+        consensus_data=cons,
     )
 
     rel_snap = str(snap_path.relative_to(ws_dir))

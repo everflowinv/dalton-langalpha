@@ -24,7 +24,7 @@
 
 | 路由与操作（route / operation） | `document_id` 格式 | `identity`（来源身份） | `publisher`（发布方） | `as_of` 口径 |
 |---|---|---|---|---|
-| `alphaengine` (`search_library` / `get_document`) | `alphaengine:{doc_id}` | 研报 → `broker_report`；公告 → `company`；业绩/调研纪要 → `company`；专家纪要 → `expert`；新闻 → `news` | `sources[0]` 机构名 | `publish_time` |
+| `alphaengine` (`search_library` / `get_document`；仅此两操作生成研究文档 `_sources`，`list_recording_tasks` / `get_recording_status` / `get_recording_task` / `get_document_info` / `list_attachments` / `list_filters` / `auth_status` 不生成研究文档来源) | `alphaengine:{doc_id}`（完整不透明字符串 ID，保留 `_inst_` 后缀） | 结合 `document_code` / `type_id` / `type_name` / `type_show_name` 映射：业绩说明会（`IND_SECOND_5FA442AE` / `SimultaneousInterpretation` / 业绩会）与公司公告（`companyAllAnnouncement`）→ `company`；专家库（`expert_summary` / 专家）→ `expert`；资讯（`news`）→ `news`；卖方研报与点评（`comment` / `chinaReport` / `foreignReport`，或细分类型明确为券商/卖方研报）→ `broker_report`；**`document_code="summary"` 且细分类型未确认为卖方的个人/机构会议、三方报告（`thirdReport`）、全球智库（`globalThinkTank`）及未知类型均保持 `unknown`（录制范围或资料大类本身不足以证明卖方身份，不默认判卖方）** | `sources[0]` 机构名 | `publish_time`（缺发布时间时留空、`as_of_basis="unknown"`，不用调用日期冒充；`rank_date` 是入库排序时间，非会议开始时间） |
 | `guidepoint` (`search_library`) | `guidepoint:{sha1}` | `expert` | `"Guidepoint · {title}, {company}"`（**不写姓名**） | `date` (`call_date`) |
 | `transcript` (`transcript`) | `alphaengine:{doc_id}` | 公司电话会 → `_sources` 标 `company`，知识层 `source.type` 记 `transcript`（tier 2，含 AlphaEngine ASR 稿）；卖方回访 → `broker_report` / `transcript`（tier 3） | `sources` | `publish_time` |
 | `company-wiki` (`search` / `read` / `list`) | `wiki:<id>` | 专家访谈 → `expert`；管理层纪要 → `company`（或知识层 `transcript`）；券商研报/卖方交流/Earnings Update → `broker_report`；微信文章 → `news`；内部笔记 → `internal_note`（默认 tier 5） | frontmatter `source`（无则写`"基金 wiki"`） | `date` (`document_date`) |
@@ -155,3 +155,27 @@
 3. **Blind 第 31 条以后的正文不能当证据**：Blind 免费接口从第 31 条评论起正文为锁死占位文本（lorem ipsum / `body_locked: true`），严禁将第 31 条以后的正文当作员工观点或证据引用；被锁定的记录（第 31 条以后）仅可用于统计评分等元数据，**不能**用于做正文词频统计（正文词频只能来自未锁定的前 30 条真实正文）。
 4. **Polymarket 只算市场定价信号**：`last30days` 返回的 Polymarket 赔率与成交量仅代表预测市场当前的概率定价信号，不算事实证据或基本面定论。
 5. **财务数字要回到公告核对**：社区帖子或评论中提及的任何营收、利润、订单、指引或估值数字，必须回到公司法定公告（SEC / 巨潮 `cn-hk` / 港交所披露易）原文核对，禁止直接引用社区帖子的财务数字。
+
+---
+
+## 14. 机构会议 / 个人会议（AlphaEngine 1.1.0）
+
+调用 `researchdata.research(route="alphaengine", ...)` 检索与读取机构会议、个人会议、专家库及录制任务时，必须遵守以下五条规则：
+
+1. **浏览本机构最新会议（无关键词模式）**：
+   - `search_library` 的 `query` 不再必填：浏览本机构最新入库会议时，不传 `query`，调用 `research(route="alphaengine", operation="search_library", params={"meeting_scope": "institution", "sort": "newest", "limit": 20})`（个人会议传 `meeting_scope="personal"`，或传 `document_categories=["institution_meetings"|"personal_meetings"]`；`meeting_scope` 不能与互斥的分类混传，否则报 `E_SCOPE_CONFLICT`）。
+   - 无关键词时默认 `sort="newest"`（也允许显式 `sort="relevance"`）；**一旦传入有效关键词（顶层 `query`、`params.query` 或 `ticker` 折叠后的关键词），只允许 `sort="relevance"`**（传 `"newest"` 会报 `E_QUERY_SORT`）。
+2. **按关键词、标题检索与行业筛选（不依赖上游公司/地区/自选标签）**：
+   - 按公司检索统一使用关键词 `query`（公司名 + ticker），必要时配合标题检索 `params={"search_in": "title"}`；机构会议浏览用 `meeting_scope` + 日期（`start`/`end`）+ 关键词 `query`；文档搜索按行业过滤用 `params.industry_names`（旧名 `industries`、`companies` 已废弃；`industry_ids` 仅用于录制任务 `list_recording_tasks`）。
+   - 文档搜索统一用 `params.cursor` 翻页（直到 `has_more=false`）：`search_in="title"` 可以翻页，续页时必须保持相同的 `search_in`、`query`、日期与其他筛选条件，只加 `cursor`（否则报 `E_CURSOR_FILTER_MISMATCH`）；不能在 `search_library` 上传 `page` 或 `pages`。
+3. **查录制中 / 失败的任务与状态**：
+   - 用 `operation="list_recording_tasks"` 查询机构或个人录制任务列表（参数：`params={"meeting_scope": "institution"|"personal", "page": 1, "limit": 100, "date_from": ..., "date_to": ..., "query": ...}`，可选 `industry_ids`、`source_ids`、`states`；分页用 `page`/`next_page`，日期按成对 `date_from`/`date_to` 传且支持未来排期日期，不套用历史文档截断到今天的规则）。
+   - 用 `operation="get_recording_status"`（可选 `params={"meeting_scope": "institution"|"personal"}`）查当前正在录制的任务状态，或用 `operation="get_recording_task"`（必传 `params={"roadshow_id": ...}`）查单个录制任务详情。
+   - **录制任务尚未入库成文**：`list_recording_tasks` / `get_recording_status` / `get_recording_task`（以及 `get_document_info`、`list_attachments`）不生成研究文档 `_sources`，严禁把录制任务的 `roadshow_id` / 任务 `id` 拼成 `alphaengine:<id>` 冒充已入库研究文档引用。
+4. **按字段独立分页读取正文（`content_field`）与完整字符串 ID**：
+   - AlphaEngine 的 `doc_id` 是不透明字符串（如 `"290001790954279_inst_134249"`），全链路必须原样保留完整字符串，严禁转整数、截断 `_inst_` 后缀或携带首尾空白。
+   - `operation="get_document"` 的 `params.content_field` 仅接受 7 个枚举值：`"auto"`（默认）| `"original_text"`（原文/转录）| `"content"`（正文）| `"digest"`（摘要）| `"digest_cn"`（中文摘要）| `"main_point"`（要点）| `"question_answer"`（问答）（映射：摘要 → `digest`/`digest_cn`，要点 → `main_point`，问答 → `question_answer`，原文/转录 → `original_text`；`available_content_fields` 中可能出现的 `full_content`/`text`/`markdown` 仅为长度信息，不能作为 `content_field` 请求，否则触发 `E_BAD_CONTENT_FIELD`）。
+   - `get_document` 实际返回 `metadata.doc_id`、`content_field`、`available_content_fields`（字段名→字符长度映射）、`warning`、`next_offset`、`complete`、`content_sha256`（**无顶层 `doc_id`，也无 `has_more`**）：当所选字段为空时返回 `warning` 与 `available_content_fields`，不得推断整篇文档为空，应改传有字符数的合法 `content_field`（如 `original_text`、`digest`、`main_point` 或 `question_answer`）；同一分页序列必须固定同一个 `content_field` 按 `next_offset` 续读，直到 `complete=true` 或 `next_offset` 为空，并核对 `content_sha256`。
+5. **发布日期、入库排序时间、资料发布方与录制归属的严格区分**：
+   - `start`/`end`（`date_from`/`date_to`）按文档发布时间 **`publish_time`** 筛选；**`rank_date`** 是上游入库排序时间（仅精确到秒，**不是会议开始时间**），`sort="newest"` 必须保留上游返回顺序，严禁在本地按 `publish_time` 二次重排。
+   - **`source_names` / `sources`** 表示资料发布方（如券商或第三方研究机构名称），而 **`meeting_scope`** 与返回条目中的 **`institution_meeting_flag` / `personal_meeting_flag`** 才表示本机构或个人录制归属，严禁将资料发布方与本机构录制归属混为一谈。

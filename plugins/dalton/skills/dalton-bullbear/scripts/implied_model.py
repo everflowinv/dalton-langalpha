@@ -3,12 +3,17 @@
 
 移植自 OpenClaw `consensus_estimates.py implied_model`，纯 Python 标准库实现。
 
-核心公式（单位：十亿美元 / 美元每股）：
+核心公式（单位：十亿 <币种> / 每股 <币种>）：
 - implied_pretax = EPS * shares / (1 - tax)
 - implied_total_expenses = rev - implied_pretax + other_income
 - implied_op_margin_pct = (implied_pretax - other_income) / rev * 100
 - eps_per_10bn_expense = -10 * (1 - tax) / shares
 - eps_per_1pct_revenue = rev * 0.01 * (1 - tax) / shares
+
+币种契约（对齐 researchdata 1.5）：只有某期间 EPS 与收入的 `currency` 都明确为 USD
+才计算美元隐含模型；币种为其他或缺失（未知）时该期间不出美元数字，保留原币种
+一致预期数值并在 warnings 写明原因。零 EPS 是有效值（None 才是缺失）；收入换算
+统一按"原始值为报表币种元、除以 1e9 得十亿"，不按数值大小猜单位。
 
 用法 1（直接传参测算单期）：
   python implied_model.py --rev-bn 205.0 --eps 25.5 --shares-bn 2.55 --tax 0.15 --period +1y
@@ -25,6 +30,25 @@ import sys
 from typing import Any
 
 
+def _norm_currency(value: Any) -> str | None:
+    """字段币种规范化：缺失/非字符串返回 None（未知），其余去空格大写。"""
+    if isinstance(value, str) and value.strip():
+        return value.strip().upper()
+    return None
+
+
+def _revenue_bn(row: dict[str, Any]) -> float | None:
+    """收入换算为十亿：上游已给 `*_bn` 字段直接用；否则原始值是报表币种元，统一 /1e9。"""
+    for key in ("avg_bn", "revenue_bn"):
+        v = row.get(key)
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            return float(v)
+    avg = row.get("avg")
+    if isinstance(avg, (int, float)) and not isinstance(avg, bool):
+        return float(avg) / 1e9
+    return None
+
+
 def calc_period_implied(
     rev_bn: float,
     eps: float,
@@ -32,8 +56,9 @@ def calc_period_implied(
     tax_rate: float,
     other_income_bn: float = 0.0,
     label: str = "下一财年",
+    currency: str = "USD",
 ) -> dict[str, Any]:
-    """用一致预期 EPS 与收入（十亿美元）反推隐含税前利润、隐含总费用空间与 EPS 敏感度。"""
+    """用一致预期 EPS 与收入（十亿 `currency`）反推隐含税前利润、隐含总费用空间与 EPS 敏感度。"""
     if shares_bn <= 0:
         raise ValueError("shares_bn 必须大于 0")
     if not (0.0 <= tax_rate < 1.0):
@@ -49,6 +74,7 @@ def calc_period_implied(
 
     return {
         "label": label,
+        "currency": currency,
         "consensus_revenue_bn": round(rev_bn, 2),
         "consensus_eps": round(eps, 2),
         "implied_pretax_bn": round(implied_pretax, 2),
@@ -67,7 +93,11 @@ def implied_model(
     other_income_bn: dict[str, float] | None = None,
     source: str = "",
 ) -> dict[str, Any]:
-    """从 estimates 快照字典计算 0y 与 +1y 的隐含费用空间与 EPS 敏感度。"""
+    """从 estimates 快照字典计算 0y 与 +1y 的隐含费用空间与 EPS 敏感度。
+
+    仅 EPS 与收入币种都确认为 USD 的期间计算美元模型；否则保留原币种一致预期
+    数值并写明原因。快照的 `field_status` 与上游模型 `warnings` 原样透传。
+    """
     other = other_income_bn or {}
     out: dict[str, Any] = {
         "layer": "model-derived",
@@ -76,25 +106,49 @@ def implied_model(
             "tax_rate": tax,
             "other_income_bn": other,
             "source": source,
-            "note": "隐含总费用 = 一致收入 − EPS×股数/(1−税率) + 其他收入；单位十亿美元",
+            "note": "隐含总费用 = 一致收入 − EPS×股数/(1−税率) + 其他收入；单位十亿 <币种>，"
+                    "仅 EPS 与收入均确认为 USD 的期间计算美元模型",
         },
+        "warnings": [],
     }
+    if isinstance(cons.get("field_status"), dict):
+        out["field_status"] = cons["field_status"]
+    upstream = cons.get("implied_model") if isinstance(cons.get("implied_model"), dict) else {}
+    if isinstance(upstream.get("warnings"), list):
+        out["upstream_warnings"] = list(upstream["warnings"])
     ee = cons.get("earnings_estimate") or {}
     re_ = cons.get("revenue_estimate") or {}
+    for field, section in (("earnings_estimate", ee), ("revenue_estimate", re_)):
+        if isinstance(section, dict) and section.get("error"):
+            out["warnings"].append(f"{field} 字段读取失败：{section['error']}")
     for period, label in (("0y", "本财年"), ("+1y", "下一财年")):
-        eps = (ee.get(period) or {}).get("avg")
-        rev = (re_.get(period) or {}).get("avg")
-        if not eps or not rev:
+        e_row = ee.get(period) if isinstance(ee.get(period), dict) else {}
+        r_row = re_.get(period) if isinstance(re_.get(period), dict) else {}
+        eps = e_row.get("avg")
+        eps_cur = _norm_currency(e_row.get("currency"))
+        rev_cur = _norm_currency(r_row.get("currency"))
+        rev_bn = _revenue_bn(r_row)
+        if eps is None or rev_bn is None or rev_bn == 0:
+            continue  # None 才是缺失；EPS=0 是有效值，币种通过后照常计算
+        if eps_cur != "USD" or rev_cur != "USD":
+            cur_text = "/".join(c or "未知" for c in (eps_cur, rev_cur))
+            out["warnings"].append(f"{period} EPS/收入币种为 {cur_text}，未做美元隐含测算")
+            out[period] = {
+                "label": label,
+                "currency": {"eps": eps_cur or "未知", "revenue": rev_cur or "未知"},
+                "consensus_revenue_bn": round(rev_bn, 2),
+                "consensus_eps": round(float(eps), 2),
+                "note": f"币种为 {cur_text}，未做美元隐含测算；保留原币种一致预期数值",
+            }
             continue
-        rev_bn = float(rev) / 1e9 if float(rev) > 1e6 else float(rev)
-        oth = float(other.get(period, 0.0) or 0.0)
         out[period] = calc_period_implied(
             rev_bn=rev_bn,
             eps=float(eps),
             shares_bn=shares,
             tax_rate=tax,
-            other_income_bn=oth,
+            other_income_bn=float(other.get(period, 0.0) or 0.0),
             label=label,
+            currency="USD",
         )
     return out
 
@@ -106,20 +160,38 @@ def render_md(im: dict[str, Any], ticker: str = "") -> str:
     if a:
         lines.append(
             f"- 假设：稀释股数 {a.get('diluted_shares_bn')} 十亿股、有效税率 {a.get('tax_rate')}、"
-            f"其他收入 {a.get('other_income_bn') or 0} 十亿美元"
+            f"其他收入 {a.get('other_income_bn') or 0} 十亿美元（美元模型专用）"
             + (f"（{a['source']}）" if a.get("source") else "")
         )
     for per in ("0y", "+1y"):
         m = im.get(per)
         if not isinstance(m, dict):
             continue
+        cur = m.get("currency")
+        if isinstance(cur, dict):
+            # 币种未确认同为 USD 的期间：不出美元数字，保留原币种一致预期
+            lines.append(
+                f"- **{m['label']}（{per}）**：{m.get('note', '未做美元隐含测算')}；"
+                f"一致收入 {m['consensus_revenue_bn']} 十亿{cur.get('revenue', '未知')}、"
+                f"一致 EPS {m['consensus_eps']}（{cur.get('eps', '未知')}）"
+            )
+            continue
+        unit = f"十亿{cur or 'USD'}"
         lines.append(
-            f"- **{m['label']}（{per}）**：一致收入 {m['consensus_revenue_bn']} 十亿美元、一致 EPS {m['consensus_eps']} "
-            f"→ 隐含税前利润 {m['implied_pretax_bn']} 十亿美元、隐含总费用空间 **{m['implied_total_expenses_bn']} 十亿美元**，"
+            f"- **{m['label']}（{per}）**：一致收入 {m['consensus_revenue_bn']} {unit}、一致 EPS {m['consensus_eps']} "
+            f"→ 隐含税前利润 {m['implied_pretax_bn']} {unit}、隐含总费用空间 **{m['implied_total_expenses_bn']} {unit}**，"
             f"隐含经营利润率 {m['implied_op_margin_pct']}%；"
-            f"敏感度：费用每多 100 亿美元对应 EPS {m['eps_per_10bn_expense']:+.2f}，"
+            f"敏感度：费用每多 100 亿{cur or 'USD'}对应 EPS {m['eps_per_10bn_expense']:+.2f}，"
             f"收入每多 1%（不加成本）对应 EPS {m['eps_per_1pct_revenue']:+.2f}"
         )
+    fs = im.get("field_status") if isinstance(im.get("field_status"), dict) else {}
+    bad = {k: v for k, v in fs.items() if v != "ok"}
+    if bad:
+        lines.append("- 上游字段状态：" + "、".join(f"{k}={v}" for k, v in bad.items()))
+    for w in im.get("upstream_warnings", []) or []:
+        lines.append(f"- 上游模型缺口：{w}")
+    for w in im.get("warnings", []) or []:
+        lines.append(f"- 模型缺口：{w}")
     return "\n".join(lines) + "\n"
 
 
@@ -177,7 +249,8 @@ def main() -> int:
                     "tax_rate": args.tax,
                     "other_income_bn": {args.period: args.other_income_bn},
                     "source": args.source,
-                    "note": "隐含总费用 = 一致收入 − EPS×股数/(1−税率) + 其他收入；单位十亿美元",
+                    "note": "隐含总费用 = 一致收入 − EPS×股数/(1−税率) + 其他收入；"
+                            "单位十亿 <币种>，直接传参模式按美元口径计算",
                 },
                 args.period: per_res,
             }

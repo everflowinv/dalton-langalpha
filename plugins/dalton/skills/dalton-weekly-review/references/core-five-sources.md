@@ -13,15 +13,18 @@
 
 ## 二、五类必查来源（Core Five Sources）
 
-### 1. AlphaEngine（卖方研报、卖方点评、会议纪要、新闻公告）
-通过 PTC 先调用 `researchdata.research(route="alphaengine", operation="list_filters")` 查询文档分类对应的 `type_ids`，再调用 `researchdata.research(route="alphaengine", operation="search_library", query=..., start=base_minus_1d, end=end_plus_1d, params={"type_ids": [...], "sort": "relevance"})`，每家公司执行 **2 次检索**：
+### 1. AlphaEngine（卖方研报、卖方点评、会议纪要、本机构会议、新闻公告）
+通过 PTC 直接使用友好分类 `params.document_categories`（或显式调用 `researchdata.research(route="alphaengine", operation="list_filters", params={"filter_type": "document_types", "document_code": "summary"})` 查询细粒度 `type_ids`——注意无参 `list_filters()` 只返回友好 `categories`，不返回 `type_ids`），再调用 `researchdata.research(route="alphaengine", operation="search_library", ...)`，每家公司执行以下独立检索（输出中须明确注明**“首屏 / 限定检索”**，不得声称全量穷尽）：
 1. **研报与纪要类**：
-   - `params={"type_ids": <研报、点评、会议纪要对应的 type_ids>, "sort": "relevance"}`
+   - `params={"document_categories": ["sell_side_report", "sell_side_comment", "foreign_report", "meeting_minutes"], "sort": "relevance"}`（或对应 `type_ids`）
    - `start: base - 1d`，`end: end + 1d`，`query`: 公司主名（美股用英文名/ticker，中概用中文名）。
-2. **新闻与公告类**：
-   - `params={"type_ids": <新闻、公告对应的 type_ids>, "sort": "relevance"}`
+2. **本周本机构会议（`meeting_scope="institution"` 独立检索）**：
+   - 单独调用 `researchdata.research(route="alphaengine", operation="search_library", query=..., start=base_minus_1d, end=end_plus_1d, params={"meeting_scope": "institution", "sort": "relevance", "limit": 20})`（若无关键词浏览本周本机构全部最新会议，则不传 `query` 并用 `params={"meeting_scope": "institution", "sort": "newest", "limit": 20}`）；
+   - 输出时注明**“首屏 / 限定检索”**，并保留完整字符串 `doc_id`（含 `_inst_` 后缀）。
+3. **新闻与公告类**：
+   - `params={"document_categories": ["news", "announcement"], "sort": "relevance"}`（或对应 `type_ids`）
    - 参数同上。
-3. **跨语言补查与配额纪律**：
+4. **跨语言补查与配额纪律**：
    - 当某类相关结果少于 3 条时，换用另一种语言的公司名补查 1 次；
    - 挑出解释本周股价或基本面变化最关键的文档调 `get_document` 读取正文；
    - **配额保护**：若接口返回“无查看权限或额度已达上限”或 `E_DESKTOP_NOT_RUNNING`，**立即停止重试**，在输出文件及“口径与缺口”中如实写明**“AlphaEngine 额度用尽 / 未登录，未覆盖”**，**严禁写成“本周无更新”**。
