@@ -4,6 +4,7 @@ import { useScrollMemory } from '@/lib/scrollMemory';
 import { useUser } from '@/hooks/useUser';
 import { usePreferences } from '@/hooks/usePreferences';
 import { useTranslation } from 'react-i18next';
+import { BRAND_NAME } from '@/config/brand'; // DALTON-HOOK(brand-name)
 import { SwapCell } from '@/components/ui/crossfade';
 import { SkeletonBar } from '@/components/ui/skeleton';
 import { AccountPanel } from './panels/AccountPanel';
@@ -131,7 +132,7 @@ function Settings() {
           <div className="settings-column">
             <header className="settings-head">
               <h1 className="settings-head-title">{t(SECTIONS[section].labelKey)}</h1>
-              <p className="settings-head-def">{t(SECTIONS[section].descKey)}</p>
+              <p className="settings-head-def">{t(SECTIONS[section].descKey, { brand: BRAND_NAME })}</p> {/* DALTON-HOOK(brand-name) */}
             </header>
             {/* Only a cold load waits here: the app shell has usually read
                 both already. The section takes the placeholder rows' place in

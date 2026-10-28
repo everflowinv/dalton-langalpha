@@ -61,6 +61,19 @@ export const GROUPS: readonly { labelKey: string; sections: readonly Section[] }
   { labelKey: 'settings.group.labs', sections: ['experiments'] },
 ];
 
+// DALTON-HOOK(settings-section): shared visibility context and predicates from Dalton card modules
+import {
+  canShowDaltonCosSharingCard,
+  type DaltonSettingVisibilityContext,
+} from './panels/dalton/DaltonCosSharingCard';
+import { canShowDaltonInviteAdminCard } from './panels/dalton/DaltonInvitesCard';
+
+export {
+  canShowDaltonCosSharingCard,
+  canShowDaltonInviteAdminCard,
+  type DaltonSettingVisibilityContext,
+};
+
 /**
  * One setting: the section it lives in, the anchor its row carries, and the
  * name and line it is drawn with. The rows take their copy from here, so the
@@ -78,8 +91,9 @@ export interface SettingEntry {
   /** Names of rows drawn only some of the time beside this one, which a
    *  search finds here so it never opens on a row that is not there. */
   alsoKeys?: readonly string[];
-  // DALTON-HOOK(settings-section): bilingual search terms so Chinese and English queries always match
+  // DALTON-HOOK(settings-section): bilingual search terms and card-level visibility predicate
   keywords?: string;
+  visibleWhen?: (ctx?: DaltonSettingVisibilityContext | null) => boolean;
 }
 
 export const SETTINGS = {
@@ -129,12 +143,12 @@ export const SETTINGS = {
   daltonAssistFallbackModels: { section: 'model', anchor: 'dalton-assist-fallback-models', labelKey: 'settings.modelTuning.daltonAssistFallbackModels', descKey: 'settings.modelTuning.daltonAssistFallbackModelsDesc', advanced: true, keywords: '辅助任务备选 辅助备选模型 auxiliary task fallback models' },
   daltonReviewerModels: { section: 'model', anchor: 'dalton-reviewer-models', labelKey: 'settings.modelTuning.daltonReviewerModels', descKey: 'settings.modelTuning.daltonReviewerModelsDesc', advanced: true, keywords: '审稿 审稿模型候选 独立审稿模型 逻辑审稿 盲审 independent reviewer candidates' },
   daltonExtractModel: { section: 'model', anchor: 'dalton-extract-model', labelKey: 'settings.modelTuning.daltonExtractModel', descKey: 'settings.modelTuning.daltonExtractModelDesc', advanced: true, keywords: '对话归档抽卡模型 网页摘取模型 摘取 conversation archive extraction model' },
-  daltonCosSharing: { section: 'model', anchor: 'dalton-cos-sharing', labelKey: 'settings.dalton.cosSharingLabel', descKey: 'settings.dalton.cosSharingDesc', keywords: '研究总监 研究总监共享开关 允许同事的研究总监向我的工作区派活 chief of staff sharing colleague dispatch' },
-  daltonInvites: { section: 'model', anchor: 'dalton-invites', labelKey: 'settings.dalton.invitesLabel', descKey: 'settings.dalton.invitesDesc', keywords: '团队邀请 成员权限 邀请链接 team invites allowlist' },
-  daltonFeishuScopes: { section: 'model', anchor: 'dalton-feishu-scopes', labelKey: 'settings.dalton.feishuScopesLabel', descKey: 'settings.dalton.feishuScopesDesc', keywords: '飞书读取权限 飞书授权 文档 知识库 多维表格 feishu read scopes' },
+  daltonCosSharing: { section: 'model', anchor: 'dalton-cos-sharing', labelKey: 'settings.dalton.cosSharingLabel', descKey: 'settings.dalton.cosSharingDesc', keywords: '研究总监 研究总监共享开关 允许同事的研究总监向我的工作区派活 chief of staff sharing colleague dispatch', visibleWhen: canShowDaltonCosSharingCard },
+  daltonInvites: { section: 'model', anchor: 'dalton-invites', labelKey: 'settings.dalton.invitesLabel', descKey: 'settings.dalton.invitesDesc', keywords: '团队邀请 成员权限 邀请链接 team invites allowlist', visibleWhen: canShowDaltonInviteAdminCard },
+  daltonFeishuScopes: { section: 'model', anchor: 'dalton-feishu-scopes', labelKey: 'settings.dalton.feishuScopesLabel', descKey: 'settings.dalton.feishuScopesDesc', keywords: '飞书读取权限 飞书授权 文档 知识库 多维表格 feishu read scopes', visibleWhen: canShowDaltonInviteAdminCard },
   daltonProviders: { section: 'model', anchor: 'dalton-providers', labelKey: 'settings.dalton.providersLabel', descKey: 'settings.dalton.providersDesc', keywords: '团队凭据 模型与数据源状态 团队共享凭据 team credentials provider status openclaw' },
   daltonBudget: { section: 'model', anchor: 'dalton-budget', labelKey: 'settings.dalton.budgetLabel', descKey: 'settings.dalton.budgetDesc', keywords: '预算 每日预算 团队模型限额 USD 额度 调额 daily budget spending limit' },
-  daltonNotifyTargets: { section: 'model', anchor: 'dalton-notify-targets', labelKey: 'settings.dalton.notifyTargetsLabel', descKey: 'settings.dalton.notifyTargetsDesc', advanced: true, keywords: '通知目标 飞书 Discord 主动推送 notify targets feishu discord' },
+  daltonNotifyTargets: { section: 'model', anchor: 'dalton-notify-targets', labelKey: 'settings.dalton.notifyTargetsLabel', descKey: 'settings.dalton.notifyTargetsDesc', keywords: '通知目标 飞书 Discord 主动推送 消息提醒 notify targets feishu discord proactive alerts' },
   daltonSystemJobs: { section: 'model', anchor: 'dalton-system-jobs', labelKey: 'settings.dalton.systemJobsLabel', descKey: 'settings.dalton.systemJobsDesc', advanced: true, keywords: '自动任务 知识库同步 研报增量扫描 公司近况巡检 system jobs cron' },
   chatApps: { section: 'integrations', anchor: 'chat-apps', labelKey: 'settings.integrations.chatApps', descKey: 'settings.integrations.chatAppsDesc' },
   connectedApps: { section: 'integrations', anchor: 'connected-apps', labelKey: 'settings.integrations.connectedApps', descKey: 'settings.integrations.connectedAppsDesc' },
@@ -151,8 +165,16 @@ export function settingAt(hash: string): SettingEntry | undefined {
 }
 
 /** Every setting the search can find on this surface. */
-export function searchableSettings(desktop: boolean): SettingEntry[] {
-  return ENTRIES.filter((entry) => (desktop || !entry.desktopOnly) && sectionShown(entry.section));
+export function searchableSettings(
+  desktop: boolean,
+  ctx?: DaltonSettingVisibilityContext | null,
+): SettingEntry[] {
+  return ENTRIES.filter(
+    (entry) =>
+      (desktop || !entry.desktopOnly) &&
+      sectionShown(entry.section) &&
+      (!entry.visibleWhen || entry.visibleWhen(ctx)),
+  );
 }
 
 // DALTON-HOOK(settings-section): map legacy tab query params and hashes to their new sections
