@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import logging
 import os
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
@@ -1069,6 +1070,11 @@ def test_cli_apply_refusal_prints_pause_hint_and_exits_2(
     monkeypatch.setattr(rx, "apply_run", apply_spy)
     monkeypatch.setattr(rx, "RUNS_ROOT", tmp_path)
 
+    # rx.main() runs the CLI's logging setup, which force-resets root; pin the
+    # previous config for teardown so later tests' caplogs stay level-clean.
+    root = logging.getLogger()
+    monkeypatch.setattr(root, "level", root.level)
+    monkeypatch.setattr(root, "handlers", list(root.handlers))
     code = rx.main(["apply", "--run-id", "rx_x", "--yes"])
     assert code == rx.EXIT_CODE_LOCK_HELD
     err = capsys.readouterr().err

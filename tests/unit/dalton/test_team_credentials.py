@@ -1590,3 +1590,65 @@ async def test_antigravity_save_without_cache_refuses(monkeypatch: pytest.Monkey
         )
     assert "cannot be verified" in str(refused.value)
     fake_upsert.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_antigravity_stale_done_marker_cannot_complete_newer_login(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The completion marker rides the save's connection-lock section: an old
+    callback that saved its tokens cannot mark completion AFTER a disconnect
+    and a newer login landed — the newer login's poll stays pending instead of
+    being reported complete."""
+    _enable_team_sharing(monkeypatch)
+    store = _FakeRedisStore()
+    cache = _fake_cache_with_store(store)
+    monkeypatch.setattr(
+        "src.utils.cache.redis_cache.get_cache_client",
+        create_autospec(lambda: cache, return_value=cache),
+    )
+    get_db_conn, _, executed = _make_autospec_db()
+    monkeypatch.setattr(oauth_tokens_db, "get_db_connection", get_db_conn)
+
+    flow1 = json.dumps({"verifier": "v1", "state": "s1", "port": 51121, "redirect_uri": "http://localhost:51121/callback"})
+    store.store[f"oauth:antigravity:{HOLDER_ID}"] = flow1
+
+    # Hold the save mid-critical-section (the token write), Future-gated.
+    upsert_release: asyncio.Future[None] = asyncio.get_event_loop().create_future()
+
+    async def _held_upsert(**kwargs):
+        await upsert_release
+
+    fake_upsert = create_autospec(agy_oauth_mod.upsert_oauth_tokens, side_effect=_held_upsert)
+    monkeypatch.setattr(agy_oauth_mod, "upsert_oauth_tokens", fake_upsert)
+
+    save_task = asyncio.ensure_future(
+        agy_oauth_mod._finalize_token_save(
+            MEMBER_ID,
+            {"access_token": "old-agy-tok", "refresh_token": "old-ref", "id_token": "", "expires_in": 3600},
+            expected_flow_raw=flow1,
+        )
+    )
+    await asyncio.sleep(0)  # the save holds inside its critical section
+
+    # "Saved tokens and released the lock": the save finishes here.
+    upsert_release.set_result(None)
+    await save_task
+    fake_upsert.assert_awaited_once()
+    # The marker landed inside the same section — before anything later ran.
+    assert store.store[f"oauth:antigravity:done:{HOLDER_ID}"] == "1"
+
+    # Disconnect + a newer login land after the save.
+    await oauth_native_app.antigravity_disconnect(user_id=SECOND_PM_ID)
+    flow2 = json.dumps({"verifier": "v2", "state": "s2", "port": 51122, "redirect_uri": "http://localhost:51122/callback"})
+    store.store[f"oauth:antigravity:{HOLDER_ID}"] = flow2
+
+    # The old callback has nothing left to write (its marker moved inside the
+    # lock), so the newer login's poll reads no completion and stays pending.
+    resp = await oauth_native_app.antigravity_poll(user_id=MEMBER_ID)
+    assert resp == {"pending": True}
+    assert f"oauth:antigravity:done:{HOLDER_ID}" not in store.store
+    assert store.store[f"oauth:antigravity:{HOLDER_ID}"] == flow2
+    # And the connection row the old save wrote is gone with the disconnect.
+    delete_params = [p for sql, p in executed if "DELETE FROM user_oauth_tokens" in str(sql)]
+    assert any(p == (HOLDER_ID, "antigravity-oauth") for p in delete_params)

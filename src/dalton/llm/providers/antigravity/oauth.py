@@ -213,13 +213,16 @@ async def _finalize_token_save(user_id: str, tokens: dict, expected_flow_raw: st
 
     ``expected_flow_raw`` is the flow-key value the caller read before it
     spent the authorization. The claim (compare-and-delete on exactly that
-    value) runs inside the connection lock and the tokens are written over
-    that connection, so: a disconnect that landed while Google was answering
-    leaves the key gone and this save aborts; a newer login that replaced the
-    flow keeps its own key, and this old authorization cannot claim it.
-    With no cache there is no verifiable flow, so nothing is stored — an
-    unverifiable save is exactly the revive-on-disconnect race
+    value), the token write and the completion marker all land in ONE
+    ``connection_change`` critical section, so: a disconnect that landed while
+    Google was answering leaves the key gone and this save aborts; a newer
+    login that replaced the flow keeps its own key, and this old authorization
+    cannot claim it. The marker rides the same section because a disconnect
+    and a newer login take the same lock — a marker written after the lock
+    released could land on top of them and report the NEW login complete
     (DALTON-HOOK(team-credentials)).
+    With no cache there is no verifiable flow, so nothing is stored — an
+    unverifiable save is exactly the revive-on-disconnect race.
     """
     from src.server.database.oauth_tokens import connection_change
     from src.utils.cache.redis_cache import get_cache_client
@@ -233,14 +236,10 @@ async def _finalize_token_save(user_id: str, tokens: dict, expected_flow_raw: st
             "store; start again with the cache available."
         )
 
-    async def _save(conn) -> bool:
+    async with connection_change(user_id, ANTIGRAVITY_PROVIDER) as conn:
         # Claim on the value THIS login read: gone (disconnected) or replaced
         # (a newer login) both refuse, and the newer flow's key survives.
-        return await cache.claim(flow_key, expected_flow_raw)
-
-    async with connection_change(user_id, ANTIGRAVITY_PROVIDER) as conn:
-        claimed = await _save(conn)
-        if not claimed:
+        if not await cache.claim(flow_key, expected_flow_raw):
             raise ValueError("The Antigravity sign-in was cancelled or replaced; start again.")
         await upsert_oauth_tokens(
             user_id=user_id,
@@ -254,7 +253,9 @@ async def _finalize_token_save(user_id: str, tokens: dict, expected_flow_raw: st
             + timedelta(seconds=tokens.get("expires_in", 3600)),
             conn=conn,
         )
-    await cache.client.set(done_key, "1", ex=600)
+        # Same critical section as the claim: no disconnect or newer login can
+        # slip between the save and this marker.
+        await cache.client.set(done_key, "1", ex=600)
     return claims
 
 
