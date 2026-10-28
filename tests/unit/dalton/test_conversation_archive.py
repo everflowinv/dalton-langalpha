@@ -29,6 +29,7 @@ import asyncio
 import threading
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timezone
+import logging
 import json
 import os
 from pathlib import Path
@@ -2345,6 +2346,27 @@ def test_journal_redaction_drops_nested_figure_values() -> None:
     assert "nested source text" not in str(redacted)
 
 
+
+def _pin_root_logging_for_teardown(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Restore root's logging config at teardown, before the CLI touches it.
+
+    The CLI's entry points run ``configure_archive_logging``, a process-entry
+    helper that force-resets root to INFO with its own handler. In-process,
+    that leaks to every later test (an INFO httpx line quoting a URL with a
+    secret then lands in unrelated caplogs). The monkeypatch snapshots pin
+    root's level and handlers for restoration once this test ends; the CLI
+    stays free to reconfigure while the test itself runs.
+    """
+    root = logging.getLogger()
+    monkeypatch.setattr(root, "level", root.level)
+    monkeypatch.setattr(root, "handlers", list(root.handlers))
+
+
+def _configure_archive_logging_for_test(monkeypatch: pytest.MonkeyPatch) -> None:
+    _pin_root_logging_for_teardown(monkeypatch)
+    archive_cli.configure_archive_logging()
+
+
 @pytest.mark.asyncio
 async def test_concurrent_extraction_flushes_in_original_segment_order(
     monkeypatch: pytest.MonkeyPatch,
@@ -2355,7 +2377,7 @@ async def test_concurrent_extraction_flushes_in_original_segment_order(
     segment order (`seg 0 -> seg 1 -> seg 2`), updating run progress counters and logging unbuffered
     per-segment INFO lines to stderr.
     """
-    archive_cli.configure_archive_logging()
+    _configure_archive_logging_for_test(monkeypatch)
 
     # Three events spaced > 30 minutes apart so `segment_events` produces 3 distinct segments (0, 1, 2)
     base_ms = int(datetime(2026, 10, 20, 10, 0, tzinfo=timezone.utc).timestamp() * 1000)
@@ -3554,6 +3576,7 @@ async def test_advisory_lock_contention_exits_code_2_and_marks_stale_running_aba
     assert lock_conn.close.await_count == 1
 
     # Also verify CLI `main()` catches `ArchiveAlreadyRunningError` and returns exit code 2
+    _pin_root_logging_for_teardown(monkeypatch)  # main() force-resets root logging
     mock_pool = create_autospec(AsyncConnectionPool, instance=True)
     mock_pool.open.return_value = None
     mock_pool.close.return_value = None
@@ -4489,6 +4512,7 @@ async def test_exit_code_contract_and_maxrss_memory_cleanup(
             },
         ),
     )
+    _pin_root_logging_for_teardown(monkeypatch)  # main() force-resets root logging
     rc_incomplete = await asyncio.to_thread(
         archive_cli.main,
         ["backfill", "--since", "2026-10-13", "--skip-host-export"],
@@ -5050,7 +5074,7 @@ async def test_committed_segment_raw_events_released_via_weakref_and_optional_tr
         create_autospec(db_conv.list_unrendered_dates, return_value=[]),
     )
 
-    archive_cli.configure_archive_logging()
+    _configure_archive_logging_for_test(monkeypatch)
     monkeypatch.setenv("DALTON_ARCHIVE_MEM_TRACE", "1")
     monkeypatch.setattr(archive_cli, "MEM_TRACE_SEGMENT_INTERVAL", 2)
 
@@ -9929,6 +9953,7 @@ def test_round3_cli_main_exits_bounded_without_releasing_zombie_task(
     exit_codes: list[int] = []
     mock_exit = create_autospec(os._exit, side_effect=lambda code: exit_codes.append(int(code)))
 
+    _pin_root_logging_for_teardown(monkeypatch)
     t0 = archive_cli.time.monotonic()
     ret_code = archive_cli.main(
         [
@@ -10483,6 +10508,7 @@ def test_round4_cli_main_sigint_executes_finally_and_exits_bounded(
         nonlocal finally_executed
         finally_executed = True
 
+    _pin_root_logging_for_teardown(monkeypatch)
     t0 = archive_cli.time.monotonic()
     ret_code = archive_cli.main(
         [

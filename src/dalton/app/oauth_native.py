@@ -317,7 +317,9 @@ async def antigravity_disconnect(user_id: CurrentUserId):
     async with connection_change(user_id, ANTIGRAVITY_PROVIDER) as conn:
         if getattr(cache, "enabled", False) and getattr(cache, "client", None):
             flow_key, done_key = _flow_keys(user_id)
-            await cache.client.delete(flow_key, done_key)
+            from src.dalton.llm.providers.antigravity.oauth import _current_flow_key
+
+            await cache.client.delete(flow_key, done_key, _current_flow_key(user_id))
         await delete_oauth_tokens(user_id, ANTIGRAVITY_PROVIDER, conn=conn)
     await connection_changed(user_id)
     logger.info(f"[oauth] Antigravity disconnected for user_id={user_id}")

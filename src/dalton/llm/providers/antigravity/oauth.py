@@ -208,18 +208,45 @@ def _flow_keys(user_id: str) -> tuple[str, str]:
     return f"oauth:antigravity:{holder}", f"oauth:antigravity:done:{holder}"
 
 
+def _current_flow_key(user_id: str) -> str:
+    """Key naming the login flow a poll is currently waiting on.
+
+    The completion marker carries its flow's id and only counts while it names
+    this current flow, so an older login finishing late can never report a
+    newer one done (whether or not a disconnect came in between)."""
+    from src.dalton.credentials import credential_user_id
+
+    return f"oauth:antigravity:current:{credential_user_id(user_id)}"
+
+
+# Set the completion marker only while ARGV[1] is still the current flow.
+_PUBLISH_DONE_LUA = """
+if redis.call('get', KEYS[1]) == ARGV[1] then
+  redis.call('set', KEYS[2], ARGV[1], 'EX', tonumber(ARGV[2]))
+  return 1
+end
+return 0
+"""
+
+
+def _flow_id(flow_raw: str) -> str:
+    return hashlib.sha256(flow_raw.encode("utf-8")).hexdigest()[:32]
+
+
 async def _finalize_token_save(user_id: str, tokens: dict, expected_flow_raw: str) -> dict:
     """Store a finished sign-in, only while THE SAME login is still pending.
 
     ``expected_flow_raw`` is the flow-key value the caller read before it
     spent the authorization. The claim (compare-and-delete on exactly that
-    value) runs inside the connection lock and the tokens are written over
-    that connection, so: a disconnect that landed while Google was answering
-    leaves the key gone and this save aborts; a newer login that replaced the
-    flow keeps its own key, and this old authorization cannot claim it.
-    With no cache there is no verifiable flow, so nothing is stored — an
-    unverifiable save is exactly the revive-on-disconnect race
-    (DALTON-HOOK(team-credentials)).
+    value) and the token write share one ``connection_change`` critical
+    section: a disconnect that landed while Google was answering leaves the key
+    gone and this save aborts; a newer login that replaced the flow keeps its
+    own key, and this old authorization cannot claim it. Once the save has
+    committed, the completion marker is published atomically and only while
+    this flow is still the current one (``start_login`` names it under the same
+    lock), so a late older login can neither report a newer one done nor
+    overwrite its marker. A cache that cannot verify the flow refuses the save:
+    an unverifiable save is exactly the revive-on-disconnect race.
     """
     from src.server.database.oauth_tokens import connection_change
     from src.utils.cache.redis_cache import get_cache_client
@@ -233,14 +260,10 @@ async def _finalize_token_save(user_id: str, tokens: dict, expected_flow_raw: st
             "store; start again with the cache available."
         )
 
-    async def _save(conn) -> bool:
+    async with connection_change(user_id, ANTIGRAVITY_PROVIDER) as conn:
         # Claim on the value THIS login read: gone (disconnected) or replaced
         # (a newer login) both refuse, and the newer flow's key survives.
-        return await cache.claim(flow_key, expected_flow_raw)
-
-    async with connection_change(user_id, ANTIGRAVITY_PROVIDER) as conn:
-        claimed = await _save(conn)
-        if not claimed:
+        if not await cache.claim(flow_key, expected_flow_raw):
             raise ValueError("The Antigravity sign-in was cancelled or replaced; start again.")
         await upsert_oauth_tokens(
             user_id=user_id,
@@ -254,7 +277,22 @@ async def _finalize_token_save(user_id: str, tokens: dict, expected_flow_raw: st
             + timedelta(seconds=tokens.get("expires_in", 3600)),
             conn=conn,
         )
-    await cache.client.set(done_key, "1", ex=600)
+    # Published only once the save has committed (an exception above leaves no
+    # marker), naming the flow it completes, and only while that flow is still
+    # the current one — atomically, so a late older login can neither report a
+    # newer one done nor overwrite the newer one's marker.
+    flow_id = _flow_id(expected_flow_raw)
+    try:
+        await cache.client.eval(
+            _PUBLISH_DONE_LUA, 2, _current_flow_key(user_id), done_key, flow_id, 600
+        )
+    except Exception as exc:
+        # The save stands; only the poll's shortcut is missing. The settings
+        # page reads the connection itself, so the user sees it connected on
+        # the next status refresh instead of a 500 here.
+        logger.warning(
+            "[antigravity] completion marker not published: %s", type(exc).__name__
+        )
     return claims
 
 
@@ -321,6 +359,9 @@ async def start_login(user_id: str) -> dict:
         async with connection_change(user_id, ANTIGRAVITY_PROVIDER):
             await cache.client.delete(done_key)
             await cache.client.set(flow_key, payload, ex=_CALLBACK_TIMEOUT_S)
+            await cache.client.set(
+                _current_flow_key(user_id), _flow_id(payload), ex=_CALLBACK_TIMEOUT_S + 600
+            )
 
     return {
         "authorize_url": build_authorize_url(redirect_uri, state, challenge),
@@ -511,7 +552,13 @@ async def check_login_complete(user_id: str) -> bool:
     cache = get_cache_client()
     if cache.enabled and cache.client:
         _flow_key, done_key = _flow_keys(user_id)
-        return bool(await cache.client.get(done_key))
+        done = await cache.client.get(done_key)
+        current = await cache.client.get(_current_flow_key(user_id))
+        # Only the marker of the flow this poll waits on counts.
+        if not done or not current or done != current:
+            return False
+        tokens = await get_oauth_tokens(user_id, ANTIGRAVITY_PROVIDER)
+        return bool(tokens and tokens.get("access_token"))
     # Redis unavailable: fall back to a DB lookup, comparing updated_at against initiated_at (R2-N5N6 #7).
     tokens = await get_oauth_tokens(user_id, ANTIGRAVITY_PROVIDER)
     if not tokens or not tokens.get("access_token"):
