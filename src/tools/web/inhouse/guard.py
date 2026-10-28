@@ -98,6 +98,13 @@ class GuardedAsyncTransport(httpx.AsyncHTTPTransport):
 
     def __init__(self, **kwargs) -> None:
         kwargs.setdefault("limits", httpx.Limits(max_keepalive_connections=0))
+        # DALTON-HOOK(fake-ip-allow): a fake-IP proxy mode is a TUN every
+        # egress already rides, not an HTTP proxy to route through — the
+        # rechecked real address is dialed directly. Through an HTTP proxy the
+        # request would hand the hostname back to the proxy to re-resolve,
+        # which the recheck cannot stand behind, so such a target is refused
+        # in ``handle_async_request`` rather than dialed.
+        self._proxied = kwargs.get("proxy") is not None
         super().__init__(**kwargs)
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
@@ -118,18 +125,28 @@ class GuardedAsyncTransport(httpx.AsyncHTTPTransport):
                 )
         # DALTON-HOOK(fake-ip-allow): a fake-IP answer hides the real target the
         # proxy would pick itself; check the host's real addresses with the
-        # strict test, failing closed when that lookup cannot be done.
+        # strict test, failing closed when that lookup cannot be done. A
+        # proxied transport never takes this path: the rechecked address must
+        # be the one dialed, and through a proxy it would not be.
+        if self._proxied and any(_is_fake_ip(ipaddress.ip_address(ip)) for ip in addresses):
+            raise BlockedAddressError(
+                f"Blocked {host!r}: its fake-IP answer is only fetched by dialing the "
+                "rechecked real address directly, never through an HTTP proxy, which "
+                "would re-resolve the host itself",
+                request=request,
+            )
         reason, real = await _fake_ip_recheck(host, addresses)
         if reason:
             raise BlockedAddressError(reason, request=request)
         # DALTON-HOOK(fake-ip-allow): the dial is pinned to the rechecked real
         # addresses, never to the fake-IP answer: whatever maps a fake-IP back
         # re-resolves the hostname, and that answer could name a private host
-        # the recheck never saw. Pinned the upstream way, the address the
-        # connection goes to — the dial with no proxy, the CONNECT authority
-        # through one — is one the strict test passed, while the Host header
-        # and the TLS name stay the hostname's, so the certificate is still
-        # checked against the name.
+        # the recheck never saw. The rechecked address is dialed directly — a
+        # fake-IP proxy mode is a TUN the traffic rides anyway — so what the
+        # connection goes to is one the strict test passed, while the Host
+        # header and the TLS name stay the hostname's: httpcore sends the
+        # ``sni_hostname`` extension as the TLS server name, which is also the
+        # name the certificate is verified against.
         dial = real if real is not None else addresses
         # Dialed by the addresses just checked, in order, the next one only
         # when a connection fails, as a dial by hostname would: handed the

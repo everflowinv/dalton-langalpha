@@ -1082,3 +1082,169 @@ class TestByteTotalRecordsTheRemoval:
         assert sent[1] is replayed[1]
         assert sent[2] is replayed[2]
         assert response == "ok"
+
+    @pytest.mark.asyncio
+    async def test_with_compaction_off_the_record_still_holds_the_second_round(self):
+        """``compaction.enabled=false`` runs no offload view, so nothing else
+        replays the record; the strip replays both ``_removed_attachment_ids``
+        and ``_unsent_thinking_ids`` itself. Across two calls off the raw
+        checkpoint, the second call renders the first call's placeholders and
+        stripped thinking — not the byte note the walk would leave over images
+        still in history — and records nothing new."""
+        seen: list = []
+
+        async def handler(request):
+            seen.append(request)
+            return "ok"
+
+        history = [
+            HumanMessage(content=self._images(3, "chart"), id="m1"),
+            self._bound_answer("a1"),
+            HumanMessage(content=self._images(3, "fresh"), id="m2"),
+        ]
+        strip = MultimodalStripMiddleware()
+        first = await strip.awrap_model_call(
+            _ModelCallRequest("claude-sonnet-5-5", history, state={}), handler
+        )
+        state = dict(first.command.update)
+        assert state["_removed_attachment_ids"] == {"m1"}
+        assert state["_unsent_thinking_ids"] == {"a1"}
+
+        second = await strip.awrap_model_call(
+            _ModelCallRequest("claude-sonnet-5-5", history, state=state), handler
+        )
+
+        round_one, round_two = seen[0].messages, seen[1].messages
+        recorded_bytes = remove_attachments(history, {"m1"})[0].content
+        assert round_two[0].content == recorded_bytes
+        assert round_two[0].content == round_one[0].content
+        assert not any(b.get("type") == "image_url" for b in round_two[0].content)
+        assert not any(
+            "left out of this request" in b.get("text", "") for b in round_two[0].content
+        )
+        assert round_two[1].content == [{"type": "text", "text": "Here is what the images show."}]
+        assert round_two[1].content == round_one[1].content
+        assert round_two[2] is history[2]
+        assert second == "ok"
+
+    @pytest.mark.asyncio
+    async def test_same_step_writes_from_compaction_and_the_strip_union_without_refusal(self):
+        """DALTON-HOOK(attachment-native-cap): compaction's ``Fitted.update``
+        and the strip's image byte total can each return a ``Command`` writing
+        ``_removed_attachment_ids`` in the same model call; the key uses the
+        same ``_union`` reducer as ``_unsent_thinking_ids`` so the two writes
+        merge into their union instead of raising ``InvalidUpdateError``."""
+        from typing import get_type_hints
+
+        from langchain.agents.middleware.types import ModelResponse
+        from langgraph.graph import END, START, StateGraph
+        from langgraph.types import Command
+
+        from ptc_agent.agent.middleware.compaction.fitting import Fitted
+        from ptc_agent.agent.middleware.compaction.types import CompactionState
+        from ptc_agent.agent.middleware.file_operations.multimodal_strip import ImageSideState
+        from ptc_agent.agent.middleware.thinking_binding import UnsentThinkingState, _union
+
+        for schema in (CompactionState, ImageSideState):
+            hint = get_type_hints(schema, include_extras=True)["_removed_attachment_ids"]
+            callables = [m for m in getattr(hint, "__metadata__", ()) if callable(m)]
+            assert callables[-1] is _union
+        thinking_hint = get_type_hints(UnsentThinkingState, include_extras=True)[
+            "_unsent_thinking_ids"
+        ]
+        assert [m for m in getattr(thinking_hint, "__metadata__", ()) if callable(m)][-1] is _union
+
+        history = [
+            HumanMessage(content=self._images(3, "chart"), id="m1"),
+            self._bound_answer("a1"),
+            HumanMessage(content=self._images(3, "fresh"), id="m2"),
+        ]
+
+        async def handler(_request):
+            return ModelResponse(result=[AIMessage("ok", id="a2")])
+
+        strip_resp = await MultimodalStripMiddleware().awrap_model_call(
+            _ModelCallRequest("claude-sonnet-5-5", history, state={"_removed_attachment_ids": {"held"}}),
+            handler,
+        )
+        fitted = Fitted(response=strip_resp.model_response, removed={"fit-pdf"}, unsent=set(), spared=0)
+        fit_cmd = Command(update=fitted.update({"_removed_attachment_ids": {"held"}}))
+
+        graph = StateGraph(CompactionState)
+        graph.add_node("model", lambda _state: [strip_resp.command, fit_cmd])
+        graph.add_edge(START, "model")
+        graph.add_edge("model", END)
+        app = graph.compile()
+
+        out = await app.ainvoke({"messages": [], "_removed_attachment_ids": {"held"}})
+        assert out["_removed_attachment_ids"] == {"held", "m1", "fit-pdf"}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("strip_first", [True, False])
+    async def test_compaction_cleanup_shrinks_the_set_under_the_union_reducer(self, strip_first):
+        """DALTON-HOOK(attachment-native-cap): when ``Compaction.update`` (with
+        or without ``Fitted.update``) or ``window.trim`` shrinks
+        ``_removed_attachment_ids`` to the kept messages, the union reducer
+        drops the retired ids as upstream requires, while still unioning any
+        same-step addition from the strip in either command order."""
+        from langchain.agents.middleware.types import ModelResponse
+        from langgraph.graph import END, START, StateGraph
+        from langgraph.types import Command
+
+        from ptc_agent.agent.middleware.compaction.compact import Compaction
+        from ptc_agent.agent.middleware.compaction.fitting import Fitted
+        from ptc_agent.agent.middleware.compaction.summarize import Summary
+        from ptc_agent.agent.middleware.compaction.types import CompactionState
+        from ptc_agent.agent.middleware.compaction.utils import build_summary_message
+
+        summarized = [
+            HumanMessage("old turn", id="old-removed"),
+            AIMessage("old reply", id="old-a"),
+        ]
+        kept = [
+            HumanMessage("kept pdf", id="kept-old"),
+            HumanMessage(content=self._images(3, "chart"), id="m1"),
+            self._bound_answer("a1"),
+            HumanMessage(content=self._images(3, "fresh"), id="m2"),
+        ]
+        summary_msg = build_summary_message("condensed", None)
+        compaction = Compaction(
+            event={"summary_message": summary_msg, "cutoff_index": 2, "anchor_message_id": "kept-old"},
+            summary=Summary("condensed", "model", summarized),
+            original_count=len(summarized) + len(kept),
+            preserved=kept,
+        )
+        prior_state = {"_removed_attachment_ids": {"old-removed", "kept-old"}}
+
+        # Alone, Compaction.update drops the summarized id through the graph reducer.
+        compact_only = compaction.update(prior_state)
+        assert compact_only["_removed_attachment_ids"] == {"kept-old"}
+        solo_graph = StateGraph(CompactionState)
+        solo_graph.add_node("compact", lambda _s: Command(update=compact_only))
+        solo_graph.add_edge(START, "compact")
+        solo_graph.add_edge("compact", END)
+        solo_out = await solo_graph.compile().ainvoke({"messages": [], **prior_state})
+        assert solo_out["_removed_attachment_ids"] == {"kept-old"}
+
+        # In the same step as the strip (and with Fitted.update also adding an id),
+        # the summarized id stays dropped while kept + fit + strip ids union.
+        async def handler(_request):
+            return ModelResponse(result=[AIMessage("ok", id="a2")])
+
+        strip_resp = await MultimodalStripMiddleware().awrap_model_call(
+            _ModelCallRequest("claude-sonnet-5-5", kept[1:], state=prior_state),
+            handler,
+        )
+        fitted = Fitted(
+            response=strip_resp.model_response, removed={"fit-new"}, unsent=set(), spared=0
+        )
+        compact_cmd = Command(update={**compact_only, **fitted.update(compact_only)})
+        cmds = [strip_resp.command, compact_cmd] if strip_first else [compact_cmd, strip_resp.command]
+
+        graph = StateGraph(CompactionState)
+        graph.add_node("model", lambda _state: cmds)
+        graph.add_edge(START, "model")
+        graph.add_edge("model", END)
+        out = await graph.compile().ainvoke({"messages": [], **prior_state})
+        assert out["_removed_attachment_ids"] == {"kept-old", "fit-new", "m1"}
+        assert "old-removed" not in out["_removed_attachment_ids"]

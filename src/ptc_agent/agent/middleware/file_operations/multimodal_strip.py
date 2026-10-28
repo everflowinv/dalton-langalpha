@@ -15,7 +15,7 @@ but still inherits history full of blocks it may not be able to read.
 from collections.abc import Callable, Collection
 from typing import Annotated, Any, Literal
 
-from langchain.agents.middleware import AgentMiddleware, AgentState
+from langchain.agents.middleware import AgentMiddleware
 from langchain.agents.middleware.types import ExtendedModelResponse, PrivateStateAttr
 from langchain_core.messages import AIMessage, ToolMessage
 from langgraph.types import Command
@@ -26,6 +26,8 @@ from ptc_agent.agent.middleware._message_utils import order_tool_results_first
 from ptc_agent.agent.middleware.file_operations.image_fit import fit_images, unsaved_upload_name
 from ptc_agent.agent.middleware.thinking_binding import (
     UNSENT_THINKING_KEY,
+    UnsentThinkingState,
+    _union,
     checked_thinking_end,
     thinking_after,
     unsent_thinking,
@@ -326,8 +328,12 @@ IMAGE_SIDE_KEY = "image_side_rule"
 ImageSideRule = Literal["fixed", "count"]
 
 
-class ImageSideState(AgentState):
+class ImageSideState(UnsentThinkingState):
     image_side_rule: NotRequired[Annotated[ImageSideRule, PrivateStateAttr]]
+    # DALTON-HOOK(attachment-native-cap): declared on the strip's own state
+    # schema too so a graph built with ``compaction.enabled=false`` (no
+    # ``CompactionMiddleware``) still checkpoints and unions the removal record.
+    _removed_attachment_ids: Annotated[NotRequired[set[str]], PrivateStateAttr, _union]
 
 
 def _image_side_rule(request: Any, route: str) -> tuple[ImageSideRule, ImageSideRule | None]:
@@ -467,6 +473,26 @@ class MultimodalStripMiddleware(AgentMiddleware):
             def fit(count: int) -> int | None:
                 return side(route, count)
 
+            # ``pdf_pages`` is imported here: ``compaction`` imports this module
+            # (offloading takes remove_attachments from it), so a module-level
+            # import would cycle.
+            from ptc_agent.agent.middleware.compaction.utils import pdf_pages
+
+            state = getattr(request, "state", None) or {}
+            already = set(state.get("_removed_attachment_ids") or ())
+            already_unsent = unsent_thinking(state)
+            # DALTON-HOOK(attachment-native-cap): the recorded removal and its
+            # unsent thinking are replayed here whatever else applies them: the
+            # offload view runs only while compaction is on, and with it off
+            # the record must still hold every later call's bytes — an image a
+            # recorded message still carried would otherwise ride the byte note
+            # the walk leaves, behind thinking whose prefix just moved.
+            # Idempotent where the view already applied them: a placeholder is
+            # not an attachment block and a stripped answer has no reasoning.
+            if already or already_unsent:
+                messages = without_thinking(
+                    remove_attachments(messages, already, pages=pdf_pages), already_unsent
+                )
             messages, unreadable, left_out = await fit_images(
                 messages, get_image_types(route), fit
             )
@@ -476,23 +502,15 @@ class MultimodalStripMiddleware(AgentMiddleware):
             # per-request rewrite: the message goes into
             # ``_removed_attachment_ids`` and every answer after it into
             # ``_unsent_thinking_ids``, and this request already sends the
-            # bytes every later one reads (the offload view re-applies the
-            # record before this middleware runs). Before, the first trimming
-            # request replaced the images with notes but kept sending the
-            # thinking behind them, whose prefix had just changed — the API
-            # dropped or refused exactly that thinking on every later call.
-            # The removal is applied to the pre-fit messages and they are
-            # fitted again, so this call's placeholders are the ones the
-            # record replays, not the byte note they would otherwise become.
-            state = getattr(request, "state", None) or {}
-            already = set(state.get("_removed_attachment_ids") or ())
+            # bytes every later one reads. Before, the first trimming request
+            # replaced the images with notes but kept sending the thinking
+            # behind them, whose prefix had just changed — the API dropped or
+            # refused exactly that thinking on every later call. The removal
+            # is applied to the pre-fit messages and they are fitted again, so
+            # this call's placeholders are the ones the record replays, not
+            # the byte note they would otherwise become.
             recorded = already.copy()
             unsent_all: set[str] = set()
-            # ``pdf_pages`` is imported here: ``compaction`` imports this module
-            # (offloading takes remove_attachments from it), so a module-level
-            # import would cycle.
-            from ptc_agent.agent.middleware.compaction.utils import pdf_pages
-
             # The refit finds nothing new to leave out — removal only frees
             # budget — so the second pass exits at once; the bound keeps a
             # surprise from looping.
@@ -503,7 +521,8 @@ class MultimodalStripMiddleware(AgentMiddleware):
                 unsent_all |= thinking_after(ordered, newly)
                 recorded |= newly
                 messages = without_thinking(
-                    remove_attachments(ordered, recorded, pages=pdf_pages), unsent_all
+                    remove_attachments(ordered, recorded, pages=pdf_pages),
+                    already_unsent | unsent_all,
                 )
                 messages, unreadable, left_out = await fit_images(
                     messages, get_image_types(route), fit
@@ -511,7 +530,7 @@ class MultimodalStripMiddleware(AgentMiddleware):
             if recorded != already:
                 updates["_removed_attachment_ids"] = recorded
             if unsent_all:
-                updates[UNSENT_THINKING_KEY] = unsent_thinking(state) | unsent_all
+                updates[UNSENT_THINKING_KEY] = already_unsent | unsent_all
         # Decided on the call where the target is known: a tool-time note judged
         # the configured model and froze that verdict into the transcript, which
         # a subagent on its own model then inherited wrongly. The system prompt
