@@ -14,11 +14,12 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/aria-select';
+import { INTEGRATIONS_URL } from '@/config/supportLinks';
 import { FAIL_FAST_OFFLINE } from '@/lib/network';
 import { queryKeys } from '@/lib/queryKeys';
 import { cn } from '@/lib/utils';
 import { Favicon } from '@/pages/ChatAgent/components/Favicon';
-import { messagingAppDomain, messagingAppName, platformOf } from '@/pages/ChatAgent/components/messaging/messageDelivery';
+import { MESSAGING_APPS, messagingAppDomain, messagingAppName, platformOf } from '@/pages/ChatAgent/components/messaging/messageDelivery';
 import type { DeliveryApp, DeliveryChat, DeliveryDefault, DeliveryOptions } from '@/types/automation';
 import { setDeliveryDefault } from '../utils/api';
 import {
@@ -29,9 +30,6 @@ import {
   mergeDeliverySelection,
   namesChat,
 } from '../utils/delivery';
-
-/** The apps in the order the reader knows them; any other after, by name. */
-const APP_ORDER = ['slack', 'discord', 'telegram', 'imessage', 'feishu'];
 
 const VIA_KEY: Record<DeliveryDefault['via'], string> = {
   workspace: 'automation.deliveryViaWorkspace',
@@ -44,10 +42,11 @@ const HEADING = 'pb-1 font-mono text-[11px] font-normal text-(--color-text-terti
 const MENU_ITEM =
   'relative flex w-full cursor-default select-none items-center rounded-sm px-2 py-1.5 text-sm outline-hidden data-focused:bg-accent/15 data-hovered:bg-accent/15 data-disabled:opacity-50';
 
+/** The apps in the order the reader knows them; any other after, by name. */
 function orderedApps(apps: Record<string, DeliveryApp>): [string, DeliveryApp][] {
   const rank = (app: string) => {
-    const i = APP_ORDER.indexOf(app);
-    return i === -1 ? APP_ORDER.length : i;
+    const i = MESSAGING_APPS.indexOf(app);
+    return i === -1 ? MESSAGING_APPS.length : i;
   };
   return Object.entries(apps).sort(([a], [b]) => rank(a) - rank(b) || a.localeCompare(b));
 }
@@ -246,7 +245,23 @@ export default function DeliveryPicker({
       )}
 
       {apps.length === 0 ? (
-        <p className="automation-form-readout mt-0">{t('automation.deliveryNoApps')}</p>
+        <p className="automation-form-readout mt-0">
+          {t('automation.deliveryNoApps')}
+          {/* A new tab or window, so the form being filled in stays put. */}
+          {INTEGRATIONS_URL && (
+            <>
+              {' · '}
+              <a
+                href={INTEGRATIONS_URL}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="underline underline-offset-2 hover:text-(--color-text-primary)"
+              >
+                {t('automation.deliveryConnectApp')}
+              </a>
+            </>
+          )}
+        </p>
       ) : (
         <Select
           selectionMode="multiple"

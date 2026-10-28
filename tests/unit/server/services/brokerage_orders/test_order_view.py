@@ -73,6 +73,21 @@ def test_an_option_names_its_underlying_expiry_and_strike():
     assert summary.startswith("buy 2 NVDA 2026-11-20 210C")
 
 
+def test_a_combo_on_one_symbol_names_it_before_its_strategy():
+    legs = [
+        {"symbol": "AAPL", "leg": "take_profit", "limit_price": "260"},
+        {"symbol": "AAPL", "leg": "stop_loss", "stop_price": "200"},
+    ]
+    order = equity_limit(
+        instrument={"kind": "combo", "legs": legs, "strategy": "oco"},
+        order_type=None,
+        limit_price=None,
+        side="sell",
+        qty=10,
+    )
+    assert order_view(attempt(order)).summary.startswith("sell 10 AAPL oco")
+
+
 @pytest.mark.parametrize("bad", [None, {}])
 def test_no_attempt_gives_none(bad):
     assert order_view(bad) is None

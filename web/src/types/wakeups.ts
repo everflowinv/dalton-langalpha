@@ -1,7 +1,17 @@
 export type WakeupKind = 'at' | 'cron' | 'price' | 'order';
 export type WakeupState =
   | 'armed' | 'held' | 'held_usage' | 'fired' | 'finished' | 'lapsed' | 'expired' | 'cancelled';
-export type OrderOutcome = 'filled' | 'partial' | 'partial_cancelled' | 'cancelled' | 'rejected' | 'failed';
+export type OrderOutcome =
+  | 'filled'
+  | 'partial'
+  | 'partial_cancelled'
+  | 'cancelled'
+  | 'rejected'
+  | 'failed'
+  | 'partial_expired'
+  | 'expired'
+  | 'confirmed'
+  | 'handed_off';
 
 export interface WakeupPrice {
   symbol: string;

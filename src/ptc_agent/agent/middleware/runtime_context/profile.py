@@ -15,7 +15,7 @@ from typing import Any
 from ptc_agent.agent.middleware.runtime_context.changes import sha256_text
 from ptc_agent.agent.middleware.runtime_context.state import as_dict
 from ptc_agent.agent.middleware.runtime_context.templates import render_template
-from src.server.models.profile_vocabulary import prompt_preferences
+from src.server.models.profile_vocabulary import prompt_preferences, upgraded_agent_preference
 
 _PROFILE_LABELS = {
     "name": "Name",
@@ -163,7 +163,8 @@ class ProfileSnapshot:
                 rendered[_PROFILE_LABELS[key]] = str(profile[key])
         if self.preferred_market:
             rendered["Preferred market"] = self.preferred_market
-        for key, value in sorted(as_dict(profile.get("agent_preference")).items()):
+        agent_preference = upgraded_agent_preference(as_dict(profile.get("agent_preference")))
+        for key, value in sorted(agent_preference.items()):
             # Every key, the ones that select guidance among them: a move in
             # one moves the block. A key holding nothing has no line there,
             # so it is no field here either.

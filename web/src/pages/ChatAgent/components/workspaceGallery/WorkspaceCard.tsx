@@ -85,9 +85,12 @@ const CARD_BODY = 'relative flex h-full w-full flex-col gap-1.5 overflow-hidden 
 const CARD_SURFACE = {
   background: 'var(--color-bg-card-gradient, linear-gradient(to bottom, var(--color-border-muted), var(--color-border-muted)))',
   border: '1px solid var(--lift-edge, var(--color-bg-card-border, var(--color-border-muted)))',
-  backdropFilter: 'blur(8px)',
-  WebkitBackdropFilter: 'blur(8px)',
 } as const;
+// Only the lifted copy blurs what is behind it: it passes over other cards,
+// seen through its translucent fill. A resting card has the flat page behind
+// it, and a backdrop filter is a compositor surface per card, which Electron
+// on macOS drew stale over a dialog open above the gallery.
+const LIFTED_SURFACE = { ...CARD_SURFACE, backdropFilter: 'blur(8px)', WebkitBackdropFilter: 'blur(8px)' } as const;
 
 /**
  * A workspace in the gallery grid: its name and when it was last used, its
@@ -183,7 +186,7 @@ export function WorkspaceCard({
           style={placeholder ? {
             background: 'transparent',
             border: '1.5px dashed var(--color-border-default)',
-          } : CARD_SURFACE}
+          } : lifted ? LIFTED_SURFACE : CARD_SURFACE}
         >
           {/* Where the menu always shows (a touch screen), the row leaves it its
               corner and the time sits clear of it. */}

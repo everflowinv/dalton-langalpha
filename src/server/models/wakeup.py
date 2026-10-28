@@ -37,7 +37,18 @@ class WakeupOrderOut(BaseModel):
     summary: str
     # How the order stood when the wakeup fired; None while it still watches.
     outcome: Optional[
-        Literal["filled", "partial", "partial_cancelled", "cancelled", "rejected", "failed"]
+        Literal[
+            "filled",
+            "partial",
+            "partial_cancelled",
+            "cancelled",
+            "rejected",
+            "failed",
+            "partial_expired",
+            "expired",
+            "confirmed",
+            "handed_off",
+        ]
     ] = None
     filled_qty: Optional[float] = None
     qty: Optional[float] = None

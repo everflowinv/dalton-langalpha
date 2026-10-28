@@ -8,7 +8,7 @@
  * writers (this pane, the agent editing the file) never overwrite each other.
  */
 import { api, ApiError } from '@/api/client';
-import { apiErrorCoded, apiErrorObject, apiErrorStatus } from './errors';
+import { apiErrorCoded, apiErrorObject, apiErrorStatus } from '@/api/errors';
 
 export type SubagentTool = 'web' | 'market_data' | 'code' | 'shell';
 

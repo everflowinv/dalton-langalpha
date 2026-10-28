@@ -15,8 +15,10 @@
   color: var(--color-text-primary);
 }
 
+/* The app's page ground, as the windows drawn on it have: the canvas is
+   kept for the ground under filled cards (orders). */
 [data-theme='light'] .intro-visual {
-  background: var(--color-bg-canvas);
+  background: var(--color-bg-page);
 }
 
 /* Radix's built-in close button sits over the visual panel — follow the

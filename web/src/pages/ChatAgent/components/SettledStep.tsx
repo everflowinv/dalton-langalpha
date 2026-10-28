@@ -2,6 +2,7 @@ import React, { useId, useState } from 'react';
 import { Check, Circle, X } from 'lucide-react';
 import { Disclosure } from '@/components/ui/Disclosure';
 import { FoldChevron } from './decisionCardMotion';
+import { announceAnchoredToggle } from '../utils/anchoredToggle';
 
 /** `none` is a question nobody answered, which only an older thread's plan
  *  can be now. */
@@ -53,7 +54,7 @@ export function SettledStep({
     <div data-testid={testId} {...(order ? { 'data-order': 'true' } : {})}>
       <button
         type="button"
-        onClick={() => setCollapsed((v) => !v)}
+        onClick={(e) => { announceAnchoredToggle(e.currentTarget); setCollapsed((v) => !v); }}
         aria-expanded={!collapsed}
         aria-controls={bodyId}
         className="flex items-center gap-2 py-1 cursor-pointer w-full text-left"

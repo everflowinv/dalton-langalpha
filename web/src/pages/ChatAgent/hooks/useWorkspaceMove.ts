@@ -20,7 +20,7 @@ import { createValueStore } from '@/lib/valueStore';
 import type { WorkspaceMove, WorkspaceMovePhase } from '@/types/api';
 
 import { cancelWorkspaceMove, getWorkspaceMove, moveWorkspace } from '../utils/api';
-import { retryUnlessClientError } from '../utils/api/errors';
+import { retryUnlessClientError } from '@/api/errors';
 import { invalidateMachineStorage } from './useComputers';
 import { invalidateWorkspaceMembership } from './workspaceRowActions';
 

@@ -27,6 +27,7 @@ import { Check, Plus, X } from 'lucide-react';
 import type { IChartApi, ISeriesApi, Time } from 'lightweight-charts';
 
 import { chartSelectionStore, isConfirmedFor, useChartSelections, type ChartSelection } from '../stores/chartSelectionStore';
+import { isImeComposing } from '@/lib/ime';
 import { toUnixSeconds } from '../utils/annotationGeometry';
 import { pricePaneElement, pricePaneHeight } from '../utils/paneBounds';
 import './SelectionCommentOverlay.css';
@@ -293,6 +294,7 @@ export const SelectionCommentOverlay = React.memo(function SelectionCommentOverl
   const onKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLInputElement>) => {
       e.stopPropagation(); // keep chart-level Esc-to-disarm from firing
+      if (isImeComposing(e)) return;
       if (e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault();
         onPrimary();

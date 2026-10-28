@@ -43,7 +43,7 @@ class TestGetInputModalities:
         assert "image" in result
 
     def test_moonshot_supports_image_not_pdf(self, model_config):
-        result = model_config.get_input_modalities("kimi-k3")
+        result = model_config.get_input_modalities("kimi-k3.1-pro")
         assert "image" in result
         assert "pdf" not in result
 

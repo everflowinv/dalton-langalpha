@@ -16,8 +16,20 @@ above it, and it carries that figure marked as not measured: an upper bound
 the reader can show as one, rather than an estimate that could understate. A
 level with nothing measured above it has no bound and is left out.
 
+Where the source skips the levels that matter for a model, ``model_sources``
+names another that measured them, often the provider's own launch chart. That
+chart's dollars are not the source's, since two benchmarks put different tasks
+behind a dollar, so only its ratios between levels are taken: they scale a
+level the source did measure, and the figures stay comparable across models.
+
 Some models are measured once without naming a level. Those carry a single
 ``"any"`` figure in place of a per-level breakdown.
+
+A model the source never measured can still be bounded, when it runs the same
+tokens as one it did, at no more than a known multiple of that model's rates:
+a faster tier of the same model, say. The file's ``bounds`` names the measured
+model and the multiple, and every level carries that model's figure times the
+multiple, marked as not measured, for the same reason a gap is.
 """
 
 from __future__ import annotations
@@ -25,7 +37,7 @@ from __future__ import annotations
 import json
 import logging
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Optional, Sequence
@@ -48,6 +60,8 @@ class TaskCosts:
     #: ``{"model": <manifest key>, "effort": <level>}``, the figure that reads as 1.0.
     baseline: dict[str, str]
     relative: RelativeTable
+    #: Per unmeasured model, the measured model whose figures bound it and the multiple.
+    bounds: dict[str, tuple[str, float]] = field(default_factory=dict)
 
 
 def _usd(value: Any) -> Optional[float]:
@@ -106,7 +120,34 @@ def parse_task_costs(data: Any) -> Optional[TaskCosts]:
                 continue
             relative[effort] = usd / base
         table[model] = relative
-    return TaskCosts(baseline={"model": base_model, "effort": base_effort}, relative=table)
+    return TaskCosts(
+        baseline={"model": base_model, "effort": base_effort},
+        relative=table,
+        bounds=_bounds(data.get("bounds"), table),
+    )
+
+
+def _bounds(data: Any, table: RelativeTable) -> dict[str, tuple[str, float]]:
+    """Each usable entry of the file's ``bounds``, as (measured model, multiple).
+
+    A bound must point at a model with figures of its own, so a chain of bounds
+    or a misspelled name drops the one entry rather than showing a figure no
+    measurement stands behind.
+    """
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        logger.warning("Ignoring task cost bounds: not an object")
+        return {}
+    bounds = {}
+    for model, bound in data.items():
+        source = bound.get("model") if isinstance(bound, dict) else None
+        times = _usd(bound.get("times")) if isinstance(bound, dict) else None
+        if not isinstance(source, str) or not table.get(source) or times is None:
+            logger.warning(f"Ignoring task cost bound for {model!r}: {bound!r}")
+            continue
+        bounds[model] = (source, times)
+    return bounds
 
 
 def _read_json(path: Path) -> Any:
@@ -162,9 +203,20 @@ def task_cost(
     """
     if costs is None:
         costs = _shipped()
-    figures = costs.relative.get(model_name) if costs is not None else None
-    if not figures:
+    if costs is None:
         return None
+    figures = costs.relative.get(model_name)
+    if not figures:
+        if model_name not in costs.bounds:
+            return None
+        source, times = costs.bounds[model_name]
+        bounded = task_cost(source, efforts, costs)
+        if bounded is None:
+            return None
+        return {
+            effort: {"value": cost["value"] * times, "measured": False}
+            for effort, cost in bounded.items()
+        }
 
     # Walk down from the top so each gap can take the last figure seen above it.
     filled: dict[str, dict[str, Any]] = {}

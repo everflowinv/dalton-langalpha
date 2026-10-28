@@ -1,15 +1,19 @@
 import { useMemo } from 'react';
 import { useModels } from './useModels';
 import { usePreferences } from './usePreferences';
-import { getModelAccess, usePlatformModels, useModelAccessMap } from './usePlatformModels';
-import { buildVisibleModels, augmentPlatformWithLocal } from './useFilteredModels';
+import { getModelAccess, usePlatformModels } from './usePlatformModels';
+import { buildVisibleModels, augmentPlatformWithLocal, customPairKey } from './useFilteredModels';
 import type { BuildVisibleModelsResult, ModelMetadataEntry } from './useFilteredModels';
 import { useConfiguredProviders } from './useConfiguredProviders';
-import type { ProviderModelsData, CustomModelEntry, KeyCandidates } from '@/components/model/types';
-import type { PlatformModelsResponse, ModelAccess } from '@/types/platform';
+import { useMissingModels } from './useProviderModels';
+import { isPlatformMode } from '@/config/hostMode';
+import type { ProviderModelsData, CustomModelEntry } from '@/components/model/types';
+import type { ModelsResponse } from '@/api/model';
+import type { PlatformModelsResponse } from '@/types/platform';
 import { modelPrefs } from '@/lib/modelPreferences';
+import { ownKeyRule, payerResolver, type Payer } from '@/lib/modelPayer';
 
-interface SystemDefaults {
+export interface SystemDefaults {
   default_model?: string;
   background_model?: string;
   compaction_model?: string;
@@ -71,8 +75,13 @@ export interface UseAllModelsResult {
   metadata: Record<string, ModelMetadataEntry>;
   /** Pre-filter models (all models before access/tier gating). */
   rawModels: Record<string, ProviderModelsData>;
-  /** Model-name → access status map for badge display (undefined when no platform). */
-  modelAccessMap: Record<string, ModelAccess> | undefined;
+  /** Who pays for a turn on each listed model, the badge beside its name.
+   *  A model nothing serves, or a local server, has none. */
+  payers: Record<string, Payer>;
+  /** Listed models the user added that no key or sign-in of theirs serves
+   *  now (none saved, or their keys switched off). Unlike a local server's,
+   *  which also has no payer, a turn on one is refused until a key is back. */
+  keylessModels: Set<string>;
   /** The models the plan holds back, by provider: listed in a picker, but
    *  not pickable. */
   lockedModels: Record<string, ProviderModelsData>;
@@ -98,7 +107,7 @@ export interface UseAllModelsResult {
   /** Web-search provider catalog from the models API (name → tiers + depths). */
   searchProviders: SearchProviderCatalog | null;
   /** Raw models API response (for callers that need the full shape). */
-  rawApiResponse: Record<string, unknown> | null;
+  rawApiResponse: ModelsResponse | null;
   /** True while any upstream query is still loading. */
   isLoading: boolean;
 }
@@ -124,21 +133,15 @@ export function useAllModels(): UseAllModelsResult {
   }, [preferences]);
 
   /** Provider catalog for resolving SDK of custom models */
-  const providerCatalog = useMemo<Record<string, { sdk?: string; parent_provider?: string }>>(() => {
-    if (!modelsData) return {};
-    const raw = modelsData as Record<string, unknown>;
-    const catalog = (raw.provider_catalog ?? []) as Array<{ provider: string; sdk?: string }>;
+  const providerCatalog = useMemo<Record<string, { sdk?: string }>>(() => {
     const map: Record<string, { sdk?: string }> = {};
-    for (const entry of catalog) {
+    for (const entry of modelsData?.provider_catalog ?? []) {
       map[entry.provider] = entry;
     }
     // Also index custom providers from preferences
-    if (preferences) {
-      const customProviders = (modelPrefs(preferences).custom_providers ?? []) as Array<{ name: string; parent_provider?: string }>;
-      for (const cp of customProviders) {
-        if (!map[cp.name] && cp.parent_provider && map[cp.parent_provider]) {
-          map[cp.name] = { sdk: map[cp.parent_provider].sdk };
-        }
+    for (const cp of modelPrefs(preferences).custom_providers ?? []) {
+      if (!map[cp.name] && cp.parent_provider && map[cp.parent_provider]) {
+        map[cp.name] = { sdk: map[cp.parent_provider].sdk };
       }
     }
     return map;
@@ -151,26 +154,18 @@ export function useAllModels(): UseAllModelsResult {
     [rawPlatform, configuredProviders, byokEnabled],
   );
 
-  /** System defaults from the models API response */
-  const systemDefaults = useMemo<SystemDefaults | null>(() => {
-    if (!modelsData) return null;
-    const raw = modelsData as Record<string, unknown>;
-    return (raw.system_defaults as SystemDefaults) ?? null;
-  }, [modelsData]);
+  const systemDefaults = modelsData?.system_defaults ?? null;
+  const compactionProfiles = modelsData?.compaction_profiles ?? null;
+  const searchProviders = modelsData?.search_providers ?? null;
 
-  /** Compaction profile catalog from the models API */
-  const compactionProfiles = useMemo<CompactionProfileCatalog | null>(() => {
-    if (!modelsData) return null;
-    const raw = modelsData as Record<string, unknown>;
-    return (raw.compaction_profiles as CompactionProfileCatalog) ?? null;
-  }, [modelsData]);
-
-  /** Web-search provider catalog from the models API */
-  const searchProviders = useMemo<SearchProviderCatalog | null>(() => {
-    if (!modelsData) return null;
-    const raw = modelsData as Record<string, unknown>;
-    return (raw.search_providers as SearchProviderCatalog) ?? null;
-  }, [modelsData]);
+  // Each connected credential's own list, read to hide the manifest models it
+  // cannot run. A key the server would not use (BYOK off on a hosted account)
+  // and a local or user-defined provider have no list here.
+  const listedProviders = useMemo(() => configuredProviders
+    .filter((p) => !p.is_custom && p.access_type !== 'local')
+    .filter((p) => (p.access_type === 'oauth' ? p.state === 'connected' : !isPlatformMode || byokEnabled))
+    .map((p) => p.provider), [configuredProviders, byokEnabled]);
+  const { missingByProvider, isLoading: listsLoading } = useMissingModels(listedProviders);
 
   /** Run the full pipeline: normalize → merge custom → filter */
   const visible = useMemo<BuildVisibleModelsResult>(() => {
@@ -183,19 +178,18 @@ export function useAllModels(): UseAllModelsResult {
         customPairs: new Set(),
       };
     }
-    const raw = modelsData as Record<string, unknown>;
-    const rawApiModels = (raw.models ?? raw) as Record<string, Record<string, unknown>>;
-    const rawMetadata = (raw.model_metadata ?? {}) as Record<string, ModelMetadataEntry>;
-
+    // Read as the network sent it: a response without the map must still
+    // render, not crash every view that lists models.
     return buildVisibleModels(
-      rawApiModels,
-      rawMetadata,
+      modelsData.models ?? {},
+      modelsData.model_metadata ?? {},
       customModels,
       providerCatalog,
       platform,
       configuredProviders,
+      missingByProvider,
     );
-  }, [modelsData, customModels, providerCatalog, platform, configuredProviders]);
+  }, [modelsData, customModels, providerCatalog, platform, configuredProviders, missingByProvider]);
 
   const catalogModelNames = useMemo(() => {
     const names = new Set<string>();
@@ -212,12 +206,31 @@ export function useAllModels(): UseAllModelsResult {
     return names;
   }, [visible.rawModels, prefsLoaded, preferences]);
 
-  const modelAccessMap = useModelAccessMap(
-    visible.models,
-    visible.metadata,
-    platform,
-    visible.customPairs,
-  );
+  const { payers, keylessModels } = useMemo(() => {
+    const payerOf = payerResolver({
+      platform,
+      configured: configuredProviders,
+      byokEnabled,
+      keyCandidates: modelsData?.key_candidates ?? {},
+    });
+    const locals = new Set(
+      configuredProviders.filter((p) => p.access_type === 'local').map((p) => p.provider),
+    );
+    const out: Record<string, Payer> = {};
+    const keyless = new Set<string>();
+    for (const [group, data] of Object.entries(visible.models)) {
+      for (const m of data.models ?? []) {
+        const meta = visible.metadata[m];
+        // A model the user added under a provider of theirs runs through that
+        // provider's key, whatever built-in it shares a name with.
+        const custom = visible.customPairs.has(customPairKey(group, m));
+        const payer = custom ? payerOf(meta, group, m) : payerOf(meta, meta?.provider ?? group);
+        if (payer) out[m] = payer;
+        else if (custom && !locals.has(group)) keyless.add(m);
+      }
+    }
+    return { payers: out, keylessModels: keyless };
+  }, [visible, platform, configuredProviders, byokEnabled, modelsData]);
 
   const lockedModels = useMemo(() => {
     const { rawModels, validModelNames, metadata } = visible;
@@ -239,36 +252,35 @@ export function useAllModels(): UseAllModelsResult {
   // the server leaves it: a lapsed connection is refused with its reconnect
   // prompt, not swapped for another. A custom model under a built-in's name
   // passes that filter as the user's own, but without a key for it the server
-  // judges it as the built-in, which is what runs in its place.
+  // judges it as the built-in, which is what runs in its place. Whether a key
+  // serves is the payer's rule, so no model is tagged "Your key" and refused.
   const offPlanModels = useMemo(() => {
     const out = new Set<string>();
     if (!platform || !modelsData) return out;
-    const raw = modelsData as Record<string, unknown>;
-    const candidates = (raw.key_candidates ?? {}) as Record<string, KeyCandidates>;
-    const keyed = new Set(platform.byok_providers);
-    // Saved with a base URL, a key goes where the user pointed it, so it
-    // serves whichever model it is found for.
-    const pointed = new Set(
-      byokEnabled ? configuredProviders.filter((p) => p.base_url).map((p) => p.provider) : [],
-    );
-    const ownKey = (provider: string, anyKey: boolean) => {
-      const { slugs, shared } = candidates[provider] ?? { slugs: [provider], shared: [provider] };
-      return (anyKey ? slugs : shared).some((s) => keyed.has(s)) || slugs.some((s) => pointed.has(s));
-    };
+    const ownKey = ownKeyRule({
+      configured: configuredProviders,
+      byokEnabled,
+      keyCandidates: modelsData.key_candidates ?? {},
+    });
     const { rawModels, validModelNames, metadata } = visible;
     for (const [group, data] of Object.entries(rawModels)) {
       for (const m of data.models ?? []) {
         const meta = metadata[m];
         if (validModelNames.has(m) || meta?.access_type === 'oauth') continue;
-        if (!ownKey(meta?.provider ?? group, false)) out.add(m);
+        if (!ownKey.serves(meta?.provider ?? group)) out.add(m);
       }
     }
-    const builtIns = (raw.model_metadata ?? {}) as Record<string, ModelMetadataEntry>;
+    const builtIns = modelsData.model_metadata ?? {};
+    // One added on a sign-in runs on it, like that provider's built-ins, so no
+    // plan gates it (the server's `on_subscription`).
+    const signIns = new Set(
+      (modelsData.provider_catalog ?? []).filter((p) => p.access_type === 'oauth').map((p) => p.provider),
+    );
     for (const cm of customModels) {
       const builtIn = builtIns[cm.name];
-      if (!builtIn) continue;
+      if (!builtIn || signIns.has(cm.provider)) continue;
       const covered = typeof builtIn.tier === 'number' && builtIn.tier <= platform.model_tier;
-      if (!covered && !keyed.has(cm.name) && !ownKey(cm.provider, true)) out.add(cm.name);
+      if (!covered && !ownKey.holds(cm.name) && !ownKey.serves(cm.provider, true)) out.add(cm.name);
     }
     return out;
   }, [visible, platform, modelsData, customModels, configuredProviders, byokEnabled]);
@@ -277,7 +289,8 @@ export function useAllModels(): UseAllModelsResult {
     models: visible.models,
     metadata: visible.metadata,
     rawModels: visible.rawModels,
-    modelAccessMap,
+    payers,
+    keylessModels,
     lockedModels,
     offPlanModels,
     platform,
@@ -287,7 +300,7 @@ export function useAllModels(): UseAllModelsResult {
     catalogModelNames,
     compactionProfiles,
     searchProviders,
-    rawApiResponse: modelsData ? (modelsData as Record<string, unknown>) : null,
-    isLoading: modelsLoading || prefsLoading || configuredLoading || platformLoading,
+    rawApiResponse: modelsData,
+    isLoading: modelsLoading || prefsLoading || configuredLoading || platformLoading || listsLoading,
   };
 }

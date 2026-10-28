@@ -76,7 +76,7 @@ def resolver(monkeypatch):
     """Stand-in for resolve_oauth_llm_client: each call returns a model with a newer token."""
     counter = {"n": 0}
 
-    async def _resolve(user_id, model_name, reasoning_effort=None, service_tier=None, cache_key=None):
+    async def _resolve(user_id, model_name, reasoning_effort=None, service_tier=None, cache_key=None, custom_entry=None):
         counter["n"] += 1
         return _oauth_model(model_name, token=f"t{counter['n']}", user=user_id)
 
@@ -226,7 +226,7 @@ async def test_same_token_back_forces_expiry_then_uses_refreshed(monkeypatch):
     """The store still calls the refused token valid: expire it, resolve again."""
     tokens = iter(["t0", "t1"])
 
-    async def _resolve(user_id, model_name, reasoning_effort=None, service_tier=None, cache_key=None):
+    async def _resolve(user_id, model_name, reasoning_effort=None, service_tier=None, cache_key=None, custom_entry=None):
         return _oauth_model(model_name, token=next(tokens), user=user_id)
 
     monkeypatch.setattr(
@@ -244,7 +244,7 @@ async def test_same_token_back_forces_expiry_then_uses_refreshed(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_same_token_even_after_expiry_gives_up(monkeypatch):
-    async def _resolve(user_id, model_name, reasoning_effort=None, service_tier=None, cache_key=None):
+    async def _resolve(user_id, model_name, reasoning_effort=None, service_tier=None, cache_key=None, custom_entry=None):
         return _oauth_model(model_name, token="t0", user=user_id)
 
     monkeypatch.setattr(
@@ -261,12 +261,23 @@ async def test_same_token_even_after_expiry_gives_up(monkeypatch):
 @pytest.mark.asyncio
 async def test_resolver_tags_clients_without_the_token(monkeypatch):
     """The production resolver attaches the spec: provider and a digest, never the token."""
-    from src.server.services import claude_oauth
+    from datetime import datetime, timedelta, timezone
 
-    async def _token(user_id):
-        return {"access_token": "secret-access-token", "plan_type": None}
+    from src.server.services import oauth_health
+    from src.server.services.oauth_protocol import TokenSet
 
-    monkeypatch.setattr(claude_oauth, "get_valid_token", create_autospec(claude_oauth.get_valid_token, side_effect=_token))
+    async def _token(user_id, provider):
+        return TokenSet(
+            access_token="secret-access-token",
+            refresh_token="",
+            expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+        )
+
+    monkeypatch.setattr(
+        oauth_health,
+        "valid_token",
+        create_autospec(oauth_health.valid_token, side_effect=_token),
+    )
     client = await llm_clients.resolve_oauth_llm_client("u1", "claude-opus-5-5-oauth")
     spec = oauth_rebuild_spec(client)
     assert spec.provider == "claude-oauth" and spec.model_name == "claude-opus-5-5-oauth"
@@ -337,7 +348,7 @@ async def test_subagent_narrowed_cache_key_survives_rebuild(monkeypatch):
             ),
         )
 
-    async def _resolve(user_id, model_name, reasoning_effort=None, service_tier=None, cache_key=None):
+    async def _resolve(user_id, model_name, reasoning_effort=None, service_tier=None, cache_key=None, custom_entry=None):
         return _build("t1")
 
     monkeypatch.setattr(
@@ -527,3 +538,84 @@ async def test_ordinary_400_vs_real_context_overflow_fallback_and_compaction_han
     with pytest.raises(Exception, match="prompt is too long"):
         await mw_overflow.awrap_model_call(_FakeRequest(primary), handler_all_overflow)
     assert seen_sub_ovf == ["claude-opus-5-5-oauth", "larger-window-fallback"]
+
+
+@pytest.mark.asyncio
+async def test_custom_subscription_model_rebuilds_with_its_entry(monkeypatch):
+    """A custom model the manifest does not carry (an untuned model the
+    subscription lists) must rebuild from the entry it was first built with:
+    the spec records it and the rebuild passes it back to the resolver."""
+    from datetime import datetime, timedelta, timezone
+    from unittest.mock import create_autospec
+
+    import src.server.services.llm.clients as llm_clients_mod
+    from src.server.services import oauth_health
+    from src.server.services.oauth_protocol import TokenSet
+
+    async def _token(user_id, provider):
+        return TokenSet(
+            access_token="secret-access-token",
+            refresh_token="",
+            expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+        )
+
+    monkeypatch.setattr(
+        oauth_health,
+        "valid_token",
+        create_autospec(oauth_health.valid_token, side_effect=_token),
+    )
+
+    class _TaggedFake:
+        pass
+
+    entry = {
+        "name": "vendor-untuned-model",
+        "provider": "codex-oauth",
+        "parameters": {},
+    }
+    fake_client = _TaggedFake()
+    # create_llm_from_custom is imported inside the resolver from src.llms.llm.
+    import src.llms.llm as llm_factory_mod
+
+    fake_builder = create_autospec(
+        llm_factory_mod.create_llm_from_custom, return_value=fake_client
+    )
+    monkeypatch.setattr(llm_factory_mod, "create_llm_from_custom", fake_builder)
+
+    # The manifest does not carry the model; only the saved entry resolves it.
+    import src.llms.llm as llm_mod
+
+    monkeypatch.setattr(
+        llm_mod.LLM,
+        "get_model_config",
+        create_autospec(
+            llm_mod.LLM.get_model_config,
+            return_value=type(
+                "MC",
+                (),
+                {
+                    "get_model_config": staticmethod(lambda n: None),
+                    "get_provider_info": staticmethod(lambda n: {}),
+                },
+            )(),
+        ),
+    )
+
+    client = await llm_clients_mod.resolve_oauth_llm_client(
+        "u1", "vendor-untuned-model", custom_entry=entry
+    )
+    assert client is fake_client
+    spec = oauth_rebuild_spec(client)
+    assert spec is not None
+    assert spec.custom_entry == entry
+
+    # The rebuild path forwards the entry, so a model absent from the manifest
+    # still re-resolves instead of returning None.
+    fake_resolver = create_autospec(
+        llm_clients_mod.resolve_oauth_llm_client, return_value=fake_client
+    )
+    monkeypatch.setattr(llm_clients_mod, "resolve_oauth_llm_client", fake_resolver)
+    rebuilt = await oauth_refresh._resolve(spec)
+    assert rebuilt is fake_client
+    fake_resolver.assert_awaited_once()
+    assert fake_resolver.call_args.kwargs["custom_entry"] == entry

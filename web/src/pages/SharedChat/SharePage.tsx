@@ -5,7 +5,7 @@ import { Loader } from '@/components/ui/loader';
 import { GRANT_RENEW_MARGIN_MS, MIN_RENEW_INTERVAL_MS, msUntilRenewal } from '@/lib/expiry';
 import { queryKeys } from '@/lib/queryKeys';
 import { useAuth } from '../../contexts/AuthContext';
-import { apiErrorStatus, retryUnlessClientError } from '../ChatAgent/utils/api/errors';
+import { apiErrorStatus, retryUnlessClientError } from '@/api/errors';
 import { getSharedMetadata, type ShareMetadata } from './api';
 import ShareUnavailable from './ShareUnavailable';
 import SharedAppView from './SharedAppView';

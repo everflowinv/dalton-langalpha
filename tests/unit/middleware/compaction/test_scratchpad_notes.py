@@ -7,7 +7,7 @@ import asyncio
 import itertools
 import posixpath
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from types import SimpleNamespace
 
 import pytest
@@ -16,7 +16,7 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, Tool
 
 from ptc_agent.agent.middleware.compaction import CompactionMiddleware
 from ptc_agent.agent.middleware.compaction import compact as compact_module
-from ptc_agent.agent.middleware.compaction.compact import Summarizer
+from ptc_agent.agent.middleware.compaction.compact import Compaction, Summarizer
 from ptc_agent.agent.middleware.compaction.summarize import Summary
 from ptc_agent.agent.middleware.compaction.notes import (
     NotesDueMiddleware,
@@ -422,18 +422,19 @@ async def test_a_rebuilt_baseline_has_no_reminder_to_fold_in():
 @dataclass
 class _Request:
     messages: list
+    state: dict = field(default_factory=dict)
 
     def override(self, **changes):
         return replace(self, **changes)
 
 
-async def _sent(messages: list) -> list:
+async def _sent(messages: list, state: dict | None = None) -> list:
     seen: list = []
 
     async def handler(request):
         seen.extend(request.messages)
 
-    await _middleware().awrap_model_call(_Request(messages), handler)
+    await _middleware().awrap_model_call(_Request(messages, state or {}), handler)
     return seen
 
 
@@ -456,6 +457,61 @@ async def test_the_reminder_of_the_current_stretch_is_sent():
 
     assert await _sent([summary, HumanMessage("go"), current]) == [summary, HumanMessage("go"), current]
     assert await _sent([HumanMessage("go"), first]) == [HumanMessage("go"), first]
+
+
+@pytest.mark.asyncio
+async def test_a_summary_written_before_the_deploy_drops_its_kept_rows_as_it_did():
+    """A summary from before kept turns were sent as they were records no
+    unanswered rows; the thinking after it was produced without the rows its
+    kept turns answered, so they stay out."""
+    (answered,) = (await _ask(0.85))["messages"]
+    summary = build_summary_message("the summary")
+    event = {"summary_message": summary, "cutoff_index": 1}
+    turns = [summary, HumanMessage("go"), answered, AIMessage("noted"), HumanMessage("next")]
+
+    before = await _sent(turns, {"_summarization_event": event})
+    since = await _sent(turns, {"_summarization_event": event, "_unanswered_notes_rows": set()})
+
+    assert answered not in before
+    assert since == turns
+
+
+@pytest.mark.asyncio
+async def test_a_row_the_summary_before_the_deploy_kept_out_stays_out_after_the_next():
+    """The next summary keeps turns the old one kept, sent as they went, so the
+    row the old rule kept out of them is recorded with it rather than sent again."""
+    (row,) = (await _ask(0.85))["messages"]
+    answered = row.model_copy(update={"id": "row"})
+    summary = build_summary_message("the summary")
+    kept = [
+        HumanMessage("go", id="h1"),
+        answered,
+        AIMessage("noted", id="a1"),
+        HumanMessage("next", id="h2"),
+    ]
+    after = build_summary_message("the next summary")
+    compaction = Compaction(
+        {"summary_message": after, "cutoff_index": 1},
+        Summary("ok", "model", []),
+        6,
+        kept,
+    )
+
+    update = compaction.update(
+        {"_summarization_event": {"summary_message": summary, "cutoff_index": 1}}
+    )
+
+    assert update["_unanswered_notes_rows"] == {answered.id}
+    assert answered not in await _sent([after, *kept], update)
+    assert (
+        compaction.update(
+            {
+                "_summarization_event": {"summary_message": summary, "cutoff_index": 1},
+                "_unanswered_notes_rows": set(),
+            }
+        )["_unanswered_notes_rows"]
+        == set()
+    )
 
 
 # -- the check-in between summaries -------------------------------------------

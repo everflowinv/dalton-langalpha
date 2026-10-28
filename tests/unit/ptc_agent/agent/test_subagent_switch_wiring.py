@@ -131,7 +131,7 @@ def test_the_notes_prompt_sits_inside_compaction_on_the_main_stack_only(machine)
             "CompactionMiddleware",
             "BaselineContextMiddleware",
             "NotesDueMiddleware",
-            "TailEnvelopeMiddleware",
+            "RowCarrierMiddleware",
         )
     ]
     assert order == sorted(order)
@@ -152,7 +152,7 @@ def test_without_the_scratchpad_its_rows_stay_out_of_the_calls(machine):
     assert "NotesDueMiddleware" not in names
     at = names.index("NotesOffMiddleware")
     assert names[at - 1] == "BaselineContextMiddleware"
-    assert names[at + 1] == "TailEnvelopeMiddleware"
+    assert names[at + 1] == "RowCarrierMiddleware"
 
 
 def _compactions(built: dict, handed: list | None = None):

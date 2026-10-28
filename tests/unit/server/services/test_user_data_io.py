@@ -717,18 +717,18 @@ class TestPreferenceStructuredKeys:
 
     def test_values_come_back_as_the_check_spells_them(self):
         current = {"investment_preference": {"horizon": "long_term"}}
-        values = {"risk_preference": {"risk_level": " Growth "}, "agent_preference": {"output_format": "HTML"}}
+        values = {"risk_preference": {"risk_level": " Growth "}, "agent_preference": {"output_format": ["Visual"]}}
         assert io.check_preferences({**values, **current}, current) == {
             "risk_preference": {"risk_level": "growth"},
             "investment_preference": {"horizon": "long_term"},
-            "agent_preference": {"output_format": "html"},
+            "agent_preference": {"output_format": ["visual"]},
         }
 
     def test_every_problem_is_named_in_one_refusal(self):
         values = {
             "risk_preference": {"risk_level": "yolo"},
             "investment_preference": {"investor_type": "trader", "horizon": 5},
-            "agent_preference": {"output_format": "pdf"},
+            "agent_preference": {"output_format": ["pdf"]},
         }
         with pytest.raises(UserDataValidationError) as exc:
             io.check_preferences(values, None)
@@ -738,7 +738,7 @@ class TestPreferenceStructuredKeys:
             "risk_preference.risk_level",
             "investment_preference.investor_type",
             "investment_preference.horizon",
-            "agent_preference.output_format",
+            "agent_preference.output_format[0]",
         ]
         assert "individual, professional, student" in exc.value.message
 

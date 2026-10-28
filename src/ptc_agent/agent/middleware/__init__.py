@@ -84,7 +84,7 @@ from .large_result_eviction import (
 # per-call row to the envelope.
 from .runtime_context import (
     BaselineContextMiddleware,
-    TailEnvelopeMiddleware,
+    RowCarrierMiddleware,
 )
 
 # Market watch middleware (live price injection for watched tickers)
@@ -97,9 +97,9 @@ from .steering import (
     SteeringMiddleware,
 )
 
-# OpenAI prompt-cache breakpoint middleware (GPT-5.6+ explicit caching)
-from .openai_prompt_caching import (
-    OpenAIPromptCachingMiddleware,
+# System-prompt cache breakpoint middleware (OpenAI GPT-5.6+, Claude over OpenRouter)
+from .system_prompt_caching import (
+    SystemPromptCacheMiddleware,
 )
 
 # Cross-provider reasoning sanitizer (origin + shape gates, origin stamping)
@@ -172,9 +172,9 @@ __all__ = [
     "SubagentSteeringMiddleware",
     # Runtime context
     "BaselineContextMiddleware",
-    "TailEnvelopeMiddleware",
+    "RowCarrierMiddleware",
     # OpenAI prompt caching
-    "OpenAIPromptCachingMiddleware",
+    "SystemPromptCacheMiddleware",
     # Cross-provider reasoning sanitizer
     "ReasoningCompatibilityMiddleware",
     # Stream heartbeat

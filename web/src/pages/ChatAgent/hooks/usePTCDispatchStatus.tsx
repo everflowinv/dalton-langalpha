@@ -20,7 +20,7 @@ import {
   type HandoffLiveness,
   type LivenessAsk,
 } from '../utils/api';
-import { isLastingRefusal } from '../utils/api/errors';
+import { isLastingRefusal } from '@/api/errors';
 
 /** UI-facing lifecycle of a dispatched PTC research run. */
 export type PTCDispatchStatus =

@@ -163,6 +163,36 @@ class TestAShadowInheritsTheHalfItDidNotDeclare:
         assert client.reasoning is None
 
 
+class TestASurfaceComesWholeFromOneSide:
+    """``on``/``off`` are only coherent beside the ``write`` and ladder they
+    were declared with. Mixed into a ladder of the entry's own, a borrowed
+    ``off`` with no off rung beside it failed validation on every turn."""
+
+    def test_an_entry_naming_its_own_write_takes_none_of_the_built_ins_switches(self):
+        """The block the provider list writes for GLM-5.2 on OpenRouter."""
+        client = _build(
+            {
+                "name": "glm-5.2",
+                "model_id": "z-ai/glm-5.2",
+                "provider": "openrouter",
+                "reasoning": {"efforts": ["low", "medium", "high"], "write": "parameters.reasoning.effort"},
+            },
+            reasoning_effort="medium",
+        )
+        assert client.reasoning == {"effort": "medium"}
+        assert "thinking" not in (client.model_kwargs or {})
+
+    def test_a_narrowed_ladder_with_no_off_rung_drops_the_off_patch(self):
+        """Borrowing the surface is still right for a flat ladder, which names
+        none of its own; only the ``off`` none of its rungs can apply goes."""
+        client = _build(
+            {"name": "glm-5.2", "model_id": "glm-5.2", "provider": "z-ai", "reasoning_efforts": ["high", "max"]},
+            reasoning_effort="max",
+        )
+        assert client.extra_body["reasoning_effort"] == "max"
+        assert client.extra_body["thinking"]["type"] == "enabled"
+
+
 class TestAnEmptyBlockDoesNotAnswerForTheEntry:
     """``reasoning: {}`` declares nothing, so an entry's flat keys are still its
     declaration. Reading the block on presence stranded them: the save
@@ -192,3 +222,55 @@ class TestAnEmptyBlockDoesNotAnswerForTheEntry:
         client = _build({**self.ENTRY, "reasoning_efforts": []}, reasoning_effort="high")
         assert client.reasoning == {"effort": "medium"}
         assert client.metadata.get("reasoning_effort") is None
+
+
+class TestAShadowOnAnotherApiKeepsOnlyItsOwnControl:
+    """A gateway can serve a built-in's model through another API (Claude over
+    Chat Completions). The built-in's write path is a keyword of its own SDK,
+    so borrowing it there failed every call (``output_config`` on an OpenAI
+    client) or moved the call to another endpoint (``reasoning`` turning a Chat
+    Completions route into a Responses one)."""
+
+    @staticmethod
+    def _gateway(name: str, provider: str = "my-gateway", **extra) -> dict:
+        # ``provider`` as the resolver leaves it: an OpenAI-shaped custom
+        # provider keeps its own slug, an Anthropic one becomes ``anthropic``.
+        return {"name": name, "model_id": name, "provider": provider, **extra}
+
+    _URL = {"base_url": "https://gateway.example/v1"}
+
+    def test_claude_over_chat_completions_gets_no_anthropic_keyword(self):
+        client = _build(self._gateway("claude-sonnet-5-5"), reasoning_effort="high", **self._URL)
+        assert "output_config" not in (client.model_kwargs or {})
+        assert not client.metadata.get("reasoning_effort")
+
+    def test_gpt_over_chat_completions_stays_on_chat_completions(self):
+        client = _build(self._gateway("gpt-6.1-sol", _use_response_api=False), reasoning_effort="high", **self._URL)
+        assert not client.use_responses_api
+        assert client.reasoning is None
+
+    def test_gpt_over_the_responses_api_keeps_its_control(self):
+        client = _build(self._gateway("gpt-6.1-sol", _use_response_api=True), reasoning_effort="high", **self._URL)
+        assert client.reasoning == {"effort": "high"}
+
+    def test_claude_over_the_messages_api_keeps_its_control(self):
+        client = _build(self._gateway("claude-sonnet-5-5", provider="anthropic"), reasoning_effort="high")
+        assert client.metadata["reasoning_effort"] == "high"
+
+
+class TestBorrowsReasoning:
+    def test_a_control_written_only_into_the_body_crosses_apis(self):
+        """A coding plan reaches GLM through its Anthropic route this way."""
+        from src.llms.model_spec import borrows_reasoning
+
+        glm = {"reasoning": {"efforts": ["high"], "write": "extra_body.reasoning_effort",
+                             "on": {"extra_body.thinking.type": "enabled"}}}
+        assert borrows_reasoning(glm, "anthropic", "glm")
+
+    def test_a_switch_on_a_keyword_keeps_it_home(self):
+        from src.llms.model_spec import borrows_reasoning
+
+        mixed = {"reasoning": {"efforts": ["high"], "write": "extra_body.reasoning_effort",
+                               "on": {"parameters.thinking.type": "enabled"}}}
+        assert not borrows_reasoning(mixed, "openai-chat", "anthropic")
+        assert borrows_reasoning(mixed, "anthropic", "anthropic")

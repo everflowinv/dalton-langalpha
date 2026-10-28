@@ -37,7 +37,7 @@ export function resolveComposerModel(
   return { seed: modeDefault, retired: threadModel || null };
 }
 
-export interface PrimaryModelsParams {
+export interface RecentModelsParams {
   selectedModel: string | null;
   /** Models this thread has already used, from replayed turn metadata. */
   threadModels: string[];
@@ -45,19 +45,20 @@ export interface PrimaryModelsParams {
 }
 
 /**
- * Models listed in the menu's primary section: the ones this thread already used,
- * then the current selection.
+ * The thread's models for the picker's first tab: the ones this thread already
+ * used, then the current selection. The composer lists those that are not
+ * favorites under the favorites.
  *
  * Thread history is gated on availability because a model can be revoked long
  * after a turn used it, and an unreachable row only fails once the user sends.
  * The selection itself is never gated — the trigger displays it, so dropping it
- * would leave the menu unable to show what is currently selected.
+ * would leave the picker unable to show what is currently selected.
  */
-export function derivePrimaryModels({
+export function deriveRecentModels({
   selectedModel,
   threadModels,
   validModelNames,
-}: PrimaryModelsParams): string[] {
+}: RecentModelsParams): string[] {
   const reachable = threadModels.filter(
     (m) => typeof m === 'string' && m.length > 0 && isModelAvailable(m, validModelNames),
   );

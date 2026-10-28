@@ -24,7 +24,7 @@ describe('welcome draft', () => {
       styles: ['index' as const],
       sectors: ['biotech'],
       depth: 'thorough' as const,
-      deliverable: 'report' as const,
+      deliverable: 'markdown' as const,
       proactivity: 'proactive' as const,
     };
     const seeded = { ...emptyProfile(), sectors: ['biotech'] };
@@ -33,28 +33,26 @@ describe('welcome draft', () => {
     expect(readWelcomeDraft('u2')).toBeNull();
   });
 
-  it("keeps how the agent should work, a report as the row's output format and the others as the deliverable", () => {
+  it("keeps how the agent should work, the answer at the head of the row's output format ranking", () => {
     const stored = () => JSON.parse(localStorage.getItem('langalpha-welcome-draft:u1') ?? 'null');
-    const report = {
+    const file = {
       ...answered,
       depth: 'light' as const,
-      deliverable: 'report' as const,
+      deliverable: 'markdown' as const,
       proactivity: 'on_request' as const,
     };
-    writeWelcomeDraft('u1', { step: 'agent', profile: report, base, elsewhere: stayed });
-    // In the shape the server stores, so a report is the setting, not a
-    // deliverable beside it.
+    writeWelcomeDraft('u1', { step: 'agent', profile: file, base, elsewhere: stayed });
+    // In the shape the server stores.
     expect(stored().profile.agent_preference).toEqual({
       research_depth: 'light',
-      deliverable: null,
       proactivity: 'on_request',
-      output_format: 'html',
+      output_format: ['markdown', 'text', 'visual'],
     });
-    expect(readWelcomeDraft('u1')).toEqual({ step: 'agent', profile: report, base, elsewhere: stayed });
+    expect(readWelcomeDraft('u1')).toEqual({ step: 'agent', profile: file, base, elsewhere: stayed });
 
-    const visual = { ...report, deliverable: 'visual' as const };
+    const visual = { ...file, deliverable: 'visual' as const };
     writeWelcomeDraft('u1', { step: 'agent', profile: visual, base, elsewhere: stayed });
-    expect(stored().profile.agent_preference).toMatchObject({ deliverable: 'visual', output_format: null });
+    expect(stored().profile.agent_preference).toMatchObject({ output_format: ['visual', 'markdown', 'text'] });
     expect(readWelcomeDraft('u1')).toEqual({ step: 'agent', profile: visual, base, elsewhere: stayed });
   });
 

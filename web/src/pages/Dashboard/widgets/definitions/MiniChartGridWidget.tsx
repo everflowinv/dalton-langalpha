@@ -5,6 +5,7 @@ import { Grid2x2 } from 'lucide-react';
 import { useNavigate } from 'react-router';
 import { useDashboardContext } from '../framework/DashboardDataContext';
 import { registerWidget } from '../framework/WidgetRegistry';
+import { WidgetCardMeta } from '../framework/widgetCardSlots';
 import { useWidgetContextExport } from '../framework/contextSnapshot';
 import {
   serializeRowsToMarkdown,
@@ -264,25 +265,10 @@ function MiniChartGridWidget({ instance }: WidgetRenderProps<MiniChartGridConfig
   });
 
   return (
-    <div className="dashboard-glass-card p-4 flex flex-col h-full">
-      <div
-        className="flex items-baseline justify-between mb-3 pb-2 border-b"
-        style={{ borderColor: 'var(--color-border-muted)' }}
-      >
-        <div className="flex items-baseline gap-2">
-          <Grid2x2 className="h-3.5 w-3.5 self-center" style={{ color: 'var(--color-text-tertiary)' }} />
-          <span
-            className="text-[0.625rem] font-semibold uppercase tracking-[0.14em]"
-            style={{ color: 'var(--color-text-secondary)' }}
-          >
-            {t('dashboard.widgets.miniChartGrid.header')}
-          </span>
-        </div>
-        <span className="text-[0.6875rem] dashboard-mono" style={{ color: 'var(--color-text-tertiary)' }}>
-          {t('dashboard.widgets.miniChartGrid.summary', { count: effectiveSymbols.length, days: SPARK_DAYS })}
-        </span>
-      </div>
-
+    <div className="flex flex-col h-full">
+      <WidgetCardMeta>
+        {t('dashboard.widgets.miniChartGrid.summary', { count: effectiveSymbols.length, days: SPARK_DAYS })}
+      </WidgetCardMeta>
       <div className="flex-1 min-h-0 overflow-y-auto">
         {isLoading && !data ? (
           <div className="grid grid-cols-2 md:grid-cols-3 gap-2">
@@ -388,6 +374,7 @@ function MiniChartGridSettings({
 registerWidget<MiniChartGridConfig>({
   type: 'markets.miniChartGrid',
   titleKey: 'dashboard.widgets.miniChartGrid.title',
+  cardTitleKey: 'dashboard.widgets.miniChartGrid.header',
   descriptionKey: 'dashboard.widgets.miniChartGrid.description',
   category: 'markets',
   icon: Grid2x2,

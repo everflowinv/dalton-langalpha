@@ -1,6 +1,7 @@
 import React, { Suspense, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { I18nProvider } from 'react-aria-components';
 import { Routes, Route, Navigate, useNavigate, useLocation } from 'react-router';
+import { useQueryClient } from '@tanstack/react-query';
 import AppSidebar from './components/Sidebar/AppSidebar';
 import { SIDEBAR_DEFAULT_WIDTH, clampSidebarWidth } from './components/Sidebar/sidebarWidth';
 import { useScrollMemory } from './lib/scrollMemory';
@@ -27,7 +28,8 @@ import { ThreadLifecycleFeed } from './lib/threadLifecycle/ThreadLifecycleFeed';
 import { WarmHome } from './components/WarmHome';
 import { HostedSignInGate } from './components/HostedSignInGate';
 import { forgetHostedSignIn, hostedSignInReturn, landAfterSignIn } from './lib/hostedSignIn';
-import { markBooted, watchStaleBuild } from './lib/staleBuild';
+import { markBooted, reloadIfStale, watchStaleBuild } from './lib/staleBuild';
+import { appSectionOf } from './lib/appRoutes';
 import { lazyWithMotion } from './lib/lazyWithMotion';
 import './App.css';
 
@@ -225,6 +227,10 @@ function LegacyAppPathRedirect() {
  */
 const SIDEBAR_COLLAPSED_KEY = 'app-sidebar-collapsed';
 const SIDEBAR_WIDTH_KEY = 'app-sidebar-width';
+/** Route state that only saves the page a fetch (the sidebar's workspace name and status). */
+const ROUTE_HINTS = new Set(['workspaceName', 'workspaceStatus']);
+/** A thread the URL names finds its workspace again after a load; a new one does not. */
+const NAMED_THREAD = /^\/chat\/t\/(?!__default__(?:\/|$))[^/]+/;
 
 function AuthenticatedShell() {
   const isMobile = useIsMobile();
@@ -232,6 +238,35 @@ function AuthenticatedShell() {
   const onWelcome = location.pathname === WELCOME_PATH;
   const hideTabBar = isMobile && location.pathname.startsWith('/chat/t/');
   const { isLoading, needsSetup } = useSetupGate();
+
+  // A new build is taken on a switch between sections, never inside one: chat
+  // keeps every thread it has opened mounted, with its unsent message, while
+  // its threads are switched, and only leaving the section lets them go. Not
+  // on a switch that hands something over in its route state (a message the
+  // dashboard sends into chat), which the page it opens takes and clears. And
+  // a macrotask later, once the writes in flight have landed: the page being
+  // left saves what it still holds as it unmounts (a dashboard edit on its
+  // debounce), and by then that write has started. The timer is not cancelled
+  // when the page that opens rewrites its own route state: the switch was
+  // decided on the state it arrived with.
+  const queryClient = useQueryClient();
+  const section = appSectionOf(location.pathname);
+  // An empty one hands nothing over (a thread opened from Automations), and
+  // nor do hints the page that opens reads again after a load.
+  const namesThread = NAMED_THREAD.test(location.pathname);
+  const handsOver =
+    location.state != null &&
+    Object.entries(location.state as object).some(
+      ([key, v]) => v !== undefined && !ROUTE_HINTS.has(key) && !(key === 'workspaceId' && namesThread),
+    );
+  const shownSection = useRef(section);
+  useEffect(() => {
+    if (section === shownSection.current) return;
+    const left = shownSection.current;
+    shownSection.current = section;
+    if (!left || !section || handsOver) return;
+    setTimeout(() => reloadIfStale(() => queryClient.isMutating() === 0), 0);
+  }, [section, handsOver, queryClient]);
 
   // Reaching any page outside setup ends a visit another page sent here, so
   // its return can't catch a later setup opened from inside the app.

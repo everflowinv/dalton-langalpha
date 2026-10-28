@@ -11,6 +11,8 @@
  */
 import { describe, it, expect } from 'vitest';
 import {
+  pruneModelReferences,
+  starredModels,
   MODEL_PREF_KEYS,
   BACKGROUND_AUTO,
   backgroundDefaultChoice,
@@ -183,5 +185,71 @@ describe('readDefaultModelScope', () => {
   it('returns a saved answer', () => {
     expect(readDefaultModelScope({ model_preference: { default_model_scope: 'existing_threads' } })).toBe('existing_threads');
     expect(readDefaultModelScope({ model_preference: { default_model_scope: 'new_threads' } })).toBe('new_threads');
+  });
+});
+
+describe('starredModels', () => {
+  it('reads the list from other_preference, never the model bag', () => {
+    expect(starredModels({ other_preference: { starred_models: ['a', 'b'] }, model_preference: { starred_models: ['c'] } })).toEqual(['a', 'b']);
+  });
+
+  it('reads anything but a list of names as no list', () => {
+    expect(starredModels(null)).toEqual([]);
+    expect(starredModels({ other_preference: { starred_models: 'a' } })).toEqual([]);
+    expect(starredModels({ other_preference: { starred_models: ['a', 3, ''] } })).toEqual(['a']);
+  });
+});
+
+describe('pruneModelReferences', () => {
+  // The models a removed key or an unpicked provider served.
+  const gone = new Set(['gpt-4o', 'gpt-3.5']);
+  const isGone = (m: string) => gone.has(m);
+
+  it('is empty when nothing names a gone model', () => {
+    const prefs = { model_preference: { preferred_model: 'gpt-5.4', fallback_models: ['claude-5'] } };
+    expect(pruneModelReferences(prefs, isGone)).toEqual({});
+  });
+
+  it('clears every slot that names a gone model, and only those', () => {
+    const prefs = {
+      model_preference: {
+        preferred_model: 'claude-5',
+        preferred_background_model: 'gpt-4o',
+        compaction_model: 'gpt-3.5',
+        summarization_model: 'gpt-4o',
+        fetch_model: 'gpt-3.5',
+      },
+    };
+    expect(pruneModelReferences(prefs, isGone)).toEqual({
+      preferred_background_model: null,
+      compaction_model: null,
+      summarization_model: null,
+      fetch_model: null,
+    });
+  });
+
+  it('shrinks the fallbacks and the list, clearing one left empty', () => {
+    const prefs = {
+      model_preference: { fallback_models: ['gpt-5.4', 'gpt-3.5', 'claude-5'] },
+      other_preference: { starred_models: ['gpt-4o'] },
+    };
+    expect(pruneModelReferences(prefs, isGone)).toEqual({
+      fallback_models: ['gpt-5.4', 'claude-5'],
+      starred_models: null,
+    });
+  });
+
+  it("saves emptied fallbacks as empty, so the deployment's list does not take their place", () => {
+    const prefs = { model_preference: { fallback_models: ['gpt-4o', 'gpt-3.5'] } };
+    expect(pruneModelReferences(prefs, isGone)).toEqual({ fallback_models: [] });
+  });
+
+  it("drops a gone model's profile, so no model inheriting its name inherits its tuning", () => {
+    const prefs = { model_preference: { profiles: { 'gpt-4o': { reasoning_effort: 'high' }, 'claude-5': { fast_mode: true } } } };
+    expect(pruneModelReferences(prefs, isGone)).toEqual({ profiles: { 'gpt-4o': null } });
+  });
+
+  it('reads a slot still in the legacy column', () => {
+    expect(pruneModelReferences({ other_preference: { preferred_model: 'gpt-4o' } }, isGone)).toEqual({ preferred_model: null });
   });
 });

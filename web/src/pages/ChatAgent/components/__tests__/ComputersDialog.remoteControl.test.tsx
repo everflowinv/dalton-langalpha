@@ -11,7 +11,8 @@ import type { Mock } from 'vitest';
 import { act, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 
-import { renderWithProviders } from '@/test/utils';
+import { createTestQueryClient, renderWithProviders } from '@/test/utils';
+import { queryKeys } from '@/lib/queryKeys';
 import type { RemoteControlResult, RemoteControlStatus } from '@/lib/desktop';
 import type { Computer, SshPairingStatus, SshProbeResult } from '@/types/api';
 
@@ -32,7 +33,7 @@ vi.mock('@/config/hostMode', () => ({
 vi.mock('@/components/ui/use-toast', () => ({ toast: vi.fn() }));
 
 vi.mock('../../utils/api', async () => {
-  const errors = await vi.importActual<typeof import('../../utils/api/errors')>('../../utils/api/errors');
+  const errors = await vi.importActual<typeof import('@/api/errors')>('@/api/errors');
   return {
     getComputers: vi.fn(),
     getComputerProviders: vi.fn(),
@@ -377,6 +378,67 @@ describe('adding a computer', () => {
     await waitFor(() => expect(enable).toHaveBeenCalledTimes(1));
     return view;
   }
+
+  // The form lays its provider cards out by this Mac's card, so one opened
+  // ahead of the shell's answer would enter on three cards and reflow to four.
+  it.each([
+    ['opened onto', () => renderWithProviders(<ComputersDialog panel={{ view: 'create' }} onClose={() => {}} />)],
+    ['added from the rail', async () => {
+      const user = userEvent.setup();
+      open();
+      await user.click(await screen.findByRole('button', { name: 'Add a computer' }));
+    }],
+  ])('opens the form %s only once the desktop app has said whether this Mac is one', async (_, show) => {
+    // The form's code is in hand, as the panel fetches it as it opens.
+    await import('../CreateComputerDialog');
+    const answer = deferred<RemoteControlStatus>();
+    getStatus.mockReturnValue(answer.promise);
+    await show();
+    // Everything else the form waits on has answered, and React Query has told
+    // its readers, which it does on a timer.
+    await waitFor(() => expect(mockProviders).toHaveBeenCalled());
+    await act(() => new Promise((r) => setTimeout(r, 20)));
+    expect(screen.queryByRole('dialog', { name: 'New computer' })).toBeNull();
+
+    await act(async () => answer.resolve(UNPAIRED));
+    const form = await screen.findByRole('dialog', { name: 'New computer' });
+    expect(within(form).getByRole('radio', { name: 'This Mac' })).toBeInTheDocument();
+  });
+
+  // A channel that threw on an earlier open left null behind, which is no answer.
+  it('waits for the desktop app again when all it kept is a read that threw', async () => {
+    await import('../CreateComputerDialog');
+    const queryClient = createTestQueryClient();
+    queryClient.setQueryData(queryKeys.desktop.remoteControl(), null);
+    const answer = deferred<RemoteControlStatus>();
+    getStatus.mockReturnValue(answer.promise);
+    renderWithProviders(<ComputersDialog panel={{ view: 'create' }} onClose={() => {}} />, { queryClient });
+    await waitFor(() => expect(getStatus).toHaveBeenCalled());
+    await act(() => new Promise((r) => setTimeout(r, 20)));
+    expect(screen.queryByRole('dialog', { name: 'New computer' })).toBeNull();
+
+    await act(async () => answer.resolve(UNPAIRED));
+    const form = await screen.findByRole('dialog', { name: 'New computer' });
+    expect(within(form).getByRole('radio', { name: 'This Mac' })).toBeInTheDocument();
+  });
+
+  // The form lays out on the read the panel waited for, so an answer that
+  // changes under it waits for the next poll rather than its entrance.
+  it('opens the form on the answer the panel read, not a read of its own', async () => {
+    getStatus.mockResolvedValueOnce(null);
+    renderWithProviders(<ComputersDialog panel={{ view: 'create' }} onClose={() => {}} />);
+    const form = await screen.findByRole('dialog', { name: 'New computer' });
+    await act(() => new Promise((r) => setTimeout(r, 20)));
+    expect(getStatus).toHaveBeenCalledTimes(1);
+    expect(within(form).queryByRole('radio', { name: 'This Mac' })).toBeNull();
+  });
+
+  it('opens the form though the list that says whether this Mac is added was refused', async () => {
+    mockGetComputers.mockRejectedValue(new Error('Request failed with status code 503'));
+    renderWithProviders(<ComputersDialog panel={{ view: 'create' }} onClose={() => {}} />);
+    const form = await screen.findByRole('dialog', { name: 'New computer' });
+    expect(within(form).queryByRole('radio', { name: 'This Mac' })).toBeNull();
+  });
 
   // Turning remote control on and off take turns on this Mac; adding any
   // other machine is no part of that.

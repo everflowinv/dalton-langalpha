@@ -165,11 +165,10 @@ envelope:
   updates:
     template: envelope/updates.md.j2
     description: >-
-      Per-call updates contributed on the request, rendered in the tail. Each
-      item carries kind, text, provenance, created_at, schema_version;
-      schema_version is machinery and is not rendered. kind == "market_watch"
-      renders text verbatim.
-    kwargs: [updates]
+      The live-price block a market_watch row carries, rendered once when the
+      row is written. stamp is the wrapped market-watch block and renders
+      verbatim.
+    kwargs: [stamp]
 
   update_row:
     template: envelope/update_row.md.j2

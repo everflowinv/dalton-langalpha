@@ -1,15 +1,14 @@
-"""Settled contracts of the runtime-context tail envelope and its carrier.
+"""Settled contracts of the runtime-context rows and their carrier.
 
 Three things here are load-bearing enough to pin. The hard cap decides what the
-model does NOT see when the one live block runs long. The carrier decides how
+model does NOT see when the live-price block runs long. The carrier decides how
 harness text reaches the model at all: a block inside the message it belongs to
 where the provider has no operator channel, a message of its own where it has
 one, and never inside a tool result. And breakpoint 4 has to land on content the
 next call still carries, which is the only reason the pin is worth placing.
 
-The durable rows go through that same carrier. They are persisted history, so
-the shape is applied to a request-only copy and the checkpoint keeps the
-provider-neutral message.
+The rows are persisted history, so the shape is applied to a request-only copy
+and the checkpoint keeps the provider-neutral message.
 """
 
 from datetime import UTC, datetime
@@ -22,19 +21,18 @@ from ptc_agent.agent.middleware.runtime_context import (
     ENVELOPE_CLOSE,
     ENVELOPE_HARD_CAP_TOKENS,
     ENVELOPE_OPEN,
-    RUNTIME_CONTEXT_SOURCE,
     RUNTIME_UPDATE_SOURCE,
+    Carrier,
     DurableUpdate,
     PinSite,
     apply_breakpoint,
     build_update_message,
-    carry_durable_updates,
     compose_request,
     count_tokens,
     frame_reminder,
-    render_call_updates,
+    render_stamp,
 )
-from ptc_agent.agent.middleware.runtime_context.carrier import resolve_carrier_shape
+from ptc_agent.agent.middleware.runtime_context.carrier import resolve_carrier
 
 NOW = datetime(2026, 4, 5, 12, 0, tzinfo=UTC)
 
@@ -48,43 +46,31 @@ def _padded(target_tokens: int, word: str) -> str:
 
 
 def _stamp(text: str) -> DurableUpdate:
-    """A per-call row, in the one kind the envelope renders verbatim."""
+    """A live-price row, the one kind both templates render verbatim."""
     return DurableUpdate(
-        kind="market_watch", schema_version=1, text=text, created_at=NOW
+        kind="market_watch", schema_version=2, text=text, created_at=NOW
     )
+
+
+def _stamp_row(text: str):
+    """The message a live-price row is persisted as."""
+    return build_update_message(_stamp(text))
 
 
 class TestTheHardCap:
     """The block is dropped whole, never trimmed: half a stamp is worse than none."""
 
     def test_a_block_under_the_cap_is_rendered_with_its_header(self):
-        block = render_call_updates([_stamp("AAPL 232.10 (+1.2%)")], NOW, "lean")
+        block = render_stamp("AAPL 232.10 (+1.2%)", "lean")
 
         assert "AAPL 232.10 (+1.2%)" in block
-        assert "Runtime context for you" in block
+        assert "Runtime context from the platform" in block
         assert count_tokens(block) <= ENVELOPE_HARD_CAP_TOKENS
 
     def test_a_block_over_the_cap_is_dropped(self):
-        block = render_call_updates([_stamp(_padded(2600, "alpha"))], NOW, "lean")
+        block = render_stamp(_padded(2600, "alpha"), "lean")
 
         assert block == ""
-
-    def test_nothing_to_say_renders_nothing(self):
-        assert render_call_updates([], NOW, "lean") == ""
-        assert render_call_updates([_stamp("")], NOW, "lean") == ""
-
-    def test_rows_render_oldest_first(self):
-        older = _stamp("older")
-        newer = DurableUpdate(
-            kind="market_watch",
-            schema_version=1,
-            text="newer",
-            created_at=datetime(2026, 4, 5, 12, 5, tzinfo=UTC),
-        )
-
-        block = render_call_updates([newer, older], NOW, "lean")
-
-        assert block.index("older") < block.index("newer")
 
 
 class TestCarrierShapes:
@@ -94,12 +80,12 @@ class TestCarrierShapes:
     FRAMED = "<system-reminder>\ncontext\n</system-reminder>"
 
     def _carried(self, messages: list, shape: str = "reminder") -> list:
-        """The composed request, which is the only door onto a shape."""
-        return compose_request(messages, self.ENVELOPE, shape).messages
+        """The composed request with one row after *messages*: the only door onto a shape."""
+        return compose_request([*messages, _stamp_row(self.ENVELOPE)], Carrier(shape)).messages
 
     def test_shape_is_reminder_without_an_operator_channel(self):
-        assert resolve_carrier_shape(None) == "reminder"
-        assert resolve_carrier_shape(MagicMock()) == "reminder"
+        assert resolve_carrier(None).shape == "reminder"
+        assert resolve_carrier(MagicMock()).shape == "reminder"
 
     def test_shape_falls_back_to_reminder_when_resolution_raises(self, monkeypatch):
         """A carrier fault costs a role, never a turn."""
@@ -109,7 +95,7 @@ class TestCarrierShapes:
             raise RuntimeError("manifest is gone")
 
         monkeypatch.setattr(oc, "resolve_operator_channel", _boom)
-        assert resolve_carrier_shape(MagicMock()) == "reminder"
+        assert resolve_carrier(MagicMock()).shape == "reminder"
 
     def test_reminder_merges_into_a_trailing_human_message(self):
         """The Claude Code shape: one message, the user's text first.
@@ -162,7 +148,7 @@ class TestCarrierShapes:
         assert len(result) == 4
         assert isinstance(result[-1], HumanMessage)
         assert result[-1].content == self.FRAMED
-        assert result[-1].additional_kwargs["lc_source"] == RUNTIME_CONTEXT_SOURCE
+        assert result[-1].additional_kwargs["lc_source"] == RUNTIME_UPDATE_SOURCE
         assert result[2].content == "result"
 
     def test_reminder_stands_alone_after_an_assistant_turn(self):
@@ -175,7 +161,7 @@ class TestCarrierShapes:
         result = self._carried([])
 
         assert len(result) == 1
-        assert result[0].additional_kwargs["lc_source"] == RUNTIME_CONTEXT_SOURCE
+        assert result[0].additional_kwargs["lc_source"] == RUNTIME_UPDATE_SOURCE
 
     def test_never_mutates_the_user_message_or_the_input_list(self):
         original = HumanMessage(content="What moved today?")
@@ -187,10 +173,6 @@ class TestCarrierShapes:
         assert original.content == "What moved today?"
         assert result is not messages
         assert result[0] is not original
-
-    def test_empty_envelope_appends_nothing(self):
-        messages = [HumanMessage(content="hi")]
-        assert compose_request(messages, "", "reminder").messages == messages
 
     def test_operator_shapes_stand_alone_and_win_over_the_reminder(self, monkeypatch):
         """A resolved channel is its own message, even behind a user turn."""
@@ -205,7 +187,7 @@ class TestCarrierShapes:
             )
             user = HumanMessage(content="hi")
 
-            shape = resolve_carrier_shape(MagicMock())
+            shape = resolve_carrier(MagicMock()).shape
             result = self._carried([user], shape)
 
             assert len(result) == 2
@@ -213,7 +195,7 @@ class TestCarrierShapes:
             carried = result[-1]
             assert isinstance(carried, SystemMessage)
             assert carried.additional_kwargs[kwarg] in (channel, "developer")
-            assert carried.additional_kwargs["lc_source"] == RUNTIME_CONTEXT_SOURCE
+            assert carried.additional_kwargs["lc_source"] == RUNTIME_UPDATE_SOURCE
             # The role is the framing: an operator message carries the bare text.
             assert carried.content == self.ENVELOPE
 
@@ -246,7 +228,7 @@ class TestDurableCarrier:
         """The Claude Code shape: harness attachments ride inside the message
         that precedes them, so a turn is one user message however many rows it
         collected."""
-        result = carry_durable_updates(self._history(), "reminder")
+        result = compose_request(self._history(), Carrier("reminder")).messages
 
         assert len(result) == 1
         blocks = result[0].content
@@ -258,7 +240,7 @@ class TestDurableCarrier:
 
     def test_reminder_stands_alone_with_no_preceding_human_message(self):
         """After an assistant turn there is nothing to ride inside."""
-        result = carry_durable_updates([AIMessage(content="done"), self._row("body")], "reminder")
+        result = compose_request([AIMessage(content="done"), self._row("body")], Carrier("reminder")).messages
 
         assert len(result) == 2
         carried = result[-1]
@@ -274,7 +256,7 @@ class TestDurableCarrier:
         import src.llms.operator_channel as oc
 
         monkeypatch.setattr(oc, "resolve_operator_channel", lambda model: shape)
-        result = carry_durable_updates(self._history(), shape)
+        result = compose_request(self._history(), Carrier(shape)).messages
 
         assert len(result) == 2
         assert isinstance(result[0], HumanMessage)
@@ -288,9 +270,9 @@ class TestDurableCarrier:
         assert ENVELOPE_OPEN not in carried.content[0]["text"]
 
     @pytest.mark.parametrize("shape", ["system", "developer"])
-    def test_the_envelope_coalesces_into_the_trailing_row_message(self, shape):
-        """A row followed by the envelope is still one operator message."""
-        result = compose_request(self._history(), self.ENVELOPE, shape).messages
+    def test_a_stamp_coalesces_into_the_trailing_row_message(self, shape):
+        """The turn's rows followed by its live-price row are still one operator message."""
+        result = compose_request([*self._history(), _stamp_row(self.ENVELOPE)], Carrier(shape)).messages
 
         assert len(result) == 2
         blocks = result[-1].content
@@ -300,7 +282,7 @@ class TestDurableCarrier:
     def test_a_row_that_renders_empty_is_dropped(self):
         """An empty message is a malformed request on several providers."""
         row = self._row("body").model_copy(update={"content": "   "})
-        result = carry_durable_updates([HumanMessage(content="hi"), row], "reminder")
+        result = compose_request([HumanMessage(content="hi"), row], Carrier("reminder")).messages
 
         assert len(result) == 1
         assert result[0].content == "hi"
@@ -311,7 +293,7 @@ class TestDurableCarrier:
         snapshot = [(m, m.content) for m in messages]
 
         for shape in ("reminder", "system", "developer"):
-            result = carry_durable_updates(messages, shape)
+            result = compose_request(messages, Carrier(shape)).messages
             assert result is not messages
             assert [(m, m.content) for m in messages] == snapshot
 
@@ -326,7 +308,7 @@ class TestDurableCarrier:
             self._row("write your notes", kind="notes_due"),
         ]
 
-        result = carry_durable_updates(messages, shape)
+        result = compose_request(messages, Carrier(shape)).messages
 
         assert len(result) == 4
         assert result[2] == tool_result
@@ -337,98 +319,94 @@ class TestDurableCarrier:
 
     def test_a_history_without_rows_is_left_alone(self):
         messages = [HumanMessage(content="hi"), AIMessage(content="ok")]
-        assert carry_durable_updates(messages, "reminder") == messages
+        assert compose_request(messages, Carrier("reminder")).messages == messages
 
 
 class TestHistoryBreakpoint:
     """Breakpoint 4 goes on the newest content the next call still carries.
 
-    The composer places the envelope and names the site in one pass, so the pin
-    is where the carrier says it is rather than where a second reading of the
-    finished list guesses it should be.
+    Every row is history, so the newest block is one the next call sends again,
+    and the pin goes on it unless it is an operator message, whose breakpoint
+    is unproven.
     """
 
     MARK = ("cache_control", {"type": "ephemeral"})
 
     def _composed(self, messages: list, shape: str = "reminder"):
         """The composed request with the marker applied at the site it named."""
-        composed = compose_request(messages, "<envelope>", shape)
+        composed = compose_request(messages, Carrier(shape))
         if composed.pin is not None:
             apply_breakpoint(composed.messages, composed.pin, *self.MARK)
         return composed
 
-    def test_merged_shape_pins_the_users_own_block(self):
-        """The envelope block trails the marker, exactly as a transient should."""
-        composed = self._composed([HumanMessage(content="hello")])
+    def test_a_merged_stamp_trails_the_marker(self):
+        """The next call leaves the stamp out, so the pin goes on the user's
+        own block before it."""
+        composed = self._composed([HumanMessage(content="hello"), _stamp_row("<stamp>")])
 
         assert composed.pin == PinSite(0, 0)
         blocks = composed.messages[0].content
         assert blocks[0]["cache_control"] == {"type": "ephemeral"}
-        assert blocks[1]["text"] == frame_reminder("<envelope>")
+        assert blocks[1]["text"] == frame_reminder("<stamp>")
         assert "cache_control" not in blocks[1]
 
-    def test_merged_shape_pins_the_last_user_block_of_several(self):
+    def test_a_merged_durable_row_takes_the_marker(self):
+        """A row the next call sends again is the newest history block."""
+        row = build_update_message(
+            DurableUpdate(kind="memo_changed", schema_version=1, text="3 memos now")
+        )
+        composed = self._composed([HumanMessage(content="hello"), row])
+
+        assert composed.pin == PinSite(0, 1)
+        assert composed.messages[0].content[1]["cache_control"] == {"type": "ephemeral"}
+
+    def test_the_pin_walks_back_past_a_message_with_no_text(self):
+        """An image-only user message cannot carry a marker, so the pin moves to
+        the last message that can."""
+        image = {"type": "image", "source": {"type": "url", "url": "x://y"}}
         composed = self._composed(
             [
-                HumanMessage(
-                    content=[
-                        {"type": "text", "text": "a"},
-                        {"type": "text", "text": "b"},
-                    ]
-                )
+                HumanMessage(content="hello"),
+                _stamp_row("<stamp>"),
+                AIMessage(content="earlier"),
+                HumanMessage(content=[image]),
             ]
         )
 
-        blocks = composed.messages[0].content
-        assert "cache_control" not in blocks[0]
-        assert blocks[1]["cache_control"] == {"type": "ephemeral"}
-        assert "cache_control" not in blocks[2]
-
-    def test_merged_shape_walks_back_when_the_message_has_no_other_text(self):
-        """An image-only user message cannot carry a marker, so the pin moves to
-        the last message that can rather than onto the envelope."""
-        image = {"type": "image", "source": {"type": "url", "url": "x://y"}}
-        composed = self._composed(
-            [AIMessage(content="earlier"), HumanMessage(content=[image])]
-        )
-
-        assert composed.pin == PinSite(0, None)
+        assert composed.pin == PinSite(1, None)
         messages = composed.messages
-        assert messages[0].content[-1]["cache_control"] == {"type": "ephemeral"}
-        assert messages[1].content[-1]["text"] == frame_reminder("<envelope>")
-        assert "cache_control" not in messages[1].content[-1]
+        assert messages[1].content[-1]["cache_control"] == {"type": "ephemeral"}
+        assert "cache_control" not in messages[2].content[-1]
 
-    def test_standalone_carrier_pins_the_message_before_the_envelope(self):
-        """After a tool batch the envelope is a message of its own, so the
-        marker goes on the last history message instead of inside one."""
+    def test_a_standalone_stamp_after_a_tool_batch_trails_the_marker(self):
+        """After a tool batch the stamp is a message of its own, which the next
+        call leaves out, so the pin goes on the tool result before it."""
         composed = self._composed(
             [
                 HumanMessage(content="hello"),
                 AIMessage(content=""),
                 ToolMessage(content="result", tool_call_id="call_a"),
+                _stamp_row("<stamp>"),
             ]
         )
 
         messages = composed.messages
         assert len(messages) == 4
         assert composed.pin == PinSite(2, None)
-        assert messages[2].content[-1]["cache_control"] == {"type": "ephemeral"}
-        assert messages[3].content == frame_reminder("<envelope>")
-        assert messages[3].additional_kwargs["lc_source"] == RUNTIME_CONTEXT_SOURCE
+        assert messages[3].content == frame_reminder("<stamp>")
+        assert messages[3].additional_kwargs["lc_source"] == RUNTIME_UPDATE_SOURCE
 
     def test_a_standalone_row_can_take_the_marker(self):
-        """A row is history the carrier only re-shaped, not transient text."""
+        """A row is history the carrier only re-shaped."""
         row = build_update_message(
             DurableUpdate(kind="memo_changed", schema_version=1, text="3 memos now")
         )
         composed = self._composed([AIMessage(content="done"), row])
 
-        # The envelope merged into the standalone row, so the row's block takes it.
-        assert composed.pin == PinSite(1, 0)
-        blocks = composed.messages[1].content
-        assert "3 memos now" in blocks[0]["text"]
-        assert blocks[0]["cache_control"] == {"type": "ephemeral"}
-        assert "cache_control" not in blocks[1]
+        assert composed.pin == PinSite(1, None)
+        block = composed.messages[1].content[-1]
+        assert "3 memos now" in block["text"]
+        assert block["cache_control"] == {"type": "ephemeral"}
 
     @pytest.mark.parametrize("shape", ["system", "developer"])
     def test_an_operator_message_is_skipped_rather_than_pinned(self, shape):
@@ -443,13 +421,12 @@ class TestHistoryBreakpoint:
         assert messages[0].content[-1]["cache_control"] == {"type": "ephemeral"}
         assert all("cache_control" not in b for b in messages[1].content)
 
-    def test_nothing_is_pinned_when_only_the_envelope_could_take_it(self):
-        """A boundary ending in the envelope is one the next call never reads
-        back, so it is worth less than the breakpoint it spends."""
-        composed = self._composed([])
+    @pytest.mark.parametrize("shape", ["system", "developer"])
+    def test_nothing_is_pinned_when_only_an_operator_message_could_take_it(self, shape):
+        composed = self._composed([_stamp_row("<stamp>")], shape)
 
         assert composed.pin is None
-        assert composed.messages[0].content == frame_reminder("<envelope>")
+        assert isinstance(composed.messages[0], SystemMessage)
 
 
 class TestOperatorWindow:
@@ -468,7 +445,7 @@ class TestOperatorWindow:
     ):
         import src.llms.operator_channel as oc
         from langchain.agents.middleware.types import ModelRequest
-        from ptc_agent.agent.middleware.runtime_context.tail import TailEnvelopeMiddleware
+        from ptc_agent.agent.middleware.runtime_context.tail import RowCarrierMiddleware
 
         monkeypatch.setattr(oc, "resolve_operator_channel", lambda model: channel)
         seen: dict = {}
@@ -486,9 +463,7 @@ class TestOperatorWindow:
                 created_at=datetime(2026, 4, 5, 12, 0, tzinfo=UTC),
             )
         )
-        await TailEnvelopeMiddleware(
-            now=datetime(2026, 4, 5, 12, 0, tzinfo=UTC), guidance="lean"
-        ).awrap_model_call(
+        await RowCarrierMiddleware().awrap_model_call(
             ModelRequest(
                 model=MagicMock(),
                 messages=[HumanMessage(content="hi"), row],
@@ -534,7 +509,7 @@ class TestRequestLevelMarker:
     async def test_anthropic_request_marker_is_dropped_when_the_pin_is_placed(self, monkeypatch):
         import src.llms.operator_channel as oc
         from langchain_anthropic import ChatAnthropic
-        from ptc_agent.agent.middleware.runtime_context.tail import TailEnvelopeMiddleware
+        from ptc_agent.agent.middleware.runtime_context.tail import RowCarrierMiddleware
 
         monkeypatch.setattr(oc, "resolve_operator_channel", lambda model: None)
         seen: dict = {}
@@ -545,9 +520,7 @@ class TestRequestLevelMarker:
             return MagicMock()
 
         model = ChatAnthropic(model="claude-opus-5", api_key="x")
-        await TailEnvelopeMiddleware(
-            now=datetime(2026, 4, 5, 12, 0, tzinfo=UTC), guidance="lean"
-        ).awrap_model_call(
+        await RowCarrierMiddleware().awrap_model_call(
             self._request(model, {"cache_control": {"type": "ephemeral"}, "max_tokens": 9}),
             handler,
         )
@@ -564,7 +537,7 @@ class TestRequestLevelMarker:
     @pytest.mark.asyncio
     async def test_settings_pass_through_without_a_marker(self, monkeypatch):
         import src.llms.operator_channel as oc
-        from ptc_agent.agent.middleware.runtime_context.tail import TailEnvelopeMiddleware
+        from ptc_agent.agent.middleware.runtime_context.tail import RowCarrierMiddleware
 
         monkeypatch.setattr(oc, "resolve_operator_channel", lambda model: None)
         seen: dict = {}
@@ -574,7 +547,72 @@ class TestRequestLevelMarker:
             return MagicMock()
 
         settings = {"cache_control": {"type": "ephemeral"}}
-        await TailEnvelopeMiddleware(
-            now=datetime(2026, 4, 5, 12, 0, tzinfo=UTC), guidance="lean"
-        ).awrap_model_call(self._request(MagicMock(), settings), handler)
+        await RowCarrierMiddleware().awrap_model_call(self._request(MagicMock(), settings), handler)
         assert seen["settings"] == settings
+
+
+
+class TestPerCallStamps:
+    """A stamp is true until the next user message: turn-scoped where the model
+    takes that, else left out once a user message has followed it."""
+
+    def _history(self):
+        return [
+            HumanMessage(content="go"),
+            _stamp_row("first"),
+            AIMessage(content="", tool_calls=[{"name": "Bash", "args": {}, "id": "c1"}]),
+            ToolMessage(content="ok", tool_call_id="c1"),
+            _stamp_row("second"),
+        ]
+
+    def test_a_stamp_a_user_message_followed_costs_nothing(self):
+        """The API clears it from a turn-scoped request and every other target
+        is not sent it, so compaction does not count it either."""
+        from ptc_agent.agent.middleware.compaction.measure import Estimate, message_sizes
+        from ptc_agent.agent.middleware.runtime_context.carrier import spent_stamps
+
+        history = self._history()
+        estimate = Estimate(lambda messages: sum(len(str(m.content)) for m in messages))
+
+        assert spent_stamps(history) == {id(history[1])}
+        assert estimate(history) == estimate([m for m in history if m is not history[1]])
+        # Newest first: the turn's answer onward, then what came before it.
+        assert list(message_sizes(history, estimate)) == [6, 2, 0, 0, 2]
+
+    def test_turn_scoped_sends_every_stamp_as_its_own_cleared_message(self):
+        result = compose_request(self._history(), Carrier("system", turn_scoped=True)).messages
+
+        stamps = [m for m in result if isinstance(m, SystemMessage)]
+        assert [m.content for m in stamps] == ["first", "second"]
+        assert all(m.additional_kwargs["clear_at"] == "next_user_message" for m in stamps)
+
+    def test_a_turn_scoped_stamp_never_coalesces_with_a_row(self):
+        row = build_update_message(
+            DurableUpdate(kind="memo_changed", schema_version=1, text="3 memos now")
+        )
+        result = compose_request(
+            [HumanMessage(content="go"), row, _stamp_row("stamp")],
+            Carrier("system", turn_scoped=True),
+        ).messages
+
+        assert len(result) == 3
+        assert "clear_at" not in result[1].additional_kwargs
+        assert result[2].additional_kwargs["clear_at"] == "next_user_message"
+
+    def test_a_stamp_no_answer_followed_is_left_out(self):
+        """Directly before a user message the API refuses it, and no thinking
+        was produced behind it."""
+        messages = [HumanMessage(content="go"), _stamp_row("stamp"), HumanMessage(content="again")]
+
+        result = compose_request(messages, Carrier("system", turn_scoped=True)).messages
+
+        assert [m.content for m in result] == ["go", "again"]
+
+    @pytest.mark.parametrize("shape", ["reminder", "system", "developer"])
+    def test_without_turn_scope_only_the_newest_stamp_is_sent(self, shape):
+        result = compose_request(self._history(), Carrier(shape)).messages
+
+        text = str([m.content for m in result])
+        assert "second" in text
+        assert "first" not in text
+

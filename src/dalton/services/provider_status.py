@@ -269,10 +269,13 @@ async def get_providers_status(*, user_id: str) -> dict[str, Any]:
 
         if is_oauth:
             try:
-                from src.server.database.oauth_tokens import get_oauth_status
+                # Unified projection: a connection is configured when its state
+                # says connected, not merely because a token row exists.
+                from src.server.services.oauth_health import connection_state
+                from src.server.database.oauth_tokens import get_oauth_connection
 
-                st = await get_oauth_status(user_id, prov) or {}
-                configured = bool(st.get("connected"))
+                st = (await get_oauth_connection(user_id, prov)) or {}
+                configured = connection_state(st) == "connected"
                 expires_at = st.get("expires_at")
                 seconds_left: int | None = None
                 expires_iso: str | None = None
@@ -294,13 +297,22 @@ async def get_providers_status(*, user_id: str) -> dict[str, Any]:
                 }
                 if prov == "xai-oauth" and configured:
                     try:
-                        from src.dalton.llm.providers.xai_grok.oauth import (
-                            fetch_xai_billing,
-                            get_valid_token as get_xai_valid_token,
+                        # The unified refresh protocol, not the removed
+                        # per-provider refresher: refreshes under the shared
+                        # lock and saves conditionally, so a status-page read
+                        # cannot race a disconnect or reconnect (DALTON-HOOK(oauth-dispatch)).
+                        from src.dalton.llm.providers.xai_grok.oauth import fetch_xai_billing
+                        from src.server.services.oauth_health import (
+                            OAuthReauthRequired,
+                            OAuthRefreshUnavailable,
+                            valid_token,
                         )
 
-                        valid_tok = await get_xai_valid_token(user_id)
-                        access_tok = (valid_tok or {}).get("access_token")
+                        try:
+                            valid_tok = await valid_token(user_id, prov)
+                        except (OAuthReauthRequired, OAuthRefreshUnavailable):
+                            valid_tok = None
+                        access_tok = valid_tok.access_token if valid_tok else None
                         if access_tok:
                             quota_info = await fetch_xai_billing(str(access_tok))
                             credential_info["quota"] = quota_info

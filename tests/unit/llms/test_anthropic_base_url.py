@@ -107,7 +107,7 @@ class TestKeyTest:
         ["https://example.test/anthropic/v1", "https://example.test/anthropic/v1/"],
     )
     async def test_probe_does_not_double_the_version(self, saved):
-        from src.server.app.api_keys import _test_anthropic_key
+        from src.server.services.llm.key_probe import _test_anthropic_key
 
         seen = []
 
@@ -116,7 +116,7 @@ class TestKeyTest:
             return httpx.Response(200, json={"data": [{"id": "m1"}]})
 
         result = await _test_anthropic_key(
-            "test-key", "m1", saved, 5.0, transport=httpx.MockTransport(handler)
+            "test-key", "m1", {"sdk": "anthropic"}, saved, 5.0, transport=httpx.MockTransport(handler)
         )
 
         assert seen == ["/anthropic/v1/models"]
@@ -124,7 +124,7 @@ class TestKeyTest:
 
     @pytest.mark.asyncio
     async def test_inference_fallback_posts_to_the_messages_path(self):
-        from src.server.app.api_keys import _test_anthropic_key
+        from src.server.services.llm.key_probe import _test_anthropic_key
 
         seen = []
 
@@ -135,6 +135,7 @@ class TestKeyTest:
         await _test_anthropic_key(
             "test-key",
             "m1",
+            {"sdk": "anthropic"},
             "https://example.test/anthropic/v1",
             5.0,
             transport=httpx.MockTransport(handler),

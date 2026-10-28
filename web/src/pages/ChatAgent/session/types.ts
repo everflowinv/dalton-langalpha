@@ -116,7 +116,7 @@ interface SSEEvent {
  */
 export type ModelStatus =
   | { kind: 'retrying'; model: string; attempt: number; maxRetries: number }
-  | { kind: 'fallback'; fromModel: string; toModel: string };
+  | { kind: 'fallback'; fromModel: string; toModel: string; paidBy?: string; provider?: string };
 
 /**
  * Suggestion surfaced as a pill above the chat input after a turn was
@@ -126,6 +126,10 @@ export type ModelStatus =
 export interface FallbackSuggestion {
   fromModel: string;
   toModel: string;
+  /** Who paid for `toModel`'s call (`billing_type`), where the server said. */
+  paidBy?: string;
+  /** The provider that call went through, which names a sign-in's plan. */
+  provider?: string;
 }
 
 

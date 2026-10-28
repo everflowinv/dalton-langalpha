@@ -1,11 +1,13 @@
-"""moomoo's two order families, and the two envelopes they answer in.
+"""moomoo's three order families, and the three envelopes they answer in.
 
-One server carries both: the live tools take ``exchange.code`` strings and
-answer ``{"s": "ok", "d": ...}``, the simulated ones take integer markets and
-sides and answer ``{"ret_code": 0, "data": ...}``. A business failure arrives
-inside a ToolMessage whose status is "success" in both families -- live as
-``{"s": "error", "errcode": 28, "errmsg": ...}``, paper as ``ret_code: -5`` --
-which is why the envelope decides the outcome and the tool status never does.
+One server carries all three: the live tools take ``exchange.code`` strings
+and answer ``{"s": "ok", "d": ...}``, the simulated ones take integer markets
+and sides and answer ``{"ret_code": 0, "data": ...}``, and the crypto ones take
+a pair such as ``BTCUSD`` and answer ``{"code": 0, "msg": ..., "data": ...}``.
+A business failure arrives inside a ToolMessage whose status is "success" in
+every family -- live as ``{"s": "error", "errcode": 28, "errmsg": ...}``, paper
+as ``ret_code: -5``, crypto as a non-zero ``code`` -- which is why the envelope
+decides the outcome and the tool status never does.
 
 A third answer is not an envelope at all: a live replace, cancel or confirm
 whose upstream call returned no payload comes back as the bare word ``no
@@ -17,8 +19,10 @@ The live order object has its own vocabulary, which is not the request's:
 ``last_err_msg``, and the instrument as one ``exchange.code`` string with no
 separate exchange field. :func:`_live_row` is the only place that knows it.
 
-No moomoo response has a published schema, so every mapping below is empirical
-and anything unrecognized is carried out in ``raw`` and ``raw_status``.
+Only the crypto family's answers have a published schema, moomoo's crypto
+trading API, whose envelope and order object the MCP tools return. Every other
+mapping below is empirical, and anything unrecognized is carried out in ``raw``
+and ``raw_status``.
 """
 
 from __future__ import annotations
@@ -56,7 +60,9 @@ from src.server.services.brokerage_orders.models import (
     EquityRef,
     Failure,
     FutureRef,
+    CryptoRef,
     InstrumentRef,
+    Money,
     OpaqueRef,
     OptionRef,
     OrderMode,
@@ -73,6 +79,12 @@ VENDOR = "moomoo"
 # list that keeps both.
 LIVE_HISTORY = "account_orders_history"
 PAPER_HISTORY = "sim_trade_history_order_list"
+# Crypto settles by id instead. Its two lists split the book -- the active one
+# carries only open orders and the history only ended ones -- so an order can
+# be missing from either while it exists, and absence from a list is the one
+# thing reconciliation acts on. The detail read names the order whatever its
+# state, which needs the id the place answered with.
+CRYPTO_DETAIL = "crypto_account_order_detail"
 
 _SIDES = {
     "BUY": "buy",
@@ -104,6 +116,38 @@ _SESSIONS = {
     "ALL_DAY": "all_day",
 }
 _PAPER_SESSIONS = {1: "rth", 2: "rth_plus_ext"}
+
+# moomoo's conditional crypto orders are the stop and if-touched orders under
+# their trading names: a stop loss triggers as the price moves against the
+# order, a take profit as it moves its way, and each then sends a market or a
+# limit order. Its one other time in force, ``TIF_IOC``, has no word here and
+# stays in ``extras`` under its own name.
+_CRYPTO_ORDER_TYPES = {
+    "LIMIT": "limit",
+    "MARKET": "market",
+    "STOP_LOSS_LIMIT": "stop_limit",
+    "STOP_LOSS_MARKET": "stop",
+    "TAKE_PROFIT_LIMIT": "limit_if_touched",
+    "TAKE_PROFIT_MARKET": "market_if_touched",
+}
+_CRYPTO_TIF = {"TIF_GTC": "gtc"}
+
+# The crypto order states as moomoo's naming dictionary publishes them.
+# ``PENDING_TRIGGER`` is a conditional order resting until its price, as
+# working as a resting limit; ``PENDING_NEW`` is accepted and not yet on the
+# book, which is IBKR's reading of the same word.
+_CRYPTO_STATUSES = {
+    "PENDING_TRIGGER": AttemptStatus.WORKING,
+    "PENDING_NEW": AttemptStatus.SUBMITTED,
+    "NEW": AttemptStatus.WORKING,
+    "PARTIAL_FILLED": AttemptStatus.PARTIALLY_FILLED,
+    "FILLED": AttemptStatus.FILLED,
+    "CANCELED": AttemptStatus.CANCELLED,
+    "CANCELLED_PART": AttemptStatus.CANCELLED,
+    "EXPIRED": AttemptStatus.EXPIRED,
+    "REJECTED": AttemptStatus.REJECTED_BY_VENDOR,
+    "FAILED": AttemptStatus.REJECTED_BY_VENDOR,
+}
 
 _OPTION_VENUES = frozenset({"CBOE"})
 _FUTURE_VENUES = frozenset({"CME", "CBOT", "NYMEX", "COMEX", "HKFE"})
@@ -444,6 +488,81 @@ def _paper_amend(args: Mapping[str, Any]) -> BrokerOrder:
     )
 
 
+def _crypto_trigger(args: Mapping[str, Any], consumed: set[str]) -> Decimal | None:
+    """A conditional order's trigger price, the one field ``conditional_info`` has.
+
+    The object counts as read only when the trigger is all it carries, so a
+    field moomoo adds to it later reaches ``extras`` rather than vanishing.
+    """
+    info = args.get("conditional_info")
+    if not isinstance(info, Mapping):
+        return None
+    trigger = as_decimal(info.get("trigger_price"))
+    if trigger is not None and set(info) == {"trigger_price"}:
+        consumed.add("conditional_info")
+    return trigger
+
+
+def _crypto_place(args: Mapping[str, Any]) -> BrokerOrder:
+    """A crypto order, sized by a quantity of the coin or by an amount of cash.
+
+    ``cash_order_qty`` is in the pair's quote currency, which no field names,
+    so the amount is carried without one rather than with a guess.
+    """
+    consumed = {"acc_id", "symbol", "side", "qty", "cash_order_qty", "price"}
+    order_type = _CRYPTO_ORDER_TYPES.get(str(args.get("ord_type") or "").strip().upper())
+    tif = _CRYPTO_TIF.get(str(args.get("time_in_force") or "").strip().upper())
+    # A value the vocabulary has no word for is not consumed, so it reaches
+    # ``extras`` rather than disappearing.
+    if order_type is not None:
+        consumed.add("ord_type")
+    if tif is not None:
+        consumed.add("time_in_force")
+    pair = as_text(args.get("symbol"))
+    amount = as_decimal(args.get("cash_order_qty"))
+    return BrokerOrder(
+        vendor=VENDOR,
+        account_ref=str(args.get("acc_id") or ""),
+        mode=OrderMode.LIVE,
+        asset_class="crypto",
+        instrument=CryptoRef(pair=pair.upper()) if pair else None,
+        side=_SIDES.get(str(args.get("side") or "").strip().upper()),
+        qty=as_decimal(args.get("qty")),
+        notional=Money(amount=amount) if amount is not None else None,
+        order_type=order_type,
+        limit_price=as_decimal(args.get("price")),
+        stop_price=_crypto_trigger(args, consumed),
+        time_in_force=tif,
+        extras=extras(args, consumed),
+        raw=dict(args),
+    )
+
+
+def _crypto_amend(args: Mapping[str, Any]) -> BrokerOrder:
+    """A crypto modify or cancel, naming its order as ``orderId``.
+
+    A modify has to send a price even for a conditional market order, and
+    moomoo's own instruction for that case is to send 0, so a zero price is no
+    limit and stays in ``extras`` as sent.
+    """
+    consumed = {"acc_id", "orderId", "qty"}
+    price = as_decimal(args.get("price"))
+    if price:
+        consumed.add("price")
+    return BrokerOrder(
+        vendor=VENDOR,
+        account_ref=str(args.get("acc_id") or ""),
+        mode=OrderMode.LIVE,
+        asset_class="crypto",
+        target_ref=as_text(args.get("orderId")),
+        qty=as_decimal(args.get("qty")),
+        limit_price=price or None,
+        stop_price=_crypto_trigger(args, consumed),
+        extras={**target_ids(args, ("orderId",)), **extras(args, consumed)},
+        raw=dict(args),
+    )
+
+
 def _order_payload(data: Any, request: BrokerOrder | None) -> dict[str, Any]:
     """The one order object in a response, whichever way the vendor wrapped it."""
     if isinstance(data, Mapping):
@@ -728,6 +847,64 @@ def _unanswered(paper: bool, text: str, request: BrokerOrder | None) -> OrderOut
     )
 
 
+def _crypto_outcome(
+    envelope: Mapping[str, Any] | None,
+    text: str,
+    action: OrderAction | None,
+    request: BrokerOrder | None,
+) -> OrderOutcome:
+    """A crypto command's answer, which carries an order id and never a state.
+
+    A place and a modify answer ``{"order_id": ...}`` and a cancel answers an
+    empty object, so ``code`` 0 is the whole of what the command says: the
+    request was taken. An id stays the one the order keeps for life, so a
+    modify or a cancel names the order it acted on.
+    """
+    named = request.target_ref if request else None
+    if envelope is None:
+        return OrderOutcome(
+            status=AttemptStatus.UNKNOWN,
+            raw_status=as_text(text),
+            vendor_order_id=named,
+            raw={"text": text} if text else {},
+        )
+    data = envelope.get("data")
+    order_id = (as_text(data.get("order_id")) if isinstance(data, Mapping) else None) or named
+    code = as_int(envelope.get("code"))
+    if code is None:
+        return OrderOutcome(
+            status=AttemptStatus.UNKNOWN, vendor_order_id=order_id, raw=dict(envelope)
+        )
+    if code != 0:
+        return _vendor_rejection(
+            code=envelope.get("code"),
+            message=envelope.get("msg"),
+            route={},
+            envelope=envelope,
+            vendor_order_id=named,
+        )
+    return OrderOutcome(
+        status=_cancelled_when(action), vendor_order_id=order_id, raw=dict(envelope)
+    )
+
+
+def _crypto_row(row: Mapping[str, Any], order_id: str) -> OrderOutcome:
+    """One crypto order object, in the published ``OrderItem`` vocabulary."""
+    raw_status = row.get("ord_status")
+    return OrderOutcome(
+        status=_CRYPTO_STATUSES.get(
+            str(raw_status or "").strip().upper(), AttemptStatus.UNKNOWN
+        ),
+        raw_status=as_text(raw_status),
+        vendor_order_id=order_id,
+        filled_qty=as_decimal(row.get("cum_qty")),
+        avg_fill_price=as_decimal(row.get("avg_px")),
+        created_at=_micros(row.get("create_time")),
+        updated_at=_micros(row.get("update_time")),
+        raw=dict(row),
+    )
+
+
 def _live_code(instrument: InstrumentRef | None) -> str | None:
     """An instrument back in the ``exchange.code`` spelling moomoo lists it as."""
     venue = getattr(instrument, "venue", None)
@@ -985,6 +1162,28 @@ def _live_status(query: StatusQuery, envelope: Mapping[str, Any]) -> list[Vendor
     return listed
 
 
+def _crypto_status(envelope: Mapping[str, Any]) -> list[VendorOrder]:
+    """The orders a crypto detail read returned, each under the id it was asked by."""
+    if as_int(envelope.get("code")) != 0:
+        raise StatusReadError(str(envelope.get("msg") or envelope.get("code")))
+    rows = _status_rows(envelope.get("data"))
+    if rows is None:
+        raise StatusReadError("no order list")
+    listed = []
+    for row in rows:
+        order_id = as_text(row.get("order_id")) if isinstance(row, Mapping) else None
+        if order_id is None:
+            raise StatusReadError("listed order with no id")
+        listed.append(
+            VendorOrder(
+                vendor_order_id=order_id,
+                outcome=_crypto_row(row, order_id),
+                placed_at=_micros(row.get("create_time")),
+            )
+        )
+    return listed
+
+
 class MoomooOrderAdapter(OrderAdapter):
     """The one place that knows ``ret_code`` from ``s``."""
 
@@ -996,6 +1195,8 @@ class MoomooOrderAdapter(OrderAdapter):
             return None
         data = dict(args or {})
         placing = entry.action is OrderAction.PLACE
+        if entry.asset_class == "crypto":
+            return _crypto_place(data) if placing else _crypto_amend(data)
         if entry.mode is OrderMode.PAPER:
             return _paper_place(data) if placing else _paper_amend(data)
         return _live_place(data) if placing else _live_amend(data, entry.action)
@@ -1008,6 +1209,8 @@ class MoomooOrderAdapter(OrderAdapter):
         request: BrokerOrder | None,
     ) -> OrderOutcome:
         entry = order_tool(VENDOR, tool)
+        if entry is not None and entry.asset_class == "crypto":
+            return _crypto_outcome(envelope, text, entry.action, request)
         declared_paper = entry is not None and entry.mode is OrderMode.PAPER
         if envelope is None:
             return _unanswered(declared_paper, text, request)
@@ -1046,6 +1249,13 @@ class MoomooOrderAdapter(OrderAdapter):
     ) -> StatusQuery | None:
         if order is None or not order.account_ref:
             return None
+        if order.asset_class == "crypto":
+            order_id = vendor_order_id or order.target_ref
+            if not order_id:
+                return None
+            return StatusQuery(
+                CRYPTO_DETAIL, {"acc_id": order.account_ref, "orderId": order_id}
+            )
         if order.mode == OrderMode.PAPER:
             market = _paper_market(order, route)
             if market is None:
@@ -1076,10 +1286,13 @@ class MoomooOrderAdapter(OrderAdapter):
             raise StatusReadError(text or "no envelope")
         if query.tool == PAPER_HISTORY:
             return _paper_status(query, envelope)
+        if query.tool == CRYPTO_DETAIL:
+            return _crypto_status(envelope)
         return _live_status(query, envelope)
 
     def next_page(self, query: StatusQuery, body: ResultBody) -> StatusQuery | None:
-        """Both families page, each in its own words.
+        """Both list families page, each in its own words; a crypto detail
+        read answers whole.
 
         Paper answers ``{"pagination": {"has_more": bool, "next_key": str}}``
         beside ``data`` and takes the key back as ``next_key``; live answers
@@ -1088,7 +1301,7 @@ class MoomooOrderAdapter(OrderAdapter):
         observed last page.
         """
         envelope, _ = body_parts(body)
-        if envelope is None:
+        if envelope is None or query.tool == CRYPTO_DETAIL:
             return None
         if query.tool == PAPER_HISTORY:
             paging = envelope.get("pagination")

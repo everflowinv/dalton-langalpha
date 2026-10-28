@@ -1,6 +1,9 @@
+import { RotateCw } from 'lucide-react';
 import i18n from '@/i18n';
 import { toast } from '@/components/ui/use-toast';
 import { StaleBuildReloadAction, StaleBuildToastText } from '@/components/StaleBuildToastCopy';
+import { reloadHeld, requestsInFlight } from '@/lib/reloadHolds';
+import { authGeneration } from '@/lib/authToken';
 
 /**
  * Detection and reporting for "this tab is running a build the server no longer
@@ -94,6 +97,16 @@ let warned = false;
 let lastChecked = 0;
 let pendingToast: ReturnType<typeof setTimeout> | null = null;
 let activeToast: { dismiss: () => void } | null = null;
+/** The server answered with another build, not just an asset failing to load. */
+let serverMovedOn = false;
+
+/** The build a section switch last reloaded away from, kept across that reload. */
+const SWITCH_RELOAD_KEY = '__la_switch_reload__';
+/** How long a switch reload waits for the page's requests to settle. */
+const SETTLE_MS = 2000;
+const SETTLE_POLL_MS = 100;
+/** A switch reload is waiting; a quicker second switch rides on it. */
+let settling = false;
 
 export function markBooted(): void {
   window.__LA_BOOTED__ = true;
@@ -103,6 +116,11 @@ export function markBooted(): void {
   // dead end that the first one already used up.
   try {
     sessionStorage.removeItem('__la_asset_recovery__');
+    // A switch reload that reached another build is done with: kept, it would
+    // block the next one if the tab ever comes back to the build it names.
+    if (sessionStorage.getItem(SWITCH_RELOAD_KEY) !== currentBuild()) {
+      sessionStorage.removeItem(SWITCH_RELOAD_KEY);
+    }
   } catch {
     // Storage disabled. index.html already declines to recover in that case.
   }
@@ -205,6 +223,7 @@ export function reportStaleBuild(reason: string, options?: { silent?: boolean })
         // Components, not strings: the toast can outlive a language switch.
         title: <StaleBuildToastText part="title" />,
         description: <StaleBuildToastText part="description" />,
+        icon: <RotateCw className="h-4 w-4 text-(--color-accent-primary)" />,
         // Overrides the Toaster's 3s default (spread onto the Radix Toast). A
         // notice that disappears before the user looks up is not a notice.
         duration: Infinity,
@@ -219,13 +238,67 @@ export function reportStaleBuild(reason: string, options?: { silent?: boolean })
 }
 
 /**
+ * Take the new build on a switch between app sections, without asking. The
+ * switch already unmounts the page being left, and a turn keeps running on the
+ * server and resumes on load, so loading the next page fresh costs the user
+ * nothing the switch did not. The toast stays the way out for someone who never
+ * switches. `idle` reports work only the caller sees (React Query's mutations).
+ */
+export function reloadIfStale(idle: () => boolean = () => true): void {
+  // Only on the server's word. A chunk that failed to load also reads as a
+  // stale build, and so does one a flaky network dropped on a current build;
+  // that case keeps its toast rather than reloading into an offline page.
+  if (!serverMovedOn || settling) return;
+  settling = true;
+  // A write the page being left still has out lands first, then the reload.
+  // Not once the user has started on the page that opened: what they type or
+  // pick there is not saved anywhere yet. And not past a short wait: a request
+  // that slow is a transfer, which the next switch can try again after.
+  const deadline = Date.now() + SETTLE_MS;
+  let touched = false;
+  const touch = () => {
+    touched = true;
+  };
+  const inputs = ['pointerdown', 'keydown'] as const;
+  for (const name of inputs) window.addEventListener(name, touch, true);
+  const stop = () => {
+    settling = false;
+    for (const name of inputs) window.removeEventListener(name, touch, true);
+  };
+  const settle = () => {
+    if (touched || reloadHeld() || !navigator.onLine) return stop();
+    if (requestsInFlight(authGeneration()) || !idle()) {
+      if (Date.now() < deadline) setTimeout(settle, SETTLE_POLL_MS);
+      else stop();
+      return;
+    }
+    stop();
+    const mine = currentBuild();
+    if (!mine) return;
+    try {
+      // A reload that came back on the same build (an edge still serving the
+      // old shell) would otherwise repeat on every switch. Without storage
+      // there is no way to tell, so the toast alone has to do.
+      if (sessionStorage.getItem(SWITCH_RELOAD_KEY) === mine) return;
+      sessionStorage.setItem(SWITCH_RELOAD_KEY, mine);
+    } catch {
+      return;
+    }
+    window.location.reload();
+  };
+  settle();
+}
+
+/**
  * Ask the server which build it is serving. Anything unclear (offline, a
  * proxy's HTML error page, a dev server with no version.json) resolves to
  * "unknown" and does nothing — never to "you are behind".
  */
 export async function checkForNewBuild(): Promise<void> {
   const mine = currentBuild();
-  if (!mine || notified) return;
+  // Still asked after an asset failure reported the build stale: only the
+  // server's answer lets a section switch reload on its own.
+  if (!mine || serverMovedOn) return;
 
   const now = Date.now();
   if (now - lastChecked < POLL_THROTTLE_MS) return;
@@ -259,7 +332,9 @@ export async function checkForNewBuild(): Promise<void> {
   }
   const build = (data as { build?: unknown } | null)?.build;
   if (typeof build !== 'string' || !build) return warnUnrecognized('no build id');
-  if (build !== mine) reportStaleBuild('version');
+  if (build === mine) return;
+  serverMovedOn = true;
+  reportStaleBuild('version');
 }
 
 /**
@@ -323,6 +398,7 @@ export function watchStaleBuild(): () => void {
 /** Test seam — the module-level dedupe and throttle outlive a test file. */
 export function __resetStaleBuildForTests(): void {
   notified = false;
+  serverMovedOn = false;
   warned = false;
   lastChecked = 0;
   if (pendingToast !== null) clearTimeout(pendingToast);

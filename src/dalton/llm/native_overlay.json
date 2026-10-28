@@ -528,24 +528,6 @@
         "write": "parameters.reasoning.effort"
       }
     },
-    "grok-4.7": {
-      "model_id": "grok-4.7",
-      "provider": "xai",
-      "visible": true,
-      "speed": 3,
-      "intelligence": 5,
-      "context": 500000,
-      "input_modalities": [
-        "text",
-        "image"
-      ],
-      "parameters": {
-        "include": [
-          "reasoning.encrypted_content"
-        ],
-        "store": false
-      }
-    },
     "grok-build-0.1": {
       "model_id": "grok-build-0.1",
       "provider": "xai",
@@ -564,28 +546,10 @@
         "store": false
       }
     },
-    "grok-4.3": {
-      "model_id": "grok-4.3",
-      "provider": "xai",
-      "visible": true,
-      "speed": 3,
-      "intelligence": 4,
-      "context": 1000000,
-      "input_modalities": [
-        "text",
-        "image"
-      ],
-      "parameters": {
-        "include": [
-          "reasoning.encrypted_content"
-        ],
-        "store": false
-      }
-    },
     "grok-4.7-oauth": {
       "model_id": "grok-4.7",
       "provider": "xai-oauth",
-      "display_name": "Grok 4.7 (OAuth)",
+      "display_name": "Grok 4.7",
       "visible": true,
       "speed": 3,
       "intelligence": 5,
@@ -618,7 +582,7 @@
     "grok-4.3-oauth": {
       "model_id": "grok-4.3",
       "provider": "xai-oauth",
-      "display_name": "Grok 4.3 (OAuth)",
+      "display_name": "Grok 4.3",
       "visible": true,
       "speed": 3,
       "intelligence": 4,
@@ -651,7 +615,7 @@
     "grok-4.7-build-fast-oauth": {
       "model_id": "grok-4.7-build-fast",
       "provider": "xai-oauth",
-      "display_name": "Grok 4.7 Build Fast (OAuth)",
+      "display_name": "Grok 4.7 Build Fast",
       "visible": true,
       "speed": 5,
       "intelligence": 4,
@@ -760,17 +724,6 @@
           }
         }
       },
-      "xai": {
-        "sdk": "openai",
-        "base_url": "https://api.x.ai/v1",
-        "env_key": "XAI_API_KEY",
-        "access_type": "api_key",
-        "byok_eligible": true,
-        "use_response_api": true,
-        "prompt_cache_key": true,
-        "display_name": "xAI Grok",
-        "operator_channel": "developer"
-      },
       "xai-oauth": {
         "sdk": "grok",
         "base_url": "https://cli-chat-proxy.grok.com/v1",
@@ -780,117 +733,28 @@
         "use_response_api": true,
         "prompt_cache_key": true,
         "display_name": "xAI Grok (SuperGrok OAuth)"
+      },
+      "volcengine": {
+        "env_key": "VOLCENGINE_API_KEY",
+        "access_type": "api_key",
+        "region": "cn",
+        "display_name": "Doubao",
+        "variants": {
+          "volcengine": {
+            "sdk": "openai",
+            "base_url": "https://ark.cn-beijing.volces.com/api/v3",
+            "use_response_api": true
+          },
+          "doubao-coding": {
+            "sdk": "anthropic",
+            "base_url": "https://ark.cn-beijing.volces.com/api/coding",
+            "access_type": "coding_plan"
+          }
+        }
       }
     },
     "provider_variants": {},
     "models": {
-      "xai": [
-        {
-          "id": "grok-4.7",
-          "name": "Grok 4.7",
-          "is_reasoning": true,
-          "description": "xAI's flagship Grok 4.7 reasoning model with tiered short/long-context pricing",
-          "pricing": {
-            "input_tiers": [
-              {
-                "max_tokens": 200000,
-                "rate": 2.0,
-                "cached_input": 0.5
-              },
-              {
-                "max_tokens": null,
-                "rate": 4.0,
-                "cached_input": 1.0
-              }
-            ],
-            "output_tiers": [
-              {
-                "max_tokens": 200000,
-                "rate": 6.0
-              },
-              {
-                "max_tokens": null,
-                "rate": 12.0
-              }
-            ],
-            "input_pricing_mode": "input_dependent",
-            "output_pricing_mode": "input_dependent",
-            "unit": "per_1m_tokens"
-          },
-          "context_window": 500000,
-          "max_output": 128000
-        },
-        {
-          "id": "grok-build-0.1",
-          "name": "Grok Build 0.1",
-          "is_reasoning": true,
-          "description": "xAI's coding-focused Grok Build model with tiered short/long-context pricing",
-          "pricing": {
-            "input_tiers": [
-              {
-                "max_tokens": 200000,
-                "rate": 1.0,
-                "cached_input": 0.2
-              },
-              {
-                "max_tokens": null,
-                "rate": 2.0,
-                "cached_input": 0.4
-              }
-            ],
-            "output_tiers": [
-              {
-                "max_tokens": 200000,
-                "rate": 2.0
-              },
-              {
-                "max_tokens": null,
-                "rate": 4.0
-              }
-            ],
-            "input_pricing_mode": "input_dependent",
-            "output_pricing_mode": "input_dependent",
-            "unit": "per_1m_tokens"
-          },
-          "context_window": 256000,
-          "max_output": 64000
-        },
-        {
-          "id": "grok-4.3",
-          "name": "Grok 4.3",
-          "is_reasoning": true,
-          "description": "xAI's long-context Grok 4.3 reasoning model with tiered short/long-context pricing",
-          "pricing": {
-            "input_tiers": [
-              {
-                "max_tokens": 200000,
-                "rate": 1.25,
-                "cached_input": 0.2
-              },
-              {
-                "max_tokens": null,
-                "rate": 2.5,
-                "cached_input": 0.4
-              }
-            ],
-            "output_tiers": [
-              {
-                "max_tokens": 200000,
-                "rate": 2.5
-              },
-              {
-                "max_tokens": null,
-                "rate": 5.0
-              }
-            ],
-            "input_pricing_mode": "input_dependent",
-            "output_pricing_mode": "input_dependent",
-            "unit": "per_1m_tokens"
-          },
-          "context_window": 1000000,
-          "max_output": 64000
-        }
-      ],
       "z-ai-cn-coding": [
         {
           "id": "glm-5.3",
@@ -1135,7 +999,7 @@
       "supports_reasoning_effort": false,
       "tool_calling": true
     },
-    "gpt-5.6-terra": {
+    "gpt-6.1-terra": {
       "family": "openai-gpt",
       "billing": "cash",
       "tool_calling": true
@@ -1290,7 +1154,12 @@
       "billing": "cash",
       "tool_calling": true
     },
-    "kimi-k3": {
+    "kimi-k3.1-pro": {
+      "family": "moonshot-kimi",
+      "billing": "cash",
+      "tool_calling": true
+    },
+    "kimi-k3.1-pro-highspeed": {
       "family": "moonshot-kimi",
       "billing": "cash",
       "tool_calling": true
@@ -1305,11 +1174,11 @@
       "billing": "subscription",
       "tool_calling": true
     },
-    "gpt-5.6-terra-oauth": {
+    "gpt-6.1-terra-oauth": {
       "family": "openai-gpt",
       "billing": "subscription",
       "tool_calling": true,
-      "notional_ref": "gpt-5.6-terra"
+      "notional_ref": "gpt-6.1-terra"
     },
     "gpt-6-astra-oauth": {
       "family": "openai-gpt",
@@ -1365,5 +1234,19 @@
       "notional_ref": "glm-5.3-flash-cn",
       "tool_calling": true
     }
-  }
+  },
+  "retired": [
+    {
+      "key": "grok-4.5-oauth",
+      "reason": "upstream grok-oauth (api.x.ai) inference not offered; Grok rides the pinned xai-oauth line"
+    },
+    {
+      "key": "grok-4.6-oauth",
+      "reason": "upstream grok-oauth (api.x.ai) inference not offered; Grok rides the pinned xai-oauth line"
+    },
+    {
+      "key": "grok-build-oauth",
+      "reason": "upstream grok-oauth (api.x.ai) inference not offered; Grok rides the pinned xai-oauth line"
+    }
+  ]
 }

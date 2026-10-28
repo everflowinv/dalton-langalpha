@@ -28,6 +28,7 @@ import {
 } from '@/pages/Automations/utils/status';
 import type { Automation } from '@/types/automation';
 import { registerWidget } from '../framework/WidgetRegistry';
+import { WidgetCardMeta } from '../framework/widgetCardSlots';
 import { useWidgetContextExport } from '../framework/contextSnapshot';
 import { serializeRowsToMarkdown, wrapWidgetContext } from '../framework/snapshotSerializers';
 import { AutomationsConfigSchema } from '../framework/configSchemas';
@@ -319,46 +320,18 @@ function AutomationsWidget({ instance }: WidgetRenderProps<AutomationsConfig>) {
   const handleRun = (a: Automation) => trigger.mutate(a.automation_id);
 
   return (
-    <div className="dashboard-glass-card p-5 flex flex-col h-full">
-      <div
-        className="flex items-baseline justify-between mb-3 pb-3 border-b"
-        style={{ borderColor: 'var(--color-border-muted)' }}
-      >
-        <div className="flex items-baseline gap-2.5 min-w-0">
-          <Workflow
-            className="h-3.5 w-3.5 shrink-0 self-center"
-            style={{ color: 'var(--color-text-tertiary)' }}
-          />
-          <span
-            className="text-[0.625rem] font-semibold uppercase tracking-[0.14em]"
-            style={{ color: 'var(--color-text-secondary)' }}
-          >
-            {t('dashboard.widgets.automations.header')}
-          </span>
-          <span
-            className="title-font text-lg leading-none dashboard-mono"
-            style={{ color: 'var(--color-text-primary)' }}
-          >
-            {total}
-          </span>
-        </div>
+    <div className="flex flex-col h-full">
+      <WidgetCardMeta>
+        <span>{total}</span>
         <button
           type="button"
           onClick={() => navigate('/automations')}
-          className="group flex items-center gap-1 text-[0.6875rem] uppercase tracking-wider transition-colors"
-          style={{ color: 'var(--color-text-tertiary)' }}
-          onMouseEnter={(e) => {
-            e.currentTarget.style.color = 'var(--color-text-primary)';
-          }}
-          onMouseLeave={(e) => {
-            e.currentTarget.style.color = 'var(--color-text-tertiary)';
-          }}
+          className="dash-link widget-drag-cancel"
         >
-          <span>{t('dashboard.widgets.automations.viewAll')}</span>
-          <ArrowUpRight className="h-3 w-3 transition-transform group-hover:translate-x-0.5 group-hover:-translate-y-0.5" />
+          {t('dashboard.widgets.automations.viewAll')}
+          <ArrowUpRight className="h-3 w-3" />
         </button>
-      </div>
-
+      </WidgetCardMeta>
       <div className="flex-1 min-h-0 overflow-y-auto -mx-1 px-1">
         {loading && total === 0 ? (
           <div className="space-y-1.5 py-1">
@@ -421,6 +394,7 @@ function AutomationsWidget({ instance }: WidgetRenderProps<AutomationsConfig>) {
 registerWidget<AutomationsConfig>({
   type: 'automations.list',
   titleKey: 'dashboard.widgets.automations.title',
+  cardTitleKey: 'dashboard.widgets.automations.header',
   descriptionKey: 'dashboard.widgets.automations.description',
   category: 'personal',
   icon: Workflow,

@@ -16,7 +16,7 @@ const TO_NAME = 'Handoff Target';
 const prefs = defaultResponses['GET /users/me/preferences'];
 
 const models = {
-  // Starred, so the menu offers it.
+  // Starred, so the picker lists it first.
   'GET /users/me/preferences': {
     ...prefs,
     other_preference: { ...prefs.other_preference, starred_models: [TO] },
@@ -61,7 +61,7 @@ async function openThread(page, patch) {
     delay: 10,
   });
   await page.goto(`/chat/t/${TH}`);
-  const trigger = page.locator('.model-selector-trigger');
+  const trigger = page.locator('button[data-pill="model"]');
   await expect(trigger).toBeVisible({ timeout: 10000 });
   await expect(trigger).toContainText('Handoff Source');
   return trigger;
@@ -69,9 +69,8 @@ async function openThread(page, patch) {
 
 async function pickTarget(page, trigger) {
   await trigger.click();
-  // The thread's own model heads the menu; every other one is in the flyout.
-  await page.getByRole('menuitem', { name: 'More models' }).hover();
-  await page.getByRole('menuitem', { name: TO_NAME }).click();
+  // A favorite, so it is on the tab the picker opens on.
+  await page.getByRole('dialog').getByRole('row').filter({ hasText: TO_NAME }).click();
 }
 
 test.describe('switching a thread model', () => {

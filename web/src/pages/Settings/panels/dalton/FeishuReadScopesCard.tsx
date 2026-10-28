@@ -11,6 +11,7 @@ import {
   updateDaltonFeishuReadScopes,
   type DaltonFeishuSpace,
 } from '../../utils/daltonApi';
+import { canShowDaltonInviteAdminCard } from './DaltonInvitesCard';
 
 function extractApiError(err: unknown, fallback: string): string {
   if (err && typeof err === 'object') {
@@ -90,7 +91,7 @@ export function FeishuReadScopesCard(): React.ReactElement | null {
     return [...fromBridge, ...extra.map((s) => ({ space_id: s.space_id, name: s.name }))];
   }, [spacesQuery.data, scopesQuery.data]);
 
-  if (!canInvite) {
+  if (!canShowDaltonInviteAdminCard({ canInvite })) {
     return null;
   }
 
@@ -113,6 +114,7 @@ export function FeishuReadScopesCard(): React.ReactElement | null {
 
   return (
     <div
+      id="dalton-feishu-scopes"
       className="flex flex-col gap-3 rounded-lg p-4"
       style={{
         backgroundColor: 'var(--color-bg-card)',

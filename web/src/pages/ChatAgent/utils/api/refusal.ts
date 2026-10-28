@@ -1,4 +1,4 @@
-import { formatApiErrorDetail } from './errors';
+import { formatApiErrorDetail } from '@/api/errors';
 import { mcpCheckFailures, type McpCheckFailure } from './mcp';
 import { fatalDiagnostics, type PluginDiagnostic } from './plugins';
 

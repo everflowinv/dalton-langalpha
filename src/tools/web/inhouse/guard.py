@@ -7,8 +7,9 @@ follows redirects transparently — a public page can 3xx to ``127.0.0.1`` or
 ``169.254.169.254`` and slip past that one check.
 
 :class:`GuardedAsyncTransport` re-validates the resolved address on *every*
-hop httpx makes (initial request and each redirect), which also closes DNS
-rebinding for these paths since it checks the resolved IP, not the hostname.
+hop httpx makes (initial request and each redirect), and connects to the
+address it checked rather than the hostname, so a second DNS answer naming a
+private address (rebinding) is never dialed.
 
 Scope: httpx clients only. The scrapling engine tiers (curl_cffi tier 1 and
 the browser tiers) do their own DNS and redirect handling below Python and are
@@ -18,18 +19,35 @@ not covered here — that residual needs network-level egress control.
 import asyncio
 import ipaddress
 import socket
+from collections.abc import Callable
+from urllib.parse import urlsplit
 
 import httpx
+
+from src.server.utils.egress_guard import is_public_address
 
 
 class BlockedAddressError(httpx.RequestError):
     """A request target resolved to a private/reserved address."""
 
 
+class UnresolvableHost(BlockedAddressError):
+    """A request target's hostname did not resolve."""
+
+
+def _ip_is_blocked(ip: str) -> bool:
+    """Whether ``ip`` is outside the public internet, judged as the server's
+    own egress judges it: anything not globally reachable, including the
+    shared address space (100.64.0.0/10, where some clouds serve their
+    metadata), and an IPv6 address carrying an IPv4 one by that IPv4 address."""
+    return not is_public_address(ipaddress.ip_address(ip))
+
+
 # DALTON-HOOK(fake-ip-allow): behind a fake-IP proxy every public host resolves
-# into a benchmarking range that ``is_private`` flags; only the configured ranges
-# are exempt (src/dalton/network.py). An unavailable or unreadable config exempts
-# nothing, so the upstream check applies unchanged.
+# into a benchmarking range the strict test above flags; only the configured
+# ranges are exempt (src/dalton/network.py), and the exemption defers the
+# address to the real-target recheck rather than skipping it. An unavailable
+# or unreadable config exempts nothing, so the upstream check applies unchanged.
 def _is_fake_ip(addr: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
     try:
         from src.dalton.network import is_fake_ip_exempt
@@ -39,31 +57,23 @@ def _is_fake_ip(addr: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
         return False
 
 
-async def _fake_ip_block_reason(host: str, addresses: list[str]) -> str | None:
+async def _fake_ip_recheck(
+    host: str, addresses: list[str]
+) -> tuple[str | None, list[str] | None]:
+    """Why a request whose DNS answer includes a fake-IP must be refused, with
+    the verified real addresses to dial when it must not be; ``(None, None)``
+    when no fake-IP is present and ``(reason, None)`` on any refusal. The real
+    addresses behind the hostname are looked up (DNS-over-HTTPS, past the
+    fake-IP resolver) and each is checked with the strict test; a failed
+    lookup fails closed."""
     if not any(_is_fake_ip(ipaddress.ip_address(ip)) for ip in addresses):
-        return None
+        return None, None
     try:
         from src.dalton.network import fake_ip_block_reason
 
-        return await fake_ip_block_reason(
-            host, addresses, lambda ip: _ip_is_blocked(ip, allow_fake_ip=False)
-        )
+        return await fake_ip_block_reason(host, addresses, _ip_is_blocked)
     except Exception as exc:  # noqa: BLE001 - fail closed
-        return f"Blocked {host!r}: fake-IP check failed ({type(exc).__name__})"
-
-
-def _ip_is_blocked(ip: str, *, allow_fake_ip: bool = True) -> bool:
-    addr = ipaddress.ip_address(ip)
-    if allow_fake_ip and _is_fake_ip(addr):  # DALTON-HOOK(fake-ip-allow)
-        return False
-    return (
-        addr.is_private
-        or addr.is_loopback
-        or addr.is_link_local
-        or addr.is_reserved
-        or addr.is_unspecified
-        or addr.is_multicast
-    )
+        return f"Blocked {host!r}: fake-IP check failed ({type(exc).__name__})", None
 
 
 def _resolve(host: str) -> list[str]:
@@ -80,7 +90,22 @@ class GuardedAsyncTransport(httpx.AsyncHTTPTransport):
 
     httpx invokes the transport once per hop, so validating here covers the
     initial request and every redirect target uniformly.
+
+    Keeps no connection open between requests: dialed by address, the pool
+    knows a connection by that address alone, so a later request for another
+    hostname on it would ride a TLS session whose certificate named the first.
     """
+
+    def __init__(self, **kwargs) -> None:
+        kwargs.setdefault("limits", httpx.Limits(max_keepalive_connections=0))
+        # DALTON-HOOK(fake-ip-allow): a fake-IP proxy mode is a TUN every
+        # egress already rides, not an HTTP proxy to route through — the
+        # rechecked real address is dialed directly. Through an HTTP proxy the
+        # request would hand the hostname back to the proxy to re-resolve,
+        # which the recheck cannot stand behind, so such a target is refused
+        # in ``handle_async_request`` rather than dialed.
+        self._proxied = kwargs.get("proxy") is not None
+        super().__init__(**kwargs)
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         host = request.url.host
@@ -89,21 +114,157 @@ class GuardedAsyncTransport(httpx.AsyncHTTPTransport):
         try:
             addresses = await asyncio.to_thread(_resolve, host)
         except socket.gaierror as exc:
-            raise BlockedAddressError(
-                f"DNS resolution failed for {host!r}", request=request
-            ) from exc
-        # TODO(dns-rebinding): the check resolves the host, then the connection
-        # below resolves it again, so a host can answer public here and private
-        # there. Closing it means connecting to the address checked here.
+            raise UnresolvableHost(f"DNS resolution failed for {host!r}", request=request) from exc
         for ip in addresses:
-            if _ip_is_blocked(ip):
+            # DALTON-HOOK(fake-ip-allow): a configured fake-IP is deferred to
+            # the real-target recheck below, not blocked here.
+            if _ip_is_blocked(ip) and not _is_fake_ip(ipaddress.ip_address(ip)):
                 raise BlockedAddressError(
                     f"Blocked private/reserved address {ip} for host {host!r}",
                     request=request,
                 )
         # DALTON-HOOK(fake-ip-allow): a fake-IP answer hides the real target the
-        # proxy will connect to; check the host's real addresses as well.
-        reason = await _fake_ip_block_reason(host, addresses)
+        # proxy would pick itself; check the host's real addresses with the
+        # strict test, failing closed when that lookup cannot be done. A
+        # proxied transport never takes this path: the rechecked address must
+        # be the one dialed, and through a proxy it would not be.
+        if self._proxied and any(_is_fake_ip(ipaddress.ip_address(ip)) for ip in addresses):
+            raise BlockedAddressError(
+                f"Blocked {host!r}: its fake-IP answer is only fetched by dialing the "
+                "rechecked real address directly, never through an HTTP proxy, which "
+                "would re-resolve the host itself",
+                request=request,
+            )
+        reason, real = await _fake_ip_recheck(host, addresses)
         if reason:
             raise BlockedAddressError(reason, request=request)
-        return await super().handle_async_request(request)
+        # DALTON-HOOK(fake-ip-allow): the dial is pinned to the rechecked real
+        # addresses, never to the fake-IP answer: whatever maps a fake-IP back
+        # re-resolves the hostname, and that answer could name a private host
+        # the recheck never saw. The rechecked address is dialed directly — a
+        # fake-IP proxy mode is a TUN the traffic rides anyway — so what the
+        # connection goes to is one the strict test passed, while the Host
+        # header and the TLS name stay the hostname's: httpcore sends the
+        # ``sni_hostname`` extension as the TLS server name, which is also the
+        # name the certificate is verified against.
+        dial = real if real is not None else addresses
+        # Dialed by the addresses just checked, in order, the next one only
+        # when a connection fails, as a dial by hostname would: handed the
+        # hostname, httpcore would resolve it again, and that answer could
+        # name a private host. The Host header and the TLS name stay the
+        # hostname's.
+        extensions = dict(request.extensions)
+        if request.url.scheme == "https":
+            extensions["sni_hostname"] = host
+        *earlier, last = dict.fromkeys(dial)
+        for ip in earlier:
+            try:
+                return await super().handle_async_request(self._pinned(request, ip, extensions))
+            except (httpx.ConnectError, httpx.ConnectTimeout):
+                continue
+        return await super().handle_async_request(self._pinned(request, last, extensions))
+
+    @staticmethod
+    def _pinned(request: httpx.Request, ip: str, extensions: dict) -> httpx.Request:
+        return httpx.Request(
+            request.method,
+            request.url.copy_with(host=ip),
+            headers=request.headers,
+            stream=request.stream,
+            extensions=extensions,
+        )
+
+
+class UnexpectedStatus(Exception):
+    """A capped fetch answered with a status other than 200, which it carries."""
+
+    def __init__(self, status_code: int) -> None:
+        super().__init__(status_code)
+        self.status_code = status_code
+
+
+class OverCap(Exception):
+    """A capped fetch passed its cap, which it carries."""
+
+    def __init__(self, limit: int) -> None:
+        super().__init__(limit)
+        self.limit = limit
+
+
+class UnexpectedEncoding(Exception):
+    """A capped fetch was answered compressed, which it carries."""
+
+    def __init__(self, encoding: str) -> None:
+        super().__init__(encoding)
+        self.encoding = encoding
+
+
+#: The longest a capped fetch may take in all. httpx's timeout bounds each
+#: read, so a server sending a byte at a time could hold one for hours.
+FETCH_DEADLINE = 30.0
+
+#: The most redirects a capped fetch follows, httpx's own default.
+MAX_REDIRECTS = 20
+
+
+def fetch_host(url: str) -> str:
+    """The host of ``url``, for a log line: a full URL can carry a signed query."""
+    try:
+        return urlsplit(url).hostname or "?"
+    except ValueError:
+        return "?"
+
+
+async def fetch_capped(url: str, cap: Callable[[bytes], int]) -> bytes:
+    """The body at ``url``, fetched through :class:`GuardedAsyncTransport` and
+    stopped as soon as it passes ``cap`` of what has arrived.
+
+    Streamed, so the cap fires mid-transfer: a Content-Length header is only a
+    claim until the bytes arrive. Asked uncompressed, and refused when
+    compressed anyway, since a decoder expands a chunk with no bound before
+    the cap could see it: a few kilobytes of gzip or zstd can inflate to
+    gigabytes. Redirects are followed here rather than by httpx, which reads
+    and decodes each redirect's whole body first; here it is never read.
+
+    Raises:
+        UnexpectedStatus: When the answer is not a 200.
+        UnexpectedEncoding: When the answer is compressed anyway.
+        OverCap: When the body passes the cap.
+        BlockedAddressError, httpx.TimeoutException, httpx.RequestError: As
+            httpx raises them, a timeout also past ``FETCH_DEADLINE`` in all.
+    """
+    try:
+        async with asyncio.timeout(FETCH_DEADLINE):
+            return await _fetch_capped(url, cap)
+    except TimeoutError:
+        raise httpx.ReadTimeout(f"no whole answer within {FETCH_DEADLINE:.0f}s") from None
+
+
+async def _fetch_capped(url: str, cap: Callable[[bytes], int]) -> bytes:
+    async with httpx.AsyncClient(
+        transport=GuardedAsyncTransport(),
+        timeout=FETCH_DEADLINE,
+        headers={"Accept-Encoding": "identity"},
+    ) as client:
+        request = client.build_request("GET", url)
+        for _ in range(MAX_REDIRECTS + 1):
+            response = await client.send(request, stream=True)
+            try:
+                if response.next_request is not None:
+                    request = response.next_request
+                    continue
+                if response.status_code != 200:
+                    raise UnexpectedStatus(response.status_code)
+                encoding = response.headers.get("content-encoding", "identity").strip().lower()
+                if encoding not in ("", "identity"):
+                    raise UnexpectedEncoding(encoding)
+                body = bytearray()
+                async for chunk in response.aiter_bytes():
+                    body.extend(chunk)
+                    limit = cap(body)
+                    if len(body) > limit:
+                        raise OverCap(limit)
+                return bytes(body)
+            finally:
+                await response.aclose()
+        raise httpx.TooManyRedirects(f"more than {MAX_REDIRECTS} redirects", request=request)

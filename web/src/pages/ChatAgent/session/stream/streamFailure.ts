@@ -1,4 +1,4 @@
-import { isUpstreamHint, type StructuredError } from '@/utils/rateLimitError';
+import { isUpstreamHint, RECONNECT_ACCOUNT_LINK, type StructuredError } from '@/utils/rateLimitError';
 import type { SSEEvent } from '../types';
 
 /**
@@ -26,17 +26,20 @@ export function readStreamFailure(event: SSEEvent, message: string): StructuredE
         }))
         .filter((m) => m.model)
     : undefined;
+  const hints = kind === 'upstream' && Array.isArray(event.hints)
+    ? (event.hints.filter(isUpstreamHint) as StructuredError['hints'])
+    : undefined;
   return {
     message,
     kind,
+    // The hint says the sign-in must be renewed; this is where.
+    links: hints?.includes('reconnect_account') ? [RECONNECT_ACCOUNT_LINK] : undefined,
     statusCode: typeof event.status_code === 'number' ? event.status_code : undefined,
     // ``hints`` are only meaningful for upstream provider errors (the bullets
     // say "check your API key / plan / provider status"). An internal error
     // doesn't get hints even if the backend ever starts emitting them for
     // some future variant.
-    hints: kind === 'upstream' && Array.isArray(event.hints)
-      ? (event.hints.filter(isUpstreamHint) as StructuredError['hints'])
-      : undefined,
+    hints,
     // User-configured model + the full attempt list, so the display can show
     // a model-aware headline and an "Also tried" line.
     model: typeof event.model === 'string' ? event.model : undefined,

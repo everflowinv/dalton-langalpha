@@ -2,7 +2,6 @@
 
 import asyncio
 import logging
-import re
 from datetime import datetime
 from typing import Literal, Optional
 
@@ -36,6 +35,11 @@ from src.server.database.user import (
     upsert_user_preferences,
 )
 from src.server.services.llm.config import BACKGROUND_FOLLOWS
+from src.server.services.llm.custom_catalog import (
+    refuse_custom_model_endpoints,
+    validate_custom_models,
+    validate_custom_providers,
+)
 from src.server.services.llm.thread_model import (
     DEFAULT_MODEL_KEYS,
     DEFAULT_MODEL_SCOPES,
@@ -56,8 +60,6 @@ from src.server.models.user import (
 from src.server.utils.api import CurrentUserId, handle_api_exceptions, raise_not_found
 
 logger = logging.getLogger(__name__)
-
-_VALID_MODALITIES = frozenset({"text", "image", "pdf"})
 
 router = APIRouter(prefix="/api/v1", tags=["Users"])
 
@@ -249,6 +251,9 @@ async def get_current_user(
         raise quota_service_unavailable()
     user_response.access_tier = int(membership.get("access_tier", -1))
     user_response.plan_display_name = membership.get("plan_display_name")
+    from src.server.services.llm.config import deployment_serves_default
+
+    user_response.deployment_serves = deployment_serves_default()
 
     preferences_response = None
     if result["preferences"]:
@@ -319,244 +324,6 @@ async def get_preferences(user_id: CurrentUserId):
         raise_not_found("Preferences")
 
     return UserPreferencesResponse.model_validate(preferences)
-
-
-def _validate_custom_models(custom_models: list, custom_providers: list | None = None) -> None:
-    """Validate custom_models list before persisting. Raises HTTPException 400 on invalid data."""
-    from ptc_agent.agent.prompts.guidance import VALID_GUIDANCE
-
-    from src.llms.llm import LLM, CUSTOM_MODEL_NAME_RE
-    from src.llms.model_spec import reasoning_block
-    from src.llms.reasoning import (
-        REASONING_LEVELS,
-        ReasoningSurfaceError,
-        validate_surface,
-    )
-
-    if not isinstance(custom_models, list):
-        raise HTTPException(status_code=400, detail="custom_models must be a list")
-
-    # Reuse the process-wide singleton — building a fresh ModelConfig on every
-    # preferences PUT re-parses models.json + re-scans _flat_providers for
-    # nothing (the manifest is static).
-    mc = LLM.get_model_config()
-    name_re = re.compile(CUSTOM_MODEL_NAME_RE)
-    seen_names: set[str] = set()
-
-    # Shadow semantics: a custom ``name`` MAY collide with a built-in. The
-    # resolver checks custom first, so the user's entry wins. This supports
-    # "route built-in model X through my variant's key" without inventing a
-    # prefix format for preferences.
-
-    valid_providers = {
-        k for k, v in mc.flat_providers.items()
-        if not v.get("platform")
-    }
-    if custom_providers:
-        valid_providers.update(
-            cp["name"] for cp in custom_providers if isinstance(cp, dict) and cp.get("name")
-        )
-
-    for idx, cm in enumerate(custom_models):
-        if not isinstance(cm, dict):
-            raise HTTPException(status_code=400, detail=f"custom_models[{idx}]: must be an object")
-
-        name = cm.get("name")
-        model_id = cm.get("model_id")
-        provider = cm.get("provider")
-
-        if not name:
-            raise HTTPException(status_code=400, detail=f"custom_models[{idx}]: name is required")
-        if not model_id:
-            raise HTTPException(status_code=400, detail=f"custom_models[{idx}]: model_id is required")
-        if not provider:
-            raise HTTPException(status_code=400, detail=f"custom_models[{idx}]: provider is required")
-
-        if not name_re.match(name):
-            raise HTTPException(
-                status_code=400,
-                detail=f"custom_models[{idx}]: name '{name}' is invalid (alphanumeric start, max 63 chars, only .-_:/ allowed)",
-            )
-
-        if name in seen_names:
-            raise HTTPException(
-                status_code=400,
-                detail=f"custom_models[{idx}]: duplicate name '{name}'",
-            )
-        seen_names.add(name)
-
-        if not isinstance(provider, str) or not provider.strip():
-            raise HTTPException(
-                status_code=400,
-                detail=f"custom_models[{idx}]: provider must be a non-empty string",
-            )
-
-        if provider not in valid_providers:
-            raise HTTPException(
-                status_code=400,
-                detail=f"custom_models[{idx}]: provider '{provider}' is not a known BYOK-eligible or custom provider",
-            )
-
-        for field in ("parameters", "extra_body", "reasoning"):
-            val = cm.get(field)
-            if val is not None and not isinstance(val, dict):
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"custom_models[{idx}]: {field} must be a JSON object",
-                )
-
-        # Rejected here rather than at request time: an unknown write path is
-        # accepted by the vendor and ignored, so the entry would render an
-        # effort control that reports a level and sends nothing.
-        if isinstance(cm.get("reasoning"), dict) and cm["reasoning"]:
-            try:
-                validate_surface(f"custom_models[{idx}]", cm["reasoning"])
-            except ReasoningSurfaceError as exc:
-                raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-        modalities = cm.get("input_modalities")
-        if modalities is not None:
-            if not isinstance(modalities, list) or len(modalities) == 0:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"custom_models[{idx}]: input_modalities must be a non-empty list",
-                )
-            for m in modalities:
-                if not isinstance(m, str) or m not in _VALID_MODALITIES:
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"custom_models[{idx}]: invalid modality '{m}', allowed: {sorted(_VALID_MODALITIES)}",
-                    )
-            # Ensure "text" is always present
-            if "text" not in modalities:
-                cm["input_modalities"] = ["text"] + modalities
-
-        # A custom model has no manifest entry, so these are the only place it
-        # can declare what it honors. Without them every custom model resolves
-        # to the fail-safe guidance level and gets no effort selector at all.
-        guidance = cm.get("prompt_guidance")
-        if guidance is not None and guidance not in VALID_GUIDANCE:
-            raise HTTPException(
-                status_code=400,
-                detail=f"custom_models[{idx}]: prompt_guidance must be one of {sorted(VALID_GUIDANCE)}",
-            )
-
-        # Either shape: a `reasoning` block, or the flat keys entries saved
-        # before it existed still carry. Whichever it used is written back to,
-        # which is why the shapes are read apart here rather than through
-        # `reasoning_block`: its normalized view cannot say which key to
-        # rewrite. Empty means unused, on the same terms as that function.
-        block = cm.get("reasoning")
-        declared = block if isinstance(block, dict) and block else cm
-        efforts_key = "efforts" if declared is not cm else "reasoning_efforts"
-        default_key = "default" if declared is not cm else "reasoning_effort_default"
-
-        efforts = declared.get(efforts_key)
-        if efforts is not None:
-            if not isinstance(efforts, list) or any(e not in REASONING_LEVELS for e in efforts):
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"custom_models[{idx}]: {efforts_key} must be a list drawn from {list(REASONING_LEVELS)}",
-                )
-            # Store in canonical order so the UI renders a ladder, not the
-            # order the client happened to send.
-            declared[efforts_key] = [lv for lv in REASONING_LEVELS if lv in set(efforts)]
-
-        # An entry shadowing a built-in inherits that model's ladder, so a
-        # default may name a level this entry does not list itself. With no
-        # ladder at all no level is ever sent and the default is inert: that is
-        # a shadow whose built-in has since left the manifest, and refusing it
-        # would 400 every later save of the whole list.
-        effective_efforts = declared.get(efforts_key)
-        if effective_efforts is None:
-            effective_efforts = reasoning_block(mc.get_model_config(name)).get("efforts") or []
-        default_effort = declared.get(default_key)
-        if (
-            default_effort is not None
-            and effective_efforts
-            and default_effort not in effective_efforts
-        ):
-            raise HTTPException(
-                status_code=400,
-                detail=f"custom_models[{idx}]: {default_key} must be one of {sorted(effective_efforts)}",
-            )
-
-
-async def _refuse_custom_model_endpoints(custom_models: list, stored: list | None = None) -> None:
-    """Refuse, in platform mode, a custom model whose parameters point its
-    client somewhere the server must not dial, or route it another way.
-
-    Only an entry that is new, or whose routing differs from the ``stored``
-    entry of its name, is checked. A save carries the whole list, so one entry
-    saved before the policy, or whose host has stopped resolving, would
-    otherwise block every later change. Such an entry is still refused, or
-    held, where its client is built.
-    """
-    from src.server.services.llm import egress
-
-    if not egress.enforced():
-        return
-    saved = {
-        cm.get("name"): egress.routing_params(cm.get("parameters"))
-        for cm in stored or []
-        if isinstance(cm, dict)
-    }
-    to_check: list[tuple[int, str]] = []
-    for idx, cm in enumerate(custom_models):
-        params = cm.get("parameters")
-        if cm.get("name") in saved and saved[cm.get("name")] == egress.routing_params(params):
-            continue
-        for key in (*egress.connection_params(params), *egress.vertex_params(params)):
-            raise HTTPException(
-                status_code=400,
-                detail=f"custom_models[{idx}]: parameters.{key} cannot be set. Remove it.",
-            )
-        to_check.extend((idx, url) for url in egress.parameter_urls(params))
-    reasons = await egress.save_refusals(url for _, url in to_check)
-    for idx, url in to_check:
-        if reasons[url]:
-            raise HTTPException(
-                status_code=400,
-                detail=f"custom_models[{idx}]: the base URL in parameters cannot be used: {reasons[url]}",
-            )
-
-
-def _validate_custom_providers(custom_providers: list) -> None:
-    """Validate custom_providers list before persisting."""
-    if not isinstance(custom_providers, list):
-        raise HTTPException(status_code=400, detail="custom_providers must be a list")
-
-    from src.llms.llm import LLM
-
-    mc = LLM.get_model_config()
-    builtin = set(mc.get_byok_eligible_providers())
-    name_re = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,62}$")
-    seen: set[str] = set()
-
-    for idx, cp in enumerate(custom_providers):
-        if not isinstance(cp, dict):
-            raise HTTPException(status_code=400, detail=f"custom_providers[{idx}]: must be an object")
-
-        name = cp.get("name")
-        parent = cp.get("parent_provider")
-
-        if not name:
-            raise HTTPException(status_code=400, detail=f"custom_providers[{idx}]: name is required")
-        if not parent:
-            raise HTTPException(status_code=400, detail=f"custom_providers[{idx}]: parent_provider is required")
-        if not name_re.match(name):
-            raise HTTPException(status_code=400, detail=f"custom_providers[{idx}]: invalid name '{name}'")
-        if name in builtin:
-            raise HTTPException(status_code=400, detail=f"custom_providers[{idx}]: name '{name}' conflicts with built-in provider")
-        if name in seen:
-            raise HTTPException(status_code=400, detail=f"custom_providers[{idx}]: duplicate name '{name}'")
-        if parent not in builtin:
-            raise HTTPException(status_code=400, detail=f"custom_providers[{idx}]: parent_provider '{parent}' is not a BYOK-eligible provider")
-        seen.add(name)
-
-        ura = cp.get("use_response_api")
-        if ura is not None and not isinstance(ura, bool):
-            raise HTTPException(status_code=400, detail=f"custom_providers[{idx}]: use_response_api must be a boolean")
 
 
 # The keys that moved out of ``other_preference``. Read on input only, to
@@ -766,20 +533,21 @@ async def update_preferences(
 
         # Providers before models: a model names the provider it runs on.
         if model_pref.get("custom_providers") is not None:
-            _validate_custom_providers(model_pref["custom_providers"])
+            validate_custom_providers(model_pref["custom_providers"], stored_model_pref)
 
         # Checked against the merged catalog rather than the request, because a
         # patch that only drops a provider names no model and would otherwise
         # skip this. ``effective`` holds the request's own list by reference, so
         # the normalization this does still reaches the row.
         if "custom_models" in model_pref or "custom_providers" in model_pref:
-            _validate_custom_models(
+            validate_custom_models(
                 effective.get("custom_models") or [],
                 effective.get("custom_providers") or [],
+                stored_model_pref,
             )
 
         if model_pref.get("custom_models"):
-            await _refuse_custom_model_endpoints(
+            await refuse_custom_model_endpoints(
                 model_pref["custom_models"], stored_model_pref.get("custom_models")
             )
 

@@ -97,6 +97,12 @@ class TestSystemProviderRouting:
         instance = self._build_llm_instance(api_key="sk-user-key-123")
         assert instance.provider == "acme"
 
+    def test_an_empty_user_key_stays_on_the_users_provider(self):
+        """A keyless endpoint of the user's is still theirs: routing it to the
+        platform proxy would send the proxy's key to the user's base URL."""
+        instance = self._build_llm_instance(api_key="")
+        assert instance.provider == "acme"
+
     def test_missing_system_provider_uses_provider(self):
         """Model without system_provider -> provider unchanged regardless of api_key."""
         models = {
@@ -330,8 +336,8 @@ class TestPlatformVariantFiltering:
         assert "beta" in info_map
 
     def test_platform_variant_filtered_from_provider_catalog(self):
-        """_build_provider_catalog should not include platform variants."""
-        from src.server.app.api_keys import _build_provider_catalog
+        """``provider_catalog`` should not include platform variants."""
+        from src.server.services.llm.provider_catalog import provider_catalog
 
         flat = self._build_flat_providers()
         mock_config = MagicMock()
@@ -339,10 +345,10 @@ class TestPlatformVariantFiltering:
         mock_config.get_display_name = lambda k: flat[k].get("display_name", k.title())
 
         # Clear the lru_cache so our mock takes effect
-        _build_provider_catalog.cache_clear()
+        provider_catalog.cache_clear()
 
-        with patch("src.llms.llm.ModelConfig", return_value=mock_config):
-            catalog = _build_provider_catalog()
+        with patch("src.llms.llm.LLM.get_model_config", return_value=mock_config):
+            catalog = provider_catalog()
 
         provider_names = {entry["provider"] for entry in catalog}
         assert "acme-platform" not in provider_names
@@ -350,7 +356,7 @@ class TestPlatformVariantFiltering:
         assert "beta" in provider_names
 
         # Clean up
-        _build_provider_catalog.cache_clear()
+        provider_catalog.cache_clear()
 
     def test_platform_variant_excluded_from_allowed_providers(self):
         """_get_allowed_providers should not include platform variants."""

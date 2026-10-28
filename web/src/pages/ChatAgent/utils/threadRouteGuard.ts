@@ -1,4 +1,4 @@
-import { apiErrorStatus } from './api/errors';
+import { apiErrorStatus } from '@/api/errors';
 
 /** Whether a failed thread lookup should evict the user back to the gallery.
  *

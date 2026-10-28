@@ -210,7 +210,7 @@ def _sent_texts(messages: Iterable[MessageLikeRepresentation]) -> Iterator[str]:
 #: text plus image, and measured 3,230 a page on an image-heavy paper. The top
 #: of the text range covers a typical page with its image. A denser one runs
 #: past it, and the provider's count of that send corrects the estimate (see
-#: ``CompactionMiddleware._measured_fit``), or its refusal sends the call to
+#: ``fitting.Fit._measured``), or its refusal sends the call to
 #: compaction anyway. A vendor that charges far less, as Gemini does, is
 #: counted at its own charge, since this would take out pages it can carry.
 PDF_PAGE_TOKENS = 3_000
@@ -798,6 +798,22 @@ def provider_cutoff(messages: list[AnyMessage], cutoff_index: int) -> int:
             and find_group_safe_cutoff(messages, i) == i
         ):
             return i
+    return 0
+
+
+def turn_start_cut(messages: list[AnyMessage]) -> int:
+    """Where a summary that keeps no turn ends on a turn's first call: right
+    after the last answer, which called no tool, with the user's new message
+    after it; 0 anywhere else. Mid-loop there is none, since a kept tool
+    result needs the call it answers, and that call its thinking.
+    """
+    for i in range(len(messages) - 1, 0, -1):
+        message = messages[i]
+        if isinstance(message, ToolMessage):
+            return 0
+        if isinstance(message, AIMessage):
+            following = messages[i + 1] if i + 1 < len(messages) else None
+            return i + 1 if not message.tool_calls and isinstance(following, HumanMessage) else 0
     return 0
 
 

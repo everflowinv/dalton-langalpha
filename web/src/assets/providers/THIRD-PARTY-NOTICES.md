@@ -7,7 +7,7 @@ name the provider a model runs on.
 
 Every SVG here except `groq.svg` is the drawing from
 [lobehub/lobe-icons](https://github.com/lobehub/lobe-icons), published as
-`@lobehub/icons-static-svg` (1.95.1; `qwen.svg` and `kimi.svg` from 1.97.0),
+`@lobehub/icons-static-svg` (1.95.1; `qwen.svg`, `kimi.svg` and `xai.svg` from 1.97.0),
 with its sizing attributes and title removed.
 
 ```

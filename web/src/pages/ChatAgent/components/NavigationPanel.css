@@ -21,6 +21,12 @@
   background-color: var(--color-border-muted);
 }
 
+/* The row a right-click menu is open for keeps its hover tint: the menu is
+   modal, so the pointer no longer hovers anything beneath it. */
+.nav-panel-row.is-menu-open {
+  background-color: var(--color-border-muted);
+}
+
 .nav-panel-row-active {
   background-color: var(--color-border-muted);
   border-radius: 8px;

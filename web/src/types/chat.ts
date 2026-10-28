@@ -91,9 +91,24 @@ export interface SubagentTaskRecord {
   launchRefusal?: 'subagents_off';
 }
 
+/** A switch to another model, as the server reported it. The notice names
+ *  the models and the payer when shown, since the catalog that names them can
+ *  arrive after the event, and the language can change after both. */
+export interface ModelFallbackNotice {
+  /** Manifest keys. */
+  from: string;
+  to: string;
+  /** Who pays for `to`, the server's `billing_type`. */
+  paidBy?: string;
+  /** The provider `to`'s call went through, which names a sign-in's plan. */
+  provider?: string;
+}
+
 export interface NotificationSegment {
   type: 'notification';
-  content: string;
+  /** The label. A model switch has none: its label is written from `fallback`. */
+  content?: string;
+  fallback?: ModelFallbackNotice;
   order: number;
   /** Optional longer text (e.g. the compaction summary) shown in an
    *  expandable panel beneath the notification label. */

@@ -428,8 +428,8 @@ async def test_a_stringified_argument_is_hashed_in_the_form_the_relay_will_see(
 ):
     """The approval binds the frame, so both sides have to hash one form.
 
-    ``ToolArgumentParsingMiddleware`` decodes a JSON-looking string argument in
-    place before the tool runs, and the relay hashes what it produced. Hashing
+    ``ToolArgumentParsingMiddleware`` decodes a JSON-looking string argument
+    before the tool runs, and the relay hashes what it produced. Hashing
     the model's raw form at propose time instead left the gate comparing two
     different digests: the attempt was already consumed, so the approved order
     came back refused and unretryable. Providers that number call ids by
@@ -438,7 +438,7 @@ async def test_a_stringified_argument_is_hashed_in_the_form_the_relay_will_see(
     """
     ledger = _FakeLedger()
     mw = OrderGovernanceMiddleware(ledger, [_tool()])
-    _answer(monkeypatch, {})
+    raised = _answer(monkeypatch, {})
     state = _state()
     state["messages"][0].tool_calls[0]["args"] = {
         "legs": '[{"side": "buy", "ratio": 1}]',
@@ -449,11 +449,15 @@ async def test_a_stringified_argument_is_hashed_in_the_form_the_relay_will_see(
 
     # Decoded before the ledger saw it, so the stored hash is over the object.
     assert ledger.proposed_args[0]["legs"] == [{"side": "buy", "ratio": 1}]
-    # And written back onto the call itself, so the approval card, the row and
-    # the frame the relay hashes all read the same value.
-    assert state["messages"][0].tool_calls[0]["args"]["legs"] == [
+    # The approval card reads the same value as the row and the frame.
+    assert raised[0]["action_requests"][0]["args"]["legs"] == [
         {"side": "buy", "ratio": 1}
     ]
+    # The message keeps the args as the model sent them: every later request
+    # carries it, so a rewrite would change the prefix of its later thinking.
+    assert state["messages"][0].tool_calls[0]["args"]["legs"] == (
+        '[{"side": "buy", "ratio": 1}]'
+    )
     # Untouched otherwise: this canonicalizes serialization, it does not coerce.
     assert ledger.proposed_args[0]["quantity"] == 1
 

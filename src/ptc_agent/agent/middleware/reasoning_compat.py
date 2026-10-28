@@ -85,7 +85,7 @@ def _target_route(model: Any) -> str | None:
     return route if isinstance(route, str) and route else None
 
 
-def _message_lineage(msg: AIMessage) -> str:
+def message_lineage(msg: AIMessage) -> str:
     meta = msg.response_metadata or {}
     origin = meta.get(ORIGIN_KEY)
     if isinstance(origin, str) and origin:
@@ -198,7 +198,7 @@ def _sanitize(
             continue
 
         new_msg: AIMessage | None = msg
-        if origin_gate and _message_lineage(msg) != target_lineage:
+        if origin_gate and message_lineage(msg) != target_lineage:
             new_msg = _origin_gate(msg, stats)
         if new_msg is not None:
             new_msg = _structure_gate(new_msg, stats, drop_unsigned=drop_unsigned)

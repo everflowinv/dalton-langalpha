@@ -713,7 +713,7 @@ async def test_an_endpoint_under_model_kwargs_is_refused_before_the_client_is_bu
     with (
         patch.object(clients.user_models, "classify_model", AsyncMock(return_value=(clients.ModelSource.CUSTOM, custom))),
         patch.object(clients.user_models, "get_custom_provider_config", AsyncMock(return_value=None)),
-        patch.object(clients, "_walk_byok_candidates", AsyncMock(return_value=({"api_key": "k"}, provider))),
+        patch.object(clients, "walk_byok_candidates", AsyncMock(return_value=({"api_key": "k"}, provider))),
         patch("src.llms.llm.create_llm_from_custom") as create,
         pytest.raises(HTTPException) as refused,
     ):
@@ -731,7 +731,7 @@ async def test_a_users_private_endpoint_is_refused_before_the_client_is_built(pl
             AsyncMock(return_value=(clients.ModelSource.SYSTEM, {"provider": "openai"})),
         ),
         patch.object(
-            clients, "_walk_byok_candidates",
+            clients, "walk_byok_candidates",
             AsyncMock(return_value=({"api_key": "sk-test", "base_url": "http://127.0.0.1:8080/v1"}, "openai")),
         ),
         patch("src.llms.llm.create_llm") as create,
@@ -774,48 +774,60 @@ def test_a_turn_that_inherited_a_blocked_model_runs_the_default():
     ],
 )
 async def test_a_custom_model_that_routes_around_the_policy_is_refused(platform, dns, params):
-    from src.server.app.users import _refuse_custom_model_endpoints
+    from src.server.services.llm.custom_catalog import refuse_custom_model_endpoints
 
     dns.table["gateway.test"] = [PUBLIC]
     with pytest.raises(HTTPException) as refused:
-        await _refuse_custom_model_endpoints([{"name": "m", "provider": "openai", "parameters": params}])
+        await refuse_custom_model_endpoints([{"name": "m", "provider": "openai", "parameters": params}])
     assert refused.value.status_code == 400
     assert refused.value.detail.startswith("custom_models[0]:")
 
 
 @pytest.mark.asyncio
 async def test_a_custom_model_on_a_public_endpoint_is_saved(platform, dns):
-    from src.server.app.users import _refuse_custom_model_endpoints
+    from src.server.services.llm.custom_catalog import refuse_custom_model_endpoints
 
     dns.table["gateway.test"] = [PUBLIC]
-    await _refuse_custom_model_endpoints(
+    await refuse_custom_model_endpoints(
         [{"name": "m", "provider": "openai", "parameters": {"base_url": "https://gateway.test/v1"}}]
     )
 
 
 @pytest.mark.asyncio
-async def test_oss_mode_saves_a_local_custom_model(dns):
-    from src.server.app.users import _refuse_custom_model_endpoints
+async def test_a_saved_model_moved_onto_a_subscription_is_checked_again(dns):
+    # Its parameters are unchanged, but a subscription's model may set none.
+    from src.server.services.llm.custom_catalog import refuse_custom_model_endpoints
 
-    await _refuse_custom_model_endpoints(
+    params = {"base_url": "https://gateway.test/v1"}
+    stored = [{"name": "m", "provider": "openai", "parameters": params}]
+    with pytest.raises(HTTPException) as refused:
+        await refuse_custom_model_endpoints([{"name": "m", "provider": "codex-oauth", "parameters": params}], stored)
+    assert "subscription" in refused.value.detail
+
+
+@pytest.mark.asyncio
+async def test_oss_mode_saves_a_local_custom_model(dns):
+    from src.server.services.llm.custom_catalog import refuse_custom_model_endpoints
+
+    await refuse_custom_model_endpoints(
         [{"name": "m", "provider": "openai", "parameters": {"base_url": "http://localhost:1234/v1"}}]
     )
 
 
 @pytest.mark.asyncio
 async def test_a_save_looks_up_each_new_base_url_once_up_to_a_bound(platform, dns):
-    from src.server.app.users import _refuse_custom_model_endpoints
+    from src.server.services.llm.custom_catalog import refuse_custom_model_endpoints
 
     def model(i, host):
         return {"name": f"m{i}", "provider": "openai", "parameters": {"base_url": f"https://{host}/v1"}}
 
     dns.table["gateway.test"] = [PUBLIC]
-    await _refuse_custom_model_endpoints([model(i, "gateway.test") for i in range(50)])
+    await refuse_custom_model_endpoints([model(i, "gateway.test") for i in range(50)])
     assert dns.lookups["gateway.test"] == 1
 
     hosts = [f"h{i}.gateway.test" for i in range(egress.MAX_SAVE_CHECKS + 1)]
     with pytest.raises(HTTPException) as refused:
-        await _refuse_custom_model_endpoints([model(i, h) for i, h in enumerate(hosts)])
+        await refuse_custom_model_endpoints([model(i, h) for i, h in enumerate(hosts)])
     assert refused.value.detail == egress.TOO_MANY_ENDPOINTS
     assert not any(dns.lookups[h] for h in hosts)
 
@@ -927,7 +939,7 @@ async def test_a_client_build_looks_its_endpoints_up_side_by_side(dns, monkeypat
 
 @pytest.mark.asyncio
 async def test_a_save_checks_only_the_entries_it_adds_or_reroutes(platform, dns):
-    from src.server.app.users import _refuse_custom_model_endpoints
+    from src.server.services.llm.custom_catalog import refuse_custom_model_endpoints
 
     dns.table["gateway.test"] = [PUBLIC]
     dns.table["inside.test"] = ["10.0.0.5"]
@@ -937,20 +949,20 @@ async def test_a_save_checks_only_the_entries_it_adds_or_reroutes(platform, dns)
         {"name": "legacy", "provider": "openai", "parameters": {"openai_proxy": "http://p.test:1"}},
     ]
     added = {"name": "new", "provider": "openai", "parameters": {"base_url": "https://gateway.test/v1"}}
-    await _refuse_custom_model_endpoints([*stored, added], stored)
+    await refuse_custom_model_endpoints([*stored, added], stored)
 
     inside = {"name": "new", "provider": "openai", "parameters": {"base_url": "https://inside.test/v1"}}
     with pytest.raises(HTTPException) as refused:
-        await _refuse_custom_model_endpoints([*stored, inside], stored)
+        await refuse_custom_model_endpoints([*stored, inside], stored)
     assert refused.value.detail.startswith("custom_models[2]:")
 
     moved = {**stored[0], "parameters": {"base_url": "https://inside.test/v1"}}
     with pytest.raises(HTTPException) as refused:
-        await _refuse_custom_model_endpoints([moved, stored[1]], stored)
+        await refuse_custom_model_endpoints([moved, stored[1]], stored)
     assert refused.value.detail.startswith("custom_models[0]:")
 
     # Rerouted under ``model_kwargs``, the top level as stored.
     nested = {**stored[0], "parameters": {**stored[0]["parameters"], "model_kwargs": {"base_url": "https://inside.test/v1"}}}
     with pytest.raises(HTTPException) as refused:
-        await _refuse_custom_model_endpoints([nested, stored[1]], stored)
+        await refuse_custom_model_endpoints([nested, stored[1]], stored)
     assert refused.value.detail.startswith("custom_models[0]:")

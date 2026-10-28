@@ -8,9 +8,12 @@ an argument, which is what keeps the dependency pointing one way.
 
 import copy
 from dataclasses import dataclass, field
+from collections.abc import Mapping
 from typing import Any, Protocol
 
+from .gateway_names import gateway_slug, manifest_slug_index
 from .reasoning import (
+    OFF_LEVELS,
     REASONING_LEVELS,
     SURFACE_KEYS,
     infer_surface,
@@ -19,9 +22,13 @@ from .reasoning import (
 
 
 class ManifestSource(Protocol):
-    """The single lookup :meth:`ModelSpec.from_manifest` needs from the config."""
+    """The lookups a spec needs from the config."""
+
+    llm_config: Mapping[str, dict]
 
     def get_model_config(self, model_id: str) -> dict | None: ...
+
+    def get_provider_info(self, provider: str) -> dict: ...
 
 
 def canonical_reasoning_efforts(declared: Any) -> tuple[str, ...]:
@@ -169,26 +176,141 @@ SHADOW_INHERITED = (
 )
 
 
-def with_inherited_declarations(entry: dict, shadowed: dict | None) -> dict:
-    """A custom entry filled in from the built-in whose name it took.
+#: SDKs whose client can call the Responses API as well as Chat Completions.
+_RESPONSES_SDKS = ("openai", "codex", "dashscope")
+
+
+def client_wire(
+    provider_info: dict | None, response_api: bool | None = None, sdk_fallback: str | None = "openai"
+) -> tuple[str | None, bool]:
+    """The SDK a provider is called through, and whether its client takes the
+    Responses API. ``response_api`` is an entry's own opt-in, over the provider's."""
+    info = provider_info or {}
+    sdk = info.get("sdk") or sdk_fallback
+    on = info.get("use_response_api", False) if response_api is None else response_api
+    return sdk, bool(on) and sdk in _RESPONSES_SDKS
+
+
+def wire_api(provider_info: dict | None, response_api: bool | None = None) -> str:
+    """The API a provider is called through: its SDK, and for an SDK with both
+    OpenAI endpoints, which one."""
+    sdk, responses = client_wire(provider_info, response_api)
+    if sdk not in ("openai", "dashscope"):
+        return sdk
+    return f"{sdk}-responses" if responses else f"{sdk}-chat"
+
+
+def borrows_reasoning(shadowed: dict | None, route_api: str, shadowed_api: str) -> bool:
+    """Whether a custom entry reached through ``route_api`` can take the effort
+    control of the built-in it shadows.
+
+    A level written to ``parameters`` is a keyword of one SDK's client:
+    ``output_config`` is Anthropic's, ``reasoning`` the Responses API's,
+    ``thinking_level`` Gemini's. Through another API's client it is refused
+    (every call fails) or moves the call to another endpoint. A control written
+    only into the body goes through any client and leaves the endpoint to
+    decide, which is how a coding plan already reaches a vendor's models
+    through its Anthropic route.
+    """
+    surface = reasoning_block(shadowed)
+    if not surface:
+        return False
+    if route_api == shadowed_api:
+        return True
+    paths = [surface["write"]] if isinstance(surface.get("write"), str) else []
+    for switch in ("on", "off"):
+        paths += list(surface.get(switch) or {})
+    return bool(paths) and all(path.startswith("extra_body.") for path in paths)
+
+
+def routed_provider_info(entry: dict, manifest: ManifestSource) -> dict:
+    """The manifest's declarations for a routed entry's ``provider``, which are
+    none when the resolver marked it ``_own_provider``: the user's own provider
+    under a name the manifest also gives one of its own."""
+    provider = entry.get("provider")
+    if entry.get("_own_provider") or not isinstance(provider, str):
+        return {}
+    return manifest.get_provider_info(provider)
+
+
+def shadowed_model(entry: dict, manifest: ManifestSource) -> dict | None:
+    """The built-in a custom entry stands for: the one whose name it took, else,
+    for an entry routed through OpenRouter, which names models its own way, the
+    one its id matches. That match is what the model list called it known by,
+    so the entry is tuned as the model it was picked as."""
+    name = entry.get("name")
+    found = manifest.get_model_config(name) if isinstance(name, str) and name else None
+    if found is not None or routed_provider_info(entry, manifest).get("sdk") != "openrouter":
+        return found
+    model_id = entry.get("model_id")
+    key = manifest_slug_index(manifest).get(gateway_slug(model_id)) if isinstance(model_id, str) else None
+    return manifest.get_model_config(key) if key else None
+
+
+def _borrows_from(entry: dict, shadowed: dict, manifest: ManifestSource) -> bool:
+    """:func:`borrows_reasoning` for a routed entry: its ``provider`` the one
+    whose SDK it speaks and ``_use_response_api`` its own opt-in, as the
+    resolver leaves them."""
+    return borrows_reasoning(
+        shadowed,
+        wire_api(routed_provider_info(entry, manifest), entry.get("_use_response_api")),
+        wire_api(manifest.get_provider_info(shadowed.get("provider"))),
+    )
+
+
+def _merged_reasoning(own: dict, borrowed: dict) -> dict:
+    """``own`` over ``borrowed``, with the write half taken whole from one side.
+
+    A surface is one declaration: an ``off`` patch is only coherent beside the
+    ``write`` and ``on`` it was written with. An entry naming any of
+    :data:`SURFACE_KEYS` owns all of them, else a borrowed ``off`` sits beside a
+    ladder of the entry's own with no off rung and every turn fails validation.
+    Borrowing the surface for a ladder of the entry's own, the narrowed one a
+    flat-shape entry stores, drops an ``off`` none of its rungs can apply.
+    """
+    if any(k in own for k in SURFACE_KEYS):
+        borrowed = {k: v for k, v in borrowed.items() if k not in SURFACE_KEYS}
+    merged = {**borrowed, **own}
+    efforts = merged.get("efforts")
+    if (
+        "off" in borrowed
+        and "efforts" in own
+        and isinstance(efforts, list)
+        and not OFF_LEVELS.intersection(lv for lv in efforts if isinstance(lv, str))
+    ):
+        del merged["off"]
+    return merged
+
+
+def inherited_declarations(entry: dict, shadowed: dict | None, manifest: ManifestSource) -> dict:
+    """What a routed custom entry takes from the built-in whose name it took.
 
     Presence, not truthiness: an entry declaring ``reasoning_efforts: []`` is
     saying the model honors no levels, and the shadowed ladder must not
     overwrite that answer.
 
-    ``reasoning`` fills in key by key rather than whole, because the block
+    ``reasoning`` fills in by half rather than whole, because the block
     bundles two declarations -- which levels exist, and where the chosen one is
     written -- and an entry that names one still needs the other. Inheriting it
     whole discards a ladder stored in the flat shape, which carries no
     ``reasoning`` key to block the inheritance; inheriting nothing when the
-    entry names any key at all strands a partial block with no surface.
+    entry names any key at all strands a partial block with no surface. The
+    surface itself comes whole from one side (``_merged_reasoning``). An entry
+    on another API than the built-in's keeps only its own (``borrows_reasoning``).
     """
     if not shadowed:
-        return entry
+        return {}
     inherited = {k: shadowed[k] for k in SHADOW_INHERITED if k not in entry and k in shadowed}
-    reasoning = {**reasoning_block(shadowed), **reasoning_block(entry)}
+    borrowed = reasoning_block(shadowed) if _borrows_from(entry, shadowed, manifest) else {}
+    reasoning = _merged_reasoning(reasoning_block(entry), borrowed)
     if reasoning:
         inherited["reasoning"] = reasoning
+    return inherited
+
+
+def with_inherited_declarations(entry: dict, shadowed: dict | None, manifest: ManifestSource) -> dict:
+    """A routed custom entry filled in from the built-in whose name it took."""
+    inherited = inherited_declarations(entry, shadowed, manifest)
     return {**entry, **inherited} if inherited else entry
 
 
@@ -214,6 +336,9 @@ class ModelSpec:
     sdk_fallback: str | None = None
     #: Response-API opt-in the entry states outright, overriding the provider's.
     use_response_api_override: bool | None = None
+    #: ``provider`` is the user's own under a name the manifest also uses, so
+    #: none of the manifest's declarations for that name apply to it.
+    own_provider: bool = False
     #: ``ModelProfile`` keys the entry declares, laid over the SDK's own table,
     #: which most models are missing from. Compaction sizes its summary input
     #: to ``max_input_tokens``.
@@ -243,14 +368,14 @@ class ModelSpec:
         )
 
     @classmethod
-    def from_custom(cls, config: dict, shadowed: dict | None = None) -> "ModelSpec":
-        """A user-defined entry, which carries its own model_id and ladder.
+    def from_custom(cls, config: dict, model_config: ManifestSource) -> "ModelSpec":
+        """A user-defined entry, routed, which carries its own model_id and ladder.
 
-        ``shadowed`` is the manifest row whose name this entry took, when it
-        took one. The entry still routes the call, but a level it does not list
-        itself is the built-in's to declare.
+        When it took a manifest model's name it still routes the call, but a
+        level it does not list itself is the built-in's to declare.
         """
-        declared = with_inherited_declarations(config, shadowed)
+        shadowed = shadowed_model(config, model_config)
+        declared = with_inherited_declarations(config, shadowed, model_config)
         reasoning = reasoning_block(declared)
         # The entry's own half of that, kept apart: what it says about itself
         # outranks anything it borrowed from the name it took.
@@ -304,5 +429,6 @@ class ModelSpec:
             use_response_api_override=(
                 None if declared_response_api is None else bool(declared_response_api)
             ),
+            own_provider=bool(config.get("_own_provider")),
             profile=profile_overrides(declared),
         )

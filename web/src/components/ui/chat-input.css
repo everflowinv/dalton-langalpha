@@ -156,65 +156,15 @@
   color: var(--color-text-muted, #8b8fa3);
 }
 
-.model-selector-trigger:hover:not([data-state=open]):not(:disabled) {
+/* Open reads as the hover held, not as a selection: the pill names a
+   setting, and an accent fill and edge made it look like the active control. */
+.model-selector-trigger:hover:not(:disabled),
+.model-selector-trigger[data-state=open] {
   background: var(--color-border-muted);
 }
 
 .model-selector-trigger[data-state=open] {
-  background: var(--color-accent-soft);
   color: var(--color-text-primary);
-  border-color: var(--color-accent-overlay);
-}
-
-/* ====== Model selector controls (inside Radix DropdownMenuContent) ====== */
-
-/* Pushes the chevron to the edge and keeps the value right-aligned under it. */
-.model-setting-value {
-  flex: 1;
-  min-width: 0;
-  text-align: right;
-  color: var(--color-text-tertiary);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.model-setting-caption {
-  padding: 6px 10px 8px;
-  font-size: 0.6875rem;
-  line-height: 1.45;
-  color: var(--color-text-tertiary);
-}
-
-.model-setting-option-label {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-}
-
-.model-setting-badge {
-  padding: 1px 5px;
-  border-radius: 4px;
-  background-color: var(--color-bg-card);
-  color: var(--color-text-tertiary);
-  font-size: 0.625rem;
-  font-weight: 500;
-  line-height: 1.5;
-}
-
-.model-setting-hint {
-  display: block;
-  margin-top: 1px;
-  font-size: 0.6875rem;
-  line-height: 1.4;
-  color: var(--color-text-tertiary);
-}
-
-/* Mobile expands the options in place (Radix submenus lose a tap there), so
-   they need an indent to read as children of the row above. The caption is not
-   an item and keeps its own padding. */
-.model-setting-options [role^='menuitem'] {
-  padding-left: 24px;
 }
 
 /* ====== Send / stop button (quiet ink) ====== */
@@ -271,9 +221,10 @@
 
 /* ====== Recording State for Container ====== */
 
-/* The composer's edge is all that changes on it: focus arriving lights it over
- * quick and leaving lets it go over exit, and recording's red edge and glow
- * ride the same transition. */
+/* The composer's edge changes only for recording: its red edge and glow come
+ * in over quick and go over exit. Focus leaves the edge neutral. The caret
+ * already says where typing goes, and an accent edge would compete with the
+ * menus its pills open against it. */
 .chat-input-container {
   position: relative;
   transition:
@@ -281,15 +232,8 @@
     box-shadow var(--motion-exit) var(--ease-out);
 }
 
-.chat-input-container:focus-within,
 .chat-input-container.recording {
   transition-duration: var(--motion-quick);
-}
-
-/* Resting border stays neutral; focus is an intentional-action moment, so it
- * earns a full-strength accent edge (never a fill or a glow). */
-.chat-input-container:focus-within:not(.recording) {
-  border-color: var(--color-accent-primary);
 }
 
 .chat-input-container.recording {

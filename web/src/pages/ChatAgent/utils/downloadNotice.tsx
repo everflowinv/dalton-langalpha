@@ -3,6 +3,7 @@ import type { TFunction } from 'i18next';
 import i18n from '@/i18n';
 import { toast } from '@/components/ui/use-toast';
 import { authSessionCheck, registerAuthReset } from '@/lib/authResets';
+import { holdReload } from '@/lib/reloadHolds';
 import { DownloadProgress, DownloadStarted } from '../components/filePanel/DownloadProgress';
 
 // Below this a save feels instant and a notice would only flash.
@@ -78,12 +79,14 @@ export function trackPending(key: string, run: () => Promise<boolean>): Promise<
   if (running) return running;
   if (started.has(key)) return Promise.resolve(true);
   const current = authSessionCheck();
+  const release = holdReload();
   const tracked: Promise<boolean> = run()
     .then((handedOff) => {
       if (handedOff && current()) markStarted(key);
       return handedOff;
     })
     .finally(() => {
+      release();
       if (inFlight.get(key) === tracked) inFlight.delete(key);
       notify();
     });

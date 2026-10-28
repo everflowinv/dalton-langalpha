@@ -6,6 +6,7 @@ import { useWorkspaces } from '../../../hooks/useWorkspaces';
 import { isHomeWorkspace } from '@/lib/homeWorkspace';
 import { CACHE_ONLY_META, queryKeys } from '../../../lib/queryKeys';
 import { createEmitter } from '@/lib/emitter';
+import { authSessionCheck, registerAuthReset } from '@/lib/authResets';
 import { isArchivedThreadsKey, patchThreadRows, rollbackThreadRows } from '@/lib/threadRowActions';
 import type { ThreadRowMapper } from '@/lib/threadRowActions';
 import {
@@ -16,9 +17,11 @@ import {
   type ThreadsData,
 } from '@/lib/navThreadsStore';
 import type { ResourceTier, ThreadsResponse, Workspace, WorkspacesResponse } from '@/types/api';
-import { getWorkspaces, getWorkspaceThreads, reorderWorkspaces, updateThread } from '../utils/api';
+import { patchThreadTitle } from '@/lib/threadListCache';
+import { getThread, getWorkspaces, getWorkspaceThreads, reorderWorkspaces, updateThread, updateThreadTitle } from '../utils/api';
 import { workspaceThreadsQuery } from '../utils/threadQueries';
 import { pinWorkspaceRow, rankCachedWorkspaces, renameWorkspaceRow, unrankCachedWorkspaces } from './workspaceRowActions';
+import { deleteThreadRow } from './deleteThreadRow';
 import { useNavPrefs } from '../utils/navPrefs';
 import { denialMessage } from '../utils/denialMessage';
 
@@ -81,6 +84,12 @@ export function forgetStableNavOrder(workspaceId: string) {
     if (idx !== -1) _frozenWorkspaceOrder.splice(idx, 1);
   }
 }
+
+// Each thread's latest rename. Module-level for the same reason as the
+// frozen orders: every cached ChatView on mobile mounts its own nav drawer,
+// and two drawers renaming one thread must share one count.
+const _renameSeq = new Map<string, number>();
+registerAuthReset(() => _renameSeq.clear());
 
 // Bump notifications: chatting in a thread moves it to the top of its
 // workspace's list (like normal chat apps), while clicking around never
@@ -500,6 +509,50 @@ export function useNavigationData(currentWorkspaceId: string) {
     return patchThread(wsId, threadId, { archived: true }, { remove: true });
   }, [patchThread]);
 
+  // Rename a thread. The inline field closes at once, so the new title lands
+  // in every cache before the server answers, and a refusal puts the old one
+  // back and says so in a toast. A thread's renames reach the server one at a
+  // time (updateThreadTitle queues them), and only the latest one writes the
+  // caches when it answers: an earlier one answering must not show its title
+  // over a later one. A refusal puts back the title the server holds, read
+  // again, and only where the refused title still shows: a remembered one may
+  // be an earlier rename's that never saved, and an entry another writer has
+  // moved on since keeps its newer title. The count is the
+  // module's (_renameSeq), shared by every mounted panel; an answer that
+  // arrives after a sign-out belongs to the session before it and is dropped.
+  const renameThread = useCallback(async (wsId: string, threadId: string, title: string, previousTitle: string) => {
+    const seq = (_renameSeq.get(threadId) ?? 0) + 1;
+    _renameSeq.set(threadId, seq);
+    const isLatest = () => _renameSeq.get(threadId) === seq;
+    const sameSession = authSessionCheck();
+    patchThreadTitle(queryClient, threadId, title);
+    try {
+      const updated = await updateThreadTitle(threadId, title);
+      if (!sameSession()) return;
+      if (isLatest()) patchThreadTitle(queryClient, threadId, updated.title ?? title, updated.updated_at);
+    } catch (e) {
+      if (!sameSession()) return;
+      console.warn('[useNavigationData] Failed to rename thread:', e);
+      toast({ variant: 'destructive', title: t('thread.failedRenameThread'), description: denialMessage(e, t) });
+      if (!isLatest()) return;
+      const held = await getThread(threadId).catch(() => null);
+      if (!sameSession() || !isLatest()) return;
+      patchThreadTitle(queryClient, threadId, held?.title ?? previousTitle, undefined, { from: title });
+    }
+    if (!isLatest()) return;
+    // A list read already in flight when the field closed would land the old
+    // title, and a refused rename may have put back one that never saved:
+    // read the server's title again now that it has answered.
+    queryClient.invalidateQueries({ queryKey: queryKeys.threads.byWorkspace(wsId) });
+    queryClient.invalidateQueries({ queryKey: queryKeys.threads.detail(threadId) });
+  }, [queryClient, t]);
+
+  // Delete a thread for good. Rejects when the server refuses, so the
+  // confirm dialog can keep the row and show why.
+  const deleteThread = useCallback((wsId: string, threadId: string) => {
+    return deleteThreadRow(queryClient, wsId, threadId);
+  }, [queryClient]);
+
   const hasMore = useMemo(() => {
     if (showAll) return false;
     if ((workspaceLimit as number) < allFetched.length) return true;
@@ -696,5 +749,5 @@ export function useNavigationData(currentWorkspaceId: string) {
   // 'custom'-order action (a drop persists sort_order the view wouldn't
   // reflect), so the consumer withholds the handler to disable the affordance.
   // Mirrors the gallery, where reordering only applies to the custom arrangement.
-  return { workspaces, workspaceThreads: mergedThreads, loading: isLoading, hasMore, loadAll, expandWorkspace, loadMoreThreads, reorderWorkspace, canReorderWorkspaces: orderBy === 'custom', pinWorkspace, renameWorkspace, pinThread, archiveThread };
+  return { workspaces, workspaceThreads: mergedThreads, loading: isLoading, hasMore, loadAll, expandWorkspace, loadMoreThreads, reorderWorkspace, canReorderWorkspaces: orderBy === 'custom', pinWorkspace, renameWorkspace, pinThread, archiveThread, renameThread, deleteThread };
 }

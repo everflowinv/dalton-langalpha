@@ -56,24 +56,7 @@ ENVELOPE_CASES: dict[str, dict] = {
         "handoff": False,
         "reset": False,
     },
-    "envelope/updates.md.j2": {
-        "updates": [
-            {
-                "kind": "market_watch",
-                "text": "AAPL 232.10 (+1.2%) as of 15:01 ET",
-                "provenance": "market_watch",
-                "created_at": "2026-09-08T19:01Z",
-                "schema_version": 1,
-            },
-            {
-                "kind": "agentmd_changed",
-                "text": "agent.md gained a Thread Index section.",
-                "provenance": "another thread in this workspace",
-                "created_at": "2026-09-08T14:02Z",
-                "schema_version": 1,
-            },
-        ]
-    },
+    "envelope/updates.md.j2": {"stamp": "AAPL 232.10 (+1.2%) as of 15:01 ET"},
     "envelope/update_row.md.j2": {
         "update": {
             "kind": "agent_md_changed",
@@ -375,33 +358,6 @@ class TestUpdates:
         would break the format the market-watch skill teaches."""
         rendered = _render("envelope/updates.md.j2", "detailed")
         assert "\nAAPL 232.10 (+1.2%) as of 15:01 ET\n" in rendered
-
-    def test_other_kinds_carry_their_provenance(self):
-        rendered = _render("envelope/updates.md.j2", "lean")
-        assert "agentmd_changed" in rendered
-        assert "another thread in this workspace" in rendered
-
-    def test_provenance_may_be_a_mapping(self):
-        """The writer side records provenance as a bag of fields; a caller that
-        hands over a bare label reads the same. Both have to land as text."""
-        rendered = init_loader().render(
-            "envelope/updates.md.j2",
-            updates=[
-                {
-                    "kind": "memory_changed",
-                    "text": "Two pointers added to the user memory index.",
-                    "provenance": {"source": "the workspace tier"},
-                    "created_at": "2026-09-08T14:02Z",
-                    "schema_version": 2,
-                }
-            ],
-        )
-        assert "the workspace tier" in rendered
-        assert "{" not in rendered, "a provenance mapping leaked its repr"
-
-    def test_schema_version_is_not_rendered(self):
-        """It is dispatch machinery for the envelope, not prompt surface."""
-        assert "schema_version" not in _render("envelope/updates.md.j2", "detailed")
 
 
 class TestHarnessRows:

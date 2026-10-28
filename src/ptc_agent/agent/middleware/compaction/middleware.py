@@ -7,11 +7,17 @@ on the one before.
 
 - Tier 1: at a turn start after a long pause, when the provider's prompt
   cache has expired, large tool arguments are cut to a pointer at the
-  transcript file that keeps them and stale Read results are hidden.
+  transcript file that keeps them and stale Read results are hidden, never
+  ahead of thinking a later call is checked against (see ``select_offloads``).
+  Off unless the operator turns it on (see ``OffloadSettings.idle_seconds``).
 - Tier 2: when the context reaches its threshold, or the model refuses it
-  as too long, the start of the view is summarized (see ``compact``), and
-  the attachments in what it keeps are taken out until it fits; and between
-  turns when the user asks (see ``between_turns``).
+  as too long, the start of the view is summarized (see ``compact``), all of
+  it at a turn start while the thread's system prompt is stale, so the call
+  after it can take the new one (see ``rebuild_pending``), and
+  the attachments in what it keeps are taken out until it fits; on Claude,
+  whose kept turns are sent as they were, the summary takes them instead
+  (see ``fitting.Fit``); and between turns when the user asks (see
+  ``between_turns``).
 - The window: on the main agent, at each pass through ``before_agent``, the
   runs a summary stands in for are trimmed from the checkpoint once the
   server holds them (see ``window``).
@@ -26,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import dataclasses
 import functools
 import logging
 import time
@@ -55,11 +62,11 @@ from src.llms.provider_compaction import (
     native_answer,
     native_kind,
 )
-from src.llms.token_counter import extract_token_usage
 
 from ptc_agent.agent.state import ensure_message_ids
 from ptc_agent.agent.middleware.compaction.between_turns import Ask, HandOff, asked
 from ptc_agent.agent.middleware.compaction.types import CompactionState, OffloadSettings
+from ptc_agent.agent.middleware.compaction.fitting import Fit, reported_usage
 from ptc_agent.agent.middleware.compaction.compact import (
     NOTHING_TO_COMPACT,
     Compaction,
@@ -81,32 +88,29 @@ from ptc_agent.agent.middleware.compaction.summarize import (
     summary_text,
 )
 from ptc_agent.agent.middleware.compaction.summary_request import (
-    HANDOFF_SUMMARY_PROMPT,
-    NATIVE_SUMMARY_PROMPT,
-    SELF_SUMMARY_PROMPT,
     finished_summary,
+    keeps_turns,
+    summary_prompt,
 )
 from ptc_agent.agent.middleware.compaction.utils import (
-    attachment_tokens,
     get_effective_messages,
     handed_off,
-    pdf_pages,
     provider_cutoff,
     read_ahead,
     stamp_compaction_summary,
     stamp_context_threshold,
     target_cost,
+    turn_start_cut,
     with_summary_text,
 )
+from ptc_agent.agent.middleware.runtime_context.frozen_prompt import rebuild_pending
 from ptc_agent.agent.middleware.compaction.offloading import (
     is_idle,
     offload_view,
     record_offloads,
     recorded_offloads,
-    removed_attachments,
     select_offloads,
 )
-from ptc_agent.agent.middleware.file_operations.multimodal_strip import remove_attachments
 from ptc_agent.agent.middleware.compaction.window import (
     WindowCarry,
     WindowCoverage,
@@ -168,19 +172,6 @@ def _user_texts(messages: Sequence[AnyMessage]) -> list[str]:
 
 def _last_ai(response: ModelResponse) -> AIMessage | None:
     return next((m for m in reversed(response.result or ()) if isinstance(m, AIMessage)), None)
-
-
-def _reported_usage(response: ModelResponse) -> tuple[AIMessage, int, int] | None:
-    """The newest AI message in ``response`` that reports its input tokens,
-    with its (input, output) tokens; None when none does."""
-    for msg in reversed(response.result or ()):
-        if not isinstance(msg, AIMessage):
-            continue
-        usage = extract_token_usage(msg)
-        input_tokens = usage.get("input_tokens", 0)
-        if input_tokens > 0:
-            return msg, input_tokens, usage.get("output_tokens", 0)
-    return None
 
 
 def _log_usage(call: str, message: AIMessage | None) -> None:
@@ -355,26 +346,45 @@ class CompactionMiddleware(AgentMiddleware):
         else:
             logger.info("[Compaction] Triggered: %d >= %d tokens", tokens, self._token_threshold)
 
-        cutoff = self._cutoff(view, request.model)
+        # A stale system prompt stays while any thinking it bound is in view,
+        # so at a turn start the summary keeps none: its own request still
+        # carries the old prompt and tools, which the thinking it summarizes
+        # is checked against, and the call after it takes the new ones.
+        rebuild = turn_start_cut(view) if rebuild_pending(request.state) else 0
+        cutoff = rebuild or self._cutoff(view, request.model)
+        fit = Fit(
+            self._token_threshold,
+            system,
+            estimate,
+            lossless=self._native and native_kind(request.model) == "anthropic",
+        )
+        if rebuild:
+            logger.info("[Compaction] Rebuild: the summary keeps no turns")
+        elif fit.lossless:
+            cutoff = fit.cut(view, cutoff, tokens, refused=refusal is not None)
         if cutoff <= 0:
             # All of it is the kept tail: the attachments are all that can go.
-            response, removed, spared = await self._send_fitted(
-                request, handler, view, system, estimate, refusal=refusal
-            )
+            fitted = await fit.send(request, handler, view, refusal=refusal)
             return self._answered(
-                response, self._removal(request.state, removed), spared=spared
+                fitted.response, fitted.update(request.state), spared=fitted.spared
             )
 
-        compaction = await self._summarize(request, handler, view, cutoff)
+        compaction = await self._summarize(request, handler, view, cutoff, rebuild=bool(rebuild))
+        note = compaction.note_row()
         # A refusal of the view says nothing of what the summary made room
-        # for, so its messages are fitted by estimate like any others.
-        response, removed, spared = await self._send_fitted(
-            request, handler, compaction.messages, system, estimate
+        # for, so its messages are fitted by estimate like any others. The
+        # note goes into history ahead of the answer produced behind it.
+        fitted = await fit.send(
+            request, handler, [*compaction.messages, note] if note is not None else compaction.messages
         )
-        self._stamp_summary(response, compaction)
+        if note is not None:
+            fitted = fitted._replace(
+                response=dataclasses.replace(fitted.response, result=[note, *fitted.response.result])
+            )
+        self._stamp_summary(fitted.response, compaction)
         update = compaction.update(request.state)
         return self._answered(
-            response, {**update, **self._removal(update, removed)}, spared=spared
+            fitted.response, {**update, **fitted.update(update)}, spared=fitted.spared
         )
 
     async def _summarize(
@@ -383,21 +393,30 @@ class CompactionMiddleware(AgentMiddleware):
         handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
         view: list[AnyMessage],
         cutoff: int,
+        *,
+        rebuild: bool = False,
     ) -> Compaction:
         """Summarize ``view`` before ``cutoff``, first by the agent's own
         model: its provider compacting the conversation where it can, else the
         model writing the summary itself (see ``_writes_own``). A provider
         that could compact but is told not to leaves it to the summarizer, as
-        the setting says."""
+        the setting says. ``rebuild`` is True for a summary that keeps no
+        turn, whose cut is the user's new message: Claude's cut stays there
+        rather than move back onto the answer before it. Whether turns stay
+        after the summary is read from what it keeps (``keeps_turns``)."""
         own: Own | None = None
         kind = native_kind(request.model)
         # Claude reads its block only where the kept turns can follow it.
-        cut = provider_cutoff(view, cutoff) if kind == "anthropic" else cutoff
+        cut = provider_cutoff(view, cutoff) if kind == "anthropic" and not rebuild else cutoff
         if kind is not None and self._native and cut > 0:
             cutoff = cut
-            own = functools.partial(self._provider_summary, request, handler)
+            own = functools.partial(
+                self._provider_summary, request, handler, notes=self._notes_dir is not None
+            )
         elif kind is None and self._writes_own(request):
-            own = functools.partial(self._self_summary, request, handler)
+            own = functools.partial(
+                self._self_summary, request, handler, notes=self._notes_dir is not None
+            )
         return await self._compact(request, view, cutoff, self._transcript_target(), own)
 
     def _writes_own(self, request: ModelRequest) -> bool:
@@ -442,7 +461,7 @@ class CompactionMiddleware(AgentMiddleware):
     ) -> Compaction | HumanMessage | None:
         """What a call between turns asks for (see ``between_turns``)."""
         if isinstance(ask, HandOff):
-            return await self._hand_off(request, handler, view)
+            return await self._hand_off(request, handler, view, notes=self._notes_dir is not None)
         cutoff = self._cutoff(view, request.model)
         if cutoff <= 0:
             raise ValueError(NOTHING_TO_COMPACT)
@@ -453,6 +472,8 @@ class CompactionMiddleware(AgentMiddleware):
         request: ModelRequest,
         handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
         view: list[AnyMessage],
+        *,
+        notes: bool,
     ) -> HumanMessage | None:
         """The view's opening summary written out by the agent's model, when
         it is one only that model's provider can read, else None.
@@ -466,10 +487,11 @@ class CompactionMiddleware(AgentMiddleware):
         head = view[0] if view and is_summary_message(view[0]) else None
         if not isinstance(head, HumanMessage) or not is_opaque(head) or handed_off(head):
             return None
+        prompt = summary_prompt("handoff", keeps_turns(view[1:]), notes)
         with as_sent():
             response = await handler(
                 request.override(
-                    messages=[head, HumanMessage(HANDOFF_SUMMARY_PROMPT)],
+                    messages=[head, HumanMessage(prompt)],
                     tool_choice="none",
                 )
             )
@@ -480,129 +502,6 @@ class CompactionMiddleware(AgentMiddleware):
         if written is None:
             raise ValueError("the model wrote no hand-off summary")
         return written
-
-    async def _send_fitted(
-        self,
-        request: ModelRequest,
-        handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
-        messages: list[AnyMessage],
-        system: list[Any],
-        estimate: Estimate,
-        *,
-        refusal: Exception | None = None,
-    ) -> tuple[ModelResponse, set[str], int]:
-        """Send ``messages`` with as many of their attachments taken out as
-        it takes to fit. Returns the response, the ids of the messages that
-        lose theirs, and what the provider counted for the ones this send
-        still carried (see ``_measured_fit``).
-
-        Below the threshold is what fits, by estimate: the oldest go first,
-        since the newest are what the agent is working on. Left over it, the
-        next call would summarize again at once. A refusal means the estimate
-        fell short, so after one every attachment goes. ``refusal`` is one
-        ``messages`` already met as they are, which is not sent again.
-        """
-        removed: set[str] = set()
-        if refusal is None:
-            removed = self._to_remove(messages, system, estimate, everything=False)
-            try:
-                response = await handler(
-                    request.override(messages=self._without(messages, removed))
-                )
-            except Exception as exc:
-                if not is_context_overflow(exc):
-                    raise
-                refusal = exc
-            else:
-                more, spared = self._measured_fit(response, messages, removed, system, estimate)
-                return response, removed | more, spared
-        everything = self._to_remove(messages, system, estimate, everything=True)
-        if everything == removed:
-            raise refusal
-        logger.warning("[Compaction] Context overflow, removing every attachment kept")
-        response = await handler(request.override(messages=self._without(messages, everything)))
-        return response, everything, 0
-
-    def _measured_fit(
-        self,
-        response: ModelResponse,
-        messages: list[AnyMessage],
-        removed: set[str],
-        system: list[Any],
-        estimate: Estimate,
-    ) -> tuple[set[str], int]:
-        """The ids of the messages whose attachments go too after a send
-        fitted by estimate that the provider measured over the threshold, and
-        the tokens they took.
-
-        The estimate can fall short of the provider's count, which includes
-        the tool schemas and a PDF's real pages. Left over the threshold, the
-        next call would summarize again and remove nothing, and so would each
-        one after. The measurement corrects the estimate: each attachment
-        counts at its estimate times measured over estimated for the view
-        that was sent, the oldest going first until the excess is covered.
-        """
-        usage = _reported_usage(response)
-        if usage is None:
-            return set(), 0
-        _, input_tokens, output_tokens = usage
-        over = input_tokens + output_tokens - self._token_threshold
-        if over < 0:
-            return set(), 0
-        fitted = self._without(messages, removed)
-        estimated = estimate([*system, *fitted])
-        if estimated <= 0:
-            return set(), 0
-        more: set[str] = set()
-        spared = 0
-        for msg in messages:
-            if over < 0:
-                break
-            if not msg.id or msg.id in removed:
-                continue
-            taken = round(attachment_tokens([msg], estimate.cost) * input_tokens / estimated)
-            if taken:
-                more.add(msg.id)
-                spared += taken
-                over -= taken
-        return more, spared
-
-    def _to_remove(
-        self,
-        messages: list[AnyMessage],
-        system: list[Any],
-        estimate: Estimate,
-        *,
-        everything: bool,
-    ) -> set[str]:
-        """The ids of the messages in ``messages`` whose attachments go.
-
-        Only attachments the target is sent count: one it cannot read reaches
-        it as the strip's placeholder, whose guidance a removal would replace.
-        """
-        costs = [(msg.id, attachment_tokens([msg], estimate.cost)) for msg in messages]
-        costs = [(msg_id, tokens) for msg_id, tokens in costs if tokens and msg_id]
-        if everything:
-            return {msg_id for msg_id, _ in costs}
-        over = estimate([*system, *messages]) - self._token_threshold
-        removed: set[str] = set()
-        for msg_id, tokens in costs:
-            if over < 0:
-                break
-            removed.add(msg_id)
-            over -= tokens
-        return removed
-
-    @staticmethod
-    def _without(messages: list[AnyMessage], removed: set[str]) -> list[AnyMessage]:
-        return remove_attachments(messages, removed, pages=pdf_pages)
-
-    @staticmethod
-    def _removal(state: Mapping[str, Any], removed: set[str]) -> dict[str, Any]:
-        """The update recording ``removed`` beside what ``state`` holds."""
-        if not removed:
-            return {}
-        return {"_removed_attachment_ids": removed_attachments(state) | removed}
 
     async def _compact(
         self,
@@ -649,20 +548,28 @@ class CompactionMiddleware(AgentMiddleware):
         request: ModelRequest,
         handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
         to_summarize: list[AnyMessage],
+        kept: bool,
+        *,
+        notes: bool,
     ) -> NativeAnswer:
         """The agent's provider compacting ``to_summarize`` itself, with the
-        summary prompt in place of its own where it takes one (Claude).
+        summary prompt in place of its own where it takes one (Claude), the
+        one for a summary that keeps no turn when ``kept`` is False.
 
         Sent through ``handler`` so the request is the conversation's own:
         the same system prompt, tools and thinking, which its cache and the
-        thinking in the kept turns are checked against. It stays out of the
-        turn's message stream, where its reply would read as the answer.
-        OpenAI's goes after the user's own messages it summarized.
+        thinking in the kept turns are checked against. It goes to this model
+        as sent: the kept thinking stays valid only through a compaction its
+        own model writes, and the summarizer is the fallback here. It stays
+        out of the turn's message stream, where its reply would read as the
+        answer. OpenAI's goes after the user's own messages it summarized.
         """
         settings = compaction_settings(
-            request.model, request.model_settings, NATIVE_SUMMARY_PROMPT
+            request.model,
+            request.model_settings,
+            summary_prompt("native", kept, notes),
         )
-        with _unstreamed():
+        with as_sent(), _unstreamed():
             response = await handler(
                 request.override(messages=to_summarize, model_settings=settings)
             )
@@ -679,6 +586,9 @@ class CompactionMiddleware(AgentMiddleware):
         request: ModelRequest,
         handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
         to_summarize: list[AnyMessage],
+        kept: bool,
+        *,
+        notes: bool,
     ) -> str:
         """The agent's model writing the summary of ``to_summarize`` as text,
         asked in the last user message of its own request.
@@ -692,7 +602,12 @@ class CompactionMiddleware(AgentMiddleware):
         """
         with as_sent(), _unstreamed():
             response = await handler(
-                request.override(messages=[*to_summarize, HumanMessage(SELF_SUMMARY_PROMPT)])
+                request.override(
+                    messages=[
+                        *to_summarize,
+                        HumanMessage(summary_prompt("self", kept, notes)),
+                    ]
+                )
             )
         message = _last_ai(response)
         _log_usage("self summary", message)
@@ -751,7 +666,7 @@ class CompactionMiddleware(AgentMiddleware):
         to the frontend with the threshold they fill and stamped with it for
         replay, and with its growth from ``reading``, or (0, 0) when none
         does."""
-        usage = _reported_usage(response)
+        usage = reported_usage(response)
         if usage is None:
             return (0, 0)
         msg, input_tokens, output_tokens = usage

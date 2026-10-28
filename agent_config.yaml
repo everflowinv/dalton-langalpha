@@ -250,10 +250,12 @@ compaction:
   # is the fallback, and writes it instead when a separate compaction model is
   # picked. false: always the transcript summarizer.
   self_summary: true
-  # Tier 1: when a turn starts this long after the model's last response
-  # (the prompt cache is cold by then), hide large tool args and stale Read
-  # results in older messages. null turns it off.
-  truncate_args_idle_minutes: 90
+  # Tier 1: when a turn starts this many minutes after the model's last
+  # response (the prompt cache is meant to be cold by then), hide large tool
+  # args and stale Read results in older messages. Off (null) by default: what
+  # it saves is negligible, and on Claude it invalidates the preserved
+  # thinking after what it hides.
+  truncate_args_idle_minutes: null
   truncate_args_keep_messages: 10 # Protect last N messages from Tier 1
   truncate_args_max_length: 2000 # Per-arg-value max chars before truncation
 

@@ -70,8 +70,8 @@ function DepthPage({ depth }: { depth: ResearchDepth }) {
 
 const DELIVERABLE_ICONS: Record<Deliverable, ComponentType<{ className?: string }>> = {
   text: MessageSquareText,
+  markdown: FileText,
   visual: LayoutDashboard,
-  report: FileText,
 };
 
 const PROACTIVITY_ICONS: Record<Proactivity, ComponentType<{ className?: string }>> = {

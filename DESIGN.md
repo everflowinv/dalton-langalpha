@@ -14,8 +14,9 @@ be declared there (enforced by `web/src/styles/__tests__/tokenRefs.test.ts`).
   **annotation color, not a brand fill** (see Accent discipline).
 - **Radius**: soft, growing with the element. Pick from the scale, never a new value:
   4px inline code · 6px thumbnails · 8px (`--radius`) the default for rows, tables
-  and most surfaces · 12px transcript file cards and the composer's send button ·
-  pills (half the height) for chips, tags and avatars.
+  and most surfaces, and the user's avatar up to 36px · 12px transcript file cards,
+  the composer's send button and the 48px settings avatar · pills (half the height)
+  for chips, tags and agent avatars.
   - **One exception, the chat composer at 22px**: concentric with its 12px send
     button, which sits 10px from the bottom edge (12 + 10). The todo tab tucked
     behind it takes 16px, about 0.7× the composer. Change the composer's radius
@@ -28,7 +29,7 @@ be declared there (enforced by `web/src/styles/__tests__/tokenRefs.test.ts`).
 | Role | Dark | Light |
 |---|---|---|
 | Page ground | `hsl(var(--background))` charcoal ~#191919 | white |
-| Canvas under card grids | = page | `#F5F4F1` warm paper |
+| Canvas under filled cards (orders; the dashboard's frames sit on the page) | = page | `#F5F4F1` warm paper |
 | Cards | `hsl(var(--card))` ~#202020 | white + `#E8E8E6` hairline |
 | Elevated (menus, tooltips) | `#2A2B2E` | `#F7F7F6` |
 | Primary text | `#E6E6E4` | `#1F1F1E` |
@@ -126,13 +127,14 @@ A tool call that returns data (a quote, a chart, a filing, an order) lands in
 the transcript as a card and opens a detail panel in the same language
 (`web/src/pages/ChatAgent/components/charts/TermCard.tsx`, `TermPanel.tsx`).
 The reader picks one of three styles in Settings, per device
-(`web/src/lib/cardStyle.ts`, stamped on `<html>` as `data-card-style`):
+(`web/src/lib/cardStyle.ts`, stamped on `<html>` as `data-card-style`); the
+dashboard's widgets and windows follow it too:
 
-- **Balanced**, the default: Terminal's frame, its title set into the top edge,
+- **Balanced**: Terminal's frame, its title set into the top edge,
   with words in the text face, figures in mono and tags as pills. Data reads as
   data beside the filled cards a reply opens (files, dashboards).
-- **Quiet**: the same type and marks in the platform's own card, filled, its
-  title inside, on the warm grays.
+- **Quiet**, the default: the same type and marks in the platform's own card,
+  filled, its title inside, on the warm grays, so cards change the app least.
 - **Terminal**: the unfilled frame with mono throughout, bracket tags, dashed
   rules and dotted leaders, on a cool palette (the `--color-term-*` tokens) so
   a figure reads as data against the warm page.

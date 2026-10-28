@@ -14,6 +14,9 @@ changed underneath reaches the model as a durable row written into history
 An epoch survives until compaction, because compaction is the one event that can
 remove the block from the model's retained history: "the file did not change" is
 not enough after a summarization dropped the injection it is measured against.
+Where Claude's thinking is in view the block outlives that too, since it is the
+prefix every thinking block after it was produced on: nothing rebuilds it, and
+after a summary one row restates every section that moved instead.
 
 The split of work is the point. This module does the IO and the rendering; the
 record itself, and the decision between rebuilding it and filing rows against
@@ -45,8 +48,10 @@ from ptc_agent.agent.middleware.provider_cache import (
 from ptc_agent.agent.middleware.runtime_context.changes import SourceRead
 from ptc_agent.agent.middleware.runtime_context.durable import (
     build_update_message,
+    messages_in_view,
     rows_in_view,
 )
+from ptc_agent.agent.middleware.thinking_binding import holds_bound_thinking
 from ptc_agent.agent.middleware.runtime_context.epoch import (
     MEMO_DISPLAY_CAP,
     MEMORY_TIERS,
@@ -68,6 +73,14 @@ from ptc_agent.agent.middleware.runtime_context.profile import (
     ProfileSwitches,
     profile_read_answered,
     render_user_profile,
+)
+from ptc_agent.agent.middleware.runtime_context.restate import (
+    SECTION_FILES,
+    SECTION_IDENTITY,
+    SECTION_MEMO,
+    SECTION_PROFILE,
+    SECTION_WORKSPACE,
+    note_sent,
 )
 from ptc_agent.agent.middleware.runtime_context.state import STATE_BASELINE, state_get
 from ptc_agent.agent.middleware.runtime_context.templates import render_template
@@ -352,7 +365,9 @@ class BaselineContextMiddleware(AgentMiddleware):
         self._opened = True
         try:
             epoch = BaselineEpoch.from_state(state_get(state, STATE_BASELINE))
-            advanced, rows = advance_epoch(epoch, await self.read_observations(state))
+            advanced, rows = advance_epoch(
+                epoch, await self.read_observations(state), self._render_sections
+            )
             if advanced is None:
                 return None
             written: dict[str, Any] = {STATE_BASELINE: advanced.to_state()}
@@ -379,8 +394,10 @@ class BaselineContextMiddleware(AgentMiddleware):
         # boundary read runs here instead, after the tool result the resume
         # produced. A subagent's instance serves every run of its definition in
         # the parent's turn, and each of those runs enters through
-        # ``abefore_agent``.
-        if self._opened:
+        # ``abefore_agent``. A summary written mid-turn is read here too, on
+        # the call after it, so the row it owes follows the first user-side
+        # message after the turns the summary kept rather than waiting a turn.
+        if self._opened and not _unseen_compaction(state):
             return None
         return await self.abefore_agent(state, runtime)
 
@@ -398,6 +415,9 @@ class BaselineContextMiddleware(AgentMiddleware):
         reads, memo_count = await asyncio.gather(
             self._read_sources(state), self._memo_count()
         )
+        event = state_get(state, "_summarization_event")
+        summary = event.get("summary_message") if isinstance(event, dict) else None
+        sent = note_sent(messages_in_view(state), getattr(summary, "id", None))
         return Observations(
             now=datetime.now(tz=UTC),
             workspace=self._workspace,
@@ -407,7 +427,7 @@ class BaselineContextMiddleware(AgentMiddleware):
             memo_configured=self._memo is not None,
             memo_count=memo_count,
             memo_path=self._memo.display_path if self._memo is not None else "",
-            compaction=compaction_fingerprint(state_get(state, "_summarization_event")),
+            compaction=compaction_fingerprint(event),
             rebuild_after_updates=self._rebuild_after_updates,
             retained_rows=_retained_change_rows(state),
             profile_available=self._profile_available,
@@ -415,6 +435,10 @@ class BaselineContextMiddleware(AgentMiddleware):
             workspace_configured=not self._subagent,
             files_mounted=self._files_mounted,
             channels_enabled=self._switches.channels,
+            wakeups_enabled=self._switches.wakeups,
+            thinking_bound=holds_bound_thinking(messages_in_view(state)),
+            compaction_note=None if sent else _compaction_note(event),
+            compaction_note_sent=sent,
             role=self._role,
         )
 
@@ -573,94 +597,101 @@ class BaselineContextMiddleware(AgentMiddleware):
         """The whole baseline block, in its fixed order.
 
         Reads the frozen epoch and nothing else, which is what makes the block
-        byte-identical for the life of that epoch. The file blocks carry their
-        own one-paragraph trust preface, rendered here rather than in the system
-        prefix so the rule sits next to the text it governs; it is emitted only
-        when there is a file block for it to govern, and the harness blocks go
-        above it so nothing stands between the preface and the files it names.
+        byte-identical for the life of that epoch.
+        """
+        return "\n\n".join(self._render_sections(epoch).values())
+
+    def _render_sections(self, epoch: BaselineEpoch) -> dict[str, str]:
+        """Each section of the block, in its fixed order, keyed by what it states.
+
+        A source's section is keyed by its read kind, the rest by the
+        ``SECTION_*`` names, so a row can state one section whole. An empty
+        section is left out. The file blocks carry their own one-paragraph
+        trust preface, rendered here rather than in the system prefix so the
+        rule sits next to the text it governs; it is emitted only when there
+        is a file block for it to govern, and the harness blocks go above it
+        so nothing stands between the preface and the files it names.
         """
         guidance = self._guidance()
-        parts: list[str] = []
+        parts: dict[str, str] = {}
 
-        parts.append(_workspace_block(epoch.workspace, self._role))
-        parts.append(self._user_profile_block(epoch.profile, epoch.channels_enabled))
+        parts[SECTION_WORKSPACE] = _workspace_block(epoch.workspace, self._role)
+        parts[SECTION_PROFILE] = self._user_profile_block(
+            epoch.profile, epoch.channels_enabled, epoch.wakeups_enabled
+        )
 
         identity = epoch.identity or self._identity()
-        parts.append(
-            render_template(
-                "envelope/baseline_identity.md.j2",
-                guidance=guidance,
-                **identity.to_state(),
-            )
+        parts[SECTION_IDENTITY] = render_template(
+            "envelope/baseline_identity.md.j2",
+            guidance=guidance,
+            **identity.to_state(),
         )
 
         for kind in BLOCK_KINDS:
             entry = epoch.blocks.get(kind)
             if entry is None:
                 continue
-            parts.append(
-                render_template(
-                    HARNESS_BLOCKS[kind].template,
-                    content=entry.text,
-                    guidance=guidance,
-                    subagent=self._subagent,
-                )
+            parts[kind] = render_template(
+                HARNESS_BLOCKS[kind].template,
+                content=entry.text,
+                guidance=guidance,
+                subagent=self._subagent,
             )
 
         if epoch.has_files:
-            parts.append(
-                render_template("envelope/baseline_files.md.j2", guidance=guidance)
+            parts[SECTION_FILES] = render_template(
+                "envelope/baseline_files.md.j2", guidance=guidance
             )
 
         if epoch.agent_md is not None:
-            parts.append(
-                render_template(
-                    "envelope/baseline_agentmd.md.j2",
-                    path=epoch.agent_md.path or AGENT_MD_PATH,
-                    content=epoch.agent_md.text,
-                    guidance=guidance,
-                    role=self._role,
-                )
+            parts["agent_md"] = render_template(
+                "envelope/baseline_agentmd.md.j2",
+                path=epoch.agent_md.path or AGENT_MD_PATH,
+                content=epoch.agent_md.text,
+                guidance=guidance,
+                role=self._role,
             )
 
         for tier in MEMORY_TIERS:
             entry = epoch.memory.get(tier)
             if entry is None:
                 continue
-            parts.append(
-                render_template(
-                    "envelope/baseline_memory.md.j2",
-                    path=entry.path or tier,
-                    content=entry.text,
-                    readonly=not self._sandbox_enabled,
-                    subagent=self._subagent,
-                    guidance=guidance,
-                )
+            parts[f"memory:{tier}"] = render_template(
+                "envelope/baseline_memory.md.j2",
+                path=entry.path or tier,
+                content=entry.text,
+                readonly=not self._sandbox_enabled,
+                subagent=self._subagent,
+                guidance=guidance,
             )
 
         if epoch.memo is not None and epoch.memo.display:
-            parts.append(
+            parts[SECTION_MEMO] = (
                 f'<memo-index count="{epoch.memo.display}" path="{epoch.memo.path}"/>'
             )
 
-        return "\n\n".join(p for p in parts if p)
+        return {key: part for key, part in parts.items() if part}
 
     def _user_profile_block(
-        self, frozen: ProfileSnapshot | None, channels: bool | None = None
+        self,
+        frozen: ProfileSnapshot | None,
+        channels: bool | None = None,
+        wakeups: bool | None = None,
     ) -> str:
         """The ``<user_profile>`` component: identity plus the steering it carries.
 
         Rendered from the epoch's frozen snapshot so the block never moves
         inside an epoch for what the profile says. A preference or count that
         changes mid-thread reaches the model as a `profile_changed` row on the
-        next turn. The wakeups switch is the one exception: it comes from the
-        build, so a flip moves the block on purpose, with the tool. An epoch
-        frozen before profiles were captured falls back to this turn's
-        snapshot, and one that froze no ``channels`` to this build's.
+        next turn. An epoch frozen before profiles were captured falls back to
+        this turn's snapshot, and one that froze no ``channels`` or
+        ``wakeups`` to this build's.
         """
         snapshot = frozen if frozen is not None else self._profile_snapshot()
         if channels is None:
             channels = self._switches.channels
+        if wakeups is None:
+            wakeups = self._switches.wakeups
         if not snapshot.user_profile and not snapshot.user_data_counts:
             return ""
         # A subagent's profile leaves out what only the main agent acts on:
@@ -672,7 +703,7 @@ class BaselineContextMiddleware(AgentMiddleware):
                 snapshot.user_profile,
                 snapshot.user_data_counts or None,
                 main_agent_steering=not self._subagent,
-                switches=replace(self._switches, channels=channels),
+                switches=replace(self._switches, channels=channels, wakeups=wakeups),
                 role=self._role,
             )
         except Exception:  # noqa: BLE001 - one component is not the whole block
@@ -760,6 +791,20 @@ def _workspace_block(workspace: Workspace, role: AgentRole = "analyst") -> str:
     lines.extend(machine_lines(workspace, role))
     body = "\n".join(lines)
     return f"<workspace>\n{body}\n</workspace>"
+
+
+def _unseen_compaction(state: Any) -> bool:
+    """Whether the newest summary in state is one the epoch has not taken in."""
+    seen = compaction_fingerprint(state_get(state, "_summarization_event"))
+    epoch = BaselineEpoch.from_state(state_get(state, STATE_BASELINE))
+    return seen is not None and seen != epoch.compaction_seen
+
+
+def _compaction_note(event: Any) -> str | None:
+    """What the newest summary leaves for the turns after it to read, if anything."""
+    from src.llms.provider_compaction import deferred_text
+
+    return deferred_text(event.get("summary_message") if isinstance(event, dict) else None)
 
 
 async def _read_sandbox_text(session: Any, relative_path: str) -> str | None:

@@ -293,13 +293,15 @@ test.describe('activity live zone', () => {
       const widget = document.querySelector('.inline-widget-container');
       const iframe = widget.querySelector('iframe');
       const row = document.querySelector('[data-turn-fold]');
-      window.widgetFoldProbe = { iframe, samples: [], done: false };
-      const start = performance.now();
+      const probe = window.widgetFoldProbe = { iframe, samples: [], done: false, clicked: null };
+      // The window runs from the click landing, not from here: the click's
+      // actionability checks alone can take most of it on a busy runner.
+      document.addEventListener('click', () => { probe.clicked = performance.now(); }, { capture: true, once: true });
       const sample = () => {
         // Relative to the toggle, so scroll anchoring cannot mask a layout step.
-        window.widgetFoldProbe.samples.push(widget.getBoundingClientRect().top - row.getBoundingClientRect().top);
-        if (performance.now() - start < 1100) requestAnimationFrame(sample);
-        else window.widgetFoldProbe.done = true;
+        probe.samples.push(widget.getBoundingClientRect().top - row.getBoundingClientRect().top);
+        if (probe.clicked === null || performance.now() - probe.clicked < 1100) requestAnimationFrame(sample);
+        else probe.done = true;
       };
       requestAnimationFrame(sample);
     });
@@ -624,7 +626,9 @@ test.describe('tool rows', () => {
       sseEvents.creditUsage(),
     ], delay: 30 });
     await send(page, 'Search then fetch');
-    await expect(page.locator('[id^="activity-summary-"]')).toBeVisible({ timeout: 5000 });
+    // Sampling from the send, so the first sample with a summary is the frame
+    // it arrived in. Started once a poll had found it, the sampler could open
+    // as late as the next call, with the inset already opening.
     await sampleFrames(page, () => {
       let inner = document.querySelector('[id^="activity-summary-"]');
       while (inner && !(inner.style.paddingBottom && inner.parentElement?.style.overflow === 'hidden')) inner = inner.parentElement;
@@ -634,13 +638,18 @@ test.describe('tool rows', () => {
         gap: inner ? parseFloat(getComputedStyle(inner).paddingBottom) : null,
       };
     });
+    await expect(page.locator('[id^="activity-summary-"]')).toBeVisible({ timeout: 5000 });
     await expect(page.locator('.titem.running').filter({ hasText: 'Web Fetch' })).toBeVisible({ timeout: 5000 });
     await page.waitForTimeout(600);
     const samples = (await stopSampling(page)).filter((s) => s.clipped !== null);
     expect(samples[0].gap).toBe(0);
     expect(samples.at(-1).gap).toBe(8);
-    // Frames inside the inset's tween, so an inset that jumped would not pass.
-    expect(samples.filter((s) => s.gap > 0.5 && s.gap < 7.5).length).toBeGreaterThan(2);
+    // A frame inside the inset's tween, so an inset that jumped would not pass.
+    // Any frame short of 8px, not a count of them in the steep part: the tween
+    // eases out, past 7.5px about 60ms into its 160ms, and its clock starts at
+    // the commit that opens it, so a slow commit spends most of that before
+    // the first frame paints.
+    expect(samples.some((s) => s.gap > 0 && s.gap < 8)).toBe(true);
     // From the inset's first frame on: before it, the summary's own entrance
     // clips it by design.
     const opening = samples.filter((s) => s.gap > 0);
@@ -731,15 +740,18 @@ test.describe('tool rows', () => {
       sseEvents.finishStop(),
       sseEvents.creditUsage(),
     ], delay: 30 });
-    await send(page, 'Fetch it');
-    const row = page.locator('.titem.running').filter({ hasText: 'Web Fetch' });
-    await expect(row).toBeVisible();
-    // Past the row's entrance, which rises it into place.
-    await page.waitForTimeout(600);
+    await page.goto(`/chat/t/${TH}`);
+    await page.locator('textarea').fill('Fetch it');
+    // Sampling from before the send, so the window below is cut on the page's
+    // own clock. Cut on when a poll for the row and then the badge happened
+    // to resolve, it could open after the result had already landed, or run
+    // on into the fold, where the summary arriving above moves the row.
     await sampleFrames(page, () => {
       const item = document.querySelector('[data-testid="activity-live-zone"] .titem');
       const cell = item?.querySelector('.titem-body > span');
-      const layers = cell ? [...cell.children].map((el) => ({ text: el.textContent, o: parseFloat(getComputedStyle(el).opacity) })) : [];
+      const layers = cell ? [...cell.children].map((el) => ({
+        o: parseFloat(getComputedStyle(el).opacity), leaving: el.getAttribute('aria-hidden') === 'true',
+      })) : [];
       const badge = item?.querySelector('.nrow-badge');
       const m = badge ? getComputedStyle(badge).transform : 'none';
       const scale = m === 'none' ? (badge ? 1 : null) : new DOMMatrixReadOnly(m).a;
@@ -750,17 +762,32 @@ test.describe('tool rows', () => {
         shimmer: title ? getComputedStyle(title).animationName : null,
       };
     });
-    await expect(page.locator('.nrow-badge')).toBeVisible({ timeout: 3000 });
-    await page.waitForTimeout(350);
-    const samples = (await stopSampling(page)).filter((s) => s.top !== null);
+    await page.getByRole('button', { name: 'Send message', exact: true }).click();
+    await page.waitForFunction(() => {
+      const badge = window.__samples.find((s) => s.scale !== null);
+      return !!badge && window.__samples.at(-1).t > badge.t + 350;
+    }, null, { timeout: 5000 });
+    const sampled = await stopSampling(page);
+    const entered = sampled.find((s) => s.top !== null);
+    const badged = sampled.find((s) => s.scale !== null);
+    // Past the row's entrance, which rises it into place, to 350ms after the
+    // badge, which lands about 1s into the row's 1.8s exposure.
+    const samples = sampled.filter((s) => s.top !== null && s.t > entered.t + 600 && s.t <= badged.t + 350);
     const swap = samples.findIndex((s) => s.layers.length === 2);
     expect(swap, 'the label did not crossfade').toBeGreaterThan(0);
-    const t0 = samples[swap].t;
-    // The label crossfades in place: out over the exit, in over quick.
-    const gone = samples.find((s) => s.t > t0 && s.layers.length === 1);
-    expect(gone.t - t0).toBeLessThan(140 + 50);
-    const shown = samples.find((s) => s.t > t0 && s.layers.at(-1).o >= 0.999);
-    expect(shown.t - t0).toBeLessThan(160 + 50);
+    // The label crossfades in place: out over the exit, in over quick. Timed
+    // on the frames that show a label partway faded, which only the fade's own
+    // clock bounds: the curve is within 0.1% of its end from 80% of the way
+    // in, so those frames fit inside the duration with no allowance for slow
+    // ones. Timed from the swap's first frame, it also counted the frame the
+    // fade waits to start on and the commit that unmounts the old label once
+    // it is gone, so a few slow frames failed a fade that kept time.
+    const fading = (leaving) => samples.filter((s) => s.layers.some((l) => l.leaving === leaving && l.o > 0.001 && l.o < 0.999));
+    const span = (frames) => (frames.length ? frames.at(-1).t - frames[0].t : 0);
+    expect(fading(true).length, 'the old label did not fade out').toBeGreaterThan(0);
+    expect(fading(false).length, 'the new label did not fade in').toBeGreaterThan(0);
+    expect(span(fading(true))).toBeLessThan(140);
+    expect(span(fading(false))).toBeLessThan(160);
     // No drop: the row does not move as it settles.
     const tops = samples.map((s) => s.top);
     expect(Math.max(...tops) - Math.min(...tops)).toBeLessThan(0.5);

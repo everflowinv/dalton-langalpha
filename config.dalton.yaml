@@ -56,4 +56,13 @@ features:
   # budget-admission hook gates. Flip to true when the decision opens it.
   wakeups:
     enabled: false
+  # SYNC2 decision 13 (#643): upstream's Claude Code runtime merges but stays
+  # off. The kill switch keeps the feature flag dark for every user (the code
+  # default is off with an opt-in gate, so this also pins it against a future
+  # catalog default flip), the production image never installs the
+  # claude-code extra, and desktop/SSH/E2B stay closed to it. Nothing reads
+  # the flag until Claude Code models are routable; flip to true only with
+  # the operator decision that opens those surfaces.
+  claude_code_runtime:
+    enabled: false
 

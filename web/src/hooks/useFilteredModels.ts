@@ -11,6 +11,8 @@ export interface ModelMetadataEntry {
   /** Name the manifest authors for people to read. Absent = print the key. */
   display_name?: string;
   provider?: string;
+  /** The provider's name for the model, where it is not the key. */
+  model_id?: string;
   sdk?: string;
   access_type?: string;
   /** "true" when variant needs its own API key (different env_key from parent). */
@@ -36,6 +38,17 @@ export interface ModelMetadataEntry {
   /** Whose compaction the model takes, on by default. Absent or null = its
    * provider cannot compact for it. */
   native_compaction?: NativeCompactionKind | null;
+  /** What a typical task costs at each level the model offers, as a multiple
+   *  of the models API's `task_cost_baseline`; "any" for a model measured
+   *  without a level. Absent = never measured. */
+  task_cost?: Record<string, TaskCost>;
+}
+
+export interface TaskCost {
+  value: number;
+  /** False for a level the benchmark skipped, which carries the figure of the
+   *  nearest level above it: no more than this, rather than about this. */
+  measured: boolean;
 }
 
 /** Key for the (group, name) pair in customPairs — '::' can't collide with any provider or model name. */
@@ -173,6 +186,15 @@ export function augmentPlatformWithLocal(
   };
 }
 
+/** Whether a model limited to some of a subscription's plans (`oauth_plans`)
+ *  is in `plan`, compared case-blind. An unknown plan fails open: the server
+ *  enforces the same gate when a turn is admitted. */
+export function planIncludes(meta: ModelMetadataEntry | undefined, plan: string | null | undefined): boolean {
+  const plans = meta?.oauth_plans;
+  if (!plans || plans.length === 0 || !plan) return true;
+  return plans.some((allowed) => allowed.toLowerCase() === plan.toLowerCase());
+}
+
 /**
  * Pure function: remove models the user's tier doesn't cover.
  *
@@ -221,6 +243,38 @@ export function filterByPlatformTier(
     }
   }
 
+  return out;
+}
+
+/**
+ * Pure function: drop the manifest models a connected credential's own list
+ * lacks (`missing`, by the model's provider), so a key or plan never offers a
+ * model it cannot run. A provider absent from `missingByProvider` keeps every
+ * model: its list was not read, and an unread list hides nothing. A model the
+ * user added themselves is theirs to keep; a manifest model they picked under
+ * another provider (`routedPairs`) answers to that provider's list.
+ */
+export function dropMissingModels(
+  providerMap: Record<string, ProviderModelsData>,
+  metadata: Record<string, ModelMetadataEntry>,
+  missingByProvider: ReadonlyMap<string, ReadonlySet<string>>,
+  customPairs?: Set<string>,
+  routedPairs?: ReadonlySet<string>,
+): Record<string, ProviderModelsData> {
+  if (missingByProvider.size === 0) return providerMap;
+  const out: Record<string, ProviderModelsData> = {};
+  for (const [groupKey, data] of Object.entries(providerMap)) {
+    const models = (data.models ?? []).filter((m) => {
+      const pair = customPairKey(groupKey, m);
+      if (routedPairs?.has(pair)) return !missingByProvider.get(groupKey)?.has(m);
+      if (customPairs?.has(pair)) return true;
+      const meta = metadata[m];
+      if (meta?.is_custom_model) return true;
+      const provider = meta?.provider;
+      return !provider || !missingByProvider.get(provider)?.has(m);
+    });
+    out[groupKey] = { ...data, models };
+  }
   return out;
 }
 
@@ -298,6 +352,7 @@ export function buildVisibleModels(
   providerCatalog: Record<string, ProviderCatalogEntry>,
   platform: PlatformModelsResponse | null,
   configuredProviders: ConfiguredProvider[],
+  missingByProvider: ReadonlyMap<string, ReadonlySet<string>> = new Map(),
 ): BuildVisibleModelsResult {
   // 1. Normalize raw API shape → Record<string, ProviderModelsData>
   const normalized: Record<string, ProviderModelsData> = {};
@@ -316,8 +371,16 @@ export function buildVisibleModels(
   // model starred under a variant must appear under the variant, not under
   // the parent group whose API metadata is still authoritative there.
   const customPairs = new Set<string>();
+  // Of those, the manifest's own models picked under another provider (a
+  // coding plan's pick of its brand's model): the same model, so that
+  // provider's own list still decides it.
+  const routedPairs = new Set<string>();
   for (const cm of customModels) {
     const key = cm.provider;
+    const manifestEntry = rawMetadata[cm.name];
+    if (manifestEntry && (cm.model_id || cm.name) === (manifestEntry.model_id ?? cm.name)) {
+      routedPairs.add(customPairKey(key, cm.name));
+    }
     if (!normalized[key]) {
       normalized[key] = { models: [], display_name: key };
     }
@@ -336,9 +399,11 @@ export function buildVisibleModels(
     // What a model declares about itself is the entry's answer where it gives
     // one, and the shadowed built-in's where it does not: a shadow reaches the
     // same model through the user's own key, so the ladder carries over. The
-    // server resolves it identically (`with_inherited_declarations`). Presence,
-    // not truthiness -- an entry declaring an empty ladder is saying the model
-    // honors no levels, which the built-in's must not overwrite.
+    // server resolves it identically (`with_inherited_declarations`), and on a
+    // route that speaks another API, which borrows nothing, it sends the entry
+    // with an empty ladder spelled out. Presence, not truthiness -- an entry
+    // declaring an empty ladder is saying the model honors no levels, which
+    // the built-in's must not overwrite.
     // The label is the exception. The entry's name is the label its author
     // typed, while the built-in's display_name names the manifest's model,
     // which this entry may not route to.
@@ -398,22 +463,22 @@ export function buildVisibleModels(
   for (const data of Object.values(normalized)) {
     if (!data.models) continue;
     data.models = data.models.filter((m) => {
-      const plans = metadata[m]?.oauth_plans;
-      if (!plans || plans.length === 0) return true;
       const provider = metadata[m]?.provider;
-      const plan = provider ? oauthPlanByProvider.get(provider) : undefined;
-      return !plan || plans.some((allowed) => allowed.toLowerCase() === plan);
+      return planIncludes(metadata[m], provider ? oauthPlanByProvider.get(provider) : undefined);
     });
   }
+
+  // 3c. What the connected credentials' own lists say they cannot run.
+  const listed = dropMissingModels(normalized, metadata, missingByProvider, customPairs, routedPairs);
 
   // 4. Filter
   let filtered: Record<string, ProviderModelsData>;
   if (platform) {
-    filtered = filterByPlatformTier(normalized, metadata, platform, customPairs);
+    filtered = filterByPlatformTier(listed, metadata, platform, customPairs);
   } else {
     const configuredSet = buildConfiguredSet(configuredProviders);
     const configuredTypeMap = buildConfiguredTypeMap(configuredProviders);
-    filtered = filterModelsByAccess(normalized, metadata, configuredSet, configuredTypeMap, customPairs);
+    filtered = filterModelsByAccess(listed, metadata, configuredSet, configuredTypeMap, customPairs);
   }
 
   // 5. Build validModelNames set

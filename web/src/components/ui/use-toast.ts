@@ -11,6 +11,9 @@ export interface ToastProps {
   description?: React.ReactNode
   action?: React.ReactElement
   variant?: "default" | "destructive"
+  /** A small glyph before the title. A destructive toast always takes the
+   *  alert glyph instead. */
+  icon?: React.ReactNode
   /** Milliseconds on screen. Unset, the Toaster picks by what the toast is:
    *  a confirmation leaves quickly, a failure stays longer, and one with an
    *  action stays until it is answered or closed. */

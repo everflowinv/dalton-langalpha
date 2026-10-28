@@ -220,16 +220,8 @@ export function ToolBindingControl({
   }
 
   return (
-    <div className="flex flex-col items-end gap-0.5 shrink-0">
-      <div className="flex items-center gap-1.5">
-        {pinned && (
-          <span
-            className="text-[0.625rem] text-right"
-            style={{ color: 'var(--color-text-quaternary)' }}
-          >
-            {t('plugins.detail.bindingPinned')}
-          </span>
-        )}
+    <div className={cn('flex flex-col items-end gap-0.5 grow', pinned && 'pb-1')}>
+      <div className="flex flex-wrap items-center justify-end gap-x-1.5 gap-y-0.5 max-w-full">
         <OrderModeBadge mode={tool.order?.mode} />
         {tool.approval && (
           <span
@@ -266,8 +258,19 @@ export function ToolBindingControl({
           onChange={write}
         />
       </div>
+      {/* Zero intrinsic width, full width once laid out: the note sits under the
+          controls and wraps in the room the row has, instead of widening the
+          control until the tool name is squeezed. */}
+      {pinned && (
+        <span
+          className="text-[0.625rem] text-right w-0 min-w-full"
+          style={{ color: 'var(--color-text-quaternary)' }}
+        >
+          {t('plugins.detail.bindingPinned')}
+        </span>
+      )}
       {error && (
-        <span role="alert" className="text-[0.625rem] text-right" style={{ color: 'var(--color-loss)' }}>
+        <span role="alert" className="text-[0.625rem] text-right w-0 min-w-full" style={{ color: 'var(--color-loss)' }}>
           {error}
         </span>
       )}

@@ -1,7 +1,9 @@
 import type React from 'react';
 import { useCallback, useState } from 'react';
 import { useTranslation } from 'react-i18next';
+import { useNavigate } from 'react-router';
 import { Info } from 'lucide-react';
+import { subscriptionKey, type SubscriptionProvider } from '@/api/oauth';
 import { getModelDisplayName } from '@/components/ui/chat-input.helpers';
 import { DefaultModelScopeChoice } from '@/components/model/DefaultModelScopeChoice';
 import { useAllModels } from '@/hooks/useAllModels';
@@ -79,5 +81,29 @@ export function RetiredModelNotice({
         {t('chat.threadModel.retired', { model: label(model), fallback: label(fallback) })}
       </span>
     </StatusLine>
+  );
+}
+
+/* The composer's model runs on a subscription whose sign-in has to be
+   renewed, so a send would be refused. Said before the send, in the rows above
+   the composer, with the way to Settings, where the connection's row offers the
+   reconnect. Dismissed, it stays down while this view shows the same model (the
+   host keys it by model); a send still meets the turn's own refusal. */
+export function LapsedSignInNotice({ model, provider }: { model: string; provider: SubscriptionProvider }): React.ReactElement | null {
+  const { t } = useTranslation();
+  const navigate = useNavigate();
+  const label = useComposerModelLabel();
+  const [dismissed, setDismissed] = useState(false);
+  if (dismissed) return null;
+  return (
+    <ThreadOfferRow
+      text={t('chat.threadModel.lapsed', {
+        account: t(`modelAccess.${subscriptionKey(provider)}.name`),
+        model: label(model),
+      })}
+      action={t('modelAccess.reconnect')}
+      onAction={() => navigate('/settings?tab=model')}
+      onDismiss={() => setDismissed(true)}
+    />
   );
 }

@@ -160,14 +160,14 @@ _NOT_GLOBAL = (
 )
 
 
-def _classify(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+def is_public_address(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
     # is_global covers private/loopback/link-local/reserved/unspecified AND
     # CGNAT; the write-time validator stops there, this adds _NOT_GLOBAL.
     if any(ip in net for net in _NOT_GLOBAL):
         return False
     if ip.version == 6 and any(ip in net for net in _EMBEDS_IPV4):
         embedded = ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
-        return ip.is_global and _classify(embedded)
+        return ip.is_global and is_public_address(embedded)
     return ip.is_global
 
 
@@ -239,7 +239,7 @@ def _literal_ips(host: str, candidate: str, allow_non_global: bool) -> list[str]
         literal = ipaddress.ip_address(candidate)
     except ValueError:
         return None
-    if not allow_non_global and not _classify(literal):
+    if not allow_non_global and not is_public_address(literal):
         raise EgressBlockedError(
             f"egress to {host!r} is blocked: non-global address"
         )
@@ -250,7 +250,7 @@ def _checked_ips(host: str, infos, allow_non_global: bool) -> list[str]:
     ips: list[str] = []
     for _family, _type, _proto, _canon, sockaddr in infos:
         addr = ipaddress.ip_address(sockaddr[0])
-        if not allow_non_global and not _classify(addr):
+        if not allow_non_global and not is_public_address(addr):
             raise EgressBlockedError(
                 f"egress to {host!r} is blocked: resolves to a non-global address"
             )

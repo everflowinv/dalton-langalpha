@@ -115,9 +115,8 @@ class AgentPreference(BaseModel):
 
     # Any, and checked in the endpoint, for the reasons RiskPreference gives.
     # A null survives the parse too, which the JSONB merge reads as deleting
-    # the key: Settings' switch sends one to go back to markdown.
+    # the key: Settings sends one to go back to letting the agent decide.
     research_depth: Optional[Any] = Field(None, description=_doc("agent_preference", "research_depth"))
-    deliverable: Optional[Any] = Field(None, description=_doc("agent_preference", "deliverable"))
     proactivity: Optional[Any] = Field(None, description=_doc("agent_preference", "proactivity"))
     output_style: Optional[str] = Field(
         None, description="Preferred output style"
@@ -221,6 +220,10 @@ class UserResponse(UserBase):
     access_tier: int = Field(
         default=-1, description="Platform access tier. -1 = no access, 0+ = tier level."
     )
+    deployment_serves: bool = Field(
+        default=False,
+        description="Whether the deployment's own key runs its default model, so the user needs no provider of their own",
+    )
     plan_display_name: Optional[str] = Field(
         default=None,
         description="Display name of the user's active plan (e.g. 'Pro'). None when no subscription.",
@@ -291,6 +294,14 @@ class UserPreferencesResponse(UserPreferencesBase):
     updated_at: datetime = Field(description="Last update timestamp")
 
     model_config = ConfigDict(from_attributes=True)
+
+    @field_validator("model_preference", mode="before")
+    @classmethod
+    def _spell_borrowed_ladders(cls, value):
+        # Every read of the column reaches the web through here.
+        from src.server.services.llm.user_models import with_borrowed_ladders
+
+        return with_borrowed_ladders(value) if isinstance(value, dict) else value
 
 
 class UserPreferencesUpdateResponse(UserPreferencesResponse):

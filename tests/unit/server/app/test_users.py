@@ -1620,7 +1620,7 @@ async def test_the_profile_form_is_saved_in_its_stored_spelling_and_completes_on
             json={
                 "risk_preference": {"risk_level": "Moderate"},
                 "investment_preference": {"markets": ["us", "HK", "us"], "sectors": ["Real Estate"]},
-                "agent_preference": {"research_depth": "Light", "output_format": "HTML", "tone": "terse"},
+                "agent_preference": {"research_depth": "Light", "output_format": ["Visual", "text", "visual"], "tone": "terse"},
             },
         )
 
@@ -1632,7 +1632,7 @@ async def test_the_profile_form_is_saved_in_its_stored_spelling_and_completes_on
     }
     assert upsert.await_args.kwargs["agent_preference"] == {
         "research_depth": "light",
-        "output_format": "html",
+        "output_format": ["visual", "text"],
         "tone": "terse",
     }
     complete.assert_awaited_once_with("test-user-123")
@@ -1672,28 +1672,28 @@ async def test_null_reaches_the_merge_as_a_deletion(client):
             json={
                 "risk_preference": {"risk_level": None},
                 "investment_preference": {"markets": None, "sectors": None},
-                "agent_preference": {"deliverable": None, "proactivity": None},
+                "agent_preference": {"research_depth": None, "proactivity": None},
             },
         )
 
     assert resp.status_code == 200
     assert upsert.await_args.kwargs["risk_preference"] == {"risk_level": None}
     assert upsert.await_args.kwargs["investment_preference"] == {"markets": None, "sectors": None}
-    assert upsert.await_args.kwargs["agent_preference"] == {"deliverable": None, "proactivity": None}
+    assert upsert.await_args.kwargs["agent_preference"] == {"research_depth": None, "proactivity": None}
 
 
 @pytest.mark.asyncio
 async def test_output_format_is_checked_with_the_structured_keys(client):
-    """Settings' switch sends ``html``, or null to go back to markdown; any
-    other value is a 422 like every structured key's."""
+    """Settings sends a ranking, or null to let the agent decide; a format
+    outside the ranking's vocabulary is a 422 like every structured key's."""
     async with _profile_endpoint() as (upsert, _complete, _read):
         resp = await client.put(
             "/api/v1/users/me/preferences",
-            json={"agent_preference": {"research_depth": "thorough", "output_format": "pdf"}},
+            json={"agent_preference": {"research_depth": "thorough", "output_format": ["visual", "pdf"]}},
         )
 
     assert resp.status_code == 422
-    assert resp.json()["detail"].startswith("agent_preference.output_format: 'pdf' is not one of")
+    assert resp.json()["detail"].startswith("agent_preference.output_format[1]: 'pdf' is not one of")
     upsert.assert_not_awaited()
 
 

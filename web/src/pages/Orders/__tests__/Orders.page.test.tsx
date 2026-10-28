@@ -253,6 +253,21 @@ describe('the orders page', () => {
     expect(link).toHaveTextContent('Open in moomoo');
   });
 
+  it('names an approval the order waits on as an approval, not a broker order', async () => {
+    getOrder.mockResolvedValue(
+      attempt({
+        status: 'pending_confirm',
+        vendor_order_id: 'apr-1',
+        route: { approval_id: 'apr-1' },
+        failure: null,
+      }),
+    );
+    renderPage(`/orders?detail=order:${ATTEMPT}`);
+    const dialog = await screen.findByRole('dialog');
+    await waitFor(() => expect(fieldValue(dialog, 'Approval ID')).toHaveTextContent('apr-1'));
+    expect(within(dialog).queryByText('Broker order')).toBeNull();
+  });
+
   it('offers no broker link when the vendor sent none', async () => {
     renderPage(`/orders?detail=order:${ATTEMPT}`);
     await screen.findByRole('dialog');

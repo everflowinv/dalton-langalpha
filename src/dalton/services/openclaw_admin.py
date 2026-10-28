@@ -443,7 +443,7 @@ async def _collect_model_references() -> dict[str, list[str]]:
 
 
 def _invalidate_local_worker_model_caches() -> None:
-    """Clear `LLM._model_config` and `_build_provider_catalog` on the current worker."""
+    """Clear `LLM._model_config` and the provider-catalog caches on the current worker."""
     try:
         from src.llms.llm import LLM
 
@@ -451,10 +451,13 @@ def _invalidate_local_worker_model_caches() -> None:
     except Exception:
         pass
 
+    # DALTON-HOOK(catalog-cache): the published catalog, its key-candidate map
+    # and the per-user available-models cache all derive from the overlay.
     try:
-        from src.server.app.api_keys import _build_provider_catalog
+        from src.server.services.llm.provider_catalog import key_candidates, provider_catalog
 
-        _build_provider_catalog.cache_clear()
+        provider_catalog.cache_clear()
+        key_candidates.cache_clear()
     except Exception:
         pass
 

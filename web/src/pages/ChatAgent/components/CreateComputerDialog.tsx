@@ -132,8 +132,10 @@ function CreateComputerDialog({ onClose, onSubmit, busy, error, takeOver = null,
   // so the card waits for the list to answer that. Where this server could
   // take it but this app cannot pair it, the card still shows, held, saying
   // what it would take: the desktop app, on a Mac in a browser; on Windows,
-  // support that is still to come.
-  const thisMac = useThisMacAvailability({ enabled: true });
+  // support that is still to come. The panel opens this form once it has read
+  // whether this Mac is one, so the form lays out on that read, not a new one
+  // that could land mid-entrance.
+  const thisMac = useThisMacAvailability({ enabled: true, reread: false });
   let thisMacCard: ThisMacCard | null = null;
   if (thisMac.offered) {
     if (thisMac.added !== undefined) thisMacCard = thisMac.added ? 'added' : 'offered';

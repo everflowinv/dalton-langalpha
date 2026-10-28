@@ -47,6 +47,10 @@ _OUTCOME_LINE = {
     "cancelled": "order_cancelled",
     "rejected": "order_rejected",
     "failed": "order_failed",
+    "partial_expired": "order_partial_expired",
+    "expired": "order_expired",
+    "confirmed": "order_confirmed",
+    "handed_off": "order_handed_off",
 }
 
 Quote = Union[float, Mapping[str, Any], None]

@@ -214,7 +214,7 @@ function ChartWidget({ instance, updateConfig }: WidgetRenderProps<ChartConfig>)
   const ctRef = useRef(ct);
   ctRef.current = ct;
 
-  // Shared WS provided at DashboardCustom level. When ginlix-data is disabled
+  // Shared WS provided by the Dashboard page. When ginlix-data is disabled
   // the hook returns an empty `prices` map and `subscribe` is a no-op.
   const { prices, subscribe, unsubscribe, ginlixDataEnabled } = useMarketDataWSContext();
 
@@ -1149,13 +1149,8 @@ function ChartWidget({ instance, updateConfig }: WidgetRenderProps<ChartConfig>)
   }, [editingSymbol]);
 
   return (
-    <div
-      className="flex flex-col h-full rounded-xl px-4 pt-4 pb-3"
-      style={{
-        backgroundColor: 'var(--color-bg-card)',
-        border: '1px solid var(--color-border-muted)',
-      }}
-    >
+    // The widget frame draws the card; the chart fills it.
+    <div className="flex flex-col h-full">
       <div className="flex items-center justify-between mb-2">
         <div ref={symbolEditorRef} className="relative text-left min-w-0">
           {editingSymbol ? (

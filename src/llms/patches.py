@@ -4,6 +4,8 @@ import functools
 import logging
 from types import SimpleNamespace
 
+from src.llms.anthropic_betas import client_betas
+
 logger = logging.getLogger(__name__)
 
 _USAGE_KEYS = (
@@ -152,6 +154,44 @@ def _patch_langchain_anthropic_compaction_block():
         logger.warning(f"Failed to patch langchain_anthropic compaction streaming: {e}")
 
 
+def _patch_langchain_anthropic_input_transformations():
+    """Keep the API's ``input_transformations`` on a streamed answer, verbatim.
+
+    It lists the earlier thinking blocks the API dropped from the request, or
+    let through unchecked, before the model read it, and a stream sends it on
+    ``message_start``, of which langchain-anthropic 1.7.6 keeps only the model
+    name. A non-streamed answer already keeps it: the body's extra fields go
+    to ``llm_output``, which langchain-core merges into the message's
+    metadata. Kept as the API sent it: later checks add types and reasons.
+    """
+    try:
+        from langchain_anthropic.chat_models import ChatAnthropic
+
+        from src.llms.input_transformations import INPUT_TRANSFORMATIONS
+
+        original = ChatAnthropic._make_message_chunk_from_anthropic_event
+        if getattr(original, "_keeps_input_transformations", False):
+            return
+
+        @functools.wraps(original)
+        def _patched(self, event, *args, **kwargs):
+            chunk, block_start_event = original(self, event, *args, **kwargs)
+            if chunk is not None and getattr(event, "type", None) == "message_start":
+                found = getattr(event.message, INPUT_TRANSFORMATIONS, None)
+                if isinstance(found, list):
+                    # An SDK that models the entries would hand objects the
+                    # checkpoint cannot hold; the non-streamed path dumps them.
+                    chunk.response_metadata[INPUT_TRANSFORMATIONS] = [
+                        e.model_dump(mode="json") if hasattr(e, "model_dump") else e for e in found
+                    ]
+            return chunk, block_start_event
+
+        _patched._keeps_input_transformations = True
+        ChatAnthropic._make_message_chunk_from_anthropic_event = _patched
+    except Exception as e:
+        logger.warning(f"Failed to patch langchain_anthropic input_transformations: {e}")
+
+
 def _patch_langchain_openai_compaction_trigger():
     """Ask OpenAI to compact where a Responses request carries the
     compaction marker (``provider_compaction.compaction_settings``).
@@ -185,3 +225,35 @@ def _patch_langchain_openai_compaction_trigger():
         BaseChatOpenAI._get_request_payload = _patched
     except Exception as e:
         logger.warning(f"Failed to patch langchain_openai compaction trigger: {e}")
+
+
+def _patch_langchain_anthropic_header_betas():
+    """Keep the client's own betas on a request that names betas.
+
+    A request's ``betas`` replace the ``anthropic-beta`` header the client was
+    built with (anthropic 0.120 sends them as that header), and
+    langchain-anthropic 1.7.6 adds one there by itself for some tools, content
+    and settings. Either way the header's betas would be gone from the call:
+    on the OAuth route what authenticates it, and the manifest's, which let
+    ``thinking.block_binding`` and turn-scoped system messages through. So
+    they lead the list, ahead of the client's ``betas`` field, which a
+    call-time list replaces too.
+    """
+    try:
+        from langchain_anthropic.chat_models import ChatAnthropic
+
+        original = ChatAnthropic._get_request_payload
+        if getattr(original, "_keeps_header_betas", False):
+            return
+
+        @functools.wraps(original)
+        def _patched(self, input_, *, stop=None, **kwargs):
+            payload = original(self, input_, stop=stop, **kwargs)
+            if payload.get("betas"):
+                payload["betas"] = list(dict.fromkeys([*client_betas(self), *payload["betas"]]))
+            return payload
+
+        _patched._keeps_header_betas = True
+        ChatAnthropic._get_request_payload = _patched
+    except Exception as e:
+        logger.warning(f"Failed to patch langchain_anthropic header betas: {e}")

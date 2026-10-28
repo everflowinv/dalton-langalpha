@@ -38,7 +38,7 @@ describe('readProfile / profilePatch', () => {
     styles: ['value'],
     sectors: ['semiconductors'],
     depth: 'thorough',
-    deliverable: 'report',
+    deliverable: 'visual',
     proactivity: 'when_needed',
   });
 
@@ -51,8 +51,8 @@ describe('readProfile / profilePatch', () => {
   it('stores the risk level alone under risk, how the agent works under agent, and the rest under investment', () => {
     // The keys are the server's and the skills', so they are pinned here: what
     // the user wants to trade is still `asset_classes`, and the horizon moved
-    // screens but not sections. A report is Settings' own output format, so
-    // the deliverable key beside it holds none.
+    // screens but not sections. The answer leads the output format's
+    // ranking, which Settings orders whole.
     expect(profileRow(full)).toEqual({
       risk_preference: { risk_level: 'growth' },
       investment_preference: {
@@ -69,9 +69,8 @@ describe('readProfile / profilePatch', () => {
       },
       agent_preference: {
         research_depth: 'thorough',
-        deliverable: null,
         proactivity: 'when_needed',
-        output_format: 'html',
+        output_format: ['visual', 'markdown', 'text'],
       },
     });
   });
@@ -82,54 +81,45 @@ describe('readProfile / profilePatch', () => {
     expect(read.styles).toEqual(['value']);
   });
 
-  it('stores a report as the output format with no deliverable, and the others as the deliverable with none', () => {
-    expect(profileRow(profile({ deliverable: 'report' })).agent_preference).toEqual({
+  it('stores the answer at the head of the output format ranking, the rest in the server order', () => {
+    expect(profileRow(profile({ deliverable: 'markdown' })).agent_preference).toEqual({
       research_depth: null,
-      deliverable: null,
       proactivity: null,
-      output_format: 'html',
+      output_format: ['markdown', 'text', 'visual'],
     });
-    for (const deliverable of ['text', 'visual'] as const) {
-      expect(profileRow(profile({ deliverable })).agent_preference).toMatchObject({
-        deliverable,
-        output_format: null,
-      });
-    }
+    expect(profileRow(profile({ deliverable: 'text' })).agent_preference.output_format).toEqual(['text', 'markdown', 'visual']);
+    expect(profileRow(profile({ deliverable: 'visual' })).agent_preference.output_format).toEqual(['visual', 'markdown', 'text']);
+    // Unanswered leaves it to the agent, as Settings' reset does.
+    expect(profileRow(emptyProfile()).agent_preference.output_format).toBeNull();
   });
 
-  it('reads the output format set to HTML as a report, whatever deliverable was saved beside it', () => {
+  it('reads the head of the ranking, and a row from before it the way the server migrated it', () => {
     const read = (agent: unknown) => readProfile({ agent_preference: agent });
-    // Settings' switch writes the output format alone, so a deliverable left
-    // beside it is the older answer.
+    expect(read({ output_format: ['markdown', 'visual'] }).deliverable).toBe('markdown');
     expect(
       read({ research_depth: 'light', deliverable: 'text', proactivity: 'on_request', output_format: 'html' }),
-    ).toEqual(profile({ depth: 'light', deliverable: 'report', proactivity: 'on_request' }));
-    expect(read({ output_format: 'html' }).deliverable).toBe('report');
+    ).toEqual(profile({ depth: 'light', deliverable: 'visual', proactivity: 'on_request' }));
+    expect(read({ output_format: 'html' }).deliverable).toBe('visual');
     expect(read({ deliverable: 'visual' }).deliverable).toBe('visual');
-    // An output format other than HTML is a setting of its own, not an answer here.
     expect(read({ deliverable: 'text', output_format: 'markdown' }).deliverable).toBe('text');
+    expect(read({ output_format: 'markdown' }).deliverable).toBeNull();
   });
 
   it('reads a report saved as a deliverable, and any value it does not know, as unanswered', () => {
     const read = (agent: unknown) => readProfile({ agent_preference: agent });
-    // A report is only ever the output format: one under the deliverable key
-    // was not written by a save, and the setting does not hold it.
+    // Neither key ever held a report, and a ranking of formats it does not
+    // know is the user's own words.
     expect(read({ deliverable: 'report' }).deliverable).toBeNull();
+    expect(read({ output_format: ['pdf'] }).deliverable).toBeNull();
     // The depth an earlier build saved, among the rest.
     expect(read({ research_depth: 'deep', deliverable: 'slides', proactivity: 'hourly' })).toEqual(emptyProfile());
     expect(read({ research_depth: 3, deliverable: ['text'], proactivity: null })).toEqual(emptyProfile());
   });
 
-  it('moves a report to the output format and back, the deliverable key cleared or set with it', () => {
+  it('writes the ranking a new answer leads', () => {
     const text = { ...full, deliverable: 'text' as const };
-    expect(profilePatch(full, text)).toEqual({ agent_preference: { deliverable: null, output_format: 'html' } });
-    expect(profilePatch({ ...full, deliverable: 'visual' }, full)).toEqual({
-      agent_preference: { deliverable: 'visual', output_format: null },
-    });
-    // Between the two the output format is not theirs to touch.
-    expect(profilePatch({ ...text, deliverable: 'visual' }, text)).toEqual({
-      agent_preference: { deliverable: 'visual' },
-    });
+    expect(profilePatch(text, full)).toEqual({ agent_preference: { output_format: ['text', 'markdown', 'visual'] } });
+    expect(profilePatch({ ...full, deliverable: null }, full)).toEqual({ agent_preference: { output_format: null } });
   });
 
   it('sends only the agent answer that changed', () => {
@@ -140,25 +130,24 @@ describe('readProfile / profilePatch', () => {
     });
   });
 
-  it('writes nothing over an older deliverable left beside a report while the report stays picked', () => {
+  it('writes nothing over an order set in Settings while its head stays picked', () => {
     const saved = readProfile({
       risk_preference: { risk_level: 'growth' },
       investment_preference: { horizon: 'months' },
       agent_preference: {
         research_depth: 'adaptive',
-        deliverable: 'text',
         proactivity: 'when_needed',
-        output_format: 'html',
+        output_format: ['visual', 'text', 'markdown'],
       },
     });
-    expect(saved.deliverable).toBe('report');
+    expect(saved.deliverable).toBe('visual');
     expect(profilePatch(saved, saved)).toBeNull();
     expect(profilePatch({ ...saved, horizon: 'years' }, saved)).toEqual({
       investment_preference: { horizon: 'years' },
     });
   });
 
-  it('leaves an output format chosen in Settings alone while no report is picked', () => {
+  it('writes nothing over a row from before the ranking while its answer stays picked', () => {
     const saved = readProfile({
       risk_preference: { risk_level: 'growth' },
       investment_preference: { horizon: 'months' },
@@ -395,9 +384,8 @@ describe('what each screen needs', () => {
     expect(answered('agent', { ...all, depth: null })).toBe(false);
     expect(answered('agent', { ...all, deliverable: null })).toBe(false);
     expect(answered('agent', { ...all, proactivity: null })).toBe(false);
-    // Any deliverable answers it, a report too, though it is saved apart.
     expect(answered('agent', { ...all, deliverable: 'visual' })).toBe(true);
-    expect(answered('agent', { ...all, deliverable: 'report' })).toBe(true);
+    expect(answered('agent', { ...all, deliverable: 'markdown' })).toBe(true);
   });
 
   it('asks nothing of its own on the brokerage screen', () => {
@@ -425,12 +413,12 @@ describe("the agent turn's answer", () => {
   // What the user's bubble reads once the last card folds: the three picks in
   // the order the card asks them, each in its card's own words.
   it('reads as how deep, what an answer looks like and when to reach out, in either language', () => {
-    const p = profile({ depth: 'adaptive', deliverable: 'report', proactivity: 'when_needed' });
-    expect(agentSummary(en, p)).toBe('Depends on the question · Full reports · When it matters');
-    expect(agentSummary(zh, p)).toBe('看问题而定 · 完整报告 · 重要变动时');
+    const p = profile({ depth: 'adaptive', deliverable: 'markdown', proactivity: 'when_needed' });
+    expect(agentSummary(en, p)).toBe('Depends on the question · Summary with a file · When it matters');
+    expect(agentSummary(zh, p)).toBe('看问题而定 · 摘要加文件 · 重要变动时');
     const other = profile({ depth: 'light', deliverable: 'visual', proactivity: 'on_request' });
-    expect(agentSummary(en, other)).toBe('Quick answers · Charts and dashboards · Only when asked');
-    expect(agentSummary(zh, other)).toBe('快速作答 · 图表和看板 · 仅在你要求时');
+    expect(agentSummary(en, other)).toBe('Quick answers · Charts and reports · Only when asked');
+    expect(agentSummary(zh, other)).toBe('快速作答 · 图表和报告 · 仅在你要求时');
   });
 
   it('leaves out what is not answered yet rather than a gap', () => {

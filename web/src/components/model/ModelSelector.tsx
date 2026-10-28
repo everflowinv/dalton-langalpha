@@ -2,16 +2,9 @@ import { useId, useMemo } from "react"
 import { useTranslation } from "react-i18next"
 import { Select } from "@/components/ui/select"
 import type { ProviderModelsData } from "./types"
-import type { ModelAccess } from "@/types/platform"
 import type { ModelMetadataEntry } from "@/hooks/useFilteredModels"
 import { modelLabel } from "@/lib/modelLabel"
-
-const ACCESS_LABEL_KEYS: Record<ModelAccess, string> = {
-  platform: "settings.modelAccess.platform",
-  byok: "settings.modelAccess.byok",
-  oauth: "settings.modelAccess.oauth",
-  locked: "settings.modelAccess.locked",
-}
+import { payerLabel, type Payer } from "@/lib/modelPayer"
 
 export interface ModelSelectorProps {
   /** Label shown above the select. Absent, `ariaLabel` names it and the
@@ -34,8 +27,8 @@ export interface ModelSelectorProps {
   autoOption?: { value: string; label: string }
   /** Required field indicator */
   required?: boolean
-  /** Optional access map: model name → access type. When set, shows badge in option text. */
-  modelAccess?: Record<string, ModelAccess>
+  /** Who pays for each model, printed after its name: an option holds text only. */
+  payers?: Record<string, Payer>
   /** Optional model metadata: options print its display_name in place of the key. */
   metadata?: Record<string, ModelMetadataEntry>
   /** Models listed but not pickable (above the plan), each in its provider's group. */
@@ -57,7 +50,7 @@ export function ModelSelector({
   placeholder,
   autoOption,
   required = false,
-  modelAccess,
+  payers,
   metadata,
   ariaLabel,
   disabledModels,
@@ -160,8 +153,8 @@ export function ModelSelector({
             return (
               <optgroup key={provider} label={display}>
                 {modelList.map((m) => {
-                  const access = modelAccess?.[m]
-                  const suffix = access ? ` (${t(ACCESS_LABEL_KEYS[access])})` : ""
+                  const payer = payers?.[m]
+                  const suffix = payer ? ` · ${payerLabel(t, payer)}` : ""
                   return (
                     <option key={m} value={m}>
                       {name(m)}{suffix}
@@ -170,7 +163,7 @@ export function ModelSelector({
                 })}
                 {locked.map((m) => (
                   <option key={m} value={m} disabled>
-                    {name(m)} ({t(ACCESS_LABEL_KEYS.locked)})
+                    {name(m)} · {t("payer.locked")}
                   </option>
                 ))}
               </optgroup>

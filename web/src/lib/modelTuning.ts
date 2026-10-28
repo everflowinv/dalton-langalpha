@@ -34,6 +34,17 @@ export function effortLabelFor(t: (key: string) => string, level: string | null)
   return level && EFFORT_LABELS[level] ? t(EFFORT_LABELS[level]) : null;
 }
 
+/** The levels the composer's effort menu lists: those it has a word for. */
+export function tuningMenuLevels(efforts: readonly string[]): string[] {
+  return efforts.filter((level) => EFFORT_LABELS[level]);
+}
+
+/** Whether the composer shows its effort pill: a level to pick, or a Codex
+ *  model's speed. The pill and the toolbar's room for it ask the same thing. */
+export function hasTuningMenu(efforts: readonly string[], isCodexModel: boolean): boolean {
+  return tuningMenuLevels(efforts).length > 0 || isCodexModel;
+}
+
 /**
  * The level a model actually runs when asked for one it does not offer.
  *

@@ -61,10 +61,11 @@ class CompactionConfig(BaseModel):
     Controls the two-tier context window lifecycle: token-threshold-based LLM
     summarization (Tier 2), and trimming of large tool args and stale Read
     results (Tier 1) at the start of a turn after a pause of
-    ``truncate_args_idle_minutes``. The pause is the point: by then the
-    provider's prompt cache has expired, so trimming the prefix costs no cache
-    hit, where trimming mid-turn would throw a warm one away. None turns
-    Tier 1 off.
+    ``truncate_args_idle_minutes``. The pause is meant to find the provider's
+    prompt cache expired, so trimming the prefix costs no cache hit, where
+    trimming mid-turn would throw a warm one away. Tier 1 is off by default
+    (None): what it saves is negligible, and on Claude it invalidates the
+    preserved thinking after what it hides.
     """
 
     enabled: bool = True
@@ -77,7 +78,7 @@ class CompactionConfig(BaseModel):
     #: the others' for the same text, in every language measured, so this
     #: keeps about the work ``keep_tokens`` keeps elsewhere.
     claude_keep_tokens: int = 32_000
-    truncate_args_idle_minutes: int | None = 90
+    truncate_args_idle_minutes: int | None = None
     truncate_args_keep_messages: int = 20
     truncate_args_max_length: int = 2000
 
@@ -394,6 +395,10 @@ class AgentConfig(BaseModel):
     # Display names aligned index-for-index with ``fallback_llm_clients``
     # (skipped fallbacks drop from both lists).
     fallback_llm_names: list[str] | None = Field(default=None, exclude=True)
+    # Whether the fallbacks are a list the user saved rather than the
+    # deployment's. Only the user's may move a call their own key or
+    # subscription pays for onto the platform's key.
+    fallback_users_choice: bool = Field(default=False, exclude=True)
     # Forwarded by ``get_llm_client()`` to ``create_llm(cache_key=...)`` for
     # the lazy factory path.
     cache_key: str | None = Field(default=None, exclude=True)

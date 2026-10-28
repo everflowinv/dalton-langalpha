@@ -8,6 +8,7 @@ import {
   ORDER_STATUS_STAGED_KEYS,
   orderStatusLabel,
   orderStatusShortLabel,
+  vendorNamedEnd,
 } from '@/components/orders/status';
 import {
   OPTION_RIGHT_KEY,
@@ -70,8 +71,8 @@ describe('order label keys', () => {
     });
   }
 
-  it('covers all fifteen attempt statuses', () => {
-    expect(Object.keys(ORDER_STATUS_KEY)).toHaveLength(15);
+  it('covers all sixteen attempt statuses', () => {
+    expect(Object.keys(ORDER_STATUS_KEY)).toHaveLength(16);
   });
 
   // Three of the five are durations vendors added after the ledger shipped,
@@ -121,6 +122,61 @@ describe('what a staged order is called', () => {
     });
   });
 
+  it('says a handed-off instruction was confirmed only when the broker said so', () => {
+    expect(orderStatusLabel('handed_off', 'staged', 'Webull', true)).toEqual({
+      key: 'toolArtifact.directTool.orderStatus.handedOffConfirmedStaged',
+      params: { vendor: 'Webull' },
+    });
+    expect(orderStatusLabel('handed_off', 'staged', null, true)).toEqual({
+      key: 'toolArtifact.directTool.orderStatus.handedOffConfirmedStagedUnnamed',
+    });
+    expect(orderStatusShortLabel('handed_off', 'staged', true)).toBe(
+      'toolArtifact.directTool.orderStatusShort.handedOffConfirmed',
+    );
+    // A broker that only stopped listing it keeps the sentence that admits it.
+    expect(orderStatusLabel('handed_off', 'staged', 'Webull', false).key).toBe(
+      'toolArtifact.directTool.orderStatus.handedOffStaged',
+    );
+    // Naming the end changes no other state.
+    expect(orderStatusLabel('submitted', 'staged', 'Webull', true).key).toBe(
+      'toolArtifact.directTool.orderStatus.submittedStaged',
+    );
+  });
+
+  it('says a live order the user approved at the broker was confirmed there', () => {
+    expect(orderStatusLabel('handed_off', 'live', 'Robinhood', true)).toEqual({
+      key: 'toolArtifact.directTool.orderStatus.handedOffConfirmedStaged',
+      params: { vendor: 'Robinhood' },
+    });
+    expect(orderStatusShortLabel('handed_off', 'live', true)).toBe(
+      'toolArtifact.directTool.orderStatusShort.handedOffConfirmed',
+    );
+  });
+
+  // Nobody cancelled it, so it must never read as cancelled.
+  it('says an expired instruction expired before it was confirmed', () => {
+    expect(orderStatusLabel('expired', 'staged', 'Webull')).toEqual({
+      key: 'toolArtifact.directTool.orderStatus.expiredStaged',
+      params: { vendor: 'Webull' },
+    });
+    expect(orderStatusLabel('expired', 'staged', null)).toEqual({
+      key: 'toolArtifact.directTool.orderStatus.expiredStagedUnnamed',
+    });
+    expect(orderStatusLabel('expired', 'live', 'Webull')).toEqual({
+      key: 'toolArtifact.directTool.orderStatus.expired',
+    });
+    expect(orderStatusShortLabel('expired', 'staged')).toBe(
+      'toolArtifact.directTool.orderStatusShort.expired',
+    );
+  });
+
+  it('reads the broker as having named the end only on an explicit null', () => {
+    expect(vendorNamedEnd(null)).toBe(true);
+    expect(vendorNamedEnd('2026-10-26T01:00:00+00:00')).toBe(false);
+    // A record from before the ledger sent the field says nothing either way.
+    expect(vendorNamedEnd(undefined)).toBe(false);
+  });
+
   it('shortens to "Staged" on a row, and only there', () => {
     expect(orderStatusShortLabel('submitted', 'staged')).toBe(
       'toolArtifact.directTool.orderStatusShort.submittedStaged',
@@ -140,7 +196,7 @@ describe('what a staged order is called', () => {
 
   it('leaves every other staged state on the word it had', () => {
     for (const status of ORDER_STATUSES) {
-      if (status === 'submitted' || status === 'handed_off') continue;
+      if (status === 'submitted' || status === 'handed_off' || status === 'expired') continue;
       expect(orderStatusLabel(status, 'staged', 'Interactive Brokers')).toEqual({
         key: ORDER_STATUS_KEY[status],
       });

@@ -19,7 +19,7 @@ from ptc_agent.agent.middleware.runtime_context import (
     BaselineContextMiddleware,
     BaselineSources,
     BlockReader,
-    TailEnvelopeMiddleware,
+    RowCarrierMiddleware,
     TurnContext,
     TurnContextMiddleware,
     resolve_preferred_market,
@@ -48,7 +48,7 @@ class ContextMiddleware:
 
     turn: TurnContextMiddleware
     baseline: BaselineContextMiddleware
-    tail: TailEnvelopeMiddleware
+    tail: RowCarrierMiddleware
 
 
 def build_context_middleware(
@@ -106,11 +106,7 @@ def build_context_middleware(
             role=role,
             switches=switches,
         ),
-        tail=TailEnvelopeMiddleware(
-            now=now,
-            guidance=guidance,
-            model_name=model_name,
-        ),
+        tail=RowCarrierMiddleware(),
     )
 
 

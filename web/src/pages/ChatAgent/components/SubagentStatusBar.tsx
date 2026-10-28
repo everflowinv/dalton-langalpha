@@ -4,6 +4,7 @@ import { MessageSquarePlus, Send, X } from 'lucide-react';
 import { Loader } from '@/components/ui/loader';
 import iconRobo from '../../../assets/img/icon-robo.png';
 import iconRoboSing from '../../../assets/img/icon-robo-sing.png';
+import { isImeComposing } from '@/lib/ime';
 import Markdown from './Markdown';
 import { deriveSubagentStatus } from '../session/subagents/subagentStatus';
 import { SubagentStatusIcon } from './taskStatusUi';
@@ -67,6 +68,7 @@ function SubagentStatusBar({ agent, onSendInstruction }: SubagentStatusBarProps)
   }, [inputValue, sending, agent?.status, onSendInstruction]);
 
   const handleKeyDown = useCallback((e: React.KeyboardEvent<HTMLInputElement>): void => {
+    if (isImeComposing(e)) return;
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       handleSend();

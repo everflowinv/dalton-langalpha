@@ -7,7 +7,7 @@ import type { useTranslation } from 'react-i18next';
 
 import type { Computer, ComputerReconnectTarget, ComputerStartFailure } from '@/types/api';
 
-import { apiErrorDetailMessage, apiErrorObject, apiErrorReason, apiErrorStatus } from '../utils/api/errors';
+import { apiErrorDetailMessage, apiErrorObject, apiErrorReason, apiErrorStatus } from '@/api/errors';
 import { folderMarkedOwner } from '../utils/sshLimit';
 import { activeSpecChange } from './specChangeUi';
 

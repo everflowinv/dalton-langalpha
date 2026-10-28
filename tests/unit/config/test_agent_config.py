@@ -410,7 +410,7 @@ class TestCompactionConfig:
         assert cfg.enabled is True
         assert cfg.token_threshold == 120000
         assert cfg.keep_tokens == 20_000
-        assert cfg.truncate_args_idle_minutes == 90
+        assert cfg.truncate_args_idle_minutes is None
         assert cfg.truncate_args_keep_messages == 20
         assert cfg.truncate_args_max_length == 2000
 

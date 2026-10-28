@@ -116,7 +116,9 @@ export function getModelDisplayName(key: string | null, metadata?: Record<string
   if (!key) return '';
   const authored = metadata?.[key]?.display_name;
   if (authored) return authored;
-  let name = key;
+  // A subscription's twin of a model is the same model, so it takes its name.
+  // A name the user gave a model of their own is theirs, suffix and all.
+  let name = metadata?.[key]?.is_custom_model ? key : key.replace(/-oauth$/, '');
   // Strip common provider prefixes
   for (const prefix of ['claude-', 'gpt-', 'chatgpt-', 'o1-', 'o3-', 'o4-']) {
     if (name.startsWith(prefix)) { name = name.slice(prefix.length); break; }

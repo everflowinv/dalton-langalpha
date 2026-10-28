@@ -107,6 +107,7 @@ export function OrderApprovalCard({
       // cannot, because that line is a button and a link inside one fights
       // the fold it opens.
       status={ledgerRow?.status}
+      unlistedAt={ledgerRow?.unlisted_at}
       attemptId={ledgerRow ? data.attemptId : undefined}
     />
   );
@@ -207,6 +208,7 @@ function SettledOrderStep({
   reason,
   args,
   status,
+  unlistedAt,
   attemptId,
 }: {
   order: OrderProposal;
@@ -216,6 +218,8 @@ function SettledOrderStep({
   /** What the ledger says became of the order. Drawn only where no receipt
    *  will ever say it, so the verdict is not left standing as the whole story. */
   status?: OrderStatus;
+  /** The row's `unlisted_at`, for the pill to say how a handed-off order ended. */
+  unlistedAt?: string | null;
   /** The row the rest of the outcome is written on. Present only beside a
    *  ledger status, since without one there is nothing more to read. */
   attemptId?: string;
@@ -233,7 +237,9 @@ function SettledOrderStep({
       badge={
         <>
           <OrderModeBadge mode={order.mode} />
-          {status && <OrderStatusPill status={status} mode={order.mode} />}
+          {status && (
+            <OrderStatusPill status={status} mode={order.mode} unlistedAt={unlistedAt} />
+          )}
         </>
       }
     >

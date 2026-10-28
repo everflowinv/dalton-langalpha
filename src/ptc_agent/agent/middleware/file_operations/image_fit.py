@@ -786,7 +786,7 @@ async def fit_images(
     messages: list,
     accepted: frozenset[str],
     max_side: Callable[[int], int | None],
-) -> tuple[list, frozenset[tuple[int, int]]]:
+) -> tuple[list, frozenset[tuple[int, int]], frozenset[str]]:
     """Fit every image block in ``messages`` to the target's types and side limit.
 
     ``accepted`` is the MIME types the target takes as is; an image in another
@@ -802,11 +802,17 @@ async def fit_images(
     bytes. An image over its ceiling is re-encoded down the ladder; one the
     ladder cannot fit, or that the total cannot carry, is replaced by a text
     note naming its sandbox copy when there is one. History keeps the original
-    in every case.
+    in every case. Unlike every other outcome here the total's cut moves
+    between calls — what fits changes as images arrive — so the ids of the
+    messages whose images it left out are returned with the messages, for the
+    caller to record the way a context-window removal is (see the strip
+    middleware), which is what keeps the cut stable and the thinking after it
+    valid.
 
-    Returns the messages, the original list when nothing changed, and the
+    Returns the messages, the original list when nothing changed, the
     positions (message, block) in them of the images the target can't be
-    given. Those are left in place for the caller to replace in its own pass,
+    given, and the ids of the messages whose images the total left out. The
+    positions are left in place for the caller to replace in its own pass,
     so that the guidance on the first placeholder lands on the first in the
     history whatever kind it is. Never mutates a message: these are checkpoint
     objects shared with the rest of the graph.
@@ -825,7 +831,8 @@ async def fit_images(
             if payload is not None:
                 located.append((i, j, *payload))
     if not located:
-        return messages, frozenset()
+        # DALTON-HOOK(attachment-native-cap): third element — no left-out ids.
+        return messages, frozenset(), frozenset()
 
     probes: dict[tuple[int, int], _Probe | None] = {}
     deferred = []
@@ -935,7 +942,7 @@ async def fit_images(
             kept_total += size
 
     if not fitted and not relabels and not too_large and not left_out:
-        return messages, frozenset(dropped)
+        return messages, frozenset(dropped), frozenset()
 
     path_reads = _path_read_calls(messages)
     unreadable: set[tuple[int, int]] = set()
@@ -981,7 +988,14 @@ async def fit_images(
             new is not old for new, old in zip(blocks, msg.content)
         ):
             result[i] = msg.model_copy(update={"content": blocks})
-    return result, frozenset(unreadable)
+    # DALTON-HOOK(attachment-native-cap): the message ids behind the total's
+    # cut, for the caller to record — every attachment of each goes then, the
+    # context-window removal's granularity, not only the images the walk left
+    # out, so the cut this call made is the one every later call reads.
+    left_out_ids = {
+        messages[i].id for i, _ in left_out if getattr(messages[i], "id", None)
+    }
+    return result, frozenset(unreadable), frozenset(left_out_ids)
 
 
 __all__ = [

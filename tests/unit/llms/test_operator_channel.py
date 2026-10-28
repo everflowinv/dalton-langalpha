@@ -26,11 +26,17 @@ from langchain_openai import ChatOpenAI
 from src.llms.extension import ChatAnthropicOAuth, ChatCodexOpenAI
 from src.llms.llm import LLM
 from src.llms.operator_channel import (
+    OPERATOR_CHANNEL_KEY,
+    INLINE_TOOLS_BETA,
+    TURN_SCOPED_BETA,
     anthropic_serves_midturn_system,
     build_operator_message,
+    carries_tool_changes,
+    carries_turn_scoped,
     is_operator_system_message,
     operator_request,
     resolve_operator_channel,
+    tool_change_betas,
 )
 from src.llms.vendor.langchain_zai import ChatZai
 
@@ -619,6 +625,73 @@ def test_an_assistant_turn_the_formatter_drops_does_not_count():
     assert [m["role"] for m in payload["messages"]] == ["user", "user", "user", "system"]
 
 
+# ---------------------------------------------------------------------------
+# Mid-conversation tool changes
+# ---------------------------------------------------------------------------
+
+_ADD = {"type": "tool_addition", "tool": {"type": "tool_reference", "name": "draw_chart"}}
+
+
+def _tool_change(*blocks):
+    return SystemMessage(
+        content=list(blocks),
+        additional_kwargs={OPERATOR_CHANNEL_KEY: "system", "lc_source": "tool_change"},
+    )
+
+
+def test_a_tool_change_reaches_the_wire_in_its_own_entry():
+    payload = _payload([SystemMessage("base prompt"), HumanMessage("hi"), _tool_change(_ADD)])
+    assert payload["messages"][-1] == {"role": "system", "content": [_ADD]}
+
+
+def test_entries_that_meet_are_joined_into_one():
+    """A row and a tool change written at the same point go out as one system
+    entry, the shape the wire rule allows, in the order they were written."""
+    payload = _payload(
+        [
+            SystemMessage("base prompt"),
+            HumanMessage("hi"),
+            build_operator_message("row", "system"),
+            _tool_change(_ADD),
+            AIMessage("answer"),
+        ]
+    )
+    assert payload["messages"] == [
+        {"role": "user", "content": "hi"},
+        {"role": "system", "content": [{"type": "text", "text": "row"}, _ADD]},
+        {"role": "assistant", "content": "answer"},
+    ]
+
+
+def test_a_tool_change_the_wire_cannot_place_is_not_sent():
+    """A user turn has no form for a tool change, so an entry of nothing else
+    that no assistant turn follows is left out rather than refused."""
+    payload = _payload(
+        [SystemMessage("base prompt"), HumanMessage("hi"), _tool_change(_ADD), HumanMessage("again")]
+    )
+    assert [m["role"] for m in payload["messages"]] == ["user", "user"]
+
+
+def _official(model: str = "claude-opus-5-5", **kwargs):
+    return _anthropic("anthropic-test", model=model, **kwargs)
+
+
+def test_tool_changes_ride_the_official_host_on_a_model_that_serves_them():
+    with provider_entry("anthropic-test", {"sdk": "anthropic", "operator_channel": "system"}):
+        assert carries_tool_changes(_official()) is True
+        assert carries_tool_changes(_official("claude-sonnet-5")) is False
+        assert carries_tool_changes(_official(base_url="https://api.deepseek.com/anthropic")) is False
+    with provider_entry("anthropic-test", {"sdk": "anthropic"}):
+        assert carries_tool_changes(_official()) is False
+    assert carries_tool_changes(_openai()) is False
+
+
+def test_tool_change_betas_add_inline_tools_once():
+    assert tool_change_betas() == [INLINE_TOOLS_BETA]
+    assert tool_change_betas(["compact-2026-09-04"]) == ["compact-2026-09-04", INLINE_TOOLS_BETA]
+    assert tool_change_betas([INLINE_TOOLS_BETA]) == [INLINE_TOOLS_BETA]
+
+
 def test_bridge_is_installed_once_and_idle_outside_the_window():
     """The wrapped hoist is the one module global; outside the window it is
     the stock function's answer, so every other Anthropic call is untouched."""
@@ -632,3 +705,50 @@ def test_bridge_is_installed_once_and_idle_outside_the_window():
     assert chat_models._format_messages is bridged
     with pytest.raises(ValueError, match="multiple non-consecutive system messages"):
         bridged(_conversation(), model=None)
+
+
+
+@pytest.mark.parametrize(
+    ("model", "takes"),
+    [
+        ("claude-sonnet-5", False),
+        ("claude-haiku-5", False),
+        ("claude-fable-5-1", True),
+        ("claude-mythos-5", True),
+        ("claude-newfamily-9", False),
+    ],
+)
+def test_the_role_cutoff_is_per_family(model, takes):
+    """Sonnet 5 refuses the role though Opus 4.8 takes it; a family nobody
+    named fails closed."""
+    assert anthropic_serves_midturn_system(None, model) is takes
+
+
+def _turn_scoped(text: str) -> SystemMessage:
+    message = build_operator_message(text, "system", source="runtime_update")
+    message.additional_kwargs["clear_at"] = "next_user_message"
+    return message
+
+
+def test_a_turn_scoped_entry_keeps_its_clear_at_and_its_own_entry():
+    """Joining it to a row's entry would clear the row, or render it forever."""
+    row = build_operator_message("row", "system", source="runtime_update")
+    payload = _payload([SystemMessage("base prompt"), HumanMessage("hi"), row, _turn_scoped("stamp")])
+
+    entries = [m for m in payload["messages"] if m["role"] == "system"]
+    assert len(entries) == 2
+    assert "clear_at" not in entries[0]
+    assert entries[1]["clear_at"] == "next_user_message"
+    assert entries[1]["content"] == [{"type": "text", "text": "stamp"}]
+
+
+@pytest.mark.parametrize("key", ["anthropic-beta", "Anthropic-Beta"])
+def test_turn_scoped_needs_the_beta_in_the_clients_own_header(key):
+    """A header name is case-insensitive on the wire, so any casing sends it."""
+    with provider_entry("anthropic-test", {"sdk": "anthropic", "operator_channel": "system"}):
+        assert carries_turn_scoped(_official()) is False
+        with_beta = _official(default_headers={key: f"other-beta, {TURN_SCOPED_BETA}"})
+        assert carries_turn_scoped(with_beta) is True
+        assert carries_turn_scoped(_official("claude-sonnet-5", default_headers={"anthropic-beta": TURN_SCOPED_BETA})) is False
+    assert carries_turn_scoped(_openai()) is False
+

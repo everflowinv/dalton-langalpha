@@ -30,7 +30,7 @@ export function useToolbarItems({
   scope,
   onScopeChange,
   emptyWorkspacesHint,
-  menuPlacement = 'top start',
+  menuDirection = 'up',
   menuContainer = null,
   draftRef,
 }: {
@@ -46,8 +46,8 @@ export function useToolbarItems({
   scope?: ComposerScope;
   onScopeChange?: ((scope: ComposerScope) => void) | null;
   emptyWorkspacesHint?: string | null;
-  menuPlacement?: 'top start' | 'bottom start';
-  /** Where the pickers portal to; null portals to the body. */
+  menuDirection?: 'up' | 'down';
+  /** The composer, which a phone portals the pickers into. */
   menuContainer?: HTMLElement | null;
   /** The composer's text field, where a pick made with the pointer leaves focus. */
   draftRef?: RefObject<HTMLTextAreaElement | null>;
@@ -114,8 +114,8 @@ export function useToolbarItems({
               selectedKey={allSelected ? ALL_WORKSPACES_KEY : selectedWorkspaceId ?? null}
               onPick={(key) => (key === ALL_WORKSPACES_KEY ? pickAll() : pickWorkspace(key))}
               emptyHint={noWorkspacesHint}
-              placement={menuPlacement}
-              portalContainer={menuContainer}
+              direction={menuDirection}
+              container={menuContainer}
               draftRef={draftRef}
             />
           </>
@@ -224,6 +224,6 @@ export function useToolbarItems({
     watchMode, setWatchMode, marketWatchEnabled, showWorkspaceMenu,
     workspaces, selectedWorkspaceId, t,
     hasScopePicker, allSelected, scopeLabel, noWorkspacesHint, hasSecondSection,
-    pickAll, pickWorkspace, menuPlacement, menuContainer, draftRef,
+    pickAll, pickWorkspace, menuDirection, menuContainer, draftRef,
   ]);
 }

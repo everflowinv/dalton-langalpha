@@ -28,7 +28,18 @@ function asString(value: unknown): string | null {
 
 const KINDS: readonly WakeupKind[] = ['at', 'cron', 'price', 'order'];
 const PRICE_KINDS: readonly WakeupPrice['kind'][] = ['above', 'below', 'pct_up', 'pct_down'];
-const OUTCOMES: readonly OrderOutcome[] = ['filled', 'partial', 'partial_cancelled', 'cancelled', 'rejected', 'failed'];
+const OUTCOMES: readonly OrderOutcome[] = [
+  'filled',
+  'partial',
+  'partial_cancelled',
+  'cancelled',
+  'rejected',
+  'failed',
+  'partial_expired',
+  'expired',
+  'confirmed',
+  'handed_off',
+];
 
 function coercePrice(raw: unknown): WakeupPrice | null {
   if (!isRecord(raw)) return null;

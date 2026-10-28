@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+// DALTON-HOOK(multi-file-upload): hold stale-build reload while a debounced, in-flight, or queued save is unfinished
+import { holdReload } from '@/lib/reloadHolds';
 
 type SaveStatus = 'idle' | 'saving' | 'saved' | 'error';
 
@@ -7,9 +9,12 @@ type SaveStatus = 'idle' | 'saving' | 'saved' | 'error';
  * - `trigger()`: schedule a debounced save (resets timer on rapid calls)
  * - `flush()`: save immediately, cancelling any pending debounce
  * - `status`: 'idle' | 'saving' | 'saved' | 'error'
+ *
+ * A save that resolves `false` wrote nothing, and the status goes back to idle
+ * rather than claiming it saved.
  */
 export function useDebouncedSave(
-  saveFn: () => Promise<void>,
+  saveFn: () => Promise<void | false>,
   delay = 800,
 ) {
   const [status, setStatus] = useState<SaveStatus>('idle');
@@ -20,10 +25,27 @@ export function useDebouncedSave(
   const runningRef = useRef(false);
   const pendingRef = useRef(false);
   const mountedRef = useRef(true);
+  const releaseReloadRef = useRef<(() => void) | null>(null);
+  // DALTON-HOOK(multi-file-upload): hold stale-build reload while a debounced,
+  // in-flight, or queued save is unfinished so a section switch never reloads
+  // before pending edits finish saving.
+  const syncReloadHold = useCallback(() => {
+    const busy =
+      timerRef.current !== null || runningRef.current || pendingRef.current;
+    if (busy && !releaseReloadRef.current) {
+      releaseReloadRef.current = holdReload();
+    } else if (!busy && releaseReloadRef.current) {
+      const release = releaseReloadRef.current;
+      releaseReloadRef.current = null;
+      release();
+    }
+  }, []);
 
   const execute = useCallback(async () => {
+    // DALTON-HOOK(multi-file-upload): keep reload held while executing or queueing saves
     if (runningRef.current) {
       pendingRef.current = true;
+      syncReloadHold();
       return;
     }
     runningRef.current = true;
@@ -31,6 +53,7 @@ export function useDebouncedSave(
       clearTimeout(timerRef.current);
       timerRef.current = null;
     }
+    syncReloadHold();
     if (savedTimerRef.current) {
       clearTimeout(savedTimerRef.current);
       savedTimerRef.current = null;
@@ -41,8 +64,12 @@ export function useDebouncedSave(
     // updates are gated on still being mounted.
     if (mountedRef.current) setStatus('saving');
     try {
-      await saveFnRef.current();
+      const saved = await saveFnRef.current();
       if (!mountedRef.current) return;
+      if (saved === false) {
+        setStatus('idle');
+        return;
+      }
       setStatus('saved');
       savedTimerRef.current = setTimeout(() => setStatus('idle'), 2000);
     } catch {
@@ -51,31 +78,40 @@ export function useDebouncedSave(
       savedTimerRef.current = setTimeout(() => setStatus('idle'), 3000);
     } finally {
       runningRef.current = false;
-      if (pendingRef.current && mountedRef.current) {
+      // An edit made while this save ran still has to land, unmounted or not.
+      if (pendingRef.current) {
         pendingRef.current = false;
         execute();
       } else {
-        pendingRef.current = false;
+        // DALTON-HOOK(multi-file-upload): release reload hold once queued saves finish
+        syncReloadHold();
       }
     }
-  }, []);
+  }, [syncReloadHold]);
 
   const trigger = useCallback(() => {
     if (timerRef.current) clearTimeout(timerRef.current);
     timerRef.current = setTimeout(execute, delay);
-  }, [delay, execute]);
+    syncReloadHold();
+  }, [delay, execute, syncReloadHold]);
 
   const flush = useCallback(() => {
     execute();
   }, [execute]);
 
   useEffect(() => {
+    mountedRef.current = true;
     return () => {
       mountedRef.current = false;
-      if (timerRef.current) clearTimeout(timerRef.current);
+      if (timerRef.current) {
+        clearTimeout(timerRef.current);
+        timerRef.current = null;
+      }
       if (savedTimerRef.current) clearTimeout(savedTimerRef.current);
+      // DALTON-HOOK(multi-file-upload): release reload hold when unmounting with no running save
+      syncReloadHold();
     };
-  }, []);
+  }, [syncReloadHold]);
 
   return { trigger, flush, status };
 }

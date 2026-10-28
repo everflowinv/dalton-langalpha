@@ -79,6 +79,8 @@ LANGCHAIN_LIBRARIES = [
     'langchain_anthropic',
     'langchain_google_genai',
     'langchain_deepseek',
+    'langchain_openrouter',
+    'openrouter',
     'langgraph',
     'langsmith',
 ]

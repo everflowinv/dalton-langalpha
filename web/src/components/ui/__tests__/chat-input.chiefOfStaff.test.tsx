@@ -32,6 +32,7 @@ vi.mock('@/hooks/usePreferences', () => ({
 vi.mock('@/hooks/useAllModels', () => ({
   useAllModels: () => ({
     models: {},
+    payers: {},
     validModelNames: new Set(),
     metadata: {},
     isLoading: false,
@@ -61,6 +62,7 @@ vi.mock('../chat-input.modelMenu', () => ({
       <button type="button" onClick={() => onSelectModel('model-beta')}>pick-beta</button>
     </>
   ),
+  ChatInputEffortMenu: () => null,
   ModelTriggerMeasure: () => null,
 }));
 

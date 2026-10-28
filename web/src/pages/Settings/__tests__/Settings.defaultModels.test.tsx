@@ -6,6 +6,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 
 const h = vi.hoisted(() => ({
   platformMode: false,
+  payers: {} as Record<string, string>,
   mutate: vi.fn((_payload: unknown) => undefined),
   mutateAsync: vi.fn(async (_payload: unknown) => ({})),
   toast: vi.fn(),
@@ -27,7 +28,7 @@ const h = vi.hoisted(() => ({
   systemDefaults: {
     default_model: 'deepseek-flash',
     background_model: 'deepseek-flash',
-    fallback_models: [],
+    fallback_models: [] as string[],
     dalton_audit_model: 'gemini-4-argon-medium-oauth',
     dalton_language_model: 'gemini-4-argon-medium-oauth',
     dalton_audit_fallback_models: ['gpt-6.1-sol-oauth', 'claude-opus-5-5-oauth'],
@@ -85,12 +86,15 @@ vi.mock('@/hooks/useAllModels', () => ({
     // Per-model tuning metadata — the Advanced section reads it for the
     // reasoning-effort ladder. Always an object from the real hook.
     metadata: {},
-    modelAccessMap: {},
+    payers: h.payers,
     systemDefaults: h.systemDefaults,
+    // DALTON-HOOK(settings-section): ModelTab reads customModels for Dalton selectors
+    customModels: [],
     offPlanModels: new Set(),
     // Stable Set ref — the stale-model cleanup effect keys on its identity.
     validModelNames: h.validModelNames,
     rawModels: h.rawModels,
+    catalogModelNames: new Set(Object.values(h.rawModels).flatMap((data) => data.models ?? [])),
     rawApiResponse: h.rawApiResponse,
     compactionProfiles: null,
     searchProviders: h.searchProviderCatalog,
@@ -105,8 +109,8 @@ vi.mock('@/components/ui/use-toast', () => ({
 }));
 
 // Debounced save. The model tab has no text input and writes on the change
-// event, but UserInfoTab (mounted by the same Settings shell) still debounces
-// its text fields.
+// event, but the Profile section (in the same Settings shell) still debounces
+// its name field.
 vi.mock('@/hooks/useDebouncedSave', () => ({
   useDebouncedSave: (saveFn: () => Promise<void>) => ({
     trigger: () => { setTimeout(() => { void saveFn(); }, 0); },
@@ -157,14 +161,6 @@ vi.mock('@/pages/Dashboard/utils/api', () => ({
   clearPreferences: vi.fn(async () => ({})),
   uploadAvatar: vi.fn(async () => ({ avatar_url: '' })),
   getUserApiKeys: vi.fn(async () => ({ providers: [] })),
-  initiateCodexDevice: vi.fn(async () => ({})),
-  pollCodexDevice: vi.fn(async () => ({})),
-  getCodexOAuthStatus: vi.fn(async () => ({ connected: false })),
-  disconnectCodexOAuth: vi.fn(async () => ({})),
-  initiateClaudeOAuth: vi.fn(async () => ({})),
-  submitClaudeCallback: vi.fn(async () => ({})),
-  getClaudeOAuthStatus: vi.fn(async () => ({ connected: false })),
-  disconnectClaudeOAuth: vi.fn(async () => ({})),
 }));
 
 // Home workspace, used by preference-modify navigation, never in these tests.
@@ -180,6 +176,12 @@ vi.mock('@/pages/Onboarding', () => ({
 // DALTON-HOOK(settings-section): stub DaltonSection card in Settings shell harness
 vi.mock('@/pages/Settings/panels/dalton/DaltonSection', () => ({
   DaltonSection: () => null,
+}));
+
+// DALTON-HOOK(team-credentials): the model-access panel reads the shared-credential hint
+vi.mock('@/hooks/useTeamCredentials', () => ({
+  TEAM_SHARED_CREDENTIALS_HINT: '',
+  useTeamCredentials: () => ({ isShared: false, canDisconnect: true, isPm: true, canInvite: false }),
 }));
 
 // Import after mocks are registered.
@@ -212,6 +214,18 @@ function wroteADefault(): boolean {
 beforeEach(() => {
   localStorage.removeItem('settings:modelMode');
   h.preferences = { model_preference: {}, other_preference: {} };
+  h.payers = {};
+  // DALTON-HOOK(settings-section): restore Dalton role defaults before each test
+  h.systemDefaults = {
+    default_model: 'deepseek-flash',
+    background_model: 'deepseek-flash',
+    fallback_models: [],
+    dalton_audit_model: 'gemini-4-argon-medium-oauth',
+    dalton_language_model: 'gemini-4-argon-medium-oauth',
+    dalton_audit_fallback_models: ['gpt-6.1-sol-oauth', 'claude-opus-5-5-oauth'],
+    dalton_audit_timeout_s: 300,
+    dalton_extract_model: 'deepseek-flash',
+  };
   h.mutate.mockClear();
   h.mutateAsync.mockClear();
   h.mutateAsync.mockResolvedValue({});
@@ -381,7 +395,8 @@ describe('Settings: Dalton routing controls', () => {
   });
 
   // DALTON-HOOK(settings-section): verify Dalton dropdowns exclude custom_models
-  it('excludes user custom_models from Dalton model selectors while keeping system catalog models', async () => {    localStorage.setItem('settings:modelMode', 'advanced');
+  it('excludes user custom_models from Dalton model selectors while keeping system catalog models', async () => {
+    localStorage.setItem('settings:modelMode', 'advanced');
     h.catalog = {
       openai: { models: ['gpt-sol', 'my-custom-model'] },
       anthropic: { models: ['claude-big'] },
@@ -440,3 +455,66 @@ describe('Settings: Dalton routing controls', () => {
   });
 });
 
+describe('saved fallbacks that cross payers', () => {
+  const NOTE = 'Saved fallbacks run on every turn, including ones you pay for yourself.';
+  const renderAdvanced = () => {
+    localStorage.setItem('settings:modelMode', 'advanced');
+    return renderModelTab();
+  };
+
+  // Saving the list made the deployment's models the user's choice, which
+  // the faded look no longer says.
+  it("says a saved list with the deployment's models runs on turns the user pays for", () => {
+    h.payers = { 'deepseek-flash': 'server_key', 'claude-big': 'own_key' };
+    h.preferences = { model_preference: { fallback_models: ['deepseek-flash'] }, other_preference: {} };
+    renderAdvanced();
+    expect(screen.getByText(NOTE)).toBeInTheDocument();
+  });
+
+  it('says nothing to a user who pays for no turn themselves', () => {
+    h.payers = { 'deepseek-flash': 'server_key' };
+    h.preferences = { model_preference: { fallback_models: ['deepseek-flash'] }, other_preference: {} };
+    renderAdvanced();
+    expect(screen.queryByText(NOTE)).not.toBeInTheDocument();
+  });
+
+  it('says nothing while the list is still the deployment\'s', () => {
+    h.payers = { 'deepseek-flash': 'server_key', 'claude-big': 'own_key' };
+    h.systemDefaults = { default_model: 'deepseek-flash', background_model: 'deepseek-flash', fallback_models: ['deepseek-flash'] };
+    renderAdvanced();
+    expect(screen.queryByText(NOTE)).not.toBeInTheDocument();
+  });
+});
+
+describe('payers in the default fallbacks and favorites', () => {
+  const FADED = 'Faded ones skip turns you pay for yourself.';
+  const renderAdvanced = () => {
+    localStorage.setItem('settings:modelMode', 'advanced');
+    return renderModelTab();
+  };
+
+  // One above the plan, or on a local server, has no payer here, and an
+  // own-key turn skips it as it skips one the deployment pays for.
+  it("fades a default fallback that no key or sign-in of the user's runs", () => {
+    h.payers = { 'claude-big': 'own_key' };
+    h.systemDefaults = { default_model: 'deepseek-flash', background_model: 'deepseek-flash', fallback_models: ['claude-small'] };
+    renderAdvanced();
+    expect(screen.getByText(FADED, { exact: false })).toBeInTheDocument();
+  });
+
+  it("does not fade a default fallback the user's own key runs", () => {
+    h.payers = { 'claude-big': 'own_key' };
+    h.systemDefaults = { default_model: 'deepseek-flash', background_model: 'deepseek-flash', fallback_models: ['claude-big'] };
+    renderAdvanced();
+    expect(screen.queryByText(FADED, { exact: false })).not.toBeInTheDocument();
+  });
+
+  // Twins share a name, one on a plan and one on credits.
+  it('tags each favorite with who pays for it', () => {
+    h.payers = { 'claude-big': 'own_key' };
+    h.preferences = { model_preference: {}, other_preference: { starred_models: ['claude-big'], favorites_starred_only: true } };
+    renderModelTab();
+    const chip = screen.getByRole('button', { name: /claude-big/i }).parentElement!;
+    expect(chip).toHaveTextContent('Your key');
+  });
+});

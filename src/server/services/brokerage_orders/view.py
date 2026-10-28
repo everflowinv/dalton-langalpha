@@ -62,7 +62,9 @@ def _instrument_text(ref: Any) -> str:
     if kind == "opaque":
         return ref.raw_code
     if kind == "combo":
-        return ref.strategy or "combo"
+        symbols = {leg.get("symbol") for leg in ref.legs or ()}
+        symbol = symbols.pop() if len(symbols) == 1 else None
+        return " ".join(x for x in (symbol, ref.strategy or "combo") if x)
     return ""
 
 

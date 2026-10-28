@@ -34,6 +34,12 @@ NATIVE_COMPACTION_OFF_PROVIDERS = frozenset(
         # xAI Grok API and OAuth relays.
         "xai",
         "xai-oauth",
+        # Upstream's own grok-oauth variant of xai (api.x.ai). Dalton does not
+        # enable it (the two grok-*-oauth keys route to xai-oauth + CLI proxy),
+        # and both gates verdict it None today — but only because an oauth
+        # variant matches no sdk branch and api.x.ai is not an official host;
+        # an upstream relaxation of either would turn it on silently.
+        "grok-oauth",
         # OpenClaw broker gateway.
         "openclaw-broker",
         # GLM coding-plan subscription routes (Anthropic-compatible wire).

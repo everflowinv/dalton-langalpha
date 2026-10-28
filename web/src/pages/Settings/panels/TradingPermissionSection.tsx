@@ -1,6 +1,5 @@
-import { useEffect, useId, useRef } from 'react';
+import { useId } from 'react';
 import { useTranslation } from 'react-i18next';
-import { useLocation } from 'react-router';
 import { TradingLevelAgreedOn, TradingLevelName } from '@/components/trading/TradingLevelText';
 import { RadioChoice } from '@/components/ui/choice';
 import { useTradingPermissionChoice } from '@/hooks/useTradingPermissionChoice';
@@ -15,40 +14,26 @@ import type { TradingLevel } from '@/types/api';
  */
 export function TradingPermissionSection() {
   const { t } = useTranslation();
-  const { hash } = useLocation();
   const headingId = useId();
   const descId = useId();
   const groupName = useId();
-  const sectionRef = useRef<HTMLElement>(null);
   const { permission, shown, pendingLevel, agreedDate, select, dialog } = useTradingPermissionChoice();
   const loaded = permission.data !== undefined;
 
-  // A deep link lands on the section once it has its height. Before that the
-  // cards are not drawn, and a scroll to a short page stops short of it.
-  useEffect(() => {
-    if (!loaded || hash !== `#${TRADING_PERMISSION_ANCHOR}`) return;
-    sectionRef.current?.scrollIntoView?.({ block: 'start' });
-  }, [loaded, hash]);
-
   return (
-    <section
-      ref={sectionRef}
-      id={TRADING_PERMISSION_ANCHOR}
-      aria-labelledby={headingId}
-      className="scroll-mt-4 space-y-3"
-    >
-      <div>
+    <section aria-labelledby={headingId} className="space-y-2">
+      <div className="mx-0.5">
         <div className="flex items-baseline justify-between gap-3">
-          <h3 id={headingId} className="text-[0.8125rem] font-medium" style={{ color: 'var(--color-text-primary)' }}>
+          <h2 id={headingId} className="settings-group-title">
             {t('settings.tradingPermission.title')}
-          </h3>
+          </h2>
           {pendingLevel && (
             <span className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
               {t('common.saving')}
             </span>
           )}
         </div>
-        <p id={descId} className="mt-0.5 text-xs leading-relaxed" style={{ color: 'var(--color-text-tertiary)' }}>
+        <p id={descId} className="settings-group-desc">
           {t('settings.tradingPermission.desc')}
         </p>
       </div>
@@ -74,7 +59,15 @@ export function TradingPermissionSection() {
       )}
 
       {loaded && (
-        <div role="radiogroup" aria-labelledby={headingId} aria-describedby={descId} className="flex flex-col gap-2">
+        // The anchor is on the levels, which draw once the permission has
+        // loaded: a link or a search lands on them, not on an empty section.
+        <div
+          id={TRADING_PERMISSION_ANCHOR}
+          role="radiogroup"
+          aria-labelledby={headingId}
+          aria-describedby={descId}
+          className="settings-levels flex flex-col gap-2"
+        >
           {TRADING_LEVELS.map((level) => (
             <LevelCard
               key={level}

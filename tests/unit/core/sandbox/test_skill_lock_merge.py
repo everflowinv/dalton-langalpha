@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import json
 import subprocess
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -31,8 +32,14 @@ from tests.unit.restored_overlay import archive, python3_on_path
 class _ShellSandbox:
     """Runs the command the host builds, on this machine's own filesystem."""
 
-    def __init__(self) -> None:
+    def __init__(self, working_dir: Path) -> None:
+        self._work_dir = str(working_dir)
         self.runtime = self
+
+    async def upload_file(self, content: bytes, dest_path: str):
+        path = Path(dest_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
 
     async def exec(self, command: str, *args, **kwargs):
         proc = subprocess.run(
@@ -55,7 +62,7 @@ def _run_merge(tmp_path, entries: dict, auth: dict) -> tuple[dict, dict]:
     )
     merged, skipped = asyncio.run(
         skill_sync.install_staged_skills(
-            _ShellSandbox(),
+            _ShellSandbox(tmp_path),
             str(tmp_path / ".staging" / "sync-test"),
             [],
             auth,
@@ -135,7 +142,7 @@ def test_install_over_a_non_dir_name_leaves_no_trash(tmp_path, occupant):
     (staged / "SKILL.md").write_text("new")
     asyncio.run(
         skill_sync.install_staged_skills(
-            _ShellSandbox(),
+            _ShellSandbox(tmp_path),
             str(tmp_path / ".staging" / "sync-test"),
             ["pdf"],
             {"pdf": _PLATFORM_NEW},
@@ -165,7 +172,7 @@ def test_install_over_a_restored_skill_deletes_it_where_it_is(tmp_path, monkeypa
     _restored_skill(base, monkeypatch, tmp_path / "bin")
     merged, _ = asyncio.run(
         skill_sync.install_staged_skills(
-            _ShellSandbox(),
+            _ShellSandbox(tmp_path),
             str(base / ".staging" / "sync-test"),
             ["pdf"],
             {"pdf": _PLATFORM_NEW},
@@ -186,7 +193,7 @@ def test_a_restored_skill_holding_a_read_only_dir_is_still_replaced(tmp_path, mo
     (base / "pdf" / "scripts").chmod(0o500)
     merged, _ = asyncio.run(
         skill_sync.install_staged_skills(
-            _ShellSandbox(),
+            _ShellSandbox(tmp_path),
             str(base / ".staging" / "sync-test"),
             ["pdf"],
             {"pdf": _PLATFORM_NEW},
@@ -206,7 +213,7 @@ def test_a_swap_over_a_restored_skill_deletes_it_where_it_is(tmp_path, monkeypat
     )
     [result] = asyncio.run(
         skill_sync.apply_actions(
-            _ShellSandbox(),
+            _ShellSandbox(tmp_path),
             [{"op": "swap_staged", "name": "pdf", "staged": str(staged), "entry": dict(_MANAGED)}],
             base=str(base),
         )
@@ -246,7 +253,7 @@ def test_a_restored_skill_whose_delete_dies_midway_holds_no_skill(tmp_path, monk
     with pytest.raises(Exception):
         asyncio.run(
             skill_sync.apply_actions(
-                _ShellSandbox(),
+                _ShellSandbox(tmp_path),
                 [{"op": "swap_staged", "name": "pdf", "staged": str(staged),
                   "entry": dict(_MANAGED)}],
                 base=str(base),
@@ -256,13 +263,13 @@ def test_a_restored_skill_whose_delete_dies_midway_holds_no_skill(tmp_path, monk
     assert not (base / "pdf" / "SKILL.md").exists()
 
     python3_on_path(monkeypatch, tmp_path / "bin", tmp_path / ".skills.restored")
-    assert "pdf" not in asyncio.run(skill_sync.report(_ShellSandbox(), base=str(base)))
+    assert "pdf" not in asyncio.run(skill_sync.report(_ShellSandbox(tmp_path), base=str(base)))
     staged = base / ".staging" / "sync-again" / "pdf"
     staged.mkdir(parents=True)
     (staged / "SKILL.md").write_text("new")
     [result] = asyncio.run(
         skill_sync.apply_actions(
-            _ShellSandbox(),
+            _ShellSandbox(tmp_path),
             [{"op": "swap_staged", "name": "pdf", "staged": str(staged),
               "entry": dict(_MANAGED), "expectAbsent": True}],
             base=str(base),
@@ -294,7 +301,7 @@ def test_a_restored_skill_whose_delete_cannot_be_marked_is_left_whole(tmp_path, 
     )
     [result] = asyncio.run(
         skill_sync.apply_actions(
-            _ShellSandbox(),
+            _ShellSandbox(tmp_path),
             [{"op": "swap_staged", "name": "pdf", "staged": str(staged), "entry": dict(_MANAGED)}],
             base=str(base),
         )
@@ -314,7 +321,7 @@ def test_a_mark_of_no_skill_name_deletes_nothing(tmp_path, name):
     (base / ".staging" / "push-1").mkdir(parents=True)
     (tmp_path / ".agents" / "memory.md").write_text("mine")
     (base / f".deleting-{name}").write_text("")
-    assert asyncio.run(skill_sync.report(_ShellSandbox(), base=str(base)))["pdf"]["present"]
+    assert asyncio.run(skill_sync.report(_ShellSandbox(tmp_path), base=str(base)))["pdf"]["present"]
     assert (base / ".staging" / "push-1").is_dir()
     assert (tmp_path / ".agents" / "memory.md").read_text() == "mine"
     assert not (base / f".deleting-{name}").exists()
@@ -328,6 +335,6 @@ def test_a_mark_beside_a_dir_that_holds_its_skill_md_keeps_it(tmp_path):
     (base / "pdf" / "SKILL.md").write_text("---\nname: pdf\ndescription: d\n---\n")
     (base / "pdf" / "scripts" / "run.py").write_text("mine")
     (base / ".deleting-pdf").write_text("")
-    assert asyncio.run(skill_sync.report(_ShellSandbox(), base=str(base)))["pdf"]["present"]
+    assert asyncio.run(skill_sync.report(_ShellSandbox(tmp_path), base=str(base)))["pdf"]["present"]
     assert (base / "pdf" / "scripts" / "run.py").read_text() == "mine"
     assert not (base / ".deleting-pdf").exists()

@@ -323,8 +323,13 @@ async def mint_api_key(access_token: str) -> dict[str, Any]:
     }
 
 
-async def save_minted_credentials(user_id: str, minted: dict[str, Any]) -> dict[str, Any]:
-    """Persist minted Muse `api_key` into `user_oauth_tokens` and cache `base_url` + `subs_usage` in Redis."""
+async def save_minted_credentials(user_id: str, minted: dict[str, Any], conn=None) -> dict[str, Any]:
+    """Persist minted Muse `api_key` into `user_oauth_tokens` and cache `base_url` + `subs_usage` in Redis.
+
+    ``conn`` rides a caller-held ``connection_change`` lock: the sign-in's poll
+    claims its pending flow and stores over that lock, so a disconnect that
+    landed mid-sign-in keeps the connection gone (DALTON-HOOK(team-credentials)).
+    """
     from src.dalton.credentials import credential_user_id
 
     api_key = str(minted.get("api_key") or "").strip()
@@ -346,6 +351,7 @@ async def save_minted_credentials(user_id: str, minted: dict[str, Any]) -> dict[
         email=email,
         plan_type=plan_type,
         expires_at=expires_at,
+        conn=conn,
     )
 
     cred_user_id = credential_user_id(user_id) if user_id else ""
@@ -392,15 +398,14 @@ async def save_minted_credentials(user_id: str, minted: dict[str, Any]) -> dict[
     }
 
 
-async def poll_device_authorization(
-    device_code: str,
-    user_id: str | None = None,
-) -> dict[str, Any] | None:
-    """Single poll attempt for device authorization; on approval, immediately mints a model API key.
+async def poll_device_authorization(device_code: str) -> dict[str, Any] | None:
+    """Single poll attempt for device authorization; on approval, mints a model API key.
 
     The transient OAuth `access_token` is used once to call `mint_api_key` and discarded without
-    ever touching disk or database. If `user_id` is supplied, the minted `api_key` is persisted
-    via `upsert_oauth_tokens` and `base_url` / `subs_usage` are cached in Redis.
+    ever touching disk or database. The minted key is RETURNED, never stored here: storing is the
+    caller's move, inside the connection lock and only while the sign-in's pending flow still
+    stands (DALTON-HOOK(team-credentials)) — a save at this depth would race a disconnect with
+    its own transaction and revive a deleted connection.
     """
     async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.post(
@@ -423,8 +428,6 @@ async def poll_device_authorization(
                 raise ValueError("Muse device token response did not include an access_token.")
             minted = await mint_api_key(oauth_access_token)
             del oauth_access_token
-            if user_id is not None:
-                return await save_minted_credentials(user_id, minted)
             return minted
 
         error = ""

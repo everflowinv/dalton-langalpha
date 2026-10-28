@@ -6,7 +6,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { fireEvent, screen, waitFor } from '@testing-library/react';
 import { renderWithProviders } from '@/test/utils';
-import { ThreadModelBanner } from '../ThreadModelBanner';
+import { LapsedSignInNotice, ThreadModelBanner } from '../ThreadModelBanner';
 
 const mocks = vi.hoisted(() => ({
   mutateAsync: vi.fn(),
@@ -67,5 +67,20 @@ describe('ThreadModelBanner', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
     expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Make Model A my default' }));
+  });
+});
+
+describe('LapsedSignInNotice', () => {
+  // Said before a send, which would be refused, with the way to the reconnect.
+  it('names the account and the model, and links to the reconnect', () => {
+    renderWithProviders(<LapsedSignInNotice model="model-a" provider="codex-oauth" />, { route: '/chat' });
+    expect(screen.getByText('Your ChatGPT sign-in has expired. Reconnect it to use Model A.')).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Reconnect' })).toBeTruthy();
+  });
+
+  it('stays down once dismissed', () => {
+    renderWithProviders(<LapsedSignInNotice model="model-a" provider="codex-oauth" />, { route: '/chat' });
+    fireEvent.click(screen.getByRole('button', { name: 'Close' }));
+    expect(screen.queryByText(/sign-in has expired/)).toBeNull();
   });
 });

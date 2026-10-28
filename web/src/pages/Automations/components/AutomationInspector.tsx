@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next';
 import { AlertCircle, ArrowUpRight, EyeOff, Pause, Pencil, Play, Trash2, Zap } from 'lucide-react';
 import { HeaderButton, ListSkeleton } from '@/components/mcp/McpPrimitives';
 import { useLocale } from '@/hooks/useLocale';
+import { useModelName } from '@/hooks/useModelName';
 import { useNow } from '@/hooks/useNow';
 import { scrollMotion } from '@/lib/reducedMotion';
 import { cn } from '@/lib/utils';
@@ -62,6 +63,7 @@ export default function AutomationInspector({
 }: AutomationInspectorProps) {
   const { t } = useTranslation();
   const locale = useLocale();
+  const modelName = useModelName();
   const now = useNow();
   const openThread = useOpenThread();
   const { pause, resume, trigger, skip, dismiss, busy } = useAutomationMutations();
@@ -212,7 +214,7 @@ export default function AutomationInspector({
         <h3 className="automations-kicker">{t('automation.details')}</h3>
         <dl className="automation-details">
           <dt>{t('automation.detailModel')}</dt>
-          <dd>{a.llm_model || t('automation.defaultModel')}</dd>
+          <dd>{a.llm_model ? modelName(a.llm_model) : t('automation.defaultModel')}</dd>
           <dt>{t('automation.threadStrategy')}</dt>
           <dd>{t(a.thread_strategy === 'continue' ? 'automation.continueExisting' : 'automation.newThreadEachRun')}</dd>
           {workspaceName && (

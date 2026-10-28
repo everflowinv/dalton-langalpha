@@ -35,7 +35,7 @@ import {
 // From the dependency-free signal module (not `../utils/api`) so decoding still
 // works where the hook tests mock `../utils/api`.
 import { decodeReportBackSignal, reportOwedForStatus, shouldArmForStatus, shouldArmReportBack } from '../utils/reportBackSignal';
-import { isLastingRefusal } from '../utils/api/errors';
+import { isLastingRefusal } from '@/api/errors';
 
 /**
  * Re-subscribe pacing for the push watch. The watch NEVER stops retrying while

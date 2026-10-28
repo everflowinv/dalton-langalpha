@@ -15,6 +15,12 @@ export type AppSection = (typeof APP_SECTIONS)[number];
 
 const SECTIONS: ReadonlySet<string> = new Set(APP_SECTIONS);
 
+/** The app section a router path is in, or null outside the app shell. */
+export function appSectionOf(pathname: string): AppSection | null {
+  const first = pathname.split('/')[1];
+  return SECTIONS.has(first) ? (first as AppSection) : null;
+}
+
 /**
  * The router path of `href` when it is a page of this app, otherwise null.
  *

@@ -17,6 +17,7 @@ from src.llms.provider_compaction import (
     COMPACTION_BETA,
     SIDECAR_KEY,
     adopt,
+    carried_text,
     compaction_settings,
     is_compaction_request,
     is_opaque,
@@ -180,6 +181,8 @@ class TestCompactionSettings:
 
         assert result == {
             "max_tokens": 10,
+            # The client's own header joins these on the way out (patches).
+            "betas": ["inline-tools-2026-09-15"],
             "extra_body": {
                 "thinking": {"type": "adaptive"},
                 "a": 2,
@@ -189,6 +192,13 @@ class TestCompactionSettings:
         }
         assert settings == {"max_tokens": 10, "extra_body": {"a": 2, "b": 3}}
         assert is_compaction_request(result)
+
+    def test_claudes_request_keeps_the_betas_the_call_already_sends(self):
+        settings = {"betas": ["context-management-2025-06-27"]}
+
+        result = compaction_settings(_claude(), settings, "p")
+
+        assert result["betas"] == ["context-management-2025-06-27", "inline-tools-2026-09-15"]
 
     def test_extra_body_an_openai_client_was_built_with_is_kept(self):
         client = _gpt(extra_body={"a": 1, "b": 1})
@@ -285,16 +295,31 @@ class TestAdopt:
         return [summary, AIMessage("kept reply", id="a1"), HumanMessage("next", id="h1")]
 
     def test_claude_block_in_the_same_lineage(self):
-        summary = _summary({"block": _BLOCK, "origin": "anthropic", "text": "notes after it"})
+        summary = _summary(
+            {"block": _BLOCK, "origin": "anthropic", "text": "notes after it", "alone": True}
+        )
         history = self._history(summary)
 
         adopted = adopt(history, _claude(), "anthropic")
 
         assert adopted is not None
-        assert adopted[0].content == [_BLOCK, {"type": "text", "text": "notes after it"}]
+        # The kept turns follow the block with nothing between: the notes
+        # are for a message after them.
+        assert adopted[0].content == [_BLOCK]
+        assert carried_text(summary) == "notes after it"
         assert adopted[0].id == "summary"
         assert adopted[1:] == history[1:]
         assert summary.content == "[Context Summary] readable"
+
+    def test_a_summary_written_before_the_block_went_alone_keeps_its_text(self):
+        """The thinking after such a summary was produced behind the block and
+        its notes in one message, so they are sent that way still."""
+        summary = _summary({"block": _BLOCK, "origin": "anthropic", "text": "notes after it"})
+
+        adopted = adopt(self._history(summary), _claude(), "anthropic")
+
+        assert adopted[0].content == [_BLOCK, {"type": "text", "text": "notes after it"}]
+        assert isinstance(adopted[0], HumanMessage)
 
     def test_claude_block_without_notes_sends_the_block_alone(self):
         summary = _summary({"block": _BLOCK, "origin": "anthropic", "text": ""})

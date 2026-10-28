@@ -453,6 +453,21 @@ describe('the receipt for an amend', () => {
     );
   });
 
+  it('labels the id of an approval the order waits on as an approval, not an order', () => {
+    renderWithProviders(
+      <OrderReceiptCard
+        artifact={artifactWith({
+          status: 'pending_confirm',
+          vendor_order_id: 'apr-1',
+          route: { approval_id: 'apr-1' },
+        })}
+      />,
+    );
+    const figures = within(screen.getByTestId('order-figures'));
+    expect(figures.getByText('toolArtifact.directTool.orderOutcome.approvalId')).toBeInTheDocument();
+    expect(figures.queryByText('toolArtifact.directTool.orderOutcome.orderId')).toBeNull();
+  });
+
   it('draws no target line for an order that acts on none', () => {
     renderWithProviders(<OrderReceiptCard artifact={artifactWith({ status: 'filled' })} />);
     expect(screen.queryByTestId('order-target-ref')).toBeNull();
@@ -612,10 +627,25 @@ describe('orderOutcomeView', () => {
       failure: null,
       fill: [],
       orderId: null,
+      orderIdIsApproval: false,
     });
     expect(
       orderOutcomeView({ status: 'submitted', vendor_order_id: '1' }, null, SHOWN).orderId,
     ).toBe('1');
+  });
+
+  it('says when the id names an approval the order waits on rather than an order', () => {
+    const waiting = orderOutcomeView(
+      { status: 'pending_confirm', vendor_order_id: 'apr-1', route: { approval_id: 'apr-1' } },
+      null,
+      SHOWN,
+    );
+    expect(waiting.orderId).toBe('apr-1');
+    expect(waiting.orderIdIsApproval).toBe(true);
+    expect(
+      orderOutcomeView({ status: 'working', vendor_order_id: '1', route: {} }, null, SHOWN)
+        .orderIdIsApproval,
+    ).toBe(false);
   });
 
   it('falls back to the failure kind when there is no message', () => {
@@ -681,6 +711,24 @@ describe('what a staged order says it is waiting on', () => {
     expect(screen.getByTestId('order-status-handed_off')).toBeInTheDocument();
     expect(screen.getByTestId('order-status-sentence')).toHaveTextContent(
       'toolArtifact.directTool.orderStatus.handedOffStaged',
+    );
+  });
+
+  // Webull lists a processed instruction as APPROVED, and the ledger then
+  // ends it with no unlisted stamp: the broker said it was sent.
+  it('says a handed-off instruction was confirmed when the broker said so', () => {
+    shipped.brokerages = [{ name: 'webull', label: 'Webull' }];
+    const artifact = stagedArtifact('handed_off');
+    const receipt = artifact.order_receipt as Record<string, unknown>;
+    receipt.vendor = 'webull';
+    (receipt.outcome as Record<string, unknown>).unlisted_at = null;
+    renderWithProviders(<OrderReceiptCard artifact={artifact} />);
+
+    expect(screen.getByTestId('order-status-handed_off')).toHaveTextContent(
+      'toolArtifact.directTool.orderStatusShort.handedOffConfirmed',
+    );
+    expect(screen.getByTestId('order-status-sentence')).toHaveTextContent(
+      'toolArtifact.directTool.orderStatus.handedOffConfirmedStaged',
     );
   });
 
@@ -782,6 +830,23 @@ describe('overlayLedgerRow', () => {
     // The order is what was sent, and the ledger is a summary of it.
     expect(merged?.order).toBe(ORDER);
     expect(merged?.vendor).toBe('moomoo');
+  });
+
+  // The ledger's null is the broker having said how the order ended, so it
+  // overrides the frozen receipt rather than falling through to it.
+  it('takes the row\'s unlisted stamp, a null included', () => {
+    const staged: OrderReceipt = {
+      ...receipt,
+      mode: 'staged',
+      outcome: { status: 'submitted', unlisted_at: '2026-10-26T00:00:00Z' },
+    };
+    const named = overlayLedgerRow(staged, ledgerRow({ status: 'handed_off', unlisted_at: null }));
+    expect(named?.outcome.unlisted_at).toBeNull();
+    const unnamed = overlayLedgerRow(
+      { ...staged, outcome: { status: 'submitted', unlisted_at: null } },
+      ledgerRow({ status: 'handed_off', unlisted_at: '2026-10-26T01:00:00Z' }),
+    );
+    expect(unnamed?.outcome.unlisted_at).toBe('2026-10-26T01:00:00Z');
   });
 
   // A lost answer froze a transport failure into the artifact. The ledger

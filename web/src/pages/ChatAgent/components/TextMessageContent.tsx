@@ -2,13 +2,14 @@ import React, { useLayoutEffect, useState } from 'react';
 import { AlertTriangle } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import Markdown from './Markdown';
+import { useModelName } from '@/hooks/useModelName';
 import { useAnimatedText } from '@/components/ui/animated-text';
 import { visibleParagraphPrefix } from '@/lib/paragraphGate';
 import { useTranscriptDisplay } from '@/lib/transcriptDisplay';
 import { parseErrorMessage, type ParsedError } from '../utils/parseErrorMessage';
 import type { OpenFileHandler } from '../utils/fileLocation';
 import { UPSTREAM_HINT_I18N_KEY, type StructuredError } from '@/utils/rateLimitError';
-import { NoticeLine } from '@/components/ui/error-banner';
+import { ErrorLink, NoticeLine } from '@/components/ui/error-banner';
 
 interface TextMessageContentProps {
   content: string;
@@ -97,6 +98,7 @@ interface ErrorDisplayProps {
  * Renders a parsed error message in a clean, structured format.
  */
 function ErrorDisplay({ parsed }: ErrorDisplayProps): React.ReactElement {
+  const name = useModelName();
   return (
     <div
       className="flex gap-3 px-4 py-3 rounded-lg text-sm"
@@ -126,7 +128,7 @@ function ErrorDisplay({ parsed }: ErrorDisplayProps): React.ReactElement {
               color: 'var(--color-text-tertiary)',
             }}
           >
-            {parsed.model}
+            {name(parsed.model)}
             {parsed.statusCode ? ` · ${parsed.statusCode}` : ''}
           </div>
         )}
@@ -151,12 +153,13 @@ interface StructuredErrorDisplayProps {
  */
 function StructuredErrorDisplay({ err }: StructuredErrorDisplayProps): React.ReactElement {
   const { t } = useTranslation();
+  const name = useModelName();
   // When the failure is attributable to a specific model, name it in the
   // headline; otherwise fall back to the generic "model provider" copy.
   const headline = err.model
     ? (err.statusCode
-        ? t('chat.errorUpstreamHeadlineModelStatus', { model: err.model, status: err.statusCode })
-        : t('chat.errorUpstreamHeadlineModel', { model: err.model }))
+        ? t('chat.errorUpstreamHeadlineModelStatus', { model: name(err.model), status: err.statusCode })
+        : t('chat.errorUpstreamHeadlineModel', { model: name(err.model) }))
     : (err.statusCode
         ? t('chat.errorUpstreamHeadlineStatus', { status: err.statusCode })
         : t('chat.errorUpstreamHeadline'));
@@ -186,6 +189,16 @@ function StructuredErrorDisplay({ err }: StructuredErrorDisplayProps): React.Rea
             {err.message}
           </div>
         )}
+        {err.links && err.links.length > 0 && (
+          <div className="text-xs" style={{ color: 'var(--color-text-secondary)' }}>
+            {err.links.map((l, i) => (
+              <React.Fragment key={`${l.url}|${l.label}`}>
+                {i > 0 && <span aria-hidden="true"> · </span>}
+                <ErrorLink {...l} />
+              </React.Fragment>
+            ))}
+          </div>
+        )}
         {err.hints && err.hints.length > 0 && (
           <ul className="mt-1 list-disc pl-4 flex flex-col gap-0.5 text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
             {err.hints.map((h) => (
@@ -200,7 +213,7 @@ function StructuredErrorDisplay({ err }: StructuredErrorDisplayProps): React.Rea
               <React.Fragment key={m.model}>
                 {i > 0 && ', '}
                 {/* Per-model error text lives in the tooltip, not inline. */}
-                <span title={m.error || undefined}>{m.model}</span>
+                <span title={m.error || undefined}>{name(m.model)}</span>
               </React.Fragment>
             ))}
           </div>

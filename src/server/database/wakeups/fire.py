@@ -204,6 +204,16 @@ async def fire_order_wakeups(
                                     THEN 'partial_cancelled'
                                 WHEN a.status = 'cancelled' THEN 'cancelled'
                                 WHEN a.status = 'rejected_by_vendor' THEN 'rejected'
+                                WHEN a.status = 'expired'
+                                     AND COALESCE(a.filled_qty, 0) > 0
+                                    THEN 'partial_expired'
+                                WHEN a.status = 'expired' THEN 'expired'
+                                -- A staged instruction the vendor's own list
+                                -- reported confirmed ends with no unlisted
+                                -- stamp; one that only left the list keeps it.
+                                WHEN a.status = 'handed_off'
+                                     AND a.unlisted_at IS NULL THEN 'confirmed'
+                                WHEN a.status = 'handed_off' THEN 'handed_off'
                                 WHEN a.status IN ({_ORDER_ENDS}) THEN 'failed'
                                 ELSE 'partial'
                             END,

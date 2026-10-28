@@ -47,7 +47,7 @@ vi.mock('@/contexts/ThemeContext', () => ({
 vi.mock('@/hooks/useAllModels', () => ({
   useAllModels: () => ({
     models: {},
-    modelAccessMap: {},
+    payers: {},
     systemDefaults: { fallback_models: [] },
     validModelNames: new Set<string>(),
     compactionProfiles: null,
@@ -108,7 +108,7 @@ function renderAccountTab() {
   });
   return render(
     <QueryClientProvider client={queryClient}>
-      <MemoryRouter initialEntries={['/settings?tab=userInfo']}>
+      <MemoryRouter initialEntries={['/settings?tab=appearance']}>
         <Settings />
       </MemoryRouter>
     </QueryClientProvider>,
@@ -122,10 +122,10 @@ beforeEach(() => {
 });
 
 describe('Settings: card style', () => {
-  it('starts on Balanced', async () => {
+  it('starts on Quiet', async () => {
     renderAccountTab();
     const row = await screen.findByRole('group', { name: 'Card style' });
-    expect(within(row).getByRole('button', { name: 'Balanced' })).toHaveAttribute('aria-pressed', 'true');
+    expect(within(row).getByRole('button', { name: 'Quiet' })).toHaveAttribute('aria-pressed', 'true');
   });
 
   it('restyles the page at once and keeps the choice on this device only', async () => {

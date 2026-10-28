@@ -11,6 +11,7 @@
 import * as z from 'zod/mini';
 import type { CustomModelEntry } from '@/components/model/types';
 import type { ModelProfile } from './modelTuning';
+import { HIDDEN_KEY, STARRED_KEY, STARRED_ONLY_KEY, modelList } from './favoriteModels';
 
 export interface PreferencesLike {
   other_preference?: Record<string, unknown> | null;
@@ -244,6 +245,59 @@ export function splitPreferenceWrite(patch: PreferencePatch): {
     ...(Object.keys(model).length > 0 ? { model_preference: model } : {}),
     ...(Object.keys(other).length > 0 ? { other_preference: other } : {}),
   };
+}
+
+/** Whether a preferences write changes model configuration, as its variables
+ *  show: anything in the model column, or the quick-access lists that stayed
+ *  in `other_preference`. */
+export function isModelWrite(variables: unknown): boolean {
+  const patch = variables as PreferencesLike | null | undefined;
+  const other = patch?.other_preference ?? {};
+  return patch?.model_preference != null || [STARRED_KEY, HIDDEN_KEY, STARRED_ONLY_KEY].some((key) => key in other);
+}
+
+/** The models on the user's list. They stay in `other_preference` by design
+ *  (see `MODEL_PREF_KEYS`), so they are never read off the model bag. */
+export function starredModels(prefs: unknown): string[] {
+  return modelList((prefs as PreferencesLike | null)?.other_preference?.starred_models);
+}
+
+/** Every single-model slot a model can be named in. */
+const MODEL_SLOTS = [
+  'preferred_model',
+  'preferred_background_model',
+  'compaction_model',
+  'summarization_model',
+  'fetch_model',
+] as const;
+
+/**
+ * The patch that takes the models `isGone` names out of everything that
+ * refers to them: the slots, the fallbacks, the list and their profiles. A
+ * key with nothing to take out is left out of the patch. Emptied, the starred
+ * list is cleared, but the fallbacks are saved as `[]`: cleared, they would
+ * hand the user the deployment's list, fallbacks they never picked.
+ *
+ * Profiles are keyed by name only, so one left behind would be inherited by
+ * whatever answers to that name next: a built-in a removed custom model
+ * shadowed would pick up its effort and compaction.
+ */
+export function pruneModelReferences(prefs: unknown, isGone: (model: string) => boolean): PreferencePatch {
+  const bag = modelPrefs(prefs);
+  const patch: PreferencePatch = {};
+  for (const slot of MODEL_SLOTS) {
+    const value = bag[slot];
+    if (typeof value === 'string' && isGone(value)) patch[slot] = null;
+  }
+  const prune = (key: 'fallback_models' | 'starred_models', list: string[], emptied: [] | null) => {
+    const kept = list.filter((m) => !isGone(m));
+    if (kept.length !== list.length) patch[key] = kept.length > 0 ? kept : emptied;
+  };
+  prune('fallback_models', bag.fallback_models ?? [], []);
+  prune('starred_models', starredModels(prefs), null);
+  const stale = Object.keys(bag.profiles ?? {}).filter(isGone);
+  if (stale.length > 0) patch.profiles = Object.fromEntries(stale.map((m) => [m, null]));
+  return patch;
 }
 
 /** The two model slots: Default, which every composer and thread starts on,

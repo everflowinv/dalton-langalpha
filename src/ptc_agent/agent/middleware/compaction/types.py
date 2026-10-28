@@ -10,8 +10,10 @@ from langchain_core.messages import MessageLikeRepresentation
 from langchain_core.messages.human import HumanMessage
 from typing_extensions import TypedDict
 
-from langchain.agents.middleware.types import AgentState, PrivateStateAttr
+from langchain.agents.middleware.types import PrivateStateAttr
 
+# DALTON-HOOK(attachment-native-cap): ``_union`` shared with ``_removed_attachment_ids``.
+from ptc_agent.agent.middleware.thinking_binding import UnsentThinkingState, _union
 from ptc_agent.agent.transcript.identity import WindowState
 from ptc_agent.config.agent import CompactionConfig
 from ptc_agent.core.paths import AGENT_HISTORY_DIRS, SandboxLayout
@@ -67,8 +69,9 @@ class OffloadSettings:
     #: The longest string argument left whole.
     max_length: int = 2000
     #: How long since the model last answered a turn must start for Tier 1
-    #: to run there; None turns automatic Tier 1 off.
-    idle_seconds: float | None = 90 * 60
+    #: to run there; None, the default, turns automatic Tier 1 off (see
+    #: ``CompactionConfig``).
+    idle_seconds: float | None = None
 
     @classmethod
     def from_config(cls, config: CompactionConfig) -> OffloadSettings:
@@ -80,12 +83,13 @@ class OffloadSettings:
         )
 
 
-class CompactionState(AgentState):
+class CompactionState(UnsentThinkingState):
     """State for the compaction middleware.
 
     Extends AgentState with private fields for tracking compaction events,
     offloaded tool call IDs, and when the model last answered (epoch seconds),
-    which gates Tier 1, and what the window trimmed (``Window``). The
+    which gates Tier 1, and what the window trimmed (``Window``), beside the
+    answers sent without their thinking (``UnsentThinkingState``). The
     PrivateStateAttr annotation hides them from input/output schemas.
 
     Note: The ``_summarization_event`` field name is preserved because values are
@@ -106,7 +110,17 @@ class CompactionState(AgentState):
     #: Messages whose attachments were taken out of the view to fit the
     #: context window, by message id. Re-applied on every call like the
     #: offloads, so what was sent once without them stays without them.
-    _removed_attachment_ids: Annotated[NotRequired[set[str]], PrivateStateAttr]
+    # DALTON-HOOK(attachment-native-cap): a union, like ``_unsent_thinking_ids``
+    # beside it — compaction's fit and the strip's image byte total can each
+    # write it in one model call. The compaction writers shrink it by value
+    # (``state & kept``, ``state & in-view``), and a same-step addition names a
+    # message in the view the shrink kept, so the union holds both semantics.
+    _removed_attachment_ids: Annotated[NotRequired[set[str]], PrivateStateAttr, _union]
+    #: Notes rows a summary kept after the last answer in its tail, by message
+    #: id. Past their summary they ask for what it paraphrased, so the call
+    #: answering from it goes without them, and every later one does too
+    #: (see ``notes.unanswered_rows``).
+    _unanswered_notes_rows: Annotated[NotRequired[set[str]], PrivateStateAttr]
     _cached_input_tokens: Annotated[NotRequired[int], PrivateStateAttr]
     _cached_output_tokens: Annotated[NotRequired[int], PrivateStateAttr]
     _last_model_response_at: Annotated[NotRequired[float], PrivateStateAttr]

@@ -151,6 +151,9 @@ GROUPS: tuple[CapabilityGroup, ...] = (
     CapabilityGroup(key="watchlists", order=20, tone="neutral"),
     CapabilityGroup(key="scanners", order=30, tone="neutral"),
     CapabilityGroup(key="alerts", order=40, tone="neutral"),
+    # Saved chart setups: the layouts and the indicators applied to them,
+    # read and changed. Display state the user arranged, with no money in it.
+    CapabilityGroup(key="charts", order=45, tone="neutral"),
     CapabilityGroup(key="account", order=50, tone="caution"),
     CapabilityGroup(
         key="paper_trading", order=60, tone="neutral", rung=True, default_binding="direct"
@@ -179,8 +182,8 @@ GROUPS: tuple[CapabilityGroup, ...] = (
 _BY_KEY: dict[str, CapabilityGroup] = {g.key: g for g in GROUPS}
 
 # Tool names exactly as the vendor publishes them, which is what the relay
-# compares against. Counted against live discovery: moomoo 88, Robinhood 67,
-# IBKR 34, Webull 71, one of IBKR's deliberately left out.
+# compares against. Counted against live discovery: moomoo 105, Robinhood 91,
+# IBKR 45, Webull 103, and ``UNCURATED`` names the ones deliberately left out.
 _CURATION: dict[str, dict[str, tuple[str, ...]]] = {
     "moomoo": {
         "market_data": (
@@ -251,6 +254,9 @@ _CURATION: dict[str, dict[str, tuple[str, ...]]] = {
             "quote_valuation_index_stock_plate_list",
             "quote_valuation_plate_stock_list",
             "quote_warrant_screen",
+            # Per-symbol margin and short-selling terms at a moomoo firm, the
+            # same for every account there: reference data, not the user's.
+            "trading_margin_ratio",
         ),
         "watchlists": (
             "quote_modify_user_security",
@@ -259,8 +265,10 @@ _CURATION: dict[str, dict[str, tuple[str, ...]]] = {
         ),
         "account": (
             "account_authorized_trd_accs",
+            "account_cash_logs",
             "account_fills_history",
             "account_funds",
+            "account_order_fees",
             "account_order_fills_today",
             "account_orders_active",
             "account_orders_detail",
@@ -275,6 +283,12 @@ _CURATION: dict[str, dict[str, tuple[str, ...]]] = {
             "crypto_account_purchasing_power",
             "crypto_account_total_balance",
         ),
+        # A what-if for one option combo: the request is a whole order (legs,
+        # side, size, price) and the answer is the buying power and margin it
+        # would use, with nothing placed or saved. The single-leg counterpart,
+        # ``account_trading_info``, asks how much the account could trade at
+        # all, which is why that one is an account read and this is not.
+        "order_preview": ("account_combo_trading_info",),
         "paper_trading": (
             "sim_trade_account_list",
             "sim_trade_cancel_order",
@@ -286,6 +300,9 @@ _CURATION: dict[str, dict[str, tuple[str, ...]]] = {
             "sim_trade_position_list",
         ),
         "trading": (
+            "crypto_account_cancel_order",
+            "crypto_account_create_order",
+            "crypto_account_modify_order",
             "trading_order_cancel",
             "trading_order_confirm",
             "trading_order_place",
@@ -298,9 +315,9 @@ _CURATION: dict[str, dict[str, tuple[str, ...]]] = {
             "get_currency_pairs",
             "get_earnings_calendar",
             "get_earnings_results",
+            "get_equity_analyst_ratings",
             "get_equity_fundamentals",
             "get_equity_historicals",
-            "get_equity_news",
             "get_equity_price_book",
             "get_equity_quotes",
             "get_equity_technical_indicators",
@@ -313,6 +330,7 @@ _CURATION: dict[str, dict[str, tuple[str, ...]]] = {
             "get_option_historicals",
             "get_option_instruments",
             "get_option_quotes",
+            "get_politician_trades",
             "get_sec_filing",
             "get_sec_filing_facts",
             "get_sec_filing_facts_catalog",
@@ -333,16 +351,43 @@ _CURATION: dict[str, dict[str, tuple[str, ...]]] = {
             "unfollow_watchlist",
             "update_watchlist",
         ),
+        # ``preview_scan`` runs a filter set without saving it, and the
+        # datapoint catalog is what a scan's expressions are built from.
         "scanners": (
             "create_scan",
+            "get_scanner_datapoints",
             "get_scanner_filter_specs",
             "get_scans",
+            "preview_scan",
             "run_scan",
             "update_scan_config",
             "update_scan_filters",
         ),
+        # Price and indicator alerts: set, changed, paused, deleted, and the
+        # log of the ones that fired, marked read once relayed.
+        "alerts": (
+            "create_alert",
+            "delete_alert",
+            "get_alert_log",
+            "get_alerts",
+            "mark_alerts_read",
+            "update_alert",
+        ),
+        # Robinhood Legend's saved charts: their layouts and display settings,
+        # and the indicators applied to them, added, changed and removed.
+        "charts": (
+            "add_legend_indicator",
+            "get_legend_charts",
+            "get_legend_indicator_catalog",
+            "get_legend_indicators",
+            "get_legend_layouts",
+            "remove_legend_indicator",
+            "set_legend_chart_settings",
+            "update_legend_indicator",
+        ),
         "account": (
             "get_accounts",
+            "get_advanced_orders",
             "get_crypto_account_onboarding_info",
             "get_crypto_orders",
             "get_crypto_positions",
@@ -356,18 +401,28 @@ _CURATION: dict[str, dict[str, tuple[str, ...]]] = {
             "get_pnl_trade_history",
             "get_portfolio",
             "get_realized_pnl",
+            # The trade-approval setting and the requests waiting on the
+            # user's decision in the Robinhood app, read only.
+            "get_trade_approval_setting",
+            "get_trade_approvals",
         ),
         "order_preview": (
             "preview_crypto_order",
+            "review_advanced_order",
             "review_equity_order",
             "review_option_order",
         ),
         "trading": (
+            "cancel_advanced_order",
             "cancel_crypto_order",
             "cancel_equity_order",
             "cancel_option_exercise",
             "cancel_option_order",
+            # Takes back an order waiting on the customer's approval in the
+            # Robinhood app, so it is a cancel of that order.
+            "decline_trade_approval",
             "exercise_option",
+            "place_advanced_order",
             "place_crypto_order",
             "place_equity_order",
             "place_option_order",
@@ -395,6 +450,13 @@ _CURATION: dict[str, dict[str, tuple[str, ...]]] = {
             "get_watchlist",
             "get_watchlists",
         ),
+        # Screeners the user saved in IBKR's own client, listed, read and run.
+        # Building or changing one is not published.
+        "scanners": (
+            "get_saved_screener",
+            "list_saved_screeners",
+            "run_saved_screener",
+        ),
         "alerts": (
             "create_alert",
             "delete_alert",
@@ -409,20 +471,41 @@ _CURATION: dict[str, dict[str, tuple[str, ...]]] = {
             "get_account_positions",
             "get_account_summary",
             "get_account_trades",
+            # Whether this consent may place live orders at all, which IBKR
+            # decides per account and reports here.
+            "get_flow_type",
+            # Both read the user's own orders: the rules can be asked for an
+            # order being modified, and the status is how a live order settles.
+            "get_order_rules",
+            "get_order_status",
             "get_pa_allocation",
             "get_pa_performance_all_periods",
         ),
+        # A what-if: cost, commission and margin impact against the real
+        # account, persisting nothing. IBKR's own word is that a preview
+        # "never places an order".
+        "order_preview": ("preview_order",),
         "staged_orders": (
             "create_order_instruction",
             "delete_order_instruction",
             "get_order_instructions",
         ),
+        # Stocks and single-leg options, under the session's AUTONOMOUS flow
+        # type. A submit, a modify or a cancel can come back holding a broker
+        # question, and none of the three reaches the market until the answer
+        # releases it, so the answer is a live order tool like the other three.
+        "trading": (
+            "answer_order_question",
+            "cancel_order",
+            "modify_order",
+            "submit_order",
+        ),
     },
-    # No rung of any kind here, and the line is the vendor's rather than ours.
-    # Webull's consent screen offers exactly four capabilities -- account infos,
-    # order query, market data, security infos -- and no trading checkbox, so the
-    # write scope is not grantable at all and nothing published places, previews
-    # or stages an order. The order tools below read.
+    # Staged and nothing above it. Every Webull order tool writes an instruction
+    # that, in Webull's own words, "requires confirmation in Webull APP /
+    # Desktop", so it is IBKR's rung rather than a live order: a person sends it
+    # from Webull's client or it never trades. The order tools in ``account``
+    # read orders that already exist.
     "webull": {
         "market_data": (
             "get_52_week_high_low",
@@ -430,6 +513,9 @@ _CURATION: dict[str, dict[str, tuple[str, ...]]] = {
             "get_analyst_target_price",
             "get_balance_sheet",
             "get_cash_flow",
+            "get_community_hot_stocks",
+            "get_community_post_detail",
+            "get_community_posts",
             "get_company_profile",
             "get_crypto_bars",
             "get_crypto_instruments",
@@ -466,10 +552,22 @@ _CURATION: dict[str, dict[str, tuple[str, ...]]] = {
             "get_gainers_losers",
             "get_high_dividend",
             "get_income_statement",
+            "get_insider_holdings",
+            "get_insider_transactions",
+            "get_institution_holding_changes",
+            "get_institution_holdings",
+            "get_institution_identifier",
             "get_instruments",
+            "get_macroeconomic_calendar",
             "get_market_sectors",
             "get_market_sectors_detail",
+            "get_market_sentiment",
             "get_most_active",
+            "get_news_detail",
+            "get_option_bars",
+            "get_option_contracts",
+            "get_option_snapshot",
+            "get_option_tick",
             "get_stock_bars",
             "get_stock_bars_single",
             "get_stock_capital_flow",
@@ -479,11 +577,14 @@ _CURATION: dict[str, dict[str, tuple[str, ...]]] = {
             "get_stock_footprint",
             "get_stock_forecast_eps",
             "get_stock_industry_comparison",
+            "get_stock_news",
             "get_stock_noii_bars",
             "get_stock_noii_snapshot",
             "get_stock_quotes",
             "get_stock_snapshot",
             "get_stock_tick",
+            "get_stock_unusual_activities",
+            "search_news",
         ),
         "watchlists": (
             "add_watchlist_instruments",
@@ -496,12 +597,27 @@ _CURATION: dict[str, dict[str, tuple[str, ...]]] = {
             "update_watchlist_instruments",
         ),
         "account": (
+            "get_account_authorization",
             "get_account_balance",
             "get_account_list",
             "get_account_positions",
+            # The user's own community posts, read back. Not market data: the
+            # market data grant promises nothing about the user, and these are
+            # theirs.
+            "get_my_community_posts",
             "get_open_orders",
             "get_order_detail",
             "get_order_history",
+        ),
+        "staged_orders": (
+            "get_pending_instruction",
+            "get_processed_instruction",
+            "place_crypto_instruction",
+            "place_futures_instruction",
+            "place_option_single_instruction",
+            "place_option_strategy_instruction",
+            "place_stock_instruction",
+            "revoke_instruction",
         ),
     },
 }
@@ -511,18 +627,21 @@ _CURATION: dict[str, dict[str, tuple[str, ...]]] = {
 # stricter than the groups -- everything else it blocks, a capability toggle can
 # unblock.
 #
-# IBKR's submits a feature request in the user's name, which is not a thing an
-# analysis turn should be able to do on its own. moomoo's crypto tools place,
-# change and cancel real orders, but the order adapter reads only moomoo's
-# equity order shape: behind the gate they would be approved and recorded
-# without anyone knowing what they are, and left ungrouped they would reach the
-# sandbox with no gate at all.
+# IBKR's submits a feature request in the user's name, and Webull's publish a
+# post or a comment to its community in the user's name: none of that is a thing
+# an analysis turn should be able to do on its own. Webull's event and algo
+# instructions stage real orders the adapter cannot describe: an event order
+# buys the yes or the no of a question, which no side or instrument in the
+# order shape can say, and an algo order is a TWAP, VWAP or participation
+# schedule rather than an order type. Recorded as something they are not, a
+# person would approve the wrong order.
 UNCURATED: dict[str, tuple[str, ...]] = {
     "ibkr": ("provide_customer_feedback",),
-    "moomoo": (
-        "crypto_account_cancel_order",
-        "crypto_account_create_order",
-        "crypto_account_modify_order",
+    "webull": (
+        "create_community_comment",
+        "create_community_post",
+        "place_algo_instruction",
+        "place_event_instruction",
     ),
 }
 
@@ -579,6 +698,17 @@ _ORDER_TOOLS: dict[str, dict[str, OrderTool]] = {
         # Not a second confirmation of ours: moomoo can answer a place with
         # ``need_order_confirm``, and the order is not live until this runs.
         "trading_order_confirm": OrderTool(OrderAction.CONFIRM, OrderMode.LIVE),
+        # A family of their own, with a pair for an instrument and an envelope
+        # of their own, which is the class the adapter dispatches on.
+        "crypto_account_create_order": OrderTool(
+            OrderAction.PLACE, OrderMode.LIVE, "crypto"
+        ),
+        "crypto_account_modify_order": OrderTool(
+            OrderAction.REPLACE, OrderMode.LIVE, "crypto"
+        ),
+        "crypto_account_cancel_order": OrderTool(
+            OrderAction.CANCEL, OrderMode.LIVE, "crypto"
+        ),
         "sim_trade_input_order": OrderTool(OrderAction.PLACE, OrderMode.PAPER),
         "sim_trade_modify_order": OrderTool(OrderAction.REPLACE, OrderMode.PAPER),
         "sim_trade_cancel_order": OrderTool(OrderAction.CANCEL, OrderMode.PAPER),
@@ -609,14 +739,52 @@ _ORDER_TOOLS: dict[str, dict[str, OrderTool]] = {
         "cancel_option_exercise": OrderTool(
             OrderAction.CANCEL_EXERCISE, OrderMode.LIVE, "option"
         ),
+        # A one-cancels-the-other pair of equity orders, placed and cancelled
+        # as one. Live like every other placement here: a trade approval the
+        # account requires is the answer's to report, not the tool's to be.
+        "place_advanced_order": OrderTool(
+            OrderAction.PLACE, OrderMode.LIVE, "equity"
+        ),
+        "cancel_advanced_order": OrderTool(
+            OrderAction.CANCEL, OrderMode.LIVE, "equity"
+        ),
+        # Names an approval rather than an order, of any class.
+        "decline_trade_approval": OrderTool(OrderAction.CANCEL, OrderMode.LIVE),
     },
     "ibkr": {
         # IBKR calls an instruction "not a live order", and it is not: it is an
         # object written into the real account, one human click from being one.
-        # One ``contract_id_ex`` addresses every class it stages, so the class
-        # is not something either tool's name says.
+        # One ``contract_id_ex`` addresses every class it stages or trades, so
+        # the class is not something any of these tools' names says.
         "create_order_instruction": OrderTool(OrderAction.STAGE, OrderMode.STAGED),
         "delete_order_instruction": OrderTool(OrderAction.UNSTAGE, OrderMode.STAGED),
+        "submit_order": OrderTool(OrderAction.PLACE, OrderMode.LIVE),
+        "modify_order": OrderTool(OrderAction.REPLACE, OrderMode.LIVE),
+        "cancel_order": OrderTool(OrderAction.CANCEL, OrderMode.LIVE),
+        # IBKR's own confirmation, not a second one of ours: a submit, modify or
+        # cancel answered with a pending question is not applied until this
+        # answers it, and an answer can raise the next question.
+        "answer_order_question": OrderTool(OrderAction.CONFIRM, OrderMode.LIVE),
+    },
+    "webull": {
+        # Each one writes an instruction a person confirms in Webull's own
+        # client, IBKR's rung, and unlike IBKR the tool's name says the class.
+        "place_stock_instruction": OrderTool(
+            OrderAction.STAGE, OrderMode.STAGED, "equity"
+        ),
+        "place_option_single_instruction": OrderTool(
+            OrderAction.STAGE, OrderMode.STAGED, "option"
+        ),
+        "place_option_strategy_instruction": OrderTool(
+            OrderAction.STAGE, OrderMode.STAGED, "option_combo"
+        ),
+        "place_crypto_instruction": OrderTool(
+            OrderAction.STAGE, OrderMode.STAGED, "crypto"
+        ),
+        "place_futures_instruction": OrderTool(
+            OrderAction.STAGE, OrderMode.STAGED, "future"
+        ),
+        "revoke_instruction": OrderTool(OrderAction.UNSTAGE, OrderMode.STAGED),
     },
 }
 
@@ -624,8 +792,8 @@ _ORDER_TOOLS: dict[str, dict[str, OrderTool]] = {
 def groups_for(brokerage: str | None) -> tuple[CapabilityGroup, ...]:
     """The consent toggles to offer for a brokerage, in display order.
 
-    Only groups the vendor actually has tools for: IBKR publishes nothing that
-    places an order, so it is never asked about trading.
+    Only groups the vendor actually has tools for: a vendor none of whose order
+    tools we carry is never asked about trading.
     """
     curated = _CURATION.get(brokerage) if brokerage else None
     if not curated:
@@ -783,7 +951,7 @@ def order_modes(brokerage: str | None) -> tuple[OrderMode, ...]:
     """The order modes this brokerage actually has, in declaration order.
 
     What the connection's approval switches are offered for: moomoo has live
-    and paper, robinhood live, IBKR staged, and Webull none at all.
+    and paper, robinhood live, IBKR live and staged, and Webull staged.
     """
     tools = _ORDER_TOOLS.get(brokerage or "")
     if not tools:

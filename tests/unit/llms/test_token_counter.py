@@ -6,10 +6,7 @@ global tracker helpers in src/llms/token_counter.py.
 
 from types import SimpleNamespace
 
-import pytest
-
 from src.llms.token_counter import (
-    TokenUsageRecord,
     TokenUsageTracker,
     extract_cache_from_details,
     extract_token_usage,
@@ -292,6 +289,15 @@ class TestTokenUsageTracker:
         assert len(tracker.records) == 1
         assert tracker.model_totals["gpt-5"]["input_tokens"] == 100
         assert tracker.model_totals["gpt-5"]["call_count"] == 1
+
+    def test_a_model_from_any_manifest_catalog_is_priced(self):
+        # Priced from the manifest, whichever provider's catalog holds it.
+        from src.llms.llm import LLM
+
+        model = LLM.get_model_config().manifest["models"]["xai"][0]["id"]
+        tracker = TokenUsageTracker()
+        tracker.add_usage({"input_tokens": 1000, "output_tokens": 1000, "total_tokens": 2000}, model=model)
+        assert tracker.estimate_cost()["total_cost"] > 0
 
     def test_add_empty_usage_skipped(self):
         tracker = TokenUsageTracker()

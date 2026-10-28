@@ -9,6 +9,7 @@ import { threadDetailQuery } from './utils/threadQueries';
 import { threadGalleryQuery } from './utils/threadGalleryQuery';
 import { getChatSession } from './hooks/utils/chatSessionRestore';
 import { useChatViewCache } from './hooks/useChatViewCache';
+import { useDeletedThreads } from '@/lib/deletedThreads';
 import { useActiveThreadPublisher } from '@/lib/threadLifecycle/useActiveThreadPublisher';
 import { useWarmWorkspaceSandbox } from './hooks/useWarmWorkspaceSandbox';
 import { useComputerStatusFanout } from './hooks/useComputers';
@@ -17,6 +18,7 @@ import { isValidUuid } from './utils/uuid';
 import { shouldLeaveThreadRoute } from './utils/threadRouteGuard';
 import ChatView from './components/ChatView';
 import ComputersDialogHost from './components/ComputersDialogHost';
+import { closeComputerSpec, closeComputersPanel } from './hooks/computerPanelStore';
 // DALTON-HOOK(team-sharing): check workspace ownership before marking thread seen
 import { isDaltonAuth } from '@/config/daltonAuth';
 import { useWorkspace } from '@/hooks/useWorkspace';
@@ -72,6 +74,14 @@ function ChatAgent(): React.ReactElement | null {
   // call is dropped here; the ownership-gated call below publishes the same
   // threadId with canMarkSeen resolved for colleague read-only views.
 
+  // The Computers dialogs mount with this page, so leaving the section (a
+  // back gesture skips their close) must close them too; left open, they
+  // would come back on the next visit and hold the stale-build reload.
+  useEffect(() => () => {
+    closeComputersPanel();
+    closeComputerSpec();
+  }, []);
+
   // Session restore: when landing at /chat (gallery) with a saved session,
   // navigate to the deep route. This creates the natural history stack:
   // [previous page] → /chat → /chat/:workspaceId or /chat/t/:threadId
@@ -126,6 +136,16 @@ function ChatAgent(): React.ReactElement | null {
   // LRU cache for ChatView instances — keeps up to 5 alive simultaneously
   const cache = useChatViewCache();
 
+  // A thread deleted in this tab: its cached view goes once it is off screen,
+  // and arriving at its route (Back to an entry that still names it) leaves
+  // for its workspace instead of making a view. Only on arrival: the sidebar
+  // moves off a thread it deletes on its own, to the next one.
+  const deletedThreads = useDeletedThreads();
+  const threadDeleted = !!threadId && deletedThreads.has(threadId);
+  useEffect(() => {
+    cache.evict(deletedThreads, threadId);
+  }, [deletedThreads, threadId]); // eslint-disable-line react-hooks/exhaustive-deps
+
   // A thread belongs to one workspace, so the workspace in view before it is
   // no stand-in when the navigation names none (back/forward to an entry
   // without state, a link from outside the chat): a view made under it was a
@@ -179,7 +199,7 @@ function ChatAgent(): React.ReactElement | null {
 
   // Ensure cache entry exists before first paint so chatViews is never empty
   // when threadId is set (same setState-during-render pattern as setResolvedWorkspaceId above).
-  if (threadId && workspaceId && !cache.entries.some(e => e.workspaceId === workspaceId && e.threadId === threadId)) {
+  if (threadId && workspaceId && !threadDeleted && !cache.entries.some(e => e.workspaceId === workspaceId && e.threadId === threadId)) {
     // Don't create a duplicate entry if a resolution touches this threadId — either as
     // the target (URL is ahead, cache hasn't renamed yet) or as the source (cache is
     // ahead, URL still points at the old __default__). Without this check, the
@@ -201,6 +221,10 @@ function ChatAgent(): React.ReactElement | null {
   // Before that fire, the set-during-render block above already handles the bridge window.
   useEffect(() => {
     if (!threadId || !workspaceId) return;
+    if (threadDeleted) {
+      navigate(`/chat/${workspaceId}`, { replace: true });
+      return;
+    }
     const pending = resolvingRef.current.get(workspaceId);
     if (pending && pending.newThreadId === threadId) return;
     const cached = queryClient.getQueryData(queryKeys.workspaces.detail(workspaceId)) as Record<string, unknown> | undefined;

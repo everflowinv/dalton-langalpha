@@ -970,6 +970,44 @@ class LocalRunExecutor:
         if info.inner_task is not None and info.inner_task.done():
             info.inner_task = None
 
+    @staticmethod
+    async def _note_credential_refusal(
+        handler, user_id, exc: Optional[BaseException]
+    ) -> None:
+        """Tell the credential store which subscription tokens the turn's model
+        calls had refused (a 401), after the run is settled. A fact about the
+        credentials, not the run, so a lost finalize race does not skip it;
+        best effort, bounded. Every call counts, a fallback's included, since
+        each subscription in the fallback list is held on its own token."""
+        from src.server.services.oauth_health import failed_model_calls, note_token_refusals
+        from src.server.services.runs.stream_errors import find_resilience_trace
+
+        agent_config = getattr(handler, "agent_config", None)
+        # The main client knows its provider where the manifest does not
+        # (a custom model on a subscription).
+        client_meta = getattr(getattr(agent_config, "llm_client", None), "metadata", None)
+        client_meta = client_meta if isinstance(client_meta, dict) else {}
+
+        def provider_of(model):
+            if model and model == client_meta.get("manifest_model"):
+                return client_meta.get("pricing_provider")
+            return None
+
+        try:
+            record = getattr(handler, "record", None)
+            calls = failed_model_calls(
+                find_resilience_trace(exc) if exc is not None else None,
+                record().model_fallbacks if callable(record) else None,
+            )
+            if not calls:
+                return
+            await asyncio.wait_for(note_token_refusals(user_id, calls, provider_of), timeout=5.0)
+        except Exception:
+            logger.warning(
+                "[LocalRunExecutor] noting a refused OAuth token failed",
+                exc_info=True,
+            )
+
     async def _finalize_run(
         self,
         thread_id: str,
@@ -1102,6 +1140,8 @@ class LocalRunExecutor:
                 workspace_id=workspace_id,
                 user_id=user_id,
             )
+
+        await self._note_credential_refusal(handler, user_id, exc)
 
         if handle is None and user_id:
             # Legacy fallback only: without a durable run row there are no

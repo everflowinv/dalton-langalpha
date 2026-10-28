@@ -13,7 +13,7 @@ why breakpoint 2 sits on the static prefix's own block.
 Middleware chain (first = outermost = runs first):
     AnthropicPromptCachingMiddleware  ->  tags LAST block it sees with cache_control
     BaselineContextMiddleware  ->  appends the frozen baseline (block 1)
-    TailEnvelopeMiddleware  ->  carries the rows in this model's shape
+    RowCarrierMiddleware  ->  carries the rows in this model's shape
 
 Expected final system message blocks:
     [0] static system prompt   (cache_control: breakpoint 2)
@@ -38,7 +38,7 @@ from ptc_agent.agent.middleware.runtime_context import (
     ENVELOPE_CLOSE,
     ENVELOPE_OPEN,
     BaselineContextMiddleware,
-    TailEnvelopeMiddleware,
+    RowCarrierMiddleware,
     TurnContextMiddleware,
 )
 
@@ -90,9 +90,9 @@ def _baseline_middleware() -> BaselineContextMiddleware:
 NOW = datetime(2026, 4, 5, 19, 42, tzinfo=UTC)
 
 
-def _tail_middleware() -> TailEnvelopeMiddleware:
+def _tail_middleware() -> RowCarrierMiddleware:
     """The real tail middleware, pinned to a fixed instant and guidance level."""
-    return TailEnvelopeMiddleware(now=NOW, guidance="lean")
+    return RowCarrierMiddleware()
 
 
 async def _turn_rows(**kwargs) -> list:
@@ -249,7 +249,7 @@ class TestPromptCacheBreakpoint:
         assert blocks[1]["cache_control"] == {"type": "ephemeral"}
 
         # Nothing volatile went out: with no call updates there is no envelope.
-        assert "Runtime context for you" not in blocks[1]["text"]
+        assert "Runtime context from the platform" not in blocks[1]["text"]
 
         # The whole Anthropic budget, and no more: tools, static prefix,
         # baseline, turn row.
@@ -317,7 +317,7 @@ class TestPromptCacheBreakpoint:
             datetime(2026, 4, 5, 19, 43, tzinfo=UTC),
             datetime(2026, 4, 6, 17, 0, tzinfo=UTC),
         ]:
-            runtime_mw = TailEnvelopeMiddleware(now=moment, guidance="lean")
+            runtime_mw = RowCarrierMiddleware()
             rows = await _turn_rows()
 
             captured = {}

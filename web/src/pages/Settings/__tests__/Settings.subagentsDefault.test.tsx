@@ -47,7 +47,7 @@ vi.mock('@/contexts/ThemeContext', () => ({
 vi.mock('@/hooks/useAllModels', () => ({
   useAllModels: () => ({
     models: {},
-    modelAccessMap: {},
+    payers: {},
     systemDefaults: { fallback_models: [] },
     validModelNames: new Set<string>(),
     compactionProfiles: null,
@@ -78,14 +78,6 @@ vi.mock('@/pages/Dashboard/utils/api', () => ({
   clearPreferences: vi.fn(async () => ({})),
   uploadAvatar: vi.fn(async () => ({ avatar_url: '' })),
   getUserApiKeys: vi.fn(async () => ({ providers: [] })),
-  initiateCodexDevice: vi.fn(async () => ({})),
-  pollCodexDevice: vi.fn(async () => ({})),
-  getCodexOAuthStatus: vi.fn(async () => ({ connected: false })),
-  disconnectCodexOAuth: vi.fn(async () => ({})),
-  initiateClaudeOAuth: vi.fn(async () => ({})),
-  submitClaudeCallback: vi.fn(async () => ({})),
-  getClaudeOAuthStatus: vi.fn(async () => ({ connected: false })),
-  disconnectClaudeOAuth: vi.fn(async () => ({})),
 }));
 
 vi.mock('@/pages/ChatAgent/utils/api', () => ({
@@ -108,7 +100,7 @@ function renderPreferencesTab(otherPreference?: Record<string, unknown>) {
   });
   return render(
     <QueryClientProvider client={queryClient}>
-      <MemoryRouter initialEntries={['/settings?tab=preferences']}>
+      <MemoryRouter initialEntries={['/settings?tab=agent']}>
         <Settings />
       </MemoryRouter>
     </QueryClientProvider>,

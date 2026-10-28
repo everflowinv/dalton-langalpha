@@ -2,7 +2,7 @@ import {
   apiErrorDetail,
   apiErrorDetailMessage,
   apiValidationErrors,
-} from '@/pages/ChatAgent/utils/api/errors';
+} from '@/api/errors';
 
 /**
  * What a failed write says to the reader. A 422 names each field by its own

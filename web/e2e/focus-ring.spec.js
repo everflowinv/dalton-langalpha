@@ -308,10 +308,12 @@ test.describe('a text field clicked with the mouse', () => {
  * field inside an edge-owning box (the composer, the dashboard search form, a
  * `rings-within` pill) must stay exactly as it rested, and the box is what
  * takes the edge. This is the regression a global field rule reopens first.
+ * The composer owns its edge to keep it neutral: its pills open menus against
+ * it, and an accent edge beside them competes for the eye.
  */
 test.describe('a borderless field inside a box that owns the edge', () => {
   const BOXED = [
-    { field: 'the chat composer', sel: COMPOSER, box: '.chat-input-container' },
+    { field: 'the chat composer', sel: COMPOSER, box: '.chat-input-container', lit: false },
     { field: 'the dashboard search box', sel: SEARCH, box: '.dashboard-search-form' },
     {
       field: 'the Workspaces search box',
@@ -321,8 +323,8 @@ test.describe('a borderless field inside a box that owns the edge', () => {
     },
   ];
 
-  for (const { field, sel, box, open } of BOXED) {
-    test(`keeps ${field} quiet and lights its box on a click`, async ({ page }) => {
+  for (const { field, sel, box, open, lit = true } of BOXED) {
+    test(`keeps ${field} quiet and ${lit ? 'lights' : 'leaves'} its box on a click`, async ({ page }) => {
       if (open) await open(page);
       const target = page.locator(sel);
       await expect(target).toBeVisible(FIRST_PAINT);
@@ -334,7 +336,7 @@ test.describe('a borderless field inside a box that owns the edge', () => {
       expect(unpainted(clicked.style, clicked.color)).toBe(true);
       expect(clicked.shadow).toBe(resting.shadow);
       // The boxes transition their edge, so the read waits for it to settle.
-      await expect.poll(() => edgeOn(page, box)).toMatchObject({ accent: true });
+      await expect.poll(() => edgeOn(page, box)).toMatchObject({ accent: lit });
     });
   }
 });
@@ -518,7 +520,8 @@ test.describe('a field left focused while the user is in another app', () => {
     await page.keyboard.type('AAPL');
     await leaveWindowAndReturn(page);
 
-    await tabTo(page, ROW);
+    // The dashboard's widgets put every row's attach button in the tab order.
+    await tabTo(page, ROW, 120);
     expect(await outlineOn(page, ROW)).toMatchObject({ focused: true });
     const ring = await outlineOn(page, ROW);
     expect(ring.style === 'solid' || ring.shadow !== 'none').toBe(true);
@@ -539,13 +542,13 @@ test.describe('a field left focused while the user is in another app', () => {
  * way.
  */
 test.describe('a native select', () => {
-  // The language field, the one native select on this tab. Named rather than
+  // The language field, the one native select on General. Named rather than
   // taken positionally so the helpers below stay strict: a selector matching
   // two controls should fail loudly, not silently pick one.
   const SELECT = 'select:has(option[value="zh-CN"])';
 
   test.beforeEach(async ({ page }) => {
-    await page.goto('/settings');
+    await page.goto('/settings?tab=general');
     await expect(page.locator(SELECT)).toBeVisible(FIRST_PAINT);
   });
 

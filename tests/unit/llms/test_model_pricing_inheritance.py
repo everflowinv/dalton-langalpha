@@ -11,7 +11,7 @@ from src.llms.pricing_utils import find_model_pricing
 #: OpenAI entries billed on the short/long-context threshold. Listed once so a
 #: new model joins both structural checks below in a single line.
 _TIERED_OPENAI_IDS = (
-    "gpt-5.6-terra",
+    "gpt-6.1-terra",
     "gpt-6-astra",
     "gpt-6.1-sol",
     "gpt-6-luna",

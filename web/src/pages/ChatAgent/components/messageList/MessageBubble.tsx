@@ -31,6 +31,7 @@ import { CollapseClockContext, isFreshSend, playEntrance, turnEndDelays } from '
 import { useMessageTyping, useProseReport } from './proseTyping';
 import type { TurnFile } from '../../utils/turnFiles';
 import { projectMessageContent, type ContentProjection } from './contentProjection';
+import { isImeComposing } from '@/lib/ime';
 import { EMPTY_OBJ } from './types';
 import type { ContentSegmentRecord, FeedbackResult, FoldState, MessageRecord, ToolCallProcessRecord } from './types';
 
@@ -356,6 +357,7 @@ export const MessageBubble = memo(function MessageBubble({ message, contentProje
   };
 
   const handleEditKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (isImeComposing(e)) return;
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       handleSubmitEdit();

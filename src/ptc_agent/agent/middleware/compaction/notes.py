@@ -242,9 +242,11 @@ class NotesDueMiddleware(AgentMiddleware):
     the summary the context grew from: the reminder is asked once per summary,
     so one the last summary kept in its tail does not count, while the
     check-in counts calls from the latest write or ask in view. A row naming
-    an older summary is not sent either: past its summary the ask is stale,
-    and read after the pointer it would have the notes rewritten from the
-    summary's paraphrase.
+    an older summary that the agent had not answered when that summary was
+    written is not sent either: past its summary the ask is stale, and read
+    after the pointer it would have the notes rewritten from the summary's
+    paraphrase. One it answered in the turns the summary kept is sent with
+    them, as they were.
 
     For the same reason the reminder waits for the context to grow past its
     mark under the current summary, from a call measured below it: a summary
@@ -447,23 +449,80 @@ def _strings(value: Any) -> Iterator[str]:
             yield from _strings(item)
 
 
+def unanswered_rows(messages: Sequence[Any]) -> set[str]:
+    """The ids of the notes rows after the last answer in ``messages``, the
+    tail a summary keeps: written before it and not yet acted on, so after it
+    they would ask for notes from what it paraphrased."""
+    last = max((i for i, m in enumerate(messages) if isinstance(m, AIMessage)), default=-1)
+    return {m.id for m in messages[last + 1 :] if m.id and _notes_row(m) is not None}
+
+
+def unanswered_notes_rows(state: Mapping[str, Any]) -> set[str]:
+    return set(state.get("_unanswered_notes_rows") or ())
+
+
+def suppressed_notes_rows(state: Mapping[str, Any], kept: Sequence[Any]) -> set[str]:
+    """The notes rows of ``kept`` that the summary ``state`` starts from kept
+    out of its calls, which the next summary must keep out too: the thinking
+    in the turns both keep was produced without them."""
+    # TODO(2026-11-25): delete 30 days after this ships, once the threads written before it have aged out.
+    if (
+        "_unanswered_notes_rows" not in state
+        and (summary := _summary_id(state)) is not None
+    ):
+        return {
+            m.id
+            for m in kept
+            if m.id
+            and (row := _notes_row(m)) is not None
+            and row.provenance.get("summary") != summary
+        }
+    return unanswered_notes_rows(state) & {m.id for m in kept}
+
+
 def _without_answered(request: ModelRequest) -> ModelRequest:
     """``request`` without the notes rows a summary has answered since.
 
     Runs inside compaction, so the summary this call is sent with, the one it
     just wrote included, leads the messages; rows that name another were
-    written before it.
+    written before it. Only the ones its tail kept unanswered go
+    (``unanswered_rows``), recorded with it, and found here on the call
+    that answers from it, which runs before the record is written. A row the
+    agent answered in the turns a summary keeps stays: those turns are sent
+    as they were, since a model with preserved thinking checks the thinking
+    in them against everything before it.
     """
-    current = next((m.id for m in request.messages or [] if is_summary_message(m)), None)
-    return _without_notes_rows(
-        request, keep=lambda row: row.provenance.get("summary") == current
+    messages = request.messages or []
+    state = request.state or {}
+    current = next((m.id for m in messages if is_summary_message(m)), None)
+    gone = unanswered_notes_rows(state)
+    if current != _summary_id(state):
+        answered = max((i for i, m in enumerate(messages) if isinstance(m, AIMessage)), default=-1)
+    # TODO(2026-11-25): delete 30 days after this ships, once the threads written before it have aged out.
+    elif current is not None and "_unanswered_notes_rows" not in state:
+        answered = 0
+    else:
+        answered = len(messages)
+    return _dropping(
+        request,
+        {
+            i
+            for i, m in enumerate(messages)
+            if (row := _notes_row(m)) is not None
+            and row.provenance.get("summary") != current
+            and (i >= answered or m.id in gone)
+        },
     )
 
 
-def _without_notes_rows(
-    request: ModelRequest, keep: Callable[[DurableUpdate], bool] = lambda _row: False
-) -> ModelRequest:
-    """``request`` without the notes rows ``keep`` refuses, by default every one."""
+def _without_notes_rows(request: ModelRequest) -> ModelRequest:
+    """``request`` without its notes rows."""
     messages = request.messages or []
-    kept = [m for m in messages if (row := _notes_row(m)) is None or keep(row)]
-    return request if len(kept) == len(messages) else request.override(messages=kept)
+    return _dropping(request, {i for i, m in enumerate(messages) if _notes_row(m) is not None})
+
+
+def _dropping(request: ModelRequest, drop: set[int]) -> ModelRequest:
+    """``request`` without the messages at the positions in ``drop``."""
+    if not drop:
+        return request
+    return request.override(messages=[m for i, m in enumerate(request.messages) if i not in drop])

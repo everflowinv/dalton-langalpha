@@ -1,7 +1,7 @@
-"""The IBKR adapter against the shapes the server actually answered.
+"""The IBKR adapter against the shapes the server answers.
 
-Every body here was captured from live calls to IBKR's MCP server and then
-retyped with invented ids: a create answering ``{"id", "url"}``, a delete
+Every staged body here was captured from live calls to IBKR's MCP server and
+then retyped with invented ids: a create answering ``{"id", "url"}``, a delete
 answering ``{}``, a list answering ``{"instructions": [...]}`` whose rows carry
 no status word at all, and a refusal arriving as an MCP tool error carrying
 ``{"code", "message", "data"}``.
@@ -23,6 +23,7 @@ from src.server.services.brokerage_orders import (
     AttemptStatus,
     BrokerOrder,
     EquityRef,
+    Money,
     OpaqueRef,
     OrderMode,
     StatusReadError,
@@ -513,3 +514,412 @@ def test_an_unstage_has_no_fingerprint():
 
 def test_match_key_of_nothing_is_none():
     assert IBKR.match_key(None) is None
+
+
+# -- live orders --------------------------------------------------------------
+#
+# Not captured from live calls: these follow IBKR's published tool
+# descriptions, which name the fields below and no others, retyped with
+# invented ids. Each arm pins one reading those descriptions force.
+
+ORDER_ID = "5001001"
+QUESTION_ID = "q-7001"
+NEXT_QUESTION_ID = "q-7002"
+CORRELATION_ID = "c-8001"
+
+SUBMIT_ARGS = {
+    "contract_id_ex": CONTRACT,
+    "side": "BUY",
+    "order_type": "LIMIT",
+    "tif": "DAY",
+    "size": 1,
+    "limit_price": 1,
+    "outside_rth": True,
+    "is_position_close": False,
+}
+MODIFY_ARGS = {**SUBMIT_ARGS, "order_id": ORDER_ID, "limit_price": 2}
+
+# A submit the broker answered with a question, which places nothing yet.
+PENDING_RESULT = {
+    "pending_question": {"question_id": QUESTION_ID, "answers": ["Yes", "No"]},
+    "correlation_id": CORRELATION_ID,
+}
+# The answer that released it: the question gone, the order named.
+SETTLED_RESULT = {
+    "pending_question": None,
+    "correlation_id": CORRELATION_ID,
+    "order_id": ORDER_ID,
+    "order_status": "NEW",
+}
+# One ``get_order_status`` answer. It names no order id of its own, and a price
+# that does not apply to the order type comes back 0.
+STATUS_RESULT = {
+    "order_status": "PARTIALLY_FILLED",
+    "total_quantity": 2.0,
+    "filled_quantity": 1.0,
+    "remaining_quantity": 1.0,
+    "contract_id_ex": CONTRACT,
+    "side": "BUY",
+    "order_type": "LIMIT",
+    "tif": "DAY",
+    "limit_price": 1.0,
+    "stop_price": 0.0,
+    "outside_rth": False,
+}
+
+
+def submit_order(**overrides) -> BrokerOrder:
+    return IBKR.parse_request("submit_order", {**SUBMIT_ARGS, **overrides})
+
+
+def answer(**overrides) -> BrokerOrder:
+    return IBKR.parse_request(
+        "answer_order_question",
+        {
+            "question_id": QUESTION_ID,
+            "value": "Yes",
+            "correlation_id": CORRELATION_ID,
+            **overrides,
+        },
+    )
+
+
+def test_submit_order_request():
+    order = submit_order()
+
+    assert order.vendor == "ibkr"
+    assert order.mode is OrderMode.LIVE
+    assert order.account_ref == ""
+    assert order.asset_class == "other"
+    assert order.target_ref is None
+    assert order.instrument == OpaqueRef(raw_code=CONTRACT)
+    assert order.side == "buy"
+    assert order.qty == Decimal("1")
+    assert order.notional is None
+    assert order.order_type == "limit"
+    assert order.limit_price == Decimal("1")
+    assert order.time_in_force == "day"
+    # No neutral field says either flag, so both survive as sent.
+    assert order.extras == {
+        "contract_id_ex": CONTRACT,
+        "outside_rth": True,
+        "is_position_close": False,
+    }
+    assert order.raw == SUBMIT_ARGS
+
+
+@pytest.mark.parametrize(
+    ("order_type", "neutral"), [("STOP", "stop"), ("STOP_LIMIT", "stop_limit")]
+)
+def test_the_live_tools_take_two_kinds_staging_does_not(order_type, neutral):
+    order = submit_order(order_type=order_type, stop_price=0.5)
+
+    assert order.order_type == neutral
+    assert order.stop_price == Decimal("0.5")
+    assert "order_type" not in order.extras
+
+
+def test_a_cash_sized_submit_is_a_notional_in_no_named_currency():
+    """``cash_size`` is in the contract's trading currency, which nothing names."""
+    order = submit_order(size=None, cash_size=250)
+
+    assert order.qty is None
+    assert order.notional == Money(amount=Decimal("250"), currency="")
+
+
+@pytest.mark.parametrize(
+    ("tif", "neutral"), [("OVT", "overnight"), ("OND", "overnight_next_day")]
+)
+def test_the_live_durations_keep_their_own_words(tif, neutral):
+    assert submit_order(tif=tif).time_in_force == neutral
+
+
+def test_a_duration_only_staging_takes_is_not_read_on_a_live_order():
+    order = submit_order(tif="GTC")
+
+    assert order.time_in_force is None
+    assert order.extras["tif"] == "GTC"
+
+
+def test_modify_order_request_names_the_order_it_replaces():
+    order = IBKR.parse_request("modify_order", MODIFY_ARGS)
+
+    assert order.mode is OrderMode.LIVE
+    assert order.target_ref == ORDER_ID
+    assert order.extras["order_id"] == ORDER_ID
+    assert order.limit_price == Decimal("2")
+    assert order.instrument == OpaqueRef(raw_code=CONTRACT)
+
+
+def test_a_submit_does_not_read_a_stray_order_id_as_its_target():
+    order = submit_order(order_id=ORDER_ID)
+
+    assert order.target_ref is None
+    assert order.extras["order_id"] == ORDER_ID
+
+
+def test_cancel_order_request():
+    order = IBKR.parse_request("cancel_order", {"order_id": ORDER_ID})
+
+    assert order.mode is OrderMode.LIVE
+    assert order.account_ref == ""
+    assert order.target_ref == ORDER_ID
+    assert order.extras == {"order_id": ORDER_ID}
+
+
+def test_an_answer_targets_its_question_and_keeps_all_three_fields():
+    order = answer()
+
+    assert order.mode is OrderMode.LIVE
+    assert order.target_ref == QUESTION_ID
+    assert order.extras == {
+        "question_id": QUESTION_ID,
+        "value": "Yes",
+        "correlation_id": CORRELATION_ID,
+    }
+    assert order.side is None
+    assert order.qty is None
+
+
+def test_an_answer_naming_no_question_is_no_order():
+    assert IBKR.parse_request("answer_order_question", {"value": "Yes"}) is None
+
+
+def test_a_submit_answered_with_a_question_is_pending_confirm():
+    """Nothing is on the market until the question is answered.
+
+    The question's id is what the answer has to quote, and the correlation is
+    what it has to echo, so the second rides on the row's route.
+    """
+    outcome = IBKR.parse_result(
+        "submit_order",
+        json.dumps(PENDING_RESULT),
+        tool_status="success",
+        request=submit_order(),
+    )
+
+    assert outcome.status is AttemptStatus.PENDING_CONFIRM
+    assert outcome.confirm_token == QUESTION_ID
+    assert outcome.route == {
+        "contract_id_ex": CONTRACT,
+        "correlation_id": CORRELATION_ID,
+    }
+    assert outcome.vendor_order_id is None
+    assert outcome.raw == PENDING_RESULT
+
+
+def test_an_answer_that_releases_the_order_names_it():
+    outcome = IBKR.parse_result(
+        "answer_order_question",
+        json.dumps(SETTLED_RESULT),
+        tool_status="success",
+        request=answer(),
+    )
+
+    assert outcome.status is AttemptStatus.WORKING
+    assert outcome.raw_status == "NEW"
+    assert outcome.vendor_order_id == ORDER_ID
+    assert outcome.confirm_token is None
+    assert outcome.route == {"correlation_id": CORRELATION_ID}
+
+
+def test_an_answer_can_raise_the_next_question():
+    outcome = IBKR.parse_result(
+        "answer_order_question",
+        json.dumps(
+            {
+                **PENDING_RESULT,
+                "pending_question": {
+                    "question_id": NEXT_QUESTION_ID,
+                    "answers": ["Yes", "No"],
+                },
+            }
+        ),
+        tool_status="success",
+        request=answer(),
+    )
+
+    assert outcome.status is AttemptStatus.PENDING_CONFIRM
+    assert outcome.confirm_token == NEXT_QUESTION_ID
+    # The question it answered is not an order, so no id is read off it.
+    assert outcome.vendor_order_id is None
+
+
+def test_a_pending_modify_carries_the_order_it_named():
+    """The answer does not repeat the id, and the status read needs it."""
+    outcome = IBKR.parse_result(
+        "modify_order",
+        json.dumps(PENDING_RESULT),
+        tool_status="success",
+        request=IBKR.parse_request("modify_order", MODIFY_ARGS),
+    )
+
+    assert outcome.status is AttemptStatus.PENDING_CONFIRM
+    assert outcome.vendor_order_id == ORDER_ID
+
+
+def test_a_question_with_no_id_is_unknown():
+    outcome = IBKR.parse_result(
+        "submit_order",
+        json.dumps({**PENDING_RESULT, "pending_question": {"answers": ["Yes"]}}),
+        tool_status="success",
+        request=submit_order(),
+    )
+
+    assert outcome.status is AttemptStatus.UNKNOWN
+    assert outcome.confirm_token is None
+
+
+def test_a_cancel_reports_what_the_venue_did_rather_than_what_was_asked():
+    """IBKR: do not assume ``CANCELLED``; the order may have filled first."""
+    request = IBKR.parse_request("cancel_order", {"order_id": ORDER_ID})
+
+    filled = IBKR.parse_result(
+        "cancel_order",
+        json.dumps({"order_status": "FILLED", "filled_quantity": 2.0}),
+        tool_status="success",
+        request=request,
+    )
+    cancelled = IBKR.parse_result(
+        "cancel_order",
+        json.dumps({"order_status": "CANCELLED", "filled_quantity": 0.0}),
+        tool_status="success",
+        request=request,
+    )
+
+    assert filled.status is AttemptStatus.FILLED
+    assert filled.filled_qty == Decimal("2")
+    # Named by the call, not the answer.
+    assert filled.vendor_order_id == ORDER_ID
+    assert cancelled.status is AttemptStatus.CANCELLED
+
+
+def test_a_settled_answer_with_no_state_is_unknown_and_keeps_the_order():
+    outcome = IBKR.parse_result(
+        "cancel_order",
+        json.dumps({"correlation_id": CORRELATION_ID}),
+        tool_status="success",
+        request=IBKR.parse_request("cancel_order", {"order_id": ORDER_ID}),
+    )
+
+    assert outcome.status is AttemptStatus.UNKNOWN
+    assert outcome.vendor_order_id == ORDER_ID
+
+
+def test_a_live_tool_error_is_unknown_rather_than_a_rejection():
+    """IBKR: after an error, the broker may already have accepted the request.
+
+    The staged tools' error object is a rejection; the same object from a live
+    tool is not proof that nothing reached the market.
+    """
+    outcome = IBKR.parse_result(
+        "cancel_order",
+        json.dumps(REJECTION),
+        tool_status="error",
+        request=IBKR.parse_request("cancel_order", {"order_id": ORDER_ID}),
+    )
+
+    assert outcome.status is AttemptStatus.UNKNOWN
+    assert outcome.failure is not None
+    assert outcome.failure.kind == "vendor"
+    assert outcome.failure.code == "-32400"
+    assert outcome.vendor_order_id == ORDER_ID
+
+
+def test_a_live_transport_failure_and_a_refusal_read_as_before():
+    assert (
+        IBKR.parse_result("submit_order", "upstream unreachable", tool_status="error")
+    ).status is AttemptStatus.FAILED
+    assert (
+        IBKR.parse_result("submit_order", "Refused: not permitted", tool_status="error")
+    ).status is AttemptStatus.REFUSED
+
+
+@pytest.mark.parametrize(
+    ("word", "status"),
+    [
+        ("PENDING_NEW", AttemptStatus.SUBMITTED),
+        ("NEW", AttemptStatus.WORKING),
+        ("PENDING_CANCEL", AttemptStatus.WORKING),
+        ("PENDING_REPLACE", AttemptStatus.WORKING),
+        ("PENDING_CANCEL_REPLACE", AttemptStatus.WORKING),
+        ("REPLACED", AttemptStatus.WORKING),
+        ("DONE_FOR_THE_DAY", AttemptStatus.WORKING),
+        ("PARTIALLY_FILLED", AttemptStatus.PARTIALLY_FILLED),
+        ("FILLED", AttemptStatus.FILLED),
+        ("CANCELLED", AttemptStatus.CANCELLED),
+        ("EXPIRED", AttemptStatus.EXPIRED),
+        ("REJECTED", AttemptStatus.REJECTED_BY_VENDOR),
+        ("SUSPENDED", AttemptStatus.UNKNOWN),
+    ],
+)
+def test_each_published_order_state_maps_once(word, status):
+    listed = IBKR.parse_status(
+        IBKR.status_query(submit_order(), vendor_order_id=ORDER_ID),
+        json.dumps({**STATUS_RESULT, "order_status": word, "filled_quantity": 0.0}),
+    )
+
+    assert listed[0].outcome.status is status
+    assert listed[0].outcome.raw_status == word
+
+
+def test_a_live_state_with_a_fill_beside_it_is_partially_filled():
+    """``PENDING_CANCEL`` says the order is live, and the quantity says some filled."""
+    listed = IBKR.parse_status(
+        IBKR.status_query(submit_order(), vendor_order_id=ORDER_ID),
+        json.dumps({**STATUS_RESULT, "order_status": "PENDING_CANCEL"}),
+    )
+
+    assert listed[0].outcome.status is AttemptStatus.PARTIALLY_FILLED
+
+
+def test_a_live_order_is_read_by_its_own_id():
+    query = IBKR.status_query(submit_order(), vendor_order_id=ORDER_ID)
+
+    assert query.tool == "get_order_status"
+    assert query.args == {"order_id": ORDER_ID}
+
+
+def test_an_answer_is_read_by_the_order_it_released_not_its_question():
+    query = IBKR.status_query(answer(), vendor_order_id=ORDER_ID)
+
+    assert query.args == {"order_id": ORDER_ID}
+
+
+def test_a_live_order_with_no_id_has_nothing_to_read():
+    """IBKR's order list does not spell its rows, so there is no matching one."""
+    assert IBKR.status_query(submit_order()) is None
+    assert IBKR.status_query(answer()) is None
+
+
+def test_a_status_read_reports_the_order_it_was_asked_about():
+    listed = IBKR.parse_status(
+        IBKR.status_query(submit_order(), vendor_order_id=ORDER_ID),
+        json.dumps(STATUS_RESULT),
+    )
+
+    assert len(listed) == 1
+    assert listed[0].vendor_order_id == ORDER_ID
+    assert listed[0].outcome.vendor_order_id == ORDER_ID
+    assert listed[0].outcome.filled_qty == Decimal("1")
+    assert listed[0].outcome.route == {"contract_id_ex": CONTRACT}
+    # The answer names no symbol, so it adds nothing to the instrument.
+    assert listed[0].instrument is None
+
+
+def test_a_status_read_about_another_order_or_none_raises():
+    query = IBKR.status_query(submit_order(), vendor_order_id=ORDER_ID)
+
+    for body in (
+        {**STATUS_RESULT, "order_id": "5001002"},
+        {k: v for k, v in STATUS_RESULT.items() if k != "order_status"},
+        REJECTION,
+    ):
+        with pytest.raises(StatusReadError):
+            IBKR.parse_status(query, json.dumps(body))
+
+
+def test_a_live_order_has_no_fingerprint():
+    """Only staged rows are ever listed, and a live key would rival them."""
+    assert IBKR.match_key(submit_order()) is None
+    assert IBKR.match_key(answer()) is None

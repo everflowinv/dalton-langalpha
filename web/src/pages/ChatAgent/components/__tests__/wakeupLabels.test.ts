@@ -87,6 +87,22 @@ describe('orderOutcomeLabel price', () => {
   });
 });
 
+describe('orderOutcomeLabel staged ends', () => {
+  const t = ((key: string) => key) as unknown as TFunction;
+  const base = { vendor_order_id: 'o1', summary: 'Buy 1 ABC', filled_qty: null, qty: 1, avg_fill_price: null };
+
+  // A lapse, a confirmation and a silent hand-off are three different ends,
+  // and none of them is the failure every unnamed end used to read as.
+  it.each([
+    ['partial_expired', 'chat.wakeups.orderPartialExpired'],
+    ['expired', 'chat.wakeups.orderExpired'],
+    ['confirmed', 'chat.wakeups.orderConfirmed'],
+    ['handed_off', 'chat.wakeups.orderHandedOff'],
+  ] as const)('names %s in its own words', (outcome, key) => {
+    expect(orderOutcomeLabel({ ...base, outcome }, t, 'en-US')).toBe(key);
+  });
+});
+
 describe('triggerText zone', () => {
   // Echoes the arguments so the test reads which zone the line names.
   const t = ((key: string, o?: { time?: string; schedule?: string; zone?: string }) =>

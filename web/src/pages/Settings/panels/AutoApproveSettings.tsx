@@ -1,34 +1,25 @@
 import { useTranslation } from 'react-i18next';
-import { ToggleSwitch } from '@/components/ui/switch';
-import { useToast } from '@/components/ui/use-toast';
 import { AUTO_APPROVE, useAutoApprove, type AutoApproveKey } from '@/hooks/useAutoApprove';
+import { SettingsGroup, ToggleRow } from '../components/SettingsLayout';
+import { useSettingCopy } from '../components/useSettingCopy';
+import { SETTINGS, type SettingEntry } from '../sections';
+import { useSaveFailureToast } from './usePreferenceWrite';
 
-const ROWS: { key: AutoApproveKey; label: string; description: string }[] = [
-  { key: AUTO_APPROVE.handoffs, label: 'settings.autoApproveHandoffs', description: 'settings.autoApproveHandoffsDesc' },
-  {
-    key: AUTO_APPROVE.workspaceCreation,
-    label: 'settings.autoApproveWorkspaceCreation',
-    description: 'settings.autoApproveWorkspaceCreationDesc',
-  },
+const ROWS: { key: AutoApproveKey; setting: SettingEntry }[] = [
+  { key: AUTO_APPROVE.handoffs, setting: SETTINGS.approveHandoffs },
+  { key: AUTO_APPROVE.workspaceCreation, setting: SETTINGS.approveWorkspaces },
 ];
 
-function AutoApproveRow({ settingKey, label, description }: { settingKey: AutoApproveKey; label: string; description: string }) {
-  const { t } = useTranslation();
-  const { toast } = useToast();
+function AutoApproveRow({ settingKey, setting }: { settingKey: AutoApproveKey; setting: SettingEntry }) {
+  const copy = useSettingCopy();
+  const reportFailure = useSaveFailureToast();
   const { enabled, set } = useAutoApprove(settingKey);
-  const toggle = () => {
-    set(!enabled).catch(() => {
-      toast({ variant: 'destructive', title: t('common.error'), description: t('settings.failedToSaveSettings') });
-    });
-  };
   return (
-    <div className="flex items-start justify-between gap-4">
-      <div className="min-w-0">
-        <p className="text-[0.8125rem] font-medium" style={{ color: 'var(--color-text-primary)' }}>{t(label)}</p>
-        <p className="text-xs mt-0.5" style={{ color: 'var(--color-text-tertiary)' }}>{t(description)}</p>
-      </div>
-      <ToggleSwitch checked={enabled} onChange={toggle} className="mt-0.5" ariaLabel={t(label)} />
-    </div>
+    <ToggleRow
+      {...copy(setting)}
+      checked={enabled}
+      onChange={() => { void reportFailure(set(!enabled)); }}
+    />
   );
 }
 
@@ -36,16 +27,8 @@ function AutoApproveRow({ settingKey, label, description }: { settingKey: AutoAp
 export function AutoApproveSettings() {
   const { t } = useTranslation();
   return (
-    <div className="p-3 rounded-lg space-y-3" style={{ backgroundColor: 'var(--color-bg-card)', border: '1px solid var(--color-border-muted)' }}>
-      <p className="text-[0.8125rem] font-medium" style={{ color: 'var(--color-text-primary)' }}>{t('settings.approvals')}</p>
-      {ROWS.map((row) => (
-        <AutoApproveRow
-          key={row.key}
-          settingKey={row.key}
-          label={row.label}
-          description={row.description}
-        />
-      ))}
-    </div>
+    <SettingsGroup title={t('settings.approvals')} description={t('settings.approvalsDesc')}>
+      {ROWS.map((row) => <AutoApproveRow key={row.key} settingKey={row.key} setting={row.setting} />)}
+    </SettingsGroup>
   );
 }

@@ -8,11 +8,14 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { renderHook } from '@testing-library/react';
 
 const h = vi.hoisted(() => ({
+  listsLoading: false,
   platformLoading: false,
   prefsLoaded: true,
   preferences: {} as Record<string, unknown>,
 }));
 
+// The providers' own lists are read through React Query; none is read here.
+vi.mock('../useProviderModels', () => ({ useMissingModels: () => ({ missingByProvider: new Map(), isLoading: h.listsLoading }) }));
 vi.mock('../useModels', () => ({
   useModels: () => ({
     models: {
@@ -37,7 +40,15 @@ vi.mock('../usePlatformModels', () => ({
 import { useAllModels } from '../useAllModels';
 
 describe('useAllModels — isLoading', () => {
-  beforeEach(() => { h.platformLoading = false; h.prefsLoaded = true; });
+  beforeEach(() => { h.platformLoading = false; h.prefsLoaded = true; h.listsLoading = false; });
+
+  it('stays loading while a connection\'s own model list is on its first read', () => {
+    // Until it answers, the manifest models the credential cannot run read as
+    // reachable, and a pick would be saved on the thread.
+    h.listsLoading = true;
+    const { result } = renderHook(() => useAllModels());
+    expect(result.current.isLoading).toBe(true);
+  });
 
   it('stays loading while only the platform access answer is pending', () => {
     h.platformLoading = true;

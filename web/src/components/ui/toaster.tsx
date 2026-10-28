@@ -1,3 +1,4 @@
+import { CircleAlert } from "lucide-react"
 import {
   Toast,
   ToastClose,
@@ -29,7 +30,15 @@ export function Toaster() {
     <ToastProvider duration={3000}>
       {/* `pinned` is store policy, not a Radix prop — the rest of props is
           spread onto the DOM node, and React warns on an unknown attribute. */}
-      {toasts.map(function ({ id, title, description, action, pinned: _pinned, ...props }) {
+      {toasts.map(function ({ id, title, description, action, icon, variant, pinned: _pinned, ...props }) {
+        // A failure always says so with the alert glyph; any other toast shows
+        // the glyph its caller gave, or none.
+        const glyph =
+          variant === "destructive" ? (
+            <CircleAlert className="h-4 w-4 text-(--color-loss)" />
+          ) : (
+            icon
+          )
         return (
           <Toast
             key={id}
@@ -37,17 +46,28 @@ export function Toaster() {
             duration={
               typeof props.duration === "number"
                 ? props.duration
-                : defaultDuration(props.variant, action)
+                : defaultDuration(variant, action)
             }
           >
-            <div className="grid gap-1">
-              {title && <ToastTitle>{title}</ToastTitle>}
-              {description && (
-                <ToastDescription>{description}</ToastDescription>
+            {/* The glyph rides with the text, not the row, so it stays on the
+                title's line however tall the description or the action is. */}
+            <div className="flex min-w-0 flex-1 items-start gap-2.5">
+              {glyph && (
+                <span aria-hidden="true" className="flex h-5 shrink-0 items-center">
+                  {glyph}
+                </span>
               )}
+              <div className="grid min-w-0 gap-0.5">
+                {title && <ToastTitle>{title}</ToastTitle>}
+                {description && (
+                  <ToastDescription>{description}</ToastDescription>
+                )}
+              </div>
             </div>
-            {action}
-            <ToastClose />
+            <div className="flex shrink-0 items-center gap-1">
+              {action}
+              <ToastClose />
+            </div>
           </Toast>
         )
       })}

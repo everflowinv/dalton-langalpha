@@ -10,12 +10,13 @@ import { Routes, Route } from 'react-router';
 import { renderWithProviders } from '@/test/utils';
 import { queryKeys } from '@/lib/queryKeys';
 
-const { post, getCurrentUser } = vi.hoisted(() => ({
+const { post, getCurrentUser, configured } = vi.hoisted(() => ({
   post: vi.fn(),
   getCurrentUser: vi.fn(),
+  configured: { providers: [] as Array<Record<string, unknown>> },
 }));
 
-vi.mock('@/api/client', () => ({ api: { post } }));
+vi.mock('@/api/client', () => ({ api: { post, defaults: { baseURL: '' } } }));
 vi.mock('@/pages/Dashboard/utils/api', () => ({
   getCurrentUser,
   deleteUserApiKey: vi.fn(),
@@ -30,14 +31,20 @@ vi.mock('@/contexts/AuthContext', () => ({ // DALTON-HOOK(team-credentials)
 vi.mock('@/hooks/useUser', () => ({
   useUser: () => ({ user: { access_tier: -1 }, isLoading: false }),
 }));
-vi.mock('@/hooks/useConfiguredProviders', () => ({
-  useConfiguredProviders: () => ({ providers: [], hasAny: false }),
+vi.mock('@/hooks/useConfiguredProviders', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/hooks/useConfiguredProviders')>()),
+  useConfiguredProviders: () => ({ providers: configured.providers, hasAny: configured.providers.length > 0 }),
 }));
 vi.mock('@/hooks/usePreferences', () => ({ usePreferences: () => ({ preferences: null }) }));
 vi.mock('@/hooks/useUpdatePreferences', () => ({
   useUpdatePreferences: () => ({ mutateAsync: vi.fn() }),
 }));
 vi.mock('@/hooks/useAllModels', () => ({ useAllModels: () => ({ metadata: {} }) }));
+// DALTON-HOOK(team-credentials): the step reads the shared-credential hint and PM disconnect guard
+vi.mock('@/hooks/useTeamCredentials', () => ({
+  TEAM_SHARED_CREDENTIALS_HINT: '',
+  useTeamCredentials: () => ({ isShared: false, canDisconnect: true, isPm: true, canInvite: false }),
+}));
 
 import MethodStep from '../MethodStep';
 
@@ -119,5 +126,20 @@ describe('MethodStep invitation redemption', () => {
     await user.type(screen.getByPlaceholderText('Enter your invitation code'), 'X');
     expect(button).toBeEnabled();
     expect(post).not.toHaveBeenCalled();
+  });
+});
+
+describe('MethodStep connected summary', () => {
+  it("offers no removal for the deployment's own key", async () => {
+    configured.providers = [
+      { provider: 'openai', display_name: 'OpenAI', access_type: 'api_key', masked_key: '(server)' },
+      { provider: 'anthropic', display_name: 'Anthropic', access_type: 'api_key', masked_key: 'sk-...abcd' },
+    ];
+    const user = userEvent.setup();
+    renderStep();
+    await user.click(screen.getByRole('button', { name: /2 providers connected/i }));
+
+    expect(screen.getAllByRole('button', { name: 'Remove' })).toHaveLength(1);
+    configured.providers = [];
   });
 });

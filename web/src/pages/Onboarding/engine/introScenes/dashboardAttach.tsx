@@ -1,5 +1,5 @@
 import type { CSSProperties } from 'react';
-import { Eye, Newspaper, Paperclip, X } from 'lucide-react';
+import { Newspaper, X } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { useLocale } from '@/hooks/useLocale';
 import { relativeTime } from '@/lib/format';
@@ -7,8 +7,8 @@ import { CLOSE, Camera, VIEW, corner, shot, type Shot } from './camera';
 import { easeInOut, useSceneTime } from './clock';
 import { Typed, pointerScript } from './kit';
 import type { IntroScene } from './types';
-import { WATCH, DashPage, PAD, PAGE_W, Floating, Composer, Widget } from './dashboardParts';
-import { WatchRow, NEWS, NewsRow, AddSymbol } from './dashboardClassic';
+import { DashPage, PAD, PAGE_W, Floating, Composer, useRowShift } from './dashboardParts';
+import { NEWS, NewsRow, NewsWidget, RowClip, WatchWidget } from './dashboardPage';
 
 /* The dashboard intro's last scene: clipping a row into the chat's context.
    Drawn after its real counterpart under pages/Dashboard (row paperclip,
@@ -35,50 +35,51 @@ const ATTACH = {
 };
 /** The page's size: a window's height, so the chat floats at its foot. */
 const ATTACH_PAGE = { width: PAGE_W, height: 300 };
-/** Page px, read off the layout: the first row and its paperclip, the
-    card in the composer's open deck, and the line its text goes on. */
-const ROW = { x: 17, y: 34, w: 208 };
-const CLIP = { x: 216, y: 52 };
+/** Page px, read off the layout in the default card style: the first row
+    and its paperclip, at the end of the headline's cell, the card in the
+    composer's open deck, and the line its text goes on. A row sits lower
+    or higher in the other styles (`useRowShift`). */
+const ROW = { x: 17, y: 37, w: 236 };
+const CLIP = { x: 169, y: 43 };
 const CARD = { x: 89, y: 216, w: 222 };
 const TEXT = { x: 198, y: 257 };
 /** Where the crops' edges fall, in page px: between the watchlist's
-    symbols and its prices; across the rows' pictures, before their titles;
-    the line under the feed's header; above the headers' text; the foot of
-    the composer, which floats the page's padding above the page's foot;
-    and the widgets' left padding, which puts the right edge of a view at
-    the last shot's zoom between the watchlist's prices and their changes. */
-const WATCH_NAMES_END = 300;
-const PICTURES = 33;
-const UNDER_HEADER = 31;
-const OVER_HEADER = 15;
+    symbols and its prices; over the cards' edges; the foot of the composer,
+    which floats the page's padding above the page's foot; and the news
+    card's left padding, which puts the right edge of a view at the last
+    shot's zoom between the watchlist's prices and their changes. */
+const WATCH_NAMES_END = 306;
+const OVER_CARDS = PAD / 2;
 const COMPOSER_FOOT = ATTACH_PAGE.height - PAD;
 const WIDGET_PAD = 12;
-/** The flying card's box: the clipped row, then its slot in the deck. It
-    eases in and out over the camera's move, so it rides along in view. */
-const CARD_FROM = { x: ROW.x, y: ROW.y + 5, w: ROW.w };
+/** The flying card's box: over the clipped row, then its slot in the deck.
+    It eases in and out over the camera's move, so it rides along in view. */
+const CARD_FROM = { x: ROW.x, y: ROW.y - 6, w: ROW.w };
 /** Onto the row's paperclip and a click on it, then down to the
-    composer's line, clicked to type. */
-const ATTACH_POINTER = pointerScript(
-  { at: 300, x: 150, y: 140 },
-  {
-    clip: { ...CLIP, arrive: 1150, click: ATTACH.click, leave: ATTACH.leave },
-    text: { ...TEXT, arrive: 2650, click: ATTACH.focus },
-  }
-);
-/** The feed under its header, out to the watchlist's symbols, a touch
-    closer than REST; a short push in on the rows as the paperclip is
-    clicked; then out with the card as it flies down to the composer, a
-    touch wider than REST so both widgets' headers and the composer's foot
-    are in: the card it lands as is whole, and the question under it
-    reads. */
+    composer's line, clicked to type. `shift` is where the card style puts
+    the row. */
+const attachPointer = (shift: number) =>
+  pointerScript(
+    { at: 300, x: 150, y: 140 },
+    {
+      clip: { ...CLIP, y: CLIP.y + shift, arrive: 1150, click: ATTACH.click, leave: ATTACH.leave },
+      text: { ...TEXT, arrive: 2650, click: ATTACH.focus },
+    }
+  );
+/** The feed with its header, out to the watchlist's symbols, a touch
+    closer than REST; a short push in on the feed as the paperclip is
+    clicked, the watchlist's edge still in; then out with the card as it
+    flies down to the composer, wide enough that the feed's header and the
+    composer's foot are in: the card it lands as is whole, and the question
+    under it reads. */
 const ATTACH_SHOTS: [Shot, ...Shot[]] = [
   shot(0, 0, 0, VIEW.width / WATCH_NAMES_END),
-  corner(1150, PICTURES, UNDER_HEADER, CLOSE, 900),
+  corner(1150, OVER_CARDS, OVER_CARDS, CLOSE, 900),
   corner(
     ATTACH.fly + ATTACH.flyDur,
     WIDGET_PAD,
-    OVER_HEADER,
-    VIEW.height / (COMPOSER_FOOT - OVER_HEADER),
+    OVER_CARDS,
+    VIEW.height / (COMPOSER_FOOT - OVER_CARDS),
     ATTACH.flyDur
   ),
 ];
@@ -114,7 +115,7 @@ function ContextCard({ style }: { style?: CSSProperties }) {
           className="truncate text-[5px] leading-none"
           style={{ color: 'var(--color-text-tertiary)' }}
         >
-          {NEWS[0].source} · {relativeTime(-NEWS[0].hours * 3_600_000, locale, 0)}
+          {NEWS[0].source} · {relativeTime(-NEWS[0].mins * 60_000, locale, 0)}
         </span>
       </span>
       <X className="h-2 w-2 shrink-0" style={{ color: 'var(--color-text-tertiary)' }} />
@@ -149,61 +150,32 @@ function ContextDeck({ shown }: { shown: boolean }) {
 }
 
 function DashboardAttach() {
-  const { t: tr } = useTranslation();
   const t = useSceneTime();
+  const shift = useRowShift();
+  const pointer = attachPointer(shift);
   const hovered = t >= ATTACH.hover && t < ATTACH.leave + 150;
-  const { clip } = ATTACH_POINTER.beats;
+  const { clip } = pointer.beats;
   const onClip = t >= clip.arrive && t < clip.leave;
   const landed = t >= ATTACH.fly + ATTACH.flyDur;
   // eased as the camera's move is, so the card keeps pace with it
   const fly = easeInOut(t, ATTACH.fly, ATTACH.flyDur);
+  const from = { ...CARD_FROM, y: CARD_FROM.y + shift };
   return (
-    <Camera shots={ATTACH_SHOTS} page={ATTACH_PAGE} pointer={ATTACH_POINTER}>
+    <Camera shots={ATTACH_SHOTS} page={ATTACH_PAGE} pointer={pointer}>
       <DashPage height={ATTACH_PAGE.height}>
-        <div className="flex min-h-0 flex-1 gap-1.5">
+        <div className="grid min-h-0 flex-1 grid-cols-[2fr_1fr] gap-1.5">
           {/* news widget: the paperclip shows on the hovered row */}
-          <Widget
-            icon={Newspaper}
-            title={tr('dashboard.widgets.newsFeed.header', {
-              label: tr('dashboard.widgets.newsFeed.tab_market'),
-            })}
-            count="24"
-            delay={0.12}
-            className="flex-[1.5]"
-          >
+          <NewsWidget delay={0.12}>
             {NEWS.map((item, i) => (
-              <NewsRow key={item.title} item={item} hovered={i === 0 && hovered}>
-                {i === 0 && (
-                  <span
-                    className={
-                      'absolute right-0.5 top-1/2 flex h-3.5 w-3.5 -translate-y-1/2 ' +
-                      'items-center justify-center rounded-full ' +
-                      'transition-[opacity,background-color,color] duration-quick'
-                    }
-                    style={{
-                      opacity: hovered ? 1 : 0,
-                      background: onClip ? 'var(--color-accent-soft)' : 'transparent',
-                      color: onClip ? 'var(--color-accent-primary)' : 'var(--color-text-tertiary)',
-                    }}
-                  >
-                    <Paperclip className="h-2 w-2" />
-                  </span>
-                )}
-              </NewsRow>
+              <NewsRow
+                key={item.title}
+                item={item}
+                hovered={i === 0 && hovered}
+                clip={i === 0 ? <RowClip shown={hovered} on={onClip} /> : undefined}
+              />
             ))}
-          </Widget>
-          <Widget
-            icon={Eye}
-            title={tr('dashboard.widgets.watchlist.header')}
-            count="5"
-            delay={0.24}
-            className="flex-1"
-          >
-            {WATCH.map((row) => (
-              <WatchRow key={row.sym} row={row} />
-            ))}
-            <AddSymbol />
-          </Widget>
+          </NewsWidget>
+          <WatchWidget delay={0.24} />
         </div>
         {/* the floating chat: takes the clipped row, then the question */}
         <Floating>
@@ -230,9 +202,9 @@ function DashboardAttach() {
             style={{
               position: 'absolute',
               pointerEvents: 'none',
-              left: CARD_FROM.x + (CARD.x - CARD_FROM.x) * fly,
-              top: CARD_FROM.y + (CARD.y - CARD_FROM.y) * fly,
-              width: CARD_FROM.w + (CARD.w - CARD_FROM.w) * fly,
+              left: from.x + (CARD.x - from.x) * fly,
+              top: from.y + (CARD.y - from.y) * fly,
+              width: from.w + (CARD.w - from.w) * fly,
               // lifted off the row: solid at once, with the shadow a
               // carried card takes
               opacity: Math.min(fly * 12, 1),

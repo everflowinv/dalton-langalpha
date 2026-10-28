@@ -1312,6 +1312,7 @@ app.add_exception_handler(SandboxTransientError, _sandbox_failure_handler)
 app.add_exception_handler(SSHConnectError, _sandbox_failure_handler)
 
 
+
 # ============================================================================
 # Router Registration
 # ============================================================================
@@ -1341,7 +1342,7 @@ from src.server.app.sec_proxy import router as sec_proxy_router
 from src.server.app.api_keys import router as api_keys_router
 from src.server.app.automations import router as automations_router
 from src.server.app.insights import router as insights_router
-from src.server.app.oauth import router as oauth_router
+from src.server.app.oauth import OAuthRefusal, router as oauth_router
 from src.server.app.orders import router as orders_router
 from src.server.app.public import router as public_router
 from src.server.app.share_links import (
@@ -1435,7 +1436,27 @@ app.include_router(
     automations_router
 )  # /api/v1/automations/* - Scheduled automation triggers
 app.include_router(insights_router)  # /api/v1/insights/* - AI market insights
+# DALTON-HOOK(router): Dalton's OAuth routes (muse/xai/antigravity under
+# /api/v1/oauth/*) must register BEFORE the upstream OAuth router: its
+# ``/{key}/device/initiate`` wildcard matches those paths first and answers
+# 404, so registration order is what routes them to Dalton's handlers.
+from src.dalton.app import dalton_router as _dalton_oauth_first_router
+
+app.include_router(_dalton_oauth_first_router)
 app.include_router(oauth_router)  # /api/v1/oauth/* - OAuth provider connections (Codex)
+
+
+# OAuth refusals carry a structured ``error`` beside the plain ``detail``.
+async def _oauth_refusal_handler(request: Request, exc: OAuthRefusal) -> JSONResponse:
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail, "error": exc.error},
+        headers=exc.headers,
+    )
+
+
+app.add_exception_handler(OAuthRefusal, _oauth_refusal_handler)
+
 app.include_router(
     orders_router
 )  # /api/v1/orders/* - Order attempt ledger (read-only, user-scoped)
@@ -1450,9 +1471,6 @@ app.include_router(
 )  # /api/v1/share-links/{code} - One of the owner's links, any workspace
 app.include_router(skills_router)  # /api/v1/skills - Available agent skills
 app.include_router(subagents_router)  # /api/v1/subagents - The user's subagents (Plugins pane)
-# DALTON-HOOK(router): register /api/v1/dalton/* endpoints
-from src.dalton.app import dalton_router
-app.include_router(dalton_router)
 app.include_router(
     workspace_skills_router
 )  # /api/v1/workspaces/{id}/skills - Workspace-scoped skills

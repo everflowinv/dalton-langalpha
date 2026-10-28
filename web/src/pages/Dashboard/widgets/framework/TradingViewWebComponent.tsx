@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
+import { cn } from '@/lib/utils';
 import { useTheme } from '@/contexts/ThemeContext';
 import { useLocale } from '@/hooks/useLocale';
 import { EmbedFallback } from './EmbedFallback';
@@ -123,7 +124,6 @@ interface Props {
   /** Per-widget config; keys converted to kebab-case attributes. */
   config: Record<string, unknown>;
   className?: string;
-  card?: boolean;
 }
 
 /**
@@ -143,7 +143,6 @@ export function TradingViewWebComponent({
   element,
   config,
   className,
-  card = false,
 }: Props) {
   const { theme } = useTheme();
   const locale = useLocale();
@@ -279,9 +278,8 @@ export function TradingViewWebComponent({
     };
   }, [element]);
 
-  const cardClass = card ? 'dashboard-glass-card p-3 overflow-hidden' : '';
   return (
-    <div className={`tv-embed-host flex flex-col h-full ${cardClass} ${className ?? ''}`}>
+    <div className={cn('tv-embed-host flex flex-col h-full', className)}>
       <div className="relative flex-1 min-h-0">
         {/* `tv-wc-container` carries the color-scheme reset from tvEmbed.css —
             see TradingViewEmbed.tsx. The custom element mounts inside it so

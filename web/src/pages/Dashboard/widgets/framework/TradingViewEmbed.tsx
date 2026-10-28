@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useEffectEvent, useRef, useState } from 'react';
+import { cn } from '@/lib/utils';
 import { useTheme } from '@/contexts/ThemeContext';
 import { useLocale } from '@/hooks/useLocale';
 import { getTVCommonConfig, mapLocaleForTV, resolveScriptSrc } from './tvConfig';
@@ -12,13 +13,6 @@ interface Props {
   config: Record<string, unknown>;
   /** Class applied to the outer container. */
   className?: string;
-  /**
-   * When true, wrap the embed in the dashboard's `dashboard-glass-card` shell
-   * so TV widgets visually match our native widgets (background, border,
-   * rounded corners, padding). Off by default so MarketView's bare usage is
-   * unaffected.
-   */
-  card?: boolean;
   /**
    * Fixed pixel height for the iframe area. When set, the host stops using
    * `h-full` and sizes to content, so the widget can pair with
@@ -53,7 +47,7 @@ interface Props {
 // the TradingView CDN.
 const REBUILD_DEBOUNCE_MS = 200;
 
-export function TradingViewEmbed({ scriptKey, config, className, card = false, contentHeight }: Props) {
+export function TradingViewEmbed({ scriptKey, config, className, contentHeight }: Props) {
   const { theme } = useTheme();
   const locale = useLocale();
   // Named local mirrors the WC component pattern (TradingViewWebComponent.tsx)
@@ -187,10 +181,9 @@ export function TradingViewEmbed({ scriptKey, config, className, card = false, c
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [scriptKey, configKey, theme, retryToken, tvLocale]);
 
-  const cardClass = card ? 'dashboard-glass-card p-3 overflow-hidden' : '';
   const isFixed = typeof contentHeight === 'number';
   return (
-    <div className={`tv-embed-host flex flex-col h-full ${cardClass} ${className ?? ''}`}>
+    <div className={cn('tv-embed-host flex flex-col h-full', className)}>
       <div
         className={
           isFixed

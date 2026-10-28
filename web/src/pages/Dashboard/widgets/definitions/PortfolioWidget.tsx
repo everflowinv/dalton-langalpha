@@ -17,12 +17,14 @@ import { RowAttachButton } from '../../components/RowAttachButton';
 import type { WidgetRenderProps } from '../types';
 import type { PortfolioRow } from '../../hooks/usePortfolioData';
 import { deriveQuoteDisplay, formatSignedPct2, roundQuote2, type MarketStatusInput } from '@/lib/quotes'; // DALTON-HOOK(extended-hours-quotes)
+import { WidgetCardMeta } from '../framework/widgetCardSlots';
 import {
   HoldingsAddButton,
   HoldingsSkeleton,
   useHoldingsSkeletonRows,
   PortfolioNavSummary,
   PortfolioRowItem,
+  PortfolioTable,
 } from './_holdingsPrimitives';
 import { formatPortfolioNavMarkdownLine, portfolioSummary } from './_holdingsHelpers';
 import { normalizePortfolioCurrency } from '../../utils/portfolioSummary';
@@ -139,77 +141,48 @@ function PortfolioWidget({ instance, updateConfig }: WidgetRenderProps<Portfolio
   const hasRealHoldings = portfolio.hasRealHoldings;
 
   return (
-    <div className="dashboard-glass-card p-5 flex flex-col h-full">
-      <div
-        className="flex items-baseline justify-between mb-3 pb-3 border-b"
-        style={{ borderColor: 'var(--color-border-muted)' }}
-      >
-        <div className="flex items-baseline gap-2.5 min-w-0">
-          <Briefcase
-            className="h-3.5 w-3.5 shrink-0 self-center"
-            style={{ color: 'var(--color-text-tertiary)' }}
-          />
-          <span
-            className="text-[0.625rem] font-semibold uppercase tracking-[0.14em]"
-            style={{ color: 'var(--color-text-secondary)' }}
-          >
-            {t('dashboard.widgets.portfolio.header')}
-          </span>
-          {/* Held but unseen while the rows load: a count of 0 that turns into
-              the real one reads as a change, not a load. */}
-          <span
-            className="title-font text-lg leading-none dashboard-mono"
-            style={{ color: 'var(--color-text-primary)', visibility: showSkeleton ? 'hidden' : undefined }}
-          >
-            {portfolio.rows.length}
-          </span>
-        </div>
-      </div>
-      <div className="flex-1 min-h-0 overflow-y-auto pr-1">
+    <div className="widget-term dash-fill">
+      {/* Held back while the rows load: a count of 0 that turns into the real
+          one reads as a change, not a load. */}
+      {!showSkeleton && <WidgetCardMeta>{portfolio.rows.length}</WidgetCardMeta>}
+      <div className="dash-scroll">
         {/* The skeleton crossfades to the rows in place. Rows present when the
             list first renders just are; only one added later enters. */}
-        <SwapCell
-          as="div"
-          className="items-start"
-          swapKey={showSkeleton ? 'loading' : 'ready'}
-          layerClassName="flex flex-col gap-1"
-        >
-          {hasRealHoldings && (
-            <PortfolioNavSummary
-              rows={portfolio.rows}
-              valuesHidden={valuesHidden}
-              onToggleHidden={toggleHidden}
-            />
-          )}
-
-          {showSkeleton ? (
-            <HoldingsSkeleton count={skeletonRows} />
-          ) : (
-            <AnimatePresence initial={false}>
-              {portfolio.rows.map((row) => (
-                <div
-                  key={row.user_portfolio_id ?? row.symbol}
-                  className="row-attach-host relative"
-                >
-                  <PortfolioRowItem
-                    item={row}
-                    marketStatus={dashboard.marketStatus}
-                    valuesHidden={valuesHidden}
-                    onEdit={portfolioHandlers.onEdit}
-                    onDelete={portfolioHandlers.onDelete}
-                  />
-                  <span className="absolute right-1 top-1/2 -translate-y-1/2">
-                    <RowAttachButton
-                      instanceId={instance.id}
-                      rowId={String(row.user_portfolio_id ?? row.symbol)}
+        <SwapCell as="div" className="items-start" swapKey={showSkeleton ? 'loading' : 'ready'}>
+          <div>
+            {hasRealHoldings && (
+              <PortfolioNavSummary
+                rows={portfolio.rows}
+                valuesHidden={valuesHidden}
+                onToggleHidden={toggleHidden}
+              />
+            )}
+            <PortfolioTable>
+              {showSkeleton ? (
+                <HoldingsSkeleton count={skeletonRows} cols={4} />
+              ) : (
+                <AnimatePresence initial={false}>
+                  {portfolio.rows.map((row) => (
+                    <PortfolioRowItem
+                      key={row.user_portfolio_id ?? row.symbol}
+                      item={row}
+                      marketStatus={dashboard.marketStatus}
+                      valuesHidden={valuesHidden}
+                      onEdit={portfolioHandlers.onEdit}
+                      onDelete={portfolioHandlers.onDelete}
+                      attach={
+                        <RowAttachButton
+                          instanceId={instance.id}
+                          rowId={String(row.user_portfolio_id ?? row.symbol)}
+                        />
+                      }
                     />
-                  </span>
-                </div>
-              ))}
-            </AnimatePresence>
-          )}
-
-          <HoldingsAddButton label={t('dashboard.widgets.portfolio.addTransaction')} onClick={portfolioHandlers.onAdd} />
+                  ))}
+                </AnimatePresence>
+              )}
+            </PortfolioTable>
+            <HoldingsAddButton label={t('dashboard.widgets.portfolio.addTransaction')} onClick={portfolioHandlers.onAdd} />
+          </div>
         </SwapCell>
       </div>
     </div>
@@ -219,14 +192,17 @@ function PortfolioWidget({ instance, updateConfig }: WidgetRenderProps<Portfolio
 registerWidget<PortfolioConfig>({
   type: 'portfolio.holdings',
   titleKey: 'dashboard.widgets.portfolio.title',
+  cardTitleKey: 'dashboard.widgets.portfolio.header',
   descriptionKey: 'dashboard.widgets.portfolio.description',
   category: 'personal',
   icon: Briefcase,
   component: PortfolioWidget,
   defaultConfig: { valuesHidden: false },
   configSchema: PortfolioConfigSchema,
-  defaultSize: { w: 4, h: 26 },
-  minSize: { w: 3, h: 15 },
+  defaultSize: { w: 4, h: 18 },
+  minSize: { w: 3, h: 10 },
+  maxSize: { w: 12, h: 30 },
+  fitToContent: true,
 });
 
 export default PortfolioWidget;

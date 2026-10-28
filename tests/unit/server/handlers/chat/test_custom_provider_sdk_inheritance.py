@@ -229,3 +229,72 @@ def test_an_inherited_dashscope_provider_actually_builds_the_bridged_client():
     assert inherited.output_version == "responses/v1"
     # The gateway's own endpoint outranks the manifest's, both ways.
     assert inherited.openai_api_base == "https://gw.example.com/v1"
+
+
+@pytest.mark.parametrize("declared", [None, True])
+def test_a_custom_provider_whose_name_the_manifest_later_took_keeps_its_own_dialect(declared):
+    """A user set up ``xai`` by hand, as an OpenAI-shaped gateway, before the
+    manifest listed a provider of that name. Read by name, the built-in's
+    ``use_response_api`` and ``prompt_cache_key`` reached a gateway that may
+    speak only Chat Completions. It gets what any other custom provider with
+    the same parent gets, and the declarations ``model_entry`` reads agree."""
+    from src.llms.llm import LLM, create_llm_from_custom
+    from src.server.services.llm.user_models import model_entry, route_custom_entry
+
+    mc = LLM.get_model_config()
+    assert mc.get_provider_info("xai").get("use_response_api")
+
+    def build(name: str):
+        provider_def = {"name": name, "parent_provider": "openai"}
+        if declared is not None:
+            provider_def["use_response_api"] = declared
+        entry = {"name": "grok-4.7", "model_id": "grok-4.7", "provider": name}
+        routed = route_custom_entry(entry, provider_def, mc)
+        client = create_llm_from_custom(
+            routed, api_key="sk-test", base_url="https://gw.example/v1",
+            cache_key="thread-1", reasoning_effort="high",
+        )
+        declared_reasoning = model_entry(
+            {"custom_providers": [provider_def], "custom_models": [entry]}, "grok-4.7"
+        ).get("reasoning")
+        return client, declared_reasoning
+
+    shadowing, shadowing_reasoning = build("xai")
+    other, other_reasoning = build("my-grok-gw")
+
+    assert bool(shadowing.use_responses_api) == bool(other.use_responses_api) == bool(declared)
+    assert "prompt_cache_key" not in (shadowing.model_kwargs or {})
+    assert shadowing.model_kwargs == other.model_kwargs
+    assert getattr(shadowing, "reasoning", None) == getattr(other, "reasoning", None)
+    assert shadowing_reasoning == other_reasoning
+
+
+def test_preferences_spell_out_a_ladder_another_api_cannot_borrow():
+    # The web fills a custom entry without a ladder from the built-in of its
+    # name; on a gateway speaking another API the server sends none instead.
+    from src.llms.llm import LLM
+    from src.llms.model_spec import reasoning_block
+    from src.server.services.llm.user_models import with_borrowed_ladders
+
+    mc = LLM.get_model_config()
+    assert mc.get_provider_info("openai").get("use_response_api")
+    shadow = next(
+        m["id"] for m in mc.manifest["models"]["openai"]
+        if reasoning_block(mc.get_model_config(m["id"])).get("efforts")
+    )
+    pref = {
+        "custom_providers": [
+            {"name": "chat-gw", "parent_provider": "openai"},
+            {"name": "resp-gw", "parent_provider": "openai", "use_response_api": True},
+        ],
+        "custom_models": [
+            {"name": shadow, "model_id": shadow, "provider": "chat-gw"},
+            {"name": "own-model", "model_id": "own", "provider": "chat-gw"},
+        ],
+    }
+    spelled = with_borrowed_ladders(pref)["custom_models"]
+    assert spelled[0]["reasoning"] == {"efforts": []}
+    assert "reasoning" not in spelled[1]
+
+    pref["custom_models"][0]["provider"] = "resp-gw"
+    assert "reasoning" not in with_borrowed_ladders(pref)["custom_models"][0]

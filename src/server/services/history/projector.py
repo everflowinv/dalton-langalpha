@@ -239,7 +239,13 @@ def _project_human_message(message: HumanMessage, agent: str) -> list[HistoryEve
     content = message.content if isinstance(message.content, str) else ""
     kind = human_kind(message)
 
-    if kind in ("market-watch", "credit-gate", "runtime-context", "orchestrator"):
+    if kind in (
+        "market-watch",
+        "credit-gate",
+        "runtime-context",
+        "orchestrator",
+        "empty-call-retry",
+    ):
         # Model-facing only. Returning here rather than falling through also
         # keeps them out of a task namespace's ``user-message`` projection,
         # where the raw reminder would surface as if the user had typed it.
@@ -536,6 +542,8 @@ MODEL_FALLBACK_UI_NAME = "model_fallback"
 MODEL_FALLBACK_FIELDS = (
     "from_model",
     "to_model",
+    "to_paid_by",
+    "to_provider",
     "from_is_primary",
     "error_type",  # DALTON-HOOK(fallback-reason-log)
     "status_code",

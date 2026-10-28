@@ -25,7 +25,7 @@ from ptc_agent.agent.middleware.compaction.compact import Summarizer
 from ptc_agent.agent.middleware.compaction.measure import Estimate
 from ptc_agent.agent.middleware.compaction.middleware import CompactionMiddleware
 from ptc_agent.agent.middleware.compaction.summarize import PROVIDER_LEAD
-from ptc_agent.agent.middleware.compaction.summary_request import NATIVE_SUMMARY_PROMPT
+from ptc_agent.agent.middleware.compaction.summary_request import summary_prompt
 from ptc_agent.agent.middleware.compaction.types import CONTEXT_SUMMARY_PREFIX
 from ptc_agent.agent.middleware.compaction.utils import parse_summary_message, summary_source
 from src.llms.provider_compaction import COMPACTION_BETA, SIDECAR_KEY, is_compaction_request
@@ -157,7 +157,7 @@ class TestClaude:
         (sent,) = run.handler.compaction_requests
         assert sent.model_settings["extra_body"]["compaction"] == {
             "type": "summarize",
-            "instructions": NATIVE_SUMMARY_PROMPT,
+            "instructions": summary_prompt("native", True),
         }
         assert sent.model_settings["max_tokens"] == 1000
         assert sent.system_message.content == "the agent's system prompt"

@@ -363,6 +363,7 @@ async def _handle_send_message(
     — a forged value could chain a new attempt onto an arbitrary failed run.
     """
     from src.server.handlers.chat import astream_ptc_workflow
+    from src.server.handlers.chat.image_intake import inline_image_urls
     from src.server.handlers.chat.error_handling import end_after_failure_frame
     from src.server.services.turn_runtime import requested_workspace, turn_route
 
@@ -419,6 +420,16 @@ async def _handle_send_message(
         if needs_plan and auth.access_tier is None:
             raise quota_service_unavailable()
         if needs_plan and auth.access_tier < 0:
+            # A flagged subscription does not count as a provider, but it is
+            # the user's, and reconnecting it is the fix rather than setup.
+            from src.server.database.oauth_tokens import flagged_oauth_connection
+            from src.server.services.llm.availability import raise_oauth_reauth_required
+            from src.server.services.oauth_providers import SUBSCRIPTIONS
+
+            flagged = await flagged_oauth_connection(user_id)
+            subscription = SUBSCRIPTIONS.get(flagged["provider"]) if flagged else None
+            if subscription is not None:
+                raise_oauth_reauth_required(subscription, None, flagged["last_error_code"])
             raise HTTPException(
                 status_code=403,
                 detail={
@@ -667,6 +678,8 @@ async def _handle_send_message(
         # the transport the run's first buffered event would kill it as
         # failed(transport_lost) anyway — refuse cheaply instead.
         await _assert_stream_transport_ready()
+
+        request = await inline_image_urls(request)
 
         await route.bind(user_id, workspace)
 

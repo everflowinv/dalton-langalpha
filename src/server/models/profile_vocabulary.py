@@ -57,15 +57,13 @@ BROKERAGES = (
 )
 
 # How the user wants the agent to work with them by default: how much
-# research a question gets, what an answer usually is, and when the agent
-# reaches out.
+# research a question gets, how an answer with substance is handed back, and
+# when the agent reaches out.
 RESEARCH_DEPTHS = ("light", "adaptive", "thorough")
-# A report is not one of these: it is ``output_format: "html"``, which
-# Settings toggles and which selects a section of the prompt of its own.
-DELIVERABLES = ("text", "visual")
 PROACTIVITY_LEVELS = ("proactive", "when_needed", "on_request")
-# Absent is markdown: Settings' switch writes null to go back to it.
-OUTPUT_FORMATS = ("markdown", "html")
+# Ranked, most preferred first. A report is the visual answer's long form, so
+# the agent picks between it and a widget by the answer rather than the rank.
+OUTPUT_FORMATS = ("visual", "markdown", "text")
 
 # Sectors are the user's own words, so they are bounded rather than listed:
 # each one is a line item in the prompt's profile block.
@@ -155,14 +153,6 @@ STRUCTURED_PREFERENCES: dict[str, dict[str, _Vocabulary]] = {
                 "(as much as the question needs), `thorough` (research before every answer)"
             ),
         ),
-        "deliverable": _Vocabulary(
-            DELIVERABLES,
-            doc=(
-                "What an answer with substance usually is: `text` (text in the chat) or "
-                "`visual` (interactive charts and dashboards in the chat). A report is not "
-                'one of these: it is `"output_format": "html"`, which overrides this key'
-            ),
-        ),
         "proactivity": _Vocabulary(
             PROACTIVITY_LEVELS,
             doc=(
@@ -172,9 +162,14 @@ STRUCTURED_PREFERENCES: dict[str, dict[str, _Vocabulary]] = {
         ),
         "output_format": _Vocabulary(
             OUTPUT_FORMATS,
+            many=True,
             doc=(
-                "`markdown` (the default) or `html`, which makes a styled HTML report the "
-                "user's usual deliverable"
+                "How the user prefers an answer with substance handed back, most preferred "
+                "first: `visual` (an interactive chart or dashboard in the chat for a short "
+                "result or a quick look, a styled HTML report for a long one or one to keep "
+                "or share), `markdown` (the full findings in a Markdown file, with a short "
+                "reply), `text` (text in the chat). A simple question is answered in the "
+                "chat whatever the order"
             ),
         ),
     },
@@ -220,6 +215,22 @@ def _checked_column(
     column: str, values: Mapping[str, Any], stored: Any, problems: list[tuple[str, str]]
 ) -> dict[str, Any]:
     before = stored if isinstance(stored, Mapping) else {}
+    if column == "agent_preference" and (
+        values.get("output_format") in _LEGACY_FORMS
+        or values.get("deliverable") in _LEGACY_DELIVERABLES
+    ):
+        # A tab still on the build before migration 096 sends the two keys
+        # the ranking replaced, often only the one it changed. They are saved
+        # as the ranking 096 wrote for them, so the stored ranking never sits
+        # beside a deliverable that contradicts it.
+        stale = (values.get("deliverable"), before.get("deliverable"))
+        upgraded = upgraded_agent_preference(values)
+        values = {**upgraded, "output_format": upgraded.get("output_format")}
+        form = values["output_format"]
+        if "deliverable" not in upgraded and any(d in _LEGACY_DELIVERABLES for d in stale) and (
+            form is None or _is_ranking(form)
+        ):
+            values["deliverable"] = None
     checked = dict(values)
     for key, vocab in STRUCTURED_PREFERENCES[column].items():
         value = values.get(key)
@@ -328,21 +339,71 @@ def structured_preferences(preferences: Mapping[str, Any] | None) -> dict[str, A
     return flat
 
 
+# Until migration 096 the answer's form was two keys: ``deliverable`` (``text``
+# or ``visual``) and ``output_format`` (``html`` for a report, ``markdown`` for
+# none chosen). Each old value maps to the ranking 096 wrote for it.
+_LEGACY_FORMS = ("html", "markdown")
+_LEGACY_DELIVERABLES = ("text", "visual")
+_LEGACY_RANKINGS = {
+    "html": ["visual", "markdown", "text"],
+    "visual": ["visual", "markdown", "text"],
+    "text": ["text", "markdown", "visual"],
+}
+
+
+def _is_ranking(value: Any) -> bool:
+    return isinstance(value, list) and bool(value) and all(item in OUTPUT_FORMATS for item in value)
+
+
+def upgraded_agent_preference(agent_preference: Mapping[str, Any] | None) -> dict[str, Any]:
+    """``agent_preference`` with the answer's form in its current shape.
+
+    A profile frozen in a thread before migration 096, a cached read, or a tab
+    still running the old build can hold the two keys the ranking replaced.
+    Read as the ranking 096 wrote for them, such a profile renders and compares
+    the same as the migrated row, and ``deliverable`` never reaches the prompt
+    as an instruction in the user's words. A value outside the old vocabularies
+    is the user's own words, and is left as it is.
+    """
+    prefs = dict(agent_preference) if isinstance(agent_preference, Mapping) else {}
+    form = prefs.get("output_format")
+    deliverable = prefs.get("deliverable")
+    if deliverable not in _LEGACY_DELIVERABLES:
+        deliverable = None
+    if _is_ranking(form) and deliverable is not None:
+        del prefs["deliverable"]
+    if form is not None and form not in _LEGACY_FORMS:
+        return prefs
+    if form is None and deliverable is None:
+        return prefs
+    prefs.pop("output_format", None)
+    if deliverable is not None:
+        del prefs["deliverable"]
+    ranking = _LEGACY_RANKINGS.get(form or "") or _LEGACY_RANKINGS.get(deliverable or "")
+    if ranking:
+        prefs["output_format"] = list(ranking)
+    return prefs
+
+
 def prompt_preferences(
     agent_preference: Mapping[str, Any] | None,
-) -> tuple[dict[str, Any], dict[str, str]]:
+) -> tuple[dict[str, Any], dict[str, Any]]:
     """``agent_preference`` split the way the prompt reads it: the keys it
     prints as the user wrote them, and the structured keys whose value
-    selects guidance instead (``output_format: "html"``, the report, among
-    them).
+    selects guidance instead (the ``output_format`` ranking among them).
 
     A structured key holding a value outside its vocabulary, such as free text
     written before the key had one, stays with the printed keys, so the user's
     words still reach the model.
     """
-    printed = dict(agent_preference) if isinstance(agent_preference, Mapping) else {}
-    steering: dict[str, str] = {}
+    printed = upgraded_agent_preference(agent_preference)
+    steering: dict[str, Any] = {}
     for key, vocab in STRUCTURED_PREFERENCES["agent_preference"].items():
-        if printed.get(key) in (vocab.choices or ()):
+        value = printed.get(key)
+        choices = vocab.choices or ()
+        if vocab.many:
+            if isinstance(value, list) and value and all(item in choices for item in value):
+                steering[key] = list(dict.fromkeys(printed.pop(key)))
+        elif value in choices:
             steering[key] = printed.pop(key)
     return printed, steering

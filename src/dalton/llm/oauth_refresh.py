@@ -28,6 +28,11 @@ class OAuthRebuildSpec:
     reasoning_effort: str | None = None
     service_tier: str | None = None
     cache_key: str | None = None
+    # A custom model of this name shadowing the manifest (an untuned model the
+    # subscription lists): without it a rebuild cannot re-resolve a model the
+    # manifest alone does not carry, and a 401 mid-turn fails the turn instead
+    # of rebuilding it (DALTON-HOOK(oauth-dispatch)).
+    custom_entry: dict | None = None
 
 
 def token_digest(access_token: str) -> str:
@@ -58,6 +63,7 @@ async def _resolve(spec: OAuthRebuildSpec) -> Any | None:
         spec.reasoning_effort,
         service_tier=spec.service_tier,
         cache_key=spec.cache_key,
+        custom_entry=spec.custom_entry,
     )
 
 

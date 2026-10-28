@@ -1,5 +1,5 @@
-"""DALTON-HOOK(html-md-canonical): with output_format=html, Dalton skill
-deliverables stay Markdown and HTML is made only at formal publication."""
+"""DALTON-HOOK(html-md-canonical): when visual is ranked first in output_format,
+Dalton skill deliverables stay Markdown and HTML is made only at formal publication."""
 
 import pytest
 
@@ -27,20 +27,38 @@ def _reset_loader():
     reset_loader()
 
 
-def test_html_preference_gets_dalton_narrowing():
-    out = _render({"output_format": "html"})
+@pytest.mark.parametrize(
+    "pref",
+    [
+        {"output_format": ["visual", "markdown", "text"]},
+        {"output_format": ["visual", "text", "markdown"]},
+        {"output_format": ["visual"]},
+        {"output_format": "html"},
+        {"deliverable": "visual"},
+    ],
+)
+def test_visual_first_preference_gets_dalton_narrowing(pref):
+    out = _render(pref)
     assert NARROWING in out
-    assert out.index("Output Format: Styled HTML") < out.index(NARROWING)
+    assert out.index("1. A visual answer.") < out.index(NARROWING)
     assert "only at formal publication" in out
     assert "`publish_report`" in out
     assert "Do not pass it to `publish_report`" in out
-    assert "where no skill or workflow names an output file, may still go straight to HTML" in out
+    assert "where no skill or workflow names an output file, may still use a visual answer" in out
     assert "`drafts/foo.md` → `drafts/foo.html`" in out
 
 
 @pytest.mark.parametrize(
     "pref,steer",
-    [({"output_format": "markdown"}, True), ({"output_format": "html"}, False), (None, True)],
+    [
+        ({"output_format": ["markdown", "visual", "text"]}, True),
+        ({"output_format": ["text", "visual", "markdown"]}, True),
+        ({"output_format": "markdown"}, True),
+        ({"deliverable": "text"}, True),
+        ({"output_format": ["visual", "markdown", "text"]}, False),
+        ({"output_format": "html"}, False),
+        (None, True),
+    ],
 )
-def test_no_narrowing_without_html_main_agent(pref, steer):
+def test_no_narrowing_without_visual_first_main_agent(pref, steer):
     assert NARROWING not in _render(pref, main_agent_steering=steer)

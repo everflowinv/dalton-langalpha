@@ -18,13 +18,16 @@ import type { WidgetRenderProps } from '../types';
 import type { PortfolioRow } from '../../hooks/usePortfolioData';
 import { deriveQuoteDisplay, formatSignedPct2, roundQuote2, type MarketStatusInput } from '@/lib/quotes'; // DALTON-HOOK(extended-hours-quotes)
 import { watchlistQuoteRow } from '../../hooks/useWatchlistData';
+import { WidgetCardMeta } from '../framework/widgetCardSlots';
 import {
   HoldingsAddButton,
   HoldingsSkeleton,
   useHoldingsSkeletonRows,
   PortfolioNavSummary,
   PortfolioRowItem,
+  PortfolioTable,
   WatchlistRowItem,
+  WatchlistTable,
 } from './_holdingsPrimitives';
 import { formatPortfolioNavMarkdownLine, portfolioSummary } from './_holdingsHelpers';
 import { normalizePortfolioCurrency } from '../../utils/portfolioSummary';
@@ -203,10 +206,14 @@ function PortfolioWatchlistWidget({
   });
 
   // The tabs dissolve in one cell at the same scroll offset, so a tab opens at
-  // its top rather than out of view below a short list.
+  // its top rather than out of view below a short list. The list scrolls in
+  // its own box, or, once the widget is past its height cap, in the card's.
   const contentRef = useRef<HTMLDivElement>(null);
   const switchTab = (tab: PWTabKey) => {
-    if (tab !== activeTab) contentRef.current?.scrollTo({ top: 0 });
+    if (tab !== activeTab) {
+      contentRef.current?.scrollTo({ top: 0 });
+      contentRef.current?.closest('.widget-card__body')?.scrollTo({ top: 0 });
+    }
     setActiveTab(tab);
     updateConfig({ defaultTab: tab });
   };
@@ -227,121 +234,72 @@ function PortfolioWatchlistWidget({
   const activeCount =
     activeTab === 'watchlist' ? watchlist.rows.length : portfolio.rows.length;
 
+  const tabs: { key: PWTabKey; label: string }[] = [
+    { key: 'watchlist', label: t('dashboard.widgets.portfolioWatchlist.headerWatchlist') },
+    { key: 'portfolio', label: t('dashboard.widgets.portfolioWatchlist.headerHoldings') },
+  ];
+
   return (
-    <div className="dashboard-glass-card p-5 flex flex-col h-full">
-      <div
-        className="flex items-baseline justify-between mb-3 pb-3 border-b"
-        style={{ borderColor: 'var(--color-border-muted)' }}
-      >
-        <div className="flex items-baseline gap-2.5 min-w-0">
-          <Wallet
-            className="h-3.5 w-3.5 shrink-0 self-center"
-            style={{ color: 'var(--color-text-tertiary)' }}
-          />
-          <span
-            className="text-[0.625rem] font-semibold uppercase tracking-[0.14em]"
-            style={{ color: 'var(--color-text-secondary)' }}
-          >
-            {activeTab === 'watchlist'
-              ? t('dashboard.widgets.portfolioWatchlist.headerWatchlist')
-              : t('dashboard.widgets.portfolioWatchlist.headerHoldings')}
-          </span>
-          {/* Held but unseen while the rows load: a count of 0 that turns into
-              the real one reads as a change, not a load. */}
-          <span
-            className="title-font text-lg leading-none dashboard-mono"
-            style={{ color: 'var(--color-text-primary)', visibility: showSkeleton ? 'hidden' : undefined }}
-          >
-            {activeCount}
-          </span>
-        </div>
-        <div
-          className="flex rounded-full p-[2px]"
-          style={{ backgroundColor: 'var(--color-bg-subtle)' }}
-        >
+    <div className="widget-term dash-fill">
+      {/* Held but unseen while the rows load: a count of 0 that turns into
+          the real one reads as a change, not a load. */}
+      {!showSkeleton && <WidgetCardMeta>{activeCount}</WidgetCardMeta>}
+      <div className="dash-chips" role="group">
+        {tabs.map((tab) => (
           <button
+            key={tab.key}
             type="button"
-            onClick={() => switchTab('watchlist')}
-            className="px-2.5 py-[3px] text-[0.6563rem] uppercase tracking-wider rounded-full transition-colors"
-            style={{
-              backgroundColor:
-                activeTab === 'watchlist' ? 'var(--color-bg-card)' : 'transparent',
-              color:
-                activeTab === 'watchlist'
-                  ? 'var(--color-text-primary)'
-                  : 'var(--color-text-tertiary)',
-              boxShadow:
-                activeTab === 'watchlist'
-                  ? '0 1px 2px rgba(0,0,0,0.04)'
-                  : 'none',
-            }}
+            className="term-chip widget-drag-cancel"
+            // Named outright: Terminal draws the chip's brackets as generated
+            // content, which would otherwise be read as part of its name.
+            aria-label={tab.label}
+            aria-pressed={activeTab === tab.key}
+            onClick={() => switchTab(tab.key)}
           >
-            {t('dashboard.widgets.portfolioWatchlist.tabWatch')}
+            {tab.label}
           </button>
-          <button
-            type="button"
-            onClick={() => switchTab('portfolio')}
-            className="px-2.5 py-[3px] text-[0.6563rem] uppercase tracking-wider rounded-full transition-colors"
-            style={{
-              backgroundColor:
-                activeTab === 'portfolio' ? 'var(--color-bg-card)' : 'transparent',
-              color:
-                activeTab === 'portfolio'
-                  ? 'var(--color-text-primary)'
-                  : 'var(--color-text-tertiary)',
-              boxShadow:
-                activeTab === 'portfolio'
-                  ? '0 1px 2px rgba(0,0,0,0.04)'
-                  : 'none',
-            }}
-          >
-            {t('dashboard.widgets.portfolioWatchlist.tabHoldings')}
-          </button>
-        </div>
+        ))}
       </div>
 
       {/* The tabs dissolve in one grid cell, so a switch never passes through
           an empty widget. A tab the reader picks rises; the skeleton giving way
           to its rows crossfades, and rows present at first render never enter
           one by one. */}
-      <div ref={contentRef} className="flex-1 min-h-0 overflow-y-auto pr-1">
+      <div ref={contentRef} className="dash-scroll">
         <SwapCell
           as="div"
           className="items-start"
           riseKey={activeTab}
           swapKey={`${activeTab}:${showSkeleton ? 'loading' : 'ready'}`}
-          layerClassName="flex flex-col gap-1"
         >
           {activeTab === 'watchlist' ? (
-            <>
-              {showWatchlistSkeleton ? (
-                <HoldingsSkeleton count={watchlistSkeletonRows} />
-              ) : (
-                <AnimatePresence initial={false}>
-                  {watchlist.rows.map((row) => (
-                    <div
-                      key={row.watchlist_item_id ?? row.symbol}
-                      className="row-attach-host relative"
-                    >
+            <div>
+              <WatchlistTable>
+                {showWatchlistSkeleton ? (
+                  <HoldingsSkeleton count={watchlistSkeletonRows} />
+                ) : (
+                  <AnimatePresence initial={false}>
+                    {watchlist.rows.map((row) => (
                       <WatchlistRowItem
+                        key={row.watchlist_item_id ?? row.symbol}
                         item={row}
                         marketStatus={dashboard.marketStatus}
                         onDelete={watchlistHandlers.onDelete}
+                        attach={
+                          <RowAttachButton
+                            instanceId={instance.id}
+                            rowId={String(row.watchlist_item_id ?? row.symbol)}
+                          />
+                        }
                       />
-                      <span className="absolute right-1 top-1/2 -translate-y-1/2">
-                        <RowAttachButton
-                          instanceId={instance.id}
-                          rowId={String(row.watchlist_item_id ?? row.symbol)}
-                        />
-                      </span>
-                    </div>
-                  ))}
-                </AnimatePresence>
-              )}
+                    ))}
+                  </AnimatePresence>
+                )}
+              </WatchlistTable>
               <HoldingsAddButton label={t('dashboard.widgets.portfolioWatchlist.addSymbol')} onClick={watchlistHandlers.onAdd} />
-            </>
+            </div>
           ) : (
-            <>
+            <div>
               {hasRealHoldings && (
                 <PortfolioNavSummary
                   rows={portfolio.rows}
@@ -349,36 +307,32 @@ function PortfolioWatchlistWidget({
                   onToggleHidden={toggleHidden}
                 />
               )}
-
-              {showPortfolioSkeleton ? (
-                <HoldingsSkeleton count={portfolioSkeletonRows} />
-              ) : (
-                <AnimatePresence initial={false}>
-                  {portfolio.rows.map((row) => (
-                    <div
-                      key={row.user_portfolio_id ?? row.symbol}
-                      className="row-attach-host relative"
-                    >
+              <PortfolioTable>
+                {showPortfolioSkeleton ? (
+                  <HoldingsSkeleton count={portfolioSkeletonRows} cols={4} />
+                ) : (
+                  <AnimatePresence initial={false}>
+                    {portfolio.rows.map((row) => (
                       <PortfolioRowItem
+                        key={row.user_portfolio_id ?? row.symbol}
                         item={row}
                         marketStatus={dashboard.marketStatus}
                         valuesHidden={valuesHidden}
                         onEdit={portfolioHandlers.onEdit}
                         onDelete={portfolioHandlers.onDelete}
+                        attach={
+                          <RowAttachButton
+                            instanceId={instance.id}
+                            rowId={String(row.user_portfolio_id ?? row.symbol)}
+                          />
+                        }
                       />
-                      <span className="absolute right-1 top-1/2 -translate-y-1/2">
-                        <RowAttachButton
-                          instanceId={instance.id}
-                          rowId={String(row.user_portfolio_id ?? row.symbol)}
-                        />
-                      </span>
-                    </div>
-                  ))}
-                </AnimatePresence>
-              )}
-
+                    ))}
+                  </AnimatePresence>
+                )}
+              </PortfolioTable>
               <HoldingsAddButton label={t('dashboard.widgets.portfolioWatchlist.addTransaction')} onClick={portfolioHandlers.onAdd} />
-            </>
+            </div>
           )}
         </SwapCell>
       </div>
@@ -389,14 +343,17 @@ function PortfolioWatchlistWidget({
 registerWidget<PortfolioWatchlistConfig>({
   type: 'personal.portfolioWatchlist',
   titleKey: 'dashboard.widgets.portfolioWatchlist.title',
+  cardTitleKey: 'dashboard.widgets.portfolioWatchlist.cardTitle',
   descriptionKey: 'dashboard.widgets.portfolioWatchlist.description',
   category: 'personal',
   icon: Wallet,
   component: PortfolioWatchlistWidget,
   defaultConfig: { defaultTab: 'watchlist', valuesHidden: false },
   configSchema: PortfolioWatchlistConfigSchema,
-  defaultSize: { w: 4, h: 30 },
-  minSize: { w: 3, h: 18 },
+  defaultSize: { w: 4, h: 18 },
+  minSize: { w: 3, h: 10 },
+  maxSize: { w: 12, h: 30 },
+  fitToContent: true,
 });
 
 export default PortfolioWatchlistWidget;

@@ -5,6 +5,7 @@
  */
 import { api } from '@/api/client';
 import { getAuthHeaders } from '@/lib/authToken';
+import { holdReload } from '@/lib/reloadHolds';
 
 export const baseURL = api.defaults.baseURL;
 
@@ -212,41 +213,48 @@ export async function postSSEStream(
   },
 ): Promise<{ disconnected: boolean; aborted: boolean; contentLocation: string | null }> {
   const { onRunIdResolved, signal } = opts;
-  const authHeaders = await getAuthHeaders();
-  // A retransmit that raced past the route's duplicate check is refused in
-  // the stream, by the same answer the route gives as a 409. It reaches the
-  // caller as that 409, so one recovery handles both: the stream's turn is
-  // the copy that arrived, not a failure of this one.
-  let duplicate: Record<string, unknown> | null = null;
-  const onEvent = (event: Record<string, unknown>) => {
-    if (event.event === 'error' && event.code === 'duplicate_request') {
-      duplicate = event;
-      return;
-    }
-    opts.onEvent(event);
-  };
-  const result = await streamFetch(
-    path,
-    {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Accept': 'text/event-stream',
-        ...authHeaders,
+  // A send holds the stale-build reload until the server has the message, a
+  // token refresh before it included; from its headers on, the turn runs there
+  // and a reload reattaches to it.
+  const release = holdReload();
+  try {
+    const authHeaders = await getAuthHeaders();
+    // A retransmit that raced past the route's duplicate check is refused in
+    // the stream, by the same answer the route gives as a 409. It reaches the
+    // caller as that 409, so one recovery handles both: the stream's turn is
+    // the copy that arrived, not a failure of this one.
+    let duplicate: Record<string, unknown> | null = null;
+    const onEvent = (event: Record<string, unknown>) => {
+      if (event.event === 'error' && event.code === 'duplicate_request') {
+        duplicate = event;
+        return;
+      }
+      opts.onEvent(event);
+    };
+    const result = await streamFetch(
+      path,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'text/event-stream',
+          ...authHeaders,
+        },
+        body: JSON.stringify(body),
+        ...(signal ? { signal } : {}),
       },
-      body: JSON.stringify(body),
-      ...(signal ? { signal } : {}),
-    },
-    onEvent,
-    onRunIdResolved
-      ? (contentLocation) => {
-          const runId = parseRunIdFromContentLocation(contentLocation);
-          if (runId) onRunIdResolved(runId, parseThreadIdFromContentLocation(contentLocation));
-        }
-      : undefined,
-  );
-  if (duplicate && !result.aborted) throw duplicateRequestError(duplicate);
-  return result;
+      onEvent,
+      (contentLocation) => {
+        release();
+        const runId = parseRunIdFromContentLocation(contentLocation);
+        if (runId && onRunIdResolved) onRunIdResolved(runId, parseThreadIdFromContentLocation(contentLocation));
+      },
+    );
+    if (duplicate && !result.aborted) throw duplicateRequestError(duplicate);
+    return result;
+  } finally {
+    release();
+  }
 }
 
 /** The route's 409 for a frame carrying the same refusal. The frame names the

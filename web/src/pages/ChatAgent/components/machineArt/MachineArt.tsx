@@ -9,8 +9,9 @@
  * from tokens.css, lit from the upper left, never a gradient. The one colour
  * in it is the machine's light, which says what its status line says.
  */
-import { useId, type CSSProperties, type ReactNode } from 'react';
+import { useEffect, useId, useState, type CSSProperties, type ReactNode } from 'react';
 
+import { DURATION } from '@/lib/motion';
 import type { ResourceTier } from '@/types/api';
 
 import type { MachineArtKind, MachineState } from './machine';
@@ -171,10 +172,28 @@ function SetupLog({ w, h }: { w: number; h: number }) {
   );
 }
 
+/**
+ * True while `on`, and for `ms` after, so what leaves can fade out where it
+ * stood rather than vanish under what fades in.
+ */
+function useLinger(on: boolean, ms: number): boolean {
+  const [shown, setShown] = useState(on);
+  if (on && !shown) setShown(true);
+  useEffect(() => {
+    if (on || !shown) return;
+    const timer = setTimeout(() => setShown(false), ms);
+    return () => clearTimeout(timer);
+  }, [on, shown, ms]);
+  return on || shown;
+}
+
 /** A screen: dark glass, the setup log while the machine gets ready, the
- *  picture fading in while it runs, a faint glare. */
+ *  picture fading in while it runs, a faint glare. The log fades out as the
+ *  picture fades in: cut at once, a start quicker than the log showed an empty
+ *  screen between the two. */
 function Screen({ x, y, w, h, state, term = false, rt = 0 }: { x: number; y: number; w: number; h: number; state: MachineState; term?: boolean; rt?: number }) {
   const id = useClipId();
+  const setup = useLinger(state === 'prep', DURATION.fold * 1000);
   return (
     <>
       <clipPath id={id}>
@@ -183,7 +202,11 @@ function Screen({ x, y, w, h, state, term = false, rt = 0 }: { x: number; y: num
       <g clipPath={`url(#${id})`}>
         <g transform={`translate(${x} ${y})`}>
           <rect width={w} height={h} className="ma-glass" />
-          {state === 'prep' && <SetupLog w={w} h={h} />}
+          {setup && (
+            <g className="ma-screen" style={{ opacity: state === 'prep' ? 1 : 0 }}>
+              <SetupLog w={w} h={h} />
+            </g>
+          )}
           <g className="ma-screen" style={{ opacity: state === 'on' ? 1 : 0 }}>
             {term ? <TermScreen w={w} h={h} /> : <AppScreen w={w} h={h} />}
           </g>

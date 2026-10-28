@@ -411,6 +411,9 @@ export interface OrderOutcome {
   decision_message?: string | null;
   executed_at?: string | null;
   completed_at?: string | null;
+  /** The ledger's stamp for an order a vendor listing stopped carrying; see
+   *  `vendorNamedEnd`. Absent on a receipt frozen before it was sent. */
+  unlisted_at?: string | null;
 }
 
 /**

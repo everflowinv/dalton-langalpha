@@ -203,7 +203,7 @@ Item fields (inside `items`):
   },
   "agent_preference": {
     "research_depth": "adaptive",
-    "deliverable": "visual",
+    "output_format": ["visual", "markdown", "text"],
     "proactivity": "when_needed",
     "tone": "plain words, no jargon"
   }

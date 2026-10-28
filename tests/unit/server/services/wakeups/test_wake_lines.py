@@ -225,6 +225,32 @@ def _order_row(outcome: dict, **over) -> dict:
             {"outcome": "failed", "reason": "the vendor timed out"},
             f"Your order ended unfilled: {ORDER} (order 7712045) failed: the vendor timed out.",
         ),
+        (
+            {
+                "outcome": "partial_expired",
+                "filled_qty": 40,
+                "qty": 100,
+                "avg_fill_price": 199.95,
+            },
+            f"Your order ended partly filled: {ORDER} (order 7712045), 40 of 100 at an average"
+            " $199.95, then expired at 10:31 EDT.",
+        ),
+        (
+            {"outcome": "expired"},
+            f"Your order ended unfilled: {ORDER} (order 7712045) expired at 10:31 EDT.",
+        ),
+        (
+            {"outcome": "confirmed"},
+            f"Your order was confirmed at the brokerage and sent there as a live order:"
+            f" {ORDER} (order 7712045), at 10:31 EDT. Its fills show in the brokerage's own"
+            " orders.",
+        ),
+        (
+            {"outcome": "handed_off"},
+            f"Your staged order left the brokerage's instruction list: {ORDER} (order 7712045)"
+            " was sent, deleted or expired there by 10:31 EDT, and the brokerage does not say"
+            " which.",
+        ),
     ],
 )
 def test_an_order_line_for_each_way_an_order_ends(outcome, expected):

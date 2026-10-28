@@ -174,6 +174,7 @@ vi.mock('@/pages/ChatAgent/components/dalton/TeamSharing', () => ({
   TeamReadOnlyBanner: () => null,
   TeamReadOnlyComposer: () => <div data-testid="mock-readonly-composer" />,
   useTeamReadOnly: () => STABLE_TEAM_READ_ONLY,
+  useTeamWorkspaces: () => ({ data: undefined }),
 }));
 
 vi.mock('@/pages/ChatAgent/components/dalton/WorkspaceTrackingToggle', () => ({

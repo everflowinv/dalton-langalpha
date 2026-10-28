@@ -40,6 +40,9 @@ from src.dalton.llm.providers.xai_grok.client import (
     has_stream_started,
     mark_xai_exception,
 )
+import src.server.services.oauth_health as oauth_health_mod
+import src.server.services.oauth_providers as oauth_providers_mod
+import src.server.services.oauth_refresh_wait as oauth_refresh_wait_mod
 from src.dalton.llm.providers.xai_grok.oauth import (
     XAI_REFRESH_HARD_TIMEOUT_S,
     XAI_REFRESH_LOCK_TTL_MS,
@@ -47,7 +50,6 @@ from src.dalton.llm.providers.xai_grok.oauth import (
     extract_token_record,
     fetch_xai_billing,
     fetch_xai_models,
-    get_valid_token,
     poll_device_authorization,
     poll_device_token_loop,
     refresh_tokens,
@@ -397,6 +399,11 @@ async def test_refresh_tokens_keeps_old_refresh_and_retries_only_cloudflare(
 
 @pytest.mark.asyncio
 async def test_get_valid_token_redis_lock_and_upsert(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The xAI line serves through the unified refresh protocol: the registry
+    adapter keeps the Cloudflare-retry refresh, a fresh TokenSet carries the
+    SuperGrok plan, and the save is the conditional replace on the holder's
+    row — never a blind upsert. The sign-in save (``save_xai_tokens``) still
+    upserts, from the poll's connection lock."""
     monkeypatch.setenv("DALTON_XAI_OAUTH_CLIENT_ID", "test-grok-build-client")
     expired_at = datetime.now(timezone.utc) - timedelta(minutes=2)
     stored_row = {
@@ -409,22 +416,14 @@ async def test_get_valid_token_redis_lock_and_upsert(monkeypatch: pytest.MonkeyP
         "expires_at": expired_at,
     }
     monkeypatch.setattr(
-        xai_oauth_mod,
+        oauth_health_mod,
         "get_oauth_tokens",
-        create_autospec(xai_oauth_mod.get_oauth_tokens, return_value=stored_row),
+        create_autospec(oauth_health_mod.get_oauth_tokens, return_value=dict(stored_row)),
     )
+    fake_replace = create_autospec(oauth_tokens_db.replace_refreshed_tokens, return_value=True)
+    monkeypatch.setattr(oauth_health_mod, "replace_refreshed_tokens", fake_replace)
     fake_upsert = create_autospec(xai_oauth_mod.upsert_oauth_tokens, return_value=None)
     monkeypatch.setattr(xai_oauth_mod, "upsert_oauth_tokens", fake_upsert)
-    monkeypatch.setattr(
-        xai_oauth_mod,
-        "invalidate_oauth_active_cache",
-        create_autospec(xai_oauth_mod.invalidate_oauth_active_cache, return_value=None),
-    )
-    monkeypatch.setattr(
-        xai_oauth_mod,
-        "_record_provider_event_safe",
-        create_autospec(xai_oauth_mod._record_provider_event_safe, return_value=None),
-    )
 
     fake_cache = create_autospec(RedisCacheClient(), instance=True)
     fake_cache.acquire_lock.return_value = True
@@ -446,20 +445,25 @@ async def test_get_valid_token_redis_lock_and_upsert(monkeypatch: pytest.MonkeyP
         create_autospec(xai_oauth_mod.refresh_tokens, return_value=rec),
     )
 
-    tok = await get_valid_token("user-123")
+    tok = await oauth_health_mod.valid_token("user-123", "xai-oauth")
     assert tok is not None
-    assert tok["access_token"] == new_jwt
-    assert tok["plan_type"] == "supergrok"
+    assert tok.access_token == new_jwt
+    # The CLI answer names no plan; the adapter stands the SuperGrok plan in.
+    assert tok.plan_type == "supergrok"
     fake_cache.acquire_lock.assert_awaited_once()
     fake_cache.release_lock.assert_awaited_once()
-    fake_upsert.assert_awaited_once()
-    upsert_kwargs = fake_upsert.call_args.kwargs
-    assert upsert_kwargs["provider"] == "xai-oauth"
-    assert upsert_kwargs["plan_type"] == "supergrok"
-    assert upsert_kwargs["refresh_token"] == "persisted-refresh"
+    fake_replace.assert_awaited_once()
+    replace_kwargs = fake_replace.call_args.kwargs
+    assert replace_kwargs["spent_refresh_token"] == "persisted-refresh"
+    assert fake_replace.call_args.args == ("user-123", "xai-oauth")
+    assert replace_kwargs["plan_type"] == "supergrok"
+    assert replace_kwargs["refresh_token"] == "persisted-refresh"
+    # The unified refresh path never blindly upserts.
+    fake_upsert.assert_not_awaited()
 
+    # The sign-in save is a plain upsert (over the poll's connection lock).
     await save_xai_tokens("user-123", rec)
-    assert fake_upsert.await_count == 2
+    assert fake_upsert.await_count == 1
 
 
 # ---------------------------------------------------------------------------
@@ -747,31 +751,38 @@ async def test_budget_mapping_and_provider_status_row(monkeypatch: pytest.Monkey
     assert role_policy_mod.family_of("grok-4.3-oauth") == "xai-grok"
     assert role_policy_mod.family_of("grok-4.7-build-fast-oauth") == "xai-grok"
 
-    # provider_status row for xai-oauth calls get_valid_token first, then fetch_xai_billing
+    # provider_status row for xai-oauth reads its billing through the unified
+    # refresh protocol (valid_token), then fetch_xai_billing
     expires_dt = datetime.now(timezone.utc) + timedelta(hours=1)
 
-    async def _fake_oauth_status(user_id: str, provider: str) -> dict[str, Any]:
+    async def _fake_oauth_connection(user_id: str, provider: str) -> dict[str, Any]:
         if provider == "xai-oauth":
             return {
-                "connected": True,
                 "email": "analyst@dalton.fund",
                 "plan_type": "supergrok",
                 "expires_at": expires_dt,
             }
-        return {"connected": False}
+        return None
 
     monkeypatch.setattr(
         oauth_tokens_db,
-        "get_oauth_status",
-        create_autospec(oauth_tokens_db.get_oauth_status, side_effect=_fake_oauth_status),
+        "get_oauth_connection",
+        create_autospec(oauth_tokens_db.get_oauth_connection, side_effect=_fake_oauth_connection),
     )
+    from src.server.services.oauth_protocol import TokenSet
+
     mock_get_valid_token = create_autospec(
-        xai_oauth_mod.get_valid_token,
-        return_value={"access_token": "tok-xai-refreshed", "plan_type": "supergrok"},
+        oauth_health_mod.valid_token,
+        return_value=TokenSet(
+            access_token="tok-xai-refreshed",
+            refresh_token="",
+            expires_at=expires_dt,
+            plan_type="supergrok",
+        ),
     )
     monkeypatch.setattr(
-        xai_oauth_mod,
-        "get_valid_token",
+        oauth_health_mod,
+        "valid_token",
         mock_get_valid_token,
     )
     mock_fetch_billing = create_autospec(
@@ -824,7 +835,7 @@ async def test_budget_mapping_and_provider_status_row(monkeypatch: pytest.Monkey
     xai_oauth_row = next(
         p for p in status_payload["providers"] if p["provider"] == "xai-oauth"
     )
-    mock_get_valid_token.assert_awaited_once_with("local-dev-user")
+    mock_get_valid_token.assert_awaited_once_with("local-dev-user", "xai-oauth")
     mock_fetch_billing.assert_awaited_once_with("tok-xai-refreshed")
     assert xai_oauth_row["configured"] is True
     assert xai_oauth_row["billing"] == "subscription"
@@ -835,7 +846,7 @@ async def test_budget_mapping_and_provider_status_row(monkeypatch: pytest.Monkey
     assert xai_oauth_row["credential"]["quota"]["subscription_tier"] == "supergrok"
     assert xai_oauth_row["warnings"] == []
 
-    # When get_valid_token fails (refresh failed), warning "请重新连接" is emitted
+    # When valid_token fails (refresh failed), warning "请重新连接" is emitted
     mock_get_valid_token.return_value = None
     status_failed = await provider_status_mod.get_providers_status(user_id="local-dev-user")
     xai_failed_row = next(
@@ -855,6 +866,10 @@ async def test_budget_mapping_and_provider_status_row(monkeypatch: pytest.Monkey
 async def test_concurrent_refresh_only_refreshes_once_and_verifies_lock_ownership(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Through the unified protocol, the xAI line's single-use refresh token is
+    spent once however many turns ask together: one lock holder refreshes, the
+    others wait for its save; and a holder whose pre-lock read went stale
+    re-reads inside the lock and refreshes nobody's spent token."""
     monkeypatch.setenv("DALTON_XAI_OAUTH_CLIENT_ID", "test-grok-build-client")
     assert XAI_REFRESH_LOCK_TTL_MS >= 150_000
     assert not hasattr(xai_oauth_mod, "_TOKEN_META_CACHE")
@@ -873,45 +888,39 @@ async def test_concurrent_refresh_only_refreshes_once_and_verifies_lock_ownershi
     async def _fake_get_tokens(user_id: str, provider: str) -> dict[str, Any] | None:
         return dict(db_state)
 
-    async def _fake_upsert(
+    async def _fake_replace(
         user_id: str,
         provider: str,
+        *,
+        spent_refresh_token: str,
         access_token: str,
         refresh_token: str,
         account_id: str,
-        email: str | None = None,
-        plan_type: str | None = None,
-        expires_at: datetime | None = None,
-    ) -> None:
+        email: str | None,
+        plan_type: str | None,
+        expires_at: datetime | None,
+    ) -> bool:
+        assert spent_refresh_token == "single-use-refresh-token"
         db_state["access_token"] = access_token
         db_state["refresh_token"] = refresh_token
         db_state["account_id"] = account_id
         db_state["email"] = email
         db_state["plan_type"] = plan_type
         db_state["expires_at"] = expires_at
+        return True
 
-    mock_get_tokens = create_autospec(
-        xai_oauth_mod.get_oauth_tokens, side_effect=_fake_get_tokens
-    )
+    real_get_tokens = oauth_tokens_db.get_oauth_tokens
+    mock_get_tokens = create_autospec(real_get_tokens, side_effect=_fake_get_tokens)
+    monkeypatch.setattr(oauth_health_mod, "get_oauth_tokens", mock_get_tokens)
     monkeypatch.setattr(
-        xai_oauth_mod,
+        oauth_refresh_wait_mod,
         "get_oauth_tokens",
-        mock_get_tokens,
+        create_autospec(real_get_tokens, side_effect=_fake_get_tokens),
     )
     monkeypatch.setattr(
-        xai_oauth_mod,
-        "upsert_oauth_tokens",
-        create_autospec(xai_oauth_mod.upsert_oauth_tokens, side_effect=_fake_upsert),
-    )
-    monkeypatch.setattr(
-        xai_oauth_mod,
-        "invalidate_oauth_active_cache",
-        create_autospec(xai_oauth_mod.invalidate_oauth_active_cache, return_value=None),
-    )
-    monkeypatch.setattr(
-        xai_oauth_mod,
-        "_record_provider_event_safe",
-        create_autospec(xai_oauth_mod._record_provider_event_safe, return_value=None),
+        oauth_health_mod,
+        "replace_refreshed_tokens",
+        create_autospec(oauth_tokens_db.replace_refreshed_tokens, side_effect=_fake_replace),
     )
 
     # Stateful lock store verifying compare-and-delete ownership via redis.asyncio.Redis autospec
@@ -938,6 +947,7 @@ async def test_concurrent_refresh_only_refreshes_once_and_verifies_lock_ownershi
 
     fake_redis = create_autospec(redis.asyncio.Redis, instance=True)
     fake_redis.eval.side_effect = _redis_eval
+
     fake_cache = create_autospec(RedisCacheClient(), instance=True)
     fake_cache.enabled = True
     fake_cache.client = fake_redis
@@ -975,12 +985,12 @@ async def test_concurrent_refresh_only_refreshes_once_and_verifies_lock_ownershi
     # 1) Two coroutines refreshing concurrently: only 1 refresh request is issued,
     #    old refresh_token is used only once, and both receive the new access token.
     res1, res2 = await asyncio.gather(
-        get_valid_token("user-123"),
-        get_valid_token("user-123"),
+        oauth_health_mod.valid_token("user-123", "xai-oauth"),
+        oauth_health_mod.valid_token("user-123", "xai-oauth"),
     )
     assert res1 is not None and res2 is not None
-    assert res1["access_token"] == new_jwt
-    assert res2["access_token"] == new_jwt
+    assert res1.access_token == new_jwt
+    assert res2.access_token == new_jwt
     assert mock_refresh.await_count == 1
     assert refresh_tokens_used == ["single-use-refresh-token"]
     assert locks == {}
@@ -1003,21 +1013,11 @@ async def test_concurrent_refresh_only_refreshes_once_and_verifies_lock_ownershi
         return dict(db_state)
 
     mock_get_tokens.side_effect = _stale_then_fresh_get
-    res3 = await get_valid_token("user-123")
+    res3 = await oauth_health_mod.valid_token("user-123", "xai-oauth")
     assert res3 is not None
-    assert res3["access_token"] == new_jwt
+    assert res3.access_token == new_jwt
     assert mock_refresh.await_count == 1  # Still only 1 refresh call total!
 
-    # 3) Lock release ownership check: releasing with wrong token must not delete another holder's lock
-    locks["oauth:refresh:user-123:xai-oauth"] = "owner-token-A"
-    await xai_oauth_mod._release_refresh_lock(
-        fake_cache, "oauth:refresh:user-123:xai-oauth", "wrong-token-B"
-    )
-    assert locks.get("oauth:refresh:user-123:xai-oauth") == "owner-token-A"
-    await xai_oauth_mod._release_refresh_lock(
-        fake_cache, "oauth:refresh:user-123:xai-oauth", "owner-token-A"
-    )
-    assert "oauth:refresh:user-123:xai-oauth" not in locks
 
 
 @pytest.mark.asyncio
@@ -1054,6 +1054,17 @@ async def test_per_user_redis_discovery_cache_and_slow_down_preserves_deadline(
     fake_cache = create_autospec(RedisCacheClient(), instance=True)
     fake_cache.enabled = True
     fake_cache.client = fake_redis
+
+    # The poll's slow_down writeback is a compare-and-set on the value its
+    # read saw, keeping the key's TTL — wired here over the same store.
+    async def _swap(key: str, old_value: str, new_value: str) -> bool:
+        item = redis_store.get(str(key))
+        if item is None or item[0] != old_value:
+            return False
+        redis_store[str(key)] = (new_value, item[1])
+        return True
+
+    fake_cache.swap.side_effect = _swap
     monkeypatch.setattr(
         "src.utils.cache.redis_cache.get_cache_client",
         create_autospec(lambda: fake_cache, return_value=fake_cache),
@@ -1280,11 +1291,19 @@ async def test_responses_stream_failed_error_zero_chunks_billing_fallback_and_no
 async def test_refresh_lock_expired_on_renew_and_hard_timeout_skip_db_write_and_preserve_email(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """The unified protocol's answers to the old refresher's worries, on the
+    xAI line: the lease outlives the whole refresh; an answer naming no
+    identity keeps the stored one; the save is conditional on the refresh
+    token it spent, so a row another worker already replaced is not
+    overwritten (the replaced row serves instead); and a refresh that
+    outlives its deadline writes nothing and flags nothing."""
     monkeypatch.setenv("DALTON_XAI_OAUTH_CLIENT_ID", "test-grok-build-client")
     assert XAI_REFRESH_HARD_TIMEOUT_S == 120.0
     assert XAI_REFRESH_HARD_TIMEOUT_S < XAI_REFRESH_LOCK_TTL_MS / 1000.0
-    assert xai_oauth_mod._REFRESH_WAIT_SECONDS == 130.0
-    assert xai_oauth_mod._REFRESH_POLL_SECONDS >= 0.5
+    # The registry entry carries the same pacing as the constants.
+    xai_entry = oauth_providers_mod.SUBSCRIPTIONS["xai-oauth"]
+    assert xai_entry.refresh_deadline_s == XAI_REFRESH_HARD_TIMEOUT_S
+    assert xai_entry.lock_ttl_ms == XAI_REFRESH_LOCK_TTL_MS
 
     now = datetime.now(timezone.utc)
     expired_row: dict[str, Any] = {
@@ -1297,46 +1316,27 @@ async def test_refresh_lock_expired_on_renew_and_hard_timeout_skip_db_write_and_
         "expires_at": now - timedelta(minutes=5),
     }
 
-    mock_get_tokens = create_autospec(
-        xai_oauth_mod.get_oauth_tokens,
-        return_value=dict(expired_row),
-    )
-    mock_upsert = create_autospec(xai_oauth_mod.upsert_oauth_tokens, return_value=None)
-    mock_invalidate = create_autospec(
-        xai_oauth_mod.invalidate_oauth_active_cache, return_value=None
-    )
-    mock_record_event = create_autospec(
-        xai_oauth_mod._record_provider_event_safe, return_value=None
-    )
-    monkeypatch.setattr(xai_oauth_mod, "get_oauth_tokens", mock_get_tokens)
-    monkeypatch.setattr(xai_oauth_mod, "upsert_oauth_tokens", mock_upsert)
-    monkeypatch.setattr(xai_oauth_mod, "invalidate_oauth_active_cache", mock_invalidate)
-    monkeypatch.setattr(xai_oauth_mod, "_record_provider_event_safe", mock_record_event)
+    real_get_tokens = oauth_tokens_db.get_oauth_tokens
+    mock_get_tokens = create_autospec(real_get_tokens, return_value=dict(expired_row))
+    monkeypatch.setattr(oauth_health_mod, "get_oauth_tokens", mock_get_tokens)
+    mock_replace = create_autospec(oauth_tokens_db.replace_refreshed_tokens, return_value=True)
+    monkeypatch.setattr(oauth_health_mod, "replace_refreshed_tokens", mock_replace)
 
-    # Fake lock backed by create_autospec(redis.asyncio.Redis, instance=True)
     lock_store: dict[str, str] = {}
 
-    async def _expiring_eval(script: str, numkeys: int, *keys_and_args: Any) -> int:
-        key = str(keys_and_args[0])
-        token = str(keys_and_args[1])
-        if lock_store.get(key) != token:
-            return 0
-        if "del" in script:
-            del lock_store[key]
-        return 1
-
-    fake_redis = create_autospec(redis.asyncio.Redis, instance=True)
-    fake_redis.eval.side_effect = _expiring_eval
-
-    fake_cache = create_autospec(RedisCacheClient(), instance=True)
-    fake_cache.enabled = True
-    fake_cache.client = fake_redis
-
     async def _acquire_lock(key: str, token: str, ttl_ms: int) -> bool:
+        if key in lock_store:
+            return False
         lock_store[key] = token
         return True
 
+    async def _release_lock(key: str, token: str) -> None:
+        if lock_store.get(key) == token:
+            del lock_store[key]
+
+    fake_cache = create_autospec(RedisCacheClient(), instance=True)
     fake_cache.acquire_lock.side_effect = _acquire_lock
+    fake_cache.release_lock.side_effect = _release_lock
     monkeypatch.setattr(
         "src.utils.cache.redis_cache.get_cache_client",
         create_autospec(lambda: fake_cache, return_value=fake_cache),
@@ -1344,15 +1344,13 @@ async def test_refresh_lock_expired_on_renew_and_hard_timeout_skip_db_write_and_
 
     new_jwt_no_email = _make_jwt({"sub": "sub-1", "name": "Display Name Only"})
 
-    async def _refresh_and_expire_lock(
+    async def _refresh_display_name_only(
         refresh_token: str,
         *,
         token_endpoint: str | None = None,
         user_id: str | None = None,
         client: httpx.AsyncClient | None = None,
     ) -> dict[str, Any]:
-        # Simulate the lock expiring in Redis before refresh_tokens finishes
-        lock_store.clear()
         return extract_token_record(
             {
                 "access_token": new_jwt_no_email,
@@ -1363,22 +1361,27 @@ async def test_refresh_lock_expired_on_renew_and_hard_timeout_skip_db_write_and_
         )
 
     mock_refresh = create_autospec(
-        xai_oauth_mod.refresh_tokens, side_effect=_refresh_and_expire_lock
+        xai_oauth_mod.refresh_tokens, side_effect=_refresh_display_name_only
     )
     monkeypatch.setattr(xai_oauth_mod, "refresh_tokens", mock_refresh)
 
-    # 1a) Lock lost before renew AND DB refresh_token is unchanged ("ref-tok-1") ->
-    #     saves new rotated credentials to DB rather than discarding them!
-    res_lost_unchanged = await get_valid_token("user-exp")
-    assert res_lost_unchanged is not None
-    assert res_lost_unchanged["access_token"] == new_jwt_no_email
-    assert mock_upsert.await_count == 1
-    assert mock_upsert.call_args.kwargs["refresh_token"] == "ref-tok-2"
-    assert mock_upsert.call_args.kwargs["email"] == "original@dalton.fund"
+    # 1a) The answer names no identity: the stored email and SuperGrok plan ride
+    #     the conditional save, and the save is guarded by the spent refresh token.
+    res_saved = await oauth_health_mod.valid_token("user-exp", "xai-oauth")
+    assert res_saved is not None
+    assert res_saved.access_token == new_jwt_no_email
+    assert res_saved.email == "original@dalton.fund"
+    assert res_saved.plan_type == "supergrok"
+    mock_replace.assert_awaited_once()
+    replace_kwargs = mock_replace.call_args.kwargs
+    assert replace_kwargs["spent_refresh_token"] == "ref-tok-1"
+    assert replace_kwargs["refresh_token"] == "ref-tok-2"
+    assert replace_kwargs["email"] == "original@dalton.fund"
 
-    # 1b) Lock lost before renew AND DB was already updated by another worker
-    #     (refresh_token changed to "other-worker-refresh") -> skips upsert and returns DB token!
-    mock_upsert.reset_mock()
+    # 1b) The row moved on (a reconnect won the race): the conditional replace
+    #     answers False, nothing is written over it, and the stored row serves.
+    mock_replace.reset_mock()
+    mock_replace.return_value = False
     other_worker_row = {
         **expired_row,
         "access_token": "other-worker-fresh-access",
@@ -1390,22 +1393,30 @@ async def test_refresh_lock_expired_on_renew_and_hard_timeout_skip_db_write_and_
     async def _expired_then_other_worker(user_id: str, provider: str) -> dict[str, Any] | None:
         nonlocal read_count
         read_count += 1
-        # 1st read (pre-lock) and 2nd read (post-lock before refresh) see expired_row;
-        # 3rd read (after _renew_refresh_lock returns False) sees other_worker_row.
+        # 1st read (pre-lock) and 2nd read (post-lock) see expired_row;
+        # the read after the refused replace sees the row that moved on.
         if read_count <= 2:
             return dict(expired_row)
         return dict(other_worker_row)
 
     mock_get_tokens.side_effect = _expired_then_other_worker
-    res_lost_changed = await get_valid_token("user-exp")
-    assert res_lost_changed is not None
-    assert res_lost_changed["access_token"] == "other-worker-fresh-access"
-    assert mock_upsert.await_count == 0
+    res_replaced = await oauth_health_mod.valid_token("user-exp", "xai-oauth")
+    assert res_replaced is not None
+    assert res_replaced.access_token == "other-worker-fresh-access"
 
-    # 2) Hard timeout triggers during refresh -> no DB write
+    # 2) A refresh that outlives its deadline writes nothing and flags nothing:
+    #    a timeout reads as transient, so no needs_reauth, no save.
+    from dataclasses import replace as _dc_replace
+
+    mock_replace.reset_mock()
     mock_get_tokens.side_effect = None
     mock_get_tokens.return_value = dict(expired_row)
-    monkeypatch.setattr(xai_oauth_mod, "XAI_REFRESH_HARD_TIMEOUT_S", 0.02)
+    timed_out_entry = _dc_replace(xai_entry, refresh_deadline_s=0.02)
+    monkeypatch.setattr(
+        oauth_health_mod,
+        "SUBSCRIPTIONS",
+        {**oauth_providers_mod.SUBSCRIPTIONS, "xai-oauth": timed_out_entry},
+    )
 
     async def _slow_refresh(
         refresh_token: str,
@@ -1421,56 +1432,10 @@ async def test_refresh_lock_expired_on_renew_and_hard_timeout_skip_db_write_and_
         )
 
     mock_refresh.side_effect = _slow_refresh
-    res_timeout = await get_valid_token("user-exp")
-    assert res_timeout is None
-    assert mock_upsert.await_count == 0
+    with pytest.raises(oauth_health_mod.OAuthRefreshUnavailable):
+        await oauth_health_mod.valid_token("user-exp", "xai-oauth")
+    mock_replace.assert_not_awaited()
 
-    # 3) Upsert is the success boundary: if invalidate_oauth_active_cache raises or hangs
-    #    after upsert succeeds, get_valid_token still returns the new access_token and
-    #    never records refresh_fail.
-    monkeypatch.setattr(xai_oauth_mod, "XAI_REFRESH_HARD_TIMEOUT_S", 120.0)
-    mock_record_event.reset_mock()
-
-    async def _normal_refresh_display_only(
-        refresh_token: str,
-        *,
-        token_endpoint: str | None = None,
-        user_id: str | None = None,
-        client: httpx.AsyncClient | None = None,
-    ) -> dict[str, Any]:
-        return extract_token_record(
-            {
-                "access_token": new_jwt_no_email,
-                "refresh_token": "ref-tok-3",
-                "expires_in": 3600,
-            },
-            token_endpoint="https://auth.x.ai/oauth2/token",
-        )
-
-    mock_refresh.side_effect = _normal_refresh_display_only
-    mock_invalidate.side_effect = RuntimeError("redis cache invalidation boom")
-
-    res_ok = await get_valid_token("user-exp")
-    assert res_ok is not None
-    assert res_ok["access_token"] == new_jwt_no_email
-    assert mock_upsert.await_count == 1
-    assert mock_upsert.call_args.kwargs["email"] == "original@dalton.fund"
-    recorded_kinds = [call.args[1] for call in mock_record_event.await_args_list]
-    assert "refresh_fail" not in recorded_kinds
-    assert "refresh_ok" in recorded_kinds
-
-    # Also when invalidate_oauth_active_cache times out / hangs, still returns new access_token
-    mock_record_event.reset_mock()
-
-    async def _SlowInvalidate(user_id: str) -> None:
-        raise TimeoutError("simulated invalidate timeout")
-
-    mock_invalidate.side_effect = _SlowInvalidate
-    res_ok_timeout_inv = await get_valid_token("user-exp")
-    assert res_ok_timeout_inv is not None
-    assert res_ok_timeout_inv["access_token"] == new_jwt_no_email
-    recorded_kinds_2 = [call.args[1] for call in mock_record_event.await_args_list]
-    assert "refresh_fail" not in recorded_kinds_2
 
 
 @pytest.mark.asyncio

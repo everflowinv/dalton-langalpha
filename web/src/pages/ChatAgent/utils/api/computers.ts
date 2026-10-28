@@ -26,7 +26,7 @@ import type {
   UnsavedFile,
 } from '@/types/api';
 
-import { apiErrorDetail, apiErrorStatus } from './errors';
+import { apiErrorDetail, apiErrorStatus } from '@/api/errors';
 import { streamStatusEvents, type StatusFrame } from './statusStream';
 
 // Matches the workspace module's bounds: starting a machine legitimately runs

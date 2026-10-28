@@ -2,7 +2,7 @@ import { useCallback, useMemo, useRef } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { queryKeys } from '../../../lib/queryKeys';
 import { listWorkspaceFiles } from '../utils/api';
-import { apiErrorDetail, apiErrorStatus } from '../utils/api/errors';
+import { apiErrorDetail, apiErrorStatus } from '@/api/errors';
 
 interface UseWorkspaceFilesOptions {
   includeSystem?: boolean;

@@ -59,6 +59,8 @@ export function useNavTreeProps({
     renameWorkspace,
     pinThread,
     archiveThread,
+    renameThread,
+    deleteThread,
   } = useNavigationData(currentWorkspaceId || '');
 
   const findWorkspace = useCallback(
@@ -74,9 +76,10 @@ export function useNavTreeProps({
 
   // Route-state contract: the workspace name/status ride along so ChatAgent
   // skips the workspace refetch.
-  const onNavigateThread = useCallback((wsId: string, threadId: string) => {
+  const onNavigateThread = useCallback((wsId: string, threadId: string, { replace = false } = {}) => {
     const ws = findWorkspace(wsId);
     navigate(`/chat/t/${threadId}`, {
+      replace,
       state: {
         workspaceId: wsId,
         workspaceName: label(ws) || fallbackWorkspaceName || '',
@@ -85,39 +88,64 @@ export function useNavTreeProps({
     });
   }, [findWorkspace, navigate, fallbackWorkspaceName, label]);
 
-  // Archiving the thread being viewed must not strand ChatView on a row that
-  // just left the nav: mount the adjacent thread in the tree's visible order
-  // (the row after, else the one before), or the workspace home when it was
-  // the workspace's last one. The target is computed BEFORE the await (the
-  // optimistic patch removes the row) and navigation waits for the server —
-  // a failed archive rolls back and must leave the user where they are.
-  // Read at call time: this handler reaches every memoized sidebar row, and
+  // Archiving or deleting the thread being viewed must not strand ChatView on
+  // a row that just left the nav: mount the adjacent thread in the tree's
+  // visible order (the row after, else the one before), or the workspace home
+  // when it was the workspace's last one. The target is computed BEFORE the
+  // await (the removal patches the row out) and navigation waits for the
+  // server: a failed removal must leave the user where they are.
+  // Read at call time: these handlers reach every memoized sidebar row, and
   // an identity that followed the thread data re-rendered them all on each
-  // refetch.
+  // refetch. A deleted thread's entry is replaced in the history, so Back
+  // never returns to it: its view stays cached and would show it as if it
+  // still existed. A user who opened another thread while the removal was
+  // pending stays on it.
   const workspaceThreadsRef = useRef(workspaceThreads);
   workspaceThreadsRef.current = workspaceThreads;
-  const onArchiveThread = useCallback(async (wsId: string, threadId: string) => {
-    const isCurrent = threadId === currentThreadId;
+  const currentThreadIdRef = useRef(currentThreadId);
+  currentThreadIdRef.current = currentThreadId;
+  const removeThread = useCallback(async (
+    wsId: string,
+    threadId: string,
+    remove: () => Promise<boolean>,
+    { replace = false }: { replace?: boolean } = {},
+  ) => {
+    const isCurrent = threadId === currentThreadIdRef.current;
     let next;
     if (isCurrent) {
       const rows = workspaceThreadsRef.current[wsId]?.threads || [];
       const idx = rows.findIndex((th) => th.thread_id === threadId);
       next = idx >= 0 ? rows[idx + 1] ?? rows[idx - 1] : undefined;
     }
-    const ok = await archiveThread(wsId, threadId);
-    if (!ok || !isCurrent) return;
+    const ok = await remove();
+    if (!ok || !isCurrent || currentThreadIdRef.current !== threadId) return;
     if (next) {
-      onNavigateThread(wsId, next.thread_id);
+      onNavigateThread(wsId, next.thread_id, { replace });
     } else {
       const ws = findWorkspace(wsId);
       navigate(`/chat/${wsId}`, {
+        replace,
         state: {
           workspaceName: label(ws) || fallbackWorkspaceName || '',
           workspaceStatus: ws?.status || null,
         },
       });
     }
-  }, [currentThreadId, onNavigateThread, findWorkspace, navigate, fallbackWorkspaceName, archiveThread, label]);
+  }, [onNavigateThread, findWorkspace, navigate, fallbackWorkspaceName, label]);
+
+  const onArchiveThread = useCallback(
+    (wsId: string, threadId: string) => removeThread(wsId, threadId, () => archiveThread(wsId, threadId)),
+    [removeThread, archiveThread],
+  );
+
+  // Rejects when the server refuses, for the confirm dialog to show.
+  const onDeleteThread = useCallback(
+    (wsId: string, threadId: string) => removeThread(wsId, threadId, async () => {
+      await deleteThread(wsId, threadId);
+      return true;
+    }, { replace: true }),
+    [removeThread, deleteThread],
+  );
 
   return useMemo(() => ({
     workspaces,
@@ -141,10 +169,12 @@ export function useNavTreeProps({
     onNewThread,
     onPinThread: pinThread,
     onArchiveThread,
+    onRenameThread: renameThread,
+    onDeleteThread,
   }), [
     workspaces, workspaceThreads, currentWorkspaceId, currentThreadId, agents,
     expandWorkspace, onNavigateThread, hasMore, loadAll, loadMoreThreads,
     canReorderWorkspaces, reorderWorkspace, pinWorkspace, renameWorkspace,
-    onNewThread, pinThread, onArchiveThread,
+    onNewThread, pinThread, onArchiveThread, renameThread, onDeleteThread,
   ]);
 }

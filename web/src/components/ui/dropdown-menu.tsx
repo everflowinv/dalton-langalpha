@@ -44,24 +44,17 @@ function DropdownMenuContent({
 // The only focus indication a menu item gets. Items wear no ring by design, so
 // this tint answers pointer and keyboard alike, and it is written once: a value
 // that clears contrast has to reach every shape of item at the same time.
-const ITEM_HIGHLIGHT = "data-highlighted:bg-accent/15"
-
-// "Label ... value >": the label at the left, whatever it currently reads
-// right-aligned against the chevron. A setting row exists in two shapes, an
-// item where the options expand in place and a sub-trigger where they fly out,
-// so the geometry belongs here rather than restated at both call sites.
-const SETTING_ROW = "justify-between text-[0.8125rem]"
+export const ITEM_HIGHLIGHT = "data-highlighted:bg-accent/15"
 
 // Every shape of item shares this box, so a checkbox row lines up with the
 // plain rows around it.
-const ITEM_BOX = "relative flex w-full cursor-default select-none items-center gap-2 rounded-sm px-2.5 py-1.5 text-sm transition-colors data-disabled:pointer-events-none data-disabled:opacity-50"
+export const ITEM_BOX = "relative flex w-full cursor-default select-none items-center gap-2 rounded-sm px-2.5 py-1.5 text-sm transition-colors data-disabled:pointer-events-none data-disabled:opacity-50"
 
 export const DESTRUCTIVE_ITEM = "text-destructive data-highlighted:bg-destructive/10 data-highlighted:text-destructive"
 
 const itemVariants = {
   default: ITEM_HIGHLIGHT,
   destructive: DESTRUCTIVE_ITEM,
-  setting: `${SETTING_ROW} ${ITEM_HIGHLIGHT}`,
 } as const
 
 type ItemVariant = keyof typeof itemVariants
@@ -141,17 +134,13 @@ const DropdownMenuSub = DropdownMenuPrimitive.Sub
 function DropdownMenuSubTrigger({
   className,
   children,
-  variant = "default",
   ...props
-}: React.ComponentProps<typeof DropdownMenuPrimitive.SubTrigger> & {
-  variant?: "default" | "setting"
-}) {
+}: React.ComponentProps<typeof DropdownMenuPrimitive.SubTrigger>) {
   return (
     <DropdownMenuPrimitive.SubTrigger
       className={cn(
         "flex cursor-default select-none items-center gap-2 rounded-sm px-2.5 py-1.5 text-sm data-[state=open]:bg-accent/15",
         ITEM_HIGHLIGHT,
-        variant === "setting" && SETTING_ROW,
         className
       )}
       {...props}

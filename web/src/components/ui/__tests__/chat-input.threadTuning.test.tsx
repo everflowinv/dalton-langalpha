@@ -36,7 +36,7 @@ vi.mock('@/hooks/usePreferences', () => ({
 vi.mock('@/hooks/useAllModels', () => ({
   useAllModels: () => ({
     models: {},
-    modelAccessMap: undefined,
+    payers: {},
     validModelNames: new Set(['model-default']),
     metadata: {
       'model-default': { sdk: 'codex', reasoning_efforts: ['low', 'medium', 'high'], reasoning_effort_default: 'medium' },
@@ -59,7 +59,8 @@ vi.mock('../use-toast', () => ({
 // The menu's own rendering is pinned in chatInputModelMenu's tests; this one
 // reads the props it is handed and reaches the same handlers its options call.
 vi.mock('../chat-input.modelMenu', () => ({
-  ChatInputModelMenu: ({ reasoningEffort, defaultEffort, fastMode, onReasoningEffortChange, onFastModeChange }: {
+  ChatInputModelMenu: () => null,
+  ChatInputEffortMenu: ({ reasoningEffort, defaultEffort, fastMode, onReasoningEffortChange, onFastModeChange }: {
     reasoningEffort: string | null;
     defaultEffort: string | null;
     fastMode: boolean | null;

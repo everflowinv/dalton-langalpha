@@ -165,6 +165,19 @@ FEATURES: dict[str, FeatureSpec] = {
             "gets that record, which leaves out the earlier tool results."
         ),
     ),
+    # Off in every deployment until an operator turns it on; then each user
+    # opts in. Nothing reads it yet: the graph build consults it once
+    # Claude Code models are routable (design phase 2).
+    "claude_code_runtime": FeatureSpec(
+        key="claude_code_runtime",
+        label="Claude Code runtime (preview)",
+        description=(
+            "Runs your Claude threads through Claude Code on your own Claude "
+            "plan instead of an API key."
+        ),
+        enabled=False,
+        gate=FeatureGate.OPT_IN,
+    ),
     "a_share_pack": FeatureSpec(
         key="a_share_pack",
         label="A-share market pack",

@@ -57,9 +57,11 @@ const readTurn = (answerStart) => {
   const pill = [...document.querySelectorAll('[data-message-role="assistant"] button')]
     .find((b) => /source/i.test(b.textContent ?? ''))?.parentElement;
   const userBottom = user?.getBoundingClientRect().bottom;
+  const column = user?.firstElementChild;
   const firstContent = assistant?.querySelector('p, .titem, [data-activity-state]');
   return {
     user: !!user,
+    rising: !!column && column.getAnimations().length > 0,
     fold: fold?.getAttribute('data-turn-fold') ?? null,
     folding: folding.length,
     foldTop: fold && userBottom !== undefined ? fold.getBoundingClientRect().top - userBottom : null,
@@ -101,14 +103,14 @@ test.describe('turn start and end', () => {
     await page.locator('textarea').fill('Say hi');
     await sampleFrames(page, readTurn);
     await page.getByRole('button', { name: 'Send message', exact: true }).click();
-    // The user's bubble rises into place as it arrives.
-    const column = page.locator('[data-message-role="user"] > div').first();
-    await expect.poll(() => column.evaluate((el) => el.getAnimations().length)).toBeGreaterThan(0);
     await expect(page.locator('[data-turn-fold="collapsed"]')).toBeVisible({ timeout: 10000 });
     const frames = await stopSampling(page);
 
     const withUser = frames.filter((f) => f.user);
     expect(withUser.length).toBeGreaterThan(10);
+    // The user's bubble rises into place as it arrives: read from the frames,
+    // since the rise can be over before a poll after the click first looks.
+    expect(withUser.some((f) => f.rising), 'the message did not rise in').toBe(true);
     // The first frame that draws the message draws its row, running.
     expect(withUser[0].fold).toBe('live');
     // Until the reply has content, the row and the indicator under it hold

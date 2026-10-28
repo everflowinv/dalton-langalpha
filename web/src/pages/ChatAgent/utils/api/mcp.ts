@@ -2,7 +2,7 @@
  * MCP server config: the account's servers, and each workspace's view of them.
  */
 import { api } from '@/api/client';
-import { apiErrorCoded } from './errors';
+import { apiErrorCoded } from '@/api/errors';
 import { foldToolName } from '@/pages/ChatAgent/utils/directTools';
 import type { OrderAction, OrderMode } from '@/types/orders';
 import type { TradingLevel } from '@/types/api';

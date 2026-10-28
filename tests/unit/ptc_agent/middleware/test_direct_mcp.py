@@ -328,3 +328,91 @@ def test_default_order_tool_names_matches_brokerage_capabilities_order_tools():
     expected = frozenset(t.strip().lower() for tools in _ORDER_TOOLS.values() for t in tools)
     assert _DEFAULT_ORDER_TOOL_NAMES == expected
     assert _DEFAULT_ORDER_TOOL_NAMES == ALL_ORDER_TOOL_NAMES
+
+
+@pytest.mark.asyncio
+async def test_default_capability_grants_and_direct_mcp_never_expose_live_order_tools(monkeypatch):
+    # DALTON-HOOK(hide-trading): default grants exclude live order tools and neither
+    # new users, existing users, nor colleague-dispatched turns can bind order tools
+    import src.server.services.egress.direct_tools as dt_mod
+    from src.ptc_agent.agent.middleware.direct_mcp import bindable_direct_tools
+    from src.server.services.brokerage_capabilities import (
+        _CURATION,
+        _ORDER_TOOLS,
+        denied_tools,
+        effective_capabilities,
+        group_keys_for,
+        groups_for,
+    )
+    from src.server.services.mcp_tool_split import (
+        DirectServerTools,
+        DirectTool,
+        split_server_tools,
+    )
+    from src.server.services.tool_binding import (
+        BindingInputs,
+        resolve_plan,
+        resolve_tool,
+    )
+
+    for vendor, groups_map in _CURATION.items():
+        live_trading_tools = frozenset(t.lower() for t in groups_map.get("trading", ()))
+        vendor_order_tools = frozenset(t.lower() for t in _ORDER_TOOLS.get(vendor, ()))
+
+        # 1. Unset/empty grant (new or pre-consent existing connection) denies all order tools
+        assert effective_capabilities(vendor, ()) == ()
+        unset_denied = denied_tools(vendor, ()) or frozenset()
+        assert live_trading_tools <= unset_denied
+        assert vendor_order_tools <= unset_denied
+
+        # 2. Default non-danger grant excludes 'trading' and denies all live trading tools
+        default_keys = [g.key for g in groups_for(vendor) if g.tone != "danger"]
+        assert "trading" not in default_keys
+        assert "trading" not in effective_capabilities(vendor, default_keys)
+        default_denied = denied_tools(vendor, default_keys) or frozenset()
+        assert live_trading_tools <= default_denied
+
+        # 3. Even if all groups (including trading/staged_orders) are in a BindingPlan,
+        # split_server_tools strips every order tool from both sandbox and direct paths
+        read_tool = groups_map["account"][0]
+        plan = resolve_plan(
+            vendor,
+            group_keys_for(vendor),
+            BindingInputs(overrides={read_tool: "direct"}),
+        )
+        raw_tools = [{"name": name, "description": name} for name in (vendor_order_tools | {read_tool})]
+        sandbox_tools, direct_entry = split_server_tools(
+            raw_tools,
+            denied=None,
+            plan=plan,
+            vendor=vendor,
+        )
+        assert sandbox_tools == []
+        assert direct_entry is not None
+        assert [t.name for t in direct_entry.tools] == [read_tool]
+
+    # 4. Colleague-dispatched turn (owner_user_id != caller_user_id) and owner turn
+    # both strip every order tool in prepare_direct_mcp_tools
+    monkeypatch.setattr(dt_mod, "EGRESS_RELAY_SECRET", "test-secret-key-32-bytes-long-00")
+    inputs = BindingInputs(overrides={"get_positions": "direct"})
+    ibkr_entry = DirectServerTools(
+        vendor="ibkr",
+        tools=(
+            DirectTool({"name": "submit_order", "description": "Submit IBKR live order", "input_schema": {}}, resolve_tool("ibkr", "submit_order", inputs)),
+            DirectTool({"name": "modify_order", "description": "Modify IBKR live order", "input_schema": {}}, resolve_tool("ibkr", "modify_order", inputs)),
+            DirectTool({"name": "cancel_order", "description": "Cancel IBKR live order", "input_schema": {}}, resolve_tool("ibkr", "cancel_order", inputs)),
+            DirectTool({"name": "answer_order_question", "description": "Confirm IBKR order warning", "input_schema": {}}, resolve_tool("ibkr", "answer_order_question", inputs)),
+            DirectTool({"name": "get_positions", "description": "Read positions", "input_schema": {}}, resolve_tool("ibkr", "get_positions", inputs)),
+        ),
+    )
+    for owner_id, caller_id in (("user-new", "user-new"), ("owner-b", "colleague-a")):
+        binding = await dt_mod.prepare_direct_mcp_tools(
+            user_id=owner_id,
+            owner_user_id=owner_id,
+            caller_user_id=caller_id,
+            workspace_id="ws-1",
+            grants={"ibkr": "grant-token-1"},
+            by_server={"ibkr": ibkr_entry},
+        )
+        bound_names = [t.name for t in bindable_direct_tools(binding)]
+        assert bound_names == ["mcp__ibkr__get_positions"]

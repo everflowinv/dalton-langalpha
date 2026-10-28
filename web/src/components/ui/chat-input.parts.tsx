@@ -153,7 +153,7 @@ export function PillToggle({
       <button
         type="button"
         tabIndex={-1}
-        className={cn('inline-flex items-center rounded-full border-none whitespace-nowrap transition-colors', className)}
+        className={cn('inline-flex items-center rounded-lg border-none whitespace-nowrap transition-colors', className)}
         style={style}
       >
         {body}
@@ -170,7 +170,7 @@ export function PillToggle({
   return (
     <button
       ref={buttonRef}
-      className={cn('inline-flex items-center rounded-full border-none whitespace-nowrap transition-colors', className)}
+      className={cn('inline-flex items-center rounded-lg border-none whitespace-nowrap transition-colors', className)}
       style={style}
       onClick={(e) => { e.stopPropagation(); if (!blocked) onToggle?.(); }}
       // A press leaves focus where it was, as a menu trigger's does: the picker
@@ -261,7 +261,7 @@ export function IconToggle({
   children: ReactNode;
   measureOnly?: boolean;
 }) {
-  const className = 'inline-flex flex-none items-center justify-center h-8 w-8 rounded-full border-none bg-transparent transition-colors';
+  const className = 'inline-flex flex-none items-center justify-center h-8 w-8 rounded-lg border-none bg-transparent transition-colors';
   const style: CSSProperties = {
     color: active ? 'var(--color-accent-light)' : 'var(--color-text-muted)',
   };

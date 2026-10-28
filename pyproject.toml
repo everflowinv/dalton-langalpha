@@ -27,6 +27,7 @@ dependencies = [
     "langchain-anthropic>=1.0.0",
     "langchain_google_genai>=2.0.0",
     "langchain-deepseek>=0.1.4",
+    "langchain-openrouter>=0.2.9",
     # LangGraph — floor pinned at the beta DeltaChannel on-disk format (messages
     # checkpoints are _DeltaSnapshot/sentinel blobs). langgraph<1.2 cannot read
     # them; downgrading after delta blobs exist strands threads on resume.
@@ -172,6 +173,12 @@ observability = [
 # `uv run playwright install chromium` to enable the `?format=pdf` routes;
 # without it the endpoints return 501 (lazy import, graceful no-op).
 pdf = ["playwright>=1.49"]
+# The Claude Code runtime (src/ptc_agent/agent/claude_code): the Agent SDK and
+# the claude CLI it bundles, about 290 MB installed. An extra so images that
+# never run a Claude Code turn do not carry the CLI; the package is imported
+# only by that runtime. Pinned exactly: the runtime subclasses the SDK's
+# subprocess transport, which is internal API.
+claude-code = ["claude-agent-sdk==0.2.174"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/ptc_agent"]

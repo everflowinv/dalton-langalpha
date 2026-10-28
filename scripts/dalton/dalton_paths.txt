@@ -19,11 +19,9 @@ docker-compose.dalton.yml
 src/ptc_agent/agent/middleware/skills/dalton_registry.py
 web/src/pages/Settings/panels/dalton/
 web/src/pages/Settings/hooks/useOpenClaw.ts
-web/src/pages/Settings/hooks/useDaltonOAuthProviders.ts
 web/src/pages/Settings/hooks/useProviderStatus.ts
 web/src/hooks/useTeamCredentials.ts
 web/src/pages/Settings/utils/daltonApi.ts
-web/src/pages/Settings/utils/daltonOAuthApi.ts
 web/src/pages/Setup/steps/connectStep/dalton/
 web/src/pages/ChatAgent/components/dalton/
 web/src/pages/Dashboard/components/dalton/
@@ -50,6 +48,7 @@ tests/unit/server/handlers/chat/test_attachments_notes.py
 tests/unit/server/handlers/chat/test_unreadable_image_upload.py
 tests/unit/server/handlers/conftest.py
 tests/unit/ptc_agent/middleware/test_image_byte_fit.py
+tests/unit/ptc_agent/agent/middleware/test_removed_attachment_union.py
 # B5/D5: transport_lost abort records its spill reason and the failure the
 # parent sees carries the run's last written text + transcript directory.
 tests/unit/middleware/test_subagent_spill_recovery.py

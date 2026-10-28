@@ -25,6 +25,8 @@
  */
 
 import { useSyncExternalStore } from 'react';
+import { registerAuthReset } from '@/lib/authResets';
+import { holdReload } from '@/lib/reloadHolds';
 
 export type SelectionType = 'region' | 'price_level';
 
@@ -173,7 +175,16 @@ let state: SelectionState = EMPTY_STATE;
 
 const listeners = new Set<() => void>();
 
+// Selections and their notes live only here, so a stale-build reload waits
+// until they are sent or cleared.
+let releaseReload: (() => void) | null = null;
+
 function emit(): void {
+  if (state.selections.length > 0) releaseReload ??= holdReload();
+  else if (releaseReload) {
+    releaseReload();
+    releaseReload = null;
+  }
   for (const listener of listeners) listener();
 }
 
@@ -296,6 +307,10 @@ export const chartSelectionStore = {
     emit();
   },
 };
+
+// A selection is the previous account's notes, and the reload hold it takes
+// would keep blocking the next account's stale-build reloads.
+registerAuthReset(() => chartSelectionStore.clearAll());
 
 /** Subscribe a component to the full selection state. */
 export function useChartSelections(): SelectionState {

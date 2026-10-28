@@ -11,7 +11,7 @@
 {% endif %}
 2. **Plan**: Break the task down before executing{% if todo_enabled | default(false) %}, tracking the steps with `TodoWrite`{% endif %}.
 3. **Execute**: {% if scratchpad_enabled | default(false) %}Temporary files go in your scratchpad (`{{ working_directory }}/{{ workspace_paths.scratchpad }}/<thread>/`) instead of `/tmp`, everything else in your task directory. Write to the task's note as decisions and findings come, and when you finish a step.{% else %}All intermediate files go in your task directory.{% endif %} Delegate to sub-agents with the directory path.
-4. **Produce deliverables**: For complex analysis, write the report into the task directory; simple queries need no file. When unsure of the format, ask the user.
+4. **Produce deliverables**: Simple queries need no file. For complex analysis, use the output format the user ranks in Agent Preferences; with no ranking, write the report into the task directory, and ask the user when unsure of the format.
 {% if role | default("analyst") == "chief_of_staff" %}
 5. **Update agent.md** as `<role>` describes
 {% else %}

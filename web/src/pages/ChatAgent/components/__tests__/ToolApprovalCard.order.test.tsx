@@ -634,6 +634,17 @@ describe('what the order ticket reads off the server', () => {
         right: 'C',
       }),
     ).toBe('AAPL 2026-01-16 200 C');
+    expect(
+      instrumentLabel({
+        kind: 'combo',
+        strategy: 'oco',
+        legs: [
+          { symbol: 'AAPL', leg: 'take_profit' },
+          { symbol: 'AAPL', leg: 'stop_loss' },
+        ],
+      }),
+    ).toBe('AAPL oco');
+    expect(instrumentLabel({ kind: 'combo', strategy: 'vertical' })).toBe('vertical');
     expect(instrumentLabel(null)).toBe('');
   });
 });

@@ -83,18 +83,22 @@ class ToolArgumentParsingMiddleware(AgentMiddleware):
     def _parse_args(self, args, tool_name: str | None = None):
         return parse_tool_args(args, tool_name)
 
-    def wrap_tool_call(self, request, handler):
+    def _parsed(self, request):
+        """The request with parsed args, the model's own tool call left as sent.
+
+        The call dict is the one in the assistant message: writing into it
+        would have later requests of this run send the parsed args while the
+        checkpoint keeps the raw ones, so the next run's requests would differ
+        from those its earlier thinking was produced behind.
+        """
         tool_call = request.tool_call
-        if "args" in tool_call:
-            tool_call["args"] = self._parse_args(
-                tool_call["args"], tool_name=tool_call.get("name")
-            )
-        return handler(request)
+        if "args" not in tool_call:
+            return request
+        args = self._parse_args(tool_call["args"], tool_name=tool_call.get("name"))
+        return request.override(tool_call={**tool_call, "args": args})
+
+    def wrap_tool_call(self, request, handler):
+        return handler(self._parsed(request))
 
     async def awrap_tool_call(self, request, handler):
-        tool_call = request.tool_call
-        if "args" in tool_call:
-            tool_call["args"] = self._parse_args(
-                tool_call["args"], tool_name=tool_call.get("name")
-            )
-        return await handler(request)
+        return await handler(self._parsed(request))

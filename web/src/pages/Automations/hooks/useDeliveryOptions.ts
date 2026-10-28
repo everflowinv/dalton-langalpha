@@ -1,8 +1,6 @@
 import { keepPreviousData, useQuery } from '@tanstack/react-query';
-import { queryKeys } from '@/lib/queryKeys';
-import { apiErrorStatus } from '@/pages/ChatAgent/utils/api/errors';
+import { deliveryOptionsQuery } from '@/hooks/useLinkedChatApps';
 import type { DeliveryOptions } from '@/types/automation';
-import { getDeliveryOptions } from '../utils/api';
 
 interface DeliveryOptionsArgs {
   /** The workspace the automation runs in, Home's id included. */
@@ -32,16 +30,11 @@ export function useDeliveryOptions({ workspaceId, enabled = true }: DeliveryOpti
   const asked = workspaceId || null;
 
   const query = useQuery({
-    queryKey: queryKeys.automationDelivery.options(asked),
-    queryFn: async () => (await getDeliveryOptions(asked)).data,
+    ...deliveryOptionsQuery(asked),
     // A form with no place picked yet asks nothing.
     enabled: enabled && !!asked,
-    staleTime: 60_000,
     // A workspace switch keeps the picker up while the new one's chats load.
     placeholderData: keepPreviousData,
-    // A refusal or an unavailable service answers the same on a retry; only
-    // a request that never got an answer is asked again.
-    retry: (count, err) => count < 1 && apiErrorStatus(err) === null,
   });
 
   return {

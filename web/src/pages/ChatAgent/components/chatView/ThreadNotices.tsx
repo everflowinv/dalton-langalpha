@@ -1,11 +1,12 @@
 import type React from 'react';
-import type { DefaultModelOffer, RetiredModel } from '../../hooks/useThreadModel';
-import { RetiredModelNotice, ThreadModelBanner } from './ThreadModelBanner';
+import type { DefaultModelOffer, LapsedSignIn, RetiredModel } from '../../hooks/useThreadModel';
+import { LapsedSignInNotice, RetiredModelNotice, ThreadModelBanner } from './ThreadModelBanner';
 import { ThreadSubagentsBanner } from './ThreadSubagentsBanner';
 
 /** What `useThreadModel` raises above a composer. */
 interface ModelNotices {
   retired: RetiredModel | null;
+  lapsed: LapsedSignIn | null;
   offer: DefaultModelOffer | null;
   dismissOffer: () => void;
 }
@@ -48,6 +49,8 @@ export function ThreadOffers({
 }): React.ReactElement {
   return (
     <>
+      {/* Keyed by the model, so a dismissal holds only for the one it was about. */}
+      {model.lapsed && <LapsedSignInNotice key={model.lapsed.model} {...model.lapsed} />}
       {model.offer && <ThreadModelBanner {...model.offer} onDismiss={model.dismissOffer} />}
       {subagents.offer !== null && (
         // Keyed by the value, so an offer for the other side starts its own clock.

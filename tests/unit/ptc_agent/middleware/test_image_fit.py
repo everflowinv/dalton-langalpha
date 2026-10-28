@@ -63,7 +63,7 @@ _HEIC = b"\0\0\0\x18ftypheic\0\0\0\0mif1heic" + b"\0" * 64
 
 
 async def _fit(messages, limit=100, accepted=COMMON_IMAGE_TYPES):
-    result, _ = await fit_images(messages, accepted, lambda count: limit)
+    result, _, _left_out = await fit_images(messages, accepted, lambda count: limit)  # DALTON-HOOK(attachment-native-cap): third return: byte-total ids
     return result
 
 
@@ -176,7 +176,7 @@ class TestFitImages:
         history = [
             HumanMessage(content=[_image_url(b"not an image"), _image_url(b"nor this")]),
         ]
-        result, unreadable = await fit_images(history, COMMON_IMAGE_TYPES, lambda count: 100)
+        result, unreadable, _left_out = await fit_images(history, COMMON_IMAGE_TYPES, lambda count: 100)  # DALTON-HOOK(attachment-native-cap): third return: byte-total ids
         assert result is history
         assert unreadable == {(0, 0), (0, 1)}
 
@@ -185,7 +185,7 @@ class TestFitImages:
         history = [
             HumanMessage(content=[_image_url(_encode((40, 300))), _image_url(b"not an image")]),
         ]
-        result, unreadable = await fit_images(history, COMMON_IMAGE_TYPES, lambda count: 100)
+        result, unreadable, _left_out = await fit_images(history, COMMON_IMAGE_TYPES, lambda count: 100)  # DALTON-HOOK(attachment-native-cap): third return: byte-total ids
         assert result[0].content[1]["text"].startswith("[Image downscaled")
         assert unreadable == {(0, 2)}
         assert result[0].content[2] == history[0].content[1]
@@ -247,11 +247,11 @@ class TestFormats:
     async def test_heic_goes_where_it_is_taken_and_is_unreadable_elsewhere(self):
         history = [HumanMessage(content=[_image_url(_HEIC, "image/heic")])]
         for route in ("gemini", "dashscope"):
-            result, unreadable = await fit_images(
+            result, unreadable, _left_out = await fit_images(  # DALTON-HOOK(attachment-native-cap): third return: byte-total ids
                 history, get_image_types(route), lambda count: None
             )
             assert result is history and not unreadable
-        result, unreadable = await fit_images(history, COMMON_IMAGE_TYPES, lambda count: None)
+        result, unreadable, _left_out = await fit_images(history, COMMON_IMAGE_TYPES, lambda count: None)  # DALTON-HOOK(attachment-native-cap): third return: byte-total ids
         assert unreadable == {(0, 0)}
 
     @pytest.mark.asyncio
@@ -259,7 +259,7 @@ class TestFormats:
         svg = b'<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"/>'
         history = [HumanMessage(content=[_image_url(svg, "image/svg+xml")])]
         for route in ("anthropic", "gemini", "dashscope"):
-            _, unreadable = await fit_images(history, get_image_types(route), lambda count: None)
+            _, unreadable, _left_out = await fit_images(history, get_image_types(route), lambda count: None)  # DALTON-HOOK(attachment-native-cap): third return: byte-total ids
             assert unreadable == {(0, 0)}
 
 
@@ -313,7 +313,7 @@ class TestPixels:
         monkeypatch.setattr(image_fit, "_MAX_DECODE_PIXELS", 5000)
         monkeypatch.setattr(image_fit, "_render", None)
         history = [HumanMessage(content=[_image_url(_encode((40, 300)))])]
-        result, unreadable = await fit_images(history, COMMON_IMAGE_TYPES, lambda count: 100)
+        result, unreadable, _left_out = await fit_images(history, COMMON_IMAGE_TYPES, lambda count: 100)  # DALTON-HOOK(attachment-native-cap): third return: byte-total ids
         assert result is history
         assert unreadable == {(0, 0)}
 

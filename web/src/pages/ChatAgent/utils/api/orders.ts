@@ -43,6 +43,7 @@ export type OrderStatusGroup =
   | 'open'
   | 'filled'
   | 'cancelled'
+  | 'expired'
   | 'handed_off'
   | 'rejected'
   | 'failed';
@@ -52,6 +53,7 @@ export const ORDER_STATUS_GROUPS: readonly OrderStatusGroup[] = [
   'open',
   'filled',
   'cancelled',
+  'expired',
   'handed_off',
   'rejected',
   'failed',
@@ -72,6 +74,7 @@ export const ORDER_STATUS_GROUP_STATUSES: Record<OrderStatusGroup, readonly Orde
   ],
   filled: ['filled'],
   cancelled: ['cancelled'],
+  expired: ['expired'],
   handed_off: ['handed_off'],
   rejected: ['rejected_by_user', 'refused', 'rejected_by_vendor'],
   failed: ['failed'],
@@ -145,6 +148,10 @@ export interface OrderAttempt {
   parent_attempt_id: string | null;
   created_at: string | null;
   updated_at: string | null;
+  /** When a complete vendor listing first lacked this order. An end the
+   *  vendor named clears it and an end read from absence keeps it, so on a
+   *  handed-off attempt null means the vendor said how it ended. */
+  unlisted_at?: string | null;
 }
 
 export interface OrderPage {

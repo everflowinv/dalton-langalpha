@@ -31,6 +31,7 @@ from .availability import (
     drop_dead_models,
     drop_off_plan_models,
     model_on_plan,
+    on_subscription,
     raise_byok_key_required,
     raise_model_not_on_plan,
     raise_model_removed,
@@ -107,6 +108,64 @@ def system_default_models() -> dict[str, str]:
     }
 
 
+def deployment_key(provider_info: dict) -> str | None:
+    """The deployment's own key for a provider, when a user's turn may run on it.
+
+    Standalone, the server's keys are its user's, which is how the turns use
+    them. In platform mode they are the platform's, which only a plan reaches.
+    """
+    import os
+
+    from src.config.settings import HOST_MODE
+
+    env_key = provider_info.get("env_key")
+    if HOST_MODE != "oss" or not env_key:
+        return None
+    return os.getenv(env_key) or None
+
+
+def _default_route() -> tuple[str | None, dict]:
+    """The provider the deployment's default model runs on with no user key,
+    and its manifest entry; ``(None, {})`` without a default model."""
+    from src.llms.llm import LLM as LLMFactory
+
+    model = system_default_models()["default_model"]
+    mc = LLMFactory.get_model_config()
+    entry = mc.get_model_config(model) if model else None
+    if not entry:
+        return None, {}
+    # Built without a user key, the client takes the system route (``LLM``).
+    provider = entry.get("system_provider") or entry.get("provider")
+    return provider, mc.get_provider_info(provider)
+
+
+def deployment_local_provider() -> str | None:
+    """The local server the deployment's default model runs on, standalone,
+    where the server is its user's too. It needs no key, so nothing the user
+    stored says it is there, and the key list names it on this."""
+    from src.config.settings import HOST_MODE
+
+    provider, info = _default_route()
+    return provider if HOST_MODE == "oss" and info.get("access_type") == "local" else None
+
+
+def deployment_serves_default() -> bool:
+    """Whether a user with no credential of their own can run a turn: the
+    deployment's default model on the deployment's own key or local server.
+
+    Outside platform mode a turn needs no plan (the guard in ``messaging``), so
+    this is the whole question; the web's setup gate asks it so it stops
+    sending such a user to set up a provider the deployment already has. In
+    platform mode the plan answers instead.
+    """
+    provider, info = _default_route()
+    if provider is None:
+        return False
+    if info.get("access_type") == "local":
+        return deployment_local_provider() is not None
+    return deployment_key(info) is not None
+
+
 # ---------------------------------------------------------------------------
 # Resolution stages. ``resolve_llm_config`` sequences these; each owns one
 # question and mutates the request-scoped config copy in place.
@@ -115,10 +174,16 @@ def system_default_models() -> dict[str, str]:
 
 @dataclass(frozen=True)
 class ModelSelection:
-    """Which model this turn runs, and the ``LLMConfig`` field that named it."""
+    """Which model this turn runs, and the ``LLMConfig`` field that named it.
+
+    ``users_fallbacks`` is whether ``llm.fallback`` is a list the user saved,
+    even an empty one, rather than the deployment's: only theirs may move an
+    own-key turn onto the platform's key.
+    """
 
     effective_model: str
     model_field: str
+    users_fallbacks: bool
 
 
 def select_model(
@@ -208,6 +273,7 @@ def select_model(
     return ModelSelection(
         effective_model=slot_model(config.llm, slot),
         model_field=model_field,
+        users_fallbacks=user_fallback is not None,
     )
 
 
@@ -363,7 +429,7 @@ async def check_model_available(
     resolver needs to tell "no usable key" from "no client wanted yet".
     """
     # Classify via the single entry point. System and custom share a flat
-    # namespace (enforced by ``_validate_custom_models``), so one call answers
+    # namespace (enforced by ``validate_custom_models``), so one call answers
     # the question for the entire downstream flow.
     source, resolved_config = await user_models.classify_model(
         user_id, effective_model, _pref_cache=model_pref
@@ -379,10 +445,12 @@ async def check_model_available(
         is not None
     )
 
-    # Custom model/provider requires BYOK. No silent fallback — raise a clear
-    # error so the frontend can show a CTA linking to Settings.
+    # Custom model/provider requires BYOK, unless a subscription serves it.
+    # No silent fallback — raise a clear error so the frontend can show a CTA
+    # linking to Settings.
     if (is_custom or is_custom_provider) and not is_byok:
-        raise_byok_key_required(effective_model)
+        if not (is_custom and on_subscription(resolved_config)):
+            raise_byok_key_required(effective_model)
 
     # Stale-model recovery. Scrub prefs if the user's saved name is the
     # culprit; raise a user-facing CTA either way. YAML-default UNKNOWN
@@ -525,6 +593,7 @@ async def resolve_llm_config(
         reasoning_effort=reasoning_effort,
         fast_mode=fast_mode,
         user_defined=user_defined,
+        users_fallbacks=selection.users_fallbacks,
     )
     # DALTON-HOOK(subagent-model-pin): only inspect subagents compiled for this
     # turn's role on the primary slot.

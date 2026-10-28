@@ -87,7 +87,7 @@
       "Cash model google/gemini-3.8-flash (ocb-google-gemini-3.8-flash) has cache_5m=1.5 > 0; verify cache_write_tokens metering.",
       "Cash model google/gemini-3.1-pro-preview (ocb-google-gemini-3.1-pro-preview) has cache_5m=4.0 > 0; verify cache_write_tokens metering.",
       "Cash model openai/gpt-6-astra (ocb-openai-gpt-6-astra) has cache_5m=12.5 > 0; verify cache_write_tokens metering.",
-      "Cash model openai/gpt-5.6-terra (ocb-openai-gpt-5.6-terra) has cache_5m=2.5 > 0; verify cache_write_tokens metering.",
+      "Cash model openai/gpt-6.1-terra (ocb-openai-gpt-6.1-terra) has cache_5m=2.5 > 0; verify cache_write_tokens metering.",
       "Cash model openai/gpt-6.1-sol (ocb-openai-gpt-6.1-sol) has cache_5m=2.5 > 0; verify cache_write_tokens metering.",
       "Cash model openai/gpt-6-luna (ocb-openai-gpt-6-luna) has cache_5m=0.125 > 0; verify cache_write_tokens metering."
     ]
@@ -505,10 +505,10 @@
         "write": "parameters.reasoning_effort"
       }
     },
-    "ocb-openai-gpt-5.6-terra": {
-      "model_id": "openai/gpt-5.6-terra",
+    "ocb-openai-gpt-6.1-terra": {
+      "model_id": "openai/gpt-6.1-terra",
       "provider": "openclaw-broker",
-      "display_name": "GPT-5.6 Terra · OpenClaw",
+      "display_name": "GPT-6.1 Terra · OpenClaw",
       "visible": true,
       "speed": 3,
       "intelligence": 4,
@@ -1336,10 +1336,10 @@
           }
         },
         {
-          "id": "openai/gpt-5.6-terra",
-          "name": "GPT-5.6 Terra",
+          "id": "openai/gpt-6.1-terra",
+          "name": "GPT-6.1 Terra",
           "is_reasoning": true,
-          "description": "GPT-5.6 Terra via Dalton broker v2",
+          "description": "GPT-6.1 Terra via Dalton broker v2",
           "context_window": 872000,
           "max_output": 128000,
           "pricing": {
@@ -1351,7 +1351,7 @@
           },
           "notional_pricing": null,
           "dalton": {
-            "openclaw_ref": "openai/gpt-5.6-terra",
+            "openclaw_ref": "openai/gpt-6.1-terra",
             "upstream_provider": "openai",
             "family": "openai-gpt",
             "billing": "cash",

@@ -30,7 +30,7 @@ import { DURATION } from '@/lib/motion';
 import type { Computer, ComputerCreate, ComputerReinstall } from '@/types/api';
 
 import { useComputerProviders, useComputers } from '../hooks/useComputers';
-import { useReleaseRefusedRemoteControl, useThisMac } from '../hooks/useRemoteControl';
+import { useReleaseRefusedRemoteControl, useThisMac, useThisMacAvailability } from '../hooks/useRemoteControl';
 import { openComputerSpec, type ComputersPanelView } from '../hooks/computerPanelStore';
 import { deletedBeforeRefusal, useComputerActions, type ReconnectComputerVariables } from '../hooks/useComputerActions';
 import { useTierQuota } from '../hooks/useTierQuota';
@@ -89,7 +89,8 @@ function ComputersDialog({ panel, opening = 0, ...rest }: ComputersDialogProps) 
 
 /**
  * The New computer form: opened from the rail, or the opening's destination,
- * which has to wait until the plan is known to leave room for it.
+ * which has to wait until the plan is known to leave room for it. Either
+ * shows once what lays the form out is known.
  */
 type CreateForm = 'closed' | 'fromRail' | 'awaitingRoom' | 'destination';
 
@@ -153,13 +154,27 @@ function ComputersPanel({
   // Waits for the providers: until then which ones are open is unknown.
   const atCap = computerCapReached(quota);
   const createHeld = atCap && !!providerData && !providerData.providers.some((p) => !isProviderLocked(p, true));
-  // Opened onto the form, it waits until it is known not to be held (the list
-  // stays covered meanwhile); held, the list shows instead, where the held
-  // button says why.
-  if (createForm === 'awaitingRoom' && !providersLoading && !quotaLoading) {
+  // The form lays its cards out by the providers, the plan and whether this
+  // Mac is one, so it opens once all three are known: opened before the
+  // desktop app answers, it would enter on three cards and reflow to four.
+  const { settled: thisMacKnown } = useThisMacAvailability({ enabled: true });
+  // Its code too, fetched as the panel opens, or it would suspend to nothing
+  // in the list's place. A failed preload is not kept: the form's own mount
+  // imports it again, as the next opening does.
+  const [formLoaded, setFormLoaded] = useState(false);
+  useEffect(() => {
+    const done = () => setFormLoaded(true);
+    void CreateComputerDialog.preload().then(done, done);
+  }, []);
+  const createReady = formLoaded && !providersLoading && !quotaLoading && thisMacKnown;
+  // Either way in, the form waits until it can show and is known not to be
+  // held, the list covered meanwhile; held, the list shows instead, where the
+  // held button says why. A click from the rail can land before the plan is
+  // known, so it is checked again here.
+  if (createReady && (createForm === 'awaitingRoom' || (createForm === 'fromRail' && createHeld))) {
     setCreateForm(createHeld ? 'closed' : 'destination');
   }
-  const createOpen = createForm === 'fromRail' || createForm === 'destination';
+  const createOpen = (createForm === 'fromRail' && createReady) || createForm === 'destination';
 
   const { power, renameComputerTo, turnOffAlwaysOn, setFilesBackup, create, remove, makePrimary, reinstall, reconnect } =
     useComputerActions();
@@ -177,11 +192,6 @@ function ComputersPanel({
     ? (sshLimitMessage(create.error, t) ?? entitlementErrorMessage(create.error, t, create.variables?.resource_tier))
     : null;
   const removeError = remove.error ? removeErrorMessage(remove.error, t) : null;
-
-  // A failed preload is not kept: the next opening imports it again.
-  useEffect(() => {
-    void CreateComputerDialog.preload().catch(() => {});
-  }, []);
 
   const actionsFor = (computer: Computer): MachineActions => {
     const computerId = computer.computer_id;

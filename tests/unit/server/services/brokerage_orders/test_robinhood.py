@@ -1018,3 +1018,271 @@ def test_the_chain_symbol_above_the_legs_names_the_contract():
         vendor_instrument_id=OPTION_ID,
         multiplier=100,
     )
+
+
+# ------------------------------------------------- advanced orders, approvals
+
+# The request is the vendor's published schema. The answers are not published:
+# the descriptions say an advanced order carries an id and its legs' equity
+# orders, and an approval an approval_id and one of five states, and these
+# bodies hold exactly that, beside the equity order shape a live account gave.
+ADVANCED_ID = "5f6a7b8c-9999-4000-8000-000000000009"
+APPROVAL_ID = "6a7b8c9d-aaaa-4000-8000-00000000000a"
+
+ADVANCED_PLACE_ARGS = {
+    "account_number": ACCOUNT,
+    "symbol": "AAPL",
+    "side": "sell",
+    "quantity": "10",
+    "take_profit_limit_price": "250.00",
+    "stop_loss_stop_price": "200.00",
+    "time_in_force": "gtc",
+    "market_hours": "regular_hours",
+    "ref_id": "7b8c9d0e-bbbb-4000-8000-00000000000b",
+}
+
+
+def _leg(trigger: str, state: str, **fields) -> dict:
+    return {
+        "id": f"leg-{trigger}",
+        "symbol": "AAPL",
+        "side": "sell",
+        "quantity": "10.000000",
+        "type": "limit" if trigger == "immediate" else "market",
+        "trigger": trigger,
+        "price": "250.000000" if trigger == "immediate" else None,
+        "stop_price": "200.000000" if trigger == "stop" else None,
+        "state": state,
+        "cumulative_quantity": "0.000000",
+        "average_price": None,
+        "fees": "0.000000",
+        "time_in_force": "gtc",
+        "market_hours": "regular_hours",
+        **fields,
+    }
+
+
+def _advanced(*legs: dict) -> dict:
+    return {
+        "id": ADVANCED_ID,
+        "account_number": ACCOUNT,
+        "contingency_type": "oco",
+        "created_at": "2026-10-27T15:00:00.000000Z",
+        "legs": list(legs),
+    }
+
+
+def test_an_advanced_order_is_an_equity_combo_of_its_two_legs():
+    order = RH.parse_request("place_advanced_order", ADVANCED_PLACE_ARGS)
+
+    assert order.mode is OrderMode.LIVE
+    assert order.asset_class == "equity"
+    assert order.side == "sell"
+    assert order.qty == Decimal("10")
+    assert order.order_type is None and order.limit_price is None
+    assert order.instrument.strategy == "oco"
+    take, stop = order.instrument.legs
+    assert (take["leg"], take["order_type"], take["limit_price"]) == ("take_profit", "limit", "250")
+    assert (stop["leg"], stop["order_type"], stop["stop_price"]) == ("stop_loss", "stop", "200")
+    assert order.time_in_force == "gtc"
+    assert order.session == "rth"
+    assert order.extras == {"ref_id": ADVANCED_PLACE_ARGS["ref_id"]}
+
+
+def test_a_placed_advanced_order_is_read_off_its_legs():
+    body = {"data": _advanced(_leg("immediate", "confirmed"), _leg("stop", "confirmed"))}
+    outcome = RH.parse_result("place_advanced_order", json.dumps(body), tool_status="success")
+
+    assert outcome.status is AttemptStatus.WORKING
+    assert outcome.vendor_order_id == ADVANCED_ID
+
+
+@pytest.mark.parametrize(
+    "tool, args",
+    [
+        ("place_advanced_order", ADVANCED_PLACE_ARGS),
+        ("place_equity_order", EQUITY_PLACE_ARGS),
+    ],
+)
+def test_a_placement_waiting_on_the_customer_names_its_approval(tool, args):
+    """With approvals on, the call places nothing: it waits on the customer."""
+    body = {"data": {"approval_id": APPROVAL_ID, "customer_approval_required": True}}
+    request = RH.parse_request(tool, args)
+    outcome = RH.parse_result(tool, json.dumps(body), tool_status="success", request=request)
+
+    assert outcome.status is AttemptStatus.PENDING_CONFIRM
+    assert outcome.vendor_order_id == APPROVAL_ID
+    assert outcome.route == {"approval_id": APPROVAL_ID}
+    assert RH.status_query(
+        request, vendor_order_id=APPROVAL_ID, route=outcome.route
+    ) == StatusQuery(
+        "get_trade_approvals", {"account_number": ACCOUNT, "approval_ids": [APPROVAL_ID]}
+    )
+
+
+CRYPTO_APPROVAL_ARGS = {
+    "rhs_account_number": "812345678",
+    "symbol": "BTC",
+    "side": "buy",
+    "type": "market",
+    "dollar_amount": "100.00",
+}
+
+
+def test_a_crypto_approval_is_read_in_the_account_the_approvals_read_takes():
+    """A crypto placement names the numeric account, which the approvals read refuses."""
+    body = {"data": {"approval_id": APPROVAL_ID, "customer_approval_required": True}}
+    request = RH.parse_request("place_crypto_order", CRYPTO_APPROVAL_ARGS)
+    outcome = RH.parse_result(
+        "place_crypto_order", json.dumps(body), tool_status="success", request=request
+    )
+    assert outcome.status is AttemptStatus.PENDING_CONFIRM
+
+    first = RH.status_query(request, vendor_order_id=APPROVAL_ID, route=outcome.route)
+    assert (first.tool, first.args) == ("get_accounts", {})
+
+    accounts = {
+        "data": {
+            "accounts": [
+                {"account_number": "5QR00002", "rhs_account_number": "800000000"},
+                {"account_number": "5QR00001", "rhs_account_number": 812345678},
+            ]
+        }
+    }
+    assert RH.parse_status(first, json.dumps(accounts)) == []
+    second = RH.next_page(first, json.dumps(accounts))
+    assert second == StatusQuery(
+        "get_trade_approvals", {"account_number": "5QR00001", "approval_ids": [APPROVAL_ID]}
+    )
+
+    approved = {"data": {"approvals": [{"approval_id": APPROVAL_ID, "state": "approved"}]}}
+    (listed,) = RH.parse_status(second, json.dumps(approved))
+    assert listed.outcome.status is AttemptStatus.HANDED_OFF
+    assert RH.next_page(second, json.dumps(approved)) is None
+
+
+@pytest.mark.parametrize(
+    "accounts",
+    [
+        {"data": {"accounts": [{"account_number": "5QR00002", "rhs_account_number": "1"}]}},
+        {"data": {}},
+        "API error 401: unauthorized",
+    ],
+)
+def test_no_account_to_read_a_crypto_approval_in_is_not_an_empty_read(accounts):
+    """An empty listing would read as the approval gone, so the read fails instead."""
+    first = StatusQuery(
+        "get_accounts",
+        carry={"rhs_account_number": "812345678", "approval_id": APPROVAL_ID},
+    )
+    body = accounts if isinstance(accounts, str) else json.dumps(accounts)
+    with pytest.raises(StatusReadError):
+        RH.parse_status(first, body)
+    with pytest.raises(StatusReadError):
+        RH.next_page(first, body)
+
+
+@pytest.mark.parametrize(
+    "state, status",
+    [
+        ("pending", AttemptStatus.PENDING_CONFIRM),
+        ("APPROVAL_STATE_APPROVED", AttemptStatus.HANDED_OFF),
+        ("auto-approved", AttemptStatus.HANDED_OFF),
+        ("declined", AttemptStatus.CANCELLED),
+        ("expired", AttemptStatus.EXPIRED),
+        ("something_new", AttemptStatus.UNKNOWN),
+    ],
+)
+def test_an_approval_read_settles_what_the_customer_did(state, status):
+    query = StatusQuery(
+        "get_trade_approvals", {"account_number": ACCOUNT, "approval_ids": [APPROVAL_ID]}
+    )
+    body = {"data": {"approvals": [{"approval_id": APPROVAL_ID, "state": state}]}}
+
+    (listed,) = RH.parse_status(query, json.dumps(body))
+
+    assert listed.vendor_order_id == APPROVAL_ID
+    assert listed.outcome.status is status
+
+
+def test_a_decline_addresses_the_approval_and_the_read_finishes_it():
+    args = {"account_number": ACCOUNT, "approval_id": APPROVAL_ID}
+    request = RH.parse_request("decline_trade_approval", args)
+
+    assert request.mode is OrderMode.LIVE
+    assert request.target_ref == APPROVAL_ID
+    assert request.extras == {"approval_id": APPROVAL_ID}
+
+    taken = RH.parse_result(
+        "decline_trade_approval", json.dumps({"data": {}}), tool_status="success", request=request
+    )
+    assert taken.status is AttemptStatus.SUBMITTED
+    assert taken.vendor_order_id == APPROVAL_ID
+    assert RH.status_query(request, vendor_order_id=APPROVAL_ID, route=taken.route).tool == (
+        "get_trade_approvals"
+    )
+
+    named = RH.parse_result(
+        "decline_trade_approval",
+        json.dumps({"data": {"approval_id": APPROVAL_ID, "state": "declined"}}),
+        tool_status="success",
+        request=request,
+    )
+    assert named.status is AttemptStatus.CANCELLED
+
+
+@pytest.mark.parametrize(
+    "legs, status, filled",
+    [
+        ((_leg("immediate", "filled", cumulative_quantity="10", average_price="250"),
+          _leg("stop", "cancelled")), AttemptStatus.FILLED, Decimal("10")),
+        ((_leg("immediate", "partially_filled", cumulative_quantity="4", average_price="250"),
+          _leg("stop", "confirmed")), AttemptStatus.PARTIALLY_FILLED, Decimal("4")),
+        ((_leg("immediate", "cancelled"), _leg("stop", "cancelled")),
+         AttemptStatus.CANCELLED, Decimal("0")),
+        ((_leg("immediate", "confirmed"), _leg("stop", "confirmed")),
+         AttemptStatus.WORKING, Decimal("0")),
+    ],
+)
+def test_an_advanced_listing_settles_on_its_legs(legs, status, filled):
+    """Filling one leg cancels the other, so a filled leg is a filled order."""
+    query = StatusQuery("get_advanced_orders", {"account_number": ACCOUNT, "order_id": ADVANCED_ID})
+    body = {"data": {"advanced_orders": [_advanced(*legs)]}}
+
+    (listed,) = RH.parse_status(query, json.dumps(body))
+
+    assert listed.vendor_order_id == ADVANCED_ID
+    assert listed.outcome.status is status
+    assert listed.outcome.filled_qty == filled
+
+
+def test_an_advanced_listing_pairs_with_the_call_that_placed_it():
+    query = StatusQuery("get_advanced_orders", {"account_number": ACCOUNT})
+    body = {"data": {"advanced_orders": [_advanced(_leg("immediate", "confirmed"), _leg("stop", "confirmed"))]}}
+    (listed,) = RH.parse_status(query, json.dumps(body))
+    request = RH.parse_request("place_advanced_order", ADVANCED_PLACE_ARGS)
+
+    assert RH.match_key(request).matches(listed.match_key)
+    other = RH.parse_request(
+        "place_advanced_order", {**ADVANCED_PLACE_ARGS, "stop_loss_stop_price": "190"}
+    )
+    assert not RH.match_key(other).matches(listed.match_key)
+
+
+def test_an_advanced_order_and_its_cancel_are_read_from_their_own_list():
+    placed = RH.parse_request("place_advanced_order", ADVANCED_PLACE_ARGS)
+    cancel = RH.parse_request(
+        "cancel_advanced_order", {"account_number": ACCOUNT, "order_id": ADVANCED_ID}
+    )
+
+    assert cancel.target_ref == ADVANCED_ID
+    for order in (placed, cancel):
+        assert RH.status_query(order, vendor_order_id=ADVANCED_ID) == StatusQuery(
+            "get_advanced_orders", {"account_number": ACCOUNT, "order_id": ADVANCED_ID}
+        )
+    acknowledged = RH.parse_result(
+        "cancel_advanced_order", json.dumps(CANCEL_RESULT), tool_status="success", request=cancel
+    )
+    assert acknowledged.status is AttemptStatus.SUBMITTED
+    assert acknowledged.vendor_order_id == ADVANCED_ID
+

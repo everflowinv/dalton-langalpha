@@ -946,6 +946,7 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
         || workspaceStarting
         || isCompacting
         || threadModel.retired
+        || threadModel.lapsed
         || threadModel.offer
         || threadSubagents.offer !== null) && (
         <div style={{ padding: '0 12px', display: 'flex', flexDirection: 'column', gap: 6 }}>

@@ -17,6 +17,7 @@ export const ORDER_STATUS_GROUP_KEY: Record<OrderStatusGroup, string> = {
   open: 'orders.statusGroup.open',
   filled: 'orders.statusGroup.filled',
   cancelled: 'orders.statusGroup.cancelled',
+  expired: 'orders.statusGroup.expired',
   handed_off: 'orders.statusGroup.handedOff',
   rejected: 'orders.statusGroup.rejected',
   failed: 'orders.statusGroup.failed',

@@ -14,7 +14,8 @@ import { useAllModels } from '@/hooks/useAllModels';
 import { usePreferences } from '@/hooks/usePreferences';
 import { useUpdatePreferences } from '@/hooks/useUpdatePreferences';
 import { useTranslation } from 'react-i18next';
-import { modelPrefs, splitPreferenceWrite } from '@/lib/modelPreferences';
+import { modelPrefs, splitPreferenceWrite, starredModels } from '@/lib/modelPreferences';
+import { apiErrorDetail } from '@/api/errors';
 import { suggestBackgroundModel } from './suggestBackgroundModel';
 import { useModelSlotCopy } from '@/components/model/useModelSlotCopy';
 
@@ -22,9 +23,23 @@ import { useModelSlotCopy } from '@/components/model/useModelSlotCopy';
 // DefaultsStep — Step 5: Set default primary + Background models
 // ---------------------------------------------------------------------------
 
+/**
+ * Setup sits outside the onboarding provider, so after a reload this step can
+ * mount before the preferences have arrived. The slots are seeded once, from
+ * what is saved, so the form mounts again when they arrive; until then nothing
+ * is filled and Continue stays off, or it would write the first-run fills over
+ * the saved defaults.
+ */
 export default function DefaultsStep() {
+  const { isLoaded, isLoading } = usePreferences();
+  return (
+    <DefaultsForm key={isLoaded ? 'loaded' : 'unread'} prefsLoaded={isLoaded} prefsFailed={!isLoaded && !isLoading} />
+  );
+}
+
+function DefaultsForm({ prefsLoaded, prefsFailed }: { prefsLoaded: boolean; prefsFailed: boolean }) {
   const navigate = useNavigate();
-  const { models, metadata, modelAccessMap, isLoading } = useAllModels();
+  const { models, metadata, payers, systemDefaults, isLoading } = useAllModels();
   const { preferences } = usePreferences();
   const updatePreferences = useUpdatePreferences();
   const { t } = useTranslation();
@@ -56,14 +71,25 @@ export default function DefaultsStep() {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  // A first run starts with a default model rather than an empty required
+  // slot: the deployment's own when this user can run it, else the first model
+  // they just picked. Set during render like the Background fill below.
+  const available = Object.values(models).flatMap((p) => p.models ?? []);
+  const primaryFill = !primaryModel && !isLoading && prefsLoaded
+    ? [systemDefaults?.default_model, ...starredModels(preferences)].find(
+        (m): m is string => typeof m === 'string' && available.includes(m),
+      ) ?? available[0]
+    : undefined;
+  if (primaryFill) setPrimaryModel(primaryFill);
+
   // A first run fills both defaults, so an empty Background slot takes a model to
   // go with the primary, set during render so the slot never paints empty.
   // The fill is a pick like any other: it stays when the primary changes, and
   // nothing is saved before Continue.
-  const backgroundFill = !backgroundModel && primaryModel ? suggestBackgroundModel(models, primaryModel) : undefined;
+  const backgroundFill = !backgroundModel && primaryModel && prefsLoaded ? suggestBackgroundModel(models, primaryModel) : undefined;
   if (backgroundFill) setBackgroundModel(backgroundFill);
 
-  const canContinue = Boolean(primaryModel && backgroundModel);
+  const canContinue = prefsLoaded && Boolean(primaryModel && backgroundModel);
 
   // ---------------------------------------------------------------------------
   // Handlers
@@ -81,7 +107,7 @@ export default function DefaultsStep() {
   );
 
   const handleNext = useCallback(async () => {
-    if (!primaryModel || !backgroundModel) return;
+    if (!canContinue) return;
 
     setSaving(true);
     setError(null);
@@ -104,13 +130,12 @@ export default function DefaultsStep() {
 
       navigate('/setup/ready');
     } catch (e: unknown) {
-      const err = e as { response?: { data?: { detail?: string } }; message?: string };
-      const detail = err?.response?.data?.detail;
-      setError(typeof detail === 'string' ? detail : err?.message ?? t('setup.errorSavePrefs'));
+      const detail = apiErrorDetail(e);
+      setError(typeof detail === 'string' ? detail : (e instanceof Error && e.message) || t('setup.errorSavePrefs'));
     } finally {
       setSaving(false);
     }
-  }, [primaryModel, backgroundModel, advancedModels, updatePreferences, navigate, t]);
+  }, [canContinue, primaryModel, backgroundModel, advancedModels, updatePreferences, navigate, t]);
 
   // ---------------------------------------------------------------------------
   // Render
@@ -162,7 +187,7 @@ export default function DefaultsStep() {
         backgroundModel={backgroundModel}
         onBackgroundModelChange={setBackgroundModel}
         showExplainer
-        modelAccess={modelAccessMap}
+        payers={payers}
         metadata={metadata}
       />
 
@@ -201,7 +226,7 @@ export default function DefaultsStep() {
                   onChange={(v) => handleAdvancedChange({ fetchModel: v })}
                   models={models}
                   placeholder={copy.defaultsToBackground}
-                  modelAccess={modelAccessMap}
+                  payers={payers}
                   metadata={metadata}
                 />
                 <ModelSelector
@@ -211,7 +236,7 @@ export default function DefaultsStep() {
                   onChange={(v) => handleAdvancedChange({ compactionModel: v })}
                   models={models}
                   placeholder={copy.defaultsToConversation}
-                  modelAccess={modelAccessMap}
+                  payers={payers}
                   metadata={metadata}
                 />
                 <FallbackModelsPicker
@@ -219,12 +244,20 @@ export default function DefaultsStep() {
                   onChange={(list) => handleAdvancedChange({ fallbackModels: list })}
                   models={models}
                   metadata={metadata}
+                  payers={payers}
                 />
               </div>
             </motion.div>
           )}
         </AnimatePresence>
       </div>
+
+      {/* A read that failed: nothing is filled, and nothing can be saved over it. */}
+      {prefsFailed && (
+        <p role="alert" className="text-sm" style={{ color: 'var(--color-loss)' }}>
+          {t('settings.failedToLoadModels')}
+        </p>
+      )}
 
       {/* Error */}
       {error && (

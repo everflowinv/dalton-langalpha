@@ -7,6 +7,10 @@ import { useWorkspaceActions } from './workspaceActions';
 import { isEffectivelyPinned } from '../hooks/useNavigationData';
 import type { NavWorkspace } from '../hooks/useNavigationData';
 import { useIsMobile } from '@/hooks/useIsMobile';
+// DALTON-HOOK(colleague-dispatch): pass caller identity and tier into sidebar rows for context-menu gating
+import { isDaltonAuth } from '@/config/daltonAuth';
+import { useUser } from '@/hooks/useUser';
+import { useTeamWorkspaces } from './dalton/TeamSharing';
 import {
   expandedWorkspaces,
   expandedThreads,
@@ -20,6 +24,8 @@ import type { SidebarAgentRow } from '../session/subagents/subagentStatus';
 import { WorkspaceTreeRow, WorkspaceDragChip } from './NavigationRows';
 import type { ThreadsData } from './NavigationRows';
 import { useArchiveThreadConfirm } from './threadArchiveAction';
+import { useThreadDeleteConfirm } from './threadDeleteAction';
+import ShareThreadDialog, { type ShareThreadTarget } from './ShareThreadDialog';
 import { NavTreeContext, useNavTreeKit } from './navTreeKit';
 import './NavigationPanel.css';
 
@@ -55,6 +61,10 @@ interface NavigationPanelProps {
   onPinThread?: (wsId: string, threadId: string, pinned: boolean) => void;
   /** Archive a thread — removes it from the sidebar (hover action). */
   onArchiveThread?: (wsId: string, threadId: string) => void;
+  /** Persist a thread rename (right-click menu → inline edit). */
+  onRenameThread?: (wsId: string, threadId: string, title: string, previousTitle: string) => void;
+  /** Delete a thread for good (right-click menu, after a confirm). Rejects when the server refuses. */
+  onDeleteThread?: (wsId: string, threadId: string) => Promise<unknown>;
   /** Right-aligned controls (pin, minimize) rendered in a header row above the list. */
   headerActions?: React.ReactNode;
 }
@@ -99,10 +109,17 @@ function NavigationPanel({
   onNewThread,
   onPinThread,
   onArchiveThread,
+  onRenameThread,
+  onDeleteThread,
   headerActions,
 }: NavigationPanelProps) {
   const { t } = useTranslation();
   const isMobile = useIsMobile();
+  // DALTON-HOOK(colleague-dispatch): subscribe to current user and team workspaces so row permissions stay reactive
+  const { user: currentUser } = useUser({ enabled: isDaltonAuth });
+  const { data: teamData } = useTeamWorkspaces(isDaltonAuth);
+  const currentUserId = currentUser?.user_id ?? null;
+  const callerTier = teamData?.caller_tier ?? null;
   const rootRef = useRef<HTMLDivElement>(null);
   const navTree = useNavTreeKit(rootRef);
   const { TreeRoot } = navTree.kit;
@@ -124,6 +141,16 @@ function NavigationPanel({
   const handleArchiveThread = useCallback((wsId: string, threadId: string) => {
     requestArchive(threadId, () => onArchiveThread?.(wsId, threadId));
   }, [requestArchive, onArchiveThread]);
+  // The right-click menu's delete and share open one dialog each here, for
+  // the same reason.
+  const { requestDelete, dialog: deleteDialog } = useThreadDeleteConfirm();
+  const handleDeleteThread = useCallback((wsId: string, threadId: string, title: string) => {
+    requestDelete(title, async () => { await onDeleteThread?.(wsId, threadId); });
+  }, [requestDelete, onDeleteThread]);
+  const [shareTarget, setShareTarget] = useState<ShareThreadTarget | null>(null);
+  const handleShareThread = useCallback((wsId: string, threadId: string) => {
+    setShareTarget({ workspaceId: wsId, threadId });
+  }, []);
   // Id of the workspace currently being dragged — drives the DragOverlay chip.
   const [activeDragId, setActiveDragId] = useState<string | null>(null);
   // Subscribe to the shared expansion store (navExpansionStore). One panel mounts
@@ -383,6 +410,9 @@ function NavigationPanel({
                 expandedThreadIds={expandedThreadIds}
                 agents={agents}
                 activeAgentId={activeAgentId}
+                // DALTON-HOOK(colleague-dispatch): pass caller identity and tier into WorkspaceTreeRow
+                currentUserId={currentUserId}
+                callerTier={callerTier}
                 wsActions={rowActions}
                 rename={renamingWsId === wsId ? activeRename : inactiveRename}
                 onToggleWorkspace={toggleWorkspace}
@@ -395,6 +425,9 @@ function NavigationPanel({
                 onNewThread={onNewThread}
                 onPinThread={onPinThread}
                 onArchiveThread={onArchiveThread ? handleArchiveThread : undefined}
+                onRenameThread={onRenameThread}
+                onShareThread={handleShareThread}
+                onDeleteThread={onDeleteThread ? handleDeleteThread : undefined}
               />
             );
           })}
@@ -416,6 +449,8 @@ function NavigationPanel({
       </ScrollArea>
       {wsActions.dialogs}
       {archiveDialog}
+      {deleteDialog}
+      <ShareThreadDialog target={shareTarget} onClose={() => setShareTarget(null)} />
     </div>
   );
 }

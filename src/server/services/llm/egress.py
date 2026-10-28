@@ -598,7 +598,7 @@ def sdk_transport(family: str):
         return _HeldHttpx2(_OpenAIEndpointRefused, shared=True)
     if family == "anthropic":
         return _HeldHttpx(_AnthropicEndpointRefused, shared=True)
-    if family == "gemini":
+    if family in ("gemini", "openrouter"):
         return _HeldHttpx(EndpointRefused, shared=True)
     raise ValueError(f"No held transport for SDK family {family!r}")
 
@@ -606,6 +606,22 @@ def sdk_transport(family: str):
 def http_transport():
     """The held transport for a plain ``httpx`` client, its own to close."""
     return _HeldHttpx(EndpointRefused)
+
+
+async def user_endpoint_transport(base_url: str | None):
+    """The transport a plain request to a base URL the user supplied goes out on.
+
+    None where the policy does not apply: outside platform mode, no URL, or an
+    operator's endpoint. Otherwise a URL the policy refuses raises
+    ``EndpointRefused`` now, and the rest go out pinned, so a name that
+    resolves elsewhere by the time it is dialed cannot carry the request inside.
+    """
+    if not enforced() or not base_url or is_operator_endpoint(base_url):
+        return None
+    reason = await endpoint_refusal(base_url)
+    if reason:
+        raise EndpointRefused(f"Base URL cannot be used: {reason}")
+    return http_transport()
 
 
 __all__ = [
@@ -619,6 +635,7 @@ __all__ = [
     "refuse_model_endpoints",
     "routing_params",
     "sdk_transport",
+    "user_endpoint_transport",
     "user_endpoints",
     "vertex_params",
 ]

@@ -292,7 +292,7 @@ async def test_platform_key_test_refuses_a_private_base_url(client, monkeypatch)
             "src.utils.cache.redis_cache.get_cache_client",
             return_value=MagicMock(enabled=False),
         ),
-        patch(f"{DB}._test_openai_key", new_callable=AsyncMock) as probe,
+        patch("src.server.services.llm.key_probe.check_key", new_callable=AsyncMock) as probe,
     ):
         resp = await client.post(
             "/api/v1/keys/test",
@@ -383,19 +383,26 @@ async def test_remove_api_key(client):
             new_callable=AsyncMock,
             return_value=updated,
         ),
+        patch(f"{DB}.invalidate_byok_cache", new_callable=AsyncMock) as invalidate,
     ):
         resp = await client.delete("/api/v1/users/me/api-keys/openai")
 
     assert resp.status_code == 200
     mock_delete.assert_awaited_once_with("test-user-123", "openai")
+    # Or the next turn still reads the deleted key's cached BYOK status.
+    invalidate.assert_awaited_once_with("test-user-123")
 
 
 @pytest.mark.asyncio
 async def test_remove_api_key_unsupported_provider(client):
-    with patch(
-        f"{DB}._get_custom_providers",
-        new_callable=AsyncMock,
-        return_value=[],
+    with (
+        patch(f"{DB}._get_custom_providers", new_callable=AsyncMock, return_value=[]),
+        patch(
+            f"{DB}.get_user_api_keys",
+            new_callable=AsyncMock,
+            return_value={"byok_enabled": True, "keys": {}, "base_urls": {}},
+        ),
+        patch(f"{DB}.delete_api_key", new_callable=AsyncMock) as mock_delete,
     ):
         resp = await client.delete(
             "/api/v1/users/me/api-keys/unknown_provider"
@@ -403,6 +410,83 @@ async def test_remove_api_key_unsupported_provider(client):
 
     assert resp.status_code == 400
     assert "Unsupported provider" in resp.json()["detail"]
+    mock_delete.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_remove_key_of_withdrawn_provider(client):
+    # A key saved before its provider left the list is still the user's to delete.
+    stored = {"byok_enabled": True, "keys": {"withdrawn-provider": "sk-old"}, "base_urls": {}}
+    with (
+        patch(f"{DB}._get_custom_providers", new_callable=AsyncMock, return_value=[]),
+        patch(f"{DB}.get_user_api_keys", new_callable=AsyncMock, return_value=stored),
+        patch(f"{DB}.delete_api_key", new_callable=AsyncMock) as mock_delete,
+        patch(f"{DB}.invalidate_byok_cache", new_callable=AsyncMock),
+        patch(f"{DB}.invalidate_available_models", new_callable=AsyncMock),
+    ):
+        resp = await client.delete("/api/v1/users/me/api-keys/withdrawn-provider")
+
+    assert resp.status_code == 200
+    mock_delete.assert_awaited_once_with("test-user-123", "withdrawn-provider")
+
+
+@pytest.mark.asyncio
+async def test_a_withdrawn_providers_key_is_listed_for_removal(client):
+    # Its own provider gone, or the one a custom provider was built on: listed
+    # as withdrawn so Settings offers to remove it, never as a connection.
+    stored = {
+        "byok_enabled": True,
+        "keys": {"openai": "sk-abc123def456xyz", "withdrawn-provider": "ark-old-key-91c2", "my-gw": "sk-gw-0000"},
+        "base_urls": {},
+    }
+    live = [{"name": "my-gw", "parent_provider": "openai"}]
+    with (
+        patch(f"{DB}.get_user_api_keys", new_callable=AsyncMock, return_value=stored),
+        patch(f"{DB}._get_custom_providers", new_callable=AsyncMock, return_value=live),
+    ):
+        resp = await client.get("/api/v1/users/me/api-keys")
+
+    rows = {p["provider"]: p for p in resp.json()["providers"]}
+    assert rows["withdrawn-provider"]["withdrawn"] is True
+    assert rows["withdrawn-provider"]["masked_key"] == "ark...91c2"
+    assert not rows["openai"].get("withdrawn") and not rows["my-gw"].get("withdrawn")
+
+
+@pytest.mark.asyncio
+async def test_a_custom_provider_named_like_a_built_in_lists_one_row(client):
+    # Saved before its name became a built-in: the key under the name is one
+    # key, so Settings shows one row for it, not two under the same slug.
+    stored = {"byok_enabled": True, "keys": {"openai": "sk-abc123def456xyz"}, "base_urls": {}}
+    legacy = [{"name": "openai", "parent_provider": "anthropic"}]
+    with (
+        patch(f"{DB}.get_user_api_keys", new_callable=AsyncMock, return_value=stored),
+        patch(f"{DB}._get_custom_providers", new_callable=AsyncMock, return_value=legacy),
+    ):
+        resp = await client.get("/api/v1/users/me/api-keys")
+
+    rows = [p for p in resp.json()["providers"] if p["provider"] == "openai"]
+    assert len(rows) == 1 and rows[0]["is_custom"] is False
+
+
+@pytest.mark.asyncio
+async def test_the_local_server_the_deployment_default_runs_on_is_listed(client):
+    # Nothing the user stored names it, but the deployment's default runs on
+    # it, so its models belong in the selector; it is the server's to remove.
+    stored = {"byok_enabled": True, "keys": {}, "base_urls": {}}
+    ollama = {"display_name": "Ollama", "access_type": "local", "brand_key": "ollama", "base_url": "http://localhost:11434/v1"}
+    with (
+        patch(f"{DB}._get_supported_providers", return_value=[*SUPPORTED_PROVIDERS, "ollama"]),
+        patch(f"{DB}._get_provider_info_map", return_value={**PROVIDER_INFO_MAP, "ollama": ollama}),
+        patch(f"{DB}.deployment_local_provider", return_value="ollama"),
+        patch(f"{DB}.get_user_api_keys", new_callable=AsyncMock, return_value=stored),
+        patch(f"{DB}._get_custom_providers", new_callable=AsyncMock, return_value=[]),
+    ):
+        resp = await client.get("/api/v1/users/me/api-keys")
+
+    row = next(p for p in resp.json()["providers"] if p["provider"] == "ollama")
+    assert row["has_key"] is True and row["masked_key"] == "(server)"
+    assert row["base_url"] == "http://localhost:11434/v1"
+
 
 
 # ---------------------------------------------------------------------------
@@ -451,72 +535,53 @@ async def test_list_models(client):
 
 
 # ---------------------------------------------------------------------------
-# GET /api/v1/providers/{parent}/visible-models
+# POST /api/v1/providers/custom/models
 # ---------------------------------------------------------------------------
 
+ENDPOINT_BODY = {"api_format": "openai-completions", "base_url": "https://gateway.example/v1", "api_key": "sk-x"}
+
 
 @pytest.mark.asyncio
-async def test_list_visible_models_returns_parent_catalog(client):
-    """Wizard endpoint returns the parent's visible models for one-click import."""
-    mock_mc = MagicMock()
-    mock_mc.get_provider_info.return_value = {"display_name": "OpenAI"}
-    mock_mc.get_display_name.return_value = "OpenAI"
-    mock_mc.get_model_config.side_effect = lambda name: {
-        "gpt-4o": {"model_id": "gpt-4o", "input_modalities": ["text", "image"]},
-        "gpt-4o-mini": {"model_id": "gpt-4o-mini"},
-    }.get(name)
-
-    mock_llm_cls = MagicMock()
-    mock_llm_cls.get_model_config.return_value = mock_mc
-
+async def test_endpoint_models_read_through_the_egress_check(client):
+    pinned = object()
+    listing = {"status": "ok", "recognized": [], "others": []}
     with (
-        patch("src.llms.llm.LLM", mock_llm_cls),
+        patch("src.utils.cache.redis_cache.get_cache_client", return_value=MagicMock(enabled=False)),
         patch(
-            "src.llms.llm.get_configured_llm_models",
-            return_value={"openai": ["gpt-4o", "gpt-4o-mini"]},
-        ),
+            "src.server.services.llm.egress.user_endpoint_transport",
+            new_callable=AsyncMock, return_value=pinned,
+        ) as probe,
+        patch(
+            "src.server.services.llm.provider_models.endpoint_models",
+            new_callable=AsyncMock, return_value=listing,
+        ) as read,
     ):
-        resp = await client.get("/api/v1/providers/openai/visible-models")
+        resp = await client.post("/api/v1/providers/custom/models", json=ENDPOINT_BODY)
 
     assert resp.status_code == 200
-    body = resp.json()
-    assert body["parent"] == "openai"
-    assert body["parent_display_name"] == "OpenAI"
-    names = [m["name"] for m in body["models"]]
-    assert names == ["gpt-4o", "gpt-4o-mini"]
-    # input_modalities echoed for the wizard to render capability chips
-    gpt4o = next(m for m in body["models"] if m["name"] == "gpt-4o")
-    assert gpt4o["input_modalities"] == ["text", "image"]
+    assert resp.json() == listing
+    probe.assert_awaited_once_with("https://gateway.example/v1")
+    read.assert_awaited_once_with("openai-completions", "https://gateway.example/v1", "sk-x", transport=pinned)
 
 
 @pytest.mark.asyncio
-async def test_list_visible_models_unknown_parent_returns_404(client):
-    """Unknown parent provider → 404, not 500."""
-    mock_mc = MagicMock()
-    mock_mc.get_provider_info.return_value = {}  # empty = unknown
-
-    mock_llm_cls = MagicMock()
-    mock_llm_cls.get_model_config.return_value = mock_mc
-
-    with patch("src.llms.llm.LLM", mock_llm_cls):
-        resp = await client.get("/api/v1/providers/unknown-brand/visible-models")
-
-    assert resp.status_code == 404
+async def test_endpoint_models_refuse_an_unknown_format(client):
+    resp = await client.post("/api/v1/providers/custom/models", json={**ENDPOINT_BODY, "api_format": "cohere"})
+    assert resp.status_code == 422
 
 
 @pytest.mark.asyncio
-async def test_list_visible_models_platform_only_rejected(client):
-    """Platform-only providers can't be imported through the wizard."""
-    mock_mc = MagicMock()
-    mock_mc.get_provider_info.return_value = {"platform": True}
+async def test_endpoint_models_are_rate_limited_per_user(client):
+    """Each read sends the user's key to an address they chose."""
+    with (
+        patch(f"{DB}.throttle", new_callable=AsyncMock, return_value=False) as throttle,
+        patch("src.server.services.llm.provider_models.endpoint_models", new_callable=AsyncMock) as read,
+    ):
+        resp = await client.post("/api/v1/providers/custom/models", json=ENDPOINT_BODY)
 
-    mock_llm_cls = MagicMock()
-    mock_llm_cls.get_model_config.return_value = mock_mc
-
-    with patch("src.llms.llm.LLM", mock_llm_cls):
-        resp = await client.get("/api/v1/providers/platform-proxy/visible-models")
-
-    assert resp.status_code == 400
+    assert resp.status_code == 429
+    throttle.assert_awaited_once_with("endpoint_models:test-user-123", 12, 60)
+    read.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
@@ -559,3 +624,133 @@ async def test_custom_providers_absent_is_empty():
 
     with patch("src.server.database.user.get_user_preferences", AsyncMock(return_value=None)):
         assert await _get_custom_providers("u1") == []
+
+
+# ---------------------------------------------------------------------------
+# OpenRouter key test: GET /key, since /models answers 200 to any key
+# ---------------------------------------------------------------------------
+
+
+def _openrouter_transport(status: int, body: dict, seen: list):
+    import httpx
+
+    def handle(request):
+        seen.append((request.url.path, request.headers.get("authorization")))
+        return httpx.Response(status, json=body)
+
+    return httpx.MockTransport(handle)
+
+
+@pytest.mark.asyncio
+async def test_openrouter_key_test_reports_what_the_key_may_spend():
+    from src.server.services.llm.key_probe import _test_openrouter_key
+
+    seen: list = []
+    body = {"data": {"label": "k", "limit": 10, "usage": 2.5, "limit_remaining": 7.5,
+                     "is_free_tier": False, "limit_reset": "monthly"}}
+    result = await _test_openrouter_key(
+        "sk-or-test", "m", {}, None, 5.0, transport=_openrouter_transport(200, body, seen)
+    )
+
+    assert seen == [("/api/v1/key", "Bearer sk-or-test")]
+    assert result["credits"] == {
+        "limit": 10.0, "usage": 2.5, "remaining": 7.5,
+        "is_free_tier": False, "limit_reset": "monthly",
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_gateway_under_the_openrouter_parent_is_not_asked_for_key():
+    """Only OpenRouter serves ``/key``. A gateway set up with OpenRouter as its
+    parent answered that route with a 401 of its own, which read as the key
+    failing; it gets the OpenAI-compatible test instead."""
+    import httpx
+
+    from src.server.services.llm.key_probe import _test_openrouter_key
+
+    seen: list = []
+
+    def handle(request):
+        seen.append(request.url.path)
+        if request.url.path.endswith("/models"):
+            return httpx.Response(200, json={"data": [{"id": "gw-model"}]})
+        return httpx.Response(401, json={"error": {"message": "unknown route"}})
+
+    result = await _test_openrouter_key(
+        "sk-gw", "m", {"sdk": "openrouter"}, "https://gateway.example/v1", 5.0,
+        transport=httpx.MockTransport(handle),
+    )
+
+    assert seen == ["/v1/models"]
+    assert result["models_found"] == 1
+
+
+@pytest.mark.asyncio
+async def test_openrouter_key_without_a_cap_has_no_remaining():
+    from src.server.services.llm.key_probe import openrouter_key_credits
+
+    credits = openrouter_key_credits(
+        {"data": {"limit": None, "usage": 0.42, "limit_remaining": None, "is_free_tier": True}}
+    )
+    assert credits == {
+        "limit": None, "usage": 0.42, "remaining": None,
+        "is_free_tier": True, "limit_reset": None,
+    }
+
+
+@pytest.mark.asyncio
+async def test_openrouter_bad_key_fails_the_test(client):
+    import httpx
+
+    seen: list = []
+    transport = _openrouter_transport(401, {"error": {"message": "User not found.", "code": 401}}, seen)
+    real_client = httpx.AsyncClient
+
+    with (
+        patch(f"{DB}._get_custom_providers", new_callable=AsyncMock, return_value=[]),
+        patch(
+            "src.utils.cache.redis_cache.get_cache_client",
+            return_value=MagicMock(enabled=False),
+        ),
+        patch(
+            "httpx.AsyncClient",
+            side_effect=lambda **kw: real_client(**{**kw, "transport": transport}),
+        ),
+    ):
+        resp = await client.post(
+            "/api/v1/keys/test", json={"provider": "openrouter", "api_key": "sk-or-bogus"}
+        )
+
+    assert resp.status_code == 200
+    assert resp.json()["success"] is False
+    assert resp.json()["error"] == "User not found."
+    assert seen and seen[0][0] == "/api/v1/key"
+
+
+@pytest.mark.asyncio
+async def test_key_test_has_one_deadline_across_its_requests(monkeypatch):
+    # A list that answers 404 is followed by a one-token call; a server that
+    # then trickles its answer must not hold the test past the deadline.
+    import asyncio
+
+    import httpx
+
+    from src.server.services.llm import key_probe
+
+    class _Trickle(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            while True:
+                await asyncio.sleep(0.05)
+                yield b" "
+
+    def handle(request):
+        if request.url.path.endswith("/models"):
+            return httpx.Response(404)
+        return httpx.Response(200, stream=_Trickle())
+
+    monkeypatch.setattr(key_probe, "TEST_TIMEOUT_S", 0.3)
+    with pytest.raises(key_probe.ProbeTimedOut):
+        await key_probe.check_key(
+            "openai", {"sdk": "openai", "base_url": "https://gw.example/v1"}, "sk-test", None,
+            transport=httpx.MockTransport(handle),
+        )

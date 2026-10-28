@@ -24,7 +24,7 @@ import {
   streamComputerEvents,
   streamWorkspaceEvents,
 } from '../utils/api';
-import { apiErrorStatus } from '../utils/api/errors';
+import { apiErrorStatus } from '@/api/errors';
 import {
   cachedWorkspaceLists,
   patchComputerStatusInCaches,

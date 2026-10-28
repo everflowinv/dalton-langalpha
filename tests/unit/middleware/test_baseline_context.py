@@ -45,7 +45,7 @@ from ptc_agent.agent.middleware.runtime_context import (
     MemoSource,
     MemoryTierSource,
     Observations,
-    TailEnvelopeMiddleware,
+    RowCarrierMiddleware,
     TurnContextMiddleware,
     advance_epoch,
     is_runtime_update_message,
@@ -76,6 +76,11 @@ from ptc_agent.core.paths import (
 STATE_BASELINE = "runtime_baseline"
 
 NOW = datetime(2026, 4, 5, 19, 42, tzinfo=UTC)
+
+
+def _unrendered(epoch: BaselineEpoch) -> dict[str, str]:
+    """A block renderer for an epoch no thinking is bound to, which never states a section."""
+    return {}
 
 
 def _rows(update: dict) -> list:
@@ -708,7 +713,7 @@ class TestCrossWriterChanges:
             text="original",
         )
         advanced, updates = advance_epoch(
-            epoch, Observations(now=NOW, reads=(read,))
+            epoch, Observations(now=NOW, reads=(read,)), _unrendered
         )
 
         assert len(updates) == 1
@@ -736,7 +741,7 @@ class TestProfileFollowsTheGoldenRule:
         "name": "Ada",
         "timezone": "Europe/Paris",
         "locale": "fr-FR",
-        "agent_preference": {"output_format": "html"},
+        "agent_preference": {"output_format": ["visual"]},
     }
     COUNTS = {"portfolio_count": 2, "watchlist_summary": "1:5", "prefs_set": True}
 
@@ -795,11 +800,11 @@ class TestProfileFollowsTheGoldenRule:
     async def test_a_preference_change_names_only_that_key(self):
         state = await self._turn(self.PROFILE, self.COUNTS).abefore_agent({}, None)
         later = self._turn(
-            {**self.PROFILE, "agent_preference": {"output_format": "markdown", "tone": "terse"}},
+            {**self.PROFILE, "agent_preference": {"output_format": ["text", "visual"], "tone": "terse"}},
             self.COUNTS,
         )
         row = runtime_update_from_message(_rows(await later.abefore_agent(state, None))[0])
-        assert "Preference output_format: markdown (the frozen block says html)" in row.text
+        assert "Preference output_format: text, visual (the frozen block says visual)" in row.text
         assert "Preference tone: terse (not in the frozen block)" in row.text
         assert "Timezone" not in row.text
 
@@ -1114,7 +1119,9 @@ class TestProfileFollowsTheGoldenRule:
         epoch = BaselineEpoch.from_state(
             {"profile": frozen.to_state(), "observed": {"profile": frozen.sha()}}
         )
-        assert advance_epoch(epoch, Observations(now=NOW, profile=frozen)) == (None, [])
+        assert advance_epoch(
+            epoch, Observations(now=NOW, profile=frozen), _unrendered
+        ) == (None, [])
 
 
 class TestSupersession:
@@ -1168,14 +1175,14 @@ class TestRendering:
             user_profile={
                 "name": "Ada",
                 "locale": "fr-FR",
-                "agent_preference": {"output_format": "html", "tone": "terse"},
+                "agent_preference": {"output_format": ["visual"], "tone": "terse"},
             },
             user_data_counts={"portfolio_count": 2, "watchlist_summary": "1:5"},
         )
         state = await mw.abefore_agent({}, None)
         text = _text(await _render(mw, state))
 
-        assert "Output Format: Styled HTML" in text
+        assert "Fit how you hand back an answer to the work behind it." in text
         assert "Default to the user's locale (fr-FR)" in text
         assert "**tone**: terse" in text
         assert ".agents/user/profile/portfolio.json" in text
@@ -1774,9 +1781,7 @@ class TestBreakpointBudget:
             [
                 AnthropicPromptCachingMiddleware(unsupported_model_behavior="ignore"),
                 mw,
-                TailEnvelopeMiddleware(
-                    now=datetime(2026, 4, 5, 19, 42, tzinfo=UTC), guidance="lean"
-                ),
+                RowCarrierMiddleware(),
             ],
             capture,
         )
@@ -1836,9 +1841,7 @@ class TestBreakpointBudget:
             captured["request"] = request
             return MagicMock()
 
-        tail = TailEnvelopeMiddleware(
-            now=datetime(2026, 4, 5, 19, 42, tzinfo=UTC), guidance="lean"
-        )
+        tail = RowCarrierMiddleware()
         request = _request({**state, **second}, rows=await _turn_row())
         request = request.override(messages=[*request.messages, *_rows(second)])
         await tail.awrap_model_call(request, capture)
@@ -2003,3 +2006,19 @@ class TestTheChannelsParagraph:
 
         assert BaselineEpoch.from_state(epoch.to_state()).channels_enabled is True
         assert "channels_enabled" not in BaselineEpoch().to_state()
+
+
+def test_a_summary_written_before_the_block_went_alone_restates_nothing():
+    """Its text already rides with the block, so restating it after the kept
+    turns would send it twice."""
+    from ptc_agent.agent.middleware.runtime_context.baseline import _compaction_note
+    from src.llms.provider_compaction import SIDECAR_KEY
+
+    def event(**marker):
+        carried = {"block": {"type": "compaction", "content": "x"}, "origin": "anthropic"}
+        carried |= {"text": "pointers", **marker}
+        summary = HumanMessage("[Context Summary] s", additional_kwargs={SIDECAR_KEY: carried})
+        return {"summary_message": summary}
+
+    assert _compaction_note(event(alone=True)) == "pointers"
+    assert _compaction_note(event()) is None

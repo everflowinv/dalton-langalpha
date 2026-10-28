@@ -15,7 +15,15 @@ export const PLATFORM_URL: string | null = isPlatformMode
   ? import.meta.env.VITE_PLATFORM_URL || '/account'
   : null;
 
-export const PLAN_URL: string | null = PLATFORM_URL ? `${PLATFORM_URL}/plans` : null;
+/** A page of the account portal, by its path (`plans`, `integrations`); null
+ *  where there is no portal. */
+export function consoleUrl(path: string): string | null {
+  return PLATFORM_URL && `${PLATFORM_URL}/${path}`;
+}
+
+export const PLAN_URL: string | null = consoleUrl('plans');
+
+export const INTEGRATIONS_URL: string | null = consoleUrl('integrations');
 
 export const SUPPORT_EMAIL: string | null =
   (import.meta.env.VITE_CONTACT_EMAILS ?? '')

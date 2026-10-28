@@ -9,22 +9,26 @@ import { useEffectiveTuning, useModelProfileWriter } from '@/hooks/useModelProfi
 import { useFeatureEnabled } from '@/hooks/useFeatures';
 import { homeWorkspaceQuery } from '@/hooks/useHomeWorkspace';
 import { useAllModels } from '@/hooks/useAllModels';
+import { useLapsedSignIn } from '@/hooks/useLapsedSignIn';
 import { useIsMobile } from '@/hooks/useIsMobile';
-import { useQuickAccessModels } from '@/hooks/useQuickAccessModels';
+import { useFavoriteModels } from '@/hooks/useFavoriteModels';
 import { useSeededModel } from '@/hooks/useSeededModel';
 import { ChatInputRegistry, ContextBus } from '@/lib/contextBus';
 import { AnimatePresence } from '@/lib/framer';
+import { isImeComposing } from '@/lib/ime';
 import { cn } from '@/lib/utils';
 import type { WidgetContextSnapshot } from '@/pages/Dashboard/widgets/framework/contextSnapshot';
 import './chat-input.css';
 import type { ComposerScope, ModelOptions, ReadyAttachment, SlashCommand, ThreadTuning, Workspace } from './chat-input.types';
 import { isLargePaste, getModelDisplayName } from './chat-input.helpers';
-import { effortLabelFor, resolveEffort } from '@/lib/modelTuning';
+import { effortLabelFor, hasTuningMenu, resolveEffort } from '@/lib/modelTuning';
 import { ChatInputWidgetDeck, MentionAutocompleteList, SlashCommandList } from './chat-input.parts';
 import {
   ComposerAttachments, ComposerPills, DropOverlay, SendStopButton, ToolbarOverflowMenu, VoiceButton, VoiceOverlay,
 } from './chat-input.composerParts';
-import { ChatInputModelMenu, ModelTriggerMeasure } from './chat-input.modelMenu';
+import { ChatInputEffortMenu, ChatInputModelMenu, ModelTriggerMeasure } from './chat-input.modelMenu';
+import { deriveRecentModels } from './chat-input.models';
+import { modelGroups } from '@/lib/modelGroups';
 import { useToolbarItems } from './chat-input.toolbar';
 import {
   useToolbarFold, CONTAINER_BORDER, CONTAINER_PX, GROUP_GAP, ICON_BUTTON_W, TOOLBAR_GAP,
@@ -194,7 +198,7 @@ function ChatInput({
   tuning: hostTuning,
   onPickReasoningEffort = null,
   onPickFastMode = null,
-  // All models used in this thread (shown in primary menu)
+  // All models used in this thread (listed under the favorites)
   threadModels: threadModelsProp = [],
   // Dropdown direction: 'up' (default, for bottom-positioned inputs) or 'down' (for mid-page inputs like ThreadGallery)
   dropdownDirection = 'up',
@@ -209,7 +213,8 @@ function ChatInput({
   const isMobile = useIsMobile();
   const { preferences, isLoaded: preferencesRead } = usePreferences();
   const marketWatchEnabled = useFeatureEnabled('market_watch');
-  const { validModelNames, metadata: modelMetadata, isLoading: modelsLoading } = useAllModels();
+  const { models: visibleModels, validModelNames, metadata: modelMetadata, payers, isLoading: modelsLoading } = useAllModels();
+  const lapsedSignIn = useLapsedSignIn();
   const otherPref = (preferences as Record<string, Record<string, unknown>> | null)?.other_preference;
   // DALTON-HOOK(composer-drafts): persist unsent composer text in localStorage when draftKey is set
   const resetRichDraftRef = useRef<() => void>(() => {});
@@ -636,6 +641,8 @@ function ChatInput({
       stopListening();
     }
 
+    if (isImeComposing(e)) return;
+
     // An open autocomplete owns the navigation keys (slash menu first — it
     // suppresses the mention menu while active).
     if (slashKeyDown(e)) return;
@@ -677,8 +684,8 @@ function ChatInput({
     subagentsAllowed: shownSubagents, onToggleSubagents: handleToggleSubagents,
     watchMode, setWatchMode, marketWatchEnabled,
     workspaces, selectedWorkspaceId, onWorkspaceChange,
-    menuPlacement: dropdownDirection === 'down' ? 'bottom start' : 'top start',
-    menuContainer: isMobile ? chatContainer : null,
+    menuDirection: dropdownDirection,
+    menuContainer: chatContainer,
     draftRef: textareaRef,
   });
 
@@ -705,11 +712,14 @@ function ChatInput({
   const inlineItems = toolbarItems.filter((i) => fold.inline.has(i.id));
   const foldedItems = toolbarItems.filter((i) => fold.folded.includes(i.id));
 
-  /** Quick-access models for both the desktop submenu and mobile inline expand.
-   *  Models already in the primary (selected + thread) section are not repeated. */
-  const { models: moreModelsItems, starred: starredModels } = useQuickAccessModels(
-    [pillModel, ...threadModelsProp].filter((m): m is string => !!m),
-  );
+  const favorites = useFavoriteModels();
+  const modelGroupList = useMemo(() => modelGroups({
+    models: visibleModels,
+    payers,
+  }), [visibleModels, payers]);
+  const recentModels = deriveRecentModels({ selectedModel: pillModel, threadModels: threadModelsProp, validModelNames })
+    .filter((m) => !favorites.models.includes(m));
+  const showEffort = hasTuningMenu(reasoningEfforts, isCodexModel);
 
   return (
     <div
@@ -878,7 +888,7 @@ function ChatInput({
                   <span key={item.id} data-measure={item.id}>{item.inline({ measureOnly: true })}</span>
                 ))}
                 <span data-measure="model">
-                  <ModelTriggerMeasure selectedModel={pillModel} metadata={modelMetadata} effortLabel={effortLabelFor(t, resolvedEffort)} fastMode={resolvedFastMode === true} isCodexModel={isCodexModel} />
+                  <ModelTriggerMeasure selectedModel={pillModel} metadata={modelMetadata} effortLabel={effortLabelFor(t, resolvedEffort)} fast={resolvedFastMode === true && isCodexModel} showEffort={showEffort} />
                 </span>
               </div>
             </div>
@@ -888,20 +898,30 @@ function ChatInput({
               <ChatInputModelMenu
                 selectedModel={pillModel}
                 metadata={modelMetadata}
+                payers={payers}
+                groups={modelGroupList}
+                favorites={favorites.models}
+                recent={recentModels}
+                onToggleFavorite={(m, on) => (on ? favorites.add(m) : favorites.remove(m))}
                 onSelectModel={handlePickModel}
-                threadModels={threadModelsProp}
-                validModelNames={validModelNames}
-                moreModelsItems={moreModelsItems}
-                hasStarredModels={starredModels.length > 0}
+                needsSignIn={(m) => lapsedSignIn(m) !== null}
+                dropdownDirection={dropdownDirection}
+                container={chatContainer}
+                draftRef={textareaRef}
+                disabled={modelsLoading}
+              />
+              <ChatInputEffortMenu
+                effortLabel={effortLabelFor(t, resolvedEffort)}
                 reasoningEffort={resolvedEffort}
                 defaultEffort={settingsEffort}
+                reasoningEfforts={reasoningEfforts}
                 onReasoningEffortChange={handleReasoningEffortChange}
                 fastMode={resolvedFastMode}
                 onFastModeChange={handleFastModeChange}
                 isCodexModel={isCodexModel}
-                reasoningEfforts={reasoningEfforts}
                 dropdownDirection={dropdownDirection}
                 container={chatContainer}
+                taskCost={pillModel ? modelMetadata[pillModel]?.task_cost : undefined}
                 disabled={modelsLoading}
               />
               {/* Voice input, when enabled in settings. */}

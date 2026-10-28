@@ -79,9 +79,12 @@ class TestGetImageTypes:
 class TestGetMaxImageSide:
     """The published per-side pixel limits per route."""
 
-    def test_anthropic_tightens_once_a_request_holds_more_than_20(self):
-        assert get_max_image_side("anthropic", 1) == 8000
-        assert get_max_image_side("anthropic", 20) == 8000
+    def test_anthropic_holds_every_image_to_its_many_image_side(self):
+        """Its side tightens above 20 images, and re-fitting an image already
+        sent would invalidate the signed thinking after it, so the count
+        never moves the side."""
+        assert get_max_image_side("anthropic", 1) == 2000
+        assert get_max_image_side("anthropic", 20) == 2000
         assert get_max_image_side("anthropic", 21) == 2000
 
     def test_deepseek_tightens_at_15(self):

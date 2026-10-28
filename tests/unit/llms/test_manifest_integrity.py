@@ -21,12 +21,6 @@ _REPO = Path(__file__).resolve().parents[3]
 #: card; joining it is a decision, which is the point: a retirement that drops
 #: a card some key still points at lands here instead of billing that key at $0.
 _UNPRICED_KEYS = frozenset({
-    "gpt-oss-120b",
-    "gpt-oss-20b",
-    "gpt-oss-20b-safe-groq",
-    "gpt-oss-120b-groq",
-    "gpt-oss-20b-deepinfra",
-    "gpt-oss-safeguard-20b-deepinfra",
     "gpt-5.3-codex-spark-oauth",
 })
 
@@ -135,6 +129,18 @@ class TestManifestIntegrity:
             f"{len(failures)} model(s) failed provider resolution:\n"
             + "\n".join(f"  - {f}" for f in failures)
         )
+
+    def test_every_codex_provider_declares_a_client_version(self, model_config):
+        """The codex backend gates models on the CLI version it is sent, and
+        the request path and the model list both read this one value."""
+        codex = [
+            name for name, info in model_config.flat_providers.items()
+            if info.get("sdk") == "codex"
+        ]
+        assert codex
+        for name in codex:
+            version = model_config.get_provider_info(name).get("client_version")
+            assert isinstance(version, str) and version.count(".") == 2, name
 
     def test_shipped_defaults_name_models_in_the_manifest(self, model_config):
         """A retirement has to repoint every default it strands. A stranded one

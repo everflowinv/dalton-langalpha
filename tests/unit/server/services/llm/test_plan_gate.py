@@ -40,7 +40,7 @@ def platform(monkeypatch):
     with (
         patch("src.server.services.llm.user_models.classify_model", classify),
         patch("src.llms.llm.LLM.get_model_config", return_value=mc),
-        patch("src.server.services.llm.clients._walk_byok_candidates", walk),
+        patch("src.server.services.llm.clients.walk_byok_candidates", walk),
         patch("src.server.services.llm.clients._resolve_custom_model_byok", custom_key),
     ):
         yield SimpleNamespace(fetch=fetch, walk=walk, custom=custom, custom_key=custom_key)

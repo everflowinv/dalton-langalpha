@@ -22,6 +22,7 @@ HumanKind = Literal[
     "credit-gate",
     "runtime-context",
     "orchestrator",
+    "empty-call-retry",
 ]
 
 #: How mid-turn input opens: the user's, and an orchestrator's follow-up to a
@@ -53,6 +54,10 @@ LEGACY_SUMMARY_PREFIX = (
 # Written by middleware/runtime_context/: the tail envelope carrier and the
 # durable rows it renders.
 _RUNTIME_CONTEXT_SOURCES = frozenset({"runtime_context", "runtime_update"})
+
+#: Written by middleware/tool/empty_call_retry.py: the remediation hint a
+#: retry sends after an answer that meant to call a tool and carried none.
+EMPTY_CALL_RETRY_SOURCE = "empty_call_retry"
 
 # Written by middleware/background_subagent/orchestrator.py: the trigger that
 # re-invokes the agent for pending steering, and background-task notices.
@@ -126,6 +131,8 @@ def human_kind(message: HumanMessage) -> HumanKind:
         return "runtime-context"
     if source == ORCHESTRATOR_SOURCE or message.name == ORCHESTRATOR_SOURCE:
         return "orchestrator"
+    if source == EMPTY_CALL_RETRY_SOURCE:
+        return "empty-call-retry"
     return "plain"
 
 

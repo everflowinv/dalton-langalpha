@@ -2,7 +2,8 @@ import * as React from "react"
 import * as ContextMenuPrimitive from "@radix-ui/react-context-menu"
 
 import { cn } from "@/lib/utils"
-import { DESTRUCTIVE_ITEM } from "./dropdown-menu"
+import { closeAutoFocus } from "@/lib/inputModality"
+import { DESTRUCTIVE_ITEM, ITEM_BOX, ITEM_HIGHLIGHT } from "./dropdown-menu"
 
 const ContextMenu = ContextMenuPrimitive.Root
 
@@ -12,11 +13,15 @@ const ContextMenuGroup = ContextMenuPrimitive.Group
 
 function ContextMenuContent({
   className,
+  collisionPadding = 8,
+  onCloseAutoFocus,
   ...props
 }: React.ComponentProps<typeof ContextMenuPrimitive.Content>) {
   return (
     <ContextMenuPrimitive.Portal>
       <ContextMenuPrimitive.Content
+        collisionPadding={collisionPadding}
+        onCloseAutoFocus={closeAutoFocus(onCloseAutoFocus)}
         className={cn(
           "z-1030 min-w-32 overflow-hidden rounded-md border bg-popover p-1 text-popover-foreground shadow-md",
           "pop-in",
@@ -28,8 +33,10 @@ function ContextMenuContent({
   )
 }
 
+// The dropdown's item box, so a row's right-click menu and its options menu
+// read as the same menu.
 const itemVariants = {
-  default: "data-highlighted:bg-accent/15",
+  default: ITEM_HIGHLIGHT,
   destructive: DESTRUCTIVE_ITEM,
 } as const
 
@@ -42,12 +49,7 @@ function ContextMenuItem({
 }) {
   return (
     <ContextMenuPrimitive.Item
-      className={cn(
-        "relative flex w-full cursor-default select-none items-center gap-2 rounded-sm px-3 py-2 text-sm transition-colors",
-        "data-disabled:pointer-events-none data-disabled:opacity-50",
-        itemVariants[variant],
-        className
-      )}
+      className={cn(ITEM_BOX, itemVariants[variant], className)}
       {...props}
     />
   )

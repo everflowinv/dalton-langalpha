@@ -1,10 +1,10 @@
-"""The ``order_attempts`` status CHECK is a copy of ``AttemptStatus``, kept readable in psql.
+"""086 added ``handed_off`` to the ``order_attempts`` status CHECK.
 
-086 is the migration that last wrote it. A state added to the enum without a
-migration surfaces as a constraint violation on the order path, where a failed
-write strands the attempt in ``submitting``. The CHECK goes in NOT VALID and is
-validated after the migration's transaction commits: a plain ADD CONSTRAINT
-scans the whole ledger under the lock every order write waits on.
+094 is the migration that last wrote the CHECK, and its test holds it to
+``AttemptStatus``; this one holds 086 to the list 094 starts from. The CHECK
+goes in NOT VALID and is validated after the migration's transaction commits: a
+plain ADD CONSTRAINT scans the whole ledger under the lock every order write
+waits on.
 """
 
 from __future__ import annotations
@@ -16,8 +16,6 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
-
-from src.server.services.brokerage_orders.models import AttemptStatus
 
 _VERSIONS = Path(__file__).resolve().parents[3] / "migrations" / "versions"
 _BEGIN, _COMMIT = "<autocommit>", "</autocommit>"
@@ -70,12 +68,13 @@ def test_it_follows_085_in_a_linear_chain(migration):
     assert (module.revision, module.down_revision) == ("086", "085")
 
 
-def test_the_check_constraint_names_every_attempt_status(migration):
+def test_the_check_constraint_names_every_status_094_starts_from(migration):
     module, events = migration
+    latest = _load("migration_094", "094_order_attempts_expired.py")
 
     module.upgrade()
 
-    assert _allowed(events[_alter(events)]) == {s.value for s in AttemptStatus}
+    assert _allowed(events[_alter(events)]) == set(latest._BEFORE)
 
 
 def test_the_downgrade_restores_exactly_what_043_allowed(migration):

@@ -1,10 +1,10 @@
-"""IBKR's staged instructions, as the server answered them.
+"""IBKR's two order families: staged instructions and live orders.
 
-Every shape below was read off live calls to ``api.ibkr.com`` rather than
-inferred: the create answers ``{"id": ..., "url": ...}`` and nothing else, the
-delete answers ``{}``, the list answers ``{"instructions": [...]}``, and a
+Every staged shape below was read off live calls to ``api.ibkr.com`` rather
+than inferred: the create answers ``{"id": ..., "url": ...}`` and nothing else,
+the delete answers ``{}``, the list answers ``{"instructions": [...]}``, and a
 refused call arrives as an MCP tool error carrying ``{"code", "message",
-"data"}``. Three consequences drive the whole file.
+"data"}``. Three consequences drive the staged half.
 
 There is no account argument and no account in any answer, so ``account_ref``
 is empty by construction rather than by a failed lookup. There is no status
@@ -21,6 +21,23 @@ and leaves the list; so does one deleted there or expired, and the list does not
 say which. Leaving it is therefore the one end this file names,
 ``handed_off``, which reconciliation writes once a complete list stops carrying
 an instruction.
+
+The live half is read from IBKR's published tool descriptions, not from live
+calls, so it parses only the fields those descriptions name. ``submit_order``,
+``modify_order``, ``cancel_order`` and ``answer_order_question`` answer in one
+shape: a non-null ``pending_question`` while the action is not yet applied,
+naming the ``question_id`` an answer must quote; a ``correlation_id`` the answer
+must echo; and once settled the ``order_id`` and its ``order_status``, with
+``filled_quantity`` on a cancel. ``get_order_status`` reads one order by its id
+in the vocabulary :data:`_LIVE_STATUSES` maps. Anything else a live answer
+carries rides in ``raw``, and an answer naming none of it is ``unknown``, which
+reconciliation asks about rather than trusts.
+
+Two live rules differ from the staged ones. The account is still the consented
+one and still unnamed, so ``account_ref`` stays empty. But IBKR's own words for
+a live tool that errors are that the broker may already have accepted the
+request, so a live error object is not read as a rejection: it is ``unknown``,
+carrying the order it named where it named one.
 """
 
 from __future__ import annotations
@@ -35,6 +52,7 @@ from src.server.services.brokerage_orders._coerce import (
     as_text,
     extras,
     norm_number,
+    target_ids,
 )
 from src.server.services.brokerage_orders.base import (
     MatchKey,
@@ -50,6 +68,7 @@ from src.server.services.brokerage_orders.models import (
     BrokerOrder,
     EquityRef,
     Failure,
+    Money,
     OpaqueRef,
     OrderMode,
     OrderOutcome,
@@ -71,6 +90,15 @@ INSTRUCTION_ID = "id"
 # The key the list read wraps its rows in.
 INSTRUCTION_ROWS = "instructions"
 
+# The read that settles a live order: one order, by the id a live answer named.
+# It sits in the account group, which the live order group requires, so a
+# connection that can place an order can always be asked what became of it.
+ORDER_STATUS = "get_order_status"
+
+# A live order's identity: on a settled answer, on the status read, and as the
+# argument a modify, a cancel and the status read address the order by.
+ORDER_ID = "order_id"
+
 _SIDES: dict[str, Side] = {"BUY": "buy", "SELL": "sell"}
 
 # The vendor publishes these two and no others. A third would be a change we
@@ -89,6 +117,50 @@ _TIF: dict[str, TimeInForce] = {
     "OND": "overnight_next_day",
     "OPG": "at_the_open",
 }
+
+# The four kinds the live tools accept, two more than staging publishes.
+_LIVE_ORDER_TYPES = {
+    "MARKET": "market",
+    "LIMIT": "limit",
+    "STOP": "stop",
+    "STOP_LIMIT": "stop_limit",
+}
+
+# The three durations the live tools accept. Staging takes two more, which a
+# live call would only have had refused, so they are not read here.
+_LIVE_TIF: dict[str, TimeInForce] = {k: _TIF[k] for k in ("DAY", "OVT", "OND")}
+
+# The twelve states ``get_order_status`` publishes, and only those: a thirteenth
+# is a word we have not read, and it maps to ``unknown``, which reconciliation
+# declines to write over what a row already says.
+#
+# ``PENDING_NEW`` is taken and not yet acknowledged; ``NEW`` is resting. The
+# pending changes keep the order live, since a cancel is a request the venue
+# may still fill ahead of. ``REPLACED`` is live too: a modify keeps its
+# ``order_id``, so the order under that id is the one now working at the new
+# parameters. ``DONE_FOR_THE_DAY`` is not an end: IBKR names it apart from
+# ``EXPIRED``, and an ``OND`` order carries into the next day, so it stays open
+# for the read that names one. ``EXPIRED`` is an end of its own rather than a
+# cancel nobody asked for: it will not fill further, and any fill it got stays
+# on the row.
+_LIVE_STATUSES: dict[str, AttemptStatus] = {
+    "PENDING_NEW": AttemptStatus.SUBMITTED,
+    "NEW": AttemptStatus.WORKING,
+    "PENDING_CANCEL": AttemptStatus.WORKING,
+    "PENDING_REPLACE": AttemptStatus.WORKING,
+    "PENDING_CANCEL_REPLACE": AttemptStatus.WORKING,
+    "REPLACED": AttemptStatus.WORKING,
+    "DONE_FOR_THE_DAY": AttemptStatus.WORKING,
+    "PARTIALLY_FILLED": AttemptStatus.PARTIALLY_FILLED,
+    "FILLED": AttemptStatus.FILLED,
+    "CANCELLED": AttemptStatus.CANCELLED,
+    "EXPIRED": AttemptStatus.EXPIRED,
+    "REJECTED": AttemptStatus.REJECTED_BY_VENDOR,
+}
+
+# What an answer quotes back, every one of them copied from the result it
+# answers.
+_ANSWER_FIELDS = ("question_id", "value", "correlation_id")
 
 
 def _contract_ref(source: Mapping[str, Any]) -> str | None:
@@ -309,8 +381,220 @@ def _listed(row: Any) -> VendorOrder:
     )
 
 
+def _upper(value: Any) -> str:
+    return str(value or "").strip().upper()
+
+
+def _live_order(args: Mapping[str, Any], action: OrderAction) -> BrokerOrder:
+    """A submit, or a modify, which restates the whole order under its id."""
+    contract = as_text(args.get("contract_id_ex"))
+    order_type = _LIVE_ORDER_TYPES.get(_upper(args.get("order_type")))
+    tif = _LIVE_TIF.get(_upper(args.get("tif")))
+    cash = as_decimal(args.get("cash_size"))
+    target = as_text(args.get(ORDER_ID)) if action is OrderAction.REPLACE else None
+    # ``outside_rth`` and ``is_position_close`` are not consumed: the first only
+    # permits a DAY order to trade outside regular hours, which no session word
+    # says, and the second has no neutral field at all.
+    consumed = {
+        "contract_id_ex",
+        "side",
+        "size",
+        "cash_size",
+        "limit_price",
+        "stop_price",
+    }
+    if order_type is not None:
+        consumed.add("order_type")
+    if tif is not None:
+        consumed.add("tif")
+    if target is not None:
+        consumed.add(ORDER_ID)
+    return BrokerOrder(
+        vendor=VENDOR,
+        account_ref="",
+        mode=OrderMode.LIVE,
+        target_ref=target,
+        # Stocks and single-leg options go out under the same ``contract_id_ex``,
+        # and the call says which in no field, so the class stays unclaimed.
+        asset_class="other",
+        instrument=OpaqueRef(raw_code=contract) if contract else None,
+        side=_SIDES.get(_upper(args.get("side"))),
+        qty=as_decimal(args.get("size")),
+        # In the contract's trading currency, which neither the call nor the
+        # answer names, so the amount carries none.
+        notional=Money(amount=cash) if cash is not None else None,
+        order_type=order_type,
+        limit_price=as_decimal(args.get("limit_price")),
+        stop_price=as_decimal(args.get("stop_price")),
+        time_in_force=tif,
+        extras={
+            **({"contract_id_ex": contract} if contract else {}),
+            **({ORDER_ID: target} if target else {}),
+            **extras(args, consumed),
+        },
+        raw=dict(args),
+    )
+
+
+def _live_cancel(args: Mapping[str, Any]) -> BrokerOrder:
+    target = as_text(args.get(ORDER_ID))
+    return BrokerOrder(
+        vendor=VENDOR,
+        account_ref="",
+        mode=OrderMode.LIVE,
+        target_ref=target,
+        extras={
+            **({ORDER_ID: target} if target else {}),
+            **extras(args, {ORDER_ID}),
+        },
+        raw=dict(args),
+    )
+
+
+def _live_answer(args: Mapping[str, Any]) -> BrokerOrder | None:
+    """An answer to a broker question, which names the question and no order.
+
+    The question is what it acts on, and IBKR keeps its id unique across every
+    order of the user's, so that id is the target. With none there is nothing
+    to attach an attempt to.
+
+    Whether ``value`` confirms or declines is not read: it is quoted verbatim
+    from the question's own answers, and no description says which of them is
+    which. The result says what the answer did, and that is what is recorded.
+    """
+    question = as_text(args.get("question_id"))
+    if question is None:
+        return None
+    return BrokerOrder(
+        vendor=VENDOR,
+        account_ref="",
+        mode=OrderMode.LIVE,
+        target_ref=question,
+        extras={
+            **target_ids(args, _ANSWER_FIELDS),
+            **extras(args, set(_ANSWER_FIELDS)),
+        },
+        raw=dict(args),
+    )
+
+
+def _live_target(request: BrokerOrder | None, action: OrderAction | None) -> str | None:
+    """The order a modify or a cancel named, which its answer need not repeat.
+
+    Never an answer's: its target is a question, and quoting that as an order id
+    would point the status read at an order nobody placed.
+    """
+    if request is None or action not in (OrderAction.REPLACE, OrderAction.CANCEL):
+        return None
+    return as_text(request.extras.get(ORDER_ID)) or as_text(request.target_ref)
+
+
+def _live_route(
+    request: BrokerOrder | None, envelope: Mapping[str, Any]
+) -> dict[str, str]:
+    """The contract, and the ``correlation_id`` an answer to this result echoes.
+
+    The correlation is kept on the row because it is the one token that ties
+    an answer to the request it answers: the next call quotes it, and it is how
+    a person reading the ledger tells which submit a question belonged to.
+    """
+    contract = (
+        as_text(request.extras.get("contract_id_ex")) if request else None
+    ) or as_text(envelope.get("contract_id_ex"))
+    correlation = as_text(envelope.get("correlation_id")) or (
+        as_text(request.extras.get("correlation_id")) if request else None
+    )
+    return {
+        **({"contract_id_ex": contract} if contract else {}),
+        **({"correlation_id": correlation} if correlation else {}),
+    }
+
+
+def _live_state(raw_status: str | None, filled: Any) -> AttemptStatus:
+    """The attempt state an ``order_status`` names, ``unknown`` for any other word.
+
+    A state that only says the order is still live names no fill, and the
+    quantity beside it does: an order part filled and awaiting a change is
+    partially filled, not merely working.
+    """
+    status = _LIVE_STATUSES.get(_upper(raw_status), AttemptStatus.UNKNOWN)
+    quantity = as_decimal(filled)
+    if status is AttemptStatus.WORKING and quantity is not None and quantity > 0:
+        return AttemptStatus.PARTIALLY_FILLED
+    return status
+
+
+def _live_outcome(
+    envelope: Mapping[str, Any], action: OrderAction | None, request: BrokerOrder | None
+) -> OrderOutcome:
+    raw_status = as_text(envelope.get("order_status"))
+    order_id = as_text(envelope.get(ORDER_ID)) or _live_target(request, action)
+    route = _live_route(request, envelope)
+    pending = envelope.get("pending_question")
+    if pending is not None:
+        # Not applied: no order on the market for a submit, the old parameters
+        # for a modify, a live order for a cancel. A question with no id is one
+        # nothing can answer, and a shape no description spells.
+        question = (
+            as_text(pending.get("question_id")) if isinstance(pending, Mapping) else None
+        )
+        return OrderOutcome(
+            status=AttemptStatus.PENDING_CONFIRM if question else AttemptStatus.UNKNOWN,
+            raw_status=raw_status,
+            vendor_order_id=order_id,
+            route=route,
+            confirm_token=question,
+            raw=dict(envelope),
+        )
+    # Settled, so the state is IBKR's own word for it, a cancel's included:
+    # the venue may have filled the order before the cancel landed. An answer
+    # with no word is ``unknown``, and the order id it carries, or the one the
+    # call named, is what the status read then asks after.
+    return OrderOutcome(
+        status=_live_state(raw_status, envelope.get("filled_quantity")),
+        raw_status=raw_status,
+        vendor_order_id=order_id,
+        route=route,
+        filled_qty=as_decimal(envelope.get("filled_quantity")),
+        raw=dict(envelope),
+    )
+
+
+def _live_status(
+    query: StatusQuery, envelope: Mapping[str, Any], text: str
+) -> list[VendorOrder]:
+    """The one order ``get_order_status`` read, by the id it was asked for.
+
+    The published result names no ``order_id`` of its own, so the query's is
+    the order's; one that does name a different order is not this one's state.
+    It names no symbol either, so the listing adds no instrument.
+    """
+    order_id = as_text(query.args.get(ORDER_ID))
+    echoed = as_text(envelope.get(ORDER_ID))
+    if order_id is None or (echoed is not None and echoed != order_id):
+        raise StatusReadError(f"status read for {order_id!r} answered for {echoed!r}")
+    raw_status = as_text(envelope.get("order_status"))
+    if raw_status is None:
+        raise StatusReadError(text or "no order status")
+    contract = as_text(envelope.get("contract_id_ex"))
+    return [
+        VendorOrder(
+            vendor_order_id=order_id,
+            outcome=OrderOutcome(
+                status=_live_state(raw_status, envelope.get("filled_quantity")),
+                raw_status=raw_status,
+                vendor_order_id=order_id,
+                route={"contract_id_ex": contract} if contract else {},
+                filled_qty=as_decimal(envelope.get("filled_quantity")),
+                raw=dict(envelope),
+            ),
+        )
+    ]
+
+
 class IbkrOrderAdapter(OrderAdapter):
-    """The one place that knows a staged instruction is not yet an order."""
+    """The one place that knows a staged instruction is not yet an order, and
+    that a live one is not applied while a question is pending."""
 
     vendor = VENDOR
 
@@ -319,7 +603,46 @@ class IbkrOrderAdapter(OrderAdapter):
         if entry is None:
             return None
         data = dict(args or {})
-        return _create(data) if entry.action is OrderAction.STAGE else _delete(data)
+        if entry.mode is OrderMode.STAGED:
+            return _create(data) if entry.action is OrderAction.STAGE else _delete(data)
+        if entry.action in (OrderAction.PLACE, OrderAction.REPLACE):
+            return _live_order(data, entry.action)
+        if entry.action is OrderAction.CANCEL:
+            return _live_cancel(data)
+        return _live_answer(data)
+
+    def parse_result(
+        self,
+        tool: str,
+        body: ResultBody,
+        *,
+        tool_status: str,
+        request: BrokerOrder | None = None,
+    ) -> OrderOutcome:
+        """The shared reading, except that a live tool's error object is not a no.
+
+        IBKR tells the caller of a live tool that errored or timed out not to
+        call it again, because the broker may already have accepted the
+        request. Read as a rejection, that would be a final answer telling a
+        person the order never reached the market, so it is ``unknown``, with
+        the vendor's words as its failure and the order the call named, if it
+        named one, for the status read to ask after.
+        """
+        entry = order_tool(VENDOR, tool)
+        if entry is not None and entry.mode is OrderMode.LIVE:
+            envelope, _ = body_parts(body)
+            failure = _vendor_failure(envelope)
+            if failure is not None:
+                return OrderOutcome(
+                    status=AttemptStatus.UNKNOWN,
+                    vendor_order_id=_live_target(request, entry.action),
+                    route=_live_route(request, {}),
+                    failure=failure,
+                    raw=dict(envelope or {}),
+                )
+        return super().parse_result(
+            tool, body, tool_status=tool_status, request=request
+        )
 
     def vendor_outcome(
         self,
@@ -341,12 +664,18 @@ class IbkrOrderAdapter(OrderAdapter):
         if envelope is None:
             return OrderOutcome(status=AttemptStatus.UNKNOWN, raw_status=as_text(text))
         entry = order_tool(VENDOR, tool)
+        if entry is not None and entry.mode is OrderMode.LIVE:
+            return _live_outcome(envelope, entry.action, request)
         return _outcome(envelope, entry.action if entry else None, request)
 
     def vendor_error(
         self, envelope: Mapping[str, Any] | None, text: str
     ) -> Failure | None:
-        """IBKR answers a refused instruction here and nowhere else."""
+        """IBKR answers a refused call here and nowhere else.
+
+        A live tool's error never reaches this: :meth:`parse_result` reads it
+        first, as the unsettled answer it may be.
+        """
         return _vendor_failure(envelope)
 
     def status_query(
@@ -356,6 +685,15 @@ class IbkrOrderAdapter(OrderAdapter):
         vendor_order_id: str | None = None,
         route: Mapping[str, str] | None = None,
     ) -> StatusQuery | None:
+        """The order by its id for a live attempt, the whole list for a staged one.
+
+        A live attempt with no id has nothing to read: the order list IBKR
+        publishes does not spell its rows' fields, so a call whose answer never
+        came back cannot be recognized in it, and stays open for a person.
+        """
+        if order is not None and order.mode is OrderMode.LIVE:
+            order_id = as_text(vendor_order_id)
+            return StatusQuery(ORDER_STATUS, {ORDER_ID: order_id}) if order_id else None
         return StatusQuery(LIST_INSTRUCTIONS)
 
     def parse_status(self, query: StatusQuery, body: ResultBody) -> list[VendorOrder]:
@@ -365,6 +703,8 @@ class IbkrOrderAdapter(OrderAdapter):
         failure = _vendor_failure(envelope)
         if failure is not None:
             raise StatusReadError(failure.message or "vendor error")
+        if query.tool == ORDER_STATUS:
+            return _live_status(query, envelope, text)
         rows = envelope.get(INSTRUCTION_ROWS)
         if not isinstance(rows, list):
             # An answer with no list is not an account with no instructions, nor
@@ -393,6 +733,11 @@ class IbkrOrderAdapter(OrderAdapter):
         None, which is honest -- it already has the id it named.
         """
         if order is None:
+            return None
+        if order.mode is not OrderMode.STAGED:
+            # Nothing lists a live order in a shape this file can read, so a
+            # live key could only ever meet a staged row, and there it would
+            # make an unanswered submit the rival of an instruction it is not.
             return None
         return _fingerprint(
             _contract_ref(order.extras) or _contract_ref(order.raw),

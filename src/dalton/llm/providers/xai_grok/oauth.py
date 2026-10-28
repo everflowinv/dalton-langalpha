@@ -10,7 +10,6 @@ import json
 import logging
 import os
 import re
-import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urlparse
@@ -18,15 +17,7 @@ from urllib.parse import urlparse
 import httpx
 
 from src.dalton.settings import get_xai_grok_client_version, get_xai_oauth_client_id
-from src.server.database.oauth_tokens import (
-    get_oauth_tokens,
-    invalidate_oauth_active_cache,
-    upsert_oauth_tokens,
-)
-from src.server.services.oauth_refresh_wait import (
-    REFRESH_BUFFER,
-    token_expiry,
-)
+from src.server.database.oauth_tokens import upsert_oauth_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -581,8 +572,12 @@ async def refresh_tokens(
         return await _do_refresh(new_client)
 
 
-async def save_xai_tokens(user_id: str, token_record: dict[str, Any]) -> None:
-    """Persist xAI OAuth token record via `upsert_oauth_tokens(provider='xai-oauth', plan_type='supergrok')`."""
+async def save_xai_tokens(user_id: str, token_record: dict[str, Any], conn=None) -> None:
+    """Persist xAI OAuth token record via `upsert_oauth_tokens(provider='xai-oauth', plan_type='supergrok')`.
+
+    ``conn`` rides a caller-held ``connection_change`` lock, so the sign-in's
+    save queues with a disconnect rather than interleaving
+    (DALTON-HOOK(team-credentials))."""
     now = datetime.now(timezone.utc)
     expires_at = token_record.get("expires_at")
     if not isinstance(expires_at, datetime):
@@ -604,247 +599,8 @@ async def save_xai_tokens(user_id: str, token_record: dict[str, Any]) -> None:
         email=email_or_name,
         plan_type=XAI_PLAN_TYPE,
         expires_at=expires_at,
+        conn=conn,
     )
-
-
-async def _renew_refresh_lock(cache: Any, lock_key: str, lock_token: str, ttl_ms: int) -> bool:
-    """Extend lock TTL only if `lock_token` still owns `lock_key`."""
-    client = getattr(cache, "client", None)
-    if getattr(cache, "enabled", False) is True and client is not None:
-        try:
-            if hasattr(client, "eval"):
-                res = await client.eval(_RENEW_LOCK_LUA, 1, lock_key, lock_token, str(ttl_ms))
-                return bool(res)
-            cur = await client.get(lock_key)
-            if isinstance(cur, bytes):
-                cur = cur.decode("utf-8", errors="ignore")
-            if cur == lock_token:
-                if hasattr(client, "pexpire"):
-                    await client.pexpire(lock_key, ttl_ms)
-                return True
-            return False
-        except Exception as exc:
-            logger.debug("[xai_oauth] Lock renew skipped for %s: %s", lock_key, type(exc).__name__)
-            return False
-    return True
-
-
-async def _release_refresh_lock(cache: Any, lock_key: str, lock_token: str) -> bool:
-    """Release `lock_key` only if `lock_token` still owns it (compare-and-delete)."""
-    client = getattr(cache, "client", None)
-    if getattr(cache, "enabled", False) is True and client is not None:
-        try:
-            if hasattr(client, "eval"):
-                res = await client.eval(_RELEASE_LOCK_LUA, 1, lock_key, lock_token)
-                return bool(res)
-            cur = await client.get(lock_key)
-            if isinstance(cur, bytes):
-                cur = cur.decode("utf-8", errors="ignore")
-            if cur == lock_token:
-                await client.delete(lock_key)
-                return True
-            return False
-        except Exception as exc:
-            logger.debug("[xai_oauth] Lock release failed for %s: %s", lock_key, type(exc).__name__)
-            return False
-    await cache.release_lock(lock_key, lock_token)
-    return True
-
-
-async def _await_xai_refreshed_tokens(cred_user_id: str) -> dict[str, Any] | None:
-    """Wait for another holder of the refresh lock to write fresh tokens to DB."""
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + _REFRESH_WAIT_SECONDS
-    poll_interval = max(0.5, float(_REFRESH_POLL_SECONDS))
-    while True:
-        await asyncio.sleep(poll_interval)
-        tokens = await get_oauth_tokens(cred_user_id, XAI_PROVIDER)
-        if not tokens:
-            return None
-        now = datetime.now(timezone.utc)
-        if token_expiry(tokens) > now + REFRESH_BUFFER:
-            return tokens
-        if loop.time() >= deadline:
-            return tokens if token_expiry(tokens) > now else None
-
-
-async def get_valid_token(user_id: str) -> dict[str, Any] | None:
-    """Get a valid xAI access token, refreshing with Redis lock and `REFRESH_BUFFER` if needed."""
-    from src.dalton.credentials import credential_user_id
-
-    cred_user_id = credential_user_id(user_id)
-    tokens = await get_oauth_tokens(cred_user_id, XAI_PROVIDER)
-    if not tokens:
-        return None
-
-    now = datetime.now(timezone.utc)
-    if token_expiry(tokens) > now + REFRESH_BUFFER:
-        return {
-            "access_token": tokens["access_token"],
-            "plan_type": tokens.get("plan_type") or XAI_PLAN_TYPE,
-            "account_id": tokens.get("account_id", ""),
-        }
-
-    if not tokens.get("refresh_token"):
-        return {
-            "access_token": tokens["access_token"],
-            "plan_type": tokens.get("plan_type") or XAI_PLAN_TYPE,
-            "account_id": tokens.get("account_id", ""),
-        }
-
-    from src.utils.cache.redis_cache import get_cache_client
-
-    cache = get_cache_client()
-    lock_key = f"oauth:refresh:{cred_user_id}:{XAI_PROVIDER}"
-    lock_token = secrets.token_hex(16)
-    acquired = await cache.acquire_lock(lock_key, lock_token, XAI_REFRESH_LOCK_TTL_MS)
-    if acquired is False:
-        tokens = await _await_xai_refreshed_tokens(cred_user_id)
-        if tokens:
-            return {
-                "access_token": tokens["access_token"],
-                "plan_type": tokens.get("plan_type") or XAI_PLAN_TYPE,
-                "account_id": tokens.get("account_id", ""),
-            }
-        return None
-
-    saved_token_result: dict[str, Any] | None = None
-    saved_expires_in: int = 3600
-    try:
-        # Bound the entire lock-held section (DB re-read, discovery, refresh_tokens,
-        # lock renewal, DB save) by XAI_REFRESH_HARD_TIMEOUT_S (120s), strictly less
-        # than XAI_REFRESH_LOCK_TTL_MS (180s) so timeout aborts before the lock expires.
-        async with asyncio.timeout(XAI_REFRESH_HARD_TIMEOUT_S):
-            # Re-read credentials from DB after acquiring the lock: if another worker
-            # already refreshed them before we acquired the lock, use the new token directly.
-            tokens = await get_oauth_tokens(cred_user_id, XAI_PROVIDER)
-            if not tokens:
-                return None
-            now = datetime.now(timezone.utc)
-            if token_expiry(tokens) > now + REFRESH_BUFFER:
-                return {
-                    "access_token": tokens["access_token"],
-                    "plan_type": tokens.get("plan_type") or XAI_PLAN_TYPE,
-                    "account_id": tokens.get("account_id", ""),
-                }
-            if not tokens.get("refresh_token"):
-                return {
-                    "access_token": tokens["access_token"],
-                    "plan_type": tokens.get("plan_type") or XAI_PLAN_TYPE,
-                    "account_id": tokens.get("account_id", ""),
-                }
-
-            used_refresh_token = tokens["refresh_token"]
-            new = await refresh_tokens(
-                used_refresh_token,
-                user_id=cred_user_id,
-            )
-            renewed = await _renew_refresh_lock(
-                cache, lock_key, lock_token, XAI_REFRESH_LOCK_TTL_MS
-            )
-            if not renewed:
-                latest = await get_oauth_tokens(cred_user_id, XAI_PROVIDER)
-                if latest and latest.get("refresh_token") == used_refresh_token:
-                    logger.warning(
-                        "[xai_oauth] lock lost but DB unchanged; saving for user_id=%s",
-                        user_id,
-                    )
-                    tokens = latest
-                else:
-                    logger.warning(
-                        "[xai_oauth] Refresh lock lost before DB save for user_id=%s; skipping upsert",
-                        user_id,
-                    )
-                    now = datetime.now(timezone.utc)
-                    if latest and (
-                        token_expiry(latest) > now + REFRESH_BUFFER
-                        or (
-                            latest.get("access_token") != tokens.get("access_token")
-                            and token_expiry(latest) > now
-                        )
-                    ):
-                        return {
-                            "access_token": latest["access_token"],
-                            "plan_type": latest.get("plan_type") or XAI_PLAN_TYPE,
-                            "account_id": latest.get("account_id", ""),
-                        }
-                    return None
-
-            now = datetime.now(timezone.utc)
-            new_expires = new.get("expires_at")
-            if not isinstance(new_expires, datetime):
-                new_expires = now + timedelta(seconds=int(new.get("expires_in") or 3600))
-
-            new_refresh = new.get("refresh_token") or new.get("refresh") or tokens["refresh_token"]
-            new_account_id = (
-                new.get("account_id")
-                or new.get("accountId")
-                or tokens.get("account_id", "")
-            )
-            new_email = (
-                new.get("email")
-                or tokens.get("email")
-                or new.get("displayName")
-                or new.get("display_name")
-            )
-
-            await upsert_oauth_tokens(
-                user_id=user_id,
-                provider=XAI_PROVIDER,
-                access_token=new["access_token"],
-                refresh_token=new_refresh,
-                account_id=new_account_id,
-                email=new_email,
-                plan_type=XAI_PLAN_TYPE,
-                expires_at=new_expires,
-            )
-            saved_expires_in = int(new.get("expires_in") or 3600)
-            saved_token_result = {
-                "access_token": new["access_token"],
-                "plan_type": XAI_PLAN_TYPE,
-                "account_id": new_account_id,
-            }
-    except Exception as e:
-        if saved_token_result is None:
-            await _record_provider_event_safe(
-                user_id,
-                "refresh_fail",
-                {"error_type": type(e).__name__, "message": str(e)[:160]},
-            )
-            logger.error(
-                "[xai_oauth] Token refresh failed for user_id=%s: %s",
-                user_id,
-                type(e).__name__,
-            )
-            return None
-    finally:
-        if acquired:
-            try:
-                await _release_refresh_lock(cache, lock_key, lock_token)
-            except Exception as exc:
-                logger.debug("[xai_oauth] Lock release skipped: %s", type(exc).__name__)
-
-    try:
-        async with asyncio.timeout(5):
-            await invalidate_oauth_active_cache(cred_user_id)
-    except Exception as exc:
-        logger.debug(
-            "[xai_oauth] invalidate_oauth_active_cache skipped: %s",
-            type(exc).__name__,
-        )
-
-    try:
-        async with asyncio.timeout(5):
-            await _record_provider_event_safe(
-                user_id,
-                "refresh_ok",
-                {"expires_in": saved_expires_in},
-            )
-    except Exception as exc:
-        logger.debug("[xai_oauth] refresh_ok event skipped: %s", type(exc).__name__)
-
-    logger.debug("[xai_oauth] Refreshed tokens for user_id=%s", user_id)
-    return saved_token_result
 
 
 async def fetch_xai_models(

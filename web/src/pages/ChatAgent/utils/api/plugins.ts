@@ -8,7 +8,7 @@
  * own only identity and lifecycle (install, update, toggle, export, remove).
  */
 import { api } from '@/api/client';
-import { apiErrorCoded, apiErrorObject } from './errors';
+import { apiErrorCoded, apiErrorObject } from '@/api/errors';
 
 export interface PluginDiagnostic {
   /** info: how the package was read, not a problem with it. */

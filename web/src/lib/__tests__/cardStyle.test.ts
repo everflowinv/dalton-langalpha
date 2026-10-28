@@ -12,18 +12,21 @@ afterEach(() => {
 });
 
 describe('card style', () => {
-  it('reads Balanced when nothing, or something unknown, is stored', () => {
-    expect(getCardStyle()).toBe('balanced');
+  it('reads Quiet when nothing, or something unknown, is stored', () => {
+    expect(getCardStyle()).toBe('quiet');
     localStorage.setItem('cardStyle', 'classic');
-    expect(getCardStyle()).toBe('balanced');
+    expect(getCardStyle()).toBe('quiet');
   });
 
   // DALTON-HOOK(brand-name): verify Dalton build defaults to 'terminal' when cardStyle is unset
   it('defaults to Terminal in a Dalton build when nothing is stored', async () => {
     vi.stubEnv('VITE_BRAND_MARK', 'everflow');
     vi.resetModules();
-    const { getCardStyle: getDaltonCardStyle } = await import('../cardStyle');
+    const { getCardStyle: getDaltonCardStyle, setCardStyle: setDaltonCardStyle } =
+      await import('../cardStyle');
     expect(getDaltonCardStyle()).toBe('terminal');
+    setDaltonCardStyle('quiet');
+    expect(getDaltonCardStyle()).toBe('quiet');
   });
 
   it('keeps a choice for the next load and stamps it on the root', () => {

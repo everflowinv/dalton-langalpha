@@ -10,8 +10,10 @@ import type { useChatMessages as useChatMessagesType } from '@/pages/ChatAgent/h
 import type { ChatMessage } from '@/types/chat';
 
 vi.mock('@/components/ui/dropdown-menu', () => ({
-  // upstream's context menu reads this class constant from the dropdown module
+  // upstream's context menu reads these class constants from the dropdown module
   DESTRUCTIVE_ITEM: 'text-destructive',
+  ITEM_BOX: 'flex items-center gap-2',
+  ITEM_HIGHLIGHT: 'focus:bg-accent',
   DropdownMenu: ({ children }: { children: React.ReactNode }) => (
     <div data-testid="dropdown-menu">{children}</div>
   ),
@@ -272,6 +274,12 @@ import FileHeaderActions from '@/pages/ChatAgent/components/FileHeaderActions';
 import HtmlViewer from '@/pages/ChatAgent/components/viewers/HtmlViewer';
 import ChatView from '@/pages/ChatAgent/components/ChatView';
 import ThreadCard from '@/pages/ChatAgent/components/ThreadCard';
+import {
+  ThreadTreeRow,
+  WorkspaceTreeRow,
+  resolveNavThreadPermissions,
+  resolveNavWorkspacePermissions,
+} from '@/pages/ChatAgent/components/NavigationRows';
 import { useActiveThreadPublisher } from '@/lib/threadLifecycle/useActiveThreadPublisher';
 import {
   applyFeedEvent,
@@ -1632,5 +1640,247 @@ describe('Dalton Team Sharing', () => {
 
     expect(screen.queryByTestId('team-readonly-composer')).toBeNull();
     unmountOn();
+  });
+
+  it('shows distinct sidebar context-menu items across owner, dispatcher, bystander colleague, and external member identities', () => {
+    const ownWs = {
+      workspace_id: 'ws-richard-1',
+      user_id: 'u-richard',
+      name: 'NVDA Deep Dive',
+      is_home: false,
+      effective_web_access: 'owner',
+      colleague_dispatch_enabled: true,
+    };
+    const colleagueRwWs = {
+      workspace_id: 'ws-richard-1',
+      user_id: 'u-richard',
+      name: 'NVDA Deep Dive',
+      is_home: false,
+      effective_web_access: 'rw',
+      colleague_dispatch_enabled: true,
+    };
+    const ownerOwnThread = {
+      thread_id: 'th-owner-own',
+      workspace_id: 'ws-richard-1',
+      title: 'Owner Analysis',
+      thread_user_id: 'u-richard',
+      workspace_owner_id: 'u-richard',
+    };
+    const colleagueDispatchedThread = {
+      thread_id: 'th-colleague-dispatched',
+      workspace_id: 'ws-richard-1',
+      title: 'Chao Dispatched Question',
+      thread_user_id: 'u-chao',
+      workspace_owner_id: 'u-richard',
+      dispatched_by: {
+        user_id: 'u-chao',
+        name: 'Chao Yu',
+        channel: 'web',
+      },
+    };
+
+    const baseCallbacks = {
+      isCurrentThread: false,
+      isExpanded: false,
+      isMobile: false,
+      onToggleThread: vi.fn(),
+      onNavigateThread: vi.fn(),
+      onSelectAgent: vi.fn(),
+      onPinThread: vi.fn(),
+      onArchiveThread: vi.fn(),
+      onRenameThread: vi.fn(),
+      onShareThread: vi.fn(),
+      onDeleteThread: vi.fn(),
+    };
+
+    // 1. 所有者 (Owner: u-richard) on own thread -> full 7-item menu (including Share, Rename, Archive, Delete, Pin)
+    const { unmount: unmountOwnerOwn } = renderWithProviders(
+      <ThreadTreeRow
+        wsId="ws-richard-1"
+        ws={ownWs}
+        thread={ownerOwnThread}
+        currentUserId="u-richard"
+        callerTier="internal"
+        {...baseCallbacks}
+      />,
+    );
+    fireEvent.contextMenu(screen.getByText('Owner Analysis'));
+    expect(screen.getByRole('menu')).toBeInTheDocument();
+    expect(screen.getByRole('menuitem', { name: /open in new tab|在新标签页中打开/i })).toBeInTheDocument();
+    expect(screen.getByRole('menuitem', { name: /pin to top|置顶/i })).toBeInTheDocument();
+    expect(screen.getByRole('menuitem', { name: /rename|重命名/i })).toBeInTheDocument();
+    expect(screen.getByRole('menuitem', { name: /^share…?$|^分享…?$/i })).toBeInTheDocument();
+    expect(screen.getByRole('menuitem', { name: /copy link|复制链接/i })).toBeInTheDocument();
+    expect(screen.getByRole('menuitem', { name: /archive|归档/i })).toBeInTheDocument();
+    expect(screen.getByRole('menuitem', { name: /delete|删除/i })).toBeInTheDocument();
+    unmountOwnerOwn();
+
+    // 1b. 所有者 (Owner: u-richard) on colleague-dispatched thread in owner's workspace -> read-only (Open in new tab + Copy link only)
+    const { unmount: unmountOwnerForeign } = renderWithProviders(
+      <ThreadTreeRow
+        wsId="ws-richard-1"
+        ws={ownWs}
+        thread={colleagueDispatchedThread}
+        currentUserId="u-richard"
+        callerTier="internal"
+        {...baseCallbacks}
+      />,
+    );
+    fireEvent.contextMenu(screen.getByText('Chao Dispatched Question'));
+    expect(screen.getByRole('menu')).toBeInTheDocument();
+    expect(screen.getByRole('menuitem', { name: /open in new tab|在新标签页中打开/i })).toBeInTheDocument();
+    expect(screen.getByRole('menuitem', { name: /copy link|复制链接/i })).toBeInTheDocument();
+    expect(screen.queryByRole('menuitem', { name: /pin to top|置顶/i })).toBeNull();
+    expect(screen.queryByRole('menuitem', { name: /rename|重命名/i })).toBeNull();
+    expect(screen.queryByRole('menuitem', { name: /^share…?$|^分享…?$/i })).toBeNull();
+    expect(screen.queryByRole('menuitem', { name: /archive|归档/i })).toBeNull();
+    expect(screen.queryByRole('menuitem', { name: /delete|删除/i })).toBeNull();
+    unmountOwnerForeign();
+
+    // 2. 派发人 (Dispatcher: u-chao) on own dispatched thread in colleague's rw workspace -> has Pin, Rename, Archive, Delete, but NO Share
+    const { unmount: unmountDispatcher } = renderWithProviders(
+      <ThreadTreeRow
+        wsId="ws-richard-1"
+        ws={colleagueRwWs}
+        thread={colleagueDispatchedThread}
+        currentUserId="u-chao"
+        callerTier="internal"
+        {...baseCallbacks}
+      />,
+    );
+    fireEvent.contextMenu(screen.getByText('Chao Dispatched Question'));
+    expect(screen.getByRole('menu')).toBeInTheDocument();
+    expect(screen.getByRole('menuitem', { name: /open in new tab|在新标签页中打开/i })).toBeInTheDocument();
+    expect(screen.getByRole('menuitem', { name: /pin to top|置顶/i })).toBeInTheDocument();
+    expect(screen.getByRole('menuitem', { name: /rename|重命名/i })).toBeInTheDocument();
+    expect(screen.getByRole('menuitem', { name: /copy link|复制链接/i })).toBeInTheDocument();
+    expect(screen.getByRole('menuitem', { name: /archive|归档/i })).toBeInTheDocument();
+    expect(screen.getByRole('menuitem', { name: /delete|删除/i })).toBeInTheDocument();
+    expect(screen.queryByRole('menuitem', { name: /^share…?$|^分享…?$/i })).toBeNull();
+    unmountDispatcher();
+
+    // 3. 旁观同事 (Bystander colleague: u-rex) on colleague's thread -> read-only (Open in new tab + Copy link only; no Pin, Rename, Share, Archive, Delete)
+    const { unmount: unmountBystander } = renderWithProviders(
+      <ThreadTreeRow
+        wsId="ws-richard-1"
+        ws={colleagueRwWs}
+        thread={colleagueDispatchedThread}
+        currentUserId="u-rex"
+        callerTier="internal"
+        {...baseCallbacks}
+      />,
+    );
+    fireEvent.contextMenu(screen.getByText('Chao Dispatched Question'));
+    expect(screen.getByRole('menu')).toBeInTheDocument();
+    expect(screen.getByRole('menuitem', { name: /open in new tab|在新标签页中打开/i })).toBeInTheDocument();
+    expect(screen.getByRole('menuitem', { name: /copy link|复制链接/i })).toBeInTheDocument();
+    expect(screen.queryByRole('menuitem', { name: /pin to top|置顶/i })).toBeNull();
+    expect(screen.queryByRole('menuitem', { name: /rename|重命名/i })).toBeNull();
+    expect(screen.queryByRole('menuitem', { name: /^share…?$|^分享…?$/i })).toBeNull();
+    expect(screen.queryByRole('menuitem', { name: /archive|归档/i })).toBeNull();
+    expect(screen.queryByRole('menuitem', { name: /delete|删除/i })).toBeNull();
+    unmountBystander();
+
+    // 4. 外部成员 (External member: u-ext) on any foreign thread -> strictly isolated (context menu disabled, 0 items, navigation blocked)
+    const navSpy = vi.fn();
+    const { unmount: unmountExternal } = renderWithProviders(
+      <ThreadTreeRow
+        wsId="ws-richard-1"
+        ws={colleagueRwWs}
+        thread={colleagueDispatchedThread}
+        currentUserId="u-ext"
+        callerTier="external"
+        {...baseCallbacks}
+        onNavigateThread={navSpy}
+      />,
+    );
+    fireEvent.contextMenu(screen.getByText('Chao Dispatched Question'));
+    expect(screen.queryByRole('menu')).toBeNull();
+    fireEvent.click(screen.getByText('Chao Dispatched Question'));
+    expect(navSpy).not.toHaveBeenCalled();
+    unmountExternal();
+
+    // 5. Workspace row context menu: enabled for owner, disabled for colleague / dispatcher / external
+    expect(
+      resolveNavWorkspacePermissions(ownWs, { currentUserId: 'u-richard', callerTier: 'internal' }),
+    ).toEqual({
+      isColleagueWorkspace: false,
+      isIsolatedExternal: false,
+      canManageWorkspace: true,
+      canCreateThread: true,
+    });
+    expect(
+      resolveNavWorkspacePermissions(colleagueRwWs, { currentUserId: 'u-chao', callerTier: 'internal' }),
+    ).toEqual({
+      isColleagueWorkspace: true,
+      isIsolatedExternal: false,
+      canManageWorkspace: false,
+      canCreateThread: true,
+    });
+    expect(
+      resolveNavWorkspacePermissions(colleagueRwWs, { currentUserId: 'u-ext', callerTier: 'external' }),
+    ).toEqual({
+      isColleagueWorkspace: true,
+      isIsolatedExternal: true,
+      canManageWorkspace: false,
+      canCreateThread: false,
+    });
+    expect(
+      resolveNavThreadPermissions(ownerOwnThread, ownWs, {
+        currentUserId: 'u-richard',
+        callerTier: 'internal',
+      }),
+    ).toMatchObject({ canMutateThread: true, canShareThread: true, canCopyOrOpen: true });
+    expect(
+      resolveNavThreadPermissions(colleagueDispatchedThread, colleagueRwWs, {
+        currentUserId: 'u-chao',
+        callerTier: 'internal',
+      }),
+    ).toMatchObject({ canMutateThread: true, canShareThread: false, canCopyOrOpen: true });
+    expect(
+      resolveNavThreadPermissions(colleagueDispatchedThread, colleagueRwWs, {
+        currentUserId: 'u-rex',
+        callerTier: 'internal',
+      }),
+    ).toMatchObject({ canMutateThread: false, canShareThread: false, canCopyOrOpen: true });
+    expect(
+      resolveNavThreadPermissions(colleagueDispatchedThread, colleagueRwWs, {
+        currentUserId: 'u-ext',
+        callerTier: 'external',
+      }),
+    ).toMatchObject({ canMutateThread: false, canShareThread: false, canCopyOrOpen: false });
+
+    const { unmount: unmountWsColleague } = renderWithProviders(
+      <WorkspaceTreeRow
+        ws={colleagueRwWs}
+        isExpanded={false}
+        isCurrent={false}
+        isMobile={false}
+        dragDisabled={false}
+        expandedThreadIds={new Set()}
+        currentUserId="u-chao"
+        callerTier="internal"
+        wsActions={{ openDuplicate: vi.fn(), openMove: vi.fn(), openDelete: vi.fn() }}
+        rename={{
+          active: false,
+          value: '',
+          inputRef: { current: null },
+          onChange: vi.fn(),
+          onCommit: vi.fn(),
+          onCancel: vi.fn(),
+          onStart: vi.fn(),
+          enabled: true,
+        }}
+        onToggleWorkspace={vi.fn()}
+        onToggleThread={vi.fn()}
+        onNavigateThread={vi.fn()}
+        onSelectAgent={vi.fn()}
+        onPinWorkspace={vi.fn()}
+        onNewThread={vi.fn()}
+      />,
+    );
+    fireEvent.contextMenu(screen.getByText('NVDA Deep Dive'));
+    expect(screen.queryByRole('menu')).toBeNull();
+    unmountWsColleague();
   });
 });

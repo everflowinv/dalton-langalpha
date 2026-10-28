@@ -6,6 +6,7 @@ import { act, render, screen } from '@testing-library/react';
 import {
   isStaleBuildError,
   checkForNewBuild,
+  reloadIfStale,
   reportStaleBuild,
   watchStaleBuild,
   markBooted,
@@ -13,6 +14,9 @@ import {
   __resetStaleBuildForTests,
 } from '../staleBuild';
 import { toast, type ToastProps } from '@/components/ui/use-toast';
+import { holdReload, trackRequest } from '@/lib/reloadHolds';
+import { authGeneration, clearAuthToken } from '@/lib/authToken';
+import { runAuthResets } from '@/lib/authResets';
 import { StaleBuildBoundary } from '@/components/StaleBuildBoundary';
 import { Toast, ToastDescription, ToastProvider, ToastTitle, ToastViewport } from '@/components/ui/toast';
 import i18n from '@/i18n';
@@ -437,6 +441,144 @@ describe('watchStaleBuild wiring', () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
     expect(toast).toHaveBeenCalledTimes(1);
     stop();
+  });
+});
+
+describe('reloadIfStale', () => {
+  // jsdom cannot reload, so the build this tab reloads away from, recorded
+  // just before the reload, is what shows one was asked for. The e2e suite
+  // covers the reload itself.
+  const reloadedAway = () => sessionStorage.getItem('__la_switch_reload__');
+
+  const serverMovesOn = async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true,
+      headers: new Headers({ 'content-type': 'application/json' }),
+      json: async () => ({ build: 'index-NEWER.js' }),
+    }));
+    await checkForNewBuild();
+  };
+
+  beforeEach(() => setEntryScript('index-CURRENT.js'));
+
+  it('does nothing on a build the server still serves', () => {
+    reloadIfStale();
+    expect(reloadedAway()).toBeNull();
+  });
+
+  it('reloads once the server says it serves another build', async () => {
+    await serverMovesOn();
+    reloadIfStale();
+    expect(reloadedAway()).toBe('index-CURRENT.js');
+  });
+
+  it('does not reload on an asset failure alone, until the server confirms it', async () => {
+    // A flaky network drops a chunk of a current build the same way a deploy does.
+    reportStaleBuild('resource');
+    reloadIfStale();
+    expect(reloadedAway()).toBeNull();
+    await serverMovesOn();
+    reloadIfStale();
+    expect(reloadedAway()).toBe('index-CURRENT.js');
+  });
+
+  it('does not reload offline', async () => {
+    await serverMovesOn();
+    vi.spyOn(navigator, 'onLine', 'get').mockReturnValue(false);
+    reloadIfStale();
+    expect(reloadedAway()).toBeNull();
+  });
+
+  it("drops the last account's holds on sign-out, and ignores their late release", async () => {
+    await serverMovesOn();
+    const stalled = holdReload();
+    runAuthResets();
+    const next = holdReload();
+    stalled();
+    reloadIfStale();
+    expect(reloadedAway()).toBeNull();
+    next();
+    reloadIfStale();
+    expect(reloadedAway()).toBe('index-CURRENT.js');
+  });
+
+  it('forgets a reload that reached another build, so coming back to it can reload again', async () => {
+    sessionStorage.setItem('__la_switch_reload__', 'index-CURRENT.js');
+    setEntryScript('index-OTHER.js');
+    markBooted();
+    expect(reloadedAway()).toBeNull();
+    sessionStorage.setItem('__la_switch_reload__', 'index-OTHER.js');
+    markBooted();
+    expect(reloadedAway()).toBe('index-OTHER.js');
+  });
+
+  it('waits for every hold to be released', async () => {
+    await serverMovesOn();
+    const upload = holdReload();
+    const download = holdReload();
+    reloadIfStale();
+    upload();
+    upload();
+    reloadIfStale();
+    expect(reloadedAway()).toBeNull();
+    download();
+    reloadIfStale();
+    expect(reloadedAway()).toBe('index-CURRENT.js');
+  });
+
+  describe('with the page still talking to the server', () => {
+    beforeEach(() => vi.useFakeTimers());
+    afterEach(() => vi.useRealTimers());
+
+    it('lets a write the page left behind land, then reloads', async () => {
+      await serverMovesOn();
+      const save = trackRequest(authGeneration());
+      reloadIfStale();
+      vi.advanceTimersByTime(500);
+      expect(reloadedAway()).toBeNull();
+      save();
+      vi.advanceTimersByTime(100);
+      expect(reloadedAway()).toBe('index-CURRENT.js');
+    });
+
+    it('waits on work only the caller sees', async () => {
+      await serverMovesOn();
+      let mutating = true;
+      reloadIfStale(() => !mutating);
+      vi.advanceTimersByTime(500);
+      expect(reloadedAway()).toBeNull();
+      mutating = false;
+      vi.advanceTimersByTime(100);
+      expect(reloadedAway()).toBe('index-CURRENT.js');
+    });
+
+    it('gives up on a request that outlasts the wait', async () => {
+      await serverMovesOn();
+      const transfer = trackRequest(authGeneration());
+      reloadIfStale();
+      vi.advanceTimersByTime(2100);
+      transfer();
+      vi.advanceTimersByTime(1000);
+      expect(reloadedAway()).toBeNull();
+    });
+
+    it('waits on nobody for a request the last account left stalled', async () => {
+      await serverMovesOn();
+      trackRequest(authGeneration());
+      clearAuthToken();
+      reloadIfStale();
+      expect(reloadedAway()).toBe('index-CURRENT.js');
+    });
+
+    it('stays once the user has started on the page that opened', async () => {
+      await serverMovesOn();
+      const read = trackRequest(authGeneration());
+      reloadIfStale();
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: 'a' }));
+      read();
+      vi.advanceTimersByTime(1000);
+      expect(reloadedAway()).toBeNull();
+    });
   });
 });
 

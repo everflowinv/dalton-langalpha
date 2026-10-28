@@ -12,6 +12,7 @@
   min-height: 0;
   overflow-y: auto;
   padding: var(--page-top) clamp(16px, 3vw, 32px) 48px;
+  scrollbar-gutter: stable;
 }
 
 .orders-container {
@@ -25,6 +26,7 @@
   border: 1px solid var(--color-border-muted);
   border-radius: 8px;
   background-color: var(--color-bg-card);
+  container-type: inline-size;
 }
 
 /* Fixed layout, so the column plan in OrdersTable.tsx is the whole story: no
@@ -100,6 +102,77 @@
    tooltip, so the pill never wraps and the glyph stays on the text's line. */
 .orders-cell-status {
   white-space: nowrap;
+}
+
+/* Below the table's own floor the nine columns would only be reachable by
+   scrolling sideways, which hid Status first. Keyed to the table's room rather
+   than the window's, since the nav sidebar takes a different share at each
+   width. Each attempt becomes a card in the same markup: the order and its
+   verdict on the first line, the order's terms under it, when and where last.
+   The header row stays for assistive tech, out of sight. */
+@container (max-width: 859px) {
+  .orders-table,
+  .orders-table tbody {
+    display: block;
+    min-width: 0;
+  }
+  .orders-table colgroup {
+    display: none;
+  }
+  .orders-table thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+  }
+  .orders-row {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr)) fit-content(45%);
+    grid-template-areas:
+      'instrument instrument instrument status'
+      'action side size price'
+      'time time mode vendor';
+    align-items: center;
+    gap: 6px 10px;
+    padding: 12px 14px;
+  }
+  /* A cancel or confirm names no instrument, side, size or price, so the id it
+     acts on leads the card in their place. */
+  .orders-row-bare {
+    grid-template-areas:
+      'action action action status'
+      'time time mode vendor';
+  }
+  .orders-row-bare .orders-cell-instrument,
+  .orders-row-bare .orders-cell-side,
+  .orders-row-bare .orders-cell-size,
+  .orders-row-bare .orders-cell-price {
+    display: none;
+  }
+  .orders-row + .orders-row {
+    border-top: 1px solid var(--color-border-muted);
+  }
+  .orders-cell {
+    padding: 0;
+    border-top: 0;
+    overflow-wrap: anywhere;
+  }
+  .orders-cell-instrument { grid-area: instrument; font-size: 0.9375rem; }
+  .orders-cell-status { grid-area: status; justify-self: end; }
+  .orders-cell-action { grid-area: action; }
+  .orders-cell-side { grid-area: side; }
+  .orders-cell-size { grid-area: size; text-align: left; }
+  .orders-cell-price { grid-area: price; }
+  .orders-cell-time,
+  .orders-cell-mode,
+  .orders-cell-vendor {
+    font-size: 0.6875rem;
+    color: var(--color-text-tertiary);
+  }
+  .orders-cell-time { grid-area: time; }
+  .orders-cell-mode { grid-area: mode; }
+  .orders-cell-vendor { grid-area: vendor; justify-self: end; text-align: right; }
 }
 
 @media (max-width: 767px) {

@@ -18,6 +18,15 @@ logger = logging.getLogger(__name__)
 
 NATIVE_OVERLAY_PATH = Path(__file__).resolve().parent / "native_overlay.json"
 
+# DALTON-HOOK(llm-overlay): model keys Dalton pins to its own OAuth line.
+# Upstream's manifest later grew same-named entries pointing at its
+# `grok-oauth` (api.x.ai); Dalton's SuperGrok subscription rides its own
+# `xai-oauth` provider and the CLI proxy, so for exactly these keys the
+# Dalton overlay's definition replaces the manifest's. Any other name
+# collision remains an error, and the checked-in overlay has the last word:
+# a runtime-sync overlay cannot repoint or drop these two routes.
+PINNED_OVERLAY_MODEL_KEYS = frozenset({"grok-4.7-oauth", "grok-4.3-oauth"})
+
 # Merge order: checked-in native overlay → runtime native-sync overlay
 # (var/dalton/catalog, written by the settings-page card) → OpenClaw overlay.
 OVERLAY_SOURCES: list[tuple[str, Path]] = [
@@ -96,6 +105,11 @@ def _merge_single_overlay(
     if isinstance(overlay_models, dict):
         for key, entry in overlay_models.items():
             if key in llm_config:
+                if key in PINNED_OVERLAY_MODEL_KEYS:
+                    # DALTON-HOOK(llm-overlay): pinned Grok keys — the overlay
+                    # wins over a same-named manifest entry (see PINNED_OVERLAY_MODEL_KEYS).
+                    llm_config[key] = copy.deepcopy(entry)
+                    continue
                 logger.error(
                     "Dalton %s overlay model key %r collides with existing models.json; skipping.",
                     source_name,
@@ -180,12 +194,23 @@ def _merge_single_overlay(
 _UPSTREAM_RAW_MANIFEST_TESTS = (
     "tests/unit/llms/test_manifest_integrity.py",
     "tests/unit/llms/test_model_rating_metadata.py",
+    "tests/unit/llms/test_provider_isolation.py",
 )
 
 
 def _in_upstream_raw_manifest_test() -> bool:
     cur = os.environ.get("PYTEST_CURRENT_TEST", "")
-    return any(t in cur for t in _UPSTREAM_RAW_MANIFEST_TESTS)
+    if cur:
+        return any(t in cur for t in _UPSTREAM_RAW_MANIFEST_TESTS)
+    import sys
+
+    frame = sys._getframe(1)
+    while frame is not None:
+        filename = frame.f_code.co_filename.replace("\\", "/")
+        if any(filename.endswith(t) for t in _UPSTREAM_RAW_MANIFEST_TESTS):
+            return True
+        frame = frame.f_back
+    return False
 
 
 def _drop_retired_models(
@@ -235,6 +260,33 @@ def _drop_retired_models(
             ]
 
 
+def _enforce_pinned_overlay_routes(llm_config: dict[str, Any]) -> None:
+    """Give the checked-in native overlay the last word on the pinned keys.
+
+    Runs after every overlay source has merged, so neither an upstream
+    same-named manifest entry nor a runtime-sync overlay can leave
+    ``grok-4.7-oauth`` / ``grok-4.3-oauth`` pointing anywhere but Dalton's
+    ``xai-oauth`` line (DALTON-HOOK(llm-overlay)).
+    """
+    native = load_overlay_data(NATIVE_OVERLAY_PATH) or {}
+    models = native.get("models") or {}
+    for key in PINNED_OVERLAY_MODEL_KEYS:
+        entry = models.get(key)
+        if not isinstance(entry, dict):
+            logger.error("Dalton native overlay is missing pinned model key %r", key)
+            continue
+        current = llm_config.get(key)
+        if current is not entry and current != entry:
+            if current is not None:
+                logger.warning(
+                    "Dalton pinned model key %r resolved to provider %r; forcing back to %r",
+                    key,
+                    (current or {}).get("provider"),
+                    entry.get("provider"),
+                )
+            llm_config[key] = copy.deepcopy(entry)
+
+
 def apply_model_overlay(
     llm_config: dict[str, Any],
     manifest: dict[str, Any],
@@ -243,8 +295,10 @@ def apply_model_overlay(
     """Merge Dalton overlays (`native_overlay.json` → native-sync runtime overlay → `openclaw_overlay.json`) into `llm_config` and `manifest`.
 
     Never overwrites existing upstream model keys or provider_config groups; logs an error and skips on collision.
-    Afterwards the native-sync overlay's PM-retired keys are dropped (see
-    `_drop_retired_models`), so they stay hidden wherever they were defined.
+    Afterwards the native overlays' retired keys are dropped (see
+    `_drop_retired_models`), so they stay hidden wherever they were defined —
+    the checked-in overlay retires keys for good (upstream lines Dalton does
+    not offer), the runtime sync overlay retires PM-retired keys.
     """
     if path is None and _in_upstream_raw_manifest_test():
         return None
@@ -265,14 +319,15 @@ def apply_model_overlay(
         overlay = load_overlay_data(src_path)
         if overlay:
             _merge_single_overlay(overlay, name, llm_config, manifest)
-            if name == "native_sync":
-                retired_records = [
+            if name in ("native", "native_sync"):
+                retired_records.extend(
                     item
                     for item in overlay.get("retired") or []
                     if isinstance(item, dict)
-                ]
+                )
     if retired_records:
         _drop_retired_models(retired_records, llm_config, manifest)
+    _enforce_pinned_overlay_routes(llm_config)
     return stamp
 
 

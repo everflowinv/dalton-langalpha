@@ -117,7 +117,7 @@ vi.mock('@/hooks/usePreferences', async () => {
 vi.mock('@/hooks/useAllModels', () => ({
   useAllModels: () => ({
     models: {},
-    modelAccessMap: undefined,
+    payers: {},
     validModelNames: new Set<string>(),
     catalogModelNames: new Set<string>(),
     metadata: {},
@@ -147,6 +147,7 @@ vi.mock('@/components/ui/chat-input.modelMenu', () => ({
       <button type="button" onClick={() => onSelectModel('model-y')}>pick-y</button>
     </>
   ),
+  ChatInputEffortMenu: () => null,
   ModelTriggerMeasure: () => null,
 }));
 

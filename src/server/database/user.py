@@ -513,7 +513,10 @@ _USER_PREFS_TTL = 86400  # 24h — freshness via explicit invalidation
 # Cached-shape version, as for the profile below. A migration that rewrites
 # these rows in raw SQL, as 072 renamed the Background slot's keys, passes no
 # application write path, so it bumps this to retire every row cached before.
-_USER_PREFS_SHAPE = 2
+# DALTON-HOOK(prefs-cache-shape): 096 rewrites agent_preference in raw SQL
+# (output_format becomes a ranking) without bumping these, so a cached row
+# would serve the pre-096 value for up to a day after the upgrade.
+_USER_PREFS_SHAPE = 3
 
 
 def _user_prefs_cache_key(user_id: str) -> str:
@@ -894,7 +897,7 @@ _USER_PROFILE_TTL = 86400  # 24h, kept fresh by explicit invalidation
 # previous shape wrote. Bump it whenever the dict below changes keys: a
 # migration can move preference data in raw SQL, under no application write
 # path, and nothing invalidates a profile cached before it ran.
-_USER_PROFILE_SHAPE = 2
+_USER_PROFILE_SHAPE = 3  # DALTON-HOOK(prefs-cache-shape): see _USER_PREFS_SHAPE
 
 
 def _user_profile_cache_key(user_id: str) -> str:

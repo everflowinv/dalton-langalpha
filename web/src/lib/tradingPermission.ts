@@ -6,7 +6,7 @@ import type { AgreementLevel, TradingLevel } from '@/types/api';
  *  address (`TRADING_SETTINGS_URL` in `src/server/services/trading_rule.py`),
  *  so a move here moves there too. */
 export const TRADING_PERMISSION_ANCHOR = 'trading-permission';
-export const TRADING_PERMISSION_HREF = `/settings?tab=preferences#${TRADING_PERMISSION_ANCHOR}`;
+export const TRADING_PERMISSION_HREF = `/settings?tab=trading#${TRADING_PERMISSION_ANCHOR}`;
 
 /** The version of the agreement text this bundle shows
  *  (`settings.tradingPermission.agreement.*`), and the one opting in sends.

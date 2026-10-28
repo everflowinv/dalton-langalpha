@@ -18,6 +18,31 @@ from src.llms.extension.dashscope import ScopedResponsesStream, _codex_pending_c
 
 logger = logging.getLogger(__name__)
 
+CODEX_ORIGINATOR = "codex_cli_rs"
+CODEX_PROVIDER = "codex-oauth"
+
+
+def codex_client_version() -> str:
+    """The Codex CLI version this server presents itself as.
+
+    One value, ``client_version`` on ``codex-oauth`` in providers.json, for the
+    request path and the model list: the backend gates which models an account
+    sees on it (0.99.0 listed one model where 0.164.0 listed nine), so the two
+    must never disagree.
+    """
+    from src.llms.llm import LLM
+
+    return LLM.get_model_config().get_provider_info(CODEX_PROVIDER)["client_version"]
+
+
+def codex_identity_headers() -> dict[str, str]:
+    """The first-party client identity the codex backend requires.
+
+    Without an originator naming a known client and a User-Agent carrying the
+    matching ``<originator>/`` prefix, newer models 404 "Model not found".
+    """
+    return {"originator": CODEX_ORIGINATOR, "User-Agent": f"{CODEX_ORIGINATOR}/{codex_client_version()}"}
+
 
 def _extract_system_to_instructions(payload: dict) -> None:
     """Move system messages from input to the top-level ``instructions`` field.
