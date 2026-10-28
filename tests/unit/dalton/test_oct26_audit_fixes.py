@@ -1118,7 +1118,7 @@ async def test_b12_zero_budget_blocks_fallback_on_main_and_subagent(
     from decimal import Decimal
     from fastapi import HTTPException
     from langchain.agents.middleware.types import ModelRequest, ModelResponse
-    from ptc_agent.agent.middleware.credit_gate import CreditLease, current_credit_gate
+    from ptc_agent.agent.middleware.credit_gate import current_credit_gate
     import src.dalton.budget.gate as budget_gate_mod
 
     # 1. Pre-turn admission: enforce_local_admission rejects when available == 0
@@ -1158,12 +1158,25 @@ async def test_b12_zero_budget_blocks_fallback_on_main_and_subagent(
         await budget_gate_mod.enforce_local_admission("user-1", byok=True)
     assert exc_info.value.status_code == 429
 
-    # 2. Mid-turn resilience: when the credit gate lease is at 0 / exhausted,
-    # a failing primary model call on both main agent and subagent does NOT
-    # select or initiate any fallback candidate.
-    lease = create_autospec(CreditLease, instance=True)
-    lease.spend.return_value = 10.0
-    lease.should_stop.return_value = True
+    # 2. Mid-turn resilience with real CreditGateState (main gate + spawned
+    # subagent child gate sharing the same CreditLease):
+    # (a) when budget is sufficient, main and subagent make model calls normally
+    #     (and fall back normally on primary failure);
+    # (b) when the shared lease is exhausted, neither main agent nor subagent
+    #     selects or initiates any fallback candidate.
+    main_gate = budget_gate_mod.build_local_run_gate(
+        user_id="user-1",
+        run_id="run-b12-1",
+        token_callback=None,
+        is_byok=True,
+    )
+    assert main_gate is not None
+    sub_gate = main_gate.spawn_child(
+        run_ref="task-b12-1",
+        tracker=None,
+        tool_tracker=None,
+    )
+    assert sub_gate.lease is main_gate.lease
 
     primary_client = SimpleNamespace(
         __langalpha_meta__={"manifest_model": "claude-opus-4-7", "billing_type": "oauth"}
@@ -1185,34 +1198,77 @@ async def test_b12_zero_budget_blocks_fallback_on_main_and_subagent(
     emit_fallback_spy = create_autospec(mw._emit_fallback)
     monkeypatch.setattr(mw, "_emit_fallback", emit_fallback_spy)
 
+    ok_response = create_autospec(ModelResponse, instance=True)
+    ok_response.result = []
     called_models: list[Any] = []
+
+    async def _ok_handler(req: ModelRequest) -> ModelResponse:
+        called_models.append(req.model)
+        return ok_response
 
     async def _failing_handler(req: ModelRequest) -> ModelResponse:
         called_models.append(req.model)
         raise RuntimeError("primary provider 503 failure")
 
-    token = current_credit_gate.set(lease)
+    def _make_req(client: Any) -> ModelRequest:
+        req = create_autospec(ModelRequest, instance=True)
+        req.model = client
+        req.messages = []
+        req.model_settings = {}
+        req.state = {"messages": []}
+        req.override.side_effect = lambda **kw: SimpleNamespace(
+            model=kw.get("model", client),
+            messages=kw.get("messages", []),
+            model_settings={},
+            state={"messages": []},
+        )
+        return req
+
+    # Scenario A: Sufficient budget (grant active, denial is None) -> normal model calls work
+    # on both main agent and subagent without AttributeError.
+    main_gate.lease.ceiling_credits = 500.0
+    main_gate.lease.denial = None
+
+    token = current_credit_gate.set(main_gate)
     try:
-        # Main agent request
-        main_req = create_autospec(ModelRequest, instance=True)
-        main_req.model = primary_client
-        main_req.messages = []
-        main_req.model_settings = {}
-        main_req.state = {"messages": []}
+        called_models.clear()
+        res_main = await mw.awrap_model_call(_make_req(primary_client), _ok_handler)
+        assert res_main is ok_response
+        assert called_models == [primary_client]
+    finally:
+        current_credit_gate.reset(token)
+
+    token = current_credit_gate.set(sub_gate)
+    try:
+        called_models.clear()
+        res_sub = await mw.awrap_model_call(_make_req(subagent_client), _ok_handler)
+        assert res_sub is ok_response
+        assert called_models == [subagent_client]
+    finally:
+        current_credit_gate.reset(token)
+
+    # Scenario B: Exhausted budget (denial recorded and spend >= ceiling_credits) ->
+    # failing turn on both main agent and subagent does NOT initiate fallback.
+    main_gate.lease.ceiling_credits = 0.0
+    main_gate.lease.denial = {"message": "Daily budget exhausted"}
+
+    token = current_credit_gate.set(main_gate)
+    try:
+        called_models.clear()
+        emit_fallback_spy.reset_mock()
         with pytest.raises(RuntimeError, match="primary provider 503 failure"):
-            await mw.awrap_model_call(main_req, _failing_handler)
+            await mw.awrap_model_call(_make_req(primary_client), _failing_handler)
         assert called_models == [primary_client]
         emit_fallback_spy.assert_not_called()
+    finally:
+        current_credit_gate.reset(token)
 
-        # Subagent request
+    token = current_credit_gate.set(sub_gate)
+    try:
         called_models.clear()
-        sub_req = create_autospec(ModelRequest, instance=True)
-        sub_req.model = subagent_client
-        sub_req.messages = []
-        sub_req.model_settings = {}
-        sub_req.state = {"messages": []}
+        emit_fallback_spy.reset_mock()
         with pytest.raises(RuntimeError, match="primary provider 503 failure"):
-            await mw.awrap_model_call(sub_req, _failing_handler)
+            await mw.awrap_model_call(_make_req(subagent_client), _failing_handler)
         assert called_models == [subagent_client]
         emit_fallback_spy.assert_not_called()
     finally:

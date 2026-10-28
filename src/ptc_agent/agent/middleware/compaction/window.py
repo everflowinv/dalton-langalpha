@@ -34,6 +34,7 @@ from ptc_agent.agent.middleware.compaction.offloading import (
 from ptc_agent.agent.middleware.compaction.utils import resolve_cutoff_index
 from ptc_agent.agent.middleware.thinking_binding import (
     UNSENT_THINKING_KEY,
+    shrink_ids,  # DALTON-HOOK(attachment-native-cap)
     unsent_thinking,
 )
 from ptc_agent.agent.state import ensure_message_ids
@@ -103,11 +104,16 @@ def trim(
         update["_offloaded_read_result_ids"] = reads & live
     ids = {msg.id for msg in kept}
     for key, recorded in (
+        # DALTON-HOOK(attachment-native-cap): ``shrink_ids`` keeps the return
+        # value a ``set`` while carrying the retired ids on ``.dropped`` so the
+        # channel's ``_union`` reducer drops them instead of unioning them back.
         ("_removed_attachment_ids", removed_attachments(state)),
         ("_unanswered_notes_rows", unanswered_notes_rows(state)),
     ):
         if recorded - ids:
-            update[key] = recorded & ids
+            update[key] = (
+                shrink_ids(recorded, ids) if key == "_removed_attachment_ids" else recorded & ids
+            )
     summary = (state.get("_summarization_event") or {}).get("summary_message")
     in_view = ids | {getattr(summary, "id", None)}
     unsent = unsent_thinking(state)

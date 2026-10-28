@@ -22,6 +22,7 @@ from ptc_agent.agent.state import ensure_message_ids
 from ptc_agent.agent.middleware.compaction.measure import Estimate
 from ptc_agent.agent.middleware.compaction.offloading import removed_attachments
 from ptc_agent.agent.middleware.thinking_binding import (
+    _Shrunk,  # DALTON-HOOK(attachment-native-cap)
     checked_thinking_end,
     thinking_after,
     unsent_thinking,
@@ -66,7 +67,16 @@ class Fitted(NamedTuple):
         ``state`` holds."""
         update: dict[str, Any] = {}
         if self.removed:
-            update["_removed_attachment_ids"] = removed_attachments(state) | self.removed
+            # DALTON-HOOK(attachment-native-cap): when ``state`` is a summary's
+            # update dict, its ``_removed_attachment_ids`` carries the ids the
+            # summary retired (``.dropped``); keep them on the unioned write so
+            # the channel reducer still drops them.
+            prior = state.get("_removed_attachment_ids")
+            dropped = getattr(prior, "dropped", frozenset())
+            merged = removed_attachments(state) | self.removed
+            update["_removed_attachment_ids"] = (
+                _Shrunk(merged, dropped=dropped) if dropped else merged
+            )
         if self.unsent:
             update["_unsent_thinking_ids"] = unsent_thinking(state) | self.unsent
         return update

@@ -86,6 +86,7 @@ from ptc_agent.agent.middleware.compaction.offloading import (
     tool_call_ids,
 )
 from ptc_agent.agent.middleware.thinking_binding import (
+    shrink_ids,  # DALTON-HOOK(attachment-native-cap)
     thinking_after,
     without_thinking,
 )
@@ -187,7 +188,10 @@ class Compaction:
             "_summarization_event": self.event,
             "_offloaded_tool_call_ids": args & live,
             "_offloaded_read_result_ids": reads & live,
-            "_removed_attachment_ids": removed_attachments(state) & kept,
+            # DALTON-HOOK(attachment-native-cap): ``shrink_ids`` returns a set
+            # carrying the retired ids on ``.dropped``, so ``_union`` drops
+            # summarized messages while still unioning any same-step addition.
+            "_removed_attachment_ids": shrink_ids(removed_attachments(state), kept),
             "_unsent_thinking_ids": self.unsent,
             "_unanswered_notes_rows": suppressed_notes_rows(state, self.preserved)
             | unanswered_rows(self.preserved),

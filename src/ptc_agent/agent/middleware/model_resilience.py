@@ -537,8 +537,11 @@ class ModelResilienceMiddleware(AgentMiddleware):
     def _credit_gate_exhausted() -> bool:  # DALTON-HOOK(budget-gate)
         from ptc_agent.agent.middleware.credit_gate import current_credit_gate
 
-        lease = current_credit_gate.get()
-        return bool(lease is not None and lease.should_stop(lease.spend()))
+        gate = current_credit_gate.get()
+        if gate is None:
+            return False
+        lease = gate.lease
+        return bool(lease.should_stop(lease.spend()))
 
     def _candidates(self, request: ModelRequest) -> list[tuple[str, Any | None]]:
         primary = (self._primary_display_name(request), None)
