@@ -130,7 +130,14 @@ function SupabaseAuthProvider({ children }: { children: React.ReactNode }) {
     const syncUserId = sess.user?.id ?? '';
     if (isDaltonAuth) {
       const existingPromise = _syncPromises.get(syncUserId);
-      if (existingPromise) return existingPromise;
+      if (existingPromise) {
+        // DALTON-HOOK(dalton-auth): a sign-in that reuses an in-flight sync
+        // (A signs out and back in, or A→B→A, before A's sync lands) holds the
+        // reload in the current auth generation too — the auth reset cleared
+        // the first sign-in's tracking, so without this nothing would.
+        const settleReuse = trackRequest(authGeneration());
+        return existingPromise.finally(settleReuse);
+      }
     } else if (_syncPromise) {
       return _syncPromise;
     }
