@@ -332,7 +332,8 @@ describe('Settings — Output format', () => {
 
     fireEvent.change(nonAdminSearch, { target: { value: '飞书' } });
     expect(screen.queryByText('Feishu read scopes')).not.toBeInTheDocument();
-    expect(screen.getByText('No settings match.')).toBeInTheDocument();
+    // Notification targets is every member's own card, so it still answers "飞书".
+    expect(await screen.findByText('Notification targets')).toBeInTheDocument();
     unmount();
 
     h.canInvite = true;

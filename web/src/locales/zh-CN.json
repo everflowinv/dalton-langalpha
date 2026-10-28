@@ -669,7 +669,7 @@
       "budgetLabel": "每日预算与团队模型限额",
       "budgetDesc": "查看今日现金与订阅折算消耗，调整团队与成员每日 USD 额度。",
       "notifyTargetsLabel": "主动通知目标",
-      "notifyTargetsDesc": "配置定时任务与系统的个人消息主动推送目标。",
+      "notifyTargetsDesc": "配置定时任务与系统的飞书、Discord 主动推送目标。",
       "systemJobsLabel": "系统自动任务",
       "systemJobsDesc": "查看并手动触发知识库同步、研报增量扫描、公司近况巡检等系统任务。"
     }

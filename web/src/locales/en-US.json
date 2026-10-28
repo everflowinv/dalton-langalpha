@@ -671,7 +671,7 @@
       "budgetLabel": "Daily budget & spending limits",
       "budgetDesc": "View today’s cash and subscription-equivalent spend and adjust daily USD limits.",
       "notifyTargetsLabel": "Notification targets",
-      "notifyTargetsDesc": "Configure personal messaging targets for proactive automation notifications.",
+      "notifyTargetsDesc": "Configure Feishu and Discord targets for proactive automation notifications.",
       "systemJobsLabel": "System scheduled jobs",
       "systemJobsDesc": "Inspect and trigger system-level background jobs such as wiki sync and filing scans."
     }
