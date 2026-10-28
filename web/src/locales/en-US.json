@@ -593,7 +593,7 @@
     "definition": {
       "account": "Your name, photo and sign-in.",
       "preferences": "What you told the agent about how you invest, so its research fits you.",
-      "plan": "Your plan, your credits and billing, managed in your LangAlpha account.",
+      "plan": "Your plan, your credits and billing, managed in your {{brand}} account.",
       "general": "Language, timezone and the in-app guides.",
       "appearance": "Theme, text size and how data cards look.",
       "chat": "How replies come in and what the chat shows while the agent works.",
@@ -615,11 +615,11 @@
     "photo": "Photo",
     "photoDesc": "PNG, JPEG, GIF or WebP.",
     "nameDesc": "Shown in the account menu.",
-    "logoutDesc": "You'll need to sign in again to use LangAlpha.",
+    "logoutDesc": "You'll need to sign in again to use {{brand}}.",
     "investingAnswers": "Your answers",
     "resetPreferencesDesc": "Clears your investing answers, default models and other model settings. Conversations keep the models they use.",
     "regionGroup": "Language and region",
-    "localeDesc": "The language LangAlpha is shown in.",
+    "localeDesc": "The language {{brand}} is shown in.",
     "timezoneDesc": "Dates and times are shown in this timezone.",
     "desktopGroup": "Desktop app",
     "helpGroup": "Help",
@@ -656,7 +656,7 @@
       "manage": "Manage",
       "open": "Open",
       "connectedApps": "Connected apps",
-      "connectedAppsDesc": "Apps you've signed in to with your LangAlpha account."
+      "connectedAppsDesc": "Apps you've signed in to with your {{brand}} account."
     },
     "dalton": {
       "routingDesc": "Default models for figure audit, language review, independent review, auxiliary tasks, and conversation archive extraction.",
@@ -671,7 +671,7 @@
       "budgetLabel": "Daily budget & spending limits",
       "budgetDesc": "View today’s cash and subscription-equivalent spend and adjust daily USD limits.",
       "notifyTargetsLabel": "Notification targets",
-      "notifyTargetsDesc": "Configure Feishu and Discord targets for proactive automation notifications.",
+      "notifyTargetsDesc": "Configure personal messaging targets for proactive automation notifications.",
       "systemJobsLabel": "System scheduled jobs",
       "systemJobsDesc": "Inspect and trigger system-level background jobs such as wiki sync and filing scans."
     }

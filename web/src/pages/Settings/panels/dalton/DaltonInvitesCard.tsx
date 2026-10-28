@@ -15,6 +15,13 @@ import {
   type DaltonInviteItem,
   type DaltonInviteStatus,
 } from '../../utils/daltonApi';
+import type { DaltonSettingVisibilityContext } from './DaltonCosSharingCard';
+
+export function canShowDaltonInviteAdminCard(
+  ctx?: DaltonSettingVisibilityContext | null,
+): boolean {
+  return Boolean(ctx?.canInvite);
+}
 
 function extractApiError(err: unknown, fallback: string): string {
   if (err && typeof err === 'object') {
@@ -77,7 +84,7 @@ export function DaltonInvitesCard(): React.ReactElement | null {
     },
   });
 
-  if (!canInvite) {
+  if (!canShowDaltonInviteAdminCard({ canInvite })) {
     return null;
   }
 
@@ -110,6 +117,7 @@ export function DaltonInvitesCard(): React.ReactElement | null {
 
   return (
     <div
+      id="dalton-invites"
       className="flex flex-col gap-3 rounded-lg p-4"
       style={{
         backgroundColor: 'var(--color-bg-card)',

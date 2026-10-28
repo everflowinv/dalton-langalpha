@@ -11,12 +11,8 @@ export function DaltonSection({ advanced = false }: { advanced?: boolean } = {})
   return (
     <div className="flex flex-col gap-3">
       <DaltonCosSharingCard />
-      <div id="dalton-invites">
-        <DaltonInvitesCard />
-      </div>
-      <div id="dalton-feishu-scopes">
-        <FeishuReadScopesCard />
-      </div>
+      <DaltonInvitesCard />
+      <FeishuReadScopesCard />
       <div id="dalton-providers">
         <ProviderStatusCard />
       </div>

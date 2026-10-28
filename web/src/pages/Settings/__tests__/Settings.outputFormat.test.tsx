@@ -9,10 +9,21 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 const h = vi.hoisted(() => ({
   platformMode: false,
   daltonAuth: false, // DALTON-HOOK(hide-experiments)
+  canInvite: false, // DALTON-HOOK(settings-section)
   mutateAsync: vi.fn(async (_payload: unknown) => ({})),
   user: null as Record<string, unknown> | null,
   preferences: null as Record<string, unknown> | null,
   validModelNames: new Set<string>(),
+}));
+
+vi.mock('@/hooks/useTeamCredentials', () => ({
+  TEAM_SHARED_CREDENTIALS_HINT: '',
+  useTeamCredentials: () => ({
+    isShared: true,
+    canDisconnect: h.canInvite,
+    isPm: h.canInvite,
+    canInvite: h.canInvite,
+  }),
 }));
 
 vi.mock('@/config/hostMode', () => ({
@@ -110,15 +121,16 @@ vi.mock('@/pages/Onboarding', () => ({
 }));
 
 // Import after mocks are registered.
+import { queryKeys } from '@/lib/queryKeys';
 import Settings from '../Settings';
 import { readSection, searchableSettings, sectionShown } from '../sections';
 
-function renderPreferencesTab() {
-  const queryClient = new QueryClient({
+function renderPreferencesTab(queryClient?: QueryClient) {
+  const client = queryClient ?? new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
   return render(
-    <QueryClientProvider client={queryClient}>
+    <QueryClientProvider client={client}>
       <MemoryRouter initialEntries={['/settings?tab=agent']}>
         <Settings />
       </MemoryRouter>
@@ -129,12 +141,16 @@ function renderPreferencesTab() {
 beforeEach(() => {
   h.platformMode = false;
   h.daltonAuth = false; // DALTON-HOOK(hide-experiments)
+  h.canInvite = false; // DALTON-HOOK(settings-section)
   h.validModelNames = new Set<string>();
   h.mutateAsync.mockClear();
   h.mutateAsync.mockResolvedValue({});
 });
 
-function setupAndRender(agentPreference: Record<string, unknown> = {}) {
+function setupAndRender(
+  agentPreference: Record<string, unknown> = {},
+  queryClient?: QueryClient,
+) {
   h.user = {
     id: 'u-1',
     email: 'tester@example.com',
@@ -142,7 +158,7 @@ function setupAndRender(agentPreference: Record<string, unknown> = {}) {
     onboarding_completed: true,
   };
   h.preferences = { agent_preference: agentPreference };
-  return renderPreferencesTab();
+  return renderPreferencesTab(queryClient);
 }
 
 describe('Settings — Output format', () => {
@@ -290,5 +306,74 @@ describe('Settings — Output format', () => {
 
     fireEvent.change(searchInput, { target: { value: '研究总监' } });
     expect(await screen.findByText('Chief of Staff workspace sharing')).toBeInTheDocument();
+  });
+
+  // DALTON-HOOK(settings-section): filter Dalton invite and Feishu scope settings in search by canInvite
+  it('hides invite and Feishu scope settings in search for non-admins and shows them for admins', async () => {
+    h.canInvite = false;
+    const { unmount } = setupAndRender({});
+    const nonAdminSearch = await screen.findByRole('combobox', { name: /Search settings/i });
+
+    fireEvent.change(nonAdminSearch, { target: { value: '邀请' } });
+    expect(screen.queryByText('Team invitations & member access')).not.toBeInTheDocument();
+    expect(screen.getByText('No settings match.')).toBeInTheDocument();
+
+    fireEvent.change(nonAdminSearch, { target: { value: '飞书' } });
+    expect(screen.queryByText('Feishu read scopes')).not.toBeInTheDocument();
+    expect(screen.getByText('No settings match.')).toBeInTheDocument();
+    unmount();
+
+    h.canInvite = true;
+    const { unmount: unmountAdmin } = setupAndRender({});
+    const adminSearch = await screen.findByRole('combobox', { name: /Search settings/i });
+
+    fireEvent.change(adminSearch, { target: { value: '邀请' } });
+    expect(await screen.findByText('Team invitations & member access')).toBeInTheDocument();
+
+    fireEvent.change(adminSearch, { target: { value: '飞书' } });
+    expect(await screen.findByText('Feishu read scopes')).toBeInTheDocument();
+    unmountAdmin();
+  });
+
+  // DALTON-HOOK(settings-section): filter Chief of Staff sharing in search for external members and when dispatch is off
+  it('hides Chief of Staff workspace sharing in search for external members and shows it for internal members when dispatch is enabled', async () => {
+    const extClient = new QueryClient({
+      defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+    });
+    extClient.setQueryData(queryKeys.dalton.userSharing(), {
+      user_id: 'u-ext',
+      cos_rw_enabled: false,
+      cos_access: 'hidden',
+      can_edit: false,
+      caller_tier: 'external',
+      colleague_dispatch_enabled: true,
+      updated_at: null,
+    });
+    const { unmount: unmountExt } = setupAndRender({}, extClient);
+    const extSearch = await screen.findByRole('combobox', { name: /Search settings/i });
+
+    fireEvent.change(extSearch, { target: { value: '研究总监' } });
+    expect(screen.queryByText('Chief of Staff workspace sharing')).not.toBeInTheDocument();
+    expect(screen.getByText('No settings match.')).toBeInTheDocument();
+    unmountExt();
+
+    const intClient = new QueryClient({
+      defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+    });
+    intClient.setQueryData(queryKeys.dalton.userSharing(), {
+      user_id: 'u-int',
+      cos_rw_enabled: true,
+      cos_access: 'rw',
+      can_edit: true,
+      caller_tier: 'internal',
+      colleague_dispatch_enabled: true,
+      updated_at: null,
+    });
+    const { unmount: unmountInt } = setupAndRender({}, intClient);
+    const intSearch = await screen.findByRole('combobox', { name: /Search settings/i });
+
+    fireEvent.change(intSearch, { target: { value: '研究总监' } });
+    expect(await screen.findByText('Chief of Staff workspace sharing')).toBeInTheDocument();
+    unmountInt();
   });
 });

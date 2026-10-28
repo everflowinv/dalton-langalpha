@@ -5,6 +5,23 @@ import { AlertTriangle } from 'lucide-react';
 import { api } from '@/api/client';
 import { queryKeys } from '@/lib/queryKeys';
 
+export interface DaltonSettingVisibilityContext {
+  canInvite?: boolean;
+  callerTier?: string | null;
+  colleagueDispatchEnabled?: boolean;
+  cosSharingError?: boolean;
+}
+
+export function canShowDaltonCosSharingCard(
+  ctx?: DaltonSettingVisibilityContext | null,
+): boolean {
+  if (!ctx) return true;
+  if (ctx.cosSharingError) return false;
+  if (ctx.callerTier === 'external') return false;
+  if (ctx.colleagueDispatchEnabled === false) return false;
+  return true;
+}
+
 export interface UserCosSharingSettings {
   user_id: string;
   cos_rw_enabled: boolean;
@@ -32,16 +49,21 @@ export async function updateUserCosSharing(payload: {
   return data;
 }
 
+export function useUserCosSharingQuery(enabled = true) {
+  return useQuery<UserCosSharingSettings>({
+    queryKey: queryKeys.dalton.userSharing(),
+    queryFn: fetchUserCosSharing,
+    enabled,
+    staleTime: 30_000,
+    retry: false,
+  });
+}
+
 export function DaltonCosSharingCard(): React.ReactElement | null {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
 
-  const { data, isLoading, isError } = useQuery<UserCosSharingSettings>({
-    queryKey: queryKeys.dalton.userSharing(),
-    queryFn: fetchUserCosSharing,
-    staleTime: 30_000,
-    retry: false,
-  });
+  const { data, isLoading, isError } = useUserCosSharingQuery();
 
   const mutation = useMutation({
     mutationFn: (payload: { cos_rw_enabled: boolean }) => updateUserCosSharing(payload),
@@ -52,9 +74,11 @@ export function DaltonCosSharingCard(): React.ReactElement | null {
   });
 
   if (
-    isError ||
-    data?.caller_tier === 'external' ||
-    data?.colleague_dispatch_enabled === false
+    !canShowDaltonCosSharingCard({
+      cosSharingError: isError,
+      callerTier: data?.caller_tier,
+      colleagueDispatchEnabled: data?.colleague_dispatch_enabled,
+    })
   ) {
     return null;
   }
