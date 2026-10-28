@@ -238,16 +238,15 @@ async def _finalize_token_save(user_id: str, tokens: dict, expected_flow_raw: st
 
     ``expected_flow_raw`` is the flow-key value the caller read before it
     spent the authorization. The claim (compare-and-delete on exactly that
-    value), the token write and the completion marker all land in ONE
-    ``connection_change`` critical section, so: a disconnect that landed while
-    Google was answering leaves the key gone and this save aborts; a newer
-    login that replaced the flow keeps its own key, and this old authorization
-    cannot claim it. The marker rides the same section because a disconnect
-    and a newer login take the same lock — a marker written after the lock
-    released could land on top of them and report the NEW login complete
-    (DALTON-HOOK(team-credentials)).
-    With no cache there is no verifiable flow, so nothing is stored — an
-    unverifiable save is exactly the revive-on-disconnect race.
+    value) and the token write share one ``connection_change`` critical
+    section: a disconnect that landed while Google was answering leaves the key
+    gone and this save aborts; a newer login that replaced the flow keeps its
+    own key, and this old authorization cannot claim it. Once the save has
+    committed, the completion marker is published atomically and only while
+    this flow is still the current one (``start_login`` names it under the same
+    lock), so a late older login can neither report a newer one done nor
+    overwrite its marker. A cache that cannot verify the flow refuses the save:
+    an unverifiable save is exactly the revive-on-disconnect race.
     """
     from src.server.database.oauth_tokens import connection_change
     from src.utils.cache.redis_cache import get_cache_client
@@ -283,9 +282,17 @@ async def _finalize_token_save(user_id: str, tokens: dict, expected_flow_raw: st
     # the current one — atomically, so a late older login can neither report a
     # newer one done nor overwrite the newer one's marker.
     flow_id = _flow_id(expected_flow_raw)
-    await cache.client.eval(
-        _PUBLISH_DONE_LUA, 2, _current_flow_key(user_id), done_key, flow_id, 600
-    )
+    try:
+        await cache.client.eval(
+            _PUBLISH_DONE_LUA, 2, _current_flow_key(user_id), done_key, flow_id, 600
+        )
+    except Exception as exc:
+        # The save stands; only the poll's shortcut is missing. The settings
+        # page reads the connection itself, so the user sees it connected on
+        # the next status refresh instead of a 500 here.
+        logger.warning(
+            "[antigravity] completion marker not published: %s", type(exc).__name__
+        )
     return claims
 
 
