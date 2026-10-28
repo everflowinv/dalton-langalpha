@@ -219,6 +219,16 @@ def _current_flow_key(user_id: str) -> str:
     return f"oauth:antigravity:current:{credential_user_id(user_id)}"
 
 
+# Set the completion marker only while ARGV[1] is still the current flow.
+_PUBLISH_DONE_LUA = """
+if redis.call('get', KEYS[1]) == ARGV[1] then
+  redis.call('set', KEYS[2], ARGV[1], 'EX', tonumber(ARGV[2]))
+  return 1
+end
+return 0
+"""
+
+
 def _flow_id(flow_raw: str) -> str:
     return hashlib.sha256(flow_raw.encode("utf-8")).hexdigest()[:32]
 
@@ -269,9 +279,13 @@ async def _finalize_token_save(user_id: str, tokens: dict, expected_flow_raw: st
             conn=conn,
         )
     # Published only once the save has committed (an exception above leaves no
-    # marker), naming the flow it completes: ``check_login_complete`` counts it
-    # only while that flow is still the current one.
-    await cache.client.set(done_key, _flow_id(expected_flow_raw), ex=600)
+    # marker), naming the flow it completes, and only while that flow is still
+    # the current one — atomically, so a late older login can neither report a
+    # newer one done nor overwrite the newer one's marker.
+    flow_id = _flow_id(expected_flow_raw)
+    await cache.client.eval(
+        _PUBLISH_DONE_LUA, 2, _current_flow_key(user_id), done_key, flow_id, 600
+    )
     return claims
 
 

@@ -104,6 +104,24 @@ async def test_older_flow_finishing_late_never_completes_a_newer_login(
 
 
 @pytest.mark.asyncio
+async def test_late_older_marker_cannot_overwrite_a_newer_success(
+    store: _FakeRedisStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A commits and pauses; B starts, commits and publishes; A resumes: B
+    stays done (codex B9 r6)."""
+    _upsert_ok(monkeypatch)
+    _tokens(monkeypatch, {"access_token": "token-from-B"})
+    _start(store, "flow-B")
+    await ag._finalize_token_save("u1", dict(_TOKENS), expected_flow_raw="flow-B")
+    assert await ag.check_login_complete("u1") is True
+    # A's late publish goes through the same atomic step and is refused.
+    applied = await store.eval(ag._PUBLISH_DONE_LUA, 2, "current:u1", "done:u1", ag._flow_id("flow-A"), 600)
+    assert applied == 0
+    assert store.store["done:u1"] == ag._flow_id("flow-B")
+    assert await ag.check_login_complete("u1") is True
+
+
+@pytest.mark.asyncio
 async def test_marker_needs_the_connection_row(store: _FakeRedisStore, monkeypatch: pytest.MonkeyPatch) -> None:
     _start(store, "flow-A")
     store.store["done:u1"] = ag._flow_id("flow-A")

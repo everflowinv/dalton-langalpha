@@ -1076,6 +1076,12 @@ class _FakeRedisStore:
         return 60 if str(key) in self.store else -2
 
     async def eval(self, script: str, numkeys: int, *keys_and_args: Any) -> int:
+        if numkeys == 2:  # Antigravity's publish-if-current (DALTON-HOOK(team-credentials))
+            current_key, done_key, flow_id = (str(x) for x in keys_and_args[:3])
+            if self.store.get(current_key) == flow_id:
+                self.store[done_key] = flow_id
+                return 1
+            return 0
         key = str(keys_and_args[0])
         value = str(keys_and_args[1])
         if "del" in script:
@@ -1219,6 +1225,8 @@ async def test_antigravity_signin_cancelled_by_disconnect_does_not_revive(
         {"verifier": "v", "state": "s", "port": 51121, "redirect_uri": "http://localhost:51121/callback"}
     )
     store.store[f"oauth:antigravity:{HOLDER_ID}"] = late_flow_raw
+    # start_login also names the current flow (DALTON-HOOK(team-credentials)).
+    store.store[f"oauth:antigravity:current:{HOLDER_ID}"] = agy_oauth_mod._flow_id(late_flow_raw)
 
     # The admin disconnects before the callback lands.
     await oauth_native_app.antigravity_disconnect(user_id=SECOND_PM_ID)
@@ -1241,6 +1249,8 @@ async def test_antigravity_signin_cancelled_by_disconnect_does_not_revive(
     fake_upsert.reset_mock()
     live_flow_raw = json.dumps({"verifier": "v2"})
     store.store[f"oauth:antigravity:{HOLDER_ID}"] = live_flow_raw
+    # start_login also names the current flow (DALTON-HOOK(team-credentials)).
+    store.store[f"oauth:antigravity:current:{HOLDER_ID}"] = agy_oauth_mod._flow_id(live_flow_raw)
     await agy_oauth_mod._finalize_token_save(
         MEMBER_ID,
         {"access_token": "ok-agy", "refresh_token": "ok-ref", "id_token": "", "expires_in": 3600},
@@ -1533,6 +1543,8 @@ async def test_antigravity_old_callback_after_disconnect_and_new_login(
 
     flow1 = json.dumps({"verifier": "v1", "state": "s1", "port": 51121, "redirect_uri": "http://localhost:51121/callback"})
     store.store[f"oauth:antigravity:{HOLDER_ID}"] = flow1
+    # start_login also names the current flow (DALTON-HOOK(team-credentials)).
+    store.store[f"oauth:antigravity:current:{HOLDER_ID}"] = agy_oauth_mod._flow_id(flow1)
 
     exchange_release: asyncio.Future[dict] = asyncio.get_event_loop().create_future()
 
@@ -1557,6 +1569,8 @@ async def test_antigravity_old_callback_after_disconnect_and_new_login(
     await oauth_native_app.antigravity_disconnect(user_id=SECOND_PM_ID)
     flow2 = json.dumps({"verifier": "v2", "state": "s2", "port": 51122, "redirect_uri": "http://localhost:51122/callback"})
     store.store[f"oauth:antigravity:{HOLDER_ID}"] = flow2
+    # start_login also names the current flow (DALTON-HOOK(team-credentials)).
+    store.store[f"oauth:antigravity:current:{HOLDER_ID}"] = agy_oauth_mod._flow_id(flow2)
 
     exchange_release.set_result({"access_token": "old-agy-tok", "refresh_token": "old-ref", "id_token": "", "expires_in": 3600})
     with pytest.raises(ValueError):
@@ -1612,6 +1626,8 @@ async def test_antigravity_stale_done_marker_cannot_complete_newer_login(
 
     flow1 = json.dumps({"verifier": "v1", "state": "s1", "port": 51121, "redirect_uri": "http://localhost:51121/callback"})
     store.store[f"oauth:antigravity:{HOLDER_ID}"] = flow1
+    # start_login also names the current flow (DALTON-HOOK(team-credentials)).
+    store.store[f"oauth:antigravity:current:{HOLDER_ID}"] = agy_oauth_mod._flow_id(flow1)
 
     # Hold the save mid-critical-section (the token write), Future-gated.
     upsert_release: asyncio.Future[None] = asyncio.get_event_loop().create_future()
@@ -1643,6 +1659,8 @@ async def test_antigravity_stale_done_marker_cannot_complete_newer_login(
     await oauth_native_app.antigravity_disconnect(user_id=SECOND_PM_ID)
     flow2 = json.dumps({"verifier": "v2", "state": "s2", "port": 51122, "redirect_uri": "http://localhost:51122/callback"})
     store.store[f"oauth:antigravity:{HOLDER_ID}"] = flow2
+    # start_login also names the current flow (DALTON-HOOK(team-credentials)).
+    store.store[f"oauth:antigravity:current:{HOLDER_ID}"] = agy_oauth_mod._flow_id(flow2)
 
     # The old callback has nothing left to write (its marker moved inside the
     # lock), so the newer login's poll reads no completion and stays pending.
