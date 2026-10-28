@@ -1636,7 +1636,8 @@ async def test_antigravity_stale_done_marker_cannot_complete_newer_login(
     await save_task
     fake_upsert.assert_awaited_once()
     # The marker landed inside the same section — before anything later ran.
-    assert store.store[f"oauth:antigravity:done:{HOLDER_ID}"] == "1"
+    # The marker names the flow it completes (DALTON-HOOK(team-credentials)).
+    assert store.store[f"oauth:antigravity:done:{HOLDER_ID}"] == agy_oauth_mod._flow_id(flow1)
 
     # Disconnect + a newer login land after the save.
     await oauth_native_app.antigravity_disconnect(user_id=SECOND_PM_ID)

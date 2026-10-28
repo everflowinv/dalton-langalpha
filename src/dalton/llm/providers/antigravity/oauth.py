@@ -208,6 +208,21 @@ def _flow_keys(user_id: str) -> tuple[str, str]:
     return f"oauth:antigravity:{holder}", f"oauth:antigravity:done:{holder}"
 
 
+def _current_flow_key(user_id: str) -> str:
+    """Key naming the login flow a poll is currently waiting on.
+
+    The completion marker carries its flow's id and only counts while it names
+    this current flow, so an older login finishing late can never report a
+    newer one done (whether or not a disconnect came in between)."""
+    from src.dalton.credentials import credential_user_id
+
+    return f"oauth:antigravity:current:{credential_user_id(user_id)}"
+
+
+def _flow_id(flow_raw: str) -> str:
+    return hashlib.sha256(flow_raw.encode("utf-8")).hexdigest()[:32]
+
+
 async def _finalize_token_save(user_id: str, tokens: dict, expected_flow_raw: str) -> dict:
     """Store a finished sign-in, only while THE SAME login is still pending.
 
@@ -254,10 +269,9 @@ async def _finalize_token_save(user_id: str, tokens: dict, expected_flow_raw: st
             conn=conn,
         )
     # Published only once the save has committed (an exception above leaves no
-    # marker). A disconnect or newer login landing in between is harmless:
-    # ``check_login_complete`` ignores the marker while a newer flow is pending
-    # and requires the connection row to exist.
-    await cache.client.set(done_key, "1", ex=600)
+    # marker), naming the flow it completes: ``check_login_complete`` counts it
+    # only while that flow is still the current one.
+    await cache.client.set(done_key, _flow_id(expected_flow_raw), ex=600)
     return claims
 
 
@@ -324,6 +338,9 @@ async def start_login(user_id: str) -> dict:
         async with connection_change(user_id, ANTIGRAVITY_PROVIDER):
             await cache.client.delete(done_key)
             await cache.client.set(flow_key, payload, ex=_CALLBACK_TIMEOUT_S)
+            await cache.client.set(
+                _current_flow_key(user_id), _flow_id(payload), ex=_CALLBACK_TIMEOUT_S + 600
+            )
 
     return {
         "authorize_url": build_authorize_url(redirect_uri, state, challenge),
@@ -513,12 +530,11 @@ async def check_login_complete(user_id: str) -> bool:
 
     cache = get_cache_client()
     if cache.enabled and cache.client:
-        flow_key, done_key = _flow_keys(user_id)
-        if not await cache.client.get(done_key):
-            return False
-        # A newer login still pending owns the poll: an older flow's marker
-        # must not report it finished.
-        if await cache.client.get(flow_key):
+        _flow_key, done_key = _flow_keys(user_id)
+        done = await cache.client.get(done_key)
+        current = await cache.client.get(_current_flow_key(user_id))
+        # Only the marker of the flow this poll waits on counts.
+        if not done or not current or done != current:
             return False
         tokens = await get_oauth_tokens(user_id, ANTIGRAVITY_PROVIDER)
         return bool(tokens and tokens.get("access_token"))
