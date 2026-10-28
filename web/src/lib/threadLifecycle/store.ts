@@ -440,7 +440,10 @@ export function applySnapshot(frame: SnapshotFrame): void {
 /** Sequence-aware list reconciliation: a stale list response can neither
  * erase a newer settlement nor resurrect a cleared dot (monotonic merge +
  * monotonic cursors). */
-export function seedFromListRows(rows: Thread[]): void {
+export function seedFromListRows(
+  rows: Thread[],
+  currentUserId?: string | null,
+): void {
   let touched = false;
   for (const row of rows) {
     if (typeof row?.latest_run_seq !== 'number' || row.latest_run_seq <= 0) {
@@ -456,7 +459,16 @@ export function seedFromListRows(rows: Thread[]): void {
       interruptReason: row.interrupt_reason ?? null,
     });
     const entry = ensure(tid);
-    const seen = typeof row.last_seen_run_seq === 'number' ? row.last_seen_run_seq : 0;
+    const rawSeen = typeof row.last_seen_run_seq === 'number' ? row.last_seen_run_seq : 0;
+    // DALTON-HOOK(colleague-dispatch): suppress unseen only when thread_user_id != currentUserId (or via server-clamped last_seen_run_seq), never from unseen=false
+    const isColleagueThread = Boolean(
+      currentUserId &&
+        row.thread_user_id &&
+        String(row.thread_user_id) !== String(currentUserId),
+    );
+    const seen = isColleagueThread
+      ? Math.max(rawSeen, row.latest_run_seq)
+      : rawSeen;
     if (seen > entry.lastSeenSeq) entry.lastSeenSeq = seen;
   }
   if (touched) recompute();

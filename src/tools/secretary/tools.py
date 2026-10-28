@@ -445,8 +445,9 @@ async def threads_list(
         else:
             from src.server.database.conversation.threads_read import get_threads_for_user
 
+            # DALTON-HOOK(colleague-dispatch): pass channel="cos" so foreign workspaces are filtered in SQL before paging.
             threads, total = await get_threads_for_user(
-                user_id=user_id, limit=20
+                user_id=user_id, limit=20, channel="cos"
             )
 
         content = json.dumps(
@@ -515,7 +516,7 @@ async def threads_stop(
             )
     # DALTON-HOOK(workspace-sharing-settings): stop/delete thread requires ownership
     if err := await verify_thread_owner(
-        thread_id, user_id, tool_call_id, owner_only=True
+        thread_id, user_id, tool_call_id, need="write", owner_only=True
     ):
         return err
 
@@ -554,7 +555,7 @@ async def threads_delete(
 
     # DALTON-HOOK(workspace-sharing-settings): stop/delete thread requires ownership
     if err := await verify_thread_owner(
-        thread_id, user_id, tool_call_id, owner_only=True
+        thread_id, user_id, tool_call_id, need="write", owner_only=True
     ):
         return err
 

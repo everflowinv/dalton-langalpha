@@ -65,7 +65,7 @@ python3 .agents/skills/dalton-thesis-delta/scripts/collect.py collect \
 当第 1 步未短路时：
 1. 按 `.agents/skills/dalton-knowledge/SKILL.md` 读序先读本工作区 `agent.md` 托管块、`thesis.md`、`debate.md`、`drivers.md`、`agenda.md` 及最近 `verdicts.md`。
 2. 读取 `research/tracker/<run_id>/packet.md` 及关联的新文档摘段/原文（若存在 `ok: false` 的来源，同步核实 `packet.md` / `internal_status` 中的失败原因并在本轮结论与汇报中如实写明“`<来源> 本轮取数失败（原因）`”）：
-   - 内部库新文档（`company-wiki`、`guidepoint`、`funda-ai`、`sales-notes`、`tmtb`）：先读摘段，必要时通过 PTC `researchdata.research(..., operation="read", document=...)`（或 Guidepoint 对应详情）读全文；
+   - 内部库新文档（`company-wiki`、`guidepoint`、`funda-ai`、`sales-notes`、`tmtb`）：先读摘段，必要时通过 PTC `researchdata.research(..., operation="read", document=...)` 读全文（**Guidepoint 例外：只有 `search_library` 问答检索，没有全文读取**——`read` / `get_document` 均不存在，不要调用；检索到的问答正文已在增量包该访谈条目的 `qa` 字段里，且检索到的问答不等于完整访谈）；
    - AlphaEngine 新研报：先看摘要，挑带新数字（盈利预测修正、capex/费用、目标价/评级变化、核心 KPI 调查）的研报调用 `researchdata.research(route="alphaengine", operation="get_document", params={"doc_id": ...})` 读全文（每轮最多 3 篇；遇配额或未登录即停并记录状态）；
    - SEC / 港股与 A 股新公告：若当日 `dalton-filing-review` 或 `dalton-earnings-flash` 已经在 `verdicts.md` 写过同一份公告的结论，直接引用，不重复拆解；否则美股读取对应 SEC Item 或附件，港股与 A 股调用 `researchdata.finance(route="cn-hk", operation="filings", ticker=CODE_5_OR_6, start=..., end=..., limit=20)` 读取巨潮法定公告原文（港股未覆盖时用 `web_search` 查披露易 `site:hkexnews.hk` 原文链接），并可调用 `researchdata.finance(route="cn-hk", operation="ask", query=..., limit=20)` 辅助核查资金流、两融、回购或股东变动（平台财务表仅作初值，核心数字回公告核实）。
 3. 严格按 `.agents/skills/dalton-thesis-delta/references/materiality.md` 的十条标准判定本轮是否为**重要变化（`material=yes`）**：

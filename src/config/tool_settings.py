@@ -61,8 +61,15 @@ def get_crawler_http_concurrency(default: int = 20) -> int:
     return int(_get_tool_config('crawler.http_concurrency', default))
 
 
-def get_crawler_browser_concurrency(default: int = 6) -> int:
+def get_crawler_browser_concurrency(default: int = 2) -> int:
     """Concurrent Tier-2/3 (Chromium/Camoufox) calls. RAM-bounded."""
+    # DALTON-HOOK(crawler-browser-ram-cap): the default is sized for the 4 GB
+    # backend container, where the server process itself takes ~0.7–0.8 GB and
+    # a running turn more: each stealth browser costs ~400 MB, so 6 (~2.4 GB)
+    # pushed the container to 3.99/4 GB and nearly an OOM kill when the
+    # pre-market insight tasks opened 3 at once (2026-10). 2 keeps browsers at
+    # ~0.8 GB. The value, not the semaphore, changed — the concurrency control
+    # is upstream's and untouched.
     explicit = _get_tool_config('crawler.browser_concurrency')
     if explicit is not None:
         return int(explicit)

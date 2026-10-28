@@ -307,6 +307,7 @@ class TestTeamWorkspacesEndpoint:
                 "owner_email": "richard.lu@dalton.test",
                 "owner_name": "Richard Lu",
                 "owner_avatar_url": None,
+                "web_access": "ro",
             },
             {
                 "workspace_id": "ws-rex-1",
@@ -320,6 +321,7 @@ class TestTeamWorkspacesEndpoint:
                 "owner_email": "rex.yuan@dalton.test",
                 "owner_name": "",
                 "owner_avatar_url": None,
+                "web_access": "ro",
             },
         ]
 
@@ -348,6 +350,66 @@ class TestTeamWorkspacesEndpoint:
         assert members[1]["user_id"] == "u-rex"
         assert members[1]["display_name"] == "rex.yuan"
         assert all(m["user_id"] != "u-chao" for m in members)
+
+    @pytest.mark.asyncio
+    async def test_lists_colleagues_workspaces_hides_unconfigured_workspaces_by_default(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _enable_dalton_auth(monkeypatch)
+        now = datetime(2026, 4, 20, 15, 30, tzinfo=UTC)
+
+        fake_rows = [
+            {
+                "workspace_id": "ws-unconfigured",
+                "user_id": "u-richard",
+                "name": "Private Draft",
+                "description": None,
+                "status": "running",
+                "created_at": now,
+                "updated_at": now,
+                "last_activity_at": now,
+                "owner_email": "richard.lu@dalton.test",
+                "owner_name": "Richard Lu",
+                "owner_avatar_url": None,
+                "web_access": None,
+                "cos_access": None,
+            },
+            {
+                "workspace_id": "ws-shared-ro",
+                "user_id": "u-richard",
+                "name": "Shared Note",
+                "description": None,
+                "status": "running",
+                "created_at": now,
+                "updated_at": now,
+                "last_activity_at": now,
+                "owner_email": "richard.lu@dalton.test",
+                "owner_name": "Richard Lu",
+                "owner_avatar_url": None,
+                "web_access": "ro",
+                "cos_access": "rw",
+            },
+        ]
+
+        mock_cur = create_autospec(psycopg.AsyncCursor, instance=True)
+        mock_cur.fetchall.return_value = fake_rows
+        mock_cur.__aenter__.return_value = mock_cur
+        mock_cur.__aexit__.return_value = False
+
+        mock_conn = create_autospec(psycopg.AsyncConnection, instance=True)
+        mock_conn.cursor.return_value = mock_cur
+        mock_conn.__aenter__.return_value = mock_conn
+        mock_conn.__aexit__.return_value = False
+
+        get_db_mock = create_autospec(
+            dalton_sharing.get_db_connection, return_value=mock_conn
+        )
+        monkeypatch.setattr(dalton_sharing, "get_db_connection", get_db_mock)
+
+        resp = await dalton_router.list_team_workspaces_endpoint(user_id="u-chao")
+        members = resp["members"]
+        assert len(members) == 1
+        assert [w["workspace_id"] for w in members[0]["workspaces"]] == ["ws-shared-ro"]
 
 
 class TestReadEndpointsAllowColleagues:

@@ -52,6 +52,15 @@ subagents:
 
 search_api: "openclaw"
 
+# Crawler: the backend container is 4 GB (docker-compose.dalton.yml mem_limit)
+# and the server process itself takes ~0.7–0.8 GB plus whatever a running turn
+# holds. Each Tier-2/3 stealth browser costs ~400 MB, so upstream's default of
+# 6 (~2.4 GB of browsers) pushed the container to 3.99/4 GB — one browser short
+# of an OOM kill — when the pre-market insight tasks opened 3 at once
+# (2026-10). 2 keeps the browser tier at ~0.8 GB and leaves the turn headroom.
+crawler:
+  browser_concurrency: 2
+
 # Fetch falls through the chain per URL: in-house first; Firecrawl only for the
 # URLs in-house could not fetch (403, anti-bot, JS-only pages). Firecrawl bills
 # per call and shares the OpenClaw account, so it stays second.

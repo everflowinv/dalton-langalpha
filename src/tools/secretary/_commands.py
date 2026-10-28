@@ -187,6 +187,47 @@ async def verify_thread_owner(
     try:
         owner_id = await get_thread_owner_id(thread_id)
         if owner_id == user_id:
+            # --- DALTON-HOOK(colleague-dispatch): begin ---
+            from src.dalton.settings import is_dalton_supabase_auth_enabled
+
+            if is_dalton_supabase_auth_enabled():
+                from fastapi import HTTPException
+                from src.dalton.sharing import require_workspace_access
+
+                meta = await get_thread_auth_meta(thread_id)
+                ws_owner_id = (meta or {}).get("workspace_owner_id")
+                ws_id = (meta or {}).get("workspace_id")
+                if ws_owner_id and str(ws_owner_id) != str(user_id):
+                    if not ws_id:
+                        return error_command(
+                            "thread not found or not owned by user", tool_call_id
+                        )
+                    try:
+                        await require_workspace_access(
+                            str(ws_id),
+                            user_id,
+                            channel="cos",
+                            need=need,
+                        )
+                    except HTTPException as exc:
+                        if exc.status_code == 403 and need == "write":
+                            try:
+                                await require_workspace_access(
+                                    str(ws_id),
+                                    user_id,
+                                    channel="cos",
+                                    need="read",
+                                )
+                            except HTTPException:
+                                return error_command(
+                                    "thread not found or not owned by user",
+                                    tool_call_id,
+                                )
+                            return error_command("该工作区对你只读", tool_call_id)
+                        return error_command(
+                            "thread not found or not owned by user", tool_call_id
+                        )
+            # --- DALTON-HOOK(colleague-dispatch): end ---
             return None
         # --- DALTON-HOOK(workspace-sharing-settings): begin ---
         # DALTON-HOOK(colleague-dispatch): pass workspace_owner_id and workspace_id for non-owner thread access checks.

@@ -92,6 +92,10 @@ def _lifecycle_fields(row: dict, current_user_id: Optional[str] = None) -> dict:
     if current_user_id and thread_user_id and str(current_user_id) != thread_user_id:
         lc["unseen"] = False
         lc["is_read"] = True
+        lc["last_seen_run_seq"] = max(
+            int(lc.get("last_seen_run_seq") or 0),
+            int(lc.get("latest_run_seq") or 0),
+        )
     else:
         lc["is_read"] = not bool(lc.get("unseen"))
     return {**lc, **extra}
@@ -291,7 +295,19 @@ async def mark_thread_seen(
     authoritative cursors so the client can reconcile its store and cached
     list rows.
     """
-    await auth_api.require_thread_owner(thread_id, x_user_id)
+    # DALTON-HOOK(colleague-dispatch): no-op seen stamp when an authorized reader views another user's thread
+    from src.dalton.settings import is_dalton_supabase_auth_enabled
+
+    if is_dalton_supabase_auth_enabled():
+        from src.dalton.sharing import require_thread_access
+
+        thread_owner = await require_thread_access(
+            thread_id, x_user_id, channel="web", need="read"
+        )
+        if str(thread_owner or "") != str(x_user_id):
+            return ThreadSeenResponse(last_seen_run_seq=0, latest_run_seq=0)
+    else:
+        await auth_api.require_thread_owner(thread_id, x_user_id)
     result = await stamp_thread_seen(thread_id, request.run_id)
     if result is None:
         raise HTTPException(

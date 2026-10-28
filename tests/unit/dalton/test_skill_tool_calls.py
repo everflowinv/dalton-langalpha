@@ -376,7 +376,17 @@ def _validate_researchdata_bridge_call(
             # Populate route-level required fields when omitted in prose shorthand so
             # `_normalize_and_validate_call_args` reaches top-level, operation, and nested `params` checks.
             canon_present = {rb.PARAM_ALIAS_TABLE.get(k, k) for k in synth_args}
-            for req_k in ("ticker", "query", "start", "end", "concept", "item", "series", "dataset"):
+            # Fill the operation's own required fields when the route declares
+            # them; filling every accepted field would hand e.g. cn-hk filings
+            # a query it refuses.
+            canon_op = (spec.get("operation_aliases") or {}).get(op, op)
+            op_required = (spec.get("required_params") or {}).get(canon_op)
+            fill_keys = (
+                tuple(op_required)
+                if op_required is not None
+                else ("ticker", "query", "start", "end", "concept", "item", "series", "dataset")
+            )
+            for req_k in fill_keys:
                 if req_k in (spec.get("accepted_params") or []) and req_k not in canon_present:
                     synth_args[req_k] = "2026-01-01" if req_k in ("start", "end") else "META"
 

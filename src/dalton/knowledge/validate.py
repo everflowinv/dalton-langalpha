@@ -141,6 +141,25 @@ def validate_schema(schema_name: str, instance: Any) -> list[dict[str, Any]]:
                         ),
                     }
                 )
+    if schema_name == "agenda" and isinstance(instance, dict):
+        # `format: date-time` 没有注册 rfc3339-validator，FormatChecker 直接放
+        # 行，schema 的 pattern 只挡形状——"2026-10-28T25:00:00-04:00" 这类
+        # 形状合法但解析失败的值要在这里真实解析挡下，否则进库后验证项永不
+        # 到期。
+        from src.dalton.autonomy.due import writable_due_error
+
+        for idx, val_item in enumerate(instance.get("next_validations") or []):
+            if not isinstance(val_item, dict) or "due" not in val_item:
+                continue
+            due_err = writable_due_error(val_item.get("due"))
+            if due_err:
+                errors.append(
+                    {
+                        "code": "invalid_due",
+                        "path": f"/next_validations/{idx}/due",
+                        "message": due_err,
+                    }
+                )
     return errors
 
 

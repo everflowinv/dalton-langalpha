@@ -556,25 +556,15 @@ async def require_workspace_access(
     if owner_tier == "unknown":
         raise HTTPException(status_code=404, detail="Workspace not found")
     if owner_tier == "external":
-        if caller_tier != "admin":
-            raise HTTPException(status_code=404, detail="Workspace not found")
-        # Admins see external-owned workspaces read-only — except the
-        # never-shared states, which stay 404 for them too.
         if (
             is_home_row(ws)
             or bool(ws.get("is_home"))
             or ws.get("status") in ("unbound", "deleted")
         ):
             raise HTTPException(status_code=404, detail="Workspace not found")
-        if cleaned_need == "write":
-            raise HTTPException(
-                status_code=403,
-                detail=EXTERNAL_OWNED_ADMIN_WRITE_FORBIDDEN_DETAIL,
-            )
-        ws[f"_caller_{cleaned_channel}_access"] = "ro"
-        return ws
+        if cleaned_channel == "cos":
+            raise HTTPException(status_code=404, detail="Workspace not found")
 
-    # Only internal/admin owners below: original sharing semantics.
     # Personal Home workspaces and deleted/unbound workspaces are never shared with colleagues.
     if (
         is_home_row(ws)
@@ -584,7 +574,12 @@ async def require_workspace_access(
         raise HTTPException(status_code=403, detail="Forbidden")
 
     # Resource owner must also be an allowlisted team member.
-    await require_team_reader(owner_id)
+    try:
+        await require_team_reader(owner_id)
+    except HTTPException:
+        if owner_tier == "external":
+            raise HTTPException(status_code=404, detail="Workspace not found")
+        raise
 
     ws_id = str(ws.get("workspace_id") or "").strip()
     if cleaned_channel == "cos":
@@ -648,6 +643,7 @@ async def require_thread_access(
     cleaned_need = str(need or "read").strip().lower()
     if cleaned_need not in VALID_NEEDS:
         raise ValueError(f"Unsupported need: {need!r}")
+    cleaned_channel = str(channel or "web").strip().lower()
 
     if not is_dalton_supabase_auth_enabled():
         if owner_id is not None:
@@ -672,8 +668,8 @@ async def require_thread_access(
 
     thread_owner = str(
         owner_id
-        or (meta or {}).get("user_id")
         or (meta or {}).get("thread_user_id")
+        or (meta or {}).get("user_id")
         or ""
     ).strip()
     ws_owner = str(
@@ -695,10 +691,12 @@ async def require_thread_access(
     )
 
     # 1. Colleague thread owner A (`uid == thread_owner != ws_owner`):
-    #    Read access is exempt from workspace revocation/deletion only for colleague threads;
-    #    a user's own workspace threads follow baseline workspace existence checks below.
+    #    Read access is exempt from workspace revocation/deletion only on the web channel;
+    #    Chief of Staff ('cos') still requires workspace access on 'cos'.
     if is_colleague_thread and uid == thread_owner:
-        if cleaned_need == "read":
+        if await get_user_tier(uid) == "external":
+            raise HTTPException(status_code=404, detail="Thread not found")
+        if cleaned_need == "read" and cleaned_channel == "web":
             return thread_owner
         if is_tail_turn:
             ws_obj = (
@@ -708,6 +706,15 @@ async def require_thread_access(
             )
             if not ws_obj or ws_obj.get("status") in ("unbound", "deleted"):
                 raise HTTPException(status_code=403, detail="Forbidden")
+            return thread_owner
+        if cleaned_need == "read":
+            await require_workspace_access(
+                resolved_workspace_id,
+                uid,
+                channel=channel,
+                need="read",
+                conn=conn,
+            )
             return thread_owner
         try:
             await require_workspace_access(
@@ -1735,50 +1742,91 @@ async def list_team_workspaces(current_user_id: str) -> list[dict[str, Any]]:
         return []
     allowed_emails = sorted(await get_team_member_emails())
 
+    dispatch_enabled = is_colleague_dispatch_enabled()
     async with get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
-            await cur.execute(
-                """
-                SELECT
-                    w.workspace_id,
-                    w.user_id,
-                    w.name,
-                    w.description,
-                    w.status,
-                    w.created_at,
-                    w.updated_at,
-                    w.last_activity_at,
-                    u.email AS owner_email,
-                    u.name AS owner_name,
-                    u.avatar_url AS owner_avatar_url,
-                    COALESCE(s.web_access, 'hidden') AS web_access,
-                    COALESCE(s.cos_access, 'ro') AS cos_access
-                FROM workspaces w
-                JOIN users u ON w.user_id = u.user_id
-                LEFT JOIN dalton_workspace_sharing s ON s.workspace_id = w.workspace_id
-                WHERE w.user_id <> %s
-                  AND w.status <> 'deleted'
-                  AND w.status <> 'unbound'
-                  AND (
-                      LOWER(BTRIM(u.email)) = ANY(%s)
-                      OR EXISTS (
-                          SELECT 1 FROM dalton_members dm
-                          WHERE dm.email = LOWER(BTRIM(u.email))
+            if dispatch_enabled:
+                await cur.execute(
+                    """
+                    SELECT
+                        w.workspace_id,
+                        w.user_id,
+                        w.name,
+                        w.description,
+                        w.status,
+                        w.created_at,
+                        w.updated_at,
+                        w.last_activity_at,
+                        u.email AS owner_email,
+                        u.name AS owner_name,
+                        u.avatar_url AS owner_avatar_url,
+                        COALESCE(s.web_access, 'hidden') AS web_access,
+                        CASE
+                            WHEN us.cos_rw_enabled IS FALSE THEN 'hidden'
+                            ELSE 'rw'
+                        END AS cos_access
+                    FROM workspaces w
+                    JOIN users u ON w.user_id = u.user_id
+                    LEFT JOIN dalton_workspace_sharing s ON s.workspace_id = w.workspace_id
+                    LEFT JOIN dalton_user_sharing us ON us.user_id = w.user_id
+                    WHERE w.user_id <> %s
+                      AND w.status <> 'deleted'
+                      AND w.status <> 'unbound'
+                      AND (
+                          LOWER(BTRIM(u.email)) = ANY(%s)
+                          OR EXISTS (
+                              SELECT 1 FROM dalton_members dm
+                              WHERE dm.email = LOWER(BTRIM(u.email))
+                          )
                       )
-                  )
-                ORDER BY
-                    COALESCE(NULLIF(BTRIM(u.name), ''), LOWER(BTRIM(u.email))) ASC,
-                    COALESCE(w.last_activity_at, w.updated_at) DESC,
-                    w.updated_at DESC
-                """,
-                (uid, allowed_emails),
-            )
+                    ORDER BY
+                        COALESCE(NULLIF(BTRIM(u.name), ''), LOWER(BTRIM(u.email))) ASC,
+                        COALESCE(w.last_activity_at, w.updated_at) DESC,
+                        w.updated_at DESC
+                    """,
+                    (uid, allowed_emails),
+                )
+            else:
+                await cur.execute(
+                    """
+                    SELECT
+                        w.workspace_id,
+                        w.user_id,
+                        w.name,
+                        w.description,
+                        w.status,
+                        w.created_at,
+                        w.updated_at,
+                        w.last_activity_at,
+                        u.email AS owner_email,
+                        u.name AS owner_name,
+                        u.avatar_url AS owner_avatar_url,
+                        COALESCE(s.web_access, 'hidden') AS web_access,
+                        COALESCE(s.cos_access, 'ro') AS cos_access
+                    FROM workspaces w
+                    JOIN users u ON w.user_id = u.user_id
+                    LEFT JOIN dalton_workspace_sharing s ON s.workspace_id = w.workspace_id
+                    WHERE w.user_id <> %s
+                      AND w.status <> 'deleted'
+                      AND w.status <> 'unbound'
+                      AND (
+                          LOWER(BTRIM(u.email)) = ANY(%s)
+                          OR EXISTS (
+                              SELECT 1 FROM dalton_members dm
+                              WHERE dm.email = LOWER(BTRIM(u.email))
+                          )
+                      )
+                    ORDER BY
+                        COALESCE(NULLIF(BTRIM(u.name), ''), LOWER(BTRIM(u.email))) ASC,
+                        COALESCE(w.last_activity_at, w.updated_at) DESC,
+                        w.updated_at DESC
+                    """,
+                    (uid, allowed_emails),
+                )
             rows = [dict(r) for r in await cur.fetchall()]
 
     grouped: dict[str, dict[str, Any]] = {}
-    # Sharing settings never apply to an external-owned workspace: admins see
-    # it read-only (even when marked hidden), everyone else sees nothing. The
-    # owner tier is classified from the joined email (no per-owner lookup).
+    default_cos = "rw" if dispatch_enabled else DEFAULT_COS_ACCESS
     owner_tiers: dict[str, str] = {}
     for row in rows:
         if is_home_row(row) or bool(row.get("is_home")):
@@ -1797,23 +1845,16 @@ async def list_team_workspaces(current_user_id: str) -> list[dict[str, Any]]:
             )
             continue
         external_owned = owner_tier == "external"
-        if external_owned and caller_tier != "admin":
-            continue
         raw_web_access = row.get("web_access")
-        if not external_owned and raw_web_access == "hidden":
-            continue
-        web_access = (
-            "ro"
-            if external_owned
-            else _normalize_access_level(raw_web_access, "ro")
-        )
+        web_access = _normalize_access_level(raw_web_access, DEFAULT_WEB_ACCESS)
         if web_access == "hidden":
             continue
-        cos_access = (
-            "ro"
-            if external_owned
-            else _normalize_access_level(row.get("cos_access"), DEFAULT_COS_ACCESS)
-        )
+        if external_owned:
+            cos_access = "hidden"
+        elif dispatch_enabled and row.get("cos_rw_enabled") is not None:
+            cos_access = "rw" if bool(row.get("cos_rw_enabled")) else "hidden"
+        else:
+            cos_access = _normalize_access_level(row.get("cos_access"), default_cos)
 
         owner_email = str(row.get("owner_email") or "").strip()
         if not await is_team_member(owner_email):
@@ -1990,23 +2031,15 @@ async def list_colleague_cos_workspaces(
             )
             continue
         external_owned = owner_tier == "external"
-        if external_owned and caller_tier != "admin":
+        if external_owned:
             continue
-        cos_access = (
-            "ro"
-            if external_owned
-            else _normalize_access_level(
-                row.get("cos_access"), default_cos
-            )
+        cos_access = _normalize_access_level(
+            row.get("cos_access"), default_cos
         )
         if cos_access == "hidden":
             continue
-        web_access = (
-            "ro"
-            if external_owned
-            else _normalize_access_level(
-                row.get("web_access"), DEFAULT_WEB_ACCESS
-            )
+        web_access = _normalize_access_level(
+            row.get("web_access"), DEFAULT_WEB_ACCESS
         )
         owner_email = str(row.get("owner_email") or "").strip()
         owner_display = _display_name(row.get("owner_name"), owner_email)

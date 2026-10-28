@@ -29,7 +29,15 @@ async def list_commands(
     """The thread's commands: every running one, then the ``limit`` newest
     started of those that ended; ``status`` (repeatable) keeps only those
     statuses."""
-    await auth_api.require_thread_owner(thread_id, x_user_id)
+    # DALTON-HOOK(colleague-dispatch): allow read access to thread commands for authorized readers
+    from src.dalton.settings import is_dalton_supabase_auth_enabled
+
+    if is_dalton_supabase_auth_enabled():
+        from src.dalton.sharing import require_thread_access
+
+        await require_thread_access(thread_id, x_user_id, channel="web", need="read")
+    else:
+        await auth_api.require_thread_owner(thread_id, x_user_id)
     rows = await cr_db.list_for_thread(thread_id, statuses=status, limit=limit)
     return CommandsResponse(
         thread_id=thread_id, commands=[CommandOut.model_validate(r) for r in rows]

@@ -215,6 +215,39 @@ def _extract_text_from_summary(summary: Any) -> Optional[str]:
     return combined_text if combined_text else None
 
 
+def extract_text_blocks(content: Any) -> Optional[str]:
+    # DALTON-HOOK(subagent-spill-recovery): only a message's text blocks,
+    # thinking and reasoning left out. ``extract_content_with_type`` types a
+    # message that mixes thinking with text as reasoning outright — right for
+    # the SSE stream, whose reasoning lifecycle keys on it, wrong whenever
+    # the last *written* words are what a caller wants: the transport-lost
+    # failure a torn subagent run leaves its parent carries them.
+    """Concatenate only the text parts of a message's content.
+
+    A plain string is text. In a list, plain-string items and items carrying
+    a ``text`` field count; thinking, reasoning and summary blocks are
+    skipped. None when nothing textual remains.
+    """
+    if isinstance(content, str):
+        return content or None
+    if not isinstance(content, list):
+        return None
+    parts: List[str] = []
+    for item in content:
+        if isinstance(item, str):
+            if item:
+                parts.append(item)
+            continue
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") in ("thinking", "reasoning") or "summary" in item:
+            continue
+        text = item.get("text")
+        if isinstance(text, str) and text:
+            parts.append(text)
+    return "".join(parts) if parts else None
+
+
 def extract_reasoning_summary_index(content: Any) -> Optional[int]:
     """Extract the summary_text item index from reasoning content.
 

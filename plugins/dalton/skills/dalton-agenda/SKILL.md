@@ -35,7 +35,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
   - `automation_execution_id`（可选）：自动任务执行记录 ID。
 - **`next_validation`**（必填）：下一个最重要验证节点对象 `{what, due, validation_id?}`：
   - `what`（必填）：具体验证内容与量化门槛（如 `"FY26Q2 财报核验云分部 ARR 增速是否守住 28%"`）
-  - `due`（必填）：预计验证日期，在 `verdict` 中只能写 `YYYY-MM-DD` 字符串，**不能为 `null`**（注：`agenda.json` 的 `/next_validations` 中 `due` 允许为 `null` 或 `YYYY-MM-DD`，那是 `agenda` 的契约，与 `verdict.next_validation.due` 不是一回事）
+  - `due`（必填）：预计验证日期，在 `verdict` 中只能写 `YYYY-MM-DD` 字符串，**不能为 `null`**（注：`agenda.json` 的 `/next_validations` 中 `due` 允许为 `null`、`YYYY-MM-DD` 或带时区偏移的 ISO 时刻，那是 `agenda` 的契约，与 `verdict.next_validation.due` 不是一回事；知道具体时刻就写时刻——如财报电话会 `"2026-10-28T16:30:00-04:00"`，到期判断按该时刻，写日期则按交易所当地时间 18:00、收盘后才算到期）
   - `validation_id`（可选）：关联 `agenda.json` 中 `/next_validations` 的 `V-xxx` 编号（如 `"V-002"`）
 - **`progress`**（必填）：严格取枚举值 `"none"` | `"some"` | `"resolved"`（无实质进展填 `"none"`，取得阶段性/实质性新证据填 `"some"`，彻底解答问题填 `"resolved"`）。
 - **可选关联字段**：`affected`（`{pillars: ["P1"], debates: ["D1"], drivers: ["K1"]}`）、`evidence_ids`（如 `["E-20261023-01"]`）、`question_ids`（如 `["Q-001"]`，服务端会自动向这些问题的 `attempts` 追加一条记录）、`house_view_changed`（布尔值）、`at`（ISO 时间戳，调用工具时服务端也会自动生成）。
@@ -90,7 +90,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
    - `linked`（可选）：`{"pillars": ["P1"], "debates": ["D1"], "drivers": ["K1"], "evidence_ids": ["E-20261023-01"]}`
 3. **关闭旧验证项与新增下一项验证（`/next_validations`）**：
    - 关闭已完成的验证项：`{"op": "set", "path": "/next_validations/V-001/status", "value": "done"}`
-   - 新增下一项验证：`{"op": "append_item", "path": "/next_validations", "value": {"what": "4Q26 财报核验 Capex 指引", "due": "2027-01-29", "expected": "FY27 Capex 指引不超过 800 亿美元", "status": "pending", "source": "analyst"}}`
+   - 新增下一项验证：`{"op": "append_item", "path": "/next_validations", "value": {"what": "4Q26 财报核验 Capex 指引", "due": "2027-01-29T16:30:00-05:00", "expected": "FY27 Capex 指引不超过 800 亿美元", "status": "pending", "source": "analyst"}}`（知道具体时刻如财报电话会就写带时区偏移的时刻；只知道日期写 `YYYY-MM-DD`，按交易所当地时间 18:00、收盘后才算到期）
 4. **更新高频跟踪配置（`/watch`）**：
    使用 `set` 或 `append` 更新 `agenda.schema.json` 支持的 `/watch/events`、`/watch/indicators`、`/watch/price`（`{abs_move_pct_1d, excess_vs_benchmark_pct, benchmark}`）、`/watch/filings`（`{sources, forms}`）或 `/watch/internal`。
 5. **队列容量纪律**：`open_questions` 保持精简高优（`status="open"` 的活跃问题一般不超过 7 条，`value="high"` 且 `urgency="now"` 的问题不超过 3 条）；过期或失去相关性的问题应及时将 `/open_questions/<id>/status` 设为 `"resolved"` 或 `"dropped"` 并填写 `resolution`。

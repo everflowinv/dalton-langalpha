@@ -499,6 +499,7 @@ def build_ingest_company_wiki_tool(
         content: str | None = None,
         file_path: str | None = None,
         confirm: bool = False,
+        aliases: list[str] | None = None,
         *,
         config: RunnableConfig,
     ) -> str:
@@ -516,6 +517,7 @@ def build_ingest_company_wiki_tool(
             content: 直接入库的文本正文（与 file_path 二选一，<=200k 字符）。
             file_path: 当前工作区（或 Home）内的文件路径（与 content 二选一，支持 .md/.txt/.pdf/.docx/.png/.jpg/.webp，<=20MB）。
             confirm: False 仅校验并返回预览；True 执行正式写入并记录审计。
+            aliases: 让中文名或股票代码以后直接指向这次的 target（可选，最多 10 个，如 ["002271.SZ", "东方雨虹"]）。target 返回 needs_alias、改用 existing_targets 里的英文目录名或新建英文目录名重新入库时，把原来用的名称放进来；写入成功后才登记，已指向别的公司的名称会被拒绝。
         Returns: JSON 字符串，含预览信息（confirm=False）或正式入库结果与 wiki:<doc_id>（confirm=True）。
         """
         user_id, workspace_id, thread_id, _ = _extract_run_identity(config)
@@ -651,6 +653,8 @@ def build_ingest_company_wiki_tool(
             },
             "dry_run": not bool(confirm),
         }
+        if aliases:
+            bridge_req["aliases"] = list(aliases)
         if request_id is not None:
             bridge_req["request_id"] = request_id
 

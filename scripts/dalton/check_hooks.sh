@@ -157,6 +157,27 @@ ALLOWED_HOOKS=(
   "sandbox-caller-identity"
   # Colleague workspace task dispatch & questioning (d020)
   "colleague-dispatch"
+  # B5/D1: crawler.browser_concurrency's code default drops 6→2, sized for
+  # the 4 GB backend container (~400 MB per stealth browser, ~0.7–0.8 GB for
+  # the server process itself; 6 browsers took it to 3.99/4 GB during the
+  # pre-market insight tasks). Value only — the concurrency control is
+  # upstream's (src/config/tool_settings.py).
+  "crawler-browser-ram-cap"
+  # B5/D5: a subagent run aborted for a torn event stream (transport_lost)
+  # records why the Redis spill failed (exception type and message) where
+  # the circuit opens and at the kill, and the failure the parent sees
+  # carries the last text the run wrote plus its transcript directory, so
+  # finished work is recoverable instead of discarded (task.py,
+  # redis_stream.py, subagent.py, outcomes.py, run_executor.py).
+  "subagent-spill-recovery"
+  # Batch 5/F: yfinance fundamentals statements serialize missing values as
+  # JSON null, not the string "N/A" — agent arithmetic on values must not
+  # crash on a placeholder string (yf_fundamentals_mcp_server.py).
+  "yfinance-null-missing"
+  # Batch 5/F: waiting for a background subagent task is done by ending the
+  # turn on its completion notification, never by sleep/poll loops
+  # (subagent_coordination.md.j2).
+  "subagent-no-sleep-poll"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

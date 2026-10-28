@@ -38,7 +38,8 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 写完 `drafts/<slug>.md` 后，先调用 `check_draft(draft_path="drafts/<slug>.md")`：
 - 生成侧车清单 `drafts/<slug>.audit.md`（按行号列出所有未匹配或冲突数字及原因：`unverified`、`source_conflict`、`period_mismatch`、`unit_mismatch`）；
 - 生成带标注副本 `drafts/<slug>.annotated.md`（未核实数字标为 `**27.10 美元**⟨未核实⟩`）；
-- 根据 `.audit.md` 补齐脚注或修正数字，直到 `unverified` 降为 0。
+- **`check_draft` 返回 `ok: true` 只表示审计跑完，不表示通过**：日常交付（研究结论、回答、内部报告）可在明确列出未核实项后交付；**正式发布（`publish_report`）必须先把 `unverified` 清零**；
+- 根据 `.audit.md` 补齐脚注或修正数字，直到 `unverified` 降为 0（正式发布的硬门槛；日常交付达不到时按上一条列明）。
 
 正式发布的稿子必须完成两轮语言审查（`check_language`，只标问题；中间产物不审）：
 1. **第 1 轮（初稿）**：初稿写完、`check_draft` 通过初检后，调用 `check_language(draft_path="drafts/<slug>.md", round=1)`，读 `drafts/<slug>.md.language.md` 清单并逐条修改草稿（只改语言表达，不动事实、数字、术语、引用编号与判断强度）。

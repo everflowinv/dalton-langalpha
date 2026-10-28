@@ -29,6 +29,7 @@ from ptc_agent.agent.middleware.background_subagent.outcomes import Outcome
 from ptc_agent.agent.middleware.background_subagent.registry import (
     BackgroundTask,
     BackgroundTaskRegistry,
+    TransportLostError,
 )
 # DALTON-HOOK(subagent-caps): wait for Redis slot before graph execution and release in finally.
 from src.dalton.subagent_slots import (
@@ -36,12 +37,78 @@ from src.dalton.subagent_slots import (
     release_subagent_slot,
     wait_for_subagent_slot,
 )
+# DALTON-HOOK(subagent-spill-recovery): joins a message's text blocks without
+# its thinking blocks, and never a Python repr of a block list.
+from src.llms.content_utils import extract_text_blocks
 
 if TYPE_CHECKING:
     from src.tools.decorators import ToolUsageTracker
     from src.utils.tracking.per_call_token_tracker import PerCallTokenTracker
 
 logger = structlog.get_logger(__name__)
+
+
+# DALTON-HOOK(subagent-spill-recovery): what a transport_lost failure tells
+# the parent it can still recover, appended to the one error string every
+# surface (in-memory result, ledger failure row, TaskOutput) carries.
+def _handler_answer_text(result: Any) -> str | None:
+    """A finished handler's answer text, whatever shape it ended with.
+
+    A normal Task handler returns a Command carrying the subagent's final
+    ToolMessage (``return_command_with_state_update``), not a ToolMessage;
+    refused and legacy paths return a ToolMessage directly. Content that is
+    a block list joins its text blocks — a ``str()`` of the list would put
+    Python source in the parent-facing excerpt.
+    """
+    message: Any = result
+    if isinstance(result, Command):
+        update = result.update if isinstance(result.update, dict) else None
+        messages = update.get("messages") if update else None
+        if not isinstance(messages, (list, tuple)):
+            return None
+        message = next(
+            (m for m in reversed(messages) if isinstance(m, ToolMessage)),
+            None,
+        )
+    if not isinstance(message, ToolMessage):
+        return None
+    return extract_text_blocks(message.content)
+
+
+def _torn_stream_recovery(
+    task: BackgroundTask,
+    registry: BackgroundTaskRegistry | None,
+    *,
+    final_text: str | None = None,
+) -> str | None:
+    """The recovery note for a run finalized over a torn event stream.
+
+    The abort itself stays — a torn replay archive cannot be served — but the
+    run's completed work is not lost with it: its transcript directory is
+    rendered at turn end, and its last written text (the handler's own answer
+    when the tear came on the final events, else the text stashed at the
+    abort) says where it got to. The transcript pointer goes first so it
+    survives the 450-char window the cross-worker TaskOutput path shows.
+    """
+    parts: list[str] = []
+    if registry is not None and registry.thread_id:
+        from ptc_agent.agent.transcript.store import task_subdir
+
+        transcript_dir = task_subdir(str(registry.thread_id)[:8], task.task_id)
+        parts.append(
+            f"its full transcript is preserved at `{transcript_dir}/` (rendered "
+            "when the current turn ends) — read it to recover the completed "
+            "work before re-running anything"
+        )
+    last_output = (final_text if final_text is not None else task.last_output_text) or None
+    if last_output:
+        excerpt = last_output.strip()
+        if len(excerpt) > 2000:
+            excerpt = excerpt[:2000] + "…"
+        parts.append(f"the last text it wrote:\n{excerpt}")
+    if not parts:
+        return None
+    return "Recoverable work: " + "; ".join(parts) + "."
 
 
 # Strong refs for the fire-and-forget pre-start finalizations below —
@@ -256,7 +323,13 @@ async def _run_background_task(
             # must not settle "completed" — the replay archive has holes the
             # consumer can't detect. The abort loop usually raises first;
             # this covers a tear on the final events.
-            torn = Outcome.torn_stream()
+            # DALTON-HOOK(subagent-spill-recovery): the run's own answer is
+            # not discarded with the verdict — it rides the failure as the
+            # last text the run wrote, Command return shape included.
+            final_answer = _handler_answer_text(result)
+            torn = Outcome.torn_stream(
+                _torn_stream_recovery(task, registry, final_text=final_answer)
+            )
             ledger_status, ledger_failure = torn.status, torn.as_failure()
             logger.error(
                 "%s finished with a torn event stream; finalizing transport_lost",
@@ -285,12 +358,21 @@ async def _run_background_task(
             result = await handler_task
             ledger_status, ledger_failure = "completed", None
             if task.redis_write_failed and not task.cancelled:
-                torn = Outcome.torn_stream()
+                torn = Outcome.torn_stream(
+                    _torn_stream_recovery(task, registry)
+                )
                 ledger_status, ledger_failure = torn.status, torn.as_failure()
                 return torn.as_result()
             return {"success": True, "result": result}
         except Exception as e:
-            outcome = Outcome.from_exception(e)
+            if isinstance(e, TransportLostError):
+                # DALTON-HOOK(subagent-spill-recovery): the abort path's
+                # outcome carries what the run left behind.
+                outcome = Outcome.torn_stream(
+                    _torn_stream_recovery(task, registry)
+                )
+            else:
+                outcome = Outcome.from_exception(e)
             ledger_status, ledger_failure = outcome.status, outcome.as_failure()
             logger.error(
                 "%s failed after cancellation",
@@ -300,7 +382,12 @@ async def _run_background_task(
             )
             return outcome.as_result()
     except Exception as e:
-        outcome = Outcome.from_exception(e)
+        if isinstance(e, TransportLostError):
+            # DALTON-HOOK(subagent-spill-recovery): the abort path's outcome
+            # carries what the run left behind.
+            outcome = Outcome.torn_stream(_torn_stream_recovery(task, registry))
+        else:
+            outcome = Outcome.from_exception(e)
         ledger_status, ledger_failure = outcome.status, outcome.as_failure()
         logger.error(
             "%s failed",

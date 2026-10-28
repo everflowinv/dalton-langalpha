@@ -226,11 +226,24 @@ async def test_bridge_wiki_ingest_slug_and_alias_validations(tmp_path: Path) -> 
     cfg_before = (
         bridge.cfg.ocw_root / "skills" / "company-wiki" / "config.json"
     ).read_text(encoding="utf-8")
-    for unmapped in ("宇树科技", "600519.SH", "09988.HK", "SH600519"):
+    companies_dir = bridge._resolve_wiki_base_dir("company", bridge._load_company_wiki_config())
+    (companies_dir / "YUHONG").mkdir(parents=True, exist_ok=True)
+    for unmapped in ("宇树科技", "600519.SH", "09988.HK", "SH600519", "002271.SZ"):
         code, res = await bridge.handle_wiki_ingest({**base_req, "target": unmapped})
         assert code == 400
         assert res["ok"] is False
         assert res["status"] == "needs_alias"
+        # The answer names the existing directories so the caller can retry
+        # under the company's English slug instead of waiting on an admin.
+        assert "YUHONG" in res["existing_targets"]
+        assert "existing_targets" in res["hint"]
+
+    # Retrying under the existing English directory files the document there.
+    code, res = await bridge.handle_wiki_ingest({**base_req, "target": "YUHONG"})
+    assert code == 200
+    assert res["ok"] is True
+    assert res["target"] == "YUHONG"
+    assert res["is_existing_slug"] is True
     cfg_after = (
         bridge.cfg.ocw_root / "skills" / "company-wiki" / "config.json"
     ).read_text(encoding="utf-8")
@@ -242,6 +255,7 @@ async def test_bridge_wiki_ingest_slug_and_alias_validations(tmp_path: Path) -> 
     assert res["ok"] is False
     assert res["status"] == "needs_alias"
     assert res["error_code"] == "numeric_ticker_rejected"
+    assert "YUHONG" in res["existing_targets"]
 
     # Reserved temp* -> rejected
     code, res = await bridge.handle_wiki_ingest({**base_req, "target": "TEMP-CO"})

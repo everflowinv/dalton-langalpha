@@ -327,7 +327,10 @@ async def test_automation_naming_templates_and_schedule_helper(monkeypatch):
 @pytest.mark.asyncio
 async def test_probes_detect_real_signals_and_resolve_cik():
     today = date(2026, 10, 18)
-    now_utc = datetime(2026, 10, 18, 12, 0, tzinfo=timezone.utc)
+    # 日期-only 的验证项按交易所时区当天结束（美东 23:59:59）才到期：美东
+    # 10/19 00:00 = UTC 10/19 04:00（today 仍显式传 10/18，保持催化剂/问题
+    # 判断的窗口不变）。
+    now_utc = datetime(2026, 10, 19, 4, 0, tzinfo=timezone.utc)
     agenda_doc = {
         "next_validations": [
             {

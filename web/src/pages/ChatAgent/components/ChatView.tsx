@@ -119,7 +119,6 @@ import {
   TeamReadOnlyComposer,
   useTeamReadOnly,
 } from './dalton/TeamSharing';
-import { isDaltonAuth } from '@/config/daltonAuth';
 import { useUser } from '@/hooks/useUser';
 // DALTON-HOOK(coverage-tracking): company workspace auto-tracking toggle in thread top bar
 import { WorkspaceTrackingToggle } from './dalton/WorkspaceTrackingToggle';
@@ -162,7 +161,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
   // DALTON-HOOK(team-sharing): detect read-only colleague workspace/thread
   const teamReadOnly = useTeamReadOnly(workspaceId, workspaceRecord);
   // DALTON-HOOK(colleague-dispatch): current user for thread ownership check
-  const { user: currentUser } = useUser({ enabled: Boolean(workspaceId) && isDaltonAuth });
+  const { user: currentUser } = useUser({ enabled: Boolean(workspaceId) });
 
   // The model a navigation's first message goes out with, captured at mount:
   // ChatAgent keeps up to five ChatViews rendered at once (display:none, not
@@ -390,26 +389,75 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     sendSubagentInstruction,
   } = chat;
 
+  const activeThreadId =
+    currentThreadId && currentThreadId !== '__default__' ? currentThreadId : threadId;
   const threadModel = useThreadModel({
-    threadId: currentThreadId,
+    threadId: activeThreadId,
     isLoading,
     initialModel: navModel,
   });
   const { pickModel: pickThreadModel, thread: threadRecord } = threadModel;
   // DALTON-HOOK(colleague-dispatch): determine whether the active thread is read-only for the caller
-  const currentUserId = currentUser?.user_id ?? null;
-  const threadUserId = (threadRecord?.thread_user_id as string | null | undefined) ?? null;
+  const effectiveThreadRecord = useMemo(() => {
+    if (threadRecord) return threadRecord as Record<string, unknown>;
+    if (!activeThreadId || activeThreadId === '__default__') return null;
+    const cachedDetail = queryClient.getQueryData<Record<string, unknown>>(
+      queryKeys.threads.detail(activeThreadId),
+    );
+    if (cachedDetail) return cachedDetail;
+    if (workspaceId) {
+      const entries = queryClient.getQueriesData<unknown>({
+        queryKey: queryKeys.threads.byWorkspace(workspaceId),
+      });
+      for (const [, data] of entries) {
+        if (!data || typeof data !== 'object') continue;
+        const directThreads = (data as { threads?: Array<Record<string, unknown>> }).threads;
+        if (Array.isArray(directThreads)) {
+          const match = directThreads.find(
+            (t) => (t.thread_id || t.conversation_thread_id) === activeThreadId,
+          );
+          if (match) return match;
+        }
+        const pages = (
+          data as { pages?: Array<{ threads?: Array<Record<string, unknown>> }> }
+        ).pages;
+        if (Array.isArray(pages)) {
+          for (const page of pages) {
+            const match = page?.threads?.find(
+              (t) => (t.thread_id || t.conversation_thread_id) === activeThreadId,
+            );
+            if (match) return match;
+          }
+        }
+      }
+    }
+    return null;
+  }, [threadRecord, activeThreadId, workspaceId, queryClient]);
+  const workspaceOwnerId =
+    (effectiveThreadRecord?.workspace_owner_id as string | null | undefined) ??
+    (workspaceRecord?.user_id as string | null | undefined) ??
+    null;
+  const currentUserId =
+    currentUser?.user_id ?? (!teamReadOnly.isColleague ? workspaceOwnerId : null);
+  const threadUserId =
+    (effectiveThreadRecord?.thread_user_id as string | null | undefined) ??
+    (effectiveThreadRecord?.user_id as string | null | undefined) ??
+    null;
+  const rawMetadata =
+    (effectiveThreadRecord?.metadata as Record<string, unknown> | null | undefined) ?? null;
   const dispatchedBy =
-    (threadRecord?.dispatched_by as
+    ((effectiveThreadRecord?.dispatched_by ?? rawMetadata?.dispatched_by) as
       | { user_id?: string; name?: string | null; channel?: string }
       | null
       | undefined) ?? null;
   const isForeignThreadOwner = Boolean(
-    isDaltonAuth &&
-      ((threadUserId && currentUserId && threadUserId !== currentUserId) ||
-        (!threadUserId &&
-          dispatchedBy?.user_id &&
-          (!currentUserId || dispatchedBy.user_id !== currentUserId))),
+    (threadUserId && currentUserId && threadUserId !== currentUserId) ||
+      (dispatchedBy?.user_id &&
+        (!currentUserId || dispatchedBy.user_id !== currentUserId)) ||
+      (!teamReadOnly.isColleague &&
+        threadUserId &&
+        workspaceOwnerId &&
+        threadUserId !== workspaceOwnerId),
   );
   const isOwnThreadInRwColleagueWs =
     teamReadOnly.isColleague &&
@@ -1573,7 +1621,8 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
               </>
             )}
             {/* DALTON-HOOK(workspace-sharing-settings): hide ShareButton for colleagues */}
-            {currentThreadId && currentThreadId !== '__default__' && !teamReadOnly.isColleague && (
+            {/* DALTON-HOOK(colleague-dispatch): hide ShareButton on read-only foreign threads */}
+            {currentThreadId && currentThreadId !== '__default__' && !isThreadReadOnly && (
               <ShareButton threadId={currentThreadId} initialIsShared={threadIsShared} workspaceId={workspaceId} />
             )}
             {/* On desktop the open panel carries this toggle in the same
@@ -1637,7 +1686,8 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
             >
               {/* Message selection tooltip */}
               {/* DALTON-HOOK(workspace-sharing-settings): hide add-to-context tooltip for colleagues */}
-              {msgSelectionTooltip && !teamReadOnly.isColleague && (() => {
+              {/* DALTON-HOOK(colleague-dispatch): hide add-to-context tooltip on read-only foreign threads */}
+              {msgSelectionTooltip && !isThreadReadOnly && (() => {
                 const lines = (msgSelectionTooltip.text.match(/\n/g) || []).length + 1;
                 return (
                   <div
@@ -2030,7 +2080,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                   filesLoading={filesLoading}
                   filesError={filesError}
                   onRefreshFiles={refreshFiles}
-                  onAddContext={teamReadOnly.isColleague ? null : handleAddContext} // DALTON-HOOK(workspace-sharing-settings)
+                  onAddContext={isThreadReadOnly ? null : handleAddContext} // DALTON-HOOK(workspace-sharing-settings)
                   showSystemFiles={showSystemFiles}
                   onToggleSystemFiles={() => {
                     setShowSystemFiles((v) => {
@@ -2103,7 +2153,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                       filesLoading={filesLoading}
                       filesError={filesError}
                       onRefreshFiles={refreshFiles}
-                      onAddContext={teamReadOnly.isColleague ? null : handleAddContext} // DALTON-HOOK(workspace-sharing-settings)
+                      onAddContext={isThreadReadOnly ? null : handleAddContext} // DALTON-HOOK(workspace-sharing-settings)
                       showSystemFiles={showSystemFiles}
                       onToggleSystemFiles={() => {
                         setShowSystemFiles((v) => {

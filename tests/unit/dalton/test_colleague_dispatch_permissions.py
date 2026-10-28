@@ -261,25 +261,48 @@ async def test_three_tier_role_matrix_across_channels_and_master_switch(
                 )
             assert exc_ext_caller.value.status_code == 404
 
-    # 4. External member's workspace: internal colleague cannot read or write (404);
-    #    admin has read-only ('ro') access but CANNOT write/dispatch tasks (403).
-    for ch in ("cos", "web"):
-        with pytest.raises(HTTPException) as exc_int_to_ext:
-            await require_workspace_access(
-                ws_external, "u-internal-a", need="read", channel=ch  # type: ignore[arg-type]
-            )
-        assert exc_int_to_ext.value.status_code == 404
+    # 4. External member's workspace:
+    #    - Default (web_access='hidden'): both internal colleague and admin get 404 on web & cos.
+    #    - When external owner enables web_access='ro': internal colleague and admin can read on web,
+    #      get 403 on web write, and still get 404 on cos.
+    _setup_roles(
+        monkeypatch,
+        dispatch_enabled=True,
+        cos_sharing_by_owner={"u-internal-b": True},
+        web_sharing_by_ws={"ws-b": "rw", "ws-ext": "hidden"},
+    )
+    for caller in ("u-internal-a", "u-admin"):
+        for ch in ("cos", "web"):
+            with pytest.raises(HTTPException) as exc_hidden_ext:
+                await require_workspace_access(
+                    ws_external, caller, need="read", channel=ch  # type: ignore[arg-type]
+                )
+            assert exc_hidden_ext.value.status_code == 404
 
-        admin_read = await require_workspace_access(
-            ws_external, "u-admin", need="read", channel=ch  # type: ignore[arg-type]
+    _setup_roles(
+        monkeypatch,
+        dispatch_enabled=True,
+        cos_sharing_by_owner={"u-internal-b": True},
+        web_sharing_by_ws={"ws-b": "rw", "ws-ext": "ro"},
+    )
+    for caller in ("u-internal-a", "u-admin"):
+        web_read = await require_workspace_access(
+            ws_external, caller, need="read", channel="web"
         )
-        assert admin_read["workspace_id"] == "ws-ext"
+        assert web_read["workspace_id"] == "ws-ext"
+        assert web_read["_caller_web_access"] == "ro"
 
-        with pytest.raises(HTTPException) as exc_admin_write_ext:
+        with pytest.raises(HTTPException) as exc_web_write_ext:
             await require_workspace_access(
-                ws_external, "u-admin", need="write", channel=ch  # type: ignore[arg-type]
+                ws_external, caller, need="write", channel="web"
             )
-        assert exc_admin_write_ext.value.status_code == 403
+        assert exc_web_write_ext.value.status_code == 403
+
+        with pytest.raises(HTTPException) as exc_cos_ext:
+            await require_workspace_access(
+                ws_external, caller, need="read", channel="cos"
+            )
+        assert exc_cos_ext.value.status_code == 404
 
 
 @pytest.mark.asyncio
@@ -2207,3 +2230,315 @@ async def test_start_lock_skips_per_notice_check_only_for_a_resumable_retry(
     else:
         await call
         per_notice.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_get_thread_by_id_projects_ownership_and_dispatched_by(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Item 3: get_thread_by_id joins workspaces and selects thread_user_id, workspace_owner_id, and dispatched_by."""
+    from src.server.database import pool as db_pool
+    from src.server.database.conversation import threads_read
+
+    thread_id = str(uuid4())
+    executed_sql: list[str] = []
+
+    cursor = create_autospec(psycopg.AsyncCursor, instance=True)
+
+    async def _fake_execute(sql: str, params: Any = None) -> None:
+        executed_sql.append(sql)
+
+    cursor.execute.side_effect = _fake_execute
+    cursor.fetchone.return_value = {
+        "conversation_thread_id": thread_id,
+        "workspace_id": "ws-b",
+        "user_id": "u-internal-a",
+        "thread_user_id": "u-internal-a",
+        "workspace_owner_id": "u-internal-b",
+        "dispatched_by": {
+            "user_id": "u-internal-a",
+            "name": "Chao Yu",
+            "channel": "cos",
+        },
+    }
+    conn = create_autospec(psycopg.AsyncConnection, instance=True)
+
+    @asynccontextmanager
+    async def _cursor_cm(*args: Any, **kwargs: Any):
+        yield cursor
+
+    @asynccontextmanager
+    async def _db_cm(*args: Any, **kwargs: Any):
+        yield conn
+
+    conn.cursor.side_effect = _cursor_cm
+    monkeypatch.setattr(
+        db_pool,
+        "get_db_connection",
+        create_autospec(db_pool.get_db_connection, side_effect=_db_cm),
+    )
+
+    row = await threads_read.get_thread_by_id(thread_id)
+    assert row is not None
+    assert row["thread_user_id"] == "u-internal-a"
+    assert row["workspace_owner_id"] == "u-internal-b"
+    assert row["dispatched_by"]["user_id"] == "u-internal-a"
+    assert any("LEFT JOIN workspaces w" in s for s in executed_sql)
+    assert any("AS thread_user_id" in s for s in executed_sql)
+    assert any("AS workspace_owner_id" in s for s in executed_sql)
+    assert any("AS dispatched_by" in s for s in executed_sql)
+
+
+@pytest.mark.asyncio
+async def test_thread_commands_feedback_and_seen_endpoints_for_non_creator_reader(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Item 4: authorized non-creator reader (e.g. workspace owner B viewing A's thread)
+    gets 200 on GET /commands, GET /feedback, and POST /seen (no-op without stamping DB),
+    while write endpoints (stop command, submit/delete feedback) remain 403."""
+    from src.server.app.threads import commands as threads_commands
+    from src.server.app.threads import crud as threads_crud
+    from src.server.app.threads import feedback as threads_feedback
+    from src.server.database.runs import command_runs as cr_db
+    from src.server.models.conversation import FeedbackRequest
+
+    _setup_roles(
+        monkeypatch,
+        dispatch_enabled=True,
+        cos_sharing_by_owner={"u-internal-b": True},
+        web_sharing_by_ws={"ws-b": "hidden"},
+    )
+    thread_id = str(uuid4())
+    run_id = str(uuid4())
+
+    from src.server.database.conversation import threads_read
+
+    meta_mock = create_autospec(
+        threads_read.get_thread_auth_meta,
+        return_value={
+            "workspace_id": "ws-b",
+            "user_id": "u-internal-a",
+            "thread_user_id": "u-internal-a",
+            "workspace_owner_id": "u-internal-b",
+        },
+    )
+    monkeypatch.setattr(
+        dalton_sharing.conv_db,
+        "get_thread_auth_meta",
+        meta_mock,
+    )
+    monkeypatch.setattr(
+        threads_read,
+        "get_thread_auth_meta",
+        meta_mock,
+    )
+    monkeypatch.setattr(
+        dalton_sharing.ws_db,
+        "get_workspace",
+        create_autospec(
+            dalton_sharing.ws_db.get_workspace,
+            return_value={
+                "workspace_id": "ws-b",
+                "user_id": "u-internal-b",
+                "name": "TSMC Workspace",
+                "status": "running",
+                "is_home": False,
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        cr_db,
+        "list_for_thread",
+        create_autospec(cr_db.list_for_thread, return_value=[]),
+    )
+    monkeypatch.setattr(
+        threads_feedback,
+        "get_feedback_for_thread",
+        create_autospec(threads_feedback.get_feedback_for_thread, return_value=[]),
+    )
+    stamp_mock = create_autospec(
+        threads_crud.stamp_thread_seen,
+        return_value={"last_seen_run_seq": 3, "latest_run_seq": 3},
+    )
+    monkeypatch.setattr(threads_crud, "stamp_thread_seen", stamp_mock)
+
+    # 1. GET /commands succeeds for workspace owner B viewing A's thread
+    cmd_res = await threads_commands.list_commands(
+        thread_id, x_user_id="u-internal-b", status=None, limit=50
+    )
+    assert cmd_res.thread_id == thread_id
+    assert cmd_res.commands == []
+
+    # 2. GET /feedback succeeds for workspace owner B viewing A's thread
+    fb_res = await threads_feedback.get_feedback(
+        thread_id, x_user_id="u-internal-b"
+    )
+    assert fb_res == []
+
+    # 3. POST /seen is a 200 no-op for non-creator B (does NOT call stamp_thread_seen)
+    seen_res_b = await threads_crud.mark_thread_seen(
+        thread_id,
+        threads_crud.ThreadSeenRequest(run_id=run_id),
+        x_user_id="u-internal-b",
+    )
+    assert seen_res_b.last_seen_run_seq == 0
+    assert stamp_mock.await_count == 0
+
+    # Thread creator A calling POST /seen DOES call stamp_thread_seen
+    seen_res_a = await threads_crud.mark_thread_seen(
+        thread_id,
+        threads_crud.ThreadSeenRequest(run_id=run_id),
+        x_user_id="u-internal-a",
+    )
+    assert seen_res_a.last_seen_run_seq == 3
+    assert stamp_mock.await_count == 1
+
+    # 4. Write endpoints still enforce thread owner (B gets 403 on A's thread)
+    with pytest.raises(HTTPException) as exc_stop:
+        await threads_commands.stop_thread_command(
+            thread_id, "cmd-1", x_user_id="u-internal-b"
+        )
+    assert exc_stop.value.status_code == 403
+
+    with pytest.raises(HTTPException) as exc_fb_post:
+        await threads_feedback.submit_feedback(
+            thread_id,
+            FeedbackRequest(turn_index=0, rating="thumbs_up"),
+            x_user_id="u-internal-b",
+        )
+    assert exc_fb_post.value.status_code == 403
+
+
+def test_lifecycle_fields_clamps_last_seen_run_seq_for_non_creator() -> None:
+    """Item 5: _lifecycle_fields sets unseen=False, is_read=True, and
+    last_seen_run_seq >= latest_run_seq for non-creator viewers so the frontend
+    store never shows an unread dot on a colleague's thread."""
+    from datetime import UTC, datetime
+
+    from src.server.app.threads.crud import _lifecycle_fields
+
+    row = {
+        "conversation_thread_id": "th-colleague",
+        "workspace_id": "ws-b",
+        "user_id": "u-internal-a",
+        "thread_user_id": "u-internal-a",
+        "workspace_owner_id": "u-internal-b",
+        "current_status": "completed",
+        "last_seen_run_seq": 0,
+        "latest_run_id": "run-1",
+        "latest_run_status": "completed",
+        "latest_cancel_requested_at": None,
+        "latest_interrupt_reason": None,
+        "latest_run_seq": 4,
+        "latest_run_started_at": datetime.now(UTC),
+    }
+
+    # Viewer B (not creator A): unseen=False, is_read=True, last_seen_run_seq=4
+    lc_b = _lifecycle_fields(row, current_user_id="u-internal-b")
+    assert lc_b["unseen"] is False
+    assert lc_b["is_read"] is True
+    assert lc_b["last_seen_run_seq"] == 4
+
+    # Creator A: unseen=True, is_read=False, last_seen_run_seq=0
+    lc_a = _lifecycle_fields(row, current_user_id="u-internal-a")
+    assert lc_a["unseen"] is True
+    assert lc_a["is_read"] is False
+    assert lc_a["last_seen_run_seq"] == 0
+
+
+@pytest.mark.asyncio
+async def test_delegate_to_analyst_cleans_up_precreated_colleague_thread_and_surfaces_oauth_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Item 6: When dispatching a new thread to a colleague workspace fails with 400
+    (e.g. oauth_required), the pre-created thread row is deleted and the error detail
+    is returned to Chief of Staff."""
+    from src.server.database import conversation as conv_pkg
+    from src.tools.secretary import dispatch as dispatch_mod
+    from src.tools.secretary.chief_of_staff import delegate_to_analyst
+    from tests.unit.server.handlers.chat.redis_fakes import FakeCache
+    from tests.unit.tools.secretary.conftest import FakeResp, FakeSession
+
+    _setup_roles(
+        monkeypatch,
+        dispatch_enabled=True,
+        cos_sharing_by_owner={"u-internal-b": True},
+        web_sharing_by_ws={"ws-b": "hidden"},
+    )
+    from src.config import settings as app_settings
+
+    monkeypatch.setattr(
+        app_settings,
+        "background_dispatch_requires_token",
+        create_autospec(
+            app_settings.background_dispatch_requires_token, return_value=False
+        ),
+    )
+    fake_cache = FakeCache()
+    monkeypatch.setattr(
+        "src.utils.cache.redis_cache.get_cache_client", lambda: fake_cache
+    )
+    ws_b_id = "22222222-2222-4222-8222-222222222222"
+    monkeypatch.setattr(
+        ws_db,
+        "get_workspace",
+        create_autospec(
+            ws_db.get_workspace,
+            return_value={
+                "workspace_id": ws_b_id,
+                "user_id": "u-internal-b",
+                "name": "ORCL Research",
+                "status": "running",
+                "is_home": False,
+            },
+        ),
+    )
+    create_mock = create_autospec(conv_pkg.create_thread, return_value={})
+    delete_mock = create_autospec(conv_pkg.delete_thread, return_value=True)
+    monkeypatch.setattr(conv_pkg, "create_thread", create_mock)
+    monkeypatch.setattr(conv_pkg, "delete_thread", delete_mock)
+    monkeypatch.setattr(
+        dispatch_mod,
+        "hitl_confirm",
+        create_autospec(dispatch_mod.hitl_confirm, return_value=(True, {})),
+    )
+
+    oauth_resp = FakeResp(
+        status=400,
+        body={
+            "detail": {
+                "type": "oauth_required",
+                "message": "Model 'claude-opus-4-6' requires a connected Claude account.",
+                "provider": "claude-oauth",
+            }
+        },
+    )
+    monkeypatch.setattr(
+        "aiohttp.ClientSession", lambda: FakeSession(oauth_resp)
+    )
+
+    cmd = await delegate_to_analyst.ainvoke(
+        {
+            "name": "delegate_to_analyst",
+            "id": "call_oauth_fail",
+            "type": "tool_call",
+            "args": {
+                "question": "Check ORCL capex",
+                "workspace_id": ws_b_id,
+                "state": {},
+            },
+        },
+        config={
+            "configurable": {
+                "user_id": "u-internal-a",
+                "thread_id": "cos-home-thread",
+            }
+        },
+    )
+    payload = json.loads(cmd.update["messages"][0].content)
+    assert payload["success"] is False
+    assert "oauth_required" in payload["error"]
+    assert "requires a connected Claude account" in payload["error"]
+    assert create_mock.await_count == 1
+    created_tid = create_mock.await_args.kwargs["conversation_thread_id"]
+    delete_mock.assert_awaited_once_with(created_tid)

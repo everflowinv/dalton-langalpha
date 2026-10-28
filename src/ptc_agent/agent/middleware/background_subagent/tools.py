@@ -159,16 +159,21 @@ async def _settled_text(registry, task: BackgroundTask) -> str:
     # happen.
     label = _settled_label(task)
     # DALTON-HOOK(workflow-resume): resumable workflow failures must resume via RunWorkflow, never manual Task re-dispatch.
+    # The resume re-passes the SAME source the run was launched with: an
+    # inline script has no workflow name — `workflow=<name>` answers Unknown
+    # workflow — so both forms are named, with the run's own script snapshot.
     if task.terminal_status == "error" and (
         "RESUMABLE" in body
         or (task.subagent_type == "workflow" and "worker_lost" in body)
     ):
+        from src.dalton.workflows.journal import workflow_resume_call
+
         body = (
             f"{body}\n\n"
             f"When continuing (or when the user asks to continue / '继续'), you MUST "
-            f"re-launch the workflow with RunWorkflow(workflow=<same workflow>, resume='{task.task_id}') "
-            f"to replay completed dispatches from its journal — do NOT manually re-dispatch "
-            f"Task subagents (such as data-prep or dalton-evidence)."
+            f"resume the workflow with {workflow_resume_call(task.task_id, getattr(registry, 'thread_id', None) or None)} "
+            f"to replay completed dispatches from its journal — do NOT manually "
+            f"re-dispatch Task subagents (such as data-prep or dalton-evidence)."
         )
     return f"**{task.display_id}** ({task.subagent_type}) {label}:\n\n{body}"
 
@@ -290,17 +295,21 @@ async def _compose_missing_reply(registry, task_id: str, run: dict | None) -> st
     if isinstance(failure, dict) and failure.get("error"):
         detail = f" Error: {str(failure['error'])[:450]}"
     # DALTON-HOOK(workflow-resume): resumable workflow failures must resume via RunWorkflow, never manual Task re-dispatch.
+    # Same-source resume: an inline script re-passes the script verbatim
+    # (its snapshot path named), a named workflow re-passes the name.
     if "RESUMABLE" in detail or (
         isinstance(run, dict)
         and run.get("subagent_type") == "workflow"
         and "worker_lost" in detail
     ):
+        from src.dalton.workflows.journal import workflow_resume_call
+
         return (
             f"Task-{task_id} failed and produced no final result.{detail} "
             f"When continuing (or when the user asks to continue / '继续'), you MUST "
-            f"re-launch the workflow with RunWorkflow(workflow=<same workflow>, resume='{task_id}') "
-            f"to replay completed dispatches from its journal — do NOT manually re-dispatch "
-            f"Task subagents (such as data-prep or dalton-evidence)."
+            f"resume the workflow with {workflow_resume_call(task_id, getattr(registry, 'thread_id', None) or None)} "
+            f"to replay completed dispatches from its journal — do NOT manually "
+            f"re-dispatch Task subagents (such as data-prep or dalton-evidence)."
         )
     return (
         f"Task-{task_id} failed and produced no result.{detail} "

@@ -434,6 +434,7 @@ def build_ingest_research_tool(
         target: str | None = None,
         content_type: str | None = None,
         source: str | None = None,
+        aliases: list[str] | None = None,
         # shared
         content: str | None = None,
         file_path: str | None = None,
@@ -461,6 +462,7 @@ def build_ingest_research_tool(
             target: 公司代码/名称或行业 slug（wiki 必填）。
             content_type: wiki 文档类型（wiki 必填）。
             source: wiki 资料来源名（可选）。
+            aliases: 让中文名或股票代码以后直接指向这次的 target（wiki 可选，最多 10 个，如 ["002271.SZ", "东方雨虹"]）。target 返回 needs_alias、改用 existing_targets 里的英文目录名或新建英文目录名重新入库时，把原来用的名称放进来；写入成功后才登记，已指向别的公司的名称会被拒绝。
             content: 正文文本（与 file_path 二选一）。
             file_path: 工作区内文件路径（与 content 二选一）。
             confirm: False 预览；True 写入（自动入库开启且分类明确时可一步写入）。
@@ -621,6 +623,8 @@ def build_ingest_research_tool(
             "ingested_via": {"workspace_id": workspace_id},
             "dry_run": not effective_confirm,
         }
+        if aliases:
+            wiki_payload["aliases"] = list(aliases)
         if wiki_request_id is not None:
             wiki_payload["request_id"] = wiki_request_id
         # r3 (#2): the confirmed "ingest anyway" answer rides the write (and
@@ -697,6 +701,11 @@ def _render_ingest_receipt(
         "document_id": identifier or None,
         "duplicate": bool(resp.get("duplicate")),
     }
+    # Alias registration rides the same write; the receipt keeps its outcome
+    # so a name that did not register is reported, not silently dropped.
+    for key in ("aliases_added", "aliases_not_added"):
+        if resp.get(key):
+            receipt[key] = resp[key]
     if resp.get("status") == "duplicate":
         receipt["receipt"] = f"检测到重复，未写第二份（{library} 已有该内容：{identifier or '同内容记录'}）"
     return json.dumps(receipt, ensure_ascii=False)
