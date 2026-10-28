@@ -8,11 +8,11 @@ signal: a lock it could not read means it does not know what it is replacing.
 
 from __future__ import annotations
 
-import base64
+import ast
 import io
 import json
 import os
-import re
+import shlex
 import tarfile
 import tempfile
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -296,7 +296,10 @@ class TestUploadOwnershipGuard:
 
     def _archived_files(self, mock_runtime) -> list[str]:
         """The sandbox paths of the files in the one archive uploaded."""
-        (call,) = mock_runtime.upload_file.call_args_list
+        (call,) = [
+            c for c in mock_runtime.upload_file.call_args_list
+            if c.args[1].endswith(".tar.gz")
+        ]
         with tarfile.open(fileobj=io.BytesIO(call[0][0]), mode="r:gz") as tar:
             return ["/" + m.name for m in tar.getmembers() if m.isfile()]
 
@@ -352,13 +355,18 @@ class TestUploadOwnershipGuard:
     def _script_args(self, mock_runtime) -> list[dict]:
         """The decoded ARGS of every skill-sync script exec, in call order."""
         out = []
+        uploads = {c.args[1]: c.args[0] for c in mock_runtime.upload_file.call_args_list}
         for c in mock_runtime.exec.call_args_list:
-            m = re.search(r"b64decode\('([A-Za-z0-9+/=]+)'\)", c[0][0])
-            if not m:
+            argv = shlex.split(c.args[0])
+            if argv[:2] != ["python3", "-I"]:
                 continue
-            script = base64.b64decode(m.group(1)).decode()
-            args = re.search(r'b64decode\("([A-Za-z0-9+/=]+)"\)', script)
-            out.append(json.loads(base64.b64decode(args.group(1))))
+            script = ast.parse(uploads[argv[2]])
+            args = next(
+                node.value for node in script.body
+                if isinstance(node, ast.Assign)
+                and any(isinstance(t, ast.Name) and t.id == "ARGS" for t in node.targets)
+            )
+            out.append(json.loads(ast.literal_eval(args.args[0])))
         return out
 
     @patch("ptc_agent.core.sandbox.ptc_sandbox.create_provider")

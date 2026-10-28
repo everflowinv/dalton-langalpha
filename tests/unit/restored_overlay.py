@@ -94,17 +94,23 @@ def python3_on_path(
     monkeypatch, bin_dir: Path, marks: Path, *, full: bool = False, extra: str = ""
 ) -> None:
     """Put a ``python3`` first on PATH that runs the commands the host builds,
-    ``python3 -I -c CODE ARGS``, with ``prefix`` and ``extra`` ahead of their
-    code."""
+    ``python3 -I -c CODE ARGS`` or ``python3 -I FILE ARGS``, with ``prefix``
+    and ``extra`` ahead of their code."""
     bin_dir.mkdir(parents=True, exist_ok=True)
     source = bin_dir / "restored_overlay.py"
     source.write_text(prefix(marks, full=full) + extra)
     shim = bin_dir / "python3"
     shim.write_text(
         "#!/bin/sh\n"
-        f'[ "$1" = -I ] && [ "$2" = -c ] || exec {sys.executable} "$@"\n'
+        f'[ "$1" = -I ] || exec {sys.executable} "$@"\n'
+        'if [ "$2" = -c ]; then\n'
         "code=$3; shift 3\n"
         f'exec {sys.executable} -I -c "exec(open({str(source)!r}).read()); $code" "$@"\n'
+        "fi\n"
+        "shift\n"
+        f'exec {sys.executable} -I -c "import sys; exec(open({str(source)!r}).read()); '
+        'sys.argv.pop(0); __file__ = sys.argv[0]; '
+        'exec(compile(open(__file__).read(), __file__, \'exec\'))" "$@"\n'
     )
     shim.chmod(0o755)
     monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")

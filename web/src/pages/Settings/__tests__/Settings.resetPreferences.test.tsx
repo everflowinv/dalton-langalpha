@@ -27,7 +27,8 @@ vi.mock('@/hooks/usePreferences', () => ({
 }));
 
 const mutationStub = { mutateAsync: vi.fn(async () => ({})) };
-vi.mock('@/hooks/useUpdatePreferences', () => ({
+vi.mock('@/hooks/useUpdatePreferences', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/hooks/useUpdatePreferences')>()),
   useUpdatePreferences: () => mutationStub,
 }));
 

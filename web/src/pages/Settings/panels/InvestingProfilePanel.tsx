@@ -4,8 +4,8 @@ import { useNavigate } from 'react-router';
 import { useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { Button } from '@/components/ui/button';
-import { clearPreferences } from '@/pages/Dashboard/utils/api';
 import { usePreferences } from '@/hooks/usePreferences';
+import { useClearPreferences } from '@/hooks/useUpdatePreferences';
 import { queryKeys } from '@/lib/queryKeys';
 import ConfirmDialog from '@/pages/Dashboard/components/ConfirmDialog';
 import { welcomeUrl } from '@/pages/Onboarding/welcome/paths';
@@ -16,19 +16,16 @@ import { SETTINGS } from '../sections';
 import type { Preferences } from './types';
 
 // The visibility test and the renderer used to disagree about what "empty"
-// means: the test counted keys, the renderer dropped nulls, empty strings and
-// output_format. A group holding only those passed the test and drew a
-// labelled empty box. Derive the rows once and let their count decide.
+// means: the test counted keys, the renderer dropped nulls and empty strings.
+// A group holding only those passed the test and drew a labelled empty box.
+// Derive the rows once and let their count decide.
 //
 // A string of spaces is the same empty box with a different value in it.
 // These come from a free-text onboarding answer, so whitespace is what a user
 // submits by holding the spacebar, not a shape only a fuzzer produces.
 function renderableEntries(data?: Record<string, unknown> | null) {
   return Object.entries(data ?? {}).filter(
-    ([key, value]) =>
-      key !== 'output_format'
-      && value != null
-      && (typeof value !== 'string' || value.trim() !== ''),
+    ([, value]) => value != null && (typeof value !== 'string' || value.trim() !== ''),
   );
 }
 
@@ -45,6 +42,7 @@ export function InvestingProfilePanel() {
   const welcomeOffer = useWelcomeOffer();
   const { preferences: prefsData } = usePreferences();
   const queryClient = useQueryClient();
+  const { mutateAsync: clearPreferences } = useClearPreferences();
   const { t } = useTranslation();
   const copy = useSettingCopy();
   // The answers a reset cleared, hidden until the refetch replaces them.
@@ -57,7 +55,6 @@ export function InvestingProfilePanel() {
   const prefSections = [
     { label: t('settings.riskTolerance'), entries: renderableEntries(preferences?.risk_preference) },
     { label: t('settings.investmentStyle'), entries: renderableEntries(preferences?.investment_preference) },
-    { label: t('settings.agentSettings'), entries: renderableEntries(preferences?.agent_preference) },
   ].filter((section) => section.entries.length > 0);
 
   const handleResetConfirm = async () => {

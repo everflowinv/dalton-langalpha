@@ -3,6 +3,7 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 // failure-summary strings shown while a multi-file upload runs.
 import { useTranslation } from 'react-i18next';
 import type { TFunction } from 'i18next';
+import { holdReload } from '@/lib/reloadHolds';
 import { uploadToWorkspace, UploadSendError } from '../../utils/workspaceUpload';
 
 function uploadErrorMessage(err: unknown, file: globalThis.File, t: TFunction): string {
@@ -109,6 +110,9 @@ export function useFileUpload({ workspaceId, onRefreshFiles }: {
     const failures: { name: string; reason: string }[] = [];
     let uploaded = 0;
     let abandoned = false;
+    // DALTON-HOOK(multi-file-upload): hold stale-build reload across the entire
+    // serial upload batch (including files enqueued mid-run), not just one file.
+    const release = holdReload();
     try {
       while (queueRef.current.length > 0) {
         const file = queueRef.current.shift()!;
@@ -175,6 +179,7 @@ export function useFileUpload({ workspaceId, onRefreshFiles }: {
         if (landed) uploaded++;
       }
     } finally {
+      release();
       // Only the loop still owning the current generation may retire the
       // flag: an abandoned older loop clearing it would falsely signal idle
       // while a younger loop is still running.

@@ -145,75 +145,152 @@ function setupAndRender(agentPreference: Record<string, unknown> = {}) {
   return renderPreferencesTab();
 }
 
-describe('Settings — Output format', () => {
-  it('defaults to Default (Markdown) when output_format is absent', async () => {
-    setupAndRender({});
+const lastWrite = () => (h.mutateAsync.mock.calls.at(-1)![0] as { agent_preference: Record<string, unknown> }).agent_preference;
+const ranked = () => screen.getAllByTestId(/^output-format-/).map((row) => row.dataset.testid!.replace('output-format-', ''));
 
-    const defaultBtn = await screen.findByRole('button', { name: 'Default' });
-    const htmlBtn = screen.getByRole('button', { name: 'HTML' });
-    expect(defaultBtn).toHaveAttribute('aria-pressed', 'true');
-    expect(htmlBtn).toHaveAttribute('aria-pressed', 'false');
+describe('Settings: output format', () => {
+  it('shows the forms in the server order, left to the agent, when none is ranked', async () => {
+    setupAndRender();
+    await screen.findByText('Output format');
+    expect(ranked()).toEqual(['visual', 'markdown', 'text']);
+    expect(screen.getByText('The agent decides for now. Reorder to set your preference.')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Let the agent decide' })).not.toBeInTheDocument();
   });
 
-  it('reflects the saved html value as the active segment', async () => {
-    setupAndRender({ output_format: 'html' });
-
-    const defaultBtn = await screen.findByRole('button', { name: 'Default' });
-    const htmlBtn = screen.getByRole('button', { name: 'HTML' });
-    expect(htmlBtn).toHaveAttribute('aria-pressed', 'true');
-    expect(defaultBtn).toHaveAttribute('aria-pressed', 'false');
+  it('shows a saved ranking in its order', async () => {
+    setupAndRender({ output_format: ['text', 'visual', 'markdown'] });
+    await screen.findByText('Output format');
+    expect(ranked()).toEqual(['text', 'visual', 'markdown']);
   });
 
-  it('selecting HTML saves output_format: "html" through updatePreferences', async () => {
-    setupAndRender({});
-
-    const htmlBtn = await screen.findByRole('button', { name: 'HTML' });
-    fireEvent.click(htmlBtn);
-
-    await waitFor(() => expect(h.mutateAsync).toHaveBeenCalled());
-    const payload = h.mutateAsync.mock.calls.at(-1)![0] as {
-      agent_preference: Record<string, unknown>;
-    };
-    expect(payload.agent_preference).toMatchObject({ output_format: 'html' });
+  it('fades the forms a partial ranking leaves out, which the agent gets no rank for', async () => {
+    setupAndRender({ output_format: ['text'] });
+    await screen.findByText('Output format');
+    expect(ranked()).toEqual(['text', 'visual', 'markdown']);
+    expect(screen.getAllByTestId(/^output-format-/).map((row) => row.dataset.ranked === 'true')).toEqual([true, false, false]);
   });
 
-  it('selecting Default writes output_format: null to delete the key', async () => {
-    setupAndRender({ output_format: 'html' });
-
-    const defaultBtn = await screen.findByRole('button', { name: 'Default' });
-    fireEvent.click(defaultBtn);
-
-    await waitFor(() => expect(h.mutateAsync).toHaveBeenCalled());
-    const payload = h.mutateAsync.mock.calls.at(-1)![0] as {
-      agent_preference: Record<string, unknown>;
-    };
-    expect(payload.agent_preference.output_format).toBeNull();
+  it('reads a row from before the ranking as the server migrated it', async () => {
+    setupAndRender({ output_format: 'html', deliverable: 'text' });
+    await screen.findByText('Output format');
+    expect(ranked()).toEqual(['visual', 'markdown', 'text']);
+    expect(screen.getByRole('button', { name: 'Let the agent decide' })).toBeInTheDocument();
   });
 
-  it('writes only output_format, leaving other agent_preference keys to the server merge', async () => {
-    setupAndRender({ tone: 'concise' });
-
-    const htmlBtn = await screen.findByRole('button', { name: 'HTML' });
-    fireEvent.click(htmlBtn);
-
-    await waitFor(() => expect(h.mutateAsync).toHaveBeenCalled());
-    expect(h.mutateAsync.mock.calls.at(-1)![0]).toEqual({ agent_preference: { output_format: 'html' } });
+  it('reads a list with a form outside the ranking as the user\'s words, not a ranking', async () => {
+    setupAndRender({ output_format: ['visual', 'pdf'] });
+    expect(await screen.findByText('visual, pdf')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Let the agent decide' })).not.toBeInTheDocument();
   });
 
-  it('does not duplicate output_format as a read-only row', async () => {
-    setupAndRender({ output_format: 'html' });
+  it('saves the whole order when a form moves, with only the keys it owns', async () => {
+    setupAndRender({ tone: 'terse' });
+    fireEvent.click(await screen.findByRole('button', { name: 'Move Chat up' }));
+    await waitFor(() => expect(h.mutateAsync).toHaveBeenCalledTimes(1));
+    expect(lastWrite()).toEqual({ output_format: ['visual', 'text', 'markdown'], deliverable: null });
+  });
 
-    await screen.findByRole('button', { name: 'HTML' });
-    // The generic key/value loop renders rows like "Output Format:"; the
-    // dedicated control replaces it, so that raw row must not appear.
-    expect(screen.queryByText('Output Format:')).not.toBeInTheDocument();
+  it('cannot move the first form up or the last one down', async () => {
+    setupAndRender({ output_format: ['visual', 'markdown', 'text'] });
+    expect(await screen.findByRole('button', { name: 'Move Visual up' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Move Chat down' })).toBeDisabled();
+  });
+
+  it('hands the choice back to the agent', async () => {
+    setupAndRender({ output_format: ['markdown', 'text', 'visual'] });
+    fireEvent.click(await screen.findByRole('button', { name: 'Let the agent decide' }));
+    await waitFor(() => expect(h.mutateAsync).toHaveBeenCalledTimes(1));
+    expect(lastWrite()).toEqual({ output_format: null, deliverable: null });
+  });
+});
+
+describe('Settings: research depth and reaching out', () => {
+  it('shows each saved choice with its own line, and Agent decides when there is none', async () => {
+    setupAndRender({ research_depth: 'thorough' });
+    const depth = (await screen.findByRole('combobox', { name: 'Research depth' })) as HTMLSelectElement;
+    expect(depth.value).toBe('thorough');
+    expect(screen.getByText('Data and evidence checked before every answer. Takes longer and uses more credits.')).toBeInTheDocument();
+    const reaching = screen.getByRole('combobox', { name: 'Reaching out' }) as HTMLSelectElement;
+    expect(reaching.value).toBe('');
+    expect(screen.getByText('When the agent gets in touch without being asked.')).toBeInTheDocument();
+  });
+
+  it('writes a pick, and null for Agent decides', async () => {
+    setupAndRender({ proactivity: 'proactive' });
+    fireEvent.change(await screen.findByRole('combobox', { name: 'Research depth' }), { target: { value: 'light' } });
+    await waitFor(() => expect(h.mutateAsync).toHaveBeenCalledTimes(1));
+    expect(lastWrite()).toEqual({ research_depth: 'light' });
+    fireEvent.change(screen.getByRole('combobox', { name: 'Reaching out' }), { target: { value: '' } });
+    await waitFor(() => expect(h.mutateAsync).toHaveBeenCalledTimes(2));
+    expect(lastWrite()).toEqual({ proactivity: null });
+  });
+});
+
+describe("Settings: the user's instructions", () => {
+  it('lists the keys the agent reads as the user\'s words, and none of the ones that steer it', async () => {
+    setupAndRender({
+      tone: 'plain words',
+      research_depth: 'deep dives please',
+      proactivity: 'on_request',
+      output_format: ['visual'],
+      avoid: ['jargon', 'emoji'],
+    });
+    expect(await screen.findByText('Your instructions')).toBeInTheDocument();
+    expect(screen.getByRole('textbox', { name: 'Tone' })).toHaveValue('plain words');
+    // A value outside its vocabulary reaches the agent as written, so it is one
+    // too, but only to remove: the server refuses words as an edit to it.
+    expect(screen.getByText('deep dives please')).toBeInTheDocument();
+    expect(screen.queryByRole('textbox', { name: 'Research depth' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Remove Research depth' })).toBeInTheDocument();
+    expect(screen.getByText('jargon, emoji')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Remove Proactivity' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Remove Output format' })).not.toBeInTheDocument();
+  });
+
+  it('lists an old deliverable beside an output format in the user\'s words, which the agent reads as written', async () => {
+    setupAndRender({ output_format: 'pdf', deliverable: 'visual' });
+    expect(await screen.findByRole('button', { name: 'Remove Deliverable' })).toBeInTheDocument();
+    expect(screen.getByText('visual')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Let the agent decide' })).not.toBeInTheDocument();
+  });
+
+  it('lists an old deliverable beside a list in the user\'s words too', async () => {
+    setupAndRender({ output_format: ['visual', 'pdf'], deliverable: 'text' });
+    expect(await screen.findByRole('button', { name: 'Remove Deliverable' })).toBeInTheDocument();
+  });
+
+  it('saves an edit on leaving the field, and removes one with its button', async () => {
+    setupAndRender({ tone: 'plain words', avoid: ['jargon'] });
+    const tone = await screen.findByRole('textbox', { name: 'Tone' });
+    fireEvent.change(tone, { target: { value: 'terse' } });
+    fireEvent.blur(tone);
+    await waitFor(() => expect(h.mutateAsync).toHaveBeenCalledTimes(1));
+    expect(lastWrite()).toEqual({ tone: 'terse' });
+    fireEvent.click(screen.getByRole('button', { name: 'Remove Avoid' }));
+    await waitFor(() => expect(h.mutateAsync).toHaveBeenCalledTimes(2));
+    expect(lastWrite()).toEqual({ avoid: null });
+  });
+
+  it('puts an emptied instruction back rather than saving it blank', async () => {
+    setupAndRender({ tone: 'plain words' });
+    const tone = await screen.findByRole('textbox', { name: 'Tone' });
+    fireEvent.change(tone, { target: { value: '  ' } });
+    fireEvent.blur(tone);
+    expect(tone).toHaveValue('plain words');
+    expect(h.mutateAsync).not.toHaveBeenCalled();
+  });
+
+  it('draws no group when there are none', async () => {
+    setupAndRender({ research_depth: 'light', output_format: ['text'] });
+    await screen.findByText('Output format');
+    expect(screen.queryByText('Your instructions')).not.toBeInTheDocument();
   });
 
   // DALTON-HOOK(hide-trading): TradingPermissionSection is hidden while AutoApproveSettings stays
   it('hides TradingPermissionSection in Preferences while keeping Approvals (AutoApproveSettings)', async () => {
     setupAndRender({});
 
-    await screen.findByRole('button', { name: 'Default' });
+    await screen.findByText('Output format');
     expect(screen.getByText('Approvals')).toBeInTheDocument();
     expect(screen.queryByText('Trading permissions')).not.toBeInTheDocument();
     expect(screen.queryByRole('radiogroup', { name: 'Trading permissions' })).not.toBeInTheDocument();

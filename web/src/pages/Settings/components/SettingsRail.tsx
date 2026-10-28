@@ -50,6 +50,7 @@ export function SettingsRail({ section }: { section: Section }) {
         const text = [
           t(entry.labelKey),
           entry.descKey ? t(entry.descKey) : '',
+          ...(entry.alsoKeys ?? []).map((key) => t(key)),
           t(SECTIONS[entry.section].labelKey),
           // DALTON-HOOK(settings-section): match bilingual keywords so Chinese and English queries always hit
           entry.keywords ?? '',

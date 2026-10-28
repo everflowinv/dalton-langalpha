@@ -115,9 +115,8 @@ class AgentPreference(BaseModel):
 
     # Any, and checked in the endpoint, for the reasons RiskPreference gives.
     # A null survives the parse too, which the JSONB merge reads as deleting
-    # the key: Settings' switch sends one to go back to markdown.
+    # the key: Settings sends one to go back to letting the agent decide.
     research_depth: Optional[Any] = Field(None, description=_doc("agent_preference", "research_depth"))
-    deliverable: Optional[Any] = Field(None, description=_doc("agent_preference", "deliverable"))
     proactivity: Optional[Any] = Field(None, description=_doc("agent_preference", "proactivity"))
     output_style: Optional[str] = Field(
         None, description="Preferred output style"

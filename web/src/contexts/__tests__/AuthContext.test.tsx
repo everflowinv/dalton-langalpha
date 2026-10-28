@@ -2,6 +2,7 @@ import React, { type ReactElement } from 'react';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, waitFor, act } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { requestsInFlight } from '../../lib/reloadHolds';
 
 // Enable platform auth code path (AuthProvider checks VITE_HOST_MODE)
 // Must be set before the dynamic import below.
@@ -53,6 +54,7 @@ vi.mock('../../lib/authToken', () => ({
   // changed; here it only has to record what was adopted.
   sessionAdopter: () => (session: unknown) => mockAdopt(session),
   clearAuthToken: () => mockClearAuthToken(),
+  authGeneration: () => 0,
 }));
 
 // The platform call a password change makes to sign connected apps out.
@@ -510,6 +512,7 @@ describe('AuthContext', () => {
       });
       expect(fetchSpy).toHaveBeenCalledTimes(1);
       expect(screen.getByTestId('userId').textContent).toBe('user-a');
+      expect(requestsInFlight(0)).toBe(true);
 
       // 2. Switch to account B before A's /auth/sync returns -> B sends its own /auth/sync
       await act(async () => {
@@ -517,8 +520,9 @@ describe('AuthContext', () => {
       });
       expect(fetchSpy).toHaveBeenCalledTimes(2);
       expect(screen.getByTestId('userId').textContent).toBe('user-b');
+      expect(requestsInFlight(0)).toBe(true);
 
-      // 3. A's stale /auth/sync returns 403 -> must NOT sign out B or show toast
+      // 3. A's stale /auth/sync returns 403 -> must NOT sign out B or show toast; B is still in flight
       await act(async () => {
         resolveFetchA(new Response(null, { status: 403 }));
         await fetchAPromise;
@@ -527,6 +531,7 @@ describe('AuthContext', () => {
       expect(mockToast).not.toHaveBeenCalled();
       expect(screen.getByTestId('userId').textContent).toBe('user-b');
       expect(screen.getByTestId('isLoggedIn').textContent).toBe('true');
+      expect(requestsInFlight(0)).toBe(true);
 
       // 4. B's /auth/sync succeeds cleanly
       await act(async () => {
@@ -539,6 +544,7 @@ describe('AuthContext', () => {
         await fetchBPromise;
       });
       expect(mockSignOut).not.toHaveBeenCalled();
+      expect(requestsInFlight(0)).toBe(false);
 
       fetchSpy.mockRestore();
       daltonAuthState.isDaltonAuth = false;

@@ -741,7 +741,7 @@ class TestProfileFollowsTheGoldenRule:
         "name": "Ada",
         "timezone": "Europe/Paris",
         "locale": "fr-FR",
-        "agent_preference": {"output_format": "html"},
+        "agent_preference": {"output_format": ["visual"]},
     }
     COUNTS = {"portfolio_count": 2, "watchlist_summary": "1:5", "prefs_set": True}
 
@@ -800,11 +800,11 @@ class TestProfileFollowsTheGoldenRule:
     async def test_a_preference_change_names_only_that_key(self):
         state = await self._turn(self.PROFILE, self.COUNTS).abefore_agent({}, None)
         later = self._turn(
-            {**self.PROFILE, "agent_preference": {"output_format": "markdown", "tone": "terse"}},
+            {**self.PROFILE, "agent_preference": {"output_format": ["text", "visual"], "tone": "terse"}},
             self.COUNTS,
         )
         row = runtime_update_from_message(_rows(await later.abefore_agent(state, None))[0])
-        assert "Preference output_format: markdown (the frozen block says html)" in row.text
+        assert "Preference output_format: text, visual (the frozen block says visual)" in row.text
         assert "Preference tone: terse (not in the frozen block)" in row.text
         assert "Timezone" not in row.text
 
@@ -1175,14 +1175,14 @@ class TestRendering:
             user_profile={
                 "name": "Ada",
                 "locale": "fr-FR",
-                "agent_preference": {"output_format": "html", "tone": "terse"},
+                "agent_preference": {"output_format": ["visual"], "tone": "terse"},
             },
             user_data_counts={"portfolio_count": 2, "watchlist_summary": "1:5"},
         )
         state = await mw.abefore_agent({}, None)
         text = _text(await _render(mw, state))
 
-        assert "Output Format: Styled HTML" in text
+        assert "Fit how you hand back an answer to the work behind it." in text
         assert "Default to the user's locale (fr-FR)" in text
         assert "**tone**: terse" in text
         assert ".agents/user/profile/portfolio.json" in text

@@ -12,6 +12,7 @@
  * shape, so it is the contract here rather than an accident of the old client.
  */
 import { authGeneration, bearerTokenOf, getAccessToken, refreshAccessToken } from '../lib/authToken';
+import { trackRequest } from '../lib/reloadHolds';
 
 const baseURL: string = import.meta.env.VITE_API_BASE_URL ?? '';
 
@@ -329,7 +330,14 @@ async function request<T>(method: string, url: string, data: unknown, config: Re
       return attempt();
     }
   };
-  return attempt();
+  // A write the page being left still has out (an archive, a save) outlives
+  // it, so the stale-build reload a section switch takes waits for it to land.
+  const settle = trackRequest(authGeneration());
+  try {
+    return await attempt();
+  } finally {
+    settle();
+  }
 }
 
 export const api = {

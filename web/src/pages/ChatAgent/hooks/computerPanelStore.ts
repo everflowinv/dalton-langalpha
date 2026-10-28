@@ -9,6 +9,7 @@
 import { useSyncExternalStore } from 'react';
 
 import { registerAuthReset } from '@/lib/authResets';
+import { holdReload } from '@/lib/reloadHolds';
 import { createValueStore } from '@/lib/valueStore';
 
 /**
@@ -34,10 +35,20 @@ export interface ComputersPanelState {
 const INITIAL: ComputersPanelState = { panel: null, opening: 0, specComputerId: null };
 const store = createValueStore<ComputersPanelState>(INITIAL);
 // Survives the page unmount, so a sign-out must not reopen it for the next account.
-registerAuthReset(() => store.set(INITIAL));
+registerAuthReset(() => set(INITIAL));
+
+// An open request outlives the page that made it (Getting Started opens the
+// dialog, then goes to chat), so a stale-build reload waits until it closes.
+let releaseReload: (() => void) | null = null;
 
 function set(next: Partial<ComputersPanelState>) {
-  store.set({ ...store.get(), ...next });
+  const state = { ...store.get(), ...next };
+  store.set(state);
+  if (state.panel || state.specComputerId) releaseReload ??= holdReload();
+  else if (releaseReload) {
+    releaseReload();
+    releaseReload = null;
+  }
 }
 
 export function openComputersPanel(panel: ComputersPanelView = { view: 'list' }) {

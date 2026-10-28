@@ -2,10 +2,10 @@
   "common": {
     "submit": "提交",
     "staleBuild": {
-      "title": "此标签页与服务器版本不一致",
-      "description": "服务器提供的版本与此标签页加载的版本不同，重新加载即可切换。",
-      "blockedTitle": "页面加载失败",
-      "blockedDescription": "此标签页打开期间应用版本已变更，请重新加载以继续。",
+      "title": "有新版本可用",
+      "description": "请立即重新加载以完成更新，Agent 会继续运行。",
+      "blockedTitle": "此页面需要重新加载",
+      "blockedDescription": "此标签页打开期间 LangAlpha 已更新，重新加载即可继续。",
       "reload": "重新加载"
     },
     "networkBanner": {
@@ -314,10 +314,7 @@
     "preferencesDesc": "也可以在任意对话中让 Agent 修改这些设置。",
     "riskTolerance": "风险偏好",
     "investmentStyle": "投资风格",
-    "agentSettings": "Agent 设置",
     "outputFormat": "输出格式",
-    "outputFormatDefault": "默认",
-    "outputFormatHtml": "HTML",
     "subagentsDefault": "子 Agent",
     "subagentsDefaultDesc": "允许 Agent 将工作分派给子 Agent。所有对话都遵循此设置，除非你在某个对话的聊天输入框中将其切换为相反设置。",
     "resetPreferences": "重置偏好",
@@ -632,7 +629,34 @@
     "defaultModels": "默认模型",
     "defaultModelsDesc": "新对话和后台任务使用的模型。",
     "experimentsGroup": "可用的实验功能",
-    "outputFormatDesc": "默认以文字作答。选择 HTML 后，较深入的回答会生成包含图表、表格和交互视图的图文报告，生成稍慢，消耗的积分也更多。",
+    "outputFormatDesc": "拖动排列你偏好的顺序。简单问题总是直接在对话中回答；较大的工作，Agent 会采用排序靠前且合适的形式。",
+    "outputFormatDecides": "目前由 Agent 自行决定。调整顺序即可设定你的偏好。",
+    "outputFormatReset": "交给 Agent 决定",
+    "outputFormatMoveUp": "将{{name}}上移",
+    "outputFormatMoveDown": "将{{name}}下移",
+    "outputFormatDrag": "拖动以调整{{name}}的顺序",
+    "outputFormatOption": {
+      "visual": {
+        "title": "可视化",
+        "desc": "快速查看时用对话中的图表和看板；长篇研究，或需要保存、分享的内容，生成排版好的 HTML 报告。耗时更长，消耗的积分也更多。"
+      },
+      "markdown": {
+        "title": "摘要 + Markdown 文件",
+        "desc": "完整结果写入 Markdown 文件，回复里只给出你现在需要知道的内容。"
+      },
+      "text": {
+        "title": "对话",
+        "desc": "研究完成后直接在回复中给出全部内容。最快，不生成文件。"
+      }
+    },
+    "researchDepth": "研究深度",
+    "researchDepthDesc": "问题默认获得多少研究。",
+    "reachingOut": "主动联系",
+    "reachingOutDesc": "Agent 在你没有提问时何时联系你。",
+    "agentDecides": "由 Agent 决定",
+    "instructions": "你的指示",
+    "instructionsDesc": "你让 Agent 记下的要求，每次回答都会遵循。",
+    "instructionsRemove": "移除{{name}}",
     "planUsage": {
       "plan": "套餐",
       "planDesc": "你的套餐包含什么、费用多少。",
@@ -4550,13 +4574,13 @@
             "title": "文字回复",
             "desc": "在对话中用文字回答，必要时配表格。"
           },
-          "visual": {
-            "title": "图表和看板",
-            "desc": "在对话中通过交互式图表和看板探索数据。"
+          "markdown": {
+            "title": "摘要加文件",
+            "desc": "完整结果写入 Markdown 文件，回复里给出要点。"
           },
-          "report": {
-            "title": "完整报告",
-            "desc": "排版好的 HTML 报告，可分享或保存为 PDF，准备时间更长，消耗更多 credits。"
+          "visual": {
+            "title": "图表和报告",
+            "desc": "快速查看时用对话中的交互式图表，长篇研究生成排版好的 HTML 报告，耗时更长，消耗更多 credits。"
           }
         },
         "proactivityTitle": "你希望我什么时候主动提供简报或提醒？",

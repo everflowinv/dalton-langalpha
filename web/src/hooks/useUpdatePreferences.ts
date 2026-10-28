@@ -1,12 +1,15 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { MOVED_MODEL_KEYS, threadsMoved } from '../lib/modelPreferences';
 import { queryKeys } from '../lib/queryKeys';
-import { updatePreferences } from '../pages/Dashboard/utils/api';
+import { clearPreferences, updatePreferences } from '../pages/Dashboard/utils/api';
 import type { UserPreferences } from '../types/api';
 
 /** Every preference write shares one mutation identity, so a save indicator can
  *  watch the write rather than the component that issued it. */
 export const PREFERENCE_MUTATION_KEY = ['user-preferences'] as const;
+
+/** Every request that changes the preferences row waits its turn here. */
+const PREFERENCE_SCOPE = { id: 'user-preferences' };
 
 /** Columns the server merges recursively (`jsonb_deep_merge`). Only
  *  `model_preference` does: its `profiles` bag is keyed by model name, so a
@@ -106,7 +109,7 @@ export function useUpdatePreferences() {
   const key = queryKeys.user.preferences();
   return useMutation({
     mutationKey: PREFERENCE_MUTATION_KEY,
-    scope: { id: 'user-preferences' },
+    scope: PREFERENCE_SCOPE,
     mutationFn: updatePreferences as (prefs: Partial<UserPreferences>) => Promise<UserPreferences>,
     onMutate: async (patch: Partial<UserPreferences>) => {
       await queryClient.cancelQueries({ queryKey: key });
@@ -145,4 +148,12 @@ export function useUpdatePreferences() {
       if (context?.previous && last) queryClient.setQueryData(key, context.previous);
     },
   });
+}
+
+/** Deletes the preferences row once every write issued before it has landed.
+ *  Sent past them, a write the server takes after the delete inserts a fresh
+ *  row holding its keys, and the reset leaves that value stored. It carries no
+ *  key, so it never counts as one of the writes a save status watches. */
+export function useClearPreferences() {
+  return useMutation({ scope: PREFERENCE_SCOPE, mutationFn: clearPreferences });
 }

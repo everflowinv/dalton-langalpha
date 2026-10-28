@@ -18,6 +18,7 @@ import { isValidUuid } from './utils/uuid';
 import { shouldLeaveThreadRoute } from './utils/threadRouteGuard';
 import ChatView from './components/ChatView';
 import ComputersDialogHost from './components/ComputersDialogHost';
+import { closeComputerSpec, closeComputersPanel } from './hooks/computerPanelStore';
 // DALTON-HOOK(team-sharing): check workspace ownership before marking thread seen
 import { isDaltonAuth } from '@/config/daltonAuth';
 import { useWorkspace } from '@/hooks/useWorkspace';
@@ -72,6 +73,14 @@ function ChatAgent(): React.ReactElement | null {
   // DALTON-HOOK(team-sharing): the upstream bare useActiveThreadPublisher(threadId)
   // call is dropped here; the ownership-gated call below publishes the same
   // threadId with canMarkSeen resolved for colleague read-only views.
+
+  // The Computers dialogs mount with this page, so leaving the section (a
+  // back gesture skips their close) must close them too; left open, they
+  // would come back on the next visit and hold the stale-build reload.
+  useEffect(() => () => {
+    closeComputersPanel();
+    closeComputerSpec();
+  }, []);
 
   // Session restore: when landing at /chat (gallery) with a saved session,
   // navigate to the deep route. This creates the natural history stack:

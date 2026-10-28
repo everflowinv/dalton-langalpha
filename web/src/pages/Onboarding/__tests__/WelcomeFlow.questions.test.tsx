@@ -92,8 +92,8 @@ describe('WelcomeFlow: the questions and their save', () => {
     fireEvent.click(screen.getByTestId('welcome-depth-light'));
     // One answer each: a second pick takes the first one's place.
     fireEvent.click(screen.getByTestId('welcome-deliverable-visual'));
-    fireEvent.click(screen.getByTestId('welcome-deliverable-report'));
-    expect(screen.getByRole('radio', { name: /^Charts and dashboards/ })).not.toBeChecked();
+    fireEvent.click(screen.getByTestId('welcome-deliverable-markdown'));
+    expect(screen.getByRole('radio', { name: /^Charts and reports/ })).not.toBeChecked();
     fireEvent.click(screen.getByTestId('welcome-proactivity-proactive'));
     expect(mutateAsync).not.toHaveBeenCalled();
     // The last question's way on is the start of the chat.
@@ -103,8 +103,7 @@ describe('WelcomeFlow: the questions and their save', () => {
     await waitFor(() => expect(location()).toBe('/chat/t/__default__'));
     expect(mutateAsync).toHaveBeenCalledTimes(1);
     // Only what was answered: the lists left empty were empty on the server.
-    // A report is the output format Settings keeps, and the deliverable key,
-    // which holds none for a report, was empty there already.
+    // The answer leads the output format's ranking.
     expect(mutateAsync).toHaveBeenCalledWith({
       risk_preference: { risk_level: 'aggressive' },
       investment_preference: {
@@ -120,7 +119,7 @@ describe('WelcomeFlow: the questions and their save', () => {
       agent_preference: {
         research_depth: 'light',
         proactivity: 'proactive',
-        output_format: 'html',
+        output_format: ['markdown', 'text', 'visual'],
       },
     });
 
@@ -239,12 +238,10 @@ describe('WelcomeFlow: the questions and their save', () => {
     expect(composer()).toBeEnabled();
     fireEvent.click(primary());
     await waitFor(() => expect(location()).toBe('/chat/t/__default__'));
-    // Text, not a report: the output format is left to Settings, which
-    // already holds none.
     expect((mutateAsync.mock.calls[0][0] as { agent_preference: object }).agent_preference).toEqual({
       research_depth: 'adaptive',
-      deliverable: 'text',
       proactivity: 'on_request',
+      output_format: ['text', 'markdown', 'visual'],
     });
   });
 
@@ -289,7 +286,7 @@ describe('WelcomeFlow: the questions and their save', () => {
     expect(turn('agent')).toBeInTheDocument();
     expect(screen.getByRole('radio', { name: /^Full research/ })).toBeChecked();
     // Read off the output format Settings keeps, as the save writes it.
-    expect(screen.getByRole('radio', { name: /^Full reports/ })).toBeChecked();
+    expect(screen.getByRole('radio', { name: /^Summary with a file/ })).toBeChecked();
     expect(screen.getByRole('radio', { name: /^When it matters/ })).toBeChecked();
 
     fireEvent.click(screen.getByTestId('welcome-depth-adaptive'));
@@ -299,15 +296,13 @@ describe('WelcomeFlow: the questions and their save', () => {
     expect(mutateAsync).toHaveBeenCalledWith({ agent_preference: { research_depth: 'adaptive' } });
   });
 
-  it("a report changed to charts from Settings' editor turns the HTML output format off with it", async () => {
+  it("a new answer from Settings' editor writes the ranking it leads", async () => {
     renderFlow({ mode: 'edit', initialStep: 'agent', profile: answered });
     fireEvent.click(screen.getByTestId('welcome-deliverable-visual'));
     fireEvent.click(primary());
     await waitFor(() => expect(location()).toBe('/settings?tab=preferences'));
-    // Null takes the output format back to the default, as Settings' own
-    // switch does.
     expect(mutateAsync).toHaveBeenCalledTimes(1);
-    expect(mutateAsync).toHaveBeenCalledWith({ agent_preference: { deliverable: 'visual', output_format: null } });
+    expect(mutateAsync).toHaveBeenCalledWith({ agent_preference: { output_format: ['visual', 'markdown', 'text'] } });
   });
 
   it('edits with no composer, since Settings hands nothing to the agent', () => {

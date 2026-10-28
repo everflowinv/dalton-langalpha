@@ -1,6 +1,9 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { act, renderHook } from '@testing-library/react';
 import { renderHookWithProviders } from '@/test/utils';
+import { reloadHeld } from '@/lib/reloadHolds';
+import { runAuthResets } from '@/lib/authResets';
+import { checkForNewBuild, reloadIfStale, __resetStaleBuildForTests } from '@/lib/staleBuild';
 
 // ---------------------------------------------------------------------------
 // useFileUpload — serial multi-file upload (DALTON multi-file-upload).
@@ -398,5 +401,67 @@ describe('useFileUpload — workspace switch / unmount guard', () => {
     // a cache refresh for that workspace, no state written anywhere.
     expect(mockUpload).toHaveBeenCalledTimes(1);
     expect(onRefreshFiles).toHaveBeenCalledTimes(1);
+  });
+
+  it('holds stale-build reload across an entire multi-file upload batch, then reloads on the next switch', async () => {
+    runAuthResets();
+    __resetStaleBuildForTests();
+    sessionStorage.clear();
+    document.head.querySelectorAll('script[type="module"]').forEach((n) => n.remove());
+    const script = document.createElement('script');
+    script.type = 'module';
+    script.src = `${window.location.origin}/assets/index-CURRENT.js`;
+    document.head.appendChild(script);
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true,
+      headers: new Headers({ 'content-type': 'application/json' }),
+      json: async () => ({ build: 'index-NEWER.js' }),
+    }));
+    await checkForNewBuild();
+    const reloadedAway = () => sessionStorage.getItem('__la_switch_reload__');
+
+    const releases: Array<() => void> = [];
+    mockUpload.mockImplementation(() => new Promise<{ path: string }>((resolve) => {
+      releases.push(() => resolve({ path: 'uploaded' }));
+    }));
+    const onRefreshFiles = vi.fn();
+    const { result } = renderUploadHook({ ws: 'ws-A', refresh: onRefreshFiles });
+
+    // Start a 2-file batch -> file 1 in flight, file 2 queued
+    act(() => {
+      result.current.handleDrop(dropEvent([
+        makeFile('batch-1.txt'),
+        makeFile('batch-2.txt'),
+      ]) as React.DragEvent);
+    });
+    expect(reloadHeld()).toBe(true);
+    reloadIfStale();
+    expect(reloadedAway()).toBeNull();
+
+    // File 1 finishes -> file 2 starts; hold must NOT drop between files in the batch
+    await act(async () => {
+      releases[0]();
+      await settle();
+    });
+    expect(mockUpload).toHaveBeenCalledTimes(2);
+    expect(reloadHeld()).toBe(true);
+    reloadIfStale();
+    expect(reloadedAway()).toBeNull();
+
+    // File 2 finishes -> entire batch done, hold released; next section switch reloads
+    await act(async () => {
+      releases[1]();
+      await settle();
+    });
+    expect(reloadHeld()).toBe(false);
+    expect(reloadedAway()).toBeNull();
+
+    reloadIfStale();
+    expect(reloadedAway()).toBe('index-CURRENT.js');
+
+    vi.unstubAllGlobals();
+    runAuthResets();
+    __resetStaleBuildForTests();
+    sessionStorage.clear();
   });
 });

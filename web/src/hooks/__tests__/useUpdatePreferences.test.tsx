@@ -15,12 +15,14 @@ import { modelPrefs } from '@/lib/modelPreferences';
 
 vi.mock('@/pages/Dashboard/utils/api', () => ({
   updatePreferences: vi.fn(),
+  clearPreferences: vi.fn(),
 }));
 
-import { updatePreferences } from '@/pages/Dashboard/utils/api';
-import { useUpdatePreferences } from '../useUpdatePreferences';
+import { clearPreferences, updatePreferences } from '@/pages/Dashboard/utils/api';
+import { useClearPreferences, useUpdatePreferences } from '../useUpdatePreferences';
 
 const mockUpdate = updatePreferences as unknown as ReturnType<typeof vi.fn>;
+const mockClear = clearPreferences as unknown as ReturnType<typeof vi.fn>;
 
 /** A write that never answers, so what is asserted is the prediction alone. */
 function inFlight() {
@@ -155,5 +157,39 @@ describe('useUpdatePreferences moved threads', () => {
         .catch(() => {});
     });
     expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.threads.all });
+  });
+});
+
+describe('useClearPreferences', () => {
+  beforeEach(() => {
+    mockUpdate.mockReset();
+    mockClear.mockReset();
+  });
+
+  it('deletes the row only once a write issued before it has landed', async () => {
+    // Sent past the write, the delete could reach the server first, and the
+    // write would then insert a fresh row holding its keys.
+    let land!: (row: unknown) => void;
+    mockUpdate.mockImplementation(() => new Promise((resolve) => { land = resolve; }));
+    mockClear.mockResolvedValue({ success: true });
+    const queryClient = seeded({ other_preference: {} });
+    const { result } = renderHookWithProviders(
+      () => ({ update: useUpdatePreferences(), clear: useClearPreferences() }),
+      { queryClient },
+    );
+
+    let cleared!: Promise<unknown>;
+    await act(async () => {
+      result.current.update.mutate({ other_preference: { theme: 'dark' } });
+      cleared = result.current.clear.mutateAsync();
+    });
+    expect(mockUpdate).toHaveBeenCalledTimes(1);
+    expect(mockClear).not.toHaveBeenCalled();
+
+    await act(async () => {
+      land({});
+      await cleared;
+    });
+    expect(mockClear).toHaveBeenCalledTimes(1);
   });
 });

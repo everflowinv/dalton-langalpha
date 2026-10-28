@@ -5,6 +5,7 @@ import type { editor } from 'monaco-editor';
 import { useTranslation } from 'react-i18next';
 import { toast } from '@/components/ui/use-toast';
 import { useLatestRef } from '@/hooks/useLatestRef';
+import { holdReload } from '@/lib/reloadHolds';
 import { disposeEditorModel, newEditorModelPath } from '../viewers/editorModels';
 import type { AskConfirm } from './usePanelConfirm';
 
@@ -201,6 +202,9 @@ export function useFileEdit({ tabId, workspaceId, selectedFile, setFileContent, 
     const seq = ++saveSeqRef.current;
     setSavingFile(file);
     setSaveError(null);
+    // A confirmed save finishes after the panel is gone, so the stale-build
+    // reload a section switch takes waits for it.
+    const release = holdReload();
     try {
       await writeFileFn(workspaceId, file, content);
       // Another file opened while the write was in flight, the same guard the
@@ -243,6 +247,7 @@ export function useFileEdit({ tabId, workspaceId, selectedFile, setFileContent, 
       }
       setSaveError(e?.response?.data?.detail || e?.message || t('filePanel.saveFailed'));
     } finally {
+      release();
       // A save that is no longer the current one must not report the panel idle:
       // it would re-enable Save under a newer write and let an older body land last.
       if (seq === saveSeqRef.current) setSavingFile(null);

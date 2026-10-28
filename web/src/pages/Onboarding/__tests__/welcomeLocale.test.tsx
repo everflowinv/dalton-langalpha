@@ -70,7 +70,7 @@ const answered: InvestingProfile = {
   approaches: ['fundamental'],
   styles: ['growth'],
   depth: 'thorough',
-  deliverable: 'report',
+  deliverable: 'markdown',
   proactivity: 'when_needed',
 };
 
@@ -222,7 +222,7 @@ describe('the welcome flow in another language', () => {
     expect(screen.getByRole('heading', { name: zh('onboarding.welcome.agent.proactivityTitle') })).toBeInTheDocument();
     expect(picked('onboarding.welcome.agent.depth.thorough.title')).toBeChecked();
     expect(picked('onboarding.welcome.agent.depth.light.title')).not.toBeChecked();
-    expect(picked('onboarding.welcome.agent.deliverable.report.title')).toBeChecked();
+    expect(picked('onboarding.welcome.agent.deliverable.markdown.title')).toBeChecked();
     expect(picked('onboarding.welcome.agent.proactivity.when_needed.title')).toBeChecked();
     // The last question's way on is the start, in the new language too.
     expect(screen.getByTestId('welcome-continue')).toHaveTextContent(zh('onboarding.welcome.start.submit'));

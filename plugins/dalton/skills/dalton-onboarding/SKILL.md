@@ -48,7 +48,7 @@ Hold their answers in context for Step 5 (still no writes).
 Ask one final question about how they want research and answers delivered (via `AskUserQuestion` or a brief conversational question):
 
 - **Research depth** — Quick takeaways (`light`), matched to the question (`adaptive`), or deep-dive with full citations and tables (`thorough`)?
-- **Deliverable & proactivity** — Prose-first (`text`) or charts and tables (`visual`), Markdown (`markdown`) or HTML (`html`), and whether you should proactively suggest follow-ups (`proactive`, `when_needed`, or `on_request`)?
+- **Output format & proactivity** — Ranked order of answer formats (`output_format`, most preferred first: `"visual"` for charts and HTML reports, `"markdown"` for summary with a Markdown file, `"text"` for text in the chat), and whether you should proactively suggest follow-ups (`proactive`, `when_needed`, or `on_request`)?
 
 Hold their answers in context for Step 5 (still no writes).
 
@@ -158,9 +158,8 @@ Only the keys the user actually answered. This interview asks about risk, holdin
   },
   "agent_preference": {
     "research_depth": "thorough",
-    "deliverable": "visual",
-    "proactivity": "when_needed",
-    "output_format": "markdown"
+    "output_format": ["markdown", "visual", "text"],
+    "proactivity": "when_needed"
   }
 }
 ```
@@ -184,9 +183,8 @@ Allowed vocabulary values for structured keys (additional free-form keys like `r
   - `sectors` (array, up to 20): lowercase slugs matching `[a-z0-9]+(?:[_-][a-z0-9]+)*` (e.g., `"technology"`, `"healthcare"`, `"financials"`, `"energy"`, `"consumer"`, `"industrials"`, `"real_estate"`, `"utilities"`, `"materials"`, `"communication"`, `"semiconductors"`, `"clean_energy"`, `"biotech"`)
 - **`agent_preference`**:
   - `research_depth`: `"light"` | `"adaptive"` | `"thorough"`
-  - `deliverable`: `"text"` | `"visual"`
+  - `output_format` (ranked array, most preferred first): `"visual"` | `"markdown"` | `"text"`
   - `proactivity`: `"proactive"` | `"when_needed"` | `"on_request"`
-  - `output_format`: `"markdown"` | `"html"`
 
 ---
 

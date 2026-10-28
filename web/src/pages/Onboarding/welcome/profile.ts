@@ -1,5 +1,6 @@
 import type { TFunction } from 'i18next';
 import * as z from 'zod/mini';
+import { rankingFrom, readOutputFormats, type OutputFormat } from '@/lib/outputFormat';
 import type { WelcomeStepId } from './paths';
 
 /**
@@ -93,11 +94,11 @@ export type BrokerageKey = (typeof BROKERAGES)[number];
 export const RESEARCH_DEPTHS = ['light', 'adaptive', 'thorough'] as const;
 export type ResearchDepth = (typeof RESEARCH_DEPTHS)[number];
 
-/** What an answer usually is. `report` is the styled HTML report that
- *  Settings' output format turns on, and is saved as that setting rather
- *  than here, so the two cannot disagree. */
-export const DELIVERABLES = ['text', 'visual', 'report'] as const;
-export type Deliverable = (typeof DELIVERABLES)[number];
+/** What an answer usually is, as the question offers it, from the quickest
+ *  to the richest. The answer is the first of the ranking Settings' output
+ *  format keeps, so the two cannot disagree. */
+export const DELIVERABLES = ['text', 'markdown', 'visual'] as const satisfies readonly OutputFormat[];
+export type Deliverable = OutputFormat;
 
 /** When the agent may come to the user unasked. */
 export const PROACTIVITY = ['proactive', 'when_needed', 'on_request'] as const;
@@ -304,14 +305,13 @@ export const PROFILE_FIELDS: { [K in ProfileKey]: Field<InvestingProfile[K]> } =
     read: oneOf(RESEARCH_DEPTHS),
     label: (t, v) => t(`onboarding.welcome.agent.depth.${v}.title`),
   },
-  // A report is `output_format` beside these, which is a setting of its own
-  // (Settings' output format), so it is never read from `deliverable` (see
-  // readProfile and profileRow).
+  // The first of the `output_format` ranking, which Settings orders whole
+  // (see readProfile and profileRow).
   deliverable: {
     section: 'agent_preference',
-    key: 'deliverable',
+    key: 'output_format',
     step: 'agent',
-    read: oneOf(['text', 'visual'] as const),
+    read: { parse: (value) => readOutputFormats({ output_format: value })?.[0] ?? null },
     label: (t, v) => t(`onboarding.welcome.agent.deliverable.${v}.title`),
   },
   proactivity: {
@@ -348,10 +348,9 @@ export function readProfile(preferences: unknown): InvestingProfile {
     const { section, key: stored, read } = PROFILE_FIELDS[key];
     return read.parse(asObject(row[section])[stored]);
   });
-  // The output format set to HTML is a report whatever else was saved:
-  // Settings switches it alone, so a deliverable beside it is the older
-  // answer.
-  if (asObject(row.agent_preference).output_format === 'html') profile.deliverable = 'report';
+  // Read off the whole section, so a row from before the ranking (a draft, a
+  // cached read) answers as the server's migration reads it.
+  profile.deliverable = readOutputFormats(row.agent_preference)?.[0] ?? null;
   return profile;
 }
 
@@ -369,10 +368,11 @@ export function profileRow(profile: InvestingProfile): ProfileRow {
     const { section, key: stored } = PROFILE_FIELDS[key];
     row[section][stored] = profile[key];
   }
-  // A report is the output format's, with no deliverable beside it. Null
-  // takes the setting back to the default, as Settings does.
-  row.agent_preference.deliverable = profile.deliverable === 'report' ? null : profile.deliverable;
-  row.agent_preference.output_format = profile.deliverable === 'report' ? 'html' : null;
+  // The answer leads the ranking, the rest after it as the server orders
+  // them; null leaves it to the agent, as Settings does. An unchanged answer
+  // writes nothing, so an order set in Settings survives a pass through the
+  // questions.
+  row.agent_preference.output_format = profile.deliverable ? rankingFrom(profile.deliverable) : null;
   return row;
 }
 

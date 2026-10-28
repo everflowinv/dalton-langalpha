@@ -41,7 +41,6 @@ files can never produce a false-dirty loop.
 
 from __future__ import annotations
 
-import base64
 import json
 import posixpath
 import secrets
@@ -50,6 +49,7 @@ import textwrap
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 
+import anyio
 import structlog
 
 from ptc_agent.agent.middleware.skills.lock import (
@@ -59,6 +59,7 @@ from ptc_agent.agent.middleware.skills.lock import (
 
 from ..paths import SandboxLayout
 from .retry import RetryPolicy
+from .tree_upload import upload_tree
 
 if TYPE_CHECKING:
     from .ptc_sandbox import PTCSandbox
@@ -69,6 +70,7 @@ logger = structlog.get_logger(__name__)
 # Generous on purpose: a dir younger than this may belong to an in-flight
 # push from another worker.
 ORPHAN_TTL_SECONDS = 3600
+_CLEANUP_TIMEOUT_SECONDS = 5
 
 
 class SkillSyncError(Exception):
@@ -98,13 +100,10 @@ def shared_link_target(base: str, user_base: str) -> str:
     return posixpath.relpath(user_base.rstrip("/"), base.rstrip("/"))
 
 
-# The script source is a plain string (no f-string) — arguments travel as a
-# base64 JSON blob, and the whole script is itself base64-wrapped into the
-# exec command line, which sidesteps shell quoting entirely.
 _SCRIPT = textwrap.dedent(r'''
-import base64, errno, fcntl, hashlib, json, os, re, shutil, stat, sys, time
+import errno, fcntl, hashlib, json, os, re, shutil, stat, sys, time
 
-ARGS = json.loads(base64.b64decode("__ARGS_B64__").decode())
+ARGS = json.loads(__ARGS_JSON__)
 BASE = ARGS["base"]
 MODE = ARGS["mode"]
 LOCK_VERSION = ARGS["lockVersion"]
@@ -358,6 +357,19 @@ def replace_live(live, staged, trash):
 
 def gc_orphans():
     now = time.time()
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    for name in os.listdir(script_dir):
+        if not (
+            (name.startswith(".skill-sync-") and name.endswith(".py"))
+            or (name.startswith(".tree-upload-") and name.endswith(".tar.gz"))
+        ):
+            continue
+        p = os.path.join(script_dir, name)
+        try:
+            if now - os.lstat(p).st_mtime > ORPHAN_TTL:
+                os.unlink(p)
+        except OSError:
+            pass
     if os.path.isdir(STAGING):
         for entry in os.listdir(STAGING):
             p = os.path.join(STAGING, entry)
@@ -838,32 +850,43 @@ else:
 ''')
 
 
-def _build_command(args: dict[str, Any]) -> str:
+def _build_script(args: dict[str, Any]) -> bytes:
     args = {
         "lockVersion": LOCK_FILE_VERSION,
         "managedSourceType": MANAGED_SOURCE_TYPE,
         "orphanTtl": ORPHAN_TTL_SECONDS,
         **args,
     }
-    args_b64 = base64.b64encode(json.dumps(args).encode()).decode()
-    script_b64 = base64.b64encode(
-        _SCRIPT.replace("__ARGS_B64__", args_b64).encode()
-    ).decode()
-    return (
-        'python3 -I -c "import base64;'
-        f"exec(base64.b64decode('{script_b64}').decode())\""
-    )
+    return _SCRIPT.replace("__ARGS_JSON__", repr(json.dumps(args))).encode()
 
 
 async def _run(
     sandbox: "PTCSandbox", args: dict[str, Any], *, retry_policy: RetryPolicy
 ) -> dict[str, Any]:
     assert sandbox.runtime is not None
-    result = await sandbox._runtime_call(
-        sandbox.runtime.exec,
-        _build_command(args),
-        retry_policy=retry_policy,
-    )
+    script = f"{SandboxLayout(sandbox._work_dir).internal}/.skill-sync-{secrets.token_hex(8)}.py"
+    try:
+        await sandbox._runtime_call(
+            sandbox.runtime.upload_file,
+            _build_script(args),
+            script,
+            retry_policy=RetryPolicy.SAFE,
+        )
+        result = await sandbox._runtime_call(
+            sandbox.runtime.exec,
+            f"python3 -I {shlex.quote(script)}",
+            retry_policy=retry_policy,
+        )
+    finally:
+        with anyio.move_on_after(_CLEANUP_TIMEOUT_SECONDS, shield=True):
+            try:
+                await sandbox._runtime_call(
+                    sandbox.runtime.exec,
+                    f"rm -f {shlex.quote(script)}",
+                    retry_policy=RetryPolicy.SAFE,
+                )
+            except Exception:
+                logger.debug("Could not remove skill-sync script", path=script)
     stdout = (getattr(result, "stdout", "") or "").strip()
     try:
         payload = json.loads(stdout.splitlines()[-1]) if stdout else {}
@@ -1062,18 +1085,9 @@ async def stage_skill_files(
     subdirs = {
         f"{staged}/{'/'.join(rel.split('/')[:-1])}" for rel, _ in files if "/" in rel
     }
-    # Archive member paths reach this command line, so quote rather than
-    # single-quote-wrap: a member named ``a'/$(id)/b`` would otherwise close
-    # the quote and run in the sandbox shell.
-    mkdir_cmd = "mkdir -p " + " ".join(
-        shlex.quote(d) for d in sorted({staged, *subdirs})
-    )
-    await sandbox._runtime_call(
-        sandbox.runtime.exec, mkdir_cmd, retry_policy=RetryPolicy.SAFE
-    )
-    await sandbox._runtime_call(
-        sandbox.runtime.upload_files,
+    await upload_tree(
+        sandbox,
         [(content, f"{staged}/{rel}") for rel, content in files],
-        retry_policy=RetryPolicy.SAFE,
+        dirs=sorted({staged, *subdirs}),
     )
     return staged

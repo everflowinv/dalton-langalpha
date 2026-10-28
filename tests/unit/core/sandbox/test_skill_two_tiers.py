@@ -5,7 +5,7 @@ workspace tier owns its own skills as real directories and reaches the shared
 ones through relative symlinks, so a skill's ``.agents/skills/<name>/...``
 cross-reference resolves the same from either cwd. The script that maintains
 that view is run here for real: the command the host builds is executed by a
-subprocess against temp dirs, so the base64 envelope, the flock paths and the
+subprocess against temp dirs, so the uploaded script, the flock paths and the
 JSON contract are all under test, not just the link logic.
 """
 
@@ -18,6 +18,7 @@ import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
+import anyio
 import pytest
 
 from ptc_agent.agent.middleware.skills.lock import (
@@ -26,6 +27,9 @@ from ptc_agent.agent.middleware.skills.lock import (
 )
 from ptc_agent.core.paths import SandboxLayout
 from ptc_agent.core.sandbox import skill_sync
+from ptc_agent.core.sandbox.retry import async_retry_with_backoff
+from ptc_agent.core.sandbox.runtime import SandboxTransientError
+from ptc_agent.core.sandbox.tree_upload import TreeUploadError
 from tests.unit.restored_overlay import archive, python3_on_path
 
 ROOT = "/home/workspace"
@@ -39,6 +43,11 @@ class _ShellRuntime:
 
     def __init__(self) -> None:
         self.commands: list[str] = []
+
+    async def upload_file(self, content: bytes, dest_path: str):
+        path = Path(dest_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
 
     async def exec(self, command: str, *args, **kwargs):
         self.commands.append(command)
@@ -54,6 +63,7 @@ class _FakeSandbox:
     def __init__(self, working_dir: str) -> None:
         self.working_dir = working_dir
         self._work_dir = working_dir
+        self.layout = SandboxLayout(working_dir)
         self.runtime = _ShellRuntime()
 
     async def _runtime_call(self, fn, *args, retry_policy=None, **kwargs):
@@ -644,3 +654,231 @@ class TestPerTierLocks:
         names = set(os.listdir(tiers.ws))
         assert names == {"pdf", ".skills-sync.flock"}
         assert not (tiers.ws / ".skills-sync.flock").is_symlink()
+
+
+class TestScriptTransport:
+    @pytest.mark.parametrize("count", [150, 3200])
+    @pytest.mark.parametrize("mode", ["install", "apply"])
+    def test_payloads_beyond_argv_limits_round_trip(self, tiers, count, mode):
+        entries = {
+            f"skill-{i:04}": {
+                **_ENTRY, "description": "x" * 1000 + "\n'\"\\雪$(false)"
+            }
+            for i in range(count)
+        }
+        if mode == "install":
+            merged, skipped = _merge(tiers, entries)
+            assert merged["skills"] == entries
+            assert skipped == []
+        else:
+            results = asyncio.run(
+                skill_sync.apply_actions(
+                    tiers.sandbox,
+                    [
+                        {"op": "set_entry", "name": name, "entry": entry}
+                        for name, entry in entries.items()
+                    ],
+                )
+            )
+            assert results == [
+                {"op": "set_entry", "name": name, "ok": True} for name in entries
+            ]
+        lock = json.loads((tiers.user / "skills-lock.json").read_text())
+        assert lock["skills"] == entries
+        assert max(len(c.encode()) for c in tiers.sandbox.runtime.commands) < 4096
+        assert not list(Path(tiers.sandbox.layout.internal).glob(".skill-sync-*"))
+
+    def test_many_long_staging_paths_use_an_archive(self, tmp_path):
+        sandbox = _FakeSandbox(str(tmp_path / "root with 'quotes'"))
+        deep = "/".join(["a" * 70] * 30)
+        files = [(f"dir-{i}/{deep}/file.txt", f"file-{i}".encode()) for i in range(64)]
+
+        staged = Path(asyncio.run(skill_sync.stage_skill_files(sandbox, files)))
+
+        for rel, content in files:
+            assert (staged / rel).read_bytes() == content
+        assert asyncio.run(skill_sync.report(sandbox)) == {}
+        assert max(len(c.encode()) for c in sandbox.runtime.commands) < 4096
+        assert not list(Path(sandbox.layout.internal).glob(".tree-upload-*"))
+
+    @pytest.mark.parametrize("mode", ["install", "apply"])
+    def test_script_survives_safe_retries_without_retrying_unsafe_actions(
+        self, tiers, monkeypatch, mode
+    ):
+        sandbox = tiers.sandbox
+        original = sandbox.runtime.exec
+        attempts = 0
+
+        async def lost_reply(command, *args, **kwargs):
+            nonlocal attempts
+            result = await original(command, *args, **kwargs)
+            if command.startswith("python3 -I "):
+                attempts += 1
+                if attempts == 1:
+                    raise SandboxTransientError("reply lost")
+            return result
+
+        async def retry(fn, *args, retry_policy=None, **kwargs):
+            return await async_retry_with_backoff(
+                fn,
+                *args,
+                retry_policy=retry_policy,
+                is_transient=lambda e: isinstance(e, SandboxTransientError),
+                initial_delay_s=0.001,
+                **kwargs,
+            )
+
+        monkeypatch.setattr(sandbox.runtime, "exec", lost_reply)
+        monkeypatch.setattr(sandbox, "_runtime_call", retry)
+        if mode == "install":
+            assert _merge(tiers, {"pdf": _ENTRY})[0]["skills"] == {"pdf": _ENTRY}
+            assert attempts == 2
+        else:
+            with pytest.raises(SandboxTransientError, match="not retrying automatically"):
+                asyncio.run(
+                    skill_sync.apply_actions(
+                        sandbox, [{"op": "set_entry", "name": "pdf", "entry": _ENTRY}]
+                    )
+                )
+            assert attempts == 1
+        assert not list(Path(sandbox.layout.internal).glob(".skill-sync-*"))
+
+    @pytest.mark.parametrize("phase", ["upload", "exec", "parse", "cancel"])
+    def test_failed_calls_remove_the_uploaded_script(self, tiers, monkeypatch, phase):
+        runtime = tiers.sandbox.runtime
+        upload = runtime.upload_file
+        execute = runtime.exec
+
+        async def fail_upload(content, path):
+            await upload(content, path)
+            raise RuntimeError("upload failed")
+
+        async def fail_exec(command, *args, **kwargs):
+            if not command.startswith("python3 -I "):
+                return await execute(command, *args, **kwargs)
+            if phase == "parse":
+                return SimpleNamespace(stdout="not JSON", exit_code=1)
+            if phase == "cancel":
+                raise asyncio.CancelledError()
+            raise RuntimeError("exec failed")
+
+        monkeypatch.setattr(
+            runtime, "upload_file", fail_upload if phase == "upload" else upload
+        )
+        monkeypatch.setattr(runtime, "exec", fail_exec)
+        expected = {
+            "upload": RuntimeError,
+            "exec": RuntimeError,
+            "parse": skill_sync.SkillSyncError,
+            "cancel": asyncio.CancelledError,
+        }[phase]
+        with pytest.raises(expected):
+            asyncio.run(skill_sync.report(tiers.sandbox))
+        assert not list(Path(tiers.sandbox.layout.internal).glob(".skill-sync-*"))
+
+    def test_concurrent_calls_have_separate_scripts(self, tiers, monkeypatch):
+        runtime = tiers.sandbox.runtime
+        upload = runtime.upload_file
+        paths = []
+
+        async def interleave(content, path):
+            paths.append(path)
+            await upload(content, path)
+            await asyncio.sleep(0)
+
+        async def reports():
+            return await asyncio.gather(
+                skill_sync.report(tiers.sandbox, base=tiers.user_base),
+                skill_sync.report(tiers.sandbox, base=tiers.ws_base),
+            )
+
+        monkeypatch.setattr(runtime, "upload_file", interleave)
+        assert asyncio.run(reports()) == [{}, {}]
+        assert len(set(paths)) == 2
+        assert all(not Path(path).exists() for path in paths)
+
+    def test_cleanup_outlasts_an_anyio_cancel_scope(self, tiers, monkeypatch):
+        runtime = tiers.sandbox.runtime
+        execute = runtime.exec
+
+        async def cancelled_call():
+            with anyio.CancelScope() as scope:
+                async def cancel_exec(command, *args, **kwargs):
+                    if command.startswith("python3 -I "):
+                        scope.cancel()
+                    await anyio.lowlevel.checkpoint()
+                    return await execute(command, *args, **kwargs)
+
+                monkeypatch.setattr(runtime, "exec", cancel_exec)
+                await skill_sync.report(tiers.sandbox)
+
+        asyncio.run(cancelled_call())
+        assert not list(Path(tiers.sandbox.layout.internal).glob(".skill-sync-*"))
+
+    @pytest.mark.parametrize("outcome", ["ok", "error", "cancel"])
+    def test_stalled_cleanup_preserves_the_sync_outcome(self, tiers, monkeypatch, outcome):
+        runtime = tiers.sandbox.runtime
+        execute = runtime.exec
+
+        async def stall_cleanup(command, *args, **kwargs):
+            if command.startswith("rm -f "):
+                await anyio.sleep_forever()
+            if outcome == "error":
+                raise RuntimeError("sync failed")
+            if outcome == "cancel":
+                raise asyncio.CancelledError()
+            return await execute(command, *args, **kwargs)
+
+        async def bounded_call():
+            return await asyncio.wait_for(skill_sync.report(tiers.sandbox), timeout=1)
+
+        monkeypatch.setattr(skill_sync, "_CLEANUP_TIMEOUT_SECONDS", 0.01)
+        monkeypatch.setattr(runtime, "exec", stall_cleanup)
+        if outcome == "ok":
+            assert asyncio.run(bounded_call()) == {}
+        else:
+            error = RuntimeError if outcome == "error" else asyncio.CancelledError
+            with pytest.raises(error):
+                asyncio.run(bounded_call())
+
+        (orphan,) = Path(tiers.sandbox.layout.internal).glob(".skill-sync-*")
+        os.utime(orphan, (0, 0))
+        monkeypatch.setattr(runtime, "exec", execute)
+        assert asyncio.run(skill_sync.report(tiers.sandbox)) == {}
+        assert not orphan.exists()
+
+    @pytest.mark.parametrize("name", [".skill-sync-stale.py", ".tree-upload-stale.tar.gz"])
+    def test_report_sweeps_only_abandoned_sync_uploads(self, tiers, name):
+        internal = Path(tiers.sandbox.layout.internal)
+        internal.mkdir(parents=True)
+        old = internal / name
+        recent = internal / name.replace("stale", "running")
+        unrelated = internal / "keep.py"
+        for path in (old, recent, unrelated):
+            path.write_text("not ours to execute")
+        for path in (old, unrelated):
+            os.utime(path, (0, 0))
+
+        asyncio.run(skill_sync.report(tiers.sandbox))
+
+        assert not old.exists()
+        assert recent.exists()
+        assert unrelated.exists()
+
+    def test_lost_unpack_reply_defers_the_stage_until_the_next_pass(self, tiers, monkeypatch):
+        sandbox = tiers.sandbox
+        call = sandbox._runtime_call
+
+        async def replay_unpack(fn, *args, retry_policy=None, **kwargs):
+            result = await call(fn, *args, retry_policy=retry_policy, **kwargs)
+            if fn == sandbox.runtime.exec and args[0].startswith("[ -f "):
+                return await call(fn, *args, retry_policy=retry_policy, **kwargs)
+            return result
+
+        monkeypatch.setattr(sandbox, "_runtime_call", replay_unpack)
+        with pytest.raises(TreeUploadError, match="exit 97"):
+            asyncio.run(skill_sync.stage_skill_files(sandbox, [("SKILL.md", b"new")]))
+        assert not (tiers.user / "skills-lock.json").exists()
+        monkeypatch.setattr(sandbox, "_runtime_call", call)
+        staged = asyncio.run(skill_sync.stage_skill_files(sandbox, [("SKILL.md", b"new")]))
+        assert (Path(staged) / "SKILL.md").read_bytes() == b"new"

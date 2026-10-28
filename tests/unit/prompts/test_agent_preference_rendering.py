@@ -1,6 +1,6 @@
 """How the structured agent preferences reach the prompt.
 
-``research_depth``, ``deliverable`` and ``proactivity`` each select guidance
+``research_depth``, ``output_format`` and ``proactivity`` each select guidance
 in ``components/user_profile.md.j2`` instead of printing as a ``- **key**:``
 line, and only in the main agent's copy: a subagent hands its result back to
 the main agent, which decides how it reaches the user. The free-form keys
@@ -24,9 +24,7 @@ from src.server.models.profile_vocabulary import (
 )
 
 LEAD = "You MUST follow these user preferences when responding:"
-HTML_BLOCK_MARKER = "### Output Format: Styled HTML"
-TEXT = "The user's usual answer is text in the chat"
-VISUAL = "The user wants answers they can explore"
+RANKED = "Fit how you hand back an answer to the work behind it."
 
 
 def _render(agent_preference, main_agent_steering=True, **kwargs):
@@ -70,8 +68,8 @@ class TestEachValueSelectsGuidance:
                 "thorough",
                 "By default the user wants research before every answer",
             ),
-            ("deliverable", "text", TEXT),
-            ("deliverable", "visual", VISUAL),
+            ("output_format", ["text"], RANKED),
+            ("output_format", ["visual", "markdown"], RANKED),
             (
                 "proactivity",
                 "proactive",
@@ -114,17 +112,6 @@ class TestEachValueSelectsGuidance:
             in section
         )
 
-    def test_a_visual_answer_keeps_quick_answers_as_text(self):
-        section = _section(_render({"deliverable": "visual"}))
-        assert "interactive chart or dashboard inline with `ShowWidget`" in section
-        assert "A quick answer stays text in the chat." in section
-
-    def test_a_visual_answer_defers_to_the_surface(self):
-        """A chat app states its own rules for what a reply may carry, and
-        one may not show widgets."""
-        section = _section(_render({"deliverable": "visual"}))
-        assert "where this turn's surface shows widgets" in section
-
     @pytest.mark.parametrize("value", ["proactive", "when_needed"])
     def test_an_offer_is_made_once_and_not_for_what_exists(self, value):
         section = _section(_render({"proactivity": value}))
@@ -132,58 +119,55 @@ class TestEachValueSelectsGuidance:
         assert "Offer each one once, not on every answer" in section
 
     def test_every_skill_it_points_at_ships(self):
-        section = _section(_render({"deliverable": "visual"}))
+        section = _section(_render({"output_format": ["visual"]}))
         named = set(re.findall(r"\.agents/(skills/[\w-]+/SKILL\.md)", section))
-        assert named == {"skills/inline-widget/SKILL.md"}
+        assert named == {
+            "skills/inline-widget/SKILL.md",
+            "skills/html-report/SKILL.md",
+            "skills/ui-design/SKILL.md",
+        }
         assert named <= {skill.skill_md_path for skill in SKILL_REGISTRY.values()}
 
     def test_the_template_knows_every_value_the_server_accepts(self):
         """The vocabulary is code and the guidance is template text. A value
         added to one and not the other would print as a raw key, so the two
-        are pinned together. ``output_format: "markdown"`` is the one value
-        that selects nothing: it is the default, written so Settings can name
-        it, and alone it renders no section."""
+        are pinned together. A ranked key renders each value ranked alone."""
         for key, vocab in STRUCTURED_PREFERENCES["agent_preference"].items():
-            assert not vocab.many, key
             for choice in vocab.choices:
-                section = _section(_render({key: choice}))
+                section = _section(_render({key: [choice] if vocab.many else choice}))
                 assert f"- **{key}**:" not in section, f"{key}={choice}"
-                if (key, choice) == ("output_format", "markdown"):
-                    assert section == "", f"{key}={choice}"
-                    continue
                 assert section, f"{key}={choice}"
 
-    def test_a_report_is_output_format_not_a_deliverable(self):
-        assert (
-            "report"
-            not in STRUCTURED_PREFERENCES["agent_preference"]["deliverable"].choices
-        )
+    def test_a_report_is_the_visual_answer_not_a_rank_of_its_own(self):
+        """The agent picks between a widget and a report by the answer, so a
+        ranking cannot put one above the other."""
+        vocab = STRUCTURED_PREFERENCES["agent_preference"]
+        assert "html" not in vocab["output_format"].choices
+        assert "deliverable" not in vocab
 
     @pytest.mark.parametrize("role", ["analyst", "chief_of_staff"])
-    @pytest.mark.parametrize("output_format", [None, "html"])
+    @pytest.mark.parametrize("output_format", [None, ["visual", "markdown", "text"], ["text"]])
     def test_every_combination_keeps_its_paragraphs_apart(self, role, output_format):
         """Each paragraph and heading stands on its own, whatever renders
         before or after it: an inline tag at a line's end would swallow its
         newline and run the next paragraph into it."""
         vocab = STRUCTURED_PREFERENCES["agent_preference"]
         for depth in (None, *vocab["research_depth"].choices):
-            for deliverable in (None, *vocab["deliverable"].choices):
-                for proactivity in (None, *vocab["proactivity"].choices):
-                    prefs = {
-                        "tone": "terse",
-                        "research_depth": depth,
-                        "deliverable": deliverable,
-                        "proactivity": proactivity,
-                        "output_format": output_format,
-                    }
-                    lines = _section(_render(prefs, role=role)).splitlines()
-                    for before, line in zip(lines, lines[1:]):
-                        if line.startswith(
-                            ("By default", "The user", "###", "You MUST")
-                        ):
-                            assert before == "", (
-                                f"{prefs}: {line[:40]!r} follows {before[:40]!r}"
-                            )
+            for proactivity in (None, *vocab["proactivity"].choices):
+                prefs = {
+                    "tone": "terse",
+                    "research_depth": depth,
+                    "proactivity": proactivity,
+                    "output_format": output_format,
+                }
+                lines = _section(_render(prefs, role=role)).splitlines()
+                for before, line in zip(lines, lines[1:]):
+                    if line.startswith(
+                        ("By default", "The user", "Fit how", "Use the highest", "You MUST", "1. ")
+                    ):
+                        assert before == "", (
+                            f"{prefs}: {line[:40]!r} follows {before[:40]!r}"
+                        )
 
     def test_the_section_is_the_same_at_both_guidance_levels(self):
         """User steering: it renders in the baseline, which takes no fence."""
@@ -191,7 +175,7 @@ class TestEachValueSelectsGuidance:
             "name": "Demo",
             "agent_preference": {
                 "research_depth": "thorough",
-                "deliverable": "visual",
+                "output_format": ["visual"],
                 "proactivity": "proactive",
             },
         }
@@ -247,7 +231,7 @@ class TestMainAgentOnly:
         out = _render(
             {
                 "research_depth": "light",
-                "deliverable": "visual",
+                "output_format": ["visual"],
                 "proactivity": "proactive",
             },
             main_agent_steering=False,
@@ -257,14 +241,14 @@ class TestMainAgentOnly:
     def test_a_subagent_keeps_the_free_form_keys_alone(self):
         section = _section(
             _render(
-                {"research_depth": "thorough", "deliverable": "text", "tone": "terse"},
+                {"research_depth": "thorough", "output_format": ["text"], "tone": "terse"},
                 main_agent_steering=False,
             )
         )
         assert f"{LEAD}\n- **tone**: terse" in section
         assert "By default the user wants" not in section
-        assert TEXT not in section
-        assert "research_depth" not in section and "deliverable" not in section
+        assert RANKED not in section
+        assert "research_depth" not in section and "output_format" not in section
 
 
 class TestBesideOtherKeys:
@@ -279,53 +263,6 @@ class TestBesideOtherKeys:
         assert "- **include_charts**: False" in section
         assert "The user wants to hear from you only when they ask" in section
         assert "- **proactivity**:" not in section
-
-    @pytest.mark.parametrize("stale", ["text", "visual"])
-    def test_html_is_the_deliverable_whatever_deliverable_holds(self, stale):
-        """Settings' switch writes only ``output_format``, so the onboarding
-        answer it replaced stays in the row; the report wins, and the stale
-        value neither guides nor prints."""
-        section = _section(
-            _render(
-                {
-                    "deliverable": stale,
-                    "output_format": "html",
-                    "research_depth": "thorough",
-                }
-            )
-        )
-        assert HTML_BLOCK_MARKER in section
-        # Its own paragraph, not run into the depth guidance above it.
-        assert f"view.\n\n{HTML_BLOCK_MARKER}" in section
-        assert TEXT not in section and VISUAL not in section
-        assert "- **deliverable**:" not in section
-        assert "By default the user wants research before every answer" in section
-
-    def test_html_beside_only_a_stale_deliverable_is_the_html_section_alone(self):
-        section = _section(_render({"deliverable": "text", "output_format": "html"}))
-        assert section.strip().startswith(HTML_BLOCK_MARKER)
-
-    def test_html_without_a_deliverable_is_the_section_alone(self):
-        section = _section(_render({"output_format": "html"}))
-        assert HTML_BLOCK_MARKER in section
-        assert LEAD not in section
-
-    def test_markdown_leaves_the_deliverable_guiding(self):
-        section = _section(
-            _render({"deliverable": "visual", "output_format": "markdown"})
-        )
-        assert VISUAL in section
-        assert HTML_BLOCK_MARKER not in section
-
-    def test_markdown_alone_renders_no_section(self):
-        assert "## Agent Preferences" not in _render({"output_format": "markdown"})
-
-    def test_a_subagent_gets_neither_the_deliverable_nor_the_html_section(self):
-        out = _render(
-            {"deliverable": "visual", "output_format": "html"},
-            main_agent_steering=False,
-        )
-        assert "## Agent Preferences" not in out
 
 
 class TestValuesOutsideTheVocabulary:
@@ -362,7 +299,7 @@ class TestInvestmentProfile:
         row = {
             "agent_preference": {
                 "research_depth": "light",
-                "deliverable": "visual",
+                "output_format": ["visual"],
                 "proactivity": "proactive",
             },
         }

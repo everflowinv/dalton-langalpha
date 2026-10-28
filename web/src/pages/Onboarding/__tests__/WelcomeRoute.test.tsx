@@ -112,7 +112,7 @@ describe('Welcome route', () => {
     expect(await screen.findByTestId(LAST_QUESTION)).toBeInTheDocument();
     expect(screen.getByRole('radio', { name: /^Full research/ })).toBeChecked();
     // Kept in the draft as the output format, the way the server keeps it.
-    expect(screen.getByRole('radio', { name: /^Full reports/ })).toBeChecked();
+    expect(screen.getByRole('radio', { name: /^Summary with a file/ })).toBeChecked();
     expect(answer('style')).toHaveTextContent(/^Fundamental analysis · Growth$/);
     expect(primary()).toHaveTextContent('Start');
     expect(primary()).toBeEnabled();
@@ -168,7 +168,7 @@ describe('Welcome route', () => {
     fireEvent.click(primary());
     // The agent's answers are the server's too, shown and not written back.
     expect(screen.getByRole('radio', { name: /^Full research/ })).toBeChecked();
-    expect(screen.getByRole('radio', { name: /^Full reports/ })).toBeChecked();
+    expect(screen.getByRole('radio', { name: /^Summary with a file/ })).toBeChecked();
     fireEvent.click(primary());
 
     await waitFor(() => expect(location()).toBe('/chat/t/__default__'));

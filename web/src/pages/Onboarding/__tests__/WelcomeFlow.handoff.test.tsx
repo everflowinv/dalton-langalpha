@@ -78,7 +78,7 @@ describe('WelcomeFlow: starting the chat', () => {
     expect(turn('agent')).toContainElement(answer('agent'));
     // How much research, what an answer looks like and when to reach out, in
     // the card's own labels.
-    expect(answer('agent')).toHaveTextContent(/^Full research · Full reports · When it matters$/);
+    expect(answer('agent')).toHaveTextContent(/^Full research · Summary with a file · When it matters$/);
     expect(turn('agent')).toContainElement(screen.getByTestId('welcome-pending'));
     // The question before it keeps its own answer above.
     expect(answer('style')).toHaveTextContent(/^Fundamental analysis · Growth$/);

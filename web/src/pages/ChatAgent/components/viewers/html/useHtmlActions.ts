@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next';
 import { toast } from '@/components/ui/use-toast';
 import { useStableHandler } from '@/hooks/useStableHandler';
 import { desktop } from '@/lib/desktop';
+import { holdReload } from '@/lib/reloadHolds';
 import { pdfQuery } from './wsfilesUrl';
 import { saveWidgetPdf } from './widgetPdf';
 
@@ -121,6 +122,9 @@ export async function exportServedPdf({
   // Server renders take seconds — show a dismissible "generating" toast so the
   // wait isn't silent, and clear it once the request settles either way.
   const pending = toast({ description: generatingHint });
+  // A render outlasts the page that asked for it, so the stale-build reload a
+  // section switch takes waits until the file is handed to the browser.
+  const release = holdReload();
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), PDF_FETCH_TIMEOUT_MS);
   try {
@@ -142,6 +146,7 @@ export async function exportServedPdf({
     // Includes the AbortError from the timeout above — fall back to print.
     printFallback();
   } finally {
+    release();
     clearTimeout(timeout);
     pending.dismiss();
   }

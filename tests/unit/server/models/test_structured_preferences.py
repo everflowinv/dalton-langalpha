@@ -40,9 +40,8 @@ class TestStoredSpelling:
                 },
                 "agent_preference": {
                     "research_depth": "Light",
-                    "deliverable": " Visual ",
                     "proactivity": "When_Needed",
-                    "output_format": "HTML",
+                    "output_format": [" Visual ", "markdown", "visual"],
                 },
             },
             None,
@@ -66,9 +65,8 @@ class TestStoredSpelling:
             },
             "agent_preference": {
                 "research_depth": "light",
-                "deliverable": "visual",
                 "proactivity": "when_needed",
-                "output_format": "html",
+                "output_format": ["visual", "markdown"],
             },
         }
 
@@ -154,14 +152,10 @@ class TestOutsideTheVocabulary:
                 {"agent_preference": {"research_depth": "deep"}},
                 "agent_preference.research_depth",
             ),
-            # A report is ``output_format: "html"``, never a deliverable.
+            # A report is the visual answer's long form, never a rank of its own.
             (
-                {"agent_preference": {"deliverable": "report"}},
-                "agent_preference.deliverable",
-            ),
-            (
-                {"agent_preference": {"deliverable": ["text"]}},
-                "agent_preference.deliverable",
+                {"agent_preference": {"output_format": ["visual", "html"]}},
+                "agent_preference.output_format[1]",
             ),
             (
                 {"agent_preference": {"proactivity": "always"}},
@@ -192,7 +186,7 @@ class TestOutsideTheVocabulary:
                     "investor_type": "trader",
                     "brokerages": ["huatai"],
                 },
-                "agent_preference": {"deliverable": "report"},
+                "agent_preference": {"output_format": ["report"]},
             },
             None,
         )
@@ -204,8 +198,8 @@ class TestOutsideTheVocabulary:
             "'huatai' is not one of fidelity, "
         )
         assert (
-            messages["agent_preference.deliverable"]
-            == "'report' is not one of text, visual"
+            messages["agent_preference.output_format[0]"]
+            == "'report' is not one of visual, markdown, text"
         )
 
     def test_every_problem_in_every_column_is_named_in_order(self):
@@ -218,7 +212,7 @@ class TestOutsideTheVocabulary:
                     "approaches": ["macro", "sentiment"],
                     "horizon": 5,
                 },
-                "agent_preference": {"proactivity": "daily", "deliverable": "report"},
+                "agent_preference": {"proactivity": "daily", "output_format": ["report"]},
             },
             None,
         )
@@ -227,8 +221,8 @@ class TestOutsideTheVocabulary:
             "investment_preference.investor_type",
             "investment_preference.approaches[1]",
             "investment_preference.horizon",
-            "agent_preference.deliverable",
             "agent_preference.proactivity",
+            "agent_preference.output_format[0]",
         ]
 
 
@@ -302,7 +296,7 @@ class TestWhatPasses:
         patches = {
             "risk_preference": {"risk_level": None},
             "investment_preference": {"markets": None, "sectors": None},
-            "agent_preference": {"deliverable": None, "output_format": None},
+            "agent_preference": {"research_depth": None, "output_format": None},
         }
         assert check_profile(patches, None) == (patches, [])
 
@@ -316,11 +310,11 @@ class TestWhatPasses:
         vocabulary; a save that sends the stored value back is not refused."""
         stored = {
             "investment_preference": {"horizon": "long_term", "sectors": ["Tech & AI"]},
-            "agent_preference": {"deliverable": "report"},
+            "agent_preference": {"research_depth": "deep"},
         }
         patches = {
             "investment_preference": {"horizon": "long_term", "sectors": ["Tech & AI"]},
-            "agent_preference": {"deliverable": "report"},
+            "agent_preference": {"research_depth": "deep"},
         }
         assert check_profile(patches, stored) == (patches, [])
 
@@ -372,13 +366,72 @@ class TestPromptPreferences:
         printed, steering = prompt_preferences(
             {
                 "research_depth": "thorough",
-                "deliverable": "report",
-                "output_format": "html",
+                "output_format": ["markdown", "text"],
+                "proactivity": "sometimes",
                 "tone": "terse",
             }
         )
-        assert steering == {"research_depth": "thorough", "output_format": "html"}
-        assert printed == {"deliverable": "report", "tone": "terse"}
+        assert steering == {"research_depth": "thorough", "output_format": ["markdown", "text"]}
+        assert printed == {"proactivity": "sometimes", "tone": "terse"}
+
+    def test_a_ranking_with_a_format_outside_it_prints(self):
+        printed, steering = prompt_preferences({"output_format": ["visual", "pdf"]})
+        assert steering == {}
+        assert printed == {"output_format": ["visual", "pdf"]}
+
+    def test_a_deliverable_outside_the_old_vocabulary_is_the_user_s_words(self):
+        """Only text and visual were ever deliverables; "html" was an output format."""
+        printed, steering = prompt_preferences({"deliverable": "html"})
+        assert steering == {}
+        assert printed == {"deliverable": "html"}
+
+
+class TestTheValuesBeforeTheRanking:
+    """A tab still on the build before migration 096 sends the old strings."""
+
+    def test_html_is_saved_as_the_ranking_096_wrote(self):
+        checked, problems = check_profile({"agent_preference": {"output_format": "html"}}, None)
+        assert problems == []
+        assert checked["agent_preference"] == {"output_format": ["visual", "markdown", "text"]}
+
+    def test_markdown_is_saved_as_no_ranking(self):
+        checked, problems = check_profile({"agent_preference": {"output_format": "markdown"}}, None)
+        assert problems == []
+        assert checked["agent_preference"] == {"output_format": None}
+
+    def test_a_deliverable_alone_replaces_the_stored_ranking(self):
+        """An old onboarding tab sends only the answer it changed."""
+        stored = {"agent_preference": {"output_format": ["visual", "markdown", "text"]}}
+        checked, problems = check_profile({"agent_preference": {"deliverable": "text"}}, stored)
+        assert problems == []
+        assert checked["agent_preference"] == {
+            "output_format": ["text", "markdown", "visual"],
+            "deliverable": None,
+        }
+
+    def test_a_deliverable_in_the_user_s_words_is_kept(self):
+        checked, problems = check_profile(
+            {"agent_preference": {"output_format": "html", "deliverable": "slides"}}, None
+        )
+        assert problems == []
+        assert checked["agent_preference"] == {
+            "output_format": ["visual", "markdown", "text"],
+            "deliverable": "slides",
+        }
+
+    def test_a_deliverable_beside_a_list_in_the_user_s_words_stays_theirs(self):
+        printed, steering = prompt_preferences(
+            {"output_format": ["visual", "pdf"], "deliverable": "text"}
+        )
+        assert steering == {}
+        assert printed == {"output_format": ["visual", "pdf"], "deliverable": "text"}
+
+    def test_a_deliverable_beside_a_ranking_never_reaches_the_prompt(self):
+        printed, steering = prompt_preferences(
+            {"output_format": ["markdown", "text", "visual"], "deliverable": "visual"}
+        )
+        assert steering == {"output_format": ["markdown", "text", "visual"]}
+        assert printed == {}
 
     def test_the_row_is_left_as_it_was(self):
         row = {"proactivity": "proactive"}

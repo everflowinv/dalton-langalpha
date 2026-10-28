@@ -239,7 +239,7 @@ export const answered: InvestingProfile = {
   approaches: ['fundamental'],
   styles: ['growth'],
   depth: 'thorough',
-  deliverable: 'report',
+  deliverable: 'markdown',
   proactivity: 'when_needed',
 };
 

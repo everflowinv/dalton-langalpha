@@ -1,10 +1,24 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { renderHook, act } from '@testing-library/react';
 import { useDebouncedSave } from '../useDebouncedSave';
+// DALTON-HOOK(multi-file-upload): verify stale-build reload is held across debounced and queued saves
+import { reloadHeld } from '@/lib/reloadHolds';
+import { runAuthResets } from '@/lib/authResets';
+import { checkForNewBuild, reloadIfStale, __resetStaleBuildForTests } from '@/lib/staleBuild';
 
 describe('useDebouncedSave', () => {
-  beforeEach(() => { vi.useFakeTimers(); });
-  afterEach(() => { vi.useRealTimers(); });
+  beforeEach(() => {
+    vi.useFakeTimers();
+    runAuthResets();
+    __resetStaleBuildForTests();
+    sessionStorage.clear();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    runAuthResets();
+    __resetStaleBuildForTests();
+    sessionStorage.clear();
+  });
 
   it('starts with idle status', () => {
     const saveFn = vi.fn().mockResolvedValue(undefined);
@@ -112,9 +126,65 @@ describe('useDebouncedSave', () => {
     const { result, unmount } = renderHook(() => useDebouncedSave(saveFn, 500));
 
     act(() => { result.current.trigger(); });
+    expect(reloadHeld()).toBe(true);
     unmount();
+    expect(reloadHeld()).toBe(false);
 
     await act(async () => { vi.advanceTimersByTime(1000); });
     expect(saveFn).not.toHaveBeenCalled();
+  });
+
+  // DALTON-HOOK(multi-file-upload): section switch must not reload while a debounced or queued save is unfinished
+  it('holds stale-build reload across debounced, in-flight, and queued saves, then reloads on the next switch', async () => {
+    document.head.querySelectorAll('script[type="module"]').forEach((n) => n.remove());
+    const script = document.createElement('script');
+    script.type = 'module';
+    script.src = `${window.location.origin}/assets/index-CURRENT.js`;
+    document.head.appendChild(script);
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true,
+      headers: new Headers({ 'content-type': 'application/json' }),
+      json: async () => ({ build: 'index-NEWER.js' }),
+    }));
+    await checkForNewBuild();
+    const reloadedAway = () => sessionStorage.getItem('__la_switch_reload__');
+
+    let resolveFirst!: () => void;
+    let resolveSecond!: () => void;
+    const saveFn = vi.fn()
+      .mockImplementationOnce(() => new Promise<void>(r => { resolveFirst = r; }))
+      .mockImplementationOnce(() => new Promise<void>(r => { resolveSecond = r; }));
+
+    const { result } = renderHook(() => useDebouncedSave(saveFn, 500));
+
+    // 1. Debounce timer pending -> section switch does not reload
+    act(() => { result.current.trigger(); });
+    expect(reloadHeld()).toBe(true);
+    reloadIfStale();
+    expect(reloadedAway()).toBeNull();
+
+    // 2. Timer fires -> first save in flight; queue a second save behind it
+    act(() => { vi.advanceTimersByTime(500); });
+    expect(saveFn).toHaveBeenCalledTimes(1);
+    act(() => { result.current.flush(); });
+    expect(reloadHeld()).toBe(true);
+    reloadIfStale();
+    expect(reloadedAway()).toBeNull();
+
+    // 3. First save finishes -> queued second save starts immediately; reload is still held
+    await act(async () => { resolveFirst(); });
+    expect(saveFn).toHaveBeenCalledTimes(2);
+    expect(reloadHeld()).toBe(true);
+    reloadIfStale();
+    expect(reloadedAway()).toBeNull();
+
+    // 4. Queued second save finishes -> hold is released, and the next section switch reloads
+    await act(async () => { resolveSecond(); });
+    expect(reloadHeld()).toBe(false);
+    expect(reloadedAway()).toBeNull();
+
+    reloadIfStale();
+    expect(reloadedAway()).toBe('index-CURRENT.js');
+    vi.unstubAllGlobals();
   });
 });
