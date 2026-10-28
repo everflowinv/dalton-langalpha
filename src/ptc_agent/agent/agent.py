@@ -279,6 +279,9 @@ class PTCAgent:
         subagent_switch: SubagentSwitchReader | None = None,
         window_coverage: WindowCoverage | None = None,
         cancel_notices: CancelNotices | None = None,
+        # DALTON-HOOK(colleague-dispatch): workspace owner identity and tail-turn tool trimming
+        workspace_owner_id: str | None = None,
+        tail_turn_no_new_work: bool = False,
     ) -> Any:
         """Create a deepagent with PTC pattern capabilities.
 
@@ -341,7 +344,12 @@ class PTCAgent:
         # Compute short thread ID for thread-scoped storage
         short_thread_id = thread_id[:8] if thread_id else ""
         # A wakeup belongs to a thread, so a build outside one has none.
-        wakeups_on = bool(thread_id) and self.config.feature_enabled("wakeups")
+        # DALTON-HOOK(colleague-dispatch): tail turns after access revocation do not bind schedule_wakeup
+        wakeups_on = (
+            bool(thread_id)
+            and self.config.feature_enabled("wakeups")
+            and not tail_turn_no_new_work
+        )
 
         preview_owner = project.workspace_id if project else None
         backend = SandboxBackend(
@@ -395,6 +403,12 @@ class PTCAgent:
             store=store,
             user_id=user_id,
             workspace_id=workspace_id_for_memory,
+            # DALTON-HOOK(colleague-dispatch): store routes belong to workspace owner
+            **(
+                {"workspace_owner_id": workspace_owner_id}
+                if workspace_owner_id is not None
+                else {}
+            ),
             layout=workspace_layout,
             call=call_context,
             history_routes=history_routes,
@@ -407,6 +421,7 @@ class PTCAgent:
         # their wait to the thread, which needs a thread, a user and a
         # workspace to record it under; without them a call waits until its
         # command ends, as a subagent's does.
+        # DALTON-HOOK(colleague-dispatch): tail turns after access revocation disable background command hand-off
         hand_off = (
             HandOff(
                 thread_id=thread_id,
@@ -414,7 +429,10 @@ class PTCAgent:
                 workspace_id=workspace_id_for_memory,
                 wakeups=wakeups_on,
             )
-            if thread_id and user_id and workspace_id_for_memory
+            if thread_id
+            and user_id
+            and workspace_id_for_memory
+            and not tail_turn_no_new_work
             else None
         )
 
@@ -685,8 +703,9 @@ class PTCAgent:
 
         # Recursion gate: no subagents compiled, none advertised in the
         # prompt ("No sub-agents configured."), no Task tool below.
+        # DALTON-HOOK(colleague-dispatch): tail turns after access revocation withhold Task/RunWorkflow while keeping TaskOutput
         subagents: list[dict[str, Any]] = []
-        if not disable_subagents:
+        if not disable_subagents and not tail_turn_no_new_work:
             subagents = compile_subagents(
                 self.config,
                 role,
@@ -744,7 +763,8 @@ class PTCAgent:
         background_middleware = BackgroundSubagentMiddleware(
             timeout=background_timeout,
             subagent_types=frozenset(spec["name"] for spec in subagents),
-            enabled=not disable_subagents,
+            # DALTON-HOOK(colleague-dispatch): disable background subagent spawning on tail turns
+            enabled=not disable_subagents and not tail_turn_no_new_work,
             registry=_bg_registry,
             checkpointer=checkpointer,
             namespace_owner=namespace_owner,
@@ -980,6 +1000,7 @@ class PTCAgent:
         # provider of the Task tool, so skipping it (plus the TaskOutput extend
         # above) makes a notification turn structurally unable to spawn
         # subagents, and RunWorkflow drops with it below.
+        # DALTON-HOOK(colleague-dispatch): withhold Task/RunWorkflow on tail turns while keeping TaskOutput
         subagent_task_middleware = (
             task_middleware(
                 subagents,
@@ -989,7 +1010,7 @@ class PTCAgent:
                 registry=background_middleware.registry,
                 checkpointer=checkpointer,
             )
-            if not disable_subagents
+            if not disable_subagents and not tail_turn_no_new_work
             else None
         )
 
@@ -1126,7 +1147,13 @@ class PTCAgent:
                 DaltonPatchToolCallsMiddleware(),  # DALTON-HOOK(dalton-patch-tool-calls)
                 context.turn,
                 # DALTON-HOOK(knowledge-reconcile-mw): reconcile direct edits and pending knowledge files before baseline reads agent.md (PK.5).
-                DaltonReconcileMiddleware(workspace_id=workspace_id_for_memory, backend=filesystem_backend, user_id=user_id),
+                # DALTON-HOOK(colleague-dispatch): pass storage_owner_id so reconcile uses workspace owner for storage
+                DaltonReconcileMiddleware(
+                    workspace_id=workspace_id_for_memory,
+                    backend=filesystem_backend,
+                    user_id=user_id,
+                    storage_owner_id=workspace_owner_id or user_id,
+                ),
                 context.baseline,
                 notes_rows,
                 context.tail,

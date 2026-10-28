@@ -128,8 +128,23 @@ async def create_thread_endpoint(
     named_title = request.title
     stamped_title = named_title if named_title is not None else request.first_query[:255]
 
+    # DALTON-HOOK(colleague-dispatch): stamp thread owner user_id and dispatched_by metadata on cross-user thread creation.
+    ws_owner_id = (
+        str(workspace.get("user_id"))
+        if workspace is not None and workspace.get("user_id")
+        else x_user_id
+    )
+    dispatched_by = None
+    thread_metadata = None
+    if ws_owner_id != x_user_id:
+        from src.dalton.sharing import build_dispatched_by_meta
+
+        dispatched_by = await build_dispatched_by_meta(x_user_id, channel="web")
+        thread_metadata = {"dispatched_by": dispatched_by}
+
     thread_id = str(uuid4())
     try:
+        # DALTON-HOOK(colleague-dispatch): stamp thread creator user_id on create_thread
         row = await create_thread(
             conversation_thread_id=thread_id,
             workspace_id=workspace_id,
@@ -137,9 +152,11 @@ async def create_thread_endpoint(
             thread_index=None,
             title=stamped_title,
             platform=request.platform,
+            metadata=thread_metadata,
             subagents_allowed=request.subagents_allowed,
             reasoning_effort=request.reasoning_effort,
             fast_mode=request.fast_mode,
+            user_id=x_user_id,
         )
     except Exception as e:
         logger.exception(f"Error pre-creating thread: {e}")
@@ -153,6 +170,7 @@ async def create_thread_endpoint(
         timezone=request.timezone,
     )
 
+    # DALTON-HOOK(colleague-dispatch): return thread_user_id, workspace_owner_id, and dispatched_by
     payload = ThreadCreateResponse(
         thread_id=thread_id,
         workspace_id=str(workspace_id),
@@ -164,6 +182,9 @@ async def create_thread_endpoint(
         fast_mode=row.get("fast_mode"),
         created_at=row["created_at"],
         updated_at=row["updated_at"],
+        thread_user_id=x_user_id,
+        workspace_owner_id=ws_owner_id,
+        dispatched_by=dispatched_by,
     )
 
     if "text/event-stream" in (http_request.headers.get("accept") or ""):

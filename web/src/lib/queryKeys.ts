@@ -324,6 +324,8 @@ export const queryKeys = {
     systemJobs:      () => [...queryKeys.dalton.all, 'system-jobs'],
     // DALTON-HOOK(workspace-sharing-settings): per-workspace sharing settings query key
     sharing:         (workspaceId: string) => [...queryKeys.dalton.all, 'sharing', workspaceId],
+    // DALTON-HOOK(colleague-dispatch): user-level Chief of Staff sharing settings query key
+    userSharing:     () => [...queryKeys.dalton.all, 'sharing', 'user-settings'],
     // DALTON-HOOK(user-coverage): Dashboard earnings calendar query key scoped by tab ('mine' | 'market') and user
     earningsCalendar: (
       scope: 'mine' | 'market',

@@ -540,6 +540,24 @@ async def handle_workflow_error(
         yield _emit_sse_error(handler, error_payload)
         return
 
+    # DALTON-HOOK(colleague-dispatch): START-txn colleague access revoked -> terminal non-retryable SSE error
+    from src.dalton.sharing import ColleagueAccessRevokedError
+
+    if isinstance(e, ColleagueAccessRevokedError):
+        await scope.release_slot()
+        error_payload = {
+            "thread_id": thread_id,
+            "error": e.message,
+            "type": "workflow_error",
+            "error_type": e.code,
+            "error_class": type(e).__name__,
+            "code": e.code,
+            "is_recoverable": False,
+            "retryable": False,
+        }
+        yield _emit_sse_error(handler, error_payload)
+        return
+
     # A (platform, external_id) create race won by a DIFFERENT user is a
     # deterministic protocol conflict, not a workflow execution failure: thread
     # creation lost the ``idx_conversation_threads_external`` check. Surface it

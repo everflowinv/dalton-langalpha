@@ -271,6 +271,7 @@ import FilePanel from '@/pages/ChatAgent/components/FilePanel';
 import FileHeaderActions from '@/pages/ChatAgent/components/FileHeaderActions';
 import HtmlViewer from '@/pages/ChatAgent/components/viewers/HtmlViewer';
 import ChatView from '@/pages/ChatAgent/components/ChatView';
+import ThreadCard from '@/pages/ChatAgent/components/ThreadCard';
 import { useActiveThreadPublisher } from '@/lib/threadLifecycle/useActiveThreadPublisher';
 import { applySnapshot, resetThreadLifecycle } from '@/lib/threadLifecycle/store';
 
@@ -1129,6 +1130,7 @@ describe('Dalton Team Sharing', () => {
       web_access: 'hidden',
       is_home: false,
       can_edit: true,
+      colleague_dispatch_enabled: true,
       updated_by: 'u-chao',
       updated_at: '2026-04-20T12:00:00Z',
     });
@@ -1139,6 +1141,7 @@ describe('Dalton Team Sharing', () => {
         web_access: 'ro',
         is_home: false,
         can_edit: true,
+        colleague_dispatch_enabled: true,
         updated_by: 'u-chao',
         updated_at: '2026-04-20T12:05:00Z',
       },
@@ -1181,40 +1184,104 @@ describe('Dalton Team Sharing', () => {
     fireEvent.click(reopenedBackdrop, { button: 0, clientX: 12, clientY: 12 });
     expect(screen.queryByRole('dialog')).toBeNull();
 
-    // 5. Re-open, verify all two 3-option radio groups reflect initial state, edit, and save
+    // 5. Re-open, verify settings hint and 3-option web radio group reflect initial state, edit, and save
     fireEvent.click(trigger);
-    expect(screen.getByText('别人的研究总监')).toBeInTheDocument();
+    expect(screen.getByTestId('sharing-cos-settings-hint')).toHaveTextContent(
+      '其他人的研究总监访问权限已在「设置」中按账户统一管理',
+    );
     expect(screen.getByText('别人的网页界面')).toBeInTheDocument();
     expect(screen.getByTestId('sharing-home-note')).toHaveTextContent(
       'Home 工作区始终不对他人开放',
     );
 
-    const cosRw = screen.getByTestId('sharing-cos-rw') as HTMLInputElement;
-    const cosRo = screen.getByTestId('sharing-cos-ro') as HTMLInputElement;
-    const cosHidden = screen.getByTestId('sharing-cos-hidden') as HTMLInputElement;
     const webRw = screen.getByTestId('sharing-web-rw') as HTMLInputElement;
     const webRo = screen.getByTestId('sharing-web-ro') as HTMLInputElement;
     const webHidden = screen.getByTestId('sharing-web-hidden') as HTMLInputElement;
 
-    expect(cosRo.checked).toBe(true);
-    expect(cosRw.checked).toBe(false);
-    expect(cosHidden.checked).toBe(false);
     expect(webHidden.checked).toBe(true);
     expect(webRw.checked).toBe(false);
     expect(webRo.checked).toBe(false);
 
-    fireEvent.click(cosRw);
+    fireEvent.click(webRw);
+    expect(webRw.checked).toBe(true);
+    expect(screen.getByTestId('sharing-web-rw-warning')).toHaveTextContent(
+      '同事在这里提问会在你的计算机上运行，等于信任这台计算机',
+    );
     fireEvent.click(webRo);
-    expect(cosRw.checked).toBe(true);
     expect(webRo.checked).toBe(true);
+    expect(screen.queryByTestId('sharing-web-rw-warning')).toBeNull();
     fireEvent.click(screen.getByTestId('sharing-save-btn'));
 
     await waitFor(() => {
       expect(mockApiPut).toHaveBeenCalledWith(
         `/api/v1/dalton/workspaces/${wsId}/sharing`,
-        { cos_access: 'rw', web_access: 'ro' },
+        { web_access: 'ro' },
       );
     });
+  });
+
+  it('renders dispatchedByBadge on ThreadCard and shows read-only hint in ChatView for colleague-dispatched threads', async () => {
+    const { default: i18n } = await import('@/i18n');
+    await i18n.changeLanguage('zh-CN');
+    onTestFinished(async () => {
+      await i18n.changeLanguage('en-US');
+    });
+
+    const queryClient = createTestQueryClient();
+    queryClient.setQueryData(queryKeys.workspaces.team(), SAMPLE_TEAM_RESPONSE);
+    queryClient.setQueryData(queryKeys.user.me(), {
+      user_id: 'u-richard',
+      email: 'richard.lu@dalton.test',
+      name: 'Richard Lu',
+    });
+    queryClient.setQueryData(workspaceDetailQuery('ws-richard-1').queryKey, {
+      workspace_id: 'ws-richard-1',
+      user_id: 'u-richard',
+      name: 'NVDA Deep Dive',
+      status: 'running',
+      is_home: false,
+      effective_web_access: 'owner',
+    });
+    queryClient.setQueryData(queryKeys.threads.detail('th-1'), {
+      thread_id: 'th-1',
+      workspace_id: 'ws-richard-1',
+      title: 'Dispatched NVDA Valuation',
+      thread_user_id: 'u-chao',
+      workspace_owner_id: 'u-richard',
+      dispatched_by: {
+        user_id: 'u-chao',
+        name: 'Chao Yu',
+        channel: 'cos',
+      },
+    });
+
+    const { unmount: unmountCard } = renderWithProviders(
+      <ThreadCard
+        thread={{
+          thread_id: 'th-1',
+          title: 'Dispatched NVDA Valuation',
+          dispatched_by: { user_id: 'u-chao', name: 'Chao Yu', channel: 'cos' },
+        }}
+        onClick={vi.fn()}
+      />,
+      { queryClient },
+    );
+    expect(screen.getByTestId('thread-dispatched-by-badge')).toHaveTextContent('由 Chao Yu 派发');
+    unmountCard();
+
+    renderWithProviders(
+      <ChatView
+        workspaceId="ws-richard-1"
+        threadId="th-1"
+        onBack={vi.fn()}
+        workspaceName="NVDA Deep Dive"
+      />,
+      { queryClient },
+    );
+
+    const readonlyInput = screen.getByLabelText('只读模式输入框') as HTMLInputElement;
+    expect(readonlyInput.disabled).toBe(true);
+    expect(readonlyInput.placeholder).toContain('由 Chao Yu 派发 · 仅创建者可继续提问');
   });
 
   it('does not render team section when caller_tier is external', () => {
@@ -1291,5 +1358,89 @@ describe('Dalton Team Sharing', () => {
     expect(screen.queryByTestId('sharing-cos-fieldset')).toBeNull();
     expect(screen.queryByTestId('sharing-web-fieldset')).toBeNull();
     expect(screen.queryByTestId('sharing-save-btn')).toBeNull();
+  });
+
+  it('disables chat composer on web_access=rw colleague workspace when colleague_dispatch_enabled is false, and enables it when true', () => {
+    const queryClient = createTestQueryClient();
+    queryClient.setQueryData(queryKeys.user.me(), {
+      user_id: 'u-chao',
+      email: 'chao.yu@dalton.test',
+      name: 'Chao Yu',
+    });
+
+    // 1. Master switch OFF (colleague_dispatch_enabled: false) -> disabled composer even when web_access='rw'
+    queryClient.setQueryData(queryKeys.workspaces.team(), {
+      ...SAMPLE_TEAM_RESPONSE,
+      colleague_dispatch_enabled: false,
+      members: [
+        {
+          user_id: 'u-richard',
+          email: 'richard.lu@dalton.test',
+          display_name: 'Richard Lu',
+          workspaces: [
+            {
+              workspace_id: 'ws-rw-1',
+              user_id: 'u-richard',
+              owner_name: 'Richard Lu',
+              owner_email: 'richard.lu@dalton.test',
+              name: 'TSM ReadWrite',
+              status: 'running',
+              access: 'rw',
+              web_access: 'rw',
+              cos_access: 'rw',
+            },
+          ],
+        },
+      ],
+    });
+    queryClient.setQueryData(workspaceDetailQuery('ws-rw-1').queryKey, {
+      workspace_id: 'ws-rw-1',
+      user_id: 'u-richard',
+      name: 'TSM ReadWrite',
+      status: 'running',
+      is_home: false,
+      effective_web_access: 'rw',
+      colleague_dispatch_enabled: false,
+    });
+
+    const { unmount: unmountOff } = renderWithProviders(
+      <ChatView
+        workspaceId="ws-rw-1"
+        threadId="__default__"
+        onBack={vi.fn()}
+        workspaceName="TSM ReadWrite"
+      />,
+      { queryClient },
+    );
+
+    expect(screen.getByTestId('team-readonly-composer')).toBeInTheDocument();
+    const disabledInput = screen.getByLabelText('只读模式输入框') as HTMLInputElement;
+    expect(disabledInput.disabled).toBe(true);
+    expect(disabledInput.placeholder).toContain('发送消息与派活：该功能下一期开放');
+    unmountOff();
+
+    // 2. Master switch ON (colleague_dispatch_enabled: true) -> writable composer enabled on __default__
+    queryClient.setQueryData(workspaceDetailQuery('ws-rw-1').queryKey, {
+      workspace_id: 'ws-rw-1',
+      user_id: 'u-richard',
+      name: 'TSM ReadWrite',
+      status: 'running',
+      is_home: false,
+      effective_web_access: 'rw',
+      colleague_dispatch_enabled: true,
+    });
+
+    const { unmount: unmountOn } = renderWithProviders(
+      <ChatView
+        workspaceId="ws-rw-1"
+        threadId="__default__"
+        onBack={vi.fn()}
+        workspaceName="TSM ReadWrite"
+      />,
+      { queryClient },
+    );
+
+    expect(screen.queryByTestId('team-readonly-composer')).toBeNull();
+    unmountOn();
   });
 });

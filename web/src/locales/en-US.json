@@ -6535,7 +6535,18 @@
       "levelHidden": "Hidden",
       "homeNote": "Home workspace is never open to others",
       "externalOwnerNote": "External members' workspaces are visible to admins only; sharing settings do not apply",
-      "nextPhaseNotice": "Available in the next phase"
+      "nextPhaseNotice": "Available in the next phase",
+      "cosUserToggleTitle": "Others' Chief of Staff",
+      "cosUserToggleLabel": "Allow internal colleagues' Chief of Staff to access my workspaces and dispatch tasks",
+      "cosUserToggleScopeHint": "Applies to all workspaces except Home (enabled by default for internal members; external members cannot access others' workspaces, and others cannot dispatch tasks to or ask questions in external members' workspaces).",
+      "cosUserToggleTrustNotice": "Enabling this means trusting internal colleagues to run tasks on your computer:\n• Full-machine read/write: Tasks can read and write all workspaces and Home, personal memory, profile, and automations on your computer.\n• Connections & external effects: Tasks use your data connections, MCP servers, and secrets; data is sent to the colleague's chosen model service or external endpoints, and linked external accounts may be written to or incur charges.\n• Resources & quotas: Tasks consume your machine resources and third-party API quotas (LLM token costs are billed to the dispatcher's daily budget).\n• Thread visibility & retention: You (and members with workspace access) can view dispatched threads read-only; if you delete the workspace, the dispatcher can still view their thread history read-only.\n• Revocation limits: Turning this off immediately blocks new dispatches while running tasks finish; revocation cannot recall data already read or undo effects already made.",
+      "cosManagedInSettingsHint": "Access for others' Chief of Staff is managed globally in Settings.",
+      "webDescRw": "Internal colleagues can browse this workspace and start new threads on the web",
+      "webRwWarningTitle": "Colleagues asking questions here will run on your computer, which equals trusting this computer",
+      "webRwWarningBody": "With web Read & Write enabled, threads started here by internal colleagues run on your computer:\n• Machine & knowledge base read/write: Threads can read and write all workspaces and Home, personal memory, and automations on this machine, and write to this workspace's knowledge base (verdicts, agenda, files).\n• Connections & external effects: Threads use your data connections and secrets; data is sent to the questioner's chosen model service, and linked external accounts may be written to or incur charges.\n• Resources & quotas: Threads consume your machine resources and third-party API quotas (LLM costs are billed to the questioner's daily budget).\n• Thread visibility & retention: You and members with workspace access can view these threads read-only; if you delete the workspace, the questioner can still view their thread history read-only.\n• Revocation limits: Reverting to Read-only or Hidden immediately blocks new questions while running tasks finish; revocation cannot recall data already read or undo effects already made.",
+      "dispatchedByBadge": "Dispatched by {{name}}",
+      "dispatchedThreadReadonlyHint": "Dispatched by {{name}} · Only the creator can send follow-up messages",
+      "revokedThreadReadonlyHint": "The workspace owner has revoked write access · Historical conversation is read-only"
     },
     "autoIngest": {
       "on": "Auto-ingest: on",

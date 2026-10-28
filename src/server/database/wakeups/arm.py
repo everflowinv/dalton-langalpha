@@ -48,8 +48,14 @@ _SHORT_DRAWS = 8
 _MAX_DRAWS = 32
 
 
+# DALTON-HOOK(colleague-dispatch): persist created_by_run_id on armed wakeups
 async def arm_wakeups(
-    thread_id: str, user_id: str, specs: List[WakeupSpec], *, cap: int = 10
+    thread_id: str,
+    user_id: str,
+    specs: List[WakeupSpec],
+    *,
+    cap: int = 10,
+    created_by_run_id: Optional[str] = None,
 ) -> Tuple[List[Dict[str, Any]], List[int]]:
     """Arm ``specs`` up to the thread's cap of open wakeups; the armed rows in
     spec order, and the indexes of the specs the cap left out.
@@ -81,40 +87,83 @@ async def arm_wakeups(
                     (thread_id,),
                 )
                 room = max(cap - (await cur.fetchone())["n"], 0)
+                # DALTON-HOOK(colleague-dispatch): pass created_by_run_id into _insert
                 armed = [
-                    await _insert(cur, thread_id, user_id, spec)
+                    await _insert(
+                        cur,
+                        thread_id,
+                        user_id,
+                        spec,
+                        created_by_run_id=created_by_run_id,
+                    )
                     for spec in specs[:room]
                 ]
                 return armed, list(range(room, len(specs)))
 
 
-async def _insert(cur, thread_id: str, user_id: str, spec: WakeupSpec) -> Dict[str, Any]:
+# DALTON-HOOK(colleague-dispatch): store optional created_by_run_id on wakeups row
+async def _insert(
+    cur,
+    thread_id: str,
+    user_id: str,
+    spec: WakeupSpec,
+    *,
+    created_by_run_id: Optional[str] = None,
+) -> Dict[str, Any]:
     timed = spec.kind in ("at", "cron")
     for draw in range(_MAX_DRAWS):
         short_id = "w_" + secrets.token_hex(2 if draw < _SHORT_DRAWS else 3)
-        await cur.execute(
-            f"""
-            INSERT INTO wakeups (
-                short_id, conversation_thread_id, user_id, label, kind,
-                timezone, cron, until_at, schedule, stop_reason, next_fire_at,
-                symbol, market, price_kind, price_value, pct_from, armed_price,
-                warn_at, expires_at, attempt_id, vendor_order_id,
-                baseline_filled_qty
+        # DALTON-HOOK(colleague-dispatch): include created_by_run_id when provided
+        if created_by_run_id is not None:
+            await cur.execute(
+                f"""
+                INSERT INTO wakeups (
+                    short_id, conversation_thread_id, user_id, label, kind,
+                    timezone, cron, until_at, schedule, stop_reason, next_fire_at,
+                    symbol, market, price_kind, price_value, pct_from, armed_price,
+                    warn_at, expires_at, attempt_id, vendor_order_id,
+                    baseline_filled_qty, created_by_run_id
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::timestamptz[], %s, %s,
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT ON CONSTRAINT wakeups_short_id_unique DO NOTHING
+                RETURNING {WAKEUP_COLUMNS}
+                """,
+                (
+                    short_id, thread_id, user_id, spec.label, spec.kind,
+                    spec.timezone, spec.cron, spec.until_at, list(spec.schedule),
+                    spec.stop_reason, spec.schedule[0] if timed and spec.schedule else None,
+                    spec.symbol, spec.market, spec.price_kind, spec.price_value,
+                    spec.pct_from, spec.armed_price, spec.warn_at, spec.expires_at,
+                    spec.attempt_id, spec.vendor_order_id, spec.baseline_filled_qty,
+                    created_by_run_id,
+                ),
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::timestamptz[], %s, %s,
-                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT ON CONSTRAINT wakeups_short_id_unique DO NOTHING
-            RETURNING {WAKEUP_COLUMNS}
-            """,
-            (
-                short_id, thread_id, user_id, spec.label, spec.kind,
-                spec.timezone, spec.cron, spec.until_at, list(spec.schedule),
-                spec.stop_reason, spec.schedule[0] if timed and spec.schedule else None,
-                spec.symbol, spec.market, spec.price_kind, spec.price_value,
-                spec.pct_from, spec.armed_price, spec.warn_at, spec.expires_at,
-                spec.attempt_id, spec.vendor_order_id, spec.baseline_filled_qty,
-            ),
-        )
+        else:
+            # DALTON-HOOK(colleague-dispatch): default insert branch without created_by_run_id
+            await cur.execute(
+                f"""
+                INSERT INTO wakeups (
+                    short_id, conversation_thread_id, user_id, label, kind,
+                    timezone, cron, until_at, schedule, stop_reason, next_fire_at,
+                    symbol, market, price_kind, price_value, pct_from, armed_price,
+                    warn_at, expires_at, attempt_id, vendor_order_id,
+                    baseline_filled_qty
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::timestamptz[], %s, %s,
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT ON CONSTRAINT wakeups_short_id_unique DO NOTHING
+                RETURNING {WAKEUP_COLUMNS}
+                """,
+                (
+                    short_id, thread_id, user_id, spec.label, spec.kind,
+                    spec.timezone, spec.cron, spec.until_at, list(spec.schedule),
+                    spec.stop_reason, spec.schedule[0] if timed and spec.schedule else None,
+                    spec.symbol, spec.market, spec.price_kind, spec.price_value,
+                    spec.pct_from, spec.armed_price, spec.warn_at, spec.expires_at,
+                    spec.attempt_id, spec.vendor_order_id, spec.baseline_filled_qty,
+                ),
+            )
         row = await cur.fetchone()
         if row is not None:
             return normalize(row)

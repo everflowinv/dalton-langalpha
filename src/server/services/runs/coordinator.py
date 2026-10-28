@@ -122,6 +122,8 @@ class RunHandle:
     # The ``pending_input`` stamp a failure or a stop before the graph took
     # this attempt's input records on its row; empty when /retry should replay.
     pending_input: Dict[str, Any] = field(default_factory=dict)
+    # DALTON-HOOK(colleague-dispatch): whether START admitted the run as a post-revocation tail turn
+    tail_turn_no_new_work: bool = False
 
     @property
     def checkpointer(self) -> Optional[Any]:
@@ -261,6 +263,16 @@ class RunCoordinator:
                     before_commit=before_commit,
                     conn=guard.conn if guard is not None else None,
                 )
+            # DALTON-HOOK(colleague-dispatch): propagate tail_turn_no_new_work if lock_run_workspace promoted the turn under START lock
+            _row_meta = (
+                row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+            )
+            _tail_turn_no_new_work = bool(
+                (_row_meta or {}).get("tail_turn_no_new_work")
+                or metadata.get("tail_turn_no_new_work")
+            )
+            if _tail_turn_no_new_work and isinstance(run_metadata, dict):
+                run_metadata["tail_turn_no_new_work"] = True
             handle = RunHandle(
                 run_id=run_id,
                 thread_id=thread_id,
@@ -272,6 +284,7 @@ class RunCoordinator:
                 started_at=row["created_at"],
                 guard=guard,
                 pending_input=pending_input or {},
+                tail_turn_no_new_work=_tail_turn_no_new_work,
             )
             if guard is not None:
                 guard.bind_owner(handle)

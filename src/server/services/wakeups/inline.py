@@ -61,6 +61,17 @@ async def wakeup_offer(job: dict) -> SteeredReport | NotOwed | None:
     if not await user_feature_enabled(user_id, "wakeups"):
         await end_wakeup(thread_id, wakeup_id, "disabled")
         return NotOwed(f"{subject}: wakeups are off for its owner")
+    # DALTON-HOOK(colleague-dispatch): verify colleague workspace write access on the wakeup's origin channel before offering inline
+    from src.dalton.sharing import is_wakeup_notice_revoked
+
+    if await is_wakeup_notice_revoked(
+        thread_id=thread_id,
+        wakeup_id=wakeup_id,
+        user_id=user_id,
+        wakeup_row=row,
+    ):
+        await end_wakeup(thread_id, wakeup_id, "disabled")
+        return NotOwed(f"{subject}: colleague access revoked")
     shown = await showing_run(job, thread_id)
     if shown is not None:
         run_id = shown[0]

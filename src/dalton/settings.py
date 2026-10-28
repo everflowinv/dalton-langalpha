@@ -173,6 +173,12 @@ class DaltonCredentialsConfig(BaseModel):
         return v
 
 
+class DaltonColleagueDispatchConfig(BaseModel):
+    """Master feature flag for colleague workspace task dispatch & questioning (d020)."""
+
+    enabled: bool = False
+
+
 # A fake-IP exemption may never reach these, whatever the config says: they are
 # the internal services and metadata endpoint the fetch guard exists to protect.
 NEVER_EXEMPT_NETWORKS: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...] = tuple(
@@ -296,6 +302,9 @@ class DaltonConfig(BaseModel):
     configured_pm_user_ids: list[str] = Field(default_factory=list)
     timezone: str = "Asia/Shanghai"
     credentials: DaltonCredentialsConfig = Field(default_factory=DaltonCredentialsConfig)
+    colleague_dispatch: DaltonColleagueDispatchConfig = Field(
+        default_factory=DaltonColleagueDispatchConfig
+    )
     models: DaltonModelsConfig = Field(default_factory=DaltonModelsConfig)
     budget: DaltonBudgetDefaults = Field(default_factory=DaltonBudgetDefaults)
     knowledge: DaltonKnowledgeConfig = Field(default_factory=DaltonKnowledgeConfig)
@@ -358,6 +367,14 @@ def is_dalton_enabled() -> bool:
     if env_flag is not None:
         return env_flag.strip().lower() in ("1", "true", "yes")
     return get_dalton_config().enabled
+
+
+def is_colleague_dispatch_enabled() -> bool:
+    """Whether colleague workspace task dispatch & questioning (d020) is enabled."""
+    env_flag = os.getenv("DALTON_COLLEAGUE_DISPATCH_ENABLED")
+    if env_flag is not None:
+        return env_flag.strip().lower() in ("1", "true", "yes")
+    return get_dalton_config().colleague_dispatch.enabled
 
 
 def is_budget_gate_enabled() -> bool:

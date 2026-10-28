@@ -161,6 +161,8 @@ def build_filesystem_backend(
     store: Any | None,
     user_id: str | None,
     workspace_id: str | None,
+    # DALTON-HOOK(colleague-dispatch): workspace owner identity for store namespaces
+    workspace_owner_id: str | None = None,
     layout: WorkspaceLayout | None = None,
     call: CallContext | None = None,
     history_routes: Sequence[Any] = (),
@@ -210,6 +212,8 @@ def build_filesystem_backend(
     # across requests, memory will cross-pollinate between users. Resolve
     # identity at call time (e.g. via `langgraph.runtime.get_runtime()`)
     # before introducing reuse.
+    # DALTON-HOOK(colleague-dispatch): computer-mounted store and user-data routes belong to workspace owner
+    user_id = workspace_owner_id or user_id
     routes: list[Any] = list(history_routes)
     user_namespace_factory: NamespaceFactory | None = None
     workspace_namespace_factory: NamespaceFactory | None = None

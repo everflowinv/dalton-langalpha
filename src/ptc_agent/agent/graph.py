@@ -221,6 +221,9 @@ async def build_ptc_graph_with_session(
     subagent_switch: SubagentSwitchReader | None = None,
     window_coverage: WindowCoverage | None = None,
     cancel_notices: CancelNotices | None = None,
+    # DALTON-HOOK(colleague-dispatch): workspace owner identity and tail-turn tool trimming
+    workspace_owner_id: str | None = None,
+    tail_turn_no_new_work: bool = False,
 ) -> Any:
     """Build a BackgroundSubagentOrchestrator from a pre-acquired session (WorkspaceManager path).
 
@@ -273,13 +276,24 @@ async def build_ptc_graph_with_session(
         _read_harness_blocks(user_id, workspace_id, thread_id, turn_context, role),
     )
 
-    if workspace_id and user_id:
+    # DALTON-HOOK(colleague-dispatch): merge workspace owner B's and caller A's vault secrets for leak detection
+    eff_owner_id = workspace_owner_id or user_id
+    if workspace_id and eff_owner_id:
         from src.server.database.user_vault_secrets import get_user_secrets_decrypted
 
         # Leak detection redacts the owner's whole vault, read fresh: every
         # workspace can read every secret, and the sandbox's cached copy is
         # process-local, so a rotation handled by another worker leaves it stale.
-        vault_secrets = await get_user_secrets_decrypted(user_id)
+        vault_secrets = dict(await get_user_secrets_decrypted(eff_owner_id) or {})
+        if user_id and str(user_id) != str(eff_owner_id):
+            caller_secrets = await get_user_secrets_decrypted(user_id) or {}
+            for k, v in caller_secrets.items():
+                if not v:
+                    continue
+                if k in vault_secrets and vault_secrets[k] != v:
+                    vault_secrets[f"{k}#caller"] = v
+                else:
+                    vault_secrets.setdefault(k, v)
     else:
         vault_secrets = dict(getattr(session.sandbox, "vault_secrets", None) or {})
     # DALTON-HOOK(data-map): warm per-turn data map from Postgres daily cache (falls back to static unprobed map)
@@ -330,6 +344,17 @@ async def build_ptc_graph_with_session(
         subagent_switch=subagent_switch,
         window_coverage=window_coverage,
         cancel_notices=cancel_notices,
+        # DALTON-HOOK(colleague-dispatch): pass workspace_owner_id and tail_turn_no_new_work
+        **(
+            {"workspace_owner_id": workspace_owner_id}
+            if workspace_owner_id is not None
+            else {}
+        ),
+        **(
+            {"tail_turn_no_new_work": tail_turn_no_new_work}
+            if tail_turn_no_new_work
+            else {}
+        ),
     )
 
     logger.debug(

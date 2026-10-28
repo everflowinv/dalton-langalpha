@@ -118,6 +118,21 @@ class WorkspaceThreadListItem(BaseModel):
     run_started_at: Optional[datetime] = Field(
         None, description="Latest attempt's start time (start, not settle)"
     )
+    # DALTON-HOOK(colleague-dispatch): thread creator, workspace owner, dispatch provenance, and per-viewer read state.
+    thread_user_id: Optional[str] = Field(
+        None, description="Thread owner user ID (creator / dispatcher)"
+    )
+    workspace_owner_id: Optional[str] = Field(
+        None, description="Workspace owner user ID"
+    )
+    dispatched_by: Optional[Dict[str, Any]] = Field(
+        None,
+        description="Colleague dispatch provenance {user_id, name, email, channel}",
+    )
+    is_read: Optional[bool] = Field(
+        None,
+        description="Whether the viewing user has read the thread (forced True for non-owner viewers)",
+    )
 
     model_config = ConfigDict(json_schema_extra={
         "example": {
@@ -335,6 +350,10 @@ class ThreadCreateResponse(BaseModel):
     )
     created_at: datetime
     updated_at: datetime
+    # DALTON-HOOK(colleague-dispatch): thread creator, workspace owner, and dispatch provenance on create response.
+    thread_user_id: Optional[str] = None
+    workspace_owner_id: Optional[str] = None
+    dispatched_by: Optional[Dict[str, Any]] = None
 
 
 class ThreadUpdateRequest(BaseModel):

@@ -179,13 +179,17 @@ async def verify_thread_owner(
     owner_only: bool = False,
 ) -> Command | None:
     """Return error Command if user cannot access thread, else None."""
-    from src.server.database.conversation.threads_read import get_thread_owner_id
+    from src.server.database.conversation.threads_read import (
+        get_thread_auth_meta,
+        get_thread_owner_id,
+    )
 
     try:
         owner_id = await get_thread_owner_id(thread_id)
         if owner_id == user_id:
             return None
         # --- DALTON-HOOK(workspace-sharing-settings): begin ---
+        # DALTON-HOOK(colleague-dispatch): pass workspace_owner_id and workspace_id for non-owner thread access checks.
         if not owner_only and owner_id is not None:
             from fastapi import HTTPException
             from src.dalton.settings import is_dalton_supabase_auth_enabled
@@ -193,6 +197,9 @@ async def verify_thread_owner(
             if is_dalton_supabase_auth_enabled():
                 from src.dalton.sharing import require_thread_access
 
+                meta = await get_thread_auth_meta(thread_id)
+                ws_owner_id = (meta or {}).get("workspace_owner_id")
+                ws_id = (meta or {}).get("workspace_id")
                 try:
                     await require_thread_access(
                         thread_id,
@@ -200,6 +207,8 @@ async def verify_thread_owner(
                         channel="cos",
                         need=need,
                         owner_id=str(owner_id),
+                        workspace_owner_id=str(ws_owner_id) if ws_owner_id else None,
+                        workspace_id=str(ws_id) if ws_id else None,
                     )
                     return None
                 except HTTPException as exc:
@@ -211,6 +220,8 @@ async def verify_thread_owner(
                                 channel="cos",
                                 need="read",
                                 owner_id=str(owner_id),
+                                workspace_owner_id=str(ws_owner_id) if ws_owner_id else None,
+                                workspace_id=str(ws_id) if ws_id else None,
                             )
                         except HTTPException:
                             return error_command(

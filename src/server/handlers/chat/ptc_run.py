@@ -209,6 +209,14 @@ async def astream_ptc_workflow(
     leaving one out.
     """
     workspace_id = route.workspace_id
+    # DALTON-HOOK(colleague-dispatch): resolve workspace owner B and tail-turn / origin-channel metadata
+    workspace_owner_id = str(
+        (extra_configurable or {}).get("workspace_owner_id")
+        or (run_metadata or {}).get("workspace_owner_id")
+        or user_id
+    )
+    tail_turn_no_new_work = bool((run_metadata or {}).get("tail_turn_no_new_work"))
+    origin_channel = str((run_metadata or {}).get("origin_channel") or "web")
     start_time = time.time()
     handler = None
     run_handle = None
@@ -336,12 +344,21 @@ async def astream_ptc_workflow(
         # Database Persistence Setup
         # =====================================================================
 
+        # DALTON-HOOK(colleague-dispatch): pass workspace_owner_id and origin_channel to ensure_thread for colleague thread metadata
         prior_thread = await ensure_thread(
             request,
             thread_id,
             workspace_id,
             user_id,
             initial_query=user_input,
+            **(
+                {
+                    "workspace_owner_id": workspace_owner_id,
+                    "origin_channel": origin_channel,
+                }
+                if workspace_owner_id != str(user_id)
+                else {}
+            ),
         )
         # /retry builds its attempt with no surface: it runs where the
         # attempt it retries did, under the same rules.
@@ -482,6 +499,11 @@ async def astream_ptc_workflow(
                 **(run_metadata or {}),
             },
         )
+        # DALTON-HOOK(colleague-dispatch): promote to tail_turn_no_new_work when START lock re-check admitted a tail turn after revocation
+        if getattr(run_handle, "tail_turn_no_new_work", False):
+            tail_turn_no_new_work = True
+            if isinstance(run_metadata, dict):
+                run_metadata["tail_turn_no_new_work"] = True
         if not is_checkpoint_replay:
             logger.debug(
                 f"[PTC_CHAT] Run started: workspace_id={workspace_id} "
@@ -547,10 +569,11 @@ async def astream_ptc_workflow(
         # broader than the old `ws_status == "stopped"` check — it also fires
         # on server-restart cold starts (workspace running in Daytona but no
         # session in memory). The extra "starting/ready" SSE pair is harmless.
+        # DALTON-HOOK(colleague-dispatch): acquire workspace session under workspace owner B's identity
         if not needs_startup:
             session = await workspace_manager.get_session_for_workspace(
                 workspace_id,
-                user_id=user_id,
+                user_id=workspace_owner_id,
                 skills_signature=skills_signature,
                 run_id=run_id,
             )
@@ -570,10 +593,11 @@ async def astream_ptc_workflow(
                 state_box["value"] = state
                 state_event.set()
 
+            # DALTON-HOOK(colleague-dispatch): acquire workspace session under workspace owner B's identity
             session_task = asyncio.create_task(
                 workspace_manager.get_session_for_workspace(
                     workspace_id,
-                    user_id=user_id,
+                    user_id=workspace_owner_id,
                     on_state_observed=_on_state,
                     skills_signature=skills_signature,
                     run_id=run_id,
@@ -665,6 +689,7 @@ async def astream_ptc_workflow(
         # agent build mounts the workspace's memory off it, the post-turn
         # reconcile materialises that folder's skills, and the run's own task
         # binds it for the path layer.
+        # DALTON-HOOK(colleague-dispatch): pass workspace_owner_id and tail_turn_no_new_work to agent build
         inputs = await AgentInputs.read(
             session,
             user_id=user_id,
@@ -672,11 +697,13 @@ async def astream_ptc_workflow(
             thread_id=thread_id,
             role=route.role,
             user_profile=user_profile,
+            workspace_owner_id=workspace_owner_id,
         )
         project = inputs.project
         # One relay session per directly bound server, held for the run.
         direct_mcp = inputs.direct_mcp
 
+        # DALTON-HOOK(colleague-dispatch): strip Task/schedule_wakeup on post-revocation tail turn
         ptc_graph = await build_ptc_graph_with_session(
             session=session,
             config=config,
@@ -695,6 +722,11 @@ async def astream_ptc_workflow(
             # the run's pinned session before it may write.
             namespace_owner=run_handle.guard,
             **inputs.build_kwargs(),
+            **(
+                {"tail_turn_no_new_work": True}
+                if tail_turn_no_new_work
+                else {}
+            ),
             order_ledger=order_ledger_for_turn(
                 user_id=user_id,
                 workspace_id=workspace_id,
@@ -844,6 +876,14 @@ async def astream_ptc_workflow(
         # LangSmith Tracing Configuration
         # =====================================================================
 
+        # DALTON-HOOK(colleague-dispatch): stamp turn_admitted_workspace_id and workspace_owner_id in configurable
+        extra_configurable = {
+            **(extra_configurable or {}),
+            "turn_admitted_workspace_id": workspace_id,
+            "workspace_owner_id": workspace_owner_id,
+            "origin_channel": origin_channel,
+            **({"tail_turn_no_new_work": True} if tail_turn_no_new_work else {}),
+        }
         graph_config = build_graph_config(
             thread_id=thread_id,
             user_id=user_id,
@@ -913,8 +953,9 @@ async def astream_ptc_workflow(
             if session and session.sandbox:
                 # The run is terminal, so a settle may move the folder now: the
                 # pass reads it under the folder hold, not from the turn start.
+                # DALTON-HOOK(colleague-dispatch): reconcile skills under workspace owner B's identity
                 await ws_manager.reconcile_skills_if_running(
-                    workspace_id, user_id, source="post_turn"
+                    workspace_id, workspace_owner_id, source="post_turn"
                 )
             try:
                 # Any project on the machine may have changed, not only this
@@ -923,9 +964,16 @@ async def astream_ptc_workflow(
                     workspace_id, session=session
                 )
                 # DALTON-HOOK(knowledge-reconcile): detect direct edits after mirror backup
+                # DALTON-HOOK(colleague-dispatch): pass storage_owner_id=workspace_owner_id and author user_id=user_id
                 if workspace_id and user_id:
                     from src.dalton.knowledge.reconcile import detect_direct_edits
-                    asyncio.create_task(detect_direct_edits(str(workspace_id), str(user_id)))
+                    asyncio.create_task(
+                        detect_direct_edits(
+                            str(workspace_id),
+                            str(user_id),
+                            storage_owner_id=str(workspace_owner_id),
+                        )
+                    )
             except Exception as e:
                 logger.warning(
                     f"[PTC_COMPLETE] file backup failed for {thread_id}: {e}"

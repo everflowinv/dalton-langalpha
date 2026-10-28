@@ -463,6 +463,10 @@ async def ensure_thread(
     workspace_id: str,
     user_id: str,
     initial_query: str = "",
+    # DALTON-HOOK(colleague-dispatch): workspace owner and origin channel for colleague thread metadata.
+    workspace_owner_id: str | None = None,
+    origin_channel: str = "web",
+    is_colleague_turn: bool = False,
 ) -> PriorThread:
     """Ensure a thread record exists in the database, optionally with external linkage.
 
@@ -488,6 +492,19 @@ async def ensure_thread(
     if request.origin:
         ensure_kwargs["metadata"] = {
             "origin": request.origin.model_dump(exclude_none=True)
+        }
+    # DALTON-HOOK(colleague-dispatch): attach dispatched_by when creating a thread in a colleague's workspace.
+    if is_colleague_turn or (
+        workspace_owner_id and str(workspace_owner_id) != str(user_id)
+    ):
+        from src.dalton.sharing import build_dispatched_by_meta
+
+        disp_channel = "cos" if origin_channel == "cos" else "web"
+        ensure_kwargs["metadata"] = {
+            **(ensure_kwargs.get("metadata") or {}),
+            "dispatched_by": await build_dispatched_by_meta(
+                user_id, channel=disp_channel
+            ),
         }
     # Applied only if this send creates the thread; PATCH owns it after.
     if request.subagents_allowed is not None:

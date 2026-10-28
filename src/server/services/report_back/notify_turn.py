@@ -561,6 +561,13 @@ async def post_notification_turn(
                             return "taken", None
                         if busy_fails_fast:
                             return "busy", None
+                    # DALTON-HOOK(colleague-dispatch): colleague_access_revoked 403 is terminal, do not defer or hold via exhaust_alert
+                    if resp.status == 403 and await _is_colleague_access_revoked(resp):
+                        logger.warning(
+                            f"{log_prefix} Thread {thread_id} refused notification "
+                            f"({resp.status} colleague_access_revoked); dropping"
+                        )
+                        return ("revoked" if refusal_fails_fast else "drop"), None
                     if refusal_fails_fast and await _lasting_refusal(resp):
                         logger.info(
                             f"{log_prefix} Thread {thread_id} refused the "
@@ -614,6 +621,17 @@ async def post_notification_turn(
                     f"on thread {thread_id}"
                 )
                 return "cap", None
+
+
+# DALTON-HOOK(colleague-dispatch): detect colleague_access_revoked 403 so callers terminate without retry
+async def _is_colleague_access_revoked(resp) -> bool:
+    if resp.status != 403:
+        return False
+    try:
+        detail = (await resp.json()).get("detail")
+    except Exception:
+        return False
+    return isinstance(detail, dict) and detail.get("code") == "colleague_access_revoked"
 
 
 async def _lasting_refusal(resp) -> bool:

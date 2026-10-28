@@ -571,7 +571,9 @@ async def _workspace_name(workspace_id: str | None) -> str | None:
     names no workspace rather than hold the report-back.
     """
     if workspace_id:
-        from src.server.database.workspace import get_workspace_name_and_description
+        from src.server.database.workspace import (
+            get_workspace_name_and_description,
+        )
 
         try:
             row = await get_workspace_name_and_description(workspace_id)
@@ -581,10 +583,49 @@ async def _workspace_name(workspace_id: str | None) -> str | None:
                 f"{workspace_id}",
                 exc_info=True,
             )
-            row = None
+            return None
         if row and row.get("name"):
             return row["name"]
     return None
+
+
+# DALTON-HOOK(colleague-dispatch): read colleague owner name for report-back
+async def _workspace_owner_name(
+    workspace_id: str | None, dispatcher_user_id: str | None = None
+) -> str | None:
+    if not workspace_id or not dispatcher_user_id:
+        return None
+    from src.server.database.workspace import get_workspace
+
+    try:
+        ws = await get_workspace(workspace_id)
+        ws_owner_id = str((ws or {}).get("user_id") or "")
+        if ws_owner_id and ws_owner_id != str(dispatcher_user_id):
+            from src.server.database.user import get_user
+
+            owner_user = await get_user(ws_owner_id)
+            return (
+                str((owner_user or {}).get("name") or "").strip()
+                or str((owner_user or {}).get("email") or "").strip()
+                or ws_owner_id
+            )
+    except Exception:
+        logger.debug(
+            f"[HANDOFF_REPORT_BACK] Could not read owner of workspace {workspace_id}",
+            exc_info=True,
+        )
+    return None
+
+
+# DALTON-HOOK(colleague-dispatch): helper combining workspace name and colleague owner name
+async def _workspace_name_and_owner(
+    workspace_id: str | None, dispatcher_user_id: str | None = None
+) -> tuple[str | None, str | None]:
+    ws_name = await _workspace_name(workspace_id)
+    owner_name = await _workspace_owner_name(
+        workspace_id, dispatcher_user_id=dispatcher_user_id
+    )
+    return ws_name, owner_name
 
 
 # How the summary turn is told the run ended. A run that did not complete
@@ -706,8 +747,17 @@ async def report_message(
     ptc_thread_id, origin = owed.ptc_thread_id, owed.origin
     final_status = owed.final_status
     ptc_workspace_id = origin.get("ptc_workspace_id")
+    # DALTON-HOOK(colleague-dispatch): include workspace_owner when reporting from a colleague's workspace
     ws_name = await _workspace_name(ptc_workspace_id)
-    ws_label = f'the "{ws_name}" workspace' if ws_name else "a workspace"
+    ws_owner_name = await _workspace_owner_name(
+        ptc_workspace_id, dispatcher_user_id=origin.get("user_id")
+    )
+    if ws_name and ws_owner_name:
+        ws_label = f'the "{ws_name}" workspace (workspace_owner="{ws_owner_name}")'
+    elif ws_name:
+        ws_label = f'the "{ws_name}" workspace'
+    else:
+        ws_label = "a workspace"
     outcome_line = (
         f"The analysis you dispatched (thread {ptc_thread_id} in {ws_label}) "
         f"{_OUTCOME_INSTRUCTIONS[final_status]}"
@@ -742,6 +792,8 @@ async def report_message(
         thread_id=ptc_thread_id,
         workspace_id=str(ptc_workspace_id) if ptc_workspace_id else None,
         workspace_name=ws_name,
+        # DALTON-HOOK(colleague-dispatch): attach colleague workspace owner name to AnalystReport
+        workspace_owner=ws_owner_name,
         # One of the three the message has words for, or it raised above.
         outcome=final_status,
         # Matches the report to its hand-off, whose result named the first.

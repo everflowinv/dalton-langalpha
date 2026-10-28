@@ -442,6 +442,27 @@ async def _deliver(wake: _Wake) -> _Exit:
             return "fence_lost"
         if outcome == "superseded":
             return "release"
+        # DALTON-HOOK(colleague-dispatch): 403 colleague_access_revoked terminates the wakeup immediately instead of holding via exhaust_alert
+        if outcome == "revoked":
+            logger.info(
+                f"{_LOG} Wake for {subject} on thread {thread_id} refused "
+                f"(colleague_access_revoked); ending wakeup"
+            )
+            if not wake.riders:
+                await end_wakeup(thread_id, wakeup_id, "disabled")
+                return "release"
+            from src.dalton.sharing import end_revoked_wake_jobs
+
+            await end_revoked_wake_jobs(
+                thread_id=thread_id,
+                jobs=[wake.job, *wake.riders],
+                default_wakeup_id=wakeup_id,
+            )
+            if await fire_db.job_owed(job_id):
+                await _release_riders(wake)
+                await asyncio.sleep(_BUSY_RETRY_DELAY)
+                continue
+            return "release"
         if outcome == "cap" and not spent:
             logger.warning(
                 f"{_LOG} Thread {thread_id} kept refusing the wake for "

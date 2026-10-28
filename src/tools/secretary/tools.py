@@ -84,7 +84,11 @@ async def workspaces_list(user_id: str, tool_call_id: str) -> Command:
             rows.append(row)
         payload: dict[str, object] = {"success": True, "workspaces": rows}
         # --- DALTON-HOOK(workspace-sharing-settings): begin ---
-        from src.dalton.settings import is_dalton_supabase_auth_enabled
+        # DALTON-HOOK(colleague-dispatch): adjust colleague_workspaces_note when colleague_dispatch is enabled.
+        from src.dalton.settings import (
+            is_colleague_dispatch_enabled,
+            is_dalton_supabase_auth_enabled,
+        )
 
         if is_dalton_supabase_auth_enabled():
             from src.dalton.sharing import list_colleague_cos_workspaces
@@ -92,16 +96,24 @@ async def workspaces_list(user_id: str, tool_call_id: str) -> Command:
             colleague_list = await list_colleague_cos_workspaces(user_id)
             payload["colleague_workspaces"] = colleague_list
             if colleague_list:
-                # Said here, where the model reads the list it is about to
-                # route by: promising a dispatch into one of these was the
-                # incident, and dispatch refuses them.
-                payload["colleague_workspaces_note"] = (
-                    "同事共享的工作区当前只能读取（list_files / read_file；rw 时可 "
-                    "write_file 写文件），delegate_to_analyst 不能向同事的工作区派发"
-                    "任务（会被拒绝）。要在同事工作区里做的事：用 manage_workspaces"
-                    '(action="create") 在用户自己名下新建工作区，再把任务派发给它的'
-                    "分析师。"
-                )
+                if is_colleague_dispatch_enabled():
+                    payload["colleague_workspaces_note"] = (
+                        "同事共享的工作区：access 为 rw 时可用 list_files / read_file / "
+                        "write_file，也可用 delegate_to_analyst 向该工作区的分析师派发任务；"
+                        "access 为 ro（read_only=true）时只能用 list_files / read_file 读取，"
+                        "不能向只读工作区派发任务。"
+                    )
+                else:
+                    # Said here, where the model reads the list it is about to
+                    # route by: promising a dispatch into one of these was the
+                    # incident, and dispatch refuses them.
+                    payload["colleague_workspaces_note"] = (
+                        "同事共享的工作区当前只能读取（list_files / read_file；rw 时可 "
+                        "write_file 写文件），delegate_to_analyst 不能向同事的工作区派发"
+                        "任务（会被拒绝）。要在同事工作区里做的事：用 manage_workspaces"
+                        '(action="create") 在用户自己名下新建工作区，再把任务派发给它的'
+                        "分析师。"
+                    )
         # --- DALTON-HOOK(workspace-sharing-settings): end ---
         content = json.dumps(payload, default=str)
     except Exception as e:

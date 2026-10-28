@@ -124,9 +124,13 @@ async def _thread_agent(
 
     # Session
     workspace_manager = WorkspaceManager.get_instance()
+    # DALTON-HOOK(colleague-dispatch): acquire workspace session under workspace owner B's identity
+    workspace_owner_id = (
+        str(thread_info.get("workspace_owner_id") or user_id or "") or None
+    )
     try:
         session = await workspace_manager.get_session_for_workspace(
-            workspace_id, user_id=user_id
+            workspace_id, user_id=workspace_owner_id
         )
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
@@ -165,6 +169,7 @@ async def _thread_agent(
     from src.server.database.user import get_user_profile_for_prompt
     from src.server.services.thread_agent import AgentInputs
 
+    # DALTON-HOOK(colleague-dispatch): pass workspace_owner_id to AgentInputs.read
     inputs = await AgentInputs.read(
         session,
         user_id=user_id,
@@ -172,6 +177,11 @@ async def _thread_agent(
         thread_id=thread_id,
         role=role,
         user_profile=await get_user_profile_for_prompt(user_id) if user_id else None,
+        **(
+            {"workspace_owner_id": workspace_owner_id}
+            if workspace_owner_id and workspace_owner_id != user_id
+            else {}
+        ),
     )
     graph = await build_ptc_graph_with_session(
         session=session,

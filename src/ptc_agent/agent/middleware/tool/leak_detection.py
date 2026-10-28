@@ -120,8 +120,10 @@ class LeakDetectionMiddleware(AgentMiddleware):
     def _scan(self, content: str) -> str:
         for name, value in self._secrets:
             if value in content:
-                logger.warning("Leak detected in tool output", secret_name=name)
-                content = content.replace(value, f"[REDACTED:{name}]")
+                # DALTON-HOOK(colleague-dispatch): strip #caller suffix from merged vault secret keys
+                display_name = name.split("#", 1)[0]
+                logger.warning("Leak detected in tool output", secret_name=display_name)
+                content = content.replace(value, f"[REDACTED:{display_name}]")
         # Pattern-based redaction for prefixed sandbox tokens (catches refreshed tokens)
         content = self._SANDBOX_TOKEN_RE.sub("[REDACTED:SANDBOX_TOKEN]", content)
         return content

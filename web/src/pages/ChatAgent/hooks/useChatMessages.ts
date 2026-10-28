@@ -2001,6 +2001,15 @@ export function useChatMessages(
         answered: true,
       };
     }
+    // DALTON-HOOK(colleague-dispatch): map 403 colleague_access_revoked to non-retryable notice without "Configure providers" link
+    if (errorInfo?.code === 'colleague_access_revoked') {
+      void queryClient.invalidateQueries({ queryKey: queryKeys.workspaces.details() });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.workspaces.team() });
+      return {
+        banner: t('dalton.sharing.revokedThreadReadonlyHint'),
+        answered: true,
+      };
+    }
     if (errObj.status === 403) {
       return {
         banner: {

@@ -50,6 +50,11 @@ function ThreadCard({ thread, onClick, onDelete, onRename, onArchive, onUnarchiv
       : 'var(--color-text-tertiary)';
   const cardTitle = (thread.title as string) || `Thread ${(thread.thread_index as number | undefined) !== undefined ? (thread.thread_index as number) + 1 : ''}`;
   const titleFading = useTitleFade(cardTitle);
+  // DALTON-HOOK(colleague-dispatch): show dispatcher badge when thread was created by a colleague
+  const dispatchedBy = thread.dispatched_by as
+    | { user_id?: string; name?: string | null; channel?: string }
+    | null
+    | undefined;
   const handleDeleteClick = (e: React.MouseEvent) => {
     e.stopPropagation(); // Prevent card click when clicking delete icon
     if (onDelete) {
@@ -92,6 +97,21 @@ function ThreadCard({ thread, onClick, onDelete, onRename, onArchive, onUnarchiv
       <div className="flex-1 min-w-0">
         <h3 className={cn('flex items-center gap-1.5 text-sm font-normal', titleFading && 'animate-fade-in')} style={{ color: 'var(--color-text-primary)' }}>
           <span className="truncate min-w-0">{cardTitle}</span>
+          {/* DALTON-HOOK(colleague-dispatch): show "Dispatched by {{name}}" badge */}
+          {dispatchedBy && (
+            <span
+              data-testid="thread-dispatched-by-badge"
+              className="text-[11px] px-1.5 py-0.5 rounded-full border shrink-0"
+              style={{
+                borderColor: 'var(--color-border-muted)',
+                color: 'var(--color-text-tertiary)',
+              }}
+            >
+              {t('dalton.sharing.dispatchedByBadge', {
+                name: dispatchedBy.name || dispatchedBy.user_id || '同事',
+              })}
+            </span>
+          )}
           {!!thread.is_shared && (
             <span
               role="img"

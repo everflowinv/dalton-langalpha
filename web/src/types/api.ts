@@ -132,6 +132,9 @@ export interface Workspace {
    *  order reads this, falling back to `updated_at`, which a rename, pin or
    *  reorder also bumps. */
   last_activity_at?: string | null;
+  // DALTON-HOOK(colleague-dispatch): effective web access level and master switch for colleague workspace
+  effective_web_access?: 'owner' | 'rw' | 'ro' | 'thread_only' | string | null;
+  colleague_dispatch_enabled?: boolean | null;
   [key: string]: unknown;
 }
 
@@ -646,6 +649,8 @@ export type ReportSource =
       steer_ids?: string[];
       // DALTON-HOOK(handoff-keep-on-resumable): interim resumable failure report
       resumable?: boolean;
+      // DALTON-HOOK(colleague-dispatch): colleague workspace owner display name
+      workspace_owner?: string | null;
     }
   /** A background subagent task in this thread, finished or failed. */
   | {
@@ -705,6 +710,14 @@ export interface Thread {
   latest_run_id?: string | null;
   last_seen_run_seq?: number;
   run_started_at?: string | null;
+  // DALTON-HOOK(colleague-dispatch): thread ownership & dispatcher metadata
+  thread_user_id?: string | null;
+  workspace_owner_id?: string | null;
+  dispatched_by?: {
+    user_id?: string;
+    name?: string | null;
+    channel?: 'cos' | 'web' | string;
+  } | null;
   [key: string]: unknown;
 }
 

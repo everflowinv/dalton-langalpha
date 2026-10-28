@@ -95,6 +95,10 @@ class WorkspaceSharingUpdateRequest(BaseModel):
     web_access: str | None = None
 
 
+class UserSharingUpdateRequest(BaseModel):
+    cos_rw_enabled: bool
+
+
 class SystemJobToggleRequest(BaseModel):
     enabled: bool
 
@@ -348,12 +352,17 @@ async def list_team_workspaces_endpoint(
     user_id: CurrentUserId,
 ) -> dict[str, Any]:
     from src.dalton.access_tiers import get_user_tier
+    from src.dalton.settings import is_colleague_dispatch_enabled
     from src.dalton.sharing import list_team_workspaces
 
     members = await list_team_workspaces(user_id)
     # The sidebar hides the whole "团队" section for external members.
     caller_tier = await get_user_tier(user_id)
-    return {"members": members, "caller_tier": caller_tier}
+    return {
+        "members": members,
+        "caller_tier": caller_tier,
+        "colleague_dispatch_enabled": is_colleague_dispatch_enabled(),
+    }
 
 
 @router.get("/workspaces/{workspace_id}/sharing")
@@ -364,7 +373,10 @@ async def get_workspace_sharing_endpoint(
 ) -> dict[str, Any]:
     from src.server.database.home_workspace import is_home_row
     from src.dalton.access_tiers import classify_owner_tier, get_user_tier
-    from src.dalton.settings import is_dalton_supabase_auth_enabled
+    from src.dalton.settings import (
+        is_colleague_dispatch_enabled,
+        is_dalton_supabase_auth_enabled,
+    )
     from src.dalton.sharing import (
         can_edit_workspace_sharing,
         get_workspace_sharing,
@@ -418,6 +430,7 @@ async def get_workspace_sharing_endpoint(
             "web_access": "hidden",
             "is_home": True,
             "can_edit": False,
+            "colleague_dispatch_enabled": is_colleague_dispatch_enabled(),
             "updated_by": None,
             "updated_at": None,
         }
@@ -457,6 +470,7 @@ async def get_workspace_sharing_endpoint(
         "is_home": False,
         "can_edit": can_edit and not owner_external,
         "owner_external": owner_external,
+        "colleague_dispatch_enabled": is_colleague_dispatch_enabled(),
     }
 
 
@@ -468,7 +482,10 @@ async def update_workspace_sharing_endpoint(
     user_id: CurrentUserId,
 ) -> dict[str, Any]:
     from src.server.database.home_workspace import is_home_row
-    from src.dalton.settings import is_dalton_supabase_auth_enabled
+    from src.dalton.settings import (
+        is_colleague_dispatch_enabled,
+        is_dalton_supabase_auth_enabled,
+    )
     from src.dalton.sharing import (
         VALID_ACCESS_LEVELS,
         can_edit_workspace_sharing,
@@ -580,6 +597,87 @@ async def update_workspace_sharing_endpoint(
         **saved,
         "is_home": False,
         "can_edit": True,
+        "colleague_dispatch_enabled": is_colleague_dispatch_enabled(),
+    }
+
+
+@router.get("/sharing/user-settings")
+@handle_api_exceptions("get user cos sharing settings", logger)
+async def get_user_sharing_settings_endpoint(
+    user_id: CurrentUserId,
+) -> dict[str, Any]:
+    from src.dalton.access_tiers import get_user_tier
+    from src.dalton.settings import (
+        is_colleague_dispatch_enabled,
+        is_dalton_supabase_auth_enabled,
+    )
+    from src.dalton.sharing import get_user_cos_sharing, require_team_reader
+
+    uid = str(user_id or "").strip()
+    if not uid:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    if is_dalton_supabase_auth_enabled():
+        await require_team_reader(uid)
+        caller_tier = await get_user_tier(uid)
+        if caller_tier == "external":
+            return {
+                "user_id": uid,
+                "cos_rw_enabled": False,
+                "cos_access": "hidden",
+                "can_edit": False,
+                "caller_tier": caller_tier,
+                "colleague_dispatch_enabled": is_colleague_dispatch_enabled(),
+                "updated_at": None,
+            }
+    else:
+        caller_tier = "internal"
+
+    settings_row = await get_user_cos_sharing(uid)
+    return {
+        **settings_row,
+        "can_edit": True,
+        "caller_tier": caller_tier,
+        "colleague_dispatch_enabled": is_colleague_dispatch_enabled(),
+    }
+
+
+@router.put("/sharing/user-settings")
+@handle_api_exceptions("update user cos sharing settings", logger)
+async def update_user_sharing_settings_endpoint(
+    body: UserSharingUpdateRequest,
+    user_id: CurrentUserId,
+) -> dict[str, Any]:
+    from src.dalton.access_tiers import get_user_tier
+    from src.dalton.settings import (
+        is_colleague_dispatch_enabled,
+        is_dalton_supabase_auth_enabled,
+    )
+    from src.dalton.sharing import require_team_reader, upsert_user_cos_sharing
+
+    uid = str(user_id or "").strip()
+    if not uid:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    if is_dalton_supabase_auth_enabled():
+        await require_team_reader(uid)
+        caller_tier = await get_user_tier(uid)
+        if caller_tier == "external":
+            raise HTTPException(
+                status_code=403,
+                detail="外部成员的工作区仅管理员可查看，不提供共享设置",
+            )
+    else:
+        caller_tier = "internal"
+
+    saved = await upsert_user_cos_sharing(
+        uid, cos_rw_enabled=body.cos_rw_enabled
+    )
+    return {
+        **saved,
+        "can_edit": True,
+        "caller_tier": caller_tier,
+        "colleague_dispatch_enabled": is_colleague_dispatch_enabled(),
     }
 
 

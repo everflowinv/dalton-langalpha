@@ -168,5 +168,6 @@ export function useThreadModel({
     ? { model: offered, defaultModel }
     : null;
 
-  return { model, retired, offer, pickModel, dismissOffer };
+  // DALTON-HOOK(colleague-dispatch): expose thread detail record so ChatView can inspect thread_user_id / dispatched_by
+  return { model, retired, offer, pickModel, dismissOffer, thread };
 }

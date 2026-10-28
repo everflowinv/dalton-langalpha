@@ -152,6 +152,8 @@ ALLOWED_HOOKS=(
   # requests as X-Dalton-* headers (code_execution.py, execution.py,
   # mcp_client_runtime.py; src/dalton/sandbox_caller_identity.py).
   "sandbox-caller-identity"
+  # Colleague workspace task dispatch & questioning (d020)
+  "colleague-dispatch"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

@@ -62,13 +62,39 @@ from src.server.database.conversation import (
 from ._deps import logger, router
 
 
-def _lifecycle_fields(row: dict) -> dict:
+def _lifecycle_fields(row: dict, current_user_id: Optional[str] = None) -> dict:
     """Derive the lifecycle enrichment from a list row carrying the
     latest-attempt LATERAL columns; {} when the row wasn't enriched (detail,
     rename, external-id sites — the model fields are optional)."""
+    # DALTON-HOOK(colleague-dispatch): attach thread_user_id, workspace_owner_id, dispatched_by, and isolate unread state for non-owner viewers.
+    meta = row.get("metadata") or {}
+    thread_user_id = (
+        str(row["thread_user_id"])
+        if row.get("thread_user_id")
+        else (str(row["user_id"]) if row.get("user_id") else None)
+    )
+    workspace_owner_id = (
+        str(row["workspace_owner_id"]) if row.get("workspace_owner_id") else None
+    )
+    dispatched_by = row.get("dispatched_by") or (
+        meta.get("dispatched_by") if isinstance(meta, dict) else None
+    )
+    extra: dict = {
+        "thread_user_id": thread_user_id,
+        "workspace_owner_id": workspace_owner_id,
+        "dispatched_by": dispatched_by if isinstance(dispatched_by, dict) else None,
+    }
     if "latest_run_seq" not in row:
-        return {}
-    return dict(project_lifecycle(row))
+        if current_user_id and thread_user_id and str(current_user_id) != thread_user_id:
+            extra["is_read"] = True
+        return extra
+    lc = dict(project_lifecycle(row))
+    if current_user_id and thread_user_id and str(current_user_id) != thread_user_id:
+        lc["unseen"] = False
+        lc["is_read"] = True
+    else:
+        lc["is_read"] = not bool(lc.get("unseen"))
+    return {**lc, **extra}
 
 
 # =============================================================================
@@ -115,17 +141,47 @@ async def list_threads(
 
             workspace = await db_get_workspace(workspace_id)
             # --- DALTON-HOOK(workspace-sharing-settings): begin ---
-            from src.dalton.settings import is_dalton_supabase_auth_enabled
+            # DALTON-HOOK(colleague-dispatch): allow caller to list own threads when workspace is hidden.
+            from src.dalton.settings import (
+                is_colleague_dispatch_enabled,
+                is_dalton_supabase_auth_enabled,
+            )
 
+            owner_filter: Optional[str] = None
             if is_dalton_supabase_auth_enabled():
                 from src.dalton.sharing import require_workspace_access
-
-                await require_workspace_access(
-                    workspace, x_user_id, channel="web", need="read"
+                from src.server.database.conversation import (
+                    user_has_threads_in_workspace,
                 )
+
+                try:
+                    await require_workspace_access(
+                        workspace, x_user_id, channel="web", need="read"
+                    )
+                except HTTPException as exc:
+                    if exc.status_code == 404 and is_colleague_dispatch_enabled():
+                        if workspace is None:
+                            workspace = await db_get_workspace(
+                                workspace_id, include_deleted=True
+                            )
+                        if (
+                            workspace is not None
+                            and str(workspace.get("user_id") or "") != str(x_user_id)
+                            and await user_has_threads_in_workspace(
+                                workspace_id, x_user_id
+                            )
+                        ):
+                            owner_filter = x_user_id
+                        else:
+                            raise
+                    else:
+                        raise
             else:
                 require_workspace_owner(workspace, user_id=x_user_id)
             # --- DALTON-HOOK(workspace-sharing-settings): end ---
+            gen_kwargs = {}
+            if owner_filter is not None:
+                gen_kwargs["owner_user_id"] = owner_filter
             threads, total = await get_workspace_threads(
                 workspace_id=workspace_id,
                 limit=limit,
@@ -134,6 +190,7 @@ async def list_threads(
                 sort_order=sort_order,
                 platform_prefix=platform_prefix,
                 archived=archived,
+                **gen_kwargs,
             )
         else:
             threads, total = await get_threads_for_user(
@@ -166,7 +223,7 @@ async def list_threads(
                 turn_count=thread.get("turn_count"),
                 created_at=thread["created_at"],
                 updated_at=thread["updated_at"],
-                **_lifecycle_fields(thread),
+                **_lifecycle_fields(thread, current_user_id=x_user_id),
             )
             for thread in threads
         ]
@@ -206,7 +263,7 @@ async def get_thread(thread_id: str, x_user_id: CurrentUserId):
     thread = await get_thread_by_id(thread_id)
     if not thread:
         raise HTTPException(status_code=404, detail="Thread not found")
-    return _thread_list_item(thread)
+    return _thread_list_item(thread, current_user_id=x_user_id)
 
 
 class ThreadSeenRequest(BaseModel):
@@ -417,7 +474,10 @@ async def delete_thread_endpoint(thread_id: str, x_user_id: CurrentUserId):
         )
 
 
-def _thread_list_item(row: dict) -> WorkspaceThreadListItem:
+# DALTON-HOOK(colleague-dispatch): pass current_user_id to _lifecycle_fields for thread ownership projection
+def _thread_list_item(
+    row: dict, current_user_id: Optional[str] = None
+) -> WorkspaceThreadListItem:
     """Build the list-item response from a detail/updated thread row."""
     return WorkspaceThreadListItem(
         thread_id=str(row["conversation_thread_id"]),
@@ -437,6 +497,8 @@ def _thread_list_item(row: dict) -> WorkspaceThreadListItem:
         fast_mode=row.get("fast_mode"),
         created_at=row["created_at"],
         updated_at=row["updated_at"],
+        # DALTON-HOOK(colleague-dispatch): project thread ownership fields
+        **_lifecycle_fields(row, current_user_id=current_user_id),
     )
 
 

@@ -457,22 +457,40 @@ async def _handle_send_message(
         # gives the workspace when the request names none, and the thread's model.
         thread_meta = await get_thread_auth_meta(thread_id) if thread_id else None
         owner_id = thread_meta["user_id"] if thread_meta else None
+        workspace_owner_id_meta = (
+            thread_meta.get("workspace_owner_id") if thread_meta else None
+        )
         if owner_id is not None and owner_id != user_id:
             # --- DALTON-HOOK(workspace-sharing-settings): begin ---
-            from src.dalton.settings import is_dalton_supabase_auth_enabled
+            # DALTON-HOOK(colleague-dispatch): enforce thread write access and colleague_dispatch feature flag.
+            from src.dalton.settings import (
+                is_colleague_dispatch_enabled,
+                is_dalton_supabase_auth_enabled,
+            )
 
             if is_dalton_supabase_auth_enabled():
                 from src.dalton.sharing import require_thread_access
 
+                if not is_colleague_dispatch_enabled():
+                    await require_thread_access(
+                        thread_id,
+                        user_id,
+                        channel="web",
+                        need="read",
+                        owner_id=str(owner_id),
+                        workspace_owner_id=workspace_owner_id_meta,
+                        workspace_id=thread_meta.get("workspace_id"),
+                    )
+                    raise HTTPException(status_code=403, detail="该功能尚未开放")
                 await require_thread_access(
                     thread_id,
                     user_id,
                     channel="web",
-                    need="read",
+                    need="write",
                     owner_id=str(owner_id),
+                    workspace_owner_id=workspace_owner_id_meta,
                     workspace_id=thread_meta.get("workspace_id"),
                 )
-                raise HTTPException(status_code=403, detail="该功能下一期开放")
             # --- DALTON-HOOK(workspace-sharing-settings): end ---
             raise HTTPException(status_code=403, detail="Forbidden")
 
@@ -483,9 +501,16 @@ async def _handle_send_message(
         # the branch tip it was read off for START to hold it to.
         request = await _settle_against_branch(thread_id, request, user_id)
 
-        # Resolve workspace_id from thread if not provided
-        if not workspace_id and thread_meta:
-            workspace_id = str(thread_meta["workspace_id"])
+        # Resolve workspace_id from thread if not provided; reject mismatched workspace_id on existing thread
+        # DALTON-HOOK(colleague-dispatch): enforce thread_meta["workspace_id"] as ground truth on existing threads
+        if thread_meta and thread_meta.get("workspace_id"):
+            thread_ws_id = str(thread_meta["workspace_id"])
+            if workspace_id and str(workspace_id) != thread_ws_id:
+                raise HTTPException(
+                    status_code=400,
+                    detail="workspace_id does not match thread's workspace",
+                )
+            workspace_id = thread_ws_id
             logger.debug(
                 f"[CHAT] Resolved workspace_id={workspace_id} from thread_id={thread_id}"
             )
@@ -497,12 +522,66 @@ async def _handle_send_message(
                 detail="PTC Agent not initialized. Check server startup logs.",
             )
 
+        # DALTON-HOOK(colleague-dispatch): resolve origin channel & server-verified tail turn for colleague threads.
+        is_existing_colleague_thread = bool(
+            thread_meta
+            and workspace_owner_id_meta
+            and str(workspace_owner_id_meta) != str(user_id)
+        )
+        origin_channel = "web"
+        is_tail_turn = False
         # A turn naming Home's id, or any turn on a thread in Home, runs in
         # Home. The workspace guard comes first: it pairs with the thread
         # guard above. Home is bound once the admission gates below pass.
-        workspace = await requested_workspace(user_id, workspace_id)
+        # DALTON-HOOK(colleague-dispatch): map ColleagueAccessRevokedError to 403 and cancel interrupted HITL workflow
+        from src.dalton.sharing import (
+            ColleagueAccessRevokedError,
+            extract_wakeup_notice_ids,
+            resolve_colleague_turn_admission,
+        )
+
+        try:
+            workspace, origin_channel, is_tail_turn = (
+                await resolve_colleague_turn_admission(
+                    user_id=user_id,
+                    workspace_id=workspace_id,
+                    thread_id=thread_id,
+                    request=request,
+                    thread_meta=thread_meta,
+                    is_existing_colleague_thread=is_existing_colleague_thread,
+                    is_internal=is_internal,
+                    is_dispatch=is_dispatch,
+                    requested_workspace_fn=requested_workspace,
+                )
+            )
+        except ColleagueAccessRevokedError as e:
+            if request.hitl_response and thread_id:
+                try:
+                    from src.server.services.cancel_dispatch import cancel_workflow
+
+                    await cancel_workflow(thread_id)
+                except Exception:
+                    logger.debug(
+                        "Failed to cancel interrupted thread after access revocation",
+                        exc_info=True,
+                    )
+            raise HTTPException(
+                status_code=403,
+                detail={"code": e.code, "message": e.message},
+            ) from e
         route = turn_route(user_id, workspace)
         workspace_id = route.workspace_id
+        # DALTON-HOOK(colleague-dispatch): determine workspace owner ws_owner_id and is_colleague_turn
+        ws_owner_id = (
+            str(workspace.get("user_id"))
+            if workspace is not None and workspace.get("user_id")
+            else (
+                str(workspace_owner_id_meta)
+                if workspace_owner_id_meta
+                else user_id
+            )
+        )
+        is_colleague_turn = ws_owner_id != str(user_id)
 
         # Extract user input
         user_input = ""
@@ -605,6 +684,29 @@ async def _handle_send_message(
         "Content-Location": f"/api/v1/threads/{thread_id}/messages/stream?run_id={run_id}",
     }
 
+    # DALTON-HOOK(colleague-dispatch): pass origin_channel, tail_turn_no_new_work, and workspace_owner_id into run metadata & configurable.
+    run_meta: dict[str, object] = {}
+    if request.report_back_ptc_thread_id:
+        run_meta["report_back_ptc_thread_id"] = request.report_back_ptc_thread_id
+        run_meta["origin_dispatch_gen"] = request.origin_dispatch_gen
+    if is_colleague_turn:
+        run_meta["origin_channel"] = origin_channel
+        # Retries carry their notices too: START decides from the ledger
+        # whether the retry is a resumable continuation or new work.
+        wakeup_notice_ids = extract_wakeup_notice_ids(request)
+        if wakeup_notice_ids:
+            run_meta["wakeup_notice_ids"] = wakeup_notice_ids
+        if is_tail_turn:
+            run_meta["tail_turn_no_new_work"] = True
+
+    extra_cfg = _automation_configurable(request)
+    if is_colleague_turn:
+        extra_cfg = dict(extra_cfg or {})
+        extra_cfg["workspace_owner_id"] = ws_owner_id
+        extra_cfg["origin_channel"] = origin_channel
+        if is_tail_turn:
+            extra_cfg["tail_turn_no_new_work"] = True
+
     gen = astream_ptc_workflow(
         request=request,
         thread_id=thread_id,
@@ -619,15 +721,9 @@ async def _handle_send_message(
         named_model=named_model,
         # A report-back summary owes its pair's watch clear, so its finalize
         # must see the pair.
-        run_metadata=(
-            {
-                "report_back_ptc_thread_id": request.report_back_ptc_thread_id,
-                "origin_dispatch_gen": request.origin_dispatch_gen,
-            }
-            if request.report_back_ptc_thread_id
-            else None
-        ),
-        extra_configurable=_automation_configurable(request),
+        # DALTON-HOOK(colleague-dispatch): forward colleague turn run_metadata and extra_configurable
+        run_metadata=run_meta or None,
+        extra_configurable=extra_cfg,
     )
 
     if not is_dispatch:
@@ -675,6 +771,8 @@ async def _prime_dispatch(
     Every exit that does not hand ``gen`` to that drain releases ``scope``'s
     slot.
     """
+    # DALTON-HOOK(colleague-dispatch): convert ColleagueAccessRevokedError into 403 JSON response
+    from src.dalton.sharing import ColleagueAccessRevokedError
     from src.server.database.runs.lifecycle import DuplicateRequestError
     from src.server.handlers.chat.request_prep import (
         DISPATCH_STARTED_MARKER,
@@ -826,6 +924,15 @@ async def _prime_dispatch(
             if gated_gen:
                 await reserve.retract_dispatch_gen(thread_id, gated_gen, run_id)
             raise
+        # DALTON-HOOK(colleague-dispatch): map ColleagueAccessRevokedError to 403 non-retriable instead of 503.
+        except ColleagueAccessRevokedError as e:
+            await scope.release_slot()
+            if gated_gen:
+                await reserve.retract_dispatch_gen(thread_id, gated_gen, run_id)
+            raise HTTPException(
+                status_code=403,
+                detail={"code": e.code, "message": e.message},
+            ) from e
         except Exception as e:
             await scope.release_slot()
             if gated_gen:
@@ -1001,12 +1108,14 @@ async def replay_thread_messages(
         if is_dalton_supabase_auth_enabled():
             from src.dalton.sharing import require_thread_access
 
+            # DALTON-HOOK(colleague-dispatch): pass both thread owner_id and workspace_owner_id to require_thread_access.
             await require_thread_access(
                 thread_id,
                 x_user_id,
                 channel="web",
                 need="read",
                 owner_id=rows.owner_id,
+                workspace_owner_id=rows.workspace_owner_id,
                 workspace_id=rows.thread.get("workspace_id"),
             )
             is_non_owner_reader = rows.owner_id != x_user_id
@@ -1147,10 +1256,12 @@ async def get_thread_status(
     if is_dalton_supabase_auth_enabled():
         from src.dalton.sharing import require_thread_reader
 
+        # DALTON-HOOK(colleague-dispatch): pass workspace_owner_id to require_thread_reader.
         await require_thread_reader(
             thread_id,
             x_user_id,
             owner_id=meta["user_id"],
+            workspace_owner_id=meta.get("workspace_owner_id"),
             workspace_id=meta.get("workspace_id"),
         )
         is_non_owner_reader = meta["user_id"] != x_user_id

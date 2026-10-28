@@ -119,6 +119,8 @@ import {
   TeamReadOnlyComposer,
   useTeamReadOnly,
 } from './dalton/TeamSharing';
+import { isDaltonAuth } from '@/config/daltonAuth';
+import { useUser } from '@/hooks/useUser';
 // DALTON-HOOK(coverage-tracking): company workspace auto-tracking toggle in thread top bar
 import { WorkspaceTrackingToggle } from './dalton/WorkspaceTrackingToggle';
 // DALTON-HOOK(workspace-sharing-settings): per-workspace sharing settings modal in thread top bar
@@ -159,6 +161,8 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
   const workspaceName = (isHome ? t('agents.chiefOfStaff') : workspaceRecord?.name) || initialWorkspaceName || '';
   // DALTON-HOOK(team-sharing): detect read-only colleague workspace/thread
   const teamReadOnly = useTeamReadOnly(workspaceId, workspaceRecord);
+  // DALTON-HOOK(colleague-dispatch): current user for thread ownership check
+  const { user: currentUser } = useUser({ enabled: Boolean(workspaceId) && isDaltonAuth });
 
   // The model a navigation's first message goes out with, captured at mount:
   // ChatAgent keeps up to five ChatViews rendered at once (display:none, not
@@ -391,7 +395,33 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     isLoading,
     initialModel: navModel,
   });
-  const { pickModel: pickThreadModel } = threadModel;
+  const { pickModel: pickThreadModel, thread: threadRecord } = threadModel;
+  // DALTON-HOOK(colleague-dispatch): determine whether the active thread is read-only for the caller
+  const currentUserId = currentUser?.user_id ?? null;
+  const threadUserId = (threadRecord?.thread_user_id as string | null | undefined) ?? null;
+  const dispatchedBy =
+    (threadRecord?.dispatched_by as
+      | { user_id?: string; name?: string | null; channel?: string }
+      | null
+      | undefined) ?? null;
+  const isForeignThreadOwner = Boolean(
+    isDaltonAuth &&
+      ((threadUserId && currentUserId && threadUserId !== currentUserId) ||
+        (!threadUserId &&
+          dispatchedBy?.user_id &&
+          (!currentUserId || dispatchedBy.user_id !== currentUserId))),
+  );
+  const isOwnThreadInRwColleagueWs =
+    teamReadOnly.isColleague &&
+    teamReadOnly.colleagueDispatchEnabled &&
+    !teamReadOnly.isReadOnly &&
+    (threadId === '__default__' ||
+      Boolean(threadUserId && currentUserId && threadUserId === currentUserId));
+  const isThreadReadOnly =
+    isForeignThreadOwner || (teamReadOnly.isColleague && !isOwnThreadInRwColleagueWs);
+  const dispatchedByName = isForeignThreadOwner
+    ? dispatchedBy?.name || dispatchedBy?.user_id || teamReadOnly.ownerName || '同事'
+    : null;
   const threadSubagents = useThreadSubagents({
     threadId: currentThreadId,
     landing: subagentsLanding,
@@ -1109,7 +1139,8 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     onSendMessage: handleSendMessage,
     chatInputRef,
     // DALTON-HOOK(workspace-sharing-settings): withhold mutation/interactive callbacks for colleagues
-    readOnly: teamReadOnly.isColleague,
+    // DALTON-HOOK(colleague-dispatch): also withhold mutation/interactive callbacks on foreign-owned threads
+    readOnly: isThreadReadOnly,
   });
 
   // The dispatcher's deep-link context for PTC-agent proposal cards. Memoized:
@@ -1252,8 +1283,9 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
   useEffect(() => {
     // Hidden views must not send initial messages (R7 — all views share useLocation)
     if (!isActive) return;
-    // DALTON-HOOK(workspace-sharing-settings): never auto-send initialMessage or onboarding kickoff on colleague workspaces
-    if (teamReadOnly.isColleague) return;
+    // DALTON-HOOK(workspace-sharing-settings): never auto-send initialMessage or onboarding kickoff on read-only colleague workspaces
+    // DALTON-HOOK(colleague-dispatch): allow auto-send when colleague starts a new thread on a web_access === 'rw' workspace
+    if (isThreadReadOnly) return;
     // Only proceed if we have the required IDs
     if (!workspaceId || !threadId) {
       return;
@@ -1324,7 +1356,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
       if (handoff) send();
       else setTimeout(send, 100);
     }
-  }, [location.state, workspaceId, threadId, isLoading, isLoadingHistory, handleSendMessage, navigate, location.pathname, isActive, subagentsToSend, tuningToSend, teamReadOnly.isReadOnly]); // DALTON-HOOK(workspace-sharing-settings): never auto-send on colleague workspaces
+  }, [location.state, workspaceId, threadId, isLoading, isLoadingHistory, handleSendMessage, navigate, location.pathname, isActive, subagentsToSend, tuningToSend, isThreadReadOnly]); // DALTON-HOOK(colleague-dispatch): never auto-send on read-only threads
 
   // The welcome's thread is never an empty chat: until its opening turn goes
   // out it draws nothing where the prompt to type would be. The route state
@@ -1349,7 +1381,8 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
   const reseededKeyRef = useRef<string | null>(null);
   useEffect(() => {
     // DALTON-HOOK(team-sharing): do not reseed composer in read-only mode
-    if (teamReadOnly.isReadOnly) return;
+    // DALTON-HOOK(colleague-dispatch): also skip reseeding on foreign-owned threads
+    if (isThreadReadOnly) return;
     if (!isActive || reseededKeyRef.current === location.key) return;
     const navState = location.state as LocationState | null;
     const snaps = navState?.widgetSnapshots;
@@ -1359,7 +1392,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     snaps?.forEach((s) => chatInputRef.current?.addWidgetSnapshot(s));
     if (draft) chatInputRef.current?.setValue(draft);
     navigate(location.pathname, { replace: true, state: { ...navState, widgetSnapshots: undefined, draftMessage: undefined } });
-  }, [isActive, location.key, location.state, location.pathname, navigate, teamReadOnly.isReadOnly]); // DALTON-HOOK(team-sharing): re-check when read-only changes
+  }, [isActive, location.key, location.state, location.pathname, navigate, isThreadReadOnly]); // DALTON-HOOK(colleague-dispatch): re-check when read-only changes
 
 
 
@@ -1650,8 +1683,9 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                               dispatcherContext={dispatcherContext}
                               ranHere={mainRanHere}
                               // DALTON-HOOK(workspace-sharing-settings): render message cards in read-only mode for colleagues while preserving file cards
-                              readOnly={teamReadOnly.isColleague}
-                              allowFiles={teamReadOnly.isColleague}
+                              // DALTON-HOOK(colleague-dispatch): also render message cards read-only on foreign-owned threads
+                              readOnly={isThreadReadOnly}
+                              allowFiles={isThreadReadOnly}
                             />
                           </DispatchStatusProvider>
                         </MessageActionsProvider>
@@ -1686,7 +1720,8 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                         resolveChildTelemetry={resolveSubagentTelemetry}
                         onStop={
                           // DALTON-HOOK(workspace-sharing-settings): disable workflow/subagent stop for colleagues
-                          !teamReadOnly.isColleague && currentThreadId && currentThreadId !== '__default__'
+                          // DALTON-HOOK(colleague-dispatch): also disable stop on foreign-owned threads
+                          !isThreadReadOnly && currentThreadId && currentThreadId !== '__default__'
                             ? () => cancelSubagentTask(currentThreadId, taskIdFromAgentId(activeAgent.id) ?? activeAgent.id)
                             : undefined
                         }
@@ -1733,8 +1768,9 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                                 isSubagentView={true}
                                 isLoading={subagentTurnLive}
                                 // DALTON-HOOK(workspace-sharing-settings): render subagent message cards in read-only mode for colleagues while preserving file cards
-                                readOnly={teamReadOnly.isColleague}
-                                allowFiles={teamReadOnly.isColleague}
+                                // DALTON-HOOK(colleague-dispatch): also render subagent message cards read-only on foreign-owned threads
+                                readOnly={isThreadReadOnly}
+                                allowFiles={isThreadReadOnly}
                               />
                             </DispatchStatusProvider>
                           </MessageActionsProvider>
@@ -1793,8 +1829,15 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                   reads it. */}
               <div className="w-full max-w-3xl sibling-space-y-3 relative pointer-events-auto [--composer-h:initial]">
                 {/* DALTON-HOOK(workspace-sharing-settings): replace writable composer with disabled colleague composer */}
-                {teamReadOnly.isColleague ? (
-                  <TeamReadOnlyComposer ownerName={teamReadOnly.ownerName} access={teamReadOnly.access} />
+                {/* DALTON-HOOK(colleague-dispatch): also show disabled composer on foreign-owned threads or revoked workspaces */}
+                {isThreadReadOnly ? (
+                  <TeamReadOnlyComposer
+                    ownerName={teamReadOnly.ownerName}
+                    access={teamReadOnly.access}
+                    colleagueDispatchEnabled={teamReadOnly.colleagueDispatchEnabled}
+                    dispatchedByName={dispatchedByName}
+                    revoked={teamReadOnly.isThreadOnly}
+                  />
                 ) : activeAgentId === 'main' ? (
                   <>
                     {/* Only rows with a surface of their own sit here: the

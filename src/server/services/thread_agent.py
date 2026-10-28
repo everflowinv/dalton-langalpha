@@ -102,6 +102,8 @@ class AgentInputs:
     user_profile: dict[str, Any] | None
     #: The directly bound tools, unopened: a run opens them (``drive``).
     direct_mcp: DirectMCPBinding
+    # DALTON-HOOK(colleague-dispatch): workspace owner identity (B) distinct from turn caller (A)
+    workspace_owner_id: str | None = None
 
     @classmethod
     async def read(
@@ -113,15 +115,31 @@ class AgentInputs:
         thread_id: str,
         role: AgentRole,
         user_profile: dict[str, Any] | None,
+        workspace_owner_id: str | None = None,
     ) -> AgentInputs:
         from src.server.services.egress.direct_tools import direct_tools_for_turn
         from src.server.services.trading_rule import with_trading_rule
         from src.server.services.workspace_layout import resolve_project_context
         from src.server.services.workspace_manager import WorkspaceManager
 
+        # DALTON-HOOK(colleague-dispatch): resolve workspace owner B and pass dual identity to direct MCP
+        eff_owner_id = workspace_owner_id or user_id
         tool_view = WorkspaceManager.get_instance().tool_view(session, workspace_id)
+        direct_kwargs: dict[str, Any] = {}
+        if eff_owner_id != user_id:
+            direct_kwargs["owner_user_id"] = eff_owner_id
+            direct_kwargs["caller_user_id"] = user_id
+        direct_mcp = await direct_tools_for_turn(
+            session,
+            user_id=eff_owner_id,
+            workspace_id=workspace_id,
+            view=tool_view,
+            **direct_kwargs,
+        )
         return cls(
             user_id=user_id,
+            # DALTON-HOOK(colleague-dispatch): store workspace owner identity
+            workspace_owner_id=eff_owner_id,
             thread_id=thread_id,
             workspace_id=workspace_id,
             role=role,
@@ -129,9 +147,8 @@ class AgentInputs:
             tool_view=tool_view,
             # Off the resolve, not the bind, so it moves only when a setting does.
             user_profile=with_trading_rule(user_profile, tool_view.trading_rule),
-            direct_mcp=await direct_tools_for_turn(
-                session, user_id=user_id, workspace_id=workspace_id, view=tool_view
-            ),
+            # DALTON-HOOK(colleague-dispatch): bind direct_mcp resolved above
+            direct_mcp=direct_mcp,
         )
 
     def build_kwargs(self) -> dict[str, Any]:
@@ -139,7 +156,8 @@ class AgentInputs:
         from src.server.app import setup
         from src.server.services.preview_links import cache_tool_preview
 
-        return {
+        # DALTON-HOOK(colleague-dispatch): forward workspace_owner_id when distinct from caller
+        kwargs: dict[str, Any] = {
             "user_id": self.user_id,
             "user_profile": self.user_profile,
             "thread_id": self.thread_id,
@@ -150,3 +168,7 @@ class AgentInputs:
             "tool_view": self.tool_view,
             "role": self.role,
         }
+        # DALTON-HOOK(colleague-dispatch): pass workspace_owner_id to graph build
+        if self.workspace_owner_id and self.workspace_owner_id != self.user_id:
+            kwargs["workspace_owner_id"] = self.workspace_owner_id
+        return kwargs

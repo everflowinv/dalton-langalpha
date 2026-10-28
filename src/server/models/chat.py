@@ -320,6 +320,8 @@ class AnalystReport(BaseModel):
     thread_id: str
     workspace_id: Optional[str] = None
     workspace_name: Optional[str] = None
+    # DALTON-HOOK(colleague-dispatch): colleague workspace owner display name
+    workspace_owner: Optional[str] = None
     outcome: Optional[Literal["completed", "error", "cancelled"]] = None
     run_ids: Optional[List[str]] = None
     steer_ids: Optional[List[str]] = None

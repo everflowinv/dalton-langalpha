@@ -177,7 +177,16 @@ async def _execute(
     armed: List[Tuple[Dict[str, Any], _Entry]] = []
     refused: List[str] = []
     if call.triggers:
-        armed, refused = await _set(call.triggers, thread_id, user_id, user_tz, now)
+        # DALTON-HOOK(colleague-dispatch): pass current run_id so wakeup inherits origin channel
+        run_id = configurable.get("run_id")
+        armed, refused = await _set(
+            call.triggers,
+            thread_id,
+            user_id,
+            user_tz,
+            now,
+            created_by_run_id=str(run_id) if run_id else None,
+        )
     if any(
         o.outcome in _ENDED and o.row is not None and o.row.get("kind") == "price"
         for o in outcomes
@@ -275,8 +284,15 @@ async def _entry_for(raw: Any, thread_id: str, user_tz: str, now: datetime) -> _
     return entry
 
 
+# DALTON-HOOK(colleague-dispatch): record created_by_run_id on armed wakeups
 async def _set(
-    triggers: List[Any], thread_id: str, user_id: Any, user_tz: str, now: datetime
+    triggers: List[Any],
+    thread_id: str,
+    user_id: Any,
+    user_tz: str,
+    now: datetime,
+    *,
+    created_by_run_id: Optional[str] = None,
 ) -> Tuple[List[Tuple[Dict[str, Any], _Entry]], List[str]]:
     """Arm every valid entry; ``([(row, entry)], refusal lines)`` in entry order."""
     many = len(triggers) > 1
@@ -304,8 +320,12 @@ async def _set(
         try:
             if not user_id:
                 raise RuntimeError("no user to set wakeups for")
+            # DALTON-HOOK(colleague-dispatch): persist created_by_run_id on armed wakeups
+            arm_kwargs: Dict[str, Any] = {"cap": MAX_PENDING}
+            if created_by_run_id:
+                arm_kwargs["created_by_run_id"] = str(created_by_run_id)
             rows, left_out = await arm_db.arm_wakeups(
-                thread_id, str(user_id), [e.spec for e in ready], cap=MAX_PENDING
+                thread_id, str(user_id), [e.spec for e in ready], **arm_kwargs
             )
         except Exception:
             logger.warning("[Wakeups] arming failed thread_id=%s", thread_id, exc_info=True)

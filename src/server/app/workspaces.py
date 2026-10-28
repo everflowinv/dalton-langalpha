@@ -193,6 +193,9 @@ def _workspace_to_response(workspace: dict) -> WorkspaceResponse:
         files_restore_incomplete=bool(workspace.get("files_restore_incomplete")),
         files_restore_offered_at=workspace.get("files_restore_offered_at"),
         files_backed_up_at=workspace.get("files_backed_up_at"),
+        # DALTON-HOOK(colleague-dispatch): pass caller's effective_web_access and colleague_dispatch_enabled.
+        effective_web_access=workspace.get("effective_web_access"),
+        colleague_dispatch_enabled=workspace.get("colleague_dispatch_enabled"),
     )
 
 
@@ -437,18 +440,78 @@ async def get_workspace(workspace_id: str, x_user_id: CurrentUserId):
     try:
         workspace = await db_get_workspace(workspace_id)
         # --- DALTON-HOOK(workspace-sharing-settings): begin ---
-        from src.dalton.settings import is_dalton_supabase_auth_enabled
+        # DALTON-HOOK(colleague-dispatch): compute effective_web_access and support thread_only fallback on hidden workspace.
+        from src.dalton.settings import (
+            is_colleague_dispatch_enabled,
+            is_dalton_supabase_auth_enabled,
+        )
 
         if is_dalton_supabase_auth_enabled():
-            from src.dalton.sharing import require_workspace_access
-
-            workspace = await require_workspace_access(
-                workspace, x_user_id, channel="web", need="read"
+            from src.dalton.sharing import (
+                get_workspace_sharing,
+                require_workspace_access,
             )
-            if workspace.get("user_id") != x_user_id:
-                workspace = {**workspace, "sandbox_id": None, "computer_id": None}
+            from src.server.database.conversation import (
+                user_has_threads_in_workspace,
+            )
+
+            try:
+                workspace = await require_workspace_access(
+                    workspace, x_user_id, channel="web", need="read"
+                )
+                if str(workspace.get("user_id")) == str(x_user_id):
+                    workspace = {
+                        **workspace,
+                        "effective_web_access": "owner",
+                        "colleague_dispatch_enabled": is_colleague_dispatch_enabled(),
+                    }
+                else:
+                    sh = await get_workspace_sharing(str(workspace["workspace_id"]))
+                    eff = str(sh.get("web_access") or "ro")
+                    if eff not in ("ro", "rw"):
+                        eff = "ro"
+                    workspace = {
+                        **workspace,
+                        "sandbox_id": None,
+                        "computer_id": None,
+                        "effective_web_access": eff,
+                        "colleague_dispatch_enabled": is_colleague_dispatch_enabled(),
+                    }
+            except HTTPException as exc:
+                if exc.status_code == 404 and is_colleague_dispatch_enabled():
+                    if workspace is None:
+                        workspace = await db_get_workspace(
+                            workspace_id, include_deleted=True
+                        )
+                    if (
+                        workspace is not None
+                        and str(workspace.get("user_id") or "") != str(x_user_id)
+                        and await user_has_threads_in_workspace(workspace_id, x_user_id)
+                    ):
+                        workspace = {
+                            **workspace,
+                            "description": None,
+                            "config": None,
+                            "sandbox_id": None,
+                            "computer_id": None,
+                            "dir_name": None,
+                            "previous_dir_names": [],
+                            "computer_root_dir": None,
+                            "previous_root_dirs": [],
+                            "effective_web_access": "thread_only",
+                            "colleague_dispatch_enabled": True,
+                        }
+                    else:
+                        raise
+                else:
+                    raise
         else:
             require_workspace_owner(workspace, user_id=x_user_id)
+            workspace = {
+                **workspace,
+                "effective_web_access": "owner",
+                "colleague_dispatch_enabled": False,
+            }
         # --- DALTON-HOOK(workspace-sharing-settings): end ---
 
         return _workspace_to_response(workspace)

@@ -143,7 +143,8 @@ async def start_task_run(
             async with conn.transaction():
                 from src.server.database.workspace import lock_run_workspace
 
-                await lock_run_workspace(conn, thread_id)
+                # DALTON-HOOK(colleague-dispatch): subagent belongs to an already-admitted parent run; skip colleague access re-check
+                await lock_run_workspace(conn, thread_id, check_colleague_access=False)
 
                 # Fast-path dedup probe for checkpoint re-execution; the
                 # partial unique index below is the race-safe backstop.

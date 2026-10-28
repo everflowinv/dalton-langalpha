@@ -236,6 +236,15 @@ class WorkspaceResponse(BaseModel):
     files_backed_up_at: Optional[datetime] = Field(
         None, description="When the last complete backup of the folder ran"
     )
+    # DALTON-HOOK(colleague-dispatch): caller's effective web access ('owner' | 'ro' | 'rw' | 'thread_only') and master switch.
+    effective_web_access: Optional[str] = Field(
+        None,
+        description="Effective web access for the requesting user: owner, ro, rw, or thread_only",
+    )
+    colleague_dispatch_enabled: Optional[bool] = Field(
+        None,
+        description="Whether colleague workspace task dispatch and chat messaging are enabled",
+    )
 
     model_config = ConfigDict(from_attributes=True)
 

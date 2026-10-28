@@ -266,6 +266,9 @@ async def create_workspace(
 async def get_workspace(
     workspace_id: str,
     conn=None,
+    *,
+    # DALTON-HOOK(colleague-dispatch): allow reading soft-deleted workspace shell for colleague historical threads.
+    include_deleted: bool = False,
 ) -> Optional[Dict[str, Any]]:
     # Normalize urn:uuid forms PostgreSQL rejects with 22P02; non-UUID SPA keys
     # cannot match the primary key and should return not-found, not 500.
@@ -274,6 +277,8 @@ async def get_workspace(
         return None
 
     try:
+        # DALTON-HOOK(colleague-dispatch): omit deleted status filter when include_deleted=True.
+        status_clause = "" if include_deleted else " AND w.status != 'deleted'"
         async with _ws_cursor(conn) as cur:
             await cur.execute(
                 f"""
@@ -282,7 +287,7 @@ async def get_workspace(
                        c.provider_config AS computer_provider_config
                 FROM workspaces w
                 LEFT JOIN computers c ON c.computer_id = w.computer_id
-                WHERE w.workspace_id = %s AND w.status != 'deleted'
+                WHERE w.workspace_id = %s{status_clause}
                 """,
                 (workspace_id,),
             )
@@ -1614,12 +1619,35 @@ async def workspace_has_active_work(workspace_id: str) -> bool:
         return await workspace_has_live_runs(cur, workspace_id)
 
 
-async def lock_run_workspace(conn, thread_id: str) -> None:
+# DALTON-HOOK(colleague-dispatch): verify colleague workspace access inside START txn under FOR SHARE OF w
+async def lock_run_workspace(
+    conn,
+    thread_id: str,
+    *,
+    turn_user_id: Optional[str] = None,
+    origin_channel: Optional[str] = None,
+    is_tail_turn: bool = False,
+    check_colleague_access: bool = True,
+    wakeup_notice_ids: Optional[list[str] | tuple[str, ...]] = None,
+    query_type: Optional[str] = None,
+    report_source: Any = None,
+    report_source_kind: Optional[str] = None,
+    report_source_id: Optional[str] = None,
+    retry_of_run_id: Optional[str] = None,
+    is_internal: bool = False,
+    is_dispatch: bool = False,
+    is_internal_dispatch: bool = False,
+    request: Any = None,
+    run_metadata: Optional[dict] = None,
+) -> bool:
     """Serialize admission with deletion and moves across workers until START commits."""
     async with conn.cursor(row_factory=dict_row) as cur:
         await cur.execute(
             """
-            SELECT w.workspace_id, w.status FROM workspaces w
+            SELECT w.workspace_id, w.user_id, w.status, w.name,
+                   COALESCE(t.user_id, w.user_id) AS thread_user_id,
+                   t.metadata AS thread_metadata
+            FROM workspaces w
             JOIN conversation_threads t ON t.workspace_id = w.workspace_id
             WHERE t.conversation_thread_id = %s
             FOR SHARE OF w
@@ -1628,13 +1656,110 @@ async def lock_run_workspace(conn, thread_id: str) -> None:
         )
         workspace = await cur.fetchone()
         if not workspace:
-            return
+            return False
         if workspace["status"] == "deleted":
             raise ValueError("Cannot start work in a deleted workspace")
     # Its own statement: one that waited on a move's claim for the row lock
     # would still read the move table as it stood before the claim.
     if await workspace_is_moving(workspace["workspace_id"], conn=conn):
         raise WorkspaceMovingError(str(workspace["workspace_id"]))
+    # DALTON-HOOK(colleague-dispatch): verify colleague access atomically under workspace FOR SHARE lock
+    from src.dalton.settings import is_dalton_supabase_auth_enabled
+
+    if check_colleague_access and is_dalton_supabase_auth_enabled():
+        ws_owner_id = str(workspace.get("user_id") or "")
+        effective_user_id = str(
+            turn_user_id or workspace.get("thread_user_id") or ws_owner_id
+        )
+        if effective_user_id and ws_owner_id and effective_user_id != ws_owner_id:
+            if is_tail_turn:
+                if isinstance(run_metadata, dict):
+                    run_metadata["tail_turn_no_new_work"] = True
+                return True
+            from fastapi import HTTPException
+            from src.dalton.sharing import (
+                ColleagueAccessRevokedError,
+                require_workspace_access,
+                verify_locked_wakeup_notices,
+                verify_server_tail_turn,
+            )
+
+            t_meta = workspace.get("thread_metadata")
+            eff_retry_id = retry_of_run_id or getattr(
+                request, "retry_of_run_id", None
+            )
+            # Only a ledger-verified resumable retry skips the per-notice
+            # check (it is re-admitted below as the run it continues); any
+            # other retry is new work and re-checks every notice's channel.
+            notices = (
+                isinstance(wakeup_notice_ids, (list, tuple)) and bool(wakeup_notice_ids)
+            )
+            resumable_retry = bool(notices and eff_retry_id) and await verify_server_tail_turn(
+                conn=conn,
+                thread_id=thread_id,
+                request=request,
+                is_internal=is_internal,
+                is_dispatch=is_dispatch,
+                is_internal_dispatch=is_internal_dispatch,
+                query_type=query_type,
+                report_source=report_source,
+                report_source_kind=report_source_kind,
+                report_source_id=report_source_id,
+                retry_of_run_id=eff_retry_id,
+            )
+            if notices and not resumable_retry:
+                await verify_locked_wakeup_notices(
+                    conn,
+                    thread_id=thread_id,
+                    turn_user_id=effective_user_id,
+                    workspace=dict(workspace),
+                    wakeup_notice_ids=wakeup_notice_ids,
+                    thread_meta=t_meta if isinstance(t_meta, dict) else None,
+                )
+            else:
+                dispatched_channel = (
+                    (t_meta.get("dispatched_by") or {}).get("channel")
+                    if isinstance(t_meta, dict)
+                    and isinstance(t_meta.get("dispatched_by"), dict)
+                    else None
+                )
+                effective_channel = str(origin_channel or dispatched_channel or "web")
+                revoked = False
+                try:
+                    await require_workspace_access(
+                        dict(workspace),
+                        effective_user_id,
+                        channel=effective_channel,
+                        need="write",
+                        workspace=dict(workspace),
+                        conn=conn,
+                    )
+                except HTTPException as exc:
+                    if exc.status_code in (403, 404):
+                        revoked = True
+                    else:
+                        raise
+                except ColleagueAccessRevokedError:
+                    revoked = True
+                if revoked:
+                    if await verify_server_tail_turn(
+                        conn=conn,
+                        thread_id=thread_id,
+                        request=request,
+                        is_internal=is_internal,
+                        is_dispatch=is_dispatch,
+                        is_internal_dispatch=is_internal_dispatch,
+                        query_type=query_type,
+                        report_source=report_source,
+                        report_source_kind=report_source_kind,
+                        report_source_id=report_source_id,
+                        retry_of_run_id=eff_retry_id,
+                    ):
+                        if isinstance(run_metadata, dict):
+                            run_metadata["tail_turn_no_new_work"] = True
+                        return True
+                    raise ColleagueAccessRevokedError()
+    return False
 
 
 async def delete_workspace(

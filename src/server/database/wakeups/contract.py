@@ -54,6 +54,8 @@ _COLUMN_NAMES = (
     "warned_at", "lapse_delivered_at", "lapse_delivered_run_id", "expires_at",
     "attempt_id", "vendor_order_id", "baseline_filled_qty", "order_outcome",
     "status", "cancelled_by", "cancelled_at", "created_at", "updated_at",
+    # DALTON-HOOK(colleague-dispatch): parent run id for origin channel inheritance
+    "created_by_run_id",
 )
 
 

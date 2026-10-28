@@ -38,6 +38,7 @@ from src.observability.langsmith_run import TOOL_PROVIDER
 from src.server.database.mcp_oauth import SERVABLE, ConnectionStatus, get_connection
 from src.server.services.brokerage_capabilities import (
     denied_tools,
+    group_for_tool,
     order_tool,
     vendor_for_url,
 )
@@ -492,9 +493,12 @@ def _pointer(root: Mapping[str, Any], ref: str) -> Any:
     return target
 
 
+# DALTON-HOOK(colleague-dispatch): dual identity (owner_user_id for relay JWT/connection, caller_user_id for trading gate)
 async def prepare_direct_mcp_tools(
     *,
-    user_id: str | None,
+    user_id: str | None = None,
+    owner_user_id: str | None = None,
+    caller_user_id: str | None = None,
     workspace_id: str,
     sandbox_id: str | None = None,
     computer_id: str | None = None,
@@ -502,8 +506,13 @@ async def prepare_direct_mcp_tools(
     by_server: Mapping[str, DirectServerTools],
 ) -> DirectMCPBinding:
     """Build the tools for one turn; nothing is dialled until ``drive``."""
-    binding = DirectMCPBinding(user_id=user_id)
-    if not by_server or not grants or not EGRESS_RELAY_SECRET or not user_id:
+    eff_owner_id = owner_user_id or user_id
+    eff_caller_id = caller_user_id or user_id or eff_owner_id
+    is_colleague_turn = bool(
+        eff_owner_id and eff_caller_id and str(eff_owner_id) != str(eff_caller_id)
+    )
+    binding = DirectMCPBinding(user_id=eff_owner_id)
+    if not by_server or not grants or not EGRESS_RELAY_SECRET or not eff_owner_id:
         return binding
 
     from mcp.types import Tool
@@ -514,7 +523,7 @@ async def prepare_direct_mcp_tools(
 
     minted = mint_relay_jwt(
         EGRESS_RELAY_SECRET,
-        user_id=user_id,
+        user_id=eff_owner_id,
         workspace_id=workspace_id,
         sandbox_id=sandbox_id,
         computer_id=computer_id,
@@ -533,7 +542,18 @@ async def prepare_direct_mcp_tools(
         non_order_tools = tuple(
             t
             for t in entry.tools
-            if t.resolved.order is None and not is_order_tool(entry.vendor, t.name)
+            if t.resolved.order is None
+            and not is_order_tool(entry.vendor, t.name)
+            and not (
+                is_colleague_turn
+                and (
+                    getattr(t.resolved, "capability_group", None) == "trading"
+                    or (
+                        (grp := group_for_tool(entry.vendor, t.name)) is not None
+                        and grp.key == "trading"
+                    )
+                )
+            )
         )
         if non_order_tools:
             grantable[name] = DirectServerTools(
@@ -632,10 +652,13 @@ async def prepare_direct_mcp_tools(
     return binding
 
 
+# DALTON-HOOK(colleague-dispatch): pass owner_user_id and caller_user_id through direct MCP tool binding
 async def direct_tools_for_turn(
     session: "Session",
     *,
-    user_id: str | None,
+    user_id: str | None = None,
+    owner_user_id: str | None = None,
+    caller_user_id: str | None = None,
     workspace_id: str,
     view: "WorkspaceToolView | None" = None,
 ) -> DirectMCPBinding:
@@ -645,13 +668,27 @@ async def direct_tools_for_turn(
     A binder that fails costs the turn its direct tools and not the turn: the
     rest of the toolset is still reachable through the sandbox.
     """
+    eff_owner_id = owner_user_id or user_id
+    eff_caller_id = caller_user_id or user_id or eff_owner_id
     try:
         return await bind_direct_mcp_tools(
-            session, user_id=user_id, workspace_id=workspace_id, view=view
+            session,
+            user_id=eff_owner_id,
+            workspace_id=workspace_id,
+            view=view,
+            **(
+                {
+                    "owner_user_id": eff_owner_id,
+                    "caller_user_id": eff_caller_id,
+                }
+                if eff_owner_id and eff_caller_id and eff_owner_id != eff_caller_id
+                else {}
+            ),
         )
     except Exception:
         logger.warning("[DIRECT_MCP] binding failed; running without", exc_info=True)
-        return DirectMCPBinding(user_id=user_id)
+        # DALTON-HOOK(colleague-dispatch): fallback DirectMCPBinding uses eff_owner_id
+        return DirectMCPBinding(user_id=eff_owner_id)
 
 
 def order_ledger_for_turn(
@@ -681,10 +718,13 @@ def order_ledger_for_turn(
     )
 
 
+# DALTON-HOOK(colleague-dispatch): accept owner_user_id and caller_user_id in bind_direct_mcp_tools
 async def bind_direct_mcp_tools(
     session: "Session",
     *,
-    user_id: str | None,
+    user_id: str | None = None,
+    owner_user_id: str | None = None,
+    caller_user_id: str | None = None,
     workspace_id: str,
     view: "WorkspaceToolView | None" = None,
 ) -> DirectMCPBinding:
@@ -697,12 +737,17 @@ async def bind_direct_mcp_tools(
     that one. The same goes for the split: the session's copy is whichever
     sibling resolved last, so a turn reads the view frozen for its project.
     """
+    eff_owner_id = owner_user_id or user_id
+    eff_caller_id = caller_user_id or user_id or eff_owner_id
     by_server = view.direct_mcp_tools if view is not None else session.direct_mcp_tools
     egress = view.egress_binding if view is not None else session.egress_binding
     if not by_server or egress is None:
-        return DirectMCPBinding(user_id=user_id)
+        return DirectMCPBinding(user_id=eff_owner_id)
+    # DALTON-HOOK(colleague-dispatch): pass owner_user_id and caller_user_id to prepare_direct_mcp_tools
     return await prepare_direct_mcp_tools(
-        user_id=user_id,
+        user_id=eff_owner_id,
+        owner_user_id=eff_owner_id,
+        caller_user_id=eff_caller_id,
         workspace_id=workspace_id,
         # Absent, not "": the host path runs for a session whose sandbox is not
         # provisioned, and the validator refuses an empty identity claim.

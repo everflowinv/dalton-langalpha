@@ -1,7 +1,8 @@
 /* eslint-disable react-refresh/only-export-components */
 import React, { useCallback, useState } from 'react';
-import { useQuery } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useLocation, useNavigate } from 'react-router';
+import { useTranslation } from 'react-i18next';
 import { ChevronDown, ChevronRight, Folder, Lock, Send, Users } from 'lucide-react';
 import { api } from '@/api/client';
 import { isDaltonAuth } from '@/config/daltonAuth';
@@ -39,6 +40,7 @@ export interface TeamMemberGroup {
 export interface TeamWorkspacesResponse {
   members: TeamMemberGroup[];
   caller_tier?: 'admin' | 'internal' | 'external';
+  colleague_dispatch_enabled?: boolean;
 }
 
 export async function fetchTeamWorkspaces(): Promise<TeamWorkspacesResponse> {
@@ -46,6 +48,7 @@ export async function fetchTeamWorkspaces(): Promise<TeamWorkspacesResponse> {
   return {
     members: Array.isArray(data?.members) ? data.members : [],
     caller_tier: data?.caller_tier,
+    colleague_dispatch_enabled: data?.colleague_dispatch_enabled,
   };
 }
 
@@ -64,6 +67,8 @@ export interface TeamReadOnlyState {
   isColleague: boolean;
   isReadOnly: boolean;
   canWriteFiles: boolean;
+  colleagueDispatchEnabled: boolean;
+  isThreadOnly?: boolean;
   ownerName: string | null;
   ownerEmail: string | null;
 }
@@ -74,9 +79,15 @@ export interface TeamReadOnlyState {
  */
 export function useTeamReadOnly(
   workspaceId: string | null | undefined,
-  workspaceRecord?: { user_id?: string | null; name?: string | null } | null,
+  workspaceRecord?: {
+    user_id?: string | null;
+    name?: string | null;
+    effective_web_access?: string | null;
+    colleague_dispatch_enabled?: boolean | null;
+  } | null,
 ): TeamReadOnlyState {
   const location = useLocation();
+  const queryClient = useQueryClient();
   const { user: currentUser } = useUser({ enabled: Boolean(workspaceId) && isDaltonAuth });
   const { data: teamData } = useTeamWorkspaces(Boolean(workspaceId));
 
@@ -86,6 +97,8 @@ export function useTeamReadOnly(
       isColleague: false,
       isReadOnly: false,
       canWriteFiles: true,
+      colleagueDispatchEnabled: false,
+      isThreadOnly: false,
       ownerName: null,
       ownerEmail: null,
     };
@@ -98,6 +111,19 @@ export function useTeamReadOnly(
     teamOwnerEmail?: string;
   } | null;
 
+  const sharingData = queryClient.getQueryData<{ colleague_dispatch_enabled?: boolean }>(
+    queryKeys.dalton.sharing(workspaceId),
+  );
+  const colleagueDispatchEnabled = Boolean(
+    workspaceRecord?.colleague_dispatch_enabled ??
+      sharingData?.colleague_dispatch_enabled ??
+      teamData?.colleague_dispatch_enabled ??
+      false,
+  );
+
+  const effectiveAccess = workspaceRecord?.effective_web_access ?? null;
+  const isThreadOnly = effectiveAccess === 'thread_only';
+
   const members = teamData?.members ?? [];
   for (const member of members) {
     const matched = member.workspaces.find((ws) => ws.workspace_id === workspaceId);
@@ -108,13 +134,20 @@ export function useTeamReadOnly(
         member.email ||
         matched.owner_email ||
         '同事';
-      const rawAccess = matched.web_access || matched.access || navState?.teamAccess || 'ro';
-      const mode: TeamAccessMode = rawAccess === 'rw' ? 'rw' : 'ro';
+      const rawAccess =
+        (effectiveAccess === 'rw' || effectiveAccess === 'ro' ? effectiveAccess : null) ||
+        matched.web_access ||
+        matched.access ||
+        navState?.teamAccess ||
+        'ro';
+      const mode: TeamAccessMode = !isThreadOnly && rawAccess === 'rw' ? 'rw' : 'ro';
       return {
         access: mode,
         isColleague: true,
         isReadOnly: mode === 'ro',
         canWriteFiles: mode === 'rw',
+        colleagueDispatchEnabled,
+        isThreadOnly,
         ownerName: display,
         ownerEmail: member.email || matched.owner_email || null,
       };
@@ -130,24 +163,32 @@ export function useTeamReadOnly(
       matchedMember?.email ||
       navState?.teamOwnerName ||
       wsOwnerId;
-    const mode: TeamAccessMode = navState?.teamAccess === 'rw' ? 'rw' : 'ro';
+    const rawAccess =
+      (effectiveAccess === 'rw' || effectiveAccess === 'ro' ? effectiveAccess : null) ||
+      navState?.teamAccess ||
+      'ro';
+    const mode: TeamAccessMode = !isThreadOnly && rawAccess === 'rw' ? 'rw' : 'ro';
     return {
       access: mode,
       isColleague: true,
       isReadOnly: mode === 'ro',
       canWriteFiles: mode === 'rw',
+      colleagueDispatchEnabled,
+      isThreadOnly,
       ownerName: display,
       ownerEmail: matchedMember?.email || navState?.teamOwnerEmail || null,
     };
   }
 
   if (navState?.isTeamReadOnly) {
-    const mode: TeamAccessMode = navState.teamAccess === 'rw' ? 'rw' : 'ro';
+    const mode: TeamAccessMode = !isThreadOnly && navState.teamAccess === 'rw' ? 'rw' : 'ro';
     return {
       access: mode,
       isColleague: true,
       isReadOnly: mode === 'ro',
       canWriteFiles: mode === 'rw',
+      colleagueDispatchEnabled,
+      isThreadOnly,
       ownerName: navState.teamOwnerName || '同事',
       ownerEmail: navState.teamOwnerEmail || null,
     };
@@ -161,6 +202,8 @@ export function useTeamReadOnly(
       isColleague: true,
       isReadOnly: true,
       canWriteFiles: false,
+      colleagueDispatchEnabled,
+      isThreadOnly,
       ownerName: navState?.teamOwnerName || '同事',
       ownerEmail: navState?.teamOwnerEmail || null,
     };
@@ -171,6 +214,8 @@ export function useTeamReadOnly(
     isColleague: false,
     isReadOnly: false,
     canWriteFiles: true,
+    colleagueDispatchEnabled,
+    isThreadOnly: false,
     ownerName: null,
     ownerEmail: null,
   };
@@ -397,20 +442,34 @@ export function TeamReadOnlyBanner({
 }
 
 /**
- * Disabled composer replacing the writable ChatInput when viewing a teammate's workspace/thread.
+ * Disabled composer replacing the writable ChatInput when viewing a teammate's workspace/thread
+ * or when viewing a thread dispatched by a colleague.
  */
 export function TeamReadOnlyComposer({
   ownerName,
   access = 'ro',
+  dispatchedByName,
+  revoked = false,
+  colleagueDispatchEnabled = true,
 }: {
   ownerName: string | null;
   access?: TeamAccessMode;
+  dispatchedByName?: string | null;
+  revoked?: boolean;
+  colleagueDispatchEnabled?: boolean;
 }): React.ReactElement {
-  const label =
-    access === 'rw'
-      ? `可读写（文件） · 来自 ${ownerName || '同事'}（发送消息与派活：该功能下一期开放）`
-      : `只读 · 来自 ${ownerName || '同事'}（无法发送消息或新建对话）`;
-  const buttonTitle = access === 'rw' ? '该功能下一期开放' : '只读模式下不可发送';
+  const { t } = useTranslation();
+  const label = revoked
+    ? t('dalton.sharing.revokedThreadReadonlyHint')
+    : dispatchedByName
+      ? t('dalton.sharing.dispatchedThreadReadonlyHint', { name: dispatchedByName })
+      : access === 'rw'
+        ? colleagueDispatchEnabled
+          ? `可读写（文件） · 来自 ${ownerName || '同事'}（仅对话创建者可继续提问）`
+          : `可读写（文件） · 来自 ${ownerName || '同事'}（发送消息与派活：该功能下一期开放）`
+        : `只读 · 来自 ${ownerName || '同事'}（无法发送消息或新建对话）`;
+  const buttonTitle =
+    access === 'rw' && !colleagueDispatchEnabled ? '该功能下一期开放' : '只读模式下不可发送';
   return (
     <div
       data-testid="team-readonly-composer"

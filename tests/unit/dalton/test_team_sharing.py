@@ -104,6 +104,11 @@ def _enable_dalton_auth(monkeypatch: pytest.MonkeyPatch) -> None:
         dalton_sharing.get_workspace_sharing, side_effect=_fake_get_sharing
     )
     monkeypatch.setattr(dalton_sharing, "get_workspace_sharing", get_sharing_mock)
+    monkeypatch.setattr(
+        conv_db,
+        "user_has_threads_in_workspace",
+        create_autospec(conv_db.user_has_threads_in_workspace, return_value=False),
+    )
 
 
 def _disable_dalton_auth(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1027,7 +1032,7 @@ class TestWriteEndpointsRejectColleagues:
                 user_id="u-chao", workspace_id=ws["workspace_id"]
             )
         assert exc_new_thread.value.status_code == 403
-        assert exc_new_thread.value.detail == "该功能下一期开放"
+        assert exc_new_thread.value.detail == "该功能尚未开放"
         get_ws_mock.assert_called_once_with(ws["workspace_id"])
 
         # Route-level send_new_thread_message also rejects creating a thread in colleague's workspace
@@ -1050,7 +1055,7 @@ class TestWriteEndpointsRejectColleagues:
                 raw_request=_make_request(),
             )
         assert exc_route_new.value.status_code == 403
-        assert exc_route_new.value.detail == "该功能下一期开放"
+        assert exc_route_new.value.detail == "该功能尚未开放"
 
         # 2. Route-level send_thread_message to an existing colleague thread -> 403
         auth_meta_mock.return_value = {
@@ -1068,7 +1073,7 @@ class TestWriteEndpointsRejectColleagues:
                 raw_request=_make_request(),
             )
         assert exc_send.value.status_code == 403
-        assert exc_send.value.detail == "该功能下一期开放"
+        assert exc_send.value.detail == "该功能尚未开放"
 
     @pytest.mark.asyncio
     async def test_file_write_delete_upload_backup_rejected_on_colleague_workspace(

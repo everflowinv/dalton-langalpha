@@ -88,7 +88,11 @@ async def _insert_reconcile_version(
 
 
 async def detect_direct_edits(
-    workspace_id: str, user_id: str
+    workspace_id: str,
+    user_id: str,
+    *,
+    storage_owner_id: str | None = None,
+    skip_access_check: bool = False,
 ) -> dict[str, Any]:
     """Inspect the Postgres workspace_files mirror after a turn and record any direct edits (PK.5).
 
@@ -99,7 +103,9 @@ async def detect_direct_edits(
       ``apply_pending`` backs up the edited markdown to ``history/`` on the next turn.
     - Tampering or deletion of ``published/**`` files is logged and surfaced as a warning.
     """
-    await verify_workspace_access(workspace_id, user_id)
+    eff_storage_owner = storage_owner_id or user_id
+    if not skip_access_check and storage_owner_id is None:
+        await verify_workspace_access(workspace_id, user_id)
     meta = await get_file_metadata_for_sync(workspace_id)
     latest_all = await db_knowledge.list_all_latest_for_workspace(
         workspace_id, valid_only=False
@@ -127,7 +133,9 @@ async def detect_direct_edits(
                 file_row = await db_get_file(workspace_id, j_path, include_content=True)
                 raw_text = (
                     await resolve_file_text_or_none(
-                        file_row, user_id=user_id, context=f"reconcile:{j_path}"
+                        file_row,
+                        user_id=eff_storage_owner,
+                        context=f"reconcile:{j_path}",
                     )
                     if file_row
                     else None
@@ -329,9 +337,11 @@ async def apply_pending(
     backend: Any,
     *,
     user_id: str | None = None,
+    storage_owner_id: str | None = None,
+    skip_access_check: bool = False,
 ) -> dict[str, Any]:
     """Reconcile any unwritten versions and refresh ``agent.md`` at turn start (PK.5)."""
-    if user_id is not None:
+    if user_id is not None and not skip_access_check and storage_owner_id is None:
         await verify_workspace_access(workspace_id, user_id)
     if backend is None:
         return {"written": 0, "alerts": []}
@@ -445,10 +455,12 @@ class DaltonReconcileMiddleware(AgentMiddleware):
         workspace_id: str | None,
         backend: Any,
         user_id: str | None = None,
+        storage_owner_id: str | None = None,
     ) -> None:
         self._workspace_id = workspace_id
         self._backend = backend
         self._user_id = user_id
+        self._storage_owner_id = storage_owner_id
 
     async def abefore_agent(
         self, state: Any, runtime: Any = None
@@ -467,6 +479,8 @@ class DaltonReconcileMiddleware(AgentMiddleware):
                     self._workspace_id,
                     self._backend,
                     user_id=self._user_id,
+                    storage_owner_id=self._storage_owner_id,
+                    skip_access_check=True,
                 ),
                 timeout=10.0,
             )

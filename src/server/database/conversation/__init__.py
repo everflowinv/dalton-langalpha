@@ -35,6 +35,8 @@ from src.server.database.conversation.threads_read import (
     get_workspace_thread_prefixes,
     _like_escape,
     lookup_thread_by_external_id,
+    # DALTON-HOOK(colleague-dispatch): re-export user_has_threads_in_workspace.
+    user_has_threads_in_workspace,
 )
 from src.server.database.conversation.threads_write import (
     calculate_next_thread_index,
@@ -126,6 +128,8 @@ __all__ = [
     "update_thread_title_cas",
     "stamp_thread_seen",
     "upsert_feedback",
+    # DALTON-HOOK(colleague-dispatch): export user_has_threads_in_workspace
+    "user_has_threads_in_workspace",
     "ws_exists_key",
     "forget_workspace_exists",
 ]

@@ -311,6 +311,7 @@ export interface WorkspaceSharingResponse {
   web_access: WorkspaceAccessLevel;
   is_home?: boolean;
   can_edit: boolean;
+  colleague_dispatch_enabled?: boolean;
   /** True when the workspace owner is an external member: sharing settings do
    *  not apply (admin read-only), so the UI shows a notice instead of options. */
   owner_external?: boolean;
@@ -329,7 +330,7 @@ export async function fetchWorkspaceSharing(
 
 export async function updateWorkspaceSharing(
   workspaceId: string,
-  payload: { cos_access: WorkspaceAccessLevel; web_access: WorkspaceAccessLevel },
+  payload: { cos_access?: WorkspaceAccessLevel; web_access: WorkspaceAccessLevel },
 ): Promise<WorkspaceSharingResponse> {
   const { data } = await api.put<WorkspaceSharingResponse>(
     `/api/v1/dalton/workspaces/${encodeURIComponent(workspaceId)}/sharing`,

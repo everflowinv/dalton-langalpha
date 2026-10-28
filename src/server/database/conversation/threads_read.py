@@ -39,6 +39,7 @@ async def lookup_thread_by_external_id(
     try:
         async with pool.get_db_connection() as conn:
             async with conn.cursor(row_factory=dict_row) as cur:
+                # DALTON-HOOK(colleague-dispatch): scope external_id lookup by thread owner.
                 await cur.execute(
                     """
                     SELECT ct.conversation_thread_id
@@ -46,7 +47,7 @@ async def lookup_thread_by_external_id(
                     JOIN workspaces w ON ct.workspace_id = w.workspace_id
                     WHERE ct.platform = %s
                       AND ct.external_id = %s
-                      AND w.user_id = %s
+                      AND COALESCE(ct.user_id, w.user_id) = %s
                     ORDER BY ct.updated_at DESC
                     LIMIT 1
                 """,
@@ -172,6 +173,8 @@ async def get_workspace_threads(
     sort_order: str = "desc",
     platform_prefix: Optional[str] = None,
     archived: bool = False,
+    # DALTON-HOOK(colleague-dispatch): optional filter for caller-owned threads when workspace is hidden.
+    owner_user_id: Optional[str] = None,
 ) -> Tuple[List[Dict[str, Any]], int]:
     """Get threads for a workspace with pagination.
 
@@ -203,6 +206,10 @@ async def get_workspace_threads(
     if platform_prefix:
         where_extra = " AND platform LIKE %s ESCAPE '\\'"
         extra_params.append(f"{_like_escape(platform_prefix)}%")
+    # DALTON-HOOK(colleague-dispatch): restrict to caller-owned threads when workspace is hidden.
+    if owner_user_id:
+        where_extra += " AND user_id = %s"
+        extra_params.append(owner_user_id)
 
     try:
         async with pool.get_db_connection() as conn:
@@ -222,8 +229,13 @@ async def get_workspace_threads(
 
                 # Page the thread rows FIRST, then one lifecycle LATERAL over
                 # the paged set only — bounded by page size, never thread count.
+                # DALTON-HOOK(colleague-dispatch): project thread_user_id, workspace_owner_id, and dispatched_by
                 query = f"""
-                    SELECT t.*, tc.turn_count, {_LATEST_ATTEMPT_LATERAL_COLS}
+                    SELECT t.*,
+                           COALESCE(t.user_id, w.user_id) AS thread_user_id,
+                           w.user_id AS workspace_owner_id,
+                           t.metadata->'dispatched_by' AS dispatched_by,
+                           tc.turn_count, {_LATEST_ATTEMPT_LATERAL_COLS}
                     FROM (
                         SELECT {_sql._THREAD_COLUMNS}, last_seen_run_seq
                         FROM conversation_threads
@@ -232,6 +244,7 @@ async def get_workspace_threads(
                                  conversation_thread_id DESC
                         LIMIT %s OFFSET %s
                     ) t
+                    LEFT JOIN workspaces w ON w.workspace_id = t.workspace_id
                     {_TURN_COUNT_LATERAL}
                     {_LATEST_ATTEMPT_LATERAL}
                     ORDER BY {outer_order}t.{sort_by} {sort_order.upper()},
@@ -285,29 +298,34 @@ async def get_threads_for_user(
     try:
         async with pool.get_db_connection() as conn:
             async with conn.cursor(row_factory=dict_row) as cur:
+                # DALTON-HOOK(colleague-dispatch): include threads created by user_id in colleague workspaces (even if soft-deleted by colleague).
                 await cur.execute(
                     f"""
                     SELECT COUNT(*) as total
                     FROM conversation_threads t
                     JOIN workspaces w ON t.workspace_id = w.workspace_id
-                    WHERE w.user_id = %s AND w.status != 'deleted'
+                    WHERE ((w.user_id = %s AND w.status != 'deleted') OR (t.user_id = %s AND w.user_id != %s))
                       AND t.archived_at IS NULL{where_extra}
                     """,
-                    (user_id, *extra_params),
+                    (user_id, user_id, user_id, *extra_params),
                 )
                 total_result = await cur.fetchone()
                 total_count = total_result["total"] if total_result else 0
 
                 # Page FIRST, then the per-row LATERALs run over the paged
                 # set only (first-query preview + lifecycle columns).
+                # DALTON-HOOK(colleague-dispatch): project thread_user_id, workspace_owner_id, and dispatched_by
                 query = f"""
                     SELECT t.*, fq.content AS first_query_content,
                            tc.turn_count, {_LATEST_ATTEMPT_LATERAL_COLS}
                     FROM (
-                        SELECT {_sql._THREAD_COLUMNS_T}, t.last_seen_run_seq
+                        SELECT {_sql._THREAD_COLUMNS_T}, t.last_seen_run_seq,
+                               COALESCE(t.user_id, w.user_id) AS thread_user_id,
+                               w.user_id AS workspace_owner_id,
+                               t.metadata->'dispatched_by' AS dispatched_by
                         FROM conversation_threads t
                         JOIN workspaces w ON t.workspace_id = w.workspace_id
-                        WHERE w.user_id = %s AND w.status != 'deleted'
+                        WHERE ((w.user_id = %s AND w.status != 'deleted') OR (t.user_id = %s AND w.user_id != %s))
                           AND t.archived_at IS NULL{where_extra}
                         ORDER BY {order_by} {sort_order.upper()},
                                  t.conversation_thread_id DESC
@@ -325,7 +343,10 @@ async def get_threads_for_user(
                     ORDER BY t.{sort_by} {sort_order.upper()},
                              t.conversation_thread_id DESC
                 """
-                await cur.execute(query, (user_id, *extra_params, limit, offset))
+                # DALTON-HOOK(colleague-dispatch): bind user_id for owner and colleague thread filters
+                await cur.execute(
+                    query, (user_id, user_id, user_id, *extra_params, limit, offset)
+                )
                 threads = await cur.fetchall()
                 return [dict(row) for row in threads], total_count
 
@@ -346,6 +367,7 @@ async def get_recent_threads_for_user(
     """
     async with pool.get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
+            # DALTON-HOOK(colleague-dispatch): scope recent threads and labels by thread owner.
             await cur.execute(
                 f"""
                 SELECT t.conversation_thread_id, t.workspace_id, t.updated_at,
@@ -356,7 +378,7 @@ async def get_recent_threads_for_user(
                            t.updated_at, w.name AS workspace_name
                     FROM conversation_threads t
                     JOIN workspaces w ON t.workspace_id = w.workspace_id
-                    WHERE w.user_id = %s AND w.status != 'deleted'
+                    WHERE COALESCE(t.user_id, w.user_id) = %s AND w.status != 'deleted'
                       AND t.archived_at IS NULL
                       AND t.conversation_thread_id IS DISTINCT FROM %s::uuid
                       AND (t.metadata->'origin'->>'type')
@@ -385,13 +407,20 @@ async def get_thread_labels(
         return []
     async with pool.get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
+            # DALTON-HOOK(colleague-dispatch): match thread owner via COALESCE(t.user_id, ws.user_id).
             await cur.execute(
                 f"""
                 SELECT t.conversation_thread_id, t.workspace_id,
                        w.name AS workspace_name,
                        {_TITLE_OR_FIRST_QUERY} AS title
                 FROM conversation_threads t
-                JOIN workspaces w ON t.workspace_id = w.workspace_id
+                JOIN LATERAL (
+                    SELECT ws.workspace_id, ws.name,
+                           COALESCE(t.user_id, ws.user_id) AS user_id,
+                           ws.status
+                    FROM workspaces ws
+                    WHERE ws.workspace_id = t.workspace_id
+                ) w ON TRUE
                 WHERE t.conversation_thread_id = ANY(%s)
                   AND w.user_id = %s AND w.status != 'deleted'
                 ORDER BY t.created_at ASC, t.conversation_thread_id ASC
@@ -419,6 +448,7 @@ async def get_thread_labels(
 # Archived threads are absent from both; the archive stamps the latest TERMINAL
 # attempt seen (GREATEST no-ops on a live one), so their absence is not
 # truncation.
+# DALTON-HOOK(colleague-dispatch): scope live/unseen feed snapshot to thread owner, not workspace owner.
 _LIFECYCLE_SNAPSHOT_SQL = f"""
     WITH owned AS (
         SELECT ct.conversation_thread_id, ct.workspace_id, ct.archived_at,
@@ -441,7 +471,7 @@ _LIFECYCLE_SNAPSHOT_SQL = f"""
             ORDER BY cr.run_seq DESC
             LIMIT 1
         ) la ON TRUE
-        WHERE w.user_id = %s AND w.status != 'deleted'
+        WHERE COALESCE(ct.user_id, w.user_id) = %s AND w.status != 'deleted'
     ),
     watermark AS (
         SELECT COALESCE(MAX(latest_run_seq), 0) AS as_of_seq FROM owned
@@ -505,11 +535,19 @@ async def get_thread_with_summary(
         async with pool.get_db_connection() as conn:
             async with conn.cursor(row_factory=dict_row) as cur:
                 # Get thread basic info
+                # DALTON-HOOK(colleague-dispatch): join workspaces to include workspace_owner_id for thread_maintenance
                 await cur.execute(
                     """
-                    SELECT conversation_thread_id, workspace_id, current_status, thread_index, created_at, updated_at
-                    FROM conversation_threads
-                    WHERE conversation_thread_id = %s
+                    SELECT t.conversation_thread_id,
+                           t.workspace_id,
+                           t.current_status,
+                           t.thread_index,
+                           t.created_at,
+                           t.updated_at,
+                           w.user_id AS workspace_owner_id
+                    FROM conversation_threads t
+                    LEFT JOIN workspaces w ON w.workspace_id = t.workspace_id
+                    WHERE t.conversation_thread_id = %s
                 """,
                     (conversation_thread_id,),
                 )
@@ -755,13 +793,21 @@ async def get_thread_auth_meta(thread_id: str, *, conn=None) -> Optional[Dict[st
     try:
         async with pool.get_db_connection(conn) as conn:
             async with conn.cursor(row_factory=dict_row) as cur:
+                # DALTON-HOOK(colleague-dispatch): return thread owner (user_id / owner_id / thread_user_id), workspace_owner_id, workspace_status, and metadata.
                 await cur.execute(
                     """
-                    SELECT w.user_id, t.is_shared, t.msg_type, t.workspace_id,
+                    SELECT COALESCE(t.user_id, w.user_id) AS user_id,
+                           COALESCE(t.user_id, w.user_id) AS owner_id,
+                           COALESCE(t.user_id, w.user_id) AS thread_user_id,
+                           w.user_id AS workspace_owner_id,
+                           w.status AS workspace_status,
+                           t.metadata,
+                           t.is_shared, t.msg_type, t.workspace_id,
                            t.llm_model, t.reasoning_effort, t.fast_mode
                     FROM conversation_threads t
                     JOIN workspaces w ON w.workspace_id = t.workspace_id
                     WHERE t.conversation_thread_id = %s
+                      AND (w.status != 'deleted' OR (t.user_id IS NOT NULL AND t.user_id != w.user_id))
                     """,
                     (thread_id,),
                 )
@@ -770,6 +816,28 @@ async def get_thread_auth_meta(thread_id: str, *, conn=None) -> Optional[Dict[st
     except Exception as e:
         logger.error(f"Error getting thread auth meta: {e}")
         raise
+
+
+# DALTON-HOOK(colleague-dispatch): check whether caller owns any thread in a workspace (for hidden fallback).
+async def user_has_threads_in_workspace(
+    workspace_id: str, user_id: str, *, conn=None
+) -> bool:
+    """Return True if ``user_id`` created at least one thread in ``workspace_id``."""
+    ws_id = normalize_uuid(workspace_id)
+    if ws_id is None or not user_id:
+        return False
+    async with pool.get_db_connection(conn) as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                SELECT 1
+                FROM conversation_threads
+                WHERE workspace_id = %s AND user_id = %s
+                LIMIT 1
+                """,
+                (ws_id, user_id),
+            )
+            return (await cur.fetchone()) is not None
 
 
 async def read_thread_subagents_allowed(thread_id: str) -> bool | None:
@@ -786,11 +854,12 @@ async def read_thread_subagents_allowed(thread_id: str) -> bool | None:
     async with pool.get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
             # A thread with no value of its own (NULL) follows its owner's default.
+            # DALTON-HOOK(colleague-dispatch): resolve subagents_default via thread owner t.user_id
             await cur.execute(
                 f"""
                 SELECT COALESCE(
                     t.subagents_allowed,
-                    {_sql.owner_subagents_default("t.workspace_id")}
+                    {_sql.owner_subagents_default("t.workspace_id", user_id_sql="t.user_id")}
                 ) AS allowed
                 FROM conversation_threads t
                 WHERE t.conversation_thread_id = %s

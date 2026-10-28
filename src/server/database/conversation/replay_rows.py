@@ -37,6 +37,8 @@ class ThreadRows:
     # The run still going on each turn that has one, by id. Replay draws
     # nothing from it; a turn with no settled response only names its run.
     open_runs: dict[Any, str] = field(default_factory=dict)
+    # DALTON-HOOK(colleague-dispatch): workspace owner (B) when distinct from thread owner (A).
+    workspace_owner_id: str | None = None
 
 
 async def get_branch_pointer(thread_id: str) -> tuple[str, list[Any]] | None:
@@ -76,15 +78,23 @@ async def get_replay_thread_data(thread_id: str) -> ThreadRows | None:
     async with pool.get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
             # 1. Owner check (join threads -> workspaces)
+            # DALTON-HOOK(colleague-dispatch): return thread owner (A) as user_id and workspace owner (B) as workspace_owner_id.
             await cur.execute(
-                """SELECT w.user_id
+                """SELECT COALESCE(t.user_id, w.user_id) AS user_id,
+                          w.user_id AS workspace_owner_id
                    FROM conversation_threads t
                    JOIN workspaces w ON w.workspace_id = t.workspace_id
-                   WHERE t.conversation_thread_id = %s""",
+                   WHERE t.conversation_thread_id = %s
+                     AND (w.status != 'deleted' OR (t.user_id IS NOT NULL AND t.user_id != w.user_id))""",
                 (thread_id,),
             )
             owner_row = await cur.fetchone()
             owner_id = owner_row["user_id"] if owner_row else None
+            workspace_owner_id = (
+                (owner_row.get("workspace_owner_id") or owner_id)
+                if owner_row
+                else None
+            )
 
             if owner_id is None:
                 return None
@@ -189,6 +199,8 @@ async def get_replay_thread_data(thread_id: str) -> ThreadRows | None:
         provenance=provenance,
         run_facts=run_facts,
         open_runs=open_runs,
+        # DALTON-HOOK(colleague-dispatch): pass workspace_owner_id alongside thread owner_id.
+        workspace_owner_id=workspace_owner_id,
     )
 
 

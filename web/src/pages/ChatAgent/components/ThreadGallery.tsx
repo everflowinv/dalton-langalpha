@@ -820,9 +820,16 @@ function ThreadGallery({ workspaceId, onBack, onThreadSelect }: ThreadGalleryPro
 
             {/* Chat Input */}
             <div className="w-full relative z-20">
-              {/* DALTON-HOOK(workspace-sharing-settings): replace writable ChatInput with disabled colleague composer */}
-              {teamReadOnly.isColleague ? (
-                <TeamReadOnlyComposer ownerName={teamReadOnly.ownerName} access={teamReadOnly.access} />
+              {/* DALTON-HOOK(workspace-sharing-settings): replace writable ChatInput with disabled colleague composer when read-only */}
+              {/* DALTON-HOOK(colleague-dispatch): allow starting new threads when colleague_dispatch_enabled is true and colleague workspace has web_access === 'rw' */}
+              {teamReadOnly.isColleague &&
+              (teamReadOnly.isReadOnly || !teamReadOnly.colleagueDispatchEnabled) ? (
+                <TeamReadOnlyComposer
+                  ownerName={teamReadOnly.ownerName}
+                  access={teamReadOnly.access}
+                  colleagueDispatchEnabled={teamReadOnly.colleagueDispatchEnabled}
+                  revoked={teamReadOnly.isThreadOnly}
+                />
               ) : (
                 <ChatInput
                   ref={chatInputRef}

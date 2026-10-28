@@ -386,7 +386,48 @@ async def start_run(
             async with conn.transaction():
                 from src.server.database.workspace import lock_run_workspace
 
-                await lock_run_workspace(conn, thread_id)
+                # DALTON-HOOK(colleague-dispatch): pass turn user, origin channel, wakeup notice ids, and tail-turn probe to lock_run_workspace
+                _meta = metadata if isinstance(metadata, dict) else {}
+                _q_meta = (
+                    query.metadata
+                    if query is not None and isinstance(query.metadata, dict)
+                    else {}
+                )
+                _report_source = _meta.get("report_source") or _q_meta.get(
+                    "report_source"
+                )
+                _query_type = _meta.get("query_type") or (
+                    query.query_type if query is not None else None
+                )
+                _has_explicit_internal = (
+                    "is_internal_dispatch" in _meta
+                    or "is_internal" in _meta
+                    or "is_dispatch" in _meta
+                )
+                _is_internal_dispatch = (
+                    bool(
+                        _meta.get("is_internal_dispatch")
+                        or _meta.get("is_internal")
+                        or _meta.get("is_dispatch")
+                    )
+                    if _has_explicit_internal
+                    else bool(_query_type == "system" and _report_source)
+                )
+                locked_tail_turn = await lock_run_workspace(
+                    conn,
+                    thread_id,
+                    turn_user_id=user_id,
+                    origin_channel=_meta.get("origin_channel"),
+                    is_tail_turn=bool(_meta.get("tail_turn_no_new_work")),
+                    wakeup_notice_ids=_meta.get("wakeup_notice_ids"),
+                    query_type=_query_type,
+                    report_source=_report_source,
+                    retry_of_run_id=retry_of_run_id or _meta.get("retry_of_run_id"),
+                    is_internal_dispatch=_is_internal_dispatch,
+                    run_metadata=_meta if isinstance(metadata, dict) else None,
+                )
+                if locked_tail_turn and not isinstance(metadata, dict):
+                    metadata = {**(metadata or {}), "tail_turn_no_new_work": True}
 
                 # Fast-path dedup probe. The unique index below is the
                 # race-safe backstop; this just avoids burning a turn_index

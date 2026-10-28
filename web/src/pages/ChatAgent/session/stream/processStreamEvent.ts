@@ -857,6 +857,13 @@ export const createStreamEventProcessor = (rt: StreamRuntime, deps: StreamRouter
         ? { message: errorMessage as string, kind: 'notice' }
         : readStreamFailure(event, errorMessage as string);
 
+      // DALTON-HOOK(colleague-dispatch): terminal non-retryable error when workspace owner revokes colleague access
+      if (event.code === 'colleague_access_revoked') {
+        failureShown = true;
+        rt.setMessageError(rt.t('dalton.sharing.revokedThreadReadonlyHint'));
+        settleFailedBubble({ assistantMessageId, refs, setMessages: setMessagesForHandlers, internal: true });
+        return;
+      }
       // A server older than this view frames its time limit, then the same
       // stop again as an internal error: the card already says it, and a
       // banner on top would report one failure twice.
