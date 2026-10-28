@@ -36,18 +36,27 @@ import {
  */
 export const REMOTE_CONTROL_POLL_MS = 10_000;
 
+interface RemoteControlReader {
+  enabled: boolean;
+  poll?: boolean;
+  reread?: boolean;
+}
+
 /**
  * The helper's status, read only in a shell that can turn it on and off; null
  * when the shell gave no answer. `poll: false` for a reader that needs no
  * pause noticed (it still sees what a polling reader of the same key reads).
+ * `reread: false` for a reader opened on an answer just read, which a read of
+ * its own as it mounts could change under it.
  */
-export function useRemoteControl(options: { enabled: boolean; poll?: boolean }) {
+export function useRemoteControl(options: RemoteControlReader) {
   return useQuery({
     queryKey: queryKeys.desktop.remoteControl(),
     queryFn: getRemoteControl,
     enabled: options.enabled && canRemoteControl(),
     staleTime: 0,
     retry: false,
+    refetchOnMount: options.reread !== false,
     refetchInterval: options.poll === false ? false : REMOTE_CONTROL_POLL_MS,
   });
 }
@@ -101,15 +110,27 @@ export function serverTakesRemoteControl(providers: ComputerProvidersResponse | 
  * already is it: undefined while the list that says so is still loading.
  * Read only while `enabled`, and each read waits on the one before, so a
  * browser, or a Mac the helper cannot run on, asks the server nothing.
- * `poll: false` as for `useRemoteControl`.
+ * `poll` and `reread` as for `useRemoteControl`. `settled` once every read it
+ * waits on has answered or failed, for a surface laid out by the answer: the
+ * shell answers apart from the server, and can land after it.
  */
-export function useThisMacAvailability(options: { enabled: boolean; poll?: boolean }) {
-  const { data: status } = useRemoteControl(options);
-  const { data: providers } = useComputerProviders({ enabled: options.enabled && !!status?.supported });
+export function useThisMacAvailability(options: RemoteControlReader) {
+  const remoteControl = useRemoteControl(options);
+  const { data: status, isLoading: statusLoading } = remoteControl;
+  const { data: providers, isLoading: providersLoading } = useComputerProviders({
+    enabled: options.enabled && !!status?.supported,
+  });
   const offered = options.enabled && remoteControlOffered(status, providers);
-  const { data: list } = useComputers({ enabled: offered });
+  const { data: list, isLoading: listLoading } = useComputers({ enabled: offered });
   const added = !offered ? false : list?.computers.some((c) => isThisMac(c, status?.fingerprint));
-  return { offered, added, status };
+  // A read that failed has answered too, or one refused list would hold the
+  // surface shut; `added` then stays undefined, and the card stays out.
+  // A null kept from a channel that threw is no answer, so the read this mount
+  // starts is waited for; the polls after it are not, or a form open on the
+  // answer would close with each one.
+  const statusRetrying = status === null && remoteControl.isFetching && !remoteControl.isFetchedAfterMount;
+  const settled = !statusLoading && !statusRetrying && !providersLoading && !listLoading;
+  return { offered, added, status, settled };
 }
 
 /**

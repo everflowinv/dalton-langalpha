@@ -264,6 +264,13 @@ AUDIT_EXEMPT_FILES = {
     # after a full diff proved that was the sole delta (see the
     # DALTON-HOOK(extended-hours-quotes) note in test_provider_isolation.py).
     "tests/unit/llms/golden/thread_render.json",
+    # sync2 B15: the request lock regenerated wholesale for Dalton (48 models),
+    # per the regeneration contract in test_request_lock.py. JSON carries no
+    # inline markers; every class of delta vs upstream is provenance-mapped in
+    # .agy/sync2/request_lock_diff.md (all to registered Dalton hooks; no
+    # unexplained diffs), and the UUID placeholders come from the
+    # DALTON-HOOK(xai-oauth) normalization in the test module.
+    "tests/unit/llms/request_lock.json",
 }
 
 def is_dalton_owned(rel: str) -> bool:

@@ -173,6 +173,12 @@ observability = [
 # `uv run playwright install chromium` to enable the `?format=pdf` routes;
 # without it the endpoints return 501 (lazy import, graceful no-op).
 pdf = ["playwright>=1.49"]
+# The Claude Code runtime (src/ptc_agent/agent/claude_code): the Agent SDK and
+# the claude CLI it bundles, about 290 MB installed. An extra so images that
+# never run a Claude Code turn do not carry the CLI; the package is imported
+# only by that runtime. Pinned exactly: the runtime subclasses the SDK's
+# subprocess transport, which is internal API.
+claude-code = ["claude-agent-sdk==0.2.174"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/ptc_agent"]
