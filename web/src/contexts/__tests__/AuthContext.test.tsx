@@ -3,6 +3,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, waitFor, act } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { requestsInFlight } from '../../lib/reloadHolds';
+import { runAuthResets } from '../../lib/authResets';
 
 // Enable platform auth code path (AuthProvider checks VITE_HOST_MODE)
 // Must be set before the dynamic import below.
@@ -545,6 +546,65 @@ describe('AuthContext', () => {
       });
       expect(mockSignOut).not.toHaveBeenCalled();
       expect(requestsInFlight(0)).toBe(false);
+
+      fetchSpy.mockRestore();
+      daltonAuthState.isDaltonAuth = false;
+    });
+
+    // DALTON-HOOK(dalton-auth): a sign-in that reuses A's in-flight sync after an
+    // auth reset still holds the stale-build reload until that sync lands
+    it('holds the reload for a sign-in that reuses an in-flight sync after an auth reset', async () => {
+      daltonAuthState.isDaltonAuth = true;
+      const sessionA = {
+        user: { id: 'user-a', email: 'a@dalton.org', user_metadata: {} },
+        access_token: 'tok-a',
+        expires_at: 4102444800,
+      };
+      let resolveFetchA!: (value: Response) => void;
+      const fetchAPromise = new Promise<Response>((resolve) => {
+        resolveFetchA = resolve;
+      });
+      const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(() => fetchAPromise);
+
+      renderWithQueryClient(
+        <AuthProvider>
+          <TestConsumer />
+        </AuthProvider>
+      );
+      await waitFor(() => expect(mockOnAuthStateChange).toHaveBeenCalled());
+      const handler = mockOnAuthStateChange.mock.calls[0][0] as (
+        event: string,
+        session: unknown,
+      ) => void;
+
+      await act(async () => {
+        handler('SIGNED_IN', sessionA);
+      });
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      expect(requestsInFlight(0)).toBe(true);
+
+      // Sign-out / account switch: the reset drops every tracked request.
+      runAuthResets();
+      expect(requestsInFlight(0)).toBe(false);
+
+      // A signs back in before the first sync lands: no second fetch, but the
+      // reused sync must hold the reload again.
+      await act(async () => {
+        handler('SIGNED_IN', sessionA);
+      });
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      expect(requestsInFlight(0)).toBe(true);
+
+      await act(async () => {
+        resolveFetchA(
+          new Response(JSON.stringify({ user: { user: 'user-a' }, preferences: null }), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          })
+        );
+        await fetchAPromise;
+      });
+      await waitFor(() => expect(requestsInFlight(0)).toBe(false));
 
       fetchSpy.mockRestore();
       daltonAuthState.isDaltonAuth = false;
