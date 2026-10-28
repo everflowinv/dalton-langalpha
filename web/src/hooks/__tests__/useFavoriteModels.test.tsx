@@ -1,18 +1,18 @@
 /**
  * The hook reads the list's inputs out of preferences and the model catalog,
- * and writes a removal as an opt-out and an add as a star that lifts one. The
- * order and the opt-out rule are tested once, in `lib/quickAccessModels`.
+ * and saves the whole list as stars on any edit. The seed and the order are
+ * tested once, in `lib/favoriteModels`.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { renderHookWithProviders } from '@/test/utils';
-import type { ModelAccess } from '@/types/platform';
-import { useQuickAccessModels } from '../useQuickAccessModels';
+import type { Payer } from '@/lib/modelPayer';
+import { useFavoriteModels } from '../useFavoriteModels';
 
 const mocks = vi.hoisted(() => ({
   preferences: null as unknown,
   isLoaded: true,
+  modelsLoading: false,
   platform: true,
-  accessMap: undefined as Record<string, ModelAccess> | undefined,
   systemDefaults: null as Record<string, string> | null,
   mutate: vi.fn(),
 }));
@@ -25,12 +25,12 @@ vi.mock('../usePreferences', () => ({
   usePreferences: () => ({ preferences: mocks.preferences, isLoading: false, isLoaded: mocks.isLoaded }),
 }));
 
-const ACCESS: Record<string, ModelAccess> = {
-  'model-platform': 'platform',
-  'model-oauth': 'oauth',
-  'model-key': 'byok',
-  'model-starred': 'platform',
-  'model-background': 'platform',
+const PAYERS: Record<string, Payer> = {
+  'model-platform': 'credits',
+  'model-oauth': 'subscription:claude-oauth',
+  'model-key': 'own_key',
+  'model-starred': 'credits',
+  'model-background': 'credits',
 };
 
 vi.mock('../useAllModels', () => ({
@@ -40,12 +40,13 @@ vi.mock('../useAllModels', () => ({
       oauth: { models: ['model-oauth'] },
       key: { models: ['model-key'] },
     },
-    modelAccessMap: mocks.accessMap,
-    validModelNames: new Set(Object.keys(ACCESS)),
+    payers: PAYERS,
+    validModelNames: new Set(Object.keys(PAYERS)),
     systemDefaults: mocks.systemDefaults,
     offPlanModels: new Set(),
     platform: mocks.platform ? { model_tier: 0, byok_providers: [], oauth_providers: [] } : null,
     rawApiResponse: {},
+    isLoading: mocks.modelsLoading,
   }),
 }));
 
@@ -57,12 +58,12 @@ function prefs(other: Record<string, unknown>, model: Record<string, unknown> = 
   mocks.preferences = { other_preference: other, model_preference: model };
 }
 
-describe('useQuickAccessModels', () => {
+describe('useFavoriteModels', () => {
   beforeEach(() => {
     mocks.mutate.mockReset();
     mocks.isLoaded = true;
+    mocks.modelsLoading = false;
     mocks.platform = true;
-    mocks.accessMap = ACCESS;
     mocks.systemDefaults = null;
     prefs({});
   });
@@ -72,15 +73,14 @@ describe('useQuickAccessModels', () => {
       { starred_models: ['model-starred'], hidden_quick_access_models: ['model-oauth'] },
       { preferred_model: 'model-platform' },
     );
-    const { result } = renderHookWithProviders(() => useQuickAccessModels());
+    const { result } = renderHookWithProviders(() => useFavoriteModels());
     expect(result.current.models).toEqual(['model-platform', 'model-starred', 'model-key']);
-    expect(result.current.starred).toEqual(['model-starred']);
   });
 
   it('lists the deployment\'s default the user left unset, but not the background model, which no conversation runs', () => {
     // A pick on a thread saves no preference, so this is the way back to it.
     mocks.systemDefaults = { default_model: 'model-platform', background_model: 'model-background' };
-    const { result } = renderHookWithProviders(() => useQuickAccessModels());
+    const { result } = renderHookWithProviders(() => useFavoriteModels());
     expect(result.current.models).toEqual(['model-platform', 'model-oauth', 'model-key']);
   });
 
@@ -88,7 +88,7 @@ describe('useQuickAccessModels', () => {
     // The read answered 404 (a reset deletes the row): known, with nothing saved.
     mocks.preferences = null;
     mocks.systemDefaults = { default_model: 'model-platform', background_model: 'model-background' };
-    const { result } = renderHookWithProviders(() => useQuickAccessModels());
+    const { result } = renderHookWithProviders(() => useFavoriteModels());
     expect(result.current.models).toEqual(['model-platform', 'model-oauth', 'model-key']);
   });
 
@@ -96,41 +96,61 @@ describe('useQuickAccessModels', () => {
     mocks.preferences = null;
     mocks.isLoaded = false;
     mocks.systemDefaults = { default_model: 'model-platform', background_model: 'model-background' };
-    const { result } = renderHookWithProviders(() => useQuickAccessModels());
+    const { result } = renderHookWithProviders(() => useFavoriteModels());
     expect(result.current.models).toEqual(['model-oauth', 'model-key']);
   });
 
-  it('records a removal as an opt-out and drops its star', () => {
-    prefs({ starred_models: ['model-starred'] });
-    const { result } = renderHookWithProviders(() => useQuickAccessModels());
+  it('saves the list it shows, less the removed one, and turns the seed off', () => {
+    prefs({ starred_models: ['model-starred'] }, { preferred_model: 'model-platform' });
+    const { result } = renderHookWithProviders(() => useFavoriteModels());
     result.current.remove('model-starred');
     expect(mocks.mutate).toHaveBeenLastCalledWith({
-      other_preference: { starred_models: null, hidden_quick_access_models: ['model-starred'] },
+      other_preference: {
+        starred_models: ['model-platform', 'model-oauth', 'model-key'],
+        hidden_quick_access_models: null,
+        favorites_starred_only: true,
+      },
     });
   });
 
-  it('stars an added model and lifts its opt-out', () => {
-    prefs({ hidden_quick_access_models: ['model-oauth'] });
-    const { result } = renderHookWithProviders(() => useQuickAccessModels());
-    result.current.add('model-oauth');
+  it('adds to the end of the saved list', () => {
+    prefs({ starred_models: ['model-key'], favorites_starred_only: true });
+    const { result } = renderHookWithProviders(() => useFavoriteModels());
+    expect(result.current.models).toEqual(['model-key']);
+    result.current.add('model-platform');
     expect(mocks.mutate).toHaveBeenLastCalledWith({
-      other_preference: { starred_models: ['model-oauth'], hidden_quick_access_models: null },
+      other_preference: {
+        starred_models: ['model-key', 'model-platform'],
+        hidden_quick_access_models: null,
+        favorites_starred_only: true,
+      },
     });
+  });
+
+  it('keeps an unreachable favorite saved while not listing it', () => {
+    prefs({ starred_models: ['model-gone', 'model-key'], favorites_starred_only: true });
+    const { result } = renderHookWithProviders(() => useFavoriteModels());
+    expect(result.current.models).toEqual(['model-key']);
+    result.current.add('model-oauth');
+    expect(mocks.mutate.mock.lastCall?.[0].other_preference.starred_models)
+      .toEqual(['model-gone', 'model-key', 'model-oauth']);
   });
 
   it('makes no edit before preferences are read, since each one replaces the saved lists', () => {
     mocks.preferences = null;
     mocks.isLoaded = false;
-    const { result } = renderHookWithProviders(() => useQuickAccessModels());
+    const { result } = renderHookWithProviders(() => useFavoriteModels());
     result.current.remove('model-oauth');
     result.current.add('model-key');
     expect(mocks.mutate).not.toHaveBeenCalled();
   });
 
-  it('lists none of the user\'s own models on a platform until the access map arrives', () => {
-    prefs({}, { preferred_model: 'model-platform' });
-    mocks.accessMap = undefined;
-    const { result } = renderHookWithProviders(() => useQuickAccessModels());
-    expect(result.current.models).toEqual(['model-platform']);
+  // The seed lists the user's own models from the payers, empty until the
+  // models load: an edit then would save a seed without them, for good.
+  it('makes no edit before the models load', () => {
+    mocks.modelsLoading = true;
+    const { result } = renderHookWithProviders(() => useFavoriteModels());
+    result.current.add('model-key');
+    expect(mocks.mutate).not.toHaveBeenCalled();
   });
 });

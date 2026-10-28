@@ -7,6 +7,7 @@ import { usePreferences } from '@/hooks/usePreferences';
 import { useApiKeys } from '@/hooks/useApiKeys';
 import type { ByokProvider } from '@/components/model/types';
 import { useTranslation } from 'react-i18next';
+import { useModelName } from '@/hooks/useModelName';
 import { modelPrefs } from '@/lib/modelPreferences';
 import { useModelSlotCopy } from '@/components/model/useModelSlotCopy';
 import { useWelcomeOffer } from '@/pages/Onboarding/welcome/useWelcomeOffer';
@@ -22,6 +23,7 @@ export default function DoneStep() {
   const { apiKeys } = useApiKeys();
   const { t } = useTranslation();
   const copy = useModelSlotCopy();
+  const modelName = useModelName();
   const welcomeOffer = useWelcomeOffer();
   const headingId = useId();
   // A connection sends the user back the moment it works, so a return that
@@ -53,8 +55,12 @@ export default function DoneStep() {
   }, [apiKeys]);
 
   const modelPref = modelPrefs(preferences);
-  const primaryModel = modelPref.preferred_model ?? t('setup.notSet');
-  const backgroundModel = modelPref.preferred_background_model ?? t('setup.notSet');
+  const primaryModel = modelPref.preferred_model
+    ? modelName(modelPref.preferred_model)
+    : t('setup.notSet');
+  const backgroundModel = modelPref.preferred_background_model
+    ? modelName(modelPref.preferred_background_model)
+    : t('setup.notSet');
   const providerLabel = configuredProviderNames.length > 0
     ? configuredProviderNames.join(', ')
     : t('setup.notConfigured');

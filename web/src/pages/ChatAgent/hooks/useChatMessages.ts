@@ -219,6 +219,8 @@ export function useChatMessages(
     setFallbackSuggestion((prev) => ({
       fromModel: event.from_is_primary === false && prev ? prev.fromModel : fromModel,
       toModel,
+      paidBy: typeof event.to_paid_by === 'string' ? event.to_paid_by : undefined,
+      provider: typeof event.to_provider === 'string' ? event.to_provider : undefined,
     }));
   };
   const clearFallbackSuggestion = useCallback(() => setFallbackSuggestion(null), []);

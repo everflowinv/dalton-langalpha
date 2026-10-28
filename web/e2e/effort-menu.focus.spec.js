@@ -1,5 +1,5 @@
 /**
- * The effort and speed lists in the composer's model menu, reached the way
+ * The effort and speed list in the composer's effort menu, reached the way
  * someone without a mouse reaches them.
  *
  * These were plain `<div role="menuitemradio">` once. That reads correctly to a
@@ -11,10 +11,13 @@
  * so a unit test can only assert which component was used. Whether focus
  * actually arrives is a question with an answer in one place, here.
  *
- * The mouse half is the other risk. Menu items deliberately wear no ring --
- * `outline-none` in the primitive, indication via `data-[highlighted]` for
- * pointer and keyboard alike -- so the fix must not have handed these rows the
- * app's baseline `:focus-visible` ring on the way in.
+ * The mouse half is the other risk. Menu items deliberately wear no ring under
+ * a pointer -- `outline-hidden`, indication via the `data-focused` tint for
+ * pointer and keyboard alike -- so the rows must not pick up the app's
+ * baseline `:focus-visible` ring.
+ *
+ * The menu is react-aria's now, as the model picker beside it is; it opens on
+ * the current level, so arrowing starts from what is set.
  */
 import { test, expect, mockAPI } from './fixtures.js';
 import { defaultResponses } from './helpers/mockResponses.js';
@@ -60,8 +63,8 @@ function preferenceRoutes() {
   };
 }
 
-// The menu renders nothing without a model to configure, and the effort list
-// nothing without a ladder on it. Both come from the manifest in real use.
+// The pill renders nothing without a model to configure, and nothing for a
+// model with no ladder on it. Both come from the manifest in real use.
 const overrides = {
   'GET /models': {
     model_metadata: {
@@ -75,52 +78,21 @@ const overrides = {
   },
 };
 
-const TRIGGER = '.model-selector-trigger';
-// A setting row is a menu item wearing the primitive's `setting` variant, so it
-// carries no class of its own; the value it currently reads is what marks one.
-const ROW = '[role="menuitem"]:has(.model-setting-value)';
-const VALUE = '.model-setting-value';
+const TRIGGER = 'button[data-pill="effort"]';
 const OPTION = '[role="menuitemradio"]';
-// A plain item in the same open menu, so the forced-colors reading below is
-// compared against the primitive as it stands rather than a memory of it.
-const CONTROL = 'Manage models';
 
-/** What Radix marks as highlighted, which is also what holds focus. */
-function highlighted(page, sel = '[data-highlighted]') {
+/** The row react-aria marks as focused, and whether it holds focus. */
+function highlighted(page, sel = `${OPTION}[data-focused]`) {
   return page.evaluate((s) => {
     const el = document.querySelector(s);
     return el && { text: el.textContent, focused: document.activeElement === el };
   }, sel);
 }
 
-/**
- * Arrow down until the Effort row is the highlighted item. A count of presses
- * would pin the menu's current length instead of the reachability under test.
- */
-async function arrowToEffortRow(page) {
-  const marked = () => page.evaluate(() => document.querySelector('[data-highlighted]')?.textContent ?? null);
-  // Roving focus is installed as the menu opens, and a key pressed before that
-  // lands nowhere. Waiting for the first highlight is what separates "the menu
-  // is visible" from "the menu takes keys".
-  await expect.poll(marked).not.toBe(null);
-
-  const items = await page.locator('[role="menuitem"], [role="menuitemradio"]').count();
-  for (let i = 0; i <= items; i += 1) {
-    if (await page.evaluate((s) => !!document.querySelector(`${s}[data-highlighted]`), ROW)) return;
-    const before = await marked();
-    await page.keyboard.press('ArrowDown');
-    // The highlight *moving* is what proves the press was taken. Polling for
-    // any highlight passes on the one already there, so a press swallowed
-    // mid-animation still spends an iteration and the walk stops short.
-    await expect.poll(marked).not.toBe(before);
-  }
-  throw new Error('arrowing through the menu never reached the effort row');
-}
-
 async function openMenuByKeyboard(page) {
   await page.locator(TRIGGER).evaluate((el) => el.focus());
   await page.keyboard.press('Enter');
-  await expect(page.locator(ROW)).toBeVisible();
+  await expect(page.locator(OPTION).first()).toBeVisible();
 }
 
 test.beforeEach(async ({ page }) => {
@@ -130,45 +102,31 @@ test.beforeEach(async ({ page }) => {
 });
 
 test.describe('the effort list on a keyboard', () => {
-  test('takes focus when arrowed into, and picking one leaves the menu open', async ({ page }) => {
+  test('takes focus when arrowed through, and picking one leaves the menu open', async ({ page }) => {
     await openMenuByKeyboard(page);
-    await arrowToEffortRow(page);
-    await page.keyboard.press('ArrowRight');
-    await expect(page.locator(OPTION).first()).toBeVisible();
-
-    // The regression: focus never arrived here, so this was an empty list to
-    // anyone arrowing. Both halves matter -- highlighted and actually focused.
-    await expect.poll(() => highlighted(page, `${OPTION}[data-highlighted]`))
-      .toEqual({ text: 'Off', focused: true });
+    // It opens on the current level, the one Settings gives here.
+    await expect.poll(() => highlighted(page)).toEqual({ text: 'MediumDefault', focused: true });
 
     await page.keyboard.press('ArrowDown');
-    await expect.poll(() => highlighted(page, `${OPTION}[data-highlighted]`))
-      .toEqual({ text: 'Low', focused: true });
+    await expect.poll(() => highlighted(page)).toEqual({ text: 'High', focused: true });
 
     await page.keyboard.press('Enter');
-    // Choosing an effort is a setting, not a send: the value updates in place
+    // Choosing an effort is a setting, not a send: the pill updates in place
     // and the menu stays up for the next choice.
-    await expect(page.locator(VALUE)).toHaveText('Low');
-    await expect(page.locator(ROW)).toBeVisible();
+    await expect(page.locator(TRIGGER)).toHaveText('High');
+    await expect(page.locator(OPTION).first()).toBeVisible();
   });
 
-  test('is reachable when the row expands in place, as it does on a narrow screen', async ({ page }) => {
+  test('works the same on a narrow screen', async ({ page }) => {
     await page.setViewportSize({ width: 390, height: 844 });
     await page.click('.langalpha-fab');
     await expect(page.locator(TRIGGER)).toBeVisible();
 
     await openMenuByKeyboard(page);
-    await arrowToEffortRow(page);
-    // No flyout here; the row itself is the toggle, which only answers Enter if
-    // it is a menu item rather than the div it used to be.
+    await expect.poll(() => highlighted(page)).toEqual({ text: 'MediumDefault', focused: true });
+    await page.keyboard.press('ArrowUp');
     await page.keyboard.press('Enter');
-    await expect(page.locator(OPTION).first()).toBeVisible();
-
-    await page.keyboard.press('ArrowDown');
-    await expect.poll(() => highlighted(page, `${OPTION}[data-highlighted]`))
-      .toEqual({ text: 'Off', focused: true });
-    await page.keyboard.press('Enter');
-    await expect(page.locator(VALUE)).toHaveText('Off');
+    await expect(page.locator(TRIGGER)).toHaveText('Low');
   });
 });
 
@@ -185,36 +143,29 @@ test.describe('the effort list on a keyboard', () => {
  * exactly the rows this branch made keyboard-reachable. Nothing on screen said
  * so outside forced colors, and jsdom paints no outlines at all.
  */
-test.describe('the setting rows under forced colors', () => {
+test.describe('the options under forced colors', () => {
   test.beforeEach(async ({ page }) => {
     await page.emulateMedia({ forcedColors: 'active' });
   });
 
-  test('keep the ring the untouched items in the same menu still have', async ({ page }) => {
+  test("keep the primitive's ring", async ({ page }) => {
     await page.click(TRIGGER);
-    await page.hover(ROW);
     await expect(page.locator(OPTION).first()).toBeVisible();
 
-    const outline = (locator) => locator.evaluate((el) => {
+    const outlines = await page.locator(OPTION).evaluateAll((els) => els.map((el) => {
       const cs = getComputedStyle(el);
       return `${cs.outlineStyle} ${cs.outlineWidth}`;
-    });
-
-    expect({
-      control: await outline(page.getByRole('menuitem', { name: CONTROL })),
-      row: await outline(page.locator(ROW)),
-      option: await outline(page.locator(OPTION).first()),
-    }).toEqual({ control: 'solid 2px', row: 'solid 2px', option: 'solid 2px' });
+    }));
+    expect(new Set(outlines)).toEqual(new Set(['solid 2px']));
   });
 });
 
 test.describe('the same list under a mouse', () => {
   test('paints no ring on the option that was clicked', async ({ page }) => {
     await page.click(TRIGGER);
-    await page.hover(ROW);
     await expect(page.locator(OPTION).first()).toBeVisible();
     await page.locator(OPTION).nth(1).click();
-    await expect(page.locator(VALUE)).toHaveText('Low');
+    await expect(page.locator(TRIGGER)).toHaveText('Low');
 
     // The click leaves the option holding focus, which is what makes this
     // worth measuring: a rule keyed on :focus rather than :focus-visible would
@@ -228,7 +179,7 @@ test.describe('the same list under a mouse', () => {
       .map((el) => {
         const cs = getComputedStyle(el);
         return { text: el.textContent, style: cs.outlineStyle, color: cs.outlineColor, shadow: cs.boxShadow };
-      }), `${OPTION}, ${ROW}`);
+      }), OPTION);
     const painted = rings
       .filter((r) => !unpainted(r.style, r.color) || r.shadow !== 'none')
       .map((r) => r.text);
@@ -240,9 +191,8 @@ test.describe('the same list under a mouse', () => {
     // the ring and every assertion there still passes, with nothing on screen
     // saying which effort is armed.
     await page.click(TRIGGER);
-    await page.hover(ROW);
     await page.locator(OPTION).nth(1).click();
-    await expect.poll(() => highlighted(page, `${OPTION}[data-highlighted]`))
+    await expect.poll(() => highlighted(page))
       .toEqual({ text: 'Low', focused: true });
   });
 });

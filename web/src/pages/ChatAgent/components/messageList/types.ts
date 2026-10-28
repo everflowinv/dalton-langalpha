@@ -1,4 +1,4 @@
-import type { TextChunkMark } from '@/types/chat';
+import type { ModelFallbackNotice, TextChunkMark } from '@/types/chat';
 
 // Stable empty object to avoid defeating React.memo with fresh `|| {}` fallbacks
 export const EMPTY_OBJ = {} as Record<string, never>;
@@ -28,6 +28,8 @@ export interface ContentSegmentRecord {
   questionId?: string;
   proposalId?: string;
   widgetId?: string;
+  /** Notification-only: a model switch, labeled when shown. */
+  fallback?: ModelFallbackNotice;
   /** Notification-only: longer text (compaction summary / fallback error) shown under toggle. */
   detail?: string;
   /** Notification-only: expander toggle label flavor. */

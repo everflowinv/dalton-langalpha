@@ -1,6 +1,7 @@
 import type React from 'react';
 import { useTranslation } from 'react-i18next';
 import { Loader } from '@/components/ui/loader';
+import { useModelName, usePaidByLabel } from '@/hooks/useModelName';
 import type { ModelStatus } from '../../session/types';
 import { StatusLine } from './StatusLine';
 
@@ -12,16 +13,21 @@ export function ModelStatusPill({ modelStatus, isLoading }: {
   isLoading: boolean;
 }): React.ReactElement | null {
   const { t } = useTranslation();
+  const name = useModelName();
+  const paidBy = usePaidByLabel();
   if (!(modelStatus && isLoading)) return null;
+  const payer = modelStatus.kind === 'fallback' ? paidBy(modelStatus.paidBy, modelStatus.toModel, modelStatus.provider) : undefined;
   return (
     <StatusLine glyph={<Loader size={14} className="text-(--color-accent-primary)" />}>
       {modelStatus.kind === 'retrying'
         ? t('chat.modelRetrying', {
-            model: modelStatus.model,
+            model: name(modelStatus.model),
             attempt: modelStatus.attempt + 1,
             total: modelStatus.maxRetries + 1,
           })
-        : t('chat.modelFallingBack', { model: modelStatus.toModel })}
+        : payer
+          ? t('chat.modelFallingBackPaid', { model: name(modelStatus.toModel), payer })
+          : t('chat.modelFallingBack', { model: name(modelStatus.toModel) })}
     </StatusLine>
   );
 }

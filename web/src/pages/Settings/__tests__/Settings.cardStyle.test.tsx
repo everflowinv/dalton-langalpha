@@ -47,7 +47,7 @@ vi.mock('@/contexts/ThemeContext', () => ({
 vi.mock('@/hooks/useAllModels', () => ({
   useAllModels: () => ({
     models: {},
-    modelAccessMap: {},
+    payers: {},
     systemDefaults: { fallback_models: [] },
     validModelNames: new Set<string>(),
     compactionProfiles: null,

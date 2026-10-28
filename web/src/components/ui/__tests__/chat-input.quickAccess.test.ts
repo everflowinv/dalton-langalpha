@@ -1,11 +1,11 @@
 // @vitest-environment node
 import { describe, it, expect } from 'vitest';
-import { derivePrimaryModels } from '../chat-input.models';
+import { deriveRecentModels } from '../chat-input.models';
 
-describe('derivePrimaryModels', () => {
+describe('deriveRecentModels', () => {
   it('lists the thread models, then the current selection', () => {
     expect(
-      derivePrimaryModels({
+      deriveRecentModels({
         selectedModel: 'gpt-5',
         threadModels: ['claude-opus', 'claude-sonnet'],
         validModelNames: new Set(),
@@ -15,7 +15,7 @@ describe('derivePrimaryModels', () => {
 
   it('dedupes a selection the thread already used', () => {
     expect(
-      derivePrimaryModels({
+      deriveRecentModels({
         selectedModel: 'claude-opus',
         threadModels: ['claude-opus'],
         validModelNames: new Set(),
@@ -27,7 +27,7 @@ describe('derivePrimaryModels', () => {
     // A model can be revoked (BYOK key removed, plan downgrade) long after a
     // turn used it. Leaving it clickable fails only once the user sends.
     expect(
-      derivePrimaryModels({
+      deriveRecentModels({
         selectedModel: 'gpt-5',
         threadModels: ['claude-opus', 'revoked-model'],
         validModelNames: new Set(['claude-opus', 'gpt-5']),
@@ -39,7 +39,7 @@ describe('derivePrimaryModels', () => {
     // The trigger renders the selection; gating it would leave the menu unable
     // to show what is currently selected.
     expect(
-      derivePrimaryModels({
+      deriveRecentModels({
         selectedModel: 'not-yet-loaded',
         threadModels: ['claude-opus'],
         validModelNames: new Set(['claude-opus']),
@@ -49,7 +49,7 @@ describe('derivePrimaryModels', () => {
 
   it('skips the availability gate while the model list is still loading', () => {
     expect(
-      derivePrimaryModels({
+      deriveRecentModels({
         selectedModel: null,
         threadModels: ['claude-opus', 'gpt-5'],
         validModelNames: new Set(),
@@ -60,7 +60,7 @@ describe('derivePrimaryModels', () => {
   it('offers thread models from any provider, not just the selection\'s', () => {
     // The point of the change: history spanning providers stays reachable.
     expect(
-      derivePrimaryModels({
+      deriveRecentModels({
         selectedModel: 'gpt-5',
         threadModels: ['claude-opus', 'glm-5.2'],
         validModelNames: new Set(['claude-opus', 'glm-5.2', 'gpt-5']),
@@ -70,7 +70,7 @@ describe('derivePrimaryModels', () => {
 
   it('returns an empty list with no selection and no history', () => {
     expect(
-      derivePrimaryModels({
+      deriveRecentModels({
         selectedModel: null,
         threadModels: [],
         validModelNames: new Set(),
@@ -80,7 +80,7 @@ describe('derivePrimaryModels', () => {
 
   it('drops malformed thread-model entries', () => {
     expect(
-      derivePrimaryModels({
+      deriveRecentModels({
         selectedModel: 'gpt-5',
         threadModels: [123, '', null, 'claude-opus'] as unknown as string[],
         validModelNames: new Set(),

@@ -394,8 +394,8 @@
     "customModelNameDuplicate": "Duplicate model name",
     "customModelProviderNoKey": "No API key configured for provider \"{{provider}}\". Add a BYOK key first.",
     "customModelInvalidJson": "Invalid JSON",
-    "starredModels": "Quick-access models",
-    "starredModelsDesc": "Shown in the chat input for quick switching. Your default models and the models of your own API keys and connected accounts are added for you; remove any you don't use.",
+    "starredModels": "Favorite models",
+    "starredModelsDesc": "First in the model picker. Star a model there, or add one here.",
     "fallbackModels": "Fallback models",
     "fallbackModelsEmpty": "No models found",
     "removeModel": "Remove {{model}}",
@@ -513,11 +513,13 @@
     "selectModel": "Select a model...",
     "autoModel": "Auto ({{model}})",
     "noModelsAvailable": "No models available",
-    "modelAccess": {
-      "platform": "platform",
-      "byok": "BYOK",
-      "oauth": "OAuth",
-      "locked": "locked"
+    "payerOrder": {
+      "rule": "Tags show who pays. <ownKey /> comes before <deployment />.",
+      "skipped": "Runs only on turns paid with credits",
+      "skippedSelfHosted": "Runs only on turns on the server's key",
+      "skippedNote": "Faded ones skip turns you pay for yourself.",
+      "savedNote": "Saved fallbacks run on every turn, including ones you pay for yourself.",
+      "useAlways": "Use on every turn"
     },
     "approvals": "Approvals",
     "autoApproveHandoffs": "Hand off work without asking",
@@ -2027,7 +2029,9 @@
     "errorAttemptedModels": "Also tried:",
     "modelRetrying": "{{model}} error — retrying ({{attempt}}/{{total}})…",
     "modelFallingBack": "Falling back to {{model}}…",
+    "modelFallingBackPaid": "Falling back to {{model}} ({{payer}})…",
     "modelFallbackNotification": "{{from}} failed — switched to {{to}}",
+    "modelFallbackNotificationPaid": "{{from}} failed — switched to {{to}} ({{payer}})",
     "modelFallbackAttempts_one": "{{count}} attempt",
     "modelFallbackAttempts_other": "{{count}} attempts",
     "viewErrorDetail": "View error",
@@ -2075,6 +2079,7 @@
     },
     "modelTroubleSuggestion": "{{from}} is having trouble — this answer came from {{to}}",
     "switchToModel": "Switch to {{model}}",
+    "switchToModelPaid": "Switch to {{model}} ({{payer}})",
     "threadSubagents": {
       "offerOff": "Subagents are off in this thread. Your default has them on.",
       "offerOn": "Subagents are on in this thread. Your default has them off.",
@@ -2423,8 +2428,6 @@
     "offloadBusy": "Can only offload when the current turn has finished streaming.",
     "modelSelector": {
       "manageModels": "Manage models",
-      "moreModels": "More models",
-      "configureModels": "Configure models →",
       "setUpModel": "Set up a model",
       "reasoningEffort": "Effort",
       "effortNone": "Off",
@@ -2434,14 +2437,29 @@
       "effortHigh": "High",
       "effortXhigh": "Extra High",
       "effortMax": "Max",
-      "effortHint": "Higher effort is more thorough but slower.",
       "defaultBadge": "Default",
       "speed": "Speed",
       "speedStandard": "Standard",
       "speedFast": "Fast",
-      "speedFastHint": "2× credit usage, priority service tier",
+      "speedFastHint": "2× usage",
       "select": "Select model",
-      "fallbackName": "Model"
+      "fallbackName": "Model",
+      "search": "Search models",
+      "groups": "Model groups",
+      "favorites": "Favorites",
+      "inThread": "In this thread",
+      "noMatch": "No models match",
+      "noFavorites": "Star a model to keep it here",
+      "favorite": "Add {{model}} to favorites",
+      "unfavorite": "Remove {{model}} from favorites",
+      "current": "Current model",
+      "paidBy": "Paid by",
+      "unbilled": "Other",
+      "taskCost": "{{value}}×",
+      "taskCostAtMost": "≤{{value}}×",
+      "taskCostUnmeasured": "Not measured at this level. Costs no more than the level above.",
+      "taskCostHeader": "Cost per task",
+      "taskCostNote": "A rough estimate of how a typical task's cost changes with effort, compared with the default level."
     },
     "voice": {
       "start": "Start voice input",
@@ -6345,6 +6363,14 @@
       "handoff": "handed to an analyst",
       "taskHandoff": "task handed to an analyst"
     }
+  },
+  "payer": {
+    "subscription": "Subscription",
+    "plan": "{{plan}} plan",
+    "ownKey": "Your key",
+    "credits": "LangAlpha credits",
+    "serverKey": "Server key",
+    "locked": "locked"
   },
   "modelAccess": {
     "title": "Model access",

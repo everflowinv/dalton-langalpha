@@ -411,6 +411,8 @@ class RunSSEProducer:
         event emits nothing."""
         import time
 
+        from src.server.services.history.projector import MODEL_FALLBACK_FIELDS
+
         # Track start time for timeout
         workflow_start_time = time.time()
         timeout_warning_sent = False
@@ -667,12 +669,7 @@ class RunSSEProducer:
                                 "attempt",
                                 "max_retries",
                                 "delay_seconds",
-                                "from_model",
-                                "to_model",
-                                "from_is_primary",
-                                "error_type",  # DALTON-HOOK(fallback-reason-log)
-                                "status_code",
-                                "attempts_on_from",
+                                *MODEL_FALLBACK_FIELDS,  # DALTON-HOOK(fallback-reason-log)
                             ):
                                 if key in event_data:
                                     resilience_data[key] = event_data[key]

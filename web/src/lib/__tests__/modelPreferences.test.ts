@@ -239,6 +239,11 @@ describe('pruneModelReferences', () => {
     });
   });
 
+  it("saves emptied fallbacks as empty, so the deployment's list does not take their place", () => {
+    const prefs = { model_preference: { fallback_models: ['gpt-4o', 'gpt-3.5'] } };
+    expect(pruneModelReferences(prefs, isGone)).toEqual({ fallback_models: [] });
+  });
+
   it("drops a gone model's profile, so no model inheriting its name inherits its tuning", () => {
     const prefs = { model_preference: { profiles: { 'gpt-4o': { reasoning_effort: 'high' }, 'claude-5': { fast_mode: true } } } };
     expect(pruneModelReferences(prefs, isGone)).toEqual({ profiles: { 'gpt-4o': null } });

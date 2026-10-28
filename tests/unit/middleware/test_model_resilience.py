@@ -331,6 +331,30 @@ class TestFallbackChain:
         ]
 
     @pytest.mark.asyncio
+    async def test_a_switch_names_who_pays_for_the_model_it_moved_to(self, events):
+        # A switch can move the turn onto another payer, so the notice says
+        # whose key the next model runs on; an unstamped client says nothing.
+        client = _FakeModel("primary-model")
+        fb_a = _FakeModel("fallback-a")
+        fb_a.metadata = {"billing_type": "oauth", "pricing_provider": "codex-oauth"}
+        fb_b = _FakeModel("fallback-b")
+        mw = _make_middleware(
+            client, fallbacks=[("fallback-a", fb_a), ("fallback-b", fb_b)]
+        )
+
+        async def handler(req):
+            if req.model is fb_b:
+                return "ok"
+            raise _status_error("bad request", status=400)
+
+        await mw.awrap_model_call(_FakeRequest(client), handler)
+        switches = _fallback_props(events)
+        # The provider names the plan: a model added on a sign-in can share
+        # its name with another provider's.
+        assert (switches[0]["to_paid_by"], switches[0]["to_provider"]) == ("oauth", "codex-oauth")
+        assert "to_paid_by" not in switches[1] and "to_provider" not in switches[1]
+
+    @pytest.mark.asyncio
     async def test_a_fallback_names_the_message_its_call_followed(self, events):
         # The turn's records keep no step, so replay places the notice by it.
         from langchain_core.messages import HumanMessage, ToolMessage
@@ -436,6 +460,46 @@ class TestFallbackChain:
         with pytest.raises(Exception):
             await mw.awrap_model_call(_FakeRequest(sub), handler)
         assert tried == ["sub-model-id", "primary-model"]
+
+    @pytest.mark.parametrize(
+        ("billing", "users_fallbacks", "expected"),
+        [
+            # On the user's own key, the deployment's list may not move it
+            # onto the platform's key, only onto another key of the user's.
+            ("byok", False, ["sub-model-id", "fallback-b"]),
+            ("oauth", False, ["sub-model-id", "fallback-b"]),
+            # A list the user saved is billed as they picked it.
+            ("byok", True, ["sub-model-id", "fallback-a", "fallback-b"]),
+            # On credits already, credits is no move at all.
+            ("platform", False, ["sub-model-id", "fallback-a", "fallback-b"]),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_a_subagent_falls_back_only_onto_a_payer_the_user_chose(
+        self, events, billing, users_fallbacks, expected
+    ):
+        # The turn's list was built for a main model on credits.
+        client = _FakeModel("primary-model")
+        fb_a = _FakeModel("fallback-a")
+        fb_a.metadata = {"billing_type": "platform"}
+        fb_b = _FakeModel("fallback-b")
+        fb_b.metadata = {"billing_type": "byok"}
+        sub = _FakeModel("sub-model-id")
+        sub.metadata = {"manifest_model": "sub-model", "billing_type": billing}
+        mw = _make_middleware(
+            client,
+            fallbacks=[("fallback-a", fb_a), ("fallback-b", fb_b)],
+            users_fallbacks=users_fallbacks,
+        )
+        tried = []
+
+        async def handler(req):
+            tried.append(req.model.model)
+            raise _status_error("bad request", status=400)
+
+        with pytest.raises(Exception):
+            await mw.awrap_model_call(_FakeRequest(sub), handler)
+        assert tried == expected
 
     @pytest.mark.asyncio
     async def test_an_overflow_is_neither_retried_nor_moved_to_a_fallback(self, events):
@@ -594,6 +658,7 @@ class TestFallbackChain:
         cfg = SimpleNamespace(
             fallback_llm_clients=[fallback],
             fallback_llm_names=["fallback-a"],
+            fallback_users_choice=False,
             llm=SimpleNamespace(fallback=None),
             compaction=SimpleNamespace(enabled=compaction_enabled),
         )

@@ -9,7 +9,8 @@
  * back — we only need to confirm the right key path was taken.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { render, screen } from '@testing-library/react';
+import { screen } from '@testing-library/react';
+import { renderWithProviders } from '@/test/utils';
 import React from 'react';
 
 vi.mock('react-i18next', () => ({
@@ -32,7 +33,7 @@ describe('TurnErrorCard routing', () => {
       statusCode: 401,
       hints: ['api_key', 'model_access', 'provider_status', 'try_another_model'],
     };
-    render(<TurnErrorCard err={structured} />);
+    renderWithProviders(<TurnErrorCard err={structured} />);
 
     // Headline comes from the status-aware key.
     expect(screen.getByText('chat.errorUpstreamHeadlineStatus:401')).toBeInTheDocument();
@@ -45,7 +46,7 @@ describe('TurnErrorCard routing', () => {
   });
 
   it('parses an unclassified failure as before', () => {
-    render(<TurnErrorCard err={{ message: "Error calling model 'gpt-5' (Bad Request): 400 Bad Request." }} />);
+    renderWithProviders(<TurnErrorCard err={{ message: "Error calling model 'gpt-5' (Bad Request): 400 Bad Request." }} />);
 
     // parseErrorMessage maps "Bad Request" → title; headline keys should NOT appear.
     expect(screen.queryByText('chat.errorUpstreamHeadline')).not.toBeInTheDocument();
@@ -53,14 +54,14 @@ describe('TurnErrorCard routing', () => {
   });
 
   it('titles an internal failure by its kind, never by keywords in its text', () => {
-    render(<TurnErrorCard err={{ message: '', kind: 'internal' }} />);
+    renderWithProviders(<TurnErrorCard err={{ message: '', kind: 'internal' }} />);
     expect(screen.getByText('chat.errorInternalHeadline')).toBeInTheDocument();
     expect(screen.queryByText('Rate limit exceeded')).not.toBeInTheDocument();
   });
 
   it('renders a notice as the quiet status line, not an error card', () => {
     const notice = 'Another reply was still running in this chat, so this message wasn\'t sent. Retry once it finishes.';
-    render(<TurnErrorCard err={{ message: notice, kind: 'notice' }} />);
+    renderWithProviders(<TurnErrorCard err={{ message: notice, kind: 'notice' }} />);
     expect(screen.getByRole('status')).toHaveTextContent(notice);
     // parseErrorMessage's headline would title it as a failure.
     expect(screen.queryByText('Error')).not.toBeInTheDocument();

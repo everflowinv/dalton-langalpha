@@ -226,6 +226,25 @@ class ModelConfig:
             return parent_info.get("display_name", parent.title())
         return provider.title()
 
+    def _task_cost_key(
+        self, model_name: str, model_info: dict[str, Any], provider_info: dict[str, Any]
+    ) -> str:
+        """The manifest key whose task cost a model shows.
+
+        A subscription runs the same model on the same tokens as its keyed twin,
+        the parent provider's entry for the same model id, so it shows that
+        figure as a guide to how hard a task draws on the plan. A regional or
+        other keyed variant is priced on its own terms and keeps its own key.
+        """
+        if provider_info.get("access_type") != "oauth":
+            return model_name
+        parent = provider_info.get("parent_provider")
+        model_id = model_info.get("model_id", model_name)
+        for key, info in self.llm_config.items():
+            if info and info.get("provider") == parent and info.get("model_id", key) == model_id:
+                return key
+        return model_name
+
     def get_model_metadata(self) -> dict[str, dict[str, Any]]:
         """Return {model_key: {sdk, provider, access_type, ...}} for all visible models."""
         result = {}
@@ -295,11 +314,8 @@ class ModelConfig:
             if price_tier is not None:
                 entry["price"] = price_tier
             # What a typical benchmark task costs at each level the model
-            # offers, against a baseline model (see task_costs.py). Read by the
-            # manifest key alone: a variant on another route, such as an OAuth
-            # or regional key, is priced on its own terms, so it shows no figure
-            # rather than borrowing its parent's.
-            costs = task_cost(model_name, efforts)
+            # offers, against a baseline model (see task_costs.py).
+            costs = task_cost(self._task_cost_key(model_name, model_info, provider_info), efforts)
             if costs is not None:
                 entry["task_cost"] = costs
             # Mark variants that require their own API key (different env_key from parent).

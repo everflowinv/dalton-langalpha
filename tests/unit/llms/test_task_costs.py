@@ -315,11 +315,25 @@ class TestShippedFile:
                 assert list(metadata[key]["task_cost"]) == [ANY_EFFORT], key
 
     def test_only_keys_in_the_file_carry_the_field(self, metadata, shipped):
-        """OAuth and regional variants share a model with a key in the file
-        but are not in it themselves, and must not borrow its figures."""
+        """A regional variant shares a model with a key in the file but is
+        priced on its own terms, so it must not borrow its figures. A
+        subscription does, as the same model on the same tokens, so it may
+        carry the field when its keyed twin is in the file (pinned in
+        test_model_rating_metadata)."""
+        mc = ModelConfig()
+        in_file = {*shipped["models"], *shipped.get("bounds", {})}
         for key, entry in metadata.items():
-            if "task_cost" in entry:
-                assert key in shipped["models"] or key in shipped.get("bounds", {}), key
+            if "task_cost" not in entry:
+                continue
+            if entry["access_type"] == "oauth":
+                key = mc._task_cost_key(
+                    key, mc.llm_config[key], mc.get_provider_info(entry["provider"])
+                )
+            assert key in in_file, key
+
+    def test_every_model_with_its_own_source_has_figures(self, shipped):
+        """A misspelled key would leave its figures attributed to the main source."""
+        assert set(shipped.get("model_sources", {})) <= set(shipped["models"])
 
     def test_every_key_in_the_file_is_a_visible_model(self, metadata, shipped):
         """A misspelled key would silently show nothing anywhere."""

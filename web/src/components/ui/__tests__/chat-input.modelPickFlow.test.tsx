@@ -38,7 +38,7 @@ vi.mock('@/hooks/usePreferences', () => ({
 vi.mock('@/hooks/useAllModels', () => ({
   useAllModels: () => ({
     models: {},
-    modelAccessMap: undefined,
+    payers: {},
     validModelNames: mocks.validModelNames,
     metadata: { 'model-default': { reasoning_efforts: ['low', 'high'], reasoning_effort_default: 'high' } },
     isLoading: mocks.modelsLoading,
@@ -61,20 +61,21 @@ vi.mock('../use-toast', () => ({
 // The menu's own rendering is not under test; the buttons reach the same
 // onSelectModel the dropdown items call.
 vi.mock('../chat-input.modelMenu', () => ({
-  ChatInputModelMenu: ({ onSelectModel, disabled, selectedModel, reasoningEfforts }: {
+  ChatInputModelMenu: ({ onSelectModel, disabled, selectedModel }: {
     onSelectModel: (m: string) => void;
     disabled?: boolean;
     selectedModel: string | null;
-    reasoningEfforts: string[];
   }) => (
     <>
       <span>{disabled ? 'menu-disabled' : 'menu-enabled'}</span>
       <span>{`pill:${selectedModel}`}</span>
-      <span>{`efforts:${reasoningEfforts.join(',')}`}</span>
       <button type="button" onClick={() => onSelectModel('model-beta')}>pick-beta</button>
       <button type="button" onClick={() => onSelectModel('model-gamma')}>pick-gamma</button>
       <button type="button" onClick={() => onSelectModel('model-default')}>pick-default</button>
     </>
+  ),
+  ChatInputEffortMenu: ({ reasoningEfforts }: { reasoningEfforts: string[] }) => (
+    <span>{`efforts:${reasoningEfforts.join(',')}`}</span>
   ),
   ModelTriggerMeasure: () => null,
 }));

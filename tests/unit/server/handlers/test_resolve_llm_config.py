@@ -1560,6 +1560,30 @@ class TestStaleModelPreference:
         assert written["fallback_models"] == ["good-model"]
 
     @pytest.mark.asyncio
+    async def test_a_scrub_that_empties_the_fallback_list_saves_it_empty(self, base_config):
+        """A saved list is the user's choice even when every entry is gone:
+        deleted, the next turn would run the deployment's list instead."""
+        from fastapi import HTTPException
+
+        from src.server.services.llm.config import resolve_llm_config
+
+        mock_mc = _mock_model_config(system_models={"system-default-model"})
+        pref = {"preferred_model": "qwen3.5-flash", "fallback_models": ["also-gone"]}
+
+        with (
+            patch(f"{USER_MODELS}.get_model_preference", new_callable=AsyncMock, return_value=pref),
+            patch(f"{USER_MODELS}.get_custom_model_config", new_callable=AsyncMock, return_value=None),
+            patch(f"{USER_MODELS}.get_custom_provider_config", new_callable=AsyncMock, return_value=None),
+            patch("src.llms.llm.LLM.get_model_config", return_value=mock_mc),
+            patch("src.server.database.user.upsert_user_preferences", new_callable=AsyncMock) as mock_upsert,
+            patch("src.server.database.user.invalidate_user_prefs_cache", new_callable=AsyncMock),
+        ):
+            with pytest.raises(HTTPException):
+                await resolve_llm_config(base_config, "user-1", None, False)
+
+        assert mock_upsert.await_args.kwargs["model_preference"]["fallback_models"] == []
+
+    @pytest.mark.asyncio
     async def test_stale_request_model_raises_without_scrub(self, base_config):
         """Frontend sent a stale model name as request_model (e.g. its
         React Query cache still held the pre-scrub value). Raise

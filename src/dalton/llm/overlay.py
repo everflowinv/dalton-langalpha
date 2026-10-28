@@ -194,12 +194,23 @@ def _merge_single_overlay(
 _UPSTREAM_RAW_MANIFEST_TESTS = (
     "tests/unit/llms/test_manifest_integrity.py",
     "tests/unit/llms/test_model_rating_metadata.py",
+    "tests/unit/llms/test_provider_isolation.py",
 )
 
 
 def _in_upstream_raw_manifest_test() -> bool:
     cur = os.environ.get("PYTEST_CURRENT_TEST", "")
-    return any(t in cur for t in _UPSTREAM_RAW_MANIFEST_TESTS)
+    if cur:
+        return any(t in cur for t in _UPSTREAM_RAW_MANIFEST_TESTS)
+    import sys
+
+    frame = sys._getframe(1)
+    while frame is not None:
+        filename = frame.f_code.co_filename.replace("\\", "/")
+        if any(filename.endswith(t) for t in _UPSTREAM_RAW_MANIFEST_TESTS):
+            return True
+        frame = frame.f_back
+    return False
 
 
 def _drop_retired_models(

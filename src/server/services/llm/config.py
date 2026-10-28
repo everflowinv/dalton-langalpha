@@ -174,10 +174,16 @@ def deployment_serves_default() -> bool:
 
 @dataclass(frozen=True)
 class ModelSelection:
-    """Which model this turn runs, and the ``LLMConfig`` field that named it."""
+    """Which model this turn runs, and the ``LLMConfig`` field that named it.
+
+    ``users_fallbacks`` is whether ``llm.fallback`` is a list the user saved,
+    even an empty one, rather than the deployment's: only theirs may move an
+    own-key turn onto the platform's key.
+    """
 
     effective_model: str
     model_field: str
+    users_fallbacks: bool
 
 
 def select_model(
@@ -267,6 +273,7 @@ def select_model(
     return ModelSelection(
         effective_model=slot_model(config.llm, slot),
         model_field=model_field,
+        users_fallbacks=user_fallback is not None,
     )
 
 
@@ -586,6 +593,7 @@ async def resolve_llm_config(
         reasoning_effort=reasoning_effort,
         fast_mode=fast_mode,
         user_defined=user_defined,
+        users_fallbacks=selection.users_fallbacks,
     )
     # DALTON-HOOK(subagent-model-pin): only inspect subagents compiled for this
     # turn's role on the primary slot.

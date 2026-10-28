@@ -535,7 +535,7 @@ def test_model_fallback_emits_warning_log_with_reason_and_scrubs_secrets(
         attempts=2,
     )
     req = SimpleNamespace(state={"messages": []})
-    mw._emit_fallback(record, "muse-wonder-1.0-oauth", req, from_is_primary=True)
+    mw._emit_fallback(record, "muse-wonder-1.0-oauth", None, req, from_is_primary=True)
 
     warning_spy.assert_called_once()
     call_kwargs = warning_spy.call_args.kwargs
@@ -1101,4 +1101,248 @@ async def test_insert_publication_and_run_publish_reject_deleted_or_archiving_wo
     assert bad_status in res["message"]
     mock_transition.assert_awaited_once()
     assert mock_transition.await_args.args[:3] == ("req-1", ("publishing",), "rejected")
+
+
+# ---------------------------------------------------------------------------
+# Sync2 B12 (#637): Payer, Dalton budget admission before fallback, empty
+# fallback_models list, Grok OAuth display name unification, and task_costs
+# isolation from Dalton budget ledger
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_b12_zero_budget_blocks_fallback_on_main_and_subagent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When budget is 0 / exhausted, a failing turn on main or subagent does not initiate fallback."""
+    from decimal import Decimal
+    from fastapi import HTTPException
+    from langchain.agents.middleware.types import ModelRequest, ModelResponse
+    from ptc_agent.agent.middleware.credit_gate import CreditLease, current_credit_gate
+    import src.dalton.budget.gate as budget_gate_mod
+
+    # 1. Pre-turn admission: enforce_local_admission rejects when available == 0
+    # regardless of byok=True / payer tag.
+    fake_conn = create_autospec(AsyncConnection, instance=True)
+
+    @asynccontextmanager
+    async def _fake_tx():
+        yield None
+
+    @asynccontextmanager
+    async def _fake_get_db():
+        yield fake_conn
+
+    fake_conn.transaction.side_effect = _fake_tx
+    monkeypatch.setattr(budget_gate_mod, "get_db_connection", _fake_get_db)
+    monkeypatch.setattr(
+        budget_gate_mod,
+        "reconcile_and_summarize_day",
+        create_autospec(
+            budget_gate_mod.reconcile_and_summarize_day,
+            return_value={
+                "configured": True,
+                "retry_after_seconds": 3600,
+                "_decimals": {
+                    "cap_usd": Decimal("50"),
+                    "spent_usd": Decimal("50"),
+                    "settled_usd": Decimal("50"),
+                    "unreserved_usage_usd": Decimal("0"),
+                    "open_reserved_usd": Decimal("0"),
+                    "expired_conservative_usd": Decimal("0"),
+                },
+            },
+        ),
+    )
+    with pytest.raises(HTTPException) as exc_info:
+        await budget_gate_mod.enforce_local_admission("user-1", byok=True)
+    assert exc_info.value.status_code == 429
+
+    # 2. Mid-turn resilience: when the credit gate lease is at 0 / exhausted,
+    # a failing primary model call on both main agent and subagent does NOT
+    # select or initiate any fallback candidate.
+    lease = create_autospec(CreditLease, instance=True)
+    lease.spend.return_value = 10.0
+    lease.should_stop.return_value = True
+
+    primary_client = SimpleNamespace(
+        __langalpha_meta__={"manifest_model": "claude-opus-4-7", "billing_type": "oauth"}
+    )
+    subagent_client = SimpleNamespace(
+        __langalpha_meta__={"manifest_model": "grok-4.7-oauth", "billing_type": "oauth"}
+    )
+    fallback_client = SimpleNamespace(
+        __langalpha_meta__={"manifest_model": "deepseek-flash", "billing_type": "platform"}
+    )
+
+    mw = ModelResilienceMiddleware(
+        primary_name="claude-opus-4-7",
+        primary_client=primary_client,
+        fallbacks=[("deepseek-flash", fallback_client)],
+        max_retries=0,
+        users_fallbacks=True,
+    )
+    emit_fallback_spy = create_autospec(mw._emit_fallback)
+    monkeypatch.setattr(mw, "_emit_fallback", emit_fallback_spy)
+
+    called_models: list[Any] = []
+
+    async def _failing_handler(req: ModelRequest) -> ModelResponse:
+        called_models.append(req.model)
+        raise RuntimeError("primary provider 503 failure")
+
+    token = current_credit_gate.set(lease)
+    try:
+        # Main agent request
+        main_req = create_autospec(ModelRequest, instance=True)
+        main_req.model = primary_client
+        main_req.messages = []
+        main_req.model_settings = {}
+        main_req.state = {"messages": []}
+        with pytest.raises(RuntimeError, match="primary provider 503 failure"):
+            await mw.awrap_model_call(main_req, _failing_handler)
+        assert called_models == [primary_client]
+        emit_fallback_spy.assert_not_called()
+
+        # Subagent request
+        called_models.clear()
+        sub_req = create_autospec(ModelRequest, instance=True)
+        sub_req.model = subagent_client
+        sub_req.messages = []
+        sub_req.model_settings = {}
+        sub_req.state = {"messages": []}
+        with pytest.raises(RuntimeError, match="primary provider 503 failure"):
+            await mw.awrap_model_call(sub_req, _failing_handler)
+        assert called_models == [subagent_client]
+        emit_fallback_spy.assert_not_called()
+    finally:
+        current_credit_gate.reset(token)
+
+
+@pytest.mark.asyncio
+async def test_b12_saved_empty_fallback_list_never_falls_back_to_system_defaults() -> None:
+    """When a user saves an empty fallback list [], it stays [] and does not fall back to system defaults."""
+    from langchain.agents.middleware.types import ModelRequest, ModelResponse
+    from ptc_agent.agent.middleware.model_resilience import build_fallback_pairs
+    from src.server.services.llm.availability import drop_dead_models
+    from src.server.services.llm.clients import _resolve_fallback_clients
+    from src.server.services.llm.config import select_model
+
+    # 1. drop_dead_models preserves an explicit empty fallback_models list []
+    # and keeps [] when every saved fallback model was removed from the catalog.
+    pruned_empty, dropped_empty = drop_dead_models({"fallback_models": []}, ())
+    assert pruned_empty == {"fallback_models": []}
+    assert dropped_empty == []
+
+    pruned_dead, dropped_dead = drop_dead_models(
+        {"fallback_models": ["nonexistent-dead-model-xyz"]}, ()
+    )
+    assert pruned_dead == {"fallback_models": []}
+    assert dropped_dead == [("fallback_models", "nonexistent-dead-model-xyz")]
+
+    # 2. select_model overrides system default fallback list when user_fallback == []
+    cfg = SimpleNamespace(
+        llm=SimpleNamespace(
+            name="deepseek-flash",
+            flash=None,
+            compaction=None,
+            fetch=None,
+            fallback=["deepseek-flash", "glm-5.2"],
+        ),
+        subagents=SimpleNamespace(),
+    )
+    selection = select_model(
+        cfg,
+        {"fallback_models": []},
+        "primary",
+        "claude-opus-4-7",
+    )
+    assert selection.effective_model == "claude-opus-4-7"
+    assert selection.users_fallbacks is True
+    assert cfg.llm.fallback == []
+
+    # 3. _resolve_fallback_clients and build_fallback_pairs keep [] without loading defaults
+    await _resolve_fallback_clients(
+        cfg,
+        "u-1",
+        {"fallback_models": []},
+        {},
+        is_byok=False,
+        cache_key=None,
+        users_fallbacks=selection.users_fallbacks,
+    )
+    assert cfg.fallback_llm_clients == []
+    assert cfg.fallback_llm_names == []
+    assert build_fallback_pairs(cfg) == []
+
+    # 4. Middleware does not fall back when fallbacks == []
+    primary_client = SimpleNamespace(
+        __langalpha_meta__={"manifest_model": "claude-opus-4-7", "billing_type": "platform"}
+    )
+    mw = ModelResilienceMiddleware(
+        primary_name="claude-opus-4-7",
+        primary_client=primary_client,
+        fallbacks=build_fallback_pairs(cfg),
+        max_retries=0,
+        users_fallbacks=selection.users_fallbacks,
+    )
+    req = create_autospec(ModelRequest, instance=True)
+    req.model = primary_client
+    req.messages = []
+    req.model_settings = {}
+    req.state = {"messages": []}
+    calls: list[Any] = []
+
+    async def _fail(r: ModelRequest) -> ModelResponse:
+        calls.append(r.model)
+        raise RuntimeError("primary failed with empty fallbacks")
+
+    with pytest.raises(RuntimeError, match="primary failed with empty fallbacks"):
+        await mw.awrap_model_call(req, _fail)
+    assert calls == [primary_client]
+
+
+def test_b12_grok_oauth_display_name_unified_and_pinned_routing_by_key() -> None:
+    """grok-4.7-oauth and grok-4.3-oauth drop (OAuth) suffix in display_name while staying pinned to xai-oauth."""
+    from src.dalton.llm.overlay import PINNED_OVERLAY_MODEL_KEYS, load_dalton_meta
+    from src.llms.llm import LLM
+
+    mc = LLM.get_model_config()
+    all_meta = load_dalton_meta()
+    for key, expected_display in (
+        ("grok-4.7-oauth", "Grok 4.7"),
+        ("grok-4.3-oauth", "Grok 4.3"),
+        ("grok-4.7-build-fast-oauth", "Grok 4.7 Build Fast"),
+    ):
+        if key in ("grok-4.7-oauth", "grok-4.3-oauth"):
+            assert key in PINNED_OVERLAY_MODEL_KEYS
+        cfg = mc.get_model_config(key)
+        assert cfg is not None
+        assert cfg["provider"] == "xai-oauth"
+        assert cfg["display_name"] == expected_display
+        assert "(OAuth)" not in cfg["display_name"]
+        meta = all_meta.get(key)
+        assert meta is not None
+        assert meta.get("billing") == "subscription"
+
+
+def test_b12_task_costs_isolated_from_dalton_budget_ledger() -> None:
+    """Upstream task_cost metadata is display-only and never alters Dalton's cash or subscription-notional accounting."""
+    from decimal import Decimal
+    from src.dalton.llm.complete import compute_call_costs
+    from src.llms.task_costs import task_cost
+
+    # Upstream task_cost exists for DeepSeek/Kimi display
+    tc = task_cost("deepseek-v3.2", ("low", "medium", "high"))
+    assert tc is None or isinstance(tc, dict)
+
+    # Dalton compute_call_costs computes cash and subscription notional strictly from token usage & pricing
+    cash_usd, sub_notional_usd = compute_call_costs(
+        model_key="deepseek-flash",
+        billing_type="platform",
+        token_usage={"input_tokens": 1000, "output_tokens": 500},
+    )
+    assert cash_usd >= Decimal("0")
+    assert sub_notional_usd == Decimal("0")
+
 

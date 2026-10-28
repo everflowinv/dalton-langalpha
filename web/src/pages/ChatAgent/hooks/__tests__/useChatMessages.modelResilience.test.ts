@@ -178,7 +178,7 @@ describe('useChatMessages — model retry/fallback resilience', () => {
       | import('@/types/chat').NotificationSegment
       | undefined;
     expect(notif).toBeDefined();
-    expect(notif!.content).toBe('chat.modelFallbackNotification');
+    expect(notif!.fallback).toEqual({ from: 'model-alpha', to: 'model-beta' });
     expect(notif!.detail).toContain('placeholder upstream error');
     expect(notif!.detail).toContain('HTTP 503');
     expect(notif!.detailKind).toBe('error');
@@ -238,6 +238,19 @@ describe('useChatMessages — model retry/fallback resilience', () => {
         toModel: 'model-gamma',
       }),
     );
+
+    await releaseHungSend(hang, send);
+  });
+
+  it("carries who pays for the fallback model to the status and the suggestion", async () => {
+    const hang = mockHangingStreamWith([
+      { event: 'model_fallback', agent: 'main', from_model: 'model-alpha', to_model: 'model-beta', to_paid_by: 'platform' },
+    ]);
+    const { result } = renderHookWithProviders(() => useChatMessages('ws-paid'));
+    const { send } = await startHungSend(result);
+
+    await waitFor(() => expect(result.current.modelStatus).toMatchObject({ kind: 'fallback', paidBy: 'platform' }));
+    expect(result.current.fallbackSuggestion).toMatchObject({ toModel: 'model-beta', paidBy: 'platform' });
 
     await releaseHungSend(hang, send);
   });
@@ -434,7 +447,7 @@ describe('useChatMessages — model retry/fallback resilience', () => {
         | import('@/types/chat').NotificationSegment
         | undefined;
       expect(notif).toBeDefined();
-      expect(notif!.content).toBe('chat.modelFallbackNotification');
+      expect(notif!.fallback).toEqual({ from: 'model-alpha', to: 'model-beta' });
       // The persisted event replays with the same expandable detail.
       expect(notif!.detail).toContain('placeholder persisted error');
       expect(notif!.detail).toContain('HTTP 429');

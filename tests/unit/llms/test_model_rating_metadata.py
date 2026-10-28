@@ -122,3 +122,19 @@ class TestPriceTier:
             {"input_tiers": [{"rate": 0.9}, {"rate": 1.8}]}, "input", "input_tiers"
         ) == 0.9
         assert _representative_rate({}, "input", "input_tiers") is None
+
+
+class TestTaskCostOnSubscriptions:
+    @pytest.mark.parametrize(
+        ("subscription", "keyed"),
+        [("claude-opus-5-5-oauth", "claude-opus-5-5"), ("gpt-6.1-sol-oauth", "gpt-6.1-sol")],
+    )
+    def test_a_subscription_shows_its_keyed_twins_task_cost(self, metadata, subscription, keyed):
+        """A subscription runs the same model on the same tokens as its keyed
+        twin, so the picker weighs both alike."""
+        assert metadata[subscription]["task_cost"] == metadata[keyed]["task_cost"]
+
+    def test_a_regional_variant_does_not_borrow_its_parents_figure(self, metadata):
+        """Priced on its own terms, so the parent's figure would mislead."""
+        assert "task_cost" in metadata["glm-5.3"]
+        assert "task_cost" not in metadata["glm-5.3-cn"]

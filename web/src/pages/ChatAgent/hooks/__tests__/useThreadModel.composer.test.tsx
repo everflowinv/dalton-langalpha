@@ -47,7 +47,7 @@ vi.mock('@/hooks/usePreferences', () => ({
 vi.mock('@/hooks/useAllModels', () => ({
   useAllModels: () => ({
     models: {},
-    modelAccessMap: undefined,
+    payers: {},
     validModelNames: new Set<string>(),
     catalogModelNames: new Set<string>(),
     metadata: {},
@@ -81,6 +81,7 @@ vi.mock('@/components/ui/chat-input.modelMenu', () => ({
       <button type="button" onClick={() => onSelectModel('model-y')}>pick-y</button>
     </>
   ),
+  ChatInputEffortMenu: () => null,
   ModelTriggerMeasure: () => null,
 }));
 
@@ -170,7 +171,7 @@ describe('the composer on a thread-owned model', () => {
     mocks.updateThread.mockReturnValueOnce(fallback.promise).mockReturnValueOnce(y.promise);
     const onSend = renderHost(THREAD);
 
-    fireEvent.click(screen.getByRole('button', { name: 'Switch to model-fallback' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Switch to Model Fallback' }));
     expect(screen.getByText('pill:model-fallback')).toBeInTheDocument();
     await waitFor(() => expect(cachedModel()).toBe('model-fallback'));
 
@@ -183,7 +184,7 @@ describe('the composer on a thread-owned model', () => {
     expect(cachedModel()).toBe('model-y');
     expect(mocks.toast).not.toHaveBeenCalled();
     // The suggestion still stands, and the composer is off its model.
-    expect(screen.getByRole('button', { name: 'Switch to model-fallback' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Switch to Model Fallback' })).toBeInTheDocument();
 
     send('next');
     expect(onSend.mock.calls[0][3]).toMatchObject({ model: 'model-y' });

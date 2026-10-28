@@ -16,6 +16,12 @@ above it, and it carries that figure marked as not measured: an upper bound
 the reader can show as one, rather than an estimate that could understate. A
 level with nothing measured above it has no bound and is left out.
 
+Where the source skips the levels that matter for a model, ``model_sources``
+names another that measured them, often the provider's own launch chart. That
+chart's dollars are not the source's, since two benchmarks put different tasks
+behind a dollar, so only its ratios between levels are taken: they scale a
+level the source did measure, and the figures stay comparable across models.
+
 Some models are measured once without naming a level. Those carry a single
 ``"any"`` figure in place of a per-level breakdown.
 

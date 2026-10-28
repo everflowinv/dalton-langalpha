@@ -15,11 +15,28 @@
  */
 import { describe, it, expect, vi } from 'vitest';
 import '@testing-library/jest-dom';
-import { render, screen, fireEvent } from '@testing-library/react';
+import { screen, fireEvent } from '@testing-library/react';
+import { createTestQueryClient, renderWithProviders } from '@/test/utils';
+import { queryKeys } from '@/lib/queryKeys';
 import React from 'react';
 import type { FallbackSuggestion } from '../../../session/types';
 import { ModelStatusPill } from '../ModelStatusPill';
 import { FallbackSuggestionPill } from '../FallbackSuggestionPill';
+
+// The pills print a model's authored name from the cached catalog the composer
+// loaded; seed it the way that load would.
+function seededClient() {
+  const queryClient = createTestQueryClient();
+  queryClient.setQueryData(queryKeys.models.all, {
+    model_metadata: {
+      'model-alpha': { display_name: 'Alpha' },
+      'model-beta': { display_name: 'Beta' },
+    },
+  });
+  return queryClient;
+}
+
+const render = (ui: React.ReactElement) => renderWithProviders(ui, { queryClient: seededClient() });
 
 describe('ModelStatusPill', () => {
   it('renders the retrying pill with 1-based counts when streaming', () => {
@@ -31,7 +48,7 @@ describe('ModelStatusPill', () => {
     );
     const pill = screen.getByRole('status');
     // attempt+1 = 2, maxRetries+1 = 4
-    expect(pill).toHaveTextContent('model-alpha error — retrying (2/4)…');
+    expect(pill).toHaveTextContent('Alpha error — retrying (2/4)…');
     expect(pill).toHaveAttribute('aria-live', 'polite');
   });
 
@@ -42,7 +59,17 @@ describe('ModelStatusPill', () => {
         isLoading={true}
       />,
     );
-    expect(screen.getByRole('status')).toHaveTextContent('Falling back to model-beta…');
+    expect(screen.getByRole('status')).toHaveTextContent('Falling back to Beta…');
+  });
+
+  it('says who pays for the model it falls back to, where the server said', () => {
+    render(
+      <ModelStatusPill
+        modelStatus={{ kind: 'fallback', fromModel: 'model-alpha', toModel: 'model-beta', paidBy: 'byok' }}
+        isLoading={true}
+      />,
+    );
+    expect(screen.getByRole('status')).toHaveTextContent('Falling back to Beta (Your key)…');
   });
 
   it('renders nothing when not loading, even with a modelStatus set', () => {
@@ -81,9 +108,18 @@ describe('FallbackSuggestionPill', () => {
     const onSwitchModel = vi.fn();
     renderPill({ onSwitchModel });
     const pill = screen.getByRole('status');
-    expect(pill).toHaveTextContent('model-alpha is having trouble — this answer came from model-beta');
+    expect(pill).toHaveTextContent('Alpha is having trouble — this answer came from Beta');
 
-    fireEvent.click(screen.getByRole('button', { name: 'Switch to model-beta' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Switch to Beta' }));
+    expect(onSwitchModel).toHaveBeenCalledWith('model-beta');
+  });
+
+  // Two models can share a name, one on a plan and one on credits, so the
+  // switch says which payer the thread moves onto.
+  it('says who pays for the model it would switch to', () => {
+    const onSwitchModel = vi.fn();
+    renderPill({ onSwitchModel, fallbackSuggestion: { ...suggestion, paidBy: 'byok' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Switch to Beta (Your key)' }));
     expect(onSwitchModel).toHaveBeenCalledWith('model-beta');
   });
 

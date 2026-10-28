@@ -9,12 +9,14 @@ import { PREFERENCE_MUTATION_KEY, useUpdatePreferences } from '@/hooks/useUpdate
 import { ModelTierConfig } from '@/components/model/ModelTierConfig';
 import { ModelSelector } from '@/components/model/ModelSelector';
 import { FallbackModelsPicker } from '@/components/model/FallbackModelsPicker';
+import { PayerOrder } from '@/components/model/PayerOrder';
+import { isPlatformMode } from '@/config/hostMode';
 import { PerModelMatrix } from '@/components/model/PerModelMatrix';
 import { AccountTuningDefaults } from '@/components/model/AccountTuningDefaults';
 import { DefaultModelScopeChoice } from '@/components/model/DefaultModelScopeChoice';
 import { useDefaultModelChange } from '@/hooks/useDefaultModelChange';
 import { useAllModels } from '@/hooks/useAllModels';
-import { useQuickAccessModels } from '@/hooks/useQuickAccessModels';
+import { useFavoriteModels } from '@/hooks/useFavoriteModels';
 import { modelLabel, modelMatches } from '@/lib/modelLabel';
 import { Trans, useTranslation } from 'react-i18next';
 import { ModelAccessSection } from './ModelAccessSection';
@@ -22,6 +24,8 @@ import { ModelAccessSection } from './ModelAccessSection';
 import { DaltonSection } from './dalton/DaltonSection';
 import { BACKGROUND_AUTO, backgroundDefaultChoice, modelPrefs, readDefaultModelScope, splitPreferenceWrite } from '@/lib/modelPreferences';
 import { useModelSlotCopy } from '@/components/model/useModelSlotCopy';
+import { paidByDeployment, paidByUser } from '@/lib/modelPayer';
+import { PayerBadge } from '@/components/model/PayerBadge';
 import type { ModelSlot, DefaultModelScope, PreferencePatch, PreferencesLike } from '@/lib/modelPreferences';
 
 type ModelTabMode = 'simple' | 'advanced';
@@ -63,7 +67,7 @@ export function ModelTab() {
   const { preferences: prefsData } = usePreferences();
   const { mutate } = useUpdatePreferences();
   // DALTON-HOOK(settings-section): customModels is read to keep custom models out of the Dalton selectors
-  const { models: visibleModels, metadata: modelMetadata, modelAccessMap, systemDefaults: hookSystemDefaults, customModels, validModelNames, rawModels, isLoading: modelsLoading, compactionProfiles, searchProviders } = useAllModels();
+  const { models: visibleModels, metadata: modelMetadata, payers, systemDefaults: hookSystemDefaults, customModels, validModelNames, rawModels, isLoading: modelsLoading, compactionProfiles, searchProviders } = useAllModels();
   const { t } = useTranslation();
   const modelSlotCopy = useModelSlotCopy();
 
@@ -100,7 +104,7 @@ export function ModelTab() {
   // stayed in other_preference.
   const mPref = modelPrefs(prefsData);
   const otherPref = (prefsData as PreferencesLike | null)?.other_preference ?? {};
-  const quickAccess = useQuickAccessModels();
+  const favorites = useFavoriteModels();
   // Every name the catalog still carries, access aside. A fallback the user
   // temporarily cannot reach is still configured; one the manifest dropped is
   // not, and _resolve_fallback_clients skips it without saying so, leaving the
@@ -117,6 +121,19 @@ export function ModelTab() {
   const fallbackModels = modelsLoading || catalogNames.size === 0
     ? storedFallbacks
     : storedFallbacks.filter((m) => catalogNames.has(m));
+  // The deployment's list, not one the user saved, keeps a turn their plan or
+  // key pays for off the deployment: of its models, only those a key or
+  // sign-in of theirs runs take such a turn. One with no payer here, above
+  // the plan or a local server, is skipped there too. Saving the list makes
+  // them the user's.
+  const deploymentOnlyFallbacks = new Set(
+    mPref.fallback_models == null ? fallbackModels.filter((m) => !paidByUser(payers[m])) : [],
+  );
+  // Once saved, those models are the user's choice and catch every turn, the
+  // ones their plan or key pays for included, which the list no longer shows.
+  const savedCrossesPayer = mPref.fallback_models != null
+    && fallbackModels.some((m) => paidByDeployment(payers[m]))
+    && Object.values(payers).some(paidByUser);
 
   // While the question is open each select shows the model the answer would
   // write, and a cancel puts both back on the saved ones.
@@ -299,10 +316,11 @@ export function ModelTab() {
             onPrimaryModelChange={setDefault('default')}
             backgroundModel={shownDefault('background')}
             onBackgroundModelChange={setDefault('background')}
-            modelAccess={modelAccessMap}
+            payers={payers}
             auto={autoModels}
           />
           {defaultQuestion && <DefaultModelScopeChoice className="mt-4" {...defaultQuestion} />}
+          <PayerOrder className="mt-4" />
 
           <div className="flex flex-col gap-1.5" style={{ marginTop: '16px' }}>
             <label htmlFor="default-model-scope" className="text-sm font-medium" style={{ color: 'var(--color-text-primary)' }}>
@@ -322,7 +340,7 @@ export function ModelTab() {
             </Select>
           </div>
 
-          {/* Quick-access models — compact strip */}
+          {/* Favorite models, the picker's first tab */}
           <div ref={modelPickerRef} style={{ marginTop: '16px' }}>
           <div className="flex flex-col gap-1.5">
             <label className="text-sm font-medium" style={{ color: 'var(--color-text-primary)' }}>
@@ -332,7 +350,7 @@ export function ModelTab() {
               {t('settings.starredModelsDesc')}
             </p>
             <div className="flex flex-wrap items-center gap-1.5">
-              {quickAccess.models.map((key) => (
+              {favorites.models.map((key) => (
                 <span
                   key={key}
                   className="inline-flex items-center gap-1 px-2 py-1 rounded text-xs"
@@ -343,9 +361,10 @@ export function ModelTab() {
                   }}
                 >
                   {modelLabel(key, modelMetadata)}
+                  <PayerBadge payer={payers[key]} />
                   <button
                     type="button"
-                    onClick={() => quickAccess.remove(key)}
+                    onClick={() => favorites.remove(key)}
                     className="ml-0.5 hover:opacity-70"
                     style={{ color: 'var(--color-text-tertiary)' }}
                     aria-label={t('settings.removeModel', { model: modelLabel(key, modelMetadata) })}
@@ -407,12 +426,12 @@ export function ModelTab() {
                         {displayName}
                       </div>
                       {filtered.map((m) => {
-                        const isStarred = quickAccess.models.includes(m);
+                        const isStarred = favorites.models.includes(m);
                         return (
                           <button
                             key={m}
                             type="button"
-                            onClick={() => (isStarred ? quickAccess.remove(m) : quickAccess.add(m))}
+                            onClick={() => (isStarred ? favorites.remove(m) : favorites.add(m))}
                             className="w-full flex items-center justify-between px-2 py-1.5 rounded-md text-xs transition-colors"
                             style={{
                               color: 'var(--color-text-primary)',
@@ -421,7 +440,10 @@ export function ModelTab() {
                             onMouseEnter={(e) => { if (!isStarred) e.currentTarget.style.backgroundColor = 'var(--color-bg-elevated)'; }}
                             onMouseLeave={(e) => { if (!isStarred) e.currentTarget.style.backgroundColor = 'transparent'; }}
                           >
-                            <span>{modelLabel(m, modelMetadata)}</span>
+                            <span className="flex min-w-0 items-center gap-2">
+                              <span className="truncate">{modelLabel(m, modelMetadata)}</span>
+                              <PayerBadge payer={payers[m]} />
+                            </span>
                             {isStarred && <Pin className="h-3 w-3 shrink-0" style={{ color: 'var(--color-accent-primary)' }} />}
                           </button>
                         );
@@ -469,7 +491,7 @@ export function ModelTab() {
                   onChange={(v) => write({ fetch_model: v || null })}
                   models={visibleModels}
                   placeholder={modelSlotCopy.defaultsToBackground}
-                  modelAccess={modelAccessMap}
+                  payers={payers}
                   metadata={modelMetadata}
                 />
                 <ModelSelector
@@ -485,7 +507,7 @@ export function ModelTab() {
                   })}
                   models={visibleModels}
                   placeholder={modelSlotCopy.defaultsToConversation}
-                  modelAccess={modelAccessMap}
+                  payers={payers}
                   metadata={modelMetadata}
                 />
                 {/* A subagent's model is the subagent's own setting, kept with
@@ -508,7 +530,29 @@ export function ModelTab() {
                   onChange={(list) => write({ fallback_models: list })}
                   models={visibleModels}
                   metadata={modelMetadata}
+                  payers={payers}
+                  skipped={{
+                    models: deploymentOnlyFallbacks,
+                    reason: t(isPlatformMode ? 'settings.payerOrder.skipped' : 'settings.payerOrder.skippedSelfHosted'),
+                  }}
                 />
+                {savedCrossesPayer && (
+                  <p className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
+                    {t('settings.payerOrder.savedNote')}
+                  </p>
+                )}
+                {deploymentOnlyFallbacks.size > 0 && (
+                  <p className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
+                    {t('settings.payerOrder.skippedNote')}{' '}
+                    <button
+                      type="button"
+                      onClick={() => write({ fallback_models: fallbackModels })}
+                      className="underline underline-offset-2 hover:text-[var(--color-text-primary)]"
+                    >
+                      {t('settings.payerOrder.useAlways')}
+                    </button>
+                  </p>
+                )}
                 {/* DALTON-HOOK(settings-section): Dalton model routing settings */}
                 <div className="pt-2 border-t flex flex-col gap-4" style={{ borderColor: 'var(--color-border-muted)' }}>
                   <h4 className="text-xs font-semibold uppercase tracking-wider" style={{ color: 'var(--color-text-secondary)' }}>
@@ -521,7 +565,7 @@ export function ModelTab() {
                     onChange={(v) => write({ dalton_audit_model: v || null })}
                     models={daltonSystemModels}
                     placeholder={daltonDefaultHint(hookSystemDefaults?.dalton_audit_model)}
-                    modelAccess={modelAccessMap}
+                    payers={payers}
                     metadata={modelMetadata}
                   />
                   {/* DALTON-HOOK(settings-section): Dalton language-review model selector */}
@@ -532,7 +576,7 @@ export function ModelTab() {
                     onChange={(v) => write({ dalton_language_model: v || null })}
                     models={daltonSystemModels}
                     placeholder={daltonDefaultHint(hookSystemDefaults?.dalton_language_model)}
-                    modelAccess={modelAccessMap}
+                    payers={payers}
                     metadata={modelMetadata}
                   />
                   <FallbackModelsPicker
@@ -542,6 +586,7 @@ export function ModelTab() {
                     onChange={(list) => write({ dalton_audit_fallback_models: list.length > 0 ? list : null })}
                     models={daltonSystemModels}
                     metadata={modelMetadata}
+                    payers={payers}
                   />
                   {/* DALTON-HOOK(settings-section): Dalton figure audit timeout and auxiliary/reviewer/extract models */}
                   <div className="flex flex-col gap-1.5">
@@ -595,7 +640,7 @@ export function ModelTab() {
                     onChange={(v) => write({ dalton_assist_model: v || null })}
                     models={daltonSystemModels}
                     placeholder={daltonDefaultHint(hookSystemDefaults?.dalton_assist_model)}
-                    modelAccess={modelAccessMap}
+                    payers={payers}
                     metadata={modelMetadata}
                   />
                   <FallbackModelsPicker
@@ -605,6 +650,7 @@ export function ModelTab() {
                     onChange={(list) => write({ dalton_assist_fallback_models: list.length > 0 ? list : null })}
                     models={daltonSystemModels}
                     metadata={modelMetadata}
+                    payers={payers}
                   />
                   <FallbackModelsPicker
                     label={t('settings.modelTuning.daltonReviewerModels')}
@@ -613,6 +659,7 @@ export function ModelTab() {
                     onChange={(list) => write({ dalton_reviewer_models: list.length > 0 ? list : null })}
                     models={daltonSystemModels}
                     metadata={modelMetadata}
+                    payers={payers}
                   />
                   <ModelSelector
                     label={t('settings.modelTuning.daltonExtractModel')}
@@ -621,7 +668,7 @@ export function ModelTab() {
                     onChange={(v) => write({ dalton_extract_model: v || null })}
                     models={daltonSystemModels}
                     placeholder={daltonDefaultHint(hookSystemDefaults?.dalton_extract_model)}
-                    modelAccess={modelAccessMap}
+                    payers={payers}
                     metadata={modelMetadata}
                   />
                 </div>

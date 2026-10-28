@@ -1,6 +1,7 @@
 import type React from 'react';
 import { useTranslation } from 'react-i18next';
 import { AlertTriangle, X } from 'lucide-react';
+import { useModelName, usePaidByLabel } from '@/hooks/useModelName';
 import type { FallbackSuggestion } from '../../session/types';
 
 /* Model-fallback suggestion: the model the user sent with
@@ -23,9 +24,15 @@ export function FallbackSuggestionPill({
   onDismiss: () => void;
 }): React.ReactElement | null {
   const { t } = useTranslation();
+  const name = useModelName();
+  const paidBy = usePaidByLabel();
   if (!(fallbackSuggestion && !isLoading && fallbackSuggestion.toModel !== composerModel)) {
     return null;
   }
+  // A switch can move the thread onto another payer, so the button says who
+  // pays: two models can share a name, one on a plan and one on credits.
+  const to = name(fallbackSuggestion.toModel);
+  const payer = paidBy(fallbackSuggestion.paidBy, fallbackSuggestion.toModel, fallbackSuggestion.provider);
   return (
     <div className="flex items-center gap-2 px-3 py-2 rounded-md text-sm"
       role="status" aria-live="polite"
@@ -40,8 +47,8 @@ export function FallbackSuggestionPill({
       <AlertTriangle aria-hidden="true" className="h-4 w-4 shrink-0" style={{ color: 'var(--color-warning)' }} />
       <span className="flex-1 min-w-0">
         {t('chat.modelTroubleSuggestion', {
-          from: fallbackSuggestion.fromModel,
-          to: fallbackSuggestion.toModel,
+          from: name(fallbackSuggestion.fromModel),
+          to,
         })}
       </span>
       <button
@@ -53,7 +60,7 @@ export function FallbackSuggestionPill({
           color: 'var(--color-btn-primary-text)',
         }}
       >
-        {t('chat.switchToModel', { model: fallbackSuggestion.toModel })}
+        {payer ? t('chat.switchToModelPaid', { model: to, payer }) : t('chat.switchToModel', { model: to })}
       </button>
       <button
         type="button"

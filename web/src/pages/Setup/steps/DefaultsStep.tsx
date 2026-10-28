@@ -39,7 +39,7 @@ export default function DefaultsStep() {
 
 function DefaultsForm({ prefsLoaded, prefsFailed }: { prefsLoaded: boolean; prefsFailed: boolean }) {
   const navigate = useNavigate();
-  const { models, metadata, modelAccessMap, systemDefaults, isLoading } = useAllModels();
+  const { models, metadata, payers, systemDefaults, isLoading } = useAllModels();
   const { preferences } = usePreferences();
   const updatePreferences = useUpdatePreferences();
   const { t } = useTranslation();
@@ -187,7 +187,7 @@ function DefaultsForm({ prefsLoaded, prefsFailed }: { prefsLoaded: boolean; pref
         backgroundModel={backgroundModel}
         onBackgroundModelChange={setBackgroundModel}
         showExplainer
-        modelAccess={modelAccessMap}
+        payers={payers}
         metadata={metadata}
       />
 
@@ -226,7 +226,7 @@ function DefaultsForm({ prefsLoaded, prefsFailed }: { prefsLoaded: boolean; pref
                   onChange={(v) => handleAdvancedChange({ fetchModel: v })}
                   models={models}
                   placeholder={copy.defaultsToBackground}
-                  modelAccess={modelAccessMap}
+                  payers={payers}
                   metadata={metadata}
                 />
                 <ModelSelector
@@ -236,7 +236,7 @@ function DefaultsForm({ prefsLoaded, prefsFailed }: { prefsLoaded: boolean; pref
                   onChange={(v) => handleAdvancedChange({ compactionModel: v })}
                   models={models}
                   placeholder={copy.defaultsToConversation}
-                  modelAccess={modelAccessMap}
+                  payers={payers}
                   metadata={metadata}
                 />
                 <FallbackModelsPicker
@@ -244,6 +244,7 @@ function DefaultsForm({ prefsLoaded, prefsFailed }: { prefsLoaded: boolean; pref
                   onChange={(list) => handleAdvancedChange({ fallbackModels: list })}
                   models={models}
                   metadata={metadata}
+                  payers={payers}
                 />
               </div>
             </motion.div>

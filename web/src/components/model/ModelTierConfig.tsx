@@ -8,7 +8,7 @@ import { BACKGROUND_AUTO } from "@/lib/modelPreferences"
 import { ModelSelector } from "./ModelSelector"
 import { useModelSlotCopy } from "./useModelSlotCopy"
 import type { ProviderModelsData } from "./types"
-import type { ModelAccess } from "@/types/platform"
+import type { Payer } from "@/lib/modelPayer"
 import type { ModelMetadataEntry } from "@/hooks/useFilteredModels"
 
 export interface ModelTierConfigProps {
@@ -24,8 +24,8 @@ export interface ModelTierConfigProps {
   onBackgroundModelChange: (model: string) => void
   /** Whether to show the "Two ways to research" explainer */
   showExplainer?: boolean
-  /** Optional access map: model name → access type for badge display */
-  modelAccess?: Record<string, ModelAccess>
+  /** Who pays for each model, shown beside its name */
+  payers?: Record<string, Payer>
   /** Optional model metadata, for display names */
   metadata?: Record<string, ModelMetadataEntry>
   /** Settings, where both slots are account defaults and may stay unset: the
@@ -49,7 +49,7 @@ export function ModelTierConfig({
   backgroundModel,
   onBackgroundModelChange,
   showExplainer = false,
-  modelAccess,
+  payers,
   metadata,
   auto,
 }: ModelTierConfigProps) {
@@ -153,7 +153,7 @@ export function ModelTierConfig({
         filterProviders={filterProviders}
         placeholder={primaryAuto ?? copy.default.placeholder}
         required={!primaryAuto}
-        modelAccess={modelAccess}
+        payers={payers}
         metadata={metadata}
       />
 
@@ -172,7 +172,7 @@ export function ModelTierConfig({
           ? { value: BACKGROUND_AUTO, label: backgroundAuto }
           : undefined}
         required={!auto}
-        modelAccess={modelAccess}
+        payers={payers}
         metadata={metadata}
       />
 

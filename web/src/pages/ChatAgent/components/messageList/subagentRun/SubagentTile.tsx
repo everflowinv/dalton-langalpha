@@ -1,31 +1,10 @@
 import React, { useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { useQuery } from '@tanstack/react-query';
-import { getAvailableModels } from '@/api/model';
-import { getModelDisplayName } from '@/components/ui/chat-input.helpers';
-import type { ModelMetadataEntry } from '@/hooks/useFilteredModels';
+import { useModelName } from '@/hooks/useModelName';
 import { llmProviderArt } from '@/lib/brandArt';
-import { CACHE_ONLY_META, queryKeys } from '@/lib/queryKeys';
 import type { SubagentModel } from '../../../session/subagents/taskRuns';
 import { SubagentGlyph } from '../../mcp/subagentGlyph';
 import { RunAvatar } from '../runCard';
-
-/**
- * A model's name as the composer pill prints it. Read from the catalog the
- * composer already loaded rather than fetched: a shared link has no composer
- * and may have no session to fetch with, and there the id, tidied, will do.
- */
-function useModelLabel(id: string): string {
-  const { data } = useQuery({
-    queryKey: queryKeys.models.all,
-    queryFn: getAvailableModels,
-    enabled: false,
-    meta: CACHE_ONLY_META,
-  });
-  const metadata = (data as { model_metadata?: Record<string, ModelMetadataEntry> } | undefined)
-    ?.model_metadata;
-  return getModelDisplayName(id, metadata);
-}
 
 /**
  * The provider's mark on the avatar's lower right, cut out of it by a ring in
@@ -35,7 +14,7 @@ function useModelLabel(id: string): string {
  * glyph on transparency needs.
  */
 function ModelBadge({ model }: { model: SubagentModel }): React.ReactElement | null {
-  const label = useModelLabel(model.id);
+  const label = useModelName()(model.id);
   const art = llmProviderArt(model.provider);
   // Keyed by src, so other art re-arms the load rather than inheriting a failure.
   const [failedSrc, setFailedSrc] = useState<string | null>(null);
@@ -74,6 +53,6 @@ export function SubagentTile({
 /** The model in words, for a screen reader: the badge itself is decoration. */
 export function ModelWords({ id, model }: { id: string; model: SubagentModel }): React.ReactElement {
   const { t } = useTranslation();
-  const label = useModelLabel(model.id);
+  const label = useModelName()(model.id);
   return <span id={id} className="sr-only">{t('chat.subagentRun.model', { model: label })}</span>;
 }

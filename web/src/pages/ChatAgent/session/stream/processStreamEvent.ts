@@ -570,7 +570,9 @@ export const createStreamEventProcessor = (rt: StreamRuntime, deps: StreamRouter
       if (!isSubagent) {
         const fromModel = (event.from_model as string) || '';
         const toModel = (event.to_model as string) || '';
-        deps.applyModelStatus({ kind: 'fallback', fromModel, toModel });
+        const paidBy = typeof event.to_paid_by === 'string' ? event.to_paid_by : undefined;
+        const provider = typeof event.to_provider === 'string' ? event.to_provider : undefined;
+        deps.applyModelStatus({ kind: 'fallback', fromModel, toModel, paidBy, provider });
         deps.applyFallbackSuggestion(event);
         // Persistent transcript notification — survives reload via the
         // persisted model_fallback replay in loadConversationHistory.

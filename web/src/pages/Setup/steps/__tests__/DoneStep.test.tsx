@@ -4,8 +4,8 @@
  * ends in the app, so that page would never be returned to.
  */
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { render, screen } from '@testing-library/react';
-import { MemoryRouter } from 'react-router';
+import { screen } from '@testing-library/react';
+import { renderWithProviders } from '@/test/utils';
 import { SETUP_RETURN_KEY } from '@/lib/setupReturn';
 
 vi.mock('@/config/supportLinks', () => ({ PLATFORM_URL: '/account' }));
@@ -19,11 +19,7 @@ vi.mock('@/pages/Onboarding/welcome/useWelcomeOffer', () => ({ useWelcomeOffer: 
 import DoneStep from '../DoneStep';
 
 const renderDone = () =>
-  render(
-    <MemoryRouter>
-      <DoneStep />
-    </MemoryRouter>,
-  );
+  renderWithProviders(<DoneStep />);
 
 afterEach(() => sessionStorage.clear());
 

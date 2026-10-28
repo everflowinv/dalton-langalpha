@@ -308,10 +308,12 @@ test.describe('a text field clicked with the mouse', () => {
  * field inside an edge-owning box (the composer, the dashboard search form, a
  * `rings-within` pill) must stay exactly as it rested, and the box is what
  * takes the edge. This is the regression a global field rule reopens first.
+ * The composer owns its edge to keep it neutral: its pills open menus against
+ * it, and an accent edge beside them competes for the eye.
  */
 test.describe('a borderless field inside a box that owns the edge', () => {
   const BOXED = [
-    { field: 'the chat composer', sel: COMPOSER, box: '.chat-input-container' },
+    { field: 'the chat composer', sel: COMPOSER, box: '.chat-input-container', lit: false },
     { field: 'the dashboard search box', sel: SEARCH, box: '.dashboard-search-form' },
     {
       field: 'the Workspaces search box',
@@ -321,8 +323,8 @@ test.describe('a borderless field inside a box that owns the edge', () => {
     },
   ];
 
-  for (const { field, sel, box, open } of BOXED) {
-    test(`keeps ${field} quiet and lights its box on a click`, async ({ page }) => {
+  for (const { field, sel, box, open, lit = true } of BOXED) {
+    test(`keeps ${field} quiet and ${lit ? 'lights' : 'leaves'} its box on a click`, async ({ page }) => {
       if (open) await open(page);
       const target = page.locator(sel);
       await expect(target).toBeVisible(FIRST_PAINT);
@@ -334,7 +336,7 @@ test.describe('a borderless field inside a box that owns the edge', () => {
       expect(unpainted(clicked.style, clicked.color)).toBe(true);
       expect(clicked.shadow).toBe(resting.shadow);
       // The boxes transition their edge, so the read waits for it to settle.
-      await expect.poll(() => edgeOn(page, box)).toMatchObject({ accent: true });
+      await expect.poll(() => edgeOn(page, box)).toMatchObject({ accent: lit });
     });
   }
 });

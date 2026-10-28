@@ -31,6 +31,10 @@ vi.mock('../useModels', () => ({
         'm-untiered': { provider: 'prov-a', access_type: 'api_key' },
         'm-oauth': { provider: 'codex-oauth', access_type: 'oauth' },
       },
+      provider_catalog: [
+        { provider: 'prov-a', access_type: 'api_key' },
+        { provider: 'codex-oauth', access_type: 'oauth' },
+      ],
       key_candidates: {
         'prov-a': { slugs: ['prov-a', 'prov-a-cn', 'prov-a-coding'], shared: ['prov-a', 'prov-a-cn'] },
         'prov-b-cn': { slugs: ['prov-b-cn', 'prov-b', 'prov-b-coding'], shared: ['prov-b-cn', 'prov-b'] },
@@ -56,8 +60,12 @@ vi.mock('../usePlatformModels', async (importActual) => ({
 
 import { useAllModels } from '../useAllModels';
 
-const KEY_A: ConfiguredProvider = { provider: 'prov-a', display_name: 'A', access_type: 'api_key' };
-const KEY_B: ConfiguredProvider = { provider: 'prov-b', display_name: 'B', access_type: 'api_key' };
+// A key the user saved, as the server masks it.
+const key = (provider: string, extra: Partial<ConfiguredProvider> = {}): ConfiguredProvider => ({
+  provider, display_name: provider, access_type: 'api_key', masked_key: 'sk-...1234', ...extra,
+});
+const KEY_A = key('prov-a');
+const KEY_B = key('prov-b');
 
 function offPlan(): string[] {
   const { result } = renderHook(() => useAllModels());
@@ -106,11 +114,18 @@ describe('useAllModels — offPlanModels', () => {
     expect(offPlan()).toEqual(['m-pro', 'm-untiered']);
   });
 
+  // The server's `on_subscription`: it runs on the sign-in, like that
+  // provider's built-ins, so no plan gates it.
+  it("leaves out a custom model added on a sign-in, whatever built-in's name it takes", () => {
+    h.customModels = [{ name: 'm-pro', model_id: 'x', provider: 'codex-oauth' }];
+    expect(offPlan()).not.toContain('m-pro');
+  });
+
   it('counts a key the server finds under a related slug when its vendor issues the two as one', () => {
-    h.providers = [{ provider: 'prov-a-cn', display_name: 'A CN', access_type: 'api_key' }];
+    h.providers = [key('prov-a-cn')];
     expect(offPlan()).toEqual([]);
 
-    h.providers = [{ provider: 'prov-a-coding', display_name: 'A coding', access_type: 'coding_plan' }];
+    h.providers = [key('prov-a-coding', { access_type: 'coding_plan' })];
     expect(offPlan()).toEqual(['m-pro', 'm-untiered']);
 
     h.providers = [{ ...h.providers[0], base_url: 'https://gateway.example.com/v1' }];
@@ -119,10 +134,10 @@ describe('useAllModels — offPlanModels', () => {
 
   it("takes any key the server finds for a custom model, which is built against the slug holding it", () => {
     h.customModels = [{ name: 'm-pro', model_id: 'x', provider: 'prov-b-cn' }];
-    h.providers = [{ provider: 'prov-c', display_name: 'C', access_type: 'api_key' }];
+    h.providers = [key('prov-c')];
     expect(offPlan()).toContain('m-pro');
 
-    h.providers = [{ provider: 'prov-b-coding', display_name: 'B coding', access_type: 'coding_plan' }];
+    h.providers = [key('prov-b-coding', { access_type: 'coding_plan' })];
     expect(offPlan()).not.toContain('m-pro');
   });
 

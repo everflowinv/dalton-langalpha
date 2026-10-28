@@ -15,14 +15,9 @@ import type { ByokProvider } from '@/components/model/types';
 // DALTON-HOOK(native-oauth-ui): Dalton's Antigravity / Muse / xAI lines ride
 // the same registry and status queries as the built-in subscriptions
 // (see SUBSCRIPTIONS in @/api/oauth); no separate provider hook here.
-
-/** How the server masks a key that is the deployment's own, from its environment. */
-export const SERVER_KEY = '(server)';
-
-/** A key saved by the user, not the deployment's own, which has no row of
- *  theirs to change. */
-export const isOwnKey = (p: ConfiguredProvider | null | undefined): p is ConfiguredProvider =>
-  !!p && !!p.masked_key && p.masked_key !== SERVER_KEY;
+// Kept apart from this hook so code that only reads a key's mask (the payer
+// of a model) does not load the queries behind it.
+export { SERVER_KEY, isOwnKey } from '@/lib/ownKey';
 
 export interface ConfiguredProvider {
   provider: string;

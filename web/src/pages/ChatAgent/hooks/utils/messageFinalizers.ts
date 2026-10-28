@@ -4,7 +4,7 @@
  * module scope (W1).
  */
 
-import type { ChatMessage, AssistantMessage, NotificationSegment } from '@/types/chat';
+import type { ChatMessage, AssistantMessage, ModelFallbackNotice, NotificationSegment } from '@/types/chat';
 import type { TodoItem } from '@/types/sse';
 import { INTERRUPT_CARD_BUCKETS } from '../../session/interrupts/buckets';
 import type { ToolCallAgentIndex } from '../../session/subagents/historyStore';
@@ -27,18 +27,15 @@ function collectRenderedInterruptIds(messages: ChatMessage[]): Set<string> {
 
 /**
  * Build the transcript notification segment for a model_fallback event.
- * Shared by the live-stream and history-replay branches. The expandable
- * detail carries the failed model's error + HTTP status / attempt count;
- * `suggestedModel` lets the renderer offer switching to the model that
- * actually answered.
+ * Shared by the live-stream and history-replay branches. The switch is kept
+ * as data and labeled when shown (`NotificationDivider`); the expandable
+ * detail carries the failed model's error + HTTP status / attempt count.
  */
 function buildModelFallbackSegment(
   event: Record<string, unknown>,
   t: (key: string, opts?: Record<string, unknown>) => string,
   order: number,
 ): NotificationSegment {
-  const fromModel = (event.from_model as string) || '';
-  const toModel = (event.to_model as string) || '';
   const errText = typeof event.error === 'string' ? event.error.trim() : '';
   const statusCode = typeof event.status_code === 'number' ? event.status_code : null;
   const attempts = typeof event.attempts_on_from === 'number' ? event.attempts_on_from : null;
@@ -46,11 +43,15 @@ function buildModelFallbackSegment(
   if (statusCode != null) metaBits.push(`HTTP ${statusCode}`);
   if (attempts != null && attempts > 0) metaBits.push(t('chat.modelFallbackAttempts', { count: attempts }));
   const detail = [metaBits.join(' · '), errText].filter(Boolean).join('\n') || undefined;
-  const segment: NotificationSegment = {
-    type: 'notification',
-    content: t('chat.modelFallbackNotification', { from: fromModel, to: toModel }),
-    order,
+  const fallback: ModelFallbackNotice = {
+    from: typeof event.from_model === 'string' ? event.from_model : '',
+    to: typeof event.to_model === 'string' ? event.to_model : '',
   };
+  // A switch can move the turn onto another payer, so the notice names who
+  // pays for the model it moved to.
+  if (typeof event.to_paid_by === 'string') fallback.paidBy = event.to_paid_by;
+  if (typeof event.to_provider === 'string') fallback.provider = event.to_provider;
+  const segment: NotificationSegment = { type: 'notification', fallback, order };
   if (detail) {
     segment.detail = detail;
     segment.detailKind = 'error';

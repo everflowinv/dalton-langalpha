@@ -5,6 +5,20 @@
     "metric": "Cost per Intelligence Index task (USD), v4.3.2",
     "retrieved": "2026-10-18"
   },
+  "model_sources": {
+    "deepseek-flash": {
+      "name": "DeepSeek, V4.1 Flash 1017 release note",
+      "url": "https://api-docs.deepseek.com/news/news261017",
+      "metric": "Max is Artificial Analysis's 'DeepSeek V4.1 Flash 1017 (Max)' (v4.3.2); Low and High are Max scaled by the ratios of the release note's DeepSWE v1.1 cost per task chart (read off its log scale: low 0.112, high 0.146, max 0.195 USD)",
+      "retrieved": "2026-10-27"
+    },
+    "kimi-k3.1-pro": {
+      "name": "Moonshot AI, Kimi K3.1 Pro launch post",
+      "url": "https://www.kimi.ai/blog/kimi-k3-1-pro",
+      "metric": "Max is Artificial Analysis's 'Kimi K3.1 Pro' (v4.3.2; Moonshot runs it at max by default); High is Max scaled by the launch post's Terminal-Bench 4.0 cost per task chart (read off its linear scale: high 4.14, max 5.22 USD)",
+      "retrieved": "2026-10-27"
+    }
+  },
   "baseline": {
     "model": "claude-sonnet-5-5",
     "effort": "medium"
@@ -69,15 +83,21 @@
       "max": 0.4035
     },
     "deepseek-flash": {
-      "none": 0.1467,
-      "max": 0.265225
+      "low": 0.150511,
+      "high": 0.196202,
+      "max": 0.26205
     },
     "glm-5.3": {
       "low": 0.852217,
       "max": 2.005638
     },
     "kimi-k3.1-pro": {
+      "high": 1.677017,
       "max": 2.1145
+    },
+    "kimi-k3-coding": {
+      "low": 1.14631,
+      "max": 2.00013
     },
     "gemini-3.8-flash": {
       "medium": 0.931038,

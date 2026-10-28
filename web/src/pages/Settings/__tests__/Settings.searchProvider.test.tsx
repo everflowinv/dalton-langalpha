@@ -112,7 +112,7 @@ vi.mock('@/hooks/useAllModels', () => ({
     // Per-model tuning metadata — the Advanced section reads it for the
     // reasoning-effort ladder. Always an object from the real hook.
     metadata: {},
-    modelAccessMap: {},
+    payers: {},
     systemDefaults: { fallback_models: [] },
     // Stable Set ref — the stale-model cleanup effect keys on its identity.
     validModelNames: h.validModelNames,

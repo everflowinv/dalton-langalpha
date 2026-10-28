@@ -11,7 +11,7 @@
 import * as z from 'zod/mini';
 import type { CustomModelEntry } from '@/components/model/types';
 import type { ModelProfile } from './modelTuning';
-import { modelList } from './quickAccessModels';
+import { modelList } from './favoriteModels';
 
 export interface PreferencesLike {
   other_preference?: Record<string, unknown> | null;
@@ -265,8 +265,9 @@ const MODEL_SLOTS = [
 /**
  * The patch that takes the models `isGone` names out of everything that
  * refers to them: the slots, the fallbacks, the list and their profiles. A
- * key with nothing to take out is left out of the patch; a list left empty is
- * cleared.
+ * key with nothing to take out is left out of the patch. Emptied, the starred
+ * list is cleared, but the fallbacks are saved as `[]`: cleared, they would
+ * hand the user the deployment's list, fallbacks they never picked.
  *
  * Profiles are keyed by name only, so one left behind would be inherited by
  * whatever answers to that name next: a built-in a removed custom model
@@ -279,12 +280,12 @@ export function pruneModelReferences(prefs: unknown, isGone: (model: string) => 
     const value = bag[slot];
     if (typeof value === 'string' && isGone(value)) patch[slot] = null;
   }
-  const prune = (key: 'fallback_models' | 'starred_models', list: string[]) => {
+  const prune = (key: 'fallback_models' | 'starred_models', list: string[], emptied: [] | null) => {
     const kept = list.filter((m) => !isGone(m));
-    if (kept.length !== list.length) patch[key] = kept.length > 0 ? kept : null;
+    if (kept.length !== list.length) patch[key] = kept.length > 0 ? kept : emptied;
   };
-  prune('fallback_models', bag.fallback_models ?? []);
-  prune('starred_models', starredModels(prefs));
+  prune('fallback_models', bag.fallback_models ?? [], []);
+  prune('starred_models', starredModels(prefs), null);
   const stale = Object.keys(bag.profiles ?? {}).filter(isGone);
   if (stale.length > 0) patch.profiles = Object.fromEntries(stale.map((m) => [m, null]));
   return patch;

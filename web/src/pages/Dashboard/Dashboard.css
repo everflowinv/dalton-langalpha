@@ -84,9 +84,8 @@
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.12);
   transition: all var(--motion-fold) var(--ease-out);
 }
-/* Focus earns a low-alpha accent edge — no glow, resting stays neutral. */
+/* Focus squares the pill off; the edge stays neutral, as the composer's does. */
 .dashboard-floating-chat:focus-within {
-  border-color: var(--color-accent-overlay);
   border-radius: 1rem;
 }
 

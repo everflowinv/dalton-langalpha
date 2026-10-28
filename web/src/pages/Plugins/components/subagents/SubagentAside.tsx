@@ -100,7 +100,7 @@ export function ModelBlock({ view, models, write }: AsideProps) {
         onChange={pickModel}
         models={offered.models}
         placeholder={t('plugins.subagents.threadsModel')}
-        modelAccess={models.modelAccessMap}
+        payers={models.payers}
         metadata={metadata}
         disabledModels={offered.locked}
         // The server says whether a saved model still runs; one this picker

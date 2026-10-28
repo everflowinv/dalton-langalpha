@@ -30,7 +30,7 @@ vi.mock('@/hooks/useAllModels', () => ({
       openai: { models: ['gpt-sol', 'gpt-terra'] },
     },
     metadata: {},
-    modelAccessMap: {},
+    payers: {},
     systemDefaults: h.systemDefaults,
     isLoading: false,
   }),

@@ -389,17 +389,18 @@ async def cleanup_stale_model_preferences(user_id: str) -> list[tuple[str, str]]
         )
         return []
 
-    # Values: ``None`` for scalar deletes, ``list[str]`` (or ``None``) for
-    # fallback_models, and a ``{model: None}`` map for profiles. Merge-upsert
+    # Values: ``None`` for scalar deletes, ``list[str]`` for fallback_models,
+    # and a ``{model: None}`` map for profiles. Merge-upsert
     # interprets ``None`` as key deletion at either level.
     live, removed = drop_dead_models(pref, _MODEL_PREF_KEYS)
     updates: dict[str, list[str] | dict[str, None] | None] = {
         key: live.get(key) for key, _ in removed
     }
     if "fallback_models" in updates:
-        # Emptied → delete the key so it doesn't linger as ``[]``; the user saw
-        # the CTA naming what was cleared.
-        updates["fallback_models"] = updates["fallback_models"] or None
+        # Emptied, the list is saved as ``[]`` rather than deleted: deleting it
+        # would hand the user the deployment's list from the next turn on,
+        # fallbacks they never picked, where this turn's filter gave them none.
+        updates["fallback_models"] = updates["fallback_models"] or []
 
     # A profile keyed on a model that no longer exists is unreachable config.
     # ``None`` per model is the merge's own per-model delete, so the surviving

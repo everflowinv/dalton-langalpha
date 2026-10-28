@@ -975,7 +975,7 @@
           "base_url": "https://api.anthropic.com",
           "env_key": null,
           "access_type": "oauth",
-          "display_name": "Claude (OAuth)",
+          "display_name": "Claude",
           "default_headers": {
             "anthropic-beta": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14",
             "user-agent": "claude-cli/2.1.77",

@@ -38,6 +38,17 @@ export interface ModelMetadataEntry {
   /** Whose compaction the model takes, on by default. Absent or null = its
    * provider cannot compact for it. */
   native_compaction?: NativeCompactionKind | null;
+  /** What a typical task costs at each level the model offers, as a multiple
+   *  of the models API's `task_cost_baseline`; "any" for a model measured
+   *  without a level. Absent = never measured. */
+  task_cost?: Record<string, TaskCost>;
+}
+
+export interface TaskCost {
+  value: number;
+  /** False for a level the benchmark skipped, which carries the figure of the
+   *  nearest level above it: no more than this, rather than about this. */
+  measured: boolean;
 }
 
 /** Key for the (group, name) pair in customPairs — '::' can't collide with any provider or model name. */
