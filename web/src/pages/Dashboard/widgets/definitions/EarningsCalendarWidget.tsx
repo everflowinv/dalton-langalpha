@@ -227,43 +227,57 @@ function EarningsCalendarWidget({ instance }: WidgetRenderProps<EarningsConfig>)
   // otherwise the window buckets. (DALTON-HOOK(user-coverage))
   const shownRows = next90 && scope === 'mine' ? next90Items : upcoming;
 
+  // DALTON-HOOK(user-coverage): the export describes what the widget shows —
+  // the 90-day flat view exports its own set and its own window, not the
+  // selected short window the list would otherwise name.
+  const next90On = next90 && scope === 'mine';
+  const exportRows = next90On ? next90Items : upcoming;
+  const exportWindowDays = next90On ? 90 : windowDays;
+  const exportToStr = next90On ? localDateStr(now + 90 * 86_400_000) : toStr;
+
   useWidgetContextExport(instance.id, {
     full: () => {
       const sections: string[] = [];
-      const counts: Record<BucketKey, number> = {
-        today: grouped.today.length,
-        tomorrow: grouped.tomorrow.length,
-        week: grouped.week.length,
-        next: grouped.next.length,
-        later: grouped.later.length,
-      };
-      (Object.keys(grouped) as BucketKey[]).forEach((b) => {
-        if (grouped[b].length === 0) return;
-        sections.push(`### ${t(BUCKET_KEY[b])} (${grouped[b].length})`, '', serializeEarningsToMarkdown(grouped[b]), '');
-      });
+      const counts: Record<BucketKey, number> = next90On
+        ? { today: 0, tomorrow: 0, week: 0, next: 0, later: next90Items.length }
+        : {
+            today: grouped.today.length,
+            tomorrow: grouped.tomorrow.length,
+            week: grouped.week.length,
+            next: grouped.next.length,
+            later: grouped.later.length,
+          };
+      if (next90On) {
+        if (next90Items.length > 0) {
+          sections.push(`### ${t('dashboard.earningsCalendarCard.next90Days')} (${next90Items.length})`, '', serializeEarningsToMarkdown(next90Items), '');
+        }
+      } else {
+        (Object.keys(grouped) as BucketKey[]).forEach((b) => {
+          if (grouped[b].length === 0) return;
+          sections.push(`### ${t(BUCKET_KEY[b])} (${grouped[b].length})`, '', serializeEarningsToMarkdown(grouped[b]), '');
+        });
+      }
       const body = sections.length
         ? sections.join('\n').trimEnd()
-        : `_no upcoming earnings in next ${windowDays}d_`;
+        : `_no upcoming earnings in next ${exportWindowDays}d_`;
       // DALTON-HOOK(user-coverage): the export names the scope it was read under.
       const text = wrapWidgetContext(
         'calendar.earnings',
-        { window_days: windowDays, count: upcoming.length, from: todayStr, to: toStr, scope },
+        { window_days: exportWindowDays, count: exportRows.length, from: todayStr, to: exportToStr, scope },
         body,
       );
       return {
         widget_type: 'calendar.earnings',
         widget_id: instance.id,
-        label: `${t('dashboard.widgets.earningsCalendar.title')} · ${upcoming.length}`,
-        description: `next ${windowDays}d`,
+        label: `${t('dashboard.widgets.earningsCalendar.title')} · ${exportRows.length}`,
+        description: `next ${exportWindowDays}d`,
         captured_at: new Date().toISOString(),
         text,
-        data: { window_days: windowDays, from: todayStr, to: toStr, scope, counts, upcoming },
+        data: { window_days: exportWindowDays, from: todayStr, to: exportToStr, scope, counts, rows: exportRows },
       };
     },
     rows: (rowId: string) => {
-      const item =
-        shownRows.find((e) => `${e.symbol}-${e.date}` === rowId) ??
-        upcoming.find((e) => `${e.symbol}-${e.date}` === rowId);
+      const item = exportRows.find((e) => `${e.symbol}-${e.date}` === rowId);
       if (!item) return null;
       const session = sessionOf(item);
       const eps = epsOf(item);
