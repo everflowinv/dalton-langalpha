@@ -253,9 +253,11 @@ async def _finalize_token_save(user_id: str, tokens: dict, expected_flow_raw: st
             + timedelta(seconds=tokens.get("expires_in", 3600)),
             conn=conn,
         )
-        # Same critical section as the claim: no disconnect or newer login can
-        # slip between the save and this marker.
-        await cache.client.set(done_key, "1", ex=600)
+    # Published only once the save has committed (an exception above leaves no
+    # marker). A disconnect or newer login landing in between is harmless:
+    # ``check_login_complete`` ignores the marker while a newer flow is pending
+    # and requires the connection row to exist.
+    await cache.client.set(done_key, "1", ex=600)
     return claims
 
 
@@ -511,8 +513,15 @@ async def check_login_complete(user_id: str) -> bool:
 
     cache = get_cache_client()
     if cache.enabled and cache.client:
-        _flow_key, done_key = _flow_keys(user_id)
-        return bool(await cache.client.get(done_key))
+        flow_key, done_key = _flow_keys(user_id)
+        if not await cache.client.get(done_key):
+            return False
+        # A newer login still pending owns the poll: an older flow's marker
+        # must not report it finished.
+        if await cache.client.get(flow_key):
+            return False
+        tokens = await get_oauth_tokens(user_id, ANTIGRAVITY_PROVIDER)
+        return bool(tokens and tokens.get("access_token"))
     # Redis unavailable: fall back to a DB lookup, comparing updated_at against initiated_at (R2-N5N6 #7).
     tokens = await get_oauth_tokens(user_id, ANTIGRAVITY_PROVIDER)
     if not tokens or not tokens.get("access_token"):
