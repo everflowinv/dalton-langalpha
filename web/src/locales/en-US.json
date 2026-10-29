@@ -2098,6 +2098,7 @@
     "moreTools": "More tools",
     "composer": {
       "remove": "Remove",
+      "previewImage": "Preview image",
       "attachFile": "Attach file",
       "attachChart": "Attach chart screenshot",
       "captureChart": "Capture chart",

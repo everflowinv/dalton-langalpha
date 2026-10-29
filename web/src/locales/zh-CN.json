@@ -2092,6 +2092,7 @@
     "moreTools": "更多工具",
     "composer": {
       "remove": "移除",
+      "previewImage": "预览图片",
       "attachFile": "添加附件",
       "attachChart": "附加图表截图",
       "captureChart": "截取图表",

@@ -96,6 +96,9 @@ src/dalton/plugin_json_budget.py
 tests/unit/server/services/test_plugin_json_budget.py
 # P8: workspace status guard in dalton publications DB layer.
 tests/unit/server/database/test_dalton_publications.py
+# Composer image-attachment thumbnail opens the shared lightbox
+# (FilePreviewCard in web/src/components/ui/chat-input.parts.tsx).
+web/src/components/ui/__tests__/chat-input.filePreview.test.tsx
 # A1 storage split: transcription audio moves to its own DALTON_ASR_STORAGE_* store.
 src/dalton/transcription_storage.py
 tests/unit/dalton/test_transcription_storage.py
