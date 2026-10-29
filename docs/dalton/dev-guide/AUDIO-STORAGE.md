@@ -64,6 +64,8 @@
 | `MINIO_API_STALE_UPLOADS_CLEANUP_INTERVAL` | `6h` | `6h` | MinIO 扫描并清理未完成分片上传的周期 |
 | `STORAGE_PUBLIC_URL_BASE` | 无 | **留空 / 不设置** | 桶为私有，所有拉取均走短期预签名 URL |
 | `STORAGE_MAX_UPLOAD_SIZE` | `10485760`（代码默认 10 MiB，`.env.example` 30 MiB） | **保持现有值不改** | 仅控制后端内存中转接口与聊天附件上限；工作区直传有独立的 2 GiB 上限（`MAX_DIRECT_UPLOAD_BYTES`），**切勿调大 `STORAGE_MAX_UPLOAD_SIZE`** |
+| `DALTON_TRANSCRIPTION_ENABLED` | 未设置（**默认关闭**） | `1`（仅 `1`/`true`/`yes`/`on`，大小写不敏感，算开启） | 录音转写总开关（A1）：关闭时 `prepare_transcription` 工具不注册、`dalton-transcript-polish` 技能隐藏、`/api/v1/dalton/transcriptions*` 返回 404、对账循环不跑；**必须先配好本清单的 MinIO 存储与火山 ASR / TOS 凭据、并用真实凭据端到端验证后再开启**（开启还要求 `is_storage_enabled()` 为真，见 `src/dalton/services/transcriptions.py` 的 `is_transcription_enabled`） |
+| `DALTON_TRANSCRIPTION_RECONCILE_ENABLED` | `1`（默认开启） | `1` | 5 分钟后台对账循环的独立关闭开关；受 `DALTON_TRANSCRIPTION_ENABLED` 总开关约束 |
 
 ---
 

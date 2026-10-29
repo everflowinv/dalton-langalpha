@@ -23,6 +23,7 @@ from src.dalton.services.transcriptions import (
     get_transcription_job_result,
     get_transcription_job_status,
     get_transcription_usage_report,
+    is_transcription_enabled,
     is_transcription_ticket_token,
     prepare_transcription_job,
     retry_transcription_job,
@@ -63,8 +64,16 @@ class CreateOrSubmitTranscriptionRequest(BaseModel):
 
 
 def _require_dalton_enabled() -> None:
+    """Single gate every endpoint passes through (via `_resolve_caller_and_ticket` or directly).
+
+    Both checks read as "feature does not exist" (404), never 403/503: the
+    transcription master switch is off exactly when the deployment must not
+    expose the feature at all.
+    """
     if not get_dalton_settings().enabled:
         raise HTTPException(status_code=404, detail="Dalton mode disabled")
+    if not is_transcription_enabled():
+        raise HTTPException(status_code=404, detail="Transcription is not enabled")
 
 
 def _extract_ticket_from_request(

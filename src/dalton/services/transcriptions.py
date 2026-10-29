@@ -2536,8 +2536,28 @@ async def cancel_transcription_job(
     }
 
 
+def is_transcription_enabled() -> bool:
+    """Return True only when the transcription master switch is on and object storage is enabled.
+
+    `DALTON_TRANSCRIPTION_ENABLED` defaults to off; only "1"/"true"/"yes"/"on"
+    (case-insensitive) turn it on. Production must configure MinIO and the
+    Volcengine ASR/TOS credentials and verify them before any transcription
+    surface (tool, skill, API, reconciliation) becomes visible.
+    """
+    flag = os.getenv("DALTON_TRANSCRIPTION_ENABLED", "").strip().lower()
+    if flag not in ("1", "true", "yes", "on"):
+        return False
+    return is_storage_enabled()
+
+
 def is_transcription_reconciliation_enabled() -> bool:
-    """Return True when Dalton mode and background transcription reconciliation are enabled."""
+    """Return True when transcription is enabled and background reconciliation is not switched off.
+
+    `DALTON_TRANSCRIPTION_RECONCILE_ENABLED` keeps its own default-on kill
+    switch; the transcription master switch (and Dalton mode) gate it from above.
+    """
+    if not is_transcription_enabled():
+        return False
     if not get_dalton_settings().enabled:
         return False
     env_flag = os.getenv("DALTON_TRANSCRIPTION_RECONCILE_ENABLED", "1").strip().lower()
@@ -2766,6 +2786,7 @@ __all__ = [
     "get_transcription_job_result",
     "get_transcription_job_status",
     "get_transcription_usage_report",
+    "is_transcription_enabled",
     "is_transcription_reconciliation_enabled",
     "is_transcription_ticket_token",
     "issue_transcription_ticket",

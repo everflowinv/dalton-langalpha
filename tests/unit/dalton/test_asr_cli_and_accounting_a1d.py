@@ -1600,7 +1600,7 @@ async def test_fix1_upload_endpoints_ticket_and_status_and_smuggled_key_and_size
     - Smuggled `key` / `source_object_key` / `url` in request body is rejected (`400`); object key is strictly the ticket-bound `source_object_key`.
     - Submitting before upload completion (`object_size != source_size_bytes`) is rejected (`409`).
     - Size mismatch on complete aborts the multipart upload (`abort_multipart_upload` + `delete_object`) and returns `400`.
-    - Object storage disabled explicitly errors (`503`).
+    - Object storage disabled explicitly: the service-level upload guard errors `503`; via the router the A1 master switch answers `404` (feature absent).
     """
     ledger = InMemoryTranscriptionLedger()
     bridge = _make_test_bridge(tmp_path, delay_s=0.01)
@@ -1691,14 +1691,26 @@ async def test_fix1_upload_endpoints_ticket_and_status_and_smuggled_key_and_size
             )
             assert r_smug.status_code == 400
 
-        # 4. Object storage disabled explicitly returns 503 (never downgrades)
+        # 4. Object storage disabled explicitly: the service-level upload guard
+        #    still refuses with 503 (never downgrades); through the router the
+        #    A1 master switch (storage off => feature absent) answers 404 first.
         storage.enabled = False
+        with pytest.raises(svc_transcriptions.HTTPException) as svc_disabled:
+            await svc_transcriptions.start_transcription_upload(
+                job_id=job_id,
+                caller_user_id="u-internal-upload",
+                ticket_claims=svc_transcriptions.verify_transcription_ticket(
+                    full_ticket, required_op="upload", expected_job_id=job_id
+                ),
+                raw_body={},
+            )
+        assert svc_disabled.value.status_code == 503
         r_disabled = await client.post(
             f"/api/v1/dalton/transcriptions/{job_id}/upload/start",
             headers={"X-Dalton-Transcription-Ticket": full_ticket},
             json={},
         )
-        assert r_disabled.status_code == 503
+        assert r_disabled.status_code == 404
         storage.enabled = True
 
         # 5. Start multipart upload -> binds strictly to `bound_key`

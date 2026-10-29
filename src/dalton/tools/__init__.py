@@ -32,7 +32,13 @@ def build_dalton_tools(
     ``conversation_search`` from external members, who would only reach its
     per-call refusal. None leaves the tool mounted (the refusal stays the
     second line of defense for builds without a resolved tier).
+
+    ``prepare_transcription`` mounts only when ``is_transcription_enabled()``
+    is true (``DALTON_TRANSCRIPTION_ENABLED`` on and storage configured); with
+    the master switch off the agent never sees a tool it cannot run.
     """
+    from src.dalton.services.transcriptions import is_transcription_enabled
+
     settings = get_dalton_settings()
     is_enabled = enabled if enabled is not None else (
         settings.enabled
@@ -142,19 +148,20 @@ def build_dalton_tools(
             )
         except Exception as e:
             logger.debug("[DALTON_TOOLS] ingest_tools not loaded: %s", e)
-        try:
-            from src.dalton.tools.transcription_tools import (
-                build_prepare_transcription_tool,
-            )
-
-            tools.append(
-                build_prepare_transcription_tool(
-                    filesystem_backend=filesystem_backend,
-                    allow_home_workspace=True,
+        if is_transcription_enabled():
+            try:
+                from src.dalton.tools.transcription_tools import (
+                    build_prepare_transcription_tool,
                 )
-            )
-        except Exception as e:
-            logger.debug("[DALTON_TOOLS] transcription_tools not loaded: %s", e)
+
+                tools.append(
+                    build_prepare_transcription_tool(
+                        filesystem_backend=filesystem_backend,
+                        allow_home_workspace=True,
+                    )
+                )
+            except Exception as e:
+                logger.debug("[DALTON_TOOLS] transcription_tools not loaded: %s", e)
         return tools
 
     # Analyst workspace tools
@@ -230,18 +237,19 @@ def build_dalton_tools(
     except Exception as e:
         logger.debug("[DALTON_TOOLS] ingest_tools not loaded: %s", e)
 
-    try:
-        from src.dalton.tools.transcription_tools import (
-            build_prepare_transcription_tool,
-        )
-
-        tools.append(
-            build_prepare_transcription_tool(
-                filesystem_backend=filesystem_backend,
-                allow_home_workspace=False,
+    if is_transcription_enabled():
+        try:
+            from src.dalton.tools.transcription_tools import (
+                build_prepare_transcription_tool,
             )
-        )
-    except Exception as e:
-        logger.debug("[DALTON_TOOLS] transcription_tools not loaded: %s", e)
+
+            tools.append(
+                build_prepare_transcription_tool(
+                    filesystem_backend=filesystem_backend,
+                    allow_home_workspace=False,
+                )
+            )
+        except Exception as e:
+            logger.debug("[DALTON_TOOLS] transcription_tools not loaded: %s", e)
 
     return tools

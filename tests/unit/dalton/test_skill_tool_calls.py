@@ -9,6 +9,9 @@ import re
 import sys
 from pathlib import Path
 from typing import Any
+from unittest.mock import create_autospec
+
+import pytest
 
 from src.dalton.tools import build_dalton_tools
 from src.dalton.web_search.provider import build_web_search_tool
@@ -482,6 +485,18 @@ def validate_extracted_calls(
     return errors
 
 
+def _enable_transcription_tool(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A1 总开关：技能 Markdown 守卫扫描要在签名注册表里认得 `prepare_transcription`。"""
+    from src.dalton.services import transcriptions as svc_transcriptions
+
+    monkeypatch.setenv("DALTON_TRANSCRIPTION_ENABLED", "1")
+    monkeypatch.setattr(
+        svc_transcriptions,
+        "is_storage_enabled",
+        create_autospec(svc_transcriptions.is_storage_enabled, return_value=True),
+    )
+
+
 def test_tool_registry_loads_dalton_direct_and_sec_mcp_signatures() -> None:
     registry = build_tool_signature_registry()
     for expected_direct in (
@@ -537,7 +552,10 @@ def test_tool_registry_loads_dalton_direct_and_sec_mcp_signatures() -> None:
     assert "pages" not in registry["researchdata.research"]
 
 
-def test_skill_markdown_tool_calls_match_signatures() -> None:
+def test_skill_markdown_tool_calls_match_signatures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_transcription_tool(monkeypatch)
     registry = build_tool_signature_registry()
     md_files = sorted(SKILLS_ROOT.rglob("*.md"))
     assert md_files, f"No skill markdown files found under {SKILLS_ROOT}"

@@ -8,6 +8,7 @@ the registry and ``SKILL.md`` never drift.
 
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 
@@ -30,6 +31,22 @@ _RW = "run-workflow"
 # Hidden skills are activated programmatically via additional_context and stay
 # out of user-facing slash listings and sandbox skill manifests.
 _HIDDEN_DALTON_SKILLS: frozenset[str] = frozenset({"dalton-onboarding"})
+
+# The transcription master switch (A1): with it off, `dalton-transcript-polish`
+# hides the same way `_HIDDEN_DALTON_SKILLS` entries do — out of the skill
+# manifest, the listings and the sandbox. Env-only by design: this module
+# builds the registry at import time, and a storage probe there would run (and
+# log config warnings) on every import; the storage half of the switch lives
+# in `is_transcription_enabled` (src/dalton/services/transcriptions.py).
+_TRANSCRIPTION_SWITCH_VALUES = ("1", "true", "yes", "on")
+
+
+def _is_transcription_switch_on() -> bool:
+    """Whether `DALTON_TRANSCRIPTION_ENABLED` is set to an on value (case-insensitive)."""
+    return (
+        os.getenv("DALTON_TRANSCRIPTION_ENABLED", "").strip().lower()
+        in _TRANSCRIPTION_SWITCH_VALUES
+    )
 
 # (skill_name, command, requires)
 _DALTON_SKILL_SPECS: tuple[tuple[str, str | None, tuple[str, ...]], ...] = (
@@ -90,7 +107,13 @@ def build_dalton_skill_definitions(
             skill_md_path=f"skills/{name}/SKILL.md",
             command=command,
             requires=requires,
-            hidden=name in _HIDDEN_DALTON_SKILLS,
+            hidden=(
+                name in _HIDDEN_DALTON_SKILLS
+                or (
+                    name == "dalton-transcript-polish"
+                    and not _is_transcription_switch_on()
+                )
+            ),
         )
     return definitions
 

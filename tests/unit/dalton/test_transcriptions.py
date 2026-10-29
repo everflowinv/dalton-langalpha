@@ -249,6 +249,9 @@ def _wire_ledger_and_bridge(
     monkeypatch.setenv(
         "DALTON_TRANSCRIPTION_TICKET_SECRET", "unit-test-ticket-hmac-secret-key-32b"
     )
+    # A1 总开关：这些用例测的是转写本体行为，统一打开总开关（存储已由下方
+    # is_storage_enabled 替身置真）。
+    monkeypatch.setenv("DALTON_TRANSCRIPTION_ENABLED", "1")
     monkeypatch.setattr(
         db_transcriptions,
         "create_transcription_job",
