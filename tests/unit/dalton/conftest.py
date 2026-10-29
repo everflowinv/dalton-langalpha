@@ -56,3 +56,20 @@ def inline_heavy_compute(request: pytest.FixtureRequest, monkeypatch: pytest.Mon
     monkeypatch.setattr(audit_mod, "run_in_heavy_subprocess", runner)
     monkeypatch.setattr(service_mod, "run_in_heavy_subprocess", runner)
     yield
+
+
+@pytest.fixture(autouse=True)
+def _isolated_bridge_env_file(
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Point the bridge at an empty env file, never the machine's real one.
+
+    The bridge loads ``DALTON_BRIDGE_ENV_FILE`` (default
+    ``~/.config/dalton/researchdata-bridge.env``) into ``os.environ`` when it
+    builds its config. Read in a unit test, real tokens and Seed-ASR / TOS keys
+    would land in the test process and switch the ASR worker from the fake to
+    the real one. A test that needs file-backed settings writes its own file.
+    """
+    empty = tmp_path_factory.getbasetemp() / "isolated-bridge.env"
+    empty.touch(exist_ok=True)
+    monkeypatch.setenv("DALTON_BRIDGE_ENV_FILE", str(empty))
