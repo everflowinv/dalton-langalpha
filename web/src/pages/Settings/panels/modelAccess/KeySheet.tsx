@@ -4,7 +4,11 @@ import type { ConfiguredProvider } from '@/hooks/useConfiguredProviders';
 import { ApiKeyFormFields, useApiKeyForm } from '@/components/modelAccess/ApiKeyForm';
 import { BackButton, KeyStepFrame } from '@/components/modelAccess/KeyProviderPicker';
 import { optionName } from '@/components/modelAccess/optionLabels';
+import { QuietNote } from '@/components/modelAccess/parts';
 import type { KeyOption, ProviderGroup } from '@/components/modelAccess/providerOptions';
+// DALTON-HOOK(team-credentials): non-PM members cannot write shared API keys under team sharing.
+import { isDaltonAuth } from '@/config/daltonAuth';
+import { useTeamCredentials } from '@/hooks/useTeamCredentials';
 
 /** Adding or updating a key, then on to its models. */
 export function KeySheet({
@@ -28,7 +32,13 @@ export function KeySheet({
   onBack?: () => void;
 }) {
   const { t } = useTranslation();
+  // DALTON-HOOK(team-credentials): non-PM members cannot write shared API keys under team sharing.
+  const { isShared: isTeamShared, canManage } = useTeamCredentials();
+  const teamManagedByAdmin = isDaltonAuth && isTeamShared && !canManage;
   const form = useApiKeyForm(option, configured);
+  if (teamManagedByAdmin) {
+    return <QuietNote>{t('modelAccess.teamManagedByAdmin')}</QuietNote>; // DALTON-HOOK(team-credentials)
+  }
   const fields = (
     <>
       {group && group.options.length > 1 && (

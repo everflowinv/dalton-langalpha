@@ -22,6 +22,7 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
+from src.dalton.credentials import require_credential_write_admin
 from src.dalton.llm.providers.antigravity.oauth import (
     ANTIGRAVITY_PROVIDER,
     check_login_complete as antigravity_check_login_complete,
@@ -97,6 +98,9 @@ async def _claim_pending(cache, key: str, raw) -> bool:
 @router.post("/muse/device/initiate")
 async def muse_device_initiate(user_id: CurrentUserId):
     """Start device code flow. Returns user_code + verification URL."""
+    # DALTON-HOOK(team-credentials): connecting writes the shared credential;
+    # only PM users pass, before the provider request or the Redis flow write.
+    require_credential_write_admin(user_id)
     from src.utils.cache.redis_cache import get_cache_client
 
     cache = get_cache_client()
@@ -126,6 +130,10 @@ async def muse_device_initiate(user_id: CurrentUserId):
 @router.post("/muse/device/poll")
 async def muse_device_poll(user_id: CurrentUserId):
     """Poll for device authorization."""
+    # DALTON-HOOK(team-credentials): the poll is where an approval becomes the
+    # stored credential, so the writer is re-checked here, not only at
+    # initiate — before the flow read, the claim, or the save.
+    require_credential_write_admin(user_id)
     from src.server.database.oauth_tokens import connection_change
     from src.utils.cache.redis_cache import get_cache_client
 
@@ -158,6 +166,9 @@ async def muse_device_poll(user_id: CurrentUserId):
         return {"pending": True}
 
     try:
+        # DALTON-HOOK(team-credentials): re-check after the upstream poll/mint
+        # so an admin demoted while waiting on Meta cannot commit the key.
+        require_credential_write_admin(user_id)
         # Claim the flow and store under the connection lock: a disconnect that
         # landed while Meta was answering has cleared the key, and this save
         # aborts instead of reviving the connection (DALTON-HOOK(team-credentials)).
@@ -251,8 +262,13 @@ async def muse_disconnect(user_id: CurrentUserId):
 @router.post("/antigravity/initiate")
 async def antigravity_initiate(user_id: CurrentUserId):
     """Start the loopback login: PKCE + local callback listener + authorize URL."""
+    # DALTON-HOOK(team-credentials): connecting writes the shared credential;
+    # only PM users pass, before the listener or the flow keys appear.
+    require_credential_write_admin(user_id)
     try:
         login = await antigravity_start_login(user_id)
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"[oauth] Antigravity login start failed for user_id={user_id}: {type(e).__name__}")
         raise HTTPException(status_code=502, detail="Failed to start Google login")
@@ -267,6 +283,9 @@ async def antigravity_initiate(user_id: CurrentUserId):
 @router.post("/antigravity/poll")
 async def antigravity_poll(user_id: CurrentUserId):
     """Poll for loopback-callback completion."""
+    # DALTON-HOOK(team-credentials): a non-PM member may not report (or land)
+    # the shared connection's sign-in; checked before the status read.
+    require_credential_write_admin(user_id)
     try:
         if await antigravity_check_login_complete(user_id):
             status = await get_oauth_connection(user_id, ANTIGRAVITY_PROVIDER)
@@ -277,6 +296,8 @@ async def antigravity_poll(user_id: CurrentUserId):
                 "plan_type": (status or {}).get("plan_type"),
             }
         return {"pending": True}
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"[oauth] Antigravity poll error for user_id={user_id}: {type(e).__name__}")
         raise HTTPException(status_code=502, detail="Failed to poll login status")
@@ -285,8 +306,14 @@ async def antigravity_poll(user_id: CurrentUserId):
 @router.post("/antigravity/callback")
 async def antigravity_callback(user_id: CurrentUserId, body: AntigravityCallbackRequest):
     """Exchange a manually pasted callback URL for Antigravity tokens (Docker fallback, R6-5)."""
+    # DALTON-HOOK(team-credentials): the paste is where the authorization
+    # becomes the stored credential, so the writer is re-checked here, not
+    # only at initiate (the save re-checks once more at its commit).
+    require_credential_write_admin(user_id)
     try:
         return await antigravity_submit_callback_url(user_id, body.callback_input)
+    except HTTPException:
+        raise
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
@@ -334,6 +361,9 @@ async def antigravity_disconnect(user_id: CurrentUserId):
 @router.post("/xai/device/initiate")
 async def xai_device_initiate(user_id: CurrentUserId):
     """Start xAI device code flow. Returns user_code + verification URL."""
+    # DALTON-HOOK(team-credentials): connecting writes the shared credential;
+    # only PM users pass, before the provider request or the Redis flow write.
+    require_credential_write_admin(user_id)
     from src.utils.cache.redis_cache import get_cache_client
 
     cache = get_cache_client()
@@ -375,6 +405,10 @@ async def xai_device_initiate(user_id: CurrentUserId):
 @router.post("/xai/device/poll")
 async def xai_device_poll(user_id: CurrentUserId):
     """Poll for xAI device authorization."""
+    # DALTON-HOOK(team-credentials): the poll is where an approval becomes the
+    # stored credential, so the writer is re-checked here, not only at
+    # initiate — before the flow read, the swap, the claim, or the save.
+    require_credential_write_admin(user_id)
     from src.server.database.oauth_tokens import connection_change
     from src.utils.cache.redis_cache import get_cache_client
 
@@ -452,6 +486,9 @@ async def xai_device_poll(user_id: CurrentUserId):
         return {"pending": True, "interval": new_interval}
 
     try:
+        # DALTON-HOOK(team-credentials): re-check after the upstream poll so an
+        # admin demoted while waiting on xAI cannot commit the tokens.
+        require_credential_write_admin(user_id)
         # Claim the flow and store under the connection lock: a disconnect that
         # landed while xAI was answering has cleared the key, and this save
         # aborts instead of reviving the connection (DALTON-HOOK(team-credentials)).

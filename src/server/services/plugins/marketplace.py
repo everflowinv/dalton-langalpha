@@ -20,7 +20,6 @@ page view. Without Redis every call fetches live.
 """
 
 import asyncio
-import json
 import logging
 import re
 from collections.abc import Iterable, Mapping
@@ -31,6 +30,8 @@ from urllib.parse import urlsplit
 from pydantic import BaseModel, Field, ValidationError
 
 from src.config.env import PLUGIN_MARKETPLACE_URL
+# DALTON-HOOK(plugin-json-budget): enforce byte, depth, and node budgets on catalog vocabulary JSON.
+from src.dalton.plugin_json_budget import loads_json_with_budget
 from src.server.models.marketplace import (
     MarketplaceContents,
     MarketplaceCoverage,
@@ -152,7 +153,8 @@ def _json(raw: bytes | None) -> Any:
     if raw is None:
         return None
     try:
-        return json.loads(raw.decode("utf-8"))
+        # DALTON-HOOK(plugin-json-budget): enforce byte, depth, and node budgets before/after json.loads.
+        return loads_json_with_budget(raw, target=_VOCABULARY_PATH, check_surrogates=False)
     except (ValueError, RecursionError):
         return None
 

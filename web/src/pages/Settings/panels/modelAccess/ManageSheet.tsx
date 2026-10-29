@@ -13,10 +13,11 @@ import { QuietNote } from '@/components/modelAccess/parts';
 import type { KeyOption } from '@/components/modelAccess/providerOptions';
 import { KeySheet } from './KeySheet';
 import { keyDetail } from './keyDetail';
-// DALTON-HOOK(team-credentials): a non-PM team member never disconnects the
-// shared team credential (the server refuses it too).
+// DALTON-HOOK(team-credentials): a non-PM team member never writes the shared
+// team credential — no disconnect, no reconnect, no key change (the server
+// refuses each of those too).
 import { isDaltonAuth } from '@/config/daltonAuth';
-import { useTeamCredentials } from '@/hooks/useTeamCredentials';;
+import { useTeamCredentials } from '@/hooks/useTeamCredentials';
 
 /** The sign-in for a subscription: a code approved on the provider's page, or Claude's paste-back. */
 export function SubscriptionFlow({
@@ -28,6 +29,12 @@ export function SubscriptionFlow({
   onConnected: () => void;
   onCancel?: () => void;
 }) {
+  const { t } = useTranslation();
+  // DALTON-HOOK(team-credentials): non-PM members cannot initiate subscription OAuth under team sharing.
+  const { isShared: isTeamShared, canManage } = useTeamCredentials();
+  if (isDaltonAuth && isTeamShared && !canManage) {
+    return <QuietNote>{t('modelAccess.teamManagedByAdmin')}</QuietNote>;
+  }
   // DALTON-HOOK(native-oauth-ui): Antigravity signs in with a browser flow, not a device code.
   if (provider === 'claude-oauth') {
     return <ClaudeConnect onConnected={onConnected} onCancel={onCancel} />;
@@ -61,8 +68,9 @@ export function ManageSheet({
   const { t } = useTranslation();
   const modelsHeadingId = useId();
   // DALTON-HOOK(team-credentials)
-  const { canDisconnect } = useTeamCredentials();
+  const { canDisconnect, canManage } = useTeamCredentials();
   const allowDisconnect = !isDaltonAuth || canDisconnect;
+  const allowManage = !isDaltonAuth || canManage;
   const subscription = isSubscriptionProvider(p.provider) ? p.provider : null;
   const picker = useModelPicker({ provider: p.provider, brandKey: option?.entry.brand_key ?? p.brand_key, justConnected });
   const [reconnecting, setReconnecting] = useState(false);
@@ -74,6 +82,16 @@ export function ManageSheet({
   const removable = p.masked_key !== SERVER_KEY && allowDisconnect;
 
   if (subscription && (needsReauth || reconnecting)) {
+    // DALTON-HOOK(team-credentials): reconnecting writes the shared
+    // credential; a non-PM member gets the note and who to ask, not the flow.
+    if (!allowManage) {
+      return (
+        <div className="flex flex-col gap-4">
+          {needsReauth && <QuietNote>{t('modelAccess.reconnectNote')}</QuietNote>}
+          <QuietNote>{t('modelAccess.teamManagedByAdmin')}</QuietNote>
+        </div>
+      );
+    }
     const done = () => setReconnecting(false);
     return (
       <div className="flex flex-col gap-4">
@@ -111,7 +129,8 @@ export function ManageSheet({
               </span>
             )}
           </div>
-          {option && (
+          {/* DALTON-HOOK(team-credentials): changing the key writes the shared credential. */}
+          {option && allowManage && (
             <Button type="button" variant="outline" size="sm" onClick={() => setEditingKey(true)}>
               {local ? t('modelAccess.apiKey.edit') : t('modelAccess.apiKey.change')}
             </Button>
@@ -132,7 +151,8 @@ export function ManageSheet({
             {subscription ? t('modelAccess.remove.disconnect') : t('modelAccess.remove.remove')}
           </Button>
         )}
-        {subscription && (
+        {/* DALTON-HOOK(team-credentials): reconnecting writes the shared credential. */}
+        {subscription && allowManage && (
           <Button type="button" variant="ghost" size="sm" onClick={() => setReconnecting(true)}>
             {t('modelAccess.reconnect')}
           </Button>

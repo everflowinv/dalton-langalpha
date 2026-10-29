@@ -68,6 +68,7 @@ export interface TeamReadOnlyState {
   isReadOnly: boolean;
   canWriteFiles: boolean;
   colleagueDispatchEnabled: boolean;
+  callerTier?: 'admin' | 'internal' | 'external' | string | null;
   isThreadOnly?: boolean;
   ownerName: string | null;
   ownerEmail: string | null;
@@ -90,6 +91,11 @@ export function useTeamReadOnly(
   const queryClient = useQueryClient();
   const { user: currentUser } = useUser({ enabled: Boolean(workspaceId) && isDaltonAuth });
   const { data: teamData } = useTeamWorkspaces(Boolean(workspaceId));
+  const callerTier =
+    teamData?.caller_tier ??
+    queryClient.getQueryData<{ caller_tier?: string | null }>(queryKeys.dalton.userSharing())
+      ?.caller_tier ??
+    null;
 
   if (!isDaltonAuth || !workspaceId) {
     return {
@@ -98,6 +104,7 @@ export function useTeamReadOnly(
       isReadOnly: false,
       canWriteFiles: true,
       colleagueDispatchEnabled: false,
+      callerTier,
       isThreadOnly: false,
       ownerName: null,
       ownerEmail: null,
@@ -147,6 +154,7 @@ export function useTeamReadOnly(
         isReadOnly: mode === 'ro',
         canWriteFiles: mode === 'rw',
         colleagueDispatchEnabled,
+        callerTier,
         isThreadOnly,
         ownerName: display,
         ownerEmail: member.email || matched.owner_email || null,
@@ -174,6 +182,7 @@ export function useTeamReadOnly(
       isReadOnly: mode === 'ro',
       canWriteFiles: mode === 'rw',
       colleagueDispatchEnabled,
+      callerTier,
       isThreadOnly,
       ownerName: display,
       ownerEmail: matchedMember?.email || navState?.teamOwnerEmail || null,
@@ -188,6 +197,7 @@ export function useTeamReadOnly(
       isReadOnly: mode === 'ro',
       canWriteFiles: mode === 'rw',
       colleagueDispatchEnabled,
+      callerTier,
       isThreadOnly,
       ownerName: navState.teamOwnerName || '同事',
       ownerEmail: navState.teamOwnerEmail || null,
@@ -203,6 +213,7 @@ export function useTeamReadOnly(
       isReadOnly: true,
       canWriteFiles: false,
       colleagueDispatchEnabled,
+      callerTier,
       isThreadOnly,
       ownerName: navState?.teamOwnerName || '同事',
       ownerEmail: navState?.teamOwnerEmail || null,
@@ -215,6 +226,7 @@ export function useTeamReadOnly(
     isReadOnly: false,
     canWriteFiles: true,
     colleagueDispatchEnabled,
+    callerTier,
     isThreadOnly: false,
     ownerName: null,
     ownerEmail: null,

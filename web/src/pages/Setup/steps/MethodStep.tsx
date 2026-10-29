@@ -167,13 +167,16 @@ export default function MethodStep() {
   const queryClient = useQueryClient();
   const { providers: configuredProviders, hasAny: hasConfigured } = useConfiguredProviders();
   // DALTON-HOOK(team-credentials): team-shared credentials status
-  const { isShared: isTeamShared, canDisconnect } = useTeamCredentials();
+  const { isShared: isTeamShared, canDisconnect, canManage } = useTeamCredentials();
   const allowDisconnect = !isDaltonAuth || canDisconnect;
+  // DALTON-HOOK(team-credentials): a non-PM member cannot write the shared
+  // credentials, so the method rows lead only to read-only notes for them.
+  const teamManagedByAdmin = isDaltonAuth && isTeamShared && !canManage;
   const { user, isLoading: userLoading } = useUser();
   const [localRedeemed, setLocalRedeemed] = useState(false);
   const hasPlatformAccess = (user?.access_tier ?? -1) >= 0 || localRedeemed;
   // Wait for user data before using hasPlatformAccess to avoid flicker
-  const canSkip = hasConfigured || (!userLoading && hasPlatformAccess);
+  const canSkip = hasConfigured || teamManagedByAdmin || (!userLoading && hasPlatformAccess);
   const [removing, setRemoving] = useState<ConfiguredProvider | null>(null);
 
   const headingId = useId();
@@ -251,9 +254,14 @@ export default function MethodStep() {
       />
       <div className="flex flex-col gap-4 sm:gap-6">
       {/* DALTON-HOOK(team-credentials): team-shared credentials hint */}
-      {isDaltonAuth && isTeamShared && (
+      {isDaltonAuth && isTeamShared && !teamManagedByAdmin && (
         <p className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
           {TEAM_SHARED_CREDENTIALS_HINT}
+        </p>
+      )}
+      {teamManagedByAdmin && (
+        <p className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
+          {t('modelAccess.teamManagedByAdmin')}
         </p>
       )}
       {/* Configured providers banner (visible when looping back) */}
@@ -286,25 +294,32 @@ export default function MethodStep() {
       )}
 
       {/* Each way goes straight on, as the rows in Settings do. */}
-      <ul aria-labelledby={headingId} className="flex flex-col gap-2">
-        {METHODS.map((method) => (
-          <li key={method.id}>
-            <button
-              type="button"
-              onClick={() => choose(method.id)}
-              className="flex w-full items-center gap-3 rounded-lg px-4 py-3.5 text-left transition-colors hover:bg-(--color-bg-hover)"
-              style={{ background: 'var(--color-bg-card)', border: '1px solid var(--color-border-muted)' }}
-            >
-              <span className="flex w-12 shrink-0 justify-center"><MethodMark method={method.id} /></span>
-              <span className="flex min-w-0 flex-1 flex-col gap-0.5">
-                <span className="text-sm font-medium" style={{ color: 'var(--color-text-primary)' }}>{t(method.titleKey)}</span>
-                <span className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>{t(method.descKey)}</span>
-              </span>
-              <ChevronRight aria-hidden="true" className="h-4 w-4 shrink-0" style={{ color: 'var(--color-text-tertiary)' }} />
-            </button>
-          </li>
-        ))}
-      </ul>
+      {/* DALTON-HOOK(team-credentials): hide credential-writing method rows for non-PM members under team sharing */}
+      {!teamManagedByAdmin && (
+        <ul aria-labelledby={headingId} className="flex flex-col gap-2">
+          {/* DALTON-HOOK(team-credentials) */}
+          {METHODS.map((method) => (
+            <li key={method.id}>
+              {/* DALTON-HOOK(team-credentials) */}
+              <button
+                type="button"
+                onClick={() => choose(method.id)}
+                className="flex w-full items-center gap-3 rounded-lg px-4 py-3.5 text-left transition-colors hover:bg-(--color-bg-hover)"
+                style={{ background: 'var(--color-bg-card)', border: '1px solid var(--color-border-muted)' }}
+              >
+                {/* DALTON-HOOK(team-credentials) */}
+                <span className="flex w-12 shrink-0 justify-center"><MethodMark method={method.id} /></span>
+                <span className="flex min-w-0 flex-1 flex-col gap-0.5">
+                  <span className="text-sm font-medium" style={{ color: 'var(--color-text-primary)' }}>{t(method.titleKey)}</span>
+                  <span className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>{t(method.descKey)}</span>
+                </span>
+                <ChevronRight aria-hidden="true" className="h-4 w-4 shrink-0" style={{ color: 'var(--color-text-tertiary)' }} />
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+      {/* DALTON-HOOK(team-credentials) */}
 
       {/* Invitation code section — hide only when user already has platform access */}
       {(userLoading || !hasPlatformAccess) && (

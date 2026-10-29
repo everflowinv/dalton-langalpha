@@ -14,13 +14,18 @@ rare entry that truly depends on it a warning rather than an install.
 """
 
 from dataclasses import dataclass, field
-from json import dumps, loads
 from typing import Any, ClassVar
 
 from jsonschema.validators import validator_for
 from referencing import Registry
 
 from ptc_agent.core.mcp_sanitize import VAULT_REF_RE
+# DALTON-HOOK(plugin-json-budget): enforce byte, depth, and node budgets on MCP documents.
+from src.dalton.plugin_json_budget import (
+    JsonBudgetError,
+    loads_json_with_budget,
+    unwrap_budget_error,
+)
 from src.server.models.mcp_server import coerce_mcp_name
 from src.server.models.plugin import Diagnostic
 from src.server.services.plugins.manifest import SPEC_URL, check_schema_version
@@ -222,17 +227,29 @@ def validate_mcp_document(
             )
         ]
 
-    if len(raw) > MAX_DOCUMENT_BYTES:
+    # DALTON-HOOK(plugin-json-budget): enforce byte, depth, node, and output budgets with file/limit diagnostics.
+    budget_err = unwrap_budget_error(raw)
+    if budget_err is None:
+        try:
+            doc = loads_json_with_budget(
+                raw,
+                target="mcp.json",
+                max_bytes=MAX_DOCUMENT_BYTES,
+            )
+        except JsonBudgetError as e:
+            budget_err = e
+        except (ValueError, RecursionError) as e:
+            return _component_error("invalid_json", f"mcp.json is not valid JSON: {e}")
+    if budget_err is not None:
+        if budget_err.limit_kind == "max_bytes":
+            return _component_error(
+                "document_too_large",
+                f"{budget_err.target} is limited to {budget_err.limit} bytes ({budget_err})",
+            )
         return _component_error(
-            "document_too_large",
-            f"mcp.json is limited to {MAX_DOCUMENT_BYTES} bytes",
+            "invalid_json",
+            f"{budget_err.target} is not valid JSON: {budget_err}",
         )
-    try:
-        doc = loads(raw.decode("utf-8"))
-        # As plugin.json: a lone surrogate the stored document cannot encode.
-        dumps(doc, ensure_ascii=False).encode("utf-8")
-    except (ValueError, RecursionError) as e:
-        return _component_error("invalid_json", f"mcp.json is not valid JSON: {e}")
     if not isinstance(doc, dict):
         return _component_error("invalid_json", "mcp.json must be a JSON object")
     entries = doc.get("mcpServers")

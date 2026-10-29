@@ -181,7 +181,7 @@ vi.mock('@/pages/Settings/panels/dalton/DaltonSection', () => ({
 // DALTON-HOOK(team-credentials): the model-access panel reads the shared-credential hint
 vi.mock('@/hooks/useTeamCredentials', () => ({
   TEAM_SHARED_CREDENTIALS_HINT: '',
-  useTeamCredentials: () => ({ isShared: false, canDisconnect: true, isPm: true, canInvite: false }),
+  useTeamCredentials: () => ({ isShared: false, canDisconnect: true, canManage: true, isPm: true, canInvite: false }),
 }));
 
 // Import after mocks are registered.

@@ -630,6 +630,8 @@ export interface DaltonInviteCreateResponse extends DaltonInviteItem {
 
 export interface DaltonInviteListResponse {
   invites: DaltonInviteItem[];
+  active_count?: number;
+  max_active?: number;
 }
 
 export interface DaltonInviteCheckResponse {

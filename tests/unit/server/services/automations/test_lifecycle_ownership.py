@@ -485,3 +485,120 @@ class TestHome:
 
         assert (exc.value.status_code, exc.value.field) == (403, "workspace_id")
         mock_auto_db.create_automation.assert_not_called()
+
+
+# DALTON-HOOK(automation-model): explicit null clears llm_model while omitted llm_model leaves it untouched
+class TestAutomationModelUpdate:
+    @pytest.mark.asyncio
+    async def test_explicit_null_llm_model_clears_stored_model(self, monkeypatch):
+        from datetime import datetime, timezone
+        from unittest.mock import create_autospec
+        from src.dalton.notify import dispatch as notify_dispatch
+        from src.server.app import automations as automations_app
+        from src.server.models.automation import AutomationUpdate
+
+        now = datetime.now(timezone.utc)
+        full_row = _current_row(
+            name="daily digest",
+            description=None,
+            trigger_config=None,
+            next_run_at=now,
+            last_run_at=None,
+            instruction="summarize the watchlist",
+            workspace_id=uuid.UUID(HOME),
+            llm_model="claude-sonnet-4-5",
+            thread_strategy="new",
+            conversation_thread_id=None,
+            max_failures=3,
+            failure_count=0,
+            delivery_config=None,
+            created_at=now,
+            updated_at=now,
+        )
+        get_mock = create_autospec(
+            lifecycle.auto_db.get_automation,
+            return_value=full_row,
+        )
+        update_mock = create_autospec(
+            lifecycle.auto_db.update_automation,
+            return_value={**full_row, "llm_model": None},
+        )
+        notify_mock = create_autospec(
+            notify_dispatch.populate_automation_notify_state,
+            return_value=None,
+        )
+        monkeypatch.setattr(lifecycle.auto_db, "get_automation", get_mock)
+        monkeypatch.setattr(lifecycle.auto_db, "update_automation", update_mock)
+        monkeypatch.setattr(
+            notify_dispatch, "populate_automation_notify_state", notify_mock
+        )
+
+        req = AutomationUpdate.model_validate({"llm_model": None})
+        resp = await automations_app.update_automation(
+            automation_id=uuid.UUID(AUTOMATION_ID),
+            request=req,
+            user_id=OWNER,
+        )
+
+        update_mock.assert_awaited_once()
+        written = update_mock.call_args.kwargs
+        assert "llm_model" in written
+        assert written["llm_model"] is None
+        assert resp.llm_model is None
+
+    @pytest.mark.asyncio
+    async def test_omitted_llm_model_leaves_stored_model_untouched(self, monkeypatch):
+        from datetime import datetime, timezone
+        from unittest.mock import create_autospec
+        from src.dalton.notify import dispatch as notify_dispatch
+        from src.server.app import automations as automations_app
+        from src.server.models.automation import AutomationUpdate
+
+        now = datetime.now(timezone.utc)
+        full_row = _current_row(
+            name="daily digest",
+            description=None,
+            trigger_config=None,
+            next_run_at=now,
+            last_run_at=None,
+            instruction="summarize the watchlist",
+            workspace_id=uuid.UUID(HOME),
+            llm_model="claude-sonnet-4-5",
+            thread_strategy="new",
+            conversation_thread_id=None,
+            max_failures=3,
+            failure_count=0,
+            delivery_config=None,
+            created_at=now,
+            updated_at=now,
+        )
+        get_mock = create_autospec(
+            lifecycle.auto_db.get_automation,
+            return_value=full_row,
+        )
+        update_mock = create_autospec(
+            lifecycle.auto_db.update_automation,
+            return_value={**full_row, "name": "renamed"},
+        )
+        notify_mock = create_autospec(
+            notify_dispatch.populate_automation_notify_state,
+            return_value=None,
+        )
+        monkeypatch.setattr(lifecycle.auto_db, "get_automation", get_mock)
+        monkeypatch.setattr(lifecycle.auto_db, "update_automation", update_mock)
+        monkeypatch.setattr(
+            notify_dispatch, "populate_automation_notify_state", notify_mock
+        )
+
+        req = AutomationUpdate.model_validate({"name": "renamed"})
+        resp = await automations_app.update_automation(
+            automation_id=uuid.UUID(AUTOMATION_ID),
+            request=req,
+            user_id=OWNER,
+        )
+
+        update_mock.assert_awaited_once()
+        written = update_mock.call_args.kwargs
+        assert "llm_model" not in written
+        assert written["name"] == "renamed"
+        assert resp.llm_model == "claude-sonnet-4-5"

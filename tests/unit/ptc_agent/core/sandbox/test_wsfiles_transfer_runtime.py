@@ -1725,3 +1725,106 @@ def test_a_symlink_standing_where_an_excluded_directory_would_be_is_skipped(tmp_
     assert [e["path"] for e in out["entries"] if e["kind"] == "symlink"] == [
         ".agents/skills/mine"
     ]
+
+
+# DALTON-HOOK(wsfiles-mtime): relay, direct, and restore never leave epoch 0 mtime
+def test_relay_direct_and_restore_paths_never_leave_epoch_mtime(tmp_path, monkeypatch):
+    """Relay, direct, and restore (files, in-situ files, directories, symlinks)
+    never leave an entry at 1970 (mtime == 0) when mtime_ns is None or 0, while
+    restore preserves a non-zero original mtime."""
+    objects = {
+        "http://store.local/direct": b"direct upload",
+        "http://store.local/restored_orig": b"restored orig",
+    }
+
+    def _fake_download_to_temp(url, root, timeout_s):
+        data = objects[url]
+        fd, name = rt.tempfile.mkstemp(prefix=rt._TEMP_PREFIX, dir=root)
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        os.utime(name, ns=(0, 0))
+        return name, _sha(data), len(data), 200
+
+    monkeypatch.setattr(rt, "_download_to_temp", _fake_download_to_temp)
+
+    # 1. Relay staged file at epoch with mtime_ns=None -> stamped with upload time
+    relay_staged = tmp_path / ".wsfiles-relay-upload"
+    relay_staged.write_bytes(b"relayed upload")
+    os.utime(relay_staged, ns=(0, 0))
+    relay_item = {
+        "path": "relay.txt",
+        "kind": "file",
+        "file": ".wsfiles-relay-upload",
+        "sha256": _sha(b"relayed upload"),
+        "size": len(b"relayed upload"),
+        "mode": 0o644,
+        "mtime_ns": None,
+    }
+
+    # 2. Direct upload (fetched via URL with mtime_ns=None) -> stamped with upload time
+    direct_item = {
+        "path": "direct.txt",
+        "kind": "file",
+        "url": "http://store.local/direct",
+        "sha256": _sha(b"direct upload"),
+        "size": len(b"direct upload"),
+        "mode": 0o644,
+        "mtime_ns": None,
+    }
+
+    # 3. Restore paths:
+    # 3a. Restore with original non-zero mtime_ns -> preserves original time
+    orig_ns = 1_710_000_000_123_456_000
+    restore_orig = {
+        "path": "restored_orig.txt",
+        "kind": "file",
+        "url": "http://store.local/restored_orig",
+        "sha256": _sha(b"restored orig"),
+        "size": len(b"restored orig"),
+        "mode": 0o640,
+        "mtime_ns": orig_ns,
+    }
+    # 3b. Restore in-situ file already on disk at epoch with mtime_ns=None -> stamped with current time
+    in_situ_path = _write(tmp_path, "restored_in_situ.txt", b"in situ bytes")
+    os.utime(in_situ_path, ns=(0, 0))
+    restore_in_situ = {
+        "path": "restored_in_situ.txt",
+        "kind": "file",
+        "url": "http://store.local/unused",
+        "sha256": _sha(b"in situ bytes"),
+        "size": len(b"in situ bytes"),
+        "mode": 0o640,
+        "mtime_ns": None,
+    }
+    # 3c. Restore dir and symlink with mtime_ns=0 -> never stamped to epoch 0
+    restore_dir = {"path": "restored_dir", "kind": "dir", "mode": 0o755, "mtime_ns": 0}
+    restore_link = {
+        "path": "restored_link",
+        "kind": "symlink",
+        "symlink_target": "restored_orig.txt",
+        "mtime_ns": 0,
+    }
+
+    out = rt.pull(
+        {
+            "root": str(tmp_path),
+            "timeout_s": 10,
+            "items": [
+                relay_item,
+                direct_item,
+                restore_orig,
+                restore_in_situ,
+                restore_dir,
+                restore_link,
+            ],
+        }
+    )
+    assert all(r["status"] == "ok" for r in out["results"].values())
+
+    assert os.stat(tmp_path / "relay.txt").st_mtime_ns // 1000 > 0
+    assert os.stat(tmp_path / "direct.txt").st_mtime_ns // 1000 > 0
+    assert os.stat(tmp_path / "restored_orig.txt").st_mtime_ns == orig_ns
+    assert os.stat(tmp_path / "restored_in_situ.txt").st_mtime_ns // 1000 > 0
+    assert os.stat(tmp_path / "restored_dir").st_mtime_ns // 1000 > 0
+    assert os.lstat(tmp_path / "restored_link").st_mtime_ns // 1000 > 0
+

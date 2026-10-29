@@ -967,12 +967,14 @@ async def test_db_delete_workspace_rechecks_published_reports_under_row_lock_and
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("bad_status", ["deleted", "archiving"])
-async def test_insert_publication_and_run_publish_reject_deleted_or_archiving_workspace(
+# "archiving" is a sandbox runtime state, never written to a workspace row (P8 dropped
+# that dead branch), so the second rejected case is a missing row.
+@pytest.mark.parametrize("bad_status", ["deleted", "missing"])
+async def test_insert_publication_and_run_publish_reject_deleted_or_missing_workspace(
     monkeypatch: pytest.MonkeyPatch,
     bad_status: str,
 ) -> None:
-    """insert_publication locks the workspace row FOR SHARE and refuses when status is deleted or archiving; run_publish transitions the request to rejected and returns an explicit error."""
+    """insert_publication locks the workspace row FOR SHARE and refuses when it is deleted or missing; run_publish transitions the request to rejected and returns an explicit error."""
     from src.dalton.database import knowledge as db_knowledge
     from src.dalton.database import publications as db_publications
     from src.dalton.publish import files as publish_files
@@ -986,6 +988,8 @@ async def test_insert_publication_and_run_publish_reject_deleted_or_archiving_wo
     async def _fetchone() -> dict[str, Any] | None:
         last_sql = executed_sqls[-1] if executed_sqls else ""
         if "FROM workspaces" in last_sql and "FOR SHARE" in last_sql:
+            if bad_status == "missing":
+                return None
             return {"workspace_id": "ws-1", "status": bad_status}
         return None
 

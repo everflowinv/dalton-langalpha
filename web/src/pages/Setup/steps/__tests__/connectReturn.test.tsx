@@ -55,9 +55,19 @@ vi.mock('@/hooks/useAllModels', () => ({
 vi.mock('@/api/client', () => ({ api: { get: h.apiGet, post: h.apiPost, defaults: { baseURL: '' } } }));
 // DALTON-HOOK(team-credentials): the connect steps read the team-credentials hint,
 // which needs the auth context these isolated step renders do not mount.
+const team = vi.hoisted(() => ({
+  current: { isShared: false, canDisconnect: true, canManage: true, isPm: true, canInvite: false },
+  daltonAuth: false,
+}));
 vi.mock('@/hooks/useTeamCredentials', () => ({
   TEAM_SHARED_CREDENTIALS_HINT: '',
-  useTeamCredentials: () => ({ isShared: false, canDisconnect: true, isPm: true, canInvite: false }),
+  useTeamCredentials: () => team.current,
+}));
+vi.mock('@/config/daltonAuth', async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  get isDaltonAuth() {
+    return team.daltonAuth;
+  },
 }));
 vi.mock('@/api/oauth', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/api/oauth')>()),
@@ -216,6 +226,22 @@ describe('CustomProviderConnect with a return', () => {
     await user.type(screen.getByLabelText('Base URL'), 'https://llm.example.com/v1');
     await user.type(screen.getByLabelText('API key'), 'sk-test');
   }
+
+  // DALTON-HOOK(team-credentials): a non-PM member under team sharing gets the
+  // note in place of the custom-provider form (the server refuses the save anyway)
+  it('shows a non-PM member the admin note instead of the custom provider form', async () => {
+    team.daltonAuth = true;
+    team.current = { isShared: true, canDisconnect: false, canManage: false, isPm: false, canInvite: false };
+    try {
+      renderStep(<CustomProviderConnect state={{ method: 'api_key', isCustom: true }} />);
+      expect(await screen.findByText(/managed by the administrator|由管理员管理/)).toBeInTheDocument();
+      expect(screen.queryByRole('textbox')).not.toBeInTheDocument();
+      expect(screen.queryByRole('button', { name: /continue|继续/i })).not.toBeInTheDocument();
+    } finally {
+      team.daltonAuth = false;
+      team.current = { isShared: false, canDisconnect: true, canManage: true, isPm: true, canInvite: false };
+    }
+  });
 
   it('goes back naming the new provider by its slug, with the tuned models it serves', async () => {
     keepReturn();

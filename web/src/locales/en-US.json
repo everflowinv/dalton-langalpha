@@ -125,6 +125,7 @@
     },
     "invites": {
       "title": "Invite members",
+      "activeQuota": "Active invites {{count}} / {{max}}",
       "subtitle": "Generate a single-use invite link (valid for 7 days) so teammates can register with a username and password.",
       "generate": "Generate invite link",
       "generating": "Generating…",
@@ -2103,7 +2104,8 @@
       "chartAlt": "Chart",
       "send": "Send message",
       "dropFiles": "Drop files to upload",
-      "uploading": "Uploading"
+      "uploading": "Uploading",
+      "inFlightDraftRestored": "Your last send may already have gone through. Check the conversation before sending it again."
     },
     "mention": {
       "noMatching": "No matching files",
@@ -3272,6 +3274,8 @@
     "colTook": "Took",
     "detailModel": "Model",
     "defaultModel": "Your default model",
+    "defaultModelOption": "Default model (account default)",
+    "modelUnavailableOption": "{{model}} (unavailable)",
     "detailWorkspace": "Workspace",
     "detailFailures": "Failures in a row",
     "failuresOf": "{{count}} of {{max}} allowed",
@@ -3339,7 +3343,10 @@
     "freqDays": "Days of the week",
     "monthDay": "{{day}}",
     "lastDay": "Last day",
-    "skipsShortMonths": "Months shorter than {{day}} days are skipped. Choose Last day to run at the end of every month."
+    "skipsShortMonths": "Months shorter than {{day}} days are skipped. Choose Last day to run at the end of every month.",
+    "modelCatalogLoading": "Loading models…",
+    "modelCatalogUnavailable": "Models could not be loaded; the saved choice is kept.",
+    "modelCurrentOption": "{{model}} (current setting)"
   },
   "toolArtifact": {
     "open": "Open",
@@ -6539,6 +6546,7 @@
     "manage": "Manage",
     "reconnect": "Reconnect",
     "reconnectNote": "This sign-in stopped working. Sign in again to keep using its models.",
+    "teamManagedByAdmin": "Team-shared credentials are managed by the administrator. Contact an administrator to connect or change them.",
     "tryAgain": "Try again",
     "copy": "Copy",
     "copied": "Copied",

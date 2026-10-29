@@ -1,9 +1,13 @@
 import { useState } from 'react';
 import { Share2 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
+import { useQueryClient } from '@tanstack/react-query';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
 import { cn } from '@/lib/utils';
 import { useIsMobile } from '@/hooks/useIsMobile';
+// DALTON-HOOK(external-share-guard): hide share trigger for external members unless an active share exists to close
+import { useSharedLinks } from '@/hooks/useShareLink';
+import { queryKeys } from '@/lib/queryKeys';
 import { useThreadShareStatus } from '../hooks/useThreadShareStatus';
 import { ThreadSharePanel } from './ThreadSharePanel';
 
@@ -12,13 +16,15 @@ interface ShareButtonProps {
   initialIsShared?: boolean;
   /** The workspace whose shared files the popover lists; null hides the list. */
   workspaceId?: string | null;
+  // DALTON-HOOK(external-share-guard): caller tier from parent view
+  callerTier?: string | null;
 }
 
 /**
  * ShareButton -- Toggle public sharing for a thread, with permission controls.
  * Shows a popover with share toggle, URL copy, and permission checkboxes.
  */
-export default function ShareButton({ threadId, initialIsShared = false, workspaceId = null }: ShareButtonProps) {
+export default function ShareButton({ threadId, initialIsShared = false, workspaceId = null, callerTier: callerTierProp }: ShareButtonProps) {
   const { t } = useTranslation();
   const isMobile = useIsMobile();
   const [open, setOpen] = useState(false);
@@ -26,6 +32,19 @@ export default function ShareButton({ threadId, initialIsShared = false, workspa
   // load's answer stands in until it arrives.
   const { data } = useThreadShareStatus(threadId);
   const isShared = data ? data.is_shared === true : initialIsShared;
+  // DALTON-HOOK(external-share-guard): external members cannot start new public shares, only close existing ones
+  const queryClient = useQueryClient();
+  const callerTier =
+    callerTierProp ??
+    queryClient.getQueryData<{ caller_tier?: string | null }>(queryKeys.workspaces.team())?.caller_tier ??
+    queryClient.getQueryData<{ caller_tier?: string | null }>(queryKeys.dalton.userSharing())?.caller_tier ??
+    null;
+  const isExternal = callerTier === 'external';
+  const { data: sharedLinks } = useSharedLinks(isExternal ? workspaceId : null);
+
+  if (isExternal && !isShared && !sharedLinks?.length) {
+    return null;
+  }
 
   // Radix owns dismissal: Escape and an outside press close it, and a keyboard
   // close hands focus back to the trigger.

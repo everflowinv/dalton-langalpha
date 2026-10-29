@@ -259,6 +259,8 @@ function ThreadGallery({ workspaceId, onBack, onThreadSelect }: ThreadGalleryPro
     // DALTON-HOOK(workspace-sharing-settings): allow file write for rw colleagues, keep colleague identity separate
     readOnly: !teamReadOnly.canWriteFiles,
     isColleague: teamReadOnly.isColleague,
+    // DALTON-HOOK(external-share-guard): external members cannot create public file share links
+    callerTier: teamReadOnly.callerTier,
   });
   // A path names a sibling by its folder from the workspace it was written
   // in: the gallery's own for the link router, the shown one's for the

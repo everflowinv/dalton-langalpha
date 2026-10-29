@@ -55,7 +55,10 @@ function KeyForm({ state, option, place }: { state: LocationState; option: KeyOp
   const { providers } = useConfiguredProviders();
   const { t } = useTranslation();
   // DALTON-HOOK(team-credentials): team-shared credentials status
-  const { isShared: isTeamShared } = useTeamCredentials();
+  const { isShared: isTeamShared, canManage } = useTeamCredentials();
+  // A non-PM member cannot write the shared credentials (the server refuses
+  // the save); the form stays read-only with a note instead.
+  const teamManagedByAdmin = isDaltonAuth && isTeamShared && !canManage;
   const headingId = useId();
 
   const method = state.method ?? 'api_key';
@@ -101,23 +104,33 @@ function KeyForm({ state, option, place }: { state: LocationState; option: KeyOp
         }
       />
       {/* DALTON-HOOK(team-credentials): team-shared credentials hint */}
-      {isDaltonAuth && isTeamShared && (
+      {isDaltonAuth && isTeamShared && !teamManagedByAdmin && (
         <p className="text-xs -mt-3 mb-4" style={{ color: 'var(--color-text-tertiary)' }}>
           {TEAM_SHARED_CREDENTIALS_HINT}
+        </p>
+      )}
+      {teamManagedByAdmin && (
+        <p className="text-xs -mt-3 mb-4" style={{ color: 'var(--color-text-tertiary)' }}>
+          {t('modelAccess.teamManagedByAdmin')}
         </p>
       )}
       {optionLabel && (
         <p className="-mt-3 mb-4 text-xs" style={{ color: 'var(--color-text-tertiary)' }}>{optionLabel}</p>
       )}
-      <ApiKeyFormFields form={form} />
+      {/* DALTON-HOOK(team-credentials): hide API key inputs and save action for non-PM members under team sharing */}
+      {!teamManagedByAdmin && <ApiKeyFormFields form={form} />}
       <SetupFooter
         back={{ label: t('setup.back'), onClick: handleBack }}
-        primary={{
-          label: form.saving ? t('setup.saving') : t('setup.continue'),
-          onClick: handleSave,
-          disabled: !form.canSave,
-          busy: form.saving,
-        }}
+        primary={
+          teamManagedByAdmin
+            ? null
+            : {
+                label: form.saving ? t('setup.saving') : t('setup.continue'),
+                onClick: handleSave,
+                disabled: !form.canSave,
+                busy: form.saving,
+              }
+        }
       />
     </div>
   );

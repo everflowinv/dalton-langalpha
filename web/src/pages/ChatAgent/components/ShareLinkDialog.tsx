@@ -15,6 +15,9 @@ import { formatBytes } from '@/lib/format';
 import { useCopyShareLink } from '@/hooks/useCopyShareLink';
 import { useLocale } from '@/hooks/useLocale';
 import { useShareLink, useShareLinkFiles, useShareLinkMutations } from '@/hooks/useShareLink';
+// DALTON-HOOK(external-share-guard): external members cannot enable public file share links
+import { useQueryClient } from '@tanstack/react-query';
+import { queryKeys } from '@/lib/queryKeys';
 import type { ShareFileEntry } from '@/types/api';
 import { basename, dirname } from '../utils/fileRefResolver';
 import { shareCapIn, shareConflictIn, shareLinkHref, type ShareLinkPatch } from '../utils/api/shareLinks';
@@ -64,6 +67,13 @@ function FileRow({ entry, notShared, t }: {
 function ShareLinkDialog({ open, workspaceId, filePath, onClose }: ShareLinkDialogProps) {
   const { t } = useTranslation();
   const locale = useLocale();
+  // DALTON-HOOK(external-share-guard): hide public share toggle for external members unless already shared (closable)
+  const queryClient = useQueryClient();
+  const callerTier =
+    queryClient.getQueryData<{ caller_tier?: string | null }>(queryKeys.workspaces.team())?.caller_tier ??
+    queryClient.getQueryData<{ caller_tier?: string | null }>(queryKeys.dalton.userSharing())?.caller_tier ??
+    null;
+  const isExternal = callerTier === 'external';
   const linkQuery = useShareLink(workspaceId, { kind: 'file', path: filePath }, { enabled: open });
   const link = linkQuery.data;
   const filesQuery = useShareLinkFiles(workspaceId, link?.code, { enabled: open });
@@ -162,35 +172,37 @@ function ShareLinkDialog({ open, workspaceId, filePath, onClose }: ShareLinkDial
             )}
           </div>
 
-          {/* The switch */}
-          <div
-            className="flex items-center justify-between gap-3 rounded-lg border px-3 py-2.5"
-            style={{ borderColor: 'var(--color-border-muted)', backgroundColor: 'var(--color-bg-card)' }}
-          >
-            <div className="flex items-center gap-2 min-w-0">
-              {link?.shared
-                ? <Link2 className="h-4 w-4 shrink-0" style={{ color: 'var(--color-accent-primary)' }} />
-                : <Lock className="h-4 w-4 shrink-0" style={{ color: 'var(--color-text-tertiary)' }} />}
-              <div className="flex flex-col min-w-0">
-                <span className="text-sm font-medium" style={{ color: 'var(--color-text-primary)' }}>
-                  {t('shareLink.anyoneWithLink')}
-                </span>
-                <span className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
-                  {link?.shared ? t('shareLink.sharedHint') : t('shareLink.privateHint')}
-                </span>
+          {/* The switch — DALTON-HOOK(external-share-guard): external members only see the switch to close an already-shared link */}
+          {(!isExternal || link?.shared) && (
+            <div
+              className="flex items-center justify-between gap-3 rounded-lg border px-3 py-2.5"
+              style={{ borderColor: 'var(--color-border-muted)', backgroundColor: 'var(--color-bg-card)' }}
+            >
+              <div className="flex items-center gap-2 min-w-0">
+                {link?.shared
+                  ? <Link2 className="h-4 w-4 shrink-0" style={{ color: 'var(--color-accent-primary)' }} />
+                  : <Lock className="h-4 w-4 shrink-0" style={{ color: 'var(--color-text-tertiary)' }} />}
+                <div className="flex flex-col min-w-0">
+                  <span className="text-sm font-medium" style={{ color: 'var(--color-text-primary)' }}>
+                    {t('shareLink.anyoneWithLink')}
+                  </span>
+                  <span className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
+                    {link?.shared ? t('shareLink.sharedHint') : t('shareLink.privateHint')}
+                  </span>
+                </div>
               </div>
+              {busy
+                ? <Loader size={16} className="text-(--color-text-tertiary)" />
+                : (
+                  <ToggleSwitch
+                    checked={!!link?.shared}
+                    onChange={() => (link?.shared ? send({ shared: false }) : shareListed())}
+                    disabled={switchDisabled}
+                    ariaLabel={t('shareLink.anyoneWithLink')}
+                  />
+                )}
             </div>
-            {busy
-              ? <Loader size={16} className="text-(--color-text-tertiary)" />
-              : (
-                <ToggleSwitch
-                  checked={!!link?.shared}
-                  onChange={() => (link?.shared ? send({ shared: false }) : shareListed())}
-                  disabled={switchDisabled}
-                  ariaLabel={t('shareLink.anyoneWithLink')}
-                />
-              )}
-          </div>
+          )} {/* DALTON-HOOK(external-share-guard) */}
 
           {/* Notices */}
           {filesChanged && (

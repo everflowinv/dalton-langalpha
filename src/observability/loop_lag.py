@@ -90,7 +90,8 @@ class EventLoopLagMonitor:
         self._loop_thread_id = threading.get_ident()
         self._touch_heartbeat()
         self._task = asyncio.create_task(self._run(), name="event-loop-lag")
-        if _is_watchdog_enabled() and (
+        watchdog_enabled = _is_watchdog_enabled()
+        if watchdog_enabled and (
             self._watchdog_thread is None or not self._watchdog_thread.is_alive()
         ):
             self._watchdog_stop.clear()
@@ -100,6 +101,22 @@ class EventLoopLagMonitor:
                 daemon=True,
             )
             self._watchdog_thread.start()
+        # DALTON-HOOK(loop-stall-stack): one startup line states the effective
+        # watchdog configuration — the 2026-10 3.2s stall logged no stack and
+        # nothing in the log said whether the stack path was even on.
+        logger.info(
+            "[loop-lag] watchdog enabled=%s stall_threshold_s=%.1f "
+            "stall_cooldown_s=%.1f all_thread_stacks=%s max_frames=%d",
+            watchdog_enabled,
+            self._stall_threshold_s
+            if self._stall_threshold_s is not None
+            else _STALL_THRESHOLD_S,
+            self._stall_cooldown_s
+            if self._stall_cooldown_s is not None
+            else _STALL_COOLDOWN_S,
+            watchdog_enabled,
+            _STALL_MAX_FRAMES,
+        )
 
     async def stop(self) -> None:
         self._stopping.set()
@@ -227,10 +244,26 @@ class EventLoopLagMonitor:
                 now = time.monotonic()
                 if now - self._last_warn >= _WARN_COOLDOWN_S:
                     self._last_warn = now
+                    # DALTON-HOOK(loop-stall-stack): say why this line carries
+                    # no thread stacks — below the stall threshold the
+                    # watchdog never samples, and a disabled watchdog samples
+                    # nothing at any duration.
+                    stall_threshold_s = (
+                        self._stall_threshold_s
+                        if self._stall_threshold_s is not None
+                        else _STALL_THRESHOLD_S
+                    )
+                    if not _is_watchdog_enabled():
+                        stack_note = "；看门狗未启用，未采集栈"
+                    elif lag_ms < stall_threshold_s * 1000.0:
+                        stack_note = f"；低于栈阈值 {stall_threshold_s:.1f} s，未采集"
+                    else:
+                        stack_note = "；达到栈阈值，全线程栈由看门狗线程另行输出"
                     logger.warning(
                         "[loop-lag] event loop stalled %.0f ms "
                         "(sample interval %.0f ms) — Redis/SSE timeouts in this "
-                        "window are in-process, not upstream",
+                        "window are in-process, not upstream%s",
                         lag_ms,
                         interval_s * 1000.0,  # DALTON-HOOK(loop-stall-stack)
+                        stack_note,
                     )

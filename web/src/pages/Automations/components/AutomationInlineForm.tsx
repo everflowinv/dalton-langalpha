@@ -8,6 +8,8 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Textarea } from '@/components/ui/textarea';
 import { toast } from '@/components/ui/use-toast';
+// DALTON-HOOK(automation-model): inspect error detail for model refusal
+import { apiErrorDetail } from '@/api/errors';
 import type { Automation, AutomationPayload, AutomationUpdatePayload } from '@/types/automation';
 import { type DeliveryProblem, deliveryProblems } from '../utils/delivery';
 import { mutationErrorMessage } from '../utils/errors';
@@ -67,11 +69,14 @@ export default function AutomationInlineForm({
   // The delivery entries the last save was refused over, until the delivery
   // changes.
   const [refused, setRefused] = useState<DeliveryProblem[]>([]);
+  // DALTON-HOOK(automation-model): server error when saving an unavailable model
+  const [modelError, setModelError] = useState<string | null>(null);
   const uid = useId();
   const ids = { name: `${uid}-name`, instruction: `${uid}-instruction` };
 
   const patch: FormPatch = (key, value) => {
     if (key === 'delivery_methods') setRefused([]);
+    if (key === 'llm_model') setModelError(null);
     setForm((f) => ({ ...f, [key]: value }));
   };
 
@@ -109,9 +114,22 @@ export default function AutomationInlineForm({
     // is also shown beside them, unfolded.
     void Promise.resolve(onSubmit(submission)).catch((err: unknown) => {
       const problems = deliveryProblems(err);
-      if (problems.length === 0) return;
-      setRefused(problems);
-      setMoreOpen(true);
+      if (problems.length > 0) {
+        setRefused(problems);
+        setMoreOpen(true);
+        return;
+      }
+      // DALTON-HOOK(automation-model): surface unavailable model error on the form
+      const detail = apiErrorDetail(err);
+      const detailField =
+        detail && typeof detail === 'object' && !Array.isArray(detail)
+          ? (detail as { field?: unknown }).field
+          : undefined;
+      const message = mutationErrorMessage(err, '');
+      if (detailField === 'llm_model' || /\bmodel\b|模型/i.test(message)) {
+        setModelError(message || t('automation.actionFailed'));
+        setMoreOpen(true);
+      }
     });
   };
 
@@ -155,6 +173,8 @@ export default function AutomationInlineForm({
             onOpenChange={setMoreOpen}
             deliveryAttempts={opened.automation?.last_execution?.delivery_result}
             deliveryProblems={refused}
+            // DALTON-HOOK(automation-model): pass server model error to MoreOptions
+            modelError={modelError}
           />
         </div>
 

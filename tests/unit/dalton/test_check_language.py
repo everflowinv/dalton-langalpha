@@ -7,8 +7,10 @@ autospec'd sandbox backend serving one draft from a dict.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
+import logging
 from typing import Any
 from unittest.mock import create_autospec
 
@@ -18,13 +20,23 @@ from src.dalton.llm.assist import AssistResult, assist_json
 from src.dalton.publish import language as language_mod
 from src.dalton.publish.language import run_check_language
 from ptc_agent.agent.backends.sandbox import SandboxBackend
+from ptc_agent.core.paths import DEFAULT_LAYOUT, resolve_agent_path
 
+WORKSPACE_DIR = DEFAULT_LAYOUT.root
 DRAFT = "drafts/2026-10-23-call-META.md"
 DRAFT_TEXT = "# Conviction Call\n\n值得注意的是，本轮实现了对回测框架的调整。\n\nFY26Q3 revenue beat consensus by 4%（公司 8-K [引用3]）。\n"
 
 
 def _backend(files: dict[str, str], fail_writes: frozenset[str] = frozenset()) -> Any:
     backend = create_autospec(SandboxBackend, instance=True)
+    backend.workspace_dir = WORKSPACE_DIR
+    backend.computer_root = WORKSPACE_DIR
+    backend.normalize_path.side_effect = lambda p: resolve_agent_path(
+        p,
+        workspace=WORKSPACE_DIR,
+        root=WORKSPACE_DIR,
+        allowed=DEFAULT_LAYOUT.allowed_directories,
+    )
 
     async def _aread(path: str) -> str | None:
         return files.get(path)
@@ -537,3 +549,257 @@ async def test_check_language_tool_resolves_home_workspace_id(
         config={"configurable": {"user_id": "user-1"}},
     )
     assert err_msg.content == "ERROR: Database unavailable"
+
+
+# ---------------------- P5: stale draft, concurrency lock, sidecar consistency
+
+
+@pytest.mark.asyncio
+async def test_draft_modified_during_review_discards_round_and_returns_stale_error(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    files = {DRAFT: DRAFT_TEXT}
+    backend = _backend(files)
+    in_flight = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _slow_assist(*args: Any, **kwargs: Any) -> AssistResult:
+        in_flight.set()
+        await release.wait()
+        return _ok_result([_issue("值得注意的是，")])
+
+    stub = create_autospec(assist_json, side_effect=_slow_assist)
+    monkeypatch.setattr(language_mod, "assist_json", stub)
+
+    with caplog.at_level(logging.WARNING, logger="src.dalton.publish.language"):
+        task = asyncio.create_task(
+            run_check_language(
+                workspace_id="ws-1",
+                draft_path=DRAFT,
+                round=1,
+                backend=backend,
+                user_id="user-1",
+            )
+        )
+        await in_flight.wait()
+        # Draft file itself is not locked during LLM review: reading and editing work.
+        assert await backend.aread_text(DRAFT) == DRAFT_TEXT
+        files[DRAFT] = DRAFT_TEXT + "\n审查期间追加的新结论。\n"
+        release.set()
+        res = await task
+
+    assert res["ok"] is False
+    assert res.get("stale") is True
+    assert "审查期间稿件已改动，请对当前稿件重新调用 check_language" in res["message"]
+    assert f"{DRAFT}.language.json" not in files
+    assert f"{DRAFT}.language.md" not in files
+    assert any("Stale check_language discarded" in rec.message for rec in caplog.records)
+    assert language_mod._DRAFT_REVIEW_LOCKS == {}
+
+
+@pytest.mark.asyncio
+async def test_concurrent_reviews_on_same_draft_reject_second_and_complete_first(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    files = {DRAFT: DRAFT_TEXT}
+    backend = _backend(files)
+    in_flight = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _slow_assist(*args: Any, **kwargs: Any) -> AssistResult:
+        in_flight.set()
+        await release.wait()
+        return _ok_result([_issue("值得注意的是，")])
+
+    stub = create_autospec(assist_json, side_effect=_slow_assist)
+    monkeypatch.setattr(language_mod, "assist_json", stub)
+
+    first_task = asyncio.create_task(
+        run_check_language(
+            workspace_id="ws-1",
+            draft_path=DRAFT,
+            round=1,
+            backend=backend,
+            user_id="user-1",
+        )
+    )
+    await in_flight.wait()
+
+    # Concurrent reviews on the same draft via relative, leading-slash, and
+    # workspace-absolute spellings all resolve to the same lock key and return immediately.
+    for alt_spelling in (DRAFT, f"/{DRAFT}", f"{WORKSPACE_DIR}/{DRAFT}", f"./{DRAFT}"):
+        second_res = await run_check_language(
+            workspace_id="ws-1",
+            draft_path=alt_spelling,
+            round=1,
+            backend=backend,
+            user_id="user-1",
+        )
+        assert second_res["ok"] is False, alt_spelling
+        assert "另一轮审查进行中" in second_res["message"], alt_spelling
+
+    release.set()
+    first_res = await first_task
+    assert first_res["ok"] is True
+    assert stub.await_count == 1
+    doc = json.loads(files[f"{DRAFT}.language.json"])
+    assert len(doc["rounds"]) == 1
+    assert doc["rounds"][0]["round"] == 1
+    assert language_mod._DRAFT_REVIEW_LOCKS == {}
+
+
+@pytest.mark.asyncio
+async def test_sidecar_reread_failure_aborts_and_preserves_existing_records(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    files = {DRAFT: DRAFT_TEXT}
+    await _run_round(files, DRAFT, 1, monkeypatch, [_ok_result([])])
+    original_sidecar = files[f"{DRAFT}.language.json"]
+    original_md = files[f"{DRAFT}.language.md"]
+
+    files[DRAFT] = DRAFT_TEXT + "\n第二轮修订内容。\n"
+    json_path = f"{DRAFT}.language.json"
+    sidecar_reads = 0
+
+    backend = _backend(files)
+
+    async def _aread_fail_on_second_sidecar_read(path: str) -> str | None:
+        nonlocal sidecar_reads
+        if path == json_path:
+            sidecar_reads += 1
+            if sidecar_reads >= 2:
+                raise OSError("sandbox read timeout")
+        return files.get(path)
+
+    backend.aread_text.side_effect = _aread_fail_on_second_sidecar_read
+
+    res = await _run_round(
+        files, DRAFT, 2, monkeypatch, [_ok_result([])], backend=backend
+    )
+    assert res["ok"] is False
+    assert "读取失败" in res["message"]
+    assert files[json_path] == original_sidecar
+    assert files[f"{DRAFT}.language.md"] == original_md
+    doc = json.loads(files[json_path])
+    assert [r["round"] for r in doc["rounds"]] == [1]
+    assert language_mod._DRAFT_REVIEW_LOCKS == {}
+
+
+@pytest.mark.asyncio
+async def test_sidecar_modified_during_review_merges_without_losing_records(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    files = {DRAFT: DRAFT_TEXT}
+    await _run_round(files, DRAFT, 1, monkeypatch, [_ok_result([])])
+
+    files[DRAFT] = DRAFT_TEXT + "\n第二轮修订内容。\n"
+    backend = _backend(files)
+    in_flight = asyncio.Event()
+    release = asyncio.Event()
+
+    external_record = {
+        "round": 1,
+        "draft_sha256": "a" * 64,
+        "model": "external-writer",
+        "generated_at": "2026-10-28T00:00:00Z",
+        "issues": [],
+        "dropped_quotes": 0,
+    }
+
+    async def _slow_assist(*args: Any, **kwargs: Any) -> AssistResult:
+        in_flight.set()
+        await release.wait()
+        return _ok_result([_issue("值得注意的是，")])
+
+    stub = create_autospec(assist_json, side_effect=_slow_assist)
+    monkeypatch.setattr(language_mod, "assist_json", stub)
+
+    task = asyncio.create_task(
+        run_check_language(
+            workspace_id="ws-1",
+            draft_path=DRAFT,
+            round=2,
+            backend=backend,
+            user_id="user-1",
+        )
+    )
+    await in_flight.wait()
+
+    # External writer modifies the sidecar while round 2 LLM review is in flight.
+    concurrent_doc = json.loads(files[f"{DRAFT}.language.json"])
+    concurrent_doc["rounds"].append(external_record)
+    files[f"{DRAFT}.language.json"] = json.dumps(concurrent_doc, ensure_ascii=False, indent=2)
+
+    release.set()
+    res = await task
+
+    assert res["ok"] is True
+    final_doc = json.loads(files[f"{DRAFT}.language.json"])
+    assert len(final_doc["rounds"]) == 3
+    assert final_doc["rounds"][1]["model"] == "external-writer"
+    assert final_doc["rounds"][2]["round"] == 2
+    assert final_doc["rounds"][2]["draft_sha256"] == hashlib.sha256(
+        files[DRAFT].encode("utf-8")
+    ).hexdigest()
+
+
+@pytest.mark.asyncio
+async def test_sidecar_write_exception_reports_error_and_leaves_no_partial_file(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    files = {DRAFT: DRAFT_TEXT}
+    backend = create_autospec(SandboxBackend, instance=True)
+
+    async def _aread(path: str) -> str | None:
+        return files.get(path)
+
+    async def _awrite_raise(path: str, text: str) -> bool:
+        raise OSError("disk full")
+
+    backend.aread_text.side_effect = _aread
+    backend.awrite_text.side_effect = _awrite_raise
+
+    res = await _run_round(files, DRAFT, 1, monkeypatch, [_ok_result([])], backend=backend)
+    assert res["ok"] is False
+    assert "写入失败" in res["message"]
+    assert f"{DRAFT}.language.json" not in files
+    assert f"{DRAFT}.language.md" not in files
+    assert language_mod._DRAFT_REVIEW_LOCKS == {}
+
+
+@pytest.mark.asyncio
+async def test_normal_path_preserves_record_content_and_reads_draft_twice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    files = {DRAFT: DRAFT_TEXT}
+    backend = _backend(files)
+    issue = _issue("值得注意的是，")
+    res = await _run_round(
+        files, DRAFT, 1, monkeypatch, [_ok_result([issue])], backend=backend
+    )
+
+    expected_sha = hashlib.sha256(DRAFT_TEXT.encode("utf-8")).hexdigest()
+    assert res["ok"] is True
+    assert res["round"] == 1
+    assert res["draft_sha256"] == expected_sha
+    assert res["model"] == "test-lang-model"
+    assert res["issues"] == [issue]
+    assert res["dropped_quotes"] == 0
+    assert res["dropped_issue_types"] == 0
+    assert res["unchanged_since_round_1"] is False
+
+    draft_reads = [
+        call.args[0]
+        for call in backend.aread_text.await_args_list
+        if call.args and call.args[0] == DRAFT
+    ]
+    assert len(draft_reads) == 2
+
+    doc = json.loads(files[f"{DRAFT}.language.json"])
+    assert doc["draft"] == DRAFT
+    assert len(doc["rounds"]) == 1
+    assert doc["rounds"][0]["round"] == 1
+    assert doc["rounds"][0]["draft_sha256"] == expected_sha
+    assert doc["rounds"][0]["issues"] == [issue]
+

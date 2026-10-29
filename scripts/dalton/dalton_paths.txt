@@ -54,6 +54,8 @@ tests/unit/ptc_agent/agent/middleware/test_removed_attachment_union.py
 tests/unit/middleware/test_subagent_spill_recovery.py
 # A1: log-only registry of in-flight heavy compute, read by the loop watchdog.
 src/observability/heavy_tasks.py
+# P6a: 3-way container memory sampler (crawler browser, pdf_render browser, other).
+src/observability/browser_memory.py
 # A1: subprocess entry points for PDF text extraction (stdlib-only at import).
 mcp_servers/_pdf_parse.py
 # LaneA new tests living in upstream test directories.
@@ -89,3 +91,8 @@ plugins/dalton/skills/dalton-transcript-polish/references/verification-protocol.
 plugins/dalton/skills/dalton-transcript-polish/references/pipeline-lessons.md
 plugins/dalton/skills/dalton-transcript-polish/scripts/audit_numeric_units.py
 tests/unit/dalton/test_transcript_polish_and_ingest_receipt_a1e.py
+# P7/A6: plugin JSON budget helper and unit tests.
+src/dalton/plugin_json_budget.py
+tests/unit/server/services/test_plugin_json_budget.py
+# P8: workspace status guard in dalton publications DB layer.
+tests/unit/server/database/test_dalton_publications.py

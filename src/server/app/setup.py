@@ -126,6 +126,9 @@ _REDIS_BACKGROUND_SINGLETONS: tuple[tuple[str, str], ...] = (
     # Tells apart "Redis is slow" from "this worker's loop was blocked", which
     # read identically at the redis-py boundary.
     ("EventLoopLagMonitor", "src.observability.loop_lag"),
+    # DALTON-HOOK(browser-memory-sampler): periodic 3-way memory attribution
+    # (crawler Chromium, pdf_render Chromium, other) + 24h rolling peaks.
+    ("BrowserMemorySampler", "src.observability.browser_memory"),
     # Refreshes expiring MCP OAuth connections ahead of the hot path; the
     # per-connection advisory try-lock dedups it across workers.
     ("McpOAuthRefreshSweeper", "src.server.services.mcp_oauth.sweep"),
@@ -184,6 +187,34 @@ def _log_container_hardening() -> None:
         )
 
 
+# DALTON-HOOK(concurrency-startup-log): one startup line names the browser
+# concurrency actually in effect (and the channel that set it) plus the PDF
+# render cap, so a RAM incident is not debugged against a value nobody can
+# see (agent_config.yaml ships 6; the code default is 2).
+def _log_effective_concurrency() -> None:
+    try:
+        from src.config.tool_settings import resolve_crawler_browser_concurrency
+
+        browser_value, browser_source = resolve_crawler_browser_concurrency()
+    except Exception as exc:
+        logger.warning(
+            f"Could not resolve crawl browser concurrency: {type(exc).__name__}"
+        )
+        return
+    pdf_value: int | None = None
+    try:
+        from src.server.services.pdf_render import PDF_RENDER_CONCURRENCY
+
+        pdf_value = PDF_RENDER_CONCURRENCY
+    except Exception:
+        pass
+    pdf_part = f", pdf_render={pdf_value}" if pdf_value is not None else ""
+    logger.info(
+        f"In-process browser concurrency: crawl={browser_value} "
+        f"(source={browser_source}){pdf_part}"
+    )
+
+
 # ============================================================================
 # Lifespan Context Manager
 # ============================================================================
@@ -218,6 +249,10 @@ async def lifespan(app: FastAPI):
     # If PID 1 is python (not tini), `init: true` in compose silently failed and
     # orphaned browser subprocesses will accumulate until cgroup exhausts.
     _log_container_hardening()
+
+    # DALTON-HOOK(concurrency-startup-log): effective crawl-browser and PDF
+    # render concurrency, with the channel that set the browser value.
+    _log_effective_concurrency()
 
     # Security warnings (one-time, startup only)
     from src.config.env import HOST_MODE

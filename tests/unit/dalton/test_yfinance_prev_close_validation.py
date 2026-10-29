@@ -21,6 +21,11 @@ from src.data_client.yfinance.data_source import (
     _fetch_single_snapshot,
     _snapshot_from_history,
 )
+from src.data_client.yfinance.financial_source import (
+    YFinanceFinancialSource,
+    _get_realtime_quote,
+    _get_single_sector_perf,
+)
 from src.data_client.yfinance.yahoo import validated_previous_close
 
 
@@ -122,10 +127,12 @@ def _history_frame(rows: list[tuple[str, float, float]]) -> pd.DataFrame:
 
 def _stub_ticker(rows_1mo: list[tuple[str, float, float]] | None,
                  fast_info: dict[str, object],
-                 regular_market_time: int | None = 1793088499) -> object:
+                 regular_market_time: int | None = 1793088499,
+                 info: dict[str, object] | None = None) -> object:
     # 1793088499 = 2026-10-27 16:08:19 HKT, the exported quote's print time.
     ticker = create_autospec(yf.Ticker, instance=True)
     ticker.fast_info = fast_info
+    ticker.info = info if info is not None else {"longName": "Test Corp"}
     ticker.history_metadata = (
         {"regularMarketTime": regular_market_time} if regular_market_time is not None else {}
     )
@@ -321,3 +328,385 @@ def test_snapshot_from_history_skips_frozen_previous_row():
     assert snap["change"] is None
     assert snap["change_percent"] is None
     assert datetime.fromtimestamp(snap["as_of"] / 1000, tz=timezone.utc) is not None
+
+
+# ---------------------------------------------------------------------------
+# P4a: company overview (_get_realtime_quote) & sector ETF (_get_single_sector_perf)
+# ---------------------------------------------------------------------------
+
+
+def _stale_hk_rows() -> list[tuple[str, float, float]]:
+    # Daily bars froze / stopped updating at 2026-10-12 (15.47), while a
+    # 2026-10-27 quote carries a newer fast_info previous close (13.57).
+    return [
+        ("2026-10-08", 15.6, 2_000_000),
+        ("2026-10-09", 15.5, 1_800_000),
+        ("2026-10-12", 15.47, 2_400_000),
+    ]
+
+
+def test_realtime_quote_reports_unknown_on_2525_hk_frozen_conflict():
+    # 2525.HK on 2026-10-27: price 12.90, fast_info still rides the frozen
+    # 15.47 while 10/26 closed 13.57 → must return None, never -16.61% or 0.0.
+    from src.data_client.yfinance import financial_source as yf_fin
+
+    ticker = _stub_ticker(
+        _frozen_hk_rows(),
+        fast_info={
+            "lastPrice": 12.90,
+            "regularMarketPreviousClose": 15.47,
+            "open": 13.40,
+            "dayHigh": 13.55,
+            "dayLow": 12.80,
+            "lastVolume": 30_000_000,
+        },
+    )
+    with patch(
+        "src.data_client.yfinance.financial_source.yahoo_ticker",
+        new=create_autospec(yf_fin.yahoo_ticker, return_value=ticker),
+    ):
+        rows = _get_realtime_quote("2525.HK")
+    assert len(rows) == 1
+    q = rows[0]
+    assert q["price"] == 12.90
+    assert q["previousClose"] is None
+    assert q["change"] is None
+    assert q["changePercentage"] is None
+
+
+def test_realtime_quote_resumption_day_reports_unknown():
+    # 2525.HK on 2026-10-26 (resumption day itself): zero-volume fills sit
+    # between 10/12 and 10/26, so previousClose and changePercentage are None.
+    from src.data_client.yfinance import financial_source as yf_fin
+
+    ticker = _stub_ticker(
+        _frozen_hk_rows(),
+        fast_info={
+            "lastPrice": 13.57,
+            "regularMarketPreviousClose": 15.47,
+            "open": 13.40,
+            "dayHigh": 13.55,
+            "dayLow": 12.80,
+            "lastVolume": 48_924_388,
+        },
+        regular_market_time=1793002099,
+    )
+    with patch(
+        "src.data_client.yfinance.financial_source.yahoo_ticker",
+        new=create_autospec(yf_fin.yahoo_ticker, return_value=ticker),
+    ):
+        q = _get_realtime_quote("2525.HK")[0]
+    assert q["price"] == 13.57
+    assert q["previousClose"] is None
+    assert q["change"] is None
+    assert q["changePercentage"] is None
+
+
+@pytest.mark.parametrize("fast_prev", [None, 13.57])
+def test_realtime_quote_post_resumption_uses_last_real_trading_day(
+    fast_prev: float | None,
+):
+    # After 10/13–10/23 suspension (0-volume fills) and 10/26 resumption
+    # (13.57, traded volume), a 10/27 quote takes 10/26 (13.57) as previousClose.
+    from src.data_client.yfinance import financial_source as yf_fin
+
+    fast_info: dict[str, object] = {
+        "lastPrice": 12.90,
+        "open": 13.40,
+        "dayHigh": 13.55,
+        "dayLow": 12.80,
+        "lastVolume": 30_000_000,
+    }
+    if fast_prev is not None:
+        fast_info["regularMarketPreviousClose"] = fast_prev
+    ticker = _stub_ticker(_frozen_hk_rows(), fast_info=fast_info)
+    with patch(
+        "src.data_client.yfinance.financial_source.yahoo_ticker",
+        new=create_autospec(yf_fin.yahoo_ticker, return_value=ticker),
+    ):
+        q = _get_realtime_quote("2525.HK")[0]
+    assert q["price"] == 12.90
+    assert q["previousClose"] == 13.57
+    assert q["change"] == -0.67
+    assert q["changePercentage"] == round((12.90 - 13.57) / 13.57 * 100, 4)
+
+
+def test_realtime_quote_stale_daily_bars_reports_unknown():
+    # Stale daily history ending 2026-10-12 (15.47) disagrees with fast_info's
+    # 13.57 on 2026-10-27 → previousClose and change come back None.
+    from src.data_client.yfinance import financial_source as yf_fin
+
+    ticker = _stub_ticker(
+        _stale_hk_rows(),
+        fast_info={
+            "lastPrice": 12.90,
+            "regularMarketPreviousClose": 13.57,
+        },
+    )
+    with patch(
+        "src.data_client.yfinance.financial_source.yahoo_ticker",
+        new=create_autospec(yf_fin.yahoo_ticker, return_value=ticker),
+    ):
+        q = _get_realtime_quote("2525.HK")[0]
+    assert q["price"] == 12.90
+    assert q["previousClose"] is None
+    assert q["change"] is None
+    assert q["changePercentage"] is None
+
+
+@pytest.mark.parametrize("fast_prev", [15.47, None])
+def test_realtime_quote_empty_history_reports_unknown_not_zero(
+    fast_prev: float | None,
+):
+    # Empty/unavailable daily history: previousClose, change, changePercentage
+    # must be None, never coerced to 0.0.
+    from src.data_client.yfinance import financial_source as yf_fin
+
+    fast_info: dict[str, object] = {"lastPrice": 12.90}
+    if fast_prev is not None:
+        fast_info["regularMarketPreviousClose"] = fast_prev
+    ticker = _stub_ticker(None, fast_info=fast_info)
+    with patch(
+        "src.data_client.yfinance.financial_source.yahoo_ticker",
+        new=create_autospec(yf_fin.yahoo_ticker, return_value=ticker),
+    ):
+        q = _get_realtime_quote("2525.HK")[0]
+    assert q["price"] == 12.90
+    assert q["previousClose"] is None
+    assert q["change"] is None
+    assert q["changePercentage"] is None
+
+
+def test_realtime_quote_normal_symbol_unchanged():
+    from src.data_client.yfinance import financial_source as yf_fin
+
+    ticker = _stub_ticker(
+        [("2026-10-26", 13.57, 48_924_388), ("2026-10-27", 12.90, 30_000_000)],
+        fast_info={
+            "lastPrice": 12.90,
+            "regularMarketPreviousClose": 13.57,
+            "open": 13.40,
+            "dayHigh": 13.55,
+            "dayLow": 12.80,
+            "lastVolume": 30_000_000,
+        },
+    )
+    with patch(
+        "src.data_client.yfinance.financial_source.yahoo_ticker",
+        new=create_autospec(yf_fin.yahoo_ticker, return_value=ticker),
+    ):
+        q = _get_realtime_quote("2525.HK")[0]
+    assert q["price"] == 12.90
+    assert q["previousClose"] == 13.57
+    assert q["change"] == -0.67
+    assert q["changePercentage"] == round((12.90 - 13.57) / 13.57 * 100, 4)
+
+
+@pytest.mark.asyncio
+async def test_company_overview_formats_unknown_prev_close_without_zero_or_error():
+    # Upper-layer company overview formatting: when previousClose/change are
+    # None, _provider_price_line omits the move (never "+0.00%" or "-16.61%"),
+    # the Previous Close row is omitted, and the artifact quote carries None.
+    from src.data_client.financial_data_provider import FinancialDataProvider
+    from src.data_client.market_data_provider import MarketDataProvider
+    from src.data_client.yfinance import financial_source as yf_fin
+    from src.tools.market_data import company as company_mod
+
+    ticker = _stub_ticker(
+        _frozen_hk_rows(),
+        fast_info={
+            "lastPrice": 12.90,
+            "regularMarketPreviousClose": 15.47,
+            "open": 13.40,
+            "dayHigh": 13.55,
+            "dayLow": 12.80,
+            "lastVolume": 30_000_000,
+            "currency": "HKD",
+            "exchange": "HKG",
+            "marketCap": 5_000_000_000,
+        },
+        info={
+            "longName": "HesHeng Corp",
+            "sector": "Industrials",
+            "industry": "Machinery",
+        },
+    )
+    fin_provider = FinancialDataProvider(financial=YFinanceFinancialSource())
+    mkt_provider = create_autospec(MarketDataProvider, instance=True)
+    mkt_provider.get_snapshots.return_value = []
+
+    with (
+        patch(
+            "src.data_client.yfinance.financial_source.yahoo_ticker",
+            new=create_autospec(yf_fin.yahoo_ticker, return_value=ticker),
+        ),
+        patch(
+            "src.tools.market_data.company.get_financial_data_provider",
+            new=create_autospec(
+                company_mod.get_financial_data_provider, return_value=fin_provider
+            ),
+        ),
+        patch(
+            "src.tools.market_data.company.get_market_data_provider",
+            new=create_autospec(
+                company_mod.get_market_data_provider, return_value=mkt_provider
+            ),
+        ),
+        patch(
+            "src.tools.market_data.company.display_names",
+            new=create_autospec(company_mod.display_names, return_value=(None, None)),
+        ),
+        patch(
+            "src.tools.market_data.company._fmp_request",
+            new=create_autospec(company_mod._fmp_request, return_value=[]),
+        ),
+    ):
+        content, artifact = await company_mod.fetch_company_overview("2525.HK")
+        rest_artifact = await company_mod.fetch_company_overview_data("2525.HK")
+
+    assert "**Price:** HK$12.90" in content
+    assert "-16.61%" not in content
+    assert "0.00%" not in content
+    assert "| Previous Close |" not in content
+    for art in (artifact, rest_artifact):
+        assert art["quote"]["price"] == 12.90
+        assert art["quote"]["previousClose"] is None
+        assert art["quote"]["change"] is None
+        assert art["quote"]["changePct"] is None
+
+
+def test_sector_etf_frozen_conflict_and_resumption_day_return_unknown():
+    from src.data_client.yfinance import financial_source as yf_fin
+
+    # 10/27 frozen-tail conflict (15.47 vs 13.57)
+    conflict_ticker = _stub_ticker(
+        _frozen_hk_rows(),
+        fast_info={"lastPrice": 12.90, "regularMarketPreviousClose": 15.47},
+    )
+    with patch(
+        "src.data_client.yfinance.financial_source.yahoo_ticker",
+        new=create_autospec(yf_fin.yahoo_ticker, return_value=conflict_ticker),
+    ):
+        assert _get_single_sector_perf("Technology", "XLK") is None
+
+    # 10/26 resumption day itself
+    resumption_ticker = _stub_ticker(
+        _frozen_hk_rows(),
+        fast_info={"lastPrice": 13.57, "regularMarketPreviousClose": 15.47},
+        regular_market_time=1793002099,
+    )
+    with patch(
+        "src.data_client.yfinance.financial_source.yahoo_ticker",
+        new=create_autospec(yf_fin.yahoo_ticker, return_value=resumption_ticker),
+    ):
+        assert _get_single_sector_perf("Technology", "XLK") is None
+
+
+@pytest.mark.parametrize("fast_prev", [None, 13.57])
+def test_sector_etf_post_resumption_uses_last_real_trading_day(
+    fast_prev: float | None,
+):
+    from src.data_client.yfinance import financial_source as yf_fin
+
+    fast_info: dict[str, object] = {"lastPrice": 12.90}
+    if fast_prev is not None:
+        fast_info["regularMarketPreviousClose"] = fast_prev
+    ticker = _stub_ticker(_frozen_hk_rows(), fast_info=fast_info)
+    with patch(
+        "src.data_client.yfinance.financial_source.yahoo_ticker",
+        new=create_autospec(yf_fin.yahoo_ticker, return_value=ticker),
+    ):
+        row = _get_single_sector_perf("Technology", "XLK")
+    assert row == {"sector": "Technology", "changePctStr": "-4.94%"}
+
+
+def test_sector_etf_stale_history_returns_unknown():
+    from src.data_client.yfinance import financial_source as yf_fin
+
+    stale_ticker = _stub_ticker(
+        _stale_hk_rows(),
+        fast_info={"lastPrice": 12.90, "regularMarketPreviousClose": 13.57},
+    )
+    with patch(
+        "src.data_client.yfinance.financial_source.yahoo_ticker",
+        new=create_autospec(yf_fin.yahoo_ticker, return_value=stale_ticker),
+    ):
+        assert _get_single_sector_perf("Technology", "XLK") is None
+
+
+# Separate from the stale case: in one test the second call hit the first
+# one's cached daily history and never read the empty history at all.
+def test_sector_etf_empty_history_returns_unknown():
+    from src.data_client.yfinance import financial_source as yf_fin
+
+    empty_ticker = _stub_ticker(
+        None,
+        fast_info={"lastPrice": 203.0, "regularMarketPreviousClose": 200.0},
+    )
+    with patch(
+        "src.data_client.yfinance.financial_source.yahoo_ticker",
+        new=create_autospec(yf_fin.yahoo_ticker, return_value=empty_ticker),
+    ):
+        assert _get_single_sector_perf("Technology", "XLK") is None
+
+
+def test_sector_etf_normal_day_unchanged():
+    from src.data_client.yfinance import financial_source as yf_fin
+
+    ticker = _stub_ticker(
+        [("2026-10-26", 200.0, 10_000_000), ("2026-10-27", 203.0, 12_000_000)],
+        fast_info={"lastPrice": 203.0, "regularMarketPreviousClose": 200.0},
+    )
+    with patch(
+        "src.data_client.yfinance.financial_source.yahoo_ticker",
+        new=create_autospec(yf_fin.yahoo_ticker, return_value=ticker),
+    ):
+        row = _get_single_sector_perf("Technology", "XLK")
+    assert row == {"sector": "Technology", "changePctStr": "+1.50%"}
+
+
+@pytest.mark.asyncio
+async def test_sector_performance_omits_unverified_etf_and_keeps_valid_sectors():
+    # Original behavior in YFinanceFinancialSource.get_sector_performance:
+    # an ETF whose previous close is unknown returns None and is omitted,
+    # while verified ETFs render unchanged without 0% or errors.
+    from src.data_client.financial_data_provider import FinancialDataProvider
+    from src.data_client.yfinance import financial_source as yf_fin
+    from src.tools.market_data import market_overview as mo_mod
+
+    valid_ticker = _stub_ticker(
+        [("2026-10-26", 200.0, 10_000_000), ("2026-10-27", 203.0, 12_000_000)],
+        fast_info={"lastPrice": 203.0, "regularMarketPreviousClose": 200.0},
+    )
+    frozen_ticker = _stub_ticker(
+        _frozen_hk_rows(),
+        fast_info={"lastPrice": 12.90, "regularMarketPreviousClose": 15.47},
+    )
+
+    def _pick_ticker(sym: str) -> object:
+        return valid_ticker if sym == "XLV" else frozen_ticker
+
+    fin_provider = FinancialDataProvider(financial=YFinanceFinancialSource())
+    with (
+        patch(
+            "src.data_client.yfinance.financial_source.yahoo_ticker",
+            new=create_autospec(yf_fin.yahoo_ticker, side_effect=_pick_ticker),
+        ),
+        patch(
+            "src.tools.market_data.market_overview.get_financial_data_provider",
+            new=create_autospec(
+                mo_mod.get_financial_data_provider, return_value=fin_provider
+            ),
+        ),
+    ):
+        content, artifact = await mo_mod.fetch_sector_performance()
+
+    assert "Healthcare" in content
+    assert "+1.50%" in content
+    assert "Technology" not in content
+    assert "-16.61%" not in content
+    assert artifact == {
+        "type": "sector_performance",
+        "sectors": [{"sector": "Healthcare", "changePercentage": 1.5}],
+    }
+

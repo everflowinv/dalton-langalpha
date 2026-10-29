@@ -6,13 +6,52 @@ that read from agent_config.yaml via the shared YAML cache.
 """
 
 import logging
+import os
+import re
 from typing import Any
 
-from src.config.core import load_agent_config
+from ptc_agent.config.file_utils import _deep_merge, _read_yaml
+from src.config.core import AGENT_CONFIG_FILE, find_config_file, load_agent_config
 
 logger = logging.getLogger(__name__)
 
 _get_agent_config_dict = load_agent_config
+
+_ENV_VAR_PLACEHOLDER_RE = re.compile(
+    r"^\s*(?:\$\{[^}]+\}|\$[A-Za-z_][A-Za-z0-9_]*)\s*$"
+)
+
+
+def _raw_yaml_uses_env_var(key_path: str) -> bool:
+    """True only when the pre-substitution YAML entry at ``key_path`` is a
+    ``${VAR}`` / ``$VAR`` placeholder; False for literal strings (e.g. ``"6"``)
+    or when the raw YAML cannot be inspected (DALTON-HOOK(concurrency-startup-log),
+    P0 fix1 10 + fix2 F: never guess ``env_var`` from ``isinstance(value, str)``,
+    and merge ``APP_ENV`` overlays via ``_deep_merge`` so a ``null`` in the
+    overlay does not clobber the base entry)."""
+    if _get_agent_config_dict is not load_agent_config:
+        return False
+    try:
+        path = find_config_file(AGENT_CONFIG_FILE, env_var="PTC_CONFIG_FILE")
+        if path is None or not path.is_file():
+            return False
+        raw = _read_yaml(path)
+        app_env = os.getenv("APP_ENV", "").strip()
+        if app_env:
+            overlay = path.with_name(f"{path.stem}.{app_env}{path.suffix}")
+            if overlay.is_file():
+                overlay_raw = _read_yaml(overlay)
+                if isinstance(overlay_raw, dict):
+                    raw = _deep_merge(raw, overlay_raw)
+        cur: Any = raw
+        for key in key_path.split("."):
+            if isinstance(cur, dict) and key in cur:
+                cur = cur[key]
+            else:
+                return False
+        return isinstance(cur, str) and bool(_ENV_VAR_PLACEHOLDER_RE.match(cur))
+    except Exception:
+        return False
 
 
 def _get_tool_config(key_path: str, default: Any = None) -> Any:
@@ -61,6 +100,34 @@ def get_crawler_http_concurrency(default: int = 20) -> int:
     return int(_get_tool_config('crawler.http_concurrency', default))
 
 
+def resolve_crawler_browser_concurrency(default: int = 2) -> tuple[int, str]:
+    """The effective crawl browser concurrency with the channel that set it.
+
+    Source labels: ``config_file`` — a literal ``crawler.browser_concurrency``
+    in the merged YAML; ``env_var`` — that YAML value was a ``${VAR}``
+    substitution, which the loader leaves as a str (a literal number parses
+    as int); ``config_file_legacy`` — the retired ``max_concurrent_crawls``,
+    capped at ``default``; ``default`` — the code default.
+
+    DALTON-HOOK(concurrency-startup-log): production ships
+    ``agent_config.yaml`` with 6 while the code default is 2, so a startup
+    line that logs only the number cannot say which channel won — this
+    resolver names the channel for that line.
+    """
+    explicit = _get_tool_config('crawler.browser_concurrency')
+    if explicit is not None:
+        source = (
+            "env_var"
+            if _raw_yaml_uses_env_var("crawler.browser_concurrency")
+            else "config_file"
+        )
+        return int(explicit), source
+    legacy = _get_tool_config('crawler.max_concurrent_crawls')
+    if legacy is not None:
+        return min(int(legacy), default), "config_file_legacy"
+    return default, "default"
+
+
 def get_crawler_browser_concurrency(default: int = 2) -> int:
     """Concurrent Tier-2/3 (Chromium/Camoufox) calls. RAM-bounded."""
     # DALTON-HOOK(crawler-browser-ram-cap): the default is sized for the 4 GB
@@ -70,17 +137,7 @@ def get_crawler_browser_concurrency(default: int = 2) -> int:
     # pre-market insight tasks opened 3 at once (2026-10). 2 keeps browsers at
     # ~0.8 GB. The value, not the semaphore, changed — the concurrency control
     # is upstream's and untouched.
-    explicit = _get_tool_config('crawler.browser_concurrency')
-    if explicit is not None:
-        return int(explicit)
-    # Fall back to legacy `max_concurrent_crawls` so a low-RAM deployment that
-    # set it as a global cap (e.g. 2) doesn't silently spawn up to `default`
-    # browsers post-upgrade. Capped at `default` so HTTP-tuned legacy values
-    # (e.g. 50) don't translate to 50 Camoufox processes.
-    legacy = _get_tool_config('crawler.max_concurrent_crawls')
-    if legacy is not None:
-        return min(int(legacy), default)
-    return default
+    return resolve_crawler_browser_concurrency(default)[0]
 
 
 def get_crawler_page_timeout(default: int = 60000) -> int:

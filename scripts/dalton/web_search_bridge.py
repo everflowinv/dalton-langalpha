@@ -57,6 +57,8 @@ from web_search_broker_protocol import (  # noqa: E402
     load_broker_key,
 )
 
+import log_redaction as _log_redaction  # noqa: E402  (sibling, pure stdlib)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] web_search_bridge: %(message)s",
@@ -68,6 +70,69 @@ DEFAULT_QUEUE_TIMEOUT_S = DEFAULT_QUEUE_TIMEOUT_SECONDS
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _MAX_X_HANDLES = 20
+
+# Upstream status passthrough (backlog 三-6, 2026-10-28): the bridge maps its
+# own HTTP status from the broker error *code* alone, so a PROVIDER_ERROR could
+# never be attributed to a 4xx/5xx at the provider. Whatever upstream signal
+# the broker frame carries is copied into new optional top-level
+# `upstream_status`/`upstream_code` fields on the bridge reply; existing fields
+# are untouched and a frame that says nothing adds nothing.
+_UPSTREAM_STATUS_KEYS = ("upstream_status", "providerStatus", "statusCode", "status", "httpStatus")
+_UPSTREAM_CODE_KEYS = ("upstream_code", "providerCode", "provider_code")
+
+
+def _extract_upstream_error_signal(
+    frame: Mapping[str, Any],
+) -> tuple[int | None, str | None]:
+    """Best-effort (upstream_status, upstream_code) from a broker reply frame.
+
+    Explicit frame fields first; then (P0 fix1 9) the broker frame today only
+    carries ``error.code``/``error.message``, so an HTTP status named in the
+    message text (``HTTP 429``, ``status 503``, ``429 Too Many Requests``,
+    a stringified dict's ``status_code``) is extracted via the shared
+    `log_redaction.http_status_from_text` — without it a PROVIDER_ERROR can
+    never be attributed to a 4xx/5xx."""
+    err_obj = frame.get("error") if isinstance(frame.get("error"), Mapping) else {}
+    upstream_status: int | None = None
+    for source in (frame, err_obj):
+        for key in _UPSTREAM_STATUS_KEYS:
+            raw = source.get(key)
+            if isinstance(raw, bool) or not isinstance(raw, int):
+                continue
+            if 100 <= raw <= 599:
+                upstream_status = raw
+                break
+        if upstream_status is not None:
+            break
+    if upstream_status is None:
+        message = str(err_obj.get("message") or "") if isinstance(err_obj, Mapping) else ""
+        if message:
+            upstream_status = _log_redaction.http_status_from_text(message)
+    upstream_code: str | None = None
+    for source in (frame, err_obj):
+        for key in _UPSTREAM_CODE_KEYS:
+            raw = source.get(key)
+            if isinstance(raw, str) and raw.strip():
+                upstream_code = raw.strip()
+                break
+        if upstream_code is not None:
+            break
+    return upstream_status, upstream_code
+
+
+def _attach_upstream_error_fields(broker_reply: dict[str, Any]) -> dict[str, Any]:
+    """A copy of ``broker_reply`` with optional top-level ``upstream_status`` /
+    ``upstream_code`` added when the frame carried them; the frame itself
+    otherwise, so a signal-free reply goes out verbatim."""
+    upstream_status, upstream_code = _extract_upstream_error_signal(broker_reply)
+    if upstream_status is None and upstream_code is None:
+        return broker_reply
+    enriched = dict(broker_reply)
+    if upstream_status is not None and "upstream_status" not in enriched:
+        enriched["upstream_status"] = upstream_status
+    if upstream_code is not None and "upstream_code" not in enriched:
+        enriched["upstream_code"] = upstream_code
+    return enriched
 
 
 def _is_valid_yyyy_mm_dd(value: Any) -> bool:
@@ -142,20 +207,38 @@ def invoke_broker_x_search(
             parsed_err = json.loads(err_bytes.decode("utf-8", errors="replace"))
             if isinstance(parsed_err, Mapping):
                 if parsed_err.get("ok") is False and isinstance(parsed_err.get("error"), Mapping):
-                    return dict(parsed_err)
+                    # P0 fix1 8: a verbatim ok:false broker frame keeps the
+                    # HTTP status it arrived with as an optional field too —
+                    # the error body's own code alone never names it.
+                    verbatim = dict(parsed_err)
+                    if (
+                        isinstance(exc.code, int)
+                        and not isinstance(exc.code, bool)
+                        and "upstream_status" not in verbatim
+                    ):
+                        verbatim["upstream_status"] = exc.code
+                    return verbatim
                 inner_err = parsed_err.get("error")
                 if isinstance(inner_err, Mapping):
-                    return {
+                    synthesized: dict[str, Any] = {
                         "ok": False,
                         "error": {
                             "code": str(inner_err.get("code") or f"HTTP_{exc.code}"),
                             "message": str(inner_err.get("message") or f"Broker HTTP {exc.code}"),
                         },
                     }
+                    # Upstream passthrough (三-6): the broker's HTTP status is
+                    # dropped once inner_err carries its own code — keep it as
+                    # an optional field instead.
+                    if isinstance(exc.code, int) and not isinstance(exc.code, bool):
+                        synthesized["upstream_status"] = exc.code
+                    return synthesized
         except Exception:
             pass
         raise WebSearchBrokerError(
-            f"OpenClaw broker returned HTTP {exc.code}", code="BROKER_HTTP_ERROR"
+            f"OpenClaw broker returned HTTP {exc.code}",
+            code="BROKER_HTTP_ERROR",
+            upstream_status=exc.code if isinstance(exc.code, int) else None,
         ) from exc
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         raise WebSearchBrokerError(
@@ -436,15 +519,22 @@ class WebSearchBridge:
         except WebSearchBrokerError as exc:
             elapsed_ms = int((time.monotonic() - t0) * 1000)
             logger.warning(
-                "search broker error code=%s elapsed_ms=%d",
-                exc.code,
+                "search broker error code=%s elapsed_ms=%d upstream_status=%s upstream_code=%s",
+                _log_redaction.clean_log_field(exc.code, max_len=64) or "-",
                 elapsed_ms,
+                exc.upstream_status if exc.upstream_status is not None else "-",
+                _log_redaction.clean_log_field(exc.upstream_code or "", max_len=64) or "-",
             )
             status = 400 if exc.code == "INVALID_REQUEST" else 503
-            return status, {
+            error_payload: dict[str, Any] = {
                 "ok": False,
                 "error": {"code": exc.code, "message": str(exc)},
             }
+            if exc.upstream_status is not None:
+                error_payload["upstream_status"] = exc.upstream_status
+            if exc.upstream_code is not None:
+                error_payload["upstream_code"] = exc.upstream_code
+            return status, error_payload
         except Exception as exc:
             elapsed_ms = int((time.monotonic() - t0) * 1000)
             logger.error(
@@ -465,13 +555,41 @@ class WebSearchBridge:
         elapsed_ms = int((time.monotonic() - t0) * 1000)
         ok = broker_reply.get("ok") is True
         err_obj = broker_reply.get("error") if isinstance(broker_reply.get("error"), Mapping) else {}
+        # P0 fix2 E: HTTP status mapping must use the raw error.code so
+        # trailing whitespace/control chars keep their baseline 502 mapping;
+        # only the copy written to logs goes through clean_log_field.
         err_code = str(err_obj.get("code") or "-") if not ok else "-"
+        log_err_code = (
+            _log_redaction.clean_log_field(str(err_obj.get("code") or ""), max_len=64) or "-"
+            if not ok
+            else "-"
+        )
+        upstream_status, upstream_code = _extract_upstream_error_signal(broker_reply)
+        upstream_suffix = ""
+        upstream_args: tuple[Any, ...] = ()
+        if not ok and (upstream_status is not None or upstream_code is not None):
+            upstream_suffix = " upstream_status=%s upstream_code=%s"
+            upstream_args = (
+                upstream_status if upstream_status is not None else "-",
+                _log_redaction.clean_log_field(upstream_code or "", max_len=64) or "-",
+            )
+        elif not ok:
+            # P0 fix1 9: no status anywhere — the sanitized message head at
+            # least names the reason text for the next PROVIDER_ERROR.
+            upstream_suffix = " message=%s"
+            upstream_args = (
+                _log_redaction.clean_log_field(
+                    str(err_obj.get("message") or ""), max_len=200
+                )
+                or "-",
+            )
         logger.info(
-            "search completed status=%s count=%d error_code=%s elapsed_ms=%d",
+            "search completed status=%s count=%d error_code=%s elapsed_ms=%d" + upstream_suffix,
             "ok" if ok else "error",
             count,
-            err_code,
+            log_err_code,
             elapsed_ms,
+            *upstream_args,
         )
         if not ok:
             if err_code == "PROVIDER_RATE_LIMITED":
@@ -482,7 +600,32 @@ class WebSearchBridge:
                 http_status = 400
             else:
                 http_status = 502
-            return http_status, broker_reply
+            return http_status, _attach_upstream_error_fields(broker_reply)
+        # Downgrade visibility (backlog 三-6): the broker picks the effective
+        # provider per call; a reply served by a fallback (e.g. last30days
+        # where the profile's primary is gemini) is a degradation worth a line.
+        # The broker does not report why it fell back, so the reason is
+        # best-effort and "unknown" when the frame says nothing.
+        reply_provider = str(broker_reply.get("provider") or "").strip()
+        expected_provider_name = (
+            expected_provider or self.cfg.expected_provider or "gemini"
+        ).strip()
+        if reply_provider and reply_provider != expected_provider_name:
+            reason_raw = str(
+                broker_reply.get("fallbackReason")
+                or broker_reply.get("degradedReason")
+                or broker_reply.get("reason")
+                or ""
+            ).strip()
+            logger.warning(
+                "search provider_downgraded expected=%s effective=%s reason_category=%s reason=%s",
+                _log_redaction.clean_log_field(expected_provider_name, max_len=64) or "-",
+                _log_redaction.clean_log_field(reply_provider, max_len=64) or "-",
+                "provider_fallback" if reason_raw else "unknown",
+                # P0 fix1 2: the reason is broker-controlled text — redacted,
+                # control-char-stripped, truncated before it reaches the log.
+                _log_redaction.clean_log_field(reason_raw, max_len=200) or "-",
+            )
         return 200, broker_reply
 
     def _load_broker_bearer_token(self) -> str:
@@ -648,15 +791,24 @@ class WebSearchBridge:
         except WebSearchBrokerError as exc:
             elapsed_ms = int((time.monotonic() - t0) * 1000)
             logger.warning(
-                "x_search broker error code=%s elapsed_ms=%d",
-                exc.code,
+                "x_search broker error code=%s elapsed_ms=%d upstream_status=%s upstream_code=%s",
+                _log_redaction.clean_log_field(exc.code, max_len=64) or "-",
                 elapsed_ms,
+                exc.upstream_status if exc.upstream_status is not None else "-",
+                _log_redaction.clean_log_field(exc.upstream_code or "", max_len=64) or "-",
             )
             status = 400 if exc.code == "INVALID_REQUEST" else 503
-            return status, {
+            error_payload: dict[str, Any] = {
                 "ok": False,
                 "error": {"code": exc.code, "message": str(exc)},
             }
+            # P0 fix1 8: the upstream HTTP status rides the reply as an
+            # optional field, mirroring handle_search's error payloads.
+            if exc.upstream_status is not None:
+                error_payload["upstream_status"] = exc.upstream_status
+            if exc.upstream_code is not None:
+                error_payload["upstream_code"] = exc.upstream_code
+            return status, error_payload
         except Exception as exc:
             elapsed_ms = int((time.monotonic() - t0) * 1000)
             logger.error(
@@ -677,12 +829,36 @@ class WebSearchBridge:
         elapsed_ms = int((time.monotonic() - t0) * 1000)
         ok = broker_reply.get("ok") is True
         err_obj = broker_reply.get("error") if isinstance(broker_reply.get("error"), Mapping) else {}
+        # P0 fix2 E: keep raw err_code for HTTP status mapping; sanitize only the logged copy.
         err_code = str(err_obj.get("code") or "-") if not ok else "-"
+        log_err_code = (
+            _log_redaction.clean_log_field(str(err_obj.get("code") or ""), max_len=64) or "-"
+            if not ok
+            else "-"
+        )
+        upstream_status, upstream_code = _extract_upstream_error_signal(broker_reply)
+        upstream_suffix = ""
+        upstream_args: tuple[Any, ...] = ()
+        if not ok and (upstream_status is not None or upstream_code is not None):
+            upstream_suffix = " upstream_status=%s upstream_code=%s"
+            upstream_args = (
+                upstream_status if upstream_status is not None else "-",
+                _log_redaction.clean_log_field(upstream_code or "", max_len=64) or "-",
+            )
+        elif not ok:
+            upstream_suffix = " message=%s"
+            upstream_args = (
+                _log_redaction.clean_log_field(
+                    str(err_obj.get("message") or ""), max_len=200
+                )
+                or "-",
+            )
         logger.info(
-            "x_search completed status=%s error_code=%s elapsed_ms=%d",
+            "x_search completed status=%s error_code=%s elapsed_ms=%d" + upstream_suffix,
             "ok" if ok else "error",
-            err_code,
+            log_err_code,
             elapsed_ms,
+            *upstream_args,
         )
         if not ok:
             if err_code in ("PROVIDER_RATE_LIMITED", "RATE_LIMITED"):
@@ -695,7 +871,7 @@ class WebSearchBridge:
                 http_status = 503
             else:
                 http_status = 502
-            return http_status, broker_reply
+            return http_status, _attach_upstream_error_fields(broker_reply)
         return 200, broker_reply
 
 

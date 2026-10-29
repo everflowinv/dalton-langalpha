@@ -221,7 +221,7 @@ function ChatInput({
   const handleDraftKeySwitch = useCallback(() => {
     resetRichDraftRef.current();
   }, []);
-  const { message, setMessage, clearCurrentDraft, submitWithDraft } = useComposerDraft({
+  const { message, setMessage, restoredFromInFlight, clearCurrentDraft, submitWithDraft } = useComposerDraft({
     draftKey,
     prefillMessage,
     onDraftKeySwitch: handleDraftKeySwitch,
@@ -802,6 +802,17 @@ function ChatInput({
               />
             )}
           </AnimatePresence>
+
+          {/* DALTON-HOOK(composer-drafts): warn when a restored draft came from an unconfirmed in-flight send */}
+          {restoredFromInFlight && (
+            <div
+              role="status"
+              data-testid="in-flight-draft-notice"
+              className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-2.5 py-1.5 text-xs text-(--color-text-secondary)"
+            >
+              {t('chat.composer.inFlightDraftRestored')}
+            </div>
+          )}
 
           {/* Textarea */}
           <div className="relative">

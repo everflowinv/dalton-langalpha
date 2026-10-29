@@ -21,6 +21,7 @@ vi.mock('@/hooks/useTeamCredentials', () => ({
   useTeamCredentials: () => ({
     isShared: true,
     canDisconnect: h.canInvite,
+    canManage: h.canInvite,
     isPm: h.canInvite,
     canInvite: h.canInvite,
   }),
@@ -445,6 +446,10 @@ describe("Settings: the user's instructions", () => {
     fireEvent.change(extSearch, { target: { value: '研究总监' } });
     expect(screen.queryByText('Chief of Staff workspace sharing')).not.toBeInTheDocument();
     expect(screen.getByText('No settings match.')).toBeInTheDocument();
+
+    fireEvent.change(extSearch, { target: { value: '邀请' } });
+    expect(screen.queryByText('Team invitations & member access')).not.toBeInTheDocument();
+    expect(screen.getByText('No settings match.')).toBeInTheDocument();
     unmountExt();
 
     const intClient = new QueryClient({
@@ -464,6 +469,13 @@ describe("Settings: the user's instructions", () => {
 
     fireEvent.change(intSearch, { target: { value: '研究总监' } });
     expect(await screen.findByText('Chief of Staff workspace sharing')).toBeInTheDocument();
+
+    // DALTON-HOOK(settings-section): internal employees can find Team invitations in search, while external members cannot
+    fireEvent.change(intSearch, { target: { value: '邀请' } });
+    expect(await screen.findByText('Team invitations & member access')).toBeInTheDocument();
+
+    fireEvent.change(intSearch, { target: { value: '飞书' } });
+    expect(screen.queryByText('Feishu read scopes')).not.toBeInTheDocument();
     unmountInt();
   });
 

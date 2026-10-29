@@ -189,6 +189,31 @@ ALLOWED_HOOKS=(
   # Backlog A1d fix1: periodic 5-minute background reconciliation loop for
   # non-terminal transcription jobs mounted in FastAPI lifespan (setup.py).
   "transcriptions-reconcile"
+  # Backlog 三-2 (2026-10-28): startup logs the effective in-process browser
+  # concurrency (crawl value + which channel set it, PDF render cap) — a
+  # named PDF_RENDER_CONCURRENCY constant, a source-resolving helper in
+  # tool_settings.py, and one lifespan line in setup.py. Log-only.
+  "concurrency-startup-log"
+  # P2: external members cannot create or enable public share links or thread
+  # public sharing, while closing an existing share remains allowed
+  # (share_links.py, threads/sharing.py, frontend share controls).
+  "external-share-guard"
+  # P3: per-automation model selector in MoreOptions and explicit null clearing
+  # on PATCH /api/v1/automations/{id}.
+  "automation-model"
+  # Backlog P6a: periodic 3-way browser memory attribution sampler started in
+  # the server lifespan (src/server/app/setup.py, src/observability/browser_memory.py).
+  "browser-memory-sampler"
+  # P7/A6: plugin discovery, manifest, MCP config, and catalog JSON parsing/
+  # formatting enforce raw byte, pre-parse string-aware bracket depth, post-
+  # parse AST node count, and compact output budgets while isolating inline
+  # mcpServers failures (discover.py, mcp.py, manifest.py, marketplace.py;
+  # src/dalton/plugin_json_budget.py).
+  "plugin-json-budget"
+  # P8: wsfiles transfer runtime stamps current time when mtime_ns is None or 0
+  # across relay, direct, and restore paths so uploaded/restored entries never
+  # land at 1970 (wsfiles_transfer_runtime.py).
+  "wsfiles-mtime"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)
