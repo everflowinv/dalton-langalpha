@@ -23,7 +23,7 @@
 - 后端实现是 `src/dalton/transcription_storage.py`（与全局 `src/utils/storage/` 完全独立）；桥侧由 `scripts/dalton/asr_jobs.py` 的 `SourceObjectStore` 读取同一组变量。
 - 对象键前缀规则两侧**必须完全一致**（后端 `resolve_full_key` 与桥 `SourceObjectStore.resolve_full_key`），否则后端上传的对象桥会找不到；该一致性由 `tests/unit/dalton/test_transcription_storage.py` 的 `test_resolve_full_key_matches_bridge_source_object_store` 钉死。
 - 分片上传的行为与全局实现一致：每个分片的字节长度签入预签名 URL（`sign_upload_part` 的 `ContentLength` 绑定），`list_uploaded_parts` 返回 `{"part_number", "size", "etag"}` 且以存储侧清单为准。
-- 沙箱向 `host.docker.internal` 的分片 PUT 走沙箱普通出网，不经出口代理；部署时确认 Docker 沙箱内能解析 `host.docker.internal`（Docker Desktop 与 Docker Engine 20.10+ 的 Linux 均内建）。
+- 沙箱向 `host.docker.internal` 的分片 PUT 走沙箱普通出网，不经出口代理；部署时确认 Docker 沙箱内能解析 `host.docker.internal`（Docker Desktop 内建；原生 Linux 不会自动解析，本仓库由 Compose 与 Docker 沙箱 provider 添加的 `host.docker.internal:host-gateway` 映射提供，Docker Engine 需 20.10+）。
 
 ---
 
