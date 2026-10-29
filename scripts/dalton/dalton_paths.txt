@@ -77,3 +77,8 @@ tests/unit/dalton/test_transcriptions.py
 # Backlog A1c: real Seed-ASR client, ffprobe/ffmpeg segmentation, TOS transfer & merge.
 scripts/dalton/seed_asr_client.py
 tests/unit/dalton/test_seed_asr_a1c.py
+# Backlog A1d: sandbox CLI, background long-command skill docs, recovery & usage accounting.
+plugins/dalton/skills/dalton-transcript-polish/SKILL.md
+plugins/dalton/skills/dalton-transcript-polish/scripts/dalton_asr.py
+scripts/dalton/asr_usage_report.py
+tests/unit/dalton/test_asr_cli_and_accounting_a1d.py

@@ -12,16 +12,23 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, ConfigDict, Field
 
 from src.dalton.services.transcriptions import (
+    abort_transcription_upload,
     cancel_transcription_job,
+    complete_transcription_upload,
     get_transcription_job_result,
     get_transcription_job_status,
+    get_transcription_usage_report,
     is_transcription_ticket_token,
     prepare_transcription_job,
     retry_transcription_job,
+    sign_transcription_upload_part,
+    start_transcription_upload,
+    stream_transcription_job_raw_result,
     submit_transcription_job,
     verify_transcription_ticket,
 )
@@ -168,6 +175,163 @@ async def create_or_submit_transcription_endpoint(
     return {"ok": True, "job": job}
 
 
+@router.get("/usage")
+@handle_api_exceptions("get transcription usage report", logger)
+async def get_transcription_usage_endpoint(
+    request: Request,
+    user_id: str | None = None,
+    workspace_id: str | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    limit: int = 500,
+    offset: int = 0,
+    credentials: HTTPAuthorizationCredentials | None = Depends(_optional_bearer),
+) -> dict[str, Any]:
+    _require_dalton_enabled()
+    has_ticket, _raw_ticket = _extract_ticket_from_request(request, credentials)
+    if has_ticket:
+        raise HTTPException(
+            status_code=403,
+            detail="Task ticket cannot query aggregate usage reports",
+        )
+    override = request.app.dependency_overrides.get(get_current_user_id)
+    if callable(override):
+        res = override()
+        if inspect.isawaitable(res):
+            res = await res
+        caller_user_id = str(res or "").strip()
+    else:
+        caller_user_id = await get_current_user_id(request, credentials)
+    if not caller_user_id:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    return await get_transcription_usage_report(
+        caller_user_id=caller_user_id,
+        target_user_id=user_id,
+        workspace_id=workspace_id,
+        start_date=start_date,
+        end_date=end_date,
+        limit=limit,
+        offset=offset,
+    )
+
+
+async def _parse_optional_json_body(request: Request) -> dict[str, Any]:
+    raw_bytes = await request.body()
+    if not raw_bytes or not raw_bytes.strip():
+        return {}
+    try:
+        payload = await request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Request body must be valid JSON") from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Request body must be a JSON object")
+    return payload
+
+
+async def _require_upload_ticket(
+    job_id: str,
+    request: Request,
+    credentials: HTTPAuthorizationCredentials | None,
+) -> tuple[str, dict[str, Any]]:
+    caller_user_id, ticket_claims = await _resolve_caller_and_ticket(
+        request,
+        credentials,
+        required_op="upload",
+        expected_job_id=job_id,
+    )
+    if ticket_claims is None:
+        raise HTTPException(
+            status_code=403,
+            detail="Upload endpoints require a valid transcription task ticket",
+        )
+    return caller_user_id, ticket_claims
+
+
+@router.post("/{job_id}/upload/start")
+@handle_api_exceptions("start transcription multipart upload", logger)
+async def start_transcription_upload_endpoint(
+    job_id: str,
+    request: Request,
+    credentials: HTTPAuthorizationCredentials | None = Depends(_optional_bearer),
+) -> dict[str, Any]:
+    caller_user_id, ticket_claims = await _require_upload_ticket(job_id, request, credentials)
+    raw_body = await _parse_optional_json_body(request)
+    return await start_transcription_upload(
+        job_id=job_id,
+        caller_user_id=caller_user_id,
+        ticket_claims=ticket_claims,
+        raw_body=raw_body,
+    )
+
+
+@router.post("/{job_id}/upload/part")
+@handle_api_exceptions("sign transcription multipart upload part", logger)
+async def sign_transcription_upload_part_endpoint(
+    job_id: str,
+    request: Request,
+    credentials: HTTPAuthorizationCredentials | None = Depends(_optional_bearer),
+) -> dict[str, Any]:
+    caller_user_id, ticket_claims = await _require_upload_ticket(job_id, request, credentials)
+    raw_body = await _parse_optional_json_body(request)
+    if "part_number" not in raw_body:
+        raise HTTPException(status_code=400, detail="part_number is required")
+    return await sign_transcription_upload_part(
+        job_id=job_id,
+        caller_user_id=caller_user_id,
+        ticket_claims=ticket_claims,
+        part_number=raw_body.get("part_number"),
+        upload_id=raw_body.get("upload_id"),
+        raw_body=raw_body,
+    )
+
+
+@router.post("/{job_id}/upload/complete")
+@handle_api_exceptions("complete transcription multipart upload", logger)
+async def complete_transcription_upload_endpoint(
+    job_id: str,
+    request: Request,
+    credentials: HTTPAuthorizationCredentials | None = Depends(_optional_bearer),
+) -> dict[str, Any]:
+    caller_user_id, ticket_claims = await _require_upload_ticket(job_id, request, credentials)
+    raw_body = await _parse_optional_json_body(request)
+    if bool(raw_body.get("abort")):
+        return await abort_transcription_upload(
+            job_id=job_id,
+            caller_user_id=caller_user_id,
+            ticket_claims=ticket_claims,
+            upload_id=raw_body.get("upload_id"),
+            reason=str(raw_body.get("reason") or "").strip() or None,
+            raw_body=raw_body,
+        )
+    return await complete_transcription_upload(
+        job_id=job_id,
+        caller_user_id=caller_user_id,
+        ticket_claims=ticket_claims,
+        upload_id=raw_body.get("upload_id"),
+        raw_body=raw_body,
+    )
+
+
+@router.post("/{job_id}/upload/abort")
+@handle_api_exceptions("abort transcription multipart upload", logger)
+async def abort_transcription_upload_endpoint(
+    job_id: str,
+    request: Request,
+    credentials: HTTPAuthorizationCredentials | None = Depends(_optional_bearer),
+) -> dict[str, Any]:
+    caller_user_id, ticket_claims = await _require_upload_ticket(job_id, request, credentials)
+    raw_body = await _parse_optional_json_body(request)
+    return await abort_transcription_upload(
+        job_id=job_id,
+        caller_user_id=caller_user_id,
+        ticket_claims=ticket_claims,
+        upload_id=raw_body.get("upload_id"),
+        reason=str(raw_body.get("reason") or "").strip() or None,
+        raw_body=raw_body,
+    )
+
+
 @router.get("/{job_id}")
 @handle_api_exceptions("get transcription job status", logger)
 async def get_transcription_status_endpoint(
@@ -204,6 +368,26 @@ async def get_transcription_result_endpoint(
         job_id=job_id,
         caller_user_id=caller_user_id,
     )
+
+
+@router.get("/{job_id}/result/raw")
+@handle_api_exceptions("stream transcription job raw result", logger)
+async def get_transcription_raw_result_endpoint(
+    job_id: str,
+    request: Request,
+    credentials: HTTPAuthorizationCredentials | None = Depends(_optional_bearer),
+) -> StreamingResponse:
+    caller_user_id, _ticket_claims = await _resolve_caller_and_ticket(
+        request,
+        credentials,
+        required_op="result",
+        expected_job_id=job_id,
+    )
+    byte_iter = await stream_transcription_job_raw_result(
+        job_id=job_id,
+        caller_user_id=caller_user_id,
+    )
+    return StreamingResponse(byte_iter, media_type="application/json")
 
 
 @router.post("/{job_id}/retry")

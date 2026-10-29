@@ -13835,6 +13835,12 @@ class ResearchDataBridge:
         """Handle ``GET /transcriptions/{id}/result``."""
         return await self._asr_job_manager().get_job_result(job_id)
 
+    async def handle_transcription_raw_result(
+        self, job_id: str
+    ) -> tuple[int, dict[str, Any] | Path]:
+        """Handle ``GET /transcriptions/{id}/result/raw`` (streams bridge ``raw_response.json``)."""
+        return await self._asr_job_manager().get_job_raw_result(job_id)
+
     async def handle_transcription_retry(
         self, job_id: str, body: dict[str, Any] | None = None
     ) -> tuple[int, dict[str, Any]]:
@@ -15530,6 +15536,40 @@ async def _send_http(
         pass
 
 
+async def _send_http_file(
+    writer: asyncio.StreamWriter,
+    status_code: int,
+    status_text: str,
+    file_path: Path,
+    *,
+    content_type: str = "application/json; charset=utf-8",
+    chunk_size: int = 65536,
+) -> None:
+    """Stream `file_path` over `writer` in fixed chunks without loading the entire file into memory."""
+    file_size = file_path.stat().st_size
+    headers = [
+        f"HTTP/1.1 {status_code} {status_text}",
+        f"Content-Type: {content_type}",
+        f"Content-Length: {file_size}",
+        "Connection: close",
+    ]
+    header_bytes = ("\r\n".join(headers) + "\r\n\r\n").encode("utf-8")
+    writer.write(header_bytes)
+    await writer.drain()
+    with file_path.open("rb") as fh:
+        while True:
+            chunk = fh.read(chunk_size)
+            if not chunk:
+                break
+            writer.write(chunk)
+            await writer.drain()
+    writer.close()
+    try:
+        await writer.wait_closed()
+    except Exception:
+        pass
+
+
 def _extract_supplied_token(headers: Mapping[str, str]) -> str:
     """Extract bridge authentication token from `Authorization: Bearer <token>` or `X-Dalton-Bridge-Token`."""
     lowered = {k.lower(): v for k, v in headers.items()}
@@ -16030,6 +16070,31 @@ async def _handle_client(
                     409: "Conflict",
                 }.get(code, "Bad Gateway")
                 await _send_http(writer, code, status_label, payload)
+                return
+
+            if len(parts) == 3 and parts[1] == "result" and parts[2] == "raw":
+                job_id = parts[0]
+                if method != "GET":
+                    await _send_http(
+                        writer, 405, "Method Not Allowed", {"ok": False, "error": "Method Not Allowed"}
+                    )
+                    return
+                code, raw_payload_or_path = await bridge.handle_transcription_raw_result(job_id)
+                status_label = {
+                    200: "OK",
+                    400: "Bad Request",
+                    404: "Not Found",
+                    409: "Conflict",
+                }.get(code, "Bad Gateway")
+                if code == 200 and isinstance(raw_payload_or_path, Path):
+                    await _send_http_file(writer, 200, "OK", raw_payload_or_path)
+                else:
+                    err_obj = (
+                        raw_payload_or_path
+                        if isinstance(raw_payload_or_path, dict)
+                        else {"ok": False, "error": "Raw response unavailable"}
+                    )
+                    await _send_http(writer, code, status_label, err_obj)
                 return
 
             if len(parts) == 2 and parts[1] in ("retry", "cancel"):

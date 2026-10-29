@@ -1920,6 +1920,7 @@ class FakeAsrWorkerConfig:
     fail_category: str | None = None
     fail_message: str | None = None
     duration_seconds: float = 60.0
+    include_raw_response: bool = True
 
 
 class FakeAsrWorker:
@@ -2054,6 +2055,32 @@ class FakeAsrWorker:
             "provider_request_ids": [req_id],
             "usage": usage,
         }
+        raw_bundle = (
+            {
+                "job_id": job_id,
+                "language": language,
+                "duration_seconds": duration_s,
+                "segment_count": 1,
+                "segments": [
+                    {
+                        "index": 0,
+                        "start_s": 0.0,
+                        "end_s": duration_s,
+                        "offset_ms": 0,
+                        "provider_request_id": req_id,
+                        "raw_response": {
+                            "result": {
+                                "text": text,
+                                "utterances": utterances,
+                            },
+                            "audio_info": {"duration": int(duration_s * 1000)},
+                        },
+                    }
+                ],
+            }
+            if self.config.include_raw_response
+            else None
+        )
         return {
             "status": "succeeded",
             "stage": "succeeded",
@@ -2076,7 +2103,177 @@ class FakeAsrWorker:
             "error_category": None,
             "error_message": None,
             "result": result_payload,
+            "raw_response": raw_bundle,
         }
+
+
+PROVIDER_CANCEL_UNVERIFIED_NOTICE = (
+    "已停止后续未提交的分片；已提交给火山 Seed-ASR 的分片能否在供应商侧取消"
+    "及是否仍计费未核实，已提交分片无法保证取消或免除计费。"
+)
+
+
+def build_attempt_usage_record(
+    state: Mapping[str, Any],
+    *,
+    attempt: int | None = None,
+    status: str | None = None,
+    recorded_at: str | None = None,
+) -> dict[str, Any]:
+    """Build a canonical per-attempt usage record from bridge job state.
+
+    Always attributes usage to `state["caller"]["user_id"]` (the verified job creator
+    supplied by the backend over the admin channel).
+    """
+    caller = state.get("caller") if isinstance(state.get("caller"), Mapping) else {}
+    raw_usage = state.get("usage") if isinstance(state.get("usage"), Mapping) else {}
+    eff_attempt = int(
+        attempt
+        if attempt is not None
+        else (state.get("attempt") or raw_usage.get("attempt") or 1)
+    )
+    eff_status = str(status or state.get("status") or "unknown").strip()
+
+    seg_count = int(state.get("segment_count") or 0)
+    comp_segs = int(state.get("completed_segments") or 0)
+    duration_s = float(raw_usage.get("duration_seconds") or 0.0)
+    submitted_s = float(raw_usage.get("submitted_seconds") or 0.0)
+    completed_s = float(raw_usage.get("completed_seconds") or 0.0)
+    billable_raw = raw_usage.get("billable_seconds")
+    billable_s = (
+        round(float(billable_raw), 3)
+        if isinstance(billable_raw, (int, float)) and not isinstance(billable_raw, bool)
+        else None
+    )
+    req_ids = [
+        str(r).strip()
+        for r in (state.get("provider_request_ids") or [])
+        if str(r).strip()
+    ]
+    raw_err_cat = state.get("error_category") or raw_usage.get("error_category")
+    err_cat = (
+        str(raw_err_cat).strip()
+        if raw_err_cat and eff_status != "succeeded"
+        else None
+    )
+    rec_ts = str(
+        recorded_at
+        or state.get("completed_at")
+        or state.get("updated_at")
+        or _now_iso()
+    )
+    record: dict[str, Any] = {
+        "job_id": str(state.get("job_id") or "").strip(),
+        "attempt": eff_attempt,
+        "user_id": str(caller.get("user_id") or raw_usage.get("user_id") or "").strip(),
+        "workspace_id": str(
+            caller.get("workspace_id") or raw_usage.get("workspace_id") or ""
+        ).strip(),
+        "thread_id": str(
+            caller.get("thread_id") or raw_usage.get("thread_id") or ""
+        ).strip(),
+        "status": eff_status,
+        "ok": eff_status == "succeeded",
+        "duration_seconds": round(duration_s, 3),
+        "submitted_seconds": round(submitted_s, 3),
+        "completed_seconds": round(completed_s, 3),
+        "billable_seconds": billable_s,
+        "segment_count": seg_count,
+        "completed_segments": comp_segs,
+        "error_category": err_cat,
+        "provider_request_ids": req_ids,
+        "recorded_at": rec_ts,
+    }
+    if eff_status == "cancelled":
+        record["billing_verified"] = False
+    return record
+
+
+@contextmanager
+def _exclusive_file_lock(path: Path) -> Iterator[None]:
+    """Acquire an exclusive advisory `fcntl.flock` on `<path>.lock`."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_name(f"{path.name}.lock")
+    with lock_path.open("a+", encoding="utf-8") as lock_fh:
+        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+
+
+def append_bridge_usage_jsonl(
+    ledger_path: Path,
+    record: Mapping[str, Any],
+) -> bool:
+    """Append `record` to `ledger_path` if `(job_id, attempt)` is not already recorded."""
+    job_id = str(record.get("job_id") or "").strip()
+    attempt = int(record.get("attempt") or 1)
+    if not job_id or attempt < 1:
+        return False
+    try:
+        ledger_path.parent.mkdir(parents=True, exist_ok=True)
+        with _exclusive_file_lock(ledger_path):
+            if ledger_path.is_file():
+                for raw_line in ledger_path.read_text(encoding="utf-8").splitlines():
+                    line = raw_line.strip()
+                    if not line:
+                        continue
+                    try:
+                        existing = json.loads(line)
+                    except Exception:
+                        continue
+                    if (
+                        isinstance(existing, dict)
+                        and str(existing.get("job_id") or "").strip() == job_id
+                        and int(existing.get("attempt") or 0) == attempt
+                    ):
+                        return False
+            serialized = json.dumps(dict(record), ensure_ascii=False, sort_keys=True) + "\n"
+            with ledger_path.open("a", encoding="utf-8") as fh:
+                fh.write(serialized)
+                fh.flush()
+                os.fsync(fh.fileno())
+        return True
+    except Exception as exc:
+        logger.warning(
+            "Failed appending ASR usage JSONL to %s: %s",
+            ledger_path,
+            type(exc).__name__,
+        )
+        return False
+
+
+def read_bridge_usage_jsonl(ledger_path: Path) -> list[dict[str, Any]]:
+    """Read and deduplicate per-attempt usage records from `ledger_path` by `(job_id, attempt)`."""
+    if not ledger_path.is_file():
+        return []
+    by_key: dict[tuple[str, int], dict[str, Any]] = {}
+    try:
+        for raw_line in ledger_path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                parsed = json.loads(line)
+            except Exception:
+                continue
+            if not isinstance(parsed, dict):
+                continue
+            jid = str(parsed.get("job_id") or "").strip()
+            att = int(parsed.get("attempt") or 0)
+            if not jid or att < 1:
+                continue
+            key = (jid, att)
+            if key not in by_key:
+                by_key[key] = parsed
+    except Exception as exc:
+        logger.warning(
+            "Failed reading ASR usage JSONL from %s: %s",
+            ledger_path,
+            type(exc).__name__,
+        )
+    return list(by_key.values())
 
 
 class AsrJobManager:
@@ -2088,8 +2285,15 @@ class AsrJobManager:
         *,
         worker: RealAsrWorker | FakeAsrWorker | None = None,
         atomic_write_fn: Callable[..., bool] | None = None,
+        usage_ledger_path: Path | None = None,
     ) -> None:
         self.jobs_dir = Path(jobs_dir)
+        env_usage = os.environ.get("DALTON_ASR_USAGE_FILE", "").strip()
+        self.usage_ledger_path = (
+            Path(env_usage)
+            if usage_ledger_path is None and env_usage
+            else (Path(usage_ledger_path) if usage_ledger_path is not None else self.jobs_dir / "asr_usage.jsonl")
+        )
         self._atomic_write = atomic_write_fn or _fallback_atomic_write_json_locked
         if worker is not None:
             self.worker: RealAsrWorker | FakeAsrWorker = worker
@@ -2172,6 +2376,10 @@ class AsrJobManager:
         job_dir = self._resolve_job_dir(job_id)
         return (job_dir / "result.json") if job_dir is not None else None
 
+    def raw_response_path(self, job_id: str) -> Path | None:
+        job_dir = self._resolve_job_dir(job_id)
+        return (job_dir / "raw_response.json") if job_dir is not None else None
+
     def read_state(self, job_id: str) -> dict[str, Any] | None:
         spath = self.state_path(job_id)
         if spath is None or not spath.is_file():
@@ -2225,6 +2433,12 @@ class AsrJobManager:
                 type(exc).__name__,
             )
             return False
+
+    def _write_raw_response(self, job_id: str, raw_bundle: dict[str, Any]) -> bool:
+        raw_path = self.raw_response_path(job_id)
+        if raw_path is None:
+            return False
+        return self._atomic_write(raw_path, raw_bundle, label="asr_raw_response")
 
     def _ensure_worker_running(self, job_id: str) -> None:
         existing = self._tasks.get(job_id)
@@ -2330,12 +2544,103 @@ class AsrJobManager:
                 result_payload = outcome.pop("result", None)
                 if isinstance(result_payload, dict):
                     self._write_result(job_id, result_payload)
+                raw_response_payload = outcome.pop("raw_response", None)
+                if isinstance(raw_response_payload, dict):
+                    self._write_raw_response(job_id, raw_response_payload)
+
+                prev_usage = (
+                    dict(cur.get("usage"))
+                    if isinstance(cur.get("usage"), dict)
+                    else {}
+                )
+                prev_attempts = [
+                    dict(a)
+                    for a in (prev_usage.get("attempts") or [])
+                    if isinstance(a, dict)
+                ]
                 cur.update(outcome)
                 cur["version"] = int(cur.get("version") or 1) + 1
                 now_str = _now_iso()
                 cur["updated_at"] = now_str
                 if cur.get("status") in TERMINAL_JOB_STATUSES:
                     cur["completed_at"] = now_str
+
+                # Record per-attempt usage on attempt completion (`succeeded` or `failed`),
+                # attributed strictly to the job creator (`caller.user_id`) and deduplicated
+                # by `(job_id, attempt)` across both `state.json` and `asr_usage.jsonl`.
+                cur_status_str = str(cur.get("status") or "")
+                if cur_status_str in ("succeeded", "failed"):
+                    existing_att_rec = next(
+                        (
+                            a
+                            for a in prev_attempts
+                            if int(a.get("attempt") or 0) == run_attempt
+                            and str(a.get("status") or "").strip()
+                            in ("succeeded", "failed", "cancelled")
+                        ),
+                        None,
+                    )
+                    attempt_record = (
+                        existing_att_rec
+                        if existing_att_rec is not None
+                        else build_attempt_usage_record(
+                            cur,
+                            attempt=run_attempt,
+                            status=cur_status_str,
+                            recorded_at=now_str,
+                        )
+                    )
+                    dedup_attempts: list[dict[str, Any]] = [
+                        a
+                        for a in prev_attempts
+                        if int(a.get("attempt") or 0) != run_attempt
+                    ]
+                    dedup_attempts.append(attempt_record)
+                    dedup_attempts.sort(key=lambda a: int(a.get("attempt") or 0))
+                    usage_dict = (
+                        dict(cur.get("usage"))
+                        if isinstance(cur.get("usage"), dict)
+                        else {}
+                    )
+                    caller_obj = (
+                        cur.get("caller")
+                        if isinstance(cur.get("caller"), dict)
+                        else {}
+                    )
+                    usage_dict["user_id"] = str(
+                        caller_obj.get("user_id") or usage_dict.get("user_id") or ""
+                    )
+                    usage_dict["workspace_id"] = str(
+                        caller_obj.get("workspace_id")
+                        or usage_dict.get("workspace_id")
+                        or ""
+                    )
+                    usage_dict["thread_id"] = str(
+                        caller_obj.get("thread_id")
+                        or usage_dict.get("thread_id")
+                        or ""
+                    )
+                    usage_dict["attempt"] = run_attempt
+                    usage_dict["status"] = str(attempt_record.get("status") or cur_status_str)
+                    usage_dict["ok"] = bool(attempt_record.get("ok"))
+                    usage_dict["segment_count"] = int(cur.get("segment_count") or 0)
+                    usage_dict["completed_segments"] = int(
+                        cur.get("completed_segments") or 0
+                    )
+                    usage_dict["error_category"] = attempt_record.get("error_category")
+                    usage_dict["attempts"] = dedup_attempts
+                    cur["usage"] = usage_dict
+
+                    recorded_list = [
+                        int(x)
+                        for x in (cur.get("usage_recorded_attempts") or [])
+                        if isinstance(x, int) and not isinstance(x, bool)
+                    ]
+                    if run_attempt not in recorded_list:
+                        append_bridge_usage_jsonl(self.usage_ledger_path, attempt_record)
+                        recorded_list.append(run_attempt)
+                        cur["usage_recorded_attempts"] = sorted(set(recorded_list))
+
                 self._write_state(job_id, cur)
 
     async def submit_job(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
@@ -2539,6 +2844,35 @@ class AsrJobManager:
             "result": result,
         }
 
+    async def get_job_raw_result(
+        self, job_id: str
+    ) -> tuple[int, dict[str, Any] | Path]:
+        """Resolve raw provider response file (`var/dalton/asr_jobs/<job_id>/raw_response.json`) for streaming."""
+        self._ensure_recovered()
+        state = self.read_state(job_id)
+        if state is None:
+            return 404, {
+                "ok": False,
+                "error_code": "not_found",
+                "error": "Transcription job not found",
+            }
+        cur_status = str(state.get("status") or "")
+        if cur_status != "succeeded":
+            return 409, {
+                "ok": False,
+                "error_code": "not_ready",
+                "status": cur_status,
+                "error": f"Transcription result is not ready (status={cur_status})",
+            }
+        raw_path = self.raw_response_path(job_id)
+        if raw_path is None or not raw_path.is_file():
+            return 404, {
+                "ok": False,
+                "error_code": "raw_response_missing",
+                "error": "Raw provider response file is not available on bridge",
+            }
+        return 200, raw_path
+
     async def retry_job(
         self, job_id: str, body: dict[str, Any] | None = None
     ) -> tuple[int, dict[str, Any]]:
@@ -2626,18 +2960,188 @@ class AsrJobManager:
                 running_task.cancel()
 
             raw_segs = state.get("segments")
+            submitted_req_ids: list[str] = []
+            all_provider_req_ids: list[str] = []
+            unsubmitted_cancelled_count = 0
+            completed_segments_count = 0
+            seg_submitted_seconds = 0.0
+            seg_completed_seconds = 0.0
             if isinstance(raw_segs, list):
-                segments_to_clean = [s for s in raw_segs if isinstance(s, dict)]
+                for s in raw_segs:
+                    if not isinstance(s, dict):
+                        continue
+                    segments_to_clean.append(s)
+                    seg_st = str(s.get("status") or "")
+                    req_id = str(s.get("provider_request_id") or "").strip()
+                    seg_dur = max(
+                        0.0,
+                        float(s.get("end_s") or 0.0) - float(s.get("start_s") or 0.0),
+                    )
+                    if req_id:
+                        if req_id not in all_provider_req_ids:
+                            all_provider_req_ids.append(req_id)
+                        seg_submitted_seconds += seg_dur
+                    if seg_st == "succeeded":
+                        completed_segments_count += 1
+                        seg_completed_seconds += seg_dur
+                    elif req_id:
+                        if req_id not in submitted_req_ids:
+                            submitted_req_ids.append(req_id)
+                        s["provider_cancel_verified"] = False
+                    else:
+                        s["status"] = "cancelled"
+                        unsubmitted_cancelled_count += 1
+            for req_id_raw in state.get("provider_request_ids") or []:
+                req_id_s = str(req_id_raw or "").strip()
+                if req_id_s:
+                    if req_id_s not in all_provider_req_ids:
+                        all_provider_req_ids.append(req_id_s)
+                    if not isinstance(raw_segs, list) and req_id_s not in submitted_req_ids:
+                        submitted_req_ids.append(req_id_s)
 
             now_str = _now_iso()
+            cancellation_info = {
+                "cancelled_at": now_str,
+                "submitted_segments_count": len(submitted_req_ids),
+                "submitted_request_ids": list(submitted_req_ids),
+                "unsubmitted_cancelled_count": unsubmitted_cancelled_count,
+                "completed_segments_count": completed_segments_count,
+                "provider_cancel_verified": False,
+                "billing_verified": False,
+                "notice": PROVIDER_CANCEL_UNVERIFIED_NOTICE,
+            }
+            prev_usage = (
+                dict(state.get("usage"))
+                if isinstance(state.get("usage"), dict)
+                else {}
+            )
+            prev_attempts = [
+                dict(a)
+                for a in (prev_usage.get("attempts") or [])
+                if isinstance(a, dict)
+            ]
+            run_attempt = int(state.get("attempt") or 1)
+            existing_attempt_rec = next(
+                (
+                    a
+                    for a in prev_attempts
+                    if int(a.get("attempt") or 0) == run_attempt
+                    and str(a.get("status") or "").strip()
+                    in ("succeeded", "failed", "cancelled")
+                ),
+                None,
+            )
+            if existing_attempt_rec is None and cur_status in ("succeeded", "failed"):
+                existing_attempt_rec = build_attempt_usage_record(
+                    state,
+                    attempt=run_attempt,
+                    status=cur_status,
+                    recorded_at=str(
+                        state.get("completed_at")
+                        or state.get("updated_at")
+                        or state.get("created_at")
+                        or now_str
+                    ),
+                )
+                if all_provider_req_ids:
+                    existing_attempt_rec["provider_request_ids"] = list(
+                        all_provider_req_ids
+                    )
+                prev_attempts.append(existing_attempt_rec)
+                prev_attempts.sort(key=lambda a: int(a.get("attempt") or 0))
+
             state.pop("interrupted", None)
             state.pop("interrupted_at", None)
             state["status"] = "cancelled"
             state["stage"] = "cancelled"
             state["version"] = int(state.get("version") or 1) + 1
             state["current_segment"] = None
+            state["cancellation"] = cancellation_info
+            if all_provider_req_ids:
+                state["provider_request_ids"] = list(all_provider_req_ids)
+            usage_dict = dict(prev_usage)
+            if seg_submitted_seconds > 0.0 and float(usage_dict.get("submitted_seconds") or 0.0) <= 0.0:
+                usage_dict["submitted_seconds"] = round(seg_submitted_seconds, 3)
+            if seg_completed_seconds > 0.0 and float(usage_dict.get("completed_seconds") or 0.0) <= 0.0:
+                usage_dict["completed_seconds"] = round(seg_completed_seconds, 3)
+            usage_dict["cancellation"] = dict(cancellation_info)
+            if prev_attempts:
+                usage_dict["attempts"] = prev_attempts
+            state["usage"] = usage_dict
             state["updated_at"] = now_str
-            state["completed_at"] = now_str
+            state["completed_at"] = state.get("completed_at") or now_str
+
+            # Item 8 & fix2 Item 6: The first usage record for a given `(job_id, attempt)`
+            # is final. If `run_attempt` already has a `succeeded`/`failed`/`cancelled`
+            # record, preserve its status, date, and counts untouched; only record
+            # `status="cancelled"` when `run_attempt` has no prior usage record.
+            recorded_list = [
+                int(x)
+                for x in (state.get("usage_recorded_attempts") or [])
+                if isinstance(x, int) and not isinstance(x, bool)
+            ]
+            if existing_attempt_rec is not None:
+                usage_dict["status"] = str(existing_attempt_rec.get("status") or cur_status)
+                usage_dict["ok"] = bool(existing_attempt_rec.get("ok"))
+                state["usage"] = usage_dict
+                if run_attempt not in recorded_list:
+                    append_bridge_usage_jsonl(
+                        self.usage_ledger_path, existing_attempt_rec
+                    )
+                    recorded_list.append(run_attempt)
+                    state["usage_recorded_attempts"] = sorted(set(recorded_list))
+            else:
+                has_submitted_segments = bool(
+                    all_provider_req_ids
+                    or submitted_req_ids
+                    or completed_segments_count > 0
+                    or float(usage_dict.get("submitted_seconds") or 0.0) > 0.0
+                )
+                if has_submitted_segments:
+                    attempt_record = build_attempt_usage_record(
+                        state,
+                        attempt=run_attempt,
+                        status="cancelled",
+                        recorded_at=now_str,
+                    )
+                    attempt_record["provider_request_ids"] = list(all_provider_req_ids)
+                    attempt_record["billing_verified"] = False
+                    dedup_attempts: list[dict[str, Any]] = [
+                        a
+                        for a in prev_attempts
+                        if int(a.get("attempt") or 0) != run_attempt
+                    ]
+                    dedup_attempts.append(attempt_record)
+                    dedup_attempts.sort(key=lambda a: int(a.get("attempt") or 0))
+                    caller_obj = (
+                        state.get("caller")
+                        if isinstance(state.get("caller"), dict)
+                        else {}
+                    )
+                    usage_dict["user_id"] = str(
+                        caller_obj.get("user_id") or usage_dict.get("user_id") or ""
+                    )
+                    usage_dict["workspace_id"] = str(
+                        caller_obj.get("workspace_id")
+                        or usage_dict.get("workspace_id")
+                        or ""
+                    )
+                    usage_dict["thread_id"] = str(
+                        caller_obj.get("thread_id")
+                        or usage_dict.get("thread_id")
+                        or ""
+                    )
+                    usage_dict["attempt"] = run_attempt
+                    usage_dict["status"] = "cancelled"
+                    usage_dict["ok"] = False
+                    usage_dict["billing_verified"] = False
+                    usage_dict["attempts"] = dedup_attempts
+                    state["usage"] = usage_dict
+
+                    if run_attempt not in recorded_list:
+                        append_bridge_usage_jsonl(self.usage_ledger_path, attempt_record)
+                        recorded_list.append(run_attempt)
+                        state["usage_recorded_attempts"] = sorted(set(recorded_list))
             if not self._write_state(job_id, state):
                 return 500, {
                     "ok": False,
@@ -2655,7 +3159,15 @@ class AsrJobManager:
                     job_id,
                     type(exc).__name__,
                 )
-        return 200, {"ok": True, "job": state}
+        return 200, {
+            "ok": True,
+            "job": state,
+            "cancellation": state.get("cancellation"),
+        }
+
+    def read_usage_ledger(self) -> list[dict[str, Any]]:
+        """Read deduplicated per-attempt usage records from `self.usage_ledger_path`."""
+        return read_bridge_usage_jsonl(self.usage_ledger_path)
 
 
 __all__ = [
@@ -2670,6 +3182,7 @@ __all__ = [
     "DEFAULT_STREAM_CHUNK_BYTES",
     "FakeAsrWorker",
     "FakeAsrWorkerConfig",
+    "PROVIDER_CANCEL_UNVERIFIED_NOTICE",
     "PreparedSegmentFile",
     "RECOVERABLE_JOB_STATUSES",
     "RealAsrWorker",
@@ -2678,12 +3191,15 @@ __all__ = [
     "SPLIT_THRESHOLD_SECONDS",
     "SourceObjectStore",
     "TERMINAL_JOB_STATUSES",
+    "append_bridge_usage_jsonl",
+    "build_attempt_usage_record",
     "check_disk_admission",
     "compute_file_sha256",
     "compute_segment_ranges",
     "format_scoped_speaker",
     "merge_segment_transcriptions",
     "probe_audio_duration",
+    "read_bridge_usage_jsonl",
     "should_split_audio",
     "split_audio_to_mp3_segments",
 ]

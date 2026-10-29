@@ -186,6 +186,9 @@ ALLOWED_HOOKS=(
   # reservation under advisory lock, and explicit 413 when direct_available()
   # is false for files exceeding the relay cap.
   "direct-upload-safety"
+  # Backlog A1d fix1: periodic 5-minute background reconciliation loop for
+  # non-terminal transcription jobs mounted in FastAPI lifespan (setup.py).
+  "transcriptions-reconcile"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

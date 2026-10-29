@@ -313,6 +313,29 @@ def _wire_ledger_and_bridge(
             side_effect=_bridge_action,
         ),
     )
+    monkeypatch.setattr(
+        svc_transcriptions,
+        "is_storage_enabled",
+        create_autospec(
+            svc_transcriptions.is_storage_enabled,
+            return_value=True,
+        ),
+    )
+
+    def _default_object_size(key: str) -> int | None:
+        for row in ledger.rows_by_id.values():
+            if str(row.get("source_object_key") or "") == str(key or ""):
+                return int(row.get("source_size_bytes") or 0)
+        return 128000
+
+    monkeypatch.setattr(
+        svc_transcriptions,
+        "object_size",
+        create_autospec(
+            svc_transcriptions.object_size,
+            side_effect=_default_object_size,
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
