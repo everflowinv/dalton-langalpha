@@ -45,11 +45,11 @@ from src.dalton.settings import (
     get_dalton_settings,
     get_dalton_transcription_ticket_hmac_key,
 )
-from src.utils.storage import is_storage_enabled
-from src.utils.storage.s3_compatible import (
+from src.dalton.transcription_storage import (
     abort_multipart_upload,
     complete_multipart_upload,
     delete_object,
+    is_transcription_storage_configured,
     list_uploaded_parts,
     object_size,
     open_multipart_upload,
@@ -1121,7 +1121,7 @@ async def _load_job_for_ticket_upload(
     if str(job_id or "").strip() != bound_job_id:
         raise HTTPException(status_code=404, detail="Transcription job not found")
 
-    if not is_storage_enabled():
+    if not is_transcription_storage_configured():
         raise HTTPException(
             status_code=503,
             detail="Object storage is not enabled; audio upload cannot proceed",
@@ -1458,11 +1458,11 @@ async def sign_transcription_upload_part(
             part_count - 1
         )
 
-    # The PUT is issued from the sandbox (`dalton_asr.py`), which never joins the
-    # backend Compose network, so sign the public browser endpoint shared with
-    # browser direct uploads. `sign_upload_part` falls back to the internal
-    # client when `STORAGE_BROWSER_ENDPOINT_URL` is unset — fine while the A1
-    # master switch keeps the feature off.
+    # The PUT is issued from the sandbox (`dalton_asr.py`), which never joins
+    # the backend Compose network, so the URL is signed for
+    # `DALTON_ASR_STORAGE_SIGNING_ENDPOINT_URL` — the address the sandbox
+    # reaches the transcription store's MinIO at (`host.docker.internal`),
+    # not the backend container's own endpoint.
     signed_url = await asyncio.to_thread(
         sign_upload_part,
         bound_key,
@@ -1470,7 +1470,6 @@ async def sign_transcription_upload_part(
         part_number=pnum,
         size=expected_part_size,
         expires_in=TRANSCRIPTION_UPLOAD_URL_EXPIRES_S,
-        for_browser=True,
     )
     if not signed_url:
         raise HTTPException(
@@ -1939,7 +1938,7 @@ async def submit_transcription_job(
 
     # Item 1: Before submitting to the bridge, verify object storage is enabled and
     # the source audio object has completed upload with exact matching byte size.
-    if not is_storage_enabled():
+    if not is_transcription_storage_configured():
         raise HTTPException(
             status_code=503,
             detail="Object storage is not enabled; transcription cannot be submitted",
@@ -2542,17 +2541,20 @@ async def cancel_transcription_job(
 
 
 def is_transcription_enabled() -> bool:
-    """Return True only when the transcription master switch is on and object storage is enabled.
+    """Return True only when the transcription master switch is on and the transcription store is configured.
 
     `DALTON_TRANSCRIPTION_ENABLED` defaults to off; only "1"/"true"/"yes"/"on"
-    (case-insensitive) turn it on. Production must configure MinIO and the
-    Volcengine ASR/TOS credentials and verify them before any transcription
+    (case-insensitive) turn it on. The store is the transcription-only
+    `DALTON_ASR_STORAGE_*` configuration (`src/dalton/transcription_storage.py`);
+    the global `STORAGE_*` object store stays out of the decision and remains
+    off in production. Production must configure the transcription MinIO and
+    the Volcengine ASR/TOS credentials and verify them before any transcription
     surface (tool, skill, API, reconciliation) becomes visible.
     """
     flag = os.getenv("DALTON_TRANSCRIPTION_ENABLED", "").strip().lower()
     if flag not in ("1", "true", "yes", "on"):
         return False
-    return is_storage_enabled()
+    return is_transcription_storage_configured()
 
 
 def is_transcription_reconciliation_enabled() -> bool:

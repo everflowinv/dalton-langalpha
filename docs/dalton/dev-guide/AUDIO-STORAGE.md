@@ -1,17 +1,44 @@
 # 大文件与音频直传存储指南（MinIO / S3 兼容）
 
-本文档说明 Dalton 大文件（含长录音音频）浏览器分片直传的架构、三种网络视角、环境变量与 YAML 配置优先级、Caddy 反代签名约束、MinIO 幂等初始化及磁盘容量估算。
+本文档说明 Dalton 大文件（含长录音音频）存储与分片直传的架构：第 0 节是生产实际采用的转写独立存储方案；第 1–6 节是上游全局存储（生产未启用）与浏览器直传的机制说明、环境变量与 YAML 配置优先级、Caddy 反代签名约束、MinIO 幂等初始化及磁盘容量估算。
+
+---
+
+## 0. 生产方案：转写独立存储
+
+生产**不配置**全局 `STORAGE_*` 对象存储并保持关闭：上游 20 多处功能（截图、工作区备份 / 恢复、头像、技能归档、备忘录、对话记录、下载链接、多模态上下文……）都以它为开关，一旦打开会同时改变行为，且给浏览器的链接会用到不适合浏览器的地址。录音转写（A1）因此使用一套独立的存储配置 `DALTON_ASR_STORAGE_*`，全局存储保持关闭、上游功能零影响。
+
+三个角色经不同地址访问同一个 MinIO（MinIO 只绑定宿主机 `127.0.0.1:9000`，见 `docker-compose.dalton.yml`；不需要公网域名、不需要 Caddy 反代、不需要沙箱接入 Compose 网络）：
+
+| 角色 | 访问地址 | 配置 |
+|---|---|---|
+| 后端容器（上传 / 组装 / 校验） | `http://host.docker.internal:9000` | `DALTON_ASR_STORAGE_ENDPOINT_URL=http://host.docker.internal:9000` |
+| 沙箱（分片 PUT 的目标；`dalton_asr.py`） | `http://host.docker.internal:9000` | `DALTON_ASR_STORAGE_SIGNING_ENDPOINT_URL=http://host.docker.internal:9000` —— 预签名分片 URL 按此地址签名；未设置时回退 `DALTON_ASR_STORAGE_ENDPOINT_URL` |
+| 桥（宿主机上流式下载音频；`asr_jobs.py`） | `http://127.0.0.1:9000` | `DALTON_ASR_STORAGE_ENDPOINT_URL=http://127.0.0.1:9000`（在桥自己的环境文件里单独设置，不与后端共用） |
+
+其余变量：`DALTON_ASR_STORAGE_BUCKET_NAME`、`DALTON_ASR_STORAGE_ACCESS_KEY_ID`、`DALTON_ASR_STORAGE_SECRET_ACCESS_KEY` 必填（这四项——含端点——齐备，`is_transcription_storage_configured()` 才为真，总开关 `DALTON_TRANSCRIPTION_ENABLED` 开启还要求它）；`DALTON_ASR_STORAGE_REGION` 默认 `us-east-1`；`DALTON_ASR_STORAGE_ADDRESSING_STYLE` 默认 `path`（MinIO 必须用 path 寻址）；`DALTON_ASR_STORAGE_KEY_PREFIX` 为可选的对象键前缀。
+
+实现与一致性约束：
+
+- 后端实现是 `src/dalton/transcription_storage.py`（与全局 `src/utils/storage/` 完全独立）；桥侧由 `scripts/dalton/asr_jobs.py` 的 `SourceObjectStore` 读取同一组变量。
+- 对象键前缀规则两侧**必须完全一致**（后端 `resolve_full_key` 与桥 `SourceObjectStore.resolve_full_key`），否则后端上传的对象桥会找不到；该一致性由 `tests/unit/dalton/test_transcription_storage.py` 的 `test_resolve_full_key_matches_bridge_source_object_store` 钉死。
+- 分片上传的行为与全局实现一致：每个分片的字节长度签入预签名 URL（`sign_upload_part` 的 `ContentLength` 绑定），`list_uploaded_parts` 返回 `{"part_number", "size", "etag"}` 且以存储侧清单为准。
+- 沙箱向 `host.docker.internal` 的分片 PUT 走沙箱普通出网，不经出口代理；部署时确认 Docker 沙箱内能解析 `host.docker.internal`（Docker Desktop 内建；原生 Linux 不会自动解析，本仓库由 Compose 与 Docker 沙箱 provider 添加的 `host.docker.internal:host-gateway` 映射提供，Docker Engine 需 20.10+）。
+
+---
+
+> **以下第 1–6 节为上游全局存储（生产未启用）的既有说明**，保留供非生产部署与浏览器 / 工作区直传参考。生产按第 0 节配置，`STORAGE_*` 全部保持未配置；文中 A1 转写使用 `STORAGE_BROWSER_ENDPOINT_URL` 的历史方案已由第 0 节取代。
 
 ---
 
 ## 1. 三种网络视角与 Endpoint 职责
 
-在 `docker-compose.dalton.yml` 中，`minio` 服务仅绑定在宿主机回环地址 `127.0.0.1:9000`。**在 Linux 宿主机上，容器内的 `host.docker.internal` 解析为 Docker 网桥网关 IP（如 `172.17.0.1`），无法连通宿主机 `127.0.0.1:9000`**。因此后端必须通过 Docker Compose 网络以服务名 `http://minio:9000` 通信，浏览器通过 HTTPS 反向代理域名访问（实现见 `src/utils/storage/s3_compatible.py:99-137`）。沙箱分两条路径：**录音转写（A1）的分片上传使用 `STORAGE_BROWSER_ENDPOINT_URL`（公网 HTTPS，与浏览器 2 GiB 直传共用同一 Caddy 反代），沙箱不需要也不应接入 Compose 网络**（接入会让沙箱内的代理代码直连后端的 Postgres / Redis）；仅工作区直传拉取（`workspace_upload_pull.py`）在 `STORAGE_BLOB_TRANSFER=direct` 时才需要加入同一 Compose 网络，该项在生产保持关闭：
+在 `docker-compose.dalton.yml` 中，`minio` 服务仅绑定在宿主机回环地址 `127.0.0.1:9000`。**在 Linux 宿主机上，容器内的 `host.docker.internal` 解析为 Docker 网桥网关 IP（如 `172.17.0.1`），无法连通宿主机 `127.0.0.1:9000`**。因此后端必须通过 Docker Compose 网络以服务名 `http://minio:9000` 通信，浏览器通过 HTTPS 反向代理域名访问（实现见 `src/utils/storage/s3_compatible.py:99-137`）。沙箱分两条路径：**录音转写（A1）的分片上传已改用独立的 `DALTON_ASR_STORAGE_*` 存储并经 `host.docker.internal` 访问 MinIO（生产方案见第 0 节；本节的历史方案曾与浏览器 2 GiB 直传共用 `STORAGE_BROWSER_ENDPOINT_URL` 公网 HTTPS 反代），沙箱不需要也不应接入 Compose 网络**（接入会让沙箱内的代理代码直连后端的 Postgres / Redis）；仅工作区直传拉取（`workspace_upload_pull.py`）在 `STORAGE_BLOB_TRANSFER=direct` 时才需要加入同一 Compose 网络，该项在生产保持关闭：
 
 | 网络视角 | 使用的环境变量 | 调用阶段与职责 | 必须配置的值 |
 |---|---|---|---|
 | **后端容器**（`backend`） | `STORAGE_ENDPOINT_URL` | `create_multipart_upload`、`complete_multipart_upload`、`abort_multipart_upload`、`head_object`、`delete_object`，以及生成供沙箱拉取的预签名 GET URL（`sign_get_url`） | `http://minio:9000`（Compose 容器内网直连） |
-| **沙箱容器**（录音转写 A1 分片上传，`dalton_asr.py`） | `STORAGE_BROWSER_ENDPOINT_URL` | 后端 `sign_transcription_upload_part` 以 `for_browser=True` 签发预签名 PUT URL；沙箱内的 `dalton_asr.py` 直接向公网 HTTPS 地址 `PUT` 音频分片，**不需要也不应接入 Compose 网络**（未配置该地址时 `sign_upload_part` 回退签内网地址，沙箱将连不上，功能由 `DALTON_TRANSCRIPTION_ENABLED` 总开关保护） | 生产：`https://storage.<domain>`（与浏览器 2 GiB 直传共用） |
+| **沙箱容器**（录音转写 A1 分片上传，`dalton_asr.py`） | `DALTON_ASR_STORAGE_SIGNING_ENDPOINT_URL`（转写独立存储） | 后端 `sign_transcription_upload_part` 用转写独立存储的签名客户端（`src/dalton/transcription_storage.py`）签发预签名 PUT URL，分片字节长度签入 URL；沙箱内的 `dalton_asr.py` 直接向该地址 `PUT` 音频分片，**不需要也不应接入 Compose 网络**（未配置该地址时回退签 `DALTON_ASR_STORAGE_ENDPOINT_URL`） | 生产：`http://host.docker.internal:9000`（见第 0 节） |
 | **沙箱容器**（工作区直传拉取，`workspace_upload_pull.py`；仅 `STORAGE_BLOB_TRANSFER=direct` 时，生产保持关闭） | `STORAGE_ENDPOINT_URL`（使用后端签发的 `get_url`） | `sandbox.pull_direct(url=get_url, ...)`，在沙箱内流式 `GET` 临时对象到 `.wsfiles-upload-<upload_id>` 并原子重命名到目标路径；此路径需要沙箱加入同一 Compose 网络（在 `agent_config.yaml` / `agent_config.dalton.yaml` 中配置 `sandbox.docker.network_mode`） | `http://minio:9000`（Compose 容器内网直连） |
 | **浏览器前端** | `STORAGE_BROWSER_ENDPOINT_URL` | 后端用 `_browser_client` 为每个分片签发预签名 PUT URL（`sign_part_url`）；浏览器直接 `PUT` 分片并读取响应头 `ETag` | 生产：`https://storage.<domain>`（经 Caddy HTTPS 反代到 `127.0.0.1:9000`）；仅本机同机调试可用 `http://127.0.0.1:9000` |
 
@@ -32,7 +59,7 @@
    若前端通过 `https://` 访问，`STORAGE_BROWSER_ENDPOINT_URL` 必须同样为 `https://`，否则浏览器会拦截向 `http://` 发起的分片 `PUT`。
 3. **Docker 沙箱网络配置（`sandbox.docker.network_mode`）**：
    - 仅工作区直传拉取（`workspace_upload_pull.py`）在 `STORAGE_BLOB_TRANSFER=direct` 时需要沙箱加入 Compose 网络：因为后端 `sign_get_url` 使用 `STORAGE_ENDPOINT_URL=http://minio:9000` 签名，Docker 沙箱容器必须与 `backend`、`minio` 处于同一 Compose 网络，才能解析 `minio` 并通过签名校验；该项在生产保持关闭。
-   - 录音转写（A1）的沙箱分片上传使用 `STORAGE_BROWSER_ENDPOINT_URL`（公网 HTTPS），沙箱不需要也不应为此接入 Compose 网络。
+   - 录音转写（A1）的沙箱分片上传使用独立的 `DALTON_ASR_STORAGE_SIGNING_ENDPOINT_URL`（见第 0 节生产方案），沙箱不需要也不应为此接入 Compose 网络。
    - 实际配置字段位于 `agent_config.yaml` / `agent_config.dalton.yaml` 的 `sandbox.docker.network_mode`（见 `src/ptc_agent/config/core.py:461`、`src/ptc_agent/core/sandbox/providers/docker.py:704`；Dalton 默认值为 `"bridge"`，见 `agent_config.yaml:125`；**注意不是 `config.dalton.yaml` 的 `sandbox.docker.network`**）。
    - **仅非生产方案使用**：工作区直传拉取（`STORAGE_BLOB_TRANSFER=direct` + 沙箱接入 Compose 网络）是非生产方案，生产保持关闭（`STORAGE_BLOB_TRANSFER` 不设置或保持默认，`network_mode` 维持默认 `"bridge"`，沙箱不接入 Compose 网络）；只有启用该方案时，才在 `agent_config.dalton.yaml`（或 `agent_config.yaml`）中将其设为 Compose 网络名（可通过 `docker network ls` 查看，通常为 `<project>_default`，如 `repo_default`）：
      ```yaml
@@ -40,7 +67,7 @@
        docker:
          network_mode: "repo_default" # 替换为实际的 docker compose 网络名（仅上述非生产方案使用；生产保持默认 "bridge"）
      ```
-4. **沙箱访问公网存储地址走普通出网**：`dalton_asr.py` 向 `STORAGE_BROWSER_ENDPOINT_URL` 发出的分片 `PUT` 不经出口代理，走沙箱的普通出网；部署时确认沙箱能解析并连到该域名（若该域名解析到宿主机本身，注意 Docker 的回环 / hairpin 是否可达）。
+4. **沙箱访问存储地址走普通出网**：`dalton_asr.py` 向 `DALTON_ASR_STORAGE_SIGNING_ENDPOINT_URL`（生产 `http://host.docker.internal:9000`）发出的分片 `PUT` 不经出口代理，走沙箱的普通出网；部署时确认沙箱能解析 `host.docker.internal` 并连通宿主机的 `127.0.0.1:9000`。
 
 ---
 
@@ -58,7 +85,7 @@
 | `STORAGE_ADDRESSING_STYLE` | `virtual`（`s3_compatible.py:89`） | **`path`**（必填） | MinIO 必须显式设为 `path`，否则默认 `virtual` 会拼接 `<bucket>.minio:9000` 导致 DNS 失败 |
 | `STORAGE_ENDPOINT_URL` | 无（必填） | `http://minio:9000` | 后端容器在 Compose 网络内访问 MinIO 的地址；沙箱仅在非生产的工作区直传拉取方案（`STORAGE_BLOB_TRANSFER=direct`，生产保持关闭）下使用它，A1 转写与浏览器直传都不经过该地址 |
 | `STORAGE_BROWSER_ENDPOINT_URL` | 回退到 `STORAGE_ENDPOINT_URL` | `https://storage.example.com` | 浏览器直传 `PUT` 分片的公网 HTTPS 反代地址 |
-| `STORAGE_BLOB_TRANSFER` | **`auto`**（`__init__.py:78`） | **生产：不设置（保持默认 `auto`）** | 工作区直传拉取的路径开关：`direct` 要求 Docker 沙箱接入 Compose 网络（见第 1 节），是**非生产方案**，生产不设置或保持默认——`auto` 仅对远程沙箱（Daytona/E2B）启用 `direct`，对 Docker 沙箱回退为 `relay`（`__init__.py:90-106`）。生产不开 `direct` 时，文件面板 / 工作区上传全部走后端内存中继（`POST /{workspace_id}/files/upload`，`crud.py:1364`），单文件上限即中继上限：`RELAY_MAX_BYTES` = 256 MiB（`blob_keys.py:39`；`MAX_UPLOAD_BYTES = RELAY_MAX_BYTES`，`_shared.py:202`；生效值为 `min(RELAY_MAX_BYTES, scan_cap)`，见 `uploads.py:183`、`crud.py:1417-1419`），超过直接返回 `413`（见第 6 节）。**只有 A1 转写的沙箱分片上传**不依赖本变量——它由沙箱直接 `PUT` 到公网存储地址（`sign_transcription_upload_part` 以 `for_browser=True` 签名，`src/dalton/services/transcriptions.py:1412-1474`，不检查传输模式与 `browser_uploads_enabled`），只需 `STORAGE_BROWSER_ENDPOINT_URL`；但录音需先放进工作区，单个录音文件因此也受中继上限约束（常见 2 小时 mp3 约 115 MB，在 256 MiB 上限内；超大的无损 WAV 需先转码或压缩） |
+| `STORAGE_BLOB_TRANSFER` | **`auto`**（`__init__.py:78`） | **生产：不设置（保持默认 `auto`）** | 工作区直传拉取的路径开关：`direct` 要求 Docker 沙箱接入 Compose 网络（见第 1 节），是**非生产方案**，生产不设置或保持默认——`auto` 仅对远程沙箱（Daytona/E2B）启用 `direct`，对 Docker 沙箱回退为 `relay`（`__init__.py:90-106`）。生产不开 `direct` 时，文件面板 / 工作区上传全部走后端内存中继（`POST /{workspace_id}/files/upload`，`crud.py:1364`），单文件上限即中继上限：`RELAY_MAX_BYTES` = 256 MiB（`blob_keys.py:39`；`MAX_UPLOAD_BYTES = RELAY_MAX_BYTES`，`_shared.py:202`；生效值为 `min(RELAY_MAX_BYTES, scan_cap)`，见 `uploads.py:183`、`crud.py:1417-1419`），超过直接返回 `413`（见第 6 节）。**只有 A1 转写的沙箱分片上传**不依赖本变量也不依赖全局存储——它使用独立的 `DALTON_ASR_STORAGE_*` 存储（第 0 节），由沙箱直接 `PUT` 到 `DALTON_ASR_STORAGE_SIGNING_ENDPOINT_URL`（不检查传输模式与 `browser_uploads_enabled`）；但录音需先放进工作区，单个录音文件因此也受中继上限约束（常见 2 小时 mp3 约 115 MB，在 256 MiB 上限内；超大的无损 WAV 需先转码或压缩） |
 | `STORAGE_BROWSER_UPLOADS` | **`false`**（`__init__.py:85-87`） | **生产：不设置（默认 `false`）**；仅与非生产的 `direct` 方案一起设为 `true` | 浏览器分片直传的开关，但**单独设 `true` 并不能开启直传**：`direct_available()`（`uploads.py:108-118`）还要求传输模式已解析为 `direct`（即 `scan_cap_bytes` 返回 `None`，`transfer.py:224-238`）且沙箱非 SSH——`relay` 模式下浏览器分片直传不可用（`browser_uploads_enabled` 仅在这一处被检查，`uploads.py:115`），上传一律走后端中继单请求路径。生产（`auto` → Docker 回退 `relay`）不设置本变量；A1 转写的沙箱分片上传同样不依赖它 |
 | `STORAGE_KEY_PREFIX` | 空字符串 `""` | `dalton/`（或保持空） | 对象键全局前缀；**一旦上线切勿修改**（见第 4 节） |
 | `DALTON_CORS_ALLOWED_ORIGINS` | 无（必填） | `https://dalton.example.com` | 逗号分隔的允许浏览器源（禁止 `*`）；在 `docker-compose.dalton.yml` 中注入为 `MINIO_API_CORS_ALLOW_ORIGIN` |
@@ -67,7 +94,7 @@
 | `MINIO_API_STALE_UPLOADS_CLEANUP_INTERVAL` | `6h` | `6h` | MinIO 扫描并清理未完成分片上传的周期 |
 | `STORAGE_PUBLIC_URL_BASE` | 无 | **留空 / 不设置** | 桶为私有，所有拉取均走短期预签名 URL |
 | `STORAGE_MAX_UPLOAD_SIZE` | `10485760`（代码默认 10 MiB，`.env.example` 30 MiB） | **保持现有值不改** | 仅控制后端内存中转接口与聊天附件上限；工作区直传有独立的 2 GiB 上限（`MAX_DIRECT_UPLOAD_BYTES`），**切勿调大 `STORAGE_MAX_UPLOAD_SIZE`** |
-| `DALTON_TRANSCRIPTION_ENABLED` | 未设置（**默认关闭**） | `1`（仅 `1`/`true`/`yes`/`on`，大小写不敏感，算开启） | 录音转写总开关（A1）：关闭时 `prepare_transcription` 工具不注册、`dalton-transcript-polish` 技能隐藏、`/api/v1/dalton/transcriptions*` 返回 404、对账循环不跑；**必须先配好本清单的 MinIO 存储与火山 ASR / TOS 凭据、并用真实凭据端到端验证后再开启**（开启还要求 `is_storage_enabled()` 为真，见 `src/dalton/services/transcriptions.py` 的 `is_transcription_enabled`）；开启前还需在**桥所用的 Python**（launchd 里配置的那个，通常为 `/opt/homebrew/bin/python3`）安装 `boto3`——桥现在没有 boto3 也能启动，但转写任务会以不可重试的 `asr_boto3_missing` 失败 |
+| `DALTON_TRANSCRIPTION_ENABLED` | 未设置（**默认关闭**） | `1`（仅 `1`/`true`/`yes`/`on`，大小写不敏感，算开启） | 录音转写总开关（A1）：关闭时 `prepare_transcription` 工具不注册、`dalton-transcript-polish` 技能隐藏、`/api/v1/dalton/transcriptions*` 返回 404、对账循环不跑；**必须先配好第 0 节的转写独立存储（`DALTON_ASR_STORAGE_*`）与火山 ASR / TOS 凭据、并用真实凭据端到端验证后再开启**（开启还要求 `is_transcription_storage_configured()` 为真，见 `src/dalton/transcription_storage.py`；与全局 `STORAGE_*` 是否配置无关）；开启前还需在**桥所用的 Python**（launchd 里配置的那个，通常为 `/opt/homebrew/bin/python3`）安装 `boto3`——桥现在没有 boto3 也能启动，但转写任务会以不可重试的 `asr_boto3_missing` 失败 |
 | `DALTON_TRANSCRIPTION_RECONCILE_ENABLED` | `1`（默认开启） | `1` | 5 分钟后台对账循环的独立关闭开关；受 `DALTON_TRANSCRIPTION_ENABLED` 总开关约束 |
 
 ---

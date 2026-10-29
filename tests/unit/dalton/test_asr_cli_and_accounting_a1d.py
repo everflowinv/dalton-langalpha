@@ -1424,7 +1424,7 @@ async def test_usage_accounting_colleague_workspace_failed_and_retried_attempts_
 
 
 class FakeMultipartStorage:
-    """In-memory fake S3 multipart storage backing `s3_compatible` helpers."""
+    """In-memory fake S3 multipart storage backing `transcription_storage` helpers."""
 
     def __init__(self, *, enabled: bool = True) -> None:
         self.enabled = enabled
@@ -1463,7 +1463,6 @@ class FakeMultipartStorage:
         part_number: int,
         size: int,
         expires_in: int = 900,
-        for_browser: bool = False,
     ) -> str | None:
         if not self.enabled or (key, upload_id) not in self.uploads:
             return None
@@ -1532,24 +1531,26 @@ def _wire_fake_multipart_storage(
     monkeypatch: pytest.MonkeyPatch,
     storage: FakeMultipartStorage,
 ) -> None:
-    from src.utils import storage as storage_mod
-    from src.utils.storage import s3_compatible as s3_mod
+    from src.dalton import transcription_storage as store_mod
 
     monkeypatch.setattr(
         svc_transcriptions,
-        "is_storage_enabled",
-        create_autospec(storage_mod.is_storage_enabled, side_effect=storage.is_enabled),
+        "is_transcription_storage_configured",
+        create_autospec(
+            store_mod.is_transcription_storage_configured,
+            side_effect=storage.is_enabled,
+        ),
     )
     monkeypatch.setattr(
         svc_transcriptions,
         "open_multipart_upload",
         create_autospec(
-            s3_mod.open_multipart_upload,
+            store_mod.open_multipart_upload,
             side_effect=storage.open_multipart_upload,
         ),
     )
     storage.sign_upload_part_mock = create_autospec(
-        s3_mod.sign_upload_part,
+        store_mod.sign_upload_part,
         side_effect=storage.sign_upload_part,
     )
     monkeypatch.setattr(
@@ -1561,7 +1562,7 @@ def _wire_fake_multipart_storage(
         svc_transcriptions,
         "list_uploaded_parts",
         create_autospec(
-            s3_mod.list_uploaded_parts,
+            store_mod.list_uploaded_parts,
             side_effect=storage.list_uploaded_parts,
         ),
     )
@@ -1569,7 +1570,7 @@ def _wire_fake_multipart_storage(
         svc_transcriptions,
         "complete_multipart_upload",
         create_autospec(
-            s3_mod.complete_multipart_upload,
+            store_mod.complete_multipart_upload,
             side_effect=storage.complete_multipart_upload,
         ),
     )
@@ -1577,19 +1578,19 @@ def _wire_fake_multipart_storage(
         svc_transcriptions,
         "abort_multipart_upload",
         create_autospec(
-            s3_mod.abort_multipart_upload,
+            store_mod.abort_multipart_upload,
             side_effect=storage.abort_multipart_upload,
         ),
     )
     monkeypatch.setattr(
         svc_transcriptions,
         "object_size",
-        create_autospec(s3_mod.object_size, side_effect=storage.object_size),
+        create_autospec(store_mod.object_size, side_effect=storage.object_size),
     )
     monkeypatch.setattr(
         svc_transcriptions,
         "delete_object",
-        create_autospec(s3_mod.delete_object, side_effect=storage.delete_object),
+        create_autospec(store_mod.delete_object, side_effect=storage.delete_object),
     )
 
 
@@ -1747,12 +1748,12 @@ async def test_fix1_upload_endpoints_ticket_and_status_and_smuggled_key_and_size
             900,
         )
         # The URL is consumed by the sandbox (`dalton_asr.py`), which never joins
-        # the backend Compose network, so it must be signed for the public
-        # browser endpoint, not the internal one.
+        # the backend Compose network, so it is signed for the sandbox-reachable
+        # signing endpoint inside the transcription store module; the caller no
+        # longer picks an endpoint (no `for_browser` kwarg exists to pass).
         assert storage.sign_upload_part_mock.call_args_list, "part signing was never invoked"
         assert (
-            storage.sign_upload_part_mock.call_args_list[-1].kwargs["for_browser"]
-            is True
+            "for_browser" not in storage.sign_upload_part_mock.call_args_list[-1].kwargs
         )
 
         # 7. Upload wrong size bytes and try to complete -> aborts multipart upload and returns 400
@@ -3182,12 +3183,12 @@ async def test_fix3_item2_start_conflict_unverifiable_foreign_upload_returns_503
     winner_upload_id = storage.open_multipart_upload(bound_key)
     assert winner_upload_id == "mp-001"
 
-    from src.utils.storage import s3_compatible as s3_mod
+    from src.dalton import transcription_storage as store_mod
 
     monkeypatch.setattr(
         svc_transcriptions,
         "list_uploaded_parts",
-        create_autospec(s3_mod.list_uploaded_parts, return_value=None),
+        create_autospec(store_mod.list_uploaded_parts, return_value=None),
     )
 
     orig_update = ledger.update_versioned

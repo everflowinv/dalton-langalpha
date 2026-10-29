@@ -4,7 +4,9 @@ Default-off contract: with the switch off the `prepare_transcription` tool is
 not registered for either role, the `dalton-transcript-polish` skill is hidden,
 background reconciliation refuses to run, and `/api/v1/dalton/transcriptions*`
 answers 404 as if the feature did not exist. The tool additionally requires
-object storage; the skill's `hidden` flag looks at the env switch only.
+the transcription store (`DALTON_ASR_STORAGE_*`); the global `STORAGE_*` store
+stays out of the decision, and the skill's `hidden` flag looks at the env
+switch only.
 """
 
 from __future__ import annotations
@@ -29,8 +31,11 @@ _ROLES = ("analyst", "chief_of_staff")
 def _set_storage(monkeypatch: pytest.MonkeyPatch, enabled: bool) -> None:
     monkeypatch.setattr(
         svc_transcriptions,
-        "is_storage_enabled",
-        create_autospec(svc_transcriptions.is_storage_enabled, return_value=enabled),
+        "is_transcription_storage_configured",
+        create_autospec(
+            svc_transcriptions.is_transcription_storage_configured,
+            return_value=enabled,
+        ),
     )
 
 
@@ -74,6 +79,45 @@ def test_switch_on_without_storage_disables_transcription(
 ) -> None:
     monkeypatch.setenv("DALTON_TRANSCRIPTION_ENABLED", "1")
     _set_storage(monkeypatch, False)
+    assert svc_transcriptions.is_transcription_enabled() is False
+
+
+def test_switch_on_with_transcription_storage_configured_but_global_storage_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The gate is the transcription store alone: `DALTON_ASR_STORAGE_*` set and
+    every global `STORAGE_*` var absent still enables transcription."""
+    monkeypatch.setenv("DALTON_TRANSCRIPTION_ENABLED", "1")
+    for var in (
+        "STORAGE_BUCKET_NAME",
+        "STORAGE_ENDPOINT_URL",
+        "STORAGE_ACCESS_KEY_ID",
+        "STORAGE_SECRET_ACCESS_KEY",
+        "S3_BUCKET_NAME",
+        "S3_ENDPOINT_URL",
+    ):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("DALTON_ASR_STORAGE_ENDPOINT_URL", "http://host.docker.internal:9000")
+    monkeypatch.setenv("DALTON_ASR_STORAGE_BUCKET_NAME", "asr-bucket")
+    monkeypatch.setenv("DALTON_ASR_STORAGE_ACCESS_KEY_ID", "ak")
+    monkeypatch.setenv("DALTON_ASR_STORAGE_SECRET_ACCESS_KEY", "sk")
+    assert svc_transcriptions.is_transcription_enabled() is True
+
+
+def test_switch_on_with_transcription_storage_unconfigured_disables(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No stand-in here: with the `DALTON_ASR_STORAGE_*` vars absent the real
+    `is_transcription_storage_configured()` must keep the switch off."""
+    monkeypatch.setenv("DALTON_TRANSCRIPTION_ENABLED", "1")
+    for var in (
+        "DALTON_ASR_STORAGE_ENDPOINT_URL",
+        "DALTON_ASR_STORAGE_SIGNING_ENDPOINT_URL",
+        "DALTON_ASR_STORAGE_BUCKET_NAME",
+        "DALTON_ASR_STORAGE_ACCESS_KEY_ID",
+        "DALTON_ASR_STORAGE_SECRET_ACCESS_KEY",
+    ):
+        monkeypatch.delenv(var, raising=False)
     assert svc_transcriptions.is_transcription_enabled() is False
 
 

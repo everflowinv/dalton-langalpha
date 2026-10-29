@@ -492,8 +492,10 @@ def _enable_transcription_tool(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("DALTON_TRANSCRIPTION_ENABLED", "1")
     monkeypatch.setattr(
         svc_transcriptions,
-        "is_storage_enabled",
-        create_autospec(svc_transcriptions.is_storage_enabled, return_value=True),
+        "is_transcription_storage_configured",
+        create_autospec(
+            svc_transcriptions.is_transcription_storage_configured, return_value=True
+        ),
     )
 
 
