@@ -487,6 +487,9 @@ export type MessageProvenance =
        *  absent when unknown (a report from before the list, or one the
        *  server could not read it for), which cannot say. */
       steerIds?: string[];
+      // DALTON-HOOK(handoff-report-quiescence): the wait cap's honest report —
+      // run ended, background work still open (named; empty when unlistable).
+      unfinished?: string[];
       // DALTON-HOOK(handoff-keep-on-resumable): interim resumable failure report
       resumable?: boolean;
     }

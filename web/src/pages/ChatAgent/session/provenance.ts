@@ -42,6 +42,9 @@ export function reportRowProvenance(source?: ReportSource): MessageProvenance | 
         // Kept when empty: a report that lists none says it answers no
         // steered hand-off, which one whose steers are unknown cannot.
         ...(source.steer_ids ? { steerIds: source.steer_ids } : {}),
+        // DALTON-HOOK(handoff-report-quiescence): kept when empty — an empty
+        // listing still says the work is unfinished, only unnamed.
+        ...(source.unfinished !== undefined ? { unfinished: source.unfinished } : {}),
         // DALTON-HOOK(handoff-keep-on-resumable): carry interim resumable flag
         ...(source.resumable ? { resumable: true } : {}),
       };

@@ -19,7 +19,9 @@ export function HandoffGroup({ views }: { views: readonly HandoffView[] }) {
   const { t } = useTranslation();
   const [open, setOpen] = useState(true);
   const [drawn, setDrawn] = useState<ReadonlySet<string>>(() => new Set(views.map((v) => v.id)));
-  const { lead, parts } = handoffTally(views.map((v) => v.phase), t);
+  // DALTON-HOOK(handoff-report-quiescence): the rows whole — a report that
+  // says work is still open counts apart from the finished.
+  const { lead, parts } = handoffTally(views, t);
 
   return (
     // Narrow, the tally is cut before the header outgrows the reply. Names its

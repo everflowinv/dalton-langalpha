@@ -142,6 +142,21 @@ describe('ReportRow: an analyst\'s', () => {
     said('The analyst reported back');
   });
 
+  // DALTON-HOOK(handoff-report-quiescence): the wait cap's report is worded
+  // as unfinished work with its listing, never as a completed deliverable.
+  it('reads a wait-cap report as unfinished work, listing what is still open', () => {
+    renderReportRow({ outcome: 'completed', unfinished: ['Task-3', 'command c-9'] });
+    said('Semis analyst reported back, background work unfinished');
+    expect(screen.getByTitle('Task-3、command c-9')).toHaveTextContent('Task-3、command c-9');
+  });
+
+  it('words an unfinished report with no listing honestly too', () => {
+    renderReportRow({ outcome: 'completed', unfinished: [] });
+    said('Semis analyst reported back, background work unfinished');
+    // An empty listing draws no detail line.
+    expect(screen.queryByText(/、/)).toBeNull();
+  });
+
   it('leads with the inbox a report arrives in, and keeps the alert for a run that did not finish', () => {
     const { container } = renderReportRow({ outcome: 'completed' });
     expect(container.querySelector('.lucide-inbox')).not.toBeNull();

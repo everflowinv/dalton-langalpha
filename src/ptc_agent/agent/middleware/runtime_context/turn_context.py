@@ -48,3 +48,8 @@ class TurnContext:
     # ``timezone``, else the request locale's default, since a tool needs a
     # clock even when nothing named one.
     tool_timezone: str = "UTC"
+    # DALTON-HOOK(turn-row-model-line): the model the server resolved this
+    # turn onto (an automation's designated llm_model, a client-named model,
+    # or the account default). Stated in the anchor row so "which model is
+    # this run on" is a fact the agent reads, never one it is asked to prove.
+    model_key: str | None = None

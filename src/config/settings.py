@@ -63,6 +63,13 @@ def get_workflow_timeout() -> int:
     return get_infrastructure_config().workflow_timeout
 
 
+# DALTON-HOOK(handoff-report-quiescence): cap on how long a completed
+# hand-off report waits for the analyst thread's background work.
+def get_report_back_quiescence_cap() -> int:
+    """Seconds a hand-off report may wait before reporting work unfinished."""
+    return get_infrastructure_config().report_back_quiescence_cap
+
+
 def get_workflow_orchestration_config() -> WorkflowOrchestrationConfig:
     """Caps and timeouts for RunWorkflow programmatic subagent runs."""
     return get_infrastructure_config().workflow

@@ -87,6 +87,7 @@ from .request_prep import (
     turn_skill_names,
     turn_surface,
     user_skill_commands,
+    with_resolved_model,  # DALTON-HOOK(turn-row-model-line)
 )
 from src.server.contracts.turn_kinds import announced
 from src.server.services import automation_delivery
@@ -407,6 +408,10 @@ async def astream_ptc_workflow(
         feedback_action = None
         query_content = user_input
         effective_model = config.llm.name if config and config.llm else None
+        # DALTON-HOOK(turn-row-model-line): the anchor row states the model
+        # the server resolved for this turn (the automation's llm_model, a
+        # client-named model, or the account default) as a settled fact.
+        turn_context = with_resolved_model(turn_context, effective_model)
         # Off the resolved credential, not off ``is_byok``: that flag answers
         # which ladder to try, and an automation with only an OAuth token
         # passes it false while still paying its own vendor bill.

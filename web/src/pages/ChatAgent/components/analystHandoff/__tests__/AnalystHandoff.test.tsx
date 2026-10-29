@@ -274,6 +274,17 @@ describe('A hand-off: a handed-off run', () => {
     expect(announced()).toBeEmptyDOMElement();
   });
 
+  // DALTON-HOOK(handoff-report-quiescence): a report the wait cap sent says
+  // background work is still open — the card must not read as finished work.
+  it('words a reported run with work still open as unfinished, never finished', async () => {
+    mockLiveness.mockResolvedValue([{ thread_id: 'thread-123', status: 'completed', run_id: null, can_reconnect: false }]);
+    renderApproved({ ...APPROVED, tool_call_id: 'call-1' }, { place: { reportId: 'msg-report', outcome: 'completed', unfinished: true } });
+
+    await waitFor(() => describedAs('chat.ptcCard.finishedUnfinished'));
+    // Not the plain finished words: the description names the swap key only.
+    expect(slip()).not.toHaveAccessibleDescription(/chat\.ptcCard\.finished(?!Unfinished)(?![A-Za-z])/);
+  });
+
   it('announces a change after its first read, once', async () => {
     mockLiveness.mockResolvedValue([{ thread_id: 'thread-123', status: 'running', run_id: 'run-1', can_reconnect: true }]);
     renderApproved();

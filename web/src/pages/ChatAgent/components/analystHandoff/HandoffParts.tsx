@@ -81,11 +81,18 @@ interface HandoffStatusProps {
  * always stays. Decorative to a screen reader, which hears
  * `HandoffAnnouncement`.
  */
-export function HandoffStatus({ phase, startedAt, finishedAt, glyph = true }: HandoffStatusProps & { glyph?: boolean }) {
+export function HandoffStatus({ phase, startedAt, finishedAt, glyph = true, unfinished }:
+HandoffStatusProps & { glyph?: boolean; unfinished?: boolean }) {
   const { t } = useTranslation();
   const look = HANDOFF_PHASES[phase];
-  const plain = t(look.labelKey);
-  const words = phaseWords(phase, startedAt, finishedAt, t);
+  // DALTON-HOOK(handoff-report-quiescence): a report that says background
+  // work is still open never words the run as finished work.
+  const plain = phase === 'finished' && unfinished
+    ? t('chat.ptcCard.finishedUnfinished')
+    : t(look.labelKey);
+  const words = phase === 'finished' && unfinished
+    ? plain
+    : phaseWords(phase, startedAt, finishedAt, t);
   return (
     <RunStatus
       aria-hidden
@@ -112,13 +119,18 @@ export function HandoffAnnouncement({
   finishedAt,
   read,
   live = true,
-}: { id?: string; read: boolean; live?: boolean } & HandoffStatusProps) {
+  unfinished,
+}: { id?: string; read: boolean; live?: boolean; unfinished?: boolean } & HandoffStatusProps) {
   const { t } = useTranslation();
+  // DALTON-HOOK(handoff-report-quiescence): same swap the visible status makes
+  const unfinishedNow = phase === 'finished' && unfinished;
   return (
     <StatusSpeech
       id={id}
-      words={phaseWords(phase, startedAt, finishedAt, t)}
-      label={t(HANDOFF_PHASES[phase].labelKey)}
+      words={unfinishedNow
+        ? t('chat.ptcCard.finishedUnfinished')
+        : phaseWords(phase, startedAt, finishedAt, t)}
+      label={unfinishedNow ? t('chat.ptcCard.finishedUnfinished') : t(HANDOFF_PHASES[phase].labelKey)}
       read={read}
       live={live}
     />

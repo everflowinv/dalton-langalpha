@@ -112,8 +112,11 @@ export function handoffPhase({
 
 /** Where a run stands in a group's column of glyphs, where an empty place
  *  would read as a gap: a finished run, which goes without one beside its
- *  words, takes `done`. */
-export function columnGlyph(phase: HandoffPhase): RunGlyphKind {
+ *  words, takes `done` — but one whose report says work is still open is
+ *  not done, so it keeps the ring its unfinished news wears elsewhere. */
+// DALTON-HOOK(handoff-report-quiescence)
+export function columnGlyph(phase: HandoffPhase, unfinished?: boolean): RunGlyphKind {
+  if (phase === 'finished' && unfinished) return 'ring';
   return HANDOFF_PHASES[phase].glyph ?? 'done';
 }
 
@@ -127,16 +130,37 @@ export function phaseWords(phase: HandoffPhase, startedAt: number | undefined, f
 }
 
 /** A group header's line: the glyph of the phase that still moves, if any
- *  does, and a count per tally in the table's order. */
-export function handoffTally(phases: readonly HandoffPhase[], t: TFn): { lead?: RunGlyphKind; parts: RunGroupPart[] } {
+ *  does, and a count per tally in the table's order. A finished run whose
+ *  report says work is still open is counted apart — reported back, not
+ *  finished — so the header never calls unfinished work completed.
+ */
+// DALTON-HOOK(handoff-report-quiescence)
+export function handoffTally(
+  rows: readonly { phase: HandoffPhase; unfinished?: boolean }[],
+  t: TFn,
+): { lead?: RunGlyphKind; parts: RunGroupPart[] } {
   let lead: RunGlyphKind | undefined;
   const tallies = new Map<string, { count: number; danger?: boolean; keep?: boolean }>();
+  const add = (key: string, count: number, look: { danger?: boolean; keep?: boolean }) => {
+    const prior = tallies.get(key);
+    tallies.set(key, { count: (prior?.count ?? 0) + count, danger: look.danger, keep: look.keep });
+  };
   for (const [phase, look] of Object.entries(HANDOFF_PHASES) as [HandoffPhase, PhaseLook][]) {
-    const count = phases.filter((p) => p === phase).length;
-    if (count === 0) continue;
+    const inPhase = rows.filter((r) => r.phase === phase);
+    if (inPhase.length === 0) continue;
     lead ??= look.lead;
-    const tally = tallies.get(look.tally);
-    tallies.set(look.tally, { count: (tally?.count ?? 0) + count, danger: look.danger, keep: look.keep });
+    if (phase === 'finished') {
+      // Split: unfinished reports tally on their own key, beside (and never
+      // inside) the finished count.
+      const unfinished = inPhase.filter((r) => r.unfinished).length;
+      const finished = inPhase.length - unfinished;
+      if (finished > 0) add(look.tally, finished, look);
+      if (unfinished > 0) add('chat.ptcCard.summaryUnfinished', unfinished, { keep: true });
+      continue;
+    }
+    // Phases may share a tally key (starting and working both read "working"),
+    // so counts accumulate rather than overwrite.
+    add(look.tally, inPhase.length, look);
   }
   return {
     lead,
@@ -186,6 +210,9 @@ export interface HandoffState {
   /** The report row that answers this run, once the run is over and the row
    *  is in the conversation. */
   reportId?: string;
+  // DALTON-HOOK(handoff-report-quiescence): its report says background work
+  // is still open — the finished phase then words itself as unfinished.
+  unfinished?: boolean;
   /** Whether a read has spoken: until then the phase is the default. */
   read: boolean;
 }
@@ -215,6 +242,8 @@ export function describeHandoff(proposal: ProposalData, place: HandoffPlace, run
     finishedAt: run.finishedAt,
     // A report is the answer to a run that ended, however it ended.
     reportId: HANDOFF_PHASES[phase].lead ? undefined : place.reportId,
+    // DALTON-HOOK(handoff-report-quiescence)
+    unfinished: place.reportId ? place.unfinished : undefined,
     read: run.read,
   };
 }

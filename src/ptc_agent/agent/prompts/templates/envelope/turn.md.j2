@@ -39,6 +39,15 @@
 {% set run_line = run | join(", ") %}
 {{ run_line[:1] | upper }}{{ run_line[1:] }}
 {% endif %}
+{# DALTON-HOOK(turn-row-model-line): the model the server DESIGNATED for
+   this turn, as a fact of the turn. Labeled because a bare model key is not
+   self-describing, and worded as the designated model — a call that
+   resilience actually moves to a fallback model says so to that call
+   itself (model_resilience.py), so the two lines never disagree. #}
+{% if model_key %}
+
+服务端为本回合指定的模型：{{ model_key }}（由服务端设定）。
+{% endif %}
 {% if disk_free_mb is defined and disk_free_mb is not none %}
 
 The computer's disk is nearly full: {{ disk_free_mb }} MB free, shared by every workspace on it. Avoid large downloads and package installs, write large outputs only when asked, and delete temporary files you create. If a write fails for lack of space, say so and suggest the user free space or upgrade the computer's spec.

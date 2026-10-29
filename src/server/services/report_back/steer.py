@@ -553,6 +553,18 @@ async def _analyst_offer(job: dict, thread_id: str) -> SteeredReport | None:
 
     if await outbox_db.has_live_hand_off(owed.ptc_thread_id, owed.dispatcher_thread_id):
         return None
+    # DALTON-HOOK(handoff-report-quiescence): a live turn must not take a
+    # premature "completed" in as a steer either — the executor's hold and
+    # this offer decide by the same quiescence probe, so whichever path the
+    # report ends up taking, it fires only when the work is actually done.
+    from src.server.services.report_back.handoff.executor import (
+        analyst_thread_quiescent,
+    )
+
+    if owed.final_status == "completed" and not await analyst_thread_quiescent(
+        owed.ptc_thread_id
+    ):
+        return None
     # DALTON-HOOK(handoff-keep-on-resumable): stamp awaiting_resume on the
     # handoff pair's ptc_origin before offering a resumable failure steer, or
     # revoke any prior awaiting_resume marker before offering a subsequent terminal report.

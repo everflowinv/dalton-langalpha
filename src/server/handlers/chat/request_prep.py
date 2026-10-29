@@ -13,7 +13,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
-from dataclasses import dataclass
+# DALTON-HOOK(turn-row-model-line): replace() stamps the resolved model
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from functools import partial
 from typing import TYPE_CHECKING, Any, NamedTuple, Optional
@@ -582,6 +583,22 @@ def build_turn_context(
         tool_timezone=zone
         or get_locale_config(request.locale or "en-US", "en").get("timezone", "UTC"),
     )
+
+
+# DALTON-HOOK(turn-row-model-line): stamp the server-resolved model onto the
+# turn context after resolve_llm_config has answered; nothing the client or
+# the user typed can reach the line.
+def with_resolved_model(
+    turn_context: TurnContext, effective_model: str | None
+) -> TurnContext:
+    """The turn context with the model the server resolved for this turn.
+
+    ``effective_model`` is ``config.llm.name`` off ``resolve_llm_config`` —
+    the automation's designated ``llm_model``, a client-named model, or the
+    account default — so the anchor row states what actually runs, which is
+    what the model-line exists to make a settled fact.
+    """
+    return replace(turn_context, model_key=effective_model)
 
 
 def is_notification_turn(request: ChatRequest) -> bool:

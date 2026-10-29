@@ -17,6 +17,7 @@ admission policy lives in our layer.
 
 import asyncio
 import logging
+import time  # DALTON-HOOK(tail-drain-outlives-workflows): wall clock for per-writer deadlines
 from datetime import datetime, timedelta
 from typing import Dict, Any, Literal, Optional, Callable, Coroutine
 from enum import Enum
@@ -119,6 +120,11 @@ class LocalRunExecutor:
     fresh ``run_id`` so concurrent turns on the same thread are isolated
     by construction.
     """
+
+    # DALTON-HOOK(tail-drain-outlives-workflows): slack past a workflow's
+    # own run_timeout before the tail drain may treat it as hung — its
+    # cancel/unwind path needs a bounded window of its own.
+    _WORKFLOW_SETTLE_MARGIN_S = 300.0
 
     _instance: Optional['LocalRunExecutor'] = None
 
@@ -1174,8 +1180,15 @@ class LocalRunExecutor:
             BackgroundRegistryStore,
         )
 
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + subagent_collection.SUBAGENT_TAIL_TIMEOUT
+        # DALTON-HOOK(tail-drain-outlives-workflows): the drain waits each
+        # writer out to ITS OWN clock, never a flat presumption. A deep
+        # workflow tail writer is governed by workflow.run_timeout (hours,
+        # from its own start) — the flat 1800s tail presumption discarded
+        # live sessions under healthy workflows in production ("the
+        # connection is closed" on the parent, GuardSessionLost on its
+        # children, 30 minutes in). Writers past their own deadline are hung
+        # and still fail toward discard, fencing intact.
+        drain_started = time.time()
         while True:
             bg_registry = await BackgroundRegistryStore.get_instance().get_registry(
                 thread_id
@@ -1187,18 +1200,109 @@ class LocalRunExecutor:
             )
             if not writers:
                 return
-            remaining = deadline - loop.time()
+            deadline, basis = await self._tail_drain_deadline(
+                thread_id, run_id, drain_started, writers
+            )
+            remaining = deadline - time.time()
             if remaining <= 0:
+                # DALTON-HOOK(tail-drain-outlives-workflows): the wording
+                # names the deadline basis the drain actually used.
                 raise TimeoutError(
                     f"tail drain deadline: {len(writers)} subagent writer(s) "
-                    f"still running for run={run_id} after "
-                    f"{subagent_collection.SUBAGENT_TAIL_TIMEOUT:.0f}s"
+                    f"still running for run={run_id}; waited past {basis}"
                 )
             logger.info(
                 f"[LocalRunExecutor] guard tail-drain awaiting "
-                f"{len(writers)} subagent writer(s) for run={run_id}"
+                f"{len(writers)} subagent writer(s) for run={run_id} "
+                f"({basis}, {remaining:.0f}s left)"
             )
             await asyncio.wait(writers, timeout=remaining)
+
+    # DALTON-HOOK(tail-drain-outlives-workflows): sizes the drain deadline
+    # per writer — a live root workflow's own run_timeout window, everyone
+    # else the flat tail allowance.
+    async def _tail_drain_deadline(
+        self, thread_id: str, run_id: str, drain_started: float, writers: list
+    ) -> tuple[float, str]:
+        """When the drain may give up on these writers, and why (for the
+        timeout's wording): each live ROOT workflow run gets its own
+        ``run_timeout`` window counted from its start plus a settle margin;
+        every other writer gets the flat ``SUBAGENT_TAIL_TIMEOUT`` tail
+        allowance counted from the drain's start. The drain waits to the
+        latest of the applicable deadlines — discarding any writer before
+        its own clock permits is the production failure this exists to
+        prevent. A workflow-rows read that fails degrades to the global
+        workflow timeout (hours): hold, never kill blind."""
+        from datetime import UTC
+
+        from src.config.settings import (
+            get_workflow_orchestration_config,
+            get_workflow_timeout,
+        )
+        from src.server.database.runs import subagent_runs as sr_db
+
+        flat_deadline = drain_started + subagent_collection.SUBAGENT_TAIL_TIMEOUT
+        flat_basis = (
+            f"the flat {subagent_collection.SUBAGENT_TAIL_TIMEOUT:.0f}s tail "
+            f"allowance"
+        )
+        try:
+            open_workflows = await sr_db.list_open_workflow_runs_for_thread(
+                thread_id
+            )
+        except Exception:
+            # Anchored at the DRAIN'S start, never recomputed: re-anchoring
+            # on each loop's failed read would postpone the deadline forever
+            # under a persistent failure, and the session would never
+            # fail-closed.
+            fallback = drain_started + float(get_workflow_timeout())
+            logger.warning(
+                f"[LocalRunExecutor] open-workflow read failed sizing the "
+                f"tail drain for run={run_id}; holding to the global "
+                f"workflow timeout from the drain's start",
+                exc_info=True,
+            )
+            return (
+                max(flat_deadline, fallback),
+                "the global workflow-timeout fallback from the drain's start "
+                "(open-workflow read failed)",
+            )
+        run_timeout = float(get_workflow_orchestration_config().run_timeout)
+        live_ids = {getattr(w, "task_id", None) for w in writers}
+        deadline = flat_deadline
+        basis_parts = [flat_basis]
+        for row in open_workflows:
+            # Roots only: a run the turn launched. A workflow's own children
+            # carry no parent run and answer to child_timeout like any other
+            # non-workflow writer, not to run_timeout.
+            if row.get("parent_run_id") is None:
+                continue
+            if row.get("task_id") not in live_ids:
+                continue
+            started = row.get("started_at")
+            if started is None:
+                continue
+            if started.tzinfo is None:
+                started = started.replace(tzinfo=UTC)
+            own = (
+                started.timestamp()
+                + run_timeout
+                + self._WORKFLOW_SETTLE_MARGIN_S
+            )
+            if own > deadline:
+                deadline = own
+            age = max(time.time() - started.timestamp(), 0.0)
+            state = (
+                "overdue"
+                if own <= time.time()
+                else f"{own - time.time():.0f}s left"
+            )
+            basis_parts.append(
+                f"workflow {row.get('task_id')} at its own run_timeout "
+                f"+{self._WORKFLOW_SETTLE_MARGIN_S:.0f}s settle "
+                f"(started {age:.0f}s ago, budget {run_timeout:.0f}s, {state})"
+            )
+        return deadline, "; ".join(basis_parts)
 
     async def _apply_post_terminal_effects(
         self,

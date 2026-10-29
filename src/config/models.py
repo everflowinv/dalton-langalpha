@@ -472,6 +472,17 @@ class InfrastructureConfig(BaseModel):
     # Application Settings
     debug: bool = Field(default=False, description="Debug mode flag")
     workflow_timeout: int = Field(default=21600, description="Workflow timeout in seconds")
+    # DALTON-HOOK(handoff-report-quiescence): how long a completed hand-off
+    # report may wait for the dispatched thread's background work to settle
+    # before it reports the work unfinished instead of completed.
+    report_back_quiescence_cap: int = Field(
+        default=86400,
+        ge=60,
+        description=(
+            "Seconds a hand-off report waits for the analyst thread's "
+            "background work before reporting it unfinished"
+        ),
+    )
     sse_keepalive_interval: float = Field(
         default=15.0, description="SSE keepalive interval in seconds"
     )

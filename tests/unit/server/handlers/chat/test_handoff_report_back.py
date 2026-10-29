@@ -15,7 +15,8 @@ import asyncio
 import uuid
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+# DALTON-HOOK(handoff-report-quiescence): create_autospec for the probe stub
+from unittest.mock import AsyncMock, MagicMock, create_autospec, patch
 
 import pytest
 
@@ -93,6 +94,14 @@ class _ExecHarness:
             patch(
                 "src.server.database.runs.outbox.has_live_hand_off",
                 AsyncMock(return_value=False),
+            ),
+            # DALTON-HOOK(handoff-report-quiescence): quiescent by default —
+            # these tests predate the hold and none models subagent work; a
+            # real probe would read Postgres and hang the executor.
+            patch.object(
+                executor,
+                "analyst_thread_quiescent",
+                create_autospec(executor.analyst_thread_quiescent, return_value=True),
             ),
             # The run admitted only the generation its report carries.
             patch(

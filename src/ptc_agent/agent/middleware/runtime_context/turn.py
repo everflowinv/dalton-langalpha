@@ -257,6 +257,10 @@ class TurnContextMiddleware(AgentMiddleware):
         disk_known: Whether a current reading stands behind ``disk_free_mb``
             being None, as opposed to no reading at all.
         is_subagent: Whether this stack belongs to a subagent.
+        model_key: The model the server resolved this turn onto, stated as a
+            fact of the turn. None (a subagent stack, a context-free build)
+            states no line.
+            # DALTON-HOOK(turn-row-model-line)
     """
 
     def __init__(
@@ -274,6 +278,7 @@ class TurnContextMiddleware(AgentMiddleware):
         disk_free_mb: int | None = None,
         disk_known: bool = False,
         is_subagent: bool = False,
+        model_key: str | None = None,
     ) -> None:
         super().__init__()
         self._now = now
@@ -288,6 +293,8 @@ class TurnContextMiddleware(AgentMiddleware):
         self._disk_free_mb = disk_free_mb
         self._disk_known = disk_known
         self._is_subagent = is_subagent
+        # DALTON-HOOK(turn-row-model-line): server-resolved model of this turn
+        self._model_key = model_key
         # Set once the turn-open hook has run on this instance; see
         # ``abefore_model``.
         self._opened = False
@@ -547,6 +554,9 @@ class TurnContextMiddleware(AgentMiddleware):
             "surface_rules": surface_rules,
             "disk_free_mb": self._disk_free_mb,
             "disk_recovered": disk_recovered,
+            # DALTON-HOOK(turn-row-model-line): stated once here, from the
+            # server's own resolution; nothing user-supplied reaches it.
+            "model_key": self._model_key,
         }
         return render_template("envelope/turn.md.j2", **fields)
 

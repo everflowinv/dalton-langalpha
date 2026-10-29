@@ -2261,7 +2261,8 @@
       "stopped": "已被停止",
       "taskFinished": "已完成",
       "taskFailed": "已失败",
-      "commandStoppedEarly": "已提前停止"
+      "commandStoppedEarly": "已提前停止",
+      "reportedBackUnfinished": "已回报，后台仍有未完成工作"
     },
     "taskCard": {
       "statusRunning": "运行中",
@@ -2375,11 +2376,13 @@
       "summaryWorking": "{{count}} 位工作中",
       "summaryNeedsAnswer_other": "{{count}} 位等待你回答",
       "summaryFinished": "{{count}} 位已完成",
+      "summaryUnfinished": "{{count}} 位已回报但后台未完成",
       "summaryCouldntFinish": "{{count}} 位未能完成",
       "summaryStopped": "{{count}} 位已停止",
       "summaryCouldntStart": "{{count}} 位未能启动",
       "alwaysApprove": "始终允许",
-      "alwaysApproveHint": "这次及以后交给分析师的任务都不再询问，可在设置中关闭。"
+      "alwaysApproveHint": "这次及以后交给分析师的任务都不再询问，可在设置中关闭。",
+      "finishedUnfinished": "已回报，后台仍有未完成工作"
     },
     "marketWatch": {
       "watching": "正在监控 {{symbols}}",
