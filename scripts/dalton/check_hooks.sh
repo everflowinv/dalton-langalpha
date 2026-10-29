@@ -181,6 +181,14 @@ ALLOWED_HOOKS=(
   # turn on its completion notification, never by sleep/poll loops
   # (subagent_coordination.md.j2).
   "subagent-no-sleep-poll"
+  # Backlog A1a: direct upload storage safety — write-access re-verification
+  # inside path_write_lock before final pull_direct, computer-scoped space
+  # reservation under advisory lock, and explicit 413 when direct_available()
+  # is false for files exceeding the relay cap.
+  "direct-upload-safety"
+  # Backlog A1d fix1: periodic 5-minute background reconciliation loop for
+  # non-terminal transcription jobs mounted in FastAPI lifespan (setup.py).
+  "transcriptions-reconcile"
   # Backlog 三-2 (2026-10-28): startup logs the effective in-process browser
   # concurrency (crawl value + which channel set it, PDF render cap) — a
   # named PDF_RENDER_CONCURRENCY constant, a source-resolving helper in

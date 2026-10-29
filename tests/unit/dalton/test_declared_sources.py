@@ -1203,7 +1203,7 @@ class TestToolsListResearchDescription:
 
 
 class TestDaltonSkillRegistrySingleSource:
-    def test_all_23_dalton_skills_match_skill_md_frontmatter(self) -> None:
+    def test_all_24_dalton_skills_match_skill_md_frontmatter(self) -> None:
         import yaml
 
         from ptc_agent.agent.middleware.skills.dalton_registry import (
@@ -1213,8 +1213,8 @@ class TestDaltonSkillRegistrySingleSource:
         )
         from ptc_agent.agent.middleware.skills.registry import SKILL_REGISTRY
 
-        assert len(_DALTON_SKILL_SPECS) == 23
-        assert len(DALTON_SKILL_DEFINITIONS) == 23
+        assert len(_DALTON_SKILL_SPECS) == 24  # + dalton-transcript-polish (A1d)
+        assert len(DALTON_SKILL_DEFINITIONS) == 24
 
         for name, skill_def in DALTON_SKILL_DEFINITIONS.items():
             skill_md = DALTON_SKILLS_DIR / name / "SKILL.md"

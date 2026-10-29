@@ -423,3 +423,191 @@ async def test_direct_needs_browser_uploads_and_a_sandbox_that_pulls(
         patch(f"{_UPLOADS}.scan_cap_bytes", lambda _sandbox, *, blobs_on: scan_cap),
     ):
         assert uploads.direct_available(_sandbox(provider)) is available
+
+
+# === DALTON-HOOK(direct-upload-safety): 2 GiB boundary, no-downgrade 413 message, and computer-level space reservation ===
+
+
+@pytest.mark.parametrize(
+    "scan_cap, size",
+    [
+        (None, MAX_UPLOAD_BYTES + 1),
+        (None, MAX_DIRECT_UPLOAD_BYTES),
+        (INLINE_MAX_BYTES, INLINE_MAX_BYTES + 1),
+    ],
+    ids=["above-relay-cap", "at-2gib-boundary", "above-inline-cap"],
+)
+async def test_large_file_when_direct_unavailable_returns_413_with_clear_chinese_reason(
+    scan_cap, size
+):
+    with _computer(direct=False, scan_cap=scan_cap) as m:
+        resp = await _begin(size)
+    assert resp.status_code == 413
+    detail = resp.json()["detail"]
+    assert uploads.DIRECT_UPLOAD_NOT_ENABLED in detail
+    assert "大文件需要对象存储直传，当前未启用" in detail
+    m.open.assert_not_called()
+    m.create.assert_not_awaited()
+
+
+async def test_create_upload_locks_computer_before_summing_and_prevents_two_uploaders_exceeding_room():
+    """Two uploaders on the same computer share the computer's disk reservation
+    budget under a computer-scoped advisory lock acquired before summing."""
+    import asyncio
+    from unittest.mock import create_autospec
+
+    import psycopg
+
+    from src.server.database import workspace_file_uploads as upload_db
+    from src.server.database.sql_fences import advisory_key
+
+    computer_id = "comp-shared-1"
+    expected_comp_lock = advisory_key("workspace_file_uploads:computer", computer_id)
+    tx_lock = asyncio.Lock()
+    committed_rows: list[dict] = []
+    query_orders_per_call: list[list[str]] = []
+    @asynccontextmanager
+    async def fake_db_connection():
+        conn = create_autospec(psycopg.AsyncConnection, instance=True)
+        cur = create_autospec(psycopg.AsyncCursor, instance=True)
+        steps: list[str] = []
+        last_result: dict | None = None
+        held_tx_lock = False
+
+        async def execute(sql: str, params: dict | tuple | None = None):
+            nonlocal last_result, held_tx_lock
+            normalized = " ".join(sql.split())
+            if "pg_advisory_xact_lock" in normalized:
+                key = params[0] if isinstance(params, tuple) else (params or {}).get("lock")
+                if key == expected_comp_lock:
+                    steps.append("computer_lock")
+                    if not held_tx_lock:
+                        await tx_lock.acquire()
+                        held_tx_lock = True
+                else:
+                    steps.append("user_lock")
+                last_result = {"pg_advisory_xact_lock": None}
+            elif "SELECT COALESCE(w.computer_id::text, w.workspace_id::text) AS computer_scope" in normalized:
+                # %(workspace_id)s must only appear in WHERE, never inside COALESCE with ::text
+                assert "COALESCE(computer_id::text, %(workspace_id)s)" not in normalized
+                steps.append("resolve_computer")
+                last_result = {"computer_scope": computer_id}
+            elif "SELECT count(*) AS n FROM workspace_file_uploads" in normalized:
+                steps.append("user_open_count")
+                uid = (params or {})["user_id"]
+                cnt = sum(1 for r in committed_rows if r["user_id"] == uid)
+                last_result = {"n": cnt}
+            elif "COALESCE(sum(u.size), 0) AS n" in normalized:
+                steps.append("computer_reserved_sum")
+                # Must not filter by user_id when summing computer reservations,
+                # and must sum against the post-lock %(computer_scope)s
+                assert "u.user_id" not in normalized
+                assert (params or {}).get("computer_scope") == computer_id
+                reserved = sum(
+                    r["size"]
+                    for r in committed_rows
+                    if r["computer_scope"] == computer_id
+                )
+                last_result = {"n": reserved}
+            elif "INSERT INTO workspace_file_uploads" in normalized:
+                steps.append("insert")
+                p = dict(params or {})
+                row = {
+                    **p,
+                    "computer_scope": computer_id,
+                    "state": "uploading",
+                    "error": None,
+                    "attempts": 0,
+                    "placing_inode": None,
+                    "lease_until": None,
+                    "expires_at": EXPIRES,
+                    "created_at": EXPIRES,
+                    "updated_at": EXPIRES,
+                }
+                committed_rows.append(row)
+                last_result = row
+            else:
+                last_result = {}
+
+        async def fetchone():
+            return last_result
+
+        cur.execute.side_effect = execute
+        cur.fetchone.side_effect = fetchone
+
+        @asynccontextmanager
+        async def cursor_cm(**_kwargs):
+            yield cur
+
+        @asynccontextmanager
+        async def transaction_cm():
+            try:
+                yield
+            finally:
+                query_orders_per_call.append(list(steps))
+                if held_tx_lock:
+                    tx_lock.release()
+
+        conn.cursor.side_effect = cursor_cm
+        conn.transaction.side_effect = transaction_cm
+        yield conn
+
+    query_orders_per_call = []
+    free_bytes = 200 * MiB
+    keep_free = 50 * MiB  # 150 MiB usable room on computer
+
+    with patch.object(upload_db, "get_db_connection", fake_db_connection):
+        results = await asyncio.gather(
+            upload_db.create_upload(
+                upload_id="00000000-0000-4000-8000-0000000000a1",
+                user_id="user-alice",
+                workspace_id="ws-alice",
+                path="audio/a.wav",
+                size=100 * MiB,
+                part_size=UPLOAD_PART_BYTES,
+                part_count=10,
+                sha256=None,
+                object_key="uploads/user-alice/a1",
+                store_upload_id="store-a1",
+                sandbox_id="sb-shared",
+                max_open=5,
+                free_bytes=free_bytes,
+                keep_free_bytes=keep_free,
+            ),
+            upload_db.create_upload(
+                upload_id="00000000-0000-4000-8000-0000000000b1",
+                user_id="user-bob",
+                workspace_id="ws-bob",
+                path="audio/b.wav",
+                size=100 * MiB,
+                part_size=UPLOAD_PART_BYTES,
+                part_count=10,
+                sha256=None,
+                object_key="uploads/user-bob/b1",
+                store_upload_id="store-b1",
+                sandbox_id="sb-shared",
+                max_open=5,
+                free_bytes=free_bytes,
+                keep_free_bytes=keep_free,
+            ),
+            return_exceptions=True,
+        )
+
+    successes = [r for r in results if isinstance(r, dict)]
+    failures = [r for r in results if isinstance(r, upload_db.NotEnoughRoom)]
+    assert len(successes) == 1
+    assert len(failures) == 1
+    assert failures[0].free_bytes == 100 * MiB
+    assert sum(r["size"] for r in committed_rows) == 100 * MiB
+
+    # Verify in every call that computer_lock was acquired strictly before computer_reserved_sum
+    # and that computer_scope was re-read under computer_lock before summing.
+    for steps in query_orders_per_call:
+        assert "computer_lock" in steps
+        assert "computer_reserved_sum" in steps
+        lock_idx = steps.index("computer_lock")
+        sum_idx = steps.index("computer_reserved_sum")
+        assert lock_idx < sum_idx
+        assert "resolve_computer" in steps[lock_idx + 1 : sum_idx]
+# === END DALTON-HOOK(direct-upload-safety) ===
+

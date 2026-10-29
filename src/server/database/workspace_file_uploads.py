@@ -118,28 +118,52 @@ async def create_upload(
             found = await cur.fetchone()
             if found is not None and found["n"] >= max_open:
                 raise TooManyOpenUploads(user_id)
+            # --- DALTON-HOOK(direct-upload-safety): begin ---
+            await cur.execute(
+                "SELECT COALESCE(w.computer_id::text, w.workspace_id::text) AS computer_scope"
+                " FROM workspaces w WHERE w.workspace_id = %(workspace_id)s",
+                params,
+            )
+            scope_row = await cur.fetchone()
+            computer_scope = str(
+                (scope_row or {}).get("computer_scope") or workspace_id
+            )
+            await cur.execute(
+                "SELECT pg_advisory_xact_lock(%s)",
+                (advisory_key("workspace_file_uploads:computer", computer_scope),),
+            )
+            await cur.execute(
+                "SELECT COALESCE(w.computer_id::text, w.workspace_id::text) AS computer_scope"
+                " FROM workspaces w WHERE w.workspace_id = %(workspace_id)s",
+                params,
+            )
+            locked_scope_row = await cur.fetchone()
+            locked_scope = str(
+                (locked_scope_row or {}).get("computer_scope") or computer_scope
+            )
+            if locked_scope != computer_scope:
+                computer_scope = locked_scope
+                await cur.execute(
+                    "SELECT pg_advisory_xact_lock(%s)",
+                    (advisory_key("workspace_file_uploads:computer", computer_scope),),
+                )
             if free_bytes is not None:
                 await cur.execute(
                     """
                     SELECT COALESCE(sum(u.size), 0) AS n
                     FROM workspace_file_uploads u
                     JOIN workspaces w ON w.workspace_id = u.workspace_id
-                    WHERE u.user_id = %(user_id)s AND u.cleaned_at IS NULL
+                    WHERE u.cleaned_at IS NULL
                       AND u.state = ANY(%(open_states)s)
-                      AND (
-                          u.workspace_id = %(workspace_id)s
-                          OR w.computer_id = (
-                              SELECT computer_id FROM workspaces
-                              WHERE workspace_id = %(workspace_id)s
-                          )
-                      )
+                      AND COALESCE(w.computer_id::text, w.workspace_id::text) = %(computer_scope)s
                     """,
-                    params,
+                    {**params, "computer_scope": computer_scope},
                 )
                 due = await cur.fetchone()
                 left = free_bytes - (int(due["n"]) if due else 0)
                 if left - keep_free_bytes < size:
                     raise NotEnoughRoom(left)
+            # --- DALTON-HOOK(direct-upload-safety): end ---
             await cur.execute(
                 f"""
                 INSERT INTO workspace_file_uploads (
@@ -325,7 +349,14 @@ async def mark_placing(upload_id: str, attempt: int, inode: int) -> bool:
 
 
 async def release_pull(
-    upload_id: str, attempt: int, *, retry_in: timedelta, refund: bool
+    upload_id: str,
+    attempt: int,
+    *,
+    retry_in: timedelta,
+    refund: bool,
+    # --- DALTON-HOOK(direct-upload-safety): begin ---
+    error: str | None = None,
+    # --- DALTON-HOOK(direct-upload-safety): end ---
 ) -> bool:
     """Give the pull back for a later try; ``refund`` when it was not this
     attempt's fault (a shutdown, or the workspace busy syncing)."""
@@ -334,6 +365,8 @@ async def release_pull(
         UPDATE workspace_file_uploads
         SET lease_until = NOW() + %(retry_in)s,
             attempts = attempts - CASE WHEN %(refund)s THEN 1 ELSE 0 END,
+            -- DALTON-HOOK(direct-upload-safety): record pending reason while deferred
+            error = %(error)s,
             updated_at = NOW()
         WHERE upload_id = %(upload_id)s AND state = 'pulling' AND attempts = %(attempt)s
         RETURNING upload_id
@@ -343,6 +376,9 @@ async def release_pull(
             "attempt": attempt,
             "retry_in": retry_in,
             "refund": refund,
+            # --- DALTON-HOOK(direct-upload-safety): begin ---
+            "error": error,
+            # --- DALTON-HOOK(direct-upload-safety): end ---
         },
     )
     return row is not None

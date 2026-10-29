@@ -220,6 +220,8 @@ def _log_effective_concurrency() -> None:
 # ============================================================================
 # DALTON-HOOK(data-map): hold strong reference to startup health-check task
 _dalton_health_startup_task: asyncio.Task | None = None
+# DALTON-HOOK(transcriptions-reconcile): hold strong reference to periodic ASR reconciliation task
+_dalton_transcription_reconcile_task: asyncio.Task | None = None
 
 
 @asynccontextmanager
@@ -232,7 +234,8 @@ async def lifespan(app: FastAPI):
         checkpointer, \
         store, \
         llm_service, \
-        _dalton_health_startup_task
+        _dalton_health_startup_task, \
+        _dalton_transcription_reconcile_task
 
     # Configure logging based on environment settings (first thing on startup)
     configure_logging()
@@ -789,6 +792,18 @@ async def lifespan(app: FastAPI):
             name="dalton-startup-data-source-health",
         )
 
+    # DALTON-HOOK(transcriptions-reconcile): start 5-minute background reconciliation loop when Dalton & ASR reconciliation are enabled
+    from src.dalton.services.transcriptions import (
+        is_transcription_reconciliation_enabled,
+        run_transcription_reconciliation_loop,
+    )
+
+    if is_transcription_reconciliation_enabled():
+        _dalton_transcription_reconcile_task = asyncio.create_task(
+            run_transcription_reconciliation_loop(),
+            name="dalton-transcription-reconcile",
+        )
+
     # A built-in remote server still down after boot's retry budget is retried
     # in the background, so this worker heals when it answers instead of
     # serving without its tools until a restart. Last, so nothing above can
@@ -823,6 +838,11 @@ async def lifespan(app: FastAPI):
         _dalton_health_startup_task.cancel()
         await asyncio.gather(_dalton_health_startup_task, return_exceptions=True)
         _dalton_health_startup_task = None
+    # DALTON-HOOK(transcriptions-reconcile): cancel periodic ASR reconciliation task on shutdown
+    if _dalton_transcription_reconcile_task is not None:
+        _dalton_transcription_reconcile_task.cancel()
+        await asyncio.gather(_dalton_transcription_reconcile_task, return_exceptions=True)
+        _dalton_transcription_reconcile_task = None
     # Awaited, so a warm-up stopped midway releases its lock while Redis is
     # still open; a lock left to expire skips the warm-up of a quick restart.
     # The refreshes go after it, since the warm-up can start them.

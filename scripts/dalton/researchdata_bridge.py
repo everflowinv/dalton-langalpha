@@ -52,6 +52,8 @@ _SCRIPT_DIR = Path(__file__).resolve().parent
 if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
 
+import asr_jobs  # noqa: E402
+import seed_asr_client  # noqa: E402
 import log_redaction as _log_redaction  # noqa: E402
 import source_identity  # noqa: E402
 
@@ -277,6 +279,7 @@ def sanitize_stderr_text(raw: str | bytes | None, *, max_len: int = 500) -> str:
         return ""
     for pat, repl in _STDERR_SECRET_PATTERNS:
         text = pat.sub(repl, text)
+    text = seed_asr_client.redact_asr_secrets(text)
     if len(text) > max_len:
         text = text[-max_len:]
     return text.strip()
@@ -1249,6 +1252,26 @@ class BridgeConfig:
         self.wiki_ingest_temp_dir: Path = Path(
             os.environ.get("DALTON_WIKI_INGEST_TEMP_DIR", str(default_wiki_tmp))
         ).expanduser()
+        default_asr_jobs = _SCRIPT_DIR.parents[1] / "var" / "dalton" / "asr_jobs"
+        self.asr_jobs_dir: Path = Path(
+            os.environ.get("DALTON_ASR_JOBS_DIR", str(default_asr_jobs))
+        ).expanduser()
+        try:
+            self.asr_fake_delay_s: float = max(
+                0.0,
+                float(os.environ.get("DALTON_ASR_FAKE_DELAY_S", "0.02") or 0.02),
+            )
+        except ValueError:
+            self.asr_fake_delay_s = 0.02
+        self.asr_fake_text: str | None = (
+            os.environ.get("DALTON_ASR_FAKE_TEXT") or None
+        )
+        self.asr_fake_fail_category: str | None = (
+            os.environ.get("DALTON_ASR_FAKE_FAIL_CATEGORY", "").strip() or None
+        )
+        self.asr_worker_mode: str = (
+            os.environ.get("DALTON_ASR_WORKER_MODE", "auto").strip().lower() or "auto"
+        )
         try:
             self.wiki_ingest_timeout_s: float = max(
                 5.0,
@@ -5917,10 +5940,12 @@ class ResearchDataBridge:
         self, requests: list[dict[str, Any]], timeout_s: float
     ) -> list[dict[str, Any]]:
         """Spawn a single `researchdata_mcp.py` subprocess, send JSON-RPC lines, and read responses."""
+        subproc_env = seed_asr_client.strip_asr_credentials_from_env(os.environ)
         proc = await asyncio.create_subprocess_exec(
             self.cfg.python_bin,
             str(self.cfg.mcp_script),
             cwd=str(self.cfg.ocw_root),
+            env=subproc_env,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -7415,10 +7440,12 @@ class ResearchDataBridge:
         }
 
     def _build_community_subprocess_env(self) -> dict[str, str]:
-        """Build subprocess environment with CLAUDECODE/CLAUDE_CODE_* stripped and optional proxy applied."""
+        """Build subprocess environment with CLAUDECODE/CLAUDE_CODE_* and ASR/TOS credentials stripped and optional proxy applied."""
         env: dict[str, str] = {
             k: v
-            for k, v in os.environ.items()
+            for k, v in seed_asr_client.strip_asr_credentials_from_env(
+                os.environ
+            ).items()
             if k != "CLAUDECODE" and not k.startswith("CLAUDE_CODE_")
         }
         env["PYTHONDONTWRITEBYTECODE"] = "1"
@@ -7513,9 +7540,13 @@ class ResearchDataBridge:
             }
         else:
             try:
+                subproc_env = seed_asr_client.strip_asr_credentials_from_env(
+                    os.environ
+                )
                 proc = await asyncio.create_subprocess_exec(
                     str(bin_path),
                     "--version",
+                    env=subproc_env,
                     stdin=asyncio.subprocess.DEVNULL,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
@@ -9958,12 +9989,14 @@ class ResearchDataBridge:
         )
 
         cmd = [py_bin, "-B", "-W", "ignore", "-c", driver_code]
-        subproc_env = {
-            **os.environ,
-            **env_file_vars,
-            "GEMINI_API_KEY": gemini_api_key,
-            "PYTHONDONTWRITEBYTECODE": "1",
-        }
+        subproc_env = seed_asr_client.strip_asr_credentials_from_env(
+            {
+                **os.environ,
+                **env_file_vars,
+                "GEMINI_API_KEY": gemini_api_key,
+                "PYTHONDONTWRITEBYTECODE": "1",
+            }
+        )
 
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -10644,14 +10677,18 @@ class ResearchDataBridge:
             py_bin = self._resolve_archive_python_bin()
             script_path = self.cfg.conversation_archive_py
             repo_root = script_path.parents[2] if len(script_path.parents) >= 3 else _SCRIPT_DIR.parent
-            env_vars = {
-                **os.environ,
-                **_read_env_file_dict(self.cfg.env_path),
-                "PYTHONDONTWRITEBYTECODE": "1",
-            }
+            env_vars = seed_asr_client.strip_asr_credentials_from_env(
+                {
+                    **os.environ,
+                    **_read_env_file_dict(self.cfg.env_path),
+                    "PYTHONDONTWRITEBYTECODE": "1",
+                }
+            )
             repo_env = repo_root / ".env"
             if repo_env.is_file():
-                for k, v in _read_env_file_dict(repo_env).items():
+                for k, v in seed_asr_client.strip_asr_credentials_from_env(
+                    _read_env_file_dict(repo_env)
+                ).items():
                     env_vars.setdefault(k, v)
             env_vars["DALTON_BRIDGE_EMBED_URL"] = "http://127.0.0.1:8960/embed"
             env_vars["no_proxy"] = (
@@ -10778,8 +10815,10 @@ class ResearchDataBridge:
         """Return ``'on'`` if ``launchctl print gui/<uid>/<label>`` succeeds, ``'off'`` on non-zero exit, else ``'unknown'``."""
         try:
             uid = os.getuid()
+            subproc_env = seed_asr_client.strip_asr_credentials_from_env(os.environ)
             res = subprocess.run(
                 ["launchctl", "print", f"gui/{uid}/{label}"],
+                env=subproc_env,
                 capture_output=True,
                 text=True,
                 timeout=2.0,
@@ -13028,6 +13067,100 @@ class ResearchDataBridge:
     _SALES_NOTES_KINDS = frozenset({"研报", "点评", "卖方电话会", "销售观点"})
     _SALES_NOTES_AUDIT_REL = "var/dalton/sales_notes_ingest_audit.jsonl"
 
+    @staticmethod
+    def _parse_sales_notes_cli_json(cli_text: str) -> dict[str, Any]:
+        """Parse the JSON object emitted by `market-digest/run.sh --json add-note` (single-line or pretty-printed)."""
+        text = (cli_text or "").strip()
+        if not text:
+            return {}
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, dict):
+                return parsed
+        except ValueError:
+            pass
+        for line in reversed(text.splitlines()):
+            line_s = line.strip()
+            if line_s.startswith("{"):
+                try:
+                    parsed = json.loads(line_s)
+                    if isinstance(parsed, dict):
+                        return parsed
+                except ValueError:
+                    continue
+        decoder = json.JSONDecoder()
+        search_end = len(text)
+        while True:
+            pos = text.rfind("{", 0, search_end)
+            if pos < 0:
+                break
+            try:
+                parsed, _ = decoder.raw_decode(text, pos)
+                if isinstance(parsed, dict):
+                    return parsed
+            except ValueError:
+                pass
+            search_end = pos
+        return {}
+
+    @staticmethod
+    def _extract_sales_note_id_fields(cli_payload: dict[str, Any]) -> tuple[str, str]:
+        """Extract `(doc_key, document_id)` from a `market-digest add-note` CLI payload."""
+        if not isinstance(cli_payload, dict):
+            return "", ""
+        candidates: list[dict[str, Any]] = [cli_payload]
+        for sub_key in ("note", "result", "data", "document"):
+            sub = cli_payload.get(sub_key)
+            if isinstance(sub, dict):
+                candidates.append(sub)
+
+        def _clean(val: Any) -> str:
+            if val is None or isinstance(val, bool):
+                return ""
+            return str(val).strip()
+
+        raw_doc_key = ""
+        for cand in candidates:
+            for k in ("doc_key", "note_id", "id", "email_id", "doc_id", "canonical_id"):
+                val = _clean(cand.get(k))
+                if val:
+                    raw_doc_key = val
+                    break
+            if raw_doc_key:
+                break
+
+        explicit_doc_id = ""
+        for cand in candidates:
+            val = _clean(cand.get("document_id"))
+            if val:
+                explicit_doc_id = val
+                break
+
+        if not raw_doc_key and explicit_doc_id:
+            raw_doc_key = explicit_doc_id
+
+        known_prefixes = ("manual:", "mail:", "sales-note:", "tmtb:", "funda:", "digest:", "wiki:")
+        if explicit_doc_id:
+            document_id = explicit_doc_id
+        elif raw_doc_key:
+            if raw_doc_key.startswith(known_prefixes) or "/" in raw_doc_key:
+                document_id = raw_doc_key
+            else:
+                document_id = f"manual:{raw_doc_key}"
+        else:
+            path_fallback = ""
+            for cand in candidates:
+                for k in ("note_path", "filepath", "path"):
+                    val = _clean(cand.get(k))
+                    if val:
+                        path_fallback = val
+                        break
+                if path_fallback:
+                    break
+            document_id = path_fallback
+
+        return raw_doc_key, document_id
+
     def _resolve_market_digest_run_sh(self) -> Path:
         explicit = getattr(self.cfg, "market_digest_run_sh", None)
         if isinstance(explicit, Path):
@@ -13262,16 +13395,26 @@ class ResearchDataBridge:
         if not dry_run and request_id is not None:
             prior = self._find_sales_notes_audit_by_request_id(request_id)
             if prior is not None and prior.get("result") == "ok":
-                prior_out = dict(prior.get("cli_result") or {})
+                prior_cli = prior.get("cli_result") if isinstance(prior.get("cli_result"), dict) else {}
+                prior_out = dict(prior_cli)
                 prior_out.update(
                     {
                         "ok": True,
                         "status": "ingested",
                         "idempotent_replay": True,
                         "request_id": request_id,
+                        "institution": prior.get("institution") or institution,
+                        "title": prior.get("title") or title,
+                        "kind": prior.get("kind") or kind,
+                        "cli_result": prior_cli,
                         "audit_path": self._SALES_NOTES_AUDIT_REL,
                     }
                 )
+                replay_doc_key, replay_doc_id = self._extract_sales_note_id_fields(prior_cli)
+                if replay_doc_key:
+                    prior_out["doc_key"] = replay_doc_key
+                if replay_doc_id:
+                    prior_out["document_id"] = replay_doc_id
                 return 200, prior_out
 
         run_sh = self._resolve_market_digest_run_sh()
@@ -13336,15 +13479,7 @@ class ResearchDataBridge:
                 return 502, {"ok": False, "status": "timeout", "request_id": request_id,
                              "error": f"add-note 超过 {self.cfg.wiki_ingest_timeout_s}s 未完成"}
             cli_text = stdout_bytes.decode("utf-8", errors="replace").strip()
-            cli_payload: dict[str, Any] = {}
-            last_line = cli_text.splitlines()[-1].strip() if cli_text else ""
-            if last_line.startswith("{"):
-                try:
-                    parsed_cli = json.loads(last_line)
-                    if isinstance(parsed_cli, dict):
-                        cli_payload = parsed_cli
-                except ValueError:
-                    cli_payload = {}
+            cli_payload = self._parse_sales_notes_cli_json(cli_text)
             if proc.returncode != 0 and not cli_payload:
                 return 502, {
                     "ok": False,
@@ -13412,10 +13547,11 @@ class ResearchDataBridge:
                 "cli_result": cli_payload,
                 "audit_path": self._SALES_NOTES_AUDIT_REL,
             }
-            doc_key = str(cli_payload.get("doc_key") or "")
+            doc_key, document_id = self._extract_sales_note_id_fields(cli_payload)
             if doc_key:
                 response["doc_key"] = doc_key
-                response["document_id"] = f"manual:{doc_key}" if not doc_key.startswith("manual:") else doc_key
+            if document_id:
+                response["document_id"] = document_id
             return 200, response
         finally:
             if tmp_payload is not None:
@@ -13912,6 +14048,94 @@ class ResearchDataBridge:
             return 502, result
         return code, result
 
+    # ------------------------------------------------------------------
+    # Controlled transcription endpoints (A1b: fake worker + disk state)
+    # ------------------------------------------------------------------
+
+    def _asr_jobs_dir(self) -> Path:
+        custom = getattr(self.cfg, "asr_jobs_dir", None)
+        if custom is not None:
+            return Path(custom)
+        audit_file = getattr(self.cfg, "wiki_ingest_audit_file", None)
+        if audit_file is not None:
+            return Path(audit_file).parent / "asr_jobs"
+        return _SCRIPT_DIR.parents[1] / "var" / "dalton" / "asr_jobs"
+
+    def _asr_job_manager(self) -> asr_jobs.AsrJobManager:
+        mgr = getattr(self, "_asr_mgr_instance", None)
+        jobs_dir = self._asr_jobs_dir().expanduser()
+        if mgr is None or mgr.jobs_dir != jobs_dir:
+            custom_worker = getattr(self, "_asr_custom_worker", None)
+            mode = (
+                str(getattr(self.cfg, "asr_worker_mode", "auto") or "auto")
+                .strip()
+                .lower()
+            )
+            fake_text = getattr(self.cfg, "asr_fake_text", None)
+            fake_fail = getattr(self.cfg, "asr_fake_fail_category", None)
+            if custom_worker is not None:
+                worker: asr_jobs.RealAsrWorker | asr_jobs.FakeAsrWorker = custom_worker
+            elif mode == "real" or (
+                mode == "auto"
+                and seed_asr_client.SeedAsrCredentials.is_configured()
+                and fake_text is None
+                and fake_fail is None
+            ):
+                worker = asr_jobs.RealAsrWorker(
+                    jobs_dir,
+                    atomic_write_fn=_atomic_write_json_locked,
+                )
+            else:
+                worker_cfg = asr_jobs.FakeAsrWorkerConfig(
+                    delay_s=float(getattr(self.cfg, "asr_fake_delay_s", 0.02) or 0.0),
+                    fixed_text=fake_text,
+                    fail_category=fake_fail,
+                )
+                worker = asr_jobs.FakeAsrWorker(worker_cfg)
+            mgr = asr_jobs.AsrJobManager(
+                jobs_dir,
+                worker=worker,
+                atomic_write_fn=_atomic_write_json_locked,
+            )
+            self._asr_mgr_instance = mgr
+        return mgr
+
+    async def handle_transcription_submit(
+        self, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        """Handle ``POST /transcriptions`` (admin token required; accounting identity from ``caller``)."""
+        return await self._asr_job_manager().submit_job(body)
+
+    async def handle_transcription_status(
+        self, job_id: str
+    ) -> tuple[int, dict[str, Any]]:
+        """Handle ``GET /transcriptions/{id}``."""
+        return await self._asr_job_manager().get_job(job_id)
+
+    async def handle_transcription_result(
+        self, job_id: str
+    ) -> tuple[int, dict[str, Any]]:
+        """Handle ``GET /transcriptions/{id}/result``."""
+        return await self._asr_job_manager().get_job_result(job_id)
+
+    async def handle_transcription_raw_result(
+        self, job_id: str
+    ) -> tuple[int, dict[str, Any] | Path]:
+        """Handle ``GET /transcriptions/{id}/result/raw`` (streams bridge ``raw_response.json``)."""
+        return await self._asr_job_manager().get_job_raw_result(job_id)
+
+    async def handle_transcription_retry(
+        self, job_id: str, body: dict[str, Any] | None = None
+    ) -> tuple[int, dict[str, Any]]:
+        """Handle ``POST /transcriptions/{id}/retry``."""
+        return await self._asr_job_manager().retry_job(job_id, body)
+
+    async def handle_transcription_cancel(
+        self, job_id: str, body: dict[str, Any] | None = None
+    ) -> tuple[int, dict[str, Any]]:
+        """Handle ``POST /transcriptions/{id}/cancel``."""
+        return await self._asr_job_manager().cancel_job(job_id, body)
+
 
 
 
@@ -14243,8 +14467,10 @@ def _run_feishu_send_card(
             card_json_file=tmp_path,
             dry_run=dry_run,
         )
+        subproc_env = seed_asr_client.strip_asr_credentials_from_env(os.environ)
         proc = subprocess.run(
             cmd,
+            env=subproc_env,
             capture_output=True,
             text=True,
             timeout=timeout_s,
@@ -15593,6 +15819,40 @@ async def _send_http(
         pass
 
 
+async def _send_http_file(
+    writer: asyncio.StreamWriter,
+    status_code: int,
+    status_text: str,
+    file_path: Path,
+    *,
+    content_type: str = "application/json; charset=utf-8",
+    chunk_size: int = 65536,
+) -> None:
+    """Stream `file_path` over `writer` in fixed chunks without loading the entire file into memory."""
+    file_size = file_path.stat().st_size
+    headers = [
+        f"HTTP/1.1 {status_code} {status_text}",
+        f"Content-Type: {content_type}",
+        f"Content-Length: {file_size}",
+        "Connection: close",
+    ]
+    header_bytes = ("\r\n".join(headers) + "\r\n\r\n").encode("utf-8")
+    writer.write(header_bytes)
+    await writer.drain()
+    with file_path.open("rb") as fh:
+        while True:
+            chunk = fh.read(chunk_size)
+            if not chunk:
+                break
+            writer.write(chunk)
+            await writer.drain()
+    writer.close()
+    try:
+        await writer.wait_closed()
+    except Exception:
+        pass
+
+
 def _extract_supplied_token(headers: Mapping[str, str]) -> str:
     """Extract bridge authentication token from `Authorization: Bearer <token>` or `X-Dalton-Bridge-Token`."""
     lowered = {k.lower(): v for k, v in headers.items()}
@@ -16033,6 +16293,128 @@ async def _handle_client(
             await _send_http(writer, code, status_label, payload)
             return
 
+        # Route 8: /transcriptions* (A1b: behind the admin token gate above;
+        # normal MCP token gets 403; accounting identity comes from the backend's
+        # trusted `caller` payload, never from sandbox X-Dalton-* headers).
+        if path == "/transcriptions" or path.startswith("/transcriptions/"):
+            if path == "/transcriptions":
+                if method != "POST":
+                    await _send_http(
+                        writer, 405, "Method Not Allowed", {"ok": False, "error": "Method Not Allowed"}
+                    )
+                    return
+                try:
+                    asr_body = json.loads(body_bytes.decode("utf-8"))
+                    if not isinstance(asr_body, dict):
+                        raise ValueError("Expected JSON object")
+                except Exception:
+                    await _send_http(writer, 400, "Bad Request", {"ok": False, "error": "Parse error"})
+                    return
+                code, payload = await bridge.handle_transcription_submit(asr_body)
+                status_label = {
+                    200: "OK",
+                    400: "Bad Request",
+                    403: "Forbidden",
+                    404: "Not Found",
+                    409: "Conflict",
+                }.get(code, "Bad Gateway")
+                await _send_http(writer, code, status_label, payload)
+                return
+
+            subpath = path[len("/transcriptions/") :]
+            parts = [p for p in subpath.split("/") if p]
+            if len(parts) == 1:
+                job_id = parts[0]
+                if method != "GET":
+                    await _send_http(
+                        writer, 405, "Method Not Allowed", {"ok": False, "error": "Method Not Allowed"}
+                    )
+                    return
+                code, payload = await bridge.handle_transcription_status(job_id)
+                status_label = {
+                    200: "OK",
+                    400: "Bad Request",
+                    404: "Not Found",
+                }.get(code, "Bad Gateway")
+                await _send_http(writer, code, status_label, payload)
+                return
+
+            if len(parts) == 2 and parts[1] == "result":
+                job_id = parts[0]
+                if method != "GET":
+                    await _send_http(
+                        writer, 405, "Method Not Allowed", {"ok": False, "error": "Method Not Allowed"}
+                    )
+                    return
+                code, payload = await bridge.handle_transcription_result(job_id)
+                status_label = {
+                    200: "OK",
+                    400: "Bad Request",
+                    404: "Not Found",
+                    409: "Conflict",
+                }.get(code, "Bad Gateway")
+                await _send_http(writer, code, status_label, payload)
+                return
+
+            if len(parts) == 3 and parts[1] == "result" and parts[2] == "raw":
+                job_id = parts[0]
+                if method != "GET":
+                    await _send_http(
+                        writer, 405, "Method Not Allowed", {"ok": False, "error": "Method Not Allowed"}
+                    )
+                    return
+                code, raw_payload_or_path = await bridge.handle_transcription_raw_result(job_id)
+                status_label = {
+                    200: "OK",
+                    400: "Bad Request",
+                    404: "Not Found",
+                    409: "Conflict",
+                }.get(code, "Bad Gateway")
+                if code == 200 and isinstance(raw_payload_or_path, Path):
+                    await _send_http_file(writer, 200, "OK", raw_payload_or_path)
+                else:
+                    err_obj = (
+                        raw_payload_or_path
+                        if isinstance(raw_payload_or_path, dict)
+                        else {"ok": False, "error": "Raw response unavailable"}
+                    )
+                    await _send_http(writer, code, status_label, err_obj)
+                return
+
+            if len(parts) == 2 and parts[1] in ("retry", "cancel"):
+                job_id = parts[0]
+                action = parts[1]
+                if method != "POST":
+                    await _send_http(
+                        writer, 405, "Method Not Allowed", {"ok": False, "error": "Method Not Allowed"}
+                    )
+                    return
+                action_body: dict[str, Any] = {}
+                if body_bytes.strip():
+                    try:
+                        parsed_action = json.loads(body_bytes.decode("utf-8"))
+                        if not isinstance(parsed_action, dict):
+                            raise ValueError("Expected JSON object")
+                        action_body = parsed_action
+                    except Exception:
+                        await _send_http(writer, 400, "Bad Request", {"ok": False, "error": "Parse error"})
+                        return
+                if action == "retry":
+                    code, payload = await bridge.handle_transcription_retry(job_id, action_body)
+                else:
+                    code, payload = await bridge.handle_transcription_cancel(job_id, action_body)
+                status_label = {
+                    200: "OK",
+                    400: "Bad Request",
+                    404: "Not Found",
+                    409: "Conflict",
+                }.get(code, "Bad Gateway")
+                await _send_http(writer, code, status_label, payload)
+                return
+
+            await _send_http(writer, 404, "Not Found", {"ok": False, "error": "Not Found"})
+            return
+
         await _send_http(writer, 404, "Not Found", {"error": "Not Found"})
     except Exception as exc:
         # P0 fix1 7: the request that died carries its correlation id in the
@@ -16081,6 +16463,10 @@ async def main() -> None:
             type(exc).__name__,
             getattr(exc, "exit_code", None),
         )
+    try:
+        bridge._asr_job_manager().recover_incomplete_jobs()
+    except Exception as exc:
+        logger.warning("Startup ASR job recovery warning: %s", type(exc).__name__)
 
     server = await asyncio.start_server(
         lambda r, w: _handle_client(bridge, r, w),

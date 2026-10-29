@@ -2261,11 +2261,13 @@ async def test_realtime_ops_jobs_and_archive_last_run_log_slice(
     def _fake_subprocess_run(
         cmd: list[str],
         *,
+        env: Any = None,
         capture_output: bool = False,
         text: bool = False,
         timeout: float | None = None,
         check: bool = False,
     ) -> subprocess.CompletedProcess[str]:
+        _ = env
         assert tuple(cmd) in expected_cmds
         assert timeout == 2.0
         assert capture_output is True

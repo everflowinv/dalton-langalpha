@@ -85,6 +85,8 @@ UPLOAD_ENDED = "This upload has ended. Start it again."
 TOO_MANY_UPLOADS = "Too many uploads in progress. Wait for one to finish."
 ALREADY_SAVING = "This upload is already being saved to the workspace."
 PARTS_MISSING = "Some parts of the file did not arrive."
+# DALTON-HOOK(direct-upload-safety): explicit Chinese reason when direct upload is disabled/unavailable
+DIRECT_UPLOAD_NOT_ENABLED = "大文件需要对象存储直传，当前未启用"
 
 
 class BeginUploadRequest(BaseModel):
@@ -180,7 +182,12 @@ async def begin_workspace_upload(
             scan_cap = scan_cap_bytes(sandbox, blobs_on=is_storage_enabled())
             relay_cap = MAX_UPLOAD_BYTES if scan_cap is None else min(MAX_UPLOAD_BYTES, scan_cap)
             if body.size > relay_cap:
-                raise HTTPException(status_code=413, detail=_too_large(relay_cap, body.size))
+                # --- DALTON-HOOK(direct-upload-safety): begin ---
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"{DIRECT_UPLOAD_NOT_ENABLED}（{_too_large(relay_cap, body.size)}）",
+                )
+                # --- DALTON-HOOK(direct-upload-safety): end ---
             return {"mode": "relay"}
 
         work_dir = owner_work_dir(workspace)
