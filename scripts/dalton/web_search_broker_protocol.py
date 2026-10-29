@@ -59,11 +59,26 @@ _DATE_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
 
 
 class WebSearchBrokerError(RuntimeError):
-    """Raised when the broker socket, key, request, or reply fails validation."""
+    """Raised when the broker socket, key, request, or reply fails validation.
 
-    def __init__(self, message: str, *, code: str = "BROKER_ERROR") -> None:
+    ``upstream_status``/``upstream_code`` (backlog 三-6) are optional
+    observability attributes — the HTTP status / error code of the upstream
+    call this failure wraps, when one is known. They change no behavior; the
+    HTTP bridge copies them into its error payload as new optional fields.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str = "BROKER_ERROR",
+        upstream_status: int | None = None,
+        upstream_code: str | None = None,
+    ) -> None:
         super().__init__(message)
         self.code = code
+        self.upstream_status = upstream_status
+        self.upstream_code = upstream_code
 
 
 def canonical_json(value: Any) -> str:

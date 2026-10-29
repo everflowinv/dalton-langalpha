@@ -181,6 +181,11 @@ ALLOWED_HOOKS=(
   # turn on its completion notification, never by sleep/poll loops
   # (subagent_coordination.md.j2).
   "subagent-no-sleep-poll"
+  # Backlog 三-2 (2026-10-28): startup logs the effective in-process browser
+  # concurrency (crawl value + which channel set it, PDF render cap) — a
+  # named PDF_RENDER_CONCURRENCY constant, a source-resolving helper in
+  # tool_settings.py, and one lifespan line in setup.py. Log-only.
+  "concurrency-startup-log"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

@@ -79,7 +79,11 @@ def _is_request_allowed(url: str, workspace_serve_prefix: str) -> bool:
 # --- Browser lifecycle -----------------------------------------------------
 
 # Cap concurrent renders: each holds a Chromium context + page.
-_RENDER_SEMAPHORE = asyncio.Semaphore(2)
+# DALTON-HOOK(concurrency-startup-log): the cap is a named constant so the
+# startup log can report the effective PDF render concurrency beside the
+# crawl browser's; the value (2) is unchanged.
+PDF_RENDER_CONCURRENCY = 2
+_RENDER_SEMAPHORE = asyncio.Semaphore(PDF_RENDER_CONCURRENCY)
 
 # Total per-render budget (navigation + pdf). Networkidle wait is bounded
 # below this so a slow asset can fall back to "load" and still finish.

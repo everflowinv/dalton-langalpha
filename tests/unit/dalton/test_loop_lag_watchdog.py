@@ -10,6 +10,7 @@ import pytest
 
 from src.observability.loop_lag import (
     _STALL_MAX_FRAMES,
+    _STALL_THRESHOLD_S,
     _STALL_WATCHDOG_ENV,
     EventLoopLagMonitor,
 )
@@ -24,6 +25,119 @@ def _deep_recursive_blocker(depth: int, duration_s: float) -> None:
         _blocking_culprit_function(duration_s)
         return
     _deep_recursive_blocker(depth - 1, duration_s)
+
+
+# ------------------------------------------------ startup configuration log
+
+
+@pytest.mark.asyncio
+async def test_start_logs_watchdog_configuration_line(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monitor = EventLoopLagMonitor(stall_threshold_s=0.08, stall_cooldown_s=60.0)
+    with caplog.at_level(logging.INFO, logger="src.observability.loop_lag"):
+        monitor.start()
+        try:
+            info_lines = [
+                r.getMessage()
+                for r in caplog.records
+                if r.levelno == logging.INFO and "watchdog enabled=" in r.getMessage()
+            ]
+        finally:
+            await monitor.stop()
+
+    assert len(info_lines) == 1
+    message = info_lines[0]
+    assert "watchdog enabled=True" in message
+    assert "stall_threshold_s=0.1" in message  # %.1f of 0.08
+    assert "stall_cooldown_s=60.0" in message
+    assert "all_thread_stacks=True" in message
+    assert f"max_frames={_STALL_MAX_FRAMES}" in message
+
+
+@pytest.mark.asyncio
+async def test_start_logs_disabled_watchdog_and_starts_no_thread(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setenv(_STALL_WATCHDOG_ENV, "0")
+    monitor = EventLoopLagMonitor()
+    with caplog.at_level(logging.INFO, logger="src.observability.loop_lag"):
+        monitor.start()
+        try:
+            assert monitor._watchdog_thread is None
+            info_lines = [
+                r.getMessage()
+                for r in caplog.records
+                if "watchdog enabled=" in r.getMessage()
+            ]
+        finally:
+            await monitor.stop()
+
+    assert len(info_lines) == 1
+    message = info_lines[0]
+    assert "watchdog enabled=False" in message
+    assert f"stall_threshold_s={_STALL_THRESHOLD_S:.1f}" in message
+    assert "all_thread_stacks=False" in message
+
+
+# ------------------------------------------------ below-stack-threshold note
+
+
+@pytest.mark.asyncio
+async def test_sub_threshold_stall_warning_says_why_no_stack_was_taken(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # A 3.2s stall in production logged no stack and nothing said why: the
+    # warn line fires from 1s but the stack only samples past the (here, high)
+    # stall threshold — the warning must now say so itself.
+    monitor = EventLoopLagMonitor(stall_threshold_s=30.0, interval_s=0.05)
+    with caplog.at_level(logging.WARNING, logger="src.observability.loop_lag"):
+        monitor.start()
+        try:
+            await asyncio.sleep(0.02)
+            _blocking_culprit_function(1.15)
+            # Let the sampler task wake past the block and compute its lag
+            # before stop() cancels it.
+            await asyncio.sleep(0.1)
+        finally:
+            await monitor.stop()
+
+    lag_warnings = [
+        r
+        for r in caplog.records
+        if r.levelno == logging.WARNING and "event loop stalled" in r.message
+    ]
+    assert len(lag_warnings) == 1
+    message = lag_warnings[0].message
+    assert "低于栈阈值 30.0 s，未采集" in message
+    # No stack may accompany a below-threshold stall.
+    assert "thread stacks" not in message
+
+
+@pytest.mark.asyncio
+async def test_disabled_watchdog_stall_warning_says_watchdog_off(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setenv(_STALL_WATCHDOG_ENV, "0")
+    monitor = EventLoopLagMonitor(interval_s=0.05)
+    with caplog.at_level(logging.WARNING, logger="src.observability.loop_lag"):
+        monitor.start()
+        try:
+            await asyncio.sleep(0.02)
+            _blocking_culprit_function(1.15)
+            # Let the sampler task wake past the block and compute its lag
+            # before stop() cancels it.
+            await asyncio.sleep(0.1)
+        finally:
+            await monitor.stop()
+
+    lag_warnings = [
+        r
+        for r in caplog.records
+        if r.levelno == logging.WARNING and "event loop stalled" in r.message
+    ]
+    assert len(lag_warnings) == 1
+    assert "看门狗未启用，未采集栈" in lag_warnings[0].message
 
 
 @pytest.mark.asyncio
