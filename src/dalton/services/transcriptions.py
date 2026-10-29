@@ -1458,6 +1458,11 @@ async def sign_transcription_upload_part(
             part_count - 1
         )
 
+    # The PUT is issued from the sandbox (`dalton_asr.py`), which never joins the
+    # backend Compose network, so sign the public browser endpoint shared with
+    # browser direct uploads. `sign_upload_part` falls back to the internal
+    # client when `STORAGE_BROWSER_ENDPOINT_URL` is unset — fine while the A1
+    # master switch keeps the feature off.
     signed_url = await asyncio.to_thread(
         sign_upload_part,
         bound_key,
@@ -1465,7 +1470,7 @@ async def sign_transcription_upload_part(
         part_number=pnum,
         size=expected_part_size,
         expires_in=TRANSCRIPTION_UPLOAD_URL_EXPIRES_S,
-        for_browser=False,
+        for_browser=True,
     )
     if not signed_url:
         raise HTTPException(

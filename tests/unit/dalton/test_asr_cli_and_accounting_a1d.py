@@ -1435,6 +1435,9 @@ class FakeMultipartStorage:
         self.deleted_keys: list[str] = []
         self.signed_part_requests: list[tuple[str, str, int, int, int]] = []
         self.override_object_size: dict[str, int | None] = {}
+        # Set by `_wire_fake_multipart_storage`: the autospec stub the service is
+        # patched onto, kept so tests can assert how `sign_upload_part` was called.
+        self.sign_upload_part_mock: Any = None
 
     def is_enabled(self) -> bool:
         return self.enabled
@@ -1545,13 +1548,14 @@ def _wire_fake_multipart_storage(
             side_effect=storage.open_multipart_upload,
         ),
     )
+    storage.sign_upload_part_mock = create_autospec(
+        s3_mod.sign_upload_part,
+        side_effect=storage.sign_upload_part,
+    )
     monkeypatch.setattr(
         svc_transcriptions,
         "sign_upload_part",
-        create_autospec(
-            s3_mod.sign_upload_part,
-            side_effect=storage.sign_upload_part,
-        ),
+        storage.sign_upload_part_mock,
     )
     monkeypatch.setattr(
         svc_transcriptions,
@@ -1741,6 +1745,14 @@ async def test_fix1_upload_endpoints_ticket_and_status_and_smuggled_key_and_size
             1,
             len(audio_payload),
             900,
+        )
+        # The URL is consumed by the sandbox (`dalton_asr.py`), which never joins
+        # the backend Compose network, so it must be signed for the public
+        # browser endpoint, not the internal one.
+        assert storage.sign_upload_part_mock.call_args_list, "part signing was never invoked"
+        assert (
+            storage.sign_upload_part_mock.call_args_list[-1].kwargs["for_browser"]
+            is True
         )
 
         # 7. Upload wrong size bytes and try to complete -> aborts multipart upload and returns 400
