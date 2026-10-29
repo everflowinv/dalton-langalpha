@@ -31,8 +31,6 @@ import time
 from typing import Any
 import uuid
 
-import boto3
-from botocore.config import Config
 import httpx
 
 logger = logging.getLogger("researchdata-bridge")
@@ -578,6 +576,20 @@ class VolcTosClient:
     def _get_s3_client(self) -> Any:
         if self._s3_client is not None:
             return self._s3_client
+        # Imported here, not at module top: launchd runs the bridge with the
+        # system Homebrew Python, which must import this module (and start)
+        # even when boto3 is not installed and transcription is disabled.
+        try:
+            import boto3
+            from botocore.config import Config
+        except ImportError as exc:
+            raise SeedAsrError(
+                "asr_boto3_missing",
+                "boto3 未安装：录音转写需要在桥的 Python 环境安装 boto3 "
+                "(boto3 is not installed; install it in the bridge's Python "
+                "to enable audio transcription)",
+                retryable=False,
+            ) from exc
         endpoint_url, addressing_style = _normalize_tos_endpoint(
             self.credentials.tos_endpoint
         )

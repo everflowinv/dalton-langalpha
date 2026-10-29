@@ -36,9 +36,6 @@ import time
 from typing import Any
 import uuid
 
-import boto3
-from botocore.config import Config
-
 from seed_asr_client import (
     DEFAULT_JOB_DEADLINE_S,
     DEFAULT_POLL_INTERVAL_S,
@@ -274,6 +271,19 @@ class SourceObjectStore:
                 "storage_not_configured",
                 "Bridge source object storage credentials/bucket are not configured",
             )
+        # Imported here, not at module top: launchd runs the bridge with the
+        # system Homebrew Python, which must import this module (and start)
+        # even when boto3 is not installed and transcription is disabled.
+        try:
+            import boto3
+            from botocore.config import Config
+        except ImportError as exc:
+            raise AsrWorkerError(
+                "asr_boto3_missing",
+                "boto3 未安装：录音转写需要在桥的 Python 环境安装 boto3 "
+                "(boto3 is not installed; install it in the bridge's Python "
+                "to enable audio transcription)",
+            ) from exc
         self._s3_client = boto3.client(
             "s3",
             endpoint_url=self.endpoint_url,
