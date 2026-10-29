@@ -1,3 +1,4 @@
+import { useState } from 'react'; // DALTON-HOOK(composer-attachment-preview)
 import type { ButtonHTMLAttributes, CSSProperties, ReactNode, Ref } from 'react';
 import { FileText, X } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
@@ -7,6 +8,7 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/comp
 import { useIsMobile } from '@/hooks/useIsMobile';
 import { motion, useIsPresent } from '@/lib/framer';
 import { cn } from '@/lib/utils';
+import ImageLightbox from '@/pages/ChatAgent/components/ImageLightbox';
 import type { WidgetContextSnapshot } from '@/pages/Dashboard/widgets/framework/contextSnapshot';
 import { WidgetContextDeck } from '@/pages/Dashboard/widgets/framework/WidgetContextDeck';
 import { CHIP_PRESENCE, MENU_PRESENCE, getSlashCommandIcon } from './chat-input.helpers';
@@ -28,6 +30,11 @@ export const FilePreviewCard = ({ file, onRemove }: { file: FileAttachment; onRe
   const { t } = useTranslation();
   const isMobilePreview = useIsMobile();
   const isImage = file.type.startsWith('image/') && file.preview;
+  // DALTON-HOOK(composer-attachment-preview): the thumbnail opens the shared
+  // ImageLightbox, the one workspace images already use — the 96px card alone
+  // gave no way to look at an attached image again. A double click re-sets the
+  // same state, so it cannot open twice.
+  const [previewOpen, setPreviewOpen] = useState(false);
 
   return (
     <motion.div
@@ -35,10 +42,28 @@ export const FilePreviewCard = ({ file, onRemove }: { file: FileAttachment; onRe
       className="relative group shrink-0 w-24 h-24 rounded-xl overflow-hidden border border-(--color-border-muted) bg-(--color-bg-elevated) transition-colors hover:border-(--color-border-default)"
     >
       {isImage ? (
-        <div className="w-full h-full relative">
+        <button
+          type="button"
+          onClick={(e) => {
+            // The composer's container focuses its textarea on any click that
+            // reaches it, which would hand the next Enter to the send handler
+            // under the open preview (and pop the mobile keyboard); the preview
+            // dialog takes focus itself, so the opening click stops here.
+            // Keyboard activation reaches this same handler as a click.
+            e.stopPropagation();
+            setPreviewOpen(true);
+          }}
+          aria-label={t('chat.composer.previewImage')}
+          className="group/preview relative block w-full h-full rounded-xl border-none bg-transparent p-0 cursor-zoom-in focus-visible:outline-hidden"
+        >
           <img src={file.preview!} alt={file.file.name} className="w-full h-full object-cover" />
-          <div className="absolute inset-0 bg-black/20 group-hover:bg-black/0 transition-colors" />
-        </div>
+          <span className="pointer-events-none absolute inset-0 bg-black/20 group-hover:bg-black/0 transition-colors" />
+          {/* Focus indicator as its own layer, after the image in DOM order:
+              a ring on the button itself is an inset box-shadow, painted under
+              the full-bleed image it would mark (same shape as the ::after
+              focus ring in HandoffParts' STRETCHED_BUTTON). */}
+          <span className="pointer-events-none absolute inset-0 rounded-xl ring-2 ring-inset ring-(--color-focus-ring) opacity-0 group-focus-visible/preview:opacity-100" />
+        </button>
       ) : (
         <div className="w-full h-full p-3 flex flex-col justify-between">
           <div className="flex items-center gap-2">
@@ -60,21 +85,35 @@ export const FilePreviewCard = ({ file, onRemove }: { file: FileAttachment; onRe
         </div>
       )}
 
-      {/* Remove Button Overlay */}
+      {/* DALTON-HOOK(composer-attachment-preview): Remove Button Overlay —
+          stopPropagation keeps the remove a remove, never a preview open. */}
       <button
         type="button"
-        onClick={() => onRemove(file.id)}
+        onClick={(e) => { e.stopPropagation(); onRemove(file.id); }}
         aria-label={t('chat.composer.remove')}
         className={`absolute top-1 right-1 p-1 bg-black/50 hover:bg-black/70 rounded-full text-white transition-opacity ${isMobilePreview ? 'opacity-60' : 'opacity-0 group-hover:opacity-100'}`}
       >
         <X className="w-3 h-3" />
       </button>
 
-      {/* Upload Status */}
+      {/* Upload Status — pointer-events-none so the preview and remove clicks
+          stay live mid-upload (the preview is allowed while uploading). */}
       {file.uploadStatus === 'uploading' && (
-        <div className="absolute inset-0 bg-black/40 flex items-center justify-center">
+        <div className="absolute inset-0 bg-black/40 flex items-center justify-center pointer-events-none">
           <Loader size={20} label={t('chat.composer.uploading')} className="text-white" />
         </div>
+      )}
+
+      {/* DALTON-HOOK(composer-attachment-preview): the full-size view the
+          thumbnail button opens; Esc, the backdrop, or the × closes it. */}
+      {isImage && (
+        <ImageLightbox
+          src={file.preview!}
+          alt={file.file.name}
+          open={previewOpen}
+          onClose={() => setPreviewOpen(false)}
+          trapFocus
+        />
       )}
     </motion.div>
   );

@@ -214,6 +214,12 @@ ALLOWED_HOOKS=(
   # across relay, direct, and restore paths so uploaded/restored entries never
   # land at 1970 (wsfiles_transfer_runtime.py).
   "wsfiles-mtime"
+  # Composer image-attachment thumbnails open the shared ImageLightbox for a
+  # full-size preview, and the lightbox is a real dialog (focus trap + opener
+  # restore) so an open preview cannot send the draft it covers
+  # (FilePreviewCard in web/src/components/ui/chat-input.parts.tsx,
+  # web/src/pages/ChatAgent/components/ImageLightbox.tsx).
+  "composer-attachment-preview"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)
