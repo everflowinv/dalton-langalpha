@@ -618,17 +618,43 @@ def get_internal_service_token() -> str:
     return os.getenv("INTERNAL_SERVICE_TOKEN", "").strip()
 
 
+def get_dalton_transcription_ticket_secret() -> str:
+    """Return ``DALTON_TRANSCRIPTION_TICKET_SECRET`` from environment (empty string if unset)."""
+    return os.getenv("DALTON_TRANSCRIPTION_TICKET_SECRET", "").strip()
+
+
+def get_dalton_transcription_ticket_hmac_key() -> bytes | None:
+    """Derive the HMAC-SHA256 signing key for per-job transcription tickets."""
+    seed = (
+        get_dalton_transcription_ticket_secret()
+        or get_internal_service_token()
+        or get_dalton_bridge_admin_token()
+    )
+    if not seed and not is_dalton_supabase_auth_enabled():
+        seed = f"dalton-local-dev-transcription-ticket-seed:{LOCAL_DEV_USER_ID}"
+    if not seed:
+        return None
+    return hmac.new(
+        seed.encode("utf-8"), b"dalton-transcription-ticket-v1", hashlib.sha256
+    ).digest()
+
+
 def managed_secret_token_values() -> tuple[str, ...]:
     """Non-empty values of the management tokens that must never reach a sandbox.
 
-    ``DALTON_BRIDGE_ADMIN_TOKEN`` (the host bridge's admin credential) and
-    ``INTERNAL_SERVICE_TOKEN`` (the backend's service-to-service credential).
-    Either may be unset; only the non-empty ones are checked, so one missing
-    never disables the other's scrub.
+    ``DALTON_BRIDGE_ADMIN_TOKEN`` (the host bridge's admin credential),
+    ``INTERNAL_SERVICE_TOKEN`` (the backend's service-to-service credential), and
+    ``DALTON_TRANSCRIPTION_TICKET_SECRET`` (the transcription ticket signing secret).
+    Any may be unset; only the non-empty ones are checked, so one missing
+    never disables the others' scrub.
     """
     return tuple(
         t
-        for t in (get_dalton_bridge_admin_token(), get_internal_service_token())
+        for t in (
+            get_dalton_bridge_admin_token(),
+            get_internal_service_token(),
+            get_dalton_transcription_ticket_secret(),
+        )
         if t
     )
 

@@ -51,6 +51,7 @@ _SCRIPT_DIR = Path(__file__).resolve().parent
 if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
 
+import asr_jobs  # noqa: E402
 import source_identity  # noqa: E402
 
 logging.basicConfig(
@@ -1184,6 +1185,23 @@ class BridgeConfig:
         self.wiki_ingest_temp_dir: Path = Path(
             os.environ.get("DALTON_WIKI_INGEST_TEMP_DIR", str(default_wiki_tmp))
         ).expanduser()
+        default_asr_jobs = _SCRIPT_DIR.parents[1] / "var" / "dalton" / "asr_jobs"
+        self.asr_jobs_dir: Path = Path(
+            os.environ.get("DALTON_ASR_JOBS_DIR", str(default_asr_jobs))
+        ).expanduser()
+        try:
+            self.asr_fake_delay_s: float = max(
+                0.0,
+                float(os.environ.get("DALTON_ASR_FAKE_DELAY_S", "0.02") or 0.02),
+            )
+        except ValueError:
+            self.asr_fake_delay_s = 0.02
+        self.asr_fake_text: str | None = (
+            os.environ.get("DALTON_ASR_FAKE_TEXT") or None
+        )
+        self.asr_fake_fail_category: str | None = (
+            os.environ.get("DALTON_ASR_FAKE_FAIL_CATEGORY", "").strip() or None
+        )
         try:
             self.wiki_ingest_timeout_s: float = max(
                 5.0,
@@ -13726,6 +13744,66 @@ class ResearchDataBridge:
             return 502, result
         return code, result
 
+    # ------------------------------------------------------------------
+    # Controlled transcription endpoints (A1b: fake worker + disk state)
+    # ------------------------------------------------------------------
+
+    def _asr_jobs_dir(self) -> Path:
+        custom = getattr(self.cfg, "asr_jobs_dir", None)
+        if custom is not None:
+            return Path(custom)
+        audit_file = getattr(self.cfg, "wiki_ingest_audit_file", None)
+        if audit_file is not None:
+            return Path(audit_file).parent / "asr_jobs"
+        return _SCRIPT_DIR.parents[1] / "var" / "dalton" / "asr_jobs"
+
+    def _asr_job_manager(self) -> asr_jobs.AsrJobManager:
+        mgr = getattr(self, "_asr_mgr_instance", None)
+        jobs_dir = self._asr_jobs_dir().expanduser()
+        if mgr is None or mgr.jobs_dir != jobs_dir:
+            worker_cfg = asr_jobs.FakeAsrWorkerConfig(
+                delay_s=float(getattr(self.cfg, "asr_fake_delay_s", 0.02) or 0.0),
+                fixed_text=getattr(self.cfg, "asr_fake_text", None),
+                fail_category=getattr(self.cfg, "asr_fake_fail_category", None),
+            )
+            mgr = asr_jobs.AsrJobManager(
+                jobs_dir,
+                worker=asr_jobs.FakeAsrWorker(worker_cfg),
+                atomic_write_fn=_atomic_write_json_locked,
+            )
+            self._asr_mgr_instance = mgr
+        return mgr
+
+    async def handle_transcription_submit(
+        self, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        """Handle ``POST /transcriptions`` (admin token required; accounting identity from ``caller``)."""
+        return await self._asr_job_manager().submit_job(body)
+
+    async def handle_transcription_status(
+        self, job_id: str
+    ) -> tuple[int, dict[str, Any]]:
+        """Handle ``GET /transcriptions/{id}``."""
+        return await self._asr_job_manager().get_job(job_id)
+
+    async def handle_transcription_result(
+        self, job_id: str
+    ) -> tuple[int, dict[str, Any]]:
+        """Handle ``GET /transcriptions/{id}/result``."""
+        return await self._asr_job_manager().get_job_result(job_id)
+
+    async def handle_transcription_retry(
+        self, job_id: str, body: dict[str, Any] | None = None
+    ) -> tuple[int, dict[str, Any]]:
+        """Handle ``POST /transcriptions/{id}/retry``."""
+        return await self._asr_job_manager().retry_job(job_id, body)
+
+    async def handle_transcription_cancel(
+        self, job_id: str, body: dict[str, Any] | None = None
+    ) -> tuple[int, dict[str, Any]]:
+        """Handle ``POST /transcriptions/{id}/cancel``."""
+        return await self._asr_job_manager().cancel_job(job_id, body)
+
 
 
 
@@ -15846,6 +15924,103 @@ async def _handle_client(
             await _send_http(writer, code, status_label, payload)
             return
 
+        # Route 8: /transcriptions* (A1b: behind the admin token gate above;
+        # normal MCP token gets 403; accounting identity comes from the backend's
+        # trusted `caller` payload, never from sandbox X-Dalton-* headers).
+        if path == "/transcriptions" or path.startswith("/transcriptions/"):
+            if path == "/transcriptions":
+                if method != "POST":
+                    await _send_http(
+                        writer, 405, "Method Not Allowed", {"ok": False, "error": "Method Not Allowed"}
+                    )
+                    return
+                try:
+                    asr_body = json.loads(body_bytes.decode("utf-8"))
+                    if not isinstance(asr_body, dict):
+                        raise ValueError("Expected JSON object")
+                except Exception:
+                    await _send_http(writer, 400, "Bad Request", {"ok": False, "error": "Parse error"})
+                    return
+                code, payload = await bridge.handle_transcription_submit(asr_body)
+                status_label = {
+                    200: "OK",
+                    400: "Bad Request",
+                    403: "Forbidden",
+                    404: "Not Found",
+                    409: "Conflict",
+                }.get(code, "Bad Gateway")
+                await _send_http(writer, code, status_label, payload)
+                return
+
+            subpath = path[len("/transcriptions/") :]
+            parts = [p for p in subpath.split("/") if p]
+            if len(parts) == 1:
+                job_id = parts[0]
+                if method != "GET":
+                    await _send_http(
+                        writer, 405, "Method Not Allowed", {"ok": False, "error": "Method Not Allowed"}
+                    )
+                    return
+                code, payload = await bridge.handle_transcription_status(job_id)
+                status_label = {
+                    200: "OK",
+                    400: "Bad Request",
+                    404: "Not Found",
+                }.get(code, "Bad Gateway")
+                await _send_http(writer, code, status_label, payload)
+                return
+
+            if len(parts) == 2 and parts[1] == "result":
+                job_id = parts[0]
+                if method != "GET":
+                    await _send_http(
+                        writer, 405, "Method Not Allowed", {"ok": False, "error": "Method Not Allowed"}
+                    )
+                    return
+                code, payload = await bridge.handle_transcription_result(job_id)
+                status_label = {
+                    200: "OK",
+                    400: "Bad Request",
+                    404: "Not Found",
+                    409: "Conflict",
+                }.get(code, "Bad Gateway")
+                await _send_http(writer, code, status_label, payload)
+                return
+
+            if len(parts) == 2 and parts[1] in ("retry", "cancel"):
+                job_id = parts[0]
+                action = parts[1]
+                if method != "POST":
+                    await _send_http(
+                        writer, 405, "Method Not Allowed", {"ok": False, "error": "Method Not Allowed"}
+                    )
+                    return
+                action_body: dict[str, Any] = {}
+                if body_bytes.strip():
+                    try:
+                        parsed_action = json.loads(body_bytes.decode("utf-8"))
+                        if not isinstance(parsed_action, dict):
+                            raise ValueError("Expected JSON object")
+                        action_body = parsed_action
+                    except Exception:
+                        await _send_http(writer, 400, "Bad Request", {"ok": False, "error": "Parse error"})
+                        return
+                if action == "retry":
+                    code, payload = await bridge.handle_transcription_retry(job_id, action_body)
+                else:
+                    code, payload = await bridge.handle_transcription_cancel(job_id, action_body)
+                status_label = {
+                    200: "OK",
+                    400: "Bad Request",
+                    404: "Not Found",
+                    409: "Conflict",
+                }.get(code, "Bad Gateway")
+                await _send_http(writer, code, status_label, payload)
+                return
+
+            await _send_http(writer, 404, "Not Found", {"ok": False, "error": "Not Found"})
+            return
+
         await _send_http(writer, 404, "Not Found", {"error": "Not Found"})
     except Exception as exc:
         logger.error("Unhandled bridge error: %s", type(exc).__name__)
@@ -15886,6 +16061,10 @@ async def main() -> None:
             type(exc).__name__,
             getattr(exc, "exit_code", None),
         )
+    try:
+        bridge._asr_job_manager().recover_incomplete_jobs()
+    except Exception as exc:
+        logger.warning("Startup ASR job recovery warning: %s", type(exc).__name__)
 
     server = await asyncio.start_server(
         lambda r, w: _handle_client(bridge, r, w),

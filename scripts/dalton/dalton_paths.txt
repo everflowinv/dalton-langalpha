@@ -66,3 +66,11 @@ tests/unit/mcp_servers/test_yf_fundamentals_null.py
 # Backlog A1a: direct upload storage safety (MinIO init script & audio storage guide).
 scripts/dalton/configure_minio.sh
 docs/dalton/dev-guide/AUDIO-STORAGE.md
+# Backlog A1b: transcription job permissions, identity, persistence & fake worker.
+src/dalton/migrations/versions/d022_transcription_jobs.py
+src/dalton/database/transcriptions.py
+src/dalton/services/transcriptions.py
+src/dalton/app/transcriptions.py
+src/dalton/tools/transcription_tools.py
+scripts/dalton/asr_jobs.py
+tests/unit/dalton/test_transcriptions.py
