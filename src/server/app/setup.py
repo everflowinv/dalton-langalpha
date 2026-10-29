@@ -126,6 +126,9 @@ _REDIS_BACKGROUND_SINGLETONS: tuple[tuple[str, str], ...] = (
     # Tells apart "Redis is slow" from "this worker's loop was blocked", which
     # read identically at the redis-py boundary.
     ("EventLoopLagMonitor", "src.observability.loop_lag"),
+    # DALTON-HOOK(browser-memory-sampler): periodic 3-way memory attribution
+    # (crawler Chromium, pdf_render Chromium, other) + 24h rolling peaks.
+    ("BrowserMemorySampler", "src.observability.browser_memory"),
     # Refreshes expiring MCP OAuth connections ahead of the hot path; the
     # per-connection advisory try-lock dedups it across workers.
     ("McpOAuthRefreshSweeper", "src.server.services.mcp_oauth.sweep"),

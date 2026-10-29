@@ -415,9 +415,13 @@ class ScraplingCrawler:
 
     async def _fetch_with_session(self, session, url: str, **fetch_kwargs):
         """Shared cancel-safe session fetch with this module's logger attached."""
-        return await fetch_with_session(
-            session, url, on_close_error=_log_close_failure, **fetch_kwargs
-        )
+        # DALTON-HOOK(browser-memory-sampler): explicitly register crawler driver/browser root PIDs for the session lifetime.
+        from src.observability.browser_memory import track_crawler_session
+
+        async with track_crawler_session(session):
+            return await fetch_with_session(
+                session, url, on_close_error=_log_close_failure, **fetch_kwargs
+            )
 
     async def shutdown(self) -> None:
         """No persistent resources to clean up (sessions are per-fetch)."""

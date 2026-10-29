@@ -299,6 +299,10 @@ async def _reset_browser() -> None:
     browser, cm = _browser, _playwright_cm
     _browser = None
     _playwright_cm = None
+    # DALTON-HOOK(browser-memory-sampler): clear explicitly registered PDF render root PIDs on reset.
+    from src.observability.browser_memory import clear_pdf_render_pids
+
+    clear_pdf_render_pids()
     if browser is not None:
         try:
             await browser.close()
@@ -351,10 +355,15 @@ async def _get_browser():
             from playwright.async_api import async_playwright
         except ImportError as exc:
             raise PdfRenderUnavailable("playwright is not installed") from exc
+        # DALTON-HOOK(browser-memory-sampler): explicitly capture and register PDF driver/browser root PIDs.
+        from src.observability.browser_memory import capture_browser_launch
+
         try:
-            cm = async_playwright()
-            pw = await cm.start()
-            browser = await pw.chromium.launch(headless=True)
+            async with capture_browser_launch("pdf_render") as launch_capture:
+                cm = async_playwright()
+                pw = await cm.start()
+                browser = await pw.chromium.launch(headless=True)
+                launch_capture.register_handles(cm, pw, browser)
         except PlaywrightError as exc:
             if _EXECUTABLE_MISSING_HINT in str(exc).lower():
                 raise PdfRenderUnavailable(

@@ -186,6 +186,17 @@ async def get_openclaw_health_endpoint(
     return await probe_health(user_id=user_id)
 
 
+@router.get("/diagnostics/browser-memory")
+@handle_api_exceptions("get browser memory diagnostics", logger)
+async def get_browser_memory_diagnostics_endpoint(
+    user_id: CurrentUserId,
+) -> dict[str, Any]:
+    _require_pm_user(user_id)
+    from src.observability.browser_memory import get_browser_memory_diagnostics
+
+    return get_browser_memory_diagnostics()
+
+
 # ---------------------------------------------------------------------------
 # Native-subscription model sync (check → confirm → add-only runtime overlay)
 # ---------------------------------------------------------------------------

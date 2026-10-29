@@ -193,6 +193,9 @@ ALLOWED_HOOKS=(
   # P3: per-automation model selector in MoreOptions and explicit null clearing
   # on PATCH /api/v1/automations/{id}.
   "automation-model"
+  # Backlog P6a: periodic 3-way browser memory attribution sampler started in
+  # the server lifespan (src/server/app/setup.py, src/observability/browser_memory.py).
+  "browser-memory-sampler"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)
