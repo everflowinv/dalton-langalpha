@@ -12881,6 +12881,100 @@ class ResearchDataBridge:
     _SALES_NOTES_KINDS = frozenset({"研报", "点评", "卖方电话会", "销售观点"})
     _SALES_NOTES_AUDIT_REL = "var/dalton/sales_notes_ingest_audit.jsonl"
 
+    @staticmethod
+    def _parse_sales_notes_cli_json(cli_text: str) -> dict[str, Any]:
+        """Parse the JSON object emitted by `market-digest/run.sh --json add-note` (single-line or pretty-printed)."""
+        text = (cli_text or "").strip()
+        if not text:
+            return {}
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, dict):
+                return parsed
+        except ValueError:
+            pass
+        for line in reversed(text.splitlines()):
+            line_s = line.strip()
+            if line_s.startswith("{"):
+                try:
+                    parsed = json.loads(line_s)
+                    if isinstance(parsed, dict):
+                        return parsed
+                except ValueError:
+                    continue
+        decoder = json.JSONDecoder()
+        search_end = len(text)
+        while True:
+            pos = text.rfind("{", 0, search_end)
+            if pos < 0:
+                break
+            try:
+                parsed, _ = decoder.raw_decode(text, pos)
+                if isinstance(parsed, dict):
+                    return parsed
+            except ValueError:
+                pass
+            search_end = pos
+        return {}
+
+    @staticmethod
+    def _extract_sales_note_id_fields(cli_payload: dict[str, Any]) -> tuple[str, str]:
+        """Extract `(doc_key, document_id)` from a `market-digest add-note` CLI payload."""
+        if not isinstance(cli_payload, dict):
+            return "", ""
+        candidates: list[dict[str, Any]] = [cli_payload]
+        for sub_key in ("note", "result", "data", "document"):
+            sub = cli_payload.get(sub_key)
+            if isinstance(sub, dict):
+                candidates.append(sub)
+
+        def _clean(val: Any) -> str:
+            if val is None or isinstance(val, bool):
+                return ""
+            return str(val).strip()
+
+        raw_doc_key = ""
+        for cand in candidates:
+            for k in ("doc_key", "note_id", "id", "email_id", "doc_id", "canonical_id"):
+                val = _clean(cand.get(k))
+                if val:
+                    raw_doc_key = val
+                    break
+            if raw_doc_key:
+                break
+
+        explicit_doc_id = ""
+        for cand in candidates:
+            val = _clean(cand.get("document_id"))
+            if val:
+                explicit_doc_id = val
+                break
+
+        if not raw_doc_key and explicit_doc_id:
+            raw_doc_key = explicit_doc_id
+
+        known_prefixes = ("manual:", "mail:", "sales-note:", "tmtb:", "funda:", "digest:", "wiki:")
+        if explicit_doc_id:
+            document_id = explicit_doc_id
+        elif raw_doc_key:
+            if raw_doc_key.startswith(known_prefixes) or "/" in raw_doc_key:
+                document_id = raw_doc_key
+            else:
+                document_id = f"manual:{raw_doc_key}"
+        else:
+            path_fallback = ""
+            for cand in candidates:
+                for k in ("note_path", "filepath", "path"):
+                    val = _clean(cand.get(k))
+                    if val:
+                        path_fallback = val
+                        break
+                if path_fallback:
+                    break
+            document_id = path_fallback
+
+        return raw_doc_key, document_id
+
     def _resolve_market_digest_run_sh(self) -> Path:
         explicit = getattr(self.cfg, "market_digest_run_sh", None)
         if isinstance(explicit, Path):
@@ -13115,16 +13209,26 @@ class ResearchDataBridge:
         if not dry_run and request_id is not None:
             prior = self._find_sales_notes_audit_by_request_id(request_id)
             if prior is not None and prior.get("result") == "ok":
-                prior_out = dict(prior.get("cli_result") or {})
+                prior_cli = prior.get("cli_result") if isinstance(prior.get("cli_result"), dict) else {}
+                prior_out = dict(prior_cli)
                 prior_out.update(
                     {
                         "ok": True,
                         "status": "ingested",
                         "idempotent_replay": True,
                         "request_id": request_id,
+                        "institution": prior.get("institution") or institution,
+                        "title": prior.get("title") or title,
+                        "kind": prior.get("kind") or kind,
+                        "cli_result": prior_cli,
                         "audit_path": self._SALES_NOTES_AUDIT_REL,
                     }
                 )
+                replay_doc_key, replay_doc_id = self._extract_sales_note_id_fields(prior_cli)
+                if replay_doc_key:
+                    prior_out["doc_key"] = replay_doc_key
+                if replay_doc_id:
+                    prior_out["document_id"] = replay_doc_id
                 return 200, prior_out
 
         run_sh = self._resolve_market_digest_run_sh()
@@ -13189,15 +13293,7 @@ class ResearchDataBridge:
                 return 502, {"ok": False, "status": "timeout", "request_id": request_id,
                              "error": f"add-note 超过 {self.cfg.wiki_ingest_timeout_s}s 未完成"}
             cli_text = stdout_bytes.decode("utf-8", errors="replace").strip()
-            cli_payload: dict[str, Any] = {}
-            last_line = cli_text.splitlines()[-1].strip() if cli_text else ""
-            if last_line.startswith("{"):
-                try:
-                    parsed_cli = json.loads(last_line)
-                    if isinstance(parsed_cli, dict):
-                        cli_payload = parsed_cli
-                except ValueError:
-                    cli_payload = {}
+            cli_payload = self._parse_sales_notes_cli_json(cli_text)
             if proc.returncode != 0 and not cli_payload:
                 return 502, {
                     "ok": False,
@@ -13265,10 +13361,11 @@ class ResearchDataBridge:
                 "cli_result": cli_payload,
                 "audit_path": self._SALES_NOTES_AUDIT_REL,
             }
-            doc_key = str(cli_payload.get("doc_key") or "")
+            doc_key, document_id = self._extract_sales_note_id_fields(cli_payload)
             if doc_key:
                 response["doc_key"] = doc_key
-                response["document_id"] = f"manual:{doc_key}" if not doc_key.startswith("manual:") else doc_key
+            if document_id:
+                response["document_id"] = document_id
             return 200, response
         finally:
             if tmp_payload is not None:

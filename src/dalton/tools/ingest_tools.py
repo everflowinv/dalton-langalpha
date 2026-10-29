@@ -258,6 +258,10 @@ def build_ingest_sales_note_tool(
             )
         if request_id is not None:
             resp.setdefault("request_id", request_id)
+        if confirm and resp.get("ok") is True:
+            extracted_id = _extract_ingest_identifier("sales-notes", resp)
+            if extracted_id and not resp.get("document_id"):
+                resp["document_id"] = extracted_id
         return json.dumps(resp, ensure_ascii=False)
 
     return _ingest_sales_note
@@ -672,6 +676,80 @@ def build_ingest_research_tool(
     return _ingest_research
 
 
+_KNOWN_DOC_ID_PREFIXES = (
+    "manual:",
+    "mail:",
+    "sales-note:",
+    "tmtb:",
+    "funda:",
+    "digest:",
+    "wiki:",
+)
+
+
+def _extract_ingest_identifier(library: str, resp: dict[str, Any]) -> str:
+    """Extract and normalize the record identifier from a bridge ingest response.
+
+    Inspects top-level fields first, then nested `cli_result` / `note` /
+    `document` / `result` / `data` dicts so sales-notes and company-wiki
+    identifiers surface even when the CLI nests them inside `cli_result`.
+    """
+    if not isinstance(resp, dict):
+        return ""
+    candidates: list[dict[str, Any]] = [resp]
+    cli_result = resp.get("cli_result")
+    if isinstance(cli_result, dict):
+        candidates.append(cli_result)
+    for container in list(candidates):
+        for sub_key in ("note", "document", "result", "data", "cli_preview"):
+            sub = container.get(sub_key)
+            if isinstance(sub, dict) and sub not in candidates:
+                candidates.append(sub)
+
+    def _clean(val: Any) -> str:
+        if val is None or isinstance(val, bool):
+            return ""
+        return str(val).strip()
+
+    lib_norm = (library or "").strip().lower()
+    primary_keys = (
+        "document_id",
+        "note_id",
+        "doc_key",
+        "doc_id",
+        "id",
+        "email_id",
+        "canonical_id",
+        "existing_doc_id",
+    )
+    for cand in candidates:
+        for key in primary_keys:
+            val = _clean(cand.get(key))
+            if not val:
+                continue
+            if lib_norm in ("company-wiki", "wiki"):
+                if key in ("doc_id", "existing_doc_id", "id") and val.isdigit():
+                    return f"wiki:{val}"
+                return val
+            if lib_norm in ("sales-notes", "sales notes"):
+                if (
+                    key == "doc_key"
+                    and not val.startswith(_KNOWN_DOC_ID_PREFIXES)
+                    and "/" not in val
+                ):
+                    return f"manual:{val}"
+                return val
+            return val
+
+    fallback_keys = ("filepath", "note_path", "path", "existing_filepath", "filename")
+    for cand in candidates:
+        for key in fallback_keys:
+            val = _clean(cand.get(key))
+            if val:
+                return val
+    return ""
+
+
 def _render_ingest_receipt(
     library: str, resp: dict[str, Any], auto_ingest: bool, effective_confirm: bool
 ) -> str:
@@ -682,20 +760,27 @@ def _render_ingest_receipt(
     instead of the full preview payload.
     """
     if not (auto_ingest and effective_confirm and resp.get("ok") is True):
+        if isinstance(resp, dict) and resp.get("ok") is True and not resp.get("dry_run"):
+            extracted = _extract_ingest_identifier(library, resp)
+            if extracted and not resp.get("document_id"):
+                resp = {**resp, "document_id": extracted}
         return json.dumps(resp, ensure_ascii=False)
-    identifier = (
-        resp.get("document_id")
-        or resp.get("doc_key")
-        or resp.get("doc_id")
-        or resp.get("filepath")
+    identifier = _extract_ingest_identifier(library, resp)
+    cli_res = resp.get("cli_result") if isinstance(resp.get("cli_result"), dict) else {}
+    name = str(
+        resp.get("title")
+        or cli_res.get("title")
+        or resp.get("institution")
+        or cli_res.get("institution")
+        or resp.get("target")
+        or cli_res.get("target")
         or ""
     )
-    name = str(resp.get("title") or resp.get("institution") or resp.get("target") or "")
     receipt = {
         "ok": True,
         "auto_ingest": True,
         "receipt": (
-            f"已入库 {library}；编号 {identifier or '（见 cli_result/audit_path）'}；{name}"
+            f"已入库 {library}；编号 {identifier or '编号未返回'}；{name}"
         ),
         "library": library,
         "document_id": identifier or None,
@@ -707,7 +792,7 @@ def _render_ingest_receipt(
         if resp.get(key):
             receipt[key] = resp[key]
     if resp.get("status") == "duplicate":
-        receipt["receipt"] = f"检测到重复，未写第二份（{library} 已有该内容：{identifier or '同内容记录'}）"
+        receipt["receipt"] = f"检测到重复，未写第二份（{library} 已有该内容：{identifier or '编号未返回'}）"
     return json.dumps(receipt, ensure_ascii=False)
 
 
