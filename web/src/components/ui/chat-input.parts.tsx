@@ -54,12 +54,15 @@ export const FilePreviewCard = ({ file, onRemove }: { file: FileAttachment; onRe
             setPreviewOpen(true);
           }}
           aria-label={t('chat.composer.previewImage')}
-          // Inset ring: the card clips overflow, so the app's usual focus ring
-          // would be cut off at the card's edge.
-          className="relative block w-full h-full rounded-xl border-none bg-transparent p-0 cursor-zoom-in focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+          className="group/preview relative block w-full h-full rounded-xl border-none bg-transparent p-0 cursor-zoom-in focus-visible:outline-hidden"
         >
           <img src={file.preview!} alt={file.file.name} className="w-full h-full object-cover" />
-          <span className="absolute inset-0 bg-black/20 group-hover:bg-black/0 transition-colors pointer-events-none" />
+          <span className="pointer-events-none absolute inset-0 bg-black/20 group-hover:bg-black/0 transition-colors" />
+          {/* Focus indicator as its own layer, after the image in DOM order:
+              a ring on the button itself is an inset box-shadow, painted under
+              the full-bleed image it would mark (same shape as the ::after
+              focus ring in HandoffParts' STRETCHED_BUTTON). */}
+          <span className="pointer-events-none absolute inset-0 rounded-xl ring-2 ring-inset ring-(--color-focus-ring) opacity-0 group-focus-visible/preview:opacity-100" />
         </button>
       ) : (
         <div className="w-full h-full p-3 flex flex-col justify-between">
@@ -109,6 +112,7 @@ export const FilePreviewCard = ({ file, onRemove }: { file: FileAttachment; onRe
           alt={file.file.name}
           open={previewOpen}
           onClose={() => setPreviewOpen(false)}
+          trapFocus
         />
       )}
     </motion.div>

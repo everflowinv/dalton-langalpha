@@ -5,6 +5,7 @@ import { MemoryRouter } from 'react-router';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { FilePreviewCard } from '../chat-input.parts';
 import ChatInput from '../chat-input';
+import ImageLightbox from '@/pages/ChatAgent/components/ImageLightbox';
 import type { FileAttachment } from '../chat-input.types';
 
 vi.mock('@/pages/ChatAgent/utils/api', () => ({
@@ -109,11 +110,55 @@ describe('FilePreviewCard image preview', () => {
     expect(images()).toHaveLength(2);
   });
 
-  it('carries an inset focus ring the card cannot clip', () => {
+  it('paints the focus indicator above the image as its own layer', () => {
     render(<FilePreviewCard file={imageAttachment()} onRemove={vi.fn()} />);
-    const cls = openButton().className;
-    expect(cls).toContain('focus-visible:ring-2');
-    expect(cls).toContain('focus-visible:ring-inset');
+    const button = openButton();
+    const image = button.querySelector('img')!;
+    const focusLayer = Array.from(button.querySelectorAll('span')).find((s) =>
+      s.className.includes('group-focus-visible/preview:opacity-100'),
+    )!;
+    expect(focusLayer).toBeTruthy();
+    expect(focusLayer.className).toContain('pointer-events-none');
+    // DOM order: the layer renders after the image, so it paints above it —
+    // a ring on the button itself is a box-shadow under the image.
+    expect(
+      image.compareDocumentPosition(focusLayer) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+    // The button claims no ring of its own anymore.
+    expect(button.className).not.toContain('focus-visible:ring-');
+  });
+});
+
+describe('ImageLightbox without trapFocus (workspace images, file panel)', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('keeps focus where it was and still names itself a dialog', () => {
+    const opener = document.createElement('button');
+    document.body.appendChild(opener);
+    opener.focus();
+    render(<ImageLightbox src={PREVIEW_SRC} alt="cat.png" open onClose={vi.fn()} />);
+    expect(screen.getByRole('dialog')).toBeInTheDocument();
+    expect(screen.getByRole('img', { name: 'cat.png' })).toBeInTheDocument();
+    // No aria-modal and no focus trap: an outer Radix dialog owns focus here.
+    expect(screen.getByRole('dialog')).not.toHaveAttribute('aria-modal');
+    expect(document.activeElement).toBe(opener);
+    opener.remove();
+  });
+
+  it('closes on Escape without a focus trap', () => {
+    const onClose = vi.fn();
+    render(<ImageLightbox src={PREVIEW_SRC} alt="cat.png" open onClose={onClose} />);
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not close when the image itself is clicked', () => {
+    const onClose = vi.fn();
+    render(<ImageLightbox src={PREVIEW_SRC} alt="cat.png" open onClose={onClose} />);
+    fireEvent.click(screen.getByRole('img', { name: 'cat.png' }));
+    expect(onClose).not.toHaveBeenCalled();
   });
 });
 

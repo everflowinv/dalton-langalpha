@@ -1,3 +1,4 @@
+import { useEffect, type Ref } from 'react';
 import { createPortal } from 'react-dom';
 import { useTranslation } from 'react-i18next';
 import { X } from 'lucide-react';
@@ -8,18 +9,31 @@ interface ImageLightboxProps {
   alt?: string;
   open: boolean;
   onClose: () => void;
+  /**
+   * DALTON-HOOK(composer-attachment-preview): run the lightbox's own dialog
+   * focus trap — focus in on open, Tab held in, focus handed back to the
+   * opener on close. Only the composer's attachment preview passes it: a
+   * lightbox opened inside a Radix dialog (a tool call's Markdown image, the
+   * file panel) must leave focus management to the layer that owns it, so the
+   * default keeps plain Esc-and-backdrop dismissal with no focus movement.
+   */
+  trapFocus?: boolean;
 }
 
-/**
- * DALTON-HOOK(composer-attachment-preview): the composer's attachment
- * thumbnails open this lightbox, and a preview that leaves focus in the
- * composer would send the attachment on Enter and edit the draft behind the
- * scrim — so it became a real dialog: `useDialogA11y` moves focus in, traps
- * Tab, answers Escape, and hands focus back to the opener on close.
- */
-function ImageLightboxDialog({ src, alt, onClose }: Omit<ImageLightboxProps, 'open'>) {
+// DALTON-HOOK(composer-attachment-preview): one frame behind both behaviors —
+// only the trap variant (the composer's preview) carries the dialog ref and
+// aria-modal.
+function LightboxFrame({
+  src,
+  alt,
+  onClose,
+  dialogRef,
+  ariaModal,
+}: Omit<ImageLightboxProps, 'open' | 'trapFocus'> & {
+  dialogRef?: Ref<HTMLDivElement>;
+  ariaModal?: boolean;
+}) {
   const { t } = useTranslation();
-  const dialogRef = useDialogA11y<HTMLDivElement>(onClose);
   const backdrop = useBackdropDismiss<HTMLDivElement>(onClose);
 
   // A lightbox is a deliberately dark surface, not a dialog scrim: the close
@@ -30,7 +44,7 @@ function ImageLightboxDialog({ src, alt, onClose }: Omit<ImageLightboxProps, 'op
     <div
       ref={dialogRef}
       role="dialog"
-      aria-modal="true"
+      aria-modal={ariaModal || undefined}
       aria-label={alt ?? t('chat.composer.previewImage')}
       className="fixed inset-0 z-1020 flex items-center justify-center bg-black/90 scrim-in"
       {...backdrop}
@@ -56,12 +70,38 @@ function ImageLightboxDialog({ src, alt, onClose }: Omit<ImageLightboxProps, 'op
   );
 }
 
-// DALTON-HOOK(composer-attachment-preview): the dialog subtree mounts only
-// while open, so the focus trap above arms per open, not once for a lightbox
-// that sits mounted as null.
-function ImageLightbox({ src, alt, open, onClose }: ImageLightboxProps) {
+/**
+ * DALTON-HOOK(composer-attachment-preview): the composer's attachment
+ * thumbnails open the lightbox this way, and a preview that leaves focus in
+ * the composer would send the attachment on Enter and edit the draft behind
+ * the scrim — so it mounts as a real dialog: `useDialogA11y` moves focus in,
+ * traps Tab, answers Escape, and hands focus back to the opener on close.
+ */
+function ImageLightboxDialog(props: Omit<ImageLightboxProps, 'open' | 'trapFocus'>) {
+  const dialogRef = useDialogA11y<HTMLDivElement>(props.onClose);
+  return <LightboxFrame {...props} dialogRef={dialogRef} ariaModal />;
+}
+
+/** The default: no focus movement, just Escape and backdrop dismissal. */
+function ImageLightboxPlain(props: Omit<ImageLightboxProps, 'open' | 'trapFocus'>) {
+  const { onClose } = props;
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose();
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [onClose]);
+  return <LightboxFrame {...props} />;
+}
+
+// DALTON-HOOK(composer-attachment-preview): the subtree mounts only while
+// open, so whichever behavior is chosen arms per open, not once for a
+// lightbox that sits mounted as null.
+function ImageLightbox({ src, alt, open, onClose, trapFocus = false }: ImageLightboxProps) {
   if (!open) return null;
-  return <ImageLightboxDialog src={src} alt={alt} onClose={onClose} />;
+  const body = { src, alt, onClose };
+  return trapFocus ? <ImageLightboxDialog {...body} /> : <ImageLightboxPlain {...body} />;
 }
 
 export default ImageLightbox;
