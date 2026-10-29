@@ -203,6 +203,27 @@ async def test_switch_off_every_transcription_endpoint_returns_404(
 
 
 @pytest.mark.asyncio
+async def test_switch_off_answers_404_before_parameter_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A malformed request to a switched-off deployment is 404, not 422."""
+    _switch_off(monkeypatch)
+    _set_storage(monkeypatch, True)
+
+    app = FastAPI()
+    app.include_router(transcriptions_router)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        bad_query = await client.get("/api/v1/dalton/transcriptions/usage", params={"limit": "abc"})
+        bad_body = await client.post(
+            "/api/v1/dalton/transcriptions", json={"source_size_bytes": "not-a-number"}
+        )
+    for resp in (bad_query, bad_body):
+        assert resp.status_code == 404, resp.text
+        assert resp.json()["detail"] == "Transcription is not enabled"
+
+
+@pytest.mark.asyncio
 async def test_switch_on_api_passes_the_gate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

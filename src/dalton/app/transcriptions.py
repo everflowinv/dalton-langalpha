@@ -38,7 +38,26 @@ from src.server.utils.api import get_current_user_id, handle_api_exceptions
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/api/v1/dalton/transcriptions", tags=["Dalton Transcriptions"])
+def _require_dalton_enabled() -> None:
+    """Single gate every endpoint passes through (via `_resolve_caller_and_ticket` or directly).
+
+    Both checks read as "feature does not exist" (404), never 403/503: the
+    transcription master switch is off exactly when the deployment must not
+    expose the feature at all.
+    """
+    if not get_dalton_settings().enabled:
+        raise HTTPException(status_code=404, detail="Dalton mode disabled")
+    if not is_transcription_enabled():
+        raise HTTPException(status_code=404, detail="Transcription is not enabled")
+
+
+# A router dependency runs before FastAPI validates query and body parameters,
+# so a switched-off deployment answers 404 even to a malformed request.
+router = APIRouter(
+    prefix="/api/v1/dalton/transcriptions",
+    tags=["Dalton Transcriptions"],
+    dependencies=[Depends(_require_dalton_enabled)],
+)
 
 _optional_bearer = HTTPBearer(auto_error=False)
 
@@ -61,19 +80,6 @@ class CreateOrSubmitTranscriptionRequest(BaseModel):
     language: str | None = None
     hotwords: list[str] | str | None = None
     submit: bool = True
-
-
-def _require_dalton_enabled() -> None:
-    """Single gate every endpoint passes through (via `_resolve_caller_and_ticket` or directly).
-
-    Both checks read as "feature does not exist" (404), never 403/503: the
-    transcription master switch is off exactly when the deployment must not
-    expose the feature at all.
-    """
-    if not get_dalton_settings().enabled:
-        raise HTTPException(status_code=404, detail="Dalton mode disabled")
-    if not is_transcription_enabled():
-        raise HTTPException(status_code=404, detail="Transcription is not enabled")
 
 
 def _extract_ticket_from_request(
