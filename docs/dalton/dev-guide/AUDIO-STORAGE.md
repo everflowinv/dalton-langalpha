@@ -6,12 +6,13 @@
 
 ## 1. 三种网络视角与 Endpoint 职责
 
-在 `docker-compose.dalton.yml` 中，`minio` 服务仅绑定在宿主机回环地址 `127.0.0.1:9000`。**在 Linux 宿主机上，容器内的 `host.docker.internal` 解析为 Docker 网桥网关 IP（如 `172.17.0.1`），无法连通宿主机 `127.0.0.1:9000`**。因此后端与沙箱必须通过同一个 Docker Compose 网络以服务名 `http://minio:9000` 通信，而浏览器通过 HTTPS 反向代理域名访问（实现见 `src/utils/storage/s3_compatible.py:99-137`）：
+在 `docker-compose.dalton.yml` 中，`minio` 服务仅绑定在宿主机回环地址 `127.0.0.1:9000`。**在 Linux 宿主机上，容器内的 `host.docker.internal` 解析为 Docker 网桥网关 IP（如 `172.17.0.1`），无法连通宿主机 `127.0.0.1:9000`**。因此后端必须通过 Docker Compose 网络以服务名 `http://minio:9000` 通信，浏览器通过 HTTPS 反向代理域名访问（实现见 `src/utils/storage/s3_compatible.py:99-137`）。沙箱分两条路径：**录音转写（A1）的分片上传使用 `STORAGE_BROWSER_ENDPOINT_URL`（公网 HTTPS，与浏览器 2 GiB 直传共用同一 Caddy 反代），沙箱不需要也不应接入 Compose 网络**（接入会让沙箱内的代理代码直连后端的 Postgres / Redis）；仅工作区直传拉取（`workspace_upload_pull.py`）在 `STORAGE_BLOB_TRANSFER=direct` 时才需要加入同一 Compose 网络，该项在生产保持关闭：
 
 | 网络视角 | 使用的环境变量 | 调用阶段与职责 | 必须配置的值 |
 |---|---|---|---|
 | **后端容器**（`backend`） | `STORAGE_ENDPOINT_URL` | `create_multipart_upload`、`complete_multipart_upload`、`abort_multipart_upload`、`head_object`、`delete_object`，以及生成供沙箱拉取的预签名 GET URL（`sign_get_url`） | `http://minio:9000`（Compose 容器内网直连） |
-| **沙箱容器**（Docker Sandbox） | `STORAGE_ENDPOINT_URL`（使用后端签发的 `get_url`） | `workspace_upload_pull.py` 调用 `sandbox.pull_direct(url=get_url, ...)`，在沙箱内流式 `GET` 临时对象到 `.wsfiles-upload-<upload_id>` 并原子重命名到目标路径 | 沙箱必须加入同一 Compose 网络（在 `agent_config.yaml` / `agent_config.dalton.yaml` 中配置 `sandbox.docker.network_mode`），使用同一个 `http://minio:9000` |
+| **沙箱容器**（录音转写 A1 分片上传，`dalton_asr.py`） | `STORAGE_BROWSER_ENDPOINT_URL` | 后端 `sign_transcription_upload_part` 以 `for_browser=True` 签发预签名 PUT URL；沙箱内的 `dalton_asr.py` 直接向公网 HTTPS 地址 `PUT` 音频分片，**不需要也不应接入 Compose 网络**（未配置该地址时 `sign_upload_part` 回退签内网地址，沙箱将连不上，功能由 `DALTON_TRANSCRIPTION_ENABLED` 总开关保护） | 生产：`https://storage.<domain>`（与浏览器 2 GiB 直传共用） |
+| **沙箱容器**（工作区直传拉取，`workspace_upload_pull.py`；仅 `STORAGE_BLOB_TRANSFER=direct` 时，生产保持关闭） | `STORAGE_ENDPOINT_URL`（使用后端签发的 `get_url`） | `sandbox.pull_direct(url=get_url, ...)`，在沙箱内流式 `GET` 临时对象到 `.wsfiles-upload-<upload_id>` 并原子重命名到目标路径；此路径需要沙箱加入同一 Compose 网络（在 `agent_config.yaml` / `agent_config.dalton.yaml` 中配置 `sandbox.docker.network_mode`） | `http://minio:9000`（Compose 容器内网直连） |
 | **浏览器前端** | `STORAGE_BROWSER_ENDPOINT_URL` | 后端用 `_browser_client` 为每个分片签发预签名 PUT URL（`sign_part_url`）；浏览器直接 `PUT` 分片并读取响应头 `ETag` | 生产：`https://storage.<domain>`（经 Caddy HTTPS 反代到 `127.0.0.1:9000`）；仅本机同机调试可用 `http://127.0.0.1:9000` |
 
 ### 关键网络与反代注意事项
@@ -30,14 +31,16 @@
 2. **HTTPS 页面 Mixed Content 限制**：
    若前端通过 `https://` 访问，`STORAGE_BROWSER_ENDPOINT_URL` 必须同样为 `https://`，否则浏览器会拦截向 `http://` 发起的分片 `PUT`。
 3. **Docker 沙箱网络配置（`sandbox.docker.network_mode`）**：
-   - 因为后端 `sign_get_url` 使用 `STORAGE_ENDPOINT_URL=http://minio:9000` 签名，Docker 沙箱容器必须与 `backend`、`minio` 处于同一 Compose 网络，才能解析 `minio` 并通过签名校验。
+   - 仅工作区直传拉取（`workspace_upload_pull.py`）在 `STORAGE_BLOB_TRANSFER=direct` 时需要沙箱加入 Compose 网络：因为后端 `sign_get_url` 使用 `STORAGE_ENDPOINT_URL=http://minio:9000` 签名，Docker 沙箱容器必须与 `backend`、`minio` 处于同一 Compose 网络，才能解析 `minio` 并通过签名校验；该项在生产保持关闭。
+   - 录音转写（A1）的沙箱分片上传使用 `STORAGE_BROWSER_ENDPOINT_URL`（公网 HTTPS），沙箱不需要也不应为此接入 Compose 网络。
    - 实际配置字段位于 `agent_config.yaml` / `agent_config.dalton.yaml` 的 `sandbox.docker.network_mode`（见 `src/ptc_agent/config/core.py:461`、`src/ptc_agent/core/sandbox/providers/docker.py:704`；Dalton 默认值为 `"bridge"`，见 `agent_config.yaml:125`；**注意不是 `config.dalton.yaml` 的 `sandbox.docker.network`**）。
-   - 在 `agent_config.dalton.yaml`（或 `agent_config.yaml`）中将其设为 Compose 网络名（可通过 `docker network ls` 查看，通常为 `<project>_default`，如 `repo_default`）：
+   - **仅非生产方案使用**：工作区直传拉取（`STORAGE_BLOB_TRANSFER=direct` + 沙箱接入 Compose 网络）是非生产方案，生产保持关闭（`STORAGE_BLOB_TRANSFER` 不设置或保持默认，`network_mode` 维持默认 `"bridge"`，沙箱不接入 Compose 网络）；只有启用该方案时，才在 `agent_config.dalton.yaml`（或 `agent_config.yaml`）中将其设为 Compose 网络名（可通过 `docker network ls` 查看，通常为 `<project>_default`，如 `repo_default`）：
      ```yaml
      sandbox:
        docker:
-         network_mode: "repo_default" # 替换为实际的 docker compose 网络名
+         network_mode: "repo_default" # 替换为实际的 docker compose 网络名（仅上述非生产方案使用；生产保持默认 "bridge"）
      ```
+4. **沙箱访问公网存储地址走普通出网**：`dalton_asr.py` 向 `STORAGE_BROWSER_ENDPOINT_URL` 发出的分片 `PUT` 不经出口代理，走沙箱的普通出网；部署时确认沙箱能解析并连到该域名（若该域名解析到宿主机本身，注意 Docker 的回环 / hairpin 是否可达）。
 
 ---
 
@@ -53,10 +56,10 @@
 | `STORAGE_SECRET_ACCESS_KEY` / `MINIO_ROOT_PASSWORD` | 无（必填，**无默认凭据**） | `<随机高强度密钥>` | MinIO 启动必填密钥，未设置时 `minio` 容器拒绝启动 |
 | `STORAGE_REGION` | `us-east-1` | `us-east-1` | MinIO 默认区域 |
 | `STORAGE_ADDRESSING_STYLE` | `virtual`（`s3_compatible.py:89`） | **`path`**（必填） | MinIO 必须显式设为 `path`，否则默认 `virtual` 会拼接 `<bucket>.minio:9000` 导致 DNS 失败 |
-| `STORAGE_ENDPOINT_URL` | 无（必填） | `http://minio:9000` | 后端与沙箱在 Compose 网络内访问 MinIO 的地址 |
+| `STORAGE_ENDPOINT_URL` | 无（必填） | `http://minio:9000` | 后端容器在 Compose 网络内访问 MinIO 的地址；沙箱仅在非生产的工作区直传拉取方案（`STORAGE_BLOB_TRANSFER=direct`，生产保持关闭）下使用它，A1 转写与浏览器直传都不经过该地址 |
 | `STORAGE_BROWSER_ENDPOINT_URL` | 回退到 `STORAGE_ENDPOINT_URL` | `https://storage.example.com` | 浏览器直传 `PUT` 分片的公网 HTTPS 反代地址 |
-| `STORAGE_BLOB_TRANSFER` | **`auto`**（`__init__.py:78`） | **`direct`**（必填） | 默认 `auto` 仅对远程沙箱（Daytona/E2B）启用 `direct`，对 Docker 沙箱会回退为 `relay`（`__init__.py:90-106`）；**Docker 沙箱必须显式设为 `direct`** |
-| `STORAGE_BROWSER_UPLOADS` | **`false`**（`__init__.py:85`） | **`true`**（必填） | 默认关闭浏览器分片直传；**必须显式设为 `true`** |
+| `STORAGE_BLOB_TRANSFER` | **`auto`**（`__init__.py:78`） | **生产：不设置（保持默认 `auto`）** | 工作区直传拉取的路径开关：`direct` 要求 Docker 沙箱接入 Compose 网络（见第 1 节），是**非生产方案**，生产不设置或保持默认——`auto` 仅对远程沙箱（Daytona/E2B）启用 `direct`，对 Docker 沙箱回退为 `relay`（`__init__.py:90-106`）。生产不开 `direct` 时，文件面板 / 工作区上传全部走后端内存中继（`POST /{workspace_id}/files/upload`，`crud.py:1364`），单文件上限即中继上限：`RELAY_MAX_BYTES` = 256 MiB（`blob_keys.py:39`；`MAX_UPLOAD_BYTES = RELAY_MAX_BYTES`，`_shared.py:202`；生效值为 `min(RELAY_MAX_BYTES, scan_cap)`，见 `uploads.py:183`、`crud.py:1417-1419`），超过直接返回 `413`（见第 6 节）。**只有 A1 转写的沙箱分片上传**不依赖本变量——它由沙箱直接 `PUT` 到公网存储地址（`sign_transcription_upload_part` 以 `for_browser=True` 签名，`src/dalton/services/transcriptions.py:1412-1474`，不检查传输模式与 `browser_uploads_enabled`），只需 `STORAGE_BROWSER_ENDPOINT_URL`；但录音需先放进工作区，单个录音文件因此也受中继上限约束（常见 2 小时 mp3 约 115 MB，在 256 MiB 上限内；超大的无损 WAV 需先转码或压缩） |
+| `STORAGE_BROWSER_UPLOADS` | **`false`**（`__init__.py:85-87`） | **生产：不设置（默认 `false`）**；仅与非生产的 `direct` 方案一起设为 `true` | 浏览器分片直传的开关，但**单独设 `true` 并不能开启直传**：`direct_available()`（`uploads.py:108-118`）还要求传输模式已解析为 `direct`（即 `scan_cap_bytes` 返回 `None`，`transfer.py:224-238`）且沙箱非 SSH——`relay` 模式下浏览器分片直传不可用（`browser_uploads_enabled` 仅在这一处被检查，`uploads.py:115`），上传一律走后端中继单请求路径。生产（`auto` → Docker 回退 `relay`）不设置本变量；A1 转写的沙箱分片上传同样不依赖它 |
 | `STORAGE_KEY_PREFIX` | 空字符串 `""` | `dalton/`（或保持空） | 对象键全局前缀；**一旦上线切勿修改**（见第 4 节） |
 | `DALTON_CORS_ALLOWED_ORIGINS` | 无（必填） | `https://dalton.example.com` | 逗号分隔的允许浏览器源（禁止 `*`）；在 `docker-compose.dalton.yml` 中注入为 `MINIO_API_CORS_ALLOW_ORIGIN` |
 | `DALTON_UPLOADS_EXPIRE_DAYS` | `2` | `2`（仅允许 `1` 或 `2`） | `configure_minio.sh` 为 `<STORAGE_KEY_PREFIX>uploads/` 配置的对象过期天数 |
@@ -78,7 +81,7 @@
      - `storage.provider` → `STORAGE_PROVIDER`（`agent_config.yaml:202-206` 已固定 `provider: "s3"`）
      - `storage.blob_transfer` → `STORAGE_BLOB_TRANSFER`
      - `storage.browser_uploads` → `STORAGE_BROWSER_UPLOADS`
-   - 注意：若在 `agent_config.yaml` 或 `agent_config.dalton.yaml` 中显式写了 `browser_uploads: false` 或 `blob_transfer: relay`，YAML 会直接覆盖 `.env` 中的 `STORAGE_BROWSER_UPLOADS=true` / `STORAGE_BLOB_TRANSFER=direct`（`__init__.py:39-45`）。因此请不要在 YAML 中写死 `false`/`relay`，保持通过环境变量开启。
+   - 注意：这 3 个开关项在 YAML 中的显式值（包括 `false` / `relay` 这类假值）会直接覆盖 `.env` 中的同名环境变量——`_load_storage_setting` 先读 YAML、未设置时才回退环境变量（`__init__.py:36-48`）。生产不开启 `direct`：`STORAGE_BLOB_TRANSFER` 不设置即保持默认 `auto`（Docker 沙箱解析为 `relay`）；浏览器分片直传是否开启以 `STORAGE_BROWSER_UPLOADS` 为准（见第 2 节——仅与非生产的 `direct` 方案一起设置）。
 2. **仅从环境变量读取的 S3 连接与桶参数（不读 YAML）**：
    - `StorageConfig`（`src/utils/storage/s3_compatible.py:99-137`）与 `src/utils/storage/key_prefix.py` **只从环境变量**读取 `STORAGE_BUCKET_NAME`、`STORAGE_ACCESS_KEY_ID`、`STORAGE_SECRET_ACCESS_KEY`、`STORAGE_REGION`、`STORAGE_ENDPOINT_URL`、`STORAGE_BROWSER_ENDPOINT_URL`、`STORAGE_ADDRESSING_STYLE`、`STORAGE_KEY_PREFIX`、`STORAGE_MAX_UPLOAD_SIZE`，在任何 YAML 中配置这些字段均不会生效。
 
@@ -137,4 +140,4 @@
    - **容量公式建议**：若单次长录音为 `500 MB`，单任务峰值磁盘消耗按 `500 MB × (3 ~ 5) ≈ 1.5 GB ~ 2.5 GB` 预留；支持并发上传时按同一电脑上所有上传者的预留总和叠加，并保留至少 `50 MiB`（`CRITICAL_FREE_BYTES`，见 `src/server/services/computer_disk.py:29`）的电脑级安全余量。
 2. **内存边界保护**：
    - `backend` 容器内存限制为 `4g`（见 `docker-compose.dalton.yml`）。
-   - 当 `direct_available()` 为假（对象存储未启用或沙箱不支持直拉）时，超过内存中转上限（`relay_cap`，默认 100 MiB）的大文件会直接返回 `413 Payload Too Large`（提示*"大文件需要对象存储直传，当前未启用"*），**绝不降级为后端整文件读入内存**。
+   - 当 `direct_available()` 为假（对象存储未启用或沙箱不支持直拉）时，超过内存中转上限（`relay_cap` = `min(RELAY_MAX_BYTES, scan_cap)`：对象存储启用、走中继时为 `RELAY_MAX_BYTES` 256 MiB（`blob_keys.py:39`），对象存储未启用时收紧为 `INLINE_MAX_BYTES` 100 MiB（`blob_keys.py:44`））的大文件会直接返回 `413 Payload Too Large`（提示*"大文件需要对象存储直传，当前未启用"*），**绝不降级为后端整文件读入内存**。
