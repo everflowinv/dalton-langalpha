@@ -23,6 +23,9 @@ export interface HandoffPlace {
   reportRunId?: string;
   /** How that run ended, as the report has it; absent on older reports. */
   outcome?: ReportOutcome;
+  // DALTON-HOOK(handoff-report-quiescence): the run ended but background
+  // work is still open — the card must not read this as finished work.
+  unfinished?: boolean;
   /** The report follows the hand-off straight on: nothing between them but
    *  replies and reports. */
   reportFollows?: boolean;
@@ -53,6 +56,8 @@ interface Report {
   outcome?: ReportOutcome;
   // DALTON-HOOK(handoff-keep-on-resumable): interim resumable failure report
   resumable?: boolean;
+  // DALTON-HOOK(handoff-report-quiescence): run ended, background work open
+  unfinished?: boolean;
   at: number;
   claimed: boolean;
 }
@@ -105,8 +110,10 @@ export function placeHandoffs(messages: readonly { message: MessageRecord }[]): 
       const provenance = message.provenance as MessageProvenance | undefined;
       if (provenance?.kind === 'analyst_report' && provenance.threadId) {
         // DALTON-HOOK(handoff-keep-on-resumable): carry resumable flag on Report
-        const { threadId, runIds = [], steerIds, outcome, resumable } = provenance;
-        reports.push({ id: String(message.id), threadId, runIds, steerIds, outcome, resumable, at, claimed: false });
+        const { threadId, runIds = [], steerIds, outcome, resumable, unfinished } = provenance;
+        reports.push({ id: String(message.id), threadId, runIds, steerIds, outcome, resumable, at, claimed: false,
+          // DALTON-HOOK(handoff-report-quiescence)
+          ...(unfinished !== undefined ? { unfinished: true } : {}) });
       }
       return;
     }
@@ -128,6 +135,8 @@ export function placeHandoffs(messages: readonly { message: MessageRecord }[]): 
       reportId: r.id,
       reportRunId: r.runIds.at(-1),
       outcome: r.outcome,
+      // DALTON-HOOK(handoff-report-quiescence)
+      ...(r.unfinished ? { unfinished: true } : {}),
       reportFollows: followsOn(messages, h.at, r.at),
     });
   };

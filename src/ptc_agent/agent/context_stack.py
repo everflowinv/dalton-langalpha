@@ -90,6 +90,9 @@ def build_context_middleware(
             inherits_rules=turn.inherits_rules,
             disk_free_mb=turn.disk_free_mb,
             disk_known=turn.disk_known,
+            # DALTON-HOOK(turn-row-model-line): the server-resolved model of
+            # the turn, stated in its anchor row.
+            model_key=turn.model_key,
         ),
         baseline=BaselineContextMiddleware(
             session=session,

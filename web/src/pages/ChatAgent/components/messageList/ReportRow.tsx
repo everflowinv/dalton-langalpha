@@ -73,23 +73,29 @@ export function ReportRow({
  * right under. The name truncates and the outcome never does, since the
  * outcome is the news.
  */
+// DALTON-HOOK(handoff-report-quiescence): the report line can carry a muted
+// second detail line — the unfinished report's listing of open work.
 function ReportLineParts({
   lead,
   name,
   glyph,
   outcomeKey,
   onOpen,
+  detail,
 }: {
   lead: React.ReactNode;
   name: string;
   glyph: RunGlyphKind | null;
   outcomeKey: string;
   onOpen: (() => void) | undefined;
+  /** A muted second line under the report, for what else it has to say. */
+  detail?: string | null;
 }): React.ReactElement {
   const { t } = useTranslation();
   const labelId = useId();
   const outcome = t(outcomeKey);
   return (
+    <>
     <div className={REPORT_LINE}>
       {lead}
       {/* The plain words as a title, for when a long name truncates. */}
@@ -107,6 +113,16 @@ function ReportLineParts({
         </button>
       )}
     </div>
+    {/* DALTON-HOOK(handoff-report-quiescence): the unfinished listing */}
+    {detail && (
+      <div
+        className="max-w-full truncate text-[0.71875rem] text-(--color-text-secondary) opacity-75"
+        title={detail}
+      >
+        {detail}
+      </div>
+    )}
+    </>
   );
 }
 
@@ -138,14 +154,18 @@ function AnalystReportRow({
 }): React.ReactElement {
   const { t } = useTranslation();
   const openDispatchedThread = useOpenDispatchedThread(dispatcherContext);
-  const { threadId, workspaceId, workspaceName, outcome } = provenance;
+  const { threadId, workspaceId, workspaceName, outcome, unfinished } = provenance;
+  // DALTON-HOOK(handoff-report-quiescence): a report the wait cap sent says
+  // the work is unfinished — never worded, glyphed or read as completed.
+  const honest = unfinished !== undefined;
   const { glyph, key } = analystOutcome(outcome);
   return (
     <ReportLineParts
       lead={<Inbox aria-hidden className="h-3 w-3 shrink-0" />}
       name={workspaceName ? t('chat.provenance.analyst', { name: workspaceName }) : t('chat.provenance.analystUnnamed')}
-      glyph={glyph}
-      outcomeKey={key}
+      glyph={honest ? 'ring' : glyph}
+      outcomeKey={honest ? 'chat.provenance.reportedBackUnfinished' : key}
+      detail={unfinished && unfinished.length > 0 ? unfinished.join('、') : null}
       onOpen={threadId && !readOnly ? () => openDispatchedThread(threadId, workspaceId) : undefined}
     />
   );

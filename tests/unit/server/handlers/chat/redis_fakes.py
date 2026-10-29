@@ -129,8 +129,28 @@ class FakeClient:
             for k, v in self.hashes.get(key, {}).items()
         }
 
-    async def expire(self, key, ttl) -> None:
+    # DALTON-HOOK(handoff-report-quiescence): models Redis >= 7's
+    # conditional EXPIRE and TTL reads, which the report-back wait's key
+    # renewal depends on: gt extends a live TTL only upward, and a key that
+    # exists with no TTL reads as immortal (-1), which gt never beats.
+    def _ttl_of(self, key) -> int:
+        if key in self.ttls:
+            return self.ttls[key]
+        exists = (
+            key in self.kv
+            or key in self.sets
+            or key in self.lists
+            or key in self.hashes
+        )
+        return -1 if exists else -2
+
+    async def expire(self, key, ttl, gt: bool = False) -> None:
+        if gt and self._ttl_of(key) >= ttl:
+            return  # the server refuses to shorten a live/immortal TTL
         self.ttls[key] = ttl
+
+    async def ttl(self, key) -> int:
+        return self._ttl_of(key)
 
     async def hget(self, key, field):
         value = self.hashes.get(key, {}).get(str(field))

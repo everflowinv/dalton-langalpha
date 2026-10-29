@@ -325,6 +325,11 @@ class AnalystReport(BaseModel):
     outcome: Optional[Literal["completed", "error", "cancelled"]] = None
     run_ids: Optional[List[str]] = None
     steer_ids: Optional[List[str]] = None
+    # DALTON-HOOK(handoff-report-quiescence): set on the report the wait cap
+    # sends instead of a completed one: the run ended, but background work it
+    # waited on is still open, named here. The outcome stays the run's own
+    # ("completed"); this field is what tells history the deliverable is not.
+    unfinished: Optional[List[str]] = None
     # DALTON-HOOK(handoff-keep-on-resumable): mark interim resumable-interruption reports
     resumable: Optional[bool] = None
 

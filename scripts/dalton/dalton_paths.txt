@@ -102,3 +102,5 @@ web/src/components/ui/__tests__/chat-input.filePreview.test.tsx
 # A1 storage split: transcription audio moves to its own DALTON_ASR_STORAGE_* store.
 src/dalton/transcription_storage.py
 tests/unit/dalton/test_transcription_storage.py
+# R1: grouped handoff tallies keep unfinished reports apart.
+web/src/pages/ChatAgent/components/analystHandoff/__tests__/HandoffGroup.unfinished.test.tsx

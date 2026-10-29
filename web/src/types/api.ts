@@ -649,6 +649,10 @@ export type ReportSource =
        *  absent when unknown (a report from before it was kept, or one the
        *  server could not read it for). */
       steer_ids?: string[];
+      // DALTON-HOOK(handoff-report-quiescence): the wait cap's honest report —
+      // the run ended but background work is still open, named here; empty
+      // when the server could not list it. Present = never show "completed".
+      unfinished?: string[];
       // DALTON-HOOK(handoff-keep-on-resumable): interim resumable failure report
       resumable?: boolean;
       // DALTON-HOOK(colleague-dispatch): colleague workspace owner display name

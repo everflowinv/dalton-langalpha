@@ -6,7 +6,8 @@ applicability (ordinary runs no-op) and RAISE on transport failure so the
 drainer's nack/backoff — not a swallowed log line — is the retry path.
 """
 
-from unittest.mock import AsyncMock, MagicMock, patch
+# DALTON-HOOK(handoff-report-quiescence): create_autospec for the probe stub
+from unittest.mock import AsyncMock, MagicMock, create_autospec, patch
 
 import pytest
 
@@ -16,6 +17,7 @@ from src.server.database.runs.outbox import (
     build_finalize_jobs_from_run_row,
 )
 from src.server.services.report_back.handoff import core
+from src.server.services.report_back.handoff import executor as handoff_executor
 from src.server.services.report_back import subagent as task_report_back
 from src.server.services.report_back.handoff.pointer import ClearOutcome
 from src.server.services import hook_outbox
@@ -34,6 +36,22 @@ def _registered_executors():
     Registration is idempotent for the same function, so autouse is safe."""
     core.register_outbox_executors()
     task_report_back.register_outbox_executors()
+
+
+@pytest.fixture(autouse=True)
+def _quiescent_analyst():
+    # DALTON-HOOK(handoff-report-quiescence): the real hand-off executor this
+    # module drives holds a completed report until the analyst thread is
+    # quiescent; these tests have no subagent ledger, so the probe defaults
+    # to quiescent (the pre-hold behavior they were written against).
+    with patch.object(
+        handoff_executor,
+        "analyst_thread_quiescent",
+        create_autospec(
+            handoff_executor.analyst_thread_quiescent, return_value=True
+        ),
+    ) as probe:
+        yield probe
 
 
 # ---------------------------------------------------------------------------

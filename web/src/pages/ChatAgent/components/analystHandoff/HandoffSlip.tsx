@@ -36,14 +36,18 @@ export function HandoffSlip({ view, grouped = false }: { view: HandoffView; grou
     >
       {grouped ? (
         <span aria-hidden className="flex justify-center">
-          <RunGlyph kind={columnGlyph(phase)} large />
+          {/* DALTON-HOOK(handoff-report-quiescence): not done while its
+              report says work is still open */}
+          <RunGlyph kind={columnGlyph(phase, view.unfinished)} large />
         </span>
       ) : <AnalystMark />}
       <span className="min-w-0">
         <HandoffTitleLine view={view} taskId={taskId} describedBy={`${metaId} ${statusId}`} />
         <HandoffMetaLine
           id={metaId}
-          status={<HandoffStatus phase={phase} startedAt={view.startedAt} finishedAt={view.finishedAt} glyph={!grouped} />}
+          status={<HandoffStatus phase={phase} startedAt={view.startedAt} finishedAt={view.finishedAt} glyph={!grouped}
+            // DALTON-HOOK(handoff-report-quiescence)
+            unfinished={view.unfinished} />}
           workspaceName={view.workspaceName}
           steered={view.steered}
           namesAnalyst={!grouped}
@@ -57,6 +61,8 @@ export function HandoffSlip({ view, grouped = false }: { view: HandoffView; grou
         finishedAt={view.finishedAt}
         read={view.read}
         live={!grouped}
+        // DALTON-HOOK(handoff-report-quiescence)
+        unfinished={view.unfinished}
       />
     </div>
   );

@@ -2269,7 +2269,8 @@
       "stopped": "was stopped",
       "taskFinished": "finished",
       "taskFailed": "failed",
-      "commandStoppedEarly": "stopped early"
+      "commandStoppedEarly": "stopped early",
+      "reportedBackUnfinished": "reported back, background work unfinished"
     },
     "taskCard": {
       "statusRunning": "Running",
@@ -2385,11 +2386,13 @@
       "summaryNeedsAnswer_one": "{{count}} needs your answer",
       "summaryNeedsAnswer_other": "{{count}} need your answer",
       "summaryFinished": "{{count}} finished",
+      "summaryUnfinished": "{{count}} reported back, work unfinished",
       "summaryCouldntFinish": "{{count}} couldn't finish",
       "summaryStopped": "{{count}} stopped",
       "summaryCouldntStart": "{{count}} couldn't start",
       "alwaysApprove": "Always allow",
-      "alwaysApproveHint": "Hand this and later work to Analysts without asking. Turn it off in Settings."
+      "alwaysApproveHint": "Hand this and later work to Analysts without asking. Turn it off in Settings.",
+      "finishedUnfinished": "Reported back, background work unfinished"
     },
     "marketWatch": {
       "watching": "Watching {{symbols}}",

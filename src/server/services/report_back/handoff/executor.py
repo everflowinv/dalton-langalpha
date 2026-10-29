@@ -10,8 +10,12 @@ ordering chain can't advance early.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
+import time
 import uuid
+
+import redis.exceptions as redis_exceptions
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -58,6 +62,13 @@ class OwedAnalystReport:
     ptc_thread_id: str
     final_status: str
     run_id: str | None = None
+    # DALTON-HOOK(handoff-report-quiescence): set when the quiescence wait
+    # hit its cap — the report the executor posts then names this still-open
+    # work instead of presenting the run as a finished deliverable. The
+    # LIST (empty included) is the independent "unfinished" state; whether
+    # the listing could be read only words the message.
+    unfinished: list[str] | None = None
+    listing_failed: bool = False
 
     def steerable_into(self, thread_id: str) -> bool:
         """Whether a live turn on ``thread_id`` can take this report in. A
@@ -215,6 +226,10 @@ async def execute_report_back(job: dict) -> None:
     dispatch_gen = payload.get("dispatch_gen")
     job_id = str(job["hook_outbox_id"])
     attempts = job["attempts"]
+    # The failure budget the DB ceilings read: raw claim count minus the
+    # reschedules a wait made (the SQL and this must agree — same helper).
+    # DALTON-HOOK(handoff-report-quiescence)
+    effective = outbox_db.effective_attempts(attempts, payload)
     job_request_key = analyst_request_key(job_id)
 
     async def _fence() -> bool:
@@ -272,7 +287,7 @@ async def execute_report_back(job: dict) -> None:
         # job is about to exhaust attempts into dead_clear, revoke awaiting_resume first.
         if (
             not resumable
-            and attempts >= MAX_ATTEMPTS
+            and effective >= MAX_ATTEMPTS
             and isinstance(origin, dict)
             and origin.get(pointer.AWAITING_RESUME_FIELD)
         ):
@@ -323,7 +338,7 @@ async def execute_report_back(job: dict) -> None:
         # dead-letter this subsequent run, revoke awaiting_resume beforehand.
         if (
             not resumable
-            and attempts >= MAX_ATTEMPTS
+            and effective >= MAX_ATTEMPTS
             and isinstance(origin, dict)
             and origin.get(pointer.AWAITING_RESUME_FIELD)
         ):
@@ -350,6 +365,28 @@ async def execute_report_back(job: dict) -> None:
             ptc_thread_id, dispatcher_thread_id, _fence, _still_due
         ):
             return  # lease lost: the reclaiming owner carries on
+
+        # DALTON-HOOK(handoff-report-quiescence): a completed report goes out
+        # only when the analyst thread is quiescent — no live turn, no open
+        # background work, no notification turn still owed. The turn this job
+        # names may have ended mid-work on purpose (ending the turn on a
+        # subagent's completion notification is the designed waiting
+        # posture). The wait RESCHEDULES the job rather than holding the
+        # slot, and at its cap delivers an honest unfinished report.
+        if final_status == "completed":
+            hold = await _hold_report_for_quiescence(
+                cache, job, ptc_thread_id, origin, attempts, _fence
+            )
+            if hold in ("rescheduled", "lost"):
+                return  # slot freed: the job returns when due, reclaimed, or capped
+            if hold == "deliver-unfinished":
+                # Unfinished is its own state, decided by the cap alone: the
+                # listing's readability only words the message, never whether
+                # the report says completed.
+                items, listing_failed = await _pending_work_listing(ptc_thread_id)
+                owed = dataclasses.replace(
+                    owed, unfinished=items, listing_failed=listing_failed
+                )
 
         # DALTON-HOOK(handoff-keep-on-resumable): revoke awaiting_resume before
         # delivering a subsequent terminal report so its watch_clear takes effect.
@@ -758,10 +795,27 @@ async def report_message(
         ws_label = f'the "{ws_name}" workspace'
     else:
         ws_label = "a workspace"
-    outcome_line = (
-        f"The analysis you dispatched (thread {ptc_thread_id} in {ws_label}) "
-        f"{_OUTCOME_INSTRUCTIONS[final_status]}"
-    )
+    # DALTON-HOOK(handoff-report-quiescence): the wait cap's honest report.
+    # The run itself ended, but work it depended on is still open, so the one
+    # thing the line must never say is "has completed" — whichever way the
+    # listing read went.
+    if owed.unfinished is not None:
+        if owed.unfinished:
+            pending = "、".join(owed.unfinished)
+        elif owed.listing_failed:
+            pending = "清单读取失败"
+        else:
+            pending = "未能列出具体条目"
+        outcome_line = (
+            f"The analysis you dispatched (thread {ptc_thread_id} in {ws_label}) "
+            f"分析师回合已结束，但后台仍有工作未完成（{pending}），"
+            "请勿当作已完成交付。"
+        )
+    else:
+        outcome_line = (
+            f"The analysis you dispatched (thread {ptc_thread_id} in {ws_label}) "
+            f"{_OUTCOME_INSTRUCTIONS[final_status]}"
+        )
     # DALTON-HOOK(handoff-keep-on-resumable): tell Home when a failed analyst
     # run was a resumable interruption that will report back again on finish.
     is_resumable = False
@@ -796,6 +850,9 @@ async def report_message(
         workspace_owner=ws_owner_name,
         # One of the three the message has words for, or it raised above.
         outcome=final_status,
+        # DALTON-HOOK(handoff-report-quiescence): the wait cap's report names
+        # the work it still sees open.
+        unfinished=owed.unfinished,
         # Matches the report to its hand-off, whose result named the first.
         run_ids=run_ids or None,
         # And to a hand-off steered into a run that ended before reading it,
@@ -884,6 +941,299 @@ async def _post_report_back(
 
 # How often a report waiting on a hand-off re-reads it.
 _HAND_OFF_POLL_S = 2.0
+
+# DALTON-HOOK(handoff-report-quiescence): the pending-work probe and the
+# rescheduling hold that keeps a "completed" report from firing while the
+# dispatched thread is still working — a turn that ends with background
+# subagents live is a pause, not a finish, and the summary would hand the
+# Chief of Staff a deliverable that does not exist yet.
+# The report-backs on the dispatched thread's own chain that will run a turn
+# of it when they land: a subagent's and a background command's. A
+# ``command_notice`` is deliberately NOT here: by design it wakes nobody (it
+# waits for the thread's next turn under its own prefixed ordering key, rows
+# parked at ``next_retry_at='infinity'``), so it is invisible to the
+# thread-keyed open-jobs read either way — running commands themselves are
+# covered by the ``command_runs`` check below. Market alerts and steers need
+# no row here either: they do not start a turn while the thread is idle, and
+# once one does start, the latest-attempt branch of the probe reads it as
+# work in motion.
+_THREAD_WAKE_JOB_TYPES = ("task_report_back", "command_report_back")
+
+
+async def analyst_thread_quiescent(ptc_thread_id: str) -> bool:
+    """One look: whether the dispatched thread has stopped working for now.
+
+    Not quiescent while a turn of its own is live or waiting on the user, a
+    background subagent run is still open, a background command is still
+    running, or a report-back job is still owed a notification turn (the
+    wake that continues the analysis). A read that fails reads as not
+    quiescent: a blind "completed" is exactly the false report this exists
+    to stop.
+    """
+    from src.server.database.runs import command_runs as cr_db
+    from src.server.database.runs import lifecycle as tl_db
+    from src.server.database.runs import outbox as outbox_db
+    from src.server.database.runs import subagent_runs as sr_db
+
+    try:
+        latest = await tl_db.get_latest_attempt(ptc_thread_id)
+        if latest and latest.get("status") in ("in_progress", "interrupted"):
+            return False
+        if await sr_db.list_open_runs_for_thread(ptc_thread_id):
+            return False
+        if await cr_db.list_running(thread_id=ptc_thread_id):
+            return False
+        return not await outbox_db.list_open_notification_jobs(
+            ptc_thread_id, _THREAD_WAKE_JOB_TYPES, limit=1
+        )
+    except Exception:
+        logger.warning(
+            f"[HANDOFF_REPORT_BACK] Quiescence read failed for {ptc_thread_id}; "
+            f"holding its report",
+            exc_info=True,
+        )
+        return False
+
+
+# The reschedule cadence for a report waiting on the analyst's background
+# work: start at 30s, double to a 5-minute ceiling. A wait costs no failure
+# budget (``reschedule_claimed_job`` bumps the payload's ``reschedules``
+# counter, which every attempts ceiling counts out), so the cadence is
+# purely politeness toward the claim loop.
+_QUIESCENCE_FIRST_POLL_S = 30.0
+_QUIESCENCE_MAX_POLL_S = 300.0
+# Payload keys the wait keeps on the job row: when the wait started (the
+# cap's anchor — the row's created_at moves with each reschedule) and the
+# reschedule count (the backoff ladder; maintained by the reschedule's own
+# atomic payload bump).
+_WAIT_SINCE_KEY = "quiescence_wait_since"
+_RESCHEDULES_KEY = "reschedules"
+def _quiescence_cap() -> float:
+    """How long a completed report may wait before it reports the work
+    unfinished instead (see ``get_report_back_quiescence_cap``)."""
+    from src.config.settings import get_report_back_quiescence_cap
+
+    return float(get_report_back_quiescence_cap())
+
+
+async def _analyst_turn_end(ptc_thread_id: str) -> float | None:
+    """When the analyst's latest turn ended, as the wait cap's anchor.
+
+    ``usage_settled_at`` is stamped by the finalize CAS (the run's own
+    "settled" convention, as liveness reads treat it); a row from before it
+    existed falls back to its start plus measured duration. None when the
+    row or its timestamps cannot be read."""
+    from datetime import UTC, datetime
+
+    from src.server.database.runs import lifecycle as tl_db
+
+    try:
+        latest = await tl_db.get_latest_attempt(ptc_thread_id)
+    except Exception:
+        logger.warning(
+            f"[HANDOFF_REPORT_BACK] Latest-attempt read failed anchoring the "
+            f"wait for {ptc_thread_id}",
+            exc_info=True,
+        )
+        return None
+    if not isinstance(latest, dict):
+        return None
+    settled = latest.get("usage_settled_at")
+    if isinstance(settled, datetime):
+        if settled.tzinfo is None:
+            settled = settled.replace(tzinfo=UTC)
+        return settled.timestamp()
+    started = latest.get("created_at")
+    execution = latest.get("execution_time")
+    if isinstance(started, datetime) and isinstance(execution, (int, float)):
+        if started.tzinfo is None:
+            started = started.replace(tzinfo=UTC)
+        return started.timestamp() + float(execution)
+    return None
+
+
+async def _renew_pair_ttls(
+    cache, ptc_thread_id: str, origin: dict, delay_seconds: float
+) -> None:
+    """Extend the pair's Redis keys for the length of the wait — never
+    shortening them.
+
+    The wait can outlive the keys' 24h TTLs (the cap anchors on the turn's
+    end, which may precede the first claim by hours); an expired origin or
+    watch membership would take the cap report's own verdict away
+    (``analyst_report_verdict`` reads the origin strictly and gates on
+    membership). But the watch and user-pending keys are SHARED by every
+    pair the same Home dispatched: an unconditional EXPIRE here once
+    trampled a sibling pair's full 24h (set at reserve, keys.py) down to
+    minutes, and its report died as NotOwed. So each key is only ever
+    extended — to the reserve-time TTL constant, the same strength a fresh
+    dispatch holds — and an extension that cannot be made safely (the
+    read fails) leaves the key exactly as it was. Best-effort: a dropped
+    renewal is healed by the next one."""
+    from src.server.services.report_back.handoff.keys import (
+        PTC_ORIGIN_TTL,
+        ptc_origin_key,
+        user_pending_key,
+        watch_key,
+    )
+
+    ttl = int(max(delay_seconds * 3.0, float(PTC_ORIGIN_TTL)))
+    pair_keys = [
+        ptc_origin_key(ptc_thread_id),
+        watch_key(str(origin.get("home_thread_id") or "")),
+    ]
+    user_id = origin.get("user_id")
+    if user_id:
+        pair_keys.append(user_pending_key(str(user_id)))
+    for key in pair_keys:
+        await _extend_key_ttl(cache.client, key, ttl)
+
+
+async def _extend_key_ttl(client, key: str, seconds: int) -> None:
+    """One key's TTL extended to ``seconds``; never shortened, never dropped.
+
+    Prefers ``EXPIRE key seconds GT`` (Redis ≥ 7 and redis-py's matching
+    option): the server itself refuses to shorten. A client without the
+    option or a server that rejects it falls back to reading the live TTL
+    and writing back only the larger value — a read that fails or names no
+    TTL-bearing key (-2 gone, -1 immortal) leaves the key untouched. Any
+    other failure is a transport problem: log and leave the key alone."""
+    try:
+        await client.expire(key, seconds, gt=True)
+        return
+    except TypeError:
+        pass  # a client whose expire takes no gt — read-compare-write below
+    except redis_exceptions.ResponseError:
+        pass  # an older server rejecting the option — same fallback
+    except Exception:
+        logger.warning(
+            f"[HANDOFF_REPORT_BACK] TTL extend failed for {key}", exc_info=True
+        )
+        return
+    try:
+        current = await client.ttl(key)
+    except Exception:
+        logger.warning(
+            f"[HANDOFF_REPORT_BACK] TTL read failed extending {key}; "
+            f"leaving it as is",
+            exc_info=True,
+        )
+        return
+    if not isinstance(current, int) or current < 0:
+        return  # gone (-2) or immortal (-1): not ours to touch
+    if seconds > current:
+        try:
+            await client.expire(key, seconds)
+        except Exception:
+            logger.warning(
+                f"[HANDOFF_REPORT_BACK] TTL write-back failed for {key}",
+                exc_info=True,
+            )
+
+
+async def _pending_work_listing(ptc_thread_id: str) -> tuple[list[str], bool]:
+    """What the analyst thread still has running, for the honest report the
+    wait cap sends: open background subagent runs and running commands, by
+    the ids the agent knows them by. Returns the items and whether any read
+    failed — the cap report is unfinished either way (its own state), and
+    the reads only decide whether the listing can name the work."""
+    from src.server.database.runs import command_runs as cr_db
+    from src.server.database.runs import subagent_runs as sr_db
+
+    items: list[str] = []
+    reads_failed = False
+    try:
+        for row in await sr_db.list_open_runs_for_thread(ptc_thread_id):
+            items.append(f"Task-{row.get('task_id')}")
+    except Exception:
+        logger.warning(
+            f"[HANDOFF_REPORT_BACK] Open-run read failed for {ptc_thread_id} "
+            f"at the wait cap",
+            exc_info=True,
+        )
+        reads_failed = True
+    try:
+        for row in await cr_db.list_running(thread_id=ptc_thread_id):
+            items.append(f"command {row.get('command_id')}")
+    except Exception:
+        logger.warning(
+            f"[HANDOFF_REPORT_BACK] Running-command read failed for "
+            f"{ptc_thread_id} at the wait cap",
+            exc_info=True,
+        )
+        reads_failed = True
+    return items, reads_failed
+
+
+async def _hold_report_for_quiescence(
+    cache, job: dict, ptc_thread_id: str, origin: dict, attempts: int, fence
+) -> str:
+    """Decide one claim of a completed report against the analyst's background
+    work: ``"rescheduled"`` (not quiescent — the job re-appears due in
+    30s..5min at the back of its chain, the slot is freed at once),
+    ``"deliver"`` (quiescent — the report goes out as completed), or
+    ``"deliver-unfinished"`` (the wait cap hit — an honest report goes out
+    naming the work still pending, never "has completed"). ``"lost"`` when
+    the lease went: the reclaiming owner decides the next claim.
+
+    Never holds the slot: a waiting report-back must not sit on one of the
+    drainer's bounded slots — enough of them would starve the very
+    ``task_report_back`` jobs whose turns end the wait.
+    """
+    from src.server.database.runs import outbox as outbox_db
+
+    if await analyst_thread_quiescent(ptc_thread_id):
+        return "deliver"
+
+    payload = job.get("payload") or {}
+    wait_since = payload.get(_WAIT_SINCE_KEY)
+    try:
+        wait_since = float(wait_since)
+    except (TypeError, ValueError):
+        wait_since = None
+    now = time.time()
+    if wait_since is None:
+        # Anchor on when the analyst's turn actually ENDED, so a report that
+        # waits hours before its first claim cannot outlive the cap — and a
+        # turn that ended long ago reaches the cap that much sooner. The
+        # anchor is fixed in the payload at first sight and survives every
+        # later claim; unreadable, it degrades to now.
+        wait_since = await _analyst_turn_end(ptc_thread_id) or now
+    if now - wait_since >= _quiescence_cap():
+        logger.warning(
+            f"[HANDOFF_REPORT_BACK] Wait cap hit for {ptc_thread_id}; "
+            f"reporting the work unfinished rather than completed"
+        )
+        return "deliver-unfinished"
+
+    try:
+        polls = int(payload.get(_RESCHEDULES_KEY) or 0)
+    except (TypeError, ValueError):
+        polls = 0
+    delay = min(_QUIESCENCE_FIRST_POLL_S * (2**polls), _QUIESCENCE_MAX_POLL_S)
+    # The anchor is durable before the reschedule: a crash between them
+    # re-enters with it intact. Unfenced by design (merge_job_payload); the
+    # reschedule's own payload bump keeps the ladder count atomic.
+    await outbox_db.merge_job_payload(
+        str(job["hook_outbox_id"]),
+        {_WAIT_SINCE_KEY: wait_since},
+    )
+    if not await fence():
+        return "lost"  # lease lost: the reclaiming owner reschedules or delivers
+    status = await outbox_db.reschedule_claimed_job(
+        str(job["hook_outbox_id"]), attempts=attempts, delay_seconds=delay
+    )
+    if status is None:
+        return "lost"
+    await _renew_pair_ttls(cache, ptc_thread_id, origin, delay)
+    logger.info(
+        f"[HANDOFF_REPORT_BACK] Analyst thread {ptc_thread_id} still has "
+        f"background work; report_back job {job['hook_outbox_id']} "
+        f"rescheduled in {delay:.0f}s (waited {now - wait_since:.0f}s of the "
+        f"cap)"
+    )
+    return "rescheduled"
+
 
 
 async def _wait_for_hand_off(

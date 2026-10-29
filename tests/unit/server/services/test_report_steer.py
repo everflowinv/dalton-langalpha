@@ -6,12 +6,14 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timedelta, timezone
-from unittest.mock import AsyncMock, MagicMock, patch
+# DALTON-HOOK(handoff-report-quiescence): create_autospec for the probe stub
+from unittest.mock import AsyncMock, MagicMock, create_autospec, patch
 
 import pytest
 
 from ptc_agent.agent.middleware.steering import SteeredReport
 from src.server.services.report_back import steer
+from src.server.services.report_back.handoff import executor
 from src.server.services.report_back.notify_turn import NotOwed
 
 _OUTBOX = "src.server.database.runs.outbox"
@@ -32,6 +34,19 @@ def _no_live_hand_off():
         new=AsyncMock(return_value=False),
     ) as live:
         yield live
+
+
+@pytest.fixture(autouse=True)
+def _quiescent_analyst():
+    # DALTON-HOOK(handoff-report-quiescence): the offer probes quiescence on
+    # the analyst thread; unit tests have no ledger to read, so it defaults
+    # to quiescent (the pre-hold behavior these tests were written against).
+    with patch.object(
+        executor,
+        "analyst_thread_quiescent",
+        new=create_autospec(executor.analyst_thread_quiescent, return_value=True),
+    ) as probe:
+        yield probe
 
 
 def _job(n: int, hook_type: str = "task_report_back") -> dict:

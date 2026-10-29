@@ -220,6 +220,20 @@ ALLOWED_HOOKS=(
   # (FilePreviewCard in web/src/components/ui/chat-input.parts.tsx,
   # web/src/pages/ChatAgent/components/ImageLightbox.tsx).
   "composer-attachment-preview"
+  # R1-1: a hand-off "completed" report waits for the dispatched analyst
+  # thread to be quiescent (no live turn, no open background subagent, no
+  # notification turn owed) before posting or offering as a steer
+  # (report_back/handoff/executor.py, report_back/steer.py).
+  "handoff-report-quiescence"
+  # R1-2: the run-teardown tail drain deadline outlives a writer its own
+  # run-level clock permits (max of SUBAGENT_TAIL_TIMEOUT and
+  # workflow_timeout) instead of discarding the pinned session under live
+  # deep workflows at a flat 30 minutes (runs/executor.py).
+  "tail-drain-outlives-workflows"
+  # R1-3: the turn anchor row states the server-resolved model of the turn as
+  # a fact (turn_context.py, turn.py, context_stack.py, turn.md.j2,
+  # request_prep.py, ptc_run.py).
+  "turn-row-model-line"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

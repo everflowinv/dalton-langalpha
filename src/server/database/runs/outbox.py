@@ -223,6 +223,33 @@ _REVIVED_TYPES_SQL = _sql_list(tuple(_REVIVED_OWED))
 _REVIVED_OWED_SQL = _owed_sql(_REVIVED_OWED)
 
 
+# DALTON-HOOK(handoff-report-quiescence): a waiting report-back reschedules
+# itself without spending its delivery-failure budget and without heading its
+# ordering chain while it waits. ``attempts`` stays monotonically increasing
+# (it is the ownership fence / claim generation and is never rewound — a
+# reused token would let a paused owner's late ack close the new owner's
+# claim); the failure budget counts reschedules out of it instead, so every
+# ceiling below reads the EFFECTIVE attempt count.
+_EFFECTIVE_ATTEMPTS_O_SQL = (
+    "(o.attempts - COALESCE((o.payload->>'reschedules')::bigint, 0))"
+)
+_EFFECTIVE_ATTEMPTS_BARE_SQL = (
+    "(attempts - COALESCE((payload->>'reschedules')::bigint, 0))"
+)
+
+
+def effective_attempts(attempts: int, payload: dict | None) -> int:
+    """The delivery-failure budget every ceiling reads: the raw claim count
+    minus the reschedules a wait made — the Python twin of
+    ``_EFFECTIVE_ATTEMPTS_BARE_SQL`` above, for callers holding the claimed
+    row's (attempts, payload) instead of running SQL. An unreadable counter
+    reads as zero reschedules (fail-closed toward the raw count)."""
+    try:
+        return int(attempts) - int((payload or {}).get("reschedules") or 0)
+    except (TypeError, ValueError):
+        return int(attempts)
+
+
 async def claim_outbox_jobs(
     limit: int = 10,
     lease_seconds: int = 60,
@@ -294,7 +321,8 @@ async def claim_outbox_jobs(
                               OR {_STEER_SAFETY_NET_SQL}))
                         OR (o.status = 'claimed'
                             AND o.lease_expires_at <= NOW()
-                            AND o.attempts < %s)
+                            -- DALTON-HOOK(handoff-report-quiescence): budget counts reschedules out
+                            AND {_EFFECTIVE_ATTEMPTS_O_SQL} < %s)
                       )
                       AND NOT EXISTS (
                         SELECT 1 FROM hook_outbox p
@@ -346,7 +374,8 @@ async def claim_outbox_jobs(
                                   OR {_STEER_SAFETY_NET_SQL}))
                             OR (o.status = 'claimed'
                                 AND o.lease_expires_at <= NOW()
-                                AND o.attempts < %s)
+                                -- DALTON-HOOK(handoff-report-quiescence): budget counts reschedules out
+                                AND {_EFFECTIVE_ATTEMPTS_O_SQL} < %s)
                         )
                         AND (
                             o.ordering_key IS NULL
@@ -463,8 +492,9 @@ async def park_exhausted_jobs(*, max_attempts: int = 5) -> List[Dict[str, Any]]:
     pending).
     """
     expired_at_ceiling = (
+        # DALTON-HOOK(handoff-report-quiescence): budget counts reschedules out
         "o.status = 'claimed' AND o.lease_expires_at <= NOW()"
-        " AND o.attempts >= %(max)s"
+        f" AND {_EFFECTIVE_ATTEMPTS_O_SQL} >= %(max)s"
     )
     async with pool.get_db_connection() as conn:
         async with conn.transaction():
@@ -484,7 +514,8 @@ async def park_exhausted_jobs(*, max_attempts: int = 5) -> List[Dict[str, Any]]:
                         WHERE status = 'claimed'
                           AND hook_type NOT IN {_sql_list(("steer", *ALERT_HOOK_TYPES))}
                           AND lease_expires_at <= NOW()
-                          AND attempts >= %s
+                          -- DALTON-HOOK(handoff-report-quiescence): effective, not raw
+                          AND {_EFFECTIVE_ATTEMPTS_BARE_SQL} >= %s
                         RETURNING *
                     ),
                     comp AS ({_DEAD_REPORT_BACK_COMPENSATION_SQL})
@@ -802,9 +833,10 @@ _NACK_BACKOFF_SQL = (
 )
 
 # A claimed job out of attempts, fenced to the caller's lease.
+# DALTON-HOOK(handoff-report-quiescence): every ceiling counts reschedules out
 _AT_CEILING_SQL = (
     "o.hook_outbox_id = %(job_id)s::uuid AND o.status = 'claimed'"
-    " AND o.attempts = %(attempts)s AND o.attempts >= %(max)s"
+    f" AND o.attempts = %(attempts)s AND {_EFFECTIVE_ATTEMPTS_O_SQL} >= %(max)s"
 )
 
 
@@ -836,27 +868,28 @@ async def nack_outbox_job(
                     f"""
                     WITH bumped AS (
                         UPDATE hook_outbox
+                        -- DALTON-HOOK(handoff-report-quiescence): effective attempts
                         SET status = CASE
-                                WHEN attempts >= %s THEN 'dead' ELSE 'pending'
+                                WHEN {_EFFECTIVE_ATTEMPTS_BARE_SQL} >= %s THEN 'dead' ELSE 'pending'
                             END,
                             -- A steer backs off in its payload (see
                             -- _STEER_DUE_SQL), so a build that cannot run it
                             -- never claims it.
                             next_retry_at = CASE
-                                WHEN hook_type = 'steer' AND attempts < %s
+                                WHEN hook_type = 'steer' AND {_EFFECTIVE_ATTEMPTS_BARE_SQL} < %s
                                     THEN 'infinity'::timestamptz
                                 ELSE NOW() + make_interval(
                                     secs => LEAST(POWER(2, attempts), 60)::float
                                 )
                             END,
                             payload = CASE
-                                WHEN hook_type = 'steer' AND attempts < %s
+                                WHEN hook_type = 'steer' AND {_EFFECTIVE_ATTEMPTS_BARE_SQL} < %s
                                     THEN {_steer_due_at_sql("payload", _NACK_BACKOFF_SQL)}
                                 ELSE payload
                             END,
                             lease_expires_at = NULL,
                             completed_at = CASE
-                                WHEN attempts >= %s THEN NOW() ELSE completed_at
+                                WHEN {_EFFECTIVE_ATTEMPTS_BARE_SQL} >= %s THEN NOW() ELSE completed_at
                             END
                         WHERE hook_outbox_id = %s AND status = 'claimed'
                           AND attempts = %s
@@ -1140,16 +1173,17 @@ async def defer_claimed_job(
                     f"""
                     WITH parked AS (
                         UPDATE hook_outbox
+                        -- DALTON-HOOK(handoff-report-quiescence): effective attempts
                         SET status = CASE
-                                WHEN attempts >= %s THEN 'dead' ELSE 'pending'
+                                WHEN {_EFFECTIVE_ATTEMPTS_BARE_SQL} >= %s THEN 'dead' ELSE 'pending'
                             END,
                             next_retry_at = CASE
-                                WHEN attempts >= %s THEN NOW()
+                                WHEN {_EFFECTIVE_ATTEMPTS_BARE_SQL} >= %s THEN NOW()
                                 ELSE 'infinity'::timestamptz
                             END,
                             lease_expires_at = NULL,
                             completed_at = CASE
-                                WHEN attempts >= %s THEN NOW() ELSE completed_at
+                                WHEN {_EFFECTIVE_ATTEMPTS_BARE_SQL} >= %s THEN NOW() ELSE completed_at
                             END,
                             payload = payload - 'steered_run_id' - 'due_at'
                         WHERE hook_outbox_id = %s AND status = 'claimed'
@@ -1166,6 +1200,54 @@ async def defer_claimed_job(
                 )
                 row = await cur.fetchone()
                 return row["status"] if row else None
+
+
+# DALTON-HOOK(handoff-report-quiescence): the waiting report-back's own
+# release — see reschedule_claimed_job's docstring for the fence contract.
+async def reschedule_claimed_job(
+    job_id: str, *, attempts: int, delay_seconds: float
+) -> Optional[str]:
+    """Release a CLAIMED job back to pending, due in ``delay_seconds``, at the
+    BACK of its ordering chain, at the SAME attempt number.
+
+    For a report-back whose work is not ready yet (the dispatched thread
+    still has background work): waiting inside the executor would hold one of
+    the drainer's bounded execution slots for hours, so the job hands its
+    slot back and returns when the work may have settled. ``attempts`` is
+    deliberately NOT changed — it is the claim-generation fence, and rewinding
+    it would let a paused owner's stale ``ack_outbox_job`` fence-match a later
+    owner's claim; instead the reschedule bumps the ``reschedules`` payload
+    counter, and every attempts ceiling (claim, park sweep, nack, defer,
+    requeue) counts reschedules out, so a wait of any length costs none of
+    the delivery-failure budget. ``created_at`` bumps like
+    ``requeue_job_with_key``'s: a waiting row that kept its original chain
+    position would head its chain while not being executable, blocking a
+    later error or cancelled report on the same watcher thread indefinitely.
+    Fenced by the claimed ``attempts``; returns the new status ('pending'),
+    or None if the fence was lost — the caller stops either way and its
+    fenced ack no-ops against the transitioned row.
+    """
+    async with pool.get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                UPDATE hook_outbox
+                SET status = 'pending',
+                    next_retry_at = NOW() + make_interval(secs => %s),
+                    created_at = clock_timestamp(),
+                    lease_expires_at = NULL,
+                    payload = payload || jsonb_build_object(
+                        'reschedules',
+                        COALESCE((payload->>'reschedules')::bigint, 0) + 1
+                    )
+                WHERE hook_outbox_id = %s AND status = 'claimed'
+                  AND attempts = %s
+                RETURNING status
+                """,
+                (delay_seconds, job_id, attempts),
+            )
+            row = await cur.fetchone()
+            return row["status"] if row else None
 
 
 async def list_open_notification_jobs(
@@ -1520,14 +1602,15 @@ async def requeue_job_with_key(
                 f"""
                 WITH bumped AS (
                     UPDATE hook_outbox
+                    -- DALTON-HOOK(handoff-report-quiescence): effective attempts
                     SET status = CASE
-                            WHEN attempts >= %s THEN 'dead' ELSE 'pending'
+                            WHEN {_EFFECTIVE_ATTEMPTS_BARE_SQL} >= %s THEN 'dead' ELSE 'pending'
                         END,
                         ordering_key = %s,
                         created_at = clock_timestamp(),
                         lease_expires_at = NULL, next_retry_at = NOW(),
                         completed_at = CASE
-                            WHEN attempts >= %s THEN NOW() ELSE completed_at
+                            WHEN {_EFFECTIVE_ATTEMPTS_BARE_SQL} >= %s THEN NOW() ELSE completed_at
                         END
                     WHERE hook_outbox_id = %s AND status = 'claimed'
                       AND attempts = %s
