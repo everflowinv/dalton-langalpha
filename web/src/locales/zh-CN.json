@@ -125,6 +125,7 @@
     },
     "invites": {
       "title": "邀请成员",
+      "activeQuota": "有效邀请 {{count}} / {{max}}",
       "subtitle": "生成一次性邀请链接（7 天有效），受邀人设置用户名与密码后即可加入团队。",
       "generate": "生成邀请链接",
       "generating": "生成中…",
@@ -2097,7 +2098,8 @@
       "chartAlt": "图表",
       "send": "发送消息",
       "dropFiles": "拖放文件以上传",
-      "uploading": "上传中"
+      "uploading": "上传中",
+      "inFlightDraftRestored": "上次发送可能已被受理，发送前请先确认对话里是否已经有这条消息。"
     },
     "mention": {
       "noMatching": "无匹配文件",
@@ -3252,6 +3254,8 @@
     "colTook": "耗时",
     "detailModel": "模型",
     "defaultModel": "你的默认模型",
+    "defaultModelOption": "默认模型（账户默认）",
+    "modelUnavailableOption": "{{model}}（不可用）",
     "detailWorkspace": "工作区",
     "detailFailures": "连续失败",
     "failuresOf": "{{count}} 次，上限 {{max}} 次",
@@ -3316,7 +3320,10 @@
     "freqDays": "按星期",
     "monthDay": "{{day}} 日",
     "lastDay": "最后一天",
-    "skipsShortMonths": "不足 {{day}} 天的月份会被跳过。选择“最后一天”可在每月月底运行。"
+    "skipsShortMonths": "不足 {{day}} 天的月份会被跳过。选择“最后一天”可在每月月底运行。",
+    "modelCatalogLoading": "正在加载模型…",
+    "modelCatalogUnavailable": "模型列表暂时无法加载，已保存的选择保持不变。",
+    "modelCurrentOption": "{{model}}（当前设置）"
   },
   "toolArtifact": {
     "open": "开盘",
@@ -6421,6 +6428,7 @@
     "manage": "管理",
     "reconnect": "重新连接",
     "reconnectNote": "此登录已失效。重新登录即可继续使用其模型。",
+    "teamManagedByAdmin": "团队共用凭据由管理员管理。如需连接或更换模型凭据，请联系管理员。",
     "tryAgain": "重试",
     "copy": "复制",
     "copied": "已复制",

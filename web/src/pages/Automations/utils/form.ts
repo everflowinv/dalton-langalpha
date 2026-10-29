@@ -34,6 +34,8 @@ export interface FormState {
   /** Where it runs: ALL_WORKSPACES, a workspace's id, or empty until the
    *  reader picks one. */
   place: string;
+  // DALTON-HOOK(automation-model): per-automation model selection
+  llm_model: string | null;
   instruction: string;
   thread_strategy: Automation['thread_strategy'];
   max_failures: number;
@@ -60,6 +62,8 @@ export const INITIAL_FORM: FormState = {
   timezone: deviceTimezone(),
   next_run_at: '',
   place: '',
+  // DALTON-HOOK(automation-model): default to account default model (null)
+  llm_model: null,
   instruction: '',
   thread_strategy: 'continue',
   max_failures: 3,
@@ -90,6 +94,8 @@ export function automationToFormState(automation: Automation, timezone = deviceT
     // read UTC digits back as local time and moved the run by the offset.
     next_run_at: automation.next_run_at ?? '',
     place: runsInHome(automation, homeId) ? ALL_WORKSPACES : automation.workspace_id ?? '',
+    // DALTON-HOOK(automation-model): backfill saved llm_model
+    llm_model: automation.llm_model ?? null,
     instruction: automation.instruction,
     thread_strategy: automation.thread_strategy,
     max_failures: automation.max_failures,
@@ -247,6 +253,8 @@ export function formStateToPayload(form: FormState, workspaceId: string): Automa
   return {
     ...settingsPayload(form, workspaceId),
     ...(form.description ? { description: form.description } : {}),
+    // DALTON-HOOK(automation-model): include llm_model when selected
+    ...(form.llm_model ? { llm_model: form.llm_model } : {}),
     trigger_type: form.trigger_type,
     timezone: form.timezone,
     ...triggerPayload(form),
@@ -300,7 +308,12 @@ export function formStateToUpdatePayload(
   original: Automation,
   workspaceId: string,
 ): AutomationUpdatePayload {
-  const payload: AutomationUpdatePayload = { ...settingsPayload(form, workspaceId), description: form.description };
+  const payload: AutomationUpdatePayload = {
+    ...settingsPayload(form, workspaceId),
+    description: form.description,
+    // DALTON-HOOK(automation-model): send llm_model only when changed (null clears override)
+    ...(form.llm_model !== initial.llm_model ? { llm_model: form.llm_model } : {}),
+  };
   if (!TRIGGER_FIELDS[form.trigger_type].some((k) => form[k] !== initial[k])) return payload;
   const trigger = triggerPayload(form);
   const saved = original.trigger_config;

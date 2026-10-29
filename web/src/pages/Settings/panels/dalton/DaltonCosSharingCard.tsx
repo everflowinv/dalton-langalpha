@@ -7,6 +7,7 @@ import { queryKeys } from '@/lib/queryKeys';
 
 export interface DaltonSettingVisibilityContext {
   canInvite?: boolean;
+  isPm?: boolean;
   callerTier?: string | null;
   colleagueDispatchEnabled?: boolean;
   /** The sharing settings have arrived (cached data counts, even while a

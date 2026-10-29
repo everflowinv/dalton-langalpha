@@ -18,6 +18,8 @@ export function usePanelFiles({
   // DALTON-HOOK(workspace-sharing-settings): separate file write lock (readOnly) from colleague identity (isColleague)
   readOnly = false,
   isColleague = readOnly,
+  // DALTON-HOOK(external-share-guard): external members cannot create public file share links
+  callerTier = null,
 }: {
   isHome: boolean;
   workspaceId: string;
@@ -27,6 +29,8 @@ export function usePanelFiles({
   // DALTON-HOOK(workspace-sharing-settings): separate file write lock (readOnly) from colleague identity (isColleague)
   readOnly?: boolean;
   isColleague?: boolean;
+  // DALTON-HOOK(external-share-guard): external members cannot create public file share links
+  callerTier?: string | null;
 }) {
   const [override, setOverride] = useState<string | null>(null);
   const shownId = override ?? workspaceId;
@@ -56,7 +60,8 @@ export function usePanelFiles({
         }
       : {
           // DALTON-HOOK(workspace-sharing-settings): teamReadOnly follows isColleague; readOnly is file write lock; canShare is owner-only
-          readOnly, teamReadOnly: isColleague, singleFileMode: false, canShare: !isColleague && !readOnly, isHome,
+          // DALTON-HOOK(external-share-guard): external members cannot create public share links
+          readOnly, teamReadOnly: isColleague, singleFileMode: false, canShare: !isColleague && !readOnly && callerTier !== 'external', isHome,
           onReturnHome: null, returnLabel: null,
         },
   };

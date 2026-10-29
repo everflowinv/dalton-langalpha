@@ -721,7 +721,11 @@ async def test_member_writes_land_on_holder_and_user_status_checks_holder_only(
 async def test_non_pm_delete_and_disconnect_forbidden_while_pm_allowed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Non-PM members get HTTP 403 (`团队共用凭据只能由管理员断开`) on OAuth disconnect, API key delete/clear, and `byok_enabled=False`; PMs are allowed."""
+    """Non-PM members get HTTP 403 on every shared-credential write: OAuth
+    disconnect and key delete keep `团队共用凭据只能由管理员断开`; every PUT
+    shape — including plain key sets and enabling BYOK, which members used to
+    be allowed — answers `团队共用凭据只能由管理员设置` before any DB or cache
+    write; PMs still write."""
     _enable_team_sharing(monkeypatch)
 
     monkeypatch.setattr(
@@ -730,11 +734,43 @@ async def test_non_pm_delete_and_disconnect_forbidden_while_pm_allowed(
         create_autospec(api_keys_app._get_custom_providers, return_value=[]),
     )
 
-    # Non-PM member is rejected before touching DB/services on:
-    # - OAuth disconnect (Codex, Claude, Muse, Antigravity)
-    # - DELETE /api-keys/{provider}
-    # - PUT /api-keys with None, empty string "", whitespace "   ", or None + base_url
-    # - PUT /api-keys with byok_enabled=False
+    # Destructive PUT / disconnected shapes keep the disconnect wording (the rule predates this one),
+    # and every PUT shape is refused BEFORE any DB or cache write.
+    fake_set_byok_enabled = create_autospec(api_keys_app.set_byok_enabled, return_value=True)
+    fake_upsert_api_key = create_autospec(api_keys_app.upsert_api_key, return_value=None)
+    fake_delete_api_key = create_autospec(api_keys_app.delete_api_key, return_value=None)
+    fake_update_base_url = create_autospec(api_keys_db.update_base_url, return_value=None)
+    fake_invalidate_byok_cache = create_autospec(api_keys_app.invalidate_byok_cache, return_value=None)
+    fake_invalidate_models = create_autospec(api_keys_app.invalidate_available_models, return_value=None)
+    fake_get_user_api_keys = create_autospec(
+        api_keys_app.get_user_api_keys,
+        return_value={"byok_enabled": True, "keys": {}, "base_urls": {}},
+    )
+    fake_maybe_complete = create_autospec(
+        onboarding_svc.maybe_complete_personalization,
+        return_value=None,
+    )
+    monkeypatch.setattr(api_keys_app, "set_byok_enabled", fake_set_byok_enabled)
+    monkeypatch.setattr(api_keys_app, "upsert_api_key", fake_upsert_api_key)
+    monkeypatch.setattr(api_keys_app, "delete_api_key", fake_delete_api_key)
+    monkeypatch.setattr(api_keys_db, "update_base_url", fake_update_base_url)
+    monkeypatch.setattr(api_keys_app, "invalidate_byok_cache", fake_invalidate_byok_cache)
+    monkeypatch.setattr(api_keys_app, "invalidate_available_models", fake_invalidate_models)
+    monkeypatch.setattr(api_keys_app, "get_user_api_keys", fake_get_user_api_keys)
+    monkeypatch.setattr(onboarding_svc, "maybe_complete_personalization", fake_maybe_complete)
+    get_db_conn_keys = create_autospec(api_keys_db.get_db_connection)
+    monkeypatch.setattr(api_keys_db, "get_db_connection", get_db_conn_keys)
+    cache_spy = create_autospec(RedisCacheClient(), instance=True)
+    cache_spy.enabled = False
+    cache_spy.client = None
+    get_cache_client_spy = create_autospec(
+        lambda: cache_spy, return_value=cache_spy
+    )
+    monkeypatch.setattr(
+        "src.utils.cache.redis_cache.get_cache_client",
+        get_cache_client_spy,
+    )
+
     for call in [
         lambda: oauth_app.oauth_disconnect(key="codex", user_id=MEMBER_ID),
         lambda: oauth_app.oauth_disconnect(key="claude", user_id=MEMBER_ID),
@@ -774,75 +810,93 @@ async def test_non_pm_delete_and_disconnect_forbidden_while_pm_allowed(
             body=UpdateApiKeysRequest(base_urls={"openai": None}),
             user_id=MEMBER_ID,
         ),
+        lambda: api_keys_app.update_api_keys(
+            body=UpdateApiKeysRequest(byok_enabled=True, base_urls={"openai": None}),
+            user_id=MEMBER_ID,
+        ),
     ]:
         with pytest.raises(HTTPException) as exc_info:
             await call()
         assert exc_info.value.status_code == 403
         assert exc_info.value.detail == "团队共用凭据只能由管理员断开"
-
-    # Non-PM member CAN still add/update non-empty API keys (including with base_urls for the same provider) and enable BYOK (`byok_enabled=True`),
-    # while mixed requests (e.g. `byok_enabled=True` + clearing `base_urls` or clearing another key) are rejected with 403 BEFORE any DB or cache write!
-    fake_set_byok_enabled = create_autospec(api_keys_app.set_byok_enabled, return_value=True)
-    fake_upsert_api_key = create_autospec(api_keys_app.upsert_api_key, return_value=None)
-    fake_update_base_url = create_autospec(api_keys_db.update_base_url, return_value=None)
-    fake_invalidate_byok_cache = create_autospec(api_keys_app.invalidate_byok_cache, return_value=None)
-    monkeypatch.setattr(
-        api_keys_app,
-        "set_byok_enabled",
-        fake_set_byok_enabled,
-    )
-    monkeypatch.setattr(
-        api_keys_app,
-        "upsert_api_key",
-        fake_upsert_api_key,
-    )
-    monkeypatch.setattr(
-        api_keys_db,
-        "update_base_url",
-        fake_update_base_url,
-    )
-    monkeypatch.setattr(
-        api_keys_app,
-        "invalidate_byok_cache",
-        fake_invalidate_byok_cache,
-    )
-    monkeypatch.setattr(
-        onboarding_svc,
-        "maybe_complete_personalization",
-        create_autospec(
-            onboarding_svc.maybe_complete_personalization,
-            return_value=None,
-        ),
-    )
-    monkeypatch.setattr(
-        api_keys_app,
-        "get_user_api_keys",
-        create_autospec(
-            api_keys_app.get_user_api_keys,
-            return_value={"byok_enabled": True, "keys": {}, "base_urls": {}},
-        ),
-    )
+        fake_set_byok_enabled.assert_not_awaited()
+        fake_upsert_api_key.assert_not_awaited()
+        fake_delete_api_key.assert_not_awaited()
+        fake_update_base_url.assert_not_awaited()
+        fake_invalidate_byok_cache.assert_not_awaited()
+        fake_invalidate_models.assert_not_awaited()
+        fake_get_user_api_keys.assert_not_awaited()
+        fake_maybe_complete.assert_not_awaited()
 
     for mixed_body in [
-        UpdateApiKeysRequest(byok_enabled=True, base_urls={"openai": None}),
         UpdateApiKeysRequest(
-            byok_enabled=True,
-            api_keys={"openai": "sk-good"},
-            base_urls={"anthropic": "https://evil.example/v1"},
+            byok_enabled=False,
+            api_keys={"openai": "sk-legit"},
         ),
         UpdateApiKeysRequest(
             byok_enabled=True,
-            api_keys={"openai": "sk-good", "anthropic": None},
+            api_keys={"openai": "sk-legit", "anthropic": None},
+        ),
+        UpdateApiKeysRequest(
+            byok_enabled=True,
+            api_keys={"openai": "sk-legit", "anthropic": "   "},
+        ),
+        UpdateApiKeysRequest(
+            byok_enabled=True,
+            api_keys={"openai": "sk-legit"},
+            base_urls={"openai": "https://api.openai.com/v1", "anthropic": "https://evil.example/v1"},
+        ),
+    ]:
+        with pytest.raises(HTTPException) as exc_mixed:
+            await api_keys_app.update_api_keys(body=mixed_body, user_id=MEMBER_ID)
+        assert exc_mixed.value.status_code == 403
+        assert exc_mixed.value.detail == "团队共用凭据只能由管理员断开"
+        fake_set_byok_enabled.assert_not_awaited()
+        fake_upsert_api_key.assert_not_awaited()
+        fake_delete_api_key.assert_not_awaited()
+        fake_update_base_url.assert_not_awaited()
+        fake_invalidate_byok_cache.assert_not_awaited()
+        fake_invalidate_models.assert_not_awaited()
+        fake_get_user_api_keys.assert_not_awaited()
+        fake_maybe_complete.assert_not_awaited()
+
+    # Plain writes that members used to be allowed now also raise 403 with
+    # `团队共用凭据只能由管理员设置` BEFORE any DB or cache write.
+    for body in [
+        UpdateApiKeysRequest(),
+        UpdateApiKeysRequest(api_keys={"openai": "sk-member-new"}),
+        UpdateApiKeysRequest(
+            api_keys={"openai": "sk-member-new"},
+            base_urls={"openai": "https://member-proxy.example/v1"},
+        ),
+        UpdateApiKeysRequest(byok_enabled=True),
+        UpdateApiKeysRequest(
+            byok_enabled=True,
+            api_keys={"openai": "sk-member-new"},
+            base_urls={"openai": "https://member-proxy.example/v1"},
         ),
     ]:
         with pytest.raises(HTTPException) as exc_info:
-            await api_keys_app.update_api_keys(body=mixed_body, user_id=MEMBER_ID)
+            await api_keys_app.update_api_keys(body=body, user_id=MEMBER_ID)
         assert exc_info.value.status_code == 403
-        assert exc_info.value.detail == "团队共用凭据只能由管理员断开"
+        assert exc_info.value.detail == "团队共用凭据只能由管理员设置"
         fake_set_byok_enabled.assert_not_awaited()
         fake_upsert_api_key.assert_not_awaited()
+        fake_delete_api_key.assert_not_awaited()
         fake_update_base_url.assert_not_awaited()
         fake_invalidate_byok_cache.assert_not_awaited()
+        fake_invalidate_models.assert_not_awaited()
+        fake_get_user_api_keys.assert_not_awaited()
+        fake_maybe_complete.assert_not_awaited()
+        get_db_conn_keys.assert_not_called()
+        get_cache_client_spy.assert_not_called()
+
+    # Both HOLDER_ID and SECOND_PM_ID pass `require_credential_admin` and can
+    # write every shape: enable BYOK, set a key with its base URL, disable,
+    # delete, disconnect.
+    assert cred_mod.is_credential_admin(HOLDER_ID) is True
+    assert cred_mod.is_credential_admin(SECOND_PM_ID) is True
+    assert cred_mod.is_credential_admin(MEMBER_ID) is False
 
     res_add = await api_keys_app.update_api_keys(
         body=UpdateApiKeysRequest(
@@ -850,20 +904,15 @@ async def test_non_pm_delete_and_disconnect_forbidden_while_pm_allowed(
             api_keys={"openai": "sk-member-new"},
             base_urls={"openai": "https://member-proxy.example/v1"},
         ),
-        user_id=MEMBER_ID,
+        user_id=SECOND_PM_ID,
     )
     assert res_add["byok_enabled"] is True
-    fake_set_byok_enabled.assert_awaited_once_with(MEMBER_ID, True)
+    fake_set_byok_enabled.assert_awaited_once_with(SECOND_PM_ID, True)
     fake_upsert_api_key.assert_awaited_once_with(
-        MEMBER_ID, "openai", "sk-member-new", base_url="https://member-proxy.example/v1"
+        SECOND_PM_ID, "openai", "sk-member-new", base_url="https://member-proxy.example/v1"
     )
     fake_update_base_url.assert_not_awaited()
-    fake_invalidate_byok_cache.assert_awaited_once_with(MEMBER_ID)
-
-    # Both HOLDER_ID and SECOND_PM_ID pass `require_credential_admin` and can update base_urls alone / disable BYOK / delete keys / disconnect OAuth
-    assert cred_mod.is_credential_admin(HOLDER_ID) is True
-    assert cred_mod.is_credential_admin(SECOND_PM_ID) is True
-    assert cred_mod.is_credential_admin(MEMBER_ID) is False
+    fake_invalidate_byok_cache.assert_awaited_once_with(SECOND_PM_ID)
 
     res_pm_base_url = await api_keys_app.update_api_keys(
         body=UpdateApiKeysRequest(base_urls={"openai": "https://pm-gateway.example/v1"}),
@@ -874,16 +923,12 @@ async def test_non_pm_delete_and_disconnect_forbidden_while_pm_allowed(
         SECOND_PM_ID, "openai", "https://pm-gateway.example/v1"
     )
 
-    monkeypatch.setattr(
-        api_keys_app,
-        "delete_api_key",
-        create_autospec(api_keys_app.delete_api_key, return_value=None),
-    )
     res_pm_disable = await api_keys_app.update_api_keys(
         body=UpdateApiKeysRequest(byok_enabled=False, api_keys={"openai": None}),
         user_id=SECOND_PM_ID,
     )
     assert res_pm_disable is not None
+    fake_delete_api_key.assert_awaited_once_with(SECOND_PM_ID, "openai")
 
     monkeypatch.setattr(
         oauth_app,
@@ -1151,20 +1196,20 @@ async def test_member_signin_cancelled_by_admin_disconnect_does_not_revive(
     fake_muse_save = create_autospec(muse_oauth_mod.save_minted_credentials)
     monkeypatch.setattr(oauth_native_app, "muse_save_minted_credentials", fake_muse_save)
 
-    # Member initiates; the pending flow lives under the HOLDER's key.
-    await oauth_native_app.muse_device_initiate(user_id=MEMBER_ID)
+    # Non-holder admin initiates; the pending flow lives under the HOLDER's key.
+    await oauth_native_app.muse_device_initiate(user_id=SECOND_PM_ID)
     assert f"oauth:muse:device:{HOLDER_ID}" in store.store
-    assert f"oauth:muse:device:{MEMBER_ID}" not in store.store
+    assert f"oauth:muse:device:{SECOND_PM_ID}" not in store.store
 
     # Admin disconnects the shared connection.
-    await oauth_native_app.muse_disconnect(user_id=SECOND_PM_ID)
+    await oauth_native_app.muse_disconnect(user_id=HOLDER_ID)
     delete_params = [p for sql, p in executed if "DELETE FROM user_oauth_tokens" in str(sql)]
     assert any(p == (HOLDER_ID, "muse-oauth") for p in delete_params)
     assert f"oauth:muse:device:{HOLDER_ID}" not in store.store
 
-    # The member's approval lands: the flow is gone, the save is refused.
+    # The late approval lands: the flow is gone, the save is refused.
     with pytest.raises(HTTPException) as late:
-        await oauth_native_app.muse_device_poll(user_id=MEMBER_ID)
+        await oauth_native_app.muse_device_poll(user_id=SECOND_PM_ID)
     assert late.value.status_code == 400
     fake_muse_save.assert_not_awaited()
 
@@ -1238,7 +1283,7 @@ async def test_antigravity_signin_cancelled_by_disconnect_does_not_revive(
     # The late callback carries the flow it acted on; the disconnect cleared it.
     with pytest.raises(ValueError):
         await agy_oauth_mod._finalize_token_save(
-            MEMBER_ID,
+            SECOND_PM_ID,
             {"access_token": "late-agy", "refresh_token": "late-ref", "id_token": "", "expires_in": 3600},
             expected_flow_raw=late_flow_raw,
         )
@@ -1252,7 +1297,7 @@ async def test_antigravity_signin_cancelled_by_disconnect_does_not_revive(
     # start_login also names the current flow (DALTON-HOOK(team-credentials)).
     store.store[f"oauth:antigravity:current:{HOLDER_ID}"] = agy_oauth_mod._flow_id(live_flow_raw)
     await agy_oauth_mod._finalize_token_save(
-        MEMBER_ID,
+        SECOND_PM_ID,
         {"access_token": "ok-agy", "refresh_token": "ok-ref", "id_token": "", "expires_in": 3600},
         expected_flow_raw=live_flow_raw,
     )
@@ -1358,15 +1403,15 @@ async def test_muse_approval_in_flight_when_admin_disconnects_does_not_revive(
         "muse_request_device_code",
         create_autospec(oauth_native_app.muse_request_device_code, side_effect=_device_code),
     )
-    await oauth_native_app.muse_device_initiate(user_id=MEMBER_ID)
+    await oauth_native_app.muse_device_initiate(user_id=SECOND_PM_ID)
     old_raw = store.store[f"oauth:muse:device:{HOLDER_ID}"]
 
-    poll_task = asyncio.ensure_future(oauth_native_app.muse_device_poll(user_id=MEMBER_ID))
+    poll_task = asyncio.ensure_future(oauth_native_app.muse_device_poll(user_id=SECOND_PM_ID))
     await asyncio.sleep(0)  # let the poll reach the held mint call
 
     # Mid-flight: the admin disconnects, then a newer sign-in starts.
-    await oauth_native_app.muse_disconnect(user_id=SECOND_PM_ID)
-    await oauth_native_app.muse_device_initiate(user_id=MEMBER_ID)
+    await oauth_native_app.muse_disconnect(user_id=HOLDER_ID)
+    await oauth_native_app.muse_device_initiate(user_id=SECOND_PM_ID)
     new_raw = store.store[f"oauth:muse:device:{HOLDER_ID}"]
     assert new_raw != old_raw
 
@@ -1414,7 +1459,7 @@ async def test_xai_slow_down_in_flight_does_not_resurrect_cleared_flow(
         "xai_request_device_code",
         create_autospec(oauth_native_app.xai_request_device_code, side_effect=_device_code),
     )
-    await oauth_native_app.xai_device_initiate(user_id=MEMBER_ID)
+    await oauth_native_app.xai_device_initiate(user_id=SECOND_PM_ID)
     old_raw = store.store[f"oauth:xai:device:{HOLDER_ID}"]
 
     poll_release: asyncio.Future[dict] = asyncio.get_event_loop().create_future()
@@ -1429,12 +1474,12 @@ async def test_xai_slow_down_in_flight_does_not_resurrect_cleared_flow(
         create_autospec(real_poll, side_effect=_held_poll),
     )
 
-    poll_task = asyncio.ensure_future(oauth_native_app.xai_device_poll(user_id=MEMBER_ID))
+    poll_task = asyncio.ensure_future(oauth_native_app.xai_device_poll(user_id=SECOND_PM_ID))
     await asyncio.sleep(0)
 
     # Mid-flight: disconnect clears the flow; a newer sign-in starts.
-    await oauth_native_app.xai_disconnect(user_id=SECOND_PM_ID)
-    await oauth_native_app.xai_device_initiate(user_id=MEMBER_ID)
+    await oauth_native_app.xai_disconnect(user_id=HOLDER_ID)
+    await oauth_native_app.xai_device_initiate(user_id=SECOND_PM_ID)
     new_raw = store.store[f"oauth:xai:device:{HOLDER_ID}"]
     assert new_raw != old_raw
 
@@ -1459,7 +1504,7 @@ async def test_xai_slow_down_in_flight_does_not_resurrect_cleared_flow(
         "xai_poll_device_authorization",
         create_autospec(real_poll, side_effect=_held_poll2),
     )
-    poll2 = asyncio.ensure_future(oauth_native_app.xai_device_poll(user_id=MEMBER_ID))
+    poll2 = asyncio.ensure_future(oauth_native_app.xai_device_poll(user_id=SECOND_PM_ID))
     await asyncio.sleep(0)
     await store.delete(f"oauth:xai:device:{HOLDER_ID}")
     poll2_release.set_result({"pending": True, "interval": 9})
@@ -1496,7 +1541,7 @@ async def test_xai_approval_in_flight_when_admin_disconnects_does_not_revive(
         "xai_request_device_code",
         create_autospec(oauth_native_app.xai_request_device_code, side_effect=_device_code),
     )
-    await oauth_native_app.xai_device_initiate(user_id=MEMBER_ID)
+    await oauth_native_app.xai_device_initiate(user_id=SECOND_PM_ID)
     poll_release: asyncio.Future[dict] = asyncio.get_event_loop().create_future()
     real_poll = oauth_native_app.xai_poll_device_authorization
 
@@ -1509,9 +1554,9 @@ async def test_xai_approval_in_flight_when_admin_disconnects_does_not_revive(
         create_autospec(real_poll, side_effect=_held_poll),
     )
 
-    poll_task = asyncio.ensure_future(oauth_native_app.xai_device_poll(user_id=MEMBER_ID))
+    poll_task = asyncio.ensure_future(oauth_native_app.xai_device_poll(user_id=SECOND_PM_ID))
     await asyncio.sleep(0)
-    await oauth_native_app.xai_disconnect(user_id=SECOND_PM_ID)
+    await oauth_native_app.xai_disconnect(user_id=HOLDER_ID)
 
     poll_release.set_result({"access_token": "late-tok", "refresh_token": "late-ref", "expires_in": 3600})
     with pytest.raises(HTTPException) as late:
@@ -1559,14 +1604,14 @@ async def test_antigravity_old_callback_after_disconnect_and_new_login(
 
     paste_task = asyncio.ensure_future(
         agy_oauth_mod.submit_callback_url(
-            MEMBER_ID,
+            SECOND_PM_ID,
             "http://localhost:51121/callback?code=old-code&state=s1",
         )
     )
     await asyncio.sleep(0)  # the paste has read flow1 and holds in the exchange
 
     # Mid-flight: disconnect, then a newer login writes its own flow.
-    await oauth_native_app.antigravity_disconnect(user_id=SECOND_PM_ID)
+    await oauth_native_app.antigravity_disconnect(user_id=HOLDER_ID)
     flow2 = json.dumps({"verifier": "v2", "state": "s2", "port": 51122, "redirect_uri": "http://localhost:51122/callback"})
     store.store[f"oauth:antigravity:{HOLDER_ID}"] = flow2
     # start_login also names the current flow (DALTON-HOOK(team-credentials)).
@@ -1598,7 +1643,7 @@ async def test_antigravity_save_without_cache_refuses(monkeypatch: pytest.Monkey
 
     with pytest.raises(ValueError) as refused:
         await agy_oauth_mod._finalize_token_save(
-            MEMBER_ID,
+            SECOND_PM_ID,
             {"access_token": "t", "refresh_token": "r", "id_token": "", "expires_in": 3600},
             expected_flow_raw="{}",
         )
@@ -1640,7 +1685,7 @@ async def test_antigravity_stale_done_marker_cannot_complete_newer_login(
 
     save_task = asyncio.ensure_future(
         agy_oauth_mod._finalize_token_save(
-            MEMBER_ID,
+            SECOND_PM_ID,
             {"access_token": "old-agy-tok", "refresh_token": "old-ref", "id_token": "", "expires_in": 3600},
             expected_flow_raw=flow1,
         )
@@ -1656,7 +1701,7 @@ async def test_antigravity_stale_done_marker_cannot_complete_newer_login(
     assert store.store[f"oauth:antigravity:done:{HOLDER_ID}"] == agy_oauth_mod._flow_id(flow1)
 
     # Disconnect + a newer login land after the save.
-    await oauth_native_app.antigravity_disconnect(user_id=SECOND_PM_ID)
+    await oauth_native_app.antigravity_disconnect(user_id=HOLDER_ID)
     flow2 = json.dumps({"verifier": "v2", "state": "s2", "port": 51122, "redirect_uri": "http://localhost:51122/callback"})
     store.store[f"oauth:antigravity:{HOLDER_ID}"] = flow2
     # start_login also names the current flow (DALTON-HOOK(team-credentials)).
@@ -1664,10 +1709,479 @@ async def test_antigravity_stale_done_marker_cannot_complete_newer_login(
 
     # The old callback has nothing left to write (its marker moved inside the
     # lock), so the newer login's poll reads no completion and stays pending.
-    resp = await oauth_native_app.antigravity_poll(user_id=MEMBER_ID)
+    resp = await oauth_native_app.antigravity_poll(user_id=SECOND_PM_ID)
     assert resp == {"pending": True}
     assert f"oauth:antigravity:done:{HOLDER_ID}" not in store.store
-    assert store.store[f"oauth:antigravity:{HOLDER_ID}"] == flow2
+    assert store.store[f"oauth:antigravity:{HOLDER_ID}" ] == flow2
     # And the connection row the old save wrote is gone with the disconnect.
     delete_params = [p for sql, p in executed if "DELETE FROM user_oauth_tokens" in str(sql)]
     assert any(p == (HOLDER_ID, "antigravity-oauth") for p in delete_params)
+
+
+# ---------------------------------------------------------------------------
+# 9. Backlog P1: All shared-credential writes require admin; internal non-admin
+#    and external members are rejected before any DB / Redis write; mid-flow
+#    demotion rejects callback/poll; non-team mode & preferences unaffected
+# ---------------------------------------------------------------------------
+
+EXTERNAL_ID = "44444444-4444-4444-8444-444444444444"
+
+
+@pytest.mark.asyncio
+async def test_all_oauth_and_key_write_entrypoints_reject_non_admin_and_external_before_any_io(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """In team mode, both internal non-admin (`MEMBER_ID`) and external member
+    (`EXTERNAL_ID`) are rejected with HTTP 403 at every credential write /
+    OAuth initiate / poll / callback entry point BEFORE any DB or Redis read/write."""
+    _enable_team_sharing(monkeypatch)
+    monkeypatch.setenv("DALTON_ALLOWED_EMAILS", "owner@everflow.ai,member@everflow.ai")
+    settings_mod.get_dalton_config.cache_clear()
+
+    from src.dalton.access_tiers import get_user_tier
+    from src.dalton.app.oauth_native import AntigravityCallbackRequest
+    from src.server.app.oauth import ClaudeCallbackRequest
+
+    async def _fake_get_user(uid: str) -> dict[str, Any] | None:
+        if uid == MEMBER_ID:
+            return {"user_id": MEMBER_ID, "email": "member@everflow.ai"}
+        if uid == EXTERNAL_ID:
+            return {"user_id": EXTERNAL_ID, "email": "guest@external.example"}
+        return {"user_id": uid, "email": "owner@everflow.ai"}
+
+    monkeypatch.setattr(
+        user_db,
+        "get_user",
+        create_autospec(user_db.get_user, side_effect=_fake_get_user),
+    )
+    assert await get_user_tier(HOLDER_ID) == "admin"
+    assert await get_user_tier(SECOND_PM_ID) == "admin"
+    assert await get_user_tier(MEMBER_ID) == "internal"
+    assert await get_user_tier(EXTERNAL_ID) == "external"
+    assert cred_mod.is_credential_admin(HOLDER_ID) is True
+    assert cred_mod.is_credential_admin(SECOND_PM_ID) is True
+    assert cred_mod.is_credential_admin(MEMBER_ID) is False
+    assert cred_mod.is_credential_admin(EXTERNAL_ID) is False
+
+    # Strict autospec spies for DB, Redis, throttle, and upstream OAuth helpers:
+    # none of them may be called when a non-admin or external user hits any write endpoint.
+    get_db_spy = create_autospec(oauth_tokens_db.get_db_connection)
+    monkeypatch.setattr(oauth_tokens_db, "get_db_connection", get_db_spy)
+    monkeypatch.setattr(api_keys_db, "get_db_connection", get_db_spy)
+
+    cache_spy = create_autospec(RedisCacheClient(), instance=True)
+    get_cache_spy = create_autospec(lambda: cache_spy, return_value=cache_spy)
+    monkeypatch.setattr("src.utils.cache.redis_cache.get_cache_client", get_cache_spy)
+
+    throttle_spy = create_autospec(oauth_app.throttle)
+    monkeypatch.setattr(oauth_app, "throttle", throttle_spy)
+    conn_change_spy = create_autospec(oauth_app.connection_change)
+    monkeypatch.setattr(oauth_app, "connection_change", conn_change_spy)
+    monkeypatch.setattr(oauth_native_app, "connection_change", conn_change_spy)
+    monkeypatch.setattr(oauth_tokens_db, "connection_change", conn_change_spy)
+
+    upsert_oauth_spy = create_autospec(oauth_tokens_db.upsert_oauth_tokens)
+    monkeypatch.setattr(oauth_tokens_db, "upsert_oauth_tokens", upsert_oauth_spy)
+    monkeypatch.setattr(agy_oauth_mod, "upsert_oauth_tokens", upsert_oauth_spy)
+
+    muse_req_spy = create_autospec(oauth_native_app.muse_request_device_code)
+    muse_poll_spy = create_autospec(oauth_native_app.muse_poll_device_authorization)
+    muse_save_spy = create_autospec(oauth_native_app.muse_save_minted_credentials)
+    monkeypatch.setattr(oauth_native_app, "muse_request_device_code", muse_req_spy)
+    monkeypatch.setattr(oauth_native_app, "muse_poll_device_authorization", muse_poll_spy)
+    monkeypatch.setattr(oauth_native_app, "muse_save_minted_credentials", muse_save_spy)
+
+    xai_req_spy = create_autospec(oauth_native_app.xai_request_device_code)
+    xai_poll_spy = create_autospec(oauth_native_app.xai_poll_device_authorization)
+    xai_save_spy = create_autospec(oauth_native_app.save_xai_tokens)
+    monkeypatch.setattr(oauth_native_app, "xai_request_device_code", xai_req_spy)
+    monkeypatch.setattr(oauth_native_app, "xai_poll_device_authorization", xai_poll_spy)
+    monkeypatch.setattr(oauth_native_app, "save_xai_tokens", xai_save_spy)
+
+    agy_start_spy = create_autospec(oauth_native_app.antigravity_start_login)
+    agy_submit_spy = create_autospec(oauth_native_app.antigravity_submit_callback_url)
+    monkeypatch.setattr(oauth_native_app, "antigravity_start_login", agy_start_spy)
+    monkeypatch.setattr(oauth_native_app, "antigravity_submit_callback_url", agy_submit_spy)
+
+    for caller_id in (MEMBER_ID, EXTERNAL_ID):
+        for call in [
+            lambda uid=caller_id: api_keys_app.update_api_keys(
+                body=UpdateApiKeysRequest(api_keys={"openai": "sk-unauthorized"}),
+                user_id=uid,
+            ),
+            lambda uid=caller_id: oauth_app.device_initiate(key="codex", user_id=uid),
+            lambda uid=caller_id: oauth_app.device_poll(key="codex", user_id=uid),
+            lambda uid=caller_id: oauth_app.claude_initiate(user_id=uid),
+            lambda uid=caller_id: oauth_app.claude_callback(
+                body=ClaudeCallbackRequest(callback_input="authcode#state123"),
+                user_id=uid,
+            ),
+            lambda uid=caller_id: oauth_app._save(
+                cache_spy,
+                "oauth:device:123",
+                "{}",
+                uid,
+                "codex-oauth",
+                None,
+            ),
+            lambda uid=caller_id: oauth_native_app.muse_device_initiate(user_id=uid),
+            lambda uid=caller_id: oauth_native_app.muse_device_poll(user_id=uid),
+            lambda uid=caller_id: oauth_native_app.antigravity_initiate(user_id=uid),
+            lambda uid=caller_id: oauth_native_app.antigravity_poll(user_id=uid),
+            lambda uid=caller_id: oauth_native_app.antigravity_callback(
+                body=AntigravityCallbackRequest(
+                    callback_input="http://localhost:51121/oauth-callback?code=c&state=s"
+                ),
+                user_id=uid,
+            ),
+            lambda uid=caller_id: agy_oauth_mod.start_login(uid),
+            lambda uid=caller_id: agy_oauth_mod.submit_callback_url(
+                uid, "http://localhost:51121/oauth-callback?code=c&state=s"
+            ),
+            lambda uid=caller_id: agy_oauth_mod._finalize_token_save(
+                uid,
+                {"access_token": "a", "refresh_token": "r", "id_token": "", "expires_in": 3600},
+                expected_flow_raw="{}",
+            ),
+            lambda uid=caller_id: oauth_native_app.xai_device_initiate(user_id=uid),
+            lambda uid=caller_id: oauth_native_app.xai_device_poll(user_id=uid),
+        ]:
+            with pytest.raises(HTTPException) as exc_info:
+                await call()
+            assert exc_info.value.status_code == 403
+            assert exc_info.value.detail == "团队共用凭据只能由管理员设置"
+
+        # Loopback Google callback also refuses non-admin without touching Redis or DB
+        reader = asyncio.StreamReader()
+        reader.feed_data(b"GET /callback?code=code-1&state=state-1 HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        reader.feed_eof()
+        writer = create_autospec(asyncio.StreamWriter, instance=True)
+        written_bytes: list[bytes] = []
+        writer.write.side_effect = written_bytes.append
+        srv_fut: asyncio.Future[asyncio.AbstractServer] = asyncio.get_running_loop().create_future()
+        await agy_oauth_mod._handle_google_callback(
+            reader, writer, caller_id, "verifier-1", "state-1", srv_fut
+        )
+        assert any(b"HTTP/1.1 403 Forbidden" in chunk for chunk in written_bytes)
+
+    get_db_spy.assert_not_called()
+    get_cache_spy.assert_not_called()
+    cache_spy.set.assert_not_called()
+    cache_spy.claim.assert_not_called()
+    cache_spy.swap.assert_not_called()
+    throttle_spy.assert_not_called()
+    conn_change_spy.assert_not_called()
+    upsert_oauth_spy.assert_not_called()
+    muse_req_spy.assert_not_called()
+    muse_poll_spy.assert_not_called()
+    muse_save_spy.assert_not_called()
+    xai_req_spy.assert_not_called()
+    xai_poll_spy.assert_not_called()
+    xai_save_spy.assert_not_called()
+    agy_start_spy.assert_not_called()
+    agy_submit_spy.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_oauth_demotion_mid_flow_rejects_callback_and_poll_without_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When an admin (`SECOND_PM_ID`) initiates OAuth and is demoted before
+    callback/poll (or while the upstream token exchange is in flight), the
+    callback/poll step re-checks admin status and rejects with 403 before
+    claiming the flow or writing tokens."""
+    _enable_team_sharing(monkeypatch)
+    store = _FakeRedisStore()
+    cache = _fake_cache_with_store(store)
+    monkeypatch.setattr(
+        "src.utils.cache.redis_cache.get_cache_client",
+        create_autospec(lambda: cache, return_value=cache),
+    )
+    get_db_conn, _, executed = _make_autospec_db()
+    monkeypatch.setattr(oauth_tokens_db, "get_db_connection", get_db_conn)
+
+    from src.dalton.app.oauth_native import AntigravityCallbackRequest
+    from src.server.app.oauth import ClaudeCallbackRequest
+    from src.server.services import claude_oauth, codex_oauth
+    from src.server.services.oauth_protocol import DeviceCode, DeviceFlow
+
+    # 1. Admin initiates Codex device, Claude PKCE, Muse device, Antigravity, and xAI device
+    monkeypatch.setattr(
+        oauth_app,
+        "throttle",
+        create_autospec(oauth_app.throttle, return_value=True),
+    )
+    fake_device_code = DeviceCode(
+        state={"device_auth_id": "da-1", "user_code": "UC-CODEX"},
+        user_code="UC-CODEX",
+        verification_url="https://auth.openai.com/codex/device",
+        url_has_code=False,
+        interval=5,
+        expires_at=datetime.now(timezone.utc) + timedelta(minutes=10),
+    )
+    fake_codex_flow = DeviceFlow(
+        provider=codex_oauth.DEVICE_FLOW.provider,
+        upstream=codex_oauth.DEVICE_FLOW.upstream,
+        redis_key=codex_oauth.DEVICE_FLOW.redis_key,
+        request=create_autospec(codex_oauth.request_device_code, return_value=fake_device_code),
+        poll=create_autospec(codex_oauth.DEVICE_FLOW.poll),
+    )
+    monkeypatch.setitem(oauth_app._DEVICE_FLOWS, "codex", fake_codex_flow)
+    monkeypatch.setattr(
+        claude_oauth,
+        "generate_authorize_url",
+        create_autospec(
+            claude_oauth.generate_authorize_url,
+            return_value=("https://claude.ai/oauth/authorize?state=s-claude", "s-claude"),
+        ),
+    )
+    monkeypatch.setattr(
+        oauth_native_app,
+        "muse_request_device_code",
+        create_autospec(
+            oauth_native_app.muse_request_device_code,
+            return_value={
+                "device_code": "dc-muse",
+                "user_code": "UC-MUSE",
+                "verification_url": "https://auth.meta.com/device",
+                "interval": 5,
+                "expires_in": 600,
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        oauth_native_app,
+        "xai_request_device_code",
+        create_autospec(
+            oauth_native_app.xai_request_device_code,
+            return_value={
+                "device_code": "dc-xai",
+                "user_code": "UC-XAI",
+                "verification_url": "https://auth.x.ai/device",
+                "interval": 5,
+                "expires_in": 600,
+            },
+        ),
+    )
+
+    await oauth_app.device_initiate(key="codex", user_id=SECOND_PM_ID)
+    await oauth_app.claude_initiate(user_id=SECOND_PM_ID)
+    await oauth_native_app.muse_device_initiate(user_id=SECOND_PM_ID)
+    await oauth_native_app.xai_device_initiate(user_id=SECOND_PM_ID)
+    agy_flow = json.dumps(
+        {
+            "verifier": "v-agy",
+            "state": "s-agy",
+            "port": 51121,
+            "redirect_uri": "http://localhost:51121/oauth-callback",
+        }
+    )
+    store.store[f"oauth:antigravity:{HOLDER_ID}"] = agy_flow
+    store.store[f"oauth:antigravity:current:{HOLDER_ID}"] = agy_oauth_mod._flow_id(agy_flow)
+
+    # 2. Demote SECOND_PM_ID so only HOLDER_ID remains admin
+    monkeypatch.setenv("DALTON_PM_USER_IDS", HOLDER_ID)
+    settings_mod.get_dalton_config.cache_clear()
+    assert cred_mod.is_credential_admin(SECOND_PM_ID) is False
+    assert cred_mod.is_credential_admin(HOLDER_ID) is True
+
+    fake_store_tokens = create_autospec(oauth_app.store_tokens)
+    monkeypatch.setattr(oauth_app, "store_tokens", fake_store_tokens)
+    fake_muse_save = create_autospec(oauth_native_app.muse_save_minted_credentials)
+    monkeypatch.setattr(oauth_native_app, "muse_save_minted_credentials", fake_muse_save)
+    fake_xai_save = create_autospec(oauth_native_app.save_xai_tokens)
+    monkeypatch.setattr(oauth_native_app, "save_xai_tokens", fake_xai_save)
+    fake_agy_upsert = create_autospec(agy_oauth_mod.upsert_oauth_tokens)
+    monkeypatch.setattr(agy_oauth_mod, "upsert_oauth_tokens", fake_agy_upsert)
+
+    # Demoted user's poll / callback is rejected with 403 and pending flows remain untouched for the real admin
+    for call in [
+        lambda: oauth_app.device_poll(key="codex", user_id=SECOND_PM_ID),
+        lambda: oauth_app.claude_callback(
+            body=ClaudeCallbackRequest(callback_input="code123#s-claude"),
+            user_id=SECOND_PM_ID,
+        ),
+        lambda: oauth_native_app.muse_device_poll(user_id=SECOND_PM_ID),
+        lambda: oauth_native_app.antigravity_poll(user_id=SECOND_PM_ID),
+        lambda: oauth_native_app.antigravity_callback(
+            body=AntigravityCallbackRequest(
+                callback_input="http://localhost:51121/oauth-callback?code=c&state=s-agy"
+            ),
+            user_id=SECOND_PM_ID,
+        ),
+        lambda: oauth_native_app.xai_device_poll(user_id=SECOND_PM_ID),
+    ]:
+        with pytest.raises(HTTPException) as exc_info:
+            await call()
+        assert exc_info.value.status_code == 403
+        assert exc_info.value.detail == "团队共用凭据只能由管理员设置"
+
+    fake_store_tokens.assert_not_awaited()
+    fake_muse_save.assert_not_awaited()
+    fake_xai_save.assert_not_awaited()
+    fake_agy_upsert.assert_not_awaited()
+    assert executed == []
+    # Pending flows in Redis were not claimed or deleted by the rejected calls
+    assert f"oauth:claude:{HOLDER_ID}" in store.store
+    assert f"oauth:muse:device:{HOLDER_ID}" in store.store
+    assert f"oauth:antigravity:{HOLDER_ID}" in store.store
+    assert f"oauth:xai:device:{HOLDER_ID}" in store.store
+
+    # 3. Also test demotion occurring WHILE the upstream poll/exchange is in flight:
+    # restore SECOND_PM_ID, start xAI poll & Antigravity paste callback, demote before exchange returns.
+    monkeypatch.setenv("DALTON_PM_USER_IDS", f"{HOLDER_ID},{SECOND_PM_ID}")
+    settings_mod.get_dalton_config.cache_clear()
+
+    xai_release: asyncio.Future[dict[str, Any]] = asyncio.get_event_loop().create_future()
+
+    async def _held_xai_poll(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        return await xai_release
+
+    monkeypatch.setattr(
+        oauth_native_app,
+        "xai_poll_device_authorization",
+        create_autospec(oauth_native_app.xai_poll_device_authorization, side_effect=_held_xai_poll),
+    )
+    agy_release: asyncio.Future[dict[str, Any]] = asyncio.get_event_loop().create_future()
+
+    async def _held_agy_exchange(code: str, verifier: str, redirect_uri: str) -> dict[str, Any]:
+        return await agy_release
+
+    monkeypatch.setattr(
+        agy_oauth_mod,
+        "exchange_code",
+        create_autospec(agy_oauth_mod.exchange_code, side_effect=_held_agy_exchange),
+    )
+
+    xai_task = asyncio.ensure_future(oauth_native_app.xai_device_poll(user_id=SECOND_PM_ID))
+    agy_task = asyncio.ensure_future(
+        oauth_native_app.antigravity_callback(
+            body=AntigravityCallbackRequest(
+                callback_input="http://localhost:51121/oauth-callback?code=c&state=s-agy"
+            ),
+            user_id=SECOND_PM_ID,
+        )
+    )
+    await asyncio.sleep(0)
+
+    # Demote SECOND_PM_ID while both upstream exchanges are in flight
+    monkeypatch.setenv("DALTON_PM_USER_IDS", HOLDER_ID)
+    settings_mod.get_dalton_config.cache_clear()
+
+    xai_release.set_result({"access_token": "tok", "refresh_token": "ref", "expires_in": 3600})
+    agy_release.set_result({"access_token": "tok", "refresh_token": "ref", "id_token": "", "expires_in": 3600})
+
+    with pytest.raises(HTTPException) as exc_xai:
+        await xai_task
+    assert exc_xai.value.status_code == 403
+
+    with pytest.raises(HTTPException) as exc_agy:
+        await agy_task
+    assert exc_agy.value.status_code == 403
+
+    fake_xai_save.assert_not_awaited()
+    fake_agy_upsert.assert_not_awaited()
+    assert executed == []
+
+
+@pytest.mark.asyncio
+async def test_non_team_mode_and_personal_model_preferences_unaffected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When `credentials.sharing == 'off'`, non-admin users can write their own
+    API keys and OAuth credentials; in team mode, personal default model
+    selection (`PUT /api/v1/users/me/preferences`) remains open to non-admins."""
+    # 1. Non-team mode (`sharing="off"`): non-admin member can write own API keys and initiate OAuth
+    _enable_team_sharing(monkeypatch, sharing="off")
+    assert cred_mod.is_team_credential_sharing_enabled() is False
+    assert cred_mod.is_credential_admin(MEMBER_ID) is True
+    assert cred_mod.is_credential_admin(EXTERNAL_ID) is True
+
+    monkeypatch.setattr(
+        api_keys_app,
+        "_get_custom_providers",
+        create_autospec(api_keys_app._get_custom_providers, return_value=[]),
+    )
+    fake_upsert_key = create_autospec(api_keys_app.upsert_api_key, return_value=None)
+    fake_inv_byok = create_autospec(api_keys_app.invalidate_byok_cache, return_value=None)
+    fake_inv_models = create_autospec(api_keys_app.invalidate_available_models, return_value=None)
+    fake_get_keys = create_autospec(
+        api_keys_app.get_user_api_keys,
+        return_value={"byok_enabled": True, "keys": {"openai": "sk-...1234"}, "base_urls": {}},
+    )
+    fake_complete = create_autospec(onboarding_svc.maybe_complete_personalization, return_value=None)
+    monkeypatch.setattr(api_keys_app, "upsert_api_key", fake_upsert_key)
+    monkeypatch.setattr(api_keys_app, "invalidate_byok_cache", fake_inv_byok)
+    monkeypatch.setattr(api_keys_app, "invalidate_available_models", fake_inv_models)
+    monkeypatch.setattr(api_keys_app, "get_user_api_keys", fake_get_keys)
+    monkeypatch.setattr(onboarding_svc, "maybe_complete_personalization", fake_complete)
+
+    res = await api_keys_app.update_api_keys(
+        body=UpdateApiKeysRequest(api_keys={"openai": "sk-personal-1234"}),
+        user_id=MEMBER_ID,
+    )
+    assert res["byok_enabled"] is True
+    fake_upsert_key.assert_awaited_once_with(MEMBER_ID, "openai", "sk-personal-1234", base_url=None)
+
+    # 2. In team mode, personal default model preferences still succeed for non-admin MEMBER_ID
+    _enable_team_sharing(monkeypatch, sharing="team")
+    assert cred_mod.is_credential_admin(MEMBER_ID) is False
+
+    import src.server.app.users as users_app
+    from src.server.models.user import UserPreferencesUpdate
+
+    get_db_prefs, _, _ = _make_autospec_db(fetchone_row={"model_preference": {}})
+    monkeypatch.setattr(users_app, "get_db_connection", get_db_prefs)
+    monkeypatch.setattr(
+        users_app,
+        "db_get_user",
+        create_autospec(users_app.db_get_user, return_value={"user_id": MEMBER_ID, "email": "member@everflow.ai"}),
+    )
+    monkeypatch.setattr(
+        users_app,
+        "db_get_user_preferences",
+        create_autospec(users_app.db_get_user_preferences, return_value={"model_preference": {}}),
+    )
+    monkeypatch.setattr(
+        users_app,
+        "db_lock_user_preferences",
+        create_autospec(users_app.db_lock_user_preferences, return_value={"model_preference": {}}),
+    )
+    now_dt = datetime.now(timezone.utc)
+    fake_upsert_prefs = create_autospec(
+        users_app.upsert_user_preferences,
+        return_value={
+            "user_preference_id": "11111111-1111-4111-8111-111111111111",
+            "user_id": MEMBER_ID,
+            "risk_preference": None,
+            "investment_preference": None,
+            "agent_preference": None,
+            "other_preference": {"preferred_flash_model": "gpt-5-mini"},
+            "model_preference": {},
+            "created_at": now_dt,
+            "updated_at": now_dt,
+        },
+    )
+    monkeypatch.setattr(users_app, "upsert_user_preferences", fake_upsert_prefs)
+    monkeypatch.setattr(
+        users_app,
+        "invalidate_user_prefs_cache",
+        create_autospec(users_app.invalidate_user_prefs_cache, return_value=None),
+    )
+    monkeypatch.setattr(
+        users_app,
+        "invalidate_user_profile_cache",
+        create_autospec(users_app.invalidate_user_profile_cache, return_value=None),
+    )
+    monkeypatch.setattr(
+        users_app,
+        "maybe_complete_onboarding",
+        create_autospec(users_app.maybe_complete_onboarding, return_value=None),
+    )
+    prefs_res = await users_app.update_preferences(
+        request=UserPreferencesUpdate(),
+        user_id=MEMBER_ID,
+    )
+    assert prefs_res is not None
+    fake_upsert_prefs.assert_awaited_once()
+

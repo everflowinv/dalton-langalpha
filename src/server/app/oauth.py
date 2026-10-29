@@ -107,6 +107,11 @@ async def _save(cache, key: str, raw, user_id: str, provider: str, tokens: Token
     one it replaced. The claim ends the sign-in whether or not the save lands:
     the provider already spent the authorization, so only a new one helps.
     """
+    # DALTON-HOOK(team-credentials): re-check at the commit step so an admin
+    # demoted while the upstream poll/exchange was in flight cannot land a save.
+    from src.dalton.credentials import require_credential_write_admin
+
+    require_credential_write_admin(user_id)
     try:
         # Bounded so the caller's lease outlasts it (the poll's 60 seconds
         # plus this stay under its 75): a save stalled on the pool or the lock
@@ -204,6 +209,12 @@ _INITIATE_DEADLINE_S = 30
 
 
 async def _device_initiate(flow: DeviceFlow, user_id: str) -> dict:
+    # DALTON-HOOK(team-credentials): connecting writes the shared credential,
+    # so only PM users may start a sign-in — checked before the throttle
+    # counter (itself a Redis write) and the provider request.
+    from src.dalton.credentials import require_credential_write_admin
+
+    require_credential_write_admin(user_id)
     cache = _require_cache()
     if not await throttle(f"oauth_device_init:{flow.provider}:{user_id}", _INITIATES_PER_MINUTE, 60):
         # Worded as the provider being busy, which asking again shortly fixes.
@@ -247,6 +258,13 @@ async def _device_initiate(flow: DeviceFlow, user_id: str) -> dict:
 
 
 async def _device_poll(flow: DeviceFlow, user_id: str) -> dict:
+    # DALTON-HOOK(team-credentials): the poll is where an approval becomes the
+    # stored credential, so the writer is re-checked here, not only at
+    # initiate — an admin demoted after starting (or anyone polling a flow
+    # someone else started) is refused before the poll lock or any cache write.
+    from src.dalton.credentials import require_credential_write_admin
+
+    require_credential_write_admin(user_id)
     cache = _require_cache()
     lock_key = f"{flow.redis_key}:poll:{_holder(user_id)}"  # DALTON-HOOK(team-credentials)
     lock_token = secrets.token_hex(16)
@@ -373,6 +391,11 @@ async def claude_initiate(user_id: CurrentUserId):
     The frontend opens it in a new tab; once the user authorizes, Anthropic's
     page shows a code they paste back via POST /claude/callback.
     """
+    # DALTON-HOOK(team-credentials): connecting writes the shared credential;
+    # checked before the flow key is written to Redis.
+    from src.dalton.credentials import require_credential_write_admin
+
+    require_credential_write_admin(user_id)
     cache = _require_cache()
     authorize_url, verifier = claude_oauth.generate_authorize_url()
     # The verifier is the flow: once it expires, a pasted code has nothing
@@ -396,6 +419,12 @@ async def claude_callback(user_id: CurrentUserId, body: ClaudeCallbackRequest):
     second waits instead, and answers as the first did when that one connected
     this same sign-in.
     """
+    # DALTON-HOOK(team-credentials): the paste is where the authorization
+    # becomes the stored credential, so the writer is re-checked here, not
+    # only at initiate — before the callback lock or any exchange/save.
+    from src.dalton.credentials import require_credential_write_admin
+
+    require_credential_write_admin(user_id)
     cache = _require_cache()
     lock_key = f"{_claude_key(user_id)}:callback"
     lock_token = secrets.token_hex(16)

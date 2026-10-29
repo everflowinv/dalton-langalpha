@@ -6,12 +6,17 @@ Errors are classified by where jsonschema reports them: only a root-level
 violation on plugin.json is fatal and nothing is written.
 """
 
-from json import dumps, loads
 from typing import Any
 
 from jsonschema.validators import validator_for
 from referencing import Registry
 
+# DALTON-HOOK(plugin-json-budget): enforce byte, depth, and node budgets on plugin manifests.
+from src.dalton.plugin_json_budget import (
+    JsonBudgetError,
+    loads_json_with_budget,
+    unwrap_budget_error,
+)
 from src.server.models.plugin import Diagnostic
 from src.server.services.plugins.errors import PluginFatal
 from src.server.services.plugins.schemas import (
@@ -55,13 +60,30 @@ def validate_manifest(raw: bytes) -> tuple[dict[str, Any], list[Diagnostic]]:
 
     Raises PluginFatal on any violation past the two tolerated warns.
     """
-    try:
-        doc = loads(raw.decode("utf-8"))
-        # A ``\ud800`` escape decodes to a lone surrogate, which neither a
-        # JSON response nor the stored manifest can encode.
-        dumps(doc, ensure_ascii=False).encode("utf-8")
-    except (ValueError, RecursionError) as e:
-        raise PluginFatal(f"plugin.json is not valid JSON: {e}") from e
+    # DALTON-HOOK(plugin-json-budget): enforce byte, depth, node, and output budgets with file/limit diagnostics.
+    budget_err = unwrap_budget_error(raw)
+    if budget_err is None:
+        try:
+            doc = loads_json_with_budget(raw, target="plugin.json")
+        except JsonBudgetError as e:
+            budget_err = e
+        except (ValueError, RecursionError) as e:
+            raise PluginFatal(f"plugin.json is not valid JSON: {e}") from e
+    if budget_err is not None:
+        msg = f"{budget_err.target} is not valid JSON: {budget_err}"
+        raise PluginFatal(
+            msg,
+            diagnostics=[
+                Diagnostic(
+                    level="error",
+                    scope="plugin",
+                    target=budget_err.target,
+                    code="unreadable",
+                    message=msg,
+                    spec_ref=SPEC_URL,
+                )
+            ],
+        )
     if not isinstance(doc, dict):
         raise PluginFatal("plugin.json must be a JSON object")
 

@@ -167,6 +167,8 @@ export interface AutomationPayload {
   instruction: string;
   /** Home's id for the Chief of Staff, else the workspace's. */
   workspace_id: string;
+  // DALTON-HOOK(automation-model): optional per-automation model override (null clears override)
+  llm_model?: string | null;
   thread_strategy: Automation['thread_strategy'];
   max_failures: number;
   delivery_config: DeliveryConfig;

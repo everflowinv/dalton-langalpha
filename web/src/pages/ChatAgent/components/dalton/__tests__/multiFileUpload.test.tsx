@@ -69,7 +69,7 @@ beforeEach(() => {
 });
 
 describe('useFileUpload — multi-file upload', () => {
-  it('uploads every dropped file serially and refreshes the list exactly once', async () => {
+  it('uploads every dropped file serially and refreshes the list as each file lands', async () => {
     let active = 0;
     let maxConcurrent = 0;
     // One microtask yield per upload, not a timer: `await act(...)` drains
@@ -101,13 +101,13 @@ describe('useFileUpload — multi-file upload', () => {
       'a.txt', 'b.txt', 'c.txt',
     ]);
     expect(maxConcurrent).toBe(1);
-    expect(onRefreshFiles).toHaveBeenCalledTimes(1);
+    expect(onRefreshFiles).toHaveBeenCalledTimes(3);
     expect(result.current.uploadProgress).toBeNull();
     expect(result.current.uploadStatus).toBeNull();
     expect(result.current.uploadError).toBeNull();
   });
 
-  it('continues past a failed file, summarises failures, still refreshes once', async () => {
+  it('continues past a failed file, summarises failures, refreshes as each file lands and at batch end', async () => {
     mockUpload.mockImplementation(async (_ws: string, file: File) => {
       if (file.name === 'bad.txt') {
         // 413 without a detail — the front-of-server limit the page can't know.
@@ -129,13 +129,53 @@ describe('useFileUpload — multi-file upload', () => {
 
     // The failed file did not stop the batch.
     expect(mockUpload).toHaveBeenCalledTimes(3);
-    expect(onRefreshFiles).toHaveBeenCalledTimes(1);
+    expect(onRefreshFiles).toHaveBeenCalledTimes(2);
     // The summary locks its content: count, file name, and the 413-without-
     // detail wording derived from the file's size.
     expect(result.current.uploadError).toBe(
       '1 个文件上传失败：bad.txt (File is too large to upload (0.0 MB).)',
     );
     expect(result.current.uploadProgress).toBeNull();
+  });
+
+  it('refreshes immediately when the first file finishes while later files are still uploading, including mixed success and failure', async () => {
+    const settlers: Array<{ ok: () => void; fail: (err: unknown) => void }> = [];
+    mockUpload.mockImplementation(() => new Promise<{ path: string }>((resolve, reject) => {
+      settlers.push({
+        ok: () => resolve({ path: 'uploaded' }),
+        fail: (err) => reject(err),
+      });
+    }));
+    const onRefreshFiles = vi.fn();
+    const { result } = renderHookWithProviders(() =>
+      useFileUpload({ workspaceId: 'ws-1', onRefreshFiles }));
+
+    act(() => {
+      result.current.handleDrop(dropEvent([
+        makeFile('first-ok.txt'),
+        makeFile('second-fail.txt'),
+      ]) as React.DragEvent);
+    });
+    expect(onRefreshFiles).not.toHaveBeenCalled();
+
+    // First file lands while second file is still in flight -> list refreshes immediately.
+    await act(async () => {
+      settlers[0].ok();
+      await settle();
+    });
+    expect(onRefreshFiles).toHaveBeenCalledTimes(1);
+    expect(result.current.uploadStatus).toMatchObject({
+      current: 2, total: 2, fileName: 'second-fail.txt',
+    });
+
+    // Second file fails -> batch ends, final batch-end refresh still runs and error is reported.
+    await act(async () => {
+      settlers[1].fail(new Error('disk full'));
+      await settle();
+    });
+    expect(onRefreshFiles).toHaveBeenCalledTimes(2);
+    expect(result.current.uploadStatus).toBeNull();
+    expect(result.current.uploadError).toBe('1 个文件上传失败：second-fail.txt (disk full)');
   });
 
   it('does not refresh the list when every upload failed', async () => {
@@ -167,7 +207,7 @@ describe('useFileUpload — multi-file upload', () => {
     });
 
     expect(mockUpload).toHaveBeenCalledTimes(2);
-    expect(onRefreshFiles).toHaveBeenCalledTimes(1);
+    expect(onRefreshFiles).toHaveBeenCalledTimes(2);
   });
 
   it('exposes the batch position while uploading', async () => {
@@ -203,7 +243,7 @@ describe('useFileUpload — multi-file upload', () => {
     expect(result.current.uploadProgress).toBeNull();
   });
 
-  it('files dropped while a batch runs join the same queue: one loop, one refresh, growing total', async () => {
+  it('files dropped while a batch runs join the same queue: one loop, per-file refresh, growing total', async () => {
     let release: (() => void) | null = null;
     mockUpload.mockImplementation(() => new Promise<{ path: string }>((resolve) => {
       release = () => resolve({ path: 'uploaded' });
@@ -234,18 +274,21 @@ describe('useFileUpload — multi-file upload', () => {
       release?.();
       await settle();
     });
+    expect(onRefreshFiles).toHaveBeenCalledTimes(1);
     expect(result.current.uploadStatus).toMatchObject({ current: 2, total: 4, fileName: 'b.txt' });
 
     await act(async () => {
       release?.();
       await settle();
     });
+    expect(onRefreshFiles).toHaveBeenCalledTimes(2);
     expect(result.current.uploadStatus).toMatchObject({ current: 3, total: 4, fileName: 'c.txt' });
 
     await act(async () => {
       release?.();
       await settle();
     });
+    expect(onRefreshFiles).toHaveBeenCalledTimes(3);
     expect(result.current.uploadStatus).toMatchObject({ current: 4, total: 4, fileName: 'd.txt' });
 
     await act(async () => {
@@ -255,7 +298,7 @@ describe('useFileUpload — multi-file upload', () => {
     expect(mockUpload.mock.calls.map((c) => c[1].name)).toEqual([
       'a.txt', 'b.txt', 'c.txt', 'd.txt',
     ]);
-    expect(onRefreshFiles).toHaveBeenCalledTimes(1);
+    expect(onRefreshFiles).toHaveBeenCalledTimes(4);
     expect(result.current.uploadError).toBeNull();
   });
 });
@@ -365,13 +408,14 @@ describe('useFileUpload — workspace switch / unmount guard', () => {
       settlers[1].ok();
       await settle();
     });
+    expect(refreshB).toHaveBeenCalledTimes(1);
     expect(mockUpload).toHaveBeenNthCalledWith(3, 'ws-B', expect.any(File), expect.anything());
     await act(async () => {
       settlers[2].ok();
       await settle();
     });
     expect(result.current.uploadStatus).toBeNull();
-    expect(refreshB).toHaveBeenCalledTimes(1);
+    expect(refreshB).toHaveBeenCalledTimes(2);
     expect(refreshA).not.toHaveBeenCalled();
   });
 

@@ -176,7 +176,13 @@ export function useFileUpload({ workspaceId, onRefreshFiles }: {
           if (landed) onRefreshFiles?.();
           break;
         }
-        if (landed) uploaded++;
+        if (landed) {
+          uploaded++;
+          // DALTON-HOOK(multi-file-upload): refresh this workspace's file list
+          // as soon as each file lands while more remain in the queue; the
+          // batch-end refresh in `finally` covers the final file.
+          if (queueRef.current.length > 0) onRefreshFiles?.();
+        }
       }
     } finally {
       release();

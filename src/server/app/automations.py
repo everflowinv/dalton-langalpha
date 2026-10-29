@@ -234,10 +234,14 @@ async def update_automation(
 ):
     """Partial update of an automation."""
     try:
+        fields = request.model_dump(exclude_none=True)
+        # DALTON-HOOK(automation-model): allow explicit null llm_model to clear model override
+        if "llm_model" in request.model_fields_set and request.llm_model is None:
+            fields["llm_model"] = None
         automation = await handler.update_automation(
             automation_id=str(automation_id),
             user_id=user_id,
-            fields=request.model_dump(exclude_none=True),
+            fields=fields,
         )
     except handler.DeliveryRefused as e:
         return _delivery_refused(e)

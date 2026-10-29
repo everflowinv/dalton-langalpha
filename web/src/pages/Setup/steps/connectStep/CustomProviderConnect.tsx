@@ -12,6 +12,8 @@ import { API_FORMATS } from '@/components/modelAccess/apiFormat';
 import { useCustomProviderForm } from '@/components/modelAccess/useCustomProviderForm';
 import { ModelCheckRow, useProviderConnected, type LocationState } from './shared';
 import { SetupFooter } from '../../SetupFooter';
+import { isDaltonAuth } from '@/config/daltonAuth';
+import { useTeamCredentials } from '@/hooks/useTeamCredentials';
 
 /** The wizard's step for a provider of the user's own: the shared form between the wizard's header and footer. */
 export function CustomProviderConnect({ state }: { state: LocationState }) {
@@ -28,11 +30,26 @@ export function CustomProviderConnect({ state }: { state: LocationState }) {
   const form = useCustomProviderForm();
   const { checking, entered, listing, recognized } = form;
   const method = state.method ?? 'api_key';
+  // DALTON-HOOK(team-credentials): a non-PM member under team sharing cannot
+  // write the shared credentials (the server refuses the save), so the form is
+  // replaced by the note, as on the API-key step.
+  const { isShared: isTeamShared, canManage } = useTeamCredentials();
+  const teamManagedByAdmin = isDaltonAuth && isTeamShared && !canManage;
 
   const handleSave = async () => {
     const slug = await form.save();
     if (slug) connected({ method, provider: slug, displayName: form.name.trim(), brandKey: slug, justConnected: true });
   };
+
+  if (teamManagedByAdmin) {
+    return (
+      <div>
+        <WizardStepHeader titleId={headingId} title={t('setup.addCustomProvider')} />
+        <QuietNote>{t('modelAccess.teamManagedByAdmin')}</QuietNote>
+        <SetupFooter back={{ label: t('setup.back'), onClick: () => navigate('/setup/provider', { state: { method } }) }} primary={null} />
+      </div>
+    );
+  }
 
   return (
     <div>

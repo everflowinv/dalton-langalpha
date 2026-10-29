@@ -13,7 +13,7 @@ import logging
 import re
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Literal, Mapping, Optional, Tuple, Union
+from typing import Any, Dict, List, Literal, Mapping, NoReturn, Optional, Tuple, Union
 from urllib.parse import urlparse
 
 import httpx
@@ -33,6 +33,7 @@ from src.dalton.web_search.broker_protocol import (
     compute_http_timeout_seconds,
 )
 from src.dalton.web_search.redirects import resolve_grounding_redirects
+from src.dalton.web_search.redaction import clean_log_field as _clean_log_field
 from src.tools.utils.validation_utils import validate_date_format
 from src.tools.web.providers._shared import (
     SNIPPET_MAX,
@@ -197,12 +198,37 @@ def _resolve_date_window(
     return computed_after, max(computed_after, today_str)
 
 
+def _upstream_error_fields(payload: Mapping[str, Any]) -> Dict[str, Any]:
+    """The bridge's optional upstream passthrough fields (backlog 三-6):
+    ``upstream_status``/``upstream_code`` are present only when the broker
+    frame carried an upstream signal; {} otherwise."""
+    fields: Dict[str, Any] = {}
+    status = payload.get("upstream_status")
+    if isinstance(status, int) and not isinstance(status, bool):
+        fields["upstream_status"] = status
+    code = payload.get("upstream_code")
+    if isinstance(code, str) and code.strip():
+        fields["upstream_code"] = code.strip()
+    return fields
+
+
 def _raise_for_bridge_error_payload(
     payload: Mapping[str, Any],
     *,
     http_status: Optional[int] = None,
 ) -> None:
-    """Classify a structured bridge/broker error payload and raise the appropriate exception."""
+    """Classify a structured bridge/broker error payload and raise the appropriate exception.
+
+    The bridge's optional ``upstream_status``/``upstream_code`` fields ride
+    onto the raised exception as attributes so the caller's log line can say
+    whether the provider answered 4xx/5xx (previously dropped at this layer)."""
+    upstream = _upstream_error_fields(payload)
+
+    def _raise_with_upstream(exc: BaseException) -> NoReturn:
+        for key, value in upstream.items():
+            setattr(exc, key, value)
+        raise exc
+
     err = payload.get("error")
     if isinstance(err, Mapping):
         code = str(err.get("code") or "").strip()
@@ -212,13 +238,15 @@ def _raise_for_bridge_error_payload(
         raw_message = clip_error(str(err or "").strip())
 
     if code == "bridge_busy" or code.lower() == "bridge_busy":
-        raise OpenClawSearchRequestError(BRIDGE_BUSY_MESSAGE, code="bridge_busy")
+        _raise_with_upstream(OpenClawSearchRequestError(BRIDGE_BUSY_MESSAGE, code="bridge_busy"))
 
     if code in _RATE_LIMIT_CODES or http_status == 429:
         detail = f"{RATE_LIMITED_MESSAGE}: {raw_message}" if raw_message else RATE_LIMITED_MESSAGE
-        raise OpenClawSearchRequestError(
-            detail,
-            code=code or "PROVIDER_RATE_LIMITED",
+        _raise_with_upstream(
+            OpenClawSearchRequestError(
+                detail,
+                code=code or "PROVIDER_RATE_LIMITED",
+            )
         )
 
     # The model generated no answer this round ("no final answer"). The bridge
@@ -228,20 +256,24 @@ def _raise_for_bridge_error_payload(
     if code.lower() in _EMPTY_GENERATION_CODES or (
         raw_message and _EMPTY_GENERATION_RE.search(raw_message)
     ):
-        raise OpenClawSearchEmptyGenerationError(EMPTY_GENERATION_MESSAGE)
+        _raise_with_upstream(OpenClawSearchEmptyGenerationError(EMPTY_GENERATION_MESSAGE))
 
     # A broker-side INVALID_JSON arrives as 5xx: that is the bridge failing, not a bad request.
     if http_status == 400 or (code in _PARAM_ERROR_CODES and http_status in (None, 400)):
         detail_parts = [p for p in (code, raw_message) if p]
         detail = ": ".join(detail_parts) if detail_parts else "invalid request"
-        raise OpenClawSearchRequestError(
-            f"Search failed: 参数错误 ({detail})",
-            code=code or "INVALID_REQUEST",
+        _raise_with_upstream(
+            OpenClawSearchRequestError(
+                f"Search failed: 参数错误 ({detail})",
+                code=code or "INVALID_REQUEST",
+            )
         )
 
     if code and raw_message:
-        raise OpenClawSearchBridgeUnavailableError(f"{code}: {raw_message}")
-    raise OpenClawSearchBridgeUnavailableError(raw_message or code or "request failed")
+        _raise_with_upstream(OpenClawSearchBridgeUnavailableError(f"{code}: {raw_message}"))
+    _raise_with_upstream(
+        OpenClawSearchBridgeUnavailableError(raw_message or code or "request failed")
+    )
 
 
 def extract_broker_payload(broker_response: Mapping[str, Any]) -> dict[str, Any]:
@@ -659,11 +691,24 @@ def build_web_search_tool(
             }
         except OpenClawSearchRequestError as exc:
             error_message = str(exc)
-            logger.warning("OpenClaw web search request error: %s", exc.code)
+            # The bridge's optional upstream passthrough (三-6): says whether
+            # the provider answered 4xx/5xx when the broker frame carried it.
+            # P0 fix1 2: both codes are externally controlled strings —
+            # redacted, control-char-stripped, truncated before logging.
+            logger.warning(
+                "OpenClaw web search request error: %s upstream_status=%s upstream_code=%s",
+                _clean_log_field(exc.code, max_len=64) or "-",
+                getattr(exc, "upstream_status", None) if getattr(exc, "upstream_status", None) is not None else "-",
+                _clean_log_field(getattr(exc, "upstream_code", None) or "", max_len=64) or "-",
+            )
             return error_message, {"error": error_message, "code": exc.code, "query": query}
         except OpenClawSearchBridgeUnavailableError as exc:
             error_message = str(exc)
-            logger.error("OpenClaw web search bridge unavailable")
+            logger.error(
+                "OpenClaw web search bridge unavailable upstream_status=%s upstream_code=%s",
+                getattr(exc, "upstream_status", None) if getattr(exc, "upstream_status", None) is not None else "-",
+                _clean_log_field(getattr(exc, "upstream_code", None) or "", max_len=64) or "-",
+            )
             return error_message, {"error": error_message, "query": query}
         except json.JSONDecodeError as exc:
             error_message = f"{BRIDGE_UNAVAILABLE_MESSAGE}: response is not JSON"

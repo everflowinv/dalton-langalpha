@@ -67,10 +67,12 @@ import {
   type DaltonSettingVisibilityContext,
 } from './panels/dalton/DaltonCosSharingCard';
 import { canShowDaltonInviteAdminCard } from './panels/dalton/DaltonInvitesCard';
+import { canShowDaltonFeishuScopesCard } from './panels/dalton/FeishuReadScopesCard';
 
 export {
   canShowDaltonCosSharingCard,
   canShowDaltonInviteAdminCard,
+  canShowDaltonFeishuScopesCard,
   type DaltonSettingVisibilityContext,
 };
 
@@ -145,7 +147,7 @@ export const SETTINGS = {
   daltonExtractModel: { section: 'model', anchor: 'dalton-extract-model', labelKey: 'settings.modelTuning.daltonExtractModel', descKey: 'settings.modelTuning.daltonExtractModelDesc', advanced: true, keywords: '对话归档抽卡模型 网页摘取模型 摘取 conversation archive extraction model' },
   daltonCosSharing: { section: 'model', anchor: 'dalton-cos-sharing', labelKey: 'settings.dalton.cosSharingLabel', descKey: 'settings.dalton.cosSharingDesc', keywords: '研究总监 研究总监共享开关 允许同事的研究总监向我的工作区派活 chief of staff sharing colleague dispatch', visibleWhen: canShowDaltonCosSharingCard },
   daltonInvites: { section: 'model', anchor: 'dalton-invites', labelKey: 'settings.dalton.invitesLabel', descKey: 'settings.dalton.invitesDesc', keywords: '团队邀请 成员权限 邀请链接 team invites allowlist', visibleWhen: canShowDaltonInviteAdminCard },
-  daltonFeishuScopes: { section: 'model', anchor: 'dalton-feishu-scopes', labelKey: 'settings.dalton.feishuScopesLabel', descKey: 'settings.dalton.feishuScopesDesc', keywords: '飞书读取权限 飞书授权 文档 知识库 多维表格 feishu read scopes', visibleWhen: canShowDaltonInviteAdminCard },
+  daltonFeishuScopes: { section: 'model', anchor: 'dalton-feishu-scopes', labelKey: 'settings.dalton.feishuScopesLabel', descKey: 'settings.dalton.feishuScopesDesc', keywords: '飞书读取权限 飞书授权 文档 知识库 多维表格 feishu read scopes', visibleWhen: canShowDaltonFeishuScopesCard },
   daltonProviders: { section: 'model', anchor: 'dalton-providers', labelKey: 'settings.dalton.providersLabel', descKey: 'settings.dalton.providersDesc', keywords: '团队凭据 模型与数据源状态 团队共享凭据 team credentials provider status openclaw' },
   daltonBudget: { section: 'model', anchor: 'dalton-budget', labelKey: 'settings.dalton.budgetLabel', descKey: 'settings.dalton.budgetDesc', keywords: '预算 每日预算 团队模型限额 USD 额度 调额 daily budget spending limit' },
   daltonNotifyTargets: { section: 'model', anchor: 'dalton-notify-targets', labelKey: 'settings.dalton.notifyTargetsLabel', descKey: 'settings.dalton.notifyTargetsDesc', keywords: '通知目标 飞书 Discord 主动推送 消息提醒 notify targets feishu discord proactive alerts' },

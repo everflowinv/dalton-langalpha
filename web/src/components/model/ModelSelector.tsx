@@ -38,6 +38,8 @@ export interface ModelSelectorProps {
   missingLabel?: (value: string) => string
   /** How an option prints its model; the manifest's name, else the key. */
   nameOf?: (model: string) => string
+  // DALTON-HOOK(automation-model): render the select with placeholder & missingLabel even when models is empty
+  allowEmpty?: boolean
 }
 
 export function ModelSelector({
@@ -56,6 +58,7 @@ export function ModelSelector({
   disabledModels,
   missingLabel,
   nameOf,
+  allowEmpty = false,
 }: ModelSelectorProps) {
   const { t } = useTranslation()
   const id = useId()
@@ -137,7 +140,8 @@ export function ModelSelector({
         </p>
       )}
 
-      {hasModels ? (
+      {/* DALTON-HOOK(automation-model): allow rendering default & saved-unavailable options when models is empty */}
+      {hasModels || allowEmpty ? (
         <Select
           id={id}
           value={value}

@@ -1188,13 +1188,13 @@ def _stamp(path: str, item: dict[str, Any]) -> None:
     if mode is not None:
         os.chmod(path, int(mode))
     mtime_ns = item.get("mtime_ns")
-    if mtime_ns is None:
-        return
-    # A recorded 0 is no stamp (see _digest_reusable). Writing it back, or
-    # leaving a file already at 0 in place, would leave it rehashed on every
-    # scan; the restore's own time lets the next backup hash it once and
-    # record a real one.
-    if int(mtime_ns) // 1000 == 0:
+    # A missing or recorded-0 mtime is no stamp (see _digest_reusable).
+    # Leaving a staged/in-situ file at 0, or writing 0 back, would leave it
+    # at 1970 and rehashed on every scan; stamping now gives relay/direct
+    # uploads and epoch restores a real current mtime while preserving
+    # non-zero original mtimes on restore.
+    # DALTON-HOOK(wsfiles-mtime): stamp current time when mtime_ns is None or 0 across relay, direct, and restore
+    if mtime_ns is None or int(mtime_ns) // 1000 == 0:
         os.utime(path)
     else:
         os.utime(path, ns=(int(mtime_ns), int(mtime_ns)))
@@ -1347,7 +1347,8 @@ def _pull_symlink(root: str, item: dict[str, Any]) -> dict[str, Any]:
     except OSError as exc:
         return _result("failed", error=str(exc))
     mtime_ns = item.get("mtime_ns")
-    if mtime_ns is not None:
+    # DALTON-HOOK(wsfiles-mtime): never stamp epoch 0 onto restored symlinks
+    if mtime_ns is not None and int(mtime_ns) // 1000 != 0:
         try:
             os.utime(final, ns=(int(mtime_ns), int(mtime_ns)), follow_symlinks=False)
         except (NotImplementedError, OSError):
@@ -1614,8 +1615,12 @@ def pull(spec: dict[str, Any]) -> dict[str, Any]:
         try:
             if mode is not None:
                 os.chmod(final, int(mode))
+            # DALTON-HOOK(wsfiles-mtime): stamp current time instead of epoch 0 on directories
             if mtime_ns is not None:
-                os.utime(final, ns=(int(mtime_ns), int(mtime_ns)))
+                if int(mtime_ns) // 1000 == 0:
+                    os.utime(final)
+                else:
+                    os.utime(final, ns=(int(mtime_ns), int(mtime_ns)))
             results[item["path"]] = done
         except OSError as exc:
             results[item["path"]] = _result("failed", error=str(exc))

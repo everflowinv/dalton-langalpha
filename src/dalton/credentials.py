@@ -4,8 +4,9 @@ When `credentials.sharing == "team"`, Dalton Supabase auth is enabled, and
 `DALTON_PM_USER_IDS` is explicitly configured and non-empty, all model credential
 reads, writes, caches, and OAuth refresh locks (`user_oauth_tokens`,
 `user_api_keys`, `users.byok_enabled`) resolve to a single credential holder
-(`DALTON_PM_USER_IDS[0]`). Only PM users (`DALTON_PM_USER_IDS`) may disconnect,
-clear, or disable shared model credentials.
+(`DALTON_PM_USER_IDS[0]`). Only PM users (`DALTON_PM_USER_IDS`) may write the
+shared model credentials — connect, replace, disconnect, clear, or disable them;
+everyone else's connection and key-saving entry points refuse before any write.
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ from src.dalton.settings import (
 )
 
 TEAM_CREDENTIAL_DISCONNECT_FORBIDDEN_DETAIL = "团队共用凭据只能由管理员断开"
+TEAM_CREDENTIAL_WRITE_FORBIDDEN_DETAIL = "团队共用凭据只能由管理员设置"
 
 
 def get_configured_pm_user_ids() -> list[str]:
@@ -77,4 +79,22 @@ def require_credential_admin(user_id: str) -> None:
         raise HTTPException(
             status_code=403,
             detail=TEAM_CREDENTIAL_DISCONNECT_FORBIDDEN_DETAIL,
+        )
+
+
+def require_credential_write_admin(user_id: str) -> None:
+    """Raise HTTP 403 if `user_id` may not write the shared credentials.
+
+    Under team sharing every user-facing write — API key / BYOK / base URL
+    saves, OAuth initiate, poll, and callback, i.e. every step that submits or
+    replaces the one credential the whole team runs on — checks this before
+    its first DB or Redis write, and the callback / poll steps re-check so an
+    admin demoted mid-flow cannot land a save. Background token refresh never
+    passes through it: it runs as the credential holder, not as a user
+    request.
+    """
+    if not is_credential_admin(user_id):
+        raise HTTPException(
+            status_code=403,
+            detail=TEAM_CREDENTIAL_WRITE_FORBIDDEN_DETAIL,
         )

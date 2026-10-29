@@ -113,6 +113,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
    - **重深度、反凑字数**：不设 300/400/500 行机械字数下限，以证据密度、因果机制与对覆盖公司判断的实质贡献为准。
    - **数据缺口诚实声明**：找不到可靠数据的维度直接写 **`目前缺乏数据`**，不估算编造。
    - **人物首次出现带全名+职务**，所有关键数字带具体日期/季度。
+   - **分析口径一致性**：链式指数、份额与预测差额比较直接遵循 `.agents/skills/dalton-conventions/SKILL.md` §3 第 10 条（口径一致才能比较），不重复展开。
 2. **运行置信度与引用闭环校验脚本**：
    ```bash
    python3 .agents/skills/dalton-topic-research/scripts/validate_topic.py \

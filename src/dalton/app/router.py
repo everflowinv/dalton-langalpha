@@ -186,6 +186,17 @@ async def get_openclaw_health_endpoint(
     return await probe_health(user_id=user_id)
 
 
+@router.get("/diagnostics/browser-memory")
+@handle_api_exceptions("get browser memory diagnostics", logger)
+async def get_browser_memory_diagnostics_endpoint(
+    user_id: CurrentUserId,
+) -> dict[str, Any]:
+    _require_pm_user(user_id)
+    from src.observability.browser_memory import get_browser_memory_diagnostics
+
+    return get_browser_memory_diagnostics()
+
+
 # ---------------------------------------------------------------------------
 # Native-subscription model sync (check → confirm → add-only runtime overlay)
 # ---------------------------------------------------------------------------
@@ -724,12 +735,13 @@ async def get_team_credentials_status_endpoint(
         is_credential_admin,
         is_team_credential_sharing_enabled,
     )
-    from src.dalton.invites import is_invite_pm
+    from src.dalton.invites import get_user_tier
     from src.dalton.settings import get_dalton_config
 
     cfg = get_dalton_config()
     enabled = is_team_credential_sharing_enabled()
     can_disconnect = is_credential_admin(user_id)
+    caller_tier = await get_user_tier(user_id)
     return {
         "sharing": cfg.credentials.sharing,
         "enabled": enabled,
@@ -737,7 +749,8 @@ async def get_team_credentials_status_endpoint(
         "credential_user_id": credential_user_id(user_id),
         "is_pm": can_disconnect,
         "can_disconnect": can_disconnect,
-        "can_invite": is_invite_pm(user_id),
+        "can_invite": caller_tier in ("admin", "internal"),
+        "caller_tier": caller_tier,
     }
 
 
@@ -1465,10 +1478,15 @@ async def create_invite_endpoint(
 async def list_invites_endpoint(
     user_id: CurrentUserId,
 ) -> dict[str, Any]:
-    from src.dalton.invites import list_invites_for_pm
+    from src.dalton.invites import MAX_ACTIVE_INVITES_PER_USER, list_invites_for_pm
 
     invites = await list_invites_for_pm(user_id)
-    return {"invites": invites}
+    active_count = sum(1 for item in invites if item.get("status") == "pending")
+    return {
+        "invites": invites,
+        "active_count": active_count,
+        "max_active": MAX_ACTIVE_INVITES_PER_USER,
+    }
 
 
 @router.delete("/invites/{invite_id}")

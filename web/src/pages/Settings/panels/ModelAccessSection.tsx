@@ -77,10 +77,13 @@ export function ModelAccessSection() {
   const sheetTitleId = useId();
   const { keyGroups, localEntries, placeOf, optionFor } = useProviderCatalog();
   const { providers, withdrawn, configuredSet, statusLoading, statusError } = useConfiguredProviders();
-  // DALTON-HOOK(team-credentials): team-shared credentials hint & PM-only disconnect
-  const { isShared: isTeamShared, canDisconnect } = useTeamCredentials();
+  // DALTON-HOOK(team-credentials): team-shared credentials hint; only PM
+  // users may write them (connect, keys, base URLs) — the server refuses
+  // everyone else, the UI just does not offer the buttons.
+  const { isShared: isTeamShared, canDisconnect, canManage } = useTeamCredentials();
   const showTeamHint = isDaltonAuth && isTeamShared;
   const allowDisconnect = !isDaltonAuth || canDisconnect;
+  const teamManagedByAdmin = isDaltonAuth && isTeamShared && !canManage;
   const [sheet, setSheet] = useState<Sheet | null>(null);
   const [removing, setRemoving] = useState<ConfiguredProvider | null>(null);
   // Kept here, not in the list, so Back from a provider returns to the same narrowed list.
@@ -129,9 +132,14 @@ export function ModelAccessSection() {
     <div className="flex flex-col gap-4">
       <p className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>{t('modelAccess.description')}</p>
       {/* DALTON-HOOK(team-credentials): team-shared credentials hint */}
-      {showTeamHint && (
+      {showTeamHint && !teamManagedByAdmin && (
         <p className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
           {TEAM_SHARED_CREDENTIALS_HINT}
+        </p>
+      )}
+      {teamManagedByAdmin && (
+        <p className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
+          {t('modelAccess.teamManagedByAdmin')}
         </p>
       )}
 
@@ -144,8 +152,8 @@ export function ModelAccessSection() {
             detail={subscriptionDetail(p)}
             status={rowStatus(p)}
             action={
-              <Button type="button" variant={p.state === 'needs_reauth' ? 'outline' : 'ghost'} size="sm" onClick={() => manage(p.provider)}>
-                {p.state === 'needs_reauth' ? t('modelAccess.reconnect') : t('modelAccess.manage')}
+              <Button type="button" variant={p.state === 'needs_reauth' && !teamManagedByAdmin ? 'outline' : 'ghost'} size="sm" onClick={() => manage(p.provider)}>
+                {p.state === 'needs_reauth' && !teamManagedByAdmin ? t('modelAccess.reconnect') : t('modelAccess.manage')}
               </Button>
             }
           />
@@ -166,9 +174,12 @@ export function ModelAccessSection() {
               detail={p.masked_key}
               status="withdrawn"
               action={
-                <Button type="button" variant="outline" size="sm" onClick={() => setRemoving(p)}>
-                  {t('modelAccess.remove.remove')}
-                </Button>
+                // DALTON-HOOK(team-credentials): removing a key is a shared-credential write.
+                allowDisconnect ? (
+                  <Button type="button" variant="outline" size="sm" onClick={() => setRemoving(p)}>
+                    {t('modelAccess.remove.remove')}
+                  </Button>
+                ) : null
               }
             />
           )),
@@ -183,25 +194,29 @@ export function ModelAccessSection() {
         </Group>
       )}
 
-      <div className="flex flex-wrap gap-2">
-        <Button type="button" variant="outline" size="sm" className="gap-1.5" onClick={() => setSheet({ kind: 'pick-subscription' })}>
-          <Plus aria-hidden="true" className="h-3.5 w-3.5" />
-          {t('modelAccess.connectSubscription')}
-        </Button>
-        <Button type="button" variant="outline" size="sm" className="gap-1.5" onClick={() => {
-          setKeyFilter(NO_FILTER);
-          setSheet({ kind: 'pick-key' });
-        }}>
-          <Plus aria-hidden="true" className="h-3.5 w-3.5" />
-          {t('modelAccess.addKey')}
-        </Button>
-        {!isPlatformMode && (
-          <Button type="button" variant="outline" size="sm" className="gap-1.5" onClick={() => setSheet({ kind: 'pick-local' })}>
+      {/* DALTON-HOOK(team-credentials): a non-PM member cannot write the
+          shared credentials — the add buttons stay with the administrators. */}
+      {!teamManagedByAdmin && (
+        <div className="flex flex-wrap gap-2">
+          <Button type="button" variant="outline" size="sm" className="gap-1.5" onClick={() => setSheet({ kind: 'pick-subscription' })}>
             <Plus aria-hidden="true" className="h-3.5 w-3.5" />
-            {t('modelAccess.addLocal')}
+            {t('modelAccess.connectSubscription')}
           </Button>
-        )}
-      </div>
+          <Button type="button" variant="outline" size="sm" className="gap-1.5" onClick={() => {
+            setKeyFilter(NO_FILTER);
+            setSheet({ kind: 'pick-key' });
+          }}>
+            <Plus aria-hidden="true" className="h-3.5 w-3.5" />
+            {t('modelAccess.addKey')}
+          </Button>
+          {!isPlatformMode && (
+            <Button type="button" variant="outline" size="sm" className="gap-1.5" onClick={() => setSheet({ kind: 'pick-local' })}>
+              <Plus aria-hidden="true" className="h-3.5 w-3.5" />
+              {t('modelAccess.addLocal')}
+            </Button>
+          )}
+        </div>
+      )}
 
       {sheet && (
         <ModalShell

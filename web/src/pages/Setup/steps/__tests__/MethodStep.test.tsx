@@ -43,7 +43,7 @@ vi.mock('@/hooks/useAllModels', () => ({ useAllModels: () => ({ metadata: {} }) 
 // DALTON-HOOK(team-credentials): the step reads the shared-credential hint and PM disconnect guard
 vi.mock('@/hooks/useTeamCredentials', () => ({
   TEAM_SHARED_CREDENTIALS_HINT: '',
-  useTeamCredentials: () => ({ isShared: false, canDisconnect: true, isPm: true, canInvite: false }),
+  useTeamCredentials: () => ({ isShared: false, canDisconnect: true, canManage: true, isPm: true, canInvite: false }),
 }));
 
 import MethodStep from '../MethodStep';

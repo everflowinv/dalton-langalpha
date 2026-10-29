@@ -9,6 +9,7 @@ from typing import Any, Mapping
 from psycopg.rows import dict_row
 
 from src.server.database.pool import get_db_connection
+from src.server.database.sql_fences import advisory_key
 
 
 def _normalize_row(row: Mapping[str, Any] | None) -> dict[str, Any] | None:
@@ -157,29 +158,104 @@ async def insert_invite(
             }
 
 
-async def list_invites(*, conn: Any = None) -> list[dict[str, Any]]:
-    """List all invites ordered by ``created_at DESC`` without exposing ``token_sha256``."""
+async def lock_invite_creator(
+    created_by_user_id: str,
+    *,
+    conn: Any,
+) -> int:
+    """Acquire a transaction-scoped advisory lock for ``created_by_user_id`` invite quota checks."""
+    uid = str(created_by_user_id or "").strip()
+    lock_key = advisory_key("dalton_invites", uid)
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(
+            "SELECT pg_advisory_xact_lock(%s)",
+            (lock_key,),
+        )
+    return lock_key
+
+
+async def count_active_invites_by_creator(
+    created_by_user_id: str,
+    *,
+    conn: Any = None,
+) -> int:
+    """Count active (unused, unrevoked, unexpired) invites created by ``created_by_user_id``."""
+    uid = str(created_by_user_id or "").strip()
+    if not uid:
+        return 0
     async with get_db_connection(conn) as c:
         async with c.cursor(row_factory=dict_row) as cur:
             await cur.execute(
                 """
-                SELECT
-                    i.invite_id::text AS invite_id,
-                    i.created_by_user_id,
-                    i.created_at,
-                    i.expires_at,
-                    i.redeeming_username,
-                    i.redeeming_at,
-                    i.used_at,
-                    i.used_by_email,
-                    i.supabase_user_id,
-                    i.revoked_at,
-                    m.username AS used_by_username
-                FROM dalton_invites i
-                LEFT JOIN dalton_members m ON m.email = i.used_by_email
-                ORDER BY i.created_at DESC
-                """
+                SELECT COUNT(*) AS active_count
+                FROM dalton_invites
+                WHERE created_by_user_id = %s
+                  AND used_at IS NULL
+                  AND revoked_at IS NULL
+                  AND expires_at > NOW()
+                """,
+                (uid,),
             )
+            row = await cur.fetchone()
+            if not row:
+                return 0
+            return int(row.get("active_count", row.get("count", 0)) or 0)
+
+
+async def list_invites(
+    *,
+    created_by_user_id: str | None = None,
+    conn: Any = None,
+) -> list[dict[str, Any]]:
+    """List invites ordered by ``created_at DESC`` without exposing ``token_sha256``.
+
+    When ``created_by_user_id`` is provided, filters in SQL by owner; otherwise returns all rows.
+    """
+    async with get_db_connection(conn) as c:
+        async with c.cursor(row_factory=dict_row) as cur:
+            if created_by_user_id is not None:
+                uid = str(created_by_user_id).strip()
+                await cur.execute(
+                    """
+                    SELECT
+                        i.invite_id::text AS invite_id,
+                        i.created_by_user_id,
+                        i.created_at,
+                        i.expires_at,
+                        i.redeeming_username,
+                        i.redeeming_at,
+                        i.used_at,
+                        i.used_by_email,
+                        i.supabase_user_id,
+                        i.revoked_at,
+                        m.username AS used_by_username
+                    FROM dalton_invites i
+                    LEFT JOIN dalton_members m ON m.email = i.used_by_email
+                    WHERE i.created_by_user_id = %s
+                    ORDER BY i.created_at DESC
+                    """,
+                    (uid,),
+                )
+            else:
+                await cur.execute(
+                    """
+                    SELECT
+                        i.invite_id::text AS invite_id,
+                        i.created_by_user_id,
+                        i.created_at,
+                        i.expires_at,
+                        i.redeeming_username,
+                        i.redeeming_at,
+                        i.used_at,
+                        i.used_by_email,
+                        i.supabase_user_id,
+                        i.revoked_at,
+                        m.username AS used_by_username
+                    FROM dalton_invites i
+                    LEFT JOIN dalton_members m ON m.email = i.used_by_email
+                    ORDER BY i.created_at DESC
+                    """
+                )
             rows = await cur.fetchall()
             return [_normalize_row(r) for r in rows if r is not None]  # type: ignore[misc]
 
@@ -221,34 +297,60 @@ async def get_invite_by_id(
 async def revoke_invite(
     invite_id: str,
     *,
+    created_by_user_id: str | None = None,
     conn: Any = None,
 ) -> dict[str, Any] | None:
-    """Mark an unused invite as revoked (`revoked_at = COALESCE(revoked_at, NOW())`)."""
+    """Mark an unused invite as revoked (`revoked_at = COALESCE(revoked_at, NOW())`).
+
+    When ``created_by_user_id`` is provided, restricts the UPDATE to rows owned by that user.
+    """
     try:
         normalized_id = str(uuid.UUID(str(invite_id).strip()))
     except (ValueError, TypeError):
         return None
     async with get_db_connection(conn) as c:
         async with c.cursor(row_factory=dict_row) as cur:
-            await cur.execute(
-                """
-                UPDATE dalton_invites
-                SET revoked_at = COALESCE(revoked_at, NOW())
-                WHERE invite_id = %s AND used_at IS NULL
-                RETURNING
-                    invite_id::text AS invite_id,
-                    created_by_user_id,
-                    created_at,
-                    expires_at,
-                    redeeming_username,
-                    redeeming_at,
-                    used_at,
-                    used_by_email,
-                    supabase_user_id,
-                    revoked_at
-                """,
-                (normalized_id,),
-            )
+            if created_by_user_id is not None:
+                uid = str(created_by_user_id).strip()
+                await cur.execute(
+                    """
+                    UPDATE dalton_invites
+                    SET revoked_at = COALESCE(revoked_at, NOW())
+                    WHERE invite_id = %s AND created_by_user_id = %s AND used_at IS NULL
+                    RETURNING
+                        invite_id::text AS invite_id,
+                        created_by_user_id,
+                        created_at,
+                        expires_at,
+                        redeeming_username,
+                        redeeming_at,
+                        used_at,
+                        used_by_email,
+                        supabase_user_id,
+                        revoked_at
+                    """,
+                    (normalized_id, uid),
+                )
+            else:
+                await cur.execute(
+                    """
+                    UPDATE dalton_invites
+                    SET revoked_at = COALESCE(revoked_at, NOW())
+                    WHERE invite_id = %s AND used_at IS NULL
+                    RETURNING
+                        invite_id::text AS invite_id,
+                        created_by_user_id,
+                        created_at,
+                        expires_at,
+                        redeeming_username,
+                        redeeming_at,
+                        used_at,
+                        used_by_email,
+                        supabase_user_id,
+                        revoked_at
+                    """,
+                    (normalized_id,),
+                )
             row = await cur.fetchone()
             return _normalize_row(row)
 

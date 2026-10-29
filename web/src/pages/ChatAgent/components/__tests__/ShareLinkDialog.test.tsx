@@ -372,4 +372,85 @@ describe('ShareLinkDialog', () => {
       expect(theSwitch()).toHaveAttribute('aria-checked', 'false');
     });
   });
+
+  // DALTON-HOOK(external-share-guard): external members cannot see switch to enable sharing, but can close an existing share
+  describe('external member restrictions', () => {
+    it('hides the public share switch when unshared for an external member, and shows it to allow closing when already shared', async () => {
+      const { QueryClient } = await import('@tanstack/react-query');
+      const { queryKeys } = await import('@/lib/queryKeys');
+      const { ThreadSharePanel } = await import('../ThreadSharePanel');
+      const { resolveNavThreadPermissions } = await import('../NavigationRows');
+
+      const extQueryClient = new QueryClient({
+        defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+      });
+      extQueryClient.setQueryData(queryKeys.dalton.userSharing(), {
+        user_id: 'u-ext',
+        cos_rw_enabled: false,
+        caller_tier: 'external',
+      });
+
+      // 1. Unshared file link in ShareLinkDialog: public share switch is hidden for external member
+      mockCreate.mockResolvedValueOnce(link({ shared: false }));
+      mockFiles.mockResolvedValueOnce(files([ENTRY_ROW]));
+      const { unmount: unmountUnshared } = renderWithProviders(
+        <ShareLinkDialog open workspaceId={WS} filePath={ENTRY} onClose={() => {}} />,
+        { queryClient: extQueryClient },
+      );
+      expect(await screen.findByText(HREF)).toBeInTheDocument();
+      expect(screen.queryByRole('switch', { name: 'Anyone with the link' })).not.toBeInTheDocument();
+      unmountUnshared();
+      extQueryClient.removeQueries({ queryKey: queryKeys.shareLinks.all });
+
+      // 2. Already-shared file link in ShareLinkDialog: switch IS shown so external member can close it
+      mockCreate.mockResolvedValueOnce(
+        link({ shared: true, shared_at: '2026-09-24T01:00:00Z', shared_files: [ENTRY] }),
+      );
+      mockFiles.mockResolvedValueOnce(files([ENTRY_ROW], { added: [], removed: [] }));
+      mockPatch.mockResolvedValueOnce(link({ shared: false }));
+      const user = userEvent.setup();
+      const { unmount: unmountShared } = renderWithProviders(
+        <ShareLinkDialog open workspaceId={WS} filePath={ENTRY} onClose={() => {}} />,
+        { queryClient: extQueryClient },
+      );
+      await waitFor(() =>
+        expect(screen.getByRole('switch', { name: 'Anyone with the link' })).toHaveAttribute(
+          'aria-checked',
+          'true',
+        ),
+      );
+      await user.click(screen.getByRole('switch', { name: 'Anyone with the link' }));
+      expect(mockPatch).toHaveBeenCalledWith(WS, CODE, { shared: false });
+      unmountShared();
+
+      // 3. ThreadSharePanel & NavigationRows permissions: external member cannot enable unshared thread,
+      //    but can close an already-shared thread
+      const unsharedPerms = resolveNavThreadPermissions(
+        { thread_id: 'th-1', user_id: 'u-ext', is_shared: false },
+        { workspace_id: WS, user_id: 'u-ext' },
+        { currentUserId: 'u-ext', callerTier: 'external' },
+      );
+      expect(unsharedPerms.canShareThread).toBe(false);
+
+      const sharedPerms = resolveNavThreadPermissions(
+        { thread_id: 'th-2', user_id: 'u-ext', is_shared: true },
+        { workspace_id: WS, user_id: 'u-ext' },
+        { currentUserId: 'u-ext', callerTier: 'external' },
+      );
+      expect(sharedPerms.canShareThread).toBe(true);
+
+      extQueryClient.setQueryData(queryKeys.threads.share('th-unshared'), {
+        is_shared: false,
+        share_token: null,
+        share_url: null,
+        permissions: { allow_files: false, allow_download: false },
+      });
+      const { unmount: unmountPanel } = renderWithProviders(
+        <ThreadSharePanel threadId="th-unshared" />,
+        { queryClient: extQueryClient },
+      );
+      expect(screen.queryByRole('switch')).not.toBeInTheDocument();
+      unmountPanel();
+    });
+  });
 });

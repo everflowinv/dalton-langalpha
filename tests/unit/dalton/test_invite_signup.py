@@ -1486,3 +1486,803 @@ async def test_verify_dalton_token_and_list_team_workspaces_with_db_members(
     # sees no colleague workspace at all, whatever the DB rows say.
     team_list = await dalton_sharing.list_team_workspaces("u-alice")
     assert team_list == []
+
+
+# ---------------------------------------------------------------------------
+# 9. Backlog P2: Internal employee invites (own-only list/revoke, 20-cap under
+#    advisory lock, invitee tier = external) and external share restrictions
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_p2_internal_employee_invites_own_list_revoke_and_sql_ownership(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Internal employees can create/list/revoke only their own invites via SQL ownership filters; external members get 403 even though is_team_member is True."""
+    from src.dalton.access_tiers import get_user_tier
+
+    internal_a = "u-internal-a"
+    internal_b = "u-internal-b"
+    external_u = "u-external-1"
+    inv_a_id = "20000000-0000-4000-8000-000000000001"
+    inv_b_id = "20000000-0000-4000-8000-000000000002"
+    now = datetime.now(timezone.utc)
+
+    monkeypatch.setenv("DALTON_AUTH_MODE", "supabase")
+    monkeypatch.setenv("DALTON_PM_USER_IDS", PM_USER_ID)
+    monkeypatch.setenv(
+        "DALTON_ALLOWED_EMAILS",
+        "internal.a@dalton.test,internal.b@dalton.test",
+    )
+    settings_mod.get_dalton_config.cache_clear()
+
+    users_by_id = {
+        PM_USER_ID: {"user_id": PM_USER_ID, "email": "pm@dalton.test", "name": "PM"},
+        internal_a: {
+            "user_id": internal_a,
+            "email": "internal.a@dalton.test",
+            "name": "Internal A",
+        },
+        internal_b: {
+            "user_id": internal_b,
+            "email": "internal.b@dalton.test",
+            "name": "Internal B",
+        },
+        external_u: {
+            "user_id": external_u,
+            "email": "ext.member@team.dalton.local",
+            "name": "External Member",
+        },
+    }
+    monkeypatch.setattr(
+        user_db,
+        "get_user",
+        create_autospec(user_db.get_user, side_effect=lambda uid: users_by_id.get(uid)),
+    )
+    # External member IS in dalton_members, so is_team_member(external) is True,
+    # proving invite gate uses get_user_tier and NEVER is_team_member.
+    monkeypatch.setattr(
+        members_db,
+        "list_member_emails",
+        create_autospec(
+            members_db.list_member_emails,
+            return_value={"ext.member@team.dalton.local"},
+        ),
+    )
+    assert await invites_mod.is_team_member("ext.member@team.dalton.local") is True
+    assert await get_user_tier(external_u) == "external"
+    assert await get_user_tier(internal_a) == "internal"
+    assert await get_user_tier(PM_USER_ID) == "admin"
+
+    # External member rejected with 403 on all invite endpoints
+    for call in (
+        lambda: dalton_router.create_invite_endpoint(user_id=external_u),
+        lambda: dalton_router.list_invites_endpoint(user_id=external_u),
+        lambda: dalton_router.revoke_invite_endpoint(
+            invite_id=inv_a_id, user_id=external_u
+        ),
+    ):
+        with pytest.raises(HTTPException) as exc_ext:
+            await call()
+        assert exc_ext.value.status_code == 403
+
+    # /credentials/status reports can_invite and caller_tier per tier
+    status_ext = await dalton_router.get_team_credentials_status_endpoint(
+        user_id=external_u
+    )
+    status_int = await dalton_router.get_team_credentials_status_endpoint(
+        user_id=internal_a
+    )
+    status_pm = await dalton_router.get_team_credentials_status_endpoint(
+        user_id=PM_USER_ID
+    )
+    assert status_ext["can_invite"] is False
+    assert status_ext["caller_tier"] == "external"
+    assert status_int["can_invite"] is True
+    assert status_int["caller_tier"] == "internal"
+    assert status_pm["can_invite"] is True
+    assert status_pm["caller_tier"] == "admin"
+
+    # In-memory invite store backing SQL cursor double to verify SQL ownership filters
+    invites_store: dict[str, dict[str, Any]] = {
+        inv_a_id: {
+            "invite_id": inv_a_id,
+            "created_by_user_id": internal_a,
+            "created_at": now - timedelta(hours=2),
+            "expires_at": now + timedelta(days=6),
+            "redeeming_username": None,
+            "redeeming_at": None,
+            "used_at": None,
+            "used_by_email": None,
+            "supabase_user_id": None,
+            "revoked_at": None,
+            "used_by_username": None,
+        },
+        inv_b_id: {
+            "invite_id": inv_b_id,
+            "created_by_user_id": internal_b,
+            "created_at": now - timedelta(hours=1),
+            "expires_at": now + timedelta(days=6),
+            "redeeming_username": None,
+            "redeeming_at": None,
+            "used_at": None,
+            "used_by_email": None,
+            "supabase_user_id": None,
+            "revoked_at": None,
+            "used_by_username": None,
+        },
+    }
+    executed_queries: list[tuple[str, Any]] = []
+    next_fetchall: list[dict[str, Any]] = []
+    next_fetchone: dict[str, Any] | None = None
+
+    mock_cur = create_autospec(psycopg.AsyncCursor, instance=True)
+
+    async def _execute(sql: str, params: Any = None) -> None:
+        nonlocal next_fetchall, next_fetchone
+        executed_queries.append((sql, params))
+        normalized = " ".join(sql.split())
+        if "FROM dalton_invites i" in normalized:
+            if "WHERE i.created_by_user_id = %s" in normalized:
+                owner = params[0]
+                next_fetchall = [
+                    dict(r)
+                    for r in invites_store.values()
+                    if r["created_by_user_id"] == owner
+                ]
+            else:
+                next_fetchall = [dict(r) for r in invites_store.values()]
+        elif normalized.startswith("UPDATE dalton_invites SET revoked_at"):
+            if "AND created_by_user_id = %s" in normalized:
+                target_id, owner = params[0], params[1]
+                row = invites_store.get(target_id)
+                if (
+                    row is not None
+                    and row["created_by_user_id"] == owner
+                    and row["used_at"] is None
+                ):
+                    row["revoked_at"] = row["revoked_at"] or now
+                    next_fetchone = dict(row)
+                else:
+                    next_fetchone = None
+            else:
+                target_id = params[0]
+                row = invites_store.get(target_id)
+                if row is not None and row["used_at"] is None:
+                    row["revoked_at"] = row["revoked_at"] or now
+                    next_fetchone = dict(row)
+                else:
+                    next_fetchone = None
+        elif "FROM dalton_invites WHERE invite_id = %s" in normalized:
+            target_id = params[0]
+            row = invites_store.get(target_id)
+            next_fetchone = dict(row) if row is not None else None
+
+    mock_cur.execute.side_effect = _execute
+    mock_cur.fetchall.side_effect = lambda: list(next_fetchall)
+    mock_cur.fetchone.side_effect = lambda: next_fetchone
+    mock_cur.__aenter__.return_value = mock_cur
+    mock_cur.__aexit__.return_value = False
+
+    mock_conn = create_autospec(psycopg.AsyncConnection, instance=True)
+    mock_conn.cursor.return_value = mock_cur
+
+    @asynccontextmanager
+    async def _fake_get_db_conn(conn: Any = None):
+        yield conn or mock_conn
+
+    monkeypatch.setattr(
+        members_db,
+        "get_db_connection",
+        create_autospec(members_db.get_db_connection, side_effect=_fake_get_db_conn),
+    )
+
+    # 1. Internal A lists invites -> SQL filters by created_by_user_id = internal_a; only sees own invite
+    listed_a = await dalton_router.list_invites_endpoint(user_id=internal_a)
+    assert [i["invite_id"] for i in listed_a["invites"]] == [inv_a_id]
+    assert listed_a["active_count"] == 1
+    assert listed_a["max_active"] == 20
+    list_sql_a, list_params_a = executed_queries[-1]
+    assert "WHERE i.created_by_user_id = %s" in list_sql_a
+    assert list_params_a == (internal_a,)
+
+    # 2. Admin lists invites -> SQL has no owner filter; sees both A's and B's invites
+    listed_pm = await dalton_router.list_invites_endpoint(user_id=PM_USER_ID)
+    assert {i["invite_id"] for i in listed_pm["invites"]} == {inv_a_id, inv_b_id}
+    list_sql_pm, list_params_pm = executed_queries[-1]
+    assert "WHERE i.created_by_user_id = %s" not in list_sql_pm
+    assert list_params_pm is None
+
+    # 3. Internal A tries to revoke Internal B's invite -> single conditional UPDATE (no pre-SELECT),
+    #    returns 404 "邀请不存在" and leaves B's invite untouched
+    spy_get_by_id = create_autospec(
+        members_db.get_invite_by_id, wraps=members_db.get_invite_by_id
+    )
+    monkeypatch.setattr(members_db, "get_invite_by_id", spy_get_by_id)
+
+    with pytest.raises(HTTPException) as exc_cross_revoke:
+        await dalton_router.revoke_invite_endpoint(
+            invite_id=inv_b_id, user_id=internal_a
+        )
+    assert exc_cross_revoke.value.status_code == 404
+    assert exc_cross_revoke.value.detail == "邀请不存在"
+    spy_get_by_id.assert_not_awaited()
+    revoke_sql_cross, revoke_params_cross = executed_queries[-1]
+    assert "UPDATE dalton_invites" in revoke_sql_cross
+    assert (
+        "WHERE invite_id = %s AND created_by_user_id = %s AND used_at IS NULL"
+        in " ".join(revoke_sql_cross.split())
+    )
+    assert revoke_params_cross == (inv_b_id, internal_a)
+    assert invites_store[inv_b_id]["revoked_at"] is None
+
+    # 4. Internal A revokes own invite -> succeeds via single conditional UPDATE
+    revoked_a = await dalton_router.revoke_invite_endpoint(
+        invite_id=inv_a_id, user_id=internal_a
+    )
+    assert revoked_a["invite_id"] == inv_a_id
+    assert revoked_a["status"] == "revoked"
+    spy_get_by_id.assert_not_awaited()
+    assert invites_store[inv_a_id]["revoked_at"] is not None
+
+    # 5. Admin can revoke Internal B's invite
+    revoked_b_by_pm = await dalton_router.revoke_invite_endpoint(
+        invite_id=inv_b_id, user_id=PM_USER_ID
+    )
+    assert revoked_b_by_pm["invite_id"] == inv_b_id
+    assert revoked_b_by_pm["status"] == "revoked"
+    assert invites_store[inv_b_id]["revoked_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_p2_internal_employee_active_invite_cap_20_locking_and_concurrency(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Internal employee invite creation locks creator via pg_advisory_xact_lock in-transaction before counting; expired/revoked/used don't count; 21st rejected; concurrent 20th/21st race succeeds once; admin is exempt."""
+    import asyncio
+    import uuid
+
+    internal_a = "u-internal-a"
+    now = datetime.now(timezone.utc)
+
+    monkeypatch.setenv("DALTON_AUTH_MODE", "supabase")
+    monkeypatch.setenv("DALTON_PM_USER_IDS", PM_USER_ID)
+    monkeypatch.setenv("DALTON_ALLOWED_EMAILS", "internal.a@dalton.test")
+    settings_mod.get_dalton_config.cache_clear()
+
+    users_by_id = {
+        PM_USER_ID: {"user_id": PM_USER_ID, "email": "pm@dalton.test", "name": "PM"},
+        internal_a: {
+            "user_id": internal_a,
+            "email": "internal.a@dalton.test",
+            "name": "Internal A",
+        },
+    }
+    monkeypatch.setattr(
+        user_db,
+        "get_user",
+        create_autospec(user_db.get_user, side_effect=lambda uid: users_by_id.get(uid)),
+    )
+
+    # Seed store for internal_a: 18 active + 1 used + 1 revoked + 1 expired
+    rows_store: list[dict[str, Any]] = []
+    for idx in range(18):
+        rows_store.append(
+            {
+                "invite_id": str(uuid.uuid4()),
+                "created_by_user_id": internal_a,
+                "created_at": now - timedelta(hours=idx + 1),
+                "expires_at": now + timedelta(days=6),
+                "used_at": None,
+                "revoked_at": None,
+            }
+        )
+    # Inactive rows (used, revoked, expired) must NOT count toward the 20 cap
+    rows_store.append(
+        {
+            "invite_id": str(uuid.uuid4()),
+            "created_by_user_id": internal_a,
+            "created_at": now - timedelta(days=2),
+            "expires_at": now + timedelta(days=5),
+            "used_at": now - timedelta(hours=1),
+            "revoked_at": None,
+        }
+    )
+    rows_store.append(
+        {
+            "invite_id": str(uuid.uuid4()),
+            "created_by_user_id": internal_a,
+            "created_at": now - timedelta(days=2),
+            "expires_at": now + timedelta(days=5),
+            "used_at": None,
+            "revoked_at": now - timedelta(hours=2),
+        }
+    )
+    rows_store.append(
+        {
+            "invite_id": str(uuid.uuid4()),
+            "created_by_user_id": internal_a,
+            "created_at": now - timedelta(days=9),
+            "expires_at": now - timedelta(days=2),
+            "used_at": None,
+            "revoked_at": None,
+        }
+    )
+
+    xact_lock = asyncio.Lock()
+    call_sequence: list[str] = []
+    executed_sqls: list[tuple[str, Any]] = []
+
+    def _make_conn() -> Any:
+        conn = create_autospec(psycopg.AsyncConnection, instance=True)
+        last_result: dict[str, Any] | None = None
+
+        cur = create_autospec(psycopg.AsyncCursor, instance=True)
+
+        async def _execute(sql: str, params: Any = None) -> None:
+            nonlocal last_result
+            executed_sqls.append((sql, params))
+            normalized = " ".join(sql.split())
+            if "SELECT pg_advisory_xact_lock(%s)" in normalized:
+                call_sequence.append("lock")
+                await xact_lock.acquire()
+                last_result = {"pg_advisory_xact_lock": ""}
+            elif "SELECT COUNT(*) AS active_count FROM dalton_invites" in normalized:
+                call_sequence.append("count")
+                # Yield to event loop so a concurrent task without the lock would race here
+                await asyncio.sleep(0)
+                uid = params[0]
+                active = sum(
+                    1
+                    for r in rows_store
+                    if r["created_by_user_id"] == uid
+                    and r["used_at"] is None
+                    and r["revoked_at"] is None
+                    and r["expires_at"] > now
+                )
+                last_result = {"active_count": active}
+            elif normalized.startswith("INSERT INTO dalton_invites"):
+                call_sequence.append("insert")
+                inv_id, tok_hash, uid, exp = params
+                new_row = {
+                    "invite_id": inv_id,
+                    "token_sha256": tok_hash,
+                    "created_by_user_id": uid,
+                    "created_at": now,
+                    "expires_at": exp,
+                    "redeeming_username": None,
+                    "redeeming_at": None,
+                    "used_at": None,
+                    "used_by_email": None,
+                    "supabase_user_id": None,
+                    "revoked_at": None,
+                }
+                rows_store.append(new_row)
+                last_result = new_row
+
+        cur.execute.side_effect = _execute
+        cur.fetchone.side_effect = lambda: last_result
+        cur.__aenter__.return_value = cur
+        cur.__aexit__.return_value = False
+        conn.cursor.return_value = cur
+
+        @asynccontextmanager
+        async def _tx_cm(*args: Any, **kwargs: Any):
+            try:
+                yield
+            finally:
+                if xact_lock.locked():
+                    xact_lock.release()
+
+        conn.transaction.side_effect = _tx_cm
+        return conn
+
+    @asynccontextmanager
+    async def _fake_get_db_conn(existing_conn: Any = None):
+        yield existing_conn or _make_conn()
+
+    monkeypatch.setattr(
+        invites_mod,
+        "get_db_connection",
+        create_autospec(invites_mod.get_db_connection, side_effect=_fake_get_db_conn),
+    )
+    monkeypatch.setattr(
+        members_db,
+        "get_db_connection",
+        create_autospec(members_db.get_db_connection, side_effect=_fake_get_db_conn),
+    )
+
+    # 19th active invite succeeds (even though total rows for internal_a is 21 due to 3 inactive rows)
+    created_19 = await dalton_router.create_invite_endpoint(user_id=internal_a)
+    assert created_19["status"] == "pending"
+    assert call_sequence == ["lock", "count", "insert"]
+    count_sql = next(
+        s for s, _ in executed_sqls if "SELECT COUNT(*) AS active_count" in s
+    )
+    assert "WHERE created_by_user_id = %s" in count_sql
+    assert "used_at IS NULL" in count_sql
+    assert "revoked_at IS NULL" in count_sql
+    assert "expires_at > NOW()" in count_sql
+
+    # Concurrent race for the 20th slot (20th vs 21st): only ONE succeeds, the other gets 409
+    results = await asyncio.gather(
+        dalton_router.create_invite_endpoint(user_id=internal_a),
+        dalton_router.create_invite_endpoint(user_id=internal_a),
+        return_exceptions=True,
+    )
+    successes = [r for r in results if isinstance(r, dict)]
+    failures = [r for r in results if isinstance(r, HTTPException)]
+    assert len(successes) == 1
+    assert len(failures) == 1
+    assert failures[0].status_code == 409
+    assert (
+        failures[0].detail
+        == "你当前有效的邀请已达 20 个上限，请先撤销不用的邀请"
+    )
+
+    # Subsequent (21st) attempt also rejected with 409
+    with pytest.raises(HTTPException) as exc_21:
+        await dalton_router.create_invite_endpoint(user_id=internal_a)
+    assert exc_21.value.status_code == 409
+    assert (
+        exc_21.value.detail
+        == "你当前有效的邀请已达 20 个上限，请先撤销不用的邀请"
+    )
+
+    # Admin is exempt from the 20 active invite cap
+    for _ in range(25):
+        rows_store.append(
+            {
+                "invite_id": str(uuid.uuid4()),
+                "created_by_user_id": PM_USER_ID,
+                "created_at": now,
+                "expires_at": now + timedelta(days=7),
+                "used_at": None,
+                "revoked_at": None,
+            }
+        )
+    admin_created = await dalton_router.create_invite_endpoint(user_id=PM_USER_ID)
+    assert admin_created["status"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_p2_internal_employee_invite_redeemed_user_tier_is_external(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An invite issued by an internal employee registers the invitee into dalton_members and resolves to tier 'external'."""
+    from src.dalton.access_tiers import get_user_tier
+
+    internal_a = "u-internal-a"
+    invitee_uid = "u-invited-from-internal"
+    invitee_email = "newbie@team.dalton.local"
+
+    monkeypatch.setenv("DALTON_AUTH_MODE", "supabase")
+    monkeypatch.setenv("DALTON_PM_USER_IDS", PM_USER_ID)
+    monkeypatch.setenv("DALTON_ALLOWED_EMAILS", "internal.a@dalton.test")
+    settings_mod.get_dalton_config.cache_clear()
+
+    users_by_id = {
+        internal_a: {
+            "user_id": internal_a,
+            "email": "internal.a@dalton.test",
+            "name": "Internal A",
+        },
+        invitee_uid: {
+            "user_id": invitee_uid,
+            "email": invitee_email,
+            "name": "Newbie",
+        },
+    }
+    monkeypatch.setattr(
+        user_db,
+        "get_user",
+        create_autospec(user_db.get_user, side_effect=lambda uid: users_by_id.get(uid)),
+    )
+    monkeypatch.setattr(
+        members_db,
+        "list_member_emails",
+        create_autospec(members_db.list_member_emails, return_value={invitee_email}),
+    )
+
+    assert await get_user_tier(internal_a) == "internal"
+    assert await invites_mod.is_team_member(invitee_email) is True
+    assert await get_user_tier(invitee_uid) == "external"
+
+
+@pytest.mark.asyncio
+async def test_p2_external_member_public_sharing_blocked_while_close_and_public_read_allowed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """External members get 403 '外部成员不能创建公开分享链接' on creating/enabling file or thread shares, while closing existing shares and public access remain allowed."""
+    from fastapi import Response
+    from src.server.app import public as pub_app
+    from src.server.app import share_links as share_links_app
+    from src.server.app.share_access import LinkAccess
+    from src.server.app.threads import sharing as threads_sharing_app
+    from src.server.database import conversation as conv_pkg
+    from src.server.database.share_links import KIND_FILE, ShareLink
+    from src.server.models.conversation import ThreadShareRequest
+    from src.server.utils.api import Viewer
+
+    internal_a = "u-internal-a"
+    external_u = "u-external-1"
+    ws_ext_id = "ws-ext-1"
+    ws_int_id = "ws-int-1"
+    thread_ext_id = "30000000-0000-4000-8000-000000000001"
+    thread_int_id = "30000000-0000-4000-8000-000000000002"
+    now = datetime(2026, 4, 21, 12, 0, 0, tzinfo=timezone.utc)
+
+    monkeypatch.setenv("DALTON_AUTH_MODE", "supabase")
+    monkeypatch.setenv("DALTON_PM_USER_IDS", PM_USER_ID)
+    monkeypatch.setenv("DALTON_ALLOWED_EMAILS", "internal.a@dalton.test")
+    monkeypatch.setattr(app_settings, "HOST_MODE", "oss")
+    monkeypatch.setattr(app_settings, "SUPABASE_URL", "https://example.supabase.co")
+    settings_mod.get_dalton_config.cache_clear()
+
+    users_by_id = {
+        PM_USER_ID: {"user_id": PM_USER_ID, "email": "pm@dalton.test", "name": "PM"},
+        internal_a: {
+            "user_id": internal_a,
+            "email": "internal.a@dalton.test",
+            "name": "Internal A",
+        },
+        external_u: {
+            "user_id": external_u,
+            "email": "ext.member@team.dalton.local",
+            "name": "External Member",
+        },
+    }
+    monkeypatch.setattr(
+        user_db,
+        "get_user",
+        create_autospec(user_db.get_user, side_effect=lambda uid: users_by_id.get(uid)),
+    )
+
+    async def _fake_owned_ws(
+        workspace_id: str, user_id: str
+    ) -> tuple[dict[str, Any], str]:
+        return (
+            {
+                "workspace_id": workspace_id,
+                "user_id": user_id,
+                "name": "WS",
+                "status": "running",
+            },
+            "/home/daytona/work",
+        )
+
+    monkeypatch.setattr(
+        share_links_app,
+        "_owned_workspace",
+        create_autospec(share_links_app._owned_workspace, side_effect=_fake_owned_ws),
+    )
+
+    existing_shared_link = ShareLink(
+        code="codeext12345",
+        workspace_id=ws_ext_id,
+        kind=KIND_FILE,
+        path="report.md",
+        port=None,
+        title="Report",
+        files=("report.md",),
+        created_at=now,
+        shared_at=now,
+    )
+    closed_link = ShareLink(
+        code="codeext12345",
+        workspace_id=ws_ext_id,
+        kind=KIND_FILE,
+        path="report.md",
+        port=None,
+        title="Report",
+        files=None,
+        created_at=now,
+        shared_at=None,
+    )
+    created_int_link = ShareLink(
+        code="codeint12345",
+        workspace_id=ws_int_id,
+        kind=KIND_FILE,
+        path="report.md",
+        port=None,
+        title="Report",
+        files=None,
+        created_at=now,
+        shared_at=None,
+    )
+
+    monkeypatch.setattr(
+        share_links_app,
+        "_owned_link",
+        create_autospec(
+            share_links_app._owned_link, return_value=existing_shared_link
+        ),
+    )
+    monkeypatch.setattr(
+        share_links_app,
+        "set_private",
+        create_autospec(share_links_app.set_private, return_value=closed_link),
+    )
+    monkeypatch.setattr(
+        share_links_app,
+        "ensure_file_link",
+        create_autospec(
+            share_links_app.ensure_file_link, return_value=created_int_link
+        ),
+    )
+
+    # 1. External member may get-or-create the item's link: it starts private
+    #    (HTML open-in-tab and app previews read it); only sharing it is refused.
+    ext_link_resp = await share_links_app.get_or_create_share_link(
+        ws_ext_id,
+        share_links_app.ShareLinkCreate(kind="file", path="report.md"),
+        x_user_id=external_u,
+    )
+    assert ext_link_resp.shared is False
+
+    # 2. External member blocked from PATCH /{workspace_id}/share-links/{code} with shared=True (403)
+    with pytest.raises(HTTPException) as exc_enable_link:
+        await share_links_app.update_share_link(
+            ws_ext_id,
+            "codeext12345",
+            share_links_app.ShareLinkUpdate(shared=True, files=["report.md"]),
+            x_user_id=external_u,
+        )
+    assert exc_enable_link.value.status_code == 403
+    assert exc_enable_link.value.detail == "外部成员不能创建公开分享链接"
+
+    # 3. External member ALLOWED to close an existing share link (shared=False)
+    closed_resp = await share_links_app.update_share_link(
+        ws_ext_id,
+        "codeext12345",
+        share_links_app.ShareLinkUpdate(shared=False),
+        x_user_id=external_u,
+    )
+    assert closed_resp.shared is False
+
+    # 4. Internal member allowed to create share link
+    int_link_resp = await share_links_app.get_or_create_share_link(
+        ws_int_id,
+        share_links_app.ShareLinkCreate(kind="file", path="report.md"),
+        x_user_id=internal_a,
+    )
+    assert int_link_resp.code == "codeint12345"
+
+    # 5. Thread sharing: external member blocked from enabling is_shared=True (403),
+    #    allowed to close is_shared=False and read get_thread_share; internal member allowed to enable
+    threads_by_id = {
+        thread_ext_id: {
+            "conversation_thread_id": thread_ext_id,
+            "workspace_id": ws_ext_id,
+            "user_id": external_u,
+            "workspace_owner_id": external_u,
+            "is_shared": True,
+            "share_token": "tok-ext-existing",
+            "share_permissions": {"allow_files": True, "allow_download": False},
+        },
+        thread_int_id: {
+            "conversation_thread_id": thread_int_id,
+            "workspace_id": ws_int_id,
+            "user_id": internal_a,
+            "workspace_owner_id": internal_a,
+            "is_shared": False,
+            "share_token": "tok-int-new",
+            "share_permissions": {},
+        },
+    }
+    monkeypatch.setattr(
+        conv_pkg,
+        "get_thread_owner_id",
+        create_autospec(
+            conv_pkg.get_thread_owner_id,
+            side_effect=lambda tid, *, conn=None: threads_by_id[tid]["user_id"],
+        ),
+    )
+    monkeypatch.setattr(
+        conv_pkg,
+        "get_thread_auth_meta",
+        create_autospec(
+            conv_pkg.get_thread_auth_meta,
+            side_effect=lambda tid, *, conn=None: threads_by_id.get(tid),
+        ),
+    )
+    monkeypatch.setattr(
+        threads_sharing_app,
+        "get_thread_by_id",
+        create_autospec(
+            threads_sharing_app.get_thread_by_id,
+            side_effect=lambda tid: threads_by_id.get(tid),
+        ),
+    )
+    monkeypatch.setattr(
+        threads_sharing_app,
+        "update_thread_sharing",
+        create_autospec(
+            threads_sharing_app.update_thread_sharing,
+            side_effect=lambda tid, **kw: {**threads_by_id[tid], **kw},
+        ),
+    )
+
+    with pytest.raises(HTTPException) as exc_thread_enable:
+        await threads_sharing_app.update_thread_share(
+            thread_ext_id,
+            ThreadShareRequest(is_shared=True),
+            x_user_id=external_u,
+        )
+    assert exc_thread_enable.value.status_code == 403
+    assert exc_thread_enable.value.detail == "外部成员不能创建公开分享链接"
+
+    ext_status = await threads_sharing_app.get_thread_share(
+        thread_ext_id, x_user_id=external_u
+    )
+    assert ext_status.is_shared is True
+
+    ext_closed = await threads_sharing_app.update_thread_share(
+        thread_ext_id,
+        ThreadShareRequest(is_shared=False),
+        x_user_id=external_u,
+    )
+    assert ext_closed.is_shared is False
+
+    int_enabled = await threads_sharing_app.update_thread_share(
+        thread_int_id,
+        ThreadShareRequest(is_shared=True),
+        x_user_id=internal_a,
+    )
+    assert int_enabled.is_shared is True
+
+    # 6. Existing public share links and public shared threads remain accessible via public route
+    monkeypatch.setattr(
+        pub_app,
+        "resolve_link",
+        create_autospec(
+            pub_app.resolve_link,
+            side_effect=lambda tok, *, user_id=None: (
+                LinkAccess(
+                    link=existing_shared_link,
+                    workspace={"workspace_id": ws_ext_id},
+                    work_dir="/home/daytona/work",
+                    owner=False,
+                )
+                if tok == "codeext12345"
+                else None
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        pub_app,
+        "get_shared_thread",
+        create_autospec(
+            pub_app.get_shared_thread,
+            return_value={
+                "conversation_thread_id": thread_ext_id,
+                "workspace_id": ws_ext_id,
+                "title": "Shared External Thread",
+                "created_at": now,
+                "updated_at": now,
+                "is_shared": True,
+                "share_permissions": {"allow_files": False, "allow_download": False},
+            },
+        ),
+    )
+
+    pub_file_meta = await pub_app.get_shared_thread_metadata(
+        "codeext12345",
+        page_viewer=Viewer(None),
+        response=Response(),
+        view_as=None,
+        path=None,
+    )
+    assert pub_file_meta["kind"] == "file"
+    assert pub_file_meta["access"] == "public"
+
+    pub_thread_meta = await pub_app.get_shared_thread_metadata(
+        "tok-ext-existing",
+        page_viewer=Viewer(None),
+        response=Response(),
+        view_as=None,
+        path=None,
+    )
+    assert pub_thread_meta["kind"] == "thread"
+    assert pub_thread_meta["thread_id"] == thread_ext_id
+

@@ -41,6 +41,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from contextvars import ContextVar
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping
@@ -51,6 +52,7 @@ _SCRIPT_DIR = Path(__file__).resolve().parent
 if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
 
+import log_redaction as _log_redaction  # noqa: E402
 import source_identity  # noqa: E402
 
 logging.basicConfig(
@@ -58,6 +60,15 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] researchdata_bridge: %(message)s",
 )
 logger = logging.getLogger("researchdata_bridge")
+
+# P0 fix1 item 7: correlation id for log lines emitted outside
+# handle_tools_call's own scope (the stdio subprocess warning, the HTTP
+# handler's last-resort catch). Set at each tools/call entry, read wherever a
+# line is emitted — a ContextVar rather than a kwarg so _run_stdio_rpc's
+# signature, and every test double built against it, stay untouched.
+_current_corr_id: ContextVar[str | None] = ContextVar(
+    "researchdata_bridge_corr_id", default=None
+)
 
 MAX_REQUEST_BYTES = 256 * 1024  # 256 KiB
 MAX_EMBED_REQUEST_BYTES = 128 * 1024  # 128 KiB dedicated limit for /embed
@@ -247,48 +258,10 @@ _SECRET_KEY_NAME_RE = re.compile(
     r"(?i)(?:api[_-]?key|apikey|token(?!s)|secret|password|passwd|cookie|authorization|(?<![a-z])auth(?![a-z])|credential|session[_-]?id|xq_[a-z_]+)"
 )
 
-_STDERR_SECRET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
-    (
-        re.compile(r"(?im)^([^\r\n]*?\b(?:set-)?cookie\s*:\s*)[^\r\n]+$"),
-        r"\1[REDACTED]",
-    ),
-    (
-        re.compile(
-            r"""(?i)(['"]?[A-Za-z0-9_.\-]*(?:api[_-]?key|apikey|token|secret|password|passwd|cookie|set-cookie|authorization|proxy-authorization|x-api-key|auth|credential|session[_-]?id|xq_[a-z0-9_]+)[A-Za-z0-9_.\-]*['"]?\s*[:=]\s*)(['"])(?:\\.|(?!\2).)*\2"""
-        ),
-        r"\1\2[REDACTED]\2",
-    ),
-    (
-        re.compile(
-            r"(?i)(\b(?:proxy-)?authorization\s*[:=]\s*)(?:(?:bearer|basic|digest|token)\s+)?(?!['\"]?\[REDACTED\])[^\s;,'\"}\]\r\n]+"
-        ),
-        r"\1[REDACTED]",
-    ),
-    (
-        re.compile(r"(?i)(\bbearer\s+)(?!\[REDACTED\])[A-Za-z0-9._\-+/=~]{4,}"),
-        r"\1[REDACTED]",
-    ),
-    (
-        re.compile(
-            r"(?i)(['\"]?\b[A-Za-z0-9_.\-]*(?:api[_-]?key|apikey|token|secret|password|passwd|cookie|set-cookie|authorization|proxy-authorization|x-api-key|auth|credential|session[_-]?id|xq_[a-z0-9_]+)[A-Za-z0-9_.\-]*['\"]?\s*[:=]\s*)(?!['\"]?\[REDACTED\])[^\s;,'\"}\]\r\n]+"
-        ),
-        r"\1[REDACTED]",
-    ),
-    (re.compile(r"\b(sk-[A-Za-z0-9_\-]{8,})\b"), "[REDACTED]"),
-    (re.compile(r"\b(xai-[A-Za-z0-9_\-]{8,})\b"), "[REDACTED]"),
-    (re.compile(r"\b(tvly-[A-Za-z0-9_\-]{8,})\b"), "[REDACTED]"),
-    (re.compile(r"\b(fc-[A-Za-z0-9_\-]{8,})\b"), "[REDACTED]"),
-    (re.compile(r"\b(ghp_[A-Za-z0-9_\-]{8,})\b"), "[REDACTED]"),
-    (re.compile(r"\b(github_pat_[A-Za-z0-9_\-]{8,})\b"), "[REDACTED]"),
-    (re.compile(r"://[^/\s:@]+:[^/\s@]+@"), "://[REDACTED]@"),
-    (re.compile(r"\b[0-9a-fA-F]{40,}\b"), "[REDACTED]"),
-    (
-        re.compile(
-            r"(?<![A-Za-z0-9_.\-/])(?=[A-Za-z0-9+/_-]*[A-Za-z0-9])[A-Za-z0-9+/_-]{40,}={0,2}(?![A-Za-z0-9_.\-/])"
-        ),
-        "[REDACTED]",
-    ),
-)
+# P0 fix1 item 1: the secret-pattern stack now lives in the shared
+# pure-stdlib `log_redaction` module (one rule set for this bridge and the
+# review-window export); these aliases keep every existing reader unchanged.
+_STDERR_SECRET_PATTERNS = _log_redaction.STDERR_SECRET_PATTERNS
 
 
 def sanitize_stderr_text(raw: str | bytes | None, *, max_len: int = 500) -> str:
@@ -309,45 +282,137 @@ def sanitize_stderr_text(raw: str | bytes | None, *, max_len: int = 500) -> str:
     return text.strip()
 
 
-# D-r2: the failure log's excerpt carries upstream error bodies, and the PII
-# in them rides past the token patterns above — a URL's query values
-# (https://…?query=alice%40example.com&phone=13800138000) and the pairs after
-# a Cookie's first segment (the key-value pattern stops at ';' and space, so
-# `Cookie=session=abc123; sid=privateSession456` kept sid's value). Only this
-# log's redaction layers on top; every other sanitize_stderr_text caller
-# keeps its behavior.
-_FAILURE_LOG_URL_RE = re.compile(r"(?i)(?:https?|ftp)://[^\s\"'<>]+")
-# Any query pair left after that — a relative request path in a client
-# error ("Max retries exceeded with url: /search?query=…") or a scheme the
-# URL pattern missed — keeps its key and loses its value.
-_FAILURE_LOG_QUERY_PAIR_RE = re.compile(r"([?&][^\s=&#?\"'<>]+=)[^\s&#\"'<>]*")
-_FAILURE_LOG_COOKIE_RE = re.compile(r"(?i)(\b(?:set-)?cookie\b\s*[:=]\s*)[^\r\n]*")
-_FAILURE_LOG_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
-# A mainland-China mobile number: 11 digits starting 13-9, never inside a
-# longer digit run (timestamps, order ids).
-_FAILURE_LOG_PHONE_RE = re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)")
-
-
-def _redact_url_query(url: str) -> str:
-    """A URL keeping its parameter names but no values, fragment cut too."""
-    head, sep, query = url.partition("?")
-    if not sep:
-        return url
-    names = [f"{part.split('=', 1)[0]}=…" for part in query.split("&") if part]
-    return f"{head}?{'&'.join(names)}" if names else f"{head}?"
-
-
-def _sanitize_failure_log_excerpt(raw: str) -> str:
+def _sanitize_failure_log_excerpt(raw: str, *, max_len: int = 300) -> str:
     """The failure log's error excerpt: `sanitize_stderr_text`'s token/secret
     redaction plus the PII those patterns never caught — URL query values,
     whole Cookie/Set-Cookie strings (to end of line), email addresses and
-    mainland-China phone numbers. Sanitized in full, then the first 300 chars."""
-    text = _FAILURE_LOG_URL_RE.sub(lambda m: _redact_url_query(m.group(0)), raw)
-    text = _FAILURE_LOG_QUERY_PAIR_RE.sub(lambda m: m.group(1) + "…", text)
-    text = _FAILURE_LOG_COOKIE_RE.sub(r"\1[REDACTED]", text)
-    text = _FAILURE_LOG_EMAIL_RE.sub("[REDACTED]", text)
-    text = _FAILURE_LOG_PHONE_RE.sub("[REDACTED]", text)
-    return sanitize_stderr_text(text, max_len=1_000_000)[:300]
+    mainland-China phone numbers — then newlines / ESC / control characters
+    collapsed to spaces and truncated to `max_len`.
+
+    P0 fix2 A: delegates to `log_redaction.clean_log_field` so `tools/call`,
+    `sec_call_failed`, and every other bridge log line run the exact same
+    redaction + control-char stripping + truncation chain."""
+    return _log_redaction.clean_log_field(raw, max_len=max_len)
+
+
+# SEC cluster observability (backlog 三-4, 2026-10-28): the 10-27 list-filings
+# cluster failed within 20s and the status-only lines could not say whether the
+# upstream answered 4xx/5xx or never answered. One structured line per SEC
+# route call carries the correlation id, any upstream HTTP status the payload
+# or error text reveals, the sanitized upstream error head, elapsed time, the
+# bridge's own stdio attempt count, and the ticker/form asked for.
+_SEC_ERROR_EXCERPT_MAX = 500
+_SEC_CODE_MAX = 64
+
+# An error object the upstream stringified into the error text (Python repr
+# or JSON): pull its `code` value out so attribution survives `_apply_error_
+# and_empty_contract` having flattened the dict before we see it (P0 fix1 6).
+_ERROR_CODE_IN_TEXT_RE = re.compile(
+    r"(?i)(?:\b|[{'\"])(?:error[_-]?)?code['\"]?\s*[:=]\s*['\"]([A-Za-z0-9_.\-]{1,64})['\"]"
+)
+
+
+def _error_code_from_text(err_text: str) -> str:
+    match = _ERROR_CODE_IN_TEXT_RE.search(err_text)
+    return match.group(1) if match is not None else ""
+
+
+def _extract_upstream_http_status(payload: dict[str, Any], err_text: str) -> int | None:
+    """Best-effort upstream HTTP status for a failed call: an explicit
+    ``status_code``/``http_status``/``upstream_status`` int in the payload
+    (top level, ``data``, ``data.structuredContent``, or the error object),
+    else the first explicit status marker in the error text — via the shared
+    `log_redaction.http_status_from_text`, which also reads a dict the
+    upstream stringified (``'status_code': 403`` / ``"status_code": 403``).
+    None when the upstream never said one."""
+    containers: list[Any] = [payload]
+    data_obj = payload.get("data")
+    if isinstance(data_obj, dict):
+        containers.append(data_obj)
+        sc = data_obj.get("structuredContent")
+        if isinstance(sc, dict):
+            containers.append(sc)
+    err_obj = payload.get("error")
+    if isinstance(err_obj, dict):
+        containers.append(err_obj)
+    for container in containers:
+        if not isinstance(container, dict):
+            continue
+        for key in ("upstream_status", "http_status", "status_code"):
+            raw = container.get(key)
+            if isinstance(raw, bool) or not isinstance(raw, int):
+                continue
+            if 100 <= raw <= 599:
+                return raw
+    return _log_redaction.http_status_from_text(err_text)
+
+
+def _log_sec_call_outcome(
+    *,
+    corr_id: str,
+    operation: str,
+    arguments: Mapping[str, Any],
+    payload: dict[str, Any] | None,
+    elapsed_ms: int,
+    stdio_attempts: int,
+    error_text: str = "",
+    error_code: str = "",
+    upstream_status_hint: int | None = None,
+    timeout_s: float | None = None,
+) -> None:
+    """One structured line per SEC route call — failure at WARNING, success at
+    DEBUG. The correlation id ties it to the same request's other lines; a
+    payload with no upstream status logs ``-`` rather than failing."""
+    ticker = _log_redaction.clean_log_field(arguments.get("ticker") or "", max_len=32) or "-"
+    form_raw = arguments.get("form")
+    params_obj = arguments.get("params")
+    if (form_raw is None or form_raw == "") and isinstance(params_obj, dict):
+        form_raw = params_obj.get("form")
+    form = _log_redaction.clean_log_field(form_raw or "", max_len=32) or "-"
+
+    err_code = error_code
+    upstream_status: int | None = upstream_status_hint
+    if payload is not None:
+        err_obj = payload.get("error")
+        if isinstance(err_obj, dict):
+            err_code = err_code or str(err_obj.get("code") or err_obj.get("error_code") or "")
+        err_code = err_code or str(payload.get("error_code") or "")
+        if not error_text:
+            error_text = str(payload.get("error") or "")
+        if upstream_status is None:
+            upstream_status = _extract_upstream_http_status(payload, error_text)
+    elif upstream_status is None and error_text:
+        upstream_status = _log_redaction.http_status_from_text(error_text)
+    if not err_code and error_text:
+        err_code = _error_code_from_text(error_text)
+    if timeout_s is not None and not error_text:
+        error_text = f"researchdata_bridge timed out after {timeout_s}s"
+
+    op = _log_redaction.clean_log_field(operation or "", max_len=64) or "list-filings"
+    base_args = (
+        corr_id,
+        op,
+        ticker,
+        form,
+        upstream_status if upstream_status is not None else "-",
+        elapsed_ms,
+        stdio_attempts,
+        max(0, stdio_attempts - 1),
+    )
+    if payload is not None and bool(payload.get("ok")):
+        logger.debug(
+            "sec_call_ok corr=%s op=%s ticker=%s form=%s upstream_status=%s "
+            "elapsed_ms=%d attempts=%d retries=%d",
+            *base_args,
+        )
+        return
+    logger.warning(
+        "sec_call_failed corr=%s op=%s ticker=%s form=%s upstream_status=%s "
+        "elapsed_ms=%d attempts=%d retries=%d error_code=%s error=%s",
+        *base_args,
+        _log_redaction.clean_log_field(err_code, max_len=_SEC_CODE_MAX) or "-",
+        _log_redaction.clean_log_field(error_text, max_len=_SEC_ERROR_EXCERPT_MAX) or "-",
+    )
 
 
 def _sanitize_metadata_tree(obj: Any, *, max_str_len: int = 300) -> Any:
@@ -5890,9 +5955,11 @@ class ResearchDataBridge:
                 continue
         if not responses:
             # R3-1: NEVER decode or log stderr content; log/report only exception class and exit code
+            corr = _current_corr_id.get()
             logger.warning(
-                "researchdata_mcp subprocess returned no JSON response (exit_code=%s)",
+                "researchdata_mcp subprocess returned no JSON response (exit_code=%s corr=%s)",
                 proc.returncode,
+                corr or "-",
             )
             raise SubprocessExitError(proc.returncode)
         return responses
@@ -8890,6 +8957,12 @@ class ResearchDataBridge:
         )
         route = str(arguments.get("route") or "").strip()
         operation = str(arguments.get("operation") or "").strip()
+        # SEC observability: one correlation id per bridge request, threaded
+        # through every line this request logs (tools/call result, timeout,
+        # sec_call_*), plus how many stdio attempts the request made.
+        corr_id = uuid.uuid4().hex[:12]
+        _current_corr_id.set(corr_id)
+        stdio_attempts = 0
 
         handoff = self.handoff_routes()
         if validation_err is not None:
@@ -9266,6 +9339,7 @@ class ResearchDataBridge:
                     )
                     try:
                         try:
+                            stdio_attempts += 1
                             resps = await self._run_stdio_rpc(
                                 [rpc_req], timeout_s=remaining_budget_s
                             )
@@ -9365,19 +9439,53 @@ class ResearchDataBridge:
                         # subprocess outlives the call: cancel what is still running and reap it.
                         await _cancel_and_reap((ae_task, gp_task))
                 else:
-                    resps = await self._run_stdio_rpc(
-                        [rpc_req], timeout_s=remaining_budget_s
-                    )
+                    stdio_attempts += 1
+                    try:
+                        resps = await self._run_stdio_rpc(
+                            [rpc_req], timeout_s=remaining_budget_s
+                        )
+                    except asyncio.TimeoutError:
+                        # P0 fix1 5: the outer asyncio.TimeoutError handler
+                        # below already writes this request's one
+                        # sec_call_failed line — logging here too would emit
+                        # two for the same failure.
+                        raise
+                    except Exception as call_exc:
+                        # SEC observability: a stdio leg that died before any
+                        # payload (subprocess exit, spawn failure) still gets
+                        # its structured failure line.
+                        if route == "sec":
+                            _log_sec_call_outcome(
+                                corr_id=corr_id,
+                                operation=operation,
+                                arguments=arguments,
+                                payload=None,
+                                elapsed_ms=int((time.monotonic() - t0) * 1000),
+                                stdio_attempts=stdio_attempts,
+                                error_text=f"{type(call_exc).__name__}: {call_exc}",
+                            )
+                        raise
             except asyncio.TimeoutError:
                 elapsed_ms = int((time.monotonic() - t0) * 1000)
                 logger.warning(
-                    "tools/call timeout tool=%s route=%s op=%s timeout_s=%d elapsed_ms=%d",
+                    "tools/call timeout corr=%s tool=%s route=%s op=%s timeout_s=%d elapsed_ms=%d",
+                    corr_id,
                     tool_name,
                     route,
                     operation,
                     eff_timeout,
                     elapsed_ms,
                 )
+                if route == "sec":
+                    _log_sec_call_outcome(
+                        corr_id=corr_id,
+                        operation=operation,
+                        arguments=arguments,
+                        payload=None,
+                        elapsed_ms=elapsed_ms,
+                        stdio_attempts=stdio_attempts,
+                        timeout_s=eff_timeout,
+                    )
                 timeout_payload: dict[str, Any] = {
                     "_declared_sources": [],
                     "_sources": [],
@@ -9427,12 +9535,18 @@ class ResearchDataBridge:
         # against status-only lines, with the reason invisible.
         error_category_str = "-"
         error_excerpt_str = ""
+        # P0 fix1 5: guards against a second sec_call_failed line for the same
+        # request (payload path already logged, or top-level error below).
+        sec_outcome_logged = False
+        mcp_is_error = isinstance(result_obj, dict) and bool(result_obj.get("isError"))
+        raw_content_text = ""
 
         if isinstance(result_obj, dict) and isinstance(result_obj.get("content"), list):
             blocks = result_obj["content"]
             if blocks and isinstance(blocks[0], dict) and isinstance(blocks[0].get("text"), str):
+                raw_content_text = blocks[0]["text"]
                 try:
-                    payload = json.loads(blocks[0]["text"])
+                    payload = json.loads(raw_content_text)
                 except Exception:
                     payload = None
 
@@ -9592,6 +9706,21 @@ class ResearchDataBridge:
                         )
                     declared_count = len(declared)
 
+                    # P0 fix1 6: extract status_code / code from any structured
+                    # error object BEFORE _apply_error_and_empty_contract
+                    # stringifies payload["error"].
+                    pre_sec_err_code = ""
+                    pre_sec_status: int | None = None
+                    if route == "sec":
+                        err_pre = payload.get("error")
+                        if isinstance(err_pre, dict):
+                            pre_sec_err_code = str(
+                                err_pre.get("code") or err_pre.get("error_code") or ""
+                            )
+                        pre_sec_status = _extract_upstream_http_status(
+                            payload, str(err_pre or "")
+                        )
+
                     _apply_error_and_empty_contract(
                         tool_name, route, operation, payload, norm_params_view
                     )
@@ -9660,6 +9789,18 @@ class ResearchDataBridge:
                         # numbers ride past the token patterns, so this layer
                         # strips them before the 300-char slice.
                         error_excerpt_str = _sanitize_failure_log_excerpt(err_body)
+                    if route == "sec":
+                        _log_sec_call_outcome(
+                            corr_id=corr_id,
+                            operation=operation,
+                            arguments=arguments,
+                            payload=payload,
+                            elapsed_ms=elapsed_ms,
+                            stdio_attempts=stdio_attempts,
+                            error_code=pre_sec_err_code,
+                            upstream_status_hint=pre_sec_status,
+                        )
+                        sec_outcome_logged = True
 
                     # Place _declared_sources and _sources first so 64 KiB truncation preserves them
                     enriched = {
@@ -9675,6 +9816,49 @@ class ResearchDataBridge:
                     if isinstance(result_obj.get("structuredContent"), dict):
                         result_obj["structuredContent"] = dict(enriched)
 
+        # P0 fix1 5 + fix2 D: a JSON-RPC top-level error reply (no result.content)
+        # or an MCP tool error with non-JSON text (`result.isError=true`, e.g.
+        # `Error calling tool finance: HTTP 403 Forbidden`) never reaches the
+        # dict payload branch above — log `sec_call_failed` with the extracted
+        # HTTP status and ensure the `tools/call` log line does not say `status=ok`
+        # (only the log field changes; `resp` returned to the caller is untouched).
+        top_error = resp.get("error") if isinstance(resp.get("error"), dict) else None
+        if (
+            route == "sec"
+            and not sec_outcome_logged
+            and (top_error is not None or mcp_is_error)
+        ):
+            _log_sec_call_outcome(
+                corr_id=corr_id,
+                operation=operation,
+                arguments=arguments,
+                payload=None,
+                elapsed_ms=elapsed_ms,
+                stdio_attempts=stdio_attempts,
+                error_text=(
+                    str(top_error.get("message") or "")
+                    if top_error is not None
+                    else raw_content_text
+                ),
+                error_code=(
+                    str(top_error.get("code") or "")
+                    if top_error is not None
+                    else ""
+                ),
+            )
+            sec_outcome_logged = True
+
+        if status_str == "ok" and (mcp_is_error or top_error is not None):
+            status_str = "error"
+            if not error_excerpt_str:
+                fallback_err = (
+                    raw_content_text
+                    if raw_content_text
+                    else (str(top_error.get("message") or "") if top_error is not None else "")
+                )
+                if fallback_err:
+                    error_excerpt_str = _sanitize_failure_log_excerpt(fallback_err)
+
         # B5: failures append the category and the sanitized error excerpt;
         # success lines keep their original shape.
         error_log_suffix = ""
@@ -9683,12 +9867,14 @@ class ResearchDataBridge:
             error_log_suffix = " error_category=%s error=%s"
             error_log_args = (error_category_str, error_excerpt_str)
         logger.info(
-            "tools/call tool=%s route=%s op=%s status=%s declared_sources=%d elapsed_ms=%d"
+            "tools/call corr=%s tool=%s route=%s op=%s status=%s declared_sources=%d elapsed_ms=%d"
             + error_log_suffix,
+            corr_id,
             tool_name,
             route or "-",
             operation or "-",
-            status_str,
+            # P0 fix3: the status can come from upstream JSON, so it is cleaned too
+            _log_redaction.clean_log_field(status_str, max_len=32),
             declared_count,
             elapsed_ms,
             *error_log_args,
@@ -15467,6 +15653,7 @@ async def _handle_client(
     reader: asyncio.StreamReader,
     writer: asyncio.StreamWriter,
 ) -> None:
+    _current_corr_id.set(uuid.uuid4().hex[:12])
     try:
         req_line_bytes = await asyncio.wait_for(reader.readline(), timeout=15.0)
         if not req_line_bytes:
@@ -15848,7 +16035,15 @@ async def _handle_client(
 
         await _send_http(writer, 404, "Not Found", {"error": "Not Found"})
     except Exception as exc:
-        logger.error("Unhandled bridge error: %s", type(exc).__name__)
+        # P0 fix1 7: the request that died carries its correlation id in the
+        # ContextVar (set at tools/call entry), so this last-resort line still
+        # groups with the request's own sec_call_* / tools/call lines.
+        corr = _current_corr_id.get()
+        logger.error(
+            "Unhandled bridge error: %s corr=%s",
+            type(exc).__name__,
+            corr or "-",
+        )
         try:
             await _send_http(
                 writer,
