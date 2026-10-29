@@ -3273,6 +3273,8 @@
     "colTook": "Took",
     "detailModel": "Model",
     "defaultModel": "Your default model",
+    "defaultModelOption": "Default model (account default)",
+    "modelUnavailableOption": "{{model}} (unavailable)",
     "detailWorkspace": "Workspace",
     "detailFailures": "Failures in a row",
     "failuresOf": "{{count}} of {{max}} allowed",
@@ -3340,7 +3342,10 @@
     "freqDays": "Days of the week",
     "monthDay": "{{day}}",
     "lastDay": "Last day",
-    "skipsShortMonths": "Months shorter than {{day}} days are skipped. Choose Last day to run at the end of every month."
+    "skipsShortMonths": "Months shorter than {{day}} days are skipped. Choose Last day to run at the end of every month.",
+    "modelCatalogLoading": "Loading models…",
+    "modelCatalogUnavailable": "Models could not be loaded; the saved choice is kept.",
+    "modelCurrentOption": "{{model}} (current setting)"
   },
   "toolArtifact": {
     "open": "Open",

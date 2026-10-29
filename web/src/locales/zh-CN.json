@@ -3253,6 +3253,8 @@
     "colTook": "耗时",
     "detailModel": "模型",
     "defaultModel": "你的默认模型",
+    "defaultModelOption": "默认模型（账户默认）",
+    "modelUnavailableOption": "{{model}}（不可用）",
     "detailWorkspace": "工作区",
     "detailFailures": "连续失败",
     "failuresOf": "{{count}} 次，上限 {{max}} 次",
@@ -3317,7 +3319,10 @@
     "freqDays": "按星期",
     "monthDay": "{{day}} 日",
     "lastDay": "最后一天",
-    "skipsShortMonths": "不足 {{day}} 天的月份会被跳过。选择“最后一天”可在每月月底运行。"
+    "skipsShortMonths": "不足 {{day}} 天的月份会被跳过。选择“最后一天”可在每月月底运行。",
+    "modelCatalogLoading": "正在加载模型…",
+    "modelCatalogUnavailable": "模型列表暂时无法加载，已保存的选择保持不变。",
+    "modelCurrentOption": "{{model}}（当前设置）"
   },
   "toolArtifact": {
     "open": "开盘",

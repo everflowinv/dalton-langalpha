@@ -12,6 +12,12 @@ import {
 import { Disclosure } from '@/components/ui/Disclosure';
 import { Input } from '@/components/ui/input';
 import { SegmentedControl } from '@/components/ui/segmented-control';
+// DALTON-HOOK(automation-model): reuse Settings ModelSelector & useAllModels
+import { ModelSelector } from '@/components/model/ModelSelector';
+import { getModelDisplayName } from '@/components/ui/chat-input.helpers';
+import { useAllModels } from '@/hooks/useAllModels';
+import { useApiKeys } from '@/hooks/useApiKeys';
+import { useConfiguredProviders } from '@/hooks/useConfiguredProviders';
 import { cn } from '@/lib/utils';
 import type { DeliveryAttempt } from '@/types/automation';
 import { useAutomationPlace } from '../hooks/useAutomationPlace';
@@ -45,6 +51,8 @@ interface MoreOptionsProps {
   deliveryAttempts?: DeliveryAttempt[] | null;
   /** The delivery entries the last save was refused over. */
   deliveryProblems?: DeliveryProblem[];
+  // DALTON-HOOK(automation-model): server refusal message when saving an unavailable model
+  modelError?: string | null;
 }
 
 const NO_PROBLEMS: DeliveryProblem[] = [];
@@ -58,6 +66,7 @@ export default function MoreOptions({
   onOpenChange,
   deliveryAttempts,
   deliveryProblems = NO_PROBLEMS,
+  modelError = null,
 }: MoreOptionsProps) {
   const { t } = useTranslation();
   const uid = useId();
@@ -88,10 +97,35 @@ export default function MoreOptions({
   const hold = unread && form.delivery_methods.length > 0 && deliveryChoice(form.delivery_methods) === null;
   const names = useMemo(() => deliveryNames(picker, deliveryAttempts ?? []), [picker, deliveryAttempts]);
   const entryName = (entry: string) => deliveryEntryName(entry, t, picker, names);
+  // DALTON-HOOK(automation-model): available user models (excluding keyless custom models) and display formatting
+  const { models, metadata, payers, keylessModels, isLoading: modelsLoading, rawApiResponse } = useAllModels();
+  // Until the catalog (and the keys deciding which custom models are keyless) has
+  // arrived, an empty list is not "no models": showing the saved model as
+  // unavailable then would invite clearing it, so the selector waits.
+  // The keys decide which custom models are keyless: a failed keys request reads
+  // as "no keys", which would mark a working custom model unavailable.
+  const { apiKeys } = useApiKeys();
+  // DALTON-HOOK(automation-model): so does a subscription status that could not be
+  // read (a custom model riding it).
+  const { statusError } = useConfiguredProviders();
+  const catalogReady = !modelsLoading && rawApiResponse != null && apiKeys != null && !statusError;
+  const availableModels = useMemo(() => {
+    if (!keylessModels || keylessModels.size === 0) return models;
+    const filtered: typeof models = {};
+    for (const [provider, data] of Object.entries(models)) {
+      const kept = (data.models ?? []).filter((m) => !keylessModels.has(m));
+      if (kept.length > 0) {
+        filtered[provider] = { ...data, models: kept };
+      }
+    }
+    return filtered;
+  }, [models, keylessModels]);
+  const formatModel = (m: string) => getModelDisplayName(m, metadata);
 
   // What the folded options are set to, so they can stay folded.
   const summary = [
     allWorkspaces ? t('agents.chiefOfStaff') : placeLabel({ workspace_id: form.place }, workspaceName),
+    ...(form.llm_model ? [formatModel(form.llm_model)] : []),
     t(form.thread_strategy === 'continue' ? 'automation.continueExisting' : 'automation.newThreadEachRun'),
     form.delivery_methods.length
       ? t('automation.deliversTo', { method: form.delivery_methods.map(entryName).join(', ') })
@@ -138,6 +172,42 @@ export default function MoreOptions({
               </SelectListBox>
             </SelectPopover>
           </Select>
+        </FormRow>
+
+        {/* DALTON-HOOK(automation-model): per-automation model selector in MoreOptions */}
+        <FormRow label={t('automation.detailModel')}>
+          <div className="max-w-sm">
+            {!catalogReady ? (
+              <p className="text-sm" style={{ color: 'var(--color-text-tertiary)' }} role="status">
+                {modelsLoading ? t('automation.modelCatalogLoading') : t('automation.modelCatalogUnavailable')}
+              </p>
+            ) : (
+            <ModelSelector
+              ariaLabel={t('automation.detailModel')}
+              nameOf={formatModel}
+              // A saved model missing from the list is called unavailable only when the
+              // keys say so; any other absence may be a request that failed, so it is
+              // shown as the current setting rather than inviting a reset.
+              missingLabel={(m) =>
+                keylessModels?.has(m)
+                  ? t('automation.modelUnavailableOption', { model: formatModel(m) })
+                  : t('automation.modelCurrentOption', { model: formatModel(m) })
+              }
+              value={form.llm_model ?? ''}
+              onChange={(m) => patch('llm_model', m || null)}
+              models={availableModels}
+              placeholder={t('automation.defaultModelOption')}
+              payers={payers}
+              metadata={metadata}
+              allowEmpty
+            />
+            )}
+            {modelError && (
+              <p className="automation-delivery-error mt-2" role="alert">
+                {modelError}
+              </p>
+            )}
+          </div>
         </FormRow>
 
         <FormRow label={t('automation.threadStrategy')} labelId={ids.thread}>

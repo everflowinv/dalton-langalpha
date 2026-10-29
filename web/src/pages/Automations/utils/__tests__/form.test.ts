@@ -489,4 +489,38 @@ describe('an edit of each template', () => {
       ...pick(formStateToPayload(changed, changed.place), triggerKeys),
     });
   });
+
+  // DALTON-HOOK(automation-model): unit tests for llm_model in form state and payloads
+  describe('llm_model in form state and payloads', () => {
+    it('defaults to null in INITIAL_FORM and omits llm_model from create payload when null, or includes it when selected', () => {
+      expect(INITIAL_FORM.llm_model).toBeNull();
+      const defaultCreate = formStateToPayload(PLACED, HOME);
+      expect(defaultCreate).not.toHaveProperty('llm_model');
+
+      const chosenCreate = formStateToPayload({ ...PLACED, llm_model: 'claude-sonnet-4-5' }, HOME);
+      expect(chosenCreate.llm_model).toBe('claude-sonnet-4-5');
+    });
+
+    it('preserves original llm_model when untouched on edit and sends explicit null when switched back to default', () => {
+      const saved = makeAutomation({ llm_model: 'claude-sonnet-4-5' });
+      const initial = automationToFormState(saved, 'UTC');
+      expect(initial.llm_model).toBe('claude-sonnet-4-5');
+
+      const untouched = formStateToUpdatePayload(
+        { ...initial, name: 'Renamed' },
+        initial,
+        saved,
+        initial.place,
+      );
+      expect(untouched).not.toHaveProperty('llm_model');
+
+      const cleared = formStateToUpdatePayload(
+        { ...initial, llm_model: null },
+        initial,
+        saved,
+        initial.place,
+      );
+      expect(cleared).toHaveProperty('llm_model', null);
+    });
+  });
 });

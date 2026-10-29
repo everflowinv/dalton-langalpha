@@ -2,14 +2,44 @@ import { useState } from 'react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { fireEvent, screen, waitFor, within } from '@testing-library/react';
 import { ApiError } from '@/api/client';
+import type { ProviderModelsData } from '@/components/model/types';
+import type { ModelMetadataEntry } from '@/hooks/useFilteredModels';
 import i18n from '@/i18n';
 import { queryKeys } from '@/lib/queryKeys';
 import { renderWithProviders } from '@/test/utils';
-import type { DeliveryOptions } from '@/types/automation';
+import type { Automation, DeliveryOptions } from '@/types/automation';
 import * as api from '../../utils/api';
-import { ALL_WORKSPACES, type FormPatch, type FormState, INITIAL_FORM } from '../../utils/form';
-import AutomationInlineForm from '../AutomationInlineForm';
+import { ALL_WORKSPACES, automationToFormState, type FormPatch, type FormState, INITIAL_FORM } from '../../utils/form';
+import AutomationInlineForm, { type FormSubmission } from '../AutomationInlineForm';
 import MoreOptions from '../MoreOptions';
+
+// DALTON-HOOK(automation-model): mock useAllModels for per-automation model selector tests
+const allModelsMock = vi.hoisted(() => ({
+  current: {
+    models: {} as Record<string, ProviderModelsData>,
+    lockedModels: {} as Record<string, ProviderModelsData>,
+    keylessModels: new Set<string>(),
+    metadata: {} as Record<string, ModelMetadataEntry>,
+    payers: {} as Record<string, 'byok' | 'oauth' | 'credits'>,
+    isLoading: false,
+    rawApiResponse: {} as unknown,
+    isLoaded: true,
+  },
+}));
+
+vi.mock('@/hooks/useAllModels', () => ({
+  useAllModels: () => allModelsMock.current,
+}));
+
+// DALTON-HOOK(automation-model): the keys decide which custom models are keyless
+const apiKeysMock = vi.hoisted(() => ({ current: { apiKeys: {} as unknown } }));
+vi.mock('@/hooks/useApiKeys', () => ({
+  useApiKeys: () => apiKeysMock.current,
+}));
+const providersMock = vi.hoisted(() => ({ current: { statusError: false } }));
+vi.mock('@/hooks/useConfiguredProviders', () => ({
+  useConfiguredProviders: () => providersMock.current,
+}));
 
 vi.mock('@/hooks/useWorkspaces', () => ({
   useWorkspaces: () => ({ data: { workspaces: [{ workspace_id: 'ws-1', name: 'Research' }] } }),
@@ -26,7 +56,22 @@ vi.mock('../../utils/api', async (importOriginal) => ({
   setDeliveryDefault: vi.fn(),
 }));
 
-afterEach(() => vi.clearAllMocks());
+afterEach(() => {
+  vi.clearAllMocks();
+  // DALTON-HOOK(automation-model): reset model catalog mock between tests
+  apiKeysMock.current = { apiKeys: {} };
+  providersMock.current = { statusError: false };
+  allModelsMock.current = {
+    models: {},
+    lockedModels: {},
+    keylessModels: new Set<string>(),
+    metadata: {},
+    payers: {},
+    isLoading: false,
+    rawApiResponse: {} as unknown,
+    isLoaded: true,
+  };
+});
 
 const label = (key: string, opts?: Record<string, unknown>) => i18n.t(key, opts);
 
@@ -507,5 +552,344 @@ describe('a save refused over delivery', () => {
     fireEvent.click(screen.getByRole('button', { name: label('automation.deliveryRemove', { name: '#research' }) }));
 
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+});
+
+// DALTON-HOOK(automation-model): component tests for model selector in MoreOptions & AutomationInlineForm
+describe('model selection in MoreOptions and AutomationInlineForm', () => {
+  const SAVED_AUTOMATION: Automation = {
+    automation_id: 'auto-1',
+    user_id: 'user-1',
+    name: 'Brief',
+    description: null,
+    trigger_type: 'cron',
+    cron_expression: '0 9 * * 1-5',
+    timezone: 'America/New_York',
+    trigger_config: null,
+    next_run_at: '2026-09-26T13:00:00Z',
+    last_run_at: null,
+    instruction: 'Summarize.',
+    workspace_id: 'ws-1',
+    llm_model: 'claude-sonnet-4-5',
+    thread_strategy: 'continue',
+    conversation_thread_id: null,
+    status: 'active',
+    max_failures: 3,
+    failure_count: 0,
+    delivery_config: { methods: [] },
+    created_at: '2026-09-01T00:00:00Z',
+    updated_at: '2026-09-01T00:00:00Z',
+    last_execution: null,
+  };
+
+  function setupAvailableModels() {
+    allModelsMock.current = {
+      models: {
+        anthropic: { display_name: 'Anthropic', models: ['claude-sonnet-4-5'] },
+        openai: { display_name: 'OpenAI', models: ['gpt-4o'] },
+      },
+      lockedModels: {
+        openai: { display_name: 'OpenAI', models: ['o3-pro-locked'] },
+      },
+      keylessModels: new Set<string>(),
+      metadata: {
+        'claude-sonnet-4-5': { display_name: 'Claude Sonnet 4.5', provider: 'anthropic' },
+        'gpt-4o': { display_name: 'GPT-4o', provider: 'openai' },
+        'o3-pro-locked': { display_name: 'o3 Pro Locked', provider: 'openai' },
+      },
+      payers: {},
+      isLoading: false,
+      rawApiResponse: {} as unknown,
+      isLoaded: true,
+    };
+  }
+
+  it('lists only available models with Default model (account default) as the first option', () => {
+    setupAvailableModels();
+    serve();
+    renderPicker();
+
+    const modelSelect = screen.getByLabelText(label('automation.detailModel')) as HTMLSelectElement;
+    const options = [...modelSelect.options].map((o) => ({ value: o.value, text: o.textContent }));
+    expect(options).toEqual([
+      { value: '', text: label('automation.defaultModelOption') },
+      { value: 'claude-sonnet-4-5', text: 'Claude Sonnet 4.5' },
+      { value: 'gpt-4o', text: 'GPT-4o' },
+    ]);
+  });
+
+  it('creates an automation with a chosen model or with the default model', async () => {
+    setupAvailableModels();
+    serve();
+    const submissions: FormSubmission[] = [];
+    const onSubmit = vi.fn((sub: FormSubmission) => {
+      submissions.push(sub);
+    });
+
+    renderWithProviders(
+      <AutomationInlineForm
+        initialValues={{ ...IN_WORKSPACE, name: 'Brief', instruction: 'Summarize.' }}
+        original={null}
+        onSubmit={onSubmit}
+        onCancel={vi.fn()}
+        loading={false}
+      />,
+    );
+
+    // Submit with default model (null)
+    fireEvent.click(screen.getByRole('button', { name: label('common.create') }));
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1));
+    expect(submissions[0]).toMatchObject({ kind: 'create' });
+    expect(submissions[0].payload).not.toHaveProperty('llm_model');
+
+    // Open More options, select a specific model, and submit
+    fireEvent.click(screen.getByRole('button', { name: new RegExp(label('automation.moreOptions')) }));
+    const modelSelect = screen.getByLabelText(label('automation.detailModel'));
+    fireEvent.change(modelSelect, { target: { value: 'gpt-4o' } });
+    fireEvent.click(screen.getByRole('button', { name: label('common.create') }));
+
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(2));
+    expect(submissions[1]).toMatchObject({
+      kind: 'create',
+      payload: { llm_model: 'gpt-4o' },
+    });
+  });
+
+  it('preserves original llm_model when untouched on edit and sends explicit null when switched back to default', async () => {
+    setupAvailableModels();
+    serve();
+    const submissions: FormSubmission[] = [];
+    const onSubmit = vi.fn((sub: FormSubmission) => {
+      submissions.push(sub);
+    });
+
+    const initial = automationToFormState(SAVED_AUTOMATION, 'America/New_York', 'home-1');
+    renderWithProviders(
+      <AutomationInlineForm
+        initialValues={initial}
+        original={SAVED_AUTOMATION}
+        onSubmit={onSubmit}
+        onCancel={vi.fn()}
+        loading={false}
+      />,
+    );
+
+    // Save without touching model -> preserves original value (omitted in patch)
+    fireEvent.change(screen.getByLabelText(label('common.name')), { target: { value: 'Brief v2' } });
+    fireEvent.click(screen.getByRole('button', { name: label('automation.saveChanges') }));
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1));
+    expect(submissions[0].kind).toBe('edit');
+    expect(submissions[0].payload).not.toHaveProperty('llm_model');
+
+    // Open More options, switch model back to default ("") -> explicitly sends llm_model: null
+    fireEvent.click(screen.getByRole('button', { name: new RegExp(label('automation.moreOptions')) }));
+    const modelSelect = screen.getByLabelText(label('automation.detailModel')) as HTMLSelectElement;
+    expect(modelSelect.value).toBe('claude-sonnet-4-5');
+    fireEvent.change(modelSelect, { target: { value: '' } });
+    fireEvent.click(screen.getByRole('button', { name: label('automation.saveChanges') }));
+
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(2));
+    expect(submissions[1]).toMatchObject({
+      kind: 'edit',
+      payload: { llm_model: null },
+    });
+  });
+
+  // DALTON-HOOK(automation-model): an empty list before the catalog has arrived (or
+  // after it failed) is not "no models"; the selector waits and the saved model stays
+  it.each([
+    ['still loading', { isLoading: true, rawApiResponse: null }, {}, 'automation.modelCatalogLoading'],
+    ['failed to load', { isLoading: false, rawApiResponse: null }, {}, 'automation.modelCatalogUnavailable'],
+    ['loaded but its keys failed', { isLoading: false, rawApiResponse: {} }, null, 'automation.modelCatalogUnavailable'],
+    ['loaded but a subscription status failed', { isLoading: false, rawApiResponse: {} }, {}, 'automation.modelCatalogUnavailable', true],
+  ])('keeps the saved model while the catalog is %s', async (_state, catalog, keys, statusKey, statusError = false) => {
+    allModelsMock.current = { ...allModelsMock.current, models: {}, keylessModels: new Set<string>(), ...catalog };
+    apiKeysMock.current = { apiKeys: keys };
+    providersMock.current = { statusError };
+    serve();
+    const onSubmit = vi.fn();
+    const initial = automationToFormState(SAVED_AUTOMATION, 'America/New_York', 'home-1');
+    renderWithProviders(
+      <AutomationInlineForm
+        initialValues={initial}
+        original={SAVED_AUTOMATION}
+        onSubmit={onSubmit}
+        onCancel={vi.fn()}
+        loading={false}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: new RegExp(label('automation.moreOptions')) }));
+    expect(screen.queryByLabelText(label('automation.detailModel'))).not.toBeInTheDocument();
+    expect(screen.getByRole('status')).toHaveTextContent(label(statusKey));
+
+    fireEvent.change(screen.getByLabelText(label('common.name')), { target: { value: 'Brief v2' } });
+    fireEvent.click(screen.getByRole('button', { name: label('automation.saveChanges') }));
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1));
+    expect(onSubmit.mock.calls[0][0].payload).not.toHaveProperty('llm_model');
+  });
+
+  // DALTON-HOOK(automation-model): only a model the keys mark keyless is called
+  // unavailable; any other absence (a request that failed) reads as the current setting
+  it('shows a saved model missing from the list as the current setting unless it is keyless', async () => {
+    allModelsMock.current = { ...allModelsMock.current, models: {}, keylessModels: new Set<string>() };
+    serve();
+    const initial = automationToFormState(SAVED_AUTOMATION, 'America/New_York', 'home-1');
+    renderWithProviders(
+      <AutomationInlineForm
+        initialValues={initial}
+        original={SAVED_AUTOMATION}
+        onSubmit={vi.fn()}
+        onCancel={vi.fn()}
+        loading={false}
+      />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: new RegExp(label('automation.moreOptions')) }));
+    const select = screen.getByLabelText(label('automation.detailModel')) as HTMLSelectElement;
+    const shown = select.options[select.selectedIndex].textContent ?? '';
+    expect(shown).not.toMatch(/unavailable/i);
+    expect(shown).toMatch(/current setting/i);
+  });
+
+  it('displays server error on the form when saving an unavailable model fails', async () => {
+    setupAvailableModels();
+    serve();
+    const errorMsg = "unknown model 'claude-sonnet-4-5'; use null for the user's default, or one of: gpt-4o";
+    const onSubmit = vi.fn().mockRejectedValue(refusal(409, { detail: errorMsg }));
+
+    const initial = automationToFormState(SAVED_AUTOMATION, 'America/New_York', 'home-1');
+    renderWithProviders(
+      <AutomationInlineForm
+        initialValues={initial}
+        original={SAVED_AUTOMATION}
+        onSubmit={onSubmit}
+        onCancel={vi.fn()}
+        loading={false}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: label('automation.saveChanges') }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(errorMsg);
+    expect(screen.getByRole('button', { name: new RegExp(label('automation.moreOptions')) })).toHaveAttribute(
+      'aria-expanded',
+      'true',
+    );
+  });
+
+  it('excludes keyless custom models from the list, while showing a saved keyless model as unavailable so it can be switched back to default', async () => {
+    allModelsMock.current = {
+      models: {
+        openai: { display_name: 'OpenAI', models: ['gpt-4o', 'custom-keyless'] },
+        custom_prov: { display_name: 'Custom Provider', models: ['only-keyless'] },
+      },
+      lockedModels: {},
+      keylessModels: new Set(['custom-keyless', 'only-keyless']),
+      metadata: {
+        'gpt-4o': { display_name: 'GPT-4o', provider: 'openai' },
+        'custom-keyless': { display_name: 'Custom Keyless', provider: 'openai' },
+        'only-keyless': { display_name: 'Only Keyless', provider: 'custom_prov' },
+      },
+      payers: {},
+      isLoading: false,
+      rawApiResponse: {} as unknown,
+      isLoaded: true,
+    };
+    serve();
+
+    // New form: keyless models are excluded from the options list
+    const { unmount } = renderPicker();
+    const createSelect = screen.getByLabelText(label('automation.detailModel')) as HTMLSelectElement;
+    expect([...createSelect.options].map((o) => ({ value: o.value, text: o.textContent }))).toEqual([
+      { value: '', text: label('automation.defaultModelOption') },
+      { value: 'gpt-4o', text: 'GPT-4o' },
+    ]);
+    unmount();
+
+    // Edit form with a saved keyless model: shown as unavailable, and can be switched back to default
+    const savedKeyless: Automation = { ...SAVED_AUTOMATION, llm_model: 'custom-keyless' };
+    const initial = automationToFormState(savedKeyless, 'America/New_York', 'home-1');
+    const submissions: FormSubmission[] = [];
+    const onSubmit = vi.fn((sub: FormSubmission) => {
+      submissions.push(sub);
+    });
+
+    renderWithProviders(
+      <AutomationInlineForm
+        initialValues={initial}
+        original={savedKeyless}
+        onSubmit={onSubmit}
+        onCancel={vi.fn()}
+        loading={false}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: new RegExp(label('automation.moreOptions')) }));
+    const editSelect = screen.getByLabelText(label('automation.detailModel')) as HTMLSelectElement;
+    expect(editSelect.value).toBe('custom-keyless');
+    expect([...editSelect.options].map((o) => ({ value: o.value, text: o.textContent }))).toEqual([
+      { value: '', text: label('automation.defaultModelOption') },
+      { value: 'custom-keyless', text: label('automation.modelUnavailableOption', { model: 'Custom Keyless' }) },
+      { value: 'gpt-4o', text: 'GPT-4o' },
+    ]);
+
+    fireEvent.change(editSelect, { target: { value: '' } });
+    fireEvent.click(screen.getByRole('button', { name: label('automation.saveChanges') }));
+
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1));
+    expect(submissions[0]).toMatchObject({
+      kind: 'edit',
+      payload: { llm_model: null },
+    });
+  });
+
+  it('renders Default model (account default) even when available models are empty and allows clearing a saved model to null', async () => {
+    allModelsMock.current = {
+      models: {},
+      lockedModels: {},
+      keylessModels: new Set(),
+      metadata: {
+        'claude-sonnet-4-5': { display_name: 'Claude Sonnet 4.5', provider: 'anthropic' },
+      },
+      payers: {},
+      isLoading: false,
+      rawApiResponse: {} as unknown,
+      isLoaded: true,
+    };
+    serve();
+
+    const initial = automationToFormState(SAVED_AUTOMATION, 'America/New_York', 'home-1');
+    const submissions: FormSubmission[] = [];
+    const onSubmit = vi.fn((sub: FormSubmission) => {
+      submissions.push(sub);
+    });
+
+    renderWithProviders(
+      <AutomationInlineForm
+        initialValues={initial}
+        original={SAVED_AUTOMATION}
+        onSubmit={onSubmit}
+        onCancel={vi.fn()}
+        loading={false}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: new RegExp(label('automation.moreOptions')) }));
+    const modelSelect = screen.getByLabelText(label('automation.detailModel')) as HTMLSelectElement;
+    expect(modelSelect.value).toBe('claude-sonnet-4-5');
+    expect([...modelSelect.options].map((o) => ({ value: o.value, text: o.textContent }))).toEqual([
+      { value: '', text: label('automation.defaultModelOption') },
+      // Not keyless, so missing from an empty list reads as the current setting.
+      { value: 'claude-sonnet-4-5', text: label('automation.modelCurrentOption', { model: 'Claude Sonnet 4.5' }) },
+    ]);
+
+    fireEvent.change(modelSelect, { target: { value: '' } });
+    fireEvent.click(screen.getByRole('button', { name: label('automation.saveChanges') }));
+
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1));
+    expect(submissions[0]).toMatchObject({
+      kind: 'edit',
+      payload: { llm_model: null },
+    });
   });
 });
