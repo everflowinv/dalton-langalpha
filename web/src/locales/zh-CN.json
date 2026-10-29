@@ -125,6 +125,7 @@
     },
     "invites": {
       "title": "邀请成员",
+      "activeQuota": "有效邀请 {{count}} / {{max}}",
       "subtitle": "生成一次性邀请链接（7 天有效），受邀人设置用户名与密码后即可加入团队。",
       "generate": "生成邀请链接",
       "generating": "生成中…",

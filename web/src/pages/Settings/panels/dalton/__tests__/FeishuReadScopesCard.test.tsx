@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { FeishuReadScopesCard } from '../FeishuReadScopesCard';
+import { FeishuReadScopesCard, canShowDaltonFeishuScopesCard } from '../FeishuReadScopesCard';
 
 const h = vi.hoisted(() => ({
   canInvite: true,
@@ -50,6 +50,9 @@ describe('FeishuReadScopesCard', () => {
     renderWithQueryClient(<FeishuReadScopesCard />);
     expect(screen.queryByTestId('dalton-feishu-scopes-card')).not.toBeInTheDocument();
     expect(h.fetchDaltonFeishuReadScopes).not.toHaveBeenCalled();
+    expect(canShowDaltonFeishuScopesCard({ canInvite: true })).toBe(false);
+    expect(canShowDaltonFeishuScopesCard({ isPm: false, canInvite: true, callerTier: 'internal' })).toBe(false);
+    expect(canShowDaltonFeishuScopesCard({ isPm: true })).toBe(true);
   });
 
   it('shows whitelisted spaces checked and saves the new selection', async () => {

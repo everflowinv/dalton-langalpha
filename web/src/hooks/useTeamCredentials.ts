@@ -16,6 +16,7 @@ export interface TeamCredentialsStatus {
   is_pm: boolean;
   can_disconnect: boolean;
   can_invite?: boolean;
+  caller_tier?: 'admin' | 'internal' | 'external' | string | null;
 }
 
 export function useTeamCredentials(): {
@@ -27,6 +28,7 @@ export function useTeamCredentials(): {
   canManage: boolean;
   isPm: boolean;
   canInvite: boolean;
+  callerTier?: string | null;
 } {
   const { userId } = useAuth();
 
@@ -45,10 +47,18 @@ export function useTeamCredentials(): {
   if (!isDaltonAuth) {
     // OSS local mode: the local dev user is the default PM for credentials,
     // while `canInvite` requires explicit DALTON_PM_USER_IDS under Dalton auth.
-    return { isShared: false, canDisconnect: true, canManage: true, isPm: true, canInvite: false };
+    return {
+      isShared: false,
+      canDisconnect: true,
+      canManage: true,
+      isPm: true,
+      canInvite: false,
+      callerTier: null,
+    };
   }
   const isShared = Boolean(data?.enabled);
   const isPm = !isError && Boolean(data?.is_pm);
+  const callerTier = !isError ? (data?.caller_tier ?? null) : null;
   return {
     isShared,
     canDisconnect: !isError && Boolean(data?.can_disconnect),
@@ -57,6 +67,10 @@ export function useTeamCredentials(): {
     // non-PM member buttons that would 403.
     canManage: !isShared || isPm,
     isPm,
-    canInvite: !isError && Boolean(data?.can_invite),
+    canInvite:
+      (!isError && Boolean(data?.can_invite)) ||
+      callerTier === 'admin' ||
+      callerTier === 'internal',
+    callerTier,
   };
 }

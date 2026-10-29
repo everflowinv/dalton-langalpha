@@ -16,11 +16,12 @@ import {
 import { GROUPS, SECTIONS, searchableSettings, sectionShown, type Section, type SettingEntry } from '../sections';
 
 function useDaltonSettingsVisibility(): DaltonSettingVisibilityContext {
-  const { canInvite } = useTeamCredentials();
+  const { canInvite, isPm, callerTier: credCallerTier } = useTeamCredentials();
   const { data } = useUserCosSharingQuery(isDaltonAuth);
   return {
     canInvite,
-    callerTier: data?.caller_tier ?? null,
+    isPm,
+    callerTier: data?.caller_tier ?? credCallerTier ?? null,
     colleagueDispatchEnabled: data?.colleague_dispatch_enabled,
     cosSharingLoaded: data !== undefined,
   };

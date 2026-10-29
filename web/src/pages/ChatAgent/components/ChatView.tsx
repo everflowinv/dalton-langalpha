@@ -270,6 +270,8 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     // DALTON-HOOK(workspace-sharing-settings): allow file write for rw colleagues, keep colleague identity separate
     readOnly: !teamReadOnly.canWriteFiles,
     isColleague: teamReadOnly.isColleague,
+    // DALTON-HOOK(external-share-guard): external members cannot create public file share links
+    callerTier: teamReadOnly.callerTier,
   });
   // A path names a sibling by its folder from the workspace it was written
   // in: the chat's for the transcript, the panel's for the files it shows.
@@ -1622,8 +1624,9 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
             )}
             {/* DALTON-HOOK(workspace-sharing-settings): hide ShareButton for colleagues */}
             {/* DALTON-HOOK(colleague-dispatch): hide ShareButton on read-only foreign threads */}
+            {/* DALTON-HOOK(external-share-guard): pass callerTier so external members only see ShareButton when closing an active share */}
             {currentThreadId && currentThreadId !== '__default__' && !isThreadReadOnly && !teamReadOnly.isColleague && (
-              <ShareButton threadId={currentThreadId} initialIsShared={threadIsShared} workspaceId={workspaceId} />
+              <ShareButton threadId={currentThreadId} initialIsShared={threadIsShared} workspaceId={workspaceId} callerTier={teamReadOnly.callerTier} />
             )}
             {/* On desktop the open panel carries this toggle in the same
                 corner, so it is sized and placed as the panel's own buttons

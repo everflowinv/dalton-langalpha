@@ -32,6 +32,7 @@ from src.utils.cache.redis_cache import get_cache_client
 logger = logging.getLogger(__name__)
 
 INVITE_TTL_DAYS = 7
+MAX_ACTIVE_INVITES_PER_USER = 20
 MEMBER_CACHE_TTL_S = 60.0
 INVITE_RATE_LIMIT_WINDOW_S = 60
 DEFAULT_INVITE_RATE_LIMIT_PER_MINUTE = 20
@@ -42,6 +43,7 @@ USERNAME_PATTERN = re.compile(r"^[a-z0-9._-]{3,32}$")
 MIN_PASSWORD_LENGTH = 10
 
 INVITE_NOT_CONFIGURED_DETAIL = "邀请注册未配置"
+INVITE_LIMIT_EXCEEDED_DETAIL = "你当前有效的邀请已达 20 个上限，请先撤销不用的邀请"
 
 _STATUS_LABELS: dict[str, str] = {
     "pending": "待使用",
@@ -147,14 +149,22 @@ def is_invite_pm(user_id: str | None) -> bool:
     return uid in set(get_configured_pm_user_ids())
 
 
-def require_pm_for_invites(user_id: str | None) -> str:
-    """Verify caller is an authenticated PM (`DALTON_PM_USER_IDS`)."""
+async def get_user_tier(user_id: str | None) -> str:
+    """Return the caller's access tier (`admin`, `internal`, or `external`)."""
+    from src.dalton.access_tiers import get_user_tier as _get_user_tier
+
+    return await _get_user_tier(user_id)
+
+
+async def require_pm_for_invites(user_id: str | None) -> tuple[str, str]:
+    """Verify caller is an authenticated internal member (`admin` or `internal`)."""
     uid = str(user_id or "").strip()
     if not uid:
         raise HTTPException(status_code=401, detail="Authentication required")
-    if not is_invite_pm(uid):
-        raise HTTPException(status_code=403, detail="仅管理员可管理邀请链接")
-    return uid
+    tier = await get_user_tier(uid)
+    if tier not in ("admin", "internal"):
+        raise HTTPException(status_code=403, detail="仅内部成员可管理邀请链接")
+    return uid, tier
 
 
 def _require_invite_supabase_config() -> tuple[str, str]:
@@ -382,12 +392,14 @@ async def enforce_invite_rate_limit(
 
 
 async def create_invite_for_pm(user_id: str | None) -> dict[str, Any]:
-    """Create a 7-day single-use invite token (PM only).
+    """Create a 7-day single-use invite token for internal members (`admin` or `internal`).
 
+    Internal members are capped at 20 active (unused, unrevoked, unexpired) invites,
+    enforced under a per-creator transaction-scoped advisory lock; admins are exempt.
     Link uses URL fragment (`{DALTON_FRONTEND_URL}/invite#{token}`) so the token
     is never sent in HTTP request paths or server access logs.
     """
-    uid = require_pm_for_invites(user_id)
+    uid, tier = await require_pm_for_invites(user_id)
     _require_invite_supabase_config()
 
     token = secrets.token_urlsafe(32)
@@ -395,11 +407,30 @@ async def create_invite_for_pm(user_id: str | None) -> dict[str, Any]:
     now = datetime.now(timezone.utc)
     expires_at = now + timedelta(days=INVITE_TTL_DAYS)
 
-    row = await members_db.insert_invite(
-        token_sha256=token_sha256,
-        created_by_user_id=uid,
-        expires_at=expires_at,
-    )
+    if tier == "admin":
+        row = await members_db.insert_invite(
+            token_sha256=token_sha256,
+            created_by_user_id=uid,
+            expires_at=expires_at,
+        )
+    else:
+        async with get_db_connection() as conn:
+            async with conn.transaction():
+                await members_db.lock_invite_creator(uid, conn=conn)
+                active_count = await members_db.count_active_invites_by_creator(
+                    uid, conn=conn
+                )
+                if active_count >= MAX_ACTIVE_INVITES_PER_USER:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=INVITE_LIMIT_EXCEEDED_DETAIL,
+                    )
+                row = await members_db.insert_invite(
+                    token_sha256=token_sha256,
+                    created_by_user_id=uid,
+                    expires_at=expires_at,
+                    conn=conn,
+                )
     frontend_base = _resolve_invite_frontend_base_url()
     invite_url = f"{frontend_base}/invite#{token}"
     summary = _format_invite_summary(row, now=now)
@@ -412,25 +443,38 @@ async def create_invite_for_pm(user_id: str | None) -> dict[str, Any]:
 
 
 async def list_invites_for_pm(user_id: str | None) -> list[dict[str, Any]]:
-    """Return all invites for PM management view without exposing token or token hash."""
-    require_pm_for_invites(user_id)
-    rows = await members_db.list_invites()
+    """Return invites for management view without exposing token or token hash.
+
+    Internal members see only their own invites (`created_by_user_id == uid` filtered in SQL);
+    admins see all invites.
+    """
+    uid, tier = await require_pm_for_invites(user_id)
+    if tier == "admin":
+        rows = await members_db.list_invites()
+    else:
+        rows = await members_db.list_invites(created_by_user_id=uid)
     now = datetime.now(timezone.utc)
     return [_format_invite_summary(r, now=now) for r in rows]
 
 
 async def revoke_invite_for_pm(user_id: str | None, invite_id: str) -> dict[str, Any]:
-    """Revoke an unused invite (PM only)."""
-    require_pm_for_invites(user_id)
-    existing = await members_db.get_invite_by_id(invite_id)
-    if existing is None:
-        raise HTTPException(status_code=404, detail="邀请不存在")
-    if existing.get("used_at") is not None:
-        raise HTTPException(status_code=409, detail="邀请已被使用，无法撤销")
+    """Revoke an unused invite (`admin` can revoke any; `internal` only their own via single UPDATE)."""
+    uid, tier = await require_pm_for_invites(user_id)
+    if tier == "admin":
+        existing = await members_db.get_invite_by_id(invite_id)
+        if existing is None:
+            raise HTTPException(status_code=404, detail="邀请不存在")
+        if existing.get("used_at") is not None:
+            raise HTTPException(status_code=409, detail="邀请已被使用，无法撤销")
 
-    updated = await members_db.revoke_invite(invite_id)
+        updated = await members_db.revoke_invite(invite_id)
+        if updated is None:
+            raise HTTPException(status_code=409, detail="邀请已被使用，无法撤销")
+        return _format_invite_summary(updated)
+
+    updated = await members_db.revoke_invite(invite_id, created_by_user_id=uid)
     if updated is None:
-        raise HTTPException(status_code=409, detail="邀请已被使用，无法撤销")
+        raise HTTPException(status_code=404, detail="邀请不存在")
     return _format_invite_summary(updated)
 
 

@@ -7,6 +7,8 @@ import { shortMonthDay } from '@/lib/format';
 import { useCopyShareLink } from '@/hooks/useCopyShareLink';
 import { useLocale } from '@/hooks/useLocale';
 import { useSharedLinks, useShareLinkMutations } from '@/hooks/useShareLink';
+// DALTON-HOOK(external-share-guard): external members cannot turn on public thread sharing
+import { queryKeys } from '@/lib/queryKeys';
 import { useQueryClient } from '@tanstack/react-query';
 import { saveThreadSharing, useThreadShareStatus } from '../hooks/useThreadShareStatus';
 import { shareConflictIn } from '../utils/api/shareLinks';
@@ -111,6 +113,12 @@ export function ThreadSharePanel({
   const [updating, setUpdating] = useState(false);
 
   const queryClient = useQueryClient();
+  // DALTON-HOOK(external-share-guard): hide public share toggle when unshared for external members; keep closable when already shared
+  const callerTier =
+    queryClient.getQueryData<{ caller_tier?: string | null }>(queryKeys.workspaces.team())?.caller_tier ??
+    queryClient.getQueryData<{ caller_tier?: string | null }>(queryKeys.dalton.userSharing())?.caller_tier ??
+    null;
+  const isExternal = callerTier === 'external';
   const { data: shareState, isPending, isError, refetch } = useThreadShareStatus(threadId, { refetchOnMount: 'always' });
 
   const save = useCallback(async (body: Pick<ThreadShareStatus, 'is_shared' | 'permissions'>) => {
@@ -194,25 +202,27 @@ export function ThreadSharePanel({
             {isShared ? t('share.publicLinkEnabled') : t('share.shareConversation')}
           </Heading>
         </div>
-        {/* Toggle */}
-        <button
-          type="button"
-          role="switch"
-          aria-checked={isShared}
-          aria-label={t('share.shareConversation')}
-          onClick={() => handleToggleShare(!isShared)}
-          disabled={updating}
-          className="relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors"
-          style={{
-            backgroundColor: isShared ? 'var(--color-accent-primary)' : 'var(--color-border-muted)',
-            opacity: updating ? 0.6 : 1,
-          }}
-        >
-          <span
-            className="pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow-sm ring-0 transition"
-            style={{ transform: isShared ? 'translateX(16px)' : 'translateX(0)' }}
-          />
-        </button>
+        {/* Toggle — DALTON-HOOK(external-share-guard): external members only see the switch to close an existing share */}
+        {(!isExternal || isShared) && (
+          <button
+            type="button"
+            role="switch"
+            aria-checked={isShared}
+            aria-label={t('share.shareConversation')}
+            onClick={() => handleToggleShare(!isShared)}
+            disabled={updating}
+            className="relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors"
+            style={{
+              backgroundColor: isShared ? 'var(--color-accent-primary)' : 'var(--color-border-muted)',
+              opacity: updating ? 0.6 : 1,
+            }}
+          >
+            <span
+              className="pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow-sm ring-0 transition"
+              style={{ transform: isShared ? 'translateX(16px)' : 'translateX(0)' }}
+            />
+          </button>
+        )}
       </div>
 
       {isShared && shareState && (

@@ -502,7 +502,8 @@ export function resolveNavThreadPermissions(
     isDispatcherOwnThread: false,
     isIsolatedExternal: false,
     canMutateThread: true,
-    canShareThread: true,
+    // DALTON-HOOK(external-share-guard): external members cannot start public thread sharing, only close an existing share
+    canShareThread: callerTier === 'external' ? Boolean(thread?.is_shared) : true,
     canCopyOrOpen: true,
   };
 }

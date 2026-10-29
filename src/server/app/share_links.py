@@ -49,7 +49,35 @@ from src.server.app.share_manifest import (
     build_manifest,
     manifest_drift,
 )
+from src.dalton.access_tiers import get_user_tier as _default_get_user_tier
+from src.dalton.settings import is_dalton_supabase_auth_enabled
 from src.server.utils.api import CurrentUserId
+
+# DALTON-HOOK(external-share-guard): external members cannot create or enable public share links
+EXTERNAL_SHARE_FORBIDDEN_DETAIL = "外部成员不能创建公开分享链接"
+get_user_tier = _default_get_user_tier
+
+
+async def _require_non_external_for_share(user_id: str | None) -> None:
+    """Reject external members from creating or enabling public share links."""
+    from src.dalton import access_tiers as _access_tiers
+    from src.dalton import sharing as _dalton_sharing
+
+    if get_user_tier is not _default_get_user_tier:
+        tier_fn = get_user_tier
+    elif _access_tiers.get_user_tier is not _default_get_user_tier:
+        tier_fn = _access_tiers.get_user_tier
+    elif _dalton_sharing.get_user_tier is not _default_get_user_tier:
+        tier_fn = _dalton_sharing.get_user_tier
+    else:
+        tier_fn = _default_get_user_tier
+    if not is_dalton_supabase_auth_enabled() and tier_fn is _default_get_user_tier:
+        return
+    if await tier_fn(user_id) == "external":
+        raise HTTPException(
+            status_code=403,
+            detail=EXTERNAL_SHARE_FORBIDDEN_DETAIL,
+        )
 
 router = APIRouter(prefix="/api/v1/workspaces", tags=["Share Links"])
 owner_router = APIRouter(prefix="/api/v1/share-links", tags=["Share Links"])
@@ -147,6 +175,9 @@ async def get_or_create_share_link(
 ) -> ShareLinkResponse:
     """The item's one link, private on first sight. Cheap: no file list here."""
     workspace, work_dir = await _owned_workspace(workspace_id, x_user_id)
+    # DALTON-HOOK(external-share-guard): no gate here — the link starts private
+    # (HTML open-in-tab and app previews read it); only making it public, in
+    # update_share_link, is refused to external members.
     ws_id = str(workspace["workspace_id"])
 
     if body.kind == KIND_APP:
@@ -206,6 +237,9 @@ async def update_share_link(
 
     if not body.shared:
         return _to_model(await set_private(code) or link)
+
+    # DALTON-HOOK(external-share-guard): external members cannot enable public share links
+    await _require_non_external_for_share(x_user_id)
 
     if link.kind != KIND_FILE:
         raise HTTPException(status_code=400, detail="An app link cannot be shared")

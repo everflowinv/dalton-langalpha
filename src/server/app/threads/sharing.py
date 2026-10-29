@@ -18,10 +18,38 @@ from src.server.models.conversation import (
     ThreadShareResponse,
     SharePermissions,
 )
+from src.dalton.access_tiers import get_user_tier as _default_get_user_tier
+from src.dalton.settings import is_dalton_supabase_auth_enabled
 from src.server.database.conversation import (
     get_thread_by_id,
     update_thread_sharing,
 )
+
+# DALTON-HOOK(external-share-guard): external members cannot enable public thread sharing
+EXTERNAL_SHARE_FORBIDDEN_DETAIL = "外部成员不能创建公开分享链接"
+get_user_tier = _default_get_user_tier
+
+
+async def _require_non_external_for_share(user_id: str | None) -> None:
+    """Reject external members from enabling public thread sharing."""
+    from src.dalton import access_tiers as _access_tiers
+    from src.dalton import sharing as _dalton_sharing
+
+    if get_user_tier is not _default_get_user_tier:
+        tier_fn = get_user_tier
+    elif _access_tiers.get_user_tier is not _default_get_user_tier:
+        tier_fn = _access_tiers.get_user_tier
+    elif _dalton_sharing.get_user_tier is not _default_get_user_tier:
+        tier_fn = _dalton_sharing.get_user_tier
+    else:
+        tier_fn = _default_get_user_tier
+    if not is_dalton_supabase_auth_enabled() and tier_fn is _default_get_user_tier:
+        return
+    if await tier_fn(user_id) == "external":
+        raise HTTPException(
+            status_code=403,
+            detail=EXTERNAL_SHARE_FORBIDDEN_DETAIL,
+        )
 
 
 
@@ -47,8 +75,6 @@ async def update_thread_share(
         raise HTTPException(status_code=404, detail="Thread not found")
 
     # DALTON-HOOK(colleague-dispatch): public thread sharing requires owning both thread and workspace
-    from src.dalton.settings import is_dalton_supabase_auth_enabled
-
     if is_dalton_supabase_auth_enabled():
         ws_owner = thread.get("workspace_owner_id")
         if ws_owner and str(ws_owner) != str(x_user_id):
@@ -58,6 +84,8 @@ async def update_thread_share(
     kwargs: dict = {"is_shared": request.is_shared}
 
     if request.is_shared:
+        # DALTON-HOOK(external-share-guard): external members cannot enable public thread sharing
+        await _require_non_external_for_share(x_user_id)
         kwargs["shared_at"] = datetime.now(timezone.utc)
 
     # Merge permissions: start from existing, overlay provided fields

@@ -17,10 +17,15 @@ import {
 } from '../../utils/daltonApi';
 import type { DaltonSettingVisibilityContext } from './DaltonCosSharingCard';
 
+export const MAX_ACTIVE_DALTON_INVITES = 20;
+
 export function canShowDaltonInviteAdminCard(
   ctx?: DaltonSettingVisibilityContext | null,
 ): boolean {
-  return Boolean(ctx?.canInvite);
+  if (!ctx) return false;
+  if (ctx.callerTier === 'external') return false;
+  if (ctx.callerTier === 'admin' || ctx.callerTier === 'internal') return true;
+  return Boolean(ctx.canInvite);
 }
 
 function extractApiError(err: unknown, fallback: string): string {
@@ -38,7 +43,7 @@ function extractApiError(err: unknown, fallback: string): string {
 }
 
 export function DaltonInvitesCard(): React.ReactElement | null {
-  const { canInvite } = useTeamCredentials();
+  const { canInvite, callerTier } = useTeamCredentials();
   const locale = useLocale();
   const { t } = useTranslation();
   const queryClient = useQueryClient();
@@ -48,10 +53,12 @@ export function DaltonInvitesCard(): React.ReactElement | null {
   const [error, setError] = useState<string | null>(null);
   const [revokingId, setRevokingId] = useState<string | null>(null);
 
+  const showCard = canShowDaltonInviteAdminCard({ canInvite, callerTier });
+
   const { data, isLoading } = useQuery({
     queryKey: queryKeys.dalton.invites(),
     queryFn: fetchDaltonInvites,
-    enabled: canInvite,
+    enabled: showCard,
   });
 
   const createMutation = useMutation({
@@ -84,11 +91,17 @@ export function DaltonInvitesCard(): React.ReactElement | null {
     },
   });
 
-  if (!canShowDaltonInviteAdminCard({ canInvite })) {
+  if (!showCard) {
     return null;
   }
 
   const invites: DaltonInviteItem[] = data?.invites ?? [];
+  const activeCount =
+    typeof data?.active_count === 'number'
+      ? data.active_count
+      : invites.filter((item) => item.status === 'pending').length;
+  const maxActive =
+    typeof data?.max_active === 'number' ? data.max_active : MAX_ACTIVE_DALTON_INVITES;
 
   const renderStatusLabel = (status: DaltonInviteStatus): string => {
     switch (status) {
@@ -130,12 +143,21 @@ export function DaltonInvitesCard(): React.ReactElement | null {
         style={{ borderColor: 'var(--color-border-muted)' }}
       >
         <div className="flex flex-col gap-1">
-          <span
-            className="text-sm font-semibold"
-            style={{ color: 'var(--color-text-primary)' }}
-          >
-            {t('auth.invites.title')}
-          </span>
+          <div className="flex items-center gap-2">
+            <span
+              className="text-sm font-semibold"
+              style={{ color: 'var(--color-text-primary)' }}
+            >
+              {t('auth.invites.title')}
+            </span>
+            <span
+              className="text-xs font-medium"
+              style={{ color: 'var(--color-text-secondary)' }}
+              data-testid="dalton-invites-quota"
+            >
+              {t('auth.invites.activeQuota', { count: activeCount, max: maxActive })}
+            </span>
+          </div>
           <p className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
             {t('auth.invites.subtitle')}
           </p>

@@ -186,6 +186,10 @@ ALLOWED_HOOKS=(
   # named PDF_RENDER_CONCURRENCY constant, a source-resolving helper in
   # tool_settings.py, and one lifespan line in setup.py. Log-only.
   "concurrency-startup-log"
+  # P2: external members cannot create or enable public share links or thread
+  # public sharing, while closing an existing share remains allowed
+  # (share_links.py, threads/sharing.py, frontend share controls).
+  "external-share-guard"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

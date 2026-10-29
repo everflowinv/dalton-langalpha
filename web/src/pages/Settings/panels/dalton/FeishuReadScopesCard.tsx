@@ -11,7 +11,15 @@ import {
   updateDaltonFeishuReadScopes,
   type DaltonFeishuSpace,
 } from '../../utils/daltonApi';
-import { canShowDaltonInviteAdminCard } from './DaltonInvitesCard';
+import type { DaltonSettingVisibilityContext } from './DaltonCosSharingCard';
+
+export function canShowDaltonFeishuScopesCard(
+  ctx?: DaltonSettingVisibilityContext | null,
+): boolean {
+  if (!ctx) return false;
+  if (ctx.callerTier === 'internal' || ctx.callerTier === 'external') return false;
+  return Boolean(ctx.isPm);
+}
 
 function extractApiError(err: unknown, fallback: string): string {
   if (err && typeof err === 'object') {
@@ -28,23 +36,24 @@ function extractApiError(err: unknown, fallback: string): string {
 }
 
 export function FeishuReadScopesCard(): React.ReactElement | null {
-  const { canInvite } = useTeamCredentials();
+  const { isPm, callerTier } = useTeamCredentials();
   const { t } = useTranslation();
   const queryClient = useQueryClient();
 
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [error, setError] = useState<string | null>(null);
+  const showCard = canShowDaltonFeishuScopesCard({ isPm, callerTier });
 
   const scopesQuery = useQuery({
     queryKey: queryKeys.dalton.feishuReadScopes(),
     queryFn: fetchDaltonFeishuReadScopes,
-    enabled: canInvite,
+    enabled: showCard,
   });
 
   const spacesQuery = useQuery({
     queryKey: queryKeys.dalton.feishuSpaces(),
     queryFn: fetchDaltonFeishuSpaces,
-    enabled: canInvite,
+    enabled: showCard,
     retry: false,
   });
 
@@ -91,7 +100,7 @@ export function FeishuReadScopesCard(): React.ReactElement | null {
     return [...fromBridge, ...extra.map((s) => ({ space_id: s.space_id, name: s.name }))];
   }, [spacesQuery.data, scopesQuery.data]);
 
-  if (!canShowDaltonInviteAdminCard({ canInvite })) {
+  if (!showCard) {
     return null;
   }
 

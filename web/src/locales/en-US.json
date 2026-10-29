@@ -125,6 +125,7 @@
     },
     "invites": {
       "title": "Invite members",
+      "activeQuota": "Active invites {{count}} / {{max}}",
       "subtitle": "Generate a single-use invite link (valid for 7 days) so teammates can register with a username and password.",
       "generate": "Generate invite link",
       "generating": "Generating…",
