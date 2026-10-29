@@ -284,6 +284,8 @@ async def update_api_keys(body: UpdateApiKeysRequest, user_id: CurrentUserId):
     ):  # DALTON-HOOK(team-credentials)
         from src.dalton.credentials import require_credential_admin  # DALTON-HOOK(team-credentials)
         require_credential_admin(user_id)  # DALTON-HOOK(team-credentials)
+    from src.dalton.credentials import require_credential_write_admin  # DALTON-HOOK(team-credentials)
+    require_credential_write_admin(user_id)  # DALTON-HOOK(team-credentials)
     custom_providers = await _get_custom_providers(user_id)
     allowed = _get_allowed_providers(custom_providers)
 

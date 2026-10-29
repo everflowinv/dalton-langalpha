@@ -6421,6 +6421,7 @@
     "manage": "管理",
     "reconnect": "重新连接",
     "reconnectNote": "此登录已失效。重新登录即可继续使用其模型。",
+    "teamManagedByAdmin": "团队共用凭据由管理员管理。如需连接或更换模型凭据，请联系管理员。",
     "tryAgain": "重试",
     "copy": "复制",
     "copied": "已复制",

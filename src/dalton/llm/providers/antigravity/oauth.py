@@ -248,8 +248,16 @@ async def _finalize_token_save(user_id: str, tokens: dict, expected_flow_raw: st
     overwrite its marker. A cache that cannot verify the flow refuses the save:
     an unverifiable save is exactly the revive-on-disconnect race.
     """
+    from src.dalton.credentials import require_credential_write_admin
     from src.server.database.oauth_tokens import connection_change
     from src.utils.cache.redis_cache import get_cache_client
+
+    # DALTON-HOOK(team-credentials): the commit step re-checks the writer, so
+    # an admin demoted after starting the login (loopback or paste — the
+    # loopback callback has no HTTP route of its own) cannot land the save.
+    # Raised before the flow claim or the token write; background refresh
+    # never passes through here.
+    require_credential_write_admin(user_id)
 
     claims = parse_id_token_claims(tokens.get("id_token", ""))
     cache = get_cache_client()
@@ -298,6 +306,9 @@ async def _finalize_token_save(user_id: str, tokens: dict, expected_flow_raw: st
 
 async def start_login(user_id: str) -> dict:
     """Begin a login: PKCE pair + one-shot loopback callback listener."""
+    from src.dalton.credentials import require_credential_write_admin
+
+    require_credential_write_admin(user_id)
     verifier, challenge = _generate_pkce_pair()
     state = secrets.token_urlsafe(24)
     now_dt = datetime.now(timezone.utc)
@@ -410,8 +421,10 @@ def parse_callback_input(raw_input: str) -> tuple[str, str, str | None]:
 
 async def submit_callback_url(user_id: str, callback_input: str) -> dict:
     """Complete Antigravity OAuth from a manually pasted callback URL (R6-5 Docker fallback)."""
+    from src.dalton.credentials import require_credential_write_admin
     from src.utils.cache.redis_cache import get_cache_client
 
+    require_credential_write_admin(user_id)
     cache = get_cache_client()
     if not cache.enabled or not cache.client:
         raise RuntimeError("Cache unavailable for OAuth callback verification.")
@@ -457,7 +470,7 @@ async def _handle_google_callback(
     server_future: "asyncio.Future[asyncio.AbstractServer]",
 ) -> None:
     """Parse one loopback HTTP request from Google, finish the login, respond."""
-    reasons = {200: "OK", 400: "Bad Request", 404: "Not Found", 500: "Internal Server Error"}
+    reasons = {200: "OK", 400: "Bad Request", 403: "Forbidden", 404: "Not Found", 500: "Internal Server Error"}
 
     def respond(status: int, title: str, detail: str) -> None:
         body = (
@@ -507,7 +520,12 @@ async def _handle_google_callback(
         # key must still stand and carry THIS verifier/state, or this is an
         # old listener answering after a disconnect / newer login
         # (DALTON-HOOK(team-credentials)).
+        from src.dalton.credentials import is_credential_admin
         from src.utils.cache.redis_cache import get_cache_client
+
+        if not is_credential_admin(user_id):
+            respond(403, "Forbidden", "Team-shared credentials are managed by the administrator.")
+            return
 
         cache = get_cache_client()
         flow_key, _done_key = _flow_keys(user_id)

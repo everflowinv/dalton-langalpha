@@ -16,6 +16,7 @@ vi.mock('@/hooks/useTeamCredentials', () => ({
   useTeamCredentials: () => ({
     isShared: true,
     canDisconnect: h.canInvite,
+    canManage: h.canInvite,
     isPm: h.canInvite,
     canInvite: h.canInvite,
   }),

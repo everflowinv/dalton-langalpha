@@ -6539,6 +6539,7 @@
     "manage": "Manage",
     "reconnect": "Reconnect",
     "reconnectNote": "This sign-in stopped working. Sign in again to keep using its models.",
+    "teamManagedByAdmin": "Team-shared credentials are managed by the administrator. Contact an administrator to connect or change them.",
     "tryAgain": "Try again",
     "copy": "Copy",
     "copied": "Copied",
