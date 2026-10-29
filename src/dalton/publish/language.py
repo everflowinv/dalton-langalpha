@@ -25,6 +25,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from ptc_agent.core.paths import DEFAULT_LAYOUT, resolve_agent_path
 from src.dalton.auth import verify_workspace_access
 from src.dalton.llm.assist import assist_json
 from src.dalton.llm.model_prefs import (
@@ -207,13 +208,6 @@ def split_sections(text: str, budget: int = _CHUNK_CHAR_BUDGET) -> list[tuple[st
     return chunks or [("（空稿）", "")]
 
 
-async def _read_optional_text(backend: Any, path: str) -> str | None:
-    try:
-        return await backend.aread_text(path)
-    except Exception:
-        return None
-
-
 def _review_instructions(round_no: int) -> str:
     return (
         "你执行 Dalton 的语言审查（只标问题模式）。规则全文如下，严格遵守其中"
@@ -286,6 +280,71 @@ def _render_language_md(doc: dict[str, Any], draft_path: str) -> str:
     return "\n".join(lines)
 
 
+# In-process per-draft review locks keyed by (workspace_id, resolved_draft_path).
+# Cleaned up in finally when the active review finishes so the dict never leaks.
+_DRAFT_REVIEW_LOCKS: dict[tuple[str, str], asyncio.Lock] = {}
+
+
+def _resolve_lock_path(backend: Any, draft_path: str) -> str:
+    """Resolve ``draft_path`` using the backend's own path normalizer
+    (``SandboxBackend.normalize_path`` / ``resolve_agent_path``) so ``drafts/a.md``,
+    ``/drafts/a.md``, and the workspace absolute path share one lock key."""
+    normalize = getattr(backend, "normalize_path", None)
+    if callable(normalize):
+        resolved = normalize(draft_path)
+        if isinstance(resolved, str) and resolved:
+            return resolved
+    workspace = getattr(backend, "workspace_dir", None)
+    if not isinstance(workspace, str) or not workspace:
+        workspace = DEFAULT_LAYOUT.root
+    root = getattr(backend, "computer_root", None)
+    if not isinstance(root, str) or not root:
+        root = DEFAULT_LAYOUT.root
+    return resolve_agent_path(
+        draft_path,
+        workspace=workspace,
+        root=root,
+        allowed=(workspace, root, *DEFAULT_LAYOUT.allowed_directories),
+    )
+
+
+async def _load_sidecar_doc(
+    backend: Any, json_path: str, draft_path: str
+) -> tuple[dict[str, Any] | None, str | None]:
+    try:
+        existing = await backend.aread_text(json_path)
+    except Exception as e:
+        logger.error("check_language sidecar read failed (%s): %s", json_path, e)
+        return None, (
+            f"ERROR: 语言审查记录读取失败（{json_path}：{e}），不会覆盖；请稍后重试。"
+        )
+    doc: dict[str, Any] = {"draft": draft_path, "rounds": []}
+    if existing is not None and existing.strip():
+        try:
+            loaded = json.loads(existing)
+        except ValueError:
+            return None, (
+                f"ERROR: 语言审查记录不可解析（{json_path}），不会覆盖；"
+                "请修复或删除该文件后重试。"
+            )
+        if not isinstance(loaded, dict) or not isinstance(loaded.get("rounds"), list):
+            return None, (
+                f"ERROR: 语言审查记录结构异常（{json_path}），不会覆盖；"
+                "请修复或删除该文件后重试。"
+            )
+        doc = loaded
+    return doc, None
+
+
+async def _write_sidecar_text(backend: Any, path: str, text: str) -> bool:
+    try:
+        res = await backend.awrite_text(path, text)
+    except Exception as e:
+        logger.error("check_language sidecar write failed (%s): %s", path, e)
+        return False
+    return res is not False
+
+
 async def run_check_language(
     *,
     workspace_id: str,
@@ -309,30 +368,61 @@ async def run_check_language(
     if backend is None:
         return {"ok": False, "message": "ERROR: filesystem backend is unavailable."}
 
-    draft_text = await backend.aread_text(draft_path)
+    lock_key = (str(workspace_id).strip(), _resolve_lock_path(backend, draft_path))
+    lock = _DRAFT_REVIEW_LOCKS.get(lock_key)
+    if lock is not None and lock.locked():
+        logger.warning(
+            "Concurrent check_language rejected (workspace_id=%s, draft_path=%s, round=%s)",
+            workspace_id,
+            draft_path,
+            round,
+        )
+        return {
+            "ok": False,
+            "message": (
+                f"ERROR: 另一轮审查进行中（{draft_path}），请等待当前语言审查完成后再调用 check_language。"
+            ),
+        }
+    if lock is None:
+        lock = asyncio.Lock()
+        _DRAFT_REVIEW_LOCKS[lock_key] = lock
+    await lock.acquire()
+    try:
+        return await _run_check_language_locked(
+            workspace_id=workspace_id,
+            draft_path=draft_path,
+            round=round,
+            backend=backend,
+            user_id=user_id,
+            thread_id=thread_id,
+        )
+    finally:
+        lock.release()
+        if not lock.locked() and _DRAFT_REVIEW_LOCKS.get(lock_key) is lock:
+            _DRAFT_REVIEW_LOCKS.pop(lock_key, None)
+
+
+async def _run_check_language_locked(
+    *,
+    workspace_id: str,
+    draft_path: str,
+    round: int,
+    backend: Any,
+    user_id: str,
+    thread_id: str | None = None,
+) -> dict[str, Any]:
+    try:
+        draft_text = await backend.aread_text(draft_path)
+    except Exception as e:
+        logger.error("check_language draft read failed (%s): %s", draft_path, e)
+        return {"ok": False, "message": f"ERROR: 草稿读取失败（{draft_path}：{e}），请稍后重试。"}
     if draft_text is None:
         return {"ok": False, "message": f"ERROR: Draft file not found at {draft_path}"}
 
     json_path, md_path = language_sidecar_paths(draft_path)
-    existing = await _read_optional_text(backend, json_path)
-    doc: dict[str, Any] = {"draft": draft_path, "rounds": []}
-    if existing is not None and existing.strip():
-        try:
-            loaded = json.loads(existing)
-        except ValueError:
-            return {
-                "ok": False,
-                "message": (
-                    f"ERROR: 语言审查记录不可解析（{json_path}），不会覆盖；"
-                    "请修复或删除该文件后重试。"
-                ),
-            }
-        if not isinstance(loaded, dict) or not isinstance(loaded.get("rounds"), list):
-            return {
-                "ok": False,
-                "message": f"ERROR: 语言审查记录结构异常（{json_path}），不会覆盖；请修复或删除该文件后重试。",
-            }
-        doc = loaded
+    doc, load_err = await _load_sidecar_doc(backend, json_path, draft_path)
+    if load_err is not None or doc is None:
+        return {"ok": False, "message": load_err or f"ERROR: 语言审查记录读取失败（{json_path}）"}
 
     draft_sha = hashlib.sha256(draft_text.encode("utf-8")).hexdigest()
     round1_records = [r for r in doc["rounds"] if isinstance(r, dict) and r.get("round") == 1]
@@ -417,6 +507,65 @@ async def run_check_language(
             ),
         }
 
+    # Re-read the draft before touching the sidecar: if the draft changed while
+    # the review was in flight, discard this round so the sidecar never records
+    # a stale sha256 as reviewed.
+    try:
+        current_draft_text = await backend.aread_text(draft_path)
+    except Exception as e:
+        logger.error("check_language draft re-read failed (%s): %s", draft_path, e)
+        return {
+            "ok": False,
+            "message": f"ERROR: 草稿重读失败（{draft_path}：{e}），本轮未写入记录；请稍后重试。",
+        }
+    current_sha = (
+        hashlib.sha256(current_draft_text.encode("utf-8")).hexdigest()
+        if current_draft_text is not None
+        else None
+    )
+    if current_sha != draft_sha:
+        logger.warning(
+            "Stale check_language discarded: draft modified during review "
+            "(workspace_id=%s, draft_path=%s, round=%s, start_sha256=%s, current_sha256=%s)",
+            workspace_id,
+            draft_path,
+            round,
+            draft_sha,
+            current_sha,
+        )
+        return {
+            "ok": False,
+            "stale": True,
+            "message": (
+                f"ERROR: 审查期间稿件已改动，请对当前稿件重新调用 check_language"
+                f"（{draft_path}，起始哈希 {draft_sha[:12]}…，当前哈希 {(current_sha or 'missing')[:12]}…；"
+                "本轮作废，未写入通过记录）。"
+            ),
+        }
+
+    # Re-read the sidecar under the per-draft lock before appending so any
+    # external write during the LLM call is preserved rather than overwritten.
+    latest_doc, latest_err = await _load_sidecar_doc(backend, json_path, draft_path)
+    if latest_err is not None or latest_doc is None:
+        return {"ok": False, "message": latest_err or f"ERROR: 语言审查记录读取失败（{json_path}）"}
+    if doc["rounds"] and not latest_doc.get("rounds"):
+        return {
+            "ok": False,
+            "message": (
+                f"ERROR: 语言审查记录重读失败（{json_path}），不会覆盖已有轮次记录；请稍后重试。"
+            ),
+        }
+    if latest_doc.get("rounds") != doc.get("rounds"):
+        doc = latest_doc
+        if round == 2:
+            latest_round1 = [
+                r for r in doc["rounds"] if isinstance(r, dict) and r.get("round") == 1
+            ]
+            if latest_round1:
+                unchanged_since_round_1 = (
+                    str(latest_round1[-1].get("draft_sha256") or "") == draft_sha
+                )
+
     raw_issues = [issue for chunk_issues in results for issue in chunk_issues]
     issues = [issue for issue in raw_issues if issue["quote"] in draft_text]
     dropped = len(raw_issues) - len(issues)
@@ -437,10 +586,10 @@ async def run_check_language(
 
     # The checklist first, the record last: the contract reads the json, so a
     # half-written pair can never be "json without checklist". Either write
-    # reporting failure (a falsy return) fails the whole round — no sidecar
-    # pair, not a pass.
+    # reporting failure (a falsy return or exception) fails the whole round — no
+    # sidecar pair, not a pass.
     language_md = _render_language_md(doc, draft_path)
-    if await backend.awrite_text(md_path, language_md) is False:
+    if not await _write_sidecar_text(backend, md_path, language_md):
         return {
             "ok": False,
             "message": (
@@ -448,7 +597,7 @@ async def run_check_language(
             ),
         }
     language_json = json.dumps(doc, ensure_ascii=False, indent=2)
-    if await backend.awrite_text(json_path, language_json) is False:
+    if not await _write_sidecar_text(backend, json_path, language_json):
         return {
             "ok": False,
             "message": (
