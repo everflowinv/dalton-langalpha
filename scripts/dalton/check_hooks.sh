@@ -202,6 +202,10 @@ ALLOWED_HOOKS=(
   # mcpServers failures (discover.py, mcp.py, manifest.py, marketplace.py;
   # src/dalton/plugin_json_budget.py).
   "plugin-json-budget"
+  # P8: wsfiles transfer runtime stamps current time when mtime_ns is None or 0
+  # across relay, direct, and restore paths so uploaded/restored entries never
+  # land at 1970 (wsfiles_transfer_runtime.py).
+  "wsfiles-mtime"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

@@ -186,7 +186,7 @@ async def consume_approval(
 
 
 class WorkspaceUnavailableForPublishError(RuntimeError):
-    """Raised when attempting to publish a report into a deleted or archiving workspace."""
+    """Raised when attempting to publish a report into a deleted workspace."""
 
 
 async def insert_publication(
@@ -235,9 +235,9 @@ async def insert_publication(
             )
             ws_row = await cur.fetchone()
             ws_status = str((ws_row or {}).get("status") or "").strip().lower()
-            if ws_row is None or ws_status in ("deleted", "archiving", "archived"):
+            if ws_row is None or ws_status == "deleted":
                 raise WorkspaceUnavailableForPublishError(
-                    f"工作区 {workspace_id} 已删除或正在归档（status={ws_status or 'missing'}），禁止发布研报。"
+                    f"工作区 {workspace_id} 已删除（status={ws_status or 'missing'}），禁止发布研报。"
                 )
 
             # Check idempotency if already inserted for this publish_request_id

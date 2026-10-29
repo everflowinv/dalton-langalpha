@@ -716,4 +716,90 @@ describe('chatDrafts storage module & ChatInput composer drafts', () => {
     setItemSpy.mockRestore();
     removeItemSpy.mockRestore();
   });
+
+  it('shows notice when restoring an unconfirmed in-flight draft, hides it on ordinary drafts, and dismisses it on edit or send', async () => {
+    const noticeText =
+      'Your last send may already have gone through. Check the conversation before sending it again.';
+
+    // 1. Ordinary draft (typed, never sent) -> no notice on mount or after remount
+    const ordinary = renderComposer({ draftKey: 'thread:ordinary' }, { userId: 'u-1' });
+    fireEvent.change(ordinary.getTextarea(), {
+      target: { value: 'ordinary unsent draft', selectionStart: 21 },
+    });
+    expect(screen.queryByTestId('in-flight-draft-notice')).toBeNull();
+    ordinary.unmount();
+
+    const ordinaryRemounted = renderComposer({ draftKey: 'thread:ordinary' }, { userId: 'u-1' });
+    expect(ordinaryRemounted.getTextarea().value).toBe('ordinary unsent draft');
+    expect(screen.queryByTestId('in-flight-draft-notice')).toBeNull();
+    ordinaryRemounted.unmount();
+
+    // 2. In-flight draft restored after reload/remount before onAccepted -> notice appears, disappears on edit
+    const pendingSend = new Promise<boolean>(() => {});
+    const onSendPending = vi.fn<ChatInputProps['onSend']>().mockReturnValue(pendingSend);
+    const inFlightView = renderComposer(
+      { draftKey: 'thread:in-flight-edit', onSend: onSendPending },
+      { userId: 'u-1' },
+    );
+    fireEvent.change(inFlightView.getTextarea(), {
+      target: { value: 'message sent before reload', selectionStart: 26 },
+    });
+    fireEvent.click(screen.getByLabelText('Send message'));
+    expect(inFlightView.getTextarea().value).toBe('');
+    expect(screen.queryByTestId('in-flight-draft-notice')).toBeNull();
+    inFlightView.unmount();
+
+    const restoredForEdit = renderComposer(
+      { draftKey: 'thread:in-flight-edit' },
+      { userId: 'u-1' },
+    );
+    expect(restoredForEdit.getTextarea().value).toBe('message sent before reload');
+    expect(screen.getByTestId('in-flight-draft-notice').textContent).toBe(noticeText);
+
+    // Editing the restored draft dismisses the notice immediately and demotes it to an ordinary draft
+    fireEvent.change(restoredForEdit.getTextarea(), {
+      target: { value: 'message sent before reload (edited)', selectionStart: 35 },
+    });
+    expect(screen.queryByTestId('in-flight-draft-notice')).toBeNull();
+    restoredForEdit.unmount();
+
+    const afterEditRemount = renderComposer(
+      { draftKey: 'thread:in-flight-edit' },
+      { userId: 'u-1' },
+    );
+    expect(afterEditRemount.getTextarea().value).toBe('message sent before reload (edited)');
+    expect(screen.queryByTestId('in-flight-draft-notice')).toBeNull();
+    afterEditRemount.unmount();
+
+    // 3. In-flight draft restored -> disappears when sent
+    const inFlightForSend = renderComposer(
+      { draftKey: 'thread:in-flight-send', onSend: onSendPending },
+      { userId: 'u-1' },
+    );
+    fireEvent.change(inFlightForSend.getTextarea(), {
+      target: { value: 'message to resend after reload', selectionStart: 30 },
+    });
+    fireEvent.click(screen.getByLabelText('Send message'));
+    inFlightForSend.unmount();
+
+    const onSendAccept = vi.fn<ChatInputProps['onSend']>().mockImplementation(
+      (_m, _a, _s, opts) => {
+        opts.onAccepted?.();
+        return true;
+      },
+    );
+    const restoredForSend = renderComposer(
+      { draftKey: 'thread:in-flight-send', onSend: onSendAccept },
+      { userId: 'u-1' },
+    );
+    expect(restoredForSend.getTextarea().value).toBe('message to resend after reload');
+    expect(screen.getByTestId('in-flight-draft-notice').textContent).toBe(noticeText);
+
+    fireEvent.click(screen.getByLabelText('Send message'));
+    expect(onSendAccept).toHaveBeenCalledTimes(1);
+    expect(restoredForSend.getTextarea().value).toBe('');
+    expect(screen.queryByTestId('in-flight-draft-notice')).toBeNull();
+    expect(load('thread:in-flight-send', 'u-1')).toBe('');
+    restoredForSend.unmount();
+  });
 });

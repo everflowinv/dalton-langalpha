@@ -2098,7 +2098,8 @@
       "chartAlt": "图表",
       "send": "发送消息",
       "dropFiles": "拖放文件以上传",
-      "uploading": "上传中"
+      "uploading": "上传中",
+      "inFlightDraftRestored": "上次发送可能已被受理，发送前请先确认对话里是否已经有这条消息。"
     },
     "mention": {
       "noMatching": "无匹配文件",

@@ -68,3 +68,5 @@ tests/unit/mcp_servers/test_yf_fundamentals_null.py
 # P7/A6: plugin JSON budget helper and unit tests.
 src/dalton/plugin_json_budget.py
 tests/unit/server/services/test_plugin_json_budget.py
+# P8: workspace status guard in dalton publications DB layer.
+tests/unit/server/database/test_dalton_publications.py

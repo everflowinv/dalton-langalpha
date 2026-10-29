@@ -2104,7 +2104,8 @@
       "chartAlt": "Chart",
       "send": "Send message",
       "dropFiles": "Drop files to upload",
-      "uploading": "Uploading"
+      "uploading": "Uploading",
+      "inFlightDraftRestored": "Your last send may already have gone through. Check the conversation before sending it again."
     },
     "mention": {
       "noMatching": "No matching files",
