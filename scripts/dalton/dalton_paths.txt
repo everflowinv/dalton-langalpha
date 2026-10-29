@@ -63,3 +63,6 @@ tests/unit/ptc_agent/core/sandbox/test_import_name_package_map.py
 web/src/pages/Onboarding/__tests__/deployedTasks.dalton.test.ts
 # Batch 5/F: yfinance fundamentals missing-value output contract (null, not "N/A").
 tests/unit/mcp_servers/test_yf_fundamentals_null.py
+# Backlog A1a: direct upload storage safety (MinIO init script & audio storage guide).
+scripts/dalton/configure_minio.sh
+docs/dalton/dev-guide/AUDIO-STORAGE.md

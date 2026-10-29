@@ -10,6 +10,7 @@ set of pulls running here only bounds how many this worker takes on.
 from __future__ import annotations
 
 import asyncio
+from contextlib import AsyncExitStack
 import logging
 import random
 import shlex
@@ -24,6 +25,10 @@ from ptc_agent.core.paths import TRANSIENT_ROOT_PREFIX
 from ptc_agent.core.sandbox.retry import RetryPolicy
 from src.config.settings import get_conversation_pool_max
 from src.server.database import workspace_file_uploads as db
+# --- DALTON-HOOK(direct-upload-safety): begin ---
+from src.server.database.home_workspace import is_unbound
+from src.server.database.workspace import get_workspace as db_get_workspace
+# --- DALTON-HOOK(direct-upload-safety): end ---
 from src.server.database.workspace_file import WorkspaceSyncBusy, workspace_sync_lock
 from src.server.models.workspace import served_from_mirror
 from src.server.services.background_starts import schedule_start
@@ -255,6 +260,25 @@ class _ClaimLost(Exception):
     """Another attempt holds the row now; this one records nothing."""
 
 
+# --- DALTON-HOOK(direct-upload-safety): begin ---
+class _DeferUntilRunning(Exception):
+    """A resuming pull whose computer is not running yet; deferred without
+    starting the computer until a later pass finds it running."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.message = message
+
+
+def _pending_running_detail(workspace: dict[str, Any]) -> str:
+    status = workspace.get("status") or "stopped"
+    return (
+        f"Upload recovery is pending because the workspace is {status}; "
+        "it will be settled when the computer is running."
+    )
+# --- DALTON-HOOK(direct-upload-safety): end ---
+
+
 def launch_pull(row: dict[str, Any]) -> None:
     # Keyed by the attempt: a claim this worker's sweep takes over from a pull
     # of its own whose renewals failed has to start, not be deduplicated
@@ -334,6 +358,16 @@ async def pull_upload(row: dict[str, Any]) -> None:
         logger.warning(f"Upload {upload_id} refused at pull: {e.message}")
         await _end_pull(upload_id, attempt, state="failed", error=e.message)
         return
+    # --- DALTON-HOOK(direct-upload-safety): begin ---
+    except _DeferUntilRunning as e:
+        logger.info(
+            f"Upload {upload_id} pull {attempt} deferred until computer is running: {e.message}"
+        )
+        await db.release_pull(
+            upload_id, attempt, retry_in=_RETRY_STEP, refund=True, error=e.message
+        )
+        return
+    # --- DALTON-HOOK(direct-upload-safety): end ---
     except WorkspaceSyncBusy:
         # A backup or a restore held the folder past the wait: nothing was
         # tried, so nothing is counted.
@@ -376,14 +410,31 @@ async def _end_pull(
 async def _pull_once(row: dict[str, Any], held: dict[str, Any]) -> None:
     workspace_id, user_id = row["workspace_id"], row["user_id"]
     size = int(row["size"])
+    # --- DALTON-HOOK(direct-upload-safety): begin ---
+    placed_inode = row.get("placing_inode")
+    resuming = placed_inode is not None
+    initial_refusal: _Refused | None = None
+    # --- DALTON-HOOK(direct-upload-safety): end ---
     try:
         # DALTON-HOOK(workspace-sharing-settings): allow rw colleague pull and reject revoked access
         current = await owned_workspace_on_computer(workspace_id, user_id, need="write")
     except HTTPException as e:
         # Deleted, or no longer this user's: nothing will take the file.
         if e.status_code in (400, 403, 404):
-            raise _Refused(UPLOAD_FAILED) from None
-        raise
+            # --- DALTON-HOOK(direct-upload-safety): begin ---
+            if not resuming:
+                raise _Refused(UPLOAD_FAILED) from None
+            initial_refusal = _Refused(UPLOAD_FAILED)
+            current = await db_get_workspace(workspace_id)
+            if not current or current.get("status") == "deleted" or is_unbound(current):
+                raise _Refused(UPLOAD_FAILED) from None
+            # --- DALTON-HOOK(direct-upload-safety): end ---
+        else:
+            raise
+    # --- DALTON-HOOK(direct-upload-safety): begin ---
+    if not current or current.get("status") == "deleted" or is_unbound(current):
+        raise _Refused(UPLOAD_FAILED)
+    # --- DALTON-HOOK(direct-upload-safety): end ---
     # --- DALTON-HOOK(workspace-sharing-settings): begin ---
     is_non_owner = current.get("user_id") != user_id
     sandbox_owner_id = str(current.get("user_id") or user_id)
@@ -391,11 +442,39 @@ async def _pull_once(row: dict[str, Any], held: dict[str, Any]) -> None:
     # Stopped since the upload began: it fails as the one-request path would
     # refuse it, rather than starting the computer again under its owner.
     if served_from_mirror(current.get("status")):
+        # --- DALTON-HOOK(direct-upload-safety): begin ---
+        if resuming:
+            raise _DeferUntilRunning(_pending_running_detail(current))
+        # --- DALTON-HOOK(direct-upload-safety): end ---
         raise _Refused(not_running_for_upload(current).detail)
-    async with acquire_sandbox_to_change(workspace_id, sandbox_owner_id) as (sandbox, workspace):
+    # --- DALTON-HOOK(direct-upload-safety): begin ---
+    async with AsyncExitStack() as acquire_stack:
+        try:
+            sandbox, workspace = await acquire_stack.enter_async_context(
+                acquire_sandbox_to_change(workspace_id, sandbox_owner_id)
+            )
+        except HTTPException as e:
+            if e.status_code in (400, 403, 404):
+                raise _Refused(UPLOAD_FAILED) from None
+            if e.status_code == 503:
+                ws_now = await db_get_workspace(workspace_id)
+                if not ws_now or ws_now.get("status") == "deleted":
+                    raise _Refused(UPLOAD_FAILED) from None
+                if resuming and served_from_mirror(ws_now.get("status")):
+                    raise _DeferUntilRunning(_pending_running_detail(ws_now)) from None
+            raise
+        except (RuntimeError, ValueError) as e:
+            msg = str(e).lower()
+            if "deleted" in msg or "not found" in msg:
+                raise _Refused(UPLOAD_FAILED) from None
+            raise
+        if not workspace or workspace.get("status") == "deleted":
+            raise _Refused(UPLOAD_FAILED)
+        # --- DALTON-HOOK(direct-upload-safety): end ---
         held["sandbox"] = sandbox
         layout = owner_layout(workspace)
         work_dir = layout.workspace
+        staged = f"{_STAGING_PREFIX}{row['upload_id']}"
         # Resolved again rather than trusted from the start: the folder may
         # have been renamed since, or a link made on the way to the file.
         try:
@@ -403,10 +482,14 @@ async def _pull_once(row: dict[str, Any], held: dict[str, Any]) -> None:
                 sandbox, row["path"], work_dir, previous_dir_names_of(workspace)
             )
         except HTTPException:
+            # --- DALTON-HOOK(direct-upload-safety): begin ---
+            if resuming:
+                await _remove(sandbox, f"{work_dir.rstrip('/')}/{staged}")
+            # --- DALTON-HOOK(direct-upload-safety): end ---
             raise _Refused(UPLOAD_FAILED) from None
         rel = target[len(work_dir.rstrip("/")) + 1 :]
         # --- DALTON-HOOK(workspace-sharing-settings): begin ---
-        if is_non_owner:
+        if is_non_owner and not resuming:
             from src.server.app.workspace_files._shared import (
                 _is_non_owner_blocked_path,
                 _virtual_file,
@@ -415,7 +498,6 @@ async def _pull_once(row: dict[str, Any], held: dict[str, Any]) -> None:
             if _is_non_owner_blocked_path(rel) or _virtual_file(rel):
                 raise _Refused(UPLOAD_FAILED)
         # --- DALTON-HOOK(workspace-sharing-settings): end ---
-        staged = f"{_STAGING_PREFIX}{row['upload_id']}"
         item: dict[str, Any] = {"kind": "file", "size": size, "mode": 0o644}
         if row.get("sha256"):
             item["sha256"] = row["sha256"]
@@ -426,8 +508,6 @@ async def _pull_once(row: dict[str, Any], held: dict[str, Any]) -> None:
             # An earlier attempt began moving the file into place and its end
             # was never recorded: the folder settles it, since placing the file
             # again would write over whatever was done to it since.
-            placed_inode = row.get("placing_inode")
-            resuming = placed_inode is not None
             found = await _clear_staging(
                 sandbox,
                 work_dir,
@@ -439,6 +519,11 @@ async def _pull_once(row: dict[str, Any], held: dict[str, Any]) -> None:
                 return
             if resuming and found != "staged":
                 raise _Refused(UPLOAD_FAILED)
+            # --- DALTON-HOOK(direct-upload-safety): begin ---
+            if initial_refusal is not None:
+                await _remove(sandbox, f"{work_dir.rstrip('/')}/{staged}")
+                raise initial_refusal
+            # --- DALTON-HOOK(direct-upload-safety): end ---
             if not resuming:
                 # Measured after the sweep, which an earlier attempt's partial
                 # or unplaced copy would otherwise count against.
@@ -464,6 +549,68 @@ async def _pull_once(row: dict[str, Any], held: dict[str, Any]) -> None:
                 raise _ClaimLost
             held["placing"] = True
             async with sandbox.path_write_lock(sandbox.normalize_path(target)):
+                # --- DALTON-HOOK(direct-upload-safety): begin ---
+                try:
+                    if initial_refusal is not None:
+                        raise initial_refusal
+                    try:
+                        current_now = await owned_workspace_on_computer(
+                            workspace_id, user_id, need="write"
+                        )
+                    except HTTPException as e:
+                        if e.status_code in (400, 403, 404):
+                            raise _Refused(UPLOAD_FAILED) from None
+                        raise
+                    if (
+                        not current_now
+                        or current_now.get("status") == "deleted"
+                        or is_unbound(current_now)
+                    ):
+                        raise _Refused(UPLOAD_FAILED)
+                    if served_from_mirror(current_now.get("status")):
+                        raise _Refused(not_running_for_upload(current_now).detail)
+                    owner_now = str(current_now.get("user_id") or user_id)
+                    if owner_now != sandbox_owner_id:
+                        raise _Refused(UPLOAD_FAILED)
+                    if (
+                        workspace.get("user_id") is not None
+                        and current_now.get("user_id") is not None
+                        and str(workspace.get("user_id")) != str(current_now.get("user_id"))
+                    ):
+                        raise _Refused(UPLOAD_FAILED)
+                    if (
+                        workspace.get("computer_id") is not None
+                        and current_now.get("computer_id") is not None
+                        and str(workspace.get("computer_id"))
+                        != str(current_now.get("computer_id"))
+                    ):
+                        raise _Refused(UPLOAD_FAILED)
+                    try:
+                        target_now = await contained_target(
+                            sandbox, row["path"], work_dir, previous_dir_names_of(workspace)
+                        )
+                    except HTTPException:
+                        raise _Refused(UPLOAD_FAILED) from None
+                    rel_now = target_now[len(work_dir.rstrip("/")) + 1 :]
+                    if not rel_now:
+                        raise _Refused(UPLOAD_FAILED)
+                    from src.server.app.workspace_files._shared import (
+                        _is_non_owner_blocked_path,
+                        _virtual_file,
+                    )
+
+                    if _virtual_file(rel_now):
+                        raise _Refused(UPLOAD_FAILED)
+                    is_non_owner_now = is_non_owner or (current_now.get("user_id") != user_id)
+                    if is_non_owner_now and _is_non_owner_blocked_path(rel_now):
+                        raise _Refused(UPLOAD_FAILED)
+                    if target_now != target:
+                        raise _Refused(UPLOAD_FAILED)
+                except _Refused:
+                    held["placing"] = False
+                    await _remove(sandbox, f"{work_dir.rstrip('/')}/{staged}")
+                    raise
+                # --- DALTON-HOOK(direct-upload-safety): end ---
                 placed = await pull_direct(
                     sandbox, [{**item, "path": rel, "file": staged}], layout=layout
                 )

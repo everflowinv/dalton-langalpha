@@ -184,3 +184,35 @@ async def test_room_is_counted_across_the_workspaces_on_one_computer(
 
     await _upload(user_id, beside, size=500, free_bytes=1150, keep_free_bytes=50)
     await _upload(user_id, elsewhere, size=500, free_bytes=600, keep_free_bytes=50)
+
+
+# === DALTON-HOOK(direct-upload-safety): computer-level space reservation across uploaders ===
+
+
+async def test_two_uploaders_on_the_same_computer_cannot_exceed_free_space_concurrently(
+    seed_user, test_db_pool
+):
+    import asyncio
+
+    owner_id = seed_user["user_id"]
+    colleague_id = (
+        await create_user(
+            user_id=f"{owner_id}-colleague",
+            email="colleague@example.com",
+            name="Colleague",
+        )
+    )["user_id"]
+    _, workspace_id = await _setup(owner_id)
+
+    outcomes = await asyncio.gather(
+        _upload(owner_id, workspace_id, size=600, free_bytes=1000, keep_free_bytes=100),
+        _upload(colleague_id, workspace_id, size=600, free_bytes=1000, keep_free_bytes=100),
+        return_exceptions=True,
+    )
+    created = [o for o in outcomes if isinstance(o, str)]
+    refused = [o for o in outcomes if isinstance(o, db.NotEnoughRoom)]
+    assert len(created) == 1
+    assert len(refused) == 1
+    assert refused[0].free_bytes == 400
+# === END DALTON-HOOK(direct-upload-safety) ===
+

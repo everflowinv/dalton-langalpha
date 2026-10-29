@@ -65,3 +65,47 @@ services:
     volumes:
       - ./deploy/dalton/Caddyfile:/etc/caddy/Caddyfile:ro
       - ./web/dist:/srv:ro
+
+  minio:
+    profiles: ["storage"]
+    # MinIO no longer publishes community images (Docker Hub / Quay refuse the
+    # pull); Chainguard's free build is pinned by digest. A copy is saved with
+    # `docker save` in the backups so a garbage-collected digest is recoverable.
+    image: ${DALTON_MINIO_IMAGE:-cgr.dev/chainguard/minio@sha256:e70b2b1e74d79457f808710483bd726ff364529ca30736eaa15a6ab547d3a5a7}
+    # Require explicit root credentials when the `storage` profile starts MinIO,
+    # without breaking `docker compose config` or non-storage services when unset.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        if [ -z "$${MINIO_ROOT_USER:-}" ] || [ -z "$${MINIO_ROOT_PASSWORD:-}" ]; then
+          echo "ERROR: MINIO_ROOT_USER and MINIO_ROOT_PASSWORD (or STORAGE_ACCESS_KEY_ID / STORAGE_SECRET_ACCESS_KEY) must be set." >&2
+          exit 1
+        fi
+        exec minio "$$@"
+      - --
+    command: ["server", "/data", "--console-address", ":9001"]
+    restart: unless-stopped
+    mem_limit: ${DALTON_MINIO_MEM_LIMIT:-512m}
+    memswap_limit: ${DALTON_MINIO_MEM_LIMIT:-512m}
+    ports:
+      - "127.0.0.1:${DALTON_MINIO_PORT:-9000}:9000"
+      - "127.0.0.1:${DALTON_MINIO_CONSOLE_PORT:-9001}:9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-${STORAGE_ACCESS_KEY_ID:-}}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-${STORAGE_SECRET_ACCESS_KEY:-}}
+      MINIO_API_CORS_ALLOW_ORIGIN: ${MINIO_API_CORS_ALLOW_ORIGIN:-${DALTON_CORS_ALLOWED_ORIGINS:-}}
+      MINIO_API_STALE_UPLOADS_EXPIRY: ${MINIO_API_STALE_UPLOADS_EXPIRY:-24h}
+      MINIO_API_STALE_UPLOADS_CLEANUP_INTERVAL: ${MINIO_API_STALE_UPLOADS_CLEANUP_INTERVAL:-6h}
+    volumes:
+      - dalton-minio-data:/data
+    healthcheck:
+      # The image has bash but no curl / wget / grep.
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/9000 && printf 'GET /minio/health/live HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n' >&3 && read -r line <&3 && [[ \"$$line\" == *\" 200 \"* ]]"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  dalton-minio-data:

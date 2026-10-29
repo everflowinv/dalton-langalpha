@@ -343,6 +343,12 @@ def _sandbox_pull(
             "owned_workspace_on_computer",
             AsyncMock(return_value={"workspace_id": "ws-1", "status": "running"}),
         ),
+        # DALTON-HOOK(direct-upload-safety): default workspace row for resume owner/status lookup
+        patch.object(
+            upload_pull,
+            "db_get_workspace",
+            AsyncMock(return_value={"workspace_id": "ws-1", "user_id": "owner-1", "status": "running"}),
+        ),
         patch.object(upload_pull, "acquire_sandbox_to_change", acquire),
         patch.object(upload_pull, "owner_layout", MagicMock(return_value=layout)),
         patch.object(upload_pull, "previous_dir_names_of", MagicMock(return_value=())),
@@ -905,3 +911,664 @@ async def test_one_row_that_raises_does_not_stop_the_sweep():
     assert [c.args[0]["upload_id"] for c in assemble.await_args_list] == ["a", "b"]
     assert [c.args[0]["upload_id"] for c in launch.call_args_list] == ["p", "q"]
     assert [c.args[0]["upload_id"] for c in clean.await_args_list] == ["x", "y"]
+
+
+# === DALTON-HOOK(direct-upload-safety): write-access re-verification before final placement ===
+from fastapi import HTTPException
+
+
+@pytest.mark.asyncio
+async def test_write_access_revoked_during_download_refuses_and_cleans_staged_and_store():
+    """If write permission is revoked while the sandbox is downloading the
+    object into staging, the re-check inside path_write_lock refuses placement,
+    deletes the staged copy, marks the upload failed, and cleans the store."""
+    from contextlib import ExitStack
+    from unittest.mock import create_autospec
+
+    events: list = []
+    ws_row = {"workspace_id": "ws-1", "status": "running", "user_id": "owner-1"}
+    check_access = create_autospec(
+        upload_pull.owned_workspace_on_computer,
+        side_effect=[
+            ws_row,
+            HTTPException(status_code=403, detail="Workspace write access revoked"),
+        ],
+    )
+    finish = create_autospec(
+        upload_pull.db.finish_pull,
+        return_value=_row(state="failed", error="Workspace write access revoked"),
+    )
+    release = create_autospec(upload_pull.db.release_pull, return_value=True)
+    delete_obj = create_autospec(upload_pull.delete_object, return_value=True)
+    abort_mp = create_autospec(upload_pull.abort_multipart_upload, return_value=True)
+    mark_cleaned = create_autospec(upload_pull.db.mark_cleaned, return_value=None)
+
+    with ExitStack() as stack:
+        for p in _sandbox_pull({"status": "ok"}, events=events):
+            stack.enter_context(p)
+        stack.enter_context(patch.object(upload_pull, "owned_workspace_on_computer", check_access))
+        stack.enter_context(patch.object(upload_pull.db, "finish_pull", finish))
+        stack.enter_context(patch.object(upload_pull.db, "release_pull", release))
+        stack.enter_context(patch.object(upload_pull, "delete_object", delete_obj))
+        stack.enter_context(patch.object(upload_pull, "abort_multipart_upload", abort_mp))
+        stack.enter_context(patch.object(upload_pull.db, "mark_cleaned", mark_cleaned))
+
+        await pull_upload(_row(state="pulling", attempts=1))
+
+    assert check_access.await_count == 2
+    assert ("place", "data/big.bin", STAGED) not in events
+    assert ("remove", f"rm -f -- /home/u/Research/{STAGED}") in events
+    finish.assert_awaited_once_with(
+        UPLOAD_ID, 1, state="failed", error=UPLOAD_FAILED
+    )
+    release.assert_not_awaited()
+    delete_obj.assert_called_once_with(_row()["object_key"])
+    mark_cleaned.assert_awaited_once_with(UPLOAD_ID)
+
+
+@pytest.mark.asyncio
+async def test_write_access_revoked_while_waiting_for_path_lock_refuses_without_placing():
+    """Permission re-verification runs strictly inside path_write_lock so a
+    revocation that lands while waiting on the lock still aborts before rename."""
+    from contextlib import ExitStack, asynccontextmanager
+    from unittest.mock import create_autospec
+
+    events: list = []
+    lock_entered = False
+    ws_row = {"workspace_id": "ws-1", "status": "running", "user_id": "owner-1"}
+
+    async def verify_access(workspace_id: str, user_id: str, *, need: str = "read"):
+        events.append(("check_access", lock_entered, user_id, need))
+        if lock_entered:
+            raise HTTPException(status_code=403, detail="Revoked while awaiting path lock")
+        return ws_row
+
+    check_access = create_autospec(
+        upload_pull.owned_workspace_on_computer, side_effect=verify_access
+    )
+    finish = create_autospec(
+        upload_pull.db.finish_pull,
+        return_value=_row(state="failed", error=UPLOAD_FAILED),
+    )
+    release = create_autospec(upload_pull.db.release_pull, return_value=True)
+    clean = create_autospec(upload_pull.clean_up, return_value=None)
+
+    with ExitStack() as stack:
+        for p in _sandbox_pull({"status": "ok"}, events=events):
+            stack.enter_context(p)
+
+        @asynccontextmanager
+        async def path_lock_recording(path):
+            nonlocal lock_entered
+            events.append(("lock", path))
+            lock_entered = True
+            yield
+            events.append(("unlock", path))
+
+        # Patch the sandbox's path_write_lock via acquire_sandbox_to_change
+        orig_acquire = upload_pull.acquire_sandbox_to_change
+
+        @asynccontextmanager
+        async def acquire_wrapped(*args):
+            async with orig_acquire(*args) as (sb, ws):
+                sb.path_write_lock = path_lock_recording
+                yield sb, ws
+
+        stack.enter_context(patch.object(upload_pull, "acquire_sandbox_to_change", acquire_wrapped))
+        stack.enter_context(patch.object(upload_pull, "owned_workspace_on_computer", check_access))
+        stack.enter_context(patch.object(upload_pull.db, "finish_pull", finish))
+        stack.enter_context(patch.object(upload_pull.db, "release_pull", release))
+        stack.enter_context(patch.object(upload_pull, "clean_up", clean))
+
+        await pull_upload(_row(state="pulling", attempts=1))
+
+    assert ("check_access", False, "user-1", "write") in events
+    assert ("check_access", True, "user-1", "write") in events
+    assert events.index(("lock", TARGET)) < events.index(
+        ("check_access", True, "user-1", "write")
+    )
+    assert ("place", "data/big.bin", STAGED) not in events
+    assert ("remove", f"rm -f -- /home/u/Research/{STAGED}") in events
+    finish.assert_awaited_once_with(
+        UPLOAD_ID, 1, state="failed", error=UPLOAD_FAILED
+    )
+    release.assert_not_awaited()
+    clean.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_code", [403, 404, 400])
+@pytest.mark.parametrize("revoked_at", ["before-retry", "inside-lock"])
+async def test_write_access_revoked_on_staged_retry_refuses_and_removes_staged_copy(
+    status_code, revoked_at
+):
+    """When a previous attempt crashed after staging (placing_inode set,
+    found == 'staged'), a retry after write access was revoked (403, hidden 404,
+    or 400) must acquire under the workspace owner, must not place the staged
+    file, must delete the staged file, and must fail without further retries."""
+    from contextlib import ExitStack, asynccontextmanager
+    from unittest.mock import create_autospec
+
+    events: list = []
+    acquired_for: list[tuple[str, str]] = []
+    ws_row = {"workspace_id": "ws-1", "status": "running", "user_id": "owner-1"}
+    err = HTTPException(status_code=status_code, detail="Access refused on staged retry")
+    side_effects = [err, err] if revoked_at == "before-retry" else [ws_row, err]
+    check_access = create_autospec(
+        upload_pull.owned_workspace_on_computer, side_effect=side_effects
+    )
+    get_ws = create_autospec(upload_pull.db_get_workspace, return_value=ws_row)
+    finish = create_autospec(
+        upload_pull.db.finish_pull,
+        return_value=_row(state="failed", error=UPLOAD_FAILED),
+    )
+    release = create_autospec(upload_pull.db.release_pull, return_value=True)
+    clean = create_autospec(upload_pull.clean_up, return_value=None)
+
+    row = _row(state="pulling", attempts=2, placing_inode=INODE)
+    with ExitStack() as stack:
+        for p in _sandbox_pull({"status": "ok"}, events=events, found="staged"):
+            stack.enter_context(p)
+        orig_acquire = upload_pull.acquire_sandbox_to_change
+
+        @asynccontextmanager
+        async def acquire_recording(ws_id: str, owner_id: str):
+            acquired_for.append((ws_id, owner_id))
+            async with orig_acquire(ws_id, owner_id) as (sb, ws):
+                yield sb, ws
+
+        stack.enter_context(patch.object(upload_pull, "acquire_sandbox_to_change", acquire_recording))
+        stack.enter_context(patch.object(upload_pull, "owned_workspace_on_computer", check_access))
+        stack.enter_context(patch.object(upload_pull, "db_get_workspace", get_ws))
+        stack.enter_context(patch.object(upload_pull.db, "finish_pull", finish))
+        stack.enter_context(patch.object(upload_pull.db, "release_pull", release))
+        stack.enter_context(patch.object(upload_pull, "clean_up", clean))
+
+        await pull_upload(row)
+
+    assert acquired_for == [("ws-1", "owner-1")]
+    assert ("place", "data/big.bin", STAGED) not in events
+    assert ("remove", f"rm -f -- /home/u/Research/{STAGED}") in events
+    finish.assert_awaited_once_with(
+        UPLOAD_ID, 2, state="failed", error=UPLOAD_FAILED
+    )
+    release.assert_not_awaited()
+    clean.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_code", [403, 404, 400])
+async def test_already_placed_file_recovery_succeeds_even_if_write_access_later_revoked(
+    tmp_path, status_code
+):
+    """If an earlier attempt already renamed the staged file into target before
+    crashing (found == 'placed'), recovery only confirms the inode and marks
+    the upload done—it must not fail or delete the legally placed file even if
+    the uploader's permission was subsequently revoked (403, hidden 404, or 400)."""
+    from contextlib import ExitStack, asynccontextmanager
+    from unittest.mock import create_autospec
+
+    from src.server.services.workspace_upload_pull import _inode_of
+
+    (tmp_path / "data").mkdir()
+    target = tmp_path / "data" / "big.bin"
+    staged = tmp_path / STAGED
+    staged.write_bytes(b"legally-placed-audio")
+    sandbox = _shell_sandbox()
+    inode = await _inode_of(sandbox, str(staged))
+    staged.replace(target)
+
+    ws_row = {"workspace_id": "ws-1", "user_id": "owner-1", "status": "running"}
+    check_access = create_autospec(
+        upload_pull.owned_workspace_on_computer,
+        side_effect=HTTPException(status_code=status_code, detail="Access revoked after placement"),
+    )
+    get_ws = create_autospec(upload_pull.db_get_workspace, return_value=ws_row)
+    finish = create_autospec(
+        upload_pull.db.finish_pull, return_value=_row(state="done")
+    )
+    release = create_autospec(upload_pull.db.release_pull, return_value=True)
+    clean = create_autospec(upload_pull.clean_up, return_value=None)
+    acquired_for: list[tuple[str, str]] = []
+
+    @asynccontextmanager
+    async def acquire(ws_id: str, owner_id: str):
+        acquired_for.append((ws_id, owner_id))
+        yield sandbox, ws_row
+
+    @asynccontextmanager
+    async def sync_lock(_ws_id):
+        yield None
+
+    layout = MagicMock(workspace=str(tmp_path))
+    row = _row(state="pulling", attempts=2, placing_inode=inode)
+    with ExitStack() as stack:
+        stack.enter_context(patch.object(upload_pull, "owned_workspace_on_computer", check_access))
+        stack.enter_context(patch.object(upload_pull, "db_get_workspace", get_ws))
+        stack.enter_context(patch.object(upload_pull, "acquire_sandbox_to_change", acquire))
+        stack.enter_context(patch.object(upload_pull, "owner_layout", MagicMock(return_value=layout)))
+        stack.enter_context(patch.object(upload_pull, "previous_dir_names_of", MagicMock(return_value=())))
+        stack.enter_context(
+            patch.object(
+                upload_pull,
+                "contained_target",
+                create_autospec(upload_pull.contained_target, return_value=str(target)),
+            )
+        )
+        stack.enter_context(patch.object(upload_pull, "workspace_sync_lock", sync_lock))
+        stack.enter_context(patch.object(upload_pull.db, "finish_pull", finish))
+        stack.enter_context(patch.object(upload_pull.db, "release_pull", release))
+        stack.enter_context(patch.object(upload_pull, "clean_up", clean))
+
+        await pull_upload(row)
+
+    assert acquired_for == [("ws-1", "owner-1")]
+    assert target.exists()
+    assert target.read_bytes() == b"legally-placed-audio"
+    finish.assert_awaited_once_with(UPLOAD_ID, 2, state="done", error=None)
+    release.assert_not_awaited()
+    clean.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_code", [403, 404, 400])
+@pytest.mark.parametrize("ws_status", ["stopped", "stopping", "starting"])
+async def test_revoked_access_on_stopped_computer_does_not_start_computer_on_resume(
+    status_code, ws_status
+):
+    """When write access was revoked (403, hidden 404, or 400) and the
+    workspace's computer is stopped / stopping / starting, resume must neither
+    wake the computer nor mark the upload terminally failed; it defers with a
+    refunded attempt until the computer is running."""
+    from contextlib import ExitStack
+    from unittest.mock import create_autospec
+
+    non_running_ws = {"workspace_id": "ws-1", "user_id": "owner-1", "status": ws_status}
+    check_access = create_autospec(
+        upload_pull.owned_workspace_on_computer,
+        side_effect=HTTPException(status_code=status_code, detail="Access revoked"),
+    )
+    get_ws = create_autospec(upload_pull.db_get_workspace, return_value=non_running_ws)
+    acquired = create_autospec(upload_pull.acquire_sandbox_to_change)
+    finish = create_autospec(upload_pull.db.finish_pull)
+    release = create_autospec(upload_pull.db.release_pull, return_value=True)
+    clean = create_autospec(upload_pull.clean_up, return_value=None)
+
+    row = _row(state="pulling", attempts=2, placing_inode=INODE)
+    with ExitStack() as stack:
+        for p in _sandbox_pull({"status": "ok"}):
+            stack.enter_context(p)
+        stack.enter_context(patch.object(upload_pull, "owned_workspace_on_computer", check_access))
+        stack.enter_context(patch.object(upload_pull, "db_get_workspace", get_ws))
+        stack.enter_context(patch.object(upload_pull, "acquire_sandbox_to_change", acquired))
+        stack.enter_context(patch.object(upload_pull.db, "finish_pull", finish))
+        stack.enter_context(patch.object(upload_pull.db, "release_pull", release))
+        stack.enter_context(patch.object(upload_pull, "clean_up", clean))
+
+        await pull_upload(row)
+
+    acquired.assert_not_called()
+    finish.assert_not_awaited()
+    clean.assert_not_awaited()
+    release.assert_awaited_once_with(
+        UPLOAD_ID,
+        2,
+        retry_in=_RETRY_STEP,
+        refund=True,
+        error=upload_pull._pending_running_detail(non_running_ws),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_code", [403, 404, 400])
+async def test_revoked_access_deferred_while_stopped_confirms_done_by_inode_when_running(
+    tmp_path, status_code
+):
+    """After a resuming upload is deferred while the computer is stopped, the
+    next pull once the computer is running confirms an already-placed file by
+    inode and marks the upload done."""
+    from contextlib import ExitStack, asynccontextmanager
+    from unittest.mock import create_autospec
+
+    from src.server.services.workspace_upload_pull import _inode_of
+
+    (tmp_path / "data").mkdir()
+    target = tmp_path / "data" / "big.bin"
+    staged = tmp_path / STAGED
+    staged.write_bytes(b"already-renamed-before-stop")
+    sandbox = _shell_sandbox()
+    inode = await _inode_of(sandbox, str(staged))
+    staged.replace(target)
+
+    stopped_ws = {"workspace_id": "ws-1", "user_id": "owner-1", "status": "stopped"}
+    running_ws = {"workspace_id": "ws-1", "user_id": "owner-1", "status": "running"}
+    check_access = create_autospec(
+        upload_pull.owned_workspace_on_computer,
+        side_effect=HTTPException(status_code=status_code, detail="Access revoked"),
+    )
+    get_ws = create_autospec(
+        upload_pull.db_get_workspace, side_effect=[stopped_ws, running_ws]
+    )
+    finish = create_autospec(
+        upload_pull.db.finish_pull, return_value=_row(state="done")
+    )
+    release = create_autospec(upload_pull.db.release_pull, return_value=True)
+    clean = create_autospec(upload_pull.clean_up, return_value=None)
+    acquired_for: list[tuple[str, str]] = []
+
+    @asynccontextmanager
+    async def acquire(ws_id: str, owner_id: str):
+        acquired_for.append((ws_id, owner_id))
+        yield sandbox, running_ws
+
+    @asynccontextmanager
+    async def sync_lock(_ws_id):
+        yield None
+
+    layout = MagicMock(workspace=str(tmp_path))
+    row = _row(state="pulling", attempts=2, placing_inode=inode)
+    with ExitStack() as stack:
+        stack.enter_context(patch.object(upload_pull, "owned_workspace_on_computer", check_access))
+        stack.enter_context(patch.object(upload_pull, "db_get_workspace", get_ws))
+        stack.enter_context(patch.object(upload_pull, "acquire_sandbox_to_change", acquire))
+        stack.enter_context(patch.object(upload_pull, "owner_layout", MagicMock(return_value=layout)))
+        stack.enter_context(patch.object(upload_pull, "previous_dir_names_of", MagicMock(return_value=())))
+        stack.enter_context(
+            patch.object(
+                upload_pull,
+                "contained_target",
+                create_autospec(upload_pull.contained_target, return_value=str(target)),
+            )
+        )
+        stack.enter_context(patch.object(upload_pull, "workspace_sync_lock", sync_lock))
+        stack.enter_context(patch.object(upload_pull.db, "finish_pull", finish))
+        stack.enter_context(patch.object(upload_pull.db, "release_pull", release))
+        stack.enter_context(patch.object(upload_pull, "clean_up", clean))
+
+        # Pass 1: computer is stopped -> deferred without starting the computer
+        await pull_upload(row)
+        assert acquired_for == []
+        finish.assert_not_awaited()
+        clean.assert_not_awaited()
+        release.assert_awaited_once_with(
+            UPLOAD_ID,
+            2,
+            retry_in=_RETRY_STEP,
+            refund=True,
+            error=upload_pull._pending_running_detail(stopped_ws),
+        )
+
+        # Pass 2: computer is running -> settles by inode as done
+        await pull_upload(row)
+
+    assert acquired_for == [("ws-1", "owner-1")]
+    assert target.exists()
+    assert target.read_bytes() == b"already-renamed-before-stop"
+    finish.assert_awaited_once_with(UPLOAD_ID, 2, state="done", error=None)
+    clean.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_code", [403, 404, 400])
+async def test_revoked_access_deferred_while_stopped_cleans_staging_and_refuses_when_running(
+    tmp_path, status_code
+):
+    """After a resuming upload is deferred while the computer is stopped, the
+    next pull once the computer is running removes the unplaced staged file and
+    refuses the upload according to current permissions."""
+    from contextlib import ExitStack, asynccontextmanager
+    from unittest.mock import create_autospec
+
+    from src.server.services.workspace_upload_pull import _inode_of
+
+    (tmp_path / "data").mkdir()
+    target = tmp_path / "data" / "big.bin"
+    staged = tmp_path / STAGED
+    staged.write_bytes(b"still-in-staging-before-stop")
+    sandbox = _shell_sandbox()
+    inode = await _inode_of(sandbox, str(staged))
+
+    stopped_ws = {"workspace_id": "ws-1", "user_id": "owner-1", "status": "stopped"}
+    running_ws = {"workspace_id": "ws-1", "user_id": "owner-1", "status": "running"}
+    check_access = create_autospec(
+        upload_pull.owned_workspace_on_computer,
+        side_effect=HTTPException(status_code=status_code, detail="Access revoked"),
+    )
+    get_ws = create_autospec(
+        upload_pull.db_get_workspace, side_effect=[stopped_ws, running_ws]
+    )
+    finish = create_autospec(
+        upload_pull.db.finish_pull,
+        return_value=_row(state="failed", error=UPLOAD_FAILED),
+    )
+    release = create_autospec(upload_pull.db.release_pull, return_value=True)
+    clean = create_autospec(upload_pull.clean_up, return_value=None)
+    acquired_for: list[tuple[str, str]] = []
+
+    @asynccontextmanager
+    async def acquire(ws_id: str, owner_id: str):
+        acquired_for.append((ws_id, owner_id))
+        yield sandbox, running_ws
+
+    @asynccontextmanager
+    async def sync_lock(_ws_id):
+        yield None
+
+    layout = MagicMock(workspace=str(tmp_path))
+    row = _row(state="pulling", attempts=2, placing_inode=inode)
+    with ExitStack() as stack:
+        stack.enter_context(patch.object(upload_pull, "owned_workspace_on_computer", check_access))
+        stack.enter_context(patch.object(upload_pull, "db_get_workspace", get_ws))
+        stack.enter_context(patch.object(upload_pull, "acquire_sandbox_to_change", acquire))
+        stack.enter_context(patch.object(upload_pull, "owner_layout", MagicMock(return_value=layout)))
+        stack.enter_context(patch.object(upload_pull, "previous_dir_names_of", MagicMock(return_value=())))
+        stack.enter_context(
+            patch.object(
+                upload_pull,
+                "contained_target",
+                create_autospec(upload_pull.contained_target, return_value=str(target)),
+            )
+        )
+        stack.enter_context(patch.object(upload_pull, "workspace_sync_lock", sync_lock))
+        stack.enter_context(patch.object(upload_pull.db, "finish_pull", finish))
+        stack.enter_context(patch.object(upload_pull.db, "release_pull", release))
+        stack.enter_context(patch.object(upload_pull, "clean_up", clean))
+
+        # Pass 1: computer is stopped -> deferred without starting the computer
+        await pull_upload(row)
+        assert acquired_for == []
+        assert staged.exists()
+        finish.assert_not_awaited()
+        clean.assert_not_awaited()
+        release.assert_awaited_once_with(
+            UPLOAD_ID,
+            2,
+            retry_in=_RETRY_STEP,
+            refund=True,
+            error=upload_pull._pending_running_detail(stopped_ws),
+        )
+
+        # Pass 2: computer is running -> cleans staging and refuses with UPLOAD_FAILED
+        await pull_upload(row)
+
+    assert acquired_for == [("ws-1", "owner-1")]
+    assert not staged.exists()
+    assert not target.exists()
+    finish.assert_awaited_once_with(
+        UPLOAD_ID, 2, state="failed", error=UPLOAD_FAILED
+    )
+    clean.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "deleted_row",
+    [None, {"workspace_id": "ws-1", "user_id": "owner-1", "status": "deleted"}],
+    ids=["missing-row", "status-deleted"],
+)
+async def test_deleted_workspace_on_resume_is_refused_without_acquiring_sandbox(
+    deleted_row,
+):
+    """A 404 caused by a genuinely deleted/missing workspace refuses immediately
+    on resume without attempting to acquire a sandbox."""
+    from contextlib import ExitStack
+    from unittest.mock import create_autospec
+
+    check_access = create_autospec(
+        upload_pull.owned_workspace_on_computer,
+        side_effect=HTTPException(status_code=404, detail="Workspace not found"),
+    )
+    get_ws = create_autospec(upload_pull.db_get_workspace, return_value=deleted_row)
+    acquired = create_autospec(upload_pull.acquire_sandbox_to_change)
+    finish = create_autospec(
+        upload_pull.db.finish_pull,
+        return_value=_row(state="failed", error=UPLOAD_FAILED),
+    )
+    release = create_autospec(upload_pull.db.release_pull, return_value=True)
+    clean = create_autospec(upload_pull.clean_up, return_value=None)
+
+    row = _row(state="pulling", attempts=2, placing_inode=INODE)
+    with ExitStack() as stack:
+        for p in _sandbox_pull({"status": "ok"}):
+            stack.enter_context(p)
+        stack.enter_context(patch.object(upload_pull, "owned_workspace_on_computer", check_access))
+        stack.enter_context(patch.object(upload_pull, "db_get_workspace", get_ws))
+        stack.enter_context(patch.object(upload_pull, "acquire_sandbox_to_change", acquired))
+        stack.enter_context(patch.object(upload_pull.db, "finish_pull", finish))
+        stack.enter_context(patch.object(upload_pull.db, "release_pull", release))
+        stack.enter_context(patch.object(upload_pull, "clean_up", clean))
+
+        await pull_upload(row)
+
+    acquired.assert_not_called()
+    finish.assert_awaited_once_with(
+        UPLOAD_ID, 2, state="failed", error=UPLOAD_FAILED
+    )
+    release.assert_not_awaited()
+    clean.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "acquire_error",
+    [
+        RuntimeError("Workspace ws-1 has been deleted"),
+        ValueError("Workspace ws-1 not found"),
+        HTTPException(status_code=404, detail="Workspace not found"),
+    ],
+    ids=["runtime-deleted", "value-not-found", "http-404"],
+)
+async def test_deleted_workspace_error_during_acquire_is_terminal_refused(
+    acquire_error,
+):
+    """If the workspace is deleted right as acquire_sandbox_to_change runs, the
+    RuntimeError / ValueError / 404 is converted to a terminal _Refused rather
+    than retried."""
+    from contextlib import ExitStack, asynccontextmanager
+    from unittest.mock import create_autospec
+
+    @asynccontextmanager
+    async def failing_acquire(*_args):
+        raise acquire_error
+        yield  # pragma: no cover
+
+    finish = create_autospec(
+        upload_pull.db.finish_pull,
+        return_value=_row(state="failed", error=UPLOAD_FAILED),
+    )
+    release = create_autospec(upload_pull.db.release_pull, return_value=True)
+    clean = create_autospec(upload_pull.clean_up, return_value=None)
+
+    with ExitStack() as stack:
+        for p in _sandbox_pull({"status": "ok"}):
+            stack.enter_context(p)
+        stack.enter_context(patch.object(upload_pull, "acquire_sandbox_to_change", failing_acquire))
+        stack.enter_context(patch.object(upload_pull.db, "finish_pull", finish))
+        stack.enter_context(patch.object(upload_pull.db, "release_pull", release))
+        stack.enter_context(patch.object(upload_pull, "clean_up", clean))
+
+        await pull_upload(_row(state="pulling", attempts=1))
+
+    finish.assert_awaited_once_with(
+        UPLOAD_ID, 1, state="failed", error=UPLOAD_FAILED
+    )
+    release.assert_not_awaited()
+    clean.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_existing_target_file_is_not_overwritten_when_write_access_revoked(tmp_path):
+    """When a target file already exists on disk and write permission is
+    revoked before final placement, the existing target file remains intact and
+    the staged file is removed."""
+    from contextlib import ExitStack, asynccontextmanager
+    from unittest.mock import create_autospec
+
+    from src.server.services.workspace_upload_pull import _inode_of
+
+    (tmp_path / "data").mkdir()
+    target = tmp_path / "data" / "big.bin"
+    target.write_bytes(b"original-protected-bytes")
+    staged = tmp_path / STAGED
+    staged.write_bytes(b"unauthorised-replacement-bytes")
+
+    sandbox = _shell_sandbox()
+
+    @asynccontextmanager
+    async def path_lock(_path):
+        yield
+
+    sandbox.normalize_path = lambda p: p
+    sandbox.path_write_lock = path_lock
+    inode = await _inode_of(sandbox, str(staged))
+
+    ws_row = {"workspace_id": "ws-1", "status": "running", "user_id": "owner-1"}
+    check_access = create_autospec(
+        upload_pull.owned_workspace_on_computer,
+        side_effect=[
+            ws_row,
+            HTTPException(status_code=403, detail="Write access revoked"),
+        ],
+    )
+    pull_spy = create_autospec(upload_pull.pull_direct)
+
+    @asynccontextmanager
+    async def acquire(*_args):
+        yield sandbox, ws_row
+
+    @asynccontextmanager
+    async def sync_lock(_ws_id):
+        yield None
+
+    layout = MagicMock(workspace=str(tmp_path))
+    row = _row(state="pulling", attempts=2, placing_inode=inode)
+    with ExitStack() as stack:
+        stack.enter_context(patch.object(upload_pull, "owned_workspace_on_computer", check_access))
+        stack.enter_context(patch.object(upload_pull, "acquire_sandbox_to_change", acquire))
+        stack.enter_context(patch.object(upload_pull, "owner_layout", MagicMock(return_value=layout)))
+        stack.enter_context(patch.object(upload_pull, "previous_dir_names_of", MagicMock(return_value=())))
+        stack.enter_context(
+            patch.object(
+                upload_pull,
+                "contained_target",
+                create_autospec(upload_pull.contained_target, return_value=str(target)),
+            )
+        )
+        stack.enter_context(patch.object(upload_pull, "workspace_sync_lock", sync_lock))
+        stack.enter_context(
+            patch.object(
+                upload_pull.db,
+                "mark_placing",
+                create_autospec(upload_pull.db.mark_placing, return_value=True),
+            )
+        )
+        stack.enter_context(patch.object(upload_pull, "pull_direct", pull_spy))
+
+        with pytest.raises(_Refused):
+            await _pull_once(row, {})
+
+    assert target.read_bytes() == b"original-protected-bytes"
+    assert not staged.exists()
+    pull_spy.assert_not_awaited()
+# === END DALTON-HOOK(direct-upload-safety) ===
+

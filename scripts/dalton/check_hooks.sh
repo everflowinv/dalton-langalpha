@@ -181,6 +181,11 @@ ALLOWED_HOOKS=(
   # turn on its completion notification, never by sleep/poll loops
   # (subagent_coordination.md.j2).
   "subagent-no-sleep-poll"
+  # Backlog A1a: direct upload storage safety — write-access re-verification
+  # inside path_write_lock before final pull_direct, computer-scoped space
+  # reservation under advisory lock, and explicit 413 when direct_available()
+  # is false for files exceeding the relay cap.
+  "direct-upload-safety"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)
