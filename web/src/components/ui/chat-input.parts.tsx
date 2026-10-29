@@ -44,9 +44,19 @@ export const FilePreviewCard = ({ file, onRemove }: { file: FileAttachment; onRe
       {isImage ? (
         <button
           type="button"
-          onClick={() => setPreviewOpen(true)}
+          onClick={(e) => {
+            // The composer's container focuses its textarea on any click that
+            // reaches it, which would hand the next Enter to the send handler
+            // under the open preview (and pop the mobile keyboard); the preview
+            // dialog takes focus itself, so the opening click stops here.
+            // Keyboard activation reaches this same handler as a click.
+            e.stopPropagation();
+            setPreviewOpen(true);
+          }}
           aria-label={t('chat.composer.previewImage')}
-          className="relative block w-full h-full border-none bg-transparent p-0 cursor-zoom-in"
+          // Inset ring: the card clips overflow, so the app's usual focus ring
+          // would be cut off at the card's edge.
+          className="relative block w-full h-full rounded-xl border-none bg-transparent p-0 cursor-zoom-in focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
         >
           <img src={file.preview!} alt={file.file.name} className="w-full h-full object-cover" />
           <span className="absolute inset-0 bg-black/20 group-hover:bg-black/0 transition-colors pointer-events-none" />
@@ -72,8 +82,8 @@ export const FilePreviewCard = ({ file, onRemove }: { file: FileAttachment; onRe
         </div>
       )}
 
-      {/* Remove Button Overlay — stopPropagation keeps the remove a remove,
-          never a preview open. */}
+      {/* DALTON-HOOK(composer-attachment-preview): Remove Button Overlay —
+          stopPropagation keeps the remove a remove, never a preview open. */}
       <button
         type="button"
         onClick={(e) => { e.stopPropagation(); onRemove(file.id); }}

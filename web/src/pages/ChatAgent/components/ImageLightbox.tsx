@@ -1,8 +1,7 @@
-import React, { useEffect, useCallback } from 'react';
 import { createPortal } from 'react-dom';
 import { useTranslation } from 'react-i18next';
 import { X } from 'lucide-react';
-import { useBackdropDismiss } from '@/hooks/useDialogA11y';
+import { useBackdropDismiss, useDialogA11y } from '@/hooks/useDialogA11y';
 
 interface ImageLightboxProps {
   src: string;
@@ -11,24 +10,17 @@ interface ImageLightboxProps {
   onClose: () => void;
 }
 
-function ImageLightbox({ src, alt, open, onClose }: ImageLightboxProps) {
+/**
+ * DALTON-HOOK(composer-attachment-preview): the composer's attachment
+ * thumbnails open this lightbox, and a preview that leaves focus in the
+ * composer would send the attachment on Enter and edit the draft behind the
+ * scrim — so it became a real dialog: `useDialogA11y` moves focus in, traps
+ * Tab, answers Escape, and hands focus back to the opener on close.
+ */
+function ImageLightboxDialog({ src, alt, onClose }: Omit<ImageLightboxProps, 'open'>) {
   const { t } = useTranslation();
-  const handleKeyDown = useCallback(
-    (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
-    },
-    [onClose]
-  );
-
-  useEffect(() => {
-    if (!open) return;
-    document.addEventListener('keydown', handleKeyDown);
-    return () => document.removeEventListener('keydown', handleKeyDown);
-  }, [open, handleKeyDown]);
-
+  const dialogRef = useDialogA11y<HTMLDivElement>(onClose);
   const backdrop = useBackdropDismiss<HTMLDivElement>(onClose);
-
-  if (!open) return null;
 
   // A lightbox is a deliberately dark surface, not a dialog scrim: the close
   // button sits on white at 70% and the image is meant to be the only lit thing
@@ -36,6 +28,10 @@ function ImageLightbox({ src, alt, open, onClose }: ImageLightboxProps) {
   // the overlay token, which lightens to 45% black under the light palette.
   return createPortal(
     <div
+      ref={dialogRef}
+      role="dialog"
+      aria-modal="true"
+      aria-label={alt ?? t('chat.composer.previewImage')}
       className="fixed inset-0 z-1020 flex items-center justify-center bg-black/90 scrim-in"
       {...backdrop}
     >
@@ -58,6 +54,14 @@ function ImageLightbox({ src, alt, open, onClose }: ImageLightboxProps) {
     </div>,
     document.body
   );
+}
+
+// DALTON-HOOK(composer-attachment-preview): the dialog subtree mounts only
+// while open, so the focus trap above arms per open, not once for a lightbox
+// that sits mounted as null.
+function ImageLightbox({ src, alt, open, onClose }: ImageLightboxProps) {
+  if (!open) return null;
+  return <ImageLightboxDialog src={src} alt={alt} onClose={onClose} />;
 }
 
 export default ImageLightbox;
