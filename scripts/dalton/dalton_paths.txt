@@ -74,3 +74,6 @@ src/dalton/app/transcriptions.py
 src/dalton/tools/transcription_tools.py
 scripts/dalton/asr_jobs.py
 tests/unit/dalton/test_transcriptions.py
+# Backlog A1c: real Seed-ASR client, ffprobe/ffmpeg segmentation, TOS transfer & merge.
+scripts/dalton/seed_asr_client.py
+tests/unit/dalton/test_seed_asr_a1c.py

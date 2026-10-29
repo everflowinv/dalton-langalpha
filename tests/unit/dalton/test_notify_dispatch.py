@@ -1306,12 +1306,13 @@ async def test_bridge_feishu_card_and_discord_log_hygiene_never_logs_body_or_exc
     def _fake_subprocess_run(
         cmd: list[str],
         *,
+        env: Any = None,
         capture_output: bool = True,
         text: bool = True,
         timeout: float = 15.0,
         check: bool = False,
     ) -> subprocess.CompletedProcess[str]:
-        _ = (capture_output, text, timeout, check)
+        _ = (env, capture_output, text, timeout, check)
         chat_id_idx = cmd.index("--chat-id")
         open_id = cmd[chat_id_idx + 1]
         if open_id == "ou_fail_card":

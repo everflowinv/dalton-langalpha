@@ -52,6 +52,7 @@ if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
 
 import asr_jobs  # noqa: E402
+import seed_asr_client  # noqa: E402
 import source_identity  # noqa: E402
 
 logging.basicConfig(
@@ -305,6 +306,7 @@ def sanitize_stderr_text(raw: str | bytes | None, *, max_len: int = 500) -> str:
         return ""
     for pat, repl in _STDERR_SECRET_PATTERNS:
         text = pat.sub(repl, text)
+    text = seed_asr_client.redact_asr_secrets(text)
     if len(text) > max_len:
         text = text[-max_len:]
     return text.strip()
@@ -1201,6 +1203,9 @@ class BridgeConfig:
         )
         self.asr_fake_fail_category: str | None = (
             os.environ.get("DALTON_ASR_FAKE_FAIL_CATEGORY", "").strip() or None
+        )
+        self.asr_worker_mode: str = (
+            os.environ.get("DALTON_ASR_WORKER_MODE", "auto").strip().lower() or "auto"
         )
         try:
             self.wiki_ingest_timeout_s: float = max(
@@ -5870,10 +5875,12 @@ class ResearchDataBridge:
         self, requests: list[dict[str, Any]], timeout_s: float
     ) -> list[dict[str, Any]]:
         """Spawn a single `researchdata_mcp.py` subprocess, send JSON-RPC lines, and read responses."""
+        subproc_env = seed_asr_client.strip_asr_credentials_from_env(os.environ)
         proc = await asyncio.create_subprocess_exec(
             self.cfg.python_bin,
             str(self.cfg.mcp_script),
             cwd=str(self.cfg.ocw_root),
+            env=subproc_env,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -7366,10 +7373,12 @@ class ResearchDataBridge:
         }
 
     def _build_community_subprocess_env(self) -> dict[str, str]:
-        """Build subprocess environment with CLAUDECODE/CLAUDE_CODE_* stripped and optional proxy applied."""
+        """Build subprocess environment with CLAUDECODE/CLAUDE_CODE_* and ASR/TOS credentials stripped and optional proxy applied."""
         env: dict[str, str] = {
             k: v
-            for k, v in os.environ.items()
+            for k, v in seed_asr_client.strip_asr_credentials_from_env(
+                os.environ
+            ).items()
             if k != "CLAUDECODE" and not k.startswith("CLAUDE_CODE_")
         }
         env["PYTHONDONTWRITEBYTECODE"] = "1"
@@ -7464,9 +7473,13 @@ class ResearchDataBridge:
             }
         else:
             try:
+                subproc_env = seed_asr_client.strip_asr_credentials_from_env(
+                    os.environ
+                )
                 proc = await asyncio.create_subprocess_exec(
                     str(bin_path),
                     "--version",
+                    env=subproc_env,
                     stdin=asyncio.subprocess.DEVNULL,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
@@ -9790,12 +9803,14 @@ class ResearchDataBridge:
         )
 
         cmd = [py_bin, "-B", "-W", "ignore", "-c", driver_code]
-        subproc_env = {
-            **os.environ,
-            **env_file_vars,
-            "GEMINI_API_KEY": gemini_api_key,
-            "PYTHONDONTWRITEBYTECODE": "1",
-        }
+        subproc_env = seed_asr_client.strip_asr_credentials_from_env(
+            {
+                **os.environ,
+                **env_file_vars,
+                "GEMINI_API_KEY": gemini_api_key,
+                "PYTHONDONTWRITEBYTECODE": "1",
+            }
+        )
 
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -10476,14 +10491,18 @@ class ResearchDataBridge:
             py_bin = self._resolve_archive_python_bin()
             script_path = self.cfg.conversation_archive_py
             repo_root = script_path.parents[2] if len(script_path.parents) >= 3 else _SCRIPT_DIR.parent
-            env_vars = {
-                **os.environ,
-                **_read_env_file_dict(self.cfg.env_path),
-                "PYTHONDONTWRITEBYTECODE": "1",
-            }
+            env_vars = seed_asr_client.strip_asr_credentials_from_env(
+                {
+                    **os.environ,
+                    **_read_env_file_dict(self.cfg.env_path),
+                    "PYTHONDONTWRITEBYTECODE": "1",
+                }
+            )
             repo_env = repo_root / ".env"
             if repo_env.is_file():
-                for k, v in _read_env_file_dict(repo_env).items():
+                for k, v in seed_asr_client.strip_asr_credentials_from_env(
+                    _read_env_file_dict(repo_env)
+                ).items():
                     env_vars.setdefault(k, v)
             env_vars["DALTON_BRIDGE_EMBED_URL"] = "http://127.0.0.1:8960/embed"
             env_vars["no_proxy"] = (
@@ -10610,8 +10629,10 @@ class ResearchDataBridge:
         """Return ``'on'`` if ``launchctl print gui/<uid>/<label>`` succeeds, ``'off'`` on non-zero exit, else ``'unknown'``."""
         try:
             uid = os.getuid()
+            subproc_env = seed_asr_client.strip_asr_credentials_from_env(os.environ)
             res = subprocess.run(
                 ["launchctl", "print", f"gui/{uid}/{label}"],
+                env=subproc_env,
                 capture_output=True,
                 text=True,
                 timeout=2.0,
@@ -13761,14 +13782,36 @@ class ResearchDataBridge:
         mgr = getattr(self, "_asr_mgr_instance", None)
         jobs_dir = self._asr_jobs_dir().expanduser()
         if mgr is None or mgr.jobs_dir != jobs_dir:
-            worker_cfg = asr_jobs.FakeAsrWorkerConfig(
-                delay_s=float(getattr(self.cfg, "asr_fake_delay_s", 0.02) or 0.0),
-                fixed_text=getattr(self.cfg, "asr_fake_text", None),
-                fail_category=getattr(self.cfg, "asr_fake_fail_category", None),
+            custom_worker = getattr(self, "_asr_custom_worker", None)
+            mode = (
+                str(getattr(self.cfg, "asr_worker_mode", "auto") or "auto")
+                .strip()
+                .lower()
             )
+            fake_text = getattr(self.cfg, "asr_fake_text", None)
+            fake_fail = getattr(self.cfg, "asr_fake_fail_category", None)
+            if custom_worker is not None:
+                worker: asr_jobs.RealAsrWorker | asr_jobs.FakeAsrWorker = custom_worker
+            elif mode == "real" or (
+                mode == "auto"
+                and seed_asr_client.SeedAsrCredentials.is_configured()
+                and fake_text is None
+                and fake_fail is None
+            ):
+                worker = asr_jobs.RealAsrWorker(
+                    jobs_dir,
+                    atomic_write_fn=_atomic_write_json_locked,
+                )
+            else:
+                worker_cfg = asr_jobs.FakeAsrWorkerConfig(
+                    delay_s=float(getattr(self.cfg, "asr_fake_delay_s", 0.02) or 0.0),
+                    fixed_text=fake_text,
+                    fail_category=fake_fail,
+                )
+                worker = asr_jobs.FakeAsrWorker(worker_cfg)
             mgr = asr_jobs.AsrJobManager(
                 jobs_dir,
-                worker=asr_jobs.FakeAsrWorker(worker_cfg),
+                worker=worker,
                 atomic_write_fn=_atomic_write_json_locked,
             )
             self._asr_mgr_instance = mgr
@@ -14135,8 +14178,10 @@ def _run_feishu_send_card(
             card_json_file=tmp_path,
             dry_run=dry_run,
         )
+        subproc_env = seed_asr_client.strip_asr_credentials_from_env(os.environ)
         proc = subprocess.run(
             cmd,
+            env=subproc_env,
             capture_output=True,
             text=True,
             timeout=timeout_s,

@@ -613,8 +613,15 @@ async def _sync_job_from_bridge_state(
         ):
             return current
 
+        # Within the same attempt, only `indeterminate -> transcribing` is allowed as a
+        # non-terminal recovery transition once the bridge reconciles the task via query.
+        is_indeterminate_recovery = (
+            cur_status == TranscriptionJobStatus.INDETERMINATE.value
+            and new_status == TranscriptionJobStatus.TRANSCRIBING.value
+        )
         if (
             not can_reset_terminal
+            and not is_indeterminate_recovery
             and _STATUS_PROGRESS_ORDER.get(new_status, 0)
             < _STATUS_PROGRESS_ORDER.get(cur_status, 0)
         ):

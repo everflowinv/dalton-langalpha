@@ -1,32 +1,94 @@
-"""Host-side ASR job persistence (`var/dalton/asr_jobs/<job_id>/state.json`) and fake worker (Backlog A1b).
+"""Host-side ASR job persistence (`var/dalton/asr_jobs/<job_id>/state.json`) and worker (Backlog A1b + A1c).
 
-Persists job state and results atomically on disk using `_atomic_write_json_locked`
-from `researchdata_bridge` so the bridge can recover and answer status/result
-queries across process restarts. In Batch A1b the worker is a configurable fake
-implementation (`queued -> transcribing -> succeeded / failed`) whose interface
-matches the real Seed-ASR / ffmpeg worker in Batch A1c.
+Persists job state, segment manifests, raw provider JSON responses, and merged
+results atomically on disk using `_atomic_write_json_locked` from
+`researchdata_bridge` so the bridge can recover and answer status/result queries
+across process restarts.
+
+Provides:
+- `RealAsrWorker`: streaming source download, disk admission check, `ffprobe`
+  duration measurement, `> 1800s` -> `600s` MP3 segmentation via `ffmpeg`
+  (concurrency 1, allowlisted subprocess env), TOS upload/presign, Seed-ASR
+  submission with pre-submit `request_id` persistence and lost-response
+  query-first recovery, global timestamp offset + segment-scoped speaker merge
+  (`S{seg_no}-Speaker X`), and terminal TOS + local file cleanup.
+- `FakeAsrWorker`: deterministic stub worker retained for A1b unit tests and
+  environments without Seed-ASR/TOS credentials configured.
 """
 
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable, Iterator, Mapping
+from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import UTC, datetime
 import fcntl
+import hashlib
+import inspect
 import json
 import logging
 import os
-import re
-import uuid
-from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
-from datetime import UTC, datetime
 from pathlib import Path
+import re
+import shutil
+import time
 from typing import Any
+import uuid
+
+import boto3
+from botocore.config import Config
+
+from seed_asr_client import (
+    DEFAULT_JOB_DEADLINE_S,
+    DEFAULT_POLL_INTERVAL_S,
+    DEFAULT_REQUEST_TIMEOUT_S,
+    TOS_PRESIGN_EXPIRY,
+    SeedAsrClient,
+    SeedAsrCredentials,
+    SeedAsrError,
+    SeedAsrIndeterminateError,
+    VolcTosClient,
+    build_asr_subprocess_env,
+    detect_format,
+    normalize_asr_language,
+    redact_asr_secrets,
+    should_clear_request_id_on_error,
+)
 
 logger = logging.getLogger("researchdata-bridge")
 
 _SAFE_JOB_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 _FORBIDDEN_KEY_CHARS_RE = re.compile(r"[\x00-\x1f\x7f\\;$()`|&<>'\"!*?\[\]{}~#]")
+
+SPLIT_THRESHOLD_SECONDS: float = 1800.0
+SEGMENT_TIME_SECONDS: int = 600
+DEFAULT_STREAM_CHUNK_BYTES: int = 1024 * 1024  # 1 MiB fixed-size streaming chunks
+DEFAULT_DISK_HEADROOM_BYTES: int = 64 * 1024 * 1024  # 64 MiB safety margin above 2x source size
+DEFAULT_FFPROBE_TIMEOUT_S: float = 60.0
+DEFAULT_FFMPEG_TIMEOUT_S: float = 600.0
+
+ACTIVE_JOB_STATUSES: frozenset[str] = frozenset(
+    {
+        "queued",
+        "downloading",
+        "probing",
+        "splitting",
+        "submitting",
+        "transcribing",
+        "assembling",
+    }
+)
+RECOVERABLE_JOB_STATUSES: frozenset[str] = ACTIVE_JOB_STATUSES | frozenset(
+    {"indeterminate"}
+)
+TERMINAL_JOB_STATUSES: frozenset[str] = frozenset(
+    {"succeeded", "failed", "cancelled"}
+)
+
+# Global transcode concurrency = 1 across the bridge process
+_GLOBAL_TRANSCODE_SEMAPHORE = asyncio.Semaphore(1)
 
 DEFAULT_FAKE_TRANSCRIPT_ZH = (
     "[Speaker 1]\n这是一段由假 worker 生成的测试转写文本，用于验证转写任务权限、身份与持久化链路。"
@@ -71,6 +133,1784 @@ def _now_iso() -> str:
     return datetime.now(UTC).isoformat()
 
 
+async def _maybe_await(val: Any) -> Any:
+    if inspect.isawaitable(val):
+        return await val
+    return val
+
+
+class AsrWorkerError(Exception):
+    """Structured error raised during local ASR worker stages (disk admission, download, ffprobe, ffmpeg)."""
+
+    def __init__(self, category: str, message: str) -> None:
+        sanitized = redact_asr_secrets(message)
+        super().__init__(sanitized)
+        self.category = str(category)
+        self.message = sanitized
+
+
+def compute_file_sha256(
+    path: Path, *, chunk_size: int = DEFAULT_STREAM_CHUNK_BYTES
+) -> tuple[str, int]:
+    """Compute SHA-256 hex digest and byte length of `path` using fixed-size streaming reads."""
+    hasher = hashlib.sha256()
+    total = 0
+    step = max(4096, int(chunk_size))
+    with path.open("rb") as fh:
+        while True:
+            buf = fh.read(step)
+            if not buf:
+                break
+            hasher.update(buf)
+            total += len(buf)
+    return hasher.hexdigest().lower(), total
+
+
+def check_disk_admission(
+    work_dir: Path,
+    source_size_bytes: int,
+    *,
+    headroom_bytes: int = DEFAULT_DISK_HEADROOM_BYTES,
+    disk_usage_fn: Callable[[Path | str], Any] = shutil.disk_usage,
+) -> int:
+    """Verify `work_dir` has at least `source_size_bytes * 2 + headroom_bytes` free space.
+
+    Returns the available free bytes if admitted, or raises `AsrWorkerError('insufficient_disk_space', ...)`.
+    """
+    work_dir.mkdir(parents=True, exist_ok=True)
+    required_bytes = int(source_size_bytes) * 2 + max(0, int(headroom_bytes))
+    usage = disk_usage_fn(work_dir)
+    free_bytes = int(getattr(usage, "free", 0))
+    if free_bytes < required_bytes:
+        raise AsrWorkerError(
+            "insufficient_disk_space",
+            f"Insufficient disk space in bridge temp dir: free={free_bytes} bytes, required={required_bytes} bytes (2x source + headroom)",
+        )
+    return free_bytes
+
+
+class SourceObjectStore:
+    """Streaming downloader for source audio objects from the Dalton S3-compatible store (MinIO)."""
+
+    def __init__(
+        self,
+        *,
+        s3_client: Any | None = None,
+        bucket: str | None = None,
+        key_prefix: str | None = None,
+        environ: Mapping[str, str] | None = None,
+    ) -> None:
+        env = environ if environ is not None else os.environ
+        self._s3_client = s3_client
+        self.endpoint_url = (
+            str(
+                env.get("DALTON_ASR_STORAGE_ENDPOINT_URL")
+                or env.get("STORAGE_ENDPOINT_URL")
+                or env.get("S3_ENDPOINT_URL")
+                or "http://127.0.0.1:9000"
+            )
+            .strip()
+            .rstrip("/")
+        )
+        self.bucket = str(
+            bucket
+            if bucket is not None
+            else (
+                env.get("DALTON_ASR_STORAGE_BUCKET_NAME")
+                or env.get("STORAGE_BUCKET_NAME")
+                or env.get("S3_BUCKET_NAME")
+                or ""
+            )
+        ).strip()
+        self.access_key = str(
+            env.get("DALTON_ASR_STORAGE_ACCESS_KEY_ID")
+            or env.get("STORAGE_ACCESS_KEY_ID")
+            or env.get("MINIO_ROOT_USER")
+            or env.get("AWS_ACCESS_KEY_ID")
+            or ""
+        ).strip()
+        self.secret_key = str(
+            env.get("DALTON_ASR_STORAGE_SECRET_ACCESS_KEY")
+            or env.get("STORAGE_SECRET_ACCESS_KEY")
+            or env.get("MINIO_ROOT_PASSWORD")
+            or env.get("AWS_SECRET_ACCESS_KEY")
+            or ""
+        ).strip()
+        self.region = (
+            str(
+                env.get("DALTON_ASR_STORAGE_REGION")
+                or env.get("STORAGE_REGION")
+                or env.get("S3_REGION")
+                or "us-east-1"
+            ).strip()
+            or "us-east-1"
+        )
+        self.addressing_style = (
+            str(
+                env.get("DALTON_ASR_STORAGE_ADDRESSING_STYLE")
+                or env.get("STORAGE_ADDRESSING_STYLE")
+                or "path"
+            )
+            .strip()
+            .lower()
+            or "path"
+        )
+        raw_prefix = str(
+            key_prefix
+            if key_prefix is not None
+            else (
+                env.get("DALTON_ASR_STORAGE_KEY_PREFIX")
+                or env.get("STORAGE_KEY_PREFIX")
+                or ""
+            )
+        ).strip().strip("/")
+        self.key_prefix = f"{raw_prefix}/" if raw_prefix else ""
+
+    def _get_s3_client(self) -> Any:
+        if self._s3_client is not None:
+            return self._s3_client
+        if not self.bucket or not self.access_key or not self.secret_key:
+            raise AsrWorkerError(
+                "storage_not_configured",
+                "Bridge source object storage credentials/bucket are not configured",
+            )
+        self._s3_client = boto3.client(
+            "s3",
+            endpoint_url=self.endpoint_url,
+            aws_access_key_id=self.access_key,
+            aws_secret_access_key=self.secret_key,
+            region_name=self.region,
+            config=Config(
+                signature_version="s3v4",
+                s3={"addressing_style": self.addressing_style},
+                connect_timeout=10,
+                read_timeout=60,
+                retries={"max_attempts": 3, "mode": "standard"},
+                response_checksum_validation="when_required",
+            ),
+        )
+        return self._s3_client
+
+    def resolve_full_key(self, object_key: str) -> str:
+        cleaned = str(object_key or "").strip().lstrip("/")
+        if self.key_prefix and not cleaned.startswith(self.key_prefix):
+            return f"{self.key_prefix}{cleaned}"
+        return cleaned
+
+    @contextmanager
+    def open_object_chunks(
+        self,
+        source_object_key: str,
+        *,
+        chunk_size: int = DEFAULT_STREAM_CHUNK_BYTES,
+    ) -> Iterator[Iterator[bytes]]:
+        """Open a streaming S3 `get_object` body and yield fixed-size byte chunks."""
+        client = self._get_s3_client()
+        full_key = self.resolve_full_key(source_object_key)
+        step = max(4096, int(chunk_size))
+        resp = client.get_object(Bucket=self.bucket, Key=full_key)
+        body = resp.get("Body") if isinstance(resp, dict) else None
+        if body is None or not hasattr(body, "read"):
+            raise AsrWorkerError(
+                "source_download_failed",
+                f"Object storage get_object returned no readable stream for {source_object_key}",
+            )
+
+        def _chunk_iter() -> Iterator[bytes]:
+            while True:
+                data = body.read(step)
+                if not data:
+                    break
+                yield bytes(data)
+
+        try:
+            yield _chunk_iter()
+        finally:
+            close_fn = getattr(body, "close", None)
+            if callable(close_fn):
+                try:
+                    close_fn()
+                except Exception:
+                    pass
+
+    def download_to_path(
+        self,
+        source_object_key: str,
+        dest_path: Path,
+        *,
+        expected_size_bytes: int,
+        expected_sha256: str,
+        chunk_size: int = DEFAULT_STREAM_CHUNK_BYTES,
+        deadline_monotonic: float | None = None,
+    ) -> tuple[int, str]:
+        """Stream `source_object_key` into `dest_path` in fixed-size chunks, verifying size, SHA-256, and job deadline."""
+        if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+            raise AsrWorkerError(
+                "asr_job_deadline_exceeded",
+                "Overall job deadline exceeded before source audio download started",
+            )
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        hasher = hashlib.sha256()
+        written = 0
+        expected_size = int(expected_size_bytes)
+        expected_hash = str(expected_sha256 or "").strip().lower()
+
+        try:
+            with (
+                self.open_object_chunks(
+                    source_object_key, chunk_size=chunk_size
+                ) as chunks,
+                dest_path.open("wb") as out_fh,
+            ):
+                for chunk in chunks:
+                    if (
+                        deadline_monotonic is not None
+                        and time.monotonic() >= deadline_monotonic
+                    ):
+                        raise AsrWorkerError(
+                            "asr_job_deadline_exceeded",
+                            "Overall job deadline exceeded during source audio download",
+                        )
+                    if not chunk:
+                        continue
+                    written += len(chunk)
+                    if written > expected_size:
+                        raise AsrWorkerError(
+                            "source_size_mismatch",
+                            f"Downloaded stream exceeded expected size ({written} > {expected_size} bytes)",
+                        )
+                    hasher.update(chunk)
+                    out_fh.write(chunk)
+                out_fh.flush()
+        except AsrWorkerError:
+            try:
+                if dest_path.exists():
+                    dest_path.unlink()
+            except Exception:
+                pass
+            raise
+        except Exception as exc:
+            try:
+                if dest_path.exists():
+                    dest_path.unlink()
+            except Exception:
+                pass
+            raise AsrWorkerError(
+                "source_download_failed",
+                f"Streaming download failed ({type(exc).__name__}): {redact_asr_secrets(str(exc))}",
+            ) from exc
+
+        actual_hash = hasher.hexdigest().lower()
+        if written != expected_size:
+            try:
+                dest_path.unlink()
+            except Exception:
+                pass
+            raise AsrWorkerError(
+                "source_size_mismatch",
+                f"Downloaded size mismatch: got {written} bytes, expected {expected_size} bytes",
+            )
+        if expected_hash and actual_hash != expected_hash:
+            try:
+                dest_path.unlink()
+            except Exception:
+                pass
+            raise AsrWorkerError(
+                "source_integrity_mismatch",
+                f"Downloaded SHA-256 mismatch: got {actual_hash}, expected {expected_hash}",
+            )
+        return written, actual_hash
+
+
+def _resolve_binary(preferred: str | Path | None, default_name: str) -> str:
+    if preferred:
+        cand = str(preferred).strip()
+        if cand:
+            return cand
+    hb = Path("/opt/homebrew/bin") / default_name
+    if hb.is_file() and os.access(hb, os.X_OK):
+        return str(hb)
+    found = shutil.which(default_name)
+    return found or default_name
+
+
+async def probe_audio_duration(
+    audio_path: Path,
+    *,
+    ffprobe_bin: str | Path | None = None,
+    timeout_s: float = DEFAULT_FFPROBE_TIMEOUT_S,
+    base_env: Mapping[str, str] | None = None,
+) -> float:
+    """Measure audio duration in seconds via `ffprobe` subprocess with allowlisted env and file path."""
+    if not audio_path.is_file():
+        raise AsrWorkerError(
+            "ffprobe_input_missing", f"Audio file not found: {audio_path.name}"
+        )
+    bin_path = _resolve_binary(ffprobe_bin, "ffprobe")
+    cmd = [
+        bin_path,
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "json",
+        str(audio_path),
+    ]
+    subproc_env = build_asr_subprocess_env(base_env)
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        env=subproc_env,
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout_bytes, stderr_bytes = await asyncio.wait_for(
+            proc.communicate(), timeout=max(0.001, float(timeout_s))
+        )
+    except TimeoutError as exc:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        await proc.wait()
+        raise AsrWorkerError(
+            "ffprobe_timeout",
+            f"ffprobe timed out after {timeout_s}s on {audio_path.name}",
+        ) from exc
+    except BaseException:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        await proc.wait()
+        raise
+
+    if proc.returncode != 0:
+        err_snip = redact_asr_secrets(
+            stderr_bytes.decode("utf-8", errors="replace").strip()[:200]
+        )
+        raise AsrWorkerError(
+            "ffprobe_failed",
+            f"ffprobe exited with code {proc.returncode}: {err_snip or 'unknown error'}",
+        )
+
+    try:
+        parsed = json.loads(stdout_bytes.decode("utf-8", errors="replace"))
+        dur_raw = (parsed.get("format") or {}).get("duration")
+        duration = float(dur_raw)
+    except Exception as exc:
+        raise AsrWorkerError(
+            "ffprobe_invalid_output",
+            "ffprobe output did not contain a valid numeric format.duration",
+        ) from exc
+
+    if duration <= 0.0:
+        raise AsrWorkerError(
+            "ffprobe_invalid_duration",
+            f"ffprobe reported non-positive duration ({duration}s)",
+        )
+    return duration
+
+
+def should_split_audio(
+    duration_seconds: float,
+    *,
+    threshold_seconds: float = SPLIT_THRESHOLD_SECONDS,
+) -> bool:
+    """Return True strictly when `duration_seconds > threshold_seconds` (1800s = 30m boundary)."""
+    return float(duration_seconds) > float(threshold_seconds)
+
+
+def compute_segment_ranges(
+    duration_seconds: float,
+    *,
+    threshold_seconds: float = SPLIT_THRESHOLD_SECONDS,
+    segment_time_seconds: int = SEGMENT_TIME_SECONDS,
+) -> list[tuple[float, float]]:
+    """Compute `(start_s, end_s)` ranges for `duration_seconds`.
+
+    - `<= 1800s`: single range `[(0.0, duration_seconds)]`.
+    - `> 1800s`: 600s segments with the final segment covering the remaining tail.
+    """
+    dur = round(float(duration_seconds), 3)
+    if not should_split_audio(dur, threshold_seconds=threshold_seconds):
+        return [(0.0, dur)]
+    step = float(max(1, int(segment_time_seconds)))
+    ranges: list[tuple[float, float]] = []
+    start = 0.0
+    while start < dur:
+        end = round(min(dur, start + step), 3)
+        if end > start:
+            ranges.append((round(start, 3), end))
+        start = round(start + step, 3)
+    return ranges
+
+
+@dataclass
+class PreparedSegmentFile:
+    """Local segment file prepared for TOS upload and Seed-ASR submission."""
+
+    index: int
+    path: Path
+    start_s: float
+    end_s: float
+    sha256: str
+    size_bytes: int
+    codec_params: dict[str, Any]
+
+
+async def split_audio_to_mp3_segments(
+    source_path: Path,
+    chunks_dir: Path,
+    *,
+    total_duration_s: float,
+    segment_time_s: int = SEGMENT_TIME_SECONDS,
+    ffmpeg_bin: str | Path | None = None,
+    timeout_s: float = DEFAULT_FFMPEG_TIMEOUT_S,
+    transcode_semaphore: asyncio.Semaphore | None = None,
+    base_env: Mapping[str, str] | None = None,
+) -> list[PreparedSegmentFile]:
+    """Split `source_path` into 600s MP3 segments (`-f segment -segment_time 600 -c:a libmp3lame -q:a 2`).
+
+    Enforces transcode concurrency = 1 via `transcode_semaphore` and runs `ffmpeg`
+    with an allowlisted environment and explicit timeout.
+    """
+    if not source_path.is_file():
+        raise AsrWorkerError(
+            "ffmpeg_input_missing", f"Source audio not found: {source_path.name}"
+        )
+    chunks_dir.mkdir(parents=True, exist_ok=True)
+    for old_chunk in chunks_dir.glob("chunk_*.mp3"):
+        try:
+            old_chunk.unlink()
+        except Exception:
+            pass
+
+    bin_path = _resolve_binary(ffmpeg_bin, "ffmpeg")
+    seg_time = max(1, int(segment_time_s))
+    pattern_path = chunks_dir / "chunk_%02d.mp3"
+    cmd = [
+        bin_path,
+        "-nostdin",
+        "-y",
+        "-i",
+        str(source_path),
+        "-f",
+        "segment",
+        "-segment_time",
+        str(seg_time),
+        "-c:a",
+        "libmp3lame",
+        "-q:a",
+        "2",
+        str(pattern_path),
+    ]
+    subproc_env = build_asr_subprocess_env(base_env)
+    sem = transcode_semaphore or _GLOBAL_TRANSCODE_SEMAPHORE
+    eff_timeout = max(0.001, float(timeout_s))
+    step_deadline = time.monotonic() + eff_timeout
+
+    try:
+        await asyncio.wait_for(sem.acquire(), timeout=eff_timeout)
+    except TimeoutError as exc:
+        raise AsrWorkerError(
+            "ffmpeg_timeout",
+            f"ffmpeg segmentation timed out waiting for transcode lock after {timeout_s}s",
+        ) from exc
+
+    try:
+        rem_exec = max(0.001, step_deadline - time.monotonic())
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            env=subproc_env,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            _stdout_b, stderr_b = await asyncio.wait_for(
+                proc.communicate(), timeout=rem_exec
+            )
+        except TimeoutError as exc:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            await proc.wait()
+            raise AsrWorkerError(
+                "ffmpeg_timeout",
+                f"ffmpeg segmentation timed out after {timeout_s}s",
+            ) from exc
+        except BaseException:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            await proc.wait()
+            raise
+    finally:
+        sem.release()
+
+    if proc.returncode != 0:
+        err_snip = redact_asr_secrets(
+            stderr_b.decode("utf-8", errors="replace").strip()[-240:]
+        )
+        raise AsrWorkerError(
+            "ffmpeg_split_failed",
+            f"ffmpeg segmentation exited with code {proc.returncode}: {err_snip or 'unknown error'}",
+        )
+
+    def _chunk_sort_key(p: Path) -> tuple[int, str]:
+        suffix_num = p.stem.rsplit("_", 1)[-1]
+        return (int(suffix_num) if suffix_num.isdigit() else 999999, p.name)
+
+    chunk_files = sorted(chunks_dir.glob("chunk_*.mp3"), key=_chunk_sort_key)
+    if not chunk_files:
+        raise AsrWorkerError(
+            "ffmpeg_no_chunks",
+            "ffmpeg segmentation produced no chunk_*.mp3 files",
+        )
+
+    codec_params = {
+        "format": "mp3",
+        "codec": "libmp3lame",
+        "q_a": "2",
+        "segment_time": seg_time,
+    }
+    prepared: list[PreparedSegmentFile] = []
+    num_chunks = len(chunk_files)
+    total_dur = round(float(total_duration_s), 3)
+    for idx, cpath in enumerate(chunk_files):
+        sha_hex, fsize = await asyncio.to_thread(compute_file_sha256, cpath)
+        start_s = round(idx * float(seg_time), 3)
+        if idx == num_chunks - 1:
+            end_s = max(round(start_s + 0.001, 3), total_dur)
+        else:
+            end_s = round(min(total_dur, (idx + 1) * float(seg_time)), 3)
+        prepared.append(
+            PreparedSegmentFile(
+                index=idx,
+                path=cpath,
+                start_s=start_s,
+                end_s=end_s,
+                sha256=sha_hex,
+                size_bytes=fsize,
+                codec_params=dict(codec_params),
+            )
+        )
+    return prepared
+
+
+def _extract_utterance_speaker(utt: Mapping[str, Any]) -> str | None:
+    additions = utt.get("additions")
+    speaker: Any = None
+    if isinstance(additions, Mapping):
+        speaker = additions.get("speaker")
+    elif isinstance(additions, str) and additions.strip():
+        try:
+            parsed_add = json.loads(additions)
+            if isinstance(parsed_add, Mapping):
+                speaker = parsed_add.get("speaker")
+        except (ValueError, TypeError):
+            pass
+    if speaker is None:
+        speaker = utt.get("speaker")
+    if speaker is None:
+        return None
+    cleaned = str(speaker).strip()
+    return cleaned if cleaned else None
+
+
+def format_scoped_speaker(segment_index: int, raw_speaker: str | None) -> str:
+    """Format a speaker label scoped to `S{segment_index + 1}` so cross-segment speakers are never conflated."""
+    seg_prefix = f"S{int(segment_index) + 1}"
+    if not raw_speaker:
+        return f"{seg_prefix}-Speaker 1"
+    cleaned = str(raw_speaker).strip()
+    if cleaned.lower().startswith("speaker"):
+        suffix = cleaned[len("speaker") :].strip(" -_:")
+        base = f"Speaker {suffix}" if suffix else "Speaker 1"
+    else:
+        base = f"Speaker {cleaned}"
+    return f"{seg_prefix}-{base}"
+
+
+def merge_segment_transcriptions(
+    segments_meta: list[dict[str, Any]],
+    raw_responses: list[dict[str, Any]],
+) -> tuple[str, list[dict[str, Any]]]:
+    """Merge per-segment Seed-ASR responses with global timestamp offsets and segment-scoped speaker labels.
+
+    - Preserves original `raw_start_ms` / `raw_end_ms` alongside shifted `start_ms` / `end_ms`.
+    - Scopes every speaker label to its segment (`S1-Speaker 1`, `S2-Speaker 1`, etc.).
+    - Silent segments (`status_code == 20000003` or empty text/utterances) produce no false text.
+    """
+    merged_utterances: list[dict[str, Any]] = []
+    transcript_lines: list[str] = []
+    current_speaker_header: str | None = None
+
+    for seg_meta, raw_resp in zip(segments_meta, raw_responses, strict=False):
+        seg_idx = int(seg_meta.get("index") or 0)
+        seg_label = f"S{seg_idx + 1}"
+        start_s = float(seg_meta.get("start_s") or 0.0)
+        end_s = float(seg_meta.get("end_s") or start_s)
+        offset_ms = int(round(start_s * 1000.0))
+
+        if not isinstance(raw_resp, Mapping) or raw_resp.get("silent") is True:
+            continue
+        result_block = raw_resp.get("result")
+        if not isinstance(result_block, Mapping):
+            continue
+
+        utterances = result_block.get("utterances")
+        if isinstance(utterances, list) and utterances:
+            for utt in utterances:
+                if not isinstance(utt, Mapping):
+                    continue
+                text = str(utt.get("text") or "").strip()
+                if not text:
+                    continue
+                raw_spk = _extract_utterance_speaker(utt)
+                scoped_spk = format_scoped_speaker(seg_idx, raw_spk)
+
+                raw_start = int(
+                    utt.get("start_time", utt.get("start_ms", 0)) or 0
+                )
+                raw_end = int(
+                    utt.get("end_time", utt.get("end_ms", raw_start)) or raw_start
+                )
+                global_start = raw_start + offset_ms
+                global_end = raw_end + offset_ms
+
+                merged_utterances.append(
+                    {
+                        "segment_index": seg_idx,
+                        "segment_label": seg_label,
+                        "speaker": scoped_spk,
+                        "raw_speaker": raw_spk,
+                        "raw_start_ms": raw_start,
+                        "raw_end_ms": raw_end,
+                        "start_ms": global_start,
+                        "end_ms": global_end,
+                        "text": text,
+                    }
+                )
+                if scoped_spk != current_speaker_header:
+                    current_speaker_header = scoped_spk
+                    transcript_lines.append(f"\n[{scoped_spk}]")
+                transcript_lines.append(text)
+        else:
+            fallback_text = str(result_block.get("text") or "").strip()
+            if fallback_text:
+                scoped_spk = format_scoped_speaker(seg_idx, "1")
+                seg_dur_ms = max(0, int(round((end_s - start_s) * 1000.0)))
+                merged_utterances.append(
+                    {
+                        "segment_index": seg_idx,
+                        "segment_label": seg_label,
+                        "speaker": scoped_spk,
+                        "raw_speaker": "1",
+                        "raw_start_ms": 0,
+                        "raw_end_ms": seg_dur_ms,
+                        "start_ms": offset_ms,
+                        "end_ms": offset_ms + seg_dur_ms,
+                        "text": fallback_text,
+                    }
+                )
+                if scoped_spk != current_speaker_header:
+                    current_speaker_header = scoped_spk
+                    transcript_lines.append(f"\n[{scoped_spk}]")
+                transcript_lines.append(fallback_text)
+
+    merged_text = "\n".join(transcript_lines).strip()
+    return merged_text, merged_utterances
+
+
+@dataclass
+class RealAsrWorkerConfig:
+    """Configuration for `RealAsrWorker` (Backlog A1c)."""
+
+    split_threshold_seconds: float = SPLIT_THRESHOLD_SECONDS
+    segment_time_seconds: int = SEGMENT_TIME_SECONDS
+    stream_chunk_bytes: int = DEFAULT_STREAM_CHUNK_BYTES
+    disk_headroom_bytes: int = DEFAULT_DISK_HEADROOM_BYTES
+    tos_presign_expiry_s: int = TOS_PRESIGN_EXPIRY
+    request_timeout_s: float = DEFAULT_REQUEST_TIMEOUT_S
+    job_deadline_s: float = DEFAULT_JOB_DEADLINE_S
+    poll_interval_s: float = DEFAULT_POLL_INTERVAL_S
+    ffprobe_timeout_s: float = DEFAULT_FFPROBE_TIMEOUT_S
+    ffmpeg_timeout_s: float = DEFAULT_FFMPEG_TIMEOUT_S
+    ffprobe_bin: str | Path | None = None
+    ffmpeg_bin: str | Path | None = None
+
+
+class RealAsrWorker:
+    """Production ASR worker implementing streaming download, ffprobe, >1800s ffmpeg segmentation, TOS transfer, Seed-ASR transcription, and merge."""
+
+    def __init__(
+        self,
+        jobs_dir: Path,
+        *,
+        config: RealAsrWorkerConfig | None = None,
+        source_store: SourceObjectStore | None = None,
+        tos_client: VolcTosClient | None = None,
+        asr_client: SeedAsrClient | None = None,
+        probe_duration_fn: Callable[..., Awaitable[float]] | None = None,
+        split_audio_fn: Callable[..., Awaitable[list[PreparedSegmentFile]]] | None = None,
+        disk_usage_fn: Callable[[Path | str], Any] = shutil.disk_usage,
+        transcode_semaphore: asyncio.Semaphore | None = None,
+        atomic_write_fn: Callable[..., bool] | None = None,
+    ) -> None:
+        self.jobs_dir = Path(jobs_dir)
+        self.config = config or RealAsrWorkerConfig()
+        self._source_store = source_store
+        self._tos_client = tos_client
+        self._asr_client = asr_client
+        self._probe_duration_fn = probe_duration_fn or probe_audio_duration
+        self._split_audio_fn = split_audio_fn or split_audio_to_mp3_segments
+        self._disk_usage_fn = disk_usage_fn
+        self._transcode_semaphore = transcode_semaphore or _GLOBAL_TRANSCODE_SEMAPHORE
+        self._atomic_write = atomic_write_fn or _fallback_atomic_write_json_locked
+        self._inflight_uploads: dict[
+            str, dict[asyncio.Future[Any], tuple[VolcTosClient, str]]
+        ] = {}
+        self._job_deadlines: dict[str, float] = {}
+
+    def _attach_deferred_tos_delete(
+        self,
+        upload_fut: asyncio.Future[Any],
+        tos_client: VolcTosClient,
+        tos_obj_key: str,
+    ) -> None:
+        """Register a one-time callback on `upload_fut` to delete `tos_obj_key` once the upload thread completes."""
+        if getattr(upload_fut, "_tos_deferred_delete_attached", False):
+            return
+        setattr(upload_fut, "_tos_deferred_delete_attached", True)
+
+        def _on_done(
+            _fut: asyncio.Future[Any],
+            _tos: VolcTosClient = tos_client,
+            _key: str = tos_obj_key,
+        ) -> None:
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(asyncio.to_thread(_tos.delete_object, _key))
+            except RuntimeError:
+                try:
+                    _tos.delete_object(_key)
+                except Exception:
+                    pass
+
+        upload_fut.add_done_callback(_on_done)
+
+    def _resolve_clients(
+        self,
+    ) -> tuple[SourceObjectStore, VolcTosClient, SeedAsrClient]:
+        source_store = self._source_store or SourceObjectStore()
+        if self._tos_client is not None and self._asr_client is not None:
+            return source_store, self._tos_client, self._asr_client
+        creds = SeedAsrCredentials.from_env()
+        tos_client = self._tos_client or VolcTosClient(
+            creds, presign_expiry_s=self.config.tos_presign_expiry_s
+        )
+        asr_client = self._asr_client or SeedAsrClient(
+            creds,
+            request_timeout_s=self.config.request_timeout_s,
+            job_deadline_s=self.config.job_deadline_s,
+            poll_interval_s=self.config.poll_interval_s,
+        )
+        return source_store, tos_client, asr_client
+
+    def _job_dir(self, job_id: str) -> Path:
+        return self.jobs_dir / str(job_id).strip()
+
+    def _work_dir(self, job_id: str) -> Path:
+        return self._job_dir(job_id) / "work"
+
+    def _segments_dir(self, job_id: str) -> Path:
+        return self._job_dir(job_id) / "segments"
+
+    def _segment_raw_path(self, job_id: str, seg_idx: int) -> Path:
+        return self._segments_dir(job_id) / f"segment_{int(seg_idx):03d}.raw.json"
+
+    def raw_response_path(self, job_id: str) -> Path:
+        return self._job_dir(job_id) / "raw_response.json"
+
+    def transcript_text_path(self, job_id: str) -> Path:
+        return self._job_dir(job_id) / "transcript.txt"
+
+    async def cleanup_job_resources(
+        self,
+        job_id: str,
+        segments: list[dict[str, Any]] | None = None,
+        *,
+        tos_client: VolcTosClient | None = None,
+        deadline_monotonic: float | None = None,
+    ) -> None:
+        """Delete any TOS temporary objects and local temporary audio/chunk files under `<job_dir>/work/`.
+
+        Waits up to `min(remaining_s, 30.0)` for any in-flight TOS upload thread to finish
+        first; any upload future still running after the wait retains a deferred delete
+        callback so cancelled or timed-out uploads cannot leave orphan TOS objects behind.
+        Logs sanitized warnings on failure and never raises.
+        """
+        eff_tos = tos_client or self._tos_client
+        if eff_tos is None and SeedAsrCredentials.is_configured():
+            try:
+                eff_tos = VolcTosClient(SeedAsrCredentials.from_env())
+            except Exception:
+                eff_tos = None
+
+        inflight_map = dict(self._inflight_uploads.get(job_id) or {})
+        still_uploading_keys: set[str] = set()
+        if inflight_map:
+            dl = (
+                deadline_monotonic
+                if deadline_monotonic is not None
+                else self._job_deadlines.get(job_id)
+            )
+            if dl is not None:
+                rem_s = max(0.005, dl - time.monotonic())
+                wait_timeout = min(rem_s, 30.0)
+            else:
+                wait_timeout = min(max(0.005, float(self.config.job_deadline_s)), 30.0)
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(
+                        asyncio.gather(*inflight_map.keys(), return_exceptions=True)
+                    ),
+                    timeout=wait_timeout,
+                )
+            except Exception:
+                pass
+            for fut, (up_tos, up_key) in inflight_map.items():
+                if not fut.done():
+                    still_uploading_keys.add(up_key)
+                    target_tos = up_tos or eff_tos
+                    if target_tos is not None and up_key:
+                        self._attach_deferred_tos_delete(fut, target_tos, up_key)
+
+        all_segments: list[dict[str, Any]] = []
+        if segments:
+            all_segments.extend(s for s in segments if isinstance(s, dict))
+        state_file = self._job_dir(job_id) / "state.json"
+        if state_file.is_file():
+            try:
+                persisted = json.loads(state_file.read_text(encoding="utf-8"))
+                if isinstance(persisted, dict):
+                    for s in persisted.get("segments") or []:
+                        if isinstance(s, dict):
+                            all_segments.append(s)
+            except Exception:
+                pass
+
+        if eff_tos is not None and all_segments:
+            seen_keys: set[str] = set()
+            for seg in all_segments:
+                tos_key = str(seg.get("tos_object_key") or "").strip()
+                if (
+                    tos_key
+                    and not seg.get("tos_cleaned")
+                    and tos_key not in seen_keys
+                    and tos_key not in still_uploading_keys
+                ):
+                    seen_keys.add(tos_key)
+                    try:
+                        await asyncio.to_thread(eff_tos.delete_object, tos_key)
+                        seg["tos_cleaned"] = True
+                    except Exception as exc:
+                        logger.warning(
+                            "TOS cleanup warning for job_id=%s key=%s: %s",
+                            job_id,
+                            tos_key,
+                            type(exc).__name__,
+                        )
+
+        work_dir = self._work_dir(job_id)
+        try:
+            if work_dir.exists():
+                await asyncio.to_thread(shutil.rmtree, work_dir)
+        except Exception as exc:
+            logger.warning(
+                "Local work dir cleanup warning for job_id=%s: %s",
+                job_id,
+                type(exc).__name__,
+            )
+        self._job_deadlines.pop(job_id, None)
+
+    async def run_job(
+        self,
+        job_state: dict[str, Any],
+        *,
+        on_progress: Callable[[dict[str, Any]], Awaitable[bool | None]],
+    ) -> dict[str, Any]:
+        job_id = str(job_state["job_id"])
+        attempt = int(job_state.get("attempt") or 1)
+        caller = dict(job_state.get("caller") or {})
+        workspace_id = str(caller.get("workspace_id") or "workspace")
+        source_object_key = str(job_state.get("source_object_key") or "").strip()
+        source_size_bytes = int(job_state.get("source_size_bytes") or 0)
+        source_sha256 = str(job_state.get("source_sha256") or "").strip().lower()
+        raw_language = job_state.get("language")
+        norm_language = normalize_asr_language(raw_language)
+        hotwords = [
+            str(w).strip()
+            for w in (job_state.get("hotwords") or [])
+            if str(w).strip()
+        ]
+
+        work_dir = self._work_dir(job_id)
+        segments_dir = self._segments_dir(job_id)
+        segments_dir.mkdir(parents=True, exist_ok=True)
+
+        existing_segments: list[dict[str, Any]] = [
+            dict(s)
+            for s in (job_state.get("segments") or [])
+            if isinstance(s, dict)
+        ]
+        # Historical segments with a persisted `provider_request_id` but no `submit_accepted`
+        # field (including historical `failed` segments) are always treated as accepted.
+        for s in existing_segments:
+            if (
+                str(s.get("provider_request_id") or "").strip()
+                and s.get("submit_accepted") is None
+            ):
+                s["submit_accepted"] = True
+
+        provider_request_ids: list[str] = [
+            str(r)
+            for r in (job_state.get("provider_request_ids") or [])
+            if str(r).strip()
+        ]
+        raw_dur = job_state.get("duration_seconds")
+        if not isinstance(raw_dur, (int, float)) or float(raw_dur) <= 0.0:
+            raw_dur = (job_state.get("usage") or {}).get("duration_seconds")
+        duration_s = float(raw_dur or 0.0)
+        if duration_s <= 0.0 and existing_segments:
+            duration_s = max(
+                (float(s.get("end_s") or 0.0) for s in existing_segments),
+                default=0.0,
+            )
+
+        deadline_mono = time.monotonic() + self.config.job_deadline_s
+        self._job_deadlines[job_id] = deadline_mono
+        terminal_reached = False
+        tos_client: VolcTosClient | None = self._tos_client
+
+        def _build_usage(
+            *,
+            dur_s: float,
+            submitted_s: float,
+            completed_s: float,
+            billable_s: float | None,
+            last_req_id: str | None = None,
+        ) -> dict[str, Any]:
+            return {
+                "user_id": caller.get("user_id", ""),
+                "workspace_id": workspace_id,
+                "thread_id": caller.get("thread_id", ""),
+                "duration_seconds": round(dur_s, 3),
+                "submitted_seconds": round(submitted_s, 3),
+                "completed_seconds": round(completed_s, 3),
+                "billable_seconds": (
+                    round(billable_s, 3) if billable_s is not None else None
+                ),
+                "provider_request_id": last_req_id
+                or (provider_request_ids[-1] if provider_request_ids else None),
+                "attempt": attempt,
+            }
+
+        def _current_usage(
+            *,
+            last_req_id: str | None = None,
+            billable_s: float | None = None,
+        ) -> dict[str, Any]:
+            sub_s = sum(
+                float(s.get("end_s", 0.0)) - float(s.get("start_s", 0.0))
+                for s in existing_segments
+                if s.get("provider_request_id")
+            )
+            comp_s = sum(
+                float(s.get("end_s", 0.0)) - float(s.get("start_s", 0.0))
+                for s in existing_segments
+                if s.get("status") == "succeeded"
+            )
+            return _build_usage(
+                dur_s=duration_s,
+                submitted_s=sub_s,
+                completed_s=comp_s,
+                billable_s=billable_s,
+                last_req_id=last_req_id,
+            )
+
+        def _has_submitted_segments() -> bool:
+            return bool(provider_request_ids) or any(
+                bool(str(s.get("provider_request_id") or "").strip())
+                for s in existing_segments
+            )
+
+        def _raise_deadline_exceeded(stage_desc: str) -> None:
+            if _has_submitted_segments():
+                last_id = (
+                    provider_request_ids[-1]
+                    if provider_request_ids
+                    else str(
+                        next(
+                            (
+                                s.get("provider_request_id")
+                                for s in reversed(existing_segments)
+                                if s.get("provider_request_id")
+                            ),
+                            "",
+                        )
+                    )
+                )
+                raise SeedAsrIndeterminateError(
+                    "asr_poll_deadline_exceeded",
+                    f"Overall job deadline ({self.config.job_deadline_s}s) exceeded during {stage_desc}",
+                    request_id=last_id,
+                )
+            raise AsrWorkerError(
+                "asr_job_deadline_exceeded",
+                f"Overall job deadline ({self.config.job_deadline_s}s) exceeded during {stage_desc}",
+            )
+
+        def _remaining_budget(stage_desc: str) -> float:
+            rem = deadline_mono - time.monotonic()
+            if rem <= 0:
+                _raise_deadline_exceeded(stage_desc)
+            return rem
+
+        try:
+            source_store, tos_client, asr_client = self._resolve_clients()
+
+            # Check which segments actually need local audio files (i.e. segments not yet
+            # succeeded and not already holding an in-flight/indeterminate/persisted provider_request_id)
+            needs_local_audio = not existing_segments or any(
+                not (
+                    (
+                        s.get("status") == "succeeded"
+                        and self._segment_raw_path(
+                            job_id, int(s.get("index") or 0)
+                        ).is_file()
+                    )
+                    or (
+                        bool(str(s.get("provider_request_id") or "").strip())
+                        and s.get("status")
+                        in ("submitting", "transcribing", "indeterminate", "failed")
+                    )
+                )
+                for s in existing_segments
+            )
+
+            prepared_files_by_idx: dict[int, Path] = {}
+            if needs_local_audio:
+                _remaining_budget("downloading")
+                # Stage 1: downloading (with disk space admission check first)
+                await on_progress(
+                    {
+                        "status": "downloading",
+                        "stage": "downloading",
+                    }
+                )
+                # Earlier runs' source files are no longer read. Unlinking one a stale
+                # download thread still holds open is safe; its space frees on close.
+                for stale_source in work_dir.glob("source.*"):
+                    stale_source.unlink(missing_ok=True)
+                check_disk_admission(
+                    work_dir,
+                    source_size_bytes,
+                    headroom_bytes=self.config.disk_headroom_bytes,
+                    disk_usage_fn=self._disk_usage_fn,
+                )
+
+                source_ext = Path(source_object_key).suffix.lower() or ".mp3"
+                # Each run downloads to its own file: a download thread that outlived
+                # its timeout may still truncate or unlink its path when it wakes.
+                source_local_path = (
+                    work_dir / f"source.{attempt}.{uuid.uuid4().hex[:12]}{source_ext}"
+                )
+                rem_download = _remaining_budget("downloading")
+                dl_kwargs: dict[str, Any] = {
+                    "expected_size_bytes": source_size_bytes,
+                    "expected_sha256": source_sha256,
+                    "chunk_size": self.config.stream_chunk_bytes,
+                }
+                try:
+                    sig_params = inspect.signature(
+                        source_store.download_to_path
+                    ).parameters
+                    if "deadline_monotonic" in sig_params or any(
+                        p.kind == inspect.Parameter.VAR_KEYWORD
+                        for p in sig_params.values()
+                    ):
+                        dl_kwargs["deadline_monotonic"] = deadline_mono
+                except (TypeError, ValueError):
+                    pass
+
+                try:
+                    await asyncio.wait_for(
+                        asyncio.to_thread(
+                            source_store.download_to_path,
+                            source_object_key,
+                            source_local_path,
+                            **dl_kwargs,
+                        ),
+                        timeout=rem_download,
+                    )
+                except TimeoutError:
+                    _raise_deadline_exceeded("downloading")
+                except AsrWorkerError as dl_exc:
+                    if dl_exc.category == "asr_job_deadline_exceeded":
+                        _raise_deadline_exceeded("downloading")
+                    raise
+                _remaining_budget("downloading")
+
+                # Stage 2: probing
+                await on_progress(
+                    {
+                        "status": "probing",
+                        "stage": "probing",
+                    }
+                )
+                rem_probe = _remaining_budget("probing")
+                probe_timeout = min(float(self.config.ffprobe_timeout_s), rem_probe)
+                try:
+                    duration_s = float(
+                        await self._probe_duration_fn(
+                            source_local_path,
+                            ffprobe_bin=self.config.ffprobe_bin,
+                            timeout_s=probe_timeout,
+                        )
+                    )
+                except AsrWorkerError as probe_exc:
+                    if (
+                        probe_exc.category == "ffprobe_timeout"
+                        and time.monotonic() >= deadline_mono
+                    ):
+                        _raise_deadline_exceeded("probing")
+                    raise
+
+                # Immediately persist probed duration and segment offsets so a process restart
+                # during splitting/submitting/transcribing never resets duration_seconds to 0.0
+                initial_ranges = compute_segment_ranges(
+                    duration_s,
+                    threshold_seconds=self.config.split_threshold_seconds,
+                    segment_time_seconds=self.config.segment_time_seconds,
+                )
+                if not existing_segments:
+                    existing_segments = [
+                        {
+                            "index": i,
+                            "start_s": st_s,
+                            "end_s": en_s,
+                            "duration_s": round(en_s - st_s, 3),
+                            "sha256": None,
+                            "size_bytes": None,
+                            "codec_params": None,
+                            "status": "pending",
+                            "provider_request_id": None,
+                            "tos_object_key": None,
+                            "attempt": attempt,
+                        }
+                        for i, (st_s, en_s) in enumerate(initial_ranges)
+                    ]
+                await on_progress(
+                    {
+                        "status": "probing",
+                        "stage": "probing",
+                        "duration_seconds": round(duration_s, 3),
+                        "segment_count": len(existing_segments),
+                        "segments": [dict(s) for s in existing_segments],
+                        "usage": _current_usage(),
+                    }
+                )
+
+                # Stage 3: splitting (strictly when duration_s > 1800.0s)
+                if should_split_audio(
+                    duration_s,
+                    threshold_seconds=self.config.split_threshold_seconds,
+                ):
+                    await on_progress(
+                        {
+                            "status": "splitting",
+                            "stage": "splitting",
+                            "duration_seconds": round(duration_s, 3),
+                            "usage": _current_usage(),
+                        }
+                    )
+                    rem_split = _remaining_budget("splitting")
+                    split_timeout = min(
+                        float(self.config.ffmpeg_timeout_s), rem_split
+                    )
+                    chunks_dir = work_dir / "chunks"
+                    try:
+                        prepared_list = await self._split_audio_fn(
+                            source_local_path,
+                            chunks_dir,
+                            total_duration_s=duration_s,
+                            segment_time_s=self.config.segment_time_seconds,
+                            ffmpeg_bin=self.config.ffmpeg_bin,
+                            timeout_s=split_timeout,
+                            transcode_semaphore=self._transcode_semaphore,
+                        )
+                    except AsrWorkerError as split_exc:
+                        if (
+                            split_exc.category == "ffmpeg_timeout"
+                            and time.monotonic() >= deadline_mono
+                        ):
+                            _raise_deadline_exceeded("splitting")
+                        raise
+                else:
+                    src_fmt = detect_format(source_local_path)
+                    prepared_list = [
+                        PreparedSegmentFile(
+                            index=0,
+                            path=source_local_path,
+                            start_s=0.0,
+                            end_s=round(duration_s, 3),
+                            sha256=source_sha256,
+                            size_bytes=source_size_bytes,
+                            codec_params={
+                                "format": src_fmt,
+                                "codec": "original",
+                                "q_a": None,
+                                "segment_time": None,
+                            },
+                        )
+                    ]
+
+                for pf in prepared_list:
+                    prepared_files_by_idx[pf.index] = pf.path
+
+                if not existing_segments:
+                    existing_segments = [
+                        {
+                            "index": pf.index,
+                            "start_s": pf.start_s,
+                            "end_s": pf.end_s,
+                            "duration_s": round(pf.end_s - pf.start_s, 3),
+                            "sha256": pf.sha256,
+                            "size_bytes": pf.size_bytes,
+                            "codec_params": pf.codec_params,
+                            "status": "pending",
+                            "provider_request_id": None,
+                            "tos_object_key": None,
+                            "attempt": attempt,
+                        }
+                        for pf in prepared_list
+                    ]
+                else:
+                    # Merge newly prepared file metadata into non-succeeded segments while keeping succeeded or already-submitted segments intact
+                    by_idx = {int(s.get("index") or 0): s for s in existing_segments}
+                    merged_segs: list[dict[str, Any]] = []
+                    for pf in prepared_list:
+                        prev = by_idx.get(pf.index)
+                        if prev is not None and (
+                            prev.get("status") == "succeeded"
+                            or (
+                                bool(str(prev.get("provider_request_id") or "").strip())
+                                and prev.get("status")
+                                in (
+                                    "submitting",
+                                    "transcribing",
+                                    "indeterminate",
+                                    "failed",
+                                )
+                            )
+                        ):
+                            merged_segs.append(prev)
+                        else:
+                            merged_segs.append(
+                                {
+                                    "index": pf.index,
+                                    "start_s": pf.start_s,
+                                    "end_s": pf.end_s,
+                                    "duration_s": round(pf.end_s - pf.start_s, 3),
+                                    "sha256": pf.sha256,
+                                    "size_bytes": pf.size_bytes,
+                                    "codec_params": pf.codec_params,
+                                    "status": "pending",
+                                    "provider_request_id": None,
+                                    "tos_object_key": None,
+                                    "attempt": attempt,
+                                }
+                            )
+                    existing_segments = merged_segs
+
+            segment_count = len(existing_segments)
+            completed_count = sum(
+                1 for s in existing_segments if s.get("status") == "succeeded"
+            )
+
+            # Stage 4: submitting / transcribing each segment
+            raw_responses_by_idx: dict[int, dict[str, Any]] = {}
+            for seg in existing_segments:
+                idx = int(seg["index"])
+                raw_file = self._segment_raw_path(job_id, idx)
+
+                # If segment already succeeded in an earlier attempt, reuse its saved raw JSON without re-submitting
+                if seg.get("status") == "succeeded" and raw_file.is_file():
+                    try:
+                        saved_raw = json.loads(raw_file.read_text(encoding="utf-8"))
+                        if isinstance(saved_raw, dict):
+                            raw_responses_by_idx[idx] = saved_raw
+                            continue
+                    except Exception:
+                        pass
+
+                existing_req_id = str(seg.get("provider_request_id") or "").strip()
+                if existing_req_id and seg.get("submit_accepted") is None:
+                    seg["submit_accepted"] = True
+                already_submitted = bool(
+                    existing_req_id
+                    and seg.get("status")
+                    in ("submitting", "transcribing", "indeterminate", "failed")
+                )
+
+                presigned_url = ""
+                audio_format = str(
+                    (seg.get("codec_params") or {}).get("format") or "mp3"
+                )
+
+                if not already_submitted:
+                    # Check job deadline BEFORE uploading or generating/persisting a new request_id
+                    rem_upload = _remaining_budget("uploading")
+
+                    seg_path = prepared_files_by_idx.get(idx)
+                    if seg_path is None or not seg_path.is_file():
+                        raise AsrWorkerError(
+                            "segment_file_missing",
+                            f"Local segment file missing for segment {idx}",
+                        )
+                    audio_format = detect_format(seg_path)
+                    tos_obj_key = (
+                        f"asr-temp/{job_id}/seg_{idx:03d}_{uuid.uuid4().hex[:8]}"
+                        f"{seg_path.suffix.lower() or '.mp3'}"
+                    )
+                    # Pre-persist tos_object_key BEFORE starting upload so cancellation or lost response can clean it up
+                    seg["tos_object_key"] = tos_obj_key
+                    seg["tos_cleaned"] = False
+                    seg["status"] = "submitting"
+                    seg["attempt"] = attempt
+                    persisted_tos = await on_progress(
+                        {
+                            "status": "submitting",
+                            "stage": "submitting",
+                            "duration_seconds": round(duration_s, 3),
+                            "segment_count": segment_count,
+                            "completed_segments": completed_count,
+                            "current_segment": idx,
+                            "segments": [dict(s) for s in existing_segments],
+                            "provider_request_ids": list(provider_request_ids),
+                            "usage": _current_usage(),
+                        }
+                    )
+                    if persisted_tos is False:
+                        raise AsrWorkerError(
+                            "state_persist_failed",
+                            "Failed persisting TOS object key to state file before upload",
+                        )
+
+                    upload_fut = asyncio.ensure_future(
+                        asyncio.to_thread(
+                            tos_client.upload_and_presign,
+                            seg_path,
+                            object_key=tos_obj_key,
+                            expires_in=self.config.tos_presign_expiry_s,
+                        )
+                    )
+                    job_uploads = self._inflight_uploads.setdefault(job_id, {})
+                    job_uploads[upload_fut] = (tos_client, tos_obj_key)
+                    upload_fut.add_done_callback(
+                        lambda f, d=job_uploads: d.pop(f, None)
+                    )
+
+                    try:
+                        presigned_url, uploaded_key = await asyncio.wait_for(
+                            asyncio.shield(upload_fut),
+                            timeout=rem_upload,
+                        )
+                    except TimeoutError:
+                        if not upload_fut.done():
+                            self._attach_deferred_tos_delete(
+                                upload_fut, tos_client, tos_obj_key
+                            )
+                        else:
+                            await asyncio.to_thread(
+                                tos_client.delete_object, tos_obj_key
+                            )
+                            seg["tos_cleaned"] = True
+                        _raise_deadline_exceeded("uploading")
+                    except asyncio.CancelledError:
+                        # Process shutdown / non-explicit CancelledError (`interrupted: True`)
+                        # MUST NOT delete TOS objects; only explicit `cancel_job` calls
+                        # `cleanup_job_resources`, which awaits / attaches deferred delete.
+                        raise
+
+                    if uploaded_key != tos_obj_key:
+                        seg["tos_object_key"] = uploaded_key
+                        await on_progress(
+                            {
+                                "segments": [dict(s) for s in existing_segments],
+                            }
+                        )
+
+                    # Re-check deadline before generating or persisting a new request_id
+                    _remaining_budget("submitting")
+                else:
+                    await on_progress(
+                        {
+                            "status": "transcribing",
+                            "stage": "transcribing",
+                            "duration_seconds": round(duration_s, 3),
+                            "segment_count": segment_count,
+                            "completed_segments": completed_count,
+                            "current_segment": idx,
+                            "segments": [dict(s) for s in existing_segments],
+                            "provider_request_ids": list(provider_request_ids),
+                            "usage": _current_usage(),
+                        }
+                    )
+
+                async def _persist_request_id(
+                    req_id: str, _seg: dict[str, Any] = seg, _idx: int = idx
+                ) -> bool:
+                    _seg["provider_request_id"] = req_id
+                    _seg["submit_accepted"] = False
+                    _seg["status"] = "submitting"
+                    if req_id not in provider_request_ids:
+                        provider_request_ids.append(req_id)
+                    try:
+                        persisted = await on_progress(
+                            {
+                                "status": "submitting",
+                                "stage": "submitting",
+                                "duration_seconds": round(duration_s, 3),
+                                "segment_count": segment_count,
+                                "completed_segments": completed_count,
+                                "current_segment": _idx,
+                                "provider_request_ids": list(provider_request_ids),
+                                "segments": [dict(s) for s in existing_segments],
+                                "usage": _current_usage(last_req_id=req_id),
+                            }
+                        )
+                    except Exception:
+                        _seg["provider_request_id"] = None
+                        if req_id in provider_request_ids:
+                            provider_request_ids.remove(req_id)
+                        raise
+                    if persisted is False:
+                        _seg["provider_request_id"] = None
+                        if req_id in provider_request_ids:
+                            provider_request_ids.remove(req_id)
+                        return False
+                    return True
+
+                async def _on_seg_status_change(
+                    new_st: str,
+                    req_id: str,
+                    _seg: dict[str, Any] = seg,
+                    _idx: int = idx,
+                ) -> None:
+                    _seg["provider_request_id"] = req_id
+                    if new_st == "transcribing":
+                        _seg["submit_accepted"] = True
+                    _seg["status"] = new_st
+                    if req_id not in provider_request_ids:
+                        provider_request_ids.append(req_id)
+                    await on_progress(
+                        {
+                            "status": new_st,
+                            "stage": new_st,
+                            "duration_seconds": round(duration_s, 3),
+                            "segment_count": segment_count,
+                            "completed_segments": completed_count,
+                            "current_segment": _idx,
+                            "provider_request_ids": list(provider_request_ids),
+                            "segments": [dict(s) for s in existing_segments],
+                            "usage": _current_usage(last_req_id=req_id),
+                        }
+                    )
+
+                try:
+                    outcome = await asr_client.transcribe_segment(
+                        audio_url=presigned_url,
+                        audio_format=audio_format,
+                        language=norm_language,
+                        hotwords=hotwords,
+                        uid=str(caller.get("user_id") or "dalton-asr"),
+                        request_id=existing_req_id if already_submitted else None,
+                        already_submitted=already_submitted,
+                        persist_request_id_fn=_persist_request_id,
+                        on_status_change_fn=_on_seg_status_change,
+                        deadline_monotonic=deadline_mono,
+                    )
+                except SeedAsrError as exc:
+                    # Determine whether this segment's provider_request_id was never created / confirmed non-existent
+                    seg_req_id = str(seg.get("provider_request_id") or "").strip()
+                    raw_sub_accepted = seg.get("submit_accepted")
+                    sub_accepted = (
+                        bool(raw_sub_accepted)
+                        if raw_sub_accepted is not None
+                        else bool(seg_req_id)
+                    )
+                    if should_clear_request_id_on_error(
+                        exc, submit_accepted=sub_accepted
+                    ):
+                        seg["provider_request_id"] = None
+                        seg["submit_accepted"] = False
+                        if seg_req_id and not any(
+                            s is not seg and s.get("provider_request_id") == seg_req_id
+                            for s in existing_segments
+                        ):
+                            while seg_req_id in provider_request_ids:
+                                provider_request_ids.remove(seg_req_id)
+                        if (
+                            exc.category == "asr_job_deadline_exceeded"
+                            and _has_submitted_segments()
+                        ):
+                            _raise_deadline_exceeded("submitting")
+                        raise
+                    # Otherwise, a valid or uncertain provider_request_id remains in flight:
+                    # convert to SeedAsrIndeterminateError so we NEVER mark it failed or clean TOS
+                    raise SeedAsrIndeterminateError(
+                        exc.category,
+                        exc.message,
+                        request_id=seg_req_id or str(exc.request_id or ""),
+                        http_status=exc.http_status,
+                        provider_status=exc.provider_status,
+                    ) from exc
+
+                # Save raw segment response (preserving original per-segment timestamps)
+                self._atomic_write(
+                    raw_file,
+                    outcome.response,
+                    label=f"asr_segment_{idx:03d}_raw",
+                )
+                raw_responses_by_idx[idx] = outcome.response
+
+                # Clean up segment TOS object immediately after transcription completes
+                seg_tos_key = str(seg.get("tos_object_key") or "").strip()
+                if seg_tos_key and not seg.get("tos_cleaned"):
+                    await asyncio.to_thread(tos_client.delete_object, seg_tos_key)
+                    seg["tos_cleaned"] = True
+
+                seg["status"] = "succeeded"
+                seg["submit_accepted"] = True
+                seg["provider_status_code"] = outcome.provider_status_code
+                seg.pop("error_category", None)
+                completed_count = sum(
+                    1 for s in existing_segments if s.get("status") == "succeeded"
+                )
+                await on_progress(
+                    {
+                        "status": "transcribing",
+                        "stage": "transcribing",
+                        "duration_seconds": round(duration_s, 3),
+                        "segment_count": segment_count,
+                        "completed_segments": completed_count,
+                        "current_segment": idx,
+                        "provider_request_ids": list(provider_request_ids),
+                        "segments": [dict(s) for s in existing_segments],
+                        "usage": _current_usage(),
+                    }
+                )
+
+            # Stage 5: assembling
+            await on_progress(
+                {
+                    "status": "assembling",
+                    "stage": "assembling",
+                    "duration_seconds": round(duration_s, 3),
+                    "segment_count": segment_count,
+                    "completed_segments": segment_count,
+                    "current_segment": None,
+                    "provider_request_ids": list(provider_request_ids),
+                    "segments": [dict(s) for s in existing_segments],
+                    "usage": _current_usage(),
+                }
+            )
+
+            ordered_raw = [
+                raw_responses_by_idx.get(int(s["index"]), {})
+                for s in existing_segments
+            ]
+
+            # Save combined raw responses separately (`raw_response.json`) with original timestamps intact
+            raw_bundle = {
+                "job_id": job_id,
+                "duration_seconds": round(duration_s, 3),
+                "segment_count": segment_count,
+                "segments": [
+                    {
+                        "index": int(s["index"]),
+                        "segment_label": f"S{int(s['index']) + 1}",
+                        "start_s": s["start_s"],
+                        "end_s": s["end_s"],
+                        "offset_ms": int(round(float(s["start_s"]) * 1000.0)),
+                        "sha256": s.get("sha256"),
+                        "codec_params": s.get("codec_params"),
+                        "provider_request_id": s.get("provider_request_id"),
+                        "raw_response": ordered_raw[i],
+                    }
+                    for i, s in enumerate(existing_segments)
+                ],
+            }
+            self._atomic_write(
+                self.raw_response_path(job_id),
+                raw_bundle,
+                label="asr_raw_response",
+            )
+
+            merged_text, merged_utterances = merge_segment_transcriptions(
+                existing_segments, ordered_raw
+            )
+
+            # Save merged plain-text transcript separately (`transcript.txt`)
+            transcript_path = self.transcript_text_path(job_id)
+            transcript_path.parent.mkdir(parents=True, exist_ok=True)
+            transcript_path.write_text(
+                (merged_text + "\n") if merged_text else "", encoding="utf-8"
+            )
+
+            submitted_s = sum(
+                float(s.get("end_s", 0.0)) - float(s.get("start_s", 0.0))
+                for s in existing_segments
+            )
+            usage = _build_usage(
+                dur_s=duration_s,
+                submitted_s=submitted_s,
+                completed_s=duration_s,
+                billable_s=duration_s,
+            )
+            result_object_key = f"transcriptions/{workspace_id}/{job_id}/result.json"
+            result_payload = {
+                "job_id": job_id,
+                "language": norm_language or raw_language,
+                "duration_seconds": round(duration_s, 3),
+                "text": merged_text,
+                "utterances": merged_utterances,
+                "segments": [dict(s) for s in existing_segments],
+                "provider_request_ids": list(provider_request_ids),
+                "raw_response_file": "raw_response.json",
+                "transcript_file": "transcript.txt",
+                "usage": usage,
+            }
+            terminal_reached = True
+            return {
+                "status": "succeeded",
+                "stage": "succeeded",
+                "duration_seconds": round(duration_s, 3),
+                "segment_count": segment_count,
+                "completed_segments": segment_count,
+                "current_segment": None,
+                "provider_request_ids": list(provider_request_ids),
+                "segments": [dict(s) for s in existing_segments],
+                "usage": usage,
+                "result_object_key": result_object_key,
+                "error_category": None,
+                "error_message": None,
+                "result": result_payload,
+            }
+
+        except asyncio.CancelledError:
+            raise
+
+        except SeedAsrIndeterminateError as exc:
+            # Ambiguous submission or poll deadline exceeded: preserve indeterminate state and TOS object
+            # so the provider can still fetch or a subsequent query can reconcile without re-submitting.
+            for s in existing_segments:
+                if s.get("provider_request_id") == exc.request_id and s.get(
+                    "status"
+                ) != "succeeded":
+                    s["status"] = "indeterminate"
+                    s["error_category"] = exc.category
+            submitted_s = sum(
+                float(s.get("end_s", 0.0)) - float(s.get("start_s", 0.0))
+                for s in existing_segments
+                if s.get("provider_request_id")
+            )
+            completed_s = sum(
+                float(s.get("end_s", 0.0)) - float(s.get("start_s", 0.0))
+                for s in existing_segments
+                if s.get("status") == "succeeded"
+            )
+            return {
+                "status": "indeterminate",
+                "stage": "indeterminate",
+                "duration_seconds": round(duration_s, 3),
+                "segment_count": max(1, len(existing_segments)),
+                "completed_segments": sum(
+                    1 for s in existing_segments if s.get("status") == "succeeded"
+                ),
+                "current_segment": None,
+                "provider_request_ids": list(provider_request_ids),
+                "segments": [dict(s) for s in existing_segments],
+                "usage": _build_usage(
+                    dur_s=duration_s,
+                    submitted_s=submitted_s,
+                    completed_s=completed_s,
+                    billable_s=None,
+                    last_req_id=exc.request_id,
+                ),
+                "error_category": exc.category,
+                "error_message": exc.message,
+            }
+
+        except (SeedAsrError, AsrWorkerError) as exc:
+            terminal_reached = True
+            for s in existing_segments:
+                if s.get("status") in ("submitting", "transcribing"):
+                    s["status"] = "failed"
+                    s["error_category"] = exc.category
+            submitted_s = sum(
+                float(s.get("end_s", 0.0)) - float(s.get("start_s", 0.0))
+                for s in existing_segments
+                if s.get("provider_request_id")
+            )
+            completed_s = sum(
+                float(s.get("end_s", 0.0)) - float(s.get("start_s", 0.0))
+                for s in existing_segments
+                if s.get("status") == "succeeded"
+            )
+            return {
+                "status": "failed",
+                "stage": "failed",
+                "duration_seconds": round(duration_s, 3),
+                "segment_count": max(1, len(existing_segments)),
+                "completed_segments": sum(
+                    1 for s in existing_segments if s.get("status") == "succeeded"
+                ),
+                "current_segment": None,
+                "provider_request_ids": list(provider_request_ids),
+                "segments": [dict(s) for s in existing_segments],
+                "usage": _build_usage(
+                    dur_s=duration_s,
+                    submitted_s=submitted_s,
+                    completed_s=completed_s,
+                    billable_s=None,
+                ),
+                "error_category": exc.category,
+                "error_message": exc.message,
+            }
+
+        except Exception:
+            terminal_reached = True
+            raise
+
+        finally:
+            if terminal_reached:
+                await self.cleanup_job_resources(
+                    job_id,
+                    existing_segments,
+                    tos_client=tos_client,
+                    deadline_monotonic=deadline_mono,
+                )
+
+
 @dataclass
 class FakeAsrWorkerConfig:
     """Configuration for the Batch A1b fake ASR worker."""
@@ -86,11 +1926,18 @@ class FakeAsrWorker:
     """Deterministic fake ASR worker for Batch A1b (`queued -> transcribing -> succeeded / failed`).
 
     Exposes the same `run_job(job_state, *, on_progress)` signature that the
-    Batch A1c real worker (ffprobe/ffmpeg + TOS + Seed-ASR) will implement.
+    Batch A1c `RealAsrWorker` implements.
     """
 
     def __init__(self, config: FakeAsrWorkerConfig | None = None) -> None:
         self.config = config or FakeAsrWorkerConfig()
+
+    async def cleanup_job_resources(
+        self,
+        job_id: str,
+        segments: list[dict[str, Any]] | None = None,
+    ) -> None:
+        return None
 
     async def run_job(
         self,
@@ -239,14 +2086,22 @@ class AsrJobManager:
         self,
         jobs_dir: Path,
         *,
-        worker: FakeAsrWorker | None = None,
+        worker: RealAsrWorker | FakeAsrWorker | None = None,
         atomic_write_fn: Callable[..., bool] | None = None,
     ) -> None:
         self.jobs_dir = Path(jobs_dir)
-        self.worker = worker or FakeAsrWorker()
         self._atomic_write = atomic_write_fn or _fallback_atomic_write_json_locked
+        if worker is not None:
+            self.worker: RealAsrWorker | FakeAsrWorker = worker
+        elif SeedAsrCredentials.is_configured():
+            self.worker = RealAsrWorker(
+                self.jobs_dir, atomic_write_fn=self._atomic_write
+            )
+        else:
+            self.worker = FakeAsrWorker()
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._locks: dict[str, asyncio.Lock] = {}
+        self._exec_locks: dict[str, asyncio.Lock] = {}
         self._explicit_cancels: set[str] = set()
         self._recovered_on_startup: bool = False
         try:
@@ -256,7 +2111,7 @@ class AsrJobManager:
             pass
 
     def recover_incomplete_jobs(self) -> list[str]:
-        """Scan `jobs_dir` and resume any non-terminal (`queued` / `transcribing`) jobs interrupted by a prior process exit."""
+        """Scan `jobs_dir` and resume any non-terminal (`RECOVERABLE_JOB_STATUSES`, including `indeterminate`) jobs interrupted by a prior process exit."""
         self._recovered_on_startup = True
         resumed: list[str] = []
         if not self.jobs_dir.is_dir():
@@ -271,7 +2126,7 @@ class AsrJobManager:
                 state = self.read_state(job_id)
                 if not isinstance(state, dict):
                     continue
-                if state.get("status") in ("queued", "transcribing"):
+                if state.get("status") in RECOVERABLE_JOB_STATUSES:
                     self._ensure_worker_running(job_id)
                     resumed.append(job_id)
         except Exception as exc:
@@ -290,6 +2145,13 @@ class AsrJobManager:
         if lock is None:
             lock = asyncio.Lock()
             self._locks[job_id] = lock
+        return lock
+
+    def _exec_lock(self, job_id: str) -> asyncio.Lock:
+        lock = self._exec_locks.get(job_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._exec_locks[job_id] = lock
         return lock
 
     def _resolve_job_dir(self, job_id: str) -> Path | None:
@@ -340,13 +2202,29 @@ class AsrJobManager:
         spath = self.state_path(job_id)
         if spath is None:
             return False
-        return self._atomic_write(spath, state, label="asr_job_state")
+        try:
+            return bool(self._atomic_write(spath, state, label="asr_job_state"))
+        except Exception as exc:
+            logger.warning(
+                "Failed writing ASR job state for %s: %s",
+                job_id,
+                type(exc).__name__,
+            )
+            return False
 
     def _write_result(self, job_id: str, result: dict[str, Any]) -> bool:
         rpath = self.result_path(job_id)
         if rpath is None:
             return False
-        return self._atomic_write(rpath, result, label="asr_job_result")
+        try:
+            return bool(self._atomic_write(rpath, result, label="asr_job_result"))
+        except Exception as exc:
+            logger.warning(
+                "Failed writing ASR job result for %s: %s",
+                job_id,
+                type(exc).__name__,
+            )
+            return False
 
     def _ensure_worker_running(self, job_id: str) -> None:
         existing = self._tasks.get(job_id)
@@ -356,14 +2234,89 @@ class AsrJobManager:
         self._tasks[job_id] = task
 
     async def _execute_job(self, job_id: str) -> None:
-        state = self.read_state(job_id)
-        if state is None:
-            return
-        if state.get("status") in ("succeeded", "failed", "cancelled"):
-            return
-        run_attempt = int(state.get("attempt") or 1)
+        async with self._exec_lock(job_id):
+            state = self.read_state(job_id)
+            if state is None:
+                return
+            if state.get("status") in TERMINAL_JOB_STATUSES:
+                return
+            run_attempt = int(state.get("attempt") or 1)
 
-        async def _on_progress(patch: dict[str, Any]) -> None:
+            async def _on_progress(patch: dict[str, Any]) -> bool:
+                async with self._job_lock(job_id):
+                    cur = self.read_state(job_id)
+                    if (
+                        cur is None
+                        or cur.get("status") == "cancelled"
+                        or int(cur.get("attempt") or 1) != run_attempt
+                    ):
+                        return False
+                    cur.pop("interrupted", None)
+                    cur.pop("interrupted_at", None)
+                    cur.update(patch)
+                    cur["version"] = int(cur.get("version") or 1) + 1
+                    cur["updated_at"] = _now_iso()
+                    return self._write_state(job_id, cur)
+
+            try:
+                outcome = await self.worker.run_job(state, on_progress=_on_progress)
+            except asyncio.CancelledError:
+                # Process shutdown / `asyncio.run` task cleanup raises `CancelledError`
+                # on in-flight tasks. Only an explicit `/cancel` request (tracked in
+                # `self._explicit_cancels`) may mark the job `cancelled`; otherwise
+                # preserve the non-terminal status and mark `interrupted: True` so
+                # the job resumes after bridge restart.
+                if job_id in self._explicit_cancels:
+                    cleanup_fn = getattr(self.worker, "cleanup_job_resources", None)
+                    if callable(cleanup_fn):
+                        cur_for_clean = self.read_state(job_id) or state
+                        segs_for_clean = [
+                            s
+                            for s in (cur_for_clean.get("segments") or [])
+                            if isinstance(s, dict)
+                        ]
+                        try:
+                            await _maybe_await(cleanup_fn(job_id, segs_for_clean))
+                        except Exception:
+                            pass
+                else:
+                    async with self._job_lock(job_id):
+                        cur = self.read_state(job_id)
+                        if (
+                            cur is not None
+                            and cur.get("status") not in TERMINAL_JOB_STATUSES
+                            and int(cur.get("attempt") or 1) == run_attempt
+                        ):
+                            now_str = _now_iso()
+                            cur["interrupted"] = True
+                            cur["interrupted_at"] = now_str
+                            cur["version"] = int(cur.get("version") or 1) + 1
+                            cur["updated_at"] = now_str
+                            self._write_state(job_id, cur)
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "ASR worker failed for job_id=%s: %s", job_id, type(exc).__name__
+                )
+                cleanup_fn = getattr(self.worker, "cleanup_job_resources", None)
+                if callable(cleanup_fn):
+                    cur_for_clean = self.read_state(job_id) or state
+                    segs_for_clean = [
+                        s
+                        for s in (cur_for_clean.get("segments") or [])
+                        if isinstance(s, dict)
+                    ]
+                    try:
+                        await _maybe_await(cleanup_fn(job_id, segs_for_clean))
+                    except Exception:
+                        pass
+                outcome = {
+                    "status": "failed",
+                    "stage": "failed",
+                    "error_category": "worker_exception",
+                    "error_message": f"{type(exc).__name__}: {redact_asr_secrets(str(exc))}",
+                }
+
             async with self._job_lock(job_id):
                 cur = self.read_state(job_id)
                 if (
@@ -374,65 +2327,16 @@ class AsrJobManager:
                     return
                 cur.pop("interrupted", None)
                 cur.pop("interrupted_at", None)
-                cur.update(patch)
+                result_payload = outcome.pop("result", None)
+                if isinstance(result_payload, dict):
+                    self._write_result(job_id, result_payload)
+                cur.update(outcome)
                 cur["version"] = int(cur.get("version") or 1) + 1
-                cur["updated_at"] = _now_iso()
+                now_str = _now_iso()
+                cur["updated_at"] = now_str
+                if cur.get("status") in TERMINAL_JOB_STATUSES:
+                    cur["completed_at"] = now_str
                 self._write_state(job_id, cur)
-
-        try:
-            outcome = await self.worker.run_job(state, on_progress=_on_progress)
-        except asyncio.CancelledError:
-            # Process shutdown / `asyncio.run` task cleanup raises `CancelledError`
-            # on in-flight tasks. Only an explicit `/cancel` request (tracked in
-            # `self._explicit_cancels`) may mark the job `cancelled`; otherwise
-            # preserve the non-terminal status and mark `interrupted: True` so
-            # the job resumes after bridge restart.
-            if job_id not in self._explicit_cancels:
-                async with self._job_lock(job_id):
-                    cur = self.read_state(job_id)
-                    if (
-                        cur is not None
-                        and cur.get("status") not in ("succeeded", "failed", "cancelled")
-                        and int(cur.get("attempt") or 1) == run_attempt
-                    ):
-                        now_str = _now_iso()
-                        cur["interrupted"] = True
-                        cur["interrupted_at"] = now_str
-                        cur["version"] = int(cur.get("version") or 1) + 1
-                        cur["updated_at"] = now_str
-                        self._write_state(job_id, cur)
-            raise
-        except Exception as exc:
-            logger.warning(
-                "ASR worker failed for job_id=%s: %s", job_id, type(exc).__name__
-            )
-            outcome = {
-                "status": "failed",
-                "stage": "failed",
-                "error_category": "worker_exception",
-                "error_message": f"{type(exc).__name__}: {exc}",
-            }
-
-        async with self._job_lock(job_id):
-            cur = self.read_state(job_id)
-            if (
-                cur is None
-                or cur.get("status") == "cancelled"
-                or int(cur.get("attempt") or 1) != run_attempt
-            ):
-                return
-            cur.pop("interrupted", None)
-            cur.pop("interrupted_at", None)
-            result_payload = outcome.pop("result", None)
-            if isinstance(result_payload, dict):
-                self._write_result(job_id, result_payload)
-            cur.update(outcome)
-            cur["version"] = int(cur.get("version") or 1) + 1
-            now_str = _now_iso()
-            cur["updated_at"] = now_str
-            if cur.get("status") in ("succeeded", "failed", "cancelled"):
-                cur["completed_at"] = now_str
-            self._write_state(job_id, cur)
 
     async def submit_job(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         """Validate and enqueue a transcription job from a backend admin request."""
@@ -534,7 +2438,7 @@ class AsrJobManager:
                         "error_code": "job_id_conflict",
                         "error": "job_id already exists for a different caller or workspace",
                     }
-                if existing.get("status") in ("queued", "transcribing"):
+                if existing.get("status") in ACTIVE_JOB_STATUSES:
                     self._ensure_worker_running(job_id)
                 return 200, {"ok": True, "job": existing}
 
@@ -596,7 +2500,7 @@ class AsrJobManager:
                 "error_code": "not_found",
                 "error": "Transcription job not found",
             }
-        if state.get("status") in ("queued", "transcribing"):
+        if state.get("status") in ACTIVE_JOB_STATUSES:
             self._ensure_worker_running(job_id)
         return 200, {"ok": True, "job": state}
 
@@ -638,7 +2542,7 @@ class AsrJobManager:
     async def retry_job(
         self, job_id: str, body: dict[str, Any] | None = None
     ) -> tuple[int, dict[str, Any]]:
-        """Retry a `failed` or `indeterminate` job on the bridge."""
+        """Retry a `failed` or `indeterminate` job on the bridge (idempotent when a retry is already in progress)."""
         async with self._job_lock(job_id):
             state = self.read_state(job_id)
             if state is None:
@@ -648,6 +2552,11 @@ class AsrJobManager:
                     "error": "Transcription job not found",
                 }
             cur_status = str(state.get("status") or "")
+            # Duplicate retry while a retry attempt is already active is deduplicated (no duplicate submission)
+            if cur_status in ACTIVE_JOB_STATUSES and int(state.get("attempt") or 1) > 1:
+                self._ensure_worker_running(job_id)
+                return 200, {"ok": True, "job": state, "deduplicated": True}
+
             if cur_status not in ("failed", "indeterminate"):
                 return 409, {
                     "ok": False,
@@ -655,6 +2564,16 @@ class AsrJobManager:
                     "status": cur_status,
                     "error": f"Job in status '{cur_status}' cannot be retried",
                 }
+            segs = state.get("segments")
+            already_done = (
+                sum(
+                    1
+                    for s in segs
+                    if isinstance(s, dict) and s.get("status") == "succeeded"
+                )
+                if isinstance(segs, list)
+                else 0
+            )
             self._explicit_cancels.discard(job_id)
             state.pop("interrupted", None)
             state.pop("interrupted_at", None)
@@ -662,7 +2581,7 @@ class AsrJobManager:
             state["stage"] = "queued"
             state["attempt"] = int(state.get("attempt") or 1) + 1
             state["version"] = int(state.get("version") or 1) + 1
-            state["completed_segments"] = 0
+            state["completed_segments"] = already_done
             state["current_segment"] = None
             state["error_category"] = None
             state["error_message"] = None
@@ -680,7 +2599,8 @@ class AsrJobManager:
     async def cancel_job(
         self, job_id: str, body: dict[str, Any] | None = None
     ) -> tuple[int, dict[str, Any]]:
-        """Cancel an in-flight or queued job on the bridge."""
+        """Cancel an in-flight or queued job on the bridge and clean up temporary TOS/local files."""
+        segments_to_clean: list[dict[str, Any]] = []
         async with self._job_lock(job_id):
             state = self.read_state(job_id)
             if state is None:
@@ -705,6 +2625,10 @@ class AsrJobManager:
             if running_task is not None and not running_task.done():
                 running_task.cancel()
 
+            raw_segs = state.get("segments")
+            if isinstance(raw_segs, list):
+                segments_to_clean = [s for s in raw_segs if isinstance(s, dict)]
+
             now_str = _now_iso()
             state.pop("interrupted", None)
             state.pop("interrupted_at", None)
@@ -720,13 +2644,46 @@ class AsrJobManager:
                     "error_code": "state_write_failed",
                     "error": "Failed persisting cancelled ASR job state",
                 }
-            return 200, {"ok": True, "job": state}
+
+        cleanup_fn = getattr(self.worker, "cleanup_job_resources", None)
+        if callable(cleanup_fn):
+            try:
+                await _maybe_await(cleanup_fn(job_id, segments_to_clean))
+            except Exception as exc:
+                logger.warning(
+                    "Cancel cleanup warning for job_id=%s: %s",
+                    job_id,
+                    type(exc).__name__,
+                )
+        return 200, {"ok": True, "job": state}
 
 
 __all__ = [
+    "ACTIVE_JOB_STATUSES",
     "AsrJobManager",
+    "AsrWorkerError",
+    "DEFAULT_DISK_HEADROOM_BYTES",
     "DEFAULT_FAKE_TRANSCRIPT_EN",
     "DEFAULT_FAKE_TRANSCRIPT_ZH",
+    "DEFAULT_FFMPEG_TIMEOUT_S",
+    "DEFAULT_FFPROBE_TIMEOUT_S",
+    "DEFAULT_STREAM_CHUNK_BYTES",
     "FakeAsrWorker",
     "FakeAsrWorkerConfig",
+    "PreparedSegmentFile",
+    "RECOVERABLE_JOB_STATUSES",
+    "RealAsrWorker",
+    "RealAsrWorkerConfig",
+    "SEGMENT_TIME_SECONDS",
+    "SPLIT_THRESHOLD_SECONDS",
+    "SourceObjectStore",
+    "TERMINAL_JOB_STATUSES",
+    "check_disk_admission",
+    "compute_file_sha256",
+    "compute_segment_ranges",
+    "format_scoped_speaker",
+    "merge_segment_transcriptions",
+    "probe_audio_duration",
+    "should_split_audio",
+    "split_audio_to_mp3_segments",
 ]
